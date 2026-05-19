@@ -25,7 +25,7 @@ use crate::device::{
     SerialPortConfiguration, SocketDeviceConfiguration, StorageDeviceConfiguration,
     VirtioFileSystemDeviceConfiguration, VirtioSocketDevice,
 };
-use crate::dispatch::{Queue, QueueAttribute};
+use crate::dispatch::{serial_queue, DispatchQueueExt, Queue};
 use crate::error::VzError;
 use crate::{GenericPlatform, LinuxBootLoader};
 
@@ -259,7 +259,7 @@ impl VirtualMachine {
 
     pub fn can_request_stop(&self) -> bool {
         self.queue
-            .exec_sync(move || unsafe { self.machine.canRequestStop() })
+            .exec_sync_with_result(move || unsafe { self.machine.canRequestStop() })
     }
 
     pub fn request_stop(&self) -> Result<(), VzError> {
@@ -297,7 +297,7 @@ impl VirtualMachine {
 
     pub fn state(&self) -> VirtualMachineState {
         self.queue
-            .exec_sync(move || unsafe { self.machine.state().into() })
+            .exec_sync_with_result(move || unsafe { self.machine.state().into() })
     }
 
     pub fn subscribe_state(&self) -> watch::Receiver<VirtualMachineState> {
@@ -307,7 +307,7 @@ impl VirtualMachine {
     pub fn open_devices(&self) -> Vec<VirtioSocketDevice> {
         let count = self
             .queue
-            .exec_sync(move || unsafe { self.machine.socketDevices().count() });
+            .exec_sync_with_result(move || unsafe { self.machine.socketDevices().count() });
         let registry = self.socket_listener_registry.clone();
         (0..count)
             .map(|index| {
@@ -382,11 +382,11 @@ impl VirtualMachineBuilder {
         let machine_config = self.config.build()?;
 
         unsafe {
-            let queue = Queue::create("codes.nvd.bentobox.vz.machine", QueueAttribute::Serial);
+            let queue = serial_queue("codes.nvd.bentobox.vz.machine");
             let machine = VZVirtualMachine::initWithConfiguration_queue(
                 VZVirtualMachine::alloc(),
                 &machine_config,
-                queue.as_dispatch_queue(),
+                &queue,
             );
             Ok(VirtualMachine::from_parts(queue, machine, machine_config))
         }

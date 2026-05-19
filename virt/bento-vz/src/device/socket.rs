@@ -22,7 +22,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::dispatch::Queue;
+use crate::dispatch::{DispatchQueueExt, Queue};
 use crate::error::VzError;
 
 type ListenerRegistry = Arc<Mutex<HashMap<usize, HashSet<u32>>>>;
