@@ -3,6 +3,15 @@ name = "bentoctl"
 version = "0.1.0"
 edition = "2021"
 default-run = "bentoctl"
+autobins = false
+
+[[bin]]
+name = "bento"
+path = "src/bin/bento.rs"
+
+[[bin]]
+name = "bentoctl"
+path = "src/bin/bentoctl.rs"
 
 [dependencies]
 bento-core = { path = "../../common/bento-core" }

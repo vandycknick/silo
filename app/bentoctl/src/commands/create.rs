@@ -1,69 +1,82 @@
 use bento_core::Mount;
-use bento_libvm::{CreateMachineRequest, LibVm};
+use bento_libvm::{CreateMachineRequest, LibVm, MachineRef};
 use clap::Args;
-use eyre::Context;
-use std::{
-    fmt::{Display, Formatter},
-    path::{Path, PathBuf},
+use std::collections::BTreeMap;
+use std::fmt::{Display, Formatter};
+use std::path::PathBuf;
+
+use crate::commands::profile::{parse_label, parse_network_mode, parse_profile_mount};
+use crate::constants::PROFILE_METADATA_KEY;
+use crate::profile::{
+    network_driver_name, resolve_host_path, MountMode, NetworkMode, ProfileStore,
 };
 
-#[derive(Debug, Clone)]
-pub(crate) struct MountConfig {
-    pub location: PathBuf,
-    pub writable: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NetworkMode {
-    User,
-    Gvisor,
-    VzNat,
-    None,
-}
-
 #[derive(Args, Debug)]
+#[command(
+    about = "Create a persistent VM from a profile or image",
+    after_help = "Examples:\n  bento create dev rust-dev\n  bento create dev rust-dev --start\n  bento create dev --profile rust-dev\n  bento create ubuntu --image ubuntu:24.04\n"
+)]
 pub struct Cmd {
-    pub image_ref: String,
+    /// Name of the persistent VM to create.
+    #[arg(value_name = "NAME")]
     pub name: String,
-    #[arg(long, help = "number of virtual CPUs")]
+    /// Profile to create the VM from.
+    #[arg(value_name = "PROFILE")]
+    pub profile: Option<String>,
+    /// Profile name. Alternative to the positional profile argument.
+    #[arg(long = "profile")]
+    pub profile_name: Option<String>,
+    /// Image reference to create from without using a profile.
+    #[arg(long)]
+    pub image: Option<String>,
+    /// Start the VM immediately after it is created.
+    #[arg(long)]
+    pub start: bool,
+    #[command(flatten)]
+    pub overrides: VmOverrideArgs,
+}
+
+#[derive(Args, Debug, Default)]
+pub(crate) struct VmOverrideArgs {
+    /// Number of virtual CPUs.
+    #[arg(long)]
     pub cpus: Option<u8>,
-    #[arg(long, help = "virtual machine RAM size in mibibytes")]
+    /// Virtual machine RAM size in mibibytes.
+    #[arg(long)]
     pub memory: Option<u32>,
-    #[arg(long, help = "Path to a custom kernel, only works for Linux.")]
+    /// Path to a custom kernel. Only works for Linux.
+    #[arg(long)]
     pub kernel: Option<PathBuf>,
-    #[arg(
-        long = "initramfs",
-        visible_alias = "initrd",
-        help = "Path to a custom initramfs image, only works for Linux."
-    )]
+    /// Path to a custom initramfs image. Only works for Linux.
+    #[arg(long = "initramfs", visible_alias = "initrd")]
     pub initramfs: Option<PathBuf>,
-    #[arg(
-        long,
-        value_name = "GB",
-        help = "Resize the image-backed root disk to this size in GB"
-    )]
+    /// Resize the image-backed root disk to this size in GB.
+    #[arg(long, value_name = "GB")]
     pub disk_size: Option<u64>,
-    #[arg(long, help = "Enable nested virtualization for supported VZ guests")]
+    /// Enable nested virtualization for supported VZ guests.
+    #[arg(long)]
     pub nested_virtualization: bool,
-    #[arg(long, help = "Enable the Bento guest agent")]
+    /// Enable the Bento guest agent.
+    #[arg(long)]
     pub agent: bool,
-    #[arg(
-        long,
-        help = "Enable Rosetta for x86_64 Linux binaries in supported VZ guests"
-    )]
+    /// Enable Rosetta for x86_64 Linux binaries in supported VZ guests.
+    #[arg(long)]
     pub rosetta: bool,
-    #[arg(long, value_name = "PATH", help = "Path to userdata file")]
+    /// Path to userdata file.
+    #[arg(long, value_name = "PATH")]
     pub userdata: Option<PathBuf>,
-    #[arg(
-        long = "disk",
-        value_name = "PATH",
-        help = "Path to an existing disk image"
-    )]
+    /// Path to an existing disk image.
+    #[arg(long = "disk", value_name = "PATH")]
     pub disks: Vec<PathBuf>,
-    #[arg(long = "mount", value_name = "PATH:ro|rw", value_parser = parse_mount_arg)]
-    pub mounts: Vec<MountConfig>,
-    #[arg(long, value_name = "MODE", value_parser = parse_network_mode)]
+    /// Add a mount or override profile mounts. Format: SRC:DST[:ro|rw].
+    #[arg(long = "mount", value_name = "SRC:DST[:MODE]", value_parser = parse_profile_mount)]
+    pub mounts: Vec<crate::profile::ProfileMount>,
+    /// Override the profile network mode. Allowed: isolated, none.
+    #[arg(long, value_parser = parse_network_mode)]
     pub network: Option<NetworkMode>,
+    /// Add or override a label. Format: KEY=VALUE.
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
+    pub labels: Vec<(String, String)>,
 }
 
 impl Display for Cmd {
@@ -74,280 +87,236 @@ impl Display for Cmd {
 
 impl Cmd {
     pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
+        let resolved = self.resolve()?;
         let request = CreateMachineRequest {
-            image_ref: self.image_ref.clone(),
+            image_ref: resolved.image_ref.clone(),
             name: self.name.clone(),
-            cpus: self.cpus,
-            memory_mib: self.memory,
-            kernel: resolve_optional_path(self.kernel.as_deref(), "kernel")?,
-            initramfs: resolve_optional_path(self.initramfs.as_deref(), "initramfs")?,
-            disk_size_gb: self.disk_size,
-            nested_virtualization: self.nested_virtualization,
-            agent: self.agent,
-            rosetta: self.rosetta,
-            userdata: resolve_optional_path(self.userdata.as_deref(), "userdata")?,
-            disks: resolve_existing_paths(&self.disks, "disk")?,
-            mounts: self.mounts.iter().cloned().map(mount_to_spec).collect(),
-            network: self.network.map(map_network_mode),
+            labels: resolved.labels,
+            metadata: resolved.metadata,
+            cpus: resolved.cpus,
+            memory_mib: resolved.memory_mib,
+            kernel: resolved.kernel,
+            initramfs: resolved.initramfs,
+            disk_size_gb: resolved.disk_size_gb,
+            nested_virtualization: resolved.nested_virtualization,
+            agent: resolved.ssh_enabled,
+            rosetta: resolved.rosetta,
+            userdata: resolved.userdata,
+            disks: resolved.disks,
+            mounts: resolved.mounts,
+            network: Some(network_driver_name(resolved.network).to_string()),
         };
 
         libvm.create_from_image(request)?;
-
         println!("created {}", self.name);
+
+        if self.start {
+            libvm.start(&MachineRef::parse(self.name.clone())?).await?;
+        }
+
         Ok(())
     }
-}
 
-fn resolve_optional_path(path: Option<&Path>, kind: &str) -> eyre::Result<Option<PathBuf>> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-
-    Ok(Some(resolve_existing_path(path, kind)?))
-}
-
-fn resolve_existing_paths(paths: &[PathBuf], kind: &str) -> eyre::Result<Vec<PathBuf>> {
-    paths
-        .iter()
-        .map(|path| resolve_existing_path(path, kind))
-        .collect()
-}
-
-fn resolve_existing_path(path: &Path, kind: &str) -> eyre::Result<PathBuf> {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-
-    let abs = std::fs::canonicalize(&abs)
-        .context(format!("{kind} path does not exist: {}", abs.display()))?;
-
-    Ok(abs)
-}
-
-pub(crate) fn parse_mount_arg(input: &str) -> Result<MountConfig, String> {
-    let (location, mode) = input
-        .rsplit_once(':')
-        .ok_or_else(|| "invalid mount, expected PATH:ro|rw".to_string())?;
-
-    if location.is_empty() {
-        return Err("invalid mount, path cannot be empty".to_string());
-    }
-
-    let writable = match mode {
-        "rw" => true,
-        "ro" => false,
-        _ => {
-            return Err(format!(
-                "invalid mount mode '{mode}', expected 'ro' or 'rw'"
-            ))
+    fn resolve(&self) -> eyre::Result<ResolvedCreate> {
+        if self.profile.is_some() && self.profile_name.is_some() {
+            eyre::bail!("profile specified twice; use either positional profile or --profile");
         }
-    };
+        let profile_name = self.profile.clone().or_else(|| self.profile_name.clone());
+        if profile_name.is_some() && self.image.is_some() {
+            eyre::bail!("use either a profile or --image, not both");
+        }
 
-    Ok(MountConfig {
-        location: PathBuf::from(location),
-        writable,
+        let mut labels = BTreeMap::new();
+        let mut metadata = BTreeMap::new();
+        let mut mounts = Vec::new();
+        let image_ref;
+        let mut network = NetworkMode::Isolated;
+        let mut ssh_enabled = true;
+
+        if let Some(profile_name) = profile_name {
+            let store = ProfileStore::from_env()?;
+            let named = store.resolve(&profile_name)?;
+            image_ref = named.profile.image.reference.clone();
+            network = named.profile.network_mode();
+            ssh_enabled = named
+                .profile
+                .ssh
+                .as_ref()
+                .map(|ssh| ssh.enabled)
+                .unwrap_or(true);
+            labels = named.profile.labels.clone();
+            metadata.insert(PROFILE_METADATA_KEY.to_string(), named.name.clone());
+            mounts = named.profile.resolved_mounts()?;
+            for (key, value) in &self.overrides.labels {
+                labels.insert(key.clone(), value.clone());
+            }
+            for mount in &self.overrides.mounts {
+                mounts.push(profile_mount_to_mount(mount)?);
+            }
+            if let Some(network_override) = self.overrides.network {
+                network = network_override;
+            }
+            return Ok(ResolvedCreate::new(
+                image_ref,
+                labels,
+                metadata,
+                mounts,
+                network,
+                ssh_enabled,
+                &self.overrides,
+            ));
+        }
+
+        let Some(image) = &self.image else {
+            eyre::bail!("either a profile or image is required\n\nexamples:\n  bento create dev rust-dev\n  bento create dev --profile rust-dev\n  bento create dev --image ubuntu:24.04");
+        };
+
+        image_ref = image.clone();
+        for (key, value) in &self.overrides.labels {
+            labels.insert(key.clone(), value.clone());
+        }
+        for mount in &self.overrides.mounts {
+            mounts.push(profile_mount_to_mount(mount)?);
+        }
+        if let Some(network_override) = self.overrides.network {
+            network = network_override;
+        }
+
+        Ok(ResolvedCreate::new(
+            image_ref,
+            labels,
+            metadata,
+            mounts,
+            network,
+            ssh_enabled,
+            &self.overrides,
+        ))
+    }
+}
+
+struct ResolvedCreate {
+    image_ref: String,
+    labels: BTreeMap<String, String>,
+    metadata: BTreeMap<String, String>,
+    mounts: Vec<Mount>,
+    network: NetworkMode,
+    ssh_enabled: bool,
+    cpus: Option<u8>,
+    memory_mib: Option<u32>,
+    kernel: Option<PathBuf>,
+    initramfs: Option<PathBuf>,
+    disk_size_gb: Option<u64>,
+    nested_virtualization: bool,
+    rosetta: bool,
+    userdata: Option<PathBuf>,
+    disks: Vec<PathBuf>,
+}
+
+impl ResolvedCreate {
+    fn new(
+        image_ref: String,
+        labels: BTreeMap<String, String>,
+        metadata: BTreeMap<String, String>,
+        mounts: Vec<Mount>,
+        network: NetworkMode,
+        ssh_enabled: bool,
+        overrides: &VmOverrideArgs,
+    ) -> Self {
+        Self {
+            image_ref,
+            labels,
+            metadata,
+            mounts,
+            network,
+            ssh_enabled: ssh_enabled || overrides.agent,
+            cpus: overrides.cpus,
+            memory_mib: overrides.memory,
+            kernel: overrides.kernel.clone(),
+            initramfs: overrides.initramfs.clone(),
+            disk_size_gb: overrides.disk_size,
+            nested_virtualization: overrides.nested_virtualization,
+            rosetta: overrides.rosetta,
+            userdata: overrides.userdata.clone(),
+            disks: overrides.disks.clone(),
+        }
+    }
+}
+
+pub(crate) fn profile_mount_to_mount(mount: &crate::profile::ProfileMount) -> eyre::Result<Mount> {
+    Ok(Mount {
+        source: resolve_host_path(&mount.source)?,
+        tag: mount.target.clone(),
+        read_only: mount.mode == MountMode::Ro,
     })
-}
-
-pub(crate) fn parse_network_mode(input: &str) -> Result<NetworkMode, String> {
-    match input {
-        "user" => Ok(NetworkMode::User),
-        "gvisor" => Ok(NetworkMode::Gvisor),
-        "vznat" => Ok(NetworkMode::VzNat),
-        "none" => Ok(NetworkMode::None),
-        _ => Err(format!(
-            "invalid network mode '{input}', expected one of: user, gvisor, vznat, none"
-        )),
-    }
-}
-
-fn map_network_mode(mode: NetworkMode) -> String {
-    match mode {
-        NetworkMode::User => "user".to_string(),
-        NetworkMode::Gvisor => "gvisor".to_string(),
-        NetworkMode::VzNat => "vznat".to_string(),
-        NetworkMode::None => "none".to_string(),
-    }
-}
-
-fn mount_to_spec(mount: MountConfig) -> Mount {
-    Mount {
-        source: mount.location,
-        tag: String::new(),
-        read_only: !mount.writable,
-    }
-}
-
-#[cfg(test)]
-fn gigabytes_to_bytes(size_gb: u64) -> u64 {
-    size_gb.saturating_mul(1_000_000_000)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::commands::{BentoCtlCmd, Command};
     use clap::Parser;
-    use tempfile::TempDir;
+
+    use crate::commands::{BentoCtlCmd, Command};
 
     #[test]
-    fn parse_mount_arg_accepts_ro_and_rw() {
-        let ro = parse_mount_arg("~/code:ro").expect("ro mount should parse");
-        assert_eq!(ro.location, PathBuf::from("~/code"));
-        assert!(!ro.writable);
-
-        let rw = parse_mount_arg("/tmp/data:rw").expect("rw mount should parse");
-        assert_eq!(rw.location, PathBuf::from("/tmp/data"));
-        assert!(rw.writable);
-    }
-
-    #[test]
-    fn parse_mount_arg_rejects_invalid_input() {
-        assert!(parse_mount_arg("/tmp/data").is_err());
-        assert!(parse_mount_arg(":rw").is_err());
-        assert!(parse_mount_arg("/tmp/data:readwrite").is_err());
-    }
-
-    #[test]
-    fn parse_network_mode_accepts_expected_values() {
-        assert_eq!(
-            parse_network_mode("user").expect("user should parse"),
-            NetworkMode::User
-        );
-        assert_eq!(
-            parse_network_mode("vznat").expect("vznat should parse"),
-            NetworkMode::VzNat
-        );
-        assert_eq!(
-            parse_network_mode("gvisor").expect("gvisor should parse"),
-            NetworkMode::Gvisor
-        );
-        assert_eq!(
-            parse_network_mode("none").expect("none should parse"),
-            NetworkMode::None
-        );
-    }
-
-    #[test]
-    fn parse_network_mode_rejects_invalid_value() {
-        assert!(parse_network_mode("default").is_err());
-    }
-
-    #[test]
-    fn create_command_parses_nested_virtualization_flag() {
-        let cmd = BentoCtlCmd::try_parse_from([
-            "bentoctl",
-            "create",
-            "ghcr.io/acme/base:latest",
-            "dev",
-            "--nested-virtualization",
-        ])
-        .expect("create command should parse");
-
+    fn create_command_parses_profile_form() {
+        let cmd = BentoCtlCmd::try_parse_from(["bento", "create", "dev", "rust-dev"])
+            .expect("create command should parse");
         let create = match cmd.cmd {
             Command::Create(cmd) => cmd,
             other => panic!("expected create command, got {other:?}"),
         };
-
-        assert!(create.nested_virtualization);
+        assert_eq!(create.name, "dev");
+        assert_eq!(create.profile.as_deref(), Some("rust-dev"));
+        assert!(!create.overrides.agent);
     }
 
     #[test]
-    fn create_command_parses_rosetta_flag() {
+    fn create_command_parses_vm_overrides() {
         let cmd = BentoCtlCmd::try_parse_from([
-            "bentoctl",
+            "bento",
             "create",
-            "ghcr.io/acme/base:latest",
             "dev",
-            "--rosetta",
-        ])
-        .expect("create command should parse");
-
-        let create = match cmd.cmd {
-            Command::Create(cmd) => cmd,
-            other => panic!("expected create command, got {other:?}"),
-        };
-
-        assert!(create.rosetta);
-    }
-
-    #[test]
-    fn create_command_parses_agent_flag() {
-        let cmd = BentoCtlCmd::try_parse_from([
-            "bentoctl",
-            "create",
-            "ghcr.io/acme/base:latest",
-            "dev",
-            "--agent",
-        ])
-        .expect("create command should parse");
-
-        let create = match cmd.cmd {
-            Command::Create(cmd) => cmd,
-            other => panic!("expected create command, got {other:?}"),
-        };
-
-        assert!(create.agent);
-    }
-
-    #[test]
-    fn create_command_parses_disk_size_flag() {
-        let cmd = BentoCtlCmd::try_parse_from([
-            "bentoctl",
-            "create",
-            "example.com/acme/image:latest",
-            "dev",
+            "rust-dev",
+            "--cpus",
+            "4",
+            "--memory",
+            "4096",
+            "--kernel",
+            "./vmlinuz",
+            "--initrd",
+            "./initrd.img",
             "--disk-size",
             "40",
+            "--nested-virtualization",
+            "--agent",
+            "--rosetta",
+            "--userdata",
+            "./user-data.yaml",
+            "--disk",
+            "./data.raw",
+            "--mount",
+            ".:/workspace:rw",
+            "--network",
+            "none",
+            "--label",
+            "env=dev",
         ])
         .expect("create command should parse");
-
         let create = match cmd.cmd {
             Command::Create(cmd) => cmd,
             other => panic!("expected create command, got {other:?}"),
         };
 
-        assert_eq!(create.disk_size, Some(40));
-    }
-
-    #[test]
-    fn resolve_optional_path_returns_none_when_unset() {
-        let resolved = resolve_optional_path(None, "kernel").expect("unset path should resolve");
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn resolve_optional_path_canonicalizes_relative_paths() {
-        let old_cwd = std::env::current_dir().expect("cwd should resolve");
-        let tmp = TempDir::new().expect("temp dir should be creatable");
-        let nested = tmp.path().join("boot");
-        std::fs::create_dir_all(&nested).expect("nested dir should be creatable");
-        let file = nested.join("initramfs.img");
-        std::fs::write(&file, b"initramfs").expect("initramfs file should be creatable");
-
-        std::env::set_current_dir(tmp.path()).expect("set cwd should succeed");
-        let resolved = resolve_optional_path(Some(Path::new("boot/./initramfs.img")), "initramfs")
-            .expect("relative path should resolve")
-            .expect("path should be present");
-        std::env::set_current_dir(old_cwd).expect("restore cwd should succeed");
-
-        let canonical_file =
-            std::fs::canonicalize(file).expect("test initramfs file should canonicalize");
-        assert_eq!(resolved, canonical_file);
-    }
-
-    #[test]
-    fn resolve_existing_paths_rejects_missing_path() {
-        let err = resolve_existing_paths(&[PathBuf::from("/definitely/not/here/disk.img")], "disk")
-            .expect_err("missing disk should fail");
-
-        assert!(err.to_string().contains("disk path does not exist"));
-    }
-
-    #[test]
-    fn gigabytes_to_bytes_uses_decimal_units() {
-        assert_eq!(gigabytes_to_bytes(40), 40_000_000_000);
+        assert_eq!(create.overrides.cpus, Some(4));
+        assert_eq!(create.overrides.memory, Some(4096));
+        assert_eq!(create.overrides.disk_size, Some(40));
+        assert!(create.overrides.nested_virtualization);
+        assert!(create.overrides.agent);
+        assert!(create.overrides.rosetta);
+        assert_eq!(create.overrides.disks.len(), 1);
+        assert_eq!(create.overrides.mounts.len(), 1);
+        assert_eq!(
+            create.overrides.labels,
+            vec![("env".to_string(), "dev".to_string())]
+        );
     }
 }

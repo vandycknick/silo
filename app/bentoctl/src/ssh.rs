@@ -19,6 +19,16 @@ pub(crate) fn exec_remote_shell(name: &str, user: Option<&str>) -> eyre::Result<
     bail!("failed to execute ssh: {err}")
 }
 
+pub(crate) fn run_remote_shell_status(name: &str, user: Option<&str>) -> eyre::Result<ExitStatus> {
+    let remote_command = format!(
+        "/bin/sh -lc '{}; exec \"${{SHELL:-/bin/bash}}\" -l || exec /bin/sh'",
+        current_dir_prologue()?
+    );
+    ssh_command(name, user, true, Some(&remote_command))?
+        .status()
+        .context("run remote shell over ssh")
+}
+
 pub(crate) fn run_remote_command(
     name: &str,
     user: Option<&str>,
@@ -41,7 +51,7 @@ fn ssh_command(
     allocate_tty: bool,
     remote_command: Option<&str>,
 ) -> eyre::Result<Command> {
-    let exe = std::env::current_exe().context("resolve bentoctl binary path")?;
+    let exe = std::env::current_exe().context("resolve CLI binary path")?;
 
     let proxy_command = format!(
         "{} shell-proxy --name {}",

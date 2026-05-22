@@ -9,12 +9,17 @@ use bento_protocol::v1::LifecycleState;
 use crate::ssh;
 
 #[derive(Args, Debug)]
+#[command(about = "Execute a command in a running VM")]
 pub struct Cmd {
+    /// Name or ID of the running VM.
+    #[arg(value_name = "VM")]
     pub name: String,
 
+    /// Guest user for the command.
     #[arg(long, short = 'u')]
     pub user: Option<String>,
 
+    /// Guest command and arguments to execute after `--`.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
 }

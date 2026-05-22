@@ -6,6 +6,8 @@ use bento_core::{InstanceFile, VmSpec};
 use bento_libvm::{LibVm, MachineRef, MachineStatus};
 use bento_protocol::v1::LifecycleState;
 
+use crate::constants::PROFILE_METADATA_KEY;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GuestConfigStatus {
     enabled: bool,
@@ -16,8 +18,14 @@ struct GuestConfigStatus {
 }
 
 #[derive(Args, Debug)]
+#[command(about = "Show VM status")]
 pub struct Cmd {
+    /// Name or ID of the VM to check.
+    #[arg(value_name = "VM")]
     pub name: String,
+    /// Output concise VM status as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 impl Display for Cmd {
@@ -30,8 +38,29 @@ impl Cmd {
     pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
         let machine_ref = MachineRef::parse(self.name.clone())?;
         let machine = libvm.inspect(&machine_ref)?;
+        if self.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "name": machine.spec.name,
+                    "state": process_status_label(machine.status),
+                    "profile": machine.metadata.get(PROFILE_METADATA_KEY),
+                    "image": machine.image_ref,
+                    "network": network_label(machine.spec.network.driver),
+                    "created_at": machine.created_at,
+                }))?
+            );
+            return Ok(());
+        }
 
         println!("name: {}", machine.spec.name);
+        if let Some(profile) = machine.metadata.get(PROFILE_METADATA_KEY) {
+            println!("profile: {profile}");
+        }
+        if !machine.image_ref.is_empty() {
+            println!("image: {}", machine.image_ref);
+        }
+        println!("network: {}", network_label(machine.spec.network.driver));
         print_process(machine.status);
 
         if !machine.status.is_running() {
@@ -226,6 +255,14 @@ fn lifecycle_label(raw: i32) -> &'static str {
         LifecycleState::Stopping => "stopping",
         LifecycleState::Stopped => "stopped",
         LifecycleState::Error => "error",
+    }
+}
+
+fn network_label(driver: bento_core::NetworkDriver) -> &'static str {
+    match driver {
+        bento_core::NetworkDriver::Gvisor => "isolated",
+        bento_core::NetworkDriver::None => "none",
+        bento_core::NetworkDriver::VzNat => "vznat",
     }
 }
 

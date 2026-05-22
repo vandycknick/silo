@@ -47,17 +47,24 @@
             '';
           };
 
+          bento = self.packages.${system}.bentoctl;
+
           default = self.packages.${system}.bentoctl;
         }
       );
 
       apps = forEachSystem (system: {
+        bento = {
+          type = "app";
+          program = "${self.packages.${system}.bento}/bin/bento";
+        };
+
         bentoctl = {
           type = "app";
           program = "${self.packages.${system}.bentoctl}/bin/bentoctl";
         };
 
-        default = self.apps.${system}.bentoctl;
+        default = self.apps.${system}.bento;
       });
 
       devShells = forEachSystem (

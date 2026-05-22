@@ -3,8 +3,14 @@ use clap::Args;
 use std::fmt::{Display, Formatter};
 
 #[derive(Args, Debug)]
+#[command(about = "Stop a persistent VM")]
 pub struct Cmd {
+    /// Name or ID of the VM to stop.
+    #[arg(value_name = "VM")]
     pub name: String,
+    /// Force stop if graceful shutdown support is unavailable.
+    #[arg(long)]
+    pub force: bool,
 }
 
 impl Display for Cmd {

@@ -13,7 +13,7 @@ use serde::Serialize;
 use tokio::time::sleep;
 
 use crate::global_config::GlobalConfig;
-use crate::state::{MachineMetadata, NetworkAttachmentState, NetworkInstanceState, StateStore};
+use crate::state::{MachineState, NetworkAttachmentState, NetworkInstanceState, StateStore};
 use crate::{Layout, LibVmError};
 
 const GVPROXY_BINARY_ENV: &str = "GVPROXY_BIN";
@@ -41,7 +41,7 @@ enum NetworkTransportFile {
 pub(crate) async fn prepare_network_runtime(
     layout: &Layout,
     state: &StateStore,
-    metadata: &MachineMetadata,
+    metadata: &MachineState,
     spec: &VmSpec,
 ) -> Result<(), LibVmError> {
     reconcile_network_runtime(layout, state, metadata, false)?;
@@ -70,7 +70,7 @@ fn host_uses_user_network_runtime() -> bool {
 pub(crate) fn reconcile_network_runtime(
     layout: &Layout,
     state: &StateStore,
-    metadata: &MachineMetadata,
+    metadata: &MachineState,
     monitor_running: bool,
 ) -> Result<(), LibVmError> {
     let Some(attachment) = state.get_network_attachment(metadata.id)? else {
@@ -98,7 +98,7 @@ pub(crate) fn reconcile_network_runtime(
 async fn prepare_gvisor_network_runtime(
     layout: &Layout,
     state: &StateStore,
-    metadata: &MachineMetadata,
+    metadata: &MachineState,
 ) -> Result<(), LibVmError> {
     let global_config = GlobalConfig::load().map_err(|err| LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
@@ -217,7 +217,7 @@ fn configure_gvproxy_command(
 async fn prepare_gvisor_network_runtime(
     _layout: &Layout,
     _state: &StateStore,
-    _metadata: &MachineMetadata,
+    _metadata: &MachineState,
 ) -> Result<(), LibVmError> {
     Ok(())
 }

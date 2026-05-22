@@ -5,8 +5,15 @@ use bento_libvm::{LibVm, MachineStatus};
 use clap::Args;
 use tabwriter::TabWriter;
 
+use crate::constants::PROFILE_METADATA_KEY;
+
 #[derive(Args, Debug, Default)]
-pub struct Cmd {}
+#[command(about = "List VMs")]
+pub struct Cmd {
+    /// Output VMs as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
 
 impl Display for Cmd {
     fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -20,26 +27,75 @@ impl Cmd {
         let host_arch = std::env::consts::ARCH;
         let now = now_unix();
 
+        if self.json {
+            let values = machines
+                .into_iter()
+                .map(|machine| {
+                    serde_json::json!({
+                        "id": machine.id.to_string(),
+                        "name": machine.spec.name,
+                        "state": state_label(machine.status),
+                        "profile": machine.metadata.get(PROFILE_METADATA_KEY),
+                        "image": machine.image_ref,
+                        "created_at": machine.created_at,
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!("{}", serde_json::to_string_pretty(&values)?);
+            return Ok(());
+        }
+
         let mut out = TabWriter::new(std::io::stdout()).padding(2);
-        writeln!(&mut out, "ID\tNAME\tSTATUS\tCREATED\tARCH\tCPUS\tMEMORY")?;
+        writeln!(
+            &mut out,
+            "ID\tNAME\tSTATE\tPROFILE\tIMAGE\tCREATED\tARCH\tCPUS\tMEMORY"
+        )?;
 
         for machine in machines {
-            let short_id = machine.id.short();
             let cpus = machine.spec.resources.cpus.to_string();
             let memory = machine.spec.resources.memory_mib.to_string();
             let created = relative_time(machine.created_at, now);
             let status = status_label(machine.status, now);
+            let profile = machine
+                .metadata
+                .get(PROFILE_METADATA_KEY)
+                .map(String::as_str)
+                .unwrap_or("-");
+            let image = if machine.image_ref.is_empty() {
+                "-"
+            } else {
+                machine.image_ref.as_str()
+            };
 
             writeln!(
                 &mut out,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                short_id, machine.spec.name, status, created, host_arch, cpus, memory,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                short_id(&machine.id.to_string()),
+                machine.spec.name,
+                status,
+                profile,
+                image,
+                created,
+                host_arch,
+                cpus,
+                memory,
             )?;
         }
 
         out.flush()?;
 
         Ok(())
+    }
+}
+
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+fn state_label(status: MachineStatus) -> &'static str {
+    match status {
+        MachineStatus::Running { .. } => "running",
+        MachineStatus::Stopped => "stopped",
     }
 }
 
@@ -111,7 +167,7 @@ fn relative_time(timestamp: i64, now: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::relative_time;
+    use super::{relative_time, short_id};
 
     #[test]
     fn relative_time_formatting() {
@@ -130,5 +186,11 @@ mod tests {
         assert_eq!(relative_time(now - 172800, now), "2 days ago");
         assert_eq!(relative_time(now - 604800, now), "7 days ago");
         assert_eq!(relative_time(now - 604800 * 2, now), "2 weeks ago");
+    }
+
+    #[test]
+    fn short_id_uses_first_eight_characters_when_available() {
+        assert_eq!(short_id("1234567890abcdef"), "12345678");
+        assert_eq!(short_id("1234"), "1234");
     }
 }

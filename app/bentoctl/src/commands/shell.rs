@@ -15,12 +15,17 @@ pub enum AttachMode {
 }
 
 #[derive(Args, Debug)]
+#[command(about = "Open a shell in a running VM")]
 pub struct Cmd {
+    /// Name or ID of the running VM.
+    #[arg(value_name = "VM")]
     pub name: String,
 
+    /// Guest user for the shell session.
     #[arg(long, short = 'u')]
     pub user: Option<String>,
 
+    /// Attach through the guest shell or serial console.
     #[arg(long, value_enum)]
     pub attach: Option<AttachMode>,
 }
@@ -62,7 +67,7 @@ impl Cmd {
         match self.attach {
             Some(AttachMode::Serial) => {
                 if self.user.is_some() {
-                    eprintln!("[bentoctl] --user is ignored for serial attach");
+                    eprintln!("[bento] --user is ignored for serial attach");
                 }
                 let stream = libvm
                     .open_serial_stream(&MachineRef::Id(machine.id))

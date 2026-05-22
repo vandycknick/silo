@@ -3,7 +3,10 @@ use clap::Args;
 use std::fmt::{Display, Formatter};
 
 #[derive(Args, Debug)]
+#[command(about = "Start a persistent VM")]
 pub struct Cmd {
+    /// Name or ID of the VM to start.
+    #[arg(value_name = "VM")]
     pub name: String,
 }
 

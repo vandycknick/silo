@@ -12,6 +12,7 @@ use clap::{Args, Subcommand};
 use tabwriter::TabWriter;
 
 #[derive(Args, Debug)]
+#[command(about = "Manage local VM images")]
 pub struct Cmd {
     #[command(subcommand)]
     pub command: ImageSubcommand,
@@ -25,41 +26,61 @@ impl Display for Cmd {
 
 #[derive(Subcommand, Debug)]
 pub enum ImageSubcommand {
+    #[command(about = "List local images")]
     List,
+    #[command(about = "Pull an image into the local store")]
     Pull(PullCmd),
+    #[command(about = "Import an OCI image archive")]
     Import(ImportCmd),
+    #[command(about = "Pack a stopped VM into an image")]
     Pack(PackCmd),
+    #[command(about = "Remove an image tag or image")]
     Rm(RmCmd),
 }
 
 #[derive(Args, Debug)]
 pub struct PullCmd {
+    /// Image reference to pull.
+    #[arg(value_name = "REF")]
     pub reference: String,
+    /// Local tag name to assign to the pulled image.
     #[arg(long)]
     pub name: Option<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct ImportCmd {
+    /// Path to an OCI tar archive.
+    #[arg(value_name = "PATH")]
     pub path: PathBuf,
 }
 
 #[derive(Args, Debug)]
 pub struct PackCmd {
+    /// Stopped VM to pack.
+    #[arg(value_name = "VM")]
     pub vm: String,
+    /// Image reference to create.
+    #[arg(value_name = "REF")]
     pub reference: String,
+    /// Include the resolved kernel in the image artifact.
     #[arg(long)]
     pub include_kernel: bool,
+    /// Include the resolved initramfs in the image artifact.
     #[arg(long, visible_alias = "include-initramfs")]
     pub include_initrd: bool,
+    /// Write the OCI archive to this path instead of importing it.
     #[arg(long, value_name = "PATH")]
     pub outfile: Option<PathBuf>,
+    /// Keep the temporary OCI layout for inspection.
     #[arg(long)]
     pub debug: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct RmCmd {
+    /// Image tag to remove.
+    #[arg(value_name = "TAG")]
     pub tag: String,
 }
 

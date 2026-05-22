@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufRead};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -24,7 +25,7 @@ use crate::layout::CONFIG_FILE_NAME;
 use crate::machine_ref::validate_machine_name;
 use crate::monitor;
 use crate::network::{prepare_network_runtime, reconcile_network_runtime};
-use crate::state::{metadata_from_path, MachineMetadata, StateStore};
+use crate::state::{machine_state_from_path_with_details, MachineState, StateStore};
 use crate::{Layout, LibVmError, MachineRef};
 
 const BYTES_PER_GB: u64 = 1_000_000_000;
@@ -33,6 +34,8 @@ const BYTES_PER_GB: u64 = 1_000_000_000;
 pub struct CreateMachineRequest {
     pub image_ref: String,
     pub name: String,
+    pub labels: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, String>,
     pub cpus: Option<u8>,
     pub memory_mib: Option<u32>,
     pub kernel: Option<PathBuf>,
@@ -54,6 +57,9 @@ pub struct MachineRecord {
     pub dir: PathBuf,
     pub status: MachineStatus,
     pub created_at: i64,
+    pub image_ref: String,
+    pub labels: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +88,9 @@ struct PendingMachine {
     spec: VmSpec,
     staged_dir: PathBuf,
     final_dir: PathBuf,
+    image_ref: String,
+    labels: BTreeMap<String, String>,
+    metadata: BTreeMap<String, String>,
     committed: bool,
 }
 
@@ -126,7 +135,7 @@ impl LibVm {
         let bootstrap = (userdata_path.is_some() || request.rosetta).then(|| Bootstrap {
             cloud_init: userdata_path.clone(),
         });
-        let guest = GuestSpec::default();
+        let guest = guest_spec_from_request(request.agent);
 
         let resolved_kernel =
             kernel_path.or_else(|| image_store.image_kernel_path(&selected_image));
@@ -151,7 +160,7 @@ impl LibVm {
             boot: Boot {
                 kernel: resolved_kernel,
                 initramfs: resolved_initramfs,
-                kernel_cmdline: vec![agent_port_arg(guest.control_port)],
+                kernel_cmdline: guest_kernel_cmdline(&guest),
                 bootstrap,
             },
             storage: Storage {
@@ -176,10 +185,15 @@ impl LibVm {
                 nested_virtualization: request.nested_virtualization,
                 rosetta: request.rosetta,
             },
-            guest: Some(guest),
+            guest,
         };
 
-        let pending = self.create_pending(spec)?;
+        let pending = self.create_pending(
+            spec,
+            request.image_ref.clone(),
+            request.labels,
+            request.metadata,
+        )?;
         let rootfs_path = pending.dir().join(InstanceFile::RootDisk.as_str());
         image_store.clone_base_image(&selected_image, &rootfs_path)?;
 
@@ -190,7 +204,13 @@ impl LibVm {
         pending.commit(self)
     }
 
-    fn create_pending(&self, spec: VmSpec) -> Result<PendingMachine, LibVmError> {
+    fn create_pending(
+        &self,
+        spec: VmSpec,
+        image_ref: String,
+        labels: BTreeMap<String, String>,
+        metadata: BTreeMap<String, String>,
+    ) -> Result<PendingMachine, LibVmError> {
         validate_machine_name(&spec.name)?;
 
         if self
@@ -223,12 +243,15 @@ impl LibVm {
             spec,
             staged_dir,
             final_dir,
+            image_ref,
+            labels,
+            metadata,
             committed: false,
         })
     }
 
     pub fn inspect(&self, machine: &MachineRef) -> Result<MachineRecord, LibVmError> {
-        let metadata = self.resolve_metadata(machine)?;
+        let metadata = self.resolve_machine_state(machine)?;
         self.machine_record(metadata)
     }
 
@@ -240,8 +263,12 @@ impl LibVm {
             .collect()
     }
 
+    pub fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError> {
+        self.state.allocate_ephemeral_name(prefix)
+    }
+
     pub fn remove(&self, machine: &MachineRef) -> Result<(), LibVmError> {
-        let metadata = self.resolve_metadata(machine)?;
+        let metadata = self.resolve_machine_state(machine)?;
         let pid_path = self.layout.monitor_pid_path(metadata.id);
         reconcile_network_runtime(&self.layout, &self.state, &metadata, pid_path.exists())?;
 
@@ -261,7 +288,7 @@ impl LibVm {
     }
 
     pub async fn start(&self, machine: &MachineRef) -> Result<MachineRecord, LibVmError> {
-        let metadata = self.resolve_metadata(machine)?;
+        let metadata = self.resolve_machine_state(machine)?;
         let pid_path = self.layout.monitor_pid_path(metadata.id);
         reconcile_network_runtime(&self.layout, &self.state, &metadata, pid_path.exists())?;
 
@@ -301,7 +328,7 @@ impl LibVm {
     }
 
     pub async fn stop(&self, machine: &MachineRef) -> Result<MachineRecord, LibVmError> {
-        let metadata = self.resolve_metadata(machine)?;
+        let metadata = self.resolve_machine_state(machine)?;
         let pid_path = self.layout.monitor_pid_path(metadata.id);
         let pid = read_monitor_pid(&pid_path).map_err(|err| match err.kind() {
             io::ErrorKind::NotFound => LibVmError::MachineNotRunning {
@@ -318,7 +345,7 @@ impl LibVm {
     }
 
     pub async fn get_status(&self, machine: &MachineRef) -> Result<InspectResponse, LibVmError> {
-        let metadata = self.resolve_metadata(machine)?;
+        let metadata = self.resolve_machine_state(machine)?;
         let monitor_running = self.layout.monitor_pid_path(metadata.id).exists();
         reconcile_network_runtime(&self.layout, &self.state, &metadata, monitor_running)?;
         let (metadata, socket_path) = self.resolve_running_socket(machine)?;
@@ -334,7 +361,7 @@ impl LibVm {
         &self,
         machine: &MachineRef,
     ) -> Result<tokio::net::UnixStream, LibVmError> {
-        let metadata = self.resolve_metadata(machine)?;
+        let metadata = self.resolve_machine_state(machine)?;
         let socket_path = self.layout.monitor_socket_path(metadata.id);
 
         if !self.layout.monitor_pid_path(metadata.id).exists() {
@@ -356,7 +383,7 @@ impl LibVm {
         machine: &MachineRef,
         wait_for_guest_readiness: bool,
     ) -> Result<tokio::net::UnixStream, LibVmError> {
-        let metadata = self.resolve_metadata(machine)?;
+        let metadata = self.resolve_machine_state(machine)?;
         let socket_path = self.layout.monitor_socket_path(metadata.id);
 
         if !self.layout.monitor_pid_path(metadata.id).exists() {
@@ -391,7 +418,7 @@ impl LibVm {
             })
     }
 
-    fn resolve_metadata(&self, machine: &MachineRef) -> Result<MachineMetadata, LibVmError> {
+    fn resolve_machine_state(&self, machine: &MachineRef) -> Result<MachineState, LibVmError> {
         match machine {
             MachineRef::Id(id) => {
                 self.state
@@ -423,18 +450,18 @@ impl LibVm {
         }
     }
 
-    fn machine_record(&self, metadata: MachineMetadata) -> Result<MachineRecord, LibVmError> {
-        let dir = PathBuf::from(&metadata.instance_dir);
+    fn machine_record(&self, machine: MachineState) -> Result<MachineRecord, LibVmError> {
+        let dir = PathBuf::from(&machine.instance_dir);
         let config_path = dir.join(CONFIG_FILE_NAME);
         let config = fs::read_to_string(&config_path)?;
         let spec =
             serde_yaml_ng::from_str(&config).map_err(|source| LibVmError::VmSpecLoadFailed {
-                id: metadata.id,
+                id: machine.id,
                 path: config_path,
                 source,
             })?;
 
-        let pid_path = self.layout.monitor_pid_path(metadata.id);
+        let pid_path = self.layout.monitor_pid_path(machine.id);
         let status = if pid_path.exists() {
             let started_at = std::fs::metadata(&pid_path)
                 .and_then(|m| m.modified())
@@ -448,19 +475,22 @@ impl LibVm {
         };
 
         Ok(MachineRecord {
-            id: metadata.id,
+            id: machine.id,
             spec,
             dir,
             status,
-            created_at: metadata.created_at,
+            created_at: machine.created_at,
+            image_ref: machine.image_ref,
+            labels: machine.labels,
+            metadata: machine.metadata,
         })
     }
 
     fn resolve_running_socket(
         &self,
         machine: &MachineRef,
-    ) -> Result<(MachineMetadata, PathBuf), LibVmError> {
-        let metadata = self.resolve_metadata(machine)?;
+    ) -> Result<(MachineState, PathBuf), LibVmError> {
+        let metadata = self.resolve_machine_state(machine)?;
         if !self.layout.monitor_pid_path(metadata.id).exists() {
             return Err(LibVmError::MachineNotRunning {
                 reference: metadata.name,
@@ -483,6 +513,17 @@ fn assign_mount_tags(mounts: Vec<Mount>) -> Vec<Mount> {
             mount
         })
         .collect()
+}
+
+fn guest_spec_from_request(agent: bool) -> Option<GuestSpec> {
+    agent.then(GuestSpec::default)
+}
+
+fn guest_kernel_cmdline(guest: &Option<GuestSpec>) -> Vec<String> {
+    guest
+        .as_ref()
+        .map(|guest| vec![agent_port_arg(guest.control_port)])
+        .unwrap_or_default()
 }
 
 fn guest_os_from_image(os: &str) -> Result<GuestOs, LibVmError> {
@@ -741,7 +782,14 @@ impl PendingMachine {
         }
         fs::rename(&self.staged_dir, &self.final_dir)?;
 
-        let metadata = metadata_from_path(self.id, self.spec.name.clone(), &self.final_dir);
+        let metadata = machine_state_from_path_with_details(
+            self.id,
+            self.spec.name.clone(),
+            &self.final_dir,
+            self.image_ref.clone(),
+            self.labels.clone(),
+            self.metadata.clone(),
+        );
         if let Err(err) = libvm.state.insert_machine(&metadata) {
             let _ = fs::remove_dir_all(&self.final_dir);
             return Err(err);
@@ -794,7 +842,9 @@ fn create_staging_dir(layout: &Layout) -> Result<PathBuf, LibVmError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_network_driver, LibVm, MachineStatus};
+    use super::{
+        default_network_driver, guest_kernel_cmdline, guest_spec_from_request, LibVm, MachineStatus,
+    };
     use crate::{Layout, LibVmError, MachineRef};
     use bento_core::{
         Architecture, Boot, GuestOs, GuestSpec, Network, NetworkDriver, Platform, Resources,
@@ -833,9 +883,32 @@ mod tests {
         }
     }
 
+    fn create_pending_sample(
+        libvm: &LibVm,
+        name: &str,
+    ) -> Result<super::PendingMachine, LibVmError> {
+        libvm.create_pending(
+            sample_vm_spec(name),
+            "test-image:latest".to_string(),
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+        )
+    }
+
     #[test]
     fn default_create_network_driver_is_gvisor() {
         assert_eq!(default_network_driver(), NetworkDriver::Gvisor);
+    }
+
+    #[test]
+    fn guest_agent_request_controls_guest_spec_and_kernel_arg() {
+        let disabled = guest_spec_from_request(false);
+        assert!(disabled.is_none());
+        assert!(guest_kernel_cmdline(&disabled).is_empty());
+
+        let enabled = guest_spec_from_request(true);
+        assert!(enabled.is_some());
+        assert!(!guest_kernel_cmdline(&enabled).is_empty());
     }
 
     #[test]
@@ -843,9 +916,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp dir");
         let libvm = LibVm::new(Layout::new(temp.path().join("bento"))).expect("create libvm");
 
-        let pending = libvm
-            .create_pending(sample_vm_spec("devbox"))
-            .expect("create pending machine");
+        let pending = create_pending_sample(&libvm, "devbox").expect("create pending machine");
 
         assert!(pending.dir().starts_with(libvm.layout().staging_dir()));
 
@@ -862,8 +933,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp dir");
         let libvm = LibVm::new(Layout::new(temp.path().join("bento"))).expect("create libvm");
 
-        let machine = libvm
-            .create_pending(sample_vm_spec("devbox"))
+        let machine = create_pending_sample(&libvm, "devbox")
             .expect("create pending machine")
             .commit(&libvm)
             .expect("commit machine");
@@ -887,8 +957,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp dir");
         let libvm = LibVm::new(Layout::new(temp.path().join("bento"))).expect("create libvm");
 
-        let machine = libvm
-            .create_pending(sample_vm_spec("devbox"))
+        let machine = create_pending_sample(&libvm, "devbox")
             .expect("create pending machine")
             .commit(&libvm)
             .expect("commit machine");
@@ -906,8 +975,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp dir");
         let libvm = LibVm::new(Layout::new(temp.path().join("bento"))).expect("create libvm");
 
-        let machine = libvm
-            .create_pending(sample_vm_spec("devbox"))
+        let machine = create_pending_sample(&libvm, "devbox")
             .expect("create pending machine")
             .commit(&libvm)
             .expect("commit machine");

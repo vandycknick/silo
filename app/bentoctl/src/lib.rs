@@ -1,15 +1,15 @@
 mod commands;
+mod constants;
+mod profile;
 mod ssh;
 mod terminal;
 
 use crate::commands::BentoCtlCmd;
 use std::process::ExitCode;
 
-use clap::Parser;
 use eyre::Report;
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> ExitCode {
+pub async fn run() -> ExitCode {
     let cmd = BentoCtlCmd::parse();
 
     match cmd.run().await {

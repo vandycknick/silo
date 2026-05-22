@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -6,15 +7,20 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{Layout, LibVmError};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
+const MACHINE_COLUMNS: &str =
+    "id, name, instance_dir, created_at, modified_at, image_ref, json(labels), json(metadata)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MachineMetadata {
+pub struct MachineState {
     pub id: MachineId,
     pub name: String,
     pub instance_dir: String,
     pub created_at: i64,
     pub modified_at: i64,
+    pub image_ref: String,
+    pub labels: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,52 +61,52 @@ impl StateStore {
         Ok(Self { conn })
     }
 
-    pub fn insert_machine(&self, metadata: &MachineMetadata) -> Result<(), LibVmError> {
+    pub fn insert_machine(&self, machine: &MachineState) -> Result<(), LibVmError> {
         self.conn.execute(
-            "INSERT INTO machines (id, name, instance_dir, created_at, modified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO machines (id, name, instance_dir, created_at, modified_at, image_ref, labels, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, jsonb(?7), jsonb(?8))",
             params![
-                metadata.id.to_string(),
-                metadata.name,
-                metadata.instance_dir,
-                metadata.created_at,
-                metadata.modified_at,
+                machine.id.to_string(),
+                machine.name,
+                machine.instance_dir,
+                machine.created_at,
+                machine.modified_at,
+                machine.image_ref,
+                serialize_map("labels", &machine.labels)?,
+                serialize_map("metadata", &machine.metadata)?,
             ],
         )?;
         Ok(())
     }
 
-    pub fn get_machine_by_id(&self, id: MachineId) -> Result<Option<MachineMetadata>, LibVmError> {
+    pub fn get_machine_by_id(&self, id: MachineId) -> Result<Option<MachineState>, LibVmError> {
         self.conn
             .query_row(
-                "SELECT id, name, instance_dir, created_at, modified_at FROM machines WHERE id = ?1",
+                &format!("SELECT {MACHINE_COLUMNS} FROM machines WHERE id = ?1"),
                 params![id.to_string()],
-                row_to_metadata,
+                row_to_machine_state,
             )
             .optional()
             .map_err(LibVmError::from)
     }
 
-    pub fn get_machine_by_name(&self, name: &str) -> Result<Option<MachineMetadata>, LibVmError> {
+    pub fn get_machine_by_name(&self, name: &str) -> Result<Option<MachineState>, LibVmError> {
         self.conn
             .query_row(
-                "SELECT id, name, instance_dir, created_at, modified_at FROM machines WHERE name = ?1",
+                &format!("SELECT {MACHINE_COLUMNS} FROM machines WHERE name = ?1"),
                 params![name],
-                row_to_metadata,
+                row_to_machine_state,
             )
             .optional()
             .map_err(LibVmError::from)
     }
 
-    pub fn get_machine_by_id_prefix(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<MachineMetadata>, LibVmError> {
+    pub fn get_machine_by_id_prefix(&self, prefix: &str) -> Result<Vec<MachineState>, LibVmError> {
         let pattern = format!("{prefix}%");
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, instance_dir, created_at, modified_at FROM machines WHERE id LIKE ?1",
-        )?;
-        let rows = stmt.query_map(params![pattern], row_to_metadata)?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MACHINE_COLUMNS} FROM machines WHERE id LIKE ?1"
+        ))?;
+        let rows = stmt.query_map(params![pattern], row_to_machine_state)?;
         let mut machines = Vec::new();
         for row in rows {
             machines.push(row?);
@@ -108,11 +114,11 @@ impl StateStore {
         Ok(machines)
     }
 
-    pub fn list_machines(&self) -> Result<Vec<MachineMetadata>, LibVmError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, instance_dir, created_at, modified_at FROM machines ORDER BY name",
-        )?;
-        let rows = stmt.query_map([], row_to_metadata)?;
+    pub fn list_machines(&self) -> Result<Vec<MachineState>, LibVmError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MACHINE_COLUMNS} FROM machines ORDER BY name"
+        ))?;
+        let rows = stmt.query_map([], row_to_machine_state)?;
         let mut machines = Vec::new();
         for row in rows {
             machines.push(row?);
@@ -120,10 +126,24 @@ impl StateStore {
         Ok(machines)
     }
 
-    pub fn remove_machine(&self, metadata: &MachineMetadata) -> Result<(), LibVmError> {
+    pub fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError> {
+        for index in 1..10_000u32 {
+            let candidate = format!("{prefix}-{index}");
+            if self.get_machine_by_name(&candidate)?.is_none() {
+                return Ok(candidate);
+            }
+        }
+
+        Err(LibVmError::InvalidMachineName {
+            name: prefix.to_string(),
+            reason: "failed to allocate ephemeral VM name".to_string(),
+        })
+    }
+
+    pub fn remove_machine(&self, machine: &MachineState) -> Result<(), LibVmError> {
         self.conn.execute(
             "DELETE FROM machines WHERE id = ?1",
-            params![metadata.id.to_string()],
+            params![machine.id.to_string()],
         )?;
         Ok(())
     }
@@ -251,11 +271,14 @@ fn open_connection(path: &Path) -> Result<Connection, LibVmError> {
 fn run_migrations(conn: &Connection) -> Result<(), LibVmError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS machines (
-            id           TEXT PRIMARY KEY,
-            name         TEXT NOT NULL UNIQUE,
-            instance_dir TEXT NOT NULL,
-            created_at   INTEGER NOT NULL,
-            modified_at  INTEGER NOT NULL
+            id             TEXT PRIMARY KEY,
+            name           TEXT NOT NULL UNIQUE,
+            instance_dir   TEXT NOT NULL,
+            created_at     INTEGER NOT NULL,
+            modified_at    INTEGER NOT NULL,
+            image_ref      TEXT NOT NULL DEFAULT '',
+            labels         BLOB NOT NULL,
+            metadata       BLOB NOT NULL
         );
         CREATE TABLE IF NOT EXISTS network_instances (
             id                      TEXT PRIMARY KEY,
@@ -295,8 +318,10 @@ fn run_migrations(conn: &Connection) -> Result<(), LibVmError> {
         BEGIN
             SELECT RAISE(ABORT, 'network_attachments.created_at is immutable');
         END;
-        PRAGMA user_version = 1;",
+        ",
     )?;
+
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
     debug_assert_eq!(
         conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
@@ -308,17 +333,42 @@ fn run_migrations(conn: &Connection) -> Result<(), LibVmError> {
     Ok(())
 }
 
-fn row_to_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineMetadata> {
+fn row_to_machine_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineState> {
     let id_str: String = row.get(0)?;
     let id: MachineId = id_str.parse().map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
     })?;
-    Ok(MachineMetadata {
+    let labels = deserialize_map(row, 6)?;
+    let metadata = deserialize_map(row, 7)?;
+    Ok(MachineState {
         id,
         name: row.get(1)?,
         instance_dir: row.get(2)?,
         created_at: row.get(3)?,
         modified_at: row.get(4)?,
+        image_ref: row.get(5)?,
+        labels,
+        metadata,
+    })
+}
+
+fn serialize_map(
+    field: &'static str,
+    values: &BTreeMap<String, String>,
+) -> Result<String, LibVmError> {
+    serde_json::to_string(values).map_err(|err| LibVmError::InvalidCreateRequest {
+        name: field.to_string(),
+        reason: format!("serialize {field}: {err}"),
+    })
+}
+
+fn deserialize_map(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<BTreeMap<String, String>> {
+    let value: String = row.get(index)?;
+    serde_json::from_str(&value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(err))
     })
 }
 
@@ -361,22 +411,48 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-pub fn metadata_from_path(id: MachineId, name: String, instance_dir: &Path) -> MachineMetadata {
+#[cfg(test)]
+pub fn machine_state_from_path(id: MachineId, name: String, instance_dir: &Path) -> MachineState {
+    machine_state_from_path_with_details(
+        id,
+        name,
+        instance_dir,
+        String::new(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    )
+}
+
+pub fn machine_state_from_path_with_details(
+    id: MachineId,
+    name: String,
+    instance_dir: &Path,
+    image_ref: String,
+    labels: BTreeMap<String, String>,
+    metadata: BTreeMap<String, String>,
+) -> MachineState {
     let now = now_unix();
-    MachineMetadata {
+    MachineState {
         id,
         name,
         instance_dir: instance_dir.display().to_string(),
         created_at: now,
         modified_at: now,
+        image_ref,
+        labels,
+        metadata,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use bento_core::MachineId;
 
-    use super::{metadata_from_path, NetworkAttachmentState, NetworkInstanceState, StateStore};
+    use super::{
+        machine_state_from_path, NetworkAttachmentState, NetworkInstanceState, StateStore,
+    };
     use crate::Layout;
 
     fn temp_layout() -> (tempfile::TempDir, Layout) {
@@ -390,7 +466,7 @@ mod tests {
         let (_dir, layout) = temp_layout();
         let store = StateStore::open(&layout).expect("open store");
         let id = MachineId::new();
-        let metadata = metadata_from_path(id, "devbox".to_string(), &layout.instance_dir(id));
+        let metadata = machine_state_from_path(id, "devbox".to_string(), &layout.instance_dir(id));
 
         store.insert_machine(&metadata).expect("insert");
         let found = store
@@ -406,7 +482,7 @@ mod tests {
         let (_dir, layout) = temp_layout();
         let store = StateStore::open(&layout).expect("open store");
         let id = MachineId::new();
-        let metadata = metadata_from_path(id, "testvm".to_string(), &layout.instance_dir(id));
+        let metadata = machine_state_from_path(id, "testvm".to_string(), &layout.instance_dir(id));
 
         store.insert_machine(&metadata).expect("insert");
         let found = store
@@ -422,7 +498,8 @@ mod tests {
         let (_dir, layout) = temp_layout();
         let store = StateStore::open(&layout).expect("open store");
         let id = MachineId::new();
-        let metadata = metadata_from_path(id, "prefix-test".to_string(), &layout.instance_dir(id));
+        let metadata =
+            machine_state_from_path(id, "prefix-test".to_string(), &layout.instance_dir(id));
 
         store.insert_machine(&metadata).expect("insert");
 
@@ -435,6 +512,47 @@ mod tests {
     }
 
     #[test]
+    fn labels_and_metadata_round_trip_as_jsonb_blobs() {
+        let (_dir, layout) = temp_layout();
+        let store = StateStore::open(&layout).expect("open store");
+        let id = MachineId::new();
+        let mut labels = BTreeMap::new();
+        labels.insert("owner".to_string(), "test".to_string());
+        let mut metadata = BTreeMap::new();
+        metadata.insert("bento.profile".to_string(), "rust-dev".to_string());
+
+        let machine = super::machine_state_from_path_with_details(
+            id,
+            "jsonb-test".to_string(),
+            &layout.instance_dir(id),
+            "test-image:latest".to_string(),
+            labels,
+            metadata,
+        );
+
+        store.insert_machine(&machine).expect("insert machine");
+        let found = store
+            .get_machine_by_id(id)
+            .expect("lookup")
+            .expect("machine exists");
+
+        assert_eq!(found.labels.get("owner").map(String::as_str), Some("test"));
+        assert_eq!(
+            found.metadata.get("bento.profile").map(String::as_str),
+            Some("rust-dev")
+        );
+        let storage_type: String = store
+            .conn
+            .query_row(
+                "SELECT typeof(labels) FROM machines WHERE id = ?1",
+                rusqlite::params![id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("query storage type");
+        assert_eq!(storage_type, "blob");
+    }
+
+    #[test]
     fn list_machines_sorted_by_name() {
         let (_dir, layout) = temp_layout();
         let store = StateStore::open(&layout).expect("open store");
@@ -442,14 +560,14 @@ mod tests {
         let id_b = MachineId::new();
         let id_a = MachineId::new();
         store
-            .insert_machine(&metadata_from_path(
+            .insert_machine(&machine_state_from_path(
                 id_b,
                 "bravo".to_string(),
                 &layout.instance_dir(id_b),
             ))
             .expect("insert b");
         store
-            .insert_machine(&metadata_from_path(
+            .insert_machine(&machine_state_from_path(
                 id_a,
                 "alpha".to_string(),
                 &layout.instance_dir(id_a),
@@ -467,7 +585,7 @@ mod tests {
         let (_dir, layout) = temp_layout();
         let store = StateStore::open(&layout).expect("open store");
         let id = MachineId::new();
-        let metadata = metadata_from_path(id, "gonner".to_string(), &layout.instance_dir(id));
+        let metadata = machine_state_from_path(id, "gonner".to_string(), &layout.instance_dir(id));
 
         store.insert_machine(&metadata).expect("insert");
         store.remove_machine(&metadata).expect("remove");
@@ -481,7 +599,7 @@ mod tests {
         let (_dir, layout) = temp_layout();
         let store = StateStore::open(&layout).expect("open store");
         let id = MachineId::new();
-        let metadata = metadata_from_path(id, "netbox".to_string(), &layout.instance_dir(id));
+        let metadata = machine_state_from_path(id, "netbox".to_string(), &layout.instance_dir(id));
         store.insert_machine(&metadata).expect("insert machine");
 
         let network_id = "netbox-runtime".to_string();
@@ -550,7 +668,8 @@ mod tests {
         let (_dir, layout) = temp_layout();
         let store = StateStore::open(&layout).expect("open store");
         let id = MachineId::new();
-        let metadata = metadata_from_path(id, "immutable".to_string(), &layout.instance_dir(id));
+        let metadata =
+            machine_state_from_path(id, "immutable".to_string(), &layout.instance_dir(id));
         store.insert_machine(&metadata).expect("insert machine");
 
         let network_id = "immutable-runtime".to_string();
@@ -606,14 +725,14 @@ mod tests {
         let id1 = MachineId::new();
         let id2 = MachineId::new();
         store
-            .insert_machine(&metadata_from_path(
+            .insert_machine(&machine_state_from_path(
                 id1,
                 "dupe".to_string(),
                 &layout.instance_dir(id1),
             ))
             .expect("insert first");
 
-        let result = store.insert_machine(&metadata_from_path(
+        let result = store.insert_machine(&machine_state_from_path(
             id2,
             "dupe".to_string(),
             &layout.instance_dir(id2),
@@ -629,7 +748,7 @@ mod tests {
 
         let id = MachineId::new();
         store1
-            .insert_machine(&metadata_from_path(
+            .insert_machine(&machine_state_from_path(
                 id,
                 "shared".to_string(),
                 &layout.instance_dir(id),

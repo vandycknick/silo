@@ -86,9 +86,9 @@ In user-facing BentoBox documentation, use "VM" when referring to an instance cr
 
 Examples:
 
-- `bentoctl create dev`
-- `bentoctl start dev`
-- `bentoctl stop dev`
+- `bento create dev rust-dev`
+- `bento start dev`
+- `bento stop dev`
 
 ## Hypervisor
 
@@ -243,7 +243,7 @@ The BentoBox runtime layers sit above the host virtualization stack:
 
 ```mermaid
 flowchart TD
-    CLI[bentoctl]
+    CLI[bento]
     LibVm[bento-libvm]
     Vmmon[bento-vmmon]
     Virt[bento-virt]

@@ -1,6 +1,6 @@
 # BentoBox 🍱
 
-BentoBox is a microVM manager that boots a full Linux environment in seconds. It is highly configurable, so you can tune nearly every aspect of the system. Whether you want a WSL-like development environment on macOS, a fresh Docker Desktop alternative, or a secure sandbox for agentic workflows, BentoBox has you covered. Run it on your laptop, on servers, in the cloud, or wherever you need it.
+BentoBox is a microVM manager that boots a full Linux environment in seconds. It is built around reusable profiles and simple VM lifecycle commands. Whether you want a WSL-like development environment on macOS, a fresh Docker Desktop alternative, or an isolated VM for agentic workflows, BentoBox has you covered.
 
 ## Runtime Backends
 
@@ -28,29 +28,37 @@ Install with Nix profile:
 nix profile install .#bentoctl
 ```
 
+This installs both `bento` and the compatibility alias `bentoctl`.
+
 Or build locally with Nix:
 
 ```bash
 nix build .#bentoctl
-./result/bin/bentoctl --help
+./result/bin/bento --help
 ```
 
 ## Usage
 
 ```text
-Bentobox instance lifecycle control
+BentoBox VM lifecycle control
 
-Usage: bentoctl [OPTIONS] <COMMAND>
+Usage: bento [OPTIONS] <COMMAND>
 
 Commands:
+  run
   create
   start
   stop
+  restart
+  rm
   shell
+  exec
+  logs
+  profile
   delete
   list
   status
-  vmmon
+  inspect
   images
 
 Options:
@@ -58,66 +66,94 @@ Options:
   -h, --help        Print help
 ```
 
-## Quick VM Lifecycle
+## Profiles
 
-Create a VM from an image:
+Profiles are reusable VM definitions stored under `~/.config/bento/profiles/`.
 
-```bash
-bentoctl create dev --image <name-or-oci-ref>
-```
+If `bento run` is used without a profile, BentoBox looks for `default.yaml` or `default.yml` in that directory. If neither exists, it uses a built-in `default` profile based on `ghcr.io/vandycknick/archlinux:latest`.
 
-Enable nested virtualization for supported macOS VZ hosts:
+Create a profile:
 
 ```bash
-bentoctl create dev --image <name-or-oci-ref> --nested-virtualization
+bento profile create rust-dev --image ghcr.io/vandycknick/archlinux:latest --network isolated
 ```
 
-This is currently VZ-only and still depends on host macOS and hardware support.
-
-Enable Rosetta for x86_64 Linux binaries in supported macOS VZ guests:
+List profiles:
 
 ```bash
-bentoctl create dev --image <name-or-oci-ref> --rosetta
+bento profile list
 ```
 
-This currently requires Apple silicon, macOS 13 or newer, and Rosetta to already be installed with `softwareupdate --install-rosetta`.
+## Ephemeral VMs
 
-Enable the Bento guest agent explicitly when you want guest bootstrap artifacts to be injected:
+Run an ephemeral VM from the default profile:
 
 ```bash
-bentoctl create dev --image <name-or-oci-ref> --agent
+bento run
 ```
 
-Images used with `--agent`, `--userdata`, or `--rosetta` are expected to support the current cloud-init/CIDATA bootstrap path. Bentobox assumes that image contract and does not validate it at create time.
+Run from a named profile:
+
+```bash
+bento run rust-dev
+```
+
+Run a command and delete the ephemeral VM when it exits:
+
+```bash
+bento run rust-dev -- cargo test
+```
+
+Ephemeral VM names use the profile name and a 1-based index, such as `rust-dev-1`.
+
+Keep a failed run for debugging:
+
+```bash
+bento run rust-dev --keep-on-failure -- cargo test
+```
+
+## Persistent VMs
+
+Create a persistent VM from a profile:
+
+```bash
+bento create dev rust-dev
+```
+
+Create directly from an image:
+
+```bash
+bento create dev --image ghcr.io/vandycknick/archlinux:latest
+```
 
 Start it:
 
 ```bash
-bentoctl start dev
+bento start dev
 ```
 
 Open a shell:
 
 ```bash
-bentoctl shell dev
+bento shell dev
 ```
 
 Run a single command over SSH, while best-effort `cd`-ing into your current host working directory first:
 
 ```bash
-bentoctl exec dev -- pwd
+bento exec dev -- pwd
 ```
 
 Stop it:
 
 ```bash
-bentoctl stop dev
+bento stop dev
 ```
 
-List instances:
+List persistent VMs:
 
 ```bash
-bentoctl list
+bento list
 ```
 
 ## More Docs
