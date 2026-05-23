@@ -6,7 +6,7 @@ use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
 use crate::commands::profile::{parse_label, parse_network_mode, parse_profile_mount};
-use crate::constants::PROFILE_METADATA_KEY;
+use crate::constants::{NETWORK_POLICY_METADATA_KEY, PROFILE_METADATA_KEY};
 use crate::profile::{
     network_driver_name, resolve_host_path, MountMode, NetworkMode, ProfileStore,
 };
@@ -156,6 +156,9 @@ impl Cmd {
             if let Some(network_override) = self.overrides.network {
                 network = network_override;
             }
+            if network == NetworkMode::Isolated {
+                insert_network_policy_metadata(&mut metadata, &named.profile)?;
+            }
             return Ok(ResolvedCreate::new(
                 image_ref,
                 labels,
@@ -192,6 +195,24 @@ impl Cmd {
             &self.overrides,
         ))
     }
+}
+
+fn insert_network_policy_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    profile: &crate::profile::Profile,
+) -> eyre::Result<()> {
+    let Some(policy) = profile
+        .network
+        .as_ref()
+        .and_then(|network| network.policy.as_ref())
+    else {
+        return Ok(());
+    };
+    metadata.insert(
+        NETWORK_POLICY_METADATA_KEY.to_string(),
+        serde_json::to_string(policy)?,
+    );
+    Ok(())
 }
 
 struct ResolvedCreate {

@@ -6,7 +6,7 @@ use bento_libvm::{CreateMachineRequest, LibVm, MachineRef};
 use clap::Args;
 
 use crate::commands::create::{profile_mount_to_mount, VmOverrideArgs};
-use crate::constants::{DEFAULT_PROFILE_NAME, PROFILE_METADATA_KEY};
+use crate::constants::{DEFAULT_PROFILE_NAME, NETWORK_POLICY_METADATA_KEY, PROFILE_METADATA_KEY};
 use crate::profile::{network_driver_name, NetworkMode, ProfileStore};
 use crate::ssh;
 
@@ -112,6 +112,7 @@ impl Cmd {
         let mut metadata = BTreeMap::new();
         let mut mounts = Vec::<Mount>::new();
         let mut network = NetworkMode::Isolated;
+        let mut network_policy_metadata = None;
         let mut ssh_enabled = true;
         let image_ref;
         let prefix;
@@ -137,6 +138,7 @@ impl Cmd {
                 .unwrap_or(true);
             labels = named.profile.labels.clone();
             metadata.insert(PROFILE_METADATA_KEY.to_string(), named.name.clone());
+            network_policy_metadata = network_policy_json(&named.profile)?;
             mounts = named.profile.resolved_mounts()?;
             prefix = named.name.clone();
         }
@@ -149,6 +151,11 @@ impl Cmd {
         }
         if let Some(network_override) = self.overrides.network {
             network = network_override;
+        }
+        if network == NetworkMode::Isolated {
+            if let Some(policy) = network_policy_metadata {
+                metadata.insert(NETWORK_POLICY_METADATA_KEY.to_string(), policy);
+            }
         }
 
         let name = libvm.allocate_ephemeral_name(&prefix)?;
@@ -171,6 +178,17 @@ impl Cmd {
             disks: self.overrides.disks.clone(),
         })
     }
+}
+
+fn network_policy_json(profile: &crate::profile::Profile) -> eyre::Result<Option<String>> {
+    let Some(policy) = profile
+        .network
+        .as_ref()
+        .and_then(|network| network.policy.as_ref())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::to_string(policy)?))
 }
 
 struct ResolvedRun {

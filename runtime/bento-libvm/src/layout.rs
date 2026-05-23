@@ -76,6 +76,14 @@ impl Layout {
         self.network_instance_dir(network_id).join("runtime.json")
     }
 
+    pub fn network_policy_path(&self, network_id: &str) -> PathBuf {
+        self.network_instance_dir(network_id).join("policy.json")
+    }
+
+    pub fn network_audit_log_path(&self, network_id: &str) -> PathBuf {
+        self.network_instance_dir(network_id).join("audit.jsonl")
+    }
+
     pub fn gvproxy_socket_path(&self, network_id: &str) -> PathBuf {
         self.network_instance_dir(network_id).join("gvproxy.sock")
     }
@@ -203,6 +211,14 @@ mod tests {
         assert_eq!(
             layout.network_runtime_path(network_id),
             PathBuf::from("/tmp/bento/net/net123/runtime.json")
+        );
+        assert_eq!(
+            layout.network_policy_path(network_id),
+            PathBuf::from("/tmp/bento/net/net123/policy.json")
+        );
+        assert_eq!(
+            layout.network_audit_log_path(network_id),
+            PathBuf::from("/tmp/bento/net/net123/audit.jsonl")
         );
         assert_eq!(
             layout.gvproxy_socket_path(network_id),

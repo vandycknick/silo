@@ -51,6 +51,54 @@ pub(crate) struct ProfileMount {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfileNetwork {
     pub mode: NetworkMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<NetworkPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NetworkPolicy {
+    #[serde(default = "default_policy_action")]
+    pub default_action: PolicyAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_log: Option<AuditLogPolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cidr_rules: Vec<CidrRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuditLogPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CidrRule {
+    pub name: String,
+    pub action: PolicyAction,
+    pub dest_cidrs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocols: Vec<PolicyProtocol>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PolicyAction {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PolicyProtocol {
+    Tcp,
+    Udp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +288,65 @@ pub(crate) fn validate_profile(profile: &Profile) -> eyre::Result<()> {
             bail!("ssh.authorizedKeys is not supported yet; guest agent support is still needed");
         }
     }
+    if let Some(network) = &profile.network {
+        if network.policy.is_some() && network.mode != NetworkMode::Isolated {
+            bail!("network.policy is only supported with network.mode: isolated");
+        }
+        if let Some(policy) = &network.policy {
+            validate_network_policy(policy)?;
+            if let Some(path) = policy
+                .audit_log
+                .as_ref()
+                .and_then(|audit| audit.path.as_ref())
+            {
+                if !path.is_absolute() {
+                    bail!(
+                        "network.policy.audit_log.path must be absolute: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_network_policy(policy: &NetworkPolicy) -> eyre::Result<()> {
+    let mut names = BTreeMap::new();
+    for rule in &policy.cidr_rules {
+        if rule.name.trim().is_empty() {
+            bail!("network.policy.cidr_rules.name cannot be empty");
+        }
+        if names.insert(rule.name.clone(), ()).is_some() {
+            bail!("duplicate network.policy.cidr_rules name `{}`", rule.name);
+        }
+        if rule.dest_cidrs.is_empty() {
+            bail!(
+                "network.policy.cidr_rules `{}` requires dest_cidrs",
+                rule.name
+            );
+        }
+        for cidr in &rule.dest_cidrs {
+            validate_cidr(cidr)
+                .with_context(|| format!("invalid CIDR in rule `{}`: {cidr}", rule.name))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_cidr(cidr: &str) -> eyre::Result<()> {
+    let Some((ip, prefix)) = cidr.split_once('/') else {
+        bail!("missing prefix length");
+    };
+    let ip: std::net::IpAddr = ip.parse().context("parse IP address")?;
+    let prefix: u8 = prefix.parse().context("parse prefix length")?;
+    let max = match ip {
+        std::net::IpAddr::V4(_) => 32,
+        std::net::IpAddr::V6(_) => 128,
+    };
+    if prefix > max {
+        bail!("prefix length {prefix} exceeds {max}");
+    }
     Ok(())
 }
 
@@ -280,6 +387,7 @@ fn built_in_default_profile() -> NamedProfile {
             mounts: Vec::new(),
             network: Some(ProfileNetwork {
                 mode: NetworkMode::Isolated,
+                policy: None,
             }),
             ssh: Some(ProfileSsh {
                 enabled: true,
@@ -340,4 +448,87 @@ fn profile_name_from_path(path: &Path) -> eyre::Result<String> {
 
 fn default_mount_mode() -> MountMode {
     MountMode::Rw
+}
+
+fn default_policy_action() -> PolicyAction {
+    PolicyAction::Allow
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::profile::parse_profile;
+
+    #[test]
+    fn parses_isolated_network_policy() {
+        let profile = parse_profile(
+            r#"
+version: "1"
+image:
+  ref: "ubuntu:24.04"
+network:
+  mode: isolated
+  policy:
+    default_action: allow
+    audit_log:
+      enabled: true
+    cidr_rules:
+      - name: deny-private
+        action: deny
+        protocols: [tcp, udp]
+        dest_cidrs: ["10.0.0.0/8"]
+        reason: "private range blocked"
+"#,
+        )
+        .expect("parse profile");
+
+        let policy = profile
+            .network
+            .as_ref()
+            .and_then(|network| network.policy.as_ref())
+            .expect("network policy");
+        assert_eq!(policy.cidr_rules.len(), 1);
+        assert!(policy.audit_log.as_ref().is_some_and(|audit| audit.enabled));
+    }
+
+    #[test]
+    fn rejects_policy_on_non_isolated_network() {
+        let err = parse_profile(
+            r#"
+version: "1"
+image:
+  ref: "ubuntu:24.04"
+network:
+  mode: none
+  policy:
+    cidr_rules:
+      - name: deny-private
+        action: deny
+        dest_cidrs: ["10.0.0.0/8"]
+"#,
+        )
+        .expect_err("policy on network none should fail");
+
+        assert!(err.to_string().contains("network.policy"));
+    }
+
+    #[test]
+    fn rejects_observe_policy_action() {
+        let err = parse_profile(
+            r#"
+version: "1"
+image:
+  ref: "ubuntu:24.04"
+network:
+  mode: isolated
+  policy:
+    cidr_rules:
+      - name: observe-private
+        action: observe
+        dest_cidrs: ["10.0.0.0/8"]
+"#,
+        )
+        .expect_err("observe action should fail");
+
+        assert!(err.to_string().contains("deserialize profile yaml"));
+    }
 }

@@ -24,6 +24,13 @@ pub struct NetworkingConfig {
 pub struct GvisorConfig {
     pub subnet: String,
     pub pcap: bool,
+    pub helper: GvisorHelper,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GvisorHelper {
+    Gvproxy,
+    BentoNetd,
 }
 
 impl GlobalConfig {
@@ -104,6 +111,7 @@ struct RawNetworkDriversConfig {
 struct RawGvisorConfig {
     subnet: Option<String>,
     pcap: Option<bool>,
+    helper: Option<String>,
 }
 
 impl Default for GvisorConfig {
@@ -111,6 +119,7 @@ impl Default for GvisorConfig {
         Self {
             subnet: "192.168.105.0/24".to_string(),
             pcap: false,
+            helper: GvisorHelper::Gvproxy,
         }
     }
 }
@@ -121,7 +130,19 @@ impl From<RawGvisorConfig> for GvisorConfig {
         Self {
             subnet: raw.subnet.unwrap_or(default.subnet),
             pcap: raw.pcap.unwrap_or(default.pcap),
+            helper: raw
+                .helper
+                .as_deref()
+                .map(parse_gvisor_helper)
+                .unwrap_or(default.helper),
         }
+    }
+}
+
+fn parse_gvisor_helper(value: &str) -> GvisorHelper {
+    match value {
+        "bento-netd" => GvisorHelper::BentoNetd,
+        _ => GvisorHelper::Gvproxy,
     }
 }
 
@@ -172,9 +193,10 @@ guest:
 networking:
   userspace: gvisor
   drivers:
-    gvisor:
-      subnet: "192.168.105.0/24"
-      pcap: true
+      gvisor:
+        subnet: "192.168.105.0/24"
+        pcap: true
+        helper: bento-netd
 "#,
         )
         .expect("parse config");
@@ -185,6 +207,7 @@ networking:
             GvisorConfig {
                 subnet: "192.168.105.0/24".to_string(),
                 pcap: true,
+                helper: GvisorHelper::BentoNetd,
             }
         );
     }

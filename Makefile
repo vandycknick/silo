@@ -27,6 +27,13 @@ $(error PROFILE must be debug or release)
 endif
 
 VMMON_BIN := target/$(TARGET_PROFILE_DIR)/vmmon
+BENTO_NETD_BIN := target/$(TARGET_PROFILE_DIR)/bento-netd
+
+ifeq ($(PROFILE),release)
+GO_BUILD_FLAGS := -ldflags "-s -w"
+else
+GO_BUILD_FLAGS :=
+endif
 
 .PHONY: build-guest-agent
 build-guest-agent:
@@ -36,7 +43,7 @@ build-guest-agent:
 	@echo "Updated $(BENTO_CONFIG) -> $(GUEST_BIN)"
 
 .PHONY: build
-build: vmmon krun
+build: vmmon krun bento-netd
 	cargo build $(CARGO_PROFILE_FLAGS) -p bentoctl
 
 .PHONY: clippy
@@ -59,6 +66,11 @@ vmmon:
 .PHONY: krun
 krun:
 	cargo build $(CARGO_PROFILE_FLAGS) -p bento-krun --features krun-bin --bin krun
+
+.PHONY: bento-netd
+bento-netd:
+	@mkdir -p "target/$(TARGET_PROFILE_DIR)"
+	cd net/bento-netd && go build $(GO_BUILD_FLAGS) -o "$(CURDIR)/$(BENTO_NETD_BIN)" ./cmd/bento-netd
 
 .PHONY: kernel
 kernel:

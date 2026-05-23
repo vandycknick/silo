@@ -12,14 +12,17 @@ use nix::unistd::Pid;
 use serde::Serialize;
 use tokio::time::sleep;
 
-use crate::global_config::GlobalConfig;
+use crate::global_config::{GlobalConfig, GvisorHelper};
 use crate::state::{MachineState, NetworkAttachmentState, NetworkInstanceState, StateStore};
 use crate::{Layout, LibVmError};
 
 const GVPROXY_BINARY_ENV: &str = "GVPROXY_BIN";
 const GVPROXY_BINARY_NAME: &str = "gvproxy";
+const BENTO_NETD_BINARY_ENV: &str = "BENTO_NETD_BIN";
+const BENTO_NETD_BINARY_NAME: &str = "bento-netd";
 const GVPROXY_DISABLE_SSH_PORT: &str = "-1";
 const GVISOR_DRIVER: &str = "gvisor";
+const NETWORK_POLICY_METADATA_KEY: &str = "bento.network.policy";
 const RUNNING_STATE: &str = "running";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -114,20 +117,34 @@ async fn prepare_gvisor_network_runtime(
     let socket_path = layout.gvproxy_socket_path(&network_id);
     let log_path = layout.gvproxy_log_path(&network_id);
     let pid_path = layout.gvproxy_pid_path(&network_id);
+    let policy_path = layout.network_policy_path(&network_id);
+    let default_audit_log_path = layout.network_audit_log_path(&network_id);
     let pcap_path = gvisor.pcap.then(|| layout.gvproxy_pcap_path(&network_id));
     remove_file_if_exists(&socket_path)?;
     remove_file_if_exists(&layout.network_runtime_path(&network_id))?;
+    remove_file_if_exists(&policy_path)?;
+    remove_file_if_exists(&default_audit_log_path)?;
     remove_file_if_exists(&pid_path)?;
+    let policy_file = write_network_policy_file(metadata, &policy_path)?;
 
     let log = File::options().create(true).append(true).open(&log_path)?;
-    let mut command = Command::new(resolve_gvproxy_binary());
-    configure_gvproxy_command(
+    let mut command = Command::new(resolve_network_helper_binary(gvisor.helper));
+    configure_network_helper_command(
         &mut command,
-        &socket_path,
-        &gvisor.subnet,
-        &log_path,
-        &pid_path,
-        pcap_path.as_deref(),
+        &NetworkHelperCommandConfig {
+            helper: gvisor.helper,
+            socket_path: &socket_path,
+            subnet: &gvisor.subnet,
+            log_path: &log_path,
+            pid_path: &pid_path,
+            pcap_path: pcap_path.as_deref(),
+            machine_id: metadata.id,
+            network_id: &network_id,
+            policy_path: policy_file.as_ref().map(|policy| policy.path.as_path()),
+            audit_log_path: policy_file
+                .as_ref()
+                .and_then(|policy| policy.audit_enabled.then_some(policy.audit_path.as_path())),
+        },
     );
     command
         .stdin(Stdio::null())
@@ -143,11 +160,11 @@ async fn prepare_gvisor_network_runtime(
 
     let mut child = command.spawn().map_err(|err| LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
-        message: format!("spawn gvproxy: {err}"),
+        message: format!("spawn userspace network helper: {err}"),
     })?;
     let pid = i32::try_from(child.id()).map_err(|_| LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
-        message: "gvproxy pid does not fit in i32".to_string(),
+        message: "userspace network helper pid does not fit in i32".to_string(),
     })?;
 
     if let Err(err) = wait_for_socket(&socket_path).await {
@@ -189,27 +206,49 @@ async fn prepare_gvisor_network_runtime(
     Ok(())
 }
 
-fn configure_gvproxy_command(
+struct NetworkHelperCommandConfig<'a> {
+    helper: GvisorHelper,
+    socket_path: &'a Path,
+    subnet: &'a str,
+    log_path: &'a Path,
+    pid_path: &'a Path,
+    pcap_path: Option<&'a Path>,
+    machine_id: MachineId,
+    network_id: &'a str,
+    policy_path: Option<&'a Path>,
+    audit_log_path: Option<&'a Path>,
+}
+
+fn configure_network_helper_command(
     command: &mut Command,
-    socket_path: &Path,
-    subnet: &str,
-    log_path: &Path,
-    pid_path: &Path,
-    pcap_path: Option<&Path>,
+    config: &NetworkHelperCommandConfig<'_>,
 ) {
     command
         .arg("--listen-vfkit")
-        .arg(format!("unixgram://{}", socket_path.display()))
+        .arg(format!("unixgram://{}", config.socket_path.display()))
         .arg("--ssh-port")
         .arg(GVPROXY_DISABLE_SSH_PORT)
         .arg("--subnet")
-        .arg(subnet)
+        .arg(config.subnet)
         .arg("--log-file")
-        .arg(log_path)
+        .arg(config.log_path)
         .arg("--pid-file")
-        .arg(pid_path);
-    if let Some(path) = pcap_path {
+        .arg(config.pid_path);
+    if let Some(path) = config.pcap_path {
         command.arg("--pcap").arg(path);
+    }
+    if config.helper == GvisorHelper::BentoNetd {
+        command
+            .arg("--vm-id")
+            .arg(config.machine_id.to_string())
+            .arg("--network-id")
+            .arg(config.network_id);
+        if let Some(path) = config.policy_path {
+            command.arg("--policy-file").arg(path);
+        }
+        if let Some(path) = config.audit_log_path {
+            command.arg("--audit-log").arg(path);
+        }
     }
 }
 
@@ -264,6 +303,46 @@ fn write_runtime_file(
     Ok(())
 }
 
+fn write_network_policy_file(
+    metadata: &MachineState,
+    path: &Path,
+) -> Result<Option<NetworkPolicyFile>, LibVmError> {
+    let Some(policy) = metadata.metadata.get(NETWORK_POLICY_METADATA_KEY) else {
+        return Ok(None);
+    };
+    fs::write(path, policy)?;
+    Ok(Some(network_policy_file(path, policy)))
+}
+
+struct NetworkPolicyFile {
+    path: std::path::PathBuf,
+    audit_enabled: bool,
+    audit_path: std::path::PathBuf,
+}
+
+fn network_policy_file(path: &Path, policy: &str) -> NetworkPolicyFile {
+    let parsed = serde_json::from_str::<serde_json::Value>(policy).ok();
+    let audit_enabled = parsed
+        .as_ref()
+        .and_then(|value| value.get("audit_log")?.get("enabled")?.as_bool())
+        .unwrap_or(false)
+        || parsed
+            .as_ref()
+            .and_then(|value| value.get("audit_log")?.get("path")?.as_str())
+            .is_some();
+    let audit_path = parsed
+        .as_ref()
+        .and_then(|value| value.get("audit_log")?.get("path")?.as_str())
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| path.with_file_name("audit.jsonl"));
+    NetworkPolicyFile {
+        path: path.to_path_buf(),
+        audit_enabled,
+        audit_path,
+    }
+}
+
 pub(crate) fn mac_from_machine_id(machine_id: MachineId) -> [u8; 6] {
     let id = machine_id.to_string();
     let bytes = id.as_bytes();
@@ -297,14 +376,32 @@ async fn wait_for_socket(path: &Path) -> Result<(), String> {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("gvproxy did not create socket {}", path.display()));
+            return Err(format!(
+                "userspace network helper did not create socket {}",
+                path.display()
+            ));
         }
         sleep(READY_POLL_INTERVAL).await;
     }
 }
 
-fn resolve_gvproxy_binary() -> String {
-    std::env::var(GVPROXY_BINARY_ENV).unwrap_or_else(|_| GVPROXY_BINARY_NAME.to_string())
+fn resolve_network_helper_binary(helper: GvisorHelper) -> String {
+    match helper {
+        GvisorHelper::Gvproxy => {
+            std::env::var(GVPROXY_BINARY_ENV).unwrap_or_else(|_| GVPROXY_BINARY_NAME.to_string())
+        }
+        GvisorHelper::BentoNetd => std::env::var(BENTO_NETD_BINARY_ENV)
+            .unwrap_or_else(|_| resolve_sibling_binary(BENTO_NETD_BINARY_NAME)),
+    }
+}
+
+fn resolve_sibling_binary(name: &str) -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(name)))
+        .filter(|path| path.exists())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| name.to_string())
 }
 
 fn process_is_alive(pid: i32) -> bool {
@@ -366,7 +463,11 @@ fn now_unix() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{configure_gvproxy_command, host_uses_user_network_runtime, write_runtime_file};
+    use super::{
+        configure_network_helper_command, host_uses_user_network_runtime, write_runtime_file,
+        NetworkHelperCommandConfig,
+    };
+    use crate::global_config::GvisorHelper;
     use std::path::Path;
     use std::process::Command;
 
@@ -402,13 +503,20 @@ mod tests {
     #[test]
     fn gvproxy_command_disables_default_ssh_forward() {
         let mut command = Command::new("gvproxy");
-        configure_gvproxy_command(
+        configure_network_helper_command(
             &mut command,
-            Path::new("/tmp/bento-net/gvproxy.sock"),
-            "192.168.105.0/24",
-            Path::new("/tmp/bento-net/gvproxy.log"),
-            Path::new("/tmp/bento-net/gvproxy.pid"),
-            None,
+            &NetworkHelperCommandConfig {
+                helper: GvisorHelper::Gvproxy,
+                socket_path: Path::new("/tmp/bento-net/gvproxy.sock"),
+                subnet: "192.168.105.0/24",
+                log_path: Path::new("/tmp/bento-net/gvproxy.log"),
+                pid_path: Path::new("/tmp/bento-net/gvproxy.pid"),
+                pcap_path: None,
+                machine_id: bento_core::MachineId::new(),
+                network_id: "net123",
+                policy_path: None,
+                audit_log_path: None,
+            },
         );
 
         let args = command
@@ -417,5 +525,45 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(args.windows(2).any(|window| window == ["--ssh-port", "-1"]));
+    }
+
+    #[test]
+    fn bento_netd_command_adds_policy_metadata() {
+        let mut command = Command::new("bento-netd");
+        let machine_id = bento_core::MachineId::new();
+        configure_network_helper_command(
+            &mut command,
+            &NetworkHelperCommandConfig {
+                helper: GvisorHelper::BentoNetd,
+                socket_path: Path::new("/tmp/bento-net/gvproxy.sock"),
+                subnet: "192.168.105.0/24",
+                log_path: Path::new("/tmp/bento-net/gvproxy.log"),
+                pid_path: Path::new("/tmp/bento-net/gvproxy.pid"),
+                pcap_path: None,
+                machine_id,
+                network_id: "net123",
+                policy_path: Some(Path::new("/tmp/bento-net/policy.json")),
+                audit_log_path: Some(Path::new("/tmp/bento-net/audit.jsonl")),
+            },
+        );
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(args
+            .windows(2)
+            .any(|window| window[0] == "--vm-id" && window[1] == machine_id.to_string()));
+        assert!(args
+            .windows(2)
+            .any(|window| window[0] == "--network-id" && window[1] == "net123"));
+        assert!(!args.iter().any(|arg| arg == "--policy-mode"));
+        assert!(args.windows(2).any(
+            |window| window[0] == "--policy-file" && window[1] == "/tmp/bento-net/policy.json"
+        ));
+        assert!(args
+            .windows(2)
+            .any(|window| window[0] == "--audit-log" && window[1] == "/tmp/bento-net/audit.jsonl"));
     }
 }

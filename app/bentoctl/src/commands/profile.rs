@@ -197,7 +197,10 @@ fn create_profile(store: &ProfileStore, cmd: &CreateCmd) -> eyre::Result<()> {
             reference: cmd.image.clone(),
         },
         mounts: cmd.mounts.clone(),
-        network: Some(ProfileNetwork { mode: cmd.network }),
+        network: Some(ProfileNetwork {
+            mode: cmd.network,
+            policy: None,
+        }),
         ssh: Some(ProfileSsh {
             enabled: cmd.ssh && !cmd.no_ssh,
             github_users: Vec::new(),
