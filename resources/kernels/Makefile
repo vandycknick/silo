@@ -4,11 +4,11 @@ KERNEL_VERSION := $(strip $(KERNEL_VERSION))
 
 ifeq ($(KERNEL_VERSION),)
 ifeq ($(TRACK),stable)
-KERNEL_VERSION := 6.19.7
+KERNEL_VERSION := 7.0.10
 else ifeq ($(TRACK),longterm)
-KERNEL_VERSION := 6.18.17
+KERNEL_VERSION := 6.18.33
 else ifeq ($(TRACK),longterm5)
-KERNEL_VERSION := 5.15.202
+KERNEL_VERSION := 5.15.208
 endif
 endif
 
