@@ -3,13 +3,17 @@ use std::os::fd::IntoRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 
-use bento_krun::{validate_config, KrunConfig, DEFAULT_ID};
+use bento_krun::{
+    validate_config, KrunConfig, NetTap, NetUnixgram, NetUnixstream, Network, DEFAULT_ID,
+};
 use bento_krun_sys::{ctx, DiskFormat, Feature, KernelFormat, SyncMode};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use nix::sys::socket::{setsockopt, sockopt};
 
 #[path = "../internal/parse.rs"]
 mod parse;
+#[path = "../watchdog.rs"]
+mod watchdog;
 
 const LOCAL_SOCKET_ID_LEN: usize = 12;
 const DEFAULT_SOCKET_BUF_SIZE: usize = 7 * 1024 * 1024;
@@ -22,37 +26,75 @@ const SOCKET_SNDBUF: usize = 65_562 - 12;
 const SOCKET_SNDBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
 
 #[derive(Debug, Parser)]
-#[command(name = "krun", about = "BentoBox libkrun helper")]
+#[command(
+    name = "krun",
+    about = "BentoBox libkrun helper",
+    after_help = "Examples:\n  krun --kernel ./vmlinux --initramfs ./initramfs.img --network none\n  krun --kernel ./vmlinux --net-peer /tmp/gvproxy.sock --net-mac 02:94:ef:e4:0c:ee --network unixgram\n  krun --kernel ./vmlinux --net-peer /tmp/passt.sock --net-mac 02:94:ef:e4:0c:ef --network unixstream\n  krun --kernel ./vmlinux --net-tap-name tap0 --net-mac 02:94:ef:e4:0c:f0 --network tap\n"
+)]
 struct Cli {
+    /// Stable VM identifier used for helper-owned socket names.
     #[arg(long, default_value = DEFAULT_ID)]
     id: String,
+    /// Number of virtual CPUs.
     #[arg(long, default_value_t = 1)]
     cpus: u8,
+    /// Guest memory size in MiB.
     #[arg(long, default_value_t = 512)]
     memory_mib: u32,
+    /// Raw Linux kernel image path.
     #[arg(long)]
     kernel: Option<PathBuf>,
+    /// Optional initramfs image path.
     #[arg(long)]
     initramfs: Option<PathBuf>,
+    /// Extra kernel command-line fragment. May be passed multiple times.
     #[arg(long = "cmdline")]
     cmdline: Vec<String>,
+    /// Add a raw virtio-blk disk. Format: BLOCK_ID:PATH:ro|rw.
     #[arg(long = "disk", value_parser = parse::disk)]
     disks: Vec<bento_krun::Disk>,
+    /// Add a virtiofs mount. Format: TAG:PATH:ro|rw.
     #[arg(long = "mount", value_parser = parse::mount)]
     mounts: Vec<bento_krun::Mount>,
+    /// Add a vsock port mapping. Format: PORT:PATH:connect|listen.
     #[arg(long = "vsock-port", value_parser = parse::vsock_port)]
     vsock_ports: Vec<bento_krun::VsockPort>,
-    #[arg(long = "net-unixgram", value_parser = parse::net_unixgram)]
-    net_unixgrams: Vec<bento_krun::NetUnixgram>,
+    /// Explicit networking backend. Defaults to no guest networking.
+    #[arg(long = "network", value_enum, default_value_t = NetworkArg::None)]
+    network: NetworkArg,
+    /// Userspace network socket path for unixgram or unixstream networking.
+    #[arg(long = "net-peer")]
+    net_peer: Option<PathBuf>,
+    /// Guest virtio-net MAC address for unixgram, unixstream, or tap networking.
+    #[arg(long = "net-mac", value_parser = parse::mac)]
+    net_mac: Option<[u8; 6]>,
+    /// Host TAP interface name for tap networking. Linux only.
+    #[arg(long = "net-tap-name")]
+    net_tap_name: Option<String>,
+    /// Attach stdin/stdout/stderr to an explicit hvc0 virtio console.
     #[arg(long)]
     stdio_console: bool,
-    #[arg(long)]
-    disable_implicit_vsock: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum NetworkArg {
+    None,
+    Unixgram,
+    Unixstream,
+    Tap,
 }
 
 impl Cli {
-    fn into_config(self) -> KrunConfig {
-        KrunConfig {
+    fn into_config(self) -> eyre::Result<KrunConfig> {
+        let network = self.network()?;
+        reject_unused_network_args(
+            &network,
+            self.net_peer.as_ref(),
+            self.net_mac,
+            self.net_tap_name.as_deref(),
+        )?;
+
+        Ok(KrunConfig {
             id: self.id,
             cpus: self.cpus,
             memory_mib: self.memory_mib,
@@ -62,16 +104,90 @@ impl Cli {
             disks: self.disks,
             mounts: self.mounts,
             vsock_ports: self.vsock_ports,
-            net_unixgrams: self.net_unixgrams,
+            network,
             stdio_console: self.stdio_console,
-            disable_implicit_vsock: self.disable_implicit_vsock,
+        })
+    }
+
+    fn network(&self) -> eyre::Result<Network> {
+        match self.network {
+            NetworkArg::None => Ok(Network::None),
+            NetworkArg::Unixgram => Ok(Network::Unixgram(NetUnixgram {
+                peer_path: required_path(self.net_peer.as_ref(), "--net-peer", "unixgram")?,
+                mac: required_mac(self.net_mac, "unixgram")?,
+            })),
+            NetworkArg::Unixstream => Ok(Network::Unixstream(NetUnixstream {
+                peer_path: required_path(self.net_peer.as_ref(), "--net-peer", "unixstream")?,
+                mac: required_mac(self.net_mac, "unixstream")?,
+            })),
+            NetworkArg::Tap => Ok(Network::Tap(NetTap {
+                name: required_string(self.net_tap_name.as_deref(), "--net-tap-name", "tap")?,
+                mac: required_mac(self.net_mac, "tap")?,
+            })),
         }
     }
 }
 
+fn required_path(
+    path: Option<&PathBuf>,
+    flag: &'static str,
+    mode: &'static str,
+) -> eyre::Result<PathBuf> {
+    path.cloned()
+        .ok_or_else(|| eyre::eyre!("--network {mode} requires {flag}"))
+}
+
+fn required_string(
+    value: Option<&str>,
+    flag: &'static str,
+    mode: &'static str,
+) -> eyre::Result<String> {
+    value
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| eyre::eyre!("--network {mode} requires {flag}"))
+}
+
+fn required_mac(mac: Option<[u8; 6]>, mode: &'static str) -> eyre::Result<[u8; 6]> {
+    mac.ok_or_else(|| eyre::eyre!("--network {mode} requires --net-mac"))
+}
+
+fn reject_unused_network_args(
+    network: &Network,
+    net_peer: Option<&PathBuf>,
+    net_mac: Option<[u8; 6]>,
+    net_tap_name: Option<&str>,
+) -> eyre::Result<()> {
+    match network {
+        Network::None => {
+            reject_arg(net_peer.is_some(), "--net-peer", "--network none")?;
+            reject_arg(net_mac.is_some(), "--net-mac", "--network none")?;
+            reject_arg(net_tap_name.is_some(), "--net-tap-name", "--network none")?;
+        }
+        Network::Unixgram(_) | Network::Unixstream(_) => {
+            reject_arg(
+                net_tap_name.is_some(),
+                "--net-tap-name",
+                "unix socket networking",
+            )?;
+        }
+        Network::Tap(_) => {
+            reject_arg(net_peer.is_some(), "--net-peer", "--network tap")?;
+        }
+    }
+    Ok(())
+}
+
+fn reject_arg(present: bool, flag: &'static str, mode: &'static str) -> eyre::Result<()> {
+    if present {
+        eyre::bail!("{flag} cannot be used with {mode}");
+    }
+    Ok(())
+}
+
 fn main() -> eyre::Result<()> {
+    watchdog::start_from_env();
     let cli = Cli::parse();
-    let config = cli.into_config();
+    let config = cli.into_config()?;
     validate_config(&config)?;
     start_enter(&config)?;
     Ok(())
@@ -90,6 +206,8 @@ fn start_enter(config: &KrunConfig) -> eyre::Result<()> {
 
 fn configure_ctx(ctx_id: u32, config: &KrunConfig) -> eyre::Result<()> {
     ctx::set_vm_config(ctx_id, config.cpus, config.memory_mib)?;
+    ctx::disable_implicit_console(ctx_id)?;
+    ctx::disable_implicit_vsock(ctx_id)?;
 
     if let Some(kernel) = config.kernel.as_ref() {
         let cmdline = (!config.cmdline.is_empty()).then(|| config.cmdline.join(" "));
@@ -129,24 +247,33 @@ fn configure_ctx(ctx_id: u32, config: &KrunConfig) -> eyre::Result<()> {
         )?;
     }
 
+    if !config.vsock_ports.is_empty() {
+        ctx::add_vsock(ctx_id, 0)?;
+    }
     for port in &config.vsock_ports {
         ctx::add_vsock_port2(ctx_id, port.port, &path_string(&port.path), port.listen)?;
     }
 
-    for net in &config.net_unixgrams {
-        require_feature(Feature::Net, "userspace networking (--net-unixgram)")?;
-        let socket = open_local_unix_datagram_socket(&net.peer_path, &config.id, "krun")?;
-        ctx::add_net_unixgram_fd(ctx_id, socket.into_raw_fd(), net.mac)?;
+    match &config.network {
+        Network::None => {}
+        Network::Unixgram(net) => {
+            require_feature(Feature::Net, "unixgram networking (--network unixgram)")?;
+            let socket = open_local_unix_datagram_socket(&net.peer_path, &config.id, "krun")?;
+            ctx::add_net_unixgram_fd(ctx_id, socket.into_raw_fd(), net.mac)?;
+        }
+        Network::Unixstream(net) => {
+            require_feature(Feature::Net, "unixstream networking (--network unixstream)")?;
+            ctx::add_net_unixstream(ctx_id, &path_string(&net.peer_path), net.mac)?;
+        }
+        Network::Tap(net) => {
+            require_feature(Feature::Net, "tap networking (--network tap)")?;
+            ctx::add_net_tap(ctx_id, &net.name, net.mac)?;
+        }
     }
 
     if config.stdio_console {
-        ctx::disable_implicit_console(ctx_id)?;
         ctx::add_virtio_console_default(ctx_id, 0, 1, 2)?;
         ctx::set_kernel_console(ctx_id, "hvc0")?;
-    }
-
-    if config.disable_implicit_vsock {
-        ctx::disable_implicit_vsock(ctx_id)?;
     }
 
     Ok(())

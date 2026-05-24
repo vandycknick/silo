@@ -1,7 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-const LIBKRUN_VERSION: &str = "1.18.0";
+const LIBKRUN_VERSION: &str = "1.18.1";
 const LIBKRUNFW_VERSION: &str = "5.2.1";
 
 fn main() {

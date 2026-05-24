@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use bento_krun::{Disk, Mount, NetUnixgram, VsockPort};
+use bento_krun::{Disk, Mount, VsockPort};
 use bento_utils::parse_mac;
 
 pub(crate) fn disk(input: &str) -> Result<Disk, String> {
@@ -47,19 +47,8 @@ pub(crate) fn vsock_port(input: &str) -> Result<VsockPort, String> {
     })
 }
 
-pub(crate) fn net_unixgram(input: &str) -> Result<NetUnixgram, String> {
-    let (peer_path, mac) = input
-        .rsplit_once(',')
-        .ok_or_else(|| "expected PEER_PATH,MAC".to_string())?;
-
-    if peer_path.is_empty() {
-        return Err("unixgram peer path cannot be empty".to_string());
-    }
-
-    Ok(NetUnixgram {
-        peer_path: PathBuf::from(peer_path),
-        mac: parse_mac(mac)?,
-    })
+pub(crate) fn mac(input: &str) -> Result<[u8; 6], String> {
+    parse_mac(input)
 }
 
 fn read_only(input: &str) -> Result<bool, String> {
@@ -72,7 +61,7 @@ fn read_only(input: &str) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::parse::{disk, net_unixgram, vsock_port};
+    use crate::parse::{disk, mac, vsock_port};
 
     #[test]
     fn parses_disk_arg() {
@@ -90,11 +79,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_net_unixgram_path() {
-        let net = net_unixgram("/tmp/gvproxy.sock,02:94:ef:e4:0c:ee").expect("valid net path");
-
-        assert_eq!(net.peer_path, std::path::PathBuf::from("/tmp/gvproxy.sock"));
-        assert_eq!(net.mac, [0x02, 0x94, 0xef, 0xe4, 0x0c, 0xee]);
-        assert!(net_unixgram("").is_err());
+    fn parses_network_mac() {
+        assert_eq!(
+            mac("02:94:ef:e4:0c:ee"),
+            Ok([0x02, 0x94, 0xef, 0xe4, 0x0c, 0xee])
+        );
+        assert!(mac("").is_err());
     }
 }

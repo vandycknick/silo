@@ -17,6 +17,6 @@ bento-utils = { path = "../../common/bento-utils" }
 bento-krun-sys = { path = "../bento-krun-sys", optional = true }
 clap = { version = "4.6.1", features = ["derive"] }
 eyre = "0.6.12"
-nix = { version = "0.31.3", features = ["socket", "term"] }
+nix = { version = "0.31.3", features = ["fs", "poll", "socket", "term"] }
 thiserror = "2.0.18"
 tracing = "0.1.44"

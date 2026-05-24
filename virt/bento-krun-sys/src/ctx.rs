@@ -166,6 +166,12 @@ pub fn add_vsock_port2(ctx: u32, port: u32, path: &str, listen: bool) -> Result<
     })
 }
 
+pub fn add_vsock(ctx: u32, tsi_features: u32) -> Result<()> {
+    check("add_vsock", unsafe {
+        sys::krun_add_vsock(ctx, tsi_features)
+    })
+}
+
 pub fn add_net_unixgram(ctx: u32, path: &str, mut mac: [u8; 6]) -> Result<()> {
     let path = CString::new(path)?;
     check("add_net_unixgram", unsafe {
@@ -176,6 +182,33 @@ pub fn add_net_unixgram(ctx: u32, path: &str, mut mac: [u8; 6]) -> Result<()> {
             mac.as_mut_ptr(),
             sys::COMPAT_NET_FEATURES,
             sys::NET_FLAG_VFKIT | sys::NET_FLAG_DHCP_CLIENT,
+        )
+    })
+}
+
+pub fn add_net_unixstream(ctx: u32, path: &str, mut mac: [u8; 6]) -> Result<()> {
+    let path = CString::new(path)?;
+    check("add_net_unixstream", unsafe {
+        sys::krun_add_net_unixstream(
+            ctx,
+            path.as_ptr(),
+            -1,
+            mac.as_mut_ptr(),
+            sys::COMPAT_NET_FEATURES,
+            sys::NET_FLAG_DHCP_CLIENT,
+        )
+    })
+}
+
+pub fn add_net_tap(ctx: u32, tap_name: &str, mut mac: [u8; 6]) -> Result<()> {
+    let tap_name = CString::new(tap_name)?;
+    check("add_net_tap", unsafe {
+        sys::krun_add_net_tap(
+            ctx,
+            tap_name.as_ptr().cast_mut(),
+            mac.as_mut_ptr(),
+            sys::COMPAT_NET_FEATURES,
+            sys::NET_FLAG_DHCP_CLIENT,
         )
     })
 }

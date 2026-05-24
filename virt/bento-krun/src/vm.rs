@@ -4,6 +4,7 @@ use std::process::{Child, ExitStatus};
 use crate::config::KrunConfig;
 use crate::error::{KrunBackendError, Result};
 use crate::serial::SerialConnection;
+use crate::watchdog::Keepalive;
 
 #[derive(Debug)]
 pub struct VirtualMachine {
@@ -11,6 +12,7 @@ pub struct VirtualMachine {
     krun_binary: PathBuf,
     config: KrunConfig,
     serial: Option<SerialConnection>,
+    _watchdog_keepalive: Option<Keepalive>,
 }
 
 impl VirtualMachine {
@@ -19,12 +21,14 @@ impl VirtualMachine {
         krun_binary: PathBuf,
         config: KrunConfig,
         serial: Option<SerialConnection>,
+        watchdog_keepalive: Option<Keepalive>,
     ) -> Self {
         Self {
             child,
             krun_binary,
             config,
             serial,
+            _watchdog_keepalive: watchdog_keepalive,
         }
     }
 
@@ -77,7 +81,7 @@ mod tests {
     #[test]
     fn serial_errors_when_stdio_console_is_disabled() {
         let child = Command::new("true").spawn().expect("spawn true");
-        let mut vm = VirtualMachine::new(child, "krun".into(), KrunConfig::default(), None);
+        let mut vm = VirtualMachine::new(child, "krun".into(), KrunConfig::default(), None, None);
 
         let err = vm.serial().expect_err("serial should be disabled");
 
@@ -101,6 +105,7 @@ mod tests {
             "krun".into(),
             config,
             Some(SerialConnection::new(read, write)),
+            None,
         );
 
         let _serial = vm.serial().expect("serial should be configured");

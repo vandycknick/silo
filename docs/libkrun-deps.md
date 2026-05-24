@@ -129,7 +129,7 @@ The output directory contains the `krun` binary plus `libkrun` and `libkrunfw`, 
 The current script pins are:
 
 ```text
-LIBKRUN_VERSION=1.18.0
+LIBKRUN_VERSION=1.18.1
 LIBKRUNFW_VERSION=5.2.1
 ```
 
