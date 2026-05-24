@@ -15,9 +15,8 @@ pub struct KrunConfig {
     pub disks: Vec<Disk>,
     pub mounts: Vec<Mount>,
     pub vsock_ports: Vec<VsockPort>,
-    pub net_unixgrams: Vec<NetUnixgram>,
+    pub network: Network,
     pub stdio_console: bool,
-    pub disable_implicit_vsock: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +46,26 @@ pub struct NetUnixgram {
     pub mac: [u8; 6],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetUnixstream {
+    pub peer_path: PathBuf,
+    pub mac: [u8; 6],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetTap {
+    pub name: String,
+    pub mac: [u8; 6],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Network {
+    None,
+    Unixgram(NetUnixgram),
+    Unixstream(NetUnixstream),
+    Tap(NetTap),
+}
+
 impl Default for KrunConfig {
     fn default() -> Self {
         Self {
@@ -59,9 +78,8 @@ impl Default for KrunConfig {
             disks: Vec::new(),
             mounts: Vec::new(),
             vsock_ports: Vec::new(),
-            net_unixgrams: Vec::new(),
+            network: Network::None,
             stdio_console: false,
-            disable_implicit_vsock: false,
         }
     }
 }
@@ -82,22 +100,61 @@ pub fn validate_config(config: &KrunConfig) -> Result<()> {
             "krun requires a kernel".to_string(),
         ));
     }
-    if !config.net_unixgrams.is_empty() && config.id.is_empty() {
+    match &config.network {
+        Network::None => {}
+        Network::Unixgram(net) => {
+            validate_vm_id(config, "net unixgram")?;
+            validate_peer_path(&net.peer_path, "net unixgram")?;
+            validate_mac(net.mac, "net unixgram")?;
+        }
+        Network::Unixstream(net) => {
+            validate_peer_path(&net.peer_path, "net unixstream")?;
+            validate_mac(net.mac, "net unixstream")?;
+        }
+        Network::Tap(net) => {
+            validate_tap_name(&net.name)?;
+            validate_mac(net.mac, "net tap")?;
+            #[cfg(not(target_os = "linux"))]
+            return Err(KrunBackendError::InvalidConfig(
+                "net tap is only supported on Linux".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_vm_id(config: &KrunConfig, name: &str) -> Result<()> {
+    if config.id.is_empty() {
+        return Err(KrunBackendError::InvalidConfig(format!(
+            "{name} requires a non-empty VM id"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_peer_path(path: &PathBuf, name: &str) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(KrunBackendError::InvalidConfig(format!(
+            "{name} peer path cannot be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_tap_name(name: &str) -> Result<()> {
+    if name.is_empty() {
         return Err(KrunBackendError::InvalidConfig(
-            "net unixgram requires a non-empty VM id".to_string(),
+            "net tap name cannot be empty".to_string(),
         ));
     }
-    for net in &config.net_unixgrams {
-        if net.peer_path.as_os_str().is_empty() {
-            return Err(KrunBackendError::InvalidConfig(
-                "net unixgram peer path cannot be empty".to_string(),
-            ));
-        }
-        if net.mac[0] & 0x01 != 0 {
-            return Err(KrunBackendError::InvalidConfig(
-                "net unixgram mac cannot be multicast".to_string(),
-            ));
-        }
+    Ok(())
+}
+
+fn validate_mac(mac: [u8; 6], name: &str) -> Result<()> {
+    if mac[0] & 0x01 != 0 {
+        return Err(KrunBackendError::InvalidConfig(format!(
+            "{name} mac cannot be multicast"
+        )));
     }
     Ok(())
 }

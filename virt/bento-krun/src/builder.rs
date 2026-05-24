@@ -8,7 +8,7 @@ use bento_utils::format_mac;
 use nix::pty::openpty;
 use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
 
-use crate::config::{validate_config, Disk, KrunConfig};
+use crate::config::{validate_config, Disk, KrunConfig, Network};
 use crate::error::Result;
 use crate::serial::SerialConnection;
 use crate::vm::VirtualMachine;
@@ -81,17 +81,27 @@ impl VirtualMachineBuilder {
     }
 
     pub fn net_unixgram(mut self, net: crate::NetUnixgram) -> Self {
-        self.config.net_unixgrams.push(net);
+        self.config.network = Network::Unixgram(net);
+        self
+    }
+
+    pub fn net_unixstream(mut self, net: crate::NetUnixstream) -> Self {
+        self.config.network = Network::Unixstream(net);
+        self
+    }
+
+    pub fn net_tap(mut self, net: crate::NetTap) -> Self {
+        self.config.network = Network::Tap(net);
+        self
+    }
+
+    pub fn network_none(mut self) -> Self {
+        self.config.network = Network::None;
         self
     }
 
     pub fn stdio_console(mut self, enabled: bool) -> Self {
         self.config.stdio_console = enabled;
-        self
-    }
-
-    pub fn disable_implicit_vsock(mut self, disabled: bool) -> Self {
-        self.config.disable_implicit_vsock = disabled;
         self
     }
 
@@ -165,14 +175,28 @@ pub(crate) fn command_args(config: &KrunConfig) -> Vec<OsString> {
     for port in &config.vsock_ports {
         push_arg(&mut args, "--vsock-port", format_vsock_port(port));
     }
-    for net in &config.net_unixgrams {
-        push_arg(&mut args, "--net-unixgram", format_net_unixgram(net));
+    match &config.network {
+        Network::None => {
+            push_arg(&mut args, "--network", "none");
+        }
+        Network::Unixgram(net) => {
+            push_arg(&mut args, "--network", "unixgram");
+            push_arg(&mut args, "--net-peer", net.peer_path.as_os_str());
+            push_arg(&mut args, "--net-mac", format_mac(net.mac));
+        }
+        Network::Unixstream(net) => {
+            push_arg(&mut args, "--network", "unixstream");
+            push_arg(&mut args, "--net-peer", net.peer_path.as_os_str());
+            push_arg(&mut args, "--net-mac", format_mac(net.mac));
+        }
+        Network::Tap(net) => {
+            push_arg(&mut args, "--network", "tap");
+            push_arg(&mut args, "--net-tap-name", &net.name);
+            push_arg(&mut args, "--net-mac", format_mac(net.mac));
+        }
     }
     if config.stdio_console {
         args.push("--stdio-console".into());
-    }
-    if config.disable_implicit_vsock {
-        args.push("--disable-implicit-vsock".into());
     }
     args
 }
@@ -234,10 +258,6 @@ fn format_vsock_port(port: &crate::VsockPort) -> String {
     )
 }
 
-fn format_net_unixgram(net: &crate::NetUnixgram) -> String {
-    format!("{},{}", net.peer_path.display(), format_mac(net.mac))
-}
-
 fn format_ro(read_only: bool) -> &'static str {
     if read_only {
         "ro"
@@ -272,7 +292,7 @@ mod tests {
 
     use crate::{Disk, VirtualMachineBuilder};
 
-    use super::{command_args, format_command};
+    use crate::builder::{command_args, format_command};
 
     #[test]
     fn builder_rejects_zero_cpus() {
@@ -330,12 +350,14 @@ mod tests {
 
         let args = command_args(&config);
 
-        assert!(args.iter().any(|arg| arg == "--net-unixgram"));
+        assert!(args.iter().any(|arg| arg == "--network"));
+        assert!(args.iter().any(|arg| arg == "unixgram"));
+        assert!(args.iter().any(|arg| arg == "--net-peer"));
+        assert!(args.iter().any(|arg| arg == "--net-mac"));
         assert!(args.iter().any(|arg| arg == "--id"));
         assert!(args.iter().any(|arg| arg == "vm123"));
-        assert!(args
-            .iter()
-            .any(|arg| arg == "/tmp/gvproxy.sock,02:94:ef:e4:0c:ee"));
+        assert!(args.iter().any(|arg| arg == "/tmp/gvproxy.sock"));
+        assert!(args.iter().any(|arg| arg == "02:94:ef:e4:0c:ee"));
     }
 
     #[test]

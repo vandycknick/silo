@@ -186,6 +186,33 @@ pub fn add_net_unixgram(ctx: u32, path: &str, mut mac: [u8; 6]) -> Result<()> {
     })
 }
 
+pub fn add_net_unixstream(ctx: u32, path: &str, mut mac: [u8; 6]) -> Result<()> {
+    let path = CString::new(path)?;
+    check("add_net_unixstream", unsafe {
+        sys::krun_add_net_unixstream(
+            ctx,
+            path.as_ptr(),
+            -1,
+            mac.as_mut_ptr(),
+            sys::COMPAT_NET_FEATURES,
+            sys::NET_FLAG_DHCP_CLIENT,
+        )
+    })
+}
+
+pub fn add_net_tap(ctx: u32, tap_name: &str, mut mac: [u8; 6]) -> Result<()> {
+    let tap_name = CString::new(tap_name)?;
+    check("add_net_tap", unsafe {
+        sys::krun_add_net_tap(
+            ctx,
+            tap_name.as_ptr().cast_mut(),
+            mac.as_mut_ptr(),
+            sys::COMPAT_NET_FEATURES,
+            sys::NET_FLAG_DHCP_CLIENT,
+        )
+    })
+}
+
 pub fn add_net_unixgram_fd(ctx: u32, fd: RawFd, mut mac: [u8; 6]) -> Result<()> {
     check("add_net_unixgram", unsafe {
         sys::krun_add_net_unixgram(
