@@ -3,9 +3,10 @@ use std::io::{self, Write};
 use std::os::fd::{BorrowedFd, FromRawFd};
 use std::sync::Arc;
 
-use bento_core::{InstanceFile, VmSpec};
+use bento_core::{InstanceFile, Network, VmSpec};
 use bento_virt::VirtualMachine;
 use eyre::Context;
+use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::context::{DaemonContext, RuntimeContext};
@@ -64,6 +65,7 @@ impl StartupReporter {
 
 pub async fn init(runtime: &RuntimeContext, machine_id: &str) -> eyre::Result<DaemonContext> {
     let spec = load_spec(runtime)?;
+    let network = load_network_runtime(runtime)?;
 
     tracing::info!(instance = %spec.name, "vmmon starting");
     remove_stale_socket(&runtime.file(InstanceFile::VmmonSocket))?;
@@ -73,6 +75,7 @@ pub async fn init(runtime: &RuntimeContext, machine_id: &str) -> eyre::Result<Da
         id: machine_id,
         data_dir: runtime.dir(),
         spec: &spec,
+        network: &network,
     })?;
     let machine = VirtualMachine::new(machine_config.config)?;
     if let Some(machine_identifier) = machine_config.machine_identifier.as_ref() {
@@ -98,12 +101,32 @@ pub async fn init(runtime: &RuntimeContext, machine_id: &str) -> eyre::Result<Da
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct NetworkRuntimeFile {
+    attachment: Network,
+}
+
 fn load_spec(runtime: &RuntimeContext) -> eyre::Result<VmSpec> {
     let config_path = runtime.file(InstanceFile::Config);
     let raw = std::fs::read_to_string(&config_path)
         .wrap_err_with(|| format!("read vm spec at {}", config_path.display()))?;
     serde_yaml_ng::from_str(&raw)
         .map_err(|err| eyre::eyre!("parse vm spec at {}: {}", config_path.display(), err))
+}
+
+fn load_network_runtime(runtime: &RuntimeContext) -> eyre::Result<Network> {
+    let runtime_path = runtime.dir().join("net/runtime.json");
+    let raw = match std::fs::read_to_string(&runtime_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Network::None),
+        Err(err) => {
+            return Err(err)
+                .wrap_err_with(|| format!("read network runtime at {}", runtime_path.display()))
+        }
+    };
+    let runtime: NetworkRuntimeFile = serde_json::from_str(&raw)
+        .wrap_err_with(|| format!("parse network runtime at {}", runtime_path.display()))?;
+    Ok(runtime.attachment)
 }
 
 fn remove_stale_socket(path: &std::path::Path) -> eyre::Result<()> {

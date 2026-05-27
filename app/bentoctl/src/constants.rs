@@ -24,6 +24,3 @@ pub(crate) const DEFAULT_PROFILE_IMAGE: &str = "ghcr.io/vandycknick/archlinux:la
 /// know what a profile is. It is not a user-facing label and should not be set
 /// through `--label`.
 pub(crate) const PROFILE_METADATA_KEY: &str = "bento.profile";
-
-/// Internal machine metadata key carrying the resolved profile network policy.
-pub(crate) const NETWORK_POLICY_METADATA_KEY: &str = "bento.network.policy";

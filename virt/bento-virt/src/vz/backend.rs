@@ -16,9 +16,7 @@ use bento_vz::{
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::stream::{MachineSerialStream, VsockListener, VsockStream};
-use crate::types::{
-    MachineIdentifier, NetworkMode, UserNetworkTransport, VirtError, VmConfig, VmExit,
-};
+use crate::types::{MachineIdentifier, NetworkMode, VirtError, VmConfig, VmExit};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -334,25 +332,18 @@ fn build_vm(spec: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguration)
         .add_serial_port(serial_port.clone())
         .add_socket_device(SocketDeviceConfiguration::new());
 
-    if spec.network == NetworkMode::VzNat {
-        builder = builder.add_network_device(NetworkDeviceConfiguration::nat());
-    }
-    if spec.network == NetworkMode::User {
-        let network = spec
-            .user_network
-            .as_ref()
-            .ok_or_else(|| VirtError::InvalidConfig {
-                name: spec.name.clone(),
-                reason: "user networking requires a userspace attachment".to_string(),
-            })?;
-        match &network.transport {
-            UserNetworkTransport::Unixgram { peer_path, mac } => {
-                builder = builder.add_network_device(
-                    NetworkDeviceConfiguration::unix_datagram(peer_path, &spec.vm_id, *mac)
-                        .map_err(vz_error)?,
-                );
-            }
+    match &spec.network {
+        NetworkMode::None => {}
+        NetworkMode::VzNat => {
+            builder = builder.add_network_device(NetworkDeviceConfiguration::nat());
         }
+        NetworkMode::UnixDatagram { peer_path, mac } => {
+            builder = builder.add_network_device(
+                NetworkDeviceConfiguration::unix_datagram(peer_path, &spec.vm_id, *mac)
+                    .map_err(vz_error)?,
+            );
+        }
+        NetworkMode::UnixStream { .. } | NetworkMode::Tap { .. } => {}
     }
 
     if let Some(root_disk) = spec.root_disk.as_ref() {
@@ -462,9 +453,23 @@ fn validate_machine_config(spec: &VmConfig) -> Result<(), VirtError> {
     validate_nested_virtualization(spec)?;
     validate_rosetta(spec)?;
 
-    match spec.network {
-        NetworkMode::VzNat | NetworkMode::None => {}
-        NetworkMode::User => validate_user_network(spec)?,
+    match &spec.network {
+        NetworkMode::None | NetworkMode::VzNat => {}
+        NetworkMode::UnixDatagram { peer_path, .. } => {
+            validate_unix_datagram_network(spec, peer_path)?
+        }
+        NetworkMode::UnixStream { .. } => {
+            return Err(VirtError::InvalidConfig {
+                name: spec.name.clone(),
+                reason: "unixstream networking is not supported by the VZ backend".to_string(),
+            });
+        }
+        NetworkMode::Tap { .. } => {
+            return Err(VirtError::InvalidConfig {
+                name: spec.name.clone(),
+                reason: "tap networking is not supported by the VZ backend".to_string(),
+            });
+        }
     }
 
     for mount in &spec.mounts {
@@ -489,23 +494,16 @@ fn validate_machine_config(spec: &VmConfig) -> Result<(), VirtError> {
     Ok(())
 }
 
-fn validate_user_network(spec: &VmConfig) -> Result<(), VirtError> {
-    match spec.user_network.as_ref().map(|network| &network.transport) {
-        Some(UserNetworkTransport::Unixgram { peer_path, .. })
-            if !peer_path.as_os_str().is_empty() && !spec.vm_id.is_empty() =>
-        {
-            Ok(())
-        }
-        Some(UserNetworkTransport::Unixgram { .. }) => Err(VirtError::InvalidConfig {
-            name: spec.name.clone(),
-            reason: "user networking requires a non-empty VM id and unixgram peer socket path"
-                .to_string(),
-        }),
-        None => Err(VirtError::InvalidConfig {
-            name: spec.name.clone(),
-            reason: "user networking requires a userspace attachment".to_string(),
-        }),
+fn validate_unix_datagram_network(spec: &VmConfig, peer_path: &Path) -> Result<(), VirtError> {
+    if !peer_path.as_os_str().is_empty() && !spec.vm_id.is_empty() {
+        return Ok(());
     }
+
+    Err(VirtError::InvalidConfig {
+        name: spec.name.clone(),
+        reason: "unixdatagram networking requires a non-empty VM id and peer socket path"
+            .to_string(),
+    })
 }
 
 fn validate_nested_virtualization(spec: &VmConfig) -> Result<(), VirtError> {

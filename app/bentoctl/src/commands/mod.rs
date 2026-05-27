@@ -11,6 +11,7 @@ pub mod images;
 pub mod inspect;
 pub mod list;
 pub mod logs;
+pub mod network;
 pub mod profile;
 pub mod restart;
 pub mod rm;
@@ -53,6 +54,7 @@ pub enum Command {
     Status(status::Cmd),
     Inspect(inspect::Cmd),
     Logs(logs::Cmd),
+    Network(network::Cmd),
     Profile(profile::Cmd),
     #[command(name = "images", alias = "image")]
     Images(images::Cmd),
@@ -76,6 +78,7 @@ impl Display for Command {
             Command::Status(cmd) => write!(f, "status {}", cmd),
             Command::Inspect(cmd) => write!(f, "inspect {}", cmd),
             Command::Logs(cmd) => write!(f, "logs {}", cmd),
+            Command::Network(cmd) => write!(f, "network {}", cmd),
             Command::Profile(cmd) => write!(f, "profile {}", cmd),
             Command::Images(cmd) => write!(f, "images {}", cmd),
             Command::ShellProxy(cmd) => write!(f, "shell-proxy {}", cmd),
@@ -148,6 +151,10 @@ impl BentoCtlCmd {
                 cmd.run(&libvm).await
             }
             Command::Logs(cmd) => {
+                let libvm = libvm()?;
+                cmd.run(&libvm).await
+            }
+            Command::Network(cmd) => {
                 let libvm = libvm()?;
                 cmd.run(&libvm).await
             }

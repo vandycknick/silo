@@ -15,8 +15,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::stream::{MachineSerialStream, VsockListener, VsockStream};
 use crate::types::{
-    DiskImage, NetworkMode, SharedDirectory, UserNetworkTransport, VirtError, VmConfig, VmExit,
-    VsockPortMode,
+    DiskImage, NetworkMode, SharedDirectory, VirtError, VmConfig, VmExit, VsockPortMode,
 };
 
 const KRUN_BINARY_ENV: &str = "KRUN_BIN";
@@ -91,14 +90,22 @@ fn validate(config: &VmConfig) -> Result<(), VirtError> {
         );
     }
 
-    match config.network {
+    match &config.network {
         NetworkMode::None => {}
-        NetworkMode::User => validate_user_network(config)?,
+        NetworkMode::UnixDatagram { peer_path, .. } => {
+            validate_unix_datagram_network(config, peer_path)?
+        }
         NetworkMode::VzNat => {
             return invalid_config(
                 config,
                 "vznat networking is only supported by the VZ backend",
             )
+        }
+        NetworkMode::UnixStream { .. } => {
+            return invalid_config(config, "unixstream networking is not implemented yet")
+        }
+        NetworkMode::Tap { .. } => {
+            return invalid_config(config, "tap networking is not implemented yet")
         }
     }
 
@@ -107,23 +114,15 @@ fn validate(config: &VmConfig) -> Result<(), VirtError> {
     Ok(())
 }
 
-fn validate_user_network(config: &VmConfig) -> Result<(), VirtError> {
-    match config
-        .user_network
-        .as_ref()
-        .map(|network| &network.transport)
-    {
-        Some(UserNetworkTransport::Unixgram { peer_path, .. })
-            if !peer_path.as_os_str().is_empty() && !config.vm_id.is_empty() =>
-        {
-            Ok(())
-        }
-        Some(UserNetworkTransport::Unixgram { .. }) => invalid_config(
-            config,
-            "user networking requires a non-empty VM id and unixgram peer socket path",
-        ),
-        None => invalid_config(config, "user networking requires a userspace attachment"),
+fn validate_unix_datagram_network(config: &VmConfig, peer_path: &Path) -> Result<(), VirtError> {
+    if !peer_path.as_os_str().is_empty() && !config.vm_id.is_empty() {
+        return Ok(());
     }
+
+    invalid_config(
+        config,
+        "unixdatagram networking requires a non-empty VM id and peer socket path",
+    )
 }
 
 fn prepare(config: &VmConfig) -> Result<(), VirtError> {
@@ -425,15 +424,11 @@ fn build_krun_vm(krun_bin: &Path, config: &VmConfig) -> Result<VirtualMachineBui
             listen: mode == VsockPortMode::Connect,
         });
     }
-    if let Some(network) = config.user_network.as_ref() {
-        match &network.transport {
-            UserNetworkTransport::Unixgram { peer_path, mac } => {
-                builder = builder.net_unixgram(KrunNetUnixgram {
-                    peer_path: peer_path.clone(),
-                    mac: *mac,
-                });
-            }
-        }
+    if let NetworkMode::UnixDatagram { peer_path, mac } = &config.network {
+        builder = builder.net_unixgram(KrunNetUnixgram {
+            peer_path: peer_path.clone(),
+            mac: *mac,
+        });
     }
 
     Ok(builder)

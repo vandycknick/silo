@@ -3,12 +3,13 @@ use std::fmt::{Display, Formatter};
 use std::io::Write;
 use std::process::Command;
 
+use bento_libvm::RequestedNetwork;
 use clap::{Args, Subcommand};
 use tabwriter::TabWriter;
 
 use crate::profile::{
-    network_mode_label, parse_profile, MountMode, NetworkMode, Profile, ProfileImage, ProfileMount,
-    ProfileNetwork, ProfileSsh, ProfileStore,
+    parse_profile, MountMode, Profile, ProfileImage, ProfileMount, ProfileNetwork, ProfileSsh,
+    ProfileStore,
 };
 
 #[derive(Args, Debug)]
@@ -80,9 +81,9 @@ pub struct CreateCmd {
     /// Human-readable profile description.
     #[arg(long)]
     pub description: Option<String>,
-    /// Network mode for VMs created from this profile. Allowed: isolated, none.
-    #[arg(long, value_parser = parse_network_mode, default_value = "isolated")]
-    pub network: NetworkMode,
+    /// Network target for VMs created from this profile. Allowed: private, none, NAME, or name:NAME.
+    #[arg(long, value_parser = parse_requested_network, default_value = "private")]
+    pub network: RequestedNetwork,
     /// Add a mount. Format: SRC:DST[:ro|rw].
     #[arg(long = "mount", value_name = "SRC:DST[:MODE]", value_parser = parse_profile_mount)]
     pub mounts: Vec<ProfileMount>,
@@ -158,7 +159,7 @@ fn list_profiles(store: &ProfileStore, cmd: &ListCmd) -> eyre::Result<()> {
             "{}\t{}\t{}\t{}",
             named.name,
             named.profile.image.reference,
-            network_mode_label(named.profile.network_mode()),
+            named.profile.network_name(),
             named.profile.description.unwrap_or_default(),
         )?;
     }
@@ -197,10 +198,7 @@ fn create_profile(store: &ProfileStore, cmd: &CreateCmd) -> eyre::Result<()> {
             reference: cmd.image.clone(),
         },
         mounts: cmd.mounts.clone(),
-        network: Some(ProfileNetwork {
-            mode: cmd.network,
-            policy: None,
-        }),
+        network: Some(requested_network_to_profile(cmd.network.clone())),
         ssh: Some(ProfileSsh {
             enabled: cmd.ssh && !cmd.no_ssh,
             github_users: Vec::new(),
@@ -293,13 +291,35 @@ pub(crate) fn parse_profile_mount(input: &str) -> Result<ProfileMount, String> {
     })
 }
 
-pub(crate) fn parse_network_mode(input: &str) -> Result<NetworkMode, String> {
+pub(crate) fn parse_requested_network(input: &str) -> Result<RequestedNetwork, String> {
     match input {
-        "isolated" => Ok(NetworkMode::Isolated),
-        "none" => Ok(NetworkMode::None),
-        other => Err(format!(
-            "network mode `{other}` is not supported in this phase; supported modes: isolated, none"
-        )),
+        "private" => Ok(RequestedNetwork::Private { policy: None }),
+        "none" => Ok(RequestedNetwork::None),
+        other if other.starts_with("name:") => {
+            named_requested_network(other.trim_start_matches("name:"))
+        }
+        other => named_requested_network(other),
+    }
+}
+
+fn named_requested_network(name: &str) -> Result<RequestedNetwork, String> {
+    if name.is_empty() {
+        return Err("invalid network name: cannot be empty".to_string());
+    }
+    if matches!(name, "private" | "none") {
+        return Err(format!("invalid network name: '{name}' is reserved"));
+    }
+    Ok(RequestedNetwork::Named {
+        name: name.to_string(),
+        policy: None,
+    })
+}
+
+fn requested_network_to_profile(requested: RequestedNetwork) -> ProfileNetwork {
+    match requested {
+        RequestedNetwork::Private { policy } => ProfileNetwork::Private { policy },
+        RequestedNetwork::None => ProfileNetwork::None,
+        RequestedNetwork::Named { name, policy } => ProfileNetwork::Named { name, policy },
     }
 }
 

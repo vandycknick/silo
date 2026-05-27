@@ -18,7 +18,6 @@ pub struct VmSpec {
     pub mounts: Vec<Mount>,
     #[serde(default)]
     pub vsock_endpoints: Vec<VsockEndpointSpec>,
-    pub network: Network,
     pub settings: Settings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest: Option<GuestSpec>,
@@ -200,8 +199,89 @@ pub struct Mount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Network {
-    pub driver: NetworkDriver,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Network {
+    None,
+    VzNat {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mac: Option<String>,
+    },
+    UnixDatagram {
+        path: PathBuf,
+        mac: String,
+    },
+    UnixStream {
+        path: PathBuf,
+        mac: String,
+    },
+    Tap {
+        name: String,
+        mac: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkPolicySpec {
+    pub default_action: PolicyAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_log: Option<AuditLogSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cidr_rules: Vec<CidrRuleSpec>,
+}
+
+impl NetworkPolicySpec {
+    pub fn required_features(&self) -> std::collections::BTreeSet<NetworkPolicyFeature> {
+        let mut features = std::collections::BTreeSet::new();
+        if !self.cidr_rules.is_empty() {
+            features.insert(NetworkPolicyFeature::CidrRules);
+        }
+        features
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyAction {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditLogSpec {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CidrRuleSpec {
+    pub name: String,
+    pub action: PolicyAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocols: Vec<NetworkProtocol>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_cidrs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dest_cidrs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkProtocol {
+    Tcp,
+    Udp,
+    Icmp,
+    Any,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NetworkPolicyFeature {
+    CidrRules,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,20 +304,12 @@ pub enum Architecture {
     X86_64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NetworkDriver {
-    None,
-    Gvisor,
-    VzNat,
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         Architecture, BackoffSpec, Boot, Bootstrap, Disk, DiskKind, GuestOs, GuestSpec,
-        LifecycleSpec, Mount, Network, NetworkDriver, Platform, PluginSpec, Resources,
-        RestartPolicy, Settings, Storage, VmSpec, VsockEndpointMode, VsockEndpointSpec,
+        LifecycleSpec, Mount, Platform, PluginSpec, Resources, RestartPolicy, Settings, Storage,
+        VmSpec, VsockEndpointMode, VsockEndpointSpec,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -302,9 +374,6 @@ mod tests {
                     },
                 },
             }],
-            network: Network {
-                driver: NetworkDriver::Gvisor,
-            },
             settings: Settings {
                 nested_virtualization: false,
                 rosetta: true,
@@ -334,7 +403,7 @@ mod tests {
         assert!(yaml.contains("vsock_endpoints:"));
         assert!(yaml.contains("guest:"));
         assert!(yaml.contains("control_port: 1027"));
-        assert!(yaml.contains("driver: gvisor"));
+        assert!(!yaml.contains("network:"));
         assert!(yaml.contains("mode: connect"));
         assert!(!yaml.contains("guest_enabled"));
     }
@@ -359,8 +428,6 @@ boot:
 storage:
   disks: []
 mounts: []
-network:
-  driver: gvisor
 settings:
   nested_virtualization: false
   rosetta: true
@@ -392,8 +459,6 @@ boot:
 storage:
   disks: []
 mounts: []
-network:
-  driver: gvisor
 settings:
   nested_virtualization: false
   rosetta: true
@@ -425,8 +490,6 @@ boot:
 storage:
   disks: []
 mounts: []
-network:
-  driver: gvisor
 settings:
   nested_virtualization: false
   rosetta: true
@@ -459,8 +522,6 @@ storage:
   disks: []
 mounts: []
 endpoints: []
-network:
-  driver: gvisor
 settings:
   nested_virtualization: false
   rosetta: true

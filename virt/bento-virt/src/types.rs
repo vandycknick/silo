@@ -79,7 +79,6 @@ pub struct VmConfig {
     pub nested_virtualization: bool,
     pub rosetta: bool,
     pub network: NetworkMode,
-    pub user_network: Option<UserNetwork>,
     pub kernel_cmdline: Vec<String>,
     pub root_disk: Option<DiskImage>,
     pub data_disks: Vec<DiskImage>,
@@ -101,7 +100,6 @@ impl VmConfig {
             nested_virtualization: false,
             rosetta: false,
             network: NetworkMode::None,
-            user_network: None,
             kernel_cmdline: Vec::new(),
             root_disk: None,
             data_disks: Vec::new(),
@@ -129,6 +127,13 @@ impl VmConfig {
 
     pub fn vm_id(&self) -> &str {
         &self.vm_id
+    }
+
+    pub fn unix_datagram_network(&self) -> Option<(&PathBuf, [u8; 6])> {
+        match &self.network {
+            NetworkMode::UnixDatagram { peer_path, mac } => Some((peer_path, *mac)),
+            _ => None,
+        }
     }
 }
 
@@ -194,8 +199,37 @@ impl VmConfigBuilder {
         self
     }
 
-    pub fn user_network(mut self, network: UserNetwork) -> Self {
-        self.config.user_network = Some(network);
+    pub fn no_network(mut self) -> Self {
+        self.config.network = NetworkMode::None;
+        self
+    }
+
+    pub fn vz_nat_network(mut self) -> Self {
+        self.config.network = NetworkMode::VzNat;
+        self
+    }
+
+    pub fn unix_datagram_network(mut self, peer_path: impl Into<PathBuf>, mac: [u8; 6]) -> Self {
+        self.config.network = NetworkMode::UnixDatagram {
+            peer_path: peer_path.into(),
+            mac,
+        };
+        self
+    }
+
+    pub fn unix_stream_network(mut self, path: impl Into<PathBuf>, mac: [u8; 6]) -> Self {
+        self.config.network = NetworkMode::UnixStream {
+            path: path.into(),
+            mac,
+        };
+        self
+    }
+
+    pub fn tap_network(mut self, name: impl Into<String>, mac: [u8; 6]) -> Self {
+        self.config.network = NetworkMode::Tap {
+            name: name.into(),
+            mac,
+        };
         self
     }
 
@@ -254,21 +288,13 @@ pub enum VsockPortMode {
     Listen,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkMode {
-    User,
-    VzNat,
     None,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserNetwork {
-    pub transport: UserNetworkTransport,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UserNetworkTransport {
-    Unixgram { peer_path: PathBuf, mac: [u8; 6] },
+    VzNat,
+    UnixDatagram { peer_path: PathBuf, mac: [u8; 6] },
+    UnixStream { path: PathBuf, mac: [u8; 6] },
+    Tap { name: String, mac: [u8; 6] },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

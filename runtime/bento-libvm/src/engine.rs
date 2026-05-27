@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::global_config::GlobalConfig;
 use crate::images::store::ImageStore;
 use crate::launch::prepare_instance_runtime;
+use crate::network::config::{NetworkDefinitionSpec, RequestedNetwork};
 use bento_core::InstanceFile;
 use bento_core::{
-    Architecture, Boot, Bootstrap, Disk, DiskKind, GuestOs, GuestSpec, MachineId, Mount, Network,
-    NetworkDriver, Platform, Resources, Settings, Storage, VmSpec,
+    Architecture, Boot, Bootstrap, Disk, DiskKind, GuestOs, GuestSpec, MachineId, Mount, Platform,
+    Resources, Settings, Storage, VmSpec,
 };
 use bento_protocol::agent_port_arg;
 use bento_protocol::v1::InspectResponse;
@@ -47,7 +47,7 @@ pub struct CreateMachineRequest {
     pub userdata: Option<PathBuf>,
     pub disks: Vec<PathBuf>,
     pub mounts: Vec<Mount>,
-    pub network: Option<String>,
+    pub network: Option<RequestedNetwork>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +60,7 @@ pub struct MachineRecord {
     pub image_ref: String,
     pub labels: BTreeMap<String, String>,
     pub metadata: BTreeMap<String, String>,
+    pub network: RequestedNetwork,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +92,7 @@ struct PendingMachine {
     image_ref: String,
     labels: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
+    network: RequestedNetwork,
     committed: bool,
 }
 
@@ -178,9 +180,6 @@ impl LibVm {
             },
             mounts: assign_mount_tags(request.mounts),
             vsock_endpoints: Vec::new(),
-            network: Network {
-                driver: resolve_create_network_driver(&request.name, request.network.as_deref())?,
-            },
             settings: Settings {
                 nested_virtualization: request.nested_virtualization,
                 rosetta: request.rosetta,
@@ -188,11 +187,15 @@ impl LibVm {
             guest,
         };
 
+        let network = request.network.unwrap_or_default();
+        self.validate_requested_network(&network)?;
+
         let pending = self.create_pending(
             spec,
             request.image_ref.clone(),
             request.labels,
             request.metadata,
+            network,
         )?;
         let rootfs_path = pending.dir().join(InstanceFile::RootDisk.as_str());
         image_store.clone_base_image(&selected_image, &rootfs_path)?;
@@ -210,6 +213,7 @@ impl LibVm {
         image_ref: String,
         labels: BTreeMap<String, String>,
         metadata: BTreeMap<String, String>,
+        network: RequestedNetwork,
     ) -> Result<PendingMachine, LibVmError> {
         validate_machine_name(&spec.name)?;
 
@@ -246,6 +250,7 @@ impl LibVm {
             image_ref,
             labels,
             metadata,
+            network,
             committed: false,
         })
     }
@@ -265,6 +270,47 @@ impl LibVm {
 
     pub fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError> {
         self.state.allocate_ephemeral_name(prefix)
+    }
+
+    pub fn create_network_definition(
+        &self,
+        definition: NetworkDefinitionSpec,
+    ) -> Result<(), LibVmError> {
+        definition
+            .validate()
+            .map_err(|reason| LibVmError::InvalidCreateRequest {
+                name: definition.name.clone(),
+                reason,
+            })?;
+        self.state.upsert_network_definition(&definition)
+    }
+
+    pub fn list_network_definitions(&self) -> Result<Vec<NetworkDefinitionSpec>, LibVmError> {
+        self.state.list_network_definitions()
+    }
+
+    pub fn get_network_definition(
+        &self,
+        name: &str,
+    ) -> Result<Option<NetworkDefinitionSpec>, LibVmError> {
+        self.state.get_network_definition(name)
+    }
+
+    pub fn remove_network_definition(&self, name: &str) -> Result<(), LibVmError> {
+        self.state.remove_network_definition(name)
+    }
+
+    pub fn set_network(
+        &self,
+        machine: &MachineRef,
+        network: RequestedNetwork,
+    ) -> Result<MachineRecord, LibVmError> {
+        self.validate_requested_network(&network)?;
+        let metadata = self.resolve_machine_state(machine)?;
+        self.state.update_machine_network(metadata.id, &network)?;
+        let mut updated = metadata;
+        updated.network = network;
+        self.machine_record(updated)
     }
 
     pub fn remove(&self, machine: &MachineRef) -> Result<(), LibVmError> {
@@ -298,15 +344,14 @@ impl LibVm {
             });
         }
 
-        prepare_instance_runtime(Path::new(&metadata.instance_dir)).map_err(|err| {
-            LibVmError::InstancePreparationFailed {
+        let resolved_network =
+            prepare_network_runtime(&self.layout, &self.state, &metadata).await?;
+        prepare_instance_runtime(Path::new(&metadata.instance_dir), &resolved_network).map_err(
+            |err| LibVmError::InstancePreparationFailed {
                 reference: metadata.name.clone(),
                 message: err.to_string(),
-            }
-        })?;
-
-        let record = self.machine_record(metadata.clone())?;
-        prepare_network_runtime(&self.layout, &self.state, &metadata, &record.spec).await?;
+            },
+        )?;
 
         let startup_pipe = spawn_vmmon(metadata.id, Path::new(&metadata.instance_dir))?;
         wait_for_monitor_start(startup_pipe, &self.layout.monitor_trace_path(metadata.id)).await?;
@@ -450,6 +495,18 @@ impl LibVm {
         }
     }
 
+    fn validate_requested_network(&self, network: &RequestedNetwork) -> Result<(), LibVmError> {
+        if let RequestedNetwork::Named { name, .. } = network {
+            self.state
+                .get_network_definition(name)?
+                .ok_or_else(|| LibVmError::NetworkRuntime {
+                    reference: name.clone(),
+                    message: format!("named network {:?} is not defined", name),
+                })?;
+        }
+        Ok(())
+    }
+
     fn machine_record(&self, machine: MachineState) -> Result<MachineRecord, LibVmError> {
         let dir = PathBuf::from(&machine.instance_dir);
         let config_path = dir.join(CONFIG_FILE_NAME);
@@ -483,6 +540,7 @@ impl LibVm {
             image_ref: machine.image_ref,
             labels: machine.labels,
             metadata: machine.metadata,
+            network: machine.network,
         })
     }
 
@@ -551,32 +609,6 @@ fn gigabytes_to_bytes(size_gb: u64) -> u64 {
 
 fn gigabytes_to_bytes_checked(size_gb: Option<u64>) -> Option<u64> {
     size_gb.map(gigabytes_to_bytes)
-}
-
-fn resolve_create_network_driver(
-    name: &str,
-    requested: Option<&str>,
-) -> Result<NetworkDriver, LibVmError> {
-    match requested {
-        Some("none") => Ok(NetworkDriver::None),
-        Some("vznat") => Ok(NetworkDriver::VzNat),
-        Some("gvisor") => Ok(NetworkDriver::Gvisor),
-        Some("user") => GlobalConfig::load()
-            .map(|config| config.networking.userspace)
-            .map_err(|err| LibVmError::InvalidCreateRequest {
-                name: name.to_string(),
-                reason: format!("resolve userspace network alias from global config: {err}"),
-            }),
-        Some(other) => Err(LibVmError::InvalidCreateRequest {
-            name: name.to_string(),
-            reason: format!("invalid network driver {other:?}"),
-        }),
-        None => Ok(default_network_driver()),
-    }
-}
-
-fn default_network_driver() -> NetworkDriver {
-    NetworkDriver::Gvisor
 }
 
 fn canonicalize_optional_existing_path(
@@ -789,6 +821,7 @@ impl PendingMachine {
             self.image_ref.clone(),
             self.labels.clone(),
             self.metadata.clone(),
+            self.network.clone(),
         );
         if let Err(err) = libvm.state.insert_machine(&metadata) {
             let _ = fs::remove_dir_all(&self.final_dir);
@@ -842,13 +875,10 @@ fn create_staging_dir(layout: &Layout) -> Result<PathBuf, LibVmError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        default_network_driver, guest_kernel_cmdline, guest_spec_from_request, LibVm, MachineStatus,
-    };
+    use super::{guest_kernel_cmdline, guest_spec_from_request, LibVm, MachineStatus};
     use crate::{Layout, LibVmError, MachineRef};
     use bento_core::{
-        Architecture, Boot, GuestOs, GuestSpec, Network, NetworkDriver, Platform, Resources,
-        Settings, Storage, VmSpec,
+        Architecture, Boot, GuestOs, GuestSpec, Platform, Resources, Settings, Storage, VmSpec,
     };
 
     fn sample_vm_spec(name: &str) -> VmSpec {
@@ -872,9 +902,6 @@ mod tests {
             storage: Storage { disks: Vec::new() },
             mounts: Vec::new(),
             vsock_endpoints: Vec::new(),
-            network: Network {
-                driver: NetworkDriver::Gvisor,
-            },
             settings: Settings {
                 nested_virtualization: false,
                 rosetta: false,
@@ -892,12 +919,8 @@ mod tests {
             "test-image:latest".to_string(),
             std::collections::BTreeMap::new(),
             std::collections::BTreeMap::new(),
+            crate::RequestedNetwork::default(),
         )
-    }
-
-    #[test]
-    fn default_create_network_driver_is_gvisor() {
-        assert_eq!(default_network_driver(), NetworkDriver::Gvisor);
     }
 
     #[test]

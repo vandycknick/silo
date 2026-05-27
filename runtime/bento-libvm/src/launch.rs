@@ -8,15 +8,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bento_core::agent::{
     AgentConfig, AgentDnsConfig, AgentForwardConfig, AgentSshConfig, AgentUdsForwardConfig,
 };
-use bento_core::{resolve_mount_location, InstanceFile, MachineId, NetworkDriver, VmSpec};
+use bento_core::{resolve_mount_location, InstanceFile, Network, VmSpec};
 use bento_utils::format_mac;
 use eyre::Context;
 use fatfs::{format_volume, FileSystem, FormatVolumeOptions, FsOptions};
 use serde::{Deserialize, Serialize};
 
-use crate::global_config::{ensure_guest_agent_binary, GlobalConfig};
+use crate::global_config::{ensure_guest_binary, GlobalConfig};
 use crate::host_user::{self, HostUser};
-use crate::network::mac_from_machine_id;
 use crate::ssh_keys;
 
 const GUEST_AGENT_CIDATA_ENTRY: &str = "bento-agent";
@@ -57,11 +56,11 @@ struct MonitorMount {
     writable: bool,
 }
 
-pub(crate) fn prepare_instance_runtime(instance_dir: &Path) -> eyre::Result<()> {
+pub(crate) fn prepare_instance_runtime(instance_dir: &Path, network: &Network) -> eyre::Result<()> {
     let spec = read_vm_spec_from_dir(instance_dir)?;
-    let guest_runtime = resolve_guest_runtime_config(&spec)?;
+    let guest_runtime = resolve_guest_runtime_config(&spec, network)?;
 
-    rebuild_bootstrap(instance_dir, &spec, &guest_runtime)?;
+    rebuild_bootstrap(instance_dir, &spec, network, &guest_runtime)?;
     Ok(())
 }
 
@@ -77,9 +76,8 @@ fn read_vm_spec_from_dir(instance_dir: &Path) -> eyre::Result<VmSpec> {
 mod tests {
     use super::{render_network_config_for_instance, resolve_guest_runtime_config};
     use bento_core::{
-        Architecture, Boot, GuestOs, GuestSpec, LifecycleSpec, MachineId, Network, NetworkDriver,
-        Platform, PluginSpec, Resources, Settings, Storage, VmSpec, VsockEndpointMode,
-        VsockEndpointSpec,
+        Architecture, Boot, GuestOs, GuestSpec, LifecycleSpec, Network, Platform, PluginSpec,
+        Resources, Settings, Storage, VmSpec, VsockEndpointMode, VsockEndpointSpec,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -106,9 +104,6 @@ mod tests {
             storage: Storage { disks: Vec::new() },
             mounts: Vec::new(),
             vsock_endpoints: Vec::new(),
-            network: Network {
-                driver: NetworkDriver::Gvisor,
-            },
             settings: Settings {
                 nested_virtualization: false,
                 rosetta: false,
@@ -119,12 +114,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn network_config_for_libkrun_user_matches_generated_mac() {
-        let id = MachineId::new();
-        let spec = sample_spec(Vec::new(), true);
-        let config = render_network_config_for_instance(&PathBuf::from(id.to_string()), &spec)
+    fn network_config_for_libkrun_attachment_matches_generated_mac() {
+        let network = Network::UnixDatagram {
+            path: PathBuf::from("/run/bento/net.sock"),
+            mac: "02:00:00:00:00:01".to_string(),
+        };
+        let config = render_network_config_for_instance(&network)
             .expect("network config should render")
-            .expect("user networking should configure network");
+            .expect("runtime attachment should configure network");
 
         assert!(config.contains("version: 2"));
         assert!(config.contains("bento:"));
@@ -138,12 +135,14 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn network_config_for_vz_userspace_matches_generated_mac() {
-        let id = MachineId::new();
-        let spec = sample_spec(Vec::new(), true);
-        let config = render_network_config_for_instance(&PathBuf::from(id.to_string()), &spec)
+    fn network_config_for_vz_attachment_matches_generated_mac() {
+        let network = Network::UnixDatagram {
+            path: PathBuf::from("/run/bento/net.sock"),
+            mac: "02:00:00:00:00:01".to_string(),
+        };
+        let config = render_network_config_for_instance(&network)
             .expect("network config should render")
-            .expect("userspace networking should configure network");
+            .expect("runtime attachment should configure network");
 
         assert!(config.contains("version: 2"));
         assert!(config.contains("bento:"));
@@ -156,17 +155,12 @@ mod tests {
 
     #[test]
     fn network_config_for_vznat_matches_virtio_net_driver() {
-        let id = MachineId::new();
-        let mut spec = sample_spec(Vec::new(), true);
-        spec.network = Network {
-            driver: NetworkDriver::VzNat,
-        };
-        let config = render_network_config_for_instance(&PathBuf::from(id.to_string()), &spec)
+        let config = render_network_config_for_instance(&Network::VzNat { mac: None })
             .expect("network config should render")
             .expect("vznat should configure network");
 
         assert!(config.contains("version: 2"));
-        assert!(config.contains("bento:"));
+        assert!(config.contains("en*:"));
         assert!(config.contains("match:"));
         assert!(config.contains("driver: virtio_net"));
         assert!(!config.contains("macaddress:"));
@@ -192,8 +186,14 @@ mod tests {
 
     #[test]
     fn guest_runtime_defaults_to_ssh_and_dns_when_guest_is_enabled() {
-        let runtime = resolve_guest_runtime_config(&sample_spec(Vec::new(), true))
-            .expect("runtime config should resolve");
+        let runtime = resolve_guest_runtime_config(
+            &sample_spec(Vec::new(), true),
+            &Network::UnixDatagram {
+                path: PathBuf::from("/run/bento/net.sock"),
+                mac: "02:00:00:00:00:01".to_string(),
+            },
+        )
+        .expect("runtime config should resolve");
 
         assert!(runtime.ssh.enabled);
         assert!(runtime.dns.enabled);
@@ -202,12 +202,10 @@ mod tests {
 
     #[test]
     fn guest_runtime_disables_dns_but_keeps_ssh_without_guest_networking() {
-        let mut spec = sample_spec(Vec::new(), true);
-        spec.network = Network {
-            driver: NetworkDriver::None,
-        };
+        let spec = sample_spec(Vec::new(), true);
 
-        let runtime = resolve_guest_runtime_config(&spec).expect("runtime config should resolve");
+        let runtime = resolve_guest_runtime_config(&spec, &Network::None)
+            .expect("runtime config should resolve");
 
         assert!(runtime.ssh.enabled);
         assert!(!runtime.dns.enabled);
@@ -216,7 +214,7 @@ mod tests {
 
     #[test]
     fn guest_runtime_disables_ssh_dns_and_forward_when_guest_is_disabled() {
-        let runtime = resolve_guest_runtime_config(&sample_spec(Vec::new(), false))
+        let runtime = resolve_guest_runtime_config(&sample_spec(Vec::new(), false), &Network::None)
             .expect("runtime config should resolve");
 
         assert!(!runtime.ssh.enabled);
@@ -229,7 +227,8 @@ mod tests {
         let mut spec = sample_spec(Vec::new(), true);
         spec.vsock_endpoints.push(forward_endpoint(4100, None));
 
-        let runtime = resolve_guest_runtime_config(&spec).expect("runtime config should resolve");
+        let runtime = resolve_guest_runtime_config(&spec, &Network::None)
+            .expect("runtime config should resolve");
 
         assert!(runtime.forward.enabled);
         assert_eq!(runtime.forward.port, 4100);
@@ -255,7 +254,8 @@ mod tests {
             })),
         ));
 
-        let runtime = resolve_guest_runtime_config(&spec).expect("runtime config should resolve");
+        let runtime = resolve_guest_runtime_config(&spec, &Network::None)
+            .expect("runtime config should resolve");
 
         assert_eq!(
             runtime
@@ -273,7 +273,8 @@ mod tests {
         let mut spec = sample_spec(Vec::new(), false);
         spec.vsock_endpoints.push(forward_endpoint(4100, None));
 
-        let runtime = resolve_guest_runtime_config(&spec).expect("runtime config should resolve");
+        let runtime = resolve_guest_runtime_config(&spec, &Network::None)
+            .expect("runtime config should resolve");
 
         assert!(!runtime.forward.enabled);
         assert_eq!(runtime.forward.port, 0);
@@ -281,17 +282,13 @@ mod tests {
     }
 }
 
-fn resolve_guest_runtime_config(spec: &VmSpec) -> eyre::Result<AgentConfig> {
+fn resolve_guest_runtime_config(spec: &VmSpec, network: &Network) -> eyre::Result<AgentConfig> {
     Ok(AgentConfig {
         ssh: AgentSshConfig {
             enabled: spec.guest_agent().is_some(),
         },
         dns: AgentDnsConfig {
-            enabled: spec.guest_agent().is_some()
-                && matches!(
-                    spec.network.driver,
-                    NetworkDriver::Gvisor | NetworkDriver::VzNat
-                ),
+            enabled: spec.guest_agent().is_some() && !matches!(network, Network::None),
             ..AgentDnsConfig::default()
         },
         forward: resolve_forward_runtime_config(spec)?,
@@ -344,6 +341,7 @@ fn requires_bootstrap(spec: &VmSpec, guest_runtime: &AgentConfig) -> bool {
 fn rebuild_bootstrap(
     instance_dir: &Path,
     spec: &VmSpec,
+    network: &Network,
     guest_runtime: &AgentConfig,
 ) -> eyre::Result<()> {
     let iso_path = instance_dir.join(InstanceFile::CidataDisk.as_str());
@@ -363,6 +361,7 @@ fn rebuild_bootstrap(
         spec,
         &host_user,
         &user_keys.public_key_openssh,
+        network,
         guest_runtime,
     )
 }
@@ -372,16 +371,17 @@ fn build_cidata_disk(
     spec: &VmSpec,
     host_user: &HostUser,
     ssh_public_key: &str,
+    network: &Network,
     guest_runtime: &AgentConfig,
 ) -> eyre::Result<()> {
     let global_config = GlobalConfig::load()?;
-    let agent_binary_path = ensure_guest_agent_binary(&global_config)?;
+    let agent_binary_path = ensure_guest_binary(&global_config)?;
     let guest_agent_binary = std::fs::read(agent_binary_path)
         .with_context(|| format!("read guest agent binary {}", agent_binary_path.display()))?;
 
     let user_data = render_user_data(spec, host_user, ssh_public_key)?;
     let meta_data = render_meta_data(&spec.name)?;
-    let network_config = render_network_config_for_instance(instance_dir, spec)?;
+    let network_config = render_network_config_for_instance(network)?;
     let agent_config = render_agent_config(guest_runtime)?;
     let config_env = render_config_env(spec)?;
     let iso_path = instance_dir.join(InstanceFile::CidataDisk.as_str());
@@ -661,7 +661,7 @@ fn render_network_config(interface: GuestNetworkInterface) -> eyre::Result<Strin
     let mut ethernets = BTreeMap::new();
     let (id, matches) = match interface {
         GuestNetworkInterface::Driver { driver } => (
-            "bento".to_string(),
+            "en*".to_string(),
             Some(EthernetMatchConfigV2 {
                 driver: Some(driver),
                 macaddress: None,
@@ -696,57 +696,24 @@ enum GuestNetworkInterface {
     Mac { mac: [u8; 6] },
 }
 
-fn render_network_config_for_instance(
-    instance_dir: &Path,
-    spec: &VmSpec,
-) -> eyre::Result<Option<String>> {
-    match spec.network.driver {
-        NetworkDriver::Gvisor if host_uses_configured_guest_mac() => {
-            let machine_id = machine_id_from_instance_dir(instance_dir)?;
-            render_network_config(GuestNetworkInterface::Mac {
-                mac: mac_from_machine_id(machine_id),
-            })
-            .map(Some)
-        }
-        NetworkDriver::Gvisor | NetworkDriver::VzNat => {
-            // Fallback for backends where Bento cannot preconfigure the MAC.
-            // These modes currently expose one virtio-net NIC; multiple NICs
-            // would need a narrower selector to avoid duplicate DHCP clients.
-            render_network_config(GuestNetworkInterface::Driver {
-                driver: "virtio_net",
-            })
-            .map(Some)
-        }
-        NetworkDriver::None => Ok(None),
+fn render_network_config_for_instance(network: &Network) -> eyre::Result<Option<String>> {
+    match network {
+        Network::None => Ok(None),
+        Network::VzNat { .. } => render_network_config(GuestNetworkInterface::Driver {
+            driver: "virtio_net",
+        })
+        .map(Some),
+        Network::UnixDatagram { mac, .. }
+        | Network::UnixStream { mac, .. }
+        | Network::Tap { mac, .. } => render_network_config(GuestNetworkInterface::Mac {
+            mac: parse_mac_string(mac)?,
+        })
+        .map(Some),
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn host_uses_configured_guest_mac() -> bool {
-    true
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn host_uses_configured_guest_mac() -> bool {
-    false
-}
-
-fn machine_id_from_instance_dir(instance_dir: &Path) -> eyre::Result<MachineId> {
-    let name = instance_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            eyre::eyre!(
-                "instance directory has no UTF-8 file name: {}",
-                instance_dir.display()
-            )
-        })?;
-    name.parse::<MachineId>().map_err(|err| {
-        eyre::eyre!(
-            "parse machine id from instance directory {}: {err}",
-            instance_dir.display()
-        )
-    })
+fn parse_mac_string(mac: &str) -> eyre::Result<[u8; 6]> {
+    bento_utils::parse_mac(mac).map_err(|err| eyre::eyre!("parse MAC address {:?}: {err}", mac))
 }
 
 fn render_meta_data(name: &str) -> eyre::Result<String> {

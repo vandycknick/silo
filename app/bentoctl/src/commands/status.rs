@@ -46,7 +46,7 @@ impl Cmd {
                     "state": process_status_label(machine.status),
                     "profile": machine.metadata.get(PROFILE_METADATA_KEY),
                     "image": machine.image_ref,
-                    "network": network_label(machine.spec.network.driver),
+                    "network": machine.network.clone(),
                     "created_at": machine.created_at,
                 }))?
             );
@@ -60,7 +60,7 @@ impl Cmd {
         if !machine.image_ref.is_empty() {
             println!("image: {}", machine.image_ref);
         }
-        println!("network: {}", network_label(machine.spec.network.driver));
+        println!("network: {}", machine.network.name());
         print_process(machine.status);
 
         if !machine.status.is_running() {
@@ -258,22 +258,13 @@ fn lifecycle_label(raw: i32) -> &'static str {
     }
 }
 
-fn network_label(driver: bento_core::NetworkDriver) -> &'static str {
-    match driver {
-        bento_core::NetworkDriver::Gvisor => "isolated",
-        bento_core::NetworkDriver::None => "none",
-        bento_core::NetworkDriver::VzNat => "vznat",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         guest_config_status, now_unix, process_started_at, process_status_label, relative_time,
     };
     use bento_core::{
-        Architecture, Boot, GuestOs, GuestSpec, Network, NetworkDriver, Platform, Resources,
-        Settings, Storage, VmSpec,
+        Architecture, Boot, GuestOs, GuestSpec, Platform, Resources, Settings, Storage, VmSpec,
     };
     use bento_libvm::MachineStatus;
     use std::fs;
@@ -300,9 +291,6 @@ mod tests {
             storage: Storage { disks: Vec::new() },
             mounts: Vec::new(),
             vsock_endpoints: Vec::new(),
-            network: Network {
-                driver: NetworkDriver::Gvisor,
-            },
             settings: Settings {
                 nested_virtualization: false,
                 rosetta: false,

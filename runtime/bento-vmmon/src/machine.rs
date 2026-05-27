@@ -1,15 +1,14 @@
 use std::path::{Path, PathBuf};
 
 use bento_core::{
-    agent::RESERVED_SHELL_PORT, resolve_mount_location, DiskKind, InstanceFile, NetworkDriver,
-    VmSpec, VsockEndpointMode,
+    agent::RESERVED_SHELL_PORT, resolve_mount_location, DiskKind, InstanceFile, Network, VmSpec,
+    VsockEndpointMode,
 };
 use bento_utils::parse_mac;
 use bento_virt::{
-    DiskImage, MachineIdentifier, NetworkMode, SharedDirectory, UserNetwork, UserNetworkTransport,
-    VirtError, VmConfig, VsockPort, VsockPortMode,
+    DiskImage, MachineIdentifier, SharedDirectory, VirtError, VmConfig, VmConfigBuilder, VsockPort,
+    VsockPortMode,
 };
-use serde::Deserialize;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -38,6 +37,7 @@ pub(crate) struct VmSpecInputs<'a> {
     pub id: &'a str,
     pub data_dir: &'a Path,
     pub spec: &'a VmSpec,
+    pub network: &'a Network,
 }
 
 pub(crate) fn vm_spec_machine_config(
@@ -49,17 +49,14 @@ pub(crate) fn vm_spec_machine_config(
     let mut builder = VmConfig::builder(inputs.name)
         .vm_id(inputs.id)
         .base_directory(inputs.data_dir.to_path_buf())
-        .network(map_vm_spec_network_mode(inputs.spec.network.driver))
         .kernel_cmdline(inputs.spec.boot.kernel_cmdline.clone())
         .nested_virtualization(inputs.spec.settings.nested_virtualization)
         .rosetta(inputs.spec.settings.rosetta);
 
+    builder = apply_runtime_network(builder, inputs.network)?;
+
     if let Some(machine_identifier) = machine_identifier.clone() {
         builder = builder.machine_identifier(machine_identifier);
-    }
-
-    if let Some(network) = user_network_from_runtime(inputs.data_dir, inputs.spec)? {
-        builder = builder.user_network(network);
     }
 
     builder = builder
@@ -220,68 +217,37 @@ fn resolve_spec_path(data_dir: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn map_vm_spec_network_mode(driver: NetworkDriver) -> NetworkMode {
-    match driver {
-        NetworkDriver::None => NetworkMode::None,
-        NetworkDriver::Gvisor => NetworkMode::User,
-        NetworkDriver::VzNat => NetworkMode::VzNat,
+fn apply_runtime_network(
+    builder: VmConfigBuilder,
+    network: &Network,
+) -> Result<VmConfigBuilder, MachineSpecError> {
+    match network {
+        Network::None => Ok(builder.no_network()),
+        Network::VzNat { .. } => Ok(builder.vz_nat_network()),
+        Network::UnixDatagram { path, mac } => {
+            Ok(builder.unix_datagram_network(path.clone(), parse_mac_str(mac)?))
+        }
+        Network::UnixStream { .. } => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unixstream network runtime attachments are not supported by the current virt runtime",
+        )
+        .into()),
+        Network::Tap { .. } => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tap network runtime attachments are not supported by the current virt runtime",
+        )
+        .into()),
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct NetworkRuntimeFile {
-    driver: String,
-    transport: NetworkTransportFile,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum NetworkTransportFile {
-    Unixgram { peer_path: PathBuf, mac: String },
-}
-
-fn user_network_from_runtime(
-    data_dir: &Path,
-    spec: &VmSpec,
-) -> Result<Option<UserNetwork>, MachineSpecError> {
-    if !matches!(spec.network.driver, NetworkDriver::Gvisor) || !host_uses_user_network_runtime() {
-        return Ok(None);
-    }
-
-    let path = data_dir.join("net/runtime.json");
-    let raw = std::fs::read_to_string(&path)?;
-    let runtime: NetworkRuntimeFile = serde_json::from_str(&raw).map_err(|err| {
+fn parse_mac_str(mac: &str) -> Result<[u8; 6], MachineSpecError> {
+    parse_mac(mac).map_err(|err| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("parse network runtime {}: {err}", path.display()),
+            format!("parse MAC address: {err}"),
         )
-    })?;
-
-    if runtime.driver != "gvisor" {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "unsupported network runtime {}: driver={}",
-                path.display(),
-                runtime.driver,
-            ),
-        )
-        .into());
-    }
-
-    match runtime.transport {
-        NetworkTransportFile::Unixgram { peer_path, mac } => {
-            let mac = parse_mac(&mac).map_err(|err| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("parse network runtime {} MAC: {err}", path.display()),
-                )
-            })?;
-            Ok(Some(UserNetwork {
-                transport: UserNetworkTransport::Unixgram { peer_path, mac },
-            }))
-        }
-    }
+        .into()
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -298,24 +264,14 @@ fn load_host_machine_identifier(
     Ok(None)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn host_uses_user_network_runtime() -> bool {
-    true
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn host_uses_user_network_runtime() -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{map_vm_spec_network_mode, vm_spec_machine_config, VmSpecInputs};
+    use super::{apply_runtime_network, vm_spec_machine_config, VmSpecInputs};
     use bento_core::{
-        agent::RESERVED_SHELL_PORT, Architecture, Boot, GuestOs, GuestSpec, Network, NetworkDriver,
-        Platform, Resources, Settings, Storage, VmSpec,
+        agent::RESERVED_SHELL_PORT, Architecture, Boot, GuestOs, GuestSpec, Network, Platform,
+        Resources, Settings, Storage, VmSpec,
     };
-    use bento_virt::{UserNetworkTransport, VsockPortMode};
+    use bento_virt::{VmConfig, VsockPortMode};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -329,21 +285,31 @@ mod tests {
     }
 
     #[test]
-    fn gvisor_network_maps_to_userspace_mode() {
-        assert_eq!(
-            map_vm_spec_network_mode(NetworkDriver::Gvisor),
-            bento_virt::NetworkMode::User
-        );
-        assert_eq!(
-            map_vm_spec_network_mode(NetworkDriver::Gvisor),
-            bento_virt::NetworkMode::User
-        );
+    fn unix_datagram_runtime_attachment_maps_to_network_mode() {
+        let config = apply_runtime_network(
+            VmConfig::builder("devbox"),
+            &Network::UnixDatagram {
+                path: PathBuf::from("/tmp/net.sock"),
+                mac: "02:00:00:00:00:01".to_string(),
+            },
+        )
+        .expect("runtime network")
+        .build();
+
+        let (peer_path, mac) = config
+            .unix_datagram_network()
+            .expect("unix datagram network");
+        assert_eq!(peer_path, &PathBuf::from("/tmp/net.sock"));
+        assert_eq!(mac, [0x02, 0, 0, 0, 0, 1]);
     }
 
     #[test]
     fn vznat_network_maps_to_vz_nat_mode() {
         assert_eq!(
-            map_vm_spec_network_mode(NetworkDriver::VzNat),
+            apply_runtime_network(VmConfig::builder("devbox"), &Network::VzNat { mac: None })
+                .expect("runtime network")
+                .build()
+                .network,
             bento_virt::NetworkMode::VzNat
         );
     }
@@ -390,9 +356,6 @@ mod tests {
             storage: Storage { disks: Vec::new() },
             mounts: Vec::new(),
             vsock_endpoints: Vec::new(),
-            network: Network {
-                driver: NetworkDriver::None,
-            },
             settings: Settings {
                 nested_virtualization: false,
                 rosetta: false,
@@ -405,6 +368,7 @@ mod tests {
             id: "vm123",
             data_dir: &dir,
             spec: &spec,
+            network: &Network::None,
         })
         .expect("machine config should resolve");
 
@@ -428,27 +392,13 @@ mod tests {
     }
 
     #[test]
-    fn vm_spec_machine_config_parses_gvisor_runtime_peer_path_and_mac() {
-        let dir = temp_dir("gvisor-runtime");
-        fs::create_dir_all(dir.join("net")).expect("create temp net dir");
+    fn vm_spec_machine_config_parses_unix_datagram_attachment() {
+        let dir = temp_dir("unix-datagram-network");
+        fs::create_dir_all(&dir).expect("create temp dir");
         let kernel = dir.join("kernel");
         let initramfs = dir.join("initramfs");
         fs::write(&kernel, b"kernel").expect("write kernel");
         fs::write(&initramfs, b"initramfs").expect("write initramfs");
-        fs::write(
-            dir.join("net/runtime.json"),
-            r#"{
-  "version": 1,
-  "driver": "gvisor",
-  "subnet": "10.0.2.0/24",
-  "transport": {
-    "kind": "unixgram",
-    "peer_path": "/tmp/gvproxy.sock",
-    "mac": "02:19:e0:00:e2:e6"
-  }
-}"#,
-        )
-        .expect("write runtime");
 
         let spec = VmSpec {
             version: 1,
@@ -480,14 +430,15 @@ mod tests {
             storage: Storage { disks: Vec::new() },
             mounts: Vec::new(),
             vsock_endpoints: Vec::new(),
-            network: Network {
-                driver: NetworkDriver::Gvisor,
-            },
             settings: Settings {
                 nested_virtualization: false,
                 rosetta: false,
             },
             guest: None,
+        };
+        let runtime_network = Network::UnixDatagram {
+            path: PathBuf::from("/tmp/gvproxy.sock"),
+            mac: "02:19:e0:00:e2:e6".to_string(),
         };
 
         let machine_config = vm_spec_machine_config(VmSpecInputs {
@@ -495,19 +446,16 @@ mod tests {
             id: "vm456",
             data_dir: &dir,
             spec: &spec,
+            network: &runtime_network,
         })
         .expect("machine config should resolve");
 
-        let network = machine_config
+        let (peer_path, mac) = machine_config
             .config
-            .user_network
-            .expect("gvisor user network");
-        match network.transport {
-            UserNetworkTransport::Unixgram { peer_path, mac } => {
-                assert_eq!(peer_path, PathBuf::from("/tmp/gvproxy.sock"));
-                assert_eq!(mac, [0x02, 0x19, 0xe0, 0x00, 0xe2, 0xe6]);
-            }
-        }
+            .unix_datagram_network()
+            .expect("unix datagram network");
+        assert_eq!(peer_path, &PathBuf::from("/tmp/gvproxy.sock"));
+        assert_eq!(mac, [0x02, 0x19, 0xe0, 0x00, 0xe2, 0xe6]);
 
         let _ = fs::remove_dir_all(&dir);
     }

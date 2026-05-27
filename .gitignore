@@ -2,6 +2,9 @@
 .tmp
 .opencode
 .direnv
+.codegraph
+
+opencode.jsonc
 
 # will have compiled files and executables
 debug/

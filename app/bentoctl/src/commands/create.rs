@@ -1,15 +1,13 @@
 use bento_core::Mount;
-use bento_libvm::{CreateMachineRequest, LibVm, MachineRef};
+use bento_libvm::{CreateMachineRequest, LibVm, MachineRef, RequestedNetwork};
 use clap::Args;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
-use crate::commands::profile::{parse_label, parse_network_mode, parse_profile_mount};
-use crate::constants::{NETWORK_POLICY_METADATA_KEY, PROFILE_METADATA_KEY};
-use crate::profile::{
-    network_driver_name, resolve_host_path, MountMode, NetworkMode, ProfileStore,
-};
+use crate::commands::profile::{parse_label, parse_profile_mount, parse_requested_network};
+use crate::constants::PROFILE_METADATA_KEY;
+use crate::profile::{resolve_host_path, MountMode, ProfileStore};
 
 #[derive(Args, Debug)]
 #[command(
@@ -71,9 +69,9 @@ pub(crate) struct VmOverrideArgs {
     /// Add a mount or override profile mounts. Format: SRC:DST[:ro|rw].
     #[arg(long = "mount", value_name = "SRC:DST[:MODE]", value_parser = parse_profile_mount)]
     pub mounts: Vec<crate::profile::ProfileMount>,
-    /// Override the profile network mode. Allowed: isolated, none.
-    #[arg(long, value_parser = parse_network_mode)]
-    pub network: Option<NetworkMode>,
+    /// Override the profile network target. Allowed: private, none, NAME, or name:NAME.
+    #[arg(long, value_parser = parse_requested_network)]
+    pub network: Option<RequestedNetwork>,
     /// Add or override a label. Format: KEY=VALUE.
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
     pub labels: Vec<(String, String)>,
@@ -104,7 +102,7 @@ impl Cmd {
             userdata: resolved.userdata,
             disks: resolved.disks,
             mounts: resolved.mounts,
-            network: Some(network_driver_name(resolved.network).to_string()),
+            network: Some(resolved.network),
         };
 
         libvm.create_from_image(request)?;
@@ -130,14 +128,14 @@ impl Cmd {
         let mut metadata = BTreeMap::new();
         let mut mounts = Vec::new();
         let image_ref;
-        let mut network = NetworkMode::Isolated;
+        let mut network = RequestedNetwork::default();
         let mut ssh_enabled = true;
 
         if let Some(profile_name) = profile_name {
             let store = ProfileStore::from_env()?;
             let named = store.resolve(&profile_name)?;
             image_ref = named.profile.image.reference.clone();
-            network = named.profile.network_mode();
+            network = named.profile.requested_network();
             ssh_enabled = named
                 .profile
                 .ssh
@@ -153,11 +151,8 @@ impl Cmd {
             for mount in &self.overrides.mounts {
                 mounts.push(profile_mount_to_mount(mount)?);
             }
-            if let Some(network_override) = self.overrides.network {
+            if let Some(network_override) = self.overrides.network.clone() {
                 network = network_override;
-            }
-            if network == NetworkMode::Isolated {
-                insert_network_policy_metadata(&mut metadata, &named.profile)?;
             }
             return Ok(ResolvedCreate::new(
                 image_ref,
@@ -181,7 +176,7 @@ impl Cmd {
         for mount in &self.overrides.mounts {
             mounts.push(profile_mount_to_mount(mount)?);
         }
-        if let Some(network_override) = self.overrides.network {
+        if let Some(network_override) = self.overrides.network.clone() {
             network = network_override;
         }
 
@@ -197,30 +192,12 @@ impl Cmd {
     }
 }
 
-fn insert_network_policy_metadata(
-    metadata: &mut BTreeMap<String, String>,
-    profile: &crate::profile::Profile,
-) -> eyre::Result<()> {
-    let Some(policy) = profile
-        .network
-        .as_ref()
-        .and_then(|network| network.policy.as_ref())
-    else {
-        return Ok(());
-    };
-    metadata.insert(
-        NETWORK_POLICY_METADATA_KEY.to_string(),
-        serde_json::to_string(policy)?,
-    );
-    Ok(())
-}
-
 struct ResolvedCreate {
     image_ref: String,
     labels: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
     mounts: Vec<Mount>,
-    network: NetworkMode,
+    network: RequestedNetwork,
     ssh_enabled: bool,
     cpus: Option<u8>,
     memory_mib: Option<u32>,
@@ -239,7 +216,7 @@ impl ResolvedCreate {
         labels: BTreeMap<String, String>,
         metadata: BTreeMap<String, String>,
         mounts: Vec<Mount>,
-        network: NetworkMode,
+        network: RequestedNetwork,
         ssh_enabled: bool,
         overrides: &VmOverrideArgs,
     ) -> Self {

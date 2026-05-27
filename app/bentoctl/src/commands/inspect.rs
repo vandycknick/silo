@@ -31,11 +31,7 @@ impl Cmd {
         } else {
             "stopped"
         };
-        let network = match machine.spec.network.driver {
-            bento_core::NetworkDriver::Gvisor => "isolated",
-            bento_core::NetworkDriver::None => "none",
-            bento_core::NetworkDriver::VzNat => "vznat",
-        };
+        let network_name = machine.network.name();
         if self.json {
             println!(
                 "{}",
@@ -47,7 +43,7 @@ impl Cmd {
                     "image": machine.image_ref,
                     "labels": machine.labels,
                     "metadata": machine.metadata,
-                    "network": network,
+                    "network": machine.network.clone(),
                     "created_at": machine.created_at,
                     "dir": machine.dir,
                     "spec": machine.spec,
@@ -64,7 +60,7 @@ impl Cmd {
         if !machine.image_ref.is_empty() {
             println!("image: {}", machine.image_ref);
         }
-        println!("network: {network}");
+        println!("network: {network_name}");
         if !machine.labels.is_empty() {
             println!("labels:");
             for (key, value) in machine.labels {

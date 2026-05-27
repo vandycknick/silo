@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
 use bento_core::Mount;
-use bento_libvm::{CreateMachineRequest, LibVm, MachineRef};
+use bento_libvm::{CreateMachineRequest, LibVm, MachineRef, RequestedNetwork};
 use clap::Args;
 
 use crate::commands::create::{profile_mount_to_mount, VmOverrideArgs};
-use crate::constants::{DEFAULT_PROFILE_NAME, NETWORK_POLICY_METADATA_KEY, PROFILE_METADATA_KEY};
-use crate::profile::{network_driver_name, NetworkMode, ProfileStore};
+use crate::constants::{DEFAULT_PROFILE_NAME, PROFILE_METADATA_KEY};
+use crate::profile::ProfileStore;
 use crate::ssh;
 
 #[derive(Args, Debug)]
@@ -70,7 +70,7 @@ impl Cmd {
             userdata: resolved.userdata,
             disks: resolved.disks,
             mounts: resolved.mounts,
-            network: Some(network_driver_name(resolved.network).to_string()),
+            network: Some(resolved.network),
         };
 
         let machine = libvm.create_from_image(request)?;
@@ -111,8 +111,7 @@ impl Cmd {
         let mut labels = BTreeMap::new();
         let mut metadata = BTreeMap::new();
         let mut mounts = Vec::<Mount>::new();
-        let mut network = NetworkMode::Isolated;
-        let mut network_policy_metadata = None;
+        let mut network = RequestedNetwork::default();
         let mut ssh_enabled = true;
         let image_ref;
         let prefix;
@@ -129,7 +128,7 @@ impl Cmd {
             let store = ProfileStore::from_env()?;
             let named = store.resolve(&selected)?;
             image_ref = named.profile.image.reference.clone();
-            network = named.profile.network_mode();
+            network = named.profile.requested_network();
             ssh_enabled = named
                 .profile
                 .ssh
@@ -138,7 +137,6 @@ impl Cmd {
                 .unwrap_or(true);
             labels = named.profile.labels.clone();
             metadata.insert(PROFILE_METADATA_KEY.to_string(), named.name.clone());
-            network_policy_metadata = network_policy_json(&named.profile)?;
             mounts = named.profile.resolved_mounts()?;
             prefix = named.name.clone();
         }
@@ -149,13 +147,8 @@ impl Cmd {
         for mount in &self.overrides.mounts {
             mounts.push(profile_mount_to_mount(mount)?);
         }
-        if let Some(network_override) = self.overrides.network {
+        if let Some(network_override) = self.overrides.network.clone() {
             network = network_override;
-        }
-        if network == NetworkMode::Isolated {
-            if let Some(policy) = network_policy_metadata {
-                metadata.insert(NETWORK_POLICY_METADATA_KEY.to_string(), policy);
-            }
         }
 
         let name = libvm.allocate_ephemeral_name(&prefix)?;
@@ -180,24 +173,13 @@ impl Cmd {
     }
 }
 
-fn network_policy_json(profile: &crate::profile::Profile) -> eyre::Result<Option<String>> {
-    let Some(policy) = profile
-        .network
-        .as_ref()
-        .and_then(|network| network.policy.as_ref())
-    else {
-        return Ok(None);
-    };
-    Ok(Some(serde_json::to_string(policy)?))
-}
-
 struct ResolvedRun {
     name: String,
     image_ref: String,
     labels: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
     mounts: Vec<Mount>,
-    network: NetworkMode,
+    network: RequestedNetwork,
     ssh_enabled: bool,
     cpus: Option<u8>,
     memory_mib: Option<u32>,

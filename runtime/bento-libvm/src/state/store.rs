@@ -5,66 +5,32 @@ use std::time::Duration;
 use bento_core::MachineId;
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::network::config::{NetworkDefinitionSpec, RequestedNetwork};
+use crate::state::migrations::run_migrations;
+use crate::state::models::{
+    MachineState, NetworkAttachmentState, NetworkDefinitionState, NetworkInstanceState,
+};
 use crate::{Layout, LibVmError};
 
-const SCHEMA_VERSION: i64 = 3;
 const MACHINE_COLUMNS: &str =
-    "id, name, instance_dir, created_at, modified_at, image_ref, json(labels), json(metadata)";
+    "id, name, instance_dir, created_at, modified_at, image_ref, json(labels), json(metadata), json(network)";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MachineState {
-    pub id: MachineId,
-    pub name: String,
-    pub instance_dir: String,
-    pub created_at: i64,
-    pub modified_at: i64,
-    pub image_ref: String,
-    pub labels: BTreeMap<String, String>,
-    pub metadata: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetworkInstanceState {
-    pub id: String,
-    pub driver: String,
-    pub definition_name: Option<String>,
-    pub subnet_cidr: String,
-    pub runtime_dir: String,
-    pub helper_pid: i32,
-    pub transport_socket_path: String,
-    pub log_path: String,
-    pub pid_file_path: String,
-    pub pcap_path: Option<String>,
-    pub state: String,
-    pub created_at: i64,
-    pub modified_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetworkAttachmentState {
-    pub machine_id: MachineId,
-    pub network_instance_id: String,
-    pub guest_mac: String,
-    pub created_at: i64,
-    pub modified_at: i64,
-}
-
-pub struct StateStore {
+pub(crate) struct StateStore {
     conn: Connection,
 }
 
 impl StateStore {
-    pub fn open(layout: &Layout) -> Result<Self, LibVmError> {
+    pub(crate) fn open(layout: &Layout) -> Result<Self, LibVmError> {
         std::fs::create_dir_all(layout.data_dir())?;
         let conn = open_connection(&layout.state_db_path())?;
         run_migrations(&conn)?;
         Ok(Self { conn })
     }
 
-    pub fn insert_machine(&self, machine: &MachineState) -> Result<(), LibVmError> {
+    pub(crate) fn insert_machine(&self, machine: &MachineState) -> Result<(), LibVmError> {
         self.conn.execute(
-            "INSERT INTO machines (id, name, instance_dir, created_at, modified_at, image_ref, labels, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, jsonb(?7), jsonb(?8))",
+            "INSERT INTO machines (id, name, instance_dir, created_at, modified_at, image_ref, labels, metadata, network)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, jsonb(?7), jsonb(?8), jsonb(?9))",
             params![
                 machine.id.to_string(),
                 machine.name,
@@ -74,12 +40,32 @@ impl StateStore {
                 machine.image_ref,
                 serialize_map("labels", &machine.labels)?,
                 serialize_map("metadata", &machine.metadata)?,
+                serialize_network(&machine.network)?,
             ],
         )?;
         Ok(())
     }
 
-    pub fn get_machine_by_id(&self, id: MachineId) -> Result<Option<MachineState>, LibVmError> {
+    pub(crate) fn update_machine_network(
+        &self,
+        machine_id: MachineId,
+        network: &RequestedNetwork,
+    ) -> Result<(), LibVmError> {
+        self.conn.execute(
+            "UPDATE machines SET network = jsonb(?1), modified_at = ?2 WHERE id = ?3",
+            params![
+                serialize_network(network)?,
+                now_unix(),
+                machine_id.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn get_machine_by_id(
+        &self,
+        id: MachineId,
+    ) -> Result<Option<MachineState>, LibVmError> {
         self.conn
             .query_row(
                 &format!("SELECT {MACHINE_COLUMNS} FROM machines WHERE id = ?1"),
@@ -90,7 +76,10 @@ impl StateStore {
             .map_err(LibVmError::from)
     }
 
-    pub fn get_machine_by_name(&self, name: &str) -> Result<Option<MachineState>, LibVmError> {
+    pub(crate) fn get_machine_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<MachineState>, LibVmError> {
         self.conn
             .query_row(
                 &format!("SELECT {MACHINE_COLUMNS} FROM machines WHERE name = ?1"),
@@ -101,7 +90,10 @@ impl StateStore {
             .map_err(LibVmError::from)
     }
 
-    pub fn get_machine_by_id_prefix(&self, prefix: &str) -> Result<Vec<MachineState>, LibVmError> {
+    pub(crate) fn get_machine_by_id_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<MachineState>, LibVmError> {
         let pattern = format!("{prefix}%");
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {MACHINE_COLUMNS} FROM machines WHERE id LIKE ?1"
@@ -114,7 +106,7 @@ impl StateStore {
         Ok(machines)
     }
 
-    pub fn list_machines(&self) -> Result<Vec<MachineState>, LibVmError> {
+    pub(crate) fn list_machines(&self) -> Result<Vec<MachineState>, LibVmError> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {MACHINE_COLUMNS} FROM machines ORDER BY name"
         ))?;
@@ -126,7 +118,7 @@ impl StateStore {
         Ok(machines)
     }
 
-    pub fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError> {
+    pub(crate) fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError> {
         for index in 1..10_000u32 {
             let candidate = format!("{prefix}-{index}");
             if self.get_machine_by_name(&candidate)?.is_none() {
@@ -140,7 +132,7 @@ impl StateStore {
         })
     }
 
-    pub fn remove_machine(&self, machine: &MachineState) -> Result<(), LibVmError> {
+    pub(crate) fn remove_machine(&self, machine: &MachineState) -> Result<(), LibVmError> {
         self.conn.execute(
             "DELETE FROM machines WHERE id = ?1",
             params![machine.id.to_string()],
@@ -148,7 +140,7 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn get_network_attachment(
+    pub(crate) fn get_network_attachment(
         &self,
         machine_id: MachineId,
     ) -> Result<Option<NetworkAttachmentState>, LibVmError> {
@@ -163,14 +155,14 @@ impl StateStore {
             .map_err(LibVmError::from)
     }
 
-    pub fn get_network_instance(
+    pub(crate) fn get_network_instance(
         &self,
         network_id: &str,
     ) -> Result<Option<NetworkInstanceState>, LibVmError> {
         self.conn
             .query_row(
-                "SELECT id, driver, definition_name, subnet_cidr, runtime_dir, helper_pid,
-                        transport_socket_path, log_path, pid_file_path, pcap_path, state, created_at, modified_at
+                "SELECT id, driver, definition_name, runtime_dir, json(attachment_json),
+                        json(driver_state_json), state, created_at, modified_at
                  FROM network_instances WHERE id = ?1",
                 params![network_id],
                 row_to_network_instance,
@@ -179,38 +171,30 @@ impl StateStore {
             .map_err(LibVmError::from)
     }
 
-    pub fn upsert_network_instance(
+    pub(crate) fn upsert_network_instance(
         &self,
         instance: &NetworkInstanceState,
     ) -> Result<(), LibVmError> {
         self.conn.execute(
             "INSERT INTO network_instances
-                (id, driver, definition_name, subnet_cidr, runtime_dir, helper_pid,
-                 transport_socket_path, log_path, pid_file_path, pcap_path, state, created_at, modified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                (id, driver, definition_name, runtime_dir, attachment_json, driver_state_json,
+                 state, created_at, modified_at)
+             VALUES (?1, ?2, ?3, ?4, jsonb(?5), jsonb(?6), ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
                 driver = excluded.driver,
                 definition_name = excluded.definition_name,
-                subnet_cidr = excluded.subnet_cidr,
                 runtime_dir = excluded.runtime_dir,
-                helper_pid = excluded.helper_pid,
-                transport_socket_path = excluded.transport_socket_path,
-                log_path = excluded.log_path,
-                pid_file_path = excluded.pid_file_path,
-                pcap_path = excluded.pcap_path,
+                attachment_json = excluded.attachment_json,
+                driver_state_json = excluded.driver_state_json,
                 state = excluded.state,
                 modified_at = excluded.modified_at",
             params![
                 instance.id,
                 instance.driver,
                 instance.definition_name,
-                instance.subnet_cidr,
                 instance.runtime_dir,
-                instance.helper_pid,
-                instance.transport_socket_path,
-                instance.log_path,
-                instance.pid_file_path,
-                instance.pcap_path,
+                instance.attachment_json,
+                instance.driver_state_json,
                 instance.state,
                 instance.created_at,
                 instance.modified_at,
@@ -219,7 +203,7 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn upsert_network_attachment(
+    pub(crate) fn upsert_network_attachment(
         &self,
         attachment: &NetworkAttachmentState,
     ) -> Result<(), LibVmError> {
@@ -242,7 +226,10 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn remove_network_attachment(&self, machine_id: MachineId) -> Result<(), LibVmError> {
+    pub(crate) fn remove_network_attachment(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<(), LibVmError> {
         self.conn.execute(
             "DELETE FROM network_attachments WHERE machine_id = ?1",
             params![machine_id.to_string()],
@@ -250,10 +237,108 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn remove_network_instance(&self, network_id: &str) -> Result<(), LibVmError> {
+    pub(crate) fn remove_network_instance(&self, network_id: &str) -> Result<(), LibVmError> {
         self.conn.execute(
             "DELETE FROM network_instances WHERE id = ?1",
             params![network_id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn get_network_instance_by_definition(
+        &self,
+        definition_name: &str,
+    ) -> Result<Option<NetworkInstanceState>, LibVmError> {
+        self.conn
+            .query_row(
+                "SELECT id, driver, definition_name, runtime_dir, json(attachment_json),
+                        json(driver_state_json), state, created_at, modified_at
+                 FROM network_instances WHERE definition_name = ?1",
+                params![definition_name],
+                row_to_network_instance,
+            )
+            .optional()
+            .map_err(LibVmError::from)
+    }
+
+    pub(crate) fn count_network_attachments(&self, network_id: &str) -> Result<u32, LibVmError> {
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM network_attachments WHERE network_instance_id = ?1",
+            params![network_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    pub(crate) fn upsert_network_definition(
+        &self,
+        definition: &NetworkDefinitionSpec,
+    ) -> Result<(), LibVmError> {
+        let now = now_unix();
+        self.conn.execute(
+            "INSERT INTO network_definitions (name, mode, driver_preference, created_at, modified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(name) DO UPDATE SET
+                mode = excluded.mode,
+                driver_preference = excluded.driver_preference,
+                modified_at = excluded.modified_at",
+            params![
+                definition.name,
+                serde_json::to_string(&definition.mode).map_err(|err| {
+                    LibVmError::InvalidCreateRequest {
+                        name: definition.name.clone(),
+                        reason: format!("serialize network mode: {err}"),
+                    }
+                })?,
+                serde_json::to_string(&definition.driver_preference).map_err(|err| {
+                    LibVmError::InvalidCreateRequest {
+                        name: definition.name.clone(),
+                        reason: format!("serialize network driver preference: {err}"),
+                    }
+                })?,
+                now,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn list_network_definitions(
+        &self,
+    ) -> Result<Vec<NetworkDefinitionSpec>, LibVmError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, mode, driver_preference, created_at, modified_at
+             FROM network_definitions ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], row_to_network_definition)?;
+        let mut definitions = Vec::new();
+        for row in rows {
+            definitions.push(network_definition_spec_from_state(&row?)?);
+        }
+        Ok(definitions)
+    }
+
+    pub(crate) fn get_network_definition(
+        &self,
+        name: &str,
+    ) -> Result<Option<NetworkDefinitionSpec>, LibVmError> {
+        self.conn
+            .query_row(
+                "SELECT name, mode, driver_preference, created_at, modified_at
+                 FROM network_definitions WHERE name = ?1",
+                params![name],
+                row_to_network_definition,
+            )
+            .optional()
+            .map_err(LibVmError::from)?
+            .map(|state| network_definition_spec_from_state(&state))
+            .transpose()
+    }
+
+    pub(crate) fn remove_network_definition(&self, name: &str) -> Result<(), LibVmError> {
+        self.conn.execute(
+            "DELETE FROM network_definitions WHERE name = ?1",
+            params![name],
         )?;
         Ok(())
     }
@@ -268,71 +353,6 @@ fn open_connection(path: &Path) -> Result<Connection, LibVmError> {
     Ok(conn)
 }
 
-fn run_migrations(conn: &Connection) -> Result<(), LibVmError> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS machines (
-            id             TEXT PRIMARY KEY,
-            name           TEXT NOT NULL UNIQUE,
-            instance_dir   TEXT NOT NULL,
-            created_at     INTEGER NOT NULL,
-            modified_at    INTEGER NOT NULL,
-            image_ref      TEXT NOT NULL DEFAULT '',
-            labels         BLOB NOT NULL,
-            metadata       BLOB NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS network_instances (
-            id                      TEXT PRIMARY KEY,
-            driver                  TEXT NOT NULL,
-            definition_name         TEXT,
-            subnet_cidr             TEXT NOT NULL,
-            runtime_dir             TEXT NOT NULL,
-            helper_pid              INTEGER NOT NULL,
-            transport_socket_path   TEXT NOT NULL,
-            log_path                TEXT NOT NULL,
-            pid_file_path           TEXT NOT NULL,
-            pcap_path               TEXT,
-            state                   TEXT NOT NULL,
-            created_at              INTEGER NOT NULL,
-            modified_at             INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS network_attachments (
-            machine_id              TEXT NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
-            network_instance_id     TEXT NOT NULL REFERENCES network_instances(id) ON DELETE CASCADE,
-            guest_mac               TEXT NOT NULL,
-            created_at              INTEGER NOT NULL,
-            modified_at             INTEGER NOT NULL,
-            PRIMARY KEY (machine_id)
-        );
-        CREATE TRIGGER IF NOT EXISTS machines_created_at_immutable
-        BEFORE UPDATE OF created_at ON machines
-        BEGIN
-            SELECT RAISE(ABORT, 'machines.created_at is immutable');
-        END;
-        CREATE TRIGGER IF NOT EXISTS network_instances_created_at_immutable
-        BEFORE UPDATE OF created_at ON network_instances
-        BEGIN
-            SELECT RAISE(ABORT, 'network_instances.created_at is immutable');
-        END;
-        CREATE TRIGGER IF NOT EXISTS network_attachments_created_at_immutable
-        BEFORE UPDATE OF created_at ON network_attachments
-        BEGIN
-            SELECT RAISE(ABORT, 'network_attachments.created_at is immutable');
-        END;
-        ",
-    )?;
-
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-
-    debug_assert_eq!(
-        conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
-            .unwrap_or(0),
-        SCHEMA_VERSION,
-        "schema version mismatch after migration"
-    );
-
-    Ok(())
-}
-
 fn row_to_machine_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineState> {
     let id_str: String = row.get(0)?;
     let id: MachineId = id_str.parse().map_err(|err| {
@@ -340,6 +360,7 @@ fn row_to_machine_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineStat
     })?;
     let labels = deserialize_map(row, 6)?;
     let metadata = deserialize_map(row, 7)?;
+    let network = deserialize_network(row, 8)?;
     Ok(MachineState {
         id,
         name: row.get(1)?,
@@ -349,6 +370,7 @@ fn row_to_machine_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<MachineStat
         image_ref: row.get(5)?,
         labels,
         metadata,
+        network,
     })
 }
 
@@ -362,10 +384,65 @@ fn serialize_map(
     })
 }
 
+fn serialize_network(network: &RequestedNetwork) -> Result<String, LibVmError> {
+    serde_json::to_string(network).map_err(|err| LibVmError::InvalidCreateRequest {
+        name: "network".to_string(),
+        reason: format!("serialize network: {err}"),
+    })
+}
+
+fn row_to_network_definition(row: &rusqlite::Row<'_>) -> rusqlite::Result<NetworkDefinitionState> {
+    Ok(NetworkDefinitionState {
+        name: row.get(0)?,
+        mode: row.get(1)?,
+        driver_preference: row.get(2)?,
+        created_at: row.get(3)?,
+        modified_at: row.get(4)?,
+    })
+}
+
+fn network_definition_spec_from_state(
+    state: &NetworkDefinitionState,
+) -> Result<NetworkDefinitionSpec, LibVmError> {
+    let mode =
+        serde_json::from_str(&state.mode).map_err(|err| LibVmError::InvalidCreateRequest {
+            name: state.name.clone(),
+            reason: format!("parse network definition mode: {err}"),
+        })?;
+    let driver_preference = serde_json::from_str(&state.driver_preference).map_err(|err| {
+        LibVmError::InvalidCreateRequest {
+            name: state.name.clone(),
+            reason: format!("parse network driver preference: {err}"),
+        }
+    })?;
+    Ok(NetworkDefinitionSpec {
+        name: state.name.clone(),
+        mode,
+        driver_preference,
+    })
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 fn deserialize_map(
     row: &rusqlite::Row<'_>,
     index: usize,
 ) -> rusqlite::Result<BTreeMap<String, String>> {
+    let value: String = row.get(index)?;
+    serde_json::from_str(&value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn deserialize_network(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<RequestedNetwork> {
     let value: String = row.get(index)?;
     serde_json::from_str(&value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(err))
@@ -377,16 +454,12 @@ fn row_to_network_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<NetworkI
         id: row.get(0)?,
         driver: row.get(1)?,
         definition_name: row.get(2)?,
-        subnet_cidr: row.get(3)?,
-        runtime_dir: row.get(4)?,
-        helper_pid: row.get(5)?,
-        transport_socket_path: row.get(6)?,
-        log_path: row.get(7)?,
-        pid_file_path: row.get(8)?,
-        pcap_path: row.get(9)?,
-        state: row.get(10)?,
-        created_at: row.get(11)?,
-        modified_at: row.get(12)?,
+        runtime_dir: row.get(3)?,
+        attachment_json: row.get(4)?,
+        driver_state_json: row.get(5)?,
+        state: row.get(6)?,
+        created_at: row.get(7)?,
+        modified_at: row.get(8)?,
     })
 }
 
@@ -404,56 +477,17 @@ fn row_to_network_attachment(row: &rusqlite::Row<'_>) -> rusqlite::Result<Networ
     })
 }
 
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs() as i64
-}
-
-#[cfg(test)]
-pub fn machine_state_from_path(id: MachineId, name: String, instance_dir: &Path) -> MachineState {
-    machine_state_from_path_with_details(
-        id,
-        name,
-        instance_dir,
-        String::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
-    )
-}
-
-pub fn machine_state_from_path_with_details(
-    id: MachineId,
-    name: String,
-    instance_dir: &Path,
-    image_ref: String,
-    labels: BTreeMap<String, String>,
-    metadata: BTreeMap<String, String>,
-) -> MachineState {
-    let now = now_unix();
-    MachineState {
-        id,
-        name,
-        instance_dir: instance_dir.display().to_string(),
-        created_at: now,
-        modified_at: now,
-        image_ref,
-        labels,
-        metadata,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use bento_core::MachineId;
 
-    use super::{
-        machine_state_from_path, NetworkAttachmentState, NetworkInstanceState, StateStore,
-    };
+    use crate::network::config::RequestedNetwork;
+    use crate::state::{machine_state_from_path, NetworkAttachmentState, NetworkInstanceState};
     use crate::Layout;
+
+    use super::StateStore;
 
     fn temp_layout() -> (tempfile::TempDir, Layout) {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -512,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn labels_and_metadata_round_trip_as_jsonb_blobs() {
+    fn labels_metadata_and_network_round_trip_as_jsonb_blobs() {
         let (_dir, layout) = temp_layout();
         let store = StateStore::open(&layout).expect("open store");
         let id = MachineId::new();
@@ -521,13 +555,14 @@ mod tests {
         let mut metadata = BTreeMap::new();
         metadata.insert("bento.profile".to_string(), "rust-dev".to_string());
 
-        let machine = super::machine_state_from_path_with_details(
+        let machine = crate::state::machine_state_from_path_with_details(
             id,
             "jsonb-test".to_string(),
             &layout.instance_dir(id),
             "test-image:latest".to_string(),
             labels,
             metadata,
+            RequestedNetwork::default(),
         );
 
         store.insert_machine(&machine).expect("insert machine");
@@ -541,6 +576,7 @@ mod tests {
             found.metadata.get("bento.profile").map(String::as_str),
             Some("rust-dev")
         );
+        assert_eq!(found.network, RequestedNetwork::default());
         let storage_type: String = store
             .conn
             .query_row(
@@ -605,15 +641,11 @@ mod tests {
         let network_id = "netbox-runtime".to_string();
         let instance = NetworkInstanceState {
             id: network_id.clone(),
-            driver: "gvisor".to_string(),
+            driver: "netd".to_string(),
             definition_name: None,
-            subnet_cidr: "192.168.105.0/24".to_string(),
             runtime_dir: "/tmp/netbox-runtime".to_string(),
-            helper_pid: 1234,
-            transport_socket_path: "/tmp/gvproxy.sock".to_string(),
-            log_path: "/tmp/gvproxy.log".to_string(),
-            pid_file_path: "/tmp/gvproxy.pid".to_string(),
-            pcap_path: None,
+            attachment_json: r#"{"kind":"none"}"#.to_string(),
+            driver_state_json: r#"{"helper_pid":1234}"#.to_string(),
             state: "running".to_string(),
             created_at: 41,
             modified_at: 42,
@@ -676,15 +708,11 @@ mod tests {
         store
             .upsert_network_instance(&NetworkInstanceState {
                 id: network_id.clone(),
-                driver: "gvisor".to_string(),
+                driver: "netd".to_string(),
                 definition_name: None,
-                subnet_cidr: "192.168.105.0/24".to_string(),
                 runtime_dir: "/tmp/immutable-runtime".to_string(),
-                helper_pid: 1234,
-                transport_socket_path: "/tmp/gvproxy.sock".to_string(),
-                log_path: "/tmp/gvproxy.log".to_string(),
-                pid_file_path: "/tmp/gvproxy.pid".to_string(),
-                pcap_path: None,
+                attachment_json: r#"{"kind":"none"}"#.to_string(),
+                driver_state_json: r#"{"helper_pid":1234}"#.to_string(),
                 state: "running".to_string(),
                 created_at: 41,
                 modified_at: 42,

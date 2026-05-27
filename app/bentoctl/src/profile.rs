@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use bento_core::Mount;
+use bento_core::{NetworkPolicySpec, NetworkProtocol};
+use bento_libvm::RequestedNetwork;
 use eyre::{bail, Context};
 use serde::{Deserialize, Serialize};
 
@@ -49,56 +51,54 @@ pub(crate) struct ProfileMount {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ProfileNetwork {
-    pub mode: NetworkMode,
+pub(crate) struct ProfileNetworkConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy: Option<NetworkPolicy>,
+    pub kind: Option<ProfileNetworkKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<NetworkPolicySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_ref: Option<NetworkPolicyRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct NetworkPolicy {
-    #[serde(default = "default_policy_action")]
-    pub default_action: PolicyAction,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audit_log: Option<AuditLogPolicy>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cidr_rules: Vec<CidrRule>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AuditLogPolicy {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CidrRule {
-    pub name: String,
-    pub action: PolicyAction,
-    pub dest_cidrs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub protocols: Vec<PolicyProtocol>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+pub(crate) struct NetworkPolicyRef {
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum PolicyAction {
-    Allow,
-    Deny,
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProfileNetworkKind {
+    Private,
+    None,
+    Named,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum PolicyProtocol {
-    Tcp,
-    Udp,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ProfileNetwork {
+    Private {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<NetworkPolicySpec>,
+    },
+    None,
+    Named {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<NetworkPolicySpec>,
+    },
+}
+
+impl<'de> Deserialize<'de> for ProfileNetwork {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = ProfileNetworkConfig::deserialize(deserializer)?;
+        normalize_network(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,13 +121,6 @@ pub(crate) struct ProfileSsh {
 pub(crate) enum MountMode {
     Ro,
     Rw,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum NetworkMode {
-    Isolated,
-    None,
 }
 
 pub(crate) struct ProfileStore {
@@ -231,11 +224,26 @@ impl ProfileStore {
 }
 
 impl Profile {
-    pub fn network_mode(&self) -> NetworkMode {
+    pub fn network(&self) -> ProfileNetwork {
         self.network
-            .as_ref()
-            .map(|network| network.mode)
-            .unwrap_or(NetworkMode::Isolated)
+            .clone()
+            .unwrap_or(ProfileNetwork::Private { policy: None })
+    }
+
+    pub fn requested_network(&self) -> RequestedNetwork {
+        match self.network() {
+            ProfileNetwork::Private { policy } => RequestedNetwork::Private { policy },
+            ProfileNetwork::None => RequestedNetwork::None,
+            ProfileNetwork::Named { name, policy } => RequestedNetwork::Named { name, policy },
+        }
+    }
+
+    pub fn network_name(&self) -> String {
+        match self.network() {
+            ProfileNetwork::Private { .. } => "private".to_string(),
+            ProfileNetwork::None => "none".to_string(),
+            ProfileNetwork::Named { name, .. } => name,
+        }
     }
 
     pub fn resolved_mounts(&self) -> eyre::Result<Vec<Mount>> {
@@ -257,6 +265,49 @@ pub(crate) fn parse_profile(raw: &str) -> eyre::Result<Profile> {
     let profile: Profile = serde_yaml_ng::from_str(raw).context("deserialize profile yaml")?;
     validate_profile(&profile)?;
     Ok(profile)
+}
+
+fn normalize_network(raw: ProfileNetworkConfig) -> eyre::Result<ProfileNetwork> {
+    if let Some(name) = raw.name.as_deref() {
+        if matches!(name, "private" | "none") {
+            bail!(
+                "invalid network config: {:?} is a reserved network name",
+                name
+            );
+        }
+    }
+    if raw.policy.is_some() && raw.policy_ref.is_some() {
+        bail!("invalid network config: policy and policy_ref are mutually exclusive");
+    }
+    if raw.policy_ref.is_some() {
+        bail!(
+            "invalid network config: policy_ref is reserved for external policy files but is not supported yet"
+        );
+    }
+    match (raw.kind, raw.name) {
+        (Some(ProfileNetworkKind::Private), Some(name)) => bail!(
+            "invalid network config: kind \"private\" cannot be combined with name {:?}",
+            name
+        ),
+        (Some(ProfileNetworkKind::None), Some(name)) => bail!(
+            "invalid network config: kind \"none\" cannot be combined with name {:?}",
+            name
+        ),
+        (Some(ProfileNetworkKind::Named), None) => {
+            bail!("invalid network config: kind \"named\" requires field \"name\"")
+        }
+        (Some(ProfileNetworkKind::Private), None) => {
+            Ok(ProfileNetwork::Private { policy: raw.policy })
+        }
+        (Some(ProfileNetworkKind::None), None) => Ok(ProfileNetwork::None),
+        (Some(ProfileNetworkKind::Named), Some(name)) | (None, Some(name)) => {
+            Ok(ProfileNetwork::Named {
+                name,
+                policy: raw.policy,
+            })
+        }
+        (None, None) => Ok(ProfileNetwork::Private { policy: raw.policy }),
+    }
 }
 
 pub(crate) fn validate_profile(profile: &Profile) -> eyre::Result<()> {
@@ -289,10 +340,12 @@ pub(crate) fn validate_profile(profile: &Profile) -> eyre::Result<()> {
         }
     }
     if let Some(network) = &profile.network {
-        if network.policy.is_some() && network.mode != NetworkMode::Isolated {
-            bail!("network.policy is only supported with network.mode: isolated");
-        }
-        if let Some(policy) = &network.policy {
+        if let Some(policy) = match network {
+            ProfileNetwork::Private { policy } | ProfileNetwork::Named { policy, .. } => {
+                policy.as_ref()
+            }
+            ProfileNetwork::None => None,
+        } {
             validate_network_policy(policy)?;
             if let Some(path) = policy
                 .audit_log
@@ -311,7 +364,7 @@ pub(crate) fn validate_profile(profile: &Profile) -> eyre::Result<()> {
     Ok(())
 }
 
-fn validate_network_policy(policy: &NetworkPolicy) -> eyre::Result<()> {
+fn validate_network_policy(policy: &NetworkPolicySpec) -> eyre::Result<()> {
     let mut names = BTreeMap::new();
     for rule in &policy.cidr_rules {
         if rule.name.trim().is_empty() {
@@ -320,11 +373,20 @@ fn validate_network_policy(policy: &NetworkPolicy) -> eyre::Result<()> {
         if names.insert(rule.name.clone(), ()).is_some() {
             bail!("duplicate network.policy.cidr_rules name `{}`", rule.name);
         }
-        if rule.dest_cidrs.is_empty() {
+        if rule.source_cidrs.is_empty() && rule.dest_cidrs.is_empty() {
             bail!(
-                "network.policy.cidr_rules `{}` requires dest_cidrs",
+                "network.policy.cidr_rules `{}` requires source_cidrs or dest_cidrs",
                 rule.name
             );
+        }
+        for protocol in &rule.protocols {
+            if matches!(protocol, NetworkProtocol::Any) && rule.protocols.len() > 1 {
+                bail!("network.policy.cidr_rules `{}` cannot combine protocol any with other protocols", rule.name);
+            }
+        }
+        for cidr in &rule.source_cidrs {
+            validate_cidr(cidr)
+                .with_context(|| format!("invalid CIDR in rule `{}`: {cidr}", rule.name))?;
         }
         for cidr in &rule.dest_cidrs {
             validate_cidr(cidr)
@@ -360,20 +422,6 @@ pub(crate) fn resolve_host_path(path: &Path) -> eyre::Result<PathBuf> {
     Ok(absolute)
 }
 
-pub(crate) fn network_driver_name(mode: NetworkMode) -> &'static str {
-    match mode {
-        NetworkMode::Isolated => "gvisor",
-        NetworkMode::None => "none",
-    }
-}
-
-pub(crate) fn network_mode_label(mode: NetworkMode) -> &'static str {
-    match mode {
-        NetworkMode::Isolated => "isolated",
-        NetworkMode::None => "none",
-    }
-}
-
 fn built_in_default_profile() -> NamedProfile {
     NamedProfile {
         name: DEFAULT_PROFILE_NAME.to_string(),
@@ -385,10 +433,7 @@ fn built_in_default_profile() -> NamedProfile {
                 reference: DEFAULT_PROFILE_IMAGE.to_string(),
             },
             mounts: Vec::new(),
-            network: Some(ProfileNetwork {
-                mode: NetworkMode::Isolated,
-                policy: None,
-            }),
+            network: Some(ProfileNetwork::Private { policy: None }),
             ssh: Some(ProfileSsh {
                 enabled: true,
                 github_users: Vec::new(),
@@ -450,23 +495,19 @@ fn default_mount_mode() -> MountMode {
     MountMode::Rw
 }
 
-fn default_policy_action() -> PolicyAction {
-    PolicyAction::Allow
-}
-
 #[cfg(test)]
 mod tests {
     use crate::profile::parse_profile;
 
     #[test]
-    fn parses_isolated_network_policy() {
+    fn parses_private_network_policy() {
         let profile = parse_profile(
             r#"
 version: "1"
 image:
   ref: "ubuntu:24.04"
 network:
-  mode: isolated
+  kind: private
   policy:
     default_action: allow
     audit_log:
@@ -484,51 +525,68 @@ network:
         let policy = profile
             .network
             .as_ref()
-            .and_then(|network| network.policy.as_ref())
+            .and_then(|network| match network {
+                super::ProfileNetwork::Private { policy }
+                | super::ProfileNetwork::Named { policy, .. } => policy.as_ref(),
+                super::ProfileNetwork::None => None,
+            })
             .expect("network policy");
         assert_eq!(policy.cidr_rules.len(), 1);
         assert!(policy.audit_log.as_ref().is_some_and(|audit| audit.enabled));
     }
 
     #[test]
-    fn rejects_policy_on_non_isolated_network() {
+    fn rejects_removed_isolated_network_mode() {
         let err = parse_profile(
             r#"
 version: "1"
 image:
   ref: "ubuntu:24.04"
 network:
-  mode: none
-  policy:
-    cidr_rules:
-      - name: deny-private
-        action: deny
-        dest_cidrs: ["10.0.0.0/8"]
+  kind: isolated
 "#,
         )
-        .expect_err("policy on network none should fail");
+        .expect_err("isolated should fail");
 
-        assert!(err.to_string().contains("network.policy"));
+        assert!(err
+            .chain()
+            .any(|cause| cause.to_string().contains("isolated")));
     }
 
     #[test]
-    fn rejects_observe_policy_action() {
+    fn rejects_reserved_network_names() {
         let err = parse_profile(
             r#"
 version: "1"
 image:
   ref: "ubuntu:24.04"
 network:
-  mode: isolated
-  policy:
-    cidr_rules:
-      - name: observe-private
-        action: observe
-        dest_cidrs: ["10.0.0.0/8"]
+  name: private
 "#,
         )
-        .expect_err("observe action should fail");
+        .expect_err("reserved network name should fail");
 
-        assert!(err.to_string().contains("deserialize profile yaml"));
+        assert!(err
+            .chain()
+            .any(|cause| cause.to_string().contains("reserved network name")));
+    }
+
+    #[test]
+    fn parses_named_network_shorthand() {
+        let profile = parse_profile(
+            r#"
+version: "1"
+image:
+  ref: "ubuntu:24.04"
+network:
+  name: dev
+"#,
+        )
+        .expect("named network shorthand should parse");
+
+        assert!(matches!(
+            profile.network,
+            Some(super::ProfileNetwork::Named { ref name, .. }) if name == "dev"
+        ));
     }
 }
