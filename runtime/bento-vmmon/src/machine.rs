@@ -73,16 +73,8 @@ pub(crate) fn vm_spec_machine_config(
 
         match disk.kind {
             DiskKind::Root => builder = builder.root_disk(disk_image),
-            DiskKind::Data | DiskKind::Seed => builder = builder.disk(disk_image),
+            DiskKind::Data => builder = builder.disk(disk_image),
         }
-    }
-
-    let cidata_path = inputs.data_dir.join(InstanceFile::CidataDisk.as_str());
-    if cidata_path.is_file() {
-        builder = builder.disk(DiskImage {
-            path: cidata_path,
-            read_only: true,
-        });
     }
 
     for mount in &inputs.spec.mounts {
@@ -268,8 +260,8 @@ fn load_host_machine_identifier(
 mod tests {
     use super::{apply_runtime_network, vm_spec_machine_config, VmSpecInputs};
     use bento_core::{
-        agent::RESERVED_SHELL_PORT, Architecture, Boot, GuestOs, GuestSpec, Network, Platform,
-        Resources, Settings, Storage, VmSpec,
+        agent::RESERVED_SHELL_PORT, Architecture, Boot, Disk, DiskKind, GuestOs, GuestSpec,
+        InstanceFile, Network, Platform, Resources, Settings, Storage, VmSpec,
     };
     use bento_virt::{VmConfig, VsockPortMode};
     use std::fs;
@@ -387,6 +379,111 @@ mod tests {
             .vsock_ports
             .iter()
             .any(|port| port.port == RESERVED_SHELL_PORT && port.mode == VsockPortMode::Connect));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vm_spec_machine_config_does_not_attach_implicit_cidata_disk() {
+        let dir = temp_dir("implicit-cidata");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        fs::write(dir.join(InstanceFile::CidataDisk.as_str()), b"cidata")
+            .expect("write cidata disk");
+
+        let spec = VmSpec {
+            version: 1,
+            name: "devbox".to_string(),
+            platform: Platform {
+                guest_os: GuestOs::Linux,
+                architecture: Architecture::Aarch64,
+            },
+            resources: Resources {
+                cpus: 2,
+                memory_mib: 1024,
+            },
+            boot: Boot {
+                kernel: None,
+                initramfs: None,
+                kernel_cmdline: Vec::new(),
+                bootstrap: None,
+            },
+            storage: Storage { disks: Vec::new() },
+            mounts: Vec::new(),
+            vsock_endpoints: Vec::new(),
+            settings: Settings {
+                nested_virtualization: false,
+                rosetta: false,
+            },
+            guest: None,
+        };
+
+        let machine_config = vm_spec_machine_config(VmSpecInputs {
+            name: &spec.name,
+            id: "vm789",
+            data_dir: &dir,
+            spec: &spec,
+            network: &Network::None,
+        })
+        .expect("machine config should resolve");
+
+        assert!(machine_config.config.data_disks.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vm_spec_machine_config_attaches_declared_cidata_disk() {
+        let dir = temp_dir("declared-cidata");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let spec = VmSpec {
+            version: 1,
+            name: "devbox".to_string(),
+            platform: Platform {
+                guest_os: GuestOs::Linux,
+                architecture: Architecture::Aarch64,
+            },
+            resources: Resources {
+                cpus: 2,
+                memory_mib: 1024,
+            },
+            boot: Boot {
+                kernel: None,
+                initramfs: None,
+                kernel_cmdline: Vec::new(),
+                bootstrap: None,
+            },
+            storage: Storage {
+                disks: vec![Disk {
+                    path: PathBuf::from(InstanceFile::CidataDisk.as_str()),
+                    kind: DiskKind::Data,
+                    read_only: true,
+                }],
+            },
+            mounts: Vec::new(),
+            vsock_endpoints: Vec::new(),
+            settings: Settings {
+                nested_virtualization: false,
+                rosetta: false,
+            },
+            guest: None,
+        };
+
+        let machine_config = vm_spec_machine_config(VmSpecInputs {
+            name: &spec.name,
+            id: "vm790",
+            data_dir: &dir,
+            spec: &spec,
+            network: &Network::None,
+        })
+        .expect("machine config should resolve");
+
+        assert_eq!(machine_config.config.data_disks.len(), 1);
+        assert_eq!(
+            machine_config.config.data_disks[0].path,
+            dir.join(InstanceFile::CidataDisk.as_str())
+        );
+        assert!(machine_config.config.data_disks[0].read_only);
 
         let _ = fs::remove_dir_all(&dir);
     }

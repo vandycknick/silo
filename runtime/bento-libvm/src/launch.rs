@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bento_core::agent::{
     AgentConfig, AgentDnsConfig, AgentForwardConfig, AgentSshConfig, AgentUdsForwardConfig,
 };
-use bento_core::{resolve_mount_location, InstanceFile, Network, VmSpec};
+use bento_core::{resolve_mount_location, Disk, DiskKind, InstanceFile, Network, VmSpec};
 use bento_utils::format_mac;
 use eyre::Context;
 use fatfs::{format_volume, FileSystem, FormatVolumeOptions, FsOptions};
@@ -57,10 +57,22 @@ struct MonitorMount {
 }
 
 pub(crate) fn prepare_instance_runtime(instance_dir: &Path, network: &Network) -> eyre::Result<()> {
-    let spec = read_vm_spec_from_dir(instance_dir)?;
+    let mut spec = read_vm_spec_from_dir(instance_dir)?;
     let guest_runtime = resolve_guest_runtime_config(&spec, network)?;
+    let needs_bootstrap = requires_bootstrap(&spec, &guest_runtime);
+    let spec_changed = reconcile_cidata_disk(&mut spec, needs_bootstrap);
 
-    rebuild_bootstrap(instance_dir, &spec, network, &guest_runtime)?;
+    rebuild_bootstrap(
+        instance_dir,
+        &spec,
+        network,
+        &guest_runtime,
+        needs_bootstrap,
+    )?;
+    if spec_changed {
+        write_vm_spec_to_dir(instance_dir, &spec)?;
+    }
+
     Ok(())
 }
 
@@ -72,12 +84,60 @@ fn read_vm_spec_from_dir(instance_dir: &Path) -> eyre::Result<VmSpec> {
         .map_err(|err| eyre::eyre!("parse vm spec at {}: {}", config_path.display(), err))
 }
 
+fn write_vm_spec_to_dir(instance_dir: &Path, spec: &VmSpec) -> eyre::Result<()> {
+    let config_path = instance_dir.join(InstanceFile::Config.as_str());
+    let config = serde_yaml_ng::to_string(spec)
+        .with_context(|| format!("serialize vm spec at {}", config_path.display()))?;
+    std::fs::write(&config_path, config)
+        .with_context(|| format!("write vm spec at {}", config_path.display()))
+}
+
+fn reconcile_cidata_disk(spec: &mut VmSpec, required: bool) -> bool {
+    let cidata_disk = Disk {
+        path: PathBuf::from(InstanceFile::CidataDisk.as_str()),
+        kind: DiskKind::Data,
+        read_only: true,
+    };
+    let mut disks = Vec::with_capacity(spec.storage.disks.len() + usize::from(required));
+    let mut found_cidata = false;
+    let mut changed = false;
+
+    for disk in &spec.storage.disks {
+        if disk.path != cidata_disk.path {
+            disks.push(disk.clone());
+            continue;
+        }
+
+        if required && !found_cidata {
+            if disk != &cidata_disk {
+                changed = true;
+            }
+            disks.push(cidata_disk.clone());
+            found_cidata = true;
+        } else {
+            changed = true;
+        }
+    }
+
+    if required && !found_cidata {
+        disks.push(cidata_disk);
+        changed = true;
+    }
+
+    if changed {
+        spec.storage.disks = disks;
+    }
+
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::{render_network_config_for_instance, resolve_guest_runtime_config};
     use bento_core::{
-        Architecture, Boot, GuestOs, GuestSpec, LifecycleSpec, Network, Platform, PluginSpec,
-        Resources, Settings, Storage, VmSpec, VsockEndpointMode, VsockEndpointSpec,
+        Architecture, Boot, Disk, DiskKind, GuestOs, GuestSpec, InstanceFile, LifecycleSpec,
+        Network, Platform, PluginSpec, Resources, Settings, Storage, VmSpec, VsockEndpointMode,
+        VsockEndpointSpec,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -280,6 +340,48 @@ mod tests {
         assert_eq!(runtime.forward.port, 0);
         assert!(runtime.forward.uds.is_empty());
     }
+
+    #[test]
+    fn cidata_disk_reconciliation_adds_read_only_data_disk() {
+        let mut spec = sample_spec(Vec::new(), true);
+
+        assert!(super::reconcile_cidata_disk(&mut spec, true));
+        assert_eq!(
+            spec.storage.disks,
+            vec![Disk {
+                path: PathBuf::from(InstanceFile::CidataDisk.as_str()),
+                kind: DiskKind::Data,
+                read_only: true,
+            }]
+        );
+        assert!(!super::reconcile_cidata_disk(&mut spec, true));
+    }
+
+    #[test]
+    fn cidata_disk_reconciliation_removes_managed_disk() {
+        let mut spec = sample_spec(Vec::new(), false);
+        spec.storage.disks.push(Disk {
+            path: PathBuf::from("data.img"),
+            kind: DiskKind::Data,
+            read_only: false,
+        });
+        spec.storage.disks.push(Disk {
+            path: PathBuf::from(InstanceFile::CidataDisk.as_str()),
+            kind: DiskKind::Data,
+            read_only: true,
+        });
+
+        assert!(super::reconcile_cidata_disk(&mut spec, false));
+        assert_eq!(
+            spec.storage.disks,
+            vec![Disk {
+                path: PathBuf::from("data.img"),
+                kind: DiskKind::Data,
+                read_only: false,
+            }]
+        );
+        assert!(!super::reconcile_cidata_disk(&mut spec, false));
+    }
 }
 
 fn resolve_guest_runtime_config(spec: &VmSpec, network: &Network) -> eyre::Result<AgentConfig> {
@@ -343,9 +445,10 @@ fn rebuild_bootstrap(
     spec: &VmSpec,
     network: &Network,
     guest_runtime: &AgentConfig,
+    required: bool,
 ) -> eyre::Result<()> {
     let iso_path = instance_dir.join(InstanceFile::CidataDisk.as_str());
-    if !requires_bootstrap(spec, guest_runtime) {
+    if !required {
         if iso_path.exists() {
             std::fs::remove_file(&iso_path)
                 .with_context(|| format!("remove stale cidata {}", iso_path.display()))?;

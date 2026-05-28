@@ -188,7 +188,6 @@ pub struct Disk {
 pub enum DiskKind {
     Root,
     Data,
-    Seed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,8 +341,8 @@ mod tests {
                         read_only: false,
                     },
                     Disk {
-                        path: PathBuf::from("/seed.img"),
-                        kind: DiskKind::Seed,
+                        path: PathBuf::from("/data.img"),
+                        kind: DiskKind::Data,
                         read_only: true,
                     },
                 ],
@@ -399,7 +398,7 @@ mod tests {
         assert!(yaml.contains("architecture: aarch64"));
         assert!(!yaml.contains("backend:"));
         assert!(yaml.contains("kind: root"));
-        assert!(yaml.contains("kind: seed"));
+        assert!(yaml.contains("kind: data"));
         assert!(yaml.contains("vsock_endpoints:"));
         assert!(yaml.contains("guest:"));
         assert!(yaml.contains("control_port: 1027"));
