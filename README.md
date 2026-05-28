@@ -22,19 +22,19 @@ BentoBox draws inspiration from these projects, which helped shape its architect
 
 ## Getting Started
 
-Install with Nix profile:
+Enter the Nix development shell:
 
 ```bash
-nix profile install .#bentoctl
+nix develop
 ```
 
-This installs `bento` and the compatibility alias `bentoctl`. The examples below use `bento`.
+The shell provides the Rust, Go, and native build tools used by this repository.
 
-Or build locally with Nix:
+Build BentoBox and its host runtime helpers locally:
 
 ```bash
-nix build .#bentoctl
-./result/bin/bento --help
+make build
+./target/debug/bento --help
 ```
 
 ## CLI Layout

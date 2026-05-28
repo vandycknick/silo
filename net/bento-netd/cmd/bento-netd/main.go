@@ -80,7 +80,7 @@ func run(args []string) error {
 		}
 		return vn.AcceptVfkit(ctx, vfkitConn)
 	})
-	slog.Info("bento-netd ready", "listen_vfkit", cfg.ListenVfkit, "subnet", cfg.Stack.Subnet)
+	slog.Info("netd ready", "listen_vfkit", cfg.ListenVfkit, "subnet", cfg.Stack.Subnet)
 	return group.Wait()
 }
 

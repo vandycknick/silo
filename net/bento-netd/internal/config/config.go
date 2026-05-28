@@ -84,7 +84,7 @@ func Parse(args []string) (*Config, error) {
 	var listenVfkit, subnet, pidFile, logFile, pcapFile, vmID, networkID, profileName, policyFile, auditLog string
 	var sshPort int
 
-	flags := flag.NewFlagSet("bento-netd", flag.ContinueOnError)
+	flags := flag.NewFlagSet("netd", flag.ContinueOnError)
 	flags.StringVar(&listenVfkit, "listen-vfkit", "", "unixgram socket used by vfkit-compatible applications")
 	flags.IntVar(&sshPort, "ssh-port", 2222, "guest SSH host forward port, or -1 to disable")
 	flags.StringVar(&subnet, "subnet", "192.168.127.0/24", "guest network subnet")

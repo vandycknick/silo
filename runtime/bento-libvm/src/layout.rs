@@ -85,16 +85,15 @@ impl Layout {
     }
 
     pub fn network_socket_path(&self, network_id: &str) -> PathBuf {
-        self.network_instance_dir(network_id)
-            .join("bento-netd.sock")
+        self.network_instance_dir(network_id).join("netd.sock")
     }
 
     pub fn network_log_path(&self, network_id: &str) -> PathBuf {
-        self.network_instance_dir(network_id).join("bento-netd.log")
+        self.network_instance_dir(network_id).join("netd.log")
     }
 
     pub fn network_pid_path(&self, network_id: &str) -> PathBuf {
-        self.network_instance_dir(network_id).join("bento-netd.pid")
+        self.network_instance_dir(network_id).join("netd.pid")
     }
 
     pub fn network_pcap_path(&self, network_id: &str) -> PathBuf {
@@ -223,15 +222,15 @@ mod tests {
         );
         assert_eq!(
             layout.network_socket_path(network_id),
-            PathBuf::from("/tmp/bento/net/net123/bento-netd.sock")
+            PathBuf::from("/tmp/bento/net/net123/netd.sock")
         );
         assert_eq!(
             layout.network_log_path(network_id),
-            PathBuf::from("/tmp/bento/net/net123/bento-netd.log")
+            PathBuf::from("/tmp/bento/net/net123/netd.log")
         );
         assert_eq!(
             layout.network_pid_path(network_id),
-            PathBuf::from("/tmp/bento/net/net123/bento-netd.pid")
+            PathBuf::from("/tmp/bento/net/net123/netd.pid")
         );
         assert_eq!(
             layout.network_pcap_path(network_id),

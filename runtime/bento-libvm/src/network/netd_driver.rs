@@ -20,9 +20,9 @@ use super::{
     remove_file_if_exists, remove_runtime_dir, serialize_json, write_runtime_file, DRIVER_NETD,
 };
 
-const BENTO_NETD_BINARY_ENV: &str = "BENTO_NETD_BIN";
-const BENTO_NETD_BINARY_NAME: &str = "bento-netd";
-const BENTO_NETD_DISABLE_SSH_PORT: &str = "-1";
+const NETD_BINARY_ENV: &str = "NETD_BIN";
+const NETD_BINARY_NAME: &str = "netd";
+const NETD_DISABLE_SSH_PORT: &str = "-1";
 const RUNNING_STATE: &str = "running";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -102,7 +102,7 @@ async fn prepare_netd_runtime(
     let policy_file = write_network_policy_file(request.policy, &policy_path)?;
 
     let log = File::options().create(true).append(true).open(&log_path)?;
-    let mut command = Command::new(resolve_bento_netd_binary());
+    let mut command = Command::new(resolve_netd_binary());
     configure_network_helper_command(
         &mut command,
         &NetworkHelperCommandConfig {
@@ -196,7 +196,7 @@ async fn prepare_netd_runtime(
     let metadata = _ctx.metadata;
     Err(LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
-        message: "bento-netd networking is not supported on this host".to_string(),
+        message: "netd networking is not supported on this host".to_string(),
     })
 }
 
@@ -250,7 +250,7 @@ fn configure_network_helper_command(
         .arg("--listen-vfkit")
         .arg(format!("unixgram://{}", config.socket_path.display()))
         .arg("--ssh-port")
-        .arg(BENTO_NETD_DISABLE_SSH_PORT)
+        .arg(NETD_DISABLE_SSH_PORT)
         .arg("--subnet")
         .arg(config.subnet)
         .arg("--log-file")
@@ -355,9 +355,8 @@ async fn wait_for_socket(path: &Path) -> Result<(), String> {
     }
 }
 
-fn resolve_bento_netd_binary() -> String {
-    std::env::var(BENTO_NETD_BINARY_ENV)
-        .unwrap_or_else(|_| resolve_sibling_binary(BENTO_NETD_BINARY_NAME))
+fn resolve_netd_binary() -> String {
+    std::env::var(NETD_BINARY_ENV).unwrap_or_else(|_| resolve_sibling_binary(NETD_BINARY_NAME))
 }
 
 fn resolve_sibling_binary(name: &str) -> String {
@@ -407,14 +406,14 @@ mod tests {
 
     #[test]
     fn netd_command_disables_default_ssh_forward() {
-        let mut command = Command::new("bento-netd");
+        let mut command = Command::new("netd");
         configure_network_helper_command(
             &mut command,
             &NetworkHelperCommandConfig {
-                socket_path: Path::new("/tmp/bento-net/bento-netd.sock"),
+                socket_path: Path::new("/tmp/bento-net/netd.sock"),
                 subnet: "192.168.105.0/24",
-                log_path: Path::new("/tmp/bento-net/bento-netd.log"),
-                pid_path: Path::new("/tmp/bento-net/bento-netd.pid"),
+                log_path: Path::new("/tmp/bento-net/netd.log"),
+                pid_path: Path::new("/tmp/bento-net/netd.pid"),
                 pcap_path: None,
                 machine_id: bento_core::MachineId::new(),
                 network_id: "net123",
@@ -433,15 +432,15 @@ mod tests {
 
     #[test]
     fn netd_command_adds_policy_metadata() {
-        let mut command = Command::new("bento-netd");
+        let mut command = Command::new("netd");
         let machine_id = bento_core::MachineId::new();
         configure_network_helper_command(
             &mut command,
             &NetworkHelperCommandConfig {
-                socket_path: Path::new("/tmp/bento-net/bento-netd.sock"),
+                socket_path: Path::new("/tmp/bento-net/netd.sock"),
                 subnet: "192.168.105.0/24",
-                log_path: Path::new("/tmp/bento-net/bento-netd.log"),
-                pid_path: Path::new("/tmp/bento-net/bento-netd.pid"),
+                log_path: Path::new("/tmp/bento-net/netd.log"),
+                pid_path: Path::new("/tmp/bento-net/netd.pid"),
                 pcap_path: None,
                 machine_id,
                 network_id: "net123",

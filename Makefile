@@ -10,10 +10,13 @@ export KRUN_DEPS_DIR
 
 ifeq ($(HOST_OS),Darwin)
 HOST_WORKSPACE_EXCLUDES := --exclude bento-agent
+HOST_BUILD_COMPONENTS := vmmon netd
 else ifeq ($(HOST_OS),Linux)
 HOST_WORKSPACE_EXCLUDES := --exclude bento-vz
+HOST_BUILD_COMPONENTS := vmmon netd krun
 else
 HOST_WORKSPACE_EXCLUDES := --exclude bento-agent --exclude bento-vz
+HOST_BUILD_COMPONENTS := vmmon netd
 endif
 
 ifeq ($(PROFILE),release)
@@ -27,7 +30,7 @@ $(error PROFILE must be debug or release)
 endif
 
 VMMON_BIN := target/$(TARGET_PROFILE_DIR)/vmmon
-BENTO_NETD_BIN := target/$(TARGET_PROFILE_DIR)/bento-netd
+NETD_BIN := target/$(TARGET_PROFILE_DIR)/netd
 
 ifeq ($(PROFILE),release)
 GO_BUILD_FLAGS := -ldflags "-s -w"
@@ -43,7 +46,7 @@ build-guest-agent:
 	@echo "Updated $(BENTO_CONFIG) -> $(GUEST_BIN)"
 
 .PHONY: build
-build: vmmon krun bento-netd
+build: $(HOST_BUILD_COMPONENTS)
 	cargo build $(CARGO_PROFILE_FLAGS) -p bentoctl
 
 .PHONY: clippy
@@ -67,10 +70,10 @@ vmmon:
 krun:
 	cargo build $(CARGO_PROFILE_FLAGS) -p bento-krun --features krun-bin --bin krun
 
-.PHONY: bento-netd
-bento-netd:
+.PHONY: netd
+netd:
 	@mkdir -p "target/$(TARGET_PROFILE_DIR)"
-	cd net/bento-netd && go build $(GO_BUILD_FLAGS) -o "$(CURDIR)/$(BENTO_NETD_BIN)" ./cmd/bento-netd
+	cd net/bento-netd && go build $(GO_BUILD_FLAGS) -o "$(CURDIR)/$(NETD_BIN)" ./cmd/bento-netd
 
 .PHONY: kernel
 kernel:

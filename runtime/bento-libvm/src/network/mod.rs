@@ -389,7 +389,7 @@ mod tests {
     fn runtime_file_serializes_resolved_attachment() {
         let dir = tempfile::tempdir().expect("temp dir");
         let attachment = bento_core::Network::UnixDatagram {
-            path: dir.path().join("bento-netd.sock"),
+            path: dir.path().join("netd.sock"),
             mac: "02:19:e0:00:e2:e6".to_string(),
         };
 
