@@ -104,15 +104,14 @@ type rawCredential struct {
 }
 
 type rawRule struct {
-	Name          string
-	Endpoints     []Ref
-	Verdict       Action
-	Priority      int
-	Disabled      bool
-	Condition     string
-	Reason        string
-	CredentialRef *Ref
-	order         int
+	Name      string
+	Endpoints []Ref
+	Verdict   Action
+	Priority  int
+	Disabled  bool
+	Condition string
+	Reason    string
+	order     int
 }
 
 func decodeSettings(policy *Policy, block *hcl.Block) error {
@@ -298,6 +297,15 @@ func (p *Policy) addCredential(raw rawCredential) error {
 	if _, ok := p.httpsEndpoints[raw.Endpoint.String()]; !ok {
 		return fmt.Errorf("credential %q.%q references unknown endpoint %q", raw.Kind, raw.Name, raw.Endpoint.String())
 	}
+	if existing := p.credentialByEndpoint[raw.Endpoint.String()]; existing != nil {
+		return fmt.Errorf(
+			"credential %q.%q references endpoint %q, but credential %q already references that endpoint; credentials and endpoints must be one-to-one",
+			raw.Kind,
+			raw.Name,
+			raw.Endpoint.String(),
+			Ref{Kind: existing.Kind, Name: existing.Name}.String(),
+		)
+	}
 	if !filepath.IsAbs(raw.ValueFile) {
 		return fmt.Errorf("credential %q.%q value_file must be absolute: %s", raw.Kind, raw.Name, raw.ValueFile)
 	}
@@ -315,6 +323,7 @@ func (p *Policy) addCredential(raw rawCredential) error {
 		return fmt.Errorf("duplicate credential %q", key)
 	}
 	p.credentials[key] = credential
+	p.credentialByEndpoint[raw.Endpoint.String()] = credential
 	return nil
 }
 
@@ -326,7 +335,6 @@ func decodeRule(block *hcl.Block, order int) (rawRule, error) {
 		{Name: "verdict"},
 		{Name: "priority"},
 		{Name: "disabled"},
-		{Name: "credential"},
 		{Name: "reason"},
 	}})
 	if diagnostics.HasErrors() {
@@ -386,13 +394,6 @@ func decodeRule(block *hcl.Block, order int) (rawRule, error) {
 		}
 		rule.Disabled = disabled
 	}
-	if credentialAttr, ok := content.Attributes["credential"]; ok {
-		credential, err := decodeRefAttr(credentialAttr)
-		if err != nil {
-			return rawRule{}, fmt.Errorf("decode rule %q credential: %w", rule.Name, err)
-		}
-		rule.CredentialRef = &credential
-	}
 	if reasonAttr, ok := content.Attributes["reason"]; ok {
 		reason, err := decodeStringAttr(reasonAttr)
 		if err != nil {
@@ -411,15 +412,14 @@ func (p *Policy) addRule(raw rawRule) error {
 		return fmt.Errorf("rule %q: %w", raw.Name, err)
 	}
 	rule := &Rule{
-		Name:          raw.Name,
-		Endpoints:     raw.Endpoints,
-		Verdict:       raw.Verdict,
-		Priority:      raw.Priority,
-		Disabled:      raw.Disabled,
-		Condition:     raw.Condition,
-		Reason:        raw.Reason,
-		CredentialRef: raw.CredentialRef,
-		order:         raw.order,
+		Name:      raw.Name,
+		Endpoints: raw.Endpoints,
+		Verdict:   raw.Verdict,
+		Priority:  raw.Priority,
+		Disabled:  raw.Disabled,
+		Condition: raw.Condition,
+		Reason:    raw.Reason,
+		order:     raw.order,
 	}
 	switch raw.Endpoints[0].Kind {
 	case "cidr":
@@ -430,9 +430,6 @@ func (p *Policy) addRule(raw rawRule) error {
 		}
 		if raw.Condition != "" {
 			return fmt.Errorf("rule %q condition is only supported for https endpoint rules", raw.Name)
-		}
-		if raw.CredentialRef != nil {
-			return fmt.Errorf("rule %q credential is only supported for https endpoint rules", raw.Name)
 		}
 		p.cidrRules = append(p.cidrRules, rule)
 	case "https":
@@ -447,16 +444,6 @@ func (p *Policy) addRule(raw rawRule) error {
 				return fmt.Errorf("rule %q condition: %w", raw.Name, err)
 			}
 			rule.program = program
-		}
-		if raw.CredentialRef != nil {
-			credential, ok := p.credentials[raw.CredentialRef.String()]
-			if !ok {
-				return fmt.Errorf("rule %q references unknown credential %q", raw.Name, raw.CredentialRef.String())
-			}
-			if !endpointListContains(raw.Endpoints, credential.Endpoint) {
-				return fmt.Errorf("rule %q credential %q is bound to endpoint %q", raw.Name, raw.CredentialRef.String(), credential.Endpoint.String())
-			}
-			rule.Credential = credential
 		}
 		p.httpsRules = append(p.httpsRules, rule)
 	default:
@@ -485,13 +472,4 @@ func validateEndpointFamily(refs []Ref) error {
 		}
 	}
 	return nil
-}
-
-func endpointListContains(endpoints []Ref, needle Ref) bool {
-	for _, endpoint := range endpoints {
-		if endpoint == needle {
-			return true
-		}
-	}
-	return false
 }

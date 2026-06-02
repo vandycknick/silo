@@ -30,9 +30,10 @@ type Policy struct {
 	DefaultAction Action
 	auditLogPath  string
 
-	cidrEndpoints  map[string]*CIDREndpoint
-	httpsEndpoints map[string]*HTTPSEndpoint
-	credentials    map[string]*Credential
+	cidrEndpoints        map[string]*CIDREndpoint
+	httpsEndpoints       map[string]*HTTPSEndpoint
+	credentials          map[string]*Credential
+	credentialByEndpoint map[string]*Credential
 
 	cidrRules  []*Rule
 	httpsRules []*Rule
@@ -60,17 +61,15 @@ type Credential struct {
 }
 
 type Rule struct {
-	Name          string
-	Endpoints     []Ref
-	Verdict       Action
-	Priority      int
-	Disabled      bool
-	Condition     string
-	Reason        string
-	CredentialRef *Ref
-	Credential    *Credential
-	order         int
-	program       cel.Program
+	Name      string
+	Endpoints []Ref
+	Verdict   Action
+	Priority  int
+	Disabled  bool
+	Condition string
+	Reason    string
+	order     int
+	program   cel.Program
 }
 
 type Flow struct {
@@ -108,10 +107,11 @@ type Decision struct {
 
 func Default() *Policy {
 	return &Policy{
-		DefaultAction:  ActionAllow,
-		cidrEndpoints:  make(map[string]*CIDREndpoint),
-		httpsEndpoints: make(map[string]*HTTPSEndpoint),
-		credentials:    make(map[string]*Credential),
+		DefaultAction:        ActionAllow,
+		cidrEndpoints:        make(map[string]*CIDREndpoint),
+		httpsEndpoints:       make(map[string]*HTTPSEndpoint),
+		credentials:          make(map[string]*Credential),
+		credentialByEndpoint: make(map[string]*Credential),
 	}
 }
 

@@ -46,7 +46,6 @@ rule "local-reads" {
   endpoint = https.local
   condition = "http.method == 'GET'"
   verdict = "allow"
-  credential = bearer_token.local
 }
 `), 0o600); err != nil {
 		t.Fatal(err)

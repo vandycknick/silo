@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -67,7 +68,6 @@ rule "github-reads" {
   endpoint = https.github
   condition = "http.method in ['GET', 'HEAD']"
   verdict = "allow"
-  credential = bearer_token.github
   priority = 10
 }
 `)
@@ -128,6 +128,9 @@ rule "github-reads" {
 	if writeDecision.Action != ActionDeny || writeDecision.RuleName != "github-writes" {
 		t.Fatalf("expected github write deny, got %#v", writeDecision)
 	}
+	if writeDecision.Credential != nil {
+		t.Fatalf("expected denied github write to skip credential injection, got %#v", writeDecision.Credential)
+	}
 }
 
 func TestLoadFileRejectsRelativeCredentialValueFile(t *testing.T) {
@@ -146,6 +149,75 @@ credential "bearer_token" "github" {
 
 	if _, err := LoadFile(policyPath); err == nil {
 		t.Fatal("expected relative value_file to be rejected")
+	}
+}
+
+func TestLoadFileRejectsMultipleCredentialsForEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "github-token")
+	if err := os.WriteFile(tokenPath, []byte("secret-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backupTokenPath := filepath.Join(dir, "github-backup-token")
+	if err := os.WriteFile(backupTokenPath, []byte("backup-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	policyPath := filepath.Join(dir, "policy.hcl")
+	writePolicy(t, policyPath, `
+endpoint "https" "github" {
+  hosts = ["api.github.com"]
+}
+
+credential "bearer_token" "github" {
+  endpoint = https.github
+  value_file = "`+tokenPath+`"
+}
+
+credential "bearer_token" "github_backup" {
+  endpoint = https.github
+  value_file = "`+backupTokenPath+`"
+}
+`)
+
+	_, err := LoadFile(policyPath)
+	if err == nil {
+		t.Fatal("expected multiple credentials for one endpoint to be rejected")
+	}
+	if !strings.Contains(err.Error(), "one-to-one") {
+		t.Fatalf("expected one-to-one credential error, got %v", err)
+	}
+}
+
+func TestLoadFileRejectsRuleCredential(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "github-token")
+	if err := os.WriteFile(tokenPath, []byte("secret-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	policyPath := filepath.Join(dir, "policy.hcl")
+	writePolicy(t, policyPath, `
+endpoint "https" "github" {
+  hosts = ["api.github.com"]
+}
+
+credential "bearer_token" "github" {
+  endpoint = https.github
+  value_file = "`+tokenPath+`"
+}
+
+rule "github-reads" {
+  endpoint = https.github
+  verdict = "allow"
+  credential = bearer_token.github
+}
+`)
+
+	_, err := LoadFile(policyPath)
+	if err == nil {
+		t.Fatal("expected rule-level credential to be rejected")
+	}
+	if !strings.Contains(err.Error(), "Unsupported argument") || !strings.Contains(err.Error(), "credential") {
+		t.Fatalf("expected unsupported credential argument error, got %v", err)
 	}
 }
 

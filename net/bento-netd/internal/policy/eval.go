@@ -43,7 +43,7 @@ func (p *Policy) EvaluateHTTP(request HTTPRequest) Decision {
 	}
 	decision := Decision{Action: p.DefaultAction}
 	for _, rule := range p.httpsRules {
-		endpoint := p.matchHTTPSRule(rule, request)
+		endpointRef, endpoint := p.matchHTTPSRule(rule, request)
 		if endpoint == nil {
 			continue
 		}
@@ -65,7 +65,9 @@ func (p *Policy) EvaluateHTTP(request HTTPRequest) Decision {
 		decision.Reason = rule.Reason
 		decision.EndpointKind = "https"
 		decision.EndpointName = endpoint.Name
-		decision.Credential = rule.Credential
+		if rule.Verdict == ActionAllow {
+			decision.Credential = p.credentialByEndpoint[endpointRef.String()]
+		}
 		return decision
 	}
 	return decision
@@ -81,15 +83,15 @@ func (p *Policy) matchCIDRRule(rule *Rule, flow Flow) *CIDREndpoint {
 	return nil
 }
 
-func (p *Policy) matchHTTPSRule(rule *Rule, request HTTPRequest) *HTTPSEndpoint {
+func (p *Policy) matchHTTPSRule(rule *Rule, request HTTPRequest) (Ref, *HTTPSEndpoint) {
 	host := normalizeHost(request.Host)
 	for _, ref := range rule.Endpoints {
 		endpoint := p.httpsEndpoints[ref.String()]
 		if endpoint != nil && endpoint.matchesHost(host) {
-			return endpoint
+			return ref, endpoint
 		}
 	}
-	return nil
+	return Ref{}, nil
 }
 
 func (r *Rule) matchesHTTP(request HTTPRequest) (bool, error) {
