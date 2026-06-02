@@ -14,11 +14,12 @@ use eyre::Context;
 use fatfs::{format_volume, FileSystem, FormatVolumeOptions, FsOptions};
 use serde::{Deserialize, Serialize};
 
+use crate::certificate_authority;
 use crate::global_config::{ensure_guest_binary, GlobalConfig};
 use crate::host_user::{self, HostUser};
 use crate::network::RuntimeNetwork;
 use crate::ssh_keys;
-use crate::{resolve_mount_location, InstanceFile};
+use crate::{resolve_mount_location, InstanceFile, Layout};
 
 const GUEST_AGENT_CIDATA_ENTRY: &str = "bento-agent";
 const GUEST_AGENT_INSTALL_SCRIPT_ENTRY: &str = "bento-install-guest-agent.sh";
@@ -33,6 +34,8 @@ const FORWARD_ENDPOINT_NAME: &str = "forward";
 const CIDATA_VOLUME_LABEL: &str = "CIDATA";
 const CIDATA_MIN_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 const CIDATA_SIZE_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
+const GUEST_CERTIFICATE_AUTHORITY_PATH: &str = "/usr/local/share/ca-certificates/bento-ca.crt";
+const GUEST_CERTIFICATE_AUTHORITY_TRUST_COMMAND: &str = "if command -v update-ca-certificates >/dev/null 2>&1; then update-ca-certificates; elif command -v trust >/dev/null 2>&1; then trust anchor --store /usr/local/share/ca-certificates/bento-ca.crt && trust extract-compat; fi";
 
 #[derive(Debug, Deserialize, Default)]
 struct ForwardPluginAgentConfig {
@@ -59,6 +62,7 @@ struct MonitorMount {
 }
 
 pub(crate) fn prepare_instance_runtime(
+    layout: &Layout,
     instance_dir: &Path,
     name: &str,
     spec: &mut VmSpec,
@@ -70,6 +74,7 @@ pub(crate) fn prepare_instance_runtime(
     normalize_runtime_mounts(spec)?;
 
     rebuild_bootstrap(
+        layout,
         instance_dir,
         name,
         spec,
@@ -149,7 +154,8 @@ fn reconcile_cidata_disk(spec: &mut VmSpec, required: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_runtime_mounts, render_network_config_for_instance, resolve_guest_runtime_config,
+        normalize_runtime_mounts, render_network_config_for_instance, render_user_data,
+        resolve_guest_runtime_config,
     };
     use bento_core::{
         Architecture, Boot, Disk, DiskKind, GuestOs, GuestSpec, LifecycleSpec, Mount, Platform,
@@ -159,6 +165,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
+    use crate::host_user::HostUser;
     use crate::network::RuntimeNetwork;
     use crate::InstanceFile;
 
@@ -335,6 +342,38 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_is_required_for_certificate_authority_injection() {
+        let spec = sample_spec(Vec::new(), false);
+        let runtime = resolve_guest_runtime_config(&spec, &RuntimeNetwork::None)
+            .expect("runtime config should resolve");
+
+        assert!(super::requires_bootstrap(&spec, &runtime));
+    }
+
+    #[test]
+    fn user_data_injects_certificate_authority() {
+        let host_user = HostUser {
+            name: "bento".to_string(),
+            uid: 1000,
+            gecos: "Bento User".to_string(),
+        };
+
+        let user_data = render_user_data(
+            &sample_spec(Vec::new(), false),
+            &host_user,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBento",
+            "-----BEGIN CERTIFICATE-----\nMIIBENTO\n-----END CERTIFICATE-----\n",
+        )
+        .expect("render user-data");
+
+        assert!(user_data.contains("/usr/local/share/ca-certificates/bento-ca.crt"));
+        assert!(user_data.contains("BEGIN CERTIFICATE"));
+        assert!(user_data.contains("permissions: '0644'"));
+        assert!(user_data.contains("update-ca-certificates"));
+        assert!(user_data.contains("trust anchor --store"));
+    }
+
+    #[test]
     fn guest_runtime_enables_forward_from_named_endpoint() {
         let mut spec = sample_spec(Vec::new(), true);
         spec.vsock_endpoints.push(forward_endpoint(4100, None));
@@ -487,15 +526,13 @@ fn resolve_forward_runtime_config(spec: &VmSpec) -> eyre::Result<AgentForwardCon
     })
 }
 
-fn requires_bootstrap(spec: &VmSpec, guest_runtime: &AgentConfig) -> bool {
-    spec.boot.bootstrap.is_some()
-        || guest_runtime.ssh.enabled
-        || guest_runtime.dns.enabled
-        || guest_runtime.forward.enabled
-        || spec.settings.rosetta
+fn requires_bootstrap(_spec: &VmSpec, _guest_runtime: &AgentConfig) -> bool {
+    // The certificate authority is installed through cloud-init for every VM.
+    true
 }
 
 fn rebuild_bootstrap(
+    layout: &Layout,
     instance_dir: &Path,
     name: &str,
     spec: &VmSpec,
@@ -512,35 +549,31 @@ fn rebuild_bootstrap(
         return Ok(());
     }
 
-    let host_user = host_user::current_host_user().context("resolve current host user")?;
-    let user_keys = ssh_keys::ensure_user_ssh_keys().context("ensure user SSH keys")?;
-
-    build_cidata_disk(
-        instance_dir,
-        name,
-        spec,
-        &host_user,
-        &user_keys.public_key_openssh,
-        network,
-        guest_runtime,
-    )
+    build_cidata_disk(layout, instance_dir, name, spec, network, guest_runtime)
 }
 
 fn build_cidata_disk(
+    layout: &Layout,
     instance_dir: &Path,
     name: &str,
     spec: &VmSpec,
-    host_user: &HostUser,
-    ssh_public_key: &str,
     network: &RuntimeNetwork,
     guest_runtime: &AgentConfig,
 ) -> eyre::Result<()> {
+    let host_user = host_user::current_host_user().context("resolve current host user")?;
+    let user_keys = ssh_keys::ensure_user_ssh_keys().context("ensure user SSH keys")?;
     let global_config = GlobalConfig::load()?;
     let agent_binary_path = ensure_guest_binary(&global_config)?;
     let guest_agent_binary = std::fs::read(agent_binary_path)
         .with_context(|| format!("read guest agent binary {}", agent_binary_path.display()))?;
+    let certificate_authority_pem = certificate_authority_pem_for_config(layout, &global_config)?;
 
-    let user_data = render_user_data(spec, host_user, ssh_public_key)?;
+    let user_data = render_user_data(
+        spec,
+        &host_user,
+        &user_keys.public_key_openssh,
+        &certificate_authority_pem,
+    )?;
     let meta_data = render_meta_data(name)?;
     let network_config = render_network_config_for_instance(network)?;
     let agent_config = render_agent_config(guest_runtime)?;
@@ -688,6 +721,8 @@ struct CloudConfig {
     mounts: Vec<[String; 6]>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     write_files: Vec<WriteFile>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    runcmd: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -750,6 +785,7 @@ fn render_user_data(
     spec: &VmSpec,
     host_user: &HostUser,
     ssh_public_key: &str,
+    certificate_authority_pem: &str,
 ) -> eyre::Result<String> {
     let cloud_config = CloudConfig {
         users: vec![CloudUser {
@@ -770,12 +806,16 @@ fn render_user_data(
         timezone: resolve_host_timezone(),
         locale: resolve_host_locale(),
         mounts: cloud_mount_entries(spec),
-        write_files: vec![WriteFile {
-            path: GUEST_AGENT_BOOTSTRAP_SCRIPT.to_string(),
-            owner: "root:root".to_string(),
-            permissions: "0755".to_string(),
-            content: GUEST_BOOTSTRAP_SCRIPT_CONTENT.to_string(),
-        }],
+        write_files: vec![
+            WriteFile {
+                path: GUEST_AGENT_BOOTSTRAP_SCRIPT.to_string(),
+                owner: "root:root".to_string(),
+                permissions: "0755".to_string(),
+                content: GUEST_BOOTSTRAP_SCRIPT_CONTENT.to_string(),
+            },
+            certificate_authority_write_file(certificate_authority_pem),
+        ],
+        runcmd: vec![GUEST_CERTIFICATE_AUTHORITY_TRUST_COMMAND.to_string()],
     };
     let mut bento_yaml = String::from("#cloud-config\n");
     bento_yaml.push_str(
@@ -794,6 +834,33 @@ fn render_user_data(
     }
 
     Ok(bento_yaml)
+}
+
+fn certificate_authority_pem_for_config(
+    layout: &Layout,
+    config: &GlobalConfig,
+) -> eyre::Result<String> {
+    if let Some(path) = config.networking.netd.tls_ca_cert.as_deref() {
+        return certificate_authority::read_certificate_authority_certificate(path);
+    }
+
+    certificate_authority::ensure_certificate_authority_in(layout)
+        .map(|authority| authority.certificate_pem)
+}
+
+fn certificate_authority_write_file(certificate_authority_pem: &str) -> WriteFile {
+    WriteFile {
+        path: GUEST_CERTIFICATE_AUTHORITY_PATH.to_string(),
+        owner: "root:root".to_string(),
+        permissions: "0644".to_string(),
+        content: pem_with_trailing_newline(certificate_authority_pem),
+    }
+}
+
+fn pem_with_trailing_newline(pem: &str) -> String {
+    let mut normalized = pem.trim_end().to_string();
+    normalized.push('\n');
+    normalized
 }
 
 fn render_multipart_user_data(bento_user_data: &str, user_data: &str) -> String {

@@ -425,6 +425,7 @@ impl LibVm {
         let resolved_network = prepare_network_runtime(&self.layout, &self.db, &metadata).await?;
         let mut spec = metadata.config.clone();
         prepare_instance_runtime(
+            &self.layout,
             Path::new(&metadata.instance_dir),
             &metadata.name,
             &mut spec,

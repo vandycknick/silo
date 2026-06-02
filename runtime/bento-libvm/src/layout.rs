@@ -105,6 +105,10 @@ impl Layout {
     pub fn images_dir(&self) -> PathBuf {
         self.data_dir.join("images")
     }
+
+    pub fn keys_dir(&self) -> PathBuf {
+        self.data_dir.join("keys")
+    }
 }
 
 pub fn resolve_config_dir() -> Option<PathBuf> {
@@ -164,6 +168,7 @@ mod tests {
             PathBuf::from("/tmp/bento/instances")
         );
         assert_eq!(layout.images_dir(), PathBuf::from("/tmp/bento/images"));
+        assert_eq!(layout.keys_dir(), PathBuf::from("/tmp/bento/keys"));
         assert_eq!(
             layout.instance_dir(machine_id),
             PathBuf::from("/tmp/bento/instances").join(machine_id.to_string())

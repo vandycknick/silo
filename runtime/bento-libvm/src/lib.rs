@@ -1,3 +1,4 @@
+pub mod certificate_authority;
 mod engine;
 mod error;
 pub mod global_config;
@@ -15,6 +16,7 @@ pub mod ssh_keys;
 mod store;
 mod vm_lock;
 
+pub use crate::certificate_authority::{ensure_certificate_authority, CertificateAuthority};
 pub use crate::engine::{CreateMachineRequest, LibVm, MachineRecord};
 pub use crate::error::LibVmError;
 pub use crate::instance_file::InstanceFile;

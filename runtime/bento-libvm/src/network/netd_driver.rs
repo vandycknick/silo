@@ -11,6 +11,8 @@ use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
+use crate::certificate_authority;
+use crate::global_config::NetdConfig;
 use crate::layout::resolve_config_dir;
 use crate::models::{Machine, NetworkAttachment, NetworkInstance};
 use crate::store::{Database, Sqlite};
@@ -98,6 +100,8 @@ async fn prepare_netd_runtime(
     let pid_path = layout.network_pid_path(&network_id);
     let pcap_path = config.pcap.then(|| layout.network_pcap_path(&network_id));
     let policy_path = resolve_network_policy_path(metadata, request.policy_ref)?;
+    let (tls_ca_cert_path, tls_ca_key_path) =
+        resolve_certificate_authority_paths(layout, &config, &metadata.name)?;
     remove_file_if_exists(&socket_path)?;
     remove_file_if_exists(&pid_path)?;
 
@@ -114,8 +118,8 @@ async fn prepare_netd_runtime(
             machine_id: metadata.id,
             network_id: &network_id,
             policy_path: policy_path.as_deref(),
-            tls_ca_cert_path: config.tls_ca_cert.as_deref(),
-            tls_ca_key_path: config.tls_ca_key.as_deref(),
+            tls_ca_cert_path: Some(tls_ca_cert_path.as_path()),
+            tls_ca_key_path: Some(tls_ca_key_path.as_path()),
         },
     );
     command
@@ -314,6 +318,32 @@ fn resolve_network_policy_path(
         })
 }
 
+fn resolve_certificate_authority_paths(
+    layout: &Layout,
+    config: &NetdConfig,
+    reference: &str,
+) -> Result<(PathBuf, PathBuf), LibVmError> {
+    match (&config.tls_ca_cert, &config.tls_ca_key) {
+        (Some(certificate_path), Some(private_key_path)) => {
+            Ok((certificate_path.clone(), private_key_path.clone()))
+        }
+        (None, None) => {
+            let authority = certificate_authority::ensure_certificate_authority_in(layout)
+                .map_err(|err| LibVmError::NetworkRuntime {
+                    reference: reference.to_string(),
+                    message: format!("ensure certificate authority: {err}"),
+                })?;
+            Ok((authority.certificate_path, authority.private_key_path))
+        }
+        _ => Err(LibVmError::NetworkRuntime {
+            reference: reference.to_string(),
+            message:
+                "certificate authority certificate and private key must be configured together"
+                    .to_string(),
+        }),
+    }
+}
+
 async fn wait_for_socket(path: &Path) -> Result<(), String> {
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
     loop {
@@ -375,9 +405,15 @@ fn terminate_helper(pid: i32) -> Result<(), LibVmError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{configure_network_helper_command, NetworkHelperCommandConfig};
-    use std::path::Path;
+    use super::{
+        configure_network_helper_command, resolve_certificate_authority_paths,
+        NetworkHelperCommandConfig,
+    };
+    use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    use crate::global_config::NetdConfig;
+    use crate::Layout;
 
     #[test]
     fn netd_command_disables_default_ssh_forward() {
@@ -448,5 +484,56 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|window| window[0] == "--tls-ca-key" && window[1] == "/tmp/bento-net/ca-key.pem"));
+    }
+
+    #[test]
+    fn certificate_authority_paths_use_config_overrides() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let layout = Layout::new(temp.path().join("bento"));
+        let config = NetdConfig {
+            tls_ca_cert: Some(PathBuf::from("/tmp/custom-ca.pem")),
+            tls_ca_key: Some(PathBuf::from("/tmp/custom-ca-key.pem")),
+            ..NetdConfig::default()
+        };
+
+        let (certificate_path, private_key_path) =
+            resolve_certificate_authority_paths(&layout, &config, "test-machine")
+                .expect("resolve configured CA paths");
+
+        assert_eq!(certificate_path, PathBuf::from("/tmp/custom-ca.pem"));
+        assert_eq!(private_key_path, PathBuf::from("/tmp/custom-ca-key.pem"));
+        assert!(!layout.keys_dir().exists());
+    }
+
+    #[test]
+    fn certificate_authority_paths_generate_defaults() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let layout = Layout::new(temp.path().join("bento"));
+
+        let (certificate_path, private_key_path) =
+            resolve_certificate_authority_paths(&layout, &NetdConfig::default(), "test-machine")
+                .expect("resolve generated CA paths");
+
+        assert_eq!(certificate_path, layout.keys_dir().join("ca.pem"));
+        assert_eq!(private_key_path, layout.keys_dir().join("ca-key.pem"));
+        assert!(certificate_path.is_file());
+        assert!(private_key_path.is_file());
+    }
+
+    #[test]
+    fn certificate_authority_paths_reject_partial_config() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let layout = Layout::new(temp.path().join("bento"));
+        let config = NetdConfig {
+            tls_ca_cert: Some(PathBuf::from("/tmp/custom-ca.pem")),
+            ..NetdConfig::default()
+        };
+
+        let err = resolve_certificate_authority_paths(&layout, &config, "test-machine")
+            .expect_err("reject partial CA config");
+
+        assert!(err.to_string().contains(
+            "certificate authority certificate and private key must be configured together"
+        ));
     }
 }
