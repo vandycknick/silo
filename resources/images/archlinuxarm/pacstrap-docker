@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <newroot> [packages...]" >&2
+  exit 1
+fi
+
+newroot="$1"
+shift
+
+packages=("${@:-base}")
+
+if [[ $EUID -ne 0 ]]; then
+  echo "this script must be run as root" >&2
+  exit 1
+fi
+
+mkdir -m 0755 -p \
+  "$newroot"/var/cache/pacman/pkg \
+  "$newroot"/var/lib/pacman \
+  "$newroot"/var/log \
+  "$newroot"/dev \
+  "$newroot"/run \
+  "$newroot"/etc/pacman.d/gnupg
+
+mkdir -m 1777 -p "$newroot"/tmp
+mkdir -m 0555 -p "$newroot"/sys "$newroot"/proc
+
+mknod "$newroot/dev/null" c 1 3
+
+pacman-key \
+  --gpgdir "$newroot/etc/pacman.d/gnupg" \
+  --init
+
+pacman-key \
+  --gpgdir "$newroot/etc/pacman.d/gnupg" \
+  --populate archlinuxarm
+
+pacman \
+  --disable-sandbox-filesystem \
+  --gpgdir "$newroot/etc/pacman.d/gnupg" \
+  -r "$newroot" \
+  -Sy --noconfirm "${packages[@]}"
+
+rm -f "$newroot/dev/null"

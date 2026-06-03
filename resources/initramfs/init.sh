@@ -42,7 +42,7 @@ if [ ! -b "${root}" ]; then
 fi
 
 mkdir -p /mnt/root
-if ! mount -o subvol=@ "${root}" /mnt/root; then
+if ! mount "${root}" /mnt/root; then
     echo "mount ${root} -> /mnt/root failed"
     exec cttyhack sh
 fi

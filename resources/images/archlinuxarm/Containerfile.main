@@ -1,0 +1,57 @@
+FROM ghcr.io/vandycknick/archlinuxarm:latest
+
+RUN pacman -Syu --disable-sandbox --noconfirm --needed \
+      base-devel \
+      git \
+      sudo \
+      go
+
+RUN useradd -m -s /bin/bash builder \
+  && echo 'builder ALL=(ALL) NOPASSWD: /usr/bin/pacman' > /etc/sudoers.d/builder \
+  && chmod 0440 /etc/sudoers.d/builder
+
+RUN git clone https://aur.archlinux.org/yay.git /tmp/yay \
+ && chown -R builder:builder /tmp/yay \
+ && cd /tmp/yay \
+ && sudo -u builder makepkg -si --noconfirm
+
+RUN pacman --disable-sandbox -Syu --noconfirm \
+    bash \
+    bind \
+    ca-certificates \
+    cloud-guest-utils \
+    cloud-init \
+    dbus \
+    iproute2 \
+    openssh \
+    procps-ng \
+    sudo \
+    systemd \
+    systemd-sysvcompat \
+    util-linux \
+    fish \
+  && pacman --disable-sandbox -Scc --noconfirm
+
+RUN sudo -u builder yay -S --noconfirm --needed \
+      --disable-sandbox \
+      --answerclean None \
+      --answerdiff None \
+      --answeredit None \
+      --sudo sudo \
+      --sudoflags "-n" \
+      opencode-bin
+
+RUN systemctl enable \
+    cloud-init-main.service \
+    cloud-final.service \
+    sshd.service \
+    systemd-networkd.service \
+    systemd-timesyncd.service \
+    systemd-resolved.service
+
+RUN ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf \
+ && passwd -d root \
+ && rm -f /etc/machine-id \
+ && touch /etc/machine-id \
+ && cloud-init clean --logs --machine-id || true
+

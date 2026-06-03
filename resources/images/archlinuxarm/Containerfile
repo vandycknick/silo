@@ -1,0 +1,52 @@
+FROM scratch AS bootstrap
+
+ARG ROOTFS=ArchLinuxARM-aarch64-latest.tar.gz
+ADD ${ROOTFS} /
+
+FROM bootstrap AS builder
+
+WORKDIR /archlinux
+
+COPY pacstrap-docker /archlinux/pacstrap-docker
+
+RUN chmod +x /archlinux/pacstrap-docker
+
+RUN mkdir -p /archlinux/rootfs
+
+RUN /archlinux/pacstrap-docker /archlinux/rootfs \
+    archlinuxarm-keyring \
+    bash \
+    ca-certificates \
+    coreutils \
+    filesystem \
+    glibc \
+    gzip \
+    pacman \
+    ed
+
+# Pacman's Linux downloader sandbox is not reliable inside Docker's sandbox.
+# RUN sed -i \
+#     -e 's/^#DisableSandbox$/DisableSandbox/' \
+#     -e 's/^DownloadUser = alpm$/#DownloadUser = alpm/' \
+#     /archlinux/rootfs/etc/pacman.conf
+
+# Remove sync DBs. They go stale quickly and are cheap to refresh.
+RUN rm -rf /archlinux/rootfs/var/lib/pacman/sync/*
+
+# Do not leak the temporary rootfs pacman local private key.
+RUN rm -rf /archlinux/rootfs/etc/pacman.d/gnupg/private-keys-v1.d/* || true
+
+FROM scratch
+
+COPY --from=builder /archlinux/rootfs/ /
+COPY rootfs/ /
+
+ENV LANG=en_US.UTF-8
+
+RUN locale-gen
+
+RUN pacman-key --init && \
+    pacman-key --populate archlinuxarm && \
+    rm -rf /etc/pacman.d/gnupg/private-keys-v1.d/*
+
+CMD ["/usr/bin/bash"]
