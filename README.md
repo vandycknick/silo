@@ -73,6 +73,9 @@ Create, show, validate, edit, and remove profiles through the `profile` command 
 bento profile create rust-dev \
   --image ghcr.io/vandycknick/archlinux:latest \
   --description "Rust development box" \
+  --cpus 4 \
+  --memory 4gb \
+  --disk-size 40gb \
   --mount .:/workspace:rw \
   --network private \
   --label stack=rust \
@@ -92,6 +95,10 @@ version: "1"
 description: Rust development box
 image:
     ref: ghcr.io/vandycknick/archlinux:latest
+resources:
+    cpus: 4
+    memory: 4gb
+disk_size: 40gb
 mounts:
     - source: .
       target: /workspace
@@ -103,6 +110,8 @@ ssh:
 labels:
     stack: rust
 ```
+
+Size values must include a unit suffix. Accepted units are `mb`, `gb`, `mib`, and `gib`, case-insensitive with optional whitespace, such as `512mb`, `4gb`, or `1 GiB`; bare numbers like `4096` are rejected.
 
 ## Ephemeral VMs
 
@@ -133,8 +142,8 @@ Override VM shape and profile settings at launch:
 ```bash
 bento run rust-dev \
   --cpus 6 \
-  --memory 8192 \
-  --disk-size 80 \
+  --memory 8gb \
+  --disk-size 80gb \
   --mount ~/src:/src:rw \
   --network private \
   --label purpose=ci \
@@ -155,7 +164,7 @@ bento create dev rust-dev
 bento create dev rust-dev --start
 
 # Create from an image without a profile.
-bento create ubuntu --image ubuntu:24.04 --cpus 4 --memory 4096
+bento create ubuntu --image ubuntu:24.04 --cpus 4 --memory 4gb
 ```
 
 Lifecycle commands operate on a VM name or ID:

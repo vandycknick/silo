@@ -480,6 +480,7 @@ dependencies = [
  "bento-core",
  "bento-libvm",
  "bento-protocol",
+ "bento-utils",
  "chrono",
  "clap",
  "eyre",

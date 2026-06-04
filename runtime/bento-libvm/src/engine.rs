@@ -32,7 +32,6 @@ use crate::store::{Database, Sqlite};
 use crate::vm_lock::VmLock;
 use crate::{Layout, LibVmError};
 
-const BYTES_PER_GB: u64 = 1_000_000_000;
 const DEFAULT_IMAGE_CPUS: u8 = 1;
 const DEFAULT_IMAGE_MEMORY_MIB: u32 = 512;
 const ENV_VM_STARTPIPE: &str = "_VM_STARTPIPE";
@@ -48,7 +47,7 @@ pub struct CreateMachineRequest {
     pub memory_mib: Option<u32>,
     pub kernel: Option<PathBuf>,
     pub initramfs: Option<PathBuf>,
-    pub disk_size_gb: Option<u64>,
+    pub disk_size_bytes: Option<u64>,
     pub nested_virtualization: bool,
     pub agent: bool,
     pub rosetta: bool,
@@ -159,10 +158,10 @@ impl LibVm {
         &self,
         request: CreateMachineRequest,
     ) -> Result<MachineRecord, LibVmError> {
-        if matches!(request.disk_size_gb, Some(0)) {
+        if matches!(request.disk_size_bytes, Some(0)) {
             return Err(LibVmError::InvalidCreateRequest {
                 name: request.name,
-                reason: "--disk-size must be greater than 0".to_string(),
+                reason: "root disk size must be greater than 0".to_string(),
             });
         }
 
@@ -244,7 +243,7 @@ impl LibVm {
         let rootfs_path = pending.dir().join(InstanceFile::RootDisk.as_str());
         image_store.clone_base_image(&selected_image, &rootfs_path)?;
 
-        if let Some(size_bytes) = gigabytes_to_bytes_checked(request.disk_size_gb) {
+        if let Some(size_bytes) = request.disk_size_bytes {
             ImageStore::resize_raw_disk(&rootfs_path, size_bytes)?;
         }
 
@@ -860,14 +859,6 @@ fn host_architecture() -> Result<Architecture, LibVmError> {
     }
 }
 
-fn gigabytes_to_bytes(size_gb: u64) -> u64 {
-    size_gb.saturating_mul(BYTES_PER_GB)
-}
-
-fn gigabytes_to_bytes_checked(size_gb: Option<u64>) -> Option<u64> {
-    size_gb.map(gigabytes_to_bytes)
-}
-
 fn canonicalize_optional_existing_path(
     path: Option<&Path>,
     kind: &str,
@@ -1312,7 +1303,7 @@ mod tests {
                 memory_mib: None,
                 kernel: None,
                 initramfs: None,
-                disk_size_gb: None,
+                disk_size_bytes: None,
                 nested_virtualization: false,
                 agent: false,
                 rosetta: false,

@@ -1,5 +1,6 @@
 use bento_core::Mount;
 use bento_libvm::{CreateMachineRequest, LibVm, MachineRef, RequestedNetwork};
+use bento_utils::HumanSize;
 use clap::Args;
 use eyre::Context;
 use std::collections::BTreeMap;
@@ -40,18 +41,18 @@ pub(crate) struct VmOverrideArgs {
     /// Number of virtual CPUs.
     #[arg(long)]
     pub cpus: Option<u8>,
-    /// Virtual machine RAM size in mibibytes.
-    #[arg(long)]
-    pub memory: Option<u32>,
+    /// Virtual machine RAM size, for example 512mb or 4gb.
+    #[arg(long, value_name = "SIZE")]
+    pub memory: Option<HumanSize>,
     /// Path to a custom kernel. Only works for Linux.
     #[arg(long)]
     pub kernel: Option<PathBuf>,
     /// Path to a custom initramfs image. Only works for Linux.
     #[arg(long = "initramfs", visible_alias = "initrd")]
     pub initramfs: Option<PathBuf>,
-    /// Resize the image-backed root disk to this size in GB.
-    #[arg(long, value_name = "GB")]
-    pub disk_size: Option<u64>,
+    /// Resize the image-backed root disk, for example 10gb or 512mb.
+    #[arg(long, value_name = "SIZE")]
+    pub disk_size: Option<HumanSize>,
     /// Enable nested virtualization for supported VZ guests.
     #[arg(long)]
     pub nested_virtualization: bool,
@@ -78,6 +79,22 @@ pub(crate) struct VmOverrideArgs {
     pub labels: Vec<(String, String)>,
 }
 
+impl VmOverrideArgs {
+    pub(crate) fn memory_mib(&self) -> eyre::Result<Option<u32>> {
+        self.memory
+            .map(HumanSize::memory_mib)
+            .transpose()
+            .map_err(eyre::Report::msg)
+    }
+
+    pub(crate) fn disk_size_bytes(&self) -> eyre::Result<Option<u64>> {
+        self.disk_size
+            .map(HumanSize::bytes)
+            .transpose()
+            .map_err(eyre::Report::msg)
+    }
+}
+
 impl Display for Cmd {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.name)
@@ -96,7 +113,7 @@ impl Cmd {
             memory_mib: resolved.memory_mib,
             kernel: resolved.kernel,
             initramfs: resolved.initramfs,
-            disk_size_gb: resolved.disk_size_gb,
+            disk_size_bytes: resolved.disk_size_bytes,
             nested_virtualization: resolved.nested_virtualization,
             agent: resolved.ssh_enabled,
             rosetta: resolved.rosetta,
@@ -132,6 +149,9 @@ impl Cmd {
         let mut network = RequestedNetwork::default();
         let mut ssh_enabled = true;
         let mut userdata = None;
+        let mut cpus = None;
+        let mut memory_mib = None;
+        let mut disk_size_bytes = None;
 
         if let Some(profile_name) = profile_name {
             let store = ProfileStore::from_env()?;
@@ -145,6 +165,9 @@ impl Cmd {
                 .map(|ssh| ssh.enabled)
                 .unwrap_or(true);
             userdata = named.profile.userdata.clone();
+            cpus = named.profile.cpus();
+            memory_mib = named.profile.memory_mib()?;
+            disk_size_bytes = named.profile.disk_size_bytes()?;
             labels = named.profile.labels.clone();
             metadata.insert(PROFILE_METADATA_KEY.to_string(), named.name.clone());
             mounts = named.profile.resolved_mounts()?;
@@ -182,11 +205,11 @@ impl Cmd {
             network,
             ssh_enabled: ssh_enabled || self.overrides.agent,
             userdata,
-            cpus: self.overrides.cpus,
-            memory_mib: self.overrides.memory,
+            cpus: self.overrides.cpus.or(cpus),
+            memory_mib: self.overrides.memory_mib()?.or(memory_mib),
             kernel: self.overrides.kernel.clone(),
             initramfs: self.overrides.initramfs.clone(),
-            disk_size_gb: self.overrides.disk_size,
+            disk_size_bytes: self.overrides.disk_size_bytes()?.or(disk_size_bytes),
             nested_virtualization: self.overrides.nested_virtualization,
             rosetta: self.overrides.rosetta,
             disks: self.overrides.disks.clone(),
@@ -206,7 +229,7 @@ struct ResolvedCreate {
     memory_mib: Option<u32>,
     kernel: Option<PathBuf>,
     initramfs: Option<PathBuf>,
-    disk_size_gb: Option<u64>,
+    disk_size_bytes: Option<u64>,
     nested_virtualization: bool,
     rosetta: bool,
     disks: Vec<PathBuf>,
@@ -253,13 +276,13 @@ mod tests {
             "--cpus",
             "4",
             "--memory",
-            "4096",
+            "4gb",
             "--kernel",
             "./vmlinuz",
             "--initrd",
             "./initrd.img",
             "--disk-size",
-            "40",
+            "40gb",
             "--nested-virtualization",
             "--agent",
             "--rosetta",
@@ -281,8 +304,14 @@ mod tests {
         };
 
         assert_eq!(create.overrides.cpus, Some(4));
-        assert_eq!(create.overrides.memory, Some(4096));
-        assert_eq!(create.overrides.disk_size, Some(40));
+        assert_eq!(
+            create.overrides.memory_mib().expect("memory mib"),
+            Some(4096)
+        );
+        assert_eq!(
+            create.overrides.disk_size_bytes().expect("disk size bytes"),
+            Some(40_000_000_000)
+        );
         assert!(create.overrides.nested_virtualization);
         assert!(create.overrides.agent);
         assert!(create.overrides.rosetta);
@@ -292,5 +321,22 @@ mod tests {
             create.overrides.labels,
             vec![("env".to_string(), "dev".to_string())]
         );
+    }
+
+    #[test]
+    fn create_command_rejects_bare_memory_and_disk_size() {
+        assert!(BentoCtlCmd::try_parse_from([
+            "bento", "create", "dev", "rust-dev", "--memory", "4096"
+        ])
+        .is_err());
+        assert!(BentoCtlCmd::try_parse_from([
+            "bento",
+            "create",
+            "dev",
+            "rust-dev",
+            "--disk-size",
+            "40"
+        ])
+        .is_err());
     }
 }

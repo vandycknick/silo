@@ -4,12 +4,13 @@ use std::io::Write;
 use std::process::Command;
 
 use bento_libvm::RequestedNetwork;
+use bento_utils::HumanSize;
 use clap::{Args, Subcommand};
 use tabwriter::TabWriter;
 
 use crate::profile::{
-    parse_profile, MountMode, Profile, ProfileImage, ProfileMount, ProfileNetwork, ProfileSsh,
-    ProfileStore,
+    parse_profile, MountMode, Profile, ProfileImage, ProfileMount, ProfileNetwork,
+    ProfileResources, ProfileSsh, ProfileStore,
 };
 
 #[derive(Args, Debug)]
@@ -69,7 +70,7 @@ pub struct ShowCmd {
 #[derive(Args, Debug)]
 #[command(
     about = "Create a profile",
-    after_help = "Examples:\n  bento profile create dev --image ghcr.io/me/dev:latest\n  bento profile create offline --image ubuntu:24.04 --network none\n  bento profile create dev --image ghcr.io/me/dev:latest --mount .:/workspace:rw\n"
+    after_help = "Examples:\n  bento profile create dev --image ghcr.io/me/dev:latest\n  bento profile create offline --image ubuntu:24.04 --network none\n  bento profile create dev --image ghcr.io/me/dev:latest --cpus 4 --memory 4gb --disk-size 40gb\n"
 )]
 pub struct CreateCmd {
     /// Profile name to create.
@@ -81,6 +82,15 @@ pub struct CreateCmd {
     /// Human-readable profile description.
     #[arg(long)]
     pub description: Option<String>,
+    /// Default number of virtual CPUs for VMs created from this profile.
+    #[arg(long)]
+    pub cpus: Option<u8>,
+    /// Default RAM size for VMs created from this profile, for example 512mb or 4gb.
+    #[arg(long, value_name = "SIZE")]
+    pub memory: Option<HumanSize>,
+    /// Default root disk resize for VMs created from this profile, for example 10gb or 512mb.
+    #[arg(long, value_name = "SIZE")]
+    pub disk_size: Option<HumanSize>,
     /// Network target for VMs created from this profile. Allowed: private, none, NAME, or name:NAME.
     #[arg(long, value_parser = parse_requested_network, default_value = "private")]
     pub network: RequestedNetwork,
@@ -197,6 +207,11 @@ fn create_profile(store: &ProfileStore, cmd: &CreateCmd) -> eyre::Result<()> {
         image: ProfileImage {
             reference: cmd.image.clone(),
         },
+        resources: (cmd.cpus.is_some() || cmd.memory.is_some()).then(|| ProfileResources {
+            cpus: cmd.cpus,
+            memory: cmd.memory.map(|memory| memory.to_string()),
+        }),
+        disk_size: cmd.disk_size.map(|disk_size| disk_size.to_string()),
         userdata: None,
         mounts: cmd.mounts.clone(),
         network: Some(requested_network_to_profile(cmd.network.clone())),

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use bento_core::Mount;
 use bento_libvm::{NetworkPolicyRef, RequestedNetwork};
+use bento_utils::HumanSize;
 use eyre::{bail, Context};
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +24,10 @@ pub(crate) struct Profile {
     pub description: Option<String>,
     pub image: ProfileImage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ProfileResources>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub userdata: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<ProfileMount>,
@@ -39,6 +44,15 @@ pub(crate) struct Profile {
 pub(crate) struct ProfileImage {
     #[serde(rename = "ref")]
     pub reference: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProfileResources {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +249,34 @@ impl Profile {
         }
     }
 
+    pub fn cpus(&self) -> Option<u8> {
+        self.resources.as_ref().and_then(|resources| resources.cpus)
+    }
+
+    pub fn memory_mib(&self) -> eyre::Result<Option<u32>> {
+        let Some(memory) = self
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.memory.as_deref())
+        else {
+            return Ok(None);
+        };
+        let size = parse_size_config(memory, "resources.memory")?;
+        size.memory_mib()
+            .map(Some)
+            .map_err(|err| eyre::eyre!("profile resources.memory: {err}"))
+    }
+
+    pub fn disk_size_bytes(&self) -> eyre::Result<Option<u64>> {
+        let Some(disk_size) = self.disk_size.as_deref() else {
+            return Ok(None);
+        };
+        parse_size_config(disk_size, "disk_size")?
+            .bytes()
+            .map(Some)
+            .map_err(|err| eyre::eyre!("profile disk_size: {err}"))
+    }
+
     pub fn network_name(&self) -> String {
         match self.network() {
             ProfileNetwork::Private { .. } => "private".to_string(),
@@ -262,6 +304,12 @@ pub(crate) fn parse_profile(raw: &str) -> eyre::Result<Profile> {
     let profile: Profile = serde_yaml_ng::from_str(raw).context("deserialize profile yaml")?;
     validate_profile(&profile)?;
     Ok(profile)
+}
+
+fn parse_size_config(input: &str, field: &str) -> eyre::Result<HumanSize> {
+    input
+        .parse::<HumanSize>()
+        .map_err(|err| eyre::eyre!("profile {field}: {err}"))
 }
 
 fn normalize_network(raw: ProfileNetworkConfig) -> eyre::Result<ProfileNetwork> {
@@ -316,6 +364,12 @@ pub(crate) fn validate_profile(profile: &Profile) -> eyre::Result<()> {
     if profile.image.reference.trim().is_empty() {
         bail!("profile image.ref cannot be empty");
     }
+    let _ = profile.memory_mib()?;
+    if let Some(disk_size_bytes) = profile.disk_size_bytes()? {
+        if disk_size_bytes == 0 {
+            bail!("profile disk_size must be greater than 0");
+        }
+    }
     if let Some(userdata) = &profile.userdata {
         if userdata.trim().is_empty() {
             bail!("profile userdata cannot be empty");
@@ -366,6 +420,8 @@ fn built_in_default_profile() -> NamedProfile {
             image: ProfileImage {
                 reference: DEFAULT_PROFILE_IMAGE.to_string(),
             },
+            resources: None,
+            disk_size: None,
             userdata: None,
             mounts: Vec::new(),
             network: Some(ProfileNetwork::Private { policy_ref: None }),
@@ -533,6 +589,70 @@ network:
             profile.network,
             Some(crate::profile::ProfileNetwork::Named { ref name, .. }) if name == "dev"
         ));
+    }
+
+    #[test]
+    fn parses_profile_resources_and_disk_size() {
+        let profile = parse_profile(
+            r#"
+version: "1"
+image:
+  ref: "ubuntu:24.04"
+resources:
+  cpus: 4
+  memory: 1gb
+disk_size: 40gb
+"#,
+        )
+        .expect("profile resources should parse");
+
+        assert_eq!(profile.cpus(), Some(4));
+        assert_eq!(profile.memory_mib().expect("memory mib"), Some(1024));
+        assert_eq!(
+            profile.disk_size_bytes().expect("disk size bytes"),
+            Some(40_000_000_000)
+        );
+    }
+
+    #[test]
+    fn rejects_bare_numeric_profile_sizes() {
+        assert!(parse_profile(
+            r#"
+version: "1"
+image:
+  ref: "ubuntu:24.04"
+resources:
+  memory: 4096
+"#,
+        )
+        .is_err());
+        assert!(parse_profile(
+            r#"
+version: "1"
+image:
+  ref: "ubuntu:24.04"
+disk_size: 40
+"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_unitless_profile_size_strings() {
+        let err = parse_profile(
+            r#"
+version: "1"
+image:
+  ref: "ubuntu:24.04"
+resources:
+  memory: "4096"
+"#,
+        )
+        .expect_err("unitless memory should fail");
+
+        assert!(err
+            .chain()
+            .any(|cause| cause.to_string().contains("missing unit")));
     }
 
     #[test]

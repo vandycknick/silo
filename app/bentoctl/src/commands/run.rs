@@ -63,7 +63,7 @@ impl Cmd {
             memory_mib: resolved.memory_mib,
             kernel: resolved.kernel,
             initramfs: resolved.initramfs,
-            disk_size_gb: resolved.disk_size_gb,
+            disk_size_bytes: resolved.disk_size_bytes,
             nested_virtualization: resolved.nested_virtualization,
             agent: resolved.ssh_enabled,
             rosetta: resolved.rosetta,
@@ -114,6 +114,9 @@ impl Cmd {
         let mut network = RequestedNetwork::default();
         let mut ssh_enabled = true;
         let mut userdata = None;
+        let mut cpus = None;
+        let mut memory_mib = None;
+        let mut disk_size_bytes = None;
         let image_ref;
         let prefix;
 
@@ -137,6 +140,9 @@ impl Cmd {
                 .map(|ssh| ssh.enabled)
                 .unwrap_or(true);
             userdata = named.profile.userdata.clone();
+            cpus = named.profile.cpus();
+            memory_mib = named.profile.memory_mib()?;
+            disk_size_bytes = named.profile.disk_size_bytes()?;
             labels = named.profile.labels.clone();
             metadata.insert(PROFILE_METADATA_KEY.to_string(), named.name.clone());
             mounts = named.profile.resolved_mounts()?;
@@ -166,11 +172,11 @@ impl Cmd {
             network,
             ssh_enabled: ssh_enabled || self.overrides.agent,
             userdata,
-            cpus: self.overrides.cpus,
-            memory_mib: self.overrides.memory,
+            cpus: self.overrides.cpus.or(cpus),
+            memory_mib: self.overrides.memory_mib()?.or(memory_mib),
             kernel: self.overrides.kernel.clone(),
             initramfs: self.overrides.initramfs.clone(),
-            disk_size_gb: self.overrides.disk_size,
+            disk_size_bytes: self.overrides.disk_size_bytes()?.or(disk_size_bytes),
             nested_virtualization: self.overrides.nested_virtualization,
             rosetta: self.overrides.rosetta,
             disks: self.overrides.disks.clone(),
@@ -191,7 +197,7 @@ struct ResolvedRun {
     memory_mib: Option<u32>,
     kernel: Option<std::path::PathBuf>,
     initramfs: Option<std::path::PathBuf>,
-    disk_size_gb: Option<u64>,
+    disk_size_bytes: Option<u64>,
     nested_virtualization: bool,
     rosetta: bool,
     disks: Vec<std::path::PathBuf>,
@@ -223,13 +229,13 @@ mod tests {
             "--cpus",
             "4",
             "--memory",
-            "4096",
+            "4gb",
             "--kernel",
             "./vmlinuz",
             "--initrd",
             "./initrd.img",
             "--disk-size",
-            "40",
+            "40gb",
             "--nested-virtualization",
             "--agent",
             "--rosetta",
@@ -252,8 +258,11 @@ mod tests {
 
         assert_eq!(run.profile.as_deref(), Some("dev"));
         assert_eq!(run.overrides.cpus, Some(4));
-        assert_eq!(run.overrides.memory, Some(4096));
-        assert_eq!(run.overrides.disk_size, Some(40));
+        assert_eq!(run.overrides.memory_mib().expect("memory mib"), Some(4096));
+        assert_eq!(
+            run.overrides.disk_size_bytes().expect("disk size bytes"),
+            Some(40_000_000_000)
+        );
         assert!(run.overrides.nested_virtualization);
         assert!(run.overrides.agent);
         assert!(run.overrides.rosetta);
@@ -263,5 +272,11 @@ mod tests {
             run.overrides.labels,
             vec![("env".to_string(), "dev".to_string())]
         );
+    }
+
+    #[test]
+    fn run_command_rejects_bare_memory_and_disk_size() {
+        assert!(BentoCtlCmd::try_parse_from(["bento", "run", "dev", "--memory", "4096"]).is_err());
+        assert!(BentoCtlCmd::try_parse_from(["bento", "run", "dev", "--disk-size", "40"]).is_err());
     }
 }

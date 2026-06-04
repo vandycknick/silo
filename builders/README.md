@@ -9,7 +9,7 @@ guest.
 ```sh
 ./target/release/bentoctl create <image-ref> archboot \
     --cpus 2 \
-    --memory 2048
+    --memory 2gb
 ```
 
 # Inside the VM run the following commands:
