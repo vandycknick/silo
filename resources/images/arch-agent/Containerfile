@@ -57,4 +57,3 @@ RUN ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf \
  && rm -f /etc/machine-id \
  && touch /etc/machine-id \
  && cloud-init clean --logs --machine-id || true
-

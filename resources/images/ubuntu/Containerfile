@@ -1,0 +1,42 @@
+FROM ubuntu:24.04
+
+RUN apt update && \
+    apt upgrade -y && \
+    apt install -y \
+        vim \
+        iptables \
+        iproute2 \
+        kmod \
+        procps \
+        sudo \
+        udev \
+        systemd \
+        openssh-server \
+        e2fsprogs \
+        cloud-init \
+        tar && \
+    apt clean && \
+    rm -rf \
+        /var/cache/apt/* \
+        /var/log/* \
+        /tmp/* \
+        /var/tmp/*
+
+RUN systemctl enable \
+    cloud-init-local.service \
+    cloud-init.service \
+    cloud-config.service \
+    cloud-final.service \
+    ssh.service \
+    systemd-networkd.service \
+    systemd-timesyncd.service \
+    systemd-resolved.service
+
+RUN ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf \
+  && passwd -d root && passwd -u root || true \
+  && rm -f /etc/machine-id \
+  && touch /etc/machine-id \
+  && cloud-init clean --logs --machine-id || true
+
+# Configure SSHD
+# RUN mkdir -p /var/empty/sshd # sshd needs this for some reason

@@ -1,0 +1,43 @@
+FROM fedora:45
+
+RUN dnf -y upgrade --refresh && \
+    dnf -y install \
+        vim \
+        iptables \
+        iproute \
+        kmod \
+        procps-ng \
+        sudo \
+        udev \
+        systemd \
+        openssh-server \
+        e2fsprogs \
+        cloud-init \
+        tar && \
+    dnf clean all && \
+    rm -rf \
+        /var/cache/dnf/* \
+        /var/log/* \
+        /tmp/* \
+        /var/tmp/*
+
+RUN systemctl enable \
+    cloud-init-local.service \
+    cloud-init-main.service \
+    cloud-init-network.service \
+    cloud-config.service \
+    cloud-final.service \
+    sshd.service \
+    systemd-networkd.service \
+    systemd-timesyncd.service \
+    systemd-resolved.service
+
+RUN printf 'L+ /etc/resolv.conf - - - - /run/systemd/resolve/stub-resolv.conf\n' > /etc/tmpfiles.d/resolv.conf \
+  && printf "datasource_list: [ NoCloud, None ]\n\nsystem_info:\n  network:\n    renderers: ['networkd']\n" > /etc/cloud/cloud.cfg.d/99-bento.cfg \
+  && (passwd -d root && passwd -u root || true) \
+  && (cloud-init clean --logs || true) \
+  && rm -f /etc/machine-id /var/lib/dbus/machine-id \
+  && touch /etc/machine-id
+
+# Configure SSHD
+# RUN mkdir -p /var/empty/sshd # sshd needs this for some reason
