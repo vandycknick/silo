@@ -762,7 +762,7 @@ fn now_unix_nanos() -> u128 {
 mod tests {
     use std::io::Cursor;
 
-    use arcbox_ext4::Reader;
+    use bento_ext4::Reader;
     use tar::{Builder, Header};
 
     use crate::store::{

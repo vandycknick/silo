@@ -11,8 +11,8 @@
 
 use std::io::Cursor;
 
-use arcbox_ext4::constants::*;
-use arcbox_ext4::{Formatter, Reader};
+use bento_ext4::constants::*;
+use bento_ext4::{Formatter, Reader};
 use tempfile::NamedTempFile;
 
 /// Helper: create a formatter backed by a temporary file.
@@ -48,7 +48,9 @@ fn tar_dir(builder: &mut tar::Builder<Vec<u8>>, path: &str, mode: u32) {
     header.set_gid(0);
     header.set_mtime(1_700_000_000);
     header.set_cksum();
-    builder.append_data(&mut header, path, &[] as &[u8]).unwrap();
+    builder
+        .append_data(&mut header, path, &[] as &[u8])
+        .unwrap();
 }
 
 /// Append a regular file entry.
@@ -86,7 +88,9 @@ fn tar_whiteout(builder: &mut tar::Builder<Vec<u8>>, path: &str) {
     header.set_gid(0);
     header.set_mtime(1_700_000_000);
     header.set_cksum();
-    builder.append_data(&mut header, path, &[] as &[u8]).unwrap();
+    builder
+        .append_data(&mut header, path, &[] as &[u8])
+        .unwrap();
 }
 
 /// Finish the tar builder and return bytes wrapped in a Cursor.
@@ -362,18 +366,8 @@ fn test_oci_utf8_filenames() {
     let mut b = tar::Builder::new(Vec::new());
 
     tar_dir(&mut b, "data/", 0o755);
-    tar_file(
-        &mut b,
-        "data/\u{65E5}\u{672C}\u{8A9E}.txt",
-        0o644,
-        b"hello",
-    );
-    tar_file(
-        &mut b,
-        "data/\u{00E9}mojis_\u{1F389}.txt",
-        0o644,
-        b"party",
-    );
+    tar_file(&mut b, "data/\u{65E5}\u{672C}\u{8A9E}.txt", 0o644, b"hello");
+    tar_file(&mut b, "data/\u{00E9}mojis_\u{1F389}.txt", 0o644, b"party");
 
     let layer = finish_tar(b);
 
@@ -414,15 +408,11 @@ fn test_oci_utf8_filenames() {
 
     // Chinese symlink resolves to the Japanese file
     assert!(reader.exists("/data/\u{94FE}\u{63A5}"));
-    let data = reader
-        .read_file("/data/\u{94FE}\u{63A5}", 0, None)
-        .unwrap();
+    let data = reader.read_file("/data/\u{94FE}\u{63A5}", 0, None).unwrap();
     assert_eq!(&data, b"hello");
 
     // Confirm the symlink is indeed a link
-    let (_, inode) = reader
-        .stat_no_follow("/data/\u{94FE}\u{63A5}")
-        .unwrap();
+    let (_, inode) = reader.stat_no_follow("/data/\u{94FE}\u{63A5}").unwrap();
     assert!(
         inode.is_link(),
         "/data/\u{94FE}\u{63A5} should be a symlink"

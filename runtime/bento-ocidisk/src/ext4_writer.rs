@@ -1,8 +1,8 @@
 use std::io::Read;
 use std::path::Path;
 
-use arcbox_ext4::constants::{file_mode, make_mode};
-use arcbox_ext4::{FormatOptions, Formatter};
+use bento_ext4::constants::{file_mode, make_mode};
+use bento_ext4::{FormatOptions, Formatter};
 
 use crate::{OciDiskError, OciDiskResult};
 
@@ -112,7 +112,7 @@ fn mode_bits(mode: u32) -> u16 {
 mod tests {
     use std::io::Cursor;
 
-    use arcbox_ext4::Reader;
+    use bento_ext4::Reader;
 
     use crate::ext4_writer::Ext4Writer;
 

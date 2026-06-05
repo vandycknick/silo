@@ -1,8 +1,8 @@
 // Minimal reproduction tests for 4 bugs reported by Codex.
 // Each test is designed to trigger the specific bug if it exists.
 
-use arcbox_ext4::constants::*;
-use arcbox_ext4::{Formatter, Reader};
+use bento_ext4::constants::*;
+use bento_ext4::{Formatter, Reader};
 use tempfile::NamedTempFile;
 
 fn new_formatter() -> (Formatter, NamedTempFile) {
@@ -26,10 +26,14 @@ fn bug1_unlink_original_preserves_hardlink() {
     fmt.create(
         "/original",
         make_mode(file_mode::S_IFREG, 0o644),
-        None, None,
+        None,
+        None,
         Some(&mut "hardlink content".as_bytes()),
-        None, None, None,
-    ).unwrap();
+        None,
+        None,
+        None,
+    )
+    .unwrap();
 
     fmt.link("/alias", "/original").unwrap();
     fmt.unlink("/original", false).unwrap();
@@ -38,9 +42,15 @@ fn bug1_unlink_original_preserves_hardlink() {
     let mut reader = Reader::new(tmp.path()).unwrap();
 
     // /alias should still exist and be readable.
-    assert!(reader.exists("/alias"), "/alias should exist after unlinking /original");
+    assert!(
+        reader.exists("/alias"),
+        "/alias should exist after unlinking /original"
+    );
     let data = reader.read_file("/alias", 0, None).unwrap();
-    assert_eq!(&data, b"hardlink content", "/alias content should be intact");
+    assert_eq!(
+        &data, b"hardlink content",
+        "/alias content should be intact"
+    );
 
     // /original should be gone.
     assert!(!reader.exists("/original"), "/original should be gone");
@@ -60,10 +70,14 @@ fn bug1b_last_hardlink_reclaims_inode() {
     fmt.create(
         "/original",
         make_mode(file_mode::S_IFREG, 0o644),
-        None, None,
+        None,
+        None,
         Some(&mut "reclaim me".as_bytes()),
-        None, None, None,
-    ).unwrap();
+        None,
+        None,
+        None,
+    )
+    .unwrap();
 
     // Note the inode number before linking.
     fmt.link("/alias", "/original").unwrap();
@@ -74,10 +88,14 @@ fn bug1b_last_hardlink_reclaims_inode() {
     fmt.create(
         "/dummy",
         make_mode(file_mode::S_IFREG, 0o644),
-        None, None,
+        None,
+        None,
         Some(&mut "keep".as_bytes()),
-        None, None, None,
-    ).unwrap();
+        None,
+        None,
+        None,
+    )
+    .unwrap();
 
     fmt.close().unwrap();
 
@@ -90,7 +108,10 @@ fn bug1b_last_hardlink_reclaims_inode() {
     // links_count == 0 and dtime != 0.
     // Inode 11 = lost+found, 12 = original, 13 = dummy.
     let inode = reader.get_inode(12).unwrap();
-    assert_eq!(inode.links_count, 0, "inode should have links_count=0 after full reclaim");
+    assert_eq!(
+        inode.links_count, 0,
+        "inode should have links_count=0 after full reclaim"
+    );
     assert_ne!(inode.dtime, 0, "inode should have dtime set after reclaim");
 
     // Verify data blocks were also reclaimed by comparing free_blocks with
@@ -102,13 +123,18 @@ fn bug1b_last_hardlink_reclaims_inode() {
 
     let baseline_tmp = NamedTempFile::new().unwrap();
     let mut baseline = Formatter::new(baseline_tmp.path(), 4096, 256 * 1024).unwrap();
-    baseline.create(
-        "/dummy",
-        make_mode(file_mode::S_IFREG, 0o644),
-        None, None,
-        Some(&mut "keep".as_bytes()),
-        None, None, None,
-    ).unwrap();
+    baseline
+        .create(
+            "/dummy",
+            make_mode(file_mode::S_IFREG, 0o644),
+            None,
+            None,
+            Some(&mut "keep".as_bytes()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
     baseline.close().unwrap();
     let baseline_reader = Reader::new(baseline_tmp.path()).unwrap();
     let free_baseline = {
@@ -141,10 +167,14 @@ fn bug1c_large_file_hardlink_reclaim() {
     fmt.create(
         "/bigfile",
         make_mode(file_mode::S_IFREG, 0o644),
-        None, None,
+        None,
+        None,
         Some(&mut pattern.as_slice()),
-        None, None, None,
-    ).unwrap();
+        None,
+        None,
+        None,
+    )
+    .unwrap();
 
     fmt.link("/biglink", "/bigfile").unwrap();
     fmt.unlink("/bigfile", false).unwrap();
@@ -153,10 +183,14 @@ fn bug1c_large_file_hardlink_reclaim() {
     fmt.create(
         "/dummy",
         make_mode(file_mode::S_IFREG, 0o644),
-        None, None,
+        None,
+        None,
         Some(&mut "x".as_bytes()),
-        None, None, None,
-    ).unwrap();
+        None,
+        None,
+        None,
+    )
+    .unwrap();
 
     fmt.close().unwrap();
 
@@ -176,13 +210,18 @@ fn bug1c_large_file_hardlink_reclaim() {
 
     let baseline_tmp = NamedTempFile::new().unwrap();
     let mut baseline = Formatter::new(baseline_tmp.path(), 4096, 256 * 1024).unwrap();
-    baseline.create(
-        "/dummy",
-        make_mode(file_mode::S_IFREG, 0o644),
-        None, None,
-        Some(&mut "x".as_bytes()),
-        None, None, None,
-    ).unwrap();
+    baseline
+        .create(
+            "/dummy",
+            make_mode(file_mode::S_IFREG, 0o644),
+            None,
+            None,
+            Some(&mut "x".as_bytes()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
     baseline.close().unwrap();
     let baseline_reader = Reader::new(baseline_tmp.path()).unwrap();
     let free_baseline = {
@@ -222,7 +261,9 @@ fn bug2_unpack_tar_symlink_not_misclassified() {
         header.set_mode(0o644);
         header.set_size(content.len() as u64);
         header.set_cksum();
-        builder.append_data(&mut header, "target.txt", &content[..]).unwrap();
+        builder
+            .append_data(&mut header, "target.txt", &content[..])
+            .unwrap();
 
         // Symlink entry.
         let mut header = tar::Header::new_gnu();
@@ -230,7 +271,9 @@ fn bug2_unpack_tar_symlink_not_misclassified() {
         header.set_mode(0o777);
         header.set_size(0);
         header.set_cksum();
-        builder.append_link(&mut header, "my_symlink", "/target.txt").unwrap();
+        builder
+            .append_link(&mut header, "my_symlink", "/target.txt")
+            .unwrap();
 
         builder.finish().unwrap();
     }
@@ -273,7 +316,10 @@ fn bug2_unpack_tar_symlink_not_misclassified() {
 fn bug3_non_4096_block_size_rejected() {
     let tmp = NamedTempFile::new().unwrap();
     let result = Formatter::new(tmp.path(), 1024, 256 * 1024);
-    assert!(result.is_err(), "non-4096 block size should return an error, not panic");
+    assert!(
+        result.is_err(),
+        "non-4096 block size should return an error, not panic"
+    );
 }
 
 #[test]
@@ -282,10 +328,14 @@ fn bug3_4096_block_size_writes_correct_log() {
     fmt.create(
         "/hello.txt",
         make_mode(file_mode::S_IFREG, 0o644),
-        None, None,
+        None,
+        None,
         Some(&mut "hello".as_bytes()),
-        None, None, None,
-    ).unwrap();
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     fmt.close().unwrap();
 
     let reader = Reader::new(tmp.path()).unwrap();
@@ -312,15 +362,26 @@ fn bug4_mkdir_p_through_symlink() {
     fmt.create(
         "/real_dir",
         make_mode(file_mode::S_IFDIR, 0o755),
-        None, None, None, None, None, None,
-    ).unwrap();
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
 
     fmt.create(
         "/sym",
         make_mode(file_mode::S_IFLNK, 0o777),
         Some("/real_dir"),
-        None, None, None, None, None,
-    ).unwrap();
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
 
     // Now create a file under /sym/... which triggers mkdir-p on /sym.
     // Since /sym is a symlink (not a directory), the formatter cannot create
@@ -329,9 +390,12 @@ fn bug4_mkdir_p_through_symlink() {
     let result = fmt.create(
         "/sym/child.txt",
         make_mode(file_mode::S_IFREG, 0o644),
-        None, None,
+        None,
+        None,
         Some(&mut "data".as_bytes()),
-        None, None, None,
+        None,
+        None,
+        None,
     );
     assert!(result.is_err(), "creating under a symlink path should fail");
 

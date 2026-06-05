@@ -2,6 +2,7 @@
 members = [
     "app/bentoctl",
     "common/bento-core",
+    "common/bento-ext4",
     "common/bento-utils",
     "guest/bento-agent",
     "runtime/bento-ocidisk",

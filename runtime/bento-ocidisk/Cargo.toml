@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-arcbox-ext4 = "0.1.2"
+bento-ext4 = { path = "../../common/bento-ext4" }
 containerregistry-image = "0.1.2"
 containerregistry-registry = "0.1.2"
 flate2 = "1.1.5"

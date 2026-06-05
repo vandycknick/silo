@@ -198,7 +198,7 @@ mod tests {
         let manifest = fs::read_to_string(manifest_path).expect("read manifest");
 
         for dependency in [
-            "arcbox-ext4",
+            "bento-ext4",
             "containerregistry-image",
             "containerregistry-registry",
         ] {

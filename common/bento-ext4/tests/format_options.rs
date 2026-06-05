@@ -1,8 +1,8 @@
 // Tests for `FormatOptions` / `Formatter::with_options` — UUID and label
 // propagation into the superblock, label validation.
 
-use arcbox_ext4::error::FormatError;
-use arcbox_ext4::{FormatOptions, Formatter, Reader};
+use bento_ext4::error::FormatError;
+use bento_ext4::{FormatOptions, Formatter, Reader};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 

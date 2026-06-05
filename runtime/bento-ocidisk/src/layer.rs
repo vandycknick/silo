@@ -44,7 +44,7 @@ pub(crate) fn apply_layer(reader: impl Read, writer: &mut Ext4Writer) -> OciDisk
             || entry_type.is_character_special()
             || entry_type.is_fifo()
         {
-            tracing::debug!(path, "skipping tar entry type not supported by arcbox-ext4");
+            tracing::debug!(path, "skipping tar entry type not supported by bento-ext4");
         } else {
             tracing::debug!(path, "skipping unsupported tar entry type");
         }
@@ -153,7 +153,7 @@ fn join(parent: &str, name: &str) -> String {
 mod tests {
     use std::io::Cursor;
 
-    use arcbox_ext4::Reader;
+    use bento_ext4::Reader;
     use tar::{Builder, Header};
 
     use crate::ext4_writer::Ext4Writer;
