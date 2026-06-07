@@ -329,6 +329,7 @@ impl Formatter {
             let block_offset = (self.pos() % self.block_size as u64) as usize;
             let writable = (block_size - block_offset).min(bytes.len() - offset);
             self.file.write_all(&bytes[offset..offset + writable])?;
+            self.size = self.size.max(self.file.stream_position()?);
             Self::record_block_range(ranges, block);
             offset += writable;
         }
@@ -943,6 +944,7 @@ impl Formatter {
         let resize_dind_block = self.allocate_resize_inode_dind_block()?;
 
         // -- Step 3: Optimize block group layout --
+        self.size = self.size.max(self.file.metadata()?.len());
         let current_blk = self.current_block();
         let inode_count = self.inodes.len() as u32;
         let (block_groups, inodes_per_group) =
@@ -1657,6 +1659,27 @@ mod tests {
         // The file should exist and have non-zero size.
         let meta = std::fs::metadata(&path).unwrap();
         assert!(meta.len() > 0);
+    }
+
+    #[test]
+    fn close_preserves_payloads_written_past_requested_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ext4");
+        let mut fmt = Formatter::new(&path, 4096, 128 * 1024 * 1024).unwrap();
+
+        // Simulate regular file payloads filling the requested size and pushing
+        // the directory payload region into the next block group without paying
+        // the test cost of writing a large tarball.
+        let root_directory_block = fmt.blocks_per_group() + 100;
+        fmt.seek_to_block(root_directory_block).unwrap();
+
+        fmt.close().unwrap();
+
+        let mut reader = crate::Reader::new(&path).unwrap();
+        let root_entries = reader.children_of(ROOT_INODE).unwrap();
+        assert!(root_entries.iter().any(|(name, _)| name == "."));
+        assert!(root_entries.iter().any(|(name, _)| name == ".."));
+        assert!(root_entries.iter().any(|(name, _)| name == "lost+found"));
     }
 
     #[test]

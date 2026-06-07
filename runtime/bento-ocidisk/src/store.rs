@@ -282,9 +282,7 @@ impl ImageStore {
         fs::create_dir_all(&self.root)?;
         let path = canonical_local_file(image_ref, &path)?;
         reject_known_tar_compression(image_ref, &path)?;
-        println!("Creating sha256 from file");
         let image_id = format!("tar-sha256:{}", sha256_file(&path)?);
-        println!("DONE Creating sha256 from file");
 
         if let Some(image) = self.cached_image(
             image_ref,
@@ -472,7 +470,6 @@ impl ImageStore {
                 reason: format!("metadata rootfs file is {}", metadata.rootfs_file),
             });
         }
-
         Ok(Some(RootfsImage {
             path: rootfs_path,
             image_ref: image_ref.to_string(),
@@ -760,7 +757,7 @@ fn now_unix_nanos() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
 
     use bento_ext4::Reader;
     use tar::{Builder, Header};
@@ -973,6 +970,27 @@ mod tests {
     }
 
     #[test]
+    fn rootfs_tar_can_grow_past_requested_size() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let tar_path = temp.path().join("rootfs.tar");
+        write_sparse_tar_file(&tar_path, "var/lib/payload", 9 * 1024 * 1024);
+
+        let store = ImageStore::open(temp.path().join("cache")).expect("open store");
+        let options =
+            RootfsOptions::new(Platform::linux_amd64()).with_disk_size_bytes(8 * 1024 * 1024);
+
+        let image = store
+            .get_or_create_rootfs_tar(&format!("tar:{}", tar_path.display()), tar_path, options)
+            .expect("convert oversized tar");
+
+        let mut reader = Reader::new(&image.path).expect("open grown ext4");
+        let bytes = reader
+            .read_file("/var/lib/payload", 0, Some(16))
+            .expect("read grown payload");
+        assert_eq!(bytes, vec![0u8; 16]);
+    }
+
+    #[test]
     fn rootfs_tar_rejects_known_compression() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let tar_path = temp.path().join("rootfs.tar.gz");
@@ -1025,6 +1043,22 @@ mod tests {
             .append(&header, Cursor::new(data.to_vec()))
             .expect("append file");
         builder.into_inner().expect("finish tar")
+    }
+
+    fn write_sparse_tar_file(path: &std::path::Path, member_path: &str, size: u64) {
+        let file = std::fs::File::create(path).expect("create tar");
+        let mut builder = Builder::new(file);
+        let mut header = Header::new_gnu();
+        header.set_path(member_path).expect("set path");
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_cksum();
+        builder
+            .append(&header, std::io::repeat(0).take(size))
+            .expect("append sparse payload");
+        builder.finish().expect("finish tar");
     }
 
     fn write_oci_archive(path: &std::path::Path, architecture: &str, layer: Vec<u8>) {

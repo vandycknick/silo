@@ -6,7 +6,7 @@
 
 use bento_ext4::constants::*;
 use bento_ext4::types::{GroupDescriptor, SuperBlock};
-use bento_ext4::{Formatter, Reader};
+use bento_ext4::{Formatter, Reader, extent};
 use std::io::{Read, Seek, SeekFrom};
 use tempfile::NamedTempFile;
 
@@ -242,6 +242,26 @@ fn test_resize_inode_and_backup_sparse_super_layout() {
     let mut reader = Reader::new(tmp.path()).unwrap();
     let sb = reader.superblock().clone();
     let block_size = 1024u64 * (1 << sb.log_block_size);
+
+    let root_entries = reader.children_of(ROOT_INODE).unwrap();
+    assert!(
+        root_entries.iter().any(|(name, _)| name == "lost+found"),
+        "root directory entries must survive final metadata writes"
+    );
+
+    let root_inode = reader.get_inode(ROOT_INODE).unwrap();
+    let mut image = std::fs::File::open(tmp.path()).unwrap();
+    let root_extents = extent::parse_extents(&root_inode, block_size, &mut image).unwrap();
+    let (root_block, _) = root_extents
+        .first()
+        .copied()
+        .expect("root directory must have a data block");
+    let root_block = read_block(&mut image, root_block, block_size);
+    assert!(
+        root_block.iter().any(|byte| *byte != 0),
+        "root directory data block must not be sparse zeroes"
+    );
+
     let group_count = (sb.blocks_count_lo - 1) / sb.blocks_per_group + 1;
     let groups_per_descriptor_block = block_size as u32 / GroupDescriptor::SIZE as u32;
     let descriptor_blocks = (group_count - 1) / groups_per_descriptor_block + 1;
