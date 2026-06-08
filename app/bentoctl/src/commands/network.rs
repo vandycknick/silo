@@ -3,7 +3,7 @@ use std::io::Write;
 
 use bento_libvm::{
     LibVm, MachineRef, NamedNetworkMode, NetworkDefinition, NetworkDriverPreference,
-    RequestedNetwork,
+    NetworkPolicyRef, RequestedNetwork,
 };
 use clap::{Args, Subcommand};
 use tabwriter::TabWriter;
@@ -88,6 +88,9 @@ pub struct SetCmd {
     /// Network to use. Allowed: private, none, name:NETWORK, or NETWORK.
     #[arg(value_name = "NETWORK", value_parser = parse_requested_network)]
     pub network: RequestedNetwork,
+    /// Network policy to apply. Named policies resolve like profile network.policy_ref.
+    #[arg(long, value_name = "POLICY", value_parser = parse_network_policy_ref)]
+    pub policy: Option<NetworkPolicyRef>,
 }
 
 impl Cmd {
@@ -161,8 +164,9 @@ async fn remove_network(libvm: &LibVm, cmd: &RmCmd) -> eyre::Result<()> {
 }
 
 async fn set_machine_network(libvm: &LibVm, cmd: &SetCmd) -> eyre::Result<()> {
+    let network = requested_network_with_policy(cmd.network.clone(), cmd.policy.clone())?;
     let machine = libvm
-        .set_network(&MachineRef::parse(cmd.vm.clone())?, cmd.network.clone())
+        .set_network(&MachineRef::parse(cmd.vm.clone())?, network)
         .await?;
     println!(
         "network for {} set to {}",
@@ -173,6 +177,21 @@ async fn set_machine_network(libvm: &LibVm, cmd: &SetCmd) -> eyre::Result<()> {
         println!("change applies on next restart");
     }
     Ok(())
+}
+
+fn requested_network_with_policy(
+    network: RequestedNetwork,
+    policy_ref: Option<NetworkPolicyRef>,
+) -> eyre::Result<RequestedNetwork> {
+    match (network, policy_ref) {
+        (RequestedNetwork::Private { .. }, policy_ref) => {
+            Ok(RequestedNetwork::Private { policy_ref })
+        }
+        (network @ (RequestedNetwork::None | RequestedNetwork::Named { .. }), None) => Ok(network),
+        (RequestedNetwork::None | RequestedNetwork::Named { .. }, Some(_)) => {
+            eyre::bail!("--policy is only supported with private networks")
+        }
+    }
 }
 
 fn parse_network_mode(input: &str) -> Result<NamedNetworkMode, String> {
@@ -197,6 +216,10 @@ fn parse_driver_preference(input: &str) -> Result<NetworkDriverPreference, Strin
     }
 }
 
+fn parse_network_policy_ref(input: &str) -> Result<NetworkPolicyRef, String> {
+    NetworkPolicyRef::new(input)
+}
+
 fn format_network_mode(mode: NamedNetworkMode) -> &'static str {
     match mode {
         NamedNetworkMode::Nat => "nat",
@@ -215,11 +238,12 @@ fn format_driver_preference(preference: NetworkDriverPreference) -> &'static str
 
 #[cfg(test)]
 mod tests {
+    use bento_libvm::{NetworkPolicyRef, RequestedNetwork};
     use clap::Parser;
 
     use crate::commands::{BentoCtlCmd, Command};
 
-    use super::NetworkSubcommand;
+    use super::{requested_network_with_policy, NetworkSubcommand};
 
     #[test]
     fn network_ls_alias_parses_as_network_list() {
@@ -237,5 +261,150 @@ mod tests {
         };
 
         assert!(list.json);
+    }
+
+    #[test]
+    fn network_set_parses_private_policy_name() {
+        let cmd = BentoCtlCmd::try_parse_from([
+            "bento", "network", "set", "devbox", "private", "--policy", "github",
+        ])
+        .expect("network set should parse");
+
+        let set = network_set_cmd(cmd);
+        assert_eq!(set.vm, "devbox");
+        assert_eq!(set.network, RequestedNetwork::Private { policy_ref: None });
+        assert_eq!(set.policy.expect("policy").as_str(), "github");
+    }
+
+    #[test]
+    fn network_set_parses_private_absolute_policy_path() {
+        let cmd = BentoCtlCmd::try_parse_from([
+            "bento",
+            "network",
+            "set",
+            "devbox",
+            "private",
+            "--policy",
+            "/etc/bento/policy.hcl",
+        ])
+        .expect("network set should parse");
+
+        let set = network_set_cmd(cmd);
+        assert_eq!(
+            set.policy.expect("policy").as_str(),
+            "/etc/bento/policy.hcl"
+        );
+    }
+
+    #[test]
+    fn network_set_rejects_invalid_policy_ref() {
+        let result = BentoCtlCmd::try_parse_from([
+            "bento",
+            "network",
+            "set",
+            "devbox",
+            "private",
+            "--policy",
+            "policies/github.hcl",
+        ]);
+
+        let err = match result {
+            Ok(_) => panic!("relative policy paths should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("relative network policy paths"));
+    }
+
+    #[test]
+    fn network_set_parses_none_with_policy_for_runtime_validation() {
+        let cmd = BentoCtlCmd::try_parse_from([
+            "bento", "network", "set", "devbox", "none", "--policy", "github",
+        ])
+        .expect("network set should parse");
+
+        let set = network_set_cmd(cmd);
+        assert_eq!(set.network, RequestedNetwork::None);
+        assert_eq!(set.policy.expect("policy").as_str(), "github");
+    }
+
+    #[test]
+    fn network_set_parses_named_with_policy_for_runtime_validation() {
+        let cmd = BentoCtlCmd::try_parse_from([
+            "bento", "network", "set", "devbox", "devnet", "--policy", "github",
+        ])
+        .expect("network set should parse");
+
+        let set = network_set_cmd(cmd);
+        assert_eq!(
+            set.network,
+            RequestedNetwork::Named {
+                name: "devnet".to_string(),
+                policy_ref: None,
+            }
+        );
+        assert_eq!(set.policy.expect("policy").as_str(), "github");
+    }
+
+    #[test]
+    fn requested_network_policy_applies_to_private_network() {
+        let policy_ref = NetworkPolicyRef::new("github").expect("policy ref");
+
+        let network = requested_network_with_policy(
+            RequestedNetwork::Private { policy_ref: None },
+            Some(policy_ref.clone()),
+        )
+        .expect("policy should apply");
+
+        assert_eq!(
+            network,
+            RequestedNetwork::Private {
+                policy_ref: Some(policy_ref),
+            }
+        );
+    }
+
+    #[test]
+    fn requested_network_policy_rejects_none_network() {
+        let policy_ref = NetworkPolicyRef::new("github").expect("policy ref");
+
+        let err = requested_network_with_policy(RequestedNetwork::None, Some(policy_ref))
+            .expect_err("policy should be rejected");
+
+        assert_eq!(
+            err.to_string(),
+            "--policy is only supported with private networks"
+        );
+    }
+
+    #[test]
+    fn requested_network_policy_rejects_named_network() {
+        let policy_ref = NetworkPolicyRef::new("github").expect("policy ref");
+
+        let err = requested_network_with_policy(
+            RequestedNetwork::Named {
+                name: "devnet".to_string(),
+                policy_ref: None,
+            },
+            Some(policy_ref),
+        )
+        .expect_err("policy should be rejected");
+
+        assert_eq!(
+            err.to_string(),
+            "--policy is only supported with private networks"
+        );
+    }
+
+    fn network_set_cmd(cmd: BentoCtlCmd) -> super::SetCmd {
+        let network = match cmd.cmd {
+            Command::Network(cmd) => cmd,
+            other => panic!("expected network command, got {other:?}"),
+        };
+
+        match network.command {
+            NetworkSubcommand::Set(cmd) => cmd,
+            other => panic!("expected network set command, got {other:?}"),
+        }
     }
 }
