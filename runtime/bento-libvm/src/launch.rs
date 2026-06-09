@@ -1,5 +1,4 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -7,10 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bento_core::agent::{
     AgentConfig, AgentDnsConfig, AgentForwardConfig, AgentSshConfig, AgentUdsForwardConfig,
-    CertificateAuthorityConfig, GrowpartConfig as ProvisionGrowpartConfig,
-    MountConfig as ProvisionMountConfig, NetworkConfig as ProvisionNetworkConfig,
-    NetworkInterfaceConfig, NetworkMatchConfig, ProvisionConfig, UserConfig, UserdataConfig,
-    UserdataContentType,
+    CertificateAuthorityConfig, MountConfig as ProvisionMountConfig,
+    NetworkConfig as ProvisionNetworkConfig, NetworkInterfaceConfig, NetworkMatchConfig,
+    ProvisionConfig, ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType,
 };
 use bento_core::{Disk, DiskKind, VmSpec};
 use bento_utils::format_mac;
@@ -29,7 +27,8 @@ const GUEST_AGENT_CIDATA_ENTRY: &str = "bento-agent";
 const GUEST_AGENT_INSTALL_SCRIPT_ENTRY: &str = "bento-install-guest-agent.sh";
 const GUEST_AGENT_CONFIG_ENTRY: &str = "bento-agent.yaml";
 const GUEST_AGENT_CONFIG_ENV_ENTRY: &str = "config.env";
-const GUEST_AGENT_BOOTSTRAP_SCRIPT: &str = "/var/lib/cloud/scripts/per-boot/00-bento.bootstrap.sh";
+const CLOUD_INIT_BOOTSTRAP_SCRIPT_PATH: &str =
+    "/var/lib/cloud/scripts/per-boot/00-bento.bootstrap.sh";
 const GUEST_BOOTSTRAP_SCRIPT_CONTENT: &str = include_str!("../scripts/guest-bootstrap.sh");
 const GUEST_INSTALL_SCRIPT_CONTENT: &str = include_str!("../scripts/guest-install.sh");
 const TASK_REGISTER_AGENT_CONTENT: &str = include_str!("../scripts/tasks/10-register-agent.sh");
@@ -39,7 +38,6 @@ const CIDATA_VOLUME_LABEL: &str = "CIDATA";
 const CIDATA_MIN_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 const CIDATA_SIZE_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
 const GUEST_CERTIFICATE_AUTHORITY_PATH: &str = "/usr/local/share/ca-certificates/bento-ca.crt";
-const GUEST_CERTIFICATE_AUTHORITY_TRUST_COMMAND: &str = "if command -v update-ca-certificates >/dev/null 2>&1; then update-ca-certificates; elif command -v trust >/dev/null 2>&1; then trust anchor --store /usr/local/share/ca-certificates/bento-ca.crt && trust extract-compat; fi";
 
 #[derive(Debug, Deserialize, Default)]
 struct ForwardPluginAgentConfig {
@@ -58,13 +56,6 @@ struct CidataEntry {
     contents: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
-struct MonitorMount {
-    source: PathBuf,
-    tag: String,
-    writable: bool,
-}
-
 pub(crate) fn prepare_instance_runtime(
     layout: &Layout,
     instance_dir: &Path,
@@ -73,19 +64,10 @@ pub(crate) fn prepare_instance_runtime(
     network: &RuntimeNetwork,
 ) -> eyre::Result<()> {
     let guest_runtime = resolve_guest_runtime_config(spec, network)?;
-    let needs_bootstrap = requires_bootstrap(spec, &guest_runtime);
-    reconcile_cidata_disk(spec, needs_bootstrap);
+    ensure_cidata_disk(spec);
     normalize_runtime_mounts(spec)?;
 
-    rebuild_bootstrap(
-        layout,
-        instance_dir,
-        name,
-        spec,
-        network,
-        &guest_runtime,
-        needs_bootstrap,
-    )?;
+    build_cidata_disk(layout, instance_dir, name, spec, network, &guest_runtime)?;
     write_vm_spec_to_dir(instance_dir, spec)?;
 
     Ok(())
@@ -116,13 +98,13 @@ fn write_vm_spec_to_dir(instance_dir: &Path, spec: &VmSpec) -> eyre::Result<()> 
         .with_context(|| format!("write vm spec at {}", config_path.display()))
 }
 
-fn reconcile_cidata_disk(spec: &mut VmSpec, required: bool) -> bool {
+fn ensure_cidata_disk(spec: &mut VmSpec) -> bool {
     let cidata_disk = Disk {
         path: PathBuf::from(InstanceFile::CidataDisk.as_str()),
         kind: DiskKind::Data,
         read_only: true,
     };
-    let mut disks = Vec::with_capacity(spec.storage.disks.len() + usize::from(required));
+    let mut disks = Vec::with_capacity(spec.storage.disks.len() + 1);
     let mut found_cidata = false;
     let mut changed = false;
 
@@ -132,7 +114,7 @@ fn reconcile_cidata_disk(spec: &mut VmSpec, required: bool) -> bool {
             continue;
         }
 
-        if required && !found_cidata {
+        if !found_cidata {
             if disk != &cidata_disk {
                 changed = true;
             }
@@ -143,7 +125,7 @@ fn reconcile_cidata_disk(spec: &mut VmSpec, required: bool) -> bool {
         }
     }
 
-    if required && !found_cidata {
+    if !found_cidata {
         disks.push(cidata_disk);
         changed = true;
     }
@@ -158,8 +140,7 @@ fn reconcile_cidata_disk(spec: &mut VmSpec, required: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_runtime_mounts, render_network_config_for_instance, render_user_data,
-        resolve_guest_runtime_config,
+        normalize_runtime_mounts, render_cloud_init_user_data, resolve_guest_runtime_config,
     };
     use bento_core::{
         agent::{AgentConfig, UserdataContentType},
@@ -235,60 +216,20 @@ mod tests {
             .contains("only '~' and '~/...'"));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn network_config_for_libkrun_attachment_matches_generated_mac() {
-        let network = RuntimeNetwork::UnixDatagram {
-            path: PathBuf::from("/run/bento/net.sock"),
-            mac: "02:00:00:00:00:01".to_string(),
-        };
-        let config = render_network_config_for_instance(&network)
-            .expect("network config should render")
-            .expect("runtime attachment should configure network");
+    fn provision_network_for_vznat_matches_virtio_net_driver() {
+        let config = super::resolve_provision_network_config(&RuntimeNetwork::VzNat { mac: None })
+            .expect("network provision config should render");
 
-        assert!(config.contains("version: 2"));
-        assert!(config.contains("bento:"));
-        assert!(config.contains("match:"));
-        assert!(config.contains("macaddress:"));
-        assert!(!config.contains("set-name"));
-        assert!(!config.contains("eth0"));
-        assert!(!config.contains("enp0s1"));
-        assert!(config.contains("dhcp4: true"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn network_config_for_vz_attachment_matches_generated_mac() {
-        let network = RuntimeNetwork::UnixDatagram {
-            path: PathBuf::from("/run/bento/net.sock"),
-            mac: "02:00:00:00:00:01".to_string(),
-        };
-        let config = render_network_config_for_instance(&network)
-            .expect("network config should render")
-            .expect("runtime attachment should configure network");
-
-        assert!(config.contains("version: 2"));
-        assert!(config.contains("bento:"));
-        assert!(config.contains("match:"));
-        assert!(config.contains("macaddress:"));
-        assert!(!config.contains("driver:"));
-        assert!(!config.contains("set-name"));
-        assert!(!config.contains("eth0"));
-    }
-
-    #[test]
-    fn network_config_for_vznat_matches_virtio_net_driver() {
-        let config = render_network_config_for_instance(&RuntimeNetwork::VzNat { mac: None })
-            .expect("network config should render")
-            .expect("vznat should configure network");
-
-        assert!(config.contains("version: 2"));
-        assert!(config.contains("en*:"));
-        assert!(config.contains("match:"));
-        assert!(config.contains("driver: virtio_net"));
-        assert!(!config.contains("macaddress:"));
-        assert!(!config.contains("set-name"));
-        assert!(!config.contains("eth0"));
+        assert_eq!(config.interfaces.len(), 1);
+        assert_eq!(config.interfaces[0].name, "en");
+        assert_eq!(
+            config.interfaces[0].matches.driver.as_deref(),
+            Some("virtio_net")
+        );
+        assert!(config.interfaces[0].matches.mac_address.is_none());
+        assert!(config.interfaces[0].dhcp4);
+        assert!(!config.interfaces[0].dhcp6);
     }
 
     fn forward_endpoint(port: u32, config: Option<serde_json::Value>) -> VsockEndpointSpec {
@@ -347,39 +288,24 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_is_required_for_certificate_authority_injection() {
-        let spec = sample_spec(Vec::new(), false);
-        let runtime = resolve_guest_runtime_config(&spec, &RuntimeNetwork::None)
-            .expect("runtime config should resolve");
+    fn cloud_init_user_data_only_bootstraps_agent_transport() {
+        let user_data = render_cloud_init_user_data().expect("render user-data");
 
-        assert!(super::requires_bootstrap(&spec, &runtime));
+        assert!(user_data.contains("#cloud-config"));
+        assert!(user_data.contains("/var/lib/cloud/scripts/per-boot/00-bento.bootstrap.sh"));
+        assert!(user_data.contains("bento guest agent cidata device not found"));
+        assert!(!user_data.contains("users:"));
+        assert!(!user_data.contains("growpart:"));
+        assert!(!user_data.contains("resize_rootfs:"));
+        assert!(!user_data.contains("timezone:"));
+        assert!(!user_data.contains("locale:"));
+        assert!(!user_data.contains("mounts:"));
+        assert!(!user_data.contains("/usr/local/share/ca-certificates/bento-ca.crt"));
+        assert!(!user_data.contains("update-ca-certificates"));
     }
 
     #[test]
-    fn user_data_injects_certificate_authority() {
-        let host_user = HostUser {
-            name: "bento".to_string(),
-            uid: 1000,
-            gecos: "Bento User".to_string(),
-        };
-
-        let user_data = render_user_data(
-            &sample_spec(Vec::new(), false),
-            &host_user,
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBento",
-            "-----BEGIN CERTIFICATE-----\nMIIBENTO\n-----END CERTIFICATE-----\n",
-        )
-        .expect("render user-data");
-
-        assert!(user_data.contains("/usr/local/share/ca-certificates/bento-ca.crt"));
-        assert!(user_data.contains("BEGIN CERTIFICATE"));
-        assert!(user_data.contains("permissions: '0644'"));
-        assert!(user_data.contains("update-ca-certificates"));
-        assert!(user_data.contains("trust anchor --store"));
-    }
-
-    #[test]
-    fn user_data_includes_inline_userdata_script() {
+    fn provision_config_includes_shell_userdata_script() {
         let host_user = HostUser {
             name: "bento".to_string(),
             uid: 1000,
@@ -390,22 +316,24 @@ mod tests {
             userdata: Some("#!/bin/sh\necho profile\n".to_string()),
         });
 
-        let user_data = render_user_data(
+        let provision = super::resolve_provision_config(
+            "demo",
             &spec,
+            &RuntimeNetwork::None,
             &host_user,
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBento",
             "-----BEGIN CERTIFICATE-----\nMIIBENTO\n-----END CERTIFICATE-----\n",
         )
-        .expect("render user-data");
+        .expect("resolve provision config");
 
-        assert!(user_data.contains("multipart/mixed"));
-        assert!(user_data.contains("Content-Type: text/x-shellscript"));
-        assert!(user_data.contains("#!/bin/sh"));
-        assert!(user_data.contains("echo profile"));
+        let userdata = provision.userdata.expect("userdata config");
+        assert_eq!(userdata.content_type, UserdataContentType::ShellScript);
+        assert!(userdata.content.contains("#!/bin/sh"));
+        assert!(userdata.content.contains("echo profile"));
     }
 
     #[test]
-    fn user_data_detects_cloud_config_userdata() {
+    fn provision_config_rejects_cloud_config_userdata() {
         let host_user = HostUser {
             name: "bento".to_string(),
             uid: 1000,
@@ -416,17 +344,19 @@ mod tests {
             userdata: Some("#cloud-config\nruncmd:\n  - echo external\n".to_string()),
         });
 
-        let user_data = render_user_data(
+        let err = super::resolve_provision_config(
+            "demo",
             &spec,
+            &RuntimeNetwork::None,
             &host_user,
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBento",
             "-----BEGIN CERTIFICATE-----\nMIIBENTO\n-----END CERTIFICATE-----\n",
         )
-        .expect("render user-data");
+        .expect_err("cloud-config userdata should be rejected");
 
-        assert!(user_data.contains("echo external"));
-        assert!(!user_data.contains("Content-Type: text/x-shellscript"));
-        assert!(user_data.matches("Content-Type: text/cloud-config").count() >= 2);
+        assert!(err
+            .to_string()
+            .contains("only supports shell-script userdata"));
     }
 
     #[test]
@@ -459,12 +389,11 @@ mod tests {
         )
         .expect("resolve provision config");
 
-        assert!(!provision.enabled);
+        assert!(provision.enabled);
         assert_eq!(provision.hostname.as_deref(), Some("demo"));
         assert_eq!(provision.users[0].name, "bento");
         assert_eq!(provision.users[0].ssh_authorized_keys.len(), 1);
-        assert!(provision.growpart.enabled);
-        assert_eq!(provision.growpart.devices, vec!["/".to_string()]);
+        assert!(provision.resize_rootfs.enabled);
         assert_eq!(provision.mounts[0].tag, "workspace");
         assert_eq!(provision.mounts[0].path, "/workspace");
         assert_eq!(provision.network.interfaces[0].name, "bento");
@@ -495,7 +424,8 @@ mod tests {
         })
         .expect("render agent config");
         assert!(rendered.contains("provision:"));
-        assert!(rendered.contains("enabled: false"));
+        assert!(rendered.contains("enabled: true"));
+        assert!(rendered.contains("resize_rootfs:"));
         assert!(rendered.contains("interfaces:"));
     }
 
@@ -562,7 +492,7 @@ mod tests {
     fn cidata_disk_reconciliation_adds_read_only_data_disk() {
         let mut spec = sample_spec(Vec::new(), true);
 
-        assert!(super::reconcile_cidata_disk(&mut spec, true));
+        assert!(super::ensure_cidata_disk(&mut spec));
         assert_eq!(
             spec.storage.disks,
             vec![Disk {
@@ -571,11 +501,11 @@ mod tests {
                 read_only: true,
             }]
         );
-        assert!(!super::reconcile_cidata_disk(&mut spec, true));
+        assert!(!super::ensure_cidata_disk(&mut spec));
     }
 
     #[test]
-    fn cidata_disk_reconciliation_removes_managed_disk() {
+    fn cidata_disk_reconciliation_canonicalizes_existing_managed_disk() {
         let mut spec = sample_spec(Vec::new(), false);
         spec.storage.disks.push(Disk {
             path: PathBuf::from("data.img"),
@@ -585,32 +515,44 @@ mod tests {
         spec.storage.disks.push(Disk {
             path: PathBuf::from(InstanceFile::CidataDisk.as_str()),
             kind: DiskKind::Data,
+            read_only: false,
+        });
+        spec.storage.disks.push(Disk {
+            path: PathBuf::from(InstanceFile::CidataDisk.as_str()),
+            kind: DiskKind::Data,
             read_only: true,
         });
 
-        assert!(super::reconcile_cidata_disk(&mut spec, false));
+        assert!(super::ensure_cidata_disk(&mut spec));
         assert_eq!(
             spec.storage.disks,
-            vec![Disk {
-                path: PathBuf::from("data.img"),
-                kind: DiskKind::Data,
-                read_only: false,
-            }]
+            vec![
+                Disk {
+                    path: PathBuf::from("data.img"),
+                    kind: DiskKind::Data,
+                    read_only: false,
+                },
+                Disk {
+                    path: PathBuf::from(InstanceFile::CidataDisk.as_str()),
+                    kind: DiskKind::Data,
+                    read_only: true,
+                }
+            ]
         );
-        assert!(!super::reconcile_cidata_disk(&mut spec, false));
+        assert!(!super::ensure_cidata_disk(&mut spec));
     }
 }
 
 fn resolve_guest_runtime_config(
     spec: &VmSpec,
-    _network: &RuntimeNetwork,
+    network: &RuntimeNetwork,
 ) -> eyre::Result<AgentConfig> {
     Ok(AgentConfig {
         ssh: AgentSshConfig {
             enabled: spec.settings.agent,
         },
         dns: AgentDnsConfig {
-            // enabled: spec.settings.agent && !matches!(network, RuntimeNetwork::None),
+            enabled: spec.settings.agent && !matches!(network, RuntimeNetwork::None),
             ..AgentDnsConfig::default()
         },
         forward: resolve_forward_runtime_config(spec)?,
@@ -662,17 +604,11 @@ fn resolve_provision_config(
     certificate_authority_pem: &str,
 ) -> eyre::Result<ProvisionConfig> {
     Ok(ProvisionConfig {
-        // Cloud-init remains the active provisioner for this slice. The agent
-        // receives the complete model so the next slice can flip ownership one
-        // feature at a time without changing the transport shape again.
-        enabled: false,
+        enabled: true,
         hostname: Some(name.to_string()),
         timezone: Some(resolve_host_timezone()),
         locale: Some(resolve_host_locale()),
-        growpart: ProvisionGrowpartConfig {
-            enabled: true,
-            devices: vec!["/".to_string()],
-        },
+        resize_rootfs: ResizeRootfsConfig { enabled: true },
         users: vec![UserConfig {
             name: host_user.name.clone(),
             uid: host_user.uid,
@@ -690,21 +626,34 @@ fn resolve_provision_config(
         }),
         network: resolve_provision_network_config(network)?,
         mounts: provision_mount_entries(spec),
-        userdata: provision_userdata(spec),
+        userdata: provision_userdata(spec)?,
         ..ProvisionConfig::default()
     })
 }
 
-fn provision_userdata(spec: &VmSpec) -> Option<UserdataConfig> {
-    let user_data = spec.boot.bootstrap.as_ref()?.userdata.as_deref()?;
-    Some(UserdataConfig {
+fn provision_userdata(spec: &VmSpec) -> eyre::Result<Option<UserdataConfig>> {
+    let Some(user_data) = spec
+        .boot
+        .bootstrap
+        .as_ref()
+        .and_then(|boot| boot.userdata.as_deref())
+    else {
+        return Ok(None);
+    };
+
+    let content_type = match detect_userdata_content_type(user_data) {
+        "text/x-shellscript" => UserdataContentType::ShellScript,
+        other => {
+            eyre::bail!(
+                "agent provisioning only supports shell-script userdata right now; got {other}"
+            )
+        }
+    };
+
+    Ok(Some(UserdataConfig {
         content: user_data.to_string(),
-        content_type: match detect_userdata_content_type(user_data) {
-            "text/x-shellscript" => UserdataContentType::ShellScript,
-            "text/cloud-config" => UserdataContentType::CloudConfig,
-            _ => UserdataContentType::PlainText,
-        },
-    })
+        content_type,
+    }))
 }
 
 fn resolve_provision_network_config(
@@ -738,45 +687,19 @@ fn resolve_provision_network_config(
 }
 
 fn provision_mount_entries(spec: &VmSpec) -> Vec<ProvisionMountConfig> {
-    mounts(spec)
-        .into_iter()
+    spec.mounts
+        .iter()
         .map(|mount| ProvisionMountConfig {
-            tag: mount.tag,
+            tag: mount.tag.clone(),
             path: mount.source.to_string_lossy().to_string(),
             fstype: "virtiofs".to_string(),
-            options: if mount.writable {
-                vec!["rw".to_string(), "nofail".to_string()]
-            } else {
+            options: if mount.read_only {
                 vec!["ro".to_string(), "nofail".to_string()]
+            } else {
+                vec!["rw".to_string(), "nofail".to_string()]
             },
         })
         .collect()
-}
-
-fn requires_bootstrap(_spec: &VmSpec, _guest_runtime: &AgentConfig) -> bool {
-    // The certificate authority is installed through cloud-init for every VM.
-    true
-}
-
-fn rebuild_bootstrap(
-    layout: &Layout,
-    instance_dir: &Path,
-    name: &str,
-    spec: &VmSpec,
-    network: &RuntimeNetwork,
-    guest_runtime: &AgentConfig,
-    required: bool,
-) -> eyre::Result<()> {
-    let iso_path = instance_dir.join(InstanceFile::CidataDisk.as_str());
-    if !required {
-        if iso_path.exists() {
-            std::fs::remove_file(&iso_path)
-                .with_context(|| format!("remove stale cidata {}", iso_path.display()))?;
-        }
-        return Ok(());
-    }
-
-    build_cidata_disk(layout, instance_dir, name, spec, network, guest_runtime)
 }
 
 fn build_cidata_disk(
@@ -805,14 +728,8 @@ fn build_cidata_disk(
         &certificate_authority_pem,
     )?;
 
-    let user_data = render_user_data(
-        spec,
-        &host_user,
-        &user_keys.public_key_openssh,
-        &certificate_authority_pem,
-    )?;
+    let user_data = render_cloud_init_user_data()?;
     let meta_data = render_meta_data(name)?;
-    let network_config = render_network_config_for_instance(network)?;
     let agent_config = render_agent_config(&guest_runtime)?;
     let config_env = render_config_env(name, spec)?;
     let iso_path = instance_dir.join(InstanceFile::CidataDisk.as_str());
@@ -852,13 +769,6 @@ fn build_cidata_disk(
         files.push(CidataEntry {
             name: "tasks/20-setup-rosetta.sh".to_string(),
             contents: TASK_SETUP_ROSETTA_CONTENT.as_bytes().to_vec(),
-        });
-    }
-
-    if let Some(network_config) = network_config {
-        files.push(CidataEntry {
-            name: "network-config".to_string(),
-            contents: network_config.into_bytes(),
         });
     }
 
@@ -948,48 +858,15 @@ fn write_cidata_entry(
 }
 
 #[derive(Serialize)]
-struct CloudConfig {
-    users: Vec<CloudUser>,
-    growpart: CloudGrowpartConfig,
-    resize_rootfs: bool,
-    timezone: String,
-    locale: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    mounts: Vec<[String; 6]>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    write_files: Vec<WriteFile>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    runcmd: Vec<String>,
+struct CloudInitUserData {
+    write_files: Vec<CloudInitWriteFile>,
 }
 
 #[derive(Serialize)]
-struct CloudGrowpartConfig {
-    mode: String,
-    devices: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct CloudUser {
-    name: String,
-    uid: u32,
-    gecos: String,
-    homedir: String,
-    shell: String,
-    sudo: String,
-    lock_passwd: bool,
-    ssh_authorized_keys: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct WriteFile {
+struct CloudInitWriteFile {
     path: String,
     owner: String,
     permissions: String,
-    content: String,
-}
-
-struct UserDataPart {
-    content_type: &'static str,
     content: String,
 }
 
@@ -1001,82 +878,19 @@ struct MetaData {
     local_hostname: String,
 }
 
-#[derive(Serialize)]
-struct NetworkConfigV2 {
-    version: u8,
-    ethernets: BTreeMap<String, EthernetConfigV2>,
-}
-
-#[derive(Serialize)]
-struct EthernetConfigV2 {
-    #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
-    matches: Option<EthernetMatchConfigV2>,
-    dhcp4: bool,
-    dhcp6: bool,
-}
-
-#[derive(Serialize)]
-struct EthernetMatchConfigV2 {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    driver: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    macaddress: Option<String>,
-}
-
-fn render_user_data(
-    spec: &VmSpec,
-    host_user: &HostUser,
-    ssh_public_key: &str,
-    certificate_authority_pem: &str,
-) -> eyre::Result<String> {
-    let cloud_config = CloudConfig {
-        users: vec![CloudUser {
-            name: host_user.name.clone(),
-            uid: host_user.uid,
-            gecos: host_user.gecos.clone(),
-            homedir: format!("/home/{}", host_user.name),
-            shell: "/bin/bash".to_string(),
-            sudo: "ALL=(ALL) NOPASSWD:ALL".to_string(),
-            lock_passwd: true,
-            ssh_authorized_keys: vec![ssh_public_key.trim().to_string()],
+fn render_cloud_init_user_data() -> eyre::Result<String> {
+    let cloud_config = CloudInitUserData {
+        write_files: vec![CloudInitWriteFile {
+            path: CLOUD_INIT_BOOTSTRAP_SCRIPT_PATH.to_string(),
+            owner: "root:root".to_string(),
+            permissions: "0755".to_string(),
+            content: GUEST_BOOTSTRAP_SCRIPT_CONTENT.to_string(),
         }],
-        growpart: CloudGrowpartConfig {
-            mode: "auto".to_string(),
-            devices: vec!["/".to_string()],
-        },
-        resize_rootfs: true,
-        timezone: resolve_host_timezone(),
-        locale: resolve_host_locale(),
-        mounts: cloud_mount_entries(spec),
-        write_files: vec![
-            WriteFile {
-                path: GUEST_AGENT_BOOTSTRAP_SCRIPT.to_string(),
-                owner: "root:root".to_string(),
-                permissions: "0755".to_string(),
-                content: GUEST_BOOTSTRAP_SCRIPT_CONTENT.to_string(),
-            },
-            certificate_authority_write_file(certificate_authority_pem),
-        ],
-        runcmd: vec![GUEST_CERTIFICATE_AUTHORITY_TRUST_COMMAND.to_string()],
     };
     let mut bento_yaml = String::from("#cloud-config\n");
     bento_yaml.push_str(
         &serde_yaml_ng::to_string(&cloud_config).context("serialize cloud-init user-data")?,
     );
-
-    let mut user_parts = Vec::new();
-    if let Some(bootstrap) = &spec.boot.bootstrap {
-        if let Some(user_data) = bootstrap.userdata.as_deref() {
-            user_parts.push(UserDataPart {
-                content_type: detect_userdata_content_type(user_data),
-                content: user_data.to_string(),
-            });
-        }
-    }
-
-    if !user_parts.is_empty() {
-        return Ok(render_multipart_user_data(&bento_yaml, &user_parts));
-    }
 
     Ok(bento_yaml)
 }
@@ -1093,43 +907,10 @@ fn certificate_authority_pem_for_config(
         .map(|authority| authority.certificate_pem)
 }
 
-fn certificate_authority_write_file(certificate_authority_pem: &str) -> WriteFile {
-    WriteFile {
-        path: GUEST_CERTIFICATE_AUTHORITY_PATH.to_string(),
-        owner: "root:root".to_string(),
-        permissions: "0644".to_string(),
-        content: pem_with_trailing_newline(certificate_authority_pem),
-    }
-}
-
 fn pem_with_trailing_newline(pem: &str) -> String {
     let mut normalized = pem.trim_end().to_string();
     normalized.push('\n');
     normalized
-}
-
-fn render_multipart_user_data(bento_user_data: &str, user_parts: &[UserDataPart]) -> String {
-    let boundary = "===============bento-userdata==";
-    let mut rendered = format!(
-        "MIME-Version: 1.0\nContent-Type: multipart/mixed; boundary=\"{boundary}\"\n\n--{boundary}\nContent-Type: text/cloud-config; charset=\"us-ascii\"\n\n{bento_user_data}\n",
-        boundary = boundary,
-        bento_user_data = bento_user_data.trim_end(),
-    );
-
-    for part in user_parts {
-        rendered.push_str("--");
-        rendered.push_str(boundary);
-        rendered.push_str("\nContent-Type: ");
-        rendered.push_str(part.content_type);
-        rendered.push_str("; charset=\"us-ascii\"\n\n");
-        rendered.push_str(part.content.trim_end());
-        rendered.push('\n');
-    }
-
-    rendered.push_str("--");
-    rendered.push_str(boundary);
-    rendered.push_str("--\n");
-    rendered
 }
 
 fn detect_userdata_content_type(user_data: &str) -> &'static str {
@@ -1140,61 +921,6 @@ fn detect_userdata_content_type(user_data: &str) -> &'static str {
         "text/x-shellscript"
     } else {
         "text/plain"
-    }
-}
-
-fn render_network_config(interface: GuestNetworkInterface) -> eyre::Result<String> {
-    let mut ethernets = BTreeMap::new();
-    let (id, matches) = match interface {
-        GuestNetworkInterface::Driver { driver } => (
-            "en*".to_string(),
-            Some(EthernetMatchConfigV2 {
-                driver: Some(driver),
-                macaddress: None,
-            }),
-        ),
-        GuestNetworkInterface::Mac { mac } => (
-            "bento".to_string(),
-            Some(EthernetMatchConfigV2 {
-                driver: None,
-                macaddress: Some(format_mac(mac)),
-            }),
-        ),
-    };
-    ethernets.insert(
-        id,
-        EthernetConfigV2 {
-            matches,
-            dhcp4: true,
-            dhcp6: false,
-        },
-    );
-
-    let cfg = NetworkConfigV2 {
-        version: 2,
-        ethernets,
-    };
-    serde_yaml_ng::to_string(&cfg).context("serialize cloud-init network-config")
-}
-
-enum GuestNetworkInterface {
-    Driver { driver: &'static str },
-    Mac { mac: [u8; 6] },
-}
-
-fn render_network_config_for_instance(network: &RuntimeNetwork) -> eyre::Result<Option<String>> {
-    match network {
-        RuntimeNetwork::None => Ok(None),
-        RuntimeNetwork::VzNat { .. } => render_network_config(GuestNetworkInterface::Driver {
-            driver: "virtio_net",
-        })
-        .map(Some),
-        RuntimeNetwork::UnixDatagram { mac, .. }
-        | RuntimeNetwork::UnixStream { mac, .. }
-        | RuntimeNetwork::Tap { mac, .. } => render_network_config(GuestNetworkInterface::Mac {
-            mac: parse_mac_string(mac)?,
-        })
-        .map(Some),
     }
 }
 
@@ -1218,38 +944,6 @@ fn render_meta_data(name: &str) -> eyre::Result<String> {
         local_hostname: name.to_string(),
     };
     serde_yaml_ng::to_string(&metadata).context("serialize cloud-init meta-data")
-}
-
-fn cloud_mount_entries(spec: &VmSpec) -> Vec<[String; 6]> {
-    mounts(spec)
-        .iter()
-        .map(|mount| {
-            let path = mount.source.to_string_lossy().to_string();
-            [
-                mount.tag.clone(),
-                path,
-                "virtiofs".to_string(),
-                if mount.writable {
-                    "rw,nofail".to_string()
-                } else {
-                    "ro,nofail".to_string()
-                },
-                "0".to_string(),
-                "0".to_string(),
-            ]
-        })
-        .collect()
-}
-
-fn mounts(spec: &VmSpec) -> Vec<MonitorMount> {
-    spec.mounts
-        .iter()
-        .map(|mount| MonitorMount {
-            source: mount.source.clone(),
-            tag: mount.tag.clone(),
-            writable: !mount.read_only,
-        })
-        .collect()
 }
 
 fn render_agent_config(guest_runtime: &AgentConfig) -> eyre::Result<String> {

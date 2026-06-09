@@ -2,17 +2,17 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use bento_core::agent::ProvisionConfig;
 use eyre::{eyre, Context};
 
 mod ca;
-mod growpart;
 mod hostname;
 mod locale;
 mod mounts;
 mod networkd;
+mod resize;
 mod ssh;
 mod state;
 mod timezone;
@@ -26,25 +26,100 @@ pub fn run_provisioning(config: &ProvisionConfig) -> eyre::Result<()> {
     }
 
     let context = ProvisionContext::default();
-    if state::is_complete(&context, &config.state_path)? {
-        tracing::info!(state_path = %config.state_path, "guest provisioning already complete");
-        return Ok(());
+    match state::is_complete(&context, &config.state_path) {
+        Ok(true) => {
+            tracing::info!(state_path = %config.state_path, "guest provisioning already complete");
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(
+                state_path = %config.state_path,
+                error = %format_error_chain(&err),
+                "could not read guest provisioning state; provisioning will continue"
+            );
+        }
     }
 
     tracing::info!("guest provisioning starting");
-    hostname::apply(&context, config.hostname.as_deref())?;
-    timezone::apply(&context, config.timezone.as_deref())?;
-    locale::apply(&context, config.locale.as_deref())?;
-    user::apply(&context, &config.users)?;
-    ca::apply(&context, config.certificate_authority.as_ref())?;
-    growpart::apply(&config.growpart)?;
-    mounts::apply(&context, &config.mounts)?;
-    networkd::apply(&context, &config.network)?;
-    userdata::apply(&context, config.userdata.as_ref())?;
-    state::mark_complete(&context, &config.state_path)?;
-    tracing::info!("guest provisioning complete");
+
+    let mut run = ProvisionRun::default();
+    run.step("hostname", || {
+        hostname::apply(&context, config.hostname.as_deref())
+    });
+    run.step("timezone", || {
+        timezone::apply(&context, config.timezone.as_deref())
+    });
+    run.step("locale", || {
+        locale::apply(&context, config.locale.as_deref())
+    });
+    run.step("users", || user::apply(&context, &config.users));
+    run.step("certificate_authority", || {
+        ca::apply(&context, config.certificate_authority.as_ref())
+    });
+    run.step("resize_rootfs", || resize::apply(&config.resize_rootfs));
+    run.step("mounts", || mounts::apply(&context, &config.mounts));
+    run.step("networkd", || networkd::apply(&context, &config.network));
+    run.step("userdata", || {
+        userdata::apply(&context, config.userdata.as_ref())
+    });
+
+    if run.is_success() {
+        match state::mark_complete(&context, &config.state_path) {
+            Ok(()) => {
+                tracing::info!(state_path = %config.state_path, "guest provisioning complete")
+            }
+            Err(err) => {
+                tracing::error!(
+                    state_path = %config.state_path,
+                    error = %format_error_chain(&err),
+                    "failed to mark guest provisioning complete; provisioning will retry on next agent start"
+                );
+            }
+        }
+    } else {
+        tracing::warn!(
+            failures = run.failure_count(),
+            provisioners = %run.failed_step_list(),
+            "guest provisioning finished with failures; provisioning will retry on next agent start"
+        );
+    }
 
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ProvisionRun {
+    failed_steps: Vec<&'static str>,
+}
+
+impl ProvisionRun {
+    fn step(&mut self, name: &'static str, apply: impl FnOnce() -> eyre::Result<()>) {
+        tracing::debug!(provisioner = name, "provisioner starting");
+        match apply() {
+            Ok(()) => tracing::debug!(provisioner = name, "provisioner complete"),
+            Err(err) => {
+                self.failed_steps.push(name);
+                tracing::error!(
+                    provisioner = name,
+                    error = %format_error_chain(&err),
+                    "provisioner failed; continuing"
+                );
+            }
+        }
+    }
+
+    fn is_success(&self) -> bool {
+        self.failed_steps.is_empty()
+    }
+
+    fn failure_count(&self) -> usize {
+        self.failed_steps.len()
+    }
+
+    fn failed_step_list(&self) -> String {
+        self.failed_steps.join(", ")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -84,20 +159,20 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let args = args
-        .into_iter()
-        .map(|arg| arg.as_ref().to_os_string())
-        .collect::<Vec<_>>();
+    let args = collect_command_args(args);
     tracing::debug!(program, args = ?args, "running provisioning command");
 
-    let status = Command::new(program)
+    let output = Command::new(program)
         .args(&args)
-        .status()
-        .with_context(|| format!("run provisioning command {program}"))?;
-    if !status.success() {
-        return Err(eyre!(
-            "provisioning command {program} failed with status {status}"
-        ));
+        .output()
+        .with_context(|| {
+            format!(
+                "run provisioning command {}",
+                format_command(program, &args)
+            )
+        })?;
+    if !output.status.success() {
+        return Err(command_failure(program, &args, &output));
     }
 
     Ok(())
@@ -108,22 +183,74 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let args = args
-        .into_iter()
-        .map(|arg| arg.as_ref().to_os_string())
-        .collect::<Vec<_>>();
+    let args = collect_command_args(args);
+    tracing::debug!(program, args = ?args, "running provisioning command");
+
     let output = Command::new(program)
         .args(&args)
         .output()
-        .with_context(|| format!("run provisioning command {program}"))?;
+        .with_context(|| {
+            format!(
+                "run provisioning command {}",
+                format_command(program, &args)
+            )
+        })?;
     if !output.status.success() {
-        return Err(eyre!(
-            "provisioning command {program} failed with status {}",
-            output.status
-        ));
+        return Err(command_failure(program, &args, &output));
     }
 
-    String::from_utf8(output.stdout).context("decode provisioning command output as UTF-8")
+    String::from_utf8(output.stdout).with_context(|| {
+        format!(
+            "decode stdout from provisioning command {} as UTF-8",
+            format_command(program, &args)
+        )
+    })
+}
+
+fn collect_command_args<I, S>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    args.into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect()
+}
+
+fn command_failure(program: &str, args: &[OsString], output: &Output) -> eyre::Report {
+    eyre!(
+        "provisioning command {} failed with {}; stdout: {}; stderr: {}",
+        format_command(program, args),
+        output.status,
+        command_stream_for_log(&output.stdout),
+        command_stream_for_log(&output.stderr)
+    )
+}
+
+fn format_command(program: &str, args: &[OsString]) -> String {
+    let mut command = String::from(program);
+    for arg in args {
+        command.push(' ');
+        command.push_str(&arg.to_string_lossy());
+    }
+    command
+}
+
+fn command_stream_for_log(value: &[u8]) -> String {
+    let value = String::from_utf8_lossy(value).trim().to_string();
+    if value.is_empty() {
+        "<empty>".to_string()
+    } else {
+        value
+    }
+}
+
+pub(crate) fn format_error_chain(error: &eyre::Report) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 pub(crate) fn command_exists(program: &str) -> bool {
@@ -153,4 +280,56 @@ pub(crate) fn sanitize_unit_name(value: &str) -> String {
         sanitized.push_str("default");
     }
     sanitized
+}
+
+#[cfg(test)]
+mod tests {
+    use eyre::{eyre, WrapErr};
+
+    use crate::provision::{command_stream_for_log, format_error_chain, ProvisionRun};
+
+    #[test]
+    fn provision_run_continues_after_failure() {
+        let mut calls = Vec::new();
+        let mut run = ProvisionRun::default();
+
+        run.step("first", || {
+            calls.push("first");
+            Err(eyre!("boom"))
+        });
+        run.step("second", || {
+            calls.push("second");
+            Ok(())
+        });
+
+        assert_eq!(calls, ["first", "second"]);
+        assert!(!run.is_success());
+        assert_eq!(run.failure_count(), 1);
+        assert_eq!(run.failed_step_list(), "first");
+    }
+
+    #[test]
+    fn provision_run_reports_success_only_without_failures() {
+        let mut run = ProvisionRun::default();
+        assert!(run.is_success());
+
+        run.step("broken", || Err(eyre!("nope")));
+
+        assert!(!run.is_success());
+    }
+
+    #[test]
+    fn error_chain_is_readable() {
+        let error = Err::<(), _>(eyre!("inner"))
+            .wrap_err("outer")
+            .expect_err("error should be preserved");
+
+        assert_eq!(format_error_chain(&error), "outer: inner");
+    }
+
+    #[test]
+    fn empty_command_streams_are_explicit() {
+        assert_eq!(command_stream_for_log(b""), "<empty>");
+        assert_eq!(command_stream_for_log(b" hello\n"), "hello");
+    }
 }

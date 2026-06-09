@@ -89,7 +89,7 @@ pub struct ProvisionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locale: Option<String>,
     #[serde(default)]
-    pub growpart: GrowpartConfig,
+    pub resize_rootfs: ResizeRootfsConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub users: Vec<UserConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,7 +110,7 @@ impl Default for ProvisionConfig {
             hostname: None,
             timezone: None,
             locale: None,
-            growpart: GrowpartConfig::default(),
+            resize_rootfs: ResizeRootfsConfig::default(),
             users: Vec::new(),
             certificate_authority: None,
             network: NetworkConfig::default(),
@@ -126,11 +126,9 @@ fn default_provision_state_path() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
-pub struct GrowpartConfig {
+pub struct ResizeRootfsConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub devices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -258,6 +256,7 @@ mod tests {
 
         assert!(!config.provision.enabled);
         assert_eq!(config.provision.state_path, DEFAULT_PROVISION_STATE_PATH);
+        assert!(!config.provision.resize_rootfs.enabled);
         assert!(config.provision.users.is_empty());
         assert!(config.provision.network.interfaces.is_empty());
     }
@@ -268,6 +267,8 @@ mod tests {
 provision:
   enabled: true
   hostname: demo
+  resize_rootfs:
+    enabled: true
   userdata:
     content: |
       #!/bin/sh
@@ -279,6 +280,7 @@ provision:
 
         assert!(config.provision.enabled);
         assert_eq!(config.provision.hostname.as_deref(), Some("demo"));
+        assert!(config.provision.resize_rootfs.enabled);
         assert_eq!(
             config.provision.userdata.expect("userdata").content_type,
             UserdataContentType::ShellScript

@@ -44,7 +44,7 @@ endif
 build-guest-agent:
 	cargo zigbuild -p bento-agent --target $(GUEST_TARGET) --release
 	mkdir -p "$(HOME)/.config/bento"
-	printf "guest:\n  agent_binary: \"%s\"\n" "$(GUEST_BIN)" > "$(BENTO_CONFIG)"
+	printf "guest:\n  binary: \"%s\"\n" "$(GUEST_BIN)" > "$(BENTO_CONFIG)"
 	@echo "Updated $(BENTO_CONFIG) -> $(GUEST_BIN)"
 
 .PHONY: build-guest-init

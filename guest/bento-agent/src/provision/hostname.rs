@@ -18,6 +18,6 @@ pub(crate) fn apply(context: &ProvisionContext, hostname: Option<&str>) -> eyre:
         run_command("hostnamectl", ["set-hostname", hostname])?;
     }
 
-    tracing::info!(hostname, "provisioned hostname");
+    tracing::info!(hostname, path = %hostname_path.display(), "provisioned hostname");
     Ok(())
 }

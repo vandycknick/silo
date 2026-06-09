@@ -19,7 +19,11 @@ pub(crate) fn apply(
         run_command("/bin/sh", ["-c", command.as_str()])?;
     }
 
-    tracing::info!(path = %config.path, "provisioned certificate authority");
+    tracing::info!(
+        path = %config.path,
+        update_trust = config.update_trust,
+        "provisioned certificate authority"
+    );
     Ok(())
 }
 

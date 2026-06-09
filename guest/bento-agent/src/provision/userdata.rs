@@ -24,6 +24,6 @@ pub(crate) fn apply(
     write_file(&path, &userdata.content, 0o700)?;
     let script = path.to_string_lossy().to_string();
     run_command("/bin/sh", [script.as_str()])?;
-    tracing::info!("provisioned userdata script");
+    tracing::info!(path = %path.display(), "provisioned userdata script");
     Ok(())
 }
