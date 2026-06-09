@@ -5,7 +5,9 @@ use bento_core::Mount;
 use bento_libvm::{CreateMachineRequest, LibVm, MachineRef, RequestedNetwork};
 use clap::Args;
 
-use crate::commands::create::{profile_mount_to_mount, read_userdata_path, VmOverrideArgs};
+use crate::commands::create::{
+    profile_mount_to_mount, read_userdata_path, resolve_boot_assets, VmOverrideArgs,
+};
 use crate::commands::rootfs_image::{get_base_rootfs_image, record_base_rootfs_metadata};
 use crate::constants::{DEFAULT_PROFILE_NAME, PROFILE_METADATA_KEY};
 use crate::profile::ProfileStore;
@@ -55,6 +57,11 @@ impl Cmd {
         if !resolved.ssh_enabled {
             eyre::bail!("profile ssh.enabled is false; bento run needs SSH to open a shell or execute a command");
         }
+        let boot_assets = resolve_boot_assets(
+            libvm.layout().data_dir(),
+            resolved.kernel.take(),
+            resolved.initramfs.take(),
+        );
         let base_rootfs = get_base_rootfs_image(libvm, &resolved.image_ref).await?;
         record_base_rootfs_metadata(&mut resolved.metadata, &base_rootfs);
         let request = CreateMachineRequest {
@@ -65,8 +72,8 @@ impl Cmd {
             metadata: resolved.metadata,
             cpus: resolved.cpus,
             memory_mib: resolved.memory_mib,
-            kernel: resolved.kernel,
-            initramfs: resolved.initramfs,
+            kernel: Some(boot_assets.kernel),
+            initramfs: Some(boot_assets.initramfs),
             disk_size_bytes: resolved.disk_size_bytes,
             nested_virtualization: resolved.nested_virtualization,
             agent: resolved.ssh_enabled,

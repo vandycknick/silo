@@ -168,32 +168,25 @@ struct BootAssets {
 }
 
 fn vm_spec_boot_assets(inputs: &VmSpecInputs<'_>) -> Result<BootAssets, MachineSpecError> {
-    let default_root = || -> Result<PathBuf, std::io::Error> {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute());
-        let data_home = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| home.map(|h| h.join(".local/share")));
-
-        data_home
-            .map(|d| d.join("bento/kernels/default"))
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "default kernel bundle root unavailable",
-                )
-            })
-    };
-
     let kernel = match inputs.spec.boot.kernel.as_ref() {
         Some(path) => resolve_spec_path(inputs.data_dir, path),
-        None => default_root()?.join("kernel"),
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "VM spec is missing boot.kernel",
+            )
+            .into())
+        }
     };
     let initramfs = match inputs.spec.boot.initramfs.as_ref() {
         Some(path) => resolve_spec_path(inputs.data_dir, path),
-        None => default_root()?.join("initramfs"),
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "VM spec is missing boot.initramfs",
+            )
+            .into())
+        }
     };
 
     if !kernel.is_file() {
@@ -283,6 +276,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const CIDATA_DISK: &str = "cidata.img";
+
+    fn boot_assets(dir: &std::path::Path) -> Boot {
+        let kernel = dir.join("kernel");
+        let initramfs = dir.join("initramfs");
+        fs::write(&kernel, b"kernel").expect("write kernel");
+        fs::write(&initramfs, b"initramfs").expect("write initramfs");
+
+        Boot {
+            kernel: Some(PathBuf::from("kernel")),
+            initramfs: Some(PathBuf::from("initramfs")),
+            kernel_cmdline: Vec::new(),
+            bootstrap: None,
+        }
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let now = SystemTime::now()
@@ -417,12 +424,7 @@ mod tests {
                 cpus: 2,
                 memory_mib: 1024,
             },
-            boot: Boot {
-                kernel: None,
-                initramfs: None,
-                kernel_cmdline: Vec::new(),
-                bootstrap: None,
-            },
+            boot: boot_assets(&dir),
             storage: Storage { disks: Vec::new() },
             mounts: Vec::new(),
             vsock_endpoints: Vec::new(),
@@ -462,12 +464,7 @@ mod tests {
                 cpus: 2,
                 memory_mib: 1024,
             },
-            boot: Boot {
-                kernel: None,
-                initramfs: None,
-                kernel_cmdline: Vec::new(),
-                bootstrap: None,
-            },
+            boot: boot_assets(&dir),
             storage: Storage {
                 disks: vec![Disk {
                     path: PathBuf::from(CIDATA_DISK),

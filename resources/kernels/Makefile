@@ -25,7 +25,6 @@ KERNEL_EXPORT_DIR ?= $(KERNEL_TARGET_ROOT)/$(TRACK)-$(ARCH)-$(KERNEL_VERSION)
 KERNEL_TARBALL ?= $(CACHE_ROOT)/downloads/linux-$(KERNEL_VERSION).tar.xz
 BASE_CONFIG ?= $(RESOURCE_ROOT)/kernels/configs/$(ARCH)-base.config
 OVERLAY_CONFIG ?= $(RESOURCE_ROOT)/kernels/configs/overlays/$(TRACK).config
-INITRAMFS_OUT_DIR ?= $(TARGET_ROOT)/initramfs
 JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 2)
 
 
@@ -53,14 +52,6 @@ kernel: guard-kernel
 	@cp "$(KERNEL_OUT_DIR)/System.map" "$(KERNEL_EXPORT_DIR)/System.map"
 	@cp "$(KERNEL_OUT_DIR)/Image" "$(KERNEL_EXPORT_DIR)/Image"
 	@printf "track=%s\narch=%s\nversion=%s\n" "$(TRACK)" "$(ARCH)" "$(KERNEL_VERSION)" > "$(KERNEL_EXPORT_DIR)/build-info.txt"
-
-.PHONY: initramfs
-initramfs:
-	@mkdir -p /initramfs/bin /initramfs/sbin /initramfs/etc /initramfs/proc /initramfs/sys /initramfs/usr/bin /initramfs/usr/sbin "$(INITRAMFS_OUT_DIR)"
-	@cp /bins/busybox /initramfs/bin/busybox
-	@cp /resources/initramfs/init.sh /initramfs/init
-	@chmod +x /initramfs/init
-	@cd /initramfs && find . -print0 | cpio --null --create --verbose --format=newc | gzip -9 > "$(INITRAMFS_OUT_DIR)/initramfs"
 
 .PHONY: guard-kernel
 guard-kernel:

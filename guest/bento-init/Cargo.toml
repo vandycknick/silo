@@ -1,0 +1,16 @@
+[package]
+name = "bento-init"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "init"
+path = "src/main.rs"
+
+[features]
+default = ["alloc", "sh"]
+alloc = []
+sh = ["alloc"]
+
+[dependencies]
+libc = { version = "0.2.186", default-features = false }

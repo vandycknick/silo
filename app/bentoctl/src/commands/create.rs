@@ -5,7 +5,7 @@ use clap::Args;
 use eyre::Context;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::commands::profile::{parse_label, parse_profile_mount, parse_requested_network};
 use crate::commands::rootfs_image::{get_base_rootfs_image, record_base_rootfs_metadata};
@@ -105,6 +105,11 @@ impl Display for Cmd {
 impl Cmd {
     pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
         let mut resolved = self.resolve()?;
+        let boot_assets = resolve_boot_assets(
+            libvm.layout().data_dir(),
+            resolved.kernel.take(),
+            resolved.initramfs.take(),
+        );
         let base_rootfs = get_base_rootfs_image(libvm, &resolved.image_ref).await?;
         record_base_rootfs_metadata(&mut resolved.metadata, &base_rootfs);
         let request = CreateMachineRequest {
@@ -115,8 +120,8 @@ impl Cmd {
             metadata: resolved.metadata,
             cpus: resolved.cpus,
             memory_mib: resolved.memory_mib,
-            kernel: resolved.kernel,
-            initramfs: resolved.initramfs,
+            kernel: Some(boot_assets.kernel),
+            initramfs: Some(boot_assets.initramfs),
             disk_size_bytes: resolved.disk_size_bytes,
             nested_virtualization: resolved.nested_virtualization,
             agent: resolved.ssh_enabled,
@@ -221,6 +226,23 @@ impl Cmd {
     }
 }
 
+pub(crate) struct BootAssets {
+    pub(crate) kernel: PathBuf,
+    pub(crate) initramfs: PathBuf,
+}
+
+pub(crate) fn resolve_boot_assets(
+    data_dir: &Path,
+    kernel: Option<PathBuf>,
+    initramfs: Option<PathBuf>,
+) -> BootAssets {
+    let assets_dir = data_dir.join("assets");
+    BootAssets {
+        kernel: kernel.unwrap_or_else(|| assets_dir.join("default")),
+        initramfs: initramfs.unwrap_or_else(|| assets_dir.join("initramfs")),
+    }
+}
+
 struct ResolvedCreate {
     image_ref: String,
     labels: BTreeMap<String, String>,
@@ -254,8 +276,36 @@ pub(crate) fn read_userdata_path(path: &std::path::Path) -> eyre::Result<String>
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use std::path::{Path, PathBuf};
 
+    use crate::commands::create::resolve_boot_assets;
     use crate::commands::{BentoCtlCmd, Command};
+
+    #[test]
+    fn default_boot_assets_use_flat_data_assets_dir() {
+        let assets = resolve_boot_assets(Path::new("/data/bento"), None, None);
+
+        assert_eq!(assets.kernel, PathBuf::from("/data/bento/assets/default"));
+        assert_eq!(
+            assets.initramfs,
+            PathBuf::from("/data/bento/assets/initramfs")
+        );
+    }
+
+    #[test]
+    fn explicit_boot_assets_override_defaults_independently() {
+        let assets = resolve_boot_assets(
+            Path::new("/data/bento"),
+            Some(PathBuf::from("./kernel")),
+            None,
+        );
+
+        assert_eq!(assets.kernel, PathBuf::from("./kernel"));
+        assert_eq!(
+            assets.initramfs,
+            PathBuf::from("/data/bento/assets/initramfs")
+        );
+    }
 
     #[test]
     fn create_command_parses_profile_form() {

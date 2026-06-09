@@ -1,5 +1,7 @@
 GUEST_TARGET := aarch64-unknown-linux-musl
 GUEST_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/bento-agent
+GUEST_INIT_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/init
+INITRAMFS_OUT := $(CURDIR)/target/resources/initramfs
 BENTO_CONFIG := $(HOME)/.config/bento/config.yaml
 ARCH ?= arm64
 PROFILE ?= debug
@@ -9,13 +11,13 @@ KRUN_DEPS_DIR ?= $(CURDIR)/target/libs/krun/$(RUST_HOST_TRIPLE)
 export KRUN_DEPS_DIR
 
 ifeq ($(HOST_OS),Darwin)
-HOST_WORKSPACE_EXCLUDES := --exclude bento-agent
+HOST_WORKSPACE_EXCLUDES := --exclude bento-agent --exclude bento-init
 HOST_BUILD_COMPONENTS := vmmon netd
 else ifeq ($(HOST_OS),Linux)
-HOST_WORKSPACE_EXCLUDES := --exclude bento-vz
+HOST_WORKSPACE_EXCLUDES := --exclude bento-init --exclude bento-vz
 HOST_BUILD_COMPONENTS := vmmon netd krun
 else
-HOST_WORKSPACE_EXCLUDES := --exclude bento-agent --exclude bento-vz
+HOST_WORKSPACE_EXCLUDES := --exclude bento-agent --exclude bento-init --exclude bento-vz
 HOST_BUILD_COMPONENTS := vmmon netd
 endif
 
@@ -44,6 +46,10 @@ build-guest-agent:
 	mkdir -p "$(HOME)/.config/bento"
 	printf "guest:\n  agent_binary: \"%s\"\n" "$(GUEST_BIN)" > "$(BENTO_CONFIG)"
 	@echo "Updated $(BENTO_CONFIG) -> $(GUEST_BIN)"
+
+.PHONY: build-guest-init
+build-guest-init:
+	RUSTFLAGS="-C panic=abort" cargo zigbuild -p bento-init --target $(GUEST_TARGET) --release
 
 .PHONY: build
 build: $(HOST_BUILD_COMPONENTS)
@@ -81,28 +87,13 @@ kernel:
 	@$(MAKE) -C resources/kernels kernel TRACK=$(TRACK) ARCH=$(ARCH)
 
 .PHONY: initramfs
-initramfs: .tmp/resources-builder .tmp/busybox
+initramfs: build-guest-init
 	@mkdir -p ./target/resources
-	@docker run \
-		-v $(shell pwd)/resources:/resources \
-		-v $(shell pwd)/target:/target \
-		-v $(shell pwd)/.tmp:/bins \
-		resources-builder \
-		-C /resources/kernels initramfs TARGET_ROOT=/target/resources RESOURCE_ROOT=/resources
+	@if [ -d "$(INITRAMFS_OUT)" ]; then rm -rf "$(INITRAMFS_OUT)"; fi
+	cargo run -p bento-initramfs -- --init "$(GUEST_INIT_BIN)" --out "$(INITRAMFS_OUT)"
 
 .PHONY: rootfs
 rootfs:
 	@mkdir -p ./target/resources/rootfs
 	@docker build -f resources/rootfs/Dockerfile -t rootfs .
 	@docker run -it -v $(shell pwd)/target/resources/rootfs:/resources --privileged --cap-add=CAP_MKNOD rootfs
-
-.tmp/resources-builder: resources/Containerfile
-	@docker build -f resources/Containerfile -t resources-builder .
-	@touch .tmp/resources-builder
-
-.tmp/busybox: resources/busybox/Containerfile
-	@cd resources/busybox && \
-		docker build -f Containerfile -t busybox-builder .
-	@docker run -v $(shell pwd)/.tmp:/output \
-			busybox-builder \
-			cp /build/busybox /output

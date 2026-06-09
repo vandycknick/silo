@@ -345,6 +345,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bento-init"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "bento-initramfs"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "cpio",
+ "flate2",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bento-krun"
 version = "0.1.0"
 dependencies = [
@@ -885,6 +903,12 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "cpio"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "938e716cb1ade5d6c8f959c13a7248b889c07491fc7e41167c3afe20f8f0de1e"
 
 [[package]]
 name = "cpubits"
