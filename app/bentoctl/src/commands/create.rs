@@ -121,7 +121,7 @@ impl Cmd {
             cpus: resolved.cpus,
             memory_mib: resolved.memory_mib,
             kernel: Some(boot_assets.kernel),
-            initramfs: Some(boot_assets.initramfs),
+            initramfs: boot_assets.initramfs,
             disk_size_bytes: resolved.disk_size_bytes,
             nested_virtualization: resolved.nested_virtualization,
             agent: resolved.ssh_enabled,
@@ -228,7 +228,7 @@ impl Cmd {
 
 pub(crate) struct BootAssets {
     pub(crate) kernel: PathBuf,
-    pub(crate) initramfs: PathBuf,
+    pub(crate) initramfs: Option<PathBuf>,
 }
 
 pub(crate) fn resolve_boot_assets(
@@ -239,7 +239,7 @@ pub(crate) fn resolve_boot_assets(
     let assets_dir = data_dir.join("assets");
     BootAssets {
         kernel: kernel.unwrap_or_else(|| assets_dir.join("default")),
-        initramfs: initramfs.unwrap_or_else(|| assets_dir.join("initramfs")),
+        initramfs,
     }
 }
 
@@ -286,10 +286,7 @@ mod tests {
         let assets = resolve_boot_assets(Path::new("/data/bento"), None, None);
 
         assert_eq!(assets.kernel, PathBuf::from("/data/bento/assets/default"));
-        assert_eq!(
-            assets.initramfs,
-            PathBuf::from("/data/bento/assets/initramfs")
-        );
+        assert_eq!(assets.initramfs, None);
     }
 
     #[test]
@@ -301,10 +298,19 @@ mod tests {
         );
 
         assert_eq!(assets.kernel, PathBuf::from("./kernel"));
-        assert_eq!(
-            assets.initramfs,
-            PathBuf::from("/data/bento/assets/initramfs")
+        assert_eq!(assets.initramfs, None);
+    }
+
+    #[test]
+    fn explicit_initramfs_is_forwarded_to_libvm() {
+        let assets = resolve_boot_assets(
+            Path::new("/data/bento"),
+            None,
+            Some(PathBuf::from("./initrd.img")),
         );
+
+        assert_eq!(assets.kernel, PathBuf::from("/data/bento/assets/default"));
+        assert_eq!(assets.initramfs, Some(PathBuf::from("./initrd.img")));
     }
 
     #[test]

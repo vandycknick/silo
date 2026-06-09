@@ -70,6 +70,13 @@ pub enum LibVmError {
         source: serde_yaml_ng::Error,
     },
 
+    #[error("failed to generate initramfs for machine {name:?}")]
+    InitramfsGeneration {
+        name: String,
+        #[source]
+        source: bento_initramfs::InitramfsError,
+    },
+
     #[error("ambiguous machine id prefix {prefix:?} matched {count} machines")]
     AmbiguousIdPrefix { prefix: String, count: usize },
 

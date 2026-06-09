@@ -9,6 +9,8 @@ mod host;
 #[cfg(target_os = "linux")]
 mod port;
 #[cfg(target_os = "linux")]
+mod provision;
+#[cfg(target_os = "linux")]
 mod rpc;
 #[cfg(target_os = "linux")]
 mod server;
@@ -32,6 +34,8 @@ use crate::forward::ForwardService;
 #[cfg(target_os = "linux")]
 use crate::port::from_kernel_cmdline;
 #[cfg(target_os = "linux")]
+use crate::provision::run_provisioning;
+#[cfg(target_os = "linux")]
 use crate::rpc::{serve_agent_connection, AgentContext};
 #[cfg(target_os = "linux")]
 use crate::server::VsockServer;
@@ -48,7 +52,7 @@ async fn main() -> eyre::Result<()> {
         .with_env_filter(filter)
         .with_target(false)
         .with_level(true)
-        .with_writer(std::io::stderr)
+        .with_writer(std::io::stdout)
         .try_init();
 
     // TODO: support direct PID 1 initialization in the future. For now the
@@ -60,6 +64,8 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("agent starting");
 
     let agent_config = load_agent_config()?;
+    run_provisioning(&agent_config.provision)?;
+
     let control_port = from_kernel_cmdline();
     let mut running_servers = Vec::new();
     let dns_server = if agent_config.dns.enabled {

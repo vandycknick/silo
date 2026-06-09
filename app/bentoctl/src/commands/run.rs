@@ -73,7 +73,7 @@ impl Cmd {
             cpus: resolved.cpus,
             memory_mib: resolved.memory_mib,
             kernel: Some(boot_assets.kernel),
-            initramfs: Some(boot_assets.initramfs),
+            initramfs: boot_assets.initramfs,
             disk_size_bytes: resolved.disk_size_bytes,
             nested_virtualization: resolved.nested_virtualization,
             agent: resolved.ssh_enabled,
@@ -229,7 +229,9 @@ async fn cleanup_ephemeral(libvm: &LibVm, name: &str) -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use std::path::{Path, PathBuf};
 
+    use crate::commands::create::resolve_boot_assets;
     use crate::commands::{BentoCtlCmd, Command};
 
     #[test]
@@ -305,6 +307,60 @@ mod tests {
 
         assert_eq!(run.profile.as_deref(), Some("dev"));
         assert_eq!(run.image.as_deref(), Some("tar:./target/rootfs.tar"));
+    }
+
+    #[test]
+    fn run_command_leaves_default_initramfs_for_libvm_generation() {
+        let cmd = BentoCtlCmd::try_parse_from([
+            "bento",
+            "run",
+            "dev",
+            "--image",
+            "disk:./target/rootfs.img",
+            "--",
+            "true",
+        ])
+        .expect("run command should parse");
+        let run = match cmd.cmd {
+            Command::Run(cmd) => cmd,
+            other => panic!("expected run command, got {other:?}"),
+        };
+
+        let assets = resolve_boot_assets(
+            Path::new("/data/bento"),
+            run.overrides.kernel.clone(),
+            run.overrides.initramfs.clone(),
+        );
+
+        assert_eq!(assets.kernel, PathBuf::from("/data/bento/assets/default"));
+        assert_eq!(assets.initramfs, None);
+    }
+
+    #[test]
+    fn run_command_forwards_explicit_initramfs_to_libvm() {
+        let cmd = BentoCtlCmd::try_parse_from([
+            "bento",
+            "run",
+            "dev",
+            "--initrd",
+            "./initrd.img",
+            "--",
+            "true",
+        ])
+        .expect("run command should parse");
+        let run = match cmd.cmd {
+            Command::Run(cmd) => cmd,
+            other => panic!("expected run command, got {other:?}"),
+        };
+
+        let assets = resolve_boot_assets(
+            Path::new("/data/bento"),
+            run.overrides.kernel.clone(),
+            run.overrides.initramfs.clone(),
+        );
+
+        assert_eq!(assets.kernel, PathBuf::from("/data/bento/assets/default"));
+        assert_eq!(assets.initramfs, Some(PathBuf::from("./initrd.img")));
     }
 
     #[test]

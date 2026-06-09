@@ -389,6 +389,7 @@ name = "bento-libvm"
 version = "0.1.0"
 dependencies = [
  "bento-core",
+ "bento-initramfs",
  "bento-protocol",
  "bento-utils",
  "eyre",

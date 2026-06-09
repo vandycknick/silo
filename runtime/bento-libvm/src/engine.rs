@@ -30,6 +30,7 @@ use crate::network::{prepare_network_runtime, reconcile_network_runtime, Runtime
 use crate::store::{Database, Sqlite};
 use crate::vm_lock::VmLock;
 use crate::{Layout, LibVmError};
+use bento_initramfs::{write_initramfs, InitramfsOptions};
 
 const DEFAULT_IMAGE_CPUS: u8 = 1;
 const DEFAULT_IMAGE_MEMORY_MIB: u32 = 512;
@@ -229,7 +230,7 @@ impl LibVm {
         let network = request.network.unwrap_or_default();
         self.validate_requested_network(&network).await?;
 
-        let pending = self
+        let mut pending = self
             .create_pending(
                 request.name.clone(),
                 spec,
@@ -239,6 +240,16 @@ impl LibVm {
                 network,
             )
             .await?;
+        let prepared_initramfs = prepare_create_initramfs(
+            &self.layout,
+            &request.name,
+            pending.dir(),
+            pending.spec.boot.initramfs.clone(),
+        )?;
+        if pending.spec.boot.initramfs != prepared_initramfs {
+            pending.spec.boot.initramfs = prepared_initramfs;
+            pending.write_config()?;
+        }
         let rootfs_path = pending.dir().join(InstanceFile::RootDisk.as_str());
         clone_or_copy_root_disk(&base_rootfs_path, &rootfs_path)?;
 
@@ -271,13 +282,7 @@ impl LibVm {
         }
 
         let staged_dir = create_staging_dir(&self.layout)?;
-        let config = serde_yaml_ng::to_string(&spec).map_err(|source| {
-            LibVmError::VmSpecSerializeFailed {
-                name: name.clone(),
-                source,
-            }
-        })?;
-        fs::write(staged_dir.join(CONFIG_FILE_NAME), config)?;
+        write_machine_config(&staged_dir, &name, &spec)?;
 
         Ok(PendingMachine {
             id,
@@ -823,6 +828,48 @@ impl LibVm {
     }
 }
 
+fn write_machine_config(instance_dir: &Path, name: &str, spec: &VmSpec) -> Result<(), LibVmError> {
+    let config =
+        serde_yaml_ng::to_string(spec).map_err(|source| LibVmError::VmSpecSerializeFailed {
+            name: name.to_string(),
+            source,
+        })?;
+    fs::write(instance_dir.join(CONFIG_FILE_NAME), config)?;
+    Ok(())
+}
+
+fn prepare_create_initramfs(
+    layout: &Layout,
+    name: &str,
+    instance_dir: &Path,
+    initramfs: Option<PathBuf>,
+) -> Result<Option<PathBuf>, LibVmError> {
+    if initramfs.is_some() {
+        return Ok(initramfs);
+    }
+
+    let assets_dir = layout.data_dir().join("assets");
+    let init_binary = assets_dir.join("init");
+    if init_binary.is_file() {
+        let output = instance_dir.join(InstanceFile::Initramfs.as_str());
+        write_initramfs(&InitramfsOptions::new(&init_binary, &output)).map_err(|source| {
+            LibVmError::InitramfsGeneration {
+                name: name.to_string(),
+                source,
+            }
+        })?;
+        return Ok(Some(PathBuf::from(InstanceFile::Initramfs.as_str())));
+    }
+
+    Err(LibVmError::InvalidCreateRequest {
+        name: name.to_string(),
+        reason: format!(
+            "missing boot asset: expected init binary at {}; copy the guest init binary there or pass --initramfs PATH explicitly",
+            init_binary.display()
+        ),
+    })
+}
+
 fn assign_mount_tags(mounts: Vec<Mount>) -> Vec<Mount> {
     mounts
         .into_iter()
@@ -1107,6 +1154,10 @@ impl PendingMachine {
         &self.staged_dir
     }
 
+    fn write_config(&self) -> Result<(), LibVmError> {
+        write_machine_config(&self.staged_dir, &self.name, &self.spec)
+    }
+
     async fn commit(mut self, libvm: &LibVm) -> Result<MachineRecord, LibVmError> {
         if self.final_dir.exists() {
             return Err(LibVmError::MachineIdAlreadyExists { id: self.id });
@@ -1256,38 +1307,58 @@ mod tests {
             .await
     }
 
-    #[tokio::test]
-    async fn create_from_base_image_clones_rootfs() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let data_dir = temp.path().join("bento");
+    fn create_request(base_rootfs_path: PathBuf, name: &str) -> CreateMachineRequest {
+        CreateMachineRequest {
+            image_ref: "ghcr.io/vandycknick/archlinuxarm:latest".to_string(),
+            base_rootfs_path,
+            name: name.to_string(),
+            labels: std::collections::BTreeMap::new(),
+            metadata: std::collections::BTreeMap::new(),
+            cpus: None,
+            memory_mib: None,
+            kernel: None,
+            initramfs: None,
+            disk_size_bytes: None,
+            nested_virtualization: false,
+            agent: false,
+            rosetta: false,
+            userdata: None,
+            disks: Vec::new(),
+            mounts: Vec::new(),
+            network: None,
+        }
+    }
+
+    fn write_base_rootfs(data_dir: &std::path::Path) -> PathBuf {
         let image_dir = data_dir.join("images/sha256-test/linux-arm64");
         std::fs::create_dir_all(&image_dir).expect("image dir should be created");
         let base_rootfs_path = image_dir.join("rootfs.img");
         std::fs::write(&base_rootfs_path, b"disk").expect("rootfs should be written");
+        base_rootfs_path
+    }
+
+    fn write_default_init(data_dir: &std::path::Path) -> PathBuf {
+        let assets_dir = data_dir.join("assets");
+        std::fs::create_dir_all(&assets_dir).expect("assets dir should be created");
+        let init = assets_dir.join("init");
+        std::fs::write(&init, b"init binary").expect("init binary should be written");
+        init
+    }
+
+    #[tokio::test]
+    async fn create_from_base_image_clones_rootfs() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_dir = temp.path().join("bento");
+        let base_rootfs_path = write_base_rootfs(&data_dir);
+        write_default_init(&data_dir);
 
         let libvm = LibVm::new(Layout::new(data_dir))
             .await
             .expect("create libvm");
+        let mut request = create_request(base_rootfs_path, "devbox");
+        request.userdata = Some("#!/bin/sh\necho profile\n".to_string());
         let machine = libvm
-            .create_from_base_image(CreateMachineRequest {
-                image_ref: "ghcr.io/vandycknick/archlinuxarm:latest".to_string(),
-                base_rootfs_path,
-                name: "devbox".to_string(),
-                labels: std::collections::BTreeMap::new(),
-                metadata: std::collections::BTreeMap::new(),
-                cpus: None,
-                memory_mib: None,
-                kernel: None,
-                initramfs: None,
-                disk_size_bytes: None,
-                nested_virtualization: false,
-                agent: false,
-                rosetta: false,
-                userdata: Some("#!/bin/sh\necho profile\n".to_string()),
-                disks: Vec::new(),
-                mounts: Vec::new(),
-                network: None,
-            })
+            .create_from_base_image(request)
             .await
             .expect("create from image");
 
@@ -1307,6 +1378,77 @@ mod tests {
             bootstrap.userdata.as_deref(),
             Some("#!/bin/sh\necho profile\n")
         );
+    }
+
+    #[tokio::test]
+    async fn create_from_base_image_generates_instance_initramfs_from_default_init() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_dir = temp.path().join("bento");
+        let base_rootfs_path = write_base_rootfs(&data_dir);
+        write_default_init(&data_dir);
+
+        let libvm = LibVm::new(Layout::new(data_dir))
+            .await
+            .expect("create libvm");
+        let machine = libvm
+            .create_from_base_image(create_request(base_rootfs_path, "devbox"))
+            .await
+            .expect("create from image");
+
+        assert_eq!(
+            machine.spec.boot.initramfs,
+            Some(PathBuf::from(InstanceFile::Initramfs.as_str()))
+        );
+        assert!(machine.dir.join(InstanceFile::Initramfs.as_str()).is_file());
+    }
+
+    #[tokio::test]
+    async fn create_from_base_image_respects_explicit_initramfs() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_dir = temp.path().join("bento");
+        let base_rootfs_path = write_base_rootfs(&data_dir);
+        let explicit = temp.path().join("custom-initramfs");
+        std::fs::write(&explicit, b"custom initramfs").expect("write explicit initramfs");
+
+        let libvm = LibVm::new(Layout::new(data_dir))
+            .await
+            .expect("create libvm");
+        let mut request = create_request(base_rootfs_path, "devbox");
+        request.initramfs = Some(explicit.clone());
+        let machine = libvm
+            .create_from_base_image(request)
+            .await
+            .expect("create from image");
+
+        assert_eq!(
+            machine.spec.boot.initramfs,
+            Some(std::fs::canonicalize(explicit).expect("canonicalize explicit"))
+        );
+        assert!(!machine.dir.join(InstanceFile::Initramfs.as_str()).exists());
+    }
+
+    #[tokio::test]
+    async fn create_from_base_image_requires_init_or_initramfs_asset() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_dir = temp.path().join("bento");
+        let base_rootfs_path = write_base_rootfs(&data_dir);
+
+        let libvm = LibVm::new(Layout::new(data_dir))
+            .await
+            .expect("create libvm");
+        let err = libvm
+            .create_from_base_image(create_request(base_rootfs_path, "devbox"))
+            .await
+            .expect_err("missing init assets should fail");
+
+        assert!(matches!(
+            err,
+            LibVmError::InvalidCreateRequest { ref name, ref reason }
+                if name == "devbox"
+                    && reason.contains("expected init binary")
+                    && reason.contains("assets/init")
+                    && reason.contains("--initramfs PATH")
+        ));
     }
 
     #[test]

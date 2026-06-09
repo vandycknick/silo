@@ -150,7 +150,7 @@ impl DnsServer {
 
     async fn handle_query(&self, data: &[u8], transport: Transport) -> eyre::Result<Vec<u8>> {
         let request = Message::from_vec(data)?;
-        let Some(query) = request.queries().first() else {
+        let Some(query) = request.queries.first() else {
             return Ok(build_response(&request, ResponseCode::FormErr, Vec::new()));
         };
 
@@ -248,10 +248,7 @@ fn should_include_record(value: &AgentDnsRecordValue, qtype: RecordType) -> bool
         || matches!(value, AgentDnsRecordValue::Cname(_)) && qtype != RecordType::CNAME
 }
 
-fn cname_target_for_query<'a>(
-    value: &'a AgentDnsRecordValue,
-    qtype: RecordType,
-) -> Option<&'a str> {
+fn cname_target_for_query(value: &AgentDnsRecordValue, qtype: RecordType) -> Option<&str> {
     if qtype == RecordType::CNAME {
         return None;
     }
@@ -263,20 +260,16 @@ fn cname_target_for_query<'a>(
 }
 
 fn build_response(request: &Message, code: ResponseCode, answers: Vec<Record>) -> Vec<u8> {
-    let mut response = Message::new();
-    response.set_id(request.id());
-    response.set_message_type(MessageType::Response);
-    response.set_op_code(OpCode::Query);
-    response.set_authoritative(code == ResponseCode::NXDomain || !answers.is_empty());
-    response.set_response_code(code);
-    response.add_queries(request.queries().to_vec());
+    let mut response = Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+    response.metadata.authoritative = code == ResponseCode::NXDomain || !answers.is_empty();
+    response.metadata.response_code = code;
+    response.add_queries(request.queries.clone());
     response.add_answers(answers);
     response.to_vec().unwrap_or_default()
 }
 
 fn record_from_value(name: &str, value: &AgentDnsRecordValue) -> eyre::Result<Record> {
     let record_name = Name::from_ascii(format!("{}.", normalize_name(name)))?;
-    let mut record = Record::with(record_name, record_type(value), 5);
     let rdata = match value {
         AgentDnsRecordValue::A(ip) => RData::A((*ip).into()),
         AgentDnsRecordValue::Aaaa(ip) => RData::AAAA((*ip).into()),
@@ -285,8 +278,7 @@ fn record_from_value(name: &str, value: &AgentDnsRecordValue) -> eyre::Result<Re
             RData::CNAME(hickory_proto::rr::rdata::CNAME(target))
         }
     };
-    record.set_data(Some(rdata));
-    Ok(record)
+    Ok(Record::from_rdata(record_name, 5, rdata))
 }
 
 fn record_type(value: &AgentDnsRecordValue) -> RecordType {
@@ -516,7 +508,7 @@ mod tests {
             .expect("local response");
         let response = Message::from_vec(&response).expect("response parse");
 
-        assert_eq!(response.answers().len(), 2);
+        assert_eq!(response.answers.len(), 2);
     }
 
     #[tokio::test]
@@ -584,8 +576,7 @@ mod tests {
     }
 
     fn build_query(name: &str, record_type: RecordType) -> Vec<u8> {
-        let mut message = Message::new();
-        message.set_id(7);
+        let mut message = Message::new(7, MessageType::Query, OpCode::Query);
         message.add_query(hickory_proto::op::Query::query(
             Name::from_ascii(format!("{}.", normalize_name(name))).expect("valid name"),
             record_type,

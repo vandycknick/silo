@@ -5,6 +5,7 @@ pub fn from_kernel_cmdline() -> u32 {
     parse_agent_port_args(cmdline.split_whitespace())
 }
 
+#[cfg(test)]
 fn parse_control_port(cmdline: &str) -> u32 {
     parse_agent_port_args(cmdline.split_whitespace())
 }

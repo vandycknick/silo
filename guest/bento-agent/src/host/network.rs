@@ -3,10 +3,10 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use futures_util::stream::TryStreamExt;
 use netlink_packet_route::{
-    neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourFlag},
+    neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourFlags},
     route::{RouteAddress, RouteAttribute},
 };
-use rtnetlink::{new_connection, IpVersion};
+use rtnetlink::{new_connection, IpVersion, RouteMessageBuilder};
 
 /// Usable default gateway addresses discovered from the guest's routing state.
 ///
@@ -60,7 +60,10 @@ async fn get_default_gateway_v4() -> eyre::Result<Ipv4Addr> {
     let (connection, handle, _) = new_connection()?;
     tokio::spawn(connection);
 
-    let mut routes = handle.route().get(IpVersion::V4).execute();
+    let mut routes = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
+        .execute();
 
     while let Some(route) = routes.try_next().await? {
         if route.header.destination_prefix_length != 0 {
@@ -81,7 +84,10 @@ async fn get_default_gateway_v6() -> eyre::Result<RouterV6Target> {
     let (connection, handle, _) = new_connection()?;
     tokio::spawn(connection);
 
-    let mut routes = handle.route().get(IpVersion::V6).execute();
+    let mut routes = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
+        .execute();
 
     let mut gateway = None;
     let mut ifindex = None;
@@ -134,13 +140,13 @@ async fn get_default_gateway_v6() -> eyre::Result<RouterV6Target> {
         for attr in &neigh.attributes {
             match attr {
                 NeighbourAttribute::Destination(NeighbourAddress::Inet6(addr)) => ip = Some(*addr),
-                NeighbourAttribute::LinkLocalAddress(bytes) => mac = Some(bytes.clone()),
+                NeighbourAttribute::LinkLayerAddress(bytes) => mac = Some(bytes.clone()),
                 _ => {}
             }
         }
 
         if let (Some(ip), Some(mac)) = (ip, mac) {
-            if neigh.header.flags.contains(&NeighbourFlag::Router) || ip == gateway {
+            if neigh.header.flags.contains(NeighbourFlags::Router) || ip == gateway {
                 ip_to_mac.insert(ip, mac.clone());
                 mac_to_ips.entry(mac).or_default().push(ip);
             }

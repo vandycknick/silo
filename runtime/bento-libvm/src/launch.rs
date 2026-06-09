@@ -7,6 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bento_core::agent::{
     AgentConfig, AgentDnsConfig, AgentForwardConfig, AgentSshConfig, AgentUdsForwardConfig,
+    CertificateAuthorityConfig, GrowpartConfig as ProvisionGrowpartConfig,
+    MountConfig as ProvisionMountConfig, NetworkConfig as ProvisionNetworkConfig,
+    NetworkInterfaceConfig, NetworkMatchConfig, ProvisionConfig, UserConfig, UserdataConfig,
+    UserdataContentType,
 };
 use bento_core::{Disk, DiskKind, VmSpec};
 use bento_utils::format_mac;
@@ -158,6 +162,7 @@ mod tests {
         resolve_guest_runtime_config,
     };
     use bento_core::{
+        agent::{AgentConfig, UserdataContentType},
         Architecture, Boot, Bootstrap, Disk, DiskKind, GuestOs, LifecycleSpec, Mount, Platform,
         PluginSpec, Resources, Settings, Storage, VmSpec, VsockEndpointMode, VsockEndpointSpec,
     };
@@ -425,6 +430,76 @@ mod tests {
     }
 
     #[test]
+    fn provision_config_captures_current_cloud_init_inputs() {
+        let host_user = HostUser {
+            name: "bento".to_string(),
+            uid: 1000,
+            gecos: "Bento User".to_string(),
+        };
+        let mut spec = sample_spec(Vec::new(), true);
+        spec.mounts.push(Mount {
+            source: PathBuf::from("/workspace"),
+            tag: "workspace".to_string(),
+            read_only: false,
+        });
+        spec.boot.bootstrap = Some(Bootstrap {
+            userdata: Some("#!/bin/sh\necho profile\n".to_string()),
+        });
+
+        let provision = super::resolve_provision_config(
+            "demo",
+            &spec,
+            &RuntimeNetwork::UnixDatagram {
+                path: PathBuf::from("/run/bento/net.sock"),
+                mac: "02:00:00:00:00:01".to_string(),
+            },
+            &host_user,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBento",
+            "-----BEGIN CERTIFICATE-----\nMIIBENTO\n-----END CERTIFICATE-----\n",
+        )
+        .expect("resolve provision config");
+
+        assert!(!provision.enabled);
+        assert_eq!(provision.hostname.as_deref(), Some("demo"));
+        assert_eq!(provision.users[0].name, "bento");
+        assert_eq!(provision.users[0].ssh_authorized_keys.len(), 1);
+        assert!(provision.growpart.enabled);
+        assert_eq!(provision.growpart.devices, vec!["/".to_string()]);
+        assert_eq!(provision.mounts[0].tag, "workspace");
+        assert_eq!(provision.mounts[0].path, "/workspace");
+        assert_eq!(provision.network.interfaces[0].name, "bento");
+        assert_eq!(
+            provision.network.interfaces[0]
+                .matches
+                .mac_address
+                .as_deref(),
+            Some("02:00:00:00:00:01")
+        );
+        assert_eq!(
+            provision
+                .userdata
+                .as_ref()
+                .map(|userdata| &userdata.content_type),
+            Some(&UserdataContentType::ShellScript)
+        );
+        assert!(provision
+            .certificate_authority
+            .as_ref()
+            .expect("certificate authority")
+            .pem
+            .ends_with('\n'));
+
+        let rendered = super::render_agent_config(&AgentConfig {
+            provision,
+            ..AgentConfig::default()
+        })
+        .expect("render agent config");
+        assert!(rendered.contains("provision:"));
+        assert!(rendered.contains("enabled: false"));
+        assert!(rendered.contains("interfaces:"));
+    }
+
+    #[test]
     fn guest_runtime_enables_forward_from_named_endpoint() {
         let mut spec = sample_spec(Vec::new(), true);
         spec.vsock_endpoints.push(forward_endpoint(4100, None));
@@ -528,17 +603,18 @@ mod tests {
 
 fn resolve_guest_runtime_config(
     spec: &VmSpec,
-    network: &RuntimeNetwork,
+    _network: &RuntimeNetwork,
 ) -> eyre::Result<AgentConfig> {
     Ok(AgentConfig {
         ssh: AgentSshConfig {
             enabled: spec.settings.agent,
         },
         dns: AgentDnsConfig {
-            enabled: spec.settings.agent && !matches!(network, RuntimeNetwork::None),
+            // enabled: spec.settings.agent && !matches!(network, RuntimeNetwork::None),
             ..AgentDnsConfig::default()
         },
         forward: resolve_forward_runtime_config(spec)?,
+        provision: ProvisionConfig::default(),
     })
 }
 
@@ -575,6 +651,106 @@ fn resolve_forward_runtime_config(spec: &VmSpec) -> eyre::Result<AgentForwardCon
             })
             .collect(),
     })
+}
+
+fn resolve_provision_config(
+    name: &str,
+    spec: &VmSpec,
+    network: &RuntimeNetwork,
+    host_user: &HostUser,
+    ssh_public_key: &str,
+    certificate_authority_pem: &str,
+) -> eyre::Result<ProvisionConfig> {
+    Ok(ProvisionConfig {
+        // Cloud-init remains the active provisioner for this slice. The agent
+        // receives the complete model so the next slice can flip ownership one
+        // feature at a time without changing the transport shape again.
+        enabled: false,
+        hostname: Some(name.to_string()),
+        timezone: Some(resolve_host_timezone()),
+        locale: Some(resolve_host_locale()),
+        growpart: ProvisionGrowpartConfig {
+            enabled: true,
+            devices: vec!["/".to_string()],
+        },
+        users: vec![UserConfig {
+            name: host_user.name.clone(),
+            uid: host_user.uid,
+            gecos: host_user.gecos.clone(),
+            home: format!("/home/{}", host_user.name),
+            shell: "/bin/bash".to_string(),
+            sudo: "ALL=(ALL) NOPASSWD:ALL".to_string(),
+            lock_passwd: true,
+            ssh_authorized_keys: vec![ssh_public_key.trim().to_string()],
+        }],
+        certificate_authority: Some(CertificateAuthorityConfig {
+            path: GUEST_CERTIFICATE_AUTHORITY_PATH.to_string(),
+            pem: pem_with_trailing_newline(certificate_authority_pem),
+            update_trust: true,
+        }),
+        network: resolve_provision_network_config(network)?,
+        mounts: provision_mount_entries(spec),
+        userdata: provision_userdata(spec),
+        ..ProvisionConfig::default()
+    })
+}
+
+fn provision_userdata(spec: &VmSpec) -> Option<UserdataConfig> {
+    let user_data = spec.boot.bootstrap.as_ref()?.userdata.as_deref()?;
+    Some(UserdataConfig {
+        content: user_data.to_string(),
+        content_type: match detect_userdata_content_type(user_data) {
+            "text/x-shellscript" => UserdataContentType::ShellScript,
+            "text/cloud-config" => UserdataContentType::CloudConfig,
+            _ => UserdataContentType::PlainText,
+        },
+    })
+}
+
+fn resolve_provision_network_config(
+    network: &RuntimeNetwork,
+) -> eyre::Result<ProvisionNetworkConfig> {
+    let interfaces = match network {
+        RuntimeNetwork::None => Vec::new(),
+        RuntimeNetwork::VzNat { .. } => vec![NetworkInterfaceConfig {
+            name: "en".to_string(),
+            matches: NetworkMatchConfig {
+                driver: Some("virtio_net".to_string()),
+                mac_address: None,
+            },
+            dhcp4: true,
+            dhcp6: false,
+        }],
+        RuntimeNetwork::UnixDatagram { mac, .. }
+        | RuntimeNetwork::UnixStream { mac, .. }
+        | RuntimeNetwork::Tap { mac, .. } => vec![NetworkInterfaceConfig {
+            name: "bento".to_string(),
+            matches: NetworkMatchConfig {
+                driver: None,
+                mac_address: Some(format_mac(parse_mac_string(mac)?)),
+            },
+            dhcp4: true,
+            dhcp6: false,
+        }],
+    };
+
+    Ok(ProvisionNetworkConfig { interfaces })
+}
+
+fn provision_mount_entries(spec: &VmSpec) -> Vec<ProvisionMountConfig> {
+    mounts(spec)
+        .into_iter()
+        .map(|mount| ProvisionMountConfig {
+            tag: mount.tag,
+            path: mount.source.to_string_lossy().to_string(),
+            fstype: "virtiofs".to_string(),
+            options: if mount.writable {
+                vec!["rw".to_string(), "nofail".to_string()]
+            } else {
+                vec!["ro".to_string(), "nofail".to_string()]
+            },
+        })
+        .collect()
 }
 
 fn requires_bootstrap(_spec: &VmSpec, _guest_runtime: &AgentConfig) -> bool {
@@ -619,6 +795,16 @@ fn build_cidata_disk(
         .with_context(|| format!("read guest agent binary {}", agent_binary_path.display()))?;
     let certificate_authority_pem = certificate_authority_pem_for_config(layout, &global_config)?;
 
+    let mut guest_runtime = guest_runtime.clone();
+    guest_runtime.provision = resolve_provision_config(
+        name,
+        spec,
+        network,
+        &host_user,
+        &user_keys.public_key_openssh,
+        &certificate_authority_pem,
+    )?;
+
     let user_data = render_user_data(
         spec,
         &host_user,
@@ -627,7 +813,7 @@ fn build_cidata_disk(
     )?;
     let meta_data = render_meta_data(name)?;
     let network_config = render_network_config_for_instance(network)?;
-    let agent_config = render_agent_config(guest_runtime)?;
+    let agent_config = render_agent_config(&guest_runtime)?;
     let config_env = render_config_env(name, spec)?;
     let iso_path = instance_dir.join(InstanceFile::CidataDisk.as_str());
 
@@ -764,7 +950,7 @@ fn write_cidata_entry(
 #[derive(Serialize)]
 struct CloudConfig {
     users: Vec<CloudUser>,
-    growpart: GrowpartConfig,
+    growpart: CloudGrowpartConfig,
     resize_rootfs: bool,
     timezone: String,
     locale: String,
@@ -777,7 +963,7 @@ struct CloudConfig {
 }
 
 #[derive(Serialize)]
-struct GrowpartConfig {
+struct CloudGrowpartConfig {
     mode: String,
     devices: Vec<String>,
 }
@@ -854,7 +1040,7 @@ fn render_user_data(
             lock_passwd: true,
             ssh_authorized_keys: vec![ssh_public_key.trim().to_string()],
         }],
-        growpart: GrowpartConfig {
+        growpart: CloudGrowpartConfig {
             mode: "auto".to_string(),
             devices: vec!["/".to_string()],
         },

@@ -6,6 +6,7 @@ pub enum InstanceFile {
     VmmonTraceLog,
     SerialLog,
     RootDisk,
+    Initramfs,
     CidataDisk,
 }
 
@@ -18,6 +19,7 @@ impl InstanceFile {
             Self::VmmonTraceLog => "vm.trace.log",
             Self::SerialLog => "serial.log",
             Self::RootDisk => "rootfs.img",
+            Self::Initramfs => "initramfs",
             Self::CidataDisk => "cidata.img",
         }
     }
