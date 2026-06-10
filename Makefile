@@ -1,8 +1,8 @@
 GUEST_TARGET := aarch64-unknown-linux-musl
 GUEST_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/bento-agent
 GUEST_INIT_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/init
+GUEST_ASSETS_DIR := $(CURDIR)/target/resources/assets
 INITRAMFS_OUT := $(CURDIR)/target/resources/initramfs
-BENTO_CONFIG := $(HOME)/.config/bento/config.yaml
 ARCH ?= arm64
 PROFILE ?= debug
 RUST_HOST_TRIPLE := $(shell rustc -vV | awk '/host:/ { print $$2 }')
@@ -43,13 +43,16 @@ endif
 .PHONY: build-guest-agent
 build-guest-agent:
 	cargo zigbuild -p bento-agent --target $(GUEST_TARGET) --release
-	mkdir -p "$(HOME)/.config/bento"
-	printf "guest:\n  binary: \"%s\"\n" "$(GUEST_BIN)" > "$(BENTO_CONFIG)"
-	@echo "Updated $(BENTO_CONFIG) -> $(GUEST_BIN)"
+	mkdir -p "$(GUEST_ASSETS_DIR)"
+	cp "$(GUEST_BIN)" "$(GUEST_ASSETS_DIR)/agent"
+	@echo "Updated $(GUEST_ASSETS_DIR)/agent"
 
 .PHONY: build-guest-init
 build-guest-init:
 	RUSTFLAGS="-C panic=abort" cargo zigbuild -p bento-init --target $(GUEST_TARGET) --release
+	mkdir -p "$(GUEST_ASSETS_DIR)"
+	cp "$(GUEST_INIT_BIN)" "$(GUEST_ASSETS_DIR)/init"
+	@echo "Updated $(GUEST_ASSETS_DIR)/init"
 
 .PHONY: build
 build: $(HOST_BUILD_COMPONENTS)

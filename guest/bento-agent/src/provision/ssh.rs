@@ -29,6 +29,6 @@ pub(crate) fn install_authorized_keys(
         run_command("chown", ["-R", owner.as_str(), path.as_str()])?;
     }
 
-    tracing::info!(user = %user.name, "provisioned SSH authorized keys");
+    tracing::info!(user = %user.name, "reconciled SSH authorized keys");
     Ok(())
 }

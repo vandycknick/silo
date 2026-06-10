@@ -13,8 +13,8 @@ mod locale;
 mod mounts;
 mod networkd;
 mod resize;
+mod rosetta;
 mod ssh;
-mod state;
 mod timezone;
 mod user;
 mod userdata;
@@ -26,22 +26,7 @@ pub fn run_provisioning(config: &ProvisionConfig) -> eyre::Result<()> {
     }
 
     let context = ProvisionContext::default();
-    match state::is_complete(&context, &config.state_path) {
-        Ok(true) => {
-            tracing::info!(state_path = %config.state_path, "guest provisioning already complete");
-            return Ok(());
-        }
-        Ok(false) => {}
-        Err(err) => {
-            tracing::warn!(
-                state_path = %config.state_path,
-                error = %format_error_chain(&err),
-                "could not read guest provisioning state; provisioning will continue"
-            );
-        }
-    }
-
-    tracing::info!("guest provisioning starting");
+    tracing::info!("guest reconciliation starting");
 
     let mut run = ProvisionRun::default();
     run.step("hostname", || {
@@ -59,29 +44,19 @@ pub fn run_provisioning(config: &ProvisionConfig) -> eyre::Result<()> {
     });
     run.step("resize_rootfs", || resize::apply(&config.resize_rootfs));
     run.step("mounts", || mounts::apply(&context, &config.mounts));
+    run.step("rosetta", || rosetta::apply(&context, &config.rosetta));
     run.step("networkd", || networkd::apply(&context, &config.network));
     run.step("userdata", || {
         userdata::apply(&context, config.userdata.as_ref())
     });
 
     if run.is_success() {
-        match state::mark_complete(&context, &config.state_path) {
-            Ok(()) => {
-                tracing::info!(state_path = %config.state_path, "guest provisioning complete")
-            }
-            Err(err) => {
-                tracing::error!(
-                    state_path = %config.state_path,
-                    error = %format_error_chain(&err),
-                    "failed to mark guest provisioning complete; provisioning will retry on next agent start"
-                );
-            }
-        }
+        tracing::info!("guest reconciliation complete");
     } else {
         tracing::warn!(
             failures = run.failure_count(),
             provisioners = %run.failed_step_list(),
-            "guest provisioning finished with failures; provisioning will retry on next agent start"
+            "guest reconciliation finished with failures; agent will continue"
         );
     }
 

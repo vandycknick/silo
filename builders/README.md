@@ -30,7 +30,7 @@ mkdir /mnt/home
 mount -o subvol=@home /dev/vda /mnt/home
 
 pacman -Syy arch-install-scripts
-pacstrap /mnt base systemd btrfs-progs cloud-init ca-certificates ca-certificates-utils openssl openssh sudo socat vim
+pacstrap /mnt base systemd btrfs-progs ca-certificates ca-certificates-utils openssl openssh sudo socat vim
 
 genfstab -U /mnt >> /mnt/etc/fstab
 ```
@@ -44,16 +44,11 @@ systemctl enable systemd-networkd.service
 systemctl enable systemd-resolved.service
 systemctl enable systemd-timesyncd.service
 systemctl enable sshd.service
-systemctl enable cloud-init-local.service cloud-init-network.service cloud-init-main.service cloud-final.service
 
 sudo rm -f /etc/resolv.conf
 sudo ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
 passwd -d root
-
-cat > /etc/cloud/cloud.cfg.d/99-datasource.cfg  <<'EOF'
-datasource_list: [ NoCloud, None ]
-EOF
 
 echo archlinux > /etc/hostname
 

@@ -26,7 +26,7 @@ use tokio::io::copy_bidirectional;
 use tokio::net::TcpStream;
 
 #[cfg(target_os = "linux")]
-use crate::config::load_agent_config;
+use crate::config::{load_agent_config, AgentArgs};
 #[cfg(target_os = "linux")]
 use crate::dns::DnsServer;
 #[cfg(target_os = "linux")]
@@ -56,14 +56,15 @@ async fn main() -> eyre::Result<()> {
         .try_init();
 
     // TODO: support direct PID 1 initialization in the future. For now the
-    // agent still expects systemd/cloud-init to own early system setup.
+    // agent expects bento-init to hand it off to systemd.
     if is_pid1 {
         tracing::info!("running as PID 1 without init mode enabled yet");
     }
 
     tracing::info!("agent starting");
 
-    let agent_config = load_agent_config()?;
+    let args = AgentArgs::parse(std::env::args_os())?;
+    let agent_config = load_agent_config(&args.config_path)?;
     run_provisioning(&agent_config.provision)?;
 
     let control_port = from_kernel_cmdline();

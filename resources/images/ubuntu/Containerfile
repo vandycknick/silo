@@ -13,7 +13,6 @@ RUN apt update && \
         systemd \
         openssh-server \
         e2fsprogs \
-        cloud-init \
         tar && \
     apt clean && \
     rm -rf \
@@ -23,10 +22,6 @@ RUN apt update && \
         /var/tmp/*
 
 RUN systemctl enable \
-    cloud-init-local.service \
-    cloud-init.service \
-    cloud-config.service \
-    cloud-final.service \
     ssh.service \
     systemd-networkd.service \
     systemd-timesyncd.service \
@@ -39,6 +34,5 @@ RUN systemctl enable \
 #   && cloud-init clean --logs --machine-id || true
 
 RUN (passwd -d root && passwd -u root || true) \
-  && (cloud-init clean --logs || true) \
   && rm -f /etc/machine-id /var/lib/dbus/machine-id \
   && touch /etc/machine-id

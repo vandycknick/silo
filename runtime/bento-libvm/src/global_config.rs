@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use eyre::Context;
 use serde::Deserialize;
@@ -8,9 +8,8 @@ use crate::models::NetworkDriverKind;
 
 const CONFIG_FILE_NAME: &str = "config.yaml";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GlobalConfig {
-    pub guest_binary: PathBuf,
     pub networking: NetworkingConfig,
 }
 
@@ -31,15 +30,26 @@ pub struct NetdConfig {
 impl GlobalConfig {
     pub fn load() -> eyre::Result<Self> {
         let config_path = config_path()?;
-        let raw = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("read global config {}", config_path.display()))?;
+        let raw = match std::fs::read_to_string(&config_path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("read global config {}", config_path.display()));
+            }
+        };
 
-        parse_global_config(&raw).with_context(|| {
-            format!(
-                "parse global config {} (expected guest.binary in yaml)",
-                config_path.display()
-            )
-        })
+        parse_global_config(&raw)
+            .with_context(|| format!("parse global config {}", config_path.display()))
+    }
+}
+
+impl Default for NetworkingConfig {
+    fn default() -> Self {
+        Self {
+            private_driver: NetworkDriverKind::Netd,
+            netd: NetdConfig::default(),
+        }
     }
 }
 
@@ -52,15 +62,6 @@ fn config_path() -> eyre::Result<PathBuf> {
 fn parse_global_config(input: &str) -> eyre::Result<GlobalConfig> {
     let parsed: RawGlobalConfig =
         serde_yaml_ng::from_str(input).context("deserialize global config yaml")?;
-
-    let guest_binary = parsed.guest.binary;
-
-    if !guest_binary.is_absolute() {
-        return Err(eyre::eyre!(
-            "[guest].binary must be an absolute path: {}",
-            guest_binary.display()
-        ));
-    }
 
     let private_driver = parsed
         .networking
@@ -77,7 +78,6 @@ fn parse_global_config(input: &str) -> eyre::Result<GlobalConfig> {
     validate_netd_config(&netd)?;
 
     Ok(GlobalConfig {
-        guest_binary,
         networking: NetworkingConfig {
             private_driver,
             netd,
@@ -87,13 +87,7 @@ fn parse_global_config(input: &str) -> eyre::Result<GlobalConfig> {
 
 #[derive(Debug, Deserialize)]
 struct RawGlobalConfig {
-    guest: RawGuestConfig,
     networking: Option<RawNetworkingConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawGuestConfig {
-    binary: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,27 +183,20 @@ fn validate_netd_config(config: &NetdConfig) -> eyre::Result<()> {
     Ok(())
 }
 
-pub fn ensure_guest_binary(config: &GlobalConfig) -> eyre::Result<&Path> {
-    let path = config.guest_binary.as_path();
-    let metadata =
-        std::fs::metadata(path).with_context(|| format!("stat guest binary {}", path.display()))?;
-
-    if !metadata.is_file() {
-        return Err(eyre::eyre!(
-            "guest binary path is not a file: {}",
-            path.display()
-        ));
-    }
-
-    Ok(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_global_config_reads_guest_binary() {
+    fn parse_global_config_reads_defaults() {
+        let cfg = parse_global_config("{}").expect("parse config");
+
+        assert_eq!(cfg.networking.private_driver, NetworkDriverKind::Netd);
+        assert_eq!(cfg.networking.netd, NetdConfig::default());
+    }
+
+    #[test]
+    fn parse_global_config_ignores_legacy_guest_settings() {
         let cfg = parse_global_config(
             r#"
 guest:
@@ -218,17 +205,13 @@ guest:
         )
         .expect("parse config");
 
-        assert_eq!(cfg.guest_binary, PathBuf::from("/tmp/bento-agent"));
-        assert_eq!(cfg.networking.private_driver, NetworkDriverKind::Netd);
-        assert_eq!(cfg.networking.netd, NetdConfig::default());
+        assert_eq!(cfg, GlobalConfig::default());
     }
 
     #[test]
     fn parse_global_config_reads_networking_defaults() {
         let cfg = parse_global_config(
             r#"
-guest:
-  binary: "/tmp/bento-agent"
 networking:
   private:
     driver: netd
@@ -256,8 +239,6 @@ networking:
     fn parse_global_config_reads_netd_tls_ca_paths() {
         let cfg = parse_global_config(
             r#"
-guest:
-  binary: "/tmp/bento-agent"
 networking:
   drivers:
     netd:
@@ -281,8 +262,6 @@ networking:
     fn parse_global_config_rejects_relative_netd_tls_ca_paths() {
         let result = parse_global_config(
             r#"
-guest:
-  binary: "/tmp/bento-agent"
 networking:
   drivers:
     netd:
@@ -298,8 +277,6 @@ networking:
     fn parse_global_config_rejects_partial_netd_tls_ca_paths() {
         let result = parse_global_config(
             r#"
-guest:
-  binary: "/tmp/bento-agent"
 networking:
   drivers:
     netd:
@@ -314,8 +291,6 @@ networking:
     fn parse_global_config_reads_vznat_private_driver() {
         let cfg = parse_global_config(
             r#"
-guest:
-  binary: "/tmp/bento-agent"
 networking:
   private:
     driver: vznat
@@ -330,8 +305,6 @@ networking:
     fn parse_global_config_rejects_legacy_gvisor_config() {
         let result = parse_global_config(
             r#"
-guest:
-  binary: "/tmp/bento-agent"
 networking:
   userspace: gvisor
   drivers:
@@ -341,30 +314,5 @@ networking:
         );
 
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_global_config_rejects_missing_guest_key() {
-        let result = parse_global_config(
-            r#"
-guest:
-  other: "value"
-"#,
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_global_config_rejects_relative_paths() {
-        let err = parse_global_config(
-            r#"
-guest:
-  binary: "./bento-agent"
-"#,
-        )
-        .expect_err("relative path should fail");
-
-        assert!(err.to_string().contains("absolute path"));
     }
 }

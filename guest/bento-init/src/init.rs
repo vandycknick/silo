@@ -7,6 +7,30 @@ use crate::io;
 const DEFAULT_ROOT: &[u8] = b"/dev/vda";
 pub(crate) const DEFAULT_INIT: &[u8] = b"/sbin/init";
 const MNT_ROOT: &[u8] = b"/mnt/root";
+const AGENT_PAYLOAD_DIR: &[u8] = b"/agent";
+const AGENT_SOURCE_BINARY: &[u8] = b"/agent/bento-agent";
+const AGENT_SOURCE_CONFIG: &[u8] = b"/agent/bento-agent.yaml";
+const AGENT_RUN_DIR: &[u8] = b"/run/agent";
+const AGENT_RUN_BINARY: &[u8] = b"/run/agent/bento-agent";
+const AGENT_RUN_CONFIG: &[u8] = b"/run/agent/bento-agent.yaml";
+const SYSTEMD_UNIT_DIR: &[u8] = b"/run/systemd/system";
+const SYSTEMD_WANTS_DIR: &[u8] = b"/run/systemd/system/multi-user.target.wants";
+const AGENT_SERVICE_PATH: &[u8] = b"/run/systemd/system/bento-agent.service";
+const AGENT_SERVICE_WANTS_PATH: &[u8] =
+    b"/run/systemd/system/multi-user.target.wants/bento-agent.service";
+const AGENT_SERVICE_WANTS_TARGET: &[u8] = b"../bento-agent.service";
+const AGENT_SERVICE_UNIT: &[u8] = b"[Unit]\n\
+Description=Bento Guest Agent\n\
+After=basic.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStart=/run/agent/bento-agent --config /run/agent/bento-agent.yaml\n\
+Restart=on-failure\n\
+RestartSec=1s\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n";
 
 struct BootConfig {
     root: Vec<u8>,
@@ -45,6 +69,7 @@ fn run_init() -> Result<(), &'static str> {
     if mount_root(&config) != 0 {
         return Err("failed to mount root filesystem");
     }
+    prepare_agent_handoff()?;
 
     let init_path = target_init_path(&config.init).ok_or("target init path is too long")?;
     if io::access(&init_path, libc::X_OK) != 0 {
@@ -152,6 +177,103 @@ fn mount_root(config: &BootConfig) -> i32 {
     }
 }
 
+fn prepare_agent_handoff() -> Result<(), &'static str> {
+    if io::access(AGENT_PAYLOAD_DIR, libc::F_OK) != 0 {
+        return Ok(());
+    }
+
+    if io::access(AGENT_SOURCE_BINARY, libc::R_OK) != 0 {
+        return Err("agent payload is missing /agent/bento-agent");
+    }
+    if io::access(AGENT_SOURCE_CONFIG, libc::R_OK) != 0 {
+        return Err("agent payload is missing /agent/bento-agent.yaml");
+    }
+
+    if applets::files::mkdir_parents(AGENT_RUN_DIR, 0o755) != 0 {
+        return Err("failed to create /run/agent");
+    }
+    if applets::files::mkdir_parents(SYSTEMD_UNIT_DIR, 0o755) != 0 {
+        return Err("failed to create /run/systemd/system");
+    }
+    if applets::files::mkdir_parents(SYSTEMD_WANTS_DIR, 0o755) != 0 {
+        return Err("failed to create bento-agent systemd wants directory");
+    }
+
+    copy_file(AGENT_SOURCE_BINARY, AGENT_RUN_BINARY, 0o755)?;
+    copy_file(AGENT_SOURCE_CONFIG, AGENT_RUN_CONFIG, 0o644)?;
+    write_static_file(AGENT_SERVICE_PATH, AGENT_SERVICE_UNIT, 0o644)?;
+
+    if io::symlink(AGENT_SERVICE_WANTS_TARGET, AGENT_SERVICE_WANTS_PATH) != 0
+        && io::errno() != libc::EEXIST
+    {
+        return Err("failed to enable bento-agent systemd unit");
+    }
+
+    Ok(())
+}
+
+fn copy_file(source: &[u8], target: &[u8], mode: u32) -> Result<(), &'static str> {
+    let input = io::open(source, libc::O_RDONLY, 0);
+    if input < 0 {
+        return Err("failed to open agent payload source");
+    }
+
+    let output = io::open(target, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, mode);
+    if output < 0 {
+        io::close(input);
+        return Err("failed to create agent payload target");
+    }
+
+    let mut result = Ok(());
+    let mut buf = [0u8; 4096];
+    loop {
+        let len = io::read(input, &mut buf);
+        if len < 0 {
+            result = Err("failed to read agent payload source");
+            break;
+        }
+        if len == 0 {
+            break;
+        }
+        if io::write_buf(output, &buf[..len as usize]) != len {
+            result = Err("failed to write agent payload target");
+            break;
+        }
+    }
+
+    if io::close(input) != 0 && result.is_ok() {
+        result = Err("failed to close agent payload source");
+    }
+    if io::close(output) != 0 && result.is_ok() {
+        result = Err("failed to close agent payload target");
+    }
+    if result.is_ok() && io::chmod(target, mode) != 0 {
+        result = Err("failed to set agent payload permissions");
+    }
+
+    result
+}
+
+fn write_static_file(path: &[u8], contents: &[u8], mode: u32) -> Result<(), &'static str> {
+    let fd = io::open(path, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, mode);
+    if fd < 0 {
+        return Err("failed to create generated file");
+    }
+
+    let mut result = Ok(());
+    if io::write_buf(fd, contents) != contents.len() as isize {
+        result = Err("failed to write generated file");
+    }
+    if io::close(fd) != 0 && result.is_ok() {
+        result = Err("failed to close generated file");
+    }
+    if result.is_ok() && io::chmod(path, mode) != 0 {
+        result = Err("failed to set generated file permissions");
+    }
+
+    result
+}
+
 fn target_init_path(init: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(MNT_ROOT);
@@ -170,6 +292,9 @@ pub(crate) fn do_switch_root(new_root: &[u8], init: &[u8], init_argv: &[&[u8]]) 
     move_mount_if_present(b"/dev", new_root);
     move_mount_if_present(b"/proc", new_root);
     move_mount_if_present(b"/sys", new_root);
+    // Match util-linux switch_root behavior for /run. Bento relies on this as
+    // a transient handoff: initramfs /run/... becomes rootfs /run/... here, and
+    // systemd reuses the existing tmpfs instead of replacing it.
     move_mount_if_present(b"/run", new_root);
 
     if io::chdir(new_root) != 0 {

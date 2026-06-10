@@ -275,7 +275,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const CIDATA_DISK: &str = "cidata.img";
+    const DATA_DISK: &str = "data.img";
 
     fn boot_assets(dir: &std::path::Path) -> Boot {
         let kernel = dir.join("kernel");
@@ -409,10 +409,10 @@ mod tests {
     }
 
     #[test]
-    fn vm_spec_machine_config_does_not_attach_implicit_cidata_disk() {
-        let dir = temp_dir("implicit-cidata");
+    fn vm_spec_machine_config_does_not_attach_implicit_data_disk() {
+        let dir = temp_dir("implicit-data-disk");
         fs::create_dir_all(&dir).expect("create temp dir");
-        fs::write(dir.join(CIDATA_DISK), b"cidata").expect("write cidata disk");
+        fs::write(dir.join(DATA_DISK), b"data disk").expect("write data disk");
 
         let spec = VmSpec {
             version: 1,
@@ -450,8 +450,8 @@ mod tests {
     }
 
     #[test]
-    fn vm_spec_machine_config_attaches_declared_cidata_disk() {
-        let dir = temp_dir("declared-cidata");
+    fn vm_spec_machine_config_attaches_declared_data_disk() {
+        let dir = temp_dir("declared-data-disk");
         fs::create_dir_all(&dir).expect("create temp dir");
 
         let spec = VmSpec {
@@ -467,7 +467,7 @@ mod tests {
             boot: boot_assets(&dir),
             storage: Storage {
                 disks: vec![Disk {
-                    path: PathBuf::from(CIDATA_DISK),
+                    path: PathBuf::from(DATA_DISK),
                     kind: DiskKind::Data,
                     read_only: true,
                 }],
@@ -493,7 +493,7 @@ mod tests {
         assert_eq!(machine_config.config.data_disks.len(), 1);
         assert_eq!(
             machine_config.config.data_disks[0].path,
-            dir.join(CIDATA_DISK)
+            dir.join(DATA_DISK)
         );
         assert!(machine_config.config.data_disks[0].read_only);
 

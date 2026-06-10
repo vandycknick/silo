@@ -10,6 +10,6 @@ pub(crate) fn apply(context: &ProvisionContext, locale: Option<&str>) -> eyre::R
         format!("LANG={locale}\n"),
         0o644,
     )?;
-    tracing::info!(locale, "provisioned locale");
+    tracing::info!(locale, "reconciled locale");
     Ok(())
 }

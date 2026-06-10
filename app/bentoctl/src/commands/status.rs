@@ -13,7 +13,7 @@ use crate::constants::PROFILE_METADATA_KEY;
 struct GuestConfigStatus {
     enabled: bool,
     bootstrap: bool,
-    cidata_present: bool,
+    initramfs_present: bool,
     shell_expected: bool,
 }
 
@@ -121,9 +121,7 @@ fn guest_config_status(spec: &VmSpec, machine_dir: &std::path::Path) -> GuestCon
     GuestConfigStatus {
         enabled: spec.settings.agent,
         bootstrap: spec.boot.bootstrap.is_some(),
-        cidata_present: machine_dir
-            .join(InstanceFile::CidataDisk.as_str())
-            .is_file(),
+        initramfs_present: machine_dir.join(InstanceFile::Initramfs.as_str()).is_file(),
         shell_expected: spec.settings.agent,
     }
 }
@@ -151,7 +149,10 @@ fn print_guest(runtime: Option<(&str, bool)>, config: GuestConfigStatus) {
     println!("  settings:");
     println!("    enabled: {}", yes_no(config.enabled));
     println!("    bootstrap: {}", yes_no(config.bootstrap));
-    println!("    cidata: {}", present_absent(config.cidata_present));
+    println!(
+        "    initramfs: {}",
+        present_absent(config.initramfs_present)
+    );
     println!("    shell_expected: {}", yes_no(config.shell_expected));
 }
 
@@ -308,22 +309,22 @@ mod tests {
         let config = guest_config_status(&sample_spec(false, false), &dir);
 
         assert!(!config.enabled);
-        assert!(!config.cidata_present);
+        assert!(!config.initramfs_present);
         assert!(!config.shell_expected);
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn guest_config_status_reports_agent_and_cidata_when_present() {
+    fn guest_config_status_reports_agent_and_initramfs_when_present() {
         let dir = temp_dir("enabled");
         fs::create_dir_all(&dir).expect("create temp dir");
-        fs::write(dir.join("cidata.img"), b"cidata").expect("write cidata marker");
+        fs::write(dir.join("initramfs"), b"initramfs").expect("write initramfs marker");
 
         let config = guest_config_status(&sample_spec(true, false), &dir);
 
         assert!(config.enabled);
-        assert!(config.cidata_present);
+        assert!(config.initramfs_present);
         assert!(config.shell_expected);
 
         let _ = fs::remove_dir_all(&dir);

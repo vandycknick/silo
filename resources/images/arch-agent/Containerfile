@@ -19,8 +19,6 @@ RUN pacman --disable-sandbox -Syu --noconfirm \
     bash \
     bind \
     ca-certificates \
-    cloud-guest-utils \
-    cloud-init \
     dbus \
     iproute2 \
     openssh \
@@ -43,18 +41,14 @@ RUN sudo -u builder yay -S --noconfirm --needed \
       opencode-bin
 
 RUN systemctl enable \
-    cloud-init-main.service \
-    cloud-final.service \
-    sshd.service \
-    systemd-networkd.service \
-    systemd-timesyncd.service \
-    systemd-resolved.service
+  sshd.service \
+  systemd-networkd.service \
+  systemd-timesyncd.service \
+  systemd-resolved.service
 
- RUN userdel -r builder \
-    && rm -f /etc/sudoers.d/builder
+RUN userdel -r builder \
+  && rm -f /etc/sudoers.d/builder
 
-RUN ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf \
- && passwd -d root \
- && rm -f /etc/machine-id \
- && touch /etc/machine-id \
- && cloud-init clean --logs --machine-id || true
+RUN (passwd -d root && passwd -u root || true) \
+  && rm -f /etc/machine-id \
+  && touch /etc/machine-id

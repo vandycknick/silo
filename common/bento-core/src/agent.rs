@@ -3,7 +3,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 pub const DNS_RECORD_HOST_BENTO_INTERNAL: &str = "host.bento.internal";
 pub const RESERVED_SHELL_PORT: u32 = 2000;
-pub const DEFAULT_PROVISION_STATE_PATH: &str = "/var/lib/bento-agent/provisioned";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AgentSshConfig {
@@ -75,13 +74,11 @@ pub struct AgentConfig {
     pub provision: ProvisionConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ProvisionConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_provision_state_path")]
-    pub state_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,32 +93,12 @@ pub struct ProvisionConfig {
     pub certificate_authority: Option<CertificateAuthorityConfig>,
     #[serde(default)]
     pub network: NetworkConfig,
+    #[serde(default)]
+    pub rosetta: AgentRosettaConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MountConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub userdata: Option<UserdataConfig>,
-}
-
-impl Default for ProvisionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            state_path: default_provision_state_path(),
-            hostname: None,
-            timezone: None,
-            locale: None,
-            resize_rootfs: ResizeRootfsConfig::default(),
-            users: Vec::new(),
-            certificate_authority: None,
-            network: NetworkConfig::default(),
-            mounts: Vec::new(),
-            userdata: None,
-        }
-    }
-}
-
-fn default_provision_state_path() -> String {
-    DEFAULT_PROVISION_STATE_PATH.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -164,6 +141,35 @@ pub struct NetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct AgentRosettaConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_rosetta_mount_tag")]
+    pub mount_tag: String,
+    #[serde(default = "default_rosetta_mount_path")]
+    pub mount_path: String,
+}
+
+impl Default for AgentRosettaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mount_tag: default_rosetta_mount_tag(),
+            mount_path: default_rosetta_mount_path(),
+        }
+    }
+}
+
+fn default_rosetta_mount_tag() -> String {
+    "bento-rosetta".to_string()
+}
+
+fn default_rosetta_mount_path() -> String {
+    "/mnt/bento-rosetta".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkInterfaceConfig {
     pub name: String,
     #[serde(default)]
@@ -199,6 +205,8 @@ pub struct UserdataConfig {
     pub content: String,
     #[serde(default)]
     pub content_type: UserdataContentType,
+    #[serde(default)]
+    pub run: UserdataRunPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -208,6 +216,14 @@ pub enum UserdataContentType {
     ShellScript,
     CloudConfig,
     PlainText,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UserdataRunPolicy {
+    #[default]
+    Once,
+    Always,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -248,15 +264,17 @@ pub enum ForwardApiResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::{AgentConfig, UserdataContentType, DEFAULT_PROVISION_STATE_PATH};
+    use crate::agent::{AgentConfig, UserdataContentType, UserdataRunPolicy};
 
     #[test]
     fn provision_config_defaults_are_safe() {
         let config = AgentConfig::default();
 
         assert!(!config.provision.enabled);
-        assert_eq!(config.provision.state_path, DEFAULT_PROVISION_STATE_PATH);
         assert!(!config.provision.resize_rootfs.enabled);
+        assert!(!config.provision.rosetta.enabled);
+        assert_eq!(config.provision.rosetta.mount_tag, "bento-rosetta");
+        assert_eq!(config.provision.rosetta.mount_path, "/mnt/bento-rosetta");
         assert!(config.provision.users.is_empty());
         assert!(config.provision.network.interfaces.is_empty());
     }
@@ -269,6 +287,34 @@ provision:
   hostname: demo
   resize_rootfs:
     enabled: true
+  rosetta:
+    enabled: true
+  userdata:
+    content: |
+      #!/bin/sh
+      echo hello
+    content_type: shell_script
+    run: always
+"#;
+
+        let config: AgentConfig = serde_yaml_ng::from_str(raw).expect("decode agent config");
+
+        assert!(config.provision.enabled);
+        assert_eq!(config.provision.hostname.as_deref(), Some("demo"));
+        assert!(config.provision.resize_rootfs.enabled);
+        assert!(config.provision.rosetta.enabled);
+        assert_eq!(config.provision.rosetta.mount_tag, "bento-rosetta");
+        assert_eq!(config.provision.rosetta.mount_path, "/mnt/bento-rosetta");
+        let userdata = config.provision.userdata.expect("userdata");
+        assert_eq!(userdata.content_type, UserdataContentType::ShellScript);
+        assert_eq!(userdata.run, UserdataRunPolicy::Always);
+    }
+
+    #[test]
+    fn userdata_run_defaults_to_once() {
+        let raw = r#"
+provision:
+  enabled: true
   userdata:
     content: |
       #!/bin/sh
@@ -277,13 +323,8 @@ provision:
 "#;
 
         let config: AgentConfig = serde_yaml_ng::from_str(raw).expect("decode agent config");
+        let userdata = config.provision.userdata.expect("userdata");
 
-        assert!(config.provision.enabled);
-        assert_eq!(config.provision.hostname.as_deref(), Some("demo"));
-        assert!(config.provision.resize_rootfs.enabled);
-        assert_eq!(
-            config.provision.userdata.expect("userdata").content_type,
-            UserdataContentType::ShellScript
-        );
+        assert_eq!(userdata.run, UserdataRunPolicy::Once);
     }
 }

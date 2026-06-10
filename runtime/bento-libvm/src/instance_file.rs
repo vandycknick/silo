@@ -7,7 +7,6 @@ pub enum InstanceFile {
     SerialLog,
     RootDisk,
     Initramfs,
-    CidataDisk,
 }
 
 impl InstanceFile {
@@ -20,7 +19,6 @@ impl InstanceFile {
             Self::SerialLog => "serial.log",
             Self::RootDisk => "rootfs.img",
             Self::Initramfs => "initramfs",
-            Self::CidataDisk => "cidata.img",
         }
     }
 }

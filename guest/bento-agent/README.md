@@ -98,19 +98,13 @@ Notes:
 
 `bento-agent` writes its runtime logs to stderr.
 
-In the default systemd/cloud-init boot path, that means agent logs are typically captured by the service manager, for example through `journalctl -u bento-agent.service`.
-
-The guest install/bootstrap flow is separate from the agent process and logs to:
-
-```text
-/var/log/bento-guest-install.log
-```
+In the default systemd boot path, logs are captured by the service manager, for example through `journalctl -u bento-agent.service`.
 
 ## Bootstrap
 
-Today Bento expects `bento-agent` to be installed and started via cloud-init plus systemd.
+Today Bento expects `bento-agent` to be handed off by `bento-init` and started by systemd.
 
-The bootstrap path writes the agent binary and config into the guest, installs a `bento-agent.service` unit, and starts or restarts the service as needed.
+The runtime initramfs embeds `/agent/bento-agent` and `/agent/bento-agent.yaml`. `bento-init` copies those files into `/run/agent`, writes a transient `bento-agent.service` unit under `/run/systemd/system`, and lets systemd start it during the normal boot.
 
 When the process is running as PID 1, the current behavior is intentionally minimal. The agent detects PID 1 and logs that init mode is not implemented yet. Direct PID 1 initialization support is planned, but is still to be implemented.
 
@@ -124,10 +118,10 @@ The current repo-level helper is:
 make build-guest-agent
 ```
 
-That target builds the guest agent binary and writes the resulting path into Bento's global config:
+That target builds the guest agent binary and copies it into Bento's runtime assets directory:
 
 ```text
-~/.config/bento/config.yaml
+target/resources/assets/agent
 ```
 
 Current target details:

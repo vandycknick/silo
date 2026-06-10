@@ -31,6 +31,6 @@ pub(crate) fn apply(context: &ProvisionContext, timezone: Option<&str>) -> eyre:
             .with_context(|| format!("link {} to {zoneinfo}", localtime.display()))?;
     }
 
-    tracing::info!(timezone, "provisioned timezone");
+    tracing::info!(timezone, "reconciled timezone");
     Ok(())
 }

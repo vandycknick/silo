@@ -85,6 +85,19 @@ pub fn unlink(path: &[u8]) -> i32 {
     unsafe { libc::unlink(path_buf.as_ptr().cast::<libc::c_char>()) }
 }
 
+pub fn chmod(path: &[u8], mode: u32) -> i32 {
+    let mut path_buf = [0u8; PATH_MAX];
+    if !path_to_cstr(path, &mut path_buf) {
+        return -1;
+    }
+    unsafe {
+        libc::chmod(
+            path_buf.as_ptr().cast::<libc::c_char>(),
+            mode as libc::mode_t,
+        )
+    }
+}
+
 pub fn symlink(target: &[u8], link_path: &[u8]) -> i32 {
     let mut target_buf = [0u8; PATH_MAX];
     let mut link_buf = [0u8; PATH_MAX];

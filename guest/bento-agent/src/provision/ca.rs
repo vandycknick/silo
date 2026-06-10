@@ -22,7 +22,7 @@ pub(crate) fn apply(
     tracing::info!(
         path = %config.path,
         update_trust = config.update_trust,
-        "provisioned certificate authority"
+        "reconciled certificate authority"
     );
     Ok(())
 }

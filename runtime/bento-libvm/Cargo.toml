@@ -9,7 +9,6 @@ bento-core = { path = "../../common/bento-core" }
 bento-initramfs = { path = "../../common/bento-initramfs" }
 bento-utils = { path = "../../common/bento-utils" }
 eyre = "0.6.12"
-fatfs = "0.3.6"
 getrandom = "0.4.2"
 hyper-util = "0.1.20"
 libc = "0.2.186"
