@@ -1,8 +1,6 @@
-use bento_agent_spec::DEFAULT_AGENT_TIMEOUT_SECONDS;
-use bento_libvm::{LibVm, MachineRecord, MachineRef};
+use bento_libvm::{LibVm, MachineRef, DEFAULT_GUEST_READINESS_TIMEOUT};
 use clap::Args;
 use std::fmt::{Display, Formatter};
-use std::time::Duration;
 
 #[derive(Args, Debug)]
 #[command(about = "Start a persistent VM")]
@@ -23,20 +21,11 @@ impl Cmd {
         let machine_ref = MachineRef::parse(self.name.clone())?;
         let machine = libvm.start(&machine_ref).await?;
 
-        if requires_guest_readiness(&machine) {
-            libvm
-                .wait_for_guest_running(
-                    &MachineRef::Id(machine.id),
-                    Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECONDS),
-                )
-                .await
-                .map_err(|err| eyre::eyre!("guest readiness check failed: {err}"))?;
-        }
+        libvm
+            .wait_for_guest_running(&MachineRef::Id(machine.id), DEFAULT_GUEST_READINESS_TIMEOUT)
+            .await
+            .map_err(|err| eyre::eyre!("guest readiness check failed: {err}"))?;
 
         Ok(())
     }
-}
-
-fn requires_guest_readiness(machine: &MachineRecord) -> bool {
-    machine.agent_enabled()
 }

@@ -204,7 +204,12 @@ pub enum ForwardApiResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::{AgentConfig, UserdataContentType, UserdataRunPolicy};
+    use crate::{
+        AgentConfig, AgentForwardConfig, AgentRosettaConfig, AgentUdsForwardConfig,
+        CertificateAuthorityConfig, MountConfig, NetworkConfig, NetworkInterfaceConfig,
+        NetworkMatchConfig, ProvisionConfig, ResizeRootfsConfig, UserConfig, UserdataConfig,
+        UserdataContentType, UserdataRunPolicy,
+    };
 
     #[test]
     fn provision_config_defaults_are_safe() {
@@ -266,5 +271,77 @@ provision:
         let userdata = config.provision.userdata.expect("userdata");
 
         assert_eq!(userdata.run, UserdataRunPolicy::Once);
+    }
+
+    #[test]
+    fn agent_config_round_trips_through_metadata_struct() {
+        let original = AgentConfig {
+            forward: AgentForwardConfig {
+                enabled: true,
+                port: 65_535,
+                uds: vec![AgentUdsForwardConfig {
+                    guest_path: "/var/run/docker.sock".to_string(),
+                }],
+            },
+            provision: ProvisionConfig {
+                enabled: true,
+                hostname: Some("demo".to_string()),
+                timezone: Some("UTC".to_string()),
+                locale: Some("en_US.UTF-8".to_string()),
+                resize_rootfs: ResizeRootfsConfig { enabled: true },
+                users: vec![UserConfig {
+                    name: "bento".to_string(),
+                    uid: u32::MAX,
+                    gecos: "Bento User".to_string(),
+                    home: "/home/bento".to_string(),
+                    shell: "/bin/bash".to_string(),
+                    sudo: "ALL=(ALL) NOPASSWD:ALL".to_string(),
+                    lock_passwd: true,
+                    ssh_authorized_keys: vec!["ssh-ed25519 AAAAC3NzaBento".to_string()],
+                }],
+                certificate_authority: Some(CertificateAuthorityConfig {
+                    path: "/usr/local/share/ca-certificates/bento-ca.crt".to_string(),
+                    pem: "-----BEGIN CERTIFICATE-----\nMIIBENTO\n-----END CERTIFICATE-----\n"
+                        .to_string(),
+                    update_trust: true,
+                }),
+                network: NetworkConfig {
+                    interfaces: vec![NetworkInterfaceConfig {
+                        name: "bento".to_string(),
+                        matches: NetworkMatchConfig {
+                            driver: Some("virtio_net".to_string()),
+                            mac_address: Some("02:00:00:00:00:01".to_string()),
+                        },
+                        dhcp4: true,
+                        dhcp6: true,
+                    }],
+                },
+                rosetta: AgentRosettaConfig {
+                    enabled: true,
+                    ..AgentRosettaConfig::default()
+                },
+                mounts: vec![MountConfig {
+                    tag: "workspace".to_string(),
+                    path: "/workspace".to_string(),
+                    fstype: "virtiofs".to_string(),
+                    options: vec!["rw".to_string(), "nofail".to_string()],
+                }],
+                userdata: Some(UserdataConfig {
+                    content: "#!/bin/sh\necho hello\n".to_string(),
+                    content_type: UserdataContentType::ShellScript,
+                    run: UserdataRunPolicy::Always,
+                }),
+            },
+        };
+
+        let value = serde_json::to_value(&original).expect("serialize agent config");
+        let encoded =
+            bento_protocol::serde_json_to_protobuf_struct(value).expect("encode metadata struct");
+        let decoded =
+            bento_protocol::protobuf_struct_to_serde_json(encoded).expect("decode metadata struct");
+        let round_tripped: AgentConfig =
+            serde_json::from_value(decoded).expect("deserialize agent config");
+
+        assert_eq!(round_tripped, original);
     }
 }

@@ -57,9 +57,6 @@ pub(crate) struct VmOverrideArgs {
     /// Enable nested virtualization for supported VZ guests.
     #[arg(long)]
     pub nested_virtualization: bool,
-    /// Enable the Bento guest agent.
-    #[arg(long)]
-    pub agent: bool,
     /// Enable Rosetta for x86_64 Linux binaries in supported VZ guests.
     #[arg(long)]
     pub rosetta: bool,
@@ -124,7 +121,6 @@ impl Cmd {
             initramfs: boot_assets.initramfs,
             disk_size_bytes: resolved.disk_size_bytes,
             nested_virtualization: resolved.nested_virtualization,
-            agent: true,
             rosetta: resolved.rosetta,
             userdata: resolved.userdata,
             disks: resolved.disks,
@@ -314,7 +310,6 @@ mod tests {
         };
         assert_eq!(create.name, "dev");
         assert_eq!(create.profile.as_deref(), Some("rust-dev"));
-        assert!(!create.overrides.agent);
     }
 
     #[test]
@@ -356,7 +351,6 @@ mod tests {
             "--disk-size",
             "40gb",
             "--nested-virtualization",
-            "--agent",
             "--rosetta",
             "--userdata",
             "./user-data.yaml",
@@ -385,7 +379,6 @@ mod tests {
             Some(40_000_000_000)
         );
         assert!(create.overrides.nested_virtualization);
-        assert!(create.overrides.agent);
         assert!(create.overrides.rosetta);
         assert_eq!(create.overrides.disks.len(), 1);
         assert_eq!(create.overrides.mounts.len(), 1);

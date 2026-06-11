@@ -1,8 +1,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 
-use bento_agent_spec::{DEFAULT_AGENT_TIMEOUT_SECONDS, SSH_VSOCK_PORT};
+use bento_agent_spec::SSH_VSOCK_PORT;
 use bento_protocol::negotiate::Upgrade;
 use bento_protocol::v1::vm_monitor_service_server::{VmMonitorService, VmMonitorServiceServer};
 use bento_protocol::v1::{
@@ -16,9 +15,10 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 
-use crate::agent::spawn_agent_control_service;
 use crate::context::{DaemonContext, RuntimeContext};
 use crate::endpoints::start_endpoint_supervisor;
+use crate::ext::VmSpecExt;
+use crate::guest::spawn_guest_services;
 use crate::net::server::NegotiateServer;
 use crate::net::tunnel::spawn_tunnel;
 use crate::startup::SyncReporter;
@@ -120,14 +120,20 @@ pub async fn start_services(
         }
     });
 
-    let guest_monitor = if let Some(agent_config) = ctx.agent_config.as_ref() {
-        ctx.store.dispatch(Action::guest_starting());
+    let guest_monitor = if ctx.guest_services_enabled {
+        if ctx.wait_for_registration.is_zero() {
+            ctx.store.dispatch(Action::guest_running());
+        } else {
+            ctx.store.dispatch(Action::guest_starting());
+        }
+
         Some(
-            spawn_agent_control_service(
+            spawn_guest_services(
                 &ctx.machine,
                 ctx.store.clone(),
-                agent_config.clone(),
-                Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECONDS),
+                ctx.metadata_config.clone().unwrap_or_default(),
+                ctx.spec.rosetta_or_default(),
+                ctx.wait_for_registration,
                 ctx.shutdown.clone(),
             )
             .await?,

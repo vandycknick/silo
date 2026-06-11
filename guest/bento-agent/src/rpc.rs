@@ -1,8 +1,9 @@
 use std::io;
 use std::sync::Arc;
 
-use bento_protocol::v1::agent_control_service_client::AgentControlServiceClient;
-use bento_protocol::v1::{GetAgentConfigRequest, GetAgentConfigResponse, RegisterAgentRequest};
+use bento_protocol::v1::guest_control_service_client::GuestControlServiceClient;
+use bento_protocol::v1::metadata_service_client::MetadataServiceClient;
+use bento_protocol::v1::{GetMetadataRequest, GetMetadataResponse, RegisterGuestRequest};
 use eyre::Context;
 use hyper_util::rt::TokioIo;
 use tokio::sync::Mutex;
@@ -12,48 +13,49 @@ use tower::service_fn;
 
 use crate::host::info::get_system_info;
 
-pub(crate) struct AgentControlClient {
-    client: AgentControlServiceClient<Channel>,
+pub(crate) struct GuestControlClient {
+    control: GuestControlServiceClient<Channel>,
+    metadata: MetadataServiceClient<Channel>,
 }
 
-impl AgentControlClient {
+impl GuestControlClient {
     pub(crate) async fn connect(port: u32) -> eyre::Result<Self> {
+        let channel = connect_guest_services_channel(port).await?;
         Ok(Self {
-            client: connect_agent_control_client(port).await?,
+            control: GuestControlServiceClient::new(channel.clone()),
+            metadata: MetadataServiceClient::new(channel),
         })
     }
 
     pub(crate) async fn register(&mut self) -> eyre::Result<()> {
-        let system_info = get_system_info().context("collect system info for agent register")?;
+        let system_info = get_system_info().context("collect system info for guest register")?;
         let response = self
-            .client
-            .register(RegisterAgentRequest {
-                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            .control
+            .register(RegisterGuestRequest {
+                guest_service_version: env!("CARGO_PKG_VERSION").to_string(),
                 system_info: Some(system_info),
             })
             .await
-            .context("register guest agent")?
+            .context("register guest service")?
             .into_inner();
 
         if !response.accepted {
-            eyre::bail!("agent registration rejected: {}", response.message);
+            eyre::bail!("guest service registration rejected: {}", response.message);
         }
 
         Ok(())
     }
 
-    pub(crate) async fn get_config(&mut self) -> eyre::Result<GetAgentConfigResponse> {
-        self.client
-            .get_config(GetAgentConfigRequest {})
+    pub(crate) async fn get_metadata(&mut self) -> eyre::Result<GetMetadataResponse> {
+        self.metadata
+            .get_metadata(GetMetadataRequest {})
             .await
             .map(|response| response.into_inner())
-            .context("fetch guest agent config")
+            .context("fetch guest metadata")
     }
 }
 
-async fn connect_agent_control_client(
-    port: u32,
-) -> eyre::Result<AgentControlServiceClient<Channel>> {
+async fn connect_guest_services_channel(port: u32) -> eyre::Result<Channel> {
     let stream = VsockStream::connect(VsockAddr::new(VMADDR_CID_HOST, port)).await?;
     let stream_slot = Arc::new(Mutex::new(Some(stream)));
     let connector = service_fn(move |_| {
@@ -65,17 +67,15 @@ async fn connect_agent_control_client(
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotConnected,
-                        "agent control connector stream already consumed",
+                        "guest services connector stream already consumed",
                     )
                 })
                 .map(TokioIo::new)
         }
     });
 
-    let channel = Endpoint::from_static("http://agent-control.local")
+    Endpoint::from_static("http://guest-services.local")
         .connect_with_connector(connector)
         .await
-        .context("connect agent control rpc client")?;
-
-    Ok(AgentControlServiceClient::new(channel))
+        .context("connect guest services rpc client")
 }

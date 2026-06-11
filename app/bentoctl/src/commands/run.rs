@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
-use std::time::Duration;
 
-use bento_agent_spec::DEFAULT_AGENT_TIMEOUT_SECONDS;
-use bento_libvm::{CreateMachineRequest, LibVm, MachineRef, RequestedNetwork};
+use bento_libvm::{
+    CreateMachineRequest, LibVm, MachineRef, RequestedNetwork, DEFAULT_GUEST_READINESS_TIMEOUT,
+};
 use bento_vm_spec::Mount;
 use clap::Args;
 
@@ -75,7 +75,6 @@ impl Cmd {
             initramfs: boot_assets.initramfs,
             disk_size_bytes: resolved.disk_size_bytes,
             nested_virtualization: resolved.nested_virtualization,
-            agent: true,
             rosetta: resolved.rosetta,
             userdata: resolved.userdata,
             disks: resolved.disks,
@@ -85,16 +84,11 @@ impl Cmd {
 
         let machine = libvm.create_from_base_image(request).await?;
         let machine_ref = MachineRef::Id(machine.id);
-        let machine = libvm.start(&machine_ref).await?;
-        if machine.agent_enabled() {
-            libvm
-                .wait_for_guest_running(
-                    &machine_ref,
-                    Duration::from_secs(DEFAULT_AGENT_TIMEOUT_SECONDS),
-                )
-                .await
-                .map_err(|err| eyre::eyre!("guest readiness check failed: {err}"))?;
-        }
+        libvm.start(&machine_ref).await?;
+        libvm
+            .wait_for_guest_running(&machine_ref, DEFAULT_GUEST_READINESS_TIMEOUT)
+            .await
+            .map_err(|err| eyre::eyre!("guest readiness check failed: {err}"))?;
 
         let status = if self.command.is_empty() {
             ssh::run_remote_shell_status(&resolved.name, None)?
@@ -244,7 +238,6 @@ mod tests {
             "--disk-size",
             "40gb",
             "--nested-virtualization",
-            "--agent",
             "--rosetta",
             "--userdata",
             "./user-data.yaml",
@@ -271,7 +264,6 @@ mod tests {
             Some(40_000_000_000)
         );
         assert!(run.overrides.nested_virtualization);
-        assert!(run.overrides.agent);
         assert!(run.overrides.rosetta);
         assert_eq!(run.overrides.disks.len(), 1);
         assert_eq!(run.overrides.mounts.len(), 1);

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use bento_agent_spec::SSH_VSOCK_PORT;
-use bento_protocol::agent_port_arg;
+use bento_protocol::guest_port_arg;
 use bento_utils::parse_mac;
 use bento_virt::{
     DiskImage, MachineIdentifier, SharedDirectory, VirtError, VmConfig, VmConfigBuilder, VsockPort,
@@ -10,8 +10,8 @@ use bento_virt::{
 use bento_vm_spec::{VmSpec, VsockEndpointMode};
 use thiserror::Error;
 
-use crate::agent::AGENT_CONTROL_PORT;
 use crate::ext::VmSpecExt;
+use crate::guest::GUEST_CONTROL_PORT;
 
 const APPLE_MACHINE_IDENTIFIER_FILE: &str = "apple-machine-id";
 
@@ -39,7 +39,7 @@ pub(crate) struct VmSpecInputs<'a> {
     pub data_dir: &'a Path,
     pub spec: &'a VmSpec,
     pub network: &'a RuntimeNetwork,
-    pub agent_enabled: bool,
+    pub guest_services_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +60,10 @@ pub(crate) fn vm_spec_machine_config(
     let mut builder = VmConfig::builder(inputs.name)
         .vm_id(inputs.id)
         .base_directory(inputs.data_dir.to_path_buf())
-        .kernel_cmdline(vm_spec_kernel_cmdline(inputs.spec, inputs.agent_enabled))
+        .kernel_cmdline(vm_spec_kernel_cmdline(
+            inputs.spec,
+            inputs.guest_services_enabled,
+        ))
         .nested_virtualization(inputs.spec.nested_virtualization_or_default())
         .rosetta(inputs.spec.rosetta_or_default());
 
@@ -103,7 +106,7 @@ pub(crate) fn vm_spec_machine_config(
         });
     }
 
-    for port in vm_spec_vsock_ports(inputs.spec, inputs.agent_enabled) {
+    for port in vm_spec_vsock_ports(inputs.spec, inputs.guest_services_enabled) {
         builder = builder.vsock_port(port);
     }
 
@@ -113,7 +116,7 @@ pub(crate) fn vm_spec_machine_config(
     })
 }
 
-fn vm_spec_vsock_ports(spec: &VmSpec, agent_enabled: bool) -> Vec<VsockPort> {
+fn vm_spec_vsock_ports(spec: &VmSpec, guest_services_enabled: bool) -> Vec<VsockPort> {
     let mut ports = Vec::new();
     if let Some(vsock) = spec.vsock.as_ref() {
         for endpoint in &vsock.endpoints {
@@ -124,9 +127,9 @@ fn vm_spec_vsock_ports(spec: &VmSpec, agent_enabled: bool) -> Vec<VsockPort> {
         }
     }
 
-    if agent_enabled {
+    if guest_services_enabled {
         ports.push(VsockPort {
-            port: AGENT_CONTROL_PORT,
+            port: GUEST_CONTROL_PORT,
             mode: VsockPortMode::Listen,
         });
         ports.push(VsockPort {
@@ -138,15 +141,15 @@ fn vm_spec_vsock_ports(spec: &VmSpec, agent_enabled: bool) -> Vec<VsockPort> {
     ports
 }
 
-fn vm_spec_kernel_cmdline(spec: &VmSpec, agent_enabled: bool) -> Vec<String> {
+fn vm_spec_kernel_cmdline(spec: &VmSpec, guest_services_enabled: bool) -> Vec<String> {
     let mut kernel_cmdline = spec
         .boot
         .as_ref()
         .and_then(|boot| boot.kernel.as_ref())
         .map(|kernel| kernel.cmdline.clone())
         .unwrap_or_default();
-    if agent_enabled {
-        kernel_cmdline.push(agent_port_arg(AGENT_CONTROL_PORT));
+    if guest_services_enabled {
+        kernel_cmdline.push(guest_port_arg(GUEST_CONTROL_PORT));
     }
     kernel_cmdline
 }
@@ -394,7 +397,7 @@ mod tests {
             data_dir: &dir,
             spec: &spec,
             network: &RuntimeNetwork::None,
-            agent_enabled: true,
+            guest_services_enabled: true,
         })
         .expect("machine config should resolve");
 
@@ -402,7 +405,7 @@ mod tests {
             machine_config.config.kernel_cmdline,
             vec![
                 "console=hvc0".to_string(),
-                "bento.agent.port=1027".to_string()
+                "bento.guest.port=1027".to_string()
             ]
         );
         assert_eq!(machine_config.config.vm_id(), "vm123");
@@ -433,7 +436,7 @@ mod tests {
             data_dir: &dir,
             spec: &spec,
             network: &RuntimeNetwork::None,
-            agent_enabled: false,
+            guest_services_enabled: false,
         })
         .expect("machine config should resolve");
 
@@ -467,7 +470,7 @@ mod tests {
             data_dir: &dir,
             spec: &spec,
             network: &RuntimeNetwork::None,
-            agent_enabled: false,
+            guest_services_enabled: false,
         })
         .expect("machine config should resolve");
 
@@ -496,7 +499,7 @@ mod tests {
             data_dir: &dir,
             spec: &spec,
             network: &runtime_network,
-            agent_enabled: false,
+            guest_services_enabled: false,
         })
         .expect("machine config should resolve");
 
@@ -525,7 +528,7 @@ mod tests {
             data_dir: &dir,
             spec: &spec,
             network: &RuntimeNetwork::None,
-            agent_enabled: false,
+            guest_services_enabled: false,
         })
         .expect("machine config should resolve");
 
@@ -553,7 +556,7 @@ mod tests {
             data_dir: &dir,
             spec: &spec,
             network: &RuntimeNetwork::None,
-            agent_enabled: false,
+            guest_services_enabled: false,
         })
         .expect("machine config should resolve");
 
@@ -574,7 +577,7 @@ mod tests {
             data_dir: &dir,
             spec: &spec,
             network: &RuntimeNetwork::None,
-            agent_enabled: false,
+            guest_services_enabled: false,
         })
         .expect_err("missing kernel path should fail");
 

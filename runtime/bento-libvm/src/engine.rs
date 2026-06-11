@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::launch::prepare_instance_runtime;
 use crate::root_disk::{clone_or_copy_root_disk, resize_raw_disk};
@@ -31,7 +31,6 @@ use crate::{Layout, LibVmError, MachineId};
 const DEFAULT_IMAGE_CPUS: u8 = 1;
 const DEFAULT_IMAGE_MEMORY_MIB: u32 = 512;
 const ROOT_DISK_KERNEL_ARG: &str = "root=/dev/vda";
-const AGENT_ENABLED_METADATA_KEY: &str = "io.bentobox.agent.enabled";
 const ENV_VM_STARTPIPE: &str = "_VM_STARTPIPE";
 const ENV_VM_SYNCPIPE: &str = "_VM_SYNCPIPE";
 
@@ -48,7 +47,6 @@ pub struct CreateMachineRequest {
     pub initramfs: Option<PathBuf>,
     pub disk_size_bytes: Option<u64>,
     pub nested_virtualization: bool,
-    pub agent: bool,
     pub rosetta: bool,
     pub userdata: Option<String>,
     pub disks: Vec<PathBuf>,
@@ -76,10 +74,6 @@ pub struct MachineRecord {
 impl MachineRecord {
     pub fn is_running(&self) -> bool {
         self.state.is_running()
-    }
-
-    pub fn agent_enabled(&self) -> bool {
-        metadata_agent_enabled(&self.metadata)
     }
 }
 
@@ -223,15 +217,13 @@ impl LibVm {
 
         let network = request.network.unwrap_or_default();
         self.validate_requested_network(&network).await?;
-        let metadata = metadata_with_agent_flag(request.metadata, request.agent);
-
         let pending = self
             .create_pending(
                 request.name.clone(),
                 spec,
                 request.image_ref.clone(),
                 request.labels,
-                metadata,
+                request.metadata,
                 network,
             )
             .await?;
@@ -409,14 +401,12 @@ impl LibVm {
 
         let resolved_network = prepare_network_runtime(&self.layout, &self.db, &metadata).await?;
         let mut spec = metadata.config.clone();
-        let agent_enabled = metadata_agent_enabled(&metadata.metadata);
         prepare_instance_runtime(
             &self.layout,
             Path::new(&metadata.instance_dir),
             &metadata.name,
             &mut spec,
             &resolved_network,
-            agent_enabled,
         )
         .map_err(|err| LibVmError::InstancePreparationFailed {
             reference: metadata.name.clone(),
@@ -431,8 +421,8 @@ impl LibVm {
         let socket_path = self.layout.monitor_socket_path(metadata.id);
         let trace_path = self.layout.monitor_trace_path(metadata.id);
         let serial_log_path = self.layout.monitor_serial_log_path(metadata.id);
-        let agent_config_path = agent_enabled
-            .then(|| Path::new(&metadata.instance_dir).join(InstanceFile::AgentConfig.as_str()));
+        let metadata_config_path =
+            Path::new(&metadata.instance_dir).join(InstanceFile::MetadataConfig.as_str());
         let launch = VmmonLaunch {
             machine_id: metadata.id,
             name: &metadata.name,
@@ -443,7 +433,8 @@ impl LibVm {
             serial_log: &serial_log_path,
             trace_log: &trace_path,
             network: &resolved_network,
-            agent_config: agent_config_path.as_deref(),
+            metadata_config: &metadata_config_path,
+            wait_for_registration: monitor::DEFAULT_GUEST_READINESS_TIMEOUT,
         };
         let handshake = match spawn_vmmon(&launch) {
             Ok(handshake) => handshake,
@@ -588,20 +579,16 @@ impl LibVm {
         }
 
         if wait_for_guest_readiness {
-            let machine_record = self.machine_record(metadata.clone())?;
-
-            if machine_record.agent_enabled() {
-                monitor::wait_for_shell_with_timeout(
-                    &socket_path,
-                    std::time::Duration::from_secs(bento_agent_spec::DEFAULT_AGENT_TIMEOUT_SECONDS),
-                    std::time::Duration::from_secs(1),
-                )
-                .await
-                .map_err(|message| LibVmError::MonitorProtocol {
-                    reference: metadata.name.clone(),
-                    message,
-                })?;
-            }
+            monitor::wait_for_shell_with_timeout(
+                &socket_path,
+                monitor::DEFAULT_GUEST_READINESS_TIMEOUT,
+                Duration::from_secs(1),
+            )
+            .await
+            .map_err(|message| LibVmError::MonitorProtocol {
+                reference: metadata.name.clone(),
+                message,
+            })?;
         }
 
         monitor::open_shell_stream(&socket_path)
@@ -827,24 +814,6 @@ fn write_machine_config(instance_dir: &Path, name: &str, spec: &VmSpec) -> Resul
     Ok(())
 }
 
-fn metadata_with_agent_flag(
-    mut metadata: BTreeMap<String, String>,
-    agent_enabled: bool,
-) -> BTreeMap<String, String> {
-    if agent_enabled {
-        metadata.insert(AGENT_ENABLED_METADATA_KEY.to_string(), "true".to_string());
-    } else {
-        metadata.remove(AGENT_ENABLED_METADATA_KEY);
-    }
-    metadata
-}
-
-fn metadata_agent_enabled(metadata: &BTreeMap<String, String>) -> bool {
-    metadata
-        .get(AGENT_ENABLED_METADATA_KEY)
-        .is_some_and(|value| value == "true")
-}
-
 fn assign_mount_tags(mounts: Vec<Mount>) -> Vec<Mount> {
     mounts
         .into_iter()
@@ -904,7 +873,8 @@ struct VmmonLaunch<'a> {
     serial_log: &'a Path,
     trace_log: &'a Path,
     network: &'a RuntimeNetwork,
-    agent_config: Option<&'a Path>,
+    metadata_config: &'a Path,
+    wait_for_registration: Duration,
 }
 
 fn spawn_vmmon(launch: &VmmonLaunch<'_>) -> Result<VmmonHandshake, LibVmError> {
@@ -930,10 +900,11 @@ fn spawn_vmmon(launch: &VmmonLaunch<'_>) -> Result<VmmonHandshake, LibVmError> {
         .arg("--trace-log")
         .arg(launch.trace_log)
         .arg("--network")
-        .arg(launch.network.to_vmmon_arg());
-    if let Some(path) = launch.agent_config {
-        command.arg("--agent-config").arg(path);
-    }
+        .arg(launch.network.to_vmmon_arg())
+        .arg("--metadata-config")
+        .arg(launch.metadata_config)
+        .arg("--wait-for-registration")
+        .arg(launch.wait_for_registration.as_secs().to_string());
     command
         .env(ENV_VM_STARTPIPE, start_read.as_raw_fd().to_string())
         .env(ENV_VM_SYNCPIPE, sync_write.as_raw_fd().to_string());
@@ -1309,7 +1280,6 @@ mod tests {
             initramfs: None,
             disk_size_bytes: None,
             nested_virtualization: false,
-            agent: false,
             rosetta: false,
             userdata: None,
             disks: Vec::new(),

@@ -44,7 +44,7 @@ use crate::port::from_kernel_cmdline;
 #[cfg(target_os = "linux")]
 use crate::provision::run_provisioning;
 #[cfg(target_os = "linux")]
-use crate::rpc::AgentControlClient;
+use crate::rpc::GuestControlClient;
 #[cfg(target_os = "linux")]
 use crate::server::VsockServer;
 
@@ -98,11 +98,16 @@ async fn main() -> eyre::Result<()> {
     reject_unexpected_args()?;
 
     let control_port = from_kernel_cmdline();
-    let mut control = AgentControlClient::connect(control_port).await?;
+    let mut control = GuestControlClient::connect(control_port).await?;
 
-    let config_response = control.get_config().await?;
-    let agent_config: AgentConfig = serde_json::from_str(&config_response.config)
-        .context("parse agent config returned by vmmon")?;
+    let metadata_response = control.get_metadata().await?;
+    let metadata_config = metadata_response
+        .config
+        .ok_or_else(|| eyre::eyre!("guest metadata response did not include a config object"))?;
+    let metadata_json = bento_protocol::protobuf_struct_to_serde_json(metadata_config)
+        .context("decode metadata config returned by vmmon")?;
+    let agent_config: AgentConfig =
+        serde_json::from_value(metadata_json).context("parse metadata config returned by vmmon")?;
 
     run_provisioning(&agent_config.provision)?;
 

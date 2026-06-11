@@ -63,10 +63,6 @@ async fn ensure_guest_ready(
     libvm: &LibVm,
     machine: &bento_libvm::MachineRecord,
 ) -> eyre::Result<()> {
-    if !machine.agent_enabled() {
-        bail!("instance has no guest agent configured, cannot run remote commands");
-    }
-
     let status = libvm.get_status(&MachineRef::Id(machine.id)).await?;
     let guest_state =
         LifecycleState::try_from(status.guest_state).unwrap_or(LifecycleState::Unspecified);
@@ -77,7 +73,7 @@ async fn ensure_guest_ready(
         } else {
             status.summary
         };
-        bail!("guest agent is not ready: {summary}");
+        bail!("guest service is not ready: {summary}");
     }
 
     Ok(())

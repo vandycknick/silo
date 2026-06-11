@@ -308,7 +308,9 @@ dependencies = [
 name = "bento-agent-spec"
 version = "0.1.0"
 dependencies = [
+ "bento-protocol",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
 ]
 
@@ -449,6 +451,7 @@ dependencies = [
  "postcard",
  "prost",
  "prost-build",
+ "prost-types",
  "protoc-bin-vendored",
  "serde",
  "serde_json",

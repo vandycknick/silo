@@ -10,7 +10,6 @@ use crate::constants::PROFILE_METADATA_KEY;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GuestConfigStatus {
-    enabled: bool,
     bootstrap: bool,
     initramfs_present: bool,
 }
@@ -62,10 +61,7 @@ impl Cmd {
         print_process(machine.state, machine.started_at);
 
         if !machine.is_running() {
-            print_guest(
-                None,
-                guest_config_status(&machine.spec, machine.agent_enabled(), &machine.dir),
-            );
+            print_guest(None, guest_config_status(&machine.spec, &machine.dir));
             println!("ready: no");
             return Ok(());
         }
@@ -75,7 +71,7 @@ impl Cmd {
         println!("vm: {}", lifecycle_label(status.vm_state));
         print_guest(
             Some((lifecycle_label(status.guest_state), status.ready)),
-            guest_config_status(&machine.spec, machine.agent_enabled(), &machine.dir),
+            guest_config_status(&machine.spec, &machine.dir),
         );
         println!("ready: {}", if status.ready { "yes" } else { "no" });
         if !status.summary.is_empty() {
@@ -86,13 +82,8 @@ impl Cmd {
     }
 }
 
-fn guest_config_status(
-    spec: &VmSpec,
-    agent_enabled: bool,
-    machine_dir: &std::path::Path,
-) -> GuestConfigStatus {
+fn guest_config_status(spec: &VmSpec, machine_dir: &std::path::Path) -> GuestConfigStatus {
     GuestConfigStatus {
-        enabled: agent_enabled,
         bootstrap: spec
             .boot
             .as_ref()
@@ -140,7 +131,6 @@ fn print_guest(runtime: Option<(&str, bool)>, config: GuestConfigStatus) {
         }
     }
     println!("  settings:");
-    println!("    enabled: {}", yes_no(config.enabled));
     println!("    bootstrap: {}", yes_no(config.bootstrap));
     println!(
         "    initramfs: {}",
@@ -290,27 +280,25 @@ mod tests {
     }
 
     #[test]
-    fn guest_config_status_reports_disabled_guest_without_agent_port() {
-        let dir = temp_dir("disabled");
+    fn guest_config_status_reports_missing_initramfs() {
+        let dir = temp_dir("missing-initramfs");
         fs::create_dir_all(&dir).expect("create temp dir");
 
-        let config = guest_config_status(&sample_spec(false, false), false, &dir);
+        let config = guest_config_status(&sample_spec(false, false), &dir);
 
-        assert!(!config.enabled);
         assert!(!config.initramfs_present);
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn guest_config_status_reports_agent_and_initramfs_when_present() {
+    fn guest_config_status_reports_initramfs_when_present() {
         let dir = temp_dir("enabled");
         fs::create_dir_all(&dir).expect("create temp dir");
         fs::write(dir.join("initramfs"), b"initramfs").expect("write initramfs marker");
 
-        let config = guest_config_status(&sample_spec(true, false), true, &dir);
+        let config = guest_config_status(&sample_spec(true, false), &dir);
 
-        assert!(config.enabled);
         assert!(config.initramfs_present);
 
         let _ = fs::remove_dir_all(&dir);

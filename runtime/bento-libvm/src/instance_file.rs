@@ -7,7 +7,7 @@ pub enum InstanceFile {
     SerialLog,
     RootDisk,
     Initramfs,
-    AgentConfig,
+    MetadataConfig,
 }
 
 impl InstanceFile {
@@ -20,7 +20,7 @@ impl InstanceFile {
             Self::SerialLog => "serial.log",
             Self::RootDisk => "rootfs.img",
             Self::Initramfs => "initramfs",
-            Self::AgentConfig => "agent.json",
+            Self::MetadataConfig => "metadata.json",
         }
     }
 }

@@ -3,7 +3,10 @@ use std::io::{self, Read, Write};
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
+use bento_protocol::prost_types::Struct;
+use bento_protocol::serde_json_to_protobuf_struct;
 use bento_virt::VirtualMachine;
 use bento_vm_spec::VmSpec;
 use eyre::Context;
@@ -129,11 +132,13 @@ pub async fn init(
     machine_id: &str,
     name: &str,
     network_args: &[String],
-    agent_config_path: Option<&Path>,
+    metadata_config_path: Option<&Path>,
+    wait_for_registration: Duration,
     start_gate: &mut StartGate,
 ) -> eyre::Result<DaemonContext> {
     let spec = load_spec(runtime)?;
-    let agent_config = load_agent_config(agent_config_path)?;
+    let metadata_config = load_metadata_config(metadata_config_path)?;
+    let guest_services_enabled = metadata_config.is_some() || !wait_for_registration.is_zero();
     let network = parse_network_args(network_args)?;
 
     tracing::info!(instance = %name, "vmmon starting");
@@ -145,7 +150,7 @@ pub async fn init(
         data_dir: runtime.dir(),
         spec: &spec,
         network: &network,
-        agent_enabled: agent_config.is_some(),
+        guest_services_enabled,
     })?;
     let machine = VirtualMachine::new(machine_config.config)?;
     if let Some(machine_identifier) = machine_config.machine_identifier.as_ref() {
@@ -165,7 +170,9 @@ pub async fn init(
 
     Ok(DaemonContext {
         spec,
-        agent_config,
+        metadata_config,
+        guest_services_enabled,
+        wait_for_registration,
         machine,
         serial_console,
         store,
@@ -180,14 +187,18 @@ fn load_spec(runtime: &RuntimeContext) -> eyre::Result<VmSpec> {
         .map_err(|err| eyre::eyre!("parse vm spec at {}: {}", runtime.config().display(), err))
 }
 
-fn load_agent_config(path: Option<&Path>) -> eyre::Result<Option<String>> {
+fn load_metadata_config(path: Option<&Path>) -> eyre::Result<Option<Struct>> {
     let Some(path) = path else {
         return Ok(None);
     };
 
-    std::fs::read_to_string(path)
+    let raw = std::fs::read_to_string(path)
+        .wrap_err_with(|| format!("read metadata config at {}", path.display()))?;
+    let value = serde_json::from_str(&raw)
+        .map_err(|err| eyre::eyre!("parse metadata config at {}: {err}", path.display()))?;
+    serde_json_to_protobuf_struct(value)
         .map(Some)
-        .wrap_err_with(|| format!("read agent config at {}", path.display()))
+        .map_err(|err| eyre::eyre!("validate metadata config at {}: {err}", path.display()))
 }
 
 fn parse_network_args(values: &[String]) -> eyre::Result<RuntimeNetwork> {

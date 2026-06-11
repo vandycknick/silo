@@ -120,14 +120,14 @@ impl Action {
     pub(crate) fn guest_starting() -> Self {
         Self::GuestTransition {
             state: LifecycleState::Starting,
-            message: String::from("waiting for guest agent"),
+            message: String::from("waiting for guest service registration"),
         }
     }
 
     pub(crate) fn guest_running() -> Self {
         Self::GuestTransition {
             state: LifecycleState::Running,
-            message: String::from("guest agent registered"),
+            message: String::from("guest service registered"),
         }
     }
 
