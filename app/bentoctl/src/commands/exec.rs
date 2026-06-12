@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter};
 
-use bento_libvm::{LibVm, MachineRef};
+use bento_libvm::{Machine, MachineRef, Runtime};
 use clap::Args;
 use eyre::bail;
 
@@ -40,30 +40,28 @@ impl Display for Cmd {
 }
 
 impl Cmd {
-    pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
+    pub async fn run(&self, libvm: &Runtime) -> eyre::Result<()> {
         let machine = libvm
-            .inspect(&MachineRef::parse(self.name.clone())?)
+            .get_machine(&MachineRef::parse(self.name.clone())?)
             .await?;
+        let inspection = machine.inspect().await?;
 
-        if !machine.is_running() {
+        if !inspection.state.status.is_running() {
             return Err(bento_libvm::LibVmError::MachineNotRunning {
                 reference: self.name.clone(),
             }
             .into());
         }
 
-        ensure_guest_ready(libvm, &machine).await?;
+        ensure_guest_ready(&machine).await?;
 
         let status = ssh::run_remote_command(&self.name, self.user.as_deref(), &self.command)?;
         std::process::exit(status.code().unwrap_or(1));
     }
 }
 
-async fn ensure_guest_ready(
-    libvm: &LibVm,
-    machine: &bento_libvm::MachineRecord,
-) -> eyre::Result<()> {
-    let status = libvm.get_status(&MachineRef::Id(machine.id)).await?;
+async fn ensure_guest_ready(machine: &Machine) -> eyre::Result<()> {
+    let status = machine.get_status().await?;
     let guest_state =
         LifecycleState::try_from(status.guest_state).unwrap_or(LifecycleState::Unspecified);
 

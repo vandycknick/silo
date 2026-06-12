@@ -2,7 +2,7 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::time::Duration;
 
-use bento_libvm::{LibVm, MachineRef};
+use bento_libvm::{MachineRef, Runtime};
 use clap::Args;
 use eyre::Context;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -24,9 +24,12 @@ impl Display for Cmd {
 }
 
 impl Cmd {
-    pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
-        let stream = libvm
-            .open_shell_stream(&MachineRef::parse(self.name.clone())?, true)
+    pub async fn run(&self, libvm: &Runtime) -> eyre::Result<()> {
+        let machine = libvm
+            .get_machine(&MachineRef::parse(self.name.clone())?)
+            .await?;
+        let stream = machine
+            .open_shell_stream(true)
             .await
             .context("open negotiated shell stream")?;
         proxy_stdio(stream).await

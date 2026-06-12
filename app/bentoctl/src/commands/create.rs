@@ -1,4 +1,4 @@
-use bento_libvm::{CreateMachineRequest, LibVm, MachineRef, RequestedNetwork};
+use bento_libvm::{MachineCreate, RequestedNetwork, Runtime};
 use bento_utils::HumanSize;
 use bento_vm_spec::Mount;
 use clap::Args;
@@ -100,16 +100,19 @@ impl Display for Cmd {
 }
 
 impl Cmd {
-    pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
+    pub async fn run(&self, libvm: &Runtime) -> eyre::Result<()> {
         let mut resolved = self.resolve()?;
+        let layout = libvm
+            .local_layout()
+            .ok_or_else(|| eyre::eyre!("local runtime layout is unavailable"))?;
         let boot_assets = resolve_boot_assets(
-            libvm.layout().data_dir(),
+            layout.data_dir(),
             resolved.kernel.take(),
             resolved.initramfs.take(),
         );
         let base_rootfs = get_base_rootfs_image(libvm, &resolved.image_ref).await?;
         record_base_rootfs_metadata(&mut resolved.metadata, &base_rootfs);
-        let request = CreateMachineRequest {
+        let request = MachineCreate {
             image_ref: resolved.image_ref.clone(),
             base_rootfs_path: base_rootfs.path,
             name: self.name.clone(),
@@ -128,11 +131,11 @@ impl Cmd {
             network: Some(resolved.network),
         };
 
-        libvm.create_from_base_image(request).await?;
+        let machine = libvm.create_machine(request).await?;
         println!("created {}", self.name);
 
         if self.start {
-            libvm.start(&MachineRef::parse(self.name.clone())?).await?;
+            machine.start().await?;
         }
 
         Ok(())

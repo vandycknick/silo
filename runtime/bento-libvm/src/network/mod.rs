@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::global_config::GlobalConfig;
 use crate::models::{
-    Machine, NamedNetworkMode, NetworkDefinition, NetworkDriverKind, NetworkDriverPreference,
+    MachineConfig, NamedNetworkMode, NetworkDefinition, NetworkDriverKind, NetworkDriverPreference,
     NetworkInstance, RequestedNetwork,
 };
 use crate::store::{Database, Sqlite};
@@ -64,7 +64,7 @@ impl RuntimeNetwork {
 pub(crate) async fn prepare_network_runtime(
     layout: &Layout,
     db: &Sqlite,
-    metadata: &Machine,
+    metadata: &MachineConfig,
 ) -> Result<RuntimeNetwork, LibVmError> {
     reconcile_network_runtime(layout, db, metadata, false).await?;
 
@@ -117,7 +117,7 @@ pub(crate) async fn prepare_network_runtime(
 pub(crate) async fn reconcile_network_runtime(
     layout: &Layout,
     db: &Sqlite,
-    metadata: &Machine,
+    metadata: &MachineConfig,
     monitor_running: bool,
 ) -> Result<(), LibVmError> {
     let Some(attachment) = db.get_network_attachment(metadata.id).await? else {
@@ -150,7 +150,7 @@ pub(crate) async fn reconcile_network_runtime(
 async fn resolve_named_network(
     layout: &Layout,
     db: &Sqlite,
-    metadata: &Machine,
+    metadata: &MachineConfig,
     definition: &NetworkDefinition,
 ) -> Result<RuntimeNetwork, LibVmError> {
     let global_config = load_global_config(&metadata.name)?;

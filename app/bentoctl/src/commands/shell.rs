@@ -1,4 +1,4 @@
-use bento_libvm::{LibVm, MachineRef};
+use bento_libvm::{Machine, MachineRef, Runtime};
 use clap::{Args, ValueEnum};
 use eyre::bail;
 use std::fmt::{Display, Formatter};
@@ -53,11 +53,12 @@ impl Display for AttachMode {
 }
 
 impl Cmd {
-    pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
+    pub async fn run(&self, libvm: &Runtime) -> eyre::Result<()> {
         let machine_ref = MachineRef::parse(self.name.clone())?;
-        let machine = libvm.inspect(&machine_ref).await?;
+        let machine = libvm.get_machine(&machine_ref).await?;
+        let inspection = machine.inspect().await?;
 
-        if !machine.is_running() {
+        if !inspection.state.status.is_running() {
             return Err(bento_libvm::LibVmError::MachineNotRunning {
                 reference: self.name.clone(),
             }
@@ -69,29 +70,24 @@ impl Cmd {
                 if self.user.is_some() {
                     eprintln!("[bento] --user is ignored for serial attach");
                 }
-                let stream = libvm
-                    .open_serial_stream(&MachineRef::Id(machine.id))
-                    .await?;
+                let stream = machine.open_serial_stream().await?;
                 return terminal::attach_serial_stream(stream).await;
             }
             Some(AttachMode::Shell) => {
-                ensure_guest_ready(libvm, &machine).await?;
+                ensure_guest_ready(&machine).await?;
                 return ssh::exec_remote_shell(&self.name, self.user.as_deref());
             }
             None => {}
         }
 
-        ensure_guest_ready(libvm, &machine).await?;
+        ensure_guest_ready(&machine).await?;
 
         ssh::exec_remote_shell(&self.name, self.user.as_deref())
     }
 }
 
-async fn ensure_guest_ready(
-    libvm: &LibVm,
-    machine: &bento_libvm::MachineRecord,
-) -> eyre::Result<()> {
-    let status = libvm.get_status(&MachineRef::Id(machine.id)).await?;
+async fn ensure_guest_ready(machine: &Machine) -> eyre::Result<()> {
+    let status = machine.get_status().await?;
     let guest_state =
         LifecycleState::try_from(status.guest_state).unwrap_or(LifecycleState::Unspecified);
 

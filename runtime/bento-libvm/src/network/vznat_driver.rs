@@ -50,7 +50,7 @@ mod tests {
 
     use super::VzNatDriver;
     use crate::global_config::{NetdConfig, NetworkingConfig};
-    use crate::models::{Machine, NetworkDriverKind, RequestedNetwork};
+    use crate::models::{MachineConfig, NetworkDriverKind, RequestedNetwork};
     use crate::network::core::{NetworkDriver, NetworkDriverContext, NetworkRequest, NetworkScope};
     use crate::network::RuntimeNetwork;
     use crate::store::{Database, Sqlite};
@@ -59,13 +59,13 @@ mod tests {
 
     use crate::NetworkPolicyRef;
 
-    fn machine_from_path(id: MachineId, name: String, instance_dir: &Path) -> Machine {
-        let config = sample_vm_spec();
-        Machine {
+    fn machine_from_path(id: MachineId, name: String, instance_dir: &Path) -> MachineConfig {
+        let spec = sample_vm_spec();
+        MachineConfig {
             id,
             name,
-            config,
-            instance_dir: instance_dir.display().to_string(),
+            spec,
+            instance_dir: instance_dir.to_path_buf(),
             created_at: 1,
             modified_at: 1,
             image_ref: String::new(),

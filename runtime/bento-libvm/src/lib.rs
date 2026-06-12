@@ -18,14 +18,16 @@ mod store;
 mod vm_lock;
 
 pub use crate::certificate_authority::{ensure_certificate_authority, CertificateAuthority};
-pub use crate::engine::{CreateMachineRequest, LibVm, MachineRecord};
+pub use crate::engine::{
+    LocalRuntimeConfig, Machine, MachineCreate, Runtime, RuntimeConfig, RuntimeTarget,
+};
 pub use crate::error::LibVmError;
 pub use crate::instance_file::InstanceFile;
 pub use crate::layout::{resolve_default_data_dir, Layout, CONFIG_FILE_NAME, STATE_DB_FILE_NAME};
 pub use crate::machine_id::{looks_like_id_prefix, MachineId, MachineIdParseError, SHORT_ID_LEN};
 pub use crate::models::{
-    MachineRef, MachineRuntimeState, NamedNetworkMode, NetworkDefinition, NetworkDriverKind,
-    NetworkDriverPreference, RequestedNetwork,
+    MachineConfig, MachineInspect, MachineRef, MachineRuntimeState, MachineState, NamedNetworkMode,
+    NetworkDefinition, NetworkDriverKind, NetworkDriverPreference, RequestedNetwork,
 };
 pub use crate::monitor::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub use crate::mount_path::resolve_mount_location;

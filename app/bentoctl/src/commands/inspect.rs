@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter};
 
-use bento_libvm::{LibVm, MachineRef};
+use bento_libvm::{MachineRef, Runtime};
 use clap::Args;
 use serde_json::json;
 
@@ -24,52 +24,55 @@ impl Display for Cmd {
 }
 
 impl Cmd {
-    pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
+    pub async fn run(&self, libvm: &Runtime) -> eyre::Result<()> {
         let machine = libvm
-            .inspect(&MachineRef::parse(self.name.clone())?)
+            .get_machine(&MachineRef::parse(self.name.clone())?)
             .await?;
-        let state = if machine.is_running() {
+        let inspection = machine.inspect().await?;
+        let config = inspection.config;
+        let state = inspection.state;
+        let state = if state.status.is_running() {
             "running"
         } else {
             "stopped"
         };
-        let network_name = machine.network.name();
+        let network_name = config.network.name();
         if self.json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
-                    "id": machine.id.to_string(),
-                    "name": machine.name,
+                    "id": config.id.to_string(),
+                    "name": &config.name,
                     "state": state,
-                    "profile": machine.metadata.get(PROFILE_METADATA_KEY),
-                    "image": machine.image_ref,
-                    "labels": machine.labels,
-                    "metadata": machine.metadata,
-                    "network": machine.network.clone(),
-                    "created_at": machine.created_at,
-                    "dir": machine.dir,
-                    "spec": machine.spec,
+                    "profile": config.metadata.get(PROFILE_METADATA_KEY).cloned(),
+                    "image": &config.image_ref,
+                    "labels": &config.labels,
+                    "metadata": &config.metadata,
+                    "network": &config.network,
+                    "created_at": config.created_at,
+                    "dir": &config.instance_dir,
+                    "spec": &config.spec,
                 }))?
             );
             return Ok(());
         }
-        println!("id: {}", machine.id);
-        println!("name: {}", machine.name);
+        println!("id: {}", config.id);
+        println!("name: {}", config.name);
         println!("state: {state}");
-        if let Some(profile) = machine.metadata.get(PROFILE_METADATA_KEY) {
+        if let Some(profile) = config.metadata.get(PROFILE_METADATA_KEY) {
             println!("profile: {profile}");
         }
-        if !machine.image_ref.is_empty() {
-            println!("image: {}", machine.image_ref);
+        if !config.image_ref.is_empty() {
+            println!("image: {}", config.image_ref);
         }
         println!("network: {network_name}");
-        if !machine.labels.is_empty() {
+        if !config.labels.is_empty() {
             println!("labels:");
-            for (key, value) in machine.labels {
+            for (key, value) in config.labels {
                 println!("  {key}: {value}");
             }
         }
-        println!("dir: {}", machine.dir.display());
+        println!("dir: {}", config.instance_dir.display());
         Ok(())
     }
 }

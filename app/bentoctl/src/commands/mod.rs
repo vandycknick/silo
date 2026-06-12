@@ -1,4 +1,4 @@
-use bento_libvm::LibVm;
+use bento_libvm::Runtime;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::fmt::{Display, Formatter};
 
@@ -182,8 +182,8 @@ fn apply_help_template(command: clap::Command) -> clap::Command {
         .mut_subcommands(apply_help_template)
 }
 
-async fn libvm() -> eyre::Result<LibVm> {
-    LibVm::from_env().await.context("initialize bento-libvm")
+async fn libvm() -> eyre::Result<Runtime> {
+    Runtime::from_env().await.context("initialize bento-libvm")
 }
 
 #[cfg(test)]

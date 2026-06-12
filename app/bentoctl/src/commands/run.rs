@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
 use bento_libvm::{
-    CreateMachineRequest, LibVm, MachineRef, RequestedNetwork, DEFAULT_GUEST_READINESS_TIMEOUT,
+    MachineCreate, MachineRef, RequestedNetwork, Runtime, DEFAULT_GUEST_READINESS_TIMEOUT,
 };
 use bento_vm_spec::Mount;
 use clap::Args;
@@ -50,20 +50,23 @@ impl Display for Cmd {
 }
 
 impl Cmd {
-    pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
+    pub async fn run(&self, libvm: &Runtime) -> eyre::Result<()> {
         if self.keep_on_failure && self.command.is_empty() {
             eyre::bail!("--keep-on-failure requires a command");
         }
 
         let mut resolved = self.resolve(libvm).await?;
+        let layout = libvm
+            .local_layout()
+            .ok_or_else(|| eyre::eyre!("local runtime layout is unavailable"))?;
         let boot_assets = resolve_boot_assets(
-            libvm.layout().data_dir(),
+            layout.data_dir(),
             resolved.kernel.take(),
             resolved.initramfs.take(),
         );
         let base_rootfs = get_base_rootfs_image(libvm, &resolved.image_ref).await?;
         record_base_rootfs_metadata(&mut resolved.metadata, &base_rootfs);
-        let request = CreateMachineRequest {
+        let request = MachineCreate {
             image_ref: resolved.image_ref.clone(),
             base_rootfs_path: base_rootfs.path,
             name: resolved.name.clone(),
@@ -82,11 +85,10 @@ impl Cmd {
             network: Some(resolved.network),
         };
 
-        let machine = libvm.create_from_base_image(request).await?;
-        let machine_ref = MachineRef::Id(machine.id);
-        libvm.start(&machine_ref).await?;
-        libvm
-            .wait_for_guest_running(&machine_ref, DEFAULT_GUEST_READINESS_TIMEOUT)
+        let machine = libvm.create_machine(request).await?;
+        machine.start().await?;
+        machine
+            .wait_for_guest_running(DEFAULT_GUEST_READINESS_TIMEOUT)
             .await
             .map_err(|err| eyre::eyre!("guest readiness check failed: {err}"))?;
 
@@ -107,7 +109,7 @@ impl Cmd {
         std::process::exit(code);
     }
 
-    async fn resolve(&self, libvm: &LibVm) -> eyre::Result<ResolvedRun> {
+    async fn resolve(&self, libvm: &Runtime) -> eyre::Result<ResolvedRun> {
         if self.profile.is_some() && self.profile_name.is_some() {
             eyre::bail!("profile specified twice; use either positional profile or --profile");
         }
@@ -202,14 +204,16 @@ struct ResolvedRun {
     disks: Vec<std::path::PathBuf>,
 }
 
-async fn cleanup_ephemeral(libvm: &LibVm, name: &str) -> eyre::Result<()> {
-    let machine = MachineRef::parse(name.to_string())?;
-    match libvm.stop(&machine).await {
+async fn cleanup_ephemeral(libvm: &Runtime, name: &str) -> eyre::Result<()> {
+    let machine = libvm
+        .get_machine(&MachineRef::parse(name.to_string())?)
+        .await?;
+    match machine.stop().await {
         Ok(_) => {}
         Err(err) if err.to_string().contains("is not running") => {}
         Err(err) => return Err(err.into()),
     }
-    libvm.remove(&machine).await?;
+    machine.remove().await?;
     Ok(())
 }
 

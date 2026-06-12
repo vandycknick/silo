@@ -3,7 +3,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::time::Duration;
 
 use bento_libvm::InstanceFile;
-use bento_libvm::{LibVm, MachineRef};
+use bento_libvm::{MachineRef, Runtime};
 use clap::Args;
 
 #[derive(Args, Debug)]
@@ -24,11 +24,15 @@ impl Display for Cmd {
 }
 
 impl Cmd {
-    pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
+    pub async fn run(&self, libvm: &Runtime) -> eyre::Result<()> {
         let machine = libvm
-            .inspect(&MachineRef::parse(self.name.clone())?)
+            .get_machine(&MachineRef::parse(self.name.clone())?)
             .await?;
-        let path = machine.dir.join(InstanceFile::VmmonTraceLog.as_str());
+        let inspection = machine.inspect().await?;
+        let path = inspection
+            .config
+            .instance_dir
+            .join(InstanceFile::VmmonTraceLog.as_str());
         if !path.exists() {
             return Ok(());
         }

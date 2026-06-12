@@ -13,7 +13,7 @@ use tokio::time::sleep;
 use crate::certificate_authority;
 use crate::global_config::NetdConfig;
 use crate::layout::resolve_config_dir;
-use crate::models::{Machine, NetworkAttachment, NetworkInstance};
+use crate::models::{MachineConfig, NetworkAttachment, NetworkInstance};
 use crate::store::{Database, Sqlite};
 use crate::{Layout, LibVmError, MachineId, NetworkPolicyRef};
 
@@ -218,7 +218,7 @@ fn host_uses_user_network_runtime() -> bool {
 async fn attach_existing_runtime(
     layout: &Layout,
     db: &Sqlite,
-    metadata: &Machine,
+    metadata: &MachineConfig,
     instance: &NetworkInstance,
 ) -> Result<PreparedNetwork, LibVmError> {
     ensure_instance_network_link(layout, metadata.id, Path::new(&instance.runtime_dir))?;
@@ -311,7 +311,7 @@ fn validate_policy_ref(
 }
 
 fn resolve_network_policy_path(
-    metadata: &Machine,
+    metadata: &MachineConfig,
     policy_ref: Option<&NetworkPolicyRef>,
 ) -> Result<Option<PathBuf>, LibVmError> {
     policy_ref

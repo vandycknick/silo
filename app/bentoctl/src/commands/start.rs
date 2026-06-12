@@ -1,4 +1,4 @@
-use bento_libvm::{LibVm, MachineRef, DEFAULT_GUEST_READINESS_TIMEOUT};
+use bento_libvm::{MachineRef, Runtime, DEFAULT_GUEST_READINESS_TIMEOUT};
 use clap::Args;
 use std::fmt::{Display, Formatter};
 
@@ -17,12 +17,13 @@ impl Display for Cmd {
 }
 
 impl Cmd {
-    pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
+    pub async fn run(&self, libvm: &Runtime) -> eyre::Result<()> {
         let machine_ref = MachineRef::parse(self.name.clone())?;
-        let machine = libvm.start(&machine_ref).await?;
+        let machine = libvm.get_machine(&machine_ref).await?;
+        machine.start().await?;
 
-        libvm
-            .wait_for_guest_running(&MachineRef::Id(machine.id), DEFAULT_GUEST_READINESS_TIMEOUT)
+        machine
+            .wait_for_guest_running(DEFAULT_GUEST_READINESS_TIMEOUT)
             .await
             .map_err(|err| eyre::eyre!("guest readiness check failed: {err}"))?;
 

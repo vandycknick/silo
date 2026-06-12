@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use bento_libvm::LibVm;
+use bento_libvm::Runtime;
 use bento_ocidisk::{ImageStore, RootfsImage, RootfsOptions};
 use eyre::Context;
 
@@ -9,12 +9,15 @@ const IMAGE_PLATFORM_METADATA_KEY: &str = "bento.image.platform";
 const IMAGE_SOURCE_METADATA_KEY: &str = "bento.image.source";
 
 pub(crate) async fn get_base_rootfs_image(
-    libvm: &LibVm,
+    libvm: &Runtime,
     image_ref: &str,
 ) -> eyre::Result<RootfsImage> {
     let options = RootfsOptions::for_host().wrap_err("failed to select host OCI platform")?;
-    let store = ImageStore::open(libvm.layout().images_dir())
-        .wrap_err("failed to open Bento image cache")?;
+    let layout = libvm
+        .local_layout()
+        .ok_or_else(|| eyre::eyre!("local runtime layout is unavailable"))?;
+    let store =
+        ImageStore::open(layout.images_dir()).wrap_err("failed to open Bento image cache")?;
     store
         .get_or_create(image_ref, options)
         .await

@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-use bento_libvm::{LibVm, MachineRef};
+use bento_libvm::{MachineRef, Runtime};
 use bento_vm_spec::VmSpec;
 use clap::Args;
 use eyre::Context;
@@ -24,14 +24,16 @@ impl Display for Cmd {
 }
 
 impl Cmd {
-    pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
+    pub async fn run(&self, libvm: &Runtime) -> eyre::Result<()> {
         let machine_ref = MachineRef::parse(self.name.clone())?;
-        let machine = libvm.inspect(&machine_ref).await?;
-        if machine.is_running() {
-            eyre::bail!("VM `{}` is running; stop it before editing", machine.name);
+        let machine = libvm.get_machine(&machine_ref).await?;
+        let inspection = machine.inspect().await?;
+        let config = inspection.config;
+        if inspection.state.status.is_running() {
+            eyre::bail!("VM `{}` is running; stop it before editing", config.name);
         }
 
-        let edit_file = EditFile::create(&machine.name, &machine.spec)?;
+        let edit_file = EditFile::create(&config.name, &config.spec)?;
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
         let status = Command::new(editor).arg(edit_file.path()).status()?;
         if !status.success() {
@@ -42,8 +44,8 @@ impl Cmd {
             .with_context(|| format!("read edited config {}", edit_file.path().display()))?;
         let edited: VmSpec = serde_json::from_str(&raw)
             .with_context(|| format!("parse edited config {}", edit_file.path().display()))?;
-        let updated = libvm.replace_config(&machine_ref, edited).await?;
-        println!("updated {}", updated.name);
+        let updated = machine.replace_config(edited).await?;
+        println!("updated {}", updated.config.name);
         Ok(())
     }
 }

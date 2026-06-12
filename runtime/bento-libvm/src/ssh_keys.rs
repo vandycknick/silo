@@ -65,16 +65,10 @@ pub fn ensure_user_ssh_keys() -> eyre::Result<UserSshKeys> {
     })
 }
 
-#[cfg(unix)]
 fn set_public_key_permissions(path: &PathBuf) -> eyre::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let perms = fs::Permissions::from_mode(0o644);
     fs::set_permissions(path, perms)
         .with_context(|| format!("set permissions for {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_public_key_permissions(_path: &PathBuf) -> eyre::Result<()> {
-    Ok(())
 }

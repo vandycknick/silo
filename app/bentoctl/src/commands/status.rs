@@ -2,7 +2,7 @@ use clap::Args;
 use std::fmt::{Display, Formatter};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bento_libvm::{LibVm, MachineRef, MachineRuntimeState};
+use bento_libvm::{MachineRef, MachineRuntimeState, Runtime};
 use bento_protocol::v1::LifecycleState;
 use bento_vm_spec::VmSpec;
 
@@ -32,46 +32,52 @@ impl Display for Cmd {
 }
 
 impl Cmd {
-    pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
+    pub async fn run(&self, libvm: &Runtime) -> eyre::Result<()> {
         let machine_ref = MachineRef::parse(self.name.clone())?;
-        let machine = libvm.inspect(&machine_ref).await?;
+        let machine = libvm.get_machine(&machine_ref).await?;
+        let inspection = machine.inspect().await?;
+        let config = inspection.config;
+        let state = inspection.state;
         if self.json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "name": machine.name,
-                    "state": process_status_label(machine.state),
-                    "profile": machine.metadata.get(PROFILE_METADATA_KEY),
-                    "image": machine.image_ref,
-                    "network": machine.network.clone(),
-                    "created_at": machine.created_at,
+                    "name": &config.name,
+                    "state": process_status_label(state.status),
+                    "profile": config.metadata.get(PROFILE_METADATA_KEY).cloned(),
+                    "image": &config.image_ref,
+                    "network": &config.network,
+                    "created_at": config.created_at,
                 }))?
             );
             return Ok(());
         }
 
-        println!("name: {}", machine.name);
-        if let Some(profile) = machine.metadata.get(PROFILE_METADATA_KEY) {
+        println!("name: {}", config.name);
+        if let Some(profile) = config.metadata.get(PROFILE_METADATA_KEY) {
             println!("profile: {profile}");
         }
-        if !machine.image_ref.is_empty() {
-            println!("image: {}", machine.image_ref);
+        if !config.image_ref.is_empty() {
+            println!("image: {}", config.image_ref);
         }
-        println!("network: {}", machine.network.name());
-        print_process(machine.state, machine.started_at);
+        println!("network: {}", config.network.name());
+        print_process(state.status, state.started_at);
 
-        if !machine.is_running() {
-            print_guest(None, guest_config_status(&machine.spec, &machine.dir));
+        if !state.status.is_running() {
+            print_guest(
+                None,
+                guest_config_status(&config.spec, &config.instance_dir),
+            );
             println!("ready: no");
             return Ok(());
         }
 
-        let status = libvm.get_status(&MachineRef::Id(machine.id)).await?;
+        let status = machine.get_status().await?;
 
         println!("vm: {}", lifecycle_label(status.vm_state));
         print_guest(
             Some((lifecycle_label(status.guest_state), status.ready)),
-            guest_config_status(&machine.spec, &machine.dir),
+            guest_config_status(&config.spec, &config.instance_dir),
         );
         println!("ready: {}", if status.ready { "yes" } else { "no" });
         if !status.summary.is_empty() {

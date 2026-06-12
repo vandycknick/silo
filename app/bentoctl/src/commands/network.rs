@@ -2,8 +2,8 @@ use std::fmt::{Display, Formatter};
 use std::io::Write;
 
 use bento_libvm::{
-    LibVm, MachineRef, NamedNetworkMode, NetworkDefinition, NetworkDriverPreference,
-    NetworkPolicyRef, RequestedNetwork,
+    MachineRef, NamedNetworkMode, NetworkDefinition, NetworkDriverPreference, NetworkPolicyRef,
+    RequestedNetwork, Runtime,
 };
 use clap::{Args, Subcommand};
 use tabwriter::TabWriter;
@@ -94,7 +94,7 @@ pub struct SetCmd {
 }
 
 impl Cmd {
-    pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
+    pub async fn run(&self, libvm: &Runtime) -> eyre::Result<()> {
         match &self.command {
             NetworkSubcommand::List(cmd) => list_networks(libvm, cmd).await,
             NetworkSubcommand::Show(cmd) => show_network(libvm, cmd).await,
@@ -105,7 +105,7 @@ impl Cmd {
     }
 }
 
-async fn list_networks(libvm: &LibVm, cmd: &ListCmd) -> eyre::Result<()> {
+async fn list_networks(libvm: &Runtime, cmd: &ListCmd) -> eyre::Result<()> {
     let definitions = libvm.list_network_definitions().await?;
     if cmd.json {
         println!("{}", serde_json::to_string_pretty(&definitions)?);
@@ -127,7 +127,7 @@ async fn list_networks(libvm: &LibVm, cmd: &ListCmd) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn show_network(libvm: &LibVm, cmd: &ShowCmd) -> eyre::Result<()> {
+async fn show_network(libvm: &Runtime, cmd: &ShowCmd) -> eyre::Result<()> {
     let definition = libvm
         .get_network_definition(&cmd.name)
         .await?
@@ -140,7 +140,7 @@ async fn show_network(libvm: &LibVm, cmd: &ShowCmd) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn create_network(libvm: &LibVm, cmd: &CreateCmd) -> eyre::Result<()> {
+async fn create_network(libvm: &Runtime, cmd: &CreateCmd) -> eyre::Result<()> {
     let definition = NetworkDefinition {
         name: cmd.name.clone(),
         mode: cmd.mode,
@@ -151,7 +151,7 @@ async fn create_network(libvm: &LibVm, cmd: &CreateCmd) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn remove_network(libvm: &LibVm, cmd: &RmCmd) -> eyre::Result<()> {
+async fn remove_network(libvm: &Runtime, cmd: &RmCmd) -> eyre::Result<()> {
     if !cmd.force {
         eyre::bail!("refusing to remove network `{}` without --force", cmd.name);
     }
@@ -163,17 +163,19 @@ async fn remove_network(libvm: &LibVm, cmd: &RmCmd) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn set_machine_network(libvm: &LibVm, cmd: &SetCmd) -> eyre::Result<()> {
+async fn set_machine_network(libvm: &Runtime, cmd: &SetCmd) -> eyre::Result<()> {
     let network = requested_network_with_policy(cmd.network.clone(), cmd.policy.clone())?;
     let machine = libvm
-        .set_network(&MachineRef::parse(cmd.vm.clone())?, network)
+        .get_machine(&MachineRef::parse(cmd.vm.clone())?)
         .await?;
+    let inspection = machine.set_network(network).await?;
+    let config = inspection.config;
     println!(
         "network for {} set to {}",
-        machine.name,
-        machine.network.name()
+        config.name,
+        config.network.name()
     );
-    if machine.is_running() {
+    if inspection.state.status.is_running() {
         println!("change applies on next restart");
     }
     Ok(())

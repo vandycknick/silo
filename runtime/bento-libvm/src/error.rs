@@ -80,6 +80,13 @@ pub enum LibVmError {
         message: String,
     },
 
+    #[error("state database config mismatch for {field}: expected {expected:?}, found {actual:?}")]
+    StateDatabaseConfigMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 

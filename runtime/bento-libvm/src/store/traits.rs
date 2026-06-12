@@ -1,8 +1,5 @@
-use bento_vm_spec::VmSpec;
-
 use crate::models::{
-    Machine, MachineRuntime, NetworkAttachment, NetworkDefinition, NetworkInstance,
-    RequestedNetwork,
+    MachineConfig, MachineState, NetworkAttachment, NetworkDefinition, NetworkInstance,
 };
 use crate::{LibVmError, MachineId};
 
@@ -11,29 +8,29 @@ pub(crate) trait Database: Sized + Clone + Send + Sync + 'static {
 
     async fn new(settings: &Self::Settings) -> Result<Self, LibVmError>;
 
-    async fn insert_machine(&self, machine: &Machine) -> Result<(), LibVmError>;
-    async fn update_machine_network(
+    async fn insert_machine_config(&self, config: &MachineConfig) -> Result<(), LibVmError>;
+    async fn update_machine_config(&self, config: &MachineConfig) -> Result<(), LibVmError>;
+    async fn get_machine_config_by_id(
         &self,
-        machine_id: MachineId,
-        network: &RequestedNetwork,
-    ) -> Result<(), LibVmError>;
-    async fn update_machine_config(
+        id: MachineId,
+    ) -> Result<Option<MachineConfig>, LibVmError>;
+    async fn get_machine_config_by_name(
         &self,
-        machine_id: MachineId,
-        config: &VmSpec,
-    ) -> Result<(), LibVmError>;
-    async fn get_machine_by_id(&self, id: MachineId) -> Result<Option<Machine>, LibVmError>;
-    async fn get_machine_by_name(&self, name: &str) -> Result<Option<Machine>, LibVmError>;
-    async fn get_machine_by_id_prefix(&self, prefix: &str) -> Result<Vec<Machine>, LibVmError>;
-    async fn list_machines(&self) -> Result<Vec<Machine>, LibVmError>;
+        name: &str,
+    ) -> Result<Option<MachineConfig>, LibVmError>;
+    async fn get_machine_config_by_id_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<MachineConfig>, LibVmError>;
+    async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError>;
     async fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError>;
-    async fn remove_machine(&self, machine: &Machine) -> Result<(), LibVmError>;
-    async fn get_machine_runtime(
+    async fn remove_machine_config(&self, machine: &MachineConfig) -> Result<(), LibVmError>;
+    async fn get_machine_state(
         &self,
         machine_id: MachineId,
-    ) -> Result<Option<MachineRuntime>, LibVmError>;
-    async fn upsert_machine_runtime(&self, runtime: &MachineRuntime) -> Result<(), LibVmError>;
-    async fn remove_machine_runtime(&self, machine_id: MachineId) -> Result<(), LibVmError>;
+    ) -> Result<Option<MachineState>, LibVmError>;
+    async fn upsert_machine_state(&self, state: &MachineState) -> Result<(), LibVmError>;
+    async fn remove_machine_state(&self, machine_id: MachineId) -> Result<(), LibVmError>;
 
     async fn get_network_attachment(
         &self,

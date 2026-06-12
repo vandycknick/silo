@@ -1,7 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::io::Write;
 
-use bento_libvm::{LibVm, MachineRuntimeState};
+use bento_libvm::{MachineRuntimeState, Runtime};
 use clap::Args;
 use tabwriter::TabWriter;
 
@@ -22,22 +22,28 @@ impl Display for Cmd {
 }
 
 impl Cmd {
-    pub async fn run(&self, libvm: &LibVm) -> eyre::Result<()> {
-        let machines = libvm.list().await?;
+    pub async fn run(&self, libvm: &Runtime) -> eyre::Result<()> {
+        let machines = libvm.list_machines().await?;
+        let mut inspections = Vec::with_capacity(machines.len());
+        for machine in machines {
+            inspections.push(machine.inspect().await?);
+        }
         let host_arch = std::env::consts::ARCH;
         let now = now_unix();
 
         if self.json {
-            let values = machines
+            let values = inspections
                 .into_iter()
-                .map(|machine| {
+                .map(|inspection| {
+                    let config = inspection.config;
+                    let state = inspection.state;
                     serde_json::json!({
-                        "id": machine.id.to_string(),
-                        "name": machine.name,
-                        "state": state_label(machine.state),
-                        "profile": machine.metadata.get(PROFILE_METADATA_KEY),
-                        "image": machine.image_ref,
-                        "created_at": machine.created_at,
+                        "id": config.id.to_string(),
+                        "name": config.name,
+                        "state": state_label(state.status),
+                        "profile": config.metadata.get(PROFILE_METADATA_KEY).cloned(),
+                        "image": config.image_ref,
+                        "created_at": config.created_at,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -51,8 +57,10 @@ impl Cmd {
             "ID\tNAME\tSTATE\tPROFILE\tIMAGE\tCREATED\tARCH\tCPUS\tMEMORY"
         )?;
 
-        for machine in machines {
-            let hardware = machine.spec.hardware.as_ref();
+        for inspection in inspections {
+            let config = inspection.config;
+            let state = inspection.state;
+            let hardware = config.spec.hardware.as_ref();
             let cpus = hardware
                 .and_then(|hardware| hardware.cpus)
                 .unwrap_or(1)
@@ -61,24 +69,24 @@ impl Cmd {
                 .and_then(|hardware| hardware.memory)
                 .unwrap_or(512)
                 .to_string();
-            let created = relative_time(machine.created_at, now);
-            let status = status_label(machine.state, machine.started_at, now);
-            let profile = machine
+            let created = relative_time(config.created_at, now);
+            let status = status_label(state.status, state.started_at, now);
+            let profile = config
                 .metadata
                 .get(PROFILE_METADATA_KEY)
                 .map(String::as_str)
                 .unwrap_or("-");
-            let image = if machine.image_ref.is_empty() {
+            let image = if config.image_ref.is_empty() {
                 "-"
             } else {
-                machine.image_ref.as_str()
+                config.image_ref.as_str()
             };
 
             writeln!(
                 &mut out,
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                short_id(&machine.id.to_string()),
-                machine.name,
+                short_id(&config.id.to_string()),
+                config.name,
                 status,
                 profile,
                 image,

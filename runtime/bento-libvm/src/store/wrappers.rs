@@ -5,52 +5,85 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{FromRow, Row};
 
 use crate::models::{
-    Machine, MachineRuntime, MachineRuntimeState, NetworkAttachment, NetworkDefinition,
+    MachineConfig, MachineRuntimeState, MachineState, NetworkAttachment, NetworkDefinition,
     NetworkDriverPreference, NetworkInstance,
 };
 use crate::MachineId;
 
-pub(crate) struct DbMachine(pub(crate) Machine);
-pub(crate) struct DbMachineRuntime(pub(crate) MachineRuntime);
+pub(crate) struct DbMachineConfig(pub(crate) MachineConfig);
+pub(crate) struct DbMachineState(pub(crate) MachineState);
 pub(crate) struct DbNetworkAttachment(pub(crate) NetworkAttachment);
 pub(crate) struct DbNetworkInstance(pub(crate) NetworkInstance);
 pub(crate) struct DbNetworkDefinition(pub(crate) NetworkDefinition);
 
-impl<'row> FromRow<'row, SqliteRow> for DbMachine {
+impl<'row> FromRow<'row, SqliteRow> for DbMachineConfig {
     fn from_row(row: &'row SqliteRow) -> sqlx::Result<Self> {
         let id_str: String = row.try_get("id")?;
-        let id = parse_machine_id(&id_str, "machines.id")?;
-        Ok(Self(Machine {
-            id,
-            name: row.try_get("name")?,
-            config: deserialize_json(row.try_get("config_json")?, "machines.config_json")?,
-            instance_dir: row.try_get("instance_dir")?,
-            created_at: row.try_get("created_at")?,
-            modified_at: row.try_get("modified_at")?,
-            image_ref: row.try_get("image_ref")?,
-            labels: deserialize_json(row.try_get("labels")?, "machines.labels")?,
-            metadata: deserialize_json(row.try_get("metadata")?, "machines.metadata")?,
-            network: deserialize_json(row.try_get("network")?, "machines.network")?,
-        }))
+        let id = parse_machine_id(&id_str, "machine_config.id")?;
+        let name: String = row.try_get("name")?;
+        let config: MachineConfig =
+            deserialize_json(row.try_get("config_json")?, "machine_config.config_json")?;
+        if config.id != id {
+            return Err(column_decode_error(
+                "machine_config.config_json.id",
+                std::io::Error::other(format!(
+                    "config id {} does not match indexed id {}",
+                    config.id, id
+                )),
+            ));
+        }
+        if config.name != name {
+            return Err(column_decode_error(
+                "machine_config.config_json.name",
+                std::io::Error::other(format!(
+                    "config name {:?} does not match indexed name {:?}",
+                    config.name, name
+                )),
+            ));
+        }
+        Ok(Self(config))
     }
 }
 
-impl<'row> FromRow<'row, SqliteRow> for DbMachineRuntime {
+impl<'row> FromRow<'row, SqliteRow> for DbMachineState {
     fn from_row(row: &'row SqliteRow) -> sqlx::Result<Self> {
         let id_str: String = row.try_get("machine_id")?;
-        let machine_id = parse_machine_id(&id_str, "machine_runtime.machine_id")?;
-        let state_str: String = row.try_get("state")?;
-        let state = MachineRuntimeState::parse(&state_str).map_err(|err| {
-            column_decode_error("machine_runtime.state", std::io::Error::other(err))
+        let machine_id = parse_machine_id(&id_str, "machine_state.machine_id")?;
+        let status_str: String = row.try_get("status")?;
+        let status = MachineRuntimeState::parse(&status_str).map_err(|err| {
+            column_decode_error("machine_state.status", std::io::Error::other(err))
         })?;
-        Ok(Self(MachineRuntime {
-            machine_id,
-            state,
-            vmmon_pid: row.try_get("vmmon_pid")?,
-            started_at: row.try_get("started_at")?,
-            last_error: row.try_get("last_error")?,
-            updated_at: row.try_get("updated_at")?,
-        }))
+        let updated_at: i64 = row.try_get("updated_at")?;
+        let state: MachineState =
+            deserialize_json(row.try_get("state_json")?, "machine_state.state_json")?;
+        if state.machine_id != machine_id {
+            return Err(column_decode_error(
+                "machine_state.state_json.machineId",
+                std::io::Error::other(format!(
+                    "state machine_id {} does not match indexed machine_id {}",
+                    state.machine_id, machine_id
+                )),
+            ));
+        }
+        if state.status != status {
+            return Err(column_decode_error(
+                "machine_state.state_json.status",
+                std::io::Error::other(format!(
+                    "state status {:?} does not match indexed status {:?}",
+                    state.status, status
+                )),
+            ));
+        }
+        if state.updated_at != updated_at {
+            return Err(column_decode_error(
+                "machine_state.state_json.updatedAt",
+                std::io::Error::other(format!(
+                    "state updated_at {} does not match indexed updated_at {}",
+                    state.updated_at, updated_at
+                )),
+            ));
+        }
+        Ok(Self(state))
     }
 }
 

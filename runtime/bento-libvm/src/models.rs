@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use bento_vm_spec::VmSpec;
@@ -6,12 +7,14 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{looks_like_id_prefix, LibVmError, MachineId, NetworkPolicyRef};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Machine {
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineConfig {
     pub id: MachineId,
     pub name: String,
-    pub config: VmSpec,
-    pub instance_dir: String,
+    pub spec: VmSpec,
+    pub instance_dir: PathBuf,
     pub created_at: i64,
     pub modified_at: i64,
     pub image_ref: String,
@@ -20,17 +23,29 @@ pub(crate) struct Machine {
     pub network: RequestedNetwork,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MachineRuntime {
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineState {
     pub machine_id: MachineId,
-    pub state: MachineRuntimeState,
+    pub status: MachineRuntimeState,
     pub vmmon_pid: Option<i32>,
     pub started_at: Option<i64>,
     pub last_error: Option<String>,
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineInspect {
+    pub config: MachineConfig,
+    pub state: MachineState,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MachineRuntimeState {
     Stopped,
     Starting,

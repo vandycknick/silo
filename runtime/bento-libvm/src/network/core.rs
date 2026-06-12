@@ -1,5 +1,5 @@
 use crate::global_config::NetworkingConfig;
-use crate::models::Machine;
+use crate::models::MachineConfig;
 use crate::store::Sqlite;
 use crate::{Layout, LibVmError, NetworkPolicyRef};
 
@@ -20,7 +20,7 @@ pub(super) struct NetworkRequest<'a> {
 pub(super) struct NetworkDriverContext<'a> {
     pub(super) layout: &'a Layout,
     pub(super) db: &'a Sqlite,
-    pub(super) metadata: &'a Machine,
+    pub(super) metadata: &'a MachineConfig,
     pub(super) config: &'a NetworkingConfig,
 }
 

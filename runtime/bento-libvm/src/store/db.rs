@@ -1,23 +1,22 @@
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bento_vm_spec::VmSpec;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 
 use crate::models::{
-    Machine, MachineRuntime, NetworkAttachment, NetworkDefinition, NetworkInstance,
-    RequestedNetwork,
+    MachineConfig, MachineState, NetworkAttachment, NetworkDefinition, NetworkInstance,
 };
 use crate::store::wrappers::{
-    DbMachine, DbMachineRuntime, DbNetworkAttachment, DbNetworkDefinition, DbNetworkInstance,
+    DbMachineConfig, DbMachineState, DbNetworkAttachment, DbNetworkDefinition, DbNetworkInstance,
 };
 use crate::store::Database;
 use crate::{Layout, LibVmError, MachineId};
 
-const MACHINE_COLUMNS: &str =
-    "id, name, json(config_json) AS config_json, instance_dir, created_at, modified_at, image_ref, json(labels) AS labels, json(metadata) AS metadata, json(network) AS network";
+const STATE_SCHEMA_VERSION: i64 = 1;
+const MACHINE_CONFIG_COLUMNS: &str = "id, name, json(config_json) AS config_json";
+const MACHINE_STATE_COLUMNS: &str =
+    "machine_id, status, json(state_json) AS state_json, updated_at";
 
 #[derive(Debug, Clone)]
 pub(crate) struct Sqlite {
@@ -25,8 +24,9 @@ pub(crate) struct Sqlite {
 }
 
 impl Sqlite {
-    async fn setup_db(pool: &SqlitePool) -> Result<(), LibVmError> {
+    async fn setup_db(pool: &SqlitePool, layout: &Layout) -> Result<(), LibVmError> {
         sqlx::migrate!("./migrations").run(pool).await?;
+        validate_db_config(pool, layout).await?;
         Ok(())
     }
 }
@@ -41,143 +41,134 @@ impl Database for Sqlite {
             .acquire_timeout(Duration::from_secs(30))
             .connect_with(options)
             .await?;
-        Self::setup_db(&pool).await?;
+        Self::setup_db(&pool, layout).await?;
         Ok(Self { pool })
     }
 
-    async fn insert_machine(&self, machine: &Machine) -> Result<(), LibVmError> {
+    async fn insert_machine_config(&self, config: &MachineConfig) -> Result<(), LibVmError> {
         sqlx::query(
-            "INSERT INTO machines (id, name, config_json, instance_dir, created_at, modified_at, image_ref, labels, metadata, network)
-             VALUES (?1, ?2, jsonb(?3), ?4, ?5, ?6, ?7, jsonb(?8), jsonb(?9), jsonb(?10))",
+            "INSERT INTO machine_config (id, name, config_json, created_at, modified_at)
+             VALUES (?1, ?2, jsonb(?3), ?4, ?5)",
         )
-        .bind(machine.id.to_string())
-        .bind(&machine.name)
-        .bind(serialize_vm_spec("config_json", &machine.config)?)
-        .bind(&machine.instance_dir)
-        .bind(machine.created_at)
-        .bind(machine.modified_at)
-        .bind(&machine.image_ref)
-        .bind(serialize_map("labels", &machine.labels)?)
-        .bind(serialize_map("metadata", &machine.metadata)?)
-        .bind(serialize_network(&machine.network)?)
+        .bind(config.id.to_string())
+        .bind(&config.name)
+        .bind(serialize_json("machine_config.config_json", config)?)
+        .bind(config.created_at)
+        .bind(config.modified_at)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    async fn get_machine_runtime(
+    async fn get_machine_state(
         &self,
         machine_id: MachineId,
-    ) -> Result<Option<MachineRuntime>, LibVmError> {
-        let runtime = sqlx::query_as::<_, DbMachineRuntime>(
-            "SELECT machine_id, state, vmmon_pid, started_at, last_error, updated_at
-             FROM machine_runtime WHERE machine_id = ?1",
-        )
-        .bind(machine_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(runtime.map(|DbMachineRuntime(runtime)| runtime))
+    ) -> Result<Option<MachineState>, LibVmError> {
+        let query =
+            format!("SELECT {MACHINE_STATE_COLUMNS} FROM machine_state WHERE machine_id = ?1");
+        let state = sqlx::query_as::<_, DbMachineState>(&query)
+            .bind(machine_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(state.map(|DbMachineState(state)| state))
     }
 
-    async fn upsert_machine_runtime(&self, runtime: &MachineRuntime) -> Result<(), LibVmError> {
+    async fn upsert_machine_state(&self, state: &MachineState) -> Result<(), LibVmError> {
         sqlx::query(
-            "INSERT INTO machine_runtime
-                (machine_id, state, vmmon_pid, started_at, last_error, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO machine_state (machine_id, status, state_json, updated_at)
+             VALUES (?1, ?2, jsonb(?3), ?4)
              ON CONFLICT(machine_id) DO UPDATE SET
-                state = excluded.state,
-                vmmon_pid = excluded.vmmon_pid,
-                started_at = excluded.started_at,
-                last_error = excluded.last_error,
+                status = excluded.status,
+                state_json = excluded.state_json,
                 updated_at = excluded.updated_at",
         )
-        .bind(runtime.machine_id.to_string())
-        .bind(runtime.state.as_str())
-        .bind(runtime.vmmon_pid)
-        .bind(runtime.started_at)
-        .bind(&runtime.last_error)
-        .bind(runtime.updated_at)
+        .bind(state.machine_id.to_string())
+        .bind(state.status.as_str())
+        .bind(serialize_json("machine_state.state_json", state)?)
+        .bind(state.updated_at)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    async fn remove_machine_runtime(&self, machine_id: MachineId) -> Result<(), LibVmError> {
-        sqlx::query("DELETE FROM machine_runtime WHERE machine_id = ?1")
+    async fn remove_machine_state(&self, machine_id: MachineId) -> Result<(), LibVmError> {
+        sqlx::query("DELETE FROM machine_state WHERE machine_id = ?1")
             .bind(machine_id.to_string())
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    async fn update_machine_network(
+    async fn update_machine_config(&self, config: &MachineConfig) -> Result<(), LibVmError> {
+        sqlx::query(
+            "UPDATE machine_config
+             SET name = ?1, config_json = jsonb(?2), modified_at = ?3
+             WHERE id = ?4",
+        )
+        .bind(&config.name)
+        .bind(serialize_json("machine_config.config_json", config)?)
+        .bind(config.modified_at)
+        .bind(config.id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_machine_config_by_id(
         &self,
-        machine_id: MachineId,
-        network: &RequestedNetwork,
-    ) -> Result<(), LibVmError> {
-        sqlx::query("UPDATE machines SET network = jsonb(?1), modified_at = ?2 WHERE id = ?3")
-            .bind(serialize_network(network)?)
-            .bind(now_unix())
-            .bind(machine_id.to_string())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn update_machine_config(
-        &self,
-        machine_id: MachineId,
-        config: &VmSpec,
-    ) -> Result<(), LibVmError> {
-        sqlx::query("UPDATE machines SET config_json = jsonb(?1), modified_at = ?2 WHERE id = ?3")
-            .bind(serialize_vm_spec("config_json", config)?)
-            .bind(now_unix())
-            .bind(machine_id.to_string())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn get_machine_by_id(&self, id: MachineId) -> Result<Option<Machine>, LibVmError> {
-        let query = format!("SELECT {MACHINE_COLUMNS} FROM machines WHERE id = ?1");
-        let machine = sqlx::query_as::<_, DbMachine>(&query)
+        id: MachineId,
+    ) -> Result<Option<MachineConfig>, LibVmError> {
+        let query = format!("SELECT {MACHINE_CONFIG_COLUMNS} FROM machine_config WHERE id = ?1");
+        let machine = sqlx::query_as::<_, DbMachineConfig>(&query)
             .bind(id.to_string())
             .fetch_optional(&self.pool)
             .await?;
-        Ok(machine.map(|DbMachine(machine)| machine))
+        Ok(machine.map(|DbMachineConfig(machine)| machine))
     }
 
-    async fn get_machine_by_name(&self, name: &str) -> Result<Option<Machine>, LibVmError> {
-        let query = format!("SELECT {MACHINE_COLUMNS} FROM machines WHERE name = ?1");
-        let machine = sqlx::query_as::<_, DbMachine>(&query)
+    async fn get_machine_config_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<MachineConfig>, LibVmError> {
+        let query = format!("SELECT {MACHINE_CONFIG_COLUMNS} FROM machine_config WHERE name = ?1");
+        let machine = sqlx::query_as::<_, DbMachineConfig>(&query)
             .bind(name)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(machine.map(|DbMachine(machine)| machine))
+        Ok(machine.map(|DbMachineConfig(machine)| machine))
     }
 
-    async fn get_machine_by_id_prefix(&self, prefix: &str) -> Result<Vec<Machine>, LibVmError> {
+    async fn get_machine_config_by_id_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<MachineConfig>, LibVmError> {
         let pattern = format!("{prefix}%");
-        let query = format!("SELECT {MACHINE_COLUMNS} FROM machines WHERE id LIKE ?1");
-        let rows = sqlx::query_as::<_, DbMachine>(&query)
+        let query = format!("SELECT {MACHINE_CONFIG_COLUMNS} FROM machine_config WHERE id LIKE ?1");
+        let rows = sqlx::query_as::<_, DbMachineConfig>(&query)
             .bind(pattern)
             .fetch_all(&self.pool)
             .await?;
-        Ok(rows.into_iter().map(|DbMachine(machine)| machine).collect())
+        Ok(rows
+            .into_iter()
+            .map(|DbMachineConfig(machine)| machine)
+            .collect())
     }
 
-    async fn list_machines(&self) -> Result<Vec<Machine>, LibVmError> {
-        let query = format!("SELECT {MACHINE_COLUMNS} FROM machines ORDER BY name");
-        let rows = sqlx::query_as::<_, DbMachine>(&query)
+    async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError> {
+        let query = format!("SELECT {MACHINE_CONFIG_COLUMNS} FROM machine_config ORDER BY name");
+        let rows = sqlx::query_as::<_, DbMachineConfig>(&query)
             .fetch_all(&self.pool)
             .await?;
-        Ok(rows.into_iter().map(|DbMachine(machine)| machine).collect())
+        Ok(rows
+            .into_iter()
+            .map(|DbMachineConfig(machine)| machine)
+            .collect())
     }
 
     async fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError> {
         for index in 1..10_000u32 {
             let candidate = format!("{prefix}-{index}");
-            if self.get_machine_by_name(&candidate).await?.is_none() {
+            if self.get_machine_config_by_name(&candidate).await?.is_none() {
                 return Ok(candidate);
             }
         }
@@ -188,8 +179,8 @@ impl Database for Sqlite {
         })
     }
 
-    async fn remove_machine(&self, machine: &Machine) -> Result<(), LibVmError> {
-        sqlx::query("DELETE FROM machines WHERE id = ?1")
+    async fn remove_machine_config(&self, machine: &MachineConfig) -> Result<(), LibVmError> {
+        sqlx::query("DELETE FROM machine_config WHERE id = ?1")
             .bind(machine.id.to_string())
             .execute(&self.pool)
             .await?;
@@ -400,25 +391,117 @@ fn sqlite_options(path: &Path) -> SqliteConnectOptions {
         .busy_timeout(Duration::from_secs(5))
 }
 
-fn serialize_map(
+async fn validate_db_config(pool: &SqlitePool, layout: &Layout) -> Result<(), LibVmError> {
+    let expected = ExpectedDbConfig::from_layout(layout);
+    let now = now_unix();
+    sqlx::query(
+        "INSERT OR IGNORE INTO db_config
+            (id, schema_version, data_dir, state_db_path, instances_dir, images_dir, net_dir, created_at, modified_at)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+    )
+    .bind(expected.schema_version)
+    .bind(&expected.data_dir)
+    .bind(&expected.state_db_path)
+    .bind(&expected.instances_dir)
+    .bind(&expected.images_dir)
+    .bind(&expected.net_dir)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    let row = sqlx::query(
+        "SELECT schema_version, data_dir, state_db_path, instances_dir, images_dir, net_dir
+         FROM db_config WHERE id = 1",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    compare_db_config_i64(
+        "schema_version",
+        expected.schema_version,
+        row.try_get("schema_version")?,
+    )?;
+    compare_db_config_str("data_dir", &expected.data_dir, row.try_get("data_dir")?)?;
+    compare_db_config_str(
+        "state_db_path",
+        &expected.state_db_path,
+        row.try_get("state_db_path")?,
+    )?;
+    compare_db_config_str(
+        "instances_dir",
+        &expected.instances_dir,
+        row.try_get("instances_dir")?,
+    )?;
+    compare_db_config_str(
+        "images_dir",
+        &expected.images_dir,
+        row.try_get("images_dir")?,
+    )?;
+    compare_db_config_str("net_dir", &expected.net_dir, row.try_get("net_dir")?)?;
+    Ok(())
+}
+
+struct ExpectedDbConfig {
+    schema_version: i64,
+    data_dir: String,
+    state_db_path: String,
+    instances_dir: String,
+    images_dir: String,
+    net_dir: String,
+}
+
+impl ExpectedDbConfig {
+    fn from_layout(layout: &Layout) -> Self {
+        Self {
+            schema_version: STATE_SCHEMA_VERSION,
+            data_dir: path_to_db_string(layout.data_dir()),
+            state_db_path: path_to_db_string(&layout.state_db_path()),
+            instances_dir: path_to_db_string(&layout.instances_dir()),
+            images_dir: path_to_db_string(&layout.images_dir()),
+            net_dir: path_to_db_string(&layout.net_dir()),
+        }
+    }
+}
+
+fn path_to_db_string(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn compare_db_config_i64(
     field: &'static str,
-    values: &BTreeMap<String, String>,
-) -> Result<String, LibVmError> {
-    serde_json::to_string(values).map_err(|err| LibVmError::InvalidCreateRequest {
-        name: field.to_string(),
-        reason: format!("serialize {field}: {err}"),
+    expected: i64,
+    actual: i64,
+) -> Result<(), LibVmError> {
+    if expected == actual {
+        return Ok(());
+    }
+    Err(LibVmError::StateDatabaseConfigMismatch {
+        field,
+        expected: expected.to_string(),
+        actual: actual.to_string(),
     })
 }
 
-fn serialize_network(network: &RequestedNetwork) -> Result<String, LibVmError> {
-    serde_json::to_string(network).map_err(|err| LibVmError::InvalidCreateRequest {
-        name: "network".to_string(),
-        reason: format!("serialize network: {err}"),
+fn compare_db_config_str(
+    field: &'static str,
+    expected: &str,
+    actual: String,
+) -> Result<(), LibVmError> {
+    if expected == actual {
+        return Ok(());
+    }
+    Err(LibVmError::StateDatabaseConfigMismatch {
+        field,
+        expected: expected.to_string(),
+        actual,
     })
 }
 
-fn serialize_vm_spec(field: &'static str, spec: &VmSpec) -> Result<String, LibVmError> {
-    serde_json::to_string(spec).map_err(|err| LibVmError::InvalidCreateRequest {
+fn serialize_json<T>(field: &'static str, value: &T) -> Result<String, LibVmError>
+where
+    T: serde::Serialize,
+{
+    serde_json::to_string(value).map_err(|err| LibVmError::InvalidCreateRequest {
         name: field.to_string(),
         reason: format!("serialize {field}: {err}"),
     })
@@ -439,7 +522,7 @@ mod tests {
     use bento_vm_spec::{Hardware, VmSpec};
 
     use crate::models::{
-        Machine, MachineRuntime, MachineRuntimeState, NetworkAttachment, NetworkInstance,
+        MachineConfig, MachineRuntimeState, MachineState, NetworkAttachment, NetworkInstance,
         RequestedNetwork,
     };
     use crate::store::{Database, Sqlite};
@@ -451,13 +534,12 @@ mod tests {
         (dir, layout)
     }
 
-    fn machine_from_path(id: MachineId, name: String, instance_dir: &Path) -> Machine {
-        let config = sample_vm_spec();
-        Machine {
+    fn machine_from_path(id: MachineId, name: String, instance_dir: &Path) -> MachineConfig {
+        MachineConfig {
             id,
             name,
-            config,
-            instance_dir: instance_dir.display().to_string(),
+            spec: sample_vm_spec(),
+            instance_dir: instance_dir.to_path_buf(),
             created_at: 1,
             modified_at: 1,
             image_ref: String::new(),
@@ -486,9 +568,9 @@ mod tests {
         let id = MachineId::new();
         let metadata = machine_from_path(id, "devbox".to_string(), &layout.instance_dir(id));
 
-        db.insert_machine(&metadata).await.expect("insert");
+        db.insert_machine_config(&metadata).await.expect("insert");
         let found = db
-            .get_machine_by_name("devbox")
+            .get_machine_config_by_name("devbox")
             .await
             .expect("lookup")
             .expect("should find machine");
@@ -503,9 +585,9 @@ mod tests {
         let id = MachineId::new();
         let metadata = machine_from_path(id, "testvm".to_string(), &layout.instance_dir(id));
 
-        db.insert_machine(&metadata).await.expect("insert");
+        db.insert_machine_config(&metadata).await.expect("insert");
         let found = db
-            .get_machine_by_id(id)
+            .get_machine_config_by_id(id)
             .await
             .expect("lookup")
             .expect("should find machine");
@@ -520,18 +602,21 @@ mod tests {
         let id = MachineId::new();
         let metadata = machine_from_path(id, "prefix-test".to_string(), &layout.instance_dir(id));
 
-        db.insert_machine(&metadata).await.expect("insert");
+        db.insert_machine_config(&metadata).await.expect("insert");
 
         let id_str = id.to_string();
         let prefix = &id_str[..8];
-        let found = db.get_machine_by_id_prefix(prefix).await.expect("lookup");
+        let found = db
+            .get_machine_config_by_id_prefix(prefix)
+            .await
+            .expect("lookup");
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0], metadata);
     }
 
     #[tokio::test]
-    async fn labels_metadata_and_network_round_trip_as_jsonb_blobs() {
+    async fn static_machine_config_round_trips_as_jsonb_blob() {
         let (_dir, layout) = temp_layout();
         let db = Sqlite::new(&layout).await.expect("open db");
         let id = MachineId::new();
@@ -540,11 +625,11 @@ mod tests {
         let mut metadata = BTreeMap::new();
         metadata.insert("bento.profile".to_string(), "rust-dev".to_string());
 
-        let machine = Machine {
+        let machine = MachineConfig {
             id,
             name: "jsonb-test".to_string(),
-            config: sample_vm_spec(),
-            instance_dir: layout.instance_dir(id).display().to_string(),
+            spec: sample_vm_spec(),
+            instance_dir: layout.instance_dir(id),
             created_at: 1,
             modified_at: 1,
             image_ref: "test-image:latest".to_string(),
@@ -553,9 +638,11 @@ mod tests {
             network: RequestedNetwork::default(),
         };
 
-        db.insert_machine(&machine).await.expect("insert machine");
+        db.insert_machine_config(&machine)
+            .await
+            .expect("insert machine");
         let found = db
-            .get_machine_by_id(id)
+            .get_machine_config_by_id(id)
             .await
             .expect("lookup")
             .expect("machine exists");
@@ -567,7 +654,7 @@ mod tests {
         );
         assert_eq!(found.network, RequestedNetwork::default());
         let storage_type: String =
-            sqlx::query_scalar("SELECT typeof(labels) FROM machines WHERE id = ?1")
+            sqlx::query_scalar("SELECT typeof(config_json) FROM machine_config WHERE id = ?1")
                 .bind(id.to_string())
                 .fetch_one(&db.pool)
                 .await
@@ -582,14 +669,14 @@ mod tests {
 
         let id_b = MachineId::new();
         let id_a = MachineId::new();
-        db.insert_machine(&machine_from_path(
+        db.insert_machine_config(&machine_from_path(
             id_b,
             "bravo".to_string(),
             &layout.instance_dir(id_b),
         ))
         .await
         .expect("insert b");
-        db.insert_machine(&machine_from_path(
+        db.insert_machine_config(&machine_from_path(
             id_a,
             "alpha".to_string(),
             &layout.instance_dir(id_a),
@@ -597,7 +684,7 @@ mod tests {
         .await
         .expect("insert a");
 
-        let list = db.list_machines().await.expect("list");
+        let list = db.list_machine_configs().await.expect("list");
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].name, "alpha");
         assert_eq!(list[1].name, "bravo");
@@ -610,47 +697,41 @@ mod tests {
         let id = MachineId::new();
         let metadata = machine_from_path(id, "gonner".to_string(), &layout.instance_dir(id));
 
-        db.insert_machine(&metadata).await.expect("insert");
-        db.remove_machine(&metadata).await.expect("remove");
+        db.insert_machine_config(&metadata).await.expect("insert");
+        db.remove_machine_config(&metadata).await.expect("remove");
 
-        let found = db.get_machine_by_id(id).await.expect("lookup");
+        let found = db.get_machine_config_by_id(id).await.expect("lookup");
         assert!(found.is_none());
     }
 
     #[tokio::test]
-    async fn machine_runtime_round_trips() {
+    async fn machine_state_round_trips() {
         let (_dir, layout) = temp_layout();
         let db = Sqlite::new(&layout).await.expect("open db");
         let id = MachineId::new();
         let metadata = machine_from_path(id, "runtime".to_string(), &layout.instance_dir(id));
-        db.insert_machine(&metadata).await.expect("insert");
+        db.insert_machine_config(&metadata).await.expect("insert");
 
-        let runtime = MachineRuntime {
+        let state = MachineState {
             machine_id: id,
-            state: MachineRuntimeState::Running,
+            status: MachineRuntimeState::Running,
             vmmon_pid: Some(1234),
             started_at: Some(42),
             last_error: None,
             updated_at: 43,
         };
-        db.upsert_machine_runtime(&runtime)
-            .await
-            .expect("upsert runtime");
+        db.upsert_machine_state(&state).await.expect("upsert state");
 
         assert_eq!(
-            db.get_machine_runtime(id)
+            db.get_machine_state(id)
                 .await
-                .expect("get runtime")
-                .expect("runtime exists"),
-            runtime
+                .expect("get state")
+                .expect("state exists"),
+            state
         );
 
-        db.remove_machine_runtime(id).await.expect("remove runtime");
-        assert!(db
-            .get_machine_runtime(id)
-            .await
-            .expect("get runtime")
-            .is_none());
+        db.remove_machine_state(id).await.expect("remove state");
+        assert!(db.get_machine_state(id).await.expect("get state").is_none());
     }
 
     #[tokio::test]
@@ -658,27 +739,28 @@ mod tests {
         let (_dir, layout) = temp_layout();
         let db = Sqlite::new(&layout).await.expect("open db");
         let id = MachineId::new();
-        let metadata = machine_from_path(id, "config".to_string(), &layout.instance_dir(id));
-        db.insert_machine(&metadata).await.expect("insert");
+        let mut metadata = machine_from_path(id, "config".to_string(), &layout.instance_dir(id));
+        db.insert_machine_config(&metadata).await.expect("insert");
 
-        let mut updated = metadata.config.clone();
-        updated
+        metadata
+            .spec
             .hardware
             .as_mut()
             .expect("sample config should include hardware")
             .cpus = Some(8);
-        db.update_machine_config(id, &updated)
+        metadata.modified_at = 2;
+        db.update_machine_config(&metadata)
             .await
             .expect("update config");
 
         let found = db
-            .get_machine_by_id(id)
+            .get_machine_config_by_id(id)
             .await
             .expect("lookup")
             .expect("machine exists");
         assert_eq!(
             found
-                .config
+                .spec
                 .hardware
                 .as_ref()
                 .expect("stored config should include hardware")
@@ -693,7 +775,9 @@ mod tests {
         let db = Sqlite::new(&layout).await.expect("open db");
         let id = MachineId::new();
         let metadata = machine_from_path(id, "netbox".to_string(), &layout.instance_dir(id));
-        db.insert_machine(&metadata).await.expect("insert machine");
+        db.insert_machine_config(&metadata)
+            .await
+            .expect("insert machine");
 
         let network_id = "netbox-runtime".to_string();
         let instance = NetworkInstance {
@@ -760,9 +844,11 @@ mod tests {
         let db = Sqlite::new(&layout).await.expect("open db");
         let id = MachineId::new();
         let metadata = machine_from_path(id, "immutable".to_string(), &layout.instance_dir(id));
-        db.insert_machine(&metadata).await.expect("insert machine");
+        db.insert_machine_config(&metadata)
+            .await
+            .expect("insert machine");
 
-        let result = sqlx::query("UPDATE machines SET created_at = ?1 WHERE id = ?2")
+        let result = sqlx::query("UPDATE machine_config SET created_at = ?1 WHERE id = ?2")
             .bind(metadata.created_at + 1)
             .bind(id.to_string())
             .execute(&db.pool)
@@ -777,7 +863,7 @@ mod tests {
 
         let id1 = MachineId::new();
         let id2 = MachineId::new();
-        db.insert_machine(&machine_from_path(
+        db.insert_machine_config(&machine_from_path(
             id1,
             "dupe".to_string(),
             &layout.instance_dir(id1),
@@ -786,7 +872,7 @@ mod tests {
         .expect("insert first");
 
         let result = db
-            .insert_machine(&machine_from_path(
+            .insert_machine_config(&machine_from_path(
                 id2,
                 "dupe".to_string(),
                 &layout.instance_dir(id2),
@@ -802,7 +888,7 @@ mod tests {
         let db2 = Sqlite::new(&layout).await.expect("open db 2");
 
         let id = MachineId::new();
-        db1.insert_machine(&machine_from_path(
+        db1.insert_machine_config(&machine_from_path(
             id,
             "shared".to_string(),
             &layout.instance_dir(id),
@@ -811,7 +897,7 @@ mod tests {
         .expect("insert via db1");
 
         let found = db2
-            .get_machine_by_name("shared")
+            .get_machine_config_by_name("shared")
             .await
             .expect("lookup via db2")
             .expect("should find machine from other connection");
