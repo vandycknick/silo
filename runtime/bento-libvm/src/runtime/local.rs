@@ -392,35 +392,6 @@ impl LocalRuntime {
         let config = self
             .resolve_machine_config(&MachineRef::id(machine_id))
             .await?;
-        let _lock = self.acquire_machine_lock(config.id)?;
-        let status = self.reconcile_machine_runtime_locked(&config).await?;
-        reconcile_network_runtime(&self.paths, &self.db, &config, status.is_active()).await?;
-
-        if status.is_active() {
-            return Err(LibVmError::MachineAlreadyRunning {
-                reference: config.name.clone(),
-            });
-        }
-
-        let resolved_network =
-            prepare_network_runtime(&self.paths, &self.db, &config, &self.networking).await?;
-        let mut spec = config.spec.clone();
-        prepare_instance_runtime(
-            &self.paths,
-            &config.instance_dir,
-            &config.name,
-            &mut spec,
-            &resolved_network,
-            &self.networking,
-        )
-        .map_err(|err| LibVmError::InstancePreparationFailed {
-            reference: config.name.clone(),
-            message: err.to_string(),
-        })?;
-
-        self.set_machine_state(config.id, MachineRuntimeState::Starting, None, None, None)
-            .await?;
-
         let machine_paths = self.paths.machine(config.id);
         let pid_path = machine_paths.vmmon_pid_path();
         let config_path = machine_paths.vm_spec_path();
@@ -428,54 +399,96 @@ impl LocalRuntime {
         let trace_path = machine_paths.vmmon_trace_log_path();
         let serial_log_path = machine_paths.serial_log_path();
         let metadata_config_path = machine_paths.metadata_config_path();
-        let launch = VmmonLaunch {
-            machine_id: config.id,
-            name: &config.name,
-            instance_dir: &config.instance_dir,
-            pidfile: &pid_path,
-            config: &config_path,
-            socket: &socket_path,
-            serial_log: &serial_log_path,
-            trace_log: &trace_path,
-            network: &resolved_network,
-            metadata_config: &metadata_config_path,
-            wait_for_registration: monitor::DEFAULT_GUEST_READINESS_TIMEOUT,
-        };
-        let handshake = match spawn_vmmon(&launch) {
-            Ok(handshake) => handshake,
-            Err(err) => {
+
+        let sync_read = {
+            let _lock = self.acquire_machine_lock(config.id)?;
+            let status = self.reconcile_machine_runtime_locked(&config).await?;
+            reconcile_network_runtime(&self.paths, &self.db, &config, status.is_active()).await?;
+
+            if status.is_active() {
+                return Err(LibVmError::MachineAlreadyRunning {
+                    reference: config.name.clone(),
+                });
+            }
+
+            let resolved_network =
+                prepare_network_runtime(&self.paths, &self.db, &config, &self.networking).await?;
+            let mut spec = config.spec.clone();
+            prepare_instance_runtime(
+                &self.paths,
+                &config.instance_dir,
+                &config.name,
+                &mut spec,
+                &resolved_network,
+                &self.networking,
+            )
+            .map_err(|err| LibVmError::InstancePreparationFailed {
+                reference: config.name.clone(),
+                message: err.to_string(),
+            })?;
+
+            self.set_machine_state(config.id, MachineRuntimeState::Starting, None, None, None)
+                .await?;
+
+            let launch = VmmonLaunch {
+                machine_id: config.id,
+                name: &config.name,
+                instance_dir: &config.instance_dir,
+                pidfile: &pid_path,
+                config: &config_path,
+                socket: &socket_path,
+                serial_log: &serial_log_path,
+                trace_log: &trace_path,
+                network: &resolved_network,
+                metadata_config: &metadata_config_path,
+                wait_for_registration: monitor::DEFAULT_GUEST_READINESS_TIMEOUT,
+            };
+            let VmmonHandshake {
+                start_write,
+                sync_read,
+            } = match spawn_vmmon(&launch) {
+                Ok(handshake) => handshake,
+                Err(err) => {
+                    self.mark_machine_stopped(config.id, Some(err.to_string()))
+                        .await?;
+                    return Err(err);
+                }
+            };
+            if let Err(err) = release_startpipe(start_write) {
                 self.mark_machine_stopped(config.id, Some(err.to_string()))
                     .await?;
-                return Err(err);
+                return Err(err.into());
             }
+
+            sync_read
         };
-        if let Err(err) = release_startpipe(handshake.start_write) {
-            self.mark_machine_stopped(config.id, Some(err.to_string()))
-                .await?;
-            return Err(err.into());
-        }
-        if let Err(err) = wait_for_monitor_start(handshake.sync_read, &trace_path).await {
+
+        if let Err(err) = wait_for_monitor_start(sync_read, &trace_path).await {
+            let _lock = self.acquire_machine_lock(config.id)?;
             self.mark_machine_stopped(config.id, Some(err.to_string()))
                 .await?;
             return Err(err);
         }
 
-        let pid = read_monitor_pid(&pid_path)?;
-        if !process_is_alive(pid)? {
-            return Err(LibVmError::MonitorConnection {
-                reference: config.name.clone(),
-                message: format!("vmmon pid {pid} from {} is not running", pid_path.display()),
-            });
+        {
+            let _lock = self.acquire_machine_lock(config.id)?;
+            let pid = read_monitor_pid(&pid_path)?;
+            if !process_is_alive(pid)? {
+                return Err(LibVmError::MonitorConnection {
+                    reference: config.name.clone(),
+                    message: format!("vmmon pid {pid} from {} is not running", pid_path.display()),
+                });
+            }
+            let started_at = pid_file_mtime(&pid_path);
+            self.set_machine_state(
+                config.id,
+                MachineRuntimeState::Running,
+                Some(pid),
+                Some(started_at),
+                None,
+            )
+            .await?;
         }
-        let started_at = pid_file_mtime(&pid_path);
-        self.set_machine_state(
-            config.id,
-            MachineRuntimeState::Running,
-            Some(pid),
-            Some(started_at),
-            None,
-        )
-        .await?;
         self.machine_inspect(config).await
     }
 
