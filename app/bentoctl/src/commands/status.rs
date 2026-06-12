@@ -2,7 +2,7 @@ use clap::Args;
 use std::fmt::{Display, Formatter};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bento_libvm::{MachineRef, MachineRuntimeState, Runtime};
+use bento_libvm::{MachineRef, MachineStatus, Runtime};
 use bento_protocol::v1::LifecycleState;
 use bento_vm_spec::VmSpec;
 
@@ -36,37 +36,35 @@ impl Cmd {
         let machine_ref = MachineRef::parse(self.name.clone())?;
         let machine = libvm.get_machine(&machine_ref).await?;
         let inspection = machine.inspect().await?;
-        let config = inspection.config;
-        let state = inspection.state;
         if self.json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "name": &config.name,
-                    "state": process_status_label(state.status),
-                    "profile": config.metadata.get(PROFILE_METADATA_KEY).cloned(),
-                    "image": &config.image_ref,
-                    "network": &config.network,
-                    "created_at": config.created_at,
+                    "name": inspection.name(),
+                    "state": process_status_label(inspection.status()),
+                    "profile": inspection.metadata().get(PROFILE_METADATA_KEY).cloned(),
+                    "image": inspection.image_ref(),
+                    "network": inspection.network(),
+                    "created_at": inspection.created_at(),
                 }))?
             );
             return Ok(());
         }
 
-        println!("name: {}", config.name);
-        if let Some(profile) = config.metadata.get(PROFILE_METADATA_KEY) {
+        println!("name: {}", inspection.name());
+        if let Some(profile) = inspection.metadata().get(PROFILE_METADATA_KEY) {
             println!("profile: {profile}");
         }
-        if !config.image_ref.is_empty() {
-            println!("image: {}", config.image_ref);
+        if !inspection.image_ref().is_empty() {
+            println!("image: {}", inspection.image_ref());
         }
-        println!("network: {}", config.network.name());
-        print_process(state.status, state.started_at);
+        println!("network: {}", inspection.network().name());
+        print_process(inspection.status(), inspection.started_at());
 
-        if !state.status.is_running() {
+        if !inspection.is_running() {
             print_guest(
                 None,
-                guest_config_status(&config.spec, &config.instance_dir),
+                guest_config_status(inspection.spec(), inspection.instance_dir()),
             );
             println!("ready: no");
             return Ok(());
@@ -77,7 +75,7 @@ impl Cmd {
         println!("vm: {}", lifecycle_label(status.vm_state));
         print_guest(
             Some((lifecycle_label(status.guest_state), status.ready)),
-            guest_config_status(&config.spec, &config.instance_dir),
+            guest_config_status(inspection.spec(), inspection.instance_dir()),
         );
         println!("ready: {}", if status.ready { "yes" } else { "no" });
         if !status.summary.is_empty() {
@@ -116,7 +114,7 @@ fn initramfs_path_exists(spec: &VmSpec, machine_dir: &std::path::Path) -> bool {
     }
 }
 
-fn print_process(state: MachineRuntimeState, started_at: Option<i64>) {
+fn print_process(state: MachineStatus, started_at: Option<i64>) {
     println!("process:");
     println!("  status: {}", process_status_label(state));
     if let Some(label) = process_started_at(state, started_at) {
@@ -160,7 +158,7 @@ fn present_absent(value: bool) -> &'static str {
     }
 }
 
-fn process_status_label(state: MachineRuntimeState) -> &'static str {
+fn process_status_label(state: MachineStatus) -> &'static str {
     if state.is_running() {
         "running"
     } else {
@@ -168,7 +166,7 @@ fn process_status_label(state: MachineRuntimeState) -> &'static str {
     }
 }
 
-fn process_started_at(state: MachineRuntimeState, started_at: Option<i64>) -> Option<String> {
+fn process_started_at(state: MachineStatus, started_at: Option<i64>) -> Option<String> {
     if state.is_running() {
         started_at.map(|started_at| relative_time(started_at, now_unix()))
     } else {
@@ -248,7 +246,7 @@ mod tests {
     use super::{
         guest_config_status, now_unix, process_started_at, process_status_label, relative_time,
     };
-    use bento_libvm::MachineRuntimeState;
+    use bento_libvm::MachineStatus;
     use bento_vm_spec::{Boot, Guest, GuestOs, Hardware, Kernel, Storage, VmSpec};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -324,13 +322,10 @@ mod tests {
 
     #[test]
     fn process_helpers_render_running_and_stopped_states() {
-        assert_eq!(
-            process_status_label(MachineRuntimeState::Stopped),
-            "stopped"
-        );
-        assert_eq!(process_started_at(MachineRuntimeState::Stopped, None), None);
+        assert_eq!(process_status_label(MachineStatus::Stopped), "stopped");
+        assert_eq!(process_started_at(MachineStatus::Stopped, None), None);
 
-        let started = process_started_at(MachineRuntimeState::Running, Some(now_unix() - 60))
+        let started = process_started_at(MachineStatus::Running, Some(now_unix() - 60))
             .expect("running machine should have started_at");
         assert!(!started.is_empty());
     }

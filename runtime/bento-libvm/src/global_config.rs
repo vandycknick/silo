@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use eyre::Context;
 use serde::Deserialize;
 
-use crate::layout::resolve_config_dir;
-use crate::models::NetworkDriverKind;
+use crate::network::NetworkDriverKind;
+use crate::paths::resolve_default_config_dir;
 
 const CONFIG_FILE_NAME: &str = "config.yaml";
 
@@ -54,9 +54,7 @@ impl Default for NetworkingConfig {
 }
 
 fn config_path() -> eyre::Result<PathBuf> {
-    resolve_config_dir()
-        .map(|base| base.join(CONFIG_FILE_NAME))
-        .ok_or_else(|| eyre::eyre!("resolve ~/.config/bento path"))
+    Ok(resolve_default_config_dir()?.join(CONFIG_FILE_NAME))
 }
 
 fn parse_global_config(input: &str) -> eyre::Result<GlobalConfig> {

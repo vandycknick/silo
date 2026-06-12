@@ -29,50 +29,49 @@ impl Cmd {
             .get_machine(&MachineRef::parse(self.name.clone())?)
             .await?;
         let inspection = machine.inspect().await?;
-        let config = inspection.config;
-        let state = inspection.state;
-        let state = if state.status.is_running() {
+        let state = if inspection.is_running() {
             "running"
         } else {
             "stopped"
         };
-        let network_name = config.network.name();
+        let network = inspection.network();
+        let network_name = network.name();
         if self.json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
-                    "id": config.id.to_string(),
-                    "name": &config.name,
+                    "id": inspection.id(),
+                    "name": inspection.name(),
                     "state": state,
-                    "profile": config.metadata.get(PROFILE_METADATA_KEY).cloned(),
-                    "image": &config.image_ref,
-                    "labels": &config.labels,
-                    "metadata": &config.metadata,
-                    "network": &config.network,
-                    "created_at": config.created_at,
-                    "dir": &config.instance_dir,
-                    "spec": &config.spec,
+                    "profile": inspection.metadata().get(PROFILE_METADATA_KEY).cloned(),
+                    "image": inspection.image_ref(),
+                    "labels": inspection.labels(),
+                    "metadata": inspection.metadata(),
+                    "network": network,
+                    "created_at": inspection.created_at(),
+                    "dir": inspection.instance_dir(),
+                    "spec": inspection.spec(),
                 }))?
             );
             return Ok(());
         }
-        println!("id: {}", config.id);
-        println!("name: {}", config.name);
+        println!("id: {}", inspection.id());
+        println!("name: {}", inspection.name());
         println!("state: {state}");
-        if let Some(profile) = config.metadata.get(PROFILE_METADATA_KEY) {
+        if let Some(profile) = inspection.metadata().get(PROFILE_METADATA_KEY) {
             println!("profile: {profile}");
         }
-        if !config.image_ref.is_empty() {
-            println!("image: {}", config.image_ref);
+        if !inspection.image_ref().is_empty() {
+            println!("image: {}", inspection.image_ref());
         }
         println!("network: {network_name}");
-        if !config.labels.is_empty() {
+        if !inspection.labels().is_empty() {
             println!("labels:");
-            for (key, value) in config.labels {
+            for (key, value) in inspection.labels() {
                 println!("  {key}: {value}");
             }
         }
-        println!("dir: {}", config.instance_dir.display());
+        println!("dir: {}", inspection.instance_dir().display());
         Ok(())
     }
 }

@@ -2,7 +2,6 @@ use std::fmt::{Display, Formatter};
 use std::io::{Read, Seek, SeekFrom};
 use std::time::Duration;
 
-use bento_libvm::InstanceFile;
 use bento_libvm::{MachineRef, Runtime};
 use clap::Args;
 
@@ -29,10 +28,7 @@ impl Cmd {
             .get_machine(&MachineRef::parse(self.name.clone())?)
             .await?;
         let inspection = machine.inspect().await?;
-        let path = inspection
-            .config
-            .instance_dir
-            .join(InstanceFile::VmmonTraceLog.as_str());
+        let path = inspection.trace_log_path();
         if !path.exists() {
             return Ok(());
         }

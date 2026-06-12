@@ -1,7 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::io::Write;
 
-use bento_libvm::{MachineRuntimeState, Runtime};
+use bento_libvm::{MachineStatus, Runtime};
 use clap::Args;
 use tabwriter::TabWriter;
 
@@ -35,15 +35,13 @@ impl Cmd {
             let values = inspections
                 .into_iter()
                 .map(|inspection| {
-                    let config = inspection.config;
-                    let state = inspection.state;
                     serde_json::json!({
-                        "id": config.id.to_string(),
-                        "name": config.name,
-                        "state": state_label(state.status),
-                        "profile": config.metadata.get(PROFILE_METADATA_KEY).cloned(),
-                        "image": config.image_ref,
-                        "created_at": config.created_at,
+                        "id": inspection.id(),
+                        "name": inspection.name(),
+                        "state": state_label(inspection.status()),
+                        "profile": inspection.metadata().get(PROFILE_METADATA_KEY).cloned(),
+                        "image": inspection.image_ref(),
+                        "created_at": inspection.created_at(),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -58,9 +56,7 @@ impl Cmd {
         )?;
 
         for inspection in inspections {
-            let config = inspection.config;
-            let state = inspection.state;
-            let hardware = config.spec.hardware.as_ref();
+            let hardware = inspection.spec().hardware.as_ref();
             let cpus = hardware
                 .and_then(|hardware| hardware.cpus)
                 .unwrap_or(1)
@@ -69,24 +65,25 @@ impl Cmd {
                 .and_then(|hardware| hardware.memory)
                 .unwrap_or(512)
                 .to_string();
-            let created = relative_time(config.created_at, now);
-            let status = status_label(state.status, state.started_at, now);
-            let profile = config
-                .metadata
+            let created = relative_time(inspection.created_at(), now);
+            let status = status_label(inspection.status(), inspection.started_at(), now);
+            let profile = inspection
+                .metadata()
                 .get(PROFILE_METADATA_KEY)
                 .map(String::as_str)
                 .unwrap_or("-");
-            let image = if config.image_ref.is_empty() {
+            let image = if inspection.image_ref().is_empty() {
                 "-"
             } else {
-                config.image_ref.as_str()
+                inspection.image_ref()
             };
+            let id = inspection.id();
 
             writeln!(
                 &mut out,
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                short_id(&config.id.to_string()),
-                config.name,
+                short_id(&id),
+                inspection.name(),
                 status,
                 profile,
                 image,
@@ -107,7 +104,7 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-fn state_label(state: MachineRuntimeState) -> &'static str {
+fn state_label(state: MachineStatus) -> &'static str {
     if state.is_running() {
         "running"
     } else {
@@ -115,7 +112,7 @@ fn state_label(state: MachineRuntimeState) -> &'static str {
     }
 }
 
-fn status_label(state: MachineRuntimeState, started_at: Option<i64>, now: i64) -> String {
+fn status_label(state: MachineStatus, started_at: Option<i64>, now: i64) -> String {
     if state.is_running() {
         let uptime = started_at
             .map(|started_at| relative_time(started_at, now))

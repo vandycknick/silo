@@ -16,8 +16,9 @@ use crate::certificate_authority;
 use crate::global_config::GlobalConfig;
 use crate::host_user::{self, HostUser};
 use crate::network::RuntimeNetwork;
+use crate::paths::{metadata_config_path_in, vm_spec_path_in, LocalPaths};
+use crate::resolve_mount_location;
 use crate::ssh_keys;
-use crate::{resolve_mount_location, InstanceFile, Layout};
 
 const ASSET_INITRAMFS_FILENAME: &str = "initramfs";
 const FORWARD_ENDPOINT_NAME: &str = "forward";
@@ -35,16 +36,16 @@ struct ForwardPluginUdsConfig {
 }
 
 pub(crate) fn prepare_instance_runtime(
-    layout: &Layout,
+    paths: &LocalPaths,
     instance_dir: &Path,
     name: &str,
     spec: &mut VmSpec,
     network: &RuntimeNetwork,
 ) -> eyre::Result<()> {
     normalize_runtime_mounts(spec)?;
-    let metadata_config = resolve_metadata_config(layout, name, spec, network)?;
+    let metadata_config = resolve_metadata_config(paths, name, spec, network)?;
     write_metadata_config_to_dir(instance_dir, &metadata_config)?;
-    prepare_runtime_initramfs(layout, spec)?;
+    prepare_runtime_initramfs(paths, spec)?;
     write_vm_spec_to_dir(instance_dir, spec)?;
 
     Ok(())
@@ -68,7 +69,7 @@ fn normalize_runtime_mounts(spec: &mut VmSpec) -> eyre::Result<()> {
 }
 
 fn write_vm_spec_to_dir(instance_dir: &Path, spec: &VmSpec) -> eyre::Result<()> {
-    let config_path = instance_dir.join(InstanceFile::Config.as_str());
+    let config_path = vm_spec_path_in(instance_dir);
     let config = serde_json::to_string_pretty(spec)
         .with_context(|| format!("serialize vm spec at {}", config_path.display()))?;
     std::fs::write(&config_path, config)
@@ -76,18 +77,18 @@ fn write_vm_spec_to_dir(instance_dir: &Path, spec: &VmSpec) -> eyre::Result<()> 
 }
 
 fn write_metadata_config_to_dir(instance_dir: &Path, config: &AgentConfig) -> eyre::Result<()> {
-    let config_path = instance_dir.join(InstanceFile::MetadataConfig.as_str());
+    let config_path = metadata_config_path_in(instance_dir);
     let rendered = render_metadata_config(config)?;
     std::fs::write(&config_path, rendered)
         .with_context(|| format!("write metadata config at {}", config_path.display()))
 }
 
-fn prepare_runtime_initramfs(layout: &Layout, spec: &mut VmSpec) -> eyre::Result<()> {
+fn prepare_runtime_initramfs(paths: &LocalPaths, spec: &mut VmSpec) -> eyre::Result<()> {
     if spec_initramfs(spec).is_some() {
         return Ok(());
     }
 
-    let initramfs = asset_path(layout, ASSET_INITRAMFS_FILENAME);
+    let initramfs = asset_path(paths, ASSET_INITRAMFS_FILENAME);
     ensure_asset(&initramfs, "guest initramfs")?;
 
     spec_kernel_mut(spec).initramfs = Some(initramfs);
@@ -114,7 +115,7 @@ fn spec_kernel_mut(spec: &mut VmSpec) -> &mut Kernel {
 }
 
 fn resolve_metadata_config(
-    layout: &Layout,
+    paths: &LocalPaths,
     name: &str,
     spec: &VmSpec,
     network: &RuntimeNetwork,
@@ -122,7 +123,7 @@ fn resolve_metadata_config(
     let host_user = host_user::current_host_user().context("resolve current host user")?;
     let user_keys = ssh_keys::ensure_user_ssh_keys().context("ensure user SSH keys")?;
     let global_config = GlobalConfig::load()?;
-    let certificate_authority_pem = certificate_authority_pem_for_config(layout, &global_config)?;
+    let certificate_authority_pem = certificate_authority_pem_for_config(paths, &global_config)?;
 
     let mut guest_runtime = resolve_guest_runtime_config(spec, network)?;
     guest_runtime.provision = resolve_provision_config(
@@ -136,8 +137,8 @@ fn resolve_metadata_config(
     Ok(guest_runtime)
 }
 
-fn asset_path(layout: &Layout, filename: &str) -> PathBuf {
-    layout.data_dir().join("assets").join(filename)
+fn asset_path(paths: &LocalPaths, filename: &str) -> PathBuf {
+    paths.assets_dir().join(filename)
 }
 
 fn ensure_asset(path: &Path, label: &str) -> eyre::Result<()> {
@@ -304,14 +305,14 @@ fn provision_mount_entries(spec: &VmSpec) -> Vec<ProvisionMountConfig> {
 }
 
 fn certificate_authority_pem_for_config(
-    layout: &Layout,
+    paths: &LocalPaths,
     config: &GlobalConfig,
 ) -> eyre::Result<String> {
     if let Some(path) = config.networking.netd.tls_ca_cert.as_deref() {
         return certificate_authority::read_certificate_authority_certificate(path);
     }
 
-    certificate_authority::ensure_certificate_authority_in(layout)
+    certificate_authority::ensure_certificate_authority_in(paths)
         .map(|authority| authority.certificate_pem)
 }
 
@@ -401,7 +402,7 @@ mod tests {
 
     use crate::host_user::HostUser;
     use crate::network::RuntimeNetwork;
-    use crate::Layout;
+    use crate::paths::LocalPaths;
 
     fn sample_spec(kernel_cmdline: Vec<String>) -> VmSpec {
         VmSpec {
@@ -753,7 +754,7 @@ mod tests {
         write_asset(&data_dir, "initramfs", b"initramfs");
         let mut spec = sample_spec(Vec::new());
 
-        prepare_runtime_initramfs(&Layout::new(&data_dir), &mut spec)
+        prepare_runtime_initramfs(&LocalPaths::new(&data_dir), &mut spec)
             .expect("prepare runtime initramfs");
 
         assert_eq!(
@@ -773,7 +774,7 @@ mod tests {
         let mut spec = sample_spec(Vec::new());
         spec_kernel_mut(&mut spec).initramfs = Some(PathBuf::from("custom-initramfs"));
 
-        prepare_runtime_initramfs(&Layout::new(&data_dir), &mut spec)
+        prepare_runtime_initramfs(&LocalPaths::new(&data_dir), &mut spec)
             .expect("explicit initramfs should be accepted");
 
         assert_eq!(

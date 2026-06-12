@@ -3,19 +3,28 @@ use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod api;
 mod core;
 mod netd_driver;
 mod vznat_driver;
+
+pub use api::{
+    NamedNetworkMode, NetworkDefinition, NetworkDriverKind, NetworkDriverPreference,
+    RequestedNetwork,
+};
 
 use serde::{Deserialize, Serialize};
 
 use crate::global_config::GlobalConfig;
 use crate::models::{
-    MachineConfig, NamedNetworkMode, NetworkDefinition, NetworkDriverKind, NetworkDriverPreference,
-    NetworkInstance, RequestedNetwork,
+    MachineConfig, NamedNetworkMode as ModelNamedNetworkMode,
+    NetworkDefinition as ModelNetworkDefinition,
+    NetworkDriverPreference as ModelNetworkDriverPreference, NetworkInstance,
+    RequestedNetwork as ModelRequestedNetwork,
 };
+use crate::paths::LocalPaths;
 use crate::store::{Database, Sqlite};
-use crate::{Layout, LibVmError, MachineId};
+use crate::{LibVmError, MachineId};
 
 use self::core::{
     NetworkDriver, NetworkDriverContext, NetworkRequest, NetworkScope, PreparedNetwork,
@@ -62,18 +71,18 @@ impl RuntimeNetwork {
 }
 
 pub(crate) async fn prepare_network_runtime(
-    layout: &Layout,
+    paths: &LocalPaths,
     db: &Sqlite,
     metadata: &MachineConfig,
 ) -> Result<RuntimeNetwork, LibVmError> {
-    reconcile_network_runtime(layout, db, metadata, false).await?;
+    reconcile_network_runtime(paths, db, metadata, false).await?;
 
     match metadata.network.clone() {
-        RequestedNetwork::None => {
-            remove_attached_network(layout, db, metadata.id).await?;
+        ModelRequestedNetwork::None => {
+            remove_attached_network(paths, db, metadata.id).await?;
             Ok(RuntimeNetwork::None)
         }
-        RequestedNetwork::Private { policy_ref } => {
+        ModelRequestedNetwork::Private { policy_ref } => {
             let global_config = load_global_config(&metadata.name)?;
             let request = NetworkRequest {
                 scope: NetworkScope::Private,
@@ -83,7 +92,7 @@ pub(crate) async fn prepare_network_runtime(
             prepare_with_driver(
                 selected_private_driver(global_config.networking.private_driver),
                 &NetworkDriverContext {
-                    layout,
+                    paths,
                     db,
                     metadata,
                     config: &global_config.networking,
@@ -93,7 +102,7 @@ pub(crate) async fn prepare_network_runtime(
             .await
             .map(|prepared| prepared.attachment)
         }
-        RequestedNetwork::Named { name, policy_ref } => {
+        ModelRequestedNetwork::Named { name, policy_ref } => {
             if policy_ref.is_some() {
                 return Err(LibVmError::NetworkRuntime {
                     reference: metadata.name.clone(),
@@ -109,13 +118,13 @@ pub(crate) async fn prepare_network_runtime(
                     message: format!("named network {:?} is not defined", name),
                 }
             })?;
-            resolve_named_network(layout, db, metadata, &definition).await
+            resolve_named_network(paths, db, metadata, &definition).await
         }
     }
 }
 
 pub(crate) async fn reconcile_network_runtime(
-    layout: &Layout,
+    paths: &LocalPaths,
     db: &Sqlite,
     metadata: &MachineConfig,
     monitor_running: bool,
@@ -127,18 +136,18 @@ pub(crate) async fn reconcile_network_runtime(
         .get_network_instance(&attachment.network_instance_id)
         .await?
     else {
-        remove_instance_network_link(layout, metadata.id)?;
+        remove_instance_network_link(paths, metadata.id)?;
         db.remove_network_attachment(metadata.id).await?;
         return Ok(());
     };
 
     if monitor_running && network_instance_is_alive(&instance) {
-        ensure_instance_network_link(layout, metadata.id, Path::new(&instance.runtime_dir))?;
+        ensure_instance_network_link(paths, metadata.id, Path::new(&instance.runtime_dir))?;
         return Ok(());
     }
 
     db.remove_network_attachment(metadata.id).await?;
-    remove_instance_network_link(layout, metadata.id)?;
+    remove_instance_network_link(paths, metadata.id)?;
     if db.count_network_attachments(&instance.id).await? == 0 {
         terminate_network_instance(&instance)?;
         db.remove_network_instance(&instance.id).await?;
@@ -148,19 +157,19 @@ pub(crate) async fn reconcile_network_runtime(
 }
 
 async fn resolve_named_network(
-    layout: &Layout,
+    paths: &LocalPaths,
     db: &Sqlite,
     metadata: &MachineConfig,
-    definition: &NetworkDefinition,
+    definition: &ModelNetworkDefinition,
 ) -> Result<RuntimeNetwork, LibVmError> {
     let global_config = load_global_config(&metadata.name)?;
     match definition.mode {
-        NamedNetworkMode::Nat => {
+        ModelNamedNetworkMode::Nat => {
             let driver = match definition.driver_preference {
-                NetworkDriverPreference::Auto | NetworkDriverPreference::Netd => {
+                ModelNetworkDriverPreference::Auto | ModelNetworkDriverPreference::Netd => {
                     NetworkDriverKind::Netd
                 }
-                NetworkDriverPreference::VzNat => NetworkDriverKind::VzNat,
+                ModelNetworkDriverPreference::VzNat => NetworkDriverKind::VzNat,
             };
             let request = NetworkRequest {
                 scope: NetworkScope::Named,
@@ -170,7 +179,7 @@ async fn resolve_named_network(
             prepare_with_driver(
                 selected_private_driver(driver),
                 &NetworkDriverContext {
-                    layout,
+                    paths,
                     db,
                     metadata,
                     config: &global_config.networking,
@@ -180,14 +189,14 @@ async fn resolve_named_network(
             .await
             .map(|prepared| prepared.attachment)
         }
-        NamedNetworkMode::Bridge => Err(LibVmError::NetworkRuntime {
+        ModelNamedNetworkMode::Bridge => Err(LibVmError::NetworkRuntime {
             reference: metadata.name.clone(),
             message: format!(
                 "named network {:?} uses bridge mode, which is not implemented yet",
                 definition.name
             ),
         }),
-        NamedNetworkMode::Isolated => Err(LibVmError::NetworkRuntime {
+        ModelNamedNetworkMode::Isolated => Err(LibVmError::NetworkRuntime {
             reference: metadata.name.clone(),
             message: format!(
                 "named network {:?} uses isolated mode, which is not implemented yet",
@@ -246,19 +255,19 @@ async fn prepare_with_driver(
 }
 
 pub(super) async fn remove_attached_network(
-    layout: &Layout,
+    paths: &LocalPaths,
     db: &Sqlite,
     machine_id: MachineId,
 ) -> Result<(), LibVmError> {
     let Some(attachment) = db.get_network_attachment(machine_id).await? else {
-        remove_instance_network_link(layout, machine_id)?;
+        remove_instance_network_link(paths, machine_id)?;
         return Ok(());
     };
     let instance = db
         .get_network_instance(&attachment.network_instance_id)
         .await?;
     db.remove_network_attachment(machine_id).await?;
-    remove_instance_network_link(layout, machine_id)?;
+    remove_instance_network_link(paths, machine_id)?;
     if let Some(instance) = instance {
         if db.count_network_attachments(&instance.id).await? == 0 {
             terminate_network_instance(&instance)?;
@@ -337,21 +346,21 @@ pub(super) fn serialize_json<T: Serialize>(value: &T, label: &str) -> Result<Str
 }
 
 pub(super) fn ensure_instance_network_link(
-    layout: &Layout,
+    paths: &LocalPaths,
     machine_id: MachineId,
     runtime_dir: &Path,
 ) -> Result<(), LibVmError> {
-    let link = layout.instance_network_link(machine_id);
-    remove_instance_network_link(layout, machine_id)?;
+    let link = paths.machine(machine_id).network_link();
+    remove_instance_network_link(paths, machine_id)?;
     symlink(runtime_dir, link)?;
     Ok(())
 }
 
 pub(super) fn remove_instance_network_link(
-    layout: &Layout,
+    paths: &LocalPaths,
     machine_id: MachineId,
 ) -> Result<(), LibVmError> {
-    let link = layout.instance_network_link(machine_id);
+    let link = paths.machine(machine_id).network_link();
     let metadata = match fs::symlink_metadata(&link) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),

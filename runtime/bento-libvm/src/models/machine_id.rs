@@ -5,30 +5,17 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct MachineId(Uuid);
+pub(crate) struct MachineId(Uuid);
 
 impl MachineId {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
-    pub fn from_uuid(uuid: Uuid) -> Self {
+    pub(crate) fn from_uuid(uuid: Uuid) -> Self {
         Self(uuid)
     }
-
-    pub fn as_uuid(&self) -> Uuid {
-        self.0
-    }
-
-    /// Returns the first 12 hex characters of the ID as a new `String`,
-    /// matching the short format used by `podman` and `docker`.
-    pub fn short(&self) -> String {
-        self.0.simple().to_string()[..SHORT_ID_LEN].to_string()
-    }
 }
-
-/// Number of hex characters shown in short ID output (matches podman/docker).
-pub const SHORT_ID_LEN: usize = 12;
 
 impl Default for MachineId {
     fn default() -> Self {
@@ -55,7 +42,7 @@ impl From<MachineId> for Uuid {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MachineIdParseError {
+pub(crate) enum MachineIdParseError {
     InvalidFormat(String),
 }
 
@@ -95,15 +82,14 @@ impl<'de> Deserialize<'de> for MachineId {
 /// Returns true if the input looks like a hex string that could be a machine
 /// ID prefix (3-32 hex characters). Requires at least 3 chars to avoid
 /// treating short names as ID prefixes.
-pub fn looks_like_id_prefix(input: &str) -> bool {
+pub(crate) fn looks_like_id_prefix(input: &str) -> bool {
     input.len() >= 3 && input.len() <= 32 && input.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::machine_id::looks_like_id_prefix;
-
-    use crate::MachineId;
+    use super::{looks_like_id_prefix, MachineId};
+    use uuid::Uuid;
 
     #[test]
     fn machine_id_round_trips_through_string() {
@@ -125,7 +111,7 @@ mod tests {
     #[test]
     fn machine_id_parses_dashed_uuid() {
         let id = MachineId::new();
-        let dashed = id.as_uuid().to_string();
+        let dashed = Uuid::from(id).to_string();
         let parsed: MachineId = dashed.parse().expect("parse dashed uuid");
         assert_eq!(parsed, id);
     }
@@ -147,15 +133,6 @@ mod tests {
         assert!(looks_like_id_prefix("a1b2c3"));
         assert!(looks_like_id_prefix("deadbeef"));
         assert!(looks_like_id_prefix("0123456789abcdef0123456789abcdef"));
-    }
-
-    #[test]
-    fn short_returns_first_12_chars() {
-        let id = MachineId::new();
-        let full = id.to_string();
-        let short = id.short();
-        assert_eq!(short.len(), 12);
-        assert_eq!(short, &full[..12]);
     }
 
     #[test]

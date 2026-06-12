@@ -12,10 +12,10 @@ use tokio::time::sleep;
 
 use crate::certificate_authority;
 use crate::global_config::NetdConfig;
-use crate::layout::resolve_config_dir;
 use crate::models::{MachineConfig, NetworkAttachment, NetworkInstance};
+use crate::paths::{resolve_default_config_dir, LocalPaths};
 use crate::store::{Database, Sqlite};
-use crate::{Layout, LibVmError, MachineId, NetworkPolicyRef};
+use crate::{LibVmError, MachineId, NetworkPolicyRef};
 
 use super::core::{NetworkDriver, NetworkDriverContext, NetworkRequest, PreparedNetwork};
 use super::{
@@ -65,7 +65,7 @@ async fn prepare_netd_runtime(
     ctx: &NetworkDriverContext<'_>,
     request: &NetworkRequest<'_>,
 ) -> Result<PreparedNetwork, LibVmError> {
-    let layout = ctx.layout;
+    let paths = ctx.paths;
     let db = ctx.db;
     let metadata = ctx.metadata;
     let config = ctx.config.netd.clone();
@@ -82,7 +82,7 @@ async fn prepare_netd_runtime(
             .await?
         {
             if instance_is_alive(&instance) {
-                return attach_existing_runtime(layout, db, metadata, &instance).await;
+                return attach_existing_runtime(paths, db, metadata, &instance).await;
             }
             db.remove_network_instance(&instance.id).await?;
             remove_runtime_dir(Path::new(&instance.runtime_dir))?;
@@ -90,18 +90,19 @@ async fn prepare_netd_runtime(
     }
 
     let network_id = MachineId::new().to_string();
-    let runtime_dir = layout.network_instance_dir(&network_id);
+    let network_paths = paths.network(&network_id);
+    let runtime_dir = network_paths.dir().to_path_buf();
     fs::create_dir_all(&runtime_dir)?;
-    ensure_instance_network_link(layout, metadata.id, &runtime_dir)?;
+    ensure_instance_network_link(paths, metadata.id, &runtime_dir)?;
 
-    let socket_path = layout.network_socket_path(&network_id);
-    let log_path = layout.network_log_path(&network_id);
-    let pid_path = layout.network_pid_path(&network_id);
-    let pcap_path = config.pcap.then(|| layout.network_pcap_path(&network_id));
+    let socket_path = network_paths.socket_path();
+    let log_path = network_paths.log_path();
+    let pid_path = network_paths.pid_path();
+    let pcap_path = config.pcap.then(|| network_paths.pcap_path());
     let policy_path = resolve_network_policy_path(metadata, request.policy_ref)?;
-    let secret_store_path = layout.secret_store_path();
+    let secret_store_path = paths.secret_store_path();
     let (tls_ca_cert_path, tls_ca_key_path) =
-        resolve_certificate_authority_paths(layout, &config, &metadata.name)?;
+        resolve_certificate_authority_paths(paths, &config, &metadata.name)?;
     remove_file_if_exists(&socket_path)?;
     remove_file_if_exists(&pid_path)?;
 
@@ -147,7 +148,7 @@ async fn prepare_netd_runtime(
     if let Err(err) = wait_for_socket(&socket_path).await {
         let _ = child.kill();
         let _ = child.wait();
-        let _ = super::remove_instance_network_link(layout, metadata.id);
+        let _ = super::remove_instance_network_link(paths, metadata.id);
         return Err(LibVmError::NetworkRuntime {
             reference: metadata.name.clone(),
             message: format!("{err} (preserved runtime dir: {})", runtime_dir.display()),
@@ -216,12 +217,12 @@ fn host_uses_user_network_runtime() -> bool {
 }
 
 async fn attach_existing_runtime(
-    layout: &Layout,
+    paths: &LocalPaths,
     db: &Sqlite,
     metadata: &MachineConfig,
     instance: &NetworkInstance,
 ) -> Result<PreparedNetwork, LibVmError> {
-    ensure_instance_network_link(layout, metadata.id, Path::new(&instance.runtime_dir))?;
+    ensure_instance_network_link(paths, metadata.id, Path::new(&instance.runtime_dir))?;
     let now = now_unix();
     let mac = format_mac(mac_from_machine_id(metadata.id));
     let attachment = network_attachment_from_instance(instance, mac.clone())?;
@@ -302,7 +303,7 @@ fn validate_policy_ref(
         });
     }
     policy_ref
-        .resolve(resolve_config_dir())
+        .resolve(resolve_config_dir_for_policy())
         .map(|_| ())
         .map_err(|message| LibVmError::NetworkRuntime {
             reference: reference.to_string(),
@@ -315,7 +316,7 @@ fn resolve_network_policy_path(
     policy_ref: Option<&NetworkPolicyRef>,
 ) -> Result<Option<PathBuf>, LibVmError> {
     policy_ref
-        .map(|policy_ref| policy_ref.resolve(resolve_config_dir()))
+        .map(|policy_ref| policy_ref.resolve(resolve_config_dir_for_policy()))
         .transpose()
         .map_err(|message| LibVmError::NetworkRuntime {
             reference: metadata.name.clone(),
@@ -324,7 +325,7 @@ fn resolve_network_policy_path(
 }
 
 fn resolve_certificate_authority_paths(
-    layout: &Layout,
+    paths: &LocalPaths,
     config: &NetdConfig,
     reference: &str,
 ) -> Result<(PathBuf, PathBuf), LibVmError> {
@@ -333,10 +334,12 @@ fn resolve_certificate_authority_paths(
             Ok((certificate_path.clone(), private_key_path.clone()))
         }
         (None, None) => {
-            let authority = certificate_authority::ensure_certificate_authority_in(layout)
-                .map_err(|err| LibVmError::NetworkRuntime {
-                    reference: reference.to_string(),
-                    message: format!("ensure certificate authority: {err}"),
+            let authority =
+                certificate_authority::ensure_certificate_authority_in(paths).map_err(|err| {
+                    LibVmError::NetworkRuntime {
+                        reference: reference.to_string(),
+                        message: format!("ensure certificate authority: {err}"),
+                    }
                 })?;
             Ok((authority.certificate_path, authority.private_key_path))
         }
@@ -347,6 +350,10 @@ fn resolve_certificate_authority_paths(
                     .to_string(),
         }),
     }
+}
+
+fn resolve_config_dir_for_policy() -> Option<PathBuf> {
+    resolve_default_config_dir().ok()
 }
 
 async fn wait_for_socket(path: &Path) -> Result<(), String> {
@@ -418,7 +425,8 @@ mod tests {
     use std::process::Command;
 
     use crate::global_config::NetdConfig;
-    use crate::{Layout, MachineId};
+    use crate::paths::LocalPaths;
+    use crate::MachineId;
 
     #[test]
     fn netd_command_disables_default_ssh_forward() {
@@ -500,7 +508,7 @@ mod tests {
     #[test]
     fn certificate_authority_paths_use_config_overrides() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let layout = Layout::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("bento"));
         let config = NetdConfig {
             tls_ca_cert: Some(PathBuf::from("/tmp/custom-ca.pem")),
             tls_ca_key: Some(PathBuf::from("/tmp/custom-ca-key.pem")),
@@ -508,25 +516,25 @@ mod tests {
         };
 
         let (certificate_path, private_key_path) =
-            resolve_certificate_authority_paths(&layout, &config, "test-machine")
+            resolve_certificate_authority_paths(&paths, &config, "test-machine")
                 .expect("resolve configured CA paths");
 
         assert_eq!(certificate_path, PathBuf::from("/tmp/custom-ca.pem"));
         assert_eq!(private_key_path, PathBuf::from("/tmp/custom-ca-key.pem"));
-        assert!(!layout.keys_dir().exists());
+        assert!(!paths.keys_dir().exists());
     }
 
     #[test]
     fn certificate_authority_paths_generate_defaults() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let layout = Layout::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("bento"));
 
         let (certificate_path, private_key_path) =
-            resolve_certificate_authority_paths(&layout, &NetdConfig::default(), "test-machine")
+            resolve_certificate_authority_paths(&paths, &NetdConfig::default(), "test-machine")
                 .expect("resolve generated CA paths");
 
-        assert_eq!(certificate_path, layout.keys_dir().join("ca.pem"));
-        assert_eq!(private_key_path, layout.keys_dir().join("ca-key.pem"));
+        assert_eq!(certificate_path, paths.keys_dir().join("ca.pem"));
+        assert_eq!(private_key_path, paths.keys_dir().join("ca-key.pem"));
         assert!(certificate_path.is_file());
         assert!(private_key_path.is_file());
     }
@@ -534,13 +542,13 @@ mod tests {
     #[test]
     fn certificate_authority_paths_reject_partial_config() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let layout = Layout::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("bento"));
         let config = NetdConfig {
             tls_ca_cert: Some(PathBuf::from("/tmp/custom-ca.pem")),
             ..NetdConfig::default()
         };
 
-        let err = resolve_certificate_authority_paths(&layout, &config, "test-machine")
+        let err = resolve_certificate_authority_paths(&paths, &config, "test-machine")
             .expect_err("reject partial CA config");
 
         assert!(err.to_string().contains(

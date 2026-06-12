@@ -6,7 +6,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
 };
 
-use crate::Layout;
+use crate::paths::LocalPaths;
 
 const CERTIFICATE_FILE_NAME: &str = "ca.pem";
 const PRIVATE_KEY_FILE_NAME: &str = "ca-key.pem";
@@ -20,14 +20,14 @@ pub struct CertificateAuthority {
 }
 
 pub fn ensure_certificate_authority() -> eyre::Result<CertificateAuthority> {
-    let layout = Layout::from_env()?;
-    ensure_certificate_authority_in(&layout)
+    let paths = LocalPaths::from_env()?;
+    ensure_certificate_authority_in(&paths)
 }
 
 pub(crate) fn ensure_certificate_authority_in(
-    layout: &Layout,
+    paths: &LocalPaths,
 ) -> eyre::Result<CertificateAuthority> {
-    let keys_dir = layout.keys_dir();
+    let keys_dir = paths.keys_dir();
     fs::create_dir_all(&keys_dir)
         .with_context(|| format!("create bento keys directory {}", keys_dir.display()))?;
     set_keys_dir_permissions(&keys_dir)?;
@@ -216,14 +216,14 @@ mod tests {
     #[test]
     fn ensure_certificate_authority_creates_files_in_keys_dir() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let layout = Layout::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("bento"));
 
-        let authority = ensure_certificate_authority_in(&layout).expect("ensure CA");
+        let authority = ensure_certificate_authority_in(&paths).expect("ensure CA");
 
-        assert_eq!(authority.certificate_path, layout.keys_dir().join("ca.pem"));
+        assert_eq!(authority.certificate_path, paths.keys_dir().join("ca.pem"));
         assert_eq!(
             authority.private_key_path,
-            layout.keys_dir().join("ca-key.pem")
+            paths.keys_dir().join("ca-key.pem")
         );
         assert!(authority.certificate_pem.contains("BEGIN CERTIFICATE"));
         assert!(authority.certificate_path.is_file());
@@ -233,9 +233,9 @@ mod tests {
     #[test]
     fn ensure_certificate_authority_reuses_existing_files() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let layout = Layout::new(temp.path().join("bento"));
-        let first = ensure_certificate_authority_in(&layout).expect("ensure CA");
-        let second = ensure_certificate_authority_in(&layout).expect("reuse CA");
+        let paths = LocalPaths::new(temp.path().join("bento"));
+        let first = ensure_certificate_authority_in(&paths).expect("ensure CA");
+        let second = ensure_certificate_authority_in(&paths).expect("reuse CA");
 
         assert_eq!(second.certificate_path, first.certificate_path);
         assert_eq!(second.private_key_path, first.private_key_path);
@@ -245,11 +245,11 @@ mod tests {
     #[test]
     fn ensure_certificate_authority_rejects_partial_files() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let layout = Layout::new(temp.path().join("bento"));
-        fs::create_dir_all(layout.keys_dir()).expect("create keys dir");
-        fs::write(layout.keys_dir().join("ca.pem"), "certificate").expect("write cert");
+        let paths = LocalPaths::new(temp.path().join("bento"));
+        fs::create_dir_all(paths.keys_dir()).expect("create keys dir");
+        fs::write(paths.keys_dir().join("ca.pem"), "certificate").expect("write cert");
 
-        let err = ensure_certificate_authority_in(&layout).expect_err("reject partial CA");
+        let err = ensure_certificate_authority_in(&paths).expect_err("reject partial CA");
 
         assert!(err.to_string().contains("must exist together"));
     }
@@ -260,9 +260,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("create tempdir");
-        let layout = Layout::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("bento"));
 
-        let authority = ensure_certificate_authority_in(&layout).expect("ensure CA");
+        let authority = ensure_certificate_authority_in(&paths).expect("ensure CA");
 
         let mode = fs::metadata(authority.private_key_path)
             .expect("stat private key")

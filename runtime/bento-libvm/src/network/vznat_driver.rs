@@ -35,8 +35,8 @@ impl NetworkDriver for VzNatDriver {
         ctx: &NetworkDriverContext<'_>,
         _request: &NetworkRequest<'_>,
     ) -> Result<PreparedNetwork, LibVmError> {
-        remove_attached_network(ctx.layout, ctx.db, ctx.metadata.id).await?;
-        let runtime_dir = ctx.layout.instance_network_link(ctx.metadata.id);
+        remove_attached_network(ctx.paths, ctx.db, ctx.metadata.id).await?;
+        let runtime_dir = ctx.paths.machine(ctx.metadata.id).network_link();
         fs::create_dir_all(&runtime_dir)?;
         let attachment = RuntimeNetwork::VzNat { mac: None };
         Ok(PreparedNetwork { attachment })
@@ -50,11 +50,13 @@ mod tests {
 
     use super::VzNatDriver;
     use crate::global_config::{NetdConfig, NetworkingConfig};
-    use crate::models::{MachineConfig, NetworkDriverKind, RequestedNetwork};
+    use crate::models::{MachineConfig, RequestedNetwork};
     use crate::network::core::{NetworkDriver, NetworkDriverContext, NetworkRequest, NetworkScope};
+    use crate::network::NetworkDriverKind;
     use crate::network::RuntimeNetwork;
+    use crate::paths::LocalPaths;
     use crate::store::{Database, Sqlite};
-    use crate::{Layout, MachineId};
+    use crate::MachineId;
     use bento_vm_spec::VmSpec;
 
     use crate::NetworkPolicyRef;
@@ -125,13 +127,13 @@ mod tests {
     #[tokio::test]
     async fn vznat_prepare_writes_instance_runtime_file() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        let layout = Layout::new(dir.path());
-        let db = Sqlite::new(&layout).await.expect("open db");
+        let paths = LocalPaths::new(dir.path());
+        let db = Sqlite::new(&paths).await.expect("open db");
         let machine_id = MachineId::new();
         let metadata = machine_from_path(
             machine_id,
             "devbox".to_string(),
-            &layout.instance_dir(machine_id),
+            paths.machine(machine_id).dir(),
         );
         let config = NetworkingConfig {
             private_driver: NetworkDriverKind::VzNat,
@@ -142,7 +144,7 @@ mod tests {
         let prepared = driver
             .prepare(
                 &NetworkDriverContext {
-                    layout: &layout,
+                    paths: &paths,
                     db: &db,
                     metadata: &metadata,
                     config: &config,

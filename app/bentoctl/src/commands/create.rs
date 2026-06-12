@@ -102,14 +102,11 @@ impl Display for Cmd {
 impl Cmd {
     pub async fn run(&self, libvm: &Runtime) -> eyre::Result<()> {
         let mut resolved = self.resolve()?;
-        let layout = libvm
-            .local_layout()
-            .ok_or_else(|| eyre::eyre!("local runtime layout is unavailable"))?;
-        let boot_assets = resolve_boot_assets(
-            layout.data_dir(),
-            resolved.kernel.take(),
-            resolved.initramfs.take(),
-        );
+        let data_dir = libvm
+            .local_data_dir()
+            .ok_or_else(|| eyre::eyre!("local runtime data directory is unavailable"))?;
+        let boot_assets =
+            resolve_boot_assets(data_dir, resolved.kernel.take(), resolved.initramfs.take());
         let base_rootfs = get_base_rootfs_image(libvm, &resolved.image_ref).await?;
         record_base_rootfs_metadata(&mut resolved.metadata, &base_rootfs);
         let request = MachineCreate {

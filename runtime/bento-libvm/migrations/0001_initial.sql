@@ -60,6 +60,13 @@ BEGIN
     SELECT RAISE(ABORT, 'db_config.created_at is immutable');
 END;
 
+CREATE TRIGGER IF NOT EXISTS db_config_singleton
+BEFORE INSERT ON db_config
+WHEN (SELECT COUNT(*) FROM db_config) > 0
+BEGIN
+    SELECT RAISE(ABORT, 'db_config allows exactly one row');
+END;
+
 CREATE TRIGGER IF NOT EXISTS machine_config_created_at_immutable
 BEFORE UPDATE OF created_at ON machine_config
 BEGIN

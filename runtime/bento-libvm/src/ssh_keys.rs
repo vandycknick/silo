@@ -5,7 +5,7 @@ use eyre::{eyre, Context};
 use ssh_key::private::Ed25519Keypair;
 use ssh_key::{LineEnding, PrivateKey};
 
-use crate::layout::resolve_config_dir;
+use crate::paths::resolve_default_config_dir;
 
 #[derive(Debug, Clone)]
 pub struct UserSshKeys {
@@ -15,8 +15,7 @@ pub struct UserSshKeys {
 }
 
 pub fn ensure_user_ssh_keys() -> eyre::Result<UserSshKeys> {
-    let config_home =
-        resolve_config_dir().ok_or_else(|| eyre!("unable to resolve bento config home"))?;
+    let config_home = resolve_default_config_dir().map_err(|err| eyre!(err))?;
     fs::create_dir_all(&config_home).context("create bento config home")?;
 
     let private_key_path = config_home.join("id_ed25519");

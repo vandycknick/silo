@@ -2,12 +2,13 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::MachineId;
-
 #[derive(Debug, Error)]
 pub enum LibVmError {
     #[error("could not resolve Bento data directory from XDG_DATA_HOME or HOME")]
     DataDirUnavailable,
+
+    #[error("could not resolve Bento config directory from XDG_CONFIG_HOME or HOME")]
+    ConfigDirUnavailable,
 
     #[error("environment variable {name} must be an absolute path, got {path}")]
     RelativeEnvironmentPath { name: &'static str, path: PathBuf },
@@ -22,7 +23,7 @@ pub enum LibVmError {
     MachineNotFound { reference: String },
 
     #[error("machine {id} already exists")]
-    MachineIdAlreadyExists { id: MachineId },
+    MachineIdAlreadyExists { id: String },
 
     #[error("machine {reference} is already running")]
     MachineAlreadyRunning { reference: String },
@@ -54,7 +55,7 @@ pub enum LibVmError {
     UnsupportedHostArchitecture { arch: String },
 
     #[error("machine {id} metadata is missing required field {field}")]
-    CorruptState { id: MachineId, field: &'static str },
+    CorruptState { id: String, field: &'static str },
 
     #[error("failed to serialize VmSpec for machine {name:?}")]
     VmSpecSerializeFailed {
@@ -65,7 +66,7 @@ pub enum LibVmError {
 
     #[error("failed to load VmSpec for machine {id} from {path}")]
     VmSpecLoadFailed {
-        id: MachineId,
+        id: String,
         path: PathBuf,
         #[source]
         source: serde_json::Error,

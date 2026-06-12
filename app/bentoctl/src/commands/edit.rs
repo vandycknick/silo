@@ -28,12 +28,14 @@ impl Cmd {
         let machine_ref = MachineRef::parse(self.name.clone())?;
         let machine = libvm.get_machine(&machine_ref).await?;
         let inspection = machine.inspect().await?;
-        let config = inspection.config;
-        if inspection.state.status.is_running() {
-            eyre::bail!("VM `{}` is running; stop it before editing", config.name);
+        if inspection.is_running() {
+            eyre::bail!(
+                "VM `{}` is running; stop it before editing",
+                inspection.name()
+            );
         }
 
-        let edit_file = EditFile::create(&config.name, &config.spec)?;
+        let edit_file = EditFile::create(inspection.name(), inspection.spec())?;
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
         let status = Command::new(editor).arg(edit_file.path()).status()?;
         if !status.success() {
@@ -45,7 +47,7 @@ impl Cmd {
         let edited: VmSpec = serde_json::from_str(&raw)
             .with_context(|| format!("parse edited config {}", edit_file.path().display()))?;
         let updated = machine.replace_config(edited).await?;
-        println!("updated {}", updated.config.name);
+        println!("updated {}", updated.name());
         Ok(())
     }
 }
