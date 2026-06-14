@@ -46,8 +46,6 @@ pub struct BentoCtlCmd {
 pub enum Command {
     Run(run::Cmd),
     Create(create::Cmd),
-    #[command(name = "new", hide = true)]
-    New(create::Cmd),
     Start(start::Cmd),
     Stop(stop::Cmd),
     Restart(restart::Cmd),
@@ -77,7 +75,6 @@ impl Display for Command {
         match self {
             Command::Create(cmd) => write!(f, "create {}", cmd),
             Command::Run(cmd) => write!(f, "run {}", cmd),
-            Command::New(cmd) => write!(f, "new {}", cmd),
             Command::Start(cmd) => write!(f, "start {}", cmd),
             Command::Stop(cmd) => write!(f, "stop {}", cmd),
             Command::Restart(cmd) => write!(f, "restart {}", cmd),
@@ -119,10 +116,6 @@ impl BentoCtlCmd {
                 cmd.run(&libvm).await
             }
             Command::Create(cmd) => {
-                let libvm = libvm().await?;
-                cmd.run(&libvm).await
-            }
-            Command::New(cmd) => {
                 let libvm = libvm().await?;
                 cmd.run(&libvm).await
             }

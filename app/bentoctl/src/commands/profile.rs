@@ -30,7 +30,7 @@ impl Display for Cmd {
 
 #[derive(Subcommand, Debug)]
 pub enum ProfileSubcommand {
-    #[command(about = "List available profiles")]
+    #[command(about = "List available profiles", visible_alias = "ls")]
     List(ListCmd),
     #[command(about = "Show a profile")]
     Show(ShowCmd),
