@@ -526,7 +526,7 @@ impl LocalRuntime {
         &self,
         machine_id: MachineId,
     ) -> Result<MachineInspectData, LibVmError> {
-        let (config, pid_path, trace_path, sync_read) = {
+        let config = {
             let LockedMachine { _lock, config } =
                 self.lock_machine_config_by_id(machine_id).await?;
             let machine_paths = self.paths.machine(config.id);
@@ -597,24 +597,36 @@ impl LocalRuntime {
                 return Err(err.into());
             }
 
-            (config, pid_path, trace_path, sync_read)
-        };
+            if let Err(err) = wait_for_monitor_start(sync_read, &trace_path).await {
+                self.mark_machine_stopped(config.id, Some(err.to_string()))
+                    .await?;
+                return Err(err);
+            }
 
-        if let Err(err) = wait_for_monitor_start(sync_read, &trace_path).await {
-            let _lock = self.acquire_machine_lock(config.lock_id).await?;
-            self.mark_machine_stopped(config.id, Some(err.to_string()))
-                .await?;
-            return Err(err);
-        }
-
-        {
-            let _lock = self.acquire_machine_lock(config.lock_id).await?;
-            let pid = read_monitor_pid(&pid_path)?;
-            if !process_is_alive(pid)? {
-                return Err(LibVmError::MonitorConnection {
+            let pid = match read_monitor_pid(&pid_path) {
+                Ok(pid) => pid,
+                Err(err) => {
+                    self.mark_machine_stopped(config.id, Some(err.to_string()))
+                        .await?;
+                    return Err(err.into());
+                }
+            };
+            let alive = match process_is_alive(pid) {
+                Ok(alive) => alive,
+                Err(err) => {
+                    self.mark_machine_stopped(config.id, Some(err.to_string()))
+                        .await?;
+                    return Err(err);
+                }
+            };
+            if !alive {
+                let err = LibVmError::MonitorConnection {
                     reference: config.name.clone(),
                     message: format!("vmmon pid {pid} from {} is not running", pid_path.display()),
-                });
+                };
+                self.mark_machine_stopped(config.id, Some(err.to_string()))
+                    .await?;
+                return Err(err);
             }
             let started_at = pid_file_mtime(&pid_path);
             self.set_machine_state(
@@ -625,7 +637,9 @@ impl LocalRuntime {
                 None,
             )
             .await?;
-        }
+
+            config
+        };
         self.machine_inspect_data(config).await
     }
 
@@ -647,38 +661,57 @@ impl LocalRuntime {
         &self,
         machine_id: MachineId,
     ) -> Result<MachineInspectData, LibVmError> {
-        let (config, pid_path) = {
+        let (config, pid_path, wait_for_stop) = {
             let LockedMachine { _lock, config } =
                 self.lock_machine_config_by_id(machine_id).await?;
             let pid_path = self.paths.machine(config.id).vmmon_pid_path();
             let status = self.reconcile_machine_runtime_locked(&config).await?;
-            if !status.is_running() {
+            if matches!(
+                status.state,
+                MachineRuntimeState::Stopped | MachineRuntimeState::Error
+            ) {
                 return Err(LibVmError::MachineNotRunning {
                     reference: config.name.clone(),
                 });
             }
-            let pid = read_monitor_pid(&pid_path)?;
 
-            self.set_machine_state(
-                config.id,
-                MachineRuntimeState::Stopping,
-                Some(pid),
-                status.started_at,
-                None,
-            )
-            .await?;
+            match live_monitor_pid(&pid_path)? {
+                Some(pid) if status.state == MachineRuntimeState::Stopping => {
+                    (config, pid_path, true)
+                }
+                Some(pid) => {
+                    if interrupt_monitor(pid)? {
+                        self.set_machine_state(
+                            config.id,
+                            MachineRuntimeState::Stopping,
+                            Some(pid),
+                            status.started_at,
+                            None,
+                        )
+                        .await?;
 
-            kill(Pid::from_raw(pid), Some(Signal::SIGINT))
-                .map_err(|err| io::Error::other(err.to_string()))?;
-
-            (config, pid_path)
+                        (config, pid_path, true)
+                    } else {
+                        self.mark_machine_stopped(config.id, None).await?;
+                        reconcile_network_runtime(&self.paths, &self.db, &config, false).await?;
+                        (config, pid_path, false)
+                    }
+                }
+                None => {
+                    self.mark_machine_stopped(config.id, None).await?;
+                    reconcile_network_runtime(&self.paths, &self.db, &config, false).await?;
+                    (config, pid_path, false)
+                }
+            }
         };
 
-        wait_for_monitor_stop(&pid_path, &config.name).await?;
-        {
-            let _lock = self.acquire_machine_lock(config.lock_id).await?;
-            self.mark_machine_stopped(config.id, None).await?;
-            reconcile_network_runtime(&self.paths, &self.db, &config, false).await?;
+        if wait_for_stop {
+            wait_for_monitor_stop(&pid_path, &config.name).await?;
+            {
+                let _lock = self.acquire_machine_lock(config.lock_id).await?;
+                self.mark_machine_stopped(config.id, None).await?;
+                reconcile_network_runtime(&self.paths, &self.db, &config, false).await?;
+            }
         }
         self.machine_inspect_data(config).await
     }
@@ -1154,7 +1187,7 @@ fn spawn_vmmon(launch: &VmmonLaunch<'_>) -> Result<VmmonHandshake, LibVmError> {
     clear_cloexec(&start_read)?;
     clear_cloexec(&sync_write)?;
 
-    command
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1162,11 +1195,25 @@ fn spawn_vmmon(launch: &VmmonLaunch<'_>) -> Result<VmmonHandshake, LibVmError> {
 
     drop(start_read);
     drop(sync_write);
+    wait_for_vmmon_launcher(child)?;
 
     Ok(VmmonHandshake {
         start_write,
         sync_read,
     })
+}
+
+fn wait_for_vmmon_launcher(mut child: std::process::Child) -> io::Result<()> {
+    // NOTE: This should eventually use a short timeout so Bento fails hard if
+    // vmmon does not daemonize promptly instead of blocking forever here.
+    let status = child.wait()?;
+    if status.success() {
+        return Ok(());
+    }
+
+    Err(io::Error::other(format!(
+        "vmmon launcher exited with {status}"
+    )))
 }
 
 fn resolve_vmmon_executable() -> Result<PathBuf, LibVmError> {
@@ -1303,12 +1350,33 @@ fn read_monitor_pid(pid_path: &Path) -> io::Result<i32> {
     })
 }
 
+fn live_monitor_pid(pid_path: &Path) -> Result<Option<i32>, LibVmError> {
+    let pid = match read_monitor_pid(pid_path) {
+        Ok(pid) => pid,
+        Err(_) => return Ok(None),
+    };
+
+    if process_is_alive(pid)? {
+        Ok(Some(pid))
+    } else {
+        Ok(None)
+    }
+}
+
 fn process_is_alive(pid: i32) -> Result<bool, LibVmError> {
     match kill(Pid::from_raw(pid), None) {
         Ok(()) => Ok(true),
         Err(Errno::ESRCH) => Ok(false),
         Err(Errno::EPERM) => Ok(true),
         Err(err) => Err(io::Error::other(err.to_string()).into()),
+    }
+}
+
+fn interrupt_monitor(pid: i32) -> io::Result<bool> {
+    match kill(Pid::from_raw(pid), Some(Signal::SIGINT)) {
+        Ok(()) => Ok(true),
+        Err(Errno::ESRCH) => Ok(false),
+        Err(err) => Err(io::Error::other(err.to_string())),
     }
 }
 
@@ -1948,6 +2016,68 @@ mod tests {
         assert_eq!(inspect_data.status, MachineStatus::Stopped);
         assert_eq!(state.status, MachineRuntimeState::Stopped);
         drop(child);
+    }
+
+    #[tokio::test]
+    async fn stop_starting_without_live_monitor_marks_machine_stopped() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let runtime = LocalRuntime::new(
+            LocalPaths::new(temp.path().join("bento")),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .expect("create runtime");
+
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+        runtime
+            .set_machine_state(machine.id, MachineRuntimeState::Starting, None, None, None)
+            .await
+            .expect("set starting state");
+
+        let inspect_data = runtime.stop_by_id(machine.id).await.expect("stop machine");
+        let state = runtime
+            .machine_state(machine.id)
+            .await
+            .expect("read machine state");
+
+        assert_eq!(inspect_data.status, MachineStatus::Stopped);
+        assert_eq!(state.status, MachineRuntimeState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn stop_stopping_without_live_monitor_marks_machine_stopped() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let runtime = LocalRuntime::new(
+            LocalPaths::new(temp.path().join("bento")),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .expect("create runtime");
+
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+        runtime
+            .set_machine_state(machine.id, MachineRuntimeState::Stopping, None, None, None)
+            .await
+            .expect("set stopping state");
+
+        let inspect_data = runtime.stop_by_id(machine.id).await.expect("stop machine");
+        let state = runtime
+            .machine_state(machine.id)
+            .await
+            .expect("read machine state");
+
+        assert_eq!(inspect_data.status, MachineStatus::Stopped);
+        assert_eq!(state.status, MachineRuntimeState::Stopped);
     }
 
     #[tokio::test]

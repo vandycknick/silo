@@ -34,4 +34,25 @@ The main shapes are:
 - `MachineCreate` and `MachineUpdate`, request DTOs for caller input.
 - `MachineInspectData`, an owned snapshot returned by inspect and mutation calls.
 
+## Lifecycle States
+
+`bento-libvm` treats VM lifecycle mutations as lock-owned transactions. Commands
+that change a VM, such as start, stop, update, and remove, serialize on the
+machine lock. Observing commands, such as inspect and list, prefer returning the
+last persisted state over blocking when another process owns the machine lock.
+
+The persisted machine states mean:
+
+- `stopped`: no live `vmmon` is associated with the VM.
+- `starting`: a start transaction owns the VM and is waiting for the host-side
+  `vmmon` startup handshake to finish.
+- `running`: `vmmon` is alive and the host-side startup handshake succeeded.
+- `stopping`: a stop signal was sent to `vmmon` and Bento is waiting for the
+  monitor to exit.
+- `error`: the VM is not usable until an explicit lifecycle command repairs or
+  replaces the state.
+
+Guest-agent readiness is not part of the host-side lifecycle lock. A VM can be
+`running` while the CLI is still waiting for the guest agent to register.
+
 See the generated Rust docs for the full method and field-level API.

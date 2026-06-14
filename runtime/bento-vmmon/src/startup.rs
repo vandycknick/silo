@@ -44,6 +44,7 @@ impl InheritedPipeFds {
         Ok(self)
     }
 
+    #[cfg(target_os = "macos")]
     pub fn clear_cloexec(self) -> eyre::Result<()> {
         for fd in [self.startpipe, self.syncpipe].into_iter().flatten() {
             set_cloexec(fd, false).map_err(|err| eyre::eyre!("clear CLOEXEC on fd {fd}: {err}"))?;
