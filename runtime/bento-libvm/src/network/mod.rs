@@ -9,25 +9,24 @@ mod netd_driver;
 mod vznat_driver;
 
 pub use api::{
-    NamedNetworkMode, NetworkDefinition, NetworkDriverKind, NetworkDriverPreference,
-    RequestedNetwork,
+    MachineNetworkConfig, NetworkDefinition, NetworkDriverKind, NetworkDriverPreference,
+    NetworkTopology,
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{
-    MachineConfig, NamedNetworkMode as ModelNamedNetworkMode,
+use crate::paths::LocalPaths;
+use crate::store::models::MachineId;
+use crate::store::models::{
+    MachineConfig, MachineNetworkConfig as ModelMachineNetworkConfig,
     NetworkDefinition as ModelNetworkDefinition,
     NetworkDriverPreference as ModelNetworkDriverPreference, NetworkInstance,
-    RequestedNetwork as ModelRequestedNetwork,
+    NetworkTopology as ModelNetworkTopology,
 };
-use crate::paths::LocalPaths;
 use crate::store::{Database, Sqlite};
-use crate::{LibVmError, MachineId, RuntimeNetworkingConfig};
+use crate::{LibVmError, RuntimeNetworkingConfig};
 
-use self::core::{
-    NetworkDriver, NetworkDriverContext, NetworkRequest, NetworkScope, PreparedNetwork,
-};
+use self::core::{NetworkAttachmentRequest, NetworkDriver, NetworkDriverContext};
 use self::netd_driver::NetdDriver;
 use self::vznat_driver::VzNatDriver;
 
@@ -36,7 +35,12 @@ const DRIVER_VZNAT: &str = "vznat";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum RuntimeNetwork {
+/// Resolved network attachment passed to vmmon.
+///
+/// This is neither the public desired network (`MachineNetworkConfig`) nor the stored
+/// network model. Drivers produce this after resolving policy, named networks,
+/// runtime directories, and persisted attachments.
+pub(crate) enum VmmonNetworkAttachment {
     None,
     VzNat {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,25 +50,15 @@ pub(crate) enum RuntimeNetwork {
         path: std::path::PathBuf,
         mac: String,
     },
-    UnixStream {
-        path: std::path::PathBuf,
-        mac: String,
-    },
-    Tap {
-        name: String,
-        mac: String,
-    },
 }
 
-impl RuntimeNetwork {
+impl VmmonNetworkAttachment {
     pub(crate) fn to_vmmon_arg(&self) -> String {
         match self {
             Self::None => "none".to_string(),
             Self::VzNat { mac: None } => "vznat".to_string(),
             Self::VzNat { mac: Some(mac) } => format!("vznat,mac={mac}"),
             Self::UnixDatagram { path, mac } => format!("unixdg,{},mac={mac}", path.display()),
-            Self::UnixStream { path, mac } => format!("unixstream,{},mac={mac}", path.display()),
-            Self::Tap { name, mac } => format!("tap,{name},mac={mac}"),
         }
     }
 }
@@ -74,20 +68,16 @@ pub(crate) async fn prepare_network_runtime(
     db: &Sqlite,
     metadata: &MachineConfig,
     config: &RuntimeNetworkingConfig,
-) -> Result<RuntimeNetwork, LibVmError> {
+) -> Result<VmmonNetworkAttachment, LibVmError> {
     reconcile_network_runtime(paths, db, metadata, false).await?;
 
     match metadata.network.clone() {
-        ModelRequestedNetwork::None => {
+        ModelMachineNetworkConfig::None => {
             remove_attached_network(paths, db, metadata.id).await?;
-            Ok(RuntimeNetwork::None)
+            Ok(VmmonNetworkAttachment::None)
         }
-        ModelRequestedNetwork::Private { policy_ref } => {
-            let request = NetworkRequest {
-                scope: NetworkScope::Private,
-                definition_name: None,
-                policy_ref: policy_ref.as_ref(),
-            };
+        ModelMachineNetworkConfig::Private { policy_ref } => {
+            let request = NetworkAttachmentRequest::private(policy_ref.as_ref());
             prepare_with_driver(
                 selected_private_driver(config.private_driver),
                 &NetworkDriverContext {
@@ -99,18 +89,8 @@ pub(crate) async fn prepare_network_runtime(
                 &request,
             )
             .await
-            .map(|prepared| prepared.attachment)
         }
-        ModelRequestedNetwork::Named { name, policy_ref } => {
-            if policy_ref.is_some() {
-                return Err(LibVmError::NetworkRuntime {
-                    reference: metadata.name.clone(),
-                    message: format!(
-                        "named network {:?} does not support per-machine policy_ref yet",
-                        name
-                    ),
-                });
-            }
+        ModelMachineNetworkConfig::Named { name } => {
             let definition = db.get_network_definition(&name).await?.ok_or_else(|| {
                 LibVmError::NetworkRuntime {
                     reference: metadata.name.clone(),
@@ -161,20 +141,16 @@ async fn resolve_named_network(
     metadata: &MachineConfig,
     definition: &ModelNetworkDefinition,
     config: &RuntimeNetworkingConfig,
-) -> Result<RuntimeNetwork, LibVmError> {
-    match definition.mode {
-        ModelNamedNetworkMode::Nat => {
+) -> Result<VmmonNetworkAttachment, LibVmError> {
+    match definition.topology {
+        ModelNetworkTopology::Nat => {
             let driver = match definition.driver_preference {
                 ModelNetworkDriverPreference::Auto | ModelNetworkDriverPreference::Netd => {
                     NetworkDriverKind::Netd
                 }
                 ModelNetworkDriverPreference::VzNat => NetworkDriverKind::VzNat,
             };
-            let request = NetworkRequest {
-                scope: NetworkScope::Named,
-                definition_name: Some(definition.name.as_str()),
-                policy_ref: None,
-            };
+            let request = NetworkAttachmentRequest::named(definition.name.as_str());
             prepare_with_driver(
                 selected_private_driver(driver),
                 &NetworkDriverContext {
@@ -186,16 +162,15 @@ async fn resolve_named_network(
                 &request,
             )
             .await
-            .map(|prepared| prepared.attachment)
         }
-        ModelNamedNetworkMode::Bridge => Err(LibVmError::NetworkRuntime {
+        ModelNetworkTopology::Bridge => Err(LibVmError::NetworkRuntime {
             reference: metadata.name.clone(),
             message: format!(
                 "named network {:?} uses bridge mode, which is not implemented yet",
                 definition.name
             ),
         }),
-        ModelNamedNetworkMode::Isolated => Err(LibVmError::NetworkRuntime {
+        ModelNetworkTopology::Isolated => Err(LibVmError::NetworkRuntime {
             reference: metadata.name.clone(),
             message: format!(
                 "named network {:?} uses isolated mode, which is not implemented yet",
@@ -225,7 +200,11 @@ impl NetworkDriver for SelectedNetworkDriver {
         }
     }
 
-    fn supports(&self, reference: &str, request: &NetworkRequest<'_>) -> Result<(), LibVmError> {
+    fn supports(
+        &self,
+        reference: &str,
+        request: &NetworkAttachmentRequest<'_>,
+    ) -> Result<(), LibVmError> {
         match self {
             Self::Netd(driver) => driver.supports(reference, request),
             Self::VzNat(driver) => driver.supports(reference, request),
@@ -235,8 +214,8 @@ impl NetworkDriver for SelectedNetworkDriver {
     async fn prepare(
         &self,
         ctx: &NetworkDriverContext<'_>,
-        request: &NetworkRequest<'_>,
-    ) -> Result<PreparedNetwork, LibVmError> {
+        request: &NetworkAttachmentRequest<'_>,
+    ) -> Result<VmmonNetworkAttachment, LibVmError> {
         match self {
             Self::Netd(driver) => driver.prepare(ctx, request).await,
             Self::VzNat(driver) => driver.prepare(ctx, request).await,
@@ -247,8 +226,8 @@ impl NetworkDriver for SelectedNetworkDriver {
 async fn prepare_with_driver(
     driver: impl NetworkDriver,
     ctx: &NetworkDriverContext<'_>,
-    request: &NetworkRequest<'_>,
-) -> Result<PreparedNetwork, LibVmError> {
+    request: &NetworkAttachmentRequest<'_>,
+) -> Result<VmmonNetworkAttachment, LibVmError> {
     driver.supports(&ctx.metadata.name, request)?;
     driver.prepare(ctx, request).await
 }
@@ -313,18 +292,13 @@ fn network_instance_is_alive(instance: &NetworkInstance) -> bool {
 pub(super) fn network_attachment_from_instance(
     instance: &NetworkInstance,
     mac: String,
-) -> Result<RuntimeNetwork, LibVmError> {
-    let mut attachment: RuntimeNetwork =
-        serde_json::from_str(&instance.attachment_json).map_err(|err| {
-            LibVmError::NetworkRuntime {
-                reference: instance.id.clone(),
-                message: format!("parse network attachment: {err}"),
-            }
+) -> Result<VmmonNetworkAttachment, LibVmError> {
+    let mut attachment: VmmonNetworkAttachment = serde_json::from_str(&instance.attachment_json)
+        .map_err(|err| LibVmError::NetworkRuntime {
+            reference: instance.id.clone(),
+            message: format!("parse network attachment: {err}"),
         })?;
-    if let RuntimeNetwork::UnixDatagram { mac: existing, .. }
-    | RuntimeNetwork::UnixStream { mac: existing, .. }
-    | RuntimeNetwork::Tap { mac: existing, .. } = &mut attachment
-    {
+    if let VmmonNetworkAttachment::UnixDatagram { mac: existing, .. } = &mut attachment {
         *existing = mac;
     }
     Ok(attachment)

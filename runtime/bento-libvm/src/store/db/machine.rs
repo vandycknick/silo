@@ -1,8 +1,9 @@
-use crate::models::{MachineConfig, MachineState};
 use crate::store::db::json;
 use crate::store::db::Sqlite;
+use crate::store::models::MachineId;
+use crate::store::models::{MachineConfig, MachineState};
 use crate::store::wrappers::{DbMachineConfig, DbMachineState};
-use crate::{LibVmError, MachineId};
+use crate::LibVmError;
 
 const MACHINE_CONFIG_COLUMNS: &str = "id, name, json(config_json) AS config_json";
 const MACHINE_STATE_COLUMNS: &str = "machine_id, status, json(state_json) AS state_json";

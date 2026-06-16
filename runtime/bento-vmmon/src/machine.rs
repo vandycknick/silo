@@ -47,8 +47,6 @@ pub(crate) enum RuntimeNetwork {
     None,
     VzNat { mac: Option<String> },
     UnixDatagram { path: PathBuf, mac: String },
-    UnixStream { path: PathBuf, mac: String },
-    Tap { name: String, mac: String },
 }
 
 pub(crate) fn vm_spec_machine_config(
@@ -246,16 +244,6 @@ fn apply_runtime_network(
         RuntimeNetwork::UnixDatagram { path, mac } => {
             Ok(builder.unix_datagram_network(path.clone(), parse_mac_str(mac)?))
         }
-        RuntimeNetwork::UnixStream { .. } => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "unixstream network runtime attachments are not supported by the current virt runtime",
-        )
-        .into()),
-        RuntimeNetwork::Tap { .. } => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "tap network runtime attachments are not supported by the current virt runtime",
-        )
-        .into()),
     }
 }
 

@@ -427,6 +427,7 @@ dependencies = [
  "libc",
  "nix 0.31.3",
  "rcgen",
+ "rustix",
  "serde",
  "serde_json",
  "sqlx",

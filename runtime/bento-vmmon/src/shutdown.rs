@@ -21,7 +21,7 @@ pub async fn run(
             ctx.store.dispatch(Action::VmTransition {
                 state: LifecycleState::Stopping,
                 message: String::from("shutdown requested"),
-            });
+            })?;
             ctx.shutdown.cancel();
             graceful_stop(&ctx).await?
         }
@@ -31,7 +31,7 @@ pub async fn run(
             ctx.store.dispatch(Action::VmTransition {
                 state: LifecycleState::Stopped,
                 message: stop_info.message,
-            });
+            })?;
             ctx.shutdown.cancel();
             false
         }
@@ -60,7 +60,7 @@ async fn graceful_stop(ctx: &DaemonContext) -> eyre::Result<bool> {
                     ctx.store.dispatch(Action::VmTransition {
                         state: LifecycleState::Stopped,
                         message: String::from("vm stopped"),
-                    });
+                    })?;
                     Ok(false)
                 }
                 Ok(Err(err)) => Err(err.into()),
@@ -120,7 +120,7 @@ async fn wait_for_machine_stop(
 }
 
 async fn cleanup(_runtime: &RuntimeContext, ctx: &DaemonContext) -> eyre::Result<()> {
-    let snapshot = ctx.store.snapshot().unwrap_or_default();
+    let snapshot = ctx.store.snapshot()?;
     let inspect = select_current_inspect(&snapshot);
     tracing::debug!(summary = %inspect.summary, "final vmmon status snapshot");
 

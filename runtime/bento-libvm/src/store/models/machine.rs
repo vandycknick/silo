@@ -6,11 +6,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::lock_manager::LockId;
 
-use super::{MachineId, RequestedNetwork};
+use super::{MachineId, MachineNetworkConfig};
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Persisted machine configuration.
+///
+/// This is the durable create/update-time record. It is private to the crate and
+/// is mapped to public `MachineData` snapshots before leaving libvm.
 pub(crate) struct MachineConfig {
     pub id: MachineId,
     pub lock_id: LockId,
@@ -24,12 +28,17 @@ pub(crate) struct MachineConfig {
     pub root_disk_size: Option<u64>,
     pub labels: BTreeMap<String, String>,
     pub metadata: BTreeMap<String, String>,
-    pub network: RequestedNetwork,
+    pub network: MachineNetworkConfig,
 }
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Persisted runtime state for a machine.
+///
+/// This stores vmmon run facts used for reconciliation, including PID,
+/// platform birth time when available, and run ID. It is not exposed directly;
+/// public callers see the reconciled `MachineStatus` view.
 pub(crate) struct MachineState {
     pub machine_id: MachineId,
     pub status: MachineRuntimeState,
@@ -44,6 +53,7 @@ pub(crate) struct MachineState {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Durable lifecycle state stored in `MachineState`.
 pub(crate) enum MachineRuntimeState {
     Stopped,
     Starting,

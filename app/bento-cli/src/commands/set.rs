@@ -5,7 +5,7 @@ use bento_utils::HumanSize;
 use clap::Args;
 
 use crate::commands::get_machine;
-use crate::commands::profile::parse_requested_network;
+use crate::commands::profile::parse_machine_network_config;
 use crate::config::GlobalConfig;
 
 #[derive(Args, Debug)]
@@ -93,7 +93,7 @@ impl ParsedSet {
                 "disk" => update.root_disk_size = Some(parse_disk(value)?),
                 "network" => {
                     update.network =
-                        Some(parse_requested_network(value).map_err(eyre::Report::msg)?)
+                        Some(parse_machine_network_config(value).map_err(eyre::Report::msg)?)
                 }
                 "nested-virtualization" => update.nested_virtualization = Some(parse_bool(value)?),
                 "rosetta" => update.rosetta = Some(parse_bool(value)?),

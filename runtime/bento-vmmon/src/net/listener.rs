@@ -15,12 +15,45 @@ pub(crate) struct NegotiateListener {
     shutdown: CancellationToken,
 }
 
+pub(crate) struct PendingNegotiation {
+    stream: UnixStream,
+    request_id: u64,
+    upgrade: Upgrade,
+}
+
+impl PendingNegotiation {
+    pub(crate) fn upgrade(&self) -> &Upgrade {
+        &self.upgrade
+    }
+
+    pub(crate) async fn accept(mut self) -> eyre::Result<(UnixStream, Upgrade)> {
+        accept(&mut self.stream, self.request_id, None).await?;
+        Ok((self.stream, self.upgrade))
+    }
+
+    pub(crate) async fn reject(
+        mut self,
+        code: RejectCode,
+        message: impl Into<String>,
+        retry_after_ms: Option<u32>,
+    ) -> eyre::Result<()> {
+        reject(
+            &mut self.stream,
+            self.request_id,
+            code,
+            message,
+            retry_after_ms,
+        )
+        .await
+    }
+}
+
 impl NegotiateListener {
     pub(crate) fn new(listener: UnixListener, shutdown: CancellationToken) -> Self {
         Self { listener, shutdown }
     }
 
-    pub(crate) async fn next(&self) -> Option<(UnixStream, Upgrade)> {
+    pub(crate) async fn next(&self) -> Option<PendingNegotiation> {
         loop {
             let (mut stream, _) = tokio::select! {
                 _ = self.shutdown.cancelled() => {
@@ -86,12 +119,11 @@ impl NegotiateListener {
                 continue;
             }
 
-            if let Err(err) = accept(&mut stream, request.request_id, None).await {
-                tracing::warn!(error = %err, "failed to accept negotiated connection");
-                continue;
-            }
-
-            return Some((stream, request.upgrade));
+            return Some(PendingNegotiation {
+                stream,
+                request_id: request.request_id,
+                upgrade: request.upgrade,
+            });
         }
     }
 }

@@ -4,11 +4,11 @@ use std::str::FromStr;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{FromRow, Row};
 
-use crate::models::{
+use crate::store::models::MachineId;
+use crate::store::models::{
     MachineConfig, MachineRuntimeState, MachineState, NetworkAttachment, NetworkDefinition,
-    NetworkDriverPreference, NetworkInstance,
+    NetworkDriverPreference, NetworkInstance, NetworkInstanceState,
 };
-use crate::MachineId;
 
 pub(crate) struct DbMachineConfig(pub(crate) MachineConfig);
 pub(crate) struct DbMachineState(pub(crate) MachineState);
@@ -100,7 +100,7 @@ impl<'row> FromRow<'row, SqliteRow> for DbNetworkInstance {
             runtime_dir: row.try_get("runtime_dir")?,
             attachment_json: row.try_get("attachment_json")?,
             driver_state_json: row.try_get("driver_state_json")?,
-            state: row.try_get("state")?,
+            state: parse_network_instance_state(row.try_get("state")?)?,
             created_at: row.try_get("created_at")?,
             modified_at: row.try_get("modified_at")?,
         }))
@@ -110,21 +110,28 @@ impl<'row> FromRow<'row, SqliteRow> for DbNetworkInstance {
 impl<'row> FromRow<'row, SqliteRow> for DbNetworkDefinition {
     fn from_row(row: &'row SqliteRow) -> sqlx::Result<Self> {
         let name: String = row.try_get("name")?;
-        let mode = deserialize_json(row.try_get("mode")?, "network_definitions.mode")?;
+        let topology = deserialize_json(row.try_get("mode")?, "network_definitions.mode")?;
         let driver_preference: NetworkDriverPreference = deserialize_json(
             row.try_get("driver_preference")?,
             "network_definitions.driver_preference",
         )?;
         Ok(Self(NetworkDefinition {
             name,
-            mode,
+            topology,
             driver_preference,
+            created_at: row.try_get("created_at")?,
+            modified_at: row.try_get("modified_at")?,
         }))
     }
 }
 
 fn parse_machine_id(value: &str, field: &'static str) -> sqlx::Result<MachineId> {
     MachineId::from_str(value).map_err(|err| column_decode_error(field, err))
+}
+
+fn parse_network_instance_state(value: String) -> sqlx::Result<NetworkInstanceState> {
+    NetworkInstanceState::parse(&value)
+        .map_err(|err| column_decode_error("network_instances.state", std::io::Error::other(err)))
 }
 
 fn deserialize_json<T>(value: String, field: &'static str) -> sqlx::Result<T>

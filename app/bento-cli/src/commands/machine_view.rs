@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use bento_libvm::{MachineInspectData, MachineRuntimeStatus, MachineStatus, RequestedNetwork};
+use bento_libvm::{MachineData, MachineNetworkConfig, MachineStatus};
 use bento_vm_spec::VmSpec;
 use serde::Serialize;
 
@@ -15,14 +15,13 @@ pub(crate) struct MachineView {
     pub(crate) default: bool,
     pub(crate) profile: Option<String>,
     pub(crate) image: String,
-    pub(crate) network: RequestedNetwork,
+    pub(crate) network: MachineNetworkConfig,
     pub(crate) created_at: i64,
     pub(crate) modified_at: i64,
     pub(crate) started_at: Option<i64>,
     pub(crate) updated_at: i64,
     pub(crate) root_disk_size: Option<u64>,
     pub(crate) resources: MachineResourcesView,
-    pub(crate) process: MachineProcessView,
     pub(crate) guest: MachineGuestView,
     pub(crate) ready: bool,
     pub(crate) summary: Option<String>,
@@ -39,12 +38,6 @@ pub(crate) struct MachineResourcesView {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct MachineProcessView {
-    pub(crate) status: &'static str,
-    pub(crate) started_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub(crate) struct MachineGuestView {
     pub(crate) status: String,
     pub(crate) ready: bool,
@@ -58,24 +51,14 @@ pub(crate) struct MachineGuestSettingsView {
 }
 
 impl MachineView {
-    pub(crate) fn new(
-        data: &MachineInspectData,
-        runtime_status: Option<&MachineRuntimeStatus>,
-        default: bool,
-    ) -> Self {
+    pub(crate) fn new(data: &MachineData, default: bool) -> Self {
         let hardware = data.spec.hardware.as_ref();
-        let guest_status = runtime_status
-            .map(|status| status.guest().as_str().to_string())
-            .unwrap_or_else(|| "stopped".to_string());
-        let summary = runtime_status
-            .map(|status| status.summary())
-            .filter(|summary| !summary.is_empty())
-            .map(str::to_string);
+        let summary = data.status.message().map(str::to_string);
 
         Self {
             id: data.id.clone(),
             name: data.name.clone(),
-            state: state_label(data.status),
+            state: state_label(&data.status),
             default,
             profile: data.metadata.get(PROFILE_METADATA_KEY).cloned(),
             image: data.image_ref.clone(),
@@ -89,16 +72,12 @@ impl MachineView {
                 cpus: hardware.and_then(|hardware| hardware.cpus).unwrap_or(1),
                 memory_mib: hardware.and_then(|hardware| hardware.memory).unwrap_or(512),
             },
-            process: MachineProcessView {
-                status: state_label(data.status),
-                started_at: data.started_at,
-            },
             guest: MachineGuestView {
-                status: guest_status,
-                ready: runtime_status.is_some_and(|status| status.guest_ready()),
+                status: data.status.label().to_string(),
+                ready: data.status.guest_ready(),
                 settings: guest_settings(&data.spec, &data.instance_dir),
             },
-            ready: runtime_status.is_some_and(|status| status.ready()),
+            ready: data.status.ready(),
             summary,
             labels: data.labels.clone(),
             metadata: data.metadata.clone(),
@@ -108,15 +87,8 @@ impl MachineView {
     }
 }
 
-pub(crate) fn state_label(state: MachineStatus) -> &'static str {
-    match state {
-        MachineStatus::Stopped => "stopped",
-        MachineStatus::Starting => "starting",
-        MachineStatus::Running => "running",
-        MachineStatus::Stopping => "stopping",
-        MachineStatus::Error => "error",
-        _ => "unknown",
-    }
+pub(crate) fn state_label(state: &MachineStatus) -> &'static str {
+    state.label()
 }
 
 fn guest_settings(spec: &VmSpec, machine_dir: &Path) -> MachineGuestSettingsView {
@@ -154,10 +126,25 @@ mod tests {
 
     #[test]
     fn labels_machine_states() {
-        assert_eq!(state_label(MachineStatus::Stopped), "stopped");
-        assert_eq!(state_label(MachineStatus::Starting), "starting");
-        assert_eq!(state_label(MachineStatus::Running), "running");
-        assert_eq!(state_label(MachineStatus::Stopping), "stopping");
-        assert_eq!(state_label(MachineStatus::Error), "error");
+        assert_eq!(state_label(&MachineStatus::Stopped), "stopped");
+        assert_eq!(
+            state_label(&MachineStatus::Starting { message: None }),
+            "starting"
+        );
+        assert_eq!(
+            state_label(&MachineStatus::Running {
+                guest_ready: false,
+                message: None,
+            }),
+            "running"
+        );
+        assert_eq!(
+            state_label(&MachineStatus::Stopping { message: None }),
+            "stopping"
+        );
+        assert_eq!(
+            state_label(&MachineStatus::Error { message: None }),
+            "error"
+        );
     }
 }

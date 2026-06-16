@@ -4,26 +4,21 @@ use crate::network::NetworkDriverKind;
 use crate::paths::resolve_default_data_dir;
 use crate::LibVmError;
 
-/// Runtime connection configuration.
-///
-/// Use `local`, `remote`, or `from_env` to choose the runtime backend.
+/// Local runtime configuration.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
-    pub(crate) target: RuntimeTarget,
+    /// Data directory used for machine state, images, and runtime files.
+    pub data_dir: PathBuf,
+    /// Networking configuration for locally started machines.
+    pub networking: RuntimeNetworkingConfig,
 }
 
 impl RuntimeConfig {
     /// Creates a local runtime configuration rooted at `data_dir`.
     pub fn local(data_dir: impl Into<PathBuf>) -> Self {
         Self {
-            target: RuntimeTarget::Local(LocalRuntimeConfig::new(data_dir)),
-        }
-    }
-
-    /// Creates a remote runtime configuration for `endpoint`.
-    pub fn remote(endpoint: impl Into<String>) -> Self {
-        Self {
-            target: RuntimeTarget::Remote(RemoteRuntimeConfig::new(endpoint)),
+            data_dir: data_dir.into(),
+            networking: RuntimeNetworkingConfig::default(),
         }
     }
 
@@ -33,60 +28,9 @@ impl RuntimeConfig {
     }
 
     /// Sets local runtime networking configuration.
-    ///
-    /// Remote runtime configs ignore this because networking is controlled by
-    /// the remote service.
     pub fn with_networking(mut self, networking: RuntimeNetworkingConfig) -> Self {
-        match &mut self.target {
-            RuntimeTarget::Local(local) => local.networking = networking,
-            RuntimeTarget::Remote(_) => {}
-        }
+        self.networking = networking;
         self
-    }
-}
-
-/// Runtime backend target.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum RuntimeTarget {
-    /// Local runtime using files and SQLite under a local data directory.
-    Local(LocalRuntimeConfig),
-    /// Remote runtime accessed through an endpoint.
-    Remote(RemoteRuntimeConfig),
-}
-
-/// Remote runtime configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteRuntimeConfig {
-    /// Remote endpoint address.
-    pub endpoint: String,
-}
-
-impl RemoteRuntimeConfig {
-    /// Creates a remote runtime configuration.
-    pub fn new(endpoint: impl Into<String>) -> Self {
-        Self {
-            endpoint: endpoint.into(),
-        }
-    }
-}
-
-/// Local runtime configuration.
-#[derive(Debug, Clone)]
-pub struct LocalRuntimeConfig {
-    /// Data directory used for machine state, images, and runtime files.
-    pub data_dir: PathBuf,
-    /// Networking configuration for locally started machines.
-    pub networking: RuntimeNetworkingConfig,
-}
-
-impl LocalRuntimeConfig {
-    /// Creates a local runtime configuration with default networking settings.
-    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            data_dir: data_dir.into(),
-            networking: RuntimeNetworkingConfig::default(),
-        }
     }
 }
 

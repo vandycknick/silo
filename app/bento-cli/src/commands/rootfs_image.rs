@@ -14,9 +14,7 @@ pub(crate) async fn get_base_rootfs_image(
     progress: Option<ImageProgressCallback<'_>>,
 ) -> eyre::Result<RootfsImage> {
     let options = RootfsOptions::for_host().wrap_err("failed to select host OCI platform")?;
-    let images_dir = libvm
-        .local_images_dir()
-        .ok_or_else(|| eyre::eyre!("local runtime images directory is unavailable"))?;
+    let images_dir = libvm.local_images_dir();
     let store = ImageStore::open(images_dir).wrap_err("failed to open Bento image cache")?;
     store
         .get_or_create(image_ref, options, progress)

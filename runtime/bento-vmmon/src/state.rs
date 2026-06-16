@@ -5,6 +5,12 @@ use bento_protocol::v1::{
 };
 use tokio::sync::broadcast;
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StoreError {
+    #[error("vmmon state store lock is poisoned")]
+    Poisoned,
+}
+
 #[derive(Debug)]
 pub(crate) struct Bus<E>
 where
@@ -60,8 +66,9 @@ where
         }
     }
 
-    pub(crate) fn dispatch(&self, action: A) {
-        if let Ok(mut state) = self.state.lock() {
+    pub(crate) fn dispatch(&self, action: A) -> Result<(), StoreError> {
+        {
+            let mut state = self.state.lock().map_err(|_| StoreError::Poisoned)?;
             let next = (self.reducer)(&state, &action);
             *state = next;
         }
@@ -69,17 +76,22 @@ where
         if let Some(event) = (self.projector)(&action) {
             self.bus.publish(event);
         }
+
+        Ok(())
     }
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<E> {
         self.bus.subscribe()
     }
 
-    pub(crate) fn snapshot(&self) -> Option<S>
+    pub(crate) fn snapshot(&self) -> Result<S, StoreError>
     where
         S: Clone,
     {
-        self.state.lock().ok().map(|state| state.clone())
+        self.state
+            .lock()
+            .map(|state| state.clone())
+            .map_err(|_| StoreError::Poisoned)
     }
 }
 
@@ -228,4 +240,45 @@ fn status_summary(state: &InstanceState) -> String {
     }
 
     state.guest_message.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    use crate::state::{new_instance_store, Action, StoreError};
+
+    #[test]
+    fn dispatch_updates_state_before_publishing() {
+        let store = new_instance_store();
+        let mut rx = store.subscribe();
+
+        store.dispatch(Action::guest_running()).unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        assert!(crate::state::guest_shell_ready(&snapshot));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn poisoned_store_does_not_publish_events() {
+        let store = Arc::new(new_instance_store());
+        let poisoned_store = store.clone();
+        let mut rx = store.subscribe();
+
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned_store.state.lock().unwrap();
+            panic!("poison state store lock");
+        })
+        .join();
+
+        assert!(matches!(
+            store.dispatch(Action::guest_running()),
+            Err(StoreError::Poisoned)
+        ));
+        assert!(matches!(store.snapshot(), Err(StoreError::Poisoned)));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
 }

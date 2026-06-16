@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use crate::models::{looks_like_id_prefix, MachineId};
+use crate::store::models::{looks_like_id_prefix, MachineId};
 use crate::LibVmError;
 
 /// Reference used to resolve a machine.
@@ -80,7 +80,7 @@ pub(crate) fn validate_machine_name(name: &str) -> Result<(), LibVmError> {
 #[cfg(test)]
 mod tests {
     use super::{MachineRef, MachineRefKind};
-    use crate::models::MachineId;
+    use crate::store::models::MachineId;
 
     #[test]
     fn parse_treats_full_uuid_as_machine_id() {

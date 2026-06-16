@@ -1,9 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::models::{NetworkAttachment, NetworkDefinition, NetworkInstance};
 use crate::store::db::Sqlite;
+use crate::store::models::MachineId;
+use crate::store::models::{NetworkAttachment, NetworkDefinition, NetworkInstance};
 use crate::store::wrappers::{DbNetworkAttachment, DbNetworkDefinition, DbNetworkInstance};
-use crate::{LibVmError, MachineId};
+use crate::LibVmError;
 
 pub(super) async fn get_attachment(
     db: &Sqlite,
@@ -58,7 +59,7 @@ pub(super) async fn upsert_instance(
     .bind(&instance.runtime_dir)
     .bind(&instance.attachment_json)
     .bind(&instance.driver_state_json)
-    .bind(&instance.state)
+    .bind(instance.state.as_str())
     .bind(instance.created_at)
     .bind(instance.modified_at)
     .execute(&db.pool)
@@ -152,8 +153,8 @@ pub(super) async fn upsert_definition(
     .bind(&definition.name)
     .bind(serialize_definition_field(
         definition,
-        "network mode",
-        &definition.mode,
+        "network topology",
+        &definition.topology,
     )?)
     .bind(serialize_definition_field(
         definition,

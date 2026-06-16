@@ -13,7 +13,7 @@ use eyre::Context;
 use serde::Deserialize;
 
 use crate::host::{self, HostUser};
-use crate::network::RuntimeNetwork;
+use crate::network::VmmonNetworkAttachment;
 use crate::paths::{metadata_config_path_in, vm_spec_path_in, LocalPaths};
 use crate::resolve_mount_location;
 use crate::RuntimeNetworkingConfig;
@@ -38,7 +38,7 @@ pub(crate) fn prepare_instance_runtime(
     instance_dir: &Path,
     name: &str,
     spec: &mut VmSpec,
-    network: &RuntimeNetwork,
+    network: &VmmonNetworkAttachment,
     networking: &RuntimeNetworkingConfig,
 ) -> eyre::Result<()> {
     normalize_runtime_mounts(spec)?;
@@ -117,14 +117,14 @@ fn resolve_metadata_config(
     paths: &LocalPaths,
     name: &str,
     spec: &VmSpec,
-    network: &RuntimeNetwork,
+    network: &VmmonNetworkAttachment,
     networking: &RuntimeNetworkingConfig,
 ) -> eyre::Result<AgentConfig> {
     let host_user = host::current_host_user().context("resolve current host user")?;
     let user_keys = host::ensure_user_ssh_keys().context("ensure user SSH keys")?;
     let certificate_authority_pem = certificate_authority_pem_for_config(paths, networking)?;
 
-    let mut guest_runtime = resolve_guest_runtime_config(spec, network)?;
+    let mut guest_runtime = resolve_guest_runtime_config(spec)?;
     guest_runtime.provision = resolve_provision_config(
         name,
         spec,
@@ -151,10 +151,7 @@ fn ensure_asset(path: &Path, label: &str) -> eyre::Result<()> {
     }
 }
 
-fn resolve_guest_runtime_config(
-    spec: &VmSpec,
-    _network: &RuntimeNetwork,
-) -> eyre::Result<AgentConfig> {
+fn resolve_guest_runtime_config(spec: &VmSpec) -> eyre::Result<AgentConfig> {
     Ok(AgentConfig {
         forward: resolve_forward_runtime_config(spec)?,
         provision: ProvisionConfig::default(),
@@ -196,7 +193,7 @@ fn resolve_forward_runtime_config(spec: &VmSpec) -> eyre::Result<AgentForwardCon
 fn resolve_provision_config(
     name: &str,
     spec: &VmSpec,
-    network: &RuntimeNetwork,
+    network: &VmmonNetworkAttachment,
     host_user: &HostUser,
     ssh_public_key: &str,
     certificate_authority_pem: &str,
@@ -258,11 +255,11 @@ fn provision_userdata(spec: &VmSpec) -> eyre::Result<Option<UserdataConfig>> {
 }
 
 fn resolve_provision_network_config(
-    network: &RuntimeNetwork,
+    network: &VmmonNetworkAttachment,
 ) -> eyre::Result<ProvisionNetworkConfig> {
     let interfaces = match network {
-        RuntimeNetwork::None => Vec::new(),
-        RuntimeNetwork::VzNat { .. } => vec![NetworkInterfaceConfig {
+        VmmonNetworkAttachment::None => Vec::new(),
+        VmmonNetworkAttachment::VzNat { .. } => vec![NetworkInterfaceConfig {
             name: "en".to_string(),
             matches: NetworkMatchConfig {
                 driver: Some("virtio_net".to_string()),
@@ -271,9 +268,7 @@ fn resolve_provision_network_config(
             dhcp4: true,
             dhcp6: false,
         }],
-        RuntimeNetwork::UnixDatagram { mac, .. }
-        | RuntimeNetwork::UnixStream { mac, .. }
-        | RuntimeNetwork::Tap { mac, .. } => vec![NetworkInterfaceConfig {
+        VmmonNetworkAttachment::UnixDatagram { mac, .. } => vec![NetworkInterfaceConfig {
             name: "bento".to_string(),
             matches: NetworkMatchConfig {
                 driver: None,
@@ -399,7 +394,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::host::HostUser;
-    use crate::network::RuntimeNetwork;
+    use crate::network::VmmonNetworkAttachment;
     use crate::paths::LocalPaths;
 
     fn sample_spec(kernel_cmdline: Vec<String>) -> VmSpec {
@@ -479,8 +474,9 @@ mod tests {
 
     #[test]
     fn provision_network_for_vznat_matches_virtio_net_driver() {
-        let config = super::resolve_provision_network_config(&RuntimeNetwork::VzNat { mac: None })
-            .expect("network provision config should render");
+        let config =
+            super::resolve_provision_network_config(&VmmonNetworkAttachment::VzNat { mac: None })
+                .expect("network provision config should render");
 
         assert_eq!(config.interfaces.len(), 1);
         assert_eq!(config.interfaces[0].name, "en");
@@ -511,31 +507,7 @@ mod tests {
 
     #[test]
     fn guest_runtime_has_no_forward_without_endpoint() {
-        let runtime = resolve_guest_runtime_config(
-            &sample_spec(Vec::new()),
-            &RuntimeNetwork::UnixDatagram {
-                path: PathBuf::from("/run/bento/net.sock"),
-                mac: "02:00:00:00:00:01".to_string(),
-            },
-        )
-        .expect("runtime config should resolve");
-
-        assert!(!runtime.forward.enabled);
-    }
-
-    #[test]
-    fn guest_runtime_has_no_forward_without_guest_networking() {
-        let spec = sample_spec(Vec::new());
-
-        let runtime = resolve_guest_runtime_config(&spec, &RuntimeNetwork::None)
-            .expect("runtime config should resolve");
-
-        assert!(!runtime.forward.enabled);
-    }
-
-    #[test]
-    fn guest_runtime_disables_forward_without_forward_endpoint() {
-        let runtime = resolve_guest_runtime_config(&sample_spec(Vec::new()), &RuntimeNetwork::None)
+        let runtime = resolve_guest_runtime_config(&sample_spec(Vec::new()))
             .expect("runtime config should resolve");
 
         assert!(!runtime.forward.enabled);
@@ -554,7 +526,7 @@ mod tests {
         let provision = super::resolve_provision_config(
             "demo",
             &spec,
-            &RuntimeNetwork::None,
+            &VmmonNetworkAttachment::None,
             &host_user,
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBento",
             "-----BEGIN CERTIFICATE-----\nMIIBENTO\n-----END CERTIFICATE-----\n",
@@ -582,7 +554,7 @@ mod tests {
         let err = super::resolve_provision_config(
             "demo",
             &spec,
-            &RuntimeNetwork::None,
+            &VmmonNetworkAttachment::None,
             &host_user,
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBento",
             "-----BEGIN CERTIFICATE-----\nMIIBENTO\n-----END CERTIFICATE-----\n",
@@ -612,7 +584,7 @@ mod tests {
         let provision = super::resolve_provision_config(
             "demo",
             &spec,
-            &RuntimeNetwork::UnixDatagram {
+            &VmmonNetworkAttachment::UnixDatagram {
                 path: PathBuf::from("/run/bento/net.sock"),
                 mac: "02:00:00:00:00:01".to_string(),
             },
@@ -684,7 +656,7 @@ mod tests {
         let provision = super::resolve_provision_config(
             "demo",
             &spec,
-            &RuntimeNetwork::None,
+            &VmmonNetworkAttachment::None,
             &host_user,
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBento",
             "-----BEGIN CERTIFICATE-----\nMIIBENTO\n-----END CERTIFICATE-----\n",
@@ -701,8 +673,7 @@ mod tests {
         let mut spec = sample_spec(Vec::new());
         push_vsock_endpoint(&mut spec, forward_endpoint(4100, None));
 
-        let runtime = resolve_guest_runtime_config(&spec, &RuntimeNetwork::None)
-            .expect("runtime config should resolve");
+        let runtime = resolve_guest_runtime_config(&spec).expect("runtime config should resolve");
 
         assert!(runtime.forward.enabled);
         assert_eq!(runtime.forward.port, 4100);
@@ -731,8 +702,7 @@ mod tests {
             ),
         );
 
-        let runtime = resolve_guest_runtime_config(&spec, &RuntimeNetwork::None)
-            .expect("runtime config should resolve");
+        let runtime = resolve_guest_runtime_config(&spec).expect("runtime config should resolve");
 
         assert_eq!(
             runtime

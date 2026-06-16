@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter};
 
-use bento_libvm::{Machine, Runtime};
+use bento_libvm::{MachineData, Runtime};
 use clap::Args;
 use eyre::bail;
 
@@ -48,22 +48,20 @@ impl Cmd {
             return Err(not_running_error(&machine_name));
         }
 
-        ensure_guest_ready(&machine).await?;
+        ensure_guest_ready(&inspect_data)?;
 
         let status = ssh::run_remote_command(&machine_name, self.user.as_deref(), &self.command)?;
         std::process::exit(status.code().unwrap_or(1));
     }
 }
 
-async fn ensure_guest_ready(machine: &Machine) -> eyre::Result<()> {
-    let status = machine.get_status().await?;
-
-    if !status.guest_ready() {
-        let summary = if status.summary().is_empty() {
-            format!("guest state is {}", status.guest().as_str())
-        } else {
-            status.summary().to_string()
-        };
+fn ensure_guest_ready(data: &MachineData) -> eyre::Result<()> {
+    if !data.status.guest_ready() {
+        let summary = data
+            .status
+            .message()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("machine state is {}", data.status.label()));
         bail!("guest service is not ready: {summary}");
     }
 

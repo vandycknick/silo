@@ -1,4 +1,4 @@
-use bento_libvm::{MachineCreate, RequestedNetwork, Runtime};
+use bento_libvm::{MachineCreate, MachineNetworkConfig, Runtime};
 use bento_utils::HumanSize;
 use bento_vm_spec::Mount;
 use clap::Args;
@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 
-use crate::commands::profile::{parse_label, parse_profile_mount, parse_requested_network};
+use crate::commands::profile::{parse_label, parse_machine_network_config, parse_profile_mount};
 use crate::commands::rootfs_image::{get_base_rootfs_image, record_base_rootfs_metadata};
 use crate::commands::start_options::machine_start_options;
 use crate::config::GlobalConfig;
@@ -76,8 +76,8 @@ pub(crate) struct VmOverrideArgs {
     #[arg(long = "mount", value_name = "SRC:DST[:MODE]", value_parser = parse_profile_mount)]
     pub mounts: Vec<crate::profile::ProfileMount>,
     /// Override the profile network target. Allowed: private, none, NAME, or name:NAME.
-    #[arg(long, value_parser = parse_requested_network)]
-    pub network: Option<RequestedNetwork>,
+    #[arg(long, value_parser = parse_machine_network_config)]
+    pub network: Option<MachineNetworkConfig>,
     /// Add or override a label. Format: KEY=VALUE.
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
     pub labels: Vec<(String, String)>,
@@ -110,9 +110,7 @@ impl Cmd {
         let progress = Progress::start("reading VM recipe");
         let mut resolved = self.resolve()?;
         progress.step("finding boot assets");
-        let data_dir = libvm
-            .local_data_dir()
-            .ok_or_else(|| eyre::eyre!("local runtime data directory is unavailable"))?;
+        let data_dir = libvm.local_data_dir();
         let boot_assets =
             resolve_boot_assets(data_dir, resolved.kernel.take(), resolved.initramfs.take());
         let base_rootfs = {
@@ -177,7 +175,7 @@ impl Cmd {
         let mut metadata = BTreeMap::new();
         let mut mounts = Vec::new();
         let mut image_ref;
-        let mut network = RequestedNetwork::default();
+        let mut network = MachineNetworkConfig::default();
         let mut userdata = None;
         let mut cpus = None;
         let mut memory_mib = None;
@@ -187,7 +185,7 @@ impl Cmd {
             let store = ProfileStore::from_env()?;
             let named = store.resolve(&profile_name)?;
             image_ref = named.profile.image.clone();
-            network = named.profile.requested_network();
+            network = named.profile.machine_network();
             userdata = named.profile.userdata.clone();
             cpus = named.profile.cpus();
             memory_mib = named.profile.memory_mib()?;
@@ -264,7 +262,7 @@ struct ResolvedCreate {
     labels: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
     mounts: Vec<Mount>,
-    network: RequestedNetwork,
+    network: MachineNetworkConfig,
     userdata: Option<String>,
     cpus: Option<u8>,
     memory_mib: Option<u32>,

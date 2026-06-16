@@ -11,12 +11,15 @@ use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
 use crate::host;
-use crate::models::{MachineConfig, NetworkAttachment, NetworkInstance};
 use crate::paths::LocalPaths;
+use crate::store::models::MachineId;
+use crate::store::models::{
+    MachineConfig, NetworkAttachment, NetworkInstance, NetworkInstanceState,
+};
 use crate::store::{Database, Sqlite};
-use crate::{LibVmError, MachineId, NetdRuntimeConfig, NetworkPolicyRef};
+use crate::{LibVmError, NetdRuntimeConfig, NetworkPolicyRef};
 
-use super::core::{NetworkDriver, NetworkDriverContext, NetworkRequest, PreparedNetwork};
+use super::core::{NetworkAttachmentRequest, NetworkDriver, NetworkDriverContext};
 use super::{
     ensure_instance_network_link, mac_from_machine_id, network_attachment_from_instance, now_unix,
     remove_file_if_exists, remove_runtime_dir, serialize_json, DRIVER_NETD,
@@ -25,7 +28,6 @@ use super::{
 const NETD_BINARY_ENV: &str = "NETD_BIN";
 const NETD_BINARY_NAME: &str = "netd";
 const NETD_DISABLE_SSH_PORT: &str = "-1";
-const RUNNING_STATE: &str = "running";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -46,15 +48,19 @@ impl NetworkDriver for NetdDriver {
         DRIVER_NETD
     }
 
-    fn supports(&self, reference: &str, request: &NetworkRequest<'_>) -> Result<(), LibVmError> {
-        validate_policy_ref(reference, self.id(), request.policy_ref)
+    fn supports(
+        &self,
+        reference: &str,
+        request: &NetworkAttachmentRequest<'_>,
+    ) -> Result<(), LibVmError> {
+        validate_policy_ref(reference, self.id(), request.policy_ref())
     }
 
     async fn prepare(
         &self,
         ctx: &NetworkDriverContext<'_>,
-        request: &NetworkRequest<'_>,
-    ) -> Result<PreparedNetwork, LibVmError> {
+        request: &NetworkAttachmentRequest<'_>,
+    ) -> Result<super::VmmonNetworkAttachment, LibVmError> {
         prepare_netd_runtime(ctx, request).await
     }
 }
@@ -62,8 +68,8 @@ impl NetworkDriver for NetdDriver {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn prepare_netd_runtime(
     ctx: &NetworkDriverContext<'_>,
-    request: &NetworkRequest<'_>,
-) -> Result<PreparedNetwork, LibVmError> {
+    request: &NetworkAttachmentRequest<'_>,
+) -> Result<super::VmmonNetworkAttachment, LibVmError> {
     let paths = ctx.paths;
     let db = ctx.db;
     let metadata = ctx.metadata;
@@ -75,7 +81,7 @@ async fn prepare_netd_runtime(
         });
     }
 
-    if let Some(definition_name) = request.definition_name {
+    if let Some(definition_name) = request.definition_name() {
         if let Some(instance) = db
             .get_network_instance_by_definition(definition_name)
             .await?
@@ -98,8 +104,11 @@ async fn prepare_netd_runtime(
     let log_path = network_paths.log_path();
     let pid_path = network_paths.pid_path();
     let pcap_path = config.pcap.then(|| network_paths.pcap_path());
-    let policy_path =
-        resolve_network_policy_path(metadata, request.policy_ref, &ctx.config.policy_config_dir)?;
+    let policy_path = resolve_network_policy_path(
+        metadata,
+        request.policy_ref(),
+        &ctx.config.policy_config_dir,
+    )?;
     let secret_store_path = paths.secret_store_path();
     let (tls_ca_cert_path, tls_ca_key_path) =
         resolve_certificate_authority_paths(paths, &config, &metadata.name)?;
@@ -156,7 +165,7 @@ async fn prepare_netd_runtime(
     }
 
     let mac = mac_from_machine_id(metadata.id);
-    let network = super::RuntimeNetwork::UnixDatagram {
+    let network = super::VmmonNetworkAttachment::UnixDatagram {
         path: socket_path.clone(),
         mac: format_mac(mac),
     };
@@ -172,11 +181,11 @@ async fn prepare_netd_runtime(
     db.upsert_network_instance(&NetworkInstance {
         id: network_id.clone(),
         driver: DRIVER_NETD.to_string(),
-        definition_name: request.definition_name.map(str::to_string),
+        definition_name: request.definition_name().map(str::to_string),
         runtime_dir: runtime_dir.display().to_string(),
         attachment_json: serialize_json(&network, "network attachment")?,
         driver_state_json: serialize_json(&driver_state, "netd driver state")?,
-        state: RUNNING_STATE.to_string(),
+        state: NetworkInstanceState::Running,
         created_at: now,
         modified_at: now,
     })
@@ -189,16 +198,14 @@ async fn prepare_netd_runtime(
         modified_at: now,
     })
     .await?;
-    Ok(PreparedNetwork {
-        attachment: network,
-    })
+    Ok(network)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn prepare_netd_runtime(
     _ctx: &NetworkDriverContext<'_>,
-    _request: &NetworkRequest<'_>,
-) -> Result<PreparedNetwork, LibVmError> {
+    _request: &NetworkAttachmentRequest<'_>,
+) -> Result<super::VmmonNetworkAttachment, LibVmError> {
     let metadata = _ctx.metadata;
     Err(LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
@@ -221,7 +228,7 @@ async fn attach_existing_runtime(
     db: &Sqlite,
     metadata: &MachineConfig,
     instance: &NetworkInstance,
-) -> Result<PreparedNetwork, LibVmError> {
+) -> Result<super::VmmonNetworkAttachment, LibVmError> {
     ensure_instance_network_link(paths, metadata.id, Path::new(&instance.runtime_dir))?;
     let now = now_unix();
     let mac = format_mac(mac_from_machine_id(metadata.id));
@@ -234,7 +241,7 @@ async fn attach_existing_runtime(
         modified_at: now,
     })
     .await?;
-    Ok(PreparedNetwork { attachment })
+    Ok(attachment)
 }
 
 struct NetworkHelperCommandConfig<'a> {
@@ -415,7 +422,8 @@ mod tests {
     use std::process::Command;
 
     use crate::paths::LocalPaths;
-    use crate::{MachineId, NetdRuntimeConfig};
+    use crate::store::models::MachineId;
+    use crate::NetdRuntimeConfig;
 
     #[test]
     fn netd_command_disables_default_ssh_forward() {

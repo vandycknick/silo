@@ -1,4 +1,5 @@
 mod db;
+pub(crate) mod models;
 mod traits;
 mod wrappers;
 

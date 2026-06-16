@@ -1,7 +1,8 @@
-use crate::models::{
+use crate::store::models::MachineId;
+use crate::store::models::{
     MachineConfig, MachineState, NetworkAttachment, NetworkDefinition, NetworkInstance,
 };
-use crate::{LibVmError, MachineId};
+use crate::LibVmError;
 
 pub(crate) trait Database: Sized + Clone + Send + Sync + 'static {
     type Settings: std::fmt::Debug + Clone + Send + Sync + 'static;

@@ -62,8 +62,10 @@ impl GuestControlService for GuestControlSvc {
             arch,
             "guest service registered"
         );
+        self.store
+            .dispatch(Action::guest_running())
+            .map_err(|err| Status::internal(err.to_string()))?;
         self.ready.store(true, Ordering::Release);
-        self.store.dispatch(Action::guest_running());
 
         Ok(Response::new(RegisterGuestResponse {
             accepted: true,
@@ -176,9 +178,11 @@ pub(crate) async fn spawn_guest_services(
 
         if let Err(err) = result {
             tracing::warn!(error = %err, "guest service RPC server failed");
-            store.dispatch(Action::guest_error(format!(
+            if let Err(store_err) = store.dispatch(Action::guest_error(format!(
                 "guest service RPC server failed: {err}"
-            )));
+            ))) {
+                tracing::error!(error = %store_err, "failed to publish guest service error");
+            }
         }
     }))
 }
@@ -222,10 +226,12 @@ fn spawn_readiness_timeout(
             _ = tokio::time::sleep(timeout) => {
                 if !ready.load(Ordering::Acquire) {
                     tracing::warn!(timeout = ?timeout, "guest service did not register before timeout");
-                    store.dispatch(Action::guest_error(format!(
+                    if let Err(err) = store.dispatch(Action::guest_error(format!(
                         "guest service did not register within {} seconds",
                         timeout.as_secs()
-                    )));
+                    ))) {
+                        tracing::error!(error = %err, "failed to publish guest readiness timeout");
+                    }
                 }
             }
         }

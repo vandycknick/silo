@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use crate::paths::defaults::resolve_default_data_dir;
 use crate::paths::machine::MachinePaths;
 use crate::paths::network::NetworkPaths;
-use crate::{LibVmError, MachineId};
+use crate::store::models::MachineId;
+use crate::LibVmError;
 
 const STATE_DB_FILE_NAME: &str = "state.db";
 const MACHINES_DIR_NAME: &str = "machines";
@@ -150,7 +151,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::paths::{LocalPaths, LocalRoots};
-    use crate::MachineId;
+    use crate::store::models::MachineId;
 
     #[test]
     fn local_roots_derive_expected_subpaths() {

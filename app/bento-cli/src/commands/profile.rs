@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::io::Write;
 use std::process::Command;
 
-use bento_libvm::RequestedNetwork;
+use bento_libvm::MachineNetworkConfig;
 use bento_utils::HumanSize;
 use clap::{Args, Subcommand};
 use tabwriter::TabWriter;
@@ -91,8 +91,8 @@ pub struct CreateCmd {
     #[arg(long, value_name = "SIZE")]
     pub disk_size: Option<HumanSize>,
     /// Network target for VMs created from this profile. Allowed: private, none, NAME, or name:NAME.
-    #[arg(long, value_parser = parse_requested_network, default_value = "private")]
-    pub network: RequestedNetwork,
+    #[arg(long, value_parser = parse_machine_network_config, default_value = "private")]
+    pub network: MachineNetworkConfig,
     /// Add a mount. Format: SRC:DST[:ro|rw].
     #[arg(long = "mount", value_name = "SRC:DST[:MODE]", value_parser = parse_profile_mount)]
     pub mounts: Vec<ProfileMount>,
@@ -205,7 +205,7 @@ fn create_profile(store: &ProfileStore, cmd: &CreateCmd) -> eyre::Result<()> {
         disk_size: cmd.disk_size.map(|disk_size| disk_size.to_string()),
         userdata: None,
         mounts: cmd.mounts.clone(),
-        network: Some(requested_network_to_profile(cmd.network.clone())),
+        network: Some(machine_network_to_profile(cmd.network.clone())),
         labels,
     };
     crate::profile::validate_profile(&profile)?;
@@ -293,35 +293,34 @@ pub(crate) fn parse_profile_mount(input: &str) -> Result<ProfileMount, String> {
     })
 }
 
-pub(crate) fn parse_requested_network(input: &str) -> Result<RequestedNetwork, String> {
+pub(crate) fn parse_machine_network_config(input: &str) -> Result<MachineNetworkConfig, String> {
     match input {
-        "private" => Ok(RequestedNetwork::Private { policy_ref: None }),
-        "none" => Ok(RequestedNetwork::None),
+        "private" => Ok(MachineNetworkConfig::Private { policy_ref: None }),
+        "none" => Ok(MachineNetworkConfig::None),
         other if other.starts_with("name:") => {
-            named_requested_network(other.trim_start_matches("name:"))
+            named_machine_network(other.trim_start_matches("name:"))
         }
-        other => named_requested_network(other),
+        other => named_machine_network(other),
     }
 }
 
-fn named_requested_network(name: &str) -> Result<RequestedNetwork, String> {
+fn named_machine_network(name: &str) -> Result<MachineNetworkConfig, String> {
     if name.is_empty() {
         return Err("invalid network name: cannot be empty".to_string());
     }
     if matches!(name, "private" | "none") {
         return Err(format!("invalid network name: '{name}' is reserved"));
     }
-    Ok(RequestedNetwork::Named {
+    Ok(MachineNetworkConfig::Named {
         name: name.to_string(),
-        policy_ref: None,
     })
 }
 
-fn requested_network_to_profile(requested: RequestedNetwork) -> ProfileNetwork {
-    match requested {
-        RequestedNetwork::Private { policy_ref } => ProfileNetwork::Private { policy_ref },
-        RequestedNetwork::None => ProfileNetwork::None,
-        RequestedNetwork::Named { name, policy_ref } => ProfileNetwork::Named { name, policy_ref },
+fn machine_network_to_profile(network: MachineNetworkConfig) -> ProfileNetwork {
+    match network {
+        MachineNetworkConfig::Private { policy_ref } => ProfileNetwork::Private { policy_ref },
+        MachineNetworkConfig::None => ProfileNetwork::None,
+        MachineNetworkConfig::Named { name } => ProfileNetwork::Named { name },
     }
 }
 

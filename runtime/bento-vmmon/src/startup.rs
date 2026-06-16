@@ -164,10 +164,10 @@ pub async fn init(
     let serial_console = machine.serial();
     let store = Arc::new(new_instance_store());
 
-    store.dispatch(Action::vm_starting());
+    store.dispatch(Action::vm_starting())?;
     start_gate.wait_for_release().await?;
     machine.start().await?;
-    store.dispatch(Action::vm_running());
+    store.dispatch(Action::vm_running())?;
 
     Ok(DaemonContext {
         spec,
@@ -222,14 +222,6 @@ fn parse_network_arg(value: &str) -> eyre::Result<RuntimeNetwork> {
         }),
         ["unixdg", path, mac] => Ok(RuntimeNetwork::UnixDatagram {
             path: PathBuf::from(path),
-            mac: parse_key_value(mac, "mac")?.to_string(),
-        }),
-        ["unixstream", path, mac] => Ok(RuntimeNetwork::UnixStream {
-            path: PathBuf::from(path),
-            mac: parse_key_value(mac, "mac")?.to_string(),
-        }),
-        ["tap", name, mac] => Ok(RuntimeNetwork::Tap {
-            name: name.to_string(),
             mac: parse_key_value(mac, "mac")?.to_string(),
         }),
         _ => Err(eyre::eyre!("invalid --network value {value:?}")),
@@ -302,7 +294,8 @@ mod tests {
 
     use nix::unistd::pipe;
 
-    use crate::startup::{StartGate, SyncReporter};
+    use crate::machine::RuntimeNetwork;
+    use crate::startup::{parse_network_arg, StartGate, SyncReporter};
 
     #[tokio::test]
     async fn start_gate_waits_for_release_byte() {
@@ -347,5 +340,22 @@ mod tests {
         let mut message = String::new();
         file.read_to_string(&mut message).expect("read message");
         assert_eq!(message, "failed\tvz failed\n");
+    }
+
+    #[test]
+    fn network_parser_rejects_unsupported_runtime_attachments() {
+        assert!(parse_network_arg("unixstream,/tmp/net.sock,mac=02:00:00:00:00:01").is_err());
+        assert!(parse_network_arg("tap,tap0,mac=02:00:00:00:00:01").is_err());
+    }
+
+    #[test]
+    fn network_parser_accepts_supported_runtime_attachments() {
+        assert_eq!(parse_network_arg("none").unwrap(), RuntimeNetwork::None);
+        assert_eq!(
+            parse_network_arg("vznat,mac=02:00:00:00:00:01").unwrap(),
+            RuntimeNetwork::VzNat {
+                mac: Some("02:00:00:00:00:01".to_string())
+            }
+        );
     }
 }

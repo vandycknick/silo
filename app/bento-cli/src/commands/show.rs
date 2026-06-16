@@ -36,14 +36,8 @@ impl Cmd {
     pub async fn run(&self, libvm: &Runtime, config: &GlobalConfig) -> eyre::Result<()> {
         let (_name, machine) = get_machine(libvm, config, self.name.as_deref()).await?;
         let inspect_data = machine.inspect().await?;
-        let runtime_status = if inspect_data.is_running() {
-            Some(machine.get_status().await?)
-        } else {
-            None
-        };
         let view = MachineView::new(
             &inspect_data,
-            runtime_status.as_ref(),
             config.default_machine() == Some(inspect_data.name.as_str()),
         );
 

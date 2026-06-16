@@ -8,9 +8,7 @@ pub(crate) fn machine_start_options(
     libvm: &Runtime,
     machine: &Machine,
 ) -> eyre::Result<MachineStartOptions> {
-    let data_dir = libvm
-        .local_data_dir()
-        .ok_or_else(|| eyre::eyre!("local runtime data directory is unavailable"))?;
+    let data_dir = libvm.local_data_dir();
     let executable = std::env::current_exe().context("resolve CLI binary path")?;
     Ok(cleanup_exit_command_options(
         executable,

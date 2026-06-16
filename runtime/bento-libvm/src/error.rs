@@ -43,12 +43,6 @@ pub enum LibVmError {
     #[error("network runtime for {reference} failed: {message}")]
     NetworkRuntime { reference: String, message: String },
 
-    #[error("remote runtime {endpoint:?} does not support {operation} yet")]
-    RemoteRuntimeUnsupported {
-        endpoint: String,
-        operation: &'static str,
-    },
-
     #[error(
         "vmmon executable not found. Expected a sibling binary at {expected_path} or `vmmon` in PATH. Build it with `cargo build -p bento-vmmon` (or `cargo build --release -p bento-vmmon`)."
     )]

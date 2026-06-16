@@ -1,4 +1,4 @@
-use crate::network::RequestedNetwork;
+use crate::network::MachineNetworkConfig;
 
 /// Partial settings update for a stopped machine.
 ///
@@ -18,8 +18,8 @@ pub struct MachineUpdate {
     pub nested_virtualization: Option<bool>,
     /// New Rosetta setting.
     pub rosetta: Option<bool>,
-    /// New requested network attachment.
-    pub network: Option<RequestedNetwork>,
+    /// New durable network config.
+    pub network: Option<MachineNetworkConfig>,
 }
 
 impl MachineUpdate {

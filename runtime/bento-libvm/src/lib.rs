@@ -2,7 +2,7 @@
 //!
 //! `Runtime` is the service entry point. It creates or resolves machines and
 //! returns `Machine` handles for lifecycle and stream operations. Read output is
-//! returned as owned `MachineInspectData` snapshots so callers do not depend on
+//! returned as owned `MachineData` snapshots so callers do not depend on
 //! internal persistence models.
 //!
 //! ```rust,no_run
@@ -21,11 +21,9 @@
 
 mod error;
 pub mod host;
-mod launch;
+mod instance;
 mod lock_manager;
 mod machine;
-mod models;
-mod monitor;
 mod mount_path;
 mod network;
 mod network_policy;
@@ -33,24 +31,19 @@ mod paths;
 mod root_disk;
 mod runtime;
 mod store;
+mod vmmon;
 
 pub use crate::error::LibVmError;
 pub use crate::host::{ensure_certificate_authority, CertificateAuthority};
 pub use crate::machine::{
-    Machine, MachineCreate, MachineExitCommand, MachineInspectData, MachineRef,
-    MachineRuntimeStatus, MachineStartOptions, MachineStatus, MachineUpdate,
-    RuntimeComponentStatus,
+    Machine, MachineCreate, MachineData, MachineExitCommand, MachineRef, MachineStartOptions,
+    MachineStatus, MachineUpdate,
 };
-pub use crate::monitor::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub use crate::mount_path::resolve_mount_location;
 pub use crate::network::{
-    NamedNetworkMode, NetworkDefinition, NetworkDriverKind, NetworkDriverPreference,
-    RequestedNetwork,
+    MachineNetworkConfig, NetworkDefinition, NetworkDriverKind, NetworkDriverPreference,
+    NetworkTopology,
 };
 pub use crate::network_policy::NetworkPolicyRef;
-pub use crate::runtime::{
-    LocalRuntimeConfig, NetdRuntimeConfig, RemoteRuntimeConfig, Runtime, RuntimeConfig,
-    RuntimeNetworkingConfig, RuntimeTarget,
-};
-
-pub(crate) use crate::models::MachineId;
+pub use crate::runtime::{NetdRuntimeConfig, Runtime, RuntimeConfig, RuntimeNetworkingConfig};
+pub use crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT;

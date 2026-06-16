@@ -1,29 +1,26 @@
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::process::CommandExt;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bento_vm_spec::{RestartPolicy, VsockEndpoint, VsockEndpointMode};
-use nix::errno::Errno;
-use nix::sys::socket::{
-    recvmsg, sendmsg, socketpair, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType,
-};
-use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdout, Command};
-use tokio::sync::mpsc;
+use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::context::DaemonContext;
 
+mod control;
+mod plugin;
+
+use control::{
+    control_message_name, send_control_message, BrokerControlSocket, ControlMessageKind,
+};
+use plugin::{spawn_plugin, terminate_plugin, PluginEvent, RunningPlugin, StartupMessage};
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STABLE_RUN_RESET: Duration = Duration::from_secs(30);
-const CONTROL_MAGIC: u32 = 0x4252_4b52;
-const CONTROL_MESSAGE_MAX_BYTES: usize = 256;
 
 pub(crate) fn start_endpoint_supervisor(
     ctx: DaemonContext,
@@ -366,9 +363,9 @@ async fn stop_control_task(broker: &mut Option<JoinHandle<Result<(), String>>>) 
 }
 
 async fn await_broker(broker: &mut Option<JoinHandle<Result<(), String>>>) -> Result<(), String> {
-    let handle = broker
-        .take()
-        .expect("broker handle should exist when awaited");
+    let Some(handle) = broker.take() else {
+        return Err("broker handle missing".to_string());
+    };
     match handle.await {
         Ok(result) => result,
         Err(err) if err.is_cancelled() => Ok(()),
@@ -395,124 +392,6 @@ fn handle_plugin_event(
         None => Some(EndpointOutcome::Failed(
             "plugin stdout closed unexpectedly".to_string(),
         )),
-    }
-}
-
-fn spawn_plugin(
-    endpoint: &VsockEndpoint,
-    fd3: OwnedFd,
-    startup: &StartupMessage,
-) -> io::Result<RunningPlugin> {
-    let raw_fd3 = fd3.as_raw_fd();
-    let mut command = Command::new(&endpoint.plugin.command);
-    command
-        .args(&endpoint.plugin.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
-
-    if let Some(working_dir) = &endpoint.plugin.working_dir {
-        command.current_dir(working_dir);
-    }
-    for (key, value) in &endpoint.plugin.env {
-        command.env(key, value);
-    }
-
-    unsafe {
-        command.as_std_mut().pre_exec(move || {
-            if libc::dup2(raw_fd3, 3) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-
-            let flags = libc::fcntl(3, libc::F_GETFD);
-            if flags == -1 {
-                return Err(io::Error::last_os_error());
-            }
-
-            if libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-
-            if raw_fd3 != 3 && libc::close(raw_fd3) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-
-            Ok(())
-        });
-    }
-
-    let mut child = command.spawn()?;
-    tracing::info!(
-        endpoint = %endpoint.name,
-        mode = %endpoint_mode_name(endpoint.mode),
-        port = endpoint.port,
-        pid = ?child.id(),
-        command = %endpoint.plugin.command.display(),
-        "spawned endpoint plugin"
-    );
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "plugin stdin unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "plugin stdout unavailable"))?;
-
-    let payload = serde_json::to_vec(startup).map_err(io::Error::other)?;
-    let (tx, rx) = mpsc::unbounded_channel();
-    spawn_stdout_reader(stdout, tx);
-
-    tokio::spawn(async move {
-        if let Err(err) = stdin.write_all(&payload).await {
-            tracing::warn!(error = %err, "failed to write plugin startup payload");
-            return;
-        }
-        if let Err(err) = stdin.write_all(b"\n").await {
-            tracing::warn!(error = %err, "failed to terminate plugin startup payload");
-        }
-    });
-
-    Ok(RunningPlugin { child, events: rx })
-}
-
-fn spawn_stdout_reader(stdout: ChildStdout, tx: mpsc::UnboundedSender<PluginEvent>) {
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => match serde_json::from_str::<PluginStdoutEvent>(&line) {
-                    Ok(event) => {
-                        if tx.send(event.into()).is_err() {
-                            return;
-                        }
-                    }
-                    Err(err) => {
-                        let _ = tx.send(PluginEvent::Failed(format!(
-                            "invalid plugin stdout event: {err}"
-                        )));
-                        return;
-                    }
-                },
-                Ok(None) => return,
-                Err(err) => {
-                    let _ = tx.send(PluginEvent::Failed(format!("read plugin stdout: {err}")));
-                    return;
-                }
-            }
-        }
-    });
-}
-
-async fn terminate_plugin(child: &mut Child) -> io::Result<()> {
-    match child.kill().await {
-        Ok(()) => {
-            let _ = child.wait().await;
-            Ok(())
-        }
-        Err(err) if err.kind() == io::ErrorKind::InvalidInput => Ok(()),
-        Err(err) => Err(err),
     }
 }
 
@@ -682,325 +561,6 @@ fn child_exit_outcome(status: io::Result<std::process::ExitStatus>) -> EndpointO
 enum EndpointOutcome {
     Shutdown,
     ExitedCleanly,
-    Failed(String),
-}
-
-struct RunningPlugin {
-    child: Child,
-    events: mpsc::UnboundedReceiver<PluginEvent>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct StartupMessage {
-    api_version: u32,
-    vsock_endpoint: String,
-    mode: VsockEndpointMode,
-    port: u32,
-    transport: PluginTransport,
-    runtime_dir: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    config: Option<serde_json::Value>,
-    fd: i32,
-}
-
-impl StartupMessage {
-    fn new(endpoint: &VsockEndpoint, runtime_dir: PathBuf, fd: i32) -> Self {
-        Self {
-            api_version: 1,
-            vsock_endpoint: endpoint.name.clone(),
-            mode: endpoint.mode,
-            port: endpoint.port,
-            transport: PluginTransport::for_mode(endpoint.mode),
-            runtime_dir: runtime_dir.to_string_lossy().into_owned(),
-            config: endpoint.plugin.config.clone(),
-            fd,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-enum PluginTransport {
-    BrokeredConnect,
-    ListenAccept,
-}
-
-impl PluginTransport {
-    fn for_mode(mode: VsockEndpointMode) -> Self {
-        match mode {
-            VsockEndpointMode::Connect => Self::BrokeredConnect,
-            VsockEndpointMode::Listen => Self::ListenAccept,
-        }
-    }
-}
-
-enum ControlMessageKind {
-    ConnectOpen {
-        request_id: u64,
-    },
-    ConnectOpenOk {
-        request_id: u64,
-    },
-    ConnectOpenErr {
-        request_id: u64,
-        retryable: bool,
-        message: String,
-    },
-    ListenIncoming {
-        conn_id: u64,
-    },
-}
-
-struct BrokerControlSocket {
-    inner: AsyncFd<OwnedFd>,
-}
-
-impl BrokerControlSocket {
-    fn new(fd: OwnedFd) -> io::Result<Self> {
-        set_nonblocking(fd.as_raw_fd())?;
-        Ok(Self {
-            inner: AsyncFd::new(fd)?,
-        })
-    }
-
-    async fn recv_message(&self) -> io::Result<ControlMessageKind> {
-        let payload = loop {
-            let mut guard = self.inner.readable().await?;
-            match guard.try_io(|inner| recv_broker_frame(inner.get_ref().as_raw_fd())) {
-                Ok(result) => break result?,
-                Err(_would_block) => continue,
-            }
-        };
-
-        ControlMessageKind::from_bytes(&payload)
-    }
-
-    async fn send_message(
-        &self,
-        message: &ControlMessageKind,
-        fd: Option<&OwnedFd>,
-    ) -> io::Result<()> {
-        let payload = message.to_bytes()?;
-
-        loop {
-            let mut guard = self.inner.writable().await?;
-            match guard.try_io(|inner| send_broker_frame(inner.get_ref().as_raw_fd(), &payload, fd))
-            {
-                Ok(result) => return result,
-                Err(_would_block) => continue,
-            }
-        }
-    }
-}
-
-fn send_broker_frame(control: RawFd, payload: &[u8], fd: Option<&OwnedFd>) -> io::Result<()> {
-    let iov = [std::io::IoSlice::new(payload)];
-    let sent = match fd {
-        Some(fd) => {
-            let fds = [fd.as_raw_fd()];
-            let cmsg = [ControlMessage::ScmRights(&fds)];
-            sendmsg::<()>(control, &iov, &cmsg, MsgFlags::empty(), None)
-        }
-        None => sendmsg::<()>(control, &iov, &[], MsgFlags::empty(), None),
-    }
-    .map_err(nix_errno_to_io_error)?;
-
-    if sent != payload.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            format!("short broker write: sent {sent} of {} bytes", payload.len()),
-        ));
-    }
-
-    Ok(())
-}
-
-fn send_control_message(
-    control: &OwnedFd,
-    message: &ControlMessageKind,
-    fd: Option<&OwnedFd>,
-) -> io::Result<()> {
-    let payload = message.to_bytes()?;
-    send_broker_frame(control.as_raw_fd(), &payload, fd)
-}
-
-fn recv_broker_frame(control: RawFd) -> io::Result<Vec<u8>> {
-    let mut payload = vec![0_u8; std::mem::size_of::<ControlMessageFrameV1>()];
-    let bytes = {
-        let mut iov = [std::io::IoSliceMut::new(&mut payload)];
-        recvmsg::<()>(control, &mut iov, None, MsgFlags::empty())
-            .map_err(nix_errno_to_io_error)?
-            .bytes
-    };
-    if bytes == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "broker socket closed",
-        ));
-    }
-
-    payload.truncate(bytes);
-    Ok(payload)
-}
-
-fn control_message_name(message: &ControlMessageKind) -> &'static str {
-    match message {
-        ControlMessageKind::ConnectOpen { .. } => "connect_open",
-        ControlMessageKind::ConnectOpenOk { .. } => "connect_open_ok",
-        ControlMessageKind::ConnectOpenErr { .. } => "connect_open_err",
-        ControlMessageKind::ListenIncoming { .. } => "listen_incoming",
-    }
-}
-
-impl ControlMessageKind {
-    fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
-        if bytes.len() != std::mem::size_of::<ControlMessageFrameV1>() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected control message size {}", bytes.len()),
-            ));
-        }
-
-        let magic = u32::from_ne_bytes(bytes[0..4].try_into().expect("slice is four bytes"));
-        if magic != CONTROL_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected control magic {magic:#x}"),
-            ));
-        }
-
-        let kind = u32::from_ne_bytes(bytes[4..8].try_into().expect("slice is four bytes"));
-        let id = u64::from_ne_bytes(bytes[8..16].try_into().expect("slice is eight bytes"));
-        let flags = u32::from_ne_bytes(bytes[16..20].try_into().expect("slice is four bytes"));
-        let message_len =
-            u32::from_ne_bytes(bytes[20..24].try_into().expect("slice is four bytes")) as usize;
-
-        if message_len > CONTROL_MESSAGE_MAX_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "control message exceeded max size",
-            ));
-        }
-
-        let message = String::from_utf8(bytes[24..24 + message_len].to_vec()).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("decode control message: {err}"),
-            )
-        })?;
-
-        match kind {
-            1 => Ok(Self::ConnectOpen { request_id: id }),
-            2 => Ok(Self::ConnectOpenOk { request_id: id }),
-            3 => Ok(Self::ConnectOpenErr {
-                request_id: id,
-                retryable: flags != 0,
-                message,
-            }),
-            4 => Ok(Self::ListenIncoming { conn_id: id }),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown control message kind {kind}"),
-            )),
-        }
-    }
-
-    fn to_bytes(&self) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(std::mem::size_of::<ControlMessageFrameV1>());
-
-        match self {
-            Self::ConnectOpen { request_id } => {
-                bytes.extend_from_slice(&CONTROL_MAGIC.to_ne_bytes());
-                bytes.extend_from_slice(&1_u32.to_ne_bytes());
-                bytes.extend_from_slice(&request_id.to_ne_bytes());
-                bytes.extend_from_slice(&0_u32.to_ne_bytes());
-                bytes.extend_from_slice(&0_u32.to_ne_bytes());
-            }
-            Self::ConnectOpenOk { request_id } => {
-                bytes.extend_from_slice(&CONTROL_MAGIC.to_ne_bytes());
-                bytes.extend_from_slice(&2_u32.to_ne_bytes());
-                bytes.extend_from_slice(&request_id.to_ne_bytes());
-                bytes.extend_from_slice(&0_u32.to_ne_bytes());
-                bytes.extend_from_slice(&0_u32.to_ne_bytes());
-            }
-            Self::ConnectOpenErr {
-                request_id,
-                retryable,
-                message,
-            } => {
-                let message_bytes = message.as_bytes();
-                if message_bytes.len() > CONTROL_MESSAGE_MAX_BYTES {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "control error message exceeds max size",
-                    ));
-                }
-
-                bytes.extend_from_slice(&CONTROL_MAGIC.to_ne_bytes());
-                bytes.extend_from_slice(&3_u32.to_ne_bytes());
-                bytes.extend_from_slice(&request_id.to_ne_bytes());
-                bytes.extend_from_slice(&u32::from(*retryable).to_ne_bytes());
-                bytes.extend_from_slice(&(message_bytes.len() as u32).to_ne_bytes());
-                bytes.extend_from_slice(message_bytes);
-            }
-            Self::ListenIncoming { conn_id } => {
-                bytes.extend_from_slice(&CONTROL_MAGIC.to_ne_bytes());
-                bytes.extend_from_slice(&4_u32.to_ne_bytes());
-                bytes.extend_from_slice(&conn_id.to_ne_bytes());
-                bytes.extend_from_slice(&0_u32.to_ne_bytes());
-                bytes.extend_from_slice(&0_u32.to_ne_bytes());
-            }
-        }
-        bytes.resize(std::mem::size_of::<ControlMessageFrameV1>(), 0);
-
-        Ok(bytes)
-    }
-}
-
-#[repr(C)]
-struct ControlMessageFrameV1 {
-    magic: u32,
-    kind: u32,
-    id: u64,
-    flags: u32,
-    message_len: u32,
-    message: [u8; CONTROL_MESSAGE_MAX_BYTES],
-}
-
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn nix_errno_to_io_error(err: Errno) -> io::Error {
-    io::Error::from_raw_os_error(err as i32)
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-enum PluginStdoutEvent {
-    Ready,
-    Failed { message: String },
-}
-
-impl From<PluginStdoutEvent> for PluginEvent {
-    fn from(value: PluginStdoutEvent) -> Self {
-        match value {
-            PluginStdoutEvent::Ready => Self::Ready,
-            PluginStdoutEvent::Failed { message } => Self::Failed(message),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum PluginEvent {
-    Ready,
     Failed(String),
 }
 

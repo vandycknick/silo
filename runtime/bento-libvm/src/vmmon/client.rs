@@ -108,7 +108,7 @@ pub(crate) async fn wait_for_guest_running(
     }
 }
 
-pub(crate) async fn get_vm_monitor_inspect(socket_path: &Path) -> Result<InspectResponse, String> {
+pub(crate) async fn inspect(socket_path: &Path) -> Result<InspectResponse, String> {
     let stream = connect_vm_monitor_stream(socket_path).await?;
     let mut client = vm_monitor_client(stream)
         .await

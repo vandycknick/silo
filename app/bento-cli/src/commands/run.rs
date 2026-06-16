@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
 use bento_libvm::{
-    MachineCreate, MachineRef, RequestedNetwork, Runtime, DEFAULT_GUEST_READINESS_TIMEOUT,
+    MachineCreate, MachineNetworkConfig, MachineRef, Runtime, DEFAULT_GUEST_READINESS_TIMEOUT,
 };
 use bento_vm_spec::Mount;
 use clap::Args;
@@ -60,9 +60,7 @@ impl Cmd {
         let progress = Progress::start("reading run recipe");
         let mut resolved = self.resolve(libvm).await?;
         progress.step("finding boot assets");
-        let data_dir = libvm
-            .local_data_dir()
-            .ok_or_else(|| eyre::eyre!("local runtime data directory is unavailable"))?;
+        let data_dir = libvm.local_data_dir();
         let boot_assets =
             resolve_boot_assets(data_dir, resolved.kernel.take(), resolved.initramfs.take());
         let base_rootfs = {
@@ -130,7 +128,7 @@ impl Cmd {
         let mut labels = BTreeMap::new();
         let mut metadata = BTreeMap::new();
         let mut mounts = Vec::<Mount>::new();
-        let mut network = RequestedNetwork::default();
+        let mut network = MachineNetworkConfig::default();
         let mut userdata = None;
         let mut cpus = None;
         let mut memory_mib = None;
@@ -144,7 +142,7 @@ impl Cmd {
             let store = ProfileStore::from_env()?;
             let named = store.resolve(&selected)?;
             image_ref = named.profile.image.clone();
-            network = named.profile.requested_network();
+            network = named.profile.machine_network();
             userdata = named.profile.userdata.clone();
             cpus = named.profile.cpus();
             memory_mib = named.profile.memory_mib()?;
@@ -205,7 +203,7 @@ struct ResolvedRun {
     labels: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
     mounts: Vec<Mount>,
-    network: RequestedNetwork,
+    network: MachineNetworkConfig,
     userdata: Option<String>,
     cpus: Option<u8>,
     memory_mib: Option<u32>,

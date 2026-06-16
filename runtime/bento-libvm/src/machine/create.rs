@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use bento_vm_spec::Mount;
 
-use crate::network::RequestedNetwork;
+use crate::network::MachineNetworkConfig;
 
 /// Machine creation request.
 ///
@@ -42,6 +42,6 @@ pub struct MachineCreate {
     pub disks: Vec<PathBuf>,
     /// Host paths or volumes to mount into the guest.
     pub mounts: Vec<Mount>,
-    /// Requested network attachment.
-    pub network: Option<RequestedNetwork>,
+    /// Durable network config recorded for the machine.
+    pub network: Option<MachineNetworkConfig>,
 }

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use bento_libvm::{NetworkPolicyRef, RequestedNetwork};
+use bento_libvm::{MachineNetworkConfig, NetworkPolicyRef};
 use bento_utils::HumanSize;
 use bento_vm_spec::Mount;
 use eyre::{bail, Context};
@@ -86,8 +86,6 @@ pub(crate) enum ProfileNetwork {
     None,
     Named {
         name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        policy_ref: Option<NetworkPolicyRef>,
     },
 }
 
@@ -215,13 +213,11 @@ impl Profile {
             .unwrap_or(ProfileNetwork::Private { policy_ref: None })
     }
 
-    pub fn requested_network(&self) -> RequestedNetwork {
+    pub fn machine_network(&self) -> MachineNetworkConfig {
         match self.network() {
-            ProfileNetwork::Private { policy_ref } => RequestedNetwork::Private { policy_ref },
-            ProfileNetwork::None => RequestedNetwork::None,
-            ProfileNetwork::Named { name, policy_ref } => {
-                RequestedNetwork::Named { name, policy_ref }
-            }
+            ProfileNetwork::Private { policy_ref } => MachineNetworkConfig::Private { policy_ref },
+            ProfileNetwork::None => MachineNetworkConfig::None,
+            ProfileNetwork::Named { name } => MachineNetworkConfig::Named { name },
         }
     }
 
@@ -257,7 +253,7 @@ impl Profile {
         match self.network() {
             ProfileNetwork::Private { .. } => "private".to_string(),
             ProfileNetwork::None => "none".to_string(),
-            ProfileNetwork::Named { name, .. } => name,
+            ProfileNetwork::Named { name } => name,
         }
     }
 
@@ -302,31 +298,32 @@ fn normalize_network(raw: ProfileNetworkConfig) -> eyre::Result<ProfileNetwork> 
             "invalid network config: inline network.policy is no longer supported; use policy_ref"
         );
     }
-    match (raw.kind, raw.name) {
-        (Some(ProfileNetworkKind::Private), Some(name)) => bail!(
+    match (raw.kind, raw.name, raw.policy_ref) {
+        (Some(ProfileNetworkKind::Private), Some(name), _) => bail!(
             "invalid network config: kind \"private\" cannot be combined with name {:?}",
             name
         ),
-        (Some(ProfileNetworkKind::None), Some(name)) => bail!(
+        (Some(ProfileNetworkKind::None), Some(name), _) => bail!(
             "invalid network config: kind \"none\" cannot be combined with name {:?}",
             name
         ),
-        (Some(ProfileNetworkKind::Named), None) => {
+        (Some(ProfileNetworkKind::Named), None, _) => {
             bail!("invalid network config: kind \"named\" requires field \"name\"")
         }
-        (Some(ProfileNetworkKind::Private), None) => Ok(ProfileNetwork::Private {
-            policy_ref: raw.policy_ref,
-        }),
-        (Some(ProfileNetworkKind::None), None) => Ok(ProfileNetwork::None),
-        (Some(ProfileNetworkKind::Named), Some(name)) | (None, Some(name)) => {
-            Ok(ProfileNetwork::Named {
-                name,
-                policy_ref: raw.policy_ref,
-            })
+        (Some(ProfileNetworkKind::Private), None, policy_ref) => {
+            Ok(ProfileNetwork::Private { policy_ref })
         }
-        (None, None) => Ok(ProfileNetwork::Private {
-            policy_ref: raw.policy_ref,
-        }),
+        (Some(ProfileNetworkKind::None), None, None) => Ok(ProfileNetwork::None),
+        (Some(ProfileNetworkKind::None), None, Some(_)) => {
+            bail!("invalid network config: kind \"none\" cannot be combined with policy_ref")
+        }
+        (Some(ProfileNetworkKind::Named), Some(name), None) | (None, Some(name), None) => {
+            Ok(ProfileNetwork::Named { name })
+        }
+        (Some(ProfileNetworkKind::Named), Some(_), Some(_)) | (None, Some(_), Some(_)) => {
+            bail!("invalid network config: named networks do not support policy_ref")
+        }
+        (None, None, policy_ref) => Ok(ProfileNetwork::Private { policy_ref }),
     }
 }
 
@@ -468,8 +465,8 @@ network:
             .network
             .as_ref()
             .and_then(|network| match network {
-                crate::profile::ProfileNetwork::Private { policy_ref }
-                | crate::profile::ProfileNetwork::Named { policy_ref, .. } => policy_ref.as_ref(),
+                crate::profile::ProfileNetwork::Private { policy_ref } => policy_ref.as_ref(),
+                crate::profile::ProfileNetwork::Named { .. } => None,
                 crate::profile::ProfileNetwork::None => None,
             })
             .expect("network policy ref");
@@ -543,8 +540,26 @@ network:
 
         assert!(matches!(
             profile.network,
-            Some(crate::profile::ProfileNetwork::Named { ref name, .. }) if name == "dev"
+            Some(crate::profile::ProfileNetwork::Named { ref name }) if name == "dev"
         ));
+    }
+
+    #[test]
+    fn rejects_named_network_policy_ref() {
+        let err = parse_profile(
+            r#"
+version: "1"
+image: "ubuntu:24.04"
+network:
+  name: dev
+  policy_ref: github
+"#,
+        )
+        .expect_err("named network policy should fail");
+
+        assert!(err.chain().any(|cause| cause
+            .to_string()
+            .contains("named networks do not support policy_ref")));
     }
 
     #[test]

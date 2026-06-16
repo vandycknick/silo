@@ -9,12 +9,13 @@ use std::time::Duration;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::SqlitePool;
 
-use crate::models::{
+use crate::paths::{LocalPaths, LocalRoots};
+use crate::store::models::MachineId;
+use crate::store::models::{
     MachineConfig, MachineState, NetworkAttachment, NetworkDefinition, NetworkInstance,
 };
-use crate::paths::{LocalPaths, LocalRoots};
 use crate::store::Database;
-use crate::{LibVmError, MachineId};
+use crate::LibVmError;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Sqlite {
@@ -178,13 +179,13 @@ mod tests {
     use bento_vm_spec::{Hardware, VmSpec};
 
     use crate::lock_manager::LockId;
-    use crate::models::{
-        MachineConfig, MachineRuntimeState, MachineState, NetworkAttachment, NetworkInstance,
-        RequestedNetwork,
-    };
     use crate::paths::LocalPaths;
+    use crate::store::models::MachineId;
+    use crate::store::models::{
+        MachineConfig, MachineNetworkConfig, MachineRuntimeState, MachineState, NetworkAttachment,
+        NetworkInstance, NetworkInstanceState,
+    };
     use crate::store::{Database, Sqlite};
-    use crate::MachineId;
 
     fn temp_paths() -> (tempfile::TempDir, LocalPaths) {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -205,7 +206,7 @@ mod tests {
             root_disk_size: None,
             labels: BTreeMap::new(),
             metadata: BTreeMap::new(),
-            network: RequestedNetwork::default(),
+            network: MachineNetworkConfig::default(),
         }
     }
 
@@ -320,7 +321,7 @@ mod tests {
             root_disk_size: Some(64_000_000_000),
             labels,
             metadata,
-            network: RequestedNetwork::default(),
+            network: MachineNetworkConfig::default(),
         };
 
         db.insert_machine_config(&machine)
@@ -338,7 +339,7 @@ mod tests {
             found.metadata.get("bento.profile").map(String::as_str),
             Some("rust-dev")
         );
-        assert_eq!(found.network, RequestedNetwork::default());
+        assert_eq!(found.network, MachineNetworkConfig::default());
         let storage_type: String =
             sqlx::query_scalar("SELECT typeof(config_json) FROM machine_config WHERE id = ?1")
                 .bind(id.to_string())
@@ -523,7 +524,7 @@ mod tests {
             runtime_dir: "/tmp/netbox-runtime".to_string(),
             attachment_json: r#"{"kind":"none"}"#.to_string(),
             driver_state_json: r#"{"helper_pid":1234}"#.to_string(),
-            state: "running".to_string(),
+            state: NetworkInstanceState::Running,
             created_at: 41,
             modified_at: 42,
         };
