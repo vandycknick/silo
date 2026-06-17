@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::network::NetworkDriverKind;
-use crate::paths::{resolve_default_data_dir, resolve_default_run_dir, LocalPaths, LocalRoots};
+use crate::paths::{resolve_default_data_dir, resolve_default_run_dir, LocalRoots};
 use crate::LibVmError;
 
 /// Whether a runtime root came from defaults or a caller override.
@@ -61,15 +61,8 @@ impl RuntimeConfig {
         self
     }
 
-    pub(crate) fn local_paths(&self) -> Result<LocalPaths, LibVmError> {
-        Ok(LocalPaths::from_roots(self.resolve_roots()?))
-    }
-
     pub(crate) fn resolve_roots(&self) -> Result<LocalRoots, LibVmError> {
-        let data_root = match &self.data_root {
-            PathChoice::Default => resolve_default_data_dir()?,
-            PathChoice::Explicit(path) => path.clone(),
-        };
+        let data_root = self.bootstrap_data_root()?;
         let run_root = match &self.run_root {
             PathChoice::Default => resolve_default_run_dir(&data_root)?,
             PathChoice::Explicit(path) => path.clone(),
@@ -79,6 +72,13 @@ impl RuntimeConfig {
             PathChoice::Explicit(path) => path.clone(),
         };
         Ok(LocalRoots::with_roots(data_root, run_root, image_root))
+    }
+
+    pub(crate) fn bootstrap_data_root(&self) -> Result<PathBuf, LibVmError> {
+        match &self.data_root {
+            PathChoice::Default => resolve_default_data_dir(),
+            PathChoice::Explicit(path) => Ok(path.clone()),
+        }
     }
 }
 

@@ -9,7 +9,7 @@ use crate::store::models::MachineId;
 use crate::store::models::{
     MachineConfig, MachineState, NetworkAttachment, NetworkDefinition, NetworkInstance,
 };
-use crate::LibVmError;
+use crate::{LibVmError, RuntimeConfig};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
@@ -22,19 +22,34 @@ impl Store {
         &self.roots
     }
 
+    #[cfg(test)]
     async fn setup_db(pool: &SqlitePool, paths: &LocalPaths) -> Result<LocalRoots, LibVmError> {
         sqlx::migrate!("./migrations").run(pool).await?;
-        crate::store::config::validate(pool, paths.roots()).await
+        crate::store::config::validate(pool, paths.state_db_path(), paths.roots()).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn new(paths: &LocalPaths) -> Result<Self, LibVmError> {
+        crate::store::config::validate_roots_absolute(paths.roots())?;
         std::fs::create_dir_all(paths.data_dir())?;
-        let options = sqlite_options(paths.state_db_path());
-        let pool = SqlitePoolOptions::new()
-            .acquire_timeout(Duration::from_secs(30))
-            .connect_with(options)
-            .await?;
+        let pool = connect(paths.state_db_path()).await?;
         let roots = Self::setup_db(&pool, paths).await?;
+        Ok(Self { pool, roots })
+    }
+
+    pub(crate) async fn from_config(config: &RuntimeConfig) -> Result<Self, LibVmError> {
+        let data_root = config.bootstrap_data_root()?;
+        let bootstrap_paths = LocalPaths::from_roots(LocalRoots::with_roots(
+            data_root.clone(),
+            data_root.join("run"),
+            data_root.join("images"),
+        ));
+        crate::store::config::validate_roots_absolute(bootstrap_paths.roots())?;
+        std::fs::create_dir_all(bootstrap_paths.data_dir())?;
+        let pool = connect(bootstrap_paths.state_db_path()).await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        let roots =
+            crate::store::config::open(&pool, bootstrap_paths.state_db_path(), config).await?;
         Ok(Self { pool, roots })
     }
 
@@ -187,6 +202,14 @@ impl Store {
     }
 }
 
+async fn connect(path: &Path) -> Result<SqlitePool, LibVmError> {
+    let options = sqlite_options(path);
+    Ok(SqlitePoolOptions::new()
+        .acquire_timeout(Duration::from_secs(30))
+        .connect_with(options)
+        .await?)
+}
+
 fn sqlite_options(path: &Path) -> SqliteConnectOptions {
     SqliteConnectOptions::new()
         .filename(path)
@@ -205,13 +228,14 @@ mod tests {
     use bento_vm_spec::{Hardware, VmSpec};
 
     use crate::lock_manager::LockId;
-    use crate::paths::LocalPaths;
+    use crate::paths::{LocalPaths, LocalRoots};
     use crate::store::models::MachineId;
     use crate::store::models::{
         MachineConfig, MachineNetworkConfig, MachineRuntimeState, MachineState, NetworkAttachment,
         NetworkInstance, NetworkInstanceState,
     };
     use crate::store::Store;
+    use crate::{LibVmError, RuntimeConfig};
 
     fn temp_paths() -> (tempfile::TempDir, LocalPaths) {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -257,8 +281,8 @@ mod tests {
 
         let result = sqlx::query(
             "INSERT INTO db_config
-                (id, schema_version, data_dir, state_db_path, created_at, modified_at)
-             VALUES (2, 1, '/tmp/other', '/tmp/other/state.db', 1, 1)",
+                (id, schema_version, os, data_root, run_root, image_root, created_at, modified_at)
+             VALUES (2, 1, 'linux', '/tmp/other', '/tmp/other/run', '/tmp/other/images', 1, 1)",
         )
         .execute(&db.pool)
         .await;
@@ -269,6 +293,90 @@ mod tests {
             .await
             .expect("count db_config rows");
         assert_eq!(row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn db_config_seeds_root_contract() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+
+        let row: (i64, String, String, String) = sqlx::query_as(
+            "SELECT schema_version, data_root, run_root, image_root FROM db_config WHERE id = 1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("read db_config");
+
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1, paths.data_dir().display().to_string());
+        assert_eq!(row.2, paths.roots().run_root().display().to_string());
+        assert_eq!(row.3, paths.images_dir().display().to_string());
+    }
+
+    #[tokio::test]
+    async fn db_config_merges_default_roots_from_existing_contract() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_root = temp.path().join("bento");
+        let run_root = temp.path().join("runtime-root");
+        let image_root = temp.path().join("image-root");
+        let expected_roots = LocalRoots::with_roots(&data_root, &run_root, &image_root);
+
+        let initial = RuntimeConfig::local(&data_root)
+            .with_run_root(&run_root)
+            .with_image_root(&image_root);
+        let db = Store::from_config(&initial).await.expect("seed db_config");
+        assert_eq!(db.roots(), &expected_roots);
+        drop(db);
+
+        let reopened = Store::from_config(&RuntimeConfig::local(&data_root))
+            .await
+            .expect("reopen with default run/image roots");
+
+        assert_eq!(reopened.roots(), &expected_roots);
+    }
+
+    #[tokio::test]
+    async fn db_config_rejects_explicit_root_mismatch() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_root = temp.path().join("bento");
+        let run_root = temp.path().join("runtime-root");
+        let image_root = temp.path().join("image-root");
+        let initial = RuntimeConfig::local(&data_root)
+            .with_run_root(&run_root)
+            .with_image_root(&image_root);
+        let db = Store::from_config(&initial).await.expect("seed db_config");
+        drop(db);
+
+        let err = Store::from_config(
+            &RuntimeConfig::local(&data_root)
+                .with_run_root(temp.path().join("other-runtime-root"))
+                .with_image_root(&image_root),
+        )
+        .await
+        .expect_err("explicit run root mismatch should fail");
+
+        assert!(matches!(
+            err,
+            LibVmError::StateDatabaseConfigMismatch {
+                field: "run_root",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn db_config_rejects_relative_roots() {
+        let err = Store::from_config(&RuntimeConfig::local("relative-bento"))
+            .await
+            .expect_err("relative data root should fail");
+
+        assert!(matches!(
+            err,
+            LibVmError::StateDatabaseConfigMismatch {
+                field: "data_root",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

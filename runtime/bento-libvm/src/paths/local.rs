@@ -20,6 +20,7 @@ pub(crate) struct LocalRoots {
 }
 
 impl LocalRoots {
+    #[cfg(test)]
     pub(crate) fn new(data_root: impl Into<PathBuf>) -> Self {
         let data_root = data_root.into();
         let run_root = data_root.join("run");

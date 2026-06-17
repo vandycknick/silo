@@ -45,5 +45,7 @@ pub use crate::network::{
     NetworkTopology,
 };
 pub use crate::network_policy::NetworkPolicyRef;
-pub use crate::runtime::{NetdRuntimeConfig, Runtime, RuntimeConfig, RuntimeNetworkingConfig};
+pub use crate::runtime::{
+    NetdRuntimeConfig, PathChoice, Runtime, RuntimeConfig, RuntimeNetworkingConfig,
+};
 pub use crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT;

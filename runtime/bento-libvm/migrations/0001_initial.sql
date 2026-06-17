@@ -1,8 +1,10 @@
 CREATE TABLE IF NOT EXISTS db_config (
     id                  INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
     schema_version      INTEGER NOT NULL,
-    data_dir            TEXT NOT NULL,
-    state_db_path       TEXT NOT NULL,
+    os                  TEXT NOT NULL,
+    data_root           TEXT NOT NULL,
+    run_root            TEXT NOT NULL,
+    image_root          TEXT NOT NULL,
     created_at          INTEGER NOT NULL,
     modified_at         INTEGER NOT NULL
 );
@@ -52,13 +54,6 @@ CREATE TRIGGER IF NOT EXISTS db_config_created_at_immutable
 BEFORE UPDATE OF created_at ON db_config
 BEGIN
     SELECT RAISE(ABORT, 'db_config.created_at is immutable');
-END;
-
-CREATE TRIGGER IF NOT EXISTS db_config_singleton
-BEFORE INSERT ON db_config
-WHEN (SELECT COUNT(*) FROM db_config) > 0
-BEGIN
-    SELECT RAISE(ABORT, 'db_config allows exactly one row');
 END;
 
 CREATE TRIGGER IF NOT EXISTS network_instances_created_at_immutable

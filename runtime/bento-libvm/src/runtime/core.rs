@@ -126,8 +126,8 @@ pub(crate) struct VmmonRunIdentity {
 impl Runtime {
     /// Opens a local runtime from explicit configuration.
     pub async fn new(config: RuntimeConfig) -> Result<Self, LibVmError> {
-        let paths = config.local_paths()?;
-        Self::open(paths, config.networking).await
+        let db = Store::from_config(&config).await?;
+        Self::from_store(db, config.networking).await
     }
 
     /// Opens the default local runtime from the process environment.
@@ -135,11 +135,19 @@ impl Runtime {
         Self::new(RuntimeConfig::from_env()?).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn open(
         paths: LocalPaths,
         networking: RuntimeNetworkingConfig,
     ) -> Result<Self, LibVmError> {
         let db = Store::new(&paths).await?;
+        Self::from_store(db, networking).await
+    }
+
+    async fn from_store(
+        db: Store,
+        networking: RuntimeNetworkingConfig,
+    ) -> Result<Self, LibVmError> {
         let paths = LocalPaths::from_roots(db.roots().clone());
         let lock_manager = LockManager::open(paths.locks_dir().to_path_buf())?;
         let runtime = Self {
