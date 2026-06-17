@@ -5,6 +5,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Stored machine identifier.
+///
+/// `MachineId` wraps a UUID but displays and serializes as 32 lowercase hex
+/// characters without dashes. SQLite indexes use that exact string form so ID
+/// prefix lookup can operate on normalized lowercase hex prefixes.
 pub(crate) struct MachineId(Uuid);
 
 impl MachineId {
