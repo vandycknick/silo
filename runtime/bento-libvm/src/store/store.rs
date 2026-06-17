@@ -67,9 +67,11 @@ mod tests {
     use crate::store::models::MachineId;
     use crate::store::models::{
         MachineConfig, MachineNetworkConfig, MachineRuntimeState, MachineState, NetworkAttachment,
-        NetworkInstance, NetworkInstanceState,
+        NetworkDefinition, NetworkDriverPreference, NetworkInstance, NetworkInstanceState,
+        NetworkTopology,
     };
     use crate::store::{ConfigStore, MachineStore, NetworkStore, Store};
+    use crate::LibVmError;
 
     fn temp_paths() -> (tempfile::TempDir, LocalPaths) {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -123,6 +125,44 @@ mod tests {
         db.add_machine(config, &state)
             .await
             .expect("insert machine");
+    }
+
+    fn network_instance(id: &str, definition_name: Option<&str>) -> NetworkInstance {
+        NetworkInstance {
+            id: id.to_string(),
+            driver: "netd".to_string(),
+            definition_name: definition_name.map(str::to_string),
+            runtime_dir: format!("/tmp/{id}"),
+            attachment_json: r#"{"kind":"none"}"#.to_string(),
+            driver_state_json: r#"{"helper_pid":1234}"#.to_string(),
+            state: NetworkInstanceState::Running,
+            created_at: 41,
+            modified_at: 42,
+        }
+    }
+
+    fn network_attachment(machine_id: MachineId, network_id: &str) -> NetworkAttachment {
+        NetworkAttachment {
+            machine_id,
+            network_instance_id: network_id.to_string(),
+            guest_mac: "02:11:22:33:44:55".to_string(),
+            created_at: 43,
+            modified_at: 44,
+        }
+    }
+
+    fn network_definition(
+        name: &str,
+        topology: NetworkTopology,
+        driver_preference: NetworkDriverPreference,
+    ) -> NetworkDefinition {
+        NetworkDefinition {
+            name: name.to_string(),
+            topology,
+            driver_preference,
+            created_at: 0,
+            modified_at: 0,
+        }
     }
 
     #[tokio::test]
@@ -217,6 +257,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_machine_rejects_mismatched_initial_state_id() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id = MachineId::new();
+        let other_id = MachineId::new();
+        let metadata = machine_from_path(id, "mismatched".to_string(), paths.machine(id).dir());
+        let state = machine_state(other_id, MachineRuntimeState::Stopped);
+
+        let err = db
+            .add_machine(&metadata, &state)
+            .await
+            .expect_err("mismatched state id should fail");
+
+        assert!(matches!(err, LibVmError::InvalidCreateRequest { .. }));
+        assert!(db
+            .machine_config(id)
+            .await
+            .expect("lookup config")
+            .is_none());
+        assert!(db
+            .machine_state(other_id)
+            .await
+            .expect("lookup state")
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn insert_and_lookup_by_name() {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.expect("open db");
@@ -268,6 +335,25 @@ mod tests {
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0], metadata);
+    }
+
+    #[tokio::test]
+    async fn lookup_by_id_prefix_rejects_non_normalized_prefixes() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let too_long = "a".repeat(33);
+        let invalid_prefixes = ["", "ab", "ABC", "abc%", "abc_", "abcg", too_long.as_str()];
+
+        for prefix in invalid_prefixes {
+            let err = db
+                .machine_configs_by_id_prefix(prefix)
+                .await
+                .expect_err("invalid prefix should fail");
+            assert!(
+                matches!(err, LibVmError::InvalidMachineIdPrefix { .. }),
+                "expected InvalidMachineIdPrefix for {prefix:?}, got {err:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -393,6 +479,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_machine_cascades_network_attachment() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id = MachineId::new();
+        let metadata = machine_from_path(id, "networked".to_string(), paths.machine(id).dir());
+        seed_machine(&db, &metadata).await;
+        let instance = network_instance("networked-runtime", None);
+        let attachment = network_attachment(id, &instance.id);
+
+        db.save_network_instance(&instance)
+            .await
+            .expect("save network instance");
+        db.attach_network(&attachment)
+            .await
+            .expect("attach network");
+
+        db.remove_machine(&metadata).await.expect("remove machine");
+
+        assert!(db
+            .network_attachment(id)
+            .await
+            .expect("lookup attachment")
+            .is_none());
+        assert_eq!(
+            db.network_attachment_count(&instance.id)
+                .await
+                .expect("count attachments"),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn machine_state_round_trips() {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.expect("open db");
@@ -424,6 +542,18 @@ mod tests {
         .await
         .expect("query state updated_at");
         assert_eq!(updated_at, Some(43));
+    }
+
+    #[tokio::test]
+    async fn save_machine_state_requires_existing_machine() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id = MachineId::new();
+        let state = machine_state(id, MachineRuntimeState::Stopped);
+
+        db.save_machine_state(&state)
+            .await
+            .expect_err("state for missing machine should fail");
     }
 
     #[tokio::test]
@@ -463,6 +593,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_machine_config_requires_existing_machine() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id = MachineId::new();
+        let metadata = machine_from_path(id, "missing".to_string(), paths.machine(id).dir());
+
+        let err = db
+            .save_machine_config(&metadata)
+            .await
+            .expect_err("saving missing machine should fail");
+
+        assert!(matches!(
+            err,
+            LibVmError::MachineNotFound { reference } if reference == id.to_string()
+        ));
+    }
+
+    #[tokio::test]
+    async fn save_machine_config_duplicate_rename_fails_without_changing_rows() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id_a = MachineId::new();
+        let id_b = MachineId::new();
+        let machine_a = machine_from_path(id_a, "alpha".to_string(), paths.machine(id_a).dir());
+        let mut machine_b = machine_from_path(id_b, "bravo".to_string(), paths.machine(id_b).dir());
+        seed_machine(&db, &machine_a).await;
+        seed_machine(&db, &machine_b).await;
+
+        machine_b.name = "alpha".to_string();
+        db.save_machine_config(&machine_b)
+            .await
+            .expect_err("duplicate rename should fail");
+
+        assert_eq!(
+            db.machine_config(id_a)
+                .await
+                .expect("lookup alpha")
+                .expect("alpha exists"),
+            machine_a
+        );
+        assert_eq!(
+            db.machine_config(id_b)
+                .await
+                .expect("lookup bravo")
+                .expect("bravo exists")
+                .name,
+            "bravo"
+        );
+    }
+
+    #[tokio::test]
     async fn network_instance_and_attachment_round_trip_and_remove() {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.expect("open db");
@@ -471,24 +652,8 @@ mod tests {
         seed_machine(&db, &metadata).await;
 
         let network_id = "netbox-runtime".to_string();
-        let instance = NetworkInstance {
-            id: network_id.clone(),
-            driver: "netd".to_string(),
-            definition_name: None,
-            runtime_dir: "/tmp/netbox-runtime".to_string(),
-            attachment_json: r#"{"kind":"none"}"#.to_string(),
-            driver_state_json: r#"{"helper_pid":1234}"#.to_string(),
-            state: NetworkInstanceState::Running,
-            created_at: 41,
-            modified_at: 42,
-        };
-        let attachment = NetworkAttachment {
-            machine_id: id,
-            network_instance_id: network_id.clone(),
-            guest_mac: "02:11:22:33:44:55".to_string(),
-            created_at: 43,
-            modified_at: 44,
-        };
+        let instance = network_instance(&network_id, None);
+        let attachment = network_attachment(id, &network_id);
 
         db.save_network_instance(&instance)
             .await
@@ -530,6 +695,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn named_network_instance_definition_is_unique_but_private_instances_are_not() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+
+        db.save_network_instance(&network_instance("named-a", Some("devnet")))
+            .await
+            .expect("save first named instance");
+        db.save_network_instance(&network_instance("private-a", None))
+            .await
+            .expect("save first private instance");
+        db.save_network_instance(&network_instance("private-b", None))
+            .await
+            .expect("save second private instance");
+
+        db.save_network_instance(&network_instance("named-b", Some("devnet")))
+            .await
+            .expect_err("duplicate named instance definition should fail");
+    }
+
+    #[tokio::test]
+    async fn network_instance_by_definition_returns_unique_named_instance() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let instance = network_instance("devnet-runtime", Some("devnet"));
+
+        assert!(db
+            .network_instance_by_definition("devnet")
+            .await
+            .expect("lookup missing definition")
+            .is_none());
+        db.save_network_instance(&instance)
+            .await
+            .expect("save named network instance");
+
+        assert_eq!(
+            db.network_instance_by_definition("devnet")
+                .await
+                .expect("lookup definition")
+                .expect("definition instance exists"),
+            instance
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_network_instance_cascades_network_attachment() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id = MachineId::new();
+        let metadata = machine_from_path(id, "attached".to_string(), paths.machine(id).dir());
+        seed_machine(&db, &metadata).await;
+        let instance = network_instance("attached-runtime", None);
+        let attachment = network_attachment(id, &instance.id);
+
+        db.save_network_instance(&instance)
+            .await
+            .expect("save network instance");
+        db.attach_network(&attachment)
+            .await
+            .expect("attach network");
+
+        db.remove_network_instance(&instance.id)
+            .await
+            .expect("remove network instance");
+
+        assert!(db
+            .network_attachment(id)
+            .await
+            .expect("lookup attachment")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn network_attachment_count_tracks_attachment_lifecycle() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id_a = MachineId::new();
+        let id_b = MachineId::new();
+        let machine_a = machine_from_path(id_a, "net-a".to_string(), paths.machine(id_a).dir());
+        let machine_b = machine_from_path(id_b, "net-b".to_string(), paths.machine(id_b).dir());
+        seed_machine(&db, &machine_a).await;
+        seed_machine(&db, &machine_b).await;
+        let instance = network_instance("shared-runtime", None);
+        db.save_network_instance(&instance)
+            .await
+            .expect("save network instance");
+
+        assert_eq!(
+            db.network_attachment_count(&instance.id)
+                .await
+                .expect("count attachments"),
+            0
+        );
+        db.attach_network(&network_attachment(id_a, &instance.id))
+            .await
+            .expect("attach first machine");
+        assert_eq!(
+            db.network_attachment_count(&instance.id)
+                .await
+                .expect("count attachments"),
+            1
+        );
+        db.attach_network(&network_attachment(id_b, &instance.id))
+            .await
+            .expect("attach second machine");
+        assert_eq!(
+            db.network_attachment_count(&instance.id)
+                .await
+                .expect("count attachments"),
+            2
+        );
+        db.detach_network(id_a).await.expect("detach first machine");
+        assert_eq!(
+            db.network_attachment_count(&instance.id)
+                .await
+                .expect("count attachments"),
+            1
+        );
+        db.remove_network_instance(&instance.id)
+            .await
+            .expect("remove network instance");
+        assert_eq!(
+            db.network_attachment_count(&instance.id)
+                .await
+                .expect("count attachments"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn network_definitions_round_trip_list_update_and_remove() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let alpha = network_definition(
+            "alpha-net",
+            NetworkTopology::Bridge,
+            NetworkDriverPreference::Netd,
+        );
+        let beta = network_definition(
+            "beta-net",
+            NetworkTopology::Nat,
+            NetworkDriverPreference::VzNat,
+        );
+
+        db.define_network(&beta).await.expect("define beta network");
+        db.define_network(&alpha)
+            .await
+            .expect("define alpha network");
+
+        let list = db.list_network_definitions().await.expect("list networks");
+        assert_eq!(
+            list.iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha-net", "beta-net"]
+        );
+        let stored_alpha = db
+            .network_definition("alpha-net")
+            .await
+            .expect("lookup alpha")
+            .expect("alpha exists");
+        assert_eq!(stored_alpha.topology, NetworkTopology::Bridge);
+        assert_eq!(
+            stored_alpha.driver_preference,
+            NetworkDriverPreference::Netd
+        );
+        assert!(stored_alpha.created_at > 0);
+        assert!(stored_alpha.modified_at > 0);
+
+        let updated_alpha = network_definition(
+            "alpha-net",
+            NetworkTopology::Isolated,
+            NetworkDriverPreference::Auto,
+        );
+        db.define_network(&updated_alpha)
+            .await
+            .expect("update alpha network");
+        let stored_updated_alpha = db
+            .network_definition("alpha-net")
+            .await
+            .expect("lookup updated alpha")
+            .expect("updated alpha exists");
+        assert_eq!(stored_updated_alpha.topology, NetworkTopology::Isolated);
+        assert_eq!(
+            stored_updated_alpha.driver_preference,
+            NetworkDriverPreference::Auto
+        );
+        assert_eq!(stored_updated_alpha.created_at, stored_alpha.created_at);
+        assert!(stored_updated_alpha.modified_at >= stored_alpha.modified_at);
+
+        db.remove_network_definition("alpha-net")
+            .await
+            .expect("remove alpha network");
+        assert!(db
+            .network_definition("alpha-net")
+            .await
+            .expect("lookup removed alpha")
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn machine_timestamps_live_in_json_not_columns() {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.expect("open db");
@@ -552,6 +917,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn machine_config_decode_rejects_json_id_mismatch() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id = MachineId::new();
+        let mut machine = machine_from_path(id, "corrupt-id".to_string(), paths.machine(id).dir());
+        seed_machine(&db, &machine).await;
+        machine.id = MachineId::new();
+
+        sqlx::query("UPDATE machine_config SET config_json = jsonb(?1) WHERE id = ?2")
+            .bind(serde_json::to_string(&machine).expect("serialize corrupt config"))
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .expect("corrupt stored config");
+
+        let err = db
+            .machine_config(id)
+            .await
+            .expect_err("corrupt config should fail decode");
+        assert!(err.to_string().contains("machine_config.config_json.id"));
+    }
+
+    #[tokio::test]
+    async fn machine_config_decode_rejects_json_name_mismatch() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id = MachineId::new();
+        let mut machine =
+            machine_from_path(id, "indexed-name".to_string(), paths.machine(id).dir());
+        seed_machine(&db, &machine).await;
+        machine.name = "json-name".to_string();
+
+        sqlx::query("UPDATE machine_config SET config_json = jsonb(?1) WHERE id = ?2")
+            .bind(serde_json::to_string(&machine).expect("serialize corrupt config"))
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .expect("corrupt stored config");
+
+        let err = db
+            .machine_config(id)
+            .await
+            .expect_err("corrupt config should fail decode");
+        assert!(err.to_string().contains("machine_config.config_json.name"));
+    }
+
+    #[tokio::test]
+    async fn machine_state_decode_rejects_json_machine_id_mismatch() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id = MachineId::new();
+        let machine = machine_from_path(id, "corrupt-state".to_string(), paths.machine(id).dir());
+        seed_machine(&db, &machine).await;
+        let corrupt_state = machine_state(MachineId::new(), MachineRuntimeState::Stopped);
+
+        sqlx::query("UPDATE machine_state SET state_json = jsonb(?1) WHERE machine_id = ?2")
+            .bind(serde_json::to_string(&corrupt_state).expect("serialize corrupt state"))
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .expect("corrupt stored state");
+
+        let err = db
+            .machine_state(id)
+            .await
+            .expect_err("corrupt state should fail decode");
+        assert!(err
+            .to_string()
+            .contains("machine_state.state_json.machineId"));
+    }
+
+    #[tokio::test]
+    async fn machine_state_decode_rejects_json_status_mismatch() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id = MachineId::new();
+        let machine = machine_from_path(id, "corrupt-status".to_string(), paths.machine(id).dir());
+        seed_machine(&db, &machine).await;
+
+        sqlx::query("UPDATE machine_state SET status = 'running' WHERE machine_id = ?1")
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .expect("corrupt stored state status");
+
+        let err = db
+            .machine_state(id)
+            .await
+            .expect_err("corrupt state should fail decode");
+        assert!(err.to_string().contains("machine_state.state_json.status"));
+    }
+
+    #[tokio::test]
+    async fn network_instance_decode_rejects_unknown_state() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let instance = network_instance("corrupt-network", None);
+        db.save_network_instance(&instance)
+            .await
+            .expect("save network instance");
+
+        sqlx::query("UPDATE network_instances SET state = 'stuck' WHERE id = ?1")
+            .bind(&instance.id)
+            .execute(&db.pool)
+            .await
+            .expect("corrupt network instance state");
+
+        let err = db
+            .network_instance(&instance.id)
+            .await
+            .expect_err("corrupt network instance should fail decode");
+        assert!(err.to_string().contains("network_instances.state"));
+    }
+
+    #[tokio::test]
+    async fn network_definition_decode_rejects_invalid_json() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let definition = network_definition(
+            "corrupt-definition",
+            NetworkTopology::Nat,
+            NetworkDriverPreference::Auto,
+        );
+        db.define_network(&definition)
+            .await
+            .expect("define network");
+
+        sqlx::query("UPDATE network_definitions SET mode = 'not-json' WHERE name = ?1")
+            .bind(&definition.name)
+            .execute(&db.pool)
+            .await
+            .expect("corrupt network definition mode");
+
+        let err = db
+            .network_definition(&definition.name)
+            .await
+            .expect_err("corrupt network definition should fail decode");
+        assert!(err.to_string().contains("network_definitions.mode"));
+    }
+
+    #[tokio::test]
     async fn duplicate_name_fails() {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.expect("open db");
@@ -564,7 +1070,10 @@ mod tests {
         let second = machine_from_path(id2, "dupe".to_string(), paths.machine(id2).dir());
         let second_state = machine_state(id2, MachineRuntimeState::Stopped);
         let result = db.add_machine(&second, &second_state).await;
-        assert!(result.is_err(), "duplicate name should fail");
+        assert!(matches!(
+            result,
+            Err(LibVmError::MachineAlreadyExists { name }) if name == "dupe"
+        ));
     }
 
     #[tokio::test]

@@ -32,7 +32,8 @@ impl MachineStore for Store {
         .bind(&config.name)
         .bind(Self::serialize("machine_config.config_json", config)?)
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|err| Self::map_add_machine_error(err, &config.name))?;
         sqlx::query(
             "INSERT INTO machine_state (machine_id, status, state_json)
              VALUES (?1, ?2, jsonb(?3))",
@@ -76,7 +77,7 @@ impl MachineStore for Store {
     }
 
     async fn save_machine_config(&self, config: &MachineConfig) -> Result<(), LibVmError> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE machine_config
              SET name = ?1, config_json = jsonb(?2)
              WHERE id = ?3",
@@ -86,6 +87,13 @@ impl MachineStore for Store {
         .bind(config.id.to_string())
         .execute(&self.pool)
         .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(LibVmError::MachineNotFound {
+                reference: config.id.to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -114,6 +122,7 @@ impl MachineStore for Store {
         &self,
         prefix: &str,
     ) -> Result<Vec<MachineConfig>, LibVmError> {
+        Self::validate_machine_id_prefix(prefix)?;
         let pattern = format!("{prefix}%");
         let query = format!("SELECT {MACHINE_CONFIG_COLUMNS} FROM machine_config WHERE id LIKE ?1");
         let rows = sqlx::query_as::<_, DbMachineConfig>(&query)
@@ -167,6 +176,50 @@ impl MachineStore for Store {
 }
 
 impl Store {
+    fn validate_machine_id_prefix(prefix: &str) -> Result<(), LibVmError> {
+        let valid_length = prefix.len() >= 3 && prefix.len() <= 32;
+        let normalized_hex = prefix
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, 'a'..='f'));
+        if valid_length && normalized_hex {
+            return Ok(());
+        }
+
+        let reason = if prefix.len() < 3 {
+            "prefix must be at least 3 characters".to_string()
+        } else if prefix.len() > 32 {
+            "prefix must be at most 32 characters".to_string()
+        } else {
+            "prefix must be normalized lowercase hex".to_string()
+        };
+        Err(LibVmError::InvalidMachineIdPrefix {
+            prefix: prefix.to_string(),
+            reason,
+        })
+    }
+
+    fn map_add_machine_error(err: sqlx::Error, name: &str) -> LibVmError {
+        match err {
+            sqlx::Error::Database(db_err) => {
+                if Self::is_machine_name_unique_violation(db_err.as_ref()) {
+                    return LibVmError::MachineAlreadyExists {
+                        name: name.to_string(),
+                    };
+                }
+
+                sqlx::Error::Database(db_err).into()
+            }
+            other => other.into(),
+        }
+    }
+
+    fn is_machine_name_unique_violation(err: &(dyn sqlx::error::DatabaseError + 'static)) -> bool {
+        err.constraint() == Some("machine_config.name")
+            || err
+                .message()
+                .contains("UNIQUE constraint failed: machine_config.name")
+    }
+
     fn serialize<T>(field: &'static str, value: &T) -> Result<String, LibVmError>
     where
         T: serde::Serialize,

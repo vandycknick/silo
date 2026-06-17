@@ -88,3 +88,31 @@ impl MachineRuntimeState {
         matches!(self, Self::Running)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::MachineRuntimeState;
+
+    #[test]
+    fn machine_runtime_state_round_trips_through_storage_string() {
+        for state in [
+            MachineRuntimeState::Stopped,
+            MachineRuntimeState::Starting,
+            MachineRuntimeState::Running,
+            MachineRuntimeState::Stopping,
+            MachineRuntimeState::Error,
+        ] {
+            assert_eq!(
+                MachineRuntimeState::parse(state.as_str()).expect("parse runtime state"),
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn machine_runtime_state_rejects_unknown_storage_string() {
+        let err = MachineRuntimeState::parse("paused").expect_err("unknown state should fail");
+
+        assert!(err.contains("unknown machine runtime state"));
+    }
+}

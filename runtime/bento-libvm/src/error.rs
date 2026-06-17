@@ -16,6 +16,9 @@ pub enum LibVmError {
     #[error("invalid machine name {name:?}: {reason}")]
     InvalidMachineName { name: String, reason: String },
 
+    #[error("invalid machine id prefix {prefix:?}: {reason}")]
+    InvalidMachineIdPrefix { prefix: String, reason: String },
+
     #[error("machine {name:?} already exists")]
     MachineAlreadyExists { name: String },
 

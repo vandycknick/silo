@@ -32,6 +32,10 @@ CREATE TABLE IF NOT EXISTS network_instances (
     modified_at             INTEGER NOT NULL
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS network_instances_definition_name_unique
+ON network_instances(definition_name)
+WHERE definition_name IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS network_attachments (
     machine_id              TEXT NOT NULL REFERENCES machine_config(id) ON DELETE CASCADE,
     network_instance_id     TEXT NOT NULL REFERENCES network_instances(id) ON DELETE CASCADE,

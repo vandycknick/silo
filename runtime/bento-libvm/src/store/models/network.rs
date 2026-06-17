@@ -41,6 +41,27 @@ impl NetworkInstanceState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::NetworkInstanceState;
+
+    #[test]
+    fn network_instance_state_round_trips_through_storage_string() {
+        assert_eq!(
+            NetworkInstanceState::parse(NetworkInstanceState::Running.as_str())
+                .expect("parse network state"),
+            NetworkInstanceState::Running
+        );
+    }
+
+    #[test]
+    fn network_instance_state_rejects_unknown_storage_string() {
+        let err = NetworkInstanceState::parse("stopped").expect_err("unknown state should fail");
+
+        assert!(err.contains("unknown network instance state"));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Persisted attachment between one machine and one network instance.
 pub(crate) struct NetworkAttachment {
