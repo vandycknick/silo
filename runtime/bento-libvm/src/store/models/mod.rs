@@ -6,10 +6,12 @@
 //! exact persisted network representation. Public read and input types live in
 //! `machine` and `network` and are converted at the crate boundary.
 
+mod db_config;
 mod machine;
 mod machine_id;
 mod network;
 
+pub(crate) use db_config::DbConfig;
 pub(crate) use machine::{MachineConfig, MachineRuntimeState, MachineState};
 pub(crate) use machine_id::{looks_like_id_prefix, MachineId};
 pub(crate) use network::{

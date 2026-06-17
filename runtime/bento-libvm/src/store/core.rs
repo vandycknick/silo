@@ -294,8 +294,8 @@ mod tests {
 
         let result = sqlx::query(
             "INSERT INTO db_config
-                (id, schema_version, os, data_root, run_root, image_root, created_at, modified_at)
-             VALUES (2, 1, 'linux', '/tmp/other', '/tmp/other/run', '/tmp/other/images', 1, 1)",
+                (id, os, data_root, run_root, image_root, created_at, modified_at)
+             VALUES (2, 'linux', '/tmp/other', '/tmp/other/run', '/tmp/other/images', 1, 1)",
         )
         .execute(&db.pool)
         .await;
@@ -313,17 +313,15 @@ mod tests {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.expect("open db");
 
-        let row: (i64, String, String, String) = sqlx::query_as(
-            "SELECT schema_version, data_root, run_root, image_root FROM db_config WHERE id = 1",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .expect("read db_config");
+        let row: (String, String, String) =
+            sqlx::query_as("SELECT data_root, run_root, image_root FROM db_config WHERE id = 1")
+                .fetch_one(&db.pool)
+                .await
+                .expect("read db_config");
 
-        assert_eq!(row.0, 1);
-        assert_eq!(row.1, paths.data_dir().display().to_string());
-        assert_eq!(row.2, paths.roots().run_root().display().to_string());
-        assert_eq!(row.3, paths.images_dir().display().to_string());
+        assert_eq!(row.0, paths.data_dir().display().to_string());
+        assert_eq!(row.1, paths.roots().run_root().display().to_string());
+        assert_eq!(row.2, paths.images_dir().display().to_string());
     }
 
     #[tokio::test]

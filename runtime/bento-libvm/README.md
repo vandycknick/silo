@@ -48,10 +48,10 @@ The persisted root contract stores only main roots:
   derive from this root.
 - `image_root`: local image and cache storage.
 
-`db_config` is a singleton row with `id = 1`. It records `schema_version`, the
-host `os`, `data_root`, `run_root`, `image_root`, `created_at`, and
-`modified_at`. Derived paths are not duplicated in the row unless they become
-independently configurable. The derivation is:
+`db_config` is a singleton row with `id = 1`. It records the host `os`,
+`data_root`, `run_root`, `image_root`, `created_at`, and `modified_at`. Derived
+paths are not duplicated in the row unless they become independently
+configurable. The derivation is:
 
 | Path           | Derived from             |
 | -------------- | ------------------------ |

@@ -1,6 +1,5 @@
 CREATE TABLE IF NOT EXISTS db_config (
     id                  INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
-    schema_version      INTEGER NOT NULL,
     os                  TEXT NOT NULL,
     data_root           TEXT NOT NULL,
     run_root            TEXT NOT NULL,

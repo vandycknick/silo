@@ -6,9 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::{Row, SqlitePool};
 
 use crate::paths::LocalRoots;
+use crate::store::models::DbConfig;
 use crate::{LibVmError, PathChoice, RuntimeConfig};
 
-const STATE_SCHEMA_VERSION: i64 = 1;
 const DB_CONFIG_ID: i64 = 1;
 
 pub(super) fn validate_roots_absolute(roots: &LocalRoots) -> Result<(), LibVmError> {
@@ -71,12 +71,11 @@ async fn insert_seed(pool: &SqlitePool, seed: &DbConfig) -> Result<(), LibVmErro
     let now = now_unix();
     sqlx::query(
         "INSERT INTO db_config
-            (id, schema_version, os, data_root, run_root, image_root, created_at, modified_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+            (id, os, data_root, run_root, image_root, created_at, modified_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
          ON CONFLICT(id) DO NOTHING",
     )
     .bind(DB_CONFIG_ID)
-    .bind(seed.schema_version)
     .bind(&seed.os)
     .bind(&seed.data_root)
     .bind(&seed.run_root)
@@ -89,7 +88,7 @@ async fn insert_seed(pool: &SqlitePool, seed: &DbConfig) -> Result<(), LibVmErro
 
 async fn read_configs(pool: &SqlitePool) -> Result<Vec<DbConfig>, LibVmError> {
     let rows = sqlx::query(
-        "SELECT schema_version, os, data_root, run_root, image_root
+        "SELECT os, data_root, run_root, image_root
          FROM db_config",
     )
     .fetch_all(pool)
@@ -98,7 +97,6 @@ async fn read_configs(pool: &SqlitePool) -> Result<Vec<DbConfig>, LibVmError> {
     rows.into_iter()
         .map(|row| {
             Ok(DbConfig {
-                schema_version: row.try_get("schema_version")?,
                 os: row.try_get("os")?,
                 data_root: row.try_get("data_root")?,
                 run_root: row.try_get("run_root")?,
@@ -121,46 +119,7 @@ async fn read_single_config(pool: &SqlitePool) -> Result<Option<DbConfig>, LibVm
     }
 }
 
-/// Stored root contract for a local Bento state database.
-///
-/// The `db_config` table contains exactly one row, `id = 1`. It stores the
-/// schema version, the host OS that created the database, and only the three
-/// roots that are independently configurable:
-///
-/// - `data_root`: persistent machine metadata, assets, keys, and `state.db`
-/// - `run_root`: host-runtime files such as locks and network state
-/// - `image_root`: unpacked machine images
-///
-/// Derived paths are intentionally not persisted. `state.db` is always
-/// `data_root/state.db`; machines, assets, keys, and secrets live below
-/// `data_root`; locks and network runtime directories live below `run_root`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DbConfig {
-    schema_version: i64,
-    os: String,
-    data_root: String,
-    run_root: String,
-    image_root: String,
-}
-
-impl DbConfig {
-    fn from_roots(roots: &LocalRoots) -> Self {
-        Self {
-            schema_version: STATE_SCHEMA_VERSION,
-            os: OS.to_string(),
-            data_root: path_to_db_string(roots.data_root()),
-            run_root: path_to_db_string(roots.run_root()),
-            image_root: path_to_db_string(roots.image_root()),
-        }
-    }
-}
-
 fn validate_header(config: &DbConfig) -> Result<(), LibVmError> {
-    compare_i64(
-        "schema_version",
-        STATE_SCHEMA_VERSION,
-        config.schema_version,
-    )?;
     compare_str("os", OS, &config.os)
 }
 
@@ -213,17 +172,6 @@ fn validate_roots_match_config(roots: &LocalRoots, config: &DbConfig) -> Result<
         roots.image_root(),
         Path::new(&config.image_root),
     )
-}
-
-fn compare_i64(field: &'static str, expected: i64, actual: i64) -> Result<(), LibVmError> {
-    if expected == actual {
-        return Ok(());
-    }
-    Err(LibVmError::StateDatabaseConfigMismatch {
-        field,
-        expected: expected.to_string(),
-        actual: actual.to_string(),
-    })
 }
 
 fn compare_str(field: &'static str, expected: &str, actual: &str) -> Result<(), LibVmError> {
