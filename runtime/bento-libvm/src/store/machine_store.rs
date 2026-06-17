@@ -167,35 +167,6 @@ impl MachineStore for Store {
 }
 
 impl Store {
-    #[cfg(test)]
-    pub(crate) async fn insert_machine_config(
-        &self,
-        config: &MachineConfig,
-    ) -> Result<(), LibVmError> {
-        sqlx::query(
-            "INSERT INTO machine_config (id, name, config_json)
-             VALUES (?1, ?2, jsonb(?3))",
-        )
-        .bind(config.id.to_string())
-        .bind(&config.name)
-        .bind(Self::serialize("machine_config.config_json", config)?)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn remove_machine_state(
-        &self,
-        machine_id: MachineId,
-    ) -> Result<(), LibVmError> {
-        sqlx::query("DELETE FROM machine_state WHERE machine_id = ?1")
-            .bind(machine_id.to_string())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     fn serialize<T>(field: &'static str, value: &T) -> Result<String, LibVmError>
     where
         T: serde::Serialize,

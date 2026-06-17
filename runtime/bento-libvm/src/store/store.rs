@@ -118,6 +118,13 @@ mod tests {
         }
     }
 
+    async fn seed_machine(db: &Store, config: &MachineConfig) {
+        let state = machine_state(config.id, MachineRuntimeState::Stopped);
+        db.add_machine(config, &state)
+            .await
+            .expect("insert machine");
+    }
+
     #[tokio::test]
     async fn db_config_allows_exactly_one_row() {
         let (_dir, paths) = temp_paths();
@@ -216,7 +223,7 @@ mod tests {
         let id = MachineId::new();
         let metadata = machine_from_path(id, "devbox".to_string(), paths.machine(id).dir());
 
-        db.insert_machine_config(&metadata).await.expect("insert");
+        seed_machine(&db, &metadata).await;
         let found = db
             .machine_config_by_name("devbox")
             .await
@@ -233,7 +240,7 @@ mod tests {
         let id = MachineId::new();
         let metadata = machine_from_path(id, "testvm".to_string(), paths.machine(id).dir());
 
-        db.insert_machine_config(&metadata).await.expect("insert");
+        seed_machine(&db, &metadata).await;
         let found = db
             .machine_config(id)
             .await
@@ -250,7 +257,7 @@ mod tests {
         let id = MachineId::new();
         let metadata = machine_from_path(id, "prefix-test".to_string(), paths.machine(id).dir());
 
-        db.insert_machine_config(&metadata).await.expect("insert");
+        seed_machine(&db, &metadata).await;
 
         let id_str = id.to_string();
         let prefix = &id_str[..8];
@@ -288,9 +295,7 @@ mod tests {
             network: MachineNetworkConfig::default(),
         };
 
-        db.insert_machine_config(&machine)
-            .await
-            .expect("insert machine");
+        seed_machine(&db, &machine).await;
         let found = db
             .machine_config(id)
             .await
@@ -360,20 +365,10 @@ mod tests {
 
         let id_b = MachineId::new();
         let id_a = MachineId::new();
-        db.insert_machine_config(&machine_from_path(
-            id_b,
-            "bravo".to_string(),
-            paths.machine(id_b).dir(),
-        ))
-        .await
-        .expect("insert b");
-        db.insert_machine_config(&machine_from_path(
-            id_a,
-            "alpha".to_string(),
-            paths.machine(id_a).dir(),
-        ))
-        .await
-        .expect("insert a");
+        let machine_b = machine_from_path(id_b, "bravo".to_string(), paths.machine(id_b).dir());
+        let machine_a = machine_from_path(id_a, "alpha".to_string(), paths.machine(id_a).dir());
+        seed_machine(&db, &machine_b).await;
+        seed_machine(&db, &machine_a).await;
 
         let list = db.list_machine_configs().await.expect("list");
         assert_eq!(list.len(), 2);
@@ -403,7 +398,7 @@ mod tests {
         let db = Store::new(&paths).await.expect("open db");
         let id = MachineId::new();
         let metadata = machine_from_path(id, "runtime".to_string(), paths.machine(id).dir());
-        db.insert_machine_config(&metadata).await.expect("insert");
+        seed_machine(&db, &metadata).await;
 
         let state = MachineState {
             vmmon_pid: Some(1234),
@@ -429,9 +424,6 @@ mod tests {
         .await
         .expect("query state updated_at");
         assert_eq!(updated_at, Some(43));
-
-        db.remove_machine_state(id).await.expect("remove state");
-        assert!(db.machine_state(id).await.expect("get state").is_none());
     }
 
     #[tokio::test]
@@ -440,7 +432,7 @@ mod tests {
         let db = Store::new(&paths).await.expect("open db");
         let id = MachineId::new();
         let mut metadata = machine_from_path(id, "config".to_string(), paths.machine(id).dir());
-        db.insert_machine_config(&metadata).await.expect("insert");
+        seed_machine(&db, &metadata).await;
 
         metadata
             .spec
@@ -476,9 +468,7 @@ mod tests {
         let db = Store::new(&paths).await.expect("open db");
         let id = MachineId::new();
         let metadata = machine_from_path(id, "netbox".to_string(), paths.machine(id).dir());
-        db.insert_machine_config(&metadata)
-            .await
-            .expect("insert machine");
+        seed_machine(&db, &metadata).await;
 
         let network_id = "netbox-runtime".to_string();
         let instance = NetworkInstance {
@@ -568,21 +558,12 @@ mod tests {
 
         let id1 = MachineId::new();
         let id2 = MachineId::new();
-        db.insert_machine_config(&machine_from_path(
-            id1,
-            "dupe".to_string(),
-            paths.machine(id1).dir(),
-        ))
-        .await
-        .expect("insert first");
+        let first = machine_from_path(id1, "dupe".to_string(), paths.machine(id1).dir());
+        seed_machine(&db, &first).await;
 
-        let result = db
-            .insert_machine_config(&machine_from_path(
-                id2,
-                "dupe".to_string(),
-                paths.machine(id2).dir(),
-            ))
-            .await;
+        let second = machine_from_path(id2, "dupe".to_string(), paths.machine(id2).dir());
+        let second_state = machine_state(id2, MachineRuntimeState::Stopped);
+        let result = db.add_machine(&second, &second_state).await;
         assert!(result.is_err(), "duplicate name should fail");
     }
 
@@ -593,13 +574,8 @@ mod tests {
         let db2 = Store::new(&paths).await.expect("open db 2");
 
         let id = MachineId::new();
-        db1.insert_machine_config(&machine_from_path(
-            id,
-            "shared".to_string(),
-            paths.machine(id).dir(),
-        ))
-        .await
-        .expect("insert via db1");
+        let machine = machine_from_path(id, "shared".to_string(), paths.machine(id).dir());
+        seed_machine(&db1, &machine).await;
 
         let found = db2
             .machine_config_by_name("shared")
