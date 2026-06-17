@@ -34,6 +34,34 @@ The main shapes are:
 - `MachineCreate` and `MachineUpdate`, request DTOs for caller input.
 - `MachineInspectData`, an owned snapshot returned by inspect and mutation calls.
 
+## Runtime Roots Plan
+
+The first runtime open resolves root defaults from process configuration,
+creates `state.db`, and stores the resolved root contract in `db_config`. Later
+opens use that row to keep existing installs stable even if code defaults change.
+
+The persisted root contract should store only main roots:
+
+- `data_root`: durable manager state. `state.db`, machines, assets, keys, and
+  `secrets.json` derive from this root.
+- `run_root`: transient runtime state. Locks and network runtime directories
+  derive from this root.
+- `image_root`: local image and cache storage.
+
+Derived paths should not be duplicated in `db_config` unless they become
+independently configurable. The intended derivation is:
+
+| Path           | Derived from             |
+| -------------- | ------------------------ |
+| `state.db`     | `data_root/state.db`     |
+| `machines/`    | `data_root/machines`     |
+| `assets/`      | `data_root/assets`       |
+| `keys/`        | `data_root/keys`         |
+| `secrets.json` | `data_root/secrets.json` |
+| `images/`      | `image_root`             |
+| `locks/`       | `run_root/locks`         |
+| `net/`         | `run_root/net`           |
+
 ## Lifecycle States
 
 `bento-libvm` treats VM lifecycle mutations as lock-owned transactions. Commands
