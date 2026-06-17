@@ -5,10 +5,6 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::SqlitePool;
 
 use crate::paths::{LocalPaths, LocalRoots};
-use crate::store::models::MachineId;
-use crate::store::models::{
-    MachineConfig, MachineState, NetworkAttachment, NetworkDefinition, NetworkInstance,
-};
 use crate::{LibVmError, RuntimeConfig};
 
 #[derive(Debug, Clone)]
@@ -32,7 +28,7 @@ impl Store {
     pub(crate) async fn new(paths: &LocalPaths) -> Result<Self, LibVmError> {
         crate::store::config::validate_roots_absolute(paths.roots())?;
         std::fs::create_dir_all(paths.data_dir())?;
-        let pool = connect(paths.state_db_path()).await?;
+        let pool = Self::connect(paths.state_db_path()).await?;
         let roots = Self::setup_db(&pool, paths).await?;
         Ok(Self { pool, roots })
     }
@@ -46,179 +42,30 @@ impl Store {
         ));
         crate::store::config::validate_roots_absolute(bootstrap_paths.roots())?;
         std::fs::create_dir_all(bootstrap_paths.data_dir())?;
-        let pool = connect(bootstrap_paths.state_db_path()).await?;
+        let pool = Self::connect(bootstrap_paths.state_db_path()).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         let roots =
             crate::store::config::open(&pool, bootstrap_paths.state_db_path(), config).await?;
         Ok(Self { pool, roots })
     }
 
-    pub(crate) async fn add_machine(
-        &self,
-        config: &MachineConfig,
-        initial_state: &MachineState,
-    ) -> Result<(), LibVmError> {
-        crate::store::machine::add(self, config, initial_state).await
+    async fn connect(path: &Path) -> Result<SqlitePool, LibVmError> {
+        let options = Self::sqlite_options(path);
+        Ok(SqlitePoolOptions::new()
+            .acquire_timeout(Duration::from_secs(30))
+            .connect_with(options)
+            .await?)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn insert_machine_config(
-        &self,
-        config: &MachineConfig,
-    ) -> Result<(), LibVmError> {
-        crate::store::machine::insert_config(self, config).await
+    fn sqlite_options(path: &Path) -> SqliteConnectOptions {
+        SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5))
     }
-
-    pub(crate) async fn machine_state(
-        &self,
-        machine_id: MachineId,
-    ) -> Result<Option<MachineState>, LibVmError> {
-        crate::store::machine::get_state(self, machine_id).await
-    }
-
-    pub(crate) async fn save_machine_state(&self, state: &MachineState) -> Result<(), LibVmError> {
-        crate::store::machine::upsert_state(self, state).await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn remove_machine_state(
-        &self,
-        machine_id: MachineId,
-    ) -> Result<(), LibVmError> {
-        crate::store::machine::remove_state(self, machine_id).await
-    }
-
-    pub(crate) async fn save_machine_config(
-        &self,
-        config: &MachineConfig,
-    ) -> Result<(), LibVmError> {
-        crate::store::machine::update_config(self, config).await
-    }
-
-    pub(crate) async fn machine_config(
-        &self,
-        id: MachineId,
-    ) -> Result<Option<MachineConfig>, LibVmError> {
-        crate::store::machine::get_config_by_id(self, id).await
-    }
-
-    pub(crate) async fn machine_config_by_name(
-        &self,
-        name: &str,
-    ) -> Result<Option<MachineConfig>, LibVmError> {
-        crate::store::machine::get_config_by_name(self, name).await
-    }
-
-    pub(crate) async fn machine_configs_by_id_prefix(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<MachineConfig>, LibVmError> {
-        crate::store::machine::get_config_by_id_prefix(self, prefix).await
-    }
-
-    pub(crate) async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError> {
-        crate::store::machine::list_configs(self).await
-    }
-
-    pub(crate) async fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError> {
-        crate::store::machine::allocate_ephemeral_name(self, prefix).await
-    }
-
-    pub(crate) async fn remove_machine(&self, machine: &MachineConfig) -> Result<(), LibVmError> {
-        crate::store::machine::remove_machine(self, machine).await
-    }
-
-    pub(crate) async fn network_attachment(
-        &self,
-        machine_id: MachineId,
-    ) -> Result<Option<NetworkAttachment>, LibVmError> {
-        crate::store::network::get_attachment(self, machine_id).await
-    }
-
-    pub(crate) async fn network_instance(
-        &self,
-        network_id: &str,
-    ) -> Result<Option<NetworkInstance>, LibVmError> {
-        crate::store::network::get_instance(self, network_id).await
-    }
-
-    pub(crate) async fn save_network_instance(
-        &self,
-        instance: &NetworkInstance,
-    ) -> Result<(), LibVmError> {
-        crate::store::network::upsert_instance(self, instance).await
-    }
-
-    pub(crate) async fn attach_network(
-        &self,
-        attachment: &NetworkAttachment,
-    ) -> Result<(), LibVmError> {
-        crate::store::network::upsert_attachment(self, attachment).await
-    }
-
-    pub(crate) async fn detach_network(&self, machine_id: MachineId) -> Result<(), LibVmError> {
-        crate::store::network::remove_attachment(self, machine_id).await
-    }
-
-    pub(crate) async fn remove_network_instance(&self, network_id: &str) -> Result<(), LibVmError> {
-        crate::store::network::remove_instance(self, network_id).await
-    }
-
-    pub(crate) async fn network_instance_by_definition(
-        &self,
-        definition_name: &str,
-    ) -> Result<Option<NetworkInstance>, LibVmError> {
-        crate::store::network::get_instance_by_definition(self, definition_name).await
-    }
-
-    pub(crate) async fn network_attachment_count(
-        &self,
-        network_id: &str,
-    ) -> Result<u32, LibVmError> {
-        crate::store::network::count_attachments(self, network_id).await
-    }
-
-    pub(crate) async fn define_network(
-        &self,
-        definition: &NetworkDefinition,
-    ) -> Result<(), LibVmError> {
-        crate::store::network::upsert_definition(self, definition).await
-    }
-
-    pub(crate) async fn list_network_definitions(
-        &self,
-    ) -> Result<Vec<NetworkDefinition>, LibVmError> {
-        crate::store::network::list_definitions(self).await
-    }
-
-    pub(crate) async fn network_definition(
-        &self,
-        name: &str,
-    ) -> Result<Option<NetworkDefinition>, LibVmError> {
-        crate::store::network::get_definition(self, name).await
-    }
-
-    pub(crate) async fn remove_network_definition(&self, name: &str) -> Result<(), LibVmError> {
-        crate::store::network::remove_definition(self, name).await
-    }
-}
-
-async fn connect(path: &Path) -> Result<SqlitePool, LibVmError> {
-    let options = sqlite_options(path);
-    Ok(SqlitePoolOptions::new()
-        .acquire_timeout(Duration::from_secs(30))
-        .connect_with(options)
-        .await?)
-}
-
-fn sqlite_options(path: &Path) -> SqliteConnectOptions {
-    SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        .foreign_keys(true)
-        .busy_timeout(Duration::from_secs(5))
 }
 
 #[cfg(test)]
