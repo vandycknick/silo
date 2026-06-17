@@ -3,6 +3,7 @@ mod machine_store;
 pub(crate) mod models;
 mod network_store;
 mod row;
-mod store;
+#[path = "store.rs"]
+mod storage;
 
-pub(crate) use store::Store;
+pub(crate) use storage::Store;
