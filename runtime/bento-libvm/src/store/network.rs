@@ -1,9 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::store::db::Store;
 use crate::store::models::MachineId;
 use crate::store::models::{NetworkAttachment, NetworkDefinition, NetworkInstance};
-use crate::store::wrappers::{DbNetworkAttachment, DbNetworkDefinition, DbNetworkInstance};
+use crate::store::row::{DbNetworkAttachment, DbNetworkDefinition, DbNetworkInstance};
+use crate::store::Store;
 use crate::LibVmError;
 
 pub(super) async fn get_attachment(

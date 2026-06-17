@@ -1,12 +1,7 @@
-mod connection;
-mod db_config;
-mod json;
-mod machine;
-mod network;
-
+use std::path::Path;
 use std::time::Duration;
 
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
 
 use crate::paths::{LocalPaths, LocalRoots};
@@ -29,12 +24,12 @@ impl Store {
 
     async fn setup_db(pool: &SqlitePool, paths: &LocalPaths) -> Result<LocalRoots, LibVmError> {
         sqlx::migrate!("./migrations").run(pool).await?;
-        db_config::validate(pool, paths.roots()).await
+        crate::store::config::validate(pool, paths.roots()).await
     }
 
     pub(crate) async fn new(paths: &LocalPaths) -> Result<Self, LibVmError> {
         std::fs::create_dir_all(paths.data_dir())?;
-        let options = connection::options(paths.state_db_path());
+        let options = sqlite_options(paths.state_db_path());
         let pool = SqlitePoolOptions::new()
             .acquire_timeout(Duration::from_secs(30))
             .connect_with(options)
@@ -47,149 +42,159 @@ impl Store {
         &self,
         config: &MachineConfig,
     ) -> Result<(), LibVmError> {
-        machine::insert_config(self, config).await
+        crate::store::machine::insert_config(self, config).await
     }
 
     pub(crate) async fn get_machine_state(
         &self,
         machine_id: MachineId,
     ) -> Result<Option<MachineState>, LibVmError> {
-        machine::get_state(self, machine_id).await
+        crate::store::machine::get_state(self, machine_id).await
     }
 
     pub(crate) async fn upsert_machine_state(
         &self,
         state: &MachineState,
     ) -> Result<(), LibVmError> {
-        machine::upsert_state(self, state).await
+        crate::store::machine::upsert_state(self, state).await
     }
 
     pub(crate) async fn remove_machine_state(
         &self,
         machine_id: MachineId,
     ) -> Result<(), LibVmError> {
-        machine::remove_state(self, machine_id).await
+        crate::store::machine::remove_state(self, machine_id).await
     }
 
     pub(crate) async fn update_machine_config(
         &self,
         config: &MachineConfig,
     ) -> Result<(), LibVmError> {
-        machine::update_config(self, config).await
+        crate::store::machine::update_config(self, config).await
     }
 
     pub(crate) async fn get_machine_config_by_id(
         &self,
         id: MachineId,
     ) -> Result<Option<MachineConfig>, LibVmError> {
-        machine::get_config_by_id(self, id).await
+        crate::store::machine::get_config_by_id(self, id).await
     }
 
     pub(crate) async fn get_machine_config_by_name(
         &self,
         name: &str,
     ) -> Result<Option<MachineConfig>, LibVmError> {
-        machine::get_config_by_name(self, name).await
+        crate::store::machine::get_config_by_name(self, name).await
     }
 
     pub(crate) async fn get_machine_config_by_id_prefix(
         &self,
         prefix: &str,
     ) -> Result<Vec<MachineConfig>, LibVmError> {
-        machine::get_config_by_id_prefix(self, prefix).await
+        crate::store::machine::get_config_by_id_prefix(self, prefix).await
     }
 
     pub(crate) async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError> {
-        machine::list_configs(self).await
+        crate::store::machine::list_configs(self).await
     }
 
     pub(crate) async fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError> {
-        machine::allocate_ephemeral_name(self, prefix).await
+        crate::store::machine::allocate_ephemeral_name(self, prefix).await
     }
 
     pub(crate) async fn remove_machine_config(
         &self,
         machine: &MachineConfig,
     ) -> Result<(), LibVmError> {
-        machine::remove_config(self, machine).await
+        crate::store::machine::remove_config(self, machine).await
     }
 
     pub(crate) async fn get_network_attachment(
         &self,
         machine_id: MachineId,
     ) -> Result<Option<NetworkAttachment>, LibVmError> {
-        network::get_attachment(self, machine_id).await
+        crate::store::network::get_attachment(self, machine_id).await
     }
 
     pub(crate) async fn get_network_instance(
         &self,
         network_id: &str,
     ) -> Result<Option<NetworkInstance>, LibVmError> {
-        network::get_instance(self, network_id).await
+        crate::store::network::get_instance(self, network_id).await
     }
 
     pub(crate) async fn upsert_network_instance(
         &self,
         instance: &NetworkInstance,
     ) -> Result<(), LibVmError> {
-        network::upsert_instance(self, instance).await
+        crate::store::network::upsert_instance(self, instance).await
     }
 
     pub(crate) async fn upsert_network_attachment(
         &self,
         attachment: &NetworkAttachment,
     ) -> Result<(), LibVmError> {
-        network::upsert_attachment(self, attachment).await
+        crate::store::network::upsert_attachment(self, attachment).await
     }
 
     pub(crate) async fn remove_network_attachment(
         &self,
         machine_id: MachineId,
     ) -> Result<(), LibVmError> {
-        network::remove_attachment(self, machine_id).await
+        crate::store::network::remove_attachment(self, machine_id).await
     }
 
     pub(crate) async fn remove_network_instance(&self, network_id: &str) -> Result<(), LibVmError> {
-        network::remove_instance(self, network_id).await
+        crate::store::network::remove_instance(self, network_id).await
     }
 
     pub(crate) async fn get_network_instance_by_definition(
         &self,
         definition_name: &str,
     ) -> Result<Option<NetworkInstance>, LibVmError> {
-        network::get_instance_by_definition(self, definition_name).await
+        crate::store::network::get_instance_by_definition(self, definition_name).await
     }
 
     pub(crate) async fn count_network_attachments(
         &self,
         network_id: &str,
     ) -> Result<u32, LibVmError> {
-        network::count_attachments(self, network_id).await
+        crate::store::network::count_attachments(self, network_id).await
     }
 
     pub(crate) async fn upsert_network_definition(
         &self,
         definition: &NetworkDefinition,
     ) -> Result<(), LibVmError> {
-        network::upsert_definition(self, definition).await
+        crate::store::network::upsert_definition(self, definition).await
     }
 
     pub(crate) async fn list_network_definitions(
         &self,
     ) -> Result<Vec<NetworkDefinition>, LibVmError> {
-        network::list_definitions(self).await
+        crate::store::network::list_definitions(self).await
     }
 
     pub(crate) async fn get_network_definition(
         &self,
         name: &str,
     ) -> Result<Option<NetworkDefinition>, LibVmError> {
-        network::get_definition(self, name).await
+        crate::store::network::get_definition(self, name).await
     }
 
     pub(crate) async fn remove_network_definition(&self, name: &str) -> Result<(), LibVmError> {
-        network::remove_definition(self, name).await
+        crate::store::network::remove_definition(self, name).await
     }
+}
+
+fn sqlite_options(path: &Path) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5))
 }
 
 #[cfg(test)]

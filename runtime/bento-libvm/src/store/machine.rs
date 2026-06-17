@@ -1,8 +1,7 @@
-use crate::store::db::json;
-use crate::store::db::Store;
 use crate::store::models::MachineId;
 use crate::store::models::{MachineConfig, MachineState};
-use crate::store::wrappers::{DbMachineConfig, DbMachineState};
+use crate::store::row::{DbMachineConfig, DbMachineState};
+use crate::store::Store;
 use crate::LibVmError;
 
 const MACHINE_CONFIG_COLUMNS: &str = "id, name, json(config_json) AS config_json";
@@ -15,7 +14,7 @@ pub(super) async fn insert_config(db: &Store, config: &MachineConfig) -> Result<
     )
     .bind(config.id.to_string())
     .bind(&config.name)
-    .bind(json::serialize("machine_config.config_json", config)?)
+    .bind(serialize("machine_config.config_json", config)?)
     .execute(&db.pool)
     .await?;
     Ok(())
@@ -28,7 +27,7 @@ pub(super) async fn update_config(db: &Store, config: &MachineConfig) -> Result<
          WHERE id = ?3",
     )
     .bind(&config.name)
-    .bind(json::serialize("machine_config.config_json", config)?)
+    .bind(serialize("machine_config.config_json", config)?)
     .bind(config.id.to_string())
     .execute(&db.pool)
     .await?;
@@ -133,10 +132,20 @@ pub(super) async fn upsert_state(db: &Store, state: &MachineState) -> Result<(),
     )
     .bind(state.machine_id.to_string())
     .bind(state.status.as_str())
-    .bind(json::serialize("machine_state.state_json", state)?)
+    .bind(serialize("machine_state.state_json", state)?)
     .execute(&db.pool)
     .await?;
     Ok(())
+}
+
+fn serialize<T>(field: &'static str, value: &T) -> Result<String, LibVmError>
+where
+    T: serde::Serialize,
+{
+    serde_json::to_string(value).map_err(|err| LibVmError::InvalidCreateRequest {
+        name: field.to_string(),
+        reason: format!("serialize {field}: {err}"),
+    })
 }
 
 pub(super) async fn remove_state(db: &Store, machine_id: MachineId) -> Result<(), LibVmError> {
