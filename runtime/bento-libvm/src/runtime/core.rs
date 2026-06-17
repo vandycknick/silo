@@ -1294,13 +1294,14 @@ fn create_staging_dir(paths: &LocalPaths) -> Result<PathBuf, LibVmError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::lock_manager::LockId;
     use crate::paths::{root_disk_relative_path, LocalPaths};
     use crate::runtime::core::{
-        assign_mount_tags, read_monitor_pid, PendingMachine, PendingMachineRequest, Runtime,
-        ROOT_DISK_KERNEL_ARG, STALE_STARTING_TIMEOUT,
+        assign_mount_tags, read_monitor_pid, write_machine_config, PendingMachine,
+        PendingMachineRequest, Runtime, ROOT_DISK_KERNEL_ARG, STALE_STARTING_TIMEOUT,
     };
     use crate::store::models::{
-        MachineId, MachineNetworkConfig, MachineRuntimeState, MachineState,
+        MachineConfig, MachineId, MachineNetworkConfig, MachineRuntimeState, MachineState,
     };
     use crate::store::MockDataStore;
     use crate::utils::now_unix;
@@ -1365,6 +1366,48 @@ mod tests {
 
     fn spec_userdata(spec: &VmSpec) -> Option<&str> {
         spec.boot.as_ref().and_then(|boot| boot.userdata.as_deref())
+    }
+
+    fn sample_machine_config(paths: &LocalPaths, id: MachineId, name: &str) -> MachineConfig {
+        MachineConfig {
+            id,
+            lock_id: LockId::from(0),
+            name: name.to_string(),
+            spec: sample_vm_spec(),
+            instance_dir: paths.machine(id).dir().to_path_buf(),
+            created_at: 1,
+            modified_at: 1,
+            image_ref: "test-image:latest".to_string(),
+            root_disk_size: None,
+            labels: std::collections::BTreeMap::new(),
+            metadata: std::collections::BTreeMap::new(),
+            network: MachineNetworkConfig::default(),
+        }
+    }
+
+    fn stopped_state(machine_id: MachineId) -> MachineState {
+        MachineState {
+            machine_id,
+            status: MachineRuntimeState::Stopped,
+            vmmon_pid: None,
+            started_at: None,
+            run_id: None,
+            last_error: None,
+            updated_at: 1,
+        }
+    }
+
+    fn expect_empty_refresh(store: &mut MockDataStore) {
+        store
+            .expect_list_machine_configs()
+            .once()
+            .returning(|| Ok(Vec::new()));
+    }
+
+    async fn runtime_with_mock_store(paths: LocalPaths, store: MockDataStore) -> Runtime {
+        Runtime::from_store(paths, Arc::new(store), RuntimeNetworkingConfig::default())
+            .await
+            .expect("create runtime with mock store")
     }
 
     async fn create_pending_sample(
@@ -1515,19 +1558,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp dir");
         let paths = LocalPaths::new(temp.path().join("bento"));
         let mut store = MockDataStore::new();
-        store
-            .expect_list_machine_configs()
-            .once()
-            .returning(|| Ok(Vec::new()));
+        expect_empty_refresh(&mut store);
         store
             .expect_network_definition()
             .withf(|name| name == "devnet")
             .once()
             .returning(|_| Ok(None));
-        let runtime =
-            Runtime::from_store(paths, Arc::new(store), RuntimeNetworkingConfig::default())
-                .await
-                .expect("create runtime with mock store");
+        let runtime = runtime_with_mock_store(paths, store).await;
 
         let err = runtime
             .validate_machine_network_config(&MachineNetworkConfig::Named {
@@ -1541,6 +1578,171 @@ mod tests {
             LibVmError::NetworkRuntime { ref reference, ref message }
                 if reference == "devnet" && message.contains("not defined")
         ));
+    }
+
+    #[tokio::test]
+    async fn resolve_machine_config_reports_missing_name_from_store_boundary() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let paths = LocalPaths::new(temp.path().join("bento"));
+        let mut store = MockDataStore::new();
+        expect_empty_refresh(&mut store);
+        store
+            .expect_machine_config_by_name()
+            .withf(|name| name == "ghost")
+            .once()
+            .returning(|_| Ok(None));
+        let runtime = runtime_with_mock_store(paths, store).await;
+
+        let err = runtime
+            .resolve_machine_config(&MachineRef::parse("ghost").expect("valid machine ref"))
+            .await
+            .expect_err("missing name should fail");
+
+        assert!(matches!(
+            err,
+            LibVmError::MachineNotFound { ref reference } if reference == "ghost"
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_machine_config_handles_id_prefix_store_results() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let paths = LocalPaths::new(temp.path().join("bento"));
+        let id = MachineId::new();
+        let config = sample_machine_config(&paths, id, "devbox");
+        let prefix = id.to_string()[..8].to_string();
+        let mut store = MockDataStore::new();
+        expect_empty_refresh(&mut store);
+        let expected_prefix = prefix.clone();
+        store
+            .expect_machine_configs_by_id_prefix()
+            .withf(move |prefix| prefix == expected_prefix)
+            .once()
+            .return_once(move |_| Ok(vec![config.clone()]));
+        let runtime = runtime_with_mock_store(paths, store).await;
+
+        let found = runtime
+            .resolve_machine_config(&MachineRef::parse(prefix).expect("valid id prefix"))
+            .await
+            .expect("prefix should resolve");
+
+        assert_eq!(found.id, id);
+    }
+
+    #[tokio::test]
+    async fn resolve_machine_config_rejects_ambiguous_id_prefix_from_store_boundary() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let paths = LocalPaths::new(temp.path().join("bento"));
+        let first_id = MachineId::new();
+        let second_id = MachineId::new();
+        let first = sample_machine_config(&paths, first_id, "first");
+        let second = sample_machine_config(&paths, second_id, "second");
+        let mut store = MockDataStore::new();
+        expect_empty_refresh(&mut store);
+        store
+            .expect_machine_configs_by_id_prefix()
+            .withf(|prefix| prefix == "deadbeef")
+            .once()
+            .return_once(move |_| Ok(vec![first, second]));
+        let runtime = runtime_with_mock_store(paths, store).await;
+
+        let err = runtime
+            .resolve_machine_config(&MachineRef::parse("deadbeef").expect("valid id prefix"))
+            .await
+            .expect_err("ambiguous prefix should fail");
+
+        assert!(matches!(
+            err,
+            LibVmError::AmbiguousIdPrefix { ref prefix, count: 2 } if prefix == "deadbeef"
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_commit_cleans_files_and_lock_when_store_add_fails() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let paths = LocalPaths::new(temp.path().join("bento"));
+        let mut store = MockDataStore::new();
+        expect_empty_refresh(&mut store);
+        store
+            .expect_machine_config_by_name()
+            .withf(|name| name == "devbox")
+            .once()
+            .returning(|_| Ok(None));
+        store.expect_add_machine().once().returning(|_, _| {
+            Err(LibVmError::InvalidCreateRequest {
+                name: "store".to_string(),
+                reason: "forced add failure".to_string(),
+            })
+        });
+        let runtime = runtime_with_mock_store(paths, store).await;
+        let pending = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine");
+        let final_dir = pending.final_dir.clone();
+
+        let result = pending.commit(&runtime).await;
+
+        assert!(matches!(
+            result,
+            Err(LibVmError::InvalidCreateRequest { ref reason, .. })
+                if reason == "forced add failure"
+        ));
+        assert!(!final_dir.exists(), "failed commit should remove final dir");
+        let lock = runtime
+            .lock_manager
+            .allocate()
+            .expect("failed commit should free allocated lock");
+        assert_eq!(lock.id(), LockId::from(0));
+    }
+
+    #[tokio::test]
+    async fn replace_config_rolls_back_vm_spec_when_store_save_fails() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let paths = LocalPaths::new(temp.path().join("bento"));
+        let id = MachineId::new();
+        let config = sample_machine_config(&paths, id, "devbox");
+        std::fs::create_dir_all(&config.instance_dir).expect("create instance dir");
+        write_machine_config(&config.instance_dir, &config.name, &config.spec)
+            .expect("write original spec");
+        let state = stopped_state(id);
+        let mut store = MockDataStore::new();
+        expect_empty_refresh(&mut store);
+        let config_for_lookup = config.clone();
+        store
+            .expect_machine_config()
+            .withf(move |machine_id| *machine_id == id)
+            .times(2)
+            .returning(move |_| Ok(Some(config_for_lookup.clone())));
+        store
+            .expect_machine_state()
+            .withf(move |machine_id| *machine_id == id)
+            .once()
+            .return_once(move |_| Ok(Some(state)));
+        store.expect_save_machine_config().once().returning(|_| {
+            Err(LibVmError::InvalidMachineUpdate {
+                reference: "devbox".to_string(),
+                reason: "forced save failure".to_string(),
+            })
+        });
+        let runtime = runtime_with_mock_store(paths, store).await;
+        let mut replacement = sample_vm_spec();
+        spec_hardware_mut(&mut replacement).cpus = Some(8);
+
+        let err = machine_handle(&runtime, id)
+            .replace_config(replacement)
+            .await
+            .expect_err("store failure should fail replace_config");
+
+        assert!(matches!(
+            err,
+            LibVmError::InvalidMachineUpdate { ref reason, .. }
+                if reason == "forced save failure"
+        ));
+        let restored: VmSpec = serde_json::from_slice(
+            &std::fs::read(config.instance_dir.join("config.json")).expect("read rolled back spec"),
+        )
+        .expect("parse rolled back spec");
+        assert_eq!(spec_hardware(&restored).cpus, Some(4));
     }
 
     #[tokio::test]
