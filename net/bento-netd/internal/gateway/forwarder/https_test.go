@@ -120,6 +120,85 @@ rule "local-reads" {
 	}
 }
 
+func TestCertificateForReusesFreshCachedCertificate(t *testing.T) {
+	dir := t.TempDir()
+	caCert, caKey, _ := writeTestCA(t, dir)
+	ca, err := loadCertificateAuthority(caCert, caKey)
+	if err != nil {
+		t.Fatalf("loadCertificateAuthority returned error: %v", err)
+	}
+	cached, err := ca.mint("localhost", time.Now())
+	if err != nil {
+		t.Fatalf("mint returned error: %v", err)
+	}
+	cached.Leaf = nil
+	ca.cache["localhost"] = cached
+
+	returned, err := ca.CertificateFor("localhost")
+	if err != nil {
+		t.Fatalf("CertificateFor returned error: %v", err)
+	}
+	if returned != cached {
+		t.Fatal("expected fresh cached certificate to be reused")
+	}
+	if returned.Leaf == nil {
+		t.Fatal("expected cached certificate leaf to be populated")
+	}
+}
+
+func TestCertificateForRefreshesNearExpiryCachedCertificate(t *testing.T) {
+	dir := t.TempDir()
+	caCert, caKey, _ := writeTestCA(t, dir)
+	ca, err := loadCertificateAuthority(caCert, caKey)
+	if err != nil {
+		t.Fatalf("loadCertificateAuthority returned error: %v", err)
+	}
+	nearExpiry, err := ca.mint("localhost", time.Now().Add(-23*time.Hour-30*time.Minute))
+	if err != nil {
+		t.Fatalf("mint near-expiry certificate: %v", err)
+	}
+	ca.cache["localhost"] = nearExpiry
+
+	refreshed, err := ca.CertificateFor("localhost")
+	if err != nil {
+		t.Fatalf("CertificateFor returned error: %v", err)
+	}
+	if refreshed == nearExpiry {
+		t.Fatal("expected near-expiry certificate to be refreshed")
+	}
+	if ca.cache["localhost"] != refreshed {
+		t.Fatal("expected refreshed certificate to replace cache entry")
+	}
+	if !refreshed.Leaf.NotAfter.After(nearExpiry.Leaf.NotAfter) {
+		t.Fatalf("expected refreshed certificate to expire later than cached certificate, old=%s new=%s", nearExpiry.Leaf.NotAfter, refreshed.Leaf.NotAfter)
+	}
+}
+
+func TestCertificateForReusesCALimitedCachedCertificate(t *testing.T) {
+	dir := t.TempDir()
+	caCert, caKey, _ := writeTestCAExpiringAt(t, dir, time.Now().Add(30*time.Minute))
+	ca, err := loadCertificateAuthority(caCert, caKey)
+	if err != nil {
+		t.Fatalf("loadCertificateAuthority returned error: %v", err)
+	}
+	cached, err := ca.mint("localhost", time.Now())
+	if err != nil {
+		t.Fatalf("mint returned error: %v", err)
+	}
+	if !cached.Leaf.NotAfter.Equal(ca.cert.NotAfter) {
+		t.Fatalf("expected cached certificate expiry to be limited by CA, leaf=%s ca=%s", cached.Leaf.NotAfter, ca.cert.NotAfter)
+	}
+	ca.cache["localhost"] = cached
+
+	returned, err := ca.CertificateFor("localhost")
+	if err != nil {
+		t.Fatalf("CertificateFor returned error: %v", err)
+	}
+	if returned != cached {
+		t.Fatal("expected CA-limited cached certificate to be reused")
+	}
+}
+
 func writeHTTPSSecretStore(t *testing.T, dir string, name string, value string) *secrets.FileStore {
 	t.Helper()
 	path := filepath.Join(dir, "secrets.json")
@@ -172,6 +251,11 @@ func startTLSUpstream(t *testing.T, caCertPath string, caKeyPath string, authori
 
 func writeTestCA(t *testing.T, dir string) (string, string, *x509.CertPool) {
 	t.Helper()
+	return writeTestCAExpiringAt(t, dir, time.Now().Add(24*time.Hour))
+}
+
+func writeTestCAExpiringAt(t *testing.T, dir string, notAfter time.Time) (string, string, *x509.CertPool) {
+	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -187,7 +271,7 @@ func writeTestCA(t *testing.T, dir string) (string, string, *x509.CertPool) {
 			CommonName: "BentoBox Test CA",
 		},
 		NotBefore:             now.Add(-1 * time.Hour),
-		NotAfter:              now.Add(24 * time.Hour),
+		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 		IsCA:                  true,

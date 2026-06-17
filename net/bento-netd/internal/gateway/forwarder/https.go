@@ -27,7 +27,10 @@ import (
 	"github.com/nickvan/bentobox/net/bento-netd/internal/secrets"
 )
 
-const httpsPort uint16 = 443
+const (
+	httpsPort                      uint16 = 443
+	certificateRefreshBeforeExpiry        = time.Hour
+)
 
 type HTTPSProxy struct {
 	route             *router.Router
@@ -331,12 +334,13 @@ func (ca *certificateAuthority) CertificateFor(host string) (*tls.Certificate, e
 	if host == "" {
 		host = "bento-intercept.invalid"
 	}
+	now := time.Now()
 	ca.mu.Lock()
 	defer ca.mu.Unlock()
-	if cert := ca.cache[host]; cert != nil {
+	if cert := ca.cache[host]; ca.cachedCertificateUsable(cert, now) {
 		return cert, nil
 	}
-	cert, err := ca.mint(host)
+	cert, err := ca.mint(host, now)
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +348,32 @@ func (ca *certificateAuthority) CertificateFor(host string) (*tls.Certificate, e
 	return cert, nil
 }
 
-func (ca *certificateAuthority) mint(host string) (*tls.Certificate, error) {
+func (ca *certificateAuthority) cachedCertificateUsable(cert *tls.Certificate, now time.Time) bool {
+	if cert == nil {
+		return false
+	}
+	leaf := cert.Leaf
+	if leaf == nil {
+		if len(cert.Certificate) == 0 {
+			return false
+		}
+		parsed, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return false
+		}
+		cert.Leaf = parsed
+		leaf = parsed
+	}
+	if now.Before(leaf.NotBefore) || !now.Before(leaf.NotAfter) {
+		return false
+	}
+	if now.Add(certificateRefreshBeforeExpiry).Before(leaf.NotAfter) {
+		return true
+	}
+	return leaf.NotAfter.Equal(ca.cert.NotAfter)
+}
+
+func (ca *certificateAuthority) mint(host string, now time.Time) (*tls.Certificate, error) {
 	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serial, err := rand.Int(rand.Reader, serialLimit)
 	if err != nil {
@@ -354,7 +383,6 @@ func (ca *certificateAuthority) mint(host string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now()
 	template := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
@@ -375,7 +403,11 @@ func (ca *certificateAuthority) mint(host string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &tls.Certificate{Certificate: [][]byte{der, ca.cert.Raw}, PrivateKey: leafKey}, nil
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, fmt.Errorf("parse minted tls certificate: %w", err)
+	}
+	return &tls.Certificate{Certificate: [][]byte{der, ca.cert.Raw}, PrivateKey: leafKey, Leaf: leaf}, nil
 }
 
 func (ca *certificateAuthority) leafNotAfter(now time.Time) time.Time {
