@@ -121,7 +121,7 @@ impl Cmd {
         let request = MachineCreate {
             image_ref: resolved.image_ref.clone(),
             base_rootfs_path: base_rootfs.path,
-            name: self.name.clone(),
+            name: Some(self.name.clone()),
             labels: resolved.labels,
             metadata: resolved.metadata,
             cpus: resolved.cpus,

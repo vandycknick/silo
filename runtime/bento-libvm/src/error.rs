@@ -22,6 +22,9 @@ pub enum LibVmError {
     #[error("machine {name:?} already exists")]
     MachineAlreadyExists { name: String },
 
+    #[error("failed to generate a unique machine name after {attempts} attempts")]
+    MachineNameGenerationFailed { attempts: u32 },
+
     #[error("machine {reference} not found")]
     MachineNotFound { reference: String },
 

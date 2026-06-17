@@ -75,8 +75,6 @@ pub(crate) trait MachineStore: std::fmt::Debug + Send + Sync {
     /// Lists all machine configs sorted by machine name.
     async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError>;
 
-    async fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError>;
-
     /// Removes a machine config and runtime state.
     ///
     /// Network attachments are removed by the database foreign-key cascade.

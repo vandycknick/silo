@@ -19,8 +19,8 @@ use nix::{
 };
 
 use crate::machine::{
-    validate_machine_name, Machine, MachineCreate, MachineData, MachineRef, MachineRefKind,
-    MachineStatus,
+    generate_machine_name, validate_machine_name, Machine, MachineCreate, MachineData, MachineRef,
+    MachineRefKind, MachineStatus,
 };
 use crate::network::{
     prepare_network_runtime, reconcile_network_runtime, NetworkDefinition, VmmonNetworkAttachment,
@@ -42,6 +42,7 @@ const DEFAULT_IMAGE_CPUS: u8 = 1;
 const DEFAULT_IMAGE_MEMORY_MIB: u32 = 512;
 const ROOT_DISK_KERNEL_ARG: &str = "root=/dev/vda";
 const STALE_STARTING_TIMEOUT: Duration = Duration::from_secs(60);
+const GENERATED_NAME_ATTEMPTS: u32 = 3;
 
 /// Live runtime observation for a machine: its reconciled state plus the
 /// start timestamp when running.
@@ -192,6 +193,10 @@ impl Runtime {
     }
 
     /// Creates a machine and returns an operable handle for it.
+    ///
+    /// When `request.name` is `None`, the runtime generates a valid random name
+    /// and retries name-reservation conflicts up to three times. Explicit names
+    /// are attempted once and preserve normal duplicate-name errors.
     pub async fn create_machine(&self, request: MachineCreate) -> Result<Machine, LibVmError> {
         let config = self.create_machine_config(request).await?;
         Ok(Machine::new(self.clone(), config.id))
@@ -201,9 +206,43 @@ impl Runtime {
         &self,
         request: MachineCreate,
     ) -> Result<MachineConfig, LibVmError> {
+        let Some(name) = request.name.clone() else {
+            return self
+                .create_machine_config_with_generated_name(request)
+                .await;
+        };
+
+        self.create_machine_config_with_name(request, name).await
+    }
+
+    async fn create_machine_config_with_generated_name(
+        &self,
+        request: MachineCreate,
+    ) -> Result<MachineConfig, LibVmError> {
+        for _ in 0..GENERATED_NAME_ATTEMPTS {
+            let name = generate_machine_name()?;
+            match self
+                .create_machine_config_with_name(request.clone(), name)
+                .await
+            {
+                Err(LibVmError::MachineAlreadyExists { .. }) => {}
+                result => return result,
+            }
+        }
+
+        Err(LibVmError::MachineNameGenerationFailed {
+            attempts: GENERATED_NAME_ATTEMPTS,
+        })
+    }
+
+    async fn create_machine_config_with_name(
+        &self,
+        request: MachineCreate,
+        name: String,
+    ) -> Result<MachineConfig, LibVmError> {
         if matches!(request.disk_size_bytes, Some(0)) {
             return Err(LibVmError::InvalidCreateRequest {
-                name: request.name,
+                name,
                 reason: "root disk size must be greater than 0".to_string(),
             });
         }
@@ -217,7 +256,7 @@ impl Runtime {
         });
         if matches!(root_disk_size, Some(0)) {
             return Err(LibVmError::InvalidCreateRequest {
-                name: request.name,
+                name,
                 reason: "root disk size must be greater than 0".to_string(),
             });
         }
@@ -227,7 +266,7 @@ impl Runtime {
         if let Some(userdata) = request.userdata.as_deref() {
             if userdata.trim().is_empty() {
                 return Err(LibVmError::InvalidCreateRequest {
-                    name: request.name.clone(),
+                    name,
                     reason: "userdata cannot be empty".to_string(),
                 });
             }
@@ -276,7 +315,7 @@ impl Runtime {
         self.validate_machine_network_config(&network).await?;
         let pending = self
             .create_pending(PendingMachineRequest {
-                name: request.name.clone(),
+                name,
                 spec,
                 image_ref: request.image_ref.clone(),
                 root_disk_size,
@@ -364,11 +403,6 @@ impl Runtime {
             self.reconcile_machine_runtime_best_effort(config).await?;
         }
         Ok(machines)
-    }
-
-    /// Allocates an unused generated machine name using the provided prefix.
-    pub async fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError> {
-        self.store.allocate_ephemeral_name(prefix).await
     }
 
     /// Creates a named network definition.
@@ -1295,6 +1329,7 @@ fn create_staging_dir(paths: &LocalPaths) -> Result<PathBuf, LibVmError> {
 #[cfg(test)]
 mod tests {
     use crate::lock_manager::LockId;
+    use crate::machine::{validate_machine_name, MachineRefKind};
     use crate::paths::{root_disk_relative_path, LocalPaths};
     use crate::runtime::core::{
         assign_mount_tags, read_monitor_pid, write_machine_config, PendingMachine,
@@ -1313,6 +1348,7 @@ mod tests {
     use bento_vm_spec::{Boot, Guest, GuestOs, Hardware, Kernel, Mount, Storage, VmSpec};
     use std::io::Read;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1431,7 +1467,7 @@ mod tests {
         MachineCreate {
             image_ref: "ghcr.io/vandycknick/archlinuxarm:latest".to_string(),
             base_rootfs_path,
-            name: name.to_string(),
+            name: Some(name.to_string()),
             labels: std::collections::BTreeMap::new(),
             metadata: std::collections::BTreeMap::new(),
             cpus: None,
@@ -1786,6 +1822,143 @@ mod tests {
             Some("#!/bin/sh\necho profile\n")
         );
         assert_eq!(machine.root_disk_size, Some(4));
+    }
+
+    #[tokio::test]
+    async fn create_machine_generates_valid_name_when_missing() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_dir = temp.path().join("bento");
+        let base_rootfs_path = write_base_rootfs(&data_dir);
+
+        let runtime = Runtime::open(
+            LocalPaths::new(data_dir),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .expect("create runtime");
+        let mut request = create_request(base_rootfs_path, "ignored");
+        request.name = None;
+
+        let machine = runtime
+            .create_machine_config(request)
+            .await
+            .expect("create with generated name");
+
+        validate_machine_name(&machine.name).expect("generated name is valid");
+        assert_eq!(machine.name, machine.name.to_ascii_lowercase());
+        assert_eq!(machine.name.split('-').count(), 3);
+        let machine_ref = MachineRef::parse(machine.name.clone()).expect("parse generated name");
+        assert_eq!(machine_ref.kind(), &MachineRefKind::Name(machine.name));
+    }
+
+    #[tokio::test]
+    async fn create_machine_retries_generated_name_conflicts() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_dir = temp.path().join("bento");
+        let base_rootfs_path = write_base_rootfs(&data_dir);
+        let paths = LocalPaths::new(data_dir);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = attempts.clone();
+        let mut store = MockDataStore::new();
+        expect_empty_refresh(&mut store);
+        store
+            .expect_machine_config_by_name()
+            .times(2)
+            .returning(|_| Ok(None));
+        store
+            .expect_add_machine()
+            .times(2)
+            .returning(move |config, state| {
+                assert_eq!(state.machine_id, config.id);
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(LibVmError::MachineAlreadyExists {
+                        name: config.name.clone(),
+                    })
+                } else {
+                    Ok(())
+                }
+            });
+        let runtime = runtime_with_mock_store(paths, store).await;
+        let mut request = create_request(base_rootfs_path, "ignored");
+        request.name = None;
+
+        let config = runtime
+            .create_machine_config(request)
+            .await
+            .expect("generated-name conflict should retry");
+
+        assert_eq!(observed_attempts.load(Ordering::SeqCst), 2);
+        validate_machine_name(&config.name).expect("generated name is valid");
+    }
+
+    #[tokio::test]
+    async fn create_machine_generated_name_conflicts_stop_after_three_attempts() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_dir = temp.path().join("bento");
+        let base_rootfs_path = write_base_rootfs(&data_dir);
+        let paths = LocalPaths::new(data_dir);
+        let mut store = MockDataStore::new();
+        expect_empty_refresh(&mut store);
+        store
+            .expect_machine_config_by_name()
+            .times(3)
+            .returning(|_| Ok(None));
+        store.expect_add_machine().times(3).returning(|config, _| {
+            Err(LibVmError::MachineAlreadyExists {
+                name: config.name.clone(),
+            })
+        });
+        let runtime = runtime_with_mock_store(paths, store).await;
+        let mut request = create_request(base_rootfs_path, "ignored");
+        request.name = None;
+
+        let err = runtime
+            .create_machine_config(request)
+            .await
+            .expect_err("generated-name conflicts should eventually fail");
+
+        assert!(matches!(
+            err,
+            LibVmError::MachineNameGenerationFailed { attempts: 3 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_machine_generated_name_does_not_retry_other_errors() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_dir = temp.path().join("bento");
+        let base_rootfs_path = write_base_rootfs(&data_dir);
+        let paths = LocalPaths::new(data_dir);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = attempts.clone();
+        let mut store = MockDataStore::new();
+        expect_empty_refresh(&mut store);
+        store
+            .expect_machine_config_by_name()
+            .once()
+            .returning(|_| Ok(None));
+        store.expect_add_machine().once().returning(move |_, _| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(LibVmError::InvalidCreateRequest {
+                name: "store".to_string(),
+                reason: "forced add failure".to_string(),
+            })
+        });
+        let runtime = runtime_with_mock_store(paths, store).await;
+        let mut request = create_request(base_rootfs_path, "ignored");
+        request.name = None;
+
+        let err = runtime
+            .create_machine_config(request)
+            .await
+            .expect_err("non-conflict errors should not retry");
+
+        assert_eq!(observed_attempts.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            err,
+            LibVmError::InvalidCreateRequest { ref reason, .. } if reason == "forced add failure"
+        ));
     }
 
     #[tokio::test]

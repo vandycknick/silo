@@ -17,7 +17,11 @@ pub struct MachineCreate {
     /// Root filesystem image to clone into the machine root disk.
     pub base_rootfs_path: PathBuf,
     /// Requested machine name.
-    pub name: String,
+    ///
+    /// `Some(name)` creates the machine with that explicit name. `None` lets the
+    /// runtime generate and reserve a valid random name while creating the
+    /// machine.
+    pub name: Option<String>,
     /// User-defined labels to attach to the machine.
     pub labels: BTreeMap<String, String>,
     /// User-defined metadata to attach to the machine.

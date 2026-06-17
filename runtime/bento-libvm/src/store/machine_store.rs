@@ -146,20 +146,6 @@ impl MachineStore for Store {
             .collect())
     }
 
-    async fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError> {
-        for index in 1..10_000u32 {
-            let candidate = format!("{prefix}-{index}");
-            if self.machine_config_by_name(&candidate).await?.is_none() {
-                return Ok(candidate);
-            }
-        }
-
-        Err(LibVmError::InvalidMachineName {
-            name: prefix.to_string(),
-            reason: "failed to allocate ephemeral VM name".to_string(),
-        })
-    }
-
     async fn remove_machine(&self, machine: &MachineConfig) -> Result<(), LibVmError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM machine_state WHERE machine_id = ?1")

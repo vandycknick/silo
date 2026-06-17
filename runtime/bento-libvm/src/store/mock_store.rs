@@ -53,8 +53,6 @@ mock! {
 
         async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError>;
 
-        async fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError>;
-
         async fn remove_machine(&self, machine: &MachineConfig) -> Result<(), LibVmError>;
     }
 

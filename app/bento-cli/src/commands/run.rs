@@ -58,7 +58,7 @@ impl Cmd {
         }
 
         let progress = Progress::start("reading run recipe");
-        let mut resolved = self.resolve(libvm).await?;
+        let mut resolved = self.resolve()?;
         progress.step("finding boot assets");
         let data_dir = libvm.local_data_dir();
         let boot_assets =
@@ -71,7 +71,7 @@ impl Cmd {
         let request = MachineCreate {
             image_ref: resolved.image_ref.clone(),
             base_rootfs_path: base_rootfs.path,
-            name: resolved.name.clone(),
+            name: None,
             labels: resolved.labels,
             metadata: resolved.metadata,
             cpus: resolved.cpus,
@@ -87,13 +87,14 @@ impl Cmd {
             network: Some(resolved.network),
         };
 
-        progress.step(format!("creating ephemeral VM {}", resolved.name));
+        progress.step("creating ephemeral VM");
         let machine = libvm.create_machine(request).await?;
-        progress.step(format!("starting {}", resolved.name));
+        let machine_name = machine.inspect().await?.name;
+        progress.step(format!("starting {machine_name}"));
         machine
             .start_with(machine_start_options(libvm, &machine)?)
             .await?;
-        progress.step(format!("waiting for guest agent in {}", resolved.name));
+        progress.step(format!("waiting for guest agent in {machine_name}"));
         machine
             .wait_for_guest_running(DEFAULT_GUEST_READINESS_TIMEOUT)
             .await
@@ -106,21 +107,21 @@ impl Cmd {
         }
 
         let status = if self.command.is_empty() {
-            ssh::run_remote_shell_status(&resolved.name, None)?
+            ssh::run_remote_shell_status(&machine_name, None)?
         } else {
-            ssh::run_remote_command(&resolved.name, None, &self.command)?
+            ssh::run_remote_command(&machine_name, None, &self.command)?
         };
         let code = status.code().unwrap_or(1);
         let should_keep = self.keep || (self.keep_on_failure && code != 0);
 
         if !should_keep {
-            cleanup_ephemeral(libvm, &resolved.name).await?;
+            cleanup_ephemeral(libvm, &machine_name).await?;
         }
 
         std::process::exit(code);
     }
 
-    async fn resolve(&self, libvm: &Runtime) -> eyre::Result<ResolvedRun> {
+    fn resolve(&self) -> eyre::Result<ResolvedRun> {
         if self.profile.is_some() && self.profile_name.is_some() {
             eyre::bail!("profile specified twice; use either positional profile or --profile");
         }
@@ -134,7 +135,6 @@ impl Cmd {
         let mut memory_mib = None;
         let mut disk_size_bytes = None;
         let mut image_ref;
-        let prefix;
 
         let selected_profile = self.profile.clone().or_else(|| self.profile_name.clone());
         if selected_profile.is_some() || self.image.is_none() {
@@ -150,13 +150,11 @@ impl Cmd {
             labels = named.profile.labels.clone();
             metadata.insert(PROFILE_METADATA_KEY.to_string(), named.name.clone());
             mounts = named.profile.resolved_mounts()?;
-            prefix = named.name.clone();
         } else {
             let Some(image) = &self.image else {
                 eyre::bail!("either a profile or image is required");
             };
             image_ref = image.clone();
-            prefix = "run".to_string();
         }
 
         if let Some(image) = &self.image {
@@ -176,9 +174,7 @@ impl Cmd {
             userdata = Some(read_userdata_path(userdata_path)?);
         }
 
-        let name = libvm.allocate_ephemeral_name(&prefix).await?;
         Ok(ResolvedRun {
-            name,
             image_ref,
             labels,
             metadata,
@@ -198,7 +194,6 @@ impl Cmd {
 }
 
 struct ResolvedRun {
-    name: String,
     image_ref: String,
     labels: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
