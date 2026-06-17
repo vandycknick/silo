@@ -53,6 +53,15 @@ impl Store {
         Ok(Self { pool, roots })
     }
 
+    pub(crate) async fn add_machine(
+        &self,
+        config: &MachineConfig,
+        initial_state: &MachineState,
+    ) -> Result<(), LibVmError> {
+        crate::store::machine::add(self, config, initial_state).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn insert_machine_config(
         &self,
         config: &MachineConfig,
@@ -74,6 +83,7 @@ impl Store {
         crate::store::machine::upsert_state(self, state).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn remove_machine_state(
         &self,
         machine_id: MachineId,
@@ -117,11 +127,8 @@ impl Store {
         crate::store::machine::allocate_ephemeral_name(self, prefix).await
     }
 
-    pub(crate) async fn remove_machine_config(
-        &self,
-        machine: &MachineConfig,
-    ) -> Result<(), LibVmError> {
-        crate::store::machine::remove_config(self, machine).await
+    pub(crate) async fn remove_machine(&self, machine: &MachineConfig) -> Result<(), LibVmError> {
+        crate::store::machine::remove_machine(self, machine).await
     }
 
     pub(crate) async fn get_network_attachment(
@@ -272,6 +279,18 @@ mod tests {
         }
     }
 
+    fn machine_state(id: MachineId, status: MachineRuntimeState) -> MachineState {
+        MachineState {
+            machine_id: id,
+            status,
+            vmmon_pid: None,
+            started_at: None,
+            run_id: None,
+            last_error: None,
+            updated_at: 1,
+        }
+    }
+
     #[tokio::test]
     async fn db_config_allows_exactly_one_row() {
         let (_dir, paths) = temp_paths();
@@ -377,6 +396,59 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn add_machine_inserts_config_and_initial_state() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id = MachineId::new();
+        let metadata = machine_from_path(id, "created".to_string(), paths.machine(id).dir());
+        let state = machine_state(id, MachineRuntimeState::Stopped);
+
+        db.add_machine(&metadata, &state)
+            .await
+            .expect("add machine");
+
+        assert_eq!(
+            db.get_machine_config_by_id(id)
+                .await
+                .expect("lookup config"),
+            Some(metadata)
+        );
+        assert_eq!(
+            db.get_machine_state(id).await.expect("lookup state"),
+            Some(state)
+        );
+    }
+
+    #[tokio::test]
+    async fn add_machine_rolls_back_config_when_state_insert_fails() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        sqlx::query(
+            "CREATE TRIGGER fail_machine_state_insert
+             BEFORE INSERT ON machine_state
+             BEGIN
+                 SELECT RAISE(ABORT, 'machine_state insert failed');
+             END",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("create failing trigger");
+        let id = MachineId::new();
+        let metadata = machine_from_path(id, "rollback".to_string(), paths.machine(id).dir());
+        let state = machine_state(id, MachineRuntimeState::Stopped);
+
+        db.add_machine(&metadata, &state)
+            .await
+            .expect_err("state insert should fail");
+
+        assert!(db
+            .get_machine_config_by_id(id)
+            .await
+            .expect("lookup config")
+            .is_none());
     }
 
     #[tokio::test]
@@ -557,12 +629,14 @@ mod tests {
         let db = Store::new(&paths).await.expect("open db");
         let id = MachineId::new();
         let metadata = machine_from_path(id, "gonner".to_string(), paths.machine(id).dir());
+        let state = machine_state(id, MachineRuntimeState::Stopped);
 
-        db.insert_machine_config(&metadata).await.expect("insert");
-        db.remove_machine_config(&metadata).await.expect("remove");
+        db.add_machine(&metadata, &state).await.expect("insert");
+        db.remove_machine(&metadata).await.expect("remove");
 
         let found = db.get_machine_config_by_id(id).await.expect("lookup");
         assert!(found.is_none());
+        assert!(db.get_machine_state(id).await.expect("lookup").is_none());
     }
 
     #[tokio::test]
@@ -574,13 +648,11 @@ mod tests {
         db.insert_machine_config(&metadata).await.expect("insert");
 
         let state = MachineState {
-            machine_id: id,
-            status: MachineRuntimeState::Running,
             vmmon_pid: Some(1234),
             started_at: Some(42),
             run_id: Some("run-1".to_string()),
-            last_error: None,
             updated_at: 43,
+            ..machine_state(id, MachineRuntimeState::Running)
         };
         db.upsert_machine_state(&state).await.expect("upsert state");
 

@@ -7,6 +7,42 @@ use crate::LibVmError;
 const MACHINE_CONFIG_COLUMNS: &str = "id, name, json(config_json) AS config_json";
 const MACHINE_STATE_COLUMNS: &str = "machine_id, status, json(state_json) AS state_json";
 
+pub(super) async fn add(
+    db: &Store,
+    config: &MachineConfig,
+    initial_state: &MachineState,
+) -> Result<(), LibVmError> {
+    if initial_state.machine_id != config.id {
+        return Err(LibVmError::InvalidCreateRequest {
+            name: config.name.clone(),
+            reason: "initial machine state id does not match machine config id".to_string(),
+        });
+    }
+
+    let mut tx = db.pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO machine_config (id, name, config_json)
+         VALUES (?1, ?2, jsonb(?3))",
+    )
+    .bind(config.id.to_string())
+    .bind(&config.name)
+    .bind(serialize("machine_config.config_json", config)?)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO machine_state (machine_id, status, state_json)
+         VALUES (?1, ?2, jsonb(?3))",
+    )
+    .bind(initial_state.machine_id.to_string())
+    .bind(initial_state.status.as_str())
+    .bind(serialize("machine_state.state_json", initial_state)?)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) async fn insert_config(db: &Store, config: &MachineConfig) -> Result<(), LibVmError> {
     sqlx::query(
         "INSERT INTO machine_config (id, name, config_json)
@@ -17,6 +53,20 @@ pub(super) async fn insert_config(db: &Store, config: &MachineConfig) -> Result<
     .bind(serialize("machine_config.config_json", config)?)
     .execute(&db.pool)
     .await?;
+    Ok(())
+}
+
+pub(super) async fn remove_machine(db: &Store, machine: &MachineConfig) -> Result<(), LibVmError> {
+    let mut tx = db.pool.begin().await?;
+    sqlx::query("DELETE FROM machine_state WHERE machine_id = ?1")
+        .bind(machine.id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM machine_config WHERE id = ?1")
+        .bind(machine.id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -102,14 +152,6 @@ pub(super) async fn allocate_ephemeral_name(
     })
 }
 
-pub(super) async fn remove_config(db: &Store, machine: &MachineConfig) -> Result<(), LibVmError> {
-    sqlx::query("DELETE FROM machine_config WHERE id = ?1")
-        .bind(machine.id.to_string())
-        .execute(&db.pool)
-        .await?;
-    Ok(())
-}
-
 pub(super) async fn get_state(
     db: &Store,
     machine_id: MachineId,
@@ -148,6 +190,7 @@ where
     })
 }
 
+#[cfg(test)]
 pub(super) async fn remove_state(db: &Store, machine_id: MachineId) -> Result<(), LibVmError> {
     sqlx::query("DELETE FROM machine_state WHERE machine_id = ?1")
         .bind(machine_id.to_string())

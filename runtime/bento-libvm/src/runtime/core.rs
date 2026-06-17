@@ -867,8 +867,7 @@ impl Runtime {
         &self,
         config: &MachineConfig,
     ) -> Result<(), LibVmError> {
-        self.db.remove_machine_state(config.id).await?;
-        self.db.remove_machine_config(config).await?;
+        self.db.remove_machine(config).await?;
         self.lock_manager.free(config.lock_id)?;
         Ok(())
     }
@@ -1231,17 +1230,8 @@ impl PendingMachine {
             metadata: self.metadata.clone(),
             network: self.network.clone(),
         };
-        if let Err(err) = runtime.db.insert_machine_config(&config).await {
-            let _ = lock.free();
-            let _ = fs::remove_dir_all(&self.final_dir);
-            return Err(err);
-        }
-        if let Err(err) = runtime
-            .db
-            .upsert_machine_state(&stopped_machine_state(self.id, None))
-            .await
-        {
-            let _ = runtime.db.remove_machine_config(&config).await;
+        let initial_state = stopped_machine_state(self.id, None);
+        if let Err(err) = runtime.db.add_machine(&config, &initial_state).await {
             let _ = lock.free();
             let _ = fs::remove_dir_all(&self.final_dir);
             return Err(err);
