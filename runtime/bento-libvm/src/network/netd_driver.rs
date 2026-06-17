@@ -16,7 +16,7 @@ use crate::store::models::MachineId;
 use crate::store::models::{
     MachineConfig, NetworkAttachment, NetworkInstance, NetworkInstanceState,
 };
-use crate::store::{Database, Sqlite};
+use crate::store::Store;
 use crate::{LibVmError, NetdRuntimeConfig, NetworkPolicyRef};
 
 use super::core::{NetworkAttachmentRequest, NetworkDriver, NetworkDriverContext};
@@ -225,7 +225,7 @@ fn host_uses_user_network_runtime() -> bool {
 
 async fn attach_existing_runtime(
     paths: &LocalPaths,
-    db: &Sqlite,
+    db: &Store,
     metadata: &MachineConfig,
     instance: &NetworkInstance,
 ) -> Result<super::VmmonNetworkAttachment, LibVmError> {

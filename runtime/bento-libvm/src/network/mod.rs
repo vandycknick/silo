@@ -23,7 +23,7 @@ use crate::store::models::{
     NetworkDriverPreference as ModelNetworkDriverPreference, NetworkInstance,
     NetworkTopology as ModelNetworkTopology,
 };
-use crate::store::{Database, Sqlite};
+use crate::store::Store;
 use crate::{LibVmError, RuntimeNetworkingConfig};
 
 use self::core::{NetworkAttachmentRequest, NetworkDriver, NetworkDriverContext};
@@ -65,7 +65,7 @@ impl VmmonNetworkAttachment {
 
 pub(crate) async fn prepare_network_runtime(
     paths: &LocalPaths,
-    db: &Sqlite,
+    db: &Store,
     metadata: &MachineConfig,
     config: &RuntimeNetworkingConfig,
 ) -> Result<VmmonNetworkAttachment, LibVmError> {
@@ -104,7 +104,7 @@ pub(crate) async fn prepare_network_runtime(
 
 pub(crate) async fn reconcile_network_runtime(
     paths: &LocalPaths,
-    db: &Sqlite,
+    db: &Store,
     metadata: &MachineConfig,
     monitor_running: bool,
 ) -> Result<(), LibVmError> {
@@ -137,7 +137,7 @@ pub(crate) async fn reconcile_network_runtime(
 
 async fn resolve_named_network(
     paths: &LocalPaths,
-    db: &Sqlite,
+    db: &Store,
     metadata: &MachineConfig,
     definition: &ModelNetworkDefinition,
     config: &RuntimeNetworkingConfig,
@@ -234,7 +234,7 @@ async fn prepare_with_driver(
 
 pub(super) async fn remove_attached_network(
     paths: &LocalPaths,
-    db: &Sqlite,
+    db: &Store,
     machine_id: MachineId,
 ) -> Result<(), LibVmError> {
     let Some(attachment) = db.get_network_attachment(machine_id).await? else {

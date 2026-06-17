@@ -14,16 +14,15 @@ use crate::store::models::MachineId;
 use crate::store::models::{
     MachineConfig, MachineState, NetworkAttachment, NetworkDefinition, NetworkInstance,
 };
-use crate::store::Database;
 use crate::LibVmError;
 
 #[derive(Debug, Clone)]
-pub(crate) struct Sqlite {
+pub(crate) struct Store {
     pub(super) pool: SqlitePool,
     roots: LocalRoots,
 }
 
-impl Sqlite {
+impl Store {
     pub(crate) fn roots(&self) -> &LocalRoots {
         &self.roots
     }
@@ -32,12 +31,8 @@ impl Sqlite {
         sqlx::migrate!("./migrations").run(pool).await?;
         db_config::validate(pool, paths.roots()).await
     }
-}
 
-impl Database for Sqlite {
-    type Settings = LocalPaths;
-
-    async fn new(paths: &Self::Settings) -> Result<Self, LibVmError> {
+    pub(crate) async fn new(paths: &LocalPaths) -> Result<Self, LibVmError> {
         std::fs::create_dir_all(paths.data_dir())?;
         let options = connection::options(paths.state_db_path());
         let pool = SqlitePoolOptions::new()
@@ -48,125 +43,151 @@ impl Database for Sqlite {
         Ok(Self { pool, roots })
     }
 
-    async fn insert_machine_config(&self, config: &MachineConfig) -> Result<(), LibVmError> {
+    pub(crate) async fn insert_machine_config(
+        &self,
+        config: &MachineConfig,
+    ) -> Result<(), LibVmError> {
         machine::insert_config(self, config).await
     }
 
-    async fn get_machine_state(
+    pub(crate) async fn get_machine_state(
         &self,
         machine_id: MachineId,
     ) -> Result<Option<MachineState>, LibVmError> {
         machine::get_state(self, machine_id).await
     }
 
-    async fn upsert_machine_state(&self, state: &MachineState) -> Result<(), LibVmError> {
+    pub(crate) async fn upsert_machine_state(
+        &self,
+        state: &MachineState,
+    ) -> Result<(), LibVmError> {
         machine::upsert_state(self, state).await
     }
 
-    async fn remove_machine_state(&self, machine_id: MachineId) -> Result<(), LibVmError> {
+    pub(crate) async fn remove_machine_state(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<(), LibVmError> {
         machine::remove_state(self, machine_id).await
     }
 
-    async fn update_machine_config(&self, config: &MachineConfig) -> Result<(), LibVmError> {
+    pub(crate) async fn update_machine_config(
+        &self,
+        config: &MachineConfig,
+    ) -> Result<(), LibVmError> {
         machine::update_config(self, config).await
     }
 
-    async fn get_machine_config_by_id(
+    pub(crate) async fn get_machine_config_by_id(
         &self,
         id: MachineId,
     ) -> Result<Option<MachineConfig>, LibVmError> {
         machine::get_config_by_id(self, id).await
     }
 
-    async fn get_machine_config_by_name(
+    pub(crate) async fn get_machine_config_by_name(
         &self,
         name: &str,
     ) -> Result<Option<MachineConfig>, LibVmError> {
         machine::get_config_by_name(self, name).await
     }
 
-    async fn get_machine_config_by_id_prefix(
+    pub(crate) async fn get_machine_config_by_id_prefix(
         &self,
         prefix: &str,
     ) -> Result<Vec<MachineConfig>, LibVmError> {
         machine::get_config_by_id_prefix(self, prefix).await
     }
 
-    async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError> {
+    pub(crate) async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError> {
         machine::list_configs(self).await
     }
 
-    async fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError> {
+    pub(crate) async fn allocate_ephemeral_name(&self, prefix: &str) -> Result<String, LibVmError> {
         machine::allocate_ephemeral_name(self, prefix).await
     }
 
-    async fn remove_machine_config(&self, machine: &MachineConfig) -> Result<(), LibVmError> {
+    pub(crate) async fn remove_machine_config(
+        &self,
+        machine: &MachineConfig,
+    ) -> Result<(), LibVmError> {
         machine::remove_config(self, machine).await
     }
 
-    async fn get_network_attachment(
+    pub(crate) async fn get_network_attachment(
         &self,
         machine_id: MachineId,
     ) -> Result<Option<NetworkAttachment>, LibVmError> {
         network::get_attachment(self, machine_id).await
     }
 
-    async fn get_network_instance(
+    pub(crate) async fn get_network_instance(
         &self,
         network_id: &str,
     ) -> Result<Option<NetworkInstance>, LibVmError> {
         network::get_instance(self, network_id).await
     }
 
-    async fn upsert_network_instance(&self, instance: &NetworkInstance) -> Result<(), LibVmError> {
+    pub(crate) async fn upsert_network_instance(
+        &self,
+        instance: &NetworkInstance,
+    ) -> Result<(), LibVmError> {
         network::upsert_instance(self, instance).await
     }
 
-    async fn upsert_network_attachment(
+    pub(crate) async fn upsert_network_attachment(
         &self,
         attachment: &NetworkAttachment,
     ) -> Result<(), LibVmError> {
         network::upsert_attachment(self, attachment).await
     }
 
-    async fn remove_network_attachment(&self, machine_id: MachineId) -> Result<(), LibVmError> {
+    pub(crate) async fn remove_network_attachment(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<(), LibVmError> {
         network::remove_attachment(self, machine_id).await
     }
 
-    async fn remove_network_instance(&self, network_id: &str) -> Result<(), LibVmError> {
+    pub(crate) async fn remove_network_instance(&self, network_id: &str) -> Result<(), LibVmError> {
         network::remove_instance(self, network_id).await
     }
 
-    async fn get_network_instance_by_definition(
+    pub(crate) async fn get_network_instance_by_definition(
         &self,
         definition_name: &str,
     ) -> Result<Option<NetworkInstance>, LibVmError> {
         network::get_instance_by_definition(self, definition_name).await
     }
 
-    async fn count_network_attachments(&self, network_id: &str) -> Result<u32, LibVmError> {
+    pub(crate) async fn count_network_attachments(
+        &self,
+        network_id: &str,
+    ) -> Result<u32, LibVmError> {
         network::count_attachments(self, network_id).await
     }
 
-    async fn upsert_network_definition(
+    pub(crate) async fn upsert_network_definition(
         &self,
         definition: &NetworkDefinition,
     ) -> Result<(), LibVmError> {
         network::upsert_definition(self, definition).await
     }
 
-    async fn list_network_definitions(&self) -> Result<Vec<NetworkDefinition>, LibVmError> {
+    pub(crate) async fn list_network_definitions(
+        &self,
+    ) -> Result<Vec<NetworkDefinition>, LibVmError> {
         network::list_definitions(self).await
     }
 
-    async fn get_network_definition(
+    pub(crate) async fn get_network_definition(
         &self,
         name: &str,
     ) -> Result<Option<NetworkDefinition>, LibVmError> {
         network::get_definition(self, name).await
     }
 
-    async fn remove_network_definition(&self, name: &str) -> Result<(), LibVmError> {
+    pub(crate) async fn remove_network_definition(&self, name: &str) -> Result<(), LibVmError> {
         network::remove_definition(self, name).await
     }
 }
@@ -185,7 +206,7 @@ mod tests {
         MachineConfig, MachineNetworkConfig, MachineRuntimeState, MachineState, NetworkAttachment,
         NetworkInstance, NetworkInstanceState,
     };
-    use crate::store::{Database, Sqlite};
+    use crate::store::Store;
 
     fn temp_paths() -> (tempfile::TempDir, LocalPaths) {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -225,7 +246,7 @@ mod tests {
     #[tokio::test]
     async fn db_config_allows_exactly_one_row() {
         let (_dir, paths) = temp_paths();
-        let db = Sqlite::new(&paths).await.expect("open db");
+        let db = Store::new(&paths).await.expect("open db");
 
         assert_eq!(db.roots(), paths.roots());
 
@@ -248,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn insert_and_lookup_by_name() {
         let (_dir, paths) = temp_paths();
-        let db = Sqlite::new(&paths).await.expect("open db");
+        let db = Store::new(&paths).await.expect("open db");
         let id = MachineId::new();
         let metadata = machine_from_path(id, "devbox".to_string(), paths.machine(id).dir());
 
@@ -265,7 +286,7 @@ mod tests {
     #[tokio::test]
     async fn insert_and_lookup_by_id() {
         let (_dir, paths) = temp_paths();
-        let db = Sqlite::new(&paths).await.expect("open db");
+        let db = Store::new(&paths).await.expect("open db");
         let id = MachineId::new();
         let metadata = machine_from_path(id, "testvm".to_string(), paths.machine(id).dir());
 
@@ -282,7 +303,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_by_id_prefix() {
         let (_dir, paths) = temp_paths();
-        let db = Sqlite::new(&paths).await.expect("open db");
+        let db = Store::new(&paths).await.expect("open db");
         let id = MachineId::new();
         let metadata = machine_from_path(id, "prefix-test".to_string(), paths.machine(id).dir());
 
@@ -302,7 +323,7 @@ mod tests {
     #[tokio::test]
     async fn static_machine_config_round_trips_as_jsonb_blob() {
         let (_dir, paths) = temp_paths();
-        let db = Sqlite::new(&paths).await.expect("open db");
+        let db = Store::new(&paths).await.expect("open db");
         let id = MachineId::new();
         let mut labels = BTreeMap::new();
         labels.insert("owner".to_string(), "test".to_string());
@@ -392,7 +413,7 @@ mod tests {
     #[tokio::test]
     async fn list_machines_sorted_by_name() {
         let (_dir, paths) = temp_paths();
-        let db = Sqlite::new(&paths).await.expect("open db");
+        let db = Store::new(&paths).await.expect("open db");
 
         let id_b = MachineId::new();
         let id_a = MachineId::new();
@@ -420,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn remove_machine() {
         let (_dir, paths) = temp_paths();
-        let db = Sqlite::new(&paths).await.expect("open db");
+        let db = Store::new(&paths).await.expect("open db");
         let id = MachineId::new();
         let metadata = machine_from_path(id, "gonner".to_string(), paths.machine(id).dir());
 
@@ -434,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn machine_state_round_trips() {
         let (_dir, paths) = temp_paths();
-        let db = Sqlite::new(&paths).await.expect("open db");
+        let db = Store::new(&paths).await.expect("open db");
         let id = MachineId::new();
         let metadata = machine_from_path(id, "runtime".to_string(), paths.machine(id).dir());
         db.insert_machine_config(&metadata).await.expect("insert");
@@ -473,7 +494,7 @@ mod tests {
     #[tokio::test]
     async fn update_machine_config_persists_config_json() {
         let (_dir, paths) = temp_paths();
-        let db = Sqlite::new(&paths).await.expect("open db");
+        let db = Store::new(&paths).await.expect("open db");
         let id = MachineId::new();
         let mut metadata = machine_from_path(id, "config".to_string(), paths.machine(id).dir());
         db.insert_machine_config(&metadata).await.expect("insert");
@@ -509,7 +530,7 @@ mod tests {
     #[tokio::test]
     async fn network_instance_and_attachment_round_trip_and_remove() {
         let (_dir, paths) = temp_paths();
-        let db = Sqlite::new(&paths).await.expect("open db");
+        let db = Store::new(&paths).await.expect("open db");
         let id = MachineId::new();
         let metadata = machine_from_path(id, "netbox".to_string(), paths.machine(id).dir());
         db.insert_machine_config(&metadata)
@@ -578,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn machine_timestamps_live_in_json_not_columns() {
         let (_dir, paths) = temp_paths();
-        let db = Sqlite::new(&paths).await.expect("open db");
+        let db = Store::new(&paths).await.expect("open db");
 
         let machine_config_timestamp_columns: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('machine_config') WHERE name IN ('created_at', 'modified_at')",
@@ -600,7 +621,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_name_fails() {
         let (_dir, paths) = temp_paths();
-        let db = Sqlite::new(&paths).await.expect("open db");
+        let db = Store::new(&paths).await.expect("open db");
 
         let id1 = MachineId::new();
         let id2 = MachineId::new();
@@ -625,8 +646,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_connections_work() {
         let (_dir, paths) = temp_paths();
-        let db1 = Sqlite::new(&paths).await.expect("open db 1");
-        let db2 = Sqlite::new(&paths).await.expect("open db 2");
+        let db1 = Store::new(&paths).await.expect("open db 1");
+        let db2 = Store::new(&paths).await.expect("open db 2");
 
         let id = MachineId::new();
         db1.insert_machine_config(&machine_from_path(

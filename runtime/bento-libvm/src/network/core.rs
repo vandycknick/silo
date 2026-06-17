@@ -1,6 +1,6 @@
 use crate::paths::LocalPaths;
 use crate::store::models::MachineConfig;
-use crate::store::Sqlite;
+use crate::store::Store;
 use crate::{LibVmError, NetworkPolicyRef, RuntimeNetworkingConfig};
 
 use super::VmmonNetworkAttachment;
@@ -49,7 +49,7 @@ impl<'a> NetworkAttachmentRequest<'a> {
 
 pub(super) struct NetworkDriverContext<'a> {
     pub(super) paths: &'a LocalPaths,
-    pub(super) db: &'a Sqlite,
+    pub(super) db: &'a Store,
     pub(super) metadata: &'a MachineConfig,
     pub(super) config: &'a RuntimeNetworkingConfig,
 }

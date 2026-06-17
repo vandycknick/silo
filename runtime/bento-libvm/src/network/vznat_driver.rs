@@ -51,7 +51,7 @@ mod tests {
     use crate::paths::LocalPaths;
     use crate::store::models::MachineId;
     use crate::store::models::{MachineConfig, MachineNetworkConfig};
-    use crate::store::{Database, Sqlite};
+    use crate::store::Store;
     use crate::{NetdRuntimeConfig, RuntimeNetworkingConfig};
     use bento_vm_spec::VmSpec;
 
@@ -108,7 +108,7 @@ mod tests {
     async fn vznat_prepare_writes_instance_runtime_file() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let paths = LocalPaths::new(dir.path());
-        let db = Sqlite::new(&paths).await.expect("open db");
+        let db = Store::new(&paths).await.expect("open db");
         let machine_id = MachineId::new();
         let metadata = machine_from_path(
             machine_id,

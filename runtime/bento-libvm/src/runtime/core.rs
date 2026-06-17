@@ -30,7 +30,7 @@ use crate::store::models::{
     MachineConfig, MachineNetworkConfig as ModelMachineNetworkConfig, MachineRuntimeState,
     MachineState,
 };
-use crate::store::{Database, Sqlite};
+use crate::store::Store;
 use crate::vmmon::exit_status::{self, VmmonExitOutcome, VmmonExitStatus};
 use crate::vmmon::process::{self, ProcessIdentity};
 use crate::vmmon::Vmmon;
@@ -80,7 +80,7 @@ impl RuntimeStatus {
 #[derive(Debug, Clone)]
 pub struct Runtime {
     paths: LocalPaths,
-    db: Sqlite,
+    db: Store,
     lock_manager: LockManager,
     networking: RuntimeNetworkingConfig,
     vmmon: Vmmon,
@@ -138,7 +138,7 @@ impl Runtime {
         paths: LocalPaths,
         networking: RuntimeNetworkingConfig,
     ) -> Result<Self, LibVmError> {
-        let db = Sqlite::new(&paths).await?;
+        let db = Store::new(&paths).await?;
         let paths = LocalPaths::from_roots(db.roots().clone());
         let lock_manager = LockManager::open(paths.locks_dir().to_path_buf())?;
         let runtime = Self {
@@ -1291,7 +1291,6 @@ mod tests {
         Runtime, ROOT_DISK_KERNEL_ARG, STALE_STARTING_TIMEOUT,
     };
     use crate::store::models::{MachineId, MachineRuntimeState, MachineState};
-    use crate::store::Database;
     use crate::vmmon::process::ProcessIdentity;
     use crate::{
         LibVmError, MachineCreate, MachineRef, MachineStatus, MachineUpdate,

@@ -1,5 +1,5 @@
 use crate::store::db::json;
-use crate::store::db::Sqlite;
+use crate::store::db::Store;
 use crate::store::models::MachineId;
 use crate::store::models::{MachineConfig, MachineState};
 use crate::store::wrappers::{DbMachineConfig, DbMachineState};
@@ -8,7 +8,7 @@ use crate::LibVmError;
 const MACHINE_CONFIG_COLUMNS: &str = "id, name, json(config_json) AS config_json";
 const MACHINE_STATE_COLUMNS: &str = "machine_id, status, json(state_json) AS state_json";
 
-pub(super) async fn insert_config(db: &Sqlite, config: &MachineConfig) -> Result<(), LibVmError> {
+pub(super) async fn insert_config(db: &Store, config: &MachineConfig) -> Result<(), LibVmError> {
     sqlx::query(
         "INSERT INTO machine_config (id, name, config_json)
          VALUES (?1, ?2, jsonb(?3))",
@@ -21,7 +21,7 @@ pub(super) async fn insert_config(db: &Sqlite, config: &MachineConfig) -> Result
     Ok(())
 }
 
-pub(super) async fn update_config(db: &Sqlite, config: &MachineConfig) -> Result<(), LibVmError> {
+pub(super) async fn update_config(db: &Store, config: &MachineConfig) -> Result<(), LibVmError> {
     sqlx::query(
         "UPDATE machine_config
          SET name = ?1, config_json = jsonb(?2)
@@ -36,7 +36,7 @@ pub(super) async fn update_config(db: &Sqlite, config: &MachineConfig) -> Result
 }
 
 pub(super) async fn get_config_by_id(
-    db: &Sqlite,
+    db: &Store,
     id: MachineId,
 ) -> Result<Option<MachineConfig>, LibVmError> {
     let query = format!("SELECT {MACHINE_CONFIG_COLUMNS} FROM machine_config WHERE id = ?1");
@@ -48,7 +48,7 @@ pub(super) async fn get_config_by_id(
 }
 
 pub(super) async fn get_config_by_name(
-    db: &Sqlite,
+    db: &Store,
     name: &str,
 ) -> Result<Option<MachineConfig>, LibVmError> {
     let query = format!("SELECT {MACHINE_CONFIG_COLUMNS} FROM machine_config WHERE name = ?1");
@@ -60,7 +60,7 @@ pub(super) async fn get_config_by_name(
 }
 
 pub(super) async fn get_config_by_id_prefix(
-    db: &Sqlite,
+    db: &Store,
     prefix: &str,
 ) -> Result<Vec<MachineConfig>, LibVmError> {
     let pattern = format!("{prefix}%");
@@ -75,7 +75,7 @@ pub(super) async fn get_config_by_id_prefix(
         .collect())
 }
 
-pub(super) async fn list_configs(db: &Sqlite) -> Result<Vec<MachineConfig>, LibVmError> {
+pub(super) async fn list_configs(db: &Store) -> Result<Vec<MachineConfig>, LibVmError> {
     let query = format!("SELECT {MACHINE_CONFIG_COLUMNS} FROM machine_config ORDER BY name");
     let rows = sqlx::query_as::<_, DbMachineConfig>(&query)
         .fetch_all(&db.pool)
@@ -87,7 +87,7 @@ pub(super) async fn list_configs(db: &Sqlite) -> Result<Vec<MachineConfig>, LibV
 }
 
 pub(super) async fn allocate_ephemeral_name(
-    db: &Sqlite,
+    db: &Store,
     prefix: &str,
 ) -> Result<String, LibVmError> {
     for index in 1..10_000u32 {
@@ -103,7 +103,7 @@ pub(super) async fn allocate_ephemeral_name(
     })
 }
 
-pub(super) async fn remove_config(db: &Sqlite, machine: &MachineConfig) -> Result<(), LibVmError> {
+pub(super) async fn remove_config(db: &Store, machine: &MachineConfig) -> Result<(), LibVmError> {
     sqlx::query("DELETE FROM machine_config WHERE id = ?1")
         .bind(machine.id.to_string())
         .execute(&db.pool)
@@ -112,7 +112,7 @@ pub(super) async fn remove_config(db: &Sqlite, machine: &MachineConfig) -> Resul
 }
 
 pub(super) async fn get_state(
-    db: &Sqlite,
+    db: &Store,
     machine_id: MachineId,
 ) -> Result<Option<MachineState>, LibVmError> {
     let query = format!("SELECT {MACHINE_STATE_COLUMNS} FROM machine_state WHERE machine_id = ?1");
@@ -123,7 +123,7 @@ pub(super) async fn get_state(
     Ok(state.map(|DbMachineState(state)| state))
 }
 
-pub(super) async fn upsert_state(db: &Sqlite, state: &MachineState) -> Result<(), LibVmError> {
+pub(super) async fn upsert_state(db: &Store, state: &MachineState) -> Result<(), LibVmError> {
     sqlx::query(
         "INSERT INTO machine_state (machine_id, status, state_json)
          VALUES (?1, ?2, jsonb(?3))
@@ -139,7 +139,7 @@ pub(super) async fn upsert_state(db: &Sqlite, state: &MachineState) -> Result<()
     Ok(())
 }
 
-pub(super) async fn remove_state(db: &Sqlite, machine_id: MachineId) -> Result<(), LibVmError> {
+pub(super) async fn remove_state(db: &Store, machine_id: MachineId) -> Result<(), LibVmError> {
     sqlx::query("DELETE FROM machine_state WHERE machine_id = ?1")
         .bind(machine_id.to_string())
         .execute(&db.pool)

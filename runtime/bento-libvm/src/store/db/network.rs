@@ -1,13 +1,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::store::db::Sqlite;
+use crate::store::db::Store;
 use crate::store::models::MachineId;
 use crate::store::models::{NetworkAttachment, NetworkDefinition, NetworkInstance};
 use crate::store::wrappers::{DbNetworkAttachment, DbNetworkDefinition, DbNetworkInstance};
 use crate::LibVmError;
 
 pub(super) async fn get_attachment(
-    db: &Sqlite,
+    db: &Store,
     machine_id: MachineId,
 ) -> Result<Option<NetworkAttachment>, LibVmError> {
     let attachment = sqlx::query_as::<_, DbNetworkAttachment>(
@@ -21,7 +21,7 @@ pub(super) async fn get_attachment(
 }
 
 pub(super) async fn get_instance(
-    db: &Sqlite,
+    db: &Store,
     network_id: &str,
 ) -> Result<Option<NetworkInstance>, LibVmError> {
     let instance = sqlx::query_as::<_, DbNetworkInstance>(
@@ -36,7 +36,7 @@ pub(super) async fn get_instance(
 }
 
 pub(super) async fn upsert_instance(
-    db: &Sqlite,
+    db: &Store,
     instance: &NetworkInstance,
 ) -> Result<(), LibVmError> {
     sqlx::query(
@@ -68,7 +68,7 @@ pub(super) async fn upsert_instance(
 }
 
 pub(super) async fn upsert_attachment(
-    db: &Sqlite,
+    db: &Store,
     attachment: &NetworkAttachment,
 ) -> Result<(), LibVmError> {
     sqlx::query(
@@ -90,10 +90,7 @@ pub(super) async fn upsert_attachment(
     Ok(())
 }
 
-pub(super) async fn remove_attachment(
-    db: &Sqlite,
-    machine_id: MachineId,
-) -> Result<(), LibVmError> {
+pub(super) async fn remove_attachment(db: &Store, machine_id: MachineId) -> Result<(), LibVmError> {
     sqlx::query("DELETE FROM network_attachments WHERE machine_id = ?1")
         .bind(machine_id.to_string())
         .execute(&db.pool)
@@ -101,7 +98,7 @@ pub(super) async fn remove_attachment(
     Ok(())
 }
 
-pub(super) async fn remove_instance(db: &Sqlite, network_id: &str) -> Result<(), LibVmError> {
+pub(super) async fn remove_instance(db: &Store, network_id: &str) -> Result<(), LibVmError> {
     sqlx::query("DELETE FROM network_instances WHERE id = ?1")
         .bind(network_id)
         .execute(&db.pool)
@@ -110,7 +107,7 @@ pub(super) async fn remove_instance(db: &Sqlite, network_id: &str) -> Result<(),
 }
 
 pub(super) async fn get_instance_by_definition(
-    db: &Sqlite,
+    db: &Store,
     definition_name: &str,
 ) -> Result<Option<NetworkInstance>, LibVmError> {
     let instance = sqlx::query_as::<_, DbNetworkInstance>(
@@ -124,7 +121,7 @@ pub(super) async fn get_instance_by_definition(
     Ok(instance.map(|DbNetworkInstance(instance)| instance))
 }
 
-pub(super) async fn count_attachments(db: &Sqlite, network_id: &str) -> Result<u32, LibVmError> {
+pub(super) async fn count_attachments(db: &Store, network_id: &str) -> Result<u32, LibVmError> {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM network_attachments WHERE network_instance_id = ?1",
     )
@@ -138,7 +135,7 @@ pub(super) async fn count_attachments(db: &Sqlite, network_id: &str) -> Result<u
 }
 
 pub(super) async fn upsert_definition(
-    db: &Sqlite,
+    db: &Store,
     definition: &NetworkDefinition,
 ) -> Result<(), LibVmError> {
     let now = now_unix();
@@ -168,7 +165,7 @@ pub(super) async fn upsert_definition(
     Ok(())
 }
 
-pub(super) async fn list_definitions(db: &Sqlite) -> Result<Vec<NetworkDefinition>, LibVmError> {
+pub(super) async fn list_definitions(db: &Store) -> Result<Vec<NetworkDefinition>, LibVmError> {
     let rows = sqlx::query_as::<_, DbNetworkDefinition>(
         "SELECT name, mode, driver_preference, created_at, modified_at
          FROM network_definitions ORDER BY name",
@@ -182,7 +179,7 @@ pub(super) async fn list_definitions(db: &Sqlite) -> Result<Vec<NetworkDefinitio
 }
 
 pub(super) async fn get_definition(
-    db: &Sqlite,
+    db: &Store,
     name: &str,
 ) -> Result<Option<NetworkDefinition>, LibVmError> {
     let definition = sqlx::query_as::<_, DbNetworkDefinition>(
@@ -195,7 +192,7 @@ pub(super) async fn get_definition(
     Ok(definition.map(|DbNetworkDefinition(definition)| definition))
 }
 
-pub(super) async fn remove_definition(db: &Sqlite, name: &str) -> Result<(), LibVmError> {
+pub(super) async fn remove_definition(db: &Store, name: &str) -> Result<(), LibVmError> {
     sqlx::query("DELETE FROM network_definitions WHERE name = ?1")
         .bind(name)
         .execute(&db.pool)
