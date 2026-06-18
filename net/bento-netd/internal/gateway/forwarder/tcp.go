@@ -20,9 +20,8 @@ import (
 const linkLocalSubnet = "169.254.0.0/16"
 
 type TCPMetadata struct {
-	VMID        string
-	NetworkID   string
-	ProfileName string
+	VMID      string
+	NetworkID string
 }
 
 func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, route *router.Router, httpsProxy *HTTPSProxy, metadata TCPMetadata) *tcp.Forwarder {
@@ -42,14 +41,13 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 		natLock.Unlock()
 
 		flow := hooks.Flow{
-			Protocol:    "tcp",
-			SourceIP:    addressIP(id.RemoteAddress),
-			SourcePort:  id.RemotePort,
-			DestIP:      addressIP(localAddress),
-			DestPort:    id.LocalPort,
-			VMID:        metadata.VMID,
-			NetworkID:   metadata.NetworkID,
-			ProfileName: metadata.ProfileName,
+			Protocol:   "tcp",
+			SourceIP:   addressIP(id.RemoteAddress),
+			SourcePort: id.RemotePort,
+			DestIP:     addressIP(localAddress),
+			DestPort:   id.LocalPort,
+			VMID:       metadata.VMID,
+			NetworkID:  metadata.NetworkID,
 		}
 		decision, err := route.Decide(context.Background(), flow)
 		if err != nil {

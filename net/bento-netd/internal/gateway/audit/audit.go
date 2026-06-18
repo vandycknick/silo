@@ -33,7 +33,6 @@ type Event struct {
 	HTTPPath     string            `json:"http_path,omitempty"`
 	VMID         string            `json:"vm_id,omitempty"`
 	NetworkID    string            `json:"network_id,omitempty"`
-	ProfileName  string            `json:"profile_name,omitempty"`
 }
 
 func Open(path string) (*Logger, error) {
@@ -54,19 +53,19 @@ func (l *Logger) Close() error {
 	return l.file.Close()
 }
 
-func (l *Logger) RecordFlow(flow hooks.Flow, event hooks.AuditEvent, decision hooks.RouteDecision) {
+func (l *Logger) RecordFlow(flow hooks.Flow, decision hooks.RouteDecision) {
 	if l == nil || l.file == nil {
 		return
 	}
 	record := Event{
 		Timestamp:    time.Now().UTC(),
-		Action:       "audit",
+		Action:       "decision",
 		FinalAction:  decision.Action,
-		Reason:       event.Reason,
-		RuleName:     event.RuleName,
-		EndpointKind: event.EndpointKind,
-		EndpointName: event.EndpointName,
-		Layer:        event.Layer,
+		Reason:       decision.Reason,
+		RuleName:     decision.RuleName,
+		EndpointKind: decision.EndpointKind,
+		EndpointName: decision.EndpointName,
+		Layer:        decision.Layer,
 		Protocol:     flow.Protocol,
 		SourceIP:     flow.SourceIP.String(),
 		SourcePort:   flow.SourcePort,
@@ -74,24 +73,23 @@ func (l *Logger) RecordFlow(flow hooks.Flow, event hooks.AuditEvent, decision ho
 		DestPort:     flow.DestPort,
 		VMID:         flow.VMID,
 		NetworkID:    flow.NetworkID,
-		ProfileName:  flow.ProfileName,
 	}
 	l.write(record)
 }
 
-func (l *Logger) RecordHTTP(request hooks.HTTPRequest, event hooks.AuditEvent, decision hooks.RouteDecision) {
+func (l *Logger) RecordHTTP(request hooks.HTTPRequest, decision hooks.RouteDecision) {
 	if l == nil || l.file == nil {
 		return
 	}
 	record := Event{
 		Timestamp:    time.Now().UTC(),
-		Action:       "audit",
+		Action:       "decision",
 		FinalAction:  decision.Action,
-		Reason:       event.Reason,
-		RuleName:     event.RuleName,
-		EndpointKind: event.EndpointKind,
-		EndpointName: event.EndpointName,
-		Layer:        event.Layer,
+		Reason:       decision.Reason,
+		RuleName:     decision.RuleName,
+		EndpointKind: decision.EndpointKind,
+		EndpointName: decision.EndpointName,
+		Layer:        decision.Layer,
 		Protocol:     request.Flow.Protocol,
 		SourceIP:     request.Flow.SourceIP.String(),
 		SourcePort:   request.Flow.SourcePort,
@@ -102,7 +100,6 @@ func (l *Logger) RecordHTTP(request hooks.HTTPRequest, event hooks.AuditEvent, d
 		HTTPPath:     request.Path,
 		VMID:         request.Flow.VMID,
 		NetworkID:    request.Flow.NetworkID,
-		ProfileName:  request.Flow.ProfileName,
 	}
 	l.write(record)
 }

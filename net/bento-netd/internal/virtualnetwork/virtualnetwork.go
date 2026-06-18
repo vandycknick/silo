@@ -31,9 +31,8 @@ import (
 )
 
 type Metadata struct {
-	VMID        string
-	NetworkID   string
-	ProfileName string
+	VMID      string
+	NetworkID string
 }
 
 type VirtualNetwork struct {

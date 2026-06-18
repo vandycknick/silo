@@ -13,7 +13,6 @@ import (
 
 	"github.com/containers/gvisor-tap-vsock/pkg/transport"
 	"github.com/nickvan/bentobox/net/bento-netd/internal/config"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/audit"
 	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/forwarder"
 	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/hooks"
 	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/router"
@@ -52,14 +51,8 @@ func run(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	auditLog, err := audit.Open(cfg.AuditLog)
-	if err != nil {
-		return fmt.Errorf("open audit log: %w", err)
-	}
-	defer auditLog.Close()
-
 	hook := hooks.NewPolicyHook(cfg.Policy)
-	route := router.New(hook, auditLog)
+	route := router.New(hook, nil)
 	var secretStore secrets.Store
 	if cfg.SecretStore != "" {
 		secretStore = secrets.NewFileStore(cfg.SecretStore)
@@ -69,9 +62,8 @@ func run(args []string) error {
 		return err
 	}
 	vn, err := virtualnetwork.New(&cfg.Stack, route, httpsProxy, virtualnetwork.Metadata{
-		VMID:        cfg.Metadata.VMID,
-		NetworkID:   cfg.Metadata.NetworkID,
-		ProfileName: cfg.Metadata.ProfileName,
+		VMID:      cfg.Metadata.VMID,
+		NetworkID: cfg.Metadata.NetworkID,
 	})
 	if err != nil {
 		return err

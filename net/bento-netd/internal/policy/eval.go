@@ -10,72 +10,120 @@ import (
 
 func (p *Policy) EvaluateFlow(flow Flow) Decision {
 	if p == nil {
-		return Decision{Action: ActionAllow}
+		return Decision{Action: ActionAllow, Layer: DecisionLayerFlow, Source: DecisionSourceDefault, DefaultAction: ActionAllow, MatchedFlow: flow}
 	}
-	decision := Decision{Action: p.DefaultAction}
-	for _, rule := range p.cidrRules {
-		endpoint := p.matchCIDRRule(rule, flow)
+	for _, rule := range p.ipRules {
+		endpoint := p.matchIPRule(rule, flow)
 		if endpoint == nil {
 			continue
 		}
-		if rule.Verdict == ActionAudit {
-			decision.Audits = append(decision.Audits, AuditMatch{
-				RuleName:     rule.Name,
-				Reason:       rule.Reason,
-				EndpointKind: "cidr",
-				EndpointName: endpoint.Name,
-			})
-			continue
+		return Decision{
+			Action:                    rule.Verdict,
+			Layer:                     DecisionLayerFlow,
+			Source:                    DecisionSourceRule,
+			DefaultAction:             p.DefaultAction,
+			ClassificationOpportunity: rule.Verdict == ActionAllow && p.CanClassify(flow),
+			RuleName:                  rule.Name,
+			Reason:                    rule.Reason,
+			EndpointKind:              "ip",
+			EndpointName:              endpoint.Name,
+			MatchedFlow:               flow,
 		}
-		decision.Action = rule.Verdict
-		decision.RuleName = rule.Name
-		decision.Reason = rule.Reason
-		decision.EndpointKind = "cidr"
-		decision.EndpointName = endpoint.Name
-		return decision
 	}
-	return decision
+	return Decision{
+		Action:                    p.DefaultAction,
+		Layer:                     DecisionLayerFlow,
+		Source:                    DecisionSourceDefault,
+		DefaultAction:             p.DefaultAction,
+		ClassificationOpportunity: p.CanClassify(flow),
+		Reason:                    defaultReason(p.DefaultAction),
+		MatchedFlow:               flow,
+	}
 }
 
 func (p *Policy) EvaluateHTTP(request HTTPRequest) Decision {
 	if p == nil {
-		return Decision{Action: ActionAllow}
+		return Decision{Action: ActionAllow, Layer: DecisionLayerRequest, Source: DecisionSourceDefault, DefaultAction: ActionAllow, MatchedRequest: &request}
 	}
-	decision := Decision{Action: p.DefaultAction}
-	for _, rule := range p.httpsRules {
-		endpointRef, endpoint := p.matchHTTPSRule(rule, request)
-		if endpoint == nil {
+	endpointRef, endpoint, ok := p.MatchHTTPFamilyHost(request.EndpointKind, request.Host)
+	if !ok {
+		return Decision{
+			Action:         p.DefaultAction,
+			Layer:          DecisionLayerRequest,
+			Source:         DecisionSourceDefault,
+			DefaultAction:  p.DefaultAction,
+			Reason:         "unknown_l7_endpoint",
+			MatchedFlow:    request.Flow,
+			MatchedRequest: &request,
+		}
+	}
+	request.EndpointKind = endpoint.Kind
+	for _, rule := range p.httpRules {
+		if !rule.references(endpointRef) {
 			continue
+		}
+		credential := p.selectedCredential(endpointRef)
+		if rule.Credential != nil {
+			if credential == nil || (Ref{Kind: credential.Kind, Name: credential.Name}) != *rule.Credential {
+				continue
+			}
 		}
 		matches, err := rule.matchesHTTP(request)
-		if err != nil || !matches {
+		if err != nil {
+			return Decision{
+				Action:         ActionDeny,
+				Layer:          DecisionLayerRequest,
+				Source:         DecisionSourceRule,
+				DefaultAction:  p.DefaultAction,
+				RuleName:       rule.Name,
+				Reason:         "condition_error",
+				EndpointKind:   endpoint.Kind,
+				EndpointName:   endpoint.Name,
+				MatchedFlow:    request.Flow,
+				MatchedRequest: &request,
+			}
+		}
+		if !matches {
 			continue
 		}
-		if rule.Verdict == ActionAudit {
-			decision.Audits = append(decision.Audits, AuditMatch{
-				RuleName:     rule.Name,
-				Reason:       rule.Reason,
-				EndpointKind: "https",
-				EndpointName: endpoint.Name,
-			})
-			continue
+		decision := Decision{
+			Action:         rule.Verdict,
+			Layer:          DecisionLayerRequest,
+			Source:         DecisionSourceRule,
+			DefaultAction:  p.DefaultAction,
+			RuleName:       rule.Name,
+			Reason:         rule.Reason,
+			EndpointKind:   endpoint.Kind,
+			EndpointName:   endpoint.Name,
+			MatchedFlow:    request.Flow,
+			MatchedRequest: &request,
 		}
-		decision.Action = rule.Verdict
-		decision.RuleName = rule.Name
-		decision.Reason = rule.Reason
-		decision.EndpointKind = "https"
-		decision.EndpointName = endpoint.Name
 		if rule.Verdict == ActionAllow {
-			decision.Credential = p.credentialByEndpoint[endpointRef.String()]
+			decision.SelectedCredential = credential
+			decision.SelectedCredentialUnsupported = credential != nil
 		}
 		return decision
 	}
-	return decision
+	return Decision{
+		Action:         p.DefaultAction,
+		Layer:          DecisionLayerRequest,
+		Source:         DecisionSourceDefault,
+		DefaultAction:  p.DefaultAction,
+		Reason:         defaultReason(p.DefaultAction),
+		EndpointKind:   endpoint.Kind,
+		EndpointName:   endpoint.Name,
+		MatchedFlow:    request.Flow,
+		MatchedRequest: &request,
+	}
 }
 
-func (p *Policy) matchCIDRRule(rule *Rule, flow Flow) *CIDREndpoint {
+func defaultReason(action Action) string {
+	return "default_" + string(action)
+}
+
+func (p *Policy) matchIPRule(rule *Rule, flow Flow) *IPEndpoint {
 	for _, ref := range rule.Endpoints {
-		endpoint := p.cidrEndpoints[ref.String()]
+		endpoint := p.ipEndpoints[ref.String()]
 		if endpoint != nil && endpoint.matches(flow) {
 			return endpoint
 		}
@@ -83,15 +131,21 @@ func (p *Policy) matchCIDRRule(rule *Rule, flow Flow) *CIDREndpoint {
 	return nil
 }
 
-func (p *Policy) matchHTTPSRule(rule *Rule, request HTTPRequest) (Ref, *HTTPSEndpoint) {
-	host := normalizeHost(request.Host)
-	for _, ref := range rule.Endpoints {
-		endpoint := p.httpsEndpoints[ref.String()]
-		if endpoint != nil && endpoint.matchesHost(host) {
-			return ref, endpoint
+func (p *Policy) selectedCredential(endpoint Ref) *Credential {
+	credentials := p.credentialsByEndpoint[endpoint.String()]
+	if len(credentials) == 1 {
+		return credentials[0]
+	}
+	return nil
+}
+
+func (r *Rule) references(endpoint Ref) bool {
+	for _, candidate := range r.Endpoints {
+		if candidate == endpoint {
+			return true
 		}
 	}
-	return Ref{}, nil
+	return false
 }
 
 func (r *Rule) matchesHTTP(request HTTPRequest) (bool, error) {
@@ -100,9 +154,10 @@ func (r *Rule) matchesHTTP(request HTTPRequest) (bool, error) {
 	}
 	value, _, err := r.program.Eval(map[string]any{
 		"http": map[string]any{
-			"method":  request.Method,
-			"host":    normalizeHost(request.Host),
+			"method":  strings.ToUpper(request.Method),
+			"host":    normalizedRequestHost(request),
 			"path":    request.Path,
+			"query":   request.Query,
 			"headers": headersForCEL(request.Header),
 		},
 	})
@@ -139,13 +194,21 @@ func compileCondition(condition string) (cel.Program, error) {
 	return program, nil
 }
 
-func headersForCEL(header map[string][]string) map[string]any {
-	result := make(map[string]any, len(header))
+func normalizedRequestHost(request HTTPRequest) string {
+	defaultPort := uint16(80)
+	if request.EndpointKind == "https" {
+		defaultPort = 443
+	}
+	authority, err := parseAuthority(request.Host, defaultPort)
+	if err != nil {
+		return strings.ToLower(strings.TrimSpace(request.Host))
+	}
+	return authority.Host
+}
+
+func headersForCEL(header map[string][]string) map[string][]string {
+	result := make(map[string][]string, len(header))
 	for key, values := range header {
-		if len(values) == 1 {
-			result[strings.ToLower(key)] = values[0]
-			continue
-		}
 		copied := make([]string, len(values))
 		copy(copied, values)
 		result[strings.ToLower(key)] = copied

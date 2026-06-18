@@ -37,14 +37,13 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 		natLock.Unlock()
 
 		flow := hooks.Flow{
-			Protocol:    "udp",
-			SourceIP:    addressIP(id.RemoteAddress),
-			SourcePort:  id.RemotePort,
-			DestIP:      addressIP(localAddress),
-			DestPort:    id.LocalPort,
-			VMID:        metadata.VMID,
-			NetworkID:   metadata.NetworkID,
-			ProfileName: metadata.ProfileName,
+			Protocol:   "udp",
+			SourceIP:   addressIP(id.RemoteAddress),
+			SourcePort: id.RemotePort,
+			DestIP:     addressIP(localAddress),
+			DestPort:   id.LocalPort,
+			VMID:       metadata.VMID,
+			NetworkID:  metadata.NetworkID,
 		}
 		decision, err := route.Decide(context.Background(), flow)
 		if err != nil {

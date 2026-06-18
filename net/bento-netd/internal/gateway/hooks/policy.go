@@ -25,7 +25,15 @@ func (h *PolicyHook) Decide(_ context.Context, flow Flow) (RouteDecision, error)
 		DestIP:     flow.DestIP,
 		DestPort:   flow.DestPort,
 	})
-	return routeDecisionFromPolicy(decision, "l3_l4"), nil
+	return routeDecisionFromPolicy(decision), nil
+}
+
+func (h *PolicyHook) HasHTTP() bool {
+	return h.policy.HasHTTP()
+}
+
+func (h *PolicyHook) MatchHTTPHost(host string) bool {
+	return h.policy.MatchHTTPHost(host)
 }
 
 func (h *PolicyHook) HasHTTPS() bool {
@@ -45,44 +53,42 @@ func (h *PolicyHook) DecideHTTP(_ context.Context, request HTTPRequest) (RouteDe
 			DestIP:     request.Flow.DestIP,
 			DestPort:   request.Flow.DestPort,
 		},
-		Host:   request.Host,
-		Method: request.Method,
-		Path:   request.Path,
-		Header: request.Header,
+		EndpointKind: request.EndpointKind,
+		Host:         request.Host,
+		Method:       request.Method,
+		Path:         request.Path,
+		Query:        request.Query,
+		Header:       request.Header,
 	})
-	return routeDecisionFromPolicy(decision, "https"), nil
+	return routeDecisionFromPolicy(decision), nil
 }
 
-func routeDecisionFromPolicy(decision policy.Decision, layer string) RouteDecision {
+func routeDecisionFromPolicy(decision policy.Decision) RouteDecision {
 	converted := RouteDecision{
-		Action:       routeActionFromPolicy(decision.Action),
-		Reason:       decision.Reason,
-		RuleName:     decision.RuleName,
-		EndpointKind: decision.EndpointKind,
-		EndpointName: decision.EndpointName,
-		AuditEvents:  make([]AuditEvent, 0, len(decision.Audits)),
+		Action:                    routeActionFromPolicy(decision),
+		Layer:                     string(decision.Layer),
+		Source:                    string(decision.Source),
+		DefaultAction:             string(decision.DefaultAction),
+		ClassificationOpportunity: decision.ClassificationOpportunity,
+		Reason:                    decision.Reason,
+		RuleName:                  decision.RuleName,
+		EndpointKind:              decision.EndpointKind,
+		EndpointName:              decision.EndpointName,
 	}
-	for _, event := range decision.Audits {
-		converted.AuditEvents = append(converted.AuditEvents, AuditEvent{
-			RuleName:     event.RuleName,
-			Reason:       event.Reason,
-			EndpointKind: event.EndpointKind,
-			EndpointName: event.EndpointName,
-			Layer:        layer,
-		})
-	}
-	if decision.Credential != nil {
+	if decision.SelectedCredential != nil && !decision.SelectedCredentialUnsupported {
 		converted.Credential = &Credential{
-			Kind:   decision.Credential.Kind,
-			Name:   decision.Credential.Name,
-			Secret: decision.Credential.Secret,
+			Kind: decision.SelectedCredential.Kind,
+			Name: decision.SelectedCredential.Name,
 		}
 	}
 	return converted
 }
 
-func routeActionFromPolicy(action policy.Action) RouteAction {
-	switch action {
+func routeActionFromPolicy(decision policy.Decision) RouteAction {
+	if decision.ClassificationOpportunity {
+		return RouteClassify
+	}
+	switch decision.Action {
 	case policy.ActionDeny:
 		return RouteDeny
 	default:

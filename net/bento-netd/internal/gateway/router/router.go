@@ -14,6 +14,8 @@ type Router struct {
 }
 
 type httpsHook interface {
+	HasHTTP() bool
+	MatchHTTPHost(host string) bool
 	HasHTTPS() bool
 	MatchHTTPSHost(host string) bool
 	DecideHTTP(ctx context.Context, request hooks.HTTPRequest) (hooks.RouteDecision, error)
@@ -28,11 +30,12 @@ func (r *Router) Decide(ctx context.Context, flow hooks.Flow) (hooks.RouteDecisi
 	if err != nil {
 		return hooks.RouteDecision{}, err
 	}
-	for _, event := range decision.AuditEvents {
-		r.audit.RecordFlow(flow, event, decision)
-	}
 	slog.Info("network flow decision",
 		"action", decision.Action,
+		"layer", decision.Layer,
+		"source", decision.Source,
+		"default_action", decision.DefaultAction,
+		"classification_opportunity", decision.ClassificationOpportunity,
 		"reason", decision.Reason,
 		"rule_name", decision.RuleName,
 		"endpoint_kind", decision.EndpointKind,
@@ -44,9 +47,18 @@ func (r *Router) Decide(ctx context.Context, flow hooks.Flow) (hooks.RouteDecisi
 		"dest_port", flow.DestPort,
 		"vm_id", flow.VMID,
 		"network_id", flow.NetworkID,
-		"profile", flow.ProfileName,
 	)
 	return decision, nil
+}
+
+func (r *Router) HasHTTP() bool {
+	resolver, ok := r.hook.(httpsHook)
+	return ok && resolver.HasHTTP()
+}
+
+func (r *Router) MatchHTTPHost(host string) bool {
+	resolver, ok := r.hook.(httpsHook)
+	return ok && resolver.MatchHTTPHost(host)
 }
 
 func (r *Router) HasHTTPS() bool {
@@ -68,11 +80,11 @@ func (r *Router) DecideHTTP(ctx context.Context, request hooks.HTTPRequest) (hoo
 	if err != nil {
 		return hooks.RouteDecision{}, err
 	}
-	for _, event := range decision.AuditEvents {
-		r.audit.RecordHTTP(request, event, decision)
-	}
 	slog.Info("http flow decision",
 		"action", decision.Action,
+		"layer", decision.Layer,
+		"source", decision.Source,
+		"default_action", decision.DefaultAction,
 		"reason", decision.Reason,
 		"rule_name", decision.RuleName,
 		"endpoint_kind", decision.EndpointKind,
@@ -86,7 +98,6 @@ func (r *Router) DecideHTTP(ctx context.Context, request hooks.HTTPRequest) (hoo
 		"dest_port", request.Flow.DestPort,
 		"vm_id", request.Flow.VMID,
 		"network_id", request.Flow.NetworkID,
-		"profile", request.Flow.ProfileName,
 	)
 	return decision, nil
 }

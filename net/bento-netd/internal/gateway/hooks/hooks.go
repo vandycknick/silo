@@ -11,33 +11,27 @@ type RouteAction string
 const (
 	RouteAllowDirect RouteAction = "allow_direct"
 	RouteDeny        RouteAction = "deny"
+	RouteClassify    RouteAction = "classify"
 )
 
 type Flow struct {
-	Protocol    string
-	SourceIP    net.IP
-	SourcePort  uint16
-	DestIP      net.IP
-	DestPort    uint16
-	VMID        string
-	NetworkID   string
-	ProfileName string
+	Protocol   string
+	SourceIP   net.IP
+	SourcePort uint16
+	DestIP     net.IP
+	DestPort   uint16
+	VMID       string
+	NetworkID  string
 }
 
 type HTTPRequest struct {
-	Flow   Flow
-	Host   string
-	Method string
-	Path   string
-	Header http.Header
-}
-
-type AuditEvent struct {
-	RuleName     string
-	Reason       string
+	Flow         Flow
 	EndpointKind string
-	EndpointName string
-	Layer        string
+	Host         string
+	Method       string
+	Path         string
+	Query        string
+	Header       http.Header
 }
 
 type Credential struct {
@@ -47,13 +41,16 @@ type Credential struct {
 }
 
 type RouteDecision struct {
-	Action       RouteAction
-	Reason       string
-	RuleName     string
-	EndpointKind string
-	EndpointName string
-	AuditEvents  []AuditEvent
-	Credential   *Credential
+	Action                    RouteAction
+	Layer                     string
+	Source                    string
+	DefaultAction             string
+	ClassificationOpportunity bool
+	Reason                    string
+	RuleName                  string
+	EndpointKind              string
+	EndpointName              string
+	Credential                *Credential
 }
 
 type Hook interface {

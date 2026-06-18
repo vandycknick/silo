@@ -6,33 +6,22 @@ import (
 	"testing"
 )
 
-func TestParseUsesPolicyAuditLogSetting(t *testing.T) {
+func TestParseRejectsRemovedAuditAndProfileFlags(t *testing.T) {
 	dir := t.TempDir()
-	policyPath := filepath.Join(dir, "policy.hcl")
-	writeConfigPolicy(t, policyPath, `
-settings {
-  audit_log = "/tmp/bento-audit.jsonl"
-}
-
-endpoint "cidr" "private" {
-  cidrs = ["10.0.0.0/8"]
-}
-
-rule "audit-private" {
-  endpoint = cidr.private
-  verdict = "audit"
-}
-`)
-
-	cfg, err := Parse([]string{
+	_, err := Parse([]string{
 		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
-		"--policy-file", policyPath,
+		"--audit-log", filepath.Join(dir, "audit.jsonl"),
 	})
-	if err != nil {
-		t.Fatalf("Parse returned error: %v", err)
+	if err == nil {
+		t.Fatal("expected removed --audit-log flag to be rejected")
 	}
-	if cfg.AuditLog != "/tmp/bento-audit.jsonl" {
-		t.Fatalf("expected policy audit log, got %q", cfg.AuditLog)
+
+	_, err = Parse([]string{
+		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
+		"--profile-name", "default",
+	})
+	if err == nil {
+		t.Fatal("expected removed --profile-name flag to be rejected")
 	}
 }
 
@@ -44,9 +33,9 @@ endpoint "https" "github" {
   hosts = ["api.github.com"]
 }
 
-rule "audit-github" {
+rule "allow-github" {
   endpoint = https.github
-  verdict = "audit"
+  verdict = "allow"
 }
 `)
 
@@ -69,7 +58,6 @@ endpoint "https" "github" {
 
 credential "bearer_token" "github" {
   endpoint = https.github
-  secret = "github-token"
 }
 
 rule "allow-github" {

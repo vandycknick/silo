@@ -3,8 +3,8 @@ package policy
 import (
 	"fmt"
 	"net/netip"
-	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/hashicorp/hcl/v2"
@@ -27,6 +27,8 @@ func loadBody(body hcl.Body) (*Policy, error) {
 			{Type: "settings"},
 			{Type: "endpoint", LabelNames: []string{"kind", "name"}},
 			{Type: "credential", LabelNames: []string{"kind", "name"}},
+			{Type: "tailscale", LabelNames: []string{"name"}},
+			{Type: "forward", LabelNames: []string{"name"}},
 			{Type: "rule", LabelNames: []string{"name"}},
 		},
 	})
@@ -38,10 +40,15 @@ func loadBody(body hcl.Body) (*Policy, error) {
 	rawCredentials := make([]rawCredential, 0)
 	rawRules := make([]rawRule, 0)
 	seenRules := make(map[string]struct{})
+	settingsSeen := false
 
 	for _, block := range content.Blocks {
 		switch block.Type {
 		case "settings":
+			if settingsSeen {
+				return nil, fmt.Errorf("duplicate settings block")
+			}
+			settingsSeen = true
 			if err := decodeSettings(compiled, block); err != nil {
 				return nil, err
 			}
@@ -55,6 +62,8 @@ func loadBody(body hcl.Body) (*Policy, error) {
 				return nil, err
 			}
 			rawCredentials = append(rawCredentials, credential)
+		case "tailscale", "forward":
+			return nil, fmt.Errorf("%s blocks are reserved by the policy schema but not implemented by bento-netd yet", block.Type)
 		case "rule":
 			name := block.Labels[0]
 			if _, ok := seenRules[name]; ok {
@@ -83,41 +92,41 @@ func loadBody(body hcl.Body) (*Policy, error) {
 	return compiled, nil
 }
 
-type rawCIDREndpoint struct {
-	CIDRs       []string `hcl:"cidrs,optional"`
-	DestCIDRs   []string `hcl:"dest_cidrs,optional"`
-	SourceCIDRs []string `hcl:"source_cidrs,optional"`
-	Protocols   []string `hcl:"protocols,optional"`
-	Ports       []int    `hcl:"ports,optional"`
+type rawIPEndpoint struct {
+	Source      []string
+	Destination []string
+	Protocol    string
+	Ports       []PortRange
 }
 
-type rawHTTPSEndpoint struct {
-	Hosts []string `hcl:"hosts"`
+type rawHTTPEndpoint struct {
+	Hosts []string
 }
 
 type rawCredential struct {
-	Kind     string
-	Name     string
-	Endpoint Ref
-	Secret   string
+	Kind      string
+	Name      string
+	Endpoint  Ref
+	Condition string
 }
 
 type rawRule struct {
-	Name      string
-	Endpoints []Ref
-	Verdict   Action
-	Priority  int
-	Disabled  bool
-	Condition string
-	Reason    string
-	order     int
+	Name       string
+	Endpoints  []Ref
+	Credential *Ref
+	Verdict    Action
+	Priority   int
+	Disabled   bool
+	Condition  string
+	Reason     string
+	order      int
 }
 
 func decodeSettings(policy *Policy, block *hcl.Block) error {
-	content, diagnostics := block.Body.Content(&hcl.BodySchema{Attributes: []hcl.AttributeSchema{
-		{Name: "default_action"},
-		{Name: "audit_log"},
-	}})
+	content, diagnostics := block.Body.Content(&hcl.BodySchema{
+		Attributes: []hcl.AttributeSchema{{Name: "default_action"}},
+		Blocks:     []hcl.BlockHeaderSchema{{Type: "audit"}},
+	})
 	if diagnostics.HasErrors() {
 		return fmt.Errorf("decode settings block: %s", diagnostics.Error())
 	}
@@ -132,48 +141,135 @@ func decodeSettings(policy *Policy, block *hcl.Block) error {
 		}
 		policy.DefaultAction = action
 	}
-	if attr, ok := content.Attributes["audit_log"]; ok {
-		path, err := decodeStringAttr(attr)
-		if err != nil {
-			return fmt.Errorf("decode settings.audit_log: %w", err)
+	auditSeen := false
+	for _, auditBlock := range content.Blocks {
+		if auditSeen {
+			return fmt.Errorf("duplicate settings.audit block")
 		}
-		if path != "" && !filepath.IsAbs(path) {
-			return fmt.Errorf("settings.audit_log must be an absolute path: %s", path)
+		auditSeen = true
+		if err := decodeAuditSettings(policy, auditBlock); err != nil {
+			return err
 		}
-		policy.auditLogPath = path
 	}
 	return nil
+}
+
+func decodeAuditSettings(policy *Policy, block *hcl.Block) error {
+	content, diagnostics := block.Body.Content(&hcl.BodySchema{Attributes: []hcl.AttributeSchema{
+		{Name: "body_buffer"},
+		{Name: "body_storage"},
+	}})
+	if diagnostics.HasErrors() {
+		return fmt.Errorf("decode settings.audit block: %s", diagnostics.Error())
+	}
+	bodyBuffer := int64(1024 * 1024)
+	bodyStorage := int64(4 * 1024)
+	if attr, ok := content.Attributes["body_buffer"]; ok {
+		value, err := decodeStringAttr(attr)
+		if err != nil {
+			return fmt.Errorf("decode settings.audit.body_buffer: %w", err)
+		}
+		parsed, err := parseSize(value)
+		if err != nil {
+			return fmt.Errorf("decode settings.audit.body_buffer: %w", err)
+		}
+		bodyBuffer = parsed
+	}
+	if attr, ok := content.Attributes["body_storage"]; ok {
+		value, err := decodeStringAttr(attr)
+		if err != nil {
+			return fmt.Errorf("decode settings.audit.body_storage: %w", err)
+		}
+		parsed, err := parseSize(value)
+		if err != nil {
+			return fmt.Errorf("decode settings.audit.body_storage: %w", err)
+		}
+		bodyStorage = parsed
+	}
+	if bodyBuffer < bodyStorage {
+		policy.addWarning("settings.audit.body_buffer is smaller than settings.audit.body_storage")
+	}
+	return nil
+}
+
+func parseSize(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, fmt.Errorf("size must not be empty")
+	}
+	lower := strings.ToLower(value)
+	for _, candidate := range []struct {
+		suffix     string
+		multiplier int64
+	}{
+		{suffix: "gib", multiplier: 1024 * 1024 * 1024},
+		{suffix: "mib", multiplier: 1024 * 1024},
+		{suffix: "kib", multiplier: 1024},
+		{suffix: "b", multiplier: 1},
+	} {
+		suffix := candidate.suffix
+		if !strings.HasSuffix(lower, suffix) {
+			continue
+		}
+		number := strings.TrimSpace(value[:len(value)-len(suffix)])
+		parsed, err := strconv.ParseInt(number, 10, 64)
+		if err != nil || parsed < 0 {
+			return 0, fmt.Errorf("invalid size %q", value)
+		}
+		return parsed * candidate.multiplier, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("invalid size %q", value)
+	}
+	return parsed, nil
 }
 
 func decodeEndpoint(policy *Policy, block *hcl.Block) error {
 	kind := block.Labels[0]
 	name := block.Labels[1]
+	if !validTraversalIdentifier(name) {
+		return fmt.Errorf("endpoint %q.%q name must use a traversal identifier", kind, name)
+	}
 	ref := Ref{Kind: kind, Name: name}
 	key := ref.String()
 	switch kind {
 	case "cidr":
-		if _, ok := policy.cidrEndpoints[key]; ok {
+		return fmt.Errorf("endpoint %q uses removed syntax; use endpoint \"ip\" instead", key)
+	case "ip":
+		if _, ok := policy.ipEndpoints[key]; ok {
 			return fmt.Errorf("duplicate endpoint %q", key)
 		}
-		var raw rawCIDREndpoint
-		if diagnostics := gohcl.DecodeBody(block.Body, nil, &raw); diagnostics.HasErrors() {
-			return fmt.Errorf("decode endpoint %q: %s", key, diagnostics.Error())
-		}
-		endpoint, err := compileCIDREndpoint(name, raw)
+		raw, err := decodeIPEndpoint(block)
 		if err != nil {
 			return fmt.Errorf("decode endpoint %q: %w", key, err)
 		}
-		policy.cidrEndpoints[key] = endpoint
+		endpoint, err := compileIPEndpoint(name, raw)
+		if err != nil {
+			return fmt.Errorf("decode endpoint %q: %w", key, err)
+		}
+		policy.ipEndpoints[key] = endpoint
+	case "http":
+		if _, ok := policy.httpEndpoints[key]; ok {
+			return fmt.Errorf("duplicate endpoint %q", key)
+		}
+		endpoint, err := decodeHTTPEndpoint(kind, name, TransportHTTPProxy, 80, block)
+		if err != nil {
+			return fmt.Errorf("decode endpoint %q: %w", key, err)
+		}
+		if err := policy.addHTTPEndpoint(endpoint); err != nil {
+			return fmt.Errorf("decode endpoint %q: %w", key, err)
+		}
+		policy.httpEndpoints[key] = endpoint
 	case "https":
 		if _, ok := policy.httpsEndpoints[key]; ok {
 			return fmt.Errorf("duplicate endpoint %q", key)
 		}
-		var raw rawHTTPSEndpoint
-		if diagnostics := gohcl.DecodeBody(block.Body, nil, &raw); diagnostics.HasErrors() {
-			return fmt.Errorf("decode endpoint %q: %s", key, diagnostics.Error())
-		}
-		endpoint, err := compileHTTPSEndpoint(name, raw)
+		endpoint, err := decodeHTTPEndpoint(kind, name, TransportHTTPSMITM, 443, block)
 		if err != nil {
+			return fmt.Errorf("decode endpoint %q: %w", key, err)
+		}
+		if err := policy.addHTTPEndpoint(endpoint); err != nil {
 			return fmt.Errorf("decode endpoint %q: %w", key, err)
 		}
 		policy.httpsEndpoints[key] = endpoint
@@ -183,89 +279,149 @@ func decodeEndpoint(policy *Policy, block *hcl.Block) error {
 	return nil
 }
 
-func compileCIDREndpoint(name string, raw rawCIDREndpoint) (*CIDREndpoint, error) {
-	if len(raw.CIDRs) > 0 && len(raw.DestCIDRs) > 0 {
-		return nil, fmt.Errorf("use cidrs or dest_cidrs, not both")
+func decodeIPEndpoint(block *hcl.Block) (rawIPEndpoint, error) {
+	content, diagnostics := block.Body.Content(&hcl.BodySchema{Attributes: []hcl.AttributeSchema{
+		{Name: "source"},
+		{Name: "destination"},
+		{Name: "protocol"},
+		{Name: "ports"},
+	}})
+	if diagnostics.HasErrors() {
+		return rawIPEndpoint{}, fmt.Errorf("%s", diagnostics.Error())
 	}
-	destCIDRs := raw.DestCIDRs
-	if len(raw.CIDRs) > 0 {
-		destCIDRs = raw.CIDRs
+	raw := rawIPEndpoint{Protocol: "any"}
+	if attr, ok := content.Attributes["source"]; ok {
+		var source []string
+		if diagnostics := gohcl.DecodeExpression(attr.Expr, nil, &source); diagnostics.HasErrors() {
+			return rawIPEndpoint{}, fmt.Errorf("decode source: %s", diagnostics.Error())
+		}
+		raw.Source = source
 	}
-	if len(destCIDRs) == 0 && len(raw.SourceCIDRs) == 0 {
-		return nil, fmt.Errorf("at least one source_cidrs, dest_cidrs, or cidrs entry is required")
+	if attr, ok := content.Attributes["destination"]; ok {
+		var destination []string
+		if diagnostics := gohcl.DecodeExpression(attr.Expr, nil, &destination); diagnostics.HasErrors() {
+			return rawIPEndpoint{}, fmt.Errorf("decode destination: %s", diagnostics.Error())
+		}
+		raw.Destination = destination
 	}
-	endpoint := &CIDREndpoint{
-		Name:      name,
-		Protocols: make(map[string]struct{}),
-		Ports:     make(map[uint16]struct{}),
+	if attr, ok := content.Attributes["protocol"]; ok {
+		protocol, err := decodeStringAttr(attr)
+		if err != nil {
+			return rawIPEndpoint{}, fmt.Errorf("decode protocol: %w", err)
+		}
+		raw.Protocol = protocol
 	}
-	for _, cidr := range raw.SourceCIDRs {
+	if attr, ok := content.Attributes["ports"]; ok {
+		ports, err := decodePortRangesAttr(attr)
+		if err != nil {
+			return rawIPEndpoint{}, fmt.Errorf("decode ports: %w", err)
+		}
+		raw.Ports = ports
+	}
+	return raw, nil
+}
+
+func compileIPEndpoint(name string, raw rawIPEndpoint) (*IPEndpoint, error) {
+	if len(raw.Destination) == 0 && len(raw.Source) == 0 {
+		return nil, fmt.Errorf("at least one source or destination entry is required")
+	}
+	protocol := strings.ToLower(strings.TrimSpace(raw.Protocol))
+	if protocol == "" {
+		protocol = "any"
+	}
+	switch protocol {
+	case "any":
+		if len(raw.Ports) > 0 {
+			return nil, fmt.Errorf("protocol any cannot be combined with ports")
+		}
+	case "tcp", "udp", "icmp":
+	default:
+		return nil, fmt.Errorf("unsupported protocol %q", protocol)
+	}
+	endpoint := &IPEndpoint{Name: name, Protocol: protocol, Ports: raw.Ports}
+	for _, cidr := range raw.Source {
 		prefix, err := netip.ParsePrefix(cidr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid source_cidrs entry %q: %w", cidr, err)
+			return nil, fmt.Errorf("invalid source entry %q: %w", cidr, err)
 		}
 		endpoint.SourcePrefixes = append(endpoint.SourcePrefixes, prefix)
 	}
-	for _, cidr := range destCIDRs {
+	for _, cidr := range raw.Destination {
 		prefix, err := netip.ParsePrefix(cidr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid dest cidr entry %q: %w", cidr, err)
+			return nil, fmt.Errorf("invalid destination entry %q: %w", cidr, err)
 		}
-		endpoint.DestPrefixes = append(endpoint.DestPrefixes, prefix)
-	}
-	for _, protocol := range raw.Protocols {
-		protocol = strings.ToLower(protocol)
-		switch protocol {
-		case "", "any":
-			if len(raw.Protocols) > 1 {
-				return nil, fmt.Errorf("protocol any cannot be combined with other protocols")
-			}
-			endpoint.Protocols = map[string]struct{}{}
-		case "tcp", "udp":
-			endpoint.Protocols[protocol] = struct{}{}
-		default:
-			return nil, fmt.Errorf("unsupported protocol %q", protocol)
-		}
-	}
-	for _, port := range raw.Ports {
-		if port < 1 || port > 65535 {
-			return nil, fmt.Errorf("port %d is out of range", port)
-		}
-		endpoint.Ports[uint16(port)] = struct{}{}
+		endpoint.DestinationPrefixes = append(endpoint.DestinationPrefixes, prefix)
 	}
 	return endpoint, nil
 }
 
-func compileHTTPSEndpoint(name string, raw rawHTTPSEndpoint) (*HTTPSEndpoint, error) {
+func decodeHTTPEndpoint(kind string, name string, transport Transport, defaultPort uint16, block *hcl.Block) (*HTTPEndpoint, error) {
+	content, diagnostics := block.Body.Content(&hcl.BodySchema{Attributes: []hcl.AttributeSchema{{Name: "hosts"}}})
+	if diagnostics.HasErrors() {
+		return nil, fmt.Errorf("%s", diagnostics.Error())
+	}
+	hostsAttr, ok := content.Attributes["hosts"]
+	if !ok {
+		return nil, fmt.Errorf("hosts is required")
+	}
+	var raw rawHTTPEndpoint
+	if diagnostics := gohcl.DecodeExpression(hostsAttr.Expr, nil, &raw.Hosts); diagnostics.HasErrors() {
+		return nil, fmt.Errorf("decode hosts: %s", diagnostics.Error())
+	}
 	if len(raw.Hosts) == 0 {
 		return nil, fmt.Errorf("hosts must not be empty")
 	}
-	endpoint := &HTTPSEndpoint{Name: name}
+	endpoint := &HTTPEndpoint{Kind: kind, Name: name, Family: EndpointFamilyHTTP, Transport: transport, DefaultPort: defaultPort}
 	seen := make(map[string]struct{})
 	for _, host := range raw.Hosts {
-		if strings.Contains(host, "://") || strings.Contains(host, "/") {
-			return nil, fmt.Errorf("host %q must not include a scheme or path", host)
+		binding, err := parseHostBinding(host, defaultPort)
+		if err != nil {
+			return nil, err
 		}
-		host = normalizeHost(host)
-		if host == "" {
-			return nil, fmt.Errorf("host must not be empty")
-		}
-		if _, ok := seen[host]; ok {
+		key := hostBindingKey(transport, binding.Host, binding.Port, binding.Wildcard)
+		if _, ok := seen[key]; ok {
 			continue
 		}
-		seen[host] = struct{}{}
-		endpoint.Hosts = append(endpoint.Hosts, host)
+		seen[key] = struct{}{}
+		endpoint.Hosts = append(endpoint.Hosts, binding)
 	}
 	return endpoint, nil
+}
+
+func (p *Policy) addHTTPEndpoint(endpoint *HTTPEndpoint) error {
+	ref := Ref{Kind: endpoint.Kind, Name: endpoint.Name}
+	for _, binding := range endpoint.Hosts {
+		if binding.Wildcard {
+			continue
+		}
+		key := hostBindingKey(endpoint.Transport, binding.Host, binding.Port, false)
+		if existing, ok := p.exactHTTPBindings[key]; ok {
+			return fmt.Errorf("host %q:%d duplicates exact binding on %q", binding.Host, binding.Port, existing.String())
+		}
+		p.exactHTTPBindings[key] = ref
+	}
+	return nil
+}
+
+func hostBindingKey(transport Transport, host string, port uint16, wildcard bool) string {
+	marker := "exact"
+	if wildcard {
+		marker = "wildcard"
+	}
+	return string(transport) + "|" + marker + "|" + host + "|" + strconv.Itoa(int(port))
 }
 
 func decodeCredential(block *hcl.Block) (rawCredential, error) {
 	content, diagnostics := block.Body.Content(&hcl.BodySchema{Attributes: []hcl.AttributeSchema{
 		{Name: "endpoint"},
-		{Name: "secret"},
+		{Name: "condition"},
 	}})
 	if diagnostics.HasErrors() {
 		return rawCredential{}, fmt.Errorf("decode credential %q.%q: %s", block.Labels[0], block.Labels[1], diagnostics.Error())
+	}
+	if !validTraversalIdentifier(block.Labels[1]) {
+		return rawCredential{}, fmt.Errorf("credential %q.%q name must use a traversal identifier", block.Labels[0], block.Labels[1])
 	}
 	endpointAttr, ok := content.Attributes["endpoint"]
 	if !ok {
@@ -275,19 +431,19 @@ func decodeCredential(block *hcl.Block) (rawCredential, error) {
 	if err != nil {
 		return rawCredential{}, fmt.Errorf("decode credential %q.%q endpoint: %w", block.Labels[0], block.Labels[1], err)
 	}
-	var secret string
-	if secretAttr, ok := content.Attributes["secret"]; ok {
-		decoded, err := decodeStringAttr(secretAttr)
+	var condition string
+	if conditionAttr, ok := content.Attributes["condition"]; ok {
+		decoded, err := decodeStringAttr(conditionAttr)
 		if err != nil {
-			return rawCredential{}, fmt.Errorf("decode credential %q.%q secret: %w", block.Labels[0], block.Labels[1], err)
+			return rawCredential{}, fmt.Errorf("decode credential %q.%q condition: %w", block.Labels[0], block.Labels[1], err)
 		}
-		secret = decoded
+		condition = decoded
 	}
-	return rawCredential{Kind: block.Labels[0], Name: block.Labels[1], Endpoint: endpoint, Secret: secret}, nil
+	return rawCredential{Kind: block.Labels[0], Name: block.Labels[1], Endpoint: endpoint, Condition: condition}, nil
 }
 
 func (p *Policy) addCredential(raw rawCredential) error {
-	if raw.Kind != "bearer_token" && raw.Kind != "openai_codex_oauth" {
+	if !knownCredentialKind(raw.Kind) {
 		return fmt.Errorf("unsupported credential kind %q", raw.Kind)
 	}
 	if raw.Endpoint.Kind != "https" {
@@ -296,63 +452,30 @@ func (p *Policy) addCredential(raw rawCredential) error {
 	if _, ok := p.httpsEndpoints[raw.Endpoint.String()]; !ok {
 		return fmt.Errorf("credential %q.%q references unknown endpoint %q", raw.Kind, raw.Name, raw.Endpoint.String())
 	}
-	if existing := p.credentialByEndpoint[raw.Endpoint.String()]; existing != nil {
-		return fmt.Errorf(
-			"credential %q.%q references endpoint %q, but credential %q already references that endpoint; credentials and endpoints must be one-to-one",
-			raw.Kind,
-			raw.Name,
-			raw.Endpoint.String(),
-			Ref{Kind: existing.Kind, Name: existing.Name}.String(),
-		)
-	}
-	credential, err := compileCredential(raw)
-	if err != nil {
-		return err
-	}
+	credential := &Credential{Kind: raw.Kind, Name: raw.Name, Endpoint: raw.Endpoint, Condition: raw.Condition}
 	key := Ref{Kind: raw.Kind, Name: raw.Name}.String()
 	if _, ok := p.credentials[key]; ok {
 		return fmt.Errorf("duplicate credential %q", key)
 	}
 	p.credentials[key] = credential
-	p.credentialByEndpoint[raw.Endpoint.String()] = credential
+	p.credentialsByEndpoint[raw.Endpoint.String()] = append(p.credentialsByEndpoint[raw.Endpoint.String()], credential)
 	return nil
 }
 
-func compileCredential(raw rawCredential) (*Credential, error) {
-	if raw.Secret == "" {
-		return nil, fmt.Errorf("credential %q.%q requires secret", raw.Kind, raw.Name)
-	}
-	if err := validateSecretName(raw.Secret); err != nil {
-		return nil, fmt.Errorf("credential %q.%q secret: %w", raw.Kind, raw.Name, err)
-	}
-	switch raw.Kind {
-	case "bearer_token", "openai_codex_oauth":
-		return &Credential{Kind: raw.Kind, Name: raw.Name, Endpoint: raw.Endpoint, Secret: raw.Secret}, nil
+func knownCredentialKind(kind string) bool {
+	switch kind {
+	case "basic_auth", "bearer_token", "header_token", "github_oauth", "openai_codex_oauth", "aws_credential":
+		return true
 	default:
-		return nil, fmt.Errorf("unsupported credential kind %q", raw.Kind)
+		return false
 	}
-}
-
-func validateSecretName(name string) error {
-	if name == "" {
-		return fmt.Errorf("cannot be empty")
-	}
-	if name == "." || name == ".." || strings.HasPrefix(name, ".") {
-		return fmt.Errorf("name %q is not allowed", name)
-	}
-	for _, ch := range name {
-		if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '-' || ch == '_' || ch == '.' {
-			continue
-		}
-		return fmt.Errorf("name %q may only contain ASCII letters, numbers, dots, underscores, and dashes", name)
-	}
-	return nil
 }
 
 func decodeRule(block *hcl.Block, order int) (rawRule, error) {
 	content, diagnostics := block.Body.Content(&hcl.BodySchema{Attributes: []hcl.AttributeSchema{
 		{Name: "endpoint"},
 		{Name: "endpoints"},
+		{Name: "credential"},
 		{Name: "condition"},
 		{Name: "verdict"},
 		{Name: "priority"},
@@ -395,6 +518,13 @@ func decodeRule(block *hcl.Block, order int) (rawRule, error) {
 	if err != nil {
 		return rawRule{}, fmt.Errorf("decode rule %q verdict: %w", rule.Name, err)
 	}
+	if credentialAttr, ok := content.Attributes["credential"]; ok {
+		credential, err := decodeRefAttr(credentialAttr)
+		if err != nil {
+			return rawRule{}, fmt.Errorf("decode rule %q credential: %w", rule.Name, err)
+		}
+		rule.Credential = &credential
+	}
 	if conditionAttr, ok := content.Attributes["condition"]; ok {
 		condition, err := decodeStringAttr(conditionAttr)
 		if err != nil {
@@ -427,39 +557,35 @@ func decodeRule(block *hcl.Block, order int) (rawRule, error) {
 }
 
 func (p *Policy) addRule(raw rawRule) error {
-	if raw.Disabled {
-		return nil
-	}
-	if err := validateEndpointFamily(raw.Endpoints); err != nil {
+	family, err := p.validateEndpointFamily(raw.Endpoints)
+	if err != nil {
 		return fmt.Errorf("rule %q: %w", raw.Name, err)
 	}
 	rule := &Rule{
-		Name:      raw.Name,
-		Endpoints: raw.Endpoints,
-		Verdict:   raw.Verdict,
-		Priority:  raw.Priority,
-		Disabled:  raw.Disabled,
-		Condition: raw.Condition,
-		Reason:    raw.Reason,
-		order:     raw.order,
+		Name:       raw.Name,
+		Family:     family,
+		Endpoints:  raw.Endpoints,
+		Credential: raw.Credential,
+		Verdict:    raw.Verdict,
+		Priority:   raw.Priority,
+		Disabled:   raw.Disabled,
+		Condition:  raw.Condition,
+		Reason:     raw.Reason,
+		order:      raw.order,
 	}
-	switch raw.Endpoints[0].Kind {
-	case "cidr":
-		for _, endpoint := range raw.Endpoints {
-			if _, ok := p.cidrEndpoints[endpoint.String()]; !ok {
-				return fmt.Errorf("rule %q references unknown endpoint %q", raw.Name, endpoint.String())
-			}
-		}
+	if err := p.validateRuleCredential(rule); err != nil {
+		return err
+	}
+	switch family {
+	case EndpointFamilyIP:
 		if raw.Condition != "" {
-			return fmt.Errorf("rule %q condition is only supported for https endpoint rules", raw.Name)
+			return fmt.Errorf("rule %q condition is only supported for HTTP-family endpoint rules", raw.Name)
 		}
-		p.cidrRules = append(p.cidrRules, rule)
-	case "https":
-		for _, endpoint := range raw.Endpoints {
-			if _, ok := p.httpsEndpoints[endpoint.String()]; !ok {
-				return fmt.Errorf("rule %q references unknown endpoint %q", raw.Name, endpoint.String())
-			}
+		if raw.Disabled {
+			return nil
 		}
+		p.ipRules = append(p.ipRules, rule)
+	case EndpointFamilyHTTP:
 		if raw.Condition != "" {
 			program, err := compileCondition(raw.Condition)
 			if err != nil {
@@ -467,31 +593,85 @@ func (p *Policy) addRule(raw rawRule) error {
 			}
 			rule.program = program
 		}
-		p.httpsRules = append(p.httpsRules, rule)
+		if raw.Disabled {
+			return nil
+		}
+		p.httpRules = append(p.httpRules, rule)
 	default:
-		return fmt.Errorf("rule %q references unsupported endpoint kind %q", raw.Name, raw.Endpoints[0].Kind)
+		return fmt.Errorf("rule %q references unsupported endpoint family %q", raw.Name, family)
 	}
 	return nil
+}
+
+func (p *Policy) validateRuleCredential(rule *Rule) error {
+	if rule.Credential == nil {
+		return nil
+	}
+	credential := p.credentials[rule.Credential.String()]
+	if credential == nil {
+		return fmt.Errorf("rule %q references unknown credential %q", rule.Name, rule.Credential.String())
+	}
+	if rule.Family != EndpointFamilyHTTP {
+		return fmt.Errorf("rule %q credential predicates are invalid on ip endpoints", rule.Name)
+	}
+	if credential.Endpoint.Kind != "https" {
+		return fmt.Errorf("rule %q credential predicate must reference an https credential", rule.Name)
+	}
+	for _, endpoint := range rule.Endpoints {
+		if endpoint == credential.Endpoint {
+			return nil
+		}
+	}
+	return fmt.Errorf("rule %q credential %q must bind to a directly referenced endpoint", rule.Name, rule.Credential.String())
 }
 
 func (p *Policy) sortRules() {
-	sort.SliceStable(p.cidrRules, func(i, j int) bool {
-		return p.cidrRules[i].Priority > p.cidrRules[j].Priority
+	sort.SliceStable(p.ipRules, func(i, j int) bool {
+		return p.ipRules[i].Priority > p.ipRules[j].Priority
 	})
-	sort.SliceStable(p.httpsRules, func(i, j int) bool {
-		return p.httpsRules[i].Priority > p.httpsRules[j].Priority
+	sort.SliceStable(p.httpRules, func(i, j int) bool {
+		return p.httpRules[i].Priority > p.httpRules[j].Priority
 	})
 }
 
-func validateEndpointFamily(refs []Ref) error {
+func (p *Policy) validateEndpointFamily(refs []Ref) (EndpointFamily, error) {
 	if len(refs) == 0 {
-		return fmt.Errorf("requires at least one endpoint")
+		return "", fmt.Errorf("requires at least one endpoint")
 	}
-	kind := refs[0].Kind
+	family, err := p.endpointFamily(refs[0])
+	if err != nil {
+		return "", err
+	}
 	for _, ref := range refs[1:] {
-		if ref.Kind != kind {
-			return fmt.Errorf("all endpoints in one rule must have the same kind")
+		otherFamily, err := p.endpointFamily(ref)
+		if err != nil {
+			return "", err
+		}
+		if otherFamily != family {
+			return "", fmt.Errorf("all endpoints in one rule must have the same family")
 		}
 	}
-	return nil
+	return family, nil
+}
+
+func (p *Policy) endpointFamily(ref Ref) (EndpointFamily, error) {
+	switch ref.Kind {
+	case "ip":
+		if _, ok := p.ipEndpoints[ref.String()]; !ok {
+			return "", fmt.Errorf("references unknown endpoint %q", ref.String())
+		}
+		return EndpointFamilyIP, nil
+	case "http":
+		if _, ok := p.httpEndpoints[ref.String()]; !ok {
+			return "", fmt.Errorf("references unknown endpoint %q", ref.String())
+		}
+		return EndpointFamilyHTTP, nil
+	case "https":
+		if _, ok := p.httpsEndpoints[ref.String()]; !ok {
+			return "", fmt.Errorf("references unknown endpoint %q", ref.String())
+		}
+		return EndpointFamilyHTTP, nil
+	default:
+		return "", fmt.Errorf("references unsupported endpoint kind %q", ref.Kind)
+	}
 }

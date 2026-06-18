@@ -8,7 +8,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -23,22 +22,15 @@ import (
 	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/hooks"
 	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/router"
 	"github.com/nickvan/bentobox/net/bento-netd/internal/policy"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/secrets"
 )
 
-func TestHTTPSProxyInterceptsAndInjectsBearerToken(t *testing.T) {
+func TestHTTPSProxyInterceptsAllowedRequest(t *testing.T) {
 	dir := t.TempDir()
 	caCert, caKey, caPool := writeTestCA(t, dir)
-	secretStore := writeHTTPSSecretStore(t, dir, "local-token", "replacement-token")
 	policyPath := filepath.Join(dir, "policy.hcl")
 	if err := os.WriteFile(policyPath, []byte(`
 endpoint "https" "local" {
   hosts = ["localhost"]
-}
-
-credential "bearer_token" "local" {
-  endpoint = https.local
-  secret = "local-token"
 }
 
 rule "local-reads" {
@@ -54,14 +46,14 @@ rule "local-reads" {
 		t.Fatalf("LoadFile returned error: %v", err)
 	}
 	route := router.New(hooks.NewPolicyHook(compiled), nil)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, secretStore)
+	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
 	proxy.upstreamRootCAs = caPool
 
-	authorizationCh := make(chan string, 1)
-	upstreamAddress, stopUpstream := startTLSUpstream(t, caCert, caKey, authorizationCh)
+	requestCh := make(chan *http.Request, 1)
+	upstreamAddress, stopUpstream := startTLSUpstream(t, caCert, caKey, requestCh)
 	defer stopUpstream()
 
 	clientConn, proxyConn := net.Pipe()
@@ -90,7 +82,6 @@ rule "local-reads" {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.Header.Set("Authorization", "Bearer stale-token")
 	if err := request.Write(clientTLS); err != nil {
 		t.Fatalf("write client request: %v", err)
 	}
@@ -111,9 +102,9 @@ rule "local-reads" {
 		t.Fatal("timed out waiting for proxy")
 	}
 	select {
-	case authorization := <-authorizationCh:
-		if authorization != "Bearer replacement-token" {
-			t.Fatalf("expected injected authorization header, got %q", authorization)
+	case upstreamRequest := <-requestCh:
+		if upstreamRequest.URL.Path != "/private" {
+			t.Fatalf("expected upstream request path /private, got %q", upstreamRequest.URL.Path)
 		}
 	default:
 		t.Fatal("upstream did not receive request")
@@ -199,21 +190,7 @@ func TestCertificateForReusesCALimitedCachedCertificate(t *testing.T) {
 	}
 }
 
-func writeHTTPSSecretStore(t *testing.T, dir string, name string, value string) *secrets.FileStore {
-	t.Helper()
-	path := filepath.Join(dir, "secrets.json")
-	body, err := json.MarshalIndent(map[string]secrets.Secret{name: secrets.Plain(value)}, "", "  ")
-	if err != nil {
-		t.Fatalf("encode secret store: %v", err)
-	}
-	body = append(body, '\n')
-	if err := os.WriteFile(path, body, 0o600); err != nil {
-		t.Fatalf("write secret store: %v", err)
-	}
-	return secrets.NewFileStore(path)
-}
-
-func startTLSUpstream(t *testing.T, caCertPath string, caKeyPath string, authorizationCh chan<- string) (string, func()) {
+func startTLSUpstream(t *testing.T, caCertPath string, caKeyPath string, requestCh chan<- *http.Request) (string, func()) {
 	t.Helper()
 	ca, err := loadCertificateAuthority(caCertPath, caKeyPath)
 	if err != nil {
@@ -241,7 +218,7 @@ func startTLSUpstream(t *testing.T, caCertPath string, caKeyPath string, authori
 		if err != nil {
 			return
 		}
-		authorizationCh <- request.Header.Get("Authorization")
+		requestCh <- request
 		_, _ = io.Copy(io.Discard, request.Body)
 		_ = request.Body.Close()
 		_, _ = fmt.Fprint(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
