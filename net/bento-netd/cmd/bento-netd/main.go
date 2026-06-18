@@ -57,11 +57,12 @@ func run(args []string) error {
 	if cfg.SecretStore != "" {
 		secretStore = secrets.NewFileStore(cfg.SecretStore)
 	}
+	httpProxy := forwarder.NewHTTPProxy(route)
 	httpsProxy, err := forwarder.NewHTTPSProxy(route, cfg.TLS.CACert, cfg.TLS.CAKey, secretStore)
 	if err != nil {
 		return err
 	}
-	vn, err := virtualnetwork.New(&cfg.Stack, route, httpsProxy, virtualnetwork.Metadata{
+	vn, err := virtualnetwork.New(&cfg.Stack, route, httpProxy, httpsProxy, virtualnetwork.Metadata{
 		VMID:      cfg.Metadata.VMID,
 		NetworkID: cfg.Metadata.NetworkID,
 	})

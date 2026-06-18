@@ -24,7 +24,7 @@ type TCPMetadata struct {
 	NetworkID string
 }
 
-func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, route *router.Router, httpsProxy *HTTPSProxy, metadata TCPMetadata) *tcp.Forwarder {
+func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, route *router.Router, httpProxy *HTTPProxy, httpsProxy *HTTPSProxy, metadata TCPMetadata) *tcp.Forwarder {
 	return tcp.NewForwarder(s, 0, 10, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		localAddress := id.LocalAddress
@@ -69,8 +69,14 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 		}
 		inbound := gonet.NewTCPConn(&wq, ep)
 		target := net.JoinHostPort(localAddress.String(), fmt.Sprint(id.LocalPort))
+		if httpProxy != nil && httpProxy.ShouldHandle(id.LocalPort) {
+			if err := httpProxy.Handle(context.Background(), inbound, flow, target); err != nil {
+				slog.Debug("http proxy failed", "error", err, "target", target)
+			}
+			return
+		}
 		if httpsProxy != nil && httpsProxy.ShouldHandle(id.LocalPort) {
-			if err := httpsProxy.Handle(context.Background(), inbound, flow, target); err != nil {
+			if err := httpsProxy.Handle(context.Background(), inbound, flow, target, decision); err != nil {
 				slog.Debug("https proxy failed", "error", err, "target", target)
 			}
 			return

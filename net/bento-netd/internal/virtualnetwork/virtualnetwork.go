@@ -43,7 +43,7 @@ type VirtualNetwork struct {
 	ipPool        *tap.IPPool
 }
 
-func New(configuration *types.Configuration, route *router.Router, httpsProxy *forwarder.HTTPSProxy, metadata Metadata) (*VirtualNetwork, error) {
+func New(configuration *types.Configuration, route *router.Router, httpProxy *forwarder.HTTPProxy, httpsProxy *forwarder.HTTPSProxy, metadata Metadata) (*VirtualNetwork, error) {
 	_, subnet, err := net.ParseCIDR(configuration.Subnet)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse subnet cidr: %w", err)
@@ -85,7 +85,7 @@ func New(configuration *types.Configuration, route *router.Router, httpsProxy *f
 		return nil, fmt.Errorf("cannot create network stack: %w", err)
 	}
 
-	mux, err := addServices(configuration, stack, ipPool, route, httpsProxy, metadata)
+	mux, err := addServices(configuration, stack, ipPool, route, httpProxy, httpsProxy, metadata)
 	if err != nil {
 		return nil, fmt.Errorf("cannot add network services: %w", err)
 	}
@@ -97,11 +97,11 @@ func (n *VirtualNetwork) AcceptVfkit(ctx context.Context, conn net.Conn) error {
 	return n.networkSwitch.Accept(ctx, conn, types.VfkitProtocol)
 }
 
-func addServices(configuration *types.Configuration, s *stack.Stack, ipPool *tap.IPPool, route *router.Router, httpsProxy *forwarder.HTTPSProxy, metadata Metadata) (http.Handler, error) {
+func addServices(configuration *types.Configuration, s *stack.Stack, ipPool *tap.IPPool, route *router.Router, httpProxy *forwarder.HTTPProxy, httpsProxy *forwarder.HTTPSProxy, metadata Metadata) (http.Handler, error) {
 	var natLock sync.Mutex
 	translation := parseNATTable(configuration)
 
-	tcpForwarder := forwarder.TCP(s, translation, &natLock, configuration.Ec2MetadataAccess, route, httpsProxy, forwarder.TCPMetadata(metadata))
+	tcpForwarder := forwarder.TCP(s, translation, &natLock, configuration.Ec2MetadataAccess, route, httpProxy, httpsProxy, forwarder.TCPMetadata(metadata))
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 	udpForwarder := forwarder.UDP(s, translation, &natLock, configuration.Ec2MetadataAccess, route, forwarder.TCPMetadata(metadata))
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)

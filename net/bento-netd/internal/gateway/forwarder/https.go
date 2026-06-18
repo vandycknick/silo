@@ -54,12 +54,37 @@ func (p *HTTPSProxy) ShouldHandle(port uint16) bool {
 	return p != nil && p.route.HasHTTPS() && port == httpsPort
 }
 
-func (p *HTTPSProxy) Handle(ctx context.Context, inbound net.Conn, flow hooks.Flow, target string) error {
+func (p *HTTPSProxy) Handle(ctx context.Context, inbound net.Conn, flow hooks.Flow, target string, flowDecision hooks.RouteDecision) error {
 	sni, replayed, err := peekClientHello(inbound)
-	if err != nil || !p.route.MatchHTTPSHost(sni) {
-		return p.proxyDirect(replayed, target)
+	if err != nil {
+		if flowAllowsRawFallback(flowDecision) {
+			return p.proxyDirect(replayed, target)
+		}
+		_ = replayed.Close()
+		return err
 	}
-	return p.proxyHTTPS(ctx, replayed, flow, target, sni)
+	_, endpointName, ok := p.route.ResolveHTTPHost("https", sni)
+	if !ok {
+		if flowAllowsRawFallback(flowDecision) {
+			return p.proxyDirect(replayed, target)
+		}
+		_ = replayed.Close()
+		return fmt.Errorf("https sni %q does not match a policy endpoint", sni)
+	}
+	return p.proxyHTTPS(ctx, replayed, flow, target, sni, endpointName)
+}
+
+func flowAllowsRawFallback(decision hooks.RouteDecision) bool {
+	if decision.Action == hooks.RouteAllowDirect {
+		return true
+	}
+	if decision.Action != hooks.RouteClassify {
+		return false
+	}
+	if decision.Source == "rule" {
+		return true
+	}
+	return decision.DefaultAction == "allow"
 }
 
 func (p *HTTPSProxy) proxyDirect(inbound net.Conn, target string) error {
@@ -72,7 +97,7 @@ func (p *HTTPSProxy) proxyDirect(inbound net.Conn, target string) error {
 	return nil
 }
 
-func (p *HTTPSProxy) proxyHTTPS(ctx context.Context, inbound net.Conn, flow hooks.Flow, target string, serverName string) error {
+func (p *HTTPSProxy) proxyHTTPS(ctx context.Context, inbound net.Conn, flow hooks.Flow, target string, serverName string, endpointName string) error {
 	serverTLS := tls.Server(inbound, &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		NextProtos: []string{"http/1.1"},
@@ -88,26 +113,13 @@ func (p *HTTPSProxy) proxyHTTPS(ctx context.Context, inbound net.Conn, flow hook
 		_ = serverTLS.Close()
 		return err
 	}
-
-	upstreamTLS, err := tls.DialWithDialer(&net.Dialer{}, "tcp", target, &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"http/1.1"},
-		RootCAs:    p.upstreamRootCAs,
-		ServerName: serverName,
-	})
-	if err != nil {
-		_ = serverTLS.Close()
-		return err
-	}
-	return p.proxyHTTP(ctx, serverTLS, upstreamTLS, flow, serverName)
+	return p.proxyHTTP(ctx, serverTLS, flow, target, serverName, endpointName)
 }
 
-func (p *HTTPSProxy) proxyHTTP(ctx context.Context, client *tls.Conn, upstream *tls.Conn, flow hooks.Flow, serverName string) error {
+func (p *HTTPSProxy) proxyHTTP(ctx context.Context, client *tls.Conn, flow hooks.Flow, target string, serverName string, endpointName string) error {
 	defer client.Close()
-	defer upstream.Close()
 
 	clientReader := bufio.NewReader(client)
-	upstreamReader := bufio.NewReader(upstream)
 	for {
 		req, err := http.ReadRequest(clientReader)
 		if errors.Is(err, io.EOF) {
@@ -116,21 +128,24 @@ func (p *HTTPSProxy) proxyHTTP(ctx context.Context, client *tls.Conn, upstream *
 		if err != nil {
 			return err
 		}
+		if req.Host == "" {
+			_ = req.Body.Close()
+			return writeHTTPStatus(client, http.StatusBadRequest, "missing_host")
+		}
+		_, hostEndpointName, ok := p.route.ResolveHTTPHost("https", req.Host)
+		if !ok || hostEndpointName != endpointName {
+			_ = req.Body.Close()
+			return writeHTTPStatus(client, http.StatusMisdirectedRequest, "host_mismatch")
+		}
 
-		host := req.Host
-		if host == "" {
-			host = serverName
-		}
-		policyHost := host
-		if !p.route.MatchHTTPSHost(policyHost) {
-			policyHost = serverName
-		}
 		decision, err := p.route.DecideHTTP(ctx, hooks.HTTPRequest{
-			Flow:   flow,
-			Host:   policyHost,
-			Method: req.Method,
-			Path:   req.URL.RequestURI(),
-			Header: req.Header.Clone(),
+			Flow:         flow,
+			EndpointKind: "https",
+			Host:         req.Host,
+			Method:       req.Method,
+			Path:         requestPath(req),
+			Query:        req.URL.RawQuery,
+			Header:       req.Header.Clone(),
 		})
 		if err != nil {
 			_ = req.Body.Close()
@@ -140,45 +155,50 @@ func (p *HTTPSProxy) proxyHTTP(ctx context.Context, client *tls.Conn, upstream *
 			_ = req.Body.Close()
 			return writeDeny(client, decision.Reason)
 		}
-		if err := p.credentialManager.Apply(ctx, req, decision.Credential); err != nil {
-			_ = req.Body.Close()
-			return err
-		}
 
-		req.RequestURI = ""
-		if req.URL.Scheme == "" {
-			req.URL.Scheme = "https"
-		}
-		if req.URL.Host == "" {
-			req.URL.Host = host
-		}
-		if err := req.Write(upstream); err != nil {
-			_ = req.Body.Close()
-			return err
-		}
-
-		resp, err := http.ReadResponse(upstreamReader, req)
+		upstream, err := tls.DialWithDialer(&net.Dialer{}, "tcp", target, &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			NextProtos: []string{"http/1.1"},
+			RootCAs:    p.upstreamRootCAs,
+			ServerName: serverName,
+		})
 		if err != nil {
+			_ = req.Body.Close()
+			return writeHTTPStatus(client, http.StatusBadGateway, "upstream_error")
+		}
+		if err := p.proxyHTTPSRequest(ctx, client, upstream, req, decision, serverName); err != nil {
 			return err
 		}
-		closeAfterResponse := req.Close || resp.Close
-		if err := resp.Write(client); err != nil {
-			_ = resp.Body.Close()
-			return err
-		}
-		_ = resp.Body.Close()
-		if closeAfterResponse {
+		if req.Close {
 			return nil
 		}
 	}
 }
 
-func writeDeny(conn net.Conn, reason string) error {
-	if reason == "" {
-		reason = "request denied by network policy"
+func (p *HTTPSProxy) proxyHTTPSRequest(ctx context.Context, client net.Conn, upstream *tls.Conn, req *http.Request, decision hooks.RouteDecision, serverName string) error {
+	defer upstream.Close()
+	upstreamReader := bufio.NewReader(upstream)
+	if err := p.credentialManager.Apply(ctx, req, decision.Credential); err != nil {
+		_ = req.Body.Close()
+		return writeHTTPStatus(client, http.StatusBadGateway, "credential_error")
 	}
-	_, err := fmt.Fprintf(conn, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s", len(reason), reason)
-	return err
+
+	prepareForwardRequest(req, "https", serverName)
+	if err := req.Write(upstream); err != nil {
+		_ = req.Body.Close()
+		return err
+	}
+
+	resp, err := http.ReadResponse(upstreamReader, req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	resp.Header.Del("Alt-Svc")
+	if err := resp.Write(client); err != nil {
+		return err
+	}
+	return nil
 }
 
 type replayConn struct {

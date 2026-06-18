@@ -36,6 +36,11 @@ func (h *PolicyHook) MatchHTTPHost(host string) bool {
 	return h.policy.MatchHTTPHost(host)
 }
 
+func (h *PolicyHook) ResolveHTTPHost(kind string, host string) (string, string, bool) {
+	ref, _, ok := h.policy.MatchHTTPFamilyHost(kind, host)
+	return ref.Kind, ref.Name, ok
+}
+
 func (h *PolicyHook) HasHTTPS() bool {
 	return h.policy.HasHTTPS()
 }

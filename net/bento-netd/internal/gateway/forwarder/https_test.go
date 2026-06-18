@@ -66,7 +66,7 @@ rule "local-reads" {
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- proxy.Handle(context.Background(), proxyConn, flow, upstreamAddress)
+		done <- proxy.Handle(context.Background(), proxyConn, flow, upstreamAddress, routeDecision(t, route, flow))
 	}()
 
 	clientTLS := tls.Client(clientConn, &tls.Config{
@@ -93,14 +93,7 @@ rule "local-reads" {
 	_ = response.Body.Close()
 	_ = clientTLS.Close()
 
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("proxy returned error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for proxy")
-	}
+	waitForProxy(t, done)
 	select {
 	case upstreamRequest := <-requestCh:
 		if upstreamRequest.URL.Path != "/private" {
@@ -109,6 +102,177 @@ rule "local-reads" {
 	default:
 		t.Fatal("upstream did not receive request")
 	}
+}
+
+func TestHTTPSProxyDefaultDenyDoesNotContactUpstreamBeforeRequestAllow(t *testing.T) {
+	dir := t.TempDir()
+	caCert, caKey, caPool := writeTestCA(t, dir)
+	route := testRoute(t, `
+settings {
+  default_action = "deny"
+}
+
+endpoint "https" "local" {
+  hosts = ["localhost"]
+}
+`)
+	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	if err != nil {
+		t.Fatalf("NewHTTPSProxy returned error: %v", err)
+	}
+	proxy.upstreamRootCAs = caPool
+
+	requestCh := make(chan *http.Request, 1)
+	upstreamAddress, stopUpstream, acceptedCh := startObservedTLSUpstream(t, caCert, caKey, requestCh)
+	defer stopUpstream()
+
+	clientConn, proxyConn := net.Pipe()
+	flow := hooks.Flow{
+		Protocol:   "tcp",
+		SourceIP:   net.ParseIP("192.168.127.2"),
+		SourcePort: 53100,
+		DestIP:     net.ParseIP("127.0.0.1"),
+		DestPort:   443,
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- proxy.Handle(context.Background(), proxyConn, flow, upstreamAddress, routeDecision(t, route, flow))
+	}()
+
+	clientTLS := tls.Client(clientConn, &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+		RootCAs:    caPool,
+		ServerName: "localhost",
+	})
+	if err := clientTLS.Handshake(); err != nil {
+		t.Fatalf("client handshake failed: %v", err)
+	}
+	request, err := http.NewRequest(http.MethodGet, "https://localhost/private", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := request.Write(clientTLS); err != nil {
+		t.Fatalf("write client request: %v", err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(clientTLS), request)
+	if err != nil {
+		t.Fatalf("read client response: %v", err)
+	}
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", response.StatusCode)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	_ = clientTLS.Close()
+	waitForProxy(t, done)
+	assertNoUpstreamAccept(t, acceptedCh)
+}
+
+func TestHTTPSProxyRejectsHostMismatchWithoutUpstreamContact(t *testing.T) {
+	dir := t.TempDir()
+	caCert, caKey, caPool := writeTestCA(t, dir)
+	route := testRoute(t, `
+endpoint "https" "local" {
+  hosts = ["localhost"]
+}
+
+rule "allow-local" {
+  endpoint = https.local
+  verdict = "allow"
+}
+`)
+	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	if err != nil {
+		t.Fatalf("NewHTTPSProxy returned error: %v", err)
+	}
+	proxy.upstreamRootCAs = caPool
+
+	requestCh := make(chan *http.Request, 1)
+	upstreamAddress, stopUpstream, acceptedCh := startObservedTLSUpstream(t, caCert, caKey, requestCh)
+	defer stopUpstream()
+
+	clientConn, proxyConn := net.Pipe()
+	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 53100, DestIP: net.ParseIP("127.0.0.1"), DestPort: 443}
+	done := make(chan error, 1)
+	go func() {
+		done <- proxy.Handle(context.Background(), proxyConn, flow, upstreamAddress, routeDecision(t, route, flow))
+	}()
+
+	clientTLS := tls.Client(clientConn, &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}, RootCAs: caPool, ServerName: "localhost"})
+	if err := clientTLS.Handshake(); err != nil {
+		t.Fatalf("client handshake failed: %v", err)
+	}
+	request, err := http.NewRequest(http.MethodGet, "https://other.local/private", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := request.Write(clientTLS); err != nil {
+		t.Fatalf("write client request: %v", err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(clientTLS), request)
+	if err != nil {
+		t.Fatalf("read client response: %v", err)
+	}
+	if response.StatusCode != http.StatusMisdirectedRequest {
+		t.Fatalf("expected 421, got %d", response.StatusCode)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	_ = clientTLS.Close()
+	waitForProxy(t, done)
+	assertNoUpstreamAccept(t, acceptedCh)
+}
+
+func TestHTTPSProxyRejectsMissingHostWithoutUpstreamContact(t *testing.T) {
+	dir := t.TempDir()
+	caCert, caKey, caPool := writeTestCA(t, dir)
+	route := testRoute(t, `
+endpoint "https" "local" {
+  hosts = ["localhost"]
+}
+
+rule "allow-local" {
+  endpoint = https.local
+  verdict = "allow"
+}
+`)
+	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	if err != nil {
+		t.Fatalf("NewHTTPSProxy returned error: %v", err)
+	}
+	proxy.upstreamRootCAs = caPool
+
+	requestCh := make(chan *http.Request, 1)
+	upstreamAddress, stopUpstream, acceptedCh := startObservedTLSUpstream(t, caCert, caKey, requestCh)
+	defer stopUpstream()
+
+	clientConn, proxyConn := net.Pipe()
+	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 53100, DestIP: net.ParseIP("127.0.0.1"), DestPort: 443}
+	done := make(chan error, 1)
+	go func() {
+		done <- proxy.Handle(context.Background(), proxyConn, flow, upstreamAddress, routeDecision(t, route, flow))
+	}()
+
+	clientTLS := tls.Client(clientConn, &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}, RootCAs: caPool, ServerName: "localhost"})
+	if err := clientTLS.Handshake(); err != nil {
+		t.Fatalf("client handshake failed: %v", err)
+	}
+	if _, err := fmt.Fprint(clientTLS, "GET /private HTTP/1.1\r\n\r\n"); err != nil {
+		t.Fatalf("write raw client request: %v", err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(clientTLS), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("read client response: %v", err)
+	}
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", response.StatusCode)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	_ = clientTLS.Close()
+	waitForProxy(t, done)
+	assertNoUpstreamAccept(t, acceptedCh)
 }
 
 func TestCertificateForReusesFreshCachedCertificate(t *testing.T) {
@@ -191,6 +355,11 @@ func TestCertificateForReusesCALimitedCachedCertificate(t *testing.T) {
 }
 
 func startTLSUpstream(t *testing.T, caCertPath string, caKeyPath string, requestCh chan<- *http.Request) (string, func()) {
+	address, stop, _ := startObservedTLSUpstream(t, caCertPath, caKeyPath, requestCh)
+	return address, stop
+}
+
+func startObservedTLSUpstream(t *testing.T, caCertPath string, caKeyPath string, requestCh chan<- *http.Request) (string, func(), <-chan struct{}) {
 	t.Helper()
 	ca, err := loadCertificateAuthority(caCertPath, caKeyPath)
 	if err != nil {
@@ -208,10 +377,15 @@ func startTLSUpstream(t *testing.T, caCertPath string, caKeyPath string, request
 	if err != nil {
 		t.Fatalf("tls listen: %v", err)
 	}
+	acceptedCh := make(chan struct{}, 1)
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
 			return
+		}
+		select {
+		case acceptedCh <- struct{}{}:
+		default:
 		}
 		defer conn.Close()
 		request, err := http.ReadRequest(bufio.NewReader(conn))
@@ -223,7 +397,16 @@ func startTLSUpstream(t *testing.T, caCertPath string, caKeyPath string, request
 		_ = request.Body.Close()
 		_, _ = fmt.Fprint(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
 	}()
-	return listener.Addr().String(), func() { _ = listener.Close() }
+	return listener.Addr().String(), func() { _ = listener.Close() }, acceptedCh
+}
+
+func routeDecision(t *testing.T, route *router.Router, flow hooks.Flow) hooks.RouteDecision {
+	t.Helper()
+	decision, err := route.Decide(context.Background(), flow)
+	if err != nil {
+		t.Fatalf("Decide returned error: %v", err)
+	}
+	return decision
 }
 
 func writeTestCA(t *testing.T, dir string) (string, string, *x509.CertPool) {
