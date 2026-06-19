@@ -3,10 +3,10 @@ package policy
 import (
 	"fmt"
 	"strings"
-	"unicode"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/gohcl"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/zclconf/go-cty/cty"
 )
 
@@ -135,7 +135,7 @@ func refFromTraversal(traversal hcl.Traversal) (Ref, error) {
 	if !ok {
 		return Ref{}, fmt.Errorf("expected reference attribute")
 	}
-	if !validTraversalIdentifier(root.Name) || !validTraversalIdentifier(attr.Name) {
+	if !hclsyntax.ValidIdentifier(root.Name) || !hclsyntax.ValidIdentifier(attr.Name) {
 		return Ref{}, fmt.Errorf("reference %q must use traversal identifiers", root.Name+"."+attr.Name)
 	}
 	return Ref{Kind: root.Name, Name: attr.Name}, nil
@@ -159,23 +159,4 @@ func parseRuleAction(value string) (Action, error) {
 	default:
 		return "", fmt.Errorf("invalid verdict %q, expected allow or deny", value)
 	}
-}
-
-func validTraversalIdentifier(value string) bool {
-	if value == "" {
-		return false
-	}
-	for index, r := range value {
-		if index == 0 {
-			if r == '_' || unicode.IsLetter(r) {
-				continue
-			}
-			return false
-		}
-		if r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r) {
-			continue
-		}
-		return false
-	}
-	return true
 }

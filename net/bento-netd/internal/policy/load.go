@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/gohcl"
 	"github.com/hashicorp/hcl/v2/hclparse"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 )
 
 func LoadFile(path string) (*Policy, error) {
@@ -228,7 +229,7 @@ func parseSize(value string) (int64, error) {
 func decodeEndpoint(policy *Policy, block *hcl.Block) error {
 	kind := block.Labels[0]
 	name := block.Labels[1]
-	if !validTraversalIdentifier(name) {
+	if !hclsyntax.ValidIdentifier(name) {
 		return fmt.Errorf("endpoint %q.%q name must use a traversal identifier", kind, name)
 	}
 	ref := Ref{Kind: kind, Name: name}
@@ -420,7 +421,7 @@ func decodeCredential(block *hcl.Block) (rawCredential, error) {
 	if diagnostics.HasErrors() {
 		return rawCredential{}, fmt.Errorf("decode credential %q.%q: %s", block.Labels[0], block.Labels[1], diagnostics.Error())
 	}
-	if !validTraversalIdentifier(block.Labels[1]) {
+	if !hclsyntax.ValidIdentifier(block.Labels[1]) {
 		return rawCredential{}, fmt.Errorf("credential %q.%q name must use a traversal identifier", block.Labels[0], block.Labels[1])
 	}
 	endpointAttr, ok := content.Attributes["endpoint"]

@@ -151,6 +151,39 @@ rule "http-family-read" {
 	}
 }
 
+func TestReferencesAllowHCLIdentifiersWithDashes(t *testing.T) {
+	compiled := loadPolicy(t, `
+settings {
+  default_action = "deny"
+}
+
+endpoint "https" "openai-codex" {
+  hosts = ["chatgpt.com"]
+}
+
+credential "bearer_token" "api-token" {
+  endpoint = https.openai-codex
+}
+
+rule "allow-codex" {
+  endpoint = https.openai-codex
+  credential = bearer_token.api-token
+  verdict = "allow"
+}
+`)
+
+	decision := compiled.EvaluateHTTP(HTTPRequest{EndpointKind: "https", Host: "chatgpt.com", Method: http.MethodGet})
+	if decision.Action != ActionAllow || decision.RuleName != "allow-codex" {
+		t.Fatalf("expected dashed endpoint reference to allow, got %#v", decision)
+	}
+	if decision.EndpointName != "openai-codex" {
+		t.Fatalf("expected dashed endpoint name, got %q", decision.EndpointName)
+	}
+	if decision.SelectedCredential == nil || decision.SelectedCredential.Name != "api-token" {
+		t.Fatalf("expected dashed credential name, got %#v", decision.SelectedCredential)
+	}
+}
+
 func TestMixedEndpointFamiliesAreRejected(t *testing.T) {
 	_, err := loadPolicyError(t, `
 endpoint "ip" "private" {
