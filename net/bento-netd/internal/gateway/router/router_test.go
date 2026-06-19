@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/audit"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/hooks"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/policy"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/audit"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/hooks"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy"
 )
 
 func TestDecideWritesFlowAuditRecord(t *testing.T) {

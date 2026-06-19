@@ -13,7 +13,7 @@ import (
 	"strings"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/policy"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy"
 )
 
 type uint16Flags []uint16

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nickvan/bentobox/net/bento-netd/internal/policy"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy"
 )
 
 func TestLogPolicyWarningsUsesServiceLogger(t *testing.T) {

@@ -9,8 +9,8 @@ import (
 	"time"
 
 	upstreamForwarder "github.com/containers/gvisor-tap-vsock/pkg/services/forwarder"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/hooks"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/router"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/hooks"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/router"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"

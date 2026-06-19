@@ -9,8 +9,8 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/hooks"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/router"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/hooks"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/router"
 )
 
 const httpPort uint16 = 80

@@ -19,9 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/hooks"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/router"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/policy"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/hooks"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/router"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy"
 )
 
 func TestHTTPSProxyInterceptsAllowedRequest(t *testing.T) {

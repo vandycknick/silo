@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/hooks"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/secrets"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/hooks"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/secrets"
 )
 
 const (

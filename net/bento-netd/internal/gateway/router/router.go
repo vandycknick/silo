@@ -4,8 +4,8 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/audit"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/hooks"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/audit"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/hooks"
 )
 
 type Router struct {

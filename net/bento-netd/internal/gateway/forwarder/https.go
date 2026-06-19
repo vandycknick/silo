@@ -21,10 +21,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nickvan/bentobox/net/bento-netd/internal/credentials"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/hooks"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/router"
-	"github.com/nickvan/bentobox/net/bento-netd/internal/secrets"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/credentials"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/hooks"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/router"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/secrets"
 )
 
 const (

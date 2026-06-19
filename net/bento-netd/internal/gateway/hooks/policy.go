@@ -3,7 +3,7 @@ package hooks
 import (
 	"context"
 
-	"github.com/nickvan/bentobox/net/bento-netd/internal/policy"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy"
 )
 
 type PolicyHook struct {

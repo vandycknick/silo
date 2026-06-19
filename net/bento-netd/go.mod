@@ -1,4 +1,4 @@
-module github.com/nickvan/bentobox/net/bento-netd
+module github.com/vandycknick/bentobox/net/bento-netd
 
 go 1.25.5
 
@@ -8,6 +8,7 @@ require (
 	github.com/hashicorp/hcl/v2 v2.24.0
 	github.com/inetaf/tcpproxy v0.0.0-20250222171855-c4b9df066048
 	github.com/sirupsen/logrus v1.9.4
+	github.com/zclconf/go-cty v1.16.3
 	golang.org/x/sync v0.20.0
 	gvisor.dev/gvisor v0.0.0-20260413194555-9680d69bf798
 )
@@ -31,7 +32,6 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.14 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
-	github.com/zclconf/go-cty v1.16.3 // indirect
 	golang.org/x/crypto v0.51.0 // indirect
 	golang.org/x/exp v0.0.0-20240823005443-9b4947da3948 // indirect
 	golang.org/x/mod v0.36.0 // indirect

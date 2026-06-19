@@ -3,7 +3,7 @@ package forwarder
 import (
 	"log/slog"
 
-	"github.com/nickvan/bentobox/net/bento-netd/internal/gateway/hooks"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/hooks"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
