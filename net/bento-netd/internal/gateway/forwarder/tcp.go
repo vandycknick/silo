@@ -69,7 +69,7 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 		}
 		inbound := gonet.NewTCPConn(&wq, ep)
 		target := net.JoinHostPort(localAddress.String(), fmt.Sprint(id.LocalPort))
-		if httpProxy != nil && httpProxy.ShouldHandle(id.LocalPort) {
+		if httpProxy != nil && httpProxy.ShouldHandle(flow, decision) {
 			if err := httpProxy.Handle(context.Background(), inbound, flow, target); err != nil {
 				slog.Debug("http proxy failed", "error", err, "target", target)
 			}

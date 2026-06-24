@@ -134,14 +134,24 @@ rule "allow-api" {
 	}
 }
 
-func TestRouterExposesHTTPSPortAndRawIPResolution(t *testing.T) {
+func TestRouterExposesHTTPAndHTTPSPortResolution(t *testing.T) {
 	compiled := loadRouterPolicy(t, `
+endpoint "http" "metadata" {
+  hosts = ["metadata.internal:8080"]
+}
+
 endpoint "https" "proxmox" {
   hosts = ["203.0.113.10:8006"]
 }
 `)
 	route := New(hooks.NewPolicyHook(compiled), nil)
 
+	if !route.ShouldInterceptHTTP(8080) {
+		t.Fatal("expected route to intercept configured http port 8080")
+	}
+	if route.ShouldInterceptHTTP(80) {
+		t.Fatal("did not expect route to intercept unconfigured http port 80")
+	}
 	if !route.ShouldInterceptHTTPS(8006) {
 		t.Fatal("expected route to intercept configured https port 8006")
 	}

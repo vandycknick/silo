@@ -8,6 +8,7 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/gohcl"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy/hostmatch"
 	"github.com/zclconf/go-cty/cty"
 )
 
@@ -110,11 +111,11 @@ func parsePortRange(value string) (PortRange, error) {
 	if !ok || strings.Contains(endText, "-") {
 		return PortRange{}, fmt.Errorf("invalid port range %q", value)
 	}
-	start, err := parsePort(strings.TrimSpace(startText))
+	start, err := hostmatch.ParsePort(strings.TrimSpace(startText))
 	if err != nil {
 		return PortRange{}, err
 	}
-	end, err := parsePort(strings.TrimSpace(endText))
+	end, err := hostmatch.ParsePort(strings.TrimSpace(endText))
 	if err != nil {
 		return PortRange{}, err
 	}

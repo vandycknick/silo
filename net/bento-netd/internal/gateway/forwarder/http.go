@@ -13,8 +13,6 @@ import (
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/router"
 )
 
-const httpPort uint16 = 80
-
 type HTTPProxy struct {
 	route *router.Router
 }
@@ -26,8 +24,8 @@ func NewHTTPProxy(route *router.Router) *HTTPProxy {
 	return &HTTPProxy{route: route}
 }
 
-func (p *HTTPProxy) ShouldHandle(port uint16) bool {
-	return p != nil && p.route.HasHTTP() && port == httpPort
+func (p *HTTPProxy) ShouldHandle(flow hooks.Flow, decision hooks.RouteDecision) bool {
+	return p != nil && decision.Action == hooks.RouteClassify && p.route.ShouldInterceptHTTP(flow.DestPort)
 }
 
 func (p *HTTPProxy) Handle(ctx context.Context, inbound net.Conn, flow hooks.Flow, target string) error {
@@ -62,6 +60,9 @@ func (p *HTTPProxy) Handle(ctx context.Context, inbound net.Conn, flow hooks.Flo
 		}
 		if decision.Action == hooks.RouteDeny {
 			_ = req.Body.Close()
+			if decision.Reason == "missing_host" {
+				return writeHTTPStatus(inbound, http.StatusBadRequest, decision.Reason)
+			}
 			return writeDeny(inbound, decision.Reason)
 		}
 

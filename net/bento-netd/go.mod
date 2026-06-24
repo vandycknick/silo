@@ -9,6 +9,7 @@ require (
 	github.com/inetaf/tcpproxy v0.0.0-20250222171855-c4b9df066048
 	github.com/sirupsen/logrus v1.9.4
 	github.com/zclconf/go-cty v1.16.3
+	golang.org/x/net v0.54.0
 	golang.org/x/sync v0.20.0
 	gvisor.dev/gvisor v0.0.0-20260413194555-9680d69bf798
 )
@@ -35,7 +36,6 @@ require (
 	golang.org/x/crypto v0.51.0 // indirect
 	golang.org/x/exp v0.0.0-20240823005443-9b4947da3948 // indirect
 	golang.org/x/mod v0.36.0 // indirect
-	golang.org/x/net v0.54.0 // indirect
 	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.12.0 // indirect

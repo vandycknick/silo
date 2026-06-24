@@ -151,6 +151,241 @@ rule "http-family-read" {
 	}
 }
 
+func TestHTTPHostBindingsMatchADRNormalization(t *testing.T) {
+	compiled := loadPolicy(t, `
+endpoint "http" "exact" {
+  hosts = ["Example.COM", "api.example.com:8080", "192.0.2.10", "[2001:db8::1]"]
+}
+
+endpoint "http" "wildcard" {
+  hosts = ["*.example.com", "*.wild.test"]
+}
+
+endpoint "http" "nested" {
+  hosts = ["*.svc.example.com"]
+}
+`)
+
+	tests := []struct {
+		host     string
+		endpoint string
+	}{
+		{host: "EXAMPLE.com", endpoint: "exact"},
+		{host: "example.com:80", endpoint: "exact"},
+		{host: "api.example.com:8080", endpoint: "exact"},
+		{host: "api.example.com", endpoint: "wildcard"},
+		{host: "192.0.2.10", endpoint: "exact"},
+		{host: "192.0.2.10:80", endpoint: "exact"},
+		{host: "[2001:DB8::1]", endpoint: "exact"},
+		{host: "[2001:db8::1]:80", endpoint: "exact"},
+		{host: "one.wild.test", endpoint: "wildcard"},
+		{host: "svc.example.com", endpoint: "wildcard"},
+		{host: "service.svc.example.com", endpoint: "nested"},
+		{host: "deep.service.svc.example.com", endpoint: "nested"},
+	}
+	for _, test := range tests {
+		t.Run(test.host, func(t *testing.T) {
+			ref, endpoint, ok := compiled.MatchHTTPFamilyHost("http", test.host)
+			if !ok || ref.Kind != "http" || ref.Name != test.endpoint || endpoint.Name != test.endpoint {
+				t.Fatalf("MatchHTTPFamilyHost(%q) = (%#v, %#v, %v), want http.%s", test.host, ref, endpoint, ok, test.endpoint)
+			}
+		})
+	}
+
+	for _, host := range []string{"wild.test", "api.example.com:9090", "2001:db8::1"} {
+		t.Run("miss "+host, func(t *testing.T) {
+			if ref, _, ok := compiled.MatchHTTPFamilyHost("http", host); ok {
+				t.Fatalf("expected %q not to match, got %#v", host, ref)
+			}
+		})
+	}
+}
+
+func TestHTTPSHostBindingsMatchWildcards(t *testing.T) {
+	compiled := loadPolicy(t, `
+endpoint "https" "generic" {
+  hosts = ["*.example.com"]
+}
+
+endpoint "https" "service" {
+  hosts = ["*.svc.example.com"]
+}
+`)
+
+	tests := []struct {
+		host      string
+		endpoint  string
+		authority string
+		certHost  string
+	}{
+		{host: "api.example.com", endpoint: "generic", authority: "api.example.com", certHost: "api.example.com"},
+		{host: "deep.api.example.com", endpoint: "generic", authority: "deep.api.example.com", certHost: "deep.api.example.com"},
+		{host: "API.SVC.EXAMPLE.COM", endpoint: "service", authority: "api.svc.example.com", certHost: "api.svc.example.com"},
+	}
+	for _, test := range tests {
+		t.Run(test.host, func(t *testing.T) {
+			ref, authority, certHost, ok := compiled.ResolveHTTPSHost(test.host, 443)
+			if !ok || ref.Kind != "https" || ref.Name != test.endpoint || authority != test.authority || certHost != test.certHost {
+				t.Fatalf("ResolveHTTPSHost(%q) = (%#v, %q, %q, %v), want https.%s %q %q true", test.host, ref, authority, certHost, ok, test.endpoint, test.authority, test.certHost)
+			}
+		})
+	}
+
+	if ref, _, _, ok := compiled.ResolveHTTPSHost("example.com", 443); ok {
+		t.Fatalf("wildcard must not match apex host, got %#v", ref)
+	}
+	if ref, _, _, ok := compiled.ResolveHTTPSHost("api.example.com", 8443); ok {
+		t.Fatalf("wildcard must not match wrong port, got %#v", ref)
+	}
+}
+
+func TestHTTPClassificationUsesConfiguredEndpointPorts(t *testing.T) {
+	compiled := loadPolicy(t, `
+settings {
+  default_action = "deny"
+}
+
+endpoint "http" "metadata" {
+  hosts = ["metadata.internal:8080"]
+}
+`)
+
+	if !compiled.ShouldInterceptHTTP(8080) {
+		t.Fatal("expected explicitly configured http port 8080 to be intercepted")
+	}
+	if compiled.ShouldInterceptHTTP(80) {
+		t.Fatal("did not expect port 80 interception without a port 80 http binding")
+	}
+
+	decision := compiled.EvaluateFlow(Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), DestIP: net.ParseIP("169.254.169.254"), DestPort: 8080})
+	if decision.Action != ActionDeny || decision.Source != DecisionSourceDefault || !decision.ClassificationOpportunity {
+		t.Fatalf("expected default-deny classification on configured http port, got %#v", decision)
+	}
+
+	decision = compiled.EvaluateFlow(Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), DestIP: net.ParseIP("169.254.169.254"), DestPort: 80})
+	if decision.Action != ActionDeny || decision.ClassificationOpportunity {
+		t.Fatalf("expected unconfigured http port to remain flow default deny, got %#v", decision)
+	}
+}
+
+func TestDuplicateHTTPExactHostBindingsAreRejected(t *testing.T) {
+	_, err := loadPolicyError(t, `
+endpoint "http" "one" {
+  hosts = ["Example.COM"]
+}
+
+endpoint "http" "two" {
+  hosts = ["example.com:80"]
+}
+`)
+	if err == nil || !strings.Contains(err.Error(), "duplicates exact binding") {
+		t.Fatalf("expected duplicate exact http binding error, got %v", err)
+	}
+
+	loadPolicy(t, `
+endpoint "http" "cleartext" {
+  hosts = ["api.example.com"]
+}
+
+endpoint "https" "tls" {
+  hosts = ["api.example.com"]
+}
+`)
+}
+
+func TestHTTPEndpointHostsAreRequiredAndValidated(t *testing.T) {
+	_, err := loadPolicyError(t, `
+endpoint "http" "missing" {
+}
+`)
+	if err == nil || !strings.Contains(err.Error(), "Missing hosts") {
+		t.Fatalf("expected missing hosts error, got %v", err)
+	}
+
+	tests := []string{
+		"",
+		"http://example.com",
+		"example.com/path",
+		"example.com?debug=1",
+		"example.com#fragment",
+		"user:pass@example.com",
+		"example.com:http",
+		"example.com:0",
+		"example.com:65536",
+		"bad host.example",
+		"café.example",
+		"2001:db8::1",
+		"[192.0.2.10]",
+		"*.0.0.1",
+		"*.168.1.1",
+	}
+	for _, host := range tests {
+		t.Run(host, func(t *testing.T) {
+			_, err := loadPolicyError(t, fmt.Sprintf(`
+endpoint "http" "bad" {
+  hosts = [%q]
+}
+`, host))
+			if err == nil {
+				t.Fatalf("expected host binding %q to be rejected", host)
+			}
+		})
+	}
+}
+
+func TestCredentialsCannotBindToHTTPEndpoints(t *testing.T) {
+	_, err := loadPolicyError(t, `
+endpoint "http" "metadata" {
+  hosts = ["metadata.internal"]
+}
+
+credential "bearer_token" "metadata" {
+  endpoint = http.metadata
+}
+`)
+	if err == nil || !strings.Contains(err.Error(), "must reference an https endpoint") {
+		t.Fatalf("expected http credential binding to be rejected, got %v", err)
+	}
+}
+
+func TestUnknownHTTPHostsUseDefaultActionWithoutCredentials(t *testing.T) {
+	compiled := loadPolicy(t, `
+endpoint "http" "metadata" {
+  hosts = ["metadata.internal"]
+}
+
+endpoint "https" "api" {
+  hosts = ["api.example.com"]
+}
+
+credential "bearer_token" "api" {
+  endpoint = https.api
+}
+`)
+
+	decision := compiled.EvaluateHTTP(HTTPRequest{EndpointKind: "http", Host: "unknown.internal", Method: http.MethodGet, Path: "/"})
+	if decision.Action != ActionAllow || decision.Source != DecisionSourceDefault || decision.Reason != "unknown_l7_endpoint" {
+		t.Fatalf("expected unknown http host to use default allow, got %#v", decision)
+	}
+	if decision.SelectedCredential != nil {
+		t.Fatalf("unknown http host must not borrow credentials, got %#v", decision.SelectedCredential)
+	}
+
+	compiled = loadPolicy(t, `
+settings {
+  default_action = "deny"
+}
+
+endpoint "http" "metadata" {
+  hosts = ["metadata.internal"]
+}
+`)
+	decision = compiled.EvaluateHTTP(HTTPRequest{EndpointKind: "http", Host: "unknown.internal", Method: http.MethodGet, Path: "/"})
+	if decision.Action != ActionDeny || decision.Source != DecisionSourceDefault || decision.Reason != "unknown_l7_endpoint" {
+		t.Fatalf("expected unknown http host to use default deny, got %#v", decision)
+	}
+}
+
 func TestHTTPCELRequestFacets(t *testing.T) {
 	request := HTTPRequest{
 		EndpointKind: "https",

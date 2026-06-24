@@ -42,6 +42,10 @@ func (h *PolicyHook) ResolveHTTPHost(kind string, host string) (string, string, 
 	return ref.Kind, ref.Name, ok
 }
 
+func (h *PolicyHook) ShouldInterceptHTTP(port uint16) bool {
+	return h.policy.ShouldInterceptHTTP(port)
+}
+
 func (h *PolicyHook) HasHTTPS() bool {
 	return h.policy.HasHTTPS()
 }

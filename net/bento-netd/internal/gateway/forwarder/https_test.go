@@ -113,6 +113,86 @@ rule "local-reads" {
 	}
 }
 
+func TestHTTPSProxyInterceptsWildcardEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	caCert, caKey, caPool := writeTestCA(t, dir)
+	route := testRoute(t, `
+settings {
+  default_action = "deny"
+}
+
+endpoint "https" "assets" {
+  hosts = ["*.example.test"]
+}
+
+rule "asset-reads" {
+  endpoint = https.assets
+  condition = "http.method == 'GET'"
+  verdict = "allow"
+}
+`)
+	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	if err != nil {
+		t.Fatalf("NewHTTPSProxy returned error: %v", err)
+	}
+	proxy.upstreamRootCAs = caPool
+
+	requestCh := make(chan *http.Request, 1)
+	upstreamAddress, stopUpstream, _ := startObservedTLSUpstreamForHost(t, caCert, caKey, "api.example.test", requestCh)
+	defer stopUpstream()
+
+	clientConn, proxyConn := net.Pipe()
+	flow := hooks.Flow{
+		Protocol:   "tcp",
+		SourceIP:   net.ParseIP("192.168.127.2"),
+		SourcePort: 53100,
+		DestIP:     net.ParseIP("127.0.0.1"),
+		DestPort:   443,
+	}
+	flowDecision := routeDecision(t, route, flow)
+	if flowDecision.Action != hooks.RouteClassify {
+		t.Fatalf("expected HTTPS wildcard flow classification, got %#v", flowDecision)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- proxy.Handle(context.Background(), proxyConn, flow, upstreamAddress, flowDecision)
+	}()
+
+	clientTLS := tls.Client(clientConn, &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+		RootCAs:    caPool,
+		ServerName: "api.example.test",
+	})
+	if err := clientTLS.Handshake(); err != nil {
+		t.Fatalf("client handshake failed: %v", err)
+	}
+	request, err := http.NewRequest(http.MethodGet, "https://api.example.test/assets/app.js", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := request.Write(clientTLS); err != nil {
+		t.Fatalf("write client request: %v", err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(clientTLS), request)
+	if err != nil {
+		t.Fatalf("read client response: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	_ = clientTLS.Close()
+
+	waitForProxy(t, done)
+	select {
+	case upstreamRequest := <-requestCh:
+		if upstreamRequest.Host != "api.example.test" {
+			t.Fatalf("expected concrete wildcard host upstream, got %q", upstreamRequest.Host)
+		}
+	default:
+		t.Fatal("upstream did not receive wildcard HTTPS request")
+	}
+}
+
 func TestHTTPSProxyDefaultDenyDoesNotContactUpstreamBeforeRequestAllow(t *testing.T) {
 	dir := t.TempDir()
 	caCert, caKey, caPool := writeTestCA(t, dir)

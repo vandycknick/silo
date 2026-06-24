@@ -13,6 +13,7 @@ import (
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/common/types/traits"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy/hostmatch"
 )
 
 func (p *Policy) EvaluateFlow(flow Flow) Decision {
@@ -52,6 +53,17 @@ func (p *Policy) EvaluateFlow(flow Flow) Decision {
 func (p *Policy) EvaluateHTTP(request HTTPRequest) Decision {
 	if p == nil {
 		return Decision{Action: ActionAllow, Layer: DecisionLayerRequest, Source: DecisionSourceDefault, DefaultAction: ActionAllow, MatchedRequest: &request}
+	}
+	if _, err := hostmatch.ParseAuthority(request.Host, hostmatch.DefaultPort(request.EndpointKind)); err != nil {
+		return Decision{
+			Action:         ActionDeny,
+			Layer:          DecisionLayerRequest,
+			Source:         DecisionSourceDefault,
+			DefaultAction:  p.DefaultAction,
+			Reason:         "missing_host",
+			MatchedFlow:    request.Flow,
+			MatchedRequest: &request,
+		}
 	}
 	endpointRef, endpoint, ok := p.MatchHTTPFamilyHost(request.EndpointKind, request.Host)
 	if !ok {
@@ -216,11 +228,8 @@ func compileCondition(condition string) (cel.Program, error) {
 }
 
 func normalizedRequestHost(request HTTPRequest) string {
-	defaultPort := uint16(80)
-	if request.EndpointKind == "https" {
-		defaultPort = 443
-	}
-	authority, err := parseAuthority(request.Host, defaultPort)
+	defaultPort := hostmatch.DefaultPort(request.EndpointKind)
+	authority, err := hostmatch.ParseAuthority(request.Host, defaultPort)
 	if err != nil {
 		return strings.ToLower(strings.TrimSpace(request.Host))
 	}

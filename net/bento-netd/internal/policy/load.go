@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/hcl/v2/gohcl"
 	"github.com/hashicorp/hcl/v2/hclparse"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy/hostmatch"
 )
 
 type LoadError struct {
@@ -479,7 +480,7 @@ func decodeHTTPEndpoint(kind string, name string, transport Transport, defaultPo
 	endpoint := &HTTPEndpoint{Kind: kind, Name: name, Family: EndpointFamilyHTTP, Transport: transport, DefaultPort: defaultPort}
 	seen := make(map[string]struct{})
 	for _, host := range raw.Hosts {
-		binding, err := parseHostBinding(host, defaultPort)
+		binding, err := hostmatch.ParseBinding(host, defaultPort)
 		if err != nil {
 			diagnostics = append(diagnostics, attrDiagnostic(hostsAttr, "Invalid host binding", err.Error()))
 			continue

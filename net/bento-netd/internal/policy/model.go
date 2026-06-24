@@ -1,14 +1,13 @@
 package policy
 
 import (
-	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
-	"strconv"
 	"strings"
 
 	"github.com/google/cel-go/cel"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy/hostmatch"
 )
 
 type Action string
@@ -113,12 +112,7 @@ type HTTPEndpoint struct {
 	Hosts       []HostBinding
 }
 
-type HostBinding struct {
-	Pattern  string
-	Host     string
-	Port     uint16
-	Wildcard bool
-}
+type HostBinding = hostmatch.Binding
 
 type Credential struct {
 	Kind      string
@@ -221,7 +215,17 @@ func (p *Policy) CanClassify(flow Flow) bool {
 }
 
 func (p *Policy) ShouldInterceptHTTP(port uint16) bool {
-	return p != nil && port == 80 && len(p.httpEndpoints) > 0
+	if p == nil {
+		return false
+	}
+	for _, endpoint := range p.httpEndpoints {
+		for _, binding := range endpoint.Hosts {
+			if binding.Port == port {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (p *Policy) ShouldInterceptHTTPS(port uint16) bool {
@@ -249,10 +253,7 @@ func (p *Policy) MatchHTTPSHost(host string) bool {
 }
 
 func (p *Policy) MatchHTTPFamilyHost(kind string, host string) (Ref, *HTTPEndpoint, bool) {
-	defaultPort := uint16(80)
-	if kind == "https" {
-		defaultPort = 443
-	}
+	defaultPort := hostmatch.DefaultPort(kind)
 	ref, endpoint, _, ok := p.matchHTTPFamilyHost(kind, host, defaultPort)
 	return ref, endpoint, ok
 }
@@ -265,7 +266,7 @@ func (p *Policy) ResolveHTTPSHost(host string, port uint16) (Ref, string, string
 	if !ok {
 		return Ref{}, "", "", false
 	}
-	return ref, formatAuthority(authority, 443), authority.Host, true
+	return ref, hostmatch.FormatAuthority(authority, 443), authority.Host, true
 }
 
 func (p *Policy) ResolveHTTPSRawIP(destIP net.IP, destPort uint16) (Ref, string, string, bool) {
@@ -285,41 +286,41 @@ func (p *Policy) ResolveHTTPSRawIP(destIP net.IP, destPort uint16) (Ref, string,
 			if err != nil || bindingAddr.Unmap() != dest {
 				continue
 			}
-			authority := authority{Host: dest.String(), Port: binding.Port}
-			return Ref{Kind: endpoint.Kind, Name: endpoint.Name}, formatAuthority(authority, 443), authority.Host, true
+			authority := hostmatch.Authority{Host: dest.String(), Port: binding.Port}
+			return Ref{Kind: endpoint.Kind, Name: endpoint.Name}, hostmatch.FormatAuthority(authority, 443), authority.Host, true
 		}
 	}
 	return Ref{}, "", "", false
 }
 
 func (p *Policy) MatchHTTPSAuthority(host string, selected string) bool {
-	hostAuthority, err := parseAuthority(host, 443)
+	hostAuthority, err := hostmatch.ParseAuthority(host, 443)
 	if err != nil || hostAuthority.Host == "" {
 		return false
 	}
-	selectedAuthority, err := parseAuthority(selected, 443)
+	selectedAuthority, err := hostmatch.ParseAuthority(selected, 443)
 	if err != nil || selectedAuthority.Host == "" {
 		return false
 	}
 	return hostAuthority == selectedAuthority
 }
 
-func (p *Policy) matchHTTPFamilyHost(kind string, host string, defaultPort uint16) (Ref, *HTTPEndpoint, authority, bool) {
+func (p *Policy) matchHTTPFamilyHost(kind string, host string, defaultPort uint16) (Ref, *HTTPEndpoint, hostmatch.Authority, bool) {
 	if p == nil {
-		return Ref{}, nil, authority{}, false
+		return Ref{}, nil, hostmatch.Authority{}, false
 	}
 	endpoints := p.httpFamilyEndpoints(kind)
 	if len(endpoints) == 0 {
-		return Ref{}, nil, authority{}, false
+		return Ref{}, nil, hostmatch.Authority{}, false
 	}
-	parsedAuthority, err := parseAuthority(host, defaultPort)
+	parsedAuthority, err := hostmatch.ParseAuthority(host, defaultPort)
 	if err != nil || parsedAuthority.Host == "" {
-		return Ref{}, nil, authority{}, false
+		return Ref{}, nil, hostmatch.Authority{}, false
 	}
 	var wildcardMatch *hostMatch
 	for _, endpoint := range endpoints {
 		for _, binding := range endpoint.Hosts {
-			if !binding.matches(parsedAuthority) {
+			if !binding.Matches(parsedAuthority) {
 				continue
 			}
 			ref := Ref{Kind: endpoint.Kind, Name: endpoint.Name}
@@ -335,7 +336,7 @@ func (p *Policy) matchHTTPFamilyHost(kind string, host string, defaultPort uint1
 	if wildcardMatch != nil {
 		return wildcardMatch.ref, wildcardMatch.endpoint, parsedAuthority, true
 	}
-	return Ref{}, nil, authority{}, false
+	return Ref{}, nil, hostmatch.Authority{}, false
 }
 
 type hostMatch struct {
@@ -422,16 +423,6 @@ func l4MatchKind(portRange PortRange) L4MatchKind {
 	return L4MatchRange
 }
 
-func (b HostBinding) matches(authority authority) bool {
-	if b.Port != authority.Port {
-		return false
-	}
-	if !b.Wildcard {
-		return b.Host == authority.Host
-	}
-	return authority.Host != b.Host && strings.HasSuffix(authority.Host, "."+b.Host)
-}
-
 func prefixesContain(prefixes []netip.Prefix, addr netip.Addr) bool {
 	addr = addr.Unmap()
 	for _, prefix := range prefixes {
@@ -448,99 +439,4 @@ func addrFromIP(ip net.IP) (netip.Addr, bool) {
 		return netip.Addr{}, false
 	}
 	return addr.Unmap(), true
-}
-
-type authority struct {
-	Host string
-	Port uint16
-}
-
-func formatAuthority(authority authority, defaultPort uint16) string {
-	if authority.Port == defaultPort {
-		return formatAuthorityHost(authority.Host)
-	}
-	return net.JoinHostPort(authority.Host, strconv.Itoa(int(authority.Port)))
-}
-
-func formatAuthorityHost(host string) string {
-	if strings.Contains(host, ":") {
-		if _, err := netip.ParseAddr(host); err == nil {
-			return "[" + host + "]"
-		}
-	}
-	return host
-}
-
-func parseHostBinding(pattern string, defaultPort uint16) (HostBinding, error) {
-	if strings.Contains(pattern, "://") || strings.Contains(pattern, "/") {
-		return HostBinding{}, fmt.Errorf("host %q must not include a scheme or path", pattern)
-	}
-	pattern = strings.TrimSpace(strings.ToLower(pattern))
-	if pattern == "" {
-		return HostBinding{}, fmt.Errorf("host must not be empty")
-	}
-	wildcard := strings.HasPrefix(pattern, "*.")
-	if wildcard {
-		pattern = strings.TrimPrefix(pattern, "*.")
-		if pattern == "" || strings.Contains(pattern, "*") {
-			return HostBinding{}, fmt.Errorf("wildcard host %q is invalid", "*."+pattern)
-		}
-	}
-	authority, err := parseAuthority(pattern, defaultPort)
-	if err != nil {
-		return HostBinding{}, err
-	}
-	if _, err := netip.ParseAddr(authority.Host); err == nil && wildcard {
-		return HostBinding{}, fmt.Errorf("wildcard host %q cannot be an IP address", "*."+authority.Host)
-	}
-	canonicalPattern := authority.Host
-	if wildcard {
-		canonicalPattern = "*." + authority.Host
-	}
-	return HostBinding{Pattern: canonicalPattern, Host: authority.Host, Port: authority.Port, Wildcard: wildcard}, nil
-}
-
-func parseAuthority(input string, defaultPort uint16) (authority, error) {
-	input = strings.TrimSpace(strings.ToLower(input))
-	if input == "" {
-		return authority{}, nil
-	}
-	if strings.Contains(input, "://") {
-		return authority{}, fmt.Errorf("authority %q must not include a scheme", input)
-	}
-	host := input
-	port := defaultPort
-	if parsedHost, parsedPort, err := net.SplitHostPort(input); err == nil {
-		host = parsedHost
-		decodedPort, err := parsePort(parsedPort)
-		if err != nil {
-			return authority{}, err
-		}
-		port = decodedPort
-	} else if strings.HasPrefix(input, "[") && strings.HasSuffix(input, "]") {
-		host = strings.Trim(input, "[]")
-	} else if strings.Count(input, ":") == 1 {
-		left, right, _ := strings.Cut(input, ":")
-		if right != "" {
-			decodedPort, err := parsePort(right)
-			if err == nil {
-				host = left
-				port = decodedPort
-			}
-		}
-	}
-	host = strings.Trim(strings.TrimSpace(host), "[]")
-	host = strings.TrimSuffix(host, ".")
-	if host == "" {
-		return authority{}, fmt.Errorf("authority host must not be empty")
-	}
-	return authority{Host: host, Port: port}, nil
-}
-
-func parsePort(value string) (uint16, error) {
-	port, err := strconv.Atoi(value)
-	if err != nil || port < 1 || port > 65535 {
-		return 0, fmt.Errorf("port %q is out of range", value)
-	}
-	return uint16(port), nil
 }
