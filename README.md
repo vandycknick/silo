@@ -1,247 +1,79 @@
 # BentoBox 🍱
 
-BentoBox is a microVM manager that boots a full Linux environment in seconds. It is built around reusable profiles, a local raw image registry, and a small `bento` CLI for creating, running, and inspecting VMs. Use it as a WSL-like development environment on macOS, a lightweight Docker Desktop alternative, or an isolated throwaway VM for agentic workflows.
+BentoBox is a local microVM sandbox runtime where machines are created from OCI images.
 
-## Runtime Backends
+The short version:
 
-- macOS: Apple `Virtualization.framework`
-- Linux: libkrun through the `krun` helper
+1. OCI image in.
+2. Runtime config from policy.
+3. Small, isolated VM out.
 
-Backend selection is internal to BentoBox and depends on the host platform. `VmSpec` describes the VM; users do not choose the backend.
+## Core Principles
 
-See [`docs/terminology.md`](docs/terminology.md) for the vocabulary BentoBox uses around VMs, VMMs, hypervisors, KVM, microVMs, and backend drivers.
+- **Image first**: OS images are built from OCI images.
+- **API first**: `libvm` is the core runtime interface.
+- **Policy first**: networking, kernel access, and userspace access are driven by policy.
 
-## Inspiration
+Only network policies are implemented today. Kernel and userspace policies are the direction.
 
-BentoBox draws inspiration from these projects, which helped shape its architecture and developer experience:
+## CLI
 
-- [macosvm](https://github.com/s-u/macosvm)
-- [UTM](https://github.com/utmapp/UTM)
-- [Lima](https://github.com/lima-vm/lima)
-- [vfkit](https://github.com/crc-org/vfkit)
-
-## Getting Started
-
-Enter the Nix development shell:
+Build the CLI locally:
 
 ```bash
 nix develop
-```
-
-The shell provides the Rust, Go, and native build tools used by this repository.
-
-Build BentoBox and its host runtime helpers locally:
-
-```bash
 make build
-./target/debug/bento --help
 ```
 
-## CLI Layout
-
-```text
-BentoBox VM lifecycle control
-
-Usage: bento [OPTIONS] <COMMAND>
-Commands:
-  run      Run an ephemeral VM from a profile or image
-  create   Create a persistent VM from a profile or image
-  start    Start a persistent VM
-  stop     Stop a persistent VM
-  restart  Restart a persistent VM
-  rm       Remove a persistent VM
-  shell    Open a shell in a running VM
-  exec     Execute a command in a running VM
-  list     List VMs [aliases: ls]
-  status   Show VM status
-  inspect  Show full VM details
-  logs     Show VM logs
-  profile  Manage reusable VM profiles
-
-Options:
-  -v, --verbose...  Increase diagnostic output. Repeat for full error chains
-  -h, --help        Print help
-```
-
-## Profiles
-
-Profiles are reusable VM definitions stored under `~/.config/bento/profiles/` as `.yaml` or `.yml` files. If `bento run` is used without a profile, BentoBox looks for `default.yaml` or `default.yml`; if neither exists, it uses the built-in `default` profile based on `ghcr.io/vandycknick/archlinux:latest`.
-
-Create, show, validate, edit, and remove profiles through the `profile` command group:
-
-```bash
-bento profile create rust-dev \
-  --image ghcr.io/vandycknick/archlinux:latest \
-  --description "Rust development box" \
-  --cpus 4 \
-  --memory 4gb \
-  --disk-size 40gb \
-  --mount .:/workspace:rw \
-  --network private \
-  --label stack=rust
-
-bento profile list
-bento profile show rust-dev
-bento profile validate rust-dev
-bento profile edit rust-dev
-bento profile rm rust-dev
-```
-
-A profile created by the CLI looks like this:
-
-```yaml
-version: "1"
-description: Rust development box
-image: ghcr.io/vandycknick/archlinux:latest
-resources:
-    cpus: 4
-    memory: 4gb
-disk_size: 40gb
-mounts:
-    - source: .
-      target: /workspace
-      mode: rw
-network:
-    kind: private
-labels:
-    stack: rust
-```
-
-Image values can point at a remote OCI image, a local disk image, a plain rootfs tarball, or a local OCI archive:
-
-```yaml
-image: ghcr.io/vandycknick/archlinux:latest
-image: disk:./target/rootfs.img
-image: tar:./target/rootfs.tar
-image: oci:./target/image.tar
-```
-
-`disk:` uses the local disk directly as the immutable base and Bento COW-clones it into each instance. `tar:` currently supports plain uncompressed rootfs tar files only and converts them into cached ext4 base images. `oci:` expects a local OCI archive with `index.json`; remote registry images stay scheme-less.
-
-Size values must include a unit suffix. Accepted units are `mb`, `gb`, `mib`, and `gib`, case-insensitive with optional whitespace, such as `512mb`, `4gb`, or `1 GiB`; bare numbers like `4096` are rejected.
-
-## Ephemeral VMs
-
-`bento run` creates a temporary VM, starts it, opens a shell or runs a command, then removes the VM when the session exits.
-
-```bash
-# Run the built-in or configured default profile.
-bento run
-
-# Run from a named profile.
-bento run rust-dev
-
-# Run a command after `--` and delete the VM with the command's exit status.
-bento run rust-dev -- cargo test
-
-# Keep the VM only when the command fails, useful for poking the crime scene.
-bento run rust-dev --keep-on-failure -- cargo test
-```
-
-Run directly from an image when you do not need a profile:
+Run an ephemeral VM from an image:
 
 ```bash
 bento run --image ubuntu:24.04 -- uname -a
 ```
 
-When `--image` is supplied with a profile, it overrides only the profile image. The rest of the profile settings still apply:
+Create and enter a persistent VM:
 
 ```bash
-bento run rust-dev --image disk:./target/rootfs.img -- cargo test
-```
-
-Override VM shape and profile settings at launch:
-
-```bash
-bento run rust-dev \
-  --cpus 6 \
-  --memory 8gb \
-  --disk-size 80gb \
-  --mount ~/src:/src:rw \
-  --network private \
-  --label purpose=ci \
-  -- cargo test
-```
-
-Ephemeral VM names use the profile or image-derived prefix plus a 1-based index, such as `rust-dev-1`.
-
-## Persistent VMs
-
-`bento create` creates a named VM that stays around until you remove it.
-
-```bash
-# Create from a profile.
-bento create dev rust-dev
-
-# Create from a profile and start immediately.
-bento create dev rust-dev --start
-
-# Create from an image without a profile.
-bento create ubuntu --image ubuntu:24.04 --cpus 4 --memory 4gb
-```
-
-Lifecycle commands operate on a VM name or ID:
-
-```bash
-bento start dev
+bento create dev --image ghcr.io/vandycknick/archlinux:latest --start
 bento shell dev
-bento exec dev -- pwd
-bento logs dev --follow
+```
+
+Inspect and manage machines:
+
+```bash
+bento ls
 bento status dev
-bento inspect dev
 bento stop dev
-bento restart dev
 bento rm dev
 ```
 
-Use `bento shell --attach serial` when the guest agent or SSH is unavailable:
+## SDK
 
-```bash
-bento shell dev --attach serial
-```
+Use `libvm` when you want to create and manage machines directly from Rust.
 
-List VMs in table or JSON form:
+```rust
+use libvm::{MachineNetworkConfig, Memory, Runtime, LibVmError};
 
-```bash
-bento list
-bento ls --json
-```
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), LibVmError> {
+    let runtime = Runtime::from_env().await?;
 
-## Local Runtime Storage
+    let machine = runtime
+        .machine("ghcr.io/vandycknick/archlinux:latest")
+        .name("devbox")
+        .cpus(6)
+        .memory(Memory::gb(16))
+        .network(MachineNetworkConfig::private())
+        .create()
+        .await?;
 
-BentoBox keeps durable VM state under a data root, transient runtime state under a run root, and local image storage under an image root. By default, the data root is `XDG_DATA_HOME/bento` or `~/.local/share/bento`, the run root is `XDG_RUNTIME_DIR/bento` when available or `data_root/run`, and the image root is `data_root/images`.
+    machine.start().await?;
 
-The local state database is always `data_root/state.db`. On first open, BentoBox stores the resolved roots in `db_config`; later opens reuse that contract so existing installs do not move if defaults change. Derived directories stay predictable: machines, assets, keys, and `secrets.json` live below the data root; locks and network runtime directories live below the run root; image cache files live below the image root.
-
-## Images
-
-BentoBox creates VMs from raw disk images registered in the image root, which defaults to `~/.local/share/bento/images`. The registry is intentionally small and manually editable:
-
-```json
-{
-    "version": 1,
-    "images": {
-        "ghcr.io/vandycknick/archlinuxarm:latest": "sha256-abc123/rootfs.img"
-    }
+    Ok(())
 }
 ```
 
-Registry paths are relative to the image root and must point to a `rootfs.img` file. With the default image root, the example above makes BentoBox clone or copy `~/.local/share/bento/images/sha256-abc123/rootfs.img` into the VM when creating from `ghcr.io/vandycknick/archlinuxarm:latest`.
+## Docs
 
-## Introspection
-
-Status is concise and readiness-oriented; inspect is the full machine record. Both commands print JSON.
-
-```bash
-bento status dev
-bento inspect dev
-```
-
-`status` includes process state, guest agent readiness, network mode, profile, and image. `inspect` is the better target for scripts that need labels, metadata, paths, and the resolved VM spec.
-
-## More Docs
-
-- [`docs/terminology.md`](docs/terminology.md): BentoBox vocabulary and backend terminology
-- [`resources/README.md`](resources/README.md): bundled resources
-- [`builders/README.md`](builders/README.md): image and artifact builders
-- [`guest/bento-agent/README.md`](guest/bento-agent/README.md): guest agent details
+- [Terminology](docs/terminology.md)
+- [Guest agent](guest/bento-agent/README.md)
