@@ -15,7 +15,7 @@ import (
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy"
 )
 
-func TestLogPolicyWarningsUsesServiceLogger(t *testing.T) {
+func TestLogPolicyDiagnosticsUsesServiceLogger(t *testing.T) {
 	compiled := loadMainPolicy(t, `
 settings {
   audit {
@@ -29,7 +29,7 @@ settings {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
-	logPolicyWarnings(compiled)
+	logPolicyDiagnostics(compiled)
 
 	logLine := output.String()
 	if !strings.Contains(logLine, `"msg":"policy load warning"`) {

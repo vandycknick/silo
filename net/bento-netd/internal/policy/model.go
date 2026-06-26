@@ -6,8 +6,8 @@ import (
 	"net/netip"
 	"strings"
 
-	"github.com/google/cel-go/cel"
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy/hostmatch"
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy/native"
 )
 
 type Action string
@@ -60,8 +60,11 @@ func (r Ref) zero() bool {
 }
 
 type Policy struct {
+	Documents   []PolicyDocument
+	diagnostics []Diagnostic
+	native      *native.Policy
+
 	DefaultAction Action
-	warnings      []string
 
 	ipEndpoints    map[string]*IPEndpoint
 	httpEndpoints  map[string]*HTTPEndpoint
@@ -119,7 +122,8 @@ type Credential struct {
 	Name      string
 	Endpoint  Ref
 	Condition string
-	program   cel.Program
+	condition *httpCondition
+	policy    *Policy
 }
 
 type Rule struct {
@@ -133,7 +137,12 @@ type Rule struct {
 	Condition  string
 	Reason     string
 	order      int
-	program    cel.Program
+	condition  *httpCondition
+	policy     *Policy
+}
+
+type httpCondition struct {
+	id uint32
 }
 
 type Flow struct {
@@ -182,17 +191,21 @@ func Default() *Policy {
 	}
 }
 
-func (p *Policy) Warnings() []string {
-	if p == nil || len(p.warnings) == 0 {
+func (p *Policy) Diagnostics() []Diagnostic {
+	if p == nil || len(p.diagnostics) == 0 {
 		return nil
 	}
-	warnings := make([]string, len(p.warnings))
-	copy(warnings, p.warnings)
-	return warnings
+	diagnostics := make([]Diagnostic, len(p.diagnostics))
+	copy(diagnostics, p.diagnostics)
+	return diagnostics
 }
 
-func (p *Policy) addWarning(message string) {
-	p.warnings = append(p.warnings, message)
+func (p *Policy) Close() {
+	if p == nil || p.native == nil {
+		return
+	}
+	p.native.Close()
+	p.native = nil
 }
 
 func (p *Policy) HasHTTP() bool {

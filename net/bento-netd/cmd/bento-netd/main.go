@@ -15,7 +15,6 @@ import (
 	"syscall"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/transport"
-	"github.com/hashicorp/hcl/v2"
 	log "github.com/sirupsen/logrus"
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/config"
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/audit"
@@ -77,7 +76,7 @@ func run(cfg *config.Config) error {
 			return err
 		}
 	}
-	logPolicyWarnings(cfg.Policy)
+	logPolicyDiagnostics(cfg.Policy)
 	if cfg.PIDFile != "" {
 		if err := writePIDFile(cfg.PIDFile); err != nil {
 			return err
@@ -150,7 +149,7 @@ func writeErrorRecords(writer io.Writer, err error) {
 	if errors.As(err, &loadErr) {
 		wrote := false
 		for _, diagnostic := range loadErr.Diagnostics {
-			if diagnostic.Severity != hcl.DiagError {
+			if diagnostic.Severity != "error" {
 				continue
 			}
 			_ = encoder.Encode(policyDiagnosticToErrorRecord(loadErr.Filename, diagnostic))
@@ -163,33 +162,37 @@ func writeErrorRecords(writer io.Writer, err error) {
 	_ = encoder.Encode(errorRecord{Type: "startup_error", Message: err.Error()})
 }
 
-func policyDiagnosticToErrorRecord(filename string, diagnostic *hcl.Diagnostic) errorRecord {
+func policyDiagnosticToErrorRecord(filename string, diagnostic policy.Diagnostic) errorRecord {
 	record := errorRecord{Type: "policy_error", Message: "Invalid policy"}
-	if diagnostic == nil {
-		record.File = filename
-		return record
-	}
 	if diagnostic.Summary != "" {
 		record.Message = diagnostic.Summary
 	}
 	record.Detail = diagnostic.Detail
-	if diagnostic.Subject != nil {
-		record.File = diagnostic.Subject.Filename
-		record.Line = diagnostic.Subject.Start.Line
-		record.Column = diagnostic.Subject.Start.Column
-	}
+	record.File = diagnostic.File
+	record.Line = diagnostic.Line
+	record.Column = diagnostic.Column
 	if record.File == "" {
 		record.File = filename
 	}
 	return record
 }
 
-func logPolicyWarnings(compiled *policy.Policy) {
+func logPolicyDiagnostics(compiled *policy.Policy) {
 	if compiled == nil {
 		return
 	}
-	for _, warning := range compiled.Warnings() {
-		slog.Warn("policy load warning", "warning", warning)
+	for _, diagnostic := range compiled.Diagnostics() {
+		if diagnostic.Severity != "warning" {
+			continue
+		}
+		slog.Warn(
+			"policy load warning",
+			"summary", diagnostic.Summary,
+			"detail", diagnostic.Detail,
+			"file", diagnostic.File,
+			"line", diagnostic.Line,
+			"column", diagnostic.Column,
+		)
 	}
 }
 

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "app/bento-cli",
+    "common/bento-policy",
     "common/bento-ext4",
     "common/bento-initramfs",
     "common/bento-utils",

@@ -83,7 +83,12 @@ krun:
 .PHONY: netd
 netd:
 	@mkdir -p "target/$(TARGET_PROFILE_DIR)"
-	cd net/bento-netd && go build $(GO_BUILD_FLAGS) -o "$(CURDIR)/$(NETD_BIN)" ./cmd/bento-netd
+	cargo build $(CARGO_PROFILE_FLAGS) -p bento-policy --features ffi
+	cd net/bento-netd && CGO_ENABLED=1 CGO_LDFLAGS="-L$(CURDIR)/target/$(TARGET_PROFILE_DIR) -lbento_policy" go build $(GO_BUILD_FLAGS) -o "$(CURDIR)/$(NETD_BIN)" ./cmd/bento-netd
+
+.PHONY: policy-header
+policy-header:
+	BENTO_POLICY_REGENERATE_HEADER=1 cargo build -p bento-policy --features ffi,regenerate-ffi-header
 
 .PHONY: kernel
 kernel:

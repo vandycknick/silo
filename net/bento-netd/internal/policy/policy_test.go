@@ -1192,7 +1192,7 @@ credential "bearer_token" "api" {
 	}
 }
 
-func TestAuditSettingsWarningsArePolicyLoadWarnings(t *testing.T) {
+func TestAuditSettingsWarningsArePolicyDiagnostics(t *testing.T) {
 	compiled := loadPolicy(t, `
 settings {
   audit {
@@ -1201,8 +1201,9 @@ settings {
   }
 }
 `)
-	if len(compiled.Warnings()) != 1 || !strings.Contains(compiled.Warnings()[0], "body_buffer") {
-		t.Fatalf("expected audit warning, got %#v", compiled.Warnings())
+	diagnostics := compiled.Diagnostics()
+	if len(diagnostics) != 1 || diagnostics[0].Severity != "warning" || !strings.Contains(diagnostics[0].Detail, "body_buffer") {
+		t.Fatalf("expected audit warning diagnostic, got %#v", diagnostics)
 	}
 }
 
