@@ -3,6 +3,11 @@ use serde::Serialize;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
+// The C ABI exposes opaque pointers only. The real Rust values live in the
+// private handle structs below, and we cast between the two at the boundary.
+// cbindgen sees these marker types, but does not emit their fields, so Go
+// cannot accidentally rely on Rust's private Policy or HttpConditionContext
+// layout.
 /// cbindgen:no-export
 #[repr(C)]
 pub struct bento_policy_t {
@@ -105,6 +110,11 @@ pub unsafe extern "C" fn bento_policy_parse_source(
 #[no_mangle]
 /// Serialize a policy snapshot as JSON.
 ///
+/// The JSON snapshot is a load-time transfer format, not the runtime state.
+/// It contains the document model Go needs to rebuild its own evaluator
+/// indexes, while compiled CEL programs and other private indexes remain in
+/// this Rust policy handle and are addressed from Go by condition id.
+///
 /// # Safety
 /// `policy` must be a valid handle returned by `bento_policy_parse_source`. `out_json` must be
 /// non-null and writable. The returned buffer must be freed with `bento_policy_buffer_free`.
@@ -127,6 +137,11 @@ pub unsafe extern "C" fn bento_policy_snapshot_json(
 
 #[no_mangle]
 /// Build an HTTP condition evaluation context from JSON.
+///
+/// This is the request-time half of the bridge. Go still owns endpoint/rule
+/// decision making, but it serializes the normalized request facets once into a
+/// short-lived Rust context so multiple condition ids can be evaluated without
+/// reparsing query/header data for each rule.
 ///
 /// # Safety
 /// `input_json` must either be null with length zero or point to readable memory for its length
@@ -327,6 +342,8 @@ unsafe fn write_buffer(out: *mut bento_policy_buffer_t, mut bytes: Vec<u8>) {
         ptr: bytes.as_mut_ptr(),
         len: bytes.len(),
     };
+    // Transfer ownership to the caller. Go immediately copies the buffer and
+    // returns it to Rust with bento_policy_buffer_free.
     std::mem::forget(bytes);
     *out = buffer;
 }

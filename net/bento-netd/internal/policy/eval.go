@@ -244,6 +244,9 @@ type httpConditionEvaluator struct {
 }
 
 func newHTTPConditionEvaluator(policy *Policy, request HTTPRequest) *httpConditionEvaluator {
+	// Go owns the request decision flow. Rust only evaluates compiled HTTP CEL
+	// programs by id, so this helper lazily builds one Rust-owned request context
+	// and reuses it for all credential/rule conditions checked for the request.
 	return &httpConditionEvaluator{policy: policy, request: request}
 }
 

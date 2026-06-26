@@ -1,3 +1,11 @@
+// Package native wraps the Rust bento-policy C ABI.
+//
+// Go never reads Rust policy structs directly. The Rust side returns opaque
+// handles for long-lived policy state and short-lived HTTP condition contexts.
+// Complex load-time data crosses the boundary as JSON: Go copies the
+// Rust-owned buffer, frees it with bento_policy_buffer_free, unmarshals into Go
+// DTOs, and then builds its own runtime evaluator indexes. Compiled CEL stays
+// in Rust and is referenced by condition id.
 package native
 
 /*
@@ -68,6 +76,8 @@ func (p *Policy) SnapshotJSON() ([]byte, error) {
 	if status != StatusOK {
 		return nil, nativeError(status, payload)
 	}
+	// The returned buffer belonged to Rust until copyBuffer copied and freed it.
+	// Callers can safely unmarshal this byte slice without holding Rust memory.
 	return payload, nil
 }
 
@@ -103,6 +113,9 @@ func (p *Policy) Close() {
 }
 
 func NewHTTPContext(input HTTPConditionContextInput) (*HTTPContext, error) {
+	// This JSON handoff is request-scoped and intentionally narrow: Go has
+	// already normalized method, host, query, and headers for the policy engine;
+	// Rust only receives enough data to evaluate compiled HTTP CEL conditions.
 	payload, err := json.Marshal(input)
 	if err != nil {
 		return nil, fmt.Errorf("encode HTTP condition context: %w", err)
@@ -146,6 +159,8 @@ func copyBuffer(buffer C.bento_policy_buffer_t) []byte {
 	if buffer.ptr == nil || buffer.len == 0 {
 		return nil
 	}
+	// C.GoBytes copies the Rust-owned allocation into Go memory. After this point
+	// the Rust allocation must be returned through the matching free function.
 	bytes := C.GoBytes(unsafe.Pointer(buffer.ptr), C.int(buffer.len))
 	C.bento_policy_buffer_free(buffer)
 	return bytes

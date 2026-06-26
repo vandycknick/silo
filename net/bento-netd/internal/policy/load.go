@@ -78,6 +78,10 @@ func LoadReader(filename string, reader io.Reader) (*Policy, error) {
 }
 
 func loadSource(filename string, source []byte) (*Policy, error) {
+	// Rust owns parsing, structural validation, diagnostics, and CEL compilation.
+	// The returned native handle keeps the compiled CEL programs alive. The JSON
+	// snapshot is only the document-shaped data Go needs to rebuild the existing
+	// runtime evaluator maps and rule lists.
 	nativePolicy, status, errorJSON, err := native.ParseSource(filename, source)
 	if err != nil {
 		return nil, err
