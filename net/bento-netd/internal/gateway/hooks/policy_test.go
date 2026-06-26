@@ -3,6 +3,7 @@ package hooks
 import (
 	"context"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -48,5 +49,46 @@ rule "allow-app" {
 	}
 	if *decision.MatchedL4 != want {
 		t.Fatalf("expected l4 match %#v, got %#v", want, *decision.MatchedL4)
+	}
+}
+
+func TestPolicyHookCarriesCredentialMetadata(t *testing.T) {
+	compiled, err := policy.LoadReader("policy.hcl", strings.NewReader(`
+settings {
+  default_action = "deny"
+}
+
+endpoint "https" "api" {
+  hosts = ["api.example.com"]
+}
+
+credential "header_token" "internal-api" {
+  endpoint = https.api
+  header = "X-Internal-Token"
+  prefix = "Token "
+}
+
+rule "allow-api" {
+  endpoint = https.api
+  verdict = "allow"
+}
+`))
+	if err != nil {
+		t.Fatalf("LoadReader returned error: %v", err)
+	}
+
+	decision, err := NewPolicyHook(compiled).DecideHTTP(context.Background(), HTTPRequest{
+		EndpointKind: "https",
+		Host:         "api.example.com",
+		Method:       http.MethodGet,
+	})
+	if err != nil {
+		t.Fatalf("DecideHTTP returned error: %v", err)
+	}
+	if decision.Credential == nil {
+		t.Fatalf("expected credential metadata, got %#v", decision)
+	}
+	if decision.Credential.Kind != "header_token" || decision.Credential.Name != "internal-api" || decision.Credential.Header != "X-Internal-Token" || decision.Credential.Prefix != "Token " {
+		t.Fatalf("unexpected credential metadata: %#v", decision.Credential)
 	}
 }

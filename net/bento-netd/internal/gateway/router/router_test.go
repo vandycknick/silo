@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/audit"
@@ -80,6 +81,10 @@ endpoint "https" "api" {
   hosts = ["api.example.test"]
 }
 
+credential "bearer_token" "api" {
+  endpoint = https.api
+}
+
 rule "allow-api" {
   endpoint = https.api
   verdict = "allow"
@@ -106,6 +111,9 @@ rule "allow-api" {
 		Host:         "api.example.test",
 		Method:       http.MethodPost,
 		Path:         "/v1/messages",
+		Header: http.Header{
+			"Authorization": []string{"Bearer guest-secret"},
+		},
 	}
 	route := New(hooks.NewPolicyHook(compiled), auditLog)
 
@@ -126,11 +134,21 @@ rule "allow-api" {
 	if event.RuleName != "allow-api" || event.EndpointKind != "https" || event.EndpointName != "api" {
 		t.Fatalf("unexpected audit decision metadata: %#v", event)
 	}
+	if event.CredentialKind != "bearer_token" || event.CredentialName != "api" || event.CredentialStatus != "selected" {
+		t.Fatalf("unexpected audit credential metadata: %#v", event)
+	}
 	if event.HTTPMethod != http.MethodPost || event.HTTPHost != "api.example.test" || event.HTTPPath != "/v1/messages" {
 		t.Fatalf("unexpected audit HTTP metadata: %#v", event)
 	}
 	if event.Protocol != "tcp" || event.SourcePort != 49153 || event.DestPort != 443 {
 		t.Fatalf("unexpected audit flow metadata: %#v", event)
+	}
+	rawAudit, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rawAudit), "guest-secret") || strings.Contains(string(rawAudit), "Authorization") {
+		t.Fatalf("audit record leaked request credential material: %s", rawAudit)
 	}
 }
 

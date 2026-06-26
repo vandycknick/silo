@@ -25,7 +25,7 @@ const SECRET_STORE_FILE_NAME: &str = "secrets.json";
 #[derive(Args, Debug)]
 #[command(
     about = "Manage Bento secrets",
-    after_help = "Examples:\n  bento secret login openai-codex --name personal\n  printf '%s' \"$TOKEN\" | bento secret set github-token --value-stdin\n  bento secret list\n  bento secret show personal\n  bento secret rm personal --force\n"
+    after_help = "Examples:\n  bento secret login openai-codex --name personal\n  printf '%s' \"$TOKEN\" | bento secret set bearer_token github-api --token-stdin\n  printf '%s' \"$TOKEN\" | bento secret set bearer_token.github-api.token --value-stdin\n  bento secret set aws_credential prod --profile production-admin\n  bento secret list\n  bento secret show openai_codex_oauth.personal.oauth\n  bento secret rm bearer_token.github-api.token --force\n"
 )]
 pub struct Cmd {
     #[command(subcommand)]
@@ -64,15 +64,48 @@ pub struct LoginCmd {
 
 #[derive(Args, Debug)]
 pub struct SetCmd {
-    /// Secret name to save.
-    #[arg(value_name = "NAME")]
-    pub name: String,
-    /// Secret value. Prefer --value-stdin to avoid shell history.
+    /// Either an exact secret key, or a credential kind and credential name.
+    #[arg(value_name = "TARGET", num_args = 1..=2)]
+    pub target: Vec<String>,
+    /// Exact-key secret value. Prefer --value-stdin to avoid shell history.
     #[arg(long)]
     pub value: Option<String>,
-    /// Read the secret value from stdin.
+    /// Read the exact-key secret value from stdin.
     #[arg(long)]
     pub value_stdin: bool,
+    /// Provider token value. Prefer --token-stdin to avoid shell history.
+    #[arg(long)]
+    pub token: Option<String>,
+    /// Read the provider token value from stdin.
+    #[arg(long)]
+    pub token_stdin: bool,
+    /// Basic auth password. Prefer --password-stdin to avoid shell history.
+    #[arg(long)]
+    pub password: Option<String>,
+    /// Read the basic auth password from stdin.
+    #[arg(long)]
+    pub password_stdin: bool,
+    /// AWS access key id.
+    #[arg(long)]
+    pub access_key_id: Option<String>,
+    /// Read the AWS access key id from stdin.
+    #[arg(long)]
+    pub access_key_id_stdin: bool,
+    /// AWS secret access key. Prefer --secret-access-key-stdin to avoid shell history.
+    #[arg(long)]
+    pub secret_access_key: Option<String>,
+    /// Read the AWS secret access key from stdin.
+    #[arg(long)]
+    pub secret_access_key_stdin: bool,
+    /// Optional AWS session token. Prefer --session-token-stdin to avoid shell history.
+    #[arg(long)]
+    pub session_token: Option<String>,
+    /// Read the optional AWS session token from stdin.
+    #[arg(long)]
+    pub session_token_stdin: bool,
+    /// AWS shared-config profile name. When set, this credential uses the profile resolver.
+    #[arg(long)]
+    pub profile: Option<String>,
     /// Replace an existing secret.
     #[arg(long)]
     pub force: bool,
@@ -136,10 +169,11 @@ fn parse_provider(input: &str) -> Result<LoginProvider, String> {
 }
 
 async fn login(store: &SecretStore, cmd: &LoginCmd) -> eyre::Result<()> {
-    if store.contains(&cmd.name)? {
+    let key = slot_key(OPENAI_CODEX_KIND, &cmd.name, "oauth");
+    if store.contains(&key)? {
         eyre::bail!(
             "secret `{}` already exists in {}",
-            cmd.name,
+            key,
             store.path().display()
         );
     }
@@ -156,9 +190,9 @@ async fn login(store: &SecretStore, cmd: &LoginCmd) -> eyre::Result<()> {
         created_at: now.clone(),
         updated_at: now,
     };
-    store.put(&cmd.name, secret)?;
+    store.put(&key, secret)?;
 
-    println!("saved secret `{}` in {}", cmd.name, store.path().display());
+    println!("saved secret `{}` in {}", key, store.path().display());
     println!();
     print_hcl_snippet(&cmd.name);
     Ok(())
@@ -295,19 +329,196 @@ where
 }
 
 fn set_plain_secret(store: &SecretStore, cmd: &SetCmd) -> eyre::Result<()> {
-    let value = plain_secret_value(cmd, read_stdin_string)?;
-    write_plain_secret(store, &cmd.name, value, cmd.force)
+    if cmd.stdin_source_count() > 1 {
+        eyre::bail!("only one stdin-backed secret value can be provided at a time");
+    }
+
+    match cmd.target.as_slice() {
+        [key] => {
+            if cmd.has_provider_specific_source() {
+                eyre::bail!(
+                    "provider-specific options require `bento secret set <kind> <name> ...`"
+                );
+            }
+            let value =
+                plain_secret_value(&cmd.value, cmd.value_stdin, "value", read_stdin_string)?;
+            write_plain_secret(store, key, value, cmd.force)
+        }
+        [kind, name] => set_provider_plain_secret(store, kind, name, cmd),
+        _ => eyre::bail!("provide either an exact secret key or a credential kind and name"),
+    }
 }
 
-fn plain_secret_value<F>(cmd: &SetCmd, read_stdin: F) -> eyre::Result<String>
+fn set_provider_plain_secret(
+    store: &SecretStore,
+    kind: &str,
+    name: &str,
+    cmd: &SetCmd,
+) -> eyre::Result<()> {
+    if cmd.has_exact_key_source() {
+        eyre::bail!("--value and --value-stdin are only valid with an exact secret key");
+    }
+
+    let entries = match kind {
+        "basic_auth" => {
+            if cmd.has_token_source() || cmd.has_static_aws_source() || cmd.profile.is_some() {
+                eyre::bail!("basic_auth accepts --password or --password-stdin only");
+            }
+            vec![(
+                slot_key(kind, name, "password"),
+                plain_secret_value(
+                    &cmd.password,
+                    cmd.password_stdin,
+                    "password",
+                    read_stdin_string,
+                )?,
+            )]
+        }
+        "bearer_token" => {
+            if cmd.has_password_source() || cmd.has_static_aws_source() || cmd.profile.is_some() {
+                eyre::bail!("bearer_token accepts --token or --token-stdin only");
+            }
+            vec![(
+                slot_key(kind, name, "token"),
+                plain_secret_value(&cmd.token, cmd.token_stdin, "token", read_stdin_string)?,
+            )]
+        }
+        "header_token" => {
+            if cmd.has_password_source() || cmd.has_static_aws_source() || cmd.profile.is_some() {
+                eyre::bail!("header_token accepts --token or --token-stdin only");
+            }
+            vec![(
+                slot_key(kind, name, "token"),
+                plain_secret_value(&cmd.token, cmd.token_stdin, "token", read_stdin_string)?,
+            )]
+        }
+        "aws_credential" => aws_secret_entries(kind, name, cmd)?,
+        other => eyre::bail!(
+            "unsupported credential kind `{other}` for `bento secret set`; use an exact secret key with --value if needed"
+        ),
+    };
+    write_plain_secret_entries(store, entries, cmd.force)
+}
+
+fn aws_secret_entries(kind: &str, name: &str, cmd: &SetCmd) -> eyre::Result<Vec<(String, String)>> {
+    if cmd.has_token_source() || cmd.has_password_source() {
+        eyre::bail!("aws_credential accepts AWS slot options only");
+    }
+    if let Some(profile) = &cmd.profile {
+        if cmd.has_static_aws_source() {
+            eyre::bail!(
+                "provide either --profile or static AWS key slots for aws_credential, not both"
+            );
+        }
+        return Ok(vec![(slot_key(kind, name, "profile"), profile.clone())]);
+    }
+
+    let mut entries = vec![
+        (
+            slot_key(kind, name, "access_key_id"),
+            plain_secret_value(
+                &cmd.access_key_id,
+                cmd.access_key_id_stdin,
+                "access-key-id",
+                read_stdin_string,
+            )?,
+        ),
+        (
+            slot_key(kind, name, "secret_access_key"),
+            plain_secret_value(
+                &cmd.secret_access_key,
+                cmd.secret_access_key_stdin,
+                "secret-access-key",
+                read_stdin_string,
+            )?,
+        ),
+    ];
+    if let Some(session_token) = optional_plain_secret_value(
+        &cmd.session_token,
+        cmd.session_token_stdin,
+        "session-token",
+        read_stdin_string,
+    )? {
+        entries.push((slot_key(kind, name, "session_token"), session_token));
+    }
+    Ok(entries)
+}
+
+fn plain_secret_value<F>(
+    value: &Option<String>,
+    value_stdin: bool,
+    label: &str,
+    read_stdin: F,
+) -> eyre::Result<String>
 where
     F: FnOnce() -> eyre::Result<String>,
 {
-    match (&cmd.value, cmd.value_stdin) {
-        (Some(_), true) => eyre::bail!("provide either --value or --value-stdin, not both"),
+    match (value, value_stdin) {
+        (Some(_), true) => eyre::bail!("provide either --{label} or --{label}-stdin, not both"),
         (Some(value), false) => Ok(value.clone()),
         (None, true) => read_stdin(),
-        (None, false) => eyre::bail!("provide --value or --value-stdin"),
+        (None, false) => eyre::bail!("provide --{label} or --{label}-stdin"),
+    }
+}
+
+fn optional_plain_secret_value<F>(
+    value: &Option<String>,
+    value_stdin: bool,
+    label: &str,
+    read_stdin: F,
+) -> eyre::Result<Option<String>>
+where
+    F: FnOnce() -> eyre::Result<String>,
+{
+    match (value, value_stdin) {
+        (Some(_), true) => eyre::bail!("provide either --{label} or --{label}-stdin, not both"),
+        (Some(value), false) => Ok(Some(value.clone())),
+        (None, true) => read_stdin().map(Some),
+        (None, false) => Ok(None),
+    }
+}
+
+impl SetCmd {
+    fn stdin_source_count(&self) -> usize {
+        [
+            self.value_stdin,
+            self.token_stdin,
+            self.password_stdin,
+            self.access_key_id_stdin,
+            self.secret_access_key_stdin,
+            self.session_token_stdin,
+        ]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count()
+    }
+
+    fn has_exact_key_source(&self) -> bool {
+        self.value.is_some() || self.value_stdin
+    }
+
+    fn has_token_source(&self) -> bool {
+        self.token.is_some() || self.token_stdin
+    }
+
+    fn has_password_source(&self) -> bool {
+        self.password.is_some() || self.password_stdin
+    }
+
+    fn has_static_aws_source(&self) -> bool {
+        self.access_key_id.is_some()
+            || self.access_key_id_stdin
+            || self.secret_access_key.is_some()
+            || self.secret_access_key_stdin
+            || self.session_token.is_some()
+            || self.session_token_stdin
+    }
+
+    fn has_provider_specific_source(&self) -> bool {
+        self.has_token_source()
+            || self.has_password_source()
+            || self.has_static_aws_source()
+            || self.profile.is_some()
     }
 }
 
@@ -333,6 +544,43 @@ fn write_plain_secret(
     store.put(name, Secret::Plain { value })?;
     println!("saved secret `{}` in {}", name, store.path().display());
     Ok(())
+}
+
+fn write_plain_secret_entries(
+    store: &SecretStore,
+    entries: Vec<(String, String)>,
+    force: bool,
+) -> eyre::Result<()> {
+    if entries.is_empty() {
+        eyre::bail!("no secret slots to write");
+    }
+    if !force {
+        for (name, _) in &entries {
+            if store.contains(name)? {
+                eyre::bail!(
+                    "secret `{}` already exists in {}; pass --force to replace it",
+                    name,
+                    store.path().display()
+                );
+            }
+        }
+    }
+    for (name, value) in &entries {
+        store.put(
+            name,
+            Secret::Plain {
+                value: value.clone(),
+            },
+        )?;
+    }
+    for (name, _) in entries {
+        println!("saved secret `{}` in {}", name, store.path().display());
+    }
+    Ok(())
+}
+
+fn slot_key(kind: &str, name: &str, slot: &str) -> String {
+    format!("{kind}.{name}.{slot}")
 }
 
 fn list_secrets(store: &SecretStore, cmd: &ListCmd) -> eyre::Result<()> {
@@ -402,11 +650,10 @@ fn remove_secret(store: &SecretStore, cmd: &RmCmd) -> eyre::Result<()> {
 }
 
 fn print_hcl_snippet(name: &str) {
-    println!("Add this secret to a policy credential for an HTTPS endpoint:");
+    println!("Use this credential name in policy for an HTTPS endpoint:");
     println!();
     println!("credential \"{}\" \"{}\" {{", OPENAI_CODEX_KIND, name);
     println!("  endpoint = https.openai-codex");
-    println!("  secret = \"{}\"", name);
     println!("}}");
 }
 
@@ -822,8 +1069,9 @@ mod tests {
     use crate::commands::{BentoCmd, Command};
 
     use super::{
-        is_pending_device_poll_response, plain_secret_value, write_plain_secret, LoginProvider,
-        Secret, SecretStore, SecretSubcommand, SetCmd, OPENAI_CODEX_KIND,
+        is_pending_device_poll_response, plain_secret_value, set_plain_secret, slot_key,
+        write_plain_secret, LoginProvider, Secret, SecretStore, SecretSubcommand, SetCmd,
+        OPENAI_CODEX_KIND,
     };
 
     #[test]
@@ -870,12 +1118,12 @@ mod tests {
     }
 
     #[test]
-    fn secret_set_plain_value_parses() {
+    fn secret_set_exact_key_plain_value_parses() {
         let cmd = BentoCmd::try_parse_from([
             "bento",
             "secret",
             "set",
-            "github-token",
+            "bearer_token.github-api.token",
             "--value",
             "secret-token",
             "--force",
@@ -891,37 +1139,103 @@ mod tests {
             other => panic!("expected set command, got {other:?}"),
         };
 
-        assert_eq!(set.name, "github-token");
+        assert_eq!(set.target, ["bearer_token.github-api.token"]);
         assert_eq!(set.value.as_deref(), Some("secret-token"));
         assert!(set.force);
     }
 
     #[test]
+    fn secret_set_provider_aware_value_parses() {
+        let cmd = BentoCmd::try_parse_from([
+            "bento",
+            "secret",
+            "set",
+            "bearer_token",
+            "github-api",
+            "--token-stdin",
+            "--force",
+        ])
+        .expect("provider-aware secret set should parse");
+
+        let secret = match cmd.cmd {
+            Command::Secret(cmd) => cmd,
+            other => panic!("expected secret command, got {other:?}"),
+        };
+        let set = match secret.command {
+            SecretSubcommand::Set(cmd) => cmd,
+            other => panic!("expected set command, got {other:?}"),
+        };
+
+        assert_eq!(set.target, ["bearer_token", "github-api"]);
+        assert!(set.token_stdin);
+        assert!(set.force);
+    }
+
+    #[test]
     fn plain_secret_value_validates_sources() {
-        let missing = SetCmd {
-            name: "api-token".to_string(),
-            value: None,
-            value_stdin: false,
-            force: false,
-        };
-        assert!(plain_secret_value(&missing, || Ok("stdin".to_string())).is_err());
+        assert!(plain_secret_value(&None, false, "value", || Ok("stdin".to_string())).is_err());
+        assert!(
+            plain_secret_value(&Some("argument".to_string()), true, "value", || Ok(
+                "stdin".to_string()
+            ))
+            .is_err()
+        );
 
-        let conflicting = SetCmd {
-            name: "api-token".to_string(),
-            value: Some("argument".to_string()),
-            value_stdin: true,
-            force: false,
-        };
-        assert!(plain_secret_value(&conflicting, || Ok("stdin".to_string())).is_err());
-
-        let stdin = SetCmd {
-            name: "api-token".to_string(),
-            value: None,
-            value_stdin: true,
-            force: false,
-        };
-        let value = plain_secret_value(&stdin, || Ok("stdin".to_string())).expect("stdin value");
+        let value = plain_secret_value(&None, true, "value", || Ok("stdin".to_string()))
+            .expect("stdin value");
         assert_eq!(value, "stdin");
+    }
+
+    #[test]
+    fn set_provider_aware_bearer_token_writes_slot_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SecretStore::new(dir.path().join("secrets.json"));
+        let mut cmd = set_cmd(["bearer_token", "github-api"]);
+        cmd.token = Some("secret-token".to_string());
+
+        set_plain_secret(&store, &cmd).expect("write bearer token");
+
+        let loaded = store
+            .get("bearer_token.github-api.token")
+            .expect("read bearer token slot");
+        match loaded {
+            Secret::Plain { value } => assert_eq!(value, "secret-token"),
+            other => panic!("expected plain secret, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_provider_aware_aws_profile_writes_profile_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SecretStore::new(dir.path().join("secrets.json"));
+        let mut cmd = set_cmd(["aws_credential", "prod"]);
+        cmd.profile = Some("production-admin".to_string());
+
+        set_plain_secret(&store, &cmd).expect("write aws profile");
+
+        let loaded = store
+            .get("aws_credential.prod.profile")
+            .expect("read aws profile slot");
+        match loaded {
+            Secret::Plain { value } => assert_eq!(value, "production-admin"),
+            other => panic!("expected plain secret, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_provider_aware_aws_static_writes_required_slots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SecretStore::new(dir.path().join("secrets.json"));
+        let mut cmd = set_cmd(["aws_credential", "prod"]);
+        cmd.access_key_id = Some("AKIAEXAMPLE".to_string());
+        cmd.secret_access_key = Some("secret".to_string());
+        cmd.session_token = Some("session".to_string());
+
+        set_plain_secret(&store, &cmd).expect("write aws slots");
+
+        assert_plain_secret(&store, "aws_credential.prod.access_key_id", "AKIAEXAMPLE");
+        assert_plain_secret(&store, "aws_credential.prod.secret_access_key", "secret");
+        assert_plain_secret(&store, "aws_credential.prod.session_token", "session");
     }
 
     #[test]
@@ -961,12 +1275,13 @@ mod tests {
             updated_at: "2026-06-02T11:00:00Z".to_string(),
         };
 
-        store.put("personal", secret).expect("write secret");
+        let key = slot_key(OPENAI_CODEX_KIND, "personal", "oauth");
+        store.put(&key, secret).expect("write secret");
 
         assert_eq!(path, dir.path().join("secrets.json"));
         let raw = std::fs::read_to_string(&path).expect("read secret store");
         assert!(raw.contains(r#""type": "oauth""#));
-        let loaded = store.get("personal").expect("read secret");
+        let loaded = store.get(&key).expect("read secret");
         match loaded {
             Secret::OAuth { refresh_token, .. } => assert_eq!(refresh_token, "refresh"),
             other => panic!("expected oauth secret, got {other:?}"),
@@ -1011,6 +1326,34 @@ mod tests {
             .is_err());
     }
 
+    fn set_cmd<const N: usize>(target: [&str; N]) -> SetCmd {
+        SetCmd {
+            target: target.into_iter().map(str::to_string).collect(),
+            value: None,
+            value_stdin: false,
+            token: None,
+            token_stdin: false,
+            password: None,
+            password_stdin: false,
+            access_key_id: None,
+            access_key_id_stdin: false,
+            secret_access_key: None,
+            secret_access_key_stdin: false,
+            session_token: None,
+            session_token_stdin: false,
+            profile: None,
+            force: false,
+        }
+    }
+
+    fn assert_plain_secret(store: &SecretStore, name: &str, expected: &str) {
+        let loaded = store.get(name).expect("read plain secret");
+        match loaded {
+            Secret::Plain { value } => assert_eq!(value, expected),
+            other => panic!("expected plain secret, got {other:?}"),
+        }
+    }
+
     #[test]
     fn secret_store_reads_shared_fixture() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1024,7 +1367,9 @@ mod tests {
             other => panic!("expected plain secret, got {other:?}"),
         }
 
-        let oauth = store.get("codex-personal").expect("oauth fixture secret");
+        let oauth = store
+            .get("openai_codex_oauth.personal.oauth")
+            .expect("oauth fixture secret");
         match oauth {
             Secret::OAuth {
                 access_token,

@@ -118,12 +118,16 @@ type HTTPEndpoint struct {
 type HostBinding = hostmatch.Binding
 
 type Credential struct {
-	Kind      string
-	Name      string
-	Endpoint  Ref
-	Condition string
-	condition *httpCondition
-	policy    *Policy
+	Kind           string
+	Name           string
+	Endpoint       Ref
+	Username       string
+	Header         string
+	Prefix         string
+	IdempotencyKey bool
+	Condition      string
+	condition      *httpCondition
+	policy         *Policy
 }
 
 type Rule struct {

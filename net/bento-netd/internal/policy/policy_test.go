@@ -491,6 +491,72 @@ rule "allow-codex" {
 	}
 }
 
+func TestCredentialProviderMetadataReachesRuntime(t *testing.T) {
+	compiled := loadPolicy(t, `
+settings {
+  default_action = "deny"
+}
+
+endpoint "https" "git" {
+  hosts = ["git.example.com"]
+}
+
+endpoint "https" "internal" {
+  hosts = ["internal.example.com"]
+}
+
+endpoint "https" "api" {
+  hosts = ["api.example.com"]
+}
+
+credential "basic_auth" "git-basic" {
+  endpoint = https.git
+  username = "octo"
+}
+
+credential "header_token" "internal-api" {
+  endpoint = https.internal
+  header = "X-Internal-Token"
+  prefix = "Token "
+}
+
+credential "bearer_token" "api-token" {
+  endpoint = https.api
+  idempotency_key = true
+}
+
+rule "allow-git" {
+  endpoint = https.git
+  verdict = "allow"
+}
+
+rule "allow-internal" {
+  endpoint = https.internal
+  verdict = "allow"
+}
+
+rule "allow-api" {
+  endpoint = https.api
+  verdict = "allow"
+}
+`)
+
+	basic := compiled.EvaluateHTTP(HTTPRequest{EndpointKind: "https", Host: "git.example.com", Method: http.MethodGet})
+	if basic.SelectedCredential == nil || basic.SelectedCredential.Kind != "basic_auth" || basic.SelectedCredential.Username != "octo" {
+		t.Fatalf("expected basic_auth metadata, got %#v", basic.SelectedCredential)
+	}
+
+	header := compiled.EvaluateHTTP(HTTPRequest{EndpointKind: "https", Host: "internal.example.com", Method: http.MethodGet})
+	if header.SelectedCredential == nil || header.SelectedCredential.Kind != "header_token" || header.SelectedCredential.Header != "X-Internal-Token" || header.SelectedCredential.Prefix != "Token " {
+		t.Fatalf("expected header_token metadata, got %#v", header.SelectedCredential)
+	}
+
+	bearer := compiled.EvaluateHTTP(HTTPRequest{EndpointKind: "https", Host: "api.example.com", Method: http.MethodGet})
+	if bearer.SelectedCredential == nil || bearer.SelectedCredential.Kind != "bearer_token" || !bearer.SelectedCredential.IdempotencyKey {
+		t.Fatalf("expected bearer_token metadata, got %#v", bearer.SelectedCredential)
+	}
+}
+
 func TestMixedEndpointFamiliesAreRejected(t *testing.T) {
 	_, err := loadPolicyError(t, `
 endpoint "ip" "private" {

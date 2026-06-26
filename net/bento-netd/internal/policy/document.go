@@ -54,11 +54,15 @@ type ConditionDecl struct {
 }
 
 type CredentialDecl struct {
-	Kind      string         `json:"kind"`
-	Name      string         `json:"name"`
-	Endpoint  Ref            `json:"endpoint"`
-	Condition *ConditionDecl `json:"condition,omitempty"`
-	Order     int            `json:"order"`
+	Kind           string         `json:"kind"`
+	Name           string         `json:"name"`
+	Endpoint       Ref            `json:"endpoint"`
+	Username       string         `json:"username,omitempty"`
+	Header         string         `json:"header,omitempty"`
+	Prefix         string         `json:"prefix,omitempty"`
+	IdempotencyKey bool           `json:"idempotency_key,omitempty"`
+	Condition      *ConditionDecl `json:"condition,omitempty"`
+	Order          int            `json:"order"`
 }
 
 type RuleDecl struct {

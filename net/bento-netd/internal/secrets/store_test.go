@@ -21,7 +21,7 @@ func TestFileStoreReadsSharedFixture(t *testing.T) {
 	if value != "123" {
 		t.Fatalf("expected plain value, got %q", value)
 	}
-	oauth, err := store.Get("codex-personal")
+	oauth, err := store.Get("openai_codex_oauth.personal.oauth")
 	if err != nil {
 		t.Fatalf("Get oauth returned error: %v", err)
 	}

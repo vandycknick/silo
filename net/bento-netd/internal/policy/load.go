@@ -325,7 +325,16 @@ func (p *Policy) addCredentialDecl(decl CredentialDecl) error {
 	if _, ok := p.credentials[key]; ok {
 		return fmt.Errorf("duplicate credential %q", key)
 	}
-	credential := &Credential{Kind: decl.Kind, Name: decl.Name, Endpoint: decl.Endpoint, policy: p}
+	credential := &Credential{
+		Kind:           decl.Kind,
+		Name:           decl.Name,
+		Endpoint:       decl.Endpoint,
+		Username:       decl.Username,
+		Header:         decl.Header,
+		Prefix:         decl.Prefix,
+		IdempotencyKey: decl.IdempotencyKey,
+		policy:         p,
+	}
 	if decl.Condition != nil {
 		credential.Condition = decl.Condition.Source
 		credential.condition = &httpCondition{id: decl.Condition.ID}

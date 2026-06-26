@@ -24,13 +24,19 @@ impl Policy {
         self.documents
             .iter()
             .flat_map(|document| document.credentials.iter())
-            .map(|credential| SecretRequirement {
-                credential: Ref {
-                    kind: credential.kind.clone(),
-                    name: credential.name.clone(),
-                },
-                endpoint: credential.endpoint.clone(),
-                expected_secret: ExpectedSecret::Plain,
+            .flat_map(|credential| {
+                credential_secret_slots(credential)
+                    .into_iter()
+                    .map(move |slot| SecretRequirement {
+                        credential: Ref {
+                            kind: credential.kind.clone(),
+                            name: credential.name.clone(),
+                        },
+                        endpoint: credential.endpoint.clone(),
+                        slot: slot.name.to_owned(),
+                        required: slot.required,
+                        expected_secret: slot.expected_secret,
+                    })
             })
             .collect()
     }
@@ -289,6 +295,14 @@ pub struct CredentialDecl {
     pub kind: String,
     pub name: String,
     pub endpoint: Ref,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub header: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub idempotency_key: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<ConditionDecl>,
     pub order: usize,
@@ -313,12 +327,52 @@ pub struct RuleDecl {
 pub struct SecretRequirement {
     pub credential: Ref,
     pub endpoint: Ref,
+    pub slot: String,
+    pub required: bool,
     pub expected_secret: ExpectedSecret,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExpectedSecret {
     Plain,
     OAuth,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CredentialSecretSlot {
+    name: &'static str,
+    required: bool,
+    expected_secret: ExpectedSecret,
+}
+
+fn credential_secret_slots(credential: &CredentialDecl) -> Vec<CredentialSecretSlot> {
+    match credential.kind.as_str() {
+        "basic_auth" => vec![plain_slot("password", true)],
+        "bearer_token" | "header_token" => vec![plain_slot("token", true)],
+        "github_oauth" | "openai_codex_oauth" => vec![CredentialSecretSlot {
+            name: "oauth",
+            required: true,
+            expected_secret: ExpectedSecret::OAuth,
+        }],
+        "aws_credential" => vec![
+            plain_slot("access_key_id", true),
+            plain_slot("secret_access_key", true),
+            plain_slot("session_token", false),
+            plain_slot("profile", false),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn plain_slot(name: &'static str, required: bool) -> CredentialSecretSlot {
+    CredentialSecretSlot {
+        name,
+        required,
+        expected_secret: ExpectedSecret::Plain,
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }

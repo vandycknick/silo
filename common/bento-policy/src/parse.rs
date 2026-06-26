@@ -479,10 +479,14 @@ impl<'a> DocumentBuilder<'a> {
         }
         let mut endpoint = None;
         let mut condition_source = None;
+        let mut username = String::new();
+        let mut header = String::new();
+        let mut prefix = String::new();
+        let mut idempotency_key = false;
         for structure in block.body().iter() {
             match structure {
-                Structure::Attribute(attribute) => match attribute.key() {
-                    "endpoint" => match decode_ref(attribute.expr()) {
+                Structure::Attribute(attribute) => match (kind.as_str(), attribute.key()) {
+                    (_, "endpoint") => match decode_ref(attribute.expr()) {
                         Ok(value) => endpoint = Some(value),
                         Err(detail) => self.attr_error(
                             attribute,
@@ -491,7 +495,7 @@ impl<'a> DocumentBuilder<'a> {
                             detail,
                         ),
                     },
-                    "condition" => match decode_string(attribute.expr()) {
+                    (_, "condition") => match decode_string(attribute.expr()) {
                         Ok(value) => condition_source = Some(value),
                         Err(detail) => self.attr_error(
                             attribute,
@@ -500,7 +504,55 @@ impl<'a> DocumentBuilder<'a> {
                             detail,
                         ),
                     },
-                    key => self.attr_error(
+                    ("basic_auth", "username") => match decode_string(attribute.expr()) {
+                        Ok(value) if value.is_empty() => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid credential username",
+                            "username must not be empty",
+                        ),
+                        Ok(value) => username = value,
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid credential username",
+                            detail,
+                        ),
+                    },
+                    ("bearer_token", "idempotency_key") => match decode_bool(attribute.expr()) {
+                        Ok(value) => idempotency_key = value,
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid credential idempotency_key",
+                            detail,
+                        ),
+                    },
+                    ("header_token", "header") => match decode_string(attribute.expr()) {
+                        Ok(value) if valid_http_header_name(&value) => header = value,
+                        Ok(_) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid credential header",
+                            "header must be a valid HTTP header name",
+                        ),
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid credential header",
+                            detail,
+                        ),
+                    },
+                    ("header_token", "prefix") => match decode_string(attribute.expr()) {
+                        Ok(value) => prefix = value,
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid credential prefix",
+                            detail,
+                        ),
+                    },
+                    (_, key) => self.attr_error(
                         attribute,
                         block_position.line,
                         "Unsupported argument",
@@ -532,17 +584,41 @@ impl<'a> DocumentBuilder<'a> {
             );
             return;
         };
+        match kind.as_str() {
+            "basic_auth" if username.is_empty() => self.error_at(
+                block_position,
+                "Invalid credential",
+                format!("credential \"{kind}\".\"{name}\" requires username"),
+            ),
+            "header_token" if header.is_empty() => self.error_at(
+                block_position,
+                "Invalid credential",
+                format!("credential \"{kind}\".\"{name}\" requires header"),
+            ),
+            _ => {}
+        }
         let condition = match condition_source {
             Some(source) if !source.is_empty() => {
-                match self.policy.register_http_condition(&source) {
-                    Ok(condition) => Some(condition),
-                    Err(err) => {
-                        self.error_at(
-                            block_position,
-                            "Invalid credential",
-                            format!("credential \"{kind}\".\"{name}\" condition: {err}"),
-                        );
-                        None
+                if credential_condition_references_secret(&source) {
+                    self.error_at(
+                        block_position,
+                        "Invalid credential",
+                        format!(
+                            "credential \"{kind}\".\"{name}\" condition cannot reference credential.* or secret material"
+                        ),
+                    );
+                    None
+                } else {
+                    match self.policy.register_http_condition(&source) {
+                        Ok(condition) => Some(condition),
+                        Err(err) => {
+                            self.error_at(
+                                block_position,
+                                "Invalid credential",
+                                format!("credential \"{kind}\".\"{name}\" condition: {err}"),
+                            );
+                            None
+                        }
                     }
                 }
             }
@@ -552,6 +628,10 @@ impl<'a> DocumentBuilder<'a> {
             kind,
             name,
             endpoint,
+            username,
+            header,
+            prefix,
+            idempotency_key,
             condition,
             order: self.credentials.len(),
         });
@@ -803,6 +883,7 @@ impl<'a> DocumentBuilder<'a> {
                 );
             }
         }
+        self.warn_credential_overlap();
 
         let rules_snapshot = self.rules.clone();
         for rule in &rules_snapshot {
@@ -882,6 +963,50 @@ impl<'a> DocumentBuilder<'a> {
                             "rule \"{}\" credential \"{}\" must bind to a directly referenced endpoint",
                             rule.name,
                             credential.key()
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    fn warn_credential_overlap(&mut self) {
+        let mut by_endpoint: HashMap<String, Vec<CredentialDecl>> = HashMap::new();
+        for credential in &self.credentials {
+            by_endpoint
+                .entry(credential.endpoint.key())
+                .or_default()
+                .push(credential.clone());
+        }
+        for (endpoint, credentials) in by_endpoint {
+            let unconditional_count = credentials
+                .iter()
+                .filter(|credential| credential.condition.is_none())
+                .count();
+            if unconditional_count > 1 {
+                self.warning_at(
+                    Position { line: 1, column: 1 },
+                    "Policy warning",
+                    format!(
+                        "multiple unconditional credentials bind to endpoint \"{endpoint}\"; runtime requests will fail closed if more than one matches"
+                    ),
+                );
+            }
+
+            let mut seen_conditions = HashSet::new();
+            let mut warned_conditions = HashSet::new();
+            for condition in credentials
+                .iter()
+                .filter_map(|credential| credential.condition.as_ref())
+            {
+                if !seen_conditions.insert(condition.source.clone())
+                    && warned_conditions.insert(condition.source.clone())
+                {
+                    self.warning_at(
+                        Position { line: 1, column: 1 },
+                        "Policy warning",
+                        format!(
+                            "multiple credentials on endpoint \"{endpoint}\" use the same condition string"
                         ),
                     );
                 }
@@ -1176,6 +1301,78 @@ fn valid_identifier(value: &str) -> bool {
         })
 }
 
+fn valid_http_header_name(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(http_header_token_byte)
+}
+
+fn http_header_token_byte(value: u8) -> bool {
+    value.is_ascii_alphanumeric()
+        || matches!(
+            value,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn credential_condition_references_secret(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' => index = skip_quoted_condition_literal(bytes, index),
+            value if identifier_start_byte(value) => {
+                let start = index;
+                index += 1;
+                while index < bytes.len() && identifier_byte(bytes[index]) {
+                    index += 1;
+                }
+                let identifier = &source[start..index];
+                if identifier == "secret" || identifier == "secrets" || identifier == "credential" {
+                    return true;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+fn skip_quoted_condition_literal(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[index] == quote {
+            return index + 1;
+        }
+        index += 1;
+    }
+    index
+}
+
+fn identifier_start_byte(value: u8) -> bool {
+    value.is_ascii_alphabetic() || value == b'_'
+}
+
+fn identifier_byte(value: u8) -> bool {
+    identifier_start_byte(value) || value.is_ascii_digit()
+}
+
 fn parse_terminal_action(value: &str) -> Result<Action, String> {
     match value {
         "" | "allow" => Ok(Action::Allow),
@@ -1238,4 +1435,193 @@ fn known_credential_kind(kind: &str) -> bool {
             | "openai_codex_oauth"
             | "aws_credential"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::model::{DiagnosticSeverity, ExpectedSecret, Policy};
+
+    #[test]
+    fn parses_provider_specific_credential_metadata() {
+        let policy = Policy::parse_str(
+            "policy.hcl",
+            r#"
+endpoint "https" "api" {
+  hosts = ["api.example.com"]
+}
+
+credential "basic_auth" "git-basic" {
+  endpoint = https.api
+  username = "git"
+}
+
+credential "bearer_token" "api-token" {
+  endpoint = https.api
+  idempotency_key = true
+  condition = "http.path.startsWith('/v1')"
+}
+
+credential "header_token" "internal" {
+  endpoint = https.api
+  header = "X-Internal-Token"
+  prefix = "Token "
+}
+"#,
+        )
+        .expect("policy parses");
+
+        let credentials = &policy.documents[0].credentials;
+        assert_eq!(credentials[0].username, "git");
+        assert!(credentials[1].idempotency_key);
+        assert!(credentials[1].condition.is_some());
+        assert_eq!(credentials[2].header, "X-Internal-Token");
+        assert_eq!(credentials[2].prefix, "Token ");
+    }
+
+    #[test]
+    fn rejects_missing_required_provider_metadata_and_secret_argument() {
+        let err = Policy::parse_str(
+            "policy.hcl",
+            r#"
+endpoint "https" "api" {
+  hosts = ["api.example.com"]
+}
+
+credential "basic_auth" "git-basic" {
+  endpoint = https.api
+  secret = "old-syntax"
+}
+
+credential "header_token" "internal" {
+  endpoint = https.api
+}
+"#,
+        )
+        .expect_err("policy should fail");
+        let text = err.to_string();
+        assert!(text.contains("Unsupported argument"), "{text}");
+        assert!(text.contains("requires username"), "{text}");
+        assert!(text.contains("requires header"), "{text}");
+    }
+
+    #[test]
+    fn rejects_credential_condition_secret_references() {
+        let err = Policy::parse_str(
+            "policy.hcl",
+            r#"
+endpoint "https" "api" {
+  hosts = ["api.example.com"]
+}
+
+credential "bearer_token" "api" {
+  endpoint = https.api
+  condition = "credential.name == 'api' || secret.token != ''"
+}
+"#,
+        )
+        .expect_err("policy should fail");
+
+        assert!(
+            err.to_string()
+                .contains("condition cannot reference credential.* or secret material"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reports_provider_secret_slots() {
+        let policy = Policy::parse_str(
+            "policy.hcl",
+            r#"
+endpoint "https" "api" {
+  hosts = ["api.example.com"]
+}
+
+credential "basic_auth" "git-basic" {
+  endpoint = https.api
+  username = "git"
+}
+
+credential "openai_codex_oauth" "personal" {
+  endpoint = https.api
+}
+
+credential "aws_credential" "prod" {
+  endpoint = https.api
+}
+"#,
+        )
+        .expect("policy parses");
+
+        let requirements = policy.secret_requirements();
+        assert!(requirements.iter().any(|requirement| {
+            requirement.credential.kind == "basic_auth"
+                && requirement.credential.name == "git-basic"
+                && requirement.slot == "password"
+                && requirement.required
+                && requirement.expected_secret == ExpectedSecret::Plain
+        }));
+        assert!(requirements.iter().any(|requirement| {
+            requirement.credential.kind == "openai_codex_oauth"
+                && requirement.slot == "oauth"
+                && requirement.required
+                && requirement.expected_secret == ExpectedSecret::OAuth
+        }));
+        assert!(requirements.iter().any(|requirement| {
+            requirement.credential.kind == "aws_credential"
+                && requirement.slot == "profile"
+                && !requirement.required
+                && requirement.expected_secret == ExpectedSecret::Plain
+        }));
+    }
+
+    #[test]
+    fn warns_on_suspicious_overlapping_credentials() {
+        let policy = Policy::parse_str(
+            "policy.hcl",
+            r#"
+endpoint "https" "api" {
+  hosts = ["api.example.com"]
+}
+
+credential "bearer_token" "one" {
+  endpoint = https.api
+}
+
+credential "bearer_token" "two" {
+  endpoint = https.api
+}
+
+credential "bearer_token" "three" {
+  endpoint = https.api
+  condition = "http.path == '/private'"
+}
+
+credential "bearer_token" "four" {
+  endpoint = https.api
+  condition = "http.path == '/private'"
+}
+"#,
+        )
+        .expect("warnings do not fail load");
+
+        let warnings = policy
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Warning)
+            .map(|diagnostic| diagnostic.detail.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            warnings
+                .iter()
+                .any(|detail| detail.contains("multiple unconditional credentials")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|detail| detail.contains("same condition string")),
+            "{warnings:?}"
+        );
+    }
 }

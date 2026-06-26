@@ -109,8 +109,12 @@ func routeDecisionFromPolicy(decision policy.Decision) RouteDecision {
 	}
 	if decision.SelectedCredential != nil {
 		converted.Credential = &Credential{
-			Kind: decision.SelectedCredential.Kind,
-			Name: decision.SelectedCredential.Name,
+			Kind:           decision.SelectedCredential.Kind,
+			Name:           decision.SelectedCredential.Name,
+			Username:       decision.SelectedCredential.Username,
+			Header:         decision.SelectedCredential.Header,
+			Prefix:         decision.SelectedCredential.Prefix,
+			IdempotencyKey: decision.SelectedCredential.IdempotencyKey,
 		}
 	}
 	if decision.MatchedL4 != nil {

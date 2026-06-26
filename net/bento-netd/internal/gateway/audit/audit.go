@@ -3,6 +3,7 @@ package audit
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,10 @@ type Event struct {
 	EndpointKind              string            `json:"endpoint_kind,omitempty"`
 	EndpointName              string            `json:"endpoint_name,omitempty"`
 	Layer                     string            `json:"layer,omitempty"`
+	CredentialKind            string            `json:"credential_kind,omitempty"`
+	CredentialName            string            `json:"credential_name,omitempty"`
+	CredentialStatus          string            `json:"credential_status,omitempty"`
+	CredentialErrorReason     string            `json:"credential_error_reason,omitempty"`
 	Protocol                  string            `json:"protocol"`
 	SourceIP                  string            `json:"source_ip"`
 	SourcePort                uint16            `json:"source_port"`
@@ -80,6 +85,7 @@ func (l *Logger) RecordFlow(flow hooks.Flow, decision hooks.RouteDecision) {
 		VMID:                      flow.VMID,
 		NetworkID:                 flow.NetworkID,
 	}
+	addCredentialDecisionMetadata(&record, decision)
 	l.write(record)
 }
 
@@ -110,7 +116,22 @@ func (l *Logger) RecordHTTP(request hooks.HTTPRequest, decision hooks.RouteDecis
 		VMID:                      request.Flow.VMID,
 		NetworkID:                 request.Flow.NetworkID,
 	}
+	addCredentialDecisionMetadata(&record, decision)
 	l.write(record)
+}
+
+func addCredentialDecisionMetadata(record *Event, decision hooks.RouteDecision) {
+	if decision.Credential != nil {
+		record.CredentialKind = decision.Credential.Kind
+		record.CredentialName = decision.Credential.Name
+		record.CredentialStatus = "selected"
+	}
+	if strings.HasPrefix(decision.Reason, "credential_") {
+		if record.CredentialStatus == "" {
+			record.CredentialStatus = "error"
+		}
+		record.CredentialErrorReason = decision.Reason
+	}
 }
 
 func (l *Logger) write(event Event) {

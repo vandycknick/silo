@@ -49,6 +49,9 @@ func (r *Router) Decide(ctx context.Context, flow hooks.Flow) (hooks.RouteDecisi
 		"rule_name", decision.RuleName,
 		"endpoint_kind", decision.EndpointKind,
 		"endpoint_name", decision.EndpointName,
+		"credential_kind", credentialKind(decision),
+		"credential_name", credentialName(decision),
+		"credential_status", credentialStatus(decision),
 		"protocol", flow.Protocol,
 		"source_ip", flow.SourceIP.String(),
 		"source_port", flow.SourcePort,
@@ -143,6 +146,9 @@ func (r *Router) DecideHTTP(ctx context.Context, request hooks.HTTPRequest) (hoo
 		"rule_name", decision.RuleName,
 		"endpoint_kind", decision.EndpointKind,
 		"endpoint_name", decision.EndpointName,
+		"credential_kind", credentialKind(decision),
+		"credential_name", credentialName(decision),
+		"credential_status", credentialStatus(decision),
 		"method", request.Method,
 		"host", request.Host,
 		"path", request.Path,
@@ -154,4 +160,25 @@ func (r *Router) DecideHTTP(ctx context.Context, request hooks.HTTPRequest) (hoo
 		"network_id", request.Flow.NetworkID,
 	)
 	return decision, nil
+}
+
+func credentialKind(decision hooks.RouteDecision) string {
+	if decision.Credential == nil {
+		return ""
+	}
+	return decision.Credential.Kind
+}
+
+func credentialName(decision hooks.RouteDecision) string {
+	if decision.Credential == nil {
+		return ""
+	}
+	return decision.Credential.Name
+}
+
+func credentialStatus(decision hooks.RouteDecision) string {
+	if decision.Credential != nil {
+		return "selected"
+	}
+	return ""
 }

@@ -2,6 +2,7 @@ package secrets
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"sync"
 )
+
+var ErrNotFound = errors.New("secret not found")
 
 const (
 	TypePlain = "plain"
@@ -107,7 +110,7 @@ func (s *FileStore) Get(name string) (Secret, error) {
 	}
 	secret, ok := secrets[name]
 	if !ok {
-		return Secret{}, fmt.Errorf("secret %q not found", name)
+		return Secret{}, fmt.Errorf("%w: %q", ErrNotFound, name)
 	}
 	return secret, nil
 }
@@ -127,7 +130,7 @@ func (s *FileStore) UpdateOAuth(name string, secret OAuthSecret) error {
 	}
 	existing, ok := secrets[name]
 	if !ok {
-		return fmt.Errorf("secret %q not found", name)
+		return fmt.Errorf("%w: %q", ErrNotFound, name)
 	}
 	if existing.Type != TypeOAuth {
 		return fmt.Errorf("secret %q has type %q, expected %q", name, existing.Type, TypeOAuth)
@@ -141,6 +144,9 @@ func (s *FileStore) readAll() (map[string]Secret, error) {
 		return nil, fmt.Errorf("secret store path is empty")
 	}
 	f, err := os.Open(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return make(map[string]Secret), nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("open secret store %s: %w", s.path, err)
 	}
