@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -11,6 +12,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -22,15 +24,13 @@ import (
 
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/hooks"
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/router"
-	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy"
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/secrets"
 )
 
 func TestHTTPSProxyInterceptsAllowedRequest(t *testing.T) {
 	dir := t.TempDir()
 	caCert, caKey, caPool := writeTestCA(t, dir)
-	policyPath := filepath.Join(dir, "policy.hcl")
-	if err := os.WriteFile(policyPath, []byte(`
+	route, auditLog, auditPath, policyHash := testRouteWithAudit(t, `
 settings {
   default_action = "deny"
 }
@@ -44,14 +44,7 @@ rule "local-reads" {
   condition = "http.method == 'GET'"
   verdict = "allow"
 }
-`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	compiled, err := policy.LoadFile(policyPath)
-	if err != nil {
-		t.Fatalf("LoadFile returned error: %v", err)
-	}
-	route := router.New(hooks.NewPolicyHook(compiled), nil)
+	`)
 	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
@@ -59,7 +52,7 @@ rule "local-reads" {
 	proxy.upstreamRootCAs = caPool
 
 	requestCh := make(chan *http.Request, 1)
-	upstreamAddress, stopUpstream := startTLSUpstream(t, caCert, caKey, requestCh)
+	upstreamAddress, stopUpstream, _ := startObservedTLSUpstreamWithResponseForHost(t, caCert, caKey, "localhost", requestCh, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Trace: allowed-https\r\nSet-Cookie: session=secret\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
 	defer stopUpstream()
 
 	clientConn, proxyConn := net.Pipe()
@@ -69,6 +62,9 @@ rule "local-reads" {
 		SourcePort: 53100,
 		DestIP:     net.ParseIP("127.0.0.1"),
 		DestPort:   443,
+		FlowID:     "019f11a2-ff64-778d-8aa5-637c3921dfc9",
+		VMID:       "vm-123",
+		NetworkID:  "net-456",
 	}
 	flowDecision := routeDecision(t, route, flow)
 	if flowDecision.Action != hooks.RouteClassify {
@@ -99,6 +95,9 @@ rule "local-reads" {
 	if err != nil {
 		t.Fatalf("read client response: %v", err)
 	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", response.StatusCode)
+	}
 	_, _ = io.Copy(io.Discard, response.Body)
 	_ = response.Body.Close()
 	_ = clientTLS.Close()
@@ -111,6 +110,44 @@ rule "local-reads" {
 		}
 	default:
 		t.Fatal("upstream did not receive request")
+	}
+	if err := auditLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	event := readForwarderAuditEvent(t, auditPath)
+	if event.Version != 1 || event.Phase != "end" || event.Family != "http" || event.PolicyHash != policyHash {
+		t.Fatalf("unexpected audit envelope: %#v", event)
+	}
+	if !isUUIDv7(event.RequestID) || event.FlowID != "" || event.ParentFlowID != flow.FlowID {
+		t.Fatalf("unexpected audit ids: %#v", event)
+	}
+	if event.Verdict != "allow" || event.Reason != "" {
+		t.Fatalf("unexpected audit verdict: %#v", event)
+	}
+	if event.VMID != "vm-123" || event.NetworkID != "net-456" {
+		t.Fatalf("unexpected runtime metadata: %#v", event)
+	}
+	if event.Policy == nil || event.Policy.EndpointKind != "https" || event.Policy.EndpointName != "local" || event.Policy.RuleName != "local-reads" {
+		t.Fatalf("unexpected policy metadata: %#v", event)
+	}
+	if event.HTTP == nil || event.HTTP.Scheme != "https" || event.HTTP.Request == nil || event.HTTP.Response == nil {
+		t.Fatalf("unexpected HTTP metadata: %#v", event)
+	}
+	if event.HTTP.Request.Method != http.MethodGet || event.HTTP.Request.Host != "localhost" || event.HTTP.Request.Path != "/private" {
+		t.Fatalf("unexpected HTTP request metadata: %#v", event.HTTP.Request)
+	}
+	if event.HTTP.Response.Status != http.StatusOK {
+		t.Fatalf("unexpected HTTP response status: %#v", event.HTTP.Response)
+	}
+	if values := event.HTTP.Response.Headers["Content-Type"]; len(values) != 1 || values[0] != "application/json" {
+		t.Fatalf("expected Content-Type response header, got %#v", event.HTTP.Response.Headers)
+	}
+	if values := event.HTTP.Response.Headers["X-Trace"]; len(values) != 1 || values[0] != "allowed-https" {
+		t.Fatalf("expected X-Trace response header, got %#v", event.HTTP.Response.Headers)
+	}
+	if values := event.HTTP.Response.Headers["Set-Cookie"]; len(values) != 0 {
+		t.Fatalf("expected Set-Cookie response header to be stripped, got %#v", values)
 	}
 }
 
@@ -282,6 +319,7 @@ rule "allow-local" {
 }
 
 func TestHTTPSProxyCredentialSecretFailureDoesNotContactUpstream(t *testing.T) {
+	logs := captureForwarderLogs(t)
 	dir := t.TempDir()
 	caCert, caKey, caPool := writeTestCA(t, dir)
 	route := testRoute(t, `
@@ -340,9 +378,24 @@ rule "allow-local" {
 	if body := readResponseBody(t, response); body != "credential_secret_error" {
 		t.Fatalf("expected credential_secret_error response, got %q", body)
 	}
+	logText := logs.String()
+	for _, want := range []string{"credential application failed", "credential_secret_error", "bearer_token", "credential_name\":\"local", "bearer_token.local.token", "localhost", "/private"} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("expected credential failure log to contain %q, got %q", want, logText)
+		}
+	}
 	_ = clientTLS.Close()
 	waitForProxy(t, done)
 	assertNoUpstreamAccept(t, acceptedCh)
+}
+
+func captureForwarderLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return &logs
 }
 
 func TestHTTPSProxyDefaultDenyDoesNotContactUpstreamBeforeRequestAllow(t *testing.T) {

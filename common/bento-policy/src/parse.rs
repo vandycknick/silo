@@ -4,10 +4,12 @@ use crate::model::{
     SourceFile, Transport,
 };
 use hcl::{Block, Body, Expression, Structure};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 pub fn parse_policy(filename: String, source: &str) -> Result<Policy, LoadError> {
     let mut policy = Policy {
+        policy_hash: policy_hash(source.as_bytes()),
         documents: Vec::new(),
         diagnostics: Vec::new(),
         conditions: Vec::new(),
@@ -25,6 +27,11 @@ pub fn parse_policy(filename: String, source: &str) -> Result<Policy, LoadError>
     document.id = 1;
     policy.documents.push(document);
     Ok(policy)
+}
+
+fn policy_hash(source: &[u8]) -> String {
+    let digest = Sha256::digest(source);
+    format!("sha256:{digest:x}")
 }
 
 fn parse_document(
@@ -1440,6 +1447,28 @@ fn known_credential_kind(kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::model::{DiagnosticSeverity, ExpectedSecret, Policy};
+    use sha2::{Digest, Sha256};
+
+    fn expected_hash(source: &str) -> String {
+        let digest = Sha256::digest(source.as_bytes());
+        format!("sha256:{digest:x}")
+    }
+
+    #[test]
+    fn policy_hash_covers_exact_source_bytes() {
+        let source = "settings {\n  default_action = \"allow\"\n}";
+        let with_comment = "# comment\nsettings {\n  default_action = \"allow\"\n}";
+        let reformatted = "settings { default_action = \"allow\" }";
+
+        let policy = Policy::parse_str("policy.hcl", source).expect("policy parses");
+        let comment_policy = Policy::parse_str("policy.hcl", with_comment).expect("policy parses");
+        let reformatted_policy =
+            Policy::parse_str("policy.hcl", reformatted).expect("policy parses");
+
+        assert_eq!(policy.policy_hash, expected_hash(source));
+        assert_ne!(policy.policy_hash, comment_policy.policy_hash);
+        assert_ne!(policy.policy_hash, reformatted_policy.policy_hash);
+    }
 
     #[test]
     fn parses_provider_specific_credential_metadata() {

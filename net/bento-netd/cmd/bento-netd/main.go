@@ -88,7 +88,7 @@ func run(cfg *config.Config) error {
 	defer cancel()
 
 	hook := hooks.NewPolicyHook(cfg.Policy)
-	auditLog, err := openAuditLogger(cfg.LogFile)
+	auditLog, err := openAuditLogger(cfg.LogFile, cfg.Policy.PolicyHash())
 	if err != nil {
 		return err
 	}
@@ -196,12 +196,12 @@ func logPolicyDiagnostics(compiled *policy.Policy) {
 	}
 }
 
-func openAuditLogger(logFile string) (*audit.Logger, error) {
+func openAuditLogger(logFile string, policyHash string) (*audit.Logger, error) {
 	auditPath := auditPathForLogFile(logFile)
 	if auditPath == "" {
 		return nil, nil
 	}
-	auditLog, err := audit.Open(auditPath)
+	auditLog, err := audit.Open(auditPath, policyHash)
 	if err != nil {
 		return nil, fmt.Errorf("open audit log %s: %w", auditPath, err)
 	}

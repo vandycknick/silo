@@ -7,6 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.25
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.24
 	github.com/containers/gvisor-tap-vsock v0.0.0-20260519151820-e0561ea366a0
+	github.com/google/uuid v1.6.0
 	github.com/inetaf/tcpproxy v0.0.0-20250222171855-c4b9df066048
 	github.com/sirupsen/logrus v1.9.4
 	golang.org/x/net v0.54.0

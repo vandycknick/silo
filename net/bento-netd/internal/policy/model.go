@@ -63,6 +63,7 @@ type Policy struct {
 	Documents   []PolicyDocument
 	diagnostics []Diagnostic
 	native      *native.Policy
+	policyHash  string
 
 	DefaultAction Action
 
@@ -184,6 +185,10 @@ type Decision struct {
 }
 
 func Default() *Policy {
+	return newPolicy()
+}
+
+func newPolicy() *Policy {
 	return &Policy{
 		DefaultAction:         ActionAllow,
 		ipEndpoints:           make(map[string]*IPEndpoint),
@@ -193,6 +198,13 @@ func Default() *Policy {
 		credentialsByEndpoint: make(map[string][]*Credential),
 		exactHTTPBindings:     make(map[string]Ref),
 	}
+}
+
+func (p *Policy) PolicyHash() string {
+	if p == nil {
+		return ""
+	}
+	return p.policyHash
 }
 
 func (p *Policy) Diagnostics() []Diagnostic {

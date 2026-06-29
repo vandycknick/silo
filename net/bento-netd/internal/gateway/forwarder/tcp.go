@@ -28,18 +28,6 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 	return tcp.NewForwarder(s, 0, 10, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		localAddress := id.LocalAddress
-
-		if !ec2MetadataAccess && linkLocal().Contains(localAddress) {
-			r.Complete(true)
-			return
-		}
-
-		natLock.Lock()
-		if replaced, ok := nat[localAddress]; ok {
-			localAddress = replaced
-		}
-		natLock.Unlock()
-
 		flow := hooks.Flow{
 			Protocol:   "tcp",
 			SourceIP:   addressIP(id.RemoteAddress),
@@ -49,13 +37,29 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 			VMID:       metadata.VMID,
 			NetworkID:  metadata.NetworkID,
 		}
+		flow = route.WithFlowID(flow)
+
+		if !ec2MetadataAccess && linkLocal().Contains(localAddress) {
+			route.RecordFlowOutcome(flow, deniedFlow("metadata_disabled"), "metadata_disabled")
+			r.Complete(true)
+			return
+		}
+
+		natLock.Lock()
+		if replaced, ok := nat[localAddress]; ok {
+			localAddress = replaced
+		}
+		natLock.Unlock()
+		flow.DestIP = addressIP(localAddress)
 		decision, err := route.Decide(context.Background(), flow)
 		if err != nil {
 			slog.Warn("tcp policy hook failed", "error", err)
+			route.RecordFlowOutcome(flow, deniedFlow("policy_error"), "policy_error")
 			r.Complete(true)
 			return
 		}
 		if decision.Action == hooks.RouteDeny {
+			route.RecordFlow(flow, decision)
 			r.Complete(true)
 			return
 		}
@@ -65,20 +69,27 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 		r.Complete(false)
 		if tcpErr != nil {
 			logCreateEndpointError("tcp", flow, tcpErr)
+			route.RecordFlowOutcome(flow, decision, "endpoint_error")
 			return
 		}
 		inbound := gonet.NewTCPConn(&wq, ep)
 		target := net.JoinHostPort(localAddress.String(), fmt.Sprint(id.LocalPort))
 		if httpProxy != nil && httpProxy.ShouldHandle(flow, decision) {
+			reason := ""
 			if err := httpProxy.Handle(context.Background(), inbound, flow, target); err != nil {
 				slog.Debug("http proxy failed", "error", err, "target", target)
+				reason = "proxy_error"
 			}
+			route.RecordFlowOutcome(flow, decision, reason)
 			return
 		}
 		if httpsProxy != nil && httpsProxy.ShouldHandle(flow, decision) {
+			reason := ""
 			if err := httpsProxy.Handle(context.Background(), inbound, flow, target, decision); err != nil {
 				slog.Debug("https proxy failed", "error", err, "target", target)
+				reason = "proxy_error"
 			}
+			route.RecordFlowOutcome(flow, decision, reason)
 			return
 		}
 
@@ -86,10 +97,16 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 		if err != nil {
 			slog.Debug("tcp outbound dial failed", "error", err, "target", target)
 			_ = inbound.Close()
+			route.RecordFlowOutcome(flow, decision, "upstream_error")
 			return
 		}
 		proxyTCP(inbound, outbound)
+		route.RecordFlow(flow, decision)
 	})
+}
+
+func deniedFlow(reason string) hooks.RouteDecision {
+	return hooks.RouteDecision{Action: hooks.RouteDeny, Reason: reason}
 }
 
 func proxyTCP(inbound net.Conn, outbound net.Conn) {

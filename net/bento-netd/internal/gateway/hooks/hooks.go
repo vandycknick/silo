@@ -15,6 +15,7 @@ const (
 )
 
 type Flow struct {
+	FlowID     string
 	Protocol   string
 	SourceIP   net.IP
 	SourcePort uint16

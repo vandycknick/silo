@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -8,6 +9,53 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestPolicyHashUsesExactSourceBytes(t *testing.T) {
+	source := "settings {\n  default_action = \"allow\"\n}"
+	compiled := loadPolicy(t, source)
+	if got, want := compiled.PolicyHash(), policyHashForTest(source); got != want {
+		t.Fatalf("unexpected policy hash: got %q want %q", got, want)
+	}
+
+	withComment := loadPolicy(t, "# comment\n"+source)
+	reformatted := loadPolicy(t, "settings { default_action = \"allow\" }")
+	if compiled.PolicyHash() == withComment.PolicyHash() {
+		t.Fatal("expected comment bytes to change policy hash")
+	}
+	if compiled.PolicyHash() == reformatted.PolicyHash() {
+		t.Fatal("expected formatting bytes to change policy hash")
+	}
+}
+
+func TestDefaultPolicyHasNoPolicyHash(t *testing.T) {
+	compiled := Default()
+	if compiled.PolicyHash() != "" {
+		t.Fatalf("expected implicit default policy to have no hash, got %q", compiled.PolicyHash())
+	}
+
+	decision := compiled.EvaluateFlow(Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), DestIP: net.ParseIP("192.0.2.10"), DestPort: 443})
+	if decision.Action != ActionAllow || decision.Source != DecisionSourceDefault {
+		t.Fatalf("expected default policy to allow, got %#v", decision)
+	}
+}
+
+func TestAuditSettingsRejectSinkControls(t *testing.T) {
+	_, err := loadPolicyError(t, `
+settings {
+  audit {
+    path = "audit.jsonl"
+    enabled = true
+  }
+}
+`)
+	if err == nil {
+		t.Fatal("expected audit sink controls to be rejected")
+	}
+	text := err.Error()
+	if !strings.Contains(text, `An argument named "path" is not expected here.`) || !strings.Contains(text, `An argument named "enabled" is not expected here.`) {
+		t.Fatalf("expected audit sink controls to be rejected, got %v", err)
+	}
+}
 
 func TestDefaultActionDefaultsToAllow(t *testing.T) {
 	compiled := loadPolicy(t, `
@@ -1330,6 +1378,11 @@ func loadPolicy(t *testing.T, text string) *Policy {
 func loadPolicyError(t *testing.T, text string) (*Policy, error) {
 	t.Helper()
 	return LoadReader("policy.hcl", strings.NewReader(text))
+}
+
+func policyHashForTest(source string) string {
+	digest := sha256.Sum256([]byte(source))
+	return fmt.Sprintf("sha256:%x", digest)
 }
 
 func httpConditionPolicy(condition string) string {

@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -15,7 +15,7 @@ import (
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy"
 )
 
-func TestDecideWritesFlowAuditRecord(t *testing.T) {
+func TestRecordFlowWritesIPAuditRecord(t *testing.T) {
 	compiled := loadRouterPolicy(t, `
 endpoint "ip" "web" {
   destination = ["203.0.113.10/32"]
@@ -30,7 +30,7 @@ rule "deny-web" {
 }
 `)
 	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	auditLog, err := audit.Open(auditPath)
+	auditLog, err := audit.Open(auditPath, compiled.PolicyHash())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,21 +46,26 @@ rule "deny-web" {
 	}
 	route := New(hooks.NewPolicyHook(compiled), auditLog)
 
-	if _, err := route.Decide(context.Background(), flow); err != nil {
+	decision, err := route.Decide(context.Background(), flow)
+	if err != nil {
 		t.Fatal(err)
 	}
+	route.RecordFlow(flow, decision)
 	if err := auditLog.Close(); err != nil {
 		t.Fatal(err)
 	}
 
 	event := readAuditEvent(t, auditPath)
-	if event.FinalAction != hooks.RouteDeny {
-		t.Fatalf("expected deny audit action, got %q", event.FinalAction)
+	if event.Version != 1 || event.Phase != "end" || event.Family != "ip" {
+		t.Fatalf("unexpected audit envelope: %#v", event)
 	}
-	if event.Layer != "flow" || event.Source != "rule" || event.DefaultAction != "allow" || event.ClassificationOpportunity {
-		t.Fatalf("unexpected audit decision source metadata: %#v", event)
+	if event.PolicyHash != compiled.PolicyHash() || !isUUIDv7(event.FlowID) || event.ParentFlowID != "" || event.RequestID != "" {
+		t.Fatalf("unexpected audit ids/hash: %#v", event)
 	}
-	if event.RuleName != "deny-web" || event.EndpointKind != "ip" || event.EndpointName != "web" {
+	if event.Verdict != "deny" || event.Reason != "blocked" {
+		t.Fatalf("unexpected audit verdict: %#v", event)
+	}
+	if event.Policy == nil || event.Policy.RuleName != "deny-web" || event.Policy.EndpointKind != "ip" || event.Policy.EndpointName != "web" {
 		t.Fatalf("unexpected audit decision metadata: %#v", event)
 	}
 	if event.Protocol != "tcp" || event.SourceIP != "192.168.127.2" || event.SourcePort != 49152 || event.DestIP != "203.0.113.10" || event.DestPort != 443 {
@@ -69,86 +74,71 @@ rule "deny-web" {
 	if event.VMID != "vm-123" || event.NetworkID != "net-456" {
 		t.Fatalf("unexpected audit runtime metadata: %#v", event)
 	}
+	assertAuditDoesNotContain(t, auditPath, "profile_name")
+	assertAuditDoesNotContain(t, auditPath, "l4_match")
 }
 
-func TestDecideHTTPWritesRequestAuditRecord(t *testing.T) {
+func TestDecideDoesNotAuditBeforeTerminalPath(t *testing.T) {
 	compiled := loadRouterPolicy(t, `
 settings {
   default_action = "deny"
 }
-
-endpoint "https" "api" {
-  hosts = ["api.example.test"]
-}
-
-credential "bearer_token" "api" {
-  endpoint = https.api
-}
-
-rule "allow-api" {
-  endpoint = https.api
-  verdict = "allow"
-  reason = "allowed"
-}
 `)
 	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	auditLog, err := audit.Open(auditPath)
+	auditLog, err := audit.Open(auditPath, compiled.PolicyHash())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	request := hooks.HTTPRequest{
-		Flow: hooks.Flow{
-			Protocol:   "tcp",
-			SourceIP:   net.ParseIP("192.168.127.2"),
-			SourcePort: 49153,
-			DestIP:     net.ParseIP("198.51.100.20"),
-			DestPort:   443,
-			VMID:       "vm-123",
-			NetworkID:  "net-456",
-		},
-		EndpointKind: "https",
-		Host:         "api.example.test",
-		Method:       http.MethodPost,
-		Path:         "/v1/messages",
-		Header: http.Header{
-			"Authorization": []string{"Bearer guest-secret"},
-		},
-	}
 	route := New(hooks.NewPolicyHook(compiled), auditLog)
-
-	if _, err := route.DecideHTTP(context.Background(), request); err != nil {
+	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 49152, DestIP: net.ParseIP("203.0.113.10"), DestPort: 443}
+	if _, err := route.Decide(context.Background(), flow); err != nil {
 		t.Fatal(err)
 	}
 	if err := auditLog.Close(); err != nil {
 		t.Fatal(err)
 	}
+	assertNoAuditRecords(t, auditPath)
+}
 
-	event := readAuditEvent(t, auditPath)
-	if event.FinalAction != hooks.RouteAllowDirect {
-		t.Fatalf("expected allow audit action, got %q", event.FinalAction)
+func TestRecordFlowWritesDefaultActionAuditRecords(t *testing.T) {
+	tests := []struct {
+		name        string
+		policy      string
+		wantVerdict string
+		wantReason  string
+	}{
+		{name: "default allow", policy: `settings { default_action = "allow" }`, wantVerdict: "allow", wantReason: "default_allow"},
+		{name: "default deny", policy: `settings { default_action = "deny" }`, wantVerdict: "deny", wantReason: "default_deny"},
 	}
-	if event.Layer != "request" || event.Source != "rule" || event.DefaultAction != "deny" || event.ClassificationOpportunity {
-		t.Fatalf("unexpected audit decision source metadata: %#v", event)
-	}
-	if event.RuleName != "allow-api" || event.EndpointKind != "https" || event.EndpointName != "api" {
-		t.Fatalf("unexpected audit decision metadata: %#v", event)
-	}
-	if event.CredentialKind != "bearer_token" || event.CredentialName != "api" || event.CredentialStatus != "selected" {
-		t.Fatalf("unexpected audit credential metadata: %#v", event)
-	}
-	if event.HTTPMethod != http.MethodPost || event.HTTPHost != "api.example.test" || event.HTTPPath != "/v1/messages" {
-		t.Fatalf("unexpected audit HTTP metadata: %#v", event)
-	}
-	if event.Protocol != "tcp" || event.SourcePort != 49153 || event.DestPort != 443 {
-		t.Fatalf("unexpected audit flow metadata: %#v", event)
-	}
-	rawAudit, err := os.ReadFile(auditPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(rawAudit), "guest-secret") || strings.Contains(string(rawAudit), "Authorization") {
-		t.Fatalf("audit record leaked request credential material: %s", rawAudit)
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			compiled := loadRouterPolicy(t, test.policy)
+			auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+			auditLog, err := audit.Open(auditPath, compiled.PolicyHash())
+			if err != nil {
+				t.Fatal(err)
+			}
+			flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 49152, DestIP: net.ParseIP("203.0.113.10"), DestPort: 443}
+			route := New(hooks.NewPolicyHook(compiled), auditLog)
+			decision, err := route.Decide(context.Background(), flow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			route.RecordFlow(flow, decision)
+			if err := auditLog.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			event := readAuditEvent(t, auditPath)
+			if event.Phase != "end" || event.Family != "ip" || event.Verdict != test.wantVerdict || event.Reason != test.wantReason {
+				t.Fatalf("unexpected default audit record: %#v", event)
+			}
+			if event.Policy != nil {
+				t.Fatalf("default decision should not include endpoint/rule metadata: %#v", event)
+			}
+		})
 	}
 }
 
@@ -201,6 +191,32 @@ func readAuditEvent(t *testing.T, path string) audit.Event {
 		t.Fatal(err)
 	}
 	return event
+}
+
+func assertNoAuditRecords(t *testing.T, path string) {
+	t.Helper()
+	rawAudit, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rawAudit) != 0 {
+		t.Fatalf("expected no audit records, got %s", rawAudit)
+	}
+}
+
+func assertAuditDoesNotContain(t *testing.T, path string, forbidden string) {
+	t.Helper()
+	rawAudit, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rawAudit), forbidden) {
+		t.Fatalf("audit record contained %q: %s", forbidden, rawAudit)
+	}
+}
+
+func isUUIDv7(value string) bool {
+	return regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(value)
 }
 
 func loadRouterPolicy(t *testing.T, text string) *policy.Policy {

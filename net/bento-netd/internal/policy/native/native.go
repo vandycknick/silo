@@ -53,6 +53,10 @@ func ParseSource(filename string, source []byte) (*Policy, Status, []byte, error
 	status := Status(C.bento_policy_parse_source(bytesView(filenameBytes), bytesView(source), &rawPolicy, &rawError))
 	runtime.KeepAlive(filenameBytes)
 	runtime.KeepAlive(source)
+	return finishParse(status, rawPolicy, rawError)
+}
+
+func finishParse(status Status, rawPolicy *C.bento_policy_t, rawError C.bento_policy_buffer_t) (*Policy, Status, []byte, error) {
 	errorJSON := copyBuffer(rawError)
 	if status != StatusOK {
 		return nil, status, errorJSON, nil

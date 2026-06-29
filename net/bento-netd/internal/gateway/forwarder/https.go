@@ -164,50 +164,53 @@ func (p *HTTPSProxy) proxyHTTP(ctx context.Context, client *tls.Conn, flow hooks
 		if err != nil {
 			return err
 		}
+		request := httpRequest(flow, "https", req)
 		if req.Host == "" {
 			_ = req.Body.Close()
-			return writeHTTPStatus(client, http.StatusBadRequest, "missing_host")
+			status, body := http.StatusBadRequest, "missing_host"
+			p.route.RecordHTTP(request, deniedFlow(body), status, httpStatusHeader(status, body))
+			return writeHTTPStatus(client, status, body)
 		}
 		if selection.rawAuthority != "" {
 			if !p.route.MatchHTTPSAuthority(req.Host, selection.rawAuthority) {
 				_ = req.Body.Close()
-				return writeHTTPStatus(client, http.StatusMisdirectedRequest, "host_mismatch")
+				status, body := http.StatusMisdirectedRequest, "host_mismatch"
+				p.route.RecordHTTP(request, deniedFlow(body), status, httpStatusHeader(status, body))
+				return writeHTTPStatus(client, status, body)
 			}
 		} else {
 			_, hostEndpointName, ok := p.route.ResolveHTTPHost("https", req.Host)
 			if !ok || hostEndpointName != selection.endpointName {
 				_ = req.Body.Close()
-				return writeHTTPStatus(client, http.StatusMisdirectedRequest, "host_mismatch")
+				status, body := http.StatusMisdirectedRequest, "host_mismatch"
+				p.route.RecordHTTP(request, deniedFlow(body), status, httpStatusHeader(status, body))
+				return writeHTTPStatus(client, status, body)
 			}
 		}
 
-		decision, err := p.route.DecideHTTP(ctx, hooks.HTTPRequest{
-			Flow:         flow,
-			EndpointKind: "https",
-			Host:         req.Host,
-			Method:       req.Method,
-			Path:         requestPath(req),
-			Query:        req.URL.RawQuery,
-			Header:       req.Header.Clone(),
-		})
+		decision, err := p.route.DecideHTTP(ctx, request)
 		if err != nil {
 			_ = req.Body.Close()
 			return err
 		}
 		if decision.Action == hooks.RouteDeny {
 			_ = req.Body.Close()
-			return writeDeny(client, decision.Reason)
+			status, body := denyStatusAndBody(decision.Reason)
+			p.route.RecordHTTP(request, decision, status, httpStatusHeader(status, body))
+			return writeHTTPStatus(client, status, body)
 		}
 
 		upgrade := isWebSocketUpgrade(req)
-		if err := forwardHTTPFamilyRequest(ctx, client, clientReader, req, "https", selection.forwardHost, p.credentialManager, decision.Credential, func() (net.Conn, error) {
+		outcome, err := forwardHTTPFamilyRequest(ctx, client, clientReader, req, "https", selection.forwardHost, p.credentialManager, decision.Credential, func() (net.Conn, error) {
 			return tls.DialWithDialer(&net.Dialer{}, "tcp", target, &tls.Config{
 				MinVersion: tls.VersionTLS12,
 				NextProtos: []string{"http/1.1"},
 				RootCAs:    p.upstreamRootCAs,
 				ServerName: selection.upstreamServerName,
 			})
-		}); err != nil {
+		})
+		p.route.RecordHTTPOutcome(request, decision, outcome.status, outcome.responseHeader, outcome.reason)
+		if err != nil {
 			return err
 		}
 		if upgrade || req.Close {

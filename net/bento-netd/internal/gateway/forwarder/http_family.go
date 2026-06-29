@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -18,6 +19,12 @@ import (
 const maxHTTPResponseHeaderBytes = 1 << 20
 
 var errHTTPResponseHeaderTooLarge = errors.New("http response header too large")
+
+type httpForwardOutcome struct {
+	status         int
+	reason         string
+	responseHeader http.Header
+}
 
 var normalRequestStripHeaders = []string{
 	"Connection",
@@ -59,19 +66,21 @@ func forwardHTTPFamilyRequest(
 	credentialManager *credentials.Manager,
 	credential *hooks.Credential,
 	dial func() (net.Conn, error),
-) error {
+) (httpForwardOutcome, error) {
 	if isWebSocketUpgrade(req) {
 		prepareWebSocketForwardRequest(req, scheme, authority)
 		if err := applyHTTPFamilyCredential(ctx, req, credentialManager, credential); err != nil {
+			logCredentialApplyError(req, credential, err)
 			_ = req.Body.Close()
-			return writeHTTPStatus(client, http.StatusBadGateway, credentials.FailureReason(err))
+			return writeHTTPFamilyStatus(client, http.StatusBadGateway, credentials.FailureReason(err))
 		}
 		return proxyWebSocketUpgrade(client, clientReader, req, dial)
 	}
 	prepareNormalForwardRequest(req, scheme, authority)
 	if err := applyHTTPFamilyCredential(ctx, req, credentialManager, credential); err != nil {
+		logCredentialApplyError(req, credential, err)
 		_ = req.Body.Close()
-		return writeHTTPStatus(client, http.StatusBadGateway, credentials.FailureReason(err))
+		return writeHTTPFamilyStatus(client, http.StatusBadGateway, credentials.FailureReason(err))
 	}
 	return proxyHTTPFamilyRoundTrip(client, req, dial)
 }
@@ -86,57 +95,77 @@ func applyHTTPFamilyCredential(ctx context.Context, req *http.Request, manager *
 	return manager.Apply(ctx, req, credential)
 }
 
-func proxyHTTPFamilyRoundTrip(client net.Conn, req *http.Request, dial func() (net.Conn, error)) error {
+func logCredentialApplyError(req *http.Request, credential *hooks.Credential, err error) {
+	attrs := []any{
+		"reason", credentials.FailureReason(err),
+		"error", err,
+		"method", req.Method,
+		"host", req.Host,
+		"path", requestPath(req),
+	}
+	if credential != nil {
+		attrs = append(attrs, "credential_kind", credential.Kind, "credential_name", credential.Name)
+	}
+	slog.Error("credential application failed", attrs...)
+}
+
+func proxyHTTPFamilyRoundTrip(client net.Conn, req *http.Request, dial func() (net.Conn, error)) (httpForwardOutcome, error) {
 	defer req.Body.Close()
 	outbound, err := dial()
 	if err != nil {
-		return writeHTTPStatus(client, http.StatusBadGateway, "upstream_error")
+		return writeHTTPFamilyStatus(client, http.StatusBadGateway, "upstream_error")
 	}
 	defer outbound.Close()
 
 	upstreamReader := bufio.NewReader(outbound)
 	if err := req.Write(outbound); err != nil {
-		return writeHTTPStatus(client, http.StatusBadGateway, "upstream_error")
+		return writeHTTPFamilyStatus(client, http.StatusBadGateway, "upstream_error")
 	}
 
 	resp, err := http.ReadResponse(upstreamReader, req)
 	if err != nil {
-		return writeHTTPStatus(client, http.StatusBadGateway, "upstream_error")
+		return writeHTTPFamilyStatus(client, http.StatusBadGateway, "upstream_error")
 	}
 	defer resp.Body.Close()
 	sanitizeHTTPFamilyResponse(resp, true)
-	return resp.Write(client)
+	return httpForwardOutcome{status: resp.StatusCode, responseHeader: resp.Header.Clone()}, resp.Write(client)
 }
 
-func proxyWebSocketUpgrade(client net.Conn, clientReader *bufio.Reader, req *http.Request, dial func() (net.Conn, error)) error {
+func proxyWebSocketUpgrade(client net.Conn, clientReader *bufio.Reader, req *http.Request, dial func() (net.Conn, error)) (httpForwardOutcome, error) {
 	defer req.Body.Close()
 	outbound, err := dial()
 	if err != nil {
-		return writeHTTPStatus(client, http.StatusBadGateway, "upstream_error")
+		return writeHTTPFamilyStatus(client, http.StatusBadGateway, "upstream_error")
 	}
 	defer outbound.Close()
 
 	upstreamReader := bufio.NewReader(outbound)
 	if err := req.Write(outbound); err != nil {
-		return writeHTTPStatus(client, http.StatusBadGateway, "upstream_error")
+		return writeHTTPFamilyStatus(client, http.StatusBadGateway, "upstream_error")
 	}
 
 	rawHeader, err := readHTTPResponseHeader(upstreamReader)
 	if err != nil {
-		return writeHTTPStatus(client, http.StatusBadGateway, "upstream_error")
+		return writeHTTPFamilyStatus(client, http.StatusBadGateway, "upstream_error")
 	}
 	statusCode := statusCodeFromRawHTTPResponseHeader(rawHeader)
 	if statusCode == 0 {
-		return writeHTTPStatus(client, http.StatusBadGateway, "upstream_error")
+		return writeHTTPFamilyStatus(client, http.StatusBadGateway, "upstream_error")
 	}
-	if _, err := client.Write(sanitizeRawHTTPResponseHeader(rawHeader)); err != nil {
-		return err
+	sanitizedHeader := sanitizeRawHTTPResponseHeader(rawHeader)
+	responseHeader := responseHeaderFromRawHTTPResponseHeader(sanitizedHeader, req)
+	if _, err := client.Write(sanitizedHeader); err != nil {
+		return httpForwardOutcome{status: statusCode, responseHeader: responseHeader}, err
 	}
 	if statusCode != http.StatusSwitchingProtocols {
 		_, err := io.Copy(client, upstreamReader)
-		return err
+		return httpForwardOutcome{status: statusCode, responseHeader: responseHeader}, err
 	}
-	return relayOpaqueWebSocket(client, clientReader, outbound, upstreamReader)
+	return httpForwardOutcome{status: statusCode, responseHeader: responseHeader}, relayOpaqueWebSocket(client, clientReader, outbound, upstreamReader)
+}
+
+func writeHTTPFamilyStatus(conn net.Conn, status int, reason string) (httpForwardOutcome, error) {
+	return httpForwardOutcome{status: status, reason: reason, responseHeader: httpStatusHeader(status, reason)}, writeHTTPStatus(conn, status, reason)
 }
 
 func prepareNormalForwardRequest(req *http.Request, scheme string, authority string) {
@@ -251,6 +280,15 @@ func sanitizeRawHTTPResponseHeader(header []byte) []byte {
 		sanitized.Write(line)
 	}
 	return sanitized.Bytes()
+}
+
+func responseHeaderFromRawHTTPResponseHeader(header []byte, req *http.Request) http.Header {
+	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(header)), req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	return resp.Header.Clone()
 }
 
 func rawHeaderLines(header []byte) [][]byte {

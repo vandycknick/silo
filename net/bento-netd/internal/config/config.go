@@ -104,13 +104,15 @@ func LoadPolicy(cfg *Config) error {
 	if cfg == nil {
 		return errors.New("missing configuration")
 	}
-	compiledPolicy := policy.Default()
+	var compiledPolicy *policy.Policy
+	var err error
 	if cfg.PolicyFile != "" {
-		loaded, err := policy.LoadFile(cfg.PolicyFile)
-		if err != nil {
-			return err
-		}
-		compiledPolicy = loaded
+		compiledPolicy, err = policy.LoadFile(cfg.PolicyFile)
+	} else {
+		compiledPolicy = policy.Default()
+	}
+	if err != nil {
+		return err
 	}
 	if compiledPolicy.HasHTTPS() {
 		if cfg.TLS.CACert == "" || cfg.TLS.CAKey == "" {

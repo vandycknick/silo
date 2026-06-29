@@ -50,16 +50,15 @@ The rest of this document follows from these decisions.
 3. Endpoint kinds, credential kinds, facets, transports, and capabilities are registered statically by the implementing policy runtime. This is not a dynamic plugin system.
 4. Rules have only terminal verdicts: `allow` and `deny`. Audit is not a verdict.
 5. `settings.default_action` defaults to `allow`. It applies only when no explicit rule matches at the relevant stage.
-6. `endpoint "ip"` replaces the older `endpoint "cidr"` syntax. There is no legacy alias or compatibility mode.
-7. L7 transports may classify configured HTTP/HTTPS traffic under default deny, but classification punch-through never permits upstream contact, credential injection, or data forwarding by itself.
-8. HTTPS no-SNI classification is allowed only for explicit raw-IP HTTPS endpoint bindings. No-SNI HTTPS without such a binding fails closed before upstream contact.
-9. HTTP-family proxy and MITM behavior follows a transparent proxy model: rules evaluate on the request, WebSocket frames are opaque after upgrade, `CONNECT` is treated as an HTTP method, and synthetic denials/errors are returned without upstream contact where possible.
-10. Credentials are endpoint-bound request modifiers. `rule.credential` is a predicate over the selected credential identity, not an injection trigger.
-11. Secret lookup, refresh, signing, and injection occur only after an explicit allow. Runtime credential failures return synthetic `502` responses and do not fall back to unauthenticated forwarding.
-12. Tailscale outbound routing is selected only by an explicit allow rule with `tunnel = tailscale.<name>`. Default allow never tunnels.
-13. Inbound forwards are configured exposures and are outside the outbound endpoint/rule/default-action policy model. Initial forwards are raw TCP byte proxies only.
-14. Audit records are JSONL with `version = 1`, UUIDv7 IDs, RFC3339Nano UTC timestamps, a raw policy-file `policy_hash`, and no `profile_name` field.
-15. Policy-load warnings are non-fatal and visible in service logs and runtime status, not in `audit.jsonl`.
+6. L7 transports may classify configured HTTP/HTTPS traffic under default deny, but classification punch-through never permits upstream contact, credential injection, or data forwarding by itself.
+7. HTTPS no-SNI classification is allowed only for explicit raw-IP HTTPS endpoint bindings. No-SNI HTTPS without such a binding fails closed before upstream contact.
+8. HTTP-family proxy and MITM behavior follows a transparent proxy model: rules evaluate on the request, WebSocket frames are opaque after upgrade, `CONNECT` is treated as an HTTP method, and synthetic denials/errors are returned without upstream contact where possible.
+9. Credentials are endpoint-bound request modifiers. `rule.credential` is a predicate over the selected credential identity, not an injection trigger.
+10. Secret lookup, refresh, signing, and injection occur only after an explicit allow. Runtime credential failures return synthetic `502` responses and do not fall back to unauthenticated forwarding.
+11. Tailscale outbound routing is selected only by an explicit allow rule with `tunnel = tailscale.<name>`. Default allow never tunnels.
+12. Inbound forwards are configured exposures and are outside the outbound endpoint/rule/default-action policy model. Initial forwards are raw TCP byte proxies only.
+13. Audit records are JSONL with `version = 1`, UUIDv7 IDs, RFC3339Nano UTC timestamps, an optional raw policy-file `policy_hash`, and no `profile_name` field.
+14. Policy-load warnings are non-fatal and visible in service logs and runtime status, not in `audit.jsonl`.
 
 ## Goals
 
@@ -182,10 +181,10 @@ Only one `settings` block is valid. Multiple settings blocks are a load error.
 
 The audit block here is only for body sampling knobs. It is not where we configure sinks, enablement, verdicts, durability guarantees, or traffic policy.
 
-| Attribute | Type | Default | Semantics |
-| --------- | ---- | ------- | --------- |
-| `body_buffer` | size string | `"1MiB"` | Maximum request body bytes an implementation may buffer for HTTP-family operational and audit processing. |
-| `body_storage` | size string | `"4KiB"` | Maximum body preview bytes persisted in audit JSONL samples. |
+| Attribute      | Type        | Default  | Semantics                                                                                                 |
+| -------------- | ----------- | -------- | --------------------------------------------------------------------------------------------------------- |
+| `body_buffer`  | size string | `"1MiB"` | Maximum request body bytes an implementation may buffer for HTTP-family operational and audit processing. |
+| `body_storage` | size string | `"4KiB"` | Maximum body preview bytes persisted in audit JSONL samples.                                              |
 
 Size strings must be positive. Implementations should accept human-readable values such as `"64KiB"`, `"1MiB"`, and bare byte counts. Invalid, zero, and negative sizes are load errors.
 
@@ -212,12 +211,12 @@ endpoint "ip" "private_https" {
 
 Schema:
 
-| Attribute | Type | Required | Semantics |
-| --------- | ---- | -------- | --------- |
-| `source` | list of CIDR strings | No | Source IP prefixes. |
-| `destination` | list of CIDR strings | No | Destination IP prefixes. |
-| `protocol` | string | No | `any`, `tcp`, or `udp`. Defaults to `any`. |
-| `ports` | list of integers or ranges | No | Destination ports, valid only when protocol is `tcp` or `udp`. |
+| Attribute     | Type                       | Required | Semantics                                                      |
+| ------------- | -------------------------- | -------- | -------------------------------------------------------------- |
+| `source`      | list of CIDR strings       | No       | Source IP prefixes.                                            |
+| `destination` | list of CIDR strings       | No       | Destination IP prefixes.                                       |
+| `protocol`    | string                     | No       | `any`, `tcp`, or `udp`. Defaults to `any`.                     |
+| `ports`       | list of integers or ranges | No       | Destination ports, valid only when protocol is `tcp` or `udp`. |
 
 At least one of `source` or `destination` is required. If both are present, both must match. `protocol = "any"` cannot be combined with `ports`.
 
@@ -241,9 +240,9 @@ endpoint "http" "metadata_service" {
 
 Schema:
 
-| Attribute | Type | Required | Semantics |
-| --------- | ---- | -------- | --------- |
-| `hosts` | list of host patterns | Yes | Exact hosts, exact authorities, IP literals, or wildcard host patterns. |
+| Attribute | Type                  | Required | Semantics                                                               |
+| --------- | --------------------- | -------- | ----------------------------------------------------------------------- |
+| `hosts`   | list of host patterns | Yes      | Exact hosts, exact authorities, IP literals, or wildcard host patterns. |
 
 The default port for `http` endpoints is `80`. A host entry may include a non-default port. Host entries must not include a URL scheme, path, query string, or fragment.
 
@@ -267,9 +266,9 @@ endpoint "https" "github" {
 
 Schema:
 
-| Attribute | Type | Required | Semantics |
-| --------- | ---- | -------- | --------- |
-| `hosts` | list of host patterns | Yes | Exact hosts, exact authorities, IP literals, or wildcard host patterns. |
+| Attribute | Type                  | Required | Semantics                                                               |
+| --------- | --------------------- | -------- | ----------------------------------------------------------------------- |
+| `hosts`   | list of host patterns | Yes      | Exact hosts, exact authorities, IP literals, or wildcard host patterns. |
 
 The default port for `https` endpoints is `443`. A host entry may include a non-default port. Configured non-default HTTPS ports must actually route into the `https-mitm` transport. It is not enough for the parser to accept `host:8443` while the gateway only MITMs port `443`.
 
@@ -326,17 +325,17 @@ rule "github-read-only" {
 
 Schema:
 
-| Attribute | Type | Required | Semantics |
-| --------- | ---- | -------- | --------- |
-| `endpoint` | endpoint reference | Exactly one of `endpoint` or `endpoints` | Single endpoint target. |
-| `endpoints` | list of endpoint references | Exactly one of `endpoint` or `endpoints` | Multiple endpoint targets in the same family. |
-| `condition` | string | No | CEL expression compiled against the endpoint family facets. |
-| `credential` | credential reference | No | Predicate requiring the selected credential to match. |
-| `tunnel` | Tailscale reference | No | Route an explicitly allowed outbound request or flow through a Tailscale node. |
-| `verdict` | string | Yes | `allow` or `deny`. |
-| `priority` | integer | No | Higher values evaluate first. Defaults to `0`. |
-| `disabled` | bool | No | Disabled rules are validated but removed from evaluation. Defaults to `false`. |
-| `reason` | string | No | Human-readable reason for logs and audit. |
+| Attribute    | Type                        | Required                                 | Semantics                                                                      |
+| ------------ | --------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------ |
+| `endpoint`   | endpoint reference          | Exactly one of `endpoint` or `endpoints` | Single endpoint target.                                                        |
+| `endpoints`  | list of endpoint references | Exactly one of `endpoint` or `endpoints` | Multiple endpoint targets in the same family.                                  |
+| `condition`  | string                      | No                                       | CEL expression compiled against the endpoint family facets.                    |
+| `credential` | credential reference        | No                                       | Predicate requiring the selected credential to match.                          |
+| `tunnel`     | Tailscale reference         | No                                       | Route an explicitly allowed outbound request or flow through a Tailscale node. |
+| `verdict`    | string                      | Yes                                      | `allow` or `deny`.                                                             |
+| `priority`   | integer                     | No                                       | Higher values evaluate first. Defaults to `0`.                                 |
+| `disabled`   | bool                        | No                                       | Disabled rules are validated but removed from evaluation. Defaults to `false`. |
+| `reason`     | string                      | No                                       | Human-readable reason for logs and audit.                                      |
 
 Exactly one of `endpoint` or `endpoints` is required. A rule with neither is a load error. A rule with both is a load error.
 
@@ -356,13 +355,13 @@ Rules evaluate separately per policy stage. Within a stage, enabled rules are or
 
 The initial `http` facet keeps the policy surface narrow. It exposes only these variables to CEL:
 
-| Variable | Type | Semantics |
-| -------- | ---- | --------- |
-| `http.method` | string | Request method, matched case-insensitively. |
-| `http.host` | string | Normalized policy host, lowercase and default-port-normalized. |
-| `http.path` | string | Parsed path component only, excluding query string. |
-| `http.query` | `map<string, list<string>>` | Parsed query parameters. |
-| `http.headers` | `map<string, list<string>>` | Request headers with case-insensitive key lookup. |
+| Variable       | Type                        | Semantics                                                      |
+| -------------- | --------------------------- | -------------------------------------------------------------- |
+| `http.method`  | string                      | Request method, matched case-insensitively.                    |
+| `http.host`    | string                      | Normalized policy host, lowercase and default-port-normalized. |
+| `http.path`    | string                      | Parsed path component only, excluding query string.            |
+| `http.query`   | `map<string, list<string>>` | Parsed query parameters.                                       |
+| `http.headers` | `map<string, list<string>>` | Request headers with case-insensitive key lookup.              |
 
 `http.method` comparisons must be case-insensitive. Runtimes can satisfy this by normalizing method values in the CEL adapter before equality and membership checks.
 
@@ -386,7 +385,7 @@ Evaluation is layered for one reason: an L7 allow cannot undo an explicit L3/L4 
 
 Policy load proceeds in this order:
 
-1. Read the single raw HCL policy file and compute `policy_hash`.
+1. If a policy file is provided, read the single raw HCL policy file and compute `policy_hash`.
 2. Parse HCL.
 3. Validate top-level block types, unknown attributes, and duplicate names.
 4. Decode `settings` and validate audit size limits.
@@ -430,11 +429,11 @@ Classification punch-through is permission for the runtime to accept and inspect
 
 Punch-through is allowed only when the selected transport can classify before upstream contact. The initial transports behave as follows:
 
-| Transport | Punch-through under default deny | Reason |
-| --------- | -------------------------------- | ------ |
-| `http-proxy` | Yes | It can parse the HTTP request line and headers before upstream contact. |
-| `https-mitm` | Yes | It can classify SNI or explicit raw-IP HTTPS bindings and decrypted HTTP request metadata before upstream contact. |
-| `packet-filter` | No | Raw forwarding has no higher-layer classification step. |
+| Transport       | Punch-through under default deny | Reason                                                                                                             |
+| --------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `http-proxy`    | Yes                              | It can parse the HTTP request line and headers before upstream contact.                                            |
+| `https-mitm`    | Yes                              | It can classify SNI or explicit raw-IP HTTPS bindings and decrypted HTTP request metadata before upstream contact. |
+| `packet-filter` | No                               | Raw forwarding has no higher-layer classification step.                                                            |
 
 Future transports must declare this property explicitly. A future `postgres-proxy` may use punch-through only if it can classify startup/query metadata before upstream contact or before any upstream-visible side effect. A future `ssh-proxy` may use it only if it can classify login/channel/command intent before upstream authentication or command execution effects.
 
@@ -450,18 +449,18 @@ Once transport classification says an HTTP-family request is owned by an endpoin
 
 When policy rejects a request before upstream work begins, the runtime returns a gateway-generated response and does not contact upstream.
 
-| Condition | Status | Reason |
-| --------- | ------ | ------ |
-| Missing/invalid HTTP Host or authority for owned endpoint | `400 Bad Request` | `missing_host` |
-| SNI/Host, raw-IP/Host, or dispatch/Host mismatch | `421 Misdirected Request` | `host_mismatch` |
-| Explicit deny | `403 Forbidden` | rule/default reason |
-| Default deny | `403 Forbidden` | `default_deny` |
-| Runtime rule condition error | `403 Forbidden` | `condition_error` |
-| Runtime credential condition error | `403 Forbidden` | `credential_condition_error` |
-| Ambiguous credentials | `403 Forbidden` | `ambiguous_credentials` |
-| Credential secret lookup/refresh/signing/injection failure | `502 Bad Gateway` | specific credential error reason |
-| Selected Tailscale tunnel unavailable or failed | `502 Bad Gateway` | `tunnel_not_connected` or `tunnel_error` |
-| Upstream dial, TLS, or round-trip failure after explicit allow | `502 Bad Gateway` | `upstream_error` |
+| Condition                                                      | Status                    | Reason                                   |
+| -------------------------------------------------------------- | ------------------------- | ---------------------------------------- |
+| Missing/invalid HTTP Host or authority for owned endpoint      | `400 Bad Request`         | `missing_host`                           |
+| SNI/Host, raw-IP/Host, or dispatch/Host mismatch               | `421 Misdirected Request` | `host_mismatch`                          |
+| Explicit deny                                                  | `403 Forbidden`           | rule/default reason                      |
+| Default deny                                                   | `403 Forbidden`           | `default_deny`                           |
+| Runtime rule condition error                                   | `403 Forbidden`           | `condition_error`                        |
+| Runtime credential condition error                             | `403 Forbidden`           | `credential_condition_error`             |
+| Ambiguous credentials                                          | `403 Forbidden`           | `ambiguous_credentials`                  |
+| Credential secret lookup/refresh/signing/injection failure     | `502 Bad Gateway`         | specific credential error reason         |
+| Selected Tailscale tunnel unavailable or failed                | `502 Bad Gateway`         | `tunnel_not_connected` or `tunnel_error` |
+| Upstream dial, TLS, or round-trip failure after explicit allow | `502 Bad Gateway`         | `upstream_error`                         |
 
 Credential runtime reasons should be specific and redacted, such as `credential_secret_error`, `credential_refresh_error`, `credential_signing_error`, or `credential_injection_error`.
 
@@ -519,7 +518,7 @@ WebSocket upgrade request forwarding preserves the headers required for the hand
 
 The raw `101 Switching Protocols` response path strips credential-bearing response headers and `Alt-Svc` while preserving the handshake headers needed for the upgrade.
 
-Audit for WebSocket traffic is limited to upgrade request/response metadata, endpoint/rule/credential/tunnel metadata, duration, byte counts, and errors.
+Audit for WebSocket traffic is limited to upgrade request/response metadata, policy/credential/tunnel metadata, duration, byte counts, and errors.
 
 ### CONNECT
 
@@ -549,10 +548,10 @@ credential "bearer_token" "github_api" {
 
 Common schema:
 
-| Attribute | Type | Required | Semantics |
-| --------- | ---- | -------- | --------- |
-| `endpoint` | endpoint reference | Yes | The single endpoint this credential can apply to. |
-| `condition` | string | No | CEL expression compiled against the endpoint family facets. |
+| Attribute   | Type               | Required | Semantics                                                   |
+| ----------- | ------------------ | -------- | ----------------------------------------------------------- |
+| `endpoint`  | endpoint reference | Yes      | The single endpoint this credential can apply to.           |
+| `condition` | string             | No       | CEL expression compiled against the endpoint family facets. |
 
 `credential.endpoint` is a fully qualified typed endpoint reference such as `https.github`. Credentials bind to exactly one endpoint for now. There is no `credential.endpoints` attribute.
 
@@ -570,11 +569,11 @@ Credential selection happens after L7 endpoint classification and before L7 rule
 
 For the classified endpoint and request context:
 
-| Matching credentials | Result |
-| -------------------- | ------ |
-| `0` | No credential is selected. |
-| `1` | That credential is selected. |
-| `2+` | The request fails closed with reason `ambiguous_credentials`. |
+| Matching credentials | Result                                                        |
+| -------------------- | ------------------------------------------------------------- |
+| `0`                  | No credential is selected.                                    |
+| `1`                  | That credential is selected.                                  |
+| `2+`                 | The request fails closed with reason `ambiguous_credentials`. |
 
 Credential selection is part of classifying an endpoint request. If an endpoint supports credentials and multiple credentials match, the request fails closed with `ambiguous_credentials` before rule evaluation, even under `default_action = "allow"` and even if a later allow rule would omit `rule.credential`.
 
@@ -615,14 +614,14 @@ Credential kinds live in a static registry. A credential kind defines policy att
 
 The initial credential kinds are:
 
-| Kind | Policy attributes | Secret slots | Initial behavior |
-| ---- | ----------------- | ------------ | ---------------- |
-| `basic_auth` | `username` | `password` | Sets `Authorization: Basic base64(username:password)`. |
-| `bearer_token` | optional `idempotency_key` | `token` | Sets `Authorization: Bearer <token>`. |
-| `header_token` | `header`, optional `prefix` | `token` | Sets the configured header to `prefix + token`. |
-| `github_oauth` | none | OAuth token material | Supports GitHub API bearer auth and Git smart HTTP-compatible auth. |
-| `openai_codex_oauth` | none | OAuth token material | Sets OpenAI Codex auth headers and refreshes tokens when needed. |
-| `aws_credential` | none | `access_key_id`, `secret_access_key`, optional `session_token` | Performs generic AWS SigV4 re-signing on compatible `endpoint "https"`. |
+| Kind                 | Policy attributes           | Secret slots                                                   | Initial behavior                                                        |
+| -------------------- | --------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `basic_auth`         | `username`                  | `password`                                                     | Sets `Authorization: Basic base64(username:password)`.                  |
+| `bearer_token`       | optional `idempotency_key`  | `token`                                                        | Sets `Authorization: Bearer <token>`.                                   |
+| `header_token`       | `header`, optional `prefix` | `token`                                                        | Sets the configured header to `prefix + token`.                         |
+| `github_oauth`       | none                        | OAuth token material                                           | Supports GitHub API bearer auth and Git smart HTTP-compatible auth.     |
+| `openai_codex_oauth` | none                        | OAuth token material                                           | Sets OpenAI Codex auth headers and refreshes tokens when needed.        |
+| `aws_credential`     | none                        | `access_key_id`, `secret_access_key`, optional `session_token` | Performs generic AWS SigV4 re-signing on compatible `endpoint "https"`. |
 
 `basic_auth.username`, `header_token.header`, and `header_token.prefix` are policy metadata, not secrets. Secret slots are never logged.
 
@@ -645,13 +644,13 @@ tailscale "main" {
 
 Schema:
 
-| Attribute | Type | Required | Semantics |
-| --------- | ---- | -------- | --------- |
-| `hostname` | string | No | Tailnet hostname for the embedded node. |
-| `auth_key_secret` | secret handle | No | Out-of-band secret handle for a Tailscale auth key. |
-| `oauth_client_secret` | secret handle | No | Out-of-band secret handle for OAuth client-secret based auth. |
-| `tags` | list of string | No | Tailscale tags requested by the node. |
-| `control_url` | string | No | Optional alternate control plane URL. |
+| Attribute             | Type           | Required | Semantics                                                     |
+| --------------------- | -------------- | -------- | ------------------------------------------------------------- |
+| `hostname`            | string         | No       | Tailnet hostname for the embedded node.                       |
+| `auth_key_secret`     | secret handle  | No       | Out-of-band secret handle for a Tailscale auth key.           |
+| `oauth_client_secret` | secret handle  | No       | Out-of-band secret handle for OAuth client-secret based auth. |
+| `tags`                | list of string | No       | Tailscale tags requested by the node.                         |
+| `control_url`         | string         | No       | Optional alternate control plane URL.                         |
 
 At most one of `auth_key_secret` and `oauth_client_secret` may be set. If neither is set, the node starts in interactive-login mode and surfaces the login URL through runtime status/logging. This is valid policy, not a load error.
 
@@ -721,11 +720,11 @@ The first `forward` label selects the listener kind. The second label is the for
 
 Common forward schema:
 
-| Attribute | Type | Required | Semantics |
-| --------- | ---- | -------- | --------- |
-| `listen` | string | Yes | Listener address such as `tcp/127.0.0.1:2222` or `tcp/:8080`. |
-| `target` | nested block | No | VM target selector and port. |
-| `tailscale` | Tailscale ref | `tailscale` forwards only | Embedded Tailscale node that owns the listener. |
+| Attribute   | Type          | Required                  | Semantics                                                     |
+| ----------- | ------------- | ------------------------- | ------------------------------------------------------------- |
+| `listen`    | string        | Yes                       | Listener address such as `tcp/127.0.0.1:2222` or `tcp/:8080`. |
+| `target`    | nested block  | No                        | VM target selector and port.                                  |
+| `tailscale` | Tailscale ref | `tailscale` forwards only | Embedded Tailscale node that owns the listener.               |
 
 Inbound forwards are outside the outbound endpoint/rule/`settings.default_action` policy model. A configured forward is an explicit inbound exposure. If its listener exists, the runtime accepts/proxies matching connections and audits them. Outbound endpoint/rule/default-action policy is not evaluated for inbound forwarded connections.
 
@@ -754,10 +753,10 @@ target {
 
 Schema:
 
-| Attribute | Type | Required | Semantics |
-| --------- | ---- | -------- | --------- |
-| `selector` | string | No | VM selector. If omitted, resolve the network default VM. |
-| `port` | int | No | VM destination port. If omitted, use the listener port. |
+| Attribute  | Type   | Required | Semantics                                                |
+| ---------- | ------ | -------- | -------------------------------------------------------- |
+| `selector` | string | No       | VM selector. If omitted, resolve the network default VM. |
+| `port`     | int    | No       | VM destination port. If omitted, use the listener port.  |
 
 Supported user-facing selector forms are:
 
@@ -790,47 +789,49 @@ The first runtime sink is append-only JSONL at `audit.jsonl` in the same runtime
 
 The record shape and redaction requirements are part of the policy contract. The contract deliberately does not over-specify post-start write guarantees, backpressure behavior, fsync policy, or fail-open/fail-closed behavior for audit sink failures. Implementations should make audit write failures visible in service logs and runtime health.
 
-All audit records are JSON objects, one per line. Every record includes:
+All audit records are JSON objects, one per line. Every record includes the common fields below, with `policy_hash` present only when a policy file was loaded:
 
-| Field | Type | Semantics |
-| ----- | ---- | --------- |
-| `version` | integer | Audit schema version. Initially `1`. |
-| `event_type` | string | One of the stable event names below. |
-| `timestamp` | string | UTC RFC3339Nano timestamp. |
-| `policy_hash` | string | `sha256:<64 lowercase hex chars>` over exact raw bytes of the single loaded policy HCL file. |
-| `vm_id` | string/null/omitted | Stable VM identity when known/applicable. |
-| `network_id` | string/null/omitted | Stable network identity when known/applicable. |
+| Field         | Type                | Semantics                                                                                                                                                                     |
+| ------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `version`     | integer             | Audit schema version. Initially `1`.                                                                                                                                          |
+| `phase`       | string              | Lifecycle phase for the record. Current terminal records use `end`; future lifecycle records may use `start` where that adds value.                                           |
+| `family`      | string              | Traffic family for the record. Current values are `ip` and `http`; inbound forwarding uses `forward` when implemented.                                                          |
+| `timestamp`   | string              | UTC RFC3339Nano timestamp.                                                                                                                                                    |
+| `policy_hash` | string/omitted      | `sha256:<64 lowercase hex chars>` over exact raw bytes of the single loaded policy HCL file. Omitted when no policy file is provided and the implicit default policy is used. |
+| `vm_id`       | string/null/omitted | Stable VM identity when known/applicable.                                                                                                                                     |
+| `network_id`  | string/null/omitted | Stable network identity when known/applicable.                                                                                                                                |
 
 `profile_name` must not appear in audit records.
 
-`policy_hash` is audit metadata only. It ties JSONL records to the exact loaded policy source file. Comments, formatting, disabled rules, and other source bytes are part of the hash. There are no includes/imports or multi-file hash semantics.
+`policy_hash` is audit metadata only. When present, it ties JSONL records to the exact loaded policy source file. Comments, formatting, disabled rules, and other source bytes are part of the hash. There are no includes/imports or multi-file hash semantics. When no policy file is provided, the implicit default policy has no source file bytes and audit records omit `policy_hash`.
 
 Audit IDs use UUIDv7 strings for stable uniqueness and useful time ordering:
 
 - `flow_id` identifies one L3/L4 flow.
 - `request_id` identifies one inspected L7 request.
-- `parent_flow_id` links an L7 request to its underlying TCP flow when available.
+- `parent_flow_id` links an L7 request record to its underlying TCP `flow_id` when available.
 
 Parsers should tolerate unknown fields on known record versions so new metadata can be added without breaking older tooling.
 
-### Event Types
+### Phases And Families
 
-The stable `event_type` enum is:
+Audit records are organized by lifecycle `phase` and traffic `family`, not by a separate event-name taxonomy. Current runtime audit records are terminal records with `phase = "end"`. A later implementation may add `phase = "start"` where a lifecycle pair is useful, but terminal `end` records remain the authoritative completed audit stream.
 
-| Event type | Semantics |
-| ---------- | --------- |
-| `flow_start` | Outbound L3/L4 flow begins forwarding. |
-| `flow_end` | Outbound L3/L4 flow denied, completed, or errored. |
-| `request_start` | Intercepted HTTP-family request begins upstream/proxy work. |
-| `request_end` | Intercepted HTTP-family request denied, completed, or errored. |
-| `forward_start` | Inbound forward begins proxying to a target. |
-| `forward_end` | Inbound forward failed, completed, or errored. |
+The current traffic families are:
 
-For denied traffic or errors that never open an upstream/target connection, audit emits only the terminal `flow_end`, `request_end`, or `forward_end` record with verdict/reason/status populated. `*_start` records are used only once the runtime is actually beginning a proxied flow, request, or forward.
+| Family    | Semantics                                                  |
+| --------- | ---------------------------------------------------------- |
+| `ip`      | Outbound L3/L4 TCP or UDP traffic.                         |
+| `http`    | Intercepted HTTP-family traffic, including HTTPS MITM.     |
+| `forward` | Inbound forwarding traffic when forwarding is implemented. |
+
+For denied traffic or errors that never open an upstream/target connection, audit emits only a terminal record with `phase = "end"`, the relevant `family`, and verdict/reason/status populated.
 
 ### L3/L4 Flow Audit
 
-IP decisions use flow events because there is no L7 request lifecycle. TCP flows that are forwarded emit `flow_start` and `flow_end`. UDP traffic is aggregated by 5-tuple and emits an aggregate `flow_end` when the implementation-defined idle timeout or close condition fires. Denied UDP can emit a single `flow_end` without creating long-lived aggregate state.
+IP decisions use `family = "ip"` records because there is no L7 request lifecycle. `netd` logs all L3/L4 actions by default: default allow, default deny, explicit rule allow, explicit rule deny, classification handoff, and terminal forwarding errors. These records use `phase = "end"` in the initial implementation.
+
+TCP emits a terminal `family = "ip"` record when the flow is denied, completed, handed to an L7 proxy, or errored. UDP traffic is aggregated by 5-tuple in a later implementation and emits an aggregate terminal `family = "ip"` record when the implementation-defined idle timeout or close condition fires. Denied UDP can emit a single terminal record without creating long-lived aggregate state.
 
 The UDP aggregation timeout is intentionally implementation-defined for now.
 
@@ -839,98 +840,103 @@ L3/L4 audit metadata includes enough context for:
 - `flow_id`,
 - `direction`, such as VM egress,
 - `protocol`, `ip_version`, source/destination IPs, and source/destination ports,
-- endpoint kind/name and configured source/destination/protocol/port metadata when an endpoint matched,
-- rule name, verdict, reason, and whether the flow deferred to L7 inspection,
-- default-action metadata when applicable,
+- `policy.endpoint_kind`, `policy.endpoint_name`, and `policy.rule_name` when policy endpoint/rule metadata is available,
+- verdict and reason,
 - tunnel metadata when routing uses Tailscale,
 - duration, byte counts, packet counts when available,
 - redacted error metadata.
 
+`policy` presence means an outbound policy endpoint matched, was selected, or an explicit rule matched. `policy.endpoint_kind` and `policy.endpoint_name` identify the selected endpoint. `policy.rule_name` identifies the explicit matching rule. When `policy` is omitted, the action came from default behavior or an implementation/runtime failure before endpoint selection.
+
 ### HTTP-Family Request Audit
 
-Intercepted HTTP-family requests use request events:
+Intercepted HTTP-family traffic uses `family = "http"` records for both cleartext HTTP and HTTPS MITM. The `http.scheme` field identifies the observed transport scheme (`http` or `https`). Terminal records use `phase = "end"` after deny, forward completion, or error. If a later implementation adds a start phase, it must only emit `phase = "start"` after classification/rule context is known and proxy/upstream work is about to begin.
 
-- `request_start`, after classification/rule context is known and proxy/upstream work is about to begin,
-- `request_end`, after deny, forward completion, or error.
-
-Body hashes and samples appear only on `request_end`, not on `request_start`. `request_end` carries final request/response byte counts, hashes, samples, status, and errors so each body sample is recorded once.
+Body hashes and samples appear only on terminal HTTP-family records. Terminal records carry final request/response byte counts, hashes, samples, status, and errors so each body sample is recorded once.
 
 HTTP-family audit metadata includes:
 
 - `request_id`,
 - `parent_flow_id` when available,
-- endpoint kind/name,
-- family and transport,
-- rule name/verdict when an explicit rule matched,
-- final verdict, reason, and synthetic/upstream status code,
-- method, normalized host, path, parsed query, and redacted headers,
+- `policy.endpoint_kind`, `policy.endpoint_name`, and `policy.rule_name` when policy endpoint/rule metadata is available,
+- `family = "http"`, with `http.scheme` as `http` or `https`,
+- final verdict, reason, and guest-visible status code,
+- `http.request.method`, normalized host, path, parsed query, and redacted request headers,
+- `http.response.status` and redacted response headers that reflect what the guest saw,
 - TLS metadata for HTTPS when available,
 - credential kind/name/status/error reason without values,
 - tunnel metadata when an explicit allow uses Tailscale,
 - upstream error metadata when applicable,
 - duration and byte counts.
 
-Example `request_end`:
+Example terminal HTTPS record:
 
 ```json
 {
-  "version": 1,
-  "event_type": "request_end",
-  "timestamp": "2026-06-18T20:41:33.123456789Z",
-  "policy_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "request_id": "018f2f7d-8a0b-7c6d-9e10-111213141516",
-  "parent_flow_id": "018f2f7d-89ff-7c6d-9e10-111213141516",
-  "vm_id": "vm_123",
-  "network_id": "net_123",
-  "endpoint": { "kind": "https", "name": "github" },
-  "family": "http",
-  "transport": "https-mitm",
-  "rule": { "name": "github-read-only", "verdict": "allow" },
-  "verdict": "allow",
-  "reason": "read-only GitHub API access",
-  "http": {
-    "method": "GET",
-    "host": "api.github.com",
-    "path": "/repos/nickvd/bentobox",
-    "query": { "per_page": ["100"] },
-    "request_headers": { "Authorization": ["***"] },
-    "response_headers": { "Content-Type": ["application/json"] }
-  },
-  "tls": {
-    "sni": "api.github.com",
-    "intercepted": true,
-    "client_version": "TLS1.3",
-    "upstream_version": "TLS1.3"
-  },
-  "credential": {
-    "kind": "bearer_token",
-    "name": "github_api",
-    "status": "injected"
-  },
-  "status_code": 200,
-  "request_body": {
-    "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "bytes": 0
-  },
-  "response_body": {
-    "content_encoding": "gzip",
-    "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "bytes": 4096,
-    "sample": {
-      "encoding": "decoded:gzip",
-      "truncated": true,
-      "value": "{\"items\":["
-    }
-  },
-  "bytes_in": 123,
-  "bytes_out": 456,
-  "duration_ms": 42
+    "version": 1,
+    "phase": "end",
+    "family": "http",
+    "timestamp": "2026-06-18T20:41:33.123456789Z",
+    "policy_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "request_id": "018f2f7d-8a0b-7c6d-9e10-111213141516",
+    "parent_flow_id": "018f2f7d-89ff-7c6d-9e10-111213141516",
+    "vm_id": "vm_123",
+    "network_id": "net_123",
+    "policy": {
+        "endpoint_kind": "https",
+        "endpoint_name": "github",
+        "rule_name": "github-read-only"
+    },
+    "verdict": "allow",
+    "reason": "read-only GitHub API access",
+    "http": {
+        "scheme": "https",
+        "request": {
+            "method": "GET",
+            "host": "api.github.com",
+            "path": "/repos/nickvd/bentobox",
+            "query": "per_page=100",
+            "headers": { "Authorization": ["<redacted>"] }
+        },
+        "response": {
+            "status": 200,
+            "headers": { "Content-Type": ["application/json"] }
+        }
+    },
+    "tls": {
+        "sni": "api.github.com",
+        "intercepted": true,
+        "client_version": "TLS1.3",
+        "upstream_version": "TLS1.3"
+    },
+    "credential": {
+        "kind": "bearer_token",
+        "name": "github_api",
+        "status": "injected"
+    },
+    "request_body": {
+        "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "bytes": 0
+    },
+    "response_body": {
+        "content_encoding": "gzip",
+        "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bytes": 4096,
+        "sample": {
+            "encoding": "decoded:gzip",
+            "truncated": true,
+            "value": "{\"items\":["
+        }
+    },
+    "bytes_in": 123,
+    "bytes_out": 456,
+    "duration_ms": 42
 }
 ```
 
 ### Forward Audit
 
-Inbound forward audit uses `forward_start` and `forward_end`.
+Inbound forward audit uses `family = "forward"` records. Terminal forwarding records use `phase = "end"`. A later implementation may add `phase = "start"` after target resolution has selected a concrete target and proxying is about to begin.
 
 Forward audit metadata includes:
 
@@ -941,7 +947,7 @@ Forward audit metadata includes:
 - connection result, reason, errors,
 - duration and byte counts.
 
-For target resolution failures before proxying begins, emit only `forward_end` with a reason such as `target_unresolved`, `target_ambiguous`, or `target_no_lease`.
+For target resolution failures before proxying begins, emit only a terminal `family = "forward"` record with a reason such as `target_unresolved`, `target_ambiguous`, or `target_no_lease`.
 
 ### TLS Audit
 
@@ -970,9 +976,9 @@ Sample objects are structured:
 
 ```json
 {
-  "encoding": "utf-8",
-  "truncated": true,
-  "value": "sample text"
+    "encoding": "utf-8",
+    "truncated": true,
+    "value": "sample text"
 }
 ```
 
@@ -1012,12 +1018,6 @@ Warnings are for suspicious but still-valid policy. They should be non-fatal and
 
 Warnings are written to service logs and runtime status. They never appear in `audit.jsonl` and never change enforcement behavior. True runtime ambiguity still fails closed.
 
-## Migration From Earlier Policy Syntax
-
-When `netd` adopts this ADR, it supports only the syntax defined here. Older `endpoint "cidr"` policy syntax is not accepted. There is no `cidr` alias and no one-release compatibility mode.
-
-If the loader sees old syntax it should fail with a clear load error that names the replacement syntax, such as `endpoint "ip"` with `source`, `destination`, `protocol`, and `ports`.
-
 ## Future Endpoint Extension Model
 
 Adding a protocol should mean adding registry entries and transport adapters, not forking the rule engine.
@@ -1035,9 +1035,9 @@ The high-level process for a new endpoint kind is:
 
 Kubernetes should be modeled as its own endpoint kind, not as raw HTTPS with a pile of ad hoc HTTP conditions. Its likely registry entry is:
 
-| Kind | Family | Facets | Transport | Credentials |
-| ---- | ------ | ------ | --------- | ----------- |
-| `kubernetes` | `k8s` | `http`, `k8s` | `https-mitm` | Yes |
+| Kind         | Family | Facets        | Transport    | Credentials |
+| ------------ | ------ | ------------- | ------------ | ----------- |
+| `kubernetes` | `k8s`  | `http`, `k8s` | `https-mitm` | Yes         |
 
 The endpoint can reuse `https-mitm` because Kubernetes API traffic is HTTPS. It should compose the `http` facet with a `k8s` facet. The `http` facet supplies method, host, path, query, and headers. The `k8s` facet can add parsed API group, version, resource, namespace, name, verb, and subresource fields.
 
@@ -1047,9 +1047,9 @@ Rules for `kubernetes` endpoints should use family `k8s`, not `http`, even thoug
 
 PostgreSQL should be a protocol-aware SQL endpoint rather than an IP endpoint with a port number. Its likely registry entry is:
 
-| Kind | Family | Facets | Transport | Credentials |
-| ---- | ------ | ------ | --------- | ----------- |
-| `postgres` | `sql` | `sql` | `postgres-proxy` | Yes |
+| Kind       | Family | Facets | Transport        | Credentials |
+| ---------- | ------ | ------ | ---------------- | ----------- |
+| `postgres` | `sql`  | `sql`  | `postgres-proxy` | Yes         |
 
 The `postgres-proxy` transport would classify the startup message, database, username, TLS mode, and query boundaries before forwarding upstream effects. The `sql` facet can expose fields such as database, user, statement type, and normalized operation metadata. The first version does not need to parse every SQL dialect perfectly; it does need to be explicit about which fields are reliable enough for policy.
 
@@ -1061,9 +1061,9 @@ Postgres credentials should bind to a `postgres` endpoint and inject through pro
 
 SSH should be a protocol-aware endpoint for login, channel, and command policy. Its likely registry entry is:
 
-| Kind | Family | Facets | Transport | Credentials |
-| ---- | ------ | ------ | --------- | ----------- |
-| `ssh` | `ssh` | `ssh` | `ssh-proxy` | Yes |
+| Kind  | Family | Facets | Transport   | Credentials |
+| ----- | ------ | ------ | ----------- | ----------- |
+| `ssh` | `ssh`  | `ssh`  | `ssh-proxy` | Yes         |
 
 The `ssh` facet can expose login user, requested subsystem, exec command, channel type, and remote forwarding intent as those fields become available. The transport must be careful about the timing of authentication and command execution. A policy allow should happen before upstream-visible authentication or command side effects whenever the rule depends on fields available before those effects.
 

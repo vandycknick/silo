@@ -78,6 +78,7 @@ type RuleDecl struct {
 }
 
 type policySnapshot struct {
+	PolicyHash  string           `json:"policy_hash"`
 	Documents   []PolicyDocument `json:"documents"`
 	Diagnostics []Diagnostic     `json:"diagnostics"`
 }

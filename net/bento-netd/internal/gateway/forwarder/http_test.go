@@ -4,22 +4,26 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/audit"
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/hooks"
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/router"
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/policy"
 )
 
 func TestHTTPProxyInterceptsAllowedRequest(t *testing.T) {
-	route := testRoute(t, `
+	route, auditLog, auditPath, policyHash := testRouteWithAudit(t, `
 settings {
   default_action = "deny"
 }
@@ -40,11 +44,18 @@ rule "allow-metadata" {
 	}
 
 	requestCh := make(chan *http.Request, 1)
-	upstreamAddress, stopUpstream, _ := startPlainHTTPUpstream(t, requestCh)
+	upstreamAddress, stopUpstream, _ := startPlainHTTPUpstreamWithResponse(t, requestCh, newHTTPResponse(http.StatusOK, http.Header{
+		"Content-Type": {"application/json"},
+		"Set-Cookie":   {"session=secret"},
+		"X-Trace":      {"allowed-http"},
+	}, "ok"))
 	defer stopUpstream()
 
 	clientConn, proxyConn := net.Pipe()
 	flow := httpFlow()
+	flow.FlowID = "019f11a2-ff64-778d-8aa5-637c3921dfc9"
+	flow.VMID = "vm-123"
+	flow.NetworkID = "net-456"
 	flowDecision, err := route.Decide(context.Background(), flow)
 	if err != nil {
 		t.Fatalf("Decide returned error: %v", err)
@@ -71,6 +82,9 @@ rule "allow-metadata" {
 	if err != nil {
 		t.Fatalf("read client response: %v", err)
 	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", response.StatusCode)
+	}
 	_, _ = io.Copy(io.Discard, response.Body)
 	_ = response.Body.Close()
 	_ = clientConn.Close()
@@ -83,6 +97,44 @@ rule "allow-metadata" {
 		}
 	default:
 		t.Fatal("upstream did not receive request")
+	}
+	if err := auditLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	event := readForwarderAuditEvent(t, auditPath)
+	if event.Version != 1 || event.Phase != "end" || event.Family != "http" || event.PolicyHash != policyHash {
+		t.Fatalf("unexpected audit envelope: %#v", event)
+	}
+	if !isUUIDv7(event.RequestID) || event.FlowID != "" || event.ParentFlowID != flow.FlowID {
+		t.Fatalf("unexpected audit ids: %#v", event)
+	}
+	if event.Verdict != "allow" || event.Reason != "" {
+		t.Fatalf("unexpected audit verdict: %#v", event)
+	}
+	if event.VMID != "vm-123" || event.NetworkID != "net-456" {
+		t.Fatalf("unexpected runtime metadata: %#v", event)
+	}
+	if event.Policy == nil || event.Policy.EndpointKind != "http" || event.Policy.EndpointName != "metadata" || event.Policy.RuleName != "allow-metadata" {
+		t.Fatalf("unexpected policy metadata: %#v", event)
+	}
+	if event.HTTP == nil || event.HTTP.Scheme != "http" || event.HTTP.Request == nil || event.HTTP.Response == nil {
+		t.Fatalf("unexpected HTTP metadata: %#v", event)
+	}
+	if event.HTTP.Request.Method != http.MethodGet || event.HTTP.Request.Host != "metadata.internal" || event.HTTP.Request.Path != "/latest" {
+		t.Fatalf("unexpected HTTP request metadata: %#v", event.HTTP.Request)
+	}
+	if event.HTTP.Response.Status != http.StatusOK {
+		t.Fatalf("unexpected HTTP response status: %#v", event.HTTP.Response)
+	}
+	if values := event.HTTP.Response.Headers["Content-Type"]; len(values) != 1 || values[0] != "application/json" {
+		t.Fatalf("expected Content-Type response header, got %#v", event.HTTP.Response.Headers)
+	}
+	if values := event.HTTP.Response.Headers["X-Trace"]; len(values) != 1 || values[0] != "allowed-http" {
+		t.Fatalf("expected X-Trace response header, got %#v", event.HTTP.Response.Headers)
+	}
+	if values := event.HTTP.Response.Headers["Set-Cookie"]; len(values) != 0 {
+		t.Fatalf("expected Set-Cookie response header to be stripped, got %#v", values)
 	}
 }
 
@@ -221,6 +273,106 @@ endpoint "http" "metadata" {
 	_ = clientConn.Close()
 	waitForProxy(t, done)
 	assertNoUpstreamAccept(t, acceptedCh)
+}
+
+func TestHTTPProxyDefaultDenyWritesRequestAuditRecord(t *testing.T) {
+	route, auditLog, auditPath, policyHash := testRouteWithAudit(t, `
+settings {
+  default_action = "deny"
+}
+
+endpoint "http" "metadata" {
+  hosts = ["metadata.internal"]
+}
+`)
+	proxy := NewHTTPProxy(route)
+	if proxy == nil {
+		t.Fatal("expected HTTP proxy")
+	}
+
+	requestCh := make(chan *http.Request, 1)
+	upstreamAddress, stopUpstream, acceptedCh := startPlainHTTPUpstream(t, requestCh)
+	defer stopUpstream()
+
+	clientConn, proxyConn := net.Pipe()
+	flow := httpFlow()
+	flow.FlowID = "019f11a2-ff64-778d-8aa5-637c3921dfc9"
+	flow.VMID = "vm-123"
+	flow.NetworkID = "net-456"
+	done := make(chan error, 1)
+	go func() {
+		done <- proxy.Handle(context.Background(), proxyConn, flow, upstreamAddress)
+	}()
+
+	request, err := http.NewRequest(http.MethodGet, "http://metadata.internal/latest?debug=1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Authorization", "Bearer guest-secret")
+	request.Header.Set("User-Agent", "curl/8.7.1")
+	if err := request.Write(clientConn); err != nil {
+		t.Fatalf("write client request: %v", err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(clientConn), request)
+	if err != nil {
+		t.Fatalf("read client response: %v", err)
+	}
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", response.StatusCode)
+	}
+	_ = readResponseBody(t, response)
+	_ = clientConn.Close()
+	waitForProxy(t, done)
+	assertNoUpstreamAccept(t, acceptedCh)
+	if err := auditLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	event := readForwarderAuditEvent(t, auditPath)
+	if event.Version != 1 || event.Phase != "end" || event.Family != "http" || event.PolicyHash != policyHash {
+		t.Fatalf("unexpected audit envelope: %#v", event)
+	}
+	if !isUUIDv7(event.RequestID) || event.FlowID != "" || event.ParentFlowID != flow.FlowID {
+		t.Fatalf("unexpected audit ids: %#v", event)
+	}
+	if event.Verdict != "deny" || event.Reason != "default_deny" {
+		t.Fatalf("unexpected audit verdict: %#v", event)
+	}
+	if event.VMID != "vm-123" || event.NetworkID != "net-456" {
+		t.Fatalf("unexpected runtime metadata: %#v", event)
+	}
+	if event.Policy == nil || event.Policy.EndpointKind != "http" || event.Policy.EndpointName != "metadata" || event.Policy.RuleName != "" {
+		t.Fatalf("unexpected endpoint metadata: %#v", event)
+	}
+	if event.HTTP == nil || event.HTTP.Scheme != "http" || event.HTTP.Request == nil || event.HTTP.Response == nil {
+		t.Fatalf("unexpected HTTP metadata: %#v", event)
+	}
+	if event.HTTP.Request.Method != http.MethodGet || event.HTTP.Request.Host != "metadata.internal" || event.HTTP.Request.Path != "/latest" || event.HTTP.Request.Query != "debug=1" {
+		t.Fatalf("unexpected HTTP request metadata: %#v", event.HTTP.Request)
+	}
+	if event.HTTP.Response.Status != http.StatusForbidden {
+		t.Fatalf("unexpected HTTP response metadata: %#v", event.HTTP.Response)
+	}
+	if values := event.HTTP.Response.Headers["Content-Type"]; len(values) != 1 || values[0] != "text/plain; charset=utf-8" {
+		t.Fatalf("expected synthetic Content-Type response header, got %#v", event.HTTP.Response.Headers)
+	}
+	if values := event.HTTP.Request.Headers["Authorization"]; len(values) != 1 || values[0] != "<redacted>" {
+		t.Fatalf("expected redacted Authorization header, got %#v", event.HTTP.Request.Headers)
+	}
+	if values := event.HTTP.Request.Headers["Accept"]; len(values) != 1 || values[0] != "application/json" {
+		t.Fatalf("expected preserved Accept header, got %#v", event.HTTP.Request.Headers)
+	}
+	if values := event.HTTP.Request.Headers["User-Agent"]; len(values) != 1 || values[0] != "curl/8.7.1" {
+		t.Fatalf("expected preserved User-Agent header, got %#v", event.HTTP.Request.Headers)
+	}
+	rawAudit, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rawAudit), "guest-secret") || strings.Contains(string(rawAudit), "profile_name") || strings.Contains(string(rawAudit), "l4_match") {
+		t.Fatalf("audit record leaked forbidden data: %s", rawAudit)
+	}
 }
 
 func TestHTTPProxyRejectsMissingAndInvalidHost(t *testing.T) {
@@ -725,6 +877,23 @@ func TestRequestPathUsesParsedPath(t *testing.T) {
 
 func testRoute(t *testing.T, text string) *router.Router {
 	t.Helper()
+	compiled := testPolicy(t, text)
+	return router.New(hooks.NewPolicyHook(compiled), nil)
+}
+
+func testRouteWithAudit(t *testing.T, text string) (*router.Router, *audit.Logger, string, string) {
+	t.Helper()
+	compiled := testPolicy(t, text)
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLog, err := audit.Open(auditPath, compiled.PolicyHash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return router.New(hooks.NewPolicyHook(compiled), auditLog), auditLog, auditPath, compiled.PolicyHash()
+}
+
+func testPolicy(t *testing.T, text string) *policy.Policy {
+	t.Helper()
 	dir := t.TempDir()
 	policyPath := filepath.Join(dir, "policy.hcl")
 	if err := os.WriteFile(policyPath, []byte(text), 0o600); err != nil {
@@ -734,7 +903,26 @@ func testRoute(t *testing.T, text string) *router.Router {
 	if err != nil {
 		t.Fatalf("LoadFile returned error: %v", err)
 	}
-	return router.New(hooks.NewPolicyHook(compiled), nil)
+	return compiled
+}
+
+func readForwarderAuditEvent(t *testing.T, path string) audit.Event {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	var event audit.Event
+	if err := json.NewDecoder(file).Decode(&event); err != nil {
+		t.Fatal(err)
+	}
+	return event
+}
+
+func isUUIDv7(value string) bool {
+	return regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(value)
 }
 
 func httpFlow() hooks.Flow {

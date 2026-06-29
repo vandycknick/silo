@@ -2,8 +2,8 @@ package router
 
 import (
 	"context"
-	"log/slog"
 	"net"
+	"net/http"
 
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/audit"
 	"github.com/vandycknick/bentobox/net/bento-netd/internal/gateway/hooks"
@@ -38,29 +38,19 @@ func (r *Router) Decide(ctx context.Context, flow hooks.Flow) (hooks.RouteDecisi
 	if err != nil {
 		return hooks.RouteDecision{}, err
 	}
-	r.audit.RecordFlow(flow, decision)
-	slog.Info("network flow decision",
-		"action", decision.Action,
-		"layer", decision.Layer,
-		"source", decision.Source,
-		"default_action", decision.DefaultAction,
-		"classification_opportunity", decision.ClassificationOpportunity,
-		"reason", decision.Reason,
-		"rule_name", decision.RuleName,
-		"endpoint_kind", decision.EndpointKind,
-		"endpoint_name", decision.EndpointName,
-		"credential_kind", credentialKind(decision),
-		"credential_name", credentialName(decision),
-		"credential_status", credentialStatus(decision),
-		"protocol", flow.Protocol,
-		"source_ip", flow.SourceIP.String(),
-		"source_port", flow.SourcePort,
-		"dest_ip", flow.DestIP.String(),
-		"dest_port", flow.DestPort,
-		"vm_id", flow.VMID,
-		"network_id", flow.NetworkID,
-	)
 	return decision, nil
+}
+
+func (r *Router) WithFlowID(flow hooks.Flow) hooks.Flow {
+	if r == nil || r.audit == nil || flow.FlowID != "" {
+		return flow
+	}
+	flowID, ok := audit.NewFlowID()
+	if !ok {
+		return flow
+	}
+	flow.FlowID = flowID
+	return flow
 }
 
 func (r *Router) HasHTTP() bool {
@@ -136,49 +126,21 @@ func (r *Router) DecideHTTP(ctx context.Context, request hooks.HTTPRequest) (hoo
 	if err != nil {
 		return hooks.RouteDecision{}, err
 	}
-	r.audit.RecordHTTP(request, decision)
-	slog.Info("http flow decision",
-		"action", decision.Action,
-		"layer", decision.Layer,
-		"source", decision.Source,
-		"default_action", decision.DefaultAction,
-		"reason", decision.Reason,
-		"rule_name", decision.RuleName,
-		"endpoint_kind", decision.EndpointKind,
-		"endpoint_name", decision.EndpointName,
-		"credential_kind", credentialKind(decision),
-		"credential_name", credentialName(decision),
-		"credential_status", credentialStatus(decision),
-		"method", request.Method,
-		"host", request.Host,
-		"path", request.Path,
-		"source_ip", request.Flow.SourceIP.String(),
-		"source_port", request.Flow.SourcePort,
-		"dest_ip", request.Flow.DestIP.String(),
-		"dest_port", request.Flow.DestPort,
-		"vm_id", request.Flow.VMID,
-		"network_id", request.Flow.NetworkID,
-	)
 	return decision, nil
 }
 
-func credentialKind(decision hooks.RouteDecision) string {
-	if decision.Credential == nil {
-		return ""
-	}
-	return decision.Credential.Kind
+func (r *Router) RecordFlow(flow hooks.Flow, decision hooks.RouteDecision) {
+	r.audit.RecordFlow(flow, decision)
 }
 
-func credentialName(decision hooks.RouteDecision) string {
-	if decision.Credential == nil {
-		return ""
-	}
-	return decision.Credential.Name
+func (r *Router) RecordFlowOutcome(flow hooks.Flow, decision hooks.RouteDecision, reason string) {
+	r.audit.RecordFlowOutcome(flow, decision, reason)
 }
 
-func credentialStatus(decision hooks.RouteDecision) string {
-	if decision.Credential != nil {
-		return "selected"
-	}
-	return ""
+func (r *Router) RecordHTTP(request hooks.HTTPRequest, decision hooks.RouteDecision, status int, responseHeader http.Header) {
+	r.audit.RecordHTTPRequest(request, decision, status, responseHeader)
+}
+
+func (r *Router) RecordHTTPOutcome(request hooks.HTTPRequest, decision hooks.RouteDecision, status int, responseHeader http.Header, reason string) {
+	r.audit.RecordHTTPRequestOutcome(request, decision, status, responseHeader, reason)
 }

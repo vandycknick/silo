@@ -86,6 +86,10 @@ func loadSource(filename string, source []byte) (*Policy, error) {
 	if err != nil {
 		return nil, err
 	}
+	return loadNativePolicy(filename, nativePolicy, status, errorJSON)
+}
+
+func loadNativePolicy(filename string, nativePolicy *native.Policy, status native.Status, errorJSON []byte) (*Policy, error) {
 	if status == native.StatusLoadError {
 		return nil, decodeLoadError(filename, errorJSON)
 	}
@@ -123,8 +127,12 @@ func decodeLoadError(filename string, payload []byte) error {
 }
 
 func compileSnapshot(filename string, snapshot policySnapshot, nativePolicy *native.Policy) (*Policy, error) {
-	compiled := Default()
+	if snapshot.PolicyHash == "" {
+		return nil, fmt.Errorf("policy snapshot %s missing policy_hash", filename)
+	}
+	compiled := newPolicy()
 	compiled.native = nativePolicy
+	compiled.policyHash = snapshot.PolicyHash
 	compiled.Documents = snapshot.Documents
 	compiled.diagnostics = append(compiled.diagnostics, snapshot.Diagnostics...)
 	if len(snapshot.Documents) == 0 {

@@ -23,6 +23,35 @@ func TestParseRejectsRemovedAuditAndProfileFlags(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected removed --profile-name flag to be rejected")
 	}
+
+	for _, flag := range []string{"--audit-path", "--audit-file"} {
+		_, err = Parse([]string{
+			"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
+			flag, filepath.Join(dir, "audit.jsonl"),
+		})
+		if err == nil {
+			t.Fatalf("expected %s flag to be rejected", flag)
+		}
+	}
+}
+
+func TestLoadPolicyUsesDefaultPolicyWithoutHash(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := Parse([]string{
+		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LoadPolicy(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Policy == nil {
+		t.Fatal("expected policy to be loaded")
+	}
+	if cfg.Policy.PolicyHash() != "" {
+		t.Fatalf("expected implicit default policy to omit policy hash, got %q", cfg.Policy.PolicyHash())
+	}
 }
 
 func TestLoadPolicyRequiresTLSCAForHTTPSEndpoints(t *testing.T) {

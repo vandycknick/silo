@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
 pub struct Policy {
+    pub policy_hash: String,
     pub documents: Vec<PolicyDocument>,
     pub diagnostics: Vec<Diagnostic>,
     #[serde(skip)]
