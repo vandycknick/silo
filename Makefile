@@ -12,13 +12,13 @@ KRUN_DEPS_DIR ?= $(CURDIR)/target/libs/krun/$(RUST_HOST_TRIPLE)
 export KRUN_DEPS_DIR
 
 ifeq ($(HOST_OS),Darwin)
-HOST_WORKSPACE_EXCLUDES := --exclude bento-agent --exclude bento-init
+HOST_WORKSPACE_EXCLUDES := --exclude agent --exclude init
 HOST_BUILD_COMPONENTS := vmmon netd
 else ifeq ($(HOST_OS),Linux)
-HOST_WORKSPACE_EXCLUDES := --exclude bento-init --exclude bento-vz
+HOST_WORKSPACE_EXCLUDES := --exclude init --exclude vz
 HOST_BUILD_COMPONENTS := vmmon netd krun
 else
-HOST_WORKSPACE_EXCLUDES := --exclude bento-agent --exclude bento-init --exclude bento-vz
+HOST_WORKSPACE_EXCLUDES := --exclude agent --exclude init --exclude vz
 HOST_BUILD_COMPONENTS := vmmon netd
 endif
 
@@ -43,21 +43,21 @@ endif
 
 .PHONY: build-guest-agent
 build-guest-agent:
-	cargo zigbuild -p bento-agent --target $(GUEST_TARGET) --release
+	cargo zigbuild -p agent --target $(GUEST_TARGET) --release
 	mkdir -p "$(GUEST_ASSETS_DIR)"
 	cp "$(GUEST_BIN)" "$(GUEST_ASSETS_DIR)/agent"
 	@echo "Updated $(GUEST_ASSETS_DIR)/agent"
 
 .PHONY: build-guest-init
 build-guest-init:
-	RUSTFLAGS="-C panic=abort" cargo zigbuild -p bento-init --target $(GUEST_TARGET) --release
+	RUSTFLAGS="-C panic=abort" cargo zigbuild -p init --target $(GUEST_TARGET) --release
 	mkdir -p "$(GUEST_ASSETS_DIR)"
 	cp "$(GUEST_INIT_BIN)" "$(GUEST_ASSETS_DIR)/init"
 	@echo "Updated $(GUEST_ASSETS_DIR)/init"
 
 .PHONY: build
 build: $(HOST_BUILD_COMPONENTS)
-	cargo build $(CARGO_PROFILE_FLAGS) -p bento-cli
+	cargo build $(CARGO_PROFILE_FLAGS) -p cli
 
 .PHONY: clippy
 clippy:
@@ -73,22 +73,22 @@ build-libkrun:
 
 .PHONY: vmmon
 vmmon:
-	cargo build $(CARGO_PROFILE_FLAGS) -p bento-vmmon
-	runtime/bento-vmmon/scripts/sign-vmmon "$(VMMON_BIN)"
+	cargo build $(CARGO_PROFILE_FLAGS) -p vmmon
+	cargo run -p xtask -- sign-vmmon "$(VMMON_BIN)"
 
 .PHONY: krun
 krun:
-	cargo build $(CARGO_PROFILE_FLAGS) -p bento-krun --features krun-bin --bin krun
+	cargo build $(CARGO_PROFILE_FLAGS) -p krun --features krun-bin --bin krun
 
 .PHONY: netd
 netd:
 	@mkdir -p "target/$(TARGET_PROFILE_DIR)"
-	cargo build $(CARGO_PROFILE_FLAGS) -p bento-policy --features ffi
-	cd net/bento-netd && CGO_ENABLED=1 CGO_LDFLAGS="-L$(CURDIR)/target/$(TARGET_PROFILE_DIR) -lbento_policy" go build $(GO_BUILD_FLAGS) -o "$(CURDIR)/$(NETD_BIN)" ./cmd/bento-netd
+	cargo build $(CARGO_PROFILE_FLAGS) -p policy --features ffi
+	cd net/netd && CGO_ENABLED=1 CGO_LDFLAGS="-L$(CURDIR)/target/$(TARGET_PROFILE_DIR) -lbento_policy" go build $(GO_BUILD_FLAGS) -o "$(CURDIR)/$(NETD_BIN)" ./cmd/netd
 
 .PHONY: policy-header
 policy-header:
-	BENTO_POLICY_REGENERATE_HEADER=1 cargo build -p bento-policy --features ffi,regenerate-ffi-header
+	BENTO_POLICY_REGENERATE_HEADER=1 cargo build -p policy --features ffi,regenerate-ffi-header
 
 .PHONY: kernel
 kernel:
@@ -96,12 +96,8 @@ kernel:
 	@$(MAKE) -C resources/kernels kernel TRACK=$(TRACK) ARCH=$(ARCH)
 
 .PHONY: initramfs
-initramfs: build-guest-init build-guest-agent
-	@mkdir -p "$(GUEST_ASSETS_DIR)"
-	@if [ -d "$(INITRAMFS_OUT)" ]; then rm -rf "$(INITRAMFS_OUT)"; else rm -f "$(INITRAMFS_OUT)"; fi
-	@if [ -d "$(INITRAMFS_NO_AGENT_OUT)" ]; then rm -rf "$(INITRAMFS_NO_AGENT_OUT)"; else rm -f "$(INITRAMFS_NO_AGENT_OUT)"; fi
-	cargo run -p bento-initramfs -- --init "$(GUEST_INIT_BIN)" --agent "$(GUEST_BIN)" --out "$(INITRAMFS_OUT)"
-	cargo run -p bento-initramfs -- --init "$(GUEST_INIT_BIN)" --out "$(INITRAMFS_NO_AGENT_OUT)"
+initramfs:
+	cargo run -p xtask -- guest-assets --target "$(GUEST_TARGET)" --assets-dir "$(GUEST_ASSETS_DIR)"
 
 .PHONY: rootfs
 rootfs:

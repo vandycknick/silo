@@ -1,0 +1,9 @@
+[package]
+name = "vm-spec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+semver = { version = "1.0.27", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"

@@ -99,7 +99,7 @@ This keeps `vmmon` out of the data path while allowing one long-running plugin p
 sequenceDiagram
   participant libvm as libvm (launcher)
   participant vmmon as vmmon
-  participant virt as bento-virt
+  participant virt as virt
   participant plugin as plugin
 
   libvm->>vmmon: spawn vmmon (startup-fd pipe)
@@ -165,11 +165,11 @@ Endpoint failures are handled by `vmmon` supervision, restart policy, and logs, 
 
 ### Protocol ownership
 
-`bento-protocol` does not define a runtime endpoint status model. The configured endpoint model remains owned by `bento-core` and the monitor only reports overall instance lifecycle state.
+`protocol` does not define a runtime endpoint status model. The configured endpoint model remains owned by `bento-core` and the monitor only reports overall instance lifecycle state.
 
 ### Scope of first implementation
 
-The first implementation is macOS-first and relies on the existing Virtualization.framework vsock support already surfaced through `bento-virt`.
+The first implementation is macOS-first and relies on the existing Virtualization.framework vsock support already surfaced through `virt`.
 
 This ADR does not require every host virtualization driver to expose `listen_vsock` immediately. Drivers can adopt the same plugin contract as support lands.
 
@@ -387,7 +387,7 @@ The intended Rust API is instance-based. Plugins initialize once, then call `con
 Illustrative outline:
 
 ```rust
-use bento_plugins::Plugin;
+use plugins::Plugin;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {

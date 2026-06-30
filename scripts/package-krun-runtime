@@ -14,7 +14,7 @@ KRUN_DEPS_DIR="${KRUN_DEPS_DIR:-$ROOT_DIR/target/libs/krun/$TARGET_TRIPLE}"
 KRUN_BIN="$ROOT_DIR/target/$PROFILE/krun"
 
 if [ ! -x "$KRUN_BIN" ]; then
-  printf 'krun binary not found: %s\nBuild it first with `cargo build -p bento-krun` or `cargo build -p bento-krun --release`.\n' "$KRUN_BIN" >&2
+  printf 'krun binary not found: %s\nBuild it first with `cargo build -p krun` or `cargo build -p krun --release`.\n' "$KRUN_BIN" >&2
   exit 1
 fi
 

@@ -1,25 +1,25 @@
 [workspace]
 members = [
-    "app/bento-cli",
-    "common/bento-policy",
-    "common/bento-ext4",
-    "common/bento-initramfs",
-    "common/bento-utils",
-    "guest/bento-agent",
-    "guest/bento-init",
-    "runtime/bento-ocidisk",
-    "runtime/bento-libvm",
-    "runtime/bento-plugins",
-    "runtime/bento-vmmon",
-    "virt/bento-krun",
-    "virt/bento-krun-sys",
-    "virt/bento-virt",
-    "virt/bento-vz",
-    "specs/bento-agent-spec",
-    "specs/bento-protocol",
-    "specs/bento-vm-spec",
+    "app/cli",
+    "common/policy",
+    "common/ext4",
+    "xtask",
+    "common/utils",
+    "guest/agent",
+    "guest/init",
+    "runtime/ocidisk",
+    "runtime/libvm",
+    "runtime/plugins",
+    "runtime/vmmon",
+    "virt/krun",
+    "virt/krun-sys",
+    "virt/virt",
+    "virt/vz",
+    "specs/agent-spec",
+    "specs/protocol",
+    "specs/vm-spec",
 ]
-default-members = ["app/bento-cli", "runtime/bento-vmmon"]
+default-members = ["app/cli", "runtime/vmmon"]
 resolver = "2"
 
 [profile.dev.package.sha2]

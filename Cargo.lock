@@ -46,6 +46,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent"
+version = "0.1.0"
+dependencies = [
+ "agent-spec",
+ "eyre",
+ "futures",
+ "hyper-util",
+ "nix 0.31.3",
+ "protocol",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-util",
+ "tokio-vsock",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "agent-spec"
+version = "0.1.0"
+dependencies = [
+ "protocol",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -298,285 +330,6 @@ name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
-
-[[package]]
-name = "bento-agent"
-version = "0.1.0"
-dependencies = [
- "bento-agent-spec",
- "bento-protocol",
- "eyre",
- "futures",
- "hyper-util",
- "nix 0.31.3",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tokio-util",
- "tokio-vsock",
- "tonic",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "bento-agent-spec"
-version = "0.1.0"
-dependencies = [
- "bento-protocol",
- "serde",
- "serde_json",
- "serde_yaml_ng",
-]
-
-[[package]]
-name = "bento-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bento-agent-spec",
- "bento-libvm",
- "bento-ocidisk",
- "bento-utils",
- "bento-vm-spec",
- "chrono",
- "clap",
- "eyre",
- "hyper-util",
- "indicatif",
- "libc",
- "nix 0.31.3",
- "reqwest 0.13.3",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "tabwriter",
- "tempfile",
- "time",
- "tokio",
- "tonic",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "bento-ext4"
-version = "0.1.2"
-dependencies = [
- "tar",
- "tempfile",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
-name = "bento-init"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "bento-initramfs"
-version = "0.1.0"
-dependencies = [
- "clap",
- "cpio",
- "flate2",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "bento-krun"
-version = "0.1.0"
-dependencies = [
- "bento-krun-sys",
- "bento-utils",
- "clap",
- "eyre",
- "nix 0.31.3",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "bento-krun-sys"
-version = "0.1.0"
-dependencies = [
- "bindgen",
- "libc",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "bento-libvm"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bento-agent-spec",
- "bento-protocol",
- "bento-utils",
- "bento-vm-spec",
- "eyre",
- "getrandom 0.4.2",
- "hyper-util",
- "libc",
- "mockall",
- "nix 0.31.3",
- "rcgen",
- "rustix",
- "serde",
- "serde_json",
- "sqlx",
- "ssh-key",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tonic",
- "tower",
- "uuid",
-]
-
-[[package]]
-name = "bento-ocidisk"
-version = "0.1.0"
-dependencies = [
- "bento-ext4",
- "containerregistry-image",
- "containerregistry-registry",
- "flate2",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "zstd",
-]
-
-[[package]]
-name = "bento-plugins"
-version = "0.1.0"
-dependencies = [
- "bento-agent-spec",
- "bytes",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "nix 0.31.3",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "bento-policy"
-version = "0.1.0"
-dependencies = [
- "cbindgen",
- "cel",
- "hcl-rs",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "bento-protocol"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "prost",
- "prost-build",
- "prost-types",
- "protoc-bin-vendored",
- "serde",
- "serde_json",
- "tarpc",
- "tokio",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
-name = "bento-utils"
-version = "0.1.0"
-
-[[package]]
-name = "bento-virt"
-version = "0.1.0"
-dependencies = [
- "bento-krun",
- "bento-protocol",
- "bento-vz",
- "crossbeam",
- "nix 0.31.3",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "bento-vm-spec"
-version = "0.1.0"
-dependencies = [
- "semver",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "bento-vmmon"
-version = "0.1.0"
-dependencies = [
- "bento-agent-spec",
- "bento-protocol",
- "bento-utils",
- "bento-virt",
- "bento-vm-spec",
- "clap",
- "eyre",
- "futures",
- "hyper-util",
- "libc",
- "nix 0.31.3",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tonic",
- "tower",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "bento-vz"
-version = "0.1.0"
-dependencies = [
- "bento-utils",
- "block2",
- "crossbeam",
- "dispatch2",
- "nix 0.31.3",
- "objc2",
- "objc2-foundation",
- "objc2-virtualization",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
 
 [[package]]
 name = "better_any"
@@ -854,6 +607,37 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "cli"
+version = "0.1.0"
+dependencies = [
+ "agent-spec",
+ "anyhow",
+ "chrono",
+ "clap",
+ "eyre",
+ "hyper-util",
+ "indicatif",
+ "libc",
+ "libvm",
+ "nix 0.31.3",
+ "ocidisk",
+ "reqwest 0.13.3",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tabwriter",
+ "tempfile",
+ "time",
+ "tokio",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "utils",
+ "vm-spec",
+]
 
 [[package]]
 name = "cmake"
@@ -1406,6 +1190,16 @@ dependencies = [
  "concurrent-queue",
  "parking",
  "pin-project-lite",
+]
+
+[[package]]
+name = "ext4"
+version = "0.1.2"
+dependencies = [
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
@@ -2152,6 +1946,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "init"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "inout"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2249,6 +2050,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "krun"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "eyre",
+ "krun-sys",
+ "nix 0.31.3",
+ "thiserror 2.0.18",
+ "tracing",
+ "utils",
+]
+
+[[package]]
+name = "krun-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "libc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kstring"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2315,6 +2138,35 @@ dependencies = [
  "cc",
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "libvm"
+version = "0.1.0"
+dependencies = [
+ "agent-spec",
+ "async-trait",
+ "eyre",
+ "getrandom 0.4.2",
+ "hyper-util",
+ "libc",
+ "mockall",
+ "nix 0.31.3",
+ "protocol",
+ "rcgen",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "ssh-key",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tower",
+ "utils",
+ "uuid",
+ "vm-spec",
 ]
 
 [[package]]
@@ -2664,6 +2516,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocidisk"
+version = "0.1.0"
+dependencies = [
+ "containerregistry-image",
+ "containerregistry-registry",
+ "ext4",
+ "flate2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2894,6 +2764,36 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
+
+[[package]]
+name = "plugins"
+version = "0.1.0"
+dependencies = [
+ "agent-spec",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "policy"
+version = "0.1.0"
+dependencies = [
+ "cbindgen",
+ "cel",
+ "hcl-rs",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "poly1305"
@@ -3127,6 +3027,24 @@ name = "protoc-bin-vendored-win32"
 version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
+
+[[package]]
+name = "protocol"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "protoc-bin-vendored",
+ "serde",
+ "serde_json",
+ "tarpc",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
 
 [[package]]
 name = "pulldown-cmark"
@@ -4826,6 +4744,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "utils"
+version = "0.1.0"
+
+[[package]]
 name = "uuid"
 version = "1.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4865,6 +4787,56 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "virt"
+version = "0.1.0"
+dependencies = [
+ "crossbeam",
+ "krun",
+ "nix 0.31.3",
+ "protocol",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "vz",
+]
+
+[[package]]
+name = "vm-spec"
+version = "0.1.0"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "vmmon"
+version = "0.1.0"
+dependencies = [
+ "agent-spec",
+ "clap",
+ "eyre",
+ "futures",
+ "hyper-util",
+ "libc",
+ "nix 0.31.3",
+ "protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "utils",
+ "virt",
+ "vm-spec",
+]
+
+[[package]]
 name = "vsock"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4872,6 +4844,23 @@ checksum = "e2da6e4ac76cd19635dce0f98985378bb62f8044ee2ff80abd2a7334b920ed63"
 dependencies = [
  "libc",
  "nix 0.30.1",
+]
+
+[[package]]
+name = "vz"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "crossbeam",
+ "dispatch2",
+ "nix 0.31.3",
+ "objc2",
+ "objc2-foundation",
+ "objc2-virtualization",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "utils",
 ]
 
 [[package]]
@@ -5570,6 +5559,17 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix",
+]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "cpio",
+ "flate2",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

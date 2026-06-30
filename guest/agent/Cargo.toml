@@ -1,0 +1,26 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bento-agent"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+agent-spec = { path = "../../specs/agent-spec" }
+protocol = { path = "../../specs/protocol" }
+eyre = "0.6.12"
+futures = "0.3.32"
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+nix = { version = "0.31.3", features = ["feature", "fs", "hostname", "net"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "io-util", "net", "process", "time", "sync"] }
+tokio-util = "0.7.18"
+tokio-vsock = "0.7.2"
+tonic = { version = "0.14.6", features = ["transport"] }
+tower = "0.5.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }

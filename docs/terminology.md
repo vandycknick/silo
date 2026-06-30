@@ -217,8 +217,8 @@ A virtualization backend is the concrete host implementation BentoBox uses to ru
 
 Current BentoBox runtime backend selection is internal and host-driven:
 
-- macOS uses Apple Virtualization.framework through `bento-vz`
-- Linux uses libkrun/krun through `bento-krun`
+- macOS uses Apple Virtualization.framework through `vz`
+- Linux uses libkrun/krun through `krun`
 
 Users do not select a backend in `VmSpec`. `VmSpec` describes the VM, while BentoBox chooses the host implementation at compile time.
 
@@ -230,8 +230,8 @@ A backend driver is the Rust adapter code that implements support for a virtuali
 
 Examples:
 
-- `bento-vz`
-- `bento-krun`
+- `vz`
+- `krun`
 
 Use "driver" for BentoBox adapter code. Use "VMM" for the lower-level userspace virtualization implementation/runtime when that layer exists as a distinct concept.
 
@@ -242,10 +242,10 @@ The BentoBox runtime layers sit above the host virtualization stack:
 ```mermaid
 flowchart TD
     CLI[bento]
-    LibVm[bento-libvm]
-    Vmmon[bento-vmmon]
-    Virt[bento-virt]
-    BackendDriver[bento-vz / bento-krun]
+    LibVm[libvm]
+    Vmmon[vmmon]
+    Virt[virt]
+    BackendDriver[vz / krun]
     HostPlatform[Host virtualization platform]
     Guest[Guest VM]
     Agent[Guest agent]
@@ -254,29 +254,29 @@ flowchart TD
     Agent -. runs inside .-> Guest
 ```
 
-### `bento-virt`
+### `virt`
 
-`bento-virt` is BentoBox's host virtualization facade.
+`virt` is BentoBox's host virtualization facade.
 
-It exposes the common Rust API that `bento-vmmon` uses to create, start, stop, and communicate with a VM. The concrete implementation is selected at compile time by host platform.
+It exposes the common Rust API that `vmmon` uses to create, start, stop, and communicate with a VM. The concrete implementation is selected at compile time by host platform.
 
 The exported `VirtualMachine` type is BentoBox's per-instance VM handle. It is not the guest OS and it is not the underlying VMM implementation. It is the API handle used by BentoBox code to control one VM.
 
-`bento-virt` is not a hypervisor. It is also not the product-level VM manager.
+`virt` is not a hypervisor. It is also not the product-level VM manager.
 
-### `bento-vmmon`
+### `vmmon`
 
-`bento-vmmon` is the VM monitor process.
+`vmmon` is the VM monitor process.
 
 It supervises one running VM, exposes monitor and control APIs, tracks lifecycle state, handles guest readiness, and participates in cleanup and reconciliation.
 
-`bento-vmmon` uses `bento-virt` to start and control the host-selected virtualization implementation. It is BentoBox's process-level supervisor around one VM, not the guest VM itself.
+`vmmon` uses `virt` to start and control the host-selected virtualization implementation. It is BentoBox's process-level supervisor around one VM, not the guest VM itself.
 
-### `bento-libvm`
+### `libvm`
 
-`bento-libvm` is the higher-level VM orchestration library.
+`libvm` is the higher-level VM orchestration library.
 
-It owns product-level lifecycle semantics, persisted state, image handling, launch flow, and interaction with `bento-vmmon`.
+It owns product-level lifecycle semantics, persisted state, image handling, launch flow, and interaction with `vmmon`.
 
 Its role is similar in spirit to how libpod sits above lower-level container runtime pieces.
 
@@ -284,7 +284,7 @@ Its role is similar in spirit to how libpod sits above lower-level container run
 
 The guest agent is software running inside the guest VM.
 
-It is separate from the VMM, `bento-virt`, and `bento-vmmon`. It provides guest-side services such as readiness, shell support, or bootstrap integration.
+It is separate from the VMM, `virt`, and `vmmon`. It provides guest-side services such as readiness, shell support, or bootstrap integration.
 
 ### Host
 

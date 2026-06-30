@@ -16,31 +16,31 @@ Bentobox needs a VM architecture that keeps the runtime surface small, focused, 
 - works well without a central always-on daemon,
 - preserves room for a future daemon or tunnel mode without changing the machine model.
 
-The chosen architecture is daemonless. `bento` calls into `bento-libvm`, and `bento-libvm` owns machine lifecycle in local ABI mode. When a machine starts, `bento-libvm` spawns a dedicated `vmmon` process for that machine. `vmmon` reads the machine configuration from the instance directory, starts the VM, supervises it, and exposes the per-VM control surface.
+The chosen architecture is daemonless. `bento` calls into `libvm`, and `libvm` owns machine lifecycle in local ABI mode. When a machine starts, `libvm` spawns a dedicated `vmmon` process for that machine. `vmmon` reads the machine configuration from the instance directory, starts the VM, supervises it, and exposes the per-VM control surface.
 
-This gives Bentobox the operational flexibility of a daemonless system while still leaving room for a future manager daemon. `bento-libvm` is the boundary that preserves that split. It is the local engine today, and it can also become the client-side boundary for future daemon or tunnel mode without changing the monitor model.
+This gives Bentobox the operational flexibility of a daemonless system while still leaving room for a future manager daemon. `libvm` is the boundary that preserves that split. It is the local engine today, and it can also become the client-side boundary for future daemon or tunnel mode without changing the monitor model.
 
 ## Decision
 
 Bentobox adopts a daemonless, config-driven architecture with these roles:
 
-- `bento` is a thin frontend over `bento-libvm`.
+- `bento` is a thin frontend over `libvm`.
 - `bento-core` owns the canonical shared domain model, including `VmSpec`, machine identity types, and guest service configuration types.
-- `bento-libvm` owns manager-side lifecycle, machine inventory, on-disk layout, image policy, bootstrap materialization, Negotiate client behavior, and `vmmon` process spawning.
-- `bento-vmmon` is the canonical per-VM monitor. It is a small-footprint runtime supervisor that owns one running VM.
-- `bento-virt` is the host virtualization facade used by `bento-vmmon`.
+- `libvm` owns manager-side lifecycle, machine inventory, on-disk layout, image policy, bootstrap materialization, Negotiate client behavior, and `vmmon` process spawning.
+- `vmmon` is the canonical per-VM monitor. It is a small-footprint runtime supervisor that owns one running VM.
+- `virt` is the host virtualization facade used by `vmmon`.
 
 Canonical vocabulary for these layers lives in [`../terminology.md`](../terminology.md).
 
-This architecture is intentionally daemonless by default. A future daemon or tunnel mode may be added later, but it must preserve the same `bento-libvm` to `vmmon` boundary and the same per-VM monitor model.
+This architecture is intentionally daemonless by default. A future daemon or tunnel mode may be added later, but it must preserve the same `libvm` to `vmmon` boundary and the same per-VM monitor model.
 
 ## Goals
 
 - Keep one `vmmon` process responsible for one VM.
-- Make `bento` a thin consumer of `bento-libvm`.
+- Make `bento` a thin consumer of `libvm`.
 - Keep `vmmon` focused on runtime supervision instead of manager concerns.
 - Make machine startup config-driven from the per-instance `config.yaml`.
-- Keep `bento-libvm` as the architectural boundary between daemonless local ABI mode and future daemon or tunnel mode.
+- Keep `libvm` as the architectural boundary between daemonless local ABI mode and future daemon or tunnel mode.
 - Preserve the current Negotiate upgrade model for serial, shell, and RPC access.
 - Keep machine identity and manager metadata in manager-owned state, not in the monitor.
 
@@ -63,7 +63,7 @@ It owns:
 - argument parsing,
 - output formatting,
 - terminal and stdio handling,
-- calling `bento-libvm`.
+- calling `libvm`.
 
 It does not own:
 
@@ -94,9 +94,9 @@ It does not own:
 - RPC servers or RPC clients,
 - host virtualization execution logic.
 
-### `bento-libvm`
+### `libvm`
 
-`bento-libvm` is the manager-side engine library.
+`libvm` is the manager-side engine library.
 
 It owns:
 
@@ -119,11 +119,11 @@ It does not own:
 - host virtualization execution,
 - guest-agent implementation.
 
-The manager API is currently a library boundary implemented by `bento-libvm`. A future remote manager may expose an equivalent API over the network, but that wire service does not exist yet and is not required for the daemonless architecture.
+The manager API is currently a library boundary implemented by `libvm`. A future remote manager may expose an equivalent API over the network, but that wire service does not exist yet and is not required for the daemonless architecture.
 
-### `bento-vmmon`
+### `vmmon`
 
-`bento-vmmon` is the canonical per-VM monitor and supervisor.
+`vmmon` is the canonical per-VM monitor and supervisor.
 
 It owns:
 
@@ -148,9 +148,9 @@ It does not own:
 
 `vmmon` should remain small and focused. It is a runtime monitor, not a general manager.
 
-### `bento-virt`
+### `virt`
 
-`bento-virt` is the host virtualization facade.
+`virt` is the host virtualization facade.
 
 It owns:
 
@@ -179,7 +179,7 @@ It does not own:
 ### Machine configuration
 
 - `config.yaml` in the instance directory is the canonical machine configuration.
-- `config.yaml` is written by `bento-libvm` from `bento-core::VmSpec`.
+- `config.yaml` is written by `libvm` from `bento-core::VmSpec`.
 - `vmmon` is data-dir-driven. It accepts `--data-dir` and reads `config.yaml` from that directory.
 
 ### Manager metadata
@@ -196,7 +196,7 @@ SQLite does not replace `config.yaml` as the canonical VM boot contract.
 ### Runtime truth
 
 - Runtime truth comes from `vmmon` while it is running.
-- `bento-libvm` may derive convenience status from monitor artifacts, but liveness and readiness are monitor-owned runtime concerns.
+- `libvm` may derive convenience status from monitor artifacts, but liveness and readiness are monitor-owned runtime concerns.
 
 ## On-disk Layout
 
@@ -346,8 +346,8 @@ It is used to upgrade a connection into:
 
 Ownership is:
 
-- `bento-vmmon`: Negotiate server implementation,
-- `bento-libvm`: Negotiate client implementation.
+- `vmmon`: Negotiate server implementation,
+- `libvm`: Negotiate client implementation.
 
 This preserves the existing connection-upgrade model while keeping the CLI out of protocol ownership.
 
@@ -367,7 +367,7 @@ The executable accepts:
 
 ### Startup
 
-`bento-libvm` spawns `vmmon` and passes a startup pipe.
+`libvm` spawns `vmmon` and passes a startup pipe.
 
 `vmmon` reports a one-shot startup result over that pipe. The current wire format is simple:
 
@@ -387,7 +387,7 @@ Start succeeds once `vmmon` has successfully initialized supervision for the VM.
 
 ### Shutdown
 
-`bento-libvm` stops a machine by signaling `vmmon`.
+`libvm` stops a machine by signaling `vmmon`.
 
 The current implementation uses `SIGINT` for the manager-triggered stop path, and `vmmon` also handles `SIGTERM`.
 
@@ -395,7 +395,7 @@ Shutdown behavior is:
 
 - first signal requests graceful shutdown,
 - `vmmon` transitions runtime state toward stopping,
-- `vmmon` asks `bento-virt` to stop the VM,
+- `vmmon` asks `virt` to stop the VM,
 - a second signal forces immediate exit,
 - `vmmon` exits after supervision shuts down.
 
@@ -409,7 +409,7 @@ Future work may refine signal choice and add a stronger durable exit-state contr
 - One monitor per VM creates a clean operational boundary.
 - Machine startup is config-driven from canonical on-disk state.
 - `vmmon` stays focused on runtime supervision with a small surface area.
-- `bento-libvm` can preserve a clean split between daemonless mode now and daemon or tunnel mode later.
+- `libvm` can preserve a clean split between daemonless mode now and daemon or tunnel mode later.
 - Existing Negotiate behavior is preserved while ownership moves to the right layers.
 
 ### Negative

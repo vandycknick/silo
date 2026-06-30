@@ -76,4 +76,4 @@ async fn main() -> Result<(), LibVmError> {
 ## Docs
 
 - [Terminology](docs/terminology.md)
-- [Guest agent](guest/bento-agent/README.md)
+- [Guest agent](guest/agent/README.md)

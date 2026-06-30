@@ -1,6 +1,6 @@
 # Building libkrun Dependencies
 
-BentoBox links `bento-krun-sys` dynamically against `libkrun`. The libraries do not need to be installed system-wide. Build or fetch them into a local dependency directory, then point Cargo at it with `KRUN_DEPS_DIR`.
+BentoBox links `krun-sys` dynamically against `libkrun`. The libraries do not need to be installed system-wide. Build or fetch them into a local dependency directory, then point Cargo at it with `KRUN_DEPS_DIR`.
 
 The expected layout is:
 
@@ -70,25 +70,25 @@ export KRUN_DEPS_DIR="$PWD/target/libs/krun/$(rustc -vV | awk '/host:/ { print $
 Then build the krun helper:
 
 ```bash
-cargo build -p bento-krun
+cargo build -p krun
 ```
 
 For release builds:
 
 ```bash
-cargo build -p bento-krun --release
+cargo build -p krun --release
 ```
 
-`bento-krun-sys` uses `KRUN_DEPS_DIR` in its build script to emit Cargo link instructions:
+`krun-sys` uses `KRUN_DEPS_DIR` in its build script to emit Cargo link instructions:
 
 ```text
 cargo:rustc-link-search=native=$KRUN_DEPS_DIR
 cargo:rustc-link-lib=dylib=krun
 ```
 
-That means `bento-krun-sys` still links dynamically, but it links against the local dependency folder instead of requiring system-wide `libkrun` installation.
+That means `krun-sys` still links dynamically, but it links against the local dependency folder instead of requiring system-wide `libkrun` installation.
 
-`bento-krun` also sets the `krun` binary rpath so the binary can load libraries copied beside it:
+`krun` also sets the `krun` binary rpath so the binary can load libraries copied beside it:
 
 - Linux: `$ORIGIN`
 - macOS: `@loader_path`
@@ -123,4 +123,4 @@ Override it only when intentionally updating the native ABI and regenerated bind
 LIBKRUN_VERSION=... make build-libkrun
 ```
 
-If `libkrun.h` changes, regenerate or update `virt/bento-krun-sys/src/bindings.rs` and keep `virt/bento-krun-sys/include/libkrun.h` in sync.
+If `libkrun.h` changes, regenerate or update `virt/krun-sys/src/bindings.rs` and keep `virt/krun-sys/include/libkrun.h` in sync.

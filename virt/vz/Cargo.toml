@@ -1,0 +1,17 @@
+[package]
+name = "vz"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+utils = { path = "../../common/utils" }
+block2 = "0.6.2"
+crossbeam = "0.8.4"
+dispatch2 = "0.3.1"
+nix = { version = "0.31.3", features = ["fs", "socket"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["io-util", "net", "sync", "time"] }
+tracing = "0.1.44"
+objc2 = { version = "0.6.4", features = ["catch-all", "exception"] }
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSFileHandle", "NSObject", "NSProcessInfo", "NSString", "NSURL"] }
+objc2-virtualization = { version = "0.3.2", features = ["default", "VZFileHandleNetworkDeviceAttachment", "VZMACAddress"] }

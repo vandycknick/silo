@@ -1,0 +1,38 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+default-run = "bento"
+
+[[bin]]
+name = "bento"
+path = "src/main.rs"
+
+[dependencies]
+agent-spec = { path = "../../specs/agent-spec" }
+libvm = { path = "../../runtime/libvm" }
+ocidisk = { path = "../../runtime/ocidisk" }
+vm-spec = { path = "../../specs/vm-spec" }
+utils = { path = "../../common/utils" }
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_yaml_ng = "0.10.0"
+libc = "0.2.186"
+time = { version = "0.3.47", features = ["formatting"] }
+chrono = "0.4.44"
+eyre = "0.6.12"
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+indicatif = "0.18.4"
+nix = { version = "0.31.3", features = ["fs"] }
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "form", "rustls"] }
+tabwriter = "1.4.1"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "io-std"] }
+tonic = { version = "0.14.6", features = ["transport"] }
+tower = "0.5.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

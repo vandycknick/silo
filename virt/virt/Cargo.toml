@@ -1,0 +1,21 @@
+[package]
+name = "virt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+protocol = { path = "../../specs/protocol" }
+crossbeam = "0.8.4"
+nix = { version = "0.31.3", features = ["fs", "process", "signal", "socket", "term"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt", "fs", "io-util", "net", "process", "sync", "time"] }
+tracing = "0.1.44"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+vz = { path = "../vz" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+krun = { path = "../krun" }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt", "sync"] }
