@@ -68,7 +68,7 @@ rule "deny-web" {
 	if event.Policy == nil || event.Policy.RuleName != "deny-web" || event.Policy.EndpointKind != "ip" || event.Policy.EndpointName != "web" {
 		t.Fatalf("unexpected audit decision metadata: %#v", event)
 	}
-	if event.Protocol != "tcp" || event.SourceIP != "192.168.127.2" || event.SourcePort != 49152 || event.DestIP != "203.0.113.10" || event.DestPort != 443 {
+	if event.Protocol != "tcp" || event.IPVersion != "ipv4" || event.SourceIP != "192.168.127.2" || event.SourcePort != 49152 || event.DestIP != "203.0.113.10" || event.DestPort != 443 {
 		t.Fatalf("unexpected audit flow metadata: %#v", event)
 	}
 	if event.VMID != "vm-123" || event.NetworkID != "net-456" {
@@ -76,6 +76,10 @@ rule "deny-web" {
 	}
 	assertAuditDoesNotContain(t, auditPath, "profile_name")
 	assertAuditDoesNotContain(t, auditPath, "l4_match")
+	assertAuditDoesNotContain(t, auditPath, "duration_ms")
+	assertAuditDoesNotContain(t, auditPath, "bytes_in")
+	assertAuditDoesNotContain(t, auditPath, "bytes_out")
+	assertAuditDoesNotContain(t, auditPath, "packets")
 }
 
 func TestDecideDoesNotAuditBeforeTerminalPath(t *testing.T) {
@@ -99,6 +103,180 @@ settings {
 		t.Fatal(err)
 	}
 	assertNoAuditRecords(t, auditPath)
+}
+
+func TestRecordFlowWritesIPv6AuditRecord(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLog, err := audit.Open(auditPath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("2001:db8::10"), SourcePort: 49152, DestIP: net.ParseIP("2001:db8::20"), DestPort: 443}
+	route := New(hooks.NewPolicyHook(policy.Default()), auditLog)
+	decision, err := route.Decide(context.Background(), flow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route.RecordFlow(flow, decision)
+	if err := auditLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	event := readAuditEvent(t, auditPath)
+	if event.IPVersion != "ipv6" || event.SourceIP != "2001:db8::10" || event.DestIP != "2001:db8::20" {
+		t.Fatalf("unexpected IPv6 audit metadata: %#v", event)
+	}
+	if event.PolicyHash != "" {
+		t.Fatalf("implicit default policy should omit policy_hash: %#v", event)
+	}
+}
+
+func TestRecordFlowWritesExplicitAllowAuditRecord(t *testing.T) {
+	compiled := loadRouterPolicy(t, `
+endpoint "ip" "api" {
+  destination = ["203.0.113.20/32"]
+  protocol = "tcp"
+  ports = [443]
+}
+
+rule "allow-api" {
+  endpoint = ip.api
+  verdict = "allow"
+}
+`)
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLog, err := audit.Open(auditPath, compiled.PolicyHash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 49152, DestIP: net.ParseIP("203.0.113.20"), DestPort: 443}
+	route := New(hooks.NewPolicyHook(compiled), auditLog)
+	decision, err := route.Decide(context.Background(), flow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route.RecordFlow(flow, decision)
+	if err := auditLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	event := readAuditEvent(t, auditPath)
+	if event.Verdict != "allow" || event.Reason != "rule_allow" {
+		t.Fatalf("unexpected explicit allow verdict/reason: %#v", event)
+	}
+	if event.Policy == nil || event.Policy.RuleName != "allow-api" || event.Policy.EndpointKind != "ip" || event.Policy.EndpointName != "api" {
+		t.Fatalf("unexpected explicit allow policy metadata: %#v", event)
+	}
+}
+
+func TestRecordFlowWritesClassificationHandoffAuditRecord(t *testing.T) {
+	compiled := loadRouterPolicy(t, `
+settings {
+  default_action = "deny"
+}
+
+endpoint "http" "metadata" {
+  hosts = ["metadata.internal"]
+}
+`)
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLog, err := audit.Open(auditPath, compiled.PolicyHash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 49152, DestIP: net.ParseIP("169.254.169.254"), DestPort: 80}
+	route := New(hooks.NewPolicyHook(compiled), auditLog)
+	decision, err := route.Decide(context.Background(), flow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Action != hooks.RouteClassify {
+		t.Fatalf("expected L7 classification handoff decision, got %#v", decision)
+	}
+	route.RecordFlowOutcome(flow, decision, "classify")
+	if err := auditLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	event := readAuditEvent(t, auditPath)
+	if event.Family != "ip" || event.Phase != "end" || event.Verdict != "allow" || event.Reason != "classify" {
+		t.Fatalf("unexpected classification handoff record: %#v", event)
+	}
+	if event.Policy != nil {
+		t.Fatalf("default classification handoff should not include policy metadata: %#v", event)
+	}
+}
+
+func TestRecordFlowWritesTerminalErrorMetadata(t *testing.T) {
+	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 49152, DestIP: net.ParseIP("203.0.113.10"), DestPort: 443}
+	tests := []struct {
+		name       string
+		decision   hooks.RouteDecision
+		reason     string
+		wantPolicy bool
+	}{
+		{
+			name:     "before endpoint selection",
+			decision: hooks.RouteDecision{Action: hooks.RouteDeny, Reason: "policy_error"},
+			reason:   "policy_error",
+		},
+		{
+			name: "after endpoint selection",
+			decision: hooks.RouteDecision{
+				Action:       hooks.RouteAllowDirect,
+				Layer:        "flow",
+				Source:       "rule",
+				RuleName:     "allow-web",
+				EndpointKind: "ip",
+				EndpointName: "web",
+			},
+			reason:     "upstream_error",
+			wantPolicy: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+			auditLog, err := audit.Open(auditPath, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			route := New(hooks.NewPolicyHook(policy.Default()), auditLog)
+			route.RecordFlowOutcome(flow, test.decision, test.reason)
+			if err := auditLog.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			event := readAuditEvent(t, auditPath)
+			if event.Reason != test.reason || event.Error == nil || event.Error.Code != test.reason {
+				t.Fatalf("unexpected terminal error metadata: %#v", event)
+			}
+			if (event.Policy != nil) != test.wantPolicy {
+				t.Fatalf("unexpected policy metadata presence: %#v", event)
+			}
+		})
+	}
+}
+
+func TestRecordFlowWritesTunnelMetadataWhenPresent(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLog, err := audit.Open(auditPath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 49152, DestIP: net.ParseIP("203.0.113.10"), DestPort: 443}
+	decision := hooks.RouteDecision{Action: hooks.RouteAllowDirect, Tunnel: &hooks.Tunnel{Kind: "tailscale", Name: "prod"}}
+	route := New(hooks.NewPolicyHook(policy.Default()), auditLog)
+	route.RecordFlow(flow, decision)
+	if err := auditLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	event := readAuditEvent(t, auditPath)
+	if event.Tunnel == nil || event.Tunnel.Kind != "tailscale" || event.Tunnel.Name != "prod" {
+		t.Fatalf("unexpected tunnel metadata: %#v", event)
+	}
 }
 
 func TestRecordFlowWritesDefaultActionAuditRecords(t *testing.T) {

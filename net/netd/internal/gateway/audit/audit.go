@@ -48,6 +48,7 @@ type Event struct {
 	RequestID    string      `json:"request_id,omitempty"`
 	Direction    string      `json:"direction,omitempty"`
 	Protocol     string      `json:"protocol,omitempty"`
+	IPVersion    string      `json:"ip_version,omitempty"`
 	SourceIP     string      `json:"source_ip,omitempty"`
 	SourcePort   uint16      `json:"source_port,omitempty"`
 	DestIP       string      `json:"destination_ip,omitempty"`
@@ -55,6 +56,8 @@ type Event struct {
 	Policy       *Policy     `json:"policy,omitempty"`
 	HTTP         *HTTP       `json:"http,omitempty"`
 	Credential   *Credential `json:"credential,omitempty"`
+	Tunnel       *Tunnel     `json:"tunnel,omitempty"`
+	Error        *AuditError `json:"error,omitempty"`
 	Verdict      string      `json:"verdict"`
 	Reason       string      `json:"reason,omitempty"`
 }
@@ -89,6 +92,15 @@ type Credential struct {
 	Name        string `json:"name,omitempty"`
 	Status      string `json:"status,omitempty"`
 	ErrorReason string `json:"error_reason,omitempty"`
+}
+
+type Tunnel struct {
+	Kind string `json:"kind,omitempty"`
+	Name string `json:"name,omitempty"`
+}
+
+type AuditError struct {
+	Code string `json:"code,omitempty"`
 }
 
 func Open(path string, policyHash string) (*Logger, error) {
@@ -175,12 +187,15 @@ func (l *Logger) RecordFlowOutcome(flow hooks.Flow, decision hooks.RouteDecision
 		FlowID:     flowID,
 		Direction:  "egress",
 		Protocol:   flow.Protocol,
+		IPVersion:  ipVersion(flow),
 		SourceIP:   ipString(flow.SourceIP),
 		SourcePort: flow.SourcePort,
 		DestIP:     ipString(flow.DestIP),
 		DestPort:   flow.DestPort,
 		Policy:     policyMetadata(decision),
 		Credential: credential(decision, effectiveReason),
+		Tunnel:     tunnel(decision),
+		Error:      auditError(effectiveReason),
 		Verdict:    verdict(decision),
 		Reason:     effectiveReason,
 	})
@@ -212,12 +227,15 @@ func (l *Logger) RecordHTTPRequestOutcome(request hooks.HTTPRequest, decision ho
 		RequestID:    requestID,
 		Direction:    "egress",
 		Protocol:     request.Flow.Protocol,
+		IPVersion:    ipVersion(request.Flow),
 		SourceIP:     ipString(request.Flow.SourceIP),
 		SourcePort:   request.Flow.SourcePort,
 		DestIP:       ipString(request.Flow.DestIP),
 		DestPort:     request.Flow.DestPort,
 		Policy:       policyMetadata(decision),
 		Credential:   credential(decision, effectiveReason),
+		Tunnel:       tunnel(decision),
+		Error:        auditError(effectiveReason),
 		HTTP: &HTTP{
 			Scheme: httpScheme(request.EndpointKind),
 			Request: &HTTPRequest{
@@ -284,6 +302,15 @@ func auditReason(decision hooks.RouteDecision, reason string) string {
 	if reason != "" {
 		return reason
 	}
+	if decision.Reason != "" {
+		return decision.Reason
+	}
+	if decision.Layer == "flow" && decision.Source == "rule" {
+		if decision.Action == hooks.RouteDeny {
+			return "rule_deny"
+		}
+		return "rule_allow"
+	}
 	return decision.Reason
 }
 
@@ -328,6 +355,22 @@ func credential(decision hooks.RouteDecision, reason string) *Credential {
 	return metadata
 }
 
+func tunnel(decision hooks.RouteDecision) *Tunnel {
+	if decision.Tunnel == nil || (decision.Tunnel.Kind == "" && decision.Tunnel.Name == "") {
+		return nil
+	}
+	return &Tunnel{Kind: decision.Tunnel.Kind, Name: decision.Tunnel.Name}
+}
+
+func auditError(reason string) *AuditError {
+	switch reason {
+	case "policy_error", "endpoint_error", "upstream_error", "proxy_error", "tunnel_not_connected", "tunnel_error":
+		return &AuditError{Code: reason}
+	default:
+		return nil
+	}
+}
+
 func redactedHeaders(header http.Header) map[string][]string {
 	if len(header) == 0 {
 		return nil
@@ -363,4 +406,24 @@ func ipString(ip net.IP) string {
 		return ""
 	}
 	return ip.String()
+}
+
+func ipVersion(flow hooks.Flow) string {
+	if version := ipVersionForIP(flow.SourceIP); version != "" {
+		return version
+	}
+	return ipVersionForIP(flow.DestIP)
+}
+
+func ipVersionForIP(ip net.IP) string {
+	if len(ip) == 0 {
+		return ""
+	}
+	if ip.To4() != nil {
+		return "ipv4"
+	}
+	if ip.To16() != nil {
+		return "ipv6"
+	}
+	return ""
 }

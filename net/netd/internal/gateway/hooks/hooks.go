@@ -44,6 +44,11 @@ type Credential struct {
 	IdempotencyKey bool
 }
 
+type Tunnel struct {
+	Kind string
+	Name string
+}
+
 type PortRange struct {
 	Start uint16
 	End   uint16
@@ -76,6 +81,7 @@ type RouteDecision struct {
 	EndpointName              string
 	MatchedL4                 *L4Match
 	Credential                *Credential
+	Tunnel                    *Tunnel
 }
 
 type Hook interface {

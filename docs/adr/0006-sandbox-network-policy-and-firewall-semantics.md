@@ -831,7 +831,7 @@ For denied traffic or errors that never open an upstream/target connection, audi
 
 IP decisions use `family = "ip"` records because there is no L7 request lifecycle. `netd` logs all L3/L4 actions by default: default allow, default deny, explicit rule allow, explicit rule deny, classification handoff, and terminal forwarding errors. These records use `phase = "end"` in the initial implementation.
 
-TCP emits a terminal `family = "ip"` record when the flow is denied, completed, handed to an L7 proxy, or errored. UDP traffic is aggregated by 5-tuple in a later implementation and emits an aggregate terminal `family = "ip"` record when the implementation-defined idle timeout or close condition fires. Denied UDP can emit a single terminal record without creating long-lived aggregate state.
+TCP emits a terminal `family = "ip"` record when the flow is denied, completed, handed to L7 classification, or errored before handoff. L7 handoff records are emitted immediately before HTTP/HTTPS classification continues, use `verdict = "allow"` with `reason = "classify"`, and are the only IP record for that flow. UDP traffic is aggregated by 5-tuple in a later implementation and emits an aggregate terminal `family = "ip"` record when the implementation-defined idle timeout or close condition fires. Denied UDP can emit a single terminal record without creating long-lived aggregate state.
 
 The UDP aggregation timeout is intentionally implementation-defined for now.
 
@@ -839,14 +839,15 @@ L3/L4 audit metadata includes enough context for:
 
 - `flow_id`,
 - `direction`, such as VM egress,
-- `protocol`, `ip_version`, source/destination IPs, and source/destination ports,
+- `protocol`, `ip_version` (`ipv4` or `ipv6`), source/destination IPs, and source/destination ports,
 - `policy.endpoint_kind`, `policy.endpoint_name`, and `policy.rule_name` when policy endpoint/rule metadata is available,
 - verdict and reason,
-- tunnel metadata when routing uses Tailscale,
-- duration, byte counts, packet counts when available,
-- redacted error metadata.
+- tunnel metadata when routing uses Tailscale, as `tunnel.kind` and `tunnel.name`,
+- redacted error metadata as a stable `error.code` without runtime error messages.
 
-`policy` presence means an outbound policy endpoint matched, was selected, or an explicit rule matched. `policy.endpoint_kind` and `policy.endpoint_name` identify the selected endpoint. `policy.rule_name` identifies the explicit matching rule. When `policy` is omitted, the action came from default behavior or an implementation/runtime failure before endpoint selection.
+Current `netd` IP audit records intentionally omit duration, byte counters, and packet counters. Those fields can be added later when the runtime has meaningful transport-level counters instead of stream-derived guesses or zero placeholders.
+
+`policy` presence means an outbound policy endpoint matched, was selected, or an explicit rule matched. `policy.endpoint_kind` and `policy.endpoint_name` identify the selected endpoint. `policy.rule_name` identifies the explicit matching rule. When `policy` is omitted, the action came from default behavior or an implementation/runtime failure before endpoint selection. Explicit IP rules preserve configured rule reasons; when no rule reason is configured, audit uses stable fallbacks such as `rule_allow` or `rule_deny`.
 
 ### HTTP-Family Request Audit
 
@@ -866,8 +867,7 @@ HTTP-family audit metadata includes:
 - TLS metadata for HTTPS when available,
 - credential kind/name/status/error reason without values,
 - tunnel metadata when an explicit allow uses Tailscale,
-- upstream error metadata when applicable,
-- duration and byte counts.
+- upstream error metadata when applicable.
 
 Example terminal HTTPS record:
 
@@ -927,10 +927,7 @@ Example terminal HTTPS record:
             "truncated": true,
             "value": "{\"items\":["
         }
-    },
-    "bytes_in": 123,
-    "bytes_out": 456,
-    "duration_ms": 42
+    }
 }
 ```
 
