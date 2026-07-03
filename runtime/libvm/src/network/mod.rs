@@ -17,6 +17,7 @@ pub use policy::NetworkPolicyRef;
 
 pub(crate) use api::validate_network_name;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::LocalPaths;
@@ -196,6 +197,7 @@ enum SelectedNetworkDriver {
     VzNat(VzNatDriver),
 }
 
+#[async_trait]
 impl NetworkDriverBackend for SelectedNetworkDriver {
     fn id(&self) -> &'static str {
         match self {

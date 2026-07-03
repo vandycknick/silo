@@ -1,5 +1,7 @@
 use std::fs;
 
+use async_trait::async_trait;
+
 use crate::LibVmError;
 
 use super::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
@@ -7,6 +9,7 @@ use super::{remove_attached_network, VmmonNetworkAttachment, DRIVER_VZNAT};
 
 pub(super) struct VzNatDriver;
 
+#[async_trait]
 impl NetworkDriverBackend for VzNatDriver {
     fn id(&self) -> &'static str {
         DRIVER_VZNAT

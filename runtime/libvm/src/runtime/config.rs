@@ -29,6 +29,12 @@ pub struct RuntimeConfig {
     pub image_root: PathChoice,
     /// Networking configuration for locally started machines.
     pub networking: RuntimeNetworkingConfig,
+    /// Default Linux kernel used when a machine does not set one explicitly.
+    pub default_kernel: Option<PathBuf>,
+    /// Default initramfs used when a machine does not set one explicitly.
+    pub default_initramfs: Option<PathBuf>,
+    /// Explicit vmmon executable path.
+    pub vmmon_path: Option<PathBuf>,
 }
 
 impl RuntimeConfig {
@@ -39,6 +45,9 @@ impl RuntimeConfig {
             run_root: PathChoice::Default,
             image_root: PathChoice::Default,
             networking: RuntimeNetworkingConfig::default(),
+            default_kernel: None,
+            default_initramfs: None,
+            vmmon_path: None,
         }
     }
 
@@ -63,6 +72,24 @@ impl RuntimeConfig {
     /// Sets local runtime networking configuration.
     pub fn with_networking(mut self, networking: RuntimeNetworkingConfig) -> Self {
         self.networking = networking;
+        self
+    }
+
+    /// Sets the default kernel path for machines that do not provide one.
+    pub fn with_default_kernel(mut self, kernel: impl Into<PathBuf>) -> Self {
+        self.default_kernel = Some(kernel.into());
+        self
+    }
+
+    /// Sets the default initramfs path for machines that do not provide one.
+    pub fn with_default_initramfs(mut self, initramfs: impl Into<PathBuf>) -> Self {
+        self.default_initramfs = Some(initramfs.into());
+        self
+    }
+
+    /// Sets the vmmon executable path used to launch machines.
+    pub fn with_vmmon_path(mut self, vmmon_path: impl Into<PathBuf>) -> Self {
+        self.vmmon_path = Some(vmmon_path.into());
         self
     }
 
@@ -247,6 +274,9 @@ impl Default for RuntimeConfig {
             run_root: PathChoice::Default,
             image_root: PathChoice::Default,
             networking: RuntimeNetworkingConfig::default(),
+            default_kernel: None,
+            default_initramfs: None,
+            vmmon_path: None,
         }
     }
 }

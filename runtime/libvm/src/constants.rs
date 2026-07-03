@@ -1,8 +1,5 @@
 //! Shared constants for libvm behavior that crosses module boundaries.
 
-/// Static initramfs asset filename under the local Bento assets directory.
-pub(crate) const ASSET_INITRAMFS_FILENAME: &str = "initramfs";
-
 /// Local certificate authority certificate filename under the Bento keys directory.
 pub(crate) const CERTIFICATE_AUTHORITY_CERTIFICATE_FILE_NAME: &str = "ca.pem";
 

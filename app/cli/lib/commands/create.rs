@@ -110,15 +110,9 @@ impl VmOverrideArgs {
 
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        let mut progress = Spinner::start("Reading", "VM recipe");
-        let mut resolved = self.resolve()?;
+        let progress = Spinner::start("Reading", "VM recipe");
+        let resolved = self.resolve()?;
         let runtime = context.runtime().await?;
-        progress.step("Finding", "boot assets");
-        let boot_assets = resolve_boot_assets(
-            runtime.local_data_dir(),
-            resolved.kernel.take(),
-            resolved.initramfs.take(),
-        );
         progress.finish_clear();
         let image_source = parse_cli_image_source(&resolved.image_ref)?;
         let (image_progress, image_events) = ImageProgressSender::default_channel();
@@ -131,7 +125,7 @@ impl Cmd {
                 .image_source(image_source)
                 .name(self.name.clone());
 
-            apply_resolved_machine_options(builder, machine_options, boot_assets)
+            apply_resolved_machine_options(builder, machine_options)
                 .create()
                 .await
         };
@@ -219,8 +213,6 @@ impl Cmd {
 
         Ok(ResolvedCreate {
             image_ref,
-            kernel: self.overrides.kernel.clone(),
-            initramfs: self.overrides.initramfs.clone(),
             options: ResolvedMachineOptions {
                 labels,
                 metadata,
@@ -232,33 +224,17 @@ impl Cmd {
                 disk_size_bytes: self.overrides.disk_size_bytes()?.or(disk_size_bytes),
                 nested_virtualization: self.overrides.nested_virtualization,
                 rosetta: self.overrides.rosetta,
+                kernel: self.overrides.kernel.clone(),
+                initramfs: self.overrides.initramfs.clone(),
                 disks: self.overrides.disks.clone(),
             },
         })
     }
 }
 
-pub(crate) struct BootAssets {
-    pub(crate) kernel: PathBuf,
-    pub(crate) initramfs: Option<PathBuf>,
-}
-
-pub(crate) fn resolve_boot_assets(
-    data_dir: &Path,
-    kernel: Option<PathBuf>,
-    initramfs: Option<PathBuf>,
-) -> BootAssets {
-    let assets_dir = data_dir.join("assets");
-    BootAssets {
-        kernel: kernel.unwrap_or_else(|| assets_dir.join("default")),
-        initramfs,
-    }
-}
-
 pub(crate) fn apply_resolved_machine_options(
     mut builder: MachineBuilder,
     options: ResolvedMachineOptions,
-    boot_assets: BootAssets,
 ) -> MachineBuilder {
     let ResolvedMachineOptions {
         labels,
@@ -271,13 +247,14 @@ pub(crate) fn apply_resolved_machine_options(
         disk_size_bytes,
         nested_virtualization,
         rosetta,
+        kernel,
+        initramfs,
         disks,
     } = options;
 
     builder = builder
         .labels(labels)
         .metadata(metadata)
-        .kernel(boot_assets.kernel)
         .nested_virtualization(nested_virtualization)
         .rosetta(rosetta)
         .disks(disks)
@@ -290,7 +267,10 @@ pub(crate) fn apply_resolved_machine_options(
     if let Some(memory_mib) = memory_mib {
         builder = builder.memory(Memory::mebibytes(u64::from(memory_mib)));
     }
-    if let Some(initramfs) = boot_assets.initramfs {
+    if let Some(kernel) = kernel {
+        builder = builder.kernel(kernel);
+    }
+    if let Some(initramfs) = initramfs {
         builder = builder.initramfs(initramfs);
     }
     if let Some(bytes) = disk_size_bytes {
@@ -305,8 +285,6 @@ pub(crate) fn apply_resolved_machine_options(
 
 struct ResolvedCreate {
     image_ref: String,
-    kernel: Option<PathBuf>,
-    initramfs: Option<PathBuf>,
     options: ResolvedMachineOptions,
 }
 
@@ -321,6 +299,8 @@ pub(crate) struct ResolvedMachineOptions {
     pub(crate) disk_size_bytes: Option<u64>,
     pub(crate) nested_virtualization: bool,
     pub(crate) rosetta: bool,
+    pub(crate) kernel: Option<PathBuf>,
+    pub(crate) initramfs: Option<PathBuf>,
     pub(crate) disks: Vec<PathBuf>,
 }
 
@@ -338,45 +318,10 @@ pub(crate) fn read_userdata_path(path: &Path) -> eyre::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
-
     use clap::Parser;
 
     use crate::app::Cli;
-    use crate::commands::create::resolve_boot_assets;
     use crate::commands::Command;
-
-    #[test]
-    fn default_boot_assets_use_flat_data_assets_dir() {
-        let assets = resolve_boot_assets(Path::new("/data/bento"), None, None);
-
-        assert_eq!(assets.kernel, PathBuf::from("/data/bento/assets/default"));
-        assert_eq!(assets.initramfs, None);
-    }
-
-    #[test]
-    fn explicit_boot_assets_override_defaults_independently() {
-        let assets = resolve_boot_assets(
-            Path::new("/data/bento"),
-            Some(PathBuf::from("./kernel")),
-            None,
-        );
-
-        assert_eq!(assets.kernel, PathBuf::from("./kernel"));
-        assert_eq!(assets.initramfs, None);
-    }
-
-    #[test]
-    fn explicit_initramfs_is_forwarded_to_libvm() {
-        let assets = resolve_boot_assets(
-            Path::new("/data/bento"),
-            None,
-            Some(PathBuf::from("./initrd.img")),
-        );
-
-        assert_eq!(assets.kernel, PathBuf::from("/data/bento/assets/default"));
-        assert_eq!(assets.initramfs, Some(PathBuf::from("./initrd.img")));
-    }
 
     #[test]
     fn create_command_parses_profile_form() {
@@ -449,6 +394,14 @@ mod tests {
         );
         assert!(create.overrides.nested_virtualization);
         assert!(create.overrides.rosetta);
+        assert_eq!(
+            create.overrides.kernel.as_deref(),
+            Some("./vmlinuz".as_ref())
+        );
+        assert_eq!(
+            create.overrides.initramfs.as_deref(),
+            Some("./initrd.img".as_ref())
+        );
         assert_eq!(create.overrides.disks.len(), 1);
         assert_eq!(create.overrides.mounts.len(), 1);
         assert_eq!(

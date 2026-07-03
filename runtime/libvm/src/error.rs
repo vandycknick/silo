@@ -69,10 +69,20 @@ pub enum LibVmError {
     #[error("network runtime for {reference} failed: {message}")]
     NetworkRuntime { reference: String, message: String },
 
-    #[error(
-        "vmmon executable not found. Expected a sibling binary at {expected_path} or `vmmon` in PATH. Build it with `cargo build -p vmmon` (or `cargo build --release -p vmmon`)."
-    )]
-    VmMonExecutableNotFound { expected_path: PathBuf },
+    #[error("vmmon executable not found; checked {searched}")]
+    VmMonExecutableNotFound { searched: String },
+
+    #[error("vmmon executable path is not a file: {path}")]
+    VmMonExecutableInvalid { path: PathBuf },
+
+    #[error("boot asset {asset} not found; checked {checked}")]
+    BootAssetNotFound {
+        asset: &'static str,
+        checked: String,
+    },
+
+    #[error("boot asset {asset} path is not a file: {path}")]
+    BootAssetInvalid { asset: &'static str, path: PathBuf },
 
     #[error("invalid create request for machine {name:?}: {reason}")]
     InvalidCreateRequest { name: String, reason: String },

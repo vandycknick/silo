@@ -1,3 +1,5 @@
+use async_trait::async_trait;
+
 use crate::paths::LocalPaths;
 use crate::store::models::MachineConfig;
 use crate::store::DataStore;
@@ -54,7 +56,8 @@ pub(super) struct NetworkDriverContext<'a> {
     pub(super) config: &'a RuntimeNetworkingConfig,
 }
 
-pub(super) trait NetworkDriverBackend {
+#[async_trait]
+pub(super) trait NetworkDriverBackend: Send + Sync {
     fn id(&self) -> &'static str;
     fn supports(
         &self,

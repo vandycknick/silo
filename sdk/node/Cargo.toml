@@ -1,0 +1,19 @@
+[package]
+name = "bentobox-node"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "native/lib.rs"
+
+[dependencies]
+libvm = { path = "../../runtime/libvm" }
+napi = { version = "3", features = ["async", "tokio_rt", "napi9"] }
+napi-derive = "3"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+vm-spec = { path = "../../specs/vm-spec" }
+
+[build-dependencies]
+napi-build = "2"

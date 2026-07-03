@@ -60,6 +60,24 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Sets the default kernel path for machines opened by this runtime.
+    pub fn default_kernel(mut self, kernel: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_default_kernel(kernel);
+        self
+    }
+
+    /// Sets the default initramfs path for machines opened by this runtime.
+    pub fn default_initramfs(mut self, initramfs: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_default_initramfs(initramfs);
+        self
+    }
+
+    /// Sets the vmmon executable path used to launch machines.
+    pub fn vmmon_path(mut self, vmmon_path: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_vmmon_path(vmmon_path);
+        self
+    }
+
     /// Opens the runtime.
     pub async fn open(self) -> Result<Runtime, LibVmError> {
         Runtime::new(self.config).await

@@ -11,6 +11,7 @@ members = [
     "runtime/libvm",
     "runtime/plugins",
     "runtime/vmmon",
+    "sdk/node",
     "virt/krun",
     "virt/krun-sys",
     "virt/virt",

@@ -12,6 +12,7 @@ use crate::store::models::MachineId;
 use crate::vmmon::Vmmon;
 use crate::LibVmError;
 
+const ENV_VMMON_PATH: &str = "BENTO_VMMON_PATH";
 const ENV_VM_STARTPIPE: &str = "_VM_STARTPIPE";
 const ENV_VM_SYNCPIPE: &str = "_VM_SYNCPIPE";
 const VMMON_LAUNCHER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,7 +39,7 @@ impl Vmmon {
         let (start_read, start_write) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
         let (sync_read, sync_write) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
 
-        let mut command = Command::new(resolve_vmmon_executable()?);
+        let mut command = Command::new(resolve_vmmon_executable(self.executable())?);
         command
             .arg("--id")
             .arg(launch.machine_id.to_string())
@@ -137,27 +138,56 @@ fn wait_for_vmmon_launcher_blocking(mut child: std::process::Child) -> io::Resul
     )))
 }
 
-fn resolve_vmmon_executable() -> Result<PathBuf, LibVmError> {
+fn resolve_vmmon_executable(configured: Option<&Path>) -> Result<PathBuf, LibVmError> {
+    let mut searched = Vec::new();
+
+    if let Some(path) = configured {
+        searched.push(format!("runtime config {}", path.display()));
+        return require_vmmon_executable(path);
+    }
+
+    if let Some(path) = std::env::var_os(ENV_VMMON_PATH) {
+        let path = PathBuf::from(path);
+        searched.push(format!("{ENV_VMMON_PATH}={}", path.display()));
+        return require_vmmon_executable(&path);
+    }
+
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("vmmon");
+            searched.push(candidate.display().to_string());
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    } else {
+        searched.push("PATH unset".to_string());
+    }
+
     let current_exe = std::env::current_exe()?;
     let expected_path = current_exe
         .parent()
         .map(|parent| parent.join("vmmon"))
         .unwrap_or_else(|| PathBuf::from("vmmon"));
+    searched.push(format!("sibling {}", expected_path.display()));
 
-    if expected_path.exists() {
+    if expected_path.is_file() {
         return Ok(expected_path);
     }
 
-    if let Some(path) = std::env::var_os("PATH") {
-        if std::env::split_paths(&path)
-            .map(|path| path.join("vmmon"))
-            .any(|candidate| candidate.exists())
-        {
-            return Ok(PathBuf::from("vmmon"));
-        }
+    Err(LibVmError::VmMonExecutableNotFound {
+        searched: searched.join(", "),
+    })
+}
+
+fn require_vmmon_executable(path: &Path) -> Result<PathBuf, LibVmError> {
+    if path.is_file() {
+        return std::fs::canonicalize(path).map_err(LibVmError::Io);
     }
 
-    Err(LibVmError::VmMonExecutableNotFound { expected_path })
+    Err(LibVmError::VmMonExecutableInvalid {
+        path: path.to_path_buf(),
+    })
 }
 
 async fn wait_for_start(syncpipe: OwnedFd, trace_path: &Path) -> Result<(), LibVmError> {

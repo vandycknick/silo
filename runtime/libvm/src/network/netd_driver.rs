@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,7 @@ struct NetdDriverState {
     pcap_path: Option<PathBuf>,
 }
 
+#[async_trait]
 impl NetworkDriverBackend for NetdDriver {
     fn id(&self) -> &'static str {
         DRIVER_NETD

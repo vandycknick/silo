@@ -1,3 +1,4 @@
+pub(crate) mod boot_assets;
 mod builder;
 mod config;
 pub(crate) mod core;

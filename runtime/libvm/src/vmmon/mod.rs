@@ -6,6 +6,8 @@
 //! decide whether a lifecycle operation is valid. Those policies live in
 //! `Machine` and `Runtime`.
 
+use std::path::PathBuf;
+
 use crate::paths::LocalPaths;
 use crate::store::models::MachineId;
 
@@ -24,12 +26,17 @@ pub(crate) use launch_spec::{prepare_launch_spec, write_launch_spec, LaunchSpecI
 #[derive(Debug, Clone)]
 pub(crate) struct Vmmon {
     paths: LocalPaths,
+    executable: Option<PathBuf>,
 }
 
 impl Vmmon {
     /// Creates a vmmon adapter bound to the runtime's local paths.
-    pub(crate) fn new(paths: LocalPaths) -> Self {
-        Self { paths }
+    pub(crate) fn new(paths: LocalPaths, executable: Option<PathBuf>) -> Self {
+        Self { paths, executable }
+    }
+
+    pub(crate) fn executable(&self) -> Option<&std::path::Path> {
+        self.executable.as_deref()
     }
 
     pub(crate) fn client(&self, machine_id: MachineId) -> VmmonClient {

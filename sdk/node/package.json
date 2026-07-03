@@ -1,0 +1,50 @@
+{
+  "name": "bentobox",
+  "version": "0.1.0",
+  "description": "Node.js SDK for BentoBox VMs",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./native": {
+      "types": "./native/index.d.ts",
+      "require": "./native/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "native/index.cjs",
+    "native/index.d.ts",
+    "native/*.node",
+    "README.md"
+  ],
+  "scripts": {
+    "build:native": "napi build --release --platform --js index.cjs --dts index.d.ts --output-dir native",
+    "build:ts": "tsc -p tsconfig.json",
+    "build": "npm run build:native && npm run build:ts",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "napi": {
+    "binaryName": "bentobox",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu"
+    ]
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.0"
+  }
+}

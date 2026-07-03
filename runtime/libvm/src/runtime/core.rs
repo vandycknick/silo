@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +14,9 @@ use crate::guest_agent::{self, GuestAgentConfigInput};
 use crate::lock_manager::{LockGuard, LockId, LockManager, ManagedLock};
 use crate::machine::root_disk::resize_raw_disk;
 use crate::paths::{vm_spec_path_in, LocalPaths, MachinePaths};
+use crate::runtime::boot_assets::{
+    self, BootAssetOverrides, ResolvedBootAssets, RuntimeBootDefaults,
+};
 use crate::runtime::{RuntimeConfig, RuntimeNetworkingConfig};
 use nix::{
     errno::Errno,
@@ -21,7 +24,7 @@ use nix::{
     unistd::Pid,
 };
 use utils::format_storage_size;
-use vm_spec::{Hardware, VmSpec};
+use vm_spec::{Boot, Hardware, Kernel, VmSpec};
 
 use crate::image::{
     ImageDetail, ImageHandle, ImageProgress, ImageProgressSender, ImagePruneReport,
@@ -95,6 +98,7 @@ pub struct Runtime {
     lock_manager: LockManager,
     networking: RuntimeNetworkingConfig,
     vmmon: Vmmon,
+    boot_defaults: RuntimeBootDefaults,
     image_pull_policy: ImagePullPolicy,
     image_progress: Option<ImageProgressSender>,
 }
@@ -131,7 +135,18 @@ impl Runtime {
         };
         let roots = config.resolve_store_roots(&stored, bootstrap_paths.state_db_path())?;
         let paths = LocalPaths::from_roots(roots);
-        Self::from_store(paths, Arc::new(store), config.networking).await
+        let boot_defaults = RuntimeBootDefaults {
+            kernel: config.default_kernel,
+            initramfs: config.default_initramfs,
+        };
+        Self::from_store(
+            paths,
+            Arc::new(store),
+            config.networking,
+            boot_defaults,
+            config.vmmon_path,
+        )
+        .await
     }
 
     /// Opens the default local runtime from the process environment.
@@ -145,22 +160,32 @@ impl Runtime {
         networking: RuntimeNetworkingConfig,
     ) -> Result<Self, LibVmError> {
         let store = Store::new(&paths).await?;
-        Self::from_store(paths, Arc::new(store), networking).await
+        Self::from_store(
+            paths,
+            Arc::new(store),
+            networking,
+            RuntimeBootDefaults::default(),
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn from_store(
         paths: LocalPaths,
         store: Arc<dyn DataStore>,
         networking: RuntimeNetworkingConfig,
+        boot_defaults: RuntimeBootDefaults,
+        vmmon_path: Option<PathBuf>,
     ) -> Result<Self, LibVmError> {
         let lock_manager = LockManager::open(paths.locks_dir().to_path_buf())?;
-        let vmmon = Vmmon::new(paths.clone());
+        let vmmon = Vmmon::new(paths.clone(), vmmon_path);
         let runtime = Self {
             paths,
             store,
             lock_manager,
             networking,
             vmmon,
+            boot_defaults,
             image_pull_policy: ImagePullPolicy::default(),
             image_progress: None,
         };
@@ -222,6 +247,24 @@ impl Runtime {
 
     pub(crate) fn vmmon(&self) -> &Vmmon {
         &self.vmmon
+    }
+
+    pub(crate) fn resolve_boot_assets(
+        &self,
+        kernel: Option<&Path>,
+        initramfs: Option<&Path>,
+    ) -> Result<ResolvedBootAssets, LibVmError> {
+        boot_assets::resolve_boot_assets(
+            BootAssetOverrides { kernel, initramfs },
+            &self.boot_defaults,
+        )
+    }
+
+    fn complete_launch_boot_assets(&self, spec: &mut VmSpec) -> Result<(), LibVmError> {
+        let (kernel, initramfs) = boot_asset_overrides_from_spec(spec);
+        let boot_assets = self.resolve_boot_assets(kernel, initramfs)?;
+        apply_resolved_boot_assets(spec, boot_assets);
+        Ok(())
     }
 
     /// Creates a builder for a new machine.
@@ -833,10 +876,11 @@ impl Runtime {
             let relative_mount_base = std::env::current_dir()
                 .context("resolve current directory for relative mount sources")?;
             let machine_paths = self.machine_paths(config.id);
+            let mut launch_spec = config.spec.clone();
+            self.complete_launch_boot_assets(&mut launch_spec)?;
             let launch_spec = vmmon::prepare_launch_spec(LaunchSpecInput {
-                paths: &self.paths,
                 relative_mount_base: &relative_mount_base,
-                spec: config.spec.clone(),
+                spec: launch_spec,
             })?;
             let agent_config = guest_agent::build_config(GuestAgentConfigInput {
                 paths: &self.paths,
@@ -1431,10 +1475,33 @@ pub(crate) fn stopped_machine_state(
     }
 }
 
+fn boot_asset_overrides_from_spec(spec: &VmSpec) -> (Option<&Path>, Option<&Path>) {
+    let kernel = spec.boot.as_ref().and_then(|boot| boot.kernel.as_ref());
+    (
+        kernel.and_then(|kernel| kernel.path.as_deref()),
+        kernel.and_then(|kernel| kernel.initramfs.as_deref()),
+    )
+}
+
+fn apply_resolved_boot_assets(spec: &mut VmSpec, boot_assets: ResolvedBootAssets) {
+    let boot = spec.boot.get_or_insert(Boot {
+        kernel: None,
+        userdata: None,
+    });
+    let kernel = boot.kernel.get_or_insert_with(|| Kernel {
+        path: None,
+        cmdline: Vec::new(),
+        initramfs: None,
+    });
+    kernel.path = Some(boot_assets.kernel);
+    kernel.initramfs = Some(boot_assets.initramfs);
+}
+
 #[cfg(test)]
 mod tests {
     use crate::lock_manager::LockId;
     use crate::paths::{LocalPaths, MachinePaths};
+    use crate::runtime::boot_assets::RuntimeBootDefaults;
     use crate::runtime::core::{
         effective_oci_manifest_digest, materialized_manifest_digest, oci_image_record,
         read_monitor_pid, stopped_machine_state, write_machine_config, Runtime,
@@ -1555,9 +1622,132 @@ mod tests {
     }
 
     async fn runtime_with_mock_store(paths: LocalPaths, store: MockDataStore) -> Runtime {
-        Runtime::from_store(paths, Arc::new(store), RuntimeNetworkingConfig::default())
-            .await
-            .expect("create runtime with mock store")
+        Runtime::from_store(
+            paths,
+            Arc::new(store),
+            RuntimeNetworkingConfig::default(),
+            RuntimeBootDefaults::default(),
+            None,
+        )
+        .await
+        .expect("create runtime with mock store")
+    }
+
+    async fn runtime_with_boot_defaults(
+        paths: LocalPaths,
+        mut store: MockDataStore,
+        boot_defaults: RuntimeBootDefaults,
+    ) -> Runtime {
+        expect_empty_refresh(&mut store);
+        Runtime::from_store(
+            paths,
+            Arc::new(store),
+            RuntimeNetworkingConfig::default(),
+            boot_defaults,
+            None,
+        )
+        .await
+        .expect("create runtime with boot defaults")
+    }
+
+    fn write_test_asset(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).expect("create asset dir");
+        let path = dir.join(name);
+        std::fs::write(&path, b"asset").expect("write asset");
+        path
+    }
+
+    #[tokio::test]
+    async fn launch_boot_assets_fill_missing_initramfs_for_legacy_specs() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let asset_dir = temp.path().join("assets");
+        let kernel = write_test_asset(&asset_dir, "kernel-default");
+        let initramfs = write_test_asset(&asset_dir, "initramfs");
+        let runtime = runtime_with_boot_defaults(
+            LocalPaths::new(temp.path().join("data")),
+            MockDataStore::new(),
+            RuntimeBootDefaults {
+                kernel: Some(kernel.clone()),
+                initramfs: Some(initramfs.clone()),
+            },
+        )
+        .await;
+        let mut spec = sample_vm_spec();
+        let kernel_spec = spec
+            .boot
+            .as_mut()
+            .and_then(|boot| boot.kernel.as_mut())
+            .expect("sample spec kernel");
+        kernel_spec.path = Some(kernel.clone());
+        kernel_spec.initramfs = None;
+        kernel_spec.cmdline = vec!["root=/dev/vda".to_string()];
+
+        runtime
+            .complete_launch_boot_assets(&mut spec)
+            .expect("complete launch boot assets");
+        let kernel_spec = spec
+            .boot
+            .as_ref()
+            .and_then(|boot| boot.kernel.as_ref())
+            .expect("launch spec kernel");
+
+        assert_eq!(
+            kernel_spec.path,
+            Some(kernel.canonicalize().expect("kernel"))
+        );
+        assert_eq!(
+            kernel_spec.initramfs,
+            Some(initramfs.canonicalize().expect("initramfs"))
+        );
+        assert_eq!(kernel_spec.cmdline, vec!["root=/dev/vda".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn launch_boot_assets_preserve_explicit_initramfs() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let asset_dir = temp.path().join("assets");
+        let kernel = write_test_asset(&asset_dir, "kernel-default");
+        let runtime_initramfs = write_test_asset(&asset_dir, "runtime-initramfs");
+        let explicit_initramfs = write_test_asset(&asset_dir, "explicit-initramfs");
+        let runtime = runtime_with_boot_defaults(
+            LocalPaths::new(temp.path().join("data")),
+            MockDataStore::new(),
+            RuntimeBootDefaults {
+                kernel: Some(kernel.clone()),
+                initramfs: Some(runtime_initramfs),
+            },
+        )
+        .await;
+        let mut spec = sample_vm_spec();
+        let kernel_spec = spec
+            .boot
+            .as_mut()
+            .and_then(|boot| boot.kernel.as_mut())
+            .expect("sample spec kernel");
+        kernel_spec.path = Some(kernel.clone());
+        kernel_spec.initramfs = Some(explicit_initramfs.clone());
+
+        runtime
+            .complete_launch_boot_assets(&mut spec)
+            .expect("complete launch boot assets");
+        let kernel_spec = spec
+            .boot
+            .as_ref()
+            .and_then(|boot| boot.kernel.as_ref())
+            .expect("launch spec kernel");
+
+        assert_eq!(
+            kernel_spec.path,
+            Some(kernel.canonicalize().expect("kernel"))
+        );
+        assert_eq!(
+            kernel_spec.initramfs,
+            Some(
+                explicit_initramfs
+                    .canonicalize()
+                    .expect("explicit initramfs")
+            )
+        );
     }
 
     #[test]

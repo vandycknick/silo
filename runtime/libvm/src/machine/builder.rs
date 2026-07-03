@@ -294,9 +294,8 @@ async fn create_machine_config_with_name(
         });
     };
 
-    let kernel_path = canonicalize_optional_existing_path(request.kernel.as_deref(), "kernel")?;
-    let initramfs_path =
-        canonicalize_optional_existing_path(request.initramfs.as_deref(), "initramfs")?;
+    let boot_assets =
+        runtime.resolve_boot_assets(request.kernel.as_deref(), request.initramfs.as_deref())?;
     if let Some(userdata) = request.userdata.as_deref() {
         if userdata.trim().is_empty() {
             return Err(LibVmError::InvalidCreateRequest {
@@ -332,9 +331,9 @@ async fn create_machine_config_with_name(
         }),
         boot: Some(Boot {
             kernel: Some(Kernel {
-                path: kernel_path,
+                path: Some(boot_assets.kernel),
                 cmdline: vec![ROOT_DISK_KERNEL_ARG.to_string()],
-                initramfs: initramfs_path,
+                initramfs: Some(boot_assets.initramfs),
             }),
             userdata,
         }),
@@ -444,17 +443,6 @@ fn assign_mount_tags(mounts: Vec<Mount>) -> Vec<Mount> {
             mount
         })
         .collect()
-}
-
-fn canonicalize_optional_existing_path(
-    path: Option<&Path>,
-    kind: &str,
-) -> Result<Option<PathBuf>, LibVmError> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-
-    Ok(Some(canonicalize_existing_path(path, kind)?))
 }
 
 fn canonicalize_existing_paths(paths: &[PathBuf], kind: &str) -> Result<Vec<PathBuf>, LibVmError> {
@@ -590,6 +578,7 @@ mod tests {
         MachineCreatePlan, MachineCreateRequest, ROOT_DISK_KERNEL_ARG,
     };
     use crate::paths::{root_disk_relative_path, LocalPaths};
+    use crate::runtime::boot_assets::RuntimeBootDefaults;
     use crate::runtime::Runtime;
     use crate::store::models::{MachineId, MachineNetworkConfig, MachineRootfsRecord};
     use crate::store::MockDataStore;
@@ -639,9 +628,15 @@ mod tests {
     }
 
     async fn runtime_with_mock_store(paths: LocalPaths, store: MockDataStore) -> Runtime {
-        Runtime::from_store(paths, Arc::new(store), RuntimeNetworkingConfig::default())
-            .await
-            .expect("create runtime with mock store")
+        Runtime::from_store(
+            paths,
+            Arc::new(store),
+            RuntimeNetworkingConfig::default(),
+            RuntimeBootDefaults::default(),
+            None,
+        )
+        .await
+        .expect("create runtime with mock store")
     }
 
     async fn create_guard_sample(
@@ -662,6 +657,16 @@ mod tests {
     }
 
     fn create_request(base_rootfs_path: PathBuf, name: &str) -> MachineCreateRequest {
+        let boot_dir = base_rootfs_path
+            .parent()
+            .expect("rootfs has parent")
+            .join("boot-assets");
+        std::fs::create_dir_all(&boot_dir).expect("create boot assets dir");
+        let kernel = boot_dir.join("kernel-default");
+        let initramfs = boot_dir.join("initramfs");
+        std::fs::write(&kernel, b"kernel").expect("write kernel");
+        std::fs::write(&initramfs, b"initramfs").expect("write initramfs");
+
         MachineCreateRequest {
             image_source: Some(ImageSource::disk(base_rootfs_path)),
             name: Some(name.to_string()),
@@ -669,8 +674,8 @@ mod tests {
             metadata: std::collections::BTreeMap::new(),
             cpus: None,
             memory: None,
-            kernel: None,
-            initramfs: None,
+            kernel: Some(kernel),
+            initramfs: Some(initramfs),
             disk_size_bytes: None,
             nested_virtualization: false,
             rosetta: false,

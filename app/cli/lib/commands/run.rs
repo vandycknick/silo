@@ -1,15 +1,13 @@
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-
 use clap::Args;
 use libvm::{
     ImageProgressSender, MachineNetworkConfig, MachineRef, Runtime, DEFAULT_GUEST_READINESS_TIMEOUT,
 };
+use std::collections::BTreeMap;
 use vm_spec::Mount;
 
 use crate::commands::create::{
     apply_resolved_machine_options, profile_mount_to_mount, read_userdata_path,
-    resolve_boot_assets, ResolvedMachineOptions, VmOverrideArgs,
+    ResolvedMachineOptions, VmOverrideArgs,
 };
 use crate::commands::rootfs_image::parse_cli_image_source;
 use crate::commands::start_options::machine_start_options;
@@ -65,13 +63,9 @@ impl Cmd {
             eyre::bail!("--keep-on-failure requires a command");
         }
 
-        let mut progress = Spinner::start("Reading", "run recipe");
-        let mut resolved = self.resolve()?;
+        let progress = Spinner::start("Reading", "run recipe");
+        let resolved = self.resolve()?;
         let runtime = context.runtime().await?;
-        progress.step("Finding", "boot assets");
-        let data_dir = runtime.local_data_dir().to_path_buf();
-        let boot_assets =
-            resolve_boot_assets(&data_dir, resolved.kernel.take(), resolved.initramfs.take());
         progress.finish_clear();
         let image_source = parse_cli_image_source(&resolved.image_ref)?;
         let (image_progress, image_events) = ImageProgressSender::default_channel();
@@ -81,7 +75,7 @@ impl Cmd {
             let runtime_with_progress = (*runtime).clone().with_image_progress(image_progress);
             let builder = runtime_with_progress.machine().image_source(image_source);
 
-            apply_resolved_machine_options(builder, machine_options, boot_assets)
+            apply_resolved_machine_options(builder, machine_options)
                 .create()
                 .await
         };
@@ -171,8 +165,6 @@ impl Cmd {
 
         Ok(ResolvedRun {
             image_ref,
-            kernel: self.overrides.kernel.clone(),
-            initramfs: self.overrides.initramfs.clone(),
             options: ResolvedMachineOptions {
                 labels,
                 metadata,
@@ -184,6 +176,8 @@ impl Cmd {
                 disk_size_bytes: self.overrides.disk_size_bytes()?.or(disk_size_bytes),
                 nested_virtualization: self.overrides.nested_virtualization,
                 rosetta: self.overrides.rosetta,
+                kernel: self.overrides.kernel.clone(),
+                initramfs: self.overrides.initramfs.clone(),
                 disks: self.overrides.disks.clone(),
             },
         })
@@ -192,8 +186,6 @@ impl Cmd {
 
 struct ResolvedRun {
     image_ref: String,
-    kernel: Option<PathBuf>,
-    initramfs: Option<PathBuf>,
     options: ResolvedMachineOptions,
 }
 
@@ -212,12 +204,9 @@ async fn cleanup_ephemeral(runtime: &Runtime, name: &str) -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
-
     use clap::Parser;
 
     use crate::app::Cli;
-    use crate::commands::create::resolve_boot_assets;
     use crate::commands::Command;
 
     #[test]
@@ -263,6 +252,11 @@ mod tests {
         );
         assert!(run.overrides.nested_virtualization);
         assert!(run.overrides.rosetta);
+        assert_eq!(run.overrides.kernel.as_deref(), Some("./vmlinuz".as_ref()));
+        assert_eq!(
+            run.overrides.initramfs.as_deref(),
+            Some("./initrd.img".as_ref())
+        );
         assert_eq!(run.overrides.disks.len(), 1);
         assert_eq!(run.overrides.mounts.len(), 1);
         assert_eq!(
@@ -306,37 +300,13 @@ mod tests {
     }
 
     #[test]
-    fn run_command_leaves_default_initramfs_for_libvm_generation() {
+    fn run_command_keeps_boot_overrides_for_libvm() {
         let cli = Cli::try_parse_from([
             "bento",
             "run",
             "dev",
-            "--image",
-            "disk:./target/rootfs.img",
-            "--",
-            "true",
-        ])
-        .expect("run command should parse");
-        let Command::Run(run) = cli.command else {
-            panic!("expected run command");
-        };
-
-        let assets = resolve_boot_assets(
-            Path::new("/data/bento"),
-            run.overrides.kernel.clone(),
-            run.overrides.initramfs.clone(),
-        );
-
-        assert_eq!(assets.kernel, PathBuf::from("/data/bento/assets/default"));
-        assert_eq!(assets.initramfs, None);
-    }
-
-    #[test]
-    fn run_command_forwards_explicit_initramfs_to_libvm() {
-        let cli = Cli::try_parse_from([
-            "bento",
-            "run",
-            "dev",
+            "--kernel",
+            "./vmlinuz",
             "--initrd",
             "./initrd.img",
             "--",
@@ -347,14 +317,11 @@ mod tests {
             panic!("expected run command");
         };
 
-        let assets = resolve_boot_assets(
-            Path::new("/data/bento"),
-            run.overrides.kernel.clone(),
-            run.overrides.initramfs.clone(),
+        assert_eq!(run.overrides.kernel.as_deref(), Some("./vmlinuz".as_ref()));
+        assert_eq!(
+            run.overrides.initramfs.as_deref(),
+            Some("./initrd.img".as_ref())
         );
-
-        assert_eq!(assets.kernel, PathBuf::from("/data/bento/assets/default"));
-        assert_eq!(assets.initramfs, Some(PathBuf::from("./initrd.img")));
     }
 
     #[test]
