@@ -29,6 +29,22 @@ pub enum LibVmError {
     #[error("machine {reference} not found")]
     MachineNotFound { reference: String },
 
+    #[error("image {reference} not found")]
+    ImageNotFound { reference: String },
+
+    #[error("image {reference} is still pinned by {machine_count} machine(s)")]
+    ImageInUse {
+        reference: String,
+        machine_count: u64,
+    },
+
+    #[error("image operation for {reference} failed")]
+    Image {
+        reference: String,
+        #[source]
+        source: ocidisk::OciDiskError,
+    },
+
     #[error("machine {id} already exists")]
     MachineIdAlreadyExists { id: String },
 
@@ -43,6 +59,9 @@ pub enum LibVmError {
 
     #[error("monitor protocol for {reference} failed: {message}")]
     MonitorProtocol { reference: String, message: String },
+
+    #[error("guest session for {reference} failed: {message}")]
+    GuestSession { reference: String, message: String },
 
     #[error("machine preparation for {reference} failed: {message}")]
     MachinePreparationFailed { reference: String, message: String },

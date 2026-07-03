@@ -15,7 +15,6 @@ path = "bin/main.rs"
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }
 libvm = { path = "../../runtime/libvm" }
-ocidisk = { path = "../../runtime/ocidisk" }
 vm-spec = { path = "../../specs/vm-spec" }
 utils = { path = "../../common/utils" }
 anyhow = "1.0.102"

@@ -1,10 +1,14 @@
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::Context;
+use ocidisk::{
+    ImageStore as RootfsImageStore, OciDiskResult, RootfsImage, RootfsImageMetadata,
+    RootfsImageSource, RootfsOptions,
+};
 
 use crate::guest_agent::{self, GuestAgentConfigInput};
 use crate::lock_manager::{LockGuard, LockId, LockManager, ManagedLock};
@@ -19,6 +23,10 @@ use nix::{
 use utils::format_storage_size;
 use vm_spec::{Hardware, VmSpec};
 
+use crate::image::{
+    ImageDetail, ImageHandle, ImageProgress, ImageProgressSender, ImagePruneReport,
+    ImagePullPolicy, ImageRemoveOptions, ImageSource, ImageSourceKind, Images, MaterializedImage,
+};
 use crate::machine::{
     Machine, MachineBuilder, MachineData, MachineRef, MachineRefKind, MachineStatus,
 };
@@ -30,8 +38,10 @@ use crate::runtime::transitions::{self, StartFailure, TransitionError};
 use crate::runtime::RuntimeBuilder;
 use crate::store::models::MachineId;
 use crate::store::models::{
-    MachineConfig, MachineNetworkConfig as ModelMachineNetworkConfig, MachineRuntimeState,
-    MachineState,
+    ImageConfigRecord, ImageLayerRecord, ImageManifestLayerRecord, ImageManifestRecord,
+    ImageRefRecord, ImageRootfsArtifactRecord, MachineConfig,
+    MachineNetworkConfig as ModelMachineNetworkConfig, MachineRootfsRecord, MachineRuntimeState,
+    MachineState, OciImageRecord,
 };
 use crate::store::{ConfigStore, DataStore, Store};
 use crate::utils::now_unix;
@@ -85,6 +95,8 @@ pub struct Runtime {
     lock_manager: LockManager,
     networking: RuntimeNetworkingConfig,
     vmmon: Vmmon,
+    image_pull_policy: ImagePullPolicy,
+    image_progress: Option<ImageProgressSender>,
 }
 
 /// Identity for one concrete vmmon run.
@@ -149,6 +161,8 @@ impl Runtime {
             lock_manager,
             networking,
             vmmon,
+            image_pull_policy: ImagePullPolicy::default(),
+            image_progress: None,
         };
         runtime.refresh_active_machine_states().await?;
         Ok(runtime)
@@ -162,6 +176,39 @@ impl Runtime {
     /// Returns the local image directory.
     pub fn local_images_dir(&self) -> &Path {
         self.paths.images_dir()
+    }
+
+    /// Returns the runtime-scoped image management namespace.
+    pub fn images(&self) -> Images {
+        Images::new(self.clone())
+    }
+
+    /// Returns a runtime handle that uses `policy` for future image materialization.
+    ///
+    /// The policy applies to `Runtime::images().pull` and machine creation through
+    /// `Runtime::machine().image(...).create()`. Starting an existing machine
+    /// never pulls or re-resolves images.
+    pub fn with_image_pull_policy(mut self, policy: ImagePullPolicy) -> Self {
+        self.image_pull_policy = policy;
+        self
+    }
+
+    /// Returns a runtime handle that reports future image materialization progress.
+    ///
+    /// Progress is runtime-scoped on purpose: machine start options stay focused
+    /// on starting an already-created machine.
+    pub fn with_image_progress(mut self, sender: ImageProgressSender) -> Self {
+        self.image_progress = Some(sender);
+        self
+    }
+
+    pub(crate) fn without_image_progress(mut self) -> Self {
+        self.image_progress = None;
+        self
+    }
+
+    pub(crate) fn load_guest_ssh_keypair(&self) -> eyre::Result<crate::host::SshKeyPair> {
+        guest_agent::load_or_generate_guest_ssh_keypair(&self.paths)
     }
 
     #[cfg(test)]
@@ -178,12 +225,8 @@ impl Runtime {
     }
 
     /// Creates a builder for a new machine.
-    pub fn machine(
-        &self,
-        image_ref: impl Into<String>,
-        base_rootfs_path: impl Into<PathBuf>,
-    ) -> MachineBuilder {
-        MachineBuilder::new(self.clone(), image_ref, base_rootfs_path)
+    pub fn machine(&self) -> MachineBuilder {
+        MachineBuilder::new(self.clone())
     }
 
     /// Creates a builder for a named network definition.
@@ -212,6 +255,99 @@ impl Runtime {
             self.reconcile_machine_runtime_best_effort(config).await?;
         }
         Ok(machines)
+    }
+
+    pub(crate) async fn materialize_image(
+        &self,
+        source: &ImageSource,
+    ) -> Result<MaterializedImage, LibVmError> {
+        let cache_reference = source.cache_reference();
+        let store = RootfsImageStore::open(self.local_images_dir())
+            .map_err(|err| image_error(&cache_reference, err))?;
+        let options =
+            RootfsOptions::for_host().map_err(|err| image_error(&cache_reference, err))?;
+        let progress = self.image_progress.clone();
+
+        let rootfs = match self.image_pull_policy {
+            ImagePullPolicy::IfMissing => {
+                match get_cached_rootfs(&store, source, &cache_reference, options.clone())
+                    .map_err(|err| image_error(&cache_reference, err))?
+                {
+                    Some(image) => {
+                        emit_cached_image_progress(progress.as_ref(), &image.image_ref);
+                        image
+                    }
+                    None => {
+                        get_or_create_rootfs(&store, source, &cache_reference, options, progress)
+                            .await
+                            .map_err(|err| image_error(&cache_reference, err))?
+                    }
+                }
+            }
+            ImagePullPolicy::Always => {
+                get_or_create_rootfs(&store, source, &cache_reference, options, progress)
+                    .await
+                    .map_err(|err| image_error(&cache_reference, err))?
+            }
+            ImagePullPolicy::Never => get_cached_rootfs(&store, source, &cache_reference, options)
+                .map_err(|err| image_error(&cache_reference, err))?
+                .ok_or_else(|| LibVmError::ImageNotFound {
+                    reference: source.source_reference(),
+                })?,
+        };
+
+        let metadata = store
+            .rootfs_metadata(&rootfs)
+            .map_err(|err| image_error(&rootfs.image_ref, err))?;
+        let size_bytes = fs::metadata(&rootfs.path)?.len();
+        let manifest_digest = materialized_manifest_digest(source, &rootfs, metadata.as_ref())?;
+        self.persist_materialized_image(source, &rootfs, metadata.as_ref(), size_bytes)
+            .await?;
+
+        Ok(MaterializedImage {
+            rootfs_path: rootfs.path,
+            image_ref: rootfs.image_ref,
+            source_kind: source.kind(),
+            source_reference: source.source_reference(),
+            image_id: Some(rootfs.image_id),
+            manifest_digest,
+            size_bytes,
+        })
+    }
+
+    async fn persist_materialized_image(
+        &self,
+        source: &ImageSource,
+        rootfs: &RootfsImage,
+        metadata: Option<&RootfsImageMetadata>,
+        size_bytes: u64,
+    ) -> Result<(), LibVmError> {
+        match source.kind() {
+            ImageSourceKind::Oci => {
+                let metadata = metadata.ok_or_else(|| LibVmError::StateDecode {
+                    field: "image.metadata",
+                    message: format!("OCI image {} is missing rootfs metadata", rootfs.image_ref),
+                })?;
+                let record = oci_image_record(source, rootfs, metadata, size_bytes)?;
+                self.store.save_oci_image(&record).await
+            }
+            ImageSourceKind::Tar => {
+                let metadata = metadata.ok_or_else(|| LibVmError::StateDecode {
+                    field: "image.metadata",
+                    message: format!("tar image {} is missing rootfs metadata", rootfs.image_ref),
+                })?;
+                let artifact = image_artifact_record(
+                    source.kind(),
+                    source.source_reference(),
+                    rootfs,
+                    metadata,
+                    None,
+                    size_bytes,
+                );
+                self.store.save_rootfs_artifact(&artifact).await
+            }
+            ImageSourceKind::Disk => Ok(()),
+        }
     }
 
     /// Creates a named network definition.
@@ -737,12 +873,54 @@ impl Runtime {
         self.store.save_machine_config(config).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn add_machine_record(
         &self,
         config: &MachineConfig,
         initial_state: &MachineState,
     ) -> Result<(), LibVmError> {
         self.store.add_machine(config, initial_state).await
+    }
+
+    pub(crate) async fn add_machine_record_with_rootfs(
+        &self,
+        config: &MachineConfig,
+        initial_state: &MachineState,
+        rootfs: &MachineRootfsRecord,
+    ) -> Result<(), LibVmError> {
+        self.store
+            .add_machine_with_rootfs(config, initial_state, rootfs)
+            .await
+    }
+
+    pub(crate) async fn image_handle(
+        &self,
+        reference: &str,
+    ) -> Result<Option<ImageHandle>, LibVmError> {
+        self.store.image_handle(reference).await
+    }
+
+    pub(crate) async fn list_image_handles(&self) -> Result<Vec<ImageHandle>, LibVmError> {
+        self.store.list_image_handles().await
+    }
+
+    pub(crate) async fn image_detail(
+        &self,
+        reference: &str,
+    ) -> Result<Option<ImageDetail>, LibVmError> {
+        self.store.image_detail(reference).await
+    }
+
+    pub(crate) async fn remove_image(
+        &self,
+        reference: &str,
+        options: ImageRemoveOptions,
+    ) -> Result<(), LibVmError> {
+        self.store.remove_image(reference, options).await
+    }
+
+    pub(crate) async fn prune_images(&self) -> Result<ImagePruneReport, LibVmError> {
+        self.store.prune_images().await
     }
 
     pub(crate) async fn machine_config_by_name(
@@ -797,6 +975,217 @@ impl Runtime {
             state.updated_at,
         ))
     }
+}
+
+const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
+fn image_error(reference: &str, source: ocidisk::OciDiskError) -> LibVmError {
+    LibVmError::Image {
+        reference: reference.to_string(),
+        source,
+    }
+}
+
+fn get_cached_rootfs(
+    store: &RootfsImageStore,
+    source: &ImageSource,
+    cache_reference: &str,
+    options: RootfsOptions,
+) -> OciDiskResult<Option<RootfsImage>> {
+    match source {
+        ImageSource::Oci(reference) => store.get_cached_oci(reference, options),
+        ImageSource::Disk(_) | ImageSource::Tar(_) => store.get_cached(cache_reference, options),
+    }
+}
+
+async fn get_or_create_rootfs(
+    store: &RootfsImageStore,
+    source: &ImageSource,
+    cache_reference: &str,
+    options: RootfsOptions,
+    progress: Option<ImageProgressSender>,
+) -> OciDiskResult<RootfsImage> {
+    match source {
+        ImageSource::Oci(reference) => store.get_or_create_oci(reference, options, progress).await,
+        ImageSource::Disk(_) | ImageSource::Tar(_) => {
+            store
+                .get_or_create(cache_reference, options, progress)
+                .await
+        }
+    }
+}
+
+fn emit_cached_image_progress(progress: Option<&ImageProgressSender>, image_ref: &str) {
+    let Some(progress) = progress else {
+        return;
+    };
+    progress.send(ImageProgress::CheckingCache {
+        image_ref: image_ref.to_string(),
+    });
+    progress.send(ImageProgress::CacheHit {
+        image_ref: image_ref.to_string(),
+    });
+}
+
+fn oci_image_record(
+    source: &ImageSource,
+    rootfs: &RootfsImage,
+    metadata: &RootfsImageMetadata,
+    size_bytes: u64,
+) -> Result<OciImageRecord, LibVmError> {
+    if rootfs.source != RootfsImageSource::OciRegistry {
+        return Err(LibVmError::StateDecode {
+            field: "image.source",
+            message: format!("expected OCI rootfs source, found {}", rootfs.source),
+        });
+    }
+
+    let now = now_unix();
+    let manifest_digest = effective_oci_manifest_digest(rootfs, metadata);
+    let created_at = metadata.created_at_unix;
+    let total_size_bytes = i64_from_u64("image_manifest.total_size_bytes", size_bytes)?;
+    let layer_count =
+        i64::try_from(metadata.layers.len()).map_err(|_| LibVmError::StateDecode {
+            field: "image_manifest.layer_count",
+            message: format!("layer count {} does not fit in i64", metadata.layers.len()),
+        })?;
+
+    let layers = metadata
+        .layers
+        .iter()
+        .map(|layer| ImageLayerRecord {
+            diff_id: layer.diff_id.clone(),
+            blob_digest: layer.blob_digest.clone(),
+            media_type: layer.media_type.clone(),
+            compressed_size_bytes: Some(layer.size_bytes),
+            uncompressed_size_bytes: None,
+            created_at,
+            last_used_at: Some(now),
+        })
+        .collect::<Vec<_>>();
+    let manifest_layers = metadata
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(position, layer)| {
+            let position = i64::try_from(position).map_err(|_| LibVmError::StateDecode {
+                field: "image_manifest_layer.position",
+                message: format!("layer position {position} does not fit in i64"),
+            })?;
+            Ok(ImageManifestLayerRecord {
+                manifest_digest: manifest_digest.clone(),
+                layer_diff_id: layer.diff_id.clone(),
+                position,
+            })
+        })
+        .collect::<Result<Vec<_>, LibVmError>>()?;
+
+    Ok(OciImageRecord {
+        manifest: ImageManifestRecord {
+            digest: manifest_digest.clone(),
+            media_type: OCI_MANIFEST_MEDIA_TYPE.to_string(),
+            image_id: rootfs.image_id.clone(),
+            platform_os: rootfs.platform.os.clone(),
+            platform_architecture: rootfs.platform.architecture.clone(),
+            platform_variant: rootfs.platform.variant.clone(),
+            config_digest: metadata.config_digest.clone(),
+            layer_count,
+            total_size_bytes,
+            created_at,
+            last_used_at: Some(now),
+        },
+        reference: ImageRefRecord {
+            reference: rootfs.image_ref.clone(),
+            manifest_digest: manifest_digest.clone(),
+            image_id: rootfs.image_id.clone(),
+            platform_os: rootfs.platform.os.clone(),
+            platform_architecture: rootfs.platform.architecture.clone(),
+            platform_variant: rootfs.platform.variant.clone(),
+            size_bytes: Some(size_bytes),
+            created_at,
+            updated_at: now,
+            last_used_at: Some(now),
+        },
+        config: ImageConfigRecord {
+            manifest_digest: manifest_digest.clone(),
+            digest: metadata.config_digest.clone(),
+            env_json: "[]".to_string(),
+            cmd_json: "[]".to_string(),
+            entrypoint_json: "[]".to_string(),
+            working_dir: None,
+            user: None,
+            labels_json: "{}".to_string(),
+            created_at,
+        },
+        layers,
+        manifest_layers,
+        artifact: image_artifact_record(
+            ImageSourceKind::Oci,
+            source.source_reference(),
+            rootfs,
+            metadata,
+            Some(manifest_digest),
+            size_bytes,
+        ),
+    })
+}
+
+fn materialized_manifest_digest(
+    source: &ImageSource,
+    rootfs: &RootfsImage,
+    metadata: Option<&RootfsImageMetadata>,
+) -> Result<Option<String>, LibVmError> {
+    match source.kind() {
+        ImageSourceKind::Oci => {
+            let metadata = metadata.ok_or_else(|| LibVmError::StateDecode {
+                field: "image.metadata",
+                message: format!("OCI image {} is missing rootfs metadata", rootfs.image_ref),
+            })?;
+            Ok(Some(effective_oci_manifest_digest(rootfs, metadata)))
+        }
+        ImageSourceKind::Disk | ImageSourceKind::Tar => {
+            Ok(metadata.and_then(|metadata| metadata.manifest_digest.clone()))
+        }
+    }
+}
+
+fn effective_oci_manifest_digest(rootfs: &RootfsImage, metadata: &RootfsImageMetadata) -> String {
+    metadata
+        .manifest_digest
+        .clone()
+        .unwrap_or_else(|| rootfs.image_id.clone())
+}
+
+fn image_artifact_record(
+    source_kind: ImageSourceKind,
+    source_reference: String,
+    rootfs: &RootfsImage,
+    metadata: &RootfsImageMetadata,
+    manifest_digest: Option<String>,
+    size_bytes: u64,
+) -> ImageRootfsArtifactRecord {
+    let now = now_unix();
+    ImageRootfsArtifactRecord {
+        image_id: rootfs.image_id.clone(),
+        source_kind,
+        manifest_digest,
+        source_reference,
+        platform_os: rootfs.platform.os.clone(),
+        platform_architecture: rootfs.platform.architecture.clone(),
+        platform_variant: rootfs.platform.variant.clone(),
+        filesystem: metadata.filesystem.clone(),
+        rootfs_path: rootfs.path.clone(),
+        size_bytes,
+        created_at: metadata.created_at_unix,
+        last_used_at: Some(now),
+    }
+}
+
+fn i64_from_u64(field: &'static str, value: u64) -> Result<i64, LibVmError> {
+    i64::try_from(value).map_err(|_| LibVmError::StateDecode {
+        field,
+        message: format!("value {value} does not fit in i64"),
+    })
 }
 
 pub(crate) fn write_machine_config(
@@ -1047,6 +1436,7 @@ mod tests {
     use crate::lock_manager::LockId;
     use crate::paths::{LocalPaths, MachinePaths};
     use crate::runtime::core::{
+        effective_oci_manifest_digest, materialized_manifest_digest, oci_image_record,
         read_monitor_pid, stopped_machine_state, write_machine_config, Runtime,
         STALE_STARTING_TIMEOUT,
     };
@@ -1057,9 +1447,10 @@ mod tests {
     use crate::utils::now_unix;
     use crate::vmmon::process::ProcessIdentity;
     use crate::{
-        LibVmError, MachineExitOutcome, MachineKillOptions, MachineRef, MachineStatus,
+        ImageSource, LibVmError, MachineExitOutcome, MachineKillOptions, MachineRef, MachineStatus,
         MachineUpdate, Memory, RuntimeNetworkingConfig,
     };
+    use ocidisk::{Platform, RootfsImage, RootfsImageMetadata, RootfsImageSource};
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::process::CommandExt;
     use std::sync::Arc;
@@ -1118,6 +1509,32 @@ mod tests {
         }
     }
 
+    fn sample_oci_rootfs_image() -> RootfsImage {
+        RootfsImage {
+            path: std::path::PathBuf::from("/tmp/rootfs.img"),
+            image_ref: "ubuntu:latest".to_string(),
+            image_id: "sha256:imageid".to_string(),
+            platform: Platform::linux_arm64(),
+            source: RootfsImageSource::OciRegistry,
+        }
+    }
+
+    fn sample_oci_rootfs_metadata(manifest_digest: Option<&str>) -> RootfsImageMetadata {
+        RootfsImageMetadata {
+            version: 1,
+            image_ref: "ubuntu:latest".to_string(),
+            image_id: "sha256:imageid".to_string(),
+            source: RootfsImageSource::OciRegistry,
+            manifest_digest: manifest_digest.map(str::to_string),
+            config_digest: Some("sha256:config".to_string()),
+            layers: Vec::new(),
+            platform: Platform::linux_arm64(),
+            filesystem: "ext4".to_string(),
+            rootfs_file: "rootfs.img".to_string(),
+            created_at_unix: 1,
+        }
+    }
+
     fn stopped_state(machine_id: MachineId) -> MachineState {
         MachineState {
             machine_id,
@@ -1141,6 +1558,36 @@ mod tests {
         Runtime::from_store(paths, Arc::new(store), RuntimeNetworkingConfig::default())
             .await
             .expect("create runtime with mock store")
+    }
+
+    #[test]
+    fn effective_oci_manifest_digest_prefers_metadata_digest() {
+        let rootfs = sample_oci_rootfs_image();
+        let metadata = sample_oci_rootfs_metadata(Some("sha256:manifest"));
+
+        let digest = effective_oci_manifest_digest(&rootfs, &metadata);
+
+        assert_eq!(digest, "sha256:manifest");
+    }
+
+    #[test]
+    fn materialized_oci_manifest_digest_matches_record_fallback() {
+        let source = ImageSource::oci("ubuntu:latest");
+        let rootfs = sample_oci_rootfs_image();
+        let metadata = sample_oci_rootfs_metadata(None);
+
+        let digest = materialized_manifest_digest(&source, &rootfs, Some(&metadata))
+            .expect("materialized digest should resolve");
+        let record = oci_image_record(&source, &rootfs, &metadata, 4)
+            .expect("OCI image record should resolve");
+
+        assert_eq!(digest.as_deref(), Some("sha256:imageid"));
+        assert_eq!(record.manifest.digest, "sha256:imageid");
+        assert_eq!(record.reference.manifest_digest, "sha256:imageid");
+        assert_eq!(
+            record.artifact.manifest_digest.as_deref(),
+            Some("sha256:imageid")
+        );
     }
 
     struct TestMachineCreate {

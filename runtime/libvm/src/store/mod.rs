@@ -1,4 +1,5 @@
 mod config_store;
+mod image_store;
 mod machine_store;
 #[cfg(test)]
 mod mock_store;
@@ -12,4 +13,4 @@ mod traits;
 #[cfg(test)]
 pub(crate) use mock_store::MockDataStore;
 pub(crate) use storage::Store;
-pub(crate) use traits::{ConfigStore, DataStore, MachineStore, NetworkStore};
+pub(crate) use traits::{ConfigStore, DataStore, ImageStore, MachineStore, NetworkStore};

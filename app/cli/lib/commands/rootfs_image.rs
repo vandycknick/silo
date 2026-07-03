@@ -1,38 +1,33 @@
-use std::collections::BTreeMap;
+use std::path::PathBuf;
 
-use eyre::Context as _;
-use libvm::Runtime;
-use ocidisk::{ImageProgressSender, ImageStore, RootfsImage, RootfsOptions};
+use libvm::ImageSource;
 
-const IMAGE_ID_METADATA_KEY: &str = "bento.image.id";
-const IMAGE_PLATFORM_METADATA_KEY: &str = "bento.image.platform";
-const IMAGE_SOURCE_METADATA_KEY: &str = "bento.image.source";
+/// Parses CLI image syntax into libvm's explicit image-source API.
+///
+/// The Rust API treats strings as OCI references only. The CLI keeps its
+/// historical `disk:` and `tar:` prefixes as command-line conveniences.
+pub(crate) fn parse_cli_image_source(value: &str) -> eyre::Result<ImageSource> {
+    let value = value.trim();
+    if value.is_empty() {
+        eyre::bail!("image reference cannot be empty");
+    }
 
-pub(crate) async fn get_base_rootfs_image(
-    runtime: &Runtime,
-    image_ref: &str,
-    progress: Option<ImageProgressSender>,
-) -> eyre::Result<RootfsImage> {
-    let options = RootfsOptions::for_host().wrap_err("failed to select host OCI platform")?;
-    let store = ImageStore::open(runtime.local_images_dir())
-        .wrap_err("failed to open Bento image cache")?;
-    store
-        .get_or_create(image_ref, options, progress)
-        .await
-        .wrap_err_with(|| format!("failed to get base rootfs image for {image_ref}"))
+    if let Some(path) = value.strip_prefix("disk:") {
+        return Ok(ImageSource::disk(parse_local_image_path(value, path)?));
+    }
+    if let Some(path) = value.strip_prefix("tar:") {
+        return Ok(ImageSource::tar(parse_local_image_path(value, path)?));
+    }
+    if value.starts_with("oci:") {
+        eyre::bail!("OCI archive image sources are no longer supported");
+    }
+
+    Ok(ImageSource::oci(value.to_string()))
 }
 
-pub(crate) fn record_base_rootfs_metadata(
-    metadata: &mut BTreeMap<String, String>,
-    image: &RootfsImage,
-) {
-    metadata.insert(IMAGE_ID_METADATA_KEY.to_string(), image.image_id.clone());
-    metadata.insert(
-        IMAGE_PLATFORM_METADATA_KEY.to_string(),
-        image.platform.to_string(),
-    );
-    metadata.insert(
-        IMAGE_SOURCE_METADATA_KEY.to_string(),
-        image.source.to_string(),
-    );
+fn parse_local_image_path(reference: &str, path: &str) -> eyre::Result<PathBuf> {
+    if path.trim().is_empty() {
+        eyre::bail!("local image source path cannot be empty in {reference}");
+    }
+    Ok(PathBuf::from(path))
 }

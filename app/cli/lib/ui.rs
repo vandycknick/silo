@@ -8,7 +8,7 @@ use clap::builder::styling::{AnsiColor, Effects};
 use clap::builder::Styles;
 use console::{measure_text_width, style, Term};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use ocidisk::{ImageProgress, ImageProgressReceiver};
+use libvm::{ImageProgress, ImageProgressReceiver};
 use serde::Serialize;
 use tokio::task::JoinHandle;
 

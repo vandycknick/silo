@@ -2,24 +2,28 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::Args;
-use libvm::{MachineNetworkConfig, MachineRef, Memory, Runtime, DEFAULT_GUEST_READINESS_TIMEOUT};
+use libvm::{
+    ImageProgressSender, MachineNetworkConfig, MachineRef, Runtime, DEFAULT_GUEST_READINESS_TIMEOUT,
+};
 use vm_spec::Mount;
 
 use crate::commands::create::{
-    profile_mount_to_mount, read_userdata_path, resolve_boot_assets, VmOverrideArgs,
+    apply_resolved_machine_options, profile_mount_to_mount, read_userdata_path,
+    resolve_boot_assets, ResolvedMachineOptions, VmOverrideArgs,
 };
-use crate::commands::rootfs_image::{get_base_rootfs_image, record_base_rootfs_metadata};
+use crate::commands::rootfs_image::parse_cli_image_source;
 use crate::commands::start_options::machine_start_options;
 use crate::constants::{DEFAULT_PROFILE_NAME, PROFILE_METADATA_KEY};
 use crate::context::Context;
+use crate::guest;
 use crate::profile::ProfileStore;
-use crate::ssh;
 use crate::ui::{watch_image_progress, Spinner};
 
 const EXAMPLES: &[&str] = &[
     "bento run",
     "bento run dev",
     "bento run dev -- cargo test",
+    "bento run -t agent -- opencode",
     "bento run dev --image disk:./target/rootfs.img -- cargo test",
     "bento run dev --keep-on-failure -- cargo test",
 ];
@@ -45,6 +49,9 @@ pub struct Cmd {
     /// Keep the ephemeral VM only when the guest command exits non-zero.
     #[arg(long)]
     pub keep_on_failure: bool,
+    /// Attach a TTY to the guest command.
+    #[arg(long, short = 't')]
+    pub tty: bool,
     #[command(flatten)]
     pub(crate) overrides: VmOverrideArgs,
     /// Guest command and arguments to execute after `--`.
@@ -66,40 +73,22 @@ impl Cmd {
         let boot_assets =
             resolve_boot_assets(&data_dir, resolved.kernel.take(), resolved.initramfs.take());
         progress.finish_clear();
-        let base_rootfs = {
-            let (image_progress, image_events) = ocidisk::ImageProgressSender::default_channel();
-            let image_progress_task =
-                watch_image_progress(resolved.image_ref.clone(), image_events);
-            let image =
-                get_base_rootfs_image(runtime, &resolved.image_ref, Some(image_progress)).await;
-            let _ = image_progress_task.await;
-            image?
+        let image_source = parse_cli_image_source(&resolved.image_ref)?;
+        let (image_progress, image_events) = ImageProgressSender::default_channel();
+        let image_progress_task = watch_image_progress(resolved.image_ref.clone(), image_events);
+        let machine_options = resolved.options;
+        let machine = {
+            let runtime_with_progress = (*runtime).clone().with_image_progress(image_progress);
+            let builder = runtime_with_progress.machine().image_source(image_source);
+
+            apply_resolved_machine_options(builder, machine_options, boot_assets)
+                .create()
+                .await
         };
-        record_base_rootfs_metadata(&mut resolved.metadata, &base_rootfs);
-        let mut progress = Spinner::start("Creating", "ephemeral VM");
-        let machine = runtime
-            .machine(resolved.image_ref.clone(), base_rootfs.path)
-            .labels(resolved.labels)
-            .metadata(resolved.metadata)
-            .maybe_cpus(resolved.cpus)
-            .maybe_memory(
-                resolved
-                    .memory_mib
-                    .map(|memory| Memory::mebibytes(u64::from(memory))),
-            )
-            .kernel(boot_assets.kernel)
-            .maybe_initramfs(boot_assets.initramfs)
-            .maybe_root_disk_size(resolved.disk_size_bytes)
-            .nested_virtualization(resolved.nested_virtualization)
-            .rosetta(resolved.rosetta)
-            .maybe_userdata(resolved.userdata)
-            .disks(resolved.disks)
-            .mounts(resolved.mounts)
-            .network(resolved.network)
-            .create()
-            .await?;
+        let _ = image_progress_task.await;
+        let machine = machine?;
         let machine_name = machine.inspect().await?.name;
-        progress.step("Starting", &machine_name);
+        let mut progress = Spinner::start("Starting", &machine_name);
         machine
             .start_with(machine_start_options(runtime, &machine)?)
             .await?;
@@ -113,11 +102,13 @@ impl Cmd {
         progress.finish_success("Started");
 
         let status = if self.command.is_empty() {
-            ssh::run_remote_shell_status(&data_dir, &machine_name, None)?
+            guest::attach_shell(&machine, None, false).await?
+        } else if self.tty {
+            guest::attach_command(&machine, None, &self.command, false).await?
         } else {
-            ssh::run_remote_command(&data_dir, &machine_name, None, &self.command)?
+            guest::run_command_streaming(&machine, None, &self.command, false).await?
         };
-        let code = status.code().unwrap_or(1);
+        let code = status.code;
         let should_keep = self.keep || (self.keep_on_failure && code != 0);
 
         if !should_keep {
@@ -180,38 +171,30 @@ impl Cmd {
 
         Ok(ResolvedRun {
             image_ref,
-            labels,
-            metadata,
-            mounts,
-            network,
-            userdata,
-            cpus: self.overrides.cpus.or(cpus),
-            memory_mib: self.overrides.memory_mib()?.or(memory_mib),
             kernel: self.overrides.kernel.clone(),
             initramfs: self.overrides.initramfs.clone(),
-            disk_size_bytes: self.overrides.disk_size_bytes()?.or(disk_size_bytes),
-            nested_virtualization: self.overrides.nested_virtualization,
-            rosetta: self.overrides.rosetta,
-            disks: self.overrides.disks.clone(),
+            options: ResolvedMachineOptions {
+                labels,
+                metadata,
+                mounts,
+                network,
+                userdata,
+                cpus: self.overrides.cpus.or(cpus),
+                memory_mib: self.overrides.memory_mib()?.or(memory_mib),
+                disk_size_bytes: self.overrides.disk_size_bytes()?.or(disk_size_bytes),
+                nested_virtualization: self.overrides.nested_virtualization,
+                rosetta: self.overrides.rosetta,
+                disks: self.overrides.disks.clone(),
+            },
         })
     }
 }
 
 struct ResolvedRun {
     image_ref: String,
-    labels: BTreeMap<String, String>,
-    metadata: BTreeMap<String, String>,
-    mounts: Vec<Mount>,
-    network: MachineNetworkConfig,
-    userdata: Option<String>,
-    cpus: Option<u8>,
-    memory_mib: Option<u32>,
     kernel: Option<PathBuf>,
     initramfs: Option<PathBuf>,
-    disk_size_bytes: Option<u64>,
-    nested_virtualization: bool,
-    rosetta: bool,
-    disks: Vec<PathBuf>,
+    options: ResolvedMachineOptions,
 }
 
 async fn cleanup_ephemeral(runtime: &Runtime, name: &str) -> eyre::Result<()> {
@@ -305,7 +288,21 @@ mod tests {
         };
 
         assert_eq!(run.profile.as_deref(), Some("dev"));
+        assert!(!run.tty);
         assert_eq!(run.image.as_deref(), Some("tar:./target/rootfs.tar"));
+    }
+
+    #[test]
+    fn run_command_parses_tty_command() {
+        let cli = Cli::try_parse_from(["bento", "run", "-t", "agent", "--", "opencode"])
+            .expect("run command should parse");
+        let Command::Run(run) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(run.profile.as_deref(), Some("agent"));
+        assert!(run.tty);
+        assert_eq!(run.command, vec!["opencode".to_string()]);
     }
 
     #[test]

@@ -12,4 +12,7 @@ mod store;
 pub use crate::error::{OciDiskError, OciDiskResult};
 pub use crate::platform::Platform;
 pub use crate::progress::{ImageProgress, ImageProgressReceiver, ImageProgressSender};
-pub use crate::store::{ImageStore, RootfsImage, RootfsImageSource, RootfsOptions};
+pub use crate::store::{
+    ImageStore, RootfsImage, RootfsImageLayerMetadata, RootfsImageMetadata, RootfsImageSource,
+    RootfsOptions,
+};

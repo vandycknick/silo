@@ -119,36 +119,40 @@ struct TagRecord {
     updated_at_unix: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ImageMetadata {
-    version: u32,
-    image_ref: String,
-    image_id: String,
-    source: RootfsImageSource,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RootfsImageMetadata {
+    pub version: u32,
+    pub image_ref: String,
+    pub image_id: String,
+    pub source: RootfsImageSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    manifest_digest: Option<String>,
+    pub manifest_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    config_digest: Option<String>,
+    pub config_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    layers: Vec<ImageLayerMetadata>,
-    platform: Platform,
-    filesystem: String,
-    rootfs_file: String,
-    created_at_unix: i64,
+    pub layers: Vec<RootfsImageLayerMetadata>,
+    pub platform: Platform,
+    pub filesystem: String,
+    pub rootfs_file: String,
+    pub created_at_unix: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ImageLayerMetadata {
-    digest: String,
-    media_type: String,
-    size_bytes: u64,
-    diff_id: String,
+pub struct RootfsImageLayerMetadata {
+    #[serde(rename = "digest")]
+    pub blob_digest: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+    pub diff_id: String,
 }
 
-impl From<&ResolvedLayer> for ImageLayerMetadata {
+type ImageMetadata = RootfsImageMetadata;
+type ImageLayerMetadata = RootfsImageLayerMetadata;
+
+impl From<&ResolvedLayer> for RootfsImageLayerMetadata {
     fn from(layer: &ResolvedLayer) -> Self {
         Self {
-            digest: layer.digest.clone(),
+            blob_digest: layer.digest.clone(),
             media_type: layer.media_type.clone(),
             size_bytes: layer.size_bytes,
             diff_id: layer.diff_id.clone(),
@@ -235,6 +239,59 @@ impl ImageStore {
         }
     }
 
+    pub fn get_cached(
+        &self,
+        image_ref: &str,
+        options: RootfsOptions,
+    ) -> OciDiskResult<Option<RootfsImage>> {
+        match ImageSource::parse(image_ref)? {
+            ImageSource::RemoteOci(image_ref) => self.cached_remote_oci(&image_ref, &options),
+            ImageSource::LocalDisk(path) => {
+                self.local_disk(image_ref, path, options, None).map(Some)
+            }
+            ImageSource::RootfsTar(path) => self.cached_rootfs_tar(image_ref, path, &options),
+            ImageSource::OciArchive(_) => Ok(None),
+        }
+    }
+
+    /// Pulls or reuses an OCI registry reference without applying local-source prefix syntax.
+    pub async fn get_or_create_oci(
+        &self,
+        image_ref: &str,
+        options: RootfsOptions,
+        progress: Option<ImageProgressSender>,
+    ) -> OciDiskResult<RootfsImage> {
+        self.get_or_create_remote_oci(image_ref, options, progress.as_ref())
+            .await
+    }
+
+    /// Returns a cached OCI registry reference without applying local-source prefix syntax.
+    pub fn get_cached_oci(
+        &self,
+        image_ref: &str,
+        options: RootfsOptions,
+    ) -> OciDiskResult<Option<RootfsImage>> {
+        self.cached_remote_oci(image_ref, &options)
+    }
+
+    pub fn rootfs_metadata(
+        &self,
+        image: &RootfsImage,
+    ) -> OciDiskResult<Option<RootfsImageMetadata>> {
+        if image.source == RootfsImageSource::Disk {
+            return Ok(None);
+        }
+
+        let Some(dir) = image.path.parent() else {
+            return Err(OciDiskError::CorruptCacheEntry {
+                path: image.path.clone(),
+                reason: "rootfs path has no parent directory".to_string(),
+            });
+        };
+
+        Ok(Some(read_metadata(&dir.join(METADATA_FILE_NAME))?))
+    }
+
     async fn get_or_create_remote_oci(
         &self,
         image_ref: &str,
@@ -312,6 +369,34 @@ impl ImageStore {
             self.update_tag_mapping(&canonical_ref, &options.platform, &resolved.manifest_digest)?;
         }
         Ok(image)
+    }
+
+    fn cached_remote_oci(
+        &self,
+        image_ref: &str,
+        options: &RootfsOptions,
+    ) -> OciDiskResult<Option<RootfsImage>> {
+        let reference = RegistryClient::parse_reference(image_ref)?;
+        let canonical_ref = reference.to_string();
+        let Some(digest) = reference.digest() else {
+            let index = self.read_index()?;
+            let Some(tag) = index.tags.get(&tag_key(&canonical_ref, &options.platform)) else {
+                return Ok(None);
+            };
+            return self.cached_image(
+                &canonical_ref,
+                &tag.manifest_digest,
+                &options.platform,
+                RootfsImageSource::OciRegistry,
+            );
+        };
+
+        self.cached_image(
+            &canonical_ref,
+            digest,
+            &options.platform,
+            RootfsImageSource::OciRegistry,
+        )
     }
 
     async fn create_rootfs(
@@ -545,6 +630,23 @@ impl ImageStore {
             platform: options.platform,
             source: RootfsImageSource::Tar,
         })
+    }
+
+    fn cached_rootfs_tar(
+        &self,
+        image_ref: &str,
+        path: PathBuf,
+        options: &RootfsOptions,
+    ) -> OciDiskResult<Option<RootfsImage>> {
+        let path = canonical_local_file(image_ref, &path)?;
+        reject_known_tar_compression(image_ref, &path)?;
+        let image_id = format!("tar-sha256:{}", sha256_file(&path)?);
+        self.cached_image(
+            image_ref,
+            &image_id,
+            &options.platform,
+            RootfsImageSource::Tar,
+        )
     }
 
     fn get_or_create_oci_archive(
@@ -1682,6 +1784,20 @@ mod tests {
         assert_eq!(image.path, disk.canonicalize().expect("canonical disk"));
         assert_eq!(image.source, RootfsImageSource::Disk);
         assert!(!cache.exists());
+    }
+
+    #[test]
+    fn explicit_oci_cache_lookup_does_not_parse_local_source_prefixes() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let store = ImageStore::open(temp.path()).expect("open store");
+        let image = store
+            .get_cached_oci(
+                "disk:5000/repo:tag",
+                RootfsOptions::new(Platform::linux_amd64()),
+            )
+            .expect("lookup OCI cache");
+
+        assert!(image.is_none());
     }
 
     #[test]

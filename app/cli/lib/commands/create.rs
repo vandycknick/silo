@@ -3,18 +3,18 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use eyre::Context as _;
-use libvm::{MachineNetworkConfig, Memory};
+use libvm::{ImageProgressSender, MachineBuilder, MachineNetworkConfig, Memory};
 use utils::HumanSize;
 use vm_spec::Mount;
 
 use crate::commands::profile::{parse_label, parse_machine_network_config, parse_profile_mount};
-use crate::commands::rootfs_image::{get_base_rootfs_image, record_base_rootfs_metadata};
+use crate::commands::rootfs_image::parse_cli_image_source;
 use crate::commands::start_options::machine_start_options;
 use crate::config::GlobalConfig;
 use crate::constants::{DEFAULT_PROFILE_NAME, PROFILE_METADATA_KEY};
 use crate::context::Context;
 use crate::profile::{resolve_host_path, MountMode, ProfileMount, ProfileStore};
-use crate::ui::{watch_image_progress, Spinner};
+use crate::ui::{success, watch_image_progress, Spinner};
 
 const EXAMPLES: &[&str] = &[
     "bento create dev --start --default",
@@ -120,40 +120,24 @@ impl Cmd {
             resolved.initramfs.take(),
         );
         progress.finish_clear();
-        let base_rootfs = {
-            let (image_progress, image_events) = ocidisk::ImageProgressSender::default_channel();
-            let image_progress_task =
-                watch_image_progress(resolved.image_ref.clone(), image_events);
-            let image =
-                get_base_rootfs_image(runtime, &resolved.image_ref, Some(image_progress)).await;
-            let _ = image_progress_task.await;
-            image?
+        let image_source = parse_cli_image_source(&resolved.image_ref)?;
+        let (image_progress, image_events) = ImageProgressSender::default_channel();
+        let image_progress_task = watch_image_progress(resolved.image_ref.clone(), image_events);
+        let machine_options = resolved.options;
+        let machine = {
+            let runtime_with_progress = (*runtime).clone().with_image_progress(image_progress);
+            let builder = runtime_with_progress
+                .machine()
+                .image_source(image_source)
+                .name(self.name.clone());
+
+            apply_resolved_machine_options(builder, machine_options, boot_assets)
+                .create()
+                .await
         };
-        record_base_rootfs_metadata(&mut resolved.metadata, &base_rootfs);
-        let progress = Spinner::start("Creating", &self.name);
-        let machine = runtime
-            .machine(resolved.image_ref.clone(), base_rootfs.path)
-            .name(self.name.clone())
-            .labels(resolved.labels)
-            .metadata(resolved.metadata)
-            .maybe_cpus(resolved.cpus)
-            .maybe_memory(
-                resolved
-                    .memory_mib
-                    .map(|memory| Memory::mebibytes(u64::from(memory))),
-            )
-            .kernel(boot_assets.kernel)
-            .maybe_initramfs(boot_assets.initramfs)
-            .maybe_root_disk_size(resolved.disk_size_bytes)
-            .nested_virtualization(resolved.nested_virtualization)
-            .rosetta(resolved.rosetta)
-            .maybe_userdata(resolved.userdata)
-            .disks(resolved.disks)
-            .mounts(resolved.mounts)
-            .network(resolved.network)
-            .create()
-            .await?;
-        progress.finish_success("Created");
+        let _ = image_progress_task.await;
+        let machine = machine?;
+        success(format!("Created {}", self.name));
 
         if self.default {
             GlobalConfig::write_default_machine(Some(&self.name))?;
@@ -235,19 +219,21 @@ impl Cmd {
 
         Ok(ResolvedCreate {
             image_ref,
-            labels,
-            metadata,
-            mounts,
-            network,
-            userdata,
-            cpus: self.overrides.cpus.or(cpus),
-            memory_mib: self.overrides.memory_mib()?.or(memory_mib),
             kernel: self.overrides.kernel.clone(),
             initramfs: self.overrides.initramfs.clone(),
-            disk_size_bytes: self.overrides.disk_size_bytes()?.or(disk_size_bytes),
-            nested_virtualization: self.overrides.nested_virtualization,
-            rosetta: self.overrides.rosetta,
-            disks: self.overrides.disks.clone(),
+            options: ResolvedMachineOptions {
+                labels,
+                metadata,
+                mounts,
+                network,
+                userdata,
+                cpus: self.overrides.cpus.or(cpus),
+                memory_mib: self.overrides.memory_mib()?.or(memory_mib),
+                disk_size_bytes: self.overrides.disk_size_bytes()?.or(disk_size_bytes),
+                nested_virtualization: self.overrides.nested_virtualization,
+                rosetta: self.overrides.rosetta,
+                disks: self.overrides.disks.clone(),
+            },
         })
     }
 }
@@ -269,21 +255,73 @@ pub(crate) fn resolve_boot_assets(
     }
 }
 
+pub(crate) fn apply_resolved_machine_options(
+    mut builder: MachineBuilder,
+    options: ResolvedMachineOptions,
+    boot_assets: BootAssets,
+) -> MachineBuilder {
+    let ResolvedMachineOptions {
+        labels,
+        metadata,
+        mounts,
+        network,
+        userdata,
+        cpus,
+        memory_mib,
+        disk_size_bytes,
+        nested_virtualization,
+        rosetta,
+        disks,
+    } = options;
+
+    builder = builder
+        .labels(labels)
+        .metadata(metadata)
+        .kernel(boot_assets.kernel)
+        .nested_virtualization(nested_virtualization)
+        .rosetta(rosetta)
+        .disks(disks)
+        .mounts(mounts)
+        .network(network);
+
+    if let Some(cpus) = cpus {
+        builder = builder.cpus(cpus);
+    }
+    if let Some(memory_mib) = memory_mib {
+        builder = builder.memory(Memory::mebibytes(u64::from(memory_mib)));
+    }
+    if let Some(initramfs) = boot_assets.initramfs {
+        builder = builder.initramfs(initramfs);
+    }
+    if let Some(bytes) = disk_size_bytes {
+        builder = builder.root_disk_size(bytes);
+    }
+    if let Some(userdata) = userdata {
+        builder = builder.userdata(userdata);
+    }
+
+    builder
+}
+
 struct ResolvedCreate {
     image_ref: String,
-    labels: BTreeMap<String, String>,
-    metadata: BTreeMap<String, String>,
-    mounts: Vec<Mount>,
-    network: MachineNetworkConfig,
-    userdata: Option<String>,
-    cpus: Option<u8>,
-    memory_mib: Option<u32>,
     kernel: Option<PathBuf>,
     initramfs: Option<PathBuf>,
-    disk_size_bytes: Option<u64>,
-    nested_virtualization: bool,
-    rosetta: bool,
-    disks: Vec<PathBuf>,
+    options: ResolvedMachineOptions,
+}
+
+pub(crate) struct ResolvedMachineOptions {
+    pub(crate) labels: BTreeMap<String, String>,
+    pub(crate) metadata: BTreeMap<String, String>,
+    pub(crate) mounts: Vec<Mount>,
+    pub(crate) network: MachineNetworkConfig,
+    pub(crate) userdata: Option<String>,
+    pub(crate) cpus: Option<u8>,
+    pub(crate) memory_mib: Option<u32>,
+    pub(crate) disk_size_bytes: Option<u64>,
+    pub(crate) nested_virtualization: bool,
+    pub(crate) rosetta: bool,
+    pub(crate) disks: Vec<PathBuf>,
 }
 
 pub(crate) fn profile_mount_to_mount(mount: &ProfileMount) -> eyre::Result<Mount> {

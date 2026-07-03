@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 
+use crate::image::{ImageDetail, ImageHandle, ImagePruneReport, ImageRemoveOptions};
 use crate::store::models::MachineId;
 use crate::store::models::{
-    DbConfig, MachineConfig, MachineState, NetworkAttachment, NetworkDefinition, NetworkInstance,
+    DbConfig, ImageRootfsArtifactRecord, MachineConfig, MachineRootfsRecord, MachineState,
+    NetworkAttachment, NetworkDefinition, NetworkInstance, OciImageRecord,
 };
 use crate::LibVmError;
 
@@ -32,10 +34,19 @@ pub(crate) trait MachineStore: std::fmt::Debug + Send + Sync {
     /// Atomically inserts a machine config and its initial runtime state.
     ///
     /// Returns `MachineAlreadyExists` when the machine name is already reserved.
+    #[cfg(test)]
     async fn add_machine(
         &self,
         config: &MachineConfig,
         initial_state: &MachineState,
+    ) -> Result<(), LibVmError>;
+
+    /// Atomically inserts a machine config, initial state, and rootfs pin.
+    async fn add_machine_with_rootfs(
+        &self,
+        config: &MachineConfig,
+        initial_state: &MachineState,
+        rootfs: &MachineRootfsRecord,
     ) -> Result<(), LibVmError>;
 
     /// Reads runtime state for an existing machine, if a row is present.
@@ -79,6 +90,38 @@ pub(crate) trait MachineStore: std::fmt::Debug + Send + Sync {
     ///
     /// Network attachments are removed by the database foreign-key cascade.
     async fn remove_machine(&self, machine: &MachineConfig) -> Result<(), LibVmError>;
+}
+
+/// Durable image metadata and machine rootfs pin storage.
+#[async_trait]
+pub(crate) trait ImageStore: std::fmt::Debug + Send + Sync {
+    /// Upserts OCI manifest metadata, its mutable reference, layers, and rootfs artifact.
+    async fn save_oci_image(&self, image: &OciImageRecord) -> Result<(), LibVmError>;
+
+    /// Upserts a non-OCI managed rootfs artifact, currently used by tar sources.
+    async fn save_rootfs_artifact(
+        &self,
+        artifact: &ImageRootfsArtifactRecord,
+    ) -> Result<(), LibVmError>;
+
+    /// Reads a lightweight image reference by exact reference.
+    async fn image_handle(&self, reference: &str) -> Result<Option<ImageHandle>, LibVmError>;
+
+    /// Lists known image references sorted by reference.
+    async fn list_image_handles(&self) -> Result<Vec<ImageHandle>, LibVmError>;
+
+    /// Reads image detail by exact reference.
+    async fn image_detail(&self, reference: &str) -> Result<Option<ImageDetail>, LibVmError>;
+
+    /// Removes an image reference.
+    async fn remove_image(
+        &self,
+        reference: &str,
+        options: ImageRemoveOptions,
+    ) -> Result<(), LibVmError>;
+
+    /// Removes unreferenced image rows and reports best-effort reclaimed bytes.
+    async fn prune_images(&self) -> Result<ImagePruneReport, LibVmError>;
 }
 
 /// Durable network runtime and named-network definition storage.
@@ -144,11 +187,11 @@ pub(crate) trait NetworkStore: std::fmt::Debug + Send + Sync {
 
 /// Full persistence boundary required by `Runtime`.
 pub(crate) trait DataStore:
-    std::fmt::Debug + ConfigStore + MachineStore + NetworkStore + Send + Sync
+    std::fmt::Debug + ConfigStore + MachineStore + NetworkStore + ImageStore + Send + Sync
 {
 }
 
 impl<T> DataStore for T where
-    T: std::fmt::Debug + ConfigStore + MachineStore + NetworkStore + Send + Sync
+    T: std::fmt::Debug + ConfigStore + MachineStore + NetworkStore + ImageStore + Send + Sync
 {
 }

@@ -95,6 +95,5 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
 
         assert!(!help.contains("cleanup"));
-        assert!(!help.contains("shell-proxy"));
     }
 }

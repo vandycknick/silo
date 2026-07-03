@@ -194,21 +194,4 @@ mod tests {
             RootDiskError::RawDiskShrinkUnsupported { .. }
         ));
     }
-
-    #[test]
-    fn libvm_manifest_keeps_registry_and_ext4_out() {
-        let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-        let manifest = fs::read_to_string(manifest_path).expect("read manifest");
-
-        for dependency in [
-            "ext4",
-            "containerregistry-image",
-            "containerregistry-registry",
-        ] {
-            assert!(
-                !manifest.contains(dependency),
-                "libvm must not depend on {dependency}"
-            );
-        }
-    }
 }

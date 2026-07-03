@@ -23,6 +23,7 @@ mod constants;
 mod error;
 mod guest_agent;
 pub mod host;
+mod image;
 mod lock_manager;
 mod machine;
 mod network;
@@ -34,10 +35,17 @@ mod vmmon;
 
 pub use crate::error::LibVmError;
 pub use crate::host::{ensure_certificate_authority, CertificateAuthority};
+pub use crate::image::{
+    ImageBuilder, ImageDetail, ImageHandle, ImageLayerDetail, ImageProgress, ImageProgressReceiver,
+    ImageProgressSender, ImagePruneReport, ImagePullOptions, ImagePullPolicy, ImageRemoveOptions,
+    ImageSource, ImageSourceKind, Images,
+};
 pub use crate::machine::{
-    resolve_mount_location, Machine, MachineBuilder, MachineData, MachineExit, MachineExitCommand,
-    MachineExitOutcome, MachineKillOptions, MachineRef, MachineStartOptions, MachineStatus,
-    MachineStopOptions, MachineUpdate, MachineWaitOptions, Memory, DEFAULT_MACHINE_WAIT_TIMEOUT,
+    resolve_mount_location, AttachOptions, AttachOptionsBuilder, ExecControl, ExecEvent,
+    ExecHandle, ExecOptions, ExecOptionsBuilder, ExecOutput, ExecSink, ExitStatus, Machine,
+    MachineBuilder, MachineData, MachineExit, MachineExitCommand, MachineExitOutcome,
+    MachineKillOptions, MachineRef, MachineStartOptions, MachineStatus, MachineStopOptions,
+    MachineUpdate, MachineWaitOptions, Memory, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
     MachineNetworkConfig, NetworkBuilder, NetworkDefinition, NetworkDriver, NetworkDriverKind,

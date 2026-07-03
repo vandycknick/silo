@@ -56,7 +56,7 @@ impl HelpDoc {
     pub(crate) fn examples(mut self, examples: &[&str]) -> Self {
         for example in examples {
             self.write("  ");
-            self.write(*example);
+            self.write(example);
             self.write("\n");
         }
         self.has_content = true;

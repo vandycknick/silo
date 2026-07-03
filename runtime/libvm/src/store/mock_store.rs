@@ -1,11 +1,13 @@
 use async_trait::async_trait;
 use mockall::mock;
 
+use crate::image::{ImageDetail, ImageHandle, ImagePruneReport, ImageRemoveOptions};
 use crate::store::models::MachineId;
 use crate::store::models::{
-    DbConfig, MachineConfig, MachineState, NetworkAttachment, NetworkDefinition, NetworkInstance,
+    DbConfig, ImageRootfsArtifactRecord, MachineConfig, MachineRootfsRecord, MachineState,
+    NetworkAttachment, NetworkDefinition, NetworkInstance, OciImageRecord,
 };
-use crate::store::{ConfigStore, MachineStore, NetworkStore};
+use crate::store::{ConfigStore, ImageStore, MachineStore, NetworkStore};
 use crate::LibVmError;
 
 mock! {
@@ -21,10 +23,18 @@ mock! {
 
     #[async_trait]
     impl MachineStore for DataStore {
+        #[cfg(test)]
         async fn add_machine(
             &self,
             config: &MachineConfig,
             initial_state: &MachineState,
+        ) -> Result<(), LibVmError>;
+
+        async fn add_machine_with_rootfs(
+            &self,
+            config: &MachineConfig,
+            initial_state: &MachineState,
+            rootfs: &MachineRootfsRecord,
         ) -> Result<(), LibVmError>;
 
         async fn machine_state(
@@ -54,6 +64,30 @@ mock! {
         async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError>;
 
         async fn remove_machine(&self, machine: &MachineConfig) -> Result<(), LibVmError>;
+    }
+
+    #[async_trait]
+    impl ImageStore for DataStore {
+        async fn save_oci_image(&self, image: &OciImageRecord) -> Result<(), LibVmError>;
+
+        async fn save_rootfs_artifact(
+            &self,
+            artifact: &ImageRootfsArtifactRecord,
+        ) -> Result<(), LibVmError>;
+
+        async fn image_handle(&self, reference: &str) -> Result<Option<ImageHandle>, LibVmError>;
+
+        async fn list_image_handles(&self) -> Result<Vec<ImageHandle>, LibVmError>;
+
+        async fn image_detail(&self, reference: &str) -> Result<Option<ImageDetail>, LibVmError>;
+
+        async fn remove_image(
+            &self,
+            reference: &str,
+            options: ImageRemoveOptions,
+        ) -> Result<(), LibVmError>;
+
+        async fn prune_images(&self) -> Result<ImagePruneReport, LibVmError>;
     }
 
     #[async_trait]

@@ -167,7 +167,9 @@ fn build_provision_config(
     })
 }
 
-fn load_or_generate_guest_ssh_keypair(paths: &LocalPaths) -> eyre::Result<host::SshKeyPair> {
+pub(crate) fn load_or_generate_guest_ssh_keypair(
+    paths: &LocalPaths,
+) -> eyre::Result<host::SshKeyPair> {
     let (private_key_path, public_key_path) = guest_ssh_key_paths(paths);
     if private_key_path.is_file() && public_key_path.is_file() {
         validate_guest_ssh_keypair(&private_key_path, &public_key_path)

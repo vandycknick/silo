@@ -49,11 +49,7 @@ impl Machine {
             })
     }
 
-    /// Opens the guest shell stream.
-    ///
-    /// When `wait_for_guest_readiness` is true, this waits for the guest agent
-    /// before opening the stream.
-    pub async fn open_shell_stream(
+    pub(crate) async fn open_shell_stream(
         &self,
         wait_for_guest_readiness: bool,
     ) -> Result<tokio::net::UnixStream, LibVmError> {
@@ -82,7 +78,7 @@ impl Machine {
             })
     }
 
-    async fn running_config(&self) -> Result<MachineConfig, LibVmError> {
+    pub(crate) async fn running_config(&self) -> Result<MachineConfig, LibVmError> {
         let runtime = self.runtime();
         let machine_id = self.machine_id();
         let config = runtime

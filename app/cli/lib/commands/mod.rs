@@ -17,7 +17,6 @@ pub mod run;
 pub mod secret;
 pub mod set;
 pub mod shell;
-pub mod shell_proxy;
 pub mod show;
 pub mod start;
 mod start_options;
@@ -47,8 +46,6 @@ pub enum Command {
     Network(network::Cmd),
     Profile(profile::Cmd),
     Set(set::Cmd),
-    #[command(hide = true)]
-    ShellProxy(shell_proxy::Cmd),
 }
 
 impl Command {
@@ -71,7 +68,6 @@ impl Command {
             Self::Network(command) => command.run(context).await,
             Self::Profile(command) => command.run(context).await,
             Self::Set(command) => command.run(context).await,
-            Self::ShellProxy(command) => command.run(context).await,
         }
     }
 }

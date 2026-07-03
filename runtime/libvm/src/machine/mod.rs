@@ -9,6 +9,7 @@ mod mounts;
 mod name_generator;
 mod reference;
 pub(crate) mod root_disk;
+mod session;
 mod start;
 mod streams;
 mod update;
@@ -23,6 +24,10 @@ pub use lifecycle_options::{
 pub use memory::Memory;
 pub use mounts::resolve_mount_location;
 pub use reference::MachineRef;
+pub use session::{
+    AttachOptions, AttachOptionsBuilder, ExecControl, ExecEvent, ExecHandle, ExecOptions,
+    ExecOptionsBuilder, ExecOutput, ExecSink, ExitStatus, StdinMode,
+};
 pub use start::{MachineExitCommand, MachineStartOptions};
 pub use update::MachineUpdate;
 
