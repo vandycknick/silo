@@ -23,3 +23,4 @@ We use Michael Nygard-style ADRs to capture architectural decisions.
 | 0004 | Daemonless architecture                                       | Implemented | 2026-04-06 | `docs/adr/0004-daemonless-architecture.md`       |
 | 0005 | Vmmon endpoint plugins for vsock streams                      | Implemented | 2026-04-12 | `docs/adr/0005-vmmon-vsock-endpoint-plugins.md`  |
 | 0006 | Sandbox network policy and firewall semantics                 | Proposed    | 2026-06-18 | `docs/adr/0006-sandbox-network-policy-and-firewall-semantics.md` |
+| 0007 | HCL network policy frontend                                   | Proposed    | 2026-07-04 | `docs/adr/0007-hcl-network-policy-frontend.md`   |
