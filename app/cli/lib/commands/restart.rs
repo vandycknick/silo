@@ -29,7 +29,7 @@ impl Cmd {
 
         spinner.step("Starting", &name);
         let options = machine_start_options(context.runtime().await?, &machine)?;
-        let data = machine.start_with(options).await?;
+        let data = machine.start_with_options(options).await?;
 
         spinner.step("Waiting", &name);
         machine

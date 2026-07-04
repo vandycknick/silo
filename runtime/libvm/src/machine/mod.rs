@@ -28,7 +28,9 @@ pub use session::{
     AttachOptions, AttachOptionsBuilder, ExecControl, ExecEvent, ExecHandle, ExecOptions,
     ExecOptionsBuilder, ExecOutput, ExecSink, ExitStatus, StdinMode,
 };
-pub use start::{MachineExitCommand, MachineStartOptions};
+pub use start::{
+    MachineExitCommand, MachineStartOptions, NetworkLaunch, NetworkLaunchSecret, OAuthRefreshHook,
+};
 pub use update::{MachineUpdate, NetworkPolicyUpdate};
 
 pub(crate) use name_generator::generate_machine_name;

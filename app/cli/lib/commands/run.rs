@@ -84,7 +84,7 @@ impl Cmd {
         let machine_name = machine.inspect().await?.name;
         let mut progress = Spinner::start("Starting", &machine_name);
         machine
-            .start_with(machine_start_options(runtime, &machine)?)
+            .start_with_options(machine_start_options(runtime, &machine)?)
             .await?;
         progress.step("Waiting", &machine_name);
         machine

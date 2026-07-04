@@ -141,7 +141,7 @@ impl Cmd {
         if self.start {
             let progress = Spinner::start("Starting", &self.name);
             machine
-                .start_with(machine_start_options(runtime, &machine)?)
+                .start_with_options(machine_start_options(runtime, &machine)?)
                 .await?;
             progress.finish_success("Started");
         }

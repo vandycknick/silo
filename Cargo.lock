@@ -2524,6 +2524,7 @@ version = "0.1.0"
 dependencies = [
  "agent-spec",
  "async-trait",
+ "base64",
  "eyre",
  "getrandom 0.4.2",
  "hyper-util",

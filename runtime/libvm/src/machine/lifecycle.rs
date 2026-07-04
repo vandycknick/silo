@@ -29,11 +29,21 @@ struct WaitTarget {
 impl Machine {
     /// Starts the machine and returns its updated inspect data.
     pub async fn start(&self) -> Result<MachineData, LibVmError> {
-        self.start_with(MachineStartOptions::default()).await
+        self.start_with_options(MachineStartOptions::default())
+            .await
     }
 
     /// Starts the machine with explicit start options.
-    pub async fn start_with(
+    pub async fn start_with<F>(&self, configure: F) -> Result<MachineData, LibVmError>
+    where
+        F: FnOnce(MachineStartOptions) -> MachineStartOptions,
+    {
+        self.start_with_options(configure(MachineStartOptions::default()))
+            .await
+    }
+
+    /// Starts the machine with prebuilt start options.
+    pub async fn start_with_options(
         &self,
         options: MachineStartOptions,
     ) -> Result<MachineData, LibVmError> {
@@ -61,6 +71,7 @@ impl Machine {
                 });
             }
 
+            options.validate_network_launch(&config.network, &config.name)?;
             reconcile_root_disk_size(&config)?;
             runtime.remove_vmmon_exit_status(&config)?;
             let run_id = Uuid::new_v4().to_string();

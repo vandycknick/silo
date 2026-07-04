@@ -45,8 +45,8 @@ pub use crate::machine::{
     ExecHandle, ExecOptions, ExecOptionsBuilder, ExecOutput, ExecSink, ExitStatus, Machine,
     MachineBuilder, MachineData, MachineExit, MachineExitCommand, MachineExitOutcome,
     MachineKillOptions, MachineRef, MachineStartOptions, MachineStatus, MachineStopOptions,
-    MachineUpdate, MachineWaitOptions, Memory, NetworkPolicyUpdate, StdinMode,
-    DEFAULT_MACHINE_WAIT_TIMEOUT,
+    MachineUpdate, MachineWaitOptions, Memory, NetworkLaunch, NetworkLaunchSecret,
+    NetworkPolicyUpdate, OAuthRefreshHook, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
     MachineNetworkConfig, NetworkBuilder, NetworkDefinition, NetworkDriver, NetworkDriverKind,
