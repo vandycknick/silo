@@ -76,7 +76,9 @@ impl Machine {
             runtime.remove_vmmon_exit_status(&config)?;
             let run_id = Uuid::new_v4().to_string();
 
-            let resolved_network = runtime.prepare_machine_network(&config).await?;
+            let resolved_network = runtime
+                .prepare_machine_network(&config, &options.network)
+                .await?;
             runtime.prepare_vmmon_launch_inputs(&config, &resolved_network)?;
 
             runtime.request_machine_start(config.id, &run_id).await?;

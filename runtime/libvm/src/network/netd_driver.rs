@@ -10,6 +10,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use bento_policy::NetworkPolicy;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
@@ -17,6 +19,7 @@ use tokio::time::sleep;
 use utils::format_mac;
 
 use crate::host;
+use crate::machine::{NetworkLaunch, OAuthRefreshHook};
 use crate::paths::LocalPaths;
 use crate::store::models::MachineId;
 use crate::store::models::{
@@ -38,6 +41,8 @@ const NETD_DISABLE_SSH_PORT: &str = "-1";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
+const OAUTH_REFRESH_HOOK_ENV: &str = "BENTO_NET_OAUTH_REFRESH_HOOK";
+const OAUTH_REFRESH_AUTH_ENV: &str = "BENTO_NET_OAUTH_REFRESH_AUTH";
 
 pub(super) struct NetdDriver;
 
@@ -114,12 +119,17 @@ async fn prepare_netd_runtime(
     let log_path = network_paths.log_path();
     let pid_path = network_paths.pid_path();
     let pcap_path = config.pcap.then(|| network_paths.pcap_path());
-    let policy_path = resolve_network_policy_path(
-        metadata,
-        request.policy_ref(),
-        &ctx.config.policy_config_dir,
-    )?;
-    let secret_store_path = paths.secret_store_path();
+    let policy_path = if let Some(policy) = request.policy() {
+        let path = network_paths.policy_path();
+        write_runtime_policy_file(metadata, policy, &path)?;
+        Some(path)
+    } else {
+        resolve_network_policy_path(
+            metadata,
+            request.policy_ref(),
+            &ctx.config.policy_config_dir,
+        )?
+    };
     let (tls_ca_cert_path, tls_ca_key_path) =
         resolve_certificate_authority_paths(paths, &config, &metadata.name)?;
     remove_file_if_exists(&socket_path)?;
@@ -138,11 +148,16 @@ async fn prepare_netd_runtime(
             machine_id: metadata.id,
             network_id: &network_id,
             policy_path: policy_path.as_deref(),
-            secret_store_path: secret_store_path.as_path(),
             tls_ca_cert_path: Some(tls_ca_cert_path.as_path()),
             tls_ca_key_path: Some(tls_ca_key_path.as_path()),
         },
     );
+    configure_network_launch_environment(
+        &mut command,
+        ctx.network_launch,
+        request.policy(),
+        &metadata.name,
+    )?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
@@ -293,7 +308,6 @@ struct NetworkHelperCommandConfig<'a> {
     machine_id: MachineId,
     network_id: &'a str,
     policy_path: Option<&'a Path>,
-    secret_store_path: &'a Path,
     tls_ca_cert_path: Option<&'a Path>,
     tls_ca_key_path: Option<&'a Path>,
 }
@@ -324,9 +338,6 @@ fn configure_network_helper_command(
     if let Some(path) = config.policy_path {
         command.arg("--policy-file").arg(path);
     }
-    command
-        .arg("--secret-store-file")
-        .arg(config.secret_store_path);
     if let Some(path) = config.tls_ca_cert_path {
         command.arg("--tls-ca-cert").arg(path);
     }
@@ -351,6 +362,89 @@ fn validate_policy(
         });
     }
     Ok(())
+}
+
+fn write_runtime_policy_file(
+    metadata: &MachineConfig,
+    policy: &NetworkPolicy,
+    path: &Path,
+) -> Result<(), LibVmError> {
+    let normalized = policy.clone().normalized();
+    let mut bytes =
+        serde_json::to_vec_pretty(&normalized).map_err(|err| LibVmError::NetworkRuntime {
+            reference: metadata.name.clone(),
+            message: format!("serialize generated network policy: {err}"),
+        })?;
+    bytes.push(b'\n');
+    fs::write(path, bytes).map_err(|err| LibVmError::NetworkRuntime {
+        reference: metadata.name.clone(),
+        message: format!("write generated network policy {}: {err}", path.display()),
+    })
+}
+
+fn configure_network_launch_environment(
+    command: &mut Command,
+    launch: &NetworkLaunch,
+    policy: Option<&NetworkPolicy>,
+    reference: &str,
+) -> Result<(), LibVmError> {
+    let Some(policy) = policy else {
+        if launch.is_empty() {
+            return Ok(());
+        }
+        return Err(LibVmError::NetworkRuntime {
+            reference: reference.to_string(),
+            message: "network launch material requires a persisted network policy".to_string(),
+        });
+    };
+
+    for (name, value) in launch.secret_environment(policy, reference)? {
+        command.env(name, value);
+    }
+    if let Some(hook) = &launch.oauth_refresh_hook {
+        command.env(
+            OAUTH_REFRESH_HOOK_ENV,
+            encode_oauth_refresh_hook_config(hook, reference)?,
+        );
+        command.env(OAUTH_REFRESH_AUTH_ENV, hook.encoded_auth());
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct OAuthRefreshHookConfig<'a> {
+    version: u8,
+    command: &'a str,
+    args: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_skew_seconds: Option<u64>,
+}
+
+fn encode_oauth_refresh_hook_config(
+    hook: &OAuthRefreshHook,
+    reference: &str,
+) -> Result<String, LibVmError> {
+    let command = hook
+        .command
+        .to_str()
+        .ok_or_else(|| LibVmError::NetworkRuntime {
+            reference: reference.to_string(),
+            message: "OAuth refresh hook command must be valid UTF-8".to_string(),
+        })?;
+    let config = OAuthRefreshHookConfig {
+        version: 1,
+        command,
+        args: &hook.args,
+        timeout_ms: hook.timeout_ms,
+        refresh_skew_seconds: hook.refresh_skew_seconds,
+    };
+    let bytes = serde_json::to_vec(&config).map_err(|err| LibVmError::NetworkRuntime {
+        reference: reference.to_string(),
+        message: format!("serialize OAuth refresh hook config: {err}"),
+    })?;
+    Ok(STANDARD.encode(bytes))
 }
 
 fn resolve_network_policy_path(
@@ -700,16 +794,38 @@ fn terminate_helper(pid: i32) -> Result<(), LibVmError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_bounded_stderr_line, configure_network_helper_command, format_netd_startup_failure,
+        append_bounded_stderr_line, configure_network_helper_command,
+        configure_network_launch_environment, format_netd_startup_failure,
         resolve_certificate_authority_paths, CapturedStderrLines, NetworkHelperCommandConfig,
-        STDERR_CAPTURE_LIMIT,
+        OAUTH_REFRESH_AUTH_ENV, OAUTH_REFRESH_HOOK_ENV, STDERR_CAPTURE_LIMIT,
     };
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use bento_policy::NetworkPolicy;
+    use serde_json::json;
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    use crate::machine::{NetworkLaunch, OAuthRefreshHook};
     use crate::paths::LocalPaths;
     use crate::store::models::MachineId;
     use crate::NetdRuntimeConfig;
+
+    fn oauth_policy() -> NetworkPolicy {
+        NetworkPolicy::from_json_str(
+            r#"{
+                "version": 1,
+                "metadata": {},
+                "endpoints": [
+                    { "name": "chatgpt", "kind": "https", "hosts": ["chatgpt.com"] }
+                ],
+                "credentials": [
+                    { "name": "codex", "kind": "openai_codex_oauth", "endpoint": "chatgpt" }
+                ]
+            }"#,
+        )
+        .expect("oauth policy")
+    }
 
     #[test]
     fn netd_command_disables_default_ssh_forward() {
@@ -725,7 +841,6 @@ mod tests {
                 machine_id: MachineId::new(),
                 network_id: "net123",
                 policy_path: None,
-                secret_store_path: Path::new("/tmp/bento/secrets.json"),
                 tls_ca_cert_path: None,
                 tls_ca_key_path: None,
             },
@@ -753,8 +868,7 @@ mod tests {
                 pcap_path: None,
                 machine_id,
                 network_id: "net123",
-                policy_path: Some(Path::new("/tmp/bento-net/policy.hcl")),
-                secret_store_path: Path::new("/tmp/bento/secrets.json"),
+                policy_path: Some(Path::new("/tmp/bento-net/network-policy.json")),
                 tls_ca_cert_path: Some(Path::new("/tmp/bento-net/ca.pem")),
                 tls_ca_key_path: Some(Path::new("/tmp/bento-net/ca-key.pem")),
             },
@@ -771,21 +885,68 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|window| window[0] == "--network-id" && window[1] == "net123"));
-        assert!(
-            args.windows(2)
-                .any(|window| window[0] == "--policy-file"
-                    && window[1] == "/tmp/bento-net/policy.hcl")
-        );
-        assert!(args
-            .windows(2)
-            .any(|window| window[0] == "--secret-store-file"
-                && window[1] == "/tmp/bento/secrets.json"));
+        assert!(args.windows(2).any(|window| window[0] == "--policy-file"
+            && window[1] == "/tmp/bento-net/network-policy.json"));
+        assert!(args.iter().all(|arg| arg != "--secret-store-file"));
         assert!(args
             .windows(2)
             .any(|window| window[0] == "--tls-ca-cert" && window[1] == "/tmp/bento-net/ca.pem"));
         assert!(args
             .windows(2)
             .any(|window| window[0] == "--tls-ca-key" && window[1] == "/tmp/bento-net/ca-key.pem"));
+    }
+
+    #[test]
+    fn netd_command_sets_network_launch_environment() {
+        let policy = oauth_policy();
+        let launch = NetworkLaunch::new()
+            .secret("codex.oauth.access_token", "token")
+            .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
+            .oauth_refresh_hook(
+                OAuthRefreshHook::new("/usr/bin/bento", b"auth".to_vec())
+                    .arg("secret")
+                    .arg("refresh-oauth")
+                    .timeout_ms(2500)
+                    .refresh_skew_seconds(120),
+            );
+        let mut command = Command::new("netd");
+
+        configure_network_launch_environment(&mut command, &launch, Some(&policy), "devbox")
+            .expect("configure launch environment");
+
+        let env = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.expect("env value").to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            env.get("BENTO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN"),
+            Some(&"dG9rZW4=".to_string())
+        );
+        assert_eq!(
+            env.get(OAUTH_REFRESH_AUTH_ENV),
+            Some(&"YXV0aA==".to_string())
+        );
+
+        let hook_config = env.get(OAUTH_REFRESH_HOOK_ENV).expect("hook config env");
+        let hook_json = STANDARD.decode(hook_config).expect("decode hook config");
+        let hook_json: serde_json::Value =
+            serde_json::from_slice(&hook_json).expect("parse hook config");
+        assert_eq!(
+            hook_json,
+            json!({
+                "version": 1,
+                "command": "/usr/bin/bento",
+                "args": ["secret", "refresh-oauth"],
+                "timeout_ms": 2500,
+                "refresh_skew_seconds": 120
+            })
+        );
     }
 
     #[test]

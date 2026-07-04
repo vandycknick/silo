@@ -30,7 +30,7 @@ use crate::store::models::{
     NetworkTopology as ModelNetworkTopology,
 };
 use crate::store::DataStore;
-use crate::{LibVmError, RuntimeNetworkingConfig};
+use crate::{LibVmError, NetworkLaunch, RuntimeNetworkingConfig};
 
 use self::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
 use self::netd_driver::NetdDriver;
@@ -74,6 +74,7 @@ pub(crate) async fn prepare_network_runtime(
     store: &dyn DataStore,
     metadata: &MachineConfig,
     config: &RuntimeNetworkingConfig,
+    network_launch: &NetworkLaunch,
 ) -> Result<VmmonNetworkAttachment, LibVmError> {
     reconcile_network_runtime(paths, store, metadata, false).await?;
 
@@ -91,6 +92,7 @@ pub(crate) async fn prepare_network_runtime(
                     store,
                     metadata,
                     config,
+                    network_launch,
                 },
                 &request,
             )
@@ -103,7 +105,7 @@ pub(crate) async fn prepare_network_runtime(
                     message: format!("named network {:?} is not defined", name),
                 }
             })?;
-            resolve_named_network(paths, store, metadata, &definition, config).await
+            resolve_named_network(paths, store, metadata, &definition, config, network_launch).await
         }
     }
 }
@@ -147,6 +149,7 @@ async fn resolve_named_network(
     metadata: &MachineConfig,
     definition: &ModelNetworkDefinition,
     config: &RuntimeNetworkingConfig,
+    network_launch: &NetworkLaunch,
 ) -> Result<VmmonNetworkAttachment, LibVmError> {
     match definition.topology {
         ModelNetworkTopology::Nat => {
@@ -164,6 +167,7 @@ async fn resolve_named_network(
                     store,
                     metadata,
                     config,
+                    network_launch,
                 },
                 &request,
             )
@@ -635,6 +639,7 @@ mod tests {
             &store,
             &metadata,
             &RuntimeNetworkingConfig::default(),
+            &crate::NetworkLaunch::default(),
         )
         .await
         .expect_err("bridge topology should not be implemented yet");

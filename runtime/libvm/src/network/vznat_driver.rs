@@ -139,6 +139,7 @@ mod tests {
                     store: &store,
                     metadata: &metadata,
                     config: &config,
+                    network_launch: &crate::NetworkLaunch::default(),
                 },
                 &NetworkAttachmentRequest::named("devnet"),
             )

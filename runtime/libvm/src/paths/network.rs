@@ -4,6 +4,7 @@ const SOCKET_FILE_NAME: &str = "netd.sock";
 const LOG_FILE_NAME: &str = "netd.log";
 const PID_FILE_NAME: &str = "netd.pid";
 const PCAP_FILE_NAME: &str = "capture.pcap";
+const POLICY_FILE_NAME: &str = "network-policy.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NetworkPaths {
@@ -34,6 +35,10 @@ impl NetworkPaths {
     pub(crate) fn pcap_path(&self) -> PathBuf {
         self.dir.join(PCAP_FILE_NAME)
     }
+
+    pub(crate) fn policy_path(&self) -> PathBuf {
+        self.dir.join(POLICY_FILE_NAME)
+    }
 }
 
 #[cfg(test)]
@@ -61,6 +66,10 @@ mod tests {
         assert_eq!(
             paths.pcap_path(),
             PathBuf::from("/tmp/bento/net/net123/capture.pcap")
+        );
+        assert_eq!(
+            paths.policy_path(),
+            PathBuf::from("/tmp/bento/net/net123/network-policy.json")
         );
     }
 }

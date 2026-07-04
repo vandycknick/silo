@@ -4,7 +4,7 @@ use bento_policy::NetworkPolicy;
 use crate::paths::LocalPaths;
 use crate::store::models::MachineConfig;
 use crate::store::DataStore;
-use crate::{LibVmError, NetworkPolicyRef, RuntimeNetworkingConfig};
+use crate::{LibVmError, NetworkLaunch, NetworkPolicyRef, RuntimeNetworkingConfig};
 
 use super::VmmonNetworkAttachment;
 
@@ -66,6 +66,7 @@ pub(super) struct NetworkDriverContext<'a> {
     pub(super) store: &'a dyn DataStore,
     pub(super) metadata: &'a MachineConfig,
     pub(super) config: &'a RuntimeNetworkingConfig,
+    pub(super) network_launch: &'a NetworkLaunch,
 }
 
 #[async_trait]

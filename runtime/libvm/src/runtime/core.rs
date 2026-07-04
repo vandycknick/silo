@@ -31,7 +31,7 @@ use crate::image::{
     ImagePullPolicy, ImageRemoveOptions, ImageSource, ImageSourceKind, Images, MaterializedImage,
 };
 use crate::machine::{
-    Machine, MachineBuilder, MachineData, MachineRef, MachineRefKind, MachineStatus,
+    Machine, MachineBuilder, MachineData, MachineRef, MachineRefKind, MachineStatus, NetworkLaunch,
 };
 use crate::network::{
     prepare_network_runtime, reconcile_network_runtime, validate_network_name, NetworkBuilder,
@@ -873,8 +873,16 @@ impl Runtime {
     pub(crate) async fn prepare_machine_network(
         &self,
         config: &MachineConfig,
+        network_launch: &NetworkLaunch,
     ) -> Result<VmmonNetworkAttachment, LibVmError> {
-        prepare_network_runtime(&self.paths, self.store.as_ref(), config, &self.networking).await
+        prepare_network_runtime(
+            &self.paths,
+            self.store.as_ref(),
+            config,
+            &self.networking,
+            network_launch,
+        )
+        .await
     }
 
     pub(crate) async fn reconcile_machine_network(

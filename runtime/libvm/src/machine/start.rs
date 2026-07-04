@@ -238,7 +238,6 @@ impl NetworkLaunch {
         self.validate_oauth_refresh_hook(policy, reference)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn secret_environment(
         &self,
         policy: &NetworkPolicy,
@@ -347,7 +346,6 @@ impl OAuthRefreshHook {
         self
     }
 
-    #[allow(dead_code)]
     pub(crate) fn encoded_auth(&self) -> String {
         STANDARD.encode(&self.auth)
     }

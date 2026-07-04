@@ -161,10 +161,6 @@ impl LocalPaths {
     pub(crate) fn keys_dir(&self) -> PathBuf {
         self.data_dir().join("keys")
     }
-
-    pub(crate) fn secret_store_path(&self) -> PathBuf {
-        self.data_dir().join("secrets.json")
-    }
 }
 
 #[cfg(test)]
@@ -224,10 +220,6 @@ mod tests {
         let network = paths.network("net123");
 
         assert_eq!(paths.keys_dir(), PathBuf::from("/tmp/bento/keys"));
-        assert_eq!(
-            paths.secret_store_path(),
-            PathBuf::from("/tmp/bento/secrets.json")
-        );
         assert_eq!(
             machine.dir(),
             PathBuf::from("/tmp/bento/machines").join(machine_id.to_string())
