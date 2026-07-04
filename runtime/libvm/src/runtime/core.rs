@@ -837,17 +837,35 @@ impl Runtime {
         &self,
         network: &ModelMachineNetworkConfig,
     ) -> Result<(), LibVmError> {
-        if let ModelMachineNetworkConfig::Named { name } = network {
-            validate_network_name(name).map_err(|message| LibVmError::NetworkRuntime {
-                reference: name.clone(),
-                message,
-            })?;
-            self.store.network_definition(name).await?.ok_or_else(|| {
-                LibVmError::NetworkRuntime {
-                    reference: name.clone(),
-                    message: format!("named network {:?} is not defined", name),
+        match network {
+            ModelMachineNetworkConfig::Private { policy, .. } => {
+                if let Some(policy) = policy {
+                    if let Some(diagnostic) = policy.validate().into_iter().find(|diagnostic| {
+                        diagnostic.severity == bento_policy::DiagnosticSeverity::Error
+                    }) {
+                        return Err(LibVmError::NetworkRuntime {
+                            reference: "private".to_string(),
+                            message: format!(
+                                "invalid network policy: {}: {}",
+                                diagnostic.summary, diagnostic.detail
+                            ),
+                        });
+                    }
                 }
-            })?;
+            }
+            ModelMachineNetworkConfig::Named { name } => {
+                validate_network_name(name).map_err(|message| LibVmError::NetworkRuntime {
+                    reference: name.clone(),
+                    message,
+                })?;
+                self.store.network_definition(name).await?.ok_or_else(|| {
+                    LibVmError::NetworkRuntime {
+                        reference: name.clone(),
+                        message: format!("named network {:?} is not defined", name),
+                    }
+                })?;
+            }
+            ModelMachineNetworkConfig::None => {}
         }
         Ok(())
     }
@@ -1517,6 +1535,7 @@ mod tests {
         ImageSource, LibVmError, MachineExitOutcome, MachineKillOptions, MachineRef, MachineStatus,
         MachineUpdate, Memory, RuntimeNetworkingConfig,
     };
+    use bento_policy::NetworkPolicy;
     use ocidisk::{Platform, RootfsImage, RootfsImageMetadata, RootfsImageSource};
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::process::CommandExt;
@@ -1557,6 +1576,16 @@ mod tests {
         spec.hardware
             .as_mut()
             .expect("spec should have hardware section")
+    }
+
+    fn sample_network_policy() -> NetworkPolicy {
+        NetworkPolicy::from_json_str(
+            r#"{
+                "version": 1,
+                "metadata": { "source": "test" }
+            }"#,
+        )
+        .expect("sample network policy")
     }
 
     fn sample_machine_config(paths: &LocalPaths, id: MachineId, name: &str) -> MachineConfig {
@@ -3143,6 +3172,72 @@ mod tests {
         .expect("inspect persisted update");
         assert_eq!(spec_hardware(&persisted.spec).cpus, Some(6));
         assert_eq!(persisted.root_disk_size, Some(8));
+    }
+
+    #[tokio::test]
+    async fn update_sets_and_clears_private_network_policy() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let runtime = Runtime::open(
+            LocalPaths::new(temp.path().join("bento")),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .expect("create runtime");
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+        let policy = sample_network_policy();
+
+        let updated = machine_handle(&runtime, machine.id)
+            .update(MachineUpdate::new().set_network_policy(policy.clone()))
+            .await
+            .expect("set network policy");
+
+        assert_eq!(updated.network.policy(), Some(&policy));
+        assert!(updated.network.policy_ref().is_none());
+
+        let cleared = machine_handle(&runtime, machine.id)
+            .update(MachineUpdate::new().clear_network_policy())
+            .await
+            .expect("clear network policy");
+
+        assert!(cleared.network.policy().is_none());
+        assert!(cleared.network.policy_ref().is_none());
+    }
+
+    #[tokio::test]
+    async fn update_rejects_policy_update_when_network_is_disabled() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let runtime = Runtime::open(
+            LocalPaths::new(temp.path().join("bento")),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .expect("create runtime");
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+        machine_handle(&runtime, machine.id)
+            .set_network(crate::MachineNetworkConfig::none())
+            .await
+            .expect("disable network");
+
+        let err = machine_handle(&runtime, machine.id)
+            .update(MachineUpdate::new().set_network_policy(sample_network_policy()))
+            .await
+            .expect_err("policy update should require private network");
+
+        assert!(matches!(
+            err,
+            LibVmError::InvalidMachineUpdate { ref reason, .. }
+                if reason.contains("machine networking is disabled")
+        ));
     }
 
     #[tokio::test]

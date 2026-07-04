@@ -62,7 +62,7 @@ impl NetworkDriverBackend for NetdDriver {
         reference: &str,
         request: &NetworkAttachmentRequest<'_>,
     ) -> Result<(), LibVmError> {
-        validate_policy_ref(reference, self.id(), request.policy_ref())
+        validate_policy(reference, self.id(), request.policy(), request.policy_ref())
     }
 
     async fn prepare(
@@ -335,18 +335,19 @@ fn configure_network_helper_command(
     }
 }
 
-fn validate_policy_ref(
+fn validate_policy(
     reference: &str,
     driver: &str,
+    policy: Option<&bento_policy::NetworkPolicy>,
     policy_ref: Option<&NetworkPolicyRef>,
 ) -> Result<(), LibVmError> {
-    if policy_ref.is_none() {
+    if policy.is_none() && policy_ref.is_none() {
         return Ok(());
     }
     if driver != DRIVER_NETD {
         return Err(LibVmError::NetworkRuntime {
             reference: reference.to_string(),
-            message: format!("resolved driver {driver:?} does not support network policy_ref"),
+            message: format!("resolved driver {driver:?} does not support network policy"),
         });
     }
     Ok(())

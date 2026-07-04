@@ -1,6 +1,15 @@
 use crate::machine::Memory;
 use crate::network::MachineNetworkConfig;
 
+use bento_policy::NetworkPolicy;
+
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum NetworkPolicyUpdate {
+    Set(NetworkPolicy),
+    Clear,
+}
+
 /// Partial settings update for a stopped machine.
 ///
 /// Every field is optional. Use `is_empty` to reject no-op updates before
@@ -32,6 +41,8 @@ pub struct MachineUpdate {
     pub rosetta: Option<bool>,
     /// New durable network config.
     pub network: Option<MachineNetworkConfig>,
+    /// Policy-only update for the current durable network config.
+    pub network_policy: Option<NetworkPolicyUpdate>,
 }
 
 impl MachineUpdate {
@@ -82,6 +93,18 @@ impl MachineUpdate {
         self
     }
 
+    /// Replaces the persisted private-network policy without changing the network attachment.
+    pub fn set_network_policy(mut self, policy: NetworkPolicy) -> Self {
+        self.network_policy = Some(NetworkPolicyUpdate::Set(policy));
+        self
+    }
+
+    /// Removes the persisted private-network policy without changing the network attachment.
+    pub fn clear_network_policy(mut self) -> Self {
+        self.network_policy = Some(NetworkPolicyUpdate::Clear);
+        self
+    }
+
     /// Returns true when no settings are present.
     pub fn is_empty(&self) -> bool {
         self.name.is_none()
@@ -91,5 +114,6 @@ impl MachineUpdate {
             && self.nested_virtualization.is_none()
             && self.rosetta.is_none()
             && self.network.is_none()
+            && self.network_policy.is_none()
     }
 }

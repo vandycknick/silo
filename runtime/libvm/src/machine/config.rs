@@ -1,6 +1,8 @@
 use vm_spec::VmSpec;
 
-use crate::machine::{validate_machine_name, Machine, MachineData, MachineUpdate};
+use crate::machine::{
+    validate_machine_name, Machine, MachineData, MachineUpdate, NetworkPolicyUpdate,
+};
 use crate::network::MachineNetworkConfig;
 use crate::runtime::core::{empty_hardware, validate_root_disk_growth, write_machine_config};
 use crate::store::models::MachineNetworkConfig as ModelMachineNetworkConfig;
@@ -54,9 +56,16 @@ impl Machine {
     /// Applies partial settings updates to a stopped machine.
     pub async fn update(&self, update: MachineUpdate) -> Result<MachineData, LibVmError> {
         let runtime = self.runtime();
-        let network: Option<ModelMachineNetworkConfig> = update.network.clone().map(Into::into);
-        if let Some(network) = &network {
+        let replacement_network: Option<ModelMachineNetworkConfig> =
+            update.network.clone().map(Into::into);
+        if let Some(network) = &replacement_network {
             runtime.validate_machine_network_config(network).await?;
+        }
+        if replacement_network.is_some() && update.network_policy.is_some() {
+            return Err(LibVmError::InvalidMachineUpdate {
+                reference: self.id(),
+                reason: "network and network policy updates cannot be combined".to_string(),
+            });
         }
         if let Some(name) = update.name.as_deref() {
             validate_machine_name(name)?;
@@ -135,8 +144,19 @@ impl Machine {
             }
             spec_changed = true;
         }
-        if let Some(network) = network {
+        if let Some(network) = replacement_network {
             config.network = network;
+        }
+        if let Some(update) = update.network_policy {
+            apply_network_policy_update(&mut config.network, update).map_err(|reason| {
+                LibVmError::InvalidMachineUpdate {
+                    reference: config.name.clone(),
+                    reason,
+                }
+            })?;
+            runtime
+                .validate_machine_network_config(&config.network)
+                .await?;
         }
 
         config.modified_at = now_unix();
@@ -150,5 +170,33 @@ impl Machine {
             return Err(err);
         }
         runtime.machine_inspect_data(config).await
+    }
+}
+
+fn apply_network_policy_update(
+    network: &mut ModelMachineNetworkConfig,
+    update: NetworkPolicyUpdate,
+) -> Result<(), String> {
+    match network {
+        ModelMachineNetworkConfig::Private { policy, policy_ref } => {
+            match update {
+                NetworkPolicyUpdate::Set(next) => {
+                    *policy = Some(next.normalized());
+                    *policy_ref = None;
+                }
+                NetworkPolicyUpdate::Clear => {
+                    *policy = None;
+                    *policy_ref = None;
+                }
+            }
+            Ok(())
+        }
+        ModelMachineNetworkConfig::None => Err(
+            "network policy updates require a private network attachment, but machine networking is disabled"
+                .to_string(),
+        ),
+        ModelMachineNetworkConfig::Named { name } => Err(format!(
+            "network policy updates require a private network attachment, but machine uses named network {name:?}"
+        )),
     }
 }

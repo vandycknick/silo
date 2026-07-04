@@ -215,7 +215,10 @@ impl Profile {
 
     pub fn machine_network(&self) -> MachineNetworkConfig {
         match self.network() {
-            ProfileNetwork::Private { policy_ref } => MachineNetworkConfig::Private { policy_ref },
+            ProfileNetwork::Private { policy_ref } => MachineNetworkConfig::Private {
+                policy: None,
+                policy_ref,
+            },
             ProfileNetwork::None => MachineNetworkConfig::None,
             ProfileNetwork::Named { name } => MachineNetworkConfig::Named { name },
         }

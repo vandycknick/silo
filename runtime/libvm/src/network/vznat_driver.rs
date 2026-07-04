@@ -20,10 +20,10 @@ impl NetworkDriverBackend for VzNatDriver {
         reference: &str,
         request: &NetworkAttachmentRequest<'_>,
     ) -> Result<(), LibVmError> {
-        if request.policy_ref().is_some() {
+        if request.policy().is_some() || request.policy_ref().is_some() {
             return Err(LibVmError::NetworkRuntime {
                 reference: reference.to_string(),
-                message: "vznat does not support network policy_ref".to_string(),
+                message: "vznat does not support network policy".to_string(),
             });
         }
         Ok(())
@@ -89,7 +89,7 @@ mod tests {
         let driver = VzNatDriver;
 
         driver
-            .supports("devbox", &NetworkAttachmentRequest::private(None))
+            .supports("devbox", &NetworkAttachmentRequest::private(None, None))
             .expect("private vznat should be supported");
         driver
             .supports("devbox", &NetworkAttachmentRequest::named("devnet"))
@@ -103,7 +103,7 @@ mod tests {
 
         let result = driver.supports(
             "devbox",
-            &NetworkAttachmentRequest::private(Some(&policy_ref)),
+            &NetworkAttachmentRequest::private(None, Some(&policy_ref)),
         );
 
         assert!(result.is_err());

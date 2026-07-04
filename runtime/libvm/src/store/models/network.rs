@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use bento_policy::NetworkPolicy;
+
 use super::MachineId;
 use crate::NetworkPolicyRef;
 
@@ -81,6 +83,8 @@ pub(crate) struct NetworkAttachment {
 pub(crate) enum MachineNetworkConfig {
     Private {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<NetworkPolicy>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_ref: Option<NetworkPolicyRef>,
     },
     None,
@@ -91,7 +95,10 @@ pub(crate) enum MachineNetworkConfig {
 
 impl Default for MachineNetworkConfig {
     fn default() -> Self {
-        Self::Private { policy_ref: None }
+        Self::Private {
+            policy: None,
+            policy_ref: None,
+        }
     }
 }
 

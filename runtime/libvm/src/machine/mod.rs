@@ -29,7 +29,7 @@ pub use session::{
     ExecOptionsBuilder, ExecOutput, ExecSink, ExitStatus, StdinMode,
 };
 pub use start::{MachineExitCommand, MachineStartOptions};
-pub use update::MachineUpdate;
+pub use update::{MachineUpdate, NetworkPolicyUpdate};
 
 pub(crate) use name_generator::generate_machine_name;
 pub(crate) use reference::{validate_machine_name, MachineRefKind};

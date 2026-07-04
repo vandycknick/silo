@@ -390,7 +390,10 @@ pub(crate) fn parse_profile_mount(input: &str) -> Result<ProfileMount, String> {
 
 pub(crate) fn parse_machine_network_config(input: &str) -> Result<MachineNetworkConfig, String> {
     match input {
-        "private" => Ok(MachineNetworkConfig::Private { policy_ref: None }),
+        "private" => Ok(MachineNetworkConfig::Private {
+            policy: None,
+            policy_ref: None,
+        }),
         "none" => Ok(MachineNetworkConfig::None),
         other if other.starts_with("name:") => {
             named_machine_network(other.trim_start_matches("name:"))
@@ -405,7 +408,7 @@ fn named_machine_network(name: &str) -> Result<MachineNetworkConfig, String> {
 
 fn machine_network_to_profile(network: MachineNetworkConfig) -> ProfileNetwork {
     match network {
-        MachineNetworkConfig::Private { policy_ref } => ProfileNetwork::Private { policy_ref },
+        MachineNetworkConfig::Private { policy_ref, .. } => ProfileNetwork::Private { policy_ref },
         MachineNetworkConfig::None => ProfileNetwork::None,
         MachineNetworkConfig::Named { name } => ProfileNetwork::Named { name },
         other => ProfileNetwork::Named { name: other.name() },

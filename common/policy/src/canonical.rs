@@ -13,7 +13,7 @@ const POLICY_VERSION: u32 = 1;
 const DEFAULT_BODY_BUFFER_BYTES: u64 = 1_048_576;
 const DEFAULT_BODY_STORAGE_BYTES: u64 = 4_096;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkPolicy {
     pub version: u32,
@@ -198,7 +198,7 @@ impl NetworkPolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkPolicySettings {
     #[serde(default)]
@@ -220,7 +220,7 @@ impl Default for NetworkPolicySettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkAuditSettings {
     #[serde(default = "default_body_buffer_bytes")]
@@ -238,7 +238,7 @@ impl Default for NetworkAuditSettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkEndpoint {
     pub name: String,
@@ -280,7 +280,7 @@ pub enum IpProtocol {
     Udp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkCredential {
     pub name: String,
@@ -298,7 +298,7 @@ pub struct NetworkCredential {
     pub condition: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -324,7 +324,7 @@ impl NetworkRule {
     fn normalize(&mut self) {}
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TailscaleTunnel {
     pub name: String,
@@ -336,7 +336,7 @@ pub struct TailscaleTunnel {
     pub control_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkForward {
     pub name: String,

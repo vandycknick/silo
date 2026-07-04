@@ -968,7 +968,7 @@ fn machine_status_to_native(status: MachineStatus) -> NativeMachineStatus {
 
 fn network_to_native(network: MachineNetworkConfig) -> NativeNetworkData {
     match network {
-        MachineNetworkConfig::Private { policy_ref } => NativeNetworkData {
+        MachineNetworkConfig::Private { policy_ref, .. } => NativeNetworkData {
             kind: "private".to_string(),
             name: None,
             policy_ref: policy_ref.map(|policy_ref| policy_ref.as_str().to_string()),

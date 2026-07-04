@@ -45,13 +45,15 @@ pub use crate::machine::{
     ExecHandle, ExecOptions, ExecOptionsBuilder, ExecOutput, ExecSink, ExitStatus, Machine,
     MachineBuilder, MachineData, MachineExit, MachineExitCommand, MachineExitOutcome,
     MachineKillOptions, MachineRef, MachineStartOptions, MachineStatus, MachineStopOptions,
-    MachineUpdate, MachineWaitOptions, Memory, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
+    MachineUpdate, MachineWaitOptions, Memory, NetworkPolicyUpdate, StdinMode,
+    DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
     MachineNetworkConfig, NetworkBuilder, NetworkDefinition, NetworkDriver, NetworkDriverKind,
-    NetworkPolicyRef, NetworkTopology,
+    NetworkPolicyRef, NetworkTopology, PrivateNetworkPolicy,
 };
 pub use crate::runtime::{
     NetdRuntimeConfig, PathChoice, Runtime, RuntimeBuilder, RuntimeConfig, RuntimeNetworkingConfig,
 };
 pub use crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT;
+pub use bento_policy::NetworkPolicy;

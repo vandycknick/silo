@@ -271,7 +271,7 @@ pub struct EndpointDecl {
     pub order: usize,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortRange {
     pub start: u16,
     pub end: u16,

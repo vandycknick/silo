@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use bento_policy::NetworkPolicy;
 
 use crate::paths::LocalPaths;
 use crate::store::models::MachineConfig;
@@ -10,6 +11,7 @@ use super::VmmonNetworkAttachment;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NetworkAttachmentTarget<'a> {
     Private {
+        policy: Option<&'a NetworkPolicy>,
         policy_ref: Option<&'a NetworkPolicyRef>,
     },
     Named {
@@ -22,9 +24,12 @@ pub(super) struct NetworkAttachmentRequest<'a> {
 }
 
 impl<'a> NetworkAttachmentRequest<'a> {
-    pub(super) fn private(policy_ref: Option<&'a NetworkPolicyRef>) -> Self {
+    pub(super) fn private(
+        policy: Option<&'a NetworkPolicy>,
+        policy_ref: Option<&'a NetworkPolicyRef>,
+    ) -> Self {
         Self {
-            target: NetworkAttachmentTarget::Private { policy_ref },
+            target: NetworkAttachmentTarget::Private { policy, policy_ref },
         }
     }
 
@@ -36,7 +41,14 @@ impl<'a> NetworkAttachmentRequest<'a> {
 
     pub(super) fn policy_ref(&self) -> Option<&'a NetworkPolicyRef> {
         match self.target {
-            NetworkAttachmentTarget::Private { policy_ref } => policy_ref,
+            NetworkAttachmentTarget::Private { policy_ref, .. } => policy_ref,
+            NetworkAttachmentTarget::Named { .. } => None,
+        }
+    }
+
+    pub(super) fn policy(&self) -> Option<&'a NetworkPolicy> {
+        match self.target {
+            NetworkAttachmentTarget::Private { policy, .. } => policy,
             NetworkAttachmentTarget::Named { .. } => None,
         }
     }

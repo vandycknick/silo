@@ -202,9 +202,10 @@ fn machine_network_with_policy(
     policy_ref: Option<NetworkPolicyRef>,
 ) -> eyre::Result<MachineNetworkConfig> {
     match (network, policy_ref) {
-        (MachineNetworkConfig::Private { .. }, policy_ref) => {
-            Ok(MachineNetworkConfig::Private { policy_ref })
-        }
+        (MachineNetworkConfig::Private { .. }, policy_ref) => Ok(MachineNetworkConfig::Private {
+            policy: None,
+            policy_ref,
+        }),
         (network, None) => Ok(network),
         (_, Some(_)) => eyre::bail!("--policy is only supported with private networks"),
     }
@@ -299,7 +300,10 @@ mod tests {
         assert_eq!(set.vm, "devbox");
         assert_eq!(
             set.network,
-            MachineNetworkConfig::Private { policy_ref: None }
+            MachineNetworkConfig::Private {
+                policy: None,
+                policy_ref: None,
+            }
         );
         assert_eq!(set.policy.expect("policy").as_str(), "github");
     }
@@ -328,7 +332,10 @@ mod tests {
     fn machine_network_policy_applies_to_private_network() {
         let policy_ref = NetworkPolicyRef::new("github").expect("policy ref");
         let network = machine_network_with_policy(
-            MachineNetworkConfig::Private { policy_ref: None },
+            MachineNetworkConfig::Private {
+                policy: None,
+                policy_ref: None,
+            },
             Some(policy_ref.clone()),
         )
         .expect("policy should apply");
@@ -336,6 +343,7 @@ mod tests {
         assert_eq!(
             network,
             MachineNetworkConfig::Private {
+                policy: None,
                 policy_ref: Some(policy_ref),
             }
         );
