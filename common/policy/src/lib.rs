@@ -13,6 +13,7 @@ pub use canonical::{
 pub use condition::{ConditionCompileError, ConditionEvalError, HttpConditionContext};
 pub use model::{
     Action, AuditSettingsDecl, ConditionDecl, CredentialDecl, Diagnostic, DiagnosticSeverity,
-    EndpointDecl, EndpointFamily, ExpectedSecret, LoadError, Policy, PolicyDocument, PortRange,
-    Ref, RuleDecl, SecretRequirement, SettingsDecl, SourceFile, Transport,
+    EndpointDecl, EndpointFamily, ExpectedSecret, ForwardDecl, LoadError, Policy, PolicyDocument,
+    PortRange, Ref, RuleDecl, SecretRequirement, SettingsDecl, SourceFile, TailscaleDecl,
+    Transport,
 };

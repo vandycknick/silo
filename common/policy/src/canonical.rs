@@ -1,7 +1,11 @@
 use crate::condition::HttpCondition;
+use crate::model::{
+    CredentialDecl, EndpointDecl, ForwardDecl, LoadError, Policy as HclPolicy, PolicyDocument,
+    RuleDecl, SettingsDecl, TailscaleDecl,
+};
 use crate::{Action, Diagnostic, DiagnosticSeverity, PortRange};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -61,6 +65,25 @@ impl NetworkPolicy {
             )],
         })?;
         Self::from_json_source("<json>", source)
+    }
+
+    pub fn from_hcl_file(path: impl AsRef<Path>) -> Result<Self, PolicyLoadError> {
+        let path = path.as_ref();
+        let source = std::fs::read_to_string(path).map_err(|err| PolicyLoadError {
+            filename: path.display().to_string(),
+            diagnostics: vec![Diagnostic::error(
+                path.display().to_string(),
+                0,
+                0,
+                "failed to read HCL policy",
+                err.to_string(),
+            )],
+        })?;
+        Self::from_hcl_source(path.display().to_string(), &source)
+    }
+
+    pub fn from_hcl_str(source: &str) -> Result<Self, PolicyLoadError> {
+        Self::from_hcl_source("<hcl>", source)
     }
 
     pub fn normalize(&mut self) {
@@ -128,6 +151,50 @@ impl NetworkPolicy {
             });
         }
         Ok(policy)
+    }
+
+    fn from_hcl_source(filename: impl Into<String>, source: &str) -> Result<Self, PolicyLoadError> {
+        let filename = filename.into();
+        let policy =
+            HclPolicy::parse_str(filename.clone(), source).map_err(PolicyLoadError::from)?;
+        Self::from_hcl_policy(filename, policy)
+    }
+
+    fn from_hcl_policy(filename: String, policy: HclPolicy) -> Result<Self, PolicyLoadError> {
+        let mut metadata = Map::new();
+        metadata.insert(
+            "hcl".to_owned(),
+            json!({
+                "source_hash": policy.policy_hash,
+            }),
+        );
+
+        let mut network_policy = Self {
+            version: POLICY_VERSION,
+            metadata,
+            settings: NetworkPolicySettings::default(),
+            endpoints: Vec::new(),
+            credentials: Vec::new(),
+            rules: Vec::new(),
+            tailscale: Vec::new(),
+            forwards: Vec::new(),
+        };
+
+        for document in &policy.documents {
+            lower_document(document, &mut network_policy);
+        }
+        network_policy.normalize();
+        let diagnostics = network_policy.validate();
+        if diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+        {
+            return Err(PolicyLoadError {
+                filename,
+                diagnostics,
+            });
+        }
+        Ok(network_policy)
     }
 }
 
@@ -275,20 +342,15 @@ pub struct NetworkForward {
     pub name: String,
     pub kind: String,
     pub target: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub listen_host: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub listen_port: Option<u16>,
+    pub target_port: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub listen: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<String>,
 }
 
 impl NetworkForward {
-    fn normalize(&mut self) {
-        if self.kind == "host" && self.listen_host.is_none() {
-            self.listen_host = Some("127.0.0.1".to_owned());
-        }
-    }
+    fn normalize(&mut self) {}
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,6 +442,136 @@ impl std::fmt::Display for PolicyLoadError {
 }
 
 impl std::error::Error for PolicyLoadError {}
+
+impl From<LoadError> for PolicyLoadError {
+    fn from(value: LoadError) -> Self {
+        Self {
+            filename: value.filename,
+            diagnostics: value.diagnostics,
+        }
+    }
+}
+
+fn lower_document(document: &PolicyDocument, policy: &mut NetworkPolicy) {
+    policy.settings = lower_settings(&document.settings);
+    policy
+        .endpoints
+        .extend(document.endpoints.iter().map(lower_endpoint));
+    policy
+        .credentials
+        .extend(document.credentials.iter().map(lower_credential));
+    policy.rules.extend(document.rules.iter().map(lower_rule));
+    policy
+        .tailscale
+        .extend(document.tailscale.iter().map(lower_tailscale));
+    policy
+        .forwards
+        .extend(document.forwards.iter().map(lower_forward));
+}
+
+fn lower_settings(settings: &SettingsDecl) -> NetworkPolicySettings {
+    let audit = settings
+        .audit
+        .as_ref()
+        .map_or_else(NetworkAuditSettings::default, |audit| {
+            NetworkAuditSettings {
+                body_buffer_bytes: audit.body_buffer as u64,
+                body_storage_bytes: audit.body_storage as u64,
+            }
+        });
+    NetworkPolicySettings {
+        default_action: settings.default_action,
+        audit,
+    }
+}
+
+fn lower_endpoint(endpoint: &EndpointDecl) -> NetworkEndpoint {
+    NetworkEndpoint {
+        name: endpoint.name.clone(),
+        kind: endpoint.kind.clone(),
+        source_cidrs: endpoint.source.clone(),
+        destination_cidrs: endpoint.destination.clone(),
+        protocol: lower_ip_protocol(&endpoint.protocol),
+        ports: endpoint.ports.clone(),
+        hosts: endpoint.hosts.clone(),
+    }
+}
+
+fn lower_credential(credential: &CredentialDecl) -> NetworkCredential {
+    NetworkCredential {
+        name: credential.name.clone(),
+        kind: credential.kind.clone(),
+        endpoint: credential.endpoint.name.clone(),
+        username: non_empty_string(&credential.username),
+        header: non_empty_string(&credential.header),
+        prefix: non_empty_string(&credential.prefix),
+        idempotency_key: credential.idempotency_key,
+        condition: credential
+            .condition
+            .as_ref()
+            .map(|condition| condition.source.clone()),
+    }
+}
+
+fn lower_rule(rule: &RuleDecl) -> NetworkRule {
+    NetworkRule {
+        name: non_empty_string(&rule.name),
+        endpoints: rule
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.name.clone())
+            .collect(),
+        credential: rule
+            .credential
+            .as_ref()
+            .map(|credential| credential.name.clone()),
+        condition: rule
+            .condition
+            .as_ref()
+            .map(|condition| condition.source.clone()),
+        tunnel: rule.tunnel.as_ref().map(|tunnel| tunnel.name.clone()),
+        verdict: rule.verdict,
+        priority: rule.priority,
+        disabled: rule.disabled,
+        reason: rule.reason.clone(),
+    }
+}
+
+fn lower_tailscale(tunnel: &TailscaleDecl) -> TailscaleTunnel {
+    TailscaleTunnel {
+        name: tunnel.name.clone(),
+        tags: tunnel.tags.clone(),
+        hostname: non_empty_string(&tunnel.hostname),
+        control_url: non_empty_string(&tunnel.control_url),
+    }
+}
+
+fn lower_forward(forward: &ForwardDecl) -> NetworkForward {
+    NetworkForward {
+        name: forward.name.clone(),
+        kind: forward.kind.clone(),
+        target: forward.target.clone(),
+        target_port: forward.target_port,
+        listen: forward.listen.clone(),
+        tunnel: forward.tunnel.as_ref().map(|tunnel| tunnel.name.clone()),
+    }
+}
+
+fn lower_ip_protocol(protocol: &str) -> IpProtocol {
+    match protocol {
+        "tcp" => IpProtocol::Tcp,
+        "udp" => IpProtocol::Udp,
+        _ => IpProtocol::Any,
+    }
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
 
 #[derive(Default)]
 struct PolicyValidator {
@@ -721,6 +913,15 @@ impl PolicyValidator {
                     ),
                 ),
             }
+            if forward.target_port == 0 {
+                self.error(
+                    "invalid forward target port",
+                    format!(
+                        "forward {} target_port must be greater than 0",
+                        forward.name
+                    ),
+                );
+            }
             if !valid_target_selector(&forward.target) {
                 self.error(
                     "invalid forward target selector",
@@ -931,6 +1132,66 @@ mod tests {
         assert!(slots
             .iter()
             .any(|slot| slot.name == "worktail.tailscale.auth_key" && slot.required));
+    }
+
+    #[test]
+    fn hcl_loader_lowers_to_canonical_policy() {
+        let policy = NetworkPolicy::from_hcl_str(
+            r#"
+            settings {
+              default_action = "deny"
+
+              audit {
+                body_buffer_bytes = 1048576
+                body_storage_bytes = 4096
+              }
+            }
+
+            endpoint "https" "chatgpt" {
+              hosts = ["ChatGPT.com.", "*.chatgpt.com"]
+            }
+
+            credential "openai_codex_oauth" "codex" {
+              endpoint = https.chatgpt
+            }
+
+            tailscale "worktail" {
+              tags = ["tag:dev"]
+            }
+
+            rule "allow_chatgpt" {
+              endpoints = [https.chatgpt]
+              credential = openai_codex_oauth.codex
+              condition = "http.method == 'POST'"
+              tunnel = tailscale.worktail
+              verdict = "allow"
+              priority = 10
+              reason = "Codex API"
+            }
+
+            forward "host" "ssh" {
+              listen = "127.0.0.1:2222"
+              target = "name:web"
+              target_port = 22
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(policy.settings.default_action, Action::Deny);
+        assert_eq!(policy.endpoints[0].name, "chatgpt");
+        assert_eq!(policy.endpoints[0].hosts[0], "chatgpt.com");
+        assert_eq!(policy.credentials[0].endpoint, "chatgpt");
+        assert_eq!(policy.tailscale[0].name, "worktail");
+        assert_eq!(policy.rules[0].tunnel.as_deref(), Some("worktail"));
+        assert_eq!(policy.forwards[0].listen, "127.0.0.1:2222");
+        assert_eq!(policy.forwards[0].target_port, 22);
+        assert!(policy
+            .metadata
+            .get("hcl")
+            .and_then(|value| value.get("source_hash"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|hash| hash.starts_with("sha256:")));
     }
 
     #[test]

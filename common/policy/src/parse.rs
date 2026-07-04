@@ -1,7 +1,7 @@
 use crate::model::{
     Action, AuditSettingsDecl, CredentialDecl, Diagnostic, DiagnosticSeverity, EndpointDecl,
-    EndpointFamily, LoadError, Policy, PolicyDocument, PortRange, Ref, RuleDecl, SettingsDecl,
-    SourceFile, Transport,
+    EndpointFamily, ForwardDecl, LoadError, Policy, PolicyDocument, PortRange, Ref, RuleDecl,
+    SettingsDecl, SourceFile, TailscaleDecl, Transport,
 };
 use hcl::{Block, Body, Expression, Structure};
 use sha2::{Digest, Sha256};
@@ -72,9 +72,13 @@ struct DocumentBuilder<'a> {
     endpoints: Vec<EndpointDecl>,
     credentials: Vec<CredentialDecl>,
     rules: Vec<RuleDecl>,
+    tailscale: Vec<TailscaleDecl>,
+    forwards: Vec<ForwardDecl>,
     endpoint_keys: HashSet<String>,
     credential_keys: HashSet<String>,
     rule_names: HashSet<String>,
+    tailscale_names: HashSet<String>,
+    forward_keys: HashSet<String>,
 }
 
 impl<'a> DocumentBuilder<'a> {
@@ -89,9 +93,13 @@ impl<'a> DocumentBuilder<'a> {
             endpoints: Vec::new(),
             credentials: Vec::new(),
             rules: Vec::new(),
+            tailscale: Vec::new(),
+            forwards: Vec::new(),
             endpoint_keys: HashSet::new(),
             credential_keys: HashSet::new(),
             rule_names: HashSet::new(),
+            tailscale_names: HashSet::new(),
+            forward_keys: HashSet::new(),
         }
     }
 
@@ -141,14 +149,8 @@ impl<'a> DocumentBuilder<'a> {
             "endpoint" => self.read_endpoint(block, labels, block_position),
             "credential" => self.read_credential(block, labels, block_position),
             "rule" => self.read_rule(block, labels, block_position),
-            "tailscale" | "forward" => self.error_at(
-                block_position,
-                "Reserved policy block",
-                format!(
-                    "{} blocks are reserved by the policy schema but not implemented by netd yet",
-                    block.identifier()
-                ),
-            ),
+            "tailscale" => self.read_tailscale(block, labels, block_position),
+            "forward" => self.read_forward(block, labels, block_position),
             other => self.error_at(
                 block_position,
                 "Unsupported block",
@@ -221,28 +223,24 @@ impl<'a> DocumentBuilder<'a> {
         for structure in block.body().iter() {
             match structure {
                 Structure::Attribute(attribute) => match attribute.key() {
-                    "body_buffer" => {
-                        match decode_string(attribute.expr()).and_then(|value| parse_size(&value)) {
-                            Ok(value) => body_buffer = value,
-                            Err(detail) => self.attr_error(
-                                attribute,
-                                block_line,
-                                "Invalid settings.audit.body_buffer",
-                                detail,
-                            ),
-                        }
-                    }
-                    "body_storage" => {
-                        match decode_string(attribute.expr()).and_then(|value| parse_size(&value)) {
-                            Ok(value) => body_storage = value,
-                            Err(detail) => self.attr_error(
-                                attribute,
-                                block_line,
-                                "Invalid settings.audit.body_storage",
-                                detail,
-                            ),
-                        }
-                    }
+                    "body_buffer" | "body_buffer_bytes" => match decode_size(attribute.expr()) {
+                        Ok(value) => body_buffer = value,
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_line,
+                            format!("Invalid settings.audit.{}", attribute.key()),
+                            detail,
+                        ),
+                    },
+                    "body_storage" | "body_storage_bytes" => match decode_size(attribute.expr()) {
+                        Ok(value) => body_storage = value,
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_line,
+                            format!("Invalid settings.audit.{}", attribute.key()),
+                            detail,
+                        ),
+                    },
                     key => self.attr_error(
                         attribute,
                         block_line,
@@ -361,7 +359,8 @@ impl<'a> DocumentBuilder<'a> {
         for structure in block.body().iter() {
             match structure {
                 Structure::Attribute(attribute) => match (kind.as_str(), attribute.key()) {
-                    ("ip", "source") => match decode_string_list(attribute.expr()) {
+                    ("ip", "source" | "source_cidrs") => match decode_string_list(attribute.expr())
+                    {
                         Ok(value) => source = value,
                         Err(detail) => self.attr_error(
                             attribute,
@@ -370,15 +369,17 @@ impl<'a> DocumentBuilder<'a> {
                             detail,
                         ),
                     },
-                    ("ip", "destination") => match decode_string_list(attribute.expr()) {
-                        Ok(value) => destination = value,
-                        Err(detail) => self.attr_error(
-                            attribute,
-                            block_position.line,
-                            "Invalid endpoint destination",
-                            detail,
-                        ),
-                    },
+                    ("ip", "destination" | "destination_cidrs") => {
+                        match decode_string_list(attribute.expr()) {
+                            Ok(value) => destination = value,
+                            Err(detail) => self.attr_error(
+                                attribute,
+                                block_position.line,
+                                "Invalid endpoint destination",
+                                detail,
+                            ),
+                        }
+                    }
                     ("ip", "protocol") => match decode_string(attribute.expr()) {
                         Ok(value) => protocol = value,
                         Err(detail) => self.attr_error(
@@ -438,6 +439,13 @@ impl<'a> DocumentBuilder<'a> {
                     );
                 }
             }
+        }
+        if kind == "ip" && !["any", "tcp", "udp"].contains(&protocol.as_str()) {
+            self.error_at(
+                block_position,
+                "Invalid endpoint protocol",
+                format!("protocol must be any, tcp, or udp, got {protocol}"),
+            );
         }
         if (kind == "http" || kind == "https") && !hosts_seen {
             self.error_at(block_position, "Missing hosts", "hosts is required");
@@ -670,6 +678,7 @@ impl<'a> DocumentBuilder<'a> {
         let mut saw_endpoint = false;
         let mut saw_endpoints = false;
         let mut credential = None;
+        let mut tunnel = None;
         let mut verdict = None;
         let mut priority = 0;
         let mut disabled = false;
@@ -717,6 +726,15 @@ impl<'a> DocumentBuilder<'a> {
                             attribute,
                             block_position.line,
                             "Invalid rule credential",
+                            detail,
+                        ),
+                    },
+                    "tunnel" => match decode_ref(attribute.expr()) {
+                        Ok(value) => tunnel = Some(value),
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid rule tunnel",
                             detail,
                         ),
                     },
@@ -829,12 +847,255 @@ impl<'a> DocumentBuilder<'a> {
             name,
             endpoints,
             credential,
+            tunnel,
             verdict,
             priority,
             disabled,
             condition,
             reason,
             order: self.rules.len(),
+        });
+    }
+
+    fn read_tailscale(&mut self, block: &Block, labels: Vec<String>, block_position: Position) {
+        if labels.len() != 1 {
+            self.error_at(
+                block_position,
+                "Invalid tailscale block",
+                "tailscale requires a name label",
+            );
+            return;
+        }
+        let name = labels[0].clone();
+        if !valid_identifier(&name) {
+            let position = self
+                .locator
+                .find_label(block_position.line, &name)
+                .unwrap_or(block_position);
+            self.error_at(
+                position,
+                "Invalid tailscale name",
+                format!("tailscale \"{name}\" name must use a traversal identifier"),
+            );
+            return;
+        }
+        if !self.tailscale_names.insert(name.clone()) {
+            self.error_at(
+                block_position,
+                "Duplicate tailscale block",
+                format!("tailscale \"{name}\" is already defined."),
+            );
+            return;
+        }
+
+        let mut tags = Vec::new();
+        let mut hostname = String::new();
+        let mut control_url = String::new();
+        for structure in block.body().iter() {
+            match structure {
+                Structure::Attribute(attribute) => match attribute.key() {
+                    "tags" => match decode_string_list(attribute.expr()) {
+                        Ok(value) => tags = value,
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid tailscale tags",
+                            detail,
+                        ),
+                    },
+                    "hostname" => match decode_string(attribute.expr()) {
+                        Ok(value) => hostname = value,
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid tailscale hostname",
+                            detail,
+                        ),
+                    },
+                    "control_url" => match decode_string(attribute.expr()) {
+                        Ok(value) => control_url = value,
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid tailscale control_url",
+                            detail,
+                        ),
+                    },
+                    key => self.attr_error(
+                        attribute,
+                        block_position.line,
+                        "Unsupported argument",
+                        format!("An argument named \"{key}\" is not expected here."),
+                    ),
+                },
+                Structure::Block(child) => {
+                    let position = self.locator.find_block_after(
+                        child.identifier(),
+                        &block_labels(child),
+                        block_position.line,
+                    );
+                    self.error_at(
+                        position,
+                        "Unsupported block",
+                        format!(
+                            "Blocks of type \"{}\" are not expected here.",
+                            child.identifier()
+                        ),
+                    );
+                }
+            }
+        }
+
+        self.tailscale.push(TailscaleDecl {
+            name,
+            tags,
+            hostname,
+            control_url,
+            order: self.tailscale.len(),
+        });
+    }
+
+    fn read_forward(&mut self, block: &Block, labels: Vec<String>, block_position: Position) {
+        if labels.len() != 2 {
+            self.error_at(
+                block_position,
+                "Invalid forward block",
+                "forward requires kind and name labels",
+            );
+            return;
+        }
+        let kind = labels[0].clone();
+        let name = labels[1].clone();
+        let key = format!("{kind}.{name}");
+        if !valid_identifier(&name) {
+            let position = self
+                .locator
+                .find_label(block_position.line, &name)
+                .unwrap_or(block_position);
+            self.error_at(
+                position,
+                "Invalid forward name",
+                format!("forward \"{kind}\".\"{name}\" name must use a traversal identifier"),
+            );
+            return;
+        }
+        if !matches!(kind.as_str(), "host" | "tailscale") {
+            self.error_at(
+                block_position,
+                "Unsupported forward kind",
+                format!("unsupported forward kind \"{kind}\""),
+            );
+            return;
+        }
+        if !self.forward_keys.insert(key.clone()) {
+            self.error_at(
+                block_position,
+                "Duplicate forward",
+                format!("forward \"{key}\" is already defined."),
+            );
+            return;
+        }
+
+        let mut listen = String::new();
+        let mut target = None;
+        let mut target_port = None;
+        let mut tunnel = None;
+        for structure in block.body().iter() {
+            match structure {
+                Structure::Attribute(attribute) => match attribute.key() {
+                    "listen" => match decode_string(attribute.expr()) {
+                        Ok(value) => listen = value,
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid forward listen",
+                            detail,
+                        ),
+                    },
+                    "target" => match decode_string(attribute.expr()) {
+                        Ok(value) => target = Some(value),
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid forward target",
+                            detail,
+                        ),
+                    },
+                    "target_port" => match decode_u16(attribute.expr()) {
+                        Ok(value) => target_port = Some(value),
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid forward target_port",
+                            detail,
+                        ),
+                    },
+                    "tunnel" => match decode_ref(attribute.expr()) {
+                        Ok(value) => tunnel = Some(value),
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid forward tunnel",
+                            detail,
+                        ),
+                    },
+                    key => self.attr_error(
+                        attribute,
+                        block_position.line,
+                        "Unsupported argument",
+                        format!("An argument named \"{key}\" is not expected here."),
+                    ),
+                },
+                Structure::Block(child) => {
+                    let position = self.locator.find_block_after(
+                        child.identifier(),
+                        &block_labels(child),
+                        block_position.line,
+                    );
+                    self.error_at(
+                        position,
+                        "Unsupported block",
+                        format!(
+                            "Blocks of type \"{}\" are not expected here.",
+                            child.identifier()
+                        ),
+                    );
+                }
+            }
+        }
+
+        let Some(target) = target else {
+            self.error_at(
+                block_position,
+                "Missing forward target",
+                format!("forward \"{kind}\".\"{name}\" requires target"),
+            );
+            return;
+        };
+        let Some(target_port) = target_port else {
+            self.error_at(
+                block_position,
+                "Missing forward target_port",
+                format!("forward \"{kind}\".\"{name}\" requires target_port"),
+            );
+            return;
+        };
+        if kind == "tailscale" && tunnel.is_none() {
+            self.error_at(
+                block_position,
+                "Missing forward tunnel",
+                format!("forward \"{kind}\".\"{name}\" requires tunnel"),
+            );
+        }
+
+        self.forwards.push(ForwardDecl {
+            kind,
+            name,
+            listen,
+            target,
+            target_port,
+            tunnel,
+            order: self.forwards.len(),
         });
     }
 
@@ -858,6 +1119,11 @@ impl<'a> DocumentBuilder<'a> {
                     credential.endpoint.clone(),
                 )
             })
+            .collect();
+        let tunnel_names: HashSet<String> = self
+            .tailscale
+            .iter()
+            .map(|tunnel| format!("tailscale.{}", tunnel.name))
             .collect();
 
         let credentials_snapshot = self.credentials.clone();
@@ -978,6 +1244,54 @@ impl<'a> DocumentBuilder<'a> {
                     );
                 }
             }
+            if let Some(tunnel) = &rule.tunnel {
+                if tunnel.kind != "tailscale" || !tunnel_names.contains(&tunnel.key()) {
+                    self.error_at(
+                        Position { line: 1, column: 1 },
+                        "Invalid rule",
+                        format!(
+                            "rule \"{}\" references unknown tunnel \"{}\"",
+                            rule.name,
+                            tunnel.key()
+                        ),
+                    );
+                }
+                if rule.verdict != Action::Allow {
+                    self.error_at(
+                        Position { line: 1, column: 1 },
+                        "Invalid rule",
+                        format!("rule \"{}\" tunnel requires verdict allow", rule.name),
+                    );
+                }
+            }
+        }
+
+        let forwards_snapshot = self.forwards.clone();
+        for forward in &forwards_snapshot {
+            if !valid_target_selector(&forward.target) {
+                self.error_at(
+                    Position { line: 1, column: 1 },
+                    "Invalid forward",
+                    format!(
+                        "forward \"{}\".\"{}\" target must start with name:, id:, or label:",
+                        forward.kind, forward.name
+                    ),
+                );
+            }
+            if let Some(tunnel) = &forward.tunnel {
+                if tunnel.kind != "tailscale" || !tunnel_names.contains(&tunnel.key()) {
+                    self.error_at(
+                        Position { line: 1, column: 1 },
+                        "Invalid forward",
+                        format!(
+                            "forward \"{}\".\"{}\" references unknown tunnel \"{}\"",
+                            forward.kind,
+                            forward.name,
+                            tunnel.key()
+                        ),
+                    );
+                }
+            }
         }
     }
 
@@ -1036,6 +1350,8 @@ impl<'a> DocumentBuilder<'a> {
             endpoints: self.endpoints,
             credentials: self.credentials,
             rules: self.rules,
+            tailscale: self.tailscale,
+            forwards: self.forwards,
         }
     }
 
@@ -1206,6 +1522,34 @@ fn decode_int(expression: &Expression) -> Result<i32, String> {
     }
 }
 
+fn decode_u16(expression: &Expression) -> Result<u16, String> {
+    let value = decode_int(expression)?;
+    if !(1..=u16::MAX as i32).contains(&value) {
+        return Err(format!("integer {value} is out of range"));
+    }
+    Ok(value as u16)
+}
+
+fn decode_size(expression: &Expression) -> Result<i64, String> {
+    match expression {
+        Expression::String(value) => parse_size(value),
+        Expression::Number(value) => {
+            let text = value.to_string();
+            if text.contains('.') {
+                return Err(format!("size {text} must be an integer"));
+            }
+            let parsed = text
+                .parse::<i64>()
+                .map_err(|_| format!("invalid size {text}"))?;
+            if parsed < 0 {
+                return Err(format!("invalid size {text}"));
+            }
+            Ok(parsed)
+        }
+        _ => Err("size string or integer required".to_owned()),
+    }
+}
+
 fn decode_string_list(expression: &Expression) -> Result<Vec<String>, String> {
     match expression {
         Expression::Array(values) => values.iter().map(decode_string).collect(),
@@ -1314,6 +1658,12 @@ fn valid_identifier(value: &str) -> bool {
 
 fn valid_http_header_name(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(http_header_token_byte)
+}
+
+fn valid_target_selector(value: &str) -> bool {
+    ["name:", "id:", "label:"]
+        .iter()
+        .any(|prefix| value.starts_with(prefix) && value.len() > prefix.len())
 }
 
 fn http_header_token_byte(value: u8) -> bool {

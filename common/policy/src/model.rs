@@ -84,6 +84,10 @@ pub struct PolicyDocument {
     pub endpoints: Vec<EndpointDecl>,
     pub credentials: Vec<CredentialDecl>,
     pub rules: Vec<RuleDecl>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tailscale: Vec<TailscaleDecl>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<ForwardDecl>,
 }
 
 impl PolicyDocument {
@@ -315,12 +319,39 @@ pub struct RuleDecl {
     pub endpoints: Vec<Ref>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<Ref>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<Ref>,
     pub verdict: Action,
     pub priority: i32,
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<ConditionDecl>,
     pub reason: String,
+    pub order: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TailscaleDecl {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hostname: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub control_url: String,
+    pub order: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardDecl {
+    pub kind: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub listen: String,
+    pub target: String,
+    pub target_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<Ref>,
     pub order: usize,
 }
 
