@@ -6,6 +6,7 @@ use libvm::MachineNetworkConfig;
 use utils::HumanSize;
 
 use crate::context::Context;
+use crate::network_policy::policy_source_display;
 use crate::profile::{
     parse_profile, validate_profile, MountMode, NamedProfile, Profile, ProfileMount,
     ProfileNetwork, ProfileResources, ProfileStore,
@@ -43,7 +44,7 @@ pub enum ProfileSubcommand {
     #[command(about = "Show a profile")]
     Show(ShowCmd),
     #[command(about = "Create a profile")]
-    Create(CreateCmd),
+    Create(Box<CreateCmd>),
     #[command(about = "Edit a profile in $EDITOR")]
     Edit(EditCmd),
     #[command(name = "rm", about = "Remove a profile")]
@@ -146,7 +147,7 @@ impl Cmd {
         match self.command {
             ProfileSubcommand::List(command) => list_profiles(&store, command),
             ProfileSubcommand::Show(command) => show_profile(&store, command),
-            ProfileSubcommand::Create(command) => create_profile(&store, command),
+            ProfileSubcommand::Create(command) => create_profile(&store, *command),
             ProfileSubcommand::Edit(command) => edit_profile(&store, command),
             ProfileSubcommand::Rm(command) => remove_profile(&store, command),
             ProfileSubcommand::Validate(command) => validate_profile_arg(&store, command),
@@ -329,7 +330,7 @@ fn format_profile_network(profile: &Profile) -> String {
         ProfileNetwork::Private { policy_ref: None } => "private".to_string(),
         ProfileNetwork::Private {
             policy_ref: Some(policy_ref),
-        } => format!("private (policy {})", policy_ref.as_str()),
+        } => format!("private (policy {})", policy_source_display(&policy_ref)),
         ProfileNetwork::None => "none".to_string(),
         ProfileNetwork::Named { name } => format!("named ({name})"),
     }
@@ -408,7 +409,9 @@ fn named_machine_network(name: &str) -> Result<MachineNetworkConfig, String> {
 
 fn machine_network_to_profile(network: MachineNetworkConfig) -> ProfileNetwork {
     match network {
-        MachineNetworkConfig::Private { policy_ref, .. } => ProfileNetwork::Private { policy_ref },
+        MachineNetworkConfig::Private { policy_ref, .. } => ProfileNetwork::Private {
+            policy_ref: policy_ref.map(|policy_ref| policy_ref.as_str().to_string()),
+        },
         MachineNetworkConfig::None => ProfileNetwork::None,
         MachineNetworkConfig::Named { name } => ProfileNetwork::Named { name },
         other => ProfileNetwork::Named { name: other.name() },
@@ -470,6 +473,7 @@ mod tests {
         let super::ProfileSubcommand::Create(create) = profile.command else {
             panic!("expected profile create command");
         };
+        let create = *create;
 
         assert_eq!(
             create.network,

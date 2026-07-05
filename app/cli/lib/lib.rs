@@ -6,6 +6,7 @@ pub mod context;
 pub mod errors;
 pub mod guest;
 pub mod help;
+mod network_policy;
 pub mod profile;
 pub mod terminal;
 pub mod ui;

@@ -110,8 +110,9 @@ impl VmOverrideArgs {
 
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
+        let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
         let progress = Spinner::start("Reading", "VM recipe");
-        let resolved = self.resolve()?;
+        let resolved = self.resolve(policy_config_dir.as_deref())?;
         let runtime = context.runtime().await?;
         progress.finish_clear();
         let image_source = parse_cli_image_source(&resolved.image_ref)?;
@@ -149,7 +150,7 @@ impl Cmd {
         Ok(())
     }
 
-    fn resolve(&self) -> eyre::Result<ResolvedCreate> {
+    fn resolve(&self, policy_config_dir: Option<&Path>) -> eyre::Result<ResolvedCreate> {
         if self.profile.is_some() && self.profile_name.is_some() {
             eyre::bail!("profile specified twice; use either positional profile or --profile");
         }
@@ -173,7 +174,7 @@ impl Cmd {
         let mut resolved_image_ref = if let Some(profile_name) = profile_name {
             let store = ProfileStore::from_env()?;
             let named = store.resolve(&profile_name)?;
-            network = named.profile.machine_network();
+            network = named.profile.machine_network(policy_config_dir)?;
             userdata = named.profile.userdata.clone();
             cpus = named.profile.cpus();
             memory_mib = named.profile.memory_mib()?;

@@ -63,8 +63,9 @@ impl Cmd {
             eyre::bail!("--keep-on-failure requires a command");
         }
 
+        let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
         let progress = Spinner::start("Reading", "run recipe");
-        let resolved = self.resolve()?;
+        let resolved = self.resolve(policy_config_dir.as_deref())?;
         let runtime = context.runtime().await?;
         progress.finish_clear();
         let image_source = parse_cli_image_source(&resolved.image_ref)?;
@@ -112,7 +113,7 @@ impl Cmd {
         std::process::exit(code);
     }
 
-    fn resolve(&self) -> eyre::Result<ResolvedRun> {
+    fn resolve(&self, policy_config_dir: Option<&std::path::Path>) -> eyre::Result<ResolvedRun> {
         if self.profile.is_some() && self.profile_name.is_some() {
             eyre::bail!("profile specified twice; use either positional profile or --profile");
         }
@@ -131,7 +132,7 @@ impl Cmd {
             let selected = selected_profile.unwrap_or_else(|| DEFAULT_PROFILE_NAME.to_string());
             let store = ProfileStore::from_env()?;
             let named = store.resolve(&selected)?;
-            network = named.profile.machine_network();
+            network = named.profile.machine_network(policy_config_dir)?;
             userdata = named.profile.userdata.clone();
             cpus = named.profile.cpus();
             memory_mib = named.profile.memory_mib()?;

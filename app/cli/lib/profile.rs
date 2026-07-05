@@ -2,12 +2,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use eyre::{bail, Context as _};
-use libvm::{MachineNetworkConfig, NetworkPolicyRef};
+use libvm::MachineNetworkConfig;
 use serde::{Deserialize, Serialize};
 use utils::HumanSize;
 use vm_spec::Mount;
 
 use crate::constants::{DEFAULT_PROFILE_IMAGE, DEFAULT_PROFILE_NAME};
+use crate::network_policy::resolve_network_policy_source;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct NamedProfile {
@@ -65,7 +66,7 @@ pub(crate) struct ProfileNetworkConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<serde_yaml_ng::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_ref: Option<NetworkPolicyRef>,
+    pub policy_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,7 +82,7 @@ pub(crate) enum ProfileNetworkKind {
 pub(crate) enum ProfileNetwork {
     Private {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        policy_ref: Option<NetworkPolicyRef>,
+        policy_ref: Option<String>,
     },
     None,
     Named {
@@ -213,14 +214,23 @@ impl Profile {
             .unwrap_or(ProfileNetwork::Private { policy_ref: None })
     }
 
-    pub fn machine_network(&self) -> MachineNetworkConfig {
+    pub fn machine_network(
+        &self,
+        policy_config_dir: Option<&Path>,
+    ) -> eyre::Result<MachineNetworkConfig> {
         match self.network() {
-            ProfileNetwork::Private { policy_ref } => MachineNetworkConfig::Private {
-                policy: None,
-                policy_ref,
-            },
-            ProfileNetwork::None => MachineNetworkConfig::None,
-            ProfileNetwork::Named { name } => MachineNetworkConfig::Named { name },
+            ProfileNetwork::Private { policy_ref } => {
+                let policy = policy_ref
+                    .as_deref()
+                    .map(|source| resolve_network_policy_source(source, policy_config_dir))
+                    .transpose()?;
+                Ok(MachineNetworkConfig::Private {
+                    policy,
+                    policy_ref: None,
+                })
+            }
+            ProfileNetwork::None => Ok(MachineNetworkConfig::None),
+            ProfileNetwork::Named { name } => Ok(MachineNetworkConfig::Named { name }),
         }
     }
 
@@ -300,6 +310,11 @@ fn normalize_network(raw: ProfileNetworkConfig) -> eyre::Result<ProfileNetwork> 
         bail!(
             "invalid network config: inline network.policy is no longer supported; use policy_ref"
         );
+    }
+    if let Some(policy_ref) = raw.policy_ref.as_deref() {
+        if policy_ref.trim().is_empty() {
+            bail!("invalid network config: policy_ref cannot be empty");
+        }
     }
     match (raw.kind, raw.name, raw.policy_ref) {
         (Some(ProfileNetworkKind::Private), Some(name), _) => bail!(
@@ -473,7 +488,7 @@ network:
                 crate::profile::ProfileNetwork::None => None,
             })
             .expect("network policy ref");
-        assert_eq!(policy_ref.as_str(), "github");
+        assert_eq!(policy_ref, "github");
     }
 
     #[test]

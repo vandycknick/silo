@@ -1,7 +1,8 @@
 use clap::{Args, Subcommand};
-use libvm::{MachineNetworkConfig, MachineRef, NetworkDriver, NetworkPolicyRef, NetworkTopology};
+use libvm::{MachineNetworkConfig, MachineRef, NetworkDriver, NetworkTopology};
 
 use crate::context::Context;
+use crate::network_policy::resolve_network_policy_source;
 use crate::ui::{self, OutputFormat, Table};
 
 const EXAMPLES: &[&str] = &[
@@ -33,7 +34,7 @@ enum NetworkSubcommand {
     #[command(name = "rm", about = "Remove a named network")]
     Rm(RmCmd),
     #[command(about = "Set a VM's network config")]
-    Set(SetCmd),
+    Set(Box<SetCmd>),
 }
 
 #[derive(Debug, Args)]
@@ -91,8 +92,8 @@ struct SetCmd {
     network: MachineNetworkConfig,
 
     /// Network policy to apply to private networks.
-    #[arg(long, value_name = "POLICY", value_parser = parse_network_policy_ref)]
-    policy: Option<NetworkPolicyRef>,
+    #[arg(long, value_name = "POLICY")]
+    policy: Option<String>,
 }
 
 impl Cmd {
@@ -102,7 +103,7 @@ impl Cmd {
             NetworkSubcommand::Show(command) => show_network(context, command).await,
             NetworkSubcommand::Create(command) => create_network(context, command).await,
             NetworkSubcommand::Rm(command) => remove_network(context, command).await,
-            NetworkSubcommand::Set(command) => set_machine_network(context, command).await,
+            NetworkSubcommand::Set(command) => set_machine_network(context, *command).await,
         }
     }
 }
@@ -180,7 +181,12 @@ async fn remove_network(context: &mut Context, command: RmCmd) -> eyre::Result<(
 }
 
 async fn set_machine_network(context: &mut Context, command: SetCmd) -> eyre::Result<()> {
-    let network = machine_network_with_policy(command.network, command.policy)?;
+    let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
+    let network = machine_network_with_policy(
+        command.network,
+        command.policy.as_deref(),
+        policy_config_dir.as_deref(),
+    )?;
     let runtime = context.runtime().await?;
     let machine = runtime
         .get_machine(&MachineRef::parse(command.vm.clone())?)
@@ -199,12 +205,20 @@ async fn set_machine_network(context: &mut Context, command: SetCmd) -> eyre::Re
 
 fn machine_network_with_policy(
     network: MachineNetworkConfig,
-    policy_ref: Option<NetworkPolicyRef>,
+    policy_source: Option<&str>,
+    policy_config_dir: Option<&std::path::Path>,
 ) -> eyre::Result<MachineNetworkConfig> {
-    match (network, policy_ref) {
-        (MachineNetworkConfig::Private { .. }, policy_ref) => Ok(MachineNetworkConfig::Private {
+    match (network, policy_source) {
+        (MachineNetworkConfig::Private { .. }, Some(source)) => {
+            let policy = resolve_network_policy_source(source, policy_config_dir)?;
+            Ok(MachineNetworkConfig::Private {
+                policy: Some(policy),
+                policy_ref: None,
+            })
+        }
+        (MachineNetworkConfig::Private { .. }, None) => Ok(MachineNetworkConfig::Private {
             policy: None,
-            policy_ref,
+            policy_ref: None,
         }),
         (network, None) => Ok(network),
         (_, Some(_)) => eyre::bail!("--policy is only supported with private networks"),
@@ -244,10 +258,6 @@ fn parse_driver(input: &str) -> Result<NetworkDriver, String> {
     }
 }
 
-fn parse_network_policy_ref(input: &str) -> Result<NetworkPolicyRef, String> {
-    NetworkPolicyRef::new(input)
-}
-
 fn format_network_topology(topology: NetworkTopology) -> &'static str {
     match topology {
         NetworkTopology::Nat => "nat",
@@ -268,8 +278,10 @@ fn format_driver(driver: NetworkDriver) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use clap::Parser;
-    use libvm::{MachineNetworkConfig, NetworkPolicyRef};
+    use libvm::MachineNetworkConfig;
 
     use crate::app::Cli;
     use crate::commands::Command;
@@ -309,56 +321,46 @@ mod tests {
     }
 
     #[test]
-    fn network_set_rejects_invalid_policy_ref() {
-        let result = Cli::try_parse_from([
-            "bento",
-            "network",
-            "set",
-            "devbox",
-            "private",
-            "--policy",
-            "policies/github.hcl",
-        ]);
-
-        let err = match result {
-            Ok(_) => panic!("relative policy paths should be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains("relative network policy paths"));
-    }
-
-    #[test]
     fn machine_network_policy_applies_to_private_network() {
-        let policy_ref = NetworkPolicyRef::new("github").expect("policy ref");
+        let policy_dir = write_named_policy("github");
         let network = machine_network_with_policy(
             MachineNetworkConfig::Private {
                 policy: None,
                 policy_ref: None,
             },
-            Some(policy_ref.clone()),
+            Some("github"),
+            Some(policy_dir.path()),
         )
         .expect("policy should apply");
 
-        assert_eq!(
-            network,
-            MachineNetworkConfig::Private {
-                policy: None,
-                policy_ref: Some(policy_ref),
-            }
-        );
+        let MachineNetworkConfig::Private { policy, policy_ref } = network else {
+            panic!("expected private network");
+        };
+        assert_eq!(policy.expect("policy").metadata["source"], "test");
+        assert_eq!(policy_ref, None);
     }
 
     #[test]
     fn machine_network_policy_rejects_none_network() {
-        let policy_ref = NetworkPolicyRef::new("github").expect("policy ref");
-        let err = machine_network_with_policy(MachineNetworkConfig::None, Some(policy_ref))
+        let err = machine_network_with_policy(MachineNetworkConfig::None, Some("github"), None)
             .expect_err("policy should be rejected");
 
         assert_eq!(
             err.to_string(),
             "--policy is only supported with private networks"
         );
+    }
+
+    #[test]
+    fn machine_network_policy_rejects_relative_path() {
+        let err = machine_network_with_policy(
+            MachineNetworkConfig::private(),
+            Some("policies/github.hcl"),
+            None,
+        )
+        .expect_err("relative path should fail");
+
+        assert!(err.to_string().contains("relative network policy paths"));
     }
 
     fn network_set_cmd(args: impl IntoIterator<Item = &'static str>) -> super::SetCmd {
@@ -369,6 +371,18 @@ mod tests {
         let NetworkSubcommand::Set(set) = network.command else {
             panic!("expected network set command");
         };
-        set
+        *set
+    }
+
+    fn write_named_policy(name: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let policies = dir.path().join("policies");
+        fs::create_dir(&policies).expect("create policies dir");
+        fs::write(
+            policies.join(format!("{name}.json")),
+            r#"{ "version": 1, "metadata": { "source": "test" } }"#,
+        )
+        .expect("write policy");
+        dir
     }
 }
