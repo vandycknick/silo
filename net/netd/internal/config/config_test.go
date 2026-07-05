@@ -56,15 +56,17 @@ func TestLoadPolicyUsesDefaultPolicyWithoutHash(t *testing.T) {
 
 func TestLoadPolicyRequiresTLSCAForHTTPSEndpoints(t *testing.T) {
 	dir := t.TempDir()
-	policyPath := filepath.Join(dir, "policy.hcl")
+	policyPath := filepath.Join(dir, "policy.json")
 	writeConfigPolicy(t, policyPath, `
-endpoint "https" "github" {
-  hosts = ["api.github.com"]
-}
-
-rule "allow-github" {
-  endpoint = https.github
-  verdict = "allow"
+{
+  "version": 1,
+  "metadata": {},
+  "settings": {"default_action": "allow", "audit": {"body_buffer_bytes": 1048576, "body_storage_bytes": 4096}},
+  "endpoints": [{"kind": "https", "name": "github", "hosts": ["api.github.com"]}],
+  "credentials": [],
+  "rules": [{"name": "allow-github", "endpoints": ["github"], "verdict": "allow", "priority": 0, "disabled": false}],
+  "tailscale": [],
+  "forwards": []
 }
 `)
 
@@ -83,19 +85,17 @@ rule "allow-github" {
 
 func TestLoadPolicyDoesNotRequireSecretStoreForCredentials(t *testing.T) {
 	dir := t.TempDir()
-	policyPath := filepath.Join(dir, "policy.hcl")
+	policyPath := filepath.Join(dir, "policy.json")
 	writeConfigPolicy(t, policyPath, `
-endpoint "https" "github" {
-  hosts = ["api.github.com"]
-}
-
-credential "bearer_token" "github" {
-  endpoint = https.github
-}
-
-rule "allow-github" {
-  endpoint = https.github
-  verdict = "allow"
+{
+  "version": 1,
+  "metadata": {},
+  "settings": {"default_action": "allow", "audit": {"body_buffer_bytes": 1048576, "body_storage_bytes": 4096}},
+  "endpoints": [{"kind": "https", "name": "github", "hosts": ["api.github.com"]}],
+  "credentials": [{"kind": "bearer_token", "name": "github", "endpoint": "github"}],
+  "rules": [{"name": "allow-github", "endpoints": ["github"], "verdict": "allow", "priority": 0, "disabled": false}],
+  "tailscale": [],
+  "forwards": []
 }
 `)
 

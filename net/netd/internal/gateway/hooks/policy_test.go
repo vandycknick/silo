@@ -4,14 +4,13 @@ import (
 	"context"
 	"net"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/policy"
+	"github.com/vandycknick/bentobox/net/netd/internal/policy/policytest"
 )
 
 func TestPolicyHookCarriesL4MatchMetadata(t *testing.T) {
-	compiled, err := policy.LoadReader("policy.hcl", strings.NewReader(`
+	compiled := policytest.LoadPolicy(t, `
 settings {
   default_action = "deny"
 }
@@ -26,10 +25,7 @@ rule "allow-app" {
   endpoint = ip.app
   verdict = "allow"
 }
-`))
-	if err != nil {
-		t.Fatalf("LoadReader returned error: %v", err)
-	}
+`)
 
 	decision, err := NewPolicyHook(compiled).Decide(context.Background(), Flow{
 		Protocol: "tcp",
@@ -53,7 +49,7 @@ rule "allow-app" {
 }
 
 func TestPolicyHookCarriesCredentialMetadata(t *testing.T) {
-	compiled, err := policy.LoadReader("policy.hcl", strings.NewReader(`
+	compiled := policytest.LoadPolicy(t, `
 settings {
   default_action = "deny"
 }
@@ -72,10 +68,7 @@ rule "allow-api" {
   endpoint = https.api
   verdict = "allow"
 }
-`))
-	if err != nil {
-		t.Fatalf("LoadReader returned error: %v", err)
-	}
+`)
 
 	decision, err := NewPolicyHook(compiled).DecideHTTP(context.Background(), HTTPRequest{
 		EndpointKind: "https",

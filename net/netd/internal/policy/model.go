@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/vandycknick/bentobox/net/netd/internal/policy/hostmatch"
-	"github.com/vandycknick/bentobox/net/netd/internal/policy/native"
 )
 
 type Action string
@@ -60,10 +59,8 @@ func (r Ref) zero() bool {
 }
 
 type Policy struct {
-	Documents   []PolicyDocument
 	diagnostics []Diagnostic
-	native      *native.Policy
-	policyHash  string
+	metadata    map[string]any
 
 	DefaultAction Action
 
@@ -71,6 +68,10 @@ type Policy struct {
 	httpEndpoints  map[string]*HTTPEndpoint
 	httpsEndpoints map[string]*HTTPEndpoint
 	credentials    map[string]*Credential
+
+	endpointRefsByName   map[string]Ref
+	credentialRefsByName map[string]Ref
+	tailscaleByName      map[string]struct{}
 
 	credentialsByEndpoint map[string][]*Credential
 	exactHTTPBindings     map[string]Ref
@@ -147,7 +148,8 @@ type Rule struct {
 }
 
 type httpCondition struct {
-	id uint32
+	source  string
+	program conditionProgram
 }
 
 type Flow struct {
@@ -195,16 +197,28 @@ func newPolicy() *Policy {
 		httpEndpoints:         make(map[string]*HTTPEndpoint),
 		httpsEndpoints:        make(map[string]*HTTPEndpoint),
 		credentials:           make(map[string]*Credential),
+		endpointRefsByName:    make(map[string]Ref),
+		credentialRefsByName:  make(map[string]Ref),
+		tailscaleByName:       make(map[string]struct{}),
 		credentialsByEndpoint: make(map[string][]*Credential),
 		exactHTTPBindings:     make(map[string]Ref),
 	}
 }
 
 func (p *Policy) PolicyHash() string {
-	if p == nil {
-		return ""
+	return ""
+
+}
+
+func (p *Policy) Metadata() map[string]any {
+	if p == nil || len(p.metadata) == 0 {
+		return nil
 	}
-	return p.policyHash
+	metadata := make(map[string]any, len(p.metadata))
+	for key, value := range p.metadata {
+		metadata[key] = value
+	}
+	return metadata
 }
 
 func (p *Policy) Diagnostics() []Diagnostic {
@@ -217,11 +231,6 @@ func (p *Policy) Diagnostics() []Diagnostic {
 }
 
 func (p *Policy) Close() {
-	if p == nil || p.native == nil {
-		return
-	}
-	p.native.Close()
-	p.native = nil
 }
 
 func (p *Policy) HasHTTP() bool {

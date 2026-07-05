@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/vandycknick/bentobox/net/netd/internal/policy/hostmatch"
-	"github.com/vandycknick/bentobox/net/netd/internal/policy/native"
 )
 
 type LoadError struct {
@@ -66,7 +66,7 @@ func LoadFile(path string) (*Policy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read policy file %s: %w", path, err)
 	}
-	return loadSource(path, source)
+	return loadCanonicalSource(path, source)
 }
 
 func LoadReader(filename string, reader io.Reader) (*Policy, error) {
@@ -74,85 +74,89 @@ func LoadReader(filename string, reader io.Reader) (*Policy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read policy source %s: %w", filename, err)
 	}
-	return loadSource(filename, source)
+	return loadCanonicalSource(filename, source)
 }
 
-func loadSource(filename string, source []byte) (*Policy, error) {
-	// Rust owns parsing, structural validation, diagnostics, and CEL compilation.
-	// The returned native handle keeps the compiled CEL programs alive. The JSON
-	// snapshot is only the document-shaped data Go needs to rebuild the existing
-	// runtime evaluator maps and rule lists.
-	nativePolicy, status, errorJSON, err := native.ParseSource(filename, source)
-	if err != nil {
-		return nil, err
+func loadCanonicalSource(filename string, source []byte) (*Policy, error) {
+	var raw struct {
+		Metadata json.RawMessage `json:"metadata"`
 	}
-	return loadNativePolicy(filename, nativePolicy, status, errorJSON)
+	if err := json.Unmarshal(source, &raw); err == nil && !emptyMetadata(raw.Metadata) {
+		trimmedMetadata := bytes.TrimSpace(raw.Metadata)
+		if !bytes.HasPrefix(trimmedMetadata, []byte("{")) {
+			return nil, &LoadError{Filename: filename, Diagnostics: []Diagnostic{{Severity: "error", Summary: "Invalid metadata", Detail: "metadata must be a JSON object", File: filename, Line: 1, Column: 1}}}
+		}
+		var metadata map[string]any
+		if err := json.Unmarshal(trimmedMetadata, &metadata); err != nil {
+			return nil, &LoadError{Filename: filename, Diagnostics: []Diagnostic{{Severity: "error", Summary: "Invalid metadata", Detail: "metadata must be a JSON object", File: filename, Line: 1, Column: 1}}}
+		}
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(source))
+	decoder.DisallowUnknownFields()
+	var document networkPolicyFile
+	if err := decoder.Decode(&document); err != nil {
+		return nil, &LoadError{Filename: filename, Diagnostics: []Diagnostic{{Severity: "error", Summary: "Invalid policy JSON", Detail: err.Error(), File: filename, Line: 1, Column: 1}}}
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil, &LoadError{Filename: filename, Diagnostics: []Diagnostic{{Severity: "error", Summary: "Invalid policy JSON", Detail: "policy file must contain exactly one JSON document", File: filename, Line: 1, Column: 1}}}
+	}
+	return compileNetworkPolicy(filename, document)
 }
 
-func loadNativePolicy(filename string, nativePolicy *native.Policy, status native.Status, errorJSON []byte) (*Policy, error) {
-	if status == native.StatusLoadError {
-		return nil, decodeLoadError(filename, errorJSON)
-	}
-	if status != native.StatusOK {
-		return nil, fmt.Errorf("parse policy source %s failed with status %d: %s", filename, status, string(errorJSON))
-	}
-
-	snapshotJSON, err := nativePolicy.SnapshotJSON()
-	if err != nil {
-		nativePolicy.Close()
-		return nil, err
-	}
-	var snapshot policySnapshot
-	if err := json.Unmarshal(snapshotJSON, &snapshot); err != nil {
-		nativePolicy.Close()
-		return nil, fmt.Errorf("decode policy snapshot: %w", err)
-	}
-	compiled, err := compileSnapshot(filename, snapshot, nativePolicy)
-	if err != nil {
-		nativePolicy.Close()
-		return nil, err
-	}
-	return compiled, nil
-}
-
-func decodeLoadError(filename string, payload []byte) error {
-	var loadErr LoadError
-	if err := json.Unmarshal(payload, &loadErr); err != nil || len(loadErr.Diagnostics) == 0 {
-		return &LoadError{Filename: filename, Diagnostics: []Diagnostic{{Severity: "error", Summary: "Invalid policy", Detail: string(payload), File: filename, Line: 1, Column: 1}}}
-	}
-	if loadErr.Filename == "" {
-		loadErr.Filename = filename
-	}
-	return &loadErr
-}
-
-func compileSnapshot(filename string, snapshot policySnapshot, nativePolicy *native.Policy) (*Policy, error) {
-	if snapshot.PolicyHash == "" {
-		return nil, fmt.Errorf("policy snapshot %s missing policy_hash", filename)
+func compileNetworkPolicy(filename string, document networkPolicyFile) (*Policy, error) {
+	if document.Version != 1 {
+		return nil, compileLoadError(filename, "Unsupported policy version", fmt.Sprintf("policy version must be 1, got %d", document.Version))
 	}
 	compiled := newPolicy()
-	compiled.native = nativePolicy
-	compiled.policyHash = snapshot.PolicyHash
-	compiled.Documents = snapshot.Documents
-	compiled.diagnostics = append(compiled.diagnostics, snapshot.Diagnostics...)
-	if len(snapshot.Documents) == 0 {
-		return compiled, nil
-	}
-	for _, document := range snapshot.Documents {
+	compiled.metadata = document.metadataCopy()
+	if document.Settings.DefaultAction != "" {
 		compiled.DefaultAction = document.Settings.DefaultAction
-		for _, endpoint := range document.Endpoints {
-			if err := compiled.addEndpointDecl(endpoint); err != nil {
-				return nil, compileLoadError(filename, "Invalid endpoint", err.Error())
-			}
+	}
+	if compiled.DefaultAction != ActionAllow && compiled.DefaultAction != ActionDeny {
+		return nil, compileLoadError(filename, "Invalid settings", fmt.Sprintf("unsupported default_action %q", compiled.DefaultAction))
+	}
+	if document.Settings.Audit.BodyBufferBytes > 0 && document.Settings.Audit.BodyStorageBytes > 0 && document.Settings.Audit.BodyBufferBytes < document.Settings.Audit.BodyStorageBytes {
+		compiled.diagnostics = append(compiled.diagnostics, Diagnostic{Severity: "warning", Summary: "Audit body buffer is smaller than storage sample", Detail: "body_buffer_bytes is smaller than body_storage_bytes; response/request bodies may truncate before the configured stored sample size", File: filename, Line: 1, Column: 1})
+	}
+	for _, endpoint := range document.Endpoints {
+		if err := compiled.addEndpointDecl(endpoint); err != nil {
+			return nil, compileLoadError(filename, "Invalid endpoint", err.Error())
 		}
-		for _, credential := range document.Credentials {
-			if err := compiled.addCredentialDecl(credential); err != nil {
-				return nil, compileLoadError(filename, "Invalid credential", err.Error())
-			}
+	}
+	for _, tunnel := range document.Tailscale {
+		if tunnel.Name == "" {
+			return nil, compileLoadError(filename, "Invalid tailscale tunnel", "name is required")
 		}
-		for _, rule := range document.Rules {
-			if err := compiled.addRuleDecl(rule); err != nil {
-				return nil, compileLoadError(filename, "Invalid rule", err.Error())
+		if _, ok := compiled.tailscaleByName[tunnel.Name]; ok {
+			return nil, compileLoadError(filename, "Invalid tailscale tunnel", fmt.Sprintf("duplicate tailscale tunnel %q", tunnel.Name))
+		}
+		compiled.tailscaleByName[tunnel.Name] = struct{}{}
+	}
+	for _, credential := range document.Credentials {
+		if err := compiled.addCredentialDecl(credential); err != nil {
+			return nil, compileLoadError(filename, "Invalid credential", err.Error())
+		}
+	}
+	for index, rule := range document.Rules {
+		if err := compiled.addRuleDecl(rule, index); err != nil {
+			return nil, compileLoadError(filename, "Invalid rule", err.Error())
+		}
+	}
+	for _, forward := range document.Forwards {
+		if forward.Name == "" {
+			return nil, compileLoadError(filename, "Invalid forward", "name is required")
+		}
+		if forward.Kind != "host" && forward.Kind != "tailscale" {
+			return nil, compileLoadError(filename, "Invalid forward", fmt.Sprintf("unsupported forward kind %q", forward.Kind))
+		}
+		if forward.Kind == "tailscale" {
+			if forward.Tunnel == "" {
+				return nil, compileLoadError(filename, "Invalid forward", fmt.Sprintf("tailscale forward %q requires tunnel", forward.Name))
+			}
+			if _, ok := compiled.tailscaleByName[forward.Tunnel]; !ok {
+				return nil, compileLoadError(filename, "Invalid forward", fmt.Sprintf("forward %q references unknown tailscale tunnel %q", forward.Name, forward.Tunnel))
 			}
 		}
 	}
@@ -174,12 +178,18 @@ type rawIPEndpoint struct {
 func (p *Policy) addEndpointDecl(decl EndpointDecl) error {
 	ref := Ref{Kind: decl.Kind, Name: decl.Name}
 	key := ref.String()
+	if decl.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if _, ok := p.endpointRefsByName[decl.Name]; ok {
+		return fmt.Errorf("duplicate endpoint name %q", decl.Name)
+	}
 	switch decl.Kind {
 	case "ip":
 		if _, ok := p.ipEndpoints[key]; ok {
 			return fmt.Errorf("Endpoint %q is already defined.", key)
 		}
-		endpoint, err := compileIPEndpoint(decl.Name, rawIPEndpoint{Source: decl.Source, Destination: decl.Destination, Protocol: decl.Protocol, Ports: decl.Ports})
+		endpoint, err := compileIPEndpoint(decl.Name, rawIPEndpoint{Source: decl.SourceCIDRs, Destination: decl.DestinationCIDRs, Protocol: decl.Protocol, Ports: decl.Ports})
 		if err != nil {
 			return fmt.Errorf("decode endpoint %q: %v", key, err)
 		}
@@ -211,6 +221,7 @@ func (p *Policy) addEndpointDecl(decl EndpointDecl) error {
 	default:
 		return fmt.Errorf("unsupported endpoint kind %q", decl.Kind)
 	}
+	p.endpointRefsByName[decl.Name] = ref
 	return nil
 }
 
@@ -281,7 +292,7 @@ func normalizePortRanges(ranges []PortRange) []PortRange {
 
 func compileHTTPEndpointDecl(kind string, name string, transport Transport, defaultPort uint16, hosts []string) (*HTTPEndpoint, error) {
 	if len(hosts) == 0 {
-		return nil, fmt.Errorf("hosts is required")
+		return nil, fmt.Errorf("Missing hosts: hosts is required")
 	}
 	endpoint := &HTTPEndpoint{Kind: kind, Name: name, Family: EndpointFamilyHTTP, Transport: transport, DefaultPort: defaultPort}
 	seen := make(map[string]struct{})
@@ -327,11 +338,21 @@ func (p *Policy) addCredentialDecl(decl CredentialDecl) error {
 	if !knownCredentialKind(decl.Kind) {
 		return fmt.Errorf("unsupported credential kind %q", decl.Kind)
 	}
-	if decl.Endpoint.Kind != "https" {
+	if decl.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if _, ok := p.credentialRefsByName[decl.Name]; ok {
+		return fmt.Errorf("duplicate credential name %q", decl.Name)
+	}
+	endpoint, ok := p.endpointRefsByName[decl.Endpoint]
+	if !ok {
+		return fmt.Errorf("credential %q.%q references unknown endpoint %q", decl.Kind, decl.Name, decl.Endpoint)
+	}
+	if endpoint.Kind != "https" {
 		return fmt.Errorf("credential %q.%q must reference an https endpoint", decl.Kind, decl.Name)
 	}
-	if _, ok := p.httpsEndpoints[decl.Endpoint.String()]; !ok {
-		return fmt.Errorf("credential %q.%q references unknown endpoint %q", decl.Kind, decl.Name, decl.Endpoint.String())
+	if _, ok := p.httpsEndpoints[endpoint.String()]; !ok {
+		return fmt.Errorf("credential %q.%q references unknown endpoint %q", decl.Kind, decl.Name, endpoint.String())
 	}
 	key := Ref{Kind: decl.Kind, Name: decl.Name}.String()
 	if _, ok := p.credentials[key]; ok {
@@ -340,19 +361,24 @@ func (p *Policy) addCredentialDecl(decl CredentialDecl) error {
 	credential := &Credential{
 		Kind:           decl.Kind,
 		Name:           decl.Name,
-		Endpoint:       decl.Endpoint,
+		Endpoint:       endpoint,
 		Username:       decl.Username,
 		Header:         decl.Header,
 		Prefix:         decl.Prefix,
 		IdempotencyKey: decl.IdempotencyKey,
 		policy:         p,
 	}
-	if decl.Condition != nil {
-		credential.Condition = decl.Condition.Source
-		credential.condition = &httpCondition{id: decl.Condition.ID}
+	if decl.Condition != "" {
+		condition, err := compileHTTPCondition(decl.Condition)
+		if err != nil {
+			return fmt.Errorf("credential %q.%q condition is invalid: %w", decl.Kind, decl.Name, err)
+		}
+		credential.Condition = decl.Condition
+		credential.condition = condition
 	}
 	p.credentials[key] = credential
-	p.credentialsByEndpoint[decl.Endpoint.String()] = append(p.credentialsByEndpoint[decl.Endpoint.String()], credential)
+	p.credentialRefsByName[decl.Name] = Ref{Kind: decl.Kind, Name: decl.Name}
+	p.credentialsByEndpoint[endpoint.String()] = append(p.credentialsByEndpoint[endpoint.String()], credential)
 	return nil
 }
 
@@ -365,26 +391,57 @@ func knownCredentialKind(kind string) bool {
 	}
 }
 
-func (p *Policy) addRuleDecl(decl RuleDecl) error {
-	family, err := p.validateEndpointFamily(decl.Endpoints)
+func (p *Policy) addRuleDecl(decl RuleDecl, order int) error {
+	endpoints := make([]Ref, 0, len(decl.Endpoints))
+	for _, name := range decl.Endpoints {
+		endpoint, ok := p.endpointRefsByName[name]
+		if !ok {
+			return fmt.Errorf("rule %q references unknown endpoint %q", decl.Name, name)
+		}
+		endpoints = append(endpoints, endpoint)
+	}
+	family, err := p.validateEndpointFamily(endpoints)
 	if err != nil {
 		return fmt.Errorf("rule %q: %w", decl.Name, err)
+	}
+	var credentialRef *Ref
+	if decl.Credential != "" {
+		credential, ok := p.credentialRefsByName[decl.Credential]
+		if !ok {
+			return fmt.Errorf("rule %q references unknown credential %q", decl.Name, decl.Credential)
+		}
+		credentialRef = &credential
+	}
+	if decl.Tunnel != "" {
+		if _, ok := p.tailscaleByName[decl.Tunnel]; !ok {
+			return fmt.Errorf("rule %q references unknown tailscale tunnel %q", decl.Name, decl.Tunnel)
+		}
+		if decl.Verdict != ActionAllow {
+			return fmt.Errorf("rule %q tunnel is only valid on allow rules", decl.Name)
+		}
+	}
+	if decl.Verdict != ActionAllow && decl.Verdict != ActionDeny {
+		return fmt.Errorf("rule %q has unsupported verdict %q", decl.Name, decl.Verdict)
 	}
 	rule := &Rule{
 		Name:       decl.Name,
 		Family:     family,
-		Endpoints:  decl.Endpoints,
-		Credential: decl.Credential,
+		Endpoints:  endpoints,
+		Credential: credentialRef,
 		Verdict:    decl.Verdict,
 		Priority:   decl.Priority,
 		Disabled:   decl.Disabled,
 		Reason:     decl.Reason,
-		order:      decl.Order,
+		order:      order,
 		policy:     p,
 	}
-	if decl.Condition != nil {
-		rule.Condition = decl.Condition.Source
-		rule.condition = &httpCondition{id: decl.Condition.ID}
+	if decl.Condition != "" {
+		condition, err := compileHTTPCondition(decl.Condition)
+		if err != nil {
+			return fmt.Errorf("rule %q condition is invalid: %w", decl.Name, err)
+		}
+		rule.Condition = decl.Condition
+		rule.condition = condition
 	}
 	if err := p.validateRuleCredential(rule); err != nil {
 		return err

@@ -3,11 +3,11 @@ package policy
 import (
 	"fmt"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/vandycknick/bentobox/net/netd/internal/policy/hostmatch"
-	"github.com/vandycknick/bentobox/net/netd/internal/policy/native"
 )
 
 func (p *Policy) EvaluateFlow(flow Flow) Decision {
@@ -239,32 +239,37 @@ func (c *Credential) matchesHTTPWithEvaluator(evaluator *httpConditionEvaluator)
 type httpConditionEvaluator struct {
 	policy  *Policy
 	request HTTPRequest
-	context *native.HTTPContext
+	context map[string]any
 	err     error
 }
 
 func newHTTPConditionEvaluator(policy *Policy, request HTTPRequest) *httpConditionEvaluator {
-	// Go owns the request decision flow. Rust only evaluates compiled HTTP CEL
-	// programs by id, so this helper lazily builds one Rust-owned request context
-	// and reuses it for all credential/rule conditions checked for the request.
 	return &httpConditionEvaluator{policy: policy, request: request}
 }
 
 func (e *httpConditionEvaluator) Evaluate(condition *httpCondition) (bool, error) {
-	if condition == nil || condition.id == 0 {
+	if condition == nil || condition.program == nil {
 		return true, nil
 	}
-	if e == nil || e.policy == nil || e.policy.native == nil {
-		return false, fmt.Errorf("policy condition %d is unavailable", condition.id)
+	if e == nil {
+		return false, fmt.Errorf("policy condition %q is unavailable", condition.source)
 	}
 	context, err := e.Context()
 	if err != nil {
 		return false, err
 	}
-	return e.policy.native.EvaluateHTTPCondition(condition.id, context)
+	result, _, err := condition.program.Eval(contextWithConditionDefaults(context, condition.source))
+	if err != nil {
+		return false, err
+	}
+	matches, ok := result.Value().(bool)
+	if !ok {
+		return false, fmt.Errorf("policy condition %q returned %T", condition.source, result.Value())
+	}
+	return matches, nil
 }
 
-func (e *httpConditionEvaluator) Context() (*native.HTTPContext, error) {
+func (e *httpConditionEvaluator) Context() (map[string]any, error) {
 	if e.context != nil || e.err != nil {
 		return e.context, e.err
 	}
@@ -273,27 +278,18 @@ func (e *httpConditionEvaluator) Context() (*native.HTTPContext, error) {
 		e.err = err
 		return nil, err
 	}
-	context, err := native.NewHTTPContext(native.HTTPConditionContextInput{
-		Method:  strings.ToLower(e.request.Method),
-		Host:    normalizedRequestHost(e.request),
-		Path:    e.request.Path,
-		Query:   query,
-		Headers: headersForCEL(e.request.Header),
-	})
-	if err != nil {
-		e.err = err
-		return nil, err
+	context := map[string]any{
+		"http.method":  strings.ToUpper(e.request.Method),
+		"http.host":    normalizedRequestHost(e.request),
+		"http.path":    e.request.Path,
+		"http.query":   query,
+		"http.headers": headersForCEL(e.request.Header),
 	}
 	e.context = context
 	return context, nil
 }
 
 func (e *httpConditionEvaluator) Close() {
-	if e == nil || e.context == nil {
-		return
-	}
-	e.context.Close()
-	e.context = nil
 }
 
 func normalizedRequestHost(request HTTPRequest) string {
@@ -315,6 +311,44 @@ func queryForCEL(rawQuery string) (map[string][]string, error) {
 
 func headersForCEL(header map[string][]string) map[string][]string {
 	return normalizedStringListMap(header, strings.ToLower)
+}
+
+var celMapLookupPattern = regexp.MustCompile(`http\.(query|headers)\[['"]([^'"]+)['"]\]`)
+
+func contextWithConditionDefaults(context map[string]any, source string) map[string]any {
+	matches := celMapLookupPattern.FindAllStringSubmatch(source, -1)
+	if len(matches) == 0 {
+		return context
+	}
+	copyContext := make(map[string]any, len(context))
+	for key, value := range context {
+		copyContext[key] = value
+	}
+	for _, match := range matches {
+		mapKey := "http." + match[1]
+		lookup := match[2]
+		values, ok := copyContext[mapKey].(map[string][]string)
+		if !ok {
+			continue
+		}
+		copyValues := make(map[string][]string, len(values)+1)
+		for key, value := range values {
+			copyValues[key] = value
+		}
+		if _, ok := copyValues[lookup]; !ok {
+			if match[1] == "headers" {
+				if value, ok := copyValues[strings.ToLower(lookup)]; ok {
+					copyValues[lookup] = value
+				} else {
+					copyValues[lookup] = []string{}
+				}
+			} else {
+				copyValues[lookup] = []string{}
+			}
+		}
+		copyContext[mapKey] = copyValues
+	}
+	return copyContext
 }
 
 func normalizedStringListMap(source map[string][]string, normalize func(string) string) map[string][]string {

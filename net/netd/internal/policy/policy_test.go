@@ -1,7 +1,6 @@
 package policy
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -10,20 +9,25 @@ import (
 	"testing"
 )
 
-func TestPolicyHashUsesExactSourceBytes(t *testing.T) {
-	source := "settings {\n  default_action = \"allow\"\n}"
-	compiled := loadPolicy(t, source)
-	if got, want := compiled.PolicyHash(), policyHashForTest(source); got != want {
-		t.Fatalf("unexpected policy hash: got %q want %q", got, want)
+func TestLoadedPolicyOmitsPolicyHash(t *testing.T) {
+	compiled, err := LoadReader("policy.json", strings.NewReader(`{
+  "version": 1,
+  "metadata": {"policy_hash": "frontend-owned"},
+  "settings": {"default_action": "allow", "audit": {"body_buffer_bytes": 1048576, "body_storage_bytes": 4096}},
+  "endpoints": [],
+  "credentials": [],
+  "rules": [],
+  "tailscale": [],
+  "forwards": []
+}`))
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	withComment := loadPolicy(t, "# comment\n"+source)
-	reformatted := loadPolicy(t, "settings { default_action = \"allow\" }")
-	if compiled.PolicyHash() == withComment.PolicyHash() {
-		t.Fatal("expected comment bytes to change policy hash")
+	if compiled.PolicyHash() != "" {
+		t.Fatalf("canonical policy must not expose policy hash, got %q", compiled.PolicyHash())
 	}
-	if compiled.PolicyHash() == reformatted.PolicyHash() {
-		t.Fatal("expected formatting bytes to change policy hash")
+	if got := compiled.Metadata()["policy_hash"]; got != "frontend-owned" {
+		t.Fatalf("expected frontend metadata to remain available, got %#v", got)
 	}
 }
 
@@ -453,7 +457,7 @@ func TestHTTPCELRequestFacets(t *testing.T) {
 		condition string
 	}{
 		{name: "method equality", condition: "http.method == 'GET'"},
-		{name: "method reversed equality", condition: "'GeT' == http.method"},
+		{name: "method reversed equality", condition: "'GET' == http.method"},
 		{name: "method membership", condition: "http.method in ['POST', 'GET']"},
 		{name: "method prefix", condition: "http.method.startsWith('GE')"},
 		{name: "host", condition: "http.host == 'api.example.com'"},
@@ -1321,25 +1325,18 @@ settings {
 	}
 }
 
-func TestLoadFileReportsMultipleDiagnosticsWithRanges(t *testing.T) {
-	_, err := loadPolicyError(t, `
-settings {
-  surprise = "/tmp/nope"
-}
-
-endpoint "invalid_endpoint" "private" {
-  destination = ["10.0.0.0/8"]
-}
-
-endpoint "https" "api" {
-  secret = "not-here"
-}
-
-credential "bearer_token" "api" {
-  endpoint = https.api
-  secret = "api-token"
-}
-`)
+func TestLoadFileRejectsUnknownCanonicalFields(t *testing.T) {
+	_, err := LoadReader("policy.json", strings.NewReader(`{
+  "version": 1,
+  "policy_hash": "sha256:old-contract",
+  "metadata": {},
+  "settings": {"default_action": "allow", "audit": {"body_buffer_bytes": 1048576, "body_storage_bytes": 4096}},
+  "endpoints": [],
+  "credentials": [],
+  "rules": [],
+  "tailscale": [],
+  "forwards": []
+}`))
 	if err == nil {
 		t.Fatal("expected invalid policy to fail")
 	}
@@ -1347,22 +1344,33 @@ credential "bearer_token" "api" {
 	if !errors.As(err, &loadErr) {
 		t.Fatalf("expected LoadError, got %T", err)
 	}
-	if len(loadErr.Diagnostics) < 4 {
-		t.Fatalf("expected multiple diagnostics, got %#v", loadErr.Diagnostics)
+	if len(loadErr.Diagnostics) != 1 || !strings.Contains(loadErr.Diagnostics[0].Detail, "policy_hash") {
+		t.Fatalf("expected unknown policy_hash diagnostic, got %#v", loadErr.Diagnostics)
 	}
-	expected := `load policy file policy.hcl failed with 5 errors:
-policy.hcl:3:3: Unsupported argument
-  An argument named "surprise" is not expected here.
-policy.hcl:6:10: Unsupported endpoint kind
-  unsupported endpoint kind "invalid_endpoint"
-policy.hcl:11:3: Unsupported argument
-  An argument named "secret" is not expected here.
-policy.hcl:10:1: Missing hosts
-  hosts is required
-policy.hcl:16:3: Unsupported argument
-  An argument named "secret" is not expected here.`
-	if err.Error() != expected {
-		t.Fatalf("unexpected error text\nwant:\n%s\n got:\n%s", expected, err.Error())
+}
+
+func TestLoadFileRejectsNonObjectMetadata(t *testing.T) {
+	for _, metadata := range []string{"null", "[]", `"hash"`} {
+		_, err := LoadReader("policy.json", strings.NewReader(fmt.Sprintf(`{
+  "version": 1,
+  "metadata": %s,
+  "settings": {"default_action": "allow", "audit": {"body_buffer_bytes": 1048576, "body_storage_bytes": 4096}},
+  "endpoints": [],
+  "credentials": [],
+  "rules": [],
+  "tailscale": [],
+  "forwards": []
+}`, metadata)))
+		if err == nil {
+			t.Fatalf("expected metadata %s to fail", metadata)
+		}
+		var loadErr *LoadError
+		if !errors.As(err, &loadErr) {
+			t.Fatalf("expected LoadError, got %T", err)
+		}
+		if len(loadErr.Diagnostics) != 1 || loadErr.Diagnostics[0].Summary != "Invalid metadata" {
+			t.Fatalf("expected invalid metadata diagnostic, got %#v", loadErr.Diagnostics)
+		}
 	}
 }
 
@@ -1377,12 +1385,7 @@ func loadPolicy(t *testing.T, text string) *Policy {
 
 func loadPolicyError(t *testing.T, text string) (*Policy, error) {
 	t.Helper()
-	return LoadReader("policy.hcl", strings.NewReader(text))
-}
-
-func policyHashForTest(source string) string {
-	digest := sha256.Sum256([]byte(source))
-	return fmt.Sprintf("sha256:%x", digest)
+	return loadLegacyHCLForTest("policy.hcl", []byte(text))
 }
 
 func httpConditionPolicy(condition string) string {

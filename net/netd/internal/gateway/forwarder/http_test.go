@@ -20,6 +20,7 @@ import (
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/router"
 	"github.com/vandycknick/bentobox/net/netd/internal/policy"
+	"github.com/vandycknick/bentobox/net/netd/internal/policy/policytest"
 )
 
 func TestHTTPProxyInterceptsAllowedRequest(t *testing.T) {
@@ -894,16 +895,7 @@ func testRouteWithAudit(t *testing.T, text string) (*router.Router, *audit.Logge
 
 func testPolicy(t *testing.T, text string) *policy.Policy {
 	t.Helper()
-	dir := t.TempDir()
-	policyPath := filepath.Join(dir, "policy.hcl")
-	if err := os.WriteFile(policyPath, []byte(text), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	compiled, err := policy.LoadFile(policyPath)
-	if err != nil {
-		t.Fatalf("LoadFile returned error: %v", err)
-	}
-	return compiled
+	return policytest.LoadPolicy(t, text)
 }
 
 func readForwarderAuditEvent(t *testing.T, path string) audit.Event {

@@ -1,18 +1,6 @@
 package policy
 
-type PolicyDocument struct {
-	ID          uint32           `json:"id"`
-	Source      SourceFile       `json:"source"`
-	Diagnostics []Diagnostic     `json:"diagnostics"`
-	Settings    SettingsDecl     `json:"settings"`
-	Endpoints   []EndpointDecl   `json:"endpoints"`
-	Credentials []CredentialDecl `json:"credentials"`
-	Rules       []RuleDecl       `json:"rules"`
-}
-
-type SourceFile struct {
-	Filename string `json:"filename"`
-}
+import "encoding/json"
 
 type Diagnostic struct {
 	Severity string `json:"severity"`
@@ -24,61 +12,87 @@ type Diagnostic struct {
 	Column   int    `json:"column"`
 }
 
+type networkPolicyFile struct {
+	Version     int                  `json:"version"`
+	Metadata    map[string]any       `json:"metadata"`
+	Settings    SettingsDecl         `json:"settings"`
+	Endpoints   []EndpointDecl       `json:"endpoints"`
+	Credentials []CredentialDecl     `json:"credentials"`
+	Rules       []RuleDecl           `json:"rules"`
+	Tailscale   []TailscaleDecl      `json:"tailscale"`
+	Forwards    []NetworkForwardDecl `json:"forwards"`
+}
+
 type SettingsDecl struct {
-	DefaultAction Action             `json:"default_action"`
-	Audit         *AuditSettingsDecl `json:"audit,omitempty"`
+	DefaultAction Action            `json:"default_action"`
+	Audit         AuditSettingsDecl `json:"audit"`
 }
 
 type AuditSettingsDecl struct {
-	BodyBuffer  int64 `json:"body_buffer"`
-	BodyStorage int64 `json:"body_storage"`
+	BodyBufferBytes  int64 `json:"body_buffer_bytes"`
+	BodyStorageBytes int64 `json:"body_storage_bytes"`
 }
 
 type EndpointDecl struct {
-	Kind        string         `json:"kind"`
-	Name        string         `json:"name"`
-	Family      EndpointFamily `json:"family"`
-	Transport   Transport      `json:"transport"`
-	DefaultPort uint16         `json:"default_port"`
-	Source      []string       `json:"source,omitempty"`
-	Destination []string       `json:"destination,omitempty"`
-	Protocol    string         `json:"protocol,omitempty"`
-	Ports       []PortRange    `json:"ports,omitempty"`
-	Hosts       []string       `json:"hosts,omitempty"`
-	Order       int            `json:"order"`
-}
-
-type ConditionDecl struct {
-	ID     uint32 `json:"id"`
-	Source string `json:"source"`
+	Kind             string      `json:"kind"`
+	Name             string      `json:"name"`
+	SourceCIDRs      []string    `json:"source_cidrs"`
+	DestinationCIDRs []string    `json:"destination_cidrs"`
+	Protocol         string      `json:"protocol"`
+	Ports            []PortRange `json:"ports"`
+	Hosts            []string    `json:"hosts"`
 }
 
 type CredentialDecl struct {
-	Kind           string         `json:"kind"`
-	Name           string         `json:"name"`
-	Endpoint       Ref            `json:"endpoint"`
-	Username       string         `json:"username,omitempty"`
-	Header         string         `json:"header,omitempty"`
-	Prefix         string         `json:"prefix,omitempty"`
-	IdempotencyKey bool           `json:"idempotency_key,omitempty"`
-	Condition      *ConditionDecl `json:"condition,omitempty"`
-	Order          int            `json:"order"`
+	Kind           string `json:"kind"`
+	Name           string `json:"name"`
+	Endpoint       string `json:"endpoint"`
+	Username       string `json:"username,omitempty"`
+	Header         string `json:"header,omitempty"`
+	Prefix         string `json:"prefix,omitempty"`
+	IdempotencyKey bool   `json:"idempotency_key,omitempty"`
+	Condition      string `json:"condition,omitempty"`
 }
 
 type RuleDecl struct {
-	Name       string         `json:"name"`
-	Endpoints  []Ref          `json:"endpoints"`
-	Credential *Ref           `json:"credential,omitempty"`
-	Verdict    Action         `json:"verdict"`
-	Priority   int            `json:"priority"`
-	Disabled   bool           `json:"disabled"`
-	Condition  *ConditionDecl `json:"condition,omitempty"`
-	Reason     string         `json:"reason"`
-	Order      int            `json:"order"`
+	Name       string   `json:"name,omitempty"`
+	Endpoints  []string `json:"endpoints"`
+	Credential string   `json:"credential,omitempty"`
+	Condition  string   `json:"condition,omitempty"`
+	Tunnel     string   `json:"tunnel,omitempty"`
+	Verdict    Action   `json:"verdict"`
+	Priority   int      `json:"priority"`
+	Disabled   bool     `json:"disabled"`
+	Reason     string   `json:"reason"`
 }
 
-type policySnapshot struct {
-	PolicyHash  string           `json:"policy_hash"`
-	Documents   []PolicyDocument `json:"documents"`
-	Diagnostics []Diagnostic     `json:"diagnostics"`
+type TailscaleDecl struct {
+	Name       string   `json:"name"`
+	Tags       []string `json:"tags"`
+	Hostname   string   `json:"hostname,omitempty"`
+	ControlURL string   `json:"control_url,omitempty"`
+}
+
+type NetworkForwardDecl struct {
+	Name       string `json:"name"`
+	Kind       string `json:"kind"`
+	Target     string `json:"target"`
+	TargetPort uint16 `json:"target_port"`
+	Listen     string `json:"listen,omitempty"`
+	Tunnel     string `json:"tunnel,omitempty"`
+}
+
+func (p networkPolicyFile) metadataCopy() map[string]any {
+	if len(p.Metadata) == 0 {
+		return nil
+	}
+	copy := make(map[string]any, len(p.Metadata))
+	for key, value := range p.Metadata {
+		copy[key] = value
+	}
+	return copy
+}
+
+func emptyMetadata(raw json.RawMessage) bool {
+	return len(raw) == 0
 }

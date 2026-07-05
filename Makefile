@@ -83,8 +83,7 @@ krun:
 .PHONY: netd
 netd:
 	@mkdir -p "target/$(TARGET_PROFILE_DIR)"
-	cargo build $(CARGO_PROFILE_FLAGS) -p policy --features ffi
-	cd net/netd && CGO_ENABLED=1 CGO_LDFLAGS="-L$(CURDIR)/target/$(TARGET_PROFILE_DIR) -lbento_policy" go build $(GO_BUILD_FLAGS) -o "$(CURDIR)/$(NETD_BIN)" ./cmd/netd
+	cd net/netd && go build $(GO_BUILD_FLAGS) -o "$(CURDIR)/$(NETD_BIN)" ./cmd/netd
 
 .PHONY: policy-header
 policy-header:

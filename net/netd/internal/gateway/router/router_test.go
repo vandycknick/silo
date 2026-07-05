@@ -13,6 +13,7 @@ import (
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/audit"
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
 	"github.com/vandycknick/bentobox/net/netd/internal/policy"
+	"github.com/vandycknick/bentobox/net/netd/internal/policy/policytest"
 )
 
 func TestRecordFlowWritesIPAuditRecord(t *testing.T) {
@@ -399,13 +400,5 @@ func isUUIDv7(value string) bool {
 
 func loadRouterPolicy(t *testing.T, text string) *policy.Policy {
 	t.Helper()
-	policyPath := filepath.Join(t.TempDir(), "policy.hcl")
-	if err := os.WriteFile(policyPath, []byte(text), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	compiled, err := policy.LoadFile(policyPath)
-	if err != nil {
-		t.Fatalf("LoadFile returned error: %v", err)
-	}
-	return compiled
+	return policytest.LoadPolicy(t, text)
 }

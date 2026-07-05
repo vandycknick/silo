@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -17,11 +16,15 @@ import (
 
 func TestLogPolicyDiagnosticsUsesServiceLogger(t *testing.T) {
 	compiled := loadMainPolicy(t, `
-settings {
-  audit {
-    body_buffer = "1KiB"
-    body_storage = "4KiB"
-  }
+{
+  "version": 1,
+  "metadata": {},
+  "settings": {"default_action": "allow", "audit": {"body_buffer_bytes": 1024, "body_storage_bytes": 4096}},
+  "endpoints": [],
+  "credentials": [],
+  "rules": [],
+  "tailscale": [],
+  "forwards": []
 }
 `)
 	var output bytes.Buffer
@@ -35,7 +38,7 @@ settings {
 	if !strings.Contains(logLine, `"msg":"policy load warning"`) {
 		t.Fatalf("expected policy warning log message, got %q", logLine)
 	}
-	if !strings.Contains(logLine, "settings.audit.body_buffer") {
+	if !strings.Contains(logLine, "body_buffer_bytes") {
 		t.Fatalf("expected warning text in service log, got %q", logLine)
 	}
 }
@@ -103,15 +106,16 @@ func TestReportStartupErrorWritesGenericJSONLine(t *testing.T) {
 }
 
 func TestReportStartupErrorWritesPolicyJSONLines(t *testing.T) {
-	_, err := policy.LoadReader("policy.hcl", strings.NewReader(`
-endpoint "invalid_endpoint" "private" {
-  destination = ["10.0.0.0/8"]
-}
-
-credential "bearer_token" "api" {
-  secret = "api-token"
-}
-`))
+	_, err := policy.LoadReader("policy.json", strings.NewReader(`{
+  "version": 1,
+  "metadata": {},
+  "settings": {"default_action": "allow", "audit": {"body_buffer_bytes": 1048576, "body_storage_bytes": 4096}},
+  "endpoints": [{"kind": "invalid_endpoint", "name": "private", "destination_cidrs": ["10.0.0.0/8"]}],
+  "credentials": [],
+  "rules": [],
+  "tailscale": [],
+  "forwards": []
+}`))
 	if err == nil {
 		t.Fatal("expected invalid policy")
 	}
@@ -120,11 +124,9 @@ credential "bearer_token" "api" {
 	writeErrorRecords(&output, err)
 	records := decodeErrorRecords(t, output.String())
 	expected := []errorRecord{
-		{Type: "policy_error", Message: "Unsupported endpoint kind", Detail: `unsupported endpoint kind "invalid_endpoint"`, File: "policy.hcl", Line: 2, Column: 10},
-		{Type: "policy_error", Message: "Unsupported argument", Detail: `An argument named "secret" is not expected here.`, File: "policy.hcl", Line: 7, Column: 3},
-		{Type: "policy_error", Message: "Missing credential endpoint", Detail: `credential "bearer_token"."api" requires endpoint`, File: "policy.hcl", Line: 6, Column: 1},
+		{Type: "policy_error", Message: "Invalid endpoint", Detail: `unsupported endpoint kind "invalid_endpoint"`, File: "policy.json", Line: 1, Column: 1},
 	}
-	if !reflect.DeepEqual(records, expected) {
+	if len(records) != len(expected) || records[0] != expected[0] {
 		t.Fatalf("unexpected policy error records\nwant %#v\n got %#v", expected, records)
 	}
 }
@@ -149,7 +151,7 @@ func decodeErrorRecords(t *testing.T, text string) []errorRecord {
 
 func loadMainPolicy(t *testing.T, text string) *policy.Policy {
 	t.Helper()
-	compiled, err := policy.LoadReader("policy.hcl", strings.NewReader(text))
+	compiled, err := policy.LoadReader("policy.json", strings.NewReader(text))
 	if err != nil {
 		t.Fatalf("LoadFile returned error: %v", err)
 	}
