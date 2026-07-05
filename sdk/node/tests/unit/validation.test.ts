@@ -53,18 +53,20 @@ describe("runtime options", () => {
 });
 
 describe("Network", () => {
-  it("converts private policy refs to native input", () => {
-    expect(networkToNative({ kind: "private", policyRef: "github" })).toEqual({
+  const policyJson = `{ "version": 1, "metadata": { "source": "test" } }`;
+
+  it("converts private policy JSON to native input", () => {
+    expect(networkToNative({ kind: "private", policyJson })).toEqual({
       kind: "private",
-      policyRef: "github",
+      policyJson,
     });
   });
 
-  it("rejects empty private policy refs", () => {
-    expect(() => networkToNative({ kind: "private", policyRef: "" })).toThrow(TypeError);
+  it("rejects empty private policy JSON", () => {
+    expect(() => networkToNative({ kind: "private", policyJson: "" })).toThrow(TypeError);
   });
 
-  it("converts private policy refs from native machine data", () => {
+  it("converts private policy JSON from native machine data", () => {
     expect(
       machineDataFromNative({
         id: "machine-id",
@@ -75,11 +77,11 @@ describe("Network", () => {
         imageRef: "ubuntu:24.04",
         labels: [],
         metadata: [],
-        network: { kind: "private", policyRef: "github" },
+        network: { kind: "private", policyJson },
         status: { kind: "stopped" },
         updatedAt: 1,
       }).network,
-    ).toEqual({ kind: "private", policyRef: "github" });
+    ).toEqual({ kind: "private", policyJson });
   });
 });
 

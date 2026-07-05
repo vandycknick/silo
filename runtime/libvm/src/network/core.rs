@@ -4,19 +4,14 @@ use bento_policy::NetworkPolicy;
 use crate::paths::LocalPaths;
 use crate::store::models::MachineConfig;
 use crate::store::DataStore;
-use crate::{LibVmError, NetworkLaunch, NetworkPolicyRef, RuntimeNetworkingConfig};
+use crate::{LibVmError, NetworkLaunch, RuntimeNetworkingConfig};
 
 use super::VmmonNetworkAttachment;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NetworkAttachmentTarget<'a> {
-    Private {
-        policy: Option<&'a NetworkPolicy>,
-        policy_ref: Option<&'a NetworkPolicyRef>,
-    },
-    Named {
-        definition_name: &'a str,
-    },
+    Private { policy: Option<&'a NetworkPolicy> },
+    Named { definition_name: &'a str },
 }
 
 pub(super) struct NetworkAttachmentRequest<'a> {
@@ -24,12 +19,9 @@ pub(super) struct NetworkAttachmentRequest<'a> {
 }
 
 impl<'a> NetworkAttachmentRequest<'a> {
-    pub(super) fn private(
-        policy: Option<&'a NetworkPolicy>,
-        policy_ref: Option<&'a NetworkPolicyRef>,
-    ) -> Self {
+    pub(super) fn private(policy: Option<&'a NetworkPolicy>) -> Self {
         Self {
-            target: NetworkAttachmentTarget::Private { policy, policy_ref },
+            target: NetworkAttachmentTarget::Private { policy },
         }
     }
 
@@ -39,16 +31,9 @@ impl<'a> NetworkAttachmentRequest<'a> {
         }
     }
 
-    pub(super) fn policy_ref(&self) -> Option<&'a NetworkPolicyRef> {
-        match self.target {
-            NetworkAttachmentTarget::Private { policy_ref, .. } => policy_ref,
-            NetworkAttachmentTarget::Named { .. } => None,
-        }
-    }
-
     pub(super) fn policy(&self) -> Option<&'a NetworkPolicy> {
         match self.target {
-            NetworkAttachmentTarget::Private { policy, .. } => policy,
+            NetworkAttachmentTarget::Private { policy } => policy,
             NetworkAttachmentTarget::Named { .. } => None,
         }
     }

@@ -3205,7 +3205,6 @@ mod tests {
             .expect("set network policy");
 
         assert_eq!(updated.network.policy(), Some(&policy));
-        assert!(updated.network.policy_ref().is_none());
 
         let cleared = machine_handle(&runtime, machine.id)
             .update(MachineUpdate::new().clear_network_policy())
@@ -3213,7 +3212,6 @@ mod tests {
             .expect("clear network policy");
 
         assert!(cleared.network.policy().is_none());
-        assert!(cleared.network.policy_ref().is_none());
     }
 
     #[tokio::test]

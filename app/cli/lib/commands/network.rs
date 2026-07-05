@@ -213,13 +213,11 @@ fn machine_network_with_policy(
             let policy = resolve_network_policy_source(source, policy_config_dir)?;
             Ok(MachineNetworkConfig::Private {
                 policy: Some(policy),
-                policy_ref: None,
             })
         }
-        (MachineNetworkConfig::Private { .. }, None) => Ok(MachineNetworkConfig::Private {
-            policy: None,
-            policy_ref: None,
-        }),
+        (MachineNetworkConfig::Private { .. }, None) => {
+            Ok(MachineNetworkConfig::Private { policy: None })
+        }
         (network, None) => Ok(network),
         (_, Some(_)) => eyre::bail!("--policy is only supported with private networks"),
     }
@@ -310,13 +308,7 @@ mod tests {
         ]);
 
         assert_eq!(set.vm, "devbox");
-        assert_eq!(
-            set.network,
-            MachineNetworkConfig::Private {
-                policy: None,
-                policy_ref: None,
-            }
-        );
+        assert_eq!(set.network, MachineNetworkConfig::Private { policy: None });
         assert_eq!(set.policy.expect("policy").as_str(), "github");
     }
 
@@ -324,20 +316,16 @@ mod tests {
     fn machine_network_policy_applies_to_private_network() {
         let policy_dir = write_named_policy("github");
         let network = machine_network_with_policy(
-            MachineNetworkConfig::Private {
-                policy: None,
-                policy_ref: None,
-            },
+            MachineNetworkConfig::Private { policy: None },
             Some("github"),
             Some(policy_dir.path()),
         )
         .expect("policy should apply");
 
-        let MachineNetworkConfig::Private { policy, policy_ref } = network else {
+        let MachineNetworkConfig::Private { policy } = network else {
             panic!("expected private network");
         };
         assert_eq!(policy.expect("policy").metadata["source"], "test");
-        assert_eq!(policy_ref, None);
     }
 
     #[test]

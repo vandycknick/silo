@@ -61,8 +61,8 @@ export interface Mount {
 
 /** Machine network attachment. */
 export type Network =
-  /** Private NAT-backed network, optionally constrained by a named policy or absolute `.hcl` policy path. */
-  | { kind: "private"; policyRef?: string }
+  /** Private NAT-backed network, optionally constrained by canonical NetworkPolicy JSON. */
+  | { kind: "private"; policyJson?: string }
   /** No network attachment. */
   | { kind: "none" }
   /** Attach to a named network. */

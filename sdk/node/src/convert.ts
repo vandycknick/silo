@@ -80,7 +80,7 @@ export function networkToNative(network: Network): NativeNetworkInput {
     case "private":
       return {
         kind,
-        policyRef: optionalNonEmptyString(record.policyRef, "network.policyRef"),
+        policyJson: optionalNonEmptyString(record.policyJson, "network.policyJson"),
       };
     case "none":
       return { kind };
@@ -233,8 +233,8 @@ function imageLayerFromNative(layer: NativeImageLayerDetail): ImageLayerDetail {
 
 function networkFromNative(network: NativeNetworkData): Network {
   if (network.kind === "private") {
-    const policyRef = optionalNullableNonEmptyString(network.policyRef, "network.policyRef");
-    return policyRef === undefined ? { kind: "private" } : { kind: "private", policyRef };
+    const policyJson = optionalNullableNonEmptyString(network.policyJson, "network.policyJson");
+    return policyJson === undefined ? { kind: "private" } : { kind: "private", policyJson };
   }
   if (network.kind === "named") {
     return { kind: "named", name: network.name ?? "" };

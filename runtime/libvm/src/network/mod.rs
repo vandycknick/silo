@@ -6,15 +6,12 @@ mod api;
 mod builder;
 mod core;
 mod netd_driver;
-mod policy;
 mod vznat_driver;
 
 pub use api::{
     MachineNetworkConfig, NetworkDefinition, NetworkDriver, NetworkDriverKind, NetworkTopology,
-    PrivateNetworkPolicy,
 };
 pub use builder::NetworkBuilder;
-pub use policy::NetworkPolicyRef;
 
 pub(crate) use api::validate_network_name;
 
@@ -83,8 +80,8 @@ pub(crate) async fn prepare_network_runtime(
             remove_attached_network(paths, store, metadata.id).await?;
             Ok(VmmonNetworkAttachment::None)
         }
-        ModelMachineNetworkConfig::Private { policy, policy_ref } => {
-            let request = NetworkAttachmentRequest::private(policy.as_ref(), policy_ref.as_ref());
+        ModelMachineNetworkConfig::Private { policy } => {
+            let request = NetworkAttachmentRequest::private(policy.as_ref());
             prepare_with_driver(
                 selected_private_driver(config.private_driver),
                 &NetworkDriverContext {

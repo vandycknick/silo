@@ -404,7 +404,6 @@ mod tests {
     fn private_network(policy: NetworkPolicy) -> MachineNetworkConfig {
         MachineNetworkConfig::Private {
             policy: Some(policy),
-            policy_ref: None,
         }
     }
 

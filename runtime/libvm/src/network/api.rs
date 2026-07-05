@@ -4,7 +4,6 @@ use bento_policy::NetworkPolicy;
 
 use crate::store::models;
 use crate::utils::{validate_identifier, IdentifierPolicy};
-use crate::NetworkPolicyRef;
 
 const RESERVED_NETWORK_NAMES: &[&str] = &["private", "none"];
 
@@ -33,12 +32,6 @@ pub enum MachineNetworkConfig {
         /// Resolved canonical policy for the private network.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy: Option<NetworkPolicy>,
-        /// Optional policy reference for the private network.
-        ///
-        /// This is a temporary compatibility field while CLI policy source
-        /// resolution moves out of libvm.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        policy_ref: Option<NetworkPolicyRef>,
     },
     /// Start the machine with no network attachment.
     None,
@@ -51,57 +44,21 @@ pub enum MachineNetworkConfig {
 
 impl Default for MachineNetworkConfig {
     fn default() -> Self {
-        Self::Private {
-            policy: None,
-            policy_ref: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PrivateNetworkPolicy {
-    Policy(NetworkPolicy),
-    Ref(NetworkPolicyRef),
-}
-
-impl From<NetworkPolicy> for PrivateNetworkPolicy {
-    fn from(value: NetworkPolicy) -> Self {
-        Self::Policy(value)
-    }
-}
-
-impl From<NetworkPolicyRef> for PrivateNetworkPolicy {
-    fn from(value: NetworkPolicyRef) -> Self {
-        Self::Ref(value)
+        Self::Private { policy: None }
     }
 }
 
 impl MachineNetworkConfig {
     /// Creates the default private network config.
     pub fn private() -> Self {
-        Self::Private {
-            policy: None,
-            policy_ref: None,
-        }
+        Self::Private { policy: None }
     }
 
     /// Creates a private network config with a network policy.
-    pub fn private_with_policy(policy: impl Into<PrivateNetworkPolicy>) -> Self {
-        match policy.into() {
-            PrivateNetworkPolicy::Policy(policy) => Self::Private {
-                policy: Some(policy),
-                policy_ref: None,
-            },
-            PrivateNetworkPolicy::Ref(policy_ref) => Self::Private {
-                policy: None,
-                policy_ref: Some(policy_ref),
-            },
+    pub fn private_with_policy(policy: NetworkPolicy) -> Self {
+        Self::Private {
+            policy: Some(policy),
         }
-    }
-
-    /// Creates a private network config with a temporary policy reference.
-    pub fn private_with_policy_ref(policy_ref: NetworkPolicyRef) -> Self {
-        Self::private_with_policy(policy_ref)
     }
 
     /// Creates a no-network config.
@@ -130,14 +87,6 @@ impl MachineNetworkConfig {
         }
     }
 
-    /// Returns the configured private-network policy reference, when present.
-    pub fn policy_ref(&self) -> Option<&NetworkPolicyRef> {
-        match self {
-            Self::Private { policy_ref, .. } => policy_ref.as_ref(),
-            Self::None | Self::Named { .. } => None,
-        }
-    }
-
     /// Returns the configured private-network policy, when present.
     pub fn policy(&self) -> Option<&NetworkPolicy> {
         match self {
@@ -150,9 +99,7 @@ impl MachineNetworkConfig {
 impl From<MachineNetworkConfig> for models::MachineNetworkConfig {
     fn from(value: MachineNetworkConfig) -> Self {
         match value {
-            MachineNetworkConfig::Private { policy, policy_ref } => {
-                Self::Private { policy, policy_ref }
-            }
+            MachineNetworkConfig::Private { policy } => Self::Private { policy },
             MachineNetworkConfig::None => Self::None,
             MachineNetworkConfig::Named { name } => Self::Named { name },
         }
@@ -162,9 +109,7 @@ impl From<MachineNetworkConfig> for models::MachineNetworkConfig {
 impl From<models::MachineNetworkConfig> for MachineNetworkConfig {
     fn from(value: models::MachineNetworkConfig) -> Self {
         match value {
-            models::MachineNetworkConfig::Private { policy, policy_ref } => {
-                Self::Private { policy, policy_ref }
-            }
+            models::MachineNetworkConfig::Private { policy } => Self::Private { policy },
             models::MachineNetworkConfig::None => Self::None,
             models::MachineNetworkConfig::Named { name } => Self::Named { name },
         }

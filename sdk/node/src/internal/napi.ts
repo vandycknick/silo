@@ -105,7 +105,7 @@ export interface NativeMountInput {
 export interface NativeNetworkInput {
   kind: "private" | "none" | "named";
   name?: string;
-  policyRef?: string;
+  policyJson?: string;
 }
 
 export interface NativeExecOptionsInput {
@@ -156,7 +156,7 @@ export interface NativeMachineStatus {
 export interface NativeNetworkData {
   kind: "private" | "none" | "named" | "unknown";
   name?: string | null;
-  policyRef?: string | null;
+  policyJson?: string | null;
 }
 
 export interface NativeExitStatus {

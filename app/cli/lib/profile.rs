@@ -224,10 +224,7 @@ impl Profile {
                     .as_deref()
                     .map(|source| resolve_network_policy_source(source, policy_config_dir))
                     .transpose()?;
-                Ok(MachineNetworkConfig::Private {
-                    policy,
-                    policy_ref: None,
-                })
+                Ok(MachineNetworkConfig::Private { policy })
             }
             ProfileNetwork::None => Ok(MachineNetworkConfig::None),
             ProfileNetwork::Named { name } => Ok(MachineNetworkConfig::Named { name }),
@@ -467,7 +464,7 @@ mod tests {
     use crate::profile::parse_profile;
 
     #[test]
-    fn parses_private_network_policy_ref() {
+    fn parses_private_network_policy_source() {
         let profile = parse_profile(
             r#"
 version: "1"

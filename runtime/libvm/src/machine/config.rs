@@ -178,15 +178,13 @@ fn apply_network_policy_update(
     update: NetworkPolicyUpdate,
 ) -> Result<(), String> {
     match network {
-        ModelMachineNetworkConfig::Private { policy, policy_ref } => {
+        ModelMachineNetworkConfig::Private { policy } => {
             match update {
                 NetworkPolicyUpdate::Set(next) => {
                     *policy = Some(next.normalized());
-                    *policy_ref = None;
                 }
                 NetworkPolicyUpdate::Clear => {
                     *policy = None;
-                    *policy_ref = None;
                 }
             }
             Ok(())

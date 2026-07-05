@@ -20,7 +20,7 @@ impl NetworkDriverBackend for VzNatDriver {
         reference: &str,
         request: &NetworkAttachmentRequest<'_>,
     ) -> Result<(), LibVmError> {
-        if request.policy().is_some() || request.policy_ref().is_some() {
+        if request.policy().is_some() {
             return Err(LibVmError::NetworkRuntime {
                 reference: reference.to_string(),
                 message: "vznat does not support network policy".to_string(),
@@ -57,10 +57,8 @@ mod tests {
     use crate::store::models::MachineId;
     use crate::store::models::{MachineConfig, MachineNetworkConfig};
     use crate::store::MockDataStore;
-    use crate::{NetdRuntimeConfig, RuntimeNetworkingConfig};
+    use crate::{NetdRuntimeConfig, NetworkPolicy, RuntimeNetworkingConfig};
     use vm_spec::VmSpec;
-
-    use crate::NetworkPolicyRef;
 
     fn machine_from_path(id: MachineId, name: String, machine_dir: &Path) -> MachineConfig {
         let spec = sample_vm_spec();
@@ -89,7 +87,7 @@ mod tests {
         let driver = VzNatDriver;
 
         driver
-            .supports("devbox", &NetworkAttachmentRequest::private(None, None))
+            .supports("devbox", &NetworkAttachmentRequest::private(None))
             .expect("private vznat should be supported");
         driver
             .supports("devbox", &NetworkAttachmentRequest::named("devnet"))
@@ -99,12 +97,10 @@ mod tests {
     #[test]
     fn vznat_driver_rejects_network_policies() {
         let driver = VzNatDriver;
-        let policy_ref = NetworkPolicyRef::new("private").expect("policy ref");
+        let policy =
+            NetworkPolicy::from_json_str(r#"{ "version": 1, "metadata": {} }"#).expect("policy");
 
-        let result = driver.supports(
-            "devbox",
-            &NetworkAttachmentRequest::private(None, Some(&policy_ref)),
-        );
+        let result = driver.supports("devbox", &NetworkAttachmentRequest::private(Some(&policy)));
 
         assert!(result.is_err());
     }

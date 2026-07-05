@@ -8,7 +8,7 @@ use libvm::{
     ExecSink, ExitStatus, ImageDetail, ImageHandle, ImageLayerDetail, ImagePruneReport,
     ImagePullOptions, ImagePullPolicy, ImageRemoveOptions, ImageSource, Images, LibVmError,
     Machine, MachineBuilder, MachineData, MachineNetworkConfig, MachineRef, MachineStatus, Memory,
-    NetworkPolicyRef, Runtime, RuntimeConfig,
+    NetworkPolicy, Runtime, RuntimeConfig,
 };
 use napi::bindgen_prelude::Uint8Array;
 use napi::{Error, Result, Status};
@@ -49,7 +49,7 @@ pub struct NativeMountInput {
 pub struct NativeNetworkInput {
     pub kind: String,
     pub name: Option<String>,
-    pub policy_ref: Option<String>,
+    pub policy_json: Option<String>,
 }
 
 #[napi(object)]
@@ -105,7 +105,7 @@ pub struct NativeMachineStatus {
 pub struct NativeNetworkData {
     pub kind: String,
     pub name: Option<String>,
-    pub policy_ref: Option<String>,
+    pub policy_json: Option<String>,
 }
 
 #[napi(object)]
@@ -880,10 +880,10 @@ fn image_source_from_input(input: NativeImageSourceInput) -> Result<ImageSource>
 
 fn network_from_input(input: NativeNetworkInput) -> Result<MachineNetworkConfig> {
     match input.kind.as_str() {
-        "private" => match input.policy_ref {
-            Some(policy_ref) => NetworkPolicyRef::new(policy_ref)
+        "private" => match input.policy_json {
+            Some(policy_json) => NetworkPolicy::from_json_str(&policy_json)
                 .map(MachineNetworkConfig::private_with_policy)
-                .map_err(invalid_arg),
+                .map_err(|err| invalid_arg(format!("invalid network.policyJson: {err}"))),
             None => Ok(MachineNetworkConfig::private()),
         },
         "none" => Ok(MachineNetworkConfig::none()),
@@ -968,25 +968,25 @@ fn machine_status_to_native(status: MachineStatus) -> NativeMachineStatus {
 
 fn network_to_native(network: MachineNetworkConfig) -> NativeNetworkData {
     match network {
-        MachineNetworkConfig::Private { policy_ref, .. } => NativeNetworkData {
+        MachineNetworkConfig::Private { policy } => NativeNetworkData {
             kind: "private".to_string(),
             name: None,
-            policy_ref: policy_ref.map(|policy_ref| policy_ref.as_str().to_string()),
+            policy_json: policy.and_then(|policy| serde_json::to_string(&policy.normalized()).ok()),
         },
         MachineNetworkConfig::None => NativeNetworkData {
             kind: "none".to_string(),
             name: None,
-            policy_ref: None,
+            policy_json: None,
         },
         MachineNetworkConfig::Named { name } => NativeNetworkData {
             kind: "named".to_string(),
             name: Some(name),
-            policy_ref: None,
+            policy_json: None,
         },
         _ => NativeNetworkData {
             kind: "unknown".to_string(),
             name: None,
-            policy_ref: None,
+            policy_json: None,
         },
     }
 }
@@ -1164,35 +1164,37 @@ fn invalid_state(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use libvm::{MachineNetworkConfig, NetworkPolicyRef};
+    use libvm::{MachineNetworkConfig, NetworkPolicy};
 
     use crate::{network_from_input, network_to_native, NativeNetworkInput};
 
-    #[test]
-    fn network_input_preserves_private_policy_ref() {
-        let network = network_from_input(NativeNetworkInput {
-            kind: "private".to_string(),
-            name: None,
-            policy_ref: Some("github".to_string()),
-        })
-        .expect("private network with policy ref");
-
-        assert_eq!(
-            network.policy_ref().map(|policy_ref| policy_ref.as_str()),
-            Some("github")
-        );
+    fn sample_policy_json() -> String {
+        r#"{ "version": 1, "metadata": { "source": "test" } }"#.to_string()
     }
 
     #[test]
-    fn network_output_preserves_private_policy_ref() {
-        let network = MachineNetworkConfig::private_with_policy(
-            NetworkPolicyRef::new("github").expect("policy ref"),
-        );
+    fn network_input_preserves_private_policy_json() {
+        let network = network_from_input(NativeNetworkInput {
+            kind: "private".to_string(),
+            name: None,
+            policy_json: Some(sample_policy_json()),
+        })
+        .expect("private network with policy json");
+
+        assert_eq!(network.policy().expect("policy").metadata["source"], "test");
+    }
+
+    #[test]
+    fn network_output_preserves_private_policy_json() {
+        let policy = NetworkPolicy::from_json_str(&sample_policy_json()).expect("policy");
+        let network = MachineNetworkConfig::private_with_policy(policy);
 
         let native = network_to_native(network);
 
         assert_eq!(native.kind, "private");
         assert_eq!(native.name, None);
-        assert_eq!(native.policy_ref.as_deref(), Some("github"));
+        let policy_json = native.policy_json.expect("policy json");
+        let parsed = NetworkPolicy::from_json_str(&policy_json).expect("parse output policy json");
+        assert_eq!(parsed.metadata["source"], "test");
     }
 }

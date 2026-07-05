@@ -27,7 +27,7 @@ use crate::store::models::{
 };
 use crate::store::DataStore;
 use crate::utils::now_unix;
-use crate::{LibVmError, NetdRuntimeConfig, NetworkPolicyRef};
+use crate::{LibVmError, NetdRuntimeConfig};
 
 use super::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
 use super::{
@@ -67,7 +67,7 @@ impl NetworkDriverBackend for NetdDriver {
         reference: &str,
         request: &NetworkAttachmentRequest<'_>,
     ) -> Result<(), LibVmError> {
-        validate_policy(reference, self.id(), request.policy(), request.policy_ref())
+        validate_policy(reference, self.id(), request.policy())
     }
 
     async fn prepare(
@@ -124,11 +124,7 @@ async fn prepare_netd_runtime(
         write_runtime_policy_file(metadata, policy, &path)?;
         Some(path)
     } else {
-        resolve_network_policy_path(
-            metadata,
-            request.policy_ref(),
-            &ctx.config.policy_config_dir,
-        )?
+        None
     };
     let (tls_ca_cert_path, tls_ca_key_path) =
         resolve_certificate_authority_paths(paths, &config, &metadata.name)?;
@@ -350,9 +346,8 @@ fn validate_policy(
     reference: &str,
     driver: &str,
     policy: Option<&bento_policy::NetworkPolicy>,
-    policy_ref: Option<&NetworkPolicyRef>,
 ) -> Result<(), LibVmError> {
-    if policy.is_none() && policy_ref.is_none() {
+    if policy.is_none() {
         return Ok(());
     }
     if driver != DRIVER_NETD {
@@ -445,20 +440,6 @@ fn encode_oauth_refresh_hook_config(
         message: format!("serialize OAuth refresh hook config: {err}"),
     })?;
     Ok(STANDARD.encode(bytes))
-}
-
-fn resolve_network_policy_path(
-    metadata: &MachineConfig,
-    policy_ref: Option<&NetworkPolicyRef>,
-    config_dir: &Option<PathBuf>,
-) -> Result<Option<PathBuf>, LibVmError> {
-    policy_ref
-        .map(|policy_ref| policy_ref.resolve(config_dir.clone()))
-        .transpose()
-        .map_err(|message| LibVmError::NetworkRuntime {
-            reference: metadata.name.clone(),
-            message,
-        })
 }
 
 fn resolve_certificate_authority_paths(
