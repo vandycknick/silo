@@ -17,12 +17,12 @@ import (
 	"github.com/containers/gvisor-tap-vsock/pkg/transport"
 	log "github.com/sirupsen/logrus"
 	"github.com/vandycknick/bentobox/net/netd/internal/config"
+	"github.com/vandycknick/bentobox/net/netd/internal/credentials"
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/audit"
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/forwarder"
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/router"
 	"github.com/vandycknick/bentobox/net/netd/internal/policy"
-	"github.com/vandycknick/bentobox/net/netd/internal/secrets"
 	"github.com/vandycknick/bentobox/net/netd/internal/virtualnetwork"
 	"golang.org/x/sync/errgroup"
 )
@@ -94,12 +94,12 @@ func run(cfg *config.Config) error {
 	}
 	defer auditLog.Close()
 	route := router.New(hook, auditLog)
-	var secretStore secrets.Store
-	if cfg.SecretStore != "" {
-		secretStore = secrets.NewFileStore(cfg.SecretStore)
+	credentialManager, err := credentials.NewManagerFromEnvironment()
+	if err != nil {
+		return err
 	}
 	httpProxy := forwarder.NewHTTPProxy(route)
-	httpsProxy, err := forwarder.NewHTTPSProxy(route, cfg.TLS.CACert, cfg.TLS.CAKey, secretStore)
+	httpsProxy, err := forwarder.NewHTTPSProxy(route, cfg.TLS.CACert, cfg.TLS.CAKey, credentialManager)
 	if err != nil {
 		return err
 	}

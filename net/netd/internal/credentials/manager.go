@@ -14,14 +14,15 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awscredentials "github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
-	"github.com/vandycknick/bentobox/net/netd/internal/secrets"
 )
 
 const (
@@ -30,9 +31,7 @@ const (
 	ReasonSigning   = "credential_signing_error"
 	ReasonInjection = "credential_injection_error"
 
-	openAICodexClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
-	openAITokenURL      = "https://auth.openai.com/oauth/token"
-	refreshBeforeExpiry = 2 * time.Minute
+	networkSecretPrefix = "BENTO_NET_SECRET_"
 )
 
 type ApplyError struct {
@@ -70,20 +69,38 @@ func applyError(reason string, format string, args ...any) error {
 }
 
 type Manager struct {
-	store                 secrets.Store
-	client                *http.Client
 	now                   func() time.Time
-	openAITokenURL        string
 	awsProfileCredentials func(context.Context, string) (aws.Credentials, error)
+	oauthRefreshHook      *OAuthRefreshHook
+
+	oauthMu      sync.Mutex
+	oauthSecrets map[string]oauthSecret
 }
 
-func NewManager(store secrets.Store) *Manager {
+type oauthSecret struct {
+	AccessToken string
+	ExpiresAt   string
+	AccountID   string
+}
+
+func NewManager() *Manager {
+	return newManager(nil)
+}
+
+func NewManagerFromEnvironment() (*Manager, error) {
+	hook, err := LoadOAuthRefreshHookFromEnvironment()
+	if err != nil {
+		return nil, err
+	}
+	return newManager(hook), nil
+}
+
+func newManager(hook *OAuthRefreshHook) *Manager {
 	return &Manager{
-		store:                 store,
-		client:                &http.Client{Timeout: 30 * time.Second},
 		now:                   time.Now,
-		openAITokenURL:        openAITokenURL,
 		awsProfileCredentials: retrieveAWSProfileCredentials,
+		oauthRefreshHook:      hook,
+		oauthSecrets:          make(map[string]oauthSecret),
 	}
 }
 
@@ -102,7 +119,7 @@ func (m *Manager) Apply(ctx context.Context, req *http.Request, credential *hook
 	case "header_token":
 		return m.applyHeaderToken(credential, req)
 	case "github_oauth":
-		return m.applyGitHubOAuth(credential, req)
+		return m.applyGitHubOAuth(ctx, credential, req)
 	case "openai_codex_oauth":
 		return m.applyOpenAICodexOAuth(ctx, credential, req)
 	case "aws_credential":
@@ -150,8 +167,8 @@ func (m *Manager) applyHeaderToken(credential *hooks.Credential, req *http.Reque
 	return nil
 }
 
-func (m *Manager) applyGitHubOAuth(credential *hooks.Credential, req *http.Request) error {
-	secret, _, err := m.oauthSlot(credential, "oauth")
+func (m *Manager) applyGitHubOAuth(ctx context.Context, credential *hooks.Credential, req *http.Request) error {
+	secret, err := m.currentOAuth(ctx, credential)
 	if err != nil {
 		return applyError(ReasonSecret, "github oauth: %w", err)
 	}
@@ -169,25 +186,9 @@ func (m *Manager) applyGitHubOAuth(credential *hooks.Credential, req *http.Reque
 }
 
 func (m *Manager) applyOpenAICodexOAuth(ctx context.Context, credential *hooks.Credential, req *http.Request) error {
-	secret, fromEnv, err := m.oauthSlot(credential, "oauth")
+	secret, err := m.currentOAuth(ctx, credential)
 	if err != nil {
-		return applyError(ReasonSecret, "openai codex oauth: %w", err)
-	}
-	if m.oauthNeedsRefresh(secret) {
-		refreshed, err := m.refreshOpenAICodexOAuth(ctx, secret)
-		if err != nil {
-			return applyError(ReasonRefresh, "%w", err)
-		}
-		if !fromEnv {
-			key := slotKey(credential.Kind, credential.Name, "oauth")
-			if m.store == nil {
-				return applyError(ReasonRefresh, "secret store is not configured")
-			}
-			if err := m.store.UpdateOAuth(key, refreshed); err != nil {
-				return applyError(ReasonRefresh, "update oauth slot %q: %w", key, err)
-			}
-		}
-		secret = refreshed
+		return applyError(ReasonRefresh, "%w", err)
 	}
 	req.Header.Del("Authorization")
 	req.Header.Set("Authorization", "Bearer "+secret.AccessToken)
@@ -223,70 +224,94 @@ func (m *Manager) applyAWSCredential(ctx context.Context, credential *hooks.Cred
 }
 
 func (m *Manager) plainSlot(credential *hooks.Credential, slot string, required bool) (string, error) {
-	key := slotKey(credential.Kind, credential.Name, slot)
-	if m.store != nil {
-		secret, err := m.store.Get(key)
-		if err == nil {
-			value, err := secret.PlainValue()
-			if err != nil {
-				return "", fmt.Errorf("slot %q: %w", key, err)
-			}
-			if value == "" {
-				if required {
-					return "", fmt.Errorf("slot %q is empty", key)
-				}
-				return "", nil
-			}
-			return value, nil
-		}
-		if !errors.Is(err, secrets.ErrNotFound) {
-			return "", fmt.Errorf("slot %q: %w", key, err)
-		}
-	}
-	if value, ok := os.LookupEnv(envNameForSlot(key)); ok {
-		if value == "" {
-			return "", fmt.Errorf("env %s is empty", envNameForSlot(key))
-		}
-		return value, nil
-	}
-	if required {
-		return "", fmt.Errorf("slot %q not found", key)
-	}
-	return "", nil
+	key := slotKey(credential.Name, slot)
+	return networkSecretString(key, required)
 }
 
-func (m *Manager) oauthSlot(credential *hooks.Credential, slot string) (secrets.OAuthSecret, bool, error) {
-	key := slotKey(credential.Kind, credential.Name, slot)
-	if m.store != nil {
-		secret, err := m.store.Get(key)
-		if err == nil {
-			oauth, err := secret.OAuth()
-			if err != nil {
-				return secrets.OAuthSecret{}, false, fmt.Errorf("slot %q: %w", key, err)
-			}
-			return oauth, false, nil
-		}
-		if !errors.Is(err, secrets.ErrNotFound) {
-			return secrets.OAuthSecret{}, false, fmt.Errorf("slot %q: %w", key, err)
-		}
-	}
-	oauth, ok, err := oauthSecretFromEnv(key)
+func (m *Manager) currentOAuth(ctx context.Context, credential *hooks.Credential) (oauthSecret, error) {
+	secret, err := m.oauthSlot(credential)
 	if err != nil {
-		return secrets.OAuthSecret{}, true, err
+		return oauthSecret{}, err
 	}
-	if ok {
-		return oauth, true, nil
+	expiresAt, err := time.Parse(time.RFC3339, secret.ExpiresAt)
+	if err != nil {
+		return oauthSecret{}, fmt.Errorf("oauth slot %q has invalid expires_at: %w", oauthSlotKey(credential.Name), err)
 	}
-	return secrets.OAuthSecret{}, false, fmt.Errorf("slot %q not found", key)
+	now := m.now()
+	expired := !now.Before(expiresAt)
+	needsRefresh := m.oauthRefreshHook != nil && !now.Add(m.oauthRefreshHook.refreshSkew()).Before(expiresAt)
+	if !expired && !needsRefresh {
+		return secret, nil
+	}
+	if m.oauthRefreshHook == nil {
+		if expired {
+			return oauthSecret{}, fmt.Errorf("oauth credential %q expired at %s", credential.Name, secret.ExpiresAt)
+		}
+		return secret, nil
+	}
+	reason := "expires_soon"
+	if expired {
+		reason = "expired"
+	}
+	refreshed, err := m.oauthRefreshHook.Refresh(ctx, credential, secret.ExpiresAt, reason)
+	if err != nil {
+		if expired {
+			return oauthSecret{}, err
+		}
+		return secret, nil
+	}
+	if _, err := time.Parse(time.RFC3339, refreshed.ExpiresAt); err != nil {
+		if expired {
+			return oauthSecret{}, fmt.Errorf("oauth refresh hook returned invalid expires_at: %w", err)
+		}
+		return secret, nil
+	}
+	m.setOAuthSlot(credential, refreshed)
+	return refreshed, nil
 }
 
-func slotKey(kind string, name string, slot string) string {
-	return kind + "." + name + "." + slot
+func (m *Manager) oauthSlot(credential *hooks.Credential) (oauthSecret, error) {
+	key := oauthSlotKey(credential.Name)
+	m.oauthMu.Lock()
+	cached, ok := m.oauthSecrets[key]
+	m.oauthMu.Unlock()
+	if ok {
+		return cached, nil
+	}
+	accessToken, err := networkSecretString(key+".access_token", true)
+	if err != nil {
+		return oauthSecret{}, err
+	}
+	expiresAt, err := networkSecretString(key+".expires_at", true)
+	if err != nil {
+		return oauthSecret{}, err
+	}
+	accountID, err := networkSecretString(key+".account_id", false)
+	if err != nil {
+		return oauthSecret{}, err
+	}
+	secret := oauthSecret{AccessToken: accessToken, ExpiresAt: expiresAt, AccountID: accountID}
+	m.setOAuthSlot(credential, secret)
+	return secret, nil
+}
+
+func (m *Manager) setOAuthSlot(credential *hooks.Credential, secret oauthSecret) {
+	m.oauthMu.Lock()
+	defer m.oauthMu.Unlock()
+	m.oauthSecrets[oauthSlotKey(credential.Name)] = secret
+}
+
+func slotKey(name string, slot string) string {
+	return name + "." + slot
+}
+
+func oauthSlotKey(name string) string {
+	return name + ".oauth"
 }
 
 func envNameForSlot(key string) string {
 	var builder strings.Builder
-	builder.WriteString("BENTO_SECRET_")
+	builder.WriteString(networkSecretPrefix)
 	lastUnderscore := false
 	for _, r := range key {
 		if r >= 'a' && r <= 'z' {
@@ -307,26 +332,37 @@ func envNameForSlot(key string) string {
 	return strings.TrimRight(builder.String(), "_")
 }
 
-func oauthSecretFromEnv(key string) (secrets.OAuthSecret, bool, error) {
-	base := envNameForSlot(key)
-	accessToken, hasAccessToken := os.LookupEnv(base + "_ACCESS_TOKEN")
-	refreshToken, hasRefreshToken := os.LookupEnv(base + "_REFRESH_TOKEN")
-	expiresAt, hasExpiresAt := os.LookupEnv(base + "_EXPIRES_AT")
-	if !hasAccessToken && !hasRefreshToken && !hasExpiresAt {
-		return secrets.OAuthSecret{}, false, nil
+func networkSecretString(key string, required bool) (string, error) {
+	value, ok, err := networkSecretBytes(key, required)
+	if err != nil || !ok {
+		return "", err
 	}
-	if accessToken == "" || refreshToken == "" || expiresAt == "" {
-		return secrets.OAuthSecret{}, true, fmt.Errorf("env oauth slot %q is incomplete", key)
+	if !utf8.Valid(value) {
+		return "", fmt.Errorf("slot %q is not valid UTF-8", key)
 	}
-	secret := secrets.OAuthSecret{
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		ExpiresAt:    expiresAt,
+	return string(value), nil
+}
+
+func networkSecretBytes(key string, required bool) ([]byte, bool, error) {
+	envName := envNameForSlot(key)
+	encoded, ok := os.LookupEnv(envName)
+	if !ok {
+		if required {
+			return nil, false, fmt.Errorf("slot %q not found", key)
+		}
+		return nil, false, nil
 	}
-	secret.AccountID, _ = os.LookupEnv(base + "_ACCOUNT_ID")
-	secret.CreatedAt, _ = os.LookupEnv(base + "_CREATED_AT")
-	secret.UpdatedAt, _ = os.LookupEnv(base + "_UPDATED_AT")
-	return secret, true, nil
+	if encoded == "" {
+		return nil, true, fmt.Errorf("env %s is empty", envName)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, true, fmt.Errorf("env %s is not valid base64: %w", envName, err)
+	}
+	if len(decoded) == 0 {
+		return nil, true, fmt.Errorf("slot %q is empty", key)
+	}
+	return decoded, true, nil
 }
 
 func applyIdempotencyKey(req *http.Request) {
@@ -370,70 +406,7 @@ func requestHostname(req *http.Request) string {
 	return strings.ToLower(strings.Trim(host, "[]"))
 }
 
-func (m *Manager) oauthNeedsRefresh(secret secrets.OAuthSecret) bool {
-	expiresAt, err := time.Parse(time.RFC3339, secret.ExpiresAt)
-	if err != nil {
-		return true
-	}
-	return !m.now().Add(refreshBeforeExpiry).Before(expiresAt)
-}
-
-func (m *Manager) refreshOpenAICodexOAuth(ctx context.Context, secret secrets.OAuthSecret) (secrets.OAuthSecret, error) {
-	client := m.client
-	if client == nil {
-		client = http.DefaultClient
-	}
-	form := url.Values{}
-	form.Set("grant_type", "refresh_token")
-	form.Set("refresh_token", secret.RefreshToken)
-	form.Set("client_id", openAICodexClientID)
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, m.openAITokenURL, strings.NewReader(form.Encode()))
-	if err != nil {
-		return secrets.OAuthSecret{}, err
-	}
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	response, err := client.Do(request)
-	if err != nil {
-		return secrets.OAuthSecret{}, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode > 299 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 512))
-		return secrets.OAuthSecret{}, fmt.Errorf("refresh endpoint returned %s", response.Status)
-	}
-	var token struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int64  `json:"expires_in"`
-	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&token); err != nil {
-		return secrets.OAuthSecret{}, err
-	}
-	if token.AccessToken == "" {
-		return secrets.OAuthSecret{}, fmt.Errorf("refresh response did not include access_token")
-	}
-	if token.RefreshToken == "" {
-		token.RefreshToken = secret.RefreshToken
-	}
-	createdAt := secret.CreatedAt
-	if createdAt == "" {
-		createdAt = rfc3339(m.now())
-	}
-	return secrets.OAuthSecret{
-		AccessToken:  token.AccessToken,
-		RefreshToken: token.RefreshToken,
-		ExpiresAt:    rfc3339(m.now().Add(time.Duration(token.ExpiresIn) * time.Second)),
-		AccountID:    openAIAccountID(secrets.OAuthSecret{AccessToken: token.AccessToken, AccountID: secret.AccountID}),
-		CreatedAt:    createdAt,
-		UpdatedAt:    rfc3339(m.now()),
-	}, nil
-}
-
-func rfc3339(value time.Time) string {
-	return value.UTC().Format(time.RFC3339)
-}
-
-func openAIAccountID(secret secrets.OAuthSecret) string {
+func openAIAccountID(secret oauthSecret) string {
 	if secret.AccountID != "" {
 		return secret.AccountID
 	}

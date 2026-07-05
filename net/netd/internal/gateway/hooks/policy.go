@@ -111,6 +111,7 @@ func routeDecisionFromPolicy(decision policy.Decision) RouteDecision {
 		converted.Credential = &Credential{
 			Kind:           decision.SelectedCredential.Kind,
 			Name:           decision.SelectedCredential.Name,
+			Endpoint:       decision.SelectedCredential.Endpoint.Name,
 			Username:       decision.SelectedCredential.Username,
 			Header:         decision.SelectedCredential.Header,
 			Prefix:         decision.SelectedCredential.Prefix,

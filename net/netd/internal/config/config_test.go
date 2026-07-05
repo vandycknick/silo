@@ -24,7 +24,7 @@ func TestParseRejectsRemovedAuditAndProfileFlags(t *testing.T) {
 		t.Fatal("expected removed --profile-name flag to be rejected")
 	}
 
-	for _, flag := range []string{"--audit-path", "--audit-file"} {
+	for _, flag := range []string{"--audit-path", "--audit-file", "--secret-store-file"} {
 		_, err = Parse([]string{
 			"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
 			flag, filepath.Join(dir, "audit.jsonl"),

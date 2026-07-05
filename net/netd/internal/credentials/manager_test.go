@@ -2,24 +2,24 @@ package credentials
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
-	"github.com/vandycknick/bentobox/net/netd/internal/secrets"
 )
 
 func TestBasicAuthAppliesPasswordSlotAndOverwritesAuthorization(t *testing.T) {
-	manager := NewManager(testSecretStore{
-		"basic_auth.git-basic.password": secrets.Plain("stored-password"),
-	})
+	setNetworkSecret(t, "git-basic.password", "stored-password")
+	manager := NewManager()
 	req := httptest.NewRequest(http.MethodGet, "https://git.example.test/repo", nil)
 	req.Header.Set("Authorization", "Bearer guest-token")
 
@@ -33,9 +33,9 @@ func TestBasicAuthAppliesPasswordSlotAndOverwritesAuthorization(t *testing.T) {
 	}
 }
 
-func TestBearerTokenUsesEnvFallbackAndIdempotencyKey(t *testing.T) {
-	t.Setenv(envNameForSlot("bearer_token.github-api.token"), "env-token")
-	manager := NewManager(nil)
+func TestBearerTokenUsesNetworkSecretAndIdempotencyKey(t *testing.T) {
+	setNetworkSecret(t, "github-api.token", "env-token")
+	manager := NewManager()
 	req := httptest.NewRequest(http.MethodPost, "https://api.example.test/repos?debug=1", nil)
 	req.Header.Set("Authorization", "Bearer guest-token")
 
@@ -52,9 +52,8 @@ func TestBearerTokenUsesEnvFallbackAndIdempotencyKey(t *testing.T) {
 }
 
 func TestHeaderTokenAppliesTokenSlotAndOverwritesManagedHeader(t *testing.T) {
-	manager := NewManager(testSecretStore{
-		"header_token.internal-api.token": secrets.Plain("stored-token"),
-	})
+	setNetworkSecret(t, "internal-api.token", "stored-token")
+	manager := NewManager()
 	req := httptest.NewRequest(http.MethodGet, "https://internal.example.test", nil)
 	req.Header.Set("X-Internal-Token", "guest-token")
 
@@ -67,50 +66,40 @@ func TestHeaderTokenAppliesTokenSlotAndOverwritesManagedHeader(t *testing.T) {
 	}
 }
 
-func TestFileSlotWrongTypeDoesNotFallBackToEnv(t *testing.T) {
-	t.Setenv(envNameForSlot("bearer_token.api.token"), "env-token")
-	manager := NewManager(testSecretStore{
-		"bearer_token.api.token": secrets.OAuth(secrets.OAuthSecret{
-			AccessToken:  "wrong",
-			RefreshToken: "wrong",
-			ExpiresAt:    "2026-06-02T12:00:00Z",
-		}),
-	})
+func TestInvalidBase64SecretFailsClosed(t *testing.T) {
+	t.Setenv(envNameForSlot("api.token"), "not base64!!!")
+	manager := NewManager()
 	req := httptest.NewRequest(http.MethodGet, "https://api.example.test", nil)
 
 	err := manager.Apply(context.Background(), req, &hooks.Credential{Kind: "bearer_token", Name: "api"})
 	if err == nil || FailureReason(err) != ReasonSecret {
-		t.Fatalf("expected wrong file slot type to fail closed with %q, got %v", ReasonSecret, err)
+		t.Fatalf("expected invalid env slot to fail closed with %q, got %v", ReasonSecret, err)
 	}
 	if got := req.Header.Get("Authorization"); got != "" {
-		t.Fatalf("wrong file slot must not fall back to env injection, got %q", got)
+		t.Fatalf("invalid env slot must not inject Authorization, got %q", got)
 	}
 }
 
-func TestRequiredPlainSlotRejectsEmptyFileValue(t *testing.T) {
-	manager := NewManager(testSecretStore{
-		"bearer_token.api.token": secrets.Plain(""),
-	})
+func TestRequiredPlainSlotRejectsEmptyValue(t *testing.T) {
+	t.Setenv(envNameForSlot("api.token"), "")
+	manager := NewManager()
 	req := httptest.NewRequest(http.MethodGet, "https://api.example.test", nil)
 
 	err := manager.Apply(context.Background(), req, &hooks.Credential{Kind: "bearer_token", Name: "api"})
 	if err == nil || FailureReason(err) != ReasonSecret {
-		t.Fatalf("expected empty file slot to fail closed with %q, got %v", ReasonSecret, err)
+		t.Fatalf("expected empty env slot to fail closed with %q, got %v", ReasonSecret, err)
 	}
 	if got := req.Header.Get("Authorization"); got != "" {
-		t.Fatalf("empty file slot must not inject Authorization, got %q", got)
+		t.Fatalf("empty env slot must not inject Authorization, got %q", got)
 	}
 }
 
 func TestGitHubOAuthUsesBearerForAPIAndBasicForSmartHTTP(t *testing.T) {
-	manager := NewManager(testSecretStore{
-		"github_oauth.personal.oauth": secrets.OAuth(secrets.OAuthSecret{
-			AccessToken:  "gh-access-token",
-			RefreshToken: "gh-refresh-token",
-			ExpiresAt:    "2026-06-02T12:00:00Z",
-		}),
-	})
-	credential := &hooks.Credential{Kind: "github_oauth", Name: "personal"}
+	setNetworkSecret(t, "personal.oauth.access_token", "gh-access-token")
+	setNetworkSecret(t, "personal.oauth.expires_at", "2026-06-02T12:30:00Z")
+	manager := NewManager()
+	manager.now = func() time.Time { return mustTime(t, "2026-06-02T12:00:00Z") }
+	credential := &hooks.Credential{Kind: "github_oauth", Name: "personal", Endpoint: "github"}
 
 	apiReq := httptest.NewRequest(http.MethodGet, "https://api.github.com/repos/acme/widgets", nil)
 	apiReq.Header.Set("Authorization", "Bearer guest-token")
@@ -132,65 +121,53 @@ func TestGitHubOAuthUsesBearerForAPIAndBasicForSmartHTTP(t *testing.T) {
 	}
 }
 
-func TestOpenAICodexOAuthInjectsHeadersAndRefreshesExpiredStoreSecret(t *testing.T) {
-	store := testSecretStore{
-		"openai_codex_oauth.personal.oauth": secrets.OAuth(secrets.OAuthSecret{
-			AccessToken:  "old-access-token",
-			RefreshToken: "old-refresh-token",
-			ExpiresAt:    "2026-06-02T11:59:00Z",
-			AccountID:    "acct_old",
-			CreatedAt:    "2026-06-02T11:00:00Z",
-			UpdatedAt:    "2026-06-02T11:00:00Z",
-		}),
+func TestOpenAICodexOAuthInjectsHeadersAndRefreshesExpiredSecretWithHook(t *testing.T) {
+	setNetworkSecret(t, "personal.oauth.access_token", "old-access-token")
+	setNetworkSecret(t, "personal.oauth.expires_at", "2026-06-02T11:59:00Z")
+	setNetworkSecret(t, "personal.oauth.account_id", "acct_old")
+	configureOAuthRefreshHookHelper(t)
+	manager, err := NewManagerFromEnvironment()
+	if err != nil {
+		t.Fatalf("NewManagerFromEnvironment returned error: %v", err)
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if err := req.ParseForm(); err != nil {
-			t.Fatalf("ParseForm returned error: %v", err)
-		}
-		if req.Form.Get("grant_type") != "refresh_token" || req.Form.Get("refresh_token") != "old-refresh-token" {
-			t.Fatalf("unexpected refresh form: %v", req.Form)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"access_token":"new-access-token","refresh_token":"new-refresh-token","expires_in":3600}`)
-	}))
-	defer server.Close()
-	manager := NewManager(store)
-	manager.client = server.Client()
-	manager.openAITokenURL = server.URL
 	manager.now = func() time.Time { return mustTime(t, "2026-06-02T12:00:00Z") }
 	req := httptest.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/conversation", nil)
 	req.Header.Set("Authorization", "Bearer guest-token")
 	req.Header.Set("ChatGPT-Account-Id", "guest-account")
 
-	err := manager.Apply(context.Background(), req, &hooks.Credential{Kind: "openai_codex_oauth", Name: "personal"})
+	err = manager.Apply(context.Background(), req, &hooks.Credential{Kind: "openai_codex_oauth", Name: "personal", Endpoint: "chatgpt"})
 	if err != nil {
 		t.Fatalf("Apply returned error: %v", err)
 	}
 	if got := req.Header.Get("Authorization"); got != "Bearer new-access-token" {
 		t.Fatalf("expected refreshed OpenAI auth header, got %q", got)
 	}
-	if got := req.Header.Get("ChatGPT-Account-Id"); got != "acct_old" {
-		t.Fatalf("expected account id to be preserved, got %q", got)
+	if got := req.Header.Get("ChatGPT-Account-Id"); got != "acct_new" {
+		t.Fatalf("expected refreshed account id, got %q", got)
 	}
-	updated, err := store.Get("openai_codex_oauth.personal.oauth")
-	if err != nil {
-		t.Fatalf("Get updated OAuth returned error: %v", err)
+}
+
+func TestExpiredOAuthWithoutHookFailsClosed(t *testing.T) {
+	setNetworkSecret(t, "personal.oauth.access_token", "old-access-token")
+	setNetworkSecret(t, "personal.oauth.expires_at", "2026-06-02T11:59:00Z")
+	manager := NewManager()
+	manager.now = func() time.Time { return mustTime(t, "2026-06-02T12:00:00Z") }
+	req := httptest.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/conversation", nil)
+
+	err := manager.Apply(context.Background(), req, &hooks.Credential{Kind: "openai_codex_oauth", Name: "personal", Endpoint: "chatgpt"})
+	if err == nil || FailureReason(err) != ReasonRefresh {
+		t.Fatalf("expected expired oauth to fail closed with %q, got %v", ReasonRefresh, err)
 	}
-	oauth, err := updated.OAuth()
-	if err != nil {
-		t.Fatalf("OAuth returned error: %v", err)
-	}
-	if oauth.AccessToken != "new-access-token" || oauth.RefreshToken != "new-refresh-token" || oauth.UpdatedAt != "2026-06-02T12:00:00Z" {
-		t.Fatalf("expected refreshed store secret, got %#v", oauth)
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Fatalf("expired oauth must not inject Authorization, got %q", got)
 	}
 }
 
 func TestAWSCredentialSignsWithStaticSlots(t *testing.T) {
-	manager := NewManager(testSecretStore{
-		"aws_credential.prod.access_key_id":     secrets.Plain("AKIASTATIC"),
-		"aws_credential.prod.secret_access_key": secrets.Plain("static-secret"),
-		"aws_credential.prod.session_token":     secrets.Plain("static-session"),
-	})
+	setNetworkSecret(t, "prod.access_key_id", "AKIASTATIC")
+	setNetworkSecret(t, "prod.secret_access_key", "static-secret")
+	setNetworkSecret(t, "prod.session_token", "static-session")
+	manager := NewManager()
 	manager.now = func() time.Time { return mustTime(t, "2026-06-02T12:00:00Z") }
 	req := httptest.NewRequest(http.MethodPost, "https://s3.us-west-2.amazonaws.com/bucket/key", strings.NewReader("hello"))
 	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=PLACEHOLDER/20260602/us-east-1/sts/aws4_request")
@@ -220,9 +197,8 @@ func TestAWSCredentialSignsWithStaticSlots(t *testing.T) {
 }
 
 func TestAWSCredentialProfileSlotUsesProfileResolver(t *testing.T) {
-	manager := NewManager(testSecretStore{
-		"aws_credential.prod.profile": secrets.Plain("production-admin"),
-	})
+	setNetworkSecret(t, "prod.profile", "production-admin")
+	manager := NewManager()
 	manager.now = func() time.Time { return mustTime(t, "2026-06-02T12:00:00Z") }
 	calledProfile := ""
 	manager.awsProfileCredentials = func(_ context.Context, profile string) (aws.Credentials, error) {
@@ -264,26 +240,66 @@ func TestFailureReasonUsesClassifiedApplyError(t *testing.T) {
 	}
 }
 
-type testSecretStore map[string]secrets.Secret
-
-func (s testSecretStore) Get(name string) (secrets.Secret, error) {
-	secret, ok := s[name]
-	if !ok {
-		return secrets.Secret{}, fmt.Errorf("%w: %q", secrets.ErrNotFound, name)
+func TestOAuthRefreshHookHelperProcess(t *testing.T) {
+	if os.Getenv(OAuthRefreshAuthEnv) == "" {
+		return
 	}
-	return secret, nil
+	if os.Getenv(OAuthRefreshAuthEnv) != base64.StdEncoding.EncodeToString([]byte("hook-auth")) {
+		t.Fatalf("hook did not receive expected auth env")
+	}
+	if os.Getenv(envNameForSlot("personal.oauth.access_token")) != "" {
+		t.Fatalf("hook received network secret env")
+	}
+	var request oauthRefreshHookRequest
+	if err := readJSONFrame(os.Stdin, &request); err != nil {
+		t.Fatalf("read hook request: %v", err)
+	}
+	if request.Operation != "oauth_refresh" || request.Credential.Name != "personal" || request.Credential.Kind != "openai_codex_oauth" || request.Credential.Endpoint != "chatgpt" || request.Reason != "expired" {
+		t.Fatalf("unexpected hook request: %#v", request)
+	}
+	response := oauthRefreshHookResponse{
+		Version: 1,
+		Status:  "ok",
+		OAuth: oauthRefreshHookOAuth{
+			AccessToken: "new-access-token",
+			ExpiresAt:   "2026-06-02T13:00:00Z",
+			AccountID:   "acct_new",
+		},
+	}
+	payload, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	if err := writeJSONFrame(os.Stdout, payload); err != nil {
+		t.Fatalf("write hook response: %v", err)
+	}
+	os.Exit(0)
 }
 
-func (s testSecretStore) UpdateOAuth(name string, secret secrets.OAuthSecret) error {
-	existing, ok := s[name]
-	if !ok {
-		return fmt.Errorf("%w: %q", secrets.ErrNotFound, name)
+func configureOAuthRefreshHookHelper(t *testing.T) {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable returned error: %v", err)
 	}
-	if existing.Type != secrets.TypeOAuth {
-		return fmt.Errorf("secret %q has type %q, expected %q", name, existing.Type, secrets.TypeOAuth)
+	config := oauthRefreshHookConfig{
+		Version:            1,
+		Command:            executable,
+		Args:               []string{"-test.run=TestOAuthRefreshHookHelperProcess"},
+		TimeoutMS:          5000,
+		RefreshSkewSeconds: 300,
 	}
-	s[name] = secrets.OAuth(secret)
-	return nil
+	payload, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal hook config: %v", err)
+	}
+	t.Setenv(OAuthRefreshHookEnv, base64.StdEncoding.EncodeToString(payload))
+	t.Setenv(OAuthRefreshAuthEnv, base64.StdEncoding.EncodeToString([]byte("hook-auth")))
+}
+
+func setNetworkSecret(t *testing.T, slot string, value string) {
+	t.Helper()
+	t.Setenv(envNameForSlot(slot), base64.StdEncoding.EncodeToString([]byte(value)))
 }
 
 func mustTime(t *testing.T, value string) time.Time {

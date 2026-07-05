@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -22,9 +23,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vandycknick/bentobox/net/netd/internal/credentials"
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/router"
-	"github.com/vandycknick/bentobox/net/netd/internal/secrets"
 )
 
 func TestHTTPSProxyInterceptsAllowedRequest(t *testing.T) {
@@ -252,9 +253,8 @@ rule "allow-local" {
   verdict = "allow"
 }
 `)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, testHTTPSSecretStore{
-		"bearer_token.local.token": secrets.Plain("local-token"),
-	})
+	setHTTPSNetworkSecret(t, "local.token", "local-token")
+	proxy, err := NewHTTPSProxy(route, caCert, caKey, credentials.NewManager())
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -379,7 +379,7 @@ rule "allow-local" {
 		t.Fatalf("expected credential_secret_error response, got %q", body)
 	}
 	logText := logs.String()
-	for _, want := range []string{"credential application failed", "credential_secret_error", "bearer_token", "credential_name\":\"local", "bearer_token.local.token", "localhost", "/private"} {
+	for _, want := range []string{"credential application failed", "credential_secret_error", "bearer_token", "credential_name\":\"local", "local.token", "localhost", "/private"} {
 		if !strings.Contains(logText, want) {
 			t.Fatalf("expected credential failure log to contain %q, got %q", want, logText)
 		}
@@ -994,26 +994,28 @@ func startObservedTLSUpstreamWithResponseForHost(t *testing.T, caCertPath string
 	return listener.Addr().String(), func() { _ = listener.Close() }, acceptedCh
 }
 
-type testHTTPSSecretStore map[string]secrets.Secret
-
-func (s testHTTPSSecretStore) Get(name string) (secrets.Secret, error) {
-	secret, ok := s[name]
-	if !ok {
-		return secrets.Secret{}, fmt.Errorf("%w: %q", secrets.ErrNotFound, name)
+func setHTTPSNetworkSecret(t *testing.T, slot string, value string) {
+	t.Helper()
+	var builder strings.Builder
+	builder.WriteString("BENTO_NET_SECRET_")
+	lastUnderscore := false
+	for _, r := range slot {
+		if r >= 'a' && r <= 'z' {
+			builder.WriteRune(r - 'a' + 'A')
+			lastUnderscore = false
+			continue
+		}
+		if r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			builder.WriteRune(r)
+			lastUnderscore = false
+			continue
+		}
+		if !lastUnderscore {
+			builder.WriteByte('_')
+			lastUnderscore = true
+		}
 	}
-	return secret, nil
-}
-
-func (s testHTTPSSecretStore) UpdateOAuth(name string, secret secrets.OAuthSecret) error {
-	existing, ok := s[name]
-	if !ok {
-		return fmt.Errorf("%w: %q", secrets.ErrNotFound, name)
-	}
-	if existing.Type != secrets.TypeOAuth {
-		return fmt.Errorf("secret %q has type %q, expected %q", name, existing.Type, secrets.TypeOAuth)
-	}
-	s[name] = secrets.OAuth(secret)
-	return nil
+	t.Setenv(strings.TrimRight(builder.String(), "_"), base64.StdEncoding.EncodeToString([]byte(value)))
 }
 
 func waitForProxyError(t *testing.T, done <-chan error, want string) {

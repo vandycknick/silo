@@ -24,7 +24,6 @@ import (
 	"github.com/vandycknick/bentobox/net/netd/internal/credentials"
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
 	"github.com/vandycknick/bentobox/net/netd/internal/gateway/router"
-	"github.com/vandycknick/bentobox/net/netd/internal/secrets"
 )
 
 const certificateRefreshBeforeExpiry = time.Hour
@@ -38,7 +37,7 @@ type HTTPSProxy struct {
 	upstreamRootCAs   *x509.CertPool
 }
 
-func NewHTTPSProxy(route *router.Router, certPath string, keyPath string, store secrets.Store) (*HTTPSProxy, error) {
+func NewHTTPSProxy(route *router.Router, certPath string, keyPath string, manager *credentials.Manager) (*HTTPSProxy, error) {
 	if route == nil || !route.HasHTTPS() {
 		return nil, nil
 	}
@@ -46,7 +45,10 @@ func NewHTTPSProxy(route *router.Router, certPath string, keyPath string, store 
 	if err != nil {
 		return nil, err
 	}
-	return &HTTPSProxy{route: route, ca: ca, credentialManager: credentials.NewManager(store)}, nil
+	if manager == nil {
+		manager = credentials.NewManager()
+	}
+	return &HTTPSProxy{route: route, ca: ca, credentialManager: manager}, nil
 }
 
 func (p *HTTPSProxy) ShouldHandle(flow hooks.Flow, decision hooks.RouteDecision) bool {

@@ -46,7 +46,6 @@ type Config struct {
 	Stack       types.Configuration
 	PolicyFile  string
 	Policy      *policy.Policy
-	SecretStore string
 	TLS         TLSConfig
 	Metadata    Metadata
 }
@@ -75,7 +74,6 @@ func Parse(args []string) (*Config, error) {
 	flags.StringVar(&cfg.LogFile, "log-file", "", "write logs to this file")
 	flags.StringVar(&pcapFile, "pcap", "", "capture network traffic to a pcap file")
 	flags.StringVar(&cfg.PolicyFile, "policy-file", "", "canonical network policy JSON file")
-	flags.StringVar(&cfg.SecretStore, "secret-store-file", "", "JSON secret store used by policy credentials")
 	flags.StringVar(&cfg.TLS.CACert, "tls-ca-cert", "", "CA certificate used for HTTPS interception")
 	flags.StringVar(&cfg.TLS.CAKey, "tls-ca-key", "", "CA private key used for HTTPS interception")
 	flags.StringVar(&cfg.Metadata.VMID, "vm-id", "", "VM identifier added to flow logs")

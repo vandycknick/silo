@@ -38,6 +38,7 @@ type HTTPRequest struct {
 type Credential struct {
 	Kind           string
 	Name           string
+	Endpoint       string
 	Username       string
 	Header         string
 	Prefix         string
