@@ -19,7 +19,7 @@ impl Cmd {
         let (name, machine) = context.machine(self.name.as_deref()).await?;
 
         spinner.step("Starting", &name);
-        let options = machine_start_options(context.runtime().await?, &machine)?;
+        let options = machine_start_options(context.runtime().await?, &machine).await?;
         let data = machine.start_with_options(options).await?;
 
         spinner.step("Waiting", &name);

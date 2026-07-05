@@ -1,10 +1,16 @@
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use bento_policy::{
+    NetworkCredential, NetworkPolicy, NetworkSecretAlternative, NetworkSecretKind,
+    NetworkSecretRequirement, NetworkSecretSlot,
+};
 use chrono::{SecondsFormat, Utc};
 use clap::{Args, Subcommand};
+use libvm::{NetworkLaunch, OAuthRefreshHook};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,6 +28,7 @@ const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
 const OPENAI_CODEX_KIND: &str = "openai_codex_oauth";
 const OPENAI_DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SECRET_STORE_FILE_NAME: &str = "secrets.json";
+const OAUTH_REFRESH_AUTH_ENV: &str = "BENTO_NET_OAUTH_REFRESH_AUTH";
 
 const EXAMPLES: &[&str] = &[
     "bento secret login openai-codex --name personal",
@@ -55,6 +62,8 @@ pub(crate) enum SecretSubcommand {
     Show(ShowCmd),
     #[command(name = "rm", about = "Remove a saved secret")]
     Rm(RmCmd),
+    #[command(name = "refresh-oauth", hide = true)]
+    RefreshOAuth(RefreshOAuthCmd),
 }
 
 #[derive(Args, Debug)]
@@ -146,6 +155,13 @@ pub(crate) struct RmCmd {
     pub(crate) force: bool,
 }
 
+#[derive(Args, Debug)]
+pub(crate) struct RefreshOAuthCmd {
+    /// Secret store file used by the launch that created this hook.
+    #[arg(long = "store-file")]
+    pub(crate) store_file: PathBuf,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LoginProvider {
     OpenAICodex,
@@ -153,13 +169,28 @@ pub(crate) enum LoginProvider {
 
 impl Cmd {
     pub async fn run(self, _context: &mut Context) -> eyre::Result<()> {
-        let store = SecretStore::from_env()?;
         match &self.command {
-            SecretSubcommand::Login(command) => login(&store, command).await,
-            SecretSubcommand::Set(command) => set_plain_secret(&store, command),
-            SecretSubcommand::List(command) => list_secrets(&store, command),
-            SecretSubcommand::Show(command) => show_secret(&store, command),
-            SecretSubcommand::Rm(command) => remove_secret(&store, command),
+            SecretSubcommand::Login(command) => {
+                let store = SecretStore::from_env()?;
+                login(&store, command).await
+            }
+            SecretSubcommand::Set(command) => {
+                let store = SecretStore::from_env()?;
+                set_plain_secret(&store, command)
+            }
+            SecretSubcommand::List(command) => {
+                let store = SecretStore::from_env()?;
+                list_secrets(&store, command)
+            }
+            SecretSubcommand::Show(command) => {
+                let store = SecretStore::from_env()?;
+                show_secret(&store, command)
+            }
+            SecretSubcommand::Rm(command) => {
+                let store = SecretStore::from_env()?;
+                remove_secret(&store, command)
+            }
+            SecretSubcommand::RefreshOAuth(command) => refresh_oauth(command).await,
         }
     }
 }
@@ -630,6 +661,468 @@ fn slot_key(kind: &str, name: &str, slot: &str) -> String {
     format!("{kind}.{name}.{slot}")
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct OAuthRefreshGrant {
+    version: u8,
+    store_file: PathBuf,
+    credentials: Vec<OAuthRefreshGrantCredential>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OAuthRefreshGrantCredential {
+    name: String,
+    kind: String,
+    endpoint: String,
+    secret_key: String,
+}
+
+pub(crate) fn network_launch_from_secret_store(
+    policy: &NetworkPolicy,
+) -> eyre::Result<NetworkLaunch> {
+    if policy.secret_slots().is_empty() {
+        return Ok(NetworkLaunch::new());
+    }
+    let hook_command = std::env::current_exe()?;
+    let store = SecretStore::from_env()?;
+    network_launch_from_store(policy, &store, &hook_command)
+}
+
+fn network_launch_from_store(
+    policy: &NetworkPolicy,
+    store: &SecretStore,
+    hook_command: &Path,
+) -> eyre::Result<NetworkLaunch> {
+    let mut launch = NetworkLaunch::new();
+    let mut supplied_slots = std::collections::BTreeSet::new();
+    for slot in policy.secret_slots() {
+        if should_skip_network_slot(policy, store, &slot)? {
+            continue;
+        }
+        if let Some(value) = network_secret_value(policy, store, &slot)? {
+            supplied_slots.insert(slot.name.clone());
+            launch = launch.secret(slot.name, value);
+        }
+    }
+    let missing = missing_network_secret_requirements(policy, &supplied_slots);
+    if !missing.is_empty() {
+        eyre::bail!(format_missing_network_secrets(&missing, store.path()));
+    }
+    if let Some(hook) = oauth_refresh_hook_from_store(policy, store, hook_command)? {
+        launch = launch.oauth_refresh_hook(hook);
+    }
+    Ok(launch)
+}
+
+fn oauth_refresh_hook_from_store(
+    policy: &NetworkPolicy,
+    store: &SecretStore,
+    hook_command: &Path,
+) -> eyre::Result<Option<OAuthRefreshHook>> {
+    let grant = oauth_refresh_grant(policy, store)?;
+    if grant.credentials.is_empty() {
+        return Ok(None);
+    }
+    let auth = serde_json::to_vec(&grant)?;
+    Ok(Some(
+        OAuthRefreshHook::new(hook_command, auth)
+            .arg("secret")
+            .arg("refresh-oauth")
+            .arg("--store-file")
+            .arg(store.path().to_string_lossy()),
+    ))
+}
+
+fn oauth_refresh_grant(
+    policy: &NetworkPolicy,
+    store: &SecretStore,
+) -> eyre::Result<OAuthRefreshGrant> {
+    let mut credentials = Vec::new();
+    for credential in &policy.credentials {
+        if !credential_uses_oauth_secret_slots(policy, credential) {
+            continue;
+        }
+        let key = slot_key(&credential.kind, &credential.name, "oauth");
+        let Some(secret) = store.get_optional(&key)? else {
+            continue;
+        };
+        if matches!(secret, Secret::OAuth { .. }) {
+            credentials.push(OAuthRefreshGrantCredential {
+                name: credential.name.clone(),
+                kind: credential.kind.clone(),
+                endpoint: credential.endpoint.clone(),
+                secret_key: key,
+            });
+        }
+    }
+    Ok(OAuthRefreshGrant {
+        version: 1,
+        store_file: store.path().to_path_buf(),
+        credentials,
+    })
+}
+
+fn credential_uses_oauth_secret_slots(
+    policy: &NetworkPolicy,
+    credential: &NetworkCredential,
+) -> bool {
+    let prefix = format!("{}.", credential.name);
+    policy
+        .secret_slots()
+        .into_iter()
+        .any(|slot| slot.kind == NetworkSecretKind::OAuth && slot.name.starts_with(prefix.as_str()))
+}
+
+fn network_secret_value(
+    policy: &NetworkPolicy,
+    store: &SecretStore,
+    slot: &NetworkSecretSlot,
+) -> eyre::Result<Option<String>> {
+    if let Some(secret) = store.get_optional(&slot.name)? {
+        return secret_plain_value(&slot.name, secret, store.path()).map(Some);
+    }
+
+    if let Some(credential) = credential_for_slot(policy, &slot.name) {
+        return credential_secret_value(store, credential, slot);
+    }
+
+    tailscale_secret_value(store, &slot.name)
+}
+
+fn should_skip_network_slot(
+    policy: &NetworkPolicy,
+    store: &SecretStore,
+    slot: &NetworkSecretSlot,
+) -> eyre::Result<bool> {
+    let Some(credential) = credential_for_slot(policy, &slot.name) else {
+        return Ok(false);
+    };
+    if credential.kind != "aws_credential" {
+        return Ok(false);
+    }
+    let Some(slot_suffix) = slot.name.strip_prefix(&format!("{}.", credential.name)) else {
+        return Ok(false);
+    };
+    if !matches!(
+        slot_suffix,
+        "access_key_id" | "secret_access_key" | "session_token"
+    ) {
+        return Ok(false);
+    }
+    Ok(network_secret_value(
+        policy,
+        store,
+        &NetworkSecretSlot {
+            name: format!("{}.profile", credential.name),
+            required: false,
+            kind: NetworkSecretKind::Plain,
+        },
+    )?
+    .is_some())
+}
+
+fn credential_secret_value(
+    store: &SecretStore,
+    credential: &NetworkCredential,
+    slot: &NetworkSecretSlot,
+) -> eyre::Result<Option<String>> {
+    let Some(slot_suffix) = slot.name.strip_prefix(&format!("{}.", credential.name)) else {
+        return Ok(None);
+    };
+    match slot.kind {
+        NetworkSecretKind::Plain => {
+            let key = slot_key(&credential.kind, &credential.name, slot_suffix);
+            store
+                .get_optional(&key)?
+                .map(|secret| secret_plain_value(&key, secret, store.path()))
+                .transpose()
+        }
+        NetworkSecretKind::OAuth => {
+            let Some(oauth_field) = slot_suffix.strip_prefix("oauth.") else {
+                return Ok(None);
+            };
+            let key = slot_key(&credential.kind, &credential.name, "oauth");
+            let Some(secret) = store.get_optional(&key)? else {
+                return Ok(None);
+            };
+            secret_oauth_field(&key, secret, oauth_field, store.path())
+        }
+    }
+}
+
+fn tailscale_secret_value(store: &SecretStore, slot_name: &str) -> eyre::Result<Option<String>> {
+    let Some((name, "tailscale.auth_key")) = slot_name.split_once('.') else {
+        return Ok(None);
+    };
+    let key = format!("tailscale.{name}.auth_key");
+    store
+        .get_optional(&key)?
+        .map(|secret| secret_plain_value(&key, secret, store.path()))
+        .transpose()
+}
+
+fn credential_for_slot<'a>(
+    policy: &'a NetworkPolicy,
+    slot_name: &str,
+) -> Option<&'a NetworkCredential> {
+    let (name, _) = slot_name.split_once('.')?;
+    policy
+        .credentials
+        .iter()
+        .find(|credential| credential.name == name)
+}
+
+fn secret_plain_value(key: &str, secret: Secret, path: &Path) -> eyre::Result<String> {
+    match secret {
+        Secret::Plain { value } => non_empty_secret_value(key, value, path),
+        other => eyre::bail!(
+            "secret `{key}` in {} has type {}, expected plain",
+            path.display(),
+            other.secret_type()
+        ),
+    }
+}
+
+fn secret_oauth_field(
+    key: &str,
+    secret: Secret,
+    field: &str,
+    path: &Path,
+) -> eyre::Result<Option<String>> {
+    let Secret::OAuth {
+        access_token,
+        expires_at,
+        account_id,
+        ..
+    } = secret
+    else {
+        eyre::bail!(
+            "secret `{key}` in {} has type plain, expected oauth",
+            path.display()
+        );
+    };
+    match field {
+        "access_token" => non_empty_secret_value(key, access_token, path).map(Some),
+        "expires_at" => non_empty_secret_value(key, expires_at, path).map(Some),
+        "account_id" => account_id
+            .map(|value| non_empty_secret_value(key, value, path))
+            .transpose(),
+        _ => Ok(None),
+    }
+}
+
+fn non_empty_secret_value(key: &str, value: String, path: &Path) -> eyre::Result<String> {
+    if value.is_empty() {
+        eyre::bail!("secret `{key}` in {} has an empty value", path.display());
+    }
+    Ok(value)
+}
+
+#[derive(Debug)]
+struct MissingNetworkSecret {
+    owner: String,
+    expected: Vec<Vec<String>>,
+    hint: String,
+}
+
+impl MissingNetworkSecret {
+    fn new(policy: &NetworkPolicy, requirement: &NetworkSecretRequirement) -> Self {
+        Self {
+            owner: requirement.owner.clone(),
+            expected: expected_secret_requirement_keys(policy, requirement),
+            hint: secret_requirement_hint(policy, requirement),
+        }
+    }
+}
+
+fn missing_network_secret_requirements(
+    policy: &NetworkPolicy,
+    supplied_slots: &std::collections::BTreeSet<String>,
+) -> Vec<MissingNetworkSecret> {
+    policy
+        .secret_requirements()
+        .into_iter()
+        .filter(|requirement| {
+            !requirement.alternatives.iter().any(|alternative| {
+                alternative
+                    .slots
+                    .iter()
+                    .all(|slot| supplied_slots.contains(slot))
+            })
+        })
+        .map(|requirement| MissingNetworkSecret::new(policy, &requirement))
+        .collect()
+}
+
+fn expected_secret_requirement_keys(
+    policy: &NetworkPolicy,
+    requirement: &NetworkSecretRequirement,
+) -> Vec<Vec<String>> {
+    let mut expected = Vec::new();
+    for alternative in &requirement.alternatives {
+        expected.extend(expected_secret_alternative_keys(policy, alternative));
+    }
+    expected.sort();
+    expected.dedup();
+    expected
+}
+
+fn expected_secret_alternative_keys(
+    policy: &NetworkPolicy,
+    alternative: &NetworkSecretAlternative,
+) -> Vec<Vec<String>> {
+    if let Some(credential) = credential_for_alternative(policy, alternative) {
+        let slot_suffixes = alternative
+            .slots
+            .iter()
+            .filter_map(|slot| slot.strip_prefix(&format!("{}.", credential.name)))
+            .collect::<Vec<_>>();
+        let slot_kinds = alternative
+            .slots
+            .iter()
+            .filter_map(|slot_name| policy_slot(policy, slot_name).map(|slot| slot.kind))
+            .collect::<Vec<_>>();
+        if slot_kinds
+            .iter()
+            .all(|kind| *kind == NetworkSecretKind::OAuth)
+        {
+            return vec![
+                vec![slot_key(&credential.kind, &credential.name, "oauth")],
+                alternative.slots.clone(),
+            ];
+        }
+        if slot_kinds
+            .iter()
+            .all(|kind| *kind == NetworkSecretKind::Plain)
+            && slot_suffixes.len() == alternative.slots.len()
+        {
+            return vec![
+                slot_suffixes
+                    .iter()
+                    .map(|suffix| slot_key(&credential.kind, &credential.name, suffix))
+                    .collect(),
+                alternative.slots.clone(),
+            ];
+        }
+    }
+
+    if let Some(tunnel_name) = tailscale_tunnel_for_alternative(alternative) {
+        return vec![
+            vec![format!("tailscale.{tunnel_name}.auth_key")],
+            alternative.slots.clone(),
+        ];
+    }
+
+    vec![alternative.slots.clone()]
+}
+
+fn credential_for_alternative<'a>(
+    policy: &'a NetworkPolicy,
+    alternative: &NetworkSecretAlternative,
+) -> Option<&'a NetworkCredential> {
+    let first_slot = alternative.slots.first()?;
+    let credential = credential_for_slot(policy, first_slot)?;
+    if alternative.slots.iter().all(|slot| {
+        credential_for_slot(policy, slot).is_some_and(|candidate| candidate.name == credential.name)
+    }) {
+        Some(credential)
+    } else {
+        None
+    }
+}
+
+fn policy_slot(policy: &NetworkPolicy, slot_name: &str) -> Option<NetworkSecretSlot> {
+    policy
+        .secret_slots()
+        .into_iter()
+        .find(|slot| slot.name == slot_name)
+}
+
+fn tailscale_tunnel_for_alternative(alternative: &NetworkSecretAlternative) -> Option<&str> {
+    let [slot] = alternative.slots.as_slice() else {
+        return None;
+    };
+    slot.strip_suffix(".tailscale.auth_key")
+}
+
+fn credential_secret_hint(credential: &NetworkCredential) -> String {
+    match credential.kind.as_str() {
+        OPENAI_CODEX_KIND => format!("run `bento secret login openai-codex --name {}`", credential.name),
+        "basic_auth" => format!(
+            "write it with `printf '%s' \"$PASSWORD\" | bento secret set basic_auth {} --password-stdin`",
+            credential.name
+        ),
+        "bearer_token" => format!(
+            "write it with `printf '%s' \"$TOKEN\" | bento secret set bearer_token {} --token-stdin`",
+            credential.name
+        ),
+        "header_token" => format!(
+            "write it with `printf '%s' \"$TOKEN\" | bento secret set header_token {} --token-stdin`",
+            credential.name
+        ),
+        "aws_credential" => format!(
+            "write a profile with `bento secret set aws_credential {} --profile <profile>` or static keys with `bento secret set aws_credential {} --access-key-id ... --secret-access-key-stdin`",
+            credential.name, credential.name
+        ),
+        _ => format!(
+            "write a matching secret with `bento secret set {}`",
+            credential.name
+        ),
+    }
+}
+
+fn secret_requirement_hint(
+    policy: &NetworkPolicy,
+    requirement: &NetworkSecretRequirement,
+) -> String {
+    if let Some(credential) = requirement
+        .alternatives
+        .iter()
+        .find_map(|alternative| credential_for_alternative(policy, alternative))
+    {
+        return credential_secret_hint(credential);
+    }
+    if let Some(tunnel_name) = requirement
+        .alternatives
+        .iter()
+        .find_map(tailscale_tunnel_for_alternative)
+    {
+        return format!(
+            "write it with `printf '%s' \"$SECRET\" | bento secret set tailscale.{tunnel_name}.auth_key --value-stdin`"
+        );
+    }
+    "write the required network secret material with `bento secret set`".to_string()
+}
+
+fn format_missing_network_secrets(missing: &[MissingNetworkSecret], path: &Path) -> String {
+    let mut message = format!(
+        "missing required network secret material for persisted network policy in {}",
+        path.display()
+    );
+    for missing in missing {
+        message.push_str("\n- ");
+        message.push_str(&missing.owner);
+        message.push_str("\n  expected one of: ");
+        message.push_str(&format_expected_secret_alternatives(&missing.expected));
+        message.push_str("\n  hint: ");
+        message.push_str(&missing.hint);
+    }
+    message
+}
+
+fn format_expected_secret_alternatives(alternatives: &[Vec<String>]) -> String {
+    alternatives
+        .iter()
+        .map(|alternative| {
+            alternative
+                .iter()
+                .map(|key| format!("`{key}`"))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        })
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
 fn list_secrets(store: &SecretStore, command: &ListCmd) -> eyre::Result<()> {
     let secrets = store.list()?;
     match command.format {
@@ -717,6 +1210,328 @@ fn print_hcl_snippet(name: &str) -> eyre::Result<()> {
     writeln!(out, "  endpoint = https.openai-codex")?;
     writeln!(out, "}}")?;
     Ok(())
+}
+
+async fn refresh_oauth(command: &RefreshOAuthCmd) -> eyre::Result<()> {
+    let request = read_json_frame(std::io::stdin().lock())?;
+    let store = SecretStore::new(command.store_file.clone());
+    let response = match refresh_oauth_request(&store, &command.store_file, request).await {
+        Ok(oauth) => OAuthRefreshHookResponse::ok(oauth),
+        Err(error) => OAuthRefreshHookResponse::error(error),
+    };
+    write_json_frame(std::io::stdout().lock(), &response)
+}
+
+async fn refresh_oauth_request(
+    store: &SecretStore,
+    store_file: &Path,
+    request: OAuthRefreshHookRequest,
+) -> Result<OAuthRefreshHookOAuth, OAuthRefreshFailure> {
+    if request.version != 1 || request.operation != "oauth_refresh" {
+        return Err(OAuthRefreshFailure::invalid_request(
+            "unsupported OAuth refresh request",
+        ));
+    }
+    let encoded_auth = std::env::var(OAUTH_REFRESH_AUTH_ENV).map_err(|_| {
+        OAuthRefreshFailure::unauthorized(format!("{OAUTH_REFRESH_AUTH_ENV} is required"))
+    })?;
+    let grant = decode_oauth_refresh_grant(&encoded_auth)?;
+    if grant.version != 1 {
+        return Err(OAuthRefreshFailure::unauthorized(
+            "unsupported OAuth refresh grant version",
+        ));
+    }
+    if grant.store_file != store_file {
+        return Err(OAuthRefreshFailure::unauthorized(
+            "OAuth refresh grant does not match requested secret store",
+        ));
+    }
+    let Some(grant_credential) = grant.credentials.iter().find(|candidate| {
+        candidate.name == request.credential.name
+            && candidate.kind == request.credential.kind
+            && candidate.endpoint == request.credential.endpoint
+    }) else {
+        return Err(OAuthRefreshFailure::unauthorized(
+            "OAuth refresh grant does not allow this credential",
+        ));
+    };
+    let secret = store
+        .get_optional(&grant_credential.secret_key)
+        .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?
+        .ok_or_else(|| OAuthRefreshFailure::not_found("OAuth secret was not found"))?;
+    match request.credential.kind.as_str() {
+        OPENAI_CODEX_KIND => {
+            refresh_openai_codex_oauth(store, &grant_credential.secret_key, secret).await
+        }
+        other => Err(OAuthRefreshFailure::invalid_request(format!(
+            "OAuth credential kind {other:?} is not refreshable by this command"
+        ))),
+    }
+}
+
+fn decode_oauth_refresh_grant(encoded: &str) -> Result<OAuthRefreshGrant, OAuthRefreshFailure> {
+    let raw = STANDARD
+        .decode(encoded)
+        .map_err(|err| OAuthRefreshFailure::unauthorized(format!("decode refresh auth: {err}")))?;
+    serde_json::from_slice(&raw)
+        .map_err(|err| OAuthRefreshFailure::unauthorized(format!("parse refresh auth: {err}")))
+}
+
+async fn refresh_openai_codex_oauth(
+    store: &SecretStore,
+    key: &str,
+    secret: Secret,
+) -> Result<OAuthRefreshHookOAuth, OAuthRefreshFailure> {
+    let Secret::OAuth {
+        refresh_token,
+        account_id,
+        created_at,
+        ..
+    } = secret
+    else {
+        return Err(OAuthRefreshFailure::invalid_request(format!(
+            "secret {key:?} is not an OAuth secret"
+        )));
+    };
+    if refresh_token.is_empty() {
+        return Err(OAuthRefreshFailure::invalid_request(
+            "OAuth secret does not contain a refresh token",
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("bento/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?;
+    let token = refresh_openai_codex_token(&client, &refresh_token).await?;
+    let next_refresh_token = if token.refresh_token.is_empty() {
+        refresh_token
+    } else {
+        token.refresh_token
+    };
+    let expires_at = expires_at_from_seconds(token.expires_in);
+    let updated = Secret::OAuth {
+        access_token: token.access_token.clone(),
+        refresh_token: next_refresh_token,
+        expires_at: expires_at.clone(),
+        account_id: account_id.clone(),
+        created_at,
+        updated_at: rfc3339_now(),
+    };
+    store
+        .put(key, updated)
+        .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?;
+    Ok(OAuthRefreshHookOAuth {
+        access_token: token.access_token,
+        expires_at,
+        account_id,
+    })
+}
+
+async fn refresh_openai_codex_token(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<TokenResponse, OAuthRefreshFailure> {
+    let response = client
+        .post(OPENAI_TOKEN_URL)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", OPENAI_CODEX_CLIENT_ID),
+        ])
+        .send()
+        .await
+        .map_err(|err| OAuthRefreshFailure::provider_unavailable(err.to_string()))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|err| OAuthRefreshFailure::provider_unavailable(err.to_string()))?;
+    if !status.is_success() {
+        return Err(OAuthRefreshFailure::provider_rejected(format!(
+            "OpenAI Codex OAuth refresh returned {status}: {}",
+            sanitize_response_body(&body)
+        )));
+    }
+    let token = serde_json::from_str::<TokenResponse>(&body)
+        .map_err(|err| OAuthRefreshFailure::provider_rejected(err.to_string()))?;
+    if token.access_token.is_empty() {
+        return Err(OAuthRefreshFailure::provider_rejected(
+            "OpenAI Codex OAuth refresh did not include an access token",
+        ));
+    }
+    Ok(token)
+}
+
+fn read_json_frame<R, T>(reader: R) -> eyre::Result<T>
+where
+    R: Read,
+    T: for<'de> Deserialize<'de>,
+{
+    let mut reader = std::io::BufReader::new(reader);
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            eyre::bail!("missing Content-Length frame header");
+        }
+        let header = line.trim_end_matches(['\r', '\n']);
+        if header.is_empty() {
+            break;
+        }
+        let Some((name, value)) = header.split_once(':') else {
+            eyre::bail!("invalid frame header {header:?}");
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = Some(value.trim().parse::<usize>()?);
+        }
+    }
+    let length = content_length.ok_or_else(|| eyre::eyre!("missing Content-Length header"))?;
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+fn write_json_frame<W, T>(mut writer: W, value: &T) -> eyre::Result<()>
+where
+    W: Write,
+    T: Serialize,
+{
+    let body = serde_json::to_vec(value)?;
+    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
+    writer.write_all(&body)?;
+    writer.flush()?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OAuthRefreshHookRequest {
+    version: u8,
+    operation: String,
+    credential: OAuthRefreshHookCredential,
+    #[allow(dead_code)]
+    reason: String,
+    #[allow(dead_code)]
+    expires_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OAuthRefreshHookCredential {
+    name: String,
+    kind: String,
+    endpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OAuthRefreshHookResponse {
+    version: u8,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oauth: Option<OAuthRefreshHookOAuth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<OAuthRefreshHookError>,
+}
+
+impl OAuthRefreshHookResponse {
+    fn ok(oauth: OAuthRefreshHookOAuth) -> Self {
+        Self {
+            version: 1,
+            status: "ok",
+            oauth: Some(oauth),
+            error: None,
+        }
+    }
+
+    fn error(error: OAuthRefreshFailure) -> Self {
+        Self {
+            version: 1,
+            status: "error",
+            oauth: None,
+            error: Some(OAuthRefreshHookError {
+                code: error.code,
+                message: error.message,
+                retryable: error.retryable,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct OAuthRefreshHookOAuth {
+    access_token: String,
+    expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OAuthRefreshHookError {
+    code: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "is_false")]
+    retryable: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug)]
+struct OAuthRefreshFailure {
+    code: &'static str,
+    message: String,
+    retryable: bool,
+}
+
+impl OAuthRefreshFailure {
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            code: "unauthorized",
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: "not_found",
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    fn provider_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: "provider_unavailable",
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    fn provider_rejected(message: impl Into<String>) -> Self {
+        Self {
+            code: "provider_rejected",
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    fn invalid_request(message: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_request",
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            code: "internal_error",
+            message: message.into(),
+            retryable: false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -930,10 +1745,13 @@ impl SecretStore {
     }
 
     fn get(&self, name: &str) -> eyre::Result<Secret> {
-        validate_secret_name(name)?;
-        self.read_all()?
-            .remove(name)
+        self.get_optional(name)?
             .ok_or_else(|| eyre::eyre!("secret `{name}` not found"))
+    }
+
+    fn get_optional(&self, name: &str) -> eyre::Result<Option<Secret>> {
+        validate_secret_name(name)?;
+        Ok(self.read_all()?.remove(name))
     }
 
     fn remove(&self, name: &str) -> eyre::Result<()> {
@@ -1132,9 +1950,10 @@ mod tests {
     use crate::commands::Command;
 
     use super::{
-        is_pending_device_poll_response, plain_secret_value, set_plain_secret, slot_key,
-        write_plain_secret, LoginProvider, Secret, SecretStore, SecretSubcommand, SetCmd,
-        OPENAI_CODEX_KIND,
+        is_pending_device_poll_response, network_launch_from_store, plain_secret_value,
+        read_json_frame, set_plain_secret, slot_key, write_json_frame, write_plain_secret,
+        LoginProvider, OAuthRefreshGrant, OAuthRefreshHookRequest, Secret, SecretStore,
+        SecretSubcommand, SetCmd, OPENAI_CODEX_KIND,
     };
 
     #[test]
@@ -1178,6 +1997,27 @@ mod tests {
             "personal",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn secret_refresh_oauth_parses_but_is_hidden() {
+        let cli = Cli::try_parse_from([
+            "bento",
+            "secret",
+            "refresh-oauth",
+            "--store-file",
+            "/tmp/secrets.json",
+        ])
+        .expect("hidden refresh command should parse");
+
+        let secret = match cli.command {
+            Command::Secret(command) => command,
+            other => panic!("expected secret command, got {other:?}"),
+        };
+        assert!(matches!(secret.command, SecretSubcommand::RefreshOAuth(_)));
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("refresh-oauth"));
     }
 
     #[test]
@@ -1299,6 +2139,262 @@ mod tests {
         assert_plain_secret(&store, "aws_credential.prod.access_key_id", "AKIAEXAMPLE");
         assert_plain_secret(&store, "aws_credential.prod.secret_access_key", "secret");
         assert_plain_secret(&store, "aws_credential.prod.session_token", "session");
+    }
+
+    #[test]
+    fn network_launch_reads_openai_oauth_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SecretStore::new(dir.path().join("secrets.json"));
+        let key = slot_key(OPENAI_CODEX_KIND, "personal", "oauth");
+        store
+            .put(
+                &key,
+                Secret::OAuth {
+                    access_token: "access-token".to_string(),
+                    refresh_token: "refresh-token".to_string(),
+                    expires_at: "2026-07-04T00:00:00Z".to_string(),
+                    account_id: Some("acct_123".to_string()),
+                    created_at: "2026-07-03T00:00:00Z".to_string(),
+                    updated_at: "2026-07-03T00:00:00Z".to_string(),
+                },
+            )
+            .expect("write oauth secret");
+        let policy = network_policy(
+            r#"{
+                "version": 1,
+                "endpoints": [
+                    { "name": "openai", "kind": "https", "hosts": ["chatgpt.com"] }
+                ],
+                "credentials": [
+                    { "name": "personal", "kind": "openai_codex_oauth", "endpoint": "openai" }
+                ]
+            }"#,
+        );
+
+        let launch =
+            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/bento").as_path())
+                .expect("network launch");
+
+        assert_network_secret(&launch, "personal.oauth.access_token", "access-token");
+        assert_network_secret(&launch, "personal.oauth.expires_at", "2026-07-04T00:00:00Z");
+        assert_network_secret(&launch, "personal.oauth.account_id", "acct_123");
+        assert!(!launch
+            .secrets
+            .iter()
+            .any(|secret| secret.value == b"refresh-token"));
+
+        let hook = launch.oauth_refresh_hook.as_ref().expect("oauth hook");
+        assert_eq!(hook.command, PathBuf::from("/usr/bin/bento"));
+        assert_eq!(
+            hook.args,
+            vec![
+                "secret".to_string(),
+                "refresh-oauth".to_string(),
+                "--store-file".to_string(),
+                store.path().to_string_lossy().to_string(),
+            ]
+        );
+        let grant: OAuthRefreshGrant = serde_json::from_slice(&hook.auth).expect("hook grant");
+        assert_eq!(grant.store_file, store.path());
+        assert_eq!(grant.credentials.len(), 1);
+        assert_eq!(grant.credentials[0].name, "personal");
+        assert_eq!(grant.credentials[0].kind, OPENAI_CODEX_KIND);
+        assert_eq!(grant.credentials[0].endpoint, "openai");
+        assert_eq!(grant.credentials[0].secret_key, key);
+    }
+
+    #[test]
+    fn network_launch_reports_missing_oauth_secret_with_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SecretStore::new(dir.path().join("secrets.json"));
+        let policy = network_policy(
+            r#"{
+                "version": 1,
+                "endpoints": [
+                    { "name": "openai", "kind": "https", "hosts": ["chatgpt.com"] }
+                ],
+                "credentials": [
+                    { "name": "personal", "kind": "openai_codex_oauth", "endpoint": "openai" }
+                ]
+            }"#,
+        );
+
+        let error =
+            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/bento").as_path())
+                .expect_err("missing secret");
+        let message = error.to_string();
+
+        assert!(message.contains("personal.oauth.access_token"));
+        assert!(message.contains("personal.oauth.expires_at"));
+        assert!(message.contains("openai_codex_oauth.personal.oauth"));
+        assert!(message.contains("bento secret login openai-codex --name personal"));
+    }
+
+    #[test]
+    fn network_launch_reads_provider_plain_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SecretStore::new(dir.path().join("secrets.json"));
+        store
+            .put(
+                "bearer_token.github-api.token",
+                Secret::Plain {
+                    value: "github-token".to_string(),
+                },
+            )
+            .expect("write token secret");
+        let policy = network_policy(
+            r#"{
+                "version": 1,
+                "endpoints": [
+                    { "name": "github", "kind": "https", "hosts": ["github.com"] }
+                ],
+                "credentials": [
+                    { "name": "github-api", "kind": "bearer_token", "endpoint": "github" }
+                ]
+            }"#,
+        );
+
+        let launch =
+            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/bento").as_path())
+                .expect("network launch");
+
+        assert_network_secret(&launch, "github-api.token", "github-token");
+        assert!(launch.oauth_refresh_hook.is_none());
+    }
+
+    #[test]
+    fn network_launch_reads_aws_profile_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SecretStore::new(dir.path().join("secrets.json"));
+        store
+            .put(
+                "aws_credential.prod.profile",
+                Secret::Plain {
+                    value: "production-admin".to_string(),
+                },
+            )
+            .expect("write aws profile");
+        store
+            .put(
+                "aws_credential.prod.access_key_id",
+                Secret::Plain {
+                    value: "AKIAIGNORED".to_string(),
+                },
+            )
+            .expect("write ignored access key");
+        store
+            .put(
+                "aws_credential.prod.secret_access_key",
+                Secret::Plain {
+                    value: "ignored-secret".to_string(),
+                },
+            )
+            .expect("write ignored secret key");
+        let policy = aws_network_policy();
+
+        let launch =
+            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/bento").as_path())
+                .expect("network launch");
+
+        assert_network_secret(&launch, "prod.profile", "production-admin");
+        assert!(!launch
+            .secrets
+            .iter()
+            .any(|secret| secret.slot == "prod.access_key_id"));
+        assert!(!launch
+            .secrets
+            .iter()
+            .any(|secret| secret.slot == "prod.secret_access_key"));
+    }
+
+    #[test]
+    fn network_launch_reads_aws_static_secret_pair() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SecretStore::new(dir.path().join("secrets.json"));
+        store
+            .put(
+                "aws_credential.prod.access_key_id",
+                Secret::Plain {
+                    value: "AKIAEXAMPLE".to_string(),
+                },
+            )
+            .expect("write access key");
+        store
+            .put(
+                "aws_credential.prod.secret_access_key",
+                Secret::Plain {
+                    value: "secret".to_string(),
+                },
+            )
+            .expect("write secret key");
+        store
+            .put(
+                "aws_credential.prod.session_token",
+                Secret::Plain {
+                    value: "session".to_string(),
+                },
+            )
+            .expect("write session token");
+        let policy = aws_network_policy();
+
+        let launch =
+            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/bento").as_path())
+                .expect("network launch");
+
+        assert_network_secret(&launch, "prod.access_key_id", "AKIAEXAMPLE");
+        assert_network_secret(&launch, "prod.secret_access_key", "secret");
+        assert_network_secret(&launch, "prod.session_token", "session");
+    }
+
+    #[test]
+    fn network_launch_reports_missing_aws_profile_or_static_pair() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SecretStore::new(dir.path().join("secrets.json"));
+        store
+            .put(
+                "aws_credential.prod.session_token",
+                Secret::Plain {
+                    value: "session".to_string(),
+                },
+            )
+            .expect("write session token");
+        let policy = aws_network_policy();
+
+        let error =
+            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/bento").as_path())
+                .expect_err("missing aws credential material");
+        let message = error.to_string();
+
+        assert!(message.contains("aws_credential.prod.profile"));
+        assert!(message.contains("prod.profile"));
+        assert!(message.contains("aws_credential.prod.access_key_id"));
+        assert!(message.contains("aws_credential.prod.secret_access_key"));
+        assert!(message.contains("bento secret set aws_credential prod --profile <profile>"));
+    }
+
+    #[test]
+    fn oauth_refresh_frames_round_trip_json() {
+        let request = OAuthRefreshHookRequest {
+            version: 1,
+            operation: "oauth_refresh".to_string(),
+            credential: super::OAuthRefreshHookCredential {
+                name: "personal".to_string(),
+                kind: OPENAI_CODEX_KIND.to_string(),
+                endpoint: "openai".to_string(),
+            },
+            reason: "expires_soon".to_string(),
+            expires_at: "2026-07-04T00:00:00Z".to_string(),
+        };
+        let mut frame = Vec::new();
+        write_json_frame(&mut frame, &request).expect("write frame");
+
+        let decoded: OAuthRefreshHookRequest =
+            read_json_frame(frame.as_slice()).expect("read frame");
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.operation, "oauth_refresh");
+        assert_eq!(decoded.credential.name, "personal");
+        assert_eq!(decoded.credential.kind, OPENAI_CODEX_KIND);
+        assert_eq!(decoded.credential.endpoint, "openai");
     }
 
     #[test]
@@ -1469,6 +2565,33 @@ mod tests {
             profile: None,
             force: false,
         }
+    }
+
+    fn network_policy(source: &str) -> bento_policy::NetworkPolicy {
+        bento_policy::NetworkPolicy::from_json_str(source).expect("network policy")
+    }
+
+    fn aws_network_policy() -> bento_policy::NetworkPolicy {
+        network_policy(
+            r#"{
+                "version": 1,
+                "endpoints": [
+                    { "name": "aws", "kind": "https", "hosts": ["sts.amazonaws.com"] }
+                ],
+                "credentials": [
+                    { "name": "prod", "kind": "aws_credential", "endpoint": "aws" }
+                ]
+            }"#,
+        )
+    }
+
+    fn assert_network_secret(launch: &libvm::NetworkLaunch, slot: &str, expected: &str) {
+        let secret = launch
+            .secrets
+            .iter()
+            .find(|secret| secret.slot == slot)
+            .unwrap_or_else(|| panic!("missing network secret {slot}"));
+        assert_eq!(secret.value, expected.as_bytes());
     }
 
     fn assert_plain_secret(store: &SecretStore, name: &str, expected: &str) {

@@ -7,8 +7,8 @@ mod parse;
 
 pub use canonical::{
     IpProtocol, NetworkAuditSettings, NetworkCredential, NetworkEndpoint, NetworkForward,
-    NetworkPolicy, NetworkPolicySettings, NetworkRule, NetworkSecretKind, NetworkSecretSlot,
-    PolicyLoadError, TailscaleTunnel,
+    NetworkPolicy, NetworkPolicySettings, NetworkRule, NetworkSecretAlternative, NetworkSecretKind,
+    NetworkSecretRequirement, NetworkSecretSlot, PolicyLoadError, TailscaleTunnel,
 };
 pub use condition::{ConditionCompileError, ConditionEvalError, HttpConditionContext};
 pub use model::{

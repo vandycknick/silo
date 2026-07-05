@@ -4,16 +4,24 @@ use std::path::{Path, PathBuf};
 use eyre::Context as _;
 use libvm::{Machine, MachineExitCommand, MachineStartOptions, Runtime};
 
-pub(crate) fn machine_start_options(
+use crate::commands::secret::network_launch_from_secret_store;
+
+pub(crate) async fn machine_start_options(
     runtime: &Runtime,
     machine: &Machine,
 ) -> eyre::Result<MachineStartOptions> {
     let executable = std::env::current_exe().context("resolve CLI binary path")?;
-    Ok(cleanup_exit_command_options(
-        executable,
-        runtime.local_data_dir(),
-        &machine.id(),
-    ))
+    let mut options =
+        cleanup_exit_command_options(executable, runtime.local_data_dir(), &machine.id());
+    let data = machine
+        .inspect()
+        .await
+        .context("inspect machine network policy")?;
+    if let Some(policy) = data.network.policy() {
+        let launch = network_launch_from_secret_store(policy)?;
+        options = options.network(|network| network.apply(launch));
+    }
+    Ok(options)
 }
 
 fn cleanup_exit_command_options(

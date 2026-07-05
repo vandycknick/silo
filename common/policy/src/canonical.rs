@@ -124,6 +124,20 @@ impl NetworkPolicy {
         slots
     }
 
+    pub fn secret_requirements(&self) -> Vec<NetworkSecretRequirement> {
+        let mut requirements = Vec::new();
+        for credential in &self.credentials {
+            requirements.extend(credential_secret_requirements(credential));
+        }
+        for tunnel in &self.tailscale {
+            requirements.push(NetworkSecretRequirement::one(
+                format!("Tailscale tunnel {}", tunnel.name),
+                vec![format!("{}.tailscale.auth_key", tunnel.name)],
+            ));
+        }
+        requirements
+    }
+
     fn from_json_source(
         filename: impl Into<String>,
         source: &str,
@@ -394,6 +408,36 @@ impl NetworkSecretSlot {
             kind,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkSecretRequirement {
+    pub owner: String,
+    pub alternatives: Vec<NetworkSecretAlternative>,
+}
+
+impl NetworkSecretRequirement {
+    fn one(owner: String, slots: Vec<String>) -> Self {
+        Self {
+            owner,
+            alternatives: vec![NetworkSecretAlternative { slots }],
+        }
+    }
+
+    fn alternatives(owner: String, alternatives: Vec<Vec<String>>) -> Self {
+        Self {
+            owner,
+            alternatives: alternatives
+                .into_iter()
+                .map(|slots| NetworkSecretAlternative { slots })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkSecretAlternative {
+    pub slots: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -935,6 +979,8 @@ impl PolicyValidator {
     }
 
     fn validate_secret_slots(&mut self, policy: &NetworkPolicy) {
+        let mut env_names: BTreeMap<String, String> = BTreeMap::new();
+
         for slot in policy.secret_slots() {
             if !valid_secret_slot(&slot.name) {
                 self.error(
@@ -944,6 +990,21 @@ impl PolicyValidator {
                         slot.name
                     ),
                 );
+            }
+
+            let env_name = slot.env_name();
+            if let Some(existing) = env_names.get(&env_name) {
+                if existing != &slot.name {
+                    self.error(
+                        "network secret env name collision",
+                        format!(
+                            "network secret slots {:?} and {:?} both map to {}",
+                            existing, slot.name, env_name
+                        ),
+                    );
+                }
+            } else {
+                env_names.insert(env_name, slot.name);
             }
         }
     }
@@ -1013,6 +1074,32 @@ fn credential_secret_slots(credential: &NetworkCredential) -> Vec<NetworkSecretS
             NetworkSecretSlot::optional(slot("session_token"), NetworkSecretKind::Plain),
             NetworkSecretSlot::optional(slot("profile"), NetworkSecretKind::Plain),
         ],
+        _ => Vec::new(),
+    }
+}
+
+fn credential_secret_requirements(credential: &NetworkCredential) -> Vec<NetworkSecretRequirement> {
+    let slot = |name: &str| format!("{}.{}", credential.name, name);
+    let owner = || format!("credential {}.{}", credential.kind, credential.name);
+    match credential.kind.as_str() {
+        "basic_auth" => vec![NetworkSecretRequirement::one(
+            owner(),
+            vec![slot("password")],
+        )],
+        "bearer_token" | "header_token" => {
+            vec![NetworkSecretRequirement::one(owner(), vec![slot("token")])]
+        }
+        "github_oauth" | "openai_codex_oauth" => vec![NetworkSecretRequirement::one(
+            owner(),
+            vec![slot("oauth.access_token"), slot("oauth.expires_at")],
+        )],
+        "aws_credential" => vec![NetworkSecretRequirement::alternatives(
+            owner(),
+            vec![
+                vec![slot("profile")],
+                vec![slot("access_key_id"), slot("secret_access_key")],
+            ],
+        )],
         _ => Vec::new(),
     }
 }
@@ -1132,6 +1219,68 @@ mod tests {
         assert!(slots
             .iter()
             .any(|slot| slot.name == "worktail.tailscale.auth_key" && slot.required));
+    }
+
+    #[test]
+    fn rejects_network_secret_env_name_collisions() {
+        let error = NetworkPolicy::from_json_str(
+            r#"
+            {
+              "version": 1,
+              "endpoints": [
+                { "name": "api", "kind": "https", "hosts": ["api.example.com"] }
+              ],
+              "credentials": [
+                { "name": "api-key", "kind": "bearer_token", "endpoint": "api" },
+                { "name": "api_key", "kind": "bearer_token", "endpoint": "api" }
+              ]
+            }
+            "#,
+        )
+        .expect_err("colliding secret env names should fail");
+
+        assert!(error.diagnostics.iter().any(|diagnostic| {
+            diagnostic.summary == "network secret env name collision"
+                && diagnostic.detail.contains("api-key.token")
+                && diagnostic.detail.contains("api_key.token")
+                && diagnostic.detail.contains("BENTO_NET_SECRET_API_KEY_TOKEN")
+        }));
+    }
+
+    #[test]
+    fn aws_credential_secret_requirements_allow_profile_or_static_keys() {
+        let policy = NetworkPolicy::from_json_str(
+            r#"
+            {
+              "version": 1,
+              "endpoints": [
+                { "name": "aws", "kind": "https", "hosts": ["sts.amazonaws.com"] }
+              ],
+              "credentials": [
+                { "name": "prod", "kind": "aws_credential", "endpoint": "aws" }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let requirements = policy.secret_requirements();
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].owner, "credential aws_credential.prod");
+        let alternatives = requirements[0]
+            .alternatives
+            .iter()
+            .map(|alternative| alternative.slots.as_slice())
+            .collect::<Vec<_>>();
+
+        assert!(alternatives.contains(&["prod.profile".to_string()].as_slice()));
+        assert!(alternatives.contains(
+            &[
+                "prod.access_key_id".to_string(),
+                "prod.secret_access_key".to_string()
+            ]
+            .as_slice()
+        ));
     }
 
     #[test]

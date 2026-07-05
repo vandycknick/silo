@@ -188,14 +188,27 @@ impl NetworkLaunch {
         };
 
         let slots = policy.secret_slots();
+        let mut env_names = HashMap::new();
+        for slot in &slots {
+            let env_name = slot.env_name();
+            if let Some(existing) = env_names.get(&env_name) {
+                if *existing != slot.name.as_str() {
+                    return Err(LibVmError::NetworkRuntime {
+                        reference: reference.to_string(),
+                        message: format!(
+                            "network secret slots {:?} and {:?} both map to {}",
+                            existing, slot.name, env_name
+                        ),
+                    });
+                }
+            } else {
+                env_names.insert(env_name, slot.name.as_str());
+            }
+        }
+
         let allowed_slots: HashMap<&str, _> = slots
             .iter()
             .map(|slot| (slot.name.as_str(), slot))
-            .collect();
-        let required_slots: HashSet<&str> = slots
-            .iter()
-            .filter(|slot| slot.required)
-            .map(|slot| slot.name.as_str())
             .collect();
         let mut supplied_slots = HashSet::new();
 
@@ -226,11 +239,20 @@ impl NetworkLaunch {
             }
         }
 
-        for slot in required_slots {
-            if !supplied_slots.contains(slot) {
+        for requirement in policy.secret_requirements() {
+            if !requirement.alternatives.iter().any(|alternative| {
+                alternative
+                    .slots
+                    .iter()
+                    .all(|slot| supplied_slots.contains(slot.as_str()))
+            }) {
                 return Err(LibVmError::NetworkRuntime {
                     reference: reference.to_string(),
-                    message: format!("required network secret slot {slot:?} was not supplied"),
+                    message: format!(
+                        "required network secret material for {} was not supplied; expected {}",
+                        requirement.owner,
+                        format_secret_requirement(&requirement.alternatives)
+                    ),
                 });
             }
         }
@@ -304,6 +326,21 @@ impl NetworkLaunch {
         }
         Ok(())
     }
+}
+
+fn format_secret_requirement(alternatives: &[bento_policy::NetworkSecretAlternative]) -> String {
+    alternatives
+        .iter()
+        .map(|alternative| {
+            alternative
+                .slots
+                .iter()
+                .map(|slot| format!("{slot:?}"))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        })
+        .collect::<Vec<_>>()
+        .join(" or ")
 }
 
 impl OAuthRefreshHook {
@@ -401,6 +438,22 @@ mod tests {
         .expect("oauth policy")
     }
 
+    fn aws_policy() -> NetworkPolicy {
+        NetworkPolicy::from_json_str(
+            r#"{
+                "version": 1,
+                "metadata": {},
+                "endpoints": [
+                    { "name": "aws", "kind": "https", "hosts": ["sts.amazonaws.com"] }
+                ],
+                "credentials": [
+                    { "name": "prod", "kind": "aws_credential", "endpoint": "aws" }
+                ]
+            }"#,
+        )
+        .expect("aws policy")
+    }
+
     fn private_network(policy: NetworkPolicy) -> MachineNetworkConfig {
         MachineNetworkConfig::Private {
             policy: Some(policy),
@@ -446,6 +499,47 @@ mod tests {
     }
 
     #[test]
+    fn network_launch_accepts_aws_profile_secret() {
+        let policy = aws_policy();
+        let launch = NetworkLaunch::new().secret("prod.profile", "production-admin");
+
+        launch
+            .validate_for_policy(Some(&policy), "devbox")
+            .expect("profile should satisfy aws credential requirement");
+    }
+
+    #[test]
+    fn network_launch_accepts_aws_static_secrets() {
+        let policy = aws_policy();
+        let launch = NetworkLaunch::new()
+            .secret("prod.access_key_id", "AKIAEXAMPLE")
+            .secret("prod.secret_access_key", "secret")
+            .secret("prod.session_token", "session");
+
+        launch
+            .validate_for_policy(Some(&policy), "devbox")
+            .expect("static keys should satisfy aws credential requirement");
+    }
+
+    #[test]
+    fn network_launch_rejects_aws_session_token_without_profile_or_static_keys() {
+        let policy = aws_policy();
+        let launch = NetworkLaunch::new().secret("prod.session_token", "session");
+
+        let err = launch
+            .validate_for_policy(Some(&policy), "devbox")
+            .expect_err("session token alone should fail");
+
+        assert!(matches!(
+            err,
+            LibVmError::NetworkRuntime { ref message, .. }
+                if message.contains("prod.profile")
+                    && message.contains("prod.access_key_id")
+                    && message.contains("prod.secret_access_key")
+        ));
+    }
+
+    #[test]
     fn network_launch_rejects_unknown_secret_slots() {
         let policy = oauth_policy();
         let launch = NetworkLaunch::new()
@@ -479,6 +573,66 @@ mod tests {
             "BENTO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN".to_string(),
             "dG9rZW4=".to_string()
         )));
+    }
+
+    #[test]
+    fn network_launch_rejects_policy_secret_env_name_collisions() {
+        use bento_policy::{NetworkCredential, NetworkEndpoint};
+
+        let policy = NetworkPolicy {
+            version: 1,
+            metadata: Default::default(),
+            settings: Default::default(),
+            endpoints: vec![NetworkEndpoint {
+                name: "api".to_string(),
+                kind: "https".to_string(),
+                source_cidrs: Vec::new(),
+                destination_cidrs: Vec::new(),
+                protocol: Default::default(),
+                ports: Vec::new(),
+                hosts: vec!["api.example.com".to_string()],
+            }],
+            credentials: vec![
+                NetworkCredential {
+                    name: "api-key".to_string(),
+                    kind: "bearer_token".to_string(),
+                    endpoint: "api".to_string(),
+                    username: None,
+                    header: None,
+                    prefix: None,
+                    idempotency_key: false,
+                    condition: None,
+                },
+                NetworkCredential {
+                    name: "api_key".to_string(),
+                    kind: "bearer_token".to_string(),
+                    endpoint: "api".to_string(),
+                    username: None,
+                    header: None,
+                    prefix: None,
+                    idempotency_key: false,
+                    condition: None,
+                },
+            ],
+            rules: Vec::new(),
+            tailscale: Vec::new(),
+            forwards: Vec::new(),
+        };
+        let launch = NetworkLaunch::new()
+            .secret("api-key.token", "left")
+            .secret("api_key.token", "right");
+
+        let err = launch
+            .validate_for_policy(Some(&policy), "devbox")
+            .expect_err("colliding env names should fail before spawning netd");
+
+        assert!(matches!(
+            err,
+            LibVmError::NetworkRuntime { ref message, .. }
+                if message.contains("api-key.token")
+                    && message.contains("api_key.token")
+                    && message.contains("BENTO_NET_SECRET_API_KEY_TOKEN")
+        ));
     }
 
     #[test]
