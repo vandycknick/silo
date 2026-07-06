@@ -2,8 +2,6 @@
   <img src="docs/brand/silo-lockup-transparent.png" alt="Silo" width="520">
 </p>
 
-# Silo
-
 Silo is a local microVM sandbox runtime where machines are created from OCI images.
 
 The short version:
