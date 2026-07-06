@@ -12,7 +12,7 @@ Implemented
 
 Today, host to guest stream integrations are implemented as built-ins. `vmmon` already connects to guest vsock ports for things like the guest agent and shell access. That works for a small fixed set of features, but it does not scale well for arbitrary host to guest services. Every new service would require more built-in `vmmon` logic, more coupling to host virtualization details, and more monitor-specific code for behavior that does not belong in the core VM supervisor.
 
-Bentobox needs a generic way for `vmmon` to launch long-running helpers that can consume host to guest byte streams without `vmmon` relaying data in userspace.
+Silo needs a generic way for `vmmon` to launch long-running helpers that can consume host to guest byte streams without `vmmon` relaying data in userspace.
 
 This ADR defines that mechanism as endpoint plugins.
 
@@ -20,7 +20,7 @@ The first implementation target is macOS Virtualization.framework. The plugin co
 
 ## Decision
 
-Bentobox will add declarative `vsock_endpoints` to `VmSpec` and `vmmon` will supervise vsock endpoint plugins for them.
+Silo will add declarative `vsock_endpoints` to `VmSpec` and `vmmon` will supervise vsock endpoint plugins for them.
 
 Each configured endpoint binds together:
 
@@ -165,7 +165,7 @@ Endpoint failures are handled by `vmmon` supervision, restart policy, and logs, 
 
 ### Protocol ownership
 
-`protocol` does not define a runtime endpoint status model. The configured endpoint model remains owned by `bento-core` and the monitor only reports overall instance lifecycle state.
+`protocol` does not define a runtime endpoint status model. The configured endpoint model remains owned by `silo-core` and the monitor only reports overall instance lifecycle state.
 
 ### Scope of first implementation
 

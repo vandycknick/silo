@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { BentoError, mapNativeError } from "../../src/errors.js";
+import { SiloError, mapNativeError } from "../../src/errors.js";
 
 describe("mapNativeError", () => {
-  it("translates tagged native errors into BentoError", () => {
+  it("translates tagged native errors into SiloError", () => {
     const raw = new Error("[MachineNotFound] no machine named ubuntu");
 
-    expect(() => mapNativeError(raw)).toThrow(BentoError);
+    expect(() => mapNativeError(raw)).toThrow(SiloError);
     const error = capture(() => mapNativeError(raw));
-    expect(error).toBeInstanceOf(BentoError);
-    if (!(error instanceof BentoError)) throw error;
+    expect(error).toBeInstanceOf(SiloError);
+    if (!(error instanceof SiloError)) throw error;
     expect(error.variant).toBe("MachineNotFound");
     expect(error.message).toBe("no machine named ubuntu");
     expect(error.cause).toBe(raw);
@@ -18,8 +18,8 @@ describe("mapNativeError", () => {
     const raw = new Error("plain failure");
 
     const error = capture(() => mapNativeError(raw));
-    expect(error).toBeInstanceOf(BentoError);
-    if (!(error instanceof BentoError)) throw error;
+    expect(error).toBeInstanceOf(SiloError);
+    if (!(error instanceof SiloError)) throw error;
     expect(error.variant).toBeUndefined();
     expect(error.message).toBe("plain failure");
     expect(error.cause).toBe(raw);

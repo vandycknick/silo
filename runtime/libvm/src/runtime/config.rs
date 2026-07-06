@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn db_config_merges_default_roots_from_existing_contract() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let data_root = temp.path().join("bento");
+        let data_root = temp.path().join("silo");
         let (stored, expected_roots) = stored_config(&data_root);
 
         let roots = RuntimeConfig::local(&data_root)
@@ -410,7 +410,7 @@ mod tests {
     #[test]
     fn db_config_rejects_explicit_root_mismatch() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let data_root = temp.path().join("bento");
+        let data_root = temp.path().join("silo");
         let image_root = temp.path().join("image-root");
         let (stored, _) = stored_config(&data_root);
 
@@ -431,7 +431,7 @@ mod tests {
 
     #[test]
     fn db_config_rejects_relative_roots() {
-        let err = RuntimeConfig::local("relative-bento")
+        let err = RuntimeConfig::local("relative-silo")
             .bootstrap_paths()
             .expect_err("relative data root should fail");
 
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn db_config_rejects_state_db_path_mismatch() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let data_root = temp.path().join("bento");
+        let data_root = temp.path().join("silo");
         let (stored, _) = stored_config(&data_root);
 
         let err = RuntimeConfig::local(&data_root)

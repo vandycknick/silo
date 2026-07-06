@@ -6,7 +6,7 @@ use libvm::{NetdRuntimeConfig, NetworkDriverKind, RuntimeNetworkingConfig};
 use serde::Deserialize;
 use serde_yaml_ng::{Mapping, Value};
 
-const APP_DIR_NAME: &str = "bento";
+const APP_DIR_NAME: &str = "silo";
 const CONFIG_FILE_NAME: &str = "config.yaml";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -64,7 +64,7 @@ fn resolve_default_config_dir() -> eyre::Result<PathBuf> {
     config_home
         .map(|path| path.join(APP_DIR_NAME))
         .ok_or_else(|| {
-            eyre::eyre!("could not resolve Bento config directory from XDG_CONFIG_HOME or HOME")
+            eyre::eyre!("could not resolve Silo config directory from XDG_CONFIG_HOME or HOME")
         })
 }
 

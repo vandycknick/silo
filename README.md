@@ -1,6 +1,10 @@
-# BentoBox 🍱
+<p align="center">
+  <img src="docs/brand/silo-readme-banner.png" alt="Silo" width="800">
+</p>
 
-BentoBox is a local microVM sandbox runtime where machines are created from OCI images.
+# Silo
+
+Silo is a local microVM sandbox runtime where machines are created from OCI images.
 
 The short version:
 
@@ -28,23 +32,23 @@ make build
 Run an ephemeral VM from an image:
 
 ```bash
-bento run --image ubuntu:24.04 -- uname -a
+silo run --image ubuntu:24.04 -- uname -a
 ```
 
 Create and enter a persistent VM:
 
 ```bash
-bento create dev --image ghcr.io/vandycknick/archlinux:latest --start
-bento shell dev
+silo create dev --image ghcr.io/vandycknick/archlinux:latest --start
+silo shell dev
 ```
 
 Inspect and manage machines:
 
 ```bash
-bento ls
-bento status dev
-bento stop dev
-bento rm dev
+silo ls
+silo status dev
+silo stop dev
+silo rm dev
 ```
 
 ## SDK

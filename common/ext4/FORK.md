@@ -1,4 +1,4 @@
-# Bento ext4 Fork
+# Silo ext4 Fork
 
 This crate is a source snapshot of the upstream `arcbox-ext4` crate.
 
@@ -10,13 +10,13 @@ This crate is a source snapshot of the upstream `arcbox-ext4` crate.
 
 ## Why This Fork Exists
 
-Bento generates ext4 root filesystem images and then grows the backing block
+Silo generates ext4 root filesystem images and then grows the backing block
 device for VM instances. The guest runs `resize2fs` against the mounted root
 filesystem. Linux ext4 refuses mounted online resize when the filesystem has the
 `sparse_super2` feature, and upstream `arcbox-ext4` currently emits
 `sparse_super2` unconditionally.
 
-Bento needs an online-growable ext4 profile that uses the classic
+Silo needs an online-growable ext4 profile that uses the classic
 `sparse_super` layout plus `resize_inode`, with the matching backup superblock,
 group descriptor, and reserved GDT metadata. Do not solve this by flipping
 feature bits without writing the corresponding on-disk structures.

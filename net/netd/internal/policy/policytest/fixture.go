@@ -9,7 +9,7 @@ import (
 	"testing"
 	"unicode"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/policy"
+	"github.com/vandycknick/silo/net/netd/internal/policy"
 )
 
 type fixturePolicy struct {

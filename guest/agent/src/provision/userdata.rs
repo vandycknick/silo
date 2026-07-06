@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 
 use crate::provision::{run_command, write_file, ProvisionContext};
 
-const USERDATA_SCRIPT_PATH: &str = "/var/lib/bento-agent/userdata.sh";
-const USERDATA_HASH_PATH: &str = "/var/lib/bento-agent/userdata.sha256";
+const USERDATA_SCRIPT_PATH: &str = "/var/lib/silo-agent/userdata.sh";
+const USERDATA_HASH_PATH: &str = "/var/lib/silo-agent/userdata.sha256";
 
 pub(crate) fn apply(
     context: &ProvisionContext,

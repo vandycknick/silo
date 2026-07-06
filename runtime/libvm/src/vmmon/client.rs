@@ -321,7 +321,7 @@ fn render_reject_error(code: RejectCode, message: &str) -> String {
             format!("unknown_service: {message}. try a supported endpoint like 'shell'")
         }
         RejectCode::UnsupportedProtocol => {
-            format!("unsupported_protocol: {message}. update bentoctl/vmmon to matching versions")
+            format!("unsupported_protocol: {message}. update silo/vmmon to matching versions")
         }
         RejectCode::UnsupportedUpgrade => format!("unsupported_upgrade: {message}"),
         RejectCode::PermissionDenied => format!("permission_denied: {message}"),

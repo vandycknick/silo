@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package bento.v1;
+package silo.v1;
 
 service VmMonitorService {
   rpc Ping(PingRequest) returns (PingResponse);

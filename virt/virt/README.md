@@ -1,6 +1,6 @@
 # virt
 
-`virt` is BentoBox's host virtualization facade.
+`virt` is Silo's host virtualization facade.
 
 The crate exposes:
 
@@ -8,11 +8,11 @@ The crate exposes:
 - serial and vsock access types consumed by `vmmon`
 - typed VM configuration structs shared by the monitor and backend drivers
 
-`virt` does not expose user-selectable backend routing. BentoBox chooses the host implementation at compile time. The exported `VirtualMachine` type is BentoBox's per-instance VM handle; it is not the guest OS and not the underlying VMM implementation.
+`virt` does not expose user-selectable backend routing. Silo chooses the host implementation at compile time. The exported `VirtualMachine` type is Silo's per-instance VM handle; it is not the guest OS and not the underlying VMM implementation.
 
 ## Scope
 
-Current scope focuses on the VM execution path used by BentoBox today:
+Current scope focuses on the VM execution path used by Silo today:
 
 - direct Linux kernel and initramfs boot
 - root and data disks
@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .vm_id("vm123")
         .cpus(2)
         .memory(2048)
-        .base_directory("/tmp/bento-dev")
+        .base_directory("/tmp/silo-dev")
         .kernel("/path/to/kernel")
         .initramfs("/path/to/initramfs")
         .network(NetworkMode::None)
@@ -73,4 +73,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-See [`docs/terminology.md`](../../docs/terminology.md) for the vocabulary used around VMs, VMMs, hypervisors, KVM, microVMs, backend drivers, and the BentoBox runtime layers.
+See [`docs/terminology.md`](../../docs/terminology.md) for the vocabulary used around VMs, VMMs, hypervisors, KVM, microVMs, backend drivers, and the Silo runtime layers.

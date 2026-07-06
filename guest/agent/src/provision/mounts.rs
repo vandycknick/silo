@@ -136,13 +136,13 @@ mod tests {
     #[test]
     fn mount_info_matches_desired_source_type_and_read_only_state() {
         let desired = MountConfig {
-            tag: "bento-home".to_string(),
+            tag: "silo-home".to_string(),
             path: "/mnt/home".to_string(),
             fstype: "virtiofs".to_string(),
             options: vec!["ro".to_string(), "nofail".to_string()],
         };
         let current = MountInfo {
-            source: "bento-home".to_string(),
+            source: "silo-home".to_string(),
             fstype: "virtiofs".to_string(),
             options: "ro,relatime".to_string(),
         };
@@ -153,13 +153,13 @@ mod tests {
     #[test]
     fn mount_info_rejects_different_read_only_state() {
         let desired = MountConfig {
-            tag: "bento-home".to_string(),
+            tag: "silo-home".to_string(),
             path: "/mnt/home".to_string(),
             fstype: "virtiofs".to_string(),
             options: vec!["rw".to_string(), "nofail".to_string()],
         };
         let current = MountInfo {
-            source: "bento-home".to_string(),
+            source: "silo-home".to_string(),
             fstype: "virtiofs".to_string(),
             options: "ro,relatime".to_string(),
         };

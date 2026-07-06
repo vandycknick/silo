@@ -57,7 +57,7 @@ impl Context {
 
         self.config()?.default_machine().map(str::to_string).ok_or_else(|| {
             eyre::eyre!(
-                "no default machine configured\n\nhint: run `bento default <vm>` or pass a machine name"
+                "no default machine configured\n\nhint: run `silo default <vm>` or pass a machine name"
             )
         })
     }

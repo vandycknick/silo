@@ -1,5 +1,5 @@
 {
-  description = "Nix development shell for bentobox";
+  description = "Nix development shell for silo";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -67,7 +67,7 @@
             shellHook = ''
               export PATH="$PWD/scripts:$PATH"
               export LIBCLANG_PATH="${llvm.libclang.lib}/lib"
-              echo "Entering bentobox dev shell. Run: make build"
+              echo "Entering silo dev shell. Run: make build"
             '';
           };
         }

@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
 )
 
 func TestBasicAuthAppliesPasswordSlotAndOverwritesAuthorization(t *testing.T) {

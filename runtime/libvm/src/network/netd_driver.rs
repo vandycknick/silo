@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use bento_policy::NetworkPolicy;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
+use silo_policy::NetworkPolicy;
 use tokio::time::sleep;
 use utils::format_mac;
 
@@ -41,8 +41,8 @@ const NETD_DISABLE_SSH_PORT: &str = "-1";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
-const OAUTH_REFRESH_HOOK_ENV: &str = "BENTO_NET_OAUTH_REFRESH_HOOK";
-const OAUTH_REFRESH_AUTH_ENV: &str = "BENTO_NET_OAUTH_REFRESH_AUTH";
+const OAUTH_REFRESH_HOOK_ENV: &str = "SILO_NET_OAUTH_REFRESH_HOOK";
+const OAUTH_REFRESH_AUTH_ENV: &str = "SILO_NET_OAUTH_REFRESH_AUTH";
 
 pub(super) struct NetdDriver;
 
@@ -345,7 +345,7 @@ fn configure_network_helper_command(
 fn validate_policy(
     reference: &str,
     driver: &str,
-    policy: Option<&bento_policy::NetworkPolicy>,
+    policy: Option<&silo_policy::NetworkPolicy>,
 ) -> Result<(), LibVmError> {
     if policy.is_none() {
         return Ok(());
@@ -781,8 +781,8 @@ mod tests {
         OAUTH_REFRESH_AUTH_ENV, OAUTH_REFRESH_HOOK_ENV, STDERR_CAPTURE_LIMIT,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use bento_policy::NetworkPolicy;
     use serde_json::json;
+    use silo_policy::NetworkPolicy;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -814,10 +814,10 @@ mod tests {
         configure_network_helper_command(
             &mut command,
             &NetworkHelperCommandConfig {
-                socket_path: Path::new("/tmp/bento-net/netd.sock"),
+                socket_path: Path::new("/tmp/silo-net/netd.sock"),
                 subnet: "192.168.105.0/24",
-                log_path: Path::new("/tmp/bento-net/netd.log"),
-                pid_path: Path::new("/tmp/bento-net/netd.pid"),
+                log_path: Path::new("/tmp/silo-net/netd.log"),
+                pid_path: Path::new("/tmp/silo-net/netd.pid"),
                 pcap_path: None,
                 machine_id: MachineId::new(),
                 network_id: "net123",
@@ -842,16 +842,16 @@ mod tests {
         configure_network_helper_command(
             &mut command,
             &NetworkHelperCommandConfig {
-                socket_path: Path::new("/tmp/bento-net/netd.sock"),
+                socket_path: Path::new("/tmp/silo-net/netd.sock"),
                 subnet: "192.168.105.0/24",
-                log_path: Path::new("/tmp/bento-net/netd.log"),
-                pid_path: Path::new("/tmp/bento-net/netd.pid"),
+                log_path: Path::new("/tmp/silo-net/netd.log"),
+                pid_path: Path::new("/tmp/silo-net/netd.pid"),
                 pcap_path: None,
                 machine_id,
                 network_id: "net123",
-                policy_path: Some(Path::new("/tmp/bento-net/network-policy.json")),
-                tls_ca_cert_path: Some(Path::new("/tmp/bento-net/ca.pem")),
-                tls_ca_key_path: Some(Path::new("/tmp/bento-net/ca-key.pem")),
+                policy_path: Some(Path::new("/tmp/silo-net/network-policy.json")),
+                tls_ca_cert_path: Some(Path::new("/tmp/silo-net/ca.pem")),
+                tls_ca_key_path: Some(Path::new("/tmp/silo-net/ca-key.pem")),
             },
         );
 
@@ -867,14 +867,14 @@ mod tests {
             .windows(2)
             .any(|window| window[0] == "--network-id" && window[1] == "net123"));
         assert!(args.windows(2).any(|window| window[0] == "--policy-file"
-            && window[1] == "/tmp/bento-net/network-policy.json"));
+            && window[1] == "/tmp/silo-net/network-policy.json"));
         assert!(args.iter().all(|arg| arg != "--secret-store-file"));
         assert!(args
             .windows(2)
-            .any(|window| window[0] == "--tls-ca-cert" && window[1] == "/tmp/bento-net/ca.pem"));
+            .any(|window| window[0] == "--tls-ca-cert" && window[1] == "/tmp/silo-net/ca.pem"));
         assert!(args
             .windows(2)
-            .any(|window| window[0] == "--tls-ca-key" && window[1] == "/tmp/bento-net/ca-key.pem"));
+            .any(|window| window[0] == "--tls-ca-key" && window[1] == "/tmp/silo-net/ca-key.pem"));
     }
 
     #[test]
@@ -884,7 +884,7 @@ mod tests {
             .secret("codex.oauth.access_token", "token")
             .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
             .oauth_refresh_hook(
-                OAuthRefreshHook::new("/usr/bin/bento", b"auth".to_vec())
+                OAuthRefreshHook::new("/usr/bin/silo", b"auth".to_vec())
                     .arg("secret")
                     .arg("refresh-oauth")
                     .timeout_ms(2500)
@@ -906,7 +906,7 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
 
         assert_eq!(
-            env.get("BENTO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN"),
+            env.get("SILO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN"),
             Some(&"dG9rZW4=".to_string())
         );
         assert_eq!(
@@ -922,7 +922,7 @@ mod tests {
             hook_json,
             json!({
                 "version": 1,
-                "command": "/usr/bin/bento",
+                "command": "/usr/bin/silo",
                 "args": ["secret", "refresh-oauth"],
                 "timeout_ms": 2500,
                 "refresh_skew_seconds": 120
@@ -939,7 +939,7 @@ mod tests {
         let message = format_netd_startup_failure(
             "userspace network helper exited during startup with status exit status: 1",
             &stderr_lines,
-            Path::new("/tmp/bento/netd.log"),
+            Path::new("/tmp/silo/netd.log"),
         );
 
         let expected = "\
@@ -950,7 +950,7 @@ netd failed during startup
 /tmp/policy.hcl:9:1: Invalid rule
   rule \"deny-private\": references unknown endpoint \"ip.private\"
 
-netd log: /tmp/bento/netd.log";
+netd log: /tmp/silo/netd.log";
         assert_eq!(message, expected);
     }
 
@@ -960,7 +960,7 @@ netd log: /tmp/bento/netd.log";
         let message = format_netd_startup_failure(
             "userspace network helper exited during startup with status exit status: 1",
             &stderr_lines,
-            Path::new("/tmp/bento/netd.log"),
+            Path::new("/tmp/silo/netd.log"),
         );
 
         let expected = "\
@@ -968,7 +968,7 @@ netd failed during startup
 
 plain old panic
 
-netd log: /tmp/bento/netd.log";
+netd log: /tmp/silo/netd.log";
         assert_eq!(message, expected);
     }
 
@@ -987,7 +987,7 @@ netd log: /tmp/bento/netd.log";
     #[test]
     fn certificate_authority_paths_use_config_overrides() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let config = NetdRuntimeConfig {
             tls_ca_cert: Some(PathBuf::from("/tmp/custom-ca.pem")),
             tls_ca_key: Some(PathBuf::from("/tmp/custom-ca-key.pem")),
@@ -1006,7 +1006,7 @@ netd log: /tmp/bento/netd.log";
     #[test]
     fn certificate_authority_paths_generate_defaults() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
 
         let (certificate_path, private_key_path) = resolve_certificate_authority_paths(
             &paths,
@@ -1024,7 +1024,7 @@ netd log: /tmp/bento/netd.log";
     #[test]
     fn certificate_authority_paths_reject_partial_config() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let config = NetdRuntimeConfig {
             tls_ca_cert: Some(PathBuf::from("/tmp/custom-ca.pem")),
             ..NetdRuntimeConfig::default()

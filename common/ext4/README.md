@@ -1,18 +1,18 @@
 # ext4
 
-Pure-Rust ext4 filesystem formatter and reader for Bento root disks.
+Pure-Rust ext4 filesystem formatter and reader for Silo root disks.
 
 No kernel mount. No FUSE. No C dependencies.
 
 `ext4` creates and reads ext4 filesystem images entirely in userspace. It is designed for one job: converting OCI container image layers into mountable ext4 block devices on macOS and Linux, without needing `mkfs.ext4`, `libext2fs`, or any Linux tools on the host.
 
-This crate started as a source snapshot of upstream [`arcbox-ext4`](https://github.com/arcboxlabs/ext4-rs). See [`FORK.md`](FORK.md) for the fork point and the Bento-specific filesystem changes.
+This crate started as a source snapshot of upstream [`arcbox-ext4`](https://github.com/arcboxlabs/ext4-rs). See [`FORK.md`](FORK.md) for the fork point and the Silo-specific filesystem changes.
 
 ## Why
 
 Container runtimes on macOS need to build ext4 root filesystems from OCI image layers. The standard approach requires either shelling out to Linux `mkfs.ext4` (not available on macOS) or linking against C libraries like `lwext4`. This crate does it in pure Rust.
 
-The formatter now emits classic Linux-growable ext4 metadata: `sparse_super` plus `resize_inode`, not `sparse_super2`. That layout is required for the online resize path Bento uses for Linux guests.
+The formatter now emits classic Linux-growable ext4 metadata: `sparse_super` plus `resize_inode`, not `sparse_super2`. That layout is required for the online resize path Silo uses for Linux guests.
 
 ## Features
 
@@ -44,7 +44,7 @@ let mut fmt = Formatter::new(Path::new("rootfs.ext4"), 4096, 64 * 1024 * 1024)?;
 fmt.create("/etc", make_mode(file_mode::S_IFDIR, 0o755),
     None, None, None, None, None, None)?;
 fmt.create("/etc/hostname", make_mode(file_mode::S_IFREG, 0o644),
-    None, None, Some(&mut b"bento\n".as_slice()), None, None, None)?;
+    None, None, Some(&mut b"silo\n".as_slice()), None, None, None)?;
 
 // Create a symlink.
 fmt.create("/etc/localtime", make_mode(file_mode::S_IFLNK, 0o777),
@@ -66,7 +66,7 @@ let mut reader = Reader::new(std::path::Path::new("rootfs.ext4"))?;
 assert!(reader.exists("/etc/hostname"));
 let entries = reader.list_dir("/etc")?;
 let data = reader.read_file("/etc/hostname", 0, None)?;
-assert_eq!(&data, b"bento\n");
+assert_eq!(&data, b"silo\n");
 ```
 
 ### Unpack OCI layers
@@ -141,7 +141,7 @@ This table follows the feature list documented in [`ext4(5)`](https://www.man7.o
 | `quota`                  | Not supported | Creates quota inodes and enables quota accounting automatically when mounted.                                                                            |
 | `resize_inode`           | Enabled       | Reserves space so the block group descriptor table can be extended while resizing a mounted file system.                                                 |
 | `sparse_super`           | Enabled       | Stores backup copies of the superblock and block group descriptors only in selected block groups.                                                        |
-| `sparse_super2`          | Not supported | Stores at most two backup superblocks and block group descriptors. Intentionally disabled because this layout breaks the Bento Linux online-resize path. |
+| `sparse_super2`          | Not supported | Stores at most two backup superblocks and block group descriptors. Intentionally disabled because this layout breaks the Silo Linux online-resize path. |
 | `stable_inodes`          | Not supported | Marks inode numbers and the filesystem UUID as stable, preventing shrinking and UUID changes.                                                            |
 | `uninit_bg` / `gdt_csum` | Enabled       | Protects block group descriptors using checksums and makes it safe to create a file system without initializing all block groups.                        |
 | `verity`                 | Not supported | Enables readonly verity files whose data is verified against a hidden Merkle tree.                                                                       |
@@ -180,7 +180,7 @@ cargo test -p ext4 --test e2fsprogs -- --nocapture
 
 ## Origins
 
-`ext4` began as a source snapshot of upstream [`arcbox-ext4`](https://github.com/arcboxlabs/ext4-rs). Bento keeps the fork history explicit in [`FORK.md`](FORK.md) because the code was not born immaculate from a seashell.
+`ext4` began as a source snapshot of upstream [`arcbox-ext4`](https://github.com/arcboxlabs/ext4-rs). Silo keeps the fork history explicit in [`FORK.md`](FORK.md) because the code was not born immaculate from a seashell.
 
 The original architecture was also inspired by Apple's [ContainerizationEXT4](https://github.com/apple/containerization) Swift implementation and audited against the ext4 disk layout specification.
 

@@ -1,6 +1,6 @@
 # Kernel Resources
 
-This directory owns the guest kernel build inputs for Bento.
+This directory owns the guest kernel build inputs for Silo.
 
 ## Supported tracks
 
@@ -11,12 +11,12 @@ This directory owns the guest kernel build inputs for Bento.
 Build with:
 
 ```bash
-bento exec arch -- make kernel TRACK=stable ARCH=arm64
-bento exec arch -- make kernel TRACK=longterm ARCH=arm64
-bento exec arch -- make kernel TRACK=longterm5 ARCH=arm64
+silo exec arch -- make kernel TRACK=stable ARCH=arm64
+silo exec arch -- make kernel TRACK=longterm ARCH=arm64
+silo exec arch -- make kernel TRACK=longterm5 ARCH=arm64
 ```
 
-Kernel source, build, and cache state live inside the guest under `$HOME/.cache/bento/kernels/`.
+Kernel source, build, and cache state live inside the guest under `$HOME/.cache/silo/kernels/`.
 
 Final exported artifacts land in the mounted repo under `target/kernels/<track>-<arch>-<version>/`.
 
@@ -192,7 +192,7 @@ This file tracks kernel-side config changes identified while debugging package u
 ### Why this is needed
 
 - Nested virtualization needs the guest kernel to expose `/dev/kvm` and the supporting virtualization datapath, not just guest virtio drivers.
-- `VHOST_VSOCK` matches Bento's current vsock-heavy transport model.
+- `VHOST_VSOCK` matches Silo's current vsock-heavy transport model.
 - `TUN` and `VHOST_NET` make nested guest networking usable instead of deeply annoying.
 
 ## 10) Kernel config introspection (observability)
@@ -333,7 +333,7 @@ This file tracks kernel-side config changes identified while debugging package u
 - Lets Docker create the `DOCKER` NAT chain and MASQUERADE or REDIRECT rules when userspace goes through the nftables-backed `iptables` path.
 - Lets Docker install direct access filtering rules in `raw/PREROUTING`, which it uses to drop non-bridge traffic headed at container addresses.
 - Lets Docker install IPv6 chains when ip6tables support is enabled in userspace.
-- Provides the baseline guest kernel networking and storage features needed for Bento's current rootful Docker extension model.
+- Provides the baseline guest kernel networking and storage features needed for Silo's current rootful Docker extension model.
 
 ### Notes
 
@@ -342,7 +342,7 @@ This file tracks kernel-side config changes identified while debugging package u
 - On newer kernels, `CONFIG_NETFILTER_XTABLES_LEGACY=y` is required alongside the legacy `IP*_NF_*` and `IP6*_NF_*` symbols or Docker can still fail with missing `nat`/`raw` tables.
 - `CONFIG_IP_NF_RAW=y` and `CONFIG_IP6_NF_RAW=y` are easy to miss because Docker often fails later on the first visible `raw` table access rather than during its initial capability checks.
 - `CONFIG_NETFILTER_XTABLES_COMPAT=y` is part of that legacy userspace path, and missing it can surface as conntrack match failures or legacy table initialization failures even when the newer `IP*_NF_*` options are enabled.
-- Bento currently needs both sides of the firewall stack available for reliable Docker behavior in guests:
+- Silo currently needs both sides of the firewall stack available for reliable Docker behavior in guests:
     - legacy xtables support for `iptables-legacy`
     - nftables NAT support for nft-backed `iptables`
 - If Docker reports `TABLE_ADD failed (Operation not supported): table nat`, the guest kernel is usually missing nft NAT support even if the older `IP_NF_*` options are enabled.
@@ -405,7 +405,7 @@ Kernel support only gets you the event. You still need userspace to react to the
 
 - `CONFIG_NO_HZ_IDLE` is the usual "stop scheduler ticks on idle CPUs" mode.
 - `CONFIG_NO_HZ_FULL` is the stricter adaptive-ticks configuration intended for CPUs that should avoid scheduler ticks even while running a single task.
-- For Bento's arm64 baseline, keeping `CONFIG_NO_HZ_FULL=y` is a reasonable choice because it still gives the ordinary idle tick suppression behavior, while leaving the door open for stricter tuning later.
+- For Silo's arm64 baseline, keeping `CONFIG_NO_HZ_FULL=y` is a reasonable choice because it still gives the ordinary idle tick suppression behavior, while leaving the door open for stricter tuning later.
 - In other words, without a `nohz_full=` CPU list on the kernel command line, `CONFIG_NO_HZ_FULL=y` mostly behaves like ordinary idle tickless operation for this VM use case.
 - Once `nohz_full=` is provided, the selected CPUs become adaptive-ticks CPUs and the extra housekeeping and RCU constraints start to matter.
 - That makes `NO_HZ_FULL` a decent baseline if you want room to experiment later, not because every dev VM wants full adaptive-ticks isolation on day one.
@@ -522,6 +522,6 @@ nohz_full=1-N rcu_nocbs=1-N
 
 ### Notes
 
-- Bento's current arm64 kernel profile builds these features in instead of relying on loadable modules.
+- Silo's current arm64 kernel profile builds these features in instead of relying on loadable modules.
 - Some k3s startup logs still say `Failed to load kernel module ...` when a feature is built in. Treat those as actionable only when the matching kernel config is missing or userspace reports the extension is unsupported.
 - The generated kernel config under `target/kernels/<track>-<arch>-<version>/.config` can stay stale until `make kernel TRACK=<track> ARCH=<arch>` rebuilds the kernel.

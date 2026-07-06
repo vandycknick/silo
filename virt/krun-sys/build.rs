@@ -5,7 +5,7 @@ const LIBKRUN_VERSION: &str = "1.19.0";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=KRUN_DEPS_DIR");
-    println!("cargo:rerun-if-env-changed=BENTO_KRUN_LINK_SYSTEM");
+    println!("cargo:rerun-if-env-changed=SILO_KRUN_LINK_SYSTEM");
 
     #[cfg(feature = "regenerate")]
     generate_bindings();
@@ -17,7 +17,7 @@ fn main() {
         return;
     }
 
-    if env::var_os("BENTO_KRUN_LINK_SYSTEM").is_some() {
+    if env::var_os("SILO_KRUN_LINK_SYSTEM").is_some() {
         println!("cargo:rustc-link-lib=dylib=krun");
     }
 }

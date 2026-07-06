@@ -1,6 +1,6 @@
 # Building libkrun Dependencies
 
-BentoBox links `krun-sys` dynamically against `libkrun`. The libraries do not need to be installed system-wide. Build or fetch them into a local dependency directory, then point Cargo at it with `KRUN_DEPS_DIR`.
+Silo links `krun-sys` dynamically against `libkrun`. The libraries do not need to be installed system-wide. Build or fetch them into a local dependency directory, then point Cargo at it with `KRUN_DEPS_DIR`.
 
 The expected layout is:
 
@@ -37,9 +37,9 @@ The script does the following:
 3. Copies `libkrun.so` into `target/libs/krun/<target-triple>`.
 4. Fixes the soname with `patchelf` so the copied library is relocatable.
 
-BentoBox intentionally builds `libkrun` without the upstream `init-blob` default feature. That avoids building and embedding libkrun's default guest init binary.
+Silo intentionally builds `libkrun` without the upstream `init-blob` default feature. That avoids building and embedding libkrun's default guest init binary.
 
-BentoBox also does not fetch or package `libkrunfw`. `libkrun` loads `libkrunfw` dynamically only when the caller does not provide an external kernel, firmware, or kernel bundle. BentoBox's `krun` helper requires `--kernel` and calls `krun_set_kernel()`, so this fallback path is not used.
+Silo also does not fetch or package `libkrunfw`. `libkrun` loads `libkrunfw` dynamically only when the caller does not provide an external kernel, firmware, or kernel bundle. Silo's `krun` helper requires `--kernel` and calls `krun_set_kernel()`, so this fallback path is not used.
 
 ## Build On macOS
 
@@ -57,7 +57,7 @@ The script does the following:
 4. Rewrites the install name to `@rpath/libkrun.dylib`.
 5. Ad-hoc codesigns the dylib.
 
-Because BentoBox disables libkrun's `init-blob` default feature and does not package `libkrunfw`, macOS no longer needs Docker, a Linux init-builder container, or the upstream `libkrunfw-prebuilt-aarch64.tgz` bundle for this dependency build.
+Because Silo disables libkrun's `init-blob` default feature and does not package `libkrunfw`, macOS no longer needs Docker, a Linux init-builder container, or the upstream `libkrunfw-prebuilt-aarch64.tgz` bundle for this dependency build.
 
 ## Use With Cargo
 

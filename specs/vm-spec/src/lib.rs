@@ -5,7 +5,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Top-level Bento virtual machine specification.
+/// Top-level Silo virtual machine specification.
 ///
 /// This type is intentionally permissive for persistence: sections may be
 /// absent and are resolved by the runtime boundary that launches the VM.
@@ -331,7 +331,7 @@ mod tests {
                     port: 8080,
                     mode: VsockEndpointMode::Connect,
                     plugin: Plugin {
-                        command: PathBuf::from("/usr/local/bin/bento-endpoint"),
+                        command: PathBuf::from("/usr/local/bin/silo-endpoint"),
                         args: vec!["--serve".to_string()],
                         env: BTreeMap::from([("RUST_LOG".to_string(), "info".to_string())]),
                         working_dir: Some(PathBuf::from("/tmp")),
@@ -348,7 +348,7 @@ mod tests {
                     },
                 }],
             }),
-            annotations: BTreeMap::from([("io.bentobox.demo".to_string(), "true".to_string())]),
+            annotations: BTreeMap::from([("io.silo.demo".to_string(), "true".to_string())]),
             ..VmSpec::current()
         };
 
@@ -388,7 +388,7 @@ mod tests {
                             "port": 8080,
                             "mode": "connect",
                             "plugin": {
-                                "command": "/usr/local/bin/bento-endpoint",
+                                "command": "/usr/local/bin/silo-endpoint",
                                 "args": ["--serve"],
                                 "env": { "RUST_LOG": "info" },
                                 "workingDir": "/tmp"
@@ -402,7 +402,7 @@ mod tests {
                         }
                     ]
                 },
-                "annotations": { "io.bentobox.demo": "true" }
+                "annotations": { "io.silo.demo": "true" }
             })
         );
     }

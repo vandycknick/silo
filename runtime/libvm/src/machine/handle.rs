@@ -1,7 +1,7 @@
 use crate::runtime::Runtime;
 use crate::store::models::MachineId;
 
-/// Handle for an operable Bento virtual machine.
+/// Handle for an operable Silo virtual machine.
 ///
 /// A handle stores machine identity and the `Runtime` that created it. Use
 /// `inspect` to read the machine's current public snapshot.

@@ -731,7 +731,7 @@ mod tests {
     #[tokio::test]
     async fn create_machine_config_clones_root_disk_and_sets_defaults() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         store
@@ -765,7 +765,7 @@ mod tests {
     #[tokio::test]
     async fn create_machine_config_generates_name_when_missing() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         store
@@ -791,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn create_machine_config_retries_generated_name_conflicts() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         store
@@ -839,7 +839,7 @@ mod tests {
     #[tokio::test]
     async fn create_machine_config_respects_requested_resources() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         store
@@ -872,7 +872,7 @@ mod tests {
     #[tokio::test]
     async fn create_machine_config_rounds_memory_bytes_up_to_mebibytes() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         store
@@ -898,7 +898,7 @@ mod tests {
     #[tokio::test]
     async fn create_machine_config_rejects_zero_memory() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         let runtime = runtime_with_mock_store(paths, store).await;
@@ -916,7 +916,7 @@ mod tests {
     #[tokio::test]
     async fn create_machine_config_rejects_zero_root_disk_size() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         let runtime = runtime_with_mock_store(paths, store).await;
@@ -934,7 +934,7 @@ mod tests {
     #[tokio::test]
     async fn create_machine_config_resizes_root_disk_when_requested() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         store
@@ -967,7 +967,7 @@ mod tests {
     #[tokio::test]
     async fn create_guard_and_commit_write_vm_spec_and_state() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         store
@@ -1007,7 +1007,7 @@ mod tests {
     #[tokio::test]
     async fn create_guard_drop_removes_machine_dir_and_frees_lock() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         store
@@ -1038,7 +1038,7 @@ mod tests {
     #[tokio::test]
     async fn create_guard_commit_failure_removes_machine_dir_root_disk_and_frees_lock() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         store

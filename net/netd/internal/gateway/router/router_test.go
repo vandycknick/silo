@@ -10,10 +10,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/audit"
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
-	"github.com/vandycknick/bentobox/net/netd/internal/policy"
-	"github.com/vandycknick/bentobox/net/netd/internal/policy/policytest"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/audit"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
+	"github.com/vandycknick/silo/net/netd/internal/policy"
+	"github.com/vandycknick/silo/net/netd/internal/policy/policytest"
 )
 
 func TestRecordFlowWritesIPAuditRecord(t *testing.T) {

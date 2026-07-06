@@ -1,6 +1,6 @@
 # vz
 
-`vz` is a safe Rust wrapper around Apple's `Virtualization.framework` for the Linux guest path used by BentoBox today.
+`vz` is a safe Rust wrapper around Apple's `Virtualization.framework` for the Linux guest path used by Silo today.
 
 The crate exposes:
 

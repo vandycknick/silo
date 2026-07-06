@@ -491,7 +491,7 @@ fn built_in_default_profile() -> NamedProfile {
         path: None,
         profile: Profile {
             version: "1".to_string(),
-            description: Some("Built-in default BentoBox profile".to_string()),
+            description: Some("Built-in default Silo profile".to_string()),
             image: DEFAULT_PROFILE_IMAGE.to_string(),
             resources: None,
             disk_size: None,
@@ -507,8 +507,8 @@ fn profile_dir() -> eyre::Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .ok_or_else(|| eyre::eyre!("could not resolve ~/.config/bento/profiles from HOME"))?;
-    Ok(home.join(".config/bento/profiles"))
+        .ok_or_else(|| eyre::eyre!("could not resolve ~/.config/silo/profiles from HOME"))?;
+    Ok(home.join(".config/silo/profiles"))
 }
 
 fn display_profile_dir(path: &Path) -> String {

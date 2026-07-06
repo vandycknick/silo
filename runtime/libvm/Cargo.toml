@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }
-bento_policy = { package = "policy", path = "../../common/policy" }
+silo_policy = { package = "policy", path = "../../common/policy" }
 ocidisk = { path = "../ocidisk" }
 protocol = { path = "../../specs/protocol" }
 vm-spec = { path = "../../specs/vm-spec" }

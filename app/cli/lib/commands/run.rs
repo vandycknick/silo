@@ -16,12 +16,12 @@ use crate::profile::{ProfileStore, ResolvedMachineNetwork};
 use crate::ui::{watch_image_progress, Spinner};
 
 const EXAMPLES: &[&str] = &[
-    "bento run",
-    "bento run dev",
-    "bento run dev -- cargo test",
-    "bento run -t agent -- opencode",
-    "bento run dev --image disk:./target/rootfs.img -- cargo test",
-    "bento run dev --keep-on-failure -- cargo test",
+    "silo run",
+    "silo run dev",
+    "silo run dev -- cargo test",
+    "silo run -t agent -- opencode",
+    "silo run dev --image disk:./target/rootfs.img -- cargo test",
+    "silo run dev --keep-on-failure -- cargo test",
 ];
 
 #[derive(Debug, Args)]
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn run_command_parses_create_parity_overrides() {
         let cli = Cli::try_parse_from([
-            "bento",
+            "silo",
             "run",
             "dev",
             "--cpus",
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn run_command_accepts_image_override_with_profile() {
         let cli = Cli::try_parse_from([
-            "bento",
+            "silo",
             "run",
             "dev",
             "--image",
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn run_command_parses_tty_command() {
-        let cli = Cli::try_parse_from(["bento", "run", "-t", "agent", "--", "opencode"])
+        let cli = Cli::try_parse_from(["silo", "run", "-t", "agent", "--", "opencode"])
             .expect("run command should parse");
         let Command::Run(run) = cli.command else {
             panic!("expected run command");
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn run_command_keeps_boot_overrides_for_libvm() {
         let cli = Cli::try_parse_from([
-            "bento",
+            "silo",
             "run",
             "dev",
             "--kernel",
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn run_command_rejects_bare_memory_and_disk_size() {
-        assert!(Cli::try_parse_from(["bento", "run", "dev", "--memory", "4096"]).is_err());
-        assert!(Cli::try_parse_from(["bento", "run", "dev", "--disk-size", "40"]).is_err());
+        assert!(Cli::try_parse_from(["silo", "run", "dev", "--memory", "4096"]).is_err());
+        assert!(Cli::try_parse_from(["silo", "run", "dev", "--disk-size", "40"]).is_err());
     }
 }

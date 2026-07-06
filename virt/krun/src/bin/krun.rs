@@ -26,7 +26,7 @@ const SOCKET_SNDBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
 #[derive(Debug, Parser)]
 #[command(
     name = "krun",
-    about = "BentoBox libkrun helper",
+    about = "Silo libkrun helper",
     after_help = "Examples:\n  krun --kernel ./vmlinux --initramfs ./initramfs.img --network none\n  krun --kernel ./vmlinux --net-peer /tmp/gvproxy.sock --net-mac 02:94:ef:e4:0c:ee --network unixgram\n  krun --kernel ./vmlinux --net-peer /tmp/passt.sock --net-mac 02:94:ef:e4:0c:ef --network unixstream\n  krun --kernel ./vmlinux --net-tap-name tap0 --net-mac 02:94:ef:e4:0c:f0 --network tap\n"
 )]
 struct Cli {
@@ -358,19 +358,19 @@ mod tests {
     fn local_unix_datagram_path_uses_short_vm_id_and_backend() {
         assert_eq!(
             local_unix_datagram_path(
-                Path::new("/tmp/bento-net/gvproxy.sock"),
+                Path::new("/tmp/silo-net/gvproxy.sock"),
                 "1234567890abcdef",
                 "krun"
             ),
-            Path::new("/tmp/bento-net/1234567890ab-krun.sock")
+            Path::new("/tmp/silo-net/1234567890ab-krun.sock")
         );
     }
 
     #[test]
     fn local_unix_datagram_path_keeps_short_vm_id() {
         assert_eq!(
-            local_unix_datagram_path(Path::new("/tmp/bento-net/gvproxy.sock"), "vm123", "krun"),
-            Path::new("/tmp/bento-net/vm123-krun.sock")
+            local_unix_datagram_path(Path::new("/tmp/silo-net/gvproxy.sock"), "vm123", "krun"),
+            Path::new("/tmp/silo-net/vm123-krun.sock")
         );
     }
 }

@@ -1,6 +1,6 @@
 # libvm State Model
 
-`libvm` keeps its public API above the storage boundary. A `Runtime` is a client facade for a Bentobox target; today the only target is local SQLite plus local instance directories, but the API is shaped so a future remote target can implement the same machine-management operations without exposing SQLite details.
+`libvm` keeps its public API above the storage boundary. A `Runtime` is a client facade for a Silo target; today the only target is local SQLite plus local instance directories, but the API is shaped so a future remote target can implement the same machine-management operations without exposing SQLite details.
 
 The local target follows the same split Podman's libpod uses for containers, pods, and volumes: keep columns for identity, uniqueness, relationships, and hot lookups, and keep object-shaped static config and mutable state as JSON documents.
 
@@ -8,10 +8,10 @@ The local target follows the same split Podman's libpod uses for containers, pod
 
 Each local runtime opens one state root. `db_config` is a singleton guard row that pins the database to the layout that created it. Opening the same database with a different data directory, instance directory, image directory, or network directory is an error.
 
-This lets callers create independent Bentobox installations by constructing separate local runtime configs:
+This lets callers create independent Silo installations by constructing separate local runtime configs:
 
 ```rust
-let runtime = Runtime::new(RuntimeConfig::local("/var/lib/bento-dev")).await?;
+let runtime = Runtime::new(RuntimeConfig::local("/var/lib/silo-dev")).await?;
 ```
 
 The CLI still uses the default local root through `Runtime::from_env()`, but the API does not require that default.
@@ -52,7 +52,7 @@ Runtime truth still comes from `vmmon` while a VM is running. Local inspect/list
 
 ## Launch Artifacts
 
-The per-instance `config.json` file remains the launch artifact read by `vmmon`. Today it is generated from `MachineConfig.spec` and should match that spec after create or replace-config. If Bentobox later needs libpod-style late binding, the database should continue to hold the desired static config, while per-instance `config.json` can become the generated runtime artifact.
+The per-instance `config.json` file remains the launch artifact read by `vmmon`. Today it is generated from `MachineConfig.spec` and should match that spec after create or replace-config. If Silo later needs libpod-style late binding, the database should continue to hold the desired static config, while per-instance `config.json` can become the generated runtime artifact.
 
 This mirrors libpod's two-spec model:
 

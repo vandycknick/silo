@@ -38,20 +38,20 @@ describe("runtime options", () => {
   it("passes through supported runtime options", () => {
     expect(
       runtimeOptionsToNative({
-        dataRoot: "/tmp/bento",
-        defaultKernel: "/usr/local/share/bento/assets/kernel-default",
-        defaultInitramfs: "/usr/local/share/bento/assets/initramfs",
+        dataRoot: "/tmp/silo",
+        defaultKernel: "/usr/local/share/silo/assets/kernel-default",
+        defaultInitramfs: "/usr/local/share/silo/assets/initramfs",
       }),
     ).toMatchObject({
-      dataRoot: "/tmp/bento",
-      defaultKernel: "/usr/local/share/bento/assets/kernel-default",
-      defaultInitramfs: "/usr/local/share/bento/assets/initramfs",
+      dataRoot: "/tmp/silo",
+      defaultKernel: "/usr/local/share/silo/assets/kernel-default",
+      defaultInitramfs: "/usr/local/share/silo/assets/initramfs",
     });
   });
 
   it("does not reject extra runtime option fields", () => {
-    const options: RuntimeOpenOptions & { bogus: string } = { dataRoot: "/tmp/bento", bogus: "nope" };
-    expect(runtimeOptionsToNative(options)).toMatchObject({ dataRoot: "/tmp/bento" });
+    const options: RuntimeOpenOptions & { bogus: string } = { dataRoot: "/tmp/silo", bogus: "nope" };
+    expect(runtimeOptionsToNative(options)).toMatchObject({ dataRoot: "/tmp/silo" });
   });
 });
 
@@ -72,7 +72,7 @@ describe("Network", () => {
       machineDataFromNative({
         id: "machine-id",
         name: "machine-name",
-        machineDir: "/tmp/bento/machines/machine-id",
+        machineDir: "/tmp/silo/machines/machine-id",
         createdAt: 1,
         modifiedAt: 1,
         imageRef: "ubuntu:24.04",

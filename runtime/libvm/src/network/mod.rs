@@ -455,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_detaches_attachment_when_instance_is_missing() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let machine_id = MachineId::new();
         let runtime_dir = temp.path().join("missing-runtime");
         std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
@@ -499,7 +499,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_removes_inactive_last_network_instance() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let machine_id = MachineId::new();
         let runtime_dir = temp.path().join("runtime-dir");
         std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
@@ -555,7 +555,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_keeps_inactive_network_instance_with_other_attachments() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let machine_id = MachineId::new();
         let runtime_dir = temp.path().join("shared-runtime-dir");
         std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
@@ -605,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_named_bridge_network_fails_before_driver_setup() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let machine_id = MachineId::new();
         let metadata = machine_config(
             &paths,

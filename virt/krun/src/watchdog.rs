@@ -11,7 +11,7 @@ use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::pipe;
 
-pub(crate) const ENV_WATCHDOG_FD: &str = "BENTO_KRUN_WATCHDOG_FD";
+pub(crate) const ENV_WATCHDOG_FD: &str = "SILO_KRUN_WATCHDOG_FD";
 
 #[derive(Debug)]
 pub(crate) struct Keepalive {

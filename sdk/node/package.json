@@ -1,7 +1,7 @@
 {
-  "name": "bentobox",
+  "name": "silo",
   "version": "0.1.0",
-  "description": "Node.js SDK for BentoBox VMs",
+  "description": "Node.js SDK for Silo VMs",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -34,7 +34,7 @@
     "node": ">=22"
   },
   "napi": {
-    "binaryName": "bentobox",
+    "binaryName": "silo",
     "targets": [
       "aarch64-apple-darwin",
       "x86_64-unknown-linux-gnu",

@@ -45,7 +45,7 @@ impl Cmd {
         spinner.finish_success("Removed");
 
         if removed_default {
-            ui::warn("removed default machine. Set a new one with `bento default <vm>`.");
+            ui::warn("removed default machine. Set a new one with `silo default <vm>`.");
         }
         Ok(())
     }

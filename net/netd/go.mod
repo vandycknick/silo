@@ -1,4 +1,4 @@
-module github.com/vandycknick/bentobox/net/netd
+module github.com/vandycknick/silo/net/netd
 
 go 1.25.5
 

@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/policy/hostmatch"
+	"github.com/vandycknick/silo/net/netd/internal/policy/hostmatch"
 )
 
 func (p *Policy) EvaluateFlow(flow Flow) Decision {

@@ -1,4 +1,4 @@
-//! Bentobox initramfs init and rescue applets.
+//! Silo initramfs init and rescue applets.
 //!
 //! This binary follows Armybox's multicall shape: the same executable is copied
 //! into the initramfs as `/init`, then applets are invoked through symlinks whose
@@ -83,7 +83,7 @@ fn basename(path: &[u8]) -> &[u8] {
 }
 
 fn usage() {
-    io::write(io::STDOUT, "init - Bentobox initramfs multicall binary\n\n");
+    io::write(io::STDOUT, "init - Silo initramfs multicall binary\n\n");
     io::write(io::STDOUT, "Usage: init --list\n");
     io::write(io::STDOUT, "       init --install DIR\n");
     io::write(

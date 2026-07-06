@@ -12,8 +12,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/credentials"
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
+	"github.com/vandycknick/silo/net/netd/internal/credentials"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
 )
 
 const maxHTTPResponseHeaderBytes = 1 << 20

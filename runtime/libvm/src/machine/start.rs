@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use bento_policy::{NetworkPolicy, NetworkSecretKind};
+use silo_policy::{NetworkPolicy, NetworkSecretKind};
 
 use crate::store::models::MachineNetworkConfig;
 use crate::LibVmError;
@@ -328,7 +328,7 @@ impl NetworkLaunch {
     }
 }
 
-fn format_secret_requirement(alternatives: &[bento_policy::NetworkSecretAlternative]) -> String {
+fn format_secret_requirement(alternatives: &[silo_policy::NetworkSecretAlternative]) -> String {
     alternatives
         .iter()
         .map(|alternative| {
@@ -570,7 +570,7 @@ mod tests {
             .expect("secret env");
 
         assert!(env.contains(&(
-            "BENTO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN".to_string(),
+            "SILO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN".to_string(),
             "dG9rZW4=".to_string()
         )));
     }
@@ -605,7 +605,7 @@ mod tests {
             LibVmError::NetworkRuntime { ref message, .. }
                 if message.contains("api-key.token")
                     && message.contains("api_key.token")
-                    && message.contains("BENTO_NET_SECRET_API_KEY_TOKEN")
+                    && message.contains("SILO_NET_SECRET_API_KEY_TOKEN")
         ));
     }
 
@@ -615,7 +615,7 @@ mod tests {
         let launch = NetworkLaunch::new()
             .secret("codex.oauth.access_token", "token")
             .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
-            .oauth_refresh_hook(OAuthRefreshHook::new("bento", Vec::<u8>::new()));
+            .oauth_refresh_hook(OAuthRefreshHook::new("silo", Vec::<u8>::new()));
 
         let err = launch
             .validate_for_policy(Some(&policy), "devbox")
@@ -651,7 +651,7 @@ mod tests {
                 .secret("codex.oauth.access_token", "token")
                 .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
                 .oauth_refresh_hook(
-                    OAuthRefreshHook::new("/usr/bin/bento", b"auth".to_vec()).arg("refresh"),
+                    OAuthRefreshHook::new("/usr/bin/silo", b"auth".to_vec()).arg("refresh"),
                 )
         });
 

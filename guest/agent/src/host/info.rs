@@ -7,7 +7,7 @@ use protocol::v1::SystemInfo;
 /// Reads host information for the running guest instance.
 ///
 /// This aggregates kernel, OS, memory, uptime, hostname, CPU, and non-loopback
-/// IP address data from the local Linux system and returns it in Bento's
+/// IP address data from the local Linux system and returns it in Silo's
 /// `SystemInfo` wire format.
 ///
 /// Field collection is best-effort. If one source is unavailable, the function

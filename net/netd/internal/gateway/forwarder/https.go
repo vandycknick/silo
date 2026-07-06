@@ -21,9 +21,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/credentials"
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/router"
+	"github.com/vandycknick/silo/net/netd/internal/credentials"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
 )
 
 const certificateRefreshBeforeExpiry = time.Hour
@@ -376,7 +376,7 @@ func loadCertificateAuthority(certPath string, keyPath string) (*certificateAuth
 func (ca *certificateAuthority) CertificateFor(host string) (*tls.Certificate, error) {
 	host = strings.Trim(strings.ToLower(host), "[]")
 	if host == "" {
-		host = "bento-intercept.invalid"
+		host = "silo-intercept.invalid"
 	}
 	now := time.Now()
 	ca.mu.Lock()

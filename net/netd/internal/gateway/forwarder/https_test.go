@@ -23,9 +23,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/credentials"
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/router"
+	"github.com/vandycknick/silo/net/netd/internal/credentials"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
 )
 
 func TestHTTPSProxyInterceptsAllowedRequest(t *testing.T) {
@@ -997,7 +997,7 @@ func startObservedTLSUpstreamWithResponseForHost(t *testing.T, caCertPath string
 func setHTTPSNetworkSecret(t *testing.T, slot string, value string) {
 	t.Helper()
 	var builder strings.Builder
-	builder.WriteString("BENTO_NET_SECRET_")
+	builder.WriteString("SILO_NET_SECRET_")
 	lastUnderscore := false
 	for _, r := range slot {
 		if r >= 'a' && r <= 'z' {
@@ -1058,7 +1058,7 @@ func writeTestCAExpiringAt(t *testing.T, dir string, notAfter time.Time) (string
 	template := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
-			CommonName: "BentoBox Test CA",
+			CommonName: "Silo Test CA",
 		},
 		NotBefore:             now.Add(-1 * time.Hour),
 		NotAfter:              notAfter,

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::paths::LocalRoots;
 
-/// Stored root contract for a local Bento state database.
+/// Stored root contract for a local Silo state database.
 ///
 /// The `db_config` table contains exactly one row, `id = 1`. It stores the
 /// host OS that created the database and only the three roots that are

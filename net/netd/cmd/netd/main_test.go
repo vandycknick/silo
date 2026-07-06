@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/policy"
+	"github.com/vandycknick/silo/net/netd/internal/policy"
 )
 
 func TestLogPolicyDiagnosticsUsesServiceLogger(t *testing.T) {

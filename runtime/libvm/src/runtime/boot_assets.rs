@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 
 use crate::LibVmError;
 
-const ENV_KERNEL_PATH: &str = "BENTO_KERNEL_PATH";
-const ENV_INITRAMFS_PATH: &str = "BENTO_INITRAMFS_PATH";
-const SYSTEM_ASSETS_DIR: &str = "/usr/local/share/bento/assets";
-const USER_ASSETS_SUFFIX: &str = ".local/share/bento/assets";
+const ENV_KERNEL_PATH: &str = "SILO_KERNEL_PATH";
+const ENV_INITRAMFS_PATH: &str = "SILO_INITRAMFS_PATH";
+const SYSTEM_ASSETS_DIR: &str = "/usr/local/share/silo/assets";
+const USER_ASSETS_SUFFIX: &str = ".local/share/silo/assets";
 const DEFAULT_KERNEL_FILENAME: &str = "kernel-default";
 const DEFAULT_INITRAMFS_FILENAME: &str = "initramfs";
 
@@ -276,7 +276,7 @@ mod tests {
         assert!(matches!(
             err,
             LibVmError::BootAssetNotFound { asset: "kernel", checked }
-                if checked.contains("BENTO_KERNEL_PATH unset")
+                if checked.contains("SILO_KERNEL_PATH unset")
                     && checked.contains(&standard_dir.join(DEFAULT_KERNEL_FILENAME).display().to_string())
         ));
     }

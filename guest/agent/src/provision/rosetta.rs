@@ -17,11 +17,11 @@ const BINFMT_REGISTER_PATH: &str = "/proc/sys/fs/binfmt_misc/register";
 const ROSETTA_REGISTRATION_PREFIX: &[u8] = br":rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:";
 
 // binfmt_misc supports P, O, C, and F flags:
-// - P preserves argv[0]. Rosetta does not need Bento to alter argv handling.
+// - P preserves argv[0]. Rosetta does not need Silo to alter argv handling.
 // - O opens the target binary and passes the fd to the interpreter.
 // - C uses target-binary credentials and implies O; this matches normal exec semantics.
 // - F opens and pins the interpreter at registration time. Docker containers,
-//   chroots, and mount namespaces may not have /mnt/bento-rosetta mounted, so
+//   chroots, and mount namespaces may not have /mnt/silo-rosetta mounted, so
 //   Rosetta needs F even though it can keep the virtiofs mount busy until the
 //   binfmt entry is unregistered.
 const ROSETTA_REGISTRATION_SUFFIX: &[u8] = b":OCF";
@@ -208,13 +208,13 @@ mod tests {
     #[test]
     fn parses_registered_binfmt_entry_status() {
         let status = super::BinFmtEntryStatus::parse(
-            "enabled\ninterpreter /mnt/bento-rosetta/rosetta\nflags: OCF\n",
+            "enabled\ninterpreter /mnt/silo-rosetta/rosetta\nflags: OCF\n",
         );
 
         assert_eq!(status.enabled, Some(true));
         assert_eq!(
             status.interpreter.as_deref(),
-            Some("/mnt/bento-rosetta/rosetta")
+            Some("/mnt/silo-rosetta/rosetta")
         );
         assert_eq!(status.flags.as_deref(), Some("OCF"));
     }

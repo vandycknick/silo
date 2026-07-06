@@ -12,10 +12,10 @@ use crate::initramfs::{write_initramfs, InitramfsFile, InitramfsOptions};
 mod initramfs;
 
 const DEFAULT_GUEST_TARGET: &str = "aarch64-unknown-linux-musl";
-const AGENT_ARCHIVE_PATH: &str = "agent/bento-agent";
+const AGENT_ARCHIVE_PATH: &str = "agent/silo-agent";
 
 #[derive(Debug, Parser)]
-#[command(about = "Bentobox repository automation")]
+#[command(about = "Silo repository automation")]
 struct Args {
     #[command(subcommand)]
     command: Commands,
@@ -134,7 +134,7 @@ fn guest_assets(args: GuestAssetsArgs) -> Result<()> {
 
     let guest_bin_dir = target_dir.join(&args.target).join("release");
     let init_binary = guest_bin_dir.join("init");
-    let agent_binary = guest_bin_dir.join("bento-agent");
+    let agent_binary = guest_bin_dir.join("silo-agent");
     ensure_file(&init_binary)?;
     ensure_file(&agent_binary)?;
 

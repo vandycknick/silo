@@ -40,7 +40,7 @@ struct PendingConnection {
 
 define_class!(
     #[unsafe(super(NSObject))]
-    #[name = "BentoVzVsockListenerDelegate"]
+    #[name = "SiloVzVsockListenerDelegate"]
     #[ivars = VsockListenerDelegateIvars]
     struct VsockListenerDelegate;
 

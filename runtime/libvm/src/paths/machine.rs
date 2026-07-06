@@ -85,43 +85,43 @@ mod tests {
 
     #[test]
     fn machine_paths_use_expected_filenames() {
-        let paths = MachinePaths::new("/tmp/bento/machines/test");
+        let paths = MachinePaths::new("/tmp/silo/machines/test");
 
         assert_eq!(
             paths.vm_spec_path(),
-            PathBuf::from("/tmp/bento/machines/test/config.json")
+            PathBuf::from("/tmp/silo/machines/test/config.json")
         );
         assert_eq!(
             paths.metadata_config_path(),
-            PathBuf::from("/tmp/bento/machines/test/metadata.json")
+            PathBuf::from("/tmp/silo/machines/test/metadata.json")
         );
         assert_eq!(
             paths.root_disk_path(),
-            PathBuf::from("/tmp/bento/machines/test/rootfs.img")
+            PathBuf::from("/tmp/silo/machines/test/rootfs.img")
         );
         assert_eq!(
             paths.vmmon_pid_path(),
-            PathBuf::from("/tmp/bento/machines/test/vm.pid")
+            PathBuf::from("/tmp/silo/machines/test/vm.pid")
         );
         assert_eq!(
             paths.vmmon_socket_path(),
-            PathBuf::from("/tmp/bento/machines/test/vm.sock")
+            PathBuf::from("/tmp/silo/machines/test/vm.sock")
         );
         assert_eq!(
             paths.vmmon_trace_log_path(),
-            PathBuf::from("/tmp/bento/machines/test/vm.trace.log")
+            PathBuf::from("/tmp/silo/machines/test/vm.trace.log")
         );
         assert_eq!(
             paths.vmmon_exit_status_path(),
-            PathBuf::from("/tmp/bento/machines/test/vm.exit.json")
+            PathBuf::from("/tmp/silo/machines/test/vm.exit.json")
         );
         assert_eq!(
             paths.serial_log_path(),
-            PathBuf::from("/tmp/bento/machines/test/serial.log")
+            PathBuf::from("/tmp/silo/machines/test/serial.log")
         );
         assert_eq!(
             paths.network_link(),
-            PathBuf::from("/tmp/bento/machines/test/net")
+            PathBuf::from("/tmp/silo/machines/test/net")
         );
         assert_eq!(root_disk_relative_path(), PathBuf::from("rootfs.img"));
     }

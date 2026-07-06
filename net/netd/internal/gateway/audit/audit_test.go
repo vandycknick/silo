@@ -12,7 +12,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
 )
 
 const testPolicyHash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

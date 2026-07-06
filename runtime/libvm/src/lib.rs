@@ -1,4 +1,4 @@
-//! Rust library boundary for managing Bento virtual machines.
+//! Rust library boundary for managing Silo virtual machines.
 //!
 //! `Runtime` is the service entry point. It creates or resolves machines and
 //! returns `Machine` handles for lifecycle and stream operations. Read output is
@@ -56,7 +56,7 @@ pub use crate::runtime::{
     NetdRuntimeConfig, PathChoice, Runtime, RuntimeBuilder, RuntimeConfig, RuntimeNetworkingConfig,
 };
 pub use crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT;
-pub use bento_policy::{
+pub use silo_policy::{
     NetworkAuditBuilder, NetworkCredential, NetworkCredentialBuilder, NetworkEndpointBuilder,
     NetworkForwardBuilder, NetworkPolicy, NetworkPolicyBuildError, NetworkPolicyBuilder,
     NetworkRuleBuilder, NetworkSecretAlternative, NetworkSecretKind, NetworkSecretRequirement,

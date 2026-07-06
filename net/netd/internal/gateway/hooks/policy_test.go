@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/policy/policytest"
+	"github.com/vandycknick/silo/net/netd/internal/policy/policytest"
 )
 
 func TestPolicyHookCarriesL4MatchMetadata(t *testing.T) {

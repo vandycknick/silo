@@ -127,19 +127,19 @@ mod tests {
     fn local_unix_datagram_path_uses_vm_id_and_backend() {
         assert_eq!(
             local_unix_datagram_path(
-                Path::new("/tmp/bento-net/gvproxy.sock"),
+                Path::new("/tmp/silo-net/gvproxy.sock"),
                 "1234567890abcdef",
                 "vz"
             ),
-            Path::new("/tmp/bento-net/1234567890ab-vz.sock")
+            Path::new("/tmp/silo-net/1234567890ab-vz.sock")
         );
     }
 
     #[test]
     fn local_unix_datagram_path_keeps_short_vm_id() {
         assert_eq!(
-            local_unix_datagram_path(Path::new("/tmp/bento-net/gvproxy.sock"), "vm123", "vz"),
-            Path::new("/tmp/bento-net/vm123-vz.sock")
+            local_unix_datagram_path(Path::new("/tmp/silo-net/gvproxy.sock"), "vm123", "vz"),
+            Path::new("/tmp/silo-net/vm123-vz.sock")
         );
     }
 

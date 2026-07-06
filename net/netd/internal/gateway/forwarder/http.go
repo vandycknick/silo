@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/router"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
 )
 
 type HTTPProxy struct {

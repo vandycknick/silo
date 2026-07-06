@@ -1,8 +1,6 @@
 mod builder;
 mod canonical;
 mod condition;
-#[cfg(feature = "ffi")]
-mod ffi;
 mod model;
 mod parse;
 

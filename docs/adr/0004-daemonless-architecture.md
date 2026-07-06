@@ -8,7 +8,7 @@ Implemented
 
 ## Context
 
-Bentobox needs a VM architecture that keeps the runtime surface small, focused, and flexible. Focussed on the following:
+Silo needs a VM architecture that keeps the runtime surface small, focused, and flexible. Focussed on the following:
 
 - keeps one monitor process scoped to one VM,
 - starts from canonical machine configuration on disk,
@@ -16,16 +16,16 @@ Bentobox needs a VM architecture that keeps the runtime surface small, focused, 
 - works well without a central always-on daemon,
 - preserves room for a future daemon or tunnel mode without changing the machine model.
 
-The chosen architecture is daemonless. `bento` calls into `libvm`, and `libvm` owns machine lifecycle in local ABI mode. When a machine starts, `libvm` spawns a dedicated `vmmon` process for that machine. `vmmon` reads the machine configuration from the instance directory, starts the VM, supervises it, and exposes the per-VM control surface.
+The chosen architecture is daemonless. `silo` calls into `libvm`, and `libvm` owns machine lifecycle in local ABI mode. When a machine starts, `libvm` spawns a dedicated `vmmon` process for that machine. `vmmon` reads the machine configuration from the instance directory, starts the VM, supervises it, and exposes the per-VM control surface.
 
-This gives Bentobox the operational flexibility of a daemonless system while still leaving room for a future manager daemon. `libvm` is the boundary that preserves that split. It is the local engine today, and it can also become the client-side boundary for future daemon or tunnel mode without changing the monitor model.
+This gives Silo the operational flexibility of a daemonless system while still leaving room for a future manager daemon. `libvm` is the boundary that preserves that split. It is the local engine today, and it can also become the client-side boundary for future daemon or tunnel mode without changing the monitor model.
 
 ## Decision
 
-Bentobox adopts a daemonless, config-driven architecture with these roles:
+Silo adopts a daemonless, config-driven architecture with these roles:
 
-- `bento` is a thin frontend over `libvm`.
-- `bento-core` owns the canonical shared domain model, including `VmSpec`, machine identity types, and guest service configuration types.
+- `silo` is a thin frontend over `libvm`.
+- `silo-core` owns the canonical shared domain model, including `VmSpec`, machine identity types, and guest service configuration types.
 - `libvm` owns manager-side lifecycle, machine inventory, on-disk layout, image policy, bootstrap materialization, Negotiate client behavior, and `vmmon` process spawning.
 - `vmmon` is the canonical per-VM monitor. It is a small-footprint runtime supervisor that owns one running VM.
 - `virt` is the host virtualization facade used by `vmmon`.
@@ -37,7 +37,7 @@ This architecture is intentionally daemonless by default. A future daemon or tun
 ## Goals
 
 - Keep one `vmmon` process responsible for one VM.
-- Make `bento` a thin consumer of `libvm`.
+- Make `silo` a thin consumer of `libvm`.
 - Keep `vmmon` focused on runtime supervision instead of manager concerns.
 - Make machine startup config-driven from the per-instance `config.yaml`.
 - Keep `libvm` as the architectural boundary between daemonless local ABI mode and future daemon or tunnel mode.
@@ -54,9 +54,9 @@ This architecture is intentionally daemonless by default. A future daemon or tun
 
 ## Component Boundaries
 
-### `bento`
+### `silo`
 
-`bento` is a thin command-line frontend.
+`silo` is a thin command-line frontend.
 
 It owns:
 
@@ -73,9 +73,9 @@ It does not own:
 - direct Negotiate protocol ownership,
 - direct `vmmon` lifecycle management.
 
-### `bento-core`
+### `silo-core`
 
-`bento-core` owns shared domain types.
+`silo-core` owns shared domain types.
 
 It owns:
 
@@ -105,7 +105,7 @@ It owns:
 - the top-level data directory and per-instance layout,
 - SQLite manager state at `state.db`,
 - UUID allocation,
-- canonical `config.yaml` writing from `bento-core::VmSpec`,
+- canonical `config.yaml` writing from `silo-core::VmSpec`,
 - image resolution and instance materialization,
 - bootstrap and guest runtime materialization,
 - spawning `vmmon`,
@@ -179,7 +179,7 @@ It does not own:
 ### Machine configuration
 
 - `config.yaml` in the instance directory is the canonical machine configuration.
-- `config.yaml` is written by `libvm` from `bento-core::VmSpec`.
+- `config.yaml` is written by `libvm` from `silo-core::VmSpec`.
 - `vmmon` is data-dir-driven. It accepts `--data-dir` and reads `config.yaml` from that directory.
 
 ### Manager metadata
@@ -203,7 +203,7 @@ SQLite does not replace `config.yaml` as the canonical VM boot contract.
 The current canonical layout is:
 
 ```text
-~/.local/share/bento/
+~/.local/share/silo/
   state.db
   machines/
     <uuid>/
@@ -230,7 +230,7 @@ Those filenames are part of the current implementation and should be treated as 
 
 ## Canonical `VmSpec`
 
-The canonical machine config type is `bento_core::VmSpec`.
+The canonical machine config type is `silo_core::VmSpec`.
 
 Its current shape is:
 
@@ -316,7 +316,7 @@ pub enum NetworkMode {
 }
 ```
 
-Guest service configuration used during bootstrap and readiness lives in `bento-core`, but it is not embedded directly inside `VmSpec` today.
+Guest service configuration used during bootstrap and readiness lives in `silo-core`, but it is not embedded directly inside `VmSpec` today.
 
 ## `vmmon` API and Protocol Ownership
 

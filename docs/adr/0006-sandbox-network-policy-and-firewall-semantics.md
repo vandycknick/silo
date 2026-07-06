@@ -482,9 +482,9 @@ Required and optional network secret slots are derived from policy declarations.
 Secret values are passed to networking components as base64 environment variables:
 
 ```sh
-BENTO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN=<base64>
-BENTO_NET_SECRET_CODEX_OAUTH_EXPIRES_AT=<base64>
-BENTO_NET_SECRET_CODEX_OAUTH_ACCOUNT_ID=<base64>
+SILO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN=<base64>
+SILO_NET_SECRET_CODEX_OAUTH_EXPIRES_AT=<base64>
+SILO_NET_SECRET_CODEX_OAUTH_ACCOUNT_ID=<base64>
 ```
 
 Values are base64 encoded unconditionally. The `libvm` API should support byte secrets internally and string helpers ergonomically.
@@ -502,13 +502,13 @@ If refresh is needed, the networking component invokes one network-level refresh
 Hook config is passed as base64 JSON in:
 
 ```sh
-BENTO_NET_OAUTH_REFRESH_HOOK=<base64-json>
+SILO_NET_OAUTH_REFRESH_HOOK=<base64-json>
 ```
 
 Hook authorization material is passed separately:
 
 ```sh
-BENTO_NET_OAUTH_REFRESH_AUTH=<base64>
+SILO_NET_OAUTH_REFRESH_AUTH=<base64>
 ```
 
 If hook config is set, hook auth is required.
@@ -527,7 +527,7 @@ Decoded hook config:
 
 `command` must be absolute. The networking component executes it directly with `args`. There is no shell execution, PATH lookup, or command string parsing.
 
-The hook subprocess receives a sanitized environment containing `BENTO_NET_OAUTH_REFRESH_AUTH` and a minimal safe baseline. It does not receive `BENTO_NET_SECRET_...` values.
+The hook subprocess receives a sanitized environment containing `SILO_NET_OAUTH_REFRESH_AUTH` and a minimal safe baseline. It does not receive `SILO_NET_SECRET_...` values.
 
 Hook IO uses LSP-style framing:
 
@@ -628,7 +628,7 @@ Example:
 }
 ```
 
-Required Tailscale secret slots are derived from tunnel declarations and passed through `BENTO_NET_SECRET_...`.
+Required Tailscale secret slots are derived from tunnel declarations and passed through `SILO_NET_SECRET_...`.
 
 Outbound Tailscale routing requires explicit allow with a tunnel reference. Initial routing is TCP-only. UDP through a selected tunnel fails closed until supported. Tunnel failure does not fall back to direct routing.
 

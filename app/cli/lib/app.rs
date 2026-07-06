@@ -7,8 +7,8 @@ const HELP_TEMPLATE: &str = "{about}\n\n{usage-heading} {usage}\n\n{all-args}{af
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "bento",
-    about = "BentoBox VM lifecycle control",
+    name = "silo",
+    about = "Silo VM lifecycle control",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -52,14 +52,14 @@ mod tests {
 
     #[test]
     fn parses_list_alias() {
-        let cli = Cli::try_parse_from(["bento", "ls"]).expect("list alias should parse");
+        let cli = Cli::try_parse_from(["silo", "ls"]).expect("list alias should parse");
 
         assert!(matches!(cli.command, Command::List(_)));
     }
 
     #[test]
     fn parses_status_alias() {
-        let cli = Cli::try_parse_from(["bento", "status"]).expect("status alias should parse");
+        let cli = Cli::try_parse_from(["silo", "status"]).expect("status alias should parse");
 
         assert!(matches!(cli.command, Command::Show(_)));
     }
@@ -67,27 +67,27 @@ mod tests {
     #[test]
     fn parses_default_command_forms() {
         let cli =
-            Cli::try_parse_from(["bento", "default", "devbox"]).expect("default set should parse");
+            Cli::try_parse_from(["silo", "default", "devbox"]).expect("default set should parse");
         assert!(matches!(cli.command, Command::Default(_)));
 
-        let cli = Cli::try_parse_from(["bento", "default", "--unset"])
+        let cli = Cli::try_parse_from(["silo", "default", "--unset"])
             .expect("default unset should parse");
         assert!(matches!(cli.command, Command::Default(_)));
     }
 
     #[test]
     fn output_format_replaces_json_flag() {
-        Cli::try_parse_from(["bento", "list", "--format", "plain"])
+        Cli::try_parse_from(["silo", "list", "--format", "plain"])
             .expect("plain format should parse");
-        Cli::try_parse_from(["bento", "list", "--format", "json"])
+        Cli::try_parse_from(["silo", "list", "--format", "json"])
             .expect("json format should parse");
 
-        assert!(Cli::try_parse_from(["bento", "list", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["silo", "list", "--json"]).is_err());
     }
 
     #[test]
     fn edit_command_is_not_available() {
-        assert!(Cli::try_parse_from(["bento", "edit"]).is_err());
+        assert!(Cli::try_parse_from(["silo", "edit"]).is_err());
     }
 
     #[test]

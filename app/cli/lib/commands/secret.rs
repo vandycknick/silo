@@ -27,21 +27,21 @@ const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
 const OPENAI_CODEX_KIND: &str = "openai_codex_oauth";
 const OPENAI_DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SECRET_STORE_FILE_NAME: &str = "secrets.json";
-const OAUTH_REFRESH_AUTH_ENV: &str = "BENTO_NET_OAUTH_REFRESH_AUTH";
+const OAUTH_REFRESH_AUTH_ENV: &str = "SILO_NET_OAUTH_REFRESH_AUTH";
 
 const EXAMPLES: &[&str] = &[
-    "bento secret login openai-codex --name personal",
-    "printf '%s' \"$TOKEN\" | bento secret set bearer_token github-api --token-stdin",
-    "printf '%s' \"$TOKEN\" | bento secret set bearer_token.github-api.token --value-stdin",
-    "bento secret set aws_credential prod --profile production-admin",
-    "bento secret list",
-    "bento secret show openai_codex_oauth.personal.oauth",
-    "bento secret rm bearer_token.github-api.token --force",
+    "silo secret login openai-codex --name personal",
+    "printf '%s' \"$TOKEN\" | silo secret set bearer_token github-api --token-stdin",
+    "printf '%s' \"$TOKEN\" | silo secret set bearer_token.github-api.token --value-stdin",
+    "silo secret set aws_credential prod --profile production-admin",
+    "silo secret list",
+    "silo secret show openai_codex_oauth.personal.oauth",
+    "silo secret rm bearer_token.github-api.token --force",
 ];
 
 #[derive(Args, Debug)]
 #[command(
-    about = "Manage Bento secrets",
+    about = "Manage Silo secrets",
     after_help = crate::help::examples(EXAMPLES)
 )]
 pub struct Cmd {
@@ -238,7 +238,7 @@ async fn login(store: &SecretStore, command: &LoginCmd) -> eyre::Result<()> {
 
 async fn login_openai_codex() -> eyre::Result<TokenResponse> {
     let client = reqwest::Client::builder()
-        .user_agent(concat!("bento/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("silo/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()?;
 
@@ -379,7 +379,7 @@ fn set_plain_secret(store: &SecretStore, command: &SetCmd) -> eyre::Result<()> {
         [key] => {
             if command.has_provider_specific_source() {
                 eyre::bail!(
-                    "provider-specific options require `bento secret set <kind> <name> ...`"
+                    "provider-specific options require `silo secret set <kind> <name> ...`"
                 );
             }
             let value = plain_secret_value(
@@ -459,7 +459,7 @@ fn set_provider_plain_secret(
         }
         "aws_credential" => aws_secret_entries(kind, name, command)?,
         other => eyre::bail!(
-            "unsupported credential kind `{other}` for `bento secret set`; use an exact secret key with --value if needed"
+            "unsupported credential kind `{other}` for `silo secret set`; use an exact secret key with --value if needed"
         ),
     };
     write_plain_secret_entries(store, entries, command.force)
@@ -1045,25 +1045,25 @@ fn tailscale_tunnel_for_alternative(alternative: &NetworkSecretAlternative) -> O
 
 fn credential_secret_hint(credential: &NetworkCredential) -> String {
     match credential.kind.as_str() {
-        OPENAI_CODEX_KIND => format!("run `bento secret login openai-codex --name {}`", credential.name),
+        OPENAI_CODEX_KIND => format!("run `silo secret login openai-codex --name {}`", credential.name),
         "basic_auth" => format!(
-            "write it with `printf '%s' \"$PASSWORD\" | bento secret set basic_auth {} --password-stdin`",
+            "write it with `printf '%s' \"$PASSWORD\" | silo secret set basic_auth {} --password-stdin`",
             credential.name
         ),
         "bearer_token" => format!(
-            "write it with `printf '%s' \"$TOKEN\" | bento secret set bearer_token {} --token-stdin`",
+            "write it with `printf '%s' \"$TOKEN\" | silo secret set bearer_token {} --token-stdin`",
             credential.name
         ),
         "header_token" => format!(
-            "write it with `printf '%s' \"$TOKEN\" | bento secret set header_token {} --token-stdin`",
+            "write it with `printf '%s' \"$TOKEN\" | silo secret set header_token {} --token-stdin`",
             credential.name
         ),
         "aws_credential" => format!(
-            "write a profile with `bento secret set aws_credential {} --profile <profile>` or static keys with `bento secret set aws_credential {} --access-key-id ... --secret-access-key-stdin`",
+            "write a profile with `silo secret set aws_credential {} --profile <profile>` or static keys with `silo secret set aws_credential {} --access-key-id ... --secret-access-key-stdin`",
             credential.name, credential.name
         ),
         _ => format!(
-            "write a matching secret with `bento secret set {}`",
+            "write a matching secret with `silo secret set {}`",
             credential.name
         ),
     }
@@ -1086,10 +1086,10 @@ fn secret_requirement_hint(
         .find_map(tailscale_tunnel_for_alternative)
     {
         return format!(
-            "write it with `printf '%s' \"$SECRET\" | bento secret set tailscale.{tunnel_name}.auth_key --value-stdin`"
+            "write it with `printf '%s' \"$SECRET\" | silo secret set tailscale.{tunnel_name}.auth_key --value-stdin`"
         );
     }
-    "write the required network secret material with `bento secret set`".to_string()
+    "write the required network secret material with `silo secret set`".to_string()
 }
 
 fn format_missing_network_secrets(missing: &[MissingNetworkSecret], path: &Path) -> String {
@@ -1298,7 +1298,7 @@ async fn refresh_openai_codex_oauth(
         ));
     }
     let client = reqwest::Client::builder()
-        .user_agent(concat!("bento/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("silo/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?;
@@ -1835,11 +1835,11 @@ fn validate_secret_name(name: &str) -> eyre::Result<()> {
 
 fn resolve_default_data_dir() -> eyre::Result<PathBuf> {
     if let Some(data_home) = env_absolute_path("XDG_DATA_HOME")? {
-        return Ok(data_home.join("bento"));
+        return Ok(data_home.join("silo"));
     }
     let home = env_absolute_path("HOME")?
-        .ok_or_else(|| eyre::eyre!("could not resolve Bento data dir from HOME"))?;
-    Ok(home.join(".local/share/bento"))
+        .ok_or_else(|| eyre::eyre!("could not resolve Silo data dir from HOME"))?;
+    Ok(home.join(".local/share/silo"))
 }
 
 fn env_absolute_path(name: &'static str) -> eyre::Result<Option<PathBuf>> {
@@ -1958,7 +1958,7 @@ mod tests {
     #[test]
     fn secret_login_openai_codex_parses() {
         let cli = Cli::try_parse_from([
-            "bento",
+            "silo",
             "secret",
             "login",
             "openai-codex",
@@ -1982,13 +1982,13 @@ mod tests {
 
     #[test]
     fn credentials_subcommand_is_removed() {
-        assert!(Cli::try_parse_from(["bento", "credentials", "list"]).is_err());
+        assert!(Cli::try_parse_from(["silo", "credentials", "list"]).is_err());
     }
 
     #[test]
     fn secret_login_rejects_policy_credential_kind_as_provider() {
         assert!(Cli::try_parse_from([
-            "bento",
+            "silo",
             "secret",
             "login",
             "openai_codex_oauth",
@@ -2001,7 +2001,7 @@ mod tests {
     #[test]
     fn secret_refresh_oauth_parses_but_is_hidden() {
         let cli = Cli::try_parse_from([
-            "bento",
+            "silo",
             "secret",
             "refresh-oauth",
             "--store-file",
@@ -2022,7 +2022,7 @@ mod tests {
     #[test]
     fn secret_set_exact_key_plain_value_parses() {
         let cli = Cli::try_parse_from([
-            "bento",
+            "silo",
             "secret",
             "set",
             "bearer_token.github-api.token",
@@ -2049,7 +2049,7 @@ mod tests {
     #[test]
     fn secret_set_provider_aware_value_parses() {
         let cli = Cli::try_parse_from([
-            "bento",
+            "silo",
             "secret",
             "set",
             "bearer_token",
@@ -2171,7 +2171,7 @@ mod tests {
         );
 
         let launch =
-            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/bento").as_path())
+            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/silo").as_path())
                 .expect("network launch");
 
         assert_network_secret(&launch, "personal.oauth.access_token", "access-token");
@@ -2183,7 +2183,7 @@ mod tests {
             .any(|secret| secret.value == b"refresh-token"));
 
         let hook = launch.oauth_refresh_hook.as_ref().expect("oauth hook");
-        assert_eq!(hook.command, PathBuf::from("/usr/bin/bento"));
+        assert_eq!(hook.command, PathBuf::from("/usr/bin/silo"));
         assert_eq!(
             hook.args,
             vec![
@@ -2219,14 +2219,14 @@ mod tests {
         );
 
         let error =
-            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/bento").as_path())
+            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/silo").as_path())
                 .expect_err("missing secret");
         let message = error.to_string();
 
         assert!(message.contains("personal.oauth.access_token"));
         assert!(message.contains("personal.oauth.expires_at"));
         assert!(message.contains("openai_codex_oauth.personal.oauth"));
-        assert!(message.contains("bento secret login openai-codex --name personal"));
+        assert!(message.contains("silo secret login openai-codex --name personal"));
     }
 
     #[test]
@@ -2254,7 +2254,7 @@ mod tests {
         );
 
         let launch =
-            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/bento").as_path())
+            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/silo").as_path())
                 .expect("network launch");
 
         assert_network_secret(&launch, "github-api.token", "github-token");
@@ -2292,7 +2292,7 @@ mod tests {
         let policy = aws_network_policy();
 
         let launch =
-            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/bento").as_path())
+            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/silo").as_path())
                 .expect("network launch");
 
         assert_network_secret(&launch, "prod.profile", "production-admin");
@@ -2337,7 +2337,7 @@ mod tests {
         let policy = aws_network_policy();
 
         let launch =
-            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/bento").as_path())
+            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/silo").as_path())
                 .expect("network launch");
 
         assert_network_secret(&launch, "prod.access_key_id", "AKIAEXAMPLE");
@@ -2360,7 +2360,7 @@ mod tests {
         let policy = aws_network_policy();
 
         let error =
-            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/bento").as_path())
+            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/silo").as_path())
                 .expect_err("missing aws credential material");
         let message = error.to_string();
 
@@ -2368,7 +2368,7 @@ mod tests {
         assert!(message.contains("prod.profile"));
         assert!(message.contains("aws_credential.prod.access_key_id"));
         assert!(message.contains("aws_credential.prod.secret_access_key"));
-        assert!(message.contains("bento secret set aws_credential prod --profile <profile>"));
+        assert!(message.contains("silo secret set aws_credential prod --profile <profile>"));
     }
 
     #[test]

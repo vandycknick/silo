@@ -16,14 +16,14 @@ import (
 
 	"github.com/containers/gvisor-tap-vsock/pkg/transport"
 	log "github.com/sirupsen/logrus"
-	"github.com/vandycknick/bentobox/net/netd/internal/config"
-	"github.com/vandycknick/bentobox/net/netd/internal/credentials"
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/audit"
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/forwarder"
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/router"
-	"github.com/vandycknick/bentobox/net/netd/internal/policy"
-	"github.com/vandycknick/bentobox/net/netd/internal/virtualnetwork"
+	"github.com/vandycknick/silo/net/netd/internal/config"
+	"github.com/vandycknick/silo/net/netd/internal/credentials"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/audit"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/forwarder"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
+	"github.com/vandycknick/silo/net/netd/internal/policy"
+	"github.com/vandycknick/silo/net/netd/internal/virtualnetwork"
 	"golang.org/x/sync/errgroup"
 )
 

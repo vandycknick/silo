@@ -6,7 +6,7 @@ import (
 	"net/netip"
 	"strings"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/policy/hostmatch"
+	"github.com/vandycknick/silo/net/netd/internal/policy/hostmatch"
 )
 
 type Action string

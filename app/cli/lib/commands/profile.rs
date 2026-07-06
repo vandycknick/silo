@@ -13,17 +13,17 @@ use crate::profile::{
 use crate::ui::{self, OutputFormat, Table};
 
 const EXAMPLES: &[&str] = &[
-    "bento profile list",
-    "bento profile show dev",
-    "bento profile create dev --image ghcr.io/me/dev:latest",
-    "bento profile edit dev",
-    "bento profile validate dev",
+    "silo profile list",
+    "silo profile show dev",
+    "silo profile create dev --image ghcr.io/me/dev:latest",
+    "silo profile edit dev",
+    "silo profile validate dev",
 ];
 
 const CREATE_EXAMPLES: &[&str] = &[
-    "bento profile create dev --image ghcr.io/me/dev:latest",
-    "bento profile create offline --image ubuntu:24.04 --network none",
-    "bento profile create dev --image ghcr.io/me/dev:latest --cpus 4 --memory 4gb --disk-size 40gb",
+    "silo profile create dev --image ghcr.io/me/dev:latest",
+    "silo profile create offline --image ubuntu:24.04 --network none",
+    "silo profile create dev --image ghcr.io/me/dev:latest --cpus 4 --memory 4gb --disk-size 40gb",
 ];
 
 #[derive(Debug, Args)]
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn profile_list_alias_parses() {
-        let cli = Cli::try_parse_from(["bento", "profile", "ls", "--format", "json"])
+        let cli = Cli::try_parse_from(["silo", "profile", "ls", "--format", "json"])
             .expect("profile ls should parse");
 
         let Command::Profile(profile) = cli.command else {
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn create_parses_mounts_labels_and_networks() {
         let cli = Cli::try_parse_from([
-            "bento",
+            "silo",
             "profile",
             "create",
             "dev",

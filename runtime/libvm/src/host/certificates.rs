@@ -29,7 +29,7 @@ pub(crate) fn ensure_certificate_authority_in(
 ) -> eyre::Result<CertificateAuthority> {
     let keys_dir = paths.keys_dir();
     fs::create_dir_all(&keys_dir)
-        .with_context(|| format!("create bento keys directory {}", keys_dir.display()))?;
+        .with_context(|| format!("create silo keys directory {}", keys_dir.display()))?;
     set_keys_dir_permissions(&keys_dir)?;
 
     let certificate_path = keys_dir.join(CERTIFICATE_AUTHORITY_CERTIFICATE_FILE_NAME);
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn ensure_certificate_authority_creates_files_in_keys_dir() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
 
         let authority = ensure_certificate_authority_in(&paths).expect("ensure CA");
 
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn ensure_certificate_authority_reuses_existing_files() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let first = ensure_certificate_authority_in(&paths).expect("ensure CA");
         let second = ensure_certificate_authority_in(&paths).expect("reuse CA");
 
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn ensure_certificate_authority_rejects_partial_files() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         fs::create_dir_all(paths.keys_dir()).expect("create keys dir");
         fs::write(paths.keys_dir().join("ca.pem"), "certificate").expect("write cert");
 
@@ -260,7 +260,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
 
         let authority = ensure_certificate_authority_in(&paths).expect("ensure CA");
 

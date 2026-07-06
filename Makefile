@@ -1,5 +1,5 @@
 GUEST_TARGET := aarch64-unknown-linux-musl
-GUEST_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/bento-agent
+GUEST_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/silo-agent
 GUEST_INIT_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/init
 GUEST_ASSETS_DIR := $(CURDIR)/target/resources/assets
 INITRAMFS_OUT := $(GUEST_ASSETS_DIR)/initramfs
@@ -84,10 +84,6 @@ krun:
 netd:
 	@mkdir -p "target/$(TARGET_PROFILE_DIR)"
 	cd net/netd && go build $(GO_BUILD_FLAGS) -o "$(CURDIR)/$(NETD_BIN)" ./cmd/netd
-
-.PHONY: policy-header
-policy-header:
-	BENTO_POLICY_REGENERATE_HEADER=1 cargo build -p policy --features ffi,regenerate-ffi-header
 
 .PHONY: kernel
 kernel:

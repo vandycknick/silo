@@ -429,7 +429,7 @@ pub struct NetworkSecretSlot {
 
 impl NetworkSecretSlot {
     pub fn env_name(&self) -> String {
-        let mut name = String::from("BENTO_NET_SECRET_");
+        let mut name = String::from("SILO_NET_SECRET_");
         let mut previous_was_separator = false;
         for character in self.name.chars() {
             if character.is_ascii_alphanumeric() {
@@ -1264,7 +1264,7 @@ mod tests {
             slot.name == "codex.oauth.access_token"
                 && slot.required
                 && slot.kind == NetworkSecretKind::OAuth
-                && slot.env_name() == "BENTO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN"
+                && slot.env_name() == "SILO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN"
         }));
         assert!(slots
             .iter()
@@ -1296,7 +1296,7 @@ mod tests {
             diagnostic.summary == "network secret env name collision"
                 && diagnostic.detail.contains("api-key.token")
                 && diagnostic.detail.contains("api_key.token")
-                && diagnostic.detail.contains("BENTO_NET_SECRET_API_KEY_TOKEN")
+                && diagnostic.detail.contains("SILO_NET_SECRET_API_KEY_TOKEN")
         }));
     }
 

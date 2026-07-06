@@ -1,13 +1,13 @@
 //! Shared constants for libvm behavior that crosses module boundaries.
 
-/// Local certificate authority certificate filename under the Bento keys directory.
+/// Local certificate authority certificate filename under the Silo keys directory.
 pub(crate) const CERTIFICATE_AUTHORITY_CERTIFICATE_FILE_NAME: &str = "ca.pem";
 
-/// Local certificate authority private key filename under the Bento keys directory.
+/// Local certificate authority private key filename under the Silo keys directory.
 pub(crate) const CERTIFICATE_AUTHORITY_PRIVATE_KEY_FILE_NAME: &str = "ca-key.pem";
 
-/// Common name used for the generated local Bento certificate authority.
-pub(crate) const CERTIFICATE_AUTHORITY_COMMON_NAME: &str = "Bento Local Certificate Authority";
+/// Common name used for the generated local Silo certificate authority.
+pub(crate) const CERTIFICATE_AUTHORITY_COMMON_NAME: &str = "Silo Local Certificate Authority";
 
 /// Host path checked for the system localtime symlink.
 pub(crate) const HOST_LOCALTIME_PATH: &str = "/etc/localtime";
@@ -26,12 +26,12 @@ pub(crate) const FORWARD_ENDPOINT_NAME: &str = "forward";
 
 /// Certificate authority path installed inside the guest for provisioning trust.
 pub(crate) const GUEST_CERTIFICATE_AUTHORITY_PATH: &str =
-    "/usr/local/share/ca-certificates/bento-ca.crt";
+    "/usr/local/share/ca-certificates/silo-ca.crt";
 
-/// Private SSH key filename used for Bento guest login credentials.
+/// Private SSH key filename used for Silo guest login credentials.
 pub(crate) const GUEST_SSH_PRIVATE_KEY_FILE_NAME: &str = "id_ed25519";
 
-/// Public SSH key filename used for Bento guest login credentials.
+/// Public SSH key filename used for Silo guest login credentials.
 pub(crate) const GUEST_SSH_PUBLIC_KEY_FILE_NAME: &str = "id_ed25519.pub";
 
 /// Default shell assigned to the provisioned guest user.
@@ -46,8 +46,8 @@ pub(crate) const VZNAT_MATCH_DRIVER: &str = "virtio_net";
 /// Guest network interface name used for Virtualization.framework NAT networking.
 pub(crate) const VZNAT_INTERFACE_NAME: &str = "en";
 
-/// Guest network interface name used for Bento unix datagram networking.
-pub(crate) const UNIX_DATAGRAM_INTERFACE_NAME: &str = "bento";
+/// Guest network interface name used for Silo unix datagram networking.
+pub(crate) const UNIX_DATAGRAM_INTERFACE_NAME: &str = "silo";
 
 /// Filesystem type reported to the guest agent for virtiofs mounts.
 pub(crate) const VIRTIOFS_FSTYPE: &str = "virtiofs";

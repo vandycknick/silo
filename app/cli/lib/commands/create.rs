@@ -20,11 +20,11 @@ use crate::profile::{
 use crate::ui::{success, watch_image_progress, Spinner};
 
 const EXAMPLES: &[&str] = &[
-    "bento create dev --start --default",
-    "bento create dev rust-dev --start",
-    "bento create dev --profile rust-dev",
-    "bento create ubuntu --image ubuntu:24.04",
-    "bento create dev rust-dev --image disk:./target/rootfs.img",
+    "silo create dev --start --default",
+    "silo create dev rust-dev --start",
+    "silo create dev --profile rust-dev",
+    "silo create ubuntu --image ubuntu:24.04",
+    "silo create dev rust-dev --image disk:./target/rootfs.img",
 ];
 
 #[derive(Debug, Args)]
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn create_command_parses_profile_form() {
-        let cli = Cli::try_parse_from(["bento", "create", "dev", "rust-dev"])
+        let cli = Cli::try_parse_from(["silo", "create", "dev", "rust-dev"])
             .expect("create command should parse");
         let Command::Create(create) = cli.command else {
             panic!("expected create command");
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn create_command_parses_default_machine_happy_path() {
-        let cli = Cli::try_parse_from(["bento", "create", "dev", "--start", "--default"])
+        let cli = Cli::try_parse_from(["silo", "create", "dev", "--start", "--default"])
             .expect("create command should parse");
         let Command::Create(create) = cli.command else {
             panic!("expected create command");
@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn create_command_parses_vm_overrides() {
         let cli = Cli::try_parse_from([
-            "bento",
+            "silo",
             "create",
             "dev",
             "rust-dev",
@@ -417,11 +417,10 @@ mod tests {
     #[test]
     fn create_command_rejects_bare_memory_and_disk_size() {
         assert!(
-            Cli::try_parse_from(["bento", "create", "dev", "rust-dev", "--memory", "4096"])
-                .is_err()
+            Cli::try_parse_from(["silo", "create", "dev", "rust-dev", "--memory", "4096"]).is_err()
         );
         assert!(
-            Cli::try_parse_from(["bento", "create", "dev", "rust-dev", "--disk-size", "40"])
+            Cli::try_parse_from(["silo", "create", "dev", "rust-dev", "--disk-size", "40"])
                 .is_err()
         );
     }

@@ -8,22 +8,22 @@ const DEFAULT_ROOT: &[u8] = b"/dev/vda";
 pub(crate) const DEFAULT_INIT: &[u8] = b"/sbin/init";
 const MNT_ROOT: &[u8] = b"/mnt/root";
 const AGENT_PAYLOAD_DIR: &[u8] = b"/agent";
-const AGENT_SOURCE_BINARY: &[u8] = b"/agent/bento-agent";
+const AGENT_SOURCE_BINARY: &[u8] = b"/agent/silo-agent";
 const AGENT_RUN_DIR: &[u8] = b"/run/agent";
-const AGENT_RUN_BINARY: &[u8] = b"/run/agent/bento-agent";
+const AGENT_RUN_BINARY: &[u8] = b"/run/agent/silo-agent";
 const SYSTEMD_UNIT_DIR: &[u8] = b"/run/systemd/system";
 const SYSTEMD_WANTS_DIR: &[u8] = b"/run/systemd/system/multi-user.target.wants";
-const AGENT_SERVICE_PATH: &[u8] = b"/run/systemd/system/bento-agent.service";
+const AGENT_SERVICE_PATH: &[u8] = b"/run/systemd/system/silo-agent.service";
 const AGENT_SERVICE_WANTS_PATH: &[u8] =
-    b"/run/systemd/system/multi-user.target.wants/bento-agent.service";
-const AGENT_SERVICE_WANTS_TARGET: &[u8] = b"../bento-agent.service";
+    b"/run/systemd/system/multi-user.target.wants/silo-agent.service";
+const AGENT_SERVICE_WANTS_TARGET: &[u8] = b"../silo-agent.service";
 const AGENT_SERVICE_UNIT: &[u8] = b"[Unit]\n\
-Description=Bento Guest Agent\n\
+Description=Silo Guest Agent\n\
 After=basic.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
-ExecStart=/run/agent/bento-agent\n\
+ExecStart=/run/agent/silo-agent\n\
 Restart=on-failure\n\
 RestartSec=1s\n\
 \n\
@@ -181,7 +181,7 @@ fn prepare_agent_handoff() -> Result<(), &'static str> {
     }
 
     if io::access(AGENT_SOURCE_BINARY, libc::R_OK) != 0 {
-        return Err("agent payload is missing /agent/bento-agent");
+        return Err("agent payload is missing /agent/silo-agent");
     }
 
     if applets::files::mkdir_parents(AGENT_RUN_DIR, 0o755) != 0 {
@@ -191,7 +191,7 @@ fn prepare_agent_handoff() -> Result<(), &'static str> {
         return Err("failed to create /run/systemd/system");
     }
     if applets::files::mkdir_parents(SYSTEMD_WANTS_DIR, 0o755) != 0 {
-        return Err("failed to create bento-agent systemd wants directory");
+        return Err("failed to create silo-agent systemd wants directory");
     }
 
     copy_file(AGENT_SOURCE_BINARY, AGENT_RUN_BINARY, 0o755)?;
@@ -200,7 +200,7 @@ fn prepare_agent_handoff() -> Result<(), &'static str> {
     if io::symlink(AGENT_SERVICE_WANTS_TARGET, AGENT_SERVICE_WANTS_PATH) != 0
         && io::errno() != libc::EEXIST
     {
-        return Err("failed to enable bento-agent systemd unit");
+        return Err("failed to enable silo-agent systemd unit");
     }
 
     Ok(())
@@ -286,7 +286,7 @@ pub(crate) fn do_switch_root(new_root: &[u8], init: &[u8], init_argv: &[&[u8]]) 
     move_mount_if_present(b"/dev", new_root);
     move_mount_if_present(b"/proc", new_root);
     move_mount_if_present(b"/sys", new_root);
-    // Match util-linux switch_root behavior for /run. Bento relies on this as
+    // Match util-linux switch_root behavior for /run. Silo relies on this as
     // a transient handoff: initramfs /run/... becomes rootfs /run/... here, and
     // systemd reuses the existing tmpfs instead of replacing it.
     move_mount_if_present(b"/run", new_root);

@@ -8,7 +8,7 @@ Abandoned
 
 ## Context
 
-Bentobox needs an image workflow that supports:
+Silo needs an image workflow that supports:
 
 - OCI-backed VM base images.
 - A shared local image store that acts as the persistent cache.
@@ -18,7 +18,7 @@ Bentobox needs an image workflow that supports:
 - Creating instances from image refs.
 - Creating lower-level raw instances without requiring a base image.
 
-The core design choice is that OCI is only the transport format. Bentobox persists normalized
+The core design choice is that OCI is only the transport format. Silo persists normalized
 images in its own local store and creates instances from that store. It does not keep a second
 long-lived OCI blob cache in V1.
 
@@ -26,10 +26,10 @@ long-lived OCI blob cache in V1.
 
 ### Local image store
 
-Bentobox stores normalized images under `Directory::with_prefix("images").get_data_home()`:
+Silo stores normalized images under `Directory::with_prefix("images").get_data_home()`:
 
-- `$XDG_DATA_HOME/bento/images`, else
-- `~/.local/share/bento/images`
+- `$XDG_DATA_HOME/silo/images`, else
+- `~/.local/share/silo/images`
 
 Store layout:
 
@@ -58,14 +58,14 @@ Store layout:
 
 ### OCI artifact format
 
-Bentobox uses a standard OCI image manifest with custom payload layers.
+Silo uses a standard OCI image manifest with custom payload layers.
 
-- Artifact type: `application/vnd.bentobox.base-image.v1`
+- Artifact type: `application/vnd.silo.base-image.v1`
 - Config media type: `application/vnd.oci.image.config.v1+json`
-- Metadata layer: `application/vnd.bentobox.image.metadata.v1+json`
-- Rootfs chunk layer: `application/vnd.bentobox.disk.chunk.v1+zstd`
-- Kernel layer: `application/vnd.bentobox.boot.kernel.v1` (optional, at most one)
-- Initramfs layer: `application/vnd.bentobox.boot.initramfs.v1` (optional, at most one)
+- Metadata layer: `application/vnd.silo.image.metadata.v1+json`
+- Rootfs chunk layer: `application/vnd.silo.disk.chunk.v1+zstd`
+- Kernel layer: `application/vnd.silo.boot.kernel.v1` (optional, at most one)
+- Initramfs layer: `application/vnd.silo.boot.initramfs.v1` (optional, at most one)
 
 Validation rules:
 
@@ -97,13 +97,13 @@ The metadata JSON is the source of truth for image defaults and bootstrap suppor
 Bundled boot assets are inferred from the presence of the optional kernel and initramfs layers, not
 from metadata fields.
 
-Bootstrap media for guest initialization is a separate concern from OCI image transport. Bentobox
+Bootstrap media for guest initialization is a separate concern from OCI image transport. Silo
 uses a local NoCloud seed disk with volume label `CIDATA`, formatted as VFAT, so bootstrap stays
 backend-neutral instead of depending on host-specific ISO tooling.
 
 ### Instance creation from images
 
-`bento create <ref> <name>` resolves a local image or pulls it on demand, then:
+`silo create <ref> <name>` resolves a local image or pulls it on demand, then:
 
 - applies image metadata defaults for CPU, memory, and bootstrap support unless CLI
   overrides them
@@ -114,10 +114,10 @@ backend-neutral instead of depending on host-specific ISO tooling.
 
 ### Packing local VMs
 
-`bento images pack <vm> <ref>`:
+`silo images pack <vm> <ref>`:
 
 - requires a stopped VM with a root disk
-- captures the VM rootfs and metadata into the Bentobox OCI format
+- captures the VM rootfs and metadata into the Silo OCI format
 - can optionally bundle the resolved kernel and/or initramfs with `--include-kernel` and
   `--include-initrd`
 - ingests the resulting artifact into the shared local image store under `<ref>` by default
@@ -137,12 +137,12 @@ Bundled boot asset rules:
 
 ### Pulling remote images
 
-`bento images pull <ref>` downloads the OCI artifact, validates it, reconstructs the normalized
+`silo images pull <ref>` downloads the OCI artifact, validates it, reconstructs the normalized
 image directory, and updates `registry.json`.
 
 ### Importing OCI tar archives
 
-`bento images import <path>` ingests an OCI tar archive into the normalized local image store.
+`silo images import <path>` ingests an OCI tar archive into the normalized local image store.
 
 - input is restricted to OCI tar archives in V1
 - imported artifacts follow the same validation and reconstruction rules as pulled artifacts
@@ -152,7 +152,7 @@ Pulled and packed images must converge onto the same local representation.
 
 ### Backend disk policy
 
-For file-backed Linux guests on the VZ backend, Bentobox sets explicit host caching and
+For file-backed Linux guests on the VZ backend, Silo sets explicit host caching and
 synchronization defaults in the backend rather than relying on framework defaults.
 
 Current policy:
@@ -183,9 +183,9 @@ supported backends need a common abstraction.
 
 ## Deferred
 
-- `bento images push <src> <ref>`
+- `silo images push <src> <ref>`
 - registry credential integration
 - signed artifact verification
 - multi-arch index selection
 - persistent OCI blob cache or CAS/dedupe layer if needed
-- built-in `bento images resize`
+- built-in `silo images resize`

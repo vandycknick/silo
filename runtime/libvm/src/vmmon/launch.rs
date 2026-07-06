@@ -12,7 +12,7 @@ use crate::store::models::MachineId;
 use crate::vmmon::Vmmon;
 use crate::LibVmError;
 
-const ENV_VMMON_PATH: &str = "BENTO_VMMON_PATH";
+const ENV_VMMON_PATH: &str = "SILO_VMMON_PATH";
 const ENV_VM_STARTPIPE: &str = "_VM_STARTPIPE";
 const ENV_VM_SYNCPIPE: &str = "_VM_SYNCPIPE";
 const VMMON_LAUNCHER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -319,11 +319,11 @@ mod tests {
     fn append_exit_command_args_preserves_structured_argv() {
         let mut command = Command::new("vmmon");
         let exit_command = MachineExitCommand::new(
-            "/usr/local/bin/bento",
+            "/usr/local/bin/silo",
             [
                 OsString::from("cleanup"),
                 OsString::from("--data-dir"),
-                OsString::from("/tmp/bento"),
+                OsString::from("/tmp/silo"),
                 OsString::from("--machine-id"),
                 OsString::from("0123456789abcdef0123456789abcdef"),
             ],
@@ -339,13 +339,13 @@ mod tests {
             args,
             vec![
                 OsString::from("--exit-command"),
-                OsString::from("/usr/local/bin/bento"),
+                OsString::from("/usr/local/bin/silo"),
                 OsString::from("--exit-command-arg"),
                 OsString::from("cleanup"),
                 OsString::from("--exit-command-arg"),
                 OsString::from("--data-dir"),
                 OsString::from("--exit-command-arg"),
-                OsString::from("/tmp/bento"),
+                OsString::from("/tmp/silo"),
                 OsString::from("--exit-command-arg"),
                 OsString::from("--machine-id"),
                 OsString::from("--exit-command-arg"),

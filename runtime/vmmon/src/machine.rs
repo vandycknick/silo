@@ -393,7 +393,7 @@ mod tests {
             machine_config.config.kernel_cmdline,
             vec![
                 "console=hvc0".to_string(),
-                "bento.guest.port=1027".to_string()
+                "silo.guest.port=1027".to_string()
             ]
         );
         assert_eq!(machine_config.config.vm_id(), "vm123");

@@ -400,13 +400,13 @@ mod tests {
     fn host_context() -> GuestAgentHostContext {
         GuestAgentHostContext {
             user: HostUser {
-                name: "bento".to_string(),
+                name: "silo".to_string(),
                 uid: 1000,
-                gecos: "Bento User".to_string(),
+                gecos: "Silo User".to_string(),
             },
-            ssh_public_key_openssh: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBento".to_string(),
+            ssh_public_key_openssh: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISilo".to_string(),
             certificate_authority_pem:
-                "-----BEGIN CERTIFICATE-----\nMIIBENTO\n-----END CERTIFICATE-----\n".to_string(),
+                "-----BEGIN CERTIFICATE-----\nMIISILO\n-----END CERTIFICATE-----\n".to_string(),
             timezone: "Europe/Amsterdam".to_string(),
             locale: "nl_NL.UTF-8".to_string(),
         }
@@ -414,24 +414,21 @@ mod tests {
 
     #[test]
     fn guest_ssh_key_paths_use_local_keys_dir() {
-        let paths = LocalPaths::new("/tmp/bento");
+        let paths = LocalPaths::new("/tmp/silo");
 
         let (private_key_path, public_key_path) = guest_ssh_key_paths(&paths);
 
-        assert_eq!(
-            private_key_path,
-            PathBuf::from("/tmp/bento/keys/id_ed25519")
-        );
+        assert_eq!(private_key_path, PathBuf::from("/tmp/silo/keys/id_ed25519"));
         assert_eq!(
             public_key_path,
-            PathBuf::from("/tmp/bento/keys/id_ed25519.pub")
+            PathBuf::from("/tmp/silo/keys/id_ed25519.pub")
         );
     }
 
     #[test]
     fn guest_ssh_keypair_generates_missing_keypair() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
 
         let keypair = load_or_generate_guest_ssh_keypair(&paths).expect("load guest SSH keypair");
 
@@ -451,7 +448,7 @@ mod tests {
     #[test]
     fn guest_ssh_keypair_regenerates_when_private_key_is_missing() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let first = load_or_generate_guest_ssh_keypair(&paths).expect("generate guest SSH keypair");
         fs::remove_file(&first.private_key_path).expect("remove private key");
 
@@ -466,7 +463,7 @@ mod tests {
     #[test]
     fn guest_ssh_keypair_regenerates_when_public_key_is_missing() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let first = load_or_generate_guest_ssh_keypair(&paths).expect("generate guest SSH keypair");
         fs::remove_file(&first.public_key_path).expect("remove public key");
 
@@ -481,7 +478,7 @@ mod tests {
     #[test]
     fn guest_ssh_keypair_reuses_existing_valid_keypair() {
         let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let first = load_or_generate_guest_ssh_keypair(&paths).expect("generate guest SSH keypair");
 
         let second = load_or_generate_guest_ssh_keypair(&paths).expect("reuse guest SSH keypair");
@@ -589,7 +586,7 @@ mod tests {
             "demo",
             &spec,
             &VmmonNetworkAttachment::UnixDatagram {
-                path: PathBuf::from("/run/bento/net.sock"),
+                path: PathBuf::from("/run/silo/net.sock"),
                 mac: "02:00:00:00:00:01".to_string(),
             },
             &host_context(),
@@ -600,12 +597,12 @@ mod tests {
         assert_eq!(provision.hostname.as_deref(), Some("demo"));
         assert_eq!(provision.timezone.as_deref(), Some("Europe/Amsterdam"));
         assert_eq!(provision.locale.as_deref(), Some("nl_NL.UTF-8"));
-        assert_eq!(provision.users[0].name, "bento");
+        assert_eq!(provision.users[0].name, "silo");
         assert_eq!(provision.users[0].ssh_authorized_keys.len(), 1);
         assert!(provision.resize_rootfs.enabled);
         assert_eq!(provision.mounts[0].tag, "workspace");
         assert_eq!(provision.mounts[0].path, "/workspace");
-        assert_eq!(provision.network.interfaces[0].name, "bento");
+        assert_eq!(provision.network.interfaces[0].name, "silo");
         assert_eq!(
             provision.network.interfaces[0]
                 .matches
@@ -635,7 +632,7 @@ mod tests {
         let decoded: AgentConfig = serde_json::from_str(&rendered).expect("decode metadata config");
         assert!(decoded.provision.enabled);
         assert!(decoded.provision.resize_rootfs.enabled);
-        assert_eq!(decoded.provision.rosetta.mount_tag, "bento-rosetta");
+        assert_eq!(decoded.provision.rosetta.mount_tag, "silo-rosetta");
         assert_eq!(decoded.provision.network.interfaces.len(), 1);
         assert_eq!(
             decoded
@@ -661,8 +658,8 @@ mod tests {
         .expect("resolve provision config");
 
         assert!(provision.rosetta.enabled);
-        assert_eq!(provision.rosetta.mount_tag, "bento-rosetta");
-        assert_eq!(provision.rosetta.mount_path, "/mnt/bento-rosetta");
+        assert_eq!(provision.rosetta.mount_tag, "silo-rosetta");
+        assert_eq!(provision.rosetta.mount_path, "/mnt/silo-rosetta");
     }
 
     #[test]

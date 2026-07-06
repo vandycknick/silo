@@ -88,7 +88,7 @@ async fn main() -> eyre::Result<()> {
         .try_init();
 
     // TODO: support direct PID 1 initialization in the future. For now the
-    // agent expects bento-init to hand it off to systemd.
+    // agent expects silo-init to hand it off to systemd.
     if is_pid1 {
         tracing::info!("running as PID 1 without init mode enabled yet");
     }
@@ -406,6 +406,6 @@ mod tests {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("bento-agent only runs inside Linux guests");
+    eprintln!("silo-agent only runs inside Linux guests");
     std::process::exit(1);
 }

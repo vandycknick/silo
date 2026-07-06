@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::LibVmError;
 
-const APP_DIR_NAME: &str = "bento";
+const APP_DIR_NAME: &str = "silo";
 
 pub(crate) fn resolve_default_data_dir() -> Result<PathBuf, LibVmError> {
     let home = env_absolute_path("HOME")?;

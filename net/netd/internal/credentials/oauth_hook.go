@@ -15,12 +15,12 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
 )
 
 const (
-	OAuthRefreshHookEnv = "BENTO_NET_OAUTH_REFRESH_HOOK"
-	OAuthRefreshAuthEnv = "BENTO_NET_OAUTH_REFRESH_AUTH"
+	OAuthRefreshHookEnv = "SILO_NET_OAUTH_REFRESH_HOOK"
+	OAuthRefreshAuthEnv = "SILO_NET_OAUTH_REFRESH_AUTH"
 
 	defaultOAuthRefreshTimeout = 10 * time.Second
 	defaultOAuthRefreshSkew    = 5 * time.Minute

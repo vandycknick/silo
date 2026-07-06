@@ -1,6 +1,6 @@
-# BentoBox Terminology
+# Silo Terminology
 
-Virtualization terms are overloaded across projects. KVM, hypervisor, VMM, VM, microVM, backend, and driver are often used loosely, especially in the cloud-native and microVM ecosystem. BentoBox uses the definitions below so code, docs, and architecture discussions stay pointed at the same layers.
+Virtualization terms are overloaded across projects. KVM, hypervisor, VMM, VM, microVM, backend, and driver are often used loosely, especially in the cloud-native and microVM ecosystem. Silo uses the definitions below so code, docs, and architecture discussions stay pointed at the same layers.
 
 The terms intentionally line up with the KVM, crosvm, Cloud Hypervisor, Virtualization.framework, and libvirt ecosystems where that makes the code easier to reason about.
 
@@ -38,10 +38,10 @@ flowchart TD
     AppleHardware[Apple virtualization hardware support]
     HypervisorFramework[Hypervisor.framework]
     VirtualizationFramework[Virtualization.framework]
-    BentoRuntime[BentoBox host runtime]
+    SiloRuntime[Silo host runtime]
     Guest[Guest VM]
 
-    AppleHardware --> HypervisorFramework --> VirtualizationFramework --> BentoRuntime --> Guest
+    AppleHardware --> HypervisorFramework --> VirtualizationFramework --> SiloRuntime --> Guest
 ```
 
 ## KVM
@@ -82,13 +82,13 @@ A VM typically contains:
 
 The guest OS believes it is running on real hardware, even though a VMM and host virtualization layer are mediating execution.
 
-In user-facing BentoBox documentation, use "VM" when referring to an instance created, started, stopped, or deleted by BentoBox.
+In user-facing Silo documentation, use "VM" when referring to an instance created, started, stopped, or deleted by Silo.
 
 Examples:
 
-- `bento create dev rust-dev`
-- `bento start dev`
-- `bento stop dev`
+- `silo create dev rust-dev`
+- `silo start dev`
+- `silo stop dev`
 
 ## Hypervisor
 
@@ -111,7 +111,7 @@ Type 2 hypervisors run on top of a host OS:
 
 In modern Linux/KVM systems, the line gets blurry. People may call KVM itself, QEMU, Cloud Hypervisor, or the combined stack "the hypervisor". Technically, KVM provides kernel virtualization support and userspace provides the actual machine model. Together they form the practical hypervisor stack.
 
-BentoBox itself is not a hypervisor. It orchestrates and adapts host virtualization implementations.
+Silo itself is not a hypervisor. It orchestrates and adapts host virtualization implementations.
 
 ## VMM
 
@@ -143,7 +143,7 @@ VMM = userspace VM controller/runtime
 VM = guest machine
 ```
 
-Cloud Hypervisor calls itself a VMM. crosvm uses the term heavily. BentoBox follows that ecosystem language when describing the lower-level userspace virtualization runtime layer.
+Cloud Hypervisor calls itself a VMM. crosvm uses the term heavily. Silo follows that ecosystem language when describing the lower-level userspace virtualization runtime layer.
 
 ## microVM
 
@@ -168,7 +168,7 @@ Examples and adjacent projects include:
 
 Traditional VMs often emulate a broad PC platform, including PCI buses, VGA, USB, BIOS, ACPI, or IDE controllers. MicroVMs intentionally avoid most of that surface area. They usually prefer direct kernel boot, virtio devices, and a minimal MMIO model.
 
-BentoBox primarily targets microVM-style workloads. Not every supported host virtualization stack needs to use the exact term "microVM", but BentoBox should prefer implementations and configurations that fit this model.
+Silo primarily targets microVM-style workloads. Not every supported host virtualization stack needs to use the exact term "microVM", but Silo should prefer implementations and configurations that fit this model.
 
 ## Example Virtualization Stacks
 
@@ -203,45 +203,45 @@ macOS Virtualization.framework stack:
 ```mermaid
 flowchart TD
     Guest[Guest VM]
-    Bento[BentoBox host runtime]
+    Silo[Silo host runtime]
     VZ[Virtualization.framework]
     HVF[Hypervisor.framework]
     Hardware[Apple virtualization hardware support]
 
-    Hardware --> HVF --> VZ --> Bento --> Guest
+    Hardware --> HVF --> VZ --> Silo --> Guest
 ```
 
 ## Virtualization Backend
 
-A virtualization backend is the concrete host implementation BentoBox uses to run a VM.
+A virtualization backend is the concrete host implementation Silo uses to run a VM.
 
-Current BentoBox runtime backend selection is internal and host-driven:
+Current Silo runtime backend selection is internal and host-driven:
 
 - macOS uses Apple Virtualization.framework through `vz`
 - Linux uses libkrun/krun through `krun`
 
-Users do not select a backend in `VmSpec`. `VmSpec` describes the VM, while BentoBox chooses the host implementation at compile time.
+Users do not select a backend in `VmSpec`. `VmSpec` describes the VM, while Silo chooses the host implementation at compile time.
 
-In BentoBox, "backend" is a practical project term. It names the concrete implementation path selected by host platform; it is not meant to replace the more precise ecosystem terms VMM, hypervisor, VM, or KVM.
+In Silo, "backend" is a practical project term. It names the concrete implementation path selected by host platform; it is not meant to replace the more precise ecosystem terms VMM, hypervisor, VM, or KVM.
 
 ## Backend Driver
 
-A backend driver is the Rust adapter code that implements support for a virtualization backend inside BentoBox.
+A backend driver is the Rust adapter code that implements support for a virtualization backend inside Silo.
 
 Examples:
 
 - `vz`
 - `krun`
 
-Use "driver" for BentoBox adapter code. Use "VMM" for the lower-level userspace virtualization implementation/runtime when that layer exists as a distinct concept.
+Use "driver" for Silo adapter code. Use "VMM" for the lower-level userspace virtualization implementation/runtime when that layer exists as a distinct concept.
 
-## BentoBox Components
+## Silo Components
 
-The BentoBox runtime layers sit above the host virtualization stack:
+The Silo runtime layers sit above the host virtualization stack:
 
 ```mermaid
 flowchart TD
-    CLI[bento]
+    CLI[silo]
     LibVm[libvm]
     Vmmon[vmmon]
     Virt[virt]
@@ -256,11 +256,11 @@ flowchart TD
 
 ### `virt`
 
-`virt` is BentoBox's host virtualization facade.
+`virt` is Silo's host virtualization facade.
 
 It exposes the common Rust API that `vmmon` uses to create, start, stop, and communicate with a VM. The concrete implementation is selected at compile time by host platform.
 
-The exported `VirtualMachine` type is BentoBox's per-instance VM handle. It is not the guest OS and it is not the underlying VMM implementation. It is the API handle used by BentoBox code to control one VM.
+The exported `VirtualMachine` type is Silo's per-instance VM handle. It is not the guest OS and it is not the underlying VMM implementation. It is the API handle used by Silo code to control one VM.
 
 `virt` is not a hypervisor. It is also not the product-level VM manager.
 
@@ -270,7 +270,7 @@ The exported `VirtualMachine` type is BentoBox's per-instance VM handle. It is n
 
 It supervises one running VM, exposes monitor and control APIs, tracks lifecycle state, handles guest readiness, and participates in cleanup and reconciliation.
 
-`vmmon` uses `virt` to start and control the host-selected virtualization implementation. It is BentoBox's process-level supervisor around one VM, not the guest VM itself.
+`vmmon` uses `virt` to start and control the host-selected virtualization implementation. It is Silo's process-level supervisor around one VM, not the guest VM itself.
 
 ### `libvm`
 
@@ -288,7 +288,7 @@ It is separate from the VMM, `virt`, and `vmmon`. It provides guest-side service
 
 ### Host
 
-The host is the operating system running BentoBox.
+The host is the operating system running Silo.
 
 Examples:
 

@@ -68,7 +68,7 @@ fn ensure_running(data: &MachineData) -> eyre::Result<()> {
     }
 
     Err(eyre::eyre!(
-        "machine `{}` is not running; start it with `bento start {}`",
+        "machine `{}` is not running; start it with `silo start {}`",
         data.name,
         data.name
     ))
@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn exec_command_parses_trailing_args() {
         let cli = Cli::try_parse_from([
-            "bento",
+            "silo",
             "exec",
             "arch",
             "--",
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn exec_command_parses_default_machine_form() {
-        let cli = Cli::try_parse_from(["bento", "exec", "--", "make", "kernel"])
+        let cli = Cli::try_parse_from(["silo", "exec", "--", "make", "kernel"])
             .expect("exec command should parse");
 
         let Command::Exec(exec) = cli.command else {
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn exec_command_parses_forward_agent() {
-        let cli = Cli::try_parse_from(["bento", "exec", "-A", "arch", "--", "git", "fetch"])
+        let cli = Cli::try_parse_from(["silo", "exec", "-A", "arch", "--", "git", "fetch"])
             .expect("exec command should parse");
 
         let Command::Exec(exec) = cli.command else {
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn exec_command_parses_tty_and_forward_agent() {
-        let cli = Cli::try_parse_from(["bento", "exec", "-A", "-t", "dev", "--", "opencode"])
+        let cli = Cli::try_parse_from(["silo", "exec", "-A", "-t", "dev", "--", "opencode"])
             .expect("exec command should parse");
 
         let Command::Exec(exec) = cli.command else {

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use bento_policy::NetworkPolicy;
+use silo_policy::NetworkPolicy;
 
 use crate::store::models;
 use crate::utils::{validate_identifier, IdentifierPolicy};

@@ -14,7 +14,7 @@ use crate::LibVmError;
 ///
 /// # async fn example() -> Result<(), libvm::LibVmError> {
 /// let runtime = Runtime::builder()
-///     .data_root("/var/lib/bento")
+///     .data_root("/var/lib/silo")
 ///     .networking(
 ///         RuntimeNetworkingConfig::new()
 ///             .with_netd(NetdRuntimeConfig::new().with_pcap(true)),

@@ -1,6 +1,6 @@
 # krun
 
-`krun` is BentoBox's libkrun integration crate and helper binary.
+`krun` is Silo's libkrun integration crate and helper binary.
 
 The crate exposes:
 
@@ -9,7 +9,7 @@ The crate exposes:
 - a `SerialConnection` wrapper for helper stdio access
 - typed disk, mount, and vsock configuration structs
 
-The `krun` binary is intentionally small. It parses BentoBox's flat helper arguments, configures libkrun directly, and then enters the VM. It does not use the library builder and does not expose subcommands.
+The `krun` binary is intentionally small. It parses Silo's flat helper arguments, configures libkrun directly, and then enters the VM. It does not use the library builder and does not expose subcommands.
 
 ## Boundary
 
@@ -36,7 +36,7 @@ Do not import `krun_sys` from library modules. Direct libkrun access belongs in 
 
 ## Scope
 
-Current scope focuses on the libkrun path used by BentoBox today:
+Current scope focuses on the libkrun path used by Silo today:
 
 - direct kernel and initramfs boot
 - raw block devices
@@ -59,7 +59,7 @@ Planned follow-up scope includes:
 
 ## Feature Validation
 
-Every Bento-exposed libkrun feature that requires a capability check must be checked inside the `krun` helper binary immediately before the feature-specific libkrun API is called.
+Every Silo-exposed libkrun feature that requires a capability check must be checked inside the `krun` helper binary immediately before the feature-specific libkrun API is called.
 
 Those checks return contextual helper errors that vmmon can capture and log from the helper process. For example, attempting to attach block devices with a libkrun build that lacks `BLK` support returns an error shaped like:
 
@@ -73,35 +73,35 @@ Feature checks must not live in the library. If they do, `vmmon` and other libra
 
 ## libkrun Build Features
 
-BentoBox's intended libkrun build keeps the upstream library narrow while preserving the current krun backend behavior:
+Silo's intended libkrun build keeps the upstream library narrow while preserving the current krun backend behavior:
 
 ```text
 --no-default-features --features blk --features net
 ```
 
-That means BentoBox intentionally builds libkrun with these features enabled:
+That means Silo intentionally builds libkrun with these features enabled:
 
-| Feature | Purpose | BentoBox policy |
+| Feature | Purpose | Silo policy |
 | --- | --- | --- |
-| `blk` | Enables virtio-block devices. | Keep. Required for `--disk` and BentoBox disk images. |
-| `net` | Enables virtio-net devices for unixgram, unixstream, and tap networking. | Keep. Required for BentoBox networking modes. |
+| `blk` | Enables virtio-block devices. | Keep. Required for `--disk` and Silo disk images. |
+| `net` | Enables virtio-net devices for unixgram, unixstream, and tap networking. | Keep. Required for Silo networking modes. |
 
-BentoBox intentionally leaves these libkrun features disabled for now:
+Silo intentionally leaves these libkrun features disabled for now:
 
-| Feature | Purpose | BentoBox policy |
+| Feature | Purpose | Silo policy |
 | --- | --- | --- |
-| `init-blob` | Embeds libkrun's default guest init binary. This is an upstream default feature. | Disable with `--no-default-features`. BentoBox requires explicit boot inputs and the helper disables implicit init. |
-| `gpu` | Enables virtio-gpu, Venus, and native-context graphics support. | Disable. BentoBox has no krun GPU path today. |
-| `snd` | Enables virtio-snd audio support. | Disable. BentoBox has no krun audio path today. |
-| `input` | Enables input device support for GUI/input passthrough. | Disable. BentoBox has no krun input-device path today. |
-| `efi` | Enables EFI boot support and implies `blk` and `net`. | Disable. BentoBox uses explicit external kernel/initramfs boot instead of EFI firmware boot. |
-| `tee` | Enables trusted execution environment plumbing. | Disable unless BentoBox grows a confidential-compute krun backend. |
-| `amd-sev` | Enables AMD SEV, SEV-ES, and SEV-SNP support. Implies `blk` and `tee`. | Disable unless BentoBox grows an SEV backend. |
-| `tdx` | Enables Intel TDX support. Implies `blk` and `tee`. | Disable unless BentoBox grows a TDX backend. |
-| `aws-nitro` | Enables AWS Nitro Enclaves support and its specialized init path. | Disable unless BentoBox grows a Nitro backend. |
+| `init-blob` | Embeds libkrun's default guest init binary. This is an upstream default feature. | Disable with `--no-default-features`. Silo requires explicit boot inputs and the helper disables implicit init. |
+| `gpu` | Enables virtio-gpu, Venus, and native-context graphics support. | Disable. Silo has no krun GPU path today. |
+| `snd` | Enables virtio-snd audio support. | Disable. Silo has no krun audio path today. |
+| `input` | Enables input device support for GUI/input passthrough. | Disable. Silo has no krun input-device path today. |
+| `efi` | Enables EFI boot support and implies `blk` and `net`. | Disable. Silo uses explicit external kernel/initramfs boot instead of EFI firmware boot. |
+| `tee` | Enables trusted execution environment plumbing. | Disable unless Silo grows a confidential-compute krun backend. |
+| `amd-sev` | Enables AMD SEV, SEV-ES, and SEV-SNP support. Implies `blk` and `tee`. | Disable unless Silo grows an SEV backend. |
+| `tdx` | Enables Intel TDX support. Implies `blk` and `tee`. | Disable unless Silo grows a TDX backend. |
+| `aws-nitro` | Enables AWS Nitro Enclaves support and its specialized init path. | Disable unless Silo grows a Nitro backend. |
 | `virgl_resource_map2` | Enables an optional virglrenderer GPU API used by some virtio-gpu builds. | Disable with `gpu`. It has no use without the GPU path. |
 
-If a new krun feature is exposed through BentoBox, update this table and add a helper-side `krun_has_feature()` check before calling the feature-specific libkrun API. Do not enable upstream libkrun features speculatively. The tiny VM goblin gets one feature only when it can point to the code that uses it.
+If a new krun feature is exposed through Silo, update this table and add a helper-side `krun_has_feature()` check before calling the feature-specific libkrun API. Do not enable upstream libkrun features speculatively. The tiny VM goblin gets one feature only when it can point to the code that uses it.
 
 ## Example
 
@@ -136,4 +136,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The public crate API is process-backed because BentoBox uses the `krun` helper as the libkrun execution boundary. The helper binary remains single-purpose and direct-to-libkrun, while Rust callers use the builder and VM handle facade without linking libkrun themselves.
+The public crate API is process-backed because Silo uses the `krun` helper as the libkrun execution boundary. The helper binary remains single-purpose and direct-to-libkrun, while Rust callers use the builder and VM handle facade without linking libkrun themselves.

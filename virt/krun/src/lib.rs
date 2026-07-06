@@ -1,4 +1,4 @@
-//! Process-backed libkrun helper API for BentoBox.
+//! Process-backed libkrun helper API for Silo.
 //!
 //! See `virt/krun/README.md` for the libkrun build-feature policy.
 

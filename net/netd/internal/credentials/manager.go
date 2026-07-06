@@ -22,7 +22,7 @@ import (
 	awsv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awscredentials "github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/vandycknick/bentobox/net/netd/internal/gateway/hooks"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
 )
 
 const (
@@ -31,7 +31,7 @@ const (
 	ReasonSigning   = "credential_signing_error"
 	ReasonInjection = "credential_injection_error"
 
-	networkSecretPrefix = "BENTO_NET_SECRET_"
+	networkSecretPrefix = "SILO_NET_SECRET_"
 )
 
 type ApplyError struct {
@@ -369,7 +369,7 @@ func applyIdempotencyKey(req *http.Request) {
 	if req.Method == http.MethodGet || req.Method == http.MethodHead || req.Header.Get("Idempotency-Key") != "" {
 		return
 	}
-	hint := req.Header.Get("X-Bento-Idempotency-Hint")
+	hint := req.Header.Get("X-Silo-Idempotency-Hint")
 	if hint == "" && req.URL != nil {
 		hint = req.Method + "\n" + req.URL.Path + "\n" + req.URL.RawQuery
 	}

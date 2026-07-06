@@ -2,19 +2,19 @@
 name = "cli"
 version = "0.1.0"
 edition = "2021"
-default-run = "bento"
+default-run = "silo"
 
 [lib]
 name = "cli"
 path = "lib/lib.rs"
 
 [[bin]]
-name = "bento"
+name = "silo"
 path = "bin/main.rs"
 
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }
-bento_policy = { package = "policy", path = "../../common/policy" }
+silo_policy = { package = "policy", path = "../../common/policy" }
 libvm = { path = "../../runtime/libvm" }
 vm-spec = { path = "../../specs/vm-spec" }
 utils = { path = "../../common/utils" }

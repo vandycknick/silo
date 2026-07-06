@@ -1,7 +1,7 @@
 use crate::machine::Memory;
 use crate::network::{MachineNetworkBuilder, MachineNetworkConfig};
 
-use bento_policy::NetworkPolicy;
+use silo_policy::NetworkPolicy;
 
 #[derive(Debug, Clone)]
 #[non_exhaustive]

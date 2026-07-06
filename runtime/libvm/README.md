@@ -1,10 +1,10 @@
 # libvm
 
-`libvm` is the Rust library boundary for managing Bento virtual machines.
+`libvm` is the Rust library boundary for managing Silo virtual machines.
 It gives callers a `Runtime` entry point, then returns `Machine` handles for
 lifecycle operations.
 
-Use it when you need to create, resolve, inspect, start, stop, or remove Bento
+Use it when you need to create, resolve, inspect, start, stop, or remove Silo
 VMs from Rust code. The crate keeps database rows, runtime state files, and
 process details behind the API boundary.
 
@@ -77,7 +77,7 @@ The persisted machine states mean:
 - `starting`: a start transaction owns the VM and is waiting for the host-side
   `vmmon` startup handshake to finish.
 - `running`: `vmmon` is alive and the host-side startup handshake succeeded.
-- `stopping`: a stop signal was sent to `vmmon` and Bento is waiting for the
+- `stopping`: a stop signal was sent to `vmmon` and Silo is waiting for the
   monitor to exit.
 - `error`: the VM is not usable until an explicit lifecycle command repairs or
   replaces the state.

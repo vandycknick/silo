@@ -1,4 +1,4 @@
-//! Safe Rust abstractions over Apple's Virtualization.framework for BentoBox.
+//! Safe Rust abstractions over Apple's Virtualization.framework for Silo.
 
 #[cfg(not(target_os = "macos"))]
 compile_error!("vz only supports macOS hosts");

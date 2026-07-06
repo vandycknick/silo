@@ -20,14 +20,14 @@ export class Runtime {
    * @example
    * ```ts
    * const runtime = await Runtime.open({
-   *   dataRoot: "/tmp/bento-sdk",
-   *   defaultKernel: "/usr/local/share/bento/assets/kernel-default",
-   *   defaultInitramfs: "/usr/local/share/bento/assets/initramfs",
+   *   dataRoot: "/tmp/silo-sdk",
+   *   defaultKernel: "/usr/local/share/silo/assets/kernel-default",
+   *   defaultInitramfs: "/usr/local/share/silo/assets/initramfs",
    * });
    * ```
    *
    * @throws {TypeError} When `options` is malformed.
-   * @throws {BentoError} When the runtime cannot be opened.
+   * @throws {SiloError} When the runtime cannot be opened.
    */
   static async open(options?: RuntimeOpenOptions): Promise<Runtime> {
     return new Runtime(await mapNativePromise(napi.openRuntime(runtimeOptionsToNative(options))));
@@ -47,7 +47,7 @@ export class Runtime {
    * Look up an existing machine by name or ID.
    *
    * @throws {TypeError} When `reference` is not a non-empty string.
-   * @throws {BentoError} When the machine cannot be found or loaded.
+   * @throws {SiloError} When the machine cannot be found or loaded.
    */
   async getMachine(reference: string): Promise<Machine> {
     return new Machine(await mapNativePromise(this.native.getMachine(assertNonEmptyString(reference, "reference"))));

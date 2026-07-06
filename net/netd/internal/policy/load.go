@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/vandycknick/bentobox/net/netd/internal/policy/hostmatch"
+	"github.com/vandycknick/silo/net/netd/internal/policy/hostmatch"
 )
 
 type LoadError struct {

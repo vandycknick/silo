@@ -172,59 +172,56 @@ mod tests {
 
     #[test]
     fn local_roots_derive_expected_subpaths() {
-        let roots = LocalRoots::new("/tmp/bento");
+        let roots = LocalRoots::new("/tmp/silo");
 
-        assert_eq!(roots.data_dir(), PathBuf::from("/tmp/bento").as_path());
-        assert_eq!(roots.data_root(), PathBuf::from("/tmp/bento").as_path());
-        assert_eq!(roots.run_root(), PathBuf::from("/tmp/bento/run").as_path());
+        assert_eq!(roots.data_dir(), PathBuf::from("/tmp/silo").as_path());
+        assert_eq!(roots.data_root(), PathBuf::from("/tmp/silo").as_path());
+        assert_eq!(roots.run_root(), PathBuf::from("/tmp/silo/run").as_path());
         assert_eq!(
             roots.image_root(),
-            PathBuf::from("/tmp/bento/images").as_path()
+            PathBuf::from("/tmp/silo/images").as_path()
         );
-        assert_eq!(roots.state_db_path(), PathBuf::from("/tmp/bento/state.db"));
-        assert_eq!(roots.machines_dir(), PathBuf::from("/tmp/bento/machines"));
-        assert_eq!(roots.images_dir(), PathBuf::from("/tmp/bento/images"));
-        assert_eq!(roots.net_dir(), PathBuf::from("/tmp/bento/run/net"));
-        assert_eq!(roots.locks_dir(), PathBuf::from("/tmp/bento/run/locks"));
+        assert_eq!(roots.state_db_path(), PathBuf::from("/tmp/silo/state.db"));
+        assert_eq!(roots.machines_dir(), PathBuf::from("/tmp/silo/machines"));
+        assert_eq!(roots.images_dir(), PathBuf::from("/tmp/silo/images"));
+        assert_eq!(roots.net_dir(), PathBuf::from("/tmp/silo/run/net"));
+        assert_eq!(roots.locks_dir(), PathBuf::from("/tmp/silo/run/locks"));
     }
 
     #[test]
     fn local_roots_use_explicit_run_and_image_roots() {
         let roots =
-            LocalRoots::with_roots("/tmp/bento", "/run/user/501/bento", "/var/lib/bento/images");
+            LocalRoots::with_roots("/tmp/silo", "/run/user/501/silo", "/var/lib/silo/images");
 
-        assert_eq!(roots.data_dir(), PathBuf::from("/tmp/bento").as_path());
+        assert_eq!(roots.data_dir(), PathBuf::from("/tmp/silo").as_path());
         assert_eq!(
             roots.run_root(),
-            PathBuf::from("/run/user/501/bento").as_path()
+            PathBuf::from("/run/user/501/silo").as_path()
         );
         assert_eq!(
             roots.image_root(),
-            PathBuf::from("/var/lib/bento/images").as_path()
+            PathBuf::from("/var/lib/silo/images").as_path()
         );
-        assert_eq!(roots.state_db_path(), PathBuf::from("/tmp/bento/state.db"));
-        assert_eq!(roots.machines_dir(), PathBuf::from("/tmp/bento/machines"));
-        assert_eq!(roots.images_dir(), PathBuf::from("/var/lib/bento/images"));
-        assert_eq!(roots.net_dir(), PathBuf::from("/run/user/501/bento/net"));
-        assert_eq!(
-            roots.locks_dir(),
-            PathBuf::from("/run/user/501/bento/locks")
-        );
+        assert_eq!(roots.state_db_path(), PathBuf::from("/tmp/silo/state.db"));
+        assert_eq!(roots.machines_dir(), PathBuf::from("/tmp/silo/machines"));
+        assert_eq!(roots.images_dir(), PathBuf::from("/var/lib/silo/images"));
+        assert_eq!(roots.net_dir(), PathBuf::from("/run/user/501/silo/net"));
+        assert_eq!(roots.locks_dir(), PathBuf::from("/run/user/501/silo/locks"));
     }
 
     #[test]
     fn local_paths_build_machine_and_network_paths() {
-        let paths = LocalPaths::new("/tmp/bento");
+        let paths = LocalPaths::new("/tmp/silo");
         let machine_id = MachineId::new();
         let machine = paths.machine(machine_id);
         let network = paths.network("net123");
 
-        assert_eq!(paths.keys_dir(), PathBuf::from("/tmp/bento/keys"));
+        assert_eq!(paths.keys_dir(), PathBuf::from("/tmp/silo/keys"));
         assert_eq!(
             machine.dir(),
-            PathBuf::from("/tmp/bento/machines").join(machine_id.to_string())
+            PathBuf::from("/tmp/silo/machines").join(machine_id.to_string())
         );
-        assert_eq!(paths.locks_dir(), PathBuf::from("/tmp/bento/run/locks"));
-        assert_eq!(network.dir(), PathBuf::from("/tmp/bento/run/net/net123"));
+        assert_eq!(paths.locks_dir(), PathBuf::from("/tmp/silo/run/locks"));
+        assert_eq!(network.dir(), PathBuf::from("/tmp/silo/run/net/net123"));
     }
 }

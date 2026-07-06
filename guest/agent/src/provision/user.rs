@@ -131,7 +131,7 @@ fn reconcile_password_lock(user: &UserConfig) -> eyre::Result<()> {
 
 fn write_sudoers(context: &ProvisionContext, user: &UserConfig) -> eyre::Result<()> {
     let path = context.guest_path(&format!(
-        "/etc/sudoers.d/bento-{}",
+        "/etc/sudoers.d/silo-{}",
         sanitize_unit_name(&user.name)
     ));
     if user.sudo.trim().is_empty() {
@@ -220,25 +220,25 @@ mod tests {
         fs::create_dir_all(&etc).expect("create etc");
         fs::write(
             etc.join("passwd"),
-            "root:x:0:0:root:/root:/bin/bash\nbento:x:1000:1000:Bento User:/home/bento:/bin/zsh\n",
+            "root:x:0:0:root:/root:/bin/bash\nsilo:x:1000:1000:Silo User:/home/silo:/bin/zsh\n",
         )
         .expect("write passwd");
 
         let context = ProvisionContext { root: root.clone() };
-        let entry = super::read_user_entry(&context, "bento")
+        let entry = super::read_user_entry(&context, "silo")
             .expect("read user")
             .expect("entry exists");
 
         assert_eq!(entry.uid, 1000);
-        assert_eq!(entry.gecos, "Bento User");
-        assert_eq!(entry.home, "/home/bento");
+        assert_eq!(entry.gecos, "Silo User");
+        assert_eq!(entry.home, "/home/silo");
         assert_eq!(entry.shell, "/bin/zsh");
 
         fs::remove_dir_all(root).expect("clean temp root");
     }
 
     fn temp_root(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("bento-agent-{name}-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("silo-agent-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         path
     }

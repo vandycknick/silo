@@ -110,7 +110,7 @@ pub fn sh(argc: i32, argv: *const *const u8) -> i32 {
     }
 
     if interactive {
-        io::write(io::STDOUT, "Bentobox sh\n");
+        io::write(io::STDOUT, "Silo sh\n");
     }
 
     interactive_loop(&mut shell);

@@ -1804,7 +1804,7 @@ mod tests {
     fn rootfs_tar_converts_to_cached_ext4() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let tar_path = temp.path().join("rootfs.tar");
-        std::fs::write(&tar_path, tar_file("etc/os-release", b"NAME=Bento\n")).expect("write tar");
+        std::fs::write(&tar_path, tar_file("etc/os-release", b"NAME=Silo\n")).expect("write tar");
         let store = ImageStore::open(temp.path().join("cache")).expect("open store");
         let image = store
             .get_or_create_rootfs_tar(
@@ -1825,7 +1825,7 @@ mod tests {
         let bytes = reader
             .read_file("/etc/os-release", 0, Some(64))
             .expect("read converted file");
-        assert_eq!(bytes, b"NAME=Bento\n");
+        assert_eq!(bytes, b"NAME=Silo\n");
     }
 
     #[test]

@@ -24,9 +24,9 @@ const SETTINGS: &[(&str, &str)] = &[
 ];
 
 const EXAMPLES: &[&str] = &[
-    "bento set cpus=4 memory=8G",
-    "bento set dev name=ubuntu disk=64G",
-    "bento set dev network=private rosetta=true",
+    "silo set cpus=4 memory=8G",
+    "silo set dev name=ubuntu disk=64G",
+    "silo set dev network=private rosetta=true",
 ];
 
 #[derive(Debug, Args)]
@@ -67,7 +67,7 @@ impl Cmd {
 
         let data = machine.update(parsed.update).await.map_err(|err| match err {
             libvm::LibVmError::MachineAlreadyRunning { reference } => eyre::eyre!(
-                "{reference} is running\n\nhint: stop it with `bento stop {reference}` before changing settings"
+                "{reference} is running\n\nhint: stop it with `silo stop {reference}` before changing settings"
             ),
             other => eyre::Report::from(other),
         })?;

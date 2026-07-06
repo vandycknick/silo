@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Default guest readiness timeout used when agent integration is enabled.
 pub const DEFAULT_AGENT_TIMEOUT_SECONDS: u64 = 60 * 5;
 
-/// Default guest SSH vsock port exposed by the Bento agent.
+/// Default guest SSH vsock port exposed by the Silo agent.
 pub const SSH_VSOCK_PORT: u32 = 22;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -101,11 +101,11 @@ impl Default for AgentRosettaConfig {
 }
 
 fn default_rosetta_mount_tag() -> String {
-    "bento-rosetta".to_string()
+    "silo-rosetta".to_string()
 }
 
 fn default_rosetta_mount_path() -> String {
-    "/mnt/bento-rosetta".to_string()
+    "/mnt/silo-rosetta".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -218,8 +218,8 @@ mod tests {
         assert!(!config.provision.enabled);
         assert!(!config.provision.resize_rootfs.enabled);
         assert!(!config.provision.rosetta.enabled);
-        assert_eq!(config.provision.rosetta.mount_tag, "bento-rosetta");
-        assert_eq!(config.provision.rosetta.mount_path, "/mnt/bento-rosetta");
+        assert_eq!(config.provision.rosetta.mount_tag, "silo-rosetta");
+        assert_eq!(config.provision.rosetta.mount_path, "/mnt/silo-rosetta");
         assert!(config.provision.users.is_empty());
         assert!(config.provision.network.interfaces.is_empty());
     }
@@ -248,8 +248,8 @@ provision:
         assert_eq!(config.provision.hostname.as_deref(), Some("demo"));
         assert!(config.provision.resize_rootfs.enabled);
         assert!(config.provision.rosetta.enabled);
-        assert_eq!(config.provision.rosetta.mount_tag, "bento-rosetta");
-        assert_eq!(config.provision.rosetta.mount_path, "/mnt/bento-rosetta");
+        assert_eq!(config.provision.rosetta.mount_tag, "silo-rosetta");
+        assert_eq!(config.provision.rosetta.mount_path, "/mnt/silo-rosetta");
         let userdata = config.provision.userdata.expect("userdata");
         assert_eq!(userdata.content_type, UserdataContentType::ShellScript);
         assert_eq!(userdata.run, UserdataRunPolicy::Always);
@@ -290,24 +290,24 @@ provision:
                 locale: Some("en_US.UTF-8".to_string()),
                 resize_rootfs: ResizeRootfsConfig { enabled: true },
                 users: vec![UserConfig {
-                    name: "bento".to_string(),
+                    name: "silo".to_string(),
                     uid: u32::MAX,
-                    gecos: "Bento User".to_string(),
-                    home: "/home/bento".to_string(),
+                    gecos: "Silo User".to_string(),
+                    home: "/home/silo".to_string(),
                     shell: "/bin/bash".to_string(),
                     sudo: "ALL=(ALL) NOPASSWD:ALL".to_string(),
                     lock_passwd: true,
-                    ssh_authorized_keys: vec!["ssh-ed25519 AAAAC3NzaBento".to_string()],
+                    ssh_authorized_keys: vec!["ssh-ed25519 AAAAC3NzaSilo".to_string()],
                 }],
                 certificate_authority: Some(CertificateAuthorityConfig {
-                    path: "/usr/local/share/ca-certificates/bento-ca.crt".to_string(),
-                    pem: "-----BEGIN CERTIFICATE-----\nMIIBENTO\n-----END CERTIFICATE-----\n"
+                    path: "/usr/local/share/ca-certificates/silo-ca.crt".to_string(),
+                    pem: "-----BEGIN CERTIFICATE-----\nMIISILO\n-----END CERTIFICATE-----\n"
                         .to_string(),
                     update_trust: true,
                 }),
                 network: NetworkConfig {
                     interfaces: vec![NetworkInterfaceConfig {
-                        name: "bento".to_string(),
+                        name: "silo".to_string(),
                         matches: NetworkMatchConfig {
                             driver: Some("virtio_net".to_string()),
                             mac_address: Some("02:00:00:00:00:01".to_string()),

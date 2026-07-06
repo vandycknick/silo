@@ -51,19 +51,19 @@ mod tests {
     #[test]
     fn cleanup_exit_command_uses_current_executable_shape() {
         let options = cleanup_exit_command_options(
-            PathBuf::from("/usr/local/bin/bento"),
-            Path::new("/tmp/bento"),
+            PathBuf::from("/usr/local/bin/silo"),
+            Path::new("/tmp/silo"),
             "0123456789abcdef0123456789abcdef",
         );
         let exit_command = options.exit_command.expect("exit command");
 
-        assert_eq!(exit_command.command, PathBuf::from("/usr/local/bin/bento"));
+        assert_eq!(exit_command.command, PathBuf::from("/usr/local/bin/silo"));
         assert_eq!(
             exit_command.args,
             vec![
                 OsString::from("cleanup"),
                 OsString::from("--data-dir"),
-                OsString::from("/tmp/bento"),
+                OsString::from("/tmp/silo"),
                 OsString::from("--machine-id"),
                 OsString::from("0123456789abcdef0123456789abcdef"),
             ]

@@ -7,11 +7,11 @@ use crate::profile::{MachineNetworkSelection, ResolvedMachineNetwork};
 use crate::ui::{self, OutputFormat, Table};
 
 const EXAMPLES: &[&str] = &[
-    "bento network list",
-    "bento network create devnet --topology nat",
-    "bento network set devbox devnet",
-    "bento network show devnet",
-    "bento network rm devnet",
+    "silo network list",
+    "silo network create devnet --topology nat",
+    "silo network set devbox devnet",
+    "silo network show devnet",
+    "silo network rm devnet",
 ];
 
 #[derive(Debug, Args)]
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn network_ls_alias_parses_as_network_list() {
-        let cli = Cli::try_parse_from(["bento", "network", "ls", "--format", "json"])
+        let cli = Cli::try_parse_from(["silo", "network", "ls", "--format", "json"])
             .expect("network ls alias should parse");
 
         let Command::Network(network) = cli.command else {
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn network_set_parses_private_policy_name() {
         let set = network_set_cmd([
-            "bento", "network", "set", "devbox", "private", "--policy", "github",
+            "silo", "network", "set", "devbox", "private", "--policy", "github",
         ]);
 
         assert_eq!(set.vm, "devbox");

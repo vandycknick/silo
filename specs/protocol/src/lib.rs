@@ -12,7 +12,7 @@ const JSON_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const JSON_MIN_SAFE_INTEGER: i64 = -JSON_MAX_SAFE_INTEGER;
 
 pub mod v1 {
-    tonic::include_proto!("bento.v1");
+    tonic::include_proto!("silo.v1");
 
     impl StatusUpdate {
         pub fn new(
@@ -38,7 +38,7 @@ pub mod v1 {
 }
 
 pub const DEFAULT_GUEST_CONTROL_PORT: u32 = 1027;
-pub const KERNEL_PARAM_GUEST_PORT: &str = "bento.guest.port";
+pub const KERNEL_PARAM_GUEST_PORT: &str = "silo.guest.port";
 
 pub fn guest_port_arg(port: u32) -> String {
     format!("{}={port}", KERNEL_PARAM_GUEST_PORT)
@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn guest_port_args_parse_configured_port() {
         assert_eq!(
-            parse_guest_port_args(["root=/dev/vda", "bento.guest.port=7001"]),
+            parse_guest_port_args(["root=/dev/vda", "silo.guest.port=7001"]),
             7001
         );
     }
@@ -218,7 +218,7 @@ mod tests {
             DEFAULT_GUEST_CONTROL_PORT
         );
         assert_eq!(
-            parse_guest_port_args(["root=/dev/vda", "bento.guest.port=nope"]),
+            parse_guest_port_args(["root=/dev/vda", "silo.guest.port=nope"]),
             DEFAULT_GUEST_CONTROL_PORT
         );
     }
@@ -234,7 +234,7 @@ mod tests {
             "provision": {
                 "hostname": "demo",
                 "resize_rootfs": { "enabled": true },
-                "users": [{ "name": "bento", "uid": 1000 }],
+                "users": [{ "name": "silo", "uid": 1000 }],
                 "float": 1.5,
                 "nothing": null
             }

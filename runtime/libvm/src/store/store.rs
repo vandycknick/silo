@@ -364,7 +364,7 @@ mod tests {
         let mut labels = BTreeMap::new();
         labels.insert("owner".to_string(), "test".to_string());
         let mut metadata = BTreeMap::new();
-        metadata.insert("bento.profile".to_string(), "rust-dev".to_string());
+        metadata.insert("silo.profile".to_string(), "rust-dev".to_string());
 
         let machine = MachineConfig {
             id,
@@ -391,7 +391,7 @@ mod tests {
         assert_eq!(found.labels.get("owner").map(String::as_str), Some("test"));
         assert_eq!(found.name, "jsonb-test");
         assert_eq!(
-            found.metadata.get("bento.profile").map(String::as_str),
+            found.metadata.get("silo.profile").map(String::as_str),
             Some("rust-dev")
         );
         assert_eq!(found.network, MachineNetworkConfig::default());

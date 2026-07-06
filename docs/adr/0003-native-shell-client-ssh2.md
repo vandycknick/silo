@@ -10,23 +10,23 @@ Proposed
 
 Current shell access works through an external OpenSSH process and proxy command:
 
-`bento shell -> host ssh binary -> bento shell-proxy -> vmmon (UDS control) -> VSOCK -> guest socat -> guest sshd`
+`silo shell -> host ssh binary -> silo shell-proxy -> vmmon (UDS control) -> VSOCK -> guest socat -> guest sshd`
 
 This implementation is functional and supports concurrent sessions, but it has architectural and UX drawbacks:
 
 - Multiple host-side processes for one shell command.
 - Tight coupling to host OpenSSH presence and behavior.
 - Extra complexity around ProxyCommand process lifecycle and stdio edge cases.
-- Limited ability to provide Bento-native shell behavior and features without shelling out.
+- Limited ability to provide Silo-native shell behavior and features without shelling out.
 - Harder path to unify shell/exec/cp behavior under one in-process client model.
 
 We want `vmmon` to remain the sole VM owner and VSOCK endpoint owner. We also want future per-VM key injection via cloud-init and immediate key-based login.
 
 ## Decision
 
-We will replace the external OpenSSH invocation path with an in-process SSH client built in `bento` using `ssh2` (libssh2 bindings).
+We will replace the external OpenSSH invocation path with an in-process SSH client built in `silo` using `ssh2` (libssh2 bindings).
 
-The `bento shell` command will own:
+The `silo shell` command will own:
 
 1. transport setup to `vmmon` control socket,
 2. protocol handshake (`open_vsock`),
@@ -40,9 +40,9 @@ The `bento shell` command will own:
 
 ## Target Architecture
 
-`bento shell -> vmmon vm.sock -> open_vsock(2222) -> guest VSOCK bridge -> guest sshd`
+`silo shell -> vmmon vm.sock -> open_vsock(2222) -> guest VSOCK bridge -> guest sshd`
 
-Implementation shape in `bento`:
+Implementation shape in `silo`:
 
 - `ssh_transport` module:
   - connect to `vm.sock`
@@ -72,7 +72,7 @@ We considered pure Rust SSH libraries and external OpenSSH wrappers.
 
 ### Positive
 
-- Single Bento command path for shell access (no external `ssh` process required).
+- Single Silo command path for shell access (no external `ssh` process required).
 - Reduced process chaining and fewer ProxyCommand/stdin/stdout edge cases.
 - Better control over UX and error mapping (`instance_not_running`, `guest_port_unreachable`, auth failures, host key issues).
 - Foundation for future native `exec` and `cp` primitives reusing the same transport.

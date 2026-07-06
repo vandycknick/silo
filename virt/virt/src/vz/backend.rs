@@ -20,7 +20,7 @@ use crate::types::{MachineIdentifier, NetworkMode, VirtError, VmConfig, VmExit};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-const BENTO_ROSETTA_TAG: &str = "bento-rosetta";
+const SILO_ROSETTA_TAG: &str = "silo-rosetta";
 
 #[derive(Debug)]
 pub(crate) struct VzMachineBackend {
@@ -361,7 +361,7 @@ fn build_vm(spec: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguration)
     }
 
     if spec.rosetta {
-        let mut rosetta_config = VirtioFileSystemDeviceConfiguration::new(BENTO_ROSETTA_TAG);
+        let mut rosetta_config = VirtioFileSystemDeviceConfiguration::new(SILO_ROSETTA_TAG);
         rosetta_config.set_rosetta_share(LinuxRosettaDirectoryShare::new().map_err(vz_error)?);
         builder = builder.add_directory_share(rosetta_config);
     }

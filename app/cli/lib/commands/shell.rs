@@ -70,7 +70,7 @@ fn ensure_running(data: &MachineData) -> eyre::Result<()> {
     }
 
     Err(eyre::eyre!(
-        "machine `{}` is not running; start it with `bento start {}`",
+        "machine `{}` is not running; start it with `silo start {}`",
         data.name,
         data.name
     ))
@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn shell_command_parses_forward_agent() {
-        let cli = Cli::try_parse_from(["bento", "shell", "-A", "dev"])
+        let cli = Cli::try_parse_from(["silo", "shell", "-A", "dev"])
             .expect("shell command should parse");
 
         let Command::Shell(shell) = cli.command else {
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn shell_command_parses_serial_attach() {
-        let cli = Cli::try_parse_from(["bento", "shell", "--attach", "serial"])
+        let cli = Cli::try_parse_from(["silo", "shell", "--attach", "serial"])
             .expect("shell command should parse");
 
         let Command::Shell(shell) = cli.command else {

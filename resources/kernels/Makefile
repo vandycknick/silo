@@ -14,7 +14,7 @@ endif
 
 RESOURCE_ROOT ?= $(abspath $(CURDIR)/..)
 REPO_ROOT ?= $(abspath $(RESOURCE_ROOT)/..)
-CACHE_ROOT ?= $(HOME)/.cache/bento/kernels
+CACHE_ROOT ?= $(HOME)/.cache/silo/kernels
 TARGET_ROOT ?= $(REPO_ROOT)/target
 KERNEL_TARGET_ROOT := $(TARGET_ROOT)/kernels
 KERNEL_CHANNEL := v$(shell printf '%s' "$(KERNEL_VERSION)" | cut -d '.' -f 1).x

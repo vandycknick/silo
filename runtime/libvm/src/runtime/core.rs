@@ -841,7 +841,7 @@ impl Runtime {
             ModelMachineNetworkConfig::Private { policy, .. } => {
                 if let Some(policy) = policy {
                     if let Some(diagnostic) = policy.validate().into_iter().find(|diagnostic| {
-                        diagnostic.severity == bento_policy::DiagnosticSeverity::Error
+                        diagnostic.severity == silo_policy::DiagnosticSeverity::Error
                     }) {
                         return Err(LibVmError::NetworkRuntime {
                             reference: "private".to_string(),
@@ -1543,8 +1543,8 @@ mod tests {
         ImageSource, LibVmError, MachineExitOutcome, MachineKillOptions, MachineRef, MachineStatus,
         MachineUpdate, Memory, RuntimeNetworkingConfig,
     };
-    use bento_policy::NetworkPolicy;
     use ocidisk::{Platform, RootfsImage, RootfsImageMetadata, RootfsImageSource};
+    use silo_policy::NetworkPolicy;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::process::CommandExt;
     use std::sync::Arc;
@@ -1901,7 +1901,7 @@ mod tests {
             let mut child = std::process::Command::new(
                 std::env::current_exe().expect("current test binary path"),
             )
-            .env("BENTO_LIBVM_SIGINT_IGNORING_CHILD", "1")
+            .env("SILO_LIBVM_SIGINT_IGNORING_CHILD", "1")
             .arg("sigint_ignoring_child_process")
             .arg("--nocapture")
             .stdout(std::process::Stdio::piped())
@@ -1942,7 +1942,7 @@ mod tests {
             line.clear();
             let bytes = reader.read_line(&mut line).expect("read child stdout");
             assert!(bytes > 0, "child exited before reporting readiness");
-            if line.trim() == "BENTO_READY" {
+            if line.trim() == "SILO_READY" {
                 return;
             }
         }
@@ -1950,7 +1950,7 @@ mod tests {
 
     #[test]
     fn sigint_ignoring_child_process() {
-        if std::env::var_os("BENTO_LIBVM_SIGINT_IGNORING_CHILD").is_none() {
+        if std::env::var_os("SILO_LIBVM_SIGINT_IGNORING_CHILD").is_none() {
             return;
         }
 
@@ -1963,7 +1963,7 @@ mod tests {
             nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGINT, &action)
                 .expect("ignore SIGINT");
         }
-        println!("BENTO_READY");
+        println!("SILO_READY");
         std::io::stdout().flush().expect("flush readiness");
         std::thread::sleep(Duration::from_secs(30));
     }
@@ -2003,7 +2003,7 @@ mod tests {
     #[tokio::test]
     async fn validate_named_network_config_uses_store_boundary() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         store
@@ -2030,7 +2030,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_machine_config_reports_missing_name_from_store_boundary() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let mut store = MockDataStore::new();
         expect_empty_refresh(&mut store);
         store
@@ -2054,7 +2054,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_machine_config_handles_id_prefix_store_results() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let id = MachineId::new();
         let config = sample_machine_config(&paths, id, "devbox");
         let prefix = id.to_string()[..8].to_string();
@@ -2079,7 +2079,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_machine_config_rejects_ambiguous_id_prefix_from_store_boundary() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let first_id = MachineId::new();
         let second_id = MachineId::new();
         let first = sample_machine_config(&paths, first_id, "first");
@@ -2107,7 +2107,7 @@ mod tests {
     #[tokio::test]
     async fn replace_config_rolls_back_vm_spec_when_store_save_fails() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let paths = LocalPaths::new(temp.path().join("bento"));
+        let paths = LocalPaths::new(temp.path().join("silo"));
         let id = MachineId::new();
         let config = sample_machine_config(&paths, id, "devbox");
         std::fs::create_dir_all(&config.machine_dir).expect("create machine dir");
@@ -2158,7 +2158,7 @@ mod tests {
     async fn inspect_returns_local_status_for_stopped_machine() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2185,7 +2185,7 @@ mod tests {
     async fn inspect_and_list_use_name_and_id_lookup() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2222,7 +2222,7 @@ mod tests {
     async fn inspect_and_list_use_stale_state_when_machine_lock_is_busy() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2275,7 +2275,7 @@ mod tests {
     async fn stop_releases_machine_lock_while_waiting_for_monitor_shutdown() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2341,7 +2341,7 @@ mod tests {
     async fn wait_reports_matching_exit_status_when_monitor_already_exited() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2396,7 +2396,7 @@ mod tests {
     async fn kill_with_returns_forced_machine_exit() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2455,7 +2455,7 @@ mod tests {
     async fn stop_starting_without_live_monitor_marks_machine_stopped() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2496,7 +2496,7 @@ mod tests {
     async fn stop_stopping_without_live_monitor_marks_machine_stopped() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2537,7 +2537,7 @@ mod tests {
     async fn stop_rejects_malformed_pidfile_without_clearing_state() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2594,7 +2594,7 @@ mod tests {
     async fn cleanup_reconciles_stopped_runtime_and_cleans_resources() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2636,7 +2636,7 @@ mod tests {
     async fn cleanup_keeps_starting_machine_active_without_live_runtime() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2677,7 +2677,7 @@ mod tests {
     async fn cleanup_finishes_stopping_machine_without_live_runtime() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2719,7 +2719,7 @@ mod tests {
     async fn cleanup_ignores_live_runtime() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2767,7 +2767,7 @@ mod tests {
     async fn list_reconciles_stopping_without_live_runtime_to_stopped() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2807,7 +2807,7 @@ mod tests {
     async fn matching_exit_status_marks_runtime_error() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2855,7 +2855,7 @@ mod tests {
     async fn stale_exit_status_does_not_apply_to_new_runtime_generation() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2901,7 +2901,7 @@ mod tests {
     async fn stale_starting_without_live_runtime_becomes_error() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -2948,7 +2948,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_open_refreshes_stale_active_state() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let data_dir = temp.path().join("bento");
+        let data_dir = temp.path().join("silo");
         let runtime = Runtime::open(
             LocalPaths::new(data_dir.clone()),
             RuntimeNetworkingConfig::default(),
@@ -3001,7 +3001,7 @@ mod tests {
     async fn inspect_uses_sqlite_config_when_config_file_is_missing() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -3030,7 +3030,7 @@ mod tests {
     async fn replace_config_updates_stopped_machine_config() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -3064,7 +3064,7 @@ mod tests {
     async fn update_renames_stopped_machine() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -3109,7 +3109,7 @@ mod tests {
     async fn update_rejects_duplicate_machine_name() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -3147,7 +3147,7 @@ mod tests {
     async fn update_changes_hardware_and_desired_root_disk_size() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -3186,7 +3186,7 @@ mod tests {
     async fn update_sets_and_clears_private_network_policy() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -3218,7 +3218,7 @@ mod tests {
     async fn update_rejects_policy_update_when_network_is_disabled() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -3250,7 +3250,7 @@ mod tests {
     async fn update_root_disk_shrink_error_uses_human_sizes() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -3289,7 +3289,7 @@ mod tests {
     async fn remove_deletes_machine_from_state_and_disk() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -3321,7 +3321,7 @@ mod tests {
     async fn remove_refuses_running_machine_when_pid_file_exists() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await
@@ -3361,7 +3361,7 @@ mod tests {
     async fn removed_machine_lock_id_is_reused() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("bento")),
+            LocalPaths::new(temp.path().join("silo")),
             RuntimeNetworkingConfig::default(),
         )
         .await

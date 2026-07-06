@@ -274,31 +274,31 @@ mod tests {
             "--name",
             "ubuntu",
             "--data-dir",
-            "/tmp/bento/machines/03147ec30bd748f4ad8574539c2e75ea",
+            "/tmp/silo/machines/03147ec30bd748f4ad8574539c2e75ea",
             "--pidfile",
-            "/tmp/bento/machines/03147ec30bd748f4ad8574539c2e75ea/vm.pid",
+            "/tmp/silo/machines/03147ec30bd748f4ad8574539c2e75ea/vm.pid",
             "--exit-status",
-            "/tmp/bento/machines/03147ec30bd748f4ad8574539c2e75ea/vm.exit.json",
+            "/tmp/silo/machines/03147ec30bd748f4ad8574539c2e75ea/vm.exit.json",
             "--config",
-            "/tmp/bento/machines/03147ec30bd748f4ad8574539c2e75ea/config.json",
+            "/tmp/silo/machines/03147ec30bd748f4ad8574539c2e75ea/config.json",
             "--socket",
-            "/tmp/bento/machines/03147ec30bd748f4ad8574539c2e75ea/vm.sock",
+            "/tmp/silo/machines/03147ec30bd748f4ad8574539c2e75ea/vm.sock",
             "--serial-log",
-            "/tmp/bento/machines/03147ec30bd748f4ad8574539c2e75ea/serial.log",
+            "/tmp/silo/machines/03147ec30bd748f4ad8574539c2e75ea/serial.log",
             "--trace-log",
-            "/tmp/bento/machines/03147ec30bd748f4ad8574539c2e75ea/vm.trace.log",
+            "/tmp/silo/machines/03147ec30bd748f4ad8574539c2e75ea/vm.trace.log",
             "--network",
             "none",
             "--run-id",
             "run-1",
             "--exit-command",
-            "bento",
+            "silo",
             "--exit-command-arg",
             "cleanup",
             "--exit-command-arg",
             "--data-dir",
             "--exit-command-arg",
-            "/tmp/bento",
+            "/tmp/silo",
             "--exit-command-arg",
             "--machine-id",
             "--exit-command-arg",
@@ -307,13 +307,13 @@ mod tests {
         ])
         .expect("vmmon args");
 
-        assert_eq!(args.exit_command, Some(PathBuf::from("bento")));
+        assert_eq!(args.exit_command, Some(PathBuf::from("silo")));
         assert_eq!(
             args.exit_command_args,
             vec![
                 "cleanup",
                 "--data-dir",
-                "/tmp/bento",
+                "/tmp/silo",
                 "--machine-id",
                 "03147ec30bd748f4ad8574539c2e75ea"
             ]

@@ -1,21 +1,21 @@
-# bentobox Node SDK
+# silo Node SDK
 
-Native Node.js bindings for BentoBox's `libvm` runtime.
+Native Node.js bindings for Silo's `libvm` runtime.
 
 The SDK is a thin TypeScript facade over a napi-rs addon. VM creation,
 image materialization, datastore updates, lifecycle, and guest sessions all
 delegate to `libvm`; the TypeScript layer only provides idiomatic method names,
 types, and error mapping.
 
-`bentobox` does not bundle the Bento CLI or `vmmon`. `vmmon` must be available
+`silo` does not bundle the Silo CLI or `vmmon`. `vmmon` must be available
 on `PATH`, or supplied through `Runtime.open({ vmmonPath })`.
 
 ```ts
-import { ImageSource, NetworkPolicy, Runtime } from "bentobox";
+import { ImageSource, NetworkPolicy, Runtime } from "silo";
 
 const runtime = await Runtime.open({
-  defaultKernel: "/usr/local/share/bento/assets/kernel-default",
-  defaultInitramfs: "/usr/local/share/bento/assets/initramfs",
+  defaultKernel: "/usr/local/share/silo/assets/kernel-default",
+  defaultInitramfs: "/usr/local/share/silo/assets/initramfs",
 });
 
 const machine = await runtime

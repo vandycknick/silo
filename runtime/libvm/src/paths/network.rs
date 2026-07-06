@@ -49,27 +49,27 @@ mod tests {
 
     #[test]
     fn network_paths_use_expected_filenames() {
-        let paths = NetworkPaths::new("/tmp/bento/net/net123");
+        let paths = NetworkPaths::new("/tmp/silo/net/net123");
 
         assert_eq!(
             paths.socket_path(),
-            PathBuf::from("/tmp/bento/net/net123/netd.sock")
+            PathBuf::from("/tmp/silo/net/net123/netd.sock")
         );
         assert_eq!(
             paths.log_path(),
-            PathBuf::from("/tmp/bento/net/net123/netd.log")
+            PathBuf::from("/tmp/silo/net/net123/netd.log")
         );
         assert_eq!(
             paths.pid_path(),
-            PathBuf::from("/tmp/bento/net/net123/netd.pid")
+            PathBuf::from("/tmp/silo/net/net123/netd.pid")
         );
         assert_eq!(
             paths.pcap_path(),
-            PathBuf::from("/tmp/bento/net/net123/capture.pcap")
+            PathBuf::from("/tmp/silo/net/net123/capture.pcap")
         );
         assert_eq!(
             paths.policy_path(),
-            PathBuf::from("/tmp/bento/net/net123/network-policy.json")
+            PathBuf::from("/tmp/silo/net/net123/network-policy.json")
         );
     }
 }

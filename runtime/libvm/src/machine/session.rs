@@ -29,7 +29,7 @@ pub struct ExecOptions {
     pub args: Vec<String>,
     /// Guest working directory for the command.
     pub cwd: Option<String>,
-    /// Guest user for the command. Defaults to the host user provisioned by Bento.
+    /// Guest user for the command. Defaults to the host user provisioned by Silo.
     pub user: Option<String>,
     /// Environment variables set for the command.
     pub env: Vec<(String, String)>,
@@ -127,7 +127,7 @@ pub struct AttachOptions {
     pub args: Vec<String>,
     /// Guest working directory for the attached process.
     pub cwd: Option<String>,
-    /// Guest user for the attached process. Defaults to the provisioned Bento user.
+    /// Guest user for the attached process. Defaults to the provisioned Silo user.
     pub user: Option<String>,
     /// Environment variables set for the attached process.
     pub env: Vec<(String, String)>,

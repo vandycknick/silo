@@ -5,10 +5,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LibVmError {
-    #[error("could not resolve Bento data directory from XDG_DATA_HOME or HOME")]
+    #[error("could not resolve Silo data directory from XDG_DATA_HOME or HOME")]
     DataDirUnavailable,
 
-    #[error("could not resolve Bento config directory from XDG_CONFIG_HOME or HOME")]
+    #[error("could not resolve Silo config directory from XDG_CONFIG_HOME or HOME")]
     ConfigDirUnavailable,
 
     #[error("environment variable {name} must be an absolute path, got {path}")]

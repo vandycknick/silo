@@ -16,7 +16,7 @@ pub(crate) fn apply(context: &ProvisionContext, config: &NetworkConfig) -> eyre:
 
     for interface in &config.interfaces {
         let path = network_dir.join(format!(
-            "10-bento-{}.network",
+            "10-silo-{}.network",
             sanitize_unit_name(&interface.name)
         ));
         desired_paths.insert(path.clone());
@@ -27,10 +27,10 @@ pub(crate) fn apply(context: &ProvisionContext, config: &NetworkConfig) -> eyre:
         }
     }
 
-    for stale_path in stale_bento_network_files(&network_dir, &desired_paths)? {
+    for stale_path in stale_silo_network_files(&network_dir, &desired_paths)? {
         fs::remove_file(&stale_path)
             .with_context(|| format!("remove stale networkd config {}", stale_path.display()))?;
-        tracing::info!(path = %stale_path.display(), "removed stale Bento networkd config");
+        tracing::info!(path = %stale_path.display(), "removed stale Silo networkd config");
         changed = true;
     }
 
@@ -61,7 +61,7 @@ fn file_contents(path: &std::path::Path) -> eyre::Result<Option<String>> {
     }
 }
 
-fn stale_bento_network_files(
+fn stale_silo_network_files(
     network_dir: &std::path::Path,
     desired_paths: &BTreeSet<PathBuf>,
 ) -> eyre::Result<Vec<PathBuf>> {
@@ -81,7 +81,7 @@ fn stale_bento_network_files(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if name.starts_with("10-bento-") && name.ends_with(".network") {
+        if name.starts_with("10-silo-") && name.ends_with(".network") {
             stale.push(path);
         }
     }
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn renders_networkd_mac_match() {
         let rendered = super::render_network_file(&NetworkInterfaceConfig {
-            name: "bento".to_string(),
+            name: "silo".to_string(),
             matches: NetworkMatchConfig {
                 driver: None,
                 mac_address: Some("02:00:00:00:00:01".to_string()),
@@ -141,13 +141,13 @@ mod tests {
     }
 
     #[test]
-    fn finds_stale_bento_network_files() {
+    fn finds_stale_silo_network_files() {
         let temp =
-            std::env::temp_dir().join(format!("bento-agent-networkd-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("silo-agent-networkd-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp);
         fs::create_dir_all(&temp).expect("create temp dir");
-        let desired = temp.join("10-bento-current.network");
-        let stale = temp.join("10-bento-old.network");
+        let desired = temp.join("10-silo-current.network");
+        let stale = temp.join("10-silo-old.network");
         let unrelated = temp.join("20-other.network");
         fs::write(&desired, "current").expect("write desired");
         fs::write(&stale, "old").expect("write stale");
@@ -156,7 +156,7 @@ mod tests {
         let mut desired_paths = BTreeSet::new();
         desired_paths.insert(desired);
         let stale_paths =
-            super::stale_bento_network_files(&temp, &desired_paths).expect("find stale files");
+            super::stale_silo_network_files(&temp, &desired_paths).expect("find stale files");
 
         assert_eq!(stale_paths, [stale]);
         fs::remove_dir_all(&temp).expect("clean temp dir");

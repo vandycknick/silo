@@ -27,7 +27,7 @@ impl Cmd {
             match context.config()?.default_machine() {
                 Some(name) => println!("default machine is {name}"),
                 None => println!(
-                    "no default machine configured\n\nhint: run `bento default <vm>` to choose one"
+                    "no default machine configured\n\nhint: run `silo default <vm>` to choose one"
                 ),
             }
             return Ok(());

@@ -428,7 +428,7 @@ mod tests {
     fn writes_extra_files_with_parent_directories() {
         let temp = tempfile::tempdir().expect("tempdir");
         let init = temp.path().join("init");
-        let agent = temp.path().join("bento-agent");
+        let agent = temp.path().join("silo-agent");
         let helper = temp.path().join("helper.conf");
         let output = temp.path().join("initramfs");
         fs::write(&init, b"init").expect("write init");
@@ -436,7 +436,7 @@ mod tests {
         fs::write(&helper, b"helper").expect("write helper");
 
         let options = InitramfsOptions::new(&init, &output)
-            .with_extra_file(InitramfsFile::new("agent/bento-agent", &agent, 0o755))
+            .with_extra_file(InitramfsFile::new("agent/silo-agent", &agent, 0o755))
             .with_extra_file(InitramfsFile::new("etc/helper.conf", &helper, 0o644));
         write_initramfs(&options).expect("write initramfs");
 
@@ -446,13 +446,13 @@ mod tests {
             .map(|entry| entry.name.as_str())
             .collect::<Vec<_>>();
         assert!(names.contains(&"agent"));
-        assert!(names.contains(&"agent/bento-agent"));
+        assert!(names.contains(&"agent/silo-agent"));
         assert!(names.contains(&"etc"));
         assert!(names.contains(&"etc/helper.conf"));
 
         let agent_entry = entries
             .iter()
-            .find(|entry| entry.name == "agent/bento-agent")
+            .find(|entry| entry.name == "agent/silo-agent")
             .expect("agent entry");
         assert_eq!(agent_entry.mode & 0o170000, 0o100000);
         assert_eq!(agent_entry.mode & 0o777, 0o755);
@@ -471,13 +471,13 @@ mod tests {
     fn rejects_absolute_extra_archive_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
         let init = temp.path().join("init");
-        let agent = temp.path().join("bento-agent");
+        let agent = temp.path().join("silo-agent");
         let output = temp.path().join("initramfs");
         fs::write(&init, b"init").expect("write init");
         fs::write(&agent, b"agent").expect("write agent");
 
         let options = InitramfsOptions::new(&init, &output).with_extra_file(InitramfsFile::new(
-            "/agent/bento-agent",
+            "/agent/silo-agent",
             &agent,
             0o755,
         ));

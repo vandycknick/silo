@@ -382,7 +382,7 @@ impl VirtualMachineBuilder {
         let machine_config = self.config.build()?;
 
         unsafe {
-            let queue = serial_queue("codes.nvd.bentobox.vz.machine");
+            let queue = serial_queue("sh.silo.vz.machine");
             let machine = VZVirtualMachine::initWithConfiguration_queue(
                 VZVirtualMachine::alloc(),
                 &machine_config,
@@ -405,7 +405,7 @@ struct VmDelegateIvars {
 
 define_class!(
     #[unsafe(super(NSObject))]
-    #[name = "BentoVzVirtualMachineStateObserver"]
+    #[name = "SiloVzVirtualMachineStateObserver"]
     #[ivars = Ivars]
     struct VirtualMachineStateObserver;
 
@@ -431,7 +431,7 @@ define_class!(
 
 define_class!(
     #[unsafe(super(NSObject))]
-    #[name = "BentoVzVirtualMachineDelegateBridge"]
+    #[name = "SiloVzVirtualMachineDelegateBridge"]
     #[ivars = VmDelegateIvars]
     struct VmDelegateBridge;
 

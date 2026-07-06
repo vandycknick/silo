@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bento_policy::NetworkPolicy;
+use silo_policy::NetworkPolicy;
 
 use crate::paths::LocalPaths;
 use crate::store::models::MachineConfig;

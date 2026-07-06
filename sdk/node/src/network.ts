@@ -20,7 +20,7 @@ function applyBuilder<T>(builder: T, configure: BuilderCallback<T>): T {
   return configure(builder) ?? builder;
 }
 
-/** Canonical network policy JSON produced by Bento's Rust policy builder. */
+/** Canonical network policy JSON produced by Silo's Rust policy builder. */
 export class NetworkPolicy {
   private constructor(private readonly policyJson: string) {}
 

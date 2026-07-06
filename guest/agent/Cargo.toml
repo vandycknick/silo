@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "bento-agent"
+name = "silo-agent"
 path = "src/main.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
