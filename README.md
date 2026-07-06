@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/brand/silo-readme-banner.png" alt="Silo" width="800">
+  <img src="docs/brand/silo-lockup-transparent.png" alt="Silo" width="800">
 </p>
 
 # Silo
