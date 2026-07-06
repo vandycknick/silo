@@ -1,5 +1,5 @@
 use crate::machine::Memory;
-use crate::network::MachineNetworkConfig;
+use crate::network::{MachineNetworkBuilder, MachineNetworkConfig};
 
 use bento_policy::NetworkPolicy;
 
@@ -41,6 +41,7 @@ pub struct MachineUpdate {
     pub rosetta: Option<bool>,
     /// New durable network config.
     pub network: Option<MachineNetworkConfig>,
+    pub(crate) network_error: Option<String>,
     /// Policy-only update for the current durable network config.
     pub network_policy: Option<NetworkPolicyUpdate>,
 }
@@ -87,9 +88,15 @@ impl MachineUpdate {
         self
     }
 
-    /// Sets the durable machine network config.
-    pub fn network(mut self, network: MachineNetworkConfig) -> Self {
-        self.network = Some(network);
+    /// Configures the durable machine network attachment.
+    pub fn network(
+        mut self,
+        configure: impl FnOnce(MachineNetworkBuilder) -> MachineNetworkBuilder,
+    ) -> Self {
+        match configure(MachineNetworkBuilder::new()).build() {
+            Ok(network) => self.network = Some(network),
+            Err(reason) => self.network_error = Some(reason),
+        }
         self
     }
 
@@ -114,6 +121,7 @@ impl MachineUpdate {
             && self.nested_virtualization.is_none()
             && self.rosetta.is_none()
             && self.network.is_none()
+            && self.network_error.is_none()
             && self.network_policy.is_none()
     }
 }

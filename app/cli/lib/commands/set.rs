@@ -1,7 +1,8 @@
 use clap::Args;
-use libvm::{MachineNetworkConfig, MachineUpdate, Memory};
+use libvm::{MachineUpdate, Memory};
 use utils::HumanSize;
 
+use crate::commands::profile::parse_machine_network_config;
 use crate::config::GlobalConfig;
 use crate::context::Context;
 use crate::ui;
@@ -123,7 +124,10 @@ impl ParsedSet {
                 "cpus" => update = update.cpus(parse_cpus(value)?),
                 "memory" => update = update.memory(parse_memory(value)?),
                 "disk" => update = update.root_disk_size(parse_disk(value)?),
-                "network" => update = update.network(parse_machine_network_config(value)?),
+                "network" => {
+                    let network = parse_machine_network_config(value).map_err(eyre::Report::msg)?;
+                    update = update.network(|builder| network.apply(builder));
+                }
                 "nested-virtualization" => {
                     update = update.nested_virtualization(parse_bool(value)?);
                 }
@@ -180,21 +184,6 @@ fn parse_disk(value: &str) -> eyre::Result<u64> {
         eyre::bail!("disk must be greater than 0");
     }
     Ok(bytes)
-}
-
-fn parse_machine_network_config(input: &str) -> eyre::Result<MachineNetworkConfig> {
-    match input {
-        "private" => Ok(MachineNetworkConfig::private()),
-        "none" => Ok(MachineNetworkConfig::none()),
-        other if other.starts_with("name:") => {
-            named_machine_network(other.trim_start_matches("name:"))
-        }
-        other => named_machine_network(other),
-    }
-}
-
-fn named_machine_network(name: &str) -> eyre::Result<MachineNetworkConfig> {
-    MachineNetworkConfig::try_named(name).map_err(eyre::Report::msg)
 }
 
 fn parse_bool(value: &str) -> eyre::Result<bool> {

@@ -1,7 +1,7 @@
 use std::path::{Component, Path};
 
-use bento_policy::NetworkPolicy;
 use eyre::Context as _;
+use libvm::NetworkPolicy;
 
 pub(crate) fn resolve_network_policy_source(
     source: &str,
@@ -88,7 +88,7 @@ mod tests {
         let policy = resolve_network_policy_source(path.to_str().expect("utf8"), None)
             .expect("resolve policy");
 
-        assert_eq!(policy.metadata["source"], "test");
+        assert_eq!(policy.metadata()["source"], "test");
     }
 
     #[test]
@@ -100,7 +100,7 @@ mod tests {
 
         let policy = resolve_network_policy_source("github", Some(dir.path())).expect("resolve");
 
-        assert_eq!(policy.metadata["source"], "test");
+        assert_eq!(policy.metadata()["source"], "test");
     }
 
     #[test]

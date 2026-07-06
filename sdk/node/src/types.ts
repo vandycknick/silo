@@ -59,9 +59,9 @@ export interface Mount {
   readOnly?: boolean;
 }
 
-/** Machine network attachment. */
+/** Inspectable machine network attachment data. Configure networking with `MachineBuilder.network(...)`. */
 export type Network =
-  /** Private NAT-backed network, optionally constrained by canonical NetworkPolicy JSON. */
+  /** Private NAT-backed network, optionally constrained by canonical `NetworkPolicy` JSON. */
   | { kind: "private"; policyJson?: string }
   /** No network attachment. */
   | { kind: "none" }

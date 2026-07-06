@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use eyre::Context as _;
-use libvm::{ImageProgressSender, MachineBuilder, MachineNetworkConfig, Memory};
+use libvm::{ImageProgressSender, MachineBuilder, Memory};
 use utils::HumanSize;
 use vm_spec::Mount;
 
@@ -13,7 +13,10 @@ use crate::commands::start_options::machine_start_options;
 use crate::config::GlobalConfig;
 use crate::constants::{DEFAULT_PROFILE_NAME, PROFILE_METADATA_KEY};
 use crate::context::Context;
-use crate::profile::{resolve_host_path, MountMode, ProfileMount, ProfileStore};
+use crate::profile::{
+    resolve_host_path, MachineNetworkSelection, MountMode, ProfileMount, ProfileStore,
+    ResolvedMachineNetwork,
+};
 use crate::ui::{success, watch_image_progress, Spinner};
 
 const EXAMPLES: &[&str] = &[
@@ -86,7 +89,7 @@ pub(crate) struct VmOverrideArgs {
     pub mounts: Vec<ProfileMount>,
     /// Override the profile network target. Allowed: private, none, NAME, or name:NAME.
     #[arg(long, value_parser = parse_machine_network_config)]
-    pub network: Option<MachineNetworkConfig>,
+    pub network: Option<MachineNetworkSelection>,
     /// Add or override a label. Format: KEY=VALUE.
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
     pub labels: Vec<(String, String)>,
@@ -166,7 +169,7 @@ impl Cmd {
         let mut labels = BTreeMap::new();
         let mut metadata = BTreeMap::new();
         let mut mounts = Vec::new();
-        let mut network = MachineNetworkConfig::default();
+        let mut network = ResolvedMachineNetwork::default();
         let mut userdata = None;
         let mut cpus = None;
         let mut memory_mib = None;
@@ -206,7 +209,7 @@ impl Cmd {
         }
         let image_ref = resolved_image_ref;
         if let Some(network_override) = self.overrides.network.clone() {
-            network = network_override;
+            network = network_override.into();
         }
         if let Some(userdata_path) = self.overrides.userdata.as_deref() {
             userdata = Some(read_userdata_path(userdata_path)?);
@@ -260,7 +263,7 @@ pub(crate) fn apply_resolved_machine_options(
         .rosetta(rosetta)
         .disks(disks)
         .mounts(mounts)
-        .network(network);
+        .network(|builder| network.apply(builder));
 
     if let Some(cpus) = cpus {
         builder = builder.cpus(cpus);
@@ -293,7 +296,7 @@ pub(crate) struct ResolvedMachineOptions {
     pub(crate) labels: BTreeMap<String, String>,
     pub(crate) metadata: BTreeMap<String, String>,
     pub(crate) mounts: Vec<Mount>,
-    pub(crate) network: MachineNetworkConfig,
+    pub(crate) network: ResolvedMachineNetwork,
     pub(crate) userdata: Option<String>,
     pub(crate) cpus: Option<u8>,
     pub(crate) memory_mib: Option<u32>,

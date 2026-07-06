@@ -4,13 +4,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use bento_policy::{
-    NetworkCredential, NetworkPolicy, NetworkSecretAlternative, NetworkSecretKind,
-    NetworkSecretRequirement, NetworkSecretSlot,
-};
 use chrono::{SecondsFormat, Utc};
 use clap::{Args, Subcommand};
-use libvm::{NetworkLaunch, OAuthRefreshHook};
+use libvm::{
+    NetworkCredential, NetworkLaunch, NetworkPolicy, NetworkSecretAlternative, NetworkSecretKind,
+    NetworkSecretRequirement, NetworkSecretSlot, OAuthRefreshHook,
+};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -737,7 +736,7 @@ fn oauth_refresh_grant(
     store: &SecretStore,
 ) -> eyre::Result<OAuthRefreshGrant> {
     let mut credentials = Vec::new();
-    for credential in &policy.credentials {
+    for credential in policy.credentials() {
         if !credential_uses_oauth_secret_slots(policy, credential) {
             continue;
         }
@@ -866,7 +865,7 @@ fn credential_for_slot<'a>(
 ) -> Option<&'a NetworkCredential> {
     let (name, _) = slot_name.split_once('.')?;
     policy
-        .credentials
+        .credentials()
         .iter()
         .find(|credential| credential.name == name)
 }
@@ -2567,11 +2566,11 @@ mod tests {
         }
     }
 
-    fn network_policy(source: &str) -> bento_policy::NetworkPolicy {
-        bento_policy::NetworkPolicy::from_json_str(source).expect("network policy")
+    fn network_policy(source: &str) -> libvm::NetworkPolicy {
+        libvm::NetworkPolicy::from_json_str(source).expect("network policy")
     }
 
-    fn aws_network_policy() -> bento_policy::NetworkPolicy {
+    fn aws_network_policy() -> libvm::NetworkPolicy {
         network_policy(
             r#"{
                 "version": 1,

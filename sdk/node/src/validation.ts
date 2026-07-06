@@ -59,6 +59,16 @@ export function assertPositiveI32(value: unknown, name: string): number {
   return assertPositiveInteger(value, name, MAX_I32);
 }
 
+export function assertI32(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new TypeError(`${name} must be a safe integer`);
+  }
+  if (value < -MAX_I32 - 1 || value > MAX_I32) {
+    throw new RangeError(`${name} must be between ${-MAX_I32 - 1} and ${MAX_I32}`);
+  }
+  return value;
+}
+
 export function assertPositiveU32(value: unknown, name: string): number {
   return assertPositiveInteger(value, name, MAX_U32);
 }

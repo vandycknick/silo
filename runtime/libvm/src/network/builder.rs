@@ -5,10 +5,10 @@ use crate::LibVmError;
 /// Builder for creating a named network definition.
 ///
 /// Network definitions are durable named-network config. Creating one does not
-/// attach any machine; machines opt into it with `MachineNetworkConfig::named`.
+/// attach any machine; machines opt into it through `MachineBuilder::network`.
 ///
 /// ```rust,no_run
-/// use libvm::{MachineNetworkConfig, NetworkDriver, Runtime};
+/// use libvm::{NetworkDriver, Runtime};
 ///
 /// # async fn example(runtime: Runtime) -> Result<(), libvm::LibVmError> {
 /// runtime
@@ -18,7 +18,12 @@ use crate::LibVmError;
 ///     .create()
 ///     .await?;
 ///
-/// let _machine_network = MachineNetworkConfig::named("devnet");
+/// let _machine = runtime
+///     .machine()
+///     .image("ubuntu")
+///     .network(|network| network.named("devnet"))
+///     .create()
+///     .await?;
 /// # Ok(())
 /// # }
 /// ```

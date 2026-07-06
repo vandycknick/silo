@@ -577,47 +577,21 @@ mod tests {
 
     #[test]
     fn network_launch_rejects_policy_secret_env_name_collisions() {
-        use bento_policy::{NetworkCredential, NetworkEndpoint};
-
-        let policy = NetworkPolicy {
-            version: 1,
-            metadata: Default::default(),
-            settings: Default::default(),
-            endpoints: vec![NetworkEndpoint {
-                name: "api".to_string(),
-                kind: "https".to_string(),
-                source_cidrs: Vec::new(),
-                destination_cidrs: Vec::new(),
-                protocol: Default::default(),
-                ports: Vec::new(),
-                hosts: vec!["api.example.com".to_string()],
-            }],
-            credentials: vec![
-                NetworkCredential {
-                    name: "api-key".to_string(),
-                    kind: "bearer_token".to_string(),
-                    endpoint: "api".to_string(),
-                    username: None,
-                    header: None,
-                    prefix: None,
-                    idempotency_key: false,
-                    condition: None,
-                },
-                NetworkCredential {
-                    name: "api_key".to_string(),
-                    kind: "bearer_token".to_string(),
-                    endpoint: "api".to_string(),
-                    username: None,
-                    header: None,
-                    prefix: None,
-                    idempotency_key: false,
-                    condition: None,
-                },
-            ],
-            rules: Vec::new(),
-            tailscale: Vec::new(),
-            forwards: Vec::new(),
-        };
+        let policy: NetworkPolicy = serde_json::from_str(
+            r#"
+            {
+              "version": 1,
+              "endpoints": [
+                { "name": "api", "kind": "https", "hosts": ["api.example.com"] }
+              ],
+              "credentials": [
+                { "name": "api-key", "kind": "bearer_token", "endpoint": "api" },
+                { "name": "api_key", "kind": "bearer_token", "endpoint": "api" }
+              ]
+            }
+            "#,
+        )
+        .expect("deserialize invalid policy fixture");
         let launch = NetworkLaunch::new()
             .secret("api-key.token", "left")
             .secret("api_key.token", "right");

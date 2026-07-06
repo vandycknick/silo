@@ -11,7 +11,7 @@ types, and error mapping.
 on `PATH`, or supplied through `Runtime.open({ vmmonPath })`.
 
 ```ts
-import { ImageSource, Runtime } from "bentobox";
+import { ImageSource, NetworkPolicy, Runtime } from "bentobox";
 
 const runtime = await Runtime.open({
   defaultKernel: "/usr/local/share/bento/assets/kernel-default",
@@ -26,6 +26,21 @@ const machine = await runtime
   .memory(1024)
   .create();
 
+const policy = NetworkPolicy.define((policy) => {
+  policy.defaultDeny();
+
+  const openai = policy.endpoint("openai").https().host("api.openai.com");
+  const codex = policy.credential("codex").openaiCodexOauth().endpoint(openai);
+
+  policy.rule("allow-openai").endpoint(openai).credential(codex).allow();
+});
+
+const policyMachine = await runtime
+  .machine()
+  .image("ubuntu:24.04")
+  .network((network) => network.private().policy(policy))
+  .create();
+
 await machine.start();
 const output = await machine.shell("uname -a");
 console.log(output.stdout());
@@ -36,4 +51,5 @@ const diskMachine = await runtime
   .create();
 
 await diskMachine.remove();
+await policyMachine.remove();
 ```

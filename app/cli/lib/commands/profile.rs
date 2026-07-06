@@ -2,14 +2,13 @@ use std::collections::BTreeMap;
 use std::process::Command;
 
 use clap::{Args, Subcommand};
-use libvm::MachineNetworkConfig;
 use utils::HumanSize;
 
 use crate::context::Context;
 use crate::network_policy::policy_source_display;
 use crate::profile::{
-    parse_profile, validate_profile, MountMode, NamedProfile, Profile, ProfileMount,
-    ProfileNetwork, ProfileResources, ProfileStore,
+    parse_profile, validate_profile, MachineNetworkSelection, MountMode, NamedProfile, Profile,
+    ProfileMount, ProfileNetwork, ProfileResources, ProfileStore,
 };
 use crate::ui::{self, OutputFormat, Table};
 
@@ -101,7 +100,7 @@ pub struct CreateCmd {
     pub disk_size: Option<HumanSize>,
     /// Network target for VMs created from this profile. Allowed: private, none, NAME, or name:NAME.
     #[arg(long, value_parser = parse_machine_network_config, default_value = "private")]
-    pub network: MachineNetworkConfig,
+    pub(crate) network: MachineNetworkSelection,
     /// Add a mount. Format: SRC:DST[:ro|rw].
     #[arg(long = "mount", value_name = "SRC:DST[:MODE]", value_parser = parse_profile_mount)]
     pub(crate) mounts: Vec<ProfileMount>,
@@ -249,7 +248,7 @@ fn create_profile(store: &ProfileStore, command: CreateCmd) -> eyre::Result<()> 
         disk_size: command.disk_size.map(|disk_size| disk_size.to_string()),
         userdata: None,
         mounts: command.mounts,
-        network: Some(machine_network_to_profile(command.network)),
+        network: Some(command.network.into_profile_network()),
         labels,
     };
     validate_profile(&profile)?;
@@ -389,28 +388,8 @@ pub(crate) fn parse_profile_mount(input: &str) -> Result<ProfileMount, String> {
     })
 }
 
-pub(crate) fn parse_machine_network_config(input: &str) -> Result<MachineNetworkConfig, String> {
-    match input {
-        "private" => Ok(MachineNetworkConfig::Private { policy: None }),
-        "none" => Ok(MachineNetworkConfig::None),
-        other if other.starts_with("name:") => {
-            named_machine_network(other.trim_start_matches("name:"))
-        }
-        other => named_machine_network(other),
-    }
-}
-
-fn named_machine_network(name: &str) -> Result<MachineNetworkConfig, String> {
-    MachineNetworkConfig::try_named(name)
-}
-
-fn machine_network_to_profile(network: MachineNetworkConfig) -> ProfileNetwork {
-    match network {
-        MachineNetworkConfig::Private { .. } => ProfileNetwork::Private { policy_ref: None },
-        MachineNetworkConfig::None => ProfileNetwork::None,
-        MachineNetworkConfig::Named { name } => ProfileNetwork::Named { name },
-        other => ProfileNetwork::Named { name: other.name() },
-    }
+pub(crate) fn parse_machine_network_config(input: &str) -> Result<MachineNetworkSelection, String> {
+    MachineNetworkSelection::parse(input)
 }
 
 pub(crate) fn parse_label(input: &str) -> Result<(String, String), String> {
@@ -426,12 +405,11 @@ pub(crate) fn parse_label(input: &str) -> Result<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use libvm::MachineNetworkConfig;
 
     use crate::app::Cli;
     use crate::commands::profile::{parse_label, parse_profile_mount};
     use crate::commands::Command;
-    use crate::profile::MountMode;
+    use crate::profile::{MachineNetworkSelection, MountMode};
 
     #[test]
     fn profile_list_alias_parses() {
@@ -472,7 +450,7 @@ mod tests {
 
         assert_eq!(
             create.network,
-            MachineNetworkConfig::Named {
+            MachineNetworkSelection::Named {
                 name: "devnet".to_string()
             }
         );

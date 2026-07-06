@@ -8,6 +8,7 @@ export const napi = (nativeModule.default ?? nativeModule) as NativeBindings;
 
 export interface NativeBindings {
   openRuntime(options?: NativeRuntimeOpenOptions): Promise<NativeRuntime>;
+  buildNetworkPolicy(input: NativeNetworkPolicyInput): string;
 }
 
 export interface NativeRuntimeOpenOptions {
@@ -106,6 +107,76 @@ export interface NativeNetworkInput {
   kind: "private" | "none" | "named";
   name?: string;
   policyJson?: string;
+}
+
+export interface NativeNetworkPolicyInput {
+  defaultAction?: "allow" | "deny";
+  metadata?: NativeKeyValue[];
+  audit?: NativeNetworkAuditInput;
+  endpoints?: NativeNetworkEndpointInput[];
+  credentials?: NativeNetworkCredentialInput[];
+  rules?: NativeNetworkRuleInput[];
+  tailscale?: NativeTailscaleTunnelInput[];
+  forwards?: NativeNetworkForwardInput[];
+}
+
+export interface NativeNetworkAuditInput {
+  bodyBufferBytes?: number;
+  bodyStorageBytes?: number;
+}
+
+export interface NativeNetworkPortRangeInput {
+  start: number;
+  end?: number;
+}
+
+export interface NativeNetworkEndpointInput {
+  name: string;
+  kind?: "ip" | "http" | "https";
+  sourceCidrs?: string[];
+  destinationCidrs?: string[];
+  protocol?: "any" | "tcp" | "udp";
+  ports?: NativeNetworkPortRangeInput[];
+  hosts?: string[];
+}
+
+export interface NativeNetworkCredentialInput {
+  name: string;
+  kind?: "basic_auth" | "bearer_token" | "header_token" | "github_oauth" | "openai_codex_oauth" | "aws_credential";
+  endpoint?: string;
+  username?: string;
+  header?: string;
+  prefix?: string;
+  idempotencyKey?: boolean;
+  condition?: string;
+}
+
+export interface NativeNetworkRuleInput {
+  name?: string;
+  endpoints?: string[];
+  credential?: string;
+  condition?: string;
+  tunnel?: string;
+  priority?: number;
+  disabled?: boolean;
+  reason?: string;
+  verdict?: "allow" | "deny";
+}
+
+export interface NativeTailscaleTunnelInput {
+  name: string;
+  tags?: string[];
+  hostname?: string;
+  controlUrl?: string;
+}
+
+export interface NativeNetworkForwardInput {
+  name: string;
+  kind?: "host" | "tailscale";
+  target?: string;
+  targetPort?: number;
+  listen?: string;
+  tunnel?: string;
 }
 
 export interface NativeExecOptionsInput {

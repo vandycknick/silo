@@ -7,8 +7,10 @@ use libvm::{
     AttachOptionsBuilder, ExecControl, ExecEvent, ExecHandle, ExecOptionsBuilder, ExecOutput,
     ExecSink, ExitStatus, ImageDetail, ImageHandle, ImageLayerDetail, ImagePruneReport,
     ImagePullOptions, ImagePullPolicy, ImageRemoveOptions, ImageSource, Images, LibVmError,
-    Machine, MachineBuilder, MachineData, MachineNetworkConfig, MachineRef, MachineStatus, Memory,
-    NetworkPolicy, Runtime, RuntimeConfig,
+    Machine, MachineBuilder, MachineData, MachineNetworkBuilder, MachineNetworkConfig, MachineRef,
+    MachineStatus, Memory, NetworkAuditBuilder, NetworkCredentialBuilder, NetworkEndpointBuilder,
+    NetworkForwardBuilder, NetworkPolicy, NetworkRuleBuilder, Runtime, RuntimeConfig,
+    TailscaleTunnelBuilder,
 };
 use napi::bindgen_prelude::Uint8Array;
 use napi::{Error, Result, Status};
@@ -50,6 +52,84 @@ pub struct NativeNetworkInput {
     pub kind: String,
     pub name: Option<String>,
     pub policy_json: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeNetworkPolicyInput {
+    pub default_action: Option<String>,
+    pub metadata: Option<Vec<NativeKeyValue>>,
+    pub audit: Option<NativeNetworkAuditInput>,
+    pub endpoints: Option<Vec<NativeNetworkEndpointInput>>,
+    pub credentials: Option<Vec<NativeNetworkCredentialInput>>,
+    pub rules: Option<Vec<NativeNetworkRuleInput>>,
+    pub tailscale: Option<Vec<NativeTailscaleTunnelInput>>,
+    pub forwards: Option<Vec<NativeNetworkForwardInput>>,
+}
+
+#[napi(object)]
+pub struct NativeNetworkAuditInput {
+    pub body_buffer_bytes: Option<i64>,
+    pub body_storage_bytes: Option<i64>,
+}
+
+#[napi(object)]
+pub struct NativeNetworkPortRangeInput {
+    pub start: u32,
+    pub end: Option<u32>,
+}
+
+#[napi(object)]
+pub struct NativeNetworkEndpointInput {
+    pub name: String,
+    pub kind: Option<String>,
+    pub source_cidrs: Option<Vec<String>>,
+    pub destination_cidrs: Option<Vec<String>>,
+    pub protocol: Option<String>,
+    pub ports: Option<Vec<NativeNetworkPortRangeInput>>,
+    pub hosts: Option<Vec<String>>,
+}
+
+#[napi(object)]
+pub struct NativeNetworkCredentialInput {
+    pub name: String,
+    pub kind: Option<String>,
+    pub endpoint: Option<String>,
+    pub username: Option<String>,
+    pub header: Option<String>,
+    pub prefix: Option<String>,
+    pub idempotency_key: Option<bool>,
+    pub condition: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeNetworkRuleInput {
+    pub name: Option<String>,
+    pub endpoints: Option<Vec<String>>,
+    pub credential: Option<String>,
+    pub condition: Option<String>,
+    pub tunnel: Option<String>,
+    pub priority: Option<i32>,
+    pub disabled: Option<bool>,
+    pub reason: Option<String>,
+    pub verdict: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeTailscaleTunnelInput {
+    pub name: String,
+    pub tags: Option<Vec<String>>,
+    pub hostname: Option<String>,
+    pub control_url: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeNetworkForwardInput {
+    pub name: String,
+    pub kind: Option<String>,
+    pub target: Option<String>,
+    pub target_port: Option<u32>,
+    pub listen: Option<String>,
+    pub tunnel: Option<String>,
 }
 
 #[napi(object)]
@@ -230,6 +310,13 @@ pub async fn open_runtime(options: Option<RuntimeOpenOptions>) -> Result<NativeR
         .map_err(to_napi_error)
 }
 
+#[napi(js_name = "buildNetworkPolicy")]
+pub fn build_network_policy(input: NativeNetworkPolicyInput) -> Result<String> {
+    let policy = network_policy_from_input(input)?;
+    serde_json::to_string(&policy.normalized())
+        .map_err(|err| invalid_arg(format!("serialize network policy: {err}")))
+}
+
 #[napi]
 impl NativeRuntime {
     #[napi]
@@ -374,8 +461,8 @@ impl NativeMachineBuilder {
 
     #[napi]
     pub fn network(&self, network: NativeNetworkInput) -> Result<()> {
-        let network = network_from_input(network)?;
-        self.update(|builder| builder.network(network))
+        let network = ParsedNativeNetworkInput::parse(network)?;
+        self.update(|builder| builder.network(|network_builder| network.apply(network_builder)))
     }
 
     #[napi]
@@ -878,21 +965,360 @@ fn image_source_from_input(input: NativeImageSourceInput) -> Result<ImageSource>
     }
 }
 
-fn network_from_input(input: NativeNetworkInput) -> Result<MachineNetworkConfig> {
-    match input.kind.as_str() {
-        "private" => match input.policy_json {
-            Some(policy_json) => NetworkPolicy::from_json_str(&policy_json)
-                .map(MachineNetworkConfig::private_with_policy)
-                .map_err(|err| invalid_arg(format!("invalid network.policyJson: {err}"))),
-            None => Ok(MachineNetworkConfig::private()),
-        },
-        "none" => Ok(MachineNetworkConfig::none()),
-        "named" => input
-            .name
-            .map(MachineNetworkConfig::named)
-            .ok_or_else(|| invalid_arg("named network requires name")),
-        kind => Err(invalid_arg(format!("unsupported network kind {kind:?}"))),
+struct ParsedNativeNetworkInput {
+    selection: NativeNetworkSelection,
+    policy: Option<NetworkPolicy>,
+}
+
+enum NativeNetworkSelection {
+    Private,
+    None,
+    Named(String),
+}
+
+impl ParsedNativeNetworkInput {
+    fn parse(input: NativeNetworkInput) -> Result<Self> {
+        let selection = match input.kind.as_str() {
+            "private" => NativeNetworkSelection::Private,
+            "none" => NativeNetworkSelection::None,
+            "named" => NativeNetworkSelection::Named(
+                input
+                    .name
+                    .ok_or_else(|| invalid_arg("named network requires name"))?,
+            ),
+            kind => return Err(invalid_arg(format!("unsupported network kind {kind:?}"))),
+        };
+        let policy = input
+            .policy_json
+            .map(|policy_json| {
+                NetworkPolicy::from_json_str(&policy_json)
+                    .map_err(|err| invalid_arg(format!("invalid network.policyJson: {err}")))
+            })
+            .transpose()?;
+        Ok(Self { selection, policy })
     }
+
+    fn apply(self, builder: MachineNetworkBuilder) -> MachineNetworkBuilder {
+        let builder = match self.selection {
+            NativeNetworkSelection::Private => builder.private(),
+            NativeNetworkSelection::None => builder.none(),
+            NativeNetworkSelection::Named(name) => builder.named(name),
+        };
+        if let Some(policy) = self.policy {
+            builder.policy(policy)
+        } else {
+            builder
+        }
+    }
+}
+
+fn network_policy_from_input(input: NativeNetworkPolicyInput) -> Result<NetworkPolicy> {
+    let mut builder = NetworkPolicy::builder();
+    if let Some(default_action) = input.default_action {
+        builder = match default_action.as_str() {
+            "allow" => builder.default_allow(),
+            "deny" => builder.default_deny(),
+            other => return Err(invalid_arg(format!("unsupported default action {other:?}"))),
+        };
+    }
+    for pair in input.metadata.unwrap_or_default() {
+        builder = builder.metadata(pair.key, pair.value);
+    }
+    if let Some(audit) = input.audit {
+        validate_audit_input(&audit)?;
+        builder = builder.audit(|audit_builder| apply_audit_input(audit_builder, audit));
+    }
+    for endpoint in input.endpoints.unwrap_or_default() {
+        validate_endpoint_input(&endpoint)?;
+        let name = endpoint.name.clone();
+        builder = builder.endpoint(name, |endpoint_builder| {
+            apply_endpoint_input(endpoint_builder, endpoint)
+        });
+    }
+    for credential in input.credentials.unwrap_or_default() {
+        validate_credential_input(&credential)?;
+        let name = credential.name.clone();
+        builder = builder.credential(name, |credential_builder| {
+            apply_credential_input(credential_builder, credential)
+        });
+    }
+    for rule in input.rules.unwrap_or_default() {
+        validate_rule_input(&rule)?;
+        builder = if let Some(name) = rule.name.clone() {
+            builder.rule(name, |rule_builder| apply_rule_input(rule_builder, rule))
+        } else {
+            builder.unnamed_rule(|rule_builder| apply_rule_input(rule_builder, rule))
+        };
+    }
+    for tunnel in input.tailscale.unwrap_or_default() {
+        let name = tunnel.name.clone();
+        builder = builder.tailscale(name, |tunnel_builder| {
+            apply_tailscale_input(tunnel_builder, tunnel)
+        });
+    }
+    for forward in input.forwards.unwrap_or_default() {
+        validate_forward_input(&forward)?;
+        let name = forward.name.clone();
+        builder = builder.forward(name, |forward_builder| {
+            apply_forward_input(forward_builder, forward)
+        });
+    }
+    builder
+        .build()
+        .map_err(|err| invalid_arg(format!("invalid network policy: {err}")))
+}
+
+fn validate_audit_input(input: &NativeNetworkAuditInput) -> Result<()> {
+    if input.body_buffer_bytes.is_some_and(|bytes| bytes < 0) {
+        return Err(invalid_arg("audit.bodyBufferBytes must be non-negative"));
+    }
+    if input.body_storage_bytes.is_some_and(|bytes| bytes < 0) {
+        return Err(invalid_arg("audit.bodyStorageBytes must be non-negative"));
+    }
+    Ok(())
+}
+
+fn validate_endpoint_input(input: &NativeNetworkEndpointInput) -> Result<()> {
+    if let Some(kind) = input.kind.as_deref() {
+        match kind {
+            "ip" | "http" | "https" => {}
+            _ => return Err(invalid_arg(format!("unsupported endpoint kind {kind:?}"))),
+        }
+    }
+    if let Some(protocol) = input.protocol.as_deref() {
+        match protocol {
+            "any" | "tcp" | "udp" => {}
+            _ => {
+                return Err(invalid_arg(format!(
+                    "unsupported endpoint protocol {protocol:?}"
+                )))
+            }
+        }
+    }
+    for port in input.ports.as_deref().unwrap_or_default() {
+        validate_u16_port(port.start, "endpoint port start")?;
+        if let Some(end) = port.end {
+            validate_u16_port(end, "endpoint port end")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_credential_input(input: &NativeNetworkCredentialInput) -> Result<()> {
+    if let Some(kind) = input.kind.as_deref() {
+        match kind {
+            "basic_auth" | "bearer_token" | "header_token" | "github_oauth"
+            | "openai_codex_oauth" | "aws_credential" => {}
+            _ => return Err(invalid_arg(format!("unsupported credential kind {kind:?}"))),
+        }
+    }
+    Ok(())
+}
+
+fn validate_rule_input(input: &NativeNetworkRuleInput) -> Result<()> {
+    if let Some(verdict) = input.verdict.as_deref() {
+        match verdict {
+            "allow" | "deny" => {}
+            _ => return Err(invalid_arg(format!("unsupported rule verdict {verdict:?}"))),
+        }
+    }
+    Ok(())
+}
+
+fn validate_forward_input(input: &NativeNetworkForwardInput) -> Result<()> {
+    if let Some(kind) = input.kind.as_deref() {
+        match kind {
+            "host" | "tailscale" => {}
+            _ => return Err(invalid_arg(format!("unsupported forward kind {kind:?}"))),
+        }
+    }
+    if let Some(port) = input.target_port {
+        validate_u16_port(port, "forward targetPort")?;
+    }
+    Ok(())
+}
+
+fn validate_u16_port(value: u32, field: &str) -> Result<()> {
+    match u16::try_from(value) {
+        Ok(0) => Err(invalid_arg(format!("{field} must be greater than 0"))),
+        Ok(_) => Ok(()),
+        Err(_) => Err(invalid_arg(format!("{field} must be at most {}", u16::MAX))),
+    }
+}
+
+fn apply_audit_input(
+    mut builder: NetworkAuditBuilder,
+    input: NativeNetworkAuditInput,
+) -> NetworkAuditBuilder {
+    if let Some(bytes) = input.body_buffer_bytes {
+        if let Ok(bytes) = u64::try_from(bytes) {
+            builder = builder.body_buffer_bytes(bytes);
+        }
+    }
+    if let Some(bytes) = input.body_storage_bytes {
+        if let Ok(bytes) = u64::try_from(bytes) {
+            builder = builder.body_storage_bytes(bytes);
+        }
+    }
+    builder
+}
+
+fn apply_endpoint_input(
+    mut builder: NetworkEndpointBuilder,
+    input: NativeNetworkEndpointInput,
+) -> NetworkEndpointBuilder {
+    if let Some(kind) = input.kind {
+        builder = match kind.as_str() {
+            "ip" => builder.ip(),
+            "http" => builder.http(),
+            "https" => builder.https(),
+            _ => builder,
+        };
+    }
+    for cidr in input.source_cidrs.unwrap_or_default() {
+        builder = builder.source_cidr(cidr);
+    }
+    for cidr in input.destination_cidrs.unwrap_or_default() {
+        builder = builder.destination_cidr(cidr);
+    }
+    if let Some(protocol) = input.protocol {
+        builder = match protocol.as_str() {
+            "any" => builder.any_protocol(),
+            "tcp" => builder.tcp(),
+            "udp" => builder.udp(),
+            _ => builder,
+        };
+    }
+    for port in input.ports.unwrap_or_default() {
+        if let Ok(start) = u16::try_from(port.start) {
+            if let Some(end) = port.end {
+                if let Ok(end) = u16::try_from(end) {
+                    builder = builder.port_range(start, end);
+                }
+            } else {
+                builder = builder.port(start);
+            }
+        }
+    }
+    for host in input.hosts.unwrap_or_default() {
+        builder = builder.host(host);
+    }
+    builder
+}
+
+fn apply_credential_input(
+    mut builder: NetworkCredentialBuilder,
+    input: NativeNetworkCredentialInput,
+) -> NetworkCredentialBuilder {
+    if let Some(kind) = input.kind {
+        builder = match kind.as_str() {
+            "basic_auth" => builder.basic_auth(),
+            "bearer_token" => builder.bearer_token(),
+            "header_token" => builder.header_token(),
+            "github_oauth" => builder.github_oauth(),
+            "openai_codex_oauth" => builder.openai_codex_oauth(),
+            "aws_credential" => builder.aws_credential(),
+            _ => builder,
+        };
+    }
+    if let Some(endpoint) = input.endpoint {
+        builder = builder.endpoint(endpoint);
+    }
+    if let Some(username) = input.username {
+        builder = builder.username(username);
+    }
+    if let Some(header) = input.header {
+        builder = builder.header(header);
+    }
+    if let Some(prefix) = input.prefix {
+        builder = builder.prefix(prefix);
+    }
+    if let Some(enabled) = input.idempotency_key {
+        builder = builder.idempotency_key_enabled(enabled);
+    }
+    if let Some(condition) = input.condition {
+        builder = builder.condition(condition);
+    }
+    builder
+}
+
+fn apply_rule_input(
+    mut builder: NetworkRuleBuilder,
+    input: NativeNetworkRuleInput,
+) -> NetworkRuleBuilder {
+    for endpoint in input.endpoints.unwrap_or_default() {
+        builder = builder.endpoint(endpoint);
+    }
+    if let Some(credential) = input.credential {
+        builder = builder.credential(credential);
+    }
+    if let Some(condition) = input.condition {
+        builder = builder.condition(condition);
+    }
+    if let Some(tunnel) = input.tunnel {
+        builder = builder.tunnel(tunnel);
+    }
+    if let Some(priority) = input.priority {
+        builder = builder.priority(priority);
+    }
+    if let Some(disabled) = input.disabled {
+        builder = builder.disabled(disabled);
+    }
+    if let Some(reason) = input.reason {
+        builder = builder.reason(reason);
+    }
+    if let Some(verdict) = input.verdict {
+        builder = match verdict.as_str() {
+            "allow" => builder.allow(),
+            "deny" => builder.deny(),
+            _ => builder,
+        };
+    }
+    builder
+}
+
+fn apply_tailscale_input(
+    mut builder: TailscaleTunnelBuilder,
+    input: NativeTailscaleTunnelInput,
+) -> TailscaleTunnelBuilder {
+    if let Some(tags) = input.tags {
+        builder = builder.tags(tags);
+    }
+    if let Some(hostname) = input.hostname {
+        builder = builder.hostname(hostname);
+    }
+    if let Some(control_url) = input.control_url {
+        builder = builder.control_url(control_url);
+    }
+    builder
+}
+
+fn apply_forward_input(
+    mut builder: NetworkForwardBuilder,
+    input: NativeNetworkForwardInput,
+) -> NetworkForwardBuilder {
+    if let Some(kind) = input.kind {
+        builder = match kind.as_str() {
+            "host" => builder.host(),
+            "tailscale" => match input.tunnel.as_deref() {
+                Some(tunnel) => builder.tailscale(tunnel.to_string()),
+                None => builder,
+            },
+            _ => builder,
+        };
+    } else if let Some(tunnel) = input.tunnel.as_deref() {
+        builder = builder.tailscale(tunnel.to_string());
+    }
+    if let Some(target) = input.target {
+        builder = builder.target(target);
+    }
+    if let Some(port) = input.target_port.and_then(|port| u16::try_from(port).ok()) {
+        builder = builder.target_port(port);
+    }
+    if let Some(listen) = input.listen {
+        builder = builder.listen(listen);
+    }
+    builder
 }
 
 fn key_values_to_map(values: Vec<NativeKeyValue>) -> BTreeMap<String, String> {
@@ -1165,8 +1591,12 @@ fn invalid_state(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use libvm::{MachineNetworkConfig, NetworkPolicy};
+    use serde_json::json;
 
-    use crate::{network_from_input, network_to_native, NativeNetworkInput};
+    use crate::{
+        network_policy_from_input, network_to_native, NativeKeyValue, NativeNetworkInput,
+        NativeNetworkPolicyInput, ParsedNativeNetworkInput,
+    };
 
     fn sample_policy_json() -> String {
         r#"{ "version": 1, "metadata": { "source": "test" } }"#.to_string()
@@ -1174,20 +1604,44 @@ mod tests {
 
     #[test]
     fn network_input_preserves_private_policy_json() {
-        let network = network_from_input(NativeNetworkInput {
+        let network = ParsedNativeNetworkInput::parse(NativeNetworkInput {
             kind: "private".to_string(),
             name: None,
             policy_json: Some(sample_policy_json()),
         })
         .expect("private network with policy json");
 
-        assert_eq!(network.policy().expect("policy").metadata["source"], "test");
+        assert_eq!(network.policy.expect("policy").metadata()["source"], "test");
+    }
+
+    #[test]
+    fn network_policy_input_builds_canonical_policy() {
+        let policy = network_policy_from_input(NativeNetworkPolicyInput {
+            default_action: Some("deny".to_string()),
+            metadata: Some(vec![NativeKeyValue {
+                key: "source".to_string(),
+                value: "builder".to_string(),
+            }]),
+            audit: None,
+            endpoints: None,
+            credentials: None,
+            rules: None,
+            tailscale: None,
+            forwards: None,
+        })
+        .expect("network policy");
+
+        assert_eq!(policy.metadata()["source"], "builder");
     }
 
     #[test]
     fn network_output_preserves_private_policy_json() {
         let policy = NetworkPolicy::from_json_str(&sample_policy_json()).expect("policy");
-        let network = MachineNetworkConfig::private_with_policy(policy);
+        let network: MachineNetworkConfig = serde_json::from_value(json!({
+            "kind": "private",
+            "policy": policy,
+        }))
+        .expect("machine network config");
 
         let native = network_to_native(network);
 
@@ -1195,6 +1649,6 @@ mod tests {
         assert_eq!(native.name, None);
         let policy_json = native.policy_json.expect("policy json");
         let parsed = NetworkPolicy::from_json_str(&policy_json).expect("parse output policy json");
-        assert_eq!(parsed.metadata["source"], "test");
+        assert_eq!(parsed.metadata()["source"], "test");
     }
 }

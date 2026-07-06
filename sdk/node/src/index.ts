@@ -2,6 +2,33 @@ export { BentoError } from "./errors.js";
 export { ExecHandle, ExecOutput, ExecSink, type ExecEvent } from "./exec.js";
 export { Images } from "./images.js";
 export { Machine, MachineBuilder } from "./machine.js";
+export {
+  MachineNetworkBuilder,
+  NetworkCredentialDefinitionBuilder,
+  NetworkAuditBuilder,
+  NetworkCredentialBuilder,
+  NetworkEndpointBuilder,
+  NetworkForwardDefinitionBuilder,
+  NetworkForwardBuilder,
+  NetworkPolicyDefinition,
+  NetworkPolicy,
+  NetworkPolicyBuilder,
+  NetworkRuleDefinitionBuilder,
+  NetworkRuleBuilder,
+  TailscaleTunnelBuilder,
+  type HttpsEndpointBuilder,
+  type HttpsEndpointRef,
+  type HttpEndpointBuilder,
+  type HttpEndpointRef,
+  type IpEndpointBuilder,
+  type IpProtocolEndpointBuilder,
+  type MachineNetworkBuilderCallback,
+  type NetworkEndpointRef,
+  type NetworkEndpointSelector,
+  type NetworkPolicyDefinitionCallback,
+  type NetworkCredentialRef,
+  type TailscaleTunnelRef,
+} from "./network.js";
 export { Runtime } from "./runtime.js";
 export {
   ImageSource,

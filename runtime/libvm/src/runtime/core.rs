@@ -3230,7 +3230,7 @@ mod tests {
             .await
             .expect("commit machine");
         machine_handle(&runtime, machine.id)
-            .set_network(crate::MachineNetworkConfig::none())
+            .set_network(|network| network.none())
             .await
             .expect("disable network");
 

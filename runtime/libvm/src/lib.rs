@@ -49,11 +49,16 @@ pub use crate::machine::{
     NetworkPolicyUpdate, OAuthRefreshHook, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
-    MachineNetworkConfig, NetworkBuilder, NetworkDefinition, NetworkDriver, NetworkDriverKind,
-    NetworkTopology,
+    MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition, NetworkDriver,
+    NetworkDriverKind, NetworkTopology,
 };
 pub use crate::runtime::{
     NetdRuntimeConfig, PathChoice, Runtime, RuntimeBuilder, RuntimeConfig, RuntimeNetworkingConfig,
 };
 pub use crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT;
-pub use bento_policy::NetworkPolicy;
+pub use bento_policy::{
+    NetworkAuditBuilder, NetworkCredential, NetworkCredentialBuilder, NetworkEndpointBuilder,
+    NetworkForwardBuilder, NetworkPolicy, NetworkPolicyBuildError, NetworkPolicyBuilder,
+    NetworkRuleBuilder, NetworkSecretAlternative, NetworkSecretKind, NetworkSecretRequirement,
+    NetworkSecretSlot, PolicyLoadError, TailscaleTunnelBuilder,
+};

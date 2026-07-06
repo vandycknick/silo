@@ -6,10 +6,10 @@ import {
     machineDataFromNative,
     mapToKeyValues,
     mountsToNative,
-    networkToNative,
 } from "./convert.js";
 import { mapNativePromise } from "./errors.js";
 import { ExecHandle, ExecOutput } from "./exec.js";
+import { MachineNetworkBuilder, type MachineNetworkBuilderCallback } from "./network.js";
 import type {
     AttachOptions,
     ExecOptions,
@@ -18,7 +18,6 @@ import type {
     KeyValueMap,
     MachineData,
     Mount,
-    Network,
 } from "./types.js";
 import {
     assertBoolean,
@@ -152,8 +151,10 @@ export class MachineBuilder {
     }
 
     /** Configure the machine network attachment. */
-    network(network: Network): this {
-        this.native.network(networkToNative(network));
+    network(configure: MachineNetworkBuilderCallback): this {
+        const builder = new MachineNetworkBuilder();
+        const configured = configure(builder) ?? builder;
+        this.native.network(configured.toNative());
         return this;
     }
 

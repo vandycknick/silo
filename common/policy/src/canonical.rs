@@ -9,31 +9,39 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-const POLICY_VERSION: u32 = 1;
+pub(crate) const POLICY_VERSION: u32 = 1;
 const DEFAULT_BODY_BUFFER_BYTES: u64 = 1_048_576;
 const DEFAULT_BODY_STORAGE_BYTES: u64 = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkPolicy {
-    pub version: u32,
+    pub(crate) version: u32,
     #[serde(default)]
-    pub metadata: Map<String, Value>,
+    pub(crate) metadata: Map<String, Value>,
     #[serde(default)]
-    pub settings: NetworkPolicySettings,
+    pub(crate) settings: NetworkPolicySettings,
     #[serde(default)]
-    pub endpoints: Vec<NetworkEndpoint>,
+    pub(crate) endpoints: Vec<NetworkEndpoint>,
     #[serde(default)]
-    pub credentials: Vec<NetworkCredential>,
+    pub(crate) credentials: Vec<NetworkCredential>,
     #[serde(default)]
-    pub rules: Vec<NetworkRule>,
+    pub(crate) rules: Vec<NetworkRule>,
     #[serde(default)]
-    pub tailscale: Vec<TailscaleTunnel>,
+    pub(crate) tailscale: Vec<TailscaleTunnel>,
     #[serde(default)]
-    pub forwards: Vec<NetworkForward>,
+    pub(crate) forwards: Vec<NetworkForward>,
 }
 
 impl NetworkPolicy {
+    pub fn builder() -> crate::NetworkPolicyBuilder {
+        crate::NetworkPolicyBuilder::new()
+    }
+
+    pub fn into_builder(self) -> crate::NetworkPolicyBuilder {
+        crate::NetworkPolicyBuilder::from_policy(self)
+    }
+
     pub fn from_json_file(path: impl AsRef<Path>) -> Result<Self, PolicyLoadError> {
         let path = path.as_ref();
         let source = std::fs::read_to_string(path).map_err(|err| PolicyLoadError {
@@ -84,6 +92,38 @@ impl NetworkPolicy {
 
     pub fn from_hcl_str(source: &str) -> Result<Self, PolicyLoadError> {
         Self::from_hcl_source("<hcl>", source)
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn metadata(&self) -> &Map<String, Value> {
+        &self.metadata
+    }
+
+    pub fn settings(&self) -> &NetworkPolicySettings {
+        &self.settings
+    }
+
+    pub fn endpoints(&self) -> &[NetworkEndpoint] {
+        &self.endpoints
+    }
+
+    pub fn credentials(&self) -> &[NetworkCredential] {
+        &self.credentials
+    }
+
+    pub fn rules(&self) -> &[NetworkRule] {
+        &self.rules
+    }
+
+    pub fn tailscale(&self) -> &[TailscaleTunnel] {
+        &self.tailscale
+    }
+
+    pub fn forwards(&self) -> &[NetworkForward] {
+        &self.forwards
     }
 
     pub fn normalize(&mut self) {
@@ -209,6 +249,19 @@ impl NetworkPolicy {
             });
         }
         Ok(network_policy)
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            version: POLICY_VERSION,
+            metadata: Map::new(),
+            settings: NetworkPolicySettings::default(),
+            endpoints: Vec::new(),
+            credentials: Vec::new(),
+            rules: Vec::new(),
+            tailscale: Vec::new(),
+            forwards: Vec::new(),
+        }
     }
 }
 
@@ -703,7 +756,7 @@ impl PolicyValidator {
             );
         }
         for port in &endpoint.ports {
-            if port.start > port.end {
+            if port.start == 0 || port.end == 0 || port.start > port.end {
                 self.error(
                     "invalid port range",
                     format!(

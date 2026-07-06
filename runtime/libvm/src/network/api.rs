@@ -9,20 +9,10 @@ const RESERVED_NETWORK_NAMES: &[&str] = &["private", "none"];
 
 /// Durable network configuration for a machine.
 ///
-/// This is public caller input and inspect output: it says what network a
-/// machine should connect to when it starts. It is not a running attachment and
-/// it is not the vmmon launch argument. libvm maps this value to private
-/// `store::models::MachineNetworkConfig` before writing the machine store.
-///
-/// ```rust
-/// use libvm::MachineNetworkConfig;
-///
-/// let private = MachineNetworkConfig::private();
-/// let named = MachineNetworkConfig::named("devnet");
-///
-/// assert_eq!(private.name(), "private");
-/// assert_eq!(named.name(), "devnet");
-/// ```
+/// This is inspect and serialization data: it says what network a machine is
+/// configured to connect to when it starts. Configure machine networking through
+/// `MachineNetworkBuilder` via `MachineBuilder::network`, `MachineUpdate::network`,
+/// or `Machine::set_network`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
@@ -49,33 +39,16 @@ impl Default for MachineNetworkConfig {
 }
 
 impl MachineNetworkConfig {
-    /// Creates the default private network config.
-    pub fn private() -> Self {
+    pub(crate) fn private() -> Self {
         Self::Private { policy: None }
     }
 
-    /// Creates a private network config with a network policy.
-    pub fn private_with_policy(policy: NetworkPolicy) -> Self {
-        Self::Private {
-            policy: Some(policy),
-        }
-    }
-
-    /// Creates a no-network config.
-    pub fn none() -> Self {
+    pub(crate) fn none() -> Self {
         Self::None
     }
 
-    /// Creates a named-network config.
-    pub fn named(name: impl Into<String>) -> Self {
+    pub(crate) fn named(name: impl Into<String>) -> Self {
         Self::Named { name: name.into() }
-    }
-
-    /// Creates a named-network config after validating the network name.
-    pub fn try_named(name: impl Into<String>) -> Result<Self, String> {
-        let name = name.into();
-        validate_network_name(&name)?;
-        Ok(Self::Named { name })
     }
 
     /// Returns the display name for the machine network config.
@@ -93,6 +66,78 @@ impl MachineNetworkConfig {
             Self::Private { policy, .. } => policy.as_ref(),
             Self::None | Self::Named { .. } => None,
         }
+    }
+}
+
+/// Fluent builder for a machine's durable network attachment.
+#[derive(Debug, Clone)]
+pub struct MachineNetworkBuilder {
+    config: MachineNetworkConfig,
+    error: Option<String>,
+}
+
+impl MachineNetworkBuilder {
+    pub fn new() -> Self {
+        Self {
+            config: MachineNetworkConfig::default(),
+            error: None,
+        }
+    }
+
+    pub fn private(mut self) -> Self {
+        self.config = MachineNetworkConfig::private();
+        self
+    }
+
+    pub fn none(mut self) -> Self {
+        self.config = MachineNetworkConfig::none();
+        self
+    }
+
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        let name = name.into();
+        if let Err(reason) = validate_network_name(&name) {
+            self.record_error(reason);
+        }
+        self.config = MachineNetworkConfig::named(name);
+        self
+    }
+
+    pub fn policy(mut self, policy: NetworkPolicy) -> Self {
+        let error = match &self.config {
+            MachineNetworkConfig::Private { .. } => None,
+            MachineNetworkConfig::None => {
+                Some("network policies require a private network attachment".to_string())
+            }
+            MachineNetworkConfig::Named { name } => Some(format!(
+                "network policies require a private network attachment, but named network {name:?} was selected"
+            )),
+        };
+        if let Some(error) = error {
+            self.record_error(error);
+        } else if let MachineNetworkConfig::Private { policy: existing } = &mut self.config {
+            *existing = Some(policy.normalized());
+        }
+        self
+    }
+
+    pub(crate) fn build(self) -> Result<MachineNetworkConfig, String> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        Ok(self.config)
+    }
+
+    fn record_error(&mut self, reason: impl Into<String>) {
+        if self.error.is_none() {
+            self.error = Some(reason.into());
+        }
+    }
+}
+
+impl Default for MachineNetworkBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

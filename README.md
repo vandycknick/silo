@@ -52,18 +52,19 @@ bento rm dev
 Use `libvm` when you want to create and manage machines directly from Rust.
 
 ```rust
-use libvm::{MachineNetworkConfig, Memory, Runtime, LibVmError};
+use libvm::{LibVmError, Memory, Runtime};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), LibVmError> {
     let runtime = Runtime::from_env().await?;
 
     let machine = runtime
-        .machine("ghcr.io/vandycknick/archlinux:latest")
+        .machine()
+        .image("ghcr.io/vandycknick/archlinux:latest")
         .name("devbox")
         .cpus(6)
         .memory(Memory::gb(16))
-        .network(MachineNetworkConfig::private())
+        .network(|network| network.private())
         .create()
         .await?;
 

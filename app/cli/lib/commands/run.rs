@@ -1,7 +1,5 @@
 use clap::Args;
-use libvm::{
-    ImageProgressSender, MachineNetworkConfig, MachineRef, Runtime, DEFAULT_GUEST_READINESS_TIMEOUT,
-};
+use libvm::{ImageProgressSender, MachineRef, Runtime, DEFAULT_GUEST_READINESS_TIMEOUT};
 use std::collections::BTreeMap;
 use vm_spec::Mount;
 
@@ -14,7 +12,7 @@ use crate::commands::start_options::machine_start_options;
 use crate::constants::{DEFAULT_PROFILE_NAME, PROFILE_METADATA_KEY};
 use crate::context::Context;
 use crate::guest;
-use crate::profile::ProfileStore;
+use crate::profile::{ProfileStore, ResolvedMachineNetwork};
 use crate::ui::{watch_image_progress, Spinner};
 
 const EXAMPLES: &[&str] = &[
@@ -121,7 +119,7 @@ impl Cmd {
         let mut labels = BTreeMap::new();
         let mut metadata = BTreeMap::new();
         let mut mounts = Vec::<Mount>::new();
-        let mut network = MachineNetworkConfig::default();
+        let mut network = ResolvedMachineNetwork::default();
         let mut userdata = None;
         let mut cpus = None;
         let mut memory_mib = None;
@@ -158,7 +156,7 @@ impl Cmd {
             mounts.push(profile_mount_to_mount(mount)?);
         }
         if let Some(network_override) = self.overrides.network.clone() {
-            network = network_override;
+            network = network_override.into();
         }
         if let Some(userdata_path) = self.overrides.userdata.as_deref() {
             userdata = Some(read_userdata_path(userdata_path)?);

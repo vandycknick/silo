@@ -8,7 +8,7 @@ use crate::image::{ImageBuilder, ImageSource, MaterializedImage};
 use crate::lock_manager::ManagedLock;
 use crate::machine::root_disk::{clone_or_copy_root_disk, resize_raw_disk};
 use crate::machine::{generate_machine_name, validate_machine_name, Machine, Memory};
-use crate::network::MachineNetworkConfig;
+use crate::network::{MachineNetworkBuilder, MachineNetworkConfig};
 use crate::paths::{root_disk_relative_path, MachinePaths};
 use crate::runtime::core::{stopped_machine_state, write_machine_config};
 use crate::runtime::Runtime;
@@ -41,6 +41,7 @@ struct MachineCreateRequest {
     disks: Vec<PathBuf>,
     mounts: Vec<Mount>,
     network: Option<MachineNetworkConfig>,
+    network_error: Option<String>,
 }
 
 struct MachineCreatePlan {
@@ -72,7 +73,7 @@ struct MachineCreateGuard {
 /// already-created root disk.
 ///
 /// ```rust,no_run
-/// use libvm::{ImageSource, MachineNetworkConfig, Memory, Runtime};
+/// use libvm::{ImageSource, Memory, Runtime};
 ///
 /// # async fn example(runtime: Runtime) -> Result<(), libvm::LibVmError> {
 /// let machine = runtime
@@ -81,7 +82,7 @@ struct MachineCreateGuard {
 ///     .name("devbox")
 ///     .cpus(4)
 ///     .memory(Memory::gibibytes(8))
-///     .network(MachineNetworkConfig::private())
+///     .network(|network| network.private())
 ///     .create()
 ///     .await?;
 /// let from_disk = runtime
@@ -119,6 +120,7 @@ impl MachineBuilder {
                 disks: Vec::new(),
                 mounts: Vec::new(),
                 network: None,
+                network_error: None,
             },
         }
     }
@@ -234,9 +236,15 @@ impl MachineBuilder {
         self
     }
 
-    /// Sets the durable network config.
-    pub fn network(mut self, network: MachineNetworkConfig) -> Self {
-        self.request.network = Some(network);
+    /// Configures the durable network attachment.
+    pub fn network(
+        mut self,
+        configure: impl FnOnce(MachineNetworkBuilder) -> MachineNetworkBuilder,
+    ) -> Self {
+        match configure(MachineNetworkBuilder::new()).build() {
+            Ok(network) => self.request.network = Some(network),
+            Err(reason) => self.request.network_error = Some(reason),
+        }
         self
     }
 
@@ -293,6 +301,9 @@ async fn create_machine_config_with_name(
             reason: "machine image source is required".to_string(),
         });
     };
+    if let Some(reason) = request.network_error {
+        return Err(LibVmError::InvalidCreateRequest { name, reason });
+    }
 
     let boot_assets =
         runtime.resolve_boot_assets(request.kernel.as_deref(), request.initramfs.as_deref())?;
@@ -683,6 +694,7 @@ mod tests {
             disks: Vec::new(),
             mounts: Vec::new(),
             network: None,
+            network_error: None,
         }
     }
 

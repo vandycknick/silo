@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use eyre::{bail, Context as _};
-use libvm::MachineNetworkConfig;
+use libvm::{MachineNetworkBuilder, NetworkPolicy};
 use serde::{Deserialize, Serialize};
 use utils::HumanSize;
 use vm_spec::Mount;
@@ -88,6 +88,111 @@ pub(crate) enum ProfileNetwork {
     Named {
         name: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MachineNetworkSelection {
+    Private,
+    None,
+    Named { name: String },
+}
+
+impl MachineNetworkSelection {
+    pub(crate) fn parse(input: &str) -> Result<Self, String> {
+        match input {
+            "private" => Ok(Self::Private),
+            "none" => Ok(Self::None),
+            other if other.starts_with("name:") => Self::named(other.trim_start_matches("name:")),
+            other => Self::named(other),
+        }
+    }
+
+    pub(crate) fn apply(self, builder: MachineNetworkBuilder) -> MachineNetworkBuilder {
+        match self {
+            Self::Private => builder.private(),
+            Self::None => builder.none(),
+            Self::Named { name } => builder.named(name),
+        }
+    }
+
+    pub(crate) fn into_profile_network(self) -> ProfileNetwork {
+        match self {
+            Self::Private => ProfileNetwork::Private { policy_ref: None },
+            Self::None => ProfileNetwork::None,
+            Self::Named { name } => ProfileNetwork::Named { name },
+        }
+    }
+
+    fn named(name: &str) -> Result<Self, String> {
+        if name.is_empty() {
+            return Err("network name cannot be empty".to_string());
+        }
+        if matches!(name, "private" | "none") {
+            return Err(format!("{name:?} is a reserved network name"));
+        }
+        Ok(Self::Named {
+            name: name.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedMachineNetwork {
+    Private { policy: Option<NetworkPolicy> },
+    None,
+    Named { name: String },
+}
+
+impl ResolvedMachineNetwork {
+    pub(crate) fn apply(self, builder: MachineNetworkBuilder) -> MachineNetworkBuilder {
+        match self {
+            Self::Private { policy } => {
+                let builder = builder.private();
+                if let Some(policy) = policy {
+                    builder.policy(policy)
+                } else {
+                    builder
+                }
+            }
+            Self::None => builder.none(),
+            Self::Named { name } => builder.named(name),
+        }
+    }
+}
+
+impl Default for ResolvedMachineNetwork {
+    fn default() -> Self {
+        Self::Private { policy: None }
+    }
+}
+
+impl From<MachineNetworkSelection> for ResolvedMachineNetwork {
+    fn from(selection: MachineNetworkSelection) -> Self {
+        match selection {
+            MachineNetworkSelection::Private => Self::Private { policy: None },
+            MachineNetworkSelection::None => Self::None,
+            MachineNetworkSelection::Named { name } => Self::Named { name },
+        }
+    }
+}
+
+impl ProfileNetwork {
+    pub(crate) fn resolve_machine_network(
+        self,
+        policy_config_dir: Option<&Path>,
+    ) -> eyre::Result<ResolvedMachineNetwork> {
+        match self {
+            Self::Private { policy_ref } => {
+                let policy = policy_ref
+                    .as_deref()
+                    .map(|source| resolve_network_policy_source(source, policy_config_dir))
+                    .transpose()?;
+                Ok(ResolvedMachineNetwork::Private { policy })
+            }
+            Self::None => Ok(ResolvedMachineNetwork::None),
+            Self::Named { name } => Ok(ResolvedMachineNetwork::Named { name }),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for ProfileNetwork {
@@ -217,18 +322,8 @@ impl Profile {
     pub fn machine_network(
         &self,
         policy_config_dir: Option<&Path>,
-    ) -> eyre::Result<MachineNetworkConfig> {
-        match self.network() {
-            ProfileNetwork::Private { policy_ref } => {
-                let policy = policy_ref
-                    .as_deref()
-                    .map(|source| resolve_network_policy_source(source, policy_config_dir))
-                    .transpose()?;
-                Ok(MachineNetworkConfig::Private { policy })
-            }
-            ProfileNetwork::None => Ok(MachineNetworkConfig::None),
-            ProfileNetwork::Named { name } => Ok(MachineNetworkConfig::Named { name }),
-        }
+    ) -> eyre::Result<ResolvedMachineNetwork> {
+        self.network().resolve_machine_network(policy_config_dir)
     }
 
     pub fn cpus(&self) -> Option<u8> {

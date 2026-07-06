@@ -3,7 +3,7 @@ use vm_spec::VmSpec;
 use crate::machine::{
     validate_machine_name, Machine, MachineData, MachineUpdate, NetworkPolicyUpdate,
 };
-use crate::network::MachineNetworkConfig;
+use crate::network::MachineNetworkBuilder;
 use crate::runtime::core::{empty_hardware, validate_root_disk_growth, write_machine_config};
 use crate::store::models::MachineNetworkConfig as ModelMachineNetworkConfig;
 use crate::utils::now_unix;
@@ -35,9 +35,15 @@ impl Machine {
     /// Changes the durable network config for a stopped machine.
     pub async fn set_network(
         &self,
-        network: MachineNetworkConfig,
+        configure: impl FnOnce(MachineNetworkBuilder) -> MachineNetworkBuilder,
     ) -> Result<MachineData, LibVmError> {
         let runtime = self.runtime();
+        let network = configure(MachineNetworkBuilder::new())
+            .build()
+            .map_err(|reason| LibVmError::InvalidMachineUpdate {
+                reference: self.id(),
+                reason,
+            })?;
         let network = network.into();
         runtime.validate_machine_network_config(&network).await?;
         let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
@@ -56,6 +62,12 @@ impl Machine {
     /// Applies partial settings updates to a stopped machine.
     pub async fn update(&self, update: MachineUpdate) -> Result<MachineData, LibVmError> {
         let runtime = self.runtime();
+        if let Some(reason) = update.network_error.as_ref() {
+            return Err(LibVmError::InvalidMachineUpdate {
+                reference: self.id(),
+                reason: reason.clone(),
+            });
+        }
         let replacement_network: Option<ModelMachineNetworkConfig> =
             update.network.clone().map(Into::into);
         if let Some(network) = &replacement_network {

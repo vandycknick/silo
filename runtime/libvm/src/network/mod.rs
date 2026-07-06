@@ -9,7 +9,8 @@ mod netd_driver;
 mod vznat_driver;
 
 pub use api::{
-    MachineNetworkConfig, NetworkDefinition, NetworkDriver, NetworkDriverKind, NetworkTopology,
+    MachineNetworkBuilder, MachineNetworkConfig, NetworkDefinition, NetworkDriver,
+    NetworkDriverKind, NetworkTopology,
 };
 pub use builder::NetworkBuilder;
 

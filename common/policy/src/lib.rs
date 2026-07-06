@@ -1,3 +1,4 @@
+mod builder;
 mod canonical;
 mod condition;
 #[cfg(feature = "ffi")]
@@ -5,6 +6,10 @@ mod ffi;
 mod model;
 mod parse;
 
+pub use builder::{
+    NetworkAuditBuilder, NetworkCredentialBuilder, NetworkEndpointBuilder, NetworkForwardBuilder,
+    NetworkPolicyBuildError, NetworkPolicyBuilder, NetworkRuleBuilder, TailscaleTunnelBuilder,
+};
 pub use canonical::{
     IpProtocol, NetworkAuditSettings, NetworkCredential, NetworkEndpoint, NetworkForward,
     NetworkPolicy, NetworkPolicySettings, NetworkRule, NetworkSecretAlternative, NetworkSecretKind,
