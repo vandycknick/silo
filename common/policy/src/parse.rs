@@ -6,6 +6,7 @@ use crate::model::{
 use hcl::{Block, Body, Expression, Structure};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 pub fn parse_policy(filename: String, source: &str) -> Result<Policy, LoadError> {
     let mut policy = Policy {
@@ -31,7 +32,12 @@ pub fn parse_policy(filename: String, source: &str) -> Result<Policy, LoadError>
 
 fn policy_hash(source: &[u8]) -> String {
     let digest = Sha256::digest(source);
-    format!("sha256:{digest:x}")
+    let mut hash = String::with_capacity("sha256:".len() + digest.len() * 2);
+    hash.push_str("sha256:");
+    for byte in digest {
+        let _ = write!(&mut hash, "{byte:02x}");
+    }
+    hash
 }
 
 fn parse_document(
@@ -1802,10 +1808,16 @@ fn known_credential_kind(kind: &str) -> bool {
 mod tests {
     use crate::model::{DiagnosticSeverity, ExpectedSecret, Policy};
     use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
 
     fn expected_hash(source: &str) -> String {
         let digest = Sha256::digest(source.as_bytes());
-        format!("sha256:{digest:x}")
+        let mut hash = String::with_capacity("sha256:".len() + digest.len() * 2);
+        hash.push_str("sha256:");
+        for byte in digest {
+            let _ = write!(&mut hash, "{byte:02x}");
+        }
+        hash
     }
 
     #[test]

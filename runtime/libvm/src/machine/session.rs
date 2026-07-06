@@ -859,6 +859,7 @@ impl russh::client::Handler for SshClientHandler {
     async fn server_channel_open_agent_forward(
         &mut self,
         channel: Channel<ClientMsg>,
+        _open_handle: russh::ChannelOpenHandleInner<ClientMsg>,
         _session: &mut russh::client::Session,
     ) -> Result<(), Self::Error> {
         #[cfg(unix)]

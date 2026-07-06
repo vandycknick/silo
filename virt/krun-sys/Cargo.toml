@@ -6,7 +6,6 @@ links = "krun"
 build = "build.rs"
 
 [dependencies]
-libc = "0.2.186"
 thiserror = "2.0.18"
 
 [build-dependencies]

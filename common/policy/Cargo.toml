@@ -7,9 +7,9 @@ edition = "2021"
 name = "silo_policy"
 
 [dependencies]
-cel = "0.13"
+cel = "0.14.0"
 hcl = { package = "hcl-rs", version = "0.19.7" }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0" }
-sha2 = "0.10.9"
-thiserror = "2.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+thiserror = "2.0.18"

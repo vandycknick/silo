@@ -6,9 +6,6 @@ use crate::store::row::{DbMachineConfig, DbMachineState};
 use crate::store::{MachineStore, Store};
 use crate::LibVmError;
 
-const MACHINE_CONFIG_COLUMNS: &str = "id, name, json(config_json) AS config_json";
-const MACHINE_STATE_COLUMNS: &str = "machine_id, status, json(state_json) AS state_json";
-
 #[async_trait]
 impl MachineStore for Store {
     #[cfg(test)]
@@ -60,12 +57,12 @@ impl MachineStore for Store {
         &self,
         machine_id: MachineId,
     ) -> Result<Option<MachineState>, LibVmError> {
-        let query =
-            format!("SELECT {MACHINE_STATE_COLUMNS} FROM machine_state WHERE machine_id = ?1");
-        let state = sqlx::query_as::<_, DbMachineState>(&query)
-            .bind(machine_id.to_string())
-            .fetch_optional(&self.pool)
-            .await?;
+        let state = sqlx::query_as::<_, DbMachineState>(
+            "SELECT machine_id, status, json(state_json) AS state_json FROM machine_state WHERE machine_id = ?1",
+        )
+        .bind(machine_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(state.map(|DbMachineState(state)| state))
     }
 
@@ -107,11 +104,12 @@ impl MachineStore for Store {
     }
 
     async fn machine_config(&self, id: MachineId) -> Result<Option<MachineConfig>, LibVmError> {
-        let query = format!("SELECT {MACHINE_CONFIG_COLUMNS} FROM machine_config WHERE id = ?1");
-        let machine = sqlx::query_as::<_, DbMachineConfig>(&query)
-            .bind(id.to_string())
-            .fetch_optional(&self.pool)
-            .await?;
+        let machine = sqlx::query_as::<_, DbMachineConfig>(
+            "SELECT id, name, json(config_json) AS config_json FROM machine_config WHERE id = ?1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(machine.map(|DbMachineConfig(machine)| machine))
     }
 
@@ -119,11 +117,12 @@ impl MachineStore for Store {
         &self,
         name: &str,
     ) -> Result<Option<MachineConfig>, LibVmError> {
-        let query = format!("SELECT {MACHINE_CONFIG_COLUMNS} FROM machine_config WHERE name = ?1");
-        let machine = sqlx::query_as::<_, DbMachineConfig>(&query)
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?;
+        let machine = sqlx::query_as::<_, DbMachineConfig>(
+            "SELECT id, name, json(config_json) AS config_json FROM machine_config WHERE name = ?1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(machine.map(|DbMachineConfig(machine)| machine))
     }
 
@@ -133,11 +132,12 @@ impl MachineStore for Store {
     ) -> Result<Vec<MachineConfig>, LibVmError> {
         Self::validate_machine_id_prefix(prefix)?;
         let pattern = format!("{prefix}%");
-        let query = format!("SELECT {MACHINE_CONFIG_COLUMNS} FROM machine_config WHERE id LIKE ?1");
-        let rows = sqlx::query_as::<_, DbMachineConfig>(&query)
-            .bind(pattern)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query_as::<_, DbMachineConfig>(
+            "SELECT id, name, json(config_json) AS config_json FROM machine_config WHERE id LIKE ?1",
+        )
+        .bind(pattern)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
             .map(|DbMachineConfig(machine)| machine)
@@ -145,10 +145,11 @@ impl MachineStore for Store {
     }
 
     async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError> {
-        let query = format!("SELECT {MACHINE_CONFIG_COLUMNS} FROM machine_config ORDER BY name");
-        let rows = sqlx::query_as::<_, DbMachineConfig>(&query)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query_as::<_, DbMachineConfig>(
+            "SELECT id, name, json(config_json) AS config_json FROM machine_config ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
             .map(|DbMachineConfig(machine)| machine)

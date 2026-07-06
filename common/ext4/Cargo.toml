@@ -13,9 +13,9 @@ categories = ["filesystem", "os"]
 exclude = ["/tests", "/.github"]
 
 [dependencies]
-thiserror = "2"
-uuid = { version = "1", features = ["v4"] }
-tar = "0.4"
+thiserror = "2.0.18"
+uuid = { version = "1.23.4", features = ["v4"] }
+tar = "0.4.46"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27.0"

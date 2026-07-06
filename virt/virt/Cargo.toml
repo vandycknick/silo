@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 protocol = { path = "../../specs/protocol" }
-crossbeam = "0.8.4"
 nix = { version = "0.31.3", features = ["fs", "process", "signal", "socket", "term"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "fs", "io-util", "net", "process", "sync", "time"] }

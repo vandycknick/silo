@@ -18,26 +18,18 @@ silo_policy = { package = "policy", path = "../../common/policy" }
 libvm = { path = "../../runtime/libvm" }
 vm-spec = { path = "../../specs/vm-spec" }
 utils = { path = "../../common/utils" }
-anyhow = "1.0.102"
 base64 = "0.22.1"
 clap = { version = "4.6.1", features = ["derive"] }
-console = "0.16.3"
+console = "0.16.4"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 serde_yaml_ng = "0.10.0"
 libc = "0.2.186"
-time = { version = "0.3.47", features = ["formatting"] }
-chrono = "0.4.44"
+chrono = "0.4.45"
 eyre = "0.6.12"
-hyper-util = { version = "0.1.20", features = ["tokio"] }
-indicatif = "0.18.4"
-nix = { version = "0.31.3", features = ["fs"] }
-reqwest = { version = "0.13.3", default-features = false, features = ["json", "form", "rustls"] }
+indicatif = "0.18.6"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "form", "rustls"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "io-std", "sync"] }
-tonic = { version = "0.14.6", features = ["transport"] }
-tower = "0.5.3"
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

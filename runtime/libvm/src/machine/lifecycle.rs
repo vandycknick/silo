@@ -179,30 +179,29 @@ impl Machine {
                         forced: false,
                     }
                 }
-                Some(pid) => {
-                    if interrupt_monitor(pid)? {
-                        let generation = VmmonRunIdentity {
-                            pid,
-                            started_at: Some(
-                                status
-                                    .started_at
-                                    .unwrap_or_else(|| pid_file_mtime(&pid_path)),
-                            ),
-                            run_id: status.run_id.clone(),
-                        };
-                        runtime.request_machine_stop(config.id, &generation).await?;
+                Some(pid) if interrupt_monitor(pid)? => {
+                    let generation = VmmonRunIdentity {
+                        pid,
+                        started_at: Some(
+                            status
+                                .started_at
+                                .unwrap_or_else(|| pid_file_mtime(&pid_path)),
+                        ),
+                        run_id: status.run_id.clone(),
+                    };
+                    runtime.request_machine_stop(config.id, &generation).await?;
 
-                        WaitTarget {
-                            config,
-                            generation,
-                            stop_requested: true,
-                            forced: false,
-                        }
-                    } else {
-                        runtime.mark_machine_stopped(config.id, None).await?;
-                        runtime.cleanup_machine_resources_locked(&config).await?;
-                        return runtime.machine_inspect_data(config).await;
+                    WaitTarget {
+                        config,
+                        generation,
+                        stop_requested: true,
+                        forced: false,
                     }
+                }
+                Some(_) => {
+                    runtime.mark_machine_stopped(config.id, None).await?;
+                    runtime.cleanup_machine_resources_locked(&config).await?;
+                    return runtime.machine_inspect_data(config).await;
                 }
                 None => {
                     runtime.mark_machine_stopped(config.id, None).await?;
