@@ -40,14 +40,15 @@ fn apply_user(context: &ProvisionContext, user: &UserConfig) -> eyre::Result<()>
 
 fn ensure_user(context: &ProvisionContext, user: &UserConfig) -> eyre::Result<()> {
     match read_user_entry(context, &user.name)? {
-        Some(entry) => reconcile_existing_user(user, &entry),
-        None => create_user(user),
+        Some(entry) => reconcile_existing_user(context, user, &entry),
+        None => create_user(context, user),
     }
 }
 
-fn create_user(user: &UserConfig) -> eyre::Result<()> {
+fn create_user(context: &ProvisionContext, user: &UserConfig) -> eyre::Result<()> {
     let uid = user.uid.to_string();
     run_command(
+        context.process_supervisor(),
         "useradd",
         [
             "--uid",
@@ -64,14 +65,22 @@ fn create_user(user: &UserConfig) -> eyre::Result<()> {
     )?;
 
     if user.lock_passwd && command_exists("passwd") {
-        run_command("passwd", ["--lock", user.name.as_str()])?;
+        run_command(
+            context.process_supervisor(),
+            "passwd",
+            ["--lock", user.name.as_str()],
+        )?;
     }
 
     tracing::info!(user = %user.name, uid = user.uid, "provisioned user");
     Ok(())
 }
 
-fn reconcile_existing_user(user: &UserConfig, entry: &UserEntry) -> eyre::Result<()> {
+fn reconcile_existing_user(
+    context: &ProvisionContext,
+    user: &UserConfig,
+    entry: &UserEntry,
+) -> eyre::Result<()> {
     if entry.uid != user.uid {
         return Err(eyre!(
             "existing user {} has uid {}, expected {}; refusing to change uid",
@@ -97,35 +106,47 @@ fn reconcile_existing_user(user: &UserConfig, entry: &UserEntry) -> eyre::Result
 
     if !args.is_empty() {
         args.push(OsString::from(&user.name));
-        run_command("usermod", args)?;
+        run_command(context.process_supervisor(), "usermod", args)?;
     }
 
-    reconcile_home(user)?;
-    reconcile_password_lock(user)?;
+    reconcile_home(context, user)?;
+    reconcile_password_lock(context, user)?;
 
     tracing::info!(user = %user.name, uid = user.uid, "reconciled user");
     Ok(())
 }
 
-fn reconcile_home(user: &UserConfig) -> eyre::Result<()> {
+fn reconcile_home(context: &ProvisionContext, user: &UserConfig) -> eyre::Result<()> {
     fs::create_dir_all(&user.home)
         .with_context(|| format!("create home directory {}", user.home))?;
     if command_exists("chown") {
         let owner = format!("{}:{}", user.name, user.name);
-        run_command("chown", [owner.as_str(), user.home.as_str()])?;
+        run_command(
+            context.process_supervisor(),
+            "chown",
+            [owner.as_str(), user.home.as_str()],
+        )?;
     }
     Ok(())
 }
 
-fn reconcile_password_lock(user: &UserConfig) -> eyre::Result<()> {
+fn reconcile_password_lock(context: &ProvisionContext, user: &UserConfig) -> eyre::Result<()> {
     if !command_exists("passwd") {
         return Ok(());
     }
 
     if user.lock_passwd {
-        run_command("passwd", ["--lock", user.name.as_str()])
+        run_command(
+            context.process_supervisor(),
+            "passwd",
+            ["--lock", user.name.as_str()],
+        )
     } else {
-        run_command("passwd", ["--unlock", user.name.as_str()])
+        run_command(
+            context.process_supervisor(),
+            "passwd",
+            ["--unlock", user.name.as_str()],
+        )
     }
 }
 
@@ -224,7 +245,10 @@ mod tests {
         )
         .expect("write passwd");
 
-        let context = ProvisionContext { root: root.clone() };
+        let context = ProvisionContext {
+            root: root.clone(),
+            process_supervisor: crate::pid1::ProcessSupervisor::default(),
+        };
         let entry = super::read_user_entry(&context, "silo")
             .expect("read user")
             .expect("entry exists");

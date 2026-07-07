@@ -1,11 +1,12 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use agent_spec::MountConfig;
 use eyre::{eyre, Context};
 
-use crate::provision::{command_exists, format_error_chain, run_command, ProvisionContext};
+use crate::provision::{
+    command_exists, command_output, format_error_chain, run_command, ProvisionContext,
+};
 
 pub(crate) fn apply(context: &ProvisionContext, mounts: &[MountConfig]) -> eyre::Result<()> {
     let mut failures = Vec::new();
@@ -37,7 +38,7 @@ pub(crate) fn apply(context: &ProvisionContext, mounts: &[MountConfig]) -> eyre:
 fn apply_mount(context: &ProvisionContext, mount: &MountConfig) -> eyre::Result<()> {
     let target = context.guest_path(&mount.path);
     fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
-    if let Some(current) = current_mount(&target)? {
+    if let Some(current) = current_mount(context, &target)? {
         if current.matches(mount) {
             tracing::debug!(path = %mount.path, tag = %mount.tag, "mount already reconciled");
             return Ok(());
@@ -53,12 +54,17 @@ fn apply_mount(context: &ProvisionContext, mount: &MountConfig) -> eyre::Result<
             "remounting drifted mount target"
         );
         let target_arg = target.to_string_lossy().to_string();
-        run_command("umount", [target_arg.as_str()])?;
+        run_command(
+            context.process_supervisor(),
+            "umount",
+            [target_arg.as_str()],
+        )?;
     }
 
     let options = mount.options.join(",");
     let target = target.to_string_lossy().to_string();
     run_command(
+        context.process_supervisor(),
         "mount",
         [
             "-t",
@@ -89,22 +95,29 @@ impl MountInfo {
     }
 }
 
-fn current_mount(path: &Path) -> eyre::Result<Option<MountInfo>> {
+fn current_mount(context: &ProvisionContext, path: &Path) -> eyre::Result<Option<MountInfo>> {
     if !command_exists("findmnt") {
         return Ok(None);
     }
 
-    let output = Command::new("findmnt")
-        .args(["-n", "-r", "-o", "SOURCE,FSTYPE,OPTIONS", "--mountpoint"])
-        .arg(path)
-        .output()
-        .with_context(|| format!("inspect mount target {}", path.display()))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
+    let path_arg = path.to_string_lossy().to_string();
+    let output = match command_output(
+        context.process_supervisor(),
+        "findmnt",
+        [
+            "-n",
+            "-r",
+            "-o",
+            "SOURCE,FSTYPE,OPTIONS",
+            "--mountpoint",
+            path_arg.as_str(),
+        ],
+    ) {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
 
-    let stdout = String::from_utf8(output.stdout)
-        .with_context(|| format!("decode findmnt output for {}", path.display()))?;
+    let stdout = output;
     let mut fields = stdout.split_whitespace();
     let Some(source) = fields.next() else {
         return Ok(None);

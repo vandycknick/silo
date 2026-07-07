@@ -16,7 +16,11 @@ pub(crate) fn apply(
             "if command -v update-ca-certificates >/dev/null 2>&1; then update-ca-certificates; elif command -v trust >/dev/null 2>&1; then trust anchor --store {} && trust extract-compat; fi",
             shell_quote(&config.path)
         );
-        run_command("/bin/sh", ["-c", command.as_str()])?;
+        run_command(
+            context.process_supervisor(),
+            "/bin/sh",
+            ["-c", command.as_str()],
+        )?;
     }
 
     tracing::info!(

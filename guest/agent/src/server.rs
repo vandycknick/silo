@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY};
 use tracing::{Instrument, Span};
 
@@ -13,6 +13,10 @@ pub struct RunningServer {
 }
 
 impl RunningServer {
+    pub fn abort_handle(&self) -> Option<AbortHandle> {
+        self.task.as_ref().map(JoinHandle::abort_handle)
+    }
+
     pub async fn wait(mut self) -> Result<(), tokio::task::JoinError> {
         if let Some(task) = self.task.take() {
             task.await

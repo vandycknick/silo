@@ -15,7 +15,11 @@ pub(crate) fn apply(context: &ProvisionContext, hostname: Option<&str>) -> eyre:
     nix::unistd::sethostname(hostname).context("set kernel hostname")?;
 
     if command_exists("hostnamectl") {
-        run_command("hostnamectl", ["set-hostname", hostname])?;
+        run_command(
+            context.process_supervisor(),
+            "hostnamectl",
+            ["set-hostname", hostname],
+        )?;
     }
 
     tracing::info!(hostname, path = %hostname_path.display(), "reconciled hostname");

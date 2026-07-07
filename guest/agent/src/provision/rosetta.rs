@@ -5,7 +5,7 @@ use std::path::Path;
 use agent_spec::AgentRosettaConfig;
 use eyre::Context;
 
-use crate::provision::{command_exists, run_command, ProvisionContext};
+use crate::provision::{command_exists, command_status, run_command, ProvisionContext};
 
 const BINFMT_MISC_PATH: &str = "/proc/sys/fs/binfmt_misc";
 const ROSETTA_ENTRY_PATH: &str = "/proc/sys/fs/binfmt_misc/rosetta";
@@ -34,7 +34,11 @@ pub(crate) fn apply(context: &ProvisionContext, config: &AgentRosettaConfig) -> 
     let mount_path = context.guest_path(&config.mount_path);
     fs::create_dir_all(&mount_path)
         .with_context(|| format!("create Rosetta mount path {}", mount_path.display()))?;
-    mount_if_needed(&mount_path, ["-t", "virtiofs", config.mount_tag.as_str()])?;
+    mount_if_needed(
+        context,
+        &mount_path,
+        ["-t", "virtiofs", config.mount_tag.as_str()],
+    )?;
 
     let rosetta_binary = mount_path.join("rosetta");
     ensure_rosetta_binary(&rosetta_binary)?;
@@ -42,7 +46,7 @@ pub(crate) fn apply(context: &ProvisionContext, config: &AgentRosettaConfig) -> 
     let binfmt_path = context.guest_path(BINFMT_MISC_PATH);
     fs::create_dir_all(&binfmt_path)
         .with_context(|| format!("create binfmt_misc path {}", binfmt_path.display()))?;
-    mount_if_needed(&binfmt_path, ["-t", "binfmt_misc", "binfmt_misc"])?;
+    mount_if_needed(context, &binfmt_path, ["-t", "binfmt_misc", "binfmt_misc"])?;
 
     unregister_existing_rosetta(context)?;
     register_rosetta(context, &rosetta_binary)?;
@@ -58,8 +62,12 @@ pub(crate) fn apply(context: &ProvisionContext, config: &AgentRosettaConfig) -> 
     Ok(())
 }
 
-fn mount_if_needed<const N: usize>(target: &Path, args: [&str; N]) -> eyre::Result<()> {
-    if is_mounted(target) {
+fn mount_if_needed<const N: usize>(
+    context: &ProvisionContext,
+    target: &Path,
+    args: [&str; N],
+) -> eyre::Result<()> {
+    if is_mounted(context, target) {
         tracing::debug!(path = %target.display(), "mount target already mounted");
         return Ok(());
     }
@@ -68,17 +76,22 @@ fn mount_if_needed<const N: usize>(target: &Path, args: [&str; N]) -> eyre::Resu
     let mut command_args = Vec::with_capacity(N + 1);
     command_args.extend(args);
     command_args.push(target.as_str());
-    run_command("mount", command_args)
+    run_command(context.process_supervisor(), "mount", command_args)
 }
 
-fn is_mounted(path: &Path) -> bool {
-    command_exists("findmnt")
-        && std::process::Command::new("findmnt")
-            .arg("--mountpoint")
-            .arg(path)
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+fn is_mounted(context: &ProvisionContext, path: &Path) -> bool {
+    if !command_exists("findmnt") {
+        return false;
+    }
+
+    let path = path.to_string_lossy().to_string();
+    command_status(
+        context.process_supervisor(),
+        "findmnt",
+        ["--mountpoint", path.as_str()],
+    )
+    .map(|status| status.success())
+    .unwrap_or(false)
 }
 
 fn ensure_rosetta_binary(path: &Path) -> eyre::Result<()> {

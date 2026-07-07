@@ -36,12 +36,24 @@ pub(crate) fn apply(context: &ProvisionContext, config: &NetworkConfig) -> eyre:
 
     if command_exists("systemctl") && (changed || !config.interfaces.is_empty()) {
         if !config.interfaces.is_empty() {
-            run_command("systemctl", ["enable", "systemd-networkd.service"])?;
+            run_command(
+                context.process_supervisor(),
+                "systemctl",
+                ["enable", "systemd-networkd.service"],
+            )?;
         }
         if changed {
-            run_command("systemctl", ["restart", "systemd-networkd.service"])?;
+            run_command(
+                context.process_supervisor(),
+                "systemctl",
+                ["restart", "systemd-networkd.service"],
+            )?;
         } else {
-            run_command("systemctl", ["start", "systemd-networkd.service"])?;
+            run_command(
+                context.process_supervisor(),
+                "systemctl",
+                ["start", "systemd-networkd.service"],
+            )?;
         }
     }
 

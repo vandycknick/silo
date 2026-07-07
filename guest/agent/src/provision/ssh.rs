@@ -26,7 +26,11 @@ pub(crate) fn install_authorized_keys(
     if command_exists("chown") {
         let owner = format!("{}:{}", user.uid, user.uid);
         let path = ssh_dir.to_string_lossy().to_string();
-        run_command("chown", ["-R", owner.as_str(), path.as_str()])?;
+        run_command(
+            context.process_supervisor(),
+            "chown",
+            ["-R", owner.as_str(), path.as_str()],
+        )?;
     }
 
     tracing::info!(user = %user.name, "reconciled SSH authorized keys");

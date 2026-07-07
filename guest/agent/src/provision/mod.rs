@@ -2,10 +2,12 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use agent_spec::ProvisionConfig;
 use eyre::{eyre, Context};
+
+use crate::pid1::ProcessSupervisor;
 
 mod ca;
 mod hostname;
@@ -19,13 +21,16 @@ mod timezone;
 mod user;
 mod userdata;
 
-pub fn run_provisioning(config: &ProvisionConfig) -> eyre::Result<()> {
+pub fn run_provisioning(
+    config: &ProvisionConfig,
+    process_supervisor: &ProcessSupervisor,
+) -> eyre::Result<()> {
     if !config.enabled {
         tracing::debug!("guest provisioning disabled");
         return Ok(());
     }
 
-    let context = ProvisionContext::default();
+    let context = ProvisionContext::new(process_supervisor.clone());
     tracing::info!("guest reconciliation starting");
 
     let mut run = ProvisionRun::default();
@@ -42,7 +47,9 @@ pub fn run_provisioning(config: &ProvisionConfig) -> eyre::Result<()> {
     run.step("certificate_authority", || {
         ca::apply(&context, config.certificate_authority.as_ref())
     });
-    run.step("resize_rootfs", || resize::apply(&config.resize_rootfs));
+    run.step("resize_rootfs", || {
+        resize::apply(&config.resize_rootfs, process_supervisor)
+    });
     run.step("mounts", || mounts::apply(&context, &config.mounts));
     run.step("rosetta", || rosetta::apply(&context, &config.rosetta));
     run.step("networkd", || networkd::apply(&context, &config.network));
@@ -97,23 +104,27 @@ impl ProvisionRun {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ProvisionContext {
     root: PathBuf,
-}
-
-impl Default for ProvisionContext {
-    fn default() -> Self {
-        Self {
-            root: PathBuf::from("/"),
-        }
-    }
+    process_supervisor: ProcessSupervisor,
 }
 
 impl ProvisionContext {
+    fn new(process_supervisor: ProcessSupervisor) -> Self {
+        Self {
+            root: PathBuf::from("/"),
+            process_supervisor,
+        }
+    }
+
     pub(crate) fn guest_path(&self, path: &str) -> PathBuf {
         let path = path.strip_prefix('/').unwrap_or(path);
         self.root.join(path)
+    }
+
+    pub(crate) fn process_supervisor(&self) -> &ProcessSupervisor {
+        &self.process_supervisor
     }
 }
 
@@ -129,7 +140,11 @@ pub(crate) fn write_file(path: &Path, contents: impl AsRef<[u8]>, mode: u32) -> 
     Ok(())
 }
 
-pub(crate) fn run_command<I, S>(program: &str, args: I) -> eyre::Result<()>
+pub(crate) fn run_command<I, S>(
+    process_supervisor: &ProcessSupervisor,
+    program: &str,
+    args: I,
+) -> eyre::Result<()>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -137,15 +152,12 @@ where
     let args = collect_command_args(args);
     tracing::debug!(program, args = ?args, "running provisioning command");
 
-    let output = Command::new(program)
-        .args(&args)
-        .output()
-        .with_context(|| {
-            format!(
-                "run provisioning command {}",
-                format_command(program, &args)
-            )
-        })?;
+    let output = process_supervisor.output(program, &args).with_context(|| {
+        format!(
+            "run provisioning command {}",
+            format_command(program, &args)
+        )
+    })?;
     if !output.status.success() {
         return Err(command_failure(program, &args, &output));
     }
@@ -153,7 +165,11 @@ where
     Ok(())
 }
 
-pub(crate) fn command_output<I, S>(program: &str, args: I) -> eyre::Result<String>
+pub(crate) fn command_output<I, S>(
+    process_supervisor: &ProcessSupervisor,
+    program: &str,
+    args: I,
+) -> eyre::Result<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -161,15 +177,12 @@ where
     let args = collect_command_args(args);
     tracing::debug!(program, args = ?args, "running provisioning command");
 
-    let output = Command::new(program)
-        .args(&args)
-        .output()
-        .with_context(|| {
-            format!(
-                "run provisioning command {}",
-                format_command(program, &args)
-            )
-        })?;
+    let output = process_supervisor.output(program, &args).with_context(|| {
+        format!(
+            "run provisioning command {}",
+            format_command(program, &args)
+        )
+    })?;
     if !output.status.success() {
         return Err(command_failure(program, &args, &output));
     }
@@ -177,6 +190,26 @@ where
     String::from_utf8(output.stdout).with_context(|| {
         format!(
             "decode stdout from provisioning command {} as UTF-8",
+            format_command(program, &args)
+        )
+    })
+}
+
+pub(crate) fn command_status<I, S>(
+    process_supervisor: &ProcessSupervisor,
+    program: &str,
+    args: I,
+) -> eyre::Result<std::process::ExitStatus>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args = collect_command_args(args);
+    tracing::debug!(program, args = ?args, "running provisioning command");
+
+    process_supervisor.status(program, &args).with_context(|| {
+        format!(
+            "run provisioning command {}",
             format_command(program, &args)
         )
     })

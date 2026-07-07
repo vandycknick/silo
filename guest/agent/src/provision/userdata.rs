@@ -40,7 +40,7 @@ pub(crate) fn apply(
     let path = context.guest_path(USERDATA_SCRIPT_PATH);
     write_file(&path, &userdata.content, 0o700)?;
     let script = path.to_string_lossy().to_string();
-    run_command("/bin/sh", [script.as_str()])?;
+    run_command(context.process_supervisor(), "/bin/sh", [script.as_str()])?;
     write_file(&hash_path, format!("{hash}\n"), 0o644)?;
     tracing::info!(path = %path.display(), hash = %hash, run = ?userdata.run, "reconciled userdata script");
     Ok(())

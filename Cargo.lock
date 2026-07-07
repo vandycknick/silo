@@ -50,11 +50,13 @@ name = "agent"
 version = "0.1.0"
 dependencies = [
  "agent-spec",
+ "clap",
  "eyre",
  "futures",
  "hyper-util",
  "nix",
  "protocol",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",

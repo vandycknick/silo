@@ -1,26 +1,38 @@
 use agent_spec::ResizeRootfsConfig;
 use eyre::{eyre, Context};
 
+use crate::pid1::ProcessSupervisor;
 use crate::provision::{command_exists, command_output, run_command};
 
 const ROOT_MOUNTPOINT: &str = "/";
 
-pub(crate) fn apply(config: &ResizeRootfsConfig) -> eyre::Result<()> {
+pub(crate) fn apply(
+    config: &ResizeRootfsConfig,
+    process_supervisor: &ProcessSupervisor,
+) -> eyre::Result<()> {
     if !config.enabled {
         return Ok(());
     }
 
-    let source = findmnt("SOURCE", ROOT_MOUNTPOINT)?;
-    let fstype = findmnt("FSTYPE", ROOT_MOUNTPOINT)?;
+    let source = findmnt(process_supervisor, "SOURCE", ROOT_MOUNTPOINT)?;
+    let fstype = findmnt(process_supervisor, "FSTYPE", ROOT_MOUNTPOINT)?;
     tracing::info!(source = %source, fstype = %fstype, "resizing root filesystem");
-    resize_filesystem(&source, &fstype)?;
+    resize_filesystem(process_supervisor, &source, &fstype)?;
     tracing::info!(source = %source, fstype = %fstype, "reconciled root filesystem size");
 
     Ok(())
 }
 
-fn findmnt(field: &str, target: &str) -> eyre::Result<String> {
-    let output = command_output("findmnt", ["-n", "-o", field, "--target", target])?;
+fn findmnt(
+    process_supervisor: &ProcessSupervisor,
+    field: &str,
+    target: &str,
+) -> eyre::Result<String> {
+    let output = command_output(
+        process_supervisor,
+        "findmnt",
+        ["-n", "-o", field, "--target", target],
+    )?;
     let value = output.trim();
     if value.is_empty() {
         return Err(eyre!("findmnt returned empty {field} for {target}"));
@@ -28,11 +40,15 @@ fn findmnt(field: &str, target: &str) -> eyre::Result<String> {
     Ok(value.to_string())
 }
 
-fn resize_filesystem(source: &str, fstype: &str) -> eyre::Result<()> {
+fn resize_filesystem(
+    process_supervisor: &ProcessSupervisor,
+    source: &str,
+    fstype: &str,
+) -> eyre::Result<()> {
     match resize_plan(source, fstype) {
         Some(plan) => {
             ensure_resize_command(plan.program, fstype)?;
-            run_command(plan.program, plan.args)
+            run_command(process_supervisor, plan.program, plan.args)
         }
         None => Err(eyre!(
             "unsupported filesystem {fstype:?} for root filesystem resize on {source}"
