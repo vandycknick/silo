@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/brand/silo-lockup-transparent.png" alt="Silo" width="520">
+  <img src="docs/brand/silo-lockup-transparent-web.webp" alt="Silo" width="520">
 </p>
 
 Silo is a local microVM sandbox runtime where machines are created from OCI images.

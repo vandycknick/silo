@@ -11,28 +11,13 @@ const AGENT_PAYLOAD_DIR: &[u8] = b"/agent";
 const AGENT_SOURCE_BINARY: &[u8] = b"/agent/silo-agent";
 const AGENT_RUN_DIR: &[u8] = b"/run/agent";
 const AGENT_RUN_BINARY: &[u8] = b"/run/agent/silo-agent";
-const SYSTEMD_UNIT_DIR: &[u8] = b"/run/systemd/system";
-const SYSTEMD_WANTS_DIR: &[u8] = b"/run/systemd/system/multi-user.target.wants";
-const AGENT_SERVICE_PATH: &[u8] = b"/run/systemd/system/silo-agent.service";
-const AGENT_SERVICE_WANTS_PATH: &[u8] =
-    b"/run/systemd/system/multi-user.target.wants/silo-agent.service";
-const AGENT_SERVICE_WANTS_TARGET: &[u8] = b"../silo-agent.service";
-const AGENT_SERVICE_UNIT: &[u8] = b"[Unit]\n\
-Description=Silo Guest Agent\n\
-After=basic.target\n\
-\n\
-[Service]\n\
-Type=simple\n\
-ExecStart=/run/agent/silo-agent\n\
-Restart=on-failure\n\
-RestartSec=1s\n\
-\n\
-[Install]\n\
-WantedBy=multi-user.target\n";
+const AGENT_INIT_ARG: &[u8] = b"--init";
+const AGENT_HANDOFF_ARG_PREFIX: &[u8] = b"--handoff=";
 
 struct BootConfig {
     root: Vec<u8>,
     init: Vec<u8>,
+    init_explicit: bool,
     rootfstype: Option<Vec<u8>>,
 }
 
@@ -67,16 +52,23 @@ fn run_init() -> Result<(), &'static str> {
     if mount_root(&config) != 0 {
         return Err("failed to mount root filesystem");
     }
-    prepare_agent_handoff()?;
 
-    let init_path = target_init_path(&config.init).ok_or("target init path is too long")?;
-    if io::access(&init_path, libc::X_OK) != 0 {
-        return Err("target init is not executable");
-    }
+    if prepare_agent_boot()? {
+        let handoff_arg = agent_handoff_arg(&config);
+        let init_argv = [AGENT_RUN_BINARY, AGENT_INIT_ARG, handoff_arg.as_slice()];
+        if do_switch_root(MNT_ROOT, AGENT_RUN_BINARY, &init_argv) != 0 {
+            return Err("switch_root failed");
+        }
+    } else {
+        let init_path = target_init_path(&config.init).ok_or("target init path is too long")?;
+        if io::access(&init_path, libc::X_OK) != 0 {
+            return Err("target init is not executable");
+        }
 
-    let init_argv = [config.init.as_slice()];
-    if do_switch_root(MNT_ROOT, &config.init, &init_argv) != 0 {
-        return Err("switch_root failed");
+        let init_argv = [config.init.as_slice()];
+        if do_switch_root(MNT_ROOT, &config.init, &init_argv) != 0 {
+            return Err("switch_root failed");
+        }
     }
 
     Ok(())
@@ -134,13 +126,14 @@ fn read_boot_config() -> BootConfig {
         Vec::new()
     };
 
+    let init = cmdline_value(&cmdline, b"init=");
+
     BootConfig {
         root: cmdline_value(&cmdline, b"root=")
             .unwrap_or(DEFAULT_ROOT)
             .to_vec(),
-        init: cmdline_value(&cmdline, b"init=")
-            .unwrap_or(DEFAULT_INIT)
-            .to_vec(),
+        init: init.unwrap_or(DEFAULT_INIT).to_vec(),
+        init_explicit: init.is_some(),
         rootfstype: cmdline_value(&cmdline, b"rootfstype=").map(|value| value.to_vec()),
     }
 }
@@ -175,9 +168,9 @@ fn mount_root(config: &BootConfig) -> i32 {
     }
 }
 
-fn prepare_agent_handoff() -> Result<(), &'static str> {
+fn prepare_agent_boot() -> Result<bool, &'static str> {
     if io::access(AGENT_PAYLOAD_DIR, libc::F_OK) != 0 {
-        return Ok(());
+        return Ok(false);
     }
 
     if io::access(AGENT_SOURCE_BINARY, libc::R_OK) != 0 {
@@ -187,23 +180,24 @@ fn prepare_agent_handoff() -> Result<(), &'static str> {
     if applets::files::mkdir_parents(AGENT_RUN_DIR, 0o755) != 0 {
         return Err("failed to create /run/agent");
     }
-    if applets::files::mkdir_parents(SYSTEMD_UNIT_DIR, 0o755) != 0 {
-        return Err("failed to create /run/systemd/system");
-    }
-    if applets::files::mkdir_parents(SYSTEMD_WANTS_DIR, 0o755) != 0 {
-        return Err("failed to create silo-agent systemd wants directory");
-    }
 
     copy_file(AGENT_SOURCE_BINARY, AGENT_RUN_BINARY, 0o755)?;
-    write_static_file(AGENT_SERVICE_PATH, AGENT_SERVICE_UNIT, 0o644)?;
 
-    if io::symlink(AGENT_SERVICE_WANTS_TARGET, AGENT_SERVICE_WANTS_PATH) != 0
-        && io::errno() != libc::EEXIST
-    {
-        return Err("failed to enable silo-agent systemd unit");
+    Ok(true)
+}
+
+fn agent_handoff_arg(config: &BootConfig) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(AGENT_HANDOFF_ARG_PREFIX);
+    if config.init_explicit {
+        if !config.init.is_empty() && !config.init.starts_with(b"/") {
+            out.push(b'/');
+        }
+        out.extend_from_slice(&config.init);
+    } else {
+        out.extend_from_slice(b"auto");
     }
-
-    Ok(())
+    out
 }
 
 fn copy_file(source: &[u8], target: &[u8], mode: u32) -> Result<(), &'static str> {
@@ -248,26 +242,6 @@ fn copy_file(source: &[u8], target: &[u8], mode: u32) -> Result<(), &'static str
     result
 }
 
-fn write_static_file(path: &[u8], contents: &[u8], mode: u32) -> Result<(), &'static str> {
-    let fd = io::open(path, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, mode);
-    if fd < 0 {
-        return Err("failed to create generated file");
-    }
-
-    let mut result = Ok(());
-    if io::write_buf(fd, contents) != contents.len() as isize {
-        result = Err("failed to write generated file");
-    }
-    if io::close(fd) != 0 && result.is_ok() {
-        result = Err("failed to close generated file");
-    }
-    if result.is_ok() && io::chmod(path, mode) != 0 {
-        result = Err("failed to set generated file permissions");
-    }
-
-    result
-}
-
 fn target_init_path(init: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(MNT_ROOT);
@@ -286,9 +260,8 @@ pub(crate) fn do_switch_root(new_root: &[u8], init: &[u8], init_argv: &[&[u8]]) 
     move_mount_if_present(b"/dev", new_root);
     move_mount_if_present(b"/proc", new_root);
     move_mount_if_present(b"/sys", new_root);
-    // Match util-linux switch_root behavior for /run. Silo relies on this as
-    // a transient handoff: initramfs /run/... becomes rootfs /run/... here, and
-    // systemd reuses the existing tmpfs instead of replacing it.
+    // Match util-linux switch_root behavior for /run. Silo relies on this to
+    // carry the copied /run/agent/silo-agent into the real root.
     move_mount_if_present(b"/run", new_root);
 
     if io::chdir(new_root) != 0 {

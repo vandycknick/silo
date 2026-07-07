@@ -12,15 +12,19 @@ mod rpc;
 mod server;
 
 #[cfg(target_os = "linux")]
+use std::ffi::{CString, OsStr, OsString};
+#[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
 #[cfg(target_os = "linux")]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 #[cfg(target_os = "linux")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
 
@@ -30,6 +34,10 @@ use agent_spec::{AgentConfig, SSH_VSOCK_PORT};
 use eyre::Context;
 #[cfg(target_os = "linux")]
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
+#[cfg(target_os = "linux")]
+use nix::sys::signal::{self, SigHandler, SigSet, SigmaskHow, Signal};
+#[cfg(target_os = "linux")]
+use nix::unistd::{execv, fork, setsid, ForkResult};
 #[cfg(target_os = "linux")]
 use tokio::io::{AsyncBufReadExt, BufReader};
 #[cfg(target_os = "linux")]
@@ -56,6 +64,18 @@ const SSHD_RUNTIME_DIR_MODE: u32 = 0o755;
 const UNIX_MODE_BITS: u32 = 0o7777;
 #[cfg(target_os = "linux")]
 const GROUP_OR_WORLD_WRITABLE: u32 = 0o022;
+#[cfg(target_os = "linux")]
+const HANDOFF_AUTO: &str = "auto";
+#[cfg(target_os = "linux")]
+const HANDOFF_AUTO_CANDIDATES: &[&str] = &[
+    "/sbin/init",
+    "/lib/systemd/systemd",
+    "/usr/lib/systemd/systemd",
+];
+#[cfg(target_os = "linux")]
+const AGENT_RUN_BINARY: &str = "/run/agent/silo-agent";
+#[cfg(target_os = "linux")]
+const DEFAULT_AGENT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,10 +93,31 @@ enum SshdRuntimeDirDisposition {
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> eyre::Result<()> {
+#[derive(Debug, Default)]
+struct AgentArgs {
+    init: bool,
+    handoff: Option<OsString>,
+}
+
+#[cfg(target_os = "linux")]
+fn main() -> eyre::Result<()> {
     let is_pid1 = std::process::id() == 1;
 
+    init_tracing();
+
+    let agent_args = parse_agent_args()?;
+    prepare_agent_process(&agent_args, is_pid1)?;
+    ensure_default_path();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build Tokio runtime")?;
+    runtime.block_on(run_agent())
+}
+
+#[cfg(target_os = "linux")]
+fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
@@ -86,16 +127,22 @@ async fn main() -> eyre::Result<()> {
         .with_level(true)
         .with_writer(std::io::stdout)
         .try_init();
+}
 
-    // TODO: support direct PID 1 initialization in the future. For now the
-    // agent expects silo-init to hand it off to systemd.
-    if is_pid1 {
+#[cfg(target_os = "linux")]
+fn prepare_agent_process(agent_args: &AgentArgs, is_pid1: bool) -> eyre::Result<()> {
+    if agent_args.init {
+        tracing::info!(handoff = ?agent_args.handoff, "agent init mode requested");
+        maybe_handoff_init(agent_args)?;
+    } else if is_pid1 {
         tracing::info!("running as PID 1 without init mode enabled yet");
     }
+    Ok(())
+}
 
+#[cfg(target_os = "linux")]
+async fn run_agent() -> eyre::Result<()> {
     tracing::info!("agent starting");
-
-    reject_unexpected_args()?;
 
     let control_port = from_kernel_cmdline();
     let mut control = GuestControlClient::connect(control_port).await?;
@@ -178,6 +225,140 @@ async fn main() -> eyre::Result<()> {
     while join_set.join_next().await.is_some() {}
 
     result
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_handoff_init(agent_args: &AgentArgs) -> eyre::Result<()> {
+    let Some(handoff) = agent_args.handoff.as_deref() else {
+        tracing::warn!("agent init mode requested without a handoff target");
+        return Ok(());
+    };
+
+    let Some(target) = resolve_handoff_target(handoff)? else {
+        tracing::info!(
+            handoff = ?handoff,
+            "no executable handoff init found; staying in agent PID1 mode"
+        );
+        return Ok(());
+    };
+
+    fork_handoff_init(&target)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_handoff_target(handoff: &OsStr) -> eyre::Result<Option<PathBuf>> {
+    if handoff == OsStr::new(HANDOFF_AUTO) {
+        for candidate in HANDOFF_AUTO_CANDIDATES {
+            let path = Path::new(candidate);
+            if init_candidate_is_executable_file(path)? {
+                return Ok(Some(path.to_path_buf()));
+            }
+        }
+        return Ok(None);
+    }
+
+    if handoff.is_empty() {
+        return Ok(None);
+    }
+
+    let path = PathBuf::from(handoff);
+    if init_candidate_is_executable_file(&path)? {
+        Ok(Some(path))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn init_candidate_is_executable_file(path: &Path) -> eyre::Result<bool> {
+    if is_agent_binary(path) {
+        return Ok(false);
+    }
+
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let mode = metadata.permissions().mode();
+            Ok(metadata.file_type().is_file() && mode & 0o111 != 0)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("stat handoff init {}", path.display())),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_agent_binary(path: &Path) -> bool {
+    let agent = Path::new(AGENT_RUN_BINARY);
+    if path == agent {
+        return true;
+    }
+
+    match (fs::canonicalize(path), fs::canonicalize(agent)) {
+        (Ok(path), Ok(agent)) => path == agent,
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fork_handoff_init(target: &Path) -> eyre::Result<()> {
+    let init = CString::new(target.as_os_str().as_bytes())
+        .with_context(|| format!("prepare handoff init path {}", target.display()))?;
+
+    // Fork before constructing the Tokio runtime so the child does not inherit
+    // async runtime internals. PID 1 becomes the guest init; the child remains
+    // the Silo agent.
+    match unsafe { fork() }.context("fork init handoff")? {
+        ForkResult::Parent { .. } => exec_handoff_parent(&init, target),
+        ForkResult::Child => {
+            if let Err(err) = setsid() {
+                tracing::warn!(error = %err, "failed to isolate agent child session");
+            }
+            tracing::info!(init = %target.display(), "continuing as agent after init handoff");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn exec_handoff_parent(init: &std::ffi::CStr, target: &Path) -> eyre::Result<()> {
+    reset_handoff_exec_state();
+    if let Err(err) = std::env::set_current_dir("/") {
+        tracing::error!(error = %err, "failed to chdir before init handoff exec");
+        std::process::exit(127);
+    }
+
+    let argv = [init];
+    match execv(init, &argv) {
+        Ok(_) => unreachable!("execv returned after replacing the process"),
+        Err(err) => {
+            tracing::error!(init = %target.display(), error = %err, "failed to exec handoff init");
+            std::process::exit(127);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reset_handoff_exec_state() {
+    for signal in [
+        Signal::SIGHUP,
+        Signal::SIGINT,
+        Signal::SIGQUIT,
+        Signal::SIGTERM,
+        Signal::SIGCHLD,
+    ] {
+        let _ = unsafe { signal::signal(signal, SigHandler::SigDfl) };
+    }
+
+    let empty = SigSet::empty();
+    let _ = signal::sigprocmask(SigmaskHow::SIG_SETMASK, Some(&empty), None);
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_default_path() {
+    if std::env::var_os("PATH").is_some_and(|path| !path.is_empty()) {
+        return;
+    }
+
+    std::env::set_var("PATH", DEFAULT_AGENT_PATH);
 }
 
 #[cfg(target_os = "linux")]
@@ -330,21 +511,108 @@ async fn log_sshd_stderr(stderr: ChildStderr) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn reject_unexpected_args() -> eyre::Result<()> {
+fn parse_agent_args() -> eyre::Result<AgentArgs> {
+    let mut parsed = AgentArgs::default();
     let mut args = std::env::args_os();
     let _program = args.next();
-    if let Some(arg) = args.next() {
+
+    for arg in args {
+        if arg.as_os_str() == OsStr::new("--init") {
+            parsed.init = true;
+            continue;
+        }
+        if let Some(handoff) = parse_handoff_arg(arg.as_os_str()) {
+            parsed.handoff = Some(handoff);
+            continue;
+        }
         eyre::bail!("unknown argument {:?}", arg);
     }
-    Ok(())
+
+    Ok(parsed)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_handoff_arg(arg: &OsStr) -> Option<OsString> {
+    const PREFIX: &[u8] = b"--handoff=";
+
+    let bytes = arg.as_bytes();
+    bytes
+        .strip_prefix(PREFIX)
+        .map(|value| OsString::from_vec(value.to_vec()))
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::{
-        assess_sshd_runtime_dir, SshdRuntimeDirDisposition, SshdRuntimeDirKind,
+        assess_sshd_runtime_dir, init_candidate_is_executable_file, parse_handoff_arg,
+        SshdRuntimeDirDisposition, SshdRuntimeDirKind, HANDOFF_AUTO_CANDIDATES,
         SSHD_RUNTIME_DIR_MODE,
     };
+
+    static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn parses_handoff_equals_argument() {
+        let value = parse_handoff_arg(OsStr::new("--handoff=/sbin/init"));
+
+        assert_eq!(value.as_deref(), Some(OsStr::new("/sbin/init")));
+    }
+
+    #[test]
+    fn rejects_split_handoff_argument() {
+        assert!(parse_handoff_arg(OsStr::new("--handoff")).is_none());
+    }
+
+    #[test]
+    fn auto_handoff_candidates_do_not_include_init() {
+        assert_eq!(
+            HANDOFF_AUTO_CANDIDATES,
+            [
+                "/sbin/init",
+                "/lib/systemd/systemd",
+                "/usr/lib/systemd/systemd"
+            ]
+        );
+    }
+
+    #[test]
+    fn init_candidate_requires_executable_regular_file() {
+        let dir = temp_dir("handoff-candidate");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let file = dir.join("init");
+        fs::write(&file, b"").expect("write candidate");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644))
+            .expect("set candidate permissions");
+        assert!(!init_candidate_is_executable_file(&file).expect("stat candidate"));
+
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755))
+            .expect("set candidate permissions");
+        assert!(init_candidate_is_executable_file(&file).expect("stat candidate"));
+
+        let directory = dir.join("directory");
+        fs::create_dir(&directory).expect("create candidate directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
+            .expect("set directory permissions");
+        assert!(!init_candidate_is_executable_file(&directory).expect("stat directory"));
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let sequence = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "silo-agent-{name}-{}-{sequence}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn accepts_root_owned_0755_directory() {
