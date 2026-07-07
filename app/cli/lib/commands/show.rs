@@ -60,6 +60,35 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
     if let Some(summary) = &view.summary {
         rows.push(("Summary".to_string(), summary.clone()));
     }
+    if let Some(boot) = &view.guest.boot {
+        rows.push(("Boot".to_string(), boot_summary(boot)));
+    }
+    if let Some(provision) = &view.guest.provision {
+        rows.push(("Provision".to_string(), provision_summary(provision)));
+    }
 
     ui::print_detail_rows(&rows)
+}
+
+fn boot_summary(boot: &crate::view::MachineGuestBootReportView) -> String {
+    let mut summary = boot.mode.clone();
+    if let Some(init) = &boot.handoff_init_path {
+        summary.push_str(" -> ");
+        summary.push_str(init);
+    } else if let Some(requested) = &boot.requested_init {
+        summary.push_str(" requested=");
+        summary.push_str(requested);
+    }
+    summary.push_str(&format!(" pid={}", boot.agent_pid));
+    if boot.agent_is_pid1 {
+        summary.push_str(" pid1");
+    }
+    summary
+}
+
+fn provision_summary(provision: &crate::view::MachineGuestProvisionReportView) -> String {
+    format!(
+        "{} ({} steps, {} failed, {}ms)",
+        provision.status, provision.step_count, provision.failed_step_count, provision.duration_ms
+    )
 }

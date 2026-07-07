@@ -5,7 +5,9 @@ use std::path::Path;
 use agent_spec::AgentRosettaConfig;
 use eyre::Context;
 
-use crate::provision::{command_exists, command_status, run_command, ProvisionContext};
+use crate::provision::{
+    command_exists, command_status, run_command, ProvisionContext, ProvisionOutcome,
+};
 
 const BINFMT_MISC_PATH: &str = "/proc/sys/fs/binfmt_misc";
 const ROSETTA_ENTRY_PATH: &str = "/proc/sys/fs/binfmt_misc/rosetta";
@@ -26,9 +28,12 @@ const ROSETTA_REGISTRATION_PREFIX: &[u8] = br":rosetta:M::\x7fELF\x02\x01\x01\x0
 //   binfmt entry is unregistered.
 const ROSETTA_REGISTRATION_SUFFIX: &[u8] = b":OCF";
 
-pub(crate) fn apply(context: &ProvisionContext, config: &AgentRosettaConfig) -> eyre::Result<()> {
+pub(crate) fn apply(
+    context: &ProvisionContext,
+    config: &AgentRosettaConfig,
+) -> eyre::Result<ProvisionOutcome> {
     if !config.enabled {
-        return Ok(());
+        return Ok(ProvisionOutcome::skipped("Rosetta disabled"));
     }
 
     let mount_path = context.guest_path(&config.mount_path);
@@ -59,24 +64,25 @@ pub(crate) fn apply(context: &ProvisionContext, config: &AgentRosettaConfig) -> 
         "reconciled Rosetta binfmt handler"
     );
 
-    Ok(())
+    Ok(ProvisionOutcome::succeeded(true))
 }
 
 fn mount_if_needed<const N: usize>(
     context: &ProvisionContext,
     target: &Path,
     args: [&str; N],
-) -> eyre::Result<()> {
+) -> eyre::Result<bool> {
     if is_mounted(context, target) {
         tracing::debug!(path = %target.display(), "mount target already mounted");
-        return Ok(());
+        return Ok(false);
     }
 
     let target = target.to_string_lossy().to_string();
     let mut command_args = Vec::with_capacity(N + 1);
     command_args.extend(args);
     command_args.push(target.as_str());
-    run_command(context.process_supervisor(), "mount", command_args)
+    run_command(context.process_supervisor(), "mount", command_args)?;
+    Ok(true)
 }
 
 fn is_mounted(context: &ProvisionContext, path: &Path) -> bool {

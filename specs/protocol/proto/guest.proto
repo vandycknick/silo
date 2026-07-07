@@ -16,6 +16,8 @@ service MetadataService {
 message RegisterGuestRequest {
   string guest_service_version = 1;
   SystemInfo system_info = 2;
+  GuestBootReport boot_report = 3;
+  ProvisionReport provision_report = 4;
 }
 
 message RegisterGuestResponse {

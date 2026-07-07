@@ -8,14 +8,15 @@ use std::path::{Path, PathBuf};
 use eyre::Context;
 use nix::sys::signal::{self, SigHandler, SigSet, SigmaskHow, Signal};
 use nix::unistd::{execv, fork, setsid, ForkResult};
+use protocol::v1::{GuestBootMode, GuestBootReport};
 
 const HANDOFF_AUTO: &str = "auto";
-const HANDOFF_AUTO_CANDIDATES: &[&str] = &[
+pub(crate) const HANDOFF_AUTO_CANDIDATES: &[&str] = &[
     "/sbin/init",
     "/lib/systemd/systemd",
     "/usr/lib/systemd/systemd",
 ];
-const AGENT_RUN_BINARY: &str = "/run/agent/silo-agent";
+pub(crate) const AGENT_RUN_BINARY: &str = "/run/agent/silo-agent";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BootMode {
@@ -27,6 +28,72 @@ pub(crate) enum BootMode {
         requested_init: OsString,
         init_path: PathBuf,
     },
+}
+
+impl BootMode {
+    pub(crate) fn report(&self) -> GuestBootReport {
+        let agent_pid = std::process::id();
+        match self {
+            Self::Standard => GuestBootReport {
+                mode: GuestBootMode::Standard as i32,
+                requested_init: String::new(),
+                handoff_init_path: String::new(),
+                probed_init_paths: Vec::new(),
+                agent_path: current_agent_path(),
+                agent_pid,
+                agent_is_pid1: agent_pid == 1,
+                message: String::from("agent started in standard mode"),
+            },
+            Self::AgentPid1 { requested_init } => GuestBootReport {
+                mode: GuestBootMode::AgentPid1 as i32,
+                requested_init: os_to_string(requested_init),
+                handoff_init_path: String::new(),
+                probed_init_paths: probed_init_paths(requested_init),
+                agent_path: current_agent_path(),
+                agent_pid,
+                agent_is_pid1: agent_pid == 1,
+                message: String::from("no executable init found; agent remains PID 1"),
+            },
+            Self::InitChild {
+                requested_init,
+                init_path,
+            } => GuestBootReport {
+                mode: GuestBootMode::InitChild as i32,
+                requested_init: os_to_string(requested_init),
+                handoff_init_path: init_path.display().to_string(),
+                probed_init_paths: probed_init_paths(requested_init),
+                agent_path: current_agent_path(),
+                agent_pid,
+                agent_is_pid1: agent_pid == 1,
+                message: String::from("agent handed PID 1 to guest init"),
+            },
+        }
+    }
+}
+
+fn current_agent_path() -> String {
+    std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| String::from(AGENT_RUN_BINARY))
+}
+
+fn probed_init_paths(requested_init: &OsStr) -> Vec<String> {
+    if requested_init == OsStr::new(HANDOFF_AUTO) {
+        return HANDOFF_AUTO_CANDIDATES
+            .iter()
+            .map(|candidate| (*candidate).to_string())
+            .collect();
+    }
+
+    if requested_init.is_empty() {
+        Vec::new()
+    } else {
+        vec![os_to_string(requested_init)]
+    }
+}
+
+fn os_to_string(value: &OsStr) -> String {
+    value.to_string_lossy().into_owned()
 }
 
 pub(crate) fn maybe_handoff_init(requested_init: &OsStr) -> eyre::Result<BootMode> {
@@ -161,6 +228,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use nix::sys::signal::Signal;
+    use protocol::v1::GuestBootMode;
 
     use crate::handoff::{
         init_candidate_is_executable_file, resolve_handoff_target_with_candidates,
@@ -179,6 +247,26 @@ mod tests {
                 "/usr/lib/systemd/systemd"
             ]
         );
+    }
+
+    #[test]
+    fn agent_pid1_boot_report_includes_auto_probe_paths() {
+        let report = crate::handoff::BootMode::AgentPid1 {
+            requested_init: OsStr::new(HANDOFF_AUTO).to_os_string(),
+        }
+        .report();
+
+        assert_eq!(report.mode, GuestBootMode::AgentPid1 as i32);
+        assert_eq!(report.requested_init, HANDOFF_AUTO);
+        assert_eq!(
+            report.probed_init_paths,
+            HANDOFF_AUTO_CANDIDATES
+                .iter()
+                .map(|candidate| (*candidate).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(!report.probed_init_paths.iter().any(|path| path == "/init"));
+        assert!(report.agent_pid > 0);
     }
 
     #[test]

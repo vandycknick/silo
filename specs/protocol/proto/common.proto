@@ -17,3 +17,63 @@ message SystemInfo {
   uint64 uptime = 10;
   repeated string ip_addresses = 11;
 }
+
+enum GuestBootMode {
+  GUEST_BOOT_MODE_UNSPECIFIED = 0;
+  GUEST_BOOT_MODE_STANDARD = 1;
+  GUEST_BOOT_MODE_AGENT_PID1 = 2;
+  GUEST_BOOT_MODE_INIT_CHILD = 3;
+}
+
+message GuestBootReport {
+  GuestBootMode mode = 1;
+  string requested_init = 2;
+  string handoff_init_path = 3;
+  repeated string probed_init_paths = 4;
+  string agent_path = 5;
+  uint32 agent_pid = 6;
+  bool agent_is_pid1 = 7;
+  string message = 8;
+}
+
+enum ProvisionOverallStatus {
+  PROVISION_OVERALL_STATUS_UNSPECIFIED = 0;
+  PROVISION_OVERALL_STATUS_SUCCEEDED = 1;
+  PROVISION_OVERALL_STATUS_DEGRADED = 2;
+  PROVISION_OVERALL_STATUS_SKIPPED = 3;
+  PROVISION_OVERALL_STATUS_FAILED_BOOT = 4;
+}
+
+enum ProvisionStepStatus {
+  PROVISION_STEP_STATUS_UNSPECIFIED = 0;
+  PROVISION_STEP_STATUS_SUCCEEDED = 1;
+  PROVISION_STEP_STATUS_FAILED = 2;
+  PROVISION_STEP_STATUS_SKIPPED = 3;
+  PROVISION_STEP_STATUS_UNSUPPORTED = 4;
+}
+
+enum ProvisionFailurePolicy {
+  PROVISION_FAILURE_POLICY_UNSPECIFIED = 0;
+  PROVISION_FAILURE_POLICY_BEST_EFFORT = 1;
+  PROVISION_FAILURE_POLICY_FAIL_BOOT = 2;
+}
+
+message ProvisionReport {
+  ProvisionOverallStatus status = 1;
+  int64 started_unix_ms = 2;
+  int64 finished_unix_ms = 3;
+  uint64 duration_ms = 4;
+  repeated ProvisionStepReport steps = 5;
+  string message = 6;
+}
+
+message ProvisionStepReport {
+  string id = 1;
+  ProvisionStepStatus status = 2;
+  ProvisionFailurePolicy failure_policy = 3;
+  bool changed = 4;
+  string backend = 5;
+  uint64 duration_ms = 6;
+  string message = 7;
+  string error_chain = 8;
+}

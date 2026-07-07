@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use libvm::{MachineData, MachineNetworkConfig, MachineStatus};
+use libvm::{
+    MachineBootReport, MachineData, MachineNetworkConfig, MachineProvisionReport, MachineStatus,
+};
 use serde::Serialize;
 use vm_spec::VmSpec;
 
@@ -42,12 +44,33 @@ pub struct MachineGuestView {
     pub status: String,
     pub ready: bool,
     pub settings: MachineGuestSettingsView,
+    pub boot: Option<MachineGuestBootReportView>,
+    pub provision: Option<MachineGuestProvisionReportView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MachineGuestSettingsView {
     pub bootstrap: bool,
     pub initramfs_present: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MachineGuestBootReportView {
+    pub mode: String,
+    pub requested_init: Option<String>,
+    pub handoff_init_path: Option<String>,
+    pub agent_pid: u32,
+    pub agent_is_pid1: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MachineGuestProvisionReportView {
+    pub status: String,
+    pub step_count: usize,
+    pub failed_step_count: usize,
+    pub duration_ms: u64,
+    pub message: Option<String>,
 }
 
 impl MachineView {
@@ -74,6 +97,14 @@ impl MachineView {
                 status: data.status.label().to_string(),
                 ready: data.status.guest_ready(),
                 settings: guest_settings(&data.spec, &data.machine_dir),
+                boot: data
+                    .boot_report
+                    .as_ref()
+                    .map(MachineGuestBootReportView::new),
+                provision: data
+                    .provision_report
+                    .as_ref()
+                    .map(MachineGuestProvisionReportView::new),
             },
             ready: data.status.ready(),
             summary: data.status.message().map(str::to_string),
@@ -81,6 +112,31 @@ impl MachineView {
             metadata: data.metadata.clone(),
             dir: data.machine_dir.clone(),
             spec: data.spec.clone(),
+        }
+    }
+}
+
+impl MachineGuestBootReportView {
+    fn new(report: &MachineBootReport) -> Self {
+        Self {
+            mode: report.mode.label().to_string(),
+            requested_init: report.requested_init.clone(),
+            handoff_init_path: report.handoff_init_path.clone(),
+            agent_pid: report.agent_pid,
+            agent_is_pid1: report.agent_is_pid1,
+            message: report.message.clone(),
+        }
+    }
+}
+
+impl MachineGuestProvisionReportView {
+    fn new(report: &MachineProvisionReport) -> Self {
+        Self {
+            status: report.status.label().to_string(),
+            step_count: report.steps.len(),
+            failed_step_count: report.failed_step_count(),
+            duration_ms: report.duration_ms,
+            message: report.message.clone(),
         }
     }
 }

@@ -16,7 +16,11 @@ mod update;
 
 pub use builder::MachineBuilder;
 pub use handle::Machine;
-pub use inspect::{MachineData, MachineStatus};
+pub use inspect::{
+    MachineBootMode, MachineBootReport, MachineData, MachineProvisionFailurePolicy,
+    MachineProvisionReport, MachineProvisionStatus, MachineProvisionStepReport,
+    MachineProvisionStepStatus, MachineStatus,
+};
 pub use lifecycle_options::{
     MachineExit, MachineExitOutcome, MachineKillOptions, MachineStopOptions, MachineWaitOptions,
     DEFAULT_MACHINE_WAIT_TIMEOUT,

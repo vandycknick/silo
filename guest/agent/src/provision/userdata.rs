@@ -5,7 +5,7 @@ use agent_spec::{UserdataConfig, UserdataContentType, UserdataRunPolicy};
 use eyre::Context;
 use sha2::{Digest, Sha256};
 
-use crate::provision::{run_command, write_file, ProvisionContext};
+use crate::provision::{run_command, write_file, ProvisionContext, ProvisionOutcome};
 
 const USERDATA_SCRIPT_PATH: &str = "/var/lib/silo-agent/userdata.sh";
 const USERDATA_HASH_PATH: &str = "/var/lib/silo-agent/userdata.sha256";
@@ -13,19 +13,19 @@ const USERDATA_HASH_PATH: &str = "/var/lib/silo-agent/userdata.sha256";
 pub(crate) fn apply(
     context: &ProvisionContext,
     userdata: Option<&UserdataConfig>,
-) -> eyre::Result<()> {
+) -> eyre::Result<ProvisionOutcome> {
     let Some(userdata) = userdata else {
-        return Ok(());
+        return Ok(ProvisionOutcome::skipped("no userdata configured"));
     };
     if userdata.content.trim().is_empty() {
-        return Ok(());
+        return Ok(ProvisionOutcome::skipped("userdata content is empty"));
     }
 
     if userdata.content_type != UserdataContentType::ShellScript {
-        return Err(eyre::eyre!(
+        return Ok(ProvisionOutcome::unsupported(format!(
             "agent provisioning only supports shell-script userdata for now, got {:?}",
             userdata.content_type
-        ));
+        )));
     }
 
     let hash = userdata_hash(userdata);
@@ -34,7 +34,9 @@ pub(crate) fn apply(
         && applied_hash(&hash_path)?.as_deref() == Some(&hash)
     {
         tracing::info!(hash = %hash, "userdata already applied for content hash");
-        return Ok(());
+        return Ok(ProvisionOutcome::skipped(
+            "userdata already applied for content hash",
+        ));
     }
 
     let path = context.guest_path(USERDATA_SCRIPT_PATH);
@@ -43,7 +45,7 @@ pub(crate) fn apply(
     run_command(context.process_supervisor(), "/bin/sh", [script.as_str()])?;
     write_file(&hash_path, format!("{hash}\n"), 0o644)?;
     tracing::info!(path = %path.display(), hash = %hash, run = ?userdata.run, "reconciled userdata script");
-    Ok(())
+    Ok(ProvisionOutcome::succeeded(true))
 }
 
 fn applied_hash(path: &std::path::Path) -> eyre::Result<Option<String>> {

@@ -3,14 +3,17 @@ use std::os::unix::fs::symlink;
 
 use eyre::Context;
 
-use crate::provision::{write_file, ProvisionContext};
+use crate::provision::{write_file, ProvisionContext, ProvisionOutcome};
 
-pub(crate) fn apply(context: &ProvisionContext, timezone: Option<&str>) -> eyre::Result<()> {
+pub(crate) fn apply(
+    context: &ProvisionContext,
+    timezone: Option<&str>,
+) -> eyre::Result<ProvisionOutcome> {
     let Some(timezone) = timezone
         .map(str::trim)
         .filter(|timezone| !timezone.is_empty())
     else {
-        return Ok(());
+        return Ok(ProvisionOutcome::skipped("no timezone configured"));
     };
 
     write_file(
@@ -32,5 +35,5 @@ pub(crate) fn apply(context: &ProvisionContext, timezone: Option<&str>) -> eyre:
     }
 
     tracing::info!(timezone, "reconciled timezone");
-    Ok(())
+    Ok(ProvisionOutcome::succeeded(false))
 }

@@ -6,10 +6,17 @@ use eyre::{eyre, Context};
 
 use crate::provision::{
     command_exists, format_error_chain, run_command, sanitize_unit_name, write_file,
-    ProvisionContext,
+    ProvisionContext, ProvisionOutcome,
 };
 
-pub(crate) fn apply(context: &ProvisionContext, users: &[UserConfig]) -> eyre::Result<()> {
+pub(crate) fn apply(
+    context: &ProvisionContext,
+    users: &[UserConfig],
+) -> eyre::Result<ProvisionOutcome> {
+    if users.is_empty() {
+        return Ok(ProvisionOutcome::skipped("no users configured"));
+    }
+
     let mut failures = Vec::new();
 
     for user in users {
@@ -21,7 +28,7 @@ pub(crate) fn apply(context: &ProvisionContext, users: &[UserConfig]) -> eyre::R
     }
 
     if failures.is_empty() {
-        Ok(())
+        Ok(ProvisionOutcome::succeeded(false))
     } else {
         Err(eyre!(
             "failed to provision {} user(s): {}",
@@ -248,6 +255,9 @@ mod tests {
         let context = ProvisionContext {
             root: root.clone(),
             process_supervisor: crate::pid1::ProcessSupervisor::default(),
+            service_manager: crate::provision::ServiceManagerState::detect(
+                &crate::handoff::BootMode::Standard,
+            ),
         };
         let entry = super::read_user_entry(&context, "silo")
             .expect("read user")

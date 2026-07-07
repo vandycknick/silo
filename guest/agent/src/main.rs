@@ -17,6 +17,7 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
+use std::time::{Duration, Instant};
 
 use agent_spec::{AgentConfig, SSH_VSOCK_PORT};
 use clap::Parser;
@@ -24,6 +25,7 @@ use eyre::Context;
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::mount::{mount, MsFlags};
+use protocol::v1::ProvisionOverallStatus;
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 use tokio::process::{ChildStderr as TokioChildStderr, Command as TokioCommand};
 use tokio_vsock::VsockStream;
@@ -38,6 +40,9 @@ use crate::server::VsockServer;
 
 const SSHD_RUNTIME_DIR: &str = "/run/sshd";
 const SSHD_RUNTIME_DIR_MODE: u32 = 0o755;
+const OPENSSH_SERVER_PATH: &str = "/usr/sbin/sshd";
+const OPENSSH_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const OPENSSH_READY_POLL: Duration = Duration::from_millis(250);
 const UNIX_MODE_BITS: u32 = 0o7777;
 const GROUP_OR_WORLD_WRITABLE: u32 = 0o022;
 const DEFAULT_AGENT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -171,13 +176,26 @@ async fn run_agent(
     let agent_config: AgentConfig =
         serde_json::from_value(metadata_json).context("parse metadata config returned by vmmon")?;
 
-    run_provisioning(&agent_config.provision, &process_supervisor)?;
+    let boot_report = boot_mode.report();
+    let provision_report =
+        run_provisioning(&agent_config.provision, &process_supervisor, boot_mode)?;
+
+    if provision_report.status == ProvisionOverallStatus::FailedBoot as i32 {
+        control
+            .register(boot_report, provision_report)
+            .await
+            .context("register fatal guest provisioning report")?;
+        if process_supervisor.is_active() {
+            return process_supervisor.shutdown().await;
+        }
+        eyre::bail!("guest provisioning requested boot failure");
+    }
 
     let mut running_servers = Vec::new();
     let mut server_abort_handles = Vec::new();
 
     let ssh_process_supervisor = process_supervisor.clone();
-    match VsockServer::create(move |stream| {
+    let owns_ssh_listener = match VsockServer::create(move |stream| {
         let process_supervisor = ssh_process_supervisor.clone();
         async move { handle_ssh_connection(process_supervisor, stream).await }
     })
@@ -186,24 +204,32 @@ async fn run_agent(
     .listen(SSH_VSOCK_PORT)
     {
         Ok(shell_server) => {
-            ensure_sshd_runtime_dir().context("prepare OpenSSH runtime directory")?;
             tracing::info!(port = SSH_VSOCK_PORT, "listening for SSH vsock connections");
             if let Some(abort_handle) = shell_server.abort_handle() {
                 server_abort_handles.push(abort_handle);
             }
             running_servers.push(shell_server);
+            true
         }
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
             tracing::info!(
                 port = SSH_VSOCK_PORT,
                 "SSH vsock port is already in use, leaving the existing listener active"
             );
+            false
         }
         Err(err) => {
             return Err(eyre::eyre!(
                 "listen for SSH vsock connections on port {SSH_VSOCK_PORT}: {err}"
             ));
         }
+    };
+
+    if owns_ssh_listener {
+        ensure_sshd_runtime_dir().context("prepare OpenSSH runtime directory")?;
+        wait_for_sshd_ready(&process_supervisor)
+            .await
+            .context("wait for OpenSSH server readiness")?;
     }
 
     if agent_config.forward.enabled {
@@ -227,7 +253,7 @@ async fn run_agent(
         running_servers.push(forward_server);
     }
 
-    control.register().await?;
+    control.register(boot_report, provision_report).await?;
 
     let mut join_set = tokio::task::JoinSet::new();
     for server in running_servers {
@@ -459,6 +485,70 @@ fn assess_sshd_runtime_dir(
     }
 }
 
+async fn wait_for_sshd_ready(process_supervisor: &ProcessSupervisor) -> eyre::Result<()> {
+    let metadata = fs::metadata(OPENSSH_SERVER_PATH)
+        .with_context(|| format!("stat OpenSSH server at {OPENSSH_SERVER_PATH}"))?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        eyre::bail!("{OPENSSH_SERVER_PATH} must be an executable regular file");
+    }
+
+    let started = Instant::now();
+
+    loop {
+        let process_supervisor = process_supervisor.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            process_supervisor.output(OPENSSH_SERVER_PATH, ["-t"])
+        })
+        .await
+        .context("join OpenSSH readiness check task")?;
+
+        match output {
+            Ok(output) if output.status.success() => {
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "OpenSSH server is ready"
+                );
+                return Ok(());
+            }
+            Ok(output) => {
+                let last_check = format!(
+                    "{}; stdout: {}; stderr: {}",
+                    output.status,
+                    command_stream_for_log(&output.stdout),
+                    command_stream_for_log(&output.stderr)
+                );
+                if started.elapsed() >= OPENSSH_READY_TIMEOUT {
+                    eyre::bail!(
+                        "OpenSSH server did not become ready within {:?}; last check: {last_check}",
+                        OPENSSH_READY_TIMEOUT
+                    );
+                }
+                tracing::debug!(last_check = %last_check, "waiting for OpenSSH server readiness");
+            }
+            Err(err) => {
+                let last_check = err.to_string();
+                if started.elapsed() >= OPENSSH_READY_TIMEOUT {
+                    eyre::bail!(
+                        "OpenSSH server did not become ready within {:?}; last check: {last_check}",
+                        OPENSSH_READY_TIMEOUT
+                    );
+                }
+                tracing::debug!(last_check = %last_check, "waiting for OpenSSH server readiness");
+            }
+        }
+        tokio::time::sleep(OPENSSH_READY_POLL).await;
+    }
+}
+
+fn command_stream_for_log(value: &[u8]) -> String {
+    let value = String::from_utf8_lossy(value).trim().to_string();
+    if value.is_empty() {
+        "<empty>".to_string()
+    } else {
+        value
+    }
+}
+
 async fn handle_ssh_connection(
     process_supervisor: ProcessSupervisor,
     stream: VsockStream,
@@ -480,7 +570,7 @@ async fn handle_ssh_connection_async(stream: VsockStream) -> io::Result<()> {
     let sshd_stdin = stream.as_fd().try_clone_to_owned()?;
     let sshd_stdout = stream.as_fd().try_clone_to_owned()?;
 
-    let mut child = TokioCommand::new("/usr/sbin/sshd")
+    let mut child = TokioCommand::new(OPENSSH_SERVER_PATH)
         .arg("-i")
         .stdin(Stdio::from(sshd_stdin))
         .stdout(Stdio::from(sshd_stdout))
@@ -515,7 +605,7 @@ fn handle_ssh_connection_blocking(
     let sshd_stdin = stream.as_fd().try_clone_to_owned()?;
     let sshd_stdout = stream.as_fd().try_clone_to_owned()?;
 
-    let mut command = StdCommand::new("/usr/sbin/sshd");
+    let mut command = StdCommand::new(OPENSSH_SERVER_PATH);
     command
         .arg("-i")
         .stdin(Stdio::from(sshd_stdin))

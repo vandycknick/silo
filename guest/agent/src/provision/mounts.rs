@@ -6,26 +6,38 @@ use eyre::{eyre, Context};
 
 use crate::provision::{
     command_exists, command_output, format_error_chain, run_command, ProvisionContext,
+    ProvisionOutcome,
 };
 
-pub(crate) fn apply(context: &ProvisionContext, mounts: &[MountConfig]) -> eyre::Result<()> {
+pub(crate) fn apply(
+    context: &ProvisionContext,
+    mounts: &[MountConfig],
+) -> eyre::Result<ProvisionOutcome> {
+    if mounts.is_empty() {
+        return Ok(ProvisionOutcome::skipped("no mounts configured"));
+    }
+
     let mut failures = Vec::new();
+    let mut changed = false;
 
     for mount in mounts {
-        if let Err(err) = apply_mount(context, mount) {
-            let error = format_error_chain(&err);
-            tracing::error!(
-                tag = %mount.tag,
-                path = %mount.path,
-                error = %error,
-                "failed to provision mount; continuing"
-            );
-            failures.push(format!("{} at {}: {error}", mount.tag, mount.path));
+        match apply_mount(context, mount) {
+            Ok(mount_changed) => changed |= mount_changed,
+            Err(err) => {
+                let error = format_error_chain(&err);
+                tracing::error!(
+                    tag = %mount.tag,
+                    path = %mount.path,
+                    error = %error,
+                    "failed to provision mount; continuing"
+                );
+                failures.push(format!("{} at {}: {error}", mount.tag, mount.path));
+            }
         }
     }
 
     if failures.is_empty() {
-        Ok(())
+        Ok(ProvisionOutcome::succeeded(changed))
     } else {
         Err(eyre!(
             "failed to provision {} mount(s): {}",
@@ -35,13 +47,13 @@ pub(crate) fn apply(context: &ProvisionContext, mounts: &[MountConfig]) -> eyre:
     }
 }
 
-fn apply_mount(context: &ProvisionContext, mount: &MountConfig) -> eyre::Result<()> {
+fn apply_mount(context: &ProvisionContext, mount: &MountConfig) -> eyre::Result<bool> {
     let target = context.guest_path(&mount.path);
     fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
     if let Some(current) = current_mount(context, &target)? {
         if current.matches(mount) {
             tracing::debug!(path = %mount.path, tag = %mount.tag, "mount already reconciled");
-            return Ok(());
+            return Ok(false);
         }
 
         tracing::info!(
@@ -77,7 +89,7 @@ fn apply_mount(context: &ProvisionContext, mount: &MountConfig) -> eyre::Result<
     )?;
     tracing::info!(tag = %mount.tag, path = %mount.path, "reconciled mount");
 
-    Ok(())
+    Ok(true)
 }
 
 #[derive(Debug, PartialEq, Eq)]

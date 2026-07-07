@@ -1,35 +1,32 @@
 use agent_spec::ResizeRootfsConfig;
 use eyre::{eyre, Context};
 
-use crate::pid1::ProcessSupervisor;
-use crate::provision::{command_exists, command_output, run_command};
+use crate::provision::{
+    command_exists, command_output, run_command, ProvisionContext, ProvisionOutcome,
+};
 
 const ROOT_MOUNTPOINT: &str = "/";
 
 pub(crate) fn apply(
+    context: &ProvisionContext,
     config: &ResizeRootfsConfig,
-    process_supervisor: &ProcessSupervisor,
-) -> eyre::Result<()> {
+) -> eyre::Result<ProvisionOutcome> {
     if !config.enabled {
-        return Ok(());
+        return Ok(ProvisionOutcome::skipped("root filesystem resize disabled"));
     }
 
-    let source = findmnt(process_supervisor, "SOURCE", ROOT_MOUNTPOINT)?;
-    let fstype = findmnt(process_supervisor, "FSTYPE", ROOT_MOUNTPOINT)?;
+    let source = findmnt(context, "SOURCE", ROOT_MOUNTPOINT)?;
+    let fstype = findmnt(context, "FSTYPE", ROOT_MOUNTPOINT)?;
     tracing::info!(source = %source, fstype = %fstype, "resizing root filesystem");
-    resize_filesystem(process_supervisor, &source, &fstype)?;
+    let outcome = resize_filesystem(context, &source, &fstype)?;
     tracing::info!(source = %source, fstype = %fstype, "reconciled root filesystem size");
 
-    Ok(())
+    Ok(outcome)
 }
 
-fn findmnt(
-    process_supervisor: &ProcessSupervisor,
-    field: &str,
-    target: &str,
-) -> eyre::Result<String> {
+fn findmnt(context: &ProvisionContext, field: &str, target: &str) -> eyre::Result<String> {
     let output = command_output(
-        process_supervisor,
+        context.process_supervisor(),
         "findmnt",
         ["-n", "-o", field, "--target", target],
     )?;
@@ -41,20 +38,23 @@ fn findmnt(
 }
 
 fn resize_filesystem(
-    process_supervisor: &ProcessSupervisor,
+    context: &ProvisionContext,
     source: &str,
     fstype: &str,
-) -> eyre::Result<()> {
-    match resize_plan(source, fstype) {
+) -> eyre::Result<ProvisionOutcome> {
+    let result: eyre::Result<ProvisionOutcome> = match resize_plan(source, fstype) {
         Some(plan) => {
-            ensure_resize_command(plan.program, fstype)?;
-            run_command(process_supervisor, plan.program, plan.args)
+            if let Some(message) = resize_command_unsupported(plan.program, fstype) {
+                return Ok(ProvisionOutcome::unsupported(message));
+            }
+            run_command(context.process_supervisor(), plan.program, plan.args)?;
+            Ok(ProvisionOutcome::succeeded(false))
         }
-        None => Err(eyre!(
+        None => Ok(ProvisionOutcome::unsupported(format!(
             "unsupported filesystem {fstype:?} for root filesystem resize on {source}"
-        )),
-    }
-    .with_context(|| format!("resize root filesystem {fstype} on {source}"))
+        ))),
+    };
+    result.with_context(|| format!("resize root filesystem {fstype} on {source}"))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -77,22 +77,20 @@ fn resize_plan<'a>(source: &'a str, fstype: &str) -> Option<ResizePlan<'a>> {
     }
 }
 
-fn ensure_resize_command(program: &str, fstype: &str) -> eyre::Result<()> {
+fn resize_command_unsupported(program: &str, fstype: &str) -> Option<String> {
     if command_exists(program) {
-        return Ok(());
+        return None;
     }
 
-    match program {
-        "btrfs" => Err(eyre!(
+    Some(match program {
+        "btrfs" => format!(
             "root filesystem is {fstype} but btrfs-progs is not installed or btrfs is not in PATH"
-        )),
-        "resize2fs" => Err(eyre!(
-            "root filesystem is {fstype} but resize2fs is not installed or not in PATH"
-        )),
-        _ => Err(eyre!(
-            "root filesystem is {fstype} but {program} is not installed or not in PATH"
-        )),
-    }
+        ),
+        "resize2fs" => {
+            format!("root filesystem is {fstype} but resize2fs is not installed or not in PATH")
+        }
+        _ => format!("root filesystem is {fstype} but {program} is not installed or not in PATH"),
+    })
 }
 
 #[cfg(test)]

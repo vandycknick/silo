@@ -11,7 +11,8 @@ use protocol::prost_types::Struct;
 use protocol::v1::guest_control_service_server::{GuestControlService, GuestControlServiceServer};
 use protocol::v1::metadata_service_server::{MetadataService, MetadataServiceServer};
 use protocol::v1::{
-    GetMetadataRequest, GetMetadataResponse, RegisterGuestRequest, RegisterGuestResponse,
+    GetMetadataRequest, GetMetadataResponse, ProvisionOverallStatus, RegisterGuestRequest,
+    RegisterGuestResponse,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
@@ -60,14 +61,45 @@ impl GuestControlService for GuestControlSvc {
             arch,
             "guest service registered"
         );
+        let provision_failed_boot = request
+            .provision_report
+            .as_ref()
+            .is_some_and(|report| report.status == ProvisionOverallStatus::FailedBoot as i32);
+        let provision_message = request
+            .provision_report
+            .as_ref()
+            .map(|report| report.message.clone())
+            .unwrap_or_default();
+
+        let action = match (
+            provision_failed_boot,
+            request.boot_report,
+            request.provision_report,
+        ) {
+            (true, Some(boot_report), Some(provision_report)) => Action::guest_error_with_reports(
+                provision_message.clone(),
+                boot_report,
+                provision_report,
+            ),
+            (false, Some(boot_report), Some(provision_report)) => {
+                Action::guest_running_with_reports(boot_report, provision_report)
+            }
+            (true, _, _) => Action::guest_error(provision_message.clone()),
+            (false, _, _) => Action::guest_running(),
+        };
+
         self.store
-            .dispatch(Action::guest_running())
+            .dispatch(action)
             .map_err(|err| Status::internal(err.to_string()))?;
         self.ready.store(true, Ordering::Release);
 
         Ok(Response::new(RegisterGuestResponse {
             accepted: true,
-            message: String::from("registered"),
+            message: if provision_failed_boot {
+                String::from("registered fatal provisioning report")
+            } else {
+                String::from("registered")
+            },
         }))
     }
 }

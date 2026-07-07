@@ -1026,20 +1026,42 @@ impl Runtime {
     ) -> Result<MachineData, LibVmError> {
         let runtime_status = self.reconcile_machine_runtime_best_effort(&config).await?;
         let state = self.machine_state(config.id).await?;
-        let status = if runtime_status.is_running() {
+        let (status, boot_report, provision_report) = if runtime_status.is_running() {
             match self.vmmon.client(config.id).inspect().await {
-                Ok(response) => MachineStatus::from_protocol(response),
-                Err(message) => {
-                    MachineStatus::running_with_message(format!("vmmon inspect failed: {message}"))
+                Ok(response) => {
+                    let boot_report = response
+                        .boot_report
+                        .clone()
+                        .map(crate::machine::MachineBootReport::from_protocol);
+                    let provision_report = response
+                        .provision_report
+                        .clone()
+                        .map(crate::machine::MachineProvisionReport::from_protocol);
+                    (
+                        MachineStatus::from_protocol(response),
+                        boot_report,
+                        provision_report,
+                    )
                 }
+                Err(message) => (
+                    MachineStatus::running_with_message(format!("vmmon inspect failed: {message}")),
+                    None,
+                    None,
+                ),
             }
         } else {
-            MachineStatus::from_machine_state(state.status, state.last_error.clone())
+            (
+                MachineStatus::from_machine_state(state.status, state.last_error.clone()),
+                None,
+                None,
+            )
         };
 
         Ok(MachineData::from_models_with_status(
             config,
             status,
+            boot_report,
+            provision_report,
             state.started_at,
             state.last_error,
             state.updated_at,

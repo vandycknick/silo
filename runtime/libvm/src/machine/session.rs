@@ -1,7 +1,7 @@
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use russh::client::Msg as ClientMsg;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
@@ -18,6 +18,8 @@ const DEFAULT_ATTACH_DETACH_KEY: u8 = 0x1d;
 const DEFAULT_LOGIN_SHELL_SCRIPT: &str = "exec \"${SHELL:-/bin/bash}\" -l || exec /bin/sh";
 const EXEC_EVENT_QUEUE_CAPACITY: usize = 64;
 const EXEC_STDIN_QUEUE_CAPACITY: usize = 64;
+const SSH_HANDSHAKE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const SSH_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Options for running a guest command.
 ///
@@ -812,14 +814,37 @@ impl Machine {
         let private_key = load_secret_key(&keypair.private_key_path, None).map_err(|error| {
             guest_session_error(reference, format!("load SSH private key: {error}"))
         })?;
-        let stream = self.open_shell_stream(true).await?;
-        let mut handle = russh::client::connect_stream(
-            Arc::new(russh::client::Config::default()),
-            stream,
-            SshClientHandler { agent_socket },
-        )
-        .await
-        .map_err(|error| ssh_error(reference, "client handshake", error))?;
+        let started = Instant::now();
+        let mut handle = loop {
+            let stream = self.open_shell_stream(true).await?;
+            match russh::client::connect_stream(
+                Arc::new(russh::client::Config::default()),
+                stream,
+                SshClientHandler {
+                    agent_socket: agent_socket.clone(),
+                },
+            )
+            .await
+            {
+                Ok(handle) => break handle,
+                Err(error) => {
+                    let message = error.to_string();
+                    if !is_transient_ssh_handshake_error(&message) {
+                        return Err(ssh_error(reference, "client handshake", error));
+                    }
+                    if started.elapsed() >= SSH_HANDSHAKE_READY_TIMEOUT {
+                        return Err(guest_session_error(
+                            reference,
+                            format!(
+                                "SSH endpoint did not become handshake-ready within {:?}; last error: {message}",
+                                SSH_HANDSHAKE_READY_TIMEOUT
+                            ),
+                        ));
+                    }
+                    tokio::time::sleep(SSH_HANDSHAKE_RETRY_DELAY).await;
+                }
+            }
+        };
         let hash_alg = handle
             .best_supported_rsa_hash()
             .await
@@ -1318,6 +1343,21 @@ fn ssh_error(reference: &str, context: &str, error: russh::Error) -> LibVmError 
     guest_session_error(reference, format!("SSH {context}: {error}"))
 }
 
+fn is_transient_ssh_handshake_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "disconnected",
+        "connection reset",
+        "unexpected eof",
+        "connection aborted",
+        "connection refused",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+        || message == "eof"
+        || message.ends_with(" eof")
+}
+
 fn guest_session_error(reference: &str, message: impl Into<String>) -> LibVmError {
     LibVmError::GuestSession {
         reference: reference.to_string(),
@@ -1389,8 +1429,9 @@ impl Drop for RawTerminalGuard {
 mod tests {
     use crate::machine::session::{
         attach_shell_command_line, attached_exit_status, command_line, detach_sequence,
-        input_contains_detach_sequence, resolve_agent_socket_from_env, AttachOptions,
-        AttachOptionsBuilder, ExecOptions, ExecOptionsBuilder, StdinMode,
+        input_contains_detach_sequence, is_transient_ssh_handshake_error,
+        resolve_agent_socket_from_env, AttachOptions, AttachOptionsBuilder, ExecOptions,
+        ExecOptionsBuilder, StdinMode,
     };
     use crate::LibVmError;
 
@@ -1425,6 +1466,19 @@ mod tests {
         let options = AttachOptionsBuilder::default().forward_agent(true).build();
 
         assert!(options.forward_agent);
+    }
+
+    #[test]
+    fn transient_ssh_handshake_errors_are_retried() {
+        assert!(is_transient_ssh_handshake_error("Disconnected"));
+        assert!(is_transient_ssh_handshake_error("connection reset by peer"));
+        assert!(is_transient_ssh_handshake_error("unexpected EOF"));
+        assert!(!is_transient_ssh_handshake_error(
+            "public-key authentication failed"
+        ));
+        assert!(!is_transient_ssh_handshake_error(
+            "invalid SSH identification string"
+        ));
     }
 
     #[test]

@@ -6,10 +6,13 @@ use agent_spec::{NetworkConfig, NetworkInterfaceConfig};
 use eyre::Context;
 
 use crate::provision::{
-    command_exists, run_command, sanitize_unit_name, write_file, ProvisionContext,
+    command_exists, run_command, sanitize_unit_name, write_file, ProvisionContext, ProvisionOutcome,
 };
 
-pub(crate) fn apply(context: &ProvisionContext, config: &NetworkConfig) -> eyre::Result<()> {
+pub(crate) fn apply(
+    context: &ProvisionContext,
+    config: &NetworkConfig,
+) -> eyre::Result<ProvisionOutcome> {
     let network_dir = context.guest_path("/etc/systemd/network");
     let mut desired_paths = BTreeSet::new();
     let mut changed = false;
@@ -34,7 +37,23 @@ pub(crate) fn apply(context: &ProvisionContext, config: &NetworkConfig) -> eyre:
         changed = true;
     }
 
-    if command_exists("systemctl") && (changed || !config.interfaces.is_empty()) {
+    if changed || !config.interfaces.is_empty() {
+        if !command_exists("systemctl") {
+            return Ok(ProvisionOutcome::unsupported(
+                "systemd-networkd requires systemctl, but systemctl is not available",
+            ));
+        }
+
+        let readiness = context
+            .service_manager()
+            .wait_for_systemd(context.process_supervisor());
+        if !readiness.is_ready() {
+            return Ok(ProvisionOutcome::unsupported(format!(
+                "systemd-networkd requires systemd manager readiness: {}",
+                readiness.message()
+            )));
+        }
+
         if !config.interfaces.is_empty() {
             run_command(
                 context.process_supervisor(),
@@ -62,7 +81,7 @@ pub(crate) fn apply(context: &ProvisionContext, config: &NetworkConfig) -> eyre:
         changed,
         "reconciled systemd-networkd config"
     );
-    Ok(())
+    Ok(ProvisionOutcome::succeeded(changed))
 }
 
 fn file_contents(path: &std::path::Path) -> eyre::Result<Option<String>> {

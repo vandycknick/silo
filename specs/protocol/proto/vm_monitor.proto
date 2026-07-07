@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package silo.v1;
 
+import "common.proto";
+
 service VmMonitorService {
   rpc Ping(PingRequest) returns (PingResponse);
   rpc Inspect(InspectRequest) returns (InspectResponse);
@@ -22,6 +24,8 @@ message InspectResponse {
   LifecycleState guest_state = 2;
   bool ready = 3;
   string summary = 4;
+  GuestBootReport boot_report = 5;
+  ProvisionReport provision_report = 6;
 }
 
 message WatchStatusRequest {}

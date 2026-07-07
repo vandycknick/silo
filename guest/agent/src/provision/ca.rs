@@ -1,13 +1,15 @@
 use agent_spec::CertificateAuthorityConfig;
 
-use crate::provision::{run_command, write_file, ProvisionContext};
+use crate::provision::{run_command, write_file, ProvisionContext, ProvisionOutcome};
 
 pub(crate) fn apply(
     context: &ProvisionContext,
     config: Option<&CertificateAuthorityConfig>,
-) -> eyre::Result<()> {
+) -> eyre::Result<ProvisionOutcome> {
     let Some(config) = config else {
-        return Ok(());
+        return Ok(ProvisionOutcome::skipped(
+            "no certificate authority configured",
+        ));
     };
 
     write_file(&context.guest_path(&config.path), &config.pem, 0o644)?;
@@ -28,7 +30,7 @@ pub(crate) fn apply(
         update_trust = config.update_trust,
         "reconciled certificate authority"
     );
-    Ok(())
+    Ok(ProvisionOutcome::succeeded(false))
 }
 
 fn shell_quote(value: &str) -> String {

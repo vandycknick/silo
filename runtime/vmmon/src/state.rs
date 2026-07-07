@@ -1,6 +1,9 @@
 use std::sync::Mutex;
 
-use protocol::v1::{InspectResponse, LifecycleState, PingResponse, StatusSource, StatusUpdate};
+use protocol::v1::{
+    GuestBootReport, InspectResponse, LifecycleState, PingResponse, ProvisionReport, StatusSource,
+    StatusUpdate,
+};
 use tokio::sync::broadcast;
 
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +101,8 @@ pub(crate) struct InstanceState {
     vm: LifecycleState,
     guest: LifecycleState,
     guest_message: String,
+    boot_report: Option<GuestBootReport>,
+    provision_report: Option<ProvisionReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +114,8 @@ pub(crate) enum Action {
     GuestTransition {
         state: LifecycleState,
         message: String,
+        boot_report: Option<Box<GuestBootReport>>,
+        provision_report: Option<Box<ProvisionReport>>,
     },
 }
 
@@ -131,6 +138,8 @@ impl Action {
         Self::GuestTransition {
             state: LifecycleState::Starting,
             message: String::from("waiting for guest service registration"),
+            boot_report: None,
+            provision_report: None,
         }
     }
 
@@ -138,6 +147,20 @@ impl Action {
         Self::GuestTransition {
             state: LifecycleState::Running,
             message: String::from("guest service registered"),
+            boot_report: None,
+            provision_report: None,
+        }
+    }
+
+    pub(crate) fn guest_running_with_reports(
+        boot_report: GuestBootReport,
+        provision_report: ProvisionReport,
+    ) -> Self {
+        Self::GuestTransition {
+            state: LifecycleState::Running,
+            message: String::from("guest service registered"),
+            boot_report: Some(Box::new(boot_report)),
+            provision_report: Some(Box::new(provision_report)),
         }
     }
 
@@ -145,6 +168,21 @@ impl Action {
         Self::GuestTransition {
             state: LifecycleState::Error,
             message: message.into(),
+            boot_report: None,
+            provision_report: None,
+        }
+    }
+
+    pub(crate) fn guest_error_with_reports(
+        message: impl Into<String>,
+        boot_report: GuestBootReport,
+        provision_report: ProvisionReport,
+    ) -> Self {
+        Self::GuestTransition {
+            state: LifecycleState::Error,
+            message: message.into(),
+            boot_report: Some(Box::new(boot_report)),
+            provision_report: Some(Box::new(provision_report)),
         }
     }
 }
@@ -174,6 +212,8 @@ pub(crate) fn select_current_inspect(state: &InstanceState) -> InspectResponse {
         guest_state: state.guest as i32,
         ready: state.vm == LifecycleState::Running && state.guest == LifecycleState::Running,
         summary: status_summary(state),
+        boot_report: state.boot_report.clone(),
+        provision_report: state.provision_report.clone(),
     }
 }
 
@@ -206,9 +246,20 @@ fn reduce_instance_state(current: &InstanceState, action: &Action) -> InstanceSt
         Action::VmTransition { state, .. } => {
             next.vm = *state;
         }
-        Action::GuestTransition { state, message } => {
+        Action::GuestTransition {
+            state,
+            message,
+            boot_report,
+            provision_report,
+        } => {
             next.guest = *state;
             next.guest_message = message.clone();
+            if let Some(boot_report) = boot_report {
+                next.boot_report = Some((**boot_report).clone());
+            }
+            if let Some(provision_report) = provision_report {
+                next.provision_report = Some((**provision_report).clone());
+            }
         }
     }
 
@@ -220,7 +271,7 @@ fn project_status_update(action: &Action) -> Option<StatusUpdate> {
         Action::VmTransition { state, message } => {
             Some(StatusUpdate::new(StatusSource::Vm, *state, message.clone()))
         }
-        Action::GuestTransition { state, message } => Some(StatusUpdate::new(
+        Action::GuestTransition { state, message, .. } => Some(StatusUpdate::new(
             StatusSource::Guest,
             *state,
             message.clone(),
@@ -244,9 +295,12 @@ fn status_summary(state: &InstanceState) -> String {
 mod tests {
     use std::sync::Arc;
 
+    use protocol::v1::{
+        GuestBootMode, GuestBootReport, LifecycleState, ProvisionOverallStatus, ProvisionReport,
+    };
     use tokio::sync::broadcast::error::TryRecvError;
 
-    use crate::state::{new_instance_store, Action, StoreError};
+    use crate::state::{new_instance_store, select_current_inspect, Action, StoreError};
 
     #[test]
     fn dispatch_updates_state_before_publishing() {
@@ -278,5 +332,68 @@ mod tests {
         ));
         assert!(matches!(store.snapshot(), Err(StoreError::Poisoned)));
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn inspect_includes_latest_guest_reports() {
+        let store = new_instance_store();
+        let boot_report = GuestBootReport {
+            mode: GuestBootMode::AgentPid1 as i32,
+            requested_init: String::from("auto"),
+            message: String::from("agent stayed PID1"),
+            ..GuestBootReport::default()
+        };
+        let provision_report = ProvisionReport {
+            status: ProvisionOverallStatus::Degraded as i32,
+            message: String::from("one step failed"),
+            ..ProvisionReport::default()
+        };
+
+        store.dispatch(Action::vm_running()).unwrap();
+        store
+            .dispatch(Action::guest_running_with_reports(
+                boot_report.clone(),
+                provision_report.clone(),
+            ))
+            .unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        let inspect = select_current_inspect(&snapshot);
+
+        assert!(inspect.ready);
+        assert_eq!(inspect.boot_report, Some(boot_report));
+        assert_eq!(inspect.provision_report, Some(provision_report));
+    }
+
+    #[test]
+    fn failed_boot_report_sets_guest_error_without_ready() {
+        let store = new_instance_store();
+        let boot_report = GuestBootReport::default();
+        let provision_report = ProvisionReport {
+            status: ProvisionOverallStatus::FailedBoot as i32,
+            message: String::from("fatal provisioner failed"),
+            ..ProvisionReport::default()
+        };
+
+        store.dispatch(Action::vm_running()).unwrap();
+        store
+            .dispatch(Action::guest_error_with_reports(
+                "fatal provisioner failed",
+                boot_report.clone(),
+                provision_report.clone(),
+            ))
+            .unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        let inspect = select_current_inspect(&snapshot);
+
+        assert!(!inspect.ready);
+        assert_eq!(
+            LifecycleState::try_from(inspect.guest_state),
+            Ok(LifecycleState::Error)
+        );
+        assert_eq!(inspect.summary, "fatal provisioner failed");
+        assert_eq!(inspect.boot_report, Some(boot_report));
+        assert_eq!(inspect.provision_report, Some(provision_report));
     }
 }

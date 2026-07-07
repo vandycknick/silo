@@ -1,13 +1,18 @@
 use eyre::Context;
 
-use crate::provision::{command_exists, run_command, write_file, ProvisionContext};
+use crate::provision::{
+    command_exists, run_command, write_file, ProvisionContext, ProvisionOutcome,
+};
 
-pub(crate) fn apply(context: &ProvisionContext, hostname: Option<&str>) -> eyre::Result<()> {
+pub(crate) fn apply(
+    context: &ProvisionContext,
+    hostname: Option<&str>,
+) -> eyre::Result<ProvisionOutcome> {
     let Some(hostname) = hostname
         .map(str::trim)
         .filter(|hostname| !hostname.is_empty())
     else {
-        return Ok(());
+        return Ok(ProvisionOutcome::skipped("no hostname configured"));
     };
 
     let hostname_path = context.guest_path("/etc/hostname");
@@ -15,13 +20,31 @@ pub(crate) fn apply(context: &ProvisionContext, hostname: Option<&str>) -> eyre:
     nix::unistd::sethostname(hostname).context("set kernel hostname")?;
 
     if command_exists("hostnamectl") {
-        run_command(
-            context.process_supervisor(),
-            "hostnamectl",
-            ["set-hostname", hostname],
-        )?;
+        let readiness = context
+            .service_manager()
+            .wait_for_systemd(context.process_supervisor());
+        if readiness.is_ready() {
+            run_command(
+                context.process_supervisor(),
+                "hostnamectl",
+                ["set-hostname", hostname],
+            )?;
+        } else {
+            tracing::info!(
+                reason = readiness.message(),
+                "skipping hostnamectl because systemd manager is not ready"
+            );
+            tracing::info!(hostname, path = %hostname_path.display(), "reconciled hostname");
+            return Ok(ProvisionOutcome::Succeeded {
+                changed: false,
+                message: format!(
+                    "reconciled hostname; skipped hostnamectl: {}",
+                    readiness.message()
+                ),
+            });
+        }
     }
 
     tracing::info!(hostname, path = %hostname_path.display(), "reconciled hostname");
-    Ok(())
+    Ok(ProvisionOutcome::succeeded(false))
 }

@@ -5,7 +5,9 @@ use eyre::Context;
 use hyper_util::rt::TokioIo;
 use protocol::v1::guest_control_service_client::GuestControlServiceClient;
 use protocol::v1::metadata_service_client::MetadataServiceClient;
-use protocol::v1::{GetMetadataRequest, GetMetadataResponse, RegisterGuestRequest};
+use protocol::v1::{
+    GetMetadataRequest, GetMetadataResponse, GuestBootReport, ProvisionReport, RegisterGuestRequest,
+};
 use tokio::sync::Mutex;
 use tokio_vsock::{VsockAddr, VsockStream, VMADDR_CID_HOST};
 use tonic::transport::{Channel, Endpoint};
@@ -27,13 +29,19 @@ impl GuestControlClient {
         })
     }
 
-    pub(crate) async fn register(&mut self) -> eyre::Result<()> {
+    pub(crate) async fn register(
+        &mut self,
+        boot_report: GuestBootReport,
+        provision_report: ProvisionReport,
+    ) -> eyre::Result<()> {
         let system_info = get_system_info().context("collect system info for guest register")?;
         let response = self
             .control
             .register(RegisterGuestRequest {
                 guest_service_version: env!("CARGO_PKG_VERSION").to_string(),
                 system_info: Some(system_info),
+                boot_report: Some(boot_report),
+                provision_report: Some(provision_report),
             })
             .await
             .context("register guest service")?

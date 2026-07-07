@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use protocol::v1::{InspectResponse, LifecycleState};
+use protocol::v1::{
+    GuestBootMode, GuestBootReport, InspectResponse, LifecycleState, ProvisionFailurePolicy,
+    ProvisionOverallStatus, ProvisionReport, ProvisionStepReport, ProvisionStepStatus,
+};
 use vm_spec::VmSpec;
 
 use crate::network::MachineNetworkConfig;
@@ -49,6 +52,10 @@ pub struct MachineData {
     /// vmmon telemetry failure does not fail the whole inspect call; it is
     /// reported here as a non-ready running status message instead.
     pub status: MachineStatus,
+    /// Latest guest boot report observed by vmmon, when the guest registered one.
+    pub boot_report: Option<MachineBootReport>,
+    /// Latest guest provisioning report observed by vmmon, when the guest registered one.
+    pub provision_report: Option<MachineProvisionReport>,
     /// Unix timestamp for when the machine last started.
     pub started_at: Option<i64>,
     /// Last persisted runtime error, when present.
@@ -61,6 +68,8 @@ impl MachineData {
     pub(crate) fn from_models_with_status(
         config: MachineConfig,
         status: MachineStatus,
+        boot_report: Option<MachineBootReport>,
+        provision_report: Option<MachineProvisionReport>,
         started_at: Option<i64>,
         last_error: Option<String>,
         updated_at: i64,
@@ -78,6 +87,8 @@ impl MachineData {
             metadata: config.metadata,
             network: config.network.into(),
             status,
+            boot_report,
+            provision_report,
             started_at,
             last_error,
             updated_at,
@@ -92,6 +103,211 @@ impl MachineData {
     /// Returns the runtime trace log path for this machine.
     pub fn trace_log_path(&self) -> PathBuf {
         crate::paths::vmmon_trace_log_path_in(&self.machine_dir)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineBootReport {
+    pub mode: MachineBootMode,
+    pub requested_init: Option<String>,
+    pub handoff_init_path: Option<String>,
+    pub probed_init_paths: Vec<String>,
+    pub agent_path: Option<String>,
+    pub agent_pid: u32,
+    pub agent_is_pid1: bool,
+    pub message: Option<String>,
+}
+
+impl MachineBootReport {
+    pub(crate) fn from_protocol(report: GuestBootReport) -> Self {
+        Self {
+            mode: MachineBootMode::from_protocol(report.mode),
+            requested_init: non_empty_string(report.requested_init),
+            handoff_init_path: non_empty_string(report.handoff_init_path),
+            probed_init_paths: report.probed_init_paths,
+            agent_path: non_empty_string(report.agent_path),
+            agent_pid: report.agent_pid,
+            agent_is_pid1: report.agent_is_pid1,
+            message: non_empty_string(report.message),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineBootMode {
+    Unspecified,
+    Standard,
+    AgentPid1,
+    InitChild,
+}
+
+impl MachineBootMode {
+    fn from_protocol(value: i32) -> Self {
+        match GuestBootMode::try_from(value).unwrap_or(GuestBootMode::Unspecified) {
+            GuestBootMode::Unspecified => Self::Unspecified,
+            GuestBootMode::Standard => Self::Standard,
+            GuestBootMode::AgentPid1 => Self::AgentPid1,
+            GuestBootMode::InitChild => Self::InitChild,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Standard => "standard",
+            Self::AgentPid1 => "agent-pid1",
+            Self::InitChild => "init-child",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineProvisionReport {
+    pub status: MachineProvisionStatus,
+    pub started_unix_ms: i64,
+    pub finished_unix_ms: i64,
+    pub duration_ms: u64,
+    pub steps: Vec<MachineProvisionStepReport>,
+    pub message: Option<String>,
+}
+
+impl MachineProvisionReport {
+    pub(crate) fn from_protocol(report: ProvisionReport) -> Self {
+        Self {
+            status: MachineProvisionStatus::from_protocol(report.status),
+            started_unix_ms: report.started_unix_ms,
+            finished_unix_ms: report.finished_unix_ms,
+            duration_ms: report.duration_ms,
+            steps: report
+                .steps
+                .into_iter()
+                .map(MachineProvisionStepReport::from_protocol)
+                .collect(),
+            message: non_empty_string(report.message),
+        }
+    }
+
+    pub fn failed_step_count(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| step.status == MachineProvisionStepStatus::Failed)
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineProvisionStatus {
+    Unspecified,
+    Succeeded,
+    Degraded,
+    Skipped,
+    FailedBoot,
+}
+
+impl MachineProvisionStatus {
+    fn from_protocol(value: i32) -> Self {
+        match ProvisionOverallStatus::try_from(value).unwrap_or(ProvisionOverallStatus::Unspecified)
+        {
+            ProvisionOverallStatus::Unspecified => Self::Unspecified,
+            ProvisionOverallStatus::Succeeded => Self::Succeeded,
+            ProvisionOverallStatus::Degraded => Self::Degraded,
+            ProvisionOverallStatus::Skipped => Self::Skipped,
+            ProvisionOverallStatus::FailedBoot => Self::FailedBoot,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Succeeded => "succeeded",
+            Self::Degraded => "degraded",
+            Self::Skipped => "skipped",
+            Self::FailedBoot => "failed-boot",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineProvisionStepReport {
+    pub id: String,
+    pub status: MachineProvisionStepStatus,
+    pub failure_policy: MachineProvisionFailurePolicy,
+    pub changed: bool,
+    pub backend: Option<String>,
+    pub duration_ms: u64,
+    pub message: Option<String>,
+    pub error_chain: Option<String>,
+}
+
+impl MachineProvisionStepReport {
+    fn from_protocol(report: ProvisionStepReport) -> Self {
+        Self {
+            id: report.id,
+            status: MachineProvisionStepStatus::from_protocol(report.status),
+            failure_policy: MachineProvisionFailurePolicy::from_protocol(report.failure_policy),
+            changed: report.changed,
+            backend: non_empty_string(report.backend),
+            duration_ms: report.duration_ms,
+            message: non_empty_string(report.message),
+            error_chain: non_empty_string(report.error_chain),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineProvisionStepStatus {
+    Unspecified,
+    Succeeded,
+    Failed,
+    Skipped,
+    Unsupported,
+}
+
+impl MachineProvisionStepStatus {
+    fn from_protocol(value: i32) -> Self {
+        match ProvisionStepStatus::try_from(value).unwrap_or(ProvisionStepStatus::Unspecified) {
+            ProvisionStepStatus::Unspecified => Self::Unspecified,
+            ProvisionStepStatus::Succeeded => Self::Succeeded,
+            ProvisionStepStatus::Failed => Self::Failed,
+            ProvisionStepStatus::Skipped => Self::Skipped,
+            ProvisionStepStatus::Unsupported => Self::Unsupported,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineProvisionFailurePolicy {
+    Unspecified,
+    BestEffort,
+    FailBoot,
+}
+
+impl MachineProvisionFailurePolicy {
+    fn from_protocol(value: i32) -> Self {
+        match ProvisionFailurePolicy::try_from(value).unwrap_or(ProvisionFailurePolicy::Unspecified)
+        {
+            ProvisionFailurePolicy::Unspecified => Self::Unspecified,
+            ProvisionFailurePolicy::BestEffort => Self::BestEffort,
+            ProvisionFailurePolicy::FailBoot => Self::FailBoot,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::BestEffort => "best-effort",
+            Self::FailBoot => "fail-boot",
+        }
     }
 }
 
@@ -248,4 +464,13 @@ fn non_empty_message(message: Option<String>) -> Option<String> {
             Some(message)
         }
     })
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
