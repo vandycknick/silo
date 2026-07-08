@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use agent_spec::{ProvisionConfig, UserdataContentType};
+use agent_spec::{AgentSshConfig, ProvisionConfig, UserdataContentType};
 use eyre::{eyre, Context};
 use protocol::v1::{
     ProvisionFailurePolicy as ProtoProvisionFailurePolicy, ProvisionOverallStatus, ProvisionReport,
@@ -32,6 +32,7 @@ pub(crate) use service_manager::ServiceManagerState;
 
 pub fn run_provisioning(
     config: &ProvisionConfig,
+    ssh_config: &AgentSshConfig,
     process_supervisor: &ProcessSupervisor,
     boot_mode: &BootMode,
 ) -> eyre::Result<ProvisionReport> {
@@ -54,7 +55,7 @@ pub fn run_provisioning(
     tracing::info!("guest reconciliation starting");
 
     let mut run = ProvisionRun::default();
-    run.run(provisioners(&context, config));
+    run.run(provisioners(&context, config, ssh_config));
 
     if run.is_success() {
         tracing::info!("guest reconciliation complete");
@@ -73,6 +74,7 @@ pub fn run_provisioning(
 fn provisioners<'a>(
     context: &'a ProvisionContext,
     config: &'a ProvisionConfig,
+    ssh_config: &'a AgentSshConfig,
 ) -> Vec<ProvisionerStep<'a>> {
     vec![
         ProvisionerStep::new(
@@ -95,13 +97,20 @@ fn provisioners<'a>(
         ),
         ProvisionerStep::new(
             ProvisionerId::USERS,
-            &[
-                ProvisionResource::Users,
-                ProvisionResource::SshAuthorizedKeys,
-                ProvisionResource::SshService,
-            ],
+            &[ProvisionResource::Users],
             move || configured(!config.users.is_empty(), "no users configured"),
             move || user::apply(context, &config.users),
+        ),
+        ProvisionerStep::new(
+            ProvisionerId::SSH_AUTHORIZED_KEYS,
+            &[ProvisionResource::SshAuthorizedKeys],
+            move || {
+                configured(
+                    !ssh_config.authorized_users.is_empty(),
+                    "no SSH authorized users configured",
+                )
+            },
+            move || ssh::apply(context, &ssh_config.authorized_users),
         ),
         ProvisionerStep::new(
             ProvisionerId::CERTIFICATE_AUTHORITY,
@@ -202,6 +211,7 @@ impl ProvisionerId {
     const TIMEZONE: Self = Self("timezone");
     const LOCALE: Self = Self("locale");
     const USERS: Self = Self("users");
+    const SSH_AUTHORIZED_KEYS: Self = Self("ssh_authorized_keys");
     const CERTIFICATE_AUTHORITY: Self = Self("certificate_authority");
     const RESIZE_ROOTFS: Self = Self("resize_rootfs");
     const MOUNTS: Self = Self("mounts");
@@ -228,7 +238,6 @@ enum ProvisionResource {
     NetworkConfig,
     Rosetta,
     Userdata,
-    SshService,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

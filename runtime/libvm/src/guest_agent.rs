@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_spec::{
-    AgentConfig, AgentForwardConfig, AgentRosettaConfig, AgentUdsForwardConfig,
-    CertificateAuthorityConfig, MountConfig as ProvisionMountConfig,
+    AgentConfig, AgentForwardConfig, AgentRosettaConfig, AgentSshAuthorizedUser, AgentSshConfig,
+    AgentUdsForwardConfig, CertificateAuthorityConfig, MountConfig as ProvisionMountConfig,
     NetworkConfig as ProvisionNetworkConfig, NetworkInterfaceConfig, NetworkMatchConfig,
     ProvisionConfig, ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType,
     UserdataRunPolicy,
@@ -91,6 +91,7 @@ fn build_config_with_host_context(
     Ok(AgentConfig {
         forward: build_forward_config(spec)?,
         provision: build_provision_config(machine_name, spec, network, host_context)?,
+        ssh: build_ssh_config(host_context),
     })
 }
 
@@ -146,7 +147,6 @@ fn build_provision_config(
             shell: GUEST_USER_SHELL.to_string(),
             sudo: GUEST_USER_SUDO_RULE.to_string(),
             lock_passwd: true,
-            ssh_authorized_keys: vec![host_context.ssh_public_key_openssh.trim().to_string()],
         }],
         certificate_authority: Some(CertificateAuthorityConfig {
             path: GUEST_CERTIFICATE_AUTHORITY_PATH.to_string(),
@@ -165,6 +165,25 @@ fn build_provision_config(
         mounts: provision_mount_entries(spec),
         userdata: provision_userdata(spec)?,
     })
+}
+
+fn build_ssh_config(host_context: &GuestAgentHostContext) -> AgentSshConfig {
+    let public_key = host_context.ssh_public_key_openssh.trim().to_string();
+    let mut authorized_users = vec![AgentSshAuthorizedUser {
+        name: "root".to_string(),
+        authorized_keys: vec![public_key.clone()],
+        allow_without_auth: false,
+    }];
+
+    if host_context.user.name != "root" {
+        authorized_users.push(AgentSshAuthorizedUser {
+            name: host_context.user.name.clone(),
+            authorized_keys: vec![public_key],
+            allow_without_auth: false,
+        });
+    }
+
+    AgentSshConfig { authorized_users }
 }
 
 pub(crate) fn load_or_generate_guest_ssh_keypair(
@@ -598,7 +617,6 @@ mod tests {
         assert_eq!(provision.timezone.as_deref(), Some("Europe/Amsterdam"));
         assert_eq!(provision.locale.as_deref(), Some("nl_NL.UTF-8"));
         assert_eq!(provision.users[0].name, "silo");
-        assert_eq!(provision.users[0].ssh_authorized_keys.len(), 1);
         assert!(provision.resize_rootfs.enabled);
         assert_eq!(provision.mounts[0].tag, "workspace");
         assert_eq!(provision.mounts[0].path, "/workspace");
@@ -724,5 +742,14 @@ mod tests {
         assert!(config.forward.enabled);
         assert!(config.provision.enabled);
         assert_eq!(config.provision.hostname.as_deref(), Some("demo"));
+        assert_eq!(
+            config
+                .ssh
+                .authorized_users
+                .iter()
+                .map(|user| user.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root", "silo"]
+        );
     }
 }

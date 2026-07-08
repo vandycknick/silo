@@ -78,12 +78,29 @@ impl ProcessSupervisor {
         command: &mut Command,
         label: impl Into<String>,
     ) -> io::Result<(Child, ChildGuard)> {
+        self.spawn_child_with(command, label, ChildSpawnMode::NewProcessGroup)
+    }
+
+    pub(crate) fn spawn_session_child(
+        &self,
+        command: &mut Command,
+        label: impl Into<String>,
+    ) -> io::Result<(Child, ChildGuard)> {
+        self.spawn_child_with(command, label, ChildSpawnMode::SessionLeader)
+    }
+
+    fn spawn_child_with(
+        &self,
+        command: &mut Command,
+        label: impl Into<String>,
+        mode: ChildSpawnMode,
+    ) -> io::Result<(Child, ChildGuard)> {
         let Some(inner) = &self.inner else {
             let child = command.spawn()?;
             return Ok((child, ChildGuard::inactive()));
         };
 
-        inner.spawn_child(command, label.into())
+        inner.spawn_child(command, label.into(), mode)
     }
 
     pub(crate) fn output<I, S>(&self, program: &str, args: I) -> io::Result<Output>
@@ -134,6 +151,7 @@ impl Pid1Supervisor {
         self: &Arc<Self>,
         command: &mut Command,
         label: String,
+        mode: ChildSpawnMode,
     ) -> io::Result<(Child, ChildGuard)> {
         let _spawn = lock_or_recover(&self.spawn_lock);
         if self.is_shutting_down() {
@@ -143,7 +161,9 @@ impl Pid1Supervisor {
             ));
         }
 
-        command.process_group(0);
+        if matches!(mode, ChildSpawnMode::NewProcessGroup) {
+            command.process_group(0);
+        }
         // PID1 blocks signals for synchronous delivery through the supervisor.
         // Child processes must not inherit that mask or shutdown signals may be
         // ignored until they explicitly unblock them.
@@ -298,6 +318,12 @@ impl Pid1Supervisor {
             reap_child(pid);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ChildSpawnMode {
+    NewProcessGroup,
+    SessionLeader,
 }
 
 #[derive(Default)]

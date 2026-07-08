@@ -12,6 +12,25 @@ pub struct AgentConfig {
     pub forward: AgentForwardConfig,
     #[serde(default)]
     pub provision: ProvisionConfig,
+    #[serde(default)]
+    pub ssh: AgentSshConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSshConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorized_users: Vec<AgentSshAuthorizedUser>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSshAuthorizedUser {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorized_keys: Vec<String>,
+    #[serde(default)]
+    pub allow_without_auth: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -59,8 +78,6 @@ pub struct UserConfig {
     pub sudo: String,
     #[serde(default)]
     pub lock_passwd: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ssh_authorized_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -205,10 +222,10 @@ pub enum ForwardApiResponse {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AgentConfig, AgentForwardConfig, AgentRosettaConfig, AgentUdsForwardConfig,
-        CertificateAuthorityConfig, MountConfig, NetworkConfig, NetworkInterfaceConfig,
-        NetworkMatchConfig, ProvisionConfig, ResizeRootfsConfig, UserConfig, UserdataConfig,
-        UserdataContentType, UserdataRunPolicy,
+        AgentConfig, AgentForwardConfig, AgentRosettaConfig, AgentSshAuthorizedUser,
+        AgentSshConfig, AgentUdsForwardConfig, CertificateAuthorityConfig, MountConfig,
+        NetworkConfig, NetworkInterfaceConfig, NetworkMatchConfig, ProvisionConfig,
+        ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType, UserdataRunPolicy,
     };
 
     #[test]
@@ -222,6 +239,7 @@ mod tests {
         assert_eq!(config.provision.rosetta.mount_path, "/mnt/silo-rosetta");
         assert!(config.provision.users.is_empty());
         assert!(config.provision.network.interfaces.is_empty());
+        assert!(config.ssh.authorized_users.is_empty());
     }
 
     #[test]
@@ -297,7 +315,6 @@ provision:
                     shell: "/bin/bash".to_string(),
                     sudo: "ALL=(ALL) NOPASSWD:ALL".to_string(),
                     lock_passwd: true,
-                    ssh_authorized_keys: vec!["ssh-ed25519 AAAAC3NzaSilo".to_string()],
                 }],
                 certificate_authority: Some(CertificateAuthorityConfig {
                     path: "/usr/local/share/ca-certificates/silo-ca.crt".to_string(),
@@ -331,6 +348,13 @@ provision:
                     content_type: UserdataContentType::ShellScript,
                     run: UserdataRunPolicy::Always,
                 }),
+            },
+            ssh: AgentSshConfig {
+                authorized_users: vec![AgentSshAuthorizedUser {
+                    name: "silo".to_string(),
+                    authorized_keys: vec!["ssh-ed25519 AAAAC3NzaSilo".to_string()],
+                    allow_without_auth: false,
+                }],
             },
         };
 

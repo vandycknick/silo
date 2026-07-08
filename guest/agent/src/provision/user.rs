@@ -40,7 +40,6 @@ pub(crate) fn apply(
 
 fn apply_user(context: &ProvisionContext, user: &UserConfig) -> eyre::Result<()> {
     ensure_user(context, user)?;
-    crate::provision::ssh::install_authorized_keys(context, user)?;
     write_sudoers(context, user)?;
     Ok(())
 }
