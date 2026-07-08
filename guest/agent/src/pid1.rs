@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -20,9 +21,19 @@ use tokio::sync::watch;
 use crate::handoff::BootMode;
 
 const PROC_DIR: &str = "/proc";
+const DEV_INPUT_DIR: &str = "/dev/input";
+const INPUT_EVENT_PREFIX: &str = "event";
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 const KILL_ALL_GRACE: Duration = Duration::from_millis(250);
+const INPUT_DEVICE_SCAN_POLL: Duration = Duration::from_secs(1);
+const INPUT_EVENT_TIMEVAL_SIZE: usize = 16;
+const INPUT_EVENT_TYPE_OFFSET: usize = INPUT_EVENT_TIMEVAL_SIZE;
+const INPUT_EVENT_CODE_OFFSET: usize = INPUT_EVENT_TYPE_OFFSET + 2;
+const INPUT_EVENT_VALUE_OFFSET: usize = INPUT_EVENT_CODE_OFFSET + 2;
+const INPUT_EVENT_SIZE: usize = INPUT_EVENT_VALUE_OFFSET + 4;
+const EV_KEY: u16 = 0x01;
+const KEY_POWER: u16 = 116;
 
 #[derive(Clone, Default)]
 pub(crate) struct ProcessSupervisor {
@@ -49,6 +60,7 @@ impl ProcessSupervisor {
         });
 
         spawn_signal_thread(Arc::clone(&inner), signals)?;
+        spawn_power_button_monitor(Arc::clone(&inner))?;
         tracing::info!("PID1 process supervisor active");
 
         Ok(Self { inner: Some(inner) })
@@ -385,6 +397,155 @@ fn spawn_signal_thread(supervisor: Arc<Pid1Supervisor>, signals: SigSet) -> eyre
     Ok(())
 }
 
+fn spawn_power_button_monitor(supervisor: Arc<Pid1Supervisor>) -> eyre::Result<()> {
+    thread::Builder::new()
+        .name("silo-pid1-power".to_string())
+        .spawn(move || monitor_power_button_devices(supervisor))
+        .context("spawn PID1 power button monitor")?;
+    Ok(())
+}
+
+fn monitor_power_button_devices(supervisor: Arc<Pid1Supervisor>) {
+    let mut watched = HashSet::new();
+    loop {
+        if supervisor.is_shutting_down() {
+            return;
+        }
+
+        match input_event_device_paths() {
+            Ok(paths) => {
+                for path in paths {
+                    if watched.insert(path.clone()) {
+                        spawn_power_button_device_reader(Arc::clone(&supervisor), path);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "failed to scan input event devices");
+            }
+        }
+
+        thread::sleep(INPUT_DEVICE_SCAN_POLL);
+    }
+}
+
+fn spawn_power_button_device_reader(supervisor: Arc<Pid1Supervisor>, path: PathBuf) {
+    let thread_name = power_button_thread_name(&path);
+    if let Err(err) = thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || read_power_button_events(supervisor, path))
+    {
+        tracing::debug!(error = %err, "failed to spawn PID1 power button reader");
+    }
+}
+
+fn read_power_button_events(supervisor: Arc<Pid1Supervisor>, path: PathBuf) {
+    let mut file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(err) => {
+            tracing::debug!(path = %path.display(), error = %err, "failed to open input event device");
+            return;
+        }
+    };
+
+    tracing::debug!(path = %path.display(), "watching input event device for virtual power button");
+    let mut bytes = [0u8; INPUT_EVENT_SIZE];
+    loop {
+        match file.read_exact(&mut bytes) {
+            Ok(()) => {
+                if parse_input_event(&bytes).is_some_and(|event| event.is_power_button_press()) {
+                    tracing::warn!(path = %path.display(), "virtual power button event received");
+                    supervisor.request_shutdown("received virtual power button".to_string());
+                    return;
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                tracing::debug!(path = %path.display(), error = %err, "input event device reader stopped");
+                return;
+            }
+        }
+
+        if supervisor.is_shutting_down() {
+            return;
+        }
+    }
+}
+
+fn input_event_device_paths() -> io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(DEV_INPUT_DIR) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if is_input_event_device_name(&entry.file_name()) {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn is_input_event_device_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(suffix) = name.strip_prefix(INPUT_EVENT_PREFIX) else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn power_button_thread_name(path: &Path) -> String {
+    let device = path.file_name().and_then(OsStr::to_str).unwrap_or("event");
+    format!("silo-pid1-{device}")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InputEvent {
+    event_type: u16,
+    code: u16,
+    value: i32,
+}
+
+impl InputEvent {
+    fn is_power_button_press(self) -> bool {
+        self.event_type == EV_KEY && self.code == KEY_POWER && self.value != 0
+    }
+}
+
+fn parse_input_event(bytes: &[u8]) -> Option<InputEvent> {
+    if bytes.len() != INPUT_EVENT_SIZE {
+        return None;
+    }
+
+    // Linux input_event is timeval + type + code + value on Silo's 64-bit guests.
+    let event_type = u16::from_ne_bytes([
+        bytes[INPUT_EVENT_TYPE_OFFSET],
+        bytes[INPUT_EVENT_TYPE_OFFSET + 1],
+    ]);
+    let code = u16::from_ne_bytes([
+        bytes[INPUT_EVENT_CODE_OFFSET],
+        bytes[INPUT_EVENT_CODE_OFFSET + 1],
+    ]);
+    let value = i32::from_ne_bytes([
+        bytes[INPUT_EVENT_VALUE_OFFSET],
+        bytes[INPUT_EVENT_VALUE_OFFSET + 1],
+        bytes[INPUT_EVENT_VALUE_OFFSET + 2],
+        bytes[INPUT_EVENT_VALUE_OFFSET + 3],
+    ]);
+
+    Some(InputEvent {
+        event_type,
+        code,
+        value,
+    })
+}
+
 fn pid1_signal_set() -> SigSet {
     let mut signals = SigSet::empty();
     for signal in pid1_signals() {
@@ -515,11 +676,15 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
     use nix::sys::signal::Signal;
 
     use crate::pid1::{
-        is_shutdown_signal, parse_status_ppid, pid1_signals, should_log_adopted_exit,
-        shutdown_grace_ticks,
+        is_input_event_device_name, is_shutdown_signal, parse_input_event, parse_status_ppid,
+        pid1_signals, should_log_adopted_exit, shutdown_grace_ticks, InputEvent, EV_KEY,
+        INPUT_EVENT_CODE_OFFSET, INPUT_EVENT_SIZE, INPUT_EVENT_TYPE_OFFSET,
+        INPUT_EVENT_VALUE_OFFSET, KEY_POWER,
     };
 
     #[test]
@@ -537,6 +702,52 @@ mod tests {
         assert!(is_shutdown_signal(Signal::SIGINT));
         assert!(is_shutdown_signal(Signal::SIGPWR));
         assert!(!is_shutdown_signal(Signal::SIGCHLD));
+    }
+
+    #[test]
+    fn input_event_device_name_filter_accepts_event_devices() {
+        assert!(is_input_event_device_name(OsStr::new("event0")));
+        assert!(is_input_event_device_name(OsStr::new("event12")));
+    }
+
+    #[test]
+    fn input_event_device_name_filter_rejects_non_event_devices() {
+        assert!(!is_input_event_device_name(OsStr::new("event")));
+        assert!(!is_input_event_device_name(OsStr::new("eventx")));
+        assert!(!is_input_event_device_name(OsStr::new("event0.old")));
+        assert!(!is_input_event_device_name(OsStr::new("mouse0")));
+    }
+
+    #[test]
+    fn input_event_parser_detects_power_button_press() {
+        let bytes = input_event_bytes(EV_KEY, KEY_POWER, 1);
+        let event = parse_input_event(&bytes).expect("input event should parse");
+
+        assert_eq!(
+            event,
+            InputEvent {
+                event_type: EV_KEY,
+                code: KEY_POWER,
+                value: 1,
+            }
+        );
+        assert!(event.is_power_button_press());
+    }
+
+    #[test]
+    fn input_event_parser_ignores_non_power_presses() {
+        let release = parse_input_event(&input_event_bytes(EV_KEY, KEY_POWER, 0))
+            .expect("release event should parse");
+        let other_key = parse_input_event(&input_event_bytes(EV_KEY, KEY_POWER + 1, 1))
+            .expect("other key event should parse");
+
+        assert!(!release.is_power_button_press());
+        assert!(!other_key.is_power_button_press());
+    }
+
+    #[test]
+    fn input_event_parser_rejects_incomplete_record() {
+        assert_eq!(parse_input_event(&[0u8; INPUT_EVENT_SIZE - 1]), None);
     }
 
     #[test]
@@ -560,5 +771,16 @@ mod tests {
     #[test]
     fn shutdown_grace_uses_three_seconds() {
         assert_eq!(shutdown_grace_ticks(), 30);
+    }
+
+    fn input_event_bytes(event_type: u16, code: u16, value: i32) -> [u8; INPUT_EVENT_SIZE] {
+        let mut bytes = [0u8; INPUT_EVENT_SIZE];
+        bytes[INPUT_EVENT_TYPE_OFFSET..INPUT_EVENT_TYPE_OFFSET + 2]
+            .copy_from_slice(&event_type.to_ne_bytes());
+        bytes[INPUT_EVENT_CODE_OFFSET..INPUT_EVENT_CODE_OFFSET + 2]
+            .copy_from_slice(&code.to_ne_bytes());
+        bytes[INPUT_EVENT_VALUE_OFFSET..INPUT_EVENT_VALUE_OFFSET + 4]
+            .copy_from_slice(&value.to_ne_bytes());
+        bytes
     }
 }
