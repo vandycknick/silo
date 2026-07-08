@@ -1,4 +1,7 @@
 use std::path::PathBuf;
+use std::str::FromStr;
+
+use oci_client::errors::{OciDistributionError, OciErrorCode};
 
 use thiserror::Error;
 
@@ -36,8 +39,17 @@ pub enum OciDiskError {
     Registry {
         reference: String,
         #[source]
-        source: oci_client::errors::OciDistributionError,
+        source: OciDistributionError,
     },
+
+    #[error("image {reference:?} was not found: {message}")]
+    RegistryImageNotFound { reference: String, message: String },
+
+    #[error("image {reference:?} was not found: {message}")]
+    RegistryImageTagNotFound { reference: String, message: String },
+
+    #[error("image {reference:?} was not found: {message}")]
+    RegistryImageDigestNotFound { reference: String, message: String },
 
     #[error("unsupported OCI digest algorithm in {digest:?}; only sha256 is supported")]
     UnsupportedDigestAlgorithm { digest: String },
@@ -104,19 +116,211 @@ pub enum OciDiskError {
 }
 
 impl OciDiskError {
-    pub(crate) fn registry(
-        reference: impl Into<String>,
-        source: oci_client::errors::OciDistributionError,
-    ) -> Self {
-        Self::Registry {
-            reference: reference.into(),
-            source,
+    pub(crate) fn registry(reference: impl Into<String>, source: OciDistributionError) -> Self {
+        let reference = reference.into();
+        if let Some(error) = registry_envelope_image_not_found(&reference, &source) {
+            return error;
         }
+
+        Self::Registry { reference, source }
+    }
+
+    pub(crate) fn registry_manifest(
+        reference: impl Into<String>,
+        source: OciDistributionError,
+    ) -> Self {
+        let reference = reference.into();
+        if let Some(error) = registry_envelope_image_not_found(&reference, &source) {
+            return error;
+        }
+        if matches!(
+            source,
+            OciDistributionError::ImageManifestNotFoundError(_)
+                | OciDistributionError::ServerError { code: 404, .. }
+        ) {
+            return image_not_found_error(&reference);
+        }
+
+        Self::Registry { reference, source }
     }
 
     pub(crate) fn ext4(source: impl std::fmt::Display) -> Self {
         Self::Ext4 {
             message: source.to_string(),
+        }
+    }
+}
+
+fn registry_envelope_image_not_found(
+    reference: &str,
+    source: &OciDistributionError,
+) -> Option<OciDiskError> {
+    let OciDistributionError::RegistryError { envelope, .. } = source else {
+        return None;
+    };
+
+    if envelope
+        .errors
+        .iter()
+        .any(|err| matches!(&err.code, OciErrorCode::NameUnknown))
+    {
+        return Some(repository_not_found_error(reference));
+    }
+
+    envelope
+        .errors
+        .iter()
+        .any(|err| {
+            matches!(
+                &err.code,
+                OciErrorCode::ManifestUnknown | OciErrorCode::NotFound
+            )
+        })
+        .then(|| image_not_found_error(reference))
+}
+
+fn repository_not_found_error(reference: &str) -> OciDiskError {
+    match oci_client::Reference::from_str(reference) {
+        Ok(parsed) => OciDiskError::RegistryImageNotFound {
+            reference: reference.to_string(),
+            message: format!(
+                "repository {:?} does not exist on registry {:?}",
+                parsed.repository(),
+                parsed.registry()
+            ),
+        },
+        Err(_) => OciDiskError::RegistryImageNotFound {
+            reference: reference.to_string(),
+            message: "the registry reported that the image repository does not exist".to_string(),
+        },
+    }
+}
+
+fn image_not_found_error(reference: &str) -> OciDiskError {
+    match oci_client::Reference::from_str(reference) {
+        Ok(parsed) => {
+            if let Some(tag) = parsed.tag() {
+                return OciDiskError::RegistryImageTagNotFound {
+                    reference: reference.to_string(),
+                    message: format!(
+                        "tag {tag:?} does not exist in repository {:?} on registry {:?}",
+                        parsed.repository(),
+                        parsed.registry()
+                    ),
+                };
+            }
+            if let Some(digest) = parsed.digest() {
+                return OciDiskError::RegistryImageDigestNotFound {
+                    reference: reference.to_string(),
+                    message: format!(
+                        "digest {digest:?} does not exist in repository {:?} on registry {:?}",
+                        parsed.repository(),
+                        parsed.registry()
+                    ),
+                };
+            }
+
+            OciDiskError::RegistryImageNotFound {
+                reference: reference.to_string(),
+                message: format!(
+                    "repository {:?} does not exist on registry {:?}",
+                    parsed.repository(),
+                    parsed.registry()
+                ),
+            }
+        }
+        Err(_) => OciDiskError::RegistryImageNotFound {
+            reference: reference.to_string(),
+            message: "the registry reported that the image or tag does not exist".to_string(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use oci_client::errors::{OciDistributionError, OciEnvelope, OciError, OciErrorCode};
+
+    use crate::OciDiskError;
+
+    #[test]
+    fn manifest_unknown_reports_missing_tag() {
+        let err = OciDiskError::registry(
+            "docker.io/library/ubuntu:24.0",
+            registry_error(OciErrorCode::ManifestUnknown, "manifest unknown"),
+        );
+
+        assert_eq!(
+            err.to_string(),
+            "image \"docker.io/library/ubuntu:24.0\" was not found: tag \"24.0\" does not exist in repository \"library/ubuntu\" on registry \"docker.io\""
+        );
+    }
+
+    #[test]
+    fn name_unknown_reports_missing_repository() {
+        let err = OciDiskError::registry(
+            "ghcr.io/acme/missing-image:latest",
+            registry_error(OciErrorCode::NameUnknown, "repository unknown"),
+        );
+
+        assert_eq!(
+            err.to_string(),
+            "image \"ghcr.io/acme/missing-image:latest\" was not found: repository \"acme/missing-image\" does not exist on registry \"ghcr.io\""
+        );
+    }
+
+    #[test]
+    fn manifest_404_reports_missing_digest() {
+        let err = OciDiskError::registry_manifest(
+            "docker.io/library/ubuntu@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            OciDistributionError::ServerError {
+                code: 404,
+                url: "https://index.docker.io/v2/library/ubuntu/manifests/sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                message: "not found".to_string(),
+            },
+        );
+
+        assert_eq!(
+            err.to_string(),
+            "image \"docker.io/library/ubuntu@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\" was not found: digest \"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\" does not exist in repository \"library/ubuntu\" on registry \"docker.io\""
+        );
+    }
+
+    #[test]
+    fn blob_404_preserves_registry_error() {
+        let err = OciDiskError::registry(
+            "docker.io/library/ubuntu:24.04",
+            OciDistributionError::ServerError {
+                code: 404,
+                url: "https://index.docker.io/v2/library/ubuntu/blobs/sha256:bad".to_string(),
+                message: "not found".to_string(),
+            },
+        );
+
+        assert!(matches!(err, OciDiskError::Registry { .. }));
+        assert!(err.to_string().contains("registry request for image"));
+    }
+
+    #[test]
+    fn rate_limit_preserves_registry_error() {
+        let err = OciDiskError::registry(
+            "docker.io/library/ubuntu:24.04",
+            registry_error(OciErrorCode::Toomanyrequests, "pull request limit exceeded"),
+        );
+
+        assert!(matches!(err, OciDiskError::Registry { .. }));
+        assert!(err.to_string().contains("registry request for image"));
+    }
+
+    fn registry_error(code: OciErrorCode, message: &str) -> OciDistributionError {
+        OciDistributionError::RegistryError {
+            url: "https://registry.example.test/v2/image/manifests/tag".to_string(),
+            envelope: OciEnvelope {
+                errors: vec![OciError {
+                    code,
+                    message: message.to_string(),
+                    detail: serde_json::Value::Null,
+                }],
+            },
         }
     }
 }

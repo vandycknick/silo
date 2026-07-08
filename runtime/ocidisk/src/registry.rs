@@ -68,7 +68,7 @@ impl RegistryClient {
             .client
             .pull_manifest(reference, &RegistryAuth::Anonymous)
             .await
-            .map_err(|source| OciDiskError::registry(requested_ref.clone(), source))?;
+            .map_err(|source| OciDiskError::registry_manifest(requested_ref.clone(), source))?;
 
         let (manifest_reference, manifest, manifest_digest) = match manifest {
             OciManifest::Image(manifest) => (reference.clone(), manifest, digest),
@@ -80,7 +80,9 @@ impl RegistryClient {
                     .client
                     .pull_manifest(&manifest_reference, &RegistryAuth::Anonymous)
                     .await
-                    .map_err(|source| OciDiskError::registry(requested_ref.clone(), source))?;
+                    .map_err(|source| {
+                        OciDiskError::registry_manifest(requested_ref.clone(), source)
+                    })?;
                 match selected {
                     OciManifest::Image(manifest) => (manifest_reference, manifest, selected_digest),
                     OciManifest::ImageIndex(_) => {
