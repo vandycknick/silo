@@ -6,82 +6,97 @@ use agent_spec::{NetworkConfig, NetworkInterfaceConfig};
 use eyre::Context;
 
 use crate::provision::{
-    command_exists, run_command, sanitize_unit_name, write_file, ProvisionContext, ProvisionOutcome,
+    command_exists, run_command, sanitize_unit_name, write_file, ProvisionContext,
+    ProvisionOutcome, Provisioner, ProvisionerId,
 };
 
-pub(crate) fn apply(
-    context: &ProvisionContext,
-    config: &NetworkConfig,
-) -> eyre::Result<ProvisionOutcome> {
-    let network_dir = context.guest_path("/etc/systemd/network");
-    let mut desired_paths = BTreeSet::new();
-    let mut changed = false;
+pub(crate) struct Networkd<'a> {
+    config: &'a NetworkConfig,
+}
 
-    for interface in &config.interfaces {
-        let path = network_dir.join(format!(
-            "10-silo-{}.network",
-            sanitize_unit_name(&interface.name)
-        ));
-        desired_paths.insert(path.clone());
-        let rendered = render_network_file(interface);
-        if file_contents(&path)?.as_deref() != Some(rendered.as_str()) {
-            write_file(&path, rendered, 0o644)?;
+impl<'a> Provisioner<'a> for Networkd<'a> {
+    type Config = NetworkConfig;
+
+    fn init(config: &'a Self::Config) -> Self {
+        Self { config }
+    }
+
+    fn id(&self) -> ProvisionerId {
+        ProvisionerId::NETWORKD
+    }
+
+    fn apply(&self, context: &ProvisionContext) -> eyre::Result<ProvisionOutcome> {
+        let network_dir = context.guest_path("/etc/systemd/network");
+        let mut desired_paths = BTreeSet::new();
+        let mut changed = false;
+
+        for interface in &self.config.interfaces {
+            let path = network_dir.join(format!(
+                "10-silo-{}.network",
+                sanitize_unit_name(&interface.name)
+            ));
+            desired_paths.insert(path.clone());
+            let rendered = render_network_file(interface);
+            if file_contents(&path)?.as_deref() != Some(rendered.as_str()) {
+                write_file(&path, rendered, 0o644)?;
+                changed = true;
+            }
+        }
+
+        for stale_path in stale_silo_network_files(&network_dir, &desired_paths)? {
+            fs::remove_file(&stale_path).with_context(|| {
+                format!("remove stale networkd config {}", stale_path.display())
+            })?;
+            tracing::info!(path = %stale_path.display(), "removed stale Silo networkd config");
             changed = true;
         }
+
+        if changed || !self.config.interfaces.is_empty() {
+            if !command_exists("systemctl") {
+                return Ok(ProvisionOutcome::unsupported(
+                    "systemd-networkd requires systemctl, but systemctl is not available",
+                ));
+            }
+
+            let readiness = context
+                .service_manager()
+                .wait_for_systemd(context.process_supervisor());
+            if !readiness.is_ready() {
+                return Ok(ProvisionOutcome::unsupported(format!(
+                    "systemd-networkd requires systemd manager readiness: {}",
+                    readiness.message()
+                )));
+            }
+
+            if !self.config.interfaces.is_empty() {
+                run_command(
+                    context.process_supervisor(),
+                    "systemctl",
+                    ["enable", "systemd-networkd.service"],
+                )?;
+            }
+            if changed {
+                run_command(
+                    context.process_supervisor(),
+                    "systemctl",
+                    ["restart", "systemd-networkd.service"],
+                )?;
+            } else {
+                run_command(
+                    context.process_supervisor(),
+                    "systemctl",
+                    ["start", "systemd-networkd.service"],
+                )?;
+            }
+        }
+
+        tracing::info!(
+            interfaces = self.config.interfaces.len(),
+            changed,
+            "reconciled systemd-networkd config"
+        );
+        Ok(ProvisionOutcome::succeeded(changed))
     }
-
-    for stale_path in stale_silo_network_files(&network_dir, &desired_paths)? {
-        fs::remove_file(&stale_path)
-            .with_context(|| format!("remove stale networkd config {}", stale_path.display()))?;
-        tracing::info!(path = %stale_path.display(), "removed stale Silo networkd config");
-        changed = true;
-    }
-
-    if changed || !config.interfaces.is_empty() {
-        if !command_exists("systemctl") {
-            return Ok(ProvisionOutcome::unsupported(
-                "systemd-networkd requires systemctl, but systemctl is not available",
-            ));
-        }
-
-        let readiness = context
-            .service_manager()
-            .wait_for_systemd(context.process_supervisor());
-        if !readiness.is_ready() {
-            return Ok(ProvisionOutcome::unsupported(format!(
-                "systemd-networkd requires systemd manager readiness: {}",
-                readiness.message()
-            )));
-        }
-
-        if !config.interfaces.is_empty() {
-            run_command(
-                context.process_supervisor(),
-                "systemctl",
-                ["enable", "systemd-networkd.service"],
-            )?;
-        }
-        if changed {
-            run_command(
-                context.process_supervisor(),
-                "systemctl",
-                ["restart", "systemd-networkd.service"],
-            )?;
-        } else {
-            run_command(
-                context.process_supervisor(),
-                "systemctl",
-                ["start", "systemd-networkd.service"],
-            )?;
-        }
-    }
-
-    tracing::info!(
-        interfaces = config.interfaces.len(),
-        changed,
-        "reconciled systemd-networkd config"
-    );
-    Ok(ProvisionOutcome::succeeded(changed))
 }
 
 fn file_contents(path: &std::path::Path) -> eyre::Result<Option<String>> {

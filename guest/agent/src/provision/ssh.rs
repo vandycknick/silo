@@ -6,70 +6,92 @@ use agent_spec::AgentSshAuthorizedUser;
 use eyre::{eyre, Context};
 
 use crate::provision::{
-    command_exists, run_command, write_file, ProvisionContext, ProvisionOutcome,
+    command_exists, run_command, write_file, ProvisionContext, ProvisionOutcome, Provisioner,
+    ProvisionerId,
 };
 
-pub(crate) fn apply(
-    context: &ProvisionContext,
-    authorized_users: &[AgentSshAuthorizedUser],
-) -> eyre::Result<ProvisionOutcome> {
-    if authorized_users.is_empty() {
-        return Ok(ProvisionOutcome::skipped(
-            "no SSH authorized users configured",
-        ));
+const AFTER: &[ProvisionerId] = &[ProvisionerId::USERS];
+
+pub(crate) struct AuthorizedKeys<'a> {
+    authorized_users: &'a [AgentSshAuthorizedUser],
+}
+
+impl<'a> Provisioner<'a> for AuthorizedKeys<'a> {
+    type Config = [AgentSshAuthorizedUser];
+
+    fn init(config: &'a Self::Config) -> Self {
+        Self {
+            authorized_users: config,
+        }
     }
 
-    let users = read_passwd_entries(context)?;
-    let mut installed = Vec::new();
-    let mut missing = Vec::new();
-    let mut no_keys = Vec::new();
+    fn id(&self) -> ProvisionerId {
+        ProvisionerId::SSH_AUTHORIZED_KEYS
+    }
 
-    for authorized_user in authorized_users {
-        if authorized_user.authorized_keys.is_empty() {
-            no_keys.push(authorized_user.name.clone());
-            continue;
+    fn after(&self) -> &[ProvisionerId] {
+        AFTER
+    }
+
+    fn apply(&self, context: &ProvisionContext) -> eyre::Result<ProvisionOutcome> {
+        if self.authorized_users.is_empty() {
+            return Ok(ProvisionOutcome::skipped(
+                "no SSH authorized users configured",
+            ));
         }
 
-        let Some(user) = users.get(&authorized_user.name) else {
-            missing.push(authorized_user.name.clone());
-            continue;
-        };
+        let users = read_passwd_entries(context)?;
+        let mut installed = Vec::new();
+        let mut missing = Vec::new();
+        let mut no_keys = Vec::new();
 
-        install_authorized_keys(context, user, &authorized_user.authorized_keys)?;
-        installed.push(authorized_user.name.clone());
-    }
+        for authorized_user in self.authorized_users {
+            if authorized_user.authorized_keys.is_empty() {
+                no_keys.push(authorized_user.name.clone());
+                continue;
+            }
 
-    if installed.is_empty() {
-        let mut reasons = Vec::new();
+            let Some(user) = users.get(&authorized_user.name) else {
+                missing.push(authorized_user.name.clone());
+                continue;
+            };
+
+            install_authorized_keys(context, user, &authorized_user.authorized_keys)?;
+            installed.push(authorized_user.name.clone());
+        }
+
+        if installed.is_empty() {
+            let mut reasons = Vec::new();
+            if !missing.is_empty() {
+                reasons.push(format!("missing users: {}", missing.join(", ")));
+            }
+            if !no_keys.is_empty() {
+                reasons.push(format!("users without keys: {}", no_keys.join(", ")));
+            }
+            let message = if reasons.is_empty() {
+                "no SSH authorized keys configured".to_string()
+            } else {
+                reasons.join("; ")
+            };
+            return Ok(ProvisionOutcome::skipped(message));
+        }
+
+        let mut message = format!("installed SSH authorized keys for {}", installed.join(", "));
         if !missing.is_empty() {
-            reasons.push(format!("missing users: {}", missing.join(", ")));
+            message.push_str(&format!("; skipped missing users: {}", missing.join(", ")));
         }
         if !no_keys.is_empty() {
-            reasons.push(format!("users without keys: {}", no_keys.join(", ")));
+            message.push_str(&format!(
+                "; skipped users without keys: {}",
+                no_keys.join(", ")
+            ));
         }
-        let message = if reasons.is_empty() {
-            "no SSH authorized keys configured".to_string()
-        } else {
-            reasons.join("; ")
-        };
-        return Ok(ProvisionOutcome::skipped(message));
-    }
 
-    let mut message = format!("installed SSH authorized keys for {}", installed.join(", "));
-    if !missing.is_empty() {
-        message.push_str(&format!("; skipped missing users: {}", missing.join(", ")));
+        Ok(ProvisionOutcome::Succeeded {
+            changed: true,
+            message,
+        })
     }
-    if !no_keys.is_empty() {
-        message.push_str(&format!(
-            "; skipped users without keys: {}",
-            no_keys.join(", ")
-        ));
-    }
-
-    Ok(ProvisionOutcome::Succeeded {
-        changed: true,
-        message,
-    })
 }
 
 fn install_authorized_keys(

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -5,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use agent_spec::{AgentSshConfig, ProvisionConfig, UserdataContentType};
+use agent_spec::{AgentSshConfig, ProvisionConfig};
 use eyre::{eyre, Context};
 use protocol::v1::{
     ProvisionFailurePolicy as ProtoProvisionFailurePolicy, ProvisionOverallStatus, ProvisionReport,
@@ -54,8 +55,9 @@ pub fn run_provisioning(
     let context = ProvisionContext::new(process_supervisor.clone(), boot_mode);
     tracing::info!("guest reconciliation starting");
 
+    let plan = provisioners(config, ssh_config)?;
     let mut run = ProvisionRun::default();
-    run.run(provisioners(&context, config, ssh_config));
+    run.run(&context, plan);
 
     if run.is_success() {
         tracing::info!("guest reconciliation complete");
@@ -72,138 +74,27 @@ pub fn run_provisioning(
 }
 
 fn provisioners<'a>(
-    context: &'a ProvisionContext,
     config: &'a ProvisionConfig,
     ssh_config: &'a AgentSshConfig,
-) -> Vec<ProvisionerStep<'a>> {
-    vec![
-        ProvisionerStep::new(
-            ProvisionerId::HOSTNAME,
-            &[ProvisionResource::Hostname],
-            move || configured_text(config.hostname.as_deref(), "no hostname configured"),
-            move || hostname::apply(context, config.hostname.as_deref()),
-        ),
-        ProvisionerStep::new(
-            ProvisionerId::TIMEZONE,
-            &[ProvisionResource::Timezone],
-            move || configured_text(config.timezone.as_deref(), "no timezone configured"),
-            move || timezone::apply(context, config.timezone.as_deref()),
-        ),
-        ProvisionerStep::new(
-            ProvisionerId::LOCALE,
-            &[ProvisionResource::Locale],
-            move || configured_text(config.locale.as_deref(), "no locale configured"),
-            move || locale::apply(context, config.locale.as_deref()),
-        ),
-        ProvisionerStep::new(
-            ProvisionerId::USERS,
-            &[ProvisionResource::Users],
-            move || configured(!config.users.is_empty(), "no users configured"),
-            move || user::apply(context, &config.users),
-        ),
-        ProvisionerStep::new(
-            ProvisionerId::SSH_AUTHORIZED_KEYS,
-            &[ProvisionResource::SshAuthorizedKeys],
-            move || {
-                configured(
-                    !ssh_config.authorized_users.is_empty(),
-                    "no SSH authorized users configured",
-                )
-            },
-            move || ssh::apply(context, &ssh_config.authorized_users),
-        ),
-        ProvisionerStep::new(
-            ProvisionerId::CERTIFICATE_AUTHORITY,
-            &[ProvisionResource::CertificateStore],
-            move || {
-                configured(
-                    config.certificate_authority.is_some(),
-                    "no certificate authority configured",
-                )
-            },
-            move || ca::apply(context, config.certificate_authority.as_ref()),
-        ),
-        ProvisionerStep::new(
-            ProvisionerId::RESIZE_ROOTFS,
-            &[ProvisionResource::RootFilesystem],
-            move || {
-                configured(
-                    config.resize_rootfs.enabled,
-                    "root filesystem resize disabled",
-                )
-            },
-            move || resize::apply(context, &config.resize_rootfs),
-        ),
-        ProvisionerStep::new(
-            ProvisionerId::MOUNTS,
-            &[ProvisionResource::MountTable],
-            move || configured(!config.mounts.is_empty(), "no mounts configured"),
-            move || mounts::apply(context, &config.mounts),
-        ),
-        ProvisionerStep::new(
-            ProvisionerId::ROSETTA,
-            &[ProvisionResource::Rosetta, ProvisionResource::MountTable],
-            move || configured(config.rosetta.enabled, "Rosetta disabled"),
-            move || rosetta::apply(context, &config.rosetta),
-        ),
-        ProvisionerStep::new(
-            ProvisionerId::NETWORKD,
-            &[
-                ProvisionResource::NetworkConfig,
-                ProvisionResource::ServiceManager,
-            ],
-            || ProvisionSupport::Supported,
-            move || networkd::apply(context, &config.network),
-        ),
-        ProvisionerStep::new(
-            ProvisionerId::USERDATA,
-            &[ProvisionResource::Userdata],
-            move || userdata_support(config.userdata.as_ref()),
-            move || userdata::apply(context, config.userdata.as_ref()),
-        ),
-    ]
+) -> eyre::Result<ProvisionerPlan<'a>> {
+    ProvisionerPlan::new(vec![
+        Box::new(hostname::Hostname::init(&config.hostname)),
+        Box::new(timezone::Timezone::init(&config.timezone)),
+        Box::new(locale::Locale::init(&config.locale)),
+        Box::new(user::Users::init(&config.users)),
+        Box::new(ssh::AuthorizedKeys::init(&ssh_config.authorized_users)),
+        Box::new(ca::CertificateAuthority::init(
+            &config.certificate_authority,
+        )),
+        Box::new(resize::ResizeRootfs::init(&config.resize_rootfs)),
+        Box::new(mounts::Mounts::init(&config.mounts)),
+        Box::new(rosetta::Rosetta::init(&config.rosetta)),
+        Box::new(networkd::Networkd::init(&config.network)),
+        Box::new(userdata::Userdata::init(&config.userdata)),
+    ])
 }
 
-fn configured(condition: bool, skipped_message: &'static str) -> ProvisionSupport {
-    if condition {
-        ProvisionSupport::Supported
-    } else {
-        ProvisionSupport::Skipped {
-            message: skipped_message.to_string(),
-        }
-    }
-}
-
-fn configured_text(value: Option<&str>, skipped_message: &'static str) -> ProvisionSupport {
-    configured(
-        value.map(str::trim).is_some_and(|value| !value.is_empty()),
-        skipped_message,
-    )
-}
-
-fn userdata_support(userdata: Option<&agent_spec::UserdataConfig>) -> ProvisionSupport {
-    let Some(userdata) = userdata else {
-        return ProvisionSupport::Skipped {
-            message: String::from("no userdata configured"),
-        };
-    };
-    if userdata.content.trim().is_empty() {
-        return ProvisionSupport::Skipped {
-            message: String::from("userdata content is empty"),
-        };
-    }
-    if userdata.content_type != UserdataContentType::ShellScript {
-        return ProvisionSupport::Unsupported {
-            message: format!(
-                "userdata content type {:?} is not supported",
-                userdata.content_type
-            ),
-        };
-    }
-    ProvisionSupport::Supported
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 struct ProvisionerId(&'static str);
 
 impl ProvisionerId {
@@ -225,22 +116,6 @@ impl ProvisionerId {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ProvisionResource {
-    RootFilesystem,
-    MountTable,
-    Hostname,
-    Timezone,
-    Locale,
-    Users,
-    SshAuthorizedKeys,
-    CertificateStore,
-    ServiceManager,
-    NetworkConfig,
-    Rosetta,
-    Userdata,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FailurePolicy {
     BestEffort,
     FailBoot,
@@ -253,13 +128,6 @@ impl FailurePolicy {
             Self::FailBoot => ProtoProvisionFailurePolicy::FailBoot,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProvisionSupport {
-    Supported,
-    Skipped { message: String },
-    Unsupported { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,13 +158,93 @@ impl ProvisionOutcome {
     }
 }
 
-struct ProvisionerStep<'a> {
-    id: ProvisionerId,
-    dependencies: &'static [ProvisionerId],
-    resources: &'static [ProvisionResource],
-    failure_policy: FailurePolicy,
-    supports: Box<dyn Fn() -> ProvisionSupport + 'a>,
-    execute: Box<dyn Fn() -> eyre::Result<ProvisionOutcome> + 'a>,
+trait Provisioner<'config> {
+    type Config: ?Sized
+    where
+        Self: Sized;
+
+    fn init(config: &'config Self::Config) -> Self
+    where
+        Self: Sized;
+
+    fn id(&self) -> ProvisionerId;
+
+    fn after(&self) -> &[ProvisionerId] {
+        &[]
+    }
+
+    fn requires(&self) -> &[ProvisionerId] {
+        &[]
+    }
+
+    fn failure_policy(&self) -> FailurePolicy {
+        FailurePolicy::BestEffort
+    }
+
+    fn apply(&self, context: &ProvisionContext) -> eyre::Result<ProvisionOutcome>;
+}
+
+type BoxedProvisioner<'a> = Box<dyn Provisioner<'a> + 'a>;
+
+struct ProvisionerPlan<'a> {
+    provisioners: Vec<BoxedProvisioner<'a>>,
+}
+
+impl<'a> ProvisionerPlan<'a> {
+    fn new(provisioners: Vec<BoxedProvisioner<'a>>) -> eyre::Result<Self> {
+        let mut positions = HashMap::with_capacity(provisioners.len());
+        for (position, provisioner) in provisioners.iter().enumerate() {
+            let id = provisioner.id();
+            if positions.insert(id, position).is_some() {
+                return Err(eyre!("duplicate provisioner id {}", id.as_str()));
+            }
+        }
+
+        for (position, provisioner) in provisioners.iter().enumerate() {
+            validate_dependencies(
+                provisioner.id(),
+                "after",
+                provisioner.after(),
+                position,
+                &positions,
+            )?;
+            validate_dependencies(
+                provisioner.id(),
+                "requires",
+                provisioner.requires(),
+                position,
+                &positions,
+            )?;
+        }
+
+        Ok(Self { provisioners })
+    }
+}
+
+fn validate_dependencies(
+    provisioner: ProvisionerId,
+    relation: &str,
+    dependencies: &[ProvisionerId],
+    provisioner_position: usize,
+    positions: &HashMap<ProvisionerId, usize>,
+) -> eyre::Result<()> {
+    for dependency in dependencies {
+        let Some(dependency_position) = positions.get(dependency) else {
+            return Err(eyre!(
+                "provisioner {} declares {relation} dependency {}, but it is not registered",
+                provisioner.as_str(),
+                dependency.as_str()
+            ));
+        };
+        if *dependency_position >= provisioner_position {
+            return Err(eyre!(
+                "provisioner {} declares {relation} dependency {}, but dependencies must be registered first",
+                provisioner.as_str(),
+                dependency.as_str()
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct StepRecord {
@@ -324,36 +272,6 @@ impl StepRecord {
     }
 }
 
-impl<'a> ProvisionerStep<'a> {
-    fn new(
-        id: ProvisionerId,
-        resources: &'static [ProvisionResource],
-        supports: impl Fn() -> ProvisionSupport + 'a,
-        execute: impl Fn() -> eyre::Result<ProvisionOutcome> + 'a,
-    ) -> Self {
-        Self {
-            id,
-            dependencies: &[],
-            resources,
-            failure_policy: FailurePolicy::BestEffort,
-            supports: Box::new(supports),
-            execute: Box::new(execute),
-        }
-    }
-
-    #[cfg(test)]
-    fn with_dependencies(mut self, dependencies: &'static [ProvisionerId]) -> Self {
-        self.dependencies = dependencies;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_failure_policy(mut self, failure_policy: FailurePolicy) -> Self {
-        self.failure_policy = failure_policy;
-        self
-    }
-}
-
 #[derive(Debug, Default)]
 struct ProvisionRun {
     steps: Vec<ProvisionStepReport>,
@@ -361,28 +279,29 @@ struct ProvisionRun {
 }
 
 impl ProvisionRun {
-    fn run<'a>(&mut self, provisioners: Vec<ProvisionerStep<'a>>) {
-        for provisioner in provisioners {
-            self.step(provisioner);
+    fn run<'a>(&mut self, context: &ProvisionContext, plan: ProvisionerPlan<'a>) {
+        for provisioner in plan.provisioners {
+            self.step(context, provisioner.as_ref());
             if self.failed_boot {
                 break;
             }
         }
     }
 
-    fn step(&mut self, provisioner: ProvisionerStep<'_>) {
-        let id = provisioner.id;
+    fn step<'a>(&mut self, context: &ProvisionContext, provisioner: &dyn Provisioner<'a>) {
+        let id = provisioner.id();
         let name = id.as_str();
+        let failure_policy = provisioner.failure_policy();
         tracing::debug!(
             provisioner = name,
-            dependencies = ?provisioner.dependencies,
-            resources = ?provisioner.resources,
-            failure_policy = ?provisioner.failure_policy,
+            after = ?provisioner.after(),
+            requires = ?provisioner.requires(),
+            failure_policy = ?failure_policy,
             "provisioner starting"
         );
         let started = Instant::now();
 
-        if let Some(dependency) = self.blocking_dependency(provisioner.dependencies) {
+        if let Some(dependency) = self.blocking_dependency(provisioner.requires()) {
             let message = format!(
                 "skipped because dependency {} did not succeed",
                 dependency.as_str()
@@ -393,9 +312,9 @@ impl ProvisionRun {
                 "provisioner skipped because dependency did not succeed"
             );
             self.push_step(StepRecord {
-                id: provisioner.id,
+                id,
                 status: ProvisionStepStatus::Skipped,
-                failure_policy: provisioner.failure_policy,
+                failure_policy,
                 changed: false,
                 started,
                 message,
@@ -404,40 +323,9 @@ impl ProvisionRun {
             return;
         }
 
-        match (provisioner.supports)() {
-            ProvisionSupport::Supported => {}
-            ProvisionSupport::Skipped { message } => {
-                tracing::debug!(provisioner = name, reason = %message, "provisioner skipped");
-                self.push_step(StepRecord {
-                    id,
-                    status: ProvisionStepStatus::Skipped,
-                    failure_policy: provisioner.failure_policy,
-                    changed: false,
-                    started,
-                    message,
-                    error_chain: String::new(),
-                });
-                return;
-            }
-            ProvisionSupport::Unsupported { message } => {
-                tracing::warn!(provisioner = name, reason = %message, "provisioner unsupported");
-                self.push_step(StepRecord {
-                    id,
-                    status: ProvisionStepStatus::Unsupported,
-                    failure_policy: provisioner.failure_policy,
-                    changed: false,
-                    started,
-                    message,
-                    error_chain: String::new(),
-                });
-                self.maybe_mark_failed_boot(provisioner.failure_policy);
-                return;
-            }
-        }
-
-        match (provisioner.execute)() {
-            Ok(outcome) => self.record_outcome(id, provisioner.failure_policy, started, outcome),
-            Err(err) => self.record_failure(id, provisioner.failure_policy, started, err),
+        match provisioner.apply(context) {
+            Ok(outcome) => self.record_outcome(id, failure_policy, started, outcome),
+            Err(err) => self.record_failure(id, failure_policy, started, err),
         }
     }
 
@@ -830,35 +718,108 @@ mod tests {
     use protocol::v1::{ProvisionFailurePolicy, ProvisionOverallStatus, ProvisionStepStatus};
 
     use crate::provision::{
-        command_stream_for_log, format_error_chain, FailurePolicy, ProvisionOutcome, ProvisionRun,
-        ProvisionSupport, ProvisionerId, ProvisionerStep,
+        command_stream_for_log, format_error_chain, provisioners, BoxedProvisioner, FailurePolicy,
+        ProvisionContext, ProvisionOutcome, ProvisionRun, Provisioner, ProvisionerId,
+        ProvisionerPlan,
     };
+
+    struct TestProvisioner<'a> {
+        id: ProvisionerId,
+        after: &'static [ProvisionerId],
+        requires: &'static [ProvisionerId],
+        failure_policy: FailurePolicy,
+        apply: Box<dyn Fn() -> eyre::Result<ProvisionOutcome> + 'a>,
+    }
+
+    impl<'a> TestProvisioner<'a> {
+        fn new(id: ProvisionerId, apply: impl Fn() -> eyre::Result<ProvisionOutcome> + 'a) -> Self {
+            Self {
+                id,
+                after: &[],
+                requires: &[],
+                failure_policy: FailurePolicy::BestEffort,
+                apply: Box::new(apply),
+            }
+        }
+
+        fn with_after(mut self, after: &'static [ProvisionerId]) -> Self {
+            self.after = after;
+            self
+        }
+
+        fn with_requirements(mut self, requires: &'static [ProvisionerId]) -> Self {
+            self.requires = requires;
+            self
+        }
+
+        fn with_failure_policy(mut self, failure_policy: FailurePolicy) -> Self {
+            self.failure_policy = failure_policy;
+            self
+        }
+    }
+
+    impl<'a> Provisioner<'a> for TestProvisioner<'a> {
+        type Config = ();
+
+        fn init(_config: &'a Self::Config) -> Self {
+            Self::new(ProvisionerId("test"), || {
+                Ok(ProvisionOutcome::succeeded(false))
+            })
+        }
+
+        fn id(&self) -> ProvisionerId {
+            self.id
+        }
+
+        fn after(&self) -> &[ProvisionerId] {
+            self.after
+        }
+
+        fn requires(&self) -> &[ProvisionerId] {
+            self.requires
+        }
+
+        fn failure_policy(&self) -> FailurePolicy {
+            self.failure_policy
+        }
+
+        fn apply(&self, _context: &ProvisionContext) -> eyre::Result<ProvisionOutcome> {
+            (self.apply)()
+        }
+    }
+
+    fn boxed<'a>(provisioner: TestProvisioner<'a>) -> BoxedProvisioner<'a> {
+        Box::new(provisioner)
+    }
+
+    fn run_plan<'a>(run: &mut ProvisionRun, provisioners: Vec<BoxedProvisioner<'a>>) {
+        let plan =
+            ProvisionerPlan::new(provisioners).expect("test provisioner plan should be valid");
+        let context = ProvisionContext::new(
+            crate::pid1::ProcessSupervisor::default(),
+            &crate::handoff::BootMode::Standard,
+        );
+        run.run(&context, plan);
+    }
 
     #[test]
     fn provision_run_continues_after_failure() {
         let calls = RefCell::new(Vec::new());
         let mut run = ProvisionRun::default();
 
-        run.run(vec![
-            ProvisionerStep::new(
-                ProvisionerId("first"),
-                &[],
-                || ProvisionSupport::Supported,
-                || {
+        run_plan(
+            &mut run,
+            vec![
+                boxed(TestProvisioner::new(ProvisionerId("first"), || {
                     calls.borrow_mut().push("first");
                     Err(eyre!("boom"))
-                },
-            ),
-            ProvisionerStep::new(
-                ProvisionerId("second"),
-                &[],
-                || ProvisionSupport::Supported,
-                || {
+                })),
+                boxed(TestProvisioner::new(ProvisionerId("second"), || {
                     calls.borrow_mut().push("second");
                     Ok(ProvisionOutcome::succeeded(false))
-                },
-            ),
-        ]);
+                })),
+            ],
+        );
 
         assert_eq!(calls.into_inner(), ["first", "second"]);
         assert!(!run.is_success());
@@ -869,14 +830,13 @@ mod tests {
     #[test]
     fn provision_run_reports_success_when_everything_is_skipped() {
         let mut run = ProvisionRun::default();
-        run.run(vec![ProvisionerStep::new(
-            ProvisionerId("skipped"),
-            &[],
-            || ProvisionSupport::Skipped {
-                message: String::from("nothing configured"),
-            },
-            || Ok(ProvisionOutcome::succeeded(true)),
-        )]);
+        run_plan(
+            &mut run,
+            vec![boxed(TestProvisioner::new(
+                ProvisionerId("skipped"),
+                || Ok(ProvisionOutcome::skipped("nothing configured")),
+            ))],
+        );
 
         let report = run.finish(100, Instant::now());
 
@@ -904,12 +864,12 @@ mod tests {
     #[test]
     fn provision_run_reports_best_effort_failure_as_degraded() {
         let mut run = ProvisionRun::default();
-        run.run(vec![ProvisionerStep::new(
-            ProvisionerId("broken"),
-            &[],
-            || ProvisionSupport::Supported,
-            || Err(eyre!("nope")),
-        )]);
+        run_plan(
+            &mut run,
+            vec![boxed(TestProvisioner::new(ProvisionerId("broken"), || {
+                Err(eyre!("nope"))
+            }))],
+        );
 
         let report = run.finish(100, Instant::now());
 
@@ -929,27 +889,22 @@ mod tests {
         let calls = RefCell::new(Vec::new());
         let mut run = ProvisionRun::default();
 
-        run.run(vec![
-            ProvisionerStep::new(
-                ProvisionerId("fatal"),
-                &[],
-                || ProvisionSupport::Supported,
-                || {
-                    calls.borrow_mut().push("fatal");
-                    Err(eyre!("fatal boom"))
-                },
-            )
-            .with_failure_policy(FailurePolicy::FailBoot),
-            ProvisionerStep::new(
-                ProvisionerId("later"),
-                &[],
-                || ProvisionSupport::Supported,
-                || {
+        run_plan(
+            &mut run,
+            vec![
+                boxed(
+                    TestProvisioner::new(ProvisionerId("fatal"), || {
+                        calls.borrow_mut().push("fatal");
+                        Err(eyre!("fatal boom"))
+                    })
+                    .with_failure_policy(FailurePolicy::FailBoot),
+                ),
+                boxed(TestProvisioner::new(ProvisionerId("later"), || {
                     calls.borrow_mut().push("later");
                     Ok(ProvisionOutcome::succeeded(false))
-                },
-            ),
-        ]);
+                })),
+            ],
+        );
 
         let report = run.finish(100, Instant::now());
 
@@ -970,27 +925,22 @@ mod tests {
         let calls = RefCell::new(Vec::new());
         let mut run = ProvisionRun::default();
 
-        run.run(vec![
-            ProvisionerStep::new(
-                ProvisionerId("first"),
-                &[],
-                || ProvisionSupport::Supported,
-                || {
+        run_plan(
+            &mut run,
+            vec![
+                boxed(TestProvisioner::new(ProvisionerId("first"), || {
                     calls.borrow_mut().push("first");
                     Err(eyre!("boom"))
-                },
-            ),
-            ProvisionerStep::new(
-                ProvisionerId("dependent"),
-                &[],
-                || ProvisionSupport::Supported,
-                || {
-                    calls.borrow_mut().push("dependent");
-                    Ok(ProvisionOutcome::succeeded(false))
-                },
-            )
-            .with_dependencies(FIRST_DEPENDENCY),
-        ]);
+                })),
+                boxed(
+                    TestProvisioner::new(ProvisionerId("dependent"), || {
+                        calls.borrow_mut().push("dependent");
+                        Ok(ProvisionOutcome::succeeded(false))
+                    })
+                    .with_requirements(FIRST_DEPENDENCY),
+                ),
+            ],
+        );
 
         let report = run.finish(100, Instant::now());
 
@@ -1009,14 +959,13 @@ mod tests {
     fn unsupported_best_effort_provisioner_degrades_report() {
         let mut run = ProvisionRun::default();
 
-        run.run(vec![ProvisionerStep::new(
-            ProvisionerId("unsupported"),
-            &[],
-            || ProvisionSupport::Unsupported {
-                message: String::from("backend missing"),
-            },
-            || Ok(ProvisionOutcome::succeeded(true)),
-        )]);
+        run_plan(
+            &mut run,
+            vec![boxed(TestProvisioner::new(
+                ProvisionerId("unsupported"),
+                || Ok(ProvisionOutcome::unsupported("backend missing")),
+            ))],
+        );
 
         let report = run.finish(100, Instant::now());
 
@@ -1027,5 +976,97 @@ mod tests {
             ProvisionStepStatus::Unsupported as i32
         );
         assert_eq!(report.steps[0].message, "backend missing");
+    }
+
+    #[test]
+    fn ordering_dependency_does_not_block_after_failure() {
+        const FIRST: &[ProvisionerId] = &[ProvisionerId("first")];
+        let calls = RefCell::new(Vec::new());
+        let mut run = ProvisionRun::default();
+
+        run_plan(
+            &mut run,
+            vec![
+                boxed(TestProvisioner::new(ProvisionerId("first"), || {
+                    calls.borrow_mut().push("first");
+                    Err(eyre!("boom"))
+                })),
+                boxed(
+                    TestProvisioner::new(ProvisionerId("later"), || {
+                        calls.borrow_mut().push("later");
+                        Ok(ProvisionOutcome::succeeded(false))
+                    })
+                    .with_after(FIRST),
+                ),
+            ],
+        );
+
+        assert_eq!(calls.into_inner(), ["first", "later"]);
+    }
+
+    #[test]
+    fn plan_rejects_duplicate_ids() {
+        let result = ProvisionerPlan::new(vec![
+            boxed(TestProvisioner::new(ProvisionerId("duplicate"), || {
+                Ok(ProvisionOutcome::succeeded(false))
+            })),
+            boxed(TestProvisioner::new(ProvisionerId("duplicate"), || {
+                Ok(ProvisionOutcome::succeeded(false))
+            })),
+        ]);
+
+        let error = result.err().expect("duplicate ids should be rejected");
+        assert!(error
+            .to_string()
+            .contains("duplicate provisioner id duplicate"));
+    }
+
+    #[test]
+    fn plan_rejects_missing_dependencies() {
+        const MISSING: &[ProvisionerId] = &[ProvisionerId("missing")];
+        let result = ProvisionerPlan::new(vec![boxed(
+            TestProvisioner::new(ProvisionerId("dependent"), || {
+                Ok(ProvisionOutcome::succeeded(false))
+            })
+            .with_requirements(MISSING),
+        )]);
+
+        let error = result
+            .err()
+            .expect("missing dependencies should be rejected");
+        assert!(error
+            .to_string()
+            .contains("missing, but it is not registered"));
+    }
+
+    #[test]
+    fn plan_rejects_dependencies_registered_later() {
+        const LATER: &[ProvisionerId] = &[ProvisionerId("later")];
+        let result = ProvisionerPlan::new(vec![
+            boxed(
+                TestProvisioner::new(ProvisionerId("first"), || {
+                    Ok(ProvisionOutcome::succeeded(false))
+                })
+                .with_after(LATER),
+            ),
+            boxed(TestProvisioner::new(ProvisionerId("later"), || {
+                Ok(ProvisionOutcome::succeeded(false))
+            })),
+        ]);
+
+        let error = result
+            .err()
+            .expect("forward dependencies should be rejected");
+        assert!(error
+            .to_string()
+            .contains("dependencies must be registered first"));
+    }
+
+    #[test]
+    fn built_in_provisioner_plan_is_valid() {
+        let config = agent_spec::ProvisionConfig::default();
+        let ssh_config = agent_spec::AgentSshConfig::default();
+
+        provisioners(&config, &ssh_config).expect("built-in provisioner plan should be valid");
     }
 }

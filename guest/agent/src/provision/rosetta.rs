@@ -6,7 +6,8 @@ use agent_spec::AgentRosettaConfig;
 use eyre::Context;
 
 use crate::provision::{
-    command_exists, command_status, run_command, ProvisionContext, ProvisionOutcome,
+    command_exists, command_status, run_command, ProvisionContext, ProvisionOutcome, Provisioner,
+    ProvisionerId,
 };
 
 const BINFMT_MISC_PATH: &str = "/proc/sys/fs/binfmt_misc";
@@ -28,43 +29,56 @@ const ROSETTA_REGISTRATION_PREFIX: &[u8] = br":rosetta:M::\x7fELF\x02\x01\x01\x0
 //   binfmt entry is unregistered.
 const ROSETTA_REGISTRATION_SUFFIX: &[u8] = b":OCF";
 
-pub(crate) fn apply(
-    context: &ProvisionContext,
-    config: &AgentRosettaConfig,
-) -> eyre::Result<ProvisionOutcome> {
-    if !config.enabled {
-        return Ok(ProvisionOutcome::skipped("Rosetta disabled"));
+pub(crate) struct Rosetta<'a> {
+    config: &'a AgentRosettaConfig,
+}
+
+impl<'a> Provisioner<'a> for Rosetta<'a> {
+    type Config = AgentRosettaConfig;
+
+    fn init(config: &'a Self::Config) -> Self {
+        Self { config }
     }
 
-    let mount_path = context.guest_path(&config.mount_path);
-    fs::create_dir_all(&mount_path)
-        .with_context(|| format!("create Rosetta mount path {}", mount_path.display()))?;
-    mount_if_needed(
-        context,
-        &mount_path,
-        ["-t", "virtiofs", config.mount_tag.as_str()],
-    )?;
+    fn id(&self) -> ProvisionerId {
+        ProvisionerId::ROSETTA
+    }
 
-    let rosetta_binary = mount_path.join("rosetta");
-    ensure_rosetta_binary(&rosetta_binary)?;
+    fn apply(&self, context: &ProvisionContext) -> eyre::Result<ProvisionOutcome> {
+        if !self.config.enabled {
+            return Ok(ProvisionOutcome::skipped("Rosetta disabled"));
+        }
 
-    let binfmt_path = context.guest_path(BINFMT_MISC_PATH);
-    fs::create_dir_all(&binfmt_path)
-        .with_context(|| format!("create binfmt_misc path {}", binfmt_path.display()))?;
-    mount_if_needed(context, &binfmt_path, ["-t", "binfmt_misc", "binfmt_misc"])?;
+        let mount_path = context.guest_path(&self.config.mount_path);
+        fs::create_dir_all(&mount_path)
+            .with_context(|| format!("create Rosetta mount path {}", mount_path.display()))?;
+        mount_if_needed(
+            context,
+            &mount_path,
+            ["-t", "virtiofs", self.config.mount_tag.as_str()],
+        )?;
 
-    unregister_existing_rosetta(context)?;
-    register_rosetta(context, &rosetta_binary)?;
-    log_registered_rosetta(context)?;
+        let rosetta_binary = mount_path.join("rosetta");
+        ensure_rosetta_binary(&rosetta_binary)?;
 
-    tracing::info!(
-        mount_tag = %config.mount_tag,
-        mount_path = %config.mount_path,
-        rosetta = %rosetta_binary.display(),
-        "reconciled Rosetta binfmt handler"
-    );
+        let binfmt_path = context.guest_path(BINFMT_MISC_PATH);
+        fs::create_dir_all(&binfmt_path)
+            .with_context(|| format!("create binfmt_misc path {}", binfmt_path.display()))?;
+        mount_if_needed(context, &binfmt_path, ["-t", "binfmt_misc", "binfmt_misc"])?;
 
-    Ok(ProvisionOutcome::succeeded(true))
+        unregister_existing_rosetta(context)?;
+        register_rosetta(context, &rosetta_binary)?;
+        log_registered_rosetta(context)?;
+
+        tracing::info!(
+            mount_tag = %self.config.mount_tag,
+            mount_path = %self.config.mount_path,
+            rosetta = %rosetta_binary.display(),
+            "reconciled Rosetta binfmt handler"
+        );
+
+        Ok(ProvisionOutcome::succeeded(true))
+    }
 }
 
 fn mount_if_needed<const N: usize>(

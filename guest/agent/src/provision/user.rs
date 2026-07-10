@@ -6,35 +6,48 @@ use eyre::{eyre, Context};
 
 use crate::provision::{
     command_exists, format_error_chain, run_command, sanitize_unit_name, write_file,
-    ProvisionContext, ProvisionOutcome,
+    ProvisionContext, ProvisionOutcome, Provisioner, ProvisionerId,
 };
 
-pub(crate) fn apply(
-    context: &ProvisionContext,
-    users: &[UserConfig],
-) -> eyre::Result<ProvisionOutcome> {
-    if users.is_empty() {
-        return Ok(ProvisionOutcome::skipped("no users configured"));
+pub(crate) struct Users<'a> {
+    users: &'a [UserConfig],
+}
+
+impl<'a> Provisioner<'a> for Users<'a> {
+    type Config = [UserConfig];
+
+    fn init(config: &'a Self::Config) -> Self {
+        Self { users: config }
     }
 
-    let mut failures = Vec::new();
+    fn id(&self) -> ProvisionerId {
+        ProvisionerId::USERS
+    }
 
-    for user in users {
-        if let Err(err) = apply_user(context, user) {
-            let error = format_error_chain(&err);
-            tracing::error!(user = %user.name, error = %error, "failed to provision user; continuing");
-            failures.push(format!("{}: {error}", user.name));
+    fn apply(&self, context: &ProvisionContext) -> eyre::Result<ProvisionOutcome> {
+        if self.users.is_empty() {
+            return Ok(ProvisionOutcome::skipped("no users configured"));
         }
-    }
 
-    if failures.is_empty() {
-        Ok(ProvisionOutcome::succeeded(false))
-    } else {
-        Err(eyre!(
-            "failed to provision {} user(s): {}",
-            failures.len(),
-            failures.join("; ")
-        ))
+        let mut failures = Vec::new();
+
+        for user in self.users {
+            if let Err(err) = apply_user(context, user) {
+                let error = format_error_chain(&err);
+                tracing::error!(user = %user.name, error = %error, "failed to provision user; continuing");
+                failures.push(format!("{}: {error}", user.name));
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(ProvisionOutcome::succeeded(false))
+        } else {
+            Err(eyre!(
+                "failed to provision {} user(s): {}",
+                failures.len(),
+                failures.join("; ")
+            ))
+        }
     }
 }
 

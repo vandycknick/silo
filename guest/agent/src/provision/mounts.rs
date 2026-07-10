@@ -6,44 +6,57 @@ use eyre::{eyre, Context};
 
 use crate::provision::{
     command_exists, command_output, format_error_chain, run_command, ProvisionContext,
-    ProvisionOutcome,
+    ProvisionOutcome, Provisioner, ProvisionerId,
 };
 
-pub(crate) fn apply(
-    context: &ProvisionContext,
-    mounts: &[MountConfig],
-) -> eyre::Result<ProvisionOutcome> {
-    if mounts.is_empty() {
-        return Ok(ProvisionOutcome::skipped("no mounts configured"));
+pub(crate) struct Mounts<'a> {
+    mounts: &'a [MountConfig],
+}
+
+impl<'a> Provisioner<'a> for Mounts<'a> {
+    type Config = [MountConfig];
+
+    fn init(config: &'a Self::Config) -> Self {
+        Self { mounts: config }
     }
 
-    let mut failures = Vec::new();
-    let mut changed = false;
+    fn id(&self) -> ProvisionerId {
+        ProvisionerId::MOUNTS
+    }
 
-    for mount in mounts {
-        match apply_mount(context, mount) {
-            Ok(mount_changed) => changed |= mount_changed,
-            Err(err) => {
-                let error = format_error_chain(&err);
-                tracing::error!(
-                    tag = %mount.tag,
-                    path = %mount.path,
-                    error = %error,
-                    "failed to provision mount; continuing"
-                );
-                failures.push(format!("{} at {}: {error}", mount.tag, mount.path));
+    fn apply(&self, context: &ProvisionContext) -> eyre::Result<ProvisionOutcome> {
+        if self.mounts.is_empty() {
+            return Ok(ProvisionOutcome::skipped("no mounts configured"));
+        }
+
+        let mut failures = Vec::new();
+        let mut changed = false;
+
+        for mount in self.mounts {
+            match apply_mount(context, mount) {
+                Ok(mount_changed) => changed |= mount_changed,
+                Err(err) => {
+                    let error = format_error_chain(&err);
+                    tracing::error!(
+                        tag = %mount.tag,
+                        path = %mount.path,
+                        error = %error,
+                        "failed to provision mount; continuing"
+                    );
+                    failures.push(format!("{} at {}: {error}", mount.tag, mount.path));
+                }
             }
         }
-    }
 
-    if failures.is_empty() {
-        Ok(ProvisionOutcome::succeeded(changed))
-    } else {
-        Err(eyre!(
-            "failed to provision {} mount(s): {}",
-            failures.len(),
-            failures.join("; ")
-        ))
+        if failures.is_empty() {
+            Ok(ProvisionOutcome::succeeded(changed))
+        } else {
+            Err(eyre!(
+                "failed to provision {} mount(s): {}",
+                failures.len(),
+                failures.join("; ")
+            ))
+        }
     }
 }
 

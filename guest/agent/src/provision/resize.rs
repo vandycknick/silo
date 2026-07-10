@@ -2,26 +2,40 @@ use agent_spec::ResizeRootfsConfig;
 use eyre::{eyre, Context};
 
 use crate::provision::{
-    command_exists, command_output, run_command, ProvisionContext, ProvisionOutcome,
+    command_exists, command_output, run_command, ProvisionContext, ProvisionOutcome, Provisioner,
+    ProvisionerId,
 };
 
 const ROOT_MOUNTPOINT: &str = "/";
 
-pub(crate) fn apply(
-    context: &ProvisionContext,
-    config: &ResizeRootfsConfig,
-) -> eyre::Result<ProvisionOutcome> {
-    if !config.enabled {
-        return Ok(ProvisionOutcome::skipped("root filesystem resize disabled"));
+pub(crate) struct ResizeRootfs<'a> {
+    config: &'a ResizeRootfsConfig,
+}
+
+impl<'a> Provisioner<'a> for ResizeRootfs<'a> {
+    type Config = ResizeRootfsConfig;
+
+    fn init(config: &'a Self::Config) -> Self {
+        Self { config }
     }
 
-    let source = findmnt(context, "SOURCE", ROOT_MOUNTPOINT)?;
-    let fstype = findmnt(context, "FSTYPE", ROOT_MOUNTPOINT)?;
-    tracing::info!(source = %source, fstype = %fstype, "resizing root filesystem");
-    let outcome = resize_filesystem(context, &source, &fstype)?;
-    tracing::info!(source = %source, fstype = %fstype, "reconciled root filesystem size");
+    fn id(&self) -> ProvisionerId {
+        ProvisionerId::RESIZE_ROOTFS
+    }
 
-    Ok(outcome)
+    fn apply(&self, context: &ProvisionContext) -> eyre::Result<ProvisionOutcome> {
+        if !self.config.enabled {
+            return Ok(ProvisionOutcome::skipped("root filesystem resize disabled"));
+        }
+
+        let source = findmnt(context, "SOURCE", ROOT_MOUNTPOINT)?;
+        let fstype = findmnt(context, "FSTYPE", ROOT_MOUNTPOINT)?;
+        tracing::info!(source = %source, fstype = %fstype, "resizing root filesystem");
+        let outcome = resize_filesystem(context, &source, &fstype)?;
+        tracing::info!(source = %source, fstype = %fstype, "reconciled root filesystem size");
+
+        Ok(outcome)
+    }
 }
 
 fn findmnt(context: &ProvisionContext, field: &str, target: &str) -> eyre::Result<String> {

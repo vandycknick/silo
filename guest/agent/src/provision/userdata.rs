@@ -5,47 +5,80 @@ use agent_spec::{UserdataConfig, UserdataContentType, UserdataRunPolicy};
 use eyre::Context;
 use sha2::{Digest, Sha256};
 
-use crate::provision::{run_command, write_file, ProvisionContext, ProvisionOutcome};
+use crate::provision::{
+    run_command, write_file, ProvisionContext, ProvisionOutcome, Provisioner, ProvisionerId,
+};
 
 const USERDATA_SCRIPT_PATH: &str = "/var/lib/silo-agent/userdata.sh";
 const USERDATA_HASH_PATH: &str = "/var/lib/silo-agent/userdata.sha256";
+const AFTER: &[ProvisionerId] = &[
+    ProvisionerId::HOSTNAME,
+    ProvisionerId::TIMEZONE,
+    ProvisionerId::LOCALE,
+    ProvisionerId::USERS,
+    ProvisionerId::SSH_AUTHORIZED_KEYS,
+    ProvisionerId::CERTIFICATE_AUTHORITY,
+    ProvisionerId::RESIZE_ROOTFS,
+    ProvisionerId::MOUNTS,
+    ProvisionerId::ROSETTA,
+    ProvisionerId::NETWORKD,
+];
 
-pub(crate) fn apply(
-    context: &ProvisionContext,
-    userdata: Option<&UserdataConfig>,
-) -> eyre::Result<ProvisionOutcome> {
-    let Some(userdata) = userdata else {
-        return Ok(ProvisionOutcome::skipped("no userdata configured"));
-    };
-    if userdata.content.trim().is_empty() {
-        return Ok(ProvisionOutcome::skipped("userdata content is empty"));
+pub(crate) struct Userdata<'a> {
+    userdata: Option<&'a UserdataConfig>,
+}
+
+impl<'a> Provisioner<'a> for Userdata<'a> {
+    type Config = Option<UserdataConfig>;
+
+    fn init(config: &'a Self::Config) -> Self {
+        Self {
+            userdata: config.as_ref(),
+        }
     }
 
-    if userdata.content_type != UserdataContentType::ShellScript {
-        return Ok(ProvisionOutcome::unsupported(format!(
-            "agent provisioning only supports shell-script userdata for now, got {:?}",
-            userdata.content_type
-        )));
+    fn id(&self) -> ProvisionerId {
+        ProvisionerId::USERDATA
     }
 
-    let hash = userdata_hash(userdata);
-    let hash_path = context.guest_path(USERDATA_HASH_PATH);
-    if userdata.run == UserdataRunPolicy::Once
-        && applied_hash(&hash_path)?.as_deref() == Some(&hash)
-    {
-        tracing::info!(hash = %hash, "userdata already applied for content hash");
-        return Ok(ProvisionOutcome::skipped(
-            "userdata already applied for content hash",
-        ));
+    fn after(&self) -> &[ProvisionerId] {
+        AFTER
     }
 
-    let path = context.guest_path(USERDATA_SCRIPT_PATH);
-    write_file(&path, &userdata.content, 0o700)?;
-    let script = path.to_string_lossy().to_string();
-    run_command(context.process_supervisor(), "/bin/sh", [script.as_str()])?;
-    write_file(&hash_path, format!("{hash}\n"), 0o644)?;
-    tracing::info!(path = %path.display(), hash = %hash, run = ?userdata.run, "reconciled userdata script");
-    Ok(ProvisionOutcome::succeeded(true))
+    fn apply(&self, context: &ProvisionContext) -> eyre::Result<ProvisionOutcome> {
+        let Some(userdata) = self.userdata else {
+            return Ok(ProvisionOutcome::skipped("no userdata configured"));
+        };
+        if userdata.content.trim().is_empty() {
+            return Ok(ProvisionOutcome::skipped("userdata content is empty"));
+        }
+
+        if userdata.content_type != UserdataContentType::ShellScript {
+            return Ok(ProvisionOutcome::unsupported(format!(
+                "agent provisioning only supports shell-script userdata for now, got {:?}",
+                userdata.content_type
+            )));
+        }
+
+        let hash = userdata_hash(userdata);
+        let hash_path = context.guest_path(USERDATA_HASH_PATH);
+        if userdata.run == UserdataRunPolicy::Once
+            && applied_hash(&hash_path)?.as_deref() == Some(&hash)
+        {
+            tracing::info!(hash = %hash, "userdata already applied for content hash");
+            return Ok(ProvisionOutcome::skipped(
+                "userdata already applied for content hash",
+            ));
+        }
+
+        let path = context.guest_path(USERDATA_SCRIPT_PATH);
+        write_file(&path, &userdata.content, 0o700)?;
+        let script = path.to_string_lossy().to_string();
+        run_command(context.process_supervisor(), "/bin/sh", [script.as_str()])?;
+        write_file(&hash_path, format!("{hash}\n"), 0o644)?;
+        tracing::info!(path = %path.display(), hash = %hash, run = ?userdata.run, "reconciled userdata script");
+        Ok(ProvisionOutcome::succeeded(true))
+    }
 }
 
 fn applied_hash(path: &std::path::Path) -> eyre::Result<Option<String>> {
