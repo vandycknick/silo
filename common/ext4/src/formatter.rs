@@ -158,6 +158,18 @@ pub struct Formatter {
     label: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FlexMetadataLayout {
+    block_groups: u32,
+    inode_table_offset: u32,
+    bitmap_offset: u32,
+    data_size: u32,
+    total_groups: u32,
+    gd_block_count: u32,
+    gd_area_blocks: u32,
+    size_bytes: u64,
+}
+
 impl Formatter {
     // -- Computed properties ------------------------------------------------
 
@@ -262,12 +274,17 @@ impl Formatter {
     }
 
     #[inline]
-    fn static_metadata_blocks_in_group(&self, group: u32) -> u32 {
+    fn static_metadata_blocks_in_group_for_area(&self, group: u32, gd_area_blocks: u32) -> u32 {
         if Self::has_sparse_super(group) {
-            1 + self.group_descriptor_blocks()
+            1 + gd_area_blocks
         } else {
             0
         }
+    }
+
+    #[inline]
+    fn static_metadata_blocks_in_group(&self, group: u32) -> u32 {
+        self.static_metadata_blocks_in_group_for_area(group, self.group_descriptor_blocks())
     }
 
     fn reserved_metadata_end_for_block(&self, block: u32) -> u32 {
@@ -295,6 +312,165 @@ impl Formatter {
                 return Ok(());
             }
             self.seek_to_block(next)?;
+        }
+    }
+
+    fn total_groups_for_data_end(&self, data_end: u64, minimum_disk_size_blocks: u32) -> u32 {
+        let current_size_blocks = self.size.div_ceil(self.block_size as u64);
+        let required_blocks = data_end
+            .max(minimum_disk_size_blocks as u64)
+            .max(current_size_blocks)
+            .max(1);
+
+        ((required_blocks - 1) / self.blocks_per_group() as u64 + 1) as u32
+    }
+
+    fn metadata_run_start_after_static_ranges(
+        &self,
+        mut start: u64,
+        blocks: u64,
+        total_groups: u32,
+        gd_area_blocks: u32,
+    ) -> u64 {
+        loop {
+            let end = start + blocks;
+            let mut next_start = start;
+
+            for group in 0..total_groups {
+                let metadata_blocks =
+                    self.static_metadata_blocks_in_group_for_area(group, gd_area_blocks) as u64;
+                if metadata_blocks == 0 {
+                    continue;
+                }
+
+                let group_start = group as u64 * self.blocks_per_group() as u64;
+                let metadata_end = group_start + metadata_blocks;
+                if block_ranges_overlap(start, end, group_start, metadata_end) {
+                    next_start = metadata_end;
+                    break;
+                }
+            }
+
+            if next_start == start {
+                return start;
+            }
+            start = next_start;
+        }
+    }
+
+    fn flex_metadata_layout(
+        &self,
+        start_min: u32,
+        mut block_groups: u32,
+        inode_table_size_per_group: u32,
+        minimum_disk_size_blocks: u32,
+    ) -> FlexMetadataLayout {
+        let mut start = start_min as u64;
+
+        loop {
+            let inode_table_blocks = block_groups as u64 * inode_table_size_per_group as u64;
+            let metadata_blocks = inode_table_blocks + block_groups as u64 * 2;
+            let data_end = start + metadata_blocks;
+            let total_groups = self.total_groups_for_data_end(data_end, minimum_disk_size_blocks);
+            let gd_area_blocks = self.group_descriptor_area_blocks_for_groups(total_groups);
+            let adjusted_start = self.metadata_run_start_after_static_ranges(
+                start,
+                metadata_blocks,
+                total_groups,
+                gd_area_blocks,
+            );
+            let adjusted_data_end = adjusted_start + metadata_blocks;
+            // Every group occupied by the shared run must use the shared
+            // layout. Otherwise close() gives it overlapping local metadata.
+            let adjusted_block_groups = block_groups
+                .max(((adjusted_data_end - 1) / self.blocks_per_group() as u64 + 1) as u32);
+            let adjusted_total_groups =
+                self.total_groups_for_data_end(adjusted_data_end, minimum_disk_size_blocks);
+            let adjusted_gd_area_blocks =
+                self.group_descriptor_area_blocks_for_groups(adjusted_total_groups);
+
+            if adjusted_start == start
+                && adjusted_block_groups == block_groups
+                && adjusted_total_groups == total_groups
+                && adjusted_gd_area_blocks == gd_area_blocks
+            {
+                return FlexMetadataLayout {
+                    block_groups: adjusted_block_groups,
+                    inode_table_offset: adjusted_start as u32,
+                    bitmap_offset: (adjusted_start + inode_table_blocks) as u32,
+                    data_size: adjusted_data_end as u32,
+                    total_groups: adjusted_total_groups,
+                    gd_block_count: self.descriptor_blocks_for_groups(adjusted_total_groups),
+                    gd_area_blocks: adjusted_gd_area_blocks,
+                    size_bytes: adjusted_total_groups as u64
+                        * self.blocks_per_group() as u64
+                        * self.block_size as u64,
+                };
+            }
+
+            start = adjusted_start;
+            block_groups = adjusted_block_groups;
+        }
+    }
+
+    fn free_ranges_before_shifted_metadata(
+        &self,
+        start: u32,
+        end: u32,
+        total_groups: u32,
+        gd_area_blocks: u32,
+    ) -> Vec<BlockRange> {
+        let mut ranges = Vec::new();
+        let mut cursor = start;
+
+        while cursor < end {
+            let group = cursor / self.blocks_per_group();
+            if group >= total_groups {
+                break;
+            }
+
+            let group_start = group * self.blocks_per_group();
+            let group_end = group_start + self.blocks_per_group();
+            let static_metadata_end = group_start
+                + self
+                    .static_metadata_blocks_in_group_for_area(group, gd_area_blocks)
+                    .min(self.blocks_per_group());
+
+            if cursor < static_metadata_end {
+                cursor = static_metadata_end.min(end);
+                continue;
+            }
+
+            let range_end = group_end.min(end);
+            if cursor < range_end {
+                ranges.push(BlockRange {
+                    start: cursor,
+                    end: range_end,
+                });
+            }
+            cursor = range_end;
+        }
+
+        ranges
+    }
+
+    fn clear_block_range_from_bitmap(
+        bitmap: &mut [u8],
+        group_start: u32,
+        group_end: u32,
+        range: &BlockRange,
+        used_blocks: &mut u32,
+    ) {
+        let start = range.start.max(group_start);
+        let end = range.end.min(group_end);
+
+        for block in start..end {
+            let offset = block - group_start;
+            let was_set = (bitmap[(offset / 8) as usize] >> (offset % 8)) & 1;
+            bitmap[(offset / 8) as usize] &= !(1 << (offset % 8));
+            if was_set != 0 {
+                *used_blocks -= 1;
+            }
         }
     }
 
@@ -967,12 +1143,8 @@ impl Formatter {
             self.optimize_block_group_layout(current_blk, inode_count);
 
         self.align_to_block()?;
-        let inode_table_offset = self.current_block() as u64;
+        let metadata_start = self.current_block();
         let inode_table_size_per_group = inodes_per_group * INODE_SIZE / self.block_size;
-        let inode_table_blocks = block_groups * inode_table_size_per_group;
-        let bitmap_offset = inode_table_offset as u32 + inode_table_blocks;
-        let bitmap_size = block_groups * 2; // block bitmap + inode bitmap per group
-        let data_size = bitmap_offset + bitmap_size;
 
         // Ensure the disk is large enough.
         let minimum_disk_size = if block_groups == 1 {
@@ -981,37 +1153,38 @@ impl Formatter {
             (block_groups - 1) * self.blocks_per_group() + 1
         };
 
-        if self.size < minimum_disk_size as u64 * self.block_size as u64 {
-            self.size = minimum_disk_size as u64 * self.block_size as u64;
-            self.file.set_len(self.size)?;
-        }
+        let layout = self.flex_metadata_layout(
+            metadata_start,
+            block_groups,
+            inode_table_size_per_group,
+            minimum_disk_size,
+        );
+        let block_groups = layout.block_groups;
+        let inode_table_offset = layout.inode_table_offset;
+        let expected_bitmap_offset = layout.bitmap_offset;
+        let data_size = layout.data_size;
 
-        // Check if we need more groups for the full disk size.
-        let min_groups = (data_size as u64 - 1) / self.blocks_per_group() as u64 + 1;
-        if self.size < min_groups * self.blocks_per_group() as u64 * self.block_size as u64 {
-            self.size = min_groups * self.blocks_per_group() as u64 * self.block_size as u64;
-            self.file.set_len(self.size)?;
-        }
-
-        let total_groups =
-            ((self.size / self.block_size as u64) - 1) / self.blocks_per_group() as u64 + 1;
-
-        // Align disk size to block-group boundary.
-        if self.size < total_groups * self.blocks_per_group() as u64 * self.block_size as u64 {
-            self.size = total_groups * self.blocks_per_group() as u64 * self.block_size as u64;
+        if self.size != layout.size_bytes {
             let saved_pos = self.pos();
+            self.size = layout.size_bytes;
             self.file.set_len(self.size)?;
             self.file.seek(SeekFrom::Start(saved_pos))?;
         }
 
-        let total_groups_u32 = total_groups as u32;
+        let total_groups_u32 = layout.total_groups;
 
         // Verify group descriptor space.
-        let gd_block_count = self.descriptor_blocks_for_groups(total_groups_u32);
-        let gd_area_blocks = self.group_descriptor_area_blocks_for_groups(total_groups_u32);
+        let gd_block_count = layout.gd_block_count;
+        let gd_area_blocks = layout.gd_area_blocks;
         if gd_area_blocks > allocated_descriptor_area_blocks {
             return Err(FormatError::InsufficientSpaceForGroupDescriptorBlocks);
         }
+        let metadata_gap_ranges = self.free_ranges_before_shifted_metadata(
+            metadata_start,
+            inode_table_offset,
+            total_groups_u32,
+            gd_area_blocks,
+        );
         let reserved_gdt_blocks = gd_area_blocks - gd_block_count;
         let backup_groups = self.backup_groups(total_groups_u32);
         self.configure_resize_inode(
@@ -1027,11 +1200,14 @@ impl Formatter {
         )?;
 
         // -- Step 4: Write inode table --
-        self.seek_to_block(inode_table_offset as u32)?;
+        self.seek_to_block(inode_table_offset)?;
         let inode_table_offset = self.commit_inode_table(block_groups, inodes_per_group)?;
 
         self.align_to_block()?;
         let bitmap_offset = self.current_block();
+        if bitmap_offset != expected_bitmap_offset {
+            return Err(FormatError::InsufficientSpaceForGroupDescriptorBlocks);
+        }
 
         let mut total_used_blocks: u32 = 0;
         let mut total_used_inodes: u32 = 0;
@@ -1078,18 +1254,16 @@ impl Formatter {
                 }
             }
 
-            // Mark deleted blocks as free.
-            for deleted in &self.deleted_blocks {
-                for blk in deleted.start..deleted.end {
-                    if blk / self.blocks_per_group() == group {
-                        let j = blk % self.blocks_per_group();
-                        let was_set = (bitmap[(j / 8) as usize] >> (j % 8)) & 1;
-                        bitmap[(j / 8) as usize] &= !(1 << (j % 8));
-                        if was_set != 0 {
-                            used_blocks -= 1;
-                        }
-                    }
-                }
+            // Mark deleted payloads and normal blocks skipped while shifting
+            // flex metadata past sparse-super system zones as free.
+            for freed in self.deleted_blocks.iter().chain(metadata_gap_ranges.iter()) {
+                Self::clear_block_range_from_bitmap(
+                    &mut bitmap[..self.block_size as usize],
+                    group_start,
+                    group_end,
+                    freed,
+                    &mut used_blocks,
+                );
             }
 
             // -- Inode bitmap (stored in the second block of the pair) --
@@ -1619,6 +1793,11 @@ impl Formatter {
 // Free-standing helpers
 // ---------------------------------------------------------------------------
 
+#[inline]
+fn block_ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
 /// Reject path components that cannot be represented in ext4 dir entries.
 fn validate_path_component_names(path: &str) -> FormatResult<()> {
     for component in Path::new(path).components() {
@@ -1715,6 +1894,162 @@ mod tests {
         assert!(root_entries.iter().any(|(name, _)| name == "."));
         assert!(root_entries.iter().any(|(name, _)| name == ".."));
         assert!(root_entries.iter().any(|(name, _)| name == "lost+found"));
+    }
+
+    #[test]
+    fn flex_metadata_does_not_overlap_sparse_super_system_zones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ext4");
+        let mut fmt = Formatter::new(&path, 4096, 768 * 1024 * 1024).unwrap();
+
+        // Push the final inode-table/bitmap run near the group-5 sparse-super
+        // backup area without writing a huge fixture. Linux rejects overlapping
+        // system zones during ext4_setup_system_zone().
+        let root_directory_block = 5 * fmt.blocks_per_group() - 64;
+        fmt.seek_to_block(root_directory_block).unwrap();
+        fmt.close().unwrap();
+
+        let mut reader = crate::Reader::new(&path).unwrap();
+        let sb = reader.superblock().clone();
+        let block_size = 1024u64 * (1 << sb.log_block_size);
+        let group_count = (sb.blocks_count_lo - 1) / sb.blocks_per_group + 1;
+        let groups_per_descriptor_block = block_size as u32 / GroupDescriptor::SIZE as u32;
+        let descriptor_blocks = (group_count - 1) / groups_per_descriptor_block + 1;
+        let static_metadata_blocks = 1 + descriptor_blocks + sb.reserved_gdt_blocks as u32;
+        let inode_table_blocks = sb.inodes_per_group * INODE_SIZE / block_size as u32;
+
+        assert!(group_count >= 6, "test image must reach sparse group 5");
+
+        for group in 0..group_count {
+            let gd = reader.get_group_descriptor(group).unwrap();
+            let metadata_ranges = [
+                ("block bitmap", gd.block_bitmap_lo, gd.block_bitmap_lo + 1),
+                ("inode bitmap", gd.inode_bitmap_lo, gd.inode_bitmap_lo + 1),
+                (
+                    "inode table",
+                    gd.inode_table_lo,
+                    gd.inode_table_lo + inode_table_blocks,
+                ),
+            ];
+
+            for protected_group in 0..group_count {
+                if !Formatter::has_sparse_super(protected_group) {
+                    continue;
+                }
+
+                let protected_start = protected_group * sb.blocks_per_group;
+                let protected_end = protected_start + static_metadata_blocks;
+
+                for (name, start, end) in metadata_ranges {
+                    assert!(
+                        !block_ranges_overlap(
+                            start as u64,
+                            end as u64,
+                            protected_start as u64,
+                            protected_end as u64
+                        ),
+                        "group {group} {name} range {start}..{end} overlaps sparse-super system zone {protected_start}..{protected_end} in group {protected_group}",
+                    );
+                }
+            }
+        }
+
+        let mut image = std::fs::File::open(&path).unwrap();
+        let skipped_gap_block = 5 * sb.blocks_per_group - 1;
+        let skipped_gap_group = skipped_gap_block / sb.blocks_per_group;
+        let skipped_gap_gd = reader.get_group_descriptor(skipped_gap_group).unwrap();
+        let mut skipped_gap_bitmap = vec![0u8; block_size as usize];
+        image
+            .seek(SeekFrom::Start(
+                skipped_gap_gd.block_bitmap_lo as u64 * block_size,
+            ))
+            .unwrap();
+        image.read_exact(&mut skipped_gap_bitmap).unwrap();
+        let skipped_gap_bit = skipped_gap_block % sb.blocks_per_group;
+        assert_eq!(
+            skipped_gap_bitmap[(skipped_gap_bit / 8) as usize] & (1u8 << (skipped_gap_bit % 8)),
+            0,
+            "normal block {skipped_gap_block} skipped before group 5's sparse-super zone must remain free",
+        );
+
+        let protected_gd = reader.get_group_descriptor(5).unwrap();
+        let mut protected_bitmap = vec![0u8; block_size as usize];
+        image
+            .seek(SeekFrom::Start(
+                protected_gd.block_bitmap_lo as u64 * block_size,
+            ))
+            .unwrap();
+        image.read_exact(&mut protected_bitmap).unwrap();
+        assert_ne!(
+            protected_bitmap[0] & 1,
+            0,
+            "group 5 sparse-super block must stay allocated",
+        );
+    }
+
+    #[test]
+    fn flex_metadata_relocation_promotes_overlapped_extra_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ext4");
+        let mut fmt = Formatter::new(&path, 4096, 256 * 1024).unwrap();
+        let blocks_per_group = fmt.blocks_per_group();
+        let initial_block_groups = 82;
+        let initial_inodes_per_group = 8192;
+        let initial_inode_table_blocks = initial_inodes_per_group * INODE_SIZE / fmt.block_size;
+        let data_blocks_per_group = blocks_per_group - initial_inode_table_blocks - 2;
+        let metadata_start = initial_block_groups * data_blocks_per_group;
+
+        let (block_groups, inodes_per_group) =
+            fmt.optimize_block_group_layout(metadata_start, fmt.inodes.len() as u32);
+        assert_eq!(block_groups, initial_block_groups);
+        assert_eq!(inodes_per_group, initial_inodes_per_group);
+
+        let inode_table_size_per_group = inodes_per_group * INODE_SIZE / fmt.block_size;
+        let unshifted_metadata_end =
+            metadata_start + block_groups * (inode_table_size_per_group + 2);
+        assert_eq!(
+            unshifted_metadata_end,
+            block_groups * blocks_per_group,
+            "the shared metadata run must initially end at the group-82 boundary",
+        );
+
+        // Keep one genuinely empty group after the group promoted by relocation.
+        fmt.size = 84u64 * blocks_per_group as u64 * fmt.block_size as u64;
+        let minimum_disk_size = (block_groups - 1) * blocks_per_group + 1;
+        let layout = fmt.flex_metadata_layout(
+            metadata_start,
+            block_groups,
+            inode_table_size_per_group,
+            minimum_disk_size,
+        );
+
+        assert!(
+            layout.inode_table_offset > metadata_start,
+            "group 81's sparse-super zone must shift the shared metadata run",
+        );
+        assert_eq!(
+            layout.block_groups, 83,
+            "the group crossed by the shifted shared run must be promoted",
+        );
+        assert_eq!(layout.total_groups, 84);
+
+        let first_extra_group_start = layout.block_groups * blocks_per_group;
+        let first_extra_metadata_end = first_extra_group_start
+            + fmt.static_metadata_blocks_in_group_for_area(
+                layout.block_groups,
+                layout.gd_area_blocks,
+            )
+            + inode_table_size_per_group
+            + 2;
+        assert!(
+            !block_ranges_overlap(
+                layout.inode_table_offset as u64,
+                layout.data_size as u64,
+                first_extra_group_start as u64,
+                first_extra_metadata_end as u64,
+            ),
+            "shared metadata must not overlap the first extra group's local metadata",
+        );
     }
 
     #[test]
