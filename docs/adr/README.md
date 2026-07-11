@@ -6,6 +6,7 @@ We use Michael Nygard-style ADRs to capture architectural decisions.
 
 | State       | Meaning                                           |
 | ----------- | ------------------------------------------------- |
+| Draft       | Directional work in progress, not ready for adoption. |
 | Proposed    | Drafted and under discussion.                     |
 | Accepted    | Approved decision, implementation may be pending. |
 | Implemented | Decision has been delivered in code.              |
@@ -24,3 +25,6 @@ We use Michael Nygard-style ADRs to capture architectural decisions.
 | 0005 | Vmmon endpoint plugins for vsock streams                      | Implemented | 2026-04-12 | `docs/adr/0005-vmmon-vsock-endpoint-plugins.md`  |
 | 0006 | Sandbox network policy and firewall semantics                 | Proposed    | 2026-06-18 | `docs/adr/0006-sandbox-network-policy-and-firewall-semantics.md` |
 | 0007 | HCL network policy frontend                                   | Proposed    | 2026-07-04 | `docs/adr/0007-hcl-network-policy-frontend.md`   |
+| 0008 | Vmmon host and guest agent HTTP APIs                           | Proposed    | 2026-07-08 | `docs/adr/0008-vmmon-host-and-guest-http-api.md` |
+| 0009 | Per-launch guest agent initramfs overlay                      | Proposed    | 2026-07-11 | `docs/adr/0009-per-launch-guest-agent-initramfs-overlay.md` |
+| 0010 | Static guest network configuration                            | Draft       | 2026-07-11 | `docs/adr/0010-static-guest-network-configuration.md` |

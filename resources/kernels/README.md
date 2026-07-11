@@ -218,12 +218,15 @@ This file tracks kernel-side config changes identified while debugging package u
 
 - `CONFIG_RTC_CLASS=y`
 - `CONFIG_RTC_HCTOSYS=y`
-- `CONFIG_RTC_SYSTOHC=y`
 - `CONFIG_RTC_HCTOSYS_DEVICE="rtc0"`
+- `# CONFIG_RTC_SYSTOHC is not set`
+- `# CONFIG_RTC_NVMEM is not set`
+- `CONFIG_RTC_DRV_PL031=y`
 
 ### What this enables
 
-- Linux RTC subsystem support and RTC-to-system-clock integration when a compatible virtual RTC device is present.
+- Linux RTC subsystem support, the ARM PL031 virtual RTC driver, and RTC-to-system-clock integration during boot.
+- The guest reads the host-backed virtual RTC without writing guest time back or enabling unused RTC NVMEM support.
 
 ### Why this is needed
 

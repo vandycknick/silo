@@ -195,7 +195,15 @@ The shell is OpenSSH-backed, not native-agent-backed.
 SSH public-key authentication failed
 ```
 
-First confirm the VM booted with the rebuilt initramfs. If the wrong asset was used, the host metadata may include top-level SSH auth config that the older guest agent does not provision.
+Current builds obtain `AgentConfig` from `vmmon` metadata. Confirm the VM booted
+with the rebuilt initramfs and inspect `vmmon` and agent logs for metadata
+retrieval, decoding, or schema failures. `/run/agent/config.json` is not
+expected in the current implementation.
+
+After [ADR 0009](../adr/0009-per-launch-guest-agent-initramfs-overlay.md) is
+implemented, confirm the VM booted with the per-launch composite initramfs. At
+that point, a missing or incompatible `/run/agent/config.json` indicates an
+overlay selection, extraction, or validation failure.
 
 ```text
 selected SSH backend backend="agent"
