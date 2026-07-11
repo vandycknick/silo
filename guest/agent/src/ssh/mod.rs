@@ -27,7 +27,7 @@ impl SshService {
         config: AgentSshConfig,
         process_supervisor: ProcessSupervisor,
     ) -> eyre::Result<Self> {
-        if false && openssh::exists() {
+        if openssh::exists() {
             tracing::info!(backend = "openssh", "selected SSH backend");
             return Ok(Self {
                 backend: SshBackend::OpenSsh { process_supervisor },
