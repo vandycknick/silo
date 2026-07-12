@@ -177,6 +177,7 @@ impl Cmd {
                 rosetta: self.overrides.rosetta,
                 kernel: self.overrides.kernel.clone(),
                 initramfs: self.overrides.initramfs.clone(),
+                agent: None,
                 disks: self.overrides.disks.clone(),
             },
         })

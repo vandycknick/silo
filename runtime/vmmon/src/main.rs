@@ -45,9 +45,6 @@ struct Args {
     #[arg(long = "config")]
     config: PathBuf,
 
-    #[arg(long = "metadata-config")]
-    metadata_config: Option<PathBuf>,
-
     #[arg(long = "wait-for-registration", default_value_t = 0)]
     wait_for_registration: u64,
 
@@ -138,7 +135,6 @@ async fn run(args: Args, start_gate: StartGate, sync_reporter: SyncReporter) -> 
         &args.id,
         &args.name,
         &args.network,
-        args.metadata_config.as_deref(),
         std::time::Duration::from_secs(args.wait_for_registration),
         &mut start_gate,
     )
@@ -209,9 +205,6 @@ fn daemonize(args: &Args, inherited_fds: InheritedPipeFds) -> eyre::Result<()> {
         .arg(&args.exit_status)
         .arg("--config")
         .arg(&args.config);
-    if let Some(metadata_config) = &args.metadata_config {
-        cmd.arg("--metadata-config").arg(metadata_config);
-    }
     cmd.arg("--wait-for-registration")
         .arg(args.wait_for_registration.to_string())
         .arg("--socket")

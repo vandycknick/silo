@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use vm_spec::VmSpec;
 
 use crate::lock_manager::LockId;
+use crate::machine::MachineGuestConfig;
 
 use super::{MachineId, MachineNetworkConfig};
 
@@ -20,6 +21,8 @@ pub(crate) struct MachineConfig {
     pub lock_id: LockId,
     pub name: String,
     pub spec: VmSpec,
+    #[serde(default, skip_serializing_if = "MachineGuestConfig::is_default")]
+    pub guest: MachineGuestConfig,
     #[serde(alias = "instanceDir")]
     pub machine_dir: PathBuf,
     pub created_at: i64,
@@ -92,6 +95,14 @@ impl MachineRuntimeState {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use crate::lock_manager::LockId;
+    use crate::machine::{MachineAgent, MachineGuestConfig};
+    use crate::store::models::{MachineConfig, MachineId, MachineNetworkConfig};
+    use vm_spec::VmSpec;
+
     use super::MachineRuntimeState;
 
     #[test]
@@ -115,5 +126,34 @@ mod tests {
         let err = MachineRuntimeState::parse("paused").expect_err("unknown state should fail");
 
         assert!(err.contains("unknown machine runtime state"));
+    }
+
+    #[test]
+    fn default_guest_config_is_omitted_but_custom_selection_is_persisted() {
+        let mut config = MachineConfig {
+            id: MachineId::new(),
+            lock_id: LockId::from(1),
+            name: "test".to_string(),
+            spec: VmSpec::current(),
+            guest: MachineGuestConfig::default(),
+            machine_dir: PathBuf::from("/tmp/test"),
+            created_at: 1,
+            modified_at: 1,
+            image_ref: "image".to_string(),
+            root_disk_size: None,
+            labels: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            network: MachineNetworkConfig::default(),
+        };
+
+        let default = serde_json::to_value(&config).expect("serialize default config");
+        assert!(default.get("guest").is_none());
+
+        config.guest.agent = MachineAgent::Custom {
+            path: PathBuf::from("/custom/agent"),
+        };
+        let custom = serde_json::to_value(&config).expect("serialize custom config");
+        assert_eq!(custom["guest"]["agent"]["mode"], "custom");
+        assert_eq!(custom["guest"]["agent"]["path"], "/custom/agent");
     }
 }

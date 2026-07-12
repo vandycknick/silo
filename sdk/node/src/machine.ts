@@ -114,6 +114,13 @@ export class MachineBuilder {
         return this;
     }
 
+    /** Configure guest behavior owned by Silo rather than the VMM specification. */
+    guest(configure: (guest: GuestBuilder) => GuestBuilder): this {
+        const guest = new GuestBuilder(this.native);
+        configure(guest);
+        return this;
+    }
+
     /** Set the machine root disk size in bytes. */
     rootDiskSize(value: number): this {
         this.native.rootDiskSize(assertNonNegativeInteger(value, "value"));
@@ -165,6 +172,17 @@ export class MachineBuilder {
      */
     async create(): Promise<Machine> {
         return new Machine(await mapNativePromise(this.native.create()));
+    }
+}
+
+/** Builder for durable guest settings. */
+export class GuestBuilder {
+    constructor(private readonly native: NativeMachineBuilder) {}
+
+    /** Select a custom agent path, or disable managed injection with `null`. */
+    agent(path: string | null): this {
+        this.native.agent(path === null ? undefined : assertNonEmptyString(path, "path"));
+        return this;
     }
 }
 

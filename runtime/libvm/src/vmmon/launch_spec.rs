@@ -4,6 +4,7 @@ use eyre::Context;
 use vm_spec::VmSpec;
 
 use crate::machine::resolve_mount_location;
+use crate::runtime::normalize_absolute_path;
 
 pub(crate) struct LaunchSpecInput<'a> {
     pub(crate) relative_mount_base: &'a Path,
@@ -27,11 +28,12 @@ fn normalize_mount_sources(spec: &mut VmSpec, relative_mount_base: &Path) -> eyr
         let resolved = resolve_mount_location(&mount.source)
             .map_err(eyre::Report::msg)
             .with_context(|| format!("resolve mount source {}", mount.source.display()))?;
-        mount.source = if resolved.is_absolute() {
+        let absolute = if resolved.is_absolute() {
             resolved
         } else {
             relative_mount_base.join(resolved)
         };
+        mount.source = normalize_absolute_path(&absolute);
     }
 
     Ok(())
@@ -103,6 +105,21 @@ mod tests {
             .expect("normalize runtime mounts");
 
         assert_eq!(spec.mounts[0].source, PathBuf::from("/workspace"));
+    }
+
+    #[test]
+    fn normalize_mount_sources_collapses_parent_components() {
+        let mut spec = sample_spec(Vec::new());
+        spec.mounts = vec![Mount {
+            source: PathBuf::from("../workspace/./src"),
+            tag: "workspace".to_string(),
+            read_only: false,
+        }];
+
+        normalize_mount_sources(&mut spec, Path::new("/tmp/project"))
+            .expect("normalize runtime mounts");
+
+        assert_eq!(spec.mounts[0].source, PathBuf::from("/tmp/workspace/src"));
     }
 
     #[test]

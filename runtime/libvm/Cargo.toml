@@ -12,6 +12,7 @@ vm-spec = { path = "../../specs/vm-spec" }
 utils = { path = "../../common/utils" }
 async-trait = "0.1.89"
 base64 = "0.22.1"
+cpio = "0.4.1"
 eyre = "0.6.12"
 getrandom = "0.4.3"
 hyper-util = "0.1.20"

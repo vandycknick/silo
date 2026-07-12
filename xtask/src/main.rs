@@ -7,13 +7,11 @@ use std::process::{Command, ExitStatus};
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
-use crate::initramfs::{write_initramfs, InitramfsFile, InitramfsOptions};
+use crate::initramfs::{write_initramfs, InitramfsOptions};
 
 mod initramfs;
 
 const DEFAULT_GUEST_TARGET: &str = "aarch64-unknown-linux-musl";
-const AGENT_ARCHIVE_PATH: &str = "agent/silo-agent";
-
 #[derive(Debug, Parser)]
 #[command(about = "Silo repository automation")]
 struct Args {
@@ -44,8 +42,6 @@ struct GuestAssetsArgs {
 struct PackInitramfsArgs {
     #[arg(long, value_name = "PATH")]
     init: PathBuf,
-    #[arg(long, value_name = "PATH")]
-    agent: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     out: PathBuf,
 }
@@ -142,18 +138,9 @@ fn guest_assets(args: GuestAssetsArgs) -> Result<()> {
     copy_asset(&agent_binary, &assets_dir.join("agent"))?;
 
     let initramfs = assets_dir.join("initramfs");
-    let initramfs_no_agent = assets_dir.join("initramfs-no-agent");
+    remove_existing(&assets_dir.join("initramfs-no-agent"))?;
     remove_existing(&initramfs)?;
-    remove_existing(&initramfs_no_agent)?;
-
-    write_initramfs(
-        &InitramfsOptions::new(&init_binary, &initramfs).with_extra_file(InitramfsFile::new(
-            AGENT_ARCHIVE_PATH,
-            &agent_binary,
-            0o755,
-        )),
-    )?;
-    write_initramfs(&InitramfsOptions::new(&init_binary, &initramfs_no_agent))?;
+    write_initramfs(&InitramfsOptions::new(&init_binary, &initramfs))?;
 
     println!("Updated {}", assets_dir.display());
     Ok(())
@@ -185,12 +172,7 @@ fn build_guest_agent(target: &str) -> Result<()> {
 }
 
 fn pack_initramfs(args: PackInitramfsArgs) -> Result<()> {
-    let mut options = InitramfsOptions::new(args.init, args.out);
-    if let Some(agent) = args.agent {
-        options = options.with_extra_file(InitramfsFile::new(AGENT_ARCHIVE_PATH, agent, 0o755));
-    }
-
-    write_initramfs(&options)?;
+    write_initramfs(&InitramfsOptions::new(args.init, args.out))?;
     Ok(())
 }
 

@@ -28,7 +28,6 @@ pub(crate) struct VmmonLaunch<'a> {
     pub(crate) serial_log: &'a Path,
     pub(crate) trace_log: &'a Path,
     pub(crate) network: &'a VmmonNetworkAttachment,
-    pub(crate) metadata_config: &'a Path,
     pub(crate) run_id: &'a str,
     pub(crate) exit_command: Option<&'a MachineExitCommand>,
     pub(crate) wait_for_registration: Duration,
@@ -61,8 +60,6 @@ impl Vmmon {
             .arg(launch.trace_log)
             .arg("--network")
             .arg(launch.network.to_vmmon_arg())
-            .arg("--metadata-config")
-            .arg(launch.metadata_config)
             .arg("--run-id")
             .arg(launch.run_id)
             .arg("--wait-for-registration")

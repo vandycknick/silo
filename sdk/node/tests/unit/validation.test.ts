@@ -39,13 +39,9 @@ describe("runtime options", () => {
     expect(
       runtimeOptionsToNative({
         dataRoot: "/tmp/silo",
-        defaultKernel: "/usr/local/share/silo/assets/kernel-default",
-        defaultInitramfs: "/usr/local/share/silo/assets/initramfs",
       }),
     ).toMatchObject({
       dataRoot: "/tmp/silo",
-      defaultKernel: "/usr/local/share/silo/assets/kernel-default",
-      defaultInitramfs: "/usr/local/share/silo/assets/initramfs",
     });
   });
 
@@ -79,6 +75,7 @@ describe("Network", () => {
         labels: [],
         metadata: [],
         network: { kind: "private", policyJson },
+        agentMode: "default",
         status: { kind: "stopped" },
         updatedAt: 1,
       }).network,
@@ -222,6 +219,20 @@ describe("MachineBuilder boundary validation", () => {
 
     expect(networkInput).toEqual({ kind: "private", policyJson });
   });
+
+  it("configures custom and disabled guest agents", () => {
+    const selections: Array<string | undefined> = [];
+    const builder = new MachineBuilder(
+      fakeNativeBuilder({
+        agent: (path) => selections.push(path),
+      }),
+    );
+
+    builder.guest((guest) => guest.agent("/custom/agent"));
+    builder.guest((guest) => guest.agent(null));
+
+    expect(selections).toEqual(["/custom/agent", undefined]);
+  });
 });
 
 function fakeNativeBuilder(overrides: Partial<NativeMachineBuilder> = {}): NativeMachineBuilder {
@@ -237,6 +248,7 @@ function fakeNativeBuilder(overrides: Partial<NativeMachineBuilder> = {}): Nativ
     memory: () => undefined,
     kernel: () => undefined,
     initramfs: () => undefined,
+    agent: () => undefined,
     rootDiskSize: () => undefined,
     nestedVirtualization: () => undefined,
     rosetta: () => undefined,

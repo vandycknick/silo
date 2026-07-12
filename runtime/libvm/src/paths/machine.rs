@@ -7,7 +7,8 @@ const VMMON_TRACE_LOG_FILE_NAME: &str = "vm.trace.log";
 const VMMON_EXIT_STATUS_FILE_NAME: &str = "vm.exit.json";
 const SERIAL_LOG_FILE_NAME: &str = "serial.log";
 const ROOT_DISK_FILE_NAME: &str = "rootfs.img";
-const METADATA_CONFIG_FILE_NAME: &str = "metadata.json";
+const LEGACY_METADATA_CONFIG_FILE_NAME: &str = "metadata.json";
+const COMPOSITE_INITRAMFS_FILE_NAME: &str = "initramfs";
 const NETWORK_LINK_NAME: &str = "net";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +30,11 @@ impl MachinePaths {
     }
 
     pub(crate) fn metadata_config_path(&self) -> PathBuf {
-        metadata_config_path_in(&self.dir)
+        self.dir.join(LEGACY_METADATA_CONFIG_FILE_NAME)
+    }
+
+    pub(crate) fn composite_initramfs_path(&self) -> PathBuf {
+        self.dir.join(COMPOSITE_INITRAMFS_FILE_NAME)
     }
 
     pub(crate) fn root_disk_path(&self) -> PathBuf {
@@ -69,10 +74,6 @@ pub(crate) fn vm_spec_path_in(dir: &Path) -> PathBuf {
     dir.join(VM_SPEC_FILE_NAME)
 }
 
-pub(crate) fn metadata_config_path_in(dir: &Path) -> PathBuf {
-    dir.join(METADATA_CONFIG_FILE_NAME)
-}
-
 pub(crate) fn vmmon_trace_log_path_in(dir: &Path) -> PathBuf {
     dir.join(VMMON_TRACE_LOG_FILE_NAME)
 }
@@ -94,6 +95,10 @@ mod tests {
         assert_eq!(
             paths.metadata_config_path(),
             PathBuf::from("/tmp/silo/machines/test/metadata.json")
+        );
+        assert_eq!(
+            paths.composite_initramfs_path(),
+            PathBuf::from("/tmp/silo/machines/test/initramfs")
         );
         assert_eq!(
             paths.root_disk_path(),

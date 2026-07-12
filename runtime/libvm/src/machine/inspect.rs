@@ -7,6 +7,7 @@ use protocol::v1::{
 };
 use vm_spec::VmSpec;
 
+use crate::machine::MachineGuestConfig;
 use crate::network::MachineNetworkConfig;
 use crate::store::models::{MachineConfig, MachineRuntimeState};
 
@@ -44,6 +45,8 @@ pub struct MachineData {
     pub metadata: BTreeMap<String, String>,
     /// Desired network attachment recorded for the machine.
     pub network: MachineNetworkConfig,
+    /// Durable guest behavior owned by libvm.
+    pub guest: MachineGuestConfig,
     /// Reconciled lifecycle status for the machine.
     ///
     /// `Machine::inspect` always reconciles persisted state with the local vmmon
@@ -86,6 +89,7 @@ impl MachineData {
             labels: config.labels,
             metadata: config.metadata,
             network: config.network.into(),
+            guest: config.guest,
             status,
             boot_report,
             provision_report,
@@ -329,6 +333,8 @@ pub enum MachineStatus {
     },
     /// vmmon is running.
     Running {
+        /// True when the machine satisfies its configured readiness policy.
+        ready: bool,
         /// True when vmmon reports the guest agent as ready.
         guest_ready: bool,
         /// Optional human-readable status detail.
@@ -355,6 +361,7 @@ impl MachineStatus {
             MachineRuntimeState::Stopped => Self::Stopped,
             MachineRuntimeState::Starting => Self::Starting { message: None },
             MachineRuntimeState::Running => Self::Running {
+                ready: false,
                 guest_ready: false,
                 message: None,
             },
@@ -367,17 +374,16 @@ impl MachineStatus {
 
     pub(crate) fn from_protocol(response: InspectResponse) -> Self {
         let message = non_empty_message(Some(response.summary));
-        let guest_ready = response.ready
-            && matches!(
-                LifecycleState::try_from(response.guest_state)
-                    .unwrap_or(LifecycleState::Unspecified),
-                LifecycleState::Running
-            );
+        let guest_ready = matches!(
+            LifecycleState::try_from(response.guest_state).unwrap_or(LifecycleState::Unspecified),
+            LifecycleState::Running
+        );
 
         match LifecycleState::try_from(response.vm_state).unwrap_or(LifecycleState::Unspecified) {
             LifecycleState::Stopped => Self::Stopped,
             LifecycleState::Starting => Self::Starting { message },
             LifecycleState::Running | LifecycleState::Unspecified => Self::Running {
+                ready: response.ready,
                 guest_ready,
                 message,
             },
@@ -388,6 +394,7 @@ impl MachineStatus {
 
     pub(crate) fn running_with_message(message: String) -> Self {
         Self::Running {
+            ready: false,
             guest_ready: false,
             message: non_empty_message(Some(message)),
         }
@@ -398,9 +405,9 @@ impl MachineStatus {
         matches!(self, Self::Running { .. })
     }
 
-    /// Returns true when the machine is running and the guest agent is ready.
+    /// Returns true when the machine satisfies its configured readiness policy.
     pub fn ready(&self) -> bool {
-        self.guest_ready()
+        matches!(self, Self::Running { ready: true, .. })
     }
 
     /// Returns true when vmmon reports the guest agent as ready.
@@ -472,5 +479,26 @@ fn non_empty_string(value: String) -> Option<String> {
         None
     } else {
         Some(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use protocol::v1::{InspectResponse, LifecycleState};
+
+    use crate::machine::MachineStatus;
+
+    #[test]
+    fn disabled_agent_can_be_ready_without_guest_registration() {
+        let status = MachineStatus::from_protocol(InspectResponse {
+            vm_state: LifecycleState::Running as i32,
+            guest_state: LifecycleState::Unspecified as i32,
+            ready: true,
+            summary: "instance ready (guest agent not required)".to_string(),
+            ..InspectResponse::default()
+        });
+
+        assert!(status.ready());
+        assert!(!status.guest_ready());
     }
 }

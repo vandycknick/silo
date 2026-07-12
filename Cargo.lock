@@ -73,7 +73,6 @@ dependencies = [
 name = "agent-spec"
 version = "0.1.0"
 dependencies = [
- "protocol",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -2338,6 +2337,7 @@ dependencies = [
  "agent-spec",
  "async-trait",
  "base64",
+ "cpio",
  "eyre",
  "getrandom 0.4.3",
  "hyper-util",
@@ -3368,10 +3368,8 @@ version = "0.1.0"
 dependencies = [
  "postcard",
  "prost",
- "prost-types",
  "protoc-bin-vendored",
  "serde",
- "serde_json",
  "tokio",
  "tonic",
  "tonic-prost",

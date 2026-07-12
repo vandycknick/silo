@@ -24,6 +24,12 @@ impl Machine {
     /// Waits until the guest agent reports the machine as running.
     pub async fn wait_for_guest_running(&self, timeout: Duration) -> Result<(), LibVmError> {
         let config = self.running_config().await?;
+        if matches!(config.guest.agent, crate::machine::MachineAgent::Disabled) {
+            return Err(LibVmError::MonitorProtocol {
+                reference: config.name,
+                message: "guest agent is disabled for this machine".to_string(),
+            });
+        }
         self.runtime()
             .vmmon()
             .client(self.machine_id())

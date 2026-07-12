@@ -19,11 +19,7 @@ export class Runtime {
    *
    * @example
    * ```ts
-   * const runtime = await Runtime.open({
-   *   dataRoot: "/tmp/silo-sdk",
-   *   defaultKernel: "/usr/local/share/silo/assets/kernel-default",
-   *   defaultInitramfs: "/usr/local/share/silo/assets/initramfs",
-   * });
+   * const runtime = await Runtime.open({ dataRoot: "/tmp/silo-sdk" });
    * ```
    *
    * @throws {TypeError} When `options` is malformed.

@@ -15,8 +15,6 @@ export interface NativeRuntimeOpenOptions {
   dataRoot?: string;
   runRoot?: string;
   imageRoot?: string;
-  defaultKernel?: string;
-  defaultInitramfs?: string;
   vmmonPath?: string;
 }
 
@@ -39,6 +37,7 @@ export interface NativeMachineBuilder {
   memory(value: number): void;
   kernel(path: string): void;
   initramfs(path: string): void;
+  agent(path?: string): void;
   rootDiskSize(value: number): void;
   nestedVirtualization(enabled: boolean): void;
   rosetta(enabled: boolean): void;
@@ -212,6 +211,8 @@ export interface NativeMachineData {
   labels: NativeKeyValue[];
   metadata: NativeKeyValue[];
   network: NativeNetworkData;
+  agentMode: "default" | "custom" | "disabled" | "unknown";
+  agentPath?: string | null;
   status: NativeMachineStatus;
   startedAt?: number | null;
   lastError?: string | null;
@@ -220,6 +221,7 @@ export interface NativeMachineData {
 
 export interface NativeMachineStatus {
   kind: "stopped" | "starting" | "running" | "stopping" | "error" | "unknown";
+  ready?: boolean | null;
   guestReady?: boolean | null;
   message?: string | null;
 }

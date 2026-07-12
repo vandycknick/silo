@@ -13,11 +13,11 @@ mod ssh;
 
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use agent_spec::{AgentConfig, SSH_VSOCK_PORT};
+use agent_spec::{AgentConfig, MAX_AGENT_CONFIG_SIZE_BYTES, SSH_VSOCK_PORT};
 use clap::Parser;
 use eyre::Context;
 use nix::errno::Errno;
@@ -55,6 +55,8 @@ const PROC_SELF_FD: &str = "/proc/self/fd";
     disable_version_flag = true
 )]
 struct AgentArgs {
+    #[arg(long, value_name = "PATH", require_equals = true)]
+    config: PathBuf,
     #[arg(long, requires = "handoff")]
     init: bool,
     #[arg(
@@ -79,7 +81,8 @@ fn main() -> eyre::Result<()> {
     init_tracing();
 
     let agent_args = parse_agent_args()?;
-    let agent_mode = select_agent_mode(agent_args, is_pid1)?;
+    let agent_config = load_agent_config(&agent_args.config)?;
+    let agent_mode = select_agent_mode(&agent_args, is_pid1)?;
     ensure_default_path();
     let boot_mode = prepare_agent_process(&agent_mode)?;
     let process_supervisor = ProcessSupervisor::activate(&boot_mode)?;
@@ -88,7 +91,7 @@ fn main() -> eyre::Result<()> {
         .enable_all()
         .build()
         .context("build Tokio runtime")?;
-    runtime.block_on(run_agent(&boot_mode, process_supervisor))
+    runtime.block_on(run_agent(&boot_mode, process_supervisor, agent_config))
 }
 
 fn init_tracing() {
@@ -103,13 +106,14 @@ fn init_tracing() {
         .try_init();
 }
 
-fn select_agent_mode(agent_args: AgentArgs, is_pid1: bool) -> eyre::Result<AgentMode> {
+fn select_agent_mode(agent_args: &AgentArgs, is_pid1: bool) -> eyre::Result<AgentMode> {
     if agent_args.init {
         if !is_pid1 {
             eyre::bail!("--init requires silo-agent to run as PID 1");
         }
         let requested_init = agent_args
             .handoff
+            .clone()
             .ok_or_else(|| eyre::eyre!("--init requires --handoff=<target>"))?;
         return Ok(AgentMode::Init { requested_init });
     }
@@ -136,20 +140,12 @@ fn prepare_agent_process(agent_mode: &AgentMode) -> eyre::Result<BootMode> {
 async fn run_agent(
     boot_mode: &BootMode,
     process_supervisor: ProcessSupervisor,
+    agent_config: AgentConfig,
 ) -> eyre::Result<()> {
     tracing::info!(boot_mode = ?boot_mode, "agent starting");
 
     let control_port = from_kernel_cmdline();
     let mut control = GuestControlClient::connect(control_port).await?;
-
-    let metadata_response = control.get_metadata().await?;
-    let metadata_config = metadata_response
-        .config
-        .ok_or_else(|| eyre::eyre!("guest metadata response did not include a config object"))?;
-    let metadata_json = protocol::protobuf_struct_to_serde_json(metadata_config)
-        .context("decode metadata config returned by vmmon")?;
-    let agent_config: AgentConfig =
-        serde_json::from_value(metadata_json).context("parse metadata config returned by vmmon")?;
 
     let boot_report = boot_mode.report();
     let provision_report = run_provisioning(
@@ -268,6 +264,36 @@ async fn run_agent(
     while join_set.join_next().await.is_some() {}
 
     result
+}
+
+fn load_agent_config(path: &Path) -> eyre::Result<AgentConfig> {
+    let file =
+        fs::File::open(path).with_context(|| format!("open agent config {}", path.display()))?;
+    if !file
+        .metadata()
+        .with_context(|| format!("inspect agent config {}", path.display()))?
+        .is_file()
+    {
+        eyre::bail!("agent config is not a regular file: {}", path.display());
+    }
+
+    let mut bytes = Vec::new();
+    file.take((MAX_AGENT_CONFIG_SIZE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read agent config {}", path.display()))?;
+    if bytes.len() > MAX_AGENT_CONFIG_SIZE_BYTES {
+        eyre::bail!(
+            "agent config exceeds {} byte limit: {}",
+            MAX_AGENT_CONFIG_SIZE_BYTES,
+            path.display()
+        );
+    }
+    let config: AgentConfig = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse agent config {}", path.display()))?;
+    config
+        .validate()
+        .with_context(|| format!("validate agent config {}", path.display()))?;
+    Ok(config)
 }
 
 fn agent_task_result(
@@ -399,13 +425,19 @@ where
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    use std::path::PathBuf;
 
     use crate::{parse_agent_args_from, select_agent_mode, AgentArgs, AgentMode};
 
     #[test]
     fn parses_handoff_equals_argument() {
-        let args = parse_agent_args_from(["silo-agent", "--init", "--handoff=/sbin/init"])
-            .expect("parse agent args");
+        let args = parse_agent_args_from([
+            "silo-agent",
+            "--config=/run/agent/config.json",
+            "--init",
+            "--handoff=/sbin/init",
+        ])
+        .expect("parse agent args");
 
         assert!(args.init);
         assert_eq!(args.handoff.as_deref(), Some(OsStr::new("/sbin/init")));
@@ -413,8 +445,13 @@ mod tests {
 
     #[test]
     fn parses_empty_handoff_equals_argument() {
-        let args = parse_agent_args_from(["silo-agent", "--init", "--handoff="])
-            .expect("parse agent args");
+        let args = parse_agent_args_from([
+            "silo-agent",
+            "--config=/run/agent/config.json",
+            "--init",
+            "--handoff=",
+        ])
+        .expect("parse agent args");
 
         assert!(args.init);
         assert_eq!(args.handoff.as_deref(), Some(OsStr::new("")));
@@ -422,23 +459,39 @@ mod tests {
 
     #[test]
     fn rejects_split_handoff_argument() {
-        assert!(parse_agent_args_from(["silo-agent", "--init", "--handoff", "auto"]).is_err());
+        assert!(parse_agent_args_from([
+            "silo-agent",
+            "--config=/run/agent/config.json",
+            "--init",
+            "--handoff",
+            "auto"
+        ])
+        .is_err());
     }
 
     #[test]
     fn rejects_init_without_handoff() {
-        assert!(parse_agent_args_from(["silo-agent", "--init"]).is_err());
+        assert!(
+            parse_agent_args_from(["silo-agent", "--config=/run/agent/config.json", "--init"])
+                .is_err()
+        );
     }
 
     #[test]
     fn rejects_handoff_without_init() {
-        assert!(parse_agent_args_from(["silo-agent", "--handoff=auto"]).is_err());
+        assert!(parse_agent_args_from([
+            "silo-agent",
+            "--config=/run/agent/config.json",
+            "--handoff=auto"
+        ])
+        .is_err());
     }
 
     #[test]
     fn rejects_duplicate_handoff() {
         assert!(parse_agent_args_from([
             "silo-agent",
+            "--config=/run/agent/config.json",
             "--init",
             "--handoff=auto",
             "--handoff=/sbin/init",
@@ -448,56 +501,48 @@ mod tests {
 
     #[test]
     fn selects_standard_mode_for_non_pid1_without_args() {
-        let mode = select_agent_mode(
-            AgentArgs {
-                init: false,
-                handoff: None,
-            },
-            false,
-        )
-        .expect("select mode");
+        let args = AgentArgs {
+            config: PathBuf::from("/run/agent/config.json"),
+            init: false,
+            handoff: None,
+        };
+        let mode = select_agent_mode(&args, false).expect("select mode");
 
         assert_eq!(mode, AgentMode::Standard);
     }
 
     #[test]
     fn rejects_pid1_without_init_arg() {
-        let err = select_agent_mode(
-            AgentArgs {
-                init: false,
-                handoff: None,
-            },
-            true,
-        )
-        .expect_err("PID1 without --init must fail");
+        let args = AgentArgs {
+            config: PathBuf::from("/run/agent/config.json"),
+            init: false,
+            handoff: None,
+        };
+        let err = select_agent_mode(&args, true).expect_err("PID1 without --init must fail");
 
         assert!(err.to_string().contains("without --init"));
     }
 
     #[test]
     fn rejects_init_arg_outside_pid1() {
-        let err = select_agent_mode(
-            AgentArgs {
-                init: true,
-                handoff: Some(OsStr::new("auto").to_os_string()),
-            },
-            false,
-        )
-        .expect_err("--init outside PID1 must fail");
+        let args = AgentArgs {
+            config: PathBuf::from("/run/agent/config.json"),
+            init: true,
+            handoff: Some(OsStr::new("auto").to_os_string()),
+        };
+        let err = select_agent_mode(&args, false).expect_err("--init outside PID1 must fail");
 
         assert!(err.to_string().contains("PID 1"));
     }
 
     #[test]
     fn selects_init_mode_for_pid1_with_handoff() {
-        let mode = select_agent_mode(
-            AgentArgs {
-                init: true,
-                handoff: Some(OsStr::new("auto").to_os_string()),
-            },
-            true,
-        )
-        .expect("select mode");
+        let args = AgentArgs {
+            config: PathBuf::from("/run/agent/config.json"),
+            init: true,
+            handoff: Some(OsStr::new("auto").to_os_string()),
+        };
+        let mode = select_agent_mode(&args, true).expect("select mode");
 
         assert_eq!(
             mode,

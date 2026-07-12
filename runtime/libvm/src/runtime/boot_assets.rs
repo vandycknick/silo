@@ -1,20 +1,14 @@
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::machine::{MachineAgent, MachineGuestConfig};
 use crate::LibVmError;
 
-const ENV_KERNEL_PATH: &str = "SILO_KERNEL_PATH";
-const ENV_INITRAMFS_PATH: &str = "SILO_INITRAMFS_PATH";
+const ENV_ASSET_DIR: &str = "SILO_ASSET_DIR";
 const SYSTEM_ASSETS_DIR: &str = "/usr/local/share/silo/assets";
 const USER_ASSETS_SUFFIX: &str = ".local/share/silo/assets";
 const DEFAULT_KERNEL_FILENAME: &str = "kernel-default";
 const DEFAULT_INITRAMFS_FILENAME: &str = "initramfs";
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct RuntimeBootDefaults {
-    pub(crate) kernel: Option<PathBuf>,
-    pub(crate) initramfs: Option<PathBuf>,
-}
+const DEFAULT_AGENT_FILENAME: &str = "agent";
 
 #[derive(Debug, Clone)]
 pub(crate) struct BootAssetOverrides<'a> {
@@ -30,79 +24,80 @@ pub(crate) struct ResolvedBootAssets {
 
 pub(crate) fn resolve_boot_assets(
     overrides: BootAssetOverrides<'_>,
-    defaults: &RuntimeBootDefaults,
 ) -> Result<ResolvedBootAssets, LibVmError> {
-    let standard_dirs = standard_asset_dirs();
+    let directories = asset_directories()?;
     Ok(ResolvedBootAssets {
-        kernel: resolve_asset(ResolveAssetInput {
-            asset: "kernel",
-            explicit: overrides.kernel,
-            runtime_default: defaults.kernel.as_deref(),
-            env_name: ENV_KERNEL_PATH,
-            env_value: std::env::var_os(ENV_KERNEL_PATH),
-            filename: DEFAULT_KERNEL_FILENAME,
-            standard_dirs: &standard_dirs,
-        })?,
-        initramfs: resolve_asset(ResolveAssetInput {
-            asset: "initramfs",
-            explicit: overrides.initramfs,
-            runtime_default: defaults.initramfs.as_deref(),
-            env_name: ENV_INITRAMFS_PATH,
-            env_value: std::env::var_os(ENV_INITRAMFS_PATH),
-            filename: DEFAULT_INITRAMFS_FILENAME,
-            standard_dirs: &standard_dirs,
-        })?,
+        kernel: resolve_asset(
+            "kernel",
+            overrides.kernel,
+            DEFAULT_KERNEL_FILENAME,
+            &directories,
+        )?,
+        initramfs: resolve_asset(
+            "initramfs",
+            overrides.initramfs,
+            DEFAULT_INITRAMFS_FILENAME,
+            &directories,
+        )?,
     })
 }
 
-struct ResolveAssetInput<'a> {
-    asset: &'static str,
-    explicit: Option<&'a Path>,
-    runtime_default: Option<&'a Path>,
-    env_name: &'static str,
-    env_value: Option<OsString>,
-    filename: &'static str,
-    standard_dirs: &'a [PathBuf],
+pub(crate) fn canonicalize_boot_overrides(
+    overrides: BootAssetOverrides<'_>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>), LibVmError> {
+    Ok((
+        overrides
+            .kernel
+            .map(|path| require_asset("kernel", path))
+            .transpose()?,
+        overrides
+            .initramfs
+            .map(|path| require_asset("initramfs", path))
+            .transpose()?,
+    ))
 }
 
-fn resolve_asset(input: ResolveAssetInput<'_>) -> Result<PathBuf, LibVmError> {
-    let mut checked = Vec::new();
-
-    if let Some(path) = input.explicit {
-        checked.push(format!("machine override {}", display_path(path)));
-        return require_asset(input.asset, path);
+pub(crate) fn canonicalize_guest_config(
+    mut guest: MachineGuestConfig,
+) -> Result<MachineGuestConfig, LibVmError> {
+    if let MachineAgent::Custom { path } = &mut guest.agent {
+        *path = require_asset("agent", path)?;
     }
+    Ok(guest)
+}
 
-    if let Some(path) = input.runtime_default {
-        checked.push(format!("runtime default {}", display_path(path)));
-        return require_asset(input.asset, path);
-    }
-
-    match input.env_value {
-        Some(value) => {
-            let path = PathBuf::from(value);
-            checked.push(format!("{}={}", input.env_name, display_path(&path)));
-            if !path.is_absolute() {
-                return Err(LibVmError::RelativeEnvironmentPath {
-                    name: input.env_name,
-                    path,
-                });
-            }
-            return require_asset(input.asset, &path);
+pub(crate) fn resolve_agent(agent: &MachineAgent) -> Result<Option<PathBuf>, LibVmError> {
+    match agent {
+        MachineAgent::Default => {
+            let directories = asset_directories()?;
+            resolve_asset("agent", None, DEFAULT_AGENT_FILENAME, &directories).map(Some)
         }
-        None => checked.push(format!("{} unset", input.env_name)),
+        MachineAgent::Custom { path } => require_asset("agent", path).map(Some),
+        MachineAgent::Disabled => Ok(None),
+    }
+}
+
+fn resolve_asset(
+    asset: &'static str,
+    explicit: Option<&Path>,
+    filename: &'static str,
+    directories: &[PathBuf],
+) -> Result<PathBuf, LibVmError> {
+    if let Some(path) = explicit {
+        return require_asset(asset, path);
     }
 
-    for dir in input.standard_dirs {
-        let path = dir.join(input.filename);
-        checked.push(display_path(&path));
+    let mut checked = Vec::new();
+    for directory in directories {
+        let path = directory.join(filename);
+        checked.push(path.display().to_string());
         if path.is_file() {
-            return canonicalize_asset(input.asset, &path);
+            return canonicalize_asset(asset, &path);
         }
     }
 
     Err(LibVmError::BootAssetNotFound {
-        asset: input.asset,
+        asset,
         checked: checked.join(", "),
     })
 }
@@ -133,19 +128,26 @@ fn absolute_path(path: &Path) -> Result<PathBuf, LibVmError> {
     }
 }
 
-fn standard_asset_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from(SYSTEM_ASSETS_DIR)];
+fn asset_directories() -> Result<Vec<PathBuf>, LibVmError> {
+    let mut directories = Vec::new();
+    if let Some(value) = std::env::var_os(ENV_ASSET_DIR) {
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err(LibVmError::RelativeEnvironmentPath {
+                name: ENV_ASSET_DIR,
+                path,
+            });
+        }
+        directories.push(path);
+    }
+    directories.push(PathBuf::from(SYSTEM_ASSETS_DIR));
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
         if home.is_absolute() {
-            dirs.push(home.join(USER_ASSETS_SUFFIX));
+            directories.push(home.join(USER_ASSETS_SUFFIX));
         }
     }
-    dirs
-}
-
-fn display_path(path: &Path) -> String {
-    path.display().to_string()
+    Ok(directories)
 }
 
 #[cfg(test)]
@@ -154,10 +156,10 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::machine::{MachineAgent, MachineGuestConfig};
     use crate::runtime::boot_assets::{
-        resolve_asset, ResolveAssetInput, DEFAULT_KERNEL_FILENAME, ENV_KERNEL_PATH,
+        canonicalize_boot_overrides, canonicalize_guest_config, resolve_asset, BootAssetOverrides,
     };
-    use crate::LibVmError;
 
     fn write_asset(dir: &Path, name: &str) -> PathBuf {
         std::fs::create_dir_all(dir).expect("create asset dir");
@@ -167,117 +169,54 @@ mod tests {
     }
 
     #[test]
-    fn explicit_asset_wins_over_runtime_default() {
+    fn explicit_overrides_are_canonicalized_without_default_lookup() {
         let temp = TempDir::new().expect("tempdir");
-        let explicit = write_asset(temp.path(), "explicit-kernel");
-        let runtime_default = write_asset(temp.path(), "runtime-kernel");
+        let kernel = write_asset(temp.path(), "custom-kernel");
 
-        let resolved = resolve_asset(ResolveAssetInput {
-            asset: "kernel",
-            explicit: Some(&explicit),
-            runtime_default: Some(&runtime_default),
-            env_name: ENV_KERNEL_PATH,
-            env_value: None,
-            filename: DEFAULT_KERNEL_FILENAME,
-            standard_dirs: &[],
-        })
-        .expect("resolve explicit asset");
+        let (resolved_kernel, resolved_initramfs) =
+            canonicalize_boot_overrides(BootAssetOverrides {
+                kernel: Some(&kernel),
+                initramfs: None,
+            })
+            .expect("canonicalize overrides");
 
         assert_eq!(
-            resolved,
-            explicit.canonicalize().expect("canonical explicit")
+            resolved_kernel,
+            Some(kernel.canonicalize().expect("canonical"))
         );
+        assert!(resolved_initramfs.is_none());
     }
 
     #[test]
-    fn runtime_default_wins_over_environment() {
-        let temp = TempDir::new().expect("tempdir");
-        let runtime_default = write_asset(temp.path(), "runtime-kernel");
-        let env_default = write_asset(temp.path(), "env-kernel");
-
-        let resolved = resolve_asset(ResolveAssetInput {
-            asset: "kernel",
-            explicit: None,
-            runtime_default: Some(&runtime_default),
-            env_name: ENV_KERNEL_PATH,
-            env_value: Some(env_default.into_os_string()),
-            filename: DEFAULT_KERNEL_FILENAME,
-            standard_dirs: &[],
-        })
-        .expect("resolve runtime default");
-
-        assert_eq!(
-            resolved,
-            runtime_default.canonicalize().expect("canonical runtime")
-        );
-    }
-
-    #[test]
-    fn environment_wins_over_standard_locations() {
-        let temp = TempDir::new().expect("tempdir");
-        let env_default = write_asset(temp.path(), "env-kernel");
-        let standard_dir = temp.path().join("standard");
-        write_asset(&standard_dir, DEFAULT_KERNEL_FILENAME);
-
-        let resolved = resolve_asset(ResolveAssetInput {
-            asset: "kernel",
-            explicit: None,
-            runtime_default: None,
-            env_name: ENV_KERNEL_PATH,
-            env_value: Some(env_default.clone().into_os_string()),
-            filename: DEFAULT_KERNEL_FILENAME,
-            standard_dirs: &[standard_dir],
-        })
-        .expect("resolve env asset");
-
-        assert_eq!(resolved, env_default.canonicalize().expect("canonical env"));
-    }
-
-    #[test]
-    fn standard_locations_are_checked_in_order() {
+    fn defaults_fall_through_directories_independently() {
         let temp = TempDir::new().expect("tempdir");
         let first = temp.path().join("first");
         let second = temp.path().join("second");
-        let expected = write_asset(&second, DEFAULT_KERNEL_FILENAME);
+        let expected = write_asset(&second, "agent");
 
-        let resolved = resolve_asset(ResolveAssetInput {
-            asset: "kernel",
-            explicit: None,
-            runtime_default: None,
-            env_name: ENV_KERNEL_PATH,
-            env_value: None,
-            filename: DEFAULT_KERNEL_FILENAME,
-            standard_dirs: &[first, second],
-        })
-        .expect("resolve standard asset");
+        let resolved = resolve_asset("agent", None, "agent", &[first, second])
+            .expect("resolve fallback asset");
 
-        assert_eq!(
-            resolved,
-            expected.canonicalize().expect("canonical standard")
-        );
+        assert_eq!(resolved, expected.canonicalize().expect("canonical"));
     }
 
     #[test]
-    fn missing_asset_lists_checked_sources() {
+    fn custom_agent_is_canonicalized_for_persistence() {
         let temp = TempDir::new().expect("tempdir");
-        let standard_dir = temp.path().join("missing");
+        let agent = write_asset(temp.path(), "custom-agent");
+        let guest = MachineGuestConfig {
+            agent: MachineAgent::Custom {
+                path: agent.clone(),
+            },
+        };
 
-        let err = resolve_asset(ResolveAssetInput {
-            asset: "kernel",
-            explicit: None,
-            runtime_default: None,
-            env_name: ENV_KERNEL_PATH,
-            env_value: None,
-            filename: DEFAULT_KERNEL_FILENAME,
-            standard_dirs: std::slice::from_ref(&standard_dir),
-        })
-        .expect_err("missing asset should fail");
+        let guest = canonicalize_guest_config(guest).expect("canonicalize guest");
 
-        assert!(matches!(
-            err,
-            LibVmError::BootAssetNotFound { asset: "kernel", checked }
-                if checked.contains("SILO_KERNEL_PATH unset")
-                    && checked.contains(&standard_dir.join(DEFAULT_KERNEL_FILENAME).display().to_string())
-        ));
+        assert_eq!(
+            guest.agent,
+            MachineAgent::Custom {
+                path: agent.canonicalize().expect("canonical")
+            }
+        );
     }
 }

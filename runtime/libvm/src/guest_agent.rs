@@ -58,12 +58,6 @@ pub(crate) fn build_config(input: GuestAgentConfigInput<'_>) -> eyre::Result<Age
     build_config_with_host_context(input.machine_name, input.spec, input.network, &host_context)
 }
 
-pub(crate) fn write_config(path: &Path, config: &AgentConfig) -> eyre::Result<()> {
-    let rendered = serde_json::to_string(config).context("serialize metadata config")?;
-    fs::write(path, rendered)
-        .with_context(|| format!("write metadata config at {}", path.display()))
-}
-
 fn load_host_context(
     paths: &LocalPaths,
     networking: &RuntimeNetworkingConfig,

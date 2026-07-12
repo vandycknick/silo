@@ -6,7 +6,11 @@ pub const DEFAULT_AGENT_TIMEOUT_SECONDS: u64 = 60 * 5;
 /// Default guest SSH vsock port exposed by the Silo agent.
 pub const SSH_VSOCK_PORT: u32 = 22;
 
+/// Maximum serialized configuration accepted by host composition and the guest agent.
+pub const MAX_AGENT_CONFIG_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     #[serde(default)]
     pub forward: AgentForwardConfig,
@@ -14,6 +18,140 @@ pub struct AgentConfig {
     pub provision: ProvisionConfig,
     #[serde(default)]
     pub ssh: AgentSshConfig,
+}
+
+impl AgentConfig {
+    pub fn validate(&self) -> Result<(), AgentConfigError> {
+        if self.forward.enabled && self.forward.port == 0 {
+            return Err(AgentConfigError::new(
+                "forward.port must be nonzero when enabled",
+            ));
+        }
+        validate_unique_nonempty(
+            self.forward
+                .uds
+                .iter()
+                .map(|entry| entry.guest_path.as_str()),
+            "forward.uds guest_path",
+        )?;
+        for entry in &self.forward.uds {
+            validate_absolute_path(&entry.guest_path, "forward.uds guest_path")?;
+        }
+
+        validate_unique_nonempty(
+            self.ssh
+                .authorized_users
+                .iter()
+                .map(|user| user.name.as_str()),
+            "ssh authorized user name",
+        )?;
+        for user in &self.ssh.authorized_users {
+            if user.authorized_keys.iter().any(|key| key.trim().is_empty()) {
+                return Err(AgentConfigError::new(
+                    "ssh authorized key must not be empty",
+                ));
+            }
+        }
+
+        if let Some(value) = &self.provision.hostname {
+            validate_nonempty(value, "provision.hostname")?;
+        }
+        validate_unique_nonempty(
+            self.provision.users.iter().map(|user| user.name.as_str()),
+            "provision user name",
+        )?;
+        for user in &self.provision.users {
+            validate_absolute_path(&user.home, "provision user home")?;
+            validate_absolute_path(&user.shell, "provision user shell")?;
+        }
+        if let Some(authority) = &self.provision.certificate_authority {
+            validate_absolute_path(&authority.path, "certificate authority path")?;
+            validate_nonempty(&authority.pem, "certificate authority pem")?;
+        }
+        validate_unique_nonempty(
+            self.provision
+                .network
+                .interfaces
+                .iter()
+                .map(|interface| interface.name.as_str()),
+            "network interface name",
+        )?;
+        for interface in &self.provision.network.interfaces {
+            if interface.matches.driver.is_none() && interface.matches.mac_address.is_none() {
+                return Err(AgentConfigError::new(
+                    "network interface requires a driver or MAC address match",
+                ));
+            }
+        }
+        validate_unique_nonempty(
+            self.provision.mounts.iter().map(|mount| mount.tag.as_str()),
+            "mount tag",
+        )?;
+        for mount in &self.provision.mounts {
+            validate_absolute_path(&mount.path, "mount path")?;
+            validate_nonempty(&mount.fstype, "mount fstype")?;
+        }
+        if self.provision.rosetta.enabled {
+            validate_nonempty(&self.provision.rosetta.mount_tag, "rosetta mount tag")?;
+            validate_absolute_path(&self.provision.rosetta.mount_path, "rosetta mount path")?;
+        }
+        if let Some(userdata) = &self.provision.userdata {
+            validate_nonempty(&userdata.content, "userdata content")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentConfigError {
+    message: String,
+}
+
+impl AgentConfigError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AgentConfigError {}
+
+fn validate_nonempty(value: &str, field: &str) -> Result<(), AgentConfigError> {
+    if value.trim().is_empty() {
+        return Err(AgentConfigError::new(format!("{field} must not be empty")));
+    }
+    Ok(())
+}
+
+fn validate_absolute_path(value: &str, field: &str) -> Result<(), AgentConfigError> {
+    validate_nonempty(value, field)?;
+    if !value.starts_with('/') || value.split('/').any(|part| matches!(part, "." | "..")) {
+        return Err(AgentConfigError::new(format!(
+            "{field} must be an absolute normalized path"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_unique_nonempty<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    field: &str,
+) -> Result<(), AgentConfigError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for value in values {
+        validate_nonempty(value, field)?;
+        if !seen.insert(value) {
+            return Err(AgentConfigError::new(format!("{field} must be unique")));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -184,6 +322,7 @@ pub enum UserdataRunPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AgentForwardConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -194,6 +333,7 @@ pub struct AgentForwardConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AgentUdsForwardConfig {
     pub guest_path: String,
 }
@@ -292,7 +432,7 @@ provision:
     }
 
     #[test]
-    fn agent_config_round_trips_through_metadata_struct() {
+    fn agent_config_round_trips_through_json() {
         let original = AgentConfig {
             forward: AgentForwardConfig {
                 enabled: true,
@@ -358,14 +498,25 @@ provision:
             },
         };
 
-        let value = serde_json::to_value(&original).expect("serialize agent config");
-        let encoded =
-            protocol::serde_json_to_protobuf_struct(value).expect("encode metadata struct");
-        let decoded =
-            protocol::protobuf_struct_to_serde_json(encoded).expect("decode metadata struct");
+        let encoded = serde_json::to_vec(&original).expect("serialize agent config");
         let round_tripped: AgentConfig =
-            serde_json::from_value(decoded).expect("deserialize agent config");
+            serde_json::from_slice(&encoded).expect("deserialize agent config");
 
         assert_eq!(round_tripped, original);
+    }
+
+    #[test]
+    fn validation_rejects_enabled_forward_without_port() {
+        let config = AgentConfig {
+            forward: AgentForwardConfig {
+                enabled: true,
+                ..AgentForwardConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+
+        let error = config.validate().expect_err("invalid forward config");
+
+        assert!(error.to_string().contains("forward.port"));
     }
 }

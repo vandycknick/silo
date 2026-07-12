@@ -9,8 +9,11 @@ pub(crate) const DEFAULT_INIT: &[u8] = b"/sbin/init";
 const MNT_ROOT: &[u8] = b"/mnt/root";
 const AGENT_PAYLOAD_DIR: &[u8] = b"/agent";
 const AGENT_SOURCE_BINARY: &[u8] = b"/agent/silo-agent";
+const AGENT_SOURCE_CONFIG: &[u8] = b"/agent/config.json";
 const AGENT_RUN_DIR: &[u8] = b"/run/agent";
 const AGENT_RUN_BINARY: &[u8] = b"/run/agent/silo-agent";
+const AGENT_RUN_CONFIG: &[u8] = b"/run/agent/config.json";
+const AGENT_CONFIG_ARG: &[u8] = b"--config=/run/agent/config.json";
 const AGENT_INIT_ARG: &[u8] = b"--init";
 const AGENT_HANDOFF_ARG_PREFIX: &[u8] = b"--handoff=";
 
@@ -55,7 +58,12 @@ fn run_init() -> Result<(), &'static str> {
 
     if prepare_agent_boot()? {
         let handoff_arg = agent_handoff_arg(&config);
-        let init_argv = [AGENT_RUN_BINARY, AGENT_INIT_ARG, handoff_arg.as_slice()];
+        let init_argv = [
+            AGENT_RUN_BINARY,
+            AGENT_CONFIG_ARG,
+            AGENT_INIT_ARG,
+            handoff_arg.as_slice(),
+        ];
         if do_switch_root(MNT_ROOT, AGENT_RUN_BINARY, &init_argv) != 0 {
             return Err("switch_root failed");
         }
@@ -173,17 +181,39 @@ fn prepare_agent_boot() -> Result<bool, &'static str> {
         return Ok(false);
     }
 
-    if io::access(AGENT_SOURCE_BINARY, libc::R_OK) != 0 {
-        return Err("agent payload is missing /agent/silo-agent");
-    }
+    validate_payload_file(
+        AGENT_SOURCE_BINARY,
+        "agent payload has invalid /agent/silo-agent",
+    )?;
+    validate_payload_file(
+        AGENT_SOURCE_CONFIG,
+        "agent payload has invalid /agent/config.json",
+    )?;
 
     if applets::files::mkdir_parents(AGENT_RUN_DIR, 0o755) != 0 {
         return Err("failed to create /run/agent");
     }
 
-    copy_file(AGENT_SOURCE_BINARY, AGENT_RUN_BINARY, 0o755)?;
+    if let Err(message) = copy_file(AGENT_SOURCE_BINARY, AGENT_RUN_BINARY, 0o755)
+        .and_then(|()| copy_file(AGENT_SOURCE_CONFIG, AGENT_RUN_CONFIG, 0o600))
+    {
+        io::unlink(AGENT_RUN_BINARY);
+        io::unlink(AGENT_RUN_CONFIG);
+        return Err(message);
+    }
 
     Ok(true)
+}
+
+fn validate_payload_file(path: &[u8], message: &'static str) -> Result<(), &'static str> {
+    let mut stat = io::stat_zeroed();
+    if io::lstat(path, &mut stat) != 0
+        || (stat.st_mode & libc::S_IFMT) != libc::S_IFREG
+        || io::access(path, libc::R_OK) != 0
+    {
+        return Err(message);
+    }
+    Ok(())
 }
 
 fn agent_handoff_arg(config: &BootConfig) -> Vec<u8> {
@@ -201,7 +231,7 @@ fn agent_handoff_arg(config: &BootConfig) -> Vec<u8> {
 }
 
 fn copy_file(source: &[u8], target: &[u8], mode: u32) -> Result<(), &'static str> {
-    let input = io::open(source, libc::O_RDONLY, 0);
+    let input = io::open(source, libc::O_RDONLY | libc::O_NOFOLLOW, 0);
     if input < 0 {
         return Err("failed to open agent payload source");
     }

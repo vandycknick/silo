@@ -3,7 +3,6 @@ GUEST_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/silo-agent
 GUEST_INIT_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/init
 GUEST_ASSETS_DIR := $(CURDIR)/target/resources/assets
 INITRAMFS_OUT := $(GUEST_ASSETS_DIR)/initramfs
-INITRAMFS_NO_AGENT_OUT := $(GUEST_ASSETS_DIR)/initramfs-no-agent
 ARCH ?= arm64
 PROFILE ?= debug
 RUST_HOST_TRIPLE := $(shell rustc -vV | awk '/host:/ { print $$2 }')

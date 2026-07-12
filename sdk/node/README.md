@@ -9,14 +9,14 @@ types, and error mapping.
 
 `silo` does not bundle the Silo CLI or `vmmon`. `vmmon` must be available
 on `PATH`, or supplied through `Runtime.open({ vmmonPath })`.
+Kernel, initramfs, and agent defaults come from the Silo installation through
+`SILO_ASSET_DIR`, `/usr/local/share/silo/assets`, or
+`$HOME/.local/share/silo/assets`.
 
 ```ts
 import { ImageSource, NetworkPolicy, Runtime } from "silo";
 
-const runtime = await Runtime.open({
-  defaultKernel: "/usr/local/share/silo/assets/kernel-default",
-  defaultInitramfs: "/usr/local/share/silo/assets/initramfs",
-});
+const runtime = await Runtime.open();
 
 const machine = await runtime
   .machine()

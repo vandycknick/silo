@@ -4,7 +4,7 @@ Date: 2026-07-11
 
 ## Status
 
-Proposed
+Accepted
 
 ## The Problem
 
@@ -24,8 +24,9 @@ machine.
 The agent evolves independently from the reusable initramfs. Baking it into the
 base initramfs couples every agent release to a base rebuild. Publishing
 agent-bearing and agent-free bases would duplicate artifacts and invite drift.
-We need one reusable early-userspace image, one compatible standalone agent,
-and a small launch-specific delivery mechanism.
+We need one reusable early-userspace image, one standalone default agent, the
+ability to select custom assets independently, and a small launch-specific
+delivery mechanism.
 
 This ADR owns pre-boot materialization and handoff to the agent. [ADR
 0008](0008-vmmon-host-and-guest-http-api.md) owns everything after that handoff:
@@ -33,10 +34,10 @@ post-boot discovery, readiness, status, metrics, and control.
 
 ## Where Reusable And Per-Launch State Meet
 
-We distribute a Silo asset bundle containing a kernel, a reusable base
-initramfs, and a standalone agent binary. The base contains `silo-init`, but no
-`/agent` payload. The agent is selected with that base as one compatible bundle,
-not as an independently discovered neighboring file.
+Silo installations provide three independent default assets: a kernel, a
+reusable base initramfs, and a standalone agent binary. The base contains
+`silo-init`, but no `/agent` payload. A machine may override the kernel,
+initramfs, or agent independently, or disable managed-agent injection.
 
 At launch, `libvm` resolves every machine decision, builds a complete typed
 `AgentConfig`, and serializes it once. It combines that JSON and the selected
@@ -54,9 +55,9 @@ that later boot path has made the post-boot agent service available.
 
 Consider one managed VM start.
 
-1. `libvm` resolves one compatible Silo asset bundle. It resolves an explicit
-   custom initramfs, when configured, only as a replacement for the base member.
-   The agent still comes from the selected Silo bundle.
+1. `libvm` resolves the kernel, base initramfs, and agent independently. Explicit
+   machine paths win; omitted paths are found in the current default asset
+   locations. A disabled agent selection skips agent resolution.
 2. `libvm` resolves the final machine, network, mount, user, SSH, and
    provisioning inputs. Only after those decisions are complete does it build
    the typed `AgentConfig` and serialize one UTF-8 JSON document.
@@ -83,10 +84,12 @@ look like successful payload preparation.
 ## Determination
 
 Silo distributes one reusable base initramfs and one standalone guest-agent
-binary as members of one compatible Silo asset bundle. For every
-`libvm`-managed launch, `libvm` appends an uncompressed raw `newc` CPIO overlay
-to the resolved base initramfs. The overlay contains the agent binary and the
-newly generated configuration.
+binary as independent default assets. For every `libvm`-managed launch with
+agent injection enabled, `libvm` appends an uncompressed raw `newc` CPIO overlay
+to the resolved base initramfs. The overlay contains the selected default or
+custom agent binary and the newly generated configuration. A launch with agent
+injection disabled uses the resolved base unchanged and does not derive an
+`AgentConfig`.
 
 The base contains `silo-init` but does not contain `/agent`,
 `/agent/silo-agent`, or `/agent/config.json`. Asset production emits one base
@@ -128,9 +131,9 @@ members into the same early root, making `agent/config.json` available as
 
 ## Asset And Archive Contract
 
-### Asset Bundle
+### Asset Selection
 
-At minimum, one Silo guest asset bundle is:
+An installation normally places these default assets together:
 
 ```text
 assets/
@@ -141,18 +144,23 @@ assets/
 
 `initramfs` is the reusable compressed base archive. `agent` is the standalone
 Silo agent executable; its asset filename is not its guest path. The overlay
-writes it as `agent/silo-agent`.
+writes any selected agent as `agent/silo-agent`.
 
-Managed resolution treats `initramfs` and `agent` as members of one bundle. It
-must not select an initramfs from one fallback asset directory and an agent from
-another. That preserves compatibility between the distributed `silo-init` and
-agent releases.
+For each omitted machine asset, `libvm` searches `$SILO_ASSET_DIR`, then
+`/usr/local/share/silo/assets`, then `$HOME/.local/share/silo/assets`. The fixed
+filenames are `kernel-default`, `initramfs`, and `agent`. Each asset resolves
+independently and may come from a different directory. A relative
+`SILO_ASSET_DIR` is invalid.
 
-An explicit machine initramfs overrides only the base initramfs member. `libvm`
-still appends the same managed overlay using the agent from the selected Silo
-bundle. The custom base must provide an `/init` that honors this ADR's guest
-payload preparation contract. Root replacement and process startup are a
-separate decision.
+Only explicit machine overrides are durable. Default paths are resolved for
+each start and are not written back to machine configuration. The Silo
+installation owns placing defaults in a system or user asset directory; `libvm`
+and language SDKs do not install them.
+
+An explicit machine initramfs replaces only the base. An explicit custom agent
+replaces only the executable. With injection enabled, `libvm` appends the same
+managed overlay contract for every default or custom combination. Compatibility
+of custom combinations is the caller's responsibility.
 
 ### Overlay Contents
 
@@ -169,7 +177,8 @@ Archive names are relative. Entries must never contain a leading slash, `.` or
 entry attributes where the format permits it: modification times are zero,
 inode numbers are local to the overlay, directory link counts are valid, and
 nondirectory entries use one link. Both payload sizes must fit the unsigned
-32-bit `newc` size field.
+32-bit `newc` size field. Serialized agent configuration is additionally limited
+to 16 MiB.
 
 `libvm` writes the archive directly in process. Launch must not depend on host
 `cpio`, `gzip`, a shell, or another external archive utility.
@@ -180,17 +189,19 @@ nondirectory entries use one link. Both payload sizes must fit the unsigned
 
 While holding the machine lifecycle boundary, `libvm`:
 
-1. Resolves the Silo guest asset bundle.
-2. Resolves any explicit base-initramfs override.
+1. Resolves explicit or default kernel, base-initramfs, and agent selections.
+2. Skips agent resolution and composition when injection is disabled.
 3. Resolves all launch-specific inputs required by `AgentConfig`.
 4. Serializes the typed configuration to JSON.
 5. Creates the composite initramfs at a managed machine path.
 6. Writes the generated launch specification with the composite path.
 7. Starts `vmmon` only after every generated launch input is complete.
 
-The persisted machine specification retains the configured base-initramfs
-reference. The composite is a derived launch artifact, never the canonical
-input for later composition, so overlays cannot accumulate across starts.
+The persisted `MachineConfig` retains only explicit kernel, base-initramfs, and
+custom or disabled agent choices. Agent selection is not part of `VmSpec`.
+Omitted defaults, the complete `AgentConfig`, resolved default paths, and the
+composite are derived launch state. The composite is never the canonical input
+for later composition, so overlays cannot accumulate across starts.
 `libvm` regenerates it for every start, even if the machine and base are
 unchanged, because configuration belongs to that launch. It follows the normal
 lifetime and cleanup policy for managed per-machine launch artifacts.
@@ -201,9 +212,11 @@ base and overlay bytes are written and the temporary file closes successfully,
 `libvm` atomically renames it over the prior derived artifact. Failed writes
 leave no partially updated launch artifact.
 
-`vmmon` receives only the generated VM specification and composite initramfs
-path. It does not resolve the agent, parse `AgentConfig`, write CPIO entries, or
-serve boot configuration.
+`vmmon` receives only the generated VM specification and resolved base or
+composite initramfs path. It does not resolve the agent, parse `AgentConfig`,
+write CPIO entries, or serve boot configuration. Whether post-boot guest-agent
+services are expected is launch policy owned by ADR 0008, not a `VmSpec`
+injection detail.
 
 ### `silo-init`
 
@@ -225,8 +238,8 @@ root.
 
 ### Agent
 
-When the later handoff contract invokes the agent, every `libvm`-managed
-invocation has `--config=<path>`. The agent:
+When the later handoff contract invokes a default or custom agent, every
+`libvm`-managed invocation has `--config=<path>`. The agent:
 
 1. Parses its process arguments.
 2. Opens the supplied path without discovery.
@@ -254,15 +267,16 @@ JSON as opaque after serialization.
 Configuration is immutable for one boot. A changed configuration requires a
 new launch and a new composite initramfs.
 
-Before VM start, an incomplete or incompatible bundle; missing, non-regular, or
-unreadable agent; failed configuration construction or serialization; an
-unopenable or uncopyable base; an unrepresentable overlay entry; or a temporary
+Before VM start, an unresolved required default; an invalid explicit override;
+a missing, non-regular, or unreadable agent; failed configuration construction
+or serialization; an unopenable or uncopyable base; an unrepresentable overlay
+entry; or a temporary
 file, write, close, or atomic-replacement error is a launch failure. `libvm`
 reports the machine and relevant host path without configuration contents.
 
-If `/agent` is absent, the managed payload path is not selected. The base remains
-independently bootable outside a managed launch through behavior defined by the
-later handoff decision. If `/agent` exists, both payload files are mandatory.
+If injection is disabled, `/agent` is absent from the generated overlay and
+ADR 0008 guest-agent readiness is not required. The base remains independently
+bootable. If `/agent` exists, both payload files are mandatory.
 Any missing, invalid, or uncopyable binary or configuration enters the
 `silo-init` rescue shell before the deferred root transition. There is no
 partial payload preparation and no fallback to an older agent or configuration
@@ -289,20 +303,27 @@ and data too large for the format.
 Agent configuration, userdata, credentials, keys, and certificate material
 must not appear in logs, errors, command-line arguments, or the persisted
 machine specification. Host access to a managed composite is equivalent to
-access to its generated configuration. The base initramfs and agent are
-executable release artifacts in Silo's trusted computing base. Asset signing,
+access to its generated configuration. The default base initramfs and agent are
+executable release artifacts in Silo's trusted computing base. Explicit custom
+assets extend that trust boundary to caller-selected files. Asset signing,
 package verification, and confidential guest provisioning are separate
 decisions.
 
 ## Custom Initramfs Compatibility
 
-A custom initramfs receives the same overlay. Its `/init` must:
+A custom initramfs receives the same overlay when injection is enabled. To
+satisfy managed readiness, its `/init` must:
 
 - Reserve `/agent` for the Silo payload contract.
 - Preserve or copy both payloads into the target root's runtime filesystem.
 - Execute the agent with the explicit configuration path.
 - Fail closed when only part of the payload is present.
 - Ensure configuration validation precedes successful managed boot.
+
+A custom `/init` may ignore the payload and continue booting, but ADR 0008 then
+reports the enabled agent as unavailable and the machine does not become ready.
+Selecting disabled injection is the way to boot without that readiness
+requirement.
 
 A custom base must not contain a conflicting `/agent/silo-agent` or
 `/agent/config.json`. The appended overlay follows the base and its entries are
@@ -321,7 +342,10 @@ Unit and integration tests cover:
 - A valid independent `TRAILER!!!` entry.
 - Rejection of invalid archive paths and oversized files.
 - Atomic replacement without overlay accumulation across starts.
-- Complete asset-bundle resolution without cross-directory mixing.
+- Omitted default resolution at launch without durable path persistence.
+- Independent default lookup and explicit kernel, initramfs, and agent overrides.
+- Disabled launches without an overlay or agent readiness requirement.
+- Custom-agent composition.
 - Explicit custom-initramfs composition.
 - Launch failure before `vmmon` starts when generation fails.
 - Copying both payloads into the early `/run` mount.
@@ -336,12 +360,17 @@ relying only on an archive reader. It verifies that both appended payloads are
 visible to `silo-init` and copied into early `/run/agent`. It does not select a
 root-transition or process-start contract.
 
+The first implementation may land before a suitable Linux boot-test harness is
+available. That test remains an explicit conformance gap until the harness is
+added; it does not weaken the archive or guest preparation contract.
+
 ## Consequences
 
 ### Benefits
 
 - One base initramfs serves managed and unmanaged boots.
 - Agent release and machine-specific configuration are selected at launch.
+- Kernel, initramfs, and agent assets can be overridden independently.
 - Agent configuration delivery does not depend on guest networking or a host
   configuration service.
 - The base is never unpacked or recompressed during normal launch.
@@ -358,6 +387,7 @@ root-transition or process-start contract.
 - The machine directory retains a sensitive derived artifact while it exists.
 - Runtime configuration updates require another mechanism.
 - Custom compatibility depends on its `/init` implementation.
+- Custom initramfs and agent compatibility is the caller's responsibility.
 - Guest root and the guest kernel can inspect injected configuration.
 
 ## Alternatives Considered
@@ -409,6 +439,7 @@ nonsensitive configuration path belongs in a process argument.
 - Custom initramfs compatibility cannot be established completely before boot.
 - A composite from one launch is not a reusable base for another launch.
 - Each regular file is limited to the unsigned 32-bit archive size field.
+- Serialized `AgentConfig` is limited to 16 MiB.
 - This mechanism does not synchronize host and guest clocks. The virtual RTC
   and kernel timekeeping configuration own early wall-clock initialization.
 
@@ -419,7 +450,7 @@ nonsensitive configuration path belongs in a process argument.
 ## What This Does Not Decide
 
 This ADR does not define the fields or evolution rules of `AgentConfig`, the
-public interface for selecting a custom initramfs, runtime configuration
+exact public API spelling for selecting custom assets, runtime configuration
 updates, agent installation or self-update, asset signing, remote-manager
 artifact transfer, kernel, root-disk, or guest-image distribution,
 confidential guest secrets, attestation, or custom-initramfs contract version

@@ -3,17 +3,12 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use eyre::Context as EyreContext;
 use futures::stream::{self, Stream};
-use protocol::prost_types::Struct;
 use protocol::v1::guest_control_service_server::{GuestControlService, GuestControlServiceServer};
-use protocol::v1::metadata_service_server::{MetadataService, MetadataServiceServer};
-use protocol::v1::{
-    GetMetadataRequest, GetMetadataResponse, ProvisionOverallStatus, RegisterGuestRequest,
-    RegisterGuestResponse,
-};
+use protocol::v1::{ProvisionOverallStatus, RegisterGuestRequest, RegisterGuestResponse};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -104,40 +99,6 @@ impl GuestControlService for GuestControlSvc {
     }
 }
 
-#[derive(Clone)]
-struct MetadataSvc {
-    config: Arc<Struct>,
-    rosetta_enabled: bool,
-}
-
-impl MetadataSvc {
-    fn new(config: Struct, rosetta_enabled: bool) -> Self {
-        Self {
-            config: Arc::new(config),
-            rosetta_enabled,
-        }
-    }
-}
-
-#[tonic::async_trait]
-impl MetadataService for MetadataSvc {
-    async fn get_metadata(
-        &self,
-        _request: Request<GetMetadataRequest>,
-    ) -> Result<Response<GetMetadataResponse>, Status> {
-        tracing::info!(
-            config_fields = self.config.fields.len(),
-            rosetta_enabled = self.rosetta_enabled,
-            "guest metadata requested"
-        );
-        Ok(Response::new(GetMetadataResponse {
-            timestamp_unix: current_unix_timestamp(),
-            rosetta_enabled: self.rosetta_enabled,
-            config: Some(self.config.as_ref().clone()),
-        }))
-    }
-}
-
 #[derive(Debug)]
 struct ConnectedVsock(VsockStream);
 
@@ -181,8 +142,6 @@ impl AsyncWrite for ConnectedVsock {
 pub(crate) async fn spawn_guest_services(
     machine: &VirtualMachine,
     store: Arc<InstanceStore>,
-    metadata_config: Struct,
-    rosetta_enabled: bool,
     wait_for_registration: Duration,
     shutdown: CancellationToken,
 ) -> eyre::Result<JoinHandle<()>> {
@@ -192,7 +151,6 @@ pub(crate) async fn spawn_guest_services(
         .context("listen for guest control connections")?;
     let ready = Arc::new(AtomicBool::new(false));
     let control = GuestControlSvc::new(store.clone(), ready.clone());
-    let metadata = MetadataSvc::new(metadata_config, rosetta_enabled);
     let timeout_task = spawn_readiness_timeout(
         store.clone(),
         ready,
@@ -201,7 +159,7 @@ pub(crate) async fn spawn_guest_services(
     );
 
     Ok(tokio::spawn(async move {
-        let result = serve_guest_services(listener, control, metadata, shutdown).await;
+        let result = serve_guest_services(listener, control, shutdown).await;
         if let Some(timeout_task) = timeout_task {
             timeout_task.abort();
         }
@@ -220,12 +178,10 @@ pub(crate) async fn spawn_guest_services(
 async fn serve_guest_services(
     listener: VsockListener,
     control: GuestControlSvc,
-    metadata: MetadataSvc,
     shutdown: CancellationToken,
 ) -> eyre::Result<()> {
     tonic::transport::Server::builder()
         .add_service(GuestControlServiceServer::new(control))
-        .add_service(MetadataServiceServer::new(metadata))
         .serve_with_incoming_shutdown(incoming_vsock_connections(listener), shutdown.cancelled())
         .await?;
     Ok(())
@@ -268,13 +224,6 @@ fn spawn_readiness_timeout(
     }))
 }
 
-fn current_unix_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -290,7 +239,7 @@ mod tests {
     #[test]
     fn zero_registration_wait_disables_timeout_task() {
         let task = spawn_readiness_timeout(
-            std::sync::Arc::new(new_instance_store()),
+            std::sync::Arc::new(new_instance_store(true)),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Duration::ZERO,
             tokio_util::sync::CancellationToken::new(),

@@ -11,7 +11,19 @@ use crate::LibVmError;
 
 impl Machine {
     /// Replaces the VM spec for a stopped machine.
-    pub async fn replace_config(&self, spec: VmSpec) -> Result<MachineData, LibVmError> {
+    pub async fn replace_config(&self, mut spec: VmSpec) -> Result<MachineData, LibVmError> {
+        let kernel = spec.boot.as_ref().and_then(|boot| boot.kernel.as_ref());
+        let (kernel_path, initramfs_path) =
+            crate::runtime::boot_assets::canonicalize_boot_overrides(
+                crate::runtime::boot_assets::BootAssetOverrides {
+                    kernel: kernel.and_then(|kernel| kernel.path.as_deref()),
+                    initramfs: kernel.and_then(|kernel| kernel.initramfs.as_deref()),
+                },
+            )?;
+        if let Some(kernel) = spec.boot.as_mut().and_then(|boot| boot.kernel.as_mut()) {
+            kernel.path = kernel_path;
+            kernel.initramfs = initramfs_path;
+        }
         let runtime = self.runtime();
         let (_lock, mut config) = runtime.lock_machine_config(self.machine_id()).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
@@ -70,6 +82,11 @@ impl Machine {
         }
         let replacement_network: Option<ModelMachineNetworkConfig> =
             update.network.clone().map(Into::into);
+        let replacement_guest = update
+            .guest
+            .clone()
+            .map(crate::runtime::boot_assets::canonicalize_guest_config)
+            .transpose()?;
         if let Some(network) = &replacement_network {
             runtime.validate_machine_network_config(network).await?;
         }
@@ -169,6 +186,9 @@ impl Machine {
             runtime
                 .validate_machine_network_config(&config.network)
                 .await?;
+        }
+        if let Some(guest) = replacement_guest {
+            config.guest = guest;
         }
 
         config.modified_at = now_unix();

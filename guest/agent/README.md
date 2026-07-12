@@ -91,13 +91,14 @@ In the default systemd boot path, logs are captured by the service manager, for 
 
 ## Bootstrap
 
-Today Silo expects `silo-agent` to be handed off by `silo-init` and started by systemd.
+Silo distributes an agent-free base initramfs and a standalone agent. At each
+managed launch, `libvm` appends `/agent/silo-agent` and `/agent/config.json` in a
+raw CPIO overlay. `silo-init` validates and copies both files to `/run/agent`,
+then invokes the agent with `--config=/run/agent/config.json`.
 
-The runtime initramfs embeds `/agent/silo-agent` and `/agent/silo-agent.yaml`. `silo-init` copies those files into `/run/agent`, writes a transient `silo-agent.service` unit under `/run/systemd/system`, and lets systemd start it during the normal boot.
-
-When the process is running as PID 1, the current behavior is intentionally minimal. The agent detects PID 1 and logs that init mode is not implemented yet. Direct PID 1 initialization support is planned, but is still to be implemented.
-
-That future mode is expected to cover the pieces currently delegated to the guest OS boot flow, such as early system setup and service supervision.
+The agent supports ordinary process startup and the managed PID 1 handoff mode.
+Custom agents and initramfs implementations must honor the same explicit config
+path and guest API contract when managed readiness is enabled.
 
 ## Cross-Compilation
 

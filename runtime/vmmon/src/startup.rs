@@ -1,13 +1,11 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::Context;
-use protocol::prost_types::Struct;
-use protocol::serde_json_to_protobuf_struct;
 use tokio_util::sync::CancellationToken;
 use virt::VirtualMachine;
 use vm_spec::VmSpec;
@@ -133,13 +131,11 @@ pub async fn init(
     machine_id: &str,
     name: &str,
     network_args: &[String],
-    metadata_config_path: Option<&Path>,
     wait_for_registration: Duration,
     start_gate: &mut StartGate,
 ) -> eyre::Result<DaemonContext> {
     let spec = load_spec(runtime)?;
-    let metadata_config = load_metadata_config(metadata_config_path)?;
-    let guest_services_enabled = metadata_config.is_some() || !wait_for_registration.is_zero();
+    let guest_services_enabled = !wait_for_registration.is_zero();
     let network = parse_network_args(network_args)?;
 
     tracing::info!(instance = %name, "vmmon starting");
@@ -162,7 +158,7 @@ pub async fn init(
     }
 
     let serial_console = machine.serial();
-    let store = Arc::new(new_instance_store());
+    let store = Arc::new(new_instance_store(guest_services_enabled));
 
     store.dispatch(Action::vm_starting())?;
     start_gate.wait_for_release().await?;
@@ -171,7 +167,6 @@ pub async fn init(
 
     Ok(DaemonContext {
         spec,
-        metadata_config,
         guest_services_enabled,
         wait_for_registration,
         machine,
@@ -186,20 +181,6 @@ fn load_spec(runtime: &RuntimeContext) -> eyre::Result<VmSpec> {
         .wrap_err_with(|| format!("read vm spec at {}", runtime.config().display()))?;
     serde_json::from_str(&raw)
         .map_err(|err| eyre::eyre!("parse vm spec at {}: {}", runtime.config().display(), err))
-}
-
-fn load_metadata_config(path: Option<&Path>) -> eyre::Result<Option<Struct>> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-
-    let raw = std::fs::read_to_string(path)
-        .wrap_err_with(|| format!("read metadata config at {}", path.display()))?;
-    let value = serde_json::from_str(&raw)
-        .map_err(|err| eyre::eyre!("parse metadata config at {}: {err}", path.display()))?;
-    serde_json_to_protobuf_struct(value)
-        .map(Some)
-        .map_err(|err| eyre::eyre!("validate metadata config at {}: {err}", path.display()))
 }
 
 fn parse_network_args(values: &[String]) -> eyre::Result<RuntimeNetwork> {

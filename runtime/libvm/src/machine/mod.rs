@@ -1,5 +1,6 @@
 mod builder;
 mod config;
+mod guest;
 mod handle;
 mod inspect;
 mod lifecycle;
@@ -15,6 +16,7 @@ mod streams;
 mod update;
 
 pub use builder::MachineBuilder;
+pub use guest::{GuestBuilder, MachineAgent, MachineGuestConfig};
 pub use handle::Machine;
 pub use inspect::{
     MachineBootMode, MachineBootReport, MachineData, MachineProvisionFailurePolicy,

@@ -22,8 +22,6 @@ pub struct RuntimeOpenOptions {
     pub data_root: Option<String>,
     pub run_root: Option<String>,
     pub image_root: Option<String>,
-    pub default_kernel: Option<String>,
-    pub default_initramfs: Option<String>,
     pub vmmon_path: Option<String>,
 }
 
@@ -168,6 +166,8 @@ pub struct NativeMachineData {
     pub labels: Vec<NativeKeyValue>,
     pub metadata: Vec<NativeKeyValue>,
     pub network: NativeNetworkData,
+    pub agent_mode: String,
+    pub agent_path: Option<String>,
     pub status: NativeMachineStatus,
     pub started_at: Option<i64>,
     pub last_error: Option<String>,
@@ -177,6 +177,7 @@ pub struct NativeMachineData {
 #[napi(object)]
 pub struct NativeMachineStatus {
     pub kind: String,
+    pub ready: Option<bool>,
     pub guest_ready: Option<bool>,
     pub message: Option<String>,
 }
@@ -292,12 +293,6 @@ pub async fn open_runtime(options: Option<RuntimeOpenOptions>) -> Result<NativeR
         }
         if let Some(image_root) = options.image_root {
             config = config.with_image_root(image_root);
-        }
-        if let Some(default_kernel) = options.default_kernel {
-            config = config.with_default_kernel(default_kernel);
-        }
-        if let Some(default_initramfs) = options.default_initramfs {
-            config = config.with_default_initramfs(default_initramfs);
         }
         if let Some(vmmon_path) = options.vmmon_path {
             config = config.with_vmmon_path(vmmon_path);
@@ -417,6 +412,11 @@ impl NativeMachineBuilder {
     #[napi]
     pub fn initramfs(&self, path: String) -> Result<()> {
         self.update(|builder| builder.initramfs(path))
+    }
+
+    #[napi]
+    pub fn agent(&self, path: Option<String>) -> Result<()> {
+        self.update(|builder| builder.guest(|guest| guest.agent(path.map(PathBuf::from))))
     }
 
     #[napi(js_name = "rootDiskSize")]
@@ -1336,6 +1336,14 @@ fn key_values_from_map(values: BTreeMap<String, String>) -> Vec<NativeKeyValue> 
 }
 
 fn machine_data_to_native(data: MachineData) -> NativeMachineData {
+    let (agent_mode, agent_path) = match data.guest.agent {
+        libvm::MachineAgent::Default => ("default".to_string(), None),
+        libvm::MachineAgent::Custom { path } => {
+            ("custom".to_string(), Some(path.display().to_string()))
+        }
+        libvm::MachineAgent::Disabled => ("disabled".to_string(), None),
+        _ => ("unknown".to_string(), None),
+    };
     NativeMachineData {
         id: data.id,
         name: data.name,
@@ -1347,6 +1355,8 @@ fn machine_data_to_native(data: MachineData) -> NativeMachineData {
         labels: key_values_from_map(data.labels),
         metadata: key_values_from_map(data.metadata),
         network: network_to_native(data.network),
+        agent_mode,
+        agent_path,
         status: machine_status_to_native(data.status),
         started_at: data.started_at,
         last_error: data.last_error,
@@ -1358,34 +1368,41 @@ fn machine_status_to_native(status: MachineStatus) -> NativeMachineStatus {
     match status {
         MachineStatus::Stopped => NativeMachineStatus {
             kind: "stopped".to_string(),
+            ready: None,
             guest_ready: None,
             message: None,
         },
         MachineStatus::Starting { message } => NativeMachineStatus {
             kind: "starting".to_string(),
+            ready: None,
             guest_ready: None,
             message,
         },
         MachineStatus::Running {
+            ready,
             guest_ready,
             message,
         } => NativeMachineStatus {
             kind: "running".to_string(),
+            ready: Some(ready),
             guest_ready: Some(guest_ready),
             message,
         },
         MachineStatus::Stopping { message } => NativeMachineStatus {
             kind: "stopping".to_string(),
+            ready: None,
             guest_ready: None,
             message,
         },
         MachineStatus::Error { message } => NativeMachineStatus {
             kind: "error".to_string(),
+            ready: None,
             guest_ready: None,
             message,
         },
         _ => NativeMachineStatus {
             kind: "unknown".to_string(),
+            ready: None,
             guest_ready: None,
             message: None,
         },

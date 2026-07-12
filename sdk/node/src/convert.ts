@@ -45,8 +45,6 @@ export function runtimeOptionsToNative(options?: RuntimeOpenOptions): NativeRunt
     dataRoot: optionalNonEmptyString(record.dataRoot, "options.dataRoot"),
     runRoot: optionalNonEmptyString(record.runRoot, "options.runRoot"),
     imageRoot: optionalNonEmptyString(record.imageRoot, "options.imageRoot"),
-    defaultKernel: optionalNonEmptyString(record.defaultKernel, "options.defaultKernel"),
-    defaultInitramfs: optionalNonEmptyString(record.defaultInitramfs, "options.defaultInitramfs"),
     vmmonPath: optionalNonEmptyString(record.vmmonPath, "options.vmmonPath"),
   };
 }
@@ -119,8 +117,13 @@ export function machineDataFromNative(data: NativeMachineData): MachineData {
     labels: keyValuesToMap(data.labels),
     metadata: keyValuesToMap(data.metadata),
     network: networkFromNative(data.network),
+    agent: {
+      mode: data.agentMode,
+      path: data.agentPath ?? undefined,
+    },
     status: {
       kind: data.status.kind,
+      ready: data.status.ready ?? undefined,
       guestReady: data.status.guestReady ?? undefined,
       message: data.status.message ?? undefined,
     },

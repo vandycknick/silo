@@ -75,6 +75,7 @@ mod tests {
             labels: BTreeMap::new(),
             metadata: BTreeMap::new(),
             network: MachineNetworkConfig::default(),
+            guest: crate::machine::MachineGuestConfig::default(),
         }
     }
 

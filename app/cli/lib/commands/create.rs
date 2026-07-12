@@ -51,6 +51,12 @@ pub struct Cmd {
     /// Make the created VM the default for commands that omit VM.
     #[arg(long)]
     pub default: bool,
+    /// Path to a custom managed guest agent.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_agent")]
+    pub agent: Option<PathBuf>,
+    /// Disable managed guest-agent injection and readiness.
+    #[arg(long, conflicts_with = "agent")]
+    pub no_agent: bool,
     #[command(flatten)]
     pub(crate) overrides: VmOverrideArgs,
 }
@@ -230,6 +236,11 @@ impl Cmd {
                 rosetta: self.overrides.rosetta,
                 kernel: self.overrides.kernel.clone(),
                 initramfs: self.overrides.initramfs.clone(),
+                agent: if self.no_agent {
+                    Some(None)
+                } else {
+                    self.agent.clone().map(Some)
+                },
                 disks: self.overrides.disks.clone(),
             },
         })
@@ -253,6 +264,7 @@ pub(crate) fn apply_resolved_machine_options(
         rosetta,
         kernel,
         initramfs,
+        agent,
         disks,
     } = options;
 
@@ -276,6 +288,9 @@ pub(crate) fn apply_resolved_machine_options(
     }
     if let Some(initramfs) = initramfs {
         builder = builder.initramfs(initramfs);
+    }
+    if let Some(agent) = agent {
+        builder = builder.guest(|guest| guest.agent(agent));
     }
     if let Some(bytes) = disk_size_bytes {
         builder = builder.root_disk_size(bytes);
@@ -305,6 +320,7 @@ pub(crate) struct ResolvedMachineOptions {
     pub(crate) rosetta: bool,
     pub(crate) kernel: Option<PathBuf>,
     pub(crate) initramfs: Option<PathBuf>,
+    pub(crate) agent: Option<Option<PathBuf>>,
     pub(crate) disks: Vec<PathBuf>,
 }
 
@@ -367,6 +383,8 @@ mod tests {
             "./vmlinuz",
             "--initrd",
             "./initrd.img",
+            "--agent",
+            "./silo-agent",
             "--disk-size",
             "40gb",
             "--nested-virtualization",
@@ -406,11 +424,20 @@ mod tests {
             create.overrides.initramfs.as_deref(),
             Some("./initrd.img".as_ref())
         );
+        assert_eq!(create.agent.as_deref(), Some("./silo-agent".as_ref()));
         assert_eq!(create.overrides.disks.len(), 1);
         assert_eq!(create.overrides.mounts.len(), 1);
         assert_eq!(
             create.overrides.labels,
             vec![("env".to_string(), "dev".to_string())]
+        );
+    }
+
+    #[test]
+    fn create_command_rejects_custom_and_disabled_agent_together() {
+        assert!(
+            Cli::try_parse_from(["silo", "create", "dev", "--agent", "./agent", "--no-agent"])
+                .is_err()
         );
     }
 

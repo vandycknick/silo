@@ -1,5 +1,6 @@
 use clap::Args;
 use libvm::{MachineUpdate, Memory};
+use std::path::PathBuf;
 use utils::HumanSize;
 
 use crate::commands::profile::parse_machine_network_config;
@@ -21,6 +22,10 @@ const SETTINGS: &[(&str, &str)] = &[
         "Enable or disable nested virtualization",
     ),
     ("rosetta=true|false", "Enable or disable Rosetta"),
+    (
+        "agent=default|disabled|PATH",
+        "Set managed guest agent selection",
+    ),
 ];
 
 const EXAMPLES: &[&str] = &[
@@ -132,6 +137,13 @@ impl ParsedSet {
                     update = update.nested_virtualization(parse_bool(value)?);
                 }
                 "rosetta" => update = update.rosetta(parse_bool(value)?),
+                "agent" => {
+                    update = match value {
+                        "default" => update.guest(|guest| guest),
+                        "disabled" => update.guest(|guest| guest.agent(None)),
+                        path => update.guest(|guest| guest.agent(Some(PathBuf::from(path)))),
+                    };
+                }
                 other => eyre::bail!("unsupported setting {other:?}"),
             }
         }
@@ -149,8 +161,9 @@ fn normalize_key(key: &str) -> eyre::Result<&'static str> {
         "network" | "net" => Ok("network"),
         "nested-virtualization" | "nested_virtualization" => Ok("nested-virtualization"),
         "rosetta" => Ok("rosetta"),
+        "agent" => Ok("agent"),
         _ => Err(eyre::eyre!(
-            "unknown setting {key:?}; allowed settings are name, cpus, memory, disk, network, nested-virtualization, rosetta"
+            "unknown setting {key:?}; allowed settings are name, cpus, memory, disk, network, nested-virtualization, rosetta, agent"
         )),
     }
 }

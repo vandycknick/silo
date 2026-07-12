@@ -24,6 +24,7 @@ mod error;
 mod guest_agent;
 pub mod host;
 mod image;
+mod initramfs_overlay;
 mod lock_manager;
 mod machine;
 mod network;
@@ -42,13 +43,14 @@ pub use crate::image::{
 };
 pub use crate::machine::{
     resolve_mount_location, AttachOptions, AttachOptionsBuilder, ExecControl, ExecEvent,
-    ExecHandle, ExecOptions, ExecOptionsBuilder, ExecOutput, ExecSink, ExitStatus, Machine,
-    MachineBootMode, MachineBootReport, MachineBuilder, MachineData, MachineExit,
-    MachineExitCommand, MachineExitOutcome, MachineKillOptions, MachineProvisionFailurePolicy,
-    MachineProvisionReport, MachineProvisionStatus, MachineProvisionStepReport,
-    MachineProvisionStepStatus, MachineRef, MachineStartOptions, MachineStatus, MachineStopOptions,
-    MachineUpdate, MachineWaitOptions, Memory, NetworkLaunch, NetworkLaunchSecret,
-    NetworkPolicyUpdate, OAuthRefreshHook, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
+    ExecHandle, ExecOptions, ExecOptionsBuilder, ExecOutput, ExecSink, ExitStatus, GuestBuilder,
+    Machine, MachineAgent, MachineBootMode, MachineBootReport, MachineBuilder, MachineData,
+    MachineExit, MachineExitCommand, MachineExitOutcome, MachineGuestConfig, MachineKillOptions,
+    MachineProvisionFailurePolicy, MachineProvisionReport, MachineProvisionStatus,
+    MachineProvisionStepReport, MachineProvisionStepStatus, MachineRef, MachineStartOptions,
+    MachineStatus, MachineStopOptions, MachineUpdate, MachineWaitOptions, Memory, NetworkLaunch,
+    NetworkLaunchSecret, NetworkPolicyUpdate, OAuthRefreshHook, StdinMode,
+    DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
     MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition, NetworkDriver,

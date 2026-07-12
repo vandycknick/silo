@@ -58,7 +58,6 @@ impl Machine {
             let socket_path = machine_paths.vmmon_socket_path();
             let trace_path = machine_paths.vmmon_trace_log_path();
             let serial_log_path = machine_paths.serial_log_path();
-            let metadata_config_path = machine_paths.metadata_config_path();
 
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             runtime
@@ -79,7 +78,7 @@ impl Machine {
             let resolved_network = runtime
                 .prepare_machine_network(&config, &options.network)
                 .await?;
-            runtime.prepare_vmmon_launch_inputs(&config, &resolved_network)?;
+            let agent_enabled = runtime.prepare_vmmon_launch_inputs(&config, &resolved_network)?;
 
             runtime.request_machine_start(config.id, &run_id).await?;
 
@@ -94,10 +93,13 @@ impl Machine {
                 serial_log: &serial_log_path,
                 trace_log: &trace_path,
                 network: &resolved_network,
-                metadata_config: &metadata_config_path,
                 run_id: &run_id,
                 exit_command: options.exit_command.as_ref(),
-                wait_for_registration: crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT,
+                wait_for_registration: if agent_enabled {
+                    crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT
+                } else {
+                    Duration::ZERO
+                },
             };
             if let Err(err) = vmmon.spawn(&launch).await {
                 runtime

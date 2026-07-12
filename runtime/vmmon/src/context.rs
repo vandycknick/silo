@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use protocol::prost_types::Struct;
 use tokio_util::sync::CancellationToken;
 use virt::{SerialConsole, VirtualMachine};
 use vm_spec::VmSpec;
@@ -46,7 +45,6 @@ impl RuntimeContext {
 #[derive(Clone)]
 pub struct DaemonContext {
     pub(crate) spec: VmSpec,
-    pub(crate) metadata_config: Option<Struct>,
     pub(crate) guest_services_enabled: bool,
     pub(crate) wait_for_registration: std::time::Duration,
     pub(crate) machine: VirtualMachine,

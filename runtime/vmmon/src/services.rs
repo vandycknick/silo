@@ -17,7 +17,6 @@ use virt::{spawn_serial_tunnel, SerialAccess};
 
 use crate::context::{DaemonContext, RuntimeContext};
 use crate::endpoints::start_endpoint_supervisor;
-use crate::ext::VmSpecExt;
 use crate::guest::spawn_guest_services;
 use crate::net::server::{NegotiateServer, NegotiationRejection};
 use crate::net::tunnel::spawn_tunnel;
@@ -126,25 +125,18 @@ pub async fn start_services(
     });
 
     let guest_monitor = if ctx.guest_services_enabled {
-        if ctx.wait_for_registration.is_zero() {
-            ctx.store.dispatch(Action::guest_running())?;
-        } else {
-            ctx.store.dispatch(Action::guest_starting())?;
-        }
+        ctx.store.dispatch(Action::guest_starting())?;
 
         Some(
             spawn_guest_services(
                 &ctx.machine,
                 ctx.store.clone(),
-                ctx.metadata_config.clone().unwrap_or_default(),
-                ctx.spec.rosetta_or_default(),
                 ctx.wait_for_registration,
                 ctx.shutdown.clone(),
             )
             .await?,
         )
     } else {
-        ctx.store.dispatch(Action::guest_running())?;
         None
     };
 
@@ -243,7 +235,7 @@ mod tests {
 
     #[test]
     fn shell_upgrade_is_rejected_until_guest_is_ready() {
-        let store = new_instance_store();
+        let store = new_instance_store(true);
 
         let rejection = upgrade_rejection(&Upgrade::Shell, &store).expect("shell rejection");
 
@@ -253,9 +245,19 @@ mod tests {
 
     #[test]
     fn shell_upgrade_is_allowed_after_guest_is_ready() {
-        let store = new_instance_store();
+        let store = new_instance_store(true);
         store.dispatch(Action::guest_running()).unwrap();
 
         assert!(upgrade_rejection(&Upgrade::Shell, &store).is_none());
+    }
+
+    #[test]
+    fn shell_upgrade_is_rejected_when_agent_is_disabled() {
+        let store = new_instance_store(false);
+        store.dispatch(Action::vm_running()).unwrap();
+
+        let rejection = upgrade_rejection(&Upgrade::Shell, &store).expect("shell rejection");
+
+        assert_eq!(rejection.code, RejectCode::ServiceStarting);
     }
 }

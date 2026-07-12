@@ -1,4 +1,4 @@
-use crate::machine::Memory;
+use crate::machine::{GuestBuilder, MachineGuestConfig, Memory};
 use crate::network::{MachineNetworkBuilder, MachineNetworkConfig};
 
 use silo_policy::NetworkPolicy;
@@ -44,6 +44,8 @@ pub struct MachineUpdate {
     pub(crate) network_error: Option<String>,
     /// Policy-only update for the current durable network config.
     pub network_policy: Option<NetworkPolicyUpdate>,
+    /// Replacement durable guest settings.
+    pub guest: Option<MachineGuestConfig>,
 }
 
 impl MachineUpdate {
@@ -88,6 +90,12 @@ impl MachineUpdate {
         self
     }
 
+    /// Replaces durable guest settings.
+    pub fn guest(mut self, configure: impl FnOnce(GuestBuilder) -> GuestBuilder) -> Self {
+        self.guest = Some(configure(GuestBuilder::new()).build());
+        self
+    }
+
     /// Configures the durable machine network attachment.
     pub fn network(
         mut self,
@@ -123,5 +131,6 @@ impl MachineUpdate {
             && self.network.is_none()
             && self.network_error.is_none()
             && self.network_policy.is_none()
+            && self.guest.is_none()
     }
 }

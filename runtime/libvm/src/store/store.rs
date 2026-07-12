@@ -93,6 +93,7 @@ mod tests {
             labels: BTreeMap::new(),
             metadata: BTreeMap::new(),
             network: MachineNetworkConfig::default(),
+            guest: crate::machine::MachineGuestConfig::default(),
         }
     }
 
@@ -379,6 +380,7 @@ mod tests {
             labels,
             metadata,
             network: MachineNetworkConfig::default(),
+            guest: crate::machine::MachineGuestConfig::default(),
         };
 
         seed_machine(&db, &machine).await;

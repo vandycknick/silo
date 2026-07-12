@@ -7,7 +7,9 @@ use vm_spec::{Boot, Disk, Guest, GuestOs, Hardware, Kernel, Mount, Storage, VmSp
 use crate::image::{ImageBuilder, ImageSource, MaterializedImage};
 use crate::lock_manager::ManagedLock;
 use crate::machine::root_disk::{clone_or_copy_root_disk, resize_raw_disk};
-use crate::machine::{generate_machine_name, validate_machine_name, Machine, Memory};
+use crate::machine::{
+    generate_machine_name, validate_machine_name, GuestBuilder, Machine, MachineGuestConfig, Memory,
+};
 use crate::network::{MachineNetworkBuilder, MachineNetworkConfig};
 use crate::paths::{root_disk_relative_path, MachinePaths};
 use crate::runtime::core::{stopped_machine_state, write_machine_config};
@@ -42,6 +44,7 @@ struct MachineCreateRequest {
     mounts: Vec<Mount>,
     network: Option<MachineNetworkConfig>,
     network_error: Option<String>,
+    guest: MachineGuestConfig,
 }
 
 struct MachineCreatePlan {
@@ -50,6 +53,7 @@ struct MachineCreatePlan {
     labels: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
     network: ModelMachineNetworkConfig,
+    guest: MachineGuestConfig,
 }
 
 struct MachineCreateGuard {
@@ -61,6 +65,7 @@ struct MachineCreateGuard {
     labels: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
     network: ModelMachineNetworkConfig,
+    guest: MachineGuestConfig,
     dir_created: bool,
     committed: bool,
 }
@@ -121,6 +126,7 @@ impl MachineBuilder {
                 mounts: Vec::new(),
                 network: None,
                 network_error: None,
+                guest: MachineGuestConfig::default(),
             },
         }
     }
@@ -197,6 +203,12 @@ impl MachineBuilder {
     /// Sets an initramfs path override.
     pub fn initramfs(mut self, initramfs: impl Into<PathBuf>) -> Self {
         self.request.initramfs = Some(initramfs.into());
+        self
+    }
+
+    /// Configures durable guest behavior outside the VMM specification.
+    pub fn guest(mut self, configure: impl FnOnce(GuestBuilder) -> GuestBuilder) -> Self {
+        self.request.guest = configure(GuestBuilder::new()).build();
         self
     }
 
@@ -286,7 +298,7 @@ async fn create_machine_config_with_generated_name(
 
 async fn create_machine_config_with_name(
     runtime: &Runtime,
-    request: MachineCreateRequest,
+    mut request: MachineCreateRequest,
     name: String,
 ) -> Result<MachineConfig, LibVmError> {
     if matches!(request.disk_size_bytes, Some(0)) {
@@ -305,8 +317,13 @@ async fn create_machine_config_with_name(
         return Err(LibVmError::InvalidCreateRequest { name, reason });
     }
 
-    let boot_assets =
-        runtime.resolve_boot_assets(request.kernel.as_deref(), request.initramfs.as_deref())?;
+    let (kernel, initramfs) = crate::runtime::boot_assets::canonicalize_boot_overrides(
+        crate::runtime::boot_assets::BootAssetOverrides {
+            kernel: request.kernel.as_deref(),
+            initramfs: request.initramfs.as_deref(),
+        },
+    )?;
+    request.guest = crate::runtime::boot_assets::canonicalize_guest_config(request.guest)?;
     if let Some(userdata) = request.userdata.as_deref() {
         if userdata.trim().is_empty() {
             return Err(LibVmError::InvalidCreateRequest {
@@ -342,9 +359,9 @@ async fn create_machine_config_with_name(
         }),
         boot: Some(Boot {
             kernel: Some(Kernel {
-                path: Some(boot_assets.kernel),
+                path: kernel,
                 cmdline: vec![ROOT_DISK_KERNEL_ARG.to_string()],
-                initramfs: Some(boot_assets.initramfs),
+                initramfs,
             }),
             userdata,
         }),
@@ -369,6 +386,7 @@ async fn create_machine_config_with_name(
             labels: request.labels,
             metadata: request.metadata,
             network,
+            guest: request.guest,
         },
     )
     .await?;
@@ -409,6 +427,7 @@ async fn create_machine_guard(
         labels,
         metadata,
         network,
+        guest,
     } = plan;
 
     validate_machine_name(&name)?;
@@ -433,6 +452,7 @@ async fn create_machine_guard(
         labels,
         metadata,
         network,
+        guest,
         dir_created: false,
         committed: false,
     };
@@ -553,6 +573,7 @@ impl MachineCreateGuard {
             labels: self.labels.clone(),
             metadata: self.metadata.clone(),
             network: self.network.clone(),
+            guest: self.guest.clone(),
         }
     }
 }
@@ -589,7 +610,6 @@ mod tests {
         MachineCreatePlan, MachineCreateRequest, ROOT_DISK_KERNEL_ARG,
     };
     use crate::paths::{root_disk_relative_path, LocalPaths};
-    use crate::runtime::boot_assets::RuntimeBootDefaults;
     use crate::runtime::Runtime;
     use crate::store::models::{MachineId, MachineNetworkConfig, MachineRootfsRecord};
     use crate::store::MockDataStore;
@@ -643,7 +663,6 @@ mod tests {
             paths,
             Arc::new(store),
             RuntimeNetworkingConfig::default(),
-            RuntimeBootDefaults::default(),
             None,
         )
         .await
@@ -662,6 +681,7 @@ mod tests {
                 labels: std::collections::BTreeMap::new(),
                 metadata: std::collections::BTreeMap::new(),
                 network: crate::store::models::MachineNetworkConfig::default(),
+                guest: crate::machine::MachineGuestConfig::default(),
             },
         )
         .await
@@ -695,6 +715,7 @@ mod tests {
             mounts: Vec::new(),
             network: None,
             network_error: None,
+            guest: crate::machine::MachineGuestConfig::default(),
         }
     }
 
@@ -746,7 +767,10 @@ mod tests {
         let runtime = runtime_with_mock_store(paths, store).await;
         let base_rootfs_path = write_base_rootfs(temp.path());
 
-        let machine = create_machine_config(&runtime, create_request(base_rootfs_path, "devbox"))
+        let mut request = create_request(base_rootfs_path, "devbox");
+        request.kernel = None;
+        request.initramfs = None;
+        let machine = create_machine_config(&runtime, request)
             .await
             .expect("machine should be created");
 
@@ -759,6 +783,8 @@ mod tests {
             spec_kernel(&machine.spec).cmdline,
             vec![ROOT_DISK_KERNEL_ARG.to_string()]
         );
+        assert!(spec_kernel(&machine.spec).path.is_none());
+        assert!(spec_kernel(&machine.spec).initramfs.is_none());
         assert_eq!(machine.root_disk_size, Some(4));
     }
 
@@ -815,6 +841,7 @@ mod tests {
                             labels: std::collections::BTreeMap::new(),
                             metadata: std::collections::BTreeMap::new(),
                             network: MachineNetworkConfig::default(),
+                            guest: crate::machine::MachineGuestConfig::default(),
                         }));
                     }
                 }

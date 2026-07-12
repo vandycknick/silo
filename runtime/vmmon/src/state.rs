@@ -100,6 +100,7 @@ where
 pub(crate) struct InstanceState {
     vm: LifecycleState,
     guest: LifecycleState,
+    agent_required: bool,
     guest_message: String,
     boot_report: Option<GuestBootReport>,
     provision_report: Option<ProvisionReport>,
@@ -189,9 +190,12 @@ impl Action {
 
 pub(crate) type InstanceStore = Store<InstanceState, Action, StatusUpdate>;
 
-pub(crate) fn new_instance_store() -> InstanceStore {
+pub(crate) fn new_instance_store(agent_required: bool) -> InstanceStore {
     Store::new(
-        InstanceState::default(),
+        InstanceState {
+            agent_required,
+            ..InstanceState::default()
+        },
         reduce_instance_state,
         project_status_update,
         256,
@@ -199,7 +203,7 @@ pub(crate) fn new_instance_store() -> InstanceStore {
 }
 
 pub(crate) fn select_current_ping(state: &InstanceState) -> PingResponse {
-    let ok = state.vm == LifecycleState::Running && state.guest == LifecycleState::Running;
+    let ok = instance_ready(state);
     PingResponse {
         ok,
         message: status_summary(state),
@@ -210,7 +214,7 @@ pub(crate) fn select_current_inspect(state: &InstanceState) -> InspectResponse {
     InspectResponse {
         vm_state: state.vm as i32,
         guest_state: state.guest as i32,
-        ready: state.vm == LifecycleState::Running && state.guest == LifecycleState::Running,
+        ready: instance_ready(state),
         summary: status_summary(state),
         boot_report: state.boot_report.clone(),
         provision_report: state.provision_report.clone(),
@@ -284,11 +288,20 @@ fn status_summary(state: &InstanceState) -> String {
         return format!("vm not ready (vm_state={:?})", state.vm);
     }
 
+    if !state.agent_required {
+        return String::from("instance ready (guest agent not required)");
+    }
+
     if state.guest == LifecycleState::Running {
         return String::from("instance ready");
     }
 
     state.guest_message.clone()
+}
+
+fn instance_ready(state: &InstanceState) -> bool {
+    state.vm == LifecycleState::Running
+        && (!state.agent_required || state.guest == LifecycleState::Running)
 }
 
 #[cfg(test)]
@@ -304,7 +317,7 @@ mod tests {
 
     #[test]
     fn dispatch_updates_state_before_publishing() {
-        let store = new_instance_store();
+        let store = new_instance_store(true);
         let mut rx = store.subscribe();
 
         store.dispatch(Action::guest_running()).unwrap();
@@ -316,7 +329,7 @@ mod tests {
 
     #[test]
     fn poisoned_store_does_not_publish_events() {
-        let store = Arc::new(new_instance_store());
+        let store = Arc::new(new_instance_store(true));
         let poisoned_store = store.clone();
         let mut rx = store.subscribe();
 
@@ -336,7 +349,7 @@ mod tests {
 
     #[test]
     fn inspect_includes_latest_guest_reports() {
-        let store = new_instance_store();
+        let store = new_instance_store(true);
         let boot_report = GuestBootReport {
             mode: GuestBootMode::AgentPid1 as i32,
             requested_init: String::from("auto"),
@@ -361,13 +374,14 @@ mod tests {
         let inspect = select_current_inspect(&snapshot);
 
         assert!(inspect.ready);
+        assert!(crate::state::select_current_ping(&snapshot).ok);
         assert_eq!(inspect.boot_report, Some(boot_report));
         assert_eq!(inspect.provision_report, Some(provision_report));
     }
 
     #[test]
     fn failed_boot_report_sets_guest_error_without_ready() {
-        let store = new_instance_store();
+        let store = new_instance_store(true);
         let boot_report = GuestBootReport::default();
         let provision_report = ProvisionReport {
             status: ProvisionOverallStatus::FailedBoot as i32,
@@ -395,5 +409,23 @@ mod tests {
         assert_eq!(inspect.summary, "fatal provisioner failed");
         assert_eq!(inspect.boot_report, Some(boot_report));
         assert_eq!(inspect.provision_report, Some(provision_report));
+    }
+
+    #[test]
+    fn disabled_agent_is_ready_without_guest_registration() {
+        let store = new_instance_store(false);
+        store.dispatch(Action::vm_running()).unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        let inspect = select_current_inspect(&snapshot);
+
+        assert!(inspect.ready);
+        assert!(crate::state::select_current_ping(&snapshot).ok);
+        assert_eq!(
+            LifecycleState::try_from(inspect.guest_state),
+            Ok(LifecycleState::Unspecified)
+        );
+        assert!(!crate::state::guest_shell_ready(&snapshot));
+        assert_eq!(inspect.summary, "instance ready (guest agent not required)");
     }
 }

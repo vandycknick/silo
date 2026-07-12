@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use libvm::{
-    MachineBootReport, MachineData, MachineNetworkConfig, MachineProvisionReport, MachineStatus,
+    MachineAgent, MachineBootReport, MachineData, MachineNetworkConfig, MachineProvisionReport,
+    MachineStatus,
 };
 use serde::Serialize;
 use vm_spec::VmSpec;
@@ -52,6 +53,8 @@ pub struct MachineGuestView {
 pub struct MachineGuestSettingsView {
     pub bootstrap: bool,
     pub initramfs_present: bool,
+    pub agent: String,
+    pub agent_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,7 +99,7 @@ impl MachineView {
             guest: MachineGuestView {
                 status: data.status.label().to_string(),
                 ready: data.status.guest_ready(),
-                settings: guest_settings(&data.spec, &data.machine_dir),
+                settings: guest_settings(data),
                 boot: data
                     .boot_report
                     .as_ref()
@@ -145,14 +148,23 @@ pub fn state_label(state: &MachineStatus) -> &'static str {
     state.label()
 }
 
-fn guest_settings(spec: &VmSpec, machine_dir: &Path) -> MachineGuestSettingsView {
+fn guest_settings(data: &MachineData) -> MachineGuestSettingsView {
+    let (agent, agent_path) = match &data.guest.agent {
+        MachineAgent::Default => ("default", None),
+        MachineAgent::Custom { path } => ("custom", Some(path.clone())),
+        MachineAgent::Disabled => ("disabled", None),
+        _ => ("unknown", None),
+    };
     MachineGuestSettingsView {
-        bootstrap: spec
+        bootstrap: data
+            .spec
             .boot
             .as_ref()
             .and_then(|boot| boot.userdata.as_deref())
             .is_some(),
-        initramfs_present: initramfs_path_exists(spec, machine_dir),
+        initramfs_present: initramfs_path_exists(&data.spec, &data.machine_dir),
+        agent: agent.to_string(),
+        agent_path,
     }
 }
 

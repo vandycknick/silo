@@ -4,10 +4,7 @@ use std::sync::Arc;
 use eyre::Context;
 use hyper_util::rt::TokioIo;
 use protocol::v1::guest_control_service_client::GuestControlServiceClient;
-use protocol::v1::metadata_service_client::MetadataServiceClient;
-use protocol::v1::{
-    GetMetadataRequest, GetMetadataResponse, GuestBootReport, ProvisionReport, RegisterGuestRequest,
-};
+use protocol::v1::{GuestBootReport, ProvisionReport, RegisterGuestRequest};
 use tokio::sync::Mutex;
 use tokio_vsock::{VsockAddr, VsockStream, VMADDR_CID_HOST};
 use tonic::transport::{Channel, Endpoint};
@@ -17,15 +14,13 @@ use crate::host::info::get_system_info;
 
 pub(crate) struct GuestControlClient {
     control: GuestControlServiceClient<Channel>,
-    metadata: MetadataServiceClient<Channel>,
 }
 
 impl GuestControlClient {
     pub(crate) async fn connect(port: u32) -> eyre::Result<Self> {
         let channel = connect_guest_services_channel(port).await?;
         Ok(Self {
-            control: GuestControlServiceClient::new(channel.clone()),
-            metadata: MetadataServiceClient::new(channel),
+            control: GuestControlServiceClient::new(channel),
         })
     }
 
@@ -52,14 +47,6 @@ impl GuestControlClient {
         }
 
         Ok(())
-    }
-
-    pub(crate) async fn get_metadata(&mut self) -> eyre::Result<GetMetadataResponse> {
-        self.metadata
-            .get_metadata(GetMetadataRequest {})
-            .await
-            .map(|response| response.into_inner())
-            .context("fetch guest metadata")
     }
 }
 

@@ -1,7 +1,7 @@
 export { SiloError } from "./errors.js";
 export { ExecHandle, ExecOutput, ExecSink, type ExecEvent } from "./exec.js";
 export { Images } from "./images.js";
-export { Machine, MachineBuilder } from "./machine.js";
+export { GuestBuilder, Machine, MachineBuilder } from "./machine.js";
 export {
   MachineNetworkBuilder,
   NetworkCredentialDefinitionBuilder,

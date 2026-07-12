@@ -6,8 +6,7 @@ export type KeyValueMap = Record<string, string>;
 /**
  * Options used when opening a {@link Runtime}.
  *
- * Pass `vmmonPath`, `defaultKernel`, or `defaultInitramfs` to use explicit files.
- * When omitted, paths are resolved from environment variables and standard install locations.
+ * Default VM assets are resolved from Silo's installed asset locations.
  */
 export interface RuntimeOpenOptions {
   /** Root directory for persistent state. */
@@ -16,10 +15,6 @@ export interface RuntimeOpenOptions {
   runRoot?: string;
   /** Image cache directory. */
   imageRoot?: string;
-  /** Default Linux kernel path used when a machine builder does not set `.kernel(...)`. */
-  defaultKernel?: string;
-  /** Default initramfs path used when a machine builder does not set `.initramfs(...)`. */
-  defaultInitramfs?: string;
   /** Explicit `vmmon` executable path. If unset, `vmmon` is resolved from the environment and `PATH`. */
   vmmonPath?: string;
 }
@@ -121,7 +116,9 @@ export interface ExitStatus {
 /** Current machine lifecycle status. */
 export interface MachineStatus {
   kind: "stopped" | "starting" | "running" | "stopping" | "error" | "unknown";
-  /** True when the guest is ready. Present for running machines. */
+  /** True when the machine satisfies its configured readiness policy. */
+  ready?: boolean;
+  /** True when the managed guest agent has registered. Present for running machines. */
   guestReady?: boolean;
   /** Human-readable status detail when available. */
   message?: string;
@@ -139,6 +136,7 @@ export interface MachineData {
   labels: KeyValueMap;
   metadata: KeyValueMap;
   network: Network;
+  agent: { mode: "default" | "custom" | "disabled" | "unknown"; path?: string };
   status: MachineStatus;
   startedAt?: Date;
   lastError?: string;

@@ -3,14 +3,8 @@ syntax = "proto3";
 package silo.v1;
 
 import "common.proto";
-import "google/protobuf/struct.proto";
-
 service GuestControlService {
   rpc Register(RegisterGuestRequest) returns (RegisterGuestResponse);
-}
-
-service MetadataService {
-  rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
 }
 
 message RegisterGuestRequest {
@@ -23,12 +17,4 @@ message RegisterGuestRequest {
 message RegisterGuestResponse {
   bool accepted = 1;
   string message = 2;
-}
-
-message GetMetadataRequest {}
-
-message GetMetadataResponse {
-  int64 timestamp_unix = 1;
-  bool rosetta_enabled = 2;
-  google.protobuf.Struct config = 3;
 }
