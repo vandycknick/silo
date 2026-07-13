@@ -81,6 +81,8 @@ Notes:
 - `provision` controls optional guest provisioning work such as static networking, hostname, and root filesystem resizing.
 - `provision.network` is omitted for a machine without a network attachment. In that case the agent does not modify links, routes, or `/etc/resolv.conf`.
 - When configured, static networking is the first provisioner. It matches the interface by MAC and configures it through Linux rtnetlink without invoking DHCP, `ip`, or a network manager.
+- Ext4 root filesystems grow through the kernel's online resize ioctl. Guest images do not need `findmnt`, `resize2fs`, or e2fsprogs.
+- A configured root filesystem resize is required launch state. Discovery or resize failures fail managed boot instead of exposing less capacity than requested.
 - The agent does not read its control RPC port from this file. That comes from the kernel arg owned by the host side.
 
 ## SSH

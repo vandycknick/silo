@@ -59,7 +59,14 @@ pub fn run_provisioning(
     let mut run = ProvisionRun::default();
     run.run(&context, plan);
 
-    if run.is_success() {
+    if run.failed_boot {
+        tracing::error!(
+            failures = run.failure_count(),
+            unsupported = run.unsupported_count(),
+            provisioners = %run.problem_step_list(),
+            "guest reconciliation aborted after fail-boot provisioner failure"
+        );
+    } else if run.is_success() {
         tracing::info!("guest reconciliation complete");
     } else {
         tracing::warn!(
@@ -397,10 +404,11 @@ impl ProvisionRun {
         err: eyre::Report,
     ) {
         let error_chain = format_error_chain(&err);
+        let message = failure_message(failure_policy);
         tracing::error!(
             provisioner = id.as_str(),
             error = %error_chain,
-            "provisioner failed; continuing"
+            "{message}"
         );
         self.push_step(StepRecord {
             id,
@@ -408,7 +416,7 @@ impl ProvisionRun {
             failure_policy,
             changed: false,
             started,
-            message: failure_message(failure_policy),
+            message,
             error_chain,
         });
         self.maybe_mark_failed_boot(failure_policy);
@@ -546,6 +554,7 @@ impl ProvisionContext {
         }
     }
 
+    /// Resolves a guest path against `/` in production and the fixture root in tests.
     pub(crate) fn guest_path(&self, path: &str) -> PathBuf {
         let path = path.strip_prefix('/').unwrap_or(path);
         self.root.join(path)
@@ -896,6 +905,7 @@ mod tests {
             report.steps[0].failure_policy,
             ProvisionFailurePolicy::BestEffort as i32
         );
+        assert_eq!(report.steps[0].message, "provisioner failed; continuing");
         assert_eq!(report.steps[0].error_chain, "nope");
     }
 
@@ -931,6 +941,14 @@ mod tests {
         assert_eq!(
             report.steps[0].failure_policy,
             ProvisionFailurePolicy::FailBoot as i32
+        );
+        assert_eq!(
+            report.steps[0].message,
+            "provisioner failed; failing guest boot"
+        );
+        assert_eq!(
+            report.message,
+            "guest reconciliation aborted after fail-boot provisioner failure"
         );
     }
 
@@ -1124,5 +1142,20 @@ mod tests {
 
         assert_eq!(network.id(), ProvisionerId::NETWORK);
         assert_eq!(network.failure_policy(), FailurePolicy::FailBoot);
+    }
+
+    #[test]
+    fn root_filesystem_resize_failure_fails_boot() {
+        let config = agent_spec::ProvisionConfig::default();
+        let ssh_config = agent_spec::AgentSshConfig::default();
+
+        let plan = provisioners(&config, &ssh_config).expect("build provisioner plan");
+        let resize = plan
+            .provisioners
+            .iter()
+            .find(|provisioner| provisioner.id() == ProvisionerId::RESIZE_ROOTFS)
+            .expect("root filesystem resize provisioner");
+
+        assert_eq!(resize.failure_policy(), FailurePolicy::FailBoot);
     }
 }
