@@ -528,3 +528,28 @@ nohz_full=1-N rcu_nocbs=1-N
 - Silo's current arm64 kernel profile builds these features in instead of relying on loadable modules.
 - Some k3s startup logs still say `Failed to load kernel module ...` when a feature is built in. Treat those as actionable only when the matching kernel config is missing or userspace reports the extension is unsupported.
 - The generated kernel config under `target/kernels/<track>-<arch>-<version>/.config` can stay stale until `make kernel TRACK=<track> ARCH=<arch>` rebuilds the kernel.
+
+## 17) Early entropy for cryptographic services
+
+### Required config changes
+
+- `CONFIG_HW_RANDOM=y`
+- `CONFIG_HW_RANDOM_VIRTIO=y`
+
+### What this enables
+
+- The built-in virtio RNG driver consumes entropy from the
+  `VZVirtioEntropyDeviceConfiguration` attached to every VZ-backed VM.
+- The kernel initializes its cryptographic random number generator before
+  early userspace needs secure randomness.
+
+### Why this is needed
+
+- Raw images run `silo-agent` as PID 1 and start the native SSH service during
+  guest readiness. Generating its per-boot Ed25519 host key reads from
+  `/dev/urandom`, which blocks until the kernel CRNG is initialized.
+- Without the built-in virtio RNG driver, CRNG initialization depends on
+  incidental device activity and adds roughly four seconds to an otherwise
+  one-second boot.
+- Building both options into the kernel avoids depending on a module loader
+  before the agent starts.
