@@ -113,8 +113,12 @@ async fn prepare_netd_runtime(
     } else {
         None
     };
-    let (tls_ca_cert_path, tls_ca_key_path) =
-        resolve_certificate_authority_paths(paths, &config, &metadata.name)?;
+    let requires_certificate_authority = request
+        .policy()
+        .is_some_and(NetworkPolicy::has_https_interception);
+    let certificate_authority_paths = requires_certificate_authority
+        .then(|| resolve_certificate_authority_paths(paths, &config, &metadata.name))
+        .transpose()?;
     remove_file_if_exists(&socket_path)?;
     remove_file_if_exists(&pid_path)?;
 
@@ -135,8 +139,12 @@ async fn prepare_netd_runtime(
             machine_id: metadata.id,
             network_id: &network_id,
             policy_path: policy_path.as_deref(),
-            tls_ca_cert_path: Some(tls_ca_cert_path.as_path()),
-            tls_ca_key_path: Some(tls_ca_key_path.as_path()),
+            tls_ca_cert_path: certificate_authority_paths
+                .as_ref()
+                .map(|(certificate, _)| certificate.as_path()),
+            tls_ca_key_path: certificate_authority_paths
+                .as_ref()
+                .map(|(_, private_key)| private_key.as_path()),
             static_lease: &static_lease,
         },
     );
@@ -197,6 +205,7 @@ async fn prepare_netd_runtime(
         mac: mac.clone(),
         ipv4,
         dns,
+        requires_certificate_authority,
     };
     let driver_state = NetdDriverState {
         helper_pid: pid,
@@ -853,6 +862,8 @@ mod tests {
             .windows(2)
             .any(|window| { window == ["--static-lease", "192.168.105.2=02:00:00:00:00:02",] }));
         assert!(args.iter().all(|arg| arg != "--ssh-port"));
+        assert!(args.iter().all(|arg| arg != "--tls-ca-cert"));
+        assert!(args.iter().all(|arg| arg != "--tls-ca-key"));
     }
 
     #[test]

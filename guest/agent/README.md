@@ -81,6 +81,8 @@ Notes:
 - `provision` controls optional guest provisioning work such as static networking, hostname, and root filesystem resizing.
 - `provision.network` is omitted for a machine without a network attachment. In that case the agent does not modify links, routes, or `/etc/resolv.conf`.
 - When configured, static networking is the first provisioner. It matches the interface by MAC and configures it through Linux rtnetlink without invoking DHCP, `ip`, or a network manager.
+- The host only configures a guest certificate authority when its network policy contains an HTTPS interception endpoint. VMs without a policy and VMs with only IP or HTTP endpoints do not generate, transfer, or install CA material.
+- CA trust installation uses `update-ca-certificates` when available, otherwise p11-kit `trust`. A configured CA is required launch state, so a missing or failed trust backend fails managed boot.
 - Ext4 root filesystems grow through the kernel's online resize ioctl. Guest images do not need `findmnt`, `resize2fs`, or e2fsprogs.
 - A configured root filesystem resize is required launch state. Discovery or resize failures fail managed boot instead of exposing less capacity than requested.
 - The agent does not read its control RPC port from this file. That comes from the kernel arg owned by the host side.

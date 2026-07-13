@@ -110,6 +110,14 @@ impl NetworkPolicy {
         &self.endpoints
     }
 
+    /// Returns whether enforcing this policy requires guest trust in Silo's
+    /// certificate authority for HTTPS interception.
+    pub fn has_https_interception(&self) -> bool {
+        self.endpoints
+            .iter()
+            .any(|endpoint| endpoint.kind == "https")
+    }
+
     pub fn credentials(&self) -> &[NetworkCredential] {
         &self.credentials
     }
@@ -1229,6 +1237,49 @@ mod tests {
         assert!(policy.rules.is_empty());
         assert!(policy.tailscale.is_empty());
         assert!(policy.forwards.is_empty());
+    }
+
+    #[test]
+    fn detects_https_interception_requirement() {
+        let empty = NetworkPolicy::from_json_str(r#"{ "version": 1 }"#).unwrap();
+        let http = NetworkPolicy::from_json_str(
+            r#"{
+                "version": 1,
+                "endpoints": [
+                    { "name": "registry", "kind": "http", "hosts": ["example.com"] }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let ip = NetworkPolicy::from_json_str(
+            r#"{
+                "version": 1,
+                "endpoints": [
+                    {
+                        "name": "dns",
+                        "kind": "ip",
+                        "destination_cidrs": ["1.1.1.1/32"],
+                        "protocol": "udp",
+                        "ports": [{ "start": 53, "end": 53 }]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let https = NetworkPolicy::from_json_str(
+            r#"{
+                "version": 1,
+                "endpoints": [
+                    { "name": "registry", "kind": "https", "hosts": ["example.com"] }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!empty.has_https_interception());
+        assert!(!http.has_https_interception());
+        assert!(!ip.has_https_interception());
+        assert!(https.has_https_interception());
     }
 
     #[test]

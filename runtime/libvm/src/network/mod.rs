@@ -44,6 +44,8 @@ pub(crate) enum VmmonNetworkAttachment {
         mac: String,
         ipv4: agent_spec::NetworkIpv4Config,
         dns: agent_spec::NetworkDnsConfig,
+        #[serde(default)]
+        requires_certificate_authority: bool,
     },
 }
 
@@ -55,6 +57,16 @@ impl VmmonNetworkAttachment {
                 format!("unixdg,{},mac={mac}", path.display())
             }
         }
+    }
+
+    pub(crate) fn requires_certificate_authority(&self) -> bool {
+        matches!(
+            self,
+            Self::UnixDatagram {
+                requires_certificate_authority: true,
+                ..
+            }
+        )
     }
 }
 
@@ -279,6 +291,7 @@ pub(super) fn remove_file_if_exists(path: &Path) -> Result<(), LibVmError> {
 mod tests {
     use std::collections::BTreeMap;
 
+    use serde_json::json;
     use vm_spec::VmSpec;
 
     use crate::lock_manager::LockId;
@@ -293,7 +306,10 @@ mod tests {
     use crate::store::MockDataStore;
     use crate::{LibVmError, RuntimeNetworkingConfig};
 
-    use super::{ensure_instance_network_link, prepare_network_runtime, reconcile_network_runtime};
+    use super::{
+        ensure_instance_network_link, prepare_network_runtime, reconcile_network_runtime,
+        VmmonNetworkAttachment,
+    };
 
     fn machine_config(
         paths: &LocalPaths,
@@ -350,6 +366,31 @@ mod tests {
             created_at: 1,
             modified_at: 1,
         }
+    }
+
+    #[test]
+    fn persisted_attachment_without_ca_requirement_defaults_to_false() {
+        let attachment: VmmonNetworkAttachment = serde_json::from_value(json!({
+            "kind": "unix_datagram",
+            "path": "/tmp/net.sock",
+            "mac": "02:11:22:33:44:55",
+            "ipv4": {
+                "address": "192.168.105.2",
+                "prefix_length": 24,
+                "gateway": "192.168.105.1"
+            },
+            "dns": {
+                "servers": ["192.168.105.1"],
+                "search": []
+            }
+        }))
+        .expect("decode attachment");
+
+        assert!(!attachment.requires_certificate_authority());
+        assert_eq!(
+            attachment.to_vmmon_arg(),
+            "unixdg,/tmp/net.sock,mac=02:11:22:33:44:55"
+        );
     }
 
     #[tokio::test]

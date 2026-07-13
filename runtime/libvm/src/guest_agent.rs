@@ -35,7 +35,7 @@ pub(crate) struct GuestAgentConfigInput<'a> {
 struct GuestAgentHostContext {
     user: HostUser,
     ssh_public_key_openssh: String,
-    certificate_authority_pem: String,
+    certificate_authority_pem: Option<String>,
     timezone: String,
     locale: String,
 }
@@ -52,18 +52,25 @@ struct ForwardPluginUdsConfig {
 }
 
 pub(crate) fn build_config(input: GuestAgentConfigInput<'_>) -> eyre::Result<AgentConfig> {
-    let host_context = load_host_context(input.paths, input.networking)?;
+    let host_context = load_host_context(
+        input.paths,
+        input.networking,
+        input.network.requires_certificate_authority(),
+    )?;
     build_config_with_host_context(input.machine_name, input.spec, input.network, &host_context)
 }
 
 fn load_host_context(
     paths: &LocalPaths,
     networking: &RuntimeNetworkingConfig,
+    requires_certificate_authority: bool,
 ) -> eyre::Result<GuestAgentHostContext> {
     let user = host::current_host_user().context("resolve current host user")?;
     let ssh_keypair =
         load_or_generate_guest_ssh_keypair(paths).context("load guest SSH keypair")?;
-    let certificate_authority_pem = certificate_authority_pem_for_config(paths, networking)?;
+    let certificate_authority_pem = requires_certificate_authority
+        .then(|| certificate_authority_pem_for_config(paths, networking))
+        .transpose()?;
 
     Ok(GuestAgentHostContext {
         user,
@@ -125,6 +132,20 @@ fn build_provision_config(
     network: &VmmonNetworkAttachment,
     host_context: &GuestAgentHostContext,
 ) -> eyre::Result<ProvisionConfig> {
+    let certificate_authority = if network.requires_certificate_authority() {
+        let pem = host_context
+            .certificate_authority_pem
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("network requires a certificate authority"))?;
+        Some(CertificateAuthorityConfig {
+            path: GUEST_CERTIFICATE_AUTHORITY_PATH.to_string(),
+            pem: pem_with_trailing_newline(pem),
+            update_trust: true,
+        })
+    } else {
+        None
+    };
+
     Ok(ProvisionConfig {
         enabled: true,
         hostname: Some(machine_name.to_string()),
@@ -140,11 +161,7 @@ fn build_provision_config(
             sudo: GUEST_USER_SUDO_RULE.to_string(),
             lock_passwd: true,
         }],
-        certificate_authority: Some(CertificateAuthorityConfig {
-            path: GUEST_CERTIFICATE_AUTHORITY_PATH.to_string(),
-            pem: pem_with_trailing_newline(&host_context.certificate_authority_pem),
-            update_trust: true,
-        }),
+        certificate_authority,
         network: build_provision_network_config(network)?,
         rosetta: AgentRosettaConfig {
             enabled: spec
@@ -405,8 +422,9 @@ mod tests {
                 gecos: "Silo User".to_string(),
             },
             ssh_public_key_openssh: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISilo".to_string(),
-            certificate_authority_pem:
+            certificate_authority_pem: Some(
                 "-----BEGIN CERTIFICATE-----\nMIISILO\n-----END CERTIFICATE-----\n".to_string(),
+            ),
             timezone: "Europe/Amsterdam".to_string(),
             locale: "nl_NL.UTF-8".to_string(),
         }
@@ -565,6 +583,42 @@ mod tests {
     }
 
     #[test]
+    fn provision_config_omits_certificate_authority_without_https_interception() {
+        let spec = sample_spec(Vec::new());
+
+        let detached = build_provision_config(
+            "demo",
+            &spec,
+            &VmmonNetworkAttachment::None,
+            &host_context(),
+        )
+        .expect("resolve provision config");
+        let attached = build_provision_config(
+            "demo",
+            &spec,
+            &VmmonNetworkAttachment::UnixDatagram {
+                path: PathBuf::from("/run/silo/net.sock"),
+                mac: "02:00:00:00:00:01".to_string(),
+                ipv4: agent_spec::NetworkIpv4Config {
+                    address: "192.168.105.2".parse().expect("IPv4 address"),
+                    prefix_length: 24,
+                    gateway: "192.168.105.1".parse().expect("IPv4 gateway"),
+                },
+                dns: agent_spec::NetworkDnsConfig {
+                    servers: vec!["192.168.105.1".parse().expect("DNS server")],
+                    search: Vec::new(),
+                },
+                requires_certificate_authority: false,
+            },
+            &host_context(),
+        )
+        .expect("resolve provision config");
+
+        assert!(detached.certificate_authority.is_none());
+        assert!(attached.certificate_authority.is_none());
+    }
+
+    #[test]
     fn provision_config_captures_guest_provisioning_inputs() {
         let mut spec = sample_spec(Vec::new());
         spec.mounts.push(Mount {
@@ -589,6 +643,7 @@ mod tests {
                     servers: vec!["192.168.105.1".parse().expect("DNS server")],
                     search: Vec::new(),
                 },
+                requires_certificate_authority: true,
             },
             &host_context(),
         )
