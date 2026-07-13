@@ -20,7 +20,7 @@ At startup the agent:
 1. initializes tracing
 2. loads guest config from disk
 3. reads the control port from `/proc/cmdline`
-4. runs provisioning if enabled
+4. runs provisioning if enabled, with optional static networking first
 5. attempts to bind guest `vsock::22` for SSH, unless another listener already owns it
 6. starts the forward service if enabled
 7. registers with the host-side control service
@@ -58,6 +58,16 @@ forward:
 
 provision:
   enabled: true
+  network:
+    interfaces:
+      - mac_address: "02:00:00:00:00:02"
+        ipv4:
+          address: 192.168.105.2
+          prefix_length: 24
+          gateway: 192.168.105.1
+        dns:
+          servers: [192.168.105.1]
+          search: []
   hostname: silo-dev
   resize_rootfs:
     enabled: true
@@ -68,7 +78,9 @@ Notes:
 - SSH is not configured here. The agent attempts to bind guest `vsock::22`; if another listener already owns `vsock::22`, the agent leaves it alone.
 - `forward.port` must be set when `forward.enabled` is true. This is the guest-side vsock port used by the host `forward` plugin endpoint.
 - `forward.uds` is an allowlist of guest Unix socket paths the forward service may connect to.
-- `provision` controls optional guest provisioning work such as hostname and root filesystem resizing.
+- `provision` controls optional guest provisioning work such as static networking, hostname, and root filesystem resizing.
+- `provision.network` is omitted for a machine without a network attachment. In that case the agent does not modify links, routes, or `/etc/resolv.conf`.
+- When configured, static networking is the first provisioner. It matches the interface by MAC and configures it through Linux rtnetlink without invoking DHCP, `ip`, or a network manager.
 - The agent does not read its control RPC port from this file. That comes from the kernel arg owned by the host side.
 
 ## SSH

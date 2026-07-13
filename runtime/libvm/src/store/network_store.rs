@@ -103,21 +103,6 @@ impl NetworkStore for Store {
         Ok(())
     }
 
-    async fn network_instance_by_definition(
-        &self,
-        definition_name: &str,
-    ) -> Result<Option<NetworkInstance>, LibVmError> {
-        let instance = sqlx::query_as::<_, DbNetworkInstance>(
-            "SELECT id, driver, definition_name, runtime_dir, json(attachment_json) AS attachment_json,
-                    json(driver_state_json) AS driver_state_json, state, created_at, modified_at
-             FROM network_instances WHERE definition_name = ?1",
-        )
-        .bind(definition_name)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(instance.map(|DbNetworkInstance(instance)| instance))
-    }
-
     async fn network_attachment_count(&self, network_id: &str) -> Result<u32, LibVmError> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM network_attachments WHERE network_instance_id = ?1",

@@ -10,34 +10,11 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
-	"strconv"
 	"strings"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
 )
-
-type uint16Flags []uint16
-
-func (f *uint16Flags) String() string { return fmt.Sprint([]uint16(*f)) }
-
-func (f *uint16Flags) Set(value string) error {
-	port, err := strconv.ParseUint(value, 10, 16)
-	if err != nil {
-		return fmt.Errorf("invalid port %q: %w", value, err)
-	}
-	*f = append(*f, uint16(port))
-	return nil
-}
-
-type stringFlags []string
-
-func (f *stringFlags) String() string { return strings.Join(*f, ",") }
-
-func (f *stringFlags) Set(value string) error {
-	*f = append(*f, value)
-	return nil
-}
 
 type Config struct {
 	ListenVfkit string
@@ -62,14 +39,13 @@ type Metadata struct {
 
 func Parse(args []string) (*Config, error) {
 	cfg := &Config{}
-	var subnet, pcapFile string
-	var sshPort int
+	var subnet, pcapFile, staticLease string
 
 	flags := flag.NewFlagSet("netd", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.StringVar(&cfg.ListenVfkit, "listen-vfkit", "", "unixgram socket used by vfkit-compatible applications")
-	flags.IntVar(&sshPort, "ssh-port", 2222, "guest SSH host forward port, or -1 to disable")
 	flags.StringVar(&subnet, "subnet", "192.168.127.0/24", "guest network subnet")
+	flags.StringVar(&staticLease, "static-lease", "", "guest DHCP lease in IP=MAC form")
 	flags.StringVar(&cfg.PIDFile, "pid-file", "", "write process ID to this file")
 	flags.StringVar(&cfg.LogFile, "log-file", "", "write logs to this file")
 	flags.StringVar(&pcapFile, "pcap", "", "capture network traffic to a pcap file")
@@ -87,7 +63,7 @@ func Parse(args []string) (*Config, error) {
 	if !strings.HasPrefix(cfg.ListenVfkit, "unixgram://") {
 		return cfg, errors.New("--listen-vfkit must use unixgram://")
 	}
-	stack, err := stackConfig(subnet, sshPort, pcapFile)
+	stack, err := stackConfig(subnet, staticLease, pcapFile)
 	if err != nil {
 		return cfg, err
 	}
@@ -121,10 +97,13 @@ func LoadPolicy(cfg *Config) error {
 	return nil
 }
 
-func stackConfig(subnetText string, sshPort int, pcapFile string) (types.Configuration, error) {
+func stackConfig(subnetText, staticLease, pcapFile string) (types.Configuration, error) {
 	subnet, err := netip.ParsePrefix(subnetText)
 	if err != nil {
 		return types.Configuration{}, fmt.Errorf("parse subnet: %w", err)
+	}
+	if !subnet.Addr().Is4() {
+		return types.Configuration{}, errors.New("subnet must be IPv4")
 	}
 	gatewayIP, err := getFirstUsableIPFromSubnet(subnet)
 	if err != nil {
@@ -138,13 +117,14 @@ func stackConfig(subnetText string, sshPort int, pcapFile string) (types.Configu
 	if err != nil {
 		return types.Configuration{}, err
 	}
-	if sshPort != -1 && (sshPort < 1024 || sshPort > 65535) {
-		return types.Configuration{}, errors.New("ssh-port value must be -1 or between 1024 and 65535")
-	}
-
-	forwards := map[string]string{}
-	if sshPort != -1 {
-		forwards[fmt.Sprintf("127.0.0.1:%d", sshPort)] = net.JoinHostPort(deviceIP.String(), "22")
+	staticLeases := map[string]string{}
+	if staticLease != "" {
+		leaseIP, leaseMAC, err := parseStaticLease(staticLease, subnet, gatewayIP, hostIP)
+		if err != nil {
+			return types.Configuration{}, err
+		}
+		deviceIP = leaseIP
+		staticLeases[leaseIP.String()] = leaseMAC
 	}
 
 	return types.Configuration{
@@ -160,17 +140,61 @@ func stackConfig(subnetText string, sshPort int, pcapFile string) (types.Configu
 			{Name: "docker.internal.", Records: []types.Record{{Name: "gateway", IP: net.ParseIP(gatewayIP.String())}, {Name: "host", IP: net.ParseIP(hostIP.String())}}},
 		},
 		DNSSearchDomains:  searchDomains(),
-		Forwards:          forwards,
+		Forwards:          map[string]string{},
 		NAT:               map[string]string{hostIP.String(): "127.0.0.1"},
 		GatewayVirtualIPs: []string{hostIP.String()},
-		DHCPStaticLeases: map[string]string{
-			deviceIP.String(): "5a:94:ef:e4:0c:ee",
-		},
-		VpnKitUUIDMacAddresses: map[string]string{
-			"c3d68012-0208-11ea-9fd7-f2189899ab08": "5a:94:ef:e4:0c:ee",
-		},
-		Protocol: types.VfkitProtocol,
+		DHCPStaticLeases:  staticLeases,
+		Protocol:          types.VfkitProtocol,
 	}, nil
+}
+
+func parseStaticLease(value string, subnet netip.Prefix, gatewayIP, hostIP netip.Addr) (netip.Addr, string, error) {
+	ipText, macText, ok := strings.Cut(value, "=")
+	if !ok || ipText == "" || macText == "" || strings.Contains(macText, "=") {
+		return netip.Addr{}, "", errors.New("--static-lease must use IP=MAC form")
+	}
+	ip, err := netip.ParseAddr(ipText)
+	if err != nil || !ip.Is4() {
+		return netip.Addr{}, "", fmt.Errorf("invalid static lease IPv4 address %q", ipText)
+	}
+	mac, err := net.ParseMAC(macText)
+	if err != nil || len(mac) != 6 || !isColonSeparatedMAC(macText) {
+		return netip.Addr{}, "", fmt.Errorf("invalid static lease Ethernet MAC address %q", macText)
+	}
+	if mac[0]&1 != 0 || allZeroMAC(mac) {
+		return netip.Addr{}, "", fmt.Errorf("static lease Ethernet MAC address %q must be nonzero unicast", macText)
+	}
+	broadcastIP, err := getLastUsableIPFromSubnet(subnet)
+	if err != nil {
+		return netip.Addr{}, "", err
+	}
+	broadcastIP = broadcastIP.Next()
+	if !subnet.Contains(ip) || ip == subnet.Masked().Addr() || ip == broadcastIP || ip == gatewayIP || ip == hostIP {
+		return netip.Addr{}, "", fmt.Errorf("static lease address %q is not a usable guest address", ipText)
+	}
+	return ip, mac.String(), nil
+}
+
+func allZeroMAC(mac net.HardwareAddr) bool {
+	for _, value := range mac {
+		if value != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func isColonSeparatedMAC(value string) bool {
+	parts := strings.Split(value, ":")
+	if len(parts) != 6 {
+		return false
+	}
+	for _, part := range parts {
+		if len(part) != 2 {
+			return false
+		}
+	}
+	return true
 }
 
 func getFirstUsableIPFromSubnet(subnet netip.Prefix) (netip.Addr, error) {

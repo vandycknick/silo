@@ -6,6 +6,69 @@ import (
 	"testing"
 )
 
+func TestParseWithoutStaticLeaseHasNoGuestLeaseOrForwards(t *testing.T) {
+	cfg := parseConfig(t)
+	if len(cfg.Stack.DHCPStaticLeases) != 0 {
+		t.Fatalf("expected no DHCP static leases, got %#v", cfg.Stack.DHCPStaticLeases)
+	}
+	if len(cfg.Stack.Forwards) != 0 {
+		t.Fatalf("expected no host forwards, got %#v", cfg.Stack.Forwards)
+	}
+	if len(cfg.Stack.VpnKitUUIDMacAddresses) != 0 {
+		t.Fatalf("expected no VPNKit UUID MAC addresses, got %#v", cfg.Stack.VpnKitUUIDMacAddresses)
+	}
+}
+
+func TestParseStaticLeaseSetsDeviceIPAndDHCPLease(t *testing.T) {
+	cfg := parseConfig(t, "--static-lease", "192.168.127.42=02:00:00:00:00:2a")
+	if cfg.Stack.DeviceIP != "192.168.127.42" {
+		t.Fatalf("expected static lease device IP, got %q", cfg.Stack.DeviceIP)
+	}
+	want := map[string]string{"192.168.127.42": "02:00:00:00:00:2a"}
+	if len(cfg.Stack.DHCPStaticLeases) != len(want) || cfg.Stack.DHCPStaticLeases["192.168.127.42"] != want["192.168.127.42"] {
+		t.Fatalf("unexpected DHCP static leases: %#v", cfg.Stack.DHCPStaticLeases)
+	}
+}
+
+func TestParseRejectsInvalidStaticLeases(t *testing.T) {
+	for _, lease := range []string{
+		"192.168.127.42",
+		"192.168.127.42.1=02:00:00:00:00:2a",
+		"192.168.127.42=02-00-00-00-00-2a",
+		"192.168.127.42=02:00:00:00:00:zz",
+		"192.168.127.42=02:00:00:00:00:2a:ff",
+		"192.168.127.42=00:00:00:00:00:00",
+		"192.168.127.42=01:00:00:00:00:2a",
+		"2001:db8::42=02:00:00:00:00:2a",
+		"192.168.127.0=02:00:00:00:00:2a",
+		"192.168.127.1=02:00:00:00:00:2a",
+		"192.168.127.254=02:00:00:00:00:2a",
+		"192.168.127.255=02:00:00:00:00:2a",
+		"192.168.128.42=02:00:00:00:00:2a",
+	} {
+		t.Run(lease, func(t *testing.T) {
+			_, err := Parse(append(configArgs(t), "--static-lease", lease))
+			if err == nil {
+				t.Fatal("expected static lease to be rejected")
+			}
+		})
+	}
+}
+
+func TestParseRejectsNonIPv4Subnet(t *testing.T) {
+	_, err := Parse(append(configArgs(t), "--subnet", "2001:db8::/64"))
+	if err == nil {
+		t.Fatal("expected IPv6 subnet to be rejected")
+	}
+}
+
+func TestParseRejectsRemovedSSHPortFlag(t *testing.T) {
+	_, err := Parse(append(configArgs(t), "--ssh-port", "2222"))
+	if err == nil {
+		t.Fatal("expected removed --ssh-port flag to be rejected")
+	}
+}
+
 func TestParseRejectsRemovedAuditAndProfileFlags(t *testing.T) {
 	dir := t.TempDir()
 	_, err := Parse([]string{
@@ -124,6 +187,20 @@ func TestParseKeepsLogFileOnValidationError(t *testing.T) {
 	if cfg == nil || cfg.LogFile != logFile {
 		t.Fatalf("expected parser-owned log file on validation error, got %#v", cfg)
 	}
+}
+
+func parseConfig(t *testing.T, args ...string) *Config {
+	t.Helper()
+	cfg, err := Parse(append(configArgs(t), args...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func configArgs(t *testing.T) []string {
+	t.Helper()
+	return []string{"--listen-vfkit", "unixgram://" + filepath.Join(t.TempDir(), "net.sock")}
 }
 
 func writeConfigPolicy(t *testing.T, path string, text string) {

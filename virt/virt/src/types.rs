@@ -202,11 +202,6 @@ impl VmConfigBuilder {
         self
     }
 
-    pub fn vz_nat_network(mut self) -> Self {
-        self.config.network = NetworkMode::VzNat;
-        self
-    }
-
     pub fn unix_datagram_network(mut self, peer_path: impl Into<PathBuf>, mac: [u8; 6]) -> Self {
         self.config.network = NetworkMode::UnixDatagram {
             peer_path: peer_path.into(),
@@ -284,7 +279,6 @@ pub enum VsockPortMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkMode {
     None,
-    VzNat,
     UnixDatagram { peer_path: PathBuf, mac: [u8; 6] },
     UnixStream { path: PathBuf, mac: [u8; 6] },
     Tap { name: String, mac: [u8; 6] },

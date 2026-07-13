@@ -45,7 +45,6 @@ pub(crate) struct VmSpecInputs<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeNetwork {
     None,
-    VzNat { mac: Option<String> },
     UnixDatagram { path: PathBuf, mac: String },
 }
 
@@ -240,7 +239,6 @@ fn apply_runtime_network(
 ) -> Result<VmConfigBuilder, MachineSpecError> {
     match network {
         RuntimeNetwork::None => Ok(builder.no_network()),
-        RuntimeNetwork::VzNat { .. } => Ok(builder.vz_nat_network()),
         RuntimeNetwork::UnixDatagram { path, mac } => {
             Ok(builder.unix_datagram_network(path.clone(), parse_mac_str(mac)?))
         }
@@ -352,20 +350,6 @@ mod tests {
             .expect("unix datagram network");
         assert_eq!(peer_path, &PathBuf::from("/tmp/net.sock"));
         assert_eq!(mac, [0x02, 0, 0, 0, 0, 1]);
-    }
-
-    #[test]
-    fn vznat_network_maps_to_vz_nat_mode() {
-        assert_eq!(
-            apply_runtime_network(
-                VmConfig::builder("devbox"),
-                &RuntimeNetwork::VzNat { mac: None }
-            )
-            .expect("runtime network")
-            .build()
-            .network,
-            virt::NetworkMode::VzNat
-        );
     }
 
     #[test]

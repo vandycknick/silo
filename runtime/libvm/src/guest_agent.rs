@@ -4,9 +4,8 @@ use std::path::{Path, PathBuf};
 use agent_spec::{
     AgentConfig, AgentForwardConfig, AgentRosettaConfig, AgentSshAuthorizedUser, AgentSshConfig,
     AgentUdsForwardConfig, CertificateAuthorityConfig, MountConfig as ProvisionMountConfig,
-    NetworkConfig as ProvisionNetworkConfig, NetworkInterfaceConfig, NetworkMatchConfig,
-    ProvisionConfig, ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType,
-    UserdataRunPolicy,
+    NetworkConfig as ProvisionNetworkConfig, NetworkInterfaceConfig, ProvisionConfig,
+    ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType, UserdataRunPolicy,
 };
 use eyre::Context;
 use serde::Deserialize;
@@ -17,9 +16,8 @@ use vm_spec::VmSpec;
 use crate::constants::{
     FORWARD_ENDPOINT_NAME, GUEST_CERTIFICATE_AUTHORITY_PATH, GUEST_SSH_PRIVATE_KEY_FILE_NAME,
     GUEST_SSH_PUBLIC_KEY_FILE_NAME, GUEST_USER_SHELL, GUEST_USER_SUDO_RULE, MOUNT_OPTION_NOFAIL,
-    MOUNT_OPTION_READ_ONLY, MOUNT_OPTION_READ_WRITE, UNIX_DATAGRAM_INTERFACE_NAME,
-    USERDATA_CONTENT_TYPE_CLOUD_CONFIG, USERDATA_CONTENT_TYPE_PLAIN_TEXT,
-    USERDATA_CONTENT_TYPE_SHELL_SCRIPT, VIRTIOFS_FSTYPE, VZNAT_INTERFACE_NAME, VZNAT_MATCH_DRIVER,
+    MOUNT_OPTION_READ_ONLY, MOUNT_OPTION_READ_WRITE, USERDATA_CONTENT_TYPE_CLOUD_CONFIG,
+    USERDATA_CONTENT_TYPE_PLAIN_TEXT, USERDATA_CONTENT_TYPE_SHELL_SCRIPT, VIRTIOFS_FSTYPE,
 };
 use crate::host::{self, HostUser};
 use crate::network::VmmonNetworkAttachment;
@@ -250,30 +248,19 @@ fn provision_userdata(spec: &VmSpec) -> eyre::Result<Option<UserdataConfig>> {
 
 fn build_provision_network_config(
     network: &VmmonNetworkAttachment,
-) -> eyre::Result<ProvisionNetworkConfig> {
-    let interfaces = match network {
-        VmmonNetworkAttachment::None => Vec::new(),
-        VmmonNetworkAttachment::VzNat { .. } => vec![NetworkInterfaceConfig {
-            name: VZNAT_INTERFACE_NAME.to_string(),
-            matches: NetworkMatchConfig {
-                driver: Some(VZNAT_MATCH_DRIVER.to_string()),
-                mac_address: None,
-            },
-            dhcp4: true,
-            dhcp6: false,
-        }],
-        VmmonNetworkAttachment::UnixDatagram { mac, .. } => vec![NetworkInterfaceConfig {
-            name: UNIX_DATAGRAM_INTERFACE_NAME.to_string(),
-            matches: NetworkMatchConfig {
-                driver: None,
-                mac_address: Some(format_mac(parse_mac_string(mac)?)),
-            },
-            dhcp4: true,
-            dhcp6: false,
-        }],
-    };
-
-    Ok(ProvisionNetworkConfig { interfaces })
+) -> eyre::Result<Option<ProvisionNetworkConfig>> {
+    match network {
+        VmmonNetworkAttachment::None => Ok(None),
+        VmmonNetworkAttachment::UnixDatagram { mac, ipv4, dns, .. } => {
+            Ok(Some(ProvisionNetworkConfig {
+                interfaces: vec![NetworkInterfaceConfig {
+                    mac_address: format_mac(parse_mac_string(mac)?),
+                    ipv4: ipv4.clone(),
+                    dns: dns.clone(),
+                }],
+            }))
+        }
+    }
 }
 
 fn provision_mount_entries(spec: &VmSpec) -> Vec<ProvisionMountConfig> {
@@ -524,19 +511,11 @@ mod tests {
     }
 
     #[test]
-    fn provision_network_for_vznat_matches_virtio_net_driver() {
-        let config = build_provision_network_config(&VmmonNetworkAttachment::VzNat { mac: None })
+    fn provision_network_is_absent_without_attachment() {
+        let config = build_provision_network_config(&VmmonNetworkAttachment::None)
             .expect("network provision config should render");
 
-        assert_eq!(config.interfaces.len(), 1);
-        assert_eq!(config.interfaces[0].name, "en");
-        assert_eq!(
-            config.interfaces[0].matches.driver.as_deref(),
-            Some("virtio_net")
-        );
-        assert!(config.interfaces[0].matches.mac_address.is_none());
-        assert!(config.interfaces[0].dhcp4);
-        assert!(!config.interfaces[0].dhcp6);
+        assert!(config.is_none());
     }
 
     #[test]
@@ -601,6 +580,15 @@ mod tests {
             &VmmonNetworkAttachment::UnixDatagram {
                 path: PathBuf::from("/run/silo/net.sock"),
                 mac: "02:00:00:00:00:01".to_string(),
+                ipv4: agent_spec::NetworkIpv4Config {
+                    address: "192.168.105.2".parse().expect("IPv4 address"),
+                    prefix_length: 24,
+                    gateway: "192.168.105.1".parse().expect("IPv4 gateway"),
+                },
+                dns: agent_spec::NetworkDnsConfig {
+                    servers: vec!["192.168.105.1".parse().expect("DNS server")],
+                    search: Vec::new(),
+                },
             },
             &host_context(),
         )
@@ -614,14 +602,8 @@ mod tests {
         assert!(provision.resize_rootfs.enabled);
         assert_eq!(provision.mounts[0].tag, "workspace");
         assert_eq!(provision.mounts[0].path, "/workspace");
-        assert_eq!(provision.network.interfaces[0].name, "silo");
-        assert_eq!(
-            provision.network.interfaces[0]
-                .matches
-                .mac_address
-                .as_deref(),
-            Some("02:00:00:00:00:01")
-        );
+        let network = provision.network.as_ref().expect("network config");
+        assert_eq!(network.interfaces[0].mac_address, "02:00:00:00:00:01");
         assert_eq!(
             provision
                 .userdata
@@ -645,7 +627,14 @@ mod tests {
         assert!(decoded.provision.enabled);
         assert!(decoded.provision.resize_rootfs.enabled);
         assert_eq!(decoded.provision.rosetta.mount_tag, "silo-rosetta");
-        assert_eq!(decoded.provision.network.interfaces.len(), 1);
+        assert_eq!(
+            decoded
+                .provision
+                .network
+                .as_ref()
+                .map(|network| network.interfaces.len()),
+            Some(1)
+        );
         assert_eq!(
             decoded
                 .provision

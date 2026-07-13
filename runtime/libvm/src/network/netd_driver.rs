@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
@@ -9,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use agent_spec::{NetworkDnsConfig, NetworkIpv4Config};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use nix::sys::signal::{kill, Signal};
@@ -25,19 +27,17 @@ use crate::store::models::MachineId;
 use crate::store::models::{
     MachineConfig, NetworkAttachment, NetworkInstance, NetworkInstanceState,
 };
-use crate::store::DataStore;
 use crate::utils::now_unix;
 use crate::{LibVmError, NetdRuntimeConfig};
 
 use super::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
 use super::{
-    ensure_instance_network_link, mac_from_machine_id, network_attachment_from_instance,
-    remove_file_if_exists, remove_runtime_dir, serialize_json, DRIVER_NETD,
+    ensure_instance_network_link, mac_from_machine_id, remove_file_if_exists, remove_runtime_dir,
+    serialize_json, DRIVER_NETD,
 };
 
 const NETD_BINARY_ENV: &str = "NETD_BIN";
 const NETD_BINARY_NAME: &str = "netd";
-const NETD_DISABLE_SSH_PORT: &str = "-1";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
@@ -95,19 +95,6 @@ async fn prepare_netd_runtime(
         });
     }
 
-    if let Some(definition_name) = request.definition_name() {
-        if let Some(instance) = store
-            .network_instance_by_definition(definition_name)
-            .await?
-        {
-            if instance_is_alive(&instance) {
-                return attach_existing_runtime(paths, store, metadata, &instance).await;
-            }
-            store.remove_network_instance(&instance.id).await?;
-            remove_runtime_dir(Path::new(&instance.runtime_dir))?;
-        }
-    }
-
     let network_id = MachineId::new().to_string();
     let network_paths = paths.network(&network_id);
     let runtime_dir = network_paths.dir().to_path_buf();
@@ -131,6 +118,10 @@ async fn prepare_netd_runtime(
     remove_file_if_exists(&socket_path)?;
     remove_file_if_exists(&pid_path)?;
 
+    let mac = format_mac(mac_from_machine_id(metadata.id));
+    let (ipv4, dns) = private_ipv4_config(&config.subnet, &metadata.name)?;
+    let static_lease = format!("{}={mac}", ipv4.address);
+
     let log = File::options().create(true).append(true).open(&log_path)?;
     let mut command = Command::new(resolve_netd_binary());
     configure_network_helper_command(
@@ -146,6 +137,7 @@ async fn prepare_netd_runtime(
             policy_path: policy_path.as_deref(),
             tls_ca_cert_path: Some(tls_ca_cert_path.as_path()),
             tls_ca_key_path: Some(tls_ca_key_path.as_path()),
+            static_lease: &static_lease,
         },
     );
     configure_network_launch_environment(
@@ -200,10 +192,11 @@ async fn prepare_netd_runtime(
         });
     }
 
-    let mac = mac_from_machine_id(metadata.id);
     let network = super::VmmonNetworkAttachment::UnixDatagram {
         path: socket_path.clone(),
-        mac: format_mac(mac),
+        mac: mac.clone(),
+        ipv4,
+        dns,
     };
     let driver_state = NetdDriverState {
         helper_pid: pid,
@@ -218,7 +211,7 @@ async fn prepare_netd_runtime(
         .save_network_instance(&NetworkInstance {
             id: network_id.clone(),
             driver: DRIVER_NETD.to_string(),
-            definition_name: request.definition_name().map(str::to_string),
+            definition_name: None,
             runtime_dir: runtime_dir.display().to_string(),
             attachment_json: serialize_json(&network, "network attachment")?,
             driver_state_json: serialize_json(&driver_state, "netd driver state")?,
@@ -231,7 +224,7 @@ async fn prepare_netd_runtime(
         .attach_network(&NetworkAttachment {
             machine_id: metadata.id,
             network_instance_id: network_id.clone(),
-            guest_mac: format_mac(mac),
+            guest_mac: mac,
             created_at: now,
             modified_at: now,
         })
@@ -273,28 +266,6 @@ fn host_uses_user_network_runtime() -> bool {
     false
 }
 
-async fn attach_existing_runtime(
-    paths: &LocalPaths,
-    store: &dyn DataStore,
-    metadata: &MachineConfig,
-    instance: &NetworkInstance,
-) -> Result<super::VmmonNetworkAttachment, LibVmError> {
-    ensure_instance_network_link(paths, metadata.id, Path::new(&instance.runtime_dir))?;
-    let now = now_unix();
-    let mac = format_mac(mac_from_machine_id(metadata.id));
-    let attachment = network_attachment_from_instance(instance, mac.clone())?;
-    store
-        .attach_network(&NetworkAttachment {
-            machine_id: metadata.id,
-            network_instance_id: instance.id.clone(),
-            guest_mac: mac.clone(),
-            created_at: now,
-            modified_at: now,
-        })
-        .await?;
-    Ok(attachment)
-}
-
 struct NetworkHelperCommandConfig<'a> {
     socket_path: &'a Path,
     subnet: &'a str,
@@ -306,6 +277,7 @@ struct NetworkHelperCommandConfig<'a> {
     policy_path: Option<&'a Path>,
     tls_ca_cert_path: Option<&'a Path>,
     tls_ca_key_path: Option<&'a Path>,
+    static_lease: &'a str,
 }
 
 fn configure_network_helper_command(
@@ -315,10 +287,10 @@ fn configure_network_helper_command(
     command
         .arg("--listen-vfkit")
         .arg(format!("unixgram://{}", config.socket_path.display()))
-        .arg("--ssh-port")
-        .arg(NETD_DISABLE_SSH_PORT)
         .arg("--subnet")
         .arg(config.subnet)
+        .arg("--static-lease")
+        .arg(config.static_lease)
         .arg("--log-file")
         .arg(config.log_path)
         .arg("--pid-file")
@@ -339,6 +311,50 @@ fn configure_network_helper_command(
     }
     if let Some(path) = config.tls_ca_key_path {
         command.arg("--tls-ca-key").arg(path);
+    }
+}
+
+fn private_ipv4_config(
+    subnet: &str,
+    reference: &str,
+) -> Result<(NetworkIpv4Config, NetworkDnsConfig), LibVmError> {
+    let (address, prefix) = subnet
+        .split_once('/')
+        .ok_or_else(|| network_config_error(reference, "subnet must use IPv4 CIDR notation"))?;
+    let address = address
+        .parse::<Ipv4Addr>()
+        .map_err(|err| network_config_error(reference, format!("parse subnet address: {err}")))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|err| network_config_error(reference, format!("parse subnet prefix: {err}")))?;
+    if !(1..=29).contains(&prefix) {
+        return Err(network_config_error(
+            reference,
+            "subnet prefix must be between 1 and 29",
+        ));
+    }
+
+    let mask = u32::MAX << (32 - prefix);
+    let network = u32::from(address) & mask;
+    let gateway = Ipv4Addr::from(network + 1);
+    let guest = Ipv4Addr::from(network + 2);
+    Ok((
+        NetworkIpv4Config {
+            address: guest,
+            prefix_length: prefix,
+            gateway,
+        },
+        NetworkDnsConfig {
+            servers: vec![IpAddr::V4(gateway)],
+            search: Vec::new(),
+        },
+    ))
+}
+
+fn network_config_error(reference: &str, message: impl Into<String>) -> LibVmError {
+    LibVmError::NetworkRuntime {
+        reference: reference.to_string(),
+        message: message.into(),
     }
 }
 
@@ -776,7 +792,7 @@ fn terminate_helper(pid: i32) -> Result<(), LibVmError> {
 mod tests {
     use super::{
         append_bounded_stderr_line, configure_network_helper_command,
-        configure_network_launch_environment, format_netd_startup_failure,
+        configure_network_launch_environment, format_netd_startup_failure, private_ipv4_config,
         resolve_certificate_authority_paths, CapturedStderrLines, NetworkHelperCommandConfig,
         OAUTH_REFRESH_AUTH_ENV, OAUTH_REFRESH_HOOK_ENV, STDERR_CAPTURE_LIMIT,
     };
@@ -809,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn netd_command_disables_default_ssh_forward() {
+    fn netd_command_includes_static_lease() {
         let mut command = Command::new("netd");
         configure_network_helper_command(
             &mut command,
@@ -824,6 +840,7 @@ mod tests {
                 policy_path: None,
                 tls_ca_cert_path: None,
                 tls_ca_key_path: None,
+                static_lease: "192.168.105.2=02:00:00:00:00:02",
             },
         );
 
@@ -832,7 +849,10 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        assert!(args.windows(2).any(|window| window == ["--ssh-port", "-1"]));
+        assert!(args
+            .windows(2)
+            .any(|window| { window == ["--static-lease", "192.168.105.2=02:00:00:00:00:02",] }));
+        assert!(args.iter().all(|arg| arg != "--ssh-port"));
     }
 
     #[test]
@@ -852,6 +872,7 @@ mod tests {
                 policy_path: Some(Path::new("/tmp/silo-net/network-policy.json")),
                 tls_ca_cert_path: Some(Path::new("/tmp/silo-net/ca.pem")),
                 tls_ca_key_path: Some(Path::new("/tmp/silo-net/ca-key.pem")),
+                static_lease: "192.168.105.2=02:00:00:00:00:02",
             },
         );
 
@@ -1036,5 +1057,24 @@ netd log: /tmp/silo/netd.log";
         assert!(err.to_string().contains(
             "certificate authority certificate and private key must be configured together"
         ));
+    }
+
+    #[test]
+    fn private_ipv4_config_uses_first_two_usable_addresses() {
+        let (ipv4, dns) =
+            private_ipv4_config("192.168.105.37/24", "devbox").expect("private IPv4 config");
+
+        assert_eq!(ipv4.address.to_string(), "192.168.105.2");
+        assert_eq!(ipv4.gateway.to_string(), "192.168.105.1");
+        assert_eq!(ipv4.prefix_length, 24);
+        assert_eq!(dns.servers[0].to_string(), "192.168.105.1");
+    }
+
+    #[test]
+    fn private_ipv4_config_rejects_too_small_subnet() {
+        let err = private_ipv4_config("192.168.105.0/30", "devbox")
+            .expect_err("small subnet should fail");
+
+        assert!(err.to_string().contains("between 1 and 29"));
     }
 }

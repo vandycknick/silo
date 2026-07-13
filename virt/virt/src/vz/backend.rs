@@ -334,9 +334,6 @@ fn build_vm(spec: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguration)
 
     match &spec.network {
         NetworkMode::None => {}
-        NetworkMode::VzNat => {
-            builder = builder.add_network_device(NetworkDeviceConfiguration::nat());
-        }
         NetworkMode::UnixDatagram { peer_path, mac } => {
             builder = builder.add_network_device(
                 NetworkDeviceConfiguration::unix_datagram(peer_path, &spec.vm_id, *mac)
@@ -439,7 +436,7 @@ fn validate_machine_config(spec: &VmConfig) -> Result<(), VirtError> {
     validate_rosetta(spec)?;
 
     match &spec.network {
-        NetworkMode::None | NetworkMode::VzNat => {}
+        NetworkMode::None => {}
         NetworkMode::UnixDatagram { peer_path, .. } => {
             validate_unix_datagram_network(spec, peer_path)?
         }

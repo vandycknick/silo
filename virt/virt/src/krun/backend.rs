@@ -92,12 +92,6 @@ fn validate(config: &VmConfig) -> Result<(), VirtError> {
         NetworkMode::UnixDatagram { peer_path, .. } => {
             validate_unix_datagram_network(config, peer_path)?
         }
-        NetworkMode::VzNat => {
-            return invalid_config(
-                config,
-                "vznat networking is only supported by the VZ backend",
-            )
-        }
         NetworkMode::UnixStream { .. } => {
             return invalid_config(config, "unixstream networking is not implemented yet")
         }

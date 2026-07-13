@@ -110,11 +110,6 @@ mock! {
 
         async fn remove_network_instance(&self, network_id: &str) -> Result<(), LibVmError>;
 
-        async fn network_instance_by_definition(
-            &self,
-            definition_name: &str,
-        ) -> Result<Option<NetworkInstance>, LibVmError>;
-
         async fn network_attachment_count(&self, network_id: &str) -> Result<u32, LibVmError>;
 
         async fn define_network(&self, definition: &NetworkDefinition) -> Result<(), LibVmError>;

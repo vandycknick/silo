@@ -66,7 +66,7 @@ struct CreateCmd {
     #[arg(long, value_parser = parse_network_topology, default_value = "nat")]
     topology: NetworkTopology,
 
-    /// Network driver. Allowed: auto, netd, vznat.
+    /// Network driver. Allowed: auto or netd.
     #[arg(long, value_parser = parse_driver, default_value = "auto")]
     driver: NetworkDriver,
 }
@@ -245,9 +245,8 @@ fn parse_driver(input: &str) -> Result<NetworkDriver, String> {
     match input {
         "auto" => Ok(NetworkDriver::Auto),
         "netd" => Ok(NetworkDriver::Netd),
-        "vznat" => Ok(NetworkDriver::VzNat),
         other => Err(format!(
-            "invalid network driver '{other}', expected auto, netd, or vznat"
+            "invalid network driver '{other}', expected auto or netd"
         )),
     }
 }
@@ -265,7 +264,6 @@ fn format_driver(driver: NetworkDriver) -> &'static str {
     match driver {
         NetworkDriver::Auto => "auto",
         NetworkDriver::Netd => "netd",
-        NetworkDriver::VzNat => "vznat",
         _ => "unknown",
     }
 }

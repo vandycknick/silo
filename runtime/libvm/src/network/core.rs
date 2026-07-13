@@ -8,41 +8,17 @@ use crate::{LibVmError, NetworkLaunch, RuntimeNetworkingConfig};
 
 use super::VmmonNetworkAttachment;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum NetworkAttachmentTarget<'a> {
-    Private { policy: Option<&'a NetworkPolicy> },
-    Named { definition_name: &'a str },
-}
-
 pub(super) struct NetworkAttachmentRequest<'a> {
-    pub(super) target: NetworkAttachmentTarget<'a>,
+    policy: Option<&'a NetworkPolicy>,
 }
 
 impl<'a> NetworkAttachmentRequest<'a> {
     pub(super) fn private(policy: Option<&'a NetworkPolicy>) -> Self {
-        Self {
-            target: NetworkAttachmentTarget::Private { policy },
-        }
-    }
-
-    pub(super) fn named(definition_name: &'a str) -> Self {
-        Self {
-            target: NetworkAttachmentTarget::Named { definition_name },
-        }
+        Self { policy }
     }
 
     pub(super) fn policy(&self) -> Option<&'a NetworkPolicy> {
-        match self.target {
-            NetworkAttachmentTarget::Private { policy } => policy,
-            NetworkAttachmentTarget::Named { .. } => None,
-        }
-    }
-
-    pub(super) fn definition_name(&self) -> Option<&'a str> {
-        match self.target {
-            NetworkAttachmentTarget::Private { .. } => None,
-            NetworkAttachmentTarget::Named { definition_name } => Some(definition_name),
-        }
+        self.policy
     }
 }
 

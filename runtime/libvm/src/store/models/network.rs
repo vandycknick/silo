@@ -112,7 +112,6 @@ pub(crate) enum NetworkDriverPreference {
     #[default]
     Auto,
     Netd,
-    VzNat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

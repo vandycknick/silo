@@ -54,7 +54,7 @@ pub use crate::machine::{
 };
 pub use crate::network::{
     MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition, NetworkDriver,
-    NetworkDriverKind, NetworkTopology,
+    NetworkTopology,
 };
 pub use crate::runtime::{
     NetdRuntimeConfig, PathChoice, Runtime, RuntimeBuilder, RuntimeConfig, RuntimeNetworkingConfig,

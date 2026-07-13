@@ -6,53 +6,44 @@ mod api;
 mod builder;
 mod core;
 mod netd_driver;
-mod vznat_driver;
 
 pub use api::{
-    MachineNetworkBuilder, MachineNetworkConfig, NetworkDefinition, NetworkDriver,
-    NetworkDriverKind, NetworkTopology,
+    MachineNetworkBuilder, MachineNetworkConfig, NetworkDefinition, NetworkDriver, NetworkTopology,
 };
 pub use builder::NetworkBuilder;
 
 pub(crate) use api::validate_network_name;
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::LocalPaths;
 use crate::store::models::MachineId;
 use crate::store::models::{
     MachineConfig, MachineNetworkConfig as ModelMachineNetworkConfig,
-    NetworkDefinition as ModelNetworkDefinition,
-    NetworkDriverPreference as ModelNetworkDriverPreference, NetworkInstance,
-    NetworkTopology as ModelNetworkTopology,
+    NetworkDefinition as ModelNetworkDefinition, NetworkInstance,
 };
 use crate::store::DataStore;
 use crate::{LibVmError, NetworkLaunch, RuntimeNetworkingConfig};
 
 use self::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
 use self::netd_driver::NetdDriver;
-use self::vznat_driver::VzNatDriver;
 
 const DRIVER_NETD: &str = "netd";
-const DRIVER_VZNAT: &str = "vznat";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-/// Resolved network attachment passed to vmmon.
+/// Resolved network attachment projected into vmmon and guest-agent inputs.
 ///
 /// This is neither the public desired network (`MachineNetworkConfig`) nor the stored
 /// network model. Drivers produce this after resolving policy, named networks,
-/// runtime directories, and persisted attachments.
+/// runtime directories, guest settings, and persisted attachments.
 pub(crate) enum VmmonNetworkAttachment {
     None,
-    VzNat {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        mac: Option<String>,
-    },
     UnixDatagram {
         path: std::path::PathBuf,
         mac: String,
+        ipv4: agent_spec::NetworkIpv4Config,
+        dns: agent_spec::NetworkDnsConfig,
     },
 }
 
@@ -60,9 +51,9 @@ impl VmmonNetworkAttachment {
     pub(crate) fn to_vmmon_arg(&self) -> String {
         match self {
             Self::None => "none".to_string(),
-            Self::VzNat { mac: None } => "vznat".to_string(),
-            Self::VzNat { mac: Some(mac) } => format!("vznat,mac={mac}"),
-            Self::UnixDatagram { path, mac } => format!("unixdg,{},mac={mac}", path.display()),
+            Self::UnixDatagram { path, mac, .. } => {
+                format!("unixdg,{},mac={mac}", path.display())
+            }
         }
     }
 }
@@ -84,7 +75,7 @@ pub(crate) async fn prepare_network_runtime(
         ModelMachineNetworkConfig::Private { policy } => {
             let request = NetworkAttachmentRequest::private(policy.as_ref());
             prepare_with_driver(
-                selected_private_driver(config.private_driver),
+                NetdDriver,
                 &NetworkDriverContext {
                     paths,
                     store,
@@ -149,87 +140,13 @@ async fn resolve_named_network(
     config: &RuntimeNetworkingConfig,
     network_launch: &NetworkLaunch,
 ) -> Result<VmmonNetworkAttachment, LibVmError> {
-    match definition.topology {
-        ModelNetworkTopology::Nat => {
-            let driver = match definition.driver_preference {
-                ModelNetworkDriverPreference::Auto | ModelNetworkDriverPreference::Netd => {
-                    NetworkDriverKind::Netd
-                }
-                ModelNetworkDriverPreference::VzNat => NetworkDriverKind::VzNat,
-            };
-            let request = NetworkAttachmentRequest::named(definition.name.as_str());
-            prepare_with_driver(
-                selected_private_driver(driver),
-                &NetworkDriverContext {
-                    paths,
-                    store,
-                    metadata,
-                    config,
-                    network_launch,
-                },
-                &request,
-            )
-            .await
-        }
-        ModelNetworkTopology::Bridge => Err(LibVmError::NetworkRuntime {
-            reference: metadata.name.clone(),
-            message: format!(
-                "named network {:?} uses bridge mode, which is not implemented yet",
-                definition.name
-            ),
-        }),
-        ModelNetworkTopology::Isolated => Err(LibVmError::NetworkRuntime {
-            reference: metadata.name.clone(),
-            message: format!(
-                "named network {:?} uses isolated mode, which is not implemented yet",
-                definition.name
-            ),
-        }),
-    }
-}
-
-fn selected_private_driver(kind: NetworkDriverKind) -> impl NetworkDriverBackend {
-    match kind {
-        NetworkDriverKind::Netd => SelectedNetworkDriver::Netd(NetdDriver),
-        NetworkDriverKind::VzNat => SelectedNetworkDriver::VzNat(VzNatDriver),
-    }
-}
-
-enum SelectedNetworkDriver {
-    Netd(NetdDriver),
-    VzNat(VzNatDriver),
-}
-
-#[async_trait]
-impl NetworkDriverBackend for SelectedNetworkDriver {
-    fn id(&self) -> &'static str {
-        match self {
-            Self::Netd(driver) => driver.id(),
-            Self::VzNat(driver) => driver.id(),
-        }
-    }
-
-    fn supports(
-        &self,
-        reference: &str,
-        request: &NetworkAttachmentRequest<'_>,
-    ) -> Result<(), LibVmError> {
-        match self {
-            Self::Netd(driver) => driver.supports(reference, request),
-            Self::VzNat(driver) => driver.supports(reference, request),
-        }
-    }
-
-    async fn prepare(
-        &self,
-        ctx: &NetworkDriverContext<'_>,
-        request: &NetworkAttachmentRequest<'_>,
-    ) -> Result<VmmonNetworkAttachment, LibVmError> {
-        match self {
-            Self::Netd(driver) => driver.prepare(ctx, request).await,
-            Self::VzNat(driver) => driver.prepare(ctx, request).await,
-        }
-    }
+    let _ = (paths, store, config, network_launch, definition);
+    Err(LibVmError::NetworkRuntime {
+        reference: metadata.name.clone(),
+        message:
+            "named network launches require the netd attachment API, which is not implemented yet"
+                .to_string(),
+    })
 }
 
 async fn prepare_with_driver(
@@ -296,21 +213,6 @@ fn network_instance_is_alive(instance: &NetworkInstance) -> bool {
         DRIVER_NETD => netd_driver::instance_is_alive(instance),
         _ => false,
     }
-}
-
-pub(super) fn network_attachment_from_instance(
-    instance: &NetworkInstance,
-    mac: String,
-) -> Result<VmmonNetworkAttachment, LibVmError> {
-    let mut attachment: VmmonNetworkAttachment = serde_json::from_str(&instance.attachment_json)
-        .map_err(|err| LibVmError::NetworkRuntime {
-            reference: instance.id.clone(),
-            message: format!("parse network attachment: {err}"),
-        })?;
-    if let VmmonNetworkAttachment::UnixDatagram { mac: existing, .. } = &mut attachment {
-        *existing = mac;
-    }
-    Ok(attachment)
 }
 
 fn terminate_network_instance(instance: &NetworkInstance) -> Result<(), LibVmError> {
@@ -391,10 +293,7 @@ mod tests {
     use crate::store::MockDataStore;
     use crate::{LibVmError, RuntimeNetworkingConfig};
 
-    use super::{
-        ensure_instance_network_link, prepare_network_runtime, reconcile_network_runtime,
-        DRIVER_VZNAT,
-    };
+    use super::{ensure_instance_network_link, prepare_network_runtime, reconcile_network_runtime};
 
     fn machine_config(
         paths: &LocalPaths,
@@ -432,10 +331,10 @@ mod tests {
     fn instance(id: &str, runtime_dir: &std::path::Path) -> NetworkInstance {
         NetworkInstance {
             id: id.to_string(),
-            driver: DRIVER_VZNAT.to_string(),
+            driver: "removed-driver".to_string(),
             definition_name: None,
             runtime_dir: runtime_dir.display().to_string(),
-            attachment_json: r#"{"kind":"vznat"}"#.to_string(),
+            attachment_json: r#"{"kind":"none"}"#.to_string(),
             driver_state_json: "{}".to_string(),
             state: NetworkInstanceState::Running,
             created_at: 1,
@@ -604,7 +503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_named_bridge_network_fails_before_driver_setup() {
+    async fn prepare_named_network_requires_attachment_api() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let paths = LocalPaths::new(temp.path().join("silo"));
         let machine_id = MachineId::new();
@@ -641,12 +540,12 @@ mod tests {
             &crate::NetworkLaunch::default(),
         )
         .await
-        .expect_err("bridge topology should not be implemented yet");
+        .expect_err("named attachment API should be required");
 
         assert!(matches!(
             err,
             LibVmError::NetworkRuntime { ref reference, ref message }
-                if reference == "devbox" && message.contains("bridge mode")
+                if reference == "devbox" && message.contains("attachment API")
         ));
     }
 }

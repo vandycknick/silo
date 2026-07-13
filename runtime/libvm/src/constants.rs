@@ -40,15 +40,6 @@ pub(crate) const GUEST_USER_SHELL: &str = "/bin/bash";
 /// Sudo policy assigned to the provisioned guest user.
 pub(crate) const GUEST_USER_SUDO_RULE: &str = "ALL=(ALL) NOPASSWD:ALL";
 
-/// Driver match used by the guest agent for Virtualization.framework NAT interfaces.
-pub(crate) const VZNAT_MATCH_DRIVER: &str = "virtio_net";
-
-/// Guest network interface name used for Virtualization.framework NAT networking.
-pub(crate) const VZNAT_INTERFACE_NAME: &str = "en";
-
-/// Guest network interface name used for Silo unix datagram networking.
-pub(crate) const UNIX_DATAGRAM_INTERFACE_NAME: &str = "silo";
-
 /// Filesystem type reported to the guest agent for virtiofs mounts.
 pub(crate) const VIRTIOFS_FSTYPE: &str = "virtiofs";
 

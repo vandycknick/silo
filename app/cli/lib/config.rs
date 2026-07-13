@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use eyre::Context as _;
-use libvm::{NetdRuntimeConfig, NetworkDriverKind, RuntimeNetworkingConfig};
+use libvm::{NetdRuntimeConfig, RuntimeNetworkingConfig};
 use serde::Deserialize;
 use serde_yaml_ng::{Mapping, Value};
 
@@ -95,13 +95,6 @@ fn parse_global_config(input: &str) -> eyre::Result<GlobalConfig> {
         .map(|name| validate_default_machine_name(&name).map(|()| name))
         .transpose()?;
 
-    let private_driver = parsed
-        .networking
-        .as_ref()
-        .map(RawNetworkingConfig::parse_private_driver)
-        .transpose()?
-        .flatten()
-        .unwrap_or(NetworkDriverKind::Netd);
     let netd = parsed
         .networking
         .and_then(|networking| networking.drivers.and_then(|drivers| drivers.netd))
@@ -111,9 +104,7 @@ fn parse_global_config(input: &str) -> eyre::Result<GlobalConfig> {
 
     Ok(GlobalConfig {
         default_machine,
-        networking: RuntimeNetworkingConfig::default()
-            .with_private_driver(private_driver)
-            .with_netd(netd),
+        networking: RuntimeNetworkingConfig::default().with_netd(netd),
     })
 }
 
@@ -126,14 +117,7 @@ struct RawGlobalConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawNetworkingConfig {
-    private: Option<RawPrivateNetworkingConfig>,
     drivers: Option<RawNetworkDriversConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawPrivateNetworkingConfig {
-    driver: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,16 +135,6 @@ struct RawNetdConfig {
     tls_ca_key: Option<PathBuf>,
 }
 
-impl RawNetworkingConfig {
-    fn parse_private_driver(&self) -> eyre::Result<Option<NetworkDriverKind>> {
-        self.private
-            .as_ref()
-            .and_then(|private| private.driver.as_deref())
-            .map(parse_network_driver)
-            .transpose()
-    }
-}
-
 impl From<RawNetdConfig> for NetdRuntimeConfig {
     fn from(raw: RawNetdConfig) -> Self {
         let mut config = Self::default();
@@ -173,16 +147,6 @@ impl From<RawNetdConfig> for NetdRuntimeConfig {
         config.tls_ca_cert = raw.tls_ca_cert;
         config.tls_ca_key = raw.tls_ca_key;
         config
-    }
-}
-
-fn parse_network_driver(value: &str) -> eyre::Result<NetworkDriverKind> {
-    match value {
-        "netd" => Ok(NetworkDriverKind::Netd),
-        "vznat" => Ok(NetworkDriverKind::VzNat),
-        other => Err(eyre::eyre!(
-            "invalid network driver {other:?}, expected netd or vznat"
-        )),
     }
 }
 

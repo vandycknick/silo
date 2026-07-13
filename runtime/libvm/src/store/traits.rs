@@ -157,14 +157,6 @@ pub(crate) trait NetworkStore: std::fmt::Debug + Send + Sync {
     /// foreign-key cascade.
     async fn remove_network_instance(&self, network_id: &str) -> Result<(), LibVmError>;
 
-    /// Reads the unique runtime instance for a named network definition.
-    ///
-    /// The schema enforces at most one non-null `definition_name` row.
-    async fn network_instance_by_definition(
-        &self,
-        definition_name: &str,
-    ) -> Result<Option<NetworkInstance>, LibVmError>;
-
     /// Counts current machine attachments to a network runtime instance.
     async fn network_attachment_count(&self, network_id: &str) -> Result<u32, LibVmError>;
 

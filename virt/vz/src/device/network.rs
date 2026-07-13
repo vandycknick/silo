@@ -8,8 +8,8 @@ use nix::sys::socket::{setsockopt, sockopt};
 use objc2::{rc::Retained, AllocAnyThread, ClassType};
 use objc2_foundation::{NSFileHandle, NSString};
 use objc2_virtualization::{
-    VZFileHandleNetworkDeviceAttachment, VZMACAddress, VZNATNetworkDeviceAttachment,
-    VZNetworkDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
+    VZFileHandleNetworkDeviceAttachment, VZMACAddress, VZNetworkDeviceConfiguration,
+    VZVirtioNetworkDeviceConfiguration,
 };
 use utils::format_mac;
 
@@ -27,15 +27,6 @@ pub struct NetworkDeviceConfiguration {
 }
 
 impl NetworkDeviceConfiguration {
-    pub fn nat() -> Self {
-        unsafe {
-            let inner = VZVirtioNetworkDeviceConfiguration::new();
-            let attachment = VZNATNetworkDeviceAttachment::new();
-            inner.setAttachment(Some(attachment.as_super()));
-            Self { inner }
-        }
-    }
-
     pub fn unix_datagram_file_handle(
         socket: impl IntoRawFd,
         mac: [u8; 6],

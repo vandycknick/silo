@@ -717,30 +717,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_instance_by_definition_returns_unique_named_instance() {
-        let (_dir, paths) = temp_paths();
-        let db = Store::new(&paths).await.expect("open db");
-        let instance = network_instance("devnet-runtime", Some("devnet"));
-
-        assert!(db
-            .network_instance_by_definition("devnet")
-            .await
-            .expect("lookup missing definition")
-            .is_none());
-        db.save_network_instance(&instance)
-            .await
-            .expect("save named network instance");
-
-        assert_eq!(
-            db.network_instance_by_definition("devnet")
-                .await
-                .expect("lookup definition")
-                .expect("definition instance exists"),
-            instance
-        );
-    }
-
-    #[tokio::test]
     async fn remove_network_instance_cascades_network_attachment() {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.expect("open db");
@@ -837,7 +813,7 @@ mod tests {
         let beta = network_definition(
             "beta-net",
             NetworkTopology::Nat,
-            NetworkDriverPreference::VzNat,
+            NetworkDriverPreference::Auto,
         );
 
         db.define_network(&beta).await.expect("define beta network");

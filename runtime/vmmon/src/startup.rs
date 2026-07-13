@@ -197,10 +197,6 @@ fn parse_network_arg(value: &str) -> eyre::Result<RuntimeNetwork> {
     let parts = value.split(',').collect::<Vec<_>>();
     match parts.as_slice() {
         ["none"] => Ok(RuntimeNetwork::None),
-        ["vznat"] => Ok(RuntimeNetwork::VzNat { mac: None }),
-        ["vznat", option] => Ok(RuntimeNetwork::VzNat {
-            mac: Some(parse_key_value(option, "mac")?.to_string()),
-        }),
         ["unixdg", path, mac] => Ok(RuntimeNetwork::UnixDatagram {
             path: PathBuf::from(path),
             mac: parse_key_value(mac, "mac")?.to_string(),
@@ -272,6 +268,7 @@ fn set_cloexec(fd: RawFd, enabled: bool) -> io::Result<()> {
 mod tests {
     use std::io::{Read, Write};
     use std::os::fd::IntoRawFd;
+    use std::path::PathBuf;
 
     use nix::unistd::pipe;
 
@@ -325,6 +322,7 @@ mod tests {
 
     #[test]
     fn network_parser_rejects_unsupported_runtime_attachments() {
+        assert!(parse_network_arg("vznat").is_err());
         assert!(parse_network_arg("unixstream,/tmp/net.sock,mac=02:00:00:00:00:01").is_err());
         assert!(parse_network_arg("tap,tap0,mac=02:00:00:00:00:01").is_err());
     }
@@ -333,9 +331,10 @@ mod tests {
     fn network_parser_accepts_supported_runtime_attachments() {
         assert_eq!(parse_network_arg("none").unwrap(), RuntimeNetwork::None);
         assert_eq!(
-            parse_network_arg("vznat,mac=02:00:00:00:00:01").unwrap(),
-            RuntimeNetwork::VzNat {
-                mac: Some("02:00:00:00:00:01".to_string())
+            parse_network_arg("unixdg,/tmp/net.sock,mac=02:00:00:00:00:01").unwrap(),
+            RuntimeNetwork::UnixDatagram {
+                path: PathBuf::from("/tmp/net.sock"),
+                mac: "02:00:00:00:00:01".to_string()
             }
         );
     }

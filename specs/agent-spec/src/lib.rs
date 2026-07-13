@@ -1,3 +1,5 @@
+use std::net::{IpAddr, Ipv4Addr};
+
 use serde::{Deserialize, Serialize};
 
 /// Default guest readiness timeout used when agent integration is enabled.
@@ -68,20 +70,8 @@ impl AgentConfig {
             validate_absolute_path(&authority.path, "certificate authority path")?;
             validate_nonempty(&authority.pem, "certificate authority pem")?;
         }
-        validate_unique_nonempty(
-            self.provision
-                .network
-                .interfaces
-                .iter()
-                .map(|interface| interface.name.as_str()),
-            "network interface name",
-        )?;
-        for interface in &self.provision.network.interfaces {
-            if interface.matches.driver.is_none() && interface.matches.mac_address.is_none() {
-                return Err(AgentConfigError::new(
-                    "network interface requires a driver or MAC address match",
-                ));
-            }
+        if let Some(network) = &self.provision.network {
+            validate_network_config(network)?;
         }
         validate_unique_nonempty(
             self.provision.mounts.iter().map(|mount| mount.tag.as_str()),
@@ -154,6 +144,99 @@ fn validate_unique_nonempty<'a>(
     Ok(())
 }
 
+fn validate_network_config(network: &NetworkConfig) -> Result<(), AgentConfigError> {
+    if network.interfaces.len() != 1 {
+        return Err(AgentConfigError::new(
+            "provision.network must contain exactly one interface",
+        ));
+    }
+
+    let interface = &network.interfaces[0];
+    let mac = parse_mac_address(&interface.mac_address)?;
+    if mac.iter().all(|byte| *byte == 0) || mac[0] & 1 != 0 {
+        return Err(AgentConfigError::new(
+            "provision.network interface MAC address must be nonzero unicast",
+        ));
+    }
+
+    let ipv4 = &interface.ipv4;
+    if !(1..=30).contains(&ipv4.prefix_length) {
+        return Err(AgentConfigError::new(
+            "provision.network IPv4 prefix_length must be between 1 and 30",
+        ));
+    }
+    validate_usable_ipv4(ipv4.address, "provision.network IPv4 address")?;
+    validate_usable_ipv4(ipv4.gateway, "provision.network IPv4 gateway")?;
+    if ipv4.address == ipv4.gateway {
+        return Err(AgentConfigError::new(
+            "provision.network IPv4 address and gateway must differ",
+        ));
+    }
+    let mask = u32::MAX << (32 - ipv4.prefix_length);
+    if u32::from(ipv4.address) & mask != u32::from(ipv4.gateway) & mask {
+        return Err(AgentConfigError::new(
+            "provision.network IPv4 address and gateway must share a subnet",
+        ));
+    }
+
+    if interface.dns.servers.is_empty() {
+        return Err(AgentConfigError::new(
+            "provision.network DNS requires at least one server",
+        ));
+    }
+    for domain in &interface.dns.search {
+        validate_nonempty(domain, "provision.network DNS search domain")?;
+        if domain.len() > 253
+            || domain
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(AgentConfigError::new(
+                "provision.network DNS search domain is invalid",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_mac_address(value: &str) -> Result<[u8; 6], AgentConfigError> {
+    let mut mac = [0_u8; 6];
+    let mut parts = value.split(':');
+    for byte in &mut mac {
+        let part = parts.next().ok_or_else(|| {
+            AgentConfigError::new("provision.network interface MAC address is invalid")
+        })?;
+        if part.len() != 2 {
+            return Err(AgentConfigError::new(
+                "provision.network interface MAC address is invalid",
+            ));
+        }
+        *byte = u8::from_str_radix(part, 16).map_err(|_| {
+            AgentConfigError::new("provision.network interface MAC address is invalid")
+        })?;
+    }
+    if parts.next().is_some() {
+        return Err(AgentConfigError::new(
+            "provision.network interface MAC address is invalid",
+        ));
+    }
+    Ok(mac)
+}
+
+fn validate_usable_ipv4(address: Ipv4Addr, field: &str) -> Result<(), AgentConfigError> {
+    if address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || address == Ipv4Addr::BROADCAST
+    {
+        return Err(AgentConfigError::new(format!(
+            "{field} must be a usable unicast address"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSshConfig {
@@ -188,8 +271,8 @@ pub struct ProvisionConfig {
     pub users: Vec<UserConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate_authority: Option<CertificateAuthorityConfig>,
-    #[serde(default)]
-    pub network: NetworkConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkConfig>,
     #[serde(default)]
     pub rosetta: AgentRosettaConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -230,7 +313,6 @@ pub struct CertificateAuthorityConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<NetworkInterfaceConfig>,
 }
 
@@ -266,22 +348,26 @@ fn default_rosetta_mount_path() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkInterfaceConfig {
-    pub name: String,
-    #[serde(default)]
-    pub matches: NetworkMatchConfig,
-    #[serde(default)]
-    pub dhcp4: bool,
-    #[serde(default)]
-    pub dhcp6: bool,
+    pub mac_address: String,
+    pub ipv4: NetworkIpv4Config,
+    pub dns: NetworkDnsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkIpv4Config {
+    pub address: Ipv4Addr,
+    pub prefix_length: u8,
+    pub gateway: Ipv4Addr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
-pub struct NetworkMatchConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub driver: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mac_address: Option<String>,
+pub struct NetworkDnsConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<IpAddr>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub search: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -364,8 +450,9 @@ mod tests {
     use crate::{
         AgentConfig, AgentForwardConfig, AgentRosettaConfig, AgentSshAuthorizedUser,
         AgentSshConfig, AgentUdsForwardConfig, CertificateAuthorityConfig, MountConfig,
-        NetworkConfig, NetworkInterfaceConfig, NetworkMatchConfig, ProvisionConfig,
-        ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType, UserdataRunPolicy,
+        NetworkConfig, NetworkDnsConfig, NetworkInterfaceConfig, NetworkIpv4Config,
+        ProvisionConfig, ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType,
+        UserdataRunPolicy,
     };
 
     #[test]
@@ -378,7 +465,7 @@ mod tests {
         assert_eq!(config.provision.rosetta.mount_tag, "silo-rosetta");
         assert_eq!(config.provision.rosetta.mount_path, "/mnt/silo-rosetta");
         assert!(config.provision.users.is_empty());
-        assert!(config.provision.network.interfaces.is_empty());
+        assert!(config.provision.network.is_none());
         assert!(config.ssh.authorized_users.is_empty());
     }
 
@@ -462,17 +549,20 @@ provision:
                         .to_string(),
                     update_trust: true,
                 }),
-                network: NetworkConfig {
+                network: Some(NetworkConfig {
                     interfaces: vec![NetworkInterfaceConfig {
-                        name: "silo".to_string(),
-                        matches: NetworkMatchConfig {
-                            driver: Some("virtio_net".to_string()),
-                            mac_address: Some("02:00:00:00:00:01".to_string()),
+                        mac_address: "02:00:00:00:00:01".to_string(),
+                        ipv4: NetworkIpv4Config {
+                            address: "192.168.105.2".parse().expect("IPv4 address"),
+                            prefix_length: 24,
+                            gateway: "192.168.105.1".parse().expect("IPv4 gateway"),
                         },
-                        dhcp4: true,
-                        dhcp6: true,
+                        dns: NetworkDnsConfig {
+                            servers: vec!["192.168.105.1".parse().expect("DNS server")],
+                            search: Vec::new(),
+                        },
                     }],
-                },
+                }),
                 rosetta: AgentRosettaConfig {
                     enabled: true,
                     ..AgentRosettaConfig::default()
@@ -518,5 +608,121 @@ provision:
         let error = config.validate().expect_err("invalid forward config");
 
         assert!(error.to_string().contains("forward.port"));
+    }
+
+    #[test]
+    fn validation_accepts_absent_network() {
+        AgentConfig::default()
+            .validate()
+            .expect("absent networking should be valid");
+    }
+
+    #[test]
+    fn validation_rejects_empty_network() {
+        let config = AgentConfig {
+            provision: ProvisionConfig {
+                network: Some(NetworkConfig::default()),
+                ..ProvisionConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+
+        let error = config.validate().expect_err("empty networking must fail");
+        assert!(error.to_string().contains("exactly one interface"));
+    }
+
+    #[test]
+    fn validation_rejects_gateway_outside_interface_subnet() {
+        let config = AgentConfig {
+            provision: ProvisionConfig {
+                network: Some(NetworkConfig {
+                    interfaces: vec![NetworkInterfaceConfig {
+                        mac_address: "02:00:00:00:00:01".to_string(),
+                        ipv4: NetworkIpv4Config {
+                            address: "192.168.105.2".parse().expect("IPv4 address"),
+                            prefix_length: 24,
+                            gateway: "192.168.106.1".parse().expect("IPv4 gateway"),
+                        },
+                        dns: NetworkDnsConfig {
+                            servers: vec!["192.168.105.1".parse().expect("DNS server")],
+                            search: Vec::new(),
+                        },
+                    }],
+                }),
+                ..ProvisionConfig::default()
+            },
+            ..AgentConfig::default()
+        };
+
+        let error = config
+            .validate()
+            .expect_err("gateway outside subnet must fail");
+        assert!(error.to_string().contains("share a subnet"));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_network_mac_prefix_and_search_domain() {
+        let mut network = valid_network_config();
+        network.interfaces[0].mac_address = "01:00:00:00:00:01".to_string();
+        assert!(network_error(network).contains("nonzero unicast"));
+
+        let mut network = valid_network_config();
+        network.interfaces[0].ipv4.prefix_length = 31;
+        assert!(network_error(network).contains("between 1 and 30"));
+
+        let mut network = valid_network_config();
+        network.interfaces[0].dns.search = vec!["bad domain".to_string()];
+        assert!(network_error(network).contains("search domain is invalid"));
+    }
+
+    #[test]
+    fn deserialization_rejects_non_ip_dns_server() {
+        let json = r#"{
+            "provision": {
+                "network": {
+                    "interfaces": [{
+                        "mac_address": "02:00:00:00:00:01",
+                        "ipv4": {
+                            "address": "192.168.105.2",
+                            "prefix_length": 24,
+                            "gateway": "192.168.105.1"
+                        },
+                        "dns": { "servers": ["not-an-ip"] }
+                    }]
+                }
+            }
+        }"#;
+
+        serde_json::from_str::<AgentConfig>(json).expect_err("invalid DNS server must fail");
+    }
+
+    fn valid_network_config() -> NetworkConfig {
+        NetworkConfig {
+            interfaces: vec![NetworkInterfaceConfig {
+                mac_address: "02:00:00:00:00:01".to_string(),
+                ipv4: NetworkIpv4Config {
+                    address: "192.168.105.2".parse().expect("IPv4 address"),
+                    prefix_length: 24,
+                    gateway: "192.168.105.1".parse().expect("IPv4 gateway"),
+                },
+                dns: NetworkDnsConfig {
+                    servers: vec!["192.168.105.1".parse().expect("DNS server")],
+                    search: Vec::new(),
+                },
+            }],
+        }
+    }
+
+    fn network_error(network: NetworkConfig) -> String {
+        AgentConfig {
+            provision: ProvisionConfig {
+                network: Some(network),
+                ..ProvisionConfig::default()
+            },
+            ..AgentConfig::default()
+        }
+        .validate()
+        .expect_err("network config must fail")
+        .to_string()
     }
 }

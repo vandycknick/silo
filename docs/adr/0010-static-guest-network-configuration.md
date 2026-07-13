@@ -4,7 +4,7 @@ Date: 2026-07-11
 
 ## Status
 
-Draft
+Accepted
 
 ## The Problem
 
@@ -32,10 +32,11 @@ The intended launch flow is:
 MachineNetworkConfig
   -> libvm prepares an attachment with netd
   -> libvm passes the data socket and MAC to vmmon through --network
-  -> libvm adds the static guest settings to AgentConfig
+  -> libvm adds the static guest settings to AgentConfig.provision.network
   -> ADR 0009 injects AgentConfig into the per-launch initramfs
   -> vmmon attaches the virtual NIC
-  -> the agent configures the interface before init handoff
+  -> the agent performs any PID 1 handoff and connects to vmmon
+  -> static networking runs as the first configured provisioner
 ```
 
 There is no post-boot configuration exchange in this path. Network settings are
@@ -60,25 +61,25 @@ existing `--network` argument. `VmSpec` remains unchanged. Replacing
 `--network` with another launch contract is outside this ADR.
 
 `libvm` places the guest-visible address, prefix, gateway, MAC address, and DNS
-settings in a dedicated network section of `AgentConfig`. ADR 0009 carries that
-configuration into the guest before boot. Host paths and `netd` control details
-never enter `AgentConfig`.
+settings in the optional `AgentConfig.provision.network` section. ADR 0009
+carries that configuration into the guest before boot. Host paths and `netd`
+control details never enter `AgentConfig`.
 
 The agent applies the static configuration directly through Linux networking
-interfaces before target-init handoff. It does not invoke `systemctl`,
+interfaces as its first provisioner. It does not invoke `systemctl`,
 `networkctl`, `ip`, a DHCP client, or distribution-specific scripts. It also
 replaces `/etc/resolv.conf` with the configured resolver settings.
 
-Network setup is an early-boot operation, not continuous reconciliation. Once
-the agent hands off to the target init system, later guest software may change
-the interface. Silo does not attempt to compete with a network manager started
-by the image.
+Network setup is a boot provisioning operation, not continuous reconciliation.
+It runs after any target-init handoff, so target software may already be running
+and may later change the interface. Silo does not attempt to continuously
+compete with a network manager started by the image.
 
 The first implementation supports one IPv4 attachment. IPv6 and multiple guest
 NICs remain future work.
 
 `vznat` cannot provide the resolved attachment needed by this model and does not
-support Silo network policy. It will be removed, leaving `netd` as the managed
+support Silo network policy. It is removed, leaving `netd` as the managed
 network implementation.
 
 ## Responsibilities
@@ -88,7 +89,7 @@ network implementation.
 | `libvm` | Resolve durable network selection, orchestrate `netd`, pass the existing `--network` argument, and build `AgentConfig`. |
 | `netd` | Validate attachments, allocate named-network addresses, reserve address-to-MAC mappings, and provide VM data sockets. |
 | `vmmon` | Attach the virtual NIC using the data socket and MAC supplied through `--network`. |
-| Guest agent | Apply the injected static address, route, and DNS configuration before init handoff. |
+| Guest agent | Apply the optional injected static address, route, and DNS configuration as the first provisioner. |
 
 The resolved attachment is an internal `libvm` value. It is broader than the
 current `vmmon` network argument because it also carries guest configuration.
@@ -106,6 +107,10 @@ Private mode does not need a control API because its attachment is fixed for
 the process lifetime.
 
 ## Named Networks
+
+Named attachment support is a later phase. Until the control API below exists,
+`libvm` rejects named-network launches rather than reusing one data socket across
+VMs. Named-network definitions remain available for management.
 
 A named network has one `netd` process and may have multiple VM attachments.
 Its local control API creates, inspects, and removes attachments. Creating an
@@ -169,38 +174,43 @@ limits, errors, persistence, and restart behavior remain open.
 
 ## Agent Network Configuration
 
-The network section of `AgentConfig` is independent from general guest
-provisioning. Disabling hostname, user, mount, or userdata provisioning must not
-disable required early network setup.
+Networking is an optional part of guest provisioning. Disabling provisioning
+also disables static network setup. When networking is configured, its
+provisioner runs before hostname, user, mount, and userdata provisioning.
 
 The initial shape is:
 
 ```json
 {
-  "network": {
-    "interfaces": [
-      {
-        "mac_address": "02:29:7e:41:67:c5",
-        "ipv4": {
-          "address": "192.168.105.2",
-          "prefix_length": 24,
-          "gateway": "192.168.105.1"
-        },
-        "dns": {
-          "servers": ["192.168.105.1"],
-          "search": []
+  "provision": {
+    "enabled": true,
+    "network": {
+      "interfaces": [
+        {
+          "mac_address": "02:29:7e:41:67:c5",
+          "ipv4": {
+            "address": "192.168.105.2",
+            "prefix_length": 24,
+            "gateway": "192.168.105.1"
+          },
+          "dns": {
+            "servers": ["192.168.105.1"],
+            "search": []
+          }
         }
-      }
-    ]
+      ]
+    }
   }
 }
 ```
 
-`network` is a top-level section. If it is absent, the agent leaves guest
-networking untouched. The first implementation accepts exactly one interface,
-identifies it by MAC address, and configures static IPv4. Host socket paths,
-attachment identifiers, network drivers, image-dependent interface names, and
-DHCP flags are not guest configuration and do not appear here.
+If `provision.network` is absent, no network provisioner is registered and the
+agent leaves guest networking and `/etc/resolv.conf` untouched. This is the
+normal shape for a machine started without a network attachment. The first
+implementation accepts exactly one interface, identifies it by MAC address, and
+configures static IPv4. Host socket paths, attachment identifiers, network
+drivers, image-dependent interface names, and DHCP flags are not guest
+configuration and do not appear here.
 
 The exact validation bounds, schema evolution rules, and error vocabulary are
 not settled by this draft.
@@ -208,7 +218,7 @@ not settled by this draft.
 ## Guest Setup
 
 When static network configuration is present, the agent performs the following
-work before target-init handoff:
+work as its first provisioner:
 
 1. Find the interface with the configured MAC address.
 2. Bring the link up.
@@ -216,39 +226,49 @@ work before target-init handoff:
 4. Install the default route through the configured gateway.
 5. Replace `/etc/resolv.conf` with the configured DNS values.
 
-The agent talks to the Linux kernel directly for link, address, and route
-configuration. This keeps the boot contract independent from the tools and init
-system available in the image.
+The agent uses `rtnetlink` to talk to the Linux kernel directly for link,
+address, and route configuration. This keeps the boot contract independent from
+the tools and init system available in the image.
 
-The detailed replacement and rollback behavior remains open. At minimum, a
-managed boot must not report ready when required static network setup failed.
+Resolver configuration is written to a temporary file and atomically renamed
+over `/etc/resolv.conf`. This replaces an existing symlink rather than changing
+its target. A read-only or otherwise non-replaceable resolver path fails the
+network provisioner.
+
+The provisioner does not attempt to roll back partial kernel changes. Any link,
+address, route, or resolver error uses the `FailBoot` policy, reports the failed
+step to vmmon, and prevents the managed boot from reporting ready.
 
 ## netd Cleanup
 
 The existing upstream defaults are not part of the new attachment model. `netd`
-will remove its implicit SSH forwarding, the associated `--ssh-port` option,
-and the static lease for the upstream default guest MAC. Managed address-to-MAC
-reservations will come only from explicit attachments.
+removes its implicit SSH forwarding, the associated `--ssh-port` option, and the
+static lease for the upstream default guest MAC. Managed address-to-MAC
+reservations come only from explicit attachments.
 
-The exact persistence migration and removal sequence for existing `vznat`
-definitions and runtime records remains implementation work.
+Persisted named-network `vznat` preferences are migrated to `netd`. Obsolete
+`vznat` runtime records are removed with their attachment rows through the
+existing foreign-key cascade.
 
 ## Consequences
 
 ### Benefits
 
-- Guests have an address before their target init system starts.
+- Guests receive a deterministic address during managed provisioning.
 - Boot does not depend on DHCP clients or distribution-specific network tools.
 - The host knows the expected guest address before boot.
-- Private and named networks produce one conceptual attachment shape.
+- Private networks produce a resolved attachment shape that named networks can
+  adopt when their control API is implemented.
 - `vmmon` keeps its existing narrow network boundary.
 - Guest configuration remains an immutable launch input under ADR 0009.
-- Plain OCI images can have networking while the agent remains PID 1.
+- Plain OCI images can have networking without distribution-specific tools.
 
 ### Tradeoffs
 
 - The guest agent takes responsibility for low-level Linux network setup.
 - Replacing `/etc/resolv.conf` may override conventions expected by an image.
+- Target init and its network manager may start before static provisioning runs.
+- Disabling provisioning also disables managed static networking.
 - A network manager started later by the image may replace the injected state.
 - Named networks require a new local control surface and attachment lifecycle.
 - Removing `vznat` removes a backend that is convenient but too opaque for this
@@ -283,15 +303,11 @@ contract without a current consumer.
 
 ## Open Questions
 
-This draft intentionally leaves these details unresolved:
+The following extensions remain unresolved:
 
-- `AgentConfig` validation bounds, schema evolution, and error reporting.
 - Named-network API idempotency, limits, errors, persistence, and recovery.
-- Private and named address allocation details.
-- Attachment persistence, restart recovery, and rollback behavior.
-- The Linux rtnetlink implementation and supporting Rust API.
-- Resolver replacement behavior for symlinks and read-only roots.
-- Migration behavior for existing `vznat` configuration.
+- Named-network address allocation and per-attachment data sockets.
+- Restart recovery for persisted private attachments.
 - IPv6 and multiple guest interfaces.
 
 ## References

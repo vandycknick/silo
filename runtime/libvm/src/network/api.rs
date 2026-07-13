@@ -161,17 +161,6 @@ impl From<models::MachineNetworkConfig> for MachineNetworkConfig {
     }
 }
 
-/// Network driver implementation kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum NetworkDriverKind {
-    /// netd-based networking.
-    Netd,
-    /// Virtualization.framework NAT networking.
-    VzNat,
-}
-
 /// Connectivity topology for a named network definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -195,8 +184,6 @@ pub enum NetworkDriver {
     Auto,
     /// Prefer netd.
     Netd,
-    /// Prefer Virtualization.framework NAT.
-    VzNat,
 }
 
 /// Public configuration for a named network.
@@ -249,13 +236,7 @@ impl NetworkDefinition {
 
     /// Validates this definition before storing it.
     pub fn validate(&self) -> Result<(), String> {
-        validate_network_name(&self.name)?;
-        if matches!(self.driver, NetworkDriver::VzNat)
-            && !matches!(self.topology, NetworkTopology::Nat)
-        {
-            return Err("vznat only supports nat networks".to_string());
-        }
-        Ok(())
+        validate_network_name(&self.name)
     }
 }
 
@@ -326,7 +307,6 @@ impl From<NetworkDriver> for models::NetworkDriverPreference {
         match value {
             NetworkDriver::Auto => Self::Auto,
             NetworkDriver::Netd => Self::Netd,
-            NetworkDriver::VzNat => Self::VzNat,
         }
     }
 }
@@ -336,7 +316,6 @@ impl From<models::NetworkDriverPreference> for NetworkDriver {
         match value {
             models::NetworkDriverPreference::Auto => Self::Auto,
             models::NetworkDriverPreference::Netd => Self::Netd,
-            models::NetworkDriverPreference::VzNat => Self::VzNat,
         }
     }
 }
@@ -346,27 +325,16 @@ mod tests {
     use super::{NetworkDefinition, NetworkDriver, NetworkTopology};
 
     #[test]
-    fn vznat_driver_allows_nat_named_networks() {
+    fn netd_driver_allows_nat_named_networks() {
         let definition = NetworkDefinition {
             name: "devnet".to_string(),
             topology: NetworkTopology::Nat,
-            driver: NetworkDriver::VzNat,
+            driver: NetworkDriver::Netd,
         };
 
         definition
             .validate()
-            .expect("vznat should allow nat networks");
-    }
-
-    #[test]
-    fn vznat_driver_rejects_non_nat_named_networks() {
-        let definition = NetworkDefinition {
-            name: "devnet".to_string(),
-            topology: NetworkTopology::Bridge,
-            driver: NetworkDriver::VzNat,
-        };
-
-        assert!(definition.validate().is_err());
+            .expect("netd should allow nat network definitions");
     }
 
     #[test]

@@ -2,7 +2,6 @@ use std::env::consts::OS;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-use crate::network::NetworkDriverKind;
 use crate::paths::{resolve_default_data_dir, resolve_default_run_dir, LocalPaths, LocalRoots};
 use crate::store::models::DbConfig;
 use crate::LibVmError;
@@ -262,37 +261,19 @@ impl Default for RuntimeConfig {
 }
 
 /// Networking configuration for the local runtime.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct RuntimeNetworkingConfig {
-    /// Driver used for private machine networks.
-    pub private_driver: NetworkDriverKind,
     /// Directory containing network policy configuration files.
     pub policy_config_dir: Option<PathBuf>,
     /// netd-specific runtime configuration.
     pub netd: NetdRuntimeConfig,
 }
 
-impl Default for RuntimeNetworkingConfig {
-    fn default() -> Self {
-        Self {
-            private_driver: NetworkDriverKind::Netd,
-            policy_config_dir: None,
-            netd: NetdRuntimeConfig::default(),
-        }
-    }
-}
-
 impl RuntimeNetworkingConfig {
     /// Creates runtime networking config with defaults.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Sets the driver used for private machine networks.
-    pub fn with_private_driver(mut self, private_driver: NetworkDriverKind) -> Self {
-        self.private_driver = private_driver;
-        self
     }
 
     /// Sets the directory containing policy files.

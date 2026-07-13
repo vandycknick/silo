@@ -20,7 +20,7 @@ mod ca;
 mod hostname;
 mod locale;
 mod mounts;
-mod networkd;
+mod network;
 mod resize;
 mod rosetta;
 mod service_manager;
@@ -77,8 +77,12 @@ fn provisioners<'a>(
     config: &'a ProvisionConfig,
     ssh_config: &'a AgentSshConfig,
 ) -> eyre::Result<ProvisionerPlan<'a>> {
-    ProvisionerPlan::new(vec![
-        Box::new(hostname::Hostname::init(&config.hostname)),
+    let mut provisioners: Vec<BoxedProvisioner<'a>> = Vec::new();
+    if let Some(network) = &config.network {
+        provisioners.push(Box::new(network::Network::init(network)));
+    }
+    provisioners.extend([
+        Box::new(hostname::Hostname::init(&config.hostname)) as BoxedProvisioner<'a>,
         Box::new(timezone::Timezone::init(&config.timezone)),
         Box::new(locale::Locale::init(&config.locale)),
         Box::new(user::Users::init(&config.users)),
@@ -89,9 +93,9 @@ fn provisioners<'a>(
         Box::new(resize::ResizeRootfs::init(&config.resize_rootfs)),
         Box::new(mounts::Mounts::init(&config.mounts)),
         Box::new(rosetta::Rosetta::init(&config.rosetta)),
-        Box::new(networkd::Networkd::init(&config.network)),
         Box::new(userdata::Userdata::init(&config.userdata)),
-    ])
+    ]);
+    ProvisionerPlan::new(provisioners)
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -107,7 +111,7 @@ impl ProvisionerId {
     const RESIZE_ROOTFS: Self = Self("resize_rootfs");
     const MOUNTS: Self = Self("mounts");
     const ROSETTA: Self = Self("rosetta");
-    const NETWORKD: Self = Self("networkd");
+    const NETWORK: Self = Self("network");
     const USERDATA: Self = Self("userdata");
 
     fn as_str(self) -> &'static str {
@@ -533,6 +537,15 @@ impl ProvisionContext {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            process_supervisor: ProcessSupervisor::default(),
+            service_manager: ServiceManagerState::detect(&BootMode::Standard),
+        }
+    }
+
     pub(crate) fn guest_path(&self, path: &str) -> PathBuf {
         let path = path.strip_prefix('/').unwrap_or(path);
         self.root.join(path)
@@ -712,8 +725,10 @@ pub(crate) fn sanitize_unit_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::net::IpAddr;
     use std::time::Instant;
 
+    use agent_spec::{NetworkConfig, NetworkDnsConfig, NetworkInterfaceConfig, NetworkIpv4Config};
     use eyre::{eyre, WrapErr};
     use protocol::v1::{ProvisionFailurePolicy, ProvisionOverallStatus, ProvisionStepStatus};
 
@@ -1068,5 +1083,46 @@ mod tests {
         let ssh_config = agent_spec::AgentSshConfig::default();
 
         provisioners(&config, &ssh_config).expect("built-in provisioner plan should be valid");
+    }
+
+    #[test]
+    fn network_provisioner_is_absent_without_network_config() {
+        let config = agent_spec::ProvisionConfig::default();
+        let ssh_config = agent_spec::AgentSshConfig::default();
+
+        let plan = provisioners(&config, &ssh_config).expect("build provisioner plan");
+
+        assert!(plan
+            .provisioners
+            .iter()
+            .all(|provisioner| provisioner.id() != ProvisionerId::NETWORK));
+    }
+
+    #[test]
+    fn network_provisioner_is_first_and_fails_boot() {
+        let config = agent_spec::ProvisionConfig {
+            network: Some(NetworkConfig {
+                interfaces: vec![NetworkInterfaceConfig {
+                    mac_address: "02:00:00:00:00:02".to_string(),
+                    ipv4: NetworkIpv4Config {
+                        address: "192.168.105.2".parse().expect("IPv4 address"),
+                        prefix_length: 24,
+                        gateway: "192.168.105.1".parse().expect("IPv4 gateway"),
+                    },
+                    dns: NetworkDnsConfig {
+                        servers: vec![IpAddr::V4("192.168.105.1".parse().expect("DNS server"))],
+                        search: Vec::new(),
+                    },
+                }],
+            }),
+            ..agent_spec::ProvisionConfig::default()
+        };
+        let ssh_config = agent_spec::AgentSshConfig::default();
+
+        let plan = provisioners(&config, &ssh_config).expect("build provisioner plan");
+        let network = plan.provisioners.first().expect("network provisioner");
+
+        assert_eq!(network.id(), ProvisionerId::NETWORK);
+        assert_eq!(network.failure_policy(), FailurePolicy::FailBoot);
     }
 }
