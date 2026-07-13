@@ -20,3 +20,8 @@ Silo needs an online-growable ext4 profile that uses the classic
 `sparse_super` layout plus `resize_inode`, with the matching backup superblock,
 group descriptor, and reserved GDT metadata. Do not solve this by flipping
 feature bits without writing the corresponding on-disk structures.
+
+The fork now also creates an internal JBD2 journal and can grow its own clean,
+unmounted images in userspace. The host grower follows Linux's ext4 group-add,
+resize-inode, and sparse-backup invariants. Dirty journal recovery remains the
+kernel's job; Silo falls back to mounted online growth after replay.

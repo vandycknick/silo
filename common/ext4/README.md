@@ -1,6 +1,6 @@
 # ext4
 
-Pure-Rust ext4 filesystem formatter and reader for Silo root disks.
+Pure-Rust ext4 filesystem formatter, reader, and offline grower for Silo root disks.
 
 No kernel mount. No FUSE. No C dependencies.
 
@@ -20,6 +20,8 @@ The formatter now emits classic Linux-growable ext4 metadata: `sparse_super` plu
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | **Formatter**           | Create ext4 images from scratch: superblock, group descriptors, inode table, bitmaps, extent trees, and online-resize metadata |
 | **Reader**              | Open existing ext4 images: path resolution, symlink following, file reading                                                    |
+| **Offline Grower**      | Grow clean, unmounted Silo ext4 images without host e2fsprogs                                                                  |
+| **Journal**             | Internal JBD2 journal for kernel crash recovery                                                                                |
 | **OCI Unpack**          | Stream tar layers directly into ext4 with full OCI whiteout support                                                            |
 | **Extended Attributes** | Inline and block-level xattrs with name compression                                                                            |
 | **Hard Links**          | Correct reference counting with deferred block reclamation                                                                     |
@@ -69,6 +71,21 @@ let data = reader.read_file("/etc/hostname", 0, None)?;
 assert_eq!(&data, b"silo\n");
 ```
 
+### Grow an ext4 image
+
+```rust
+let target = 64 * 1024 * 1024 * 1024;
+std::fs::OpenOptions::new()
+    .write(true)
+    .open("rootfs.ext4")?
+    .set_len(target)?;
+ext4::grow_image(std::path::Path::new("rootfs.ext4"), target)?;
+```
+
+Offline growth requires exclusive access and a clean journal. After an unclean
+shutdown, boot the image so Linux can replay JBD2 and use the mounted online
+resize path instead.
+
 ### Unpack OCI layers
 
 ```rust
@@ -105,7 +122,7 @@ Internally, the formatter writes data sequentially and computes the final metada
 1. File and symlink data blocks are appended as `create()` is called.
 2. Directory entries are committed in breadth-first order, sorted for `e2fsck`.
 3. Block group layout is optimized to minimize group count.
-4. Resize inode metadata, backup superblocks, group descriptors, inode tables, bitmaps, and the primary superblock are written.
+4. The internal journal, resize inode metadata, backup superblocks, group descriptors, inode tables, bitmaps, and the primary superblock are written.
 
 ## ext4 Feature Flags
 
@@ -126,7 +143,7 @@ This table follows the feature list documented in [`ext4(5)`](https://www.man7.o
 | `fast_commit`            | Not supported | Enables a fast-commit journal area for low-latency metadata commits.                                                                                     |
 | `filetype`               | Enabled       | Stores file type information in directory entries.                                                                                                       |
 | `flex_bg`                | Enabled       | Allows per-block-group metadata, such as allocation bitmaps and inode tables, to be placed anywhere on the storage media.                                |
-| `has_journal`            | Not supported | Creates a journal to ensure file-system consistency across unclean shutdowns.                                                                            |
+| `has_journal`            | Enabled       | Creates an internal inode-8 JBD2 journal for kernel crash recovery.                                                                                       |
 | `huge_file`              | Enabled       | Allows files to be larger than 2 terabytes.                                                                                                              |
 | `inline_data`            | Not supported | Allows data to be stored in the inode and extended attribute area.                                                                                       |
 | `journal_dev`            | Not supported | Marks the superblock found on an external journal device.                                                                                                |
@@ -151,7 +168,8 @@ This table follows the feature list documented in [`ext4(5)`](https://www.man7.o
 - Block size is fixed at **4096 bytes**.
 - Maximum file size is **128 GiB**.
 - Extent tree depth is limited to **1**.
-- There is no journal. Images are built once as container root filesystems and may be mounted read-write without crash recovery.
+- Offline resize supports the Silo formatter profile only and refuses images that require journal recovery.
+- Host-side JBD2 replay is intentionally not implemented; Linux performs recovery before the guest online-resize fallback.
 - `sparse_super2` is intentionally disabled; use classic `sparse_super` plus `resize_inode` for Linux online resize.
 - The formatter writes a focused subset of ext4 metadata. Features outside the table's enabled set should be treated as unsupported even if the reader can tolerate some of their on-disk structures.
 
@@ -164,6 +182,7 @@ Tests cover:
 - OCI two-layer rootfs simulation.
 - Low-level superblock, group descriptor, bitmap, inode table, backup metadata, and resize inode validation.
 - Linux-only e2fsprogs validation for generated images and offline resize.
+- Internal journal layout and pure-Rust offline grow behavior.
 - Error paths, symlink loops, boundary conditions, and bug regressions.
 
 ```sh

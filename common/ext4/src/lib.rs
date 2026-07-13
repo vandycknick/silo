@@ -1,4 +1,4 @@
-//! Pure-Rust ext4 filesystem formatter and reader.
+//! Pure-Rust ext4 filesystem formatter, reader, and offline grower.
 //!
 //! This crate creates and reads ext4 filesystem images entirely in userspace,
 //! with no kernel mount, no FUSE, and no C dependencies.  It is designed for
@@ -20,6 +20,12 @@
 //! let mut reader = ext4::Reader::new(Path::new("rootfs.ext4")).unwrap();
 //! let data = reader.read_file("/hello.txt", 0, None).unwrap();
 //! assert_eq!(&data, b"hello world");
+//!
+//! // Grow a clean, unmounted image.
+//! let target = 512 * 1024 * 1024;
+//! std::fs::OpenOptions::new().write(true).open("rootfs.ext4")?.set_len(target)?;
+//! ext4::grow_image(Path::new("rootfs.ext4"), target)?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 pub mod checksum;
@@ -29,8 +35,11 @@ pub mod error;
 pub mod extent;
 pub mod file_tree;
 pub mod formatter;
+mod journal;
+mod layout;
 pub mod reader;
 pub mod reader_io;
+pub mod resizer;
 pub mod types;
 pub mod unpack;
 pub mod xattr;
@@ -38,3 +47,4 @@ pub mod xattr;
 // Re-export the primary public types at the crate root.
 pub use formatter::{FileTimestamps, FormatOptions, Formatter};
 pub use reader::Reader;
+pub use resizer::{GrowOutcome, grow_image};

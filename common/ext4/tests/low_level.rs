@@ -116,6 +116,10 @@ fn read_le_u32(buf: &[u8], index: usize) -> u32 {
     u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
 }
 
+fn read_be_u32(buf: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap())
+}
+
 fn superblock_free_blocks(sb: &SuperBlock) -> u64 {
     sb.free_blocks_count_lo as u64 | ((sb.free_blocks_count_hi as u64) << 32)
 }
@@ -178,6 +182,13 @@ fn test_superblock_fields() {
         0,
         "RESIZE_INODE compat flag not set"
     );
+    assert_ne!(
+        sb.feature_compat & compat::HAS_JOURNAL,
+        0,
+        "HAS_JOURNAL compat flag not set"
+    );
+    assert_eq!(sb.journal_inum, 8, "internal journal must use inode 8");
+    assert_eq!(sb.journal_dev, 0, "internal journal must not name a device");
     assert_eq!(
         sb.feature_compat & compat::SPARSE_SUPER2,
         0,
@@ -264,6 +275,50 @@ fn test_superblock_fields() {
         sb.uuid.iter().any(|&b| b != 0),
         "uuid must not be all zeros"
     );
+}
+
+#[test]
+fn test_internal_journal_inode_and_superblock() {
+    let tmp = NamedTempFile::new().unwrap();
+    Formatter::new(tmp.path(), 4096, 512 * 1024 * 1024)
+        .unwrap()
+        .close()
+        .unwrap();
+
+    let mut reader = Reader::new(tmp.path()).unwrap();
+    let sb = reader.superblock().clone();
+    let journal = reader.get_inode(8).unwrap();
+    assert_eq!(journal.mode & file_mode::TYPE_MASK, file_mode::S_IFREG);
+    assert_eq!(journal.mode & 0o777, 0o600);
+    assert_eq!(journal.links_count, 1);
+    assert_ne!(journal.flags & inode_flags::EXTENTS, 0);
+    assert_eq!(journal.file_size(), 16 * 1024 * 1024);
+
+    let mut image = std::fs::File::open(tmp.path()).unwrap();
+    let ranges = extent::parse_extents(&journal, 4096, &mut image).unwrap();
+    let mapped_blocks: u32 = ranges.iter().map(|(start, end)| end - start).sum();
+    assert_eq!(mapped_blocks, 4096);
+
+    let journal_super = read_block(&mut image, ranges[0].0, 4096);
+    assert_eq!(read_be_u32(&journal_super, 0x00), 0xC03B_3998);
+    assert_eq!(read_be_u32(&journal_super, 0x04), 4);
+    assert_eq!(read_be_u32(&journal_super, 0x0C), 4096);
+    assert_eq!(read_be_u32(&journal_super, 0x10), 4096);
+    assert_eq!(read_be_u32(&journal_super, 0x14), 1);
+    assert_eq!(read_be_u32(&journal_super, 0x18), 1);
+    assert_eq!(read_be_u32(&journal_super, 0x1C), 0);
+    assert_eq!(&journal_super[0x30..0x40], &sb.uuid);
+    assert_eq!(read_be_u32(&journal_super, 0x40), 1);
+    assert_eq!(sb.journal_backup_type, 1);
+
+    for (index, chunk) in journal.block.chunks_exact(4).enumerate() {
+        assert_eq!(
+            sb.journal_blocks[index],
+            u32::from_le_bytes(chunk.try_into().unwrap())
+        );
+    }
+    assert_eq!(sb.journal_blocks[15], journal.size_hi);
+    assert_eq!(sb.journal_blocks[16], journal.size_lo);
 }
 
 #[test]

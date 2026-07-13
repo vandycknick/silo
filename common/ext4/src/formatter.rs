@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Component;
 use std::path::Path;
 
 use uuid::Uuid;
@@ -18,6 +17,7 @@ use crate::dir;
 use crate::error::{FormatError, FormatResult};
 use crate::extent;
 use crate::file_tree::{BlockRange, FileTree, FileTreeNode, InodeNumber};
+use crate::journal;
 use crate::types::*;
 use crate::xattr::{ExtendedAttribute, XattrState};
 
@@ -150,9 +150,8 @@ pub struct Formatter {
     /// whose original tree node has been detached.  Keyed by inode number.
     /// Used to reclaim blocks when the last hard-link reference is removed.
     deferred_blocks: HashMap<u32, Vec<BlockRange>>,
-    /// UUID to write into the superblock. `None` triggers a random v4 at
-    /// format time.
-    uuid: Option<Uuid>,
+    /// UUID shared by ext4 metadata and the internal journal.
+    uuid: Uuid,
     /// Volume label to copy into the superblock's `volume_name` field. Validated
     /// on construction.
     label: Option<String>,
@@ -223,14 +222,14 @@ impl Formatter {
     }
 
     #[inline]
-    fn pos(&mut self) -> u64 {
-        self.file.stream_position().unwrap_or(0)
+    fn pos(&mut self) -> io::Result<u64> {
+        self.file.stream_position()
     }
 
     #[inline]
-    fn current_block(&mut self) -> u32 {
-        let p = self.pos();
-        (p / self.block_size as u64) as u32
+    fn current_block(&mut self) -> io::Result<u32> {
+        let block = self.pos()? / self.block_size as u64;
+        u32::try_from(block).map_err(|_| io::Error::other("filesystem exceeds 32-bit block limit"))
     }
 
     fn seek_to_block(&mut self, block: u32) -> io::Result<()> {
@@ -240,9 +239,12 @@ impl Formatter {
     }
 
     fn align_to_block(&mut self) -> io::Result<()> {
-        let p = self.pos();
+        let p = self.pos()?;
         if p % self.block_size as u64 != 0 {
-            let blk = self.current_block() + 1;
+            let blk = self
+                .current_block()?
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("filesystem exceeds 32-bit block limit"))?;
             self.seek_to_block(blk)?;
         }
         Ok(())
@@ -301,12 +303,12 @@ impl Formatter {
     }
 
     fn skip_reserved_metadata_blocks(&mut self) -> io::Result<()> {
-        if self.pos() % self.block_size as u64 != 0 {
+        if self.pos()? % self.block_size as u64 != 0 {
             return Ok(());
         }
 
         loop {
-            let block = self.current_block();
+            let block = self.current_block()?;
             let next = self.reserved_metadata_end_for_block(block);
             if next == block {
                 return Ok(());
@@ -502,8 +504,8 @@ impl Formatter {
         while offset < bytes.len() {
             self.skip_reserved_metadata_blocks()?;
 
-            let block = self.current_block();
-            let block_offset = (self.pos() % self.block_size as u64) as usize;
+            let block = self.current_block()?;
+            let block_offset = (self.pos()? % self.block_size as u64) as usize;
             let writable = (block_size - block_offset).min(bytes.len() - offset);
             self.file.write_all(&bytes[offset..offset + writable])?;
             self.size = self.size.max(self.file.stream_position()?);
@@ -546,6 +548,81 @@ impl Formatter {
         Ok(ranges)
     }
 
+    fn allocate_sparse_blocks(&mut self, block_count: u32) -> FormatResult<Vec<BlockRange>> {
+        self.align_to_block()?;
+        let mut remaining = block_count;
+        let mut ranges = Vec::new();
+
+        while remaining > 0 {
+            self.skip_reserved_metadata_blocks()?;
+            let start = self.current_block()?;
+            let group_end = (start / self.blocks_per_group() + 1)
+                .checked_mul(self.blocks_per_group())
+                .ok_or_else(|| io::Error::other("filesystem exceeds 32-bit block limit"))?;
+            let count = remaining.min(group_end - start);
+            let end = start
+                .checked_add(count)
+                .ok_or_else(|| io::Error::other("filesystem exceeds 32-bit block limit"))?;
+            ranges.push(BlockRange { start, end });
+            self.seek_to_block(end)?;
+            remaining -= count;
+        }
+
+        Ok(ranges)
+    }
+
+    fn initialize_journal(&mut self) -> FormatResult<()> {
+        let initial_blocks = self
+            .size
+            .div_ceil(self.block_size as u64)
+            .max(self.blocks_per_group() as u64);
+        let journal_blocks = journal::default_journal_blocks(initial_blocks);
+        let ranges = self.allocate_sparse_blocks(journal_blocks)?;
+        let journal_start = ranges
+            .first()
+            .ok_or(FormatError::InsufficientSpaceForGroupDescriptorBlocks)?
+            .start;
+
+        let (time_lo, time_extra) = timestamp_now();
+        let mut inode = Inode {
+            mode: file_mode::S_IFREG | 0o600,
+            links_count: 1,
+            extra_isize: EXTRA_ISIZE,
+            atime: time_lo,
+            ctime: time_lo,
+            mtime: time_lo,
+            crtime: time_lo,
+            atime_extra: time_extra,
+            ctime_extra: time_extra,
+            mtime_extra: time_extra,
+            crtime_extra: time_extra,
+            ..Inode::default()
+        };
+        inode.set_file_size(journal_blocks as u64 * self.block_size as u64);
+
+        self.skip_reserved_metadata_blocks()?;
+        let mut next_block = self.current_block()?;
+        extent::write_extents(
+            &mut inode,
+            &ranges,
+            self.block_size,
+            &mut self.file,
+            &mut next_block,
+        )?;
+        self.seek_to_block(next_block)?;
+        self.inodes[(journal::JOURNAL_INODE_NUMBER - 1) as usize] = inode;
+
+        let end_position = self.pos()?;
+        self.seek_to_block(journal_start)?;
+        self.file.write_all(&journal::superblock(
+            self.block_size,
+            journal_blocks,
+            self.uuid,
+        ))?;
+        self.file.seek(SeekFrom::Start(end_position))?;
+        Ok(())
+    }
+
     fn assign_node_ranges(node: &mut FileTreeNode, ranges: &[BlockRange]) {
         node.blocks = ranges.first().copied();
         node.additional_blocks = ranges.iter().skip(1).copied().collect();
@@ -571,10 +648,26 @@ impl Formatter {
             return Err(FormatError::UnsupportedBlockSize(opts.block_size));
         }
 
+        if opts.size == 0 {
+            return Err(FormatError::InvalidSize {
+                size: opts.size,
+                reason: "size must be greater than zero",
+            });
+        }
+        let blocks_per_group = opts.block_size * 8;
+        let maximum_blocks = (u32::MAX / blocks_per_group) as u64 * blocks_per_group as u64;
+        if opts.size.div_ceil(opts.block_size as u64) > maximum_blocks {
+            return Err(FormatError::InvalidSize {
+                size: opts.size,
+                reason: "size exceeds the 32-bit block layout",
+            });
+        }
+
         if let Some(label) = &opts.label {
             validate_label(label)?;
         }
 
+        let uuid = opts.uuid.unwrap_or_else(Uuid::new_v4);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -606,13 +699,15 @@ impl Formatter {
             tree,
             deleted_blocks: Vec::new(),
             deferred_blocks: HashMap::new(),
-            uuid: opts.uuid,
+            uuid,
             label: opts.label,
         };
 
         // Seek past the superblock (block 0) and the group descriptor table.
         let gdb = fmt.group_descriptor_blocks();
         fmt.seek_to_block(gdb + 1)?;
+
+        fmt.initialize_journal()?;
 
         // /lost+found is required by e2fsck.
         fmt.create(
@@ -665,6 +760,13 @@ impl Formatter {
         xattrs: Option<&HashMap<String, Vec<u8>>>,
     ) -> FormatResult<()> {
         validate_path_component_names(path)?;
+
+        if !is_dir(mode) && !is_reg(mode) && !is_link(mode) {
+            return Err(FormatError::UnsupportedFiletype);
+        }
+        if is_link(mode) != link.is_some() {
+            return Err(FormatError::InvalidLink(std::path::PathBuf::from(path)));
+        }
 
         let path_buf = std::path::PathBuf::from(path);
 
@@ -809,8 +911,9 @@ impl Formatter {
             // close() so they can be sorted.
             child_inode.links_count = 2;
             self.inodes[(parent_inode_num - 1) as usize].links_count += 1;
-        } else if let Some(link_target) = link {
+        } else if is_link(mode) {
             // Symbolic link.
+            let link_target = link.ok_or_else(|| FormatError::InvalidLink(path_buf.clone()))?;
             let link_bytes = link_target.as_bytes();
 
             let size = if link_bytes.len() < 60 {
@@ -831,7 +934,7 @@ impl Formatter {
                 child_inode.blocks_lo = 0;
             } else {
                 self.skip_reserved_metadata_blocks()?;
-                let mut cur = self.current_block();
+                let mut cur = self.current_block()?;
                 extent::write_extents(
                     &mut child_inode,
                     &ranges,
@@ -854,7 +957,7 @@ impl Formatter {
             child_inode.set_file_size(size);
 
             self.skip_reserved_metadata_blocks()?;
-            let mut cur = self.current_block();
+            let mut cur = self.current_block()?;
             extent::write_extents(
                 &mut child_inode,
                 &ranges,
@@ -1137,13 +1240,13 @@ impl Formatter {
 
         // -- Step 3: Optimize block group layout --
         self.size = self.size.max(self.file.metadata()?.len());
-        let current_blk = self.current_block();
+        let current_blk = self.current_block()?;
         let inode_count = self.inodes.len() as u32;
         let (block_groups, inodes_per_group) =
             self.optimize_block_group_layout(current_blk, inode_count);
 
         self.align_to_block()?;
-        let metadata_start = self.current_block();
+        let metadata_start = self.current_block()?;
         let inode_table_size_per_group = inodes_per_group * INODE_SIZE / self.block_size;
 
         // Ensure the disk is large enough.
@@ -1165,7 +1268,7 @@ impl Formatter {
         let data_size = layout.data_size;
 
         if self.size != layout.size_bytes {
-            let saved_pos = self.pos();
+            let saved_pos = self.pos()?;
             self.size = layout.size_bytes;
             self.file.set_len(self.size)?;
             self.file.seek(SeekFrom::Start(saved_pos))?;
@@ -1204,7 +1307,7 @@ impl Formatter {
         let inode_table_offset = self.commit_inode_table(block_groups, inodes_per_group)?;
 
         self.align_to_block()?;
-        let bitmap_offset = self.current_block();
+        let bitmap_offset = self.current_block()?;
         if bitmap_offset != expected_bitmap_offset {
             return Err(FormatError::InsufficientSpaceForGroupDescriptorBlocks);
         }
@@ -1402,7 +1505,7 @@ impl Formatter {
 
         // Settle the UUID now so the group descriptor checksums and the
         // superblock agree on it.
-        let uuid = self.uuid.unwrap_or_else(Uuid::new_v4);
+        let uuid = self.uuid;
         let uuid_bytes = *uuid.as_bytes();
 
         // -- Step 6: Build group descriptor table --
@@ -1452,7 +1555,7 @@ impl Formatter {
         sb.first_ino = FIRST_INODE;
         sb.lpf_ino = LOST_AND_FOUND_INODE;
         sb.inode_size = INODE_SIZE as u16;
-        sb.feature_compat = compat::EXT_ATTR | compat::RESIZE_INODE;
+        sb.feature_compat = compat::HAS_JOURNAL | compat::EXT_ATTR | compat::RESIZE_INODE;
         sb.feature_incompat = incompat::FILETYPE | incompat::EXTENTS | incompat::FLEX_BG;
         sb.feature_ro_compat = ro_compat::LARGE_FILE
             | ro_compat::HUGE_FILE
@@ -1468,6 +1571,18 @@ impl Formatter {
         sb.want_extra_isize = EXTRA_ISIZE;
         sb.log_groups_per_flex = 31;
         sb.uuid = uuid_bytes;
+        sb.journal_inum = journal::JOURNAL_INODE_NUMBER;
+        sb.journal_backup_type = journal::JOURNAL_BACKUP_BLOCKS;
+        let journal_inode = &self.inodes[(journal::JOURNAL_INODE_NUMBER - 1) as usize];
+        for (index, chunk) in journal_inode.block.chunks_exact(4).enumerate() {
+            sb.journal_blocks[index] = u32::from_le_bytes(
+                chunk
+                    .try_into()
+                    .map_err(|_| io::Error::other("invalid journal inode block field"))?,
+            );
+        }
+        sb.journal_blocks[15] = journal_inode.size_hi;
+        sb.journal_blocks[16] = journal_inode.size_lo;
         if let Some(label) = &self.label {
             let bytes = label.as_bytes();
             sb.volume_name[..bytes.len()].copy_from_slice(bytes);
@@ -1627,7 +1742,7 @@ impl Formatter {
 
             // Write extent tree for this directory.
             self.skip_reserved_metadata_blocks()?;
-            let mut cur = self.current_block();
+            let mut cur = self.current_block()?;
             extent::write_extents(
                 &mut self.inodes[(inode_num - 1) as usize],
                 &ranges,
@@ -1648,7 +1763,7 @@ impl Formatter {
         inodes_per_group: u32,
     ) -> FormatResult<u64> {
         self.align_to_block()?;
-        let inode_table_offset = self.pos() / self.block_size as u64;
+        let inode_table_offset = self.pos()? / self.block_size as u64;
 
         // Write the actual inodes.
         let mut inode_buf = [0u8; Inode::SIZE];
@@ -1800,14 +1915,12 @@ fn block_ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> b
 
 /// Reject path components that cannot be represented in ext4 dir entries.
 fn validate_path_component_names(path: &str) -> FormatResult<()> {
-    for component in Path::new(path).components() {
-        if let Component::Normal(name) = component {
-            let name = name
-                .to_str()
-                .ok_or_else(|| FormatError::InvalidPathEncoding(path.to_string()))?;
-            if name.len() > EXT4_NAME_LEN {
-                return Err(FormatError::InvalidName(name.to_string()));
-            }
+    for name in path.split('/') {
+        if name == "." || name == ".." {
+            return Err(FormatError::InvalidPathEncoding(path.to_string()));
+        }
+        if name.len() > EXT4_NAME_LEN {
+            return Err(FormatError::InvalidName(name.to_string()));
         }
     }
 

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }
+ext4 = { path = "../../common/ext4" }
 silo_policy = { package = "policy", path = "../../common/policy" }
 ocidisk = { path = "../ocidisk" }
 protocol = { path = "../../specs/protocol" }

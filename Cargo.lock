@@ -2340,6 +2340,7 @@ dependencies = [
  "async-trait",
  "base64",
  "cpio",
+ "ext4",
  "eyre",
  "getrandom 0.4.3",
  "hyper-util",

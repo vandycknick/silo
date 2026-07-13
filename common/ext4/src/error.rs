@@ -66,6 +66,8 @@ pub enum FormatError {
     CannotHardlinkDirectory(PathBuf),
     #[error("unsupported block size {0} (only 4096 is supported)")]
     UnsupportedBlockSize(u32),
+    #[error("invalid filesystem size {size}: {reason}")]
+    InvalidSize { size: u64, reason: &'static str },
     #[error("invalid volume label: {0}")]
     InvalidLabel(String),
     #[error("cannot truncate file: {0}")]
@@ -88,5 +90,53 @@ pub enum FormatError {
     Io(#[from] std::io::Error),
 }
 
+/// Errors that can occur while growing an unmounted ext4 image.
+#[derive(Debug, thiserror::Error)]
+pub enum ResizeError {
+    #[error("filesystem requires kernel journal recovery before offline resize")]
+    RequiresRecovery,
+    #[error("offline resize does not support this filesystem: {0}")]
+    Unsupported(&'static str),
+    #[error("invalid or corrupt ext4 filesystem: {0}")]
+    Corrupt(&'static str),
+    #[error("resize target {0} is not aligned to the 4096-byte filesystem block size")]
+    UnalignedSize(u64),
+    #[error(
+        "refusing to shrink ext4 filesystem from {current_blocks} to {requested_blocks} blocks"
+    )]
+    ShrinkUnsupported {
+        current_blocks: u64,
+        requested_blocks: u64,
+    },
+    #[error(
+        "resize needs {required_descriptor_blocks} descriptor blocks but only {available_descriptor_blocks} are available"
+    )]
+    GdtCapacityExceeded {
+        required_descriptor_blocks: u32,
+        available_descriptor_blocks: u32,
+    },
+    #[error("resize target {requested_blocks} exceeds the maximum {maximum_blocks} blocks")]
+    TooLarge {
+        requested_blocks: u64,
+        maximum_blocks: u64,
+    },
+    #[error("resized filesystem would exceed the 32-bit inode count")]
+    TooManyInodes,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+impl ResizeError {
+    /// Whether the image is unchanged and the mounted kernel resize path may
+    /// safely handle this case instead.
+    pub fn can_fallback_online(&self) -> bool {
+        matches!(
+            self,
+            Self::RequiresRecovery | Self::Unsupported(_) | Self::GdtCapacityExceeded { .. }
+        )
+    }
+}
+
 pub type ReadResult<T> = std::result::Result<T, ReadError>;
 pub type FormatResult<T> = std::result::Result<T, FormatError>;
+pub type ResizeResult<T> = std::result::Result<T, ResizeError>;

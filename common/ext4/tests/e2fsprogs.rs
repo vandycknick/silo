@@ -7,7 +7,7 @@ use std::process::Command;
 
 use ext4::constants::{LOST_AND_FOUND_INODE, file_mode, make_mode};
 use ext4::error::FormatError;
-use ext4::{Formatter, Reader};
+use ext4::{Formatter, Reader, grow_image};
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -109,6 +109,12 @@ fn e2fsprogs_validates_and_resizes_generated_image() {
     assert!(
         features
             .split_whitespace()
+            .any(|feature| feature == "has_journal"),
+        "missing has_journal in: {features}"
+    );
+    assert!(
+        features
+            .split_whitespace()
             .any(|feature| feature == "sparse_super"),
         "missing sparse_super in: {features}"
     );
@@ -120,6 +126,15 @@ fn e2fsprogs_validates_and_resizes_generated_image() {
     );
 
     run("e2fsck", &["-fn", &image_str]);
+    let journal = run("debugfs", &["-R", "stat <8>", &image_str]);
+    assert!(
+        journal.contains("Type: regular"),
+        "invalid journal inode:\n{journal}"
+    );
+    assert!(
+        journal.contains("Size: 16777216"),
+        "unexpected journal size:\n{journal}"
+    );
 
     std::fs::OpenOptions::new()
         .write(true)
@@ -128,9 +143,40 @@ fn e2fsprogs_validates_and_resizes_generated_image() {
         .set_len(1024 * 1024 * 1024)
         .unwrap();
 
-    run("e2fsck", &["-f", "-y", &image_str]);
     run("resize2fs", &[&image_str]);
     run("e2fsck", &["-fn", &image_str]);
+}
+
+#[test]
+fn e2fsprogs_validates_pure_rust_offline_grow() {
+    let dir = outside_workspace_tempdir();
+    let image = create_test_image(dir.path());
+    let image_str = image.to_string_lossy();
+    let target = 1024 * 1024 * 1024;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&image)
+        .unwrap()
+        .set_len(target)
+        .unwrap();
+    let outcome = grow_image(&image, target).expect("grow ext4 image in userspace");
+
+    assert!(outcome.changed());
+    assert_eq!(outcome.new_blocks * 4096, target);
+    run("e2fsck", &["-fn", &image_str]);
+    let header = run("dumpe2fs", &["-h", &image_str]);
+    let block_count = header
+        .lines()
+        .find_map(|line| line.strip_prefix("Block count:"))
+        .expect("dumpe2fs reports block count")
+        .trim();
+    assert_eq!(block_count, "262144");
+    let mut reader = Reader::new(&image).expect("open grown image");
+    assert_eq!(
+        reader.read_file("/etc/big-file", 0, None).unwrap().len(),
+        2 * 1024 * 1024
+    );
 }
 
 #[test]
