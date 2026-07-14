@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use vm_spec::{Boot, Disk, Guest, GuestOs, Hardware, Kernel, Mount, Storage, VmSpec};
@@ -523,9 +524,12 @@ impl MachineCreateGuard {
         if let Some(parent) = self.machine_dir.parent() {
             fs::create_dir_all(parent)?;
         }
-        match fs::create_dir(&self.machine_dir) {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&self.machine_dir) {
             Ok(()) => {
                 self.dir_created = true;
+                fs::set_permissions(&self.machine_dir, fs::Permissions::from_mode(0o700))?;
                 Ok(())
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -600,6 +604,7 @@ impl Drop for MachineCreateGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -1019,6 +1024,14 @@ mod tests {
         let config_path = create.dir().join("config.json");
         assert!(machine_dir.exists());
         assert!(config_path.exists());
+        assert_eq!(
+            std::fs::metadata(&machine_dir)
+                .expect("machine directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
 
         let rootfs = rootfs_record(&create);
         let config = create

@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package silo.v1;
+
+import "common.proto";
+import "google/protobuf/timestamp.proto";
+
+service GuestFilesystemService {
+  rpc GetEntry(GetEntryRequest) returns (FilesystemEntry);
+  rpc RemoveEntry(RemoveEntryRequest) returns (RemoveEntryResponse);
+  rpc DownloadFile(DownloadFileRequest) returns (stream ByteChunk);
+  rpc UploadFile(stream UploadFileRequest) returns (UploadFileResponse);
+  rpc ListDirectory(ListDirectoryRequest) returns (DirectoryPage);
+  rpc CreateDirectory(CreateDirectoryRequest) returns (CreateDirectoryResponse);
+}
+
+enum FilesystemEntryKind {
+  FILESYSTEM_ENTRY_KIND_UNSPECIFIED = 0;
+  FILESYSTEM_ENTRY_KIND_FILE = 1;
+  FILESYSTEM_ENTRY_KIND_DIRECTORY = 2;
+  FILESYSTEM_ENTRY_KIND_SYMLINK = 3;
+  FILESYSTEM_ENTRY_KIND_FIFO = 4;
+  FILESYSTEM_ENTRY_KIND_SOCKET = 5;
+  FILESYSTEM_ENTRY_KIND_BLOCK_DEVICE = 6;
+  FILESYSTEM_ENTRY_KIND_CHARACTER_DEVICE = 7;
+}
+
+message FilesystemEntry {
+  optional string path = 1;
+  optional string name = 2;
+  optional FilesystemEntryKind kind = 3;
+  optional uint64 size_bytes = 4;
+  optional uint32 mode = 5;
+  optional uint32 uid = 6;
+  optional uint32 gid = 7;
+  google.protobuf.Timestamp modified_at = 8;
+}
+
+message GetEntryRequest {
+  optional string path = 1;
+}
+
+message RemoveEntryRequest {
+  optional string path = 1;
+  optional bool recursive = 2;
+}
+
+message RemoveEntryResponse {}
+
+message DownloadFileRequest {
+  optional string path = 1;
+}
+
+message UploadFileHeader {
+  optional string path = 1;
+  optional uint32 mode = 2;
+  optional uint32 uid = 3;
+  optional uint32 gid = 4;
+}
+
+message UploadFileRequest {
+  oneof payload {
+    UploadFileHeader header = 1;
+    ByteChunk chunk = 2;
+  }
+}
+
+enum FileWriteDisposition {
+  FILE_WRITE_DISPOSITION_UNSPECIFIED = 0;
+  FILE_WRITE_DISPOSITION_CREATED = 1;
+  FILE_WRITE_DISPOSITION_REPLACED = 2;
+}
+
+message UploadFileResponse {
+  optional FileWriteDisposition disposition = 1;
+}
+
+message ListDirectoryRequest {
+  optional string path = 1;
+  optional uint32 limit = 2;
+  optional bytes cursor = 3;
+}
+
+message DirectoryPage {
+  repeated FilesystemEntry entries = 1;
+  optional bytes next_cursor = 2;
+}
+
+message CreateDirectoryRequest {
+  optional string path = 1;
+  optional bool parents = 2;
+  optional uint32 mode = 3;
+  optional uint32 uid = 4;
+  optional uint32 gid = 5;
+}
+
+enum DirectoryCreateDisposition {
+  DIRECTORY_CREATE_DISPOSITION_UNSPECIFIED = 0;
+  DIRECTORY_CREATE_DISPOSITION_CREATED = 1;
+  DIRECTORY_CREATE_DISPOSITION_ALREADY_EXISTS = 2;
+}
+
+message CreateDirectoryResponse {
+  optional DirectoryCreateDisposition disposition = 1;
+}

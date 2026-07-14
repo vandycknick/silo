@@ -44,6 +44,8 @@
               pkgs.git
               pkgs.go
               pkgs.gnumake
+              pkgs.grpcurl
+              pkgs.jq
               pkgs.pkg-config
               pkgs.zig
               pkgs.cargo-zigbuild

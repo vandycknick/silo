@@ -3,7 +3,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::net::UnixStream;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::platform::VmBackend;
@@ -187,7 +186,21 @@ impl SerialConsole {
 }
 
 impl SerialStream {
-    async fn write_input(&self, chunk: &[u8]) -> io::Result<()> {
+    /// Reads the next output chunk. Lagged consumers are disconnected rather
+    /// than silently losing serial output.
+    pub async fn read_output(&mut self) -> io::Result<Option<Vec<u8>>> {
+        match self.output_rx.recv().await {
+            Ok(chunk) => Ok(Some(chunk)),
+            Err(broadcast::error::RecvError::Closed) => Ok(None),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("serial consumer lagged by {skipped} chunks"),
+            )),
+        }
+    }
+
+    /// Writes interactive input to the guest. Watch-only streams ignore input.
+    pub async fn write_input(&self, chunk: &[u8]) -> io::Result<()> {
         match self.access {
             SerialAccess::Interactive => self.console.write_input(self.client_id, chunk).await,
             SerialAccess::Watch => Ok(()),
@@ -277,91 +290,4 @@ async fn run_serial_reader(
 
         let _ = output_tx.send(chunk);
     }
-}
-
-pub fn spawn_serial_tunnel(stream: UnixStream, serial_stream: SerialStream) {
-    tokio::spawn(async move {
-        if let Err(err) = proxy_serial_stream(stream, serial_stream).await {
-            if is_expected_disconnect(&err) {
-                tracing::debug!(error = %err, "serial relay closed");
-            } else {
-                tracing::error!(error = %err, "serial relay failed");
-            }
-        }
-    });
-}
-
-async fn proxy_serial_stream(
-    client_stream: UnixStream,
-    mut serial_stream: SerialStream,
-) -> io::Result<()> {
-    let access = serial_stream.access;
-    let (mut client_read, mut client_write) = client_stream.into_split();
-    let mut output_rx = std::mem::replace(
-        &mut serial_stream.output_rx,
-        serial_stream.console.output_tx.subscribe(),
-    );
-
-    let output_task: tokio::task::JoinHandle<io::Result<()>> = tokio::spawn(async move {
-        loop {
-            match output_rx.recv().await {
-                Ok(chunk) => {
-                    client_write.write_all(&chunk).await?;
-                    client_write.flush().await?;
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
-            }
-        }
-    });
-
-    let relay_result = match access {
-        SerialAccess::Interactive => relay_client_input(&mut serial_stream, &mut client_read).await,
-        SerialAccess::Watch => wait_for_client_disconnect(&mut client_read).await,
-    };
-
-    output_task.abort();
-    let _ = output_task.await;
-
-    relay_result
-}
-
-async fn relay_client_input(
-    serial_stream: &mut SerialStream,
-    client_read: &mut tokio::net::unix::OwnedReadHalf,
-) -> io::Result<()> {
-    let mut buf = [0u8; 4096];
-
-    loop {
-        let n = client_read.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(());
-        }
-
-        serial_stream.write_input(&buf[..n]).await?;
-    }
-}
-
-async fn wait_for_client_disconnect(
-    client_read: &mut tokio::net::unix::OwnedReadHalf,
-) -> io::Result<()> {
-    let mut buf = [0u8; 256];
-    loop {
-        let n = client_read.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(());
-        }
-    }
-}
-
-fn is_expected_disconnect(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::BrokenPipe
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::UnexpectedEof
-            | io::ErrorKind::Interrupted
-    )
 }

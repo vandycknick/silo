@@ -3,18 +3,23 @@ syntax = "proto3";
 package silo.v1;
 
 import "common.proto";
-service GuestControlService {
-  rpc Register(RegisterGuestRequest) returns (RegisterGuestResponse);
+import "google/protobuf/duration.proto";
+
+service GuestAgentService {
+  rpc GetStatus(GetAgentStatusRequest) returns (AgentStatus);
+  rpc WatchStatus(WatchAgentStatusRequest) returns (stream AgentStatus);
+  rpc GetMetrics(GetAgentMetricsRequest) returns (AgentMetrics);
+  rpc WatchMetrics(WatchAgentMetricsRequest) returns (stream AgentMetrics);
 }
 
-message RegisterGuestRequest {
-  string guest_service_version = 1;
-  SystemInfo system_info = 2;
-  GuestBootReport boot_report = 3;
-  ProvisionReport provision_report = 4;
+message GetAgentStatusRequest {}
+
+message WatchAgentStatusRequest {
+  google.protobuf.Duration heartbeat_interval = 1;
 }
 
-message RegisterGuestResponse {
-  bool accepted = 1;
-  string message = 2;
+message GetAgentMetricsRequest {}
+
+message WatchAgentMetricsRequest {
+  google.protobuf.Duration interval = 1;
 }

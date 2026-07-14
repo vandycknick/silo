@@ -30,6 +30,7 @@ pub(crate) struct GuestAgentConfigInput<'a> {
     pub(crate) spec: &'a VmSpec,
     pub(crate) network: &'a VmmonNetworkAttachment,
     pub(crate) networking: &'a RuntimeNetworkingConfig,
+    pub(crate) resize_rootfs: bool,
 }
 
 struct GuestAgentHostContext {
@@ -57,7 +58,13 @@ pub(crate) fn build_config(input: GuestAgentConfigInput<'_>) -> eyre::Result<Age
         input.networking,
         input.network.requires_certificate_authority(),
     )?;
-    build_config_with_host_context(input.machine_name, input.spec, input.network, &host_context)
+    build_config_with_host_context(
+        input.machine_name,
+        input.spec,
+        input.network,
+        input.resize_rootfs,
+        &host_context,
+    )
 }
 
 fn load_host_context(
@@ -85,11 +92,18 @@ fn build_config_with_host_context(
     machine_name: &str,
     spec: &VmSpec,
     network: &VmmonNetworkAttachment,
+    resize_rootfs: bool,
     host_context: &GuestAgentHostContext,
 ) -> eyre::Result<AgentConfig> {
     Ok(AgentConfig {
         forward: build_forward_config(spec)?,
-        provision: build_provision_config(machine_name, spec, network, host_context)?,
+        provision: build_provision_config(
+            machine_name,
+            spec,
+            network,
+            resize_rootfs,
+            host_context,
+        )?,
         ssh: build_ssh_config(host_context),
     })
 }
@@ -130,6 +144,7 @@ fn build_provision_config(
     machine_name: &str,
     spec: &VmSpec,
     network: &VmmonNetworkAttachment,
+    resize_rootfs: bool,
     host_context: &GuestAgentHostContext,
 ) -> eyre::Result<ProvisionConfig> {
     let certificate_authority = if network.requires_certificate_authority() {
@@ -151,7 +166,9 @@ fn build_provision_config(
         hostname: Some(machine_name.to_string()),
         timezone: Some(host_context.timezone.clone()),
         locale: Some(host_context.locale.clone()),
-        resize_rootfs: ResizeRootfsConfig { enabled: true },
+        resize_rootfs: ResizeRootfsConfig {
+            enabled: resize_rootfs,
+        },
         users: vec![UserConfig {
             name: host_context.user.name.clone(),
             uid: host_context.user.uid,
@@ -552,6 +569,7 @@ mod tests {
             "demo",
             &spec,
             &VmmonNetworkAttachment::None,
+            true,
             &host_context(),
         )
         .expect("resolve provision config");
@@ -573,6 +591,7 @@ mod tests {
             "demo",
             &spec,
             &VmmonNetworkAttachment::None,
+            true,
             &host_context(),
         )
         .expect_err("cloud-config userdata should be rejected");
@@ -590,6 +609,7 @@ mod tests {
             "demo",
             &spec,
             &VmmonNetworkAttachment::None,
+            true,
             &host_context(),
         )
         .expect("resolve provision config");
@@ -610,6 +630,7 @@ mod tests {
                 },
                 requires_certificate_authority: false,
             },
+            true,
             &host_context(),
         )
         .expect("resolve provision config");
@@ -645,6 +666,7 @@ mod tests {
                 },
                 requires_certificate_authority: true,
             },
+            true,
             &host_context(),
         )
         .expect("resolve provision config");
@@ -701,6 +723,20 @@ mod tests {
     }
 
     #[test]
+    fn provision_config_disables_guest_resize_after_offline_completion() {
+        let provision = build_provision_config(
+            "demo",
+            &sample_spec(Vec::new()),
+            &VmmonNetworkAttachment::None,
+            false,
+            &host_context(),
+        )
+        .expect("resolve provision config");
+
+        assert!(!provision.resize_rootfs.enabled);
+    }
+
+    #[test]
     fn provision_config_enables_rosetta_from_vm_settings() {
         let mut spec = sample_spec(Vec::new());
         hardware_mut(&mut spec).rosetta = Some(true);
@@ -709,6 +745,7 @@ mod tests {
             "demo",
             &spec,
             &VmmonNetworkAttachment::None,
+            true,
             &host_context(),
         )
         .expect("resolve provision config");
@@ -773,6 +810,7 @@ mod tests {
             "demo",
             &spec,
             &VmmonNetworkAttachment::None,
+            true,
             &host_context(),
         )
         .expect("build agent config");

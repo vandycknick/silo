@@ -46,7 +46,6 @@ impl RuntimeContext {
 pub struct DaemonContext {
     pub(crate) spec: VmSpec,
     pub(crate) guest_services_enabled: bool,
-    pub(crate) wait_for_registration: std::time::Duration,
     pub(crate) machine: VirtualMachine,
     pub(crate) serial_console: Arc<SerialConsole>,
     pub(crate) store: Arc<InstanceStore>,

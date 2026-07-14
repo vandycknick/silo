@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use protocol::v1::{
-    GuestBootMode, GuestBootReport, InspectResponse, LifecycleState, ProvisionFailurePolicy,
-    ProvisionOverallStatus, ProvisionReport, ProvisionStepReport, ProvisionStepStatus,
+    AgentStatusState, GuestBootMode, GuestBootReport, HostAgent, HostStatus,
+    ProvisionFailurePolicy, ProvisionOverallStatus, ProvisionReport, ProvisionStepReport,
+    ProvisionStepStatus, VmState,
 };
 use vm_spec::VmSpec;
 
@@ -125,13 +126,13 @@ pub struct MachineBootReport {
 impl MachineBootReport {
     pub(crate) fn from_protocol(report: GuestBootReport) -> Self {
         Self {
-            mode: MachineBootMode::from_protocol(report.mode),
+            mode: MachineBootMode::from_protocol(report.mode.unwrap_or_default()),
             requested_init: non_empty_string(report.requested_init),
             handoff_init_path: non_empty_string(report.handoff_init_path),
             probed_init_paths: report.probed_init_paths,
             agent_path: non_empty_string(report.agent_path),
-            agent_pid: report.agent_pid,
-            agent_is_pid1: report.agent_is_pid1,
+            agent_pid: report.agent_pid.unwrap_or_default(),
+            agent_is_pid1: report.agent_is_pid1.unwrap_or_default(),
             message: non_empty_string(report.message),
         }
     }
@@ -178,10 +179,10 @@ pub struct MachineProvisionReport {
 impl MachineProvisionReport {
     pub(crate) fn from_protocol(report: ProvisionReport) -> Self {
         Self {
-            status: MachineProvisionStatus::from_protocol(report.status),
-            started_unix_ms: report.started_unix_ms,
-            finished_unix_ms: report.finished_unix_ms,
-            duration_ms: report.duration_ms,
+            status: MachineProvisionStatus::from_protocol(report.status.unwrap_or_default()),
+            started_unix_ms: timestamp_millis(report.started_at),
+            finished_unix_ms: timestamp_millis(report.finished_at),
+            duration_ms: duration_millis(report.duration),
             steps: report
                 .steps
                 .into_iter()
@@ -246,12 +247,14 @@ pub struct MachineProvisionStepReport {
 impl MachineProvisionStepReport {
     fn from_protocol(report: ProvisionStepReport) -> Self {
         Self {
-            id: report.id,
-            status: MachineProvisionStepStatus::from_protocol(report.status),
-            failure_policy: MachineProvisionFailurePolicy::from_protocol(report.failure_policy),
-            changed: report.changed,
+            id: report.id.unwrap_or_default(),
+            status: MachineProvisionStepStatus::from_protocol(report.status.unwrap_or_default()),
+            failure_policy: MachineProvisionFailurePolicy::from_protocol(
+                report.failure_policy.unwrap_or_default(),
+            ),
+            changed: report.changed.unwrap_or_default(),
             backend: non_empty_string(report.backend),
-            duration_ms: report.duration_ms,
+            duration_ms: duration_millis(report.duration),
             message: non_empty_string(report.message),
             error_chain: non_empty_string(report.error_chain),
         }
@@ -372,23 +375,25 @@ impl MachineStatus {
         }
     }
 
-    pub(crate) fn from_protocol(response: InspectResponse) -> Self {
-        let message = non_empty_message(Some(response.summary));
-        let guest_ready = matches!(
-            LifecycleState::try_from(response.guest_state).unwrap_or(LifecycleState::Unspecified),
-            LifecycleState::Running
-        );
+    pub(crate) fn from_protocol(response: HostStatus) -> Self {
+        let vm = response.vm.unwrap_or_default();
+        let message = non_empty_message(vm.message);
+        let guest_ready = agent_reports_ready(response.agent.as_ref());
+        let ready = response
+            .readiness
+            .and_then(|readiness| readiness.ready)
+            .unwrap_or(false);
 
-        match LifecycleState::try_from(response.vm_state).unwrap_or(LifecycleState::Unspecified) {
-            LifecycleState::Stopped => Self::Stopped,
-            LifecycleState::Starting => Self::Starting { message },
-            LifecycleState::Running | LifecycleState::Unspecified => Self::Running {
-                ready: response.ready,
+        match VmState::try_from(vm.state.unwrap_or_default()).unwrap_or(VmState::Unspecified) {
+            VmState::Stopped => Self::Stopped,
+            VmState::Starting => Self::Starting { message },
+            VmState::Running | VmState::Unspecified => Self::Running {
+                ready,
                 guest_ready,
                 message,
             },
-            LifecycleState::Stopping => Self::Stopping { message },
-            LifecycleState::Error => Self::Error { message },
+            VmState::Stopping => Self::Stopping { message },
+            VmState::Failed => Self::Error { message },
         }
     }
 
@@ -473,29 +478,71 @@ fn non_empty_message(message: Option<String>) -> Option<String> {
     })
 }
 
-fn non_empty_string(value: String) -> Option<String> {
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+fn non_empty_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| non_empty_message(Some(value)))
+}
+
+fn timestamp_millis(timestamp: Option<prost_types::Timestamp>) -> i64 {
+    timestamp
+        .and_then(|timestamp| {
+            timestamp
+                .seconds
+                .checked_mul(1_000)
+                .and_then(|seconds| seconds.checked_add(i64::from(timestamp.nanos) / 1_000_000))
+        })
+        .unwrap_or_default()
+}
+
+fn duration_millis(duration: Option<prost_types::Duration>) -> u64 {
+    duration
+        .and_then(|duration| {
+            let seconds = u64::try_from(duration.seconds).ok()?;
+            let nanos = u32::try_from(duration.nanos).ok()?;
+            if nanos >= 1_000_000_000 {
+                return None;
+            }
+            seconds
+                .checked_mul(1_000)
+                .and_then(|millis| millis.checked_add(u64::from(nanos / 1_000_000)))
+        })
+        .unwrap_or_default()
+}
+
+fn agent_reports_ready(agent: Option<&HostAgent>) -> bool {
+    let Some(HostAgent {
+        mode: Some(protocol::v1::host_agent::Mode::Enabled(enabled)),
+    }) = agent
+    else {
+        return false;
+    };
+    enabled
+        .status
+        .as_ref()
+        .and_then(|status| status.report.as_ref())
+        .and_then(|report| report.state)
+        .and_then(|state| AgentStatusState::try_from(state).ok())
+        .is_some_and(|state| state == AgentStatusState::Ready)
 }
 
 #[cfg(test)]
 mod tests {
-    use protocol::v1::{InspectResponse, LifecycleState};
+    use protocol::v1::{HostStatus, Readiness, VmSnapshot, VmState};
 
     use crate::machine::MachineStatus;
 
     #[test]
-    fn disabled_agent_can_be_ready_without_guest_registration() {
-        let status = MachineStatus::from_protocol(InspectResponse {
-            vm_state: LifecycleState::Running as i32,
-            guest_state: LifecycleState::Unspecified as i32,
-            ready: true,
-            summary: "instance ready (guest agent not required)".to_string(),
-            ..InspectResponse::default()
+    fn disabled_agent_can_be_ready_without_guest_status() {
+        let status = MachineStatus::from_protocol(HostStatus {
+            vm: Some(VmSnapshot {
+                state: Some(VmState::Running as i32),
+                message: Some("instance ready (guest agent not required)".to_string()),
+                ..VmSnapshot::default()
+            }),
+            readiness: Some(Readiness {
+                ready: Some(true),
+                ..Readiness::default()
+            }),
+            ..HostStatus::default()
         });
 
         assert!(status.ready());

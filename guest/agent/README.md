@@ -20,7 +20,7 @@ At startup the agent:
 1. initializes tracing
 2. loads guest config from disk
 3. reads the control port from `/proc/cmdline`
-4. runs provisioning if enabled, with optional static networking first
+4. runs provisioning if enabled, with loopback and optional static networking first
 5. attempts to bind guest `vsock::22` for SSH, unless another listener already owns it
 6. starts the forward service if enabled
 7. registers with the host-side control service
@@ -79,8 +79,8 @@ Notes:
 - `forward.port` must be set when `forward.enabled` is true. This is the guest-side vsock port used by the host `forward` plugin endpoint.
 - `forward.uds` is an allowlist of guest Unix socket paths the forward service may connect to.
 - `provision` controls optional guest provisioning work such as static networking, hostname, and root filesystem resizing.
-- `provision.network` is omitted for a machine without a network attachment. In that case the agent does not modify links, routes, or `/etc/resolv.conf`.
-- When configured, static networking is the first provisioner. It matches the interface by MAC and configures it through Linux rtnetlink without invoking DHCP, `ip`, or a network manager.
+- `provision.network` is omitted for a machine without a network attachment. When provisioning is enabled, the network provisioner still brings up loopback but leaves non-loopback links, routes, and `/etc/resolv.conf` untouched.
+- Networking is the first provisioner. It brings up loopback, then matches and configures the optional static interface through Linux rtnetlink without invoking DHCP, `ip`, or a network manager.
 - The host only configures a guest certificate authority when its network policy contains an HTTPS interception endpoint. VMs without a policy and VMs with only IP or HTTP endpoints do not generate, transfer, or install CA material.
 - CA trust installation uses `update-ca-certificates` when available, otherwise p11-kit `trust`. A configured CA is required launch state, so a missing or failed trust backend fails managed boot.
 - Ext4 root filesystems grow through the kernel's online resize ioctl. Guest images do not need `findmnt`, `resize2fs`, or e2fsprogs.

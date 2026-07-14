@@ -30,7 +30,7 @@ pub(crate) struct VmmonLaunch<'a> {
     pub(crate) network: &'a VmmonNetworkAttachment,
     pub(crate) run_id: &'a str,
     pub(crate) exit_command: Option<&'a MachineExitCommand>,
-    pub(crate) wait_for_registration: Duration,
+    pub(crate) agent_enabled: bool,
 }
 
 impl Vmmon {
@@ -61,9 +61,10 @@ impl Vmmon {
             .arg("--network")
             .arg(launch.network.to_vmmon_arg())
             .arg("--run-id")
-            .arg(launch.run_id)
-            .arg("--wait-for-registration")
-            .arg(launch.wait_for_registration.as_secs().to_string());
+            .arg(launch.run_id);
+        if launch.agent_enabled {
+            command.arg("--agent-enabled");
+        }
         if let Some(exit_command) = launch.exit_command {
             append_exit_command_args(&mut command, exit_command);
         }

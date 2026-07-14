@@ -127,7 +127,7 @@ fn vm_spec_vsock_ports(spec: &VmSpec, guest_services_enabled: bool) -> Vec<Vsock
     if guest_services_enabled {
         ports.push(VsockPort {
             port: GUEST_CONTROL_PORT,
-            mode: VsockPortMode::Listen,
+            mode: VsockPortMode::Connect,
         });
         ports.push(VsockPort {
             port: SSH_VSOCK_PORT,
@@ -385,7 +385,7 @@ mod tests {
             .config
             .vsock_ports
             .iter()
-            .any(|port| port.port == 1027 && port.mode == VsockPortMode::Listen));
+            .any(|port| port.port == 1027 && port.mode == VsockPortMode::Connect));
         assert!(machine_config
             .config
             .vsock_ports

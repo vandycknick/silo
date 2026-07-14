@@ -29,7 +29,7 @@ ability to select custom assets independently, and a small launch-specific
 delivery mechanism.
 
 This ADR owns pre-boot materialization and handoff to the agent. [ADR
-0008](0008-vmmon-host-and-guest-http-api.md) owns everything after that handoff:
+0008](0008-vmmon-host-and-guest-grpc-api.md) owns everything after that handoff:
 post-boot discovery, readiness, status, metrics, and control.
 
 ## Where Reusable And Per-Launch State Meet
@@ -407,10 +407,10 @@ rewriting the base has no benefit.
 
 ### Fetch Configuration Over A Guest Transport
 
-A pre-network vsock or HTTP service adds listener ordering, a startup protocol,
-retries, availability coupling, and a configuration-serving responsibility to a
-long-running process. The configuration is known before boot and immutable for
-that boot, so injection is simpler.
+A pre-network vsock RPC service adds listener ordering, a startup protocol,
+retries, availability coupling, and a configuration-serving responsibility to
+a long-running process. The configuration is known before boot and immutable
+for that boot, so injection is simpler.
 
 ### Dedicated Configuration Disk Or Virtiofs Share
 

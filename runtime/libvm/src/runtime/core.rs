@@ -871,6 +871,7 @@ impl Runtime {
         &self,
         config: &MachineConfig,
         network: &VmmonNetworkAttachment,
+        resize_rootfs: bool,
     ) -> Result<bool, LibVmError> {
         let prepare = || -> eyre::Result<bool> {
             let relative_mount_base = std::env::current_dir()
@@ -891,6 +892,7 @@ impl Runtime {
                     spec: &launch_spec,
                     network,
                     networking: &self.networking,
+                    resize_rootfs,
                 })?;
                 agent_config.validate().context("validate agent config")?;
                 let serialized =
@@ -1023,16 +1025,31 @@ impl Runtime {
         let runtime_status = self.reconcile_machine_runtime_best_effort(&config).await?;
         let state = self.machine_state(config.id).await?;
         let (status, boot_report, provision_report) = if runtime_status.is_running() {
-            match self.vmmon.client(config.id).inspect().await {
+            match self.vmmon.client(config.id).status().await {
                 Ok(response) => {
-                    let boot_report = response
-                        .boot_report
-                        .clone()
-                        .map(crate::machine::MachineBootReport::from_protocol);
-                    let provision_report = response
-                        .provision_report
-                        .clone()
-                        .map(crate::machine::MachineProvisionReport::from_protocol);
+                    let (boot_report, provision_report) = response
+                        .agent
+                        .as_ref()
+                        .and_then(|agent| match agent.mode.as_ref() {
+                            Some(protocol::v1::host_agent::Mode::Enabled(enabled)) => enabled
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.report.as_ref()),
+                            _ => None,
+                        })
+                        .map(|report| {
+                            (
+                                report
+                                    .boot
+                                    .clone()
+                                    .map(crate::machine::MachineBootReport::from_protocol),
+                                report
+                                    .provisioning
+                                    .clone()
+                                    .map(crate::machine::MachineProvisionReport::from_protocol),
+                            )
+                        })
+                        .unwrap_or((None, None));
                     (
                         MachineStatus::from_protocol(response),
                         boot_report,
@@ -1040,7 +1057,9 @@ impl Runtime {
                     )
                 }
                 Err(message) => (
-                    MachineStatus::running_with_message(format!("vmmon inspect failed: {message}")),
+                    MachineStatus::running_with_message(format!(
+                        "vmmon get_status failed: {message}"
+                    )),
                     None,
                     None,
                 ),
@@ -1339,14 +1358,15 @@ pub(crate) fn validate_root_disk_growth(
     Ok(())
 }
 
-pub(crate) fn reconcile_root_disk_size(config: &MachineConfig) -> Result<(), LibVmError> {
+pub(crate) fn reconcile_root_disk_size(
+    config: &MachineConfig,
+) -> Result<crate::machine::root_disk::RootDiskResizeOutcome, LibVmError> {
     let Some(desired_size) = config.root_disk_size else {
-        return Ok(());
+        return Ok(crate::machine::root_disk::RootDiskResizeOutcome::GuestRequired);
     };
 
     let root_disk_path = MachinePaths::new(&config.machine_dir).root_disk_path();
-    resize_raw_disk(&root_disk_path, desired_size)?;
-    Ok(())
+    resize_raw_disk(&root_disk_path, desired_size).map_err(Into::into)
 }
 
 pub(crate) async fn wait_for_monitor_stop(

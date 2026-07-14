@@ -9,7 +9,7 @@ mod types;
 mod vz;
 
 pub use crate::machine::VirtualMachine;
-pub use crate::serial::{spawn_serial_tunnel, SerialAccess, SerialConsole, SerialStream};
+pub use crate::serial::{SerialAccess, SerialConsole, SerialStream};
 pub use crate::stream::{VsockListener, VsockStream};
 pub use crate::types::{
     DiskImage, MachineIdentifier, NetworkMode, SharedDirectory, VirtError, VmConfig,

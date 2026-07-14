@@ -37,6 +37,21 @@ pub use session::{
 pub use start::{
     MachineExitCommand, MachineStartOptions, NetworkLaunch, NetworkLaunchSecret, OAuthRefreshHook,
 };
+pub use streams::{
+    FileWriteDisposition, MachineAgentConnection, MachineAgentConnectionState,
+    MachineAgentIdentity, MachineAgentMetricReport, MachineAgentMetricsObservation,
+    MachineAgentProvisionFailurePolicy, MachineAgentProvisionStepStatus,
+    MachineAgentProvisioningStepReport, MachineAgentStatus, MachineAgentStatusObservation,
+    MachineAgentStatusReport, MachineAgentStatusState, MachineBlockDeviceMetrics,
+    MachineByteStream, MachineCpuMetrics, MachineDirectoryCreateDisposition, MachineDirectoryPage,
+    MachineEnabledAgent, MachineEntryKind, MachineFileDownload, MachineFileEntry,
+    MachineFileUploadOptions, MachineFilesystemMetrics, MachineFreshness, MachineGuestBootMode,
+    MachineGuestBootReport, MachineLoadAverageMetrics, MachineMemoryMetrics, MachineMetricSnapshot,
+    MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus, MachineNetworkInterfaceMetrics,
+    MachineProvisionOverallStatus, MachineProvisioningReport, MachineReadiness,
+    MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState, MachineStaleReason,
+    MachineSystemInfo, MachineVmSnapshot, MachineVmState,
+};
 pub use update::{MachineUpdate, NetworkPolicyUpdate};
 
 pub(crate) use name_generator::generate_machine_name;

@@ -2,20 +2,48 @@ syntax = "proto3";
 
 package silo.v1;
 
-message Empty {}
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+message ByteChunk {
+  optional bytes data = 1;
+}
+
+message AgentIdentity {
+  optional string instance_id = 1;
+  optional string version = 2;
+  optional string boot_id = 3;
+}
+
+enum AgentStatusState {
+  AGENT_STATUS_STATE_UNSPECIFIED = 0;
+  AGENT_STATUS_STATE_STARTING = 1;
+  AGENT_STATUS_STATE_READY = 2;
+  AGENT_STATUS_STATE_FAILED = 3;
+}
+
+message AgentStatus {
+  AgentIdentity identity = 1;
+  AgentStatusReport report = 2;
+}
+
+message AgentStatusReport {
+  google.protobuf.Timestamp observed_at = 1;
+  optional AgentStatusState state = 2;
+  optional string code = 3;
+  optional string message = 4;
+  SystemInfo system = 5;
+  GuestBootReport boot = 6;
+  ProvisionReport provisioning = 7;
+}
 
 message SystemInfo {
-  string kernel_version = 1;
-  string os_name = 2;
-  string os_version = 3;
-  string arch = 4;
-  uint64 total_memory = 5;
-  uint64 available_memory = 6;
-  uint32 cpu_count = 7;
-  repeated double load_average = 8;
-  string hostname = 9;
-  uint64 uptime = 10;
-  repeated string ip_addresses = 11;
+  optional string kernel_version = 1;
+  optional string os_name = 2;
+  optional string os_version = 3;
+  optional string architecture = 4;
+  optional string hostname = 5;
+  repeated string ip_addresses = 6;
 }
 
 enum GuestBootMode {
@@ -26,14 +54,14 @@ enum GuestBootMode {
 }
 
 message GuestBootReport {
-  GuestBootMode mode = 1;
-  string requested_init = 2;
-  string handoff_init_path = 3;
+  optional GuestBootMode mode = 1;
+  optional string requested_init = 2;
+  optional string handoff_init_path = 3;
   repeated string probed_init_paths = 4;
-  string agent_path = 5;
-  uint32 agent_pid = 6;
-  bool agent_is_pid1 = 7;
-  string message = 8;
+  optional string agent_path = 5;
+  optional uint32 agent_pid = 6;
+  optional bool agent_is_pid1 = 7;
+  optional string message = 8;
 }
 
 enum ProvisionOverallStatus {
@@ -59,21 +87,88 @@ enum ProvisionFailurePolicy {
 }
 
 message ProvisionReport {
-  ProvisionOverallStatus status = 1;
-  int64 started_unix_ms = 2;
-  int64 finished_unix_ms = 3;
-  uint64 duration_ms = 4;
-  repeated ProvisionStepReport steps = 5;
-  string message = 6;
+  optional ProvisionOverallStatus status = 1;
+  google.protobuf.Timestamp started_at = 2;
+  google.protobuf.Timestamp finished_at = 3;
+  google.protobuf.Duration duration = 4;
+  optional string message = 5;
+  repeated ProvisionStepReport steps = 6;
 }
 
 message ProvisionStepReport {
-  string id = 1;
-  ProvisionStepStatus status = 2;
-  ProvisionFailurePolicy failure_policy = 3;
-  bool changed = 4;
-  string backend = 5;
-  uint64 duration_ms = 6;
-  string message = 7;
-  string error_chain = 8;
+  optional string id = 1;
+  optional ProvisionStepStatus status = 2;
+  optional ProvisionFailurePolicy failure_policy = 3;
+  optional bool changed = 4;
+  optional string backend = 5;
+  optional string message = 6;
+  optional string error_chain = 7;
+  google.protobuf.Duration duration = 8;
+}
+
+message AgentMetrics {
+  optional string agent_instance_id = 1;
+  AgentMetricReport report = 2;
+}
+
+message AgentMetricReport {
+  google.protobuf.Timestamp observed_at = 1;
+  MetricSnapshot snapshot = 2;
+}
+
+message MetricSnapshot {
+  MemoryMetrics memory = 1;
+  CpuMetrics cpu = 2;
+  LoadAverageMetrics load_average = 3;
+  optional double uptime_seconds = 4;
+  repeated FilesystemMetrics filesystems = 5;
+  repeated NetworkInterfaceMetrics network_interfaces = 6;
+  repeated BlockDeviceMetrics block_devices = 7;
+}
+
+message MemoryMetrics {
+  optional uint64 total_bytes = 1;
+  optional uint64 available_bytes = 2;
+}
+
+message CpuMetrics {
+  optional uint32 logical_cpu_count = 1;
+  optional double user_seconds = 2;
+  optional double nice_seconds = 3;
+  optional double system_seconds = 4;
+  optional double idle_seconds = 5;
+  optional double iowait_seconds = 6;
+  optional double irq_seconds = 7;
+  optional double softirq_seconds = 8;
+  optional double steal_seconds = 9;
+}
+
+message LoadAverageMetrics {
+  optional double one_minute = 1;
+  optional double five_minutes = 2;
+  optional double fifteen_minutes = 3;
+}
+
+message FilesystemMetrics {
+  optional string mount_point = 1;
+  optional string filesystem_type = 2;
+  optional uint64 total_bytes = 3;
+  optional uint64 used_bytes = 4;
+  optional uint64 available_bytes = 5;
+}
+
+message NetworkInterfaceMetrics {
+  optional string name = 1;
+  optional string mac = 2;
+  optional uint64 receive_bytes = 3;
+  optional uint64 transmit_bytes = 4;
+}
+
+message BlockDeviceMetrics {
+  optional string name = 1;
+  optional uint64 read_bytes = 2;
+  optional uint64 read_operations = 3;
+  optional uint64 write_bytes = 4;
+  optional uint64 write_operations = 5;
+  optional uint64 in_flight_operations = 6;
 }

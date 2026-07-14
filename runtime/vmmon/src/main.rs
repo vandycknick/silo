@@ -12,7 +12,6 @@ mod ext;
 mod guest;
 mod lock;
 mod machine;
-mod net;
 mod services;
 mod shutdown;
 mod startup;
@@ -45,8 +44,8 @@ struct Args {
     #[arg(long = "config")]
     config: PathBuf,
 
-    #[arg(long = "wait-for-registration", default_value_t = 0)]
-    wait_for_registration: u64,
+    #[arg(long = "agent-enabled")]
+    agent_enabled: bool,
 
     #[arg(long = "socket")]
     socket: PathBuf,
@@ -135,7 +134,7 @@ async fn run(args: Args, start_gate: StartGate, sync_reporter: SyncReporter) -> 
         &args.id,
         &args.name,
         &args.network,
-        std::time::Duration::from_secs(args.wait_for_registration),
+        args.agent_enabled,
         &mut start_gate,
     )
     .await
@@ -205,9 +204,10 @@ fn daemonize(args: &Args, inherited_fds: InheritedPipeFds) -> eyre::Result<()> {
         .arg(&args.exit_status)
         .arg("--config")
         .arg(&args.config);
-    cmd.arg("--wait-for-registration")
-        .arg(args.wait_for_registration.to_string())
-        .arg("--socket")
+    if args.agent_enabled {
+        cmd.arg("--agent-enabled");
+    }
+    cmd.arg("--socket")
         .arg(&args.socket)
         .arg("--serial-log")
         .arg(&args.serial_log)

@@ -1,9 +1,9 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use eyre::Context;
 use tokio_util::sync::CancellationToken;
@@ -14,7 +14,8 @@ use crate::context::{DaemonContext, RuntimeContext};
 use crate::machine::{
     machine_identifier_path_from_dir, vm_spec_machine_config, RuntimeNetwork, VmSpecInputs,
 };
-use crate::state::{new_instance_store, Action};
+use crate::state::new_instance_store;
+use protocol::v1::VmState;
 
 pub const ENV_STARTPIPE: &str = "_VM_STARTPIPE";
 pub const ENV_SYNCPIPE: &str = "_VM_SYNCPIPE";
@@ -131,14 +132,20 @@ pub async fn init(
     machine_id: &str,
     name: &str,
     network_args: &[String],
-    wait_for_registration: Duration,
+    agent_enabled: bool,
     start_gate: &mut StartGate,
 ) -> eyre::Result<DaemonContext> {
     let spec = load_spec(runtime)?;
-    let guest_services_enabled = !wait_for_registration.is_zero();
+    let guest_services_enabled = agent_enabled;
     let network = parse_network_args(network_args)?;
 
-    tracing::info!(instance = %name, "vmmon starting");
+    tracing::info!(
+        instance = %name,
+        machine_id,
+        agent_enabled = guest_services_enabled,
+        "vmmon starting"
+    );
+    secure_machine_dir(runtime.dir())?;
     remove_stale_socket(runtime.socket())?;
 
     let machine_config = vm_spec_machine_config(VmSpecInputs {
@@ -158,22 +165,34 @@ pub async fn init(
     }
 
     let serial_console = machine.serial();
-    let store = Arc::new(new_instance_store(guest_services_enabled));
+    let canonical_machine_id = uuid::Uuid::parse_str(machine_id)
+        .map_err(|error| eyre::eyre!("invalid machine UUID {machine_id}: {error}"))?
+        .hyphenated()
+        .to_string();
+    let store = Arc::new(new_instance_store(
+        canonical_machine_id,
+        name.to_string(),
+        guest_services_enabled,
+    ));
 
-    store.dispatch(Action::vm_starting())?;
+    store.set_vm_state(VmState::Starting, "vm starting")?;
     start_gate.wait_for_release().await?;
     machine.start().await?;
-    store.dispatch(Action::vm_running())?;
+    store.set_vm_state(VmState::Running, "vm running")?;
 
     Ok(DaemonContext {
         spec,
         guest_services_enabled,
-        wait_for_registration,
         machine,
         serial_console,
         store,
         shutdown: CancellationToken::new(),
     })
+}
+
+fn secure_machine_dir(path: &std::path::Path) -> eyre::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .context(format!("secure machine directory {}", path.display()))
 }
 
 fn load_spec(runtime: &RuntimeContext) -> eyre::Result<VmSpec> {
@@ -268,12 +287,34 @@ fn set_cloexec(fd: RawFd, enabled: bool) -> io::Result<()> {
 mod tests {
     use std::io::{Read, Write};
     use std::os::fd::IntoRawFd;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use nix::unistd::pipe;
 
     use crate::machine::RuntimeNetwork;
-    use crate::startup::{parse_network_arg, StartGate, SyncReporter};
+    use crate::startup::{parse_network_arg, secure_machine_dir, StartGate, SyncReporter};
+
+    #[test]
+    fn machine_directory_is_restricted_to_its_owner() {
+        let directory =
+            std::env::temp_dir().join(format!("silo-vmmon-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).expect("create test machine directory");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777))
+            .expect("make legacy directory permissive");
+
+        secure_machine_dir(&directory).expect("secure machine directory");
+
+        assert_eq!(
+            std::fs::metadata(&directory)
+                .expect("machine directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        std::fs::remove_dir(directory).expect("remove test machine directory");
+    }
 
     #[tokio::test]
     async fn start_gate_waits_for_release_byte() {

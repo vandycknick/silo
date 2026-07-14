@@ -1,14 +1,14 @@
 use std::time::Duration;
 
-use protocol::v1::LifecycleState;
+use protocol::v1::VmState;
 use tokio::signal;
 use virt::VmExit;
 
 use crate::context::{DaemonContext, RuntimeContext};
 use crate::services::ServiceHandles;
-use crate::state::{select_current_inspect, Action};
 
 const VM_STOP_TIMEOUT: Duration = Duration::from_secs(45);
+const SERVICE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub async fn run(
     runtime: RuntimeContext,
@@ -18,25 +18,23 @@ pub async fn run(
     let forced = tokio::select! {
         _ = wait_for_signal() => {
             tracing::info!(instance = %ctx.machine.name(), "shutdown signal received");
-            ctx.store.dispatch(Action::VmTransition {
-                state: LifecycleState::Stopping,
-                message: String::from("shutdown requested"),
-            })?;
+            ctx.store.set_vm_state(VmState::Stopping, "shutdown requested")?;
+            handles.mark_stopping().await;
             ctx.shutdown.cancel();
             graceful_stop(&ctx).await?
         }
         result = wait_for_machine_stop(&ctx.machine) => {
             let stop_info = result?;
             tracing::info!(instance = %ctx.machine.name(), message = %stop_info.message, "machine exited");
-            ctx.store.dispatch(Action::VmTransition {
-                state: LifecycleState::Stopped,
-                message: stop_info.message,
-            })?;
+            ctx.store.set_vm_state(VmState::Stopped, stop_info.message)?;
+            handles.mark_stopping().await;
             ctx.shutdown.cancel();
             false
         }
     };
 
+    handles.mark_not_serving().await;
+    handles.server_shutdown.cancel();
     drain(&mut handles).await;
     cleanup(&runtime, &ctx).await?;
 
@@ -57,10 +55,7 @@ async fn graceful_stop(ctx: &DaemonContext) -> eyre::Result<bool> {
         result = stop_task => {
             match result {
                 Ok(Ok(())) => {
-                    ctx.store.dispatch(Action::VmTransition {
-                        state: LifecycleState::Stopped,
-                        message: String::from("vm stopped"),
-                    })?;
+                    ctx.store.set_vm_state(VmState::Stopped, "vm stopped")?;
                     Ok(false)
                 }
                 Ok(Err(err)) => Err(err.into()),
@@ -79,29 +74,57 @@ async fn graceful_stop(ctx: &DaemonContext) -> eyre::Result<bool> {
 
 async fn drain(handles: &mut ServiceHandles) {
     if let Some(task) = handles.guest_monitor.take() {
-        if let Err(err) = task.await {
-            tracing::error!(error = %err, "guest monitor task failed during shutdown");
-        }
+        drain_task(task, "guest monitor").await;
     }
 
     if let Some(task) = handles.endpoint_supervisor.take() {
-        if let Err(err) = task.await {
-            tracing::error!(error = %err, "endpoint supervisor task failed during shutdown");
-        }
+        drain_task(task, "endpoint supervisor").await;
     }
 
-    match (&mut handles.control_socket).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            tracing::error!(error = %err, "control socket exited with error during shutdown");
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "control socket task failed during shutdown");
-        }
-    }
+    drain_result_task(&mut handles.control_socket, "control socket").await;
 
     handles.serial_log.abort();
     let _ = (&mut handles.serial_log).await;
+}
+
+async fn drain_task(mut task: tokio::task::JoinHandle<()>, label: &'static str) {
+    match tokio::time::timeout(SERVICE_DRAIN_TIMEOUT, &mut task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::error!(%error, task = label, "service task failed during shutdown")
+        }
+        Err(_) => {
+            tracing::warn!(
+                task = label,
+                "service task exceeded shutdown drain; aborting"
+            );
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+async fn drain_result_task(
+    task: &mut tokio::task::JoinHandle<eyre::Result<()>>,
+    label: &'static str,
+) {
+    match tokio::time::timeout(SERVICE_DRAIN_TIMEOUT, &mut *task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            tracing::error!(%error, task = label, "service task exited with error")
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%error, task = label, "service task failed during shutdown")
+        }
+        Err(_) => {
+            tracing::warn!(
+                task = label,
+                "service task exceeded shutdown drain; aborting"
+            );
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }
 
 struct VmStopInfo {
@@ -118,9 +141,8 @@ async fn wait_for_machine_stop(machine: &virt::VirtualMachine) -> Result<VmStopI
 }
 
 async fn cleanup(_runtime: &RuntimeContext, ctx: &DaemonContext) -> eyre::Result<()> {
-    let snapshot = ctx.store.snapshot()?;
-    let inspect = select_current_inspect(&snapshot);
-    tracing::debug!(summary = %inspect.summary, "final vmmon status snapshot");
+    let status = ctx.store.status()?;
+    tracing::debug!(?status, "final vmmon status snapshot");
 
     tracing::info!(instance = %ctx.machine.name(), "instance stopped");
     Ok(())

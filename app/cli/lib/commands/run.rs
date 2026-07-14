@@ -1,5 +1,8 @@
 use clap::Args;
-use libvm::{ImageProgressSender, MachineRef, Runtime, DEFAULT_GUEST_READINESS_TIMEOUT};
+use libvm::{
+    ImageProgressSender, MachineReadinessOutcome, MachineRef, Runtime,
+    DEFAULT_GUEST_READINESS_TIMEOUT,
+};
 use std::collections::BTreeMap;
 use vm_spec::Mount;
 
@@ -86,10 +89,10 @@ impl Cmd {
             .start_with_options(machine_start_options(runtime, &machine).await?)
             .await?;
         progress.step("Waiting", &machine_name);
-        machine
-            .wait_for_guest_running(DEFAULT_GUEST_READINESS_TIMEOUT)
-            .await
-            .map_err(|error| eyre::eyre!("guest readiness check failed: {error}"))?;
+        let readiness = machine.wait_ready(DEFAULT_GUEST_READINESS_TIMEOUT).await?;
+        if readiness.outcome != MachineReadinessOutcome::Ready {
+            eyre::bail!("guest readiness check ended with {:?}", readiness.outcome);
+        }
 
         progress.step("Ready", &machine_name);
         progress.finish_success("Started");

@@ -14,6 +14,12 @@ pub(crate) enum CloneDiskMethod {
     Copy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootDiskResizeOutcome {
+    OfflineComplete,
+    GuestRequired,
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum RootDiskError {
     #[error("base rootfs {path} does not exist")]
@@ -71,7 +77,10 @@ pub(crate) fn clone_or_copy_root_disk(
     Ok(CloneDiskMethod::Copy)
 }
 
-pub(crate) fn resize_raw_disk(path: &Path, size_bytes: u64) -> Result<(), RootDiskError> {
+pub(crate) fn resize_raw_disk(
+    path: &Path,
+    size_bytes: u64,
+) -> Result<RootDiskResizeOutcome, RootDiskError> {
     let mut file = File::options().read(true).write(true).open(path)?;
     let current_size = file.metadata()?.len();
     if size_bytes < current_size {
@@ -85,11 +94,11 @@ pub(crate) fn resize_raw_disk(path: &Path, size_bytes: u64) -> Result<(), RootDi
     let is_ext4 = has_ext4_superblock(&mut file)?;
     drop(file);
 
-    if is_ext4 {
+    let outcome = if is_ext4 {
         let filesystem_size = size_bytes - size_bytes % 4096;
         match ext4::grow_image(path, filesystem_size) {
-            Ok(_) => {}
-            Err(err) if err.can_fallback_online() => {}
+            Ok(_) => RootDiskResizeOutcome::OfflineComplete,
+            Err(err) if err.can_fallback_online() => RootDiskResizeOutcome::GuestRequired,
             Err(source) => {
                 return Err(RootDiskError::Ext4 {
                     path: path.to_path_buf(),
@@ -97,13 +106,15 @@ pub(crate) fn resize_raw_disk(path: &Path, size_bytes: u64) -> Result<(), RootDi
                 });
             }
         }
-    }
+    } else {
+        RootDiskResizeOutcome::GuestRequired
+    };
 
     File::options()
         .write(true)
         .open(path)?
         .set_len(size_bytes)?;
-    Ok(())
+    Ok(outcome)
 }
 
 fn has_ext4_superblock(file: &mut File) -> io::Result<bool> {
@@ -184,7 +195,9 @@ mod tests {
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
 
-    use crate::machine::root_disk::{clone_or_copy_root_disk, resize_raw_disk, RootDiskError};
+    use crate::machine::root_disk::{
+        clone_or_copy_root_disk, resize_raw_disk, RootDiskError, RootDiskResizeOutcome,
+    };
 
     #[test]
     fn clone_or_copy_root_disk_copies_contents() {
@@ -221,8 +234,9 @@ mod tests {
         let old_size = fs::metadata(&path).expect("metadata").len();
         let new_size = old_size + 128 * 1024 * 1024;
 
-        resize_raw_disk(&path, new_size).expect("resize disk");
+        let outcome = resize_raw_disk(&path, new_size).expect("resize disk");
 
+        assert_eq!(outcome, RootDiskResizeOutcome::OfflineComplete);
         assert_eq!(fs::metadata(&path).expect("metadata").len(), new_size);
         let reader = ext4::Reader::new(&path).expect("open grown ext4 image");
         assert_eq!(reader.superblock().blocks_count_lo as u64 * 4096, new_size);
@@ -271,8 +285,9 @@ mod tests {
         let path = temp.path().join("rootfs.img");
         fs::write(&path, b"not ext4").expect("write disk");
 
-        resize_raw_disk(&path, 4096).expect("extend non-ext4 disk");
+        let outcome = resize_raw_disk(&path, 4096).expect("extend non-ext4 disk");
 
+        assert_eq!(outcome, RootDiskResizeOutcome::GuestRequired);
         assert_eq!(fs::metadata(&path).expect("metadata").len(), 4096);
         assert_eq!(&fs::read(&path).expect("read disk")[..8], b"not ext4");
     }
@@ -301,8 +316,9 @@ mod tests {
         drop(file);
         let new_size = old_size + 128 * 1024 * 1024;
 
-        resize_raw_disk(&path, new_size).expect("defer resize to guest");
+        let outcome = resize_raw_disk(&path, new_size).expect("defer resize to guest");
 
+        assert_eq!(outcome, RootDiskResizeOutcome::GuestRequired);
         assert_eq!(fs::metadata(&path).expect("metadata").len(), new_size);
         let reader = ext4::Reader::new(&path).expect("open unchanged ext4 image");
         assert_eq!(reader.superblock().blocks_count_lo as u64 * 4096, old_size);

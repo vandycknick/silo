@@ -1,9 +1,11 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("silo-agent only supports Linux guests");
 
+mod filesystem;
 mod forward;
 mod handoff;
 mod host;
+mod metrics;
 mod pid1;
 mod port;
 mod provision;
@@ -29,7 +31,7 @@ use crate::handoff::BootMode;
 use crate::pid1::ProcessSupervisor;
 use crate::port::from_kernel_cmdline;
 use crate::provision::run_provisioning;
-use crate::rpc::GuestControlClient;
+use crate::rpc::AgentServer;
 use crate::server::VsockServer;
 use crate::ssh::SshService;
 
@@ -95,8 +97,10 @@ fn main() -> eyre::Result<()> {
 }
 
 fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(_) => tracing_subscriber::EnvFilter::new("info"),
+    };
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -144,32 +148,42 @@ async fn run_agent(
 ) -> eyre::Result<()> {
     tracing::info!(boot_mode = ?boot_mode, "agent starting");
 
-    let control_port = from_kernel_cmdline();
-    let mut control = GuestControlClient::connect(control_port).await?;
-
     let boot_report = boot_mode.report();
-    let provision_report = run_provisioning(
+    let agent_server = AgentServer::start(from_kernel_cmdline(), boot_report.clone()).await?;
+    let provision_report = match run_provisioning(
         &agent_config.provision,
         &agent_config.ssh,
         &process_supervisor,
         boot_mode,
-    )?;
-
-    if provision_report.status == ProvisionOverallStatus::FailedBoot as i32 {
-        control
-            .register(boot_report, provision_report)
-            .await
-            .context("register fatal guest provisioning report")?;
-        if process_supervisor.is_active() {
-            return process_supervisor.shutdown().await;
+    ) {
+        Ok(report) => report,
+        Err(err) => {
+            agent_server.fail(format!("provisioning failed: {err}"));
+            agent_server.shutdown().await?;
+            return Err(err);
         }
+    };
+    agent_server.update(boot_report.clone(), provision_report.clone());
+
+    if provision_report.status == Some(ProvisionOverallStatus::FailedBoot as i32) {
+        agent_server.fail("guest provisioning requested boot failure");
+        if process_supervisor.is_active() {
+            let result = process_supervisor.shutdown().await;
+            agent_server.shutdown().await?;
+            return result;
+        }
+        agent_server.shutdown().await?;
         eyre::bail!("guest provisioning requested boot failure");
     }
 
     let mut running_servers = Vec::new();
     let mut server_abort_handles = Vec::new();
 
-    let ssh_service = SshService::new(agent_config.ssh.clone(), process_supervisor.clone())?;
+    let ssh_service = SshService::new(agent_config.ssh.clone(), process_supervisor.clone())
+        .map_err(|error| {
+            agent_server.fail(format!("SSH startup failed: {error}"));
+            error
+        })?;
     let ssh_connection_service = ssh_service.clone();
     let owns_ssh_listener = match VsockServer::create(move |stream| {
         let ssh_service = ssh_connection_service.clone();
@@ -195,6 +209,7 @@ async fn run_agent(
             false
         }
         Err(err) => {
+            agent_server.fail(format!("SSH listener startup failed: {err}"));
             return Err(eyre::eyre!(
                 "listen for SSH vsock connections on port {SSH_VSOCK_PORT}: {err}"
             ));
@@ -202,31 +217,44 @@ async fn run_agent(
     };
 
     if owns_ssh_listener {
-        ssh_service.wait_ready().await?;
+        ssh_service.wait_ready().await.map_err(|error| {
+            agent_server.fail(format!("SSH startup failed: {error}"));
+            error
+        })?;
     }
 
     if agent_config.forward.enabled {
         if agent_config.forward.port == 0 {
+            agent_server
+                .fail("forward guest runtime is enabled but no endpoint port was configured");
             return Err(eyre::eyre!(
                 "forward guest runtime is enabled but no 'forward' endpoint port was configured"
             ));
         }
 
-        let forward_service = ForwardService::new(agent_config.forward.clone())?;
+        let forward_service =
+            ForwardService::new(agent_config.forward.clone()).map_err(|error| {
+                agent_server.fail(format!("forward startup failed: {error}"));
+                error
+            })?;
         let forward_server = VsockServer::create(move |stream| {
             let forward_service = forward_service.clone();
             async move { forward_service.handle_connection(stream).await }
         })
         .with_concurrency(256)
         .with_tracing(tracing::info_span!("vsock_server", service = "forward"))
-        .listen(agent_config.forward.port)?;
+        .listen(agent_config.forward.port)
+        .map_err(|error| {
+            agent_server.fail(format!("forward listener startup failed: {error}"));
+            error
+        })?;
         if let Some(abort_handle) = forward_server.abort_handle() {
             server_abort_handles.push(abort_handle);
         }
         running_servers.push(forward_server);
     }
 
-    control.register(boot_report, provision_report).await?;
+    agent_server.ready(boot_report, provision_report);
 
     let mut join_set = tokio::task::JoinSet::new();
     for server in running_servers {
@@ -263,6 +291,7 @@ async fn run_agent(
     join_set.abort_all();
     while join_set.join_next().await.is_some() {}
 
+    agent_server.shutdown().await?;
     result
 }
 

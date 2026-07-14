@@ -816,7 +816,7 @@ impl Machine {
         })?;
         let started = Instant::now();
         let mut handle = loop {
-            let stream = self.open_shell_stream(true).await?;
+            let stream = self.open_shell_stream().await?;
             match russh::client::connect_stream(
                 Arc::new(russh::client::Config::default()),
                 stream,

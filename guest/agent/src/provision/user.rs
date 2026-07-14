@@ -83,13 +83,7 @@ fn create_user(context: &ProvisionContext, user: &UserConfig) -> eyre::Result<()
         ],
     )?;
 
-    if user.lock_passwd && command_exists("passwd") {
-        run_command(
-            context.process_supervisor(),
-            "passwd",
-            ["--lock", user.name.as_str()],
-        )?;
-    }
+    // shadow-utils useradd creates new accounts locked when no password is supplied.
 
     tracing::info!(user = %user.name, uid = user.uid, "provisioned user");
     Ok(())

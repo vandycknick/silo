@@ -11,15 +11,19 @@ use crate::provision::{
     write_file, FailurePolicy, ProvisionContext, ProvisionOutcome, Provisioner, ProvisionerId,
 };
 
+const LOOPBACK_INTERFACE: &str = "lo";
+
 pub(crate) struct Network<'a> {
-    config: &'a NetworkConfig,
+    config: Option<&'a NetworkConfig>,
 }
 
 impl<'a> Provisioner<'a> for Network<'a> {
-    type Config = NetworkConfig;
+    type Config = Option<NetworkConfig>;
 
     fn init(config: &'a Self::Config) -> Self {
-        Self { config }
+        Self {
+            config: config.as_ref(),
+        }
     }
 
     fn id(&self) -> ProvisionerId {
@@ -31,8 +35,16 @@ impl<'a> Provisioner<'a> for Network<'a> {
     }
 
     fn apply(&self, context: &ProvisionContext) -> eyre::Result<ProvisionOutcome> {
-        let interface = self
-            .config
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(configure_loopback())
+        })?;
+
+        let Some(config) = self.config else {
+            tracing::info!("ensured guest loopback interface is up");
+            return Ok(ProvisionOutcome::succeeded(true));
+        };
+
+        let interface = config
             .interfaces
             .first()
             .ok_or_else(|| eyre::eyre!("static network config has no interface"))?;
@@ -54,23 +66,28 @@ impl<'a> Provisioner<'a> for Network<'a> {
     }
 }
 
+async fn configure_loopback() -> eyre::Result<()> {
+    let index = interface_index(LOOPBACK_INTERFACE)?;
+    let (connection, handle, _) =
+        rtnetlink::new_connection().context("open rtnetlink connection")?;
+    let connection_task = tokio::spawn(connection);
+
+    let result = bring_link_up(&handle, index, LOOPBACK_INTERFACE).await;
+    connection_task.abort();
+    result
+}
+
 async fn configure_interface(
     interface_name: &str,
     interface: &NetworkInterfaceConfig,
 ) -> eyre::Result<()> {
-    let index = if_nametoindex(interface_name)
-        .with_context(|| format!("resolve network interface index for {interface_name}"))?;
+    let index = interface_index(interface_name)?;
     let (connection, handle, _) =
         rtnetlink::new_connection().context("open rtnetlink connection")?;
     let connection_task = tokio::spawn(connection);
 
     let result = async {
-        handle
-            .link()
-            .set(LinkUnspec::new_with_index(index).up().build())
-            .execute()
-            .await
-            .with_context(|| format!("bring network interface {interface_name} up"))?;
+        bring_link_up(&handle, index, interface_name).await?;
 
         handle
             .address()
@@ -110,6 +127,28 @@ async fn configure_interface(
 
     connection_task.abort();
     result
+}
+
+fn interface_index(interface_name: &str) -> eyre::Result<u32> {
+    if_nametoindex(interface_name)
+        .with_context(|| format!("resolve network interface index for {interface_name}"))
+}
+
+async fn bring_link_up(
+    handle: &rtnetlink::Handle,
+    index: u32,
+    interface_name: &str,
+) -> eyre::Result<()> {
+    handle
+        .link()
+        .set(link_up_message(index))
+        .execute()
+        .await
+        .with_context(|| format!("bring network interface {interface_name} up"))
+}
+
+fn link_up_message(index: u32) -> rtnetlink::packet_route::link::LinkMessage {
+    LinkUnspec::new_with_index(index).up().build()
 }
 
 fn interface_name_for_mac(mac_address: &str) -> eyre::Result<String> {
@@ -187,11 +226,21 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use agent_spec::NetworkDnsConfig;
+    use rtnetlink::packet_route::link::LinkFlags;
 
     use crate::provision::network::{
-        interface_name_for_mac_in, render_resolv_conf, replace_resolv_conf,
+        interface_name_for_mac_in, link_up_message, render_resolv_conf, replace_resolv_conf,
     };
     use crate::provision::ProvisionContext;
+
+    #[test]
+    fn link_up_message_sets_interface_up() {
+        let message = link_up_message(7);
+
+        assert_eq!(message.header.index, 7);
+        assert_eq!(message.header.flags, LinkFlags::Up);
+        assert_eq!(message.header.change_mask, LinkFlags::Up);
+    }
 
     #[test]
     fn finds_interface_by_mac_address() {

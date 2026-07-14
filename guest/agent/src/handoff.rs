@@ -35,37 +35,39 @@ impl BootMode {
         let agent_pid = std::process::id();
         match self {
             Self::Standard => GuestBootReport {
-                mode: GuestBootMode::Standard as i32,
-                requested_init: String::new(),
-                handoff_init_path: String::new(),
+                mode: Some(GuestBootMode::Standard as i32),
+                requested_init: None,
+                handoff_init_path: None,
                 probed_init_paths: Vec::new(),
-                agent_path: current_agent_path(),
-                agent_pid,
-                agent_is_pid1: agent_pid == 1,
-                message: String::from("agent started in standard mode"),
+                agent_path: Some(current_agent_path()),
+                agent_pid: Some(agent_pid),
+                agent_is_pid1: Some(agent_pid == 1),
+                message: Some(String::from("agent started in standard mode")),
             },
             Self::AgentPid1 { requested_init } => GuestBootReport {
-                mode: GuestBootMode::AgentPid1 as i32,
-                requested_init: os_to_string(requested_init),
-                handoff_init_path: String::new(),
+                mode: Some(GuestBootMode::AgentPid1 as i32),
+                requested_init: Some(os_to_string(requested_init)),
+                handoff_init_path: None,
                 probed_init_paths: probed_init_paths(requested_init),
-                agent_path: current_agent_path(),
-                agent_pid,
-                agent_is_pid1: agent_pid == 1,
-                message: String::from("no executable init found; agent remains PID 1"),
+                agent_path: Some(current_agent_path()),
+                agent_pid: Some(agent_pid),
+                agent_is_pid1: Some(agent_pid == 1),
+                message: Some(String::from(
+                    "no executable init found; agent remains PID 1",
+                )),
             },
             Self::InitChild {
                 requested_init,
                 init_path,
             } => GuestBootReport {
-                mode: GuestBootMode::InitChild as i32,
-                requested_init: os_to_string(requested_init),
-                handoff_init_path: init_path.display().to_string(),
+                mode: Some(GuestBootMode::InitChild as i32),
+                requested_init: Some(os_to_string(requested_init)),
+                handoff_init_path: Some(init_path.display().to_string()),
                 probed_init_paths: probed_init_paths(requested_init),
-                agent_path: current_agent_path(),
-                agent_pid,
-                agent_is_pid1: agent_pid == 1,
-                message: String::from("agent handed PID 1 to guest init"),
+                agent_path: Some(current_agent_path()),
+                agent_pid: Some(agent_pid),
+                agent_is_pid1: Some(agent_pid == 1),
+                message: Some(String::from("agent handed PID 1 to guest init")),
             },
         }
     }
@@ -256,8 +258,8 @@ mod tests {
         }
         .report();
 
-        assert_eq!(report.mode, GuestBootMode::AgentPid1 as i32);
-        assert_eq!(report.requested_init, HANDOFF_AUTO);
+        assert_eq!(report.mode, Some(GuestBootMode::AgentPid1 as i32));
+        assert_eq!(report.requested_init.as_deref(), Some(HANDOFF_AUTO));
         assert_eq!(
             report.probed_init_paths,
             HANDOFF_AUTO_CANDIDATES
@@ -266,7 +268,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(!report.probed_init_paths.iter().any(|path| path == "/init"));
-        assert!(report.agent_pid > 0);
+        assert!(report.agent_pid.unwrap_or_default() > 0);
     }
 
     #[test]

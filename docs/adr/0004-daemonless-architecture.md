@@ -26,7 +26,7 @@ Silo adopts a daemonless, config-driven architecture with these roles:
 
 - `silo` is a thin frontend over `libvm`.
 - `silo-core` owns the canonical shared domain model, including `VmSpec`, machine identity types, and guest service configuration types.
-- `libvm` owns manager-side lifecycle, machine inventory, on-disk layout, image policy, bootstrap materialization, Negotiate client behavior, and `vmmon` process spawning.
+- `libvm` owns manager-side lifecycle, machine inventory, on-disk layout, image policy, bootstrap materialization, host gRPC client behavior, and `vmmon` process spawning.
 - `vmmon` is the canonical per-VM monitor. It is a small-footprint runtime supervisor that owns one running VM.
 - `virt` is the host virtualization facade used by `vmmon`.
 
@@ -41,7 +41,7 @@ This architecture is intentionally daemonless by default. A future daemon or tun
 - Keep `vmmon` focused on runtime supervision instead of manager concerns.
 - Make machine startup config-driven from the per-instance `config.yaml`.
 - Keep `libvm` as the architectural boundary between daemonless local ABI mode and future daemon or tunnel mode.
-- Preserve the current Negotiate upgrade model for serial, shell, and RPC access.
+- Keep one machine-scoped gRPC control socket for monitor, filesystem, serial, and shell access.
 - Keep machine identity and manager metadata in manager-owned state, not in the monitor.
 
 ## Non-goals
@@ -49,7 +49,7 @@ This architecture is intentionally daemonless by default. A future daemon or tun
 - Introducing a central always-on daemon as the primary architecture.
 - Moving global machine inventory into `vmmon`.
 - Replacing `config.yaml` with database-only machine definitions.
-- Redesigning the Negotiate protocol.
+- Defining the detailed host and guest gRPC contract, which belongs to [ADR 0008](0008-vmmon-host-and-guest-grpc-api.md).
 - Defining the final future daemon API in this ADR.
 
 ## Component Boundaries
@@ -70,7 +70,7 @@ It does not own:
 - machine lifecycle policy,
 - direct monitor spawning,
 - pidfile polling for startup,
-- direct Negotiate protocol ownership,
+- direct host gRPC protocol ownership,
 - direct `vmmon` lifecycle management.
 
 ### `silo-core`
@@ -110,7 +110,7 @@ It owns:
 - bootstrap and guest runtime materialization,
 - spawning `vmmon`,
 - monitor stop signaling,
-- Negotiate client behavior,
+- generated host gRPC client behavior,
 - manager-side status and stream attachment through `vmmon`.
 
 It does not own:
@@ -131,10 +131,9 @@ It owns:
 - self-daemonization by default,
 - a foreground mode for tests and debugging,
 - creating and supervising one VM,
-- serving `VmMonitorService`,
-- serving the Negotiate protocol for monitor upgrades,
+- serving the host gRPC services defined by ADR 0008,
 - runtime state for VM and guest readiness,
-- serial attach, shell attach, and API upgrade handling,
+- serial attach, shell attach, and guest filesystem proxying,
 - signal-driven shutdown.
 
 It does not own:
@@ -320,36 +319,17 @@ Guest service configuration used during bootstrap and readiness lives in `silo-c
 
 ## `vmmon` API and Protocol Ownership
 
-### `VmMonitorService`
+`vmmon` exposes one machine-scoped gRPC endpoint on its Unix socket. The host
+surface groups monitor state, readiness, metrics, SSH and serial streams, and
+the guest filesystem proxy. `libvm` owns the generated clients and presents
+manager-side domain types to the CLI.
 
-`VmMonitorService` is the per-VM monitor API exposed by `vmmon`.
+[ADR 0008](0008-vmmon-host-and-guest-grpc-api.md) owns the service inventory,
+protobuf contract, streaming behavior, readiness, health, reflection, and
+guest-vsock API. This ADR owns only the process boundary.
 
-It currently includes:
-
-- `Ping`
-- `Inspect`
-- `WatchStatus`
-
-It does not include `Stop`.
-
-Shutdown remains signal-driven and manager-owned.
-
-### Negotiate ownership
-
-The current Negotiate protocol remains part of the architecture.
-
-It is used to upgrade a connection into:
-
-- serial attach,
-- shell attach,
-- monitor RPC.
-
-Ownership is:
-
-- `vmmon`: Negotiate server implementation,
-- `libvm`: Negotiate client implementation.
-
-This preserves the existing connection-upgrade model while keeping the CLI out of protocol ownership.
+The host API does not include a VM `Stop` RPC. Shutdown remains signal-driven
+and manager-owned.
 
 ## `vmmon` Process Model
 
@@ -410,7 +390,7 @@ Future work may refine signal choice and add a stronger durable exit-state contr
 - Machine startup is config-driven from canonical on-disk state.
 - `vmmon` stays focused on runtime supervision with a small surface area.
 - `libvm` can preserve a clean split between daemonless mode now and daemon or tunnel mode later.
-- Existing Negotiate behavior is preserved while ownership moves to the right layers.
+- One typed gRPC endpoint keeps protocol ownership in `libvm` and `vmmon` while the CLI remains transport-agnostic.
 
 ### Negative
 

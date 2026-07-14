@@ -1,5 +1,5 @@
 use clap::Args;
-use libvm::{LibVmError, DEFAULT_GUEST_READINESS_TIMEOUT};
+use libvm::{LibVmError, MachineReadinessOutcome, DEFAULT_GUEST_READINESS_TIMEOUT};
 
 use crate::commands::start_options::machine_start_options;
 use crate::context::Context;
@@ -32,10 +32,10 @@ impl Cmd {
         let data = machine.start_with_options(options).await?;
 
         spinner.step("Waiting", &name);
-        machine
-            .wait_for_guest_running(DEFAULT_GUEST_READINESS_TIMEOUT)
-            .await
-            .map_err(|err| eyre::eyre!("guest readiness check failed: {err}"))?;
+        let readiness = machine.wait_ready(DEFAULT_GUEST_READINESS_TIMEOUT).await?;
+        if readiness.outcome != MachineReadinessOutcome::Ready {
+            eyre::bail!("guest readiness check ended with {:?}", readiness.outcome);
+        }
 
         spinner.step("Ready", &data.name);
         spinner.finish_success("Restarted");

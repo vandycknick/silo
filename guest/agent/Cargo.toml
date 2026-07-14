@@ -12,7 +12,7 @@ agent-spec = { path = "../../specs/agent-spec" }
 protocol = { path = "../../specs/protocol" }
 eyre = "0.6.12"
 futures = "0.3.32"
-hyper-util = { version = "0.1.20", features = ["tokio"] }
+bytes = "1.11.1"
 clap = { version = "4.6.1", default-features = false, features = ["derive", "std"] }
 nix = { version = "0.31.3", features = ["feature", "fs", "hostname", "mount", "net", "process", "signal", "term", "user"] }
 rustix = { version = "1.1.4", features = ["fs", "mount", "process", "system"] }
@@ -24,9 +24,13 @@ sha2 = "0.11.0"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "io-util", "net", "process", "time", "sync"] }
 tokio-vsock = "0.7.2"
 tonic = { version = "0.14.6", features = ["transport"] }
-tower = "0.5.3"
+tonic-health = "0.14.6"
+tonic-reflection = "0.14.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+prost-types = "0.14.4"
+tokio-stream = "0.1.18"
+uuid = { version = "1.23.4", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

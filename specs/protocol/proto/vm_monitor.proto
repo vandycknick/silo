@@ -3,51 +3,152 @@ syntax = "proto3";
 package silo.v1;
 
 import "common.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 
 service VmMonitorService {
-  rpc Ping(PingRequest) returns (PingResponse);
-  rpc Inspect(InspectRequest) returns (InspectResponse);
-  rpc WatchStatus(WatchStatusRequest) returns (stream StatusUpdate);
+  rpc GetStatus(GetStatusRequest) returns (HostStatus);
+  rpc WaitReady(WaitReadyRequest) returns (WaitReadyResponse);
+  rpc GetMetrics(GetMetricsRequest) returns (HostMetrics);
 }
 
-message PingRequest {}
-
-message PingResponse {
-  bool ok = 1;
-  string message = 2;
+service VmAccessService {
+  rpc OpenSsh(stream ByteChunk) returns (stream ByteChunk);
+  rpc OpenSerial(stream ByteChunk) returns (stream ByteChunk);
 }
 
-message InspectRequest {}
+message GetStatusRequest {}
 
-message InspectResponse {
-  LifecycleState vm_state = 1;
-  LifecycleState guest_state = 2;
-  bool ready = 3;
-  string summary = 4;
-  GuestBootReport boot_report = 5;
-  ProvisionReport provision_report = 6;
+message WaitReadyRequest {
+  google.protobuf.Duration max_wait = 1;
 }
 
-message WatchStatusRequest {}
-
-enum StatusSource {
-  STATUS_SOURCE_UNSPECIFIED = 0;
-  STATUS_SOURCE_VM = 1;
-  STATUS_SOURCE_GUEST = 2;
+enum WaitReadyOutcome {
+  WAIT_READY_OUTCOME_UNSPECIFIED = 0;
+  WAIT_READY_OUTCOME_READY = 1;
+  WAIT_READY_OUTCOME_TERMINAL = 2;
+  WAIT_READY_OUTCOME_TIMED_OUT = 3;
 }
 
-enum LifecycleState {
-  LIFECYCLE_STATE_UNSPECIFIED = 0;
-  LIFECYCLE_STATE_STARTING = 1;
-  LIFECYCLE_STATE_RUNNING = 2;
-  LIFECYCLE_STATE_STOPPING = 3;
-  LIFECYCLE_STATE_STOPPED = 4;
-  LIFECYCLE_STATE_ERROR = 5;
+message WaitReadyResponse {
+  optional WaitReadyOutcome outcome = 1;
+  HostStatus status = 2;
 }
 
-message StatusUpdate {
-  StatusSource source = 1;
-  LifecycleState state = 2;
-  string message = 3;
-  int64 timestamp_unix_ms = 4;
+message GetMetricsRequest {}
+
+enum VmState {
+  VM_STATE_UNSPECIFIED = 0;
+  VM_STATE_STARTING = 1;
+  VM_STATE_RUNNING = 2;
+  VM_STATE_STOPPING = 3;
+  VM_STATE_STOPPED = 4;
+  VM_STATE_FAILED = 5;
+}
+
+enum ReadinessReason {
+  READINESS_REASON_UNSPECIFIED = 0;
+  READINESS_REASON_VM_STARTING = 1;
+  READINESS_REASON_VM_STOPPING = 2;
+  READINESS_REASON_VM_STOPPED = 3;
+  READINESS_REASON_VM_FAILED = 4;
+  READINESS_REASON_AGENT_NOT_REQUIRED = 5;
+  READINESS_REASON_AGENT_UNAVAILABLE = 6;
+  READINESS_REASON_AGENT_STATUS_STALE = 7;
+  READINESS_REASON_GUEST_STARTING = 8;
+  READINESS_REASON_GUEST_FAILED = 9;
+  READINESS_REASON_GUEST_REPORTED_READY = 10;
+}
+
+enum AgentConnectionState {
+  AGENT_CONNECTION_STATE_UNSPECIFIED = 0;
+  AGENT_CONNECTION_STATE_CONNECTING = 1;
+  AGENT_CONNECTION_STATE_RESPONSIVE = 2;
+  AGENT_CONNECTION_STATE_UNRESPONSIVE = 3;
+}
+
+enum Freshness {
+  FRESHNESS_UNSPECIFIED = 0;
+  FRESHNESS_FRESH = 1;
+  FRESHNESS_STALE = 2;
+}
+
+enum StaleReason {
+  STALE_REASON_UNSPECIFIED = 0;
+  STALE_REASON_RECEIPT_AGE = 1;
+  STALE_REASON_MONITOR_STOPPING = 2;
+}
+
+message MonitorSnapshot {
+  optional string instance_id = 1;
+  google.protobuf.Timestamp observed_at = 2;
+}
+
+message VmSnapshot {
+  optional VmState state = 1;
+  google.protobuf.Timestamp state_changed_at = 2;
+  google.protobuf.Timestamp running_since = 3;
+  optional string code = 4;
+  optional string message = 5;
+}
+
+message Readiness {
+  optional bool ready = 1;
+  optional ReadinessReason reason = 2;
+}
+
+message AgentConnection {
+  optional AgentConnectionState state = 1;
+  google.protobuf.Timestamp last_success_at = 2;
+  google.protobuf.Timestamp last_failure_at = 3;
+  optional string code = 4;
+  optional string message = 5;
+}
+
+message AgentStatusObservation {
+  google.protobuf.Timestamp received_at = 1;
+  google.protobuf.Timestamp stale_at = 2;
+  optional Freshness freshness = 3;
+  optional StaleReason stale_reason = 4;
+  AgentStatusReport report = 5;
+}
+
+message DisabledAgent {}
+
+message EnabledAgent {
+  AgentConnection connection = 1;
+  AgentIdentity identity = 2;
+  AgentStatusObservation status = 3;
+}
+
+message HostAgent {
+  oneof mode {
+    DisabledAgent disabled = 1;
+    EnabledAgent enabled = 2;
+  }
+}
+
+message HostStatus {
+  optional string machine_id = 1;
+  optional string name = 2;
+  MonitorSnapshot monitor = 3;
+  VmSnapshot vm = 4;
+  Readiness readiness = 5;
+  HostAgent agent = 6;
+}
+
+message AgentMetricsObservation {
+  optional string agent_instance_id = 1;
+  google.protobuf.Timestamp received_at = 2;
+  google.protobuf.Timestamp stale_at = 3;
+  optional Freshness freshness = 4;
+  optional StaleReason stale_reason = 5;
+  AgentMetricReport report = 6;
+}
+
+message HostMetrics {
+  optional string machine_id = 1;
+  optional string name = 2;
+  MonitorSnapshot monitor = 3;
+  AgentMetricsObservation metrics = 4;
 }

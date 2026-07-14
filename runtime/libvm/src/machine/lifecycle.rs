@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Instant};
 use uuid::Uuid;
 
+use crate::machine::root_disk::RootDiskResizeOutcome;
 use crate::machine::{
     Machine, MachineData, MachineExit, MachineExitOutcome, MachineKillOptions, MachineStartOptions,
     MachineStopOptions, MachineWaitOptions,
@@ -71,14 +72,18 @@ impl Machine {
             }
 
             options.validate_network_launch(&config.network, &config.name)?;
-            reconcile_root_disk_size(&config)?;
+            let root_disk_resize = reconcile_root_disk_size(&config)?;
             runtime.remove_vmmon_exit_status(&config)?;
             let run_id = Uuid::new_v4().to_string();
 
             let resolved_network = runtime
                 .prepare_machine_network(&config, &options.network)
                 .await?;
-            let agent_enabled = runtime.prepare_vmmon_launch_inputs(&config, &resolved_network)?;
+            let agent_enabled = runtime.prepare_vmmon_launch_inputs(
+                &config,
+                &resolved_network,
+                root_disk_resize == RootDiskResizeOutcome::GuestRequired,
+            )?;
 
             runtime.request_machine_start(config.id, &run_id).await?;
 
@@ -95,11 +100,7 @@ impl Machine {
                 network: &resolved_network,
                 run_id: &run_id,
                 exit_command: options.exit_command.as_ref(),
-                wait_for_registration: if agent_enabled {
-                    crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT
-                } else {
-                    Duration::ZERO
-                },
+                agent_enabled,
             };
             if let Err(err) = vmmon.spawn(&launch).await {
                 runtime

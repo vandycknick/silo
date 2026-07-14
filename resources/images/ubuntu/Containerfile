@@ -22,12 +22,8 @@ RUN apt update && \
         /var/tmp/*
 
 RUN systemctl enable \
-    systemd-networkd.service \
-    systemd-timesyncd.service \
-    systemd-resolved.service
+    systemd-timesyncd.service
 
-RUN \
-  printf 'L+ /etc/resolv.conf - - - - /run/systemd/resolve/stub-resolv.conf\n' > /etc/tmpfiles.d/resolv.conf \
-  && (passwd -d root && passwd -u root || true) \
+RUN (passwd -d root && passwd -u root || true) \
   && rm -f /etc/machine-id /var/lib/dbus/machine-id \
   && touch /etc/machine-id

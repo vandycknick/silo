@@ -4,7 +4,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_spec::{AgentSshConfig, ProvisionConfig};
 use eyre::{eyre, Context};
@@ -37,18 +37,19 @@ pub fn run_provisioning(
     process_supervisor: &ProcessSupervisor,
     boot_mode: &BootMode,
 ) -> eyre::Result<ProvisionReport> {
-    let started_unix_ms = unix_time_ms();
+    let started_at = timestamp();
     let started = Instant::now();
 
     if !config.enabled {
         tracing::debug!("guest provisioning disabled");
+        let elapsed = started.elapsed();
         return Ok(ProvisionReport {
-            status: ProvisionOverallStatus::Skipped as i32,
-            started_unix_ms,
-            finished_unix_ms: unix_time_ms(),
-            duration_ms: started.elapsed().as_millis() as u64,
+            status: Some(ProvisionOverallStatus::Skipped as i32),
+            started_at: Some(started_at.clone()),
+            finished_at: Some(timestamp_after(&started_at, elapsed)),
+            duration: Some(proto_duration(elapsed)),
             steps: Vec::new(),
-            message: String::from("guest provisioning disabled"),
+            message: Some(String::from("guest provisioning disabled")),
         });
     }
 
@@ -77,17 +78,15 @@ pub fn run_provisioning(
         );
     }
 
-    Ok(run.finish(started_unix_ms, started))
+    Ok(run.finish(started_at, started))
 }
 
 fn provisioners<'a>(
     config: &'a ProvisionConfig,
     ssh_config: &'a AgentSshConfig,
 ) -> eyre::Result<ProvisionerPlan<'a>> {
-    let mut provisioners: Vec<BoxedProvisioner<'a>> = Vec::new();
-    if let Some(network) = &config.network {
-        provisioners.push(Box::new(network::Network::init(network)));
-    }
+    let mut provisioners: Vec<BoxedProvisioner<'a>> =
+        vec![Box::new(network::Network::init(&config.network))];
     provisioners.extend([
         Box::new(hostname::Hostname::init(&config.hostname)) as BoxedProvisioner<'a>,
         Box::new(timezone::Timezone::init(&config.timezone)),
@@ -271,14 +270,14 @@ struct StepRecord {
 impl StepRecord {
     fn into_report(self) -> ProvisionStepReport {
         ProvisionStepReport {
-            id: self.id.as_str().to_string(),
-            status: self.status as i32,
-            failure_policy: self.failure_policy.as_proto() as i32,
-            changed: self.changed,
-            backend: String::new(),
-            duration_ms: self.started.elapsed().as_millis() as u64,
-            message: self.message,
-            error_chain: self.error_chain,
+            id: Some(self.id.as_str().to_string()),
+            status: Some(self.status as i32),
+            failure_policy: Some(self.failure_policy.as_proto() as i32),
+            changed: Some(self.changed),
+            backend: None,
+            duration: Some(proto_duration(self.started.elapsed())),
+            message: Some(self.message),
+            error_chain: Some(self.error_chain),
         }
     }
 }
@@ -441,9 +440,9 @@ impl ProvisionRun {
     fn step_status(&self, id: ProvisionerId) -> Option<ProvisionStepStatus> {
         self.steps
             .iter()
-            .find(|step| step.id == id.as_str())
+            .find(|step| step.id.as_deref() == Some(id.as_str()))
             .map(|step| {
-                ProvisionStepStatus::try_from(step.status)
+                ProvisionStepStatus::try_from(step.status.unwrap_or_default())
                     .unwrap_or(ProvisionStepStatus::Unspecified)
             })
     }
@@ -455,14 +454,14 @@ impl ProvisionRun {
     fn failure_count(&self) -> usize {
         self.steps
             .iter()
-            .filter(|step| step.status == ProvisionStepStatus::Failed as i32)
+            .filter(|step| step.status == Some(ProvisionStepStatus::Failed as i32))
             .count()
     }
 
     fn unsupported_count(&self) -> usize {
         self.steps
             .iter()
-            .filter(|step| step.status == ProvisionStepStatus::Unsupported as i32)
+            .filter(|step| step.status == Some(ProvisionStepStatus::Unsupported as i32))
             .count()
     }
 
@@ -475,17 +474,17 @@ impl ProvisionRun {
             .iter()
             .filter(|step| {
                 matches!(
-                    ProvisionStepStatus::try_from(step.status)
+                    ProvisionStepStatus::try_from(step.status.unwrap_or_default())
                         .unwrap_or(ProvisionStepStatus::Unspecified),
                     ProvisionStepStatus::Failed | ProvisionStepStatus::Unsupported
                 )
             })
-            .map(|step| step.id.as_str())
+            .filter_map(|step| step.id.as_deref())
             .collect::<Vec<_>>()
             .join(", ")
     }
 
-    fn finish(self, started_unix_ms: i64, started: Instant) -> ProvisionReport {
+    fn finish(self, started_at: prost_types::Timestamp, started: Instant) -> ProvisionReport {
         let problem_count = self.problem_count();
         let status = if self.failed_boot {
             ProvisionOverallStatus::FailedBoot
@@ -504,13 +503,14 @@ impl ProvisionRun {
             )
         };
 
+        let elapsed = started.elapsed();
         ProvisionReport {
-            status: status as i32,
-            started_unix_ms,
-            finished_unix_ms: unix_time_ms(),
-            duration_ms: started.elapsed().as_millis() as u64,
+            status: Some(status as i32),
+            started_at: Some(started_at.clone()),
+            finished_at: Some(timestamp_after(&started_at, elapsed)),
+            duration: Some(proto_duration(elapsed)),
             steps: self.steps,
-            message,
+            message: Some(message),
         }
     }
 }
@@ -522,10 +522,43 @@ fn failure_message(failure_policy: FailurePolicy) -> String {
     }
 }
 
-fn unix_time_ms() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_millis() as i64,
-        Err(_) => 0,
+fn timestamp() -> prost_types::Timestamp {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    prost_types::Timestamp {
+        seconds: duration.as_secs() as i64,
+        nanos: duration.subsec_nanos() as i32,
+    }
+}
+
+fn timestamp_after(
+    started_at: &prost_types::Timestamp,
+    duration: Duration,
+) -> prost_types::Timestamp {
+    const MAX_SECONDS: i64 = 253_402_300_799;
+    let nanos = i64::from(started_at.nanos) + i64::from(duration.subsec_nanos());
+    let carry = nanos / 1_000_000_000;
+    let seconds = i64::try_from(duration.as_secs())
+        .ok()
+        .and_then(|elapsed| started_at.seconds.checked_add(elapsed))
+        .and_then(|seconds| seconds.checked_add(carry));
+    match seconds {
+        Some(seconds) if seconds <= MAX_SECONDS => prost_types::Timestamp {
+            seconds,
+            nanos: (nanos % 1_000_000_000) as i32,
+        },
+        _ => prost_types::Timestamp {
+            seconds: MAX_SECONDS,
+            nanos: 999_999_999,
+        },
+    }
+}
+
+fn proto_duration(duration: Duration) -> prost_types::Duration {
+    prost_types::Duration {
+        seconds: i64::try_from(duration.as_secs()).map_or(i64::MAX, |seconds| seconds),
+        nanos: duration.subsec_nanos() as i32,
     }
 }
 
@@ -735,17 +768,31 @@ pub(crate) fn sanitize_unit_name(value: &str) -> String {
 mod tests {
     use std::cell::RefCell;
     use std::net::IpAddr;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use agent_spec::{NetworkConfig, NetworkDnsConfig, NetworkInterfaceConfig, NetworkIpv4Config};
     use eyre::{eyre, WrapErr};
     use protocol::v1::{ProvisionFailurePolicy, ProvisionOverallStatus, ProvisionStepStatus};
 
     use crate::provision::{
-        command_stream_for_log, format_error_chain, provisioners, BoxedProvisioner, FailurePolicy,
-        ProvisionContext, ProvisionOutcome, ProvisionRun, Provisioner, ProvisionerId,
-        ProvisionerPlan,
+        command_stream_for_log, format_error_chain, provisioners, timestamp, timestamp_after,
+        BoxedProvisioner, FailurePolicy, ProvisionContext, ProvisionOutcome, ProvisionRun,
+        Provisioner, ProvisionerId, ProvisionerPlan,
     };
+
+    #[test]
+    fn finish_timestamp_uses_elapsed_duration() {
+        let finished = timestamp_after(
+            &prost_types::Timestamp {
+                seconds: 10,
+                nanos: 900_000_000,
+            },
+            Duration::from_millis(250),
+        );
+
+        assert_eq!(finished.seconds, 11);
+        assert_eq!(finished.nanos, 150_000_000);
+    }
 
     struct TestProvisioner<'a> {
         id: ProvisionerId,
@@ -862,12 +909,21 @@ mod tests {
             ))],
         );
 
-        let report = run.finish(100, Instant::now());
+        let report = run.finish(timestamp(), Instant::now());
 
-        assert_eq!(report.status, ProvisionOverallStatus::Succeeded as i32);
+        assert_eq!(
+            report.status,
+            Some(ProvisionOverallStatus::Succeeded as i32)
+        );
         assert_eq!(report.steps.len(), 1);
-        assert_eq!(report.steps[0].status, ProvisionStepStatus::Skipped as i32);
-        assert_eq!(report.steps[0].message, "nothing configured");
+        assert_eq!(
+            report.steps[0].status,
+            Some(ProvisionStepStatus::Skipped as i32)
+        );
+        assert_eq!(
+            report.steps[0].message.as_deref(),
+            Some("nothing configured")
+        );
     }
 
     #[test]
@@ -895,18 +951,24 @@ mod tests {
             }))],
         );
 
-        let report = run.finish(100, Instant::now());
+        let report = run.finish(timestamp(), Instant::now());
 
-        assert_eq!(report.status, ProvisionOverallStatus::Degraded as i32);
+        assert_eq!(report.status, Some(ProvisionOverallStatus::Degraded as i32));
         assert_eq!(report.steps.len(), 1);
-        assert_eq!(report.steps[0].id, "broken");
-        assert_eq!(report.steps[0].status, ProvisionStepStatus::Failed as i32);
+        assert_eq!(report.steps[0].id.as_deref(), Some("broken"));
+        assert_eq!(
+            report.steps[0].status,
+            Some(ProvisionStepStatus::Failed as i32)
+        );
         assert_eq!(
             report.steps[0].failure_policy,
-            ProvisionFailurePolicy::BestEffort as i32
+            Some(ProvisionFailurePolicy::BestEffort as i32)
         );
-        assert_eq!(report.steps[0].message, "provisioner failed; continuing");
-        assert_eq!(report.steps[0].error_chain, "nope");
+        assert_eq!(
+            report.steps[0].message.as_deref(),
+            Some("provisioner failed; continuing")
+        );
+        assert_eq!(report.steps[0].error_chain.as_deref(), Some("nope"));
     }
 
     #[test]
@@ -931,24 +993,30 @@ mod tests {
             ],
         );
 
-        let report = run.finish(100, Instant::now());
+        let report = run.finish(timestamp(), Instant::now());
 
         assert_eq!(calls.into_inner(), ["fatal"]);
-        assert_eq!(report.status, ProvisionOverallStatus::FailedBoot as i32);
+        assert_eq!(
+            report.status,
+            Some(ProvisionOverallStatus::FailedBoot as i32)
+        );
         assert_eq!(report.steps.len(), 1);
-        assert_eq!(report.steps[0].id, "fatal");
-        assert_eq!(report.steps[0].status, ProvisionStepStatus::Failed as i32);
+        assert_eq!(report.steps[0].id.as_deref(), Some("fatal"));
+        assert_eq!(
+            report.steps[0].status,
+            Some(ProvisionStepStatus::Failed as i32)
+        );
         assert_eq!(
             report.steps[0].failure_policy,
-            ProvisionFailurePolicy::FailBoot as i32
+            Some(ProvisionFailurePolicy::FailBoot as i32)
         );
         assert_eq!(
-            report.steps[0].message,
-            "provisioner failed; failing guest boot"
+            report.steps[0].message.as_deref(),
+            Some("provisioner failed; failing guest boot")
         );
         assert_eq!(
-            report.message,
-            "guest reconciliation aborted after fail-boot provisioner failure"
+            report.message.as_deref(),
+            Some("guest reconciliation aborted after fail-boot provisioner failure")
         );
     }
 
@@ -975,17 +1043,21 @@ mod tests {
             ],
         );
 
-        let report = run.finish(100, Instant::now());
+        let report = run.finish(timestamp(), Instant::now());
 
         assert_eq!(calls.into_inner(), ["first"]);
-        assert_eq!(report.status, ProvisionOverallStatus::Degraded as i32);
+        assert_eq!(report.status, Some(ProvisionOverallStatus::Degraded as i32));
         assert_eq!(report.steps.len(), 2);
-        assert_eq!(report.steps[0].id, "first");
-        assert_eq!(report.steps[1].id, "dependent");
-        assert_eq!(report.steps[1].status, ProvisionStepStatus::Skipped as i32);
+        assert_eq!(report.steps[0].id.as_deref(), Some("first"));
+        assert_eq!(report.steps[1].id.as_deref(), Some("dependent"));
+        assert_eq!(
+            report.steps[1].status,
+            Some(ProvisionStepStatus::Skipped as i32)
+        );
         assert!(report.steps[1]
             .message
-            .contains("dependency first did not succeed"));
+            .as_deref()
+            .is_some_and(|message| message.contains("dependency first did not succeed")));
     }
 
     #[test]
@@ -1000,15 +1072,15 @@ mod tests {
             ))],
         );
 
-        let report = run.finish(100, Instant::now());
+        let report = run.finish(timestamp(), Instant::now());
 
-        assert_eq!(report.status, ProvisionOverallStatus::Degraded as i32);
+        assert_eq!(report.status, Some(ProvisionOverallStatus::Degraded as i32));
         assert_eq!(report.steps.len(), 1);
         assert_eq!(
             report.steps[0].status,
-            ProvisionStepStatus::Unsupported as i32
+            Some(ProvisionStepStatus::Unsupported as i32)
         );
-        assert_eq!(report.steps[0].message, "backend missing");
+        assert_eq!(report.steps[0].message.as_deref(), Some("backend missing"));
     }
 
     #[test]
@@ -1104,16 +1176,15 @@ mod tests {
     }
 
     #[test]
-    fn network_provisioner_is_absent_without_network_config() {
+    fn network_provisioner_is_first_without_static_network_config() {
         let config = agent_spec::ProvisionConfig::default();
         let ssh_config = agent_spec::AgentSshConfig::default();
 
         let plan = provisioners(&config, &ssh_config).expect("build provisioner plan");
+        let network = plan.provisioners.first().expect("network provisioner");
 
-        assert!(plan
-            .provisioners
-            .iter()
-            .all(|provisioner| provisioner.id() != ProvisionerId::NETWORK));
+        assert_eq!(network.id(), ProvisionerId::NETWORK);
+        assert_eq!(network.failure_policy(), FailurePolicy::FailBoot);
     }
 
     #[test]

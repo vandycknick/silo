@@ -154,12 +154,12 @@ flowchart TD
 
 ### Runtime reporting
 
-`InspectResponse` does not expose per-endpoint runtime health.
+`HostStatus` does not expose per-endpoint runtime health.
 
 Endpoint supervision does not change the existing meaning of instance readiness:
 
-- `PingResponse.ok` remains driven by VM and guest readiness,
-- `InspectResponse.ready` remains driven by VM and guest readiness.
+- `HostStatus.readiness` remains driven by VM and guest readiness as defined by
+  [ADR 0008](0008-vmmon-host-and-guest-grpc-api.md).
 
 Endpoint failures are handled by `vmmon` supervision, restart policy, and logs, not by redefining overall instance readiness.
 
@@ -427,6 +427,6 @@ That contract is compatible with the macOS-first implementation and with future 
 
 ## Appendix C: Runtime Reporting
 
-There is no per-endpoint runtime status schema in `InspectResponse`.
+There is no per-endpoint runtime status schema in `HostStatus`.
 
 `vmmon` owns endpoint supervision internally and treats plugin readiness/failure events as process-supervision inputs. Scripts that need endpoint definitions should read the VM spec, not monitor inspection output.
