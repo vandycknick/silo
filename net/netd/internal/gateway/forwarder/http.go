@@ -69,7 +69,7 @@ func (p *HTTPProxy) Handle(ctx context.Context, inbound net.Conn, flow hooks.Flo
 
 		upgrade := isWebSocketUpgrade(req)
 		outcome, err := forwardHTTPFamilyRequest(ctx, inbound, reader, req, "http", req.Host, nil, decision.Credential, func() (net.Conn, error) {
-			return net.Dial("tcp", target)
+			return (&net.Dialer{}).DialContext(ctx, "tcp", target)
 		})
 		p.route.RecordHTTPOutcome(request, decision, outcome.status, outcome.responseHeader, outcome.reason)
 		if err != nil {

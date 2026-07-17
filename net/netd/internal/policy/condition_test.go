@@ -12,7 +12,7 @@ func TestPackageFacetCondition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compile condition: %v", err)
 	}
-	activation, err := buildFacetActivation(registry, EndpointFamilyPackage, FacetValues{
+	activation, err := buildFacetActivation(registry, EndpointFamilyPackage, facetValues{
 		"http": {
 			"method":  "GET",
 			"host":    "registry.npmjs.org",
@@ -50,7 +50,7 @@ func TestPackageFacetCondition(t *testing.T) {
 }
 
 func TestPackageFacetRequiresDeclaredFields(t *testing.T) {
-	_, err := buildFacetActivation(BuiltinRegistry(), EndpointFamilyPackage, FacetValues{
+	_, err := buildFacetActivation(BuiltinRegistry(), EndpointFamilyPackage, facetValues{
 		"package": {"ecosystem": "npm"},
 	})
 	if err == nil {

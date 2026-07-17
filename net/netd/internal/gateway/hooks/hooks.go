@@ -1,7 +1,6 @@
 package hooks
 
 import (
-	"context"
 	"net"
 	"net/http"
 )
@@ -33,16 +32,6 @@ type HTTPRequest struct {
 	Path         string
 	Query        string
 	Header       http.Header
-}
-
-type FacetValues map[string]map[string]any
-
-type RegistryEndpointConfig struct {
-	Kind             string
-	Name             string
-	Registries       []string
-	MalwareFeed      string
-	FilterPackageAge uint32
 }
 
 type Package struct {
@@ -108,8 +97,4 @@ type RouteDecision struct {
 	Credential                *Credential
 	Tunnel                    *Tunnel
 	Package                   *Package
-}
-
-type Hook interface {
-	Decide(ctx context.Context, flow Flow) (RouteDecision, error)
 }

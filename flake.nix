@@ -47,6 +47,7 @@
               pkgs.grpcurl
               pkgs.jq
               pkgs.pkg-config
+              pkgs.xz
               pkgs.zig
               pkgs.cargo-zigbuild
               pkgs.docker

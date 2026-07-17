@@ -13,18 +13,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/transport"
 	log "github.com/sirupsen/logrus"
 	"github.com/vandycknick/silo/net/netd/internal/config"
-	"github.com/vandycknick/silo/net/netd/internal/credentials"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/audit"
-	"github.com/vandycknick/silo/net/netd/internal/gateway/forwarder"
-	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
-	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
-	"github.com/vandycknick/silo/net/netd/internal/virtualnetwork"
-	"golang.org/x/sync/errgroup"
+	"github.com/vandycknick/silo/net/netd/internal/registry"
+	"github.com/vandycknick/silo/net/netd/internal/session"
+)
+
+const (
+	gracefulShutdownTimeout = 10 * time.Second
+	forcedShutdownTimeout   = 2 * time.Second
 )
 
 func main() {
@@ -44,10 +46,11 @@ func main() {
 	if err != nil {
 		reportAndExitStartupError(os.Stderr, cfg, logCloser, err)
 	}
-	if err := config.LoadPolicy(cfg); err != nil {
+	compiledPolicy, err := config.LoadPolicy(cfg)
+	if err != nil {
 		reportAndExitStartupError(os.Stderr, cfg, logCloser, err)
 	}
-	if err := run(cfg); err != nil {
+	if err := run(cfg, compiledPolicy); err != nil {
 		reportAndExitStartupError(os.Stderr, cfg, logCloser, err)
 	}
 }
@@ -67,16 +70,14 @@ func reportAndExitStartupError(writer io.Writer, cfg *config.Config, logCloser i
 	os.Exit(1)
 }
 
-func run(cfg *config.Config) error {
+func run(cfg *config.Config, compiledPolicy *policy.Policy) error {
 	if cfg == nil {
 		return errors.New("missing configuration")
 	}
-	if cfg.Policy == nil {
-		if err := config.LoadPolicy(cfg); err != nil {
-			return err
-		}
+	if compiledPolicy == nil {
+		return errors.New("missing compiled policy")
 	}
-	logPolicyDiagnostics(cfg.Policy)
+	logPolicyDiagnostics(compiledPolicy)
 	if cfg.PIDFile != "" {
 		if err := writePIDFile(cfg.PIDFile); err != nil {
 			return err
@@ -87,28 +88,33 @@ func run(cfg *config.Config) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	hook := hooks.NewPolicyHook(cfg.Policy)
-	auditLog, err := openAuditLogger(cfg.LogFile, cfg.Policy.PolicyHash())
+	auditLog, err := openAuditLogger(cfg.LogFile)
 	if err != nil {
 		return err
 	}
 	defer auditLog.Close()
-	route := router.New(hook, auditLog)
-	credentialManager, err := credentials.NewManagerFromEnvironment()
-	if err != nil {
-		return err
-	}
-	dispatcher, err := forwarder.NewBuiltinTCPDispatcher(route, cfg.TLS.CACert, cfg.TLS.CAKey, credentialManager)
-	if err != nil {
-		return err
-	}
-	vn, err := virtualnetwork.New(&cfg.Stack, route, dispatcher, virtualnetwork.Metadata{
+	intelligencePool := registry.NewIntelligencePool(nil)
+	vmSession, err := session.New(session.Spec{
 		VMID:      cfg.Metadata.VMID,
 		NetworkID: cfg.Metadata.NetworkID,
-	})
+		Stack:     cfg.Stack,
+		Policy:    compiledPolicy,
+		CACert:    cfg.TLS.CACert,
+		CAKey:     cfg.TLS.CAKey,
+	}, session.Shared{Audit: auditLog, Intelligence: intelligencePool})
 	if err != nil {
 		return err
 	}
+	defer vmSession.Close()
+	intelligenceCtx, stopIntelligence := context.WithCancel(context.Background())
+	intelligenceDone := make(chan error, 1)
+	go func() {
+		intelligenceDone <- intelligencePool.Run(intelligenceCtx)
+	}()
+	defer func() {
+		stopIntelligence()
+		<-intelligenceDone
+	}()
 
 	conn, err := transport.ListenUnixgram(cfg.ListenVfkit)
 	if err != nil {
@@ -117,20 +123,50 @@ func run(cfg *config.Config) error {
 	defer conn.Close()
 	defer removeEndpoint(cfg.ListenVfkit)
 
-	group, ctx := errgroup.WithContext(ctx)
-	group.Go(func() error {
-		<-ctx.Done()
-		return conn.Close()
-	})
-	group.Go(func() error {
-		vfkitConn, err := transport.AcceptVfkit(conn)
-		if err != nil {
-			return fmt.Errorf("vfkit accept error: %w", err)
-		}
-		return vn.AcceptVfkit(ctx, vfkitConn)
-	})
 	slog.Info("netd ready", "listen_vfkit", cfg.ListenVfkit, "subnet", cfg.Stack.Subnet)
-	return group.Wait()
+	acceptDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-acceptDone:
+		}
+	}()
+	vfkitConn, err := transport.AcceptVfkit(conn)
+	close(acceptDone)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("vfkit accept error: %w", err)
+	}
+
+	sessionDone := make(chan error, 1)
+	go func() {
+		sessionDone <- vmSession.Run(context.Background(), vfkitConn)
+	}()
+	select {
+	case err := <-sessionDone:
+		return err
+	case <-ctx.Done():
+	}
+	stopIntelligence()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
+	shutdownErr := vmSession.Shutdown(shutdownCtx)
+	shutdownCancel()
+	if shutdownErr != nil {
+		slog.Warn("session graceful shutdown did not complete", "error", shutdownErr)
+		_ = vmSession.Close()
+	}
+	forceTimer := time.NewTimer(forcedShutdownTimeout)
+	defer forceTimer.Stop()
+	select {
+	case err := <-sessionDone:
+		return err
+	case <-forceTimer.C:
+		return fmt.Errorf("session forced shutdown timed out after %s", forcedShutdownTimeout)
+	}
 }
 
 type errorRecord struct {
@@ -195,12 +231,12 @@ func logPolicyDiagnostics(compiled *policy.Policy) {
 	}
 }
 
-func openAuditLogger(logFile string, policyHash string) (*audit.Logger, error) {
+func openAuditLogger(logFile string) (*audit.Logger, error) {
 	auditPath := auditPathForLogFile(logFile)
 	if auditPath == "" {
 		return nil, nil
 	}
-	auditLog, err := audit.Open(auditPath, policyHash)
+	auditLog, err := audit.Open(auditPath, "")
 	if err != nil {
 		return nil, fmt.Errorf("open audit log %s: %w", auditPath, err)
 	}

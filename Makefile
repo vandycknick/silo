@@ -86,8 +86,8 @@ netd:
 
 .PHONY: kernel
 kernel:
-	@test -n "$(TRACK)" || (echo "TRACK is required, use TRACK=stable|longterm|longterm5" && exit 1)
-	@$(MAKE) -C resources/kernels kernel TRACK=$(TRACK) ARCH=$(ARCH)
+	@test -n "$(TRACK)" || (echo "TRACK is required" && exit 1)
+	@$(MAKE) -C resources/kernels kernel TRACK="$(TRACK)" ARCH="$(ARCH)"
 
 .PHONY: initramfs
 initramfs:

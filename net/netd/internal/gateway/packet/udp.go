@@ -1,4 +1,4 @@
-package forwarder
+package packet
 
 import (
 	"context"
@@ -21,7 +21,7 @@ import (
 
 const udpConnTrackTimeout = 90 * time.Second
 
-func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, route *router.Router, metadata TCPMetadata) *udp.Forwarder {
+func UDP(ctx context.Context, s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, route *router.Router, flows *FlowTracker, metadata TCPMetadata) *udp.Forwarder {
 	return udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
 		id := r.ID()
 		localAddress := id.LocalAddress
@@ -35,6 +35,16 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 			NetworkID:  metadata.NetworkID,
 		}
 		flow = route.WithFlowID(flow)
+		if !flows.Start() {
+			route.RecordFlowOutcome(flow, deniedFlow("session_draining"), "session_draining")
+			return false
+		}
+		flowStarted := true
+		defer func() {
+			if flowStarted {
+				flows.Done()
+			}
+		}()
 
 		if !ec2MetadataAccess && linkLocal().Contains(localAddress) {
 			route.RecordFlowOutcome(flow, deniedFlow("metadata_disabled"), "metadata_disabled")
@@ -51,7 +61,7 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 		}
 		natLock.Unlock()
 		flow.DestIP = addressIP(localAddress)
-		decision, err := route.Decide(context.Background(), flow)
+		decision, err := route.Decide(ctx, flow)
 		if err != nil {
 			slog.Warn("udp policy hook failed", "error", err)
 			route.RecordFlowOutcome(flow, deniedFlow("policy_error"), "policy_error")
@@ -71,14 +81,16 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 		}
 
 		p, err := upstreamForwarder.NewUDPProxy(&autoStoppingUDPListener{underlying: gonet.NewUDPConn(&wq, ep)}, func() (net.Conn, error) {
-			return net.Dial("udp", net.JoinHostPort(localAddress.String(), strconv.Itoa(int(id.LocalPort))))
+			return (&net.Dialer{}).DialContext(ctx, "udp", net.JoinHostPort(localAddress.String(), strconv.Itoa(int(id.LocalPort))))
 		})
 		if err != nil {
 			ep.Close()
 			route.RecordFlowOutcome(flow, decision, "upstream_error")
 			return false
 		}
+		flowStarted = false
 		go func() {
+			defer flows.Done()
 			p.Run()
 			ep.Close()
 			route.RecordFlow(flow, decision)

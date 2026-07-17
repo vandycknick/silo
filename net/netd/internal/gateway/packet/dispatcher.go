@@ -1,4 +1,4 @@
-package forwarder
+package packet
 
 import (
 	"bytes"
@@ -8,9 +8,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/vandycknick/silo/net/netd/internal/credentials"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
-	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
 )
 
 type TCPHandler interface {
@@ -18,8 +16,16 @@ type TCPHandler interface {
 	HandleTCP(ctx context.Context, inbound net.Conn, flow hooks.Flow, target string, decision hooks.RouteDecision) error
 }
 
+type EndpointType string
+
+const (
+	EndpointHTTP       EndpointType = "http"
+	EndpointHTTPS      EndpointType = "https"
+	EndpointRegistries EndpointType = "registries"
+)
+
 type registeredTCPHandler struct {
-	endpointType string
+	endpointType EndpointType
 	handler      TCPHandler
 }
 
@@ -27,44 +33,11 @@ type TCPDispatcher struct {
 	handlers []registeredTCPHandler
 }
 
-func NewBuiltinTCPDispatcher(route *router.Router, certPath string, keyPath string, manager *credentials.Manager) (*TCPDispatcher, error) {
-	dispatcher := &TCPDispatcher{}
-	httpsProxy, err := NewHTTPSProxy(route, certPath, keyPath, manager)
-	if err != nil {
-		return nil, err
-	}
-	var ca *certificateAuthority
-	if httpsProxy != nil {
-		ca = httpsProxy.ca
-	} else if route != nil && route.HasRegistries() {
-		ca, err = loadCertificateAuthority(certPath, keyPath)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if httpProxy := NewHTTPProxy(route); httpProxy != nil {
-		if err := dispatcher.Register("http", httpProxy); err != nil {
-			return nil, err
-		}
-	}
-	registryProxy, err := NewRegistryProxy(route, ca, httpsProxy)
-	if err != nil {
-		return nil, err
-	}
-	if registryProxy != nil {
-		if err := dispatcher.Register("registries", registryProxy); err != nil {
-			return nil, err
-		}
-	}
-	if httpsProxy != nil {
-		if err := dispatcher.Register("https", httpsProxy); err != nil {
-			return nil, err
-		}
-	}
-	return dispatcher, nil
+func NewTCPDispatcher() *TCPDispatcher {
+	return &TCPDispatcher{}
 }
 
-func (d *TCPDispatcher) Register(endpointType string, handler TCPHandler) error {
+func (d *TCPDispatcher) Register(endpointType EndpointType, handler TCPHandler) error {
 	if d == nil {
 		return fmt.Errorf("register TCP handler %q on nil dispatcher", endpointType)
 	}
@@ -83,7 +56,7 @@ func (d *TCPDispatcher) Register(endpointType string, handler TCPHandler) error 
 	return nil
 }
 
-func (d *TCPDispatcher) Handle(ctx context.Context, inbound net.Conn, flow hooks.Flow, target string, decision hooks.RouteDecision) (string, bool, error) {
+func (d *TCPDispatcher) Handle(ctx context.Context, inbound net.Conn, flow hooks.Flow, target string, decision hooks.RouteDecision) (EndpointType, bool, error) {
 	if d == nil {
 		return "", false, nil
 	}
@@ -93,7 +66,7 @@ func (d *TCPDispatcher) Handle(ctx context.Context, inbound net.Conn, flow hooks
 			eligible = append(eligible, registered)
 		}
 	}
-	if hasEndpointType(eligible, "http") && hasTLSEndpoint(eligible) {
+	if hasEndpointType(eligible, EndpointHTTP) && hasTLSEndpoint(eligible) {
 		isTLS, replayed, err := sniffTLSRecord(inbound)
 		if err != nil {
 			_ = replayed.Close()
@@ -108,7 +81,7 @@ func (d *TCPDispatcher) Handle(ctx context.Context, inbound net.Conn, flow hooks
 	return "", false, nil
 }
 
-func hasEndpointType(handlers []registeredTCPHandler, endpointType string) bool {
+func hasEndpointType(handlers []registeredTCPHandler, endpointType EndpointType) bool {
 	for _, handler := range handlers {
 		if handler.endpointType == endpointType {
 			return true
@@ -118,19 +91,19 @@ func hasEndpointType(handlers []registeredTCPHandler, endpointType string) bool 
 }
 
 func hasTLSEndpoint(handlers []registeredTCPHandler) bool {
-	return hasEndpointType(handlers, "registries") || hasEndpointType(handlers, "https")
+	return hasEndpointType(handlers, EndpointRegistries) || hasEndpointType(handlers, EndpointHTTPS)
 }
 
 func matchingProtocolHandlers(handlers []registeredTCPHandler, isTLS bool) []registeredTCPHandler {
 	matched := make([]registeredTCPHandler, 0, len(handlers))
 	for _, handler := range handlers {
-		if handler.endpointType == "http" {
+		if handler.endpointType == EndpointHTTP {
 			if !isTLS {
 				matched = append(matched, handler)
 			}
 			continue
 		}
-		if handler.endpointType == "registries" || handler.endpointType == "https" {
+		if handler.endpointType == EndpointRegistries || handler.endpointType == EndpointHTTPS {
 			if isTLS {
 				matched = append(matched, handler)
 			}
@@ -152,4 +125,16 @@ func sniffTLSRecord(conn net.Conn) (bool, net.Conn, error) {
 		return false, replayed, err
 	}
 	return first[0] == 0x16, replayed, nil
+}
+
+type replayConn struct {
+	net.Conn
+	reader *bytes.Reader
+}
+
+func (c *replayConn) Read(p []byte) (int, error) {
+	if c.reader.Len() > 0 {
+		return c.reader.Read(p)
+	}
+	return c.Conn.Read(p)
 }

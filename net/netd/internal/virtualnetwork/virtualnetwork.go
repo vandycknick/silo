@@ -4,21 +4,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math"
 	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/services/dhcp"
 	"github.com/containers/gvisor-tap-vsock/pkg/services/dns"
 	upstreamForwarder "github.com/containers/gvisor-tap-vsock/pkg/services/forwarder"
 	"github.com/containers/gvisor-tap-vsock/pkg/tap"
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
-	"github.com/vandycknick/silo/net/netd/internal/gateway/forwarder"
+	"github.com/vandycknick/silo/net/netd/internal/config"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/packet"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
+	"golang.org/x/sync/errgroup"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sniffer"
@@ -40,10 +42,25 @@ type VirtualNetwork struct {
 	stack         *stack.Stack
 	networkSwitch *tap.Switch
 	servicesMux   http.Handler
+	services      []networkService
 	ipPool        *tap.IPPool
+	captureFile   *os.File
+	closeOnce     sync.Once
+	closed        atomic.Bool
+	closeErr      error
 }
 
-func New(configuration *types.Configuration, route *router.Router, dispatcher *forwarder.TCPDispatcher, metadata Metadata) (*VirtualNetwork, error) {
+type networkService struct {
+	name  string
+	serve func() error
+	close func() error
+}
+
+func New(ctx context.Context, networkConfig *config.NetworkConfig, route *router.Router, dispatcher *packet.TCPDispatcher, flows *packet.FlowTracker, metadata Metadata) (*VirtualNetwork, error) {
+	if networkConfig == nil {
+		return nil, errors.New("network configuration is required")
+	}
+	configuration := upstreamConfiguration(networkConfig)
 	_, subnet, err := net.ParseCIDR(configuration.Subnet)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse subnet cidr: %w", err)
@@ -68,6 +85,7 @@ func New(configuration *types.Configuration, route *router.Router, dispatcher *f
 	networkSwitch.Connect(tapEndpoint)
 
 	var endpoint stack.LinkEndpoint = tapEndpoint
+	var captureFile *os.File
 	if configuration.CaptureFile != "" {
 		_ = os.Remove(configuration.CaptureFile)
 		fd, err := os.Create(configuration.CaptureFile)
@@ -76,55 +94,175 @@ func New(configuration *types.Configuration, route *router.Router, dispatcher *f
 		}
 		endpoint, err = sniffer.NewWithWriter(tapEndpoint, fd, math.MaxUint32)
 		if err != nil {
+			_ = fd.Close()
 			return nil, fmt.Errorf("cannot create sniffer: %w", err)
 		}
+		captureFile = fd
 	}
 
 	stack, err := createStack(configuration, endpoint)
 	if err != nil {
+		if captureFile != nil {
+			_ = captureFile.Close()
+		}
 		return nil, fmt.Errorf("cannot create network stack: %w", err)
 	}
 
-	mux, err := addServices(configuration, stack, ipPool, route, dispatcher, metadata)
+	mux, services, err := addServices(ctx, configuration, stack, ipPool, route, dispatcher, flows, metadata)
 	if err != nil {
+		stack.Close()
+		if captureFile != nil {
+			_ = captureFile.Close()
+		}
 		return nil, fmt.Errorf("cannot add network services: %w", err)
 	}
 
-	return &VirtualNetwork{configuration: configuration, stack: stack, networkSwitch: networkSwitch, servicesMux: mux, ipPool: ipPool}, nil
+	return &VirtualNetwork{configuration: configuration, stack: stack, networkSwitch: networkSwitch, servicesMux: mux, services: services, ipPool: ipPool, captureFile: captureFile}, nil
+}
+
+func upstreamConfiguration(configuration *config.NetworkConfig) *types.Configuration {
+	zones := make([]types.Zone, 0, len(configuration.DNS))
+	for _, zone := range configuration.DNS {
+		records := make([]types.Record, 0, len(zone.Records))
+		for _, record := range zone.Records {
+			records = append(records, types.Record{Name: record.Name, IP: append(net.IP(nil), record.IP...)})
+		}
+		zones = append(zones, types.Zone{Name: zone.Name, Records: records})
+	}
+	return &types.Configuration{
+		CaptureFile:       configuration.CaptureFile,
+		Debug:             configuration.Debug,
+		MTU:               configuration.MTU,
+		Subnet:            configuration.Subnet,
+		GatewayIP:         configuration.GatewayIP,
+		DeviceIP:          configuration.DeviceIP,
+		HostIP:            configuration.HostIP,
+		GatewayMacAddress: configuration.GatewayMACAddress,
+		DNS:               zones,
+		DNSSearchDomains:  append([]string(nil), configuration.DNSSearchDomains...),
+		Forwards:          cloneStringMap(configuration.Forwards),
+		NAT:               cloneStringMap(configuration.NAT),
+		GatewayVirtualIPs: append([]string(nil), configuration.GatewayVirtualIPs...),
+		DHCPStaticLeases:  cloneStringMap(configuration.DHCPStaticLeases),
+		Ec2MetadataAccess: configuration.EC2MetadataAccess,
+		Protocol:          types.VfkitProtocol,
+	}
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func (n *VirtualNetwork) AcceptVfkit(ctx context.Context, conn net.Conn) error {
-	return n.networkSwitch.Accept(ctx, conn, types.VfkitProtocol)
+	return n.Run(ctx, conn)
 }
 
-func addServices(configuration *types.Configuration, s *stack.Stack, ipPool *tap.IPPool, route *router.Router, dispatcher *forwarder.TCPDispatcher, metadata Metadata) (http.Handler, error) {
+func (n *VirtualNetwork) Run(ctx context.Context, conn net.Conn) error {
+	if n == nil {
+		return errors.New("virtual network is not configured")
+	}
+	if conn == nil {
+		return errors.New("vfkit connection is nil")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	group, groupCtx := errgroup.WithContext(runCtx)
+	for _, service := range n.services {
+		service := service
+		group.Go(func() error {
+			defer cancel()
+			err := service.serve()
+			if n.closed.Load() || groupCtx.Err() != nil {
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("%s stopped: %w", service.name, err)
+			}
+			return fmt.Errorf("%s stopped unexpectedly", service.name)
+		})
+	}
+	group.Go(func() error {
+		defer cancel()
+		err := n.networkSwitch.Accept(groupCtx, conn, types.VfkitProtocol)
+		if n.closed.Load() || groupCtx.Err() != nil {
+			return nil
+		}
+		return err
+	})
+	group.Go(func() error {
+		<-groupCtx.Done()
+		return n.Close()
+	})
+	return group.Wait()
+}
+
+func (n *VirtualNetwork) Close() error {
+	if n == nil {
+		return nil
+	}
+	n.closeOnce.Do(func() {
+		n.closed.Store(true)
+		for _, service := range n.services {
+			if service.close != nil {
+				n.closeErr = errors.Join(n.closeErr, service.close())
+			}
+		}
+		if n.stack != nil {
+			n.stack.Close()
+		}
+		if n.captureFile != nil {
+			n.closeErr = errors.Join(n.closeErr, n.captureFile.Close())
+		}
+	})
+	return n.closeErr
+}
+
+func addServices(ctx context.Context, configuration *types.Configuration, s *stack.Stack, ipPool *tap.IPPool, route *router.Router, dispatcher *packet.TCPDispatcher, flows *packet.FlowTracker, metadata Metadata) (http.Handler, []networkService, error) {
 	var natLock sync.Mutex
 	translation := parseNATTable(configuration)
 
-	tcpForwarder := forwarder.TCP(s, translation, &natLock, configuration.Ec2MetadataAccess, route, dispatcher, forwarder.TCPMetadata(metadata))
+	tcpForwarder := packet.TCP(ctx, s, translation, &natLock, configuration.Ec2MetadataAccess, route, dispatcher, flows, packet.TCPMetadata(metadata))
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
-	udpForwarder := forwarder.UDP(s, translation, &natLock, configuration.Ec2MetadataAccess, route, forwarder.TCPMetadata(metadata))
+	udpForwarder := packet.UDP(ctx, s, translation, &natLock, configuration.Ec2MetadataAccess, route, flows, packet.TCPMetadata(metadata))
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
 	icmpForwarder := upstreamForwarder.ICMP(s, translation, &natLock)
 	s.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpForwarder.HandlePacket)
 
-	dnsMux, err := dnsServer(configuration, s)
+	dnsMux, dnsServices, err := dnsServer(configuration, s)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	dhcpMux, err := dhcpServer(configuration, s, ipPool)
+	dhcpMux, dhcpService, err := dhcpServer(configuration, s, ipPool)
 	if err != nil {
-		return nil, err
+		return nil, nil, errors.Join(err, closeNetworkServices(dnsServices))
 	}
+	services := append(dnsServices, dhcpService)
 	forwarderMux, err := forwardHostVM(configuration, s)
 	if err != nil {
-		return nil, err
+		return nil, nil, errors.Join(err, closeNetworkServices(services))
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/forwarder/", http.StripPrefix("/forwarder", forwarderMux))
 	mux.Handle("/dhcp/", http.StripPrefix("/dhcp", dhcpMux))
 	mux.Handle("/dns/", http.StripPrefix("/dns", dnsMux))
-	return mux, nil
+	return mux, services, nil
+}
+
+func closeNetworkServices(services []networkService) error {
+	var closeErr error
+	for _, service := range services {
+		if service.close != nil {
+			closeErr = errors.Join(closeErr, service.close())
+		}
+	}
+	return closeErr
 }
 
 func parseNATTable(configuration *types.Configuration) map[tcpip.Address]tcpip.Address {
@@ -135,43 +273,35 @@ func parseNATTable(configuration *types.Configuration) map[tcpip.Address]tcpip.A
 	return translation
 }
 
-func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler, error) {
+func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler, []networkService, error) {
 	udpConn, err := gonet.DialUDP(s, &tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4Slice(net.ParseIP(configuration.GatewayIP).To4()), Port: uint16(53)}, nil, ipv4.ProtocolNumber)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	tcpLn, err := gonet.ListenTCP(s, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4Slice(net.ParseIP(configuration.GatewayIP).To4()), Port: uint16(53)}, ipv4.ProtocolNumber)
 	if err != nil {
-		return nil, err
+		_ = udpConn.Close()
+		return nil, nil, err
 	}
 	server, err := dns.New(udpConn, tcpLn, configuration.DNS)
 	if err != nil {
-		return nil, err
+		_ = udpConn.Close()
+		_ = tcpLn.Close()
+		return nil, nil, err
 	}
-	go func() {
-		if err := server.Serve(); err != nil {
-			slog.Error("dns udp server stopped", "error", err)
-		}
-	}()
-	go func() {
-		if err := server.ServeTCP(); err != nil {
-			slog.Error("dns tcp server stopped", "error", err)
-		}
-	}()
-	return server.Mux(), nil
+	services := []networkService{
+		{name: "dns udp server", serve: server.Serve, close: udpConn.Close},
+		{name: "dns tcp server", serve: server.ServeTCP, close: tcpLn.Close},
+	}
+	return server.Mux(), services, nil
 }
 
-func dhcpServer(configuration *types.Configuration, s *stack.Stack, ipPool *tap.IPPool) (http.Handler, error) {
+func dhcpServer(configuration *types.Configuration, s *stack.Stack, ipPool *tap.IPPool) (http.Handler, networkService, error) {
 	server, err := dhcp.New(configuration, s, ipPool)
 	if err != nil {
-		return nil, err
+		return nil, networkService{}, err
 	}
-	go func() {
-		if err := server.Serve(); err != nil {
-			slog.Error("dhcp server stopped", "error", err)
-		}
-	}()
-	return server.Mux(), nil
+	return server.Mux(), networkService{name: "dhcp server", serve: server.Serve, close: server.Underlying.Close}, nil
 }
 
 func forwardHostVM(configuration *types.Configuration, s *stack.Stack) (http.Handler, error) {

@@ -1,0 +1,149 @@
+name: Kernel
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - resources/kernels/**
+      - .github/workflows/kernel.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  REGISTRY: ghcr.io
+  TRACK: stable
+
+jobs:
+  build:
+    name: stable arm64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install kernel toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            flex \
+            gcc-aarch64-linux-gnu \
+            libelf-dev \
+            libssl-dev \
+            xz-utils
+
+      - name: Resolve build metadata
+        id: kernel
+        run: |
+          version="$(make -s -C resources/kernels kernel-version TRACK="$TRACK" ARCH="$ARCH")"
+          export_dir="$(make -s -C resources/kernels kernel-export-dir TRACK="$TRACK" ARCH="$ARCH")"
+          revision="${GITHUB_SHA}"
+          created="$(git show -s --format=%cI "$GITHUB_SHA")"
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+
+          {
+            printf 'version=%s\n' "$version"
+            printf 'export_dir=%s\n' "$export_dir"
+            printf 'revision=%s\n' "$revision"
+            printf 'created=%s\n' "$created"
+          } >> "$GITHUB_OUTPUT"
+          {
+            printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch"
+            printf 'KBUILD_BUILD_TIMESTAMP=@%s\n' "$source_date_epoch"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore kernel caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/ccache
+            ~/.cache/silo/kernels/downloads
+          key: kernel-${{ runner.os }}-${{ steps.kernel.outputs.version }}-${{ hashFiles('resources/kernels/configs/**') }}
+          restore-keys: |
+            kernel-${{ runner.os }}-${{ steps.kernel.outputs.version }}-
+
+      - name: Configure compiler cache
+        run: |
+          ccache --max-size 2G
+          ccache --zero-stats
+
+      - name: Build stable arm64 kernel
+        env:
+          KBUILD_BUILD_HOST: github-actions
+          KBUILD_BUILD_USER: silo
+        run: |
+          make -C resources/kernels kernel \
+            TRACK="$TRACK" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache aarch64-linux-gnu-gcc" \
+            BUILD_REVISION="${{ steps.kernel.outputs.revision }}"
+          ccache --show-stats
+
+      - name: Verify kernel artifacts
+        working-directory: ${{ steps.kernel.outputs.export_dir }}
+        run: |
+          sha256sum --check SHA256SUMS
+          file Image | tee image-type.txt
+          grep --quiet 'ARM64' image-type.txt
+          rm image-type.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kernel-${{ env.TRACK }}-${{ env.ARCH }}-${{ steps.kernel.outputs.version }}
+          path: ${{ steps.kernel.outputs.export_dir }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+
+      - name: Install ORAS
+        # Keep OCI publication disabled until the build artifacts are validated.
+        if: ${{ false }}
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+
+      # - name: Log in to GHCR
+      #   if: ${{ false }}
+      #   env:
+      #     GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #   run: printf '%s' "$GHCR_TOKEN" | oras login "$REGISTRY" --username "${{ github.actor }}" --password-stdin
+      #
+      # - name: Publish OCI artifact
+      #   if: ${{ false }}
+      #   working-directory: ${{ steps.kernel.outputs.export_dir }}
+      #   env:
+      #     CREATED: ${{ steps.kernel.outputs.created }}
+      #     IMAGE: ghcr.io/${{ github.repository_owner }}/silo-kernel
+      #     REVISION: ${{ steps.kernel.outputs.revision }}
+      #     VERSION: ${{ steps.kernel.outputs.version }}
+      #   run: |
+      #     oras push \
+      #       --artifact-type application/vnd.silo.kernel.v1 \
+      #       --annotation "org.opencontainers.image.created=$CREATED" \
+      #       --annotation "org.opencontainers.image.description=Silo Linux kernel ($TRACK/$ARCH)" \
+      #       --annotation "org.opencontainers.image.revision=$REVISION" \
+      #       --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+      #       --annotation "org.opencontainers.image.version=$VERSION" \
+      #       --annotation "com.silo.kernel.architecture=$ARCH" \
+      #       --annotation "com.silo.kernel.track=$TRACK" \
+      #       "$IMAGE:$VERSION,$VERSION-$REVISION" \
+      #       Image:application/vnd.silo.boot.kernel.v1 \
+      #       .config:application/vnd.silo.kernel.config.v1 \
+      #       System.map:application/vnd.silo.kernel.system-map.v1 \
+      #       vmlinux.xz:application/vnd.silo.kernel.debug.v1+xz \
+      #       build-info.txt:application/vnd.silo.kernel.build-info.v1 \
+      #       SHA256SUMS:text/plain

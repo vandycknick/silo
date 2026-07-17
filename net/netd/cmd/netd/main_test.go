@@ -47,7 +47,7 @@ func TestOpenAuditLoggerUsesLogFileSibling(t *testing.T) {
 	dir := t.TempDir()
 	logFile := filepath.Join(dir, "netd.log")
 
-	auditLog, err := openAuditLogger(logFile, "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	auditLog, err := openAuditLogger(logFile)
 	if err != nil {
 		t.Fatal(err)
 	}

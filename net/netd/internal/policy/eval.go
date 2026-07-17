@@ -148,13 +148,42 @@ func (p *Policy) EvaluateHTTP(request HTTPRequest) Decision {
 	}
 }
 
-func (p *Policy) EvaluateAction(endpoint Ref, facets FacetValues) Decision {
+func (p *Policy) EvaluatePackage(endpoint Ref, request PackageRequest) Decision {
+	facets := facetValues{
+		"http": {
+			"method":  strings.ToUpper(request.Method),
+			"host":    request.Host,
+			"path":    request.Path,
+			"query":   request.Query,
+			"headers": request.Headers,
+		},
+		"package": {
+			"ecosystem":              request.Package.Ecosystem,
+			"operation":              request.Package.Operation,
+			"name":                   request.Package.Name,
+			"version":                request.Package.Version,
+			"identity_known":         request.Package.IdentityKnown,
+			"age_known":              request.Package.AgeKnown,
+			"age_hours":              request.Package.AgeHours,
+			"age_source":             request.Package.AgeSource,
+			"malware_data_available": request.Package.MalwareDataAvailable,
+			"malware":                request.Package.Malware,
+			"malware_reason":         request.Package.MalwareReason,
+		},
+	}
+	decision := p.evaluateAction(endpoint, facets)
+	packageFacts := request.Package
+	decision.Package = &packageFacts
+	return decision
+}
+
+func (p *Policy) evaluateAction(endpoint Ref, facets facetValues) Decision {
 	if p == nil {
-		return Decision{Action: ActionAllow, Layer: DecisionLayerRequest, Source: DecisionSourceDefault, DefaultAction: ActionAllow, MatchedFacets: facets}
+		return Decision{Action: ActionAllow, Layer: DecisionLayerRequest, Source: DecisionSourceDefault, DefaultAction: ActionAllow}
 	}
 	definition, ok := p.endpointDefinitions[endpoint.String()]
 	if !ok {
-		return Decision{Action: ActionDeny, Layer: DecisionLayerRequest, Source: DecisionSourceDefault, DefaultAction: p.DefaultAction, Reason: "unknown_l7_endpoint", MatchedFacets: facets}
+		return Decision{Action: ActionDeny, Layer: DecisionLayerRequest, Source: DecisionSourceDefault, DefaultAction: p.DefaultAction, Reason: "unknown_l7_endpoint"}
 	}
 	evaluator := newFacetConditionEvaluator(p, definition.Family, facets)
 	for _, rule := range p.rulesByFamily[definition.Family] {
@@ -175,7 +204,6 @@ func (p *Policy) EvaluateAction(endpoint Ref, facets FacetValues) Decision {
 				Reason:        "condition_error",
 				EndpointKind:  endpoint.Kind,
 				EndpointName:  endpoint.Name,
-				MatchedFacets: facets,
 			}
 		}
 		if !matches {
@@ -190,7 +218,6 @@ func (p *Policy) EvaluateAction(endpoint Ref, facets FacetValues) Decision {
 			Reason:        rule.Reason,
 			EndpointKind:  endpoint.Kind,
 			EndpointName:  endpoint.Name,
-			MatchedFacets: facets,
 		}
 	}
 	return Decision{
@@ -201,7 +228,6 @@ func (p *Policy) EvaluateAction(endpoint Ref, facets FacetValues) Decision {
 		Reason:        defaultReason(p.DefaultAction),
 		EndpointKind:  endpoint.Kind,
 		EndpointName:  endpoint.Name,
-		MatchedFacets: facets,
 	}
 }
 
@@ -305,7 +331,7 @@ func newHTTPConditionEvaluator(policy *Policy, request HTTPRequest) *httpConditi
 	return &httpConditionEvaluator{policy: policy, request: request}
 }
 
-func newFacetConditionEvaluator(policy *Policy, family EndpointFamily, facets FacetValues) *httpConditionEvaluator {
+func newFacetConditionEvaluator(policy *Policy, family EndpointFamily, facets facetValues) *httpConditionEvaluator {
 	registry := BuiltinRegistry()
 	if policy != nil {
 		registry = policy.registry
@@ -345,7 +371,7 @@ func (e *httpConditionEvaluator) Context() (map[string]any, error) {
 		e.err = err
 		return nil, err
 	}
-	values := FacetValues{
+	values := facetValues{
 		"http": {
 			"method":  strings.ToUpper(e.request.Method),
 			"host":    normalizedRequestHost(e.policy, e.request),

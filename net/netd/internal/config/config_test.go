@@ -14,9 +14,6 @@ func TestParseWithoutStaticLeaseHasNoGuestLeaseOrForwards(t *testing.T) {
 	if len(cfg.Stack.Forwards) != 0 {
 		t.Fatalf("expected no host forwards, got %#v", cfg.Stack.Forwards)
 	}
-	if len(cfg.Stack.VpnKitUUIDMacAddresses) != 0 {
-		t.Fatalf("expected no VPNKit UUID MAC addresses, got %#v", cfg.Stack.VpnKitUUIDMacAddresses)
-	}
 }
 
 func TestParseStaticLeaseSetsDeviceIPAndDHCPLease(t *testing.T) {
@@ -106,14 +103,15 @@ func TestLoadPolicyUsesDefaultPolicyWithoutHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := LoadPolicy(cfg); err != nil {
+	compiled, err := LoadPolicy(cfg)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Policy == nil {
+	if compiled == nil {
 		t.Fatal("expected policy to be loaded")
 	}
-	if cfg.Policy.PolicyHash() != "" {
-		t.Fatalf("expected implicit default policy to omit policy hash, got %q", cfg.Policy.PolicyHash())
+	if compiled.PolicyHash() != "" {
+		t.Fatalf("expected implicit default policy to omit policy hash, got %q", compiled.PolicyHash())
 	}
 }
 
@@ -140,8 +138,39 @@ func TestLoadPolicyRequiresTLSCAForHTTPSEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = LoadPolicy(cfg)
+	_, err = LoadPolicy(cfg)
 	if err == nil {
+		t.Fatal("expected missing CA material to be rejected")
+	}
+}
+
+func TestLoadPolicyRequiresTLSCAForRegistryEndpoints(t *testing.T) {
+	dir := t.TempDir()
+	policyPath := filepath.Join(dir, "policy.json")
+	writeConfigPolicy(t, policyPath, `
+{
+  "version": 1,
+  "settings": {"default_action": "allow", "audit": {}},
+  "endpoints": [{
+    "kind": "registries",
+    "name": "public",
+    "family": "package",
+    "transport": "tls-terminate",
+    "tls": "terminate",
+    "config": {"registries": ["npm"], "malware_feed": "https://intelligence.example.com"},
+    "egress": [{"host": "intelligence.example.com", "port": 443, "tls": true}],
+    "hosts": ["registry.npmjs.org", "registry.yarnpkg.com", "registry.npmjs.com"]
+  }]
+}
+`)
+	cfg, err := Parse([]string{
+		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
+		"--policy-file", policyPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPolicy(cfg); err == nil {
 		t.Fatal("expected missing CA material to be rejected")
 	}
 }
@@ -171,7 +200,7 @@ func TestLoadPolicyDoesNotRequireSecretStoreForCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = LoadPolicy(cfg)
+	_, err = LoadPolicy(cfg)
 	if err != nil {
 		t.Fatalf("LoadPolicy returned error: %v", err)
 	}

@@ -879,7 +879,7 @@ func TestRequestPathUsesParsedPath(t *testing.T) {
 func testRoute(t *testing.T, text string) *router.Router {
 	t.Helper()
 	compiled := testPolicy(t, text)
-	return router.New(hooks.NewPolicyHook(compiled), nil)
+	return router.New(compiled, nil)
 }
 
 func testRouteWithAudit(t *testing.T, text string) (*router.Router, *audit.Logger, string, string) {
@@ -890,7 +890,7 @@ func testRouteWithAudit(t *testing.T, text string) (*router.Router, *audit.Logge
 	if err != nil {
 		t.Fatal(err)
 	}
-	return router.New(hooks.NewPolicyHook(compiled), auditLog), auditLog, auditPath, compiled.PolicyHash()
+	return router.New(compiled, auditLog), auditLog, auditPath, compiled.PolicyHash()
 }
 
 func testPolicy(t *testing.T, text string) *policy.Policy {

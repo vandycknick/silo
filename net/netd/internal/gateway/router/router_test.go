@@ -31,7 +31,7 @@ rule "deny-web" {
 }
 `)
 	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	auditLog, err := audit.Open(auditPath, compiled.PolicyHash())
+	auditLog, err := audit.Open(auditPath, "sha256:shared-sink-default")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ rule "deny-web" {
 		VMID:       "vm-123",
 		NetworkID:  "net-456",
 	}
-	route := New(hooks.NewPolicyHook(compiled), auditLog)
+	route := New(compiled, auditLog)
 
 	decision, err := route.Decide(context.Background(), flow)
 	if err != nil {
@@ -95,7 +95,7 @@ settings {
 		t.Fatal(err)
 	}
 
-	route := New(hooks.NewPolicyHook(compiled), auditLog)
+	route := New(compiled, auditLog)
 	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 49152, DestIP: net.ParseIP("203.0.113.10"), DestPort: 443}
 	if _, err := route.Decide(context.Background(), flow); err != nil {
 		t.Fatal(err)
@@ -113,7 +113,7 @@ func TestRecordFlowWritesIPv6AuditRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("2001:db8::10"), SourcePort: 49152, DestIP: net.ParseIP("2001:db8::20"), DestPort: 443}
-	route := New(hooks.NewPolicyHook(policy.Default()), auditLog)
+	route := New(policy.Default(), auditLog)
 	decision, err := route.Decide(context.Background(), flow)
 	if err != nil {
 		t.Fatal(err)
@@ -151,7 +151,7 @@ rule "allow-api" {
 		t.Fatal(err)
 	}
 	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 49152, DestIP: net.ParseIP("203.0.113.20"), DestPort: 443}
-	route := New(hooks.NewPolicyHook(compiled), auditLog)
+	route := New(compiled, auditLog)
 	decision, err := route.Decide(context.Background(), flow)
 	if err != nil {
 		t.Fatal(err)
@@ -186,7 +186,7 @@ endpoint "http" "metadata" {
 		t.Fatal(err)
 	}
 	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 49152, DestIP: net.ParseIP("169.254.169.254"), DestPort: 80}
-	route := New(hooks.NewPolicyHook(compiled), auditLog)
+	route := New(compiled, auditLog)
 	decision, err := route.Decide(context.Background(), flow)
 	if err != nil {
 		t.Fatal(err)
@@ -243,7 +243,7 @@ func TestRecordFlowWritesTerminalErrorMetadata(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			route := New(hooks.NewPolicyHook(policy.Default()), auditLog)
+			route := New(policy.Default(), auditLog)
 			route.RecordFlowOutcome(flow, test.decision, test.reason)
 			if err := auditLog.Close(); err != nil {
 				t.Fatal(err)
@@ -268,7 +268,7 @@ func TestRecordFlowWritesTunnelMetadataWhenPresent(t *testing.T) {
 	}
 	flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 49152, DestIP: net.ParseIP("203.0.113.10"), DestPort: 443}
 	decision := hooks.RouteDecision{Action: hooks.RouteAllowDirect, Tunnel: &hooks.Tunnel{Kind: "tailscale", Name: "prod"}}
-	route := New(hooks.NewPolicyHook(policy.Default()), auditLog)
+	route := New(policy.Default(), auditLog)
 	route.RecordFlow(flow, decision)
 	if err := auditLog.Close(); err != nil {
 		t.Fatal(err)
@@ -300,7 +300,7 @@ func TestRecordFlowWritesDefaultActionAuditRecords(t *testing.T) {
 				t.Fatal(err)
 			}
 			flow := hooks.Flow{Protocol: "tcp", SourceIP: net.ParseIP("192.168.127.2"), SourcePort: 49152, DestIP: net.ParseIP("203.0.113.10"), DestPort: 443}
-			route := New(hooks.NewPolicyHook(compiled), auditLog)
+			route := New(compiled, auditLog)
 			decision, err := route.Decide(context.Background(), flow)
 			if err != nil {
 				t.Fatal(err)
@@ -331,7 +331,7 @@ endpoint "https" "proxmox" {
   hosts = ["203.0.113.10:8006"]
 }
 `)
-	route := New(hooks.NewPolicyHook(compiled), nil)
+	route := New(compiled, nil)
 
 	if !route.ShouldInterceptHTTP(8080) {
 		t.Fatal("expected route to intercept configured http port 8080")

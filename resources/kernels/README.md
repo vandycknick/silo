@@ -4,23 +4,71 @@ This directory owns the guest kernel build inputs for Silo.
 
 ## Supported tracks
 
-- `stable`: `6.19.7`
-- `longterm`: `6.18.17`
-- `longterm5`: `5.15.202`
+- `stable`: `7.0.10`
+- `longterm`: `6.18.33`
+- `longterm5`: `5.15.208`
 
-Build with:
+`manifest.mk` is the source of truth for track versions, kernel.org tarball
+checksums, and architecture-specific build metadata. The kernel Makefile
+includes it directly.
+
+Build natively on arm64 Linux with:
+
+```bash
+make kernel TRACK=stable ARCH=arm64
+```
+
+Cross-compile from x86-64 Linux after installing an arm64 GNU toolchain with:
+
+```bash
+make kernel TRACK=stable ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+```
+
+On macOS, run the native arm64 build in a Linux VM:
 
 ```bash
 silo exec arch -- make kernel TRACK=stable ARCH=arm64
-silo exec arch -- make kernel TRACK=longterm ARCH=arm64
-silo exec arch -- make kernel TRACK=longterm5 ARCH=arm64
 ```
 
-Kernel source, build, and cache state live inside the guest under `$HOME/.cache/silo/kernels/`.
+Kernel source, build, and cache state live under `$HOME/.cache/silo/kernels/`.
+Downloaded source archives are verified against the checksum pinned in the
+manifest before extraction.
 
 Final exported artifacts land in the mounted repo under `target/kernels/<track>-<arch>-<version>/`.
 
-The canonical arm64 config baseline lives at `resources/kernels/configs/arm64-base.config`. Track-specific config drift lives in `resources/kernels/configs/overlays/<track>.config`, which gets appended before `olddefconfig` runs. The `manifest.toml` file records the current manually pinned track versions.
+Each export contains:
+
+- `Image`: the bootable arm64 kernel image
+- `.config`: the resolved Kconfig used for the build
+- `System.map`: the kernel symbol map
+- `vmlinux.xz`: the compressed kernel ELF with symbols for debugging
+- `build-info.txt`: track, architecture, version, revision, and source checksum
+- `SHA256SUMS`: checksums for every exported artifact
+
+The canonical arm64 config baseline lives at `resources/kernels/configs/arm64-base.config`.
+Track-specific config drift lives in `resources/kernels/configs/overlays/<track>.config`,
+which gets appended before `olddefconfig` runs.
+
+## Published artifacts
+
+Pushes to `main` that change `resources/kernels/` build the stable arm64 track.
+The workflow retains the exported files as a GitHub Actions artifact and
+publishes them to GHCR as `application/vnd.silo.kernel.v1`:
+
+```text
+ghcr.io/vandycknick/silo-kernel:<kernel-version>
+ghcr.io/vandycknick/silo-kernel:<kernel-version>-<git-revision>
+```
+
+Pull a published kernel with ORAS:
+
+```bash
+oras pull ghcr.io/vandycknick/silo-kernel:7.0.10
+```
+
+GHCR creates the package as private on its first publication. Change the
+package visibility to public once in the GitHub Packages settings to allow
+anonymous pulls.
 
 # Kernel config changes from the VM bring-up session
 

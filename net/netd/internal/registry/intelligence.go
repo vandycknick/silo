@@ -161,12 +161,11 @@ func (i *Intelligence) Refresh(ctx context.Context, ecosystem Ecosystem) error {
 	return errors.Join(malwareErr, releasesErr)
 }
 
-func (i *Intelligence) Facts(ctx context.Context, ecosystem Ecosystem, operation string, name string, version string, registryReleased *time.Time) Facts {
+func (i *Intelligence) Facts(ecosystem Ecosystem, operation string, name string, version string, registryReleased *time.Time) Facts {
 	repository, ok := i.repositories.RepositoryForEcosystem(ecosystem)
 	if !ok {
 		return Facts{Ecosystem: string(ecosystem), Operation: operation, Name: name, Version: version}
 	}
-	_ = i.Refresh(ctx, ecosystem)
 	name = repository.NormalizeName(name)
 	facts := Facts{
 		Ecosystem:     string(ecosystem),
@@ -178,7 +177,7 @@ func (i *Intelligence) Facts(ctx context.Context, ecosystem Ecosystem, operation
 
 	now := i.now()
 	key := packageKey(repository, name, version)
-	i.mu.Lock()
+	i.mu.RLock()
 	state := i.feeds[ecosystem]
 	facts.MalwareDataAvailable = state.malwareLoaded
 	if facts.IdentityKnown && registryReleased != nil && !registryReleased.IsZero() {
@@ -196,7 +195,7 @@ func (i *Intelligence) Facts(ctx context.Context, ecosystem Ecosystem, operation
 			facts.Malware = strings.EqualFold(entry.Reason, "MALWARE")
 		}
 	}
-	i.mu.Unlock()
+	i.mu.RUnlock()
 	return facts
 }
 

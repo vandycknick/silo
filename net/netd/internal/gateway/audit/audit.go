@@ -182,6 +182,17 @@ func (l *Logger) RecordFlowOutcome(flow hooks.Flow, decision hooks.RouteDecision
 	if l == nil {
 		return
 	}
+	l.RecordFlowOutcomeForPolicy(l.policyHash, flow, decision, reason)
+}
+
+func (l *Logger) RecordFlowForPolicy(policyHash string, flow hooks.Flow, decision hooks.RouteDecision) {
+	l.RecordFlowOutcomeForPolicy(policyHash, flow, decision, "")
+}
+
+func (l *Logger) RecordFlowOutcomeForPolicy(policyHash string, flow hooks.Flow, decision hooks.RouteDecision, reason string) {
+	if l == nil {
+		return
+	}
 	effectiveReason := auditReason(decision, reason)
 	flowID := flow.FlowID
 	if flowID == "" {
@@ -196,7 +207,7 @@ func (l *Logger) RecordFlowOutcome(flow hooks.Flow, decision hooks.RouteDecision
 		Phase:      "end",
 		Family:     "ip",
 		Timestamp:  time.Now().UTC(),
-		PolicyHash: l.policyHash,
+		PolicyHash: policyHash,
 		VMID:       flow.VMID,
 		NetworkID:  flow.NetworkID,
 		FlowID:     flowID,
@@ -224,6 +235,17 @@ func (l *Logger) RecordHTTPRequestOutcome(request hooks.HTTPRequest, decision ho
 	if l == nil {
 		return
 	}
+	l.RecordHTTPRequestOutcomeForPolicy(l.policyHash, request, decision, status, responseHeader, reason)
+}
+
+func (l *Logger) RecordHTTPRequestForPolicy(policyHash string, request hooks.HTTPRequest, decision hooks.RouteDecision, status int, responseHeader http.Header) {
+	l.RecordHTTPRequestOutcomeForPolicy(policyHash, request, decision, status, responseHeader, "")
+}
+
+func (l *Logger) RecordHTTPRequestOutcomeForPolicy(policyHash string, request hooks.HTTPRequest, decision hooks.RouteDecision, status int, responseHeader http.Header, reason string) {
+	if l == nil {
+		return
+	}
 	family := httpFamily(request.EndpointKind)
 	requestID, ok := newAuditID(family)
 	if !ok {
@@ -235,7 +257,7 @@ func (l *Logger) RecordHTTPRequestOutcome(request hooks.HTTPRequest, decision ho
 		Phase:        "end",
 		Family:       family,
 		Timestamp:    time.Now().UTC(),
-		PolicyHash:   l.policyHash,
+		PolicyHash:   policyHash,
 		VMID:         request.Flow.VMID,
 		NetworkID:    request.Flow.NetworkID,
 		ParentFlowID: request.Flow.FlowID,

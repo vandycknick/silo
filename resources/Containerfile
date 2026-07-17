@@ -14,6 +14,7 @@ RUN dnf install -y epel-release && \
         openssl-devel \
         bc \
         dwarves \
+        xz \
         perl-Pod-Html
 
 WORKDIR /resources

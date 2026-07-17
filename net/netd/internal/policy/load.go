@@ -123,19 +123,16 @@ func compileNetworkPolicy(filename string, document networkPolicyFile) (*Policy,
 	if document.Settings.Audit.BodyBufferBytes > 0 && document.Settings.Audit.BodyStorageBytes > 0 && document.Settings.Audit.BodyBufferBytes < document.Settings.Audit.BodyStorageBytes {
 		compiled.diagnostics = append(compiled.diagnostics, Diagnostic{Severity: "warning", Summary: "Audit body buffer is smaller than storage sample", Detail: "body_buffer_bytes is smaller than body_storage_bytes; response/request bodies may truncate before the configured stored sample size", File: filename, Line: 1, Column: 1})
 	}
+	if len(document.Tailscale) > 0 {
+		return nil, compileLoadError(filename, "Unsupported tailscale configuration", "tailscale is not implemented by netd")
+	}
+	if len(document.Forwards) > 0 {
+		return nil, compileLoadError(filename, "Unsupported network forwards", "forwards are not implemented by netd")
+	}
 	for _, endpoint := range document.Endpoints {
 		if err := compiled.addEndpointDecl(endpoint); err != nil {
 			return nil, compileLoadError(filename, "Invalid endpoint", err.Error())
 		}
-	}
-	for _, tunnel := range document.Tailscale {
-		if tunnel.Name == "" {
-			return nil, compileLoadError(filename, "Invalid tailscale tunnel", "name is required")
-		}
-		if _, ok := compiled.tailscaleByName[tunnel.Name]; ok {
-			return nil, compileLoadError(filename, "Invalid tailscale tunnel", fmt.Sprintf("duplicate tailscale tunnel %q", tunnel.Name))
-		}
-		compiled.tailscaleByName[tunnel.Name] = struct{}{}
 	}
 	for _, credential := range document.Credentials {
 		if err := compiled.addCredentialDecl(credential); err != nil {
@@ -145,22 +142,6 @@ func compileNetworkPolicy(filename string, document networkPolicyFile) (*Policy,
 	for index, rule := range document.Rules {
 		if err := compiled.addRuleDecl(rule, index); err != nil {
 			return nil, compileLoadError(filename, "Invalid rule", err.Error())
-		}
-	}
-	for _, forward := range document.Forwards {
-		if forward.Name == "" {
-			return nil, compileLoadError(filename, "Invalid forward", "name is required")
-		}
-		if forward.Kind != "host" && forward.Kind != "tailscale" {
-			return nil, compileLoadError(filename, "Invalid forward", fmt.Sprintf("unsupported forward kind %q", forward.Kind))
-		}
-		if forward.Kind == "tailscale" {
-			if forward.Tunnel == "" {
-				return nil, compileLoadError(filename, "Invalid forward", fmt.Sprintf("tailscale forward %q requires tunnel", forward.Name))
-			}
-			if _, ok := compiled.tailscaleByName[forward.Tunnel]; !ok {
-				return nil, compileLoadError(filename, "Invalid forward", fmt.Sprintf("forward %q references unknown tailscale tunnel %q", forward.Name, forward.Tunnel))
-			}
 		}
 	}
 	compiled.sortRules()
@@ -554,12 +535,7 @@ func (p *Policy) addRuleDecl(decl RuleDecl, order int) error {
 		credentialRef = &credential
 	}
 	if decl.Tunnel != "" {
-		if _, ok := p.tailscaleByName[decl.Tunnel]; !ok {
-			return fmt.Errorf("rule %q references unknown tailscale tunnel %q", decl.Name, decl.Tunnel)
-		}
-		if decl.Verdict != ActionAllow {
-			return fmt.Errorf("rule %q tunnel is only valid on allow rules", decl.Name)
-		}
+		return fmt.Errorf("rule %q uses tunnel %q, but tunnels are not implemented by netd", decl.Name, decl.Tunnel)
 	}
 	if decl.Verdict != ActionAllow && decl.Verdict != ActionDeny {
 		return fmt.Errorf("rule %q has unsupported verdict %q", decl.Name, decl.Verdict)

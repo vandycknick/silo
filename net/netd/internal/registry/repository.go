@@ -5,6 +5,7 @@ import (
 	"mime"
 	"net/http"
 	"path"
+	"sort"
 	"strings"
 	"time"
 )
@@ -126,6 +127,27 @@ func (c *Catalog) RepositoryForEcosystem(ecosystem Ecosystem) (Repository, bool)
 	}
 	repository, ok := c.byEcosystem[ecosystem]
 	return repository, ok
+}
+
+func (c *Catalog) Ecosystems() []Ecosystem {
+	if c == nil {
+		return nil
+	}
+	ecosystems := make([]Ecosystem, 0, len(c.byEcosystem))
+	for ecosystem := range c.byEcosystem {
+		ecosystems = append(ecosystems, ecosystem)
+	}
+	sort.Slice(ecosystems, func(i, j int) bool { return ecosystems[i] < ecosystems[j] })
+	return ecosystems
+}
+
+func (c *Catalog) cacheKey() string {
+	ecosystems := c.Ecosystems()
+	parts := make([]string, len(ecosystems))
+	for index, ecosystem := range ecosystems {
+		parts[index] = string(ecosystem)
+	}
+	return strings.Join(parts, ",")
 }
 
 func HostsForNames(names []string) ([]string, error) {

@@ -23,26 +23,6 @@ import (
 	packageregistry "github.com/vandycknick/silo/net/netd/internal/registry"
 )
 
-func TestClassifyRegistryRequestUsesObservedArtifactIdentity(t *testing.T) {
-	artifacts := packageregistry.NewArtifactIndex()
-	artifacts.Observe("https://pypi.org/packages/opaque-download", packageregistry.Candidate{
-		Ecosystem: packageregistry.EcosystemPyPI,
-		Operation: "download",
-		Name:      "example",
-		Version:   "1.0.0",
-	})
-	repositories, err := packageregistry.NewCatalog([]string{"pypi"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime := &registryEndpointRuntime{repositories: repositories, artifacts: artifacts}
-
-	classified := classifyRegistryRequest(runtime, http.MethodGet, "pypi.org", "/packages/opaque-download")
-	if classified.Kind != packageregistry.RequestArtifact || classified.Ecosystem != packageregistry.EcosystemPyPI || classified.Name != "example" || classified.Version != "1.0.0" {
-		t.Fatalf("classified request = %#v", classified)
-	}
-}
-
 func TestPackageAgeInvariantOnlyDeniesKnownYoungArtifacts(t *testing.T) {
 	base := hooks.RouteDecision{
 		Action: hooks.RouteAllowDirect,
@@ -71,64 +51,6 @@ func TestPackageAgeInvariantOnlyDeniesKnownYoungArtifacts(t *testing.T) {
 	young := applyPackageAgeInvariant(base, 24)
 	if young.Action != hooks.RouteDeny || young.Source != "endpoint" || young.RuleName != "" || young.Reason != "package was released less than 24 hours ago" {
 		t.Fatalf("young artifact decision = %#v", young)
-	}
-}
-
-func TestClassifyRegistryRequestParsesPyPIArtifactWithoutMetadataObservation(t *testing.T) {
-	repositories, err := packageregistry.NewCatalog([]string{"pypi"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime := &registryEndpointRuntime{repositories: repositories, artifacts: packageregistry.NewArtifactIndex()}
-
-	classified := classifyRegistryRequest(runtime, http.MethodGet, "files.pythonhosted.org", "/packages/aa/bb/foo_bar-2.0.0-py3-none-any.whl")
-	if classified.Kind != packageregistry.RequestArtifact || classified.Name != "foo-bar" || classified.Version != "2.0.0" {
-		t.Fatalf("classified direct artifact = %#v", classified)
-	}
-}
-
-func TestClassifyRegistryRequestUsesAdvertisedPyPICoreMetadataIdentity(t *testing.T) {
-	repositories, err := packageregistry.NewCatalog([]string{"pypi"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	repository, ok := repositories.RepositoryForEcosystem(packageregistry.EcosystemPyPI)
-	if !ok {
-		t.Fatal("PyPI repository is not configured")
-	}
-	baseURL, err := url.Parse("https://pypi.org/simple/example/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	artifacts := packageregistry.NewArtifactIndex()
-	_, err = repository.FilterMetadata(packageregistry.MetadataInput{
-		Body: []byte(`{
-  "name":"example",
-  "files":[{
-    "filename":"example-1.0.0-py3-none-any.whl",
-    "url":"https://files.pythonhosted.org/packages/opaque-download",
-    "upload-time":"2020-01-01T00:00:00Z",
-    "core-metadata":{"sha256":"abc"}
-  }]
-}`),
-		ContentType: "application/vnd.pypi.simple.v1+json",
-		URL:         baseURL,
-		Request:     packageregistry.Request{Ecosystem: packageregistry.EcosystemPyPI, Name: "example"},
-		Artifacts:   artifacts,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime := &registryEndpointRuntime{repositories: repositories, artifacts: artifacts}
-
-	classified := classifyRegistryRequest(
-		runtime,
-		http.MethodGet,
-		"files.pythonhosted.org",
-		"/packages/opaque-download.metadata",
-	)
-	if classified.Kind != packageregistry.RequestArtifact || classified.Name != "example" || classified.Version != "1.0.0" {
-		t.Fatalf("core metadata request = %#v", classified)
 	}
 }
 
@@ -171,14 +93,18 @@ func TestRegistryProxyFiltersMetadataAndBlocksDirectArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load policy: %v", err)
 	}
-	route := router.New(hooks.NewPolicyHook(compiled), nil)
+	route := router.New(compiled, nil)
 	certPath, keyPath, rootCAs := writeTestCA(t, t.TempDir())
-	ca, err := loadCertificateAuthority(certPath, keyPath)
+	ca, err := LoadCertificateAuthority(certPath, keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, err := newRegistryProxy(route, ca, nil, feedServer.Client())
+	intelligencePool := packageregistry.NewIntelligencePool(feedServer.Client())
+	proxy, err := newRegistryProxy(route, ca, nil, intelligencePool)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := intelligencePool.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	proxy.upstreamRootCAs = rootCAs
@@ -313,14 +239,18 @@ func TestRegistryProxyDoesNotFilterMalwareMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	route := router.New(hooks.NewPolicyHook(compiled), auditLog)
+	route := router.New(compiled, auditLog)
 	certPath, keyPath, rootCAs := writeTestCA(t, t.TempDir())
-	ca, err := loadCertificateAuthority(certPath, keyPath)
+	ca, err := LoadCertificateAuthority(certPath, keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, err := newRegistryProxy(route, ca, nil, feedServer.Client())
+	intelligencePool := packageregistry.NewIntelligencePool(feedServer.Client())
+	proxy, err := newRegistryProxy(route, ca, nil, intelligencePool)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := intelligencePool.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	proxy.upstreamRootCAs = rootCAs
@@ -522,14 +452,18 @@ func proxyNPMRegistryTestRequest(t *testing.T, defaultAction string, requestPath
 	if err != nil {
 		t.Fatalf("load policy: %v", err)
 	}
-	route := router.New(hooks.NewPolicyHook(compiled), nil)
+	route := router.New(compiled, nil)
 	certPath, keyPath, rootCAs := writeTestCA(t, t.TempDir())
-	ca, err := loadCertificateAuthority(certPath, keyPath)
+	ca, err := LoadCertificateAuthority(certPath, keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, err := newRegistryProxy(route, ca, nil, feedServer.Client())
+	intelligencePool := packageregistry.NewIntelligencePool(feedServer.Client())
+	proxy, err := newRegistryProxy(route, ca, nil, intelligencePool)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := intelligencePool.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	proxy.upstreamRootCAs = rootCAs

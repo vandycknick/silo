@@ -1,4 +1,4 @@
-package forwarder
+package packet
 
 import (
 	"context"
@@ -24,7 +24,7 @@ type TCPMetadata struct {
 	NetworkID string
 }
 
-func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, route *router.Router, dispatcher *TCPDispatcher, metadata TCPMetadata) *tcp.Forwarder {
+func TCP(ctx context.Context, s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, route *router.Router, dispatcher *TCPDispatcher, flows *FlowTracker, metadata TCPMetadata) *tcp.Forwarder {
 	return tcp.NewForwarder(s, 0, 10, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		localAddress := id.LocalAddress
@@ -38,6 +38,12 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 			NetworkID:  metadata.NetworkID,
 		}
 		flow = route.WithFlowID(flow)
+		if !flows.Start() {
+			route.RecordFlowOutcome(flow, deniedFlow("session_draining"), "session_draining")
+			r.Complete(true)
+			return
+		}
+		defer flows.Done()
 
 		if !ec2MetadataAccess && linkLocal().Contains(localAddress) {
 			route.RecordFlowOutcome(flow, deniedFlow("metadata_disabled"), "metadata_disabled")
@@ -51,7 +57,7 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 		}
 		natLock.Unlock()
 		flow.DestIP = addressIP(localAddress)
-		decision, err := route.Decide(context.Background(), flow)
+		decision, err := route.Decide(ctx, flow)
 		if err != nil {
 			slog.Warn("tcp policy hook failed", "error", err)
 			route.RecordFlowOutcome(flow, deniedFlow("policy_error"), "policy_error")
@@ -74,7 +80,7 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 		}
 		inbound := gonet.NewTCPConn(&wq, ep)
 		target := net.JoinHostPort(localAddress.String(), fmt.Sprint(id.LocalPort))
-		endpointType, handled, dispatchErr := dispatcher.Handle(context.Background(), inbound, flow, target, decision)
+		endpointType, handled, dispatchErr := dispatcher.Handle(ctx, inbound, flow, target, decision)
 		if handled {
 			route.RecordFlowOutcome(flow, decision, "classify")
 			if dispatchErr != nil {
@@ -83,7 +89,7 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 			return
 		}
 
-		outbound, err := net.Dial("tcp", target)
+		outbound, err := (&net.Dialer{}).DialContext(ctx, "tcp", target)
 		if err != nil {
 			slog.Debug("tcp outbound dial failed", "error", err, "target", target)
 			_ = inbound.Close()

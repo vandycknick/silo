@@ -15,21 +15,14 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
+	"github.com/vandycknick/silo/net/netd/internal/policy"
 	packageregistry "github.com/vandycknick/silo/net/netd/internal/registry"
 )
 
 const maxRegistryMetadataBytes = 64 << 20
-
-type registryEndpointRuntime struct {
-	repositories     *packageregistry.Catalog
-	intelligence     *packageregistry.Intelligence
-	artifacts        *packageregistry.ArtifactIndex
-	filterPackageAge uint32
-}
 
 type metadataForwardResult struct {
 	outcome  httpForwardOutcome
@@ -43,17 +36,17 @@ type registryMetadataPayload struct {
 
 type RegistryProxy struct {
 	route           *router.Router
-	ca              *certificateAuthority
-	endpoints       map[string]*registryEndpointRuntime
+	ca              *CertificateAuthority
+	endpoints       map[string]*packageregistry.Endpoint
 	fallback        *HTTPSProxy
 	upstreamRootCAs *x509.CertPool
 }
 
-func NewRegistryProxy(route *router.Router, ca *certificateAuthority, fallback *HTTPSProxy) (*RegistryProxy, error) {
-	return newRegistryProxy(route, ca, fallback, &http.Client{Timeout: 10 * time.Second})
+func NewRegistryProxy(route *router.Router, ca *CertificateAuthority, fallback *HTTPSProxy, intelligencePool *packageregistry.IntelligencePool) (*RegistryProxy, error) {
+	return newRegistryProxy(route, ca, fallback, intelligencePool)
 }
 
-func newRegistryProxy(route *router.Router, ca *certificateAuthority, fallback *HTTPSProxy, intelligenceClient *http.Client) (*RegistryProxy, error) {
+func newRegistryProxy(route *router.Router, ca *CertificateAuthority, fallback *HTTPSProxy, intelligencePool *packageregistry.IntelligencePool) (*RegistryProxy, error) {
 	if route == nil || !route.HasRegistries() {
 		return nil, nil
 	}
@@ -63,24 +56,18 @@ func newRegistryProxy(route *router.Router, ca *certificateAuthority, fallback *
 	proxy := &RegistryProxy{
 		route:     route,
 		ca:        ca,
-		endpoints: make(map[string]*registryEndpointRuntime),
+		endpoints: make(map[string]*packageregistry.Endpoint),
 		fallback:  fallback,
 	}
 	for _, config := range route.RegistryEndpoints() {
-		repositories, err := packageregistry.NewCatalog(config.Registries)
+		endpoint, err := packageregistry.NewEndpoint(packageregistry.EndpointConfig{
+			Repositories: config.Registries, MalwareFeed: config.MalwareFeed,
+			MinimumPackageAgeHours: config.FilterPackageAge,
+		}, intelligencePool)
 		if err != nil {
 			return nil, fmt.Errorf("configure registry endpoint %q: %w", config.Name, err)
 		}
-		intelligence, err := packageregistry.NewIntelligence(config.MalwareFeed, intelligenceClient, repositories)
-		if err != nil {
-			return nil, fmt.Errorf("configure registry endpoint %q: %w", config.Name, err)
-		}
-		proxy.endpoints[config.Name] = &registryEndpointRuntime{
-			repositories:     repositories,
-			intelligence:     intelligence,
-			artifacts:        packageregistry.NewArtifactIndex(),
-			filterPackageAge: config.FilterPackageAge,
-		}
+		proxy.endpoints[config.Name] = endpoint
 	}
 	return proxy, nil
 }
@@ -96,7 +83,7 @@ func (p *RegistryProxy) HandleTCP(ctx context.Context, inbound net.Conn, flow ho
 			return p.fallback.handleClientHello(ctx, sni, replayed, peekErr, flow, target, flowDecision)
 		}
 		if flowAllowsExplicitRawFallback(flowDecision) {
-			return p.proxyDirect(replayed, target)
+			return p.proxyDirect(ctx, replayed, target)
 		}
 		_ = replayed.Close()
 		return peekErr
@@ -107,7 +94,7 @@ func (p *RegistryProxy) HandleTCP(ctx context.Context, inbound net.Conn, flow ho
 			return p.fallback.handleClientHello(ctx, sni, replayed, nil, flow, target, flowDecision)
 		}
 		if flowAllowsRawFallback(flowDecision) {
-			return p.proxyDirect(replayed, target)
+			return p.proxyDirect(ctx, replayed, target)
 		}
 		_ = replayed.Close()
 		return fmt.Errorf("unclassified_registry: sni %q does not match a registry endpoint", sni)
@@ -135,8 +122,8 @@ func (p *RegistryProxy) HandleTCP(ctx context.Context, inbound net.Conn, flow ho
 	return p.proxyHTTP(ctx, serverTLS, flow, target, endpointName, authority, certificateHost, runtime)
 }
 
-func (p *RegistryProxy) proxyDirect(inbound net.Conn, target string) error {
-	outbound, err := net.Dial("tcp", target)
+func (p *RegistryProxy) proxyDirect(ctx context.Context, inbound net.Conn, target string) error {
+	outbound, err := (&net.Dialer{}).DialContext(ctx, "tcp", target)
 	if err != nil {
 		_ = inbound.Close()
 		return err
@@ -145,7 +132,7 @@ func (p *RegistryProxy) proxyDirect(inbound net.Conn, target string) error {
 	return nil
 }
 
-func (p *RegistryProxy) proxyHTTP(ctx context.Context, client *tls.Conn, flow hooks.Flow, target string, endpointName string, authority string, upstreamServerName string, runtime *registryEndpointRuntime) error {
+func (p *RegistryProxy) proxyHTTP(ctx context.Context, client *tls.Conn, flow hooks.Flow, target string, endpointName string, authority string, upstreamServerName string, runtime *packageregistry.Endpoint) error {
 	defer client.Close()
 	reader := bufio.NewReader(client)
 	for {
@@ -166,11 +153,11 @@ func (p *RegistryProxy) proxyHTTP(ctx context.Context, client *tls.Conn, flow ho
 			return writeHTTPStatus(client, status, body)
 		}
 
-		classified := classifyRegistryRequest(runtime, req.Method, requestHost(req.Host), requestPath(req))
+		classified := runtime.Classify(req.Method, requestHost(req.Host), requestPath(req))
 
-		if classified.Kind == packageregistry.RequestUnknown || (classified.Kind == packageregistry.RequestMetadata && (classified.Operation != "resolve" || req.Method != http.MethodGet || runtime.filterPackageAge == 0)) {
+		if classified.Kind == packageregistry.RequestUnknown || (classified.Kind == packageregistry.RequestMetadata && (classified.Operation != "resolve" || req.Method != http.MethodGet || runtime.MinimumPackageAgeHours() == 0)) {
 			decision := metadataRequestDecision(endpointName, classified)
-			outcome, err := forwardHTTPFamilyRequest(ctx, client, reader, req, "https", authority, nil, nil, p.registryDial(target, upstreamServerName))
+			outcome, err := forwardHTTPFamilyRequest(ctx, client, reader, req, "https", authority, nil, nil, p.registryDial(ctx, target, upstreamServerName))
 			p.route.RecordHTTPOutcome(request, decision, outcome.status, outcome.responseHeader, outcome.reason)
 			if err != nil {
 				return err
@@ -194,14 +181,14 @@ func (p *RegistryProxy) proxyHTTP(ctx context.Context, client *tls.Conn, flow ho
 				_ = req.Body.Close()
 				return err
 			}
-			decision = applyPackageAgeInvariant(decision, runtime.filterPackageAge)
+			decision = applyPackageAgeInvariant(decision, runtime.MinimumPackageAgeHours())
 			if decision.Action == hooks.RouteDeny {
 				_ = req.Body.Close()
 				status, body := denyStatusAndBody(decision.Reason)
 				p.route.RecordHTTP(request, decision, status, httpStatusHeader(status, body))
 				return writeHTTPStatus(client, status, body)
 			}
-			outcome, err := forwardHTTPFamilyRequest(ctx, client, reader, req, "https", authority, nil, nil, p.registryDial(target, upstreamServerName))
+			outcome, err := forwardHTTPFamilyRequest(ctx, client, reader, req, "https", authority, nil, nil, p.registryDial(ctx, target, upstreamServerName))
 			p.route.RecordHTTPOutcome(request, decision, outcome.status, outcome.responseHeader, outcome.reason)
 			if err != nil {
 				return err
@@ -226,42 +213,17 @@ func (p *RegistryProxy) proxyHTTP(ctx context.Context, client *tls.Conn, flow ho
 	}
 }
 
-func classifyRegistryRequest(runtime *registryEndpointRuntime, method string, host string, path string) packageregistry.Request {
-	repository, ok := runtime.repositories.RepositoryForHost(host)
-	if !ok {
-		return packageregistry.Request{Kind: packageregistry.RequestUnknown}
-	}
-	classified := repository.Classify(method, host, path)
-	if classified.Kind == packageregistry.RequestMetadata {
-		return classified
-	}
-	observed, ok := runtime.artifacts.Lookup(host, path)
-	if ok {
-		return packageregistry.Request{
-			Kind:             packageregistry.RequestArtifact,
-			Ecosystem:        observed.Ecosystem,
-			Operation:        observed.Operation,
-			Name:             observed.Name,
-			Version:          observed.Version,
-			RegistryReleased: observed.RegistryReleased,
-		}
-	}
-	return classified
-}
-
-func (p *RegistryProxy) forwardMetadata(ctx context.Context, client net.Conn, req *http.Request, request hooks.HTTPRequest, endpointName string, authority string, upstreamServerName string, target string, runtime *registryEndpointRuntime, classified packageregistry.Request) (metadataForwardResult, error) {
+func (p *RegistryProxy) forwardMetadata(ctx context.Context, client net.Conn, req *http.Request, request hooks.HTTPRequest, endpointName string, authority string, upstreamServerName string, target string, runtime *packageregistry.Endpoint, classified packageregistry.Request) (metadataForwardResult, error) {
 	defer req.Body.Close()
 	result := metadataForwardResult{decision: metadataRequestDecision(endpointName, classified)}
-	repository, ok := runtime.repositories.RepositoryForEcosystem(classified.Ecosystem)
-	if !ok {
+	prepareNormalForwardRequest(req, "https", authority)
+	req.Header.Del("Accept-Encoding")
+	if err := runtime.PrepareMetadataRequest(classified.Ecosystem, req.Header); err != nil {
 		outcome, writeErr := writeHTTPFamilyStatus(client, http.StatusBadGateway, "registry_metadata_error")
 		result.outcome = outcome
 		return result, writeErr
 	}
-	prepareNormalForwardRequest(req, "https", authority)
-	req.Header.Del("Accept-Encoding")
-	repository.PrepareMetadataRequest(req.Header)
-	outbound, err := p.registryDial(target, upstreamServerName)()
+	outbound, err := p.registryDial(ctx, target, upstreamServerName)()
 	if err != nil {
 		outcome, writeErr := writeHTTPFamilyStatus(client, http.StatusBadGateway, "upstream_error")
 		result.outcome = outcome
@@ -291,25 +253,11 @@ func (p *RegistryProxy) forwardMetadata(ctx context.Context, client net.Conn, re
 		result.outcome = outcome
 		return result, writeErr
 	}
-	age := func(candidate packageregistry.Candidate) (int64, bool) {
-		if candidate.RegistryReleased != nil {
-			elapsed := time.Since(*candidate.RegistryReleased)
-			if elapsed < 0 {
-				elapsed = 0
-			}
-			return int64(elapsed / time.Hour), true
-		}
-		facts := runtime.intelligence.Facts(ctx, candidate.Ecosystem, candidate.Operation, candidate.Name, candidate.Version, candidate.RegistryReleased)
-		return facts.AgeHours, facts.AgeKnown
-	}
-	filtered, err := repository.FilterMetadata(packageregistry.MetadataInput{
-		Body:             payload.decoded,
-		ContentType:      response.Header.Get("Content-Type"),
-		URL:              req.URL,
-		Request:          classified,
-		FilterPackageAge: runtime.filterPackageAge,
-		Age:              age,
-		Artifacts:        runtime.artifacts,
+	filtered, err := runtime.FilterMetadata(packageregistry.MetadataInput{
+		Body:        payload.decoded,
+		ContentType: response.Header.Get("Content-Type"),
+		URL:         req.URL,
+		Request:     classified,
 	})
 	if err != nil {
 		outcome, writeErr := writeHTTPFamilyStatus(client, http.StatusBadGateway, "registry_metadata_error")
@@ -378,45 +326,34 @@ func applyPackageAgeInvariant(decision hooks.RouteDecision, minimumAgeHours uint
 	return decision
 }
 
-func (p *RegistryProxy) evaluate(ctx context.Context, endpointName string, request hooks.HTTPRequest, runtime *registryEndpointRuntime, candidate packageregistry.Candidate) (hooks.RouteDecision, error) {
-	facts := runtime.intelligence.Facts(ctx, candidate.Ecosystem, candidate.Operation, candidate.Name, candidate.Version, candidate.RegistryReleased)
+func (p *RegistryProxy) evaluate(ctx context.Context, endpointName string, request hooks.HTTPRequest, runtime *packageregistry.Endpoint, candidate packageregistry.Candidate) (hooks.RouteDecision, error) {
+	facts := runtime.Facts(candidate)
 	query, err := url.ParseQuery(request.Query)
 	if err != nil {
 		return hooks.RouteDecision{}, err
 	}
-	facets := hooks.FacetValues{
-		"http": {
-			"method":  strings.ToUpper(request.Method),
-			"host":    requestHost(request.Host),
-			"path":    request.Path,
-			"query":   mapStringLists(query, nil),
-			"headers": mapStringLists(request.Header, strings.ToLower),
-		},
-		"package": {
-			"ecosystem":              facts.Ecosystem,
-			"operation":              facts.Operation,
-			"name":                   facts.Name,
-			"version":                facts.Version,
-			"identity_known":         facts.IdentityKnown,
-			"age_known":              facts.AgeKnown,
-			"age_hours":              facts.AgeHours,
-			"age_source":             facts.AgeSource,
-			"malware_data_available": facts.MalwareDataAvailable,
-			"malware":                facts.Malware,
-			"malware_reason":         facts.MalwareReason,
+	packageRequest := policy.PackageRequest{
+		Method: request.Method, Host: requestHost(request.Host), Path: request.Path,
+		Query: mapStringLists(query, nil), Headers: mapStringLists(request.Header, strings.ToLower),
+		Package: policy.PackageFacts{
+			Ecosystem: facts.Ecosystem, Operation: facts.Operation, Name: facts.Name, Version: facts.Version,
+			IdentityKnown: facts.IdentityKnown, AgeKnown: facts.AgeKnown, AgeHours: facts.AgeHours,
+			AgeSource: facts.AgeSource, MalwareDataAvailable: facts.MalwareDataAvailable,
+			Malware: facts.Malware, MalwareReason: facts.MalwareReason,
 		},
 	}
-	return p.route.DecideAction(ctx, "registries", endpointName, facets)
+	return p.route.DecidePackage(ctx, "registries", endpointName, packageRequest)
 }
 
-func (p *RegistryProxy) registryDial(target string, serverName string) func() (net.Conn, error) {
+func (p *RegistryProxy) registryDial(ctx context.Context, target string, serverName string) func() (net.Conn, error) {
 	return func() (net.Conn, error) {
-		return tls.DialWithDialer(&net.Dialer{}, "tcp", target, &tls.Config{
+		dialer := tls.Dialer{NetDialer: &net.Dialer{}, Config: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			NextProtos: []string{"http/1.1"},
 			RootCAs:    p.upstreamRootCAs,
 			ServerName: serverName,
-		})
+		}}
+		return dialer.DialContext(ctx, "tcp", target)
 	}
 }
 

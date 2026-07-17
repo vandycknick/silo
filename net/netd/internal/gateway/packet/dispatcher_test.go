@@ -1,4 +1,4 @@
-package forwarder
+package packet
 
 import (
 	"bytes"
@@ -29,20 +29,20 @@ func TestTCPDispatcherSelectsProtocolOnSharedPort(t *testing.T) {
 	tests := []struct {
 		name     string
 		payload  []byte
-		expected string
+		expected EndpointType
 	}{
-		{name: "plaintext HTTP", payload: []byte("GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"), expected: "http"},
-		{name: "registry TLS", payload: []byte{0x16, 0x03, 0x03, 0x00, 0x00}, expected: "registries"},
+		{name: "plaintext HTTP", payload: []byte("GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"), expected: EndpointHTTP},
+		{name: "registry TLS", payload: []byte{0x16, 0x03, 0x03, 0x00, 0x00}, expected: EndpointRegistries},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			httpHandler := &recordingTCPHandler{}
 			registryHandler := &recordingTCPHandler{}
 			dispatcher := &TCPDispatcher{}
-			if err := dispatcher.Register("http", httpHandler); err != nil {
+			if err := dispatcher.Register(EndpointHTTP, httpHandler); err != nil {
 				t.Fatal(err)
 			}
-			if err := dispatcher.Register("registries", registryHandler); err != nil {
+			if err := dispatcher.Register(EndpointRegistries, registryHandler); err != nil {
 				t.Fatal(err)
 			}
 
@@ -71,7 +71,7 @@ func TestTCPDispatcherSelectsProtocolOnSharedPort(t *testing.T) {
 				t.Fatalf("dispatch = %q, %v", endpointType, handled)
 			}
 			selected := httpHandler
-			if test.expected == "registries" {
+			if test.expected == EndpointRegistries {
 				selected = registryHandler
 			}
 			if !bytes.Equal(selected.payload, test.payload) {

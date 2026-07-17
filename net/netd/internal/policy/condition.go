@@ -13,7 +13,7 @@ type conditionProgram interface {
 	Eval(any) (ref.Val, *cel.EvalDetails, error)
 }
 
-func buildFacetActivation(registry *Registry, family EndpointFamily, values FacetValues) (map[string]any, error) {
+func buildFacetActivation(registry *Registry, family EndpointFamily, values facetValues) (map[string]any, error) {
 	familyDefinition, ok := registry.Family(family)
 	if !ok {
 		return nil, fmt.Errorf("unknown endpoint family %q", family)

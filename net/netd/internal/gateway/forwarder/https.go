@@ -32,7 +32,7 @@ var errMissingSNI = errors.New("missing_sni")
 
 type HTTPSProxy struct {
 	route             *router.Router
-	ca                *certificateAuthority
+	ca                *CertificateAuthority
 	credentialManager *credentials.Manager
 	upstreamRootCAs   *x509.CertPool
 }
@@ -41,7 +41,7 @@ func NewHTTPSProxy(route *router.Router, certPath string, keyPath string, manage
 	if route == nil || !route.HasHTTPS() {
 		return nil, nil
 	}
-	ca, err := loadCertificateAuthority(certPath, keyPath)
+	ca, err := LoadCertificateAuthority(certPath, keyPath)
 	if err != nil {
 		return nil, err
 	}
@@ -49,6 +49,13 @@ func NewHTTPSProxy(route *router.Router, certPath string, keyPath string, manage
 		manager = credentials.NewManager()
 	}
 	return &HTTPSProxy{route: route, ca: ca, credentialManager: manager}, nil
+}
+
+func (p *HTTPSProxy) CertificateAuthority() *CertificateAuthority {
+	if p == nil {
+		return nil
+	}
+	return p.ca
 }
 
 func (p *HTTPSProxy) ShouldHandle(flow hooks.Flow, decision hooks.RouteDecision) bool {
@@ -82,13 +89,13 @@ func (p *HTTPSProxy) handleClientHello(ctx context.Context, sni string, replayed
 				})
 			}
 			if flowAllowsExplicitRawFallback(flowDecision) {
-				return p.proxyDirect(replayed, target)
+				return p.proxyDirect(ctx, replayed, target)
 			}
 			_ = replayed.Close()
 			return err
 		}
 		if flowAllowsExplicitRawFallback(flowDecision) {
-			return p.proxyDirect(replayed, target)
+			return p.proxyDirect(ctx, replayed, target)
 		}
 		_ = replayed.Close()
 		return err
@@ -96,7 +103,7 @@ func (p *HTTPSProxy) handleClientHello(ctx context.Context, sni string, replayed
 	endpointName, authority, certHost, ok := p.route.ResolveHTTPSHost(sni, flow.DestPort)
 	if !ok {
 		if flowAllowsRawFallback(flowDecision) {
-			return p.proxyDirect(replayed, target)
+			return p.proxyDirect(ctx, replayed, target)
 		}
 		_ = replayed.Close()
 		return fmt.Errorf("unclassified_https: sni %q does not match a policy endpoint", sni)
@@ -133,8 +140,8 @@ func flowAllowsExplicitRawFallback(decision hooks.RouteDecision) bool {
 	return decision.Action == hooks.RouteClassify && decision.Source == "rule"
 }
 
-func (p *HTTPSProxy) proxyDirect(inbound net.Conn, target string) error {
-	outbound, err := net.Dial("tcp", target)
+func (p *HTTPSProxy) proxyDirect(ctx context.Context, inbound net.Conn, target string) error {
+	outbound, err := (&net.Dialer{}).DialContext(ctx, "tcp", target)
 	if err != nil {
 		_ = inbound.Close()
 		return err
@@ -212,12 +219,13 @@ func (p *HTTPSProxy) proxyHTTP(ctx context.Context, client *tls.Conn, flow hooks
 
 		upgrade := isWebSocketUpgrade(req)
 		outcome, err := forwardHTTPFamilyRequest(ctx, client, clientReader, req, "https", selection.forwardHost, p.credentialManager, decision.Credential, func() (net.Conn, error) {
-			return tls.DialWithDialer(&net.Dialer{}, "tcp", target, &tls.Config{
+			dialer := tls.Dialer{NetDialer: &net.Dialer{}, Config: &tls.Config{
 				MinVersion: tls.VersionTLS12,
 				NextProtos: []string{"http/1.1"},
 				RootCAs:    p.upstreamRootCAs,
 				ServerName: selection.upstreamServerName,
-			})
+			}}
+			return dialer.DialContext(ctx, "tcp", target)
 		})
 		p.route.RecordHTTPOutcome(request, decision, outcome.status, outcome.responseHeader, outcome.reason)
 		if err != nil {
@@ -352,14 +360,14 @@ func parseServerNameExtension(data []byte) (string, error) {
 	return "", errMissingSNI
 }
 
-type certificateAuthority struct {
+type CertificateAuthority struct {
 	cert  *x509.Certificate
 	key   crypto.Signer
 	cache map[string]*tls.Certificate
 	mu    sync.Mutex
 }
 
-func loadCertificateAuthority(certPath string, keyPath string) (*certificateAuthority, error) {
+func LoadCertificateAuthority(certPath string, keyPath string) (*CertificateAuthority, error) {
 	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("load tls ca material: %w", err)
@@ -378,10 +386,10 @@ func loadCertificateAuthority(certPath string, keyPath string) (*certificateAuth
 	if !ok {
 		return nil, fmt.Errorf("tls ca private key does not implement crypto.Signer")
 	}
-	return &certificateAuthority{cert: cert, key: signer, cache: make(map[string]*tls.Certificate)}, nil
+	return &CertificateAuthority{cert: cert, key: signer, cache: make(map[string]*tls.Certificate)}, nil
 }
 
-func (ca *certificateAuthority) CertificateFor(host string) (*tls.Certificate, error) {
+func (ca *CertificateAuthority) CertificateFor(host string) (*tls.Certificate, error) {
 	host = strings.Trim(strings.ToLower(host), "[]")
 	if host == "" {
 		host = "silo-intercept.invalid"
@@ -400,7 +408,7 @@ func (ca *certificateAuthority) CertificateFor(host string) (*tls.Certificate, e
 	return cert, nil
 }
 
-func (ca *certificateAuthority) cachedCertificateUsable(cert *tls.Certificate, now time.Time) bool {
+func (ca *CertificateAuthority) cachedCertificateUsable(cert *tls.Certificate, now time.Time) bool {
 	if cert == nil {
 		return false
 	}
@@ -425,7 +433,7 @@ func (ca *certificateAuthority) cachedCertificateUsable(cert *tls.Certificate, n
 	return leaf.NotAfter.Equal(ca.cert.NotAfter)
 }
 
-func (ca *certificateAuthority) mint(host string, now time.Time) (*tls.Certificate, error) {
+func (ca *CertificateAuthority) mint(host string, now time.Time) (*tls.Certificate, error) {
 	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serial, err := rand.Int(rand.Reader, serialLimit)
 	if err != nil {
@@ -462,7 +470,7 @@ func (ca *certificateAuthority) mint(host string, now time.Time) (*tls.Certifica
 	return &tls.Certificate{Certificate: [][]byte{der, ca.cert.Raw}, PrivateKey: leafKey, Leaf: leaf}, nil
 }
 
-func (ca *certificateAuthority) leafNotAfter(now time.Time) time.Time {
+func (ca *CertificateAuthority) leafNotAfter(now time.Time) time.Time {
 	notAfter := now.Add(24 * time.Hour)
 	if ca.cert.NotAfter.Before(notAfter) {
 		return ca.cert.NotAfter

@@ -1,4 +1,4 @@
-package forwarder
+package packet
 
 import (
 	"log/slog"

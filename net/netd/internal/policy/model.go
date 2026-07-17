@@ -77,7 +77,6 @@ type Policy struct {
 
 	endpointRefsByName   map[string]Ref
 	credentialRefsByName map[string]Ref
-	tailscaleByName      map[string]struct{}
 
 	credentialsByEndpoint map[string][]*Credential
 	exactHTTPBindings     map[string]Ref
@@ -192,7 +191,30 @@ type HTTPRequest struct {
 	Header       http.Header
 }
 
-type FacetValues map[string]map[string]any
+type facetValues map[string]map[string]any
+
+type PackageRequest struct {
+	Method  string
+	Host    string
+	Path    string
+	Query   map[string][]string
+	Headers map[string][]string
+	Package PackageFacts
+}
+
+type PackageFacts struct {
+	Ecosystem            string
+	Operation            string
+	Name                 string
+	Version              string
+	IdentityKnown        bool
+	AgeKnown             bool
+	AgeHours             int64
+	AgeSource            string
+	MalwareDataAvailable bool
+	Malware              bool
+	MalwareReason        string
+}
 
 type Decision struct {
 	Action                    Action
@@ -207,7 +229,7 @@ type Decision struct {
 	MatchedL4                 *L4Match
 	MatchedFlow               Flow
 	MatchedRequest            *HTTPRequest
-	MatchedFacets             FacetValues
+	Package                   *PackageFacts
 	SelectedCredential        *Credential
 }
 
@@ -227,7 +249,6 @@ func newPolicy() *Policy {
 		credentials:           make(map[string]*Credential),
 		endpointRefsByName:    make(map[string]Ref),
 		credentialRefsByName:  make(map[string]Ref),
-		tailscaleByName:       make(map[string]struct{}),
 		credentialsByEndpoint: make(map[string][]*Credential),
 		exactHTTPBindings:     make(map[string]Ref),
 		endpointDefinitions:   make(map[string]EndpointDefinition),

@@ -12,7 +12,6 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/containers/gvisor-tap-vsock/pkg/types"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
 )
 
@@ -20,9 +19,8 @@ type Config struct {
 	ListenVfkit string
 	PIDFile     string
 	LogFile     string
-	Stack       types.Configuration
+	Stack       NetworkConfig
 	PolicyFile  string
-	Policy      *policy.Policy
 	TLS         TLSConfig
 	Metadata    Metadata
 }
@@ -35,6 +33,34 @@ type TLSConfig struct {
 type Metadata struct {
 	VMID      string
 	NetworkID string
+}
+
+type NetworkConfig struct {
+	CaptureFile       string
+	Debug             bool
+	MTU               int
+	Subnet            string
+	GatewayIP         string
+	DeviceIP          string
+	HostIP            string
+	GatewayMACAddress string
+	DNS               []DNSZone
+	DNSSearchDomains  []string
+	Forwards          map[string]string
+	NAT               map[string]string
+	GatewayVirtualIPs []string
+	DHCPStaticLeases  map[string]string
+	EC2MetadataAccess bool
+}
+
+type DNSZone struct {
+	Name    string
+	Records []DNSRecord
+}
+
+type DNSRecord struct {
+	Name string
+	IP   net.IP
 }
 
 func Parse(args []string) (*Config, error) {
@@ -74,9 +100,9 @@ func Parse(args []string) (*Config, error) {
 	return cfg, nil
 }
 
-func LoadPolicy(cfg *Config) error {
+func LoadPolicy(cfg *Config) (*policy.Policy, error) {
 	if cfg == nil {
-		return errors.New("missing configuration")
+		return nil, errors.New("missing configuration")
 	}
 	var compiledPolicy *policy.Policy
 	var err error
@@ -86,65 +112,63 @@ func LoadPolicy(cfg *Config) error {
 		compiledPolicy = policy.Default()
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if compiledPolicy.HasHTTPS() {
+	if compiledPolicy.HasHTTPS() || compiledPolicy.HasRegistries() {
 		if cfg.TLS.CACert == "" || cfg.TLS.CAKey == "" {
-			return errors.New("--tls-ca-cert and --tls-ca-key are required when policy contains https endpoints")
+			return nil, errors.New("--tls-ca-cert and --tls-ca-key are required when policy contains TLS-terminating endpoints")
 		}
 	}
-	cfg.Policy = compiledPolicy
-	return nil
+	return compiledPolicy, nil
 }
 
-func stackConfig(subnetText, staticLease, pcapFile string) (types.Configuration, error) {
+func stackConfig(subnetText, staticLease, pcapFile string) (NetworkConfig, error) {
 	subnet, err := netip.ParsePrefix(subnetText)
 	if err != nil {
-		return types.Configuration{}, fmt.Errorf("parse subnet: %w", err)
+		return NetworkConfig{}, fmt.Errorf("parse subnet: %w", err)
 	}
 	if !subnet.Addr().Is4() {
-		return types.Configuration{}, errors.New("subnet must be IPv4")
+		return NetworkConfig{}, errors.New("subnet must be IPv4")
 	}
 	gatewayIP, err := getFirstUsableIPFromSubnet(subnet)
 	if err != nil {
-		return types.Configuration{}, err
+		return NetworkConfig{}, err
 	}
 	deviceIP, err := getNextUsableIPFromSubnet(subnet, gatewayIP)
 	if err != nil {
-		return types.Configuration{}, err
+		return NetworkConfig{}, err
 	}
 	hostIP, err := getLastUsableIPFromSubnet(subnet)
 	if err != nil {
-		return types.Configuration{}, err
+		return NetworkConfig{}, err
 	}
 	staticLeases := map[string]string{}
 	if staticLease != "" {
 		leaseIP, leaseMAC, err := parseStaticLease(staticLease, subnet, gatewayIP, hostIP)
 		if err != nil {
-			return types.Configuration{}, err
+			return NetworkConfig{}, err
 		}
 		deviceIP = leaseIP
 		staticLeases[leaseIP.String()] = leaseMAC
 	}
 
-	return types.Configuration{
+	return NetworkConfig{
 		CaptureFile:       pcapFile,
 		MTU:               1500,
 		Subnet:            subnetText,
 		GatewayIP:         gatewayIP.String(),
 		DeviceIP:          deviceIP.String(),
 		HostIP:            hostIP.String(),
-		GatewayMacAddress: "5a:94:ef:e4:0c:dd",
-		DNS: []types.Zone{
-			{Name: "containers.internal.", Records: []types.Record{{Name: "gateway", IP: net.ParseIP(gatewayIP.String())}, {Name: "host", IP: net.ParseIP(hostIP.String())}}},
-			{Name: "docker.internal.", Records: []types.Record{{Name: "gateway", IP: net.ParseIP(gatewayIP.String())}, {Name: "host", IP: net.ParseIP(hostIP.String())}}},
+		GatewayMACAddress: "5a:94:ef:e4:0c:dd",
+		DNS: []DNSZone{
+			{Name: "containers.internal.", Records: []DNSRecord{{Name: "gateway", IP: net.ParseIP(gatewayIP.String())}, {Name: "host", IP: net.ParseIP(hostIP.String())}}},
+			{Name: "docker.internal.", Records: []DNSRecord{{Name: "gateway", IP: net.ParseIP(gatewayIP.String())}, {Name: "host", IP: net.ParseIP(hostIP.String())}}},
 		},
 		DNSSearchDomains:  searchDomains(),
 		Forwards:          map[string]string{},
 		NAT:               map[string]string{hostIP.String(): "127.0.0.1"},
 		GatewayVirtualIPs: []string{hostIP.String()},
 		DHCPStaticLeases:  staticLeases,
-		Protocol:          types.VfkitProtocol,
 	}, nil
 }
 

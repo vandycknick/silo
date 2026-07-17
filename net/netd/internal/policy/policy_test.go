@@ -66,6 +66,26 @@ func TestLoadCanonicalPolicyRejectsUnsupportedVersion(t *testing.T) {
 	}
 }
 
+func TestLoadCanonicalPolicyRejectsUnimplementedSessionCapabilities(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "tailscale", body: `{"version":1,"tailscale":[{"name":"prod"}]}`, want: "tailscale is not implemented"},
+		{name: "forwards", body: `{"version":1,"forwards":[{"name":"ssh","kind":"host","target":"127.0.0.1","target_port":22}]}`, want: "forwards are not implemented"},
+		{name: "tunnel rule", body: `{"version":1,"endpoints":[{"kind":"ip","name":"private","family":"ip","transport":"packet-filter","tls":"none","destination_cidrs":["10.0.0.0/8"],"protocol":"any"}],"rules":[{"name":"tunneled","endpoints":["private"],"tunnel":"prod","verdict":"allow"}]}`, want: "tunnels are not implemented"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := LoadReader("policy.json", strings.NewReader(test.body))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadCanonicalPolicyRejectsDescriptorlessEndpoint(t *testing.T) {
 	_, err := LoadReader("policy.json", strings.NewReader(`{
   "version": 1,
@@ -122,25 +142,13 @@ func TestLoadCanonicalRegistryEndpoint(t *testing.T) {
 	if endpoint == nil || !slices.Equal(endpoint.Registries, []string{"npm", "pypi"}) || endpoint.Egress.Port != 8443 || endpoint.FilterPackageAge != 24 {
 		t.Fatalf("unexpected registry endpoint: %#v", endpoint)
 	}
-	decision := compiled.EvaluateAction(Ref{Kind: "registries", Name: "public"}, FacetValues{
-		"http": {
-			"method":  "GET",
-			"host":    "registry.npmjs.org",
-			"path":    "/package",
-			"query":   map[string][]string{},
-			"headers": map[string][]string{},
-		},
-		"package": {
-			"ecosystem":              "npm",
-			"operation":              "download",
-			"name":                   "package",
-			"version":                "1.0.0",
-			"identity_known":         true,
-			"age_known":              true,
-			"age_hours":              24,
-			"age_source":             "registry_metadata",
-			"malware_data_available": true,
-			"malware":                false,
+	decision := compiled.EvaluatePackage(Ref{Kind: "registries", Name: "public"}, PackageRequest{
+		Method: "GET", Host: "registry.npmjs.org", Path: "/package",
+		Query: map[string][]string{}, Headers: map[string][]string{},
+		Package: PackageFacts{
+			Ecosystem: "npm", Operation: "download", Name: "package", Version: "1.0.0",
+			IdentityKnown: true, AgeKnown: true, AgeHours: 24, AgeSource: "registry_metadata",
+			MalwareDataAvailable: true,
 		},
 	})
 	if decision.Action != ActionAllow || decision.RuleName != "allow-old" {

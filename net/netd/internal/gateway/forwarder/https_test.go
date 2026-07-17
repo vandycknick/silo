@@ -864,7 +864,7 @@ rule "allow-local" {
 func TestCertificateForReusesFreshCachedCertificate(t *testing.T) {
 	dir := t.TempDir()
 	caCert, caKey, _ := writeTestCA(t, dir)
-	ca, err := loadCertificateAuthority(caCert, caKey)
+	ca, err := LoadCertificateAuthority(caCert, caKey)
 	if err != nil {
 		t.Fatalf("loadCertificateAuthority returned error: %v", err)
 	}
@@ -890,7 +890,7 @@ func TestCertificateForReusesFreshCachedCertificate(t *testing.T) {
 func TestCertificateForRefreshesNearExpiryCachedCertificate(t *testing.T) {
 	dir := t.TempDir()
 	caCert, caKey, _ := writeTestCA(t, dir)
-	ca, err := loadCertificateAuthority(caCert, caKey)
+	ca, err := LoadCertificateAuthority(caCert, caKey)
 	if err != nil {
 		t.Fatalf("loadCertificateAuthority returned error: %v", err)
 	}
@@ -918,7 +918,7 @@ func TestCertificateForRefreshesNearExpiryCachedCertificate(t *testing.T) {
 func TestCertificateForReusesCALimitedCachedCertificate(t *testing.T) {
 	dir := t.TempDir()
 	caCert, caKey, _ := writeTestCAExpiringAt(t, dir, time.Now().Add(30*time.Minute))
-	ca, err := loadCertificateAuthority(caCert, caKey)
+	ca, err := LoadCertificateAuthority(caCert, caKey)
 	if err != nil {
 		t.Fatalf("loadCertificateAuthority returned error: %v", err)
 	}
@@ -955,7 +955,7 @@ func startObservedTLSUpstreamForHost(t *testing.T, caCertPath string, caKeyPath 
 
 func startObservedTLSUpstreamWithResponseForHost(t *testing.T, caCertPath string, caKeyPath string, certHost string, requestCh chan<- *http.Request, response string) (string, func(), <-chan struct{}) {
 	t.Helper()
-	ca, err := loadCertificateAuthority(caCertPath, caKeyPath)
+	ca, err := LoadCertificateAuthority(caCertPath, caKeyPath)
 	if err != nil {
 		t.Fatalf("loadCertificateAuthority returned error: %v", err)
 	}
