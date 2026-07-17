@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -28,6 +29,161 @@ func TestLoadedPolicyOmitsPolicyHash(t *testing.T) {
 	}
 	if got := compiled.Metadata()["policy_hash"]; got != "frontend-owned" {
 		t.Fatalf("expected frontend metadata to remain available, got %#v", got)
+	}
+}
+
+func TestLoadCanonicalPolicy(t *testing.T) {
+	compiled, err := LoadReader("policy.json", strings.NewReader(`{
+  "version": 1,
+  "metadata": {},
+  "settings": {"default_action": "deny", "audit": {}},
+  "endpoints": [{
+    "kind": "https",
+    "name": "api",
+    "family": "http",
+    "transport": "https-mitm",
+    "tls": "terminate",
+    "capabilities": ["credential-injection"],
+    "hosts": ["api.example.com"]
+  }],
+  "credentials": [],
+  "rules": [{"name": "allow-api", "endpoints": ["api"], "verdict": "allow"}],
+  "tailscale": [],
+  "forwards": []
+}`))
+	if err != nil {
+		t.Fatalf("LoadReader returned error: %v", err)
+	}
+	if !compiled.HasHTTPS() {
+		t.Fatal("HTTPS endpoint was not compiled")
+	}
+}
+
+func TestLoadCanonicalPolicyRejectsUnsupportedVersion(t *testing.T) {
+	_, err := LoadReader("policy.json", strings.NewReader(`{"version":2}`))
+	if err == nil || !strings.Contains(err.Error(), "policy version must be 1") {
+		t.Fatalf("unsupported version error = %v", err)
+	}
+}
+
+func TestLoadCanonicalPolicyRejectsDescriptorlessEndpoint(t *testing.T) {
+	_, err := LoadReader("policy.json", strings.NewReader(`{
+  "version": 1,
+  "endpoints": [{"kind":"https","name":"api","hosts":["api.example.com"]}]
+}`))
+	if err == nil || !strings.Contains(err.Error(), `requires family "http"`) {
+		t.Fatalf("descriptorless endpoint error = %v", err)
+	}
+}
+
+func TestLoadCanonicalPolicyRejectsMetadataMismatch(t *testing.T) {
+	_, err := LoadReader("policy.json", strings.NewReader(`{
+  "version": 1,
+  "settings": {"default_action": "deny", "audit": {}},
+  "endpoints": [{
+    "kind": "https",
+    "name": "api",
+    "family": "package",
+    "transport": "https-mitm",
+    "tls": "terminate",
+    "capabilities": ["credential-injection"],
+    "hosts": ["api.example.com"]
+  }]
+}`))
+	if err == nil || !strings.Contains(err.Error(), `requires family "http"`) {
+		t.Fatalf("metadata mismatch error = %v", err)
+	}
+}
+
+func TestLoadCanonicalRegistryEndpoint(t *testing.T) {
+	compiled, err := LoadReader("policy.json", strings.NewReader(`{
+  "version": 1,
+  "settings": {"default_action": "deny", "audit": {}},
+  "endpoints": [{
+    "kind": "registries",
+    "name": "public",
+    "family": "package",
+    "transport": "tls-terminate",
+    "tls": "terminate",
+    "config": {
+      "registries": ["npm", "pypi"],
+      "malware_feed": "https://intelligence.example.com:8443/v1",
+      "filter_package_age": 24
+    },
+    "egress": [{"host": "intelligence.example.com", "port": 8443, "tls": true}],
+    "hosts": ["registry.npmjs.org", "registry.yarnpkg.com", "registry.npmjs.com", "pypi.org", "files.pythonhosted.org", "pypi.python.org", "pythonhosted.org"]
+  }],
+  "rules": [{"name": "allow-old", "endpoints": ["public"], "condition": "package.age_known && package.age_hours >= 24", "verdict": "allow"}]
+}`))
+	if err != nil {
+		t.Fatalf("LoadReader returned error: %v", err)
+	}
+	endpoint := compiled.registryEndpoints["registries.public"]
+	if endpoint == nil || !slices.Equal(endpoint.Registries, []string{"npm", "pypi"}) || endpoint.Egress.Port != 8443 || endpoint.FilterPackageAge != 24 {
+		t.Fatalf("unexpected registry endpoint: %#v", endpoint)
+	}
+	decision := compiled.EvaluateAction(Ref{Kind: "registries", Name: "public"}, FacetValues{
+		"http": {
+			"method":  "GET",
+			"host":    "registry.npmjs.org",
+			"path":    "/package",
+			"query":   map[string][]string{},
+			"headers": map[string][]string{},
+		},
+		"package": {
+			"ecosystem":              "npm",
+			"operation":              "download",
+			"name":                   "package",
+			"version":                "1.0.0",
+			"identity_known":         true,
+			"age_known":              true,
+			"age_hours":              24,
+			"age_source":             "registry_metadata",
+			"malware_data_available": true,
+			"malware":                false,
+		},
+	})
+	if decision.Action != ActionAllow || decision.RuleName != "allow-old" {
+		t.Fatalf("registry action decision = %#v", decision)
+	}
+}
+
+func TestLoadCanonicalPolicyRejectsPluginFields(t *testing.T) {
+	for _, field := range []string{
+		`"plugins": []`,
+		`"endpoints": [{"kind":"https","name":"api","family":"http","transport":"https-mitm","tls":"terminate","capabilities":["credential-injection"],"plugin":"echo","hosts":["api.example.com"]}]`,
+	} {
+		_, err := LoadReader("policy.json", strings.NewReader(`{"version":1,`+field+`}`))
+		if err == nil || !strings.Contains(err.Error(), "unknown field") {
+			t.Fatalf("plugin field %s error = %v", field, err)
+		}
+	}
+}
+
+func TestLoadCanonicalRegistryEndpointRejectsDerivedEnvelopeMismatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		config string
+		egress string
+		hosts  string
+		want   string
+	}{
+		{name: "unknown registry", config: `{"registries":["rubygems"],"malware_feed":"https://intelligence.example.com"}`, egress: `[{"host":"intelligence.example.com","port":443,"tls":true}]`, hosts: `["rubygems.org"]`, want: "registry names must be npm or pypi"},
+		{name: "duplicate registry", config: `{"registries":["npm","npm"],"malware_feed":"https://intelligence.example.com"}`, egress: `[{"host":"intelligence.example.com","port":443,"tls":true}]`, hosts: `["registry.npmjs.org","registry.yarnpkg.com","registry.npmjs.com"]`, want: "declared more than once"},
+		{name: "host mismatch", config: `{"registries":["npm"],"malware_feed":"https://intelligence.example.com"}`, egress: `[{"host":"intelligence.example.com","port":443,"tls":true}]`, hosts: `["attacker.example.com"]`, want: "host bindings do not match"},
+		{name: "egress mismatch", config: `{"registries":["npm"],"malware_feed":"https://intelligence.example.com"}`, egress: `[{"host":"attacker.example.com","port":443,"tls":true}]`, hosts: `["registry.npmjs.org","registry.yarnpkg.com","registry.npmjs.com"]`, want: "egress does not match"},
+		{name: "non HTTPS intelligence", config: `{"registries":["npm"],"malware_feed":"http://intelligence.example.com"}`, egress: `[{"host":"intelligence.example.com","port":443,"tls":true}]`, hosts: `["registry.npmjs.org","registry.yarnpkg.com","registry.npmjs.com"]`, want: "must be an HTTPS URL"},
+		{name: "zero package age", config: `{"registries":["npm"],"malware_feed":"https://intelligence.example.com","filter_package_age":0}`, egress: `[{"host":"intelligence.example.com","port":443,"tls":true}]`, hosts: `["registry.npmjs.org","registry.yarnpkg.com","registry.npmjs.com"]`, want: "filter_package_age must be a positive integer"},
+		{name: "fractional package age", config: `{"registries":["npm"],"malware_feed":"https://intelligence.example.com","filter_package_age":1.5}`, egress: `[{"host":"intelligence.example.com","port":443,"tls":true}]`, hosts: `["registry.npmjs.org","registry.yarnpkg.com","registry.npmjs.com"]`, want: "filter_package_age must be a positive integer"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"version":1,"endpoints":[{"kind":"registries","name":"public","family":"package","transport":"tls-terminate","tls":"terminate","config":%s,"egress":%s,"hosts":%s}]}`, test.config, test.egress, test.hosts)
+			_, err := LoadReader("policy.json", strings.NewReader(body))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want substring %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -476,7 +632,7 @@ func TestHTTPCELRequestFacets(t *testing.T) {
 			compiled := loadPolicy(t, httpConditionPolicy(tt.condition))
 			decision := compiled.EvaluateHTTP(request)
 			if decision.Action != ActionAllow || decision.RuleName != "allow" {
-				_, matchErr := compiled.httpRules[0].matchesHTTP(request)
+				_, matchErr := compiled.rulesByFamily[EndpointFamilyHTTP][0].matchesHTTP(request)
 				t.Fatalf("expected condition %q to allow, got %#v (condition error: %v)", tt.condition, decision, matchErr)
 			}
 		})
@@ -1385,7 +1541,7 @@ func loadPolicy(t *testing.T, text string) *Policy {
 
 func loadPolicyError(t *testing.T, text string) (*Policy, error) {
 	t.Helper()
-	return loadLegacyHCLForTest("policy.hcl", []byte(text))
+	return loadHCLFixtureForTest("policy.hcl", []byte(text))
 }
 
 func httpConditionPolicy(condition string) string {

@@ -1,8 +1,12 @@
 use crate::model::{
     Action, AuditSettingsDecl, CredentialDecl, Diagnostic, DiagnosticSeverity, EndpointDecl,
     EndpointFamily, ForwardDecl, LoadError, Policy, PolicyDocument, PortRange, Ref, RuleDecl,
-    SettingsDecl, SourceFile, TailscaleDecl, Transport,
+    SettingsDecl, SourceFile, TailscaleDecl,
 };
+use crate::plugin::{
+    parse_https_origin, ConditionKind, EndpointDefinition, EndpointSchema, PluginRegistry,
+};
+use crate::registry::{registry_hosts, PackageRepository};
 use hcl::{Block, Body, Expression, Structure};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -56,7 +60,8 @@ fn parse_document(
         }
     };
 
-    let mut builder = DocumentBuilder::new(filename, source, policy);
+    let plugins = PluginRegistry::builtins();
+    let mut builder = DocumentBuilder::new(filename, source, policy, &plugins);
     builder.read_body(&body);
     builder.validate_references();
     Ok(builder.finish())
@@ -72,6 +77,7 @@ struct DocumentBuilder<'a> {
     filename: &'a str,
     locator: SourceLocator<'a>,
     policy: &'a mut Policy,
+    plugins: &'a PluginRegistry,
     diagnostics: Vec<Diagnostic>,
     settings: SettingsDecl,
     settings_seen: bool,
@@ -88,11 +94,17 @@ struct DocumentBuilder<'a> {
 }
 
 impl<'a> DocumentBuilder<'a> {
-    fn new(filename: &'a str, source: &'a str, policy: &'a mut Policy) -> Self {
+    fn new(
+        filename: &'a str,
+        source: &'a str,
+        policy: &'a mut Policy,
+        plugins: &'a PluginRegistry,
+    ) -> Self {
         Self {
             filename,
             locator: SourceLocator::new(source),
             policy,
+            plugins,
             diagnostics: Vec::new(),
             settings: SettingsDecl::default(),
             settings_seen: false,
@@ -311,38 +323,18 @@ impl<'a> DocumentBuilder<'a> {
             );
             return;
         }
-        let family;
-        let transport;
-        let default_port;
-        match kind.as_str() {
-            "ip" => {
-                family = EndpointFamily::Ip;
-                transport = Transport::PacketFilter;
-                default_port = 0;
-            }
-            "http" => {
-                family = EndpointFamily::Http;
-                transport = Transport::HttpProxy;
-                default_port = 80;
-            }
-            "https" => {
-                family = EndpointFamily::Http;
-                transport = Transport::HttpsMitm;
-                default_port = 443;
-            }
-            _ => {
-                let position = self
-                    .locator
-                    .find_label(block_position.line, &kind)
-                    .unwrap_or(block_position);
-                self.error_at(
-                    position,
-                    "Unsupported endpoint kind",
-                    format!("unsupported endpoint kind \"{kind}\""),
-                );
-                return;
-            }
-        }
+        let Some(definition) = self.plugins.endpoint(&kind) else {
+            let position = self
+                .locator
+                .find_label(block_position.line, &kind)
+                .unwrap_or(block_position);
+            self.error_at(
+                position,
+                "Unsupported endpoint kind",
+                format!("unsupported endpoint kind \"{kind}\""),
+            );
+            return;
+        };
         if !self.endpoint_keys.insert(key.clone()) {
             self.error_at(
                 block_position,
@@ -354,7 +346,7 @@ impl<'a> DocumentBuilder<'a> {
 
         let mut source = Vec::new();
         let mut destination = Vec::new();
-        let mut protocol = if kind == "ip" {
+        let mut protocol = if definition.schema == EndpointSchema::Ip {
             "any".to_owned()
         } else {
             String::new()
@@ -362,20 +354,26 @@ impl<'a> DocumentBuilder<'a> {
         let mut ports = Vec::new();
         let mut hosts = Vec::new();
         let mut hosts_seen = false;
+        let mut registries = Vec::new();
+        let mut registries_seen = false;
+        let mut malware_feed = String::new();
+        let mut malware_feed_seen = false;
+        let mut filter_package_age = None;
         for structure in block.body().iter() {
             match structure {
-                Structure::Attribute(attribute) => match (kind.as_str(), attribute.key()) {
-                    ("ip", "source" | "source_cidrs") => match decode_string_list(attribute.expr())
-                    {
-                        Ok(value) => source = value,
-                        Err(detail) => self.attr_error(
-                            attribute,
-                            block_position.line,
-                            "Invalid endpoint source",
-                            detail,
-                        ),
-                    },
-                    ("ip", "destination" | "destination_cidrs") => {
+                Structure::Attribute(attribute) => match (&definition.schema, attribute.key()) {
+                    (EndpointSchema::Ip, "source" | "source_cidrs") => {
+                        match decode_string_list(attribute.expr()) {
+                            Ok(value) => source = value,
+                            Err(detail) => self.attr_error(
+                                attribute,
+                                block_position.line,
+                                "Invalid endpoint source",
+                                detail,
+                            ),
+                        }
+                    }
+                    (EndpointSchema::Ip, "destination" | "destination_cidrs") => {
                         match decode_string_list(attribute.expr()) {
                             Ok(value) => destination = value,
                             Err(detail) => self.attr_error(
@@ -386,7 +384,7 @@ impl<'a> DocumentBuilder<'a> {
                             ),
                         }
                     }
-                    ("ip", "protocol") => match decode_string(attribute.expr()) {
+                    (EndpointSchema::Ip, "protocol") => match decode_string(attribute.expr()) {
                         Ok(value) => protocol = value,
                         Err(detail) => self.attr_error(
                             attribute,
@@ -395,7 +393,7 @@ impl<'a> DocumentBuilder<'a> {
                             detail,
                         ),
                     },
-                    ("ip", "ports") => match decode_port_ranges(attribute.expr()) {
+                    (EndpointSchema::Ip, "ports") => match decode_port_ranges(attribute.expr()) {
                         Ok(value) => ports = value,
                         Err(detail) => self.attr_error(
                             attribute,
@@ -404,7 +402,7 @@ impl<'a> DocumentBuilder<'a> {
                             detail,
                         ),
                     },
-                    ("http" | "https", "hosts") => {
+                    (EndpointSchema::Hosts, "hosts") => {
                         hosts_seen = true;
                         match decode_string_list(attribute.expr()) {
                             Ok(value) if value.is_empty() => self.attr_error(
@@ -418,6 +416,47 @@ impl<'a> DocumentBuilder<'a> {
                                 attribute,
                                 block_position.line,
                                 "Invalid hosts",
+                                detail,
+                            ),
+                        }
+                    }
+                    (EndpointSchema::Registries, "registries") => {
+                        registries_seen = true;
+                        match decode_string_list(attribute.expr()) {
+                            Ok(value) if value.is_empty() => self.attr_error(
+                                attribute,
+                                block_position.line,
+                                "Invalid registries",
+                                "registries must not be empty",
+                            ),
+                            Ok(value) => registries = value,
+                            Err(detail) => self.attr_error(
+                                attribute,
+                                block_position.line,
+                                "Invalid registries",
+                                detail,
+                            ),
+                        }
+                    }
+                    (EndpointSchema::Registries, "malware_feed") => {
+                        malware_feed_seen = true;
+                        match decode_string(attribute.expr()) {
+                            Ok(value) => malware_feed = value,
+                            Err(detail) => self.attr_error(
+                                attribute,
+                                block_position.line,
+                                "Invalid malware feed",
+                                detail,
+                            ),
+                        }
+                    }
+                    (EndpointSchema::Registries, "filter_package_age") => {
+                        match decode_positive_u32(attribute.expr()) {
+                            Ok(value) => filter_package_age = Some(value),
+                            Err(detail) => self.attr_error(
+                                attribute,
+                                block_position.line,
+                                "Invalid package age filter",
                                 detail,
                             ),
                         }
@@ -446,27 +485,76 @@ impl<'a> DocumentBuilder<'a> {
                 }
             }
         }
-        if kind == "ip" && !["any", "tcp", "udp"].contains(&protocol.as_str()) {
+        if definition.schema == EndpointSchema::Ip
+            && !["any", "tcp", "udp"].contains(&protocol.as_str())
+        {
             self.error_at(
                 block_position,
                 "Invalid endpoint protocol",
                 format!("protocol must be any, tcp, or udp, got {protocol}"),
             );
         }
-        if (kind == "http" || kind == "https") && !hosts_seen {
+        if definition.schema == EndpointSchema::Hosts && !hosts_seen {
             self.error_at(block_position, "Missing hosts", "hosts is required");
         }
+        if definition.schema == EndpointSchema::Registries {
+            if !registries_seen {
+                self.error_at(
+                    block_position,
+                    "Missing registries",
+                    "registries is required",
+                );
+            }
+            let mut seen = HashSet::new();
+            for registry in &registries {
+                if PackageRepository::parse(registry).is_none() {
+                    self.error_at(
+                        block_position,
+                        "Invalid registry",
+                        format!("registry must be npm or pypi, got {registry}"),
+                    );
+                }
+                if !seen.insert(registry.as_str()) {
+                    self.error_at(
+                        block_position,
+                        "Duplicate registry",
+                        format!("registry {registry} is declared more than once"),
+                    );
+                }
+            }
+            if !malware_feed_seen {
+                self.error_at(
+                    block_position,
+                    "Missing malware feed",
+                    "malware_feed is required",
+                );
+            } else if parse_https_origin(&malware_feed).is_none() {
+                self.error_at(
+                    block_position,
+                    "Invalid malware feed",
+                    "malware_feed must be an HTTPS URL with a valid host and optional port",
+                );
+            }
+            hosts = registry_hosts(&registries);
+        }
+        let terminates_tls = definition.terminates_tls();
+        let supports_credentials = definition.supports_credentials;
         self.endpoints.push(EndpointDecl {
             kind,
             name,
-            family,
-            transport,
-            default_port,
+            family: definition.family,
+            transport: definition.transport,
+            default_port: definition.default_port,
+            terminates_tls,
+            supports_credentials,
             source,
             destination,
             protocol,
             ports,
             hosts,
+            registries,
+            malware_feed,
+            filter_package_age,
             order: self.endpoints.len(),
         });
     }
@@ -833,22 +921,9 @@ impl<'a> DocumentBuilder<'a> {
             );
             return;
         };
-        let condition = match condition_source {
-            Some(source) if !source.is_empty() => {
-                match self.policy.register_http_condition(&source) {
-                    Ok(condition) => Some(condition),
-                    Err(err) => {
-                        self.error_at(
-                            block_position,
-                            "Invalid rule",
-                            format!("rule \"{name}\" condition: {err}"),
-                        );
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
+        let condition = condition_source
+            .filter(|source| !source.is_empty())
+            .map(|source| crate::model::ConditionDecl { id: 0, source });
         self.rules.push(RuleDecl {
             name,
             endpoints,
@@ -1106,14 +1181,13 @@ impl<'a> DocumentBuilder<'a> {
     }
 
     fn validate_references(&mut self) {
-        let endpoint_kinds: HashMap<String, String> = self
+        let endpoint_definitions: HashMap<String, EndpointDefinition> = self
             .endpoints
             .iter()
-            .map(|endpoint| {
-                (
-                    format!("{}.{}", endpoint.kind, endpoint.name),
-                    endpoint.kind.clone(),
-                )
+            .filter_map(|endpoint| {
+                self.plugins
+                    .endpoint(&endpoint.kind)
+                    .map(|definition| (format!("{}.{}", endpoint.kind, endpoint.name), definition))
             })
             .collect();
         let credential_endpoints: HashMap<String, Ref> = self
@@ -1142,18 +1216,8 @@ impl<'a> DocumentBuilder<'a> {
                 );
                 continue;
             }
-            if credential.endpoint.kind != "https" {
-                self.error_at(
-                    Position { line: 1, column: 1 },
-                    "Invalid credential",
-                    format!(
-                        "credential \"{}\".\"{}\" must reference an https endpoint",
-                        credential.kind, credential.name
-                    ),
-                );
-                continue;
-            }
-            if !endpoint_kinds.contains_key(&credential.endpoint.key()) {
+            let Some(endpoint_definition) = endpoint_definitions.get(&credential.endpoint.key())
+            else {
                 self.error_at(
                     Position { line: 1, column: 1 },
                     "Invalid credential",
@@ -1164,15 +1228,28 @@ impl<'a> DocumentBuilder<'a> {
                         credential.endpoint.key()
                     ),
                 );
+                continue;
+            };
+            if !endpoint_definition.supports_credentials {
+                self.error_at(
+                    Position { line: 1, column: 1 },
+                    "Invalid credential",
+                    format!(
+                        "credential \"{}\".\"{}\" must reference an https endpoint",
+                        credential.kind, credential.name
+                    ),
+                );
+                continue;
             }
         }
         self.warn_credential_overlap();
 
         let rules_snapshot = self.rules.clone();
-        for rule in &rules_snapshot {
+        let mut condition_compilations = Vec::new();
+        for (rule_index, rule) in rules_snapshot.iter().enumerate() {
             let mut family = None;
             for endpoint in &rule.endpoints {
-                let Some(kind) = endpoint_kinds.get(&endpoint.key()) else {
+                let Some(definition) = endpoint_definitions.get(&endpoint.key()) else {
                     self.error_at(
                         Position { line: 1, column: 1 },
                         "Invalid rule",
@@ -1184,13 +1261,9 @@ impl<'a> DocumentBuilder<'a> {
                     );
                     continue;
                 };
-                let endpoint_family = if kind == "ip" {
-                    EndpointFamily::Ip
-                } else {
-                    EndpointFamily::Http
-                };
-                if let Some(existing) = family {
-                    if existing != endpoint_family {
+                let endpoint_family = definition.family.clone();
+                if let Some(ref existing) = family {
+                    if existing != &endpoint_family {
                         self.error_at(
                             Position { line: 1, column: 1 },
                             "Invalid rule",
@@ -1204,7 +1277,11 @@ impl<'a> DocumentBuilder<'a> {
                     family = Some(endpoint_family);
                 }
             }
-            if family == Some(EndpointFamily::Ip) && rule.condition.is_some() {
+            let condition_kind = family
+                .as_ref()
+                .and_then(|family| self.plugins.family(family))
+                .map(|definition| definition.condition);
+            if condition_kind == Some(ConditionKind::None) && rule.condition.is_some() {
                 self.error_at(
                     Position { line: 1, column: 1 },
                     "Invalid rule",
@@ -1213,6 +1290,13 @@ impl<'a> DocumentBuilder<'a> {
                         rule.name
                     ),
                 );
+            } else if let (Some(family), Some(condition)) = (family.as_ref(), &rule.condition) {
+                condition_compilations.push((
+                    rule_index,
+                    rule.name.clone(),
+                    family.clone(),
+                    condition.source.clone(),
+                ));
             }
             if let Some(credential) = &rule.credential {
                 let Some(endpoint) = credential_endpoints.get(&credential.key()) else {
@@ -1269,6 +1353,20 @@ impl<'a> DocumentBuilder<'a> {
                         format!("rule \"{}\" tunnel requires verdict allow", rule.name),
                     );
                 }
+            }
+        }
+
+        for (rule_index, rule_name, family, source) in condition_compilations {
+            match self
+                .policy
+                .register_condition(&source, family, self.plugins)
+            {
+                Ok(condition) => self.rules[rule_index].condition = Some(condition),
+                Err(err) => self.error_at(
+                    Position { line: 1, column: 1 },
+                    "Invalid rule",
+                    format!("rule \"{rule_name}\" condition: {err}"),
+                ),
             }
         }
 
@@ -1534,6 +1632,25 @@ fn decode_u16(expression: &Expression) -> Result<u16, String> {
         return Err(format!("integer {value} is out of range"));
     }
     Ok(value as u16)
+}
+
+fn decode_positive_u32(expression: &Expression) -> Result<u32, String> {
+    match expression {
+        Expression::Number(value) => {
+            let text = value.to_string();
+            if text.contains('.') {
+                return Err(format!("number {text} must be an integer"));
+            }
+            let value = text
+                .parse::<u32>()
+                .map_err(|_| format!("invalid positive integer {text}"))?;
+            if value == 0 {
+                return Err("integer must be greater than zero".to_owned());
+            }
+            Ok(value)
+        }
+        _ => Err("positive integer value required".to_owned()),
+    }
 }
 
 fn decode_size(expression: &Expression) -> Result<i64, String> {

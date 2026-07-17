@@ -2162,7 +2162,7 @@ mod tests {
             r#"{
                 "version": 1,
                 "endpoints": [
-                    { "name": "openai", "kind": "https", "hosts": ["chatgpt.com"] }
+                    { "name": "openai", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["chatgpt.com"] }
                 ],
                 "credentials": [
                     { "name": "personal", "kind": "openai_codex_oauth", "endpoint": "openai" }
@@ -2210,7 +2210,7 @@ mod tests {
             r#"{
                 "version": 1,
                 "endpoints": [
-                    { "name": "openai", "kind": "https", "hosts": ["chatgpt.com"] }
+                    { "name": "openai", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["chatgpt.com"] }
                 ],
                 "credentials": [
                     { "name": "personal", "kind": "openai_codex_oauth", "endpoint": "openai" }
@@ -2245,7 +2245,7 @@ mod tests {
             r#"{
                 "version": 1,
                 "endpoints": [
-                    { "name": "github", "kind": "https", "hosts": ["github.com"] }
+                    { "name": "github", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["github.com"] }
                 ],
                 "credentials": [
                     { "name": "github-api", "kind": "bearer_token", "endpoint": "github" }
@@ -2575,7 +2575,7 @@ mod tests {
             r#"{
                 "version": 1,
                 "endpoints": [
-                    { "name": "aws", "kind": "https", "hosts": ["sts.amazonaws.com"] }
+                    { "name": "aws", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["sts.amazonaws.com"] }
                 ],
                 "credentials": [
                     { "name": "prod", "kind": "aws_credential", "endpoint": "aws" }

@@ -76,6 +76,47 @@ func (h *PolicyHook) MatchHTTPSAuthority(host string, authority string) bool {
 	return h.policy.MatchHTTPSAuthority(host, authority)
 }
 
+func (h *PolicyHook) HasRegistries() bool {
+	return h.policy.HasRegistries()
+}
+
+func (h *PolicyHook) ShouldInterceptEndpoint(kind string, port uint16) bool {
+	return h.policy.ShouldInterceptEndpoint(kind, port)
+}
+
+func (h *PolicyHook) ResolveEndpointHost(kind string, host string, port uint16) (string, string, string, bool) {
+	ref, authority, certHost, ok := h.policy.ResolveEndpointHost(kind, host, port)
+	return ref.Name, authority, certHost, ok
+}
+
+func (h *PolicyHook) MatchEndpointAuthority(kind string, host string, authority string) bool {
+	return h.policy.MatchEndpointAuthority(kind, host, authority)
+}
+
+func (h *PolicyHook) RegistryEndpoints() []RegistryEndpointConfig {
+	configs := h.policy.RegistryEndpointConfigs()
+	converted := make([]RegistryEndpointConfig, 0, len(configs))
+	for _, config := range configs {
+		converted = append(converted, RegistryEndpointConfig{
+			Kind:             config.Kind,
+			Name:             config.Name,
+			Registries:       append([]string(nil), config.Registries...),
+			MalwareFeed:      config.MalwareFeed,
+			FilterPackageAge: config.FilterPackageAge,
+		})
+	}
+	return converted
+}
+
+func (h *PolicyHook) DecideAction(_ context.Context, endpointKind string, endpointName string, facets FacetValues) (RouteDecision, error) {
+	converted := make(policy.FacetValues, len(facets))
+	for facet, fields := range facets {
+		converted[facet] = fields
+	}
+	decision := h.policy.EvaluateAction(policy.Ref{Kind: endpointKind, Name: endpointName}, converted)
+	return routeDecisionFromPolicy(decision), nil
+}
+
 func (h *PolicyHook) DecideHTTP(_ context.Context, request HTTPRequest) (RouteDecision, error) {
 	decision := h.policy.EvaluateHTTP(policy.HTTPRequest{
 		Flow: policy.Flow{
@@ -129,7 +170,45 @@ func routeDecisionFromPolicy(decision policy.Decision) RouteDecision {
 			Kind: L4MatchKind(decision.MatchedL4.Kind),
 		}
 	}
+	if fields := decision.MatchedFacets["package"]; fields != nil {
+		converted.Package = &Package{
+			Ecosystem:            facetString(fields, "ecosystem"),
+			Operation:            facetString(fields, "operation"),
+			Name:                 facetString(fields, "name"),
+			Version:              facetString(fields, "version"),
+			IdentityKnown:        facetBool(fields, "identity_known"),
+			AgeKnown:             facetBool(fields, "age_known"),
+			AgeHours:             facetInt64(fields, "age_hours"),
+			AgeSource:            facetString(fields, "age_source"),
+			MalwareDataAvailable: facetBool(fields, "malware_data_available"),
+			Malware:              facetBool(fields, "malware"),
+			MalwareReason:        facetString(fields, "malware_reason"),
+		}
+	}
 	return converted
+}
+
+func facetString(fields map[string]any, name string) string {
+	value, _ := fields[name].(string)
+	return value
+}
+
+func facetBool(fields map[string]any, name string) bool {
+	value, _ := fields[name].(bool)
+	return value
+}
+
+func facetInt64(fields map[string]any, name string) int64 {
+	switch value := fields[name].(type) {
+	case int:
+		return int64(value)
+	case int32:
+		return int64(value)
+	case int64:
+		return value
+	default:
+		return 0
+	}
 }
 
 func routeActionFromPolicy(decision policy.Decision) RouteAction {

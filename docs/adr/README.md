@@ -28,3 +28,4 @@ We use Michael Nygard-style ADRs to capture architectural decisions.
 | 0008 | Vmmon host and guest agent gRPC APIs                           | Implemented | 2026-07-08 | `docs/adr/0008-vmmon-host-and-guest-grpc-api.md` |
 | 0009 | Per-launch guest agent initramfs overlay                      | Accepted    | 2026-07-11 | `docs/adr/0009-per-launch-guest-agent-initramfs-overlay.md` |
 | 0010 | Static guest network configuration                            | Accepted    | 2026-07-11 | `docs/adr/0010-static-guest-network-configuration.md` |
+| 0011 | Package registry endpoint semantics                          | Draft       | 2026-07-16 | `docs/adr/0011-package-registry-endpoint-semantics.md` |

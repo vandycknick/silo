@@ -81,6 +81,10 @@ func (p *HTTPProxy) Handle(ctx context.Context, inbound net.Conn, flow hooks.Flo
 	}
 }
 
+func (p *HTTPProxy) HandleTCP(ctx context.Context, inbound net.Conn, flow hooks.Flow, target string, _ hooks.RouteDecision) error {
+	return p.Handle(ctx, inbound, flow, target)
+}
+
 func httpRequest(flow hooks.Flow, scheme string, req *http.Request) hooks.HTTPRequest {
 	return hooks.HTTPRequest{
 		Flow:         flow,

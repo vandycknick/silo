@@ -63,6 +63,8 @@ ADR 0006 owns:
 
 Host-side networking components never consume HCL.
 
+Package registry endpoint arguments and their canonical lowering are defined by ADR 0011. Registry metadata filtering is endpoint behavior, not a second HCL rule-evaluation stage.
+
 ## User Experience
 
 A user can author this policy:
@@ -161,6 +163,10 @@ The lowered canonical policy has the same shape as any other authoring path:
     {
       "name": "chatgpt",
       "kind": "https",
+      "family": "http",
+      "transport": "https-mitm",
+      "tls": "terminate",
+      "capabilities": ["credential-injection"],
       "hosts": ["chatgpt.com", "*.chatgpt.com"]
     }
   ],
@@ -280,6 +286,9 @@ Canonical lowering:
 {
   "name": "dns",
   "kind": "ip",
+  "family": "ip",
+  "transport": "packet-filter",
+  "tls": "none",
   "source_cidrs": [],
   "destination_cidrs": ["1.1.1.1/32"],
   "protocol": "udp",
@@ -301,6 +310,10 @@ Canonical lowering:
 {
   "name": "chatgpt",
   "kind": "https",
+  "family": "http",
+  "transport": "https-mitm",
+  "tls": "terminate",
+  "capabilities": ["credential-injection"],
   "hosts": ["chatgpt.com", "*.chatgpt.com"]
 }
 ```

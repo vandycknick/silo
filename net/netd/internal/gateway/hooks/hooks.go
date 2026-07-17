@@ -35,6 +35,30 @@ type HTTPRequest struct {
 	Header       http.Header
 }
 
+type FacetValues map[string]map[string]any
+
+type RegistryEndpointConfig struct {
+	Kind             string
+	Name             string
+	Registries       []string
+	MalwareFeed      string
+	FilterPackageAge uint32
+}
+
+type Package struct {
+	Ecosystem            string
+	Operation            string
+	Name                 string
+	Version              string
+	IdentityKnown        bool
+	AgeKnown             bool
+	AgeHours             int64
+	AgeSource            string
+	MalwareDataAvailable bool
+	Malware              bool
+	MalwareReason        string
+}
+
 type Credential struct {
 	Kind           string
 	Name           string
@@ -83,6 +107,7 @@ type RouteDecision struct {
 	MatchedL4                 *L4Match
 	Credential                *Credential
 	Tunnel                    *Tunnel
+	Package                   *Package
 }
 
 type Hook interface {

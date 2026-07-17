@@ -65,6 +65,10 @@ type httpsSelection struct {
 
 func (p *HTTPSProxy) Handle(ctx context.Context, inbound net.Conn, flow hooks.Flow, target string, flowDecision hooks.RouteDecision) error {
 	sni, replayed, err := peekClientHello(inbound)
+	return p.handleClientHello(ctx, sni, replayed, err, flow, target, flowDecision)
+}
+
+func (p *HTTPSProxy) handleClientHello(ctx context.Context, sni string, replayed net.Conn, err error, flow hooks.Flow, target string, flowDecision hooks.RouteDecision) error {
 	if err != nil {
 		if errors.Is(err, errMissingSNI) {
 			endpointName, authority, certHost, ok := p.route.ResolveHTTPSRawIP(flow.DestIP, flow.DestPort)
@@ -103,6 +107,10 @@ func (p *HTTPSProxy) Handle(ctx context.Context, inbound net.Conn, flow hooks.Fl
 		upstreamServerName: certHost,
 		forwardHost:        authority,
 	})
+}
+
+func (p *HTTPSProxy) HandleTCP(ctx context.Context, inbound net.Conn, flow hooks.Flow, target string, decision hooks.RouteDecision) error {
+	return p.Handle(ctx, inbound, flow, target, decision)
 }
 
 func flowAllowsRawFallback(decision hooks.RouteDecision) bool {

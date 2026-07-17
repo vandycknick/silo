@@ -29,6 +29,15 @@ type httpsHook interface {
 	DecideHTTP(ctx context.Context, request hooks.HTTPRequest) (hooks.RouteDecision, error)
 }
 
+type registryHook interface {
+	HasRegistries() bool
+	ShouldInterceptEndpoint(kind string, port uint16) bool
+	ResolveEndpointHost(kind string, host string, port uint16) (string, string, string, bool)
+	MatchEndpointAuthority(kind string, host string, authority string) bool
+	RegistryEndpoints() []hooks.RegistryEndpointConfig
+	DecideAction(ctx context.Context, endpointKind string, endpointName string, facets hooks.FacetValues) (hooks.RouteDecision, error)
+}
+
 func New(hook hooks.Hook, audit *audit.Logger) *Router {
 	return &Router{hook: hook, audit: audit}
 }
@@ -127,6 +136,45 @@ func (r *Router) DecideHTTP(ctx context.Context, request hooks.HTTPRequest) (hoo
 		return hooks.RouteDecision{}, err
 	}
 	return decision, nil
+}
+
+func (r *Router) HasRegistries() bool {
+	resolver, ok := r.hook.(registryHook)
+	return ok && resolver.HasRegistries()
+}
+
+func (r *Router) ShouldInterceptEndpoint(kind string, port uint16) bool {
+	resolver, ok := r.hook.(registryHook)
+	return ok && resolver.ShouldInterceptEndpoint(kind, port)
+}
+
+func (r *Router) ResolveEndpointHost(kind string, host string, port uint16) (string, string, string, bool) {
+	resolver, ok := r.hook.(registryHook)
+	if !ok {
+		return "", "", "", false
+	}
+	return resolver.ResolveEndpointHost(kind, host, port)
+}
+
+func (r *Router) MatchEndpointAuthority(kind string, host string, authority string) bool {
+	resolver, ok := r.hook.(registryHook)
+	return ok && resolver.MatchEndpointAuthority(kind, host, authority)
+}
+
+func (r *Router) RegistryEndpoints() []hooks.RegistryEndpointConfig {
+	resolver, ok := r.hook.(registryHook)
+	if !ok {
+		return nil
+	}
+	return resolver.RegistryEndpoints()
+}
+
+func (r *Router) DecideAction(ctx context.Context, endpointKind string, endpointName string, facets hooks.FacetValues) (hooks.RouteDecision, error) {
+	resolver, ok := r.hook.(registryHook)
+	if !ok {
+		return hooks.RouteDecision{Action: hooks.RouteAllowDirect}, nil
+	}
+	return resolver.DecideAction(ctx, endpointKind, endpointName, facets)
 }
 
 func (r *Router) RecordFlow(flow hooks.Flow, decision hooks.RouteDecision) {

@@ -1,6 +1,9 @@
+use crate::plugin::{parse_https_origin, PluginRegistry};
+use crate::registry::registry_hosts;
 use crate::{
     Action, Diagnostic, DiagnosticSeverity, IpProtocol, NetworkAuditSettings, NetworkCredential,
-    NetworkEndpoint, NetworkForward, NetworkPolicy, NetworkRule, PortRange, TailscaleTunnel,
+    NetworkEgress, NetworkEndpoint, NetworkForward, NetworkPolicy, NetworkRule, PortRange,
+    TailscaleTunnel,
 };
 use serde_json::{Map, Value};
 
@@ -16,10 +19,9 @@ impl NetworkPolicyBuilder {
         }
     }
 
-    pub fn from_policy(policy: NetworkPolicy) -> Self {
-        Self {
-            policy: policy.normalized(),
-        }
+    pub fn from_policy(mut policy: NetworkPolicy) -> Self {
+        policy.normalize();
+        Self { policy }
     }
 
     pub fn default_allow(mut self) -> Self {
@@ -173,6 +175,12 @@ impl NetworkEndpointBuilder {
             endpoint: NetworkEndpoint {
                 name: name.into(),
                 kind: "ip".to_string(),
+                family: "ip".to_owned(),
+                transport: "packet-filter".to_owned(),
+                tls_mode: "none".to_owned(),
+                config: Map::new(),
+                egress: Vec::new(),
+                capabilities: Vec::new(),
                 source_cidrs: Vec::new(),
                 destination_cidrs: Vec::new(),
                 protocol: IpProtocol::Any,
@@ -183,18 +191,59 @@ impl NetworkEndpointBuilder {
     }
 
     pub fn ip(mut self) -> Self {
-        self.endpoint.kind = "ip".to_string();
+        self.set_kind("ip");
         self
     }
 
     pub fn http(mut self) -> Self {
-        self.endpoint.kind = "http".to_string();
+        self.set_kind("http");
         self
     }
 
     pub fn https(mut self) -> Self {
-        self.endpoint.kind = "https".to_string();
+        self.set_kind("https");
         self
+    }
+
+    pub fn registries(
+        mut self,
+        registries: impl IntoIterator<Item = impl Into<String>>,
+        malware_feed: impl Into<String>,
+    ) -> Self {
+        self.set_kind("registries");
+        let registries = registries.into_iter().map(Into::into).collect::<Vec<_>>();
+        self.endpoint.hosts = registry_hosts(&registries);
+        self.endpoint
+            .config
+            .insert("registries".to_owned(), Value::from(registries));
+
+        let malware_feed = malware_feed.into();
+        self.endpoint.config.insert(
+            "malware_feed".to_owned(),
+            Value::String(malware_feed.clone()),
+        );
+        self.endpoint.egress = parse_https_origin(&malware_feed)
+            .map(|(host, port)| {
+                vec![NetworkEgress {
+                    host,
+                    port,
+                    tls: true,
+                }]
+            })
+            .unwrap_or_default();
+        self
+    }
+
+    pub fn filter_package_age(mut self, hours: u32) -> Self {
+        self.endpoint
+            .config
+            .insert("filter_package_age".to_owned(), Value::from(hours));
+        self
+    }
+
+    fn set_kind(&mut self, kind: &str) {
+        self.endpoint.kind = kind.to_owned();
+        apply_endpoint_descriptor(&mut self.endpoint, &PluginRegistry::builtins());
     }
 
     pub fn source_cidr(mut self, cidr: impl Into<String>) -> Self {
@@ -243,6 +292,29 @@ impl NetworkEndpointBuilder {
     fn build(self) -> NetworkEndpoint {
         self.endpoint
     }
+}
+
+fn apply_endpoint_descriptor(endpoint: &mut NetworkEndpoint, plugins: &PluginRegistry) {
+    let Some(definition) = plugins.endpoint(&endpoint.kind) else {
+        endpoint.family.clear();
+        endpoint.transport.clear();
+        endpoint.tls_mode.clear();
+        endpoint.capabilities.clear();
+        return;
+    };
+    endpoint.family = definition.family.as_str().to_owned();
+    endpoint.transport = definition.transport.as_str().to_owned();
+    endpoint.tls_mode = if definition.terminates_tls() {
+        "terminate"
+    } else {
+        "none"
+    }
+    .to_owned();
+    endpoint.capabilities = if definition.supports_credentials {
+        vec!["credential-injection".to_owned()]
+    } else {
+        Vec::new()
+    };
 }
 
 #[derive(Debug, Clone)]

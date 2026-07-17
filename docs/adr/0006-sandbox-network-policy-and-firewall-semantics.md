@@ -63,6 +63,7 @@ The key determinations are:
 13. Inbound forwards are configured exposures and are outside the outbound endpoint/rule/default-action policy model.
 14. Policy-load warnings are non-fatal and visible in service logs and runtime status, not in policy audit events.
 15. Policy changes are durable full-policy replacements. Starting a machine never replaces policy.
+16. Package registry endpoint classification, metadata filtering, artifact enforcement, and package audit semantics are specialized by ADR 0011.
 
 ## Policy Lifecycle
 
@@ -274,7 +275,7 @@ An `ip` endpoint describes L3/L4 traffic. An `http` endpoint describes transpare
 
 Endpoints are stored in one `endpoints` array. Each endpoint has a `kind` and kind-specific semantic fields.
 
-Canonical endpoint objects do not serialize derived registry facts such as family, transport, facet, capability, or default port. Networking components derive those facts from `kind`.
+Canonical endpoint objects serialize the trusted family, transport, TLS mode, and capabilities selected for their `kind`. Consumers validate that envelope against the built-in endpoint definition before using kind-specific fields. Default ports remain derived from `kind`.
 
 Initial endpoint kinds are:
 
@@ -288,6 +289,9 @@ An `ip` endpoint declares L3/L4 matching:
 {
   "name": "dns",
   "kind": "ip",
+  "family": "ip",
+  "transport": "packet-filter",
+  "tls": "none",
   "source_cidrs": ["0.0.0.0/0"],
   "destination_cidrs": ["1.1.1.1/32"],
   "protocol": "udp",
@@ -309,6 +313,9 @@ An `http` endpoint declares transparent cleartext HTTP host matching:
 {
   "name": "metadata",
   "kind": "http",
+  "family": "http",
+  "transport": "http-proxy",
+  "tls": "none",
   "hosts": ["metadata.example.internal"]
 }
 ```
@@ -321,6 +328,10 @@ An `https` endpoint declares HTTPS MITM host matching and may be used with crede
 {
   "name": "chatgpt",
   "kind": "https",
+  "family": "http",
+  "transport": "https-mitm",
+  "tls": "terminate",
+  "capabilities": ["credential-injection"],
   "hosts": ["chatgpt.com", "*.chatgpt.com"]
 }
 ```

@@ -55,6 +55,7 @@ type Event struct {
 	DestPort     uint16      `json:"destination_port,omitempty"`
 	Policy       *Policy     `json:"policy,omitempty"`
 	HTTP         *HTTP       `json:"http,omitempty"`
+	Package      *Package    `json:"package,omitempty"`
 	Credential   *Credential `json:"credential,omitempty"`
 	Tunnel       *Tunnel     `json:"tunnel,omitempty"`
 	Error        *AuditError `json:"error,omitempty"`
@@ -85,6 +86,20 @@ type HTTPRequest struct {
 type HTTPResponse struct {
 	Status  int                 `json:"status,omitempty"`
 	Headers map[string][]string `json:"headers,omitempty"`
+}
+
+type Package struct {
+	Ecosystem            string `json:"ecosystem,omitempty"`
+	Operation            string `json:"operation,omitempty"`
+	Name                 string `json:"name,omitempty"`
+	Version              string `json:"version,omitempty"`
+	IdentityKnown        bool   `json:"identity_known"`
+	AgeKnown             *bool  `json:"age_known,omitempty"`
+	AgeHours             *int64 `json:"age_hours,omitempty"`
+	AgeSource            string `json:"age_source,omitempty"`
+	MalwareDataAvailable *bool  `json:"malware_data_available,omitempty"`
+	Malware              *bool  `json:"malware,omitempty"`
+	MalwareReason        string `json:"malware_reason,omitempty"`
 }
 
 type Credential struct {
@@ -250,6 +265,7 @@ func (l *Logger) RecordHTTPRequestOutcome(request hooks.HTTPRequest, decision ho
 				Headers: redactedHeaders(responseHeader),
 			},
 		},
+		Package: packageMetadata(decision),
 		Verdict: verdict(decision),
 		Reason:  effectiveReason,
 	})
@@ -315,14 +331,39 @@ func auditReason(decision hooks.RouteDecision, reason string) string {
 }
 
 func httpFamily(endpointKind string) string {
+	if endpointKind == "registries" {
+		return "package"
+	}
 	return "http"
 }
 
 func httpScheme(endpointKind string) string {
-	if endpointKind == "https" {
+	if endpointKind == "https" || endpointKind == "registries" {
 		return "https"
 	}
 	return "http"
+}
+
+func packageMetadata(decision hooks.RouteDecision) *Package {
+	if decision.Package == nil {
+		return nil
+	}
+	metadata := &Package{
+		Ecosystem:     decision.Package.Ecosystem,
+		Operation:     decision.Package.Operation,
+		Name:          decision.Package.Name,
+		Version:       decision.Package.Version,
+		IdentityKnown: decision.Package.IdentityKnown,
+		AgeSource:     decision.Package.AgeSource,
+		MalwareReason: decision.Package.MalwareReason,
+	}
+	if decision.Package.IdentityKnown {
+		metadata.AgeKnown = &decision.Package.AgeKnown
+		metadata.AgeHours = &decision.Package.AgeHours
+		metadata.MalwareDataAvailable = &decision.Package.MalwareDataAvailable
+		metadata.Malware = &decision.Package.Malware
+	}
+	return metadata
 }
 
 func policyMetadata(decision hooks.RouteDecision) *Policy {

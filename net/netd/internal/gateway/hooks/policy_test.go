@@ -4,8 +4,10 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 
+	"github.com/vandycknick/silo/net/netd/internal/policy"
 	"github.com/vandycknick/silo/net/netd/internal/policy/policytest"
 )
 
@@ -83,5 +85,44 @@ rule "allow-api" {
 	}
 	if decision.Credential.Kind != "header_token" || decision.Credential.Name != "internal-api" || decision.Credential.Header != "X-Internal-Token" || decision.Credential.Prefix != "Token " {
 		t.Fatalf("unexpected credential metadata: %#v", decision.Credential)
+	}
+}
+
+func TestPolicyHookCarriesPackageFacetMetadata(t *testing.T) {
+	compiled, err := policy.LoadReader("policy.json", strings.NewReader(`{
+  "version": 1,
+  "settings": {"default_action": "deny", "audit": {}},
+  "endpoints": [{
+    "kind": "registries",
+    "name": "public",
+    "family": "package",
+    "transport": "tls-terminate",
+    "tls": "terminate",
+    "config": {"registries": ["npm"], "malware_feed": "https://intelligence.example.com"},
+    "egress": [{"host": "intelligence.example.com", "port": 443, "tls": true}],
+    "hosts": ["registry.npmjs.org", "registry.yarnpkg.com", "registry.npmjs.com"]
+  }],
+  "rules": [{"name": "allow-old", "endpoints": ["public"], "condition": "package.age_hours >= 24", "verdict": "allow"}]
+}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := NewPolicyHook(compiled).DecideAction(context.Background(), "registries", "public", FacetValues{
+		"http": {
+			"method": http.MethodGet, "host": "registry.npmjs.org", "path": "/example", "query": map[string][]string{}, "headers": map[string][]string{},
+		},
+		"package": {
+			"ecosystem": "npm", "operation": "download", "name": "example", "version": "1.0.0", "identity_known": true,
+			"age_known": true, "age_hours": int64(48), "age_source": "registry", "malware_data_available": true, "malware": false, "malware_reason": "",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Action != RouteAllowDirect || decision.RuleName != "allow-old" || decision.Package == nil {
+		t.Fatalf("unexpected package decision: %#v", decision)
+	}
+	if decision.Package.Name != "example" || decision.Package.Version != "1.0.0" || decision.Package.AgeHours != 48 || decision.Package.AgeSource != "registry" {
+		t.Fatalf("unexpected package metadata: %#v", decision.Package)
 	}
 }

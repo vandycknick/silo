@@ -1,3 +1,5 @@
+use crate::model::EndpointFamily;
+use crate::plugin::{FacetKind, PluginRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -6,6 +8,64 @@ pub struct HttpCondition {
     program: cel::Program,
     query_keys: BTreeSet<String>,
     header_keys: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct FacetCondition;
+
+impl FacetCondition {
+    pub fn compile(
+        source: &str,
+        family: EndpointFamily,
+        plugins: &PluginRegistry,
+    ) -> Result<Self, ConditionCompileError> {
+        let family_definition = plugins.family(&family).ok_or_else(|| {
+            ConditionCompileError::new(format!("unknown endpoint family {family:?}"))
+        })?;
+        let mut prepared = if family_definition.facets.iter().any(|facet| facet == "http") {
+            prepare_http_condition_source(source)?
+        } else {
+            PreparedSource {
+                source: source.to_owned(),
+                query_keys: BTreeSet::new(),
+                header_keys: BTreeSet::new(),
+            }
+        };
+        for facet_name in family_definition
+            .facets
+            .iter()
+            .filter(|name| name.as_str() != "http")
+        {
+            let facet = plugins.facet(facet_name).ok_or_else(|| {
+                ConditionCompileError::new(format!(
+                    "endpoint family {family:?} references unknown facet {facet_name}"
+                ))
+            })?;
+            for field in facet.fields {
+                prepared.source = rewrite_cel_identifier(
+                    &prepared.source,
+                    &format!("{}.{}", facet.name, field.name),
+                    &format!("{}_{}", facet.name, field.name),
+                );
+            }
+            if contains_cel_path_prefix(&prepared.source, &format!("{}.", facet.name)) {
+                return Err(ConditionCompileError::new(format!(
+                    "unknown {} condition facet",
+                    facet.name
+                )));
+            }
+        }
+        let program = cel::Program::compile(&prepared.source)
+            .map_err(|err| ConditionCompileError::new(format!("parse condition: {err}")))?;
+        let value = execute_facet_condition(&program, family, plugins, &prepared)?;
+        if !matches!(value, cel::Value::Bool(_)) {
+            return Err(ConditionCompileError::new(format!(
+                "must return bool, got {}",
+                value_type_name(&value)
+            )));
+        }
+        Ok(Self)
+    }
 }
 
 impl HttpCondition {
@@ -47,6 +107,16 @@ fn execute(
     context: &HttpConditionContext,
 ) -> Result<cel::Value, ConditionCompileError> {
     let mut cel_context = cel::Context::default();
+    add_http_context(&mut cel_context, context)?;
+    program
+        .execute(&cel_context)
+        .map_err(|err| ConditionCompileError::new(err.to_string()))
+}
+
+fn add_http_context(
+    cel_context: &mut cel::Context,
+    context: &HttpConditionContext,
+) -> Result<(), ConditionCompileError> {
     cel_context
         .add_variable("http_method", context.method.clone())
         .map_err(|err| ConditionCompileError::new(err.to_string()))?;
@@ -62,8 +132,50 @@ fn execute(
     cel_context
         .add_variable("http_headers", context.headers.clone())
         .map_err(|err| ConditionCompileError::new(err.to_string()))?;
+    Ok(())
+}
+
+fn execute_facet_condition(
+    program: &cel::Program,
+    family: EndpointFamily,
+    plugins: &PluginRegistry,
+    prepared: &PreparedSource,
+) -> Result<cel::Value, ConditionCompileError> {
+    let family_definition = plugins
+        .family(&family)
+        .ok_or_else(|| ConditionCompileError::new(format!("unknown endpoint family {family:?}")))?;
+    let mut context = cel::Context::default();
+    if family_definition.facets.iter().any(|facet| facet == "http") {
+        add_http_context(
+            &mut context,
+            &HttpConditionContext::default_with_keys(&prepared.query_keys, &prepared.header_keys),
+        )?;
+    }
+    for facet_name in family_definition
+        .facets
+        .iter()
+        .filter(|name| name.as_str() != "http")
+    {
+        let facet = plugins.facet(facet_name).ok_or_else(|| {
+            ConditionCompileError::new(format!(
+                "endpoint family {family:?} references unknown facet {facet_name}"
+            ))
+        })?;
+        for field in facet.fields {
+            let variable = format!("{}_{}", facet.name, field.name);
+            match field.kind {
+                FacetKind::String => context.add_variable(variable, String::new()),
+                FacetKind::StringListMap => {
+                    context.add_variable(variable, BTreeMap::<String, Vec<String>>::new())
+                }
+                FacetKind::Int => context.add_variable(variable, 0_i64),
+                FacetKind::Bool => context.add_variable(variable, false),
+            }
+            .map_err(|err| ConditionCompileError::new(err.to_string()))?;
+        }
+    }
     program
-        .execute(&cel_context)
+        .execute(&context)
         .map_err(|err| ConditionCompileError::new(err.to_string()))
 }
 
@@ -111,7 +223,7 @@ pub struct ConditionCompileError {
 }
 
 impl ConditionCompileError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -154,12 +266,12 @@ fn prepare_http_condition_source(source: &str) -> Result<PreparedSource, Conditi
     );
     prepared = rewrite_bracket_keys(&prepared, "http.query", false, &mut query_keys);
     prepared = rewrite_bracket_keys(&prepared, "http.headers", true, &mut header_keys);
-    prepared = prepared.replace("http.method", "http_method");
-    prepared = prepared.replace("http.host", "http_host");
-    prepared = prepared.replace("http.path", "http_path");
-    prepared = prepared.replace("http.query", "http_query");
-    prepared = prepared.replace("http.headers", "http_headers");
-    if prepared.contains("http.") {
+    prepared = rewrite_cel_identifier(&prepared, "http.method", "http_method");
+    prepared = rewrite_cel_identifier(&prepared, "http.host", "http_host");
+    prepared = rewrite_cel_identifier(&prepared, "http.path", "http_path");
+    prepared = rewrite_cel_identifier(&prepared, "http.query", "http_query");
+    prepared = rewrite_cel_identifier(&prepared, "http.headers", "http_headers");
+    if contains_cel_path_prefix(&prepared, "http.") {
         return Err(ConditionCompileError::new("unknown http condition facet"));
     }
     if prepared.contains("http_method") {
@@ -192,14 +304,31 @@ fn reject_known_unavailable_facets(source: &str) -> Result<(), ConditionCompileE
 }
 
 fn contains_http_facet(source: &str, facet: &str) -> bool {
-    let mut rest = source;
-    while let Some(relative) = rest.find(facet) {
-        let after = relative + facet.len();
-        let next = rest[after..].chars().next();
-        if next.is_none_or(|character| !is_identifier_char(character)) {
+    let mut index = 0;
+    while index < source.len() {
+        if quoted_literal_at(source, index) {
+            index = quoted_literal_end(source, index);
+            continue;
+        }
+        if cel_path_at(source, index, facet) {
             return true;
         }
-        rest = &rest[after..];
+        index = next_char_index(source, index);
+    }
+    false
+}
+
+fn contains_cel_path_prefix(source: &str, prefix: &str) -> bool {
+    let mut index = 0;
+    while index < source.len() {
+        if quoted_literal_at(source, index) {
+            index = quoted_literal_end(source, index);
+            continue;
+        }
+        if source[index..].starts_with(prefix) && cel_path_start_boundary(source, index) {
+            return true;
+        }
+        index = next_char_index(source, index);
     }
     false
 }
@@ -252,11 +381,20 @@ fn rewrite_field_selects(
 ) -> String {
     let mut output = String::with_capacity(source.len());
     let mut index = 0;
-    while let Some(relative) = source[index..].find(original) {
-        let start = index + relative;
-        output.push_str(&source[index..start]);
-        let after_original = start + original.len();
-        if source[after_original..].starts_with('.') {
+    while index < source.len() {
+        if quoted_literal_at(source, index) {
+            let end = quoted_literal_end(source, index);
+            output.push_str(&source[index..end]);
+            index = end;
+            continue;
+        }
+        if cel_path_at(source, index, original) {
+            let after_original = index + original.len();
+            if !source[after_original..].starts_with('.') {
+                output.push_str(original);
+                index = after_original;
+                continue;
+            }
             let key_start = after_original + 1;
             let key_end = source[key_start..]
                 .find(|character: char| !is_identifier_char(character))
@@ -278,10 +416,10 @@ fn rewrite_field_selects(
                 continue;
             }
         }
-        output.push_str(original);
-        index = after_original;
+        let next = next_char_index(source, index);
+        output.push_str(&source[index..next]);
+        index = next;
     }
-    output.push_str(&source[index..]);
     output
 }
 
@@ -293,11 +431,21 @@ fn rewrite_bracket_keys(
 ) -> String {
     let mut output = String::with_capacity(source.len());
     let mut index = 0;
-    while let Some(relative) = source[index..].find(variable) {
-        let start = index + relative;
-        output.push_str(&source[index..start]);
+    while index < source.len() {
+        if quoted_literal_at(source, index) {
+            let end = quoted_literal_end(source, index);
+            output.push_str(&source[index..end]);
+            index = end;
+            continue;
+        }
+        if !cel_path_at(source, index, variable) {
+            let next = next_char_index(source, index);
+            output.push_str(&source[index..next]);
+            index = next;
+            continue;
+        }
         output.push_str(variable);
-        let mut cursor = start + variable.len();
+        let mut cursor = index + variable.len();
         let after = &source[cursor..];
         if let Some(stripped) = after.strip_prefix('[') {
             if let Some(quote) = stripped.chars().next().filter(|c| *c == '\'' || *c == '"') {
@@ -323,8 +471,77 @@ fn rewrite_bracket_keys(
         }
         index = cursor;
     }
-    output.push_str(&source[index..]);
     output
+}
+
+fn rewrite_cel_identifier(source: &str, original: &str, replacement: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut index = 0;
+    while index < source.len() {
+        if quoted_literal_at(source, index) {
+            let end = quoted_literal_end(source, index);
+            output.push_str(&source[index..end]);
+            index = end;
+            continue;
+        }
+        if cel_path_at(source, index, original) {
+            output.push_str(replacement);
+            index += original.len();
+            continue;
+        }
+        let next = next_char_index(source, index);
+        output.push_str(&source[index..next]);
+        index = next;
+    }
+    output
+}
+
+fn cel_path_at(source: &str, index: usize, path: &str) -> bool {
+    if !source[index..].starts_with(path) {
+        return false;
+    }
+    if !cel_path_start_boundary(source, index) {
+        return false;
+    }
+    source[index + path.len()..]
+        .chars()
+        .next()
+        .is_none_or(|character| !is_cel_identifier_char(character))
+}
+
+fn cel_path_start_boundary(source: &str, index: usize) -> bool {
+    source[..index]
+        .chars()
+        .next_back()
+        .is_none_or(|character| !is_cel_identifier_char(character) && character != '.')
+}
+
+fn quoted_literal_at(source: &str, index: usize) -> bool {
+    matches!(source.as_bytes().get(index), Some(b'\'' | b'"'))
+}
+
+fn quoted_literal_end(source: &str, start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let quote = bytes[start];
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if bytes[index] == quote {
+            return index + 1;
+        } else {
+            index += 1;
+        }
+    }
+    index
+}
+
+fn next_char_index(source: &str, index: usize) -> usize {
+    index + source[index..].chars().next().map_or(0, char::len_utf8)
+}
+
+fn is_cel_identifier_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
 }
 
 fn lowercase_string_literals(source: &str) -> String {
@@ -371,5 +588,66 @@ fn value_type_name(value: &cel::Value) -> &'static str {
         cel::Value::Timestamp(_) => "timestamp",
         cel::Value::Opaque(_) => "opaque",
         cel::Value::Null => "null",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::condition::{rewrite_cel_identifier, FacetCondition};
+    use crate::model::EndpointFamily;
+    use crate::plugin::PluginRegistry;
+
+    #[test]
+    fn compiles_composed_package_condition() {
+        FacetCondition::compile(
+            "http.method == 'GET' && package.identity_known && package.age_hours < 24 && !package.malware",
+            EndpointFamily::Package,
+            &PluginRegistry::builtins(),
+        )
+        .expect("package condition");
+    }
+
+    #[test]
+    fn rejects_unknown_package_field() {
+        let error = FacetCondition::compile(
+            "package.unknown",
+            EndpointFamily::Package,
+            &PluginRegistry::builtins(),
+        )
+        .expect_err("unknown field must fail");
+
+        assert!(error
+            .to_string()
+            .contains("unknown package condition facet"));
+    }
+
+    #[test]
+    fn rejects_non_boolean_package_condition() {
+        let error = FacetCondition::compile(
+            "package.age_hours",
+            EndpointFamily::Package,
+            &PluginRegistry::builtins(),
+        )
+        .expect_err("integer result must fail");
+
+        assert!(error.to_string().contains("must return bool"));
+    }
+
+    #[test]
+    fn facet_rewrite_preserves_string_literals() {
+        assert_eq!(
+            rewrite_cel_identifier(
+                r#"package.name == "package.age_hours""#,
+                "package.age_hours",
+                "package_age_hours",
+            ),
+            r#"package.name == "package.age_hours""#
+        );
+        FacetCondition::compile(
+            r#"package.name == "package.age_hours""#,
+            EndpointFamily::Package,
+            &PluginRegistry::builtins(),
+        )
+        .expect("facet path in string literal");
     }
 }

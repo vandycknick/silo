@@ -98,12 +98,11 @@ func run(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	httpProxy := forwarder.NewHTTPProxy(route)
-	httpsProxy, err := forwarder.NewHTTPSProxy(route, cfg.TLS.CACert, cfg.TLS.CAKey, credentialManager)
+	dispatcher, err := forwarder.NewBuiltinTCPDispatcher(route, cfg.TLS.CACert, cfg.TLS.CAKey, credentialManager)
 	if err != nil {
 		return err
 	}
-	vn, err := virtualnetwork.New(&cfg.Stack, route, httpProxy, httpsProxy, virtualnetwork.Metadata{
+	vn, err := virtualnetwork.New(&cfg.Stack, route, dispatcher, virtualnetwork.Metadata{
 		VMID:      cfg.Metadata.VMID,
 		NetworkID: cfg.Metadata.NetworkID,
 	})

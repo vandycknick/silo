@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/vandycknick/silo/net/netd/internal/policy/hostmatch"
+	packageregistry "github.com/vandycknick/silo/net/netd/internal/registry"
 )
 
 type LoadError struct {
@@ -184,8 +187,15 @@ func (p *Policy) addEndpointDecl(decl EndpointDecl) error {
 	if _, ok := p.endpointRefsByName[decl.Name]; ok {
 		return fmt.Errorf("duplicate endpoint name %q", decl.Name)
 	}
-	switch decl.Kind {
-	case "ip":
+	definition, ok := p.registry.Endpoint(decl.Kind)
+	if !ok {
+		return fmt.Errorf("unsupported endpoint kind %q", decl.Kind)
+	}
+	if err := p.validateEndpointDescriptor(decl, definition); err != nil {
+		return err
+	}
+	switch definition.Schema {
+	case EndpointSchemaIP:
 		if _, ok := p.ipEndpoints[key]; ok {
 			return fmt.Errorf("Endpoint %q is already defined.", key)
 		}
@@ -194,35 +204,168 @@ func (p *Policy) addEndpointDecl(decl EndpointDecl) error {
 			return fmt.Errorf("decode endpoint %q: %v", key, err)
 		}
 		p.ipEndpoints[key] = endpoint
-	case "http":
-		if _, ok := p.httpEndpoints[key]; ok {
+	case EndpointSchemaHosts:
+		endpoints, err := p.httpEndpointsForTransport(definition.Transport)
+		if err != nil {
+			return fmt.Errorf("decode endpoint %q: %v", key, err)
+		}
+		if _, ok := endpoints[key]; ok {
 			return fmt.Errorf("Endpoint %q is already defined.", key)
 		}
-		endpoint, err := compileHTTPEndpointDecl(decl.Kind, decl.Name, TransportHTTPProxy, 80, decl.Hosts)
+		endpoint, err := compileHTTPEndpointDecl(definition, decl.Name, decl.Hosts)
 		if err != nil {
 			return fmt.Errorf("decode endpoint %q: %v", key, err)
 		}
 		if err := p.addHTTPEndpoint(endpoint); err != nil {
 			return fmt.Errorf("decode endpoint %q: %v", key, err)
 		}
-		p.httpEndpoints[key] = endpoint
-	case "https":
-		if _, ok := p.httpsEndpoints[key]; ok {
+		endpoints[key] = endpoint
+	case EndpointSchemaRegistries:
+		if _, ok := p.registryEndpoints[key]; ok {
 			return fmt.Errorf("Endpoint %q is already defined.", key)
 		}
-		endpoint, err := compileHTTPEndpointDecl(decl.Kind, decl.Name, TransportHTTPSMITM, 443, decl.Hosts)
+		endpoint, err := compileRegistryEndpointDecl(definition, decl)
 		if err != nil {
 			return fmt.Errorf("decode endpoint %q: %v", key, err)
 		}
-		if err := p.addHTTPEndpoint(endpoint); err != nil {
+		if err := p.addHTTPEndpoint(endpoint.Endpoint); err != nil {
 			return fmt.Errorf("decode endpoint %q: %v", key, err)
 		}
-		p.httpsEndpoints[key] = endpoint
+		p.packageEndpoints[key] = endpoint.Endpoint
+		p.registryEndpoints[key] = endpoint
 	default:
-		return fmt.Errorf("unsupported endpoint kind %q", decl.Kind)
+		return fmt.Errorf("endpoint kind %q has unsupported schema %q", decl.Kind, definition.Schema)
 	}
 	p.endpointRefsByName[decl.Name] = ref
+	p.endpointDefinitions[key] = definition
 	return nil
+}
+
+func (p *Policy) validateEndpointDescriptor(decl EndpointDecl, definition EndpointDefinition) error {
+	if decl.Family != definition.Family {
+		return fmt.Errorf("endpoint %q type %q requires family %q", decl.Name, decl.Kind, definition.Family)
+	}
+	if decl.Transport != definition.Transport {
+		return fmt.Errorf("endpoint %q type %q requires transport %q", decl.Name, decl.Kind, definition.Transport)
+	}
+	if decl.TLS != definition.TLSMode {
+		return fmt.Errorf("endpoint %q type %q requires TLS mode %q", decl.Name, decl.Kind, definition.TLSMode)
+	}
+	expectedCapabilities := []string(nil)
+	if definition.SupportsCredentials {
+		expectedCapabilities = []string{"credential-injection"}
+	}
+	if !slices.Equal(decl.Capabilities, expectedCapabilities) {
+		return fmt.Errorf("endpoint %q type %q has unexpected capabilities", decl.Name, decl.Kind)
+	}
+	return nil
+}
+
+func compileRegistryEndpointDecl(definition EndpointDefinition, decl EndpointDecl) (*RegistryEndpoint, error) {
+	if len(decl.Config) < 2 || len(decl.Config) > 3 {
+		return nil, fmt.Errorf("canonical config must contain registries, malware_feed, and optional filter_package_age")
+	}
+	rawRegistries, ok := decl.Config["registries"].([]any)
+	if !ok || len(rawRegistries) == 0 {
+		return nil, fmt.Errorf("registries must be a non-empty array")
+	}
+	registries := make([]string, 0, len(rawRegistries))
+	seen := make(map[string]struct{}, len(rawRegistries))
+	for _, rawRegistry := range rawRegistries {
+		registry, ok := rawRegistry.(string)
+		if !ok {
+			return nil, fmt.Errorf("registry names must be npm or pypi")
+		}
+		if _, err := packageregistry.NewCatalog([]string{registry}); err != nil {
+			return nil, fmt.Errorf("registry names must be npm or pypi")
+		}
+		if _, ok := seen[registry]; ok {
+			return nil, fmt.Errorf("registry %q is declared more than once", registry)
+		}
+		seen[registry] = struct{}{}
+		registries = append(registries, registry)
+	}
+	if !slices.Equal(decl.Hosts, registryHosts(registries)) {
+		return nil, fmt.Errorf("registry host bindings do not match registries")
+	}
+	baseURL, ok := decl.Config["malware_feed"].(string)
+	if !ok {
+		return nil, fmt.Errorf("malware_feed must be an HTTPS URL")
+	}
+	host, port, ok := parseHTTPSOrigin(baseURL)
+	if !ok {
+		return nil, fmt.Errorf("malware_feed must be an HTTPS URL with a valid host and optional port")
+	}
+	expectedEgress := []EgressDecl{{Host: host, Port: port, TLS: true}}
+	if !slices.Equal(decl.Egress, expectedEgress) {
+		return nil, fmt.Errorf("registry intelligence egress does not match malware_feed")
+	}
+	var filterPackageAge uint32
+	if rawAge, exists := decl.Config["filter_package_age"]; exists {
+		age, ok := rawAge.(float64)
+		if !ok || age < 1 || age > float64(^uint32(0)) || age != float64(uint32(age)) {
+			return nil, fmt.Errorf("filter_package_age must be a positive integer")
+		}
+		filterPackageAge = uint32(age)
+	}
+	expectedConfigKeys := 2
+	if filterPackageAge > 0 {
+		expectedConfigKeys++
+	}
+	if len(decl.Config) != expectedConfigKeys {
+		return nil, fmt.Errorf("canonical config must contain registries, malware_feed, and optional filter_package_age")
+	}
+	endpoint, err := compileHTTPEndpointDecl(definition, decl.Name, decl.Hosts)
+	if err != nil {
+		return nil, err
+	}
+	return &RegistryEndpoint{
+		Endpoint:         endpoint,
+		Registries:       registries,
+		MalwareFeed:      baseURL,
+		FilterPackageAge: filterPackageAge,
+		Egress:           expectedEgress[0],
+	}, nil
+}
+
+func registryHosts(registries []string) []string {
+	hosts, _ := packageregistry.HostsForNames(registries)
+	return hosts
+}
+
+func parseHTTPSOrigin(value string) (string, uint16, bool) {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", 0, false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" || strings.IndexFunc(host, func(character rune) bool {
+		return character == ' ' || character == '\t' || character == '\n' || character == '\r'
+	}) >= 0 {
+		return "", 0, false
+	}
+	port := uint64(443)
+	if parsed.Port() != "" {
+		parsedPort, err := strconv.ParseUint(parsed.Port(), 10, 16)
+		if err != nil || parsedPort == 0 {
+			return "", 0, false
+		}
+		port = parsedPort
+	}
+	return host, uint16(port), true
+}
+
+func (p *Policy) httpEndpointsForTransport(transport Transport) (map[string]*HTTPEndpoint, error) {
+	switch transport {
+	case TransportHTTPProxy:
+		return p.httpEndpoints, nil
+	case TransportHTTPSMITM:
+		return p.httpsEndpoints, nil
+	case TransportTLSTerminate:
+		return p.packageEndpoints, nil
+	default:
+		return nil, fmt.Errorf("transport %q does not use the HTTP endpoint frontend", transport)
+	}
 }
 
 func compileIPEndpoint(name string, raw rawIPEndpoint) (*IPEndpoint, error) {
@@ -290,18 +433,18 @@ func normalizePortRanges(ranges []PortRange) []PortRange {
 	return merged
 }
 
-func compileHTTPEndpointDecl(kind string, name string, transport Transport, defaultPort uint16, hosts []string) (*HTTPEndpoint, error) {
+func compileHTTPEndpointDecl(definition EndpointDefinition, name string, hosts []string) (*HTTPEndpoint, error) {
 	if len(hosts) == 0 {
 		return nil, fmt.Errorf("Missing hosts: hosts is required")
 	}
-	endpoint := &HTTPEndpoint{Kind: kind, Name: name, Family: EndpointFamilyHTTP, Transport: transport, DefaultPort: defaultPort}
+	endpoint := &HTTPEndpoint{Kind: definition.Kind, Name: name, Family: definition.Family, Transport: definition.Transport, DefaultPort: definition.DefaultPort}
 	seen := make(map[string]struct{})
 	for _, host := range hosts {
-		binding, err := hostmatch.ParseBinding(host, defaultPort)
+		binding, err := hostmatch.ParseBinding(host, definition.DefaultPort)
 		if err != nil {
 			return nil, err
 		}
-		key := hostBindingKey(transport, binding.Host, binding.Port, binding.Wildcard)
+		key := hostBindingKey(definition.Transport, binding.Host, binding.Port, binding.Wildcard)
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -348,11 +491,9 @@ func (p *Policy) addCredentialDecl(decl CredentialDecl) error {
 	if !ok {
 		return fmt.Errorf("credential %q.%q references unknown endpoint %q", decl.Kind, decl.Name, decl.Endpoint)
 	}
-	if endpoint.Kind != "https" {
+	definition, ok := p.endpointDefinitions[endpoint.String()]
+	if !ok || !definition.SupportsCredentials {
 		return fmt.Errorf("credential %q.%q must reference an https endpoint", decl.Kind, decl.Name)
-	}
-	if _, ok := p.httpsEndpoints[endpoint.String()]; !ok {
-		return fmt.Errorf("credential %q.%q references unknown endpoint %q", decl.Kind, decl.Name, endpoint.String())
 	}
 	key := Ref{Kind: decl.Kind, Name: decl.Name}.String()
 	if _, ok := p.credentials[key]; ok {
@@ -369,7 +510,7 @@ func (p *Policy) addCredentialDecl(decl CredentialDecl) error {
 		policy:         p,
 	}
 	if decl.Condition != "" {
-		condition, err := compileHTTPCondition(decl.Condition)
+		condition, err := compileCondition(p.registry, EndpointFamilyHTTP, decl.Condition)
 		if err != nil {
 			return fmt.Errorf("credential %q.%q condition is invalid: %w", decl.Kind, decl.Name, err)
 		}
@@ -436,7 +577,7 @@ func (p *Policy) addRuleDecl(decl RuleDecl, order int) error {
 		policy:     p,
 	}
 	if decl.Condition != "" {
-		condition, err := compileHTTPCondition(decl.Condition)
+		condition, err := compileCondition(p.registry, family, decl.Condition)
 		if err != nil {
 			return fmt.Errorf("rule %q condition is invalid: %w", decl.Name, err)
 		}
@@ -446,23 +587,17 @@ func (p *Policy) addRuleDecl(decl RuleDecl, order int) error {
 	if err := p.validateRuleCredential(rule); err != nil {
 		return err
 	}
-	switch family {
-	case EndpointFamilyIP:
-		if rule.condition != nil {
-			return fmt.Errorf("rule %q condition is only supported for HTTP-family endpoint rules", decl.Name)
-		}
-		if rule.Disabled {
-			return nil
-		}
-		p.ipRules = append(p.ipRules, rule)
-	case EndpointFamilyHTTP:
-		if rule.Disabled {
-			return nil
-		}
-		p.httpRules = append(p.httpRules, rule)
-	default:
+	familyDefinition, ok := p.registry.Family(family)
+	if !ok {
 		return fmt.Errorf("rule %q references unsupported endpoint family %q", decl.Name, family)
 	}
+	if familyDefinition.Condition == ConditionKindNone && rule.condition != nil {
+		return fmt.Errorf("rule %q condition is only supported for HTTP-family endpoint rules", decl.Name)
+	}
+	if rule.Disabled {
+		return nil
+	}
+	p.rulesByFamily[family] = append(p.rulesByFamily[family], rule)
 	return nil
 }
 
@@ -477,7 +612,8 @@ func (p *Policy) validateRuleCredential(rule *Rule) error {
 	if rule.Family != EndpointFamilyHTTP {
 		return fmt.Errorf("rule %q credential predicates are invalid on ip endpoints", rule.Name)
 	}
-	if credential.Endpoint.Kind != "https" {
+	definition, ok := p.endpointDefinitions[credential.Endpoint.String()]
+	if !ok || !definition.SupportsCredentials {
 		return fmt.Errorf("rule %q credential predicate must reference an https credential", rule.Name)
 	}
 	for _, endpoint := range rule.Endpoints {
@@ -489,12 +625,12 @@ func (p *Policy) validateRuleCredential(rule *Rule) error {
 }
 
 func (p *Policy) sortRules() {
-	sort.SliceStable(p.ipRules, func(i, j int) bool {
-		return p.ipRules[i].Priority > p.ipRules[j].Priority
-	})
-	sort.SliceStable(p.httpRules, func(i, j int) bool {
-		return p.httpRules[i].Priority > p.httpRules[j].Priority
-	})
+	for family := range p.rulesByFamily {
+		rules := p.rulesByFamily[family]
+		sort.SliceStable(rules, func(i, j int) bool {
+			return rules[i].Priority > rules[j].Priority
+		})
+	}
 }
 
 func (p *Policy) validateEndpointFamily(refs []Ref) (EndpointFamily, error) {
@@ -518,23 +654,9 @@ func (p *Policy) validateEndpointFamily(refs []Ref) (EndpointFamily, error) {
 }
 
 func (p *Policy) endpointFamily(ref Ref) (EndpointFamily, error) {
-	switch ref.Kind {
-	case "ip":
-		if _, ok := p.ipEndpoints[ref.String()]; !ok {
-			return "", fmt.Errorf("references unknown endpoint %q", ref.String())
-		}
-		return EndpointFamilyIP, nil
-	case "http":
-		if _, ok := p.httpEndpoints[ref.String()]; !ok {
-			return "", fmt.Errorf("references unknown endpoint %q", ref.String())
-		}
-		return EndpointFamilyHTTP, nil
-	case "https":
-		if _, ok := p.httpsEndpoints[ref.String()]; !ok {
-			return "", fmt.Errorf("references unknown endpoint %q", ref.String())
-		}
-		return EndpointFamilyHTTP, nil
-	default:
-		return "", fmt.Errorf("references unsupported endpoint kind %q", ref.Kind)
+	definition, ok := p.endpointDefinitions[ref.String()]
+	if !ok {
+		return "", fmt.Errorf("references unknown endpoint %q", ref.String())
 	}
+	return definition.Family, nil
 }

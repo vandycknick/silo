@@ -428,7 +428,7 @@ mod tests {
                 "version": 1,
                 "metadata": {},
                 "endpoints": [
-                    { "name": "chatgpt", "kind": "https", "hosts": ["chatgpt.com"] }
+                    { "name": "chatgpt", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["chatgpt.com"] }
                 ],
                 "credentials": [
                     { "name": "codex", "kind": "openai_codex_oauth", "endpoint": "chatgpt" }
@@ -444,7 +444,7 @@ mod tests {
                 "version": 1,
                 "metadata": {},
                 "endpoints": [
-                    { "name": "aws", "kind": "https", "hosts": ["sts.amazonaws.com"] }
+                    { "name": "aws", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["sts.amazonaws.com"] }
                 ],
                 "credentials": [
                     { "name": "prod", "kind": "aws_credential", "endpoint": "aws" }
@@ -582,7 +582,7 @@ mod tests {
             {
               "version": 1,
               "endpoints": [
-                { "name": "api", "kind": "https", "hosts": ["api.example.com"] }
+                { "name": "api", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["api.example.com"] }
               ],
               "credentials": [
                 { "name": "api-key", "kind": "bearer_token", "endpoint": "api" },

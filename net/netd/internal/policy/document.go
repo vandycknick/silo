@@ -34,13 +34,25 @@ type AuditSettingsDecl struct {
 }
 
 type EndpointDecl struct {
-	Kind             string      `json:"kind"`
-	Name             string      `json:"name"`
-	SourceCIDRs      []string    `json:"source_cidrs"`
-	DestinationCIDRs []string    `json:"destination_cidrs"`
-	Protocol         string      `json:"protocol"`
-	Ports            []PortRange `json:"ports"`
-	Hosts            []string    `json:"hosts"`
+	Kind             string         `json:"kind"`
+	Name             string         `json:"name"`
+	Family           EndpointFamily `json:"family"`
+	Transport        Transport      `json:"transport"`
+	TLS              TLSMode        `json:"tls"`
+	Config           map[string]any `json:"config,omitempty"`
+	Egress           []EgressDecl   `json:"egress,omitempty"`
+	Capabilities     []string       `json:"capabilities,omitempty"`
+	SourceCIDRs      []string       `json:"source_cidrs"`
+	DestinationCIDRs []string       `json:"destination_cidrs"`
+	Protocol         string         `json:"protocol"`
+	Ports            []PortRange    `json:"ports"`
+	Hosts            []string       `json:"hosts"`
+}
+
+type EgressDecl struct {
+	Host string `json:"host"`
+	Port uint16 `json:"port"`
+	TLS  bool   `json:"tls"`
 }
 
 type CredentialDecl struct {

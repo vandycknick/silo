@@ -34,13 +34,17 @@ type fixtureAudit struct {
 }
 
 type fixtureEndpoint struct {
-	Kind             string             `json:"kind"`
-	Name             string             `json:"name"`
-	SourceCIDRs      []string           `json:"source_cidrs"`
-	DestinationCIDRs []string           `json:"destination_cidrs"`
-	Protocol         string             `json:"protocol"`
-	Ports            []fixturePortRange `json:"ports"`
-	Hosts            []string           `json:"hosts"`
+	Kind             string                `json:"kind"`
+	Name             string                `json:"name"`
+	Family           policy.EndpointFamily `json:"family"`
+	Transport        policy.Transport      `json:"transport"`
+	TLS              policy.TLSMode        `json:"tls"`
+	Capabilities     []string              `json:"capabilities,omitempty"`
+	SourceCIDRs      []string              `json:"source_cidrs"`
+	DestinationCIDRs []string              `json:"destination_cidrs"`
+	Protocol         string                `json:"protocol"`
+	Ports            []fixturePortRange    `json:"ports"`
+	Hosts            []string              `json:"hosts"`
 }
 
 type fixturePortRange struct {
@@ -310,6 +314,14 @@ func parseFixtureSettings(filename string, body string) (fixtureSettings, error)
 func parseFixtureEndpoint(filename string, block fixtureBlock) (fixtureEndpoint, error) {
 	attrs := fixtureAttrs(block.body)
 	endpoint := fixtureEndpoint{Kind: block.label1, Name: block.label2, Protocol: "any"}
+	if definition, ok := policy.BuiltinRegistry().Endpoint(endpoint.Kind); ok {
+		endpoint.Family = definition.Family
+		endpoint.Transport = definition.Transport
+		endpoint.TLS = definition.TLSMode
+		if definition.SupportsCredentials {
+			endpoint.Capabilities = []string{"credential-injection"}
+		}
+	}
 	endpoint.SourceCIDRs = fixtureStringList(attrs["source"])
 	if len(endpoint.SourceCIDRs) == 0 {
 		endpoint.SourceCIDRs = fixtureStringList(attrs["source_cidrs"])

@@ -1,6 +1,7 @@
 use crate::condition::{
-    ConditionCompileError, ConditionEvalError, HttpCondition, HttpConditionContext,
+    ConditionCompileError, ConditionEvalError, FacetCondition, HttpCondition, HttpConditionContext,
 };
+use crate::plugin::{ConditionKind, PluginRegistry};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
@@ -9,7 +10,13 @@ pub struct Policy {
     pub documents: Vec<PolicyDocument>,
     pub diagnostics: Vec<Diagnostic>,
     #[serde(skip)]
-    pub(crate) conditions: Vec<HttpCondition>,
+    pub(crate) conditions: Vec<CompiledCondition>,
+}
+
+#[derive(Debug)]
+pub(crate) enum CompiledCondition {
+    Http(HttpCondition),
+    Facet,
 }
 
 impl Policy {
@@ -58,7 +65,12 @@ impl Policy {
             .conditions
             .get(index)
             .ok_or(ConditionEvalError::UnknownCondition(condition_id))?;
-        condition.evaluate(context)
+        match condition {
+            CompiledCondition::Http(condition) => condition.evaluate(context),
+            CompiledCondition::Facet => Err(ConditionEvalError::Message(format!(
+                "condition {condition_id} is not an HTTP-family condition"
+            ))),
+        }
     }
 
     pub(crate) fn register_http_condition(
@@ -67,7 +79,33 @@ impl Policy {
     ) -> Result<ConditionDecl, ConditionCompileError> {
         let condition = HttpCondition::compile(source)?;
         let id = (self.conditions.len() + 1) as u32;
-        self.conditions.push(condition);
+        self.conditions.push(CompiledCondition::Http(condition));
+        Ok(ConditionDecl {
+            id,
+            source: source.to_owned(),
+        })
+    }
+
+    pub(crate) fn register_condition(
+        &mut self,
+        source: &str,
+        family: EndpointFamily,
+        plugins: &PluginRegistry,
+    ) -> Result<ConditionDecl, ConditionCompileError> {
+        let definition = plugins.family(&family).ok_or_else(|| {
+            ConditionCompileError::new(format!("unknown endpoint family {family:?}"))
+        })?;
+        if definition.condition == ConditionKind::Http {
+            return self.register_http_condition(source);
+        }
+        if definition.condition == ConditionKind::None {
+            return Err(ConditionCompileError::new(format!(
+                "conditions are not supported for endpoint family {family:?}"
+            )));
+        }
+        FacetCondition::compile(source, family, plugins)?;
+        let id = (self.conditions.len() + 1) as u32;
+        self.conditions.push(CompiledCondition::Facet);
         Ok(ConditionDecl {
             id,
             source: source.to_owned(),
@@ -236,11 +274,22 @@ pub struct AuditSettingsDecl {
     pub body_storage: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EndpointFamily {
     Ip,
     Http,
+    Package,
+}
+
+impl EndpointFamily {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Ip => "ip",
+            Self::Http => "http",
+            Self::Package => "package",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +298,18 @@ pub enum Transport {
     PacketFilter,
     HttpProxy,
     HttpsMitm,
+    TlsTerminate,
+}
+
+impl Transport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PacketFilter => "packet-filter",
+            Self::HttpProxy => "http-proxy",
+            Self::HttpsMitm => "https-mitm",
+            Self::TlsTerminate => "tls-terminate",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +319,8 @@ pub struct EndpointDecl {
     pub family: EndpointFamily,
     pub transport: Transport,
     pub default_port: u16,
+    pub terminates_tls: bool,
+    pub supports_credentials: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -268,6 +331,12 @@ pub struct EndpointDecl {
     pub ports: Vec<PortRange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registries: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub malware_feed: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_package_age: Option<u32>,
     pub order: usize,
 }
 

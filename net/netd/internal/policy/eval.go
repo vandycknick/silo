@@ -14,7 +14,7 @@ func (p *Policy) EvaluateFlow(flow Flow) Decision {
 	if p == nil {
 		return Decision{Action: ActionAllow, Layer: DecisionLayerFlow, Source: DecisionSourceDefault, DefaultAction: ActionAllow, MatchedFlow: flow}
 	}
-	for _, rule := range p.ipRules {
+	for _, rule := range p.rulesByFamily[EndpointFamilyIP] {
 		endpoint, l4Match := p.matchIPRule(rule, flow)
 		if endpoint == nil {
 			continue
@@ -48,7 +48,7 @@ func (p *Policy) EvaluateHTTP(request HTTPRequest) Decision {
 	if p == nil {
 		return Decision{Action: ActionAllow, Layer: DecisionLayerRequest, Source: DecisionSourceDefault, DefaultAction: ActionAllow, MatchedRequest: &request}
 	}
-	if _, err := hostmatch.ParseAuthority(request.Host, hostmatch.DefaultPort(request.EndpointKind)); err != nil {
+	if _, err := hostmatch.ParseAuthority(request.Host, p.defaultPort(request.EndpointKind)); err != nil {
 		return Decision{
 			Action:         ActionDeny,
 			Layer:          DecisionLayerRequest,
@@ -77,7 +77,6 @@ func (p *Policy) EvaluateHTTP(request HTTPRequest) Decision {
 	}
 	request.EndpointKind = endpoint.Kind
 	conditionEvaluator := newHTTPConditionEvaluator(p, request)
-	defer conditionEvaluator.Close()
 	credential, credentialReason := p.selectedCredential(endpointRef, conditionEvaluator)
 	if credentialReason != "" {
 		return Decision{
@@ -92,7 +91,7 @@ func (p *Policy) EvaluateHTTP(request HTTPRequest) Decision {
 			MatchedRequest: &request,
 		}
 	}
-	for _, rule := range p.httpRules {
+	for _, rule := range p.rulesByFamily[EndpointFamilyHTTP] {
 		if !rule.references(endpointRef) {
 			continue
 		}
@@ -146,6 +145,63 @@ func (p *Policy) EvaluateHTTP(request HTTPRequest) Decision {
 		EndpointName:   endpoint.Name,
 		MatchedFlow:    request.Flow,
 		MatchedRequest: &request,
+	}
+}
+
+func (p *Policy) EvaluateAction(endpoint Ref, facets FacetValues) Decision {
+	if p == nil {
+		return Decision{Action: ActionAllow, Layer: DecisionLayerRequest, Source: DecisionSourceDefault, DefaultAction: ActionAllow, MatchedFacets: facets}
+	}
+	definition, ok := p.endpointDefinitions[endpoint.String()]
+	if !ok {
+		return Decision{Action: ActionDeny, Layer: DecisionLayerRequest, Source: DecisionSourceDefault, DefaultAction: p.DefaultAction, Reason: "unknown_l7_endpoint", MatchedFacets: facets}
+	}
+	evaluator := newFacetConditionEvaluator(p, definition.Family, facets)
+	for _, rule := range p.rulesByFamily[definition.Family] {
+		if !rule.references(endpoint) {
+			continue
+		}
+		if rule.Credential != nil {
+			continue
+		}
+		matches, err := rule.matchesWithEvaluator(evaluator)
+		if err != nil {
+			return Decision{
+				Action:        ActionDeny,
+				Layer:         DecisionLayerRequest,
+				Source:        DecisionSourceRule,
+				DefaultAction: p.DefaultAction,
+				RuleName:      rule.Name,
+				Reason:        "condition_error",
+				EndpointKind:  endpoint.Kind,
+				EndpointName:  endpoint.Name,
+				MatchedFacets: facets,
+			}
+		}
+		if !matches {
+			continue
+		}
+		return Decision{
+			Action:        rule.Verdict,
+			Layer:         DecisionLayerRequest,
+			Source:        DecisionSourceRule,
+			DefaultAction: p.DefaultAction,
+			RuleName:      rule.Name,
+			Reason:        rule.Reason,
+			EndpointKind:  endpoint.Kind,
+			EndpointName:  endpoint.Name,
+			MatchedFacets: facets,
+		}
+	}
+	return Decision{
+		Action:        p.DefaultAction,
+		Layer:         DecisionLayerRequest,
+		Source:        DecisionSourceDefault,
+		DefaultAction: p.DefaultAction,
+		Reason:        defaultReason(p.DefaultAction),
+		EndpointKind:  endpoint.Kind,
+		EndpointName:  endpoint.Name,
+		MatchedFacets: facets,
 	}
 }
 
@@ -203,11 +259,14 @@ func (r *Rule) matchesHTTP(request HTTPRequest) (bool, error) {
 		return r.matchesHTTPWithEvaluator(nil)
 	}
 	evaluator := newHTTPConditionEvaluator(r.policy, request)
-	defer evaluator.Close()
 	return r.matchesHTTPWithEvaluator(evaluator)
 }
 
 func (r *Rule) matchesHTTPWithEvaluator(evaluator *httpConditionEvaluator) (bool, error) {
+	return r.matchesWithEvaluator(evaluator)
+}
+
+func (r *Rule) matchesWithEvaluator(evaluator *httpConditionEvaluator) (bool, error) {
 	if r == nil || r.condition == nil {
 		return true, nil
 	}
@@ -222,7 +281,6 @@ func (c *Credential) matchesHTTP(request HTTPRequest) (bool, error) {
 		return c.matchesHTTPWithEvaluator(nil)
 	}
 	evaluator := newHTTPConditionEvaluator(c.policy, request)
-	defer evaluator.Close()
 	return c.matchesHTTPWithEvaluator(evaluator)
 }
 
@@ -245,6 +303,15 @@ type httpConditionEvaluator struct {
 
 func newHTTPConditionEvaluator(policy *Policy, request HTTPRequest) *httpConditionEvaluator {
 	return &httpConditionEvaluator{policy: policy, request: request}
+}
+
+func newFacetConditionEvaluator(policy *Policy, family EndpointFamily, facets FacetValues) *httpConditionEvaluator {
+	registry := BuiltinRegistry()
+	if policy != nil {
+		registry = policy.registry
+	}
+	context, err := buildFacetActivation(registry, family, facets)
+	return &httpConditionEvaluator{policy: policy, context: context, err: err}
 }
 
 func (e *httpConditionEvaluator) Evaluate(condition *httpCondition) (bool, error) {
@@ -278,22 +345,30 @@ func (e *httpConditionEvaluator) Context() (map[string]any, error) {
 		e.err = err
 		return nil, err
 	}
-	context := map[string]any{
-		"http.method":  strings.ToUpper(e.request.Method),
-		"http.host":    normalizedRequestHost(e.request),
-		"http.path":    e.request.Path,
-		"http.query":   query,
-		"http.headers": headersForCEL(e.request.Header),
+	values := FacetValues{
+		"http": {
+			"method":  strings.ToUpper(e.request.Method),
+			"host":    normalizedRequestHost(e.policy, e.request),
+			"path":    e.request.Path,
+			"query":   query,
+			"headers": headersForCEL(e.request.Header),
+		},
+	}
+	registry := BuiltinRegistry()
+	if e.policy != nil {
+		registry = e.policy.registry
+	}
+	context, err := buildFacetActivation(registry, EndpointFamilyHTTP, values)
+	if err != nil {
+		e.err = err
+		return nil, err
 	}
 	e.context = context
 	return context, nil
 }
 
-func (e *httpConditionEvaluator) Close() {
-}
-
-func normalizedRequestHost(request HTTPRequest) string {
-	defaultPort := hostmatch.DefaultPort(request.EndpointKind)
+func normalizedRequestHost(policy *Policy, request HTTPRequest) string {
+	defaultPort := policy.defaultPort(request.EndpointKind)
 	authority, err := hostmatch.ParseAuthority(request.Host, defaultPort)
 	if err != nil {
 		return strings.ToLower(strings.TrimSpace(request.Host))

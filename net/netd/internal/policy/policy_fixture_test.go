@@ -14,7 +14,7 @@ type fixtureBlock struct {
 	body   string
 }
 
-func loadLegacyHCLForTest(filename string, source []byte) (*Policy, error) {
+func loadHCLFixtureForTest(filename string, source []byte) (*Policy, error) {
 	policy, err := parseFixturePolicy(filename, string(source))
 	if err != nil {
 		return nil, err
@@ -228,6 +228,14 @@ func parseFixtureEndpoint(filename string, block fixtureBlock) (EndpointDecl, er
 		return EndpointDecl{}, fixtureLoadError(filename, "Unsupported argument", unsupportedFixtureArgumentDetail(unknown))
 	}
 	endpoint := EndpointDecl{Kind: block.label1, Name: block.label2, Protocol: "any"}
+	if definition, ok := BuiltinRegistry().Endpoint(endpoint.Kind); ok {
+		endpoint.Family = definition.Family
+		endpoint.Transport = definition.Transport
+		endpoint.TLS = definition.TLSMode
+		if definition.SupportsCredentials {
+			endpoint.Capabilities = []string{"credential-injection"}
+		}
+	}
 	endpoint.SourceCIDRs = fixtureStringList(attrs["source"])
 	if len(endpoint.SourceCIDRs) == 0 {
 		endpoint.SourceCIDRs = fixtureStringList(attrs["source_cidrs"])

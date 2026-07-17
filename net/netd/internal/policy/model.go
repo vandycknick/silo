@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"sort"
 	"strings"
 
 	"github.com/vandycknick/silo/net/netd/internal/policy/hostmatch"
@@ -19,8 +20,9 @@ const (
 type EndpointFamily string
 
 const (
-	EndpointFamilyIP   EndpointFamily = "ip"
-	EndpointFamilyHTTP EndpointFamily = "http"
+	EndpointFamilyIP      EndpointFamily = "ip"
+	EndpointFamilyHTTP    EndpointFamily = "http"
+	EndpointFamilyPackage EndpointFamily = "package"
 )
 
 type Transport string
@@ -29,6 +31,7 @@ const (
 	TransportPacketFilter Transport = "packet-filter"
 	TransportHTTPProxy    Transport = "http-proxy"
 	TransportHTTPSMITM    Transport = "https-mitm"
+	TransportTLSTerminate Transport = "tls-terminate"
 )
 
 type DecisionLayer string
@@ -61,13 +64,16 @@ func (r Ref) zero() bool {
 type Policy struct {
 	diagnostics []Diagnostic
 	metadata    map[string]any
+	registry    *Registry
 
 	DefaultAction Action
 
-	ipEndpoints    map[string]*IPEndpoint
-	httpEndpoints  map[string]*HTTPEndpoint
-	httpsEndpoints map[string]*HTTPEndpoint
-	credentials    map[string]*Credential
+	ipEndpoints       map[string]*IPEndpoint
+	httpEndpoints     map[string]*HTTPEndpoint
+	httpsEndpoints    map[string]*HTTPEndpoint
+	packageEndpoints  map[string]*HTTPEndpoint
+	registryEndpoints map[string]*RegistryEndpoint
+	credentials       map[string]*Credential
 
 	endpointRefsByName   map[string]Ref
 	credentialRefsByName map[string]Ref
@@ -75,9 +81,9 @@ type Policy struct {
 
 	credentialsByEndpoint map[string][]*Credential
 	exactHTTPBindings     map[string]Ref
+	endpointDefinitions   map[string]EndpointDefinition
 
-	ipRules   []*Rule
-	httpRules []*Rule
+	rulesByFamily map[EndpointFamily][]*Rule
 }
 
 type IPEndpoint struct {
@@ -115,6 +121,22 @@ type HTTPEndpoint struct {
 	Transport   Transport
 	DefaultPort uint16
 	Hosts       []HostBinding
+}
+
+type RegistryEndpoint struct {
+	Endpoint         *HTTPEndpoint
+	Registries       []string
+	MalwareFeed      string
+	FilterPackageAge uint32
+	Egress           EgressDecl
+}
+
+type RegistryEndpointConfig struct {
+	Kind             string
+	Name             string
+	Registries       []string
+	MalwareFeed      string
+	FilterPackageAge uint32
 }
 
 type HostBinding = hostmatch.Binding
@@ -170,6 +192,8 @@ type HTTPRequest struct {
 	Header       http.Header
 }
 
+type FacetValues map[string]map[string]any
+
 type Decision struct {
 	Action                    Action
 	Layer                     DecisionLayer
@@ -183,6 +207,7 @@ type Decision struct {
 	MatchedL4                 *L4Match
 	MatchedFlow               Flow
 	MatchedRequest            *HTTPRequest
+	MatchedFacets             FacetValues
 	SelectedCredential        *Credential
 }
 
@@ -193,15 +218,20 @@ func Default() *Policy {
 func newPolicy() *Policy {
 	return &Policy{
 		DefaultAction:         ActionAllow,
+		registry:              BuiltinRegistry(),
 		ipEndpoints:           make(map[string]*IPEndpoint),
 		httpEndpoints:         make(map[string]*HTTPEndpoint),
 		httpsEndpoints:        make(map[string]*HTTPEndpoint),
+		packageEndpoints:      make(map[string]*HTTPEndpoint),
+		registryEndpoints:     make(map[string]*RegistryEndpoint),
 		credentials:           make(map[string]*Credential),
 		endpointRefsByName:    make(map[string]Ref),
 		credentialRefsByName:  make(map[string]Ref),
 		tailscaleByName:       make(map[string]struct{}),
 		credentialsByEndpoint: make(map[string][]*Credential),
 		exactHTTPBindings:     make(map[string]Ref),
+		endpointDefinitions:   make(map[string]EndpointDefinition),
+		rulesByFamily:         make(map[EndpointFamily][]*Rule),
 	}
 }
 
@@ -230,15 +260,25 @@ func (p *Policy) Diagnostics() []Diagnostic {
 	return diagnostics
 }
 
-func (p *Policy) Close() {
-}
-
 func (p *Policy) HasHTTP() bool {
-	return p != nil && len(p.httpEndpoints) > 0
+	return p != nil && p.hasEndpointTransport(TransportHTTPProxy)
 }
 
 func (p *Policy) HasHTTPS() bool {
-	return p != nil && len(p.httpsEndpoints) > 0
+	return p != nil && p.hasEndpointTransport(TransportHTTPSMITM)
+}
+
+func (p *Policy) HasRegistries() bool {
+	return p != nil && p.hasEndpointTransport(TransportTLSTerminate)
+}
+
+func (p *Policy) hasEndpointTransport(transport Transport) bool {
+	for _, definition := range p.endpointDefinitions {
+		if definition.Transport == transport {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Policy) HasCredentials() bool {
@@ -249,7 +289,7 @@ func (p *Policy) CanClassify(flow Flow) bool {
 	if p == nil || strings.ToLower(flow.Protocol) != "tcp" {
 		return false
 	}
-	return p.ShouldInterceptHTTP(flow.DestPort) || p.ShouldInterceptHTTPS(flow.DestPort)
+	return p.ShouldInterceptHTTP(flow.DestPort) || p.ShouldInterceptHTTPS(flow.DestPort) || p.ShouldInterceptEndpoint("registries", flow.DestPort)
 }
 
 func (p *Policy) ShouldInterceptHTTP(port uint16) bool {
@@ -280,13 +320,27 @@ func (p *Policy) ShouldInterceptHTTPS(port uint16) bool {
 	return false
 }
 
+func (p *Policy) ShouldInterceptEndpoint(kind string, port uint16) bool {
+	if p == nil {
+		return false
+	}
+	for _, endpoint := range p.httpFamilyEndpoints(kind) {
+		for _, binding := range endpoint.Hosts {
+			if binding.Port == port {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (p *Policy) MatchHTTPHost(host string) bool {
 	_, _, ok := p.MatchHTTPFamilyHost("http", host)
 	return ok
 }
 
 func (p *Policy) MatchHTTPHostForPort(host string, port uint16) bool {
-	_, _, authority, ok := p.matchHTTPFamilyHost("http", host, hostmatch.DefaultPort("http"))
+	_, _, authority, ok := p.matchHTTPFamilyHost("http", host, p.defaultPort("http"))
 	return ok && authority.Port == port
 }
 
@@ -296,20 +350,25 @@ func (p *Policy) MatchHTTPSHost(host string) bool {
 }
 
 func (p *Policy) MatchHTTPFamilyHost(kind string, host string) (Ref, *HTTPEndpoint, bool) {
-	defaultPort := hostmatch.DefaultPort(kind)
+	defaultPort := p.defaultPort(kind)
 	ref, endpoint, _, ok := p.matchHTTPFamilyHost(kind, host, defaultPort)
 	return ref, endpoint, ok
 }
 
 func (p *Policy) ResolveHTTPSHost(host string, port uint16) (Ref, string, string, bool) {
+	return p.ResolveEndpointHost("https", host, port)
+}
+
+func (p *Policy) ResolveEndpointHost(kind string, host string, port uint16) (Ref, string, string, bool) {
+	defaultPort := p.defaultPort(kind)
 	if port == 0 {
-		port = 443
+		port = defaultPort
 	}
-	ref, _, authority, ok := p.matchHTTPFamilyHost("https", host, port)
+	ref, _, authority, ok := p.matchHTTPFamilyHost(kind, host, port)
 	if !ok {
 		return Ref{}, "", "", false
 	}
-	return ref, hostmatch.FormatAuthority(authority, 443), authority.Host, true
+	return ref, hostmatch.FormatAuthority(authority, defaultPort), authority.Host, true
 }
 
 func (p *Policy) ResolveHTTPSRawIP(destIP net.IP, destPort uint16) (Ref, string, string, bool) {
@@ -337,15 +396,43 @@ func (p *Policy) ResolveHTTPSRawIP(destIP net.IP, destPort uint16) (Ref, string,
 }
 
 func (p *Policy) MatchHTTPSAuthority(host string, selected string) bool {
-	hostAuthority, err := hostmatch.ParseAuthority(host, 443)
+	return p.MatchEndpointAuthority("https", host, selected)
+}
+
+func (p *Policy) MatchEndpointAuthority(kind string, host string, selected string) bool {
+	defaultPort := p.defaultPort(kind)
+	hostAuthority, err := hostmatch.ParseAuthority(host, defaultPort)
 	if err != nil || hostAuthority.Host == "" {
 		return false
 	}
-	selectedAuthority, err := hostmatch.ParseAuthority(selected, 443)
+	selectedAuthority, err := hostmatch.ParseAuthority(selected, defaultPort)
 	if err != nil || selectedAuthority.Host == "" {
 		return false
 	}
 	return hostAuthority == selectedAuthority
+}
+
+func (p *Policy) RegistryEndpointConfigs() []RegistryEndpointConfig {
+	if p == nil {
+		return nil
+	}
+	keys := make([]string, 0, len(p.registryEndpoints))
+	for key := range p.registryEndpoints {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	configs := make([]RegistryEndpointConfig, 0, len(keys))
+	for _, key := range keys {
+		endpoint := p.registryEndpoints[key]
+		configs = append(configs, RegistryEndpointConfig{
+			Kind:             endpoint.Endpoint.Kind,
+			Name:             endpoint.Endpoint.Name,
+			Registries:       append([]string(nil), endpoint.Registries...),
+			MalwareFeed:      endpoint.MalwareFeed,
+			FilterPackageAge: endpoint.FilterPackageAge,
+		})
+	}
+	return configs
 }
 
 func (p *Policy) matchHTTPFamilyHost(kind string, host string, defaultPort uint16) (Ref, *HTTPEndpoint, hostmatch.Authority, bool) {
@@ -389,27 +476,44 @@ type hostMatch struct {
 }
 
 func (p *Policy) httpFamilyEndpoints(kind string) map[string]*HTTPEndpoint {
-	switch kind {
-	case "http":
-		return p.httpEndpoints
-	case "https":
-		return p.httpsEndpoints
-	default:
-		if len(p.httpEndpoints) == 0 {
-			return p.httpsEndpoints
-		}
-		if len(p.httpsEndpoints) == 0 {
+	definition, ok := p.registry.Endpoint(kind)
+	if ok {
+		switch definition.Transport {
+		case TransportHTTPProxy:
 			return p.httpEndpoints
+		case TransportHTTPSMITM:
+			return p.httpsEndpoints
+		case TransportTLSTerminate:
+			return p.packageEndpoints
+		default:
+			return nil
 		}
-		combined := make(map[string]*HTTPEndpoint, len(p.httpEndpoints)+len(p.httpsEndpoints))
-		for key, endpoint := range p.httpEndpoints {
-			combined[key] = endpoint
-		}
-		for key, endpoint := range p.httpsEndpoints {
-			combined[key] = endpoint
-		}
-		return combined
 	}
+	if len(p.httpEndpoints) == 0 {
+		return p.httpsEndpoints
+	}
+	if len(p.httpsEndpoints) == 0 {
+		return p.httpEndpoints
+	}
+	combined := make(map[string]*HTTPEndpoint, len(p.httpEndpoints)+len(p.httpsEndpoints))
+	for key, endpoint := range p.httpEndpoints {
+		combined[key] = endpoint
+	}
+	for key, endpoint := range p.httpsEndpoints {
+		combined[key] = endpoint
+	}
+	return combined
+}
+
+func (p *Policy) defaultPort(kind string) uint16 {
+	if p == nil || p.registry == nil {
+		return 0
+	}
+	definition, ok := p.registry.Endpoint(kind)
+	if !ok {
+		return 0
+	}
+	return definition.DefaultPort
 }
 
 func (e *IPEndpoint) match(flow Flow) (L4Match, bool) {

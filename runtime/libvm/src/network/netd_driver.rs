@@ -823,7 +823,7 @@ mod tests {
                 "version": 1,
                 "metadata": {},
                 "endpoints": [
-                    { "name": "chatgpt", "kind": "https", "hosts": ["chatgpt.com"] }
+                    { "name": "chatgpt", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["chatgpt.com"] }
                 ],
                 "credentials": [
                     { "name": "codex", "kind": "openai_codex_oauth", "endpoint": "chatgpt" }

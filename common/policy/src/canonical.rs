@@ -1,8 +1,9 @@
-use crate::condition::HttpCondition;
+use crate::condition::{FacetCondition, HttpCondition};
 use crate::model::{
-    CredentialDecl, EndpointDecl, ForwardDecl, LoadError, Policy as HclPolicy, PolicyDocument,
-    RuleDecl, SettingsDecl, TailscaleDecl,
+    CredentialDecl, EndpointDecl, EndpointFamily, ForwardDecl, LoadError, Policy as HclPolicy,
+    PolicyDocument, RuleDecl, SettingsDecl, TailscaleDecl,
 };
+use crate::plugin::{ConditionKind, EndpointSchema, PluginRegistry};
 use crate::{Action, Diagnostic, DiagnosticSeverity, PortRange};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -115,7 +116,7 @@ impl NetworkPolicy {
     pub fn has_https_interception(&self) -> bool {
         self.endpoints
             .iter()
-            .any(|endpoint| endpoint.kind == "https")
+            .any(|endpoint| endpoint.tls_mode == "terminate")
     }
 
     pub fn credentials(&self) -> &[NetworkCredential] {
@@ -318,6 +319,16 @@ impl Default for NetworkAuditSettings {
 pub struct NetworkEndpoint {
     pub name: String,
     pub kind: String,
+    pub family: String,
+    pub transport: String,
+    #[serde(rename = "tls")]
+    pub tls_mode: String,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub config: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress: Vec<NetworkEgress>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
     #[serde(default)]
     pub source_cidrs: Vec<String>,
     #[serde(default)]
@@ -330,18 +341,23 @@ pub struct NetworkEndpoint {
     pub hosts: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkEgress {
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub tls: bool,
+}
+
 impl NetworkEndpoint {
     fn normalize(&mut self) {
-        if self.kind == "http" || self.kind == "https" {
+        let plugins = PluginRegistry::builtins();
+        if plugins
+            .endpoint(&self.kind)
+            .is_some_and(|definition| definition.schema == EndpointSchema::Hosts)
+        {
             self.hosts = self.hosts.iter().map(|host| normalize_host(host)).collect();
-        }
-    }
-
-    fn family(&self) -> Option<EndpointFamilyKind> {
-        match self.kind.as_str() {
-            "ip" => Some(EndpointFamilyKind::Ip),
-            "http" | "https" => Some(EndpointFamilyKind::Http),
-            _ => None,
         }
     }
 }
@@ -591,9 +607,45 @@ fn lower_settings(settings: &SettingsDecl) -> NetworkPolicySettings {
 }
 
 fn lower_endpoint(endpoint: &EndpointDecl) -> NetworkEndpoint {
+    let mut config = Map::new();
+    let mut egress = Vec::new();
+    if !endpoint.registries.is_empty() {
+        config.insert("registries".to_owned(), json!(endpoint.registries));
+    }
+    if !endpoint.malware_feed.is_empty() {
+        config.insert(
+            "malware_feed".to_owned(),
+            Value::String(endpoint.malware_feed.clone()),
+        );
+        if let Some((host, port)) = crate::plugin::parse_https_origin(&endpoint.malware_feed) {
+            egress.push(NetworkEgress {
+                host,
+                port,
+                tls: true,
+            });
+        }
+    }
+    if let Some(hours) = endpoint.filter_package_age {
+        config.insert("filter_package_age".to_owned(), Value::from(hours));
+    }
     NetworkEndpoint {
         name: endpoint.name.clone(),
         kind: endpoint.kind.clone(),
+        family: endpoint.family.as_str().to_owned(),
+        transport: endpoint.transport.as_str().to_owned(),
+        tls_mode: if endpoint.terminates_tls {
+            "terminate"
+        } else {
+            "none"
+        }
+        .to_owned(),
+        config,
+        egress,
+        capabilities: if endpoint.supports_credentials {
+            vec!["credential-injection".to_owned()]
+        } else {
+            Vec::new()
+        },
         source_cidrs: endpoint.source.clone(),
         destination_cidrs: endpoint.destination.clone(),
         protocol: lower_ip_protocol(&endpoint.protocol),
@@ -678,16 +730,24 @@ fn non_empty_string(value: &str) -> Option<String> {
     }
 }
 
-#[derive(Default)]
 struct PolicyValidator {
     diagnostics: Vec<Diagnostic>,
+    plugins: PluginRegistry,
+}
+
+impl Default for PolicyValidator {
+    fn default() -> Self {
+        Self {
+            diagnostics: Vec::new(),
+            plugins: PluginRegistry::builtins(),
+        }
+    }
 }
 
 impl PolicyValidator {
     fn validate(&mut self, policy: &NetworkPolicy) {
         self.validate_version(policy.version);
         self.validate_audit_settings(&policy.settings.audit);
-
         let endpoints = self.validate_endpoints(&policy.endpoints);
         let credentials = self.validate_credentials(&policy.credentials, &endpoints);
         let tunnels = self.validate_tunnels(&policy.tailscale);
@@ -722,7 +782,7 @@ impl PolicyValidator {
         let mut exact_hosts = BTreeSet::new();
         for endpoint in endpoints {
             self.validate_name("endpoint", &endpoint.name);
-            let Some(family) = endpoint.family() else {
+            let Some(definition) = self.plugins.endpoint(&endpoint.kind) else {
                 self.error(
                     "unsupported endpoint kind",
                     format!(
@@ -732,12 +792,14 @@ impl PolicyValidator {
                 );
                 continue;
             };
+            self.validate_endpoint_descriptor(endpoint, definition.clone());
             if by_name
                 .insert(
                     endpoint.name.clone(),
                     NetworkEndpointInfo {
                         kind: endpoint.kind.clone(),
-                        family,
+                        family: definition.family.clone(),
+                        supports_credentials: definition.supports_credentials,
                     },
                 )
                 .is_some()
@@ -747,13 +809,77 @@ impl PolicyValidator {
                     format!("endpoint name {} is declared more than once", endpoint.name),
                 );
             }
-            match endpoint.kind.as_str() {
-                "ip" => self.validate_ip_endpoint(endpoint),
-                "http" | "https" => self.validate_http_endpoint(endpoint, &mut exact_hosts),
-                _ => {}
+            match definition.schema {
+                EndpointSchema::Ip => self.validate_ip_endpoint(endpoint),
+                EndpointSchema::Hosts => self.validate_http_endpoint(endpoint, &mut exact_hosts),
+                EndpointSchema::Registries => {
+                    self.validate_registry_endpoint(endpoint, &mut exact_hosts)
+                }
             }
         }
         by_name
+    }
+
+    fn validate_endpoint_descriptor(
+        &mut self,
+        endpoint: &NetworkEndpoint,
+        definition: crate::plugin::EndpointDefinition,
+    ) {
+        let expected_tls = if definition.terminates_tls() {
+            "terminate"
+        } else {
+            "none"
+        };
+        if endpoint.family != definition.family.as_str() {
+            self.error(
+                "endpoint family mismatch",
+                format!(
+                    "endpoint {} type {} requires family {}",
+                    endpoint.name,
+                    endpoint.kind,
+                    definition.family.as_str()
+                ),
+            );
+        }
+        if endpoint.transport != definition.transport.as_str() {
+            self.error(
+                "endpoint transport mismatch",
+                format!(
+                    "endpoint {} type {} requires transport {}",
+                    endpoint.name,
+                    endpoint.kind,
+                    definition.transport.as_str()
+                ),
+            );
+        }
+        if endpoint.tls_mode != expected_tls {
+            self.error(
+                "endpoint TLS mode mismatch",
+                format!(
+                    "endpoint {} type {} requires TLS mode {}",
+                    endpoint.name, endpoint.kind, expected_tls
+                ),
+            );
+        }
+        let expected_capabilities = if definition.supports_credentials {
+            ["credential-injection"].as_slice()
+        } else {
+            &[]
+        };
+        if endpoint
+            .capabilities
+            .iter()
+            .map(String::as_str)
+            .ne(expected_capabilities.iter().copied())
+        {
+            self.error(
+                "endpoint capability mismatch",
+                format!(
+                    "endpoint {} type {} has unexpected capabilities",
+                    endpoint.name, endpoint.kind
+                ),
+            );
+        }
     }
 
     fn validate_ip_endpoint(&mut self, endpoint: &NetworkEndpoint) {
@@ -816,6 +942,107 @@ impl PolicyValidator {
         }
     }
 
+    fn validate_registry_endpoint(
+        &mut self,
+        endpoint: &NetworkEndpoint,
+        exact_hosts: &mut BTreeSet<String>,
+    ) {
+        self.validate_http_endpoint(endpoint, exact_hosts);
+        let Some(registries) = endpoint.config.get("registries").and_then(Value::as_array) else {
+            self.error(
+                "registry endpoint requires registries",
+                format!("endpoint {} has no canonical registries", endpoint.name),
+            );
+            return;
+        };
+        let registry_names: Vec<String> = registries
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        let unique_registry_names = registry_names.iter().collect::<BTreeSet<_>>();
+        if registry_names.len() != registries.len()
+            || unique_registry_names.len() != registry_names.len()
+            || registry_names
+                .iter()
+                .any(|registry| crate::registry::PackageRepository::parse(registry).is_none())
+        {
+            self.error(
+                "invalid canonical registries",
+                format!("endpoint {} has invalid registry names", endpoint.name),
+            );
+        }
+        if endpoint.hosts != crate::registry::registry_hosts(&registry_names) {
+            self.error(
+                "registry endpoint bindings mismatch",
+                format!(
+                    "endpoint {} has unexpected registry host bindings",
+                    endpoint.name
+                ),
+            );
+        }
+        let Some(base_url) = endpoint.config.get("malware_feed").and_then(Value::as_str) else {
+            self.error(
+                "registry endpoint requires malware feed",
+                format!("endpoint {} has no malware_feed", endpoint.name),
+            );
+            return;
+        };
+        let Some((host, port)) = crate::plugin::parse_https_origin(base_url) else {
+            self.error(
+                "invalid registry malware feed",
+                format!("endpoint {} malware_feed must use HTTPS", endpoint.name),
+            );
+            return;
+        };
+        if endpoint.egress
+            != [NetworkEgress {
+                host,
+                port,
+                tls: true,
+            }]
+        {
+            self.error(
+                "registry endpoint egress mismatch",
+                format!(
+                    "endpoint {} has unexpected intelligence egress",
+                    endpoint.name
+                ),
+            );
+        }
+        if endpoint
+            .config
+            .get("filter_package_age")
+            .is_some_and(|value| {
+                value
+                    .as_u64()
+                    .is_none_or(|hours| hours == 0 || hours > u32::MAX as u64)
+            })
+        {
+            self.error(
+                "invalid package age filter",
+                format!(
+                    "endpoint {} filter_package_age must be a positive integer",
+                    endpoint.name
+                ),
+            );
+        }
+        let expected_config_len = if endpoint.config.contains_key("filter_package_age") {
+            3
+        } else {
+            2
+        };
+        if endpoint.config.len() != expected_config_len {
+            self.error(
+                "registry endpoint has unknown config",
+                format!(
+                    "endpoint {} canonical config is not recognized",
+                    endpoint.name
+                ),
+            );
+        }
+    }
+
     fn validate_credentials(
         &mut self,
         credentials: &[NetworkCredential],
@@ -860,7 +1087,7 @@ impl PolicyValidator {
                 );
                 continue;
             };
-            if endpoint.kind != "https" {
+            if !endpoint.supports_credentials {
                 self.error(
                     "credential endpoint must be https",
                     format!(
@@ -923,22 +1150,36 @@ impl PolicyValidator {
                 };
                 endpoint_names.insert(endpoint_name.as_str());
                 match family {
-                    Some(existing) if existing != endpoint.family => self.error(
+                    Some(ref existing) if existing != &endpoint.family => self.error(
                         "rule endpoints must share a family",
                         "all endpoints on one rule must resolve to the same family",
                     ),
-                    None => family = Some(endpoint.family),
+                    None => family = Some(endpoint.family.clone()),
                     _ => {}
                 }
             }
-            if rule.condition.is_some() && family != Some(EndpointFamilyKind::Http) {
-                self.error(
-                    "condition requires http-family endpoints",
-                    "conditions are only valid on http-family rules",
-                );
-            }
+            let condition_kind = family
+                .as_ref()
+                .and_then(|family| self.plugins.family(family))
+                .map(|definition| definition.condition);
             if let Some(condition) = &rule.condition {
-                self.validate_http_condition(condition, "rule condition");
+                match (family.as_ref(), condition_kind) {
+                    (Some(_), Some(ConditionKind::Http)) => {
+                        self.validate_http_condition(condition, "rule condition");
+                    }
+                    (Some(family), Some(ConditionKind::Facet)) => {
+                        if let Err(err) =
+                            FacetCondition::compile(condition, family.clone(), &self.plugins)
+                        {
+                            self.error("rule condition", err.to_string());
+                        }
+                    }
+                    (Some(_), Some(ConditionKind::None)) => self.error(
+                        "condition requires condition-capable endpoints",
+                        "conditions are not valid on this endpoint family",
+                    ),
+                    _ => {}
+                }
             }
             if let Some(credential_name) = &rule.credential {
                 let Some(credential) = credentials.get(credential_name) else {
@@ -948,7 +1189,7 @@ impl PolicyValidator {
                     );
                     continue;
                 };
-                if family != Some(EndpointFamilyKind::Http) {
+                if family != Some(EndpointFamily::Http) {
                     self.error(
                         "credential predicate requires http-family endpoints",
                         "rule.credential is only valid on http-family rules",
@@ -1099,18 +1340,13 @@ impl PolicyValidator {
 #[derive(Debug, Clone)]
 struct NetworkEndpointInfo {
     kind: String,
-    family: EndpointFamilyKind,
+    family: EndpointFamily,
+    supports_credentials: bool,
 }
 
 #[derive(Debug, Clone)]
 struct NetworkCredentialInfo {
     endpoint: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EndpointFamilyKind {
-    Ip,
-    Http,
 }
 
 fn credential_secret_slots(credential: &NetworkCredential) -> Vec<NetworkSecretSlot> {
@@ -1222,6 +1458,7 @@ fn default_body_storage_bytes() -> u64 {
 #[cfg(test)]
 mod tests {
     use crate::{Action, NetworkPolicy, NetworkSecretKind};
+    use serde_json::json;
 
     #[test]
     fn json_load_normalizes_defaults() {
@@ -1240,13 +1477,236 @@ mod tests {
     }
 
     #[test]
+    fn hcl_compilation_emits_endpoint_metadata() {
+        let policy = NetworkPolicy::from_hcl_str(
+            r#"
+endpoint "https" "api" {
+  hosts = ["api.example.com"]
+}
+
+rule "allow-api" {
+  endpoint = https.api
+  verdict = "allow"
+}
+"#,
+        )
+        .expect("HCL policy");
+
+        assert_eq!(policy.version(), 1);
+        let endpoint = &policy.endpoints()[0];
+        assert_eq!(endpoint.family, "http");
+        assert_eq!(endpoint.transport, "https-mitm");
+        assert_eq!(endpoint.tls_mode, "terminate");
+        assert_eq!(endpoint.capabilities, ["credential-injection"]);
+    }
+
+    #[test]
+    fn hcl_compilation_derives_registry_endpoint_envelope() {
+        let policy = NetworkPolicy::from_hcl_str(
+            r#"
+endpoint "registries" "public" {
+  registries         = ["npm", "pypi"]
+  malware_feed       = "https://intelligence.example.com:8443/v1"
+  filter_package_age = 24
+}
+
+rule "allow-old-packages" {
+  endpoint  = registries.public
+  condition = "package.age_known && package.age_hours >= 24"
+  verdict   = "allow"
+}
+"#,
+        )
+        .expect("registry policy");
+
+        let endpoint = &policy.endpoints()[0];
+        assert_eq!(endpoint.family, "package");
+        assert_eq!(endpoint.transport, "tls-terminate");
+        assert_eq!(endpoint.tls_mode, "terminate");
+        assert_eq!(endpoint.config["registries"], json!(["npm", "pypi"]));
+        assert_eq!(
+            endpoint.config["malware_feed"],
+            "https://intelligence.example.com:8443/v1"
+        );
+        assert_eq!(endpoint.config["filter_package_age"], 24);
+        assert_eq!(
+            endpoint.hosts,
+            [
+                "registry.npmjs.org",
+                "registry.yarnpkg.com",
+                "registry.npmjs.com",
+                "pypi.org",
+                "files.pythonhosted.org",
+                "pypi.python.org",
+                "pythonhosted.org",
+            ]
+        );
+        assert_eq!(endpoint.egress.len(), 1);
+        assert_eq!(endpoint.egress[0].host, "intelligence.example.com");
+        assert_eq!(endpoint.egress[0].port, 8443);
+        assert!(endpoint.egress[0].tls);
+    }
+
+    #[test]
+    fn registry_builder_derives_and_validates_endpoint_envelope() {
+        let policy = NetworkPolicy::builder()
+            .endpoint("public", |endpoint| {
+                endpoint
+                    .registries(["npm"], "https://intelligence.example.com")
+                    .filter_package_age(24)
+            })
+            .build()
+            .expect("registry policy");
+
+        let endpoint = &policy.endpoints()[0];
+        assert_eq!(endpoint.kind, "registries");
+        assert_eq!(endpoint.hosts[0], "registry.npmjs.org");
+        assert_eq!(endpoint.egress[0].port, 443);
+        assert_eq!(endpoint.config["filter_package_age"], 24);
+    }
+
+    #[test]
+    fn registry_endpoint_rejects_invalid_package_age_filter() {
+        let hcl_error = NetworkPolicy::from_hcl_str(
+            r#"
+endpoint "registries" "public" {
+  registries         = ["npm"]
+  malware_feed       = "https://intelligence.example.com"
+  filter_package_age = 0
+}
+"#,
+        )
+        .expect_err("zero package age must fail");
+        assert!(hcl_error.to_string().contains("Invalid package age filter"));
+
+        let json_error = NetworkPolicy::from_json_str(
+            r#"{
+  "version": 1,
+  "endpoints": [{
+    "name": "public",
+    "kind": "registries",
+    "family": "package",
+    "transport": "tls-terminate",
+    "tls": "terminate",
+    "config": {
+      "registries": ["npm"],
+      "malware_feed": "https://intelligence.example.com",
+      "filter_package_age": 0
+    },
+    "egress": [{"host": "intelligence.example.com", "port": 443, "tls": true}],
+    "hosts": ["registry.npmjs.org", "registry.yarnpkg.com", "registry.npmjs.com"]
+  }]
+}"#,
+        )
+        .expect_err("zero canonical package age must fail");
+        assert!(json_error
+            .to_string()
+            .contains("invalid package age filter"));
+    }
+
+    #[test]
+    fn canonical_registry_endpoint_rejects_derived_binding_mismatch() {
+        let error = NetworkPolicy::from_json_str(
+            r#"{
+  "version": 1,
+  "endpoints": [{
+    "name": "public",
+    "kind": "registries",
+    "family": "package",
+    "transport": "tls-terminate",
+    "tls": "terminate",
+    "config": {
+      "registries": ["npm"],
+      "malware_feed": "https://intelligence.example.com"
+    },
+    "egress": [{"host": "intelligence.example.com", "port": 443, "tls": true}],
+    "hosts": ["attacker.example.com"]
+  }]
+}"#,
+        )
+        .expect_err("derived bindings must be exact");
+
+        assert!(error
+            .to_string()
+            .contains("registry endpoint bindings mismatch"));
+    }
+
+    #[test]
+    fn rejects_endpoint_metadata_mismatch() {
+        let error = NetworkPolicy::from_json_str(
+            r#"{
+  "version": 1,
+  "endpoints": [{
+    "name": "api",
+    "kind": "https",
+    "family": "package",
+    "transport": "https-mitm",
+    "tls": "terminate",
+    "capabilities": ["credential-injection"],
+    "hosts": ["api.example.com"]
+  }]
+}"#,
+        )
+        .expect_err("family mismatch must fail");
+
+        assert!(error.to_string().contains("endpoint family mismatch"));
+    }
+
+    #[test]
+    fn rejects_external_plugin_configuration() {
+        let hcl_error = NetworkPolicy::from_hcl_str(
+            r#"
+plugin "echo" {
+  source = "./echo"
+}
+"#,
+        )
+        .expect_err("external plugin blocks must not be accepted");
+        assert!(hcl_error.to_string().contains("Unsupported block"));
+
+        let json_error = NetworkPolicy::from_json_str(
+            r#"{
+  "version": 1,
+  "plugins": []
+}"#,
+        )
+        .expect_err("external plugin descriptors must not be accepted");
+        assert!(json_error.to_string().contains("unknown field `plugins`"));
+    }
+
+    #[test]
+    fn rejects_unsupported_policy_version() {
+        let error = NetworkPolicy::from_json_str(r#"{ "version": 2 }"#)
+            .expect_err("unsupported version must fail");
+
+        assert!(error.to_string().contains("unsupported policy version"));
+    }
+
+    #[test]
+    fn rejects_descriptorless_endpoints() {
+        let error = NetworkPolicy::from_json_str(
+            r#"{
+  "version": 1,
+  "endpoints": [{
+    "name": "api",
+    "kind": "https",
+    "hosts": ["api.example.com"]
+  }]
+}"#,
+        )
+        .expect_err("endpoint descriptors are required");
+
+        assert!(error.to_string().contains("missing field `family`"));
+    }
+
+    #[test]
     fn detects_https_interception_requirement() {
         let empty = NetworkPolicy::from_json_str(r#"{ "version": 1 }"#).unwrap();
         let http = NetworkPolicy::from_json_str(
             r#"{
                 "version": 1,
                 "endpoints": [
-                    { "name": "registry", "kind": "http", "hosts": ["example.com"] }
+                    { "name": "registry", "kind": "http", "family": "http", "transport": "http-proxy", "tls": "none", "hosts": ["example.com"] }
                 ]
             }"#,
         )
@@ -1258,6 +1718,9 @@ mod tests {
                     {
                         "name": "dns",
                         "kind": "ip",
+                        "family": "ip",
+                        "transport": "packet-filter",
+                        "tls": "none",
                         "destination_cidrs": ["1.1.1.1/32"],
                         "protocol": "udp",
                         "ports": [{ "start": 53, "end": 53 }]
@@ -1270,7 +1733,7 @@ mod tests {
             r#"{
                 "version": 1,
                 "endpoints": [
-                    { "name": "registry", "kind": "https", "hosts": ["example.com"] }
+                    { "name": "registry", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["example.com"] }
                 ]
             }"#,
         )
@@ -1297,7 +1760,7 @@ mod tests {
             {
               "version": 1,
               "endpoints": [
-                { "name": "chatgpt", "kind": "https", "hosts": ["chatgpt.com"] }
+                { "name": "chatgpt", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["chatgpt.com"] }
               ],
               "credentials": [
                 { "name": "codex", "kind": "openai_codex_oauth", "endpoint": "chatgpt" }
@@ -1332,7 +1795,7 @@ mod tests {
             {
               "version": 1,
               "endpoints": [
-                { "name": "api", "kind": "https", "hosts": ["api.example.com"] }
+                { "name": "api", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["api.example.com"] }
               ],
               "credentials": [
                 { "name": "api-key", "kind": "bearer_token", "endpoint": "api" },
@@ -1358,7 +1821,7 @@ mod tests {
             {
               "version": 1,
               "endpoints": [
-                { "name": "aws", "kind": "https", "hosts": ["sts.amazonaws.com"] }
+                { "name": "aws", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["sts.amazonaws.com"] }
               ],
               "credentials": [
                 { "name": "prod", "kind": "aws_credential", "endpoint": "aws" }
@@ -1454,7 +1917,7 @@ mod tests {
             {
               "version": 1,
               "endpoints": [
-                { "name": "metadata", "kind": "http", "hosts": ["metadata.example"] }
+                { "name": "metadata", "kind": "http", "family": "http", "transport": "http-proxy", "tls": "none", "hosts": ["metadata.example"] }
               ],
               "credentials": [
                 { "name": "token", "kind": "bearer_token", "endpoint": "metadata" }
@@ -1480,6 +1943,9 @@ mod tests {
                 {
                   "name": "dns",
                   "kind": "ip",
+                  "family": "ip",
+                  "transport": "packet-filter",
+                  "tls": "none",
                   "destination_cidrs": ["1.1.1.1/32"],
                   "protocol": "udp",
                   "ports": [{ "start": 53, "end": 53 }]
@@ -1497,9 +1963,8 @@ mod tests {
         )
         .expect_err("conditions require http-family rules");
 
-        assert!(error
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.summary == "condition requires http-family endpoints"));
+        assert!(error.diagnostics.iter().any(|diagnostic| {
+            diagnostic.summary == "condition requires condition-capable endpoints"
+        }));
     }
 }
