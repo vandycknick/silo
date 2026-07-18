@@ -12,10 +12,11 @@ This directory owns the guest kernel build inputs for Silo.
 checksums, and architecture-specific build metadata. The kernel Makefile
 includes it directly.
 
-Build natively on arm64 Linux with:
+Build natively on Linux with:
 
 ```bash
 make kernel TRACK=stable ARCH=arm64
+make kernel TRACK=stable ARCH=x86_64
 ```
 
 Cross-compile from x86-64 Linux after installing an arm64 GNU toolchain with:
@@ -38,14 +39,15 @@ Final exported artifacts land in the mounted repo under `target/kernels/<track>-
 
 Each export contains:
 
-- `Image`: the bootable arm64 kernel image
+- `Image` (arm64): the bootable raw kernel image
+- `vmlinux` (all architectures): the bootable x86_64 kernel ELF and the uncompressed kernel ELF with symbols
 - `.config`: the resolved Kconfig used for the build
 - `System.map`: the kernel symbol map
 - `vmlinux.xz`: the compressed kernel ELF with symbols for debugging
 - `build-info.txt`: track, architecture, version, revision, and source checksum
 - `SHA256SUMS`: checksums for every exported artifact
 
-The canonical arm64 config baseline lives at `resources/kernels/configs/arm64-base.config`.
+The canonical architecture config baselines live at `resources/kernels/configs/<arch>-base.config`.
 Track-specific config drift lives in `resources/kernels/configs/overlays/<track>.config`,
 which gets appended before `olddefconfig` runs.
 

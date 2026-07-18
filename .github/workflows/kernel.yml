@@ -16,15 +16,34 @@ permissions:
   contents: read
 
 env:
-  ARCH: arm64
   REGISTRY: ghcr.io
   TRACK: stable
 
 jobs:
   build:
-    name: stable arm64
+    name: stable ${{ matrix.arch }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            cc: ccache aarch64-linux-gnu-gcc
+            cross_compile: aarch64-linux-gnu-
+            kernel_artifact: Image
+            file_pattern: ARM64
+          - arch: x86_64
+            cc: ccache gcc
+            cross_compile: ""
+            kernel_artifact: vmlinux
+            file_pattern: ELF 64-bit LSB executable, x86-64
+    env:
+      ARCH: ${{ matrix.arch }}
+      CROSS_COMPILE: ${{ matrix.cross_compile }}
+      KERNEL_ARTIFACT: ${{ matrix.kernel_artifact }}
+      KERNEL_CC: ${{ matrix.cc }}
+      KERNEL_FILE_PATTERN: ${{ matrix.file_pattern }}
 
     steps:
       - name: Check out repository
@@ -72,16 +91,16 @@ jobs:
           path: |
             ~/.cache/ccache
             ~/.cache/silo/kernels/downloads
-          key: kernel-${{ runner.os }}-${{ steps.kernel.outputs.version }}-${{ hashFiles('resources/kernels/configs/**') }}
+          key: kernel-${{ runner.os }}-${{ matrix.arch }}-${{ steps.kernel.outputs.version }}-${{ hashFiles('resources/kernels/configs/**') }}
           restore-keys: |
-            kernel-${{ runner.os }}-${{ steps.kernel.outputs.version }}-
+            kernel-${{ runner.os }}-${{ matrix.arch }}-${{ steps.kernel.outputs.version }}-
 
       - name: Configure compiler cache
         run: |
           ccache --max-size 2G
           ccache --zero-stats
 
-      - name: Build stable arm64 kernel
+      - name: Build stable kernel
         env:
           KBUILD_BUILD_HOST: github-actions
           KBUILD_BUILD_USER: silo
@@ -89,8 +108,8 @@ jobs:
           make -C resources/kernels kernel \
             TRACK="$TRACK" \
             ARCH="$ARCH" \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CC="ccache aarch64-linux-gnu-gcc" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CC="$KERNEL_CC" \
             BUILD_REVISION="${{ steps.kernel.outputs.revision }}"
           ccache --show-stats
 
@@ -98,8 +117,8 @@ jobs:
         working-directory: ${{ steps.kernel.outputs.export_dir }}
         run: |
           sha256sum --check SHA256SUMS
-          file Image | tee image-type.txt
-          grep --quiet 'ARM64' image-type.txt
+          file "$KERNEL_ARTIFACT" | tee image-type.txt
+          grep --fixed-strings --quiet "$KERNEL_FILE_PATTERN" image-type.txt
           rm image-type.txt
 
       - name: Upload workflow artifact
@@ -144,6 +163,7 @@ jobs:
       #       Image:application/vnd.silo.boot.kernel.v1 \
       #       .config:application/vnd.silo.kernel.config.v1 \
       #       System.map:application/vnd.silo.kernel.system-map.v1 \
+      #       vmlinux:application/vnd.silo.kernel.debug.v1 \
       #       vmlinux.xz:application/vnd.silo.kernel.debug.v1+xz \
       #       build-info.txt:application/vnd.silo.kernel.build-info.v1 \
       #       SHA256SUMS:text/plain

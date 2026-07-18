@@ -39,7 +39,7 @@ struct Cli {
     /// Guest memory size in MiB.
     #[arg(long, default_value_t = 512)]
     memory_mib: u32,
-    /// Raw Linux kernel image path.
+    /// Linux kernel image path.
     #[arg(long)]
     kernel: Option<PathBuf>,
     /// Optional initramfs image path.
@@ -213,7 +213,7 @@ fn configure_ctx(ctx_id: u32, config: &KrunConfig) -> eyre::Result<()> {
         ctx::set_kernel(
             ctx_id,
             &path_string(kernel),
-            KernelFormat::Raw,
+            external_kernel_format(),
             config
                 .initramfs
                 .as_ref()
@@ -276,6 +276,17 @@ fn configure_ctx(ctx_id: u32, config: &KrunConfig) -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+fn external_kernel_format() -> KernelFormat {
+    #[cfg(target_arch = "x86_64")]
+    {
+        KernelFormat::Elf
+    }
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        KernelFormat::Raw
+    }
 }
 
 fn require_feature(feature: Feature, requested_by: &'static str) -> eyre::Result<()> {
@@ -351,8 +362,18 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::local_unix_datagram_path;
+    use super::{external_kernel_format, local_unix_datagram_path};
+    use krun_sys::KernelFormat;
     use std::path::Path;
+
+    #[test]
+    fn external_kernel_format_matches_host_architecture() {
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(external_kernel_format(), KernelFormat::Elf);
+
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        assert_eq!(external_kernel_format(), KernelFormat::Raw);
+    }
 
     #[test]
     fn local_unix_datagram_path_uses_short_vm_id_and_backend() {

@@ -10,6 +10,7 @@ ARCH_CONFIG := $(KERNEL_ARCH_$(ARCH)_CONFIG)
 KERNEL_BUILD_TARGET := $(KERNEL_ARCH_$(ARCH)_BUILD_TARGET)
 KERNEL_IMAGE_PATH := $(KERNEL_ARCH_$(ARCH)_IMAGE_PATH)
 KERNEL_IMAGE_NAME := $(notdir $(KERNEL_IMAGE_PATH))
+KERNEL_DEBUG_ELF := $(if $(filter vmlinux,$(KERNEL_IMAGE_NAME)),,vmlinux)
 
 RESOURCE_ROOT ?= $(abspath $(CURDIR)/..)
 REPO_ROOT ?= $(abspath $(RESOURCE_ROOT)/..)
@@ -55,12 +56,15 @@ kernel: guard-kernel
 	@cp "$(KERNEL_BUILD_DIR)/.config" "$(KERNEL_EXPORT_TMP)/.config"
 	@cp "$(KERNEL_BUILD_DIR)/System.map" "$(KERNEL_EXPORT_TMP)/System.map"
 	@cp "$(KERNEL_BUILD_DIR)/$(KERNEL_IMAGE_PATH)" "$(KERNEL_EXPORT_TMP)/$(KERNEL_IMAGE_NAME)"
+	@if [ -n "$(KERNEL_DEBUG_ELF)" ]; then \
+		cp "$(KERNEL_BUILD_DIR)/vmlinux" "$(KERNEL_EXPORT_TMP)/vmlinux"; \
+	fi
 	@xz -T0 -6 -c "$(KERNEL_BUILD_DIR)/vmlinux" > "$(KERNEL_EXPORT_TMP)/vmlinux.xz"
 	@printf "track=%s\narch=%s\nversion=%s\nrevision=%s\nsource_sha256=%s\n" \
 		"$(TRACK)" "$(ARCH)" "$(TRACK_VERSION)" "$(BUILD_REVISION)" "$(TRACK_SHA256)" \
 		> "$(KERNEL_EXPORT_TMP)/build-info.txt"
 	@cd "$(KERNEL_EXPORT_TMP)" && sha256sum \
-		"$(KERNEL_IMAGE_NAME)" .config System.map vmlinux.xz build-info.txt > SHA256SUMS
+		"$(KERNEL_IMAGE_NAME)" .config System.map $(KERNEL_DEBUG_ELF) vmlinux.xz build-info.txt > SHA256SUMS
 	@rm -rf "$(KERNEL_EXPORT_DIR)"
 	@mv "$(KERNEL_EXPORT_TMP)" "$(KERNEL_EXPORT_DIR)"
 	@printf 'Exported kernel artifacts to %s\n' "$(KERNEL_EXPORT_DIR)"
