@@ -55,6 +55,7 @@
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
               pkgs.dtc
+              pkgs.elfutils
               pkgs.gcc
               pkgs.libcap_ng
               pkgs.patchelf

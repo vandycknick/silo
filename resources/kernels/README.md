@@ -4,7 +4,7 @@ This directory owns the guest kernel build inputs for Silo.
 
 ## Supported tracks
 
-- `stable`: `7.0.10`
+- `stable`: `7.1.3`
 - `longterm`: `6.18.33`
 - `longterm5`: `5.15.208`
 
@@ -63,7 +63,7 @@ ghcr.io/vandycknick/silo-kernel:<kernel-version>-<git-revision>
 Pull a published kernel with ORAS:
 
 ```bash
-oras pull ghcr.io/vandycknick/silo-kernel:7.0.10
+oras pull ghcr.io/vandycknick/silo-kernel:7.1.3
 ```
 
 GHCR creates the package as private on its first publication. Change the
