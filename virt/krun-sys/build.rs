@@ -1,7 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-const LIBKRUN_VERSION: &str = "1.19.0";
+const LIBKRUN_VERSION: &str = "1.19.4";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=KRUN_DEPS_DIR");

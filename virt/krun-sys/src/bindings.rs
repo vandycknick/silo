@@ -18,6 +18,8 @@ pub const KRUN_DISK_FORMAT_VMDK: u32 = 2;
 pub const KRUN_SYNC_NONE: u32 = 0;
 pub const KRUN_SYNC_RELAXED: u32 = 1;
 pub const KRUN_SYNC_FULL: u32 = 2;
+pub const KRUN_SEMANTICS_LINUX_COMPLETE: u32 = 0;
+pub const KRUN_SEMANTICS_LINUX_SIMPLIFIED: u32 = 1;
 pub const NET_FLAG_VFKIT: u32 = 1;
 pub const NET_FLAG_DHCP_CLIENT: u32 = 2;
 pub const KRUN_TSI_HIJACK_INET: u32 = 1;
@@ -166,6 +168,17 @@ unsafe extern "C" {
         c_path: *const ::core::ffi::c_char,
         shm_size: u64,
         read_only: bool,
+    ) -> i32;
+}
+unsafe extern "C" {
+    #[doc = " Adds an independent virtio-fs device pointing to a host's directory with a\n tag. This variant allows specifying the permission semantics to be emulated.\n\n Arguments:\n  \"ctx_id\"         - the configuration context ID.\n  \"c_tag\"          - tag to identify the filesystem in the guest.\n  \"c_path\"         - full path to the directory in the host to be exposed to the guest.\n  \"shm_size\"       - size of the DAX SHM window in bytes.\n  \"read_only\"      - if true, the filesystem will be exposed as read-only to the guest.\n  \"semantics\"      - the permissions semantics to be emulated.\n\n Returns:\n  Zero on success or a negative error number on failure."]
+    pub fn krun_add_virtiofs4(
+        ctx_id: u32,
+        c_tag: *const ::core::ffi::c_char,
+        c_path: *const ::core::ffi::c_char,
+        shm_size: u64,
+        read_only: bool,
+        semantics: u32,
     ) -> i32;
 }
 unsafe extern "C" {

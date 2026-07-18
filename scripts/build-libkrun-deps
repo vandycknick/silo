@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LIBKRUN_VERSION="${LIBKRUN_VERSION:-1.19.0}"
+LIBKRUN_VERSION="${LIBKRUN_VERSION:-1.19.4}"
 ROOT_DIR="$(git rev-parse --show-toplevel)"
 TARGET_TRIPLE="${TARGET_TRIPLE:-$(rustc -vV | awk '/host:/ { print $2 }')}"
 BUILD_ROOT="${KRUN_BUILD_DIR:-$ROOT_DIR/target/build/libkrun/$TARGET_TRIPLE}"
 OUT_DIR="${KRUN_DEPS_DIR:-$ROOT_DIR/target/libs/krun/$TARGET_TRIPLE}"
+RUNTIME_DIR="${KRUN_RUNTIME_DIR:-$ROOT_DIR/target/release}"
 
 require_tool() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -34,7 +35,7 @@ clone_libkrun() {
 }
 
 prepare_dirs() {
-  mkdir -p "$BUILD_ROOT" "$OUT_DIR"
+  mkdir -p "$BUILD_ROOT" "$OUT_DIR" "$RUNTIME_DIR"
   rm -f "$OUT_DIR"/libkrunfw*.so "$OUT_DIR"/libkrunfw*.so.* "$OUT_DIR"/libkrunfw*.dylib
 }
 
@@ -57,6 +58,7 @@ build_linux() {
 
   cp -L "$BUILD_ROOT/libkrun-src/target/release/libkrun.so" "$OUT_DIR/libkrun.so"
   patchelf --set-soname libkrun.so "$OUT_DIR/libkrun.so"
+  cp -L "$OUT_DIR/libkrun.so" "$RUNTIME_DIR/libkrun.so"
 }
 
 build_macos() {
@@ -82,6 +84,7 @@ build_macos() {
   install_name_tool -id "@rpath/libkrun.dylib" "$OUT_DIR/libkrun.dylib"
 
   codesign -s - --force "$OUT_DIR/libkrun.dylib"
+  cp -L "$OUT_DIR/libkrun.dylib" "$RUNTIME_DIR/libkrun.dylib"
 }
 
 require_common_tools
@@ -101,4 +104,5 @@ case "$(uname -s)" in
 esac
 
 printf 'Built libkrun dependencies in %s\n' "$OUT_DIR"
+printf 'Installed libkrun runtime in %s\n' "$RUNTIME_DIR"
 printf 'Use: export KRUN_DEPS_DIR=%q\n' "$OUT_DIR"

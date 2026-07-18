@@ -8,6 +8,11 @@ The expected layout is:
 target/libs/krun/<target-triple>/
   libkrun.so        # Linux
   libkrun.dylib     # macOS
+
+target/release/
+  krun
+  libkrun.so        # Linux
+  libkrun.dylib     # macOS
 ```
 
 ## Prerequisites
@@ -36,6 +41,7 @@ The script does the following:
 2. Builds `libkrun` with Cargo features `blk` and `net`, with default features disabled.
 3. Copies `libkrun.so` into `target/libs/krun/<target-triple>`.
 4. Fixes the soname with `patchelf` so the copied library is relocatable.
+5. Copies the library into `target/release` beside the `krun` helper.
 
 Silo intentionally builds `libkrun` without the upstream `init-blob` default feature. That avoids building and embedding libkrun's default guest init binary.
 
@@ -56,6 +62,7 @@ The script does the following:
 3. Copies `libkrun.dylib` into `target/libs/krun/<target-triple>`.
 4. Rewrites the install name to `@rpath/libkrun.dylib`.
 5. Ad-hoc codesigns the dylib.
+6. Copies the library into `target/release` beside the `krun` helper.
 
 Because Silo disables libkrun's `init-blob` default feature and does not package `libkrunfw`, macOS no longer needs Docker, a Linux init-builder container, or the upstream `libkrunfw-prebuilt-aarch64.tgz` bundle for this dependency build.
 
@@ -109,12 +116,14 @@ package-krun-runtime release target/krun-runtime-release
 
 The output directory contains the `krun` binary plus `libkrun`, ready to copy together.
 
+Set `KRUN_RUNTIME_DIR` to install the runtime library beside a `krun` helper in a directory other than `target/release`.
+
 ## Version Pins
 
 The current script pins are:
 
 ```text
-LIBKRUN_VERSION=1.19.0
+LIBKRUN_VERSION=1.19.4
 ```
 
 Override it only when intentionally updating the native ABI and regenerated bindings:
