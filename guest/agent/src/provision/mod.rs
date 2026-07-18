@@ -626,12 +626,19 @@ where
     let args = collect_command_args(args);
     tracing::debug!(program, args = ?args, "running provisioning command");
 
+    let started = Instant::now();
     let output = process_supervisor.output(program, &args).with_context(|| {
         format!(
             "run provisioning command {}",
             format_command(program, &args)
         )
     })?;
+    tracing::info!(
+        program,
+        duration_ms = started.elapsed().as_millis(),
+        success = output.status.success(),
+        "provisioning command completed"
+    );
     if !output.status.success() {
         return Err(command_failure(program, &args, &output));
     }
