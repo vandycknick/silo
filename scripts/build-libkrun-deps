@@ -34,6 +34,24 @@ clone_libkrun() {
   fi
 }
 
+apply_libkrun_patches() {
+  local dest="$BUILD_ROOT/libkrun-src"
+  local patch
+  local patches=("$ROOT_DIR"/patches/libkrun/*.patch)
+
+  if [ ! -e "${patches[0]}" ]; then
+    return
+  fi
+
+  for patch in "${patches[@]}"; do
+    if git -C "$dest" apply --reverse --check "$patch" >/dev/null 2>&1; then
+      continue
+    fi
+    git -C "$dest" apply --check "$patch"
+    git -C "$dest" apply "$patch"
+  done
+}
+
 prepare_dirs() {
   mkdir -p "$BUILD_ROOT" "$OUT_DIR" "$RUNTIME_DIR"
   rm -f "$OUT_DIR"/libkrunfw*.so "$OUT_DIR"/libkrunfw*.so.* "$OUT_DIR"/libkrunfw*.dylib
@@ -41,6 +59,7 @@ prepare_dirs() {
 
 build_libkrun() {
   clone_libkrun
+  apply_libkrun_patches
   cargo build --manifest-path "$BUILD_ROOT/libkrun-src/Cargo.toml" \
     -p libkrun \
     --lib \

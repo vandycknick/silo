@@ -38,10 +38,11 @@ make build-libkrun
 The script does the following:
 
 1. Clones `libkrun/libkrun` at the pinned `LIBKRUN_VERSION` with submodules.
-2. Builds `libkrun` with Cargo features `blk` and `net`, with default features disabled.
-3. Copies `libkrun.so` into `target/libs/krun/<target-triple>`.
-4. Fixes the soname with `patchelf` so the copied library is relocatable.
-5. Copies the library into `target/release` beside the `krun` helper.
+2. Applies the downstream patches from `patches/libkrun/`.
+3. Builds `libkrun` with Cargo features `blk` and `net`, with default features disabled.
+4. Copies `libkrun.so` into `target/libs/krun/<target-triple>`.
+5. Fixes the soname with `patchelf` so the copied library is relocatable.
+6. Copies the patched library into `target/release` beside the `krun` helper.
 
 Silo intentionally builds `libkrun` without the upstream `init-blob` default feature. That avoids building and embedding libkrun's default guest init binary.
 
@@ -58,11 +59,12 @@ make build-libkrun
 The script does the following:
 
 1. Clones `libkrun/libkrun` at the pinned `LIBKRUN_VERSION` with submodules.
-2. Builds `libkrun.dylib` with Cargo features `blk` and `net`, with default features disabled.
-3. Copies `libkrun.dylib` into `target/libs/krun/<target-triple>`.
-4. Rewrites the install name to `@rpath/libkrun.dylib`.
-5. Ad-hoc codesigns the dylib.
-6. Copies the library into `target/release` beside the `krun` helper.
+2. Applies the downstream patches from `patches/libkrun/`.
+3. Builds `libkrun.dylib` with Cargo features `blk` and `net`, with default features disabled.
+4. Copies `libkrun.dylib` into `target/libs/krun/<target-triple>`.
+5. Rewrites the install name to `@rpath/libkrun.dylib`.
+6. Ad-hoc codesigns the dylib.
+7. Copies the patched library into `target/release` beside the `krun` helper.
 
 Because Silo disables libkrun's `init-blob` default feature and does not package `libkrunfw`, macOS no longer needs Docker, a Linux init-builder container, or the upstream `libkrunfw-prebuilt-aarch64.tgz` bundle for this dependency build.
 
@@ -115,6 +117,12 @@ package-krun-runtime release target/krun-runtime-release
 ```
 
 The output directory contains the `krun` binary plus `libkrun`, ready to copy together.
+
+## Downstream Patches
+
+`patches/libkrun/0001-vsock-shutdown-released-unix-proxy.patch` fixes the delayed EOF reported in [libkrun issue #684](https://github.com/containers/libkrun/issues/684). It is based on libkrun `v1.19.4` and includes a focused regression test suitable for an upstream pull request.
+
+The dependency build applies patches idempotently. A patch that no longer applies after a libkrun version update must be refreshed or removed if the fix has landed upstream.
 
 Set `KRUN_RUNTIME_DIR` to install the runtime library beside a `krun` helper in a directory other than `target/release`.
 
