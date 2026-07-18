@@ -1,9 +1,23 @@
-GUEST_TARGET := aarch64-unknown-linux-musl
+HOST_ARCH := $(shell uname -m)
+ifeq ($(HOST_ARCH),x86_64)
+DEFAULT_ARCH := x86_64
+else ifneq ($(filter arm64 aarch64,$(HOST_ARCH)),)
+DEFAULT_ARCH := arm64
+endif
+
+ARCH ?= $(DEFAULT_ARCH)
+GUEST_TARGET_x86_64 := x86_64-unknown-linux-musl
+GUEST_TARGET_arm64 := aarch64-unknown-linux-musl
+DEFAULT_GUEST_TARGET := $(GUEST_TARGET_$(ARCH))
+ifeq ($(DEFAULT_GUEST_TARGET),)
+$(error unsupported guest architecture: $(ARCH))
+endif
+
+GUEST_TARGET ?= $(DEFAULT_GUEST_TARGET)
 GUEST_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/silo-agent
 GUEST_INIT_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/init
 GUEST_ASSETS_DIR := $(CURDIR)/target/resources/assets
 INITRAMFS_OUT := $(GUEST_ASSETS_DIR)/initramfs
-ARCH ?= arm64
 PROFILE ?= debug
 RUST_HOST_TRIPLE := $(shell rustc -vV | awk '/host:/ { print $$2 }')
 HOST_OS := $(shell uname -s)

@@ -26,7 +26,10 @@
             overlays = [ (import rust-overlay) ];
           };
           rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-            targets = [ "aarch64-unknown-linux-musl" ];
+            targets = [
+              "aarch64-unknown-linux-musl"
+              "x86_64-unknown-linux-musl"
+            ];
             extensions = [
               "rust-src"
               "rustfmt"

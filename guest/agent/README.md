@@ -130,17 +130,17 @@ That target builds the guest agent binary and copies it into Silo's runtime asse
 target/resources/assets/agent
 ```
 
-Current target details:
+The helper selects a statically linked musl target matching the host architecture:
 
-- target triple: `aarch64-unknown-linux-musl`
-- output binary: `target/aarch64-unknown-linux-musl/release/silo-agent`
+- x86_64: `x86_64-unknown-linux-musl`
+- arm64: `aarch64-unknown-linux-musl`
 
-The current flow still likely needs some tuning, especially around local toolchain assumptions and Linux-target verification on non-Linux hosts.
+Override `GUEST_TARGET` when intentionally cross-building for another architecture.
 
-If you want to run the command manually, it is currently equivalent to:
+For example:
 
 ```bash
-cargo zigbuild -p agent --target aarch64-unknown-linux-musl --release
+make build-guest-agent GUEST_TARGET=x86_64-unknown-linux-musl
 ```
 
 ## Status

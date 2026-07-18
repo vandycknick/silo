@@ -11,7 +11,12 @@ use crate::initramfs::{write_initramfs, InitramfsOptions};
 
 mod initramfs;
 
+#[cfg(target_arch = "x86_64")]
+const DEFAULT_GUEST_TARGET: &str = "x86_64-unknown-linux-musl";
+#[cfg(target_arch = "aarch64")]
 const DEFAULT_GUEST_TARGET: &str = "aarch64-unknown-linux-musl";
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("xtask guest assets support only x86_64 and aarch64 hosts");
 #[derive(Debug, Parser)]
 #[command(about = "Silo repository automation")]
 struct Args {
