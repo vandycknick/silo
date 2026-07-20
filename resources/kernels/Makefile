@@ -24,12 +24,6 @@ RESOURCE_ROOT ?= $(abspath $(CURDIR)/..)
 REPO_ROOT ?= $(abspath $(RESOURCE_ROOT)/..)
 CACHE_ROOT ?= $(HOME)/.cache/silo/kernels
 TARGET_ROOT ?= $(REPO_ROOT)/target
-OCI_IMAGE ?= ghcr.io/$(GITHUB_REPOSITORY_OWNER)/silo/kernel
-ARM64_OCI_LAYOUT ?= $(TARGET_ROOT)/kernels/$(TRACK)/arm64
-AMD64_OCI_LAYOUT ?= $(TARGET_ROOT)/kernels/$(TRACK)/x86_64
-PUBLISH_REVISION ?= $(GITHUB_SHA)
-PUBLISH_SOURCE ?= https://github.com/$(GITHUB_REPOSITORY)
-PUBLISH_CREATED ?= $(shell git -C "$(REPO_ROOT)" show -s --format=%cI "$(PUBLISH_REVISION)" 2>/dev/null)
 KERNEL_CHANNEL := v$(word 1,$(subst ., ,$(TRACK_VERSION))).x
 KERNEL_SOURCE_URL := https://cdn.kernel.org/pub/linux/kernel/$(KERNEL_CHANNEL)/linux-$(TRACK_VERSION).tar.xz
 KERNEL_SOURCE_DIR ?= $(CACHE_ROOT)/src/linux-$(TRACK_VERSION)
@@ -107,51 +101,4 @@ kernel-architecture:
 
 .PHONY: publish
 publish:
-	@set -eu; \
-		temp_dir=$$(mktemp -d); \
-		trap 'rm -rf "$$temp_dir"' 0 HUP INT TERM; \
-		revision_tag="$(TRACK_VERSION)-$(PUBLISH_REVISION)"; \
-		arm64_tag="$$revision_tag-arm64"; \
-		amd64_tag="$$revision_tag-amd64"; \
-		oras cp --from-oci-layout "$(ARM64_OCI_LAYOUT):$(TRACK_VERSION)" "$(OCI_IMAGE):$$arm64_tag"; \
-		oras cp --from-oci-layout "$(AMD64_OCI_LAYOUT):$(TRACK_VERSION)" "$(OCI_IMAGE):$$amd64_tag"; \
-		oras manifest fetch --descriptor "$(OCI_IMAGE):$$arm64_tag" > "$$temp_dir/arm64-descriptor.json"; \
-		oras manifest fetch --descriptor "$(OCI_IMAGE):$$amd64_tag" > "$$temp_dir/amd64-descriptor.json"; \
-		jq -n \
-			--slurpfile arm64 "$$temp_dir/arm64-descriptor.json" \
-			--slurpfile amd64 "$$temp_dir/amd64-descriptor.json" \
-			--arg created "$(PUBLISH_CREATED)" \
-			--arg revision "$(PUBLISH_REVISION)" \
-			--arg source "$(PUBLISH_SOURCE)" \
-			--arg version "$(TRACK_VERSION)" \
-			--arg track "$(TRACK)" \
-			'{ \
-				schemaVersion: 2, \
-				mediaType: "application/vnd.oci.image.index.v1+json", \
-				artifactType: "application/vnd.silo.kernel.v1", \
-				manifests: [ \
-					($$arm64[0] | {mediaType, digest, size, artifactType} + {platform: {os: "linux", architecture: "arm64"}}), \
-					($$amd64[0] | {mediaType, digest, size, artifactType} + {platform: {os: "linux", architecture: "amd64"}}) \
-				], \
-				annotations: { \
-					"org.opencontainers.image.created": $$created, \
-					"org.opencontainers.image.description": "Silo Linux kernel", \
-					"org.opencontainers.image.revision": $$revision, \
-					"org.opencontainers.image.source": $$source, \
-					"org.opencontainers.image.version": $$version, \
-					"com.silo.kernel.track": $$track \
-				} \
-			}' > "$$temp_dir/kernel-index.json"; \
-		oras manifest push "$(OCI_IMAGE):$$revision_tag,$(TRACK_VERSION),$(TRACK)" "$$temp_dir/kernel-index.json"; \
-		oras manifest fetch "$(OCI_IMAGE):$$revision_tag" > "$$temp_dir/published-index.json"; \
-		jq -e ' \
-			.artifactType == "application/vnd.silo.kernel.v1" and \
-			([.manifests[].platform | [.os, .architecture]] | sort) == \
-				([ ["linux", "amd64"], ["linux", "arm64"] ] | sort) \
-		' "$$temp_dir/published-index.json" >/dev/null; \
-		for platform in linux/arm64 linux/amd64; do \
-			oras manifest fetch --platform "$$platform" "$(OCI_IMAGE):$$revision_tag" | \
-				jq -e '([.layers[] | select(.mediaType == "application/vnd.silo.kernel.image.v1")] | length) == 1' >/dev/null; \
-			oras manifest fetch-config --platform "$$platform" "$(OCI_IMAGE):$$revision_tag" | \
-				jq -e --arg platform "$$platform" '(.platform.os + "/" + .platform.architecture) == $$platform' >/dev/null; \
-		done
+	@TRACK="$(TRACK)" "$(RESOURCE_ROOT)/kernels/scripts/publish-oci.sh"
