@@ -1,5 +1,9 @@
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File};
+use std::io;
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use agent_spec::UserConfig;
 use eyre::{eyre, Context};
@@ -8,6 +12,8 @@ use crate::provision::{
     command_exists, format_error_chain, run_command, sanitize_unit_name, write_file,
     ProvisionContext, ProvisionOutcome, Provisioner, ProvisionerId,
 };
+
+mod database;
 
 pub(crate) struct Users<'a> {
     users: &'a [UserConfig],
@@ -68,28 +74,168 @@ fn ensure_user(context: &ProvisionContext, user: &UserConfig) -> eyre::Result<()
 }
 
 fn create_user(context: &ProvisionContext, user: &UserConfig) -> eyre::Result<()> {
-    let uid = user.uid.to_string();
-    run_command(
-        context.process_supervisor(),
-        "useradd",
-        [
-            "--uid",
-            uid.as_str(),
-            "--comment",
-            user.gecos.as_str(),
-            "--home-dir",
-            user.home.as_str(),
-            "--create-home",
-            "--shell",
-            user.shell.as_str(),
-            user.name.as_str(),
-        ],
-    )?;
+    let account_started = Instant::now();
+    let primary_gid = database::create(&context.guest_path("/etc"), user)?;
+    let account_duration = account_started.elapsed();
 
-    // shadow-utils useradd creates new accounts locked when no password is supplied.
+    let home_started = Instant::now();
+    initialize_home(context, user, primary_gid)?;
 
-    tracing::info!(user = %user.name, uid = user.uid, "provisioned user");
+    tracing::info!(
+        user = %user.name,
+        uid = user.uid,
+        account_duration_ms = account_duration.as_millis(),
+        home_duration_ms = home_started.elapsed().as_millis(),
+        "provisioned user"
+    );
     Ok(())
+}
+
+fn initialize_home(
+    context: &ProvisionContext,
+    user: &UserConfig,
+    primary_gid: u32,
+) -> eyre::Result<()> {
+    let (home, created) = ensure_home_directory(context, &user.home)?;
+    set_owner(&home, user.uid, primary_gid)?;
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("set permissions on home directory {}", home.display()))?;
+
+    if created {
+        let skeleton = context.guest_path("/etc/skel");
+        copy_skeleton(&skeleton, &home, user.uid, primary_gid)?;
+    }
+    Ok(())
+}
+
+fn ensure_home_directory(
+    context: &ProvisionContext,
+    configured: &str,
+) -> eyre::Result<(PathBuf, bool)> {
+    let root = context.guest_path("/");
+    let relative = configured
+        .strip_prefix('/')
+        .ok_or_else(|| eyre!("home directory must be absolute: {configured}"))?;
+    let components = Path::new(relative).components().collect::<Vec<_>>();
+    if components.is_empty() {
+        return Err(eyre!("home directory must not be the filesystem root"));
+    }
+
+    let mut current = root;
+    let mut home_created = false;
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(eyre!("home directory is not normalized: {configured}"));
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(eyre!(
+                    "home directory component {} must be a non-symlink directory",
+                    current.display()
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&current).with_context(|| {
+                    format!("create home directory component {}", current.display())
+                })?;
+                if index + 1 == components.len() {
+                    home_created = true;
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect home directory component {}", current.display())
+                });
+            }
+        }
+    }
+    Ok((current, home_created))
+}
+
+fn copy_skeleton(source: &Path, destination: &Path, uid: u32, gid: u32) -> eyre::Result<()> {
+    match fs::symlink_metadata(source) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(eyre!(
+                "skeleton path {} must be a directory",
+                source.display()
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", source.display())),
+    }
+
+    for entry in fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
+        let entry = entry.with_context(|| format!("read entry in {}", source.display()))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)
+            .with_context(|| format!("inspect {}", source_path.display()))?;
+        let file_type = metadata.file_type();
+
+        if file_type.is_dir() {
+            fs::create_dir(&destination_path)
+                .with_context(|| format!("create {}", destination_path.display()))?;
+            copy_skeleton(&source_path, &destination_path, uid, gid)?;
+            set_owner(&destination_path, uid, gid)?;
+            fs::set_permissions(
+                &destination_path,
+                fs::Permissions::from_mode(metadata.permissions().mode() & 0o7777),
+            )
+            .with_context(|| format!("set permissions on {}", destination_path.display()))?;
+        } else if file_type.is_file() {
+            let mut source_file = File::open(&source_path)
+                .with_context(|| format!("open {}", source_path.display()))?;
+            let mut destination_file = File::options()
+                .write(true)
+                .create_new(true)
+                .open(&destination_path)
+                .with_context(|| format!("create {}", destination_path.display()))?;
+            io::copy(&mut source_file, &mut destination_file).with_context(|| {
+                format!(
+                    "copy {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+            set_owner(&destination_path, uid, gid)?;
+            fs::set_permissions(
+                &destination_path,
+                fs::Permissions::from_mode(metadata.permissions().mode() & 0o7777),
+            )
+            .with_context(|| format!("set permissions on {}", destination_path.display()))?;
+        } else if file_type.is_symlink() {
+            let target = fs::read_link(&source_path)
+                .with_context(|| format!("read link {}", source_path.display()))?;
+            symlink(&target, &destination_path)
+                .with_context(|| format!("create symlink {}", destination_path.display()))?;
+            rustix::fs::chownat(
+                rustix::fs::CWD,
+                &destination_path,
+                Some(rustix::process::Uid::from_raw(uid)),
+                Some(rustix::process::Gid::from_raw(gid)),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|error| eyre!("set owner on {}: {error}", destination_path.display()))?;
+        } else {
+            return Err(eyre!(
+                "unsupported skeleton entry type at {}",
+                source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn set_owner(path: &Path, uid: u32, gid: u32) -> eyre::Result<()> {
+    rustix::fs::chown(
+        path,
+        Some(rustix::process::Uid::from_raw(uid)),
+        Some(rustix::process::Gid::from_raw(gid)),
+    )
+    .map_err(|error| eyre!("set owner on {}: {error}", path.display()))
 }
 
 fn adopt_existing_user(
@@ -470,7 +616,8 @@ fn read_group_entry_matching(
 mod tests {
     use std::ffi::OsString;
     use std::fs;
-    use std::path::PathBuf;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
 
     use agent_spec::UserConfig;
 
@@ -554,6 +701,74 @@ mod tests {
     #[test]
     fn home_owner_uses_numeric_uid_and_primary_gid() {
         assert_eq!(super::home_owner(1000, 1001), "1000:1001");
+    }
+
+    #[test]
+    fn initializes_new_home_from_skeleton_without_following_symlinks() {
+        let root = temp_root("initialize-home");
+        let skeleton = root.join("etc/skel");
+        fs::create_dir_all(skeleton.join("config")).expect("create skeleton");
+        fs::write(skeleton.join(".profile"), "profile\n").expect("write profile");
+        fs::write(skeleton.join("config/settings"), "settings\n").expect("write settings");
+        fs::set_permissions(
+            skeleton.join("config/settings"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .expect("set settings mode");
+        symlink(".profile", skeleton.join("profile-link")).expect("create skeleton symlink");
+
+        let mut user = nickvd_config();
+        user.uid = nix::unistd::Uid::current().as_raw();
+        user.home = "/home/nickvd".to_string();
+        let gid = nix::unistd::Gid::current().as_raw();
+        let context = ProvisionContext::for_test(&root);
+
+        super::initialize_home(&context, &user, gid).expect("initialize home");
+
+        let home = root.join("home/nickvd");
+        assert_eq!(
+            fs::read_to_string(home.join(".profile")).expect("read profile"),
+            "profile\n"
+        );
+        assert_eq!(
+            fs::read_to_string(home.join("config/settings")).expect("read settings"),
+            "settings\n"
+        );
+        assert_eq!(
+            fs::symlink_metadata(home.join("config/settings"))
+                .expect("stat settings")
+                .mode()
+                & 0o7777,
+            0o640
+        );
+        assert_eq!(
+            fs::read_link(home.join("profile-link")).expect("read copied link"),
+            Path::new(".profile")
+        );
+        assert_eq!(
+            fs::symlink_metadata(&home).expect("stat home").mode() & 0o7777,
+            0o700
+        );
+
+        fs::remove_dir_all(root).expect("clean temp root");
+    }
+
+    #[test]
+    fn rejects_symlinked_home_component() {
+        let root = temp_root("symlink-home");
+        let outside = temp_root("symlink-home-outside");
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(&outside).expect("create outside");
+        symlink(&outside, root.join("home")).expect("create home symlink");
+
+        let error = super::ensure_home_directory(&ProvisionContext::for_test(&root), "/home/silo")
+            .expect_err("symlinked home component must fail");
+
+        assert!(error.to_string().contains("non-symlink directory"));
+        assert!(!outside.join("silo").exists());
+
+        fs::remove_dir_all(root).expect("clean temp root");
+        fs::remove_dir_all(outside).expect("clean outside temp root");
     }
 
     #[test]
@@ -656,8 +871,8 @@ mod tests {
         UserConfig {
             name: "nickvd".to_string(),
             uid: 1000,
-            gecos: "Nick Van Driessche".to_string(),
             gid: 1000,
+            gecos: "Nick Van Driessche".to_string(),
             home: "/home/nickvd".to_string(),
             shell: "/bin/bash".to_string(),
             sudo: "ALL=(ALL) NOPASSWD:ALL".to_string(),
