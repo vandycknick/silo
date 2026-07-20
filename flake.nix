@@ -38,28 +38,52 @@
             ];
           };
           llvm = pkgs.llvmPackages;
+          kernelPackages = [
+            pkgs.bash
+            pkgs.cacert
+            pkgs.coreutils
+            pkgs.cpio
+            pkgs.curl
+            pkgs.diffutils
+            pkgs.findutils
+            pkgs.git
+            pkgs.gnugrep
+            pkgs.gnumake
+            pkgs.gnused
+            pkgs.gnutar
+            pkgs.gzip
+            pkgs.jq
+            pkgs.oras
+            pkgs.perl
+            pkgs.pkg-config
+            pkgs.xz
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.bc
+            pkgs.binutils
+            pkgs.bison
+            pkgs.ccache
+            pkgs.elfutils
+            pkgs.flex
+            pkgs.gawk
+            pkgs.gcc
+            pkgs.openssl
+          ];
         in
         {
           default = pkgs.mkShell {
             packages = [
               rustToolchain
-              pkgs.curl
-              pkgs.git
               pkgs.go
-              pkgs.gnumake
               pkgs.grpcurl
-              pkgs.jq
-              pkgs.pkg-config
-              pkgs.xz
               pkgs.zig
               pkgs.cargo-zigbuild
               pkgs.docker
               pkgs.docker-credential-helpers
             ]
+            ++ kernelPackages
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
               pkgs.dtc
-              pkgs.elfutils
-              pkgs.gcc
               pkgs.libcap_ng
               pkgs.patchelf
               llvm.clang
@@ -76,6 +100,10 @@
               export LIBCLANG_PATH="${llvm.libclang.lib}/lib"
               echo "Entering silo dev shell. Run: make build"
             '';
+          };
+
+          kernel = pkgs.mkShell {
+            packages = kernelPackages;
           };
         }
       );

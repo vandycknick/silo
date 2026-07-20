@@ -21,29 +21,15 @@ env:
 
 jobs:
   build:
-    name: stable ${{ matrix.arch }}
-    runs-on: ubuntu-24.04
+    name: stable ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: arm64
-            cc: ccache aarch64-linux-gnu-gcc
-            cross_compile: aarch64-linux-gnu-
-            kernel_artifact: Image
-            file_pattern: ARM64
-          - arch: x86_64
-            cc: ccache gcc
-            cross_compile: ""
-            kernel_artifact: vmlinux
-            file_pattern: ELF 64-bit LSB executable, x86-64
-    env:
-      ARCH: ${{ matrix.arch }}
-      CROSS_COMPILE: ${{ matrix.cross_compile }}
-      KERNEL_ARTIFACT: ${{ matrix.kernel_artifact }}
-      KERNEL_CC: ${{ matrix.cc }}
-      KERNEL_FILE_PATTERN: ${{ matrix.file_pattern }}
+        runner:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
 
     steps:
       - name: Check out repository
@@ -51,33 +37,22 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install kernel toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            bc \
-            bison \
-            build-essential \
-            ccache \
-            flex \
-            gcc-aarch64-linux-gnu \
-            libelf-dev \
-            libssl-dev \
-            xz-utils
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
       - name: Resolve build metadata
         id: kernel
         run: |
-          version="$(make -s -C resources/kernels kernel-version TRACK="$TRACK" ARCH="$ARCH")"
-          export_dir="$(make -s -C resources/kernels kernel-export-dir TRACK="$TRACK" ARCH="$ARCH")"
-          revision="${GITHUB_SHA}"
+          arch="$(nix develop .#kernel --command make -s -C resources/kernels kernel-architecture)"
+          version="$(nix develop .#kernel --command make -s -C resources/kernels kernel-version)"
+          layout="$GITHUB_WORKSPACE/target/kernels/$TRACK/$arch"
           created="$(git show -s --format=%cI "$GITHUB_SHA")"
           source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
 
           {
+            printf 'arch=%s\n' "$arch"
             printf 'version=%s\n' "$version"
-            printf 'export_dir=%s\n' "$export_dir"
-            printf 'revision=%s\n' "$revision"
+            printf 'layout=%s\n' "$layout"
             printf 'created=%s\n' "$created"
           } >> "$GITHUB_OUTPUT"
           {
@@ -91,79 +66,70 @@ jobs:
           path: |
             ~/.cache/ccache
             ~/.cache/silo/kernels/downloads
-          key: kernel-${{ runner.os }}-${{ matrix.arch }}-${{ steps.kernel.outputs.version }}-${{ hashFiles('resources/kernels/configs/**') }}
+          key: kernel-${{ runner.os }}-${{ steps.kernel.outputs.arch }}-${{ steps.kernel.outputs.version }}-${{ hashFiles('resources/kernels/configs/**', 'resources/kernels/sources.mk') }}
           restore-keys: |
-            kernel-${{ runner.os }}-${{ matrix.arch }}-${{ steps.kernel.outputs.version }}-
+            kernel-${{ runner.os }}-${{ steps.kernel.outputs.arch }}-${{ steps.kernel.outputs.version }}-
 
       - name: Configure compiler cache
         run: |
-          ccache --max-size 2G
-          ccache --zero-stats
+          nix develop .#kernel --command ccache --max-size 2G
+          nix develop .#kernel --command ccache --zero-stats
 
-      - name: Build stable kernel
+      - name: Build OCI kernel artifact
         env:
           KBUILD_BUILD_HOST: github-actions
           KBUILD_BUILD_USER: silo
         run: |
-          make -C resources/kernels kernel \
-            TRACK="$TRACK" \
-            ARCH="$ARCH" \
-            CROSS_COMPILE="$CROSS_COMPILE" \
-            CC="$KERNEL_CC" \
-            BUILD_REVISION="${{ steps.kernel.outputs.revision }}"
-          ccache --show-stats
+          nix develop .#kernel --command make -C resources/kernels kernel \
+            CC="ccache gcc" \
+            BUILD_REVISION="$GITHUB_SHA" \
+            BUILD_CREATED="${{ steps.kernel.outputs.created }}"
+          nix develop .#kernel --command ccache --show-stats
 
-      - name: Verify kernel artifacts
-        working-directory: ${{ steps.kernel.outputs.export_dir }}
-        run: |
-          sha256sum --check SHA256SUMS
-          file "$KERNEL_ARTIFACT" | tee image-type.txt
-          grep --fixed-strings --quiet "$KERNEL_FILE_PATTERN" image-type.txt
-          rm image-type.txt
-
-      - name: Upload workflow artifact
+      - name: Upload OCI layout
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: kernel-${{ env.TRACK }}-${{ env.ARCH }}-${{ steps.kernel.outputs.version }}
-          path: ${{ steps.kernel.outputs.export_dir }}
+          name: kernel-oci-${{ env.TRACK }}-${{ steps.kernel.outputs.arch }}
+          path: ${{ steps.kernel.outputs.layout }}
           if-no-files-found: error
-          include-hidden-files: true
           retention-days: 14
 
-      - name: Install ORAS
-        # Keep OCI publication disabled until the build artifacts are validated.
-        if: ${{ false }}
-        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+  publish:
+    name: publish stable index
+    needs: build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      OCI_IMAGE: ghcr.io/${{ github.repository_owner }}/silo/kernel
 
-      # - name: Log in to GHCR
-      #   if: ${{ false }}
-      #   env:
-      #     GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      #   run: printf '%s' "$GHCR_TOKEN" | oras login "$REGISTRY" --username "${{ github.actor }}" --password-stdin
-      #
-      # - name: Publish OCI artifact
-      #   if: ${{ false }}
-      #   working-directory: ${{ steps.kernel.outputs.export_dir }}
-      #   env:
-      #     CREATED: ${{ steps.kernel.outputs.created }}
-      #     IMAGE: ghcr.io/${{ github.repository_owner }}/silo-kernel
-      #     REVISION: ${{ steps.kernel.outputs.revision }}
-      #     VERSION: ${{ steps.kernel.outputs.version }}
-      #   run: |
-      #     oras push \
-      #       --artifact-type application/vnd.silo.kernel.v1 \
-      #       --annotation "org.opencontainers.image.created=$CREATED" \
-      #       --annotation "org.opencontainers.image.description=Silo Linux kernel ($TRACK/$ARCH)" \
-      #       --annotation "org.opencontainers.image.revision=$REVISION" \
-      #       --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-      #       --annotation "org.opencontainers.image.version=$VERSION" \
-      #       --annotation "com.silo.kernel.architecture=$ARCH" \
-      #       --annotation "com.silo.kernel.track=$TRACK" \
-      #       "$IMAGE:$VERSION,$VERSION-$REVISION" \
-      #       Image:application/vnd.silo.boot.kernel.v1 \
-      #       .config:application/vnd.silo.kernel.config.v1 \
-      #       System.map:application/vnd.silo.kernel.system-map.v1 \
-      #       vmlinux:application/vnd.silo.kernel.debug.v1 \
-      #       vmlinux.xz:application/vnd.silo.kernel.debug.v1+xz \
-      #       build-info.txt:application/vnd.silo.kernel.build-info.v1 \
-      #       SHA256SUMS:text/plain
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Download arm64 OCI layout
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: kernel-oci-stable-arm64
+          path: ${{ github.workspace }}/target/kernels/${{ env.TRACK }}/arm64
+
+      - name: Download amd64 OCI layout
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: kernel-oci-stable-x86_64
+          path: ${{ github.workspace }}/target/kernels/${{ env.TRACK }}/x86_64
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | nix develop .#kernel --command oras login "$REGISTRY" --username "${{ github.actor }}" --password-stdin
+
+      - name: Publish multi-platform kernel
+        run: nix develop .#kernel --command make -C resources/kernels publish

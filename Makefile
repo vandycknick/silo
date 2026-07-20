@@ -6,6 +6,7 @@ DEFAULT_ARCH := arm64
 endif
 
 ARCH ?= $(DEFAULT_ARCH)
+TRACK ?= stable
 GUEST_TARGET_x86_64 := x86_64-unknown-linux-musl
 GUEST_TARGET_arm64 := aarch64-unknown-linux-musl
 DEFAULT_GUEST_TARGET := $(GUEST_TARGET_$(ARCH))
@@ -100,8 +101,7 @@ netd:
 
 .PHONY: kernel
 kernel:
-	@test -n "$(TRACK)" || (echo "TRACK is required" && exit 1)
-	@$(MAKE) -C resources/kernels kernel TRACK="$(TRACK)" ARCH="$(ARCH)"
+	@$(MAKE) -C resources/kernels kernel TRACK="$(TRACK)"
 
 .PHONY: initramfs
 initramfs:
