@@ -122,6 +122,8 @@ The output directory contains the `krun` binary plus `libkrun`, ready to copy to
 
 `patches/libkrun/0001-vsock-shutdown-released-unix-proxy.patch` fixes the delayed EOF reported in [libkrun issue #684](https://github.com/containers/libkrun/issues/684). It is based on libkrun `v1.19.4` and includes a focused regression test suitable for an upstream pull request.
 
+`patches/libkrun/0002-x86_64-fix-initrd-addressing.patch` prevents x86_64 initrds from crossing the 32-bit MMIO hole and supplies Linux with the upper 32 bits when an initrd is loaded above 4 GiB. It is based on libkrun `v1.19.4` and includes regression coverage for both placement and boot parameter encoding.
+
 The dependency build applies patches idempotently. A patch that no longer applies after a libkrun version update must be refreshed or removed if the fix has landed upstream.
 
 Set `KRUN_RUNTIME_DIR` to install the runtime library beside a `krun` helper in a directory other than `target/release`.
