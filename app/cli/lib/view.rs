@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use libvm::{
     MachineAgent, MachineBootReport, MachineData, MachineNetworkConfig, MachineProvisionReport,
-    MachineStatus,
+    MachineStatus, MachineUserConfig,
 };
 use serde::Serialize;
 use vm_spec::VmSpec;
@@ -55,6 +55,7 @@ pub struct MachineGuestSettingsView {
     pub initramfs_present: bool,
     pub agent: String,
     pub agent_path: Option<PathBuf>,
+    pub user: Option<MachineUserConfig>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,6 +166,7 @@ fn guest_settings(data: &MachineData) -> MachineGuestSettingsView {
         initramfs_present: initramfs_path_exists(&data.spec, &data.machine_dir),
         agent: agent.to_string(),
         agent_path,
+        user: data.guest.user.clone(),
     }
 }
 

@@ -182,6 +182,12 @@ impl Cmd {
                 initramfs: self.overrides.initramfs.clone(),
                 agent: None,
                 disks: self.overrides.disks.clone(),
+                user: self
+                    .overrides
+                    .user
+                    .as_ref()
+                    .map(crate::commands::create::resolve_user_arg)
+                    .transpose()?,
             },
         })
     }
@@ -300,6 +306,21 @@ mod tests {
         assert_eq!(run.profile.as_deref(), Some("agent"));
         assert!(run.tty);
         assert_eq!(run.command, vec!["opencode".to_string()]);
+    }
+
+    #[test]
+    fn run_bare_user_flag_does_not_consume_command() {
+        let cli = Cli::try_parse_from(["silo", "run", "dev", "--user", "--", "id"])
+            .expect("parse bare user flag and command");
+        let Command::Run(run) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert!(matches!(
+            run.overrides.user,
+            Some(crate::commands::create::UserArg::Auto)
+        ));
+        assert_eq!(run.command, ["id"]);
     }
 
     #[test]

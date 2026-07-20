@@ -317,6 +317,13 @@ async fn create_machine_config_with_name(
     if let Some(reason) = request.network_error {
         return Err(LibVmError::InvalidCreateRequest { name, reason });
     }
+    if let Some(user) = &request.guest.user {
+        user.validate()
+            .map_err(|reason| LibVmError::InvalidCreateRequest {
+                name: name.clone(),
+                reason,
+            })?;
+    }
 
     let (kernel, initramfs) = crate::runtime::boot_assets::canonicalize_boot_overrides(
         crate::runtime::boot_assets::BootAssetOverrides {

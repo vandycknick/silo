@@ -19,7 +19,8 @@ use crate::constants::{
     MOUNT_OPTION_READ_ONLY, MOUNT_OPTION_READ_WRITE, USERDATA_CONTENT_TYPE_CLOUD_CONFIG,
     USERDATA_CONTENT_TYPE_PLAIN_TEXT, USERDATA_CONTENT_TYPE_SHELL_SCRIPT, VIRTIOFS_FSTYPE,
 };
-use crate::host::{self, HostUser};
+use crate::host;
+use crate::machine::MachineUserConfig;
 use crate::network::VmmonNetworkAttachment;
 use crate::paths::LocalPaths;
 use crate::RuntimeNetworkingConfig;
@@ -31,10 +32,11 @@ pub(crate) struct GuestAgentConfigInput<'a> {
     pub(crate) network: &'a VmmonNetworkAttachment,
     pub(crate) networking: &'a RuntimeNetworkingConfig,
     pub(crate) resize_rootfs: bool,
+    pub(crate) user: Option<&'a MachineUserConfig>,
 }
 
 struct GuestAgentHostContext {
-    user: HostUser,
+    user: Option<MachineUserConfig>,
     ssh_public_key_openssh: String,
     certificate_authority_pem: Option<String>,
     timezone: String,
@@ -57,6 +59,7 @@ pub(crate) fn build_config(input: GuestAgentConfigInput<'_>) -> eyre::Result<Age
         input.paths,
         input.networking,
         input.network.requires_certificate_authority(),
+        input.user,
     )?;
     build_config_with_host_context(
         input.machine_name,
@@ -71,8 +74,8 @@ fn load_host_context(
     paths: &LocalPaths,
     networking: &RuntimeNetworkingConfig,
     requires_certificate_authority: bool,
+    user: Option<&MachineUserConfig>,
 ) -> eyre::Result<GuestAgentHostContext> {
-    let user = host::current_host_user().context("resolve current host user")?;
     let ssh_keypair =
         load_or_generate_guest_ssh_keypair(paths).context("load guest SSH keypair")?;
     let certificate_authority_pem = requires_certificate_authority
@@ -80,7 +83,7 @@ fn load_host_context(
         .transpose()?;
 
     Ok(GuestAgentHostContext {
-        user,
+        user: user.cloned(),
         ssh_public_key_openssh: ssh_keypair.public_key_openssh,
         certificate_authority_pem,
         timezone: host::current_timezone(),
@@ -169,15 +172,20 @@ fn build_provision_config(
         resize_rootfs: ResizeRootfsConfig {
             enabled: resize_rootfs,
         },
-        users: vec![UserConfig {
-            name: host_context.user.name.clone(),
-            uid: host_context.user.uid,
-            gecos: host_context.user.gecos.clone(),
-            home: format!("/home/{}", host_context.user.name),
-            shell: GUEST_USER_SHELL.to_string(),
-            sudo: GUEST_USER_SUDO_RULE.to_string(),
-            lock_passwd: true,
-        }],
+        users: host_context
+            .user
+            .iter()
+            .map(|user| UserConfig {
+                name: user.name.clone(),
+                uid: user.uid,
+                gid: user.gid,
+                gecos: user.name.clone(),
+                home: user.home.clone(),
+                shell: GUEST_USER_SHELL.to_string(),
+                sudo: GUEST_USER_SUDO_RULE.to_string(),
+                lock_passwd: true,
+            })
+            .collect(),
         certificate_authority,
         network: build_provision_network_config(network)?,
         rosetta: AgentRosettaConfig {
@@ -201,12 +209,14 @@ fn build_ssh_config(host_context: &GuestAgentHostContext) -> AgentSshConfig {
         allow_without_auth: false,
     }];
 
-    if host_context.user.name != "root" {
-        authorized_users.push(AgentSshAuthorizedUser {
-            name: host_context.user.name.clone(),
-            authorized_keys: vec![public_key],
-            allow_without_auth: false,
-        });
+    if let Some(user) = &host_context.user {
+        if user.name != "root" {
+            authorized_users.push(AgentSshAuthorizedUser {
+                name: user.name.clone(),
+                authorized_keys: vec![public_key],
+                allow_without_auth: false,
+            });
+        }
     }
 
     AgentSshConfig { authorized_users }
@@ -369,7 +379,8 @@ mod tests {
         build_provision_network_config, guest_ssh_key_paths, load_or_generate_guest_ssh_keypair,
         GuestAgentHostContext,
     };
-    use crate::host::{self, HostUser};
+    use crate::host;
+    use crate::machine::MachineUserConfig;
     use crate::network::VmmonNetworkAttachment;
     use crate::paths::LocalPaths;
 
@@ -433,11 +444,7 @@ mod tests {
 
     fn host_context() -> GuestAgentHostContext {
         GuestAgentHostContext {
-            user: HostUser {
-                name: "silo".to_string(),
-                uid: 1000,
-                gecos: "Silo User".to_string(),
-            },
+            user: Some(MachineUserConfig::new("silo", 1000, 2000, "/home/silo")),
             ssh_public_key_openssh: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISilo".to_string(),
             certificate_authority_pem: Some(
                 "-----BEGIN CERTIFICATE-----\nMIISILO\n-----END CERTIFICATE-----\n".to_string(),
@@ -582,6 +589,25 @@ mod tests {
     }
 
     #[test]
+    fn guest_agent_omits_unconfigured_user_and_authorizes_root_only() {
+        let mut context = host_context();
+        context.user = None;
+
+        let config = build_config_with_host_context(
+            "demo",
+            &sample_spec(Vec::new()),
+            &VmmonNetworkAttachment::None,
+            false,
+            &context,
+        )
+        .expect("build agent config");
+
+        assert!(config.provision.users.is_empty());
+        assert_eq!(config.ssh.authorized_users.len(), 1);
+        assert_eq!(config.ssh.authorized_users[0].name, "root");
+    }
+
+    #[test]
     fn provision_config_rejects_cloud_config_userdata() {
         let mut spec = sample_spec(Vec::new());
         boot_mut(&mut spec).userdata =
@@ -676,6 +702,8 @@ mod tests {
         assert_eq!(provision.timezone.as_deref(), Some("Europe/Amsterdam"));
         assert_eq!(provision.locale.as_deref(), Some("nl_NL.UTF-8"));
         assert_eq!(provision.users[0].name, "silo");
+        assert_eq!(provision.users[0].uid, 1000);
+        assert_eq!(provision.users[0].gid, 2000);
         assert!(provision.resize_rootfs.enabled);
         assert_eq!(provision.mounts[0].tag, "workspace");
         assert_eq!(provision.mounts[0].path, "/workspace");

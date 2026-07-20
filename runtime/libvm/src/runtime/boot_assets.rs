@@ -208,6 +208,7 @@ mod tests {
             agent: MachineAgent::Custom {
                 path: agent.clone(),
             },
+            user: None,
         };
 
         let guest = canonicalize_guest_config(guest).expect("canonicalize guest");

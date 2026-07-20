@@ -48,6 +48,7 @@ impl AgentConfig {
             "ssh authorized user name",
         )?;
         for user in &self.ssh.authorized_users {
+            validate_login_name(&user.name, "ssh authorized user name")?;
             if user.authorized_keys.iter().any(|key| key.trim().is_empty()) {
                 return Err(AgentConfigError::new(
                     "ssh authorized key must not be empty",
@@ -63,8 +64,23 @@ impl AgentConfig {
             "provision user name",
         )?;
         for user in &self.provision.users {
+            validate_login_name(&user.name, "provision user name")?;
+            if user.uid == u32::MAX {
+                return Err(AgentConfigError::new(
+                    "provision user uid must not be the reserved maximum value",
+                ));
+            }
+            if user.gid == u32::MAX {
+                return Err(AgentConfigError::new(
+                    "provision user gid must not be the reserved maximum value",
+                ));
+            }
+            validate_account_field(&user.gecos, "provision user gecos", true)?;
             validate_absolute_path(&user.home, "provision user home")?;
             validate_absolute_path(&user.shell, "provision user shell")?;
+            validate_account_field(&user.home, "provision user home", true)?;
+            validate_account_field(&user.shell, "provision user shell", true)?;
+            validate_account_field(&user.sudo, "provision user sudo", false)?;
         }
         if let Some(authority) = &self.provision.certificate_authority {
             validate_absolute_path(&authority.path, "certificate authority path")?;
@@ -116,6 +132,42 @@ impl std::error::Error for AgentConfigError {}
 fn validate_nonempty(value: &str, field: &str) -> Result<(), AgentConfigError> {
     if value.trim().is_empty() {
         return Err(AgentConfigError::new(format!("{field} must not be empty")));
+    }
+    Ok(())
+}
+
+fn validate_login_name(value: &str, field: &str) -> Result<(), AgentConfigError> {
+    validate_nonempty(value, field)?;
+    let bytes = value.as_bytes();
+    if bytes.len() > 256
+        || value == "."
+        || value == ".."
+        || bytes.first() == Some(&b'-')
+        || bytes.iter().all(u8::is_ascii_digit)
+    {
+        return Err(AgentConfigError::new(format!("{field} is invalid")));
+    }
+
+    let body = value.strip_suffix('$').unwrap_or(value);
+    if body.is_empty()
+        || !body
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(AgentConfigError::new(format!("{field} is invalid")));
+    }
+    Ok(())
+}
+
+fn validate_account_field(
+    value: &str,
+    field: &str,
+    reject_colon: bool,
+) -> Result<(), AgentConfigError> {
+    if value.contains(['\0', '\n', '\r']) || (reject_colon && value.contains(':')) {
+        return Err(AgentConfigError::new(format!(
+            "{field} contains a character that cannot be serialized safely"
+        )));
     }
     Ok(())
 }
@@ -293,6 +345,7 @@ pub struct ResizeRootfsConfig {
 pub struct UserConfig {
     pub name: String,
     pub uid: u32,
+    pub gid: u32,
     pub gecos: String,
     pub home: String,
     pub shell: String,
@@ -537,6 +590,7 @@ provision:
                 users: vec![UserConfig {
                     name: "silo".to_string(),
                     uid: u32::MAX,
+                    gid: 2000,
                     gecos: "Silo User".to_string(),
                     home: "/home/silo".to_string(),
                     shell: "/bin/bash".to_string(),
@@ -608,6 +662,63 @@ provision:
         let error = config.validate().expect_err("invalid forward config");
 
         assert!(error.to_string().contains("forward.port"));
+    }
+
+    #[test]
+    fn validation_accepts_supported_login_names() {
+        for name in ["silo", "silo-user", "Silo_2", "machine$"] {
+            let mut config = config_with_user(name);
+            config.ssh.authorized_users.push(AgentSshAuthorizedUser {
+                name: name.to_string(),
+                authorized_keys: vec!["ssh-ed25519 AAAAC3NzaSilo".to_string()],
+                allow_without_auth: false,
+            });
+            config.validate().expect("login name should be valid");
+        }
+    }
+
+    #[test]
+    fn validation_rejects_invalid_login_names() {
+        for name in [
+            "",
+            "-silo",
+            "1234",
+            ".",
+            "..",
+            "silo.user",
+            "silo:name",
+            "silo\nroot",
+        ] {
+            let error = config_with_user(name)
+                .validate()
+                .expect_err("login name must fail")
+                .to_string();
+            assert!(error.contains("provision user name"));
+        }
+    }
+
+    #[test]
+    fn validation_rejects_account_database_and_sudoers_injection() {
+        for update in [
+            |user: &mut UserConfig| user.gecos = "Silo:/root:/bin/sh".to_string(),
+            |user: &mut UserConfig| user.home = "/home/silo\nroot".to_string(),
+            |user: &mut UserConfig| user.shell = "/bin/sh:extra".to_string(),
+            |user: &mut UserConfig| user.sudo = "ALL=(ALL) ALL\nroot ALL=(ALL) ALL".to_string(),
+        ] {
+            let mut config = config_with_user("silo");
+            update(&mut config.provision.users[0]);
+            config.validate().expect_err("injected field must fail");
+        }
+    }
+
+    #[test]
+    fn validation_rejects_reserved_user_gid() {
+        let mut config = config_with_user("silo");
+        config.provision.users[0].gid = u32::MAX;
+
+        let error = config.validate().expect_err("reserved gid must fail");
+
+        assert!(error.to_string().contains("gid"));
     }
 
     #[test]
@@ -710,6 +821,25 @@ provision:
                     search: Vec::new(),
                 },
             }],
+        }
+    }
+
+    fn config_with_user(name: &str) -> AgentConfig {
+        AgentConfig {
+            provision: ProvisionConfig {
+                users: vec![UserConfig {
+                    name: name.to_string(),
+                    uid: 2000,
+                    gid: 2000,
+                    gecos: "Silo User".to_string(),
+                    home: "/home/silo".to_string(),
+                    shell: "/bin/bash".to_string(),
+                    sudo: "ALL=(ALL) NOPASSWD:ALL".to_string(),
+                    lock_passwd: true,
+                }],
+                ..ProvisionConfig::default()
+            },
+            ..AgentConfig::default()
         }
     }
 

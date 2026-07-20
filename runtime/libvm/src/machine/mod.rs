@@ -16,7 +16,7 @@ mod streams;
 mod update;
 
 pub use builder::MachineBuilder;
-pub use guest::{GuestBuilder, MachineAgent, MachineGuestConfig};
+pub use guest::{GuestBuilder, MachineAgent, MachineGuestConfig, MachineUserConfig};
 pub use handle::Machine;
 pub use inspect::{
     MachineBootMode, MachineBootReport, MachineData, MachineProvisionFailurePolicy,
@@ -52,7 +52,7 @@ pub use streams::{
     MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState, MachineStaleReason,
     MachineSystemInfo, MachineVmSnapshot, MachineVmState,
 };
-pub use update::{MachineUpdate, NetworkPolicyUpdate};
+pub use update::{MachineUpdate, MachineUserUpdate, NetworkPolicyUpdate};
 
 pub(crate) use name_generator::generate_machine_name;
 pub(crate) use reference::{validate_machine_name, MachineRefKind};

@@ -53,6 +53,15 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
     if !view.image.is_empty() {
         rows.push(("Image".to_string(), view.image.clone()));
     }
+    rows.push((
+        "User".to_string(),
+        view.guest
+            .settings
+            .user
+            .as_ref()
+            .map(|user| format!("{} ({}:{}, {})", user.name, user.uid, user.gid, user.home))
+            .unwrap_or_else(|| "none".to_string()),
+    ));
     rows.push(("Created".to_string(), ui::format_unix(view.created_at)));
     if let Some(started_at) = view.started_at {
         rows.push(("Started".to_string(), ui::format_unix(started_at)));

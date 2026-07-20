@@ -61,9 +61,9 @@ pub use crate::machine::{
     MachineProvisionStepStatus, MachineProvisioningReport, MachineReadiness,
     MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState, MachineRef,
     MachineStaleReason, MachineStartOptions, MachineStatus, MachineStopOptions, MachineSystemInfo,
-    MachineUpdate, MachineVmSnapshot, MachineVmState, MachineWaitOptions, Memory, NetworkLaunch,
-    NetworkLaunchSecret, NetworkPolicyUpdate, OAuthRefreshHook, StdinMode,
-    DEFAULT_MACHINE_WAIT_TIMEOUT,
+    MachineUpdate, MachineUserConfig, MachineUserUpdate, MachineVmSnapshot, MachineVmState,
+    MachineWaitOptions, Memory, NetworkLaunch, NetworkLaunchSecret, NetworkPolicyUpdate,
+    OAuthRefreshHook, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
     MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition, NetworkDriver,

@@ -1,7 +1,8 @@
 use vm_spec::VmSpec;
 
 use crate::machine::{
-    validate_machine_name, Machine, MachineData, MachineUpdate, NetworkPolicyUpdate,
+    validate_machine_name, Machine, MachineData, MachineUpdate, MachineUserUpdate,
+    NetworkPolicyUpdate,
 };
 use crate::network::MachineNetworkBuilder;
 use crate::runtime::core::{empty_hardware, validate_root_disk_growth, write_machine_config};
@@ -87,6 +88,13 @@ impl Machine {
             .clone()
             .map(crate::runtime::boot_assets::canonicalize_guest_config)
             .transpose()?;
+        if let Some(MachineUserUpdate::Set(user)) = &update.user {
+            user.validate()
+                .map_err(|reason| LibVmError::InvalidMachineUpdate {
+                    reference: self.id(),
+                    reason,
+                })?;
+        }
         if let Some(network) = &replacement_network {
             runtime.validate_machine_network_config(network).await?;
         }
@@ -187,8 +195,17 @@ impl Machine {
                 .validate_machine_network_config(&config.network)
                 .await?;
         }
-        if let Some(guest) = replacement_guest {
+        if let Some(mut guest) = replacement_guest {
+            if update.user.is_none() {
+                guest.user = config.guest.user.clone();
+            }
             config.guest = guest;
+        }
+        if let Some(user) = update.user {
+            config.guest.user = match user {
+                MachineUserUpdate::Set(user) => Some(user),
+                MachineUserUpdate::Clear => None,
+            };
         }
 
         config.modified_at = now_unix();

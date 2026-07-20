@@ -893,6 +893,7 @@ impl Runtime {
                     network,
                     networking: &self.networking,
                     resize_rootfs,
+                    user: config.guest.user.as_ref(),
                 })?;
                 agent_config.validate().context("validate agent config")?;
                 let serialized =

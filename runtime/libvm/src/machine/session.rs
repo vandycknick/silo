@@ -9,8 +9,7 @@ use russh::{Channel, ChannelMsg, ChannelWriteHalf, Sig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::host::current_host_user;
-use crate::machine::Machine;
+use crate::machine::{Machine, MachineRef};
 use crate::LibVmError;
 
 const DEFAULT_TERM: &str = "xterm-256color";
@@ -31,7 +30,7 @@ pub struct ExecOptions {
     pub args: Vec<String>,
     /// Guest working directory for the command.
     pub cwd: Option<String>,
-    /// Guest user for the command. Defaults to the host user provisioned by Silo.
+    /// Guest user for the command. Defaults to the configured guest user, then root.
     pub user: Option<String>,
     /// Environment variables set for the command.
     pub env: Vec<(String, String)>,
@@ -800,13 +799,14 @@ impl Machine {
         let agent_socket = resolve_agent_socket(reference, forward_agent)?;
         let user = match user {
             Some(user) => user.to_string(),
-            None => {
-                current_host_user()
-                    .map_err(|error| {
-                        guest_session_error(reference, format!("resolve host user: {error}"))
-                    })?
-                    .name
-            }
+            None => self
+                .runtime()
+                .resolve_machine_config(&MachineRef::id(self.machine_id()))
+                .await?
+                .guest
+                .user
+                .map(|user| user.name)
+                .unwrap_or_else(|| "root".to_string()),
         };
         let keypair = self.runtime().load_guest_ssh_keypair().map_err(|error| {
             guest_session_error(reference, format!("load guest SSH keypair: {error}"))

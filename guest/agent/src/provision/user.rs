@@ -98,6 +98,7 @@ fn adopt_existing_user(
     entry: &UserEntry,
 ) -> eyre::Result<()> {
     validate_adoptable_user(entry)?;
+    validate_primary_gid(user, entry)?;
     rename_private_group(context, user, entry)?;
 
     let old_name = entry.name.clone();
@@ -107,7 +108,7 @@ fn adopt_existing_user(
         adoption_usermod_args(user, entry),
     )?;
 
-    reconcile_home(context, user, entry.gid)?;
+    reconcile_home(context, user, user.gid)?;
     reconcile_password_lock(context, user)?;
 
     tracing::info!(
@@ -212,6 +213,7 @@ fn reconcile_existing_user(
             user.uid
         ));
     }
+    validate_primary_gid(user, entry)?;
 
     let mut args = Vec::new();
     if entry.gecos != user.gecos {
@@ -232,10 +234,22 @@ fn reconcile_existing_user(
         run_command(context.process_supervisor(), "usermod", args)?;
     }
 
-    reconcile_home(context, user, entry.gid)?;
+    reconcile_home(context, user, user.gid)?;
     reconcile_password_lock(context, user)?;
 
     tracing::info!(user = %user.name, uid = user.uid, "reconciled user");
+    Ok(())
+}
+
+fn validate_primary_gid(user: &UserConfig, entry: &UserEntry) -> eyre::Result<()> {
+    if entry.gid != user.gid {
+        return Err(eyre!(
+            "existing user {} has primary gid {}, expected {}; refusing to change gid",
+            entry.name,
+            entry.gid,
+            user.gid
+        ));
+    }
     Ok(())
 }
 
@@ -548,6 +562,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_existing_account_with_different_primary_gid() {
+        let mut user = nickvd_config();
+        user.gid = 2000;
+
+        let error = super::validate_primary_gid(&user, &ubuntu_entry())
+            .expect_err("primary gid mismatch must fail");
+
+        assert!(error.to_string().contains("expected 2000"));
+    }
+
+    #[test]
     fn refuses_protected_accounts_for_adoption() {
         let cases = [
             super::UserEntry {
@@ -632,6 +657,7 @@ mod tests {
             name: "nickvd".to_string(),
             uid: 1000,
             gecos: "Nick Van Driessche".to_string(),
+            gid: 1000,
             home: "/home/nickvd".to_string(),
             shell: "/bin/bash".to_string(),
             sudo: "ALL=(ALL) NOPASSWD:ALL".to_string(),

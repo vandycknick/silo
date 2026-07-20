@@ -1,4 +1,4 @@
-use crate::machine::{GuestBuilder, MachineGuestConfig, Memory};
+use crate::machine::{GuestBuilder, MachineGuestConfig, MachineUserConfig, Memory};
 use crate::network::{MachineNetworkBuilder, MachineNetworkConfig};
 
 use silo_policy::NetworkPolicy;
@@ -7,6 +7,13 @@ use silo_policy::NetworkPolicy;
 #[non_exhaustive]
 pub enum NetworkPolicyUpdate {
     Set(NetworkPolicy),
+    Clear,
+}
+
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum MachineUserUpdate {
+    Set(MachineUserConfig),
     Clear,
 }
 
@@ -46,6 +53,8 @@ pub struct MachineUpdate {
     pub network_policy: Option<NetworkPolicyUpdate>,
     /// Replacement durable guest settings.
     pub guest: Option<MachineGuestConfig>,
+    /// Partial update to the managed guest user.
+    pub user: Option<MachineUserUpdate>,
 }
 
 impl MachineUpdate {
@@ -96,6 +105,18 @@ impl MachineUpdate {
         self
     }
 
+    /// Sets the concrete account provisioned by the managed guest agent.
+    pub fn user(mut self, user: MachineUserConfig) -> Self {
+        self.user = Some(MachineUserUpdate::Set(user));
+        self
+    }
+
+    /// Disables managed guest-user provisioning.
+    pub fn clear_user(mut self) -> Self {
+        self.user = Some(MachineUserUpdate::Clear);
+        self
+    }
+
     /// Configures the durable machine network attachment.
     pub fn network(
         mut self,
@@ -132,5 +153,6 @@ impl MachineUpdate {
             && self.network_error.is_none()
             && self.network_policy.is_none()
             && self.guest.is_none()
+            && self.user.is_none()
     }
 }

@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use eyre::Context as _;
-use libvm::{ImageProgressSender, MachineBuilder, Memory};
+use libvm::{ImageProgressSender, MachineBuilder, MachineUserConfig, Memory};
+use nix::unistd::{Uid, User};
 use utils::HumanSize;
 use vm_spec::Mount;
 
@@ -99,6 +100,23 @@ pub(crate) struct VmOverrideArgs {
     /// Add or override a label. Format: KEY=VALUE.
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
     pub labels: Vec<(String, String)>,
+    /// Experimental: provision a guest user. Omit the value for the current host user.
+    #[arg(
+        long,
+        value_name = "NAME:UID:GID:HOME",
+        num_args = 0..=1,
+        default_missing_value = "auto",
+        require_equals = true,
+        value_parser = parse_user_arg,
+        help_heading = "Experimental"
+    )]
+    pub user: Option<UserArg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UserArg {
+    Auto,
+    Explicit(MachineUserConfig),
 }
 
 impl VmOverrideArgs {
@@ -242,6 +260,12 @@ impl Cmd {
                     self.agent.clone().map(Some)
                 },
                 disks: self.overrides.disks.clone(),
+                user: self
+                    .overrides
+                    .user
+                    .as_ref()
+                    .map(resolve_user_arg)
+                    .transpose()?,
             },
         })
     }
@@ -266,6 +290,7 @@ pub(crate) fn apply_resolved_machine_options(
         initramfs,
         agent,
         disks,
+        user,
     } = options;
 
     builder = builder
@@ -289,8 +314,17 @@ pub(crate) fn apply_resolved_machine_options(
     if let Some(initramfs) = initramfs {
         builder = builder.initramfs(initramfs);
     }
-    if let Some(agent) = agent {
-        builder = builder.guest(|guest| guest.agent(agent));
+    if agent.is_some() || user.is_some() {
+        builder = builder.guest(|guest| {
+            let guest = match agent {
+                Some(agent) => guest.agent(agent),
+                None => guest,
+            };
+            match user {
+                Some(user) => guest.user(user),
+                None => guest,
+            }
+        });
     }
     if let Some(bytes) = disk_size_bytes {
         builder = builder.root_disk_size(bytes);
@@ -322,6 +356,58 @@ pub(crate) struct ResolvedMachineOptions {
     pub(crate) initramfs: Option<PathBuf>,
     pub(crate) agent: Option<Option<PathBuf>>,
     pub(crate) disks: Vec<PathBuf>,
+    pub(crate) user: Option<MachineUserConfig>,
+}
+
+pub(crate) fn parse_user_arg(value: &str) -> Result<UserArg, String> {
+    if value == "auto" {
+        return Ok(UserArg::Auto);
+    }
+
+    parse_explicit_user(value).map(UserArg::Explicit)
+}
+
+pub(crate) fn resolve_user_arg(value: &UserArg) -> eyre::Result<MachineUserConfig> {
+    match value {
+        UserArg::Auto => current_host_user(),
+        UserArg::Explicit(user) => Ok(user.clone()),
+    }
+}
+
+pub(crate) fn current_host_user() -> eyre::Result<MachineUserConfig> {
+    let uid = Uid::effective();
+    let user = User::from_uid(uid)?
+        .ok_or_else(|| eyre::eyre!("unable to resolve effective host user {uid}"))?;
+    if user.name.is_empty() {
+        eyre::bail!("effective host user has an empty account name");
+    }
+
+    let user = MachineUserConfig::new(
+        &user.name,
+        user.uid.as_raw(),
+        user.uid.as_raw(),
+        format!("/home/{}", user.name),
+    );
+    user.validate().map_err(eyre::Report::msg)?;
+    Ok(user)
+}
+
+pub(crate) fn parse_explicit_user(value: &str) -> Result<MachineUserConfig, String> {
+    let fields = value.split(':').collect::<Vec<_>>();
+    if fields.len() != 4 {
+        return Err("expected NAME:UID:GID:HOME".to_string());
+    }
+    let name = fields[0];
+    let uid = fields[1]
+        .parse::<u32>()
+        .map_err(|error| format!("invalid user uid {:?}: {error}", fields[1]))?;
+    let gid = fields[2]
+        .parse::<u32>()
+        .map_err(|error| format!("invalid user gid {:?}: {error}", fields[2]))?;
+    let home = fields[3];
+    let user = MachineUserConfig::new(name, uid, gid, home);
+    user.validate()?;
+    Ok(user)
 }
 
 pub(crate) fn profile_mount_to_mount(mount: &ProfileMount) -> eyre::Result<Mount> {
@@ -341,6 +427,7 @@ mod tests {
     use clap::Parser;
 
     use crate::app::Cli;
+    use crate::commands::create::UserArg;
     use crate::commands::Command;
 
     #[test]
@@ -366,6 +453,49 @@ mod tests {
         assert_eq!(create.profile, None);
         assert!(create.start);
         assert!(create.default);
+    }
+
+    #[test]
+    fn create_command_parses_experimental_user_forms() {
+        let cli = Cli::try_parse_from(["silo", "create", "dev", "--user", "rust-dev"])
+            .expect("parse bare user flag");
+        let Command::Create(create) = cli.command else {
+            panic!("expected create command");
+        };
+        assert_eq!(create.profile.as_deref(), Some("rust-dev"));
+        assert_eq!(create.overrides.user, Some(UserArg::Auto));
+
+        let cli = Cli::try_parse_from([
+            "silo",
+            "create",
+            "dev",
+            "--user=alice:1000:2000:/home/alice",
+        ])
+        .expect("parse explicit user");
+        let Command::Create(create) = cli.command else {
+            panic!("expected create command");
+        };
+        let Some(UserArg::Explicit(user)) = create.overrides.user else {
+            panic!("expected explicit user");
+        };
+        assert_eq!(user.name, "alice");
+        assert_eq!(user.uid, 1000);
+        assert_eq!(user.gid, 2000);
+        assert_eq!(user.home, "/home/alice");
+    }
+
+    #[test]
+    fn create_command_rejects_invalid_experimental_users() {
+        for user in [
+            "alice:1000:1000",
+            "alice:nope:1000:/home/alice",
+            "alice:1000:1000:relative",
+            "root:0:0:/root",
+        ] {
+            assert!(
+                Cli::try_parse_from(["silo", "create", "dev", &format!("--user={user}")]).is_err()
+            );
+        }
     }
 
     #[test]

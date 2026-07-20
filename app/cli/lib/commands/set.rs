@@ -26,6 +26,10 @@ const SETTINGS: &[(&str, &str)] = &[
         "agent=default|disabled|PATH",
         "Set managed guest agent selection",
     ),
+    (
+        "user=none|auto|NAME:UID:GID:HOME",
+        "Experimental: configure guest-user provisioning",
+    ),
 ];
 
 const EXAMPLES: &[&str] = &[
@@ -144,6 +148,16 @@ impl ParsedSet {
                         path => update.guest(|guest| guest.agent(Some(PathBuf::from(path)))),
                     };
                 }
+                "user" => {
+                    update = match value {
+                        "none" => update.clear_user(),
+                        "auto" => update.user(crate::commands::create::current_host_user()?),
+                        value => update.user(
+                            crate::commands::create::parse_explicit_user(value)
+                                .map_err(eyre::Report::msg)?,
+                        ),
+                    };
+                }
                 other => eyre::bail!("unsupported setting {other:?}"),
             }
         }
@@ -162,8 +176,9 @@ fn normalize_key(key: &str) -> eyre::Result<&'static str> {
         "nested-virtualization" | "nested_virtualization" => Ok("nested-virtualization"),
         "rosetta" => Ok("rosetta"),
         "agent" => Ok("agent"),
+        "user" => Ok("user"),
         _ => Err(eyre::eyre!(
-            "unknown setting {key:?}; allowed settings are name, cpus, memory, disk, network, nested-virtualization, rosetta, agent"
+            "unknown setting {key:?}; allowed settings are name, cpus, memory, disk, network, nested-virtualization, rosetta, agent, user"
         )),
     }
 }
@@ -209,7 +224,7 @@ fn parse_bool(value: &str) -> eyre::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use libvm::Memory;
+    use libvm::{MachineUserUpdate, Memory};
 
     use super::ParsedSet;
 
@@ -244,5 +259,23 @@ mod tests {
     #[test]
     fn rejects_duplicate_settings() {
         assert!(ParsedSet::parse(&["cpus=2".to_string(), "cpu=4".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parses_explicit_and_disabled_user_settings() {
+        let parsed = ParsedSet::parse(&[
+            "dev".to_string(),
+            "user=alice:1000:2000:/home/alice".to_string(),
+        ])
+        .expect("parse explicit user");
+        let Some(MachineUserUpdate::Set(user)) = parsed.update.user else {
+            panic!("expected user update");
+        };
+        assert_eq!(user.name, "alice");
+        assert_eq!(user.gid, 2000);
+
+        let parsed = ParsedSet::parse(&["dev".to_string(), "user=none".to_string()])
+            .expect("parse disabled user");
+        assert!(matches!(parsed.update.user, Some(MachineUserUpdate::Clear)));
     }
 }
