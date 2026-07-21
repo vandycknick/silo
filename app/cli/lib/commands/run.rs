@@ -180,6 +180,7 @@ impl Cmd {
                 rosetta: self.overrides.rosetta,
                 kernel: self.overrides.kernel.clone(),
                 initramfs: self.overrides.initramfs.clone(),
+                kernel_args: self.overrides.kernel_args.clone(),
                 agent: None,
                 disks: self.overrides.disks.clone(),
                 user: self
@@ -232,6 +233,10 @@ mod tests {
             "./vmlinuz",
             "--initrd",
             "./initrd.img",
+            "--kernel-arg",
+            "systemd.firstboot=off",
+            "--kernel-arg",
+            "quiet",
             "--disk-size",
             "40gb",
             "--nested-virtualization",
@@ -265,6 +270,10 @@ mod tests {
         assert_eq!(
             run.overrides.initramfs.as_deref(),
             Some("./initrd.img".as_ref())
+        );
+        assert_eq!(
+            run.overrides.kernel_args,
+            ["systemd.firstboot=off", "quiet"]
         );
         assert_eq!(run.overrides.disks.len(), 1);
         assert_eq!(run.overrides.mounts.len(), 1);
@@ -333,6 +342,10 @@ mod tests {
             "./vmlinuz",
             "--initrd",
             "./initrd.img",
+            "--kernel-arg",
+            "systemd.firstboot=off",
+            "--kernel-arg",
+            "quiet",
             "--",
             "true",
         ])
@@ -346,6 +359,11 @@ mod tests {
             run.overrides.initramfs.as_deref(),
             Some("./initrd.img".as_ref())
         );
+        assert_eq!(
+            run.overrides.kernel_args,
+            ["systemd.firstboot=off", "quiet"]
+        );
+        assert_eq!(run.command, ["true"]);
     }
 
     #[test]

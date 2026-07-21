@@ -37,6 +37,7 @@ struct MachineCreateRequest {
     memory: Option<Memory>,
     kernel: Option<PathBuf>,
     initramfs: Option<PathBuf>,
+    kernel_args: Vec<String>,
     disk_size_bytes: Option<u64>,
     nested_virtualization: bool,
     rosetta: bool,
@@ -119,6 +120,7 @@ impl MachineBuilder {
                 memory: None,
                 kernel: None,
                 initramfs: None,
+                kernel_args: Vec::new(),
                 disk_size_bytes: None,
                 nested_virtualization: false,
                 rosetta: false,
@@ -204,6 +206,12 @@ impl MachineBuilder {
     /// Sets an initramfs path override.
     pub fn initramfs(mut self, initramfs: impl Into<PathBuf>) -> Self {
         self.request.initramfs = Some(initramfs.into());
+        self
+    }
+
+    /// Replaces the extra Linux kernel command-line arguments.
+    pub fn kernel_args(mut self, args: Vec<String>) -> Self {
+        self.request.kernel_args = args;
         self
     }
 
@@ -351,6 +359,7 @@ async fn create_machine_config_with_name(
         .unwrap_or(DEFAULT_IMAGE_MEMORY_MIB);
 
     let mounts = assign_mount_tags(request.mounts);
+    let kernel_cmdline = build_kernel_cmdline(request.kernel_args);
     let disks = std::iter::once(Disk {
         path: root_disk_relative_path(),
         read_only: false,
@@ -368,7 +377,7 @@ async fn create_machine_config_with_name(
         boot: Some(Boot {
             kernel: Some(Kernel {
                 path: kernel,
-                cmdline: vec![ROOT_DISK_KERNEL_ARG.to_string()],
+                cmdline: kernel_cmdline,
                 initramfs,
             }),
             userdata,
@@ -482,6 +491,12 @@ fn assign_mount_tags(mounts: Vec<Mount>) -> Vec<Mount> {
             mount
         })
         .collect()
+}
+
+fn build_kernel_cmdline(kernel_args: Vec<String>) -> Vec<String> {
+    let mut cmdline = vec![ROOT_DISK_KERNEL_ARG.to_string()];
+    cmdline.extend(kernel_args);
+    cmdline
 }
 
 fn canonicalize_existing_paths(paths: &[PathBuf], kind: &str) -> Result<Vec<PathBuf>, LibVmError> {
@@ -618,8 +633,8 @@ mod tests {
     use vm_spec::{Boot, Guest, GuestOs, Hardware, Kernel, Mount, VmSpec};
 
     use crate::machine::builder::{
-        assign_mount_tags, create_machine_config, create_machine_guard, MachineCreateGuard,
-        MachineCreatePlan, MachineCreateRequest, ROOT_DISK_KERNEL_ARG,
+        assign_mount_tags, build_kernel_cmdline, create_machine_config, create_machine_guard,
+        MachineCreateGuard, MachineCreatePlan, MachineCreateRequest, ROOT_DISK_KERNEL_ARG,
     };
     use crate::paths::{root_disk_relative_path, LocalPaths};
     use crate::runtime::Runtime;
@@ -719,6 +734,7 @@ mod tests {
             memory: None,
             kernel: Some(kernel),
             initramfs: Some(initramfs),
+            kernel_args: Vec::new(),
             disk_size_bytes: None,
             nested_virtualization: false,
             rosetta: false,
@@ -798,6 +814,23 @@ mod tests {
         assert!(spec_kernel(&machine.spec).path.is_none());
         assert!(spec_kernel(&machine.spec).initramfs.is_none());
         assert_eq!(machine.root_disk_size, Some(4));
+    }
+
+    #[test]
+    fn kernel_cmdline_appends_args_after_root_disk() {
+        assert_eq!(
+            build_kernel_cmdline(vec![
+                "systemd.firstboot=off".to_string(),
+                "quiet".to_string(),
+                "quiet".to_string(),
+            ]),
+            [
+                ROOT_DISK_KERNEL_ARG,
+                "systemd.firstboot=off",
+                "quiet",
+                "quiet",
+            ]
+        );
     }
 
     #[tokio::test]

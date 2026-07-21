@@ -76,6 +76,9 @@ pub(crate) struct VmOverrideArgs {
     /// Path to a custom initramfs image. Only works for Linux.
     #[arg(long = "initramfs", visible_alias = "initrd")]
     pub initramfs: Option<PathBuf>,
+    /// Append an argument to the Linux kernel command line. May be repeated.
+    #[arg(long = "kernel-arg", value_name = "ARG")]
+    pub kernel_args: Vec<String>,
     /// Resize the image-backed root disk, for example 10gb or 512mb.
     #[arg(long, value_name = "SIZE")]
     pub disk_size: Option<HumanSize>,
@@ -254,6 +257,7 @@ impl Cmd {
                 rosetta: self.overrides.rosetta,
                 kernel: self.overrides.kernel.clone(),
                 initramfs: self.overrides.initramfs.clone(),
+                kernel_args: self.overrides.kernel_args.clone(),
                 agent: if self.no_agent {
                     Some(None)
                 } else {
@@ -288,6 +292,7 @@ pub(crate) fn apply_resolved_machine_options(
         rosetta,
         kernel,
         initramfs,
+        kernel_args,
         agent,
         disks,
         user,
@@ -298,6 +303,7 @@ pub(crate) fn apply_resolved_machine_options(
         .metadata(metadata)
         .nested_virtualization(nested_virtualization)
         .rosetta(rosetta)
+        .kernel_args(kernel_args)
         .disks(disks)
         .mounts(mounts)
         .network(|builder| network.apply(builder));
@@ -354,6 +360,7 @@ pub(crate) struct ResolvedMachineOptions {
     pub(crate) rosetta: bool,
     pub(crate) kernel: Option<PathBuf>,
     pub(crate) initramfs: Option<PathBuf>,
+    pub(crate) kernel_args: Vec<String>,
     pub(crate) agent: Option<Option<PathBuf>>,
     pub(crate) disks: Vec<PathBuf>,
     pub(crate) user: Option<MachineUserConfig>,
@@ -453,6 +460,7 @@ mod tests {
         assert_eq!(create.profile, None);
         assert!(create.start);
         assert!(create.default);
+        assert!(create.overrides.kernel_args.is_empty());
     }
 
     #[test]
@@ -513,6 +521,10 @@ mod tests {
             "./vmlinuz",
             "--initrd",
             "./initrd.img",
+            "--kernel-arg",
+            "systemd.firstboot=off",
+            "--kernel-arg",
+            "quiet",
             "--agent",
             "./silo-agent",
             "--disk-size",
@@ -553,6 +565,10 @@ mod tests {
         assert_eq!(
             create.overrides.initramfs.as_deref(),
             Some("./initrd.img".as_ref())
+        );
+        assert_eq!(
+            create.overrides.kernel_args,
+            ["systemd.firstboot=off", "quiet"]
         );
         assert_eq!(create.agent.as_deref(), Some("./silo-agent".as_ref()));
         assert_eq!(create.overrides.disks.len(), 1);

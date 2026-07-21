@@ -357,11 +357,15 @@ mod tests {
         let dir = temp_dir("kernel-cmdline");
         fs::create_dir_all(&dir).expect("create temp dir");
         let mut spec = sample_spec(&dir);
-        spec.boot
+        let kernel = spec
+            .boot
             .as_mut()
             .and_then(|boot| boot.kernel.as_mut())
-            .expect("kernel")
-            .cmdline = vec!["console=hvc0".to_string()];
+            .expect("kernel");
+        kernel.cmdline = vec![
+            "root=/dev/vda".to_string(),
+            "systemd.firstboot=off".to_string(),
+        ];
 
         let machine_config = vm_spec_machine_config(VmSpecInputs {
             name: "devbox",
@@ -376,7 +380,8 @@ mod tests {
         assert_eq!(
             machine_config.config.kernel_cmdline,
             vec![
-                "console=hvc0".to_string(),
+                "root=/dev/vda".to_string(),
+                "systemd.firstboot=off".to_string(),
                 "silo.guest.port=1027".to_string()
             ]
         );
