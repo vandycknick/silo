@@ -20,10 +20,7 @@ GUEST_INIT_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/init
 GUEST_ASSETS_DIR := $(CURDIR)/target/resources/assets
 INITRAMFS_OUT := $(GUEST_ASSETS_DIR)/initramfs
 PROFILE ?= debug
-RUST_HOST_TRIPLE := $(shell rustc -vV | awk '/host:/ { print $$2 }')
 HOST_OS := $(shell uname -s)
-KRUN_DEPS_DIR ?= $(CURDIR)/target/libs/krun/$(RUST_HOST_TRIPLE)
-export KRUN_DEPS_DIR
 
 ifeq ($(HOST_OS),Darwin)
 HOST_WORKSPACE_EXCLUDES := --exclude agent --exclude init
@@ -80,10 +77,6 @@ clippy:
 .PHONY: test
 test:
 	cargo test --workspace --all-targets --all-features $(HOST_WORKSPACE_EXCLUDES)
-
-.PHONY: build-libkrun
-build-libkrun:
-	scripts/build-libkrun-deps
 
 .PHONY: vmmon
 vmmon:

@@ -27,12 +27,11 @@ Library responsibilities:
 Binary responsibilities:
 
 - parse flat helper arguments
-- call `krun-sys` and libkrun APIs
-- check libkrun feature availability immediately before calling a feature-specific libkrun API
-- return contextual errors for unsupported libkrun capabilities
+- call the source-integrated libkrun APIs through a helper-private adapter
+- convert paths, strings, and libkrun return codes into contextual errors
 - enter the VM
 
-Do not import `krun_sys` from library modules. Direct libkrun access belongs in `src/bin/krun.rs` or the lower-level `krun-sys` crate. The library is a launcher/wrapper around the helper binary, not a libkrun API facade.
+Do not import `libkrun` from library modules. Direct libkrun access belongs in the helper-private adapter below `src/bin/krun`. The library is a launcher/wrapper around the helper binary, not a libkrun API facade.
 
 ## Scope
 
@@ -54,22 +53,16 @@ Planned follow-up scope includes:
 ## Requirements
 
 - Rust toolchain
-- libkrun and its runtime dependencies available at link and run time for the `krun` helper binary
-- Linux or macOS host support matching the linked libkrun build
+- access to the pinned public libkrun fork when Cargo dependencies are fetched
+- Linux or macOS host support matching the compiled libkrun backend
 
-## Feature Validation
+## Source Integration
 
-Every Silo-exposed libkrun feature that requires a capability check must be checked inside the `krun` helper binary immediately before the feature-specific libkrun API is called.
+The optional `krun-bin` Cargo feature compiles the pinned libkrun fork directly into the helper executable. Building the launcher library alone does not activate or link libkrun, preserving the process boundary for `vmmon` and other callers.
 
-Those checks return contextual helper errors that vmmon can capture and log from the helper process. For example, attempting to attach block devices with a libkrun build that lacks `BLK` support returns an error shaped like:
+The helper uses a narrow private adapter rather than generated C bindings. It owns context cleanup, string conversion, the small set of C API constants Silo uses, and negative return-code handling. The resulting runtime does not require `libkrun.so`, `libkrun.dylib`, or `libkrunfw`.
 
-```text
-unsupported libkrun feature: block devices (--disk) requires libkrun feature BLK; rebuild or install a libkrun with BLK support
-```
-
-This keeps vmmon logs useful and avoids raw negative libkrun return codes when the real issue is an unsupported feature.
-
-Feature checks must not live in the library. If they do, `vmmon` and other library users can acquire a runtime dependency on `libkrun.so` just by linking the launcher crate, which defeats the helper-process boundary.
+The `blk` and `net` APIs are selected at compile time through fixed Cargo features. Runtime feature probing is unnecessary because a helper missing either API cannot compile.
 
 ## libkrun Build Features
 
@@ -101,7 +94,7 @@ Silo intentionally leaves these libkrun features disabled for now:
 | `aws-nitro` | Enables AWS Nitro Enclaves support and its specialized init path. | Disable unless Silo grows a Nitro backend. |
 | `virgl_resource_map2` | Enables an optional virglrenderer GPU API used by some virtio-gpu builds. | Disable with `gpu`. It has no use without the GPU path. |
 
-If a new krun feature is exposed through Silo, update this table and add a helper-side `krun_has_feature()` check before calling the feature-specific libkrun API. Do not enable upstream libkrun features speculatively. The tiny VM goblin gets one feature only when it can point to the code that uses it.
+If a new krun feature is exposed through Silo, update this table, enable the matching Cargo feature, and add only the required helper adapter methods. Do not enable upstream libkrun features speculatively. The tiny VM goblin gets one feature only when it can point to the code that uses it.
 
 ## Example
 

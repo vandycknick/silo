@@ -2,7 +2,6 @@
 name = "krun"
 version = "0.1.0"
 edition = "2021"
-build = "build.rs"
 
 [[bin]]
 name = "krun"
@@ -10,11 +9,11 @@ path = "src/bin/krun.rs"
 required-features = ["krun-bin"]
 
 [features]
-krun-bin = ["dep:krun-sys"]
+krun-bin = ["dep:libkrun"]
 
 [dependencies]
 utils = { path = "../../common/utils" }
-krun-sys = { path = "../krun-sys", optional = true }
+libkrun = { workspace = true, optional = true }
 clap = { version = "4.6.1", features = ["derive"] }
 eyre = "0.6.12"
 nix = { version = "0.31.3", features = ["fs", "poll", "socket", "term"] }

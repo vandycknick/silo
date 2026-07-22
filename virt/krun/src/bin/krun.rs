@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
 use krun::{validate_config, KrunConfig, NetTap, NetUnixgram, NetUnixstream, Network, DEFAULT_ID};
-use krun_sys::{ctx, DiskFormat, Feature, KernelFormat, SyncMode};
 use nix::sys::socket::{setsockopt, sockopt};
 
+#[path = "krun/context.rs"]
+mod context;
 #[path = "../internal/parse.rs"]
 mod parse;
 #[path = "../watchdog.rs"]
@@ -192,134 +193,74 @@ fn main() -> eyre::Result<()> {
 }
 
 fn start_enter(config: &KrunConfig) -> eyre::Result<()> {
-    let ctx_id = ctx::create_ctx()?;
-    let configured = configure_ctx(ctx_id, config);
-    if let Err(err) = configured {
-        let _ = ctx::free_ctx(ctx_id);
-        return Err(err);
-    }
-    ctx::start_enter(ctx_id)?;
+    let context = context::Context::create()?;
+    configure_ctx(&context, config)?;
+    context.start_enter()?;
     Ok(())
 }
 
-fn configure_ctx(ctx_id: u32, config: &KrunConfig) -> eyre::Result<()> {
-    ctx::set_vm_config(ctx_id, config.cpus, config.memory_mib)?;
-    ctx::disable_implicit_console(ctx_id)?;
-    ctx::disable_implicit_init(ctx_id)?;
-    ctx::disable_implicit_vsock(ctx_id)?;
+fn configure_ctx(context: &context::Context, config: &KrunConfig) -> eyre::Result<()> {
+    context.set_vm_config(config.cpus, config.memory_mib)?;
+    context.disable_implicit_console()?;
+    context.disable_implicit_init()?;
+    context.disable_implicit_vsock()?;
 
     if let Some(kernel) = config.kernel.as_ref() {
         let cmdline = (!config.cmdline.is_empty()).then(|| config.cmdline.join(" "));
-        ctx::set_kernel(
-            ctx_id,
-            &path_string(kernel),
+        context.set_kernel(
+            kernel,
             external_kernel_format(),
-            config
-                .initramfs
-                .as_ref()
-                .map(|path| path_string(path))
-                .as_deref(),
+            config.initramfs.as_deref(),
             cmdline.as_deref(),
         )?;
     }
 
     for disk in &config.disks {
-        require_feature(Feature::Blk, "block devices (--disk)")?;
-        ctx::add_disk3(
-            ctx_id,
-            &disk.block_id,
-            &path_string(&disk.path),
-            DiskFormat::Raw,
-            disk.read_only,
-            false,
-            SyncMode::Relaxed,
-        )?;
+        context.add_raw_disk(&disk.block_id, &disk.path, disk.read_only)?;
     }
 
     for mount in &config.mounts {
-        ctx::add_virtiofs3(
-            ctx_id,
-            &mount.tag,
-            &path_string(&mount.path),
-            0,
-            mount.read_only,
-        )?;
+        context.add_virtiofs(&mount.tag, &mount.path, mount.read_only)?;
     }
 
     if !config.vsock_ports.is_empty() {
-        ctx::add_vsock(ctx_id, 0)?;
+        context.add_vsock()?;
     }
     for port in &config.vsock_ports {
-        ctx::add_vsock_port2(ctx_id, port.port, &path_string(&port.path), port.listen)?;
+        context.add_vsock_port(port.port, &port.path, port.listen)?;
     }
 
     match &config.network {
         Network::None => {}
         Network::Unixgram(net) => {
-            require_feature(Feature::Net, "unixgram networking (--network unixgram)")?;
             let socket = open_local_unix_datagram_socket(&net.peer_path, &config.id, "krun")?;
-            ctx::add_net_unixgram_fd(ctx_id, socket.into_raw_fd(), net.mac)?;
+            context.add_net_unixgram_fd(socket.into_raw_fd(), net.mac)?;
         }
         Network::Unixstream(net) => {
-            require_feature(Feature::Net, "unixstream networking (--network unixstream)")?;
-            ctx::add_net_unixstream(ctx_id, &path_string(&net.peer_path), net.mac)?;
+            context.add_net_unixstream(&net.peer_path, net.mac)?;
         }
         Network::Tap(net) => {
-            require_feature(Feature::Net, "tap networking (--network tap)")?;
-            ctx::add_net_tap(ctx_id, &net.name, net.mac)?;
+            context.add_net_tap(&net.name, net.mac)?;
         }
     }
 
     if config.stdio_console {
-        ctx::add_virtio_console_default(ctx_id, 0, 1, 2)?;
-        ctx::set_kernel_console(ctx_id, "hvc0")?;
+        context.add_virtio_console_default(0, 1, 2)?;
+        context.set_kernel_console("hvc0")?;
     }
 
     Ok(())
 }
 
-fn external_kernel_format() -> KernelFormat {
+fn external_kernel_format() -> context::KernelFormat {
     #[cfg(target_arch = "x86_64")]
     {
-        KernelFormat::Elf
+        context::KernelFormat::Elf
     }
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     {
-        KernelFormat::Raw
+        context::KernelFormat::Raw
     }
-}
-
-fn require_feature(feature: Feature, requested_by: &'static str) -> eyre::Result<()> {
-    if ctx::has_feature(feature)? {
-        return Ok(());
-    }
-
-    eyre::bail!(
-        "unsupported libkrun feature: {requested_by} requires libkrun feature {}; rebuild or install a libkrun with {} support",
-        feature_name(feature),
-        feature_name(feature)
-    )
-}
-
-fn feature_name(feature: Feature) -> &'static str {
-    match feature {
-        Feature::Net => "NET",
-        Feature::Blk => "BLK",
-        Feature::Gpu => "GPU",
-        Feature::Snd => "SND",
-        Feature::Input => "INPUT",
-        Feature::Efi => "EFI",
-        Feature::Tee => "TEE",
-        Feature::AmdSev => "AMD_SEV",
-        Feature::IntelTdx => "INTEL_TDX",
-        Feature::AwsNitro => "AWS_NITRO",
-        Feature::VirglResourceMap2 => "VIRGL_RESOURCE_MAP2",
-        Feature::InitBlob => "INIT_BLOB",
-    }
-}
-
-fn path_string(path: &Path) -> String {
-    path.display().to_string()
 }
 
 fn open_local_unix_datagram_socket(
@@ -362,9 +303,10 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{external_kernel_format, local_unix_datagram_path};
-    use krun_sys::KernelFormat;
     use std::path::Path;
+
+    use super::context::KernelFormat;
+    use super::{external_kernel_format, local_unix_datagram_path};
 
     #[test]
     fn external_kernel_format_matches_host_architecture() {

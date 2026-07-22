@@ -1,145 +1,99 @@
-# Building libkrun Dependencies
+# Embedded libkrun Dependency
 
-Silo links `krun-sys` dynamically against `libkrun`. The libraries do not need to be installed system-wide. Build or fetch them into a local dependency directory, then point Cargo at it with `KRUN_DEPS_DIR`.
+Silo compiles its pinned libkrun fork directly into the `krun` helper. The
+launcher library remains process-backed, so `vmmon` and other Rust callers do
+not link libkrun. The distributed runtime contains one self-contained `krun`
+executable and no `libkrun.so`, `libkrun.dylib`, or `libkrunfw` sidecar.
 
-The expected layout is:
+## Source Pin
 
-```text
-target/libs/krun/<target-triple>/
-  libkrun.so        # Linux
-  libkrun.dylib     # macOS
-
-target/release/
-  krun
-  libkrun.so        # Linux
-  libkrun.dylib     # macOS
-```
-
-## Prerequisites
-
-Use the Nix dev shell. Required native tools are provided by `flake.nix`; do not install them with `apt` or Homebrew for this project flow.
-
-```bash
-nix develop
-```
-
-The shell provides the Rust toolchain plus native build tools such as `clang`, `libclang`, `pkg-config`, `make`, and platform-specific tools like `patchelf` on Linux.
-
-On macOS, `install_name_tool` and `codesign` come from Apple’s command line tools. If those are missing, install Xcode command line tools once with Apple’s normal developer tooling.
-
-## Build On Linux
-
-From inside `nix develop`:
-
-```bash
-make build-libkrun
-```
-
-The script does the following:
-
-1. Clones `libkrun/libkrun` at the pinned `LIBKRUN_VERSION` with submodules.
-2. Applies the downstream patches from `patches/libkrun/`.
-3. Builds `libkrun` with Cargo features `blk` and `net`, with default features disabled.
-4. Copies `libkrun.so` into `target/libs/krun/<target-triple>`.
-5. Fixes the soname with `patchelf` so the copied library is relocatable.
-6. Copies the patched library into `target/release` beside the `krun` helper.
-
-Silo intentionally builds `libkrun` without the upstream `init-blob` default feature. That avoids building and embedding libkrun's default guest init binary.
-
-Silo also does not fetch or package `libkrunfw`. `libkrun` loads `libkrunfw` dynamically only when the caller does not provide an external kernel, firmware, or kernel bundle. Silo's `krun` helper requires `--kernel` and calls `krun_set_kernel()`, so this fallback path is not used.
-
-## Build On macOS
-
-From inside `nix develop` on Apple silicon:
-
-```bash
-make build-libkrun
-```
-
-The script does the following:
-
-1. Clones `libkrun/libkrun` at the pinned `LIBKRUN_VERSION` with submodules.
-2. Applies the downstream patches from `patches/libkrun/`.
-3. Builds `libkrun.dylib` with Cargo features `blk` and `net`, with default features disabled.
-4. Copies `libkrun.dylib` into `target/libs/krun/<target-triple>`.
-5. Rewrites the install name to `@rpath/libkrun.dylib`.
-6. Ad-hoc codesigns the dylib.
-7. Copies the patched library into `target/release` beside the `krun` helper.
-
-Because Silo disables libkrun's `init-blob` default feature and does not package `libkrunfw`, macOS no longer needs Docker, a Linux init-builder container, or the upstream `libkrunfw-prebuilt-aarch64.tgz` bundle for this dependency build.
-
-## Use With Cargo
-
-After building dependencies, export `KRUN_DEPS_DIR`:
-
-```bash
-export KRUN_DEPS_DIR="$PWD/target/libs/krun/$(rustc -vV | awk '/host:/ { print $2 }')"
-```
-
-Then build the krun helper:
-
-```bash
-cargo build -p krun
-```
-
-For release builds:
-
-```bash
-cargo build -p krun --release
-```
-
-`krun-sys` uses `KRUN_DEPS_DIR` in its build script to emit Cargo link instructions:
+The workspace dependency is pinned by full Git commit in the root
+`Cargo.toml`:
 
 ```text
-cargo:rustc-link-search=native=$KRUN_DEPS_DIR
-cargo:rustc-link-lib=dylib=krun
+repository: https://github.com/vandycknick/libkrun.git
+branch:     silo/stable-1.19.x
+upstream:   v1.19.4
+revision:   1b69e60ed03f58fe13bcd7b6f684aa71a404b0f9
 ```
 
-That means `krun-sys` still links dynamically, but it links against the local dependency folder instead of requiring system-wide `libkrun` installation.
+Release builds must use the committed `Cargo.lock` with `--locked`. A branch
+or tag is useful for reviewing the fork, but neither replaces the immutable
+commit pin.
 
-`krun` also sets the `krun` binary rpath so the binary can load libraries copied beside it:
+The fork carries two fixes on top of upstream `v1.19.4`:
 
-- Linux: `$ORIGIN`
-- macOS: `@loader_path`
+1. Released Unix vsock proxies close their host endpoint immediately while
+   retaining deferred proxy cleanup. This fixes the five-second EOF delay in
+   [libkrun issue #684](https://github.com/libkrun/libkrun/issues/684).
+2. x86_64 initrds remain within one contiguous RAM bank, populate the Linux
+   boot protocol's extended address fields above 4 GiB, and report placement
+   or guest-memory write failures instead of panicking.
 
-## Package A Relocatable krun Runtime
+The fork is the only source of these patches. Silo does not retain duplicate
+patch files or generate C bindings from a vendored header.
 
-After building `krun` and the dependency libraries:
+## Cargo Features
 
-```bash
-package-krun-runtime debug target/krun-runtime-debug
-```
-
-or:
-
-```bash
-package-krun-runtime release target/krun-runtime-release
-```
-
-The output directory contains the `krun` binary plus `libkrun`, ready to copy together.
-
-## Downstream Patches
-
-`patches/libkrun/0001-vsock-shutdown-released-unix-proxy.patch` fixes the delayed EOF reported in [libkrun issue #684](https://github.com/containers/libkrun/issues/684). It is based on libkrun `v1.19.4` and includes a focused regression test suitable for an upstream pull request.
-
-`patches/libkrun/0002-x86_64-fix-initrd-addressing.patch` prevents x86_64 initrds from crossing the 32-bit MMIO hole and supplies Linux with the upper 32 bits when an initrd is loaded above 4 GiB. It is based on libkrun `v1.19.4` and includes regression coverage for both placement and boot parameter encoding.
-
-The dependency build applies patches idempotently. A patch that no longer applies after a libkrun version update must be refreshed or removed if the fix has landed upstream.
-
-Set `KRUN_RUNTIME_DIR` to install the runtime library beside a `krun` helper in a directory other than `target/release`.
-
-## Version Pins
-
-The current script pins are:
+Silo disables libkrun's default features and enables only:
 
 ```text
-LIBKRUN_VERSION=1.19.4
+blk
+net
 ```
 
-Override it only when intentionally updating the native ABI and regenerated bindings:
+`blk` provides the raw virtio-block path used by Silo disks. `net` provides
+the Unix datagram, Unix stream, and Linux TAP networking paths. The helper's
+private adapter calls those APIs directly, so Cargo compilation verifies that
+both features are present.
+
+The upstream `init-blob` default feature remains disabled. Silo supplies an
+explicit kernel and optional initramfs, disables libkrun's implicit devices,
+and does not use the fallback firmware path. Consequently, Silo neither
+builds nor packages `libkrunfw`.
+
+## Build
+
+Build the self-contained helper with:
 
 ```bash
-LIBKRUN_VERSION=... make build-libkrun
+cargo build --locked -p krun --features krun-bin --bin krun
 ```
 
-If `libkrun.h` changes, regenerate or update `virt/krun-sys/src/bindings.rs` and keep `virt/krun-sys/include/libkrun.h` in sync.
+For a release build:
+
+```bash
+cargo build --locked --release -p krun --features krun-bin --bin krun
+```
+
+The plain `krun` library does not activate the optional libkrun dependency.
+Only the `krun-bin` feature used by the helper does so.
+
+On Linux, `ldd` and `readelf -d` must not report `libkrun.so`. On macOS,
+`otool -L` must not report `libkrun.dylib`. The macOS helper still uses
+Hypervisor.framework and must be signed with the
+`com.apple.security.hypervisor` entitlement before distribution.
+
+## Updating libkrun
+
+For each upstream update:
+
+1. Create a new fork branch from the exact upstream release tag.
+2. Check whether each downstream fix has landed upstream.
+3. Apply only the fixes that remain necessary as focused commits.
+4. Run the fork's targeted regression tests on x86_64 Linux and arm64 macOS.
+5. Build the fork with default features disabled and `blk,net` enabled.
+6. Update the full Git revision in the root `Cargo.toml`.
+7. Regenerate and commit `Cargo.lock`.
+8. Review the helper's private constants against upstream `include/libkrun.h`.
+9. Run Silo's krun unit, integration, lint, and VM boot tests.
+10. Inspect the final binary for unexpected dynamic dependencies and compare
+    its compressed size with the prior release.
+
+The helper currently mirrors only the libkrun constants it uses: raw disk,
+relaxed disk synchronization, raw and ELF kernel formats, the compatibility
+virtio-net feature mask, and the DHCP flag. Do not copy unrelated C API
+surface into Silo when updating the dependency.
+
+libkrun is Apache-2.0 licensed. Keep the fork's license and required
+third-party attribution in Silo release materials.
