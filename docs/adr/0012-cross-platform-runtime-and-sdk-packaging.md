@@ -2,6 +2,8 @@
 
 Date: 2026-07-22
 
+Updated: 2026-07-23
+
 ## Status
 
 Accepted
@@ -26,108 +28,111 @@ CLI, Rust consumer, or language SDK
         `-- kernel-default + initramfs + agent
 ```
 
-Those components must be built, installed, discovered, upgraded, and tested as
-one compatible release. Shipping only the `silo` frontend leaves users to
-assemble an implicit runtime from `PATH`, environment variables, and manually
-placed assets. That is not a product installation and cannot support reliable
-SDK distribution.
+These components must be built, installed, discovered, upgraded, and tested as
+one compatible release. Shipping only the `silo` frontend leaves consumers to
+assemble a runtime from `PATH`, environment variables, and manually placed
+assets. That is not a product installation and cannot provide reliable SDK
+distribution.
 
-The distribution problem spans several environments with different native
-conventions:
-
-- macOS application bundles, code signing, entitlements, notarization, and
-  Homebrew Casks;
-- Debian, Ubuntu, RHEL, and Arch package layouts;
-- Node platform packages and native addons;
-- future Python platform wheels;
-- future Go modules, which cannot carry platform runtimes like npm packages or
-  Python wheels can;
-- direct Rust `libvm` consumers and custom embedders.
+The distribution problem spans macOS application bundles, code signing,
+entitlements, notarization, and Homebrew Casks; Debian, Ubuntu, RHEL, and Arch
+layouts; Node platform packages and native addons; future Python wheels and Go
+modules; direct Rust `libvm` consumers; and custom embedders.
 
 The normal path should require no user configuration. Explicit configuration is
 still necessary for tests, development, custom embedding, and unusual
 installations. Silo therefore needs conventions that remain overrideable rather
 than configuration that every consumer must reproduce.
 
-This ADR owns immutable product layout, runtime discovery, SDK runtime
+This ADR defines immutable product layout, runtime discovery, SDK runtime
 transport, user-owned product and state paths, release staging, and package
 qualification. It does not add runtime backend selection, independent component
 updates, or an in-process package manager to `libvm`.
 
 ## Terminology
 
-| Term | Meaning |
-| --- | --- |
-| Frontend | The CLI, Rust consumer, Node addon, or future language binding that opens `libvm`. |
-| Runtime payload | The co-versioned private helpers and default boot assets required to run VMs. |
-| Runtime root | A portable directory containing the fixed `bin/` and `assets/` layout. |
-| Product installation | A CLI distribution such as `Silo.app`, a deb, an rpm, or an Arch package. |
-| Bundled runtime | A runtime payload carried inside an SDK package or wheel. |
-| Shared runtime | A runtime installed through an OS product channel and used by a frontend. |
-| Default assets | `kernel-default`, `initramfs`, and `agent`. |
-| Mutable state | Databases, images, machine state, sockets, logs, caches, and downloaded optional assets. |
-| Transport | The ecosystem-specific way in which the canonical runtime payload is delivered. |
+| Term                 | Meaning                                                                                  |
+| -------------------- | ---------------------------------------------------------------------------------------- |
+| Frontend             | The CLI, Rust consumer, Node addon, or future language binding that opens `libvm`.       |
+| Runtime payload      | The co-versioned private helpers and default boot assets required to run VMs.            |
+| Runtime root         | A portable directory containing the fixed `bin/` and `assets/` layout.                   |
+| Product installation | A CLI distribution such as `Silo.app`, a deb, an rpm, or an Arch package.                |
+| Bundled runtime      | A runtime payload carried inside an SDK package or wheel.                                |
+| Shared runtime       | A runtime installed through an OS product channel and used by a frontend.                |
+| Default assets       | `kernel-default`, `initramfs`, and `agent`.                                              |
+| Mutable state        | Databases, images, machine state, sockets, logs, caches, and downloaded optional assets. |
+| Transport            | The ecosystem-specific way in which the canonical runtime payload is delivered.          |
 
-Package-owned product files are immutable. User-owned portable product files
-and mutable state follow XDG conventions on both Linux and macOS.
-
-## Determination
+## Decision
 
 Silo produces one validated, architecture-specific runtime payload for each
-supported target. Every product installer and SDK package for that target
-consumes the same staged files rather than rebuilding its own variation.
+supported target. Product installers and SDK packages for that target consume
+the same staged files rather than rebuilding a transport-specific variation.
 
-Runtime discovery is convention-based. There is no installed path manifest,
-no `silo-runtime.json`, and no `--component-info` subprocess protocol. Fixed
-native and portable layouts are resolved into absolute component paths and held
-in memory for the lifetime of a `Runtime`. Installation paths are not persisted
-in `db_config`.
+`libvm` resolves fixed native and portable layouts to absolute component paths
+and retains them for the lifetime of a `Runtime`. It does not install or download
+a runtime. Release CI resolves the default kernel from OCI before packaging, so
+a normal first VM start requires no runtime download.
 
-The normal lookup order is:
+### Core Invariants
 
-1. Explicit per-component API paths.
-2. An explicit API runtime root.
-3. Per-component environment overrides.
-4. `SILO_RUNTIME_DIR`.
-5. A caller-supplied SDK runtime or the app bundle containing the current
-   executable.
-6. Conventional OS installations.
-7. Transitional `PATH`, sibling, and historical asset fallbacks.
-8. An actionable missing-runtime error.
+- Package-owned product files are immutable. User-owned portable product files
+  and mutable state follow XDG conventions on Linux and macOS.
+- Convention-based resolution selects one complete runtime component set rather
+  than mixing files from unrelated installations. Explicit per-component API
+  paths, per-component environment overrides, and machine asset overrides may
+  replace individual files.
+- Runtime-component installation paths are not persisted in `db_config`; the
+  ephemeral run root is not part of durable database identity.
+- There is no installed path manifest, `silo-runtime.json`, or
+  `--component-info` subprocess protocol.
+- Official runtime components are co-versioned and updated atomically. They are
+  not upgraded independently.
 
-`libvm` resolves local files but never installs or downloads a runtime. Release
-CI resolves the default kernel from OCI before packaging, so a normal first VM
-start requires no runtime download.
-
-## Supported Targets
+## Supported Targets And Compatibility
 
 The initial host matrix is:
 
-| Host | Architecture | Initial distribution promise | Active backend | Packaged backends |
-| --- | --- | --- | --- | --- |
-| macOS | arm64 | macOS 26 or newer | VZ | VZ and krun |
-| Debian | amd64, arm64 | Latest stable | krun | krun |
-| Ubuntu | amd64, arm64 | Latest stable or LTS | krun | krun |
-| RHEL | amd64, arm64 | Latest supported major | krun | krun |
-| Arch | amd64, arm64 where available | Current rolling release | krun | krun |
+| Host   | Architecture                 | Initial distribution promise | Active backend | Packaged backends |
+| ------ | ---------------------------- | ---------------------------- | -------------- | ----------------- |
+| macOS  | arm64                        | macOS 26 or newer            | VZ             | VZ and krun       |
+| Debian | amd64, arm64                 | Latest stable                | krun           | krun              |
+| Ubuntu | amd64, arm64                 | Latest stable or LTS         | krun           | krun              |
+| RHEL   | amd64, arm64                 | Latest supported major       | krun           | krun              |
+| Arch   | amd64, arm64 where available | Current rolling release      | krun           | krun              |
 
 The initial release does not support Intel macOS, macOS before version 26,
 Windows, other Linux architectures, or cross-architecture guest CPU emulation.
-
 Initial GNU/Linux binaries target glibc 2.39. This covers the selected current
 distribution generation without claiming compatibility with older releases.
-Raising that floor is a support-matrix change and requires an ADR update.
+Raising that floor changes the support matrix and requires an ADR update.
 
-VZ remains the only selected macOS backend. The krun helper is nevertheless
-packaged and signed on macOS so a later backend selector does not require a new
-distribution layout. Packaging a backend does not make it selectable.
+VZ remains the only selected macOS backend. Silo packages and signs the krun
+helper on macOS so a later backend selector does not require a new distribution
+layout. Packaging a backend does not make it selectable.
 
 The default kernel, initramfs, and agent always match the target architecture.
 Optional Rosetta support in VZ does not change the guest kernel architecture.
 
-## Runtime Payload
+Official runtime components are co-versioned and updated atomically. The
+initial compatibility policy is deliberately strict:
 
-The portable runtime root is:
+- Product packages co-install one matching CLI and runtime.
+- Node and Python platform packages use the exact SDK package version.
+- Go downloads the exact runtime release matching the SDK version.
+- Direct Rust consumers use a co-installed runtime or pass an explicit root.
+- Custom mixed-version component paths are unsupported and remain the caller's
+  responsibility.
+- Runtime components are not upgraded independently.
+
+This avoids compatibility ranges before Silo has an independent component
+compatibility promise. A later protocol-negotiation mechanism may be added if
+independent updates become necessary; it does not require changing path
+discovery.
+
+## Canonical Runtime Payload, Staging, And Provenance
+
+The portable runtime root has this fixed layout:
 
 ```text
 <runtime-root>/
@@ -143,20 +148,13 @@ The portable runtime root is:
 
 All six files are included for every initial target. `krun` contains the pinned
 Silo libkrun fork directly. The payload does not contain `libkrun.so`,
-`libkrun.dylib`, or `libkrunfw`.
+`libkrun.dylib`, or `libkrunfw`. Only the krun helper links libkrun code; the
+process boundary remains `vmmon -> krun`. Neither `vmmon`, `libvm`, nor a
+language binding links libkrun merely by using the launcher library.
 
-Only the krun helper links libkrun code. The process boundary remains:
-
-```text
-vmmon -> krun
-```
-
-Neither `vmmon`, `libvm`, nor a language binding links libkrun merely by using
-the launcher library.
-
-The runtime payload does not inherently include the `silo` CLI. Product
-packages add the CLI. SDK packages add their native binding. A complete portable
-CLI archive may place `silo` beside the helpers:
+The runtime payload does not inherently include the `silo` CLI. Product packages
+add the CLI and SDK packages add their native binding. A complete portable CLI
+archive may place `silo` beside the helpers:
 
 ```text
 silo-<version>-<target>/
@@ -171,7 +169,7 @@ silo-<version>-<target>/
     agent
 ```
 
-## Portable Staging
+### Portable Staging
 
 Developer and release staging use the portable layout in predictable target
 directories:
@@ -185,175 +183,87 @@ target/silo-runtime/linux-arm64-gnu/release/
 
 Developers select a staged root through `RuntimeConfig` or
 `SILO_RUNTIME_DIR`. `libvm` does not inspect arbitrary Cargo target directories.
-
 The staged payload is the common input to the app, Linux packages, SDK platform
 packages, and runtime archives. Packagers do not rebuild or substitute
 components after staging, except for required platform signing and container
 metadata.
 
-## macOS Product Layout
+### Default Kernel Provenance
 
-The macOS product is a relocatable application bundle:
+Release CI obtains the default kernel from Silo's stable OCI artifact during
+staging:
 
-```text
-Silo.app/
-  Contents/
-    Info.plist
-    MacOS/
-      silo
-    Helpers/
-      vmmon
-      netd
-      krun
-    Resources/
-      assets/
-        kernel-default
-        initramfs
-        agent
-```
+1. Resolve the stable OCI index.
+2. Select the target architecture manifest.
+3. Verify the expected Silo kernel media types.
+4. Verify the platform manifest and layer digests.
+5. Extract the kernel as `assets/kernel-default`.
+6. Record the index, platform manifest, and layer digests in release provenance.
+7. Package those exact bytes into every transport for the target.
 
-The layout defines the component paths without a Silo-specific manifest:
+End users never receive a release whose default kernel depends on when they
+first run it. The installed runtime needs no registry access to boot its default
+kernel. The initramfs and agent are built from the corresponding Silo source
+release. Staging verifies that all three default assets match the target
+architecture.
 
-```text
-vmmon     = Contents/Helpers/vmmon
-netd      = Contents/Helpers/netd
-krun      = Contents/Helpers/krun
-kernel    = Contents/Resources/assets/kernel-default
-initramfs = Contents/Resources/assets/initramfs
-agent     = Contents/Resources/assets/agent
-```
+Additional user-installed kernels are deferred. When added, they live below the
+XDG data root and never modify `Silo.app` or package-owned `/usr` paths.
 
-`Info.plist` carries standard application identity, version, and minimum-system
-metadata. It does not contain Silo runtime paths. The initial contract is:
+### Release Staging
 
-| Key | Value or meaning |
-| --- | --- |
-| `CFBundleIdentifier` | `sh.silo.app` |
-| `CFBundleExecutable` | `silo` |
-| `CFBundleShortVersionString` | The public Silo release version |
-| `CFBundleVersion` | The monotonically increasing release build number |
-| `LSMinimumSystemVersion` | `26.0` |
+A repository-owned staging command builds one canonical payload per target:
 
-An SDK comparing itself with an installed app requires an exact
-`CFBundleShortVersionString` match. `CFBundleVersion` distinguishes rebuilt
-artifacts of the same public release but does not create runtime compatibility
-across public versions.
+1. Build `silo`, `vmmon`, `netd`, and `krun`.
+2. Use committed lockfiles and locked dependency resolution.
+3. Build the guest initramfs and standalone agent.
+4. Resolve and verify the target kernel OCI artifact.
+5. Strip release binaries.
+6. Normalize file names, modes, and reproducible timestamps where possible.
+7. Copy components into the portable runtime layout.
+8. Inspect dynamic dependencies and runtime search paths.
+9. Reject build-machine paths and unavailable shared libraries.
+10. Record source and kernel provenance in release metadata.
+11. Generate checksums, SBOMs, and attestations.
+12. Boot a VM using only the staged tree.
+13. Report raw and compressed sizes.
+14. Hand those files to each target packager.
 
-### Bundle-Origin Discovery
-
-The CLI derives its bundle from the real executable rather than from the path
-used to invoke it. It obtains `std::env::current_exe()`, canonicalizes that path,
-and recognizes the fixed structure:
+The repository may contain build-time staging configuration. That configuration
+is not installed and `libvm` never consults it. The toolchain is deliberately
+composed because no single free tool safely owns every Silo release concern:
 
 ```text
-<bundle>/Contents/MacOS/silo
-```
-
-It then validates the expected Silo bundle identity from `Info.plist` and
-derives `Helpers` and `Resources` from `Contents`.
-
-This preserves Homebrew Cask invocation:
-
-```text
-/opt/homebrew/bin/silo
+repository-owned staging command
         |
-        | symlink
-        v
-/Applications/Silo.app/Contents/MacOS/silo
-        |
-        +-- ../Helpers/vmmon
-        +-- ../Helpers/netd
-        +-- ../Helpers/krun
-        `-- ../Resources/assets
+        +-- Apple native tools -> Silo.app, DMG, notarization
+        +-- nFPM -> deb, rpm, Arch
+        +-- npm tooling -> Node platform packages
+        +-- Python tooling -> platform wheels
+        `-- tar/zstd -> portable and Go runtime archives
 ```
 
-It also preserves relocatability to a user-owned location such as
-`~/Applications/Silo.app`. No lookup assumes that the app is under
-`/Applications`.
+GoReleaser Pro is not part of the design. The common contract is the staged
+payload, not one third-party packager.
 
-Copying `Contents/MacOS/silo` out of the bundle is not a supported way to expose
-the command because the copied executable has lost its bundle origin. Command
-exposure uses a symlink. A copied executable may still use an explicit runtime
-root or a conventional shared installation, but it does not claim the copied
-app's package-owned resources by name alone.
+## Installation Ownership, Mutable XDG State, And Migration
 
-The app bundle is read-only product content. Creating or starting a machine
-never writes into it.
+Package-owned product files are immutable. Silo never writes mutable state into
+`Silo.app` or package-owned `/usr` paths. Linux and macOS use the same XDG
+conventions for user-owned product files and mutable state; Silo does not use
+`~/Library/Application Support`, `~/Library/Caches`, or `~/Library/Logs` on
+macOS.
 
-## Linux Product Layouts
-
-Distro packages install the public frontend at:
-
-```text
-/usr/bin/silo
-```
-
-Debian, Ubuntu, and Arch packages use:
-
-```text
-/usr/lib/silo/
-  bin/
-    vmmon
-    netd
-    krun
-  assets/
-    kernel-default
-    initramfs
-    agent
-```
-
-RHEL follows package macros and may split private executables from
-architecture-specific assets:
-
-```text
-%{_libexecdir}/silo/
-  vmmon
-  netd
-  krun
-
-%{_libdir}/silo/assets/
-  kernel-default
-  initramfs
-  agent
-```
-
-The internal resolver therefore models explicit resolved component paths. It
-does not pretend that every native installation has one physical runtime root.
-
-Distro packages do not install into `/usr/local`, which is reserved for local
-administrator installations. A source or administrator installation may use:
-
-```text
-/usr/local/bin/silo
-/usr/local/lib/silo/bin/
-/usr/local/lib/silo/assets/
-```
-
-The default assets are architecture-specific. The kernel differs between
-arm64 and amd64, the agent is a compiled guest executable, and the initramfs
-contains architecture-specific executables. Package-owned defaults therefore
-belong below a private `lib` directory rather than `/usr/share` or
-`/usr/local/share`.
-
-The current `/usr/local/share/silo/assets` location is a transitional lookup
-fallback, not the canonical destination for new packages.
-
-## XDG User Paths
-
-Linux and macOS use the same XDG conventions for user-owned product files and
-mutable state. Silo does not use `~/Library/Application Support`,
-`~/Library/Caches`, or `~/Library/Logs` on macOS.
-
-| Purpose | Environment location | Fallback on Linux and macOS |
-| --- | --- | --- |
-| Data root, database, machines | `$XDG_DATA_HOME/silo` | `$HOME/.local/share/silo` |
-| Images | `$XDG_DATA_HOME/silo/images` | `$HOME/.local/share/silo/images` |
-| Downloaded runtimes | `$XDG_DATA_HOME/silo/runtimes` | `$HOME/.local/share/silo/runtimes` |
-| Downloaded kernels | `$XDG_DATA_HOME/silo/kernels` | `$HOME/.local/share/silo/kernels` |
-| Configuration | `$XDG_CONFIG_HOME/silo` | `$HOME/.config/silo` |
-| Cache | `$XDG_CACHE_HOME/silo` | `$HOME/.cache/silo` |
-| Logs and durable operational state | `$XDG_STATE_HOME/silo` | `$HOME/.local/state/silo` |
-| Sockets, locks, and PID files | `$XDG_RUNTIME_DIR/silo` | An owner-isolated directory below `std::env::temp_dir()` |
+| Purpose                            | Environment location           | Fallback on Linux and macOS                              |
+| ---------------------------------- | ------------------------------ | -------------------------------------------------------- |
+| Data root, database, machines      | `$XDG_DATA_HOME/silo`          | `$HOME/.local/share/silo`                                |
+| Images                             | `$XDG_DATA_HOME/silo/images`   | `$HOME/.local/share/silo/images`                         |
+| Downloaded runtimes                | `$XDG_DATA_HOME/silo/runtimes` | `$HOME/.local/share/silo/runtimes`                       |
+| Downloaded kernels                 | `$XDG_DATA_HOME/silo/kernels`  | `$HOME/.local/share/silo/kernels`                        |
+| Configuration                      | `$XDG_CONFIG_HOME/silo`        | `$HOME/.config/silo`                                     |
+| Cache                              | `$XDG_CACHE_HOME/silo`         | `$HOME/.cache/silo`                                      |
+| Logs and durable operational state | `$XDG_STATE_HOME/silo`         | `$HOME/.local/state/silo`                                |
+| Sockets, locks, and PID files      | `$XDG_RUNTIME_DIR/silo`        | An owner-isolated directory below `std::env::temp_dir()` |
 
 The default data tree remains compatible with the existing Linux layout:
 
@@ -367,7 +277,7 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/silo/
   kernels/
 ```
 
-Durable operational output has a fixed state layout:
+Durable operational output has this fixed state layout:
 
 ```text
 ${XDG_STATE_HOME:-$HOME/.local/state}/silo/
@@ -377,6 +287,9 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/silo/
         vm.trace.log
         serial.log
         vm.exit.json
+    networks/
+      <network-id>/
+        netd.log
 ```
 
 Ephemeral per-machine process files use the run root:
@@ -392,9 +305,9 @@ Ephemeral per-machine process files use the run root:
 ```
 
 Canonical machine configuration, disks, and launch-derived artifacts remain
-below the data root. Logs and exit records are durable operational state but are
-not canonical machine configuration. PID files, sockets, network runtime files,
-and locks are ephemeral and never belong below the data root in a newly created
+below the data root. Logs and exit records are durable operational state, not
+canonical machine configuration. PID files, sockets, network runtime files, and
+locks are ephemeral and never belong below the data root in a newly created
 layout.
 
 Existing installations may contain logs, PID files, sockets, and exit records
@@ -403,10 +316,16 @@ is stopped. It moves durable logs and exit records into the state layout, drops
 stale ephemeral files, and leaves canonical machine data in place. If the
 machine is active, migration fails with an actionable stop-and-retry error.
 Legacy files are not silently deleted before their durable replacements have
-been moved successfully.
+moved successfully.
 
-XDG environment paths and `$HOME` must be absolute when used. A relative value
-is rejected rather than interpreted relative to the process working directory.
+Existing `netd.log` files below a legacy run root move to the network-log state
+layout only after the associated netd process has stopped. Packet captures are
+not covered by this migration contract. Their retention remains a separate
+product decision.
+
+XDG environment paths and `$HOME` must be absolute when used. Silo rejects a
+relative value rather than interpreting it relative to the process working
+directory.
 
 ### Ephemeral Runtime Directory
 
@@ -418,9 +337,9 @@ The run-root resolution order is:
 
 Silo uses Rust's platform temporary-directory resolution rather than reading
 `TMPDIR` directly. On macOS that API normally returns the user's Darwin
-temporary directory, so the fallback is `<temp-dir>/silo`. On systems where the
-returned base is shared, including the common Linux `/tmp` case, the fallback
-includes the effective user identity, for example `/tmp/silo-1000`.
+temporary directory, so the fallback is `<temp-dir>/silo`. Where the returned
+base is shared, including the common Linux `/tmp` case, the fallback includes
+the effective user identity, for example `/tmp/silo-1000`.
 
 The directory is created with mode `0700`. Silo verifies that it is a real
 directory owned by the effective user and rejects symlinks, foreign ownership,
@@ -460,11 +379,11 @@ struct ResolvedRuntimeComponents {
 }
 ```
 
-The exact internal type is not a public compatibility promise. The invariant is
-that normal resolution selects one coherent installation rather than mixing
-helpers and assets from unrelated locations.
+This is a non-normative internal shape, not a public compatibility promise. The
+invariant is that normal resolution selects one coherent installation rather
+than mixing helpers and assets from unrelated locations.
 
-### Precedence
+### Authoritative Precedence
 
 Resolution follows this order:
 
@@ -489,31 +408,31 @@ SILO_ASSET_DIR
 ```
 
 `SILO_RUNTIME_DIR` selects the complete portable root. Explicit per-component
-paths can replace individual files for testing and embedding.
+paths can replace individual files for testing and embedding. All explicit
+paths are absolute. Portable-root resolution verifies that derived paths remain
+below the selected root and are regular files. `vmmon`, `netd`, `krun`, and
+`agent` must be executable. `kernel-default` and `initramfs` must be readable
+but need not be executable.
 
-All explicit paths are absolute. Portable-root resolution verifies that derived
-paths remain below the selected root and are regular files. `vmmon`, `netd`,
-`krun`, and `agent` must be executable. `kernel-default` and `initramfs` must be
-readable but need not be executable. App-bundle resolution additionally
-validates bundle identifier `sh.silo.app`, exact release compatibility,
-architecture, and minimum system version. Native package resolution checks only
-a small documented set of platform paths; it does not query dpkg, rpm,
-Homebrew, Spotlight, or mounted volumes.
+App-bundle resolution additionally validates bundle identifier `sh.silo.app`,
+exact release compatibility, architecture, and minimum system version. Native
+package resolution checks only a small documented set of platform paths; it does
+not query dpkg, rpm, Homebrew, Spotlight, or mounted volumes.
 
-Explicit machine asset overrides remain independent. An explicit machine
-kernel, initramfs, or agent wins for that asset without replacing the other
-defaults. Every omitted asset comes from the one asset directory selected by
-the resolved installation. `SILO_ASSET_DIR` likewise selects one complete
-default asset set. Transitional asset locations are considered as complete
-directories and never mixed per file.
+Explicit machine asset overrides remain independent. An explicit machine kernel,
+initramfs, or agent wins for that asset without replacing the other defaults.
+Every omitted asset comes from the one asset directory selected by the resolved
+installation. `SILO_ASSET_DIR` likewise selects one complete default asset set.
+Transitional asset locations are considered as complete directories and never
+mixed per file.
 
-A failure identifies the missing component, the candidate locations considered,
-the malformed override if one was supplied, and the expected native or portable
-layout.
+A failure identifies the missing component, candidate locations considered, a
+malformed supplied override, and the expected native or portable layout.
 
-## No Runtime Manifest
+### No Runtime Manifest
 
-A path-bearing manifest cannot eliminate discovery:
+Discovery derives the fixed paths directly after it finds an installation. A
+path-bearing manifest cannot remove that prerequisite:
 
 ```text
 find component
@@ -523,59 +442,90 @@ find manifest
   -> still requires a convention
 ```
 
-Once a convention finds the manifest, the same convention can derive this
-atomic runtime's fixed paths directly. A manifest would become justified if
-components were independently installed, independently upgraded,
-content-addressed, supplied by third parties, or selected among coexisting
-compatibility generations. None of those conditions applies to the initial
-runtime.
-
+A manifest becomes justified if components are independently installed,
+independently upgraded, content-addressed, supplied by third parties, or chosen
+from coexisting compatibility generations. None applies to the initial runtime.
 There is also no `--component-info` protocol. Release identity and provenance
 belong in application metadata, package metadata, release checksums, SBOMs, and
-attestations rather than a subprocess probe required for discovery.
+attestations, not in a subprocess probe required for discovery.
 
-## Version Compatibility
+## Product Distributions
 
-Official runtime components are co-versioned and updated atomically. The initial
-compatibility policy is deliberately strict:
+### macOS Product Layout And Distribution
 
-- product packages co-install one matching CLI and runtime;
-- Node and Python platform packages use the exact SDK package version;
-- Go downloads the exact runtime release matching the SDK version;
-- direct Rust consumers use a co-installed runtime or pass an explicit root;
-- custom mixed-version component paths are unsupported and remain the caller's
-  responsibility;
-- runtime components are not upgraded independently.
+The macOS product is a relocatable application bundle:
 
-This avoids inventing compatibility ranges before Silo has a real independent
-component compatibility promise. A later protocol negotiation mechanism may be
-added if independent updates become necessary. It does not require changing the
-path-discovery design.
+```text
+Silo.app/
+  Contents/
+    Info.plist
+    MacOS/
+      silo
+    Helpers/
+      vmmon
+      netd
+      krun
+    Resources/
+      assets/
+        kernel-default
+        initramfs
+        agent
+```
 
-## Default Kernel Provenance
+The layout defines the component paths without a Silo-specific manifest:
 
-Release CI obtains the default kernel from Silo's stable OCI artifact during
-staging:
+```text
+vmmon     = Contents/Helpers/vmmon
+netd      = Contents/Helpers/netd
+krun      = Contents/Helpers/krun
+kernel    = Contents/Resources/assets/kernel-default
+initramfs = Contents/Resources/assets/initramfs
+agent     = Contents/Resources/assets/agent
+```
 
-1. Resolve the stable OCI index.
-2. Select the target architecture manifest.
-3. Verify the expected Silo kernel media types.
-4. Verify the platform manifest and layer digests.
-5. Extract the kernel as `assets/kernel-default`.
-6. Record the index, platform manifest, and layer digests in release provenance.
-7. Package those exact bytes into every transport for the target.
+`Info.plist` carries standard application identity, version, and minimum-system
+metadata. It does not contain Silo runtime paths. The initial contract is:
 
-End users never receive a release whose default kernel depends on when they
-first run it. The installed runtime needs no registry access to boot its default
-kernel.
+| Key                          | Value or meaning                                  |
+| ---------------------------- | ------------------------------------------------- |
+| `CFBundleIdentifier`         | `sh.silo.app`                                     |
+| `CFBundleExecutable`         | `silo`                                            |
+| `CFBundleShortVersionString` | The public Silo release version                   |
+| `CFBundleVersion`            | The monotonically increasing release build number |
+| `LSMinimumSystemVersion`     | `26.0`                                            |
 
-The initramfs and agent are built from the corresponding Silo source release.
-Staging verifies that all three default assets match the target architecture.
+An SDK comparing itself with an installed app requires an exact
+`CFBundleShortVersionString` match. `CFBundleVersion` distinguishes rebuilt
+artifacts of the same public release but does not create runtime compatibility
+across public versions.
 
-Additional user-installed kernels are deferred. When added, they live below the
-XDG data root and never modify `Silo.app` or package-owned `/usr` paths.
+The CLI derives its bundle from the real executable, not the invocation path. It
+obtains `std::env::current_exe()`, canonicalizes it, recognizes
+`<bundle>/Contents/MacOS/silo`, validates the expected Silo bundle identity from
+`Info.plist`, and derives `Helpers` and `Resources` from `Contents`. This
+preserves Homebrew Cask invocation:
 
-## macOS Distribution
+```text
+/opt/homebrew/bin/silo
+        |
+        | symlink
+        v
+/Applications/Silo.app/Contents/MacOS/silo
+        |
+        +-- ../Helpers/vmmon
+        +-- ../Helpers/netd
+        +-- ../Helpers/krun
+        `-- ../Resources/assets
+```
+
+It also preserves relocatability to a user-owned location such as
+`~/Applications/Silo.app`; no lookup assumes `/Applications`. Copying
+`Contents/MacOS/silo` out of the bundle is not a supported command exposure
+method because it loses bundle origin. Command exposure uses a symlink. A copied
+executable may use an explicit runtime root or conventional shared installation,
+but does not claim the copied app's package-owned resources by name alone. The
+app bundle is read-only product content; creating or starting a machine never
+writes into it.
 
 The initial macOS channels are:
 
@@ -590,12 +540,10 @@ app "Silo.app"
 binary "#{appdir}/Silo.app/Contents/MacOS/silo", target: "silo"
 ```
 
-A tap is the repository containing package definitions. A Cask is the
-definition that installs the prebuilt application.
-
-A PKG is deferred until direct non-Homebrew command installation, installer
-receipts, enterprise deployment, or MDM support is required. A DMG does not
-place a command on `PATH` by itself.
+A tap is the repository containing package definitions. A Cask is the definition
+that installs the prebuilt application. A PKG is deferred until direct
+non-Homebrew command installation, installer receipts, enterprise deployment,
+or MDM support is required. A DMG does not place a command on `PATH` by itself.
 
 Installing into `/Applications` or a system command directory may require
 administrator authorization. A no-admin installation may use:
@@ -605,15 +553,12 @@ administrator authorization. A no-admin installation may use:
 $HOME/.local/bin/silo -> ~/Applications/Silo.app/Contents/MacOS/silo
 ```
 
-### Signing
-
 Production signing happens after the complete app is assembled. Nested code is
-signed from the inside out without `codesign --deep`.
-
-`vmmon` receives the Virtualization entitlement. `krun` receives the Hypervisor
-entitlement. Other entitlements are granted only when their need is demonstrated
-for that executable. The CLI and `netd` do not inherit virtualization
-entitlements merely because they share the bundle.
+signed from the inside out without `codesign --deep`. `vmmon` receives the
+Virtualization entitlement and `krun` receives the Hypervisor entitlement. Other
+entitlements are granted only when their need is demonstrated for that
+executable. The CLI and `netd` do not inherit virtualization entitlements merely
+because they share the bundle.
 
 The release pipeline:
 
@@ -630,10 +575,62 @@ The release pipeline:
 11. Staples and validates the notarization ticket.
 12. Tests the result on a clean macOS 26 machine without development tools.
 
-Ad-hoc signing remains a development convenience and is not a release
-signature.
+Ad-hoc signing remains a development convenience and is not a release signature.
 
-## Linux Distribution
+### Linux Product Layouts And Distribution
+
+Distro packages install the public frontend at:
+
+```text
+/usr/bin/silo
+```
+
+Debian, Ubuntu, and Arch packages use:
+
+```text
+/usr/lib/silo/
+  bin/
+    vmmon
+    netd
+    krun
+  assets/
+    kernel-default
+    initramfs
+    agent
+```
+
+RHEL follows package macros and may split private executables from
+architecture-specific assets:
+
+```text
+%{_libexecdir}/silo/
+  vmmon
+  netd
+  krun
+
+%{_libdir}/silo/assets/
+  kernel-default
+  initramfs
+  agent
+```
+
+The resolver models explicit resolved component paths; it does not pretend every
+native installation has one physical runtime root. Distro packages do not
+install into `/usr/local`, which is reserved for local administrator
+installations. A source or administrator installation may use:
+
+```text
+/usr/local/bin/silo
+/usr/local/lib/silo/bin/
+/usr/local/lib/silo/assets/
+```
+
+The default assets are architecture-specific: the kernel differs between arm64
+and amd64, the agent is a compiled guest executable, and the initramfs contains
+architecture-specific executables. Package-owned defaults therefore belong below
+a private `lib` directory rather than `/usr/share` or `/usr/local/share`. The
+current `/usr/local/share/silo/assets` location is a transitional lookup
+fallback, not the canonical destination for new packages.
 
 Release CI produces separate amd64 and arm64 artifacts:
 
@@ -641,31 +638,30 @@ Release CI produces separate amd64 and arm64 artifacts:
 - RPM packages;
 - Arch binary packages;
 - generic `.tar.zst` runtime or CLI archives;
-- detached checksums and signatures;
+- detached checksums and signatures; and
 - SBOM and provenance records.
 
-Silo uses nFPM directly for deb, rpm, and Arch package construction. The payload
-contains Rust binaries, a Go binary, generated assets, and a kernel artifact, so
-separate Rust-only package generators would duplicate layout configuration.
-
-AUR publication remains separate and requires a reviewed `PKGBUILD`. The
-nFPM-produced Arch package remains useful as a direct binary release.
+Silo uses nFPM directly for deb, rpm, and Arch package construction. The
+payload contains Rust binaries, a Go binary, generated assets, and a kernel
+artifact, so separate Rust-only package generators would duplicate layout
+configuration. AUR publication remains separate and requires a reviewed
+`PKGBUILD`. The nFPM-produced Arch package remains useful as a direct binary
+release.
 
 Linux binaries are built against the glibc 2.39 baseline. CI records the symbol
 versions required by each final ELF file and rejects dependencies on newer glibc
 or libstdc++ symbols. A future baseline change updates the support matrix and
-every Linux transport together.
+every Linux transport together. There is no system daemon, service unit, setuid
+executable, or privileged runtime installation helper.
 
-There is no system daemon, service unit, setuid executable, or privileged
-runtime installation helper.
+## SDK Distributions
 
-## Node Distribution
+### Current Node SDK Compatibility Contract
 
 The Node SDK is a TypeScript facade over a native N-API addon. It does not launch
-the `silo` CLI.
-
-The package family consists of a platform-neutral `silo` package and exact-
-version optional platform packages, conceptually:
+the `silo` CLI. The package family consists of a platform-neutral `silo` package
+and exact-version optional platform packages. The following names are
+non-normative conceptual package names:
 
 ```text
 silo
@@ -678,10 +674,9 @@ The neutral package declares every platform package in `optionalDependencies`
 at the exact same version. Each platform package declares npm `os` and `cpu`
 restrictions; Linux packages also declare `libc: ["glibc"]`. Package-manager
 selection therefore installs only compatible optional payloads without an
-install script.
+install script. The exact npm scope is finalized before publication.
 
-The exact npm scope is finalized before publication. The platform package
-contract is:
+The platform package contract is:
 
 ```text
 native/
@@ -700,13 +695,11 @@ runtime/
 The JavaScript loader selects the package from `process.platform` and
 `process.arch`, resolves its package-relative `runtime` directory, and passes
 that bundled candidate to the native addon. An explicit API root and environment
-overrides retain higher precedence.
+overrides retain higher precedence. The loader does not use `process.execPath`,
+run a postinstall downloader, download at first VM start, search arbitrary
+global npm locations, or require a separate Silo CLI installation.
 
-The loader does not use `process.execPath`, run a postinstall downloader,
-download at first VM start, search arbitrary global npm locations, or require a
-separate Silo CLI installation.
-
-## Python Distribution
+### Future Python SDK Compatibility Contract
 
 A future Python SDK uses platform-specific wheels containing its native binding
 and the portable runtime:
@@ -735,7 +728,7 @@ The initial wheel matrix mirrors the supported targets: macOS arm64,
 the runtime's glibc floor. Wheels do not use first-run downloaders or
 installation scripts to acquire the default runtime.
 
-## Go Distribution
+### Future Go SDK Compatibility Contract
 
 Go modules have no clean equivalent to npm optional platform packages or Python
 platform wheels. A future Go SDK therefore exposes an explicit installation API
@@ -749,7 +742,7 @@ and macOS:
 ${XDG_DATA_HOME:-$HOME/.local/share}/silo/runtimes/<version>/<target>/
 ```
 
-Examples are:
+Examples:
 
 ```text
 $HOME/.local/share/silo/runtimes/0.1.0/darwin-arm64/
@@ -768,29 +761,22 @@ archive against the SDK-embedded digest before extraction, rejects archive
 traversal, preserves executable modes, coordinates concurrent installers, and
 atomically renames a completed temporary directory into place. It reuses an
 already verified exact version and supports explicit mirrors and offline
-pre-seeding only when their archive matches the embedded digest.
-
-The installation API returns the runtime root. `libvm` remains unaware of the
+pre-seeding only when their archive matches the embedded digest. The
+installation API returns the runtime root. `libvm` remains unaware of the
 download.
 
-## Rust Distribution
+### Direct Rust And Shared SDK Discovery
 
 `libvm` is the native Rust API boundary. Direct Rust consumers may use a
 conventionally installed Silo runtime, pass a portable runtime root, or pass
-explicit component paths.
-
-`libvm` does not download runtime components, install system packages, pull the
-default kernel, extract embedded executables, or infer arbitrary host-
-application resource directories. A future Rust convenience installer belongs
-in a separate explicit setup API or crate.
-
-## SDK Shared Discovery
+explicit component paths. `libvm` does not download runtime components, install
+system packages, pull the default kernel, extract embedded executables, or infer
+arbitrary host-application resource directories.
 
 Self-contained Node and Python packages use their package-local runtime before
-native shared-installation conventions, subject to explicit API and environment
-overrides.
-
-A macOS SDK without a bundled runtime may check exactly:
+native shared-installation conventions, subject to the higher-precedence explicit
+API and environment overrides in the authoritative discovery order. A macOS SDK
+without a bundled runtime may check exactly:
 
 ```text
 $HOME/Applications/Silo.app
@@ -799,83 +785,43 @@ $HOME/Applications/Silo.app
 
 It validates bundle identity, host architecture, minimum OS version, and app
 release metadata before use. It does not use Spotlight, scan mounted volumes, or
-execute the first application named `Silo.app`.
+execute the first application named `Silo.app`. Linux SDK packages are
+self-contained. Selecting a shared distro installation instead requires an
+explicit override unless compatibility can be established without querying
+package-manager databases.
 
-Linux SDK packages are self-contained. Selecting a shared distro installation
-instead requires an explicit override unless compatibility can be established
-without querying package-manager databases.
-
-## Size Budget
+### SDK Size Budget
 
 The initial compressed budget is 50 MiB for each Node platform package and
-Python platform wheel carrying the complete runtime. It is a product budget,
-not a file-format limit.
+Python platform wheel carrying the complete runtime. It is a product budget, not
+a file-format limit. Release CI reports compressed and installed sizes for every
+target. Exceeding the budget requires an explicit reviewed exception with the
+responsible components identified. Size pressure does not justify removing
+required runtime files or introducing an implicit first-run downloader.
 
-Release CI reports compressed and installed sizes for every target. Exceeding
-the budget requires an explicit reviewed exception with the responsible
-components identified. Size pressure does not justify removing required runtime
-files or introducing an implicit first-run downloader.
-
-## Release Staging
-
-A repository-owned staging command builds one canonical payload per target:
-
-1. Build `silo`, `vmmon`, `netd`, and `krun`.
-2. Use committed lockfiles and locked dependency resolution.
-3. Build the guest initramfs and standalone agent.
-4. Resolve and verify the target kernel OCI artifact.
-5. Strip release binaries.
-6. Normalize file names, modes, and reproducible timestamps where possible.
-7. Copy components into the portable runtime layout.
-8. Inspect dynamic dependencies and runtime search paths.
-9. Reject build-machine paths and unavailable shared libraries.
-10. Record source and kernel provenance in release metadata.
-11. Generate checksums, SBOMs, and attestations.
-12. Boot a VM using only the staged tree.
-13. Report raw and compressed sizes.
-14. Hand those files to each target packager.
-
-The repository may contain build-time staging configuration. That configuration
-is not installed and is never consulted by `libvm`.
-
-There is no free single tool that safely owns every Silo release concern. The
-toolchain is intentionally composed:
-
-```text
-repository-owned staging command
-        |
-        +-- Apple native tools -> Silo.app, DMG, notarization
-        +-- nFPM -> deb, rpm, Arch
-        +-- npm tooling -> Node platform packages
-        +-- Python tooling -> platform wheels
-        `-- tar/zstd -> portable and Go runtime archives
-```
-
-GoReleaser Pro is not part of the design. The common contract is the staged
-payload rather than one third-party packager.
-
-## Integrity Boundaries
+## Integrity And Release Qualification
 
 Distribution channels establish trust differently:
 
-| Channel | Primary trust mechanism |
-| --- | --- |
-| `Silo.app` | Apple code signature, hardened runtime, notarization, and stapling |
-| Homebrew Cask | Signed app plus Cask artifact checksum |
-| deb, rpm, Arch | Signed package or repository plus package-owned installed files |
-| npm | Registry integrity plus signed Mach-O files on macOS |
-| Python | Wheel/index integrity plus signed Mach-O files on macOS |
+| Channel             | Primary trust mechanism                                                              |
+| ------------------- | ------------------------------------------------------------------------------------ |
+| `Silo.app`          | Apple code signature, hardened runtime, notarization, and stapling                   |
+| Homebrew Cask       | Signed app plus Cask artifact checksum                                               |
+| deb, rpm, Arch      | Signed package or repository plus package-owned installed files                      |
+| npm                 | Registry integrity plus signed Mach-O files on macOS                                 |
+| Python              | Wheel/index integrity plus signed Mach-O files on macOS                              |
 | Go runtime download | Target digest embedded in the exact Go SDK release and Go module checksum provenance |
-| Generic archive | Detached release signature and checksum |
+| Generic archive     | SHA-256 checksum and keyless Sigstore bundle from the protected release workflow      |
 
-Normal VM launch does not rehash the entire runtime. A future `silo doctor` may
-validate files, modes, dynamic dependencies, release checksums, macOS
-signatures, target architecture, and kernel provenance.
+Normal VM launch does not rehash the entire runtime. Release materials retain
+required third-party notices, including libkrun's Apache-2.0 attribution.
 
-Release materials retain required third-party notices, including libkrun's
-Apache-2.0 attribution.
-
-## Release Gates
+Each generic archive publishes a detached `*.sigstore.json` bundle. Verification
+requires the GitHub Actions OIDC issuer and the certificate identity
+`https://github.com/vandycknick/silo/.github/workflows/release.yml@refs/tags/v<version>`,
+where `<version>` is the archive's public Silo version. Verification also
+requires a transparency-log inclusion proof. The independently published
+SHA-256 checksum remains part of the release material.
 
 Every release passes the relevant target gates.
 
@@ -898,14 +844,18 @@ Every release passes the relevant target gates.
 - The generic archive boots using only its portable root.
 - No `libkrun.so` dependency remains.
 
-### SDKs
+### Current SDKs
 
 - A clean npm installation with no system Silo boots a VM.
-- A clean Python wheel installation with no system Silo boots a VM.
-- Go explicit installation verifies and boots the downloaded exact runtime.
 - Missing platform packages produce actionable errors.
-- Unsupported targets fail before download or process spawn.
+- Unsupported targets fail before process spawn.
 - Compressed size is reported and remains within budget unless waived.
+
+The Python wheel and Go installer gates become mandatory when those future SDKs
+are implemented. Before its first release, the Python SDK must boot from a clean
+wheel installation with no system Silo. Before its first release, the Go SDK
+must reject unsupported targets before download, verify its exact runtime
+archive, and boot that installed runtime.
 
 ### General
 
@@ -922,9 +872,9 @@ ADR 0009 states that an installation owns default assets and that `libvm` and
 language SDKs do not install them. This ADR refines the language-package part of
 that statement:
 
-- `libvm` never installs assets;
-- a product package may be the installation that owns default assets;
-- a language platform package may itself own a bundled runtime;
+- `libvm` never installs assets.
+- A product package may be the installation that owns default assets.
+- A language platform package may itself own a bundled runtime.
 - SDK runtime transport is packaging behavior, not runtime-library behavior.
 
 ADR 0009's independent explicit machine overrides, per-launch default
@@ -935,84 +885,125 @@ asset set rather than falling through independently across directories.
 
 ## Consequences
 
-The normal CLI and SDK paths receive one complete, coherent runtime without
-manual configuration. The same staged files are qualified across transports,
-macOS bundles remain relocatable, Linux packages follow native conventions, and
-`libvm` remains a runtime library rather than a package manager. Removing the
-dynamic libkrun sidecar also removes a loader, RPATH, and nested-signing failure
-class.
+### Benefits
 
-The design deliberately duplicates runtime bytes across Node and Python target
-packages. Security fixes require updated SDK platform packages. macOS releases
-need native signing infrastructure, Linux releases need amd64 and arm64 builders
-and KVM qualification, and Go needs a secure explicit installer. Package size
-becomes a maintained product constraint.
+- The normal CLI and SDK paths receive one complete, coherent runtime without
+  manual configuration.
+- The same staged files are qualified across transports.
+- macOS bundles remain relocatable and Linux packages follow native conventions.
+- `libvm` remains a runtime library rather than a package manager.
+- Compiling the pinned libkrun fork into the krun helper removes a loader, RPATH,
+  and nested-signing failure class.
 
-Convention-based discovery must produce strong diagnostics because there is no
-manifest to inspect. Native package layouts also require the resolver to model
-explicit components rather than force every installation into one physical
-root.
+### Tradeoffs
 
-## Rejected Alternatives
+- Node and Python target packages duplicate runtime bytes, and security fixes
+  require updated SDK platform packages.
+- macOS releases require native signing infrastructure; Linux releases require
+  amd64 and arm64 builders and KVM qualification; Go requires a secure explicit
+  installer.
+- Package size is a maintained product constraint.
+- Convention-based discovery must provide strong diagnostics because there is no
+  manifest to inspect.
+- Native package layouts require the resolver to model explicit components
+  rather than force every installation into one physical root.
+
+## Alternatives Considered
+
+The following alternatives are rejected for the initial runtime design.
 
 ### Path-Bearing Runtime Manifest
 
-Rejected because finding the manifest still requires a convention and the
-initial runtime is one atomic compatibility set with deterministic paths.
+This would centralize component paths, but finding the manifest still requires a
+convention. The initial runtime is one atomic compatibility set with
+deterministic paths, so the manifest adds another artifact without removing
+discovery.
 
 ### Component Information Commands
 
-Rejected because `--component-info` adds subprocess API and startup complexity
-without solving a current independent-versioning requirement.
+A `--component-info` command could expose component data through a subprocess,
+but it adds a subprocess API and startup complexity without a current
+independent-versioning requirement.
 
 ### Embedded Executable Bytes
 
-Rejected because helpers must be executable files, kernels need stable paths,
-macOS signatures must remain valid, and extraction adds locking, permissions,
-cleanup, and Gatekeeper failure modes.
+Embedding would make transport self-contained, but helpers must be executable
+files, kernels need stable paths, macOS signatures must remain valid, and
+extraction adds locking, permissions, cleanup, and Gatekeeper failure modes.
 
 ### Shared Runtime Only
 
-Rejected because requiring every Node and Python user to install a separate
-system product makes SDK deployment unnecessarily fragile.
+A shared runtime avoids SDK payload duplication, but requiring every Node and
+Python user to install a separate system product makes SDK deployment
+unnecessarily fragile.
 
-### Runtime Downloads In libvm
+### Runtime Downloads In `libvm`
 
-Rejected because acquisition, update, mirror, and trust policy do not belong in
-the core runtime library.
+This would make acquisition available to all frontends, but acquisition, update,
+mirror, and trust policy do not belong in the core runtime library.
 
 ### Implicit SDK Downloads
 
-Rejected because downloading during import, runtime open, or VM start creates
-surprising network access and nondeterministic offline behavior.
+Downloading during import, runtime open, or VM start creates surprising network
+access and nondeterministic offline behavior.
 
 ### One Universal Physical Layout
 
-Rejected because app bundles, FHS packages, SDK packages, and user-owned XDG
-runtimes have distinct ownership and installation conventions.
-
-### Dynamic libkrun Sidecars
-
-Rejected and superseded by compiling the pinned libkrun fork directly into the
-krun helper.
+One layout would reduce resolver cases, but app bundles, FHS packages, SDK
+packages, and user-owned XDG runtimes have distinct ownership and installation
+conventions.
 
 ### One Generic Release Tool
 
-Rejected because a paid generic packager does not replace Silo's mixed-language
-staging, per-executable Apple entitlements, signing order, and clean-machine
-qualification.
+A generic tool could centralize release packaging, but a paid generic packager
+does not replace Silo's mixed-language staging, per-executable Apple
+entitlements, signing order, and clean-machine qualification.
 
-## Deferred Work
+## Accepted Limitations
 
-The following remain separate decisions or implementation work:
+- The initial host scope excludes Intel macOS, macOS before version 26, Windows,
+  other Linux architectures, and cross-architecture guest CPU emulation.
+- The initial GNU/Linux glibc 2.39 baseline does not claim compatibility with
+  older releases.
+- macOS packages the dormant krun helper but selects only VZ.
+- zip-only Python imports are unsupported unless the package is first
+  materialized into a stable directory.
+- A DMG alone does not place a command on `PATH`.
+
+## What This Does Not Decide
+
+This ADR does not decide the following adjacent product or compatibility
+questions:
 
 - selecting krun instead of VZ on macOS;
 - PKG and enterprise or MDM installation;
 - independently updated runtime components and compatibility ranges;
 - additional downloaded kernel management;
-- final npm scope and Python or Go public API design;
-- a `silo doctor` integrity and diagnostics command;
-- publishing an AUR `PKGBUILD`.
+- final npm scope and Python or Go public API design; and
+- a future Rust convenience installer, which belongs in a separate explicit
+  setup API or crate.
+
+## Deferred Implementation Work
+
+The following delivery work remains deferred:
+
+- a `silo doctor` integrity and diagnostics command that may validate files,
+  modes, dynamic dependencies, release checksums, macOS signatures, target
+  architecture, and kernel provenance; and
+- publishing an AUR `PKGBUILD`, which remains separate and requires review.
 
 The layouts, discovery rules, XDG ownership model, and release staging contract
-in this ADR are intended to support those additions without replacement.
+in this ADR support these additions without replacement.
+
+## External References
+
+- [Apple: Bundle resources](https://developer.apple.com/documentation/bundleresources)
+- [Apple: Creating distribution-signed code for macOS](https://developer.apple.com/documentation/xcode/creating-distribution-signed-code-for-the-mac)
+- [Apple: Notarizing macOS software before distribution](https://developer.apple.com/documentation/security/notarizing_macos_software_before_distribution)
+- [Homebrew: Cask Cookbook](https://docs.brew.sh/Cask-Cookbook)
+- [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/latest/)
+- [OCI Image Specification: Image Manifest](https://github.com/opencontainers/image-spec/blob/main/manifest.md)
+- [npm: `package.json` platform metadata and optional dependencies](https://docs.npmjs.com/cli/v11/configuring-npm/package-json)
+- [PEP 600: Future `manylinux` platform tags](https://peps.python.org/pep-0600/)
+- [Go Modules Reference: Authenticating modules](https://go.dev/ref/mod#authenticating)
+- [nFPM documentation](https://nfpm.goreleaser.com/)
