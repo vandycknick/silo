@@ -8,8 +8,10 @@ use clap::{Parser, Subcommand};
 use thiserror::Error;
 
 use crate::initramfs::{write_initramfs, InitramfsOptions};
+use crate::release_target::{BuildProfile, ReleaseTarget};
 
 mod initramfs;
+mod release_target;
 
 #[cfg(target_arch = "x86_64")]
 const DEFAULT_GUEST_TARGET: &str = "x86_64-unknown-linux-musl";
@@ -28,6 +30,7 @@ struct Args {
 enum Commands {
     GuestAssets(GuestAssetsArgs),
     PackInitramfs(PackInitramfsArgs),
+    ReleaseTarget(ReleaseTargetArgs),
     SignVmmon(SignVmmonArgs),
 }
 
@@ -49,6 +52,15 @@ struct PackInitramfsArgs {
     init: PathBuf,
     #[arg(long, value_name = "PATH")]
     out: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+#[command(about = "Print the canonical release target descriptor")]
+struct ReleaseTargetArgs {
+    #[arg(long, value_enum)]
+    target: ReleaseTarget,
+    #[arg(long, value_enum, default_value_t = BuildProfile::Release)]
+    profile: BuildProfile,
 }
 
 #[derive(Debug, Parser)]
@@ -84,6 +96,24 @@ enum XtaskError {
         to: PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to read release package manifest {path}")]
+    ReadReleasePackageManifest {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to parse release package manifest {path}")]
+    ParseReleasePackageManifest {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    #[error("release package manifest {path} has no string version")]
+    MissingReleasePackageVersion { path: PathBuf },
+    #[error("release package version mismatch in {path}: expected {expected}, found {actual}")]
+    ReleasePackageVersionMismatch {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
     #[error("failed to run {program}")]
     RunCommand {
         program: String,
@@ -111,8 +141,89 @@ fn run() -> Result<()> {
     match Args::parse().command {
         Commands::GuestAssets(args) => guest_assets(args),
         Commands::PackInitramfs(args) => pack_initramfs(args),
+        Commands::ReleaseTarget(args) => {
+            validate_release_versions()?;
+            print!("{}", release_target_output(args));
+            Ok(())
+        }
         Commands::SignVmmon(args) => sign_vmmon(args),
     }
+}
+
+fn validate_release_versions() -> Result<()> {
+    let node_package = workspace_root()?.join("sdk/node/package.json");
+    validate_package_version(&node_package, env!("CARGO_PKG_VERSION"))
+}
+
+fn validate_package_version(path: &Path, expected: &str) -> Result<()> {
+    let contents =
+        fs::read_to_string(path).map_err(|source| XtaskError::ReadReleasePackageManifest {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let manifest: serde_json::Value = serde_json::from_str(&contents).map_err(|source| {
+        XtaskError::ParseReleasePackageManifest {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    let actual = manifest
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| XtaskError::MissingReleasePackageVersion {
+            path: path.to_path_buf(),
+        })?;
+    if actual == expected {
+        return Ok(());
+    }
+
+    Err(XtaskError::ReleasePackageVersionMismatch {
+        path: path.to_path_buf(),
+        expected: expected.to_string(),
+        actual: actual.to_string(),
+    })
+}
+
+fn release_target_output(args: ReleaseTargetArgs) -> String {
+    let descriptor = args.target.descriptor();
+    format!(
+        concat!(
+            "release_version={}\n",
+            "silo_target={}\n",
+            "rust_target={}\n",
+            "zig_target={}\n",
+            "glibc_baseline={}\n",
+            "macos_minimum_version={}\n",
+            "guest_target={}\n",
+            "goos={}\n",
+            "goarch={}\n",
+            "oci_platform={}\n",
+            "npm_os={}\n",
+            "npm_cpu={}\n",
+            "npm_libc={}\n",
+            "deb_arch={}\n",
+            "rpm_arch={}\n",
+            "archlinux_arch={}\n",
+            "stage_dir={}\n",
+        ),
+        env!("CARGO_PKG_VERSION"),
+        descriptor.name,
+        descriptor.rust_target,
+        descriptor.zig_target.unwrap_or_default(),
+        descriptor.glibc_baseline.unwrap_or_default(),
+        descriptor.macos_minimum_version.unwrap_or_default(),
+        descriptor.guest_target,
+        descriptor.goos,
+        descriptor.goarch,
+        descriptor.oci_platform,
+        descriptor.npm_os,
+        descriptor.npm_cpu,
+        descriptor.npm_libc.unwrap_or_default(),
+        descriptor.deb_arch,
+        descriptor.rpm_arch,
+        descriptor.archlinux_arch,
+        descriptor.stage_dir(args.profile).display(),
+    )
 }
 
 fn guest_assets(args: GuestAssetsArgs) -> Result<()> {
@@ -274,4 +385,89 @@ fn status_text(status: ExitStatus) -> String {
         .code()
         .map(|code| code.to_string())
         .unwrap_or_else(|| "terminated by signal".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use crate::release_target::{BuildProfile, ReleaseTarget};
+    use crate::{
+        release_target_output, validate_package_version, Args, Commands, ReleaseTargetArgs,
+        XtaskError,
+    };
+
+    #[test]
+    fn release_target_command_defaults_to_release_profile() {
+        let args = Args::try_parse_from(["xtask", "release-target", "--target", "darwin-arm64"])
+            .expect("parse release-target command");
+
+        let Commands::ReleaseTarget(args) = args.command else {
+            panic!("expected release-target command");
+        };
+        assert_eq!(args.target, ReleaseTarget::DarwinArm64);
+        assert_eq!(args.profile, BuildProfile::Release);
+    }
+
+    #[test]
+    fn release_target_output_is_stable() {
+        let output = release_target_output(ReleaseTargetArgs {
+            target: ReleaseTarget::DarwinArm64,
+            profile: BuildProfile::Debug,
+        });
+
+        assert_eq!(
+            output,
+            concat!(
+                "release_version=0.1.0\n",
+                "silo_target=darwin-arm64\n",
+                "rust_target=aarch64-apple-darwin\n",
+                "zig_target=\n",
+                "glibc_baseline=\n",
+                "macos_minimum_version=26.0\n",
+                "guest_target=aarch64-unknown-linux-musl\n",
+                "goos=darwin\n",
+                "goarch=arm64\n",
+                "oci_platform=linux/arm64\n",
+                "npm_os=darwin\n",
+                "npm_cpu=arm64\n",
+                "npm_libc=\n",
+                "deb_arch=arm64\n",
+                "rpm_arch=aarch64\n",
+                "archlinux_arch=aarch64\n",
+                "stage_dir=target/silo-runtime/darwin-arm64/debug\n",
+            )
+        );
+    }
+
+    #[test]
+    fn package_version_must_match_release_version() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let package = temp.path().join("package.json");
+        std::fs::write(&package, r#"{"version":"1.2.3"}"#).expect("write package manifest");
+
+        validate_package_version(&package, "1.2.3").expect("matching version");
+        let error = validate_package_version(&package, "1.2.4").expect_err("version mismatch");
+        assert!(matches!(
+            error,
+            XtaskError::ReleasePackageVersionMismatch {
+                expected,
+                actual,
+                ..
+            } if expected == "1.2.4" && actual == "1.2.3"
+        ));
+    }
+
+    #[test]
+    fn package_version_must_be_a_string() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let package = temp.path().join("package.json");
+        std::fs::write(&package, r#"{"name":"silo"}"#).expect("write package manifest");
+
+        let error = validate_package_version(&package, "1.2.3").expect_err("missing version");
+        assert!(matches!(
+            error,
+            XtaskError::MissingReleasePackageVersion { .. }
+        ));
+    }
 }
