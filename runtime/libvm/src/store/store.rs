@@ -200,10 +200,15 @@ mod tests {
 
         assert_eq!(config.data_root, paths.data_dir().display().to_string());
         assert_eq!(
-            config.run_root,
+            config.legacy_run_root,
             paths.roots().run_root().display().to_string()
         );
         assert_eq!(config.image_root, paths.images_dir().display().to_string());
+        assert_eq!(
+            config.state_root,
+            Some(paths.roots().state_root().display().to_string())
+        );
+        assert!(config.state_migration_complete);
     }
 
     #[tokio::test]

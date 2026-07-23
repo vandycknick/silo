@@ -32,6 +32,7 @@ pub struct MachineData {
     pub spec: VmSpec,
     /// Directory containing this machine's persistent runtime files.
     pub machine_dir: PathBuf,
+    trace_log_path: PathBuf,
     /// Unix timestamp for when the machine was created.
     pub created_at: i64,
     /// Unix timestamp for the last configuration change.
@@ -70,7 +71,7 @@ pub struct MachineData {
 
 impl MachineData {
     pub(crate) fn from_models_with_status(
-        config: MachineConfig,
+        config_and_trace_log: (MachineConfig, PathBuf),
         status: MachineStatus,
         boot_report: Option<MachineBootReport>,
         provision_report: Option<MachineProvisionReport>,
@@ -78,11 +79,13 @@ impl MachineData {
         last_error: Option<String>,
         updated_at: i64,
     ) -> Self {
+        let (config, trace_log_path) = config_and_trace_log;
         Self {
             id: config.id.to_string(),
             name: config.name,
             spec: config.spec,
             machine_dir: config.machine_dir,
+            trace_log_path,
             created_at: config.created_at,
             modified_at: config.modified_at,
             image_ref: config.image_ref,
@@ -107,7 +110,7 @@ impl MachineData {
 
     /// Returns the runtime trace log path for this machine.
     pub fn trace_log_path(&self) -> PathBuf {
-        crate::paths::vmmon_trace_log_path_in(&self.machine_dir)
+        self.trace_log_path.clone()
     }
 }
 

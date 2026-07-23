@@ -2,6 +2,7 @@ pub(crate) mod boot_assets;
 mod builder;
 mod config;
 pub(crate) mod core;
+pub(crate) mod migration;
 mod transitions;
 
 pub use builder::RuntimeBuilder;

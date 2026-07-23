@@ -2,7 +2,10 @@ use std::env::consts::OS;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-use crate::paths::{resolve_default_data_dir, resolve_default_run_dir, LocalPaths, LocalRoots};
+use crate::paths::{
+    ensure_secure_run_dir, resolve_default_data_dir, resolve_default_run_dir,
+    resolve_default_state_dir, LocalRoots,
+};
 use crate::store::models::DbConfig;
 use crate::LibVmError;
 
@@ -26,6 +29,8 @@ pub struct RuntimeConfig {
     pub run_root: PathChoice,
     /// Root containing unpacked machine images.
     pub image_root: PathChoice,
+    /// Root containing durable logs and operational state.
+    pub state_root: PathChoice,
     /// Networking configuration for locally started machines.
     pub networking: RuntimeNetworkingConfig,
     /// Explicit vmmon executable path.
@@ -39,6 +44,7 @@ impl RuntimeConfig {
             data_root: PathChoice::Explicit(data_dir.into()),
             run_root: PathChoice::Default,
             image_root: PathChoice::Default,
+            state_root: PathChoice::Default,
             networking: RuntimeNetworkingConfig::default(),
             vmmon_path: None,
         }
@@ -62,6 +68,12 @@ impl RuntimeConfig {
         self
     }
 
+    /// Sets the durable operational state root.
+    pub fn with_state_root(mut self, state_root: impl Into<PathBuf>) -> Self {
+        self.state_root = PathChoice::Explicit(state_root.into());
+        self
+    }
+
     /// Sets local runtime networking configuration.
     pub fn with_networking(mut self, networking: RuntimeNetworkingConfig) -> Self {
         self.networking = networking;
@@ -77,25 +89,28 @@ impl RuntimeConfig {
     pub(crate) fn resolve_roots(&self) -> Result<LocalRoots, LibVmError> {
         let data_root = self.bootstrap_data_root()?;
         let run_root = match &self.run_root {
-            PathChoice::Default => resolve_default_run_dir(&data_root)?,
+            PathChoice::Default => resolve_default_run_dir()?,
             PathChoice::Explicit(path) => path.clone(),
         };
+        validate_absolute_path("run_root", &run_root)?;
+        ensure_secure_run_dir(&run_root)?;
         let image_root = match &self.image_root {
             PathChoice::Default => data_root.join("images"),
             PathChoice::Explicit(path) => path.clone(),
         };
-        Ok(LocalRoots::with_roots(data_root, run_root, image_root))
+        let state_root = match &self.state_root {
+            PathChoice::Default => resolve_default_state_dir()?,
+            PathChoice::Explicit(path) => path.clone(),
+        };
+        Ok(LocalRoots::with_roots(
+            data_root, run_root, image_root, state_root,
+        ))
     }
 
-    pub(crate) fn bootstrap_paths(&self) -> Result<LocalPaths, LibVmError> {
+    pub(crate) fn bootstrap_state_db_path(&self) -> Result<PathBuf, LibVmError> {
         let data_root = self.bootstrap_data_root()?;
-        let roots = LocalRoots::with_roots(
-            data_root.clone(),
-            data_root.join("run"),
-            data_root.join("images"),
-        );
-        validate_roots_absolute(&roots)?;
-        Ok(LocalPaths::from_roots(roots))
+        validate_absolute_path("data_root", &data_root)?;
+        Ok(data_root.join("state.db"))
     }
 
     pub(crate) fn seed_db_config(&self) -> Result<DbConfig, LibVmError> {
@@ -115,6 +130,34 @@ impl RuntimeConfig {
         validate_roots_match_config(&roots, stored)?;
         compare_path("state_db_path", &roots.state_db_path(), opened_db_path)?;
         Ok(roots)
+    }
+
+    pub(crate) fn resolve_legacy_migration_roots(
+        &self,
+        stored: &DbConfig,
+        opened_db_path: &Path,
+    ) -> Result<(PathBuf, PathBuf, PathBuf), LibVmError> {
+        validate_db_config_header(stored)?;
+        let data_root = merge_root("data_root", &self.data_root, Path::new(&stored.data_root))?;
+        let image_root = merge_root(
+            "image_root",
+            &self.image_root,
+            Path::new(&stored.image_root),
+        )?;
+        let state_root = match stored.state_root.as_deref() {
+            Some(stored) => merge_root("state_root", &self.state_root, Path::new(stored))?,
+            None => match &self.state_root {
+                PathChoice::Default => resolve_default_state_dir()?,
+                PathChoice::Explicit(path) => path.clone(),
+            },
+        };
+        let legacy_run_root = PathBuf::from(&stored.legacy_run_root);
+        validate_absolute_path("data_root", &data_root)?;
+        validate_absolute_path("image_root", &image_root)?;
+        validate_absolute_path("state_root", &state_root)?;
+        validate_absolute_path("legacy_run_root", &legacy_run_root)?;
+        compare_path("state_db_path", &data_root.join("state.db"), opened_db_path)?;
+        Ok((data_root, state_root, legacy_run_root))
     }
 
     pub(crate) fn bootstrap_data_root(&self) -> Result<PathBuf, LibVmError> {
@@ -138,18 +181,35 @@ fn merge_roots(
         &runtime_config.data_root,
         Path::new(&stored.data_root),
     )?;
-    let run_root = merge_root(
-        "run_root",
-        &runtime_config.run_root,
-        Path::new(&stored.run_root),
-    )?;
+    let run_root = match &runtime_config.run_root {
+        PathChoice::Default => resolve_default_run_dir()?,
+        PathChoice::Explicit(path) => path.clone(),
+    };
+    validate_absolute_path("run_root", &run_root)?;
+    ensure_secure_run_dir(&run_root)?;
     let image_root = merge_root(
         "image_root",
         &runtime_config.image_root,
         Path::new(&stored.image_root),
     )?;
+    let stored_state_root =
+        stored
+            .state_root
+            .as_deref()
+            .ok_or(LibVmError::StateDatabaseConfigMismatch {
+                field: "state_root",
+                expected: "initialized absolute path".to_string(),
+                actual: "uninitialized".to_string(),
+            })?;
+    let state_root = merge_root(
+        "state_root",
+        &runtime_config.state_root,
+        Path::new(stored_state_root),
+    )?;
 
-    Ok(LocalRoots::with_roots(data_root, run_root, image_root))
+    Ok(LocalRoots::with_roots(
+        data_root, run_root, image_root, state_root,
+    ))
 }
 
 fn merge_root(
@@ -168,18 +228,28 @@ fn merge_root(
 
 fn validate_roots_match_config(roots: &LocalRoots, config: &DbConfig) -> Result<(), LibVmError> {
     compare_path("data_root", roots.data_root(), Path::new(&config.data_root))?;
-    compare_path("run_root", roots.run_root(), Path::new(&config.run_root))?;
     compare_path(
         "image_root",
         roots.image_root(),
         Path::new(&config.image_root),
-    )
+    )?;
+    let state_root =
+        config
+            .state_root
+            .as_deref()
+            .ok_or(LibVmError::StateDatabaseConfigMismatch {
+                field: "state_root",
+                expected: "initialized absolute path".to_string(),
+                actual: "uninitialized".to_string(),
+            })?;
+    compare_path("state_root", roots.state_root(), Path::new(state_root))
 }
 
 fn validate_roots_absolute(roots: &LocalRoots) -> Result<(), LibVmError> {
     validate_absolute_path("data_root", roots.data_root())?;
     validate_absolute_path("run_root", roots.run_root())?;
     validate_absolute_path("image_root", roots.image_root())
+        .and_then(|()| validate_absolute_path("state_root", roots.state_root()))
 }
 
 fn validate_absolute_path(field: &'static str, path: &Path) -> Result<(), LibVmError> {
@@ -254,6 +324,7 @@ impl Default for RuntimeConfig {
             data_root: PathChoice::Default,
             run_root: PathChoice::Default,
             image_root: PathChoice::Default,
+            state_root: PathChoice::Default,
             networking: RuntimeNetworkingConfig::default(),
             vmmon_path: None,
         }
@@ -351,6 +422,7 @@ mod tests {
             data_root,
             data_root.parent().unwrap().join("runtime-root"),
             data_root.parent().unwrap().join("image-root"),
+            data_root.parent().unwrap().join("state-root"),
         );
         (DbConfig::from_roots(&roots), roots)
     }
@@ -362,6 +434,7 @@ mod tests {
         let (stored, expected_roots) = stored_config(&data_root);
 
         let roots = RuntimeConfig::local(&data_root)
+            .with_run_root(expected_roots.run_root())
             .resolve_store_roots(&stored, &data_root.join("state.db"))
             .expect("resolve roots from stored contract");
 
@@ -369,22 +442,39 @@ mod tests {
     }
 
     #[test]
-    fn db_config_rejects_explicit_root_mismatch() {
+    fn db_config_accepts_a_different_run_root() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let data_root = temp.path().join("silo");
-        let image_root = temp.path().join("image-root");
-        let (stored, _) = stored_config(&data_root);
+        let (stored, expected_roots) = stored_config(&data_root);
+        let run_root = temp.path().join("other-runtime-root");
 
-        let err = RuntimeConfig::local(&data_root)
-            .with_run_root(temp.path().join("other-runtime-root"))
-            .with_image_root(&image_root)
+        let roots = RuntimeConfig::local(&data_root)
+            .with_run_root(&run_root)
             .resolve_store_roots(&stored, &data_root.join("state.db"))
-            .expect_err("explicit run root mismatch should fail");
+            .expect("run placement is not durable identity");
+
+        assert_eq!(roots.run_root(), run_root);
+        assert_eq!(roots.data_root(), expected_roots.data_root());
+        assert_eq!(roots.image_root(), expected_roots.image_root());
+        assert_eq!(roots.state_root(), expected_roots.state_root());
+    }
+
+    #[test]
+    fn db_config_rejects_explicit_state_root_mismatch() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_root = temp.path().join("silo");
+        let (stored, expected_roots) = stored_config(&data_root);
+
+        let error = RuntimeConfig::local(&data_root)
+            .with_run_root(expected_roots.run_root())
+            .with_state_root(temp.path().join("other-state-root"))
+            .resolve_store_roots(&stored, &data_root.join("state.db"))
+            .expect_err("state root mismatch should fail");
 
         assert!(matches!(
-            err,
+            error,
             LibVmError::StateDatabaseConfigMismatch {
-                field: "run_root",
+                field: "state_root",
                 ..
             }
         ));
@@ -393,7 +483,7 @@ mod tests {
     #[test]
     fn db_config_rejects_relative_roots() {
         let err = RuntimeConfig::local("relative-silo")
-            .bootstrap_paths()
+            .bootstrap_state_db_path()
             .expect_err("relative data root should fail");
 
         assert!(matches!(
@@ -403,6 +493,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn relative_run_root_is_rejected_before_creation() {
+        let relative =
+            std::path::PathBuf::from(format!("relative-runtime-{}", uuid::Uuid::new_v4()));
+        let error = RuntimeConfig::local(std::env::temp_dir().join("silo-data"))
+            .with_run_root(&relative)
+            .resolve_roots()
+            .expect_err("relative run root must fail");
+
+        assert!(matches!(
+            error,
+            LibVmError::StateDatabaseConfigMismatch {
+                field: "run_root",
+                ..
+            }
+        ));
+        assert!(!relative.exists());
     }
 
     #[test]

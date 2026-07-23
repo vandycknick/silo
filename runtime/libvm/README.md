@@ -37,21 +37,24 @@ The main shapes are:
 ## Runtime Roots
 
 The first runtime open resolves root defaults from process configuration,
-creates `state.db`, and stores the resolved root contract in `db_config`. Later
-opens use that row to keep existing installs stable even if code defaults change.
+creates `state.db`, and stores the durable root contract in `db_config`. Later
+opens use that row to keep existing data stable even if code defaults change.
+The run root is resolved independently for every open.
 
 The persisted root contract stores only main roots:
 
 - `data_root`: durable manager state. `state.db`, machines, assets, keys, and
   `secrets.json` derive from this root.
-- `run_root`: transient runtime state. Locks and network runtime directories
-  derive from this root.
 - `image_root`: local image and cache storage.
+- `state_root`: durable logs and operational state.
+
+`run_root` contains transient locks, PID files, sockets, and network runtime
+files. It is intentionally not durable database identity.
 
 `db_config` is a singleton row with `id = 1`. It records the host `os`,
-`data_root`, `run_root`, `image_root`, `created_at`, and `modified_at`. Derived
-paths are not duplicated in the row unless they become independently
-configurable. The derivation is:
+`data_root`, `image_root`, `state_root`, `created_at`, and `modified_at`. The
+historical `run_root` column is retained only as migration evidence for older
+databases. The derivation is:
 
 | Path           | Derived from             |
 | -------------- | ------------------------ |
@@ -62,7 +65,10 @@ configurable. The derivation is:
 | `secrets.json` | `data_root/secrets.json` |
 | `images/`      | `image_root`             |
 | `locks/`       | `run_root/locks`         |
-| `net/`         | `run_root/net`           |
+| `machines/<id>/vm.pid` | `run_root/machines/<id>/vm.pid` |
+| `networks/`    | `run_root/networks`      |
+| machine logs   | `state_root/logs/machines/<id>` |
+| network logs   | `state_root/logs/networks/<id>` |
 
 ## Lifecycle States
 

@@ -121,8 +121,8 @@ impl Runtime {
 
     /// Opens a local runtime from explicit configuration.
     pub async fn new(config: RuntimeConfig) -> Result<Self, LibVmError> {
-        let bootstrap_paths = config.bootstrap_paths()?;
-        let store = Store::open(bootstrap_paths.state_db_path()).await?;
+        let state_db_path = config.bootstrap_state_db_path()?;
+        let store = Store::open(&state_db_path).await?;
         let stored = match store.db_config().await? {
             Some(stored) => stored,
             None => {
@@ -130,7 +130,14 @@ impl Runtime {
                 store.read_or_seed_db_config(&seed).await?
             }
         };
-        let roots = config.resolve_store_roots(&stored, bootstrap_paths.state_db_path())?;
+        let stored = crate::runtime::migration::migrate_runtime_roots(
+            &config,
+            &store,
+            stored,
+            &state_db_path,
+        )
+        .await?;
+        let roots = config.resolve_store_roots(&stored, &state_db_path)?;
         let paths = LocalPaths::from_roots(roots);
         Self::from_store(paths, Arc::new(store), config.networking, config.vmmon_path).await
     }
@@ -1073,8 +1080,9 @@ impl Runtime {
             )
         };
 
+        let trace_log_path = self.paths.machine(config.id).vmmon_trace_log_path();
         Ok(MachineData::from_models_with_status(
-            config,
+            (config, trace_log_path),
             status,
             boot_report,
             provision_report,
@@ -1344,7 +1352,7 @@ pub(crate) fn validate_root_disk_growth(
     config: &MachineConfig,
     desired_size: u64,
 ) -> Result<(), LibVmError> {
-    let root_disk_path = MachinePaths::new(&config.machine_dir).root_disk_path();
+    let root_disk_path = crate::paths::root_disk_path_in(&config.machine_dir);
     let current_size = fs::metadata(&root_disk_path)?.len();
     if desired_size < current_size {
         return Err(LibVmError::InvalidMachineUpdate {
@@ -1366,7 +1374,7 @@ pub(crate) fn reconcile_root_disk_size(
         return Ok(crate::machine::root_disk::RootDiskResizeOutcome::GuestRequired);
     };
 
-    let root_disk_path = MachinePaths::new(&config.machine_dir).root_disk_path();
+    let root_disk_path = crate::paths::root_disk_path_in(&config.machine_dir);
     resize_raw_disk(&root_disk_path, desired_size).map_err(Into::into)
 }
 
@@ -1586,7 +1594,7 @@ fn apply_resolved_boot_assets(spec: &mut VmSpec, boot_assets: ResolvedBootAssets
 #[cfg(test)]
 mod tests {
     use crate::lock_manager::LockId;
-    use crate::paths::{LocalPaths, MachinePaths};
+    use crate::paths::LocalPaths;
     use crate::runtime::core::{
         effective_oci_manifest_digest, materialized_manifest_digest, oci_image_record,
         read_monitor_pid, stopped_machine_state, write_machine_config, Runtime,
@@ -1821,15 +1829,18 @@ mod tests {
             }
 
             let id = MachineId::new();
-            let machine_dir = runtime.paths.machine(id).dir().to_path_buf();
+            let machine_paths = runtime.paths.machine(id);
+            let machine_dir = machine_paths.dir().to_path_buf();
             if machine_dir.exists() {
                 return Err(LibVmError::MachineIdAlreadyExists { id: id.to_string() });
             }
             std::fs::create_dir_all(&machine_dir)?;
+            std::fs::create_dir_all(machine_paths.run_dir())?;
+            std::fs::create_dir_all(machine_paths.state_dir())?;
 
             let spec = sample_vm_spec();
             write_machine_config(&machine_dir, &self.name, &spec)?;
-            std::fs::write(MachinePaths::new(&machine_dir).root_disk_path(), b"disk")?;
+            std::fs::write(crate::paths::root_disk_path_in(&machine_dir), b"disk")?;
 
             let lock = match runtime.allocate_machine_lock() {
                 Ok(lock) => lock,
@@ -3253,7 +3264,7 @@ mod tests {
             .commit(&runtime)
             .await
             .expect("commit machine");
-        let root_disk = MachinePaths::new(&machine.machine_dir).root_disk_path();
+        let root_disk = crate::paths::root_disk_path_in(&machine.machine_dir);
         let root_disk_file = std::fs::OpenOptions::new()
             .write(true)
             .open(root_disk)
@@ -3294,6 +3305,13 @@ mod tests {
             .await
             .expect("commit machine");
         let lock_path = runtime.lock_manager.lock_path(machine.lock_id);
+        let machine_paths = runtime.paths.machine(machine.id);
+        let state_dir = machine_paths.state_dir().to_path_buf();
+        let run_dir = machine_paths.run_dir().to_path_buf();
+        std::fs::write(machine_paths.vmmon_trace_log_path(), b"trace")
+            .expect("write machine trace");
+        std::fs::write(machine_paths.vmmon_pid_path(), b"99999999")
+            .expect("write stale machine pid");
 
         machine_handle(&runtime, machine.id)
             .remove()
@@ -3301,6 +3319,8 @@ mod tests {
             .expect("remove machine");
 
         assert!(!machine.machine_dir.exists());
+        assert!(!state_dir.exists());
+        assert!(!run_dir.exists());
         assert!(!lock_path.exists());
         assert!(runtime
             .list_machine_configs()

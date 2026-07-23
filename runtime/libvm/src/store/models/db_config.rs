@@ -6,24 +6,27 @@ use crate::paths::LocalRoots;
 /// Stored root contract for a local Silo state database.
 ///
 /// The `db_config` table contains exactly one row, `id = 1`. It stores the
-/// host OS that created the database and only the three roots that are
+/// host OS that created the database and the durable roots that are
 /// independently configurable:
 ///
 /// - `data_root`: persistent machine metadata, assets, keys, and `state.db`
-/// - `run_root`: host-runtime files such as locks and network state
 /// - `image_root`: unpacked machine images
+/// - `state_root`: durable logs and operational state
 ///
 /// Derived paths are intentionally not persisted. `state.db` is always
 /// `data_root/state.db`; machines, assets, keys, and secrets live below
-/// `data_root`; locks and network runtime directories live below `run_root`.
+/// `data_root`. The legacy run root remains available only while upgrading a
+/// database created before run placement became ephemeral.
 /// Schema compatibility belongs to sqlx migrations, so this row does not carry
 /// a separate schema version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DbConfig {
     pub(crate) os: String,
     pub(crate) data_root: String,
-    pub(crate) run_root: String,
+    pub(crate) legacy_run_root: String,
     pub(crate) image_root: String,
+    pub(crate) state_root: Option<String>,
+    pub(crate) state_migration_complete: bool,
 }
 
 impl DbConfig {
@@ -31,8 +34,10 @@ impl DbConfig {
         Self {
             os: OS.to_string(),
             data_root: path_to_db_string(roots.data_root()),
-            run_root: path_to_db_string(roots.run_root()),
+            legacy_run_root: path_to_db_string(roots.run_root()),
             image_root: path_to_db_string(roots.image_root()),
+            state_root: Some(path_to_db_string(roots.state_root())),
+            state_migration_complete: true,
         }
     }
 }

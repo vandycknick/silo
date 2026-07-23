@@ -97,6 +97,7 @@ mod tests {
             .expect("current process should exist");
 
         assert_eq!(identity.pid(), pid);
+        assert!(identity.owned_by_effective_user());
         assert!(identity_is_alive(&identity).expect("check current process identity"));
     }
 

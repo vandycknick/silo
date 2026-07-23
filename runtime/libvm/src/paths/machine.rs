@@ -13,61 +13,84 @@ const NETWORK_LINK_NAME: &str = "net";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MachinePaths {
-    dir: PathBuf,
+    data_dir: PathBuf,
+    state_dir: PathBuf,
+    run_dir: PathBuf,
 }
 
 impl MachinePaths {
-    pub(crate) fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+    pub(crate) fn new(
+        data_dir: impl Into<PathBuf>,
+        state_dir: impl Into<PathBuf>,
+        run_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            state_dir: state_dir.into(),
+            run_dir: run_dir.into(),
+        }
     }
 
     pub(crate) fn dir(&self) -> &Path {
-        &self.dir
+        &self.data_dir
+    }
+
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    pub(crate) fn run_dir(&self) -> &Path {
+        &self.run_dir
     }
 
     pub(crate) fn vm_spec_path(&self) -> PathBuf {
-        vm_spec_path_in(&self.dir)
+        vm_spec_path_in(&self.data_dir)
     }
 
     pub(crate) fn metadata_config_path(&self) -> PathBuf {
-        self.dir.join(LEGACY_METADATA_CONFIG_FILE_NAME)
+        self.data_dir.join(LEGACY_METADATA_CONFIG_FILE_NAME)
     }
 
     pub(crate) fn composite_initramfs_path(&self) -> PathBuf {
-        self.dir.join(COMPOSITE_INITRAMFS_FILE_NAME)
+        self.data_dir.join(COMPOSITE_INITRAMFS_FILE_NAME)
     }
 
+    #[cfg(test)]
     pub(crate) fn root_disk_path(&self) -> PathBuf {
-        self.dir.join(ROOT_DISK_FILE_NAME)
+        root_disk_path_in(&self.data_dir)
     }
 
     pub(crate) fn vmmon_pid_path(&self) -> PathBuf {
-        self.dir.join(VMMON_PID_FILE_NAME)
+        self.run_dir.join(VMMON_PID_FILE_NAME)
     }
 
     pub(crate) fn vmmon_socket_path(&self) -> PathBuf {
-        self.dir.join(VMMON_SOCKET_FILE_NAME)
+        self.run_dir.join(VMMON_SOCKET_FILE_NAME)
     }
 
     pub(crate) fn vmmon_trace_log_path(&self) -> PathBuf {
-        vmmon_trace_log_path_in(&self.dir)
+        vmmon_trace_log_path_in(&self.state_dir)
     }
 
     pub(crate) fn vmmon_exit_status_path(&self) -> PathBuf {
-        self.dir.join(VMMON_EXIT_STATUS_FILE_NAME)
+        self.state_dir.join(VMMON_EXIT_STATUS_FILE_NAME)
     }
 
     pub(crate) fn serial_log_path(&self) -> PathBuf {
-        self.dir.join(SERIAL_LOG_FILE_NAME)
+        self.state_dir.join(SERIAL_LOG_FILE_NAME)
     }
 
     pub(crate) fn network_link(&self) -> PathBuf {
-        self.dir.join(NETWORK_LINK_NAME)
+        self.run_dir.join(NETWORK_LINK_NAME)
     }
 }
 
 pub(crate) fn root_disk_relative_path() -> PathBuf {
     PathBuf::from(ROOT_DISK_FILE_NAME)
+}
+
+pub(crate) fn root_disk_path_in(dir: &Path) -> PathBuf {
+    dir.join(ROOT_DISK_FILE_NAME)
 }
 
 pub(crate) fn vm_spec_path_in(dir: &Path) -> PathBuf {
@@ -86,7 +109,11 @@ mod tests {
 
     #[test]
     fn machine_paths_use_expected_filenames() {
-        let paths = MachinePaths::new("/tmp/silo/machines/test");
+        let paths = MachinePaths::new(
+            "/tmp/silo/machines/test",
+            "/tmp/silo-state/logs/machines/test",
+            "/tmp/silo-run/machines/test",
+        );
 
         assert_eq!(
             paths.vm_spec_path(),
@@ -106,27 +133,27 @@ mod tests {
         );
         assert_eq!(
             paths.vmmon_pid_path(),
-            PathBuf::from("/tmp/silo/machines/test/vm.pid")
+            PathBuf::from("/tmp/silo-run/machines/test/vm.pid")
         );
         assert_eq!(
             paths.vmmon_socket_path(),
-            PathBuf::from("/tmp/silo/machines/test/vm.sock")
+            PathBuf::from("/tmp/silo-run/machines/test/vm.sock")
         );
         assert_eq!(
             paths.vmmon_trace_log_path(),
-            PathBuf::from("/tmp/silo/machines/test/vm.trace.log")
+            PathBuf::from("/tmp/silo-state/logs/machines/test/vm.trace.log")
         );
         assert_eq!(
             paths.vmmon_exit_status_path(),
-            PathBuf::from("/tmp/silo/machines/test/vm.exit.json")
+            PathBuf::from("/tmp/silo-state/logs/machines/test/vm.exit.json")
         );
         assert_eq!(
             paths.serial_log_path(),
-            PathBuf::from("/tmp/silo/machines/test/serial.log")
+            PathBuf::from("/tmp/silo-state/logs/machines/test/serial.log")
         );
         assert_eq!(
             paths.network_link(),
-            PathBuf::from("/tmp/silo/machines/test/net")
+            PathBuf::from("/tmp/silo-run/machines/test/net")
         );
         assert_eq!(root_disk_relative_path(), PathBuf::from("rootfs.img"));
     }

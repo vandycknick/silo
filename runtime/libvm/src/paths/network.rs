@@ -8,36 +8,40 @@ const POLICY_FILE_NAME: &str = "network-policy.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NetworkPaths {
-    dir: PathBuf,
+    run_dir: PathBuf,
+    state_dir: PathBuf,
 }
 
 impl NetworkPaths {
-    pub(crate) fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+    pub(crate) fn new(run_dir: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            run_dir: run_dir.into(),
+            state_dir: state_dir.into(),
+        }
     }
 
     pub(crate) fn dir(&self) -> &Path {
-        &self.dir
+        &self.run_dir
     }
 
     pub(crate) fn socket_path(&self) -> PathBuf {
-        self.dir.join(SOCKET_FILE_NAME)
+        self.run_dir.join(SOCKET_FILE_NAME)
     }
 
     pub(crate) fn log_path(&self) -> PathBuf {
-        self.dir.join(LOG_FILE_NAME)
+        self.state_dir.join(LOG_FILE_NAME)
     }
 
     pub(crate) fn pid_path(&self) -> PathBuf {
-        self.dir.join(PID_FILE_NAME)
+        self.run_dir.join(PID_FILE_NAME)
     }
 
     pub(crate) fn pcap_path(&self) -> PathBuf {
-        self.dir.join(PCAP_FILE_NAME)
+        self.run_dir.join(PCAP_FILE_NAME)
     }
 
     pub(crate) fn policy_path(&self) -> PathBuf {
-        self.dir.join(POLICY_FILE_NAME)
+        self.run_dir.join(POLICY_FILE_NAME)
     }
 }
 
@@ -49,27 +53,30 @@ mod tests {
 
     #[test]
     fn network_paths_use_expected_filenames() {
-        let paths = NetworkPaths::new("/tmp/silo/net/net123");
+        let paths = NetworkPaths::new(
+            "/tmp/silo-run/networks/net123",
+            "/tmp/silo-state/logs/networks/net123",
+        );
 
         assert_eq!(
             paths.socket_path(),
-            PathBuf::from("/tmp/silo/net/net123/netd.sock")
+            PathBuf::from("/tmp/silo-run/networks/net123/netd.sock")
         );
         assert_eq!(
             paths.log_path(),
-            PathBuf::from("/tmp/silo/net/net123/netd.log")
+            PathBuf::from("/tmp/silo-state/logs/networks/net123/netd.log")
         );
         assert_eq!(
             paths.pid_path(),
-            PathBuf::from("/tmp/silo/net/net123/netd.pid")
+            PathBuf::from("/tmp/silo-run/networks/net123/netd.pid")
         );
         assert_eq!(
             paths.pcap_path(),
-            PathBuf::from("/tmp/silo/net/net123/capture.pcap")
+            PathBuf::from("/tmp/silo-run/networks/net123/capture.pcap")
         );
         assert_eq!(
             paths.policy_path(),
-            PathBuf::from("/tmp/silo/net/net123/network-policy.json")
+            PathBuf::from("/tmp/silo-run/networks/net123/network-policy.json")
         );
     }
 }

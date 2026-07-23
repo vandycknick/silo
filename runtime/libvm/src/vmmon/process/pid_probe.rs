@@ -31,4 +31,8 @@ impl ProcessIdentity {
     pub(crate) fn is_alive(&self) -> io::Result<bool> {
         pid_exists(self.pid)
     }
+
+    pub(crate) fn owned_by_effective_user(&self) -> bool {
+        true
+    }
 }

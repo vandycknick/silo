@@ -11,8 +11,21 @@ pub enum LibVmError {
     #[error("could not resolve Silo config directory from XDG_CONFIG_HOME or HOME")]
     ConfigDirUnavailable,
 
+    #[error("could not resolve Silo state directory from XDG_STATE_HOME or HOME")]
+    StateDirUnavailable,
+
     #[error("environment variable {name} must be an absolute path, got {path}")]
     RelativeEnvironmentPath { name: &'static str, path: PathBuf },
+
+    #[error(
+        "unsafe runtime directory {path}: expected directory owned by uid {expected_uid} with mode 0700, found uid {actual_uid} mode {mode:o}"
+    )]
+    UnsafeRunDirectory {
+        path: PathBuf,
+        expected_uid: u32,
+        actual_uid: u32,
+        mode: u32,
+    },
 
     #[error("invalid machine name {name:?}: {reason}")]
     InvalidMachineName { name: String, reason: String },
@@ -125,6 +138,17 @@ pub enum LibVmError {
         field: &'static str,
         expected: String,
         actual: String,
+    },
+
+    #[error("cannot migrate runtime paths while {component} is active; stop it and retry")]
+    RuntimePathMigrationActive { component: String },
+
+    #[error(
+        "cannot migrate {source_path} to {destination_path}: destination contains different data"
+    )]
+    RuntimePathMigrationCollision {
+        source_path: PathBuf,
+        destination_path: PathBuf,
     },
 
     #[error(transparent)]

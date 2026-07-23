@@ -28,6 +28,55 @@ impl ConfigStore for Store {
                 actual: "0".to_string(),
             })
     }
+
+    async fn claim_state_root(&self, state_root: &str) -> Result<DbConfig, LibVmError> {
+        let now = now_unix();
+        sqlx::query(
+            "UPDATE db_config SET state_root = ?1, modified_at = ?2
+             WHERE id = ?3 AND state_root IS NULL",
+        )
+        .bind(state_root)
+        .bind(now)
+        .bind(DB_CONFIG_ID)
+        .execute(&self.pool)
+        .await?;
+
+        let stored =
+            self.read_single_db_config()
+                .await?
+                .ok_or(LibVmError::StateDatabaseConfigMismatch {
+                    field: "db_config.row_count",
+                    expected: "1".to_string(),
+                    actual: "0".to_string(),
+                })?;
+        if stored.state_root.as_deref() != Some(state_root) {
+            return Err(LibVmError::StateDatabaseConfigMismatch {
+                field: "state_root",
+                expected: state_root.to_string(),
+                actual: stored.state_root.unwrap_or_default(),
+            });
+        }
+        Ok(stored)
+    }
+
+    async fn complete_state_root_migration(&self) -> Result<DbConfig, LibVmError> {
+        let now = now_unix();
+        sqlx::query(
+            "UPDATE db_config SET state_migration_complete = 1, modified_at = ?1
+             WHERE id = ?2 AND state_root IS NOT NULL",
+        )
+        .bind(now)
+        .bind(DB_CONFIG_ID)
+        .execute(&self.pool)
+        .await?;
+        self.read_single_db_config()
+            .await?
+            .ok_or(LibVmError::StateDatabaseConfigMismatch {
+                field: "db_config.row_count",
+                expected: "1".to_string(),
+                actual: "0".to_string(),
+            })
+    }
 }
 
 impl Store {
@@ -35,15 +84,18 @@ impl Store {
         let now = now_unix();
         sqlx::query(
             "INSERT INTO db_config
-                (id, os, data_root, run_root, image_root, created_at, modified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                (id, os, data_root, run_root, image_root, state_root,
+                 state_migration_complete, created_at, modified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(DB_CONFIG_ID)
         .bind(&seed.os)
         .bind(&seed.data_root)
-        .bind(&seed.run_root)
+        .bind(&seed.legacy_run_root)
         .bind(&seed.image_root)
+        .bind(&seed.state_root)
+        .bind(seed.state_migration_complete)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -52,7 +104,8 @@ impl Store {
 
     async fn read_db_configs(&self) -> Result<Vec<DbConfig>, LibVmError> {
         let rows = sqlx::query(
-            "SELECT os, data_root, run_root, image_root
+            "SELECT os, data_root, run_root, image_root, state_root,
+                    state_migration_complete
              FROM db_config",
         )
         .fetch_all(&self.pool)
@@ -63,8 +116,10 @@ impl Store {
                 Ok(DbConfig {
                     os: row.try_get("os")?,
                     data_root: row.try_get("data_root")?,
-                    run_root: row.try_get("run_root")?,
+                    legacy_run_root: row.try_get("run_root")?,
                     image_root: row.try_get("image_root")?,
+                    state_root: row.try_get("state_root")?,
+                    state_migration_complete: row.try_get("state_migration_complete")?,
                 })
             })
             .collect()

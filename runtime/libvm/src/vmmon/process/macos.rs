@@ -6,6 +6,7 @@ use crate::vmmon::process::pid_exists;
 pub(crate) struct ProcessIdentity {
     pid: i32,
     started_at: Option<i64>,
+    uid: u32,
 }
 
 impl ProcessIdentity {
@@ -14,9 +15,13 @@ impl ProcessIdentity {
             return Ok(None);
         }
 
+        let Some((started_at, uid)) = process_info(pid)? else {
+            return Ok(None);
+        };
         Ok(Some(Self {
             pid,
-            started_at: process_started_at(pid)?,
+            started_at: Some(started_at),
+            uid,
         }))
     }
 
@@ -38,9 +43,13 @@ impl ProcessIdentity {
         };
         Ok(current.matches_started_at(self.started_at))
     }
+
+    pub(crate) fn owned_by_effective_user(&self) -> bool {
+        self.uid == nix::unistd::Uid::effective().as_raw()
+    }
 }
 
-fn process_started_at(pid: i32) -> io::Result<Option<i64>> {
+fn process_info(pid: i32) -> io::Result<Option<(i64, u32)>> {
     const PROC_PIDTBSDINFO: libc::c_int = 3;
 
     #[repr(C)]
@@ -106,5 +115,5 @@ fn process_started_at(pid: i32) -> io::Result<Option<i64>> {
     }
 
     let info = unsafe { info.assume_init() };
-    Ok(Some(info.pbi_start_tvsec as i64))
+    Ok(Some((info.pbi_start_tvsec as i64, info.pbi_uid)))
 }

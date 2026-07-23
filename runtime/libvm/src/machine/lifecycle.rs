@@ -53,6 +53,8 @@ impl Machine {
         let config = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             let machine_paths = runtime.machine_paths(config.id);
+            std::fs::create_dir_all(machine_paths.run_dir())?;
+            std::fs::create_dir_all(machine_paths.state_dir())?;
             let pid_path = machine_paths.vmmon_pid_path();
             let exit_status_path = machine_paths.vmmon_exit_status_path();
             let config_path = machine_paths.vm_spec_path();
@@ -363,10 +365,17 @@ impl Machine {
             });
         }
 
-        match fs::remove_dir_all(&config.machine_dir) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+        let machine_paths = runtime.machine_paths(config.id);
+        for directory in [
+            config.machine_dir.as_path(),
+            machine_paths.state_dir(),
+            machine_paths.run_dir(),
+        ] {
+            match fs::remove_dir_all(directory) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
         }
 
         runtime.remove_machine_records(&config).await

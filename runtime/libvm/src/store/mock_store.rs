@@ -19,6 +19,10 @@ mock! {
         async fn db_config(&self) -> Result<Option<DbConfig>, LibVmError>;
 
         async fn read_or_seed_db_config(&self, seed: &DbConfig) -> Result<DbConfig, LibVmError>;
+
+        async fn claim_state_root(&self, state_root: &str) -> Result<DbConfig, LibVmError>;
+
+        async fn complete_state_root_migration(&self) -> Result<DbConfig, LibVmError>;
     }
 
     #[async_trait]
@@ -101,6 +105,8 @@ mock! {
             &self,
             network_id: &str,
         ) -> Result<Option<NetworkInstance>, LibVmError>;
+
+        async fn list_network_instances(&self) -> Result<Vec<NetworkInstance>, LibVmError>;
 
         async fn save_network_instance(&self, instance: &NetworkInstance) -> Result<(), LibVmError>;
 

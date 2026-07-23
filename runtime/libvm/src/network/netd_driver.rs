@@ -126,6 +126,9 @@ async fn prepare_netd_runtime(
     let (ipv4, dns) = private_ipv4_config(&config.subnet, &metadata.name)?;
     let static_lease = format!("{}={mac}", ipv4.address);
 
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let log = File::options().create(true).append(true).open(&log_path)?;
     let mut command = Command::new(resolve_netd_binary());
     configure_network_helper_command(

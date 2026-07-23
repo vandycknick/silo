@@ -54,6 +54,12 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Sets the durable logs and operational state root.
+    pub fn state_root(mut self, state_root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_state_root(state_root);
+        self
+    }
+
     /// Sets runtime networking defaults.
     pub fn networking(mut self, networking: RuntimeNetworkingConfig) -> Self {
         self.config = self.config.with_networking(networking);

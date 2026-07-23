@@ -248,6 +248,9 @@ pub(super) fn ensure_instance_network_link(
 ) -> Result<(), LibVmError> {
     let link = paths.machine(machine_id).network_link();
     remove_instance_network_link(paths, machine_id)?;
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent)?;
+    }
     symlink(runtime_dir, link)?;
     Ok(())
 }
