@@ -7,11 +7,11 @@ image materialization, datastore updates, lifecycle, and guest sessions all
 delegate to `libvm`; the TypeScript layer only provides idiomatic method names,
 types, and error mapping.
 
-`silo` does not bundle the Silo CLI or `vmmon`. `vmmon` must be available
-on `PATH`, or supplied through `Runtime.open({ vmmonPath })`.
-Kernel, initramfs, and agent defaults come from the Silo installation through
-`SILO_ASSET_DIR`, `/usr/local/share/silo/assets`, or
-`$HOME/.local/share/silo/assets`.
+The SDK opens the same six-component Silo runtime as the CLI: `vmmon`, `netd`,
+`krun`, a kernel, an initramfs, and the guest agent. Product installations are
+discovered automatically. Development and custom embedding can select a
+complete portable layout with `Runtime.open({ runtimeRoot })`, or override
+individual component paths explicitly.
 
 ```ts
 import { ImageSource, NetworkPolicy, Runtime } from "silo";

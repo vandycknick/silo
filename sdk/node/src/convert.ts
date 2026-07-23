@@ -45,7 +45,15 @@ export function runtimeOptionsToNative(options?: RuntimeOpenOptions): NativeRunt
     dataRoot: optionalNonEmptyString(record.dataRoot, "options.dataRoot"),
     runRoot: optionalNonEmptyString(record.runRoot, "options.runRoot"),
     imageRoot: optionalNonEmptyString(record.imageRoot, "options.imageRoot"),
+    stateRoot: optionalNonEmptyString(record.stateRoot, "options.stateRoot"),
+    runtimeRoot: optionalNonEmptyString(record.runtimeRoot, "options.runtimeRoot"),
+    bundledRuntimeRoot: optionalNonEmptyString(record.bundledRuntimeRoot, "options.bundledRuntimeRoot"),
     vmmonPath: optionalNonEmptyString(record.vmmonPath, "options.vmmonPath"),
+    netdPath: optionalNonEmptyString(record.netdPath, "options.netdPath"),
+    krunPath: optionalNonEmptyString(record.krunPath, "options.krunPath"),
+    kernelPath: optionalNonEmptyString(record.kernelPath, "options.kernelPath"),
+    initramfsPath: optionalNonEmptyString(record.initramfsPath, "options.initramfsPath"),
+    agentPath: optionalNonEmptyString(record.agentPath, "options.agentPath"),
   };
 }
 

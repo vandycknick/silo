@@ -637,6 +637,7 @@ mod tests {
         MachineCreateGuard, MachineCreatePlan, MachineCreateRequest, ROOT_DISK_KERNEL_ARG,
     };
     use crate::paths::{root_disk_relative_path, LocalPaths};
+    use crate::runtime::components::ResolvedRuntimeComponents;
     use crate::runtime::Runtime;
     use crate::store::models::{MachineId, MachineNetworkConfig, MachineRootfsRecord};
     use crate::store::MockDataStore;
@@ -690,7 +691,7 @@ mod tests {
             paths,
             Arc::new(store),
             RuntimeNetworkingConfig::default(),
-            None,
+            Arc::new(ResolvedRuntimeComponents::for_tests()),
         )
         .await
         .expect("create runtime with mock store")

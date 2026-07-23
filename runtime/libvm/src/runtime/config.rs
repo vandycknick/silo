@@ -35,6 +35,20 @@ pub struct RuntimeConfig {
     pub networking: RuntimeNetworkingConfig,
     /// Explicit vmmon executable path.
     pub vmmon_path: Option<PathBuf>,
+    /// Explicit netd executable path.
+    pub netd_path: Option<PathBuf>,
+    /// Explicit krun executable path.
+    pub krun_path: Option<PathBuf>,
+    /// Explicit default kernel path.
+    pub kernel_path: Option<PathBuf>,
+    /// Explicit default initramfs path.
+    pub initramfs_path: Option<PathBuf>,
+    /// Explicit default guest agent path.
+    pub agent_path: Option<PathBuf>,
+    /// Explicit portable runtime root.
+    pub runtime_root: Option<PathBuf>,
+    /// Portable runtime bundled by an SDK or embedding application.
+    pub bundled_runtime_root: Option<PathBuf>,
 }
 
 impl RuntimeConfig {
@@ -47,6 +61,13 @@ impl RuntimeConfig {
             state_root: PathChoice::Default,
             networking: RuntimeNetworkingConfig::default(),
             vmmon_path: None,
+            netd_path: None,
+            krun_path: None,
+            kernel_path: None,
+            initramfs_path: None,
+            agent_path: None,
+            runtime_root: None,
+            bundled_runtime_root: None,
         }
     }
 
@@ -83,6 +104,48 @@ impl RuntimeConfig {
     /// Sets the vmmon executable path used to launch machines.
     pub fn with_vmmon_path(mut self, vmmon_path: impl Into<PathBuf>) -> Self {
         self.vmmon_path = Some(vmmon_path.into());
+        self
+    }
+
+    /// Sets the netd executable path used for private networking.
+    pub fn with_netd_path(mut self, netd_path: impl Into<PathBuf>) -> Self {
+        self.netd_path = Some(netd_path.into());
+        self
+    }
+
+    /// Sets the krun executable path passed to vmmon.
+    pub fn with_krun_path(mut self, krun_path: impl Into<PathBuf>) -> Self {
+        self.krun_path = Some(krun_path.into());
+        self
+    }
+
+    /// Sets the default guest kernel path.
+    pub fn with_kernel_path(mut self, kernel_path: impl Into<PathBuf>) -> Self {
+        self.kernel_path = Some(kernel_path.into());
+        self
+    }
+
+    /// Sets the default guest initramfs path.
+    pub fn with_initramfs_path(mut self, initramfs_path: impl Into<PathBuf>) -> Self {
+        self.initramfs_path = Some(initramfs_path.into());
+        self
+    }
+
+    /// Sets the default guest agent path.
+    pub fn with_agent_path(mut self, agent_path: impl Into<PathBuf>) -> Self {
+        self.agent_path = Some(agent_path.into());
+        self
+    }
+
+    /// Sets a portable runtime root containing `bin/` and `assets/`.
+    pub fn with_runtime_root(mut self, runtime_root: impl Into<PathBuf>) -> Self {
+        self.runtime_root = Some(runtime_root.into());
+        self
+    }
+
+    /// Sets a lower-priority portable runtime bundled by the caller.
+    pub fn with_bundled_runtime_root(mut self, runtime_root: impl Into<PathBuf>) -> Self {
+        self.bundled_runtime_root = Some(runtime_root.into());
         self
     }
 
@@ -327,6 +390,13 @@ impl Default for RuntimeConfig {
             state_root: PathChoice::Default,
             networking: RuntimeNetworkingConfig::default(),
             vmmon_path: None,
+            netd_path: None,
+            krun_path: None,
+            kernel_path: None,
+            initramfs_path: None,
+            agent_path: None,
+            runtime_root: None,
+            bundled_runtime_root: None,
         }
     }
 }

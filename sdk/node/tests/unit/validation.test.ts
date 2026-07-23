@@ -39,9 +39,27 @@ describe("runtime options", () => {
     expect(
       runtimeOptionsToNative({
         dataRoot: "/tmp/silo",
+        stateRoot: "/tmp/silo-state",
+        runtimeRoot: "/opt/silo-runtime",
+        bundledRuntimeRoot: "/opt/node-platform-package/runtime",
+        vmmonPath: "/opt/helpers/vmmon",
+        netdPath: "/opt/helpers/netd",
+        krunPath: "/opt/helpers/krun",
+        kernelPath: "/opt/assets/kernel-default",
+        initramfsPath: "/opt/assets/initramfs",
+        agentPath: "/opt/assets/agent",
       }),
     ).toMatchObject({
       dataRoot: "/tmp/silo",
+      stateRoot: "/tmp/silo-state",
+      runtimeRoot: "/opt/silo-runtime",
+      bundledRuntimeRoot: "/opt/node-platform-package/runtime",
+      vmmonPath: "/opt/helpers/vmmon",
+      netdPath: "/opt/helpers/netd",
+      krunPath: "/opt/helpers/krun",
+      kernelPath: "/opt/assets/kernel-default",
+      initramfsPath: "/opt/assets/initramfs",
+      agentPath: "/opt/assets/agent",
     });
   });
 

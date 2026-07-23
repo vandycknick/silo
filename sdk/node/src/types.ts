@@ -15,8 +15,24 @@ export interface RuntimeOpenOptions {
   runRoot?: string;
   /** Image cache directory. */
   imageRoot?: string;
-  /** Explicit `vmmon` executable path. If unset, `vmmon` is resolved from the environment and `PATH`. */
+  /** Durable logs and operational state directory. */
+  stateRoot?: string;
+  /** Portable runtime root containing the complete `bin/` and `assets/` layout. */
+  runtimeRoot?: string;
+  /** Lower-priority portable runtime bundled by an SDK or embedding application. */
+  bundledRuntimeRoot?: string;
+  /** Explicit `vmmon` executable path. */
   vmmonPath?: string;
+  /** Explicit `netd` executable path. */
+  netdPath?: string;
+  /** Explicit `krun` executable path. */
+  krunPath?: string;
+  /** Explicit default guest kernel path. */
+  kernelPath?: string;
+  /** Explicit default guest initramfs path. */
+  initramfsPath?: string;
+  /** Explicit default guest agent path. */
+  agentPath?: string;
 }
 
 /** Source used to materialize a machine root disk during `MachineBuilder.create()`. */

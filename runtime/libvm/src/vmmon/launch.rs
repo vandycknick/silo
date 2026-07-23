@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -12,7 +12,7 @@ use crate::store::models::MachineId;
 use crate::vmmon::Vmmon;
 use crate::LibVmError;
 
-const ENV_VMMON_PATH: &str = "SILO_VMMON_PATH";
+const ENV_KRUN_PATH: &str = "KRUN_BIN";
 const ENV_VM_STARTPIPE: &str = "_VM_STARTPIPE";
 const ENV_VM_SYNCPIPE: &str = "_VM_SYNCPIPE";
 const VMMON_LAUNCHER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,7 +38,7 @@ impl Vmmon {
         let (start_read, start_write) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
         let (sync_read, sync_write) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
 
-        let mut command = Command::new(resolve_vmmon_executable(self.executable())?);
+        let mut command = Command::new(self.executable());
         command
             .arg("--id")
             .arg(launch.machine_id.to_string())
@@ -68,9 +68,12 @@ impl Vmmon {
         if let Some(exit_command) = launch.exit_command {
             append_exit_command_args(&mut command, exit_command);
         }
-        command
-            .env(ENV_VM_STARTPIPE, start_read.as_raw_fd().to_string())
-            .env(ENV_VM_SYNCPIPE, sync_write.as_raw_fd().to_string());
+        configure_runtime_environment(
+            &mut command,
+            start_read.as_raw_fd(),
+            sync_write.as_raw_fd(),
+            self.krun_executable(),
+        );
 
         // vmmon handles its own daemonization, so only the child-side pipe fds
         // must survive exec/self-spawn.
@@ -97,6 +100,18 @@ fn append_exit_command_args(command: &mut Command, exit_command: &MachineExitCom
     for arg in &exit_command.args {
         command.arg("--exit-command-arg").arg(arg);
     }
+}
+
+fn configure_runtime_environment(
+    command: &mut Command,
+    startpipe: i32,
+    syncpipe: i32,
+    krun_executable: &Path,
+) {
+    command
+        .env(ENV_VM_STARTPIPE, startpipe.to_string())
+        .env(ENV_VM_SYNCPIPE, syncpipe.to_string())
+        .env(ENV_KRUN_PATH, krun_executable);
 }
 
 async fn wait_for_vmmon_launcher(child: std::process::Child) -> io::Result<()> {
@@ -134,58 +149,6 @@ fn wait_for_vmmon_launcher_blocking(mut child: std::process::Child) -> io::Resul
     Err(io::Error::other(format!(
         "vmmon launcher exited with {status}"
     )))
-}
-
-fn resolve_vmmon_executable(configured: Option<&Path>) -> Result<PathBuf, LibVmError> {
-    let mut searched = Vec::new();
-
-    if let Some(path) = configured {
-        searched.push(format!("runtime config {}", path.display()));
-        return require_vmmon_executable(path);
-    }
-
-    if let Some(path) = std::env::var_os(ENV_VMMON_PATH) {
-        let path = PathBuf::from(path);
-        searched.push(format!("{ENV_VMMON_PATH}={}", path.display()));
-        return require_vmmon_executable(&path);
-    }
-
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("vmmon");
-            searched.push(candidate.display().to_string());
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    } else {
-        searched.push("PATH unset".to_string());
-    }
-
-    let current_exe = std::env::current_exe()?;
-    let expected_path = current_exe
-        .parent()
-        .map(|parent| parent.join("vmmon"))
-        .unwrap_or_else(|| PathBuf::from("vmmon"));
-    searched.push(format!("sibling {}", expected_path.display()));
-
-    if expected_path.is_file() {
-        return Ok(expected_path);
-    }
-
-    Err(LibVmError::VmMonExecutableNotFound {
-        searched: searched.join(", "),
-    })
-}
-
-fn require_vmmon_executable(path: &Path) -> Result<PathBuf, LibVmError> {
-    if path.is_file() {
-        return std::fs::canonicalize(path).map_err(LibVmError::Io);
-    }
-
-    Err(LibVmError::VmMonExecutableInvalid {
-        path: path.to_path_buf(),
-    })
 }
 
 async fn wait_for_start(syncpipe: OwnedFd, trace_path: &Path) -> Result<(), LibVmError> {
@@ -271,7 +234,10 @@ mod tests {
 
     use crate::machine::MachineExitCommand;
 
-    use super::{append_exit_command_args, read_syncpipe, release_startpipe, StartupResult};
+    use super::{
+        append_exit_command_args, configure_runtime_environment, read_syncpipe, release_startpipe,
+        StartupResult, ENV_KRUN_PATH, ENV_VM_STARTPIPE, ENV_VM_SYNCPIPE,
+    };
 
     #[test]
     fn release_startpipe_writes_one_byte() {
@@ -349,6 +315,40 @@ mod tests {
                 OsString::from("--exit-command-arg"),
                 OsString::from("0123456789abcdef0123456789abcdef"),
             ]
+        );
+    }
+
+    #[test]
+    fn runtime_environment_passes_resolved_krun_to_vmmon() {
+        let mut command = Command::new("vmmon");
+
+        configure_runtime_environment(
+            &mut command,
+            11,
+            12,
+            std::path::Path::new("/opt/silo/bin/krun"),
+        );
+
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_os_string(),
+                    value.expect("environment value").to_os_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new(ENV_VM_STARTPIPE)),
+            Some(&OsString::from("11"))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new(ENV_VM_SYNCPIPE)),
+            Some(&OsString::from("12"))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new(ENV_KRUN_PATH)),
+            Some(&OsString::from("/opt/silo/bin/krun"))
         );
     }
 }

@@ -36,8 +36,6 @@ use super::{
     serialize_json, DRIVER_NETD,
 };
 
-const NETD_BINARY_ENV: &str = "NETD_BIN";
-const NETD_BINARY_NAME: &str = "netd";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
@@ -130,7 +128,7 @@ async fn prepare_netd_runtime(
         fs::create_dir_all(parent)?;
     }
     let log = File::options().create(true).append(true).open(&log_path)?;
-    let mut command = Command::new(resolve_netd_binary());
+    let mut command = network_helper_command(ctx.netd_path);
     configure_network_helper_command(
         &mut command,
         &NetworkHelperCommandConfig {
@@ -324,6 +322,10 @@ fn configure_network_helper_command(
     if let Some(path) = config.tls_ca_key_path {
         command.arg("--tls-ca-key").arg(path);
     }
+}
+
+fn network_helper_command(netd_path: &Path) -> Command {
+    Command::new(netd_path)
 }
 
 fn private_ipv4_config(
@@ -757,19 +759,6 @@ fn append_bounded_stderr_line(captured: &mut CapturedStderrLines, line: String) 
     captured.lines.push_back(line);
 }
 
-fn resolve_netd_binary() -> String {
-    std::env::var(NETD_BINARY_ENV).unwrap_or_else(|_| resolve_sibling_binary(NETD_BINARY_NAME))
-}
-
-fn resolve_sibling_binary(name: &str) -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join(name)))
-        .filter(|path| path.exists())
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| name.to_string())
-}
-
 pub(super) fn instance_is_alive(instance: &NetworkInstance) -> bool {
     driver_state(instance)
         .map(|state| process_is_alive(state.helper_pid))
@@ -804,9 +793,10 @@ fn terminate_helper(pid: i32) -> Result<(), LibVmError> {
 mod tests {
     use super::{
         append_bounded_stderr_line, configure_network_helper_command,
-        configure_network_launch_environment, format_netd_startup_failure, private_ipv4_config,
-        resolve_certificate_authority_paths, CapturedStderrLines, NetworkHelperCommandConfig,
-        OAUTH_REFRESH_AUTH_ENV, OAUTH_REFRESH_HOOK_ENV, STDERR_CAPTURE_LIMIT,
+        configure_network_launch_environment, format_netd_startup_failure, network_helper_command,
+        private_ipv4_config, resolve_certificate_authority_paths, CapturedStderrLines,
+        NetworkHelperCommandConfig, OAUTH_REFRESH_AUTH_ENV, OAUTH_REFRESH_HOOK_ENV,
+        STDERR_CAPTURE_LIMIT,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
@@ -867,6 +857,13 @@ mod tests {
         assert!(args.iter().all(|arg| arg != "--ssh-port"));
         assert!(args.iter().all(|arg| arg != "--tls-ca-cert"));
         assert!(args.iter().all(|arg| arg != "--tls-ca-key"));
+    }
+
+    #[test]
+    fn netd_command_uses_resolved_executable() {
+        let command = network_helper_command(Path::new("/opt/silo/bin/netd"));
+
+        assert_eq!(command.get_program(), "/opt/silo/bin/netd");
     }
 
     #[test]

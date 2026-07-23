@@ -97,6 +97,22 @@ pub enum LibVmError {
     #[error("boot asset {asset} path is not a file: {path}")]
     BootAssetInvalid { asset: &'static str, path: PathBuf },
 
+    #[error("invalid {component} from {origin} at {path}: {reason}")]
+    RuntimeComponentInvalid {
+        component: &'static str,
+        origin: String,
+        path: PathBuf,
+        reason: String,
+    },
+
+    #[error(
+        "runtime component {component} was not found; checked {checked}; expected <runtime-root>/bin/{{vmmon,netd,krun}} and <runtime-root>/assets/{{kernel-default,initramfs,agent}}"
+    )]
+    RuntimeComponentNotFound {
+        component: &'static str,
+        checked: String,
+    },
+
     #[error("invalid create request for machine {name:?}: {reason}")]
     InvalidCreateRequest { name: String, reason: String },
 

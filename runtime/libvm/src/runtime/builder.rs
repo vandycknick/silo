@@ -72,6 +72,48 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Sets the netd executable path used for private networking.
+    pub fn netd_path(mut self, netd_path: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_netd_path(netd_path);
+        self
+    }
+
+    /// Sets the krun executable path passed to vmmon.
+    pub fn krun_path(mut self, krun_path: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_krun_path(krun_path);
+        self
+    }
+
+    /// Sets the default guest kernel path.
+    pub fn kernel_path(mut self, kernel_path: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_kernel_path(kernel_path);
+        self
+    }
+
+    /// Sets the default guest initramfs path.
+    pub fn initramfs_path(mut self, initramfs_path: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_initramfs_path(initramfs_path);
+        self
+    }
+
+    /// Sets the default guest agent path.
+    pub fn agent_path(mut self, agent_path: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_agent_path(agent_path);
+        self
+    }
+
+    /// Sets a portable runtime root containing `bin/` and `assets/`.
+    pub fn runtime_root(mut self, runtime_root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_runtime_root(runtime_root);
+        self
+    }
+
+    /// Sets a lower-priority portable runtime bundled by the caller.
+    pub fn bundled_runtime_root(mut self, runtime_root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_bundled_runtime_root(runtime_root);
+        self
+    }
+
     /// Opens the runtime.
     pub async fn open(self) -> Result<Runtime, LibVmError> {
         Runtime::new(self.config).await

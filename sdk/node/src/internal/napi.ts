@@ -15,7 +15,16 @@ export interface NativeRuntimeOpenOptions {
   dataRoot?: string;
   runRoot?: string;
   imageRoot?: string;
+  stateRoot?: string;
+  runtimeRoot?: string;
+  /** Package-relative runtime candidate supplied by the platform-package loader. */
+  bundledRuntimeRoot?: string;
   vmmonPath?: string;
+  netdPath?: string;
+  krunPath?: string;
+  kernelPath?: string;
+  initramfsPath?: string;
+  agentPath?: string;
 }
 
 export interface NativeRuntime {

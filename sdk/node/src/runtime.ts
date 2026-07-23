@@ -15,7 +15,7 @@ export class Runtime {
   /**
    * Open a local runtime.
    *
-   * If `vmmonPath` is not set, `vmmon` is resolved from the environment and `PATH`.
+   * Pass `runtimeRoot` to select a complete portable Silo runtime explicitly.
    *
    * @example
    * ```ts

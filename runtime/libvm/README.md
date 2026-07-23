@@ -70,6 +70,28 @@ databases. The derivation is:
 | machine logs   | `state_root/logs/machines/<id>` |
 | network logs   | `state_root/logs/networks/<id>` |
 
+## Runtime Components
+
+Opening a `Runtime` resolves `vmmon`, `netd`, `krun`, the default kernel,
+initramfs, and guest agent to absolute paths. The resolved set is retained for
+the lifetime of the runtime, so later machine starts do not repeat discovery or
+mix components after the process environment changes.
+
+The normal portable layout is:
+
+```text
+<runtime-root>/
+  bin/{vmmon,netd,krun}
+  assets/{kernel-default,initramfs,agent}
+```
+
+Callers can select that layout with `RuntimeConfig::with_runtime_root` or
+`SILO_RUNTIME_DIR`. Explicit component paths take precedence. Existing
+`SILO_VMMON_PATH`, `NETD_BIN`, `KRUN_BIN`, and `SILO_ASSET_DIR` controls remain
+available, followed by bundled, executable-relative, native-package, and legacy
+locations. Convention-based candidates must contain a complete component set;
+only deliberate per-component overrides may mix paths.
+
 ## Lifecycle States
 
 `libvm` treats VM lifecycle mutations as lock-owned transactions. Commands

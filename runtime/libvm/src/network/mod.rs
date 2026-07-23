@@ -76,6 +76,7 @@ pub(crate) async fn prepare_network_runtime(
     metadata: &MachineConfig,
     config: &RuntimeNetworkingConfig,
     network_launch: &NetworkLaunch,
+    netd_path: &Path,
 ) -> Result<VmmonNetworkAttachment, LibVmError> {
     reconcile_network_runtime(paths, store, metadata, false).await?;
 
@@ -94,6 +95,7 @@ pub(crate) async fn prepare_network_runtime(
                     metadata,
                     config,
                     network_launch,
+                    netd_path,
                 },
                 &request,
             )
@@ -106,7 +108,16 @@ pub(crate) async fn prepare_network_runtime(
                     message: format!("named network {:?} is not defined", name),
                 }
             })?;
-            resolve_named_network(paths, store, metadata, &definition, config, network_launch).await
+            resolve_named_network(
+                paths,
+                store,
+                metadata,
+                &definition,
+                config,
+                network_launch,
+                netd_path,
+            )
+            .await
         }
     }
 }
@@ -151,8 +162,9 @@ async fn resolve_named_network(
     definition: &ModelNetworkDefinition,
     config: &RuntimeNetworkingConfig,
     network_launch: &NetworkLaunch,
+    netd_path: &Path,
 ) -> Result<VmmonNetworkAttachment, LibVmError> {
-    let _ = (paths, store, config, network_launch, definition);
+    let _ = (paths, store, config, network_launch, definition, netd_path);
     Err(LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
         message:
@@ -293,6 +305,7 @@ pub(super) fn remove_file_if_exists(path: &Path) -> Result<(), LibVmError> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::Path;
 
     use serde_json::json;
     use vm_spec::VmSpec;
@@ -582,6 +595,7 @@ mod tests {
             &metadata,
             &RuntimeNetworkingConfig::default(),
             &crate::NetworkLaunch::default(),
+            Path::new("/test/runtime/bin/netd"),
         )
         .await
         .expect_err("named attachment API should be required");

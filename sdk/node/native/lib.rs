@@ -22,7 +22,15 @@ pub struct RuntimeOpenOptions {
     pub data_root: Option<String>,
     pub run_root: Option<String>,
     pub image_root: Option<String>,
+    pub state_root: Option<String>,
+    pub runtime_root: Option<String>,
+    pub bundled_runtime_root: Option<String>,
     pub vmmon_path: Option<String>,
+    pub netd_path: Option<String>,
+    pub krun_path: Option<String>,
+    pub kernel_path: Option<String>,
+    pub initramfs_path: Option<String>,
+    pub agent_path: Option<String>,
 }
 
 #[napi(object)]
@@ -294,8 +302,32 @@ pub async fn open_runtime(options: Option<RuntimeOpenOptions>) -> Result<NativeR
         if let Some(image_root) = options.image_root {
             config = config.with_image_root(image_root);
         }
+        if let Some(state_root) = options.state_root {
+            config = config.with_state_root(state_root);
+        }
+        if let Some(runtime_root) = options.runtime_root {
+            config = config.with_runtime_root(runtime_root);
+        }
+        if let Some(bundled_runtime_root) = options.bundled_runtime_root {
+            config = config.with_bundled_runtime_root(bundled_runtime_root);
+        }
         if let Some(vmmon_path) = options.vmmon_path {
             config = config.with_vmmon_path(vmmon_path);
+        }
+        if let Some(netd_path) = options.netd_path {
+            config = config.with_netd_path(netd_path);
+        }
+        if let Some(krun_path) = options.krun_path {
+            config = config.with_krun_path(krun_path);
+        }
+        if let Some(kernel_path) = options.kernel_path {
+            config = config.with_kernel_path(kernel_path);
+        }
+        if let Some(initramfs_path) = options.initramfs_path {
+            config = config.with_initramfs_path(initramfs_path);
+        }
+        if let Some(agent_path) = options.agent_path {
+            config = config.with_agent_path(agent_path);
         }
     }
 

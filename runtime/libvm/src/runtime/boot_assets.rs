@@ -3,13 +3,6 @@ use std::path::{Path, PathBuf};
 use crate::machine::{MachineAgent, MachineGuestConfig};
 use crate::LibVmError;
 
-const ENV_ASSET_DIR: &str = "SILO_ASSET_DIR";
-const SYSTEM_ASSETS_DIR: &str = "/usr/local/share/silo/assets";
-const USER_ASSETS_SUFFIX: &str = ".local/share/silo/assets";
-const DEFAULT_KERNEL_FILENAME: &str = "kernel-default";
-const DEFAULT_INITRAMFS_FILENAME: &str = "initramfs";
-const DEFAULT_AGENT_FILENAME: &str = "agent";
-
 #[derive(Debug, Clone)]
 pub(crate) struct BootAssetOverrides<'a> {
     pub(crate) kernel: Option<&'a Path>,
@@ -24,21 +17,12 @@ pub(crate) struct ResolvedBootAssets {
 
 pub(crate) fn resolve_boot_assets(
     overrides: BootAssetOverrides<'_>,
+    default_kernel: &Path,
+    default_initramfs: &Path,
 ) -> Result<ResolvedBootAssets, LibVmError> {
-    let directories = asset_directories()?;
     Ok(ResolvedBootAssets {
-        kernel: resolve_asset(
-            "kernel",
-            overrides.kernel,
-            DEFAULT_KERNEL_FILENAME,
-            &directories,
-        )?,
-        initramfs: resolve_asset(
-            "initramfs",
-            overrides.initramfs,
-            DEFAULT_INITRAMFS_FILENAME,
-            &directories,
-        )?,
+        kernel: resolve_asset("kernel", overrides.kernel, default_kernel)?,
+        initramfs: resolve_asset("initramfs", overrides.initramfs, default_initramfs)?,
     })
 }
 
@@ -66,12 +50,12 @@ pub(crate) fn canonicalize_guest_config(
     Ok(guest)
 }
 
-pub(crate) fn resolve_agent(agent: &MachineAgent) -> Result<Option<PathBuf>, LibVmError> {
+pub(crate) fn resolve_agent(
+    agent: &MachineAgent,
+    default_agent: &Path,
+) -> Result<Option<PathBuf>, LibVmError> {
     match agent {
-        MachineAgent::Default => {
-            let directories = asset_directories()?;
-            resolve_asset("agent", None, DEFAULT_AGENT_FILENAME, &directories).map(Some)
-        }
+        MachineAgent::Default => Ok(Some(default_agent.to_path_buf())),
         MachineAgent::Custom { path } => require_asset("agent", path).map(Some),
         MachineAgent::Disabled => Ok(None),
     }
@@ -80,26 +64,13 @@ pub(crate) fn resolve_agent(agent: &MachineAgent) -> Result<Option<PathBuf>, Lib
 fn resolve_asset(
     asset: &'static str,
     explicit: Option<&Path>,
-    filename: &'static str,
-    directories: &[PathBuf],
+    default: &Path,
 ) -> Result<PathBuf, LibVmError> {
     if let Some(path) = explicit {
         return require_asset(asset, path);
     }
 
-    let mut checked = Vec::new();
-    for directory in directories {
-        let path = directory.join(filename);
-        checked.push(path.display().to_string());
-        if path.is_file() {
-            return canonicalize_asset(asset, &path);
-        }
-    }
-
-    Err(LibVmError::BootAssetNotFound {
-        asset,
-        checked: checked.join(", "),
-    })
+    Ok(default.to_path_buf())
 }
 
 fn require_asset(asset: &'static str, path: &Path) -> Result<PathBuf, LibVmError> {
@@ -128,28 +99,6 @@ fn absolute_path(path: &Path) -> Result<PathBuf, LibVmError> {
     }
 }
 
-fn asset_directories() -> Result<Vec<PathBuf>, LibVmError> {
-    let mut directories = Vec::new();
-    if let Some(value) = std::env::var_os(ENV_ASSET_DIR) {
-        let path = PathBuf::from(value);
-        if !path.is_absolute() {
-            return Err(LibVmError::RelativeEnvironmentPath {
-                name: ENV_ASSET_DIR,
-                path,
-            });
-        }
-        directories.push(path);
-    }
-    directories.push(PathBuf::from(SYSTEM_ASSETS_DIR));
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        if home.is_absolute() {
-            directories.push(home.join(USER_ASSETS_SUFFIX));
-        }
-    }
-    Ok(directories)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -158,7 +107,7 @@ mod tests {
 
     use crate::machine::{MachineAgent, MachineGuestConfig};
     use crate::runtime::boot_assets::{
-        canonicalize_boot_overrides, canonicalize_guest_config, resolve_asset, BootAssetOverrides,
+        canonicalize_boot_overrides, canonicalize_guest_config, BootAssetOverrides,
     };
 
     fn write_asset(dir: &Path, name: &str) -> PathBuf {
@@ -185,19 +134,6 @@ mod tests {
             Some(kernel.canonicalize().expect("canonical"))
         );
         assert!(resolved_initramfs.is_none());
-    }
-
-    #[test]
-    fn defaults_fall_through_directories_independently() {
-        let temp = TempDir::new().expect("tempdir");
-        let first = temp.path().join("first");
-        let second = temp.path().join("second");
-        let expected = write_asset(&second, "agent");
-
-        let resolved = resolve_asset("agent", None, "agent", &[first, second])
-            .expect("resolve fallback asset");
-
-        assert_eq!(resolved, expected.canonicalize().expect("canonical"));
     }
 
     #[test]

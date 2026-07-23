@@ -15,6 +15,7 @@ use crate::lock_manager::{LockGuard, LockId, LockManager, ManagedLock};
 use crate::machine::root_disk::resize_raw_disk;
 use crate::paths::{vm_spec_path_in, LocalPaths, MachinePaths};
 use crate::runtime::boot_assets::{self, BootAssetOverrides, ResolvedBootAssets};
+use crate::runtime::components::ResolvedRuntimeComponents;
 use crate::runtime::{RuntimeConfig, RuntimeNetworkingConfig};
 use nix::{
     errno::Errno,
@@ -95,6 +96,7 @@ pub struct Runtime {
     store: Arc<dyn DataStore>,
     lock_manager: LockManager,
     networking: RuntimeNetworkingConfig,
+    components: Arc<ResolvedRuntimeComponents>,
     vmmon: Vmmon,
     image_pull_policy: ImagePullPolicy,
     image_progress: Option<ImageProgressSender>,
@@ -121,6 +123,7 @@ impl Runtime {
 
     /// Opens a local runtime from explicit configuration.
     pub async fn new(config: RuntimeConfig) -> Result<Self, LibVmError> {
+        let components = Arc::new(ResolvedRuntimeComponents::resolve(&config)?);
         let state_db_path = config.bootstrap_state_db_path()?;
         let store = Store::open(&state_db_path).await?;
         let stored = match store.db_config().await? {
@@ -139,7 +142,7 @@ impl Runtime {
         .await?;
         let roots = config.resolve_store_roots(&stored, &state_db_path)?;
         let paths = LocalPaths::from_roots(roots);
-        Self::from_store(paths, Arc::new(store), config.networking, config.vmmon_path).await
+        Self::from_store(paths, Arc::new(store), config.networking, components).await
     }
 
     /// Opens the default local runtime from the process environment.
@@ -153,22 +156,33 @@ impl Runtime {
         networking: RuntimeNetworkingConfig,
     ) -> Result<Self, LibVmError> {
         let store = Store::new(&paths).await?;
-        Self::from_store(paths, Arc::new(store), networking, None).await
+        Self::from_store(
+            paths,
+            Arc::new(store),
+            networking,
+            Arc::new(ResolvedRuntimeComponents::for_tests()),
+        )
+        .await
     }
 
     pub(crate) async fn from_store(
         paths: LocalPaths,
         store: Arc<dyn DataStore>,
         networking: RuntimeNetworkingConfig,
-        vmmon_path: Option<PathBuf>,
+        components: Arc<ResolvedRuntimeComponents>,
     ) -> Result<Self, LibVmError> {
         let lock_manager = LockManager::open(paths.locks_dir().to_path_buf())?;
-        let vmmon = Vmmon::new(paths.clone(), vmmon_path);
+        let vmmon = Vmmon::new(
+            paths.clone(),
+            components.vmmon().to_path_buf(),
+            components.krun().to_path_buf(),
+        );
         let runtime = Self {
             paths,
             store,
             lock_manager,
             networking,
+            components,
             vmmon,
             image_pull_policy: ImagePullPolicy::default(),
             image_progress: None,
@@ -238,7 +252,11 @@ impl Runtime {
         kernel: Option<&Path>,
         initramfs: Option<&Path>,
     ) -> Result<ResolvedBootAssets, LibVmError> {
-        boot_assets::resolve_boot_assets(BootAssetOverrides { kernel, initramfs })
+        boot_assets::resolve_boot_assets(
+            BootAssetOverrides { kernel, initramfs },
+            self.components.kernel(),
+            self.components.initramfs(),
+        )
     }
 
     fn complete_launch_boot_assets(&self, spec: &mut VmSpec) -> Result<(), LibVmError> {
@@ -862,6 +880,7 @@ impl Runtime {
             config,
             &self.networking,
             network_launch,
+            self.components.netd(),
         )
         .await
     }
@@ -892,7 +911,9 @@ impl Runtime {
             })?;
 
             let agent_enabled = config.guest.agent.enabled();
-            if let Some(agent_path) = boot_assets::resolve_agent(&config.guest.agent)? {
+            if let Some(agent_path) =
+                boot_assets::resolve_agent(&config.guest.agent, self.components.agent())?
+            {
                 let agent_config = guest_agent::build_config(GuestAgentConfigInput {
                     paths: &self.paths,
                     machine_name: &config.name,
@@ -1595,6 +1616,7 @@ fn apply_resolved_boot_assets(spec: &mut VmSpec, boot_assets: ResolvedBootAssets
 mod tests {
     use crate::lock_manager::LockId;
     use crate::paths::LocalPaths;
+    use crate::runtime::components::ResolvedRuntimeComponents;
     use crate::runtime::core::{
         effective_oci_manifest_digest, materialized_manifest_digest, oci_image_record,
         read_monitor_pid, stopped_machine_state, write_machine_config, Runtime,
@@ -1731,7 +1753,7 @@ mod tests {
             paths,
             Arc::new(store),
             RuntimeNetworkingConfig::default(),
-            None,
+            Arc::new(ResolvedRuntimeComponents::for_tests()),
         )
         .await
         .expect("create runtime with mock store")
