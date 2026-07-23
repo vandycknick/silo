@@ -2,6 +2,9 @@
 
 We use Michael Nygard-style ADRs to capture architectural decisions.
 
+The [ADR writing guide](writing-guide.md) defines the common structure, tone,
+and review standards for new and substantially revised records.
+
 ## ADR Lifecycle States
 
 | State       | Meaning                                           |
