@@ -386,8 +386,13 @@ fn validate_index(
         require_descriptor(
             &descriptor,
             OCI_MANIFEST_MEDIA_TYPE,
-            Some(KERNEL_ARTIFACT_TYPE),
+            None,
             "platform manifest descriptor",
+        )?;
+        require_optional_artifact_type(
+            &descriptor,
+            KERNEL_CONFIG_MEDIA_TYPE,
+            "platform manifest descriptor artifactType",
         )?;
         if arch == target.goarch {
             matches.push(descriptor);
@@ -407,8 +412,13 @@ fn validate_index(
     require_descriptor(
         &descriptor,
         OCI_MANIFEST_MEDIA_TYPE,
-        Some(KERNEL_ARTIFACT_TYPE),
+        None,
         "platform manifest descriptor",
+    )?;
+    require_optional_artifact_type(
+        &descriptor,
+        KERNEL_CONFIG_MEDIA_TYPE,
+        "platform manifest descriptor artifactType",
     )?;
     Ok(descriptor)
 }
@@ -568,10 +578,11 @@ fn descriptor_from_value(
     if size == 0 {
         return invalid(context, "descriptor size must be positive");
     }
-    let artifact_type = value
-        .get("artifactType")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let artifact_type = match value.get("artifactType") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => return invalid(context, "descriptor artifactType must be a string"),
+    };
     Ok(Descriptor {
         media_type,
         digest,
@@ -593,6 +604,17 @@ fn require_descriptor(
             expected,
             context,
         )?;
+    }
+    Ok(())
+}
+
+fn require_optional_artifact_type(
+    descriptor: &Descriptor,
+    expected: &str,
+    context: &'static str,
+) -> Result<(), ResolveKernelError> {
+    if let Some(actual) = descriptor.artifact_type.as_deref() {
+        require_equal(actual, expected, context)?;
     }
     Ok(())
 }
@@ -920,14 +942,14 @@ mod tests {
                     "mediaType": OCI_MANIFEST_MEDIA_TYPE,
                     "digest": DIGEST_A,
                     "size": 123,
-                    "artifactType": KERNEL_ARTIFACT_TYPE,
+                    "artifactType": KERNEL_CONFIG_MEDIA_TYPE,
                     "platform": {"os": "linux", "architecture": "amd64"}
                 },
                 {
                     "mediaType": OCI_MANIFEST_MEDIA_TYPE,
                     "digest": DIGEST_B,
                     "size": 123,
-                    "artifactType": KERNEL_ARTIFACT_TYPE,
+                    "artifactType": KERNEL_CONFIG_MEDIA_TYPE,
                     "platform": {"os": "linux", "architecture": "arm64"}
                 }
             ]
@@ -983,6 +1005,24 @@ mod tests {
             validate_manifest(&manifest(arm64), target.descriptor()).expect("manifest");
             validate_config(&config(arm64), target.descriptor()).expect("config");
         }
+    }
+
+    #[test]
+    fn accepts_omitted_descriptor_artifact_type_but_rejects_a_wrong_value() {
+        let mut compatible = index();
+        compatible["manifests"][0]
+            .as_object_mut()
+            .expect("amd64 descriptor")
+            .remove("artifactType");
+        compatible["manifests"][1]["artifactType"] = Value::Null;
+        validate_index(&compatible, ReleaseTarget::DarwinArm64.descriptor())
+            .expect("optional descriptor artifact types");
+
+        compatible["manifests"][1]["artifactType"] = json!("application/octet-stream");
+        assert!(validate_index(&compatible, ReleaseTarget::DarwinArm64.descriptor()).is_err());
+
+        compatible["manifests"][1]["artifactType"] = json!(false);
+        assert!(validate_index(&compatible, ReleaseTarget::DarwinArm64.descriptor()).is_err());
     }
 
     #[test]
@@ -1142,7 +1182,7 @@ mod tests {
             );
             let mut descriptor: Value =
                 serde_json::from_slice(&output.stdout).expect("parse platform descriptor");
-            descriptor["artifactType"] = json!(KERNEL_ARTIFACT_TYPE);
+            descriptor["artifactType"] = json!(KERNEL_CONFIG_MEDIA_TYPE);
             descriptor["platform"] = json!({"os": "linux", "architecture": architecture});
             descriptor
         });

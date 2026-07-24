@@ -313,16 +313,20 @@ fn valid_arm64_macho(bytes: &[u8], file_size: u64) -> bool {
 fn validate_arm64_kernel(component: &ComponentSource) -> Result<(), StageRuntimeError> {
     let bytes = read_prefix(component, 64)?;
     let file_size = file_size(component)?;
+    if valid_arm64_kernel(&bytes, file_size) {
+        return Ok(());
+    }
+    invalid_architecture(component, Architecture::Arm64, "Linux Image")
+}
+
+fn valid_arm64_kernel(bytes: &[u8], file_size: u64) -> bool {
     let image_size = bytes
         .get(16..24)
         .and_then(|value| value.try_into().ok())
         .map(u64::from_le_bytes);
-    if bytes.get(56..60) == Some(b"ARM\x64")
-        && image_size.is_some_and(|size| size >= 64 && size <= file_size)
-    {
-        return Ok(());
-    }
-    invalid_architecture(component, Architecture::Arm64, "Linux Image")
+    file_size >= 64
+        && bytes.get(56..60) == Some(b"ARM\x64")
+        && image_size.is_some_and(|size| size >= file_size)
 }
 
 fn validate_initramfs(
@@ -735,7 +739,8 @@ mod tests {
     use crate::release_target::{BuildProfile, ReleaseTarget};
     use crate::stage_runtime::{
         architecture_for_guest_target, replace_stage_directory, stage_runtime_for_host,
-        Architecture, StageRuntimeError, StageRuntimeOptions, EXECUTABLE_MODE, READABLE_MODE,
+        valid_arm64_kernel, Architecture, StageRuntimeError, StageRuntimeOptions, EXECUTABLE_MODE,
+        READABLE_MODE,
     };
 
     #[test]
@@ -758,6 +763,17 @@ mod tests {
             assert!(!staged.join("init").exists());
             assert!(!staged.join("silo").exists());
         }
+    }
+
+    #[test]
+    fn arm64_kernel_effective_size_may_include_unstored_bss() {
+        let mut image = vec![0_u8; 64];
+        image[16..24].copy_from_slice(&128_u64.to_le_bytes());
+        image[56..60].copy_from_slice(b"ARM\x64");
+        assert!(valid_arm64_kernel(&image, image.len() as u64));
+
+        image[16..24].copy_from_slice(&63_u64.to_le_bytes());
+        assert!(!valid_arm64_kernel(&image, image.len() as u64));
     }
 
     #[test]
@@ -995,7 +1011,7 @@ mod tests {
 
     fn write_arm64_kernel(path: &Path) {
         let mut bytes = vec![0_u8; 64];
-        bytes[16..24].copy_from_slice(&64_u64.to_le_bytes());
+        bytes[16..24].copy_from_slice(&128_u64.to_le_bytes());
         bytes[56..60].copy_from_slice(b"ARM\x64");
         write_source(path, &bytes);
     }

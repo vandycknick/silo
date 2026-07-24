@@ -36,6 +36,13 @@ type:
 application/vnd.silo.kernel.image.v1
 ```
 
+Published index descriptors carry `application/vnd.silo.kernel.config.v1+json`
+as their `artifactType`, matching the referenced manifest's config media type
+as required by OCI. Consumers tolerate an omitted descriptor field because OCI
+defines it as optional, as well as the legacy registry index's non-standard
+`null`; they reject other non-string or conflicting values and always verify
+`application/vnd.silo.kernel.v1` in the referenced platform manifest.
+
 That layer is the architecture-native boot kernel. Its
 `org.opencontainers.image.title` annotation preserves the native `Image` or
 `vmlinux` filename for humans and generic ORAS extraction, but the title is not

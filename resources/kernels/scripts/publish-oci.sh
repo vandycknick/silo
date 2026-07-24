@@ -44,6 +44,7 @@ jq -n \
     --slurpfile arm64 "$temp_dir/arm64-descriptor.json" \
     --slurpfile amd64 "$temp_dir/amd64-descriptor.json" \
     --arg created "$created" \
+    --arg descriptor_artifact_type "application/vnd.silo.kernel.config.v1+json" \
     --arg revision "$revision" \
     --arg source "$source" \
     --arg version "$version" \
@@ -53,8 +54,8 @@ jq -n \
         mediaType: "application/vnd.oci.image.index.v1+json",
         artifactType: "application/vnd.silo.kernel.v1",
         manifests: [
-            ($arm64[0] | {mediaType, digest, size, artifactType} + {platform: {os: "linux", architecture: "arm64"}}),
-            ($amd64[0] | {mediaType, digest, size, artifactType} + {platform: {os: "linux", architecture: "amd64"}})
+            ($arm64[0] | {mediaType, digest, size} + {artifactType: $descriptor_artifact_type, platform: {os: "linux", architecture: "arm64"}}),
+            ($amd64[0] | {mediaType, digest, size} + {artifactType: $descriptor_artifact_type, platform: {os: "linux", architecture: "amd64"}})
         ],
         annotations: {
             "org.opencontainers.image.created": $created,
@@ -70,6 +71,7 @@ oras manifest push "$image:$revision_tag,$version,$track" "$temp_dir/kernel-inde
 oras manifest fetch "$image:$revision_tag" > "$temp_dir/published-index.json"
 jq -e '
     .artifactType == "application/vnd.silo.kernel.v1" and
+    ([.manifests[] | select(.artifactType == "application/vnd.silo.kernel.config.v1+json")] | length) == 2 and
     ([.manifests[].platform | [.os, .architecture]] | sort) ==
         ([ ["linux", "amd64"], ["linux", "arm64"] ] | sort)
 ' "$temp_dir/published-index.json" >/dev/null
