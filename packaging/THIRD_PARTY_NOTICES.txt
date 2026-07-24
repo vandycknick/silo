@@ -1,0 +1,9 @@
+Silo Third-Party Notices
+
+libkrun
+Copyright the libkrun contributors.
+Licensed under the Apache License, Version 2.0.
+Source: https://github.com/vandycknick/libkrun
+
+Complete dependency and license information is recorded in the release SBOM and
+the Silo source repository.

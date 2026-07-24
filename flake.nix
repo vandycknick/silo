@@ -57,6 +57,7 @@
             pkgs.perl
             pkgs.pkg-config
             pkgs.xz
+            pkgs.zstd
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.bc

@@ -7,12 +7,14 @@ use std::process::{Command, ExitStatus};
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
+use crate::archive::{package_archives, PackageArchivesOptions};
 use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::kernel_oci::{resolve_kernel, ResolveKernelOptions};
 use crate::release_stage::{release_stage, ReleaseStageOptions};
 use crate::release_target::{BuildProfile, ReleaseTarget};
 use crate::stage_runtime::{stage_runtime, StageRuntimeOptions};
 
+mod archive;
 mod initramfs;
 mod kernel_oci;
 mod release_inspect;
@@ -36,12 +38,20 @@ struct Args {
 #[derive(Debug, Subcommand)]
 enum Commands {
     GuestAssets(GuestAssetsArgs),
+    PackageArchives(PackageArchivesArgs),
     PackInitramfs(PackInitramfsArgs),
     ReleaseTarget(ReleaseTargetArgs),
     ReleaseStage(ReleaseStageArgs),
     ResolveKernel(ResolveKernelArgs),
     StageRuntime(StageRuntimeArgs),
     SignVmmon(SignVmmonArgs),
+}
+
+#[derive(Debug, Parser)]
+#[command(about = "Package deterministic portable release archives")]
+struct PackageArchivesArgs {
+    #[arg(long, value_enum)]
+    target: ReleaseTarget,
 }
 
 #[derive(Debug, Parser)]
@@ -118,6 +128,8 @@ struct SignVmmonArgs {
 #[derive(Debug, Error)]
 enum XtaskError {
     #[error(transparent)]
+    Archive(#[from] archive::ArchiveError),
+    #[error(transparent)]
     Initramfs(#[from] initramfs::InitramfsError),
     #[error(transparent)]
     StageRuntime(#[from] stage_runtime::StageRuntimeError),
@@ -191,6 +203,18 @@ fn main() {
 fn run() -> Result<()> {
     match Args::parse().command {
         Commands::GuestAssets(args) => guest_assets(args),
+        Commands::PackageArchives(args) => {
+            validate_release_versions()?;
+            let result = package_archives(&PackageArchivesOptions {
+                target: args.target,
+                target_dir: target_dir()?,
+                workspace_root: workspace_root()?,
+            })?;
+            println!("runtime_archive={}", result.runtime.display());
+            println!("cli_archive={}", result.cli.display());
+            println!("metadata={}", result.metadata.display());
+            Ok(())
+        }
         Commands::PackInitramfs(args) => pack_initramfs(args),
         Commands::ReleaseTarget(args) => {
             validate_release_versions()?;
