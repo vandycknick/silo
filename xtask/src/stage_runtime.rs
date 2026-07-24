@@ -293,12 +293,17 @@ fn valid_arm64_macho(bytes: &[u8], file_size: u64) -> bool {
             let file_length = read_u64_le(bytes, offset + 48);
             let initial_protection = read_u32_le(bytes, offset + 60);
             let valid_segment = file_offset.zip(file_length).is_some_and(|(start, length)| {
-                length > 0 && start.saturating_add(length) <= file_size
+                start <= file_size
+                    && start
+                        .checked_add(length)
+                        .is_some_and(|end| end <= file_size)
             });
             if !valid_segment {
                 return false;
             }
-            if initial_protection.is_some_and(|protection| protection & 0x4 != 0) {
+            if file_length.is_some_and(|length| length > 0)
+                && initial_protection.is_some_and(|protection| protection & 0x4 != 0)
+            {
                 executable_segment = true;
             }
         }
@@ -739,8 +744,8 @@ mod tests {
     use crate::release_target::{BuildProfile, ReleaseTarget};
     use crate::stage_runtime::{
         architecture_for_guest_target, replace_stage_directory, stage_runtime_for_host,
-        valid_arm64_kernel, Architecture, StageRuntimeError, StageRuntimeOptions, EXECUTABLE_MODE,
-        READABLE_MODE,
+        valid_arm64_kernel, valid_arm64_macho, Architecture, StageRuntimeError,
+        StageRuntimeOptions, EXECUTABLE_MODE, READABLE_MODE,
     };
 
     #[test]
@@ -774,6 +779,15 @@ mod tests {
 
         image[16..24].copy_from_slice(&63_u64.to_le_bytes());
         assert!(!valid_arm64_kernel(&image, image.len() as u64));
+    }
+
+    #[test]
+    fn arm64_macho_allows_a_zero_length_pagezero_segment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("macho");
+        write_macho(&path);
+        let bytes = fs::read(&path).expect("read Mach-O fixture");
+        assert!(valid_arm64_macho(&bytes, bytes.len() as u64));
     }
 
     #[test]
@@ -995,17 +1009,19 @@ mod tests {
     }
 
     fn write_macho(path: &Path) {
-        let mut bytes = vec![0_u8; 104];
+        let mut bytes = vec![0_u8; 176];
         bytes[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
         bytes[4..8].copy_from_slice(&0x0100_000c_u32.to_le_bytes());
         bytes[12..16].copy_from_slice(&2_u32.to_le_bytes());
-        bytes[16..20].copy_from_slice(&1_u32.to_le_bytes());
-        bytes[20..24].copy_from_slice(&72_u32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&2_u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&144_u32.to_le_bytes());
         bytes[32..36].copy_from_slice(&0x19_u32.to_le_bytes());
         bytes[36..40].copy_from_slice(&72_u32.to_le_bytes());
-        bytes[72..80].copy_from_slice(&0_u64.to_le_bytes());
-        bytes[80..88].copy_from_slice(&104_u64.to_le_bytes());
-        bytes[92..96].copy_from_slice(&5_u32.to_le_bytes());
+        bytes[104..108].copy_from_slice(&0x19_u32.to_le_bytes());
+        bytes[108..112].copy_from_slice(&72_u32.to_le_bytes());
+        bytes[144..152].copy_from_slice(&0_u64.to_le_bytes());
+        bytes[152..160].copy_from_slice(&176_u64.to_le_bytes());
+        bytes[164..168].copy_from_slice(&5_u32.to_le_bytes());
         write_source(path, &bytes);
     }
 
