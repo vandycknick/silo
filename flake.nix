@@ -87,11 +87,13 @@
               pkgs.libcap_ng
               pkgs.patchelf
               llvm.clang
+              llvm.bintools
               llvm.libclang
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
               pkgs.lld
               llvm.clang
+              llvm.bintools
               llvm.libclang
             ];
 

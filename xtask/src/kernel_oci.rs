@@ -750,7 +750,7 @@ fn temporary_directory(destination: &Path) -> Result<PathBuf, ResolveKernelError
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn install_directory_noreplace(
+pub(crate) fn install_directory_noreplace(
     temporary: &Path,
     destination: &Path,
 ) -> Result<(), ResolveKernelError> {
@@ -768,8 +768,24 @@ fn install_directory_noreplace(
     })
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn exchange_directories(left: &Path, right: &Path) -> Result<(), ResolveKernelError> {
+    nix::fcntl::renameat2(
+        nix::fcntl::AT_FDCWD,
+        left,
+        nix::fcntl::AT_FDCWD,
+        right,
+        nix::fcntl::RenameFlags::RENAME_EXCHANGE,
+    )
+    .map_err(|error| ResolveKernelError::Io {
+        operation: "atomically exchange release directories",
+        path: right.to_path_buf(),
+        source: io::Error::from_raw_os_error(error as i32),
+    })
+}
+
 #[cfg(target_os = "macos")]
-fn install_directory_noreplace(
+pub(crate) fn install_directory_noreplace(
     temporary: &Path,
     destination: &Path,
 ) -> Result<(), ResolveKernelError> {
@@ -807,6 +823,45 @@ fn install_directory_noreplace(
     Err(ResolveKernelError::Io {
         operation: "install resolved kernel without replacing an existing output",
         path: destination.to_path_buf(),
+        source: io::Error::last_os_error(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn exchange_directories(left: &Path, right: &Path) -> Result<(), ResolveKernelError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    const RENAME_SWAP: u32 = 0x0000_0002;
+
+    // nix has no wrapper for Apple's renamex_np directory exchange.
+    unsafe extern "C" {
+        fn renamex_np(
+            from: *const std::ffi::c_char,
+            to: *const std::ffi::c_char,
+            flags: u32,
+        ) -> std::ffi::c_int;
+    }
+
+    let from = CString::new(left.as_os_str().as_bytes()).map_err(|error| {
+        ResolveKernelError::InvalidContract {
+            context: "runtime staging path",
+            reason: error.to_string(),
+        }
+    })?;
+    let to = CString::new(right.as_os_str().as_bytes()).map_err(|error| {
+        ResolveKernelError::InvalidContract {
+            context: "runtime output path",
+            reason: error.to_string(),
+        }
+    })?;
+    let result = unsafe { renamex_np(from.as_ptr(), to.as_ptr(), RENAME_SWAP) };
+    if result == 0 {
+        return Ok(());
+    }
+    Err(ResolveKernelError::Io {
+        operation: "atomically exchange release directories",
+        path: right.to_path_buf(),
         source: io::Error::last_os_error(),
     })
 }

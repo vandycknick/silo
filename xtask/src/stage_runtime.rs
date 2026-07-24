@@ -19,6 +19,8 @@ pub(crate) struct StageRuntimeOptions {
     pub(crate) profile: BuildProfile,
     pub(crate) kernel: PathBuf,
     pub(crate) target_dir: PathBuf,
+    pub(crate) component_dir: Option<PathBuf>,
+    pub(crate) assets_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -73,8 +75,14 @@ fn stage_runtime_for_host(
     }
 
     let descriptor = options.target.descriptor();
-    let profile_dir = options.target_dir.join(options.profile.to_string());
-    let assets_dir = options.target_dir.join("resources/assets");
+    let profile_dir = options
+        .component_dir
+        .clone()
+        .unwrap_or_else(|| options.target_dir.join(options.profile.to_string()));
+    let assets_dir = options
+        .assets_dir
+        .clone()
+        .unwrap_or_else(|| options.target_dir.join("resources/assets"));
     let sources = [
         ComponentSource::executable("vmmon", profile_dir.join("vmmon"), "bin/vmmon"),
         ComponentSource::executable("netd", profile_dir.join("netd"), "bin/netd"),
@@ -931,6 +939,8 @@ mod tests {
                 profile: BuildProfile::Release,
                 kernel: self.kernel.clone(),
                 target_dir: self.target_dir.clone(),
+                component_dir: None,
+                assets_dir: None,
             }
         }
 

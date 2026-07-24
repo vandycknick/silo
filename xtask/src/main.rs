@@ -9,11 +9,14 @@ use thiserror::Error;
 
 use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::kernel_oci::{resolve_kernel, ResolveKernelOptions};
+use crate::release_stage::{release_stage, ReleaseStageOptions};
 use crate::release_target::{BuildProfile, ReleaseTarget};
 use crate::stage_runtime::{stage_runtime, StageRuntimeOptions};
 
 mod initramfs;
 mod kernel_oci;
+mod release_inspect;
+mod release_stage;
 mod release_target;
 mod stage_runtime;
 
@@ -35,6 +38,7 @@ enum Commands {
     GuestAssets(GuestAssetsArgs),
     PackInitramfs(PackInitramfsArgs),
     ReleaseTarget(ReleaseTargetArgs),
+    ReleaseStage(ReleaseStageArgs),
     ResolveKernel(ResolveKernelArgs),
     StageRuntime(StageRuntimeArgs),
     SignVmmon(SignVmmonArgs),
@@ -94,6 +98,17 @@ struct ResolveKernelArgs {
 }
 
 #[derive(Debug, Parser)]
+#[command(about = "Build and stage a canonical Silo release payload")]
+struct ReleaseStageArgs {
+    #[arg(long, value_enum)]
+    target: ReleaseTarget,
+    #[arg(long, value_name = "REFERENCE")]
+    kernel_reference: String,
+    #[arg(long, value_name = "PATH")]
+    kernel_oci_layout: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
 #[command(about = "Ad-hoc sign the vmmon binary on macOS")]
 struct SignVmmonArgs {
     #[arg(value_name = "PATH")]
@@ -108,6 +123,8 @@ enum XtaskError {
     StageRuntime(#[from] stage_runtime::StageRuntimeError),
     #[error(transparent)]
     ResolveKernel(#[from] kernel_oci::ResolveKernelError),
+    #[error(transparent)]
+    ReleaseStage(#[from] release_stage::ReleaseStageError),
     #[error("workspace root has no parent for xtask manifest path {path}")]
     MissingWorkspaceRoot { path: PathBuf },
     #[error("guest binary not found after build: {path}")]
@@ -198,6 +215,20 @@ fn run() -> Result<()> {
             println!("provenance={}", resolved.provenance.display());
             Ok(())
         }
+        Commands::ReleaseStage(args) => {
+            validate_release_versions()?;
+            let result = release_stage(&ReleaseStageOptions {
+                target: args.target,
+                kernel_reference: args.kernel_reference,
+                kernel_oci_layout: args.kernel_oci_layout,
+                target_dir: target_dir()?,
+                workspace_root: workspace_root()?,
+            })?;
+            println!("runtime={}", result.runtime.display());
+            println!("cli={}", result.cli.display());
+            println!("metadata={}", result.metadata.display());
+            Ok(())
+        }
         Commands::StageRuntime(args) => {
             validate_release_versions()?;
             let target_dir = target_dir()?;
@@ -206,6 +237,8 @@ fn run() -> Result<()> {
                 profile: args.profile,
                 kernel: args.kernel,
                 target_dir,
+                component_dir: None,
+                assets_dir: None,
             })?;
             println!("{}", stage_dir.display());
             Ok(())
@@ -291,9 +324,15 @@ fn release_target_output(args: ReleaseTargetArgs, target_dir: &Path) -> String {
 }
 
 fn target_dir() -> Result<PathBuf> {
-    Ok(env::var_os("CARGO_TARGET_DIR")
+    let workspace = workspace_root()?;
+    let target = env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
-        .unwrap_or(workspace_root()?.join("target")))
+        .unwrap_or_else(|| workspace.join("target"));
+    Ok(if target.is_absolute() {
+        target
+    } else {
+        workspace.join(target)
+    })
 }
 
 fn guest_assets(args: GuestAssetsArgs) -> Result<()> {
@@ -562,6 +601,27 @@ mod tests {
             args.output_dir,
             Some(std::path::PathBuf::from("/tmp/kernel"))
         );
+    }
+
+    #[test]
+    fn release_stage_command_requires_target_and_kernel_reference() {
+        assert!(
+            Args::try_parse_from(["xtask", "release-stage", "--target", "darwin-arm64"]).is_err()
+        );
+        let args = Args::try_parse_from([
+            "xtask",
+            "release-stage",
+            "--target",
+            "darwin-arm64",
+            "--kernel-reference",
+            "ghcr.io/example/silo/kernel:stable",
+        ])
+        .expect("parse release-stage command");
+        let Commands::ReleaseStage(args) = args.command else {
+            panic!("expected release-stage command");
+        };
+        assert_eq!(args.target, ReleaseTarget::DarwinArm64);
+        assert_eq!(args.kernel_reference, "ghcr.io/example/silo/kernel:stable");
     }
 
     #[test]
