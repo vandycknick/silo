@@ -10,6 +10,7 @@ use thiserror::Error;
 use crate::archive::{package_archives, PackageArchivesOptions};
 use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::kernel_oci::{resolve_kernel, ResolveKernelOptions};
+use crate::macos_package::{package_macos, PackageMacosOptions};
 use crate::release_stage::{release_stage, ReleaseStageOptions};
 use crate::release_target::{BuildProfile, ReleaseTarget};
 use crate::stage_runtime::{stage_runtime, StageRuntimeOptions};
@@ -17,6 +18,7 @@ use crate::stage_runtime::{stage_runtime, StageRuntimeOptions};
 mod archive;
 mod initramfs;
 mod kernel_oci;
+mod macos_package;
 mod release_inspect;
 mod release_stage;
 mod release_target;
@@ -39,6 +41,7 @@ struct Args {
 enum Commands {
     GuestAssets(GuestAssetsArgs),
     PackageArchives(PackageArchivesArgs),
+    PackageMacos(PackageMacosArgs),
     PackInitramfs(PackInitramfsArgs),
     ReleaseTarget(ReleaseTargetArgs),
     ReleaseStage(ReleaseStageArgs),
@@ -52,6 +55,17 @@ enum Commands {
 struct PackageArchivesArgs {
     #[arg(long, value_enum)]
     target: ReleaseTarget,
+}
+
+#[derive(Debug, Parser)]
+#[command(about = "Assemble, sign, and optionally notarize the macOS distribution")]
+struct PackageMacosArgs {
+    #[arg(long, value_name = "VERSION")]
+    build_number: String,
+    #[arg(long, value_name = "IDENTITY")]
+    signing_identity: Option<String>,
+    #[arg(long, value_name = "PROFILE", requires = "signing_identity")]
+    notary_keychain_profile: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -129,6 +143,8 @@ struct SignVmmonArgs {
 enum XtaskError {
     #[error(transparent)]
     Archive(#[from] archive::ArchiveError),
+    #[error(transparent)]
+    MacosPackage(#[from] macos_package::MacosPackageError),
     #[error(transparent)]
     Initramfs(#[from] initramfs::InitramfsError),
     #[error(transparent)]
@@ -212,6 +228,20 @@ fn run() -> Result<()> {
             })?;
             println!("runtime_archive={}", result.runtime.display());
             println!("cli_archive={}", result.cli.display());
+            println!("metadata={}", result.metadata.display());
+            Ok(())
+        }
+        Commands::PackageMacos(args) => {
+            validate_release_versions()?;
+            let result = package_macos(&PackageMacosOptions {
+                build_number: args.build_number,
+                signing_identity: args.signing_identity,
+                notary_keychain_profile: args.notary_keychain_profile,
+                target_dir: target_dir()?,
+                workspace_root: workspace_root()?,
+            })?;
+            println!("app={}", result.app.display());
+            println!("dmg={}", result.dmg.display());
             println!("metadata={}", result.metadata.display());
             Ok(())
         }
@@ -646,6 +676,40 @@ mod tests {
         };
         assert_eq!(args.target, ReleaseTarget::DarwinArm64);
         assert_eq!(args.kernel_reference, "ghcr.io/example/silo/kernel:stable");
+    }
+
+    #[test]
+    fn package_macos_requires_build_number_and_pairs_notary_with_signing() {
+        assert!(Args::try_parse_from(["xtask", "package-macos"]).is_err());
+        assert!(Args::try_parse_from([
+            "xtask",
+            "package-macos",
+            "--build-number",
+            "1",
+            "--notary-keychain-profile",
+            "release",
+        ])
+        .is_err());
+        let args = Args::try_parse_from([
+            "xtask",
+            "package-macos",
+            "--build-number",
+            "42",
+            "--signing-identity",
+            "Developer ID Application: Silo",
+            "--notary-keychain-profile",
+            "release",
+        ])
+        .expect("parse package-macos command");
+        let Commands::PackageMacos(args) = args.command else {
+            panic!("expected package-macos command");
+        };
+        assert_eq!(args.build_number, "42");
+        assert_eq!(
+            args.signing_identity.as_deref(),
+            Some("Developer ID Application: Silo")
+        );
+        assert_eq!(args.notary_keychain_profile.as_deref(), Some("release"));
     }
 
     #[test]
