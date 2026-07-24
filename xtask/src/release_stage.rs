@@ -309,13 +309,18 @@ fn build_host_components(
     descriptor: ReleaseTargetDescriptor,
     source: &SourceIdentity,
 ) -> Result<PathBuf, ReleaseStageError> {
+    let macos_sdk = if descriptor.macos_minimum_version.is_some() {
+        system_macos_sdk()?
+    } else {
+        PathBuf::new()
+    };
     for (package, binary) in [("cli", "silo"), ("vmmon", "vmmon")] {
         run(build_rust_command(
-            options, descriptor, source, package, binary, false,
+            options, descriptor, source, &macos_sdk, package, binary, false,
         ))?;
     }
     run(build_rust_command(
-        options, descriptor, source, "krun", "krun", true,
+        options, descriptor, source, &macos_sdk, "krun", "krun", true,
     ))?;
     let component_dir = options
         .target_dir
@@ -323,7 +328,9 @@ fn build_host_components(
         .join("release");
     let netd = component_dir.join("netd");
     create_directory(&component_dir)?;
-    run(build_netd_command(options, descriptor, source, &netd))?;
+    run(build_netd_command(
+        options, descriptor, source, &macos_sdk, &netd,
+    ))?;
     for binary in ["silo", "vmmon", "netd", "krun"] {
         require_file(&component_dir.join(binary))?;
     }
@@ -334,6 +341,7 @@ fn build_rust_command(
     options: &ReleaseStageOptions,
     descriptor: ReleaseTargetDescriptor,
     source: &SourceIdentity,
+    macos_sdk: &Path,
     package: &str,
     binary: &str,
     krun_features: bool,
@@ -356,7 +364,13 @@ fn build_rust_command(
         command.args(["--features", "krun-bin"]);
     }
     if let Some(minimum) = descriptor.macos_minimum_version {
-        command.env("MACOSX_DEPLOYMENT_TARGET", minimum);
+        remove_nix_apple_toolchain_environment(&mut command);
+        command
+            .env("MACOSX_DEPLOYMENT_TARGET", minimum)
+            .env("SDKROOT", macos_sdk)
+            .env("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER", "/usr/bin/clang")
+            .env("CC_aarch64_apple_darwin", "/usr/bin/clang")
+            .env("CXX_aarch64_apple_darwin", "/usr/bin/clang++");
     }
     command
 }
@@ -365,6 +379,7 @@ fn build_netd_command(
     options: &ReleaseStageOptions,
     descriptor: ReleaseTargetDescriptor,
     source: &SourceIdentity,
+    macos_sdk: &Path,
     output: &Path,
 ) -> Command {
     let mut command = Command::new("go");
@@ -375,10 +390,12 @@ fn build_netd_command(
         .env("SOURCE_DATE_EPOCH", source.source_date_epoch.to_string())
         .args(["build", "-mod=readonly", "-trimpath", "-buildvcs=true"]);
     if let Some(minimum) = descriptor.macos_minimum_version {
+        remove_nix_apple_toolchain_environment(&mut command);
         command
             .env("CGO_ENABLED", "1")
-            .env("CC", "clang")
+            .env("CC", "/usr/bin/clang")
             .env("MACOSX_DEPLOYMENT_TARGET", minimum)
+            .env("SDKROOT", macos_sdk)
             .args([
                 "-ldflags",
                 &format!(
@@ -392,6 +409,33 @@ fn build_netd_command(
     }
     command.arg("-o").arg(output).arg("./cmd/netd");
     command
+}
+
+fn system_macos_sdk() -> Result<PathBuf, ReleaseStageError> {
+    let mut command = Command::new("/usr/bin/xcrun");
+    remove_nix_apple_toolchain_environment(&mut command);
+    command.args(["--sdk", "macosx", "--show-sdk-path"]);
+    let path = PathBuf::from(run_capture(command)?);
+    if !path.is_absolute() || path.starts_with("/nix/store") || !path.is_dir() {
+        return Err(ReleaseStageError::InvalidCommandOutput {
+            command: "/usr/bin/xcrun --sdk macosx --show-sdk-path".to_string(),
+            reason: format!("expected an absolute system SDK directory, found {path:?}"),
+        });
+    }
+    Ok(path)
+}
+
+fn remove_nix_apple_toolchain_environment(command: &mut Command) {
+    for variable in [
+        "DEVELOPER_DIR",
+        "NIX_CFLAGS_COMPILE",
+        "NIX_CFLAGS_COMPILE_FOR_BUILD",
+        "NIX_LDFLAGS",
+        "NIX_LDFLAGS_FOR_BUILD",
+        "SDKROOT",
+    ] {
+        command.env_remove(variable);
+    }
 }
 
 fn remap_rustflags(workspace: &Path, extra: Option<&str>) -> String {
@@ -771,6 +815,7 @@ mod tests {
                 &options,
                 target.descriptor(),
                 &source(),
+                Path::new(""),
                 "vmmon",
                 "vmmon",
                 false,
@@ -800,7 +845,13 @@ mod tests {
         let target = ReleaseTarget::LinuxAmd64Gnu;
         let options = options(target, root);
         let output = PathBuf::from("/workspace/target/netd");
-        let command = build_netd_command(&options, target.descriptor(), &source(), &output);
+        let command = build_netd_command(
+            &options,
+            target.descriptor(),
+            &source(),
+            Path::new(""),
+            &output,
+        );
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().to_string())
@@ -826,6 +877,7 @@ mod tests {
             &options,
             target.descriptor(),
             &source(),
+            Path::new("/AppleSDK"),
             Path::new("/workspace/target/netd"),
         );
         let flags = command
@@ -841,6 +893,64 @@ mod tests {
                 .and_then(|(_, value)| value),
             Some(std::ffi::OsStr::new("1"))
         );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "CC")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("/usr/bin/clang"))
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "SDKROOT")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("/AppleSDK"))
+        );
+    }
+
+    #[test]
+    fn macos_rust_builds_use_a_clean_apple_system_toolchain() {
+        let root = Path::new("/workspace");
+        let target = ReleaseTarget::DarwinArm64;
+        let command = build_rust_command(
+            &options(target, root),
+            target.descriptor(),
+            &source(),
+            Path::new("/AppleSDK"),
+            "vmmon",
+            "vmmon",
+            false,
+        );
+        let environment = command
+            .get_envs()
+            .filter_map(|(name, value)| value.map(|value| (name, value)))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new(
+                "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER"
+            )),
+            Some(&std::ffi::OsStr::new("/usr/bin/clang"))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("CC_aarch64_apple_darwin")),
+            Some(&std::ffi::OsStr::new("/usr/bin/clang"))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("SDKROOT")),
+            Some(&std::ffi::OsStr::new("/AppleSDK"))
+        );
+        for variable in [
+            "DEVELOPER_DIR",
+            "NIX_CFLAGS_COMPILE",
+            "NIX_CFLAGS_COMPILE_FOR_BUILD",
+            "NIX_LDFLAGS",
+            "NIX_LDFLAGS_FOR_BUILD",
+        ] {
+            assert!(command
+                .get_envs()
+                .any(|(name, value)| name == variable && value.is_none()));
+        }
     }
 
     #[test]

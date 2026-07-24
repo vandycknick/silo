@@ -67,12 +67,49 @@ fn reject_embedded_paths(
         source,
     })?;
     let workspace = workspace.as_os_str().as_encoded_bytes();
-    for forbidden in [workspace, b"/nix/store/".as_slice()] {
-        if !forbidden.is_empty() && contains_bytes(&bytes, forbidden) {
-            return invalid(component, path, "contains a build-machine path");
-        }
+    if !workspace.is_empty() && contains_bytes(&bytes, workspace) {
+        return invalid(component, path, "contains the build workspace path");
+    }
+    if let Some(forbidden) = non_rust_nix_path(&bytes) {
+        return invalid(
+            component,
+            path,
+            format!(
+                "contains a Nix store path: {:?}",
+                String::from_utf8_lossy(forbidden)
+            ),
+        );
     }
     Ok(())
+}
+
+fn non_rust_nix_path(bytes: &[u8]) -> Option<&[u8]> {
+    const PREFIX: &[u8] = b"/nix/store/";
+    const RUST_SOURCE: &[u8] = b"/lib/rustlib/src/rust/library/";
+    let mut offset = 0;
+    while let Some(relative) = bytes
+        .get(offset..)
+        .and_then(|remaining| find_bytes(remaining, PREFIX))
+    {
+        let start = offset + relative;
+        let remaining = &bytes[start..];
+        let end = remaining
+            .iter()
+            .position(|byte| !byte.is_ascii_graphic())
+            .unwrap_or(remaining.len());
+        let path = &remaining[..end];
+        if !contains_bytes(path, RUST_SOURCE) {
+            return Some(path);
+        }
+        offset = start + PREFIX.len();
+    }
+    None
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn inspect_macho(
@@ -390,8 +427,8 @@ fn invalid<T>(
 #[cfg(test)]
 mod tests {
     use crate::release_inspect::{
-        allowed_linux_dependency, contains_bytes, parse_elf_dependencies, parse_elf_interpreter,
-        parse_glibc_versions, parse_macho_dependencies, parse_macos_minimum,
+        allowed_linux_dependency, contains_bytes, non_rust_nix_path, parse_elf_dependencies,
+        parse_elf_interpreter, parse_glibc_versions, parse_macho_dependencies, parse_macos_minimum,
         parse_non_system_ldd_path, version_greater,
     };
 
@@ -435,5 +472,18 @@ mod tests {
     fn raw_path_scan_finds_exact_byte_sequences() {
         assert!(contains_bytes(b"prefix/nix/store/object", b"/nix/store/"));
         assert!(!contains_bytes(b"prefix/nix/stores/object", b"/nix/store/"));
+    }
+
+    #[test]
+    fn raw_path_scan_allows_only_nix_rust_standard_library_sources() {
+        assert!(non_rust_nix_path(
+            b"/nix/store/hash-rust/lib/rustlib/src/rust/library/core/src/time.rs\0"
+        )
+        .is_none());
+        assert_eq!(
+            non_rust_nix_path(b"/nix/store/hash-libiconv/lib/libiconv.2.dylib\0"),
+            Some(b"/nix/store/hash-libiconv/lib/libiconv.2.dylib".as_slice())
+        );
+        assert!(non_rust_nix_path(b"/nix/store/hash-rust/bin/rustc\0").is_some());
     }
 }
