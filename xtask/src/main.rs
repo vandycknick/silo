@@ -9,9 +9,11 @@ use thiserror::Error;
 
 use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::release_target::{BuildProfile, ReleaseTarget};
+use crate::stage_runtime::{stage_runtime, StageRuntimeOptions};
 
 mod initramfs;
 mod release_target;
+mod stage_runtime;
 
 #[cfg(target_arch = "x86_64")]
 const DEFAULT_GUEST_TARGET: &str = "x86_64-unknown-linux-musl";
@@ -31,6 +33,7 @@ enum Commands {
     GuestAssets(GuestAssetsArgs),
     PackInitramfs(PackInitramfsArgs),
     ReleaseTarget(ReleaseTargetArgs),
+    StageRuntime(StageRuntimeArgs),
     SignVmmon(SignVmmonArgs),
 }
 
@@ -64,6 +67,17 @@ struct ReleaseTargetArgs {
 }
 
 #[derive(Debug, Parser)]
+#[command(about = "Stage the validated canonical Silo runtime payload")]
+struct StageRuntimeArgs {
+    #[arg(long, value_enum)]
+    target: ReleaseTarget,
+    #[arg(long, value_enum, default_value_t = BuildProfile::Release)]
+    profile: BuildProfile,
+    #[arg(long, value_name = "PATH")]
+    kernel: PathBuf,
+}
+
+#[derive(Debug, Parser)]
 #[command(about = "Ad-hoc sign the vmmon binary on macOS")]
 struct SignVmmonArgs {
     #[arg(value_name = "PATH")]
@@ -74,6 +88,8 @@ struct SignVmmonArgs {
 enum XtaskError {
     #[error(transparent)]
     Initramfs(#[from] initramfs::InitramfsError),
+    #[error(transparent)]
+    StageRuntime(#[from] stage_runtime::StageRuntimeError),
     #[error("workspace root has no parent for xtask manifest path {path}")]
     MissingWorkspaceRoot { path: PathBuf },
     #[error("guest binary not found after build: {path}")]
@@ -143,7 +159,19 @@ fn run() -> Result<()> {
         Commands::PackInitramfs(args) => pack_initramfs(args),
         Commands::ReleaseTarget(args) => {
             validate_release_versions()?;
-            print!("{}", release_target_output(args));
+            print!("{}", release_target_output(args, &target_dir()?));
+            Ok(())
+        }
+        Commands::StageRuntime(args) => {
+            validate_release_versions()?;
+            let target_dir = target_dir()?;
+            let stage_dir = stage_runtime(&StageRuntimeOptions {
+                target: args.target,
+                profile: args.profile,
+                kernel: args.kernel,
+                target_dir,
+            })?;
+            println!("{}", stage_dir.display());
             Ok(())
         }
         Commands::SignVmmon(args) => sign_vmmon(args),
@@ -184,7 +212,7 @@ fn validate_package_version(path: &Path, expected: &str) -> Result<()> {
     })
 }
 
-fn release_target_output(args: ReleaseTargetArgs) -> String {
+fn release_target_output(args: ReleaseTargetArgs, target_dir: &Path) -> String {
     let descriptor = args.target.descriptor();
     format!(
         concat!(
@@ -222,8 +250,14 @@ fn release_target_output(args: ReleaseTargetArgs) -> String {
         descriptor.deb_arch,
         descriptor.rpm_arch,
         descriptor.archlinux_arch,
-        descriptor.stage_dir(args.profile).display(),
+        descriptor.stage_dir_in(target_dir, args.profile).display(),
     )
+}
+
+fn target_dir() -> Result<PathBuf> {
+    Ok(env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(workspace_root()?.join("target")))
 }
 
 fn guest_assets(args: GuestAssetsArgs) -> Result<()> {
@@ -411,10 +445,13 @@ mod tests {
 
     #[test]
     fn release_target_output_is_stable() {
-        let output = release_target_output(ReleaseTargetArgs {
-            target: ReleaseTarget::DarwinArm64,
-            profile: BuildProfile::Debug,
-        });
+        let output = release_target_output(
+            ReleaseTargetArgs {
+                target: ReleaseTarget::DarwinArm64,
+                profile: BuildProfile::Debug,
+            },
+            std::path::Path::new("target"),
+        );
 
         assert_eq!(
             output,
@@ -438,6 +475,30 @@ mod tests {
                 "stage_dir=target/silo-runtime/darwin-arm64/debug\n",
             )
         );
+    }
+
+    #[test]
+    fn stage_runtime_command_requires_kernel_and_defaults_to_release() {
+        assert!(
+            Args::try_parse_from(["xtask", "stage-runtime", "--target", "linux-amd64-gnu"])
+                .is_err()
+        );
+
+        let args = Args::try_parse_from([
+            "xtask",
+            "stage-runtime",
+            "--target",
+            "linux-amd64-gnu",
+            "--kernel",
+            "/tmp/vmlinux",
+        ])
+        .expect("parse stage-runtime command");
+        let Commands::StageRuntime(args) = args.command else {
+            panic!("expected stage-runtime command");
+        };
+        assert_eq!(args.target, ReleaseTarget::LinuxAmd64Gnu);
+        assert_eq!(args.profile, BuildProfile::Release);
+        assert_eq!(args.kernel, std::path::PathBuf::from("/tmp/vmlinux"));
     }
 
     #[test]

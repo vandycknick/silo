@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 
@@ -108,8 +108,13 @@ impl ReleaseTarget {
 }
 
 impl ReleaseTargetDescriptor {
+    #[cfg(test)]
     pub(crate) fn stage_dir(self, profile: BuildProfile) -> PathBuf {
-        PathBuf::from("target")
+        self.stage_dir_in(Path::new("target"), profile)
+    }
+
+    pub(crate) fn stage_dir_in(self, target_dir: &Path, profile: BuildProfile) -> PathBuf {
+        target_dir
             .join("silo-runtime")
             .join(self.name)
             .join(profile.as_str())
