@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use thiserror::Error;
 
 use crate::archive::{package_archives, PackageArchivesOptions};
+use crate::homebrew::{package_homebrew_cask, PackageHomebrewOptions};
 use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::kernel_oci::{resolve_kernel, ResolveKernelOptions};
 use crate::macos_package::{package_macos, PackageMacosOptions};
@@ -16,6 +17,7 @@ use crate::release_target::{BuildProfile, ReleaseTarget};
 use crate::stage_runtime::{stage_runtime, StageRuntimeOptions};
 
 mod archive;
+mod homebrew;
 mod initramfs;
 mod kernel_oci;
 mod macos_package;
@@ -41,6 +43,8 @@ struct Args {
 enum Commands {
     GuestAssets(GuestAssetsArgs),
     PackageArchives(PackageArchivesArgs),
+    /// Generate the official Cask from a notarized macOS package.
+    PackageHomebrewCask,
     PackageMacos(PackageMacosArgs),
     PackInitramfs(PackInitramfsArgs),
     ReleaseTarget(ReleaseTargetArgs),
@@ -144,6 +148,8 @@ enum XtaskError {
     #[error(transparent)]
     Archive(#[from] archive::ArchiveError),
     #[error(transparent)]
+    Homebrew(#[from] homebrew::HomebrewError),
+    #[error(transparent)]
     MacosPackage(#[from] macos_package::MacosPackageError),
     #[error(transparent)]
     Initramfs(#[from] initramfs::InitramfsError),
@@ -229,6 +235,14 @@ fn run() -> Result<()> {
             println!("runtime_archive={}", result.runtime.display());
             println!("cli_archive={}", result.cli.display());
             println!("metadata={}", result.metadata.display());
+            Ok(())
+        }
+        Commands::PackageHomebrewCask => {
+            validate_release_versions()?;
+            let result = package_homebrew_cask(&PackageHomebrewOptions {
+                target_dir: target_dir()?,
+            })?;
+            println!("cask={}", result.cask.display());
             Ok(())
         }
         Commands::PackageMacos(args) => {
@@ -710,6 +724,13 @@ mod tests {
             Some("Developer ID Application: Silo")
         );
         assert_eq!(args.notary_keychain_profile.as_deref(), Some("release"));
+    }
+
+    #[test]
+    fn package_homebrew_cask_has_no_untrusted_inputs() {
+        let args = Args::try_parse_from(["xtask", "package-homebrew-cask"])
+            .expect("parse package-homebrew-cask command");
+        assert!(matches!(args.command, Commands::PackageHomebrewCask));
     }
 
     #[test]
