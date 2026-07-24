@@ -437,7 +437,7 @@ fn build_guest_assets(
     let agent = guest_dir.join("silo-agent");
     require_file(&init)?;
     require_file(&agent)?;
-    strip_guest_components(descriptor, [&init, &agent])?;
+    strip_guest_components([&init, &agent])?;
     copy_file(&agent, &assets.join("agent"), RELEASE_MODE)?;
     crate::initramfs::write_initramfs(&crate::initramfs::InitramfsOptions::new(
         &init,
@@ -450,20 +450,17 @@ fn build_guest_assets(
     Ok(GuestArtifacts { init, agent })
 }
 
-fn strip_guest_components(
-    descriptor: ReleaseTargetDescriptor,
-    binaries: [&Path; 2],
-) -> Result<(), ReleaseStageError> {
+fn strip_guest_components(binaries: [&Path; 2]) -> Result<(), ReleaseStageError> {
     for binary in binaries {
-        let mut command = if descriptor.macos_minimum_version.is_some() {
-            Command::new("llvm-strip")
-        } else {
-            Command::new("strip")
-        };
-        command.arg("--strip-unneeded").arg(binary);
-        run(command)?;
+        run(guest_strip_command(binary))?;
     }
     Ok(())
+}
+
+fn guest_strip_command(binary: &Path) -> Command {
+    let mut command = Command::new("strip");
+    command.arg("--strip-unneeded").arg(binary);
+    command
 }
 
 fn strip_host_components(
@@ -739,8 +736,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::release_stage::{
-        build_netd_command, build_rust_command, publish_release_transaction, sha256,
-        write_release_metadata, SourceIdentity,
+        build_netd_command, build_rust_command, guest_strip_command, publish_release_transaction,
+        sha256, write_release_metadata, SourceIdentity,
     };
     use crate::release_target::ReleaseTarget;
 
@@ -843,6 +840,16 @@ mod tests {
                 .find(|(key, _)| *key == "CGO_ENABLED")
                 .and_then(|(_, value)| value),
             Some(std::ffi::OsStr::new("1"))
+        );
+    }
+
+    #[test]
+    fn guest_stripping_uses_the_nix_llvm_wrapper() {
+        let command = guest_strip_command(Path::new("target/guest"));
+        assert_eq!(command.get_program(), "strip");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--strip-unneeded", "target/guest"]
         );
     }
 
