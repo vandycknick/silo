@@ -8,10 +8,12 @@ use clap::{Parser, Subcommand};
 use thiserror::Error;
 
 use crate::initramfs::{write_initramfs, InitramfsOptions};
+use crate::kernel_oci::{resolve_kernel, ResolveKernelOptions};
 use crate::release_target::{BuildProfile, ReleaseTarget};
 use crate::stage_runtime::{stage_runtime, StageRuntimeOptions};
 
 mod initramfs;
+mod kernel_oci;
 mod release_target;
 mod stage_runtime;
 
@@ -33,6 +35,7 @@ enum Commands {
     GuestAssets(GuestAssetsArgs),
     PackInitramfs(PackInitramfsArgs),
     ReleaseTarget(ReleaseTargetArgs),
+    ResolveKernel(ResolveKernelArgs),
     StageRuntime(StageRuntimeArgs),
     SignVmmon(SignVmmonArgs),
 }
@@ -78,6 +81,19 @@ struct StageRuntimeArgs {
 }
 
 #[derive(Debug, Parser)]
+#[command(about = "Resolve and verify a Silo kernel OCI artifact")]
+struct ResolveKernelArgs {
+    #[arg(long, value_enum)]
+    target: ReleaseTarget,
+    #[arg(long, value_name = "REFERENCE")]
+    reference: String,
+    #[arg(long, value_name = "PATH")]
+    oci_layout: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
 #[command(about = "Ad-hoc sign the vmmon binary on macOS")]
 struct SignVmmonArgs {
     #[arg(value_name = "PATH")]
@@ -90,6 +106,8 @@ enum XtaskError {
     Initramfs(#[from] initramfs::InitramfsError),
     #[error(transparent)]
     StageRuntime(#[from] stage_runtime::StageRuntimeError),
+    #[error(transparent)]
+    ResolveKernel(#[from] kernel_oci::ResolveKernelError),
     #[error("workspace root has no parent for xtask manifest path {path}")]
     MissingWorkspaceRoot { path: PathBuf },
     #[error("guest binary not found after build: {path}")]
@@ -160,6 +178,24 @@ fn run() -> Result<()> {
         Commands::ReleaseTarget(args) => {
             validate_release_versions()?;
             print!("{}", release_target_output(args, &target_dir()?));
+            Ok(())
+        }
+        Commands::ResolveKernel(args) => {
+            validate_release_versions()?;
+            let target_dir = target_dir()?;
+            let output_dir = args.output_dir.unwrap_or_else(|| {
+                target_dir
+                    .join("release-inputs")
+                    .join(args.target.descriptor().name)
+            });
+            let resolved = resolve_kernel(&ResolveKernelOptions {
+                target: args.target,
+                reference: args.reference,
+                oci_layout: args.oci_layout,
+                output_dir,
+            })?;
+            println!("kernel={}", resolved.kernel.display());
+            println!("provenance={}", resolved.provenance.display());
             Ok(())
         }
         Commands::StageRuntime(args) => {
@@ -499,6 +535,33 @@ mod tests {
         assert_eq!(args.target, ReleaseTarget::LinuxAmd64Gnu);
         assert_eq!(args.profile, BuildProfile::Release);
         assert_eq!(args.kernel, std::path::PathBuf::from("/tmp/vmlinux"));
+    }
+
+    #[test]
+    fn resolve_kernel_command_requires_an_explicit_reference() {
+        assert!(
+            Args::try_parse_from(["xtask", "resolve-kernel", "--target", "darwin-arm64"]).is_err()
+        );
+        let args = Args::try_parse_from([
+            "xtask",
+            "resolve-kernel",
+            "--target",
+            "darwin-arm64",
+            "--reference",
+            "ghcr.io/example/silo/kernel:stable",
+            "--output-dir",
+            "/tmp/kernel",
+        ])
+        .expect("parse resolve-kernel command");
+        let Commands::ResolveKernel(args) = args.command else {
+            panic!("expected resolve-kernel command");
+        };
+        assert_eq!(args.target, ReleaseTarget::DarwinArm64);
+        assert_eq!(args.reference, "ghcr.io/example/silo/kernel:stable");
+        assert_eq!(
+            args.output_dir,
+            Some(std::path::PathBuf::from("/tmp/kernel"))
+        );
     }
 
     #[test]

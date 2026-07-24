@@ -50,6 +50,12 @@ pub(crate) fn stage_runtime(options: &StageRuntimeOptions) -> Result<PathBuf, St
     stage_runtime_for_host(options, host_release_target())
 }
 
+pub(crate) fn validate_kernel(path: &Path, target: ReleaseTarget) -> Result<(), StageRuntimeError> {
+    let source = ComponentSource::readable("kernel", path.to_path_buf(), "assets/kernel-default");
+    require_regular_file(&source)?;
+    validate_component(&source, target.descriptor())
+}
+
 fn stage_runtime_for_host(
     options: &StageRuntimeOptions,
     host_target: ReleaseTarget,
