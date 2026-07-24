@@ -37,6 +37,19 @@
               "rust-analyzer"
             ];
           };
+          portableGo = pkgs.go.overrideAttrs (previous: {
+            patches = builtins.filter (
+              patch:
+              let
+                name = builtins.baseNameOf (toString patch);
+              in
+              !builtins.any (runtimePatch: pkgs.lib.hasInfix runtimePatch name) [
+                "iana-etc"
+                "mailcap"
+                "tzdata"
+              ]
+            ) previous.patches;
+          });
           llvm = pkgs.llvmPackages;
           kernelPackages = [
             pkgs.bash
@@ -75,7 +88,7 @@
           default = pkgs.mkShell {
             packages = [
               rustToolchain
-              pkgs.go
+              portableGo
               pkgs.grpcurl
               pkgs.zig
               pkgs.cargo-zigbuild
