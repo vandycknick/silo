@@ -97,7 +97,9 @@ pub enum LibVmError {
     #[error("boot asset {asset} path is not a file: {path}")]
     BootAssetInvalid { asset: &'static str, path: PathBuf },
 
-    #[error("invalid {component} from {origin} at {path}: {reason}")]
+    #[error(
+        "invalid {component} from {origin} at {path}: {reason}; explicit component paths must be absolute regular files, portable roots must contain bin/{{vmmon,netd,krun}} and assets/{{kernel-default,initramfs,agent}}, and native installations must use the documented platform layout"
+    )]
     RuntimeComponentInvalid {
         component: &'static str,
         origin: String,

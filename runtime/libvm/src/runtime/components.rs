@@ -1209,13 +1209,16 @@ mod tests {
             .expect_err("relative environment path must fail");
 
         assert!(matches!(
-            error,
+            &error,
             LibVmError::RuntimeComponentInvalid {
                 component: "vmmon",
-                ref reason,
+                reason,
                 ..
             } if reason == "path must be absolute"
         ));
+        let message = error.to_string();
+        assert!(message.contains("portable roots must contain bin/{vmmon,netd,krun}"));
+        assert!(message.contains("explicit component paths must be absolute regular files"));
     }
 
     #[test]
