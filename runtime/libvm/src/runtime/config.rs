@@ -214,7 +214,15 @@ impl RuntimeConfig {
                 PathChoice::Explicit(path) => path.clone(),
             },
         };
-        let legacy_run_root = PathBuf::from(&stored.legacy_run_root);
+        let legacy_run_root = stored
+            .legacy_run_root
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or_else(|| LibVmError::StateDatabaseConfigMismatch {
+                field: "legacy_run_root",
+                expected: "absolute path while state migration is incomplete".to_string(),
+                actual: "uninitialized".to_string(),
+            })?;
         validate_absolute_path("data_root", &data_root)?;
         validate_absolute_path("image_root", &image_root)?;
         validate_absolute_path("state_root", &state_root)?;
@@ -527,6 +535,26 @@ mod tests {
         assert_eq!(roots.data_root(), expected_roots.data_root());
         assert_eq!(roots.image_root(), expected_roots.image_root());
         assert_eq!(roots.state_root(), expected_roots.state_root());
+    }
+
+    #[test]
+    fn incomplete_migration_requires_a_legacy_run_root() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_root = temp.path().join("silo");
+        let (mut stored, _) = stored_config(&data_root);
+        stored.state_migration_complete = false;
+
+        let error = RuntimeConfig::local(&data_root)
+            .resolve_legacy_migration_roots(&stored, &data_root.join("state.db"))
+            .expect_err("incomplete migration must retain its legacy run root");
+
+        assert!(matches!(
+            error,
+            LibVmError::StateDatabaseConfigMismatch {
+                field: "legacy_run_root",
+                ..
+            }
+        ));
     }
 
     #[test]

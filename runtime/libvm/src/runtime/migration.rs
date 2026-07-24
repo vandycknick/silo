@@ -520,6 +520,14 @@ mod tests {
     use crate::LibVmError;
     use crate::RuntimeConfig;
 
+    fn legacy_config(roots: &LocalRoots) -> DbConfig {
+        let mut legacy = DbConfig::from_roots(roots);
+        legacy.legacy_run_root = Some(roots.run_root().display().to_string());
+        legacy.state_root = None;
+        legacy.state_migration_complete = false;
+        legacy
+    }
+
     #[test]
     fn durable_move_is_retry_safe() {
         let temp = tempfile::tempdir().expect("create temp dir");
@@ -612,9 +620,7 @@ mod tests {
         let store = Store::open(&data_root.join("state.db"))
             .await
             .expect("open store");
-        let mut legacy = DbConfig::from_roots(&roots);
-        legacy.state_root = None;
-        legacy.state_migration_complete = false;
+        let legacy = legacy_config(&roots);
         let legacy = store
             .read_or_seed_db_config(&legacy)
             .await
@@ -642,6 +648,10 @@ mod tests {
 
         assert_eq!(migrated.state_root, Some(state_root.display().to_string()));
         assert_eq!(
+            migrated.legacy_run_root,
+            Some(run_root.display().to_string())
+        );
+        assert_eq!(
             std::fs::read(state_root.join("logs/machines/orphan/vm.trace.log"))
                 .expect("read migrated trace"),
             b"trace"
@@ -667,9 +677,7 @@ mod tests {
         let store = Store::open(&data_root.join("state.db"))
             .await
             .expect("open store");
-        let mut legacy = DbConfig::from_roots(&roots);
-        legacy.state_root = None;
-        legacy.state_migration_complete = false;
+        let legacy = legacy_config(&roots);
         let legacy = store
             .read_or_seed_db_config(&legacy)
             .await
@@ -712,9 +720,7 @@ mod tests {
         let store = Store::open(&data_root.join("state.db"))
             .await
             .expect("open store");
-        let mut legacy = DbConfig::from_roots(&roots);
-        legacy.state_root = None;
-        legacy.state_migration_complete = false;
+        let legacy = legacy_config(&roots);
         let legacy = store
             .read_or_seed_db_config(&legacy)
             .await
@@ -754,9 +760,7 @@ mod tests {
         let store_a = Store::open(&data_root.join("state.db"))
             .await
             .expect("open first store");
-        let mut legacy = DbConfig::from_roots(&roots);
-        legacy.state_root = None;
-        legacy.state_migration_complete = false;
+        let legacy = legacy_config(&roots);
         let legacy = store_a
             .read_or_seed_db_config(&legacy)
             .await
@@ -789,6 +793,7 @@ mod tests {
             .expect("read config")
             .expect("stored config");
         assert!(stored.state_migration_complete);
+        assert_eq!(stored.legacy_run_root, Some(run_root.display().to_string()));
         let claimed = std::path::PathBuf::from(stored.state_root.expect("state root"));
         let unclaimed = if claimed == state_a { state_b } else { state_a };
         assert_eq!(
