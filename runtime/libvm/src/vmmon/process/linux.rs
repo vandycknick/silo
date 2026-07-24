@@ -7,12 +7,15 @@ use rustix::process::{pidfd_open, PidfdFlags};
 
 use crate::vmmon::process::{errno_to_io, pid_exists, rustix_pid};
 
+const LEGACY_START_TIME_TOLERANCE_SECONDS: u64 = 2;
+
 #[derive(Debug)]
 pub(crate) struct ProcessIdentity {
     pid: i32,
     pidfd: Option<OwnedFd>,
     uid: u32,
     start_time: u64,
+    started_at: i64,
 }
 
 impl ProcessIdentity {
@@ -35,6 +38,7 @@ impl ProcessIdentity {
                             pidfd: Some(pidfd),
                             uid: after.uid,
                             start_time: after.start_time,
+                            started_at: after.started_at,
                         }));
                     }
                 }
@@ -49,6 +53,7 @@ impl ProcessIdentity {
                             pidfd: None,
                             uid: after.uid,
                             start_time: after.start_time,
+                            started_at: after.started_at,
                         }));
                     }
                 }
@@ -63,11 +68,19 @@ impl ProcessIdentity {
     }
 
     pub(crate) fn started_at(&self) -> Option<i64> {
-        None
+        Some(self.started_at)
     }
 
-    pub(crate) fn matches_started_at(&self, _expected: Option<i64>) -> bool {
-        true
+    pub(crate) fn matches_started_at(&self, expected: Option<i64>) -> bool {
+        expected.is_none_or(|expected| self.started_at == expected)
+    }
+
+    pub(crate) fn matches_legacy_started_at(&self, expected: Option<i64>) -> bool {
+        // Older releases persisted the pidfile mtime, which can trail the
+        // kernel process birth time by a second or two.
+        expected.is_none_or(|expected| {
+            self.started_at.abs_diff(expected) <= LEGACY_START_TIME_TOLERANCE_SECONDS
+        })
     }
 
     pub(crate) fn is_alive(&self) -> io::Result<bool> {
@@ -88,6 +101,7 @@ impl ProcessIdentity {
 struct ProcIdentity {
     uid: u32,
     start_time: u64,
+    started_at: i64,
 }
 
 fn proc_identity(pid: i32) -> io::Result<Option<ProcIdentity>> {
@@ -111,10 +125,38 @@ fn proc_identity(pid: i32) -> io::Result<Option<ProcIdentity>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process start time"))?
         .parse::<u64>()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let started_at = process_start_epoch_seconds(start_time)?;
     Ok(Some(ProcIdentity {
         uid: metadata.uid(),
         start_time,
+        started_at,
     }))
+}
+
+fn process_start_epoch_seconds(start_time: u64) -> io::Result<i64> {
+    let ticks_per_second = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
+        .map_err(|err| io::Error::from_raw_os_error(err as i32))?
+        .ok_or_else(|| io::Error::other("kernel did not report clock ticks per second"))?;
+    let ticks_per_second = u64::try_from(ticks_per_second)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    if ticks_per_second == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kernel reported zero clock ticks per second",
+        ));
+    }
+
+    let stat = std::fs::read_to_string("/proc/stat")?;
+    let boot_time = stat
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing /proc/stat btime"))?
+        .parse::<u64>()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let started_at = boot_time
+        .checked_add(start_time / ticks_per_second)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process start time overflow"))?;
+    i64::try_from(started_at).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
 fn pidfd_has_exited(pidfd: &OwnedFd) -> io::Result<bool> {

@@ -37,6 +37,10 @@ impl ProcessIdentity {
         expected.is_none() || self.started_at == expected
     }
 
+    pub(crate) fn matches_legacy_started_at(&self, expected: Option<i64>) -> bool {
+        self.matches_started_at(expected)
+    }
+
     pub(crate) fn is_alive(&self) -> io::Result<bool> {
         let Some(current) = Self::for_pid(self.pid)? else {
             return Ok(false);

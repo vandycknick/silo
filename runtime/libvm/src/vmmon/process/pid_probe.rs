@@ -28,6 +28,10 @@ impl ProcessIdentity {
         true
     }
 
+    pub(crate) fn matches_legacy_started_at(&self, _expected: Option<i64>) -> bool {
+        true
+    }
+
     pub(crate) fn is_alive(&self) -> io::Result<bool> {
         pid_exists(self.pid)
     }

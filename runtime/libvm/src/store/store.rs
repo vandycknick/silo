@@ -116,6 +116,7 @@ mod tests {
             status,
             vmmon_pid: None,
             started_at: None,
+            started_at_is_process_birth: false,
             run_id: None,
             last_error: None,
             updated_at: 1,

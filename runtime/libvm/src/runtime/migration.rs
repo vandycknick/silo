@@ -23,7 +23,7 @@ pub(crate) async fn migrate_runtime_roots(
     state_db_path: &Path,
 ) -> Result<DbConfig, LibVmError> {
     if stored.state_migration_complete {
-        return Ok(stored);
+        return cleanup_completed_legacy_layout(config, store, stored, state_db_path).await;
     }
 
     let (_, proposed_state_root, _) =
@@ -38,7 +38,10 @@ pub(crate) async fn migrate_runtime_roots(
     let (data_root, state_root, legacy_run_root) =
         config.resolve_legacy_migration_roots(&stored, state_db_path)?;
     fs::create_dir_all(&state_root)?;
-    let _migration_lock = migration_lock(&state_root)?;
+    let _migration_lock =
+        try_migration_lock(&state_root)?.ok_or_else(|| LibVmError::RuntimePathMigrationActive {
+            component: "runtime path migration".to_string(),
+        })?;
     let stored = store
         .db_config()
         .await?
@@ -113,24 +116,71 @@ pub(crate) async fn migrate_runtime_roots(
     store.complete_state_root_migration().await
 }
 
+async fn cleanup_completed_legacy_layout(
+    config: &RuntimeConfig,
+    store: &Store,
+    stored: DbConfig,
+    state_db_path: &Path,
+) -> Result<DbConfig, LibVmError> {
+    if stored.legacy_run_root.is_none() {
+        return Ok(stored);
+    }
+
+    let (data_root, state_root, legacy_run_root) =
+        config.resolve_legacy_migration_roots(&stored, state_db_path)?;
+    fs::create_dir_all(&state_root)?;
+    let _migration_lock =
+        try_migration_lock(&state_root)?.ok_or_else(|| LibVmError::RuntimePathMigrationActive {
+            component: "runtime path migration".to_string(),
+        })?;
+    let machines = store.list_machine_configs().await?;
+    let _machine_locks = try_lock_legacy_machines(&legacy_run_root, &machines)?;
+    if let Some(machine_dir) = first_active_legacy_machine_dir(&data_root)? {
+        return Err(LibVmError::RuntimePathMigrationActive {
+            component: format!("machine directory {}", machine_dir.display()),
+        });
+    }
+    if let Some(network_dir) = first_active_legacy_network_dir(&legacy_run_root)? {
+        return Err(LibVmError::RuntimePathMigrationActive {
+            component: format!("network directory {}", network_dir.display()),
+        });
+    }
+
+    for network in store.list_network_instances().await? {
+        if !network_runtime_is_below(&network, &legacy_run_root) {
+            continue;
+        }
+        let runtime_dir = validated_network_runtime_dir(&network, &legacy_run_root)?;
+        if network_process_is_active(&network)?
+            || pid_file_is_active(&runtime_dir.join("netd.pid"))?
+        {
+            return Err(LibVmError::RuntimePathMigrationActive {
+                component: format!("network {:?}", network.id),
+            });
+        }
+    }
+
+    migrate_machine_files(&data_root, &state_root)?;
+    migrate_network_files(&legacy_run_root, &state_root, &[])?;
+    Ok(stored)
+}
+
 struct MigrationLock {
     _file: Flock<File>,
 }
 
-fn migration_lock(state_root: &Path) -> Result<MigrationLock, LibVmError> {
+fn try_migration_lock(state_root: &Path) -> Result<Option<MigrationLock>, LibVmError> {
     let path = state_root.join(".runtime-path-migration.lock");
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)?;
-    loop {
-        match Flock::lock(file, FlockArg::LockExclusive) {
-            Ok(file) => return Ok(MigrationLock { _file: file }),
-            Err((returned, Errno::EINTR)) => file = returned,
-            Err((_, err)) => return Err(io::Error::from_raw_os_error(err as i32).into()),
-        }
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(file) => Ok(Some(MigrationLock { _file: file })),
+        Err((_, Errno::EWOULDBLOCK)) => Ok(None),
+        Err((_, err)) => Err(io::Error::from_raw_os_error(err as i32).into()),
     }
 }
 
@@ -148,6 +198,28 @@ fn lock_legacy_machines(
         .into_iter()
         .map(|lock_id| manager.retrieve(lock_id).lock().map_err(Into::into))
         .collect()
+}
+
+fn try_lock_legacy_machines(
+    legacy_run_root: &Path,
+    machines: &[crate::store::models::MachineConfig],
+) -> Result<Vec<LockGuard>, LibVmError> {
+    let manager = LockManager::open(legacy_run_root.join("locks"))?;
+    let mut lock_ids = machines
+        .iter()
+        .map(|machine| machine.lock_id)
+        .collect::<Vec<_>>();
+    lock_ids.sort_unstable();
+    let mut guards = Vec::with_capacity(lock_ids.len());
+    for lock_id in lock_ids {
+        let Some(guard) = manager.retrieve(lock_id).try_lock()? else {
+            return Err(LibVmError::RuntimePathMigrationActive {
+                component: format!("machine lock {lock_id}"),
+            });
+        };
+        guards.push(guard);
+    }
+    Ok(guards)
 }
 
 fn first_active_legacy_machine_dir(
@@ -195,7 +267,7 @@ fn process_is_active(pid: Option<i32>, started_at: Option<i64>) -> Result<bool, 
         return Ok(false);
     };
     Ok(identity.owned_by_effective_user()
-        && identity.matches_started_at(started_at)
+        && identity.matches_legacy_started_at(started_at)
         && identity.is_alive()?)
 }
 
@@ -276,6 +348,19 @@ fn validated_network_runtime_dir(
         }
     }
     Ok(path)
+}
+
+fn network_runtime_is_below(network: &NetworkInstance, legacy_run_root: &Path) -> bool {
+    let path = Path::new(&network.runtime_dir);
+    if !path.is_absolute() {
+        return false;
+    }
+    let path = crate::runtime::normalize_absolute_path(path);
+    let legacy_run_root = crate::runtime::normalize_absolute_path(legacy_run_root);
+    ["net", "networks"]
+        .iter()
+        .map(|name| legacy_run_root.join(name))
+        .any(|root| path.starts_with(root))
 }
 
 fn migrate_machine_files(data_root: &Path, state_root: &Path) -> Result<(), LibVmError> {
@@ -663,6 +748,30 @@ mod tests {
         );
         assert!(network_dir.join("capture.pcap").exists());
         assert!(!machine_dir.join("vm.pid").exists());
+
+        let late_machine_dir = data_root.join("machines/late");
+        std::fs::create_dir_all(&late_machine_dir).expect("create late machine directory");
+        std::fs::write(late_machine_dir.join("serial.log"), b"late serial")
+            .expect("write late machine log");
+        let late_network_dir = run_root.join("net/late-network");
+        std::fs::create_dir_all(&late_network_dir).expect("create late network directory");
+        std::fs::write(late_network_dir.join("netd.log"), b"late netd")
+            .expect("write late network log");
+        let reopened =
+            migrate_runtime_roots(&config, &store, migrated, &data_root.join("state.db"))
+                .await
+                .expect("clean residual legacy files");
+        assert!(reopened.state_migration_complete);
+        assert_eq!(
+            std::fs::read(state_root.join("logs/machines/late/serial.log"))
+                .expect("read late machine log"),
+            b"late serial"
+        );
+        assert_eq!(
+            std::fs::read(state_root.join("logs/networks/late-network/netd.log"))
+                .expect("read late network log"),
+            b"late netd"
+        );
     }
 
     #[tokio::test]

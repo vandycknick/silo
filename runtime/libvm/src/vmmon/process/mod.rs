@@ -99,6 +99,18 @@ mod tests {
         assert_eq!(identity.pid(), pid);
         assert!(identity.owned_by_effective_user());
         assert!(identity_is_alive(&identity).expect("check current process identity"));
+        let started_at = identity
+            .started_at()
+            .expect("supported hosts expose process birth time");
+        assert!(identity.matches_started_at(Some(started_at)));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(!identity.matches_started_at(Some(started_at.saturating_add(1))));
+            assert!(identity.matches_legacy_started_at(Some(started_at.saturating_add(1))));
+            assert!(!identity.matches_legacy_started_at(Some(started_at.saturating_add(3))));
+        }
+        #[cfg(target_os = "macos")]
+        assert!(!identity.matches_started_at(Some(started_at.saturating_add(1))));
     }
 
     #[test]
