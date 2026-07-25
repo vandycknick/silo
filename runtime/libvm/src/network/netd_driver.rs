@@ -96,11 +96,15 @@ async fn prepare_netd_runtime(
     let network_id = MachineId::new().to_string();
     let network_paths = paths.network(&network_id);
     let runtime_dir = network_paths.dir().to_path_buf();
+    let socket_path = network_paths.socket_path();
+    utils::validate_unix_socket_path(&socket_path).map_err(|err| LibVmError::NetworkRuntime {
+        reference: metadata.name.clone(),
+        message: err.to_string(),
+    })?;
     fs::create_dir_all(&runtime_dir)?;
     ensure_instance_network_link(paths, metadata.id, &runtime_dir)?;
     let mut startup = NetdStartupGuard::new(paths, metadata.id, runtime_dir.clone());
 
-    let socket_path = network_paths.socket_path();
     let log_path = network_paths.log_path();
     let pid_path = network_paths.pid_path();
     let pcap_path = config.pcap.then(|| network_paths.pcap_path());

@@ -195,42 +195,6 @@ impl RuntimeConfig {
         Ok(roots)
     }
 
-    pub(crate) fn resolve_legacy_migration_roots(
-        &self,
-        stored: &DbConfig,
-        opened_db_path: &Path,
-    ) -> Result<(PathBuf, PathBuf, PathBuf), LibVmError> {
-        validate_db_config_header(stored)?;
-        let data_root = merge_root("data_root", &self.data_root, Path::new(&stored.data_root))?;
-        let image_root = merge_root(
-            "image_root",
-            &self.image_root,
-            Path::new(&stored.image_root),
-        )?;
-        let state_root = match stored.state_root.as_deref() {
-            Some(stored) => merge_root("state_root", &self.state_root, Path::new(stored))?,
-            None => match &self.state_root {
-                PathChoice::Default => resolve_default_state_dir()?,
-                PathChoice::Explicit(path) => path.clone(),
-            },
-        };
-        let legacy_run_root = stored
-            .legacy_run_root
-            .as_deref()
-            .map(PathBuf::from)
-            .ok_or_else(|| LibVmError::StateDatabaseConfigMismatch {
-                field: "legacy_run_root",
-                expected: "absolute path while state migration is incomplete".to_string(),
-                actual: "uninitialized".to_string(),
-            })?;
-        validate_absolute_path("data_root", &data_root)?;
-        validate_absolute_path("image_root", &image_root)?;
-        validate_absolute_path("state_root", &state_root)?;
-        validate_absolute_path("legacy_run_root", &legacy_run_root)?;
-        compare_path("state_db_path", &data_root.join("state.db"), opened_db_path)?;
-        Ok((data_root, state_root, legacy_run_root))
-    }
-
     pub(crate) fn bootstrap_data_root(&self) -> Result<PathBuf, LibVmError> {
         match &self.data_root {
             PathChoice::Default => resolve_default_data_dir(),
@@ -263,19 +227,10 @@ fn merge_roots(
         &runtime_config.image_root,
         Path::new(&stored.image_root),
     )?;
-    let stored_state_root =
-        stored
-            .state_root
-            .as_deref()
-            .ok_or(LibVmError::StateDatabaseConfigMismatch {
-                field: "state_root",
-                expected: "initialized absolute path".to_string(),
-                actual: "uninitialized".to_string(),
-            })?;
     let state_root = merge_root(
         "state_root",
         &runtime_config.state_root,
-        Path::new(stored_state_root),
+        Path::new(&stored.state_root),
     )?;
 
     Ok(LocalRoots::with_roots(
@@ -304,16 +259,11 @@ fn validate_roots_match_config(roots: &LocalRoots, config: &DbConfig) -> Result<
         roots.image_root(),
         Path::new(&config.image_root),
     )?;
-    let state_root =
-        config
-            .state_root
-            .as_deref()
-            .ok_or(LibVmError::StateDatabaseConfigMismatch {
-                field: "state_root",
-                expected: "initialized absolute path".to_string(),
-                actual: "uninitialized".to_string(),
-            })?;
-    compare_path("state_root", roots.state_root(), Path::new(state_root))
+    compare_path(
+        "state_root",
+        roots.state_root(),
+        Path::new(&config.state_root),
+    )
 }
 
 fn validate_roots_absolute(roots: &LocalRoots) -> Result<(), LibVmError> {
@@ -535,26 +485,6 @@ mod tests {
         assert_eq!(roots.data_root(), expected_roots.data_root());
         assert_eq!(roots.image_root(), expected_roots.image_root());
         assert_eq!(roots.state_root(), expected_roots.state_root());
-    }
-
-    #[test]
-    fn incomplete_migration_requires_a_legacy_run_root() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let data_root = temp.path().join("silo");
-        let (mut stored, _) = stored_config(&data_root);
-        stored.state_migration_complete = false;
-
-        let error = RuntimeConfig::local(&data_root)
-            .resolve_legacy_migration_roots(&stored, &data_root.join("state.db"))
-            .expect_err("incomplete migration must retain its legacy run root");
-
-        assert!(matches!(
-            error,
-            LibVmError::StateDatabaseConfigMismatch {
-                field: "legacy_run_root",
-                ..
-            }
-        ));
     }
 
     #[test]

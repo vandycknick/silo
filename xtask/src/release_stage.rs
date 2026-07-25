@@ -9,12 +9,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::kernel_oci::{
-    exchange_directories, install_directory_noreplace, resolve_kernel, ResolveKernelError,
-    ResolveKernelOptions,
-};
+use crate::guest_build::{build_guest, GuestBuildError, GuestBuildOptions};
+use crate::kernel_oci::{resolve_kernel, ResolveKernelError, ResolveKernelOptions};
 use crate::release_inspect::{inspect_release, GuestExecutables, ReleaseInspectionError};
 use crate::release_target::{BuildProfile, ReleaseTarget, ReleaseTargetDescriptor};
+use crate::remove_path::remove_if_exists;
 use crate::stage_runtime::{stage_runtime, StageRuntimeError, StageRuntimeOptions};
 
 const RELEASE_MODE: u32 = 0o755;
@@ -42,10 +41,6 @@ pub(crate) enum ReleaseStageError {
         requested: &'static str,
         host: &'static str,
     },
-    #[error("release output already exists; use a clean target directory: {path}")]
-    OutputExists { path: PathBuf },
-    #[error("release staging requires a clean git worktree; found {status}")]
-    DirtyWorktree { status: String },
     #[error("release build output is missing: {path}")]
     MissingBuildOutput { path: PathBuf },
     #[error("failed to run {command}")]
@@ -64,6 +59,8 @@ pub(crate) enum ReleaseStageError {
     Metadata(#[from] serde_json::Error),
     #[error(transparent)]
     ResolveKernel(#[from] ResolveKernelError),
+    #[error(transparent)]
+    GuestBuild(#[from] GuestBuildError),
     #[error(transparent)]
     StageRuntime(#[from] StageRuntimeError),
     #[error(transparent)]
@@ -117,18 +114,25 @@ pub(crate) fn release_stage(
         .join("silo-release")
         .join(descriptor.name)
         .join("release");
-    if fs::symlink_metadata(&release_dir).is_ok() {
-        return Err(ReleaseStageError::OutputExists { path: release_dir });
+    let runtime = descriptor.stage_dir_in(&options.target_dir, BuildProfile::Release);
+    for output in [&release_dir, &runtime] {
+        remove_if_exists(output).map_err(|source| ReleaseStageError::Io {
+            operation: "remove previous release output",
+            path: output.to_path_buf(),
+            source,
+        })?;
     }
     let source = source_identity(&options.workspace_root)?;
-    require_clean_worktree(&options.workspace_root)?;
 
-    let component_dir = build_host_components(options, descriptor, &source)?;
-    strip_host_components(descriptor, &component_dir)?;
     let input_dir = temporary_input_dir(options)?;
+    let cargo_components = build_host_components(options, descriptor, &source)?;
+    let component_dir = input_dir.path().join("components");
+    copy_host_components(&cargo_components, &component_dir)?;
+    strip_host_components(descriptor, &component_dir)?;
     let assets_dir = input_dir.path().join("assets");
     create_directory(&assets_dir)?;
-    let guest = build_guest_assets(options, descriptor, &assets_dir, &source)?;
+    let guest_dir = input_dir.path().join("guest");
+    let guest = build_guest_assets(options, descriptor, &guest_dir, &assets_dir, &source)?;
     let kernel_dir = input_dir.path().join("kernel");
     let resolved_kernel = resolve_kernel(&ResolveKernelOptions {
         target: options.target,
@@ -177,13 +181,19 @@ pub(crate) fn release_stage(
         &inspection,
     )?;
     verify_source_identity(&options.workspace_root, &source)?;
-    let runtime = descriptor.stage_dir_in(&options.target_dir, BuildProfile::Release);
-    publish_release_transaction(
-        &staged_runtime,
-        &runtime,
-        temporary_release.path(),
-        &release_dir,
-    )?;
+    if let Some(parent) = runtime.parent() {
+        create_directory(parent)?;
+    }
+    fs::rename(&staged_runtime, &runtime).map_err(|source| ReleaseStageError::Io {
+        operation: "publish runtime output",
+        path: runtime.clone(),
+        source,
+    })?;
+    fs::rename(temporary_release.path(), &release_dir).map_err(|source| ReleaseStageError::Io {
+        operation: "publish release output",
+        path: release_dir.clone(),
+        source,
+    })?;
 
     Ok(ReleaseStageResult {
         runtime,
@@ -211,20 +221,10 @@ fn source_identity(workspace: &Path) -> Result<SourceIdentity, ReleaseStageError
     })
 }
 
-fn require_clean_worktree(workspace: &Path) -> Result<(), ReleaseStageError> {
-    let status = run_capture(git_command(workspace, ["status", "--porcelain=v1"]))?;
-    if status.is_empty() {
-        Ok(())
-    } else {
-        Err(ReleaseStageError::DirtyWorktree { status })
-    }
-}
-
 fn verify_source_identity(
     workspace: &Path,
     expected: &SourceIdentity,
 ) -> Result<(), ReleaseStageError> {
-    require_clean_worktree(workspace)?;
     let actual = source_identity(workspace)?;
     if actual.revision == expected.revision
         && actual.source_date_epoch == expected.source_date_epoch
@@ -243,61 +243,6 @@ fn verify_source_identity(
     })
 }
 
-fn publish_release_transaction(
-    staged_runtime: &Path,
-    runtime: &Path,
-    staged_release: &Path,
-    release: &Path,
-) -> Result<(), ReleaseStageError> {
-    if let Some(parent) = runtime.parent() {
-        create_directory(parent)?;
-    }
-    let replaced_runtime = match fs::symlink_metadata(runtime) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            exchange_directories(staged_runtime, runtime)?;
-            true
-        }
-        Ok(_) => {
-            return Err(ReleaseStageError::OutputExists {
-                path: runtime.to_path_buf(),
-            });
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            install_directory_noreplace(staged_runtime, runtime)?;
-            false
-        }
-        Err(source) => {
-            return Err(ReleaseStageError::Io {
-                operation: "inspect canonical runtime output",
-                path: runtime.to_path_buf(),
-                source,
-            });
-        }
-    };
-
-    if let Err(error) = install_directory_noreplace(staged_release, release) {
-        let rollback = if replaced_runtime {
-            exchange_directories(staged_runtime, runtime)
-        } else {
-            fs::rename(runtime, staged_runtime).map_err(|source| ResolveKernelError::Io {
-                operation: "roll back canonical runtime publication",
-                path: runtime.to_path_buf(),
-                source,
-            })
-        };
-        return match rollback {
-            Ok(()) => Err(error.into()),
-            Err(rollback) => Err(ReleaseStageError::InvalidCommandOutput {
-                command: "publish release transaction".to_string(),
-                reason: format!(
-                    "release install failed: {error}; runtime rollback failed: {rollback}"
-                ),
-            }),
-        };
-    }
-    Ok(())
-}
-
 fn git_command<const N: usize>(workspace: &Path, args: [&str; N]) -> Command {
     let mut command = Command::new("git");
     command.current_dir(workspace).args(args);
@@ -310,6 +255,7 @@ fn build_host_components(
     source: &SourceIdentity,
 ) -> Result<PathBuf, ReleaseStageError> {
     let macos_sdk = if descriptor.macos_minimum_version.is_some() {
+        validate_macos_build_environment()?;
         system_macos_sdk()?
     } else {
         PathBuf::new()
@@ -337,6 +283,18 @@ fn build_host_components(
     Ok(component_dir)
 }
 
+fn copy_host_components(source: &Path, destination: &Path) -> Result<(), ReleaseStageError> {
+    create_directory(destination)?;
+    for binary in ["silo", "vmmon", "netd", "krun"] {
+        copy_file(
+            &source.join(binary),
+            &destination.join(binary),
+            RELEASE_MODE,
+        )?;
+    }
+    Ok(())
+}
+
 fn build_rust_command(
     options: &ReleaseStageOptions,
     descriptor: ReleaseTargetDescriptor,
@@ -356,7 +314,7 @@ fn build_rust_command(
         .current_dir(&options.workspace_root)
         .env("CARGO_TARGET_DIR", &options.target_dir)
         .env("SOURCE_DATE_EPOCH", source.source_date_epoch.to_string())
-        .env("RUSTFLAGS", remap_rustflags(&options.workspace_root, None))
+        .env("RUSTFLAGS", remap_rustflags(&options.workspace_root))
         .args(["--locked", "--release", "--target"])
         .arg(descriptor.zig_target.unwrap_or(descriptor.rust_target))
         .args(["-p", package, "--bin", binary]);
@@ -364,7 +322,6 @@ fn build_rust_command(
         command.args(["--features", "krun-bin"]);
     }
     if let Some(minimum) = descriptor.macos_minimum_version {
-        remove_nix_apple_toolchain_environment(&mut command);
         command
             .env("MACOSX_DEPLOYMENT_TARGET", minimum)
             .env("SDKROOT", macos_sdk)
@@ -390,7 +347,6 @@ fn build_netd_command(
         .env("SOURCE_DATE_EPOCH", source.source_date_epoch.to_string())
         .args(["build", "-mod=readonly", "-trimpath", "-buildvcs=true"]);
     if let Some(minimum) = descriptor.macos_minimum_version {
-        remove_nix_apple_toolchain_environment(&mut command);
         command
             .env("CGO_ENABLED", "1")
             .env("CC", "/usr/bin/clang")
@@ -413,7 +369,6 @@ fn build_netd_command(
 
 fn system_macos_sdk() -> Result<PathBuf, ReleaseStageError> {
     let mut command = Command::new("/usr/bin/xcrun");
-    remove_nix_apple_toolchain_environment(&mut command);
     command.args(["--sdk", "macosx", "--show-sdk-path"]);
     let path = PathBuf::from(run_capture(command)?);
     if !path.is_absolute() || path.starts_with("/nix/store") || !path.is_dir() {
@@ -425,22 +380,25 @@ fn system_macos_sdk() -> Result<PathBuf, ReleaseStageError> {
     Ok(path)
 }
 
-fn remove_nix_apple_toolchain_environment(command: &mut Command) {
+fn validate_macos_build_environment() -> Result<(), ReleaseStageError> {
     for variable in [
-        "DEVELOPER_DIR",
         "NIX_CFLAGS_COMPILE",
         "NIX_CFLAGS_COMPILE_FOR_BUILD",
         "NIX_LDFLAGS",
         "NIX_LDFLAGS_FOR_BUILD",
-        "SDKROOT",
     ] {
-        command.env_remove(variable);
+        if std::env::var_os(variable).is_some_and(|value| !value.is_empty()) {
+            return Err(ReleaseStageError::InvalidCommandOutput {
+                command: "validate macOS release environment".to_string(),
+                reason: format!("{variable} must not be set"),
+            });
+        }
     }
+    Ok(())
 }
 
-fn remap_rustflags(workspace: &Path, extra: Option<&str>) -> String {
-    let remap = format!("--remap-path-prefix={}=/usr/src/silo", workspace.display());
-    extra.map_or(remap.clone(), |extra| format!("{extra} {remap}"))
+fn remap_rustflags(workspace: &Path) -> String {
+    format!("--remap-path-prefix={}=/usr/src/silo", workspace.display())
 }
 
 struct GuestArtifacts {
@@ -451,36 +409,21 @@ struct GuestArtifacts {
 fn build_guest_assets(
     options: &ReleaseStageOptions,
     descriptor: ReleaseTargetDescriptor,
+    guest_dir: &Path,
     assets: &Path,
     source: &SourceIdentity,
 ) -> Result<GuestArtifacts, ReleaseStageError> {
-    for (package, rustflags) in [("init", Some("-C panic=abort")), ("agent", None)] {
-        let mut command = Command::new("cargo");
-        command
-            .current_dir(&options.workspace_root)
-            .env("CARGO_TARGET_DIR", &options.target_dir)
-            .env("SOURCE_DATE_EPOCH", source.source_date_epoch.to_string())
-            .args(["zigbuild", "--locked", "--release", "--target"])
-            .arg(descriptor.guest_target)
-            .args(["-p", package]);
-        if let Some(rustflags) = rustflags {
-            command.env(
-                "RUSTFLAGS",
-                remap_rustflags(&options.workspace_root, Some(rustflags)),
-            );
-        } else {
-            command.env("RUSTFLAGS", remap_rustflags(&options.workspace_root, None));
-        }
-        run(command)?;
-    }
-    let guest_dir = options
-        .target_dir
-        .join(descriptor.guest_target)
-        .join("release");
+    let cargo_outputs = build_guest(&GuestBuildOptions {
+        target: descriptor.guest_target,
+        target_dir: &options.target_dir,
+        workspace_root: &options.workspace_root,
+        source_date_epoch: Some(source.source_date_epoch),
+    })?;
+    create_directory(guest_dir)?;
     let init = guest_dir.join("init");
     let agent = guest_dir.join("silo-agent");
-    require_file(&init)?;
-    require_file(&agent)?;
+    copy_file(&cargo_outputs.init, &init, RELEASE_MODE)?;
+    copy_file(&cargo_outputs.agent, &agent, RELEASE_MODE)?;
     strip_guest_components([&init, &agent])?;
     copy_file(&agent, &assets.join("agent"), RELEASE_MODE)?;
     crate::initramfs::write_initramfs(&crate::initramfs::InitramfsOptions::new(
@@ -502,7 +445,7 @@ fn strip_guest_components(binaries: [&Path; 2]) -> Result<(), ReleaseStageError>
 }
 
 fn guest_strip_command(binary: &Path) -> Command {
-    let mut command = Command::new("strip");
+    let mut command = Command::new("llvm-strip");
     command.arg("--strip-unneeded").arg(binary);
     command
 }
@@ -780,8 +723,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::release_stage::{
-        build_netd_command, build_rust_command, guest_strip_command, publish_release_transaction,
-        sha256, write_release_metadata, SourceIdentity,
+        build_netd_command, build_rust_command, guest_strip_command, sha256,
+        write_release_metadata, SourceIdentity,
     };
     use crate::release_target::ReleaseTarget;
 
@@ -910,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_rust_builds_use_a_clean_apple_system_toolchain() {
+    fn macos_rust_builds_use_the_apple_system_toolchain() {
         let root = Path::new("/workspace");
         let target = ReleaseTarget::DarwinArm64;
         let command = build_rust_command(
@@ -940,23 +883,12 @@ mod tests {
             environment.get(std::ffi::OsStr::new("SDKROOT")),
             Some(&std::ffi::OsStr::new("/AppleSDK"))
         );
-        for variable in [
-            "DEVELOPER_DIR",
-            "NIX_CFLAGS_COMPILE",
-            "NIX_CFLAGS_COMPILE_FOR_BUILD",
-            "NIX_LDFLAGS",
-            "NIX_LDFLAGS_FOR_BUILD",
-        ] {
-            assert!(command
-                .get_envs()
-                .any(|(name, value)| name == variable && value.is_none()));
-        }
     }
 
     #[test]
-    fn guest_stripping_uses_the_nix_llvm_wrapper() {
+    fn guest_stripping_uses_explicit_llvm_tooling() {
         let command = guest_strip_command(Path::new("target/guest"));
-        assert_eq!(command.get_program(), "strip");
+        assert_eq!(command.get_program(), "llvm-strip");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             ["--strip-unneeded", "target/guest"]
@@ -1017,54 +949,5 @@ mod tests {
         assert!(!contents.contains(&temp.path().display().to_string()));
         assert!(contents.contains("runtime/bin/vmmon"));
         assert!(contents.contains("bin/silo"));
-    }
-
-    #[test]
-    fn release_publication_exchanges_and_rolls_back_runtime() {
-        let temp = tempfile::tempdir().expect("create temp directory");
-        let staged_runtime = temp.path().join("staged-runtime");
-        let runtime = temp.path().join("runtime");
-        let staged_release = temp.path().join("staged-release");
-        let release = temp.path().join("release");
-        for (path, marker) in [
-            (&staged_runtime, "new"),
-            (&runtime, "old"),
-            (&staged_release, "release"),
-        ] {
-            std::fs::create_dir(path).expect("create publication directory");
-            std::fs::write(path.join("marker"), marker).expect("write marker");
-        }
-
-        publish_release_transaction(&staged_runtime, &runtime, &staged_release, &release)
-            .expect("publish release");
-        assert_eq!(
-            std::fs::read_to_string(runtime.join("marker")).expect("runtime"),
-            "new"
-        );
-        assert_eq!(
-            std::fs::read_to_string(staged_runtime.join("marker")).expect("old runtime"),
-            "old"
-        );
-        assert_eq!(
-            std::fs::read_to_string(release.join("marker")).expect("release"),
-            "release"
-        );
-
-        let next_runtime = temp.path().join("next-runtime");
-        let next_release = temp.path().join("next-release");
-        std::fs::create_dir(&next_runtime).expect("create next runtime");
-        std::fs::write(next_runtime.join("marker"), "next").expect("write next runtime");
-        std::fs::create_dir(&next_release).expect("create next release");
-        let error = publish_release_transaction(&next_runtime, &runtime, &next_release, &release)
-            .expect_err("existing release must fail");
-        assert!(error.to_string().contains("without replacing"));
-        assert_eq!(
-            std::fs::read_to_string(runtime.join("marker")).expect("runtime"),
-            "new"
-        );
-        assert_eq!(
-            std::fs::read_to_string(next_runtime.join("marker")).expect("next runtime"),
-            "next"
-        );
     }
 }

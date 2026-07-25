@@ -60,7 +60,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use sqlx::{Connection, Row};
+    use sqlx::Row;
     use vm_spec::{Hardware, VmSpec};
 
     use crate::lock_manager::LockId;
@@ -116,7 +116,6 @@ mod tests {
             status,
             vmmon_pid: None,
             started_at: None,
-            started_at_is_process_birth: false,
             run_id: None,
             last_error: None,
             updated_at: 1,
@@ -175,8 +174,8 @@ mod tests {
 
         let result = sqlx::query(
             "INSERT INTO db_config
-                (id, os, data_root, run_root, image_root, created_at, modified_at)
-             VALUES (2, 'linux', '/tmp/other', '/tmp/other/run', '/tmp/other/images', 1, 1)",
+                (id, os, data_root, image_root, state_root, created_at, modified_at)
+             VALUES (2, 'linux', '/tmp/other', '/tmp/other/images', '/tmp/other/state', 1, 1)",
         )
         .execute(&db.pool)
         .await;
@@ -201,59 +200,34 @@ mod tests {
             .expect("db_config row");
 
         assert_eq!(config.data_root, paths.data_dir().display().to_string());
-        assert_eq!(config.legacy_run_root, None);
         assert_eq!(config.image_root, paths.images_dir().display().to_string());
         assert_eq!(
             config.state_root,
-            Some(paths.roots().state_root().display().to_string())
+            paths.roots().state_root().display().to_string()
         );
-        assert!(config.state_migration_complete);
-    }
 
-    #[tokio::test]
-    async fn ephemeral_run_root_migration_preserves_only_legacy_values() {
-        let mut connection = sqlx::SqliteConnection::connect("sqlite::memory:")
+        let columns = sqlx::query("PRAGMA table_info(db_config)")
+            .fetch_all(&db.pool)
             .await
-            .expect("open in-memory database");
-        sqlx::raw_sql(include_str!("../../migrations/0001_initial.sql"))
-            .execute(&mut connection)
-            .await
-            .expect("apply initial schema");
-        sqlx::query(
-            "INSERT INTO db_config
-                (id, os, data_root, run_root, image_root, created_at, modified_at)
-             VALUES (1, 'linux', '/data', '/legacy-run', '/images', 1, 1)",
-        )
-        .execute(&mut connection)
-        .await
-        .expect("insert legacy config");
-        sqlx::raw_sql(include_str!("../../migrations/0004_xdg_state_root.sql"))
-            .execute(&mut connection)
-            .await
-            .expect("apply state root schema");
-        sqlx::raw_sql(include_str!("../../migrations/0005_ephemeral_run_root.sql"))
-            .execute(&mut connection)
-            .await
-            .expect("make run root ephemeral");
-
-        let legacy_run_root: Option<String> =
-            sqlx::query_scalar("SELECT run_root FROM db_config WHERE id = 1")
-                .fetch_one(&mut connection)
-                .await
-                .expect("read migrated legacy root");
-        assert_eq!(legacy_run_root.as_deref(), Some("/legacy-run"));
-
-        let run_root_column = sqlx::query("PRAGMA table_info(db_config)")
-            .fetch_all(&mut connection)
-            .await
-            .expect("read table columns")
+            .expect("read db_config columns")
             .into_iter()
-            .find(|row| row.get::<String, _>("name") == "run_root")
-            .expect("run_root column");
-        assert_eq!(run_root_column.get::<i64, _>("notnull"), 0);
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            columns,
+            [
+                "id",
+                "os",
+                "data_root",
+                "image_root",
+                "state_root",
+                "created_at",
+                "modified_at",
+            ]
+        );
 
         let created_at_update = sqlx::query("UPDATE db_config SET created_at = 2 WHERE id = 1")
-            .execute(&mut connection)
+            .execute(&db.pool)
             .await;
         assert!(
             created_at_update.is_err(),

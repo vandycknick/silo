@@ -1,0 +1,762 @@
+name: Publish macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_reference:
+        description: Kernel OCI reference to resolve and record in provenance
+        required: true
+        default: ghcr.io/vandycknick/silo/kernel:stable
+        type: string
+
+concurrency:
+  group: publish-macos
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preflight:
+    name: Validate immutable release input
+    runs-on: macos-26
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      dmg_name: ${{ steps.release.outputs.dmg_name }}
+
+    steps:
+      - name: Check out exact release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Verify native release host
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          test "$(sw_vers -productVersion | cut -d. -f1)" = 26
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Validate tag, source, release, and tap
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+          RELEASE_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          KERNEL_REFERENCE: ${{ inputs.kernel_reference }}
+        run: |
+          set -euo pipefail
+          test "$RELEASE_REF_TYPE" = tag
+          case "$RELEASE_REF_NAME" in
+            v*) ;;
+            *) echo "release ref must be a v-prefixed tag" >&2; exit 1 ;;
+          esac
+
+          cargo_metadata="$RUNNER_TEMP/cargo-metadata.json"
+          nix develop --command cargo metadata \
+            --no-deps \
+            --format-version 1 > "$cargo_metadata"
+          version="$(nix develop --command jq -er \
+            '.packages[] | select(.name == "xtask") | .version' \
+            "$cargo_metadata")"
+          test "$RELEASE_REF_NAME" = "v$version"
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          test "$(git rev-parse "$RELEASE_REF^{commit}")" = "$RELEASE_SHA"
+
+          if gh api "repos/$REPOSITORY/releases/tags/$RELEASE_REF_NAME" \
+            >"$RUNNER_TEMP/existing-release.json" \
+            2>"$RUNNER_TEMP/existing-release.error"; then
+            echo "a draft or published release already owns $RELEASE_REF_NAME" >&2
+            exit 1
+          fi
+          if ! grep -Fq "(HTTP 404)" "$RUNNER_TEMP/existing-release.error"; then
+            cat "$RUNNER_TEMP/existing-release.error" >&2
+            exit 1
+          fi
+
+          tap_ready="$(gh api repos/vandycknick/homebrew-tap \
+            --jq '.private == false and .default_branch == "main"')"
+          test "$tap_ready" = true
+          test -n "$KERNEL_REFERENCE"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dmg_name=Silo-$version-darwin-arm64.dmg" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Production preflight"
+            echo
+            echo "- Tag: \`$RELEASE_REF_NAME\`"
+            echo "- Commit: \`$RELEASE_SHA\`"
+            echo "- Kernel reference: \`$KERNEL_REFERENCE\`"
+            echo "- Homebrew tap: public \`main\` branch verified"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  candidate:
+    name: Build signed draft candidate
+    needs: preflight
+    runs-on: macos-26
+    timeout-minutes: 180
+    environment:
+      name: macos-signing
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+      draft_url: ${{ steps.draft.outputs.draft_url }}
+      certificate_fingerprint: ${{ steps.identity.outputs.certificate_fingerprint }}
+      team_id: ${{ steps.identity.outputs.team_id }}
+
+    steps:
+      - name: Check out exact release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Verify native release host
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          test "$(sw_vers -productVersion | cut -d. -f1)" = 26
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Restore dependency caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            ~/go/pkg/mod
+            ~/Library/Caches/go-build
+          key: publish-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'net/netd/go.sum') }}
+          restore-keys: |
+            publish-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Import signing and notarization credentials
+        id: identity
+        env:
+          APPLE_SIGNING_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_SIGNING_CERTIFICATE_P12_BASE64 }}
+          APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARY_API_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_SIGNING_IDENTITY"
+          if [[ ! "$APPLE_SIGNING_IDENTITY" =~ ^Developer\ ID\ Application:\ .+\ \([A-Z0-9]{10}\)$ ]]; then
+            echo "APPLE_SIGNING_IDENTITY must be a Developer ID Application identity with Team ID" >&2
+            exit 1
+          fi
+          p12_path="$RUNNER_TEMP/silo-signing.p12"
+          p8_path="$RUNNER_TEMP/silo-notary.p8"
+          keychain_path="$RUNNER_TEMP/silo-signing.keychain-db"
+          keychain_list="$RUNNER_TEMP/original-keychains.txt"
+          keychain_password="$(/usr/bin/openssl rand -base64 32)"
+          echo "::add-mask::$keychain_password"
+          echo "KEYCHAIN_PATH=$keychain_path" >> "$GITHUB_ENV"
+
+          printf '%s' "$APPLE_SIGNING_CERTIFICATE_P12_BASE64" \
+            | /usr/bin/base64 -D > "$p12_path"
+          printf '%s' "$APPLE_NOTARY_API_KEY_P8_BASE64" \
+            | /usr/bin/base64 -D > "$p8_path"
+          chmod 0600 "$p12_path" "$p8_path"
+
+          original_keychains=()
+          while IFS= read -r line; do
+            keychain="${line#*\"}"
+            keychain="${keychain%\"*}"
+            if test -n "$keychain"; then
+              original_keychains+=("$keychain")
+            fi
+          done < <(security list-keychains -d user)
+          printf '%s\n' "${original_keychains[@]}" > "$keychain_list"
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$p12_path" \
+            -k "$keychain_path" \
+            -P "$APPLE_SIGNING_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" "${original_keychains[@]}"
+
+          identities="$(security find-identity -v -p codesigning "$keychain_path")"
+          matches="$(printf '%s\n' "$identities" \
+            | grep -F "\"$APPLE_SIGNING_IDENTITY\"" \
+            | wc -l \
+            | tr -d ' ')"
+          test "$matches" = 1
+          test "$(printf '%s\n' "$identities" | grep -c '\"')" = 1
+
+          certificate="$RUNNER_TEMP/silo-signing-certificate.pem"
+          security find-certificate \
+            -c "$APPLE_SIGNING_IDENTITY" \
+            -p "$keychain_path" > "$certificate"
+          subject="$(/usr/bin/openssl x509 -in "$certificate" -noout -subject -nameopt RFC2253)"
+          team_id="$(printf '%s\n' "$subject" | sed -n 's/.*OU=\([^,]*\).*/\1/p')"
+          expected_team_id="${APPLE_SIGNING_IDENTITY##*(}"
+          expected_team_id="${expected_team_id%)}"
+          test -n "$team_id"
+          test "$team_id" = "$expected_team_id"
+          fingerprint="$(/usr/bin/openssl x509 -in "$certificate" -noout -fingerprint -sha256)"
+          fingerprint="${fingerprint#*=}"
+          fingerprint="${fingerprint//:/}"
+
+          xcrun notarytool store-credentials silo-ci \
+            --key "$p8_path" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --keychain "$keychain_path" \
+            --validate
+
+          echo "certificate_fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          echo "team_id=$team_id" >> "$GITHUB_OUTPUT"
+
+      - name: Verify source and build canonical release stage
+        env:
+          KERNEL_REFERENCE: ${{ inputs.kernel_reference }}
+        run: |
+          set -euo pipefail
+          nix develop --command make verify
+          nix develop --command make release-stage \
+            KERNEL_REFERENCE="$KERNEL_REFERENCE"
+
+      - name: Sign, notarize, and package macOS candidate
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          RELEASE_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          nix develop --command make package-macos \
+            RELEASE_BUILD_NUMBER="$RELEASE_BUILD_NUMBER" \
+            MACOS_SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY" \
+            MACOS_NOTARY_KEYCHAIN_PROFILE=silo-ci \
+            MACOS_NOTARY_KEYCHAIN="$KEYCHAIN_PATH"
+
+      - name: Verify production trust contract
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          DMG_NAME: ${{ needs.preflight.outputs.dmg_name }}
+        run: |
+          set -euo pipefail
+          app=target/silo-artifacts/darwin-arm64/macos/Silo.app
+          dmg="target/silo-artifacts/darwin-arm64/macos/$DMG_NAME"
+          metadata=target/silo-artifacts/darwin-arm64/macos/macos.json
+
+          nix develop --command jq -e \
+            --arg identity "$APPLE_SIGNING_IDENTITY" \
+            '.target == "darwin-arm64"
+              and .bundleIdentifier == "sh.silo.app"
+              and .minimumSystemVersion == "26.0"
+              and .signing == $identity
+              and .notarized == true
+              and (.notarization.appSubmissionId | type == "string" and length == 36)
+              and (.notarization.dmgSubmissionId | type == "string" and length == 36)' \
+            "$metadata"
+
+          /usr/bin/codesign --verify --deep --strict --verbose=4 "$app"
+          /usr/bin/codesign --verify --strict --verbose=4 "$dmg"
+          xcrun stapler validate -v "$app"
+          xcrun stapler validate -v "$dmg"
+          /usr/sbin/spctl --assess --type execute --verbose=4 "$app"
+          /usr/sbin/spctl --assess --type open \
+            --context context:primary-signature \
+            --verbose=4 \
+            "$dmg"
+          /usr/bin/hdiutil verify "$dmg"
+
+          check_signature() {
+            signed_path="$1"
+            name="$2"
+            signature="$RUNNER_TEMP/$name-signature.txt"
+            /usr/bin/codesign --display --verbose=4 "$signed_path" 2> "$signature"
+            grep -Fq "Authority=$APPLE_SIGNING_IDENTITY" "$signature"
+            grep -Fq 'flags=0x10000(runtime)' "$signature"
+            grep -Fq 'Timestamp=' "$signature"
+          }
+          check_signature "$app" app
+          check_signature "$app/Contents/MacOS/silo" silo
+          check_signature "$app/Contents/Helpers/vmmon" vmmon
+          check_signature "$app/Contents/Helpers/netd" netd
+          check_signature "$app/Contents/Helpers/krun" krun
+          check_signature "$dmg" dmg
+
+          check_entitlements() {
+            binary="$1"
+            expected="$2"
+            name="$3"
+            plist="$RUNNER_TEMP/$name-entitlements.plist"
+            json="$RUNNER_TEMP/$name-entitlements.json"
+            if /usr/bin/codesign --display --entitlements :- "$binary" \
+              > "$plist" 2>/dev/null && test -s "$plist"; then
+              /usr/bin/plutil -convert json -o "$json" "$plist"
+            else
+              printf '{}\n' > "$json"
+            fi
+            nix develop --command jq -e "$expected" "$json"
+          }
+
+          check_entitlements \
+            "$app/Contents/Helpers/vmmon" \
+            '. == {
+              "com.apple.security.virtualization": true,
+              "com.apple.security.network.client": true,
+              "com.apple.security.network.server": true
+            }' \
+            vmmon
+          check_entitlements \
+            "$app/Contents/Helpers/krun" \
+            '. == {"com.apple.security.hypervisor": true}' \
+            krun
+          check_entitlements "$app/Contents/Helpers/netd" '. == {}' netd
+          check_entitlements "$app/Contents/MacOS/silo" '. == {}' silo
+          check_entitlements "$app" '. == {}' app
+
+      - name: Create and verify draft release
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          DMG_NAME: ${{ needs.preflight.outputs.dmg_name }}
+        run: |
+          set -euo pipefail
+          jq() { nix develop --command jq "$@"; }
+          package=target/silo-artifacts/darwin-arm64/macos
+          provenance=target/silo-release/darwin-arm64/release/metadata
+          dmg="$package/$DMG_NAME"
+          metadata="$package/macos.json"
+          assets=(
+            "$dmg"
+            "$metadata"
+            "$provenance/release.json"
+            "$provenance/kernel-provenance.json"
+            "$provenance/inspection.json"
+          )
+          for asset in "${assets[@]}"; do
+            test -f "$asset"
+          done
+
+          gh release create "$RELEASE_TAG" \
+            --draft \
+            --verify-tag \
+            --title "Silo $VERSION" \
+            --generate-notes \
+            "${assets[@]}"
+
+          release_json="$RUNNER_TEMP/draft-release.json"
+          gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json"
+          release_id="$(jq -er '.id' "$release_json")"
+          draft_url="$(jq -er '.html_url' "$release_json")"
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            '.draft == true and .prerelease == false and .tag_name == $tag' \
+            "$release_json"
+
+          assets_json="$RUNNER_TEMP/draft-assets.json"
+          gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100" > "$assets_json"
+          test "$(jq 'length' "$assets_json")" = "${#assets[@]}"
+          for asset in "${assets[@]}"; do
+            name="$(basename "$asset")"
+            size="$(stat -f %z "$asset")"
+            jq -e \
+              --arg name "$name" \
+              --argjson size "$size" \
+              '[.[] | select(.name == $name and .size == $size and .state == "uploaded")] | length == 1' \
+              "$assets_json"
+          done
+
+          dmg_asset_id="$(jq -er \
+            --arg name "$DMG_NAME" \
+            '.[] | select(.name == $name) | .id' \
+            "$assets_json")"
+          dmg_size="$(stat -f %z "$dmg")"
+          server_digest="$(jq -r \
+            --arg name "$DMG_NAME" \
+            '.[] | select(.name == $name) | .digest // "unavailable"' \
+            "$assets_json")"
+          downloaded="$RUNNER_TEMP/draft-$DMG_NAME"
+          gh api \
+            -H 'Accept: application/octet-stream' \
+            "repos/$REPOSITORY/releases/assets/$dmg_asset_id" > "$downloaded"
+          cmp "$dmg" "$downloaded"
+
+          nix develop --command make package-homebrew-cask \
+            PUBLISHED_MACOS_DMG="$downloaded"
+          cask=target/silo-artifacts/darwin-arm64/homebrew/Casks/vandycknick-silo.rb
+          audit_tap=silo/release-validation
+          HOMEBREW_NO_AUTO_UPDATE=1 brew tap-new --no-git "$audit_tap"
+          audit_root="$(brew --repository "$audit_tap")"
+          mkdir -p "$audit_root/Casks"
+          cp "$cask" "$audit_root/Casks/vandycknick-silo.rb"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew style --cask \
+            "$audit_root/Casks/vandycknick-silo.rb"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew audit --cask --strict \
+            "$audit_tap/vandycknick-silo"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew untap "$audit_tap"
+
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "draft_url=$draft_url" >> "$GITHUB_OUTPUT"
+          echo "dmg_asset_id=$dmg_asset_id" >> "$GITHUB_OUTPUT"
+          echo "dmg_size=$dmg_size" >> "$GITHUB_OUTPUT"
+          echo "server_digest=$server_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Write clean-host qualification instructions
+        env:
+          DRAFT_URL: ${{ steps.draft.outputs.draft_url }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          DMG_NAME: ${{ needs.preflight.outputs.dmg_name }}
+          CERTIFICATE_FINGERPRINT: ${{ steps.identity.outputs.certificate_fingerprint }}
+          TEAM_ID: ${{ steps.identity.outputs.team_id }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          DMG_ASSET_ID: ${{ steps.draft.outputs.dmg_asset_id }}
+          DMG_SIZE: ${{ steps.draft.outputs.dmg_size }}
+          SERVER_DIGEST: ${{ steps.draft.outputs.server_digest }}
+        run: |
+          set -euo pipefail
+          metadata=target/silo-artifacts/darwin-arm64/macos/macos.json
+          digest="$(nix develop --command jq -er '.dmg.sha256' "$metadata")"
+          app_submission="$(nix develop --command jq -er '.notarization.appSubmissionId' "$metadata")"
+          dmg_submission="$(nix develop --command jq -er '.notarization.dmgSubmissionId' "$metadata")"
+          {
+            echo "## Signed macOS draft candidate"
+            echo
+            echo "- Draft: $DRAFT_URL"
+            echo "- Tag: \`$RELEASE_TAG\`"
+            echo "- Asset: \`$DMG_NAME\`"
+            echo "- SHA-256: \`$digest\`"
+            echo "- Size: \`$DMG_SIZE\` bytes"
+            echo "- GitHub asset ID: \`$DMG_ASSET_ID\`"
+            echo "- GitHub server digest: \`$SERVER_DIGEST\`"
+            echo "- Build number: \`$BUILD_NUMBER\`"
+            echo "- Team ID: \`$TEAM_ID\`"
+            echo "- Certificate SHA-256: \`$CERTIFICATE_FINGERPRINT\`"
+            echo "- App notarization: \`$app_submission\`"
+            echo "- DMG notarization: \`$dmg_submission\`"
+            echo "- Kernel provenance: \`kernel-provenance.json\` attached to the draft"
+            echo
+            echo "Download this exact draft asset on a clean native Apple Silicon macOS 26 host."
+            echo "Complete every check in \`PACKAGING.md#clean-host-qualification\`,"
+            echo "record the host, tester, date, command, and digest in the deployment approval,"
+            echo "then approve the pending \`release\` environment only if VZ boots successfully."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove ephemeral signing credentials
+        if: ${{ always() }}
+        run: |
+          original_keychains=()
+          if test -f "$RUNNER_TEMP/original-keychains.txt"; then
+            while IFS= read -r keychain; do
+              if test -n "$keychain"; then
+                original_keychains+=("$keychain")
+              fi
+            done < "$RUNNER_TEMP/original-keychains.txt"
+          fi
+          if test "${#original_keychains[@]}" -gt 0; then
+            security list-keychains -d user -s "${original_keychains[@]}" || true
+          fi
+          security delete-keychain "$RUNNER_TEMP/silo-signing.keychain-db" 2>/dev/null || true
+          HOMEBREW_NO_AUTO_UPDATE=1 brew untap silo/release-validation 2>/dev/null || true
+          rm -f \
+            "$RUNNER_TEMP/silo-signing.p12" \
+            "$RUNNER_TEMP/silo-notary.p8" \
+            "$RUNNER_TEMP/silo-signing-certificate.pem" \
+            "$RUNNER_TEMP/original-keychains.txt"
+
+  publication:
+    name: Approve and publish exact candidate
+    needs:
+      - preflight
+      - candidate
+    runs-on: macos-26
+    timeout-minutes: 120
+    environment:
+      name: release
+      url: ${{ needs.candidate.outputs.draft_url }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out exact release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Verify native publication host
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          test "$(sw_vers -productVersion | cut -d. -f1)" = 26
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Restore dependency caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+          key: publish-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+          restore-keys: |
+            publish-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Download and verify draft assets independently
+        id: assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.candidate.outputs.release_id }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          DMG_NAME: ${{ needs.preflight.outputs.dmg_name }}
+        run: |
+          set -euo pipefail
+          jq() { nix develop --command jq "$@"; }
+          release_json="$RUNNER_TEMP/release.json"
+          assets_json="$RUNNER_TEMP/assets.json"
+          gh api "repos/$REPOSITORY/releases/$RELEASE_ID" > "$release_json"
+          jq -e \
+            --argjson id "$RELEASE_ID" \
+            --arg tag "$RELEASE_TAG" \
+            '.id == $id and .tag_name == $tag and .prerelease == false' \
+            "$release_json"
+          release_is_draft="$(jq -er '.draft' "$release_json")"
+          if test "$release_is_draft" = false && test "$RUN_ATTEMPT" -le 1; then
+            echo "release was published outside the approved publication job" >&2
+            exit 1
+          fi
+
+          gh api "repos/$REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" > "$assets_json"
+          expected=(
+            "$DMG_NAME"
+            macos.json
+            release.json
+            kernel-provenance.json
+            inspection.json
+          )
+          test "$(jq 'length' "$assets_json")" = "${#expected[@]}"
+          for name in "${expected[@]}"; do
+            jq -e \
+              --arg name "$name" \
+              '[.[] | select(.name == $name and .state == "uploaded")] | length == 1' \
+              "$assets_json"
+          done
+
+          asset_id() {
+            jq -er --arg name "$1" '.[] | select(.name == $name) | .id' "$assets_json"
+          }
+          download_asset() {
+            name="$1"
+            destination="$2"
+            id="$(asset_id "$name")"
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              "repos/$REPOSITORY/releases/assets/$id" > "$destination"
+            test "$(stat -f %z "$destination")" = "$(jq -er \
+              --arg name "$name" \
+              '.[] | select(.name == $name) | .size' \
+              "$assets_json")"
+          }
+
+          package=target/silo-artifacts/darwin-arm64/macos
+          provenance=target/silo-release/darwin-arm64/release/metadata
+          mkdir -p "$package" "$provenance"
+          local_dmg="$package/$DMG_NAME"
+          published_dmg="$RUNNER_TEMP/published-$DMG_NAME"
+          download_asset "$DMG_NAME" "$local_dmg"
+          download_asset "$DMG_NAME" "$published_dmg"
+          download_asset macos.json "$package/macos.json"
+          download_asset release.json "$provenance/release.json"
+          download_asset kernel-provenance.json "$provenance/kernel-provenance.json"
+          download_asset inspection.json "$provenance/inspection.json"
+
+          recorded_digest="$(jq -er '.dmg.sha256' "$package/macos.json")"
+          local_digest="sha256:$(shasum -a 256 "$local_dmg" | cut -d' ' -f1)"
+          published_digest="sha256:$(shasum -a 256 "$published_dmg" | cut -d' ' -f1)"
+          test "$local_digest" = "$recorded_digest"
+          test "$published_digest" = "$recorded_digest"
+          cmp "$local_dmg" "$published_dmg"
+          server_digest="$(jq -r \
+            --arg name "$DMG_NAME" \
+            '.[] | select(.name == $name) | .digest // empty' \
+            "$assets_json")"
+          if test -n "$server_digest"; then
+            test "$server_digest" = "$recorded_digest"
+          else
+            server_digest=unavailable
+          fi
+          dmg_asset_id="$(asset_id "$DMG_NAME")"
+          dmg_size="$(stat -f %z "$local_dmg")"
+
+          nix develop --command make package-homebrew-cask \
+            PUBLISHED_MACOS_DMG="$published_dmg"
+          cask=target/silo-artifacts/darwin-arm64/homebrew/Casks/vandycknick-silo.rb
+          audit_tap=silo/release-validation
+          HOMEBREW_NO_AUTO_UPDATE=1 brew tap-new --no-git "$audit_tap"
+          audit_root="$(brew --repository "$audit_tap")"
+          mkdir -p "$audit_root/Casks"
+          cp "$cask" "$audit_root/Casks/vandycknick-silo.rb"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew style --cask \
+            "$audit_root/Casks/vandycknick-silo.rb"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew audit --cask --strict \
+            "$audit_tap/vandycknick-silo"
+
+          echo "release_is_draft=$release_is_draft" >> "$GITHUB_OUTPUT"
+          echo "recorded_digest=$recorded_digest" >> "$GITHUB_OUTPUT"
+          echo "dmg_asset_id=$dmg_asset_id" >> "$GITHUB_OUTPUT"
+          echo "dmg_size=$dmg_size" >> "$GITHUB_OUTPUT"
+          echo "server_digest=$server_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Homebrew tap update
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          tap="$RUNNER_TEMP/homebrew-tap"
+          git clone --depth=1 --branch main \
+            https://github.com/vandycknick/homebrew-tap.git \
+            "$tap"
+          source_cask=target/silo-artifacts/darwin-arm64/homebrew/Casks/vandycknick-silo.rb
+          mkdir -p "$tap/Casks"
+          cp "$source_cask" "$tap/Casks/vandycknick-silo.rb"
+          changes="$(git -C "$tap" diff --name-only)"
+          if test -n "$changes"; then
+            test "$changes" = Casks/vandycknick-silo.rb
+            echo "TAP_UPDATE_REQUIRED=true" >> "$GITHUB_ENV"
+          else
+            echo "TAP_UPDATE_REQUIRED=false" >> "$GITHUB_ENV"
+          fi
+          echo "TAP_CHECKOUT=$tap" >> "$GITHUB_ENV"
+          echo "TAP_BASE_REVISION=$(git -C "$tap" rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub release
+        if: ${{ steps.assets.outputs.release_is_draft == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --verify-tag
+
+      - name: Smoke test public release through local Cask
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          audit_tap=silo/release-validation
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask \
+            "$audit_tap/vandycknick-silo"
+          silo="$(brew --prefix)/bin/silo"
+          test -x "$silo"
+          test "$(/usr/bin/realpath "$silo")" = /Applications/Silo.app/Contents/MacOS/silo
+          test "$("$silo" --version)" = "silo $VERSION"
+          /usr/bin/codesign --verify --deep --strict --verbose=4 /Applications/Silo.app
+          xcrun stapler validate -v /Applications/Silo.app
+          /usr/sbin/spctl --assess --type execute --verbose=4 /Applications/Silo.app
+          HOMEBREW_NO_AUTO_UPDATE=1 brew uninstall --cask vandycknick-silo
+          HOMEBREW_NO_AUTO_UPDATE=1 brew untap "$audit_tap"
+
+      - name: Commit and push Homebrew Cask
+        if: ${{ env.TAP_UPDATE_REQUIRED == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          git -C "$TAP_CHECKOUT" config user.name github-actions[bot]
+          git -C "$TAP_CHECKOUT" config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git -C "$TAP_CHECKOUT" add -- Casks/vandycknick-silo.rb
+          test "$(git -C "$TAP_CHECKOUT" diff --cached --name-only)" = Casks/vandycknick-silo.rb
+          git -C "$TAP_CHECKOUT" commit -m "Update Silo Cask to $VERSION"
+          git -C "$TAP_CHECKOUT" fetch origin main
+          test "$(git -C "$TAP_CHECKOUT" rev-parse origin/main)" = "$TAP_BASE_REVISION"
+          git -C "$TAP_CHECKOUT" push origin HEAD:main
+
+      - name: Smoke test official tap installation
+        id: official_tap
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          HOMEBREW_NO_AUTO_UPDATE=1 brew untap vandycknick/tap 2>/dev/null || true
+          HOMEBREW_NO_AUTO_UPDATE=1 brew tap vandycknick/tap
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask vandycknick/tap/vandycknick-silo
+          silo="$(brew --prefix)/bin/silo"
+          test -x "$silo"
+          test "$(/usr/bin/realpath "$silo")" = /Applications/Silo.app/Contents/MacOS/silo
+          test "$("$silo" --version)" = "silo $VERSION"
+          /usr/bin/codesign --verify --deep --strict --verbose=4 /Applications/Silo.app
+          xcrun stapler validate -v /Applications/Silo.app
+          /usr/sbin/spctl --assess --type execute --verbose=4 /Applications/Silo.app
+          official_tap="$(brew --repository vandycknick/tap)"
+          cmp \
+            target/silo-artifacts/darwin-arm64/homebrew/Casks/vandycknick-silo.rb \
+            "$official_tap/Casks/vandycknick-silo.rb"
+          echo "revision=$(git -C "$official_tap" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew uninstall --cask vandycknick-silo
+
+      - name: Record publication evidence
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_ID: ${{ needs.candidate.outputs.release_id }}
+          DIGEST: ${{ steps.assets.outputs.recorded_digest }}
+          CERTIFICATE_FINGERPRINT: ${{ needs.candidate.outputs.certificate_fingerprint }}
+          TEAM_ID: ${{ needs.candidate.outputs.team_id }}
+          TAP_REVISION: ${{ steps.official_tap.outputs.revision }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          DMG_ASSET_ID: ${{ steps.assets.outputs.dmg_asset_id }}
+          DMG_SIZE: ${{ steps.assets.outputs.dmg_size }}
+          SERVER_DIGEST: ${{ steps.assets.outputs.server_digest }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PROVENANCE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kernel-provenance.json
+        run: |
+          set -euo pipefail
+          {
+            echo "## Published macOS release"
+            echo
+            echo "- Tag: \`$RELEASE_TAG\`"
+            echo "- Release ID: \`$RELEASE_ID\`"
+            echo "- DMG SHA-256: \`$DIGEST\`"
+            echo "- DMG size: \`$DMG_SIZE\` bytes"
+            echo "- GitHub asset ID: \`$DMG_ASSET_ID\`"
+            echo "- GitHub server digest: \`$SERVER_DIGEST\`"
+            echo "- Build number: \`$BUILD_NUMBER\`"
+            echo "- Team ID: \`$TEAM_ID\`"
+            echo "- Certificate SHA-256: \`$CERTIFICATE_FINGERPRINT\`"
+            echo "- Kernel provenance: $PROVENANCE_URL"
+            echo "- Clean-host approval: protected \`release\` deployment record in $RUN_URL"
+            echo "- Homebrew tap commit: \`$TAP_REVISION\`"
+            echo "- Local Cask and official tap smoke tests: passed"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove Homebrew validation state
+        if: ${{ always() }}
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew uninstall --cask vandycknick-silo 2>/dev/null || true
+          HOMEBREW_NO_AUTO_UPDATE=1 brew untap silo/release-validation 2>/dev/null || true
+          HOMEBREW_NO_AUTO_UPDATE=1 brew untap vandycknick/tap 2>/dev/null || true

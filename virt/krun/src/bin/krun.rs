@@ -269,6 +269,8 @@ fn open_local_unix_datagram_socket(
     backend: &str,
 ) -> eyre::Result<UnixDatagram> {
     let local_path = local_unix_datagram_path(peer_path, vm_id, backend);
+    utils::validate_unix_socket_path(peer_path)?;
+    utils::validate_unix_socket_path(&local_path)?;
     remove_file_if_exists(&local_path)?;
     let socket = UnixDatagram::bind(&local_path)?;
     socket.connect(peer_path)?;
@@ -303,10 +305,12 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::context::KernelFormat;
-    use super::{external_kernel_format, local_unix_datagram_path};
+    use super::{
+        external_kernel_format, local_unix_datagram_path, open_local_unix_datagram_socket,
+    };
 
     #[test]
     fn external_kernel_format_matches_host_architecture() {
@@ -335,5 +339,16 @@ mod tests {
             local_unix_datagram_path(Path::new("/tmp/silo-net/gvproxy.sock"), "vm123", "krun"),
             Path::new("/tmp/silo-net/vm123-krun.sock")
         );
+    }
+
+    #[test]
+    fn unix_datagram_rejects_overlong_peer_before_binding() {
+        let peer = PathBuf::from(format!("/{}", "x".repeat(200)));
+
+        let error = open_local_unix_datagram_socket(&peer, "1234567890abcdef", "krun")
+            .expect_err("reject overlong peer");
+
+        assert!(error.to_string().contains("Unix socket path"));
+        assert!(error.to_string().contains("201 bytes"));
     }
 }

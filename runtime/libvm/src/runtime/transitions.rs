@@ -133,7 +133,7 @@ fn monitor_ready(
     require_state(state.status, MachineRuntimeState::Starting, "MonitorReady")?;
     require_run_id(&state, Some(run_id.as_str()))?;
 
-    let mut state = replace_runtime(
+    Ok(replace_runtime(
         state,
         MachineRuntimeState::Running,
         Some(pid),
@@ -141,9 +141,7 @@ fn monitor_ready(
         Some(run_id),
         None,
         now,
-    );
-    state.started_at_is_process_birth = true;
-    Ok(state)
+    ))
 }
 
 fn monitor_observed(
@@ -159,7 +157,7 @@ fn monitor_observed(
         _ => MachineRuntimeState::Running,
     };
 
-    let mut state = replace_runtime(
+    Ok(replace_runtime(
         state,
         status,
         Some(pid),
@@ -167,9 +165,7 @@ fn monitor_observed(
         run_id,
         None,
         now,
-    );
-    state.started_at_is_process_birth = true;
-    Ok(state)
+    ))
 }
 
 fn start_failed(
@@ -338,9 +334,6 @@ fn replace_runtime(
     state.status = status;
     state.vmmon_pid = vmmon_pid;
     state.started_at = started_at;
-    if started_at.is_none() {
-        state.started_at_is_process_birth = false;
-    }
     state.run_id = run_id;
     state.last_error = last_error;
     state.updated_at = now;
@@ -369,7 +362,6 @@ mod tests {
             status,
             vmmon_pid: None,
             started_at: None,
-            started_at_is_process_birth: false,
             run_id: None,
             last_error: None,
             updated_at: 1,
@@ -381,7 +373,6 @@ mod tests {
             status: MachineRuntimeState::Running,
             vmmon_pid: Some(123),
             started_at: Some(42),
-            started_at_is_process_birth: true,
             run_id: Some("run-1".to_string()),
             ..state(MachineRuntimeState::Running)
         }
@@ -453,7 +444,6 @@ mod tests {
         assert_eq!(next.status, MachineRuntimeState::Running);
         assert_eq!(next.vmmon_pid, Some(123));
         assert_eq!(next.started_at, Some(42));
-        assert!(next.started_at_is_process_birth);
         assert_eq!(next.run_id.as_deref(), Some("run-1"));
         assert_eq!(next.updated_at, NOW + 1);
     }
@@ -477,7 +467,6 @@ mod tests {
         assert_eq!(next.status, MachineRuntimeState::Starting);
         assert_eq!(next.vmmon_pid, Some(123));
         assert_eq!(next.started_at, Some(42));
-        assert!(next.started_at_is_process_birth);
         assert_eq!(next.run_id.as_deref(), Some("run-1"));
     }
 

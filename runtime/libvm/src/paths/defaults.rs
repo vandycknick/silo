@@ -32,17 +32,38 @@ pub(crate) fn resolve_default_run_dir() -> Result<PathBuf, LibVmError> {
     }
 
     let temp_dir = std::env::temp_dir();
-    if directory_is_private_to_effective_user(&temp_dir)? {
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    #[cfg(target_os = "macos")]
+    {
+        Ok(fallback_run_dir(&temp_dir, effective_uid))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fallback_run_dir(&temp_dir, effective_uid)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn fallback_run_dir(_temp_dir: &Path, effective_uid: u32) -> PathBuf {
+    Path::new("/tmp").join(format!("{APP_DIR_NAME}-{effective_uid}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fallback_run_dir(temp_dir: &Path, effective_uid: u32) -> Result<PathBuf, LibVmError> {
+    if directory_is_private_to_effective_user(temp_dir)? {
         Ok(temp_dir.join(APP_DIR_NAME))
     } else {
-        Ok(temp_dir.join(format!(
-            "{APP_DIR_NAME}-{}",
-            nix::unistd::Uid::effective().as_raw()
-        )))
+        Ok(temp_dir.join(format!("{APP_DIR_NAME}-{effective_uid}")))
     }
 }
 
 pub(crate) fn ensure_secure_run_dir(path: &Path) -> Result<(), LibVmError> {
+    if let Some(parent) = path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
@@ -69,6 +90,7 @@ pub(crate) fn ensure_secure_run_dir(path: &Path) -> Result<(), LibVmError> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn directory_is_private_to_effective_user(path: &Path) -> Result<bool, LibVmError> {
     let metadata = std::fs::symlink_metadata(path)?;
     Ok(!metadata.file_type().is_symlink()
@@ -97,11 +119,16 @@ fn absolute_path(name: &'static str, value: OsString) -> Result<PathBuf, LibVmEr
 mod tests {
     use std::ffi::OsString;
     use std::path::Path;
+    use std::process::Command;
 
     use std::os::unix::fs::{symlink, PermissionsExt};
 
+    #[cfg(target_os = "macos")]
+    use super::fallback_run_dir;
     use super::{absolute_path, ensure_secure_run_dir};
     use crate::LibVmError;
+
+    const UMASK_CHILD_RUN_DIR: &str = "SILO_RUN_DIR_UMASK_CHILD";
 
     #[test]
     fn absolute_path_rejects_relative_env_values() {
@@ -117,6 +144,15 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_fallback_uses_short_user_specific_tmp_path() {
+        let nix_temp =
+            Path::new("/var/folders/5v/l61twqw154d2gpwj7r8n7vyh0000gn/T/nix-shell.E8PWtQ");
+
+        assert_eq!(fallback_run_dir(nix_temp, 501), Path::new("/tmp/silo-501"));
+    }
+
     #[test]
     fn secure_run_directory_is_private() {
         let temp = tempfile::tempdir().expect("create temp dir");
@@ -126,6 +162,46 @@ mod tests {
 
         let metadata = std::fs::metadata(path).expect("runtime metadata");
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn secure_run_directory_creates_private_missing_parent_directories() {
+        if let Some(path) = std::env::var_os(UMASK_CHILD_RUN_DIR) {
+            ensure_secure_run_dir(Path::new(&path)).expect("create child runtime dir");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let path = temp.path().join("missing/parent/runtime");
+
+        let test_binary = std::env::current_exe().expect("test binary");
+        let status = Command::new("sh")
+            .args(["-c", "umask 000; exec \"$@\"", "sh"])
+            .arg(test_binary)
+            .args([
+                "--exact",
+                "paths::defaults::tests::secure_run_directory_creates_private_missing_parent_directories",
+                "--nocapture",
+            ])
+            .env(UMASK_CHILD_RUN_DIR, &path)
+            .status()
+            .expect("run secure directory child");
+        assert!(status.success(), "secure directory child failed: {status}");
+
+        for directory in [
+            temp.path().join("missing"),
+            temp.path().join("missing/parent"),
+            path,
+        ] {
+            let metadata = std::fs::metadata(&directory).expect("runtime metadata");
+            assert!(metadata.is_dir());
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o700,
+                "unexpected mode for {}",
+                directory.display()
+            );
+        }
     }
 
     #[test]

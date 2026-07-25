@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use thiserror::Error;
 
 use crate::archive::{package_archives, PackageArchivesOptions};
+use crate::guest_build::{build_guest, GuestBuildOptions};
 use crate::homebrew::{package_homebrew_cask, PackageHomebrewOptions};
 use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::kernel_oci::{resolve_kernel, ResolveKernelOptions};
@@ -17,6 +18,8 @@ use crate::release_target::{BuildProfile, ReleaseTarget};
 use crate::stage_runtime::{stage_runtime, StageRuntimeOptions};
 
 mod archive;
+mod dmg;
+mod guest_build;
 mod homebrew;
 mod initramfs;
 mod kernel_oci;
@@ -24,6 +27,7 @@ mod macos_package;
 mod release_inspect;
 mod release_stage;
 mod release_target;
+mod remove_path;
 mod stage_runtime;
 
 #[cfg(target_arch = "x86_64")]
@@ -44,7 +48,7 @@ enum Commands {
     GuestAssets(GuestAssetsArgs),
     PackageArchives(PackageArchivesArgs),
     /// Generate the official Cask from a notarized macOS package.
-    PackageHomebrewCask,
+    PackageHomebrewCask(PackageHomebrewCaskArgs),
     PackageMacos(PackageMacosArgs),
     PackInitramfs(PackInitramfsArgs),
     ReleaseTarget(ReleaseTargetArgs),
@@ -62,6 +66,13 @@ struct PackageArchivesArgs {
 }
 
 #[derive(Debug, Parser)]
+#[command(about = "Generate the official Cask from an authenticated release download")]
+struct PackageHomebrewCaskArgs {
+    #[arg(long, value_name = "PATH")]
+    published_macos_dmg: PathBuf,
+}
+
+#[derive(Debug, Parser)]
 #[command(about = "Assemble, sign, and optionally notarize the macOS distribution")]
 struct PackageMacosArgs {
     #[arg(long, value_name = "VERSION")]
@@ -70,6 +81,8 @@ struct PackageMacosArgs {
     signing_identity: Option<String>,
     #[arg(long, value_name = "PROFILE", requires = "signing_identity")]
     notary_keychain_profile: Option<String>,
+    #[arg(long, value_name = "PATH", requires = "notary_keychain_profile")]
+    notary_keychain: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -150,6 +163,8 @@ enum XtaskError {
     #[error(transparent)]
     Homebrew(#[from] homebrew::HomebrewError),
     #[error(transparent)]
+    GuestBuild(#[from] guest_build::GuestBuildError),
+    #[error(transparent)]
     MacosPackage(#[from] macos_package::MacosPackageError),
     #[error(transparent)]
     Initramfs(#[from] initramfs::InitramfsError),
@@ -161,8 +176,6 @@ enum XtaskError {
     ReleaseStage(#[from] release_stage::ReleaseStageError),
     #[error("workspace root has no parent for xtask manifest path {path}")]
     MissingWorkspaceRoot { path: PathBuf },
-    #[error("guest binary not found after build: {path}")]
-    MissingGuestBinary { path: PathBuf },
     #[error("vmmon binary not found: {path}")]
     MissingVmmonBinary { path: PathBuf },
     #[error("failed to create asset directory {path}")]
@@ -237,10 +250,11 @@ fn run() -> Result<()> {
             println!("metadata={}", result.metadata.display());
             Ok(())
         }
-        Commands::PackageHomebrewCask => {
+        Commands::PackageHomebrewCask(args) => {
             validate_release_versions()?;
             let result = package_homebrew_cask(&PackageHomebrewOptions {
                 target_dir: target_dir()?,
+                published_macos_dmg: args.published_macos_dmg,
             })?;
             println!("cask={}", result.cask.display());
             Ok(())
@@ -251,6 +265,7 @@ fn run() -> Result<()> {
                 build_number: args.build_number,
                 signing_identity: args.signing_identity,
                 notary_keychain_profile: args.notary_keychain_profile,
+                notary_keychain: args.notary_keychain,
                 target_dir: target_dir()?,
                 workspace_root: workspace_root()?,
             })?;
@@ -413,55 +428,28 @@ fn guest_assets(args: GuestAssetsArgs) -> Result<()> {
         .assets_dir
         .unwrap_or_else(|| target_dir.join("resources/assets"));
 
-    build_guest_init(&args.target)?;
-    build_guest_agent(&args.target)?;
+    let guest = build_guest(&GuestBuildOptions {
+        target: &args.target,
+        target_dir: &target_dir,
+        workspace_root: &workspace_root,
+        source_date_epoch: None,
+    })?;
 
     fs::create_dir_all(&assets_dir).map_err(|source| XtaskError::CreateAssetDirectory {
         path: assets_dir.clone(),
         source,
     })?;
 
-    let guest_bin_dir = target_dir.join(&args.target).join("release");
-    let init_binary = guest_bin_dir.join("init");
-    let agent_binary = guest_bin_dir.join("silo-agent");
-    ensure_file(&init_binary)?;
-    ensure_file(&agent_binary)?;
-
-    copy_asset(&init_binary, &assets_dir.join("init"))?;
-    copy_asset(&agent_binary, &assets_dir.join("agent"))?;
+    copy_asset(&guest.init, &assets_dir.join("init"))?;
+    copy_asset(&guest.agent, &assets_dir.join("agent"))?;
 
     let initramfs = assets_dir.join("initramfs");
     remove_existing(&assets_dir.join("initramfs-no-agent"))?;
     remove_existing(&initramfs)?;
-    write_initramfs(&InitramfsOptions::new(&init_binary, &initramfs))?;
+    write_initramfs(&InitramfsOptions::new(&guest.init, &initramfs))?;
 
     println!("Updated {}", assets_dir.display());
     Ok(())
-}
-
-fn build_guest_init(target: &str) -> Result<()> {
-    let mut command = Command::new("cargo");
-    command
-        .env("RUSTFLAGS", "-C panic=abort")
-        .arg("zigbuild")
-        .arg("-p")
-        .arg("init")
-        .arg("--target")
-        .arg(target)
-        .arg("--release");
-    run_command(command)
-}
-
-fn build_guest_agent(target: &str) -> Result<()> {
-    let mut command = Command::new("cargo");
-    command
-        .arg("zigbuild")
-        .arg("-p")
-        .arg("agent")
-        .arg("--target")
-        .arg(target)
-        .arg("--release");
-    run_command(command)
 }
 
 fn pack_initramfs(args: PackInitramfsArgs) -> Result<()> {
@@ -499,16 +487,6 @@ fn workspace_root() -> Result<PathBuf> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or(XtaskError::MissingWorkspaceRoot { path: manifest_dir })
-}
-
-fn ensure_file(path: &Path) -> Result<()> {
-    if path.is_file() {
-        Ok(())
-    } else {
-        Err(XtaskError::MissingGuestBinary {
-            path: path.to_path_buf(),
-        })
-    }
 }
 
 fn copy_asset(source: &Path, destination: &Path) -> Result<()> {
@@ -702,6 +680,8 @@ mod tests {
             "1",
             "--notary-keychain-profile",
             "release",
+            "--notary-keychain",
+            "/tmp/release.keychain-db",
         ])
         .is_err());
         let args = Args::try_parse_from([
@@ -713,6 +693,8 @@ mod tests {
             "Developer ID Application: Silo",
             "--notary-keychain-profile",
             "release",
+            "--notary-keychain",
+            "/tmp/release.keychain-db",
         ])
         .expect("parse package-macos command");
         let Commands::PackageMacos(args) = args.command else {
@@ -724,13 +706,29 @@ mod tests {
             Some("Developer ID Application: Silo")
         );
         assert_eq!(args.notary_keychain_profile.as_deref(), Some("release"));
+        assert_eq!(
+            args.notary_keychain,
+            Some(std::path::PathBuf::from("/tmp/release.keychain-db"))
+        );
     }
 
     #[test]
-    fn package_homebrew_cask_has_no_untrusted_inputs() {
-        let args = Args::try_parse_from(["xtask", "package-homebrew-cask"])
-            .expect("parse package-homebrew-cask command");
-        assert!(matches!(args.command, Commands::PackageHomebrewCask));
+    fn package_homebrew_cask_requires_an_authenticated_download_path() {
+        assert!(Args::try_parse_from(["xtask", "package-homebrew-cask"]).is_err());
+        let args = Args::try_parse_from([
+            "xtask",
+            "package-homebrew-cask",
+            "--published-macos-dmg",
+            "/tmp/Silo.dmg",
+        ])
+        .expect("parse package-homebrew-cask command");
+        let Commands::PackageHomebrewCask(args) = args.command else {
+            panic!("expected package-homebrew-cask command");
+        };
+        assert_eq!(
+            args.published_macos_dmg,
+            std::path::PathBuf::from("/tmp/Silo.dmg")
+        );
     }
 
     #[test]

@@ -7,8 +7,6 @@ use rustix::process::{pidfd_open, PidfdFlags};
 
 use crate::vmmon::process::{errno_to_io, pid_exists, rustix_pid};
 
-const LEGACY_START_TIME_TOLERANCE_SECONDS: u64 = 2;
-
 #[derive(Debug)]
 pub(crate) struct ProcessIdentity {
     pid: i32,
@@ -75,14 +73,6 @@ impl ProcessIdentity {
         expected.is_none_or(|expected| self.started_at == expected)
     }
 
-    pub(crate) fn matches_legacy_started_at(&self, expected: Option<i64>) -> bool {
-        // Older releases persisted the pidfile mtime, which can trail the
-        // kernel process birth time by a second or two.
-        expected.is_none_or(|expected| {
-            self.started_at.abs_diff(expected) <= LEGACY_START_TIME_TOLERANCE_SECONDS
-        })
-    }
-
     pub(crate) fn is_alive(&self) -> io::Result<bool> {
         match self.pidfd.as_ref() {
             Some(pidfd) => Ok(!pidfd_has_exited(pidfd)?),
@@ -90,10 +80,6 @@ impl ProcessIdentity {
                 current.uid == self.uid && current.start_time == self.start_time
             })),
         }
-    }
-
-    pub(crate) fn owned_by_effective_user(&self) -> bool {
-        self.uid == nix::unistd::Uid::effective().as_raw()
     }
 }
 

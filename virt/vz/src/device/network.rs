@@ -64,6 +64,8 @@ fn open_local_unix_datagram_socket(
     backend: &str,
 ) -> Result<UnixDatagram, VzError> {
     let local_path = local_unix_datagram_path(peer_path, vm_id, backend);
+    utils::validate_unix_socket_path(peer_path)?;
+    utils::validate_unix_socket_path(&local_path)?;
     remove_file_if_exists(&local_path)?;
     let socket = UnixDatagram::bind(&local_path).map_err(VzError::from)?;
     socket.connect(peer_path).map_err(VzError::from)?;
@@ -110,9 +112,11 @@ fn remove_file_if_exists(path: &Path) -> Result<(), VzError> {
 
 #[cfg(test)]
 mod tests {
-    use super::local_unix_datagram_path;
-    use std::path::Path;
+    use super::{local_unix_datagram_path, open_local_unix_datagram_socket};
+    use std::path::{Path, PathBuf};
     use utils::format_mac;
+
+    use crate::VzError;
 
     #[test]
     fn local_unix_datagram_path_uses_vm_id_and_backend() {
@@ -140,5 +144,18 @@ mod tests {
             format_mac([0x02, 0xb2, 0xe4, 0x04, 0xd2, 0xcc]),
             "02:b2:e4:04:d2:cc"
         );
+    }
+
+    #[test]
+    fn unix_datagram_rejects_overlong_peer_before_binding() {
+        let peer = PathBuf::from(format!("/{}", "x".repeat(200)));
+
+        let error = open_local_unix_datagram_socket(&peer, "1234567890abcdef", "vz")
+            .expect_err("reject overlong peer");
+
+        assert!(matches!(
+            error,
+            VzError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
     }
 }

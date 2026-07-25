@@ -10,18 +10,19 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::release_target::{BuildProfile, ReleaseTarget};
+use crate::remove_path::remove_if_exists;
 
 const APP_IDENTIFIER: &str = "sh.silo.app";
 const APP_NAME: &str = "Silo.app";
 const FILE_MODE: u32 = 0o644;
 const EXECUTABLE_MODE: u32 = 0o755;
 const NOTARY_TIMEOUT: &str = "30m";
-
 #[derive(Debug)]
 pub(crate) struct PackageMacosOptions {
     pub(crate) build_number: String,
     pub(crate) signing_identity: Option<String>,
     pub(crate) notary_keychain_profile: Option<String>,
+    pub(crate) notary_keychain: Option<PathBuf>,
     pub(crate) target_dir: PathBuf,
     pub(crate) workspace_root: PathBuf,
 }
@@ -43,14 +44,12 @@ pub(crate) enum MacosPackageError {
     EmptyOption { field: &'static str },
     #[error("--notary-keychain-profile requires --signing-identity")]
     NotarizationRequiresIdentity,
-    #[error("macOS package output already exists; use a clean target directory: {path}")]
-    OutputExists { path: PathBuf },
+    #[error("--notary-keychain requires --notary-keychain-profile")]
+    NotaryKeychainRequiresProfile,
     #[error("required release input is missing or is not a regular file: {path}")]
     MissingInput { path: PathBuf },
     #[error("invalid release metadata at {path}: {reason}")]
     InvalidReleaseMetadata { path: PathBuf, reason: String },
-    #[error("macOS packaging requires a clean source worktree; found {status}")]
-    DirtyWorktree { status: String },
     #[error("release staging used source revision {expected}, but the workspace is at {actual}")]
     SourceRevisionMismatch { expected: String, actual: String },
     #[error("invalid app bundle at {path}: {reason}")]
@@ -63,8 +62,10 @@ pub(crate) enum MacosPackageError {
     },
     #[error("failed to run {command}")]
     RunCommand { command: String, source: io::Error },
-    #[error("command failed ({command}): {stderr}")]
-    CommandFailed { command: String, stderr: String },
+    #[error("command failed ({command}): {output}")]
+    CommandFailed { command: String, output: String },
+    #[error(transparent)]
+    Dmg(#[from] crate::dmg::DmgError),
     #[error("notarization of {path} was not accepted: {reason}")]
     NotarizationRejected { path: PathBuf, reason: String },
     #[error("failed to encode macOS package metadata: {0}")]
@@ -88,6 +89,11 @@ struct ValidatedComponent {
     source: PathBuf,
     digest: String,
     size: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct NotarizationSubmission {
+    id: String,
 }
 
 const COMPONENTS: [ComponentContract; 7] = [
@@ -208,9 +214,11 @@ pub(crate) fn package_macos(
         .join("silo-artifacts")
         .join(descriptor.name)
         .join("macos");
-    if fs::symlink_metadata(&output).is_ok() {
-        return Err(MacosPackageError::OutputExists { path: output });
-    }
+    remove_if_exists(&output).map_err(|source| MacosPackageError::Io {
+        operation: "remove previous macOS package output",
+        path: output.clone(),
+        source,
+    })?;
     let parent = output
         .parent()
         .ok_or_else(|| MacosPackageError::InvalidBundle {
@@ -225,30 +233,61 @@ pub(crate) fn package_macos(
     assemble_app(options, &app)?;
     sign_app(options, &app)?;
 
-    if let Some(profile) = &options.notary_keychain_profile {
+    let app_notarization = if let Some(profile) = &options.notary_keychain_profile {
         let archive = temporary.path.join("Silo.app.zip");
         create_notary_archive(&app, &archive)?;
-        notarize(&archive, profile)?;
+        let submission = notarize(
+            &archive,
+            profile,
+            options.notary_keychain.as_deref(),
+            &temporary.path.join("app-notarization.json"),
+        )?;
         staple_and_validate(&app)?;
         verify_app_signature(&app)?;
-    }
+        Some(submission)
+    } else {
+        None
+    };
 
     let dmg_name = format!("Silo-{}-{}.dmg", env!("CARGO_PKG_VERSION"), descriptor.name);
     let dmg = package.join(&dmg_name);
-    create_dmg(&temporary.path, &app, &dmg)?;
+    create_dmg(options, &temporary.path, &app, &dmg)?;
     if let Some(identity) = &options.signing_identity {
         run(codesign_dmg_command(identity, &dmg))?;
         verify_dmg_signature(&dmg)?;
+        verify_dmg_image(&dmg)?;
     }
-    if let Some(profile) = &options.notary_keychain_profile {
-        notarize(&dmg, profile)?;
+    let dmg_notarization = if let Some(profile) = &options.notary_keychain_profile {
+        let submission = notarize(
+            &dmg,
+            profile,
+            options.notary_keychain.as_deref(),
+            &temporary.path.join("dmg-notarization.json"),
+        )?;
         staple_and_validate(&dmg)?;
+        verify_dmg_signature(&dmg)?;
+        verify_dmg_image(&dmg)?;
+        validate_dmg_contents(&temporary.path, &dmg, true)?;
         assess_distribution(&app, &dmg)?;
-    }
+        Some(submission)
+    } else {
+        None
+    };
 
     let metadata = package.join("macos.json");
-    write_metadata(options, &metadata, &dmg_name, &dmg)?;
-    publish_noreplace(&package, &output)?;
+    write_metadata(
+        options,
+        &metadata,
+        &dmg_name,
+        &dmg,
+        app_notarization.as_ref(),
+        dmg_notarization.as_ref(),
+    )?;
+    fs::rename(&package, &output).map_err(|source| MacosPackageError::Io {
+        operation: "publish macOS package",
+        path: output.clone(),
+        source,
+    })?;
 
     Ok(PackageMacosResult {
         app: output.join(APP_NAME),
@@ -295,8 +334,20 @@ fn validate_options(options: &PackageMacosOptions) -> Result<(), MacosPackageErr
             field: "--notary-keychain-profile",
         });
     }
+    if options
+        .notary_keychain
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(MacosPackageError::EmptyOption {
+            field: "--notary-keychain",
+        });
+    }
     if options.notary_keychain_profile.is_some() && options.signing_identity.is_none() {
         return Err(MacosPackageError::NotarizationRequiresIdentity);
+    }
+    if options.notary_keychain.is_some() && options.notary_keychain_profile.is_none() {
+        return Err(MacosPackageError::NotaryKeychainRequiresProfile);
     }
     Ok(())
 }
@@ -339,10 +390,6 @@ fn validate_source_identity(options: &PackageMacosOptions) -> Result<(), MacosPa
         );
     }
 
-    let status = git_output(&options.workspace_root, ["status", "--porcelain=v1"])?;
-    if !status.is_empty() {
-        return Err(MacosPackageError::DirtyWorktree { status });
-    }
     let actual = git_output(&options.workspace_root, ["rev-parse", "HEAD"])?;
     if actual != expected {
         return Err(MacosPackageError::SourceRevisionMismatch {
@@ -389,6 +436,9 @@ fn assemble_app(options: &PackageMacosOptions, app: &Path) -> Result<(), MacosPa
         &resources.join("THIRD_PARTY_NOTICES.txt"),
         FILE_MODE,
     )?;
+    let icon = options.workspace_root.join("packaging/macos/Silo.icns");
+    validate_icns(&icon)?;
+    copy_file(&icon, &resources.join("Silo.icns"), FILE_MODE)?;
     let info = contents.join("Info.plist");
     fs::write(
         &info,
@@ -587,6 +637,8 @@ fn info_plist(build_number: &str, minimum_version: &str) -> String {
             "    <string>silo</string>\n",
             "    <key>CFBundleIdentifier</key>\n",
             "    <string>{app_identifier}</string>\n",
+            "    <key>CFBundleIconFile</key>\n",
+            "    <string>Silo.icns</string>\n",
             "    <key>CFBundleInfoDictionaryVersion</key>\n",
             "    <string>6.0</string>\n",
             "    <key>CFBundleName</key>\n",
@@ -620,6 +672,7 @@ fn validate_unsigned_app(app: &Path) -> Result<(), MacosPackageError> {
         ("Contents/Resources/assets/initramfs", FILE_MODE),
         ("Contents/Resources/assets/agent", EXECUTABLE_MODE),
         ("Contents/Resources/THIRD_PARTY_NOTICES.txt", FILE_MODE),
+        ("Contents/Resources/Silo.icns", FILE_MODE),
     ];
     let mut actual = collect_files(app)?;
     actual.sort();
@@ -716,6 +769,9 @@ fn sign_app(options: &PackageMacosOptions, app: &Path) -> Result<(), MacosPackag
             Some(options.workspace_root.join("virt/krun/krun.entitlements")),
         ),
     ] {
+        if let Some(entitlements) = entitlements.as_deref() {
+            validate_entitlements(entitlements)?;
+        }
         run(codesign_command(
             identity,
             identifier,
@@ -763,9 +819,27 @@ fn codesign_dmg_command(identity: &str, dmg: &Path) -> Command {
     command
         .args(["--force", "--sign"])
         .arg(identity)
-        .arg("--timestamp")
+        .args(["--options", "runtime", "--timestamp"])
         .arg(dmg);
     command
+}
+
+fn validate_entitlements(path: &Path) -> Result<(), MacosPackageError> {
+    require_regular_file(path)?;
+    let contents = fs::read(path).map_err(|source| MacosPackageError::Io {
+        operation: "read entitlement file",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if contents.starts_with(&[0xef, 0xbb, 0xbf]) || !contents.is_ascii() {
+        return Err(MacosPackageError::InvalidBundle {
+            path: path.to_path_buf(),
+            reason: "entitlements must be ASCII XML without a byte-order mark".to_string(),
+        });
+    }
+    let mut command = Command::new("/usr/bin/plutil");
+    command.args(["-lint", "--"]).arg(path);
+    run(command)
 }
 
 fn verify_app_signature(app: &Path) -> Result<(), MacosPackageError> {
@@ -793,121 +867,267 @@ fn create_notary_archive(app: &Path, archive: &Path) -> Result<(), MacosPackageE
     run(command)
 }
 
-fn notarize(path: &Path, profile: &str) -> Result<(), MacosPackageError> {
+fn notarize(
+    path: &Path,
+    profile: &str,
+    keychain: Option<&Path>,
+    log_path: &Path,
+) -> Result<NotarizationSubmission, MacosPackageError> {
+    let output = run_capture(notary_submit_command(path, profile, keychain))?;
+    let submission = parse_notary_submission(path, &output.stdout)?;
+    eprintln!(
+        "notarytool submission for {}: {}",
+        path.display(),
+        submission.id
+    );
+
+    let (wait_command, wait_output) =
+        capture_command(notary_wait_command(&submission.id, profile, keychain))?;
+    run(notary_log_command(
+        &submission.id,
+        profile,
+        keychain,
+        log_path,
+    ))?;
+    let log = read_notary_log(path, log_path)?;
+    report_notary_log(path, &log);
+
+    if !wait_output.status.success() {
+        return Err(MacosPackageError::NotarizationRejected {
+            path: path.to_path_buf(),
+            reason: format!(
+                "{wait_command} failed: {}; log: {log}",
+                String::from_utf8_lossy(&wait_output.stderr).trim()
+            ),
+        });
+    }
+    parse_notary_wait(path, &wait_output.stdout, &log)?;
+    Ok(submission)
+}
+
+fn notary_submit_command(path: &Path, profile: &str, keychain: Option<&Path>) -> Command {
     let mut command = Command::new("xcrun");
+    command.args(["notarytool", "submit"]).arg(path);
+    append_notary_authentication(&mut command, profile, keychain);
+    command.args(["--output-format", "json"]);
     command
-        .args([
-            "notarytool",
-            "submit",
-            "--keychain-profile",
-            profile,
-            "--wait",
-            "--timeout",
-            NOTARY_TIMEOUT,
-            "--output-format",
-            "json",
-        ])
-        .arg(path);
-    let output = run_capture(command)?;
-    let response: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+}
+
+fn notary_wait_command(submission_id: &str, profile: &str, keychain: Option<&Path>) -> Command {
+    let mut command = Command::new("xcrun");
+    command.args(["notarytool", "wait", submission_id]);
+    append_notary_authentication(&mut command, profile, keychain);
+    command.args(["--timeout", NOTARY_TIMEOUT, "--output-format", "json"]);
+    command
+}
+
+fn notary_log_command(
+    submission_id: &str,
+    profile: &str,
+    keychain: Option<&Path>,
+    output: &Path,
+) -> Command {
+    let mut command = Command::new("xcrun");
+    command.args(["notarytool", "log", submission_id]);
+    append_notary_authentication(&mut command, profile, keychain);
+    command.arg(output);
+    command
+}
+
+fn append_notary_authentication(command: &mut Command, profile: &str, keychain: Option<&Path>) {
+    command.args(["--keychain-profile", profile]);
+    if let Some(keychain) = keychain {
+        command.arg("--keychain").arg(keychain);
+    }
+}
+
+fn parse_notary_submission(
+    path: &Path,
+    response: &[u8],
+) -> Result<NotarizationSubmission, MacosPackageError> {
+    let response: Value = serde_json::from_slice(response).map_err(|error| {
         MacosPackageError::NotarizationRejected {
             path: path.to_path_buf(),
-            reason: format!("invalid notarytool response: {error}"),
+            reason: format!("invalid notarytool submit response: {error}"),
         }
     })?;
-    let status = response.get("status").and_then(Value::as_str);
-    if status == Some("Accepted") {
+    let id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| is_uuid(id))
+        .ok_or_else(|| MacosPackageError::NotarizationRejected {
+            path: path.to_path_buf(),
+            reason: format!("notarytool submit returned no valid submission UUID: {response}"),
+        })?;
+    Ok(NotarizationSubmission { id: id.to_string() })
+}
+
+fn parse_notary_wait(path: &Path, response: &[u8], log: &Value) -> Result<(), MacosPackageError> {
+    let response: Value = serde_json::from_slice(response).map_err(|error| {
+        MacosPackageError::NotarizationRejected {
+            path: path.to_path_buf(),
+            reason: format!("invalid notarytool wait response: {error}; log: {log}"),
+        }
+    })?;
+    if response.get("status").and_then(Value::as_str) == Some("Accepted") {
         return Ok(());
     }
     Err(MacosPackageError::NotarizationRejected {
         path: path.to_path_buf(),
-        reason: response.to_string(),
+        reason: format!("notarytool wait returned {response}; log: {log}"),
     })
 }
 
-fn staple_and_validate(path: &Path) -> Result<(), MacosPackageError> {
-    for action in ["staple", "validate"] {
-        let mut command = Command::new("xcrun");
-        command.args(["stapler", action, "-v"]).arg(path);
-        run(command)?;
-    }
-    Ok(())
+fn read_notary_log(path: &Path, log_path: &Path) -> Result<Value, MacosPackageError> {
+    let bytes = fs::read(log_path).map_err(|source| MacosPackageError::Io {
+        operation: "read notarytool log",
+        path: log_path.to_path_buf(),
+        source,
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| MacosPackageError::NotarizationRejected {
+        path: path.to_path_buf(),
+        reason: format!("invalid notarytool log: {error}"),
+    })
 }
 
-fn create_dmg(root: &Path, app: &Path, dmg: &Path) -> Result<(), MacosPackageError> {
-    let payload = root.join("dmg-root");
-    create_directory(&payload)?;
-    copy_tree(app, &payload.join(APP_NAME))?;
-    let volume_name = format!("Silo {}", env!("CARGO_PKG_VERSION"));
-    let mut command = Command::new("/usr/bin/hdiutil");
-    command
-        .args([
-            "create",
-            "-quiet",
-            "-nospotlight",
-            "-fs",
-            "HFS+",
-            "-format",
-            "UDZO",
-            "-volname",
-        ])
-        .arg(volume_name)
-        .arg("-srcfolder")
-        .arg(&payload)
-        .arg(dmg);
-    run(command)?;
-    let mut verify = Command::new("/usr/bin/hdiutil");
-    verify.args(["verify", "-quiet"]).arg(dmg);
-    run(verify)?;
+fn report_notary_log(path: &Path, log: &Value) {
+    for field in ["issues", "warnings"] {
+        let Some(entries) = log.get(field).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            eprintln!("notarytool {field} for {}: {entry}", path.display());
+        }
+    }
+}
 
-    let mounted = MountedDmg::attach(dmg, root.join("dmg-mount"))?;
-    verify_app_signature(&mounted.mount_point.join(APP_NAME))?;
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn staple_and_validate(path: &Path) -> Result<(), MacosPackageError> {
+    let mut command = Command::new("xcrun");
+    command.args(["stapler", "staple", "-v"]).arg(path);
+    run(command)?;
+    validate_staple(path)
+}
+
+fn validate_staple(path: &Path) -> Result<(), MacosPackageError> {
+    let mut command = Command::new("xcrun");
+    command.args(["stapler", "validate", "-v"]).arg(path);
+    run(command)
+}
+
+fn create_dmg(
+    options: &PackageMacosOptions,
+    root: &Path,
+    app: &Path,
+    dmg: &Path,
+) -> Result<(), MacosPackageError> {
+    let volume_icon = options.workspace_root.join("packaging/macos/Silo.icns");
+    let finder_layout = options.workspace_root.join("packaging/macos/Silo.DS_Store");
+    require_regular_file(&volume_icon)?;
+    require_regular_file(&finder_layout)?;
+    let volume_name = format!("Silo {}", env!("CARGO_PKG_VERSION"));
+    crate::dmg::create(crate::dmg::DmgSpec {
+        root,
+        app,
+        volume_icon: &volume_icon,
+        finder_layout: &finder_layout,
+        volume_name: &volume_name,
+        output: dmg,
+    })?;
+    verify_dmg_image(dmg)?;
+    validate_dmg_contents(root, dmg, false)
+}
+
+fn validate_dmg_contents(
+    root: &Path,
+    dmg: &Path,
+    require_stapled_app: bool,
+) -> Result<(), MacosPackageError> {
+    let mounted = MountedDmg::attach(dmg, root.join(nonce("dmg-mount")))?;
+    validate_mounted_dmg_root(&mounted.mount_point)?;
+    let app = mounted.mount_point.join(APP_NAME);
+    verify_app_signature(&app)?;
+    if require_stapled_app {
+        validate_staple(&app)?;
+    }
     mounted.detach()
 }
 
-fn copy_tree(source: &Path, destination: &Path) -> Result<(), MacosPackageError> {
-    create_directory(destination)?;
-    let entries = fs::read_dir(source).map_err(|source_error| MacosPackageError::Io {
-        operation: "read app for DMG assembly",
-        path: source.to_path_buf(),
-        source: source_error,
+fn verify_dmg_image(dmg: &Path) -> Result<(), MacosPackageError> {
+    let mut command = Command::new("/usr/bin/hdiutil");
+    command.args(["verify", "-quiet"]).arg(dmg);
+    run(command)
+}
+
+fn validate_mounted_dmg_root(root: &Path) -> Result<(), MacosPackageError> {
+    let entries = fs::read_dir(root).map_err(|source| MacosPackageError::Io {
+        operation: "read mounted disk image root",
+        path: root.to_path_buf(),
+        source,
     })?;
+    let mut found_app = false;
+    let mut found_applications = false;
     for entry in entries {
-        let entry = entry.map_err(|source_error| MacosPackageError::Io {
-            operation: "read app entry for DMG assembly",
-            path: source.to_path_buf(),
-            source: source_error,
+        let entry = entry.map_err(|source| MacosPackageError::Io {
+            operation: "read mounted disk image entry",
+            path: root.to_path_buf(),
+            source,
         })?;
-        let from = entry.path();
-        let to = destination.join(entry.file_name());
-        let metadata =
-            fs::symlink_metadata(&from).map_err(|source_error| MacosPackageError::Io {
-                operation: "inspect app entry for DMG assembly",
-                path: from.clone(),
-                source: source_error,
-            })?;
-        if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
-            return Err(MacosPackageError::InvalidBundle {
-                path: from,
-                reason: "symlinks and special files are not allowed".to_string(),
-            });
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
         }
-        if metadata.is_dir() {
-            copy_tree(&from, &to)?;
-        } else {
-            fs::copy(&from, &to).map_err(|source_error| MacosPackageError::Io {
-                operation: "copy app entry into DMG payload",
-                path: to.clone(),
-                source: source_error,
-            })?;
-            fs::set_permissions(&to, metadata.permissions()).map_err(|source_error| {
-                MacosPackageError::Io {
-                    operation: "preserve app entry mode in DMG payload",
-                    path: to,
-                    source: source_error,
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|source| MacosPackageError::Io {
+            operation: "inspect mounted disk image entry",
+            path: path.clone(),
+            source,
+        })?;
+        match name.to_str() {
+            Some(APP_NAME) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                found_app = true;
+            }
+            Some("Applications") if metadata.file_type().is_symlink() => {
+                let target = fs::read_link(&path).map_err(|source| MacosPackageError::Io {
+                    operation: "read Applications link from disk image",
+                    path: path.clone(),
+                    source,
+                })?;
+                if target != Path::new("/Applications") {
+                    return Err(MacosPackageError::InvalidBundle {
+                        path,
+                        reason: format!(
+                            "Applications link must target /Applications, found {}",
+                            target.display()
+                        ),
+                    });
                 }
-            })?;
+                found_applications = true;
+            }
+            _ => {
+                return Err(MacosPackageError::InvalidBundle {
+                    path,
+                    reason: "unexpected visible disk image root item".to_string(),
+                });
+            }
         }
+    }
+    if !found_app || !found_applications {
+        return Err(MacosPackageError::InvalidBundle {
+            path: root.to_path_buf(),
+            reason: "disk image must contain Silo.app and Applications -> /Applications"
+                .to_string(),
+        });
     }
     Ok(())
 }
@@ -937,6 +1157,8 @@ fn write_metadata(
     path: &Path,
     dmg_name: &str,
     dmg: &Path,
+    app_notarization: Option<&NotarizationSubmission>,
+    dmg_notarization: Option<&NotarizationSubmission>,
 ) -> Result<(), MacosPackageError> {
     let dmg_metadata = fs::metadata(dmg).map_err(|source| MacosPackageError::Io {
         operation: "inspect packaged DMG",
@@ -944,7 +1166,7 @@ fn write_metadata(
         source,
     })?;
     let signing = options.signing_identity.as_deref().unwrap_or("ad-hoc");
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "schemaVersion": 1,
         "version": env!("CARGO_PKG_VERSION"),
         "target": ReleaseTarget::DarwinArm64.descriptor().name,
@@ -962,6 +1184,31 @@ fn write_metadata(
         "signing": signing,
         "notarized": options.notary_keychain_profile.is_some(),
     });
+    match (app_notarization, dmg_notarization) {
+        (Some(app), Some(dmg)) => {
+            let object = value
+                .as_object_mut()
+                .ok_or_else(|| MacosPackageError::InvalidBundle {
+                    path: path.to_path_buf(),
+                    reason: "macOS metadata root must be an object".to_string(),
+                })?;
+            object.insert(
+                "notarization".to_string(),
+                serde_json::json!({
+                    "appSubmissionId": app.id,
+                    "dmgSubmissionId": dmg.id,
+                }),
+            );
+        }
+        (None, None) => {}
+        _ => {
+            return Err(MacosPackageError::InvalidBundle {
+                path: dmg.to_path_buf(),
+                reason: "app and disk image notarization receipts must be recorded together"
+                    .to_string(),
+            });
+        }
+    }
     let mut bytes = serde_json::to_vec_pretty(&value)?;
     bytes.push(b'\n');
     fs::write(path, bytes).map_err(|source| MacosPackageError::Io {
@@ -1005,6 +1252,32 @@ fn copy_file(source: &Path, destination: &Path, mode: u32) -> Result<(), MacosPa
     set_mode(destination, mode)
 }
 
+fn validate_icns(path: &Path) -> Result<(), MacosPackageError> {
+    let metadata = require_regular_file(path)?;
+    let mut file = File::open(path).map_err(|source| MacosPackageError::Io {
+        operation: "open macOS icon",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut header = [0_u8; 8];
+    file.read_exact(&mut header)
+        .map_err(|source| MacosPackageError::Io {
+            operation: "read macOS icon header",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let recorded_size = u64::from(u32::from_be_bytes([
+        header[4], header[5], header[6], header[7],
+    ]));
+    if &header[..4] != b"icns" || recorded_size != metadata.len() {
+        return Err(MacosPackageError::InvalidBundle {
+            path: path.to_path_buf(),
+            reason: "icon must be an ICNS file with a valid length header".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn require_regular_file(path: &Path) -> Result<fs::Metadata, MacosPackageError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| MacosPackageError::MissingInput {
         path: path.to_path_buf(),
@@ -1036,55 +1309,34 @@ fn create_directory(path: &Path) -> Result<(), MacosPackageError> {
     })
 }
 
-#[cfg(target_os = "macos")]
-fn publish_noreplace(temporary: &Path, destination: &Path) -> Result<(), MacosPackageError> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    const RENAME_EXCL: u32 = 0x0000_0004;
-
-    // nix has no wrapper for renamex_np, Apple's atomic no-replace rename.
-    unsafe extern "C" {
-        fn renamex_np(
-            from: *const std::ffi::c_char,
-            to: *const std::ffi::c_char,
-            flags: u32,
-        ) -> std::ffi::c_int;
-    }
-
-    let from = CString::new(temporary.as_os_str().as_bytes()).map_err(|error| {
-        MacosPackageError::InvalidBundle {
-            path: temporary.to_path_buf(),
-            reason: error.to_string(),
-        }
-    })?;
-    let to = CString::new(destination.as_os_str().as_bytes()).map_err(|error| {
-        MacosPackageError::InvalidBundle {
-            path: destination.to_path_buf(),
-            reason: error.to_string(),
-        }
-    })?;
-    let result = unsafe { renamex_np(from.as_ptr(), to.as_ptr(), RENAME_EXCL) };
-    if result == 0 {
-        return Ok(());
-    }
-    Err(MacosPackageError::Io {
-        operation: "publish macOS package without replacing existing output",
-        path: destination.to_path_buf(),
-        source: io::Error::last_os_error(),
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-fn publish_noreplace(_temporary: &Path, _destination: &Path) -> Result<(), MacosPackageError> {
-    Err(MacosPackageError::UnsupportedHost)
-}
-
 fn run(command: Command) -> Result<(), MacosPackageError> {
     run_capture(command).map(|_| ())
 }
 
-fn run_capture(mut command: Command) -> Result<Output, MacosPackageError> {
+fn run_capture(command: Command) -> Result<Output, MacosPackageError> {
+    let (rendered, output) = capture_command(command)?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(MacosPackageError::CommandFailed {
+            command: rendered,
+            output: command_output(&output.stdout, &output.stderr),
+        })
+    }
+}
+
+fn command_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    match (stdout.trim(), stderr.trim()) {
+        ("", "") => "no command output".to_string(),
+        (stdout, "") => stdout.to_string(),
+        ("", stderr) => stderr.to_string(),
+        (stdout, stderr) => format!("stdout: {stdout}; stderr: {stderr}"),
+    }
+}
+
+fn capture_command(mut command: Command) -> Result<(String, Output), MacosPackageError> {
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -1092,14 +1344,7 @@ fn run_capture(mut command: Command) -> Result<Output, MacosPackageError> {
             command: rendered.clone(),
             source,
         })?;
-    if output.status.success() {
-        Ok(output)
-    } else {
-        Err(MacosPackageError::CommandFailed {
-            command: rendered,
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        })
-    }
+    Ok((rendered, output))
 }
 
 fn nonce(kind: &str) -> String {
@@ -1115,8 +1360,11 @@ mod tests {
     use std::path::Path;
 
     use crate::macos_package::{
-        assemble_app, codesign_command, info_plist, package_macos, validate_options,
-        validate_source_identity, validate_unsigned_app, PackageMacosOptions, COMPONENTS,
+        assemble_app, codesign_command, codesign_dmg_command, command_output, info_plist,
+        notary_log_command, notary_submit_command, notary_wait_command, parse_notary_submission,
+        parse_notary_wait, validate_icns, validate_mounted_dmg_root, validate_options,
+        validate_unsigned_app, write_metadata, NotarizationSubmission, PackageMacosOptions,
+        COMPONENTS,
     };
 
     fn options(root: &Path, build_number: &str) -> PackageMacosOptions {
@@ -1124,6 +1372,7 @@ mod tests {
             build_number: build_number.to_string(),
             signing_identity: None,
             notary_keychain_profile: None,
+            notary_keychain: None,
             target_dir: root.join("target"),
             workspace_root: root.join("workspace"),
         }
@@ -1149,6 +1398,8 @@ mod tests {
         assert!(plist.contains("<string>0.1.0</string>"));
         assert!(plist.contains("<string>42.7</string>"));
         assert!(plist.contains("<string>26.0</string>"));
+        assert!(plist.contains("<key>CFBundleIconFile</key>"));
+        assert!(app.join("Contents/Resources/Silo.icns").is_file());
     }
 
     #[test]
@@ -1162,6 +1413,16 @@ mod tests {
         let mut notary_without_identity = options(root, "1");
         notary_without_identity.notary_keychain_profile = Some("release".to_string());
         assert!(validate_options(&notary_without_identity).is_err());
+
+        let mut keychain_without_profile = options(root, "1");
+        keychain_without_profile.notary_keychain = Some("release.keychain-db".into());
+        assert!(validate_options(&keychain_without_profile).is_err());
+
+        let mut production = options(root, "1");
+        production.signing_identity = Some("Developer ID Application: Silo".to_string());
+        production.notary_keychain_profile = Some("release".to_string());
+        production.notary_keychain = Some("release.keychain-db".into());
+        assert!(validate_options(&production).is_ok());
     }
 
     #[test]
@@ -1182,6 +1443,185 @@ mod tests {
         assert!(args.contains(&"--timestamp".to_string()));
         assert!(args.contains(&"--entitlements".to_string()));
         assert!(!args.contains(&"--deep".to_string()));
+
+        let dmg_command =
+            codesign_dmg_command("Developer ID Application: Silo", Path::new("Silo.dmg"));
+        let dmg_args = command_args(&dmg_command);
+        assert!(dmg_args
+            .windows(2)
+            .any(|args| args == ["--options", "runtime"]));
+        assert!(dmg_args.contains(&"--timestamp".to_string()));
+        assert!(!dmg_args.contains(&"--deep".to_string()));
+    }
+
+    #[test]
+    fn command_failures_include_stdout_and_stderr() {
+        assert_eq!(
+            command_output(b"create-dmg log", b"hdiutil error"),
+            "stdout: create-dmg log; stderr: hdiutil error"
+        );
+        assert_eq!(command_output(b"", b""), "no command output");
+    }
+
+    #[test]
+    fn notary_commands_reuse_the_explicit_profile_and_keychain() {
+        let keychain = Path::new("/tmp/release.keychain-db");
+        let submit = notary_submit_command(Path::new("Silo.app.zip"), "silo-ci", Some(keychain));
+        let submit_args = command_args(&submit);
+        assert_eq!(
+            submit_args,
+            [
+                "notarytool",
+                "submit",
+                "Silo.app.zip",
+                "--keychain-profile",
+                "silo-ci",
+                "--keychain",
+                "/tmp/release.keychain-db",
+                "--output-format",
+                "json",
+            ]
+        );
+
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let wait = notary_wait_command(id, "silo-ci", Some(keychain));
+        let wait_args = command_args(&wait);
+        assert_eq!(
+            wait_args,
+            [
+                "notarytool",
+                "wait",
+                id,
+                "--keychain-profile",
+                "silo-ci",
+                "--keychain",
+                "/tmp/release.keychain-db",
+                "--timeout",
+                "30m",
+                "--output-format",
+                "json",
+            ]
+        );
+
+        let log = notary_log_command(id, "silo-ci", Some(keychain), Path::new("log.json"));
+        let log_args = command_args(&log);
+        assert_eq!(
+            log_args,
+            [
+                "notarytool",
+                "log",
+                id,
+                "--keychain-profile",
+                "silo-ci",
+                "--keychain",
+                "/tmp/release.keychain-db",
+                "log.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn notary_responses_require_a_uuid_and_accepted_status() {
+        let path = Path::new("Silo.dmg");
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let submission = parse_notary_submission(
+            path,
+            format!(r#"{{"id":"{id}","status":"In Progress"}}"#).as_bytes(),
+        )
+        .expect("parse submission");
+        assert_eq!(submission.id, id);
+        assert!(parse_notary_submission(path, br#"{"status":"In Progress"}"#).is_err());
+        assert!(parse_notary_submission(path, b"not JSON").is_err());
+
+        let log = serde_json::json!({"issues": []});
+        parse_notary_wait(path, br#"{"status":"Accepted"}"#, &log).expect("accepted notarization");
+        assert!(parse_notary_wait(path, br#"{"status":"Invalid"}"#, &log).is_err());
+        assert!(parse_notary_wait(path, b"not JSON", &log).is_err());
+    }
+
+    #[test]
+    fn mounted_image_requires_the_app_and_applications_link() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let root = temp.path();
+        std::fs::create_dir(root.join("Silo.app")).expect("create app directory");
+        std::os::unix::fs::symlink("/Applications", root.join("Applications"))
+            .expect("create Applications link");
+        std::fs::write(root.join(".DS_Store"), b"hidden").expect("write hidden metadata");
+        validate_mounted_dmg_root(root).expect("validate image root");
+
+        std::fs::remove_file(root.join("Applications")).expect("remove Applications link");
+        std::os::unix::fs::symlink("/tmp", root.join("Applications"))
+            .expect("create invalid Applications link");
+        assert!(validate_mounted_dmg_root(root).is_err());
+
+        std::fs::remove_file(root.join("Applications")).expect("remove invalid link");
+        std::os::unix::fs::symlink("/Applications", root.join("Applications"))
+            .expect("restore Applications link");
+        std::fs::write(root.join("README"), b"unexpected").expect("write unexpected item");
+        assert!(validate_mounted_dmg_root(root).is_err());
+    }
+
+    #[test]
+    fn metadata_records_both_notarization_submission_ids() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let mut production_options = options(temp.path(), "7");
+        production_options.signing_identity = Some("Developer ID Application: Silo".to_string());
+        production_options.notary_keychain_profile = Some("release".to_string());
+        let dmg_name = "Silo-0.1.0-darwin-arm64.dmg";
+        let dmg = temp.path().join(dmg_name);
+        std::fs::write(&dmg, b"dmg").expect("write DMG");
+        let metadata = temp.path().join("macos.json");
+        let app = NotarizationSubmission {
+            id: "12345678-1234-1234-1234-123456789abc".to_string(),
+        };
+        let image = NotarizationSubmission {
+            id: "abcdefab-1234-1234-1234-123456789abc".to_string(),
+        };
+
+        write_metadata(
+            &production_options,
+            &metadata,
+            dmg_name,
+            &dmg,
+            Some(&app),
+            Some(&image),
+        )
+        .expect("write metadata");
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(metadata).expect("read metadata"))
+                .expect("parse metadata");
+        assert_eq!(
+            value
+                .pointer("/notarization/appSubmissionId")
+                .and_then(serde_json::Value::as_str),
+            Some(app.id.as_str())
+        );
+        assert_eq!(
+            value
+                .pointer("/notarization/dmgSubmissionId")
+                .and_then(serde_json::Value::as_str),
+            Some(image.id.as_str())
+        );
+
+        let ad_hoc_options = options(temp.path(), "8");
+        let ad_hoc_metadata = temp.path().join("macos-ad-hoc.json");
+        write_metadata(
+            &ad_hoc_options,
+            &ad_hoc_metadata,
+            dmg_name,
+            &dmg,
+            None,
+            None,
+        )
+        .expect("write ad-hoc metadata");
+        let ad_hoc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(ad_hoc_metadata).expect("read ad-hoc metadata"))
+                .expect("parse ad-hoc metadata");
+        assert_eq!(
+            ad_hoc.get("notarized"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert!(ad_hoc.get("notarization").is_none());
     }
 
     #[test]
@@ -1229,58 +1669,12 @@ mod tests {
     }
 
     #[test]
-    fn source_identity_requires_the_staged_clean_revision() {
-        let temp = tempfile::tempdir().expect("create temp directory");
-        let options = options(temp.path(), "1");
-        populate_release(&options);
-        let revision = initialize_git_workspace(&options.workspace_root);
-        write_release_metadata(&options, &revision);
-        validate_source_identity(&options).expect("matching clean source identity");
-
-        std::fs::write(options.workspace_root.join("dirty"), b"dirty")
-            .expect("dirty fixture workspace");
-        assert!(validate_source_identity(&options).is_err());
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn native_tools_accept_the_ad_hoc_signed_app_and_dmg() {
-        let temp = tempfile::tempdir().expect("create temp directory");
-        let options = options(temp.path(), "1");
-        populate_release(&options);
-        for path in [
-            options
-                .target_dir
-                .join("silo-release/darwin-arm64/release/bin/silo"),
-            options
-                .target_dir
-                .join("silo-runtime/darwin-arm64/release/bin/vmmon"),
-            options
-                .target_dir
-                .join("silo-runtime/darwin-arm64/release/bin/netd"),
-            options
-                .target_dir
-                .join("silo-runtime/darwin-arm64/release/bin/krun"),
-        ] {
-            std::fs::copy("/usr/bin/true", &path).expect("copy signable Mach-O fixture");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("set Mach-O fixture mode");
-        }
-        let revision = initialize_git_workspace(&options.workspace_root);
-        write_release_metadata(&options, &revision);
-        let packaged = package_macos(&options).expect("package macOS distribution");
-        assert!(packaged.app.is_dir());
-        assert!(packaged.dmg.is_file());
-        assert!(packaged.metadata.is_file());
-
-        assert_entitlement(
-            &packaged.app.join("Contents/Helpers/vmmon"),
-            "com.apple.security.virtualization",
-        );
-        assert_entitlement(
-            &packaged.app.join("Contents/Helpers/krun"),
-            "com.apple.security.hypervisor",
-        );
+    fn committed_icon_has_a_valid_icns_header() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        validate_icns(&repository.join("packaging/macos/Silo.icns"))
+            .expect("validate committed icon");
     }
 
     fn populate_release(options: &PackageMacosOptions) {
@@ -1307,6 +1701,11 @@ mod tests {
                 .workspace_root
                 .join("packaging/THIRD_PARTY_NOTICES.txt"),
             b"notices\n",
+            0o644,
+        );
+        write_fixture(
+            &options.workspace_root.join("packaging/macos/Silo.icns"),
+            b"icns\0\0\0\x08",
             0o644,
         );
         write_fixture(
@@ -1370,40 +1769,10 @@ mod tests {
         .expect("write release metadata");
     }
 
-    fn initialize_git_workspace(workspace: &Path) -> String {
-        let run = |arguments: &[&str]| {
-            let mut command = std::process::Command::new("git");
-            command
-                .current_dir(workspace)
-                .args(arguments)
-                .env("GIT_AUTHOR_NAME", "Silo Test")
-                .env("GIT_AUTHOR_EMAIL", "test@silo.invalid")
-                .env("GIT_COMMITTER_NAME", "Silo Test")
-                .env("GIT_COMMITTER_EMAIL", "test@silo.invalid");
-            let output = command.output().expect("run fixture git command");
-            assert!(
-                output.status.success(),
-                "git {arguments:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        };
-        run(&["init", "--quiet"]);
-        run(&["add", "."]);
-        run(&["commit", "--quiet", "-m", "fixture"]);
-        run(&["rev-parse", "HEAD"])
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn assert_entitlement(path: &Path, entitlement: &str) {
-        let output = std::process::Command::new("/usr/bin/codesign")
-            .args(["--display", "--entitlements", ":-"])
-            .arg(path)
-            .output()
-            .expect("display signed entitlements");
-        assert!(output.status.success());
-        let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-        assert!(text.contains(entitlement), "missing {entitlement}: {text}");
+    fn command_args(command: &std::process::Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().to_string())
+            .collect()
     }
 }

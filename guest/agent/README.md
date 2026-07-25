@@ -118,16 +118,18 @@ path and guest API contract when managed readiness is enabled.
 
 ## Cross-Compilation
 
-The current repo-level helper is:
+The repo-level guest asset build is:
 
 ```bash
-make build-guest-agent
+make guest-assets
 ```
 
-That target builds the guest agent binary and copies it into Silo's runtime assets directory:
+That target builds the guest init and agent binaries, packages the initramfs,
+and copies the outputs into Silo's runtime assets directory:
 
 ```text
 target/resources/assets/agent
+target/resources/assets/initramfs
 ```
 
 The helper selects a statically linked musl target matching the host architecture:
@@ -140,7 +142,7 @@ Override `GUEST_TARGET` when intentionally cross-building for another architectu
 For example:
 
 ```bash
-make build-guest-agent GUEST_TARGET=x86_64-unknown-linux-musl
+make guest-assets GUEST_TARGET=x86_64-unknown-linux-musl
 ```
 
 ## Status

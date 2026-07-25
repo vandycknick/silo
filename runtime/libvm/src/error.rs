@@ -98,7 +98,7 @@ pub enum LibVmError {
     BootAssetInvalid { asset: &'static str, path: PathBuf },
 
     #[error(
-        "invalid {component} from {origin} at {path}: {reason}; explicit component paths must be absolute regular files, portable roots must contain bin/{{vmmon,netd,krun}} and assets/{{kernel-default,initramfs,agent}}, and native installations must use the documented platform layout"
+        "invalid {component} from {origin} at {path}: {reason}; explicit component paths must be absolute regular files, development runtimes must contain sibling {{vmmon,netd,krun}} and assets/{{kernel-default,initramfs,agent}}, portable roots must contain bin/{{vmmon,netd,krun}} and assets/{{kernel-default,initramfs,agent}}, and native installations must use the documented platform layout"
     )]
     RuntimeComponentInvalid {
         component: &'static str,
@@ -108,7 +108,7 @@ pub enum LibVmError {
     },
 
     #[error(
-        "runtime component {component} was not found; checked {checked}; expected <runtime-root>/bin/{{vmmon,netd,krun}} and <runtime-root>/assets/{{kernel-default,initramfs,agent}}"
+        "runtime component {component} was not found; checked {checked}; expected sibling {{vmmon,netd,krun}} with assets/{{kernel-default,initramfs,agent}}, or <runtime-root>/bin/{{vmmon,netd,krun}} with <runtime-root>/assets/{{kernel-default,initramfs,agent}}"
     )]
     RuntimeComponentNotFound {
         component: &'static str,
@@ -156,17 +156,6 @@ pub enum LibVmError {
         field: &'static str,
         expected: String,
         actual: String,
-    },
-
-    #[error("cannot migrate runtime paths while {component} is active; stop it and retry")]
-    RuntimePathMigrationActive { component: String },
-
-    #[error(
-        "cannot migrate {source_path} to {destination_path}: destination contains different data"
-    )]
-    RuntimePathMigrationCollision {
-        source_path: PathBuf,
-        destination_path: PathBuf,
     },
 
     #[error(transparent)]

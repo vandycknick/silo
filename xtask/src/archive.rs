@@ -9,8 +9,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::kernel_oci::install_directory_noreplace;
 use crate::release_target::{BuildProfile, ReleaseTarget};
+use crate::remove_path::remove_if_exists;
 
 #[derive(Debug)]
 pub(crate) struct PackageArchivesOptions {
@@ -28,8 +28,6 @@ pub(crate) struct ArchiveResult {
 
 #[derive(Debug, Error)]
 pub(crate) enum ArchiveError {
-    #[error("archive output already exists: {path}")]
-    OutputExists { path: PathBuf },
     #[error("invalid archive input: {reason}")]
     Invalid { reason: String },
     #[error("failed to {operation} {path}")]
@@ -78,9 +76,8 @@ pub(crate) fn package_archives(
         .join("silo-artifacts")
         .join(descriptor.name)
         .join(version);
-    if fs::symlink_metadata(&output).is_ok() {
-        return Err(ArchiveError::OutputExists { path: output });
-    }
+    remove_if_exists(&output)
+        .map_err(|source| io_error("remove previous archive output", &output, source))?;
     let parent = output.parent().ok_or_else(|| ArchiveError::Invalid {
         reason: format!("{} has no parent", output.display()),
     })?;
@@ -129,9 +126,8 @@ pub(crate) fn package_archives(
             "archives": archives,
         }),
     )?;
-    install_directory_noreplace(&temporary.0, &output).map_err(|error| ArchiveError::Invalid {
-        reason: error.to_string(),
-    })?;
+    fs::rename(&temporary.0, &output)
+        .map_err(|source| io_error("publish archive output", &output, source))?;
     Ok(ArchiveResult {
         runtime: output.join(format!("{runtime_name}.tar.zst")),
         cli: output.join(format!("{cli_name}.tar.zst")),
@@ -202,7 +198,7 @@ fn verify_archive(
         reason: "zstd stdout is unavailable".to_string(),
     })?;
     let tar_status = Command::new("tar")
-        .args(["-xf", "-", "-C"])
+        .args(["--same-permissions", "-xf", "-", "-C"])
         .arg(&extraction)
         .stdin(Stdio::from(stdout))
         .status()
@@ -216,7 +212,10 @@ fn verify_archive(
     })?;
     require_success("tar extract", tar_status)?;
     require_success("zstd decompress", zstd_status)?;
-    validate_tree(&extraction.join(root), include_cli, true)
+    let validation = validate_tree(&extraction.join(root), include_cli, true);
+    fs::remove_dir_all(&extraction)
+        .map_err(|source| io_error("remove archive verification directory", &extraction, source))?;
+    validation
 }
 
 fn validate_tree(root: &Path, include_cli: bool, include_notice: bool) -> Result<(), ArchiveError> {
@@ -293,6 +292,8 @@ fn collect_files(
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), ArchiveError> {
     fs::create_dir_all(destination)
         .map_err(|error| io_error("create archive tree", destination, error))?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o755))
+        .map_err(|error| io_error("set archive directory mode", destination, error))?;
     for entry in
         fs::read_dir(source).map_err(|error| io_error("read runtime tree", source, error))?
     {
@@ -463,9 +464,14 @@ fn nonce() -> String {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     use crate::archive::{package_archives, validate_tree, PackageArchivesOptions};
     use crate::release_target::{BuildProfile, ReleaseTarget};
+
+    const UMASK_CHILD_TARGET: &str = "SILO_ARCHIVE_UMASK_CHILD_TARGET";
+    const UMASK_CHILD_WORKSPACE: &str = "SILO_ARCHIVE_UMASK_CHILD_WORKSPACE";
 
     #[test]
     fn archive_tree_rejects_unexpected_files() {
@@ -476,6 +482,33 @@ mod tests {
 
     #[test]
     fn portable_archives_are_reproducible_and_self_validating() {
+        if let Some(target) = std::env::var_os(UMASK_CHILD_TARGET) {
+            let workspace = std::env::var_os(UMASK_CHILD_WORKSPACE)
+                .map(PathBuf::from)
+                .expect("child workspace");
+            let target = PathBuf::from(target);
+            populate_release(&target);
+            let output = archive_paths(&target).2;
+            let output = output.parent().expect("archive output directory");
+            std::fs::create_dir_all(output).expect("create stale archive output");
+            std::fs::write(output.join("stale"), b"stale").expect("write stale archive output");
+            let result = package_archives(&PackageArchivesOptions {
+                target: ReleaseTarget::DarwinArm64,
+                target_dir: target,
+                workspace_root: workspace,
+            })
+            .expect("package child archives");
+            assert!(result.metadata.is_file());
+            assert!(!output.join("stale").exists());
+            let published = std::fs::read_dir(output)
+                .expect("read archive output")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read archive entries");
+            assert_eq!(published.len(), 5);
+            assert!(published.iter().all(|entry| entry.path().is_file()));
+            return;
+        }
+
         let temp = tempfile::tempdir().expect("create temp directory");
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(workspace.join("packaging")).expect("create packaging directory");
@@ -486,34 +519,58 @@ mod tests {
         .expect("write notices");
         let first_target = temp.path().join("first-target");
         let second_target = temp.path().join("second-target");
-        populate_release(&first_target);
-        populate_release(&second_target);
-
-        let first = package_archives(&PackageArchivesOptions {
-            target: ReleaseTarget::DarwinArm64,
-            target_dir: first_target,
-            workspace_root: workspace.clone(),
-        })
-        .expect("package first archives");
-        let second = package_archives(&PackageArchivesOptions {
-            target: ReleaseTarget::DarwinArm64,
-            target_dir: second_target,
-            workspace_root: workspace,
-        })
-        .expect("package second archives");
+        package_with_umask(&first_target, &workspace, "022");
+        package_with_umask(&second_target, &workspace, "077");
+        let (first_runtime, first_cli, first_metadata) = archive_paths(&first_target);
+        let (second_runtime, second_cli, second_metadata) = archive_paths(&second_target);
 
         assert_eq!(
-            std::fs::read(first.runtime).expect("read first runtime archive"),
-            std::fs::read(second.runtime).expect("read second runtime archive")
+            std::fs::read(first_runtime).expect("read first runtime archive"),
+            std::fs::read(second_runtime).expect("read second runtime archive")
         );
         assert_eq!(
-            std::fs::read(first.cli).expect("read first cli archive"),
-            std::fs::read(second.cli).expect("read second cli archive")
+            std::fs::read(first_cli).expect("read first cli archive"),
+            std::fs::read(second_cli).expect("read second cli archive")
         );
-        assert!(first.metadata.is_file());
+        assert!(first_metadata.is_file());
+        assert!(second_metadata.is_file());
     }
 
-    fn populate_release(target_dir: &std::path::Path) {
+    fn package_with_umask(target: &Path, workspace: &Path, umask: &str) {
+        let test_binary = std::env::current_exe().expect("test binary");
+        let status = Command::new("sh")
+            .args(["-c", "umask \"$1\"; shift; exec \"$@\"", "sh", umask])
+            .arg(test_binary)
+            .args([
+                "--exact",
+                "archive::tests::portable_archives_are_reproducible_and_self_validating",
+                "--nocapture",
+            ])
+            .env(UMASK_CHILD_TARGET, target)
+            .env(UMASK_CHILD_WORKSPACE, workspace)
+            .status()
+            .expect("run archive packaging child");
+        assert!(status.success(), "archive packaging child failed: {status}");
+    }
+
+    fn archive_paths(target_dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let descriptor = ReleaseTarget::DarwinArm64.descriptor();
+        let version = env!("CARGO_PKG_VERSION");
+        let output = target_dir
+            .join("silo-artifacts")
+            .join(descriptor.name)
+            .join(version);
+        (
+            output.join(format!(
+                "silo-runtime-{version}-{}.tar.zst",
+                descriptor.name
+            )),
+            output.join(format!("silo-{version}-{}.tar.zst", descriptor.name)),
+            output.join("archives.json"),
+        )
+    }
+
+    fn populate_release(target_dir: &Path) {
         let target = ReleaseTarget::DarwinArm64;
         let runtime = target
             .descriptor()

@@ -21,14 +21,8 @@ pub(crate) trait ConfigStore: std::fmt::Debug + Send + Sync {
     /// Inserts `seed` only when the config row is missing and returns the stored row.
     ///
     /// Existing rows are returned as-is and are not compared with `seed`; callers
-    /// that care about root compatibility must validate the returned value.
+    /// validate the returned root contract.
     async fn read_or_seed_db_config(&self, seed: &DbConfig) -> Result<DbConfig, LibVmError>;
-
-    /// Claims the state root for a database created before state roots existed.
-    async fn claim_state_root(&self, state_root: &str) -> Result<DbConfig, LibVmError>;
-
-    /// Marks the legacy filesystem migration complete.
-    async fn complete_state_root_migration(&self) -> Result<DbConfig, LibVmError>;
 }
 
 /// Durable machine configuration and runtime-state storage.
@@ -144,9 +138,6 @@ pub(crate) trait NetworkStore: std::fmt::Debug + Send + Sync {
         &self,
         network_id: &str,
     ) -> Result<Option<NetworkInstance>, LibVmError>;
-
-    /// Lists all ephemeral network runtime instances ordered by ID.
-    async fn list_network_instances(&self) -> Result<Vec<NetworkInstance>, LibVmError>;
 
     /// Upserts a network runtime instance.
     ///

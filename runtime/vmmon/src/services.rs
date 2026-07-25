@@ -236,6 +236,7 @@ pub async fn start_services(
     sync_reporter: &mut SyncReporter,
 ) -> eyre::Result<ServiceHandles> {
     let path = runtime.socket().to_path_buf();
+    utils::validate_unix_socket_path(&path)?;
     let listener = UnixListener::bind(&path).context(format!("bind socket {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .context(format!("set socket permissions {}", path.display()))?;

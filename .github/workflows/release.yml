@@ -40,26 +40,26 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
-      - name: Verify release tooling
-        run: |
-          nix develop --command cargo fmt --all --check
-          nix develop --command cargo test -p xtask
-          nix develop --command make clippy
+      - name: Restore dependency caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            ~/go/pkg/mod
+            ~/Library/Caches/go-build
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'net/netd/go.sum') }}
+          restore-keys: |
+            release-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build canonical release staging
+      - name: Build credential-free release
         env:
           KERNEL_REFERENCE: ${{ inputs.kernel_reference }}
-        run: |
-          nix develop --command cargo run -p xtask -- release-stage \
-            --target darwin-arm64 \
-            --kernel-reference "$KERNEL_REFERENCE"
-
-      - name: Build ad-hoc macOS distribution
-        env:
           RELEASE_BUILD_NUMBER: ${{ github.run_number }}
         run: |
-          nix develop --command cargo run -p xtask -- package-macos \
-            --build-number "$RELEASE_BUILD_NUMBER"
+          nix develop --command make release \
+            KERNEL_REFERENCE="$KERNEL_REFERENCE" \
+            RELEASE_BUILD_NUMBER="$RELEASE_BUILD_NUMBER"
 
       - name: Verify non-publishing artifact
         run: |
@@ -75,6 +75,7 @@ jobs:
         with:
           name: macos-arm64-ad-hoc-${{ github.sha }}
           path: |
+            target/silo-artifacts/darwin-arm64/[0-9]*/
             target/silo-artifacts/darwin-arm64/macos/
             target/silo-release/darwin-arm64/release/metadata/
           if-no-files-found: error

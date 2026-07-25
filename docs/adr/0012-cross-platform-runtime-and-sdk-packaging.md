@@ -2,7 +2,7 @@
 
 Date: 2026-07-22
 
-Updated: 2026-07-23
+Updated: 2026-07-25
 
 ## Status
 
@@ -171,22 +171,42 @@ silo-<version>-<target>/
 
 ### Portable Staging
 
-Developer and release staging use the portable layout in predictable target
-directories:
+Cargo development builds keep the CLI, helpers, and assets together in the
+active profile directory:
 
 ```text
-target/silo-runtime/darwin-arm64/debug/
+target/debug/
+  silo
+  vmmon
+  netd
+  krun
+  assets/
+    kernel-default
+    initramfs
+    agent
+```
+
+`make build` defaults to the debug layout. Bare `make` and `make all` build the
+equivalent `target/release` layout for source distribution. Explicit `PROFILE`
+values override either default. This development layout is internal and allows
+either binary to run directly without an environment override.
+`CARGO_TARGET_DIR` replaces `target` for both Cargo and Make-managed development
+outputs.
+
+Validated release staging continues to use the portable layout in predictable
+target directories:
+
+```text
 target/silo-runtime/darwin-arm64/release/
 target/silo-runtime/linux-amd64-gnu/release/
 target/silo-runtime/linux-arm64-gnu/release/
 ```
 
-Developers select a staged root through `RuntimeConfig` or
-`SILO_RUNTIME_DIR`. `libvm` does not inspect arbitrary Cargo target directories.
-The staged payload is the common input to the app, Linux packages, SDK platform
-packages, and runtime archives. Packagers do not rebuild or substitute
-components after staging, except for required platform signing and container
-metadata.
+Developers can still select another complete portable root through
+`RuntimeConfig` or `SILO_RUNTIME_DIR`. The staged release payload is the common
+input to the app, Linux packages, SDK platform packages, and runtime archives.
+Packagers do not rebuild or substitute components after staging, except for
+required platform signing and container metadata.
 
 ### Default Kernel Provenance
 
@@ -263,7 +283,7 @@ macOS.
 | Configuration                      | `$XDG_CONFIG_HOME/silo`        | `$HOME/.config/silo`                                     |
 | Cache                              | `$XDG_CACHE_HOME/silo`         | `$HOME/.cache/silo`                                      |
 | Logs and durable operational state | `$XDG_STATE_HOME/silo`         | `$HOME/.local/state/silo`                                |
-| Sockets, locks, and PID files      | `$XDG_RUNTIME_DIR/silo`        | An owner-isolated directory below `std::env::temp_dir()` |
+| Sockets, locks, and PID files      | `$XDG_RUNTIME_DIR/silo`        | Linux: owner-isolated temporary directory; macOS: `/tmp/silo-<uid>` |
 
 The default data tree remains compatible with the existing Linux layout:
 
@@ -333,17 +353,23 @@ The run-root resolution order is:
 
 1. Explicit `RuntimeConfig` run root.
 2. `$XDG_RUNTIME_DIR/silo`.
-3. An owner-isolated path derived from `std::env::temp_dir()`.
+3. A short, owner-isolated platform fallback.
 
-Silo uses Rust's platform temporary-directory resolution rather than reading
-`TMPDIR` directly. On macOS that API normally returns the user's Darwin
-temporary directory, so the fallback is `<temp-dir>/silo`. Where the returned
-base is shared, including the common Linux `/tmp` case, the fallback includes
-the effective user identity, for example `/tmp/silo-1000`.
+On Linux, Silo uses Rust's platform temporary-directory resolution rather than
+reading `TMPDIR` directly. A private temporary directory uses `<temp-dir>/silo`;
+a shared base includes the effective user identity, for example
+`/tmp/silo-1000`. On macOS, the fallback is always `/tmp/silo-<uid>`. Darwin's
+Unix-domain socket path is limited to 103 bytes, while its normal per-user and
+Nix-shell temporary paths leave too little room for Silo's machine and network
+socket names.
 
 The directory is created with mode `0700`. Silo verifies that it is a real
 directory owned by the effective user and rejects symlinks, foreign ownership,
 or unsafe permissions. It never uses a cross-user `/tmp/silo` directory.
+Every generated host socket path is validated against the platform byte limit
+before a helper is spawned or a bind is attempted. Explicit roots that are too
+long therefore fail with the offending path, actual byte length, and maximum
+instead of an opaque operating-system `EINVAL`.
 
 The run root is ephemeral session placement, not durable database identity.
 `Runtime::open` resolves the default run root from the current environment on
@@ -392,11 +418,12 @@ Resolution follows this order:
 3. Existing per-component environment variables.
 4. `SILO_RUNTIME_DIR` using the portable layout.
 5. A runtime bundled with the caller.
-6. A runtime relative to the canonical current executable, including
+6. A complete development runtime adjacent to the canonical current executable.
+7. A portable runtime relative to the canonical current executable, including
    `Silo.app`.
-7. Conventional native package locations.
-8. Transitional `PATH`, sibling-binary, and historical asset fallbacks.
-9. A missing-runtime error.
+8. One complete helper set from `PATH` when `SILO_ASSET_DIR` is explicit.
+9. Conventional native package locations.
+10. A missing-runtime error.
 
 Existing environment controls remain available while lookup is centralized:
 
@@ -413,6 +440,11 @@ paths are absolute. Portable-root resolution verifies that derived paths remain
 below the selected root and are regular files. `vmmon`, `netd`, `krun`, and
 `agent` must be executable. `kernel-default` and `initramfs` must be readable
 but need not be executable.
+
+Executable-relative development discovery requires `vmmon`, `netd`, and `krun`
+beside the running executable and all three assets below its `assets` directory.
+`PATH` discovery is disabled unless `SILO_ASSET_DIR` is explicit, and all three
+helpers must come from the same absolute `PATH` entry.
 
 App-bundle resolution additionally validates bundle identifier `sh.silo.app`,
 exact release compatibility, architecture, and minimum system version. Native
@@ -466,6 +498,8 @@ Silo.app/
       netd
       krun
     Resources/
+      Silo.icns
+      THIRD_PARTY_NOTICES.txt
       assets/
         kernel-default
         initramfs
@@ -490,6 +524,7 @@ metadata. It does not contain Silo runtime paths. The initial contract is:
 | ---------------------------- | ------------------------------------------------- |
 | `CFBundleIdentifier`         | `sh.silo.app`                                     |
 | `CFBundleExecutable`         | `silo`                                            |
+| `CFBundleIconFile`           | `Silo.icns`                                       |
 | `CFBundleShortVersionString` | The public Silo release version                   |
 | `CFBundleVersion`            | The monotonically increasing release build number |
 | `LSMinimumSystemVersion`     | `26.0`                                            |
@@ -533,6 +568,22 @@ The initial macOS channels are:
 2. An official Homebrew tap containing a Cask for the same app bundle.
 3. Signed target runtime archives where an SDK transport requires one.
 
+The DMG uses a conventional Finder installation window and contains exactly
+these visible root items:
+
+```text
+Silo.app/
+Applications -> /Applications
+```
+
+Hidden Finder presentation metadata and the volume icon are allowed.
+Repository Rust code owns writable-image construction, deterministic Finder
+presentation, final compression, and transient-lock retries in addition to
+application assembly, signing, notarization, mounted-image validation, release
+metadata, and publication. Native Apple tools continue to own HFS+ and UDIF
+operations. Operational packaging and release guidance lives in
+[`PACKAGING.md`](../../PACKAGING.md).
+
 The Cask installs the app and exposes its CLI with a symlink equivalent to:
 
 ```ruby
@@ -570,10 +621,16 @@ The release pipeline:
 6. Rejects Nix-store, build-prefix, and unavailable non-system dependencies.
 7. Signs nested executables with a Developer ID Application identity.
 8. Signs the outer app with hardened runtime and timestamping.
-9. Builds the DMG.
-10. Submits the distribution through `xcrun notarytool`.
-11. Staples and validates the notarization ticket.
-12. Tests the result on a clean macOS 26 machine without development tools.
+9. Submits the app archive through `xcrun notarytool`, then staples and validates
+   the accepted ticket on the app.
+10. Builds the DMG from the stapled app and verifies the mounted root layout.
+11. Signs the DMG with the Developer ID Application identity.
+12. Submits the DMG through `xcrun notarytool`, then staples and validates the
+    accepted ticket on the image.
+13. Revalidates signatures, entitlements, Gatekeeper assessment, and image
+    integrity.
+14. Tests the exact draft candidate on a clean native macOS 26 machine before
+    publication.
 
 Ad-hoc signing remains a development convenience and is not a release signature.
 

@@ -38,20 +38,6 @@ impl NetworkStore for Store {
         Ok(instance.map(|DbNetworkInstance(instance)| instance))
     }
 
-    async fn list_network_instances(&self) -> Result<Vec<NetworkInstance>, LibVmError> {
-        let instances = sqlx::query_as::<_, DbNetworkInstance>(
-            "SELECT id, driver, definition_name, runtime_dir, json(attachment_json) AS attachment_json,
-                    json(driver_state_json) AS driver_state_json, state, created_at, modified_at
-             FROM network_instances ORDER BY id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(instances
-            .into_iter()
-            .map(|DbNetworkInstance(instance)| instance)
-            .collect())
-    }
-
     async fn save_network_instance(&self, instance: &NetworkInstance) -> Result<(), LibVmError> {
         sqlx::query(
             "INSERT INTO network_instances

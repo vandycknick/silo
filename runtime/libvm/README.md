@@ -49,7 +49,11 @@ The persisted root contract stores only main roots:
 - `state_root`: durable logs and operational state.
 
 `run_root` contains transient locks, PID files, sockets, and network runtime
-files. It is intentionally not durable database identity.
+files. It is intentionally not durable database identity. The default macOS
+run root is the short, user-specific `/tmp/silo-<uid>` path so VM and network
+Unix sockets remain within Darwin's path limit. Explicit run roots and
+`XDG_RUNTIME_DIR` remain supported, but overlong socket paths are rejected with
+their byte length and platform limit.
 
 `db_config` is a singleton row with `id = 1`. It records the host `os`,
 `data_root`, `image_root`, `state_root`, `created_at`, and `modified_at`. The
@@ -85,12 +89,26 @@ The normal portable layout is:
   assets/{kernel-default,initramfs,agent}
 ```
 
-Callers can select that layout with `RuntimeConfig::with_runtime_root` or
+Local Cargo builds use a flat development layout so the built CLI can run
+directly:
+
+```text
+target/<profile>/
+  silo
+  vmmon
+  netd
+  krun
+  assets/{kernel-default,initramfs,agent}
+```
+
+Callers can select the portable layout with `RuntimeConfig::with_runtime_root` or
 `SILO_RUNTIME_DIR`. Explicit component paths take precedence. Existing
 `SILO_VMMON_PATH`, `NETD_BIN`, `KRUN_BIN`, and `SILO_ASSET_DIR` controls remain
-available, followed by bundled, executable-relative, native-package, and legacy
-locations. Convention-based candidates must contain a complete component set;
-only deliberate per-component overrides may mix paths.
+available, followed by bundled, executable-relative development, portable, and
+native-package locations. Helpers may be resolved together from one absolute
+`PATH` entry only when `SILO_ASSET_DIR` explicitly selects a complete asset set.
+Convention-based candidates must contain a complete component set; only
+deliberate per-component overrides may mix paths.
 
 ## Lifecycle States
 

@@ -3,13 +3,13 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::release_target::ReleaseTarget;
+use crate::remove_path::remove_if_exists;
 
 const CASK_NAME: &str = "vandycknick-silo.rb";
 const CASK_TOKEN: &str = "vandycknick-silo";
@@ -17,6 +17,7 @@ const CASK_TOKEN: &str = "vandycknick-silo";
 #[derive(Debug)]
 pub(crate) struct PackageHomebrewOptions {
     pub(crate) target_dir: PathBuf,
+    pub(crate) published_macos_dmg: PathBuf,
 }
 
 #[derive(Debug)]
@@ -30,10 +31,10 @@ pub(crate) enum HomebrewError {
     UnsupportedHost,
     #[error("required macOS package input is missing or is not a regular file: {path}")]
     MissingInput { path: PathBuf },
+    #[error("published macOS DMG path must be absolute: {path}")]
+    PublishedInputMustBeAbsolute { path: PathBuf },
     #[error("invalid macOS package metadata at {path}: {reason}")]
     InvalidMetadata { path: PathBuf, reason: String },
-    #[error("Homebrew Cask output already exists: {path}")]
-    OutputExists { path: PathBuf },
     #[error("failed to {operation} {path}")]
     Io {
         operation: &'static str,
@@ -46,16 +47,6 @@ pub(crate) enum HomebrewError {
     CommandFailed { command: String, stderr: String },
 }
 
-struct TemporaryFile {
-    path: PathBuf,
-}
-
-impl Drop for TemporaryFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
 pub(crate) fn package_homebrew_cask(
     options: &PackageHomebrewOptions,
 ) -> Result<PackageHomebrewResult, HomebrewError> {
@@ -63,15 +54,16 @@ pub(crate) fn package_homebrew_cask(
         return Err(HomebrewError::UnsupportedHost);
     }
     let input = validated_input(options)?;
-    validate_dmg_trust(&input.dmg)?;
-    validate_published_dmg(&input)?;
-    publish_cask(&input.artifact_root, &input.digest)
+    validate_dmg_trust(&input.dmg, &input.signing_identity)?;
+    let published_digest = validate_published_dmg(&input, &options.published_macos_dmg)?;
+    publish_cask(&input.artifact_root, &published_digest)
 }
 
 struct ValidatedInput {
     artifact_root: PathBuf,
     dmg: PathBuf,
     digest: String,
+    signing_identity: String,
     size: u64,
 }
 
@@ -82,7 +74,7 @@ fn validated_input(options: &PackageHomebrewOptions) -> Result<ValidatedInput, H
     let metadata_path = macos.join("macos.json");
     let metadata = read_metadata(&metadata_path)?;
     let dmg_name = format!("Silo-{}-{}.dmg", env!("CARGO_PKG_VERSION"), target.name);
-    validate_metadata(&metadata_path, &metadata, &dmg_name)?;
+    let signing_identity = validate_metadata(&metadata_path, &metadata, &dmg_name)?;
 
     let dmg = macos.join(&dmg_name);
     let dmg_metadata = require_file(&dmg)?;
@@ -114,6 +106,7 @@ fn validated_input(options: &PackageHomebrewOptions) -> Result<ValidatedInput, H
         artifact_root,
         dmg,
         digest: digest.to_string(),
+        signing_identity,
         size: recorded_size,
     })
 }
@@ -125,34 +118,49 @@ fn publish_cask(
     let cask_dir = artifact_root.join("homebrew/Casks");
     create_directory(&cask_dir)?;
     let cask = cask_dir.join(CASK_NAME);
-    if fs::symlink_metadata(&cask).is_ok() {
-        return Err(HomebrewError::OutputExists { path: cask });
-    }
-    let temporary = TemporaryFile {
-        path: cask_dir.join(nonce("cask")),
-    };
-    write_new(&temporary.path, cask_contents(digest).as_bytes())?;
-    fs::hard_link(&temporary.path, &cask).map_err(|source| {
-        if source.kind() == io::ErrorKind::AlreadyExists {
-            HomebrewError::OutputExists { path: cask.clone() }
-        } else {
-            HomebrewError::Io {
-                operation: "publish Homebrew Cask without replacing existing output",
-                path: cask.clone(),
-                source,
-            }
-        }
+    remove_if_exists(&cask).map_err(|source| HomebrewError::Io {
+        operation: "remove previous Homebrew Cask",
+        path: cask.clone(),
+        source,
     })?;
+    write_new(&cask, cask_contents(digest).as_bytes())?;
 
     Ok(PackageHomebrewResult { cask })
 }
 
-fn validate_dmg_trust(dmg: &Path) -> Result<(), HomebrewError> {
+fn validate_dmg_trust(dmg: &Path, signing_identity: &str) -> Result<(), HomebrewError> {
+    let mut image = Command::new("/usr/bin/hdiutil");
+    image.args(["verify", "-quiet"]).arg(dmg);
+    run(image)?;
+
     let mut signature = Command::new("/usr/bin/codesign");
     signature
         .args(["--verify", "--strict", "--verbose=4"])
         .arg(dmg);
     run(signature)?;
+
+    let mut display = Command::new("/usr/bin/codesign");
+    display.args(["--display", "--verbose=4"]).arg(dmg);
+    let rendered = format!("{display:?}");
+    let output = display
+        .output()
+        .map_err(|source| HomebrewError::RunCommand {
+            command: rendered.clone(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(HomebrewError::CommandFailed {
+            command: rendered,
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    let details = String::from_utf8_lossy(&output.stderr);
+    if !has_signing_authority(&details, signing_identity) {
+        return Err(invalid_metadata(
+            dmg,
+            "DMG signing authority does not match macOS package metadata",
+        ));
+    }
 
     let mut ticket = Command::new("xcrun");
     ticket.args(["stapler", "validate", "-v"]).arg(dmg);
@@ -172,41 +180,27 @@ fn validate_dmg_trust(dmg: &Path) -> Result<(), HomebrewError> {
     run(gatekeeper)
 }
 
-fn validate_published_dmg(input: &ValidatedInput) -> Result<(), HomebrewError> {
-    let downloaded = TemporaryFile {
-        path: input.artifact_root.join(nonce("published-dmg")),
-    };
-    write_new(&downloaded.path, b"")?;
-    let command = published_dmg_command(&downloaded.path);
-    run(command)?;
-    let metadata = require_file(&downloaded.path)?;
-    let digest = sha256(&downloaded.path)?;
+fn validate_published_dmg(
+    input: &ValidatedInput,
+    published_dmg: &Path,
+) -> Result<String, HomebrewError> {
+    if !published_dmg.is_absolute() {
+        return Err(HomebrewError::PublishedInputMustBeAbsolute {
+            path: published_dmg.to_path_buf(),
+        });
+    }
+    let metadata = require_file(published_dmg)?;
+    let digest = sha256(published_dmg)?;
     if metadata.len() != input.size || digest != format!("sha256:{}", input.digest) {
         return Err(invalid_metadata(
-            &input.dmg,
+            published_dmg,
             "published GitHub release DMG differs from the local notarized artifact",
         ));
     }
-    Ok(())
-}
-
-fn published_dmg_command(destination: &Path) -> Command {
-    let version = env!("CARGO_PKG_VERSION");
-    let url = format!(
-        "https://github.com/vandycknick/silo/releases/download/v{version}/Silo-{version}-darwin-arm64.dmg"
-    );
-    let mut command = Command::new("curl");
-    command
-        .args([
-            "--fail",
-            "--location",
-            "--silent",
-            "--show-error",
-            "--output",
-        ])
-        .arg(destination)
-        .arg(url);
-    command
+    digest
+        .strip_prefix("sha256:")
+        .map(str::to_string)
+        .ok_or_else(|| invalid_metadata(published_dmg, "downloaded DMG has an invalid digest"))
 }
 
 fn read_metadata(path: &Path) -> Result<Value, HomebrewError> {
@@ -220,7 +214,11 @@ fn read_metadata(path: &Path) -> Result<Value, HomebrewError> {
         .map_err(|error| invalid_metadata(path, &format!("invalid JSON: {error}")))
 }
 
-fn validate_metadata(path: &Path, metadata: &Value, dmg_name: &str) -> Result<(), HomebrewError> {
+fn validate_metadata(
+    path: &Path,
+    metadata: &Value,
+    dmg_name: &str,
+) -> Result<String, HomebrewError> {
     let target = ReleaseTarget::DarwinArm64.descriptor();
     for (pointer, expected) in [
         ("/version", env!("CARGO_PKG_VERSION")),
@@ -249,14 +247,36 @@ fn validate_metadata(path: &Path, metadata: &Value, dmg_name: &str) -> Result<()
     let signing = metadata
         .get("signing")
         .and_then(Value::as_str)
-        .filter(|identity| !identity.is_empty() && *identity != "ad-hoc");
-    if signing.is_none() {
-        return Err(invalid_metadata(
-            path,
-            "Homebrew publication requires a Developer ID signing identity",
-        ));
-    }
-    Ok(())
+        .filter(|identity| is_developer_id_application(identity))
+        .ok_or_else(|| {
+            invalid_metadata(
+                path,
+                "Homebrew publication requires a Developer ID signing identity",
+            )
+        })?;
+    Ok(signing.to_string())
+}
+
+fn is_developer_id_application(identity: &str) -> bool {
+    let Some(value) = identity.strip_prefix("Developer ID Application: ") else {
+        return false;
+    };
+    let Some((name, team)) = value.rsplit_once(" (") else {
+        return false;
+    };
+    let Some(team) = team.strip_suffix(')') else {
+        return false;
+    };
+    !name.is_empty()
+        && team.len() == 10
+        && team
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn has_signing_authority(details: &str, identity: &str) -> bool {
+    let expected = format!("Authority={identity}");
+    details.lines().any(|line| line == expected)
 }
 
 fn cask_contents(digest: &str) -> String {
@@ -326,12 +346,12 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), HomebrewError> {
         .create_new(true)
         .open(path)
         .map_err(|source| HomebrewError::Io {
-            operation: "create temporary Homebrew Cask",
+            operation: "create Homebrew Cask",
             path: path.to_path_buf(),
             source,
         })?;
     file.write_all(bytes).map_err(|source| HomebrewError::Io {
-        operation: "write temporary Homebrew Cask",
+        operation: "write Homebrew Cask",
         path: path.to_path_buf(),
         source,
     })?;
@@ -343,7 +363,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), HomebrewError> {
         }
     })?;
     file.sync_all().map_err(|source| HomebrewError::Io {
-        operation: "sync temporary Homebrew Cask",
+        operation: "sync Homebrew Cask",
         path: path.to_path_buf(),
         source,
     })
@@ -386,21 +406,14 @@ fn invalid_metadata(path: &Path, reason: &str) -> HomebrewError {
     }
 }
 
-fn nonce(kind: &str) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    format!(".{kind}-{}-{nanos}", std::process::id())
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use crate::homebrew::{
-        cask_contents, package_homebrew_cask, publish_cask, published_dmg_command, sha256,
-        validated_input, PackageHomebrewOptions,
+        cask_contents, has_signing_authority, package_homebrew_cask, publish_cask, sha256,
+        validate_published_dmg, validated_input, PackageHomebrewOptions,
     };
 
     #[test]
@@ -409,7 +422,9 @@ mod tests {
         let options = fixture(temp.path(), true);
 
         let input = validated_input(&options).expect("validate Homebrew input");
-        let result = publish_cask(&input.artifact_root, &input.digest).expect("publish Cask");
+        let digest = validate_published_dmg(&input, &options.published_macos_dmg)
+            .expect("validate published DMG");
+        let result = publish_cask(&input.artifact_root, &digest).expect("publish Cask");
         let cask = std::fs::read_to_string(&result.cask).expect("read generated Cask");
         assert_eq!(
             std::fs::metadata(&result.cask)
@@ -442,16 +457,44 @@ mod tests {
             .join("silo-artifacts/darwin-arm64/macos/Silo-0.1.0-darwin-arm64.dmg");
         std::fs::write(dmg, b"modified").expect("modify DMG");
         assert!(validated_input(&modified).is_err());
+
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let published_modified = fixture(temp.path(), true);
+        std::fs::write(&published_modified.published_macos_dmg, b"modified")
+            .expect("modify published DMG");
+        let input = validated_input(&published_modified).expect("validate local input");
+        assert!(validate_published_dmg(&input, &published_modified.published_macos_dmg).is_err());
+
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let development = fixture(temp.path(), true);
+        let metadata_path = development
+            .target_dir
+            .join("silo-artifacts/darwin-arm64/macos/macos.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata fixture"))
+                .expect("parse metadata fixture");
+        metadata["signing"] = serde_json::json!("Apple Development: Silo (TEAMID1234)");
+        std::fs::write(
+            metadata_path,
+            serde_json::to_vec_pretty(&metadata).expect("encode metadata fixture"),
+        )
+        .expect("write metadata fixture");
+        assert!(validated_input(&development).is_err());
     }
 
     #[test]
-    fn refuses_to_replace_an_existing_cask() {
+    fn replaces_an_existing_cask() {
         let temp = tempfile::tempdir().expect("create temp directory");
         let options = fixture(temp.path(), true);
         let input = validated_input(&options).expect("validate Homebrew input");
         let first = publish_cask(&input.artifact_root, &input.digest).expect("publish first Cask");
-        assert!(publish_cask(&input.artifact_root, &input.digest).is_err());
-        assert!(first.cask.is_file());
+        std::fs::write(&first.cask, b"stale").expect("replace Cask with stale output");
+
+        let second = publish_cask(&input.artifact_root, &input.digest).expect("replace Cask");
+        assert_eq!(
+            std::fs::read_to_string(second.cask).expect("read replaced Cask"),
+            cask_contents(&input.digest)
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -463,21 +506,33 @@ mod tests {
     }
 
     #[test]
-    fn published_download_uses_the_exact_release_asset() {
-        let command = published_dmg_command(Path::new("download.dmg"));
-        let args = command
-            .get_args()
-            .map(|argument| argument.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        assert!(args.contains(&"--fail".to_string()));
-        assert!(args.contains(&"download.dmg".to_string()));
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some(
-                "https://github.com/vandycknick/silo/releases/download/v0.1.0/\
-Silo-0.1.0-darwin-arm64.dmg"
-            )
+    fn published_asset_must_be_an_absolute_regular_file() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let options = fixture(temp.path(), true);
+        let input = validated_input(&options).expect("validate local input");
+        assert!(validate_published_dmg(&input, Path::new("download.dmg")).is_err());
+
+        let symlink = temp.path().join("published-link.dmg");
+        std::os::unix::fs::symlink(&options.published_macos_dmg, &symlink)
+            .expect("create published DMG symlink");
+        assert!(validate_published_dmg(&input, &symlink).is_err());
+    }
+
+    #[test]
+    fn signing_authority_must_exactly_match_metadata() {
+        let details = concat!(
+            "Executable=/tmp/Silo.dmg\n",
+            "Authority=Developer ID Application: Silo (TEAMID1234)\n",
+            "Authority=Developer ID Certification Authority\n",
         );
+        assert!(has_signing_authority(
+            details,
+            "Developer ID Application: Silo (TEAMID1234)"
+        ));
+        assert!(!has_signing_authority(
+            details,
+            "Developer ID Application: Other (TEAMID1234)"
+        ));
     }
 
     fn fixture(root: &Path, notarized: bool) -> PackageHomebrewOptions {
@@ -500,7 +555,11 @@ Silo-0.1.0-darwin-arm64.dmg"
                 "sha256": sha256(&dmg).expect("hash DMG"),
                 "size": 3,
             },
-            "signing": if notarized { "Developer ID Application: Silo" } else { "ad-hoc" },
+            "signing": if notarized {
+                "Developer ID Application: Silo (TEAMID1234)"
+            } else {
+                "ad-hoc"
+            },
             "notarized": notarized,
         });
         std::fs::write(
@@ -508,6 +567,11 @@ Silo-0.1.0-darwin-arm64.dmg"
             serde_json::to_vec_pretty(&metadata).expect("encode metadata"),
         )
         .expect("write metadata");
-        PackageHomebrewOptions { target_dir }
+        let published_macos_dmg = root.join("published-Silo.dmg");
+        std::fs::copy(&dmg, &published_macos_dmg).expect("copy published DMG fixture");
+        PackageHomebrewOptions {
+            target_dir,
+            published_macos_dmg,
+        }
     }
 }

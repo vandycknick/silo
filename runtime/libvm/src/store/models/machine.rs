@@ -48,16 +48,10 @@ pub(crate) struct MachineState {
     pub status: MachineRuntimeState,
     pub vmmon_pid: Option<i32>,
     pub started_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub started_at_is_process_birth: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     pub last_error: Option<String>,
     pub updated_at: i64,
-}
-
-fn is_false(value: &bool) -> bool {
-    !value
 }
 
 #[non_exhaustive]
@@ -106,7 +100,7 @@ mod tests {
 
     use crate::lock_manager::LockId;
     use crate::machine::{MachineAgent, MachineGuestConfig};
-    use crate::store::models::{MachineConfig, MachineId, MachineNetworkConfig, MachineState};
+    use crate::store::models::{MachineConfig, MachineId, MachineNetworkConfig};
     use vm_spec::VmSpec;
 
     use super::MachineRuntimeState;
@@ -132,27 +126,6 @@ mod tests {
         let err = MachineRuntimeState::parse("paused").expect_err("unknown state should fail");
 
         assert!(err.contains("unknown machine runtime state"));
-    }
-
-    #[test]
-    fn legacy_machine_state_defaults_to_pidfile_start_time() {
-        let machine_id = MachineId::new();
-        let legacy = serde_json::json!({
-            "machineId": machine_id,
-            "status": "running",
-            "vmmonPid": 123,
-            "startedAt": 42,
-            "lastError": null,
-            "updatedAt": 43
-        });
-
-        let state: MachineState = serde_json::from_value(legacy).expect("decode legacy state");
-        assert!(!state.started_at_is_process_birth);
-
-        let mut modern = state;
-        modern.started_at_is_process_birth = true;
-        let serialized = serde_json::to_value(modern).expect("encode modern state");
-        assert_eq!(serialized["startedAtIsProcessBirth"], true);
     }
 
     #[test]

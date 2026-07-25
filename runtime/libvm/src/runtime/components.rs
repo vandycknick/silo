@@ -213,12 +213,11 @@ impl<'a> Resolver<'a> {
             self.apply_current_executable_candidates()?;
         }
         if !self.resolved.is_complete() {
-            self.apply_native_candidates()?;
+            self.apply_path_candidate()?;
         }
         if !self.resolved.is_complete() {
-            self.apply_legacy_fallbacks()?;
+            self.apply_native_candidates()?;
         }
-
         self.resolved.finish(&self.checked)
     }
 
@@ -316,8 +315,79 @@ impl<'a> Resolver<'a> {
         }
 
         if let Some(bin_directory) = executable.parent() {
+            self.try_development_runtime(bin_directory)?;
+            if self.resolved.is_complete() {
+                return Ok(());
+            }
             if let Some(root) = bin_directory.parent() {
                 self.try_portable_root(root, "runtime relative to current executable")?;
+            }
+        }
+        if !self.resolved.is_complete() {
+            self.try_installed_prefix(&executable)?;
+        }
+        Ok(())
+    }
+
+    fn try_development_runtime(&mut self, directory: &Path) -> Result<(), LibVmError> {
+        let assets = directory.join("assets");
+        self.checked.push(format!(
+            "development runtime {} and {}",
+            directory.display(),
+            assets.display()
+        ));
+        if let Some(candidate) =
+            optional_split_candidate(directory, &assets, "development runtime")?
+        {
+            self.apply_candidate(candidate);
+        }
+        Ok(())
+    }
+
+    fn try_installed_prefix(&mut self, executable: &Path) -> Result<(), LibVmError> {
+        if executable.file_name().and_then(|name| name.to_str()) != Some("silo") {
+            return Ok(());
+        }
+        let Some(bin_directory) = executable.parent() else {
+            return Ok(());
+        };
+        if bin_directory.file_name().and_then(|name| name.to_str()) != Some("bin") {
+            return Ok(());
+        }
+        let Some(prefix) = bin_directory.parent() else {
+            return Ok(());
+        };
+
+        self.try_split_candidate(
+            &prefix.join("libexec/silo"),
+            &prefix.join("lib/silo/assets"),
+            "runtime installed relative to current executable",
+        )
+    }
+
+    fn apply_path_candidate(&mut self) -> Result<(), LibVmError> {
+        let (Some(path), Some(asset_directory)) =
+            (self.inputs.path.clone(), self.inputs.asset_dir.clone())
+        else {
+            return Ok(());
+        };
+        let asset_directory = PathBuf::from(asset_directory);
+
+        for bin_directory in std::env::split_paths(&path).filter(|path| path.is_absolute()) {
+            self.checked.push(format!(
+                "PATH runtime {} and SILO_ASSET_DIR {}",
+                bin_directory.display(),
+                asset_directory.display()
+            ));
+            if let Some(candidate) = optional_split_candidate(
+                &bin_directory,
+                &asset_directory,
+                "PATH with SILO_ASSET_DIR",
+            )? {
+                self.apply_candidate(candidate);
+                if self.resolved.is_complete() {
+                    return Ok(());
+                }
             }
         }
         Ok(())
@@ -359,60 +429,6 @@ impl<'a> Resolver<'a> {
         )
     }
 
-    fn apply_legacy_fallbacks(&mut self) -> Result<(), LibVmError> {
-        let sibling = self
-            .inputs
-            .current_exe
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf);
-        let path_entries = self
-            .inputs
-            .path
-            .as_deref()
-            .map(std::env::split_paths)
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-
-        let mut bin_directories = Vec::new();
-        if let Some(sibling) = sibling {
-            bin_directories.push(sibling);
-        }
-        for path_entry in path_entries {
-            if !bin_directories.contains(&path_entry) {
-                bin_directories.push(path_entry);
-            }
-        }
-
-        let mut asset_directories = Vec::new();
-        if self.inputs.use_system_locations {
-            asset_directories.push(PathBuf::from("/usr/local/share/silo/assets"));
-        }
-        if let Some(home) = self.inputs.home.as_deref().map(PathBuf::from) {
-            if home.is_absolute() {
-                asset_directories.push(home.join(".local/share/silo/assets"));
-            }
-        }
-
-        for bin_directory in &bin_directories {
-            for asset_directory in &asset_directories {
-                self.checked.push(format!(
-                    "legacy installation {} and {}",
-                    bin_directory.display(),
-                    asset_directory.display()
-                ));
-                if let Some(candidate) =
-                    optional_split_candidate(bin_directory, asset_directory, "legacy installation")?
-                {
-                    self.apply_candidate(candidate);
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn try_portable_root(&mut self, root: &Path, source: &'static str) -> Result<(), LibVmError> {
         self.checked.push(format!("{source} {}", root.display()));
         if let Some(candidate) = optional_portable_candidate(root, source)? {
@@ -431,7 +447,6 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
     fn try_split_candidate(
         &mut self,
         bin_directory: &Path,
@@ -926,6 +941,43 @@ mod tests {
         }
     }
 
+    fn write_development_runtime(root: &Path) {
+        for relative in [
+            "vmmon",
+            "netd",
+            "krun",
+            "assets/kernel-default",
+            "assets/initramfs",
+            "assets/agent",
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("component parent"))
+                .expect("create component parent");
+            std::fs::write(&path, relative.as_bytes()).expect("write component");
+            let mode = if !relative.starts_with("assets/") || relative.ends_with("agent") {
+                0o755
+            } else {
+                0o644
+            };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("set component permissions");
+        }
+    }
+
+    fn write_installed_runtime(prefix: &Path) -> PathBuf {
+        let bin = prefix.join("bin");
+        let helpers = prefix.join("libexec/silo");
+        let assets = prefix.join("lib/silo/assets");
+        let executable = write_asset(&bin, "silo", 0o755);
+        for helper in ["vmmon", "netd", "krun"] {
+            write_asset(&helpers, helper, 0o755);
+        }
+        write_asset(&assets, "kernel-default", 0o644);
+        write_asset(&assets, "initramfs", 0o644);
+        write_asset(&assets, "agent", 0o755);
+        executable
+    }
+
     fn write_asset(directory: &Path, name: &str, mode: u32) -> PathBuf {
         std::fs::create_dir_all(directory).expect("create component directory");
         let path = directory.join(name);
@@ -1011,6 +1063,108 @@ mod tests {
     }
 
     #[test]
+    fn current_executable_resolves_adjacent_development_runtime() {
+        let temp = TempDir::new().expect("tempdir");
+        write_development_runtime(temp.path());
+        let mut discovery = inputs();
+        discovery.current_exe = Some(temp.path().join("silo"));
+
+        let resolved = Resolver::new(&RuntimeConfig::default(), discovery)
+            .resolve()
+            .expect("resolve development runtime");
+        let root = temp.path().canonicalize().expect("canonical runtime root");
+
+        assert_eq!(resolved.vmmon(), root.join("vmmon"));
+        assert_eq!(resolved.netd(), root.join("netd"));
+        assert_eq!(resolved.krun(), root.join("krun"));
+        assert_eq!(resolved.kernel(), root.join("assets/kernel-default"));
+        assert_eq!(resolved.initramfs(), root.join("assets/initramfs"));
+        assert_eq!(resolved.agent(), root.join("assets/agent"));
+    }
+
+    #[test]
+    fn current_executable_resolves_split_installed_prefix() {
+        let temp = TempDir::new().expect("tempdir");
+        let prefix = temp.path().join("prefix");
+        let executable = write_installed_runtime(&prefix);
+        let mut discovery = inputs();
+        discovery.current_exe = Some(executable);
+
+        let resolved = Resolver::new(&RuntimeConfig::default(), discovery)
+            .resolve()
+            .expect("resolve installed runtime");
+        let prefix = prefix.canonicalize().expect("canonical install prefix");
+
+        assert_eq!(resolved.vmmon(), prefix.join("libexec/silo/vmmon"));
+        assert_eq!(resolved.netd(), prefix.join("libexec/silo/netd"));
+        assert_eq!(resolved.krun(), prefix.join("libexec/silo/krun"));
+        assert_eq!(
+            resolved.kernel(),
+            prefix.join("lib/silo/assets/kernel-default")
+        );
+        assert_eq!(
+            resolved.initramfs(),
+            prefix.join("lib/silo/assets/initramfs")
+        );
+        assert_eq!(resolved.agent(), prefix.join("lib/silo/assets/agent"));
+    }
+
+    #[test]
+    fn installed_asset_symlink_cannot_escape_asset_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let prefix = temp.path().join("prefix");
+        let executable = write_installed_runtime(&prefix);
+        let agent = prefix.join("lib/silo/assets/agent");
+        let outside = write_asset(temp.path(), "outside-agent", 0o755);
+        std::fs::remove_file(&agent).expect("remove installed agent");
+        std::os::unix::fs::symlink(&outside, &agent).expect("symlink installed agent");
+        let mut discovery = inputs();
+        discovery.current_exe = Some(executable);
+
+        let error = Resolver::new(&RuntimeConfig::default(), discovery)
+            .resolve()
+            .expect_err("escaping installed asset must fail");
+
+        assert!(matches!(
+            error,
+            LibVmError::RuntimeComponentInvalid {
+                component: "agent",
+                ref reason,
+                ..
+            } if reason.contains("escapes runtime root")
+        ));
+    }
+
+    #[test]
+    fn path_helpers_require_an_explicit_complete_asset_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let bin = temp.path().join("bin");
+        let assets = temp.path().join("assets");
+        for helper in ["vmmon", "netd", "krun"] {
+            write_asset(&bin, helper, 0o755);
+        }
+        write_asset(&assets, "kernel-default", 0o644);
+        write_asset(&assets, "initramfs", 0o644);
+        write_asset(&assets, "agent", 0o755);
+        let mut discovery = inputs();
+        discovery.path = Some(bin.clone().into_os_string());
+        discovery.asset_dir = Some(assets.clone().into_os_string());
+
+        let resolved = Resolver::new(&RuntimeConfig::default(), discovery)
+            .resolve()
+            .expect("resolve PATH runtime");
+        let bin = bin.canonicalize().expect("canonical bin directory");
+        let assets = assets.canonicalize().expect("canonical asset directory");
+
+        assert_eq!(resolved.vmmon(), bin.join("vmmon"));
+        assert_eq!(resolved.netd(), bin.join("netd"));
+        assert_eq!(resolved.krun(), bin.join("krun"));
+        assert_eq!(resolved.kernel(), assets.join("kernel-default"));
+        assert_eq!(resolved.initramfs(), assets.join("initramfs"));
+        assert_eq!(resolved.agent(), assets.join("agent"));
+    }
+
+    #[test]
     fn explicit_component_overrides_runtime_root() {
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path().join("runtime");
@@ -1092,14 +1246,10 @@ mod tests {
     fn convention_candidates_do_not_mix_incomplete_roots() {
         let temp = TempDir::new().expect("tempdir");
         let first = temp.path().join("first");
-        let second = temp.path().join("second");
         write_runtime(&first);
-        write_runtime(&second);
         std::fs::remove_file(first.join("assets/agent")).expect("remove first agent");
         let mut discovery = inputs();
         discovery.current_exe = Some(first.join("bin/silo"));
-        discovery.path = Some(OsString::from(second.join("bin")));
-        discovery.home = Some(second.clone().into_os_string());
 
         let error = Resolver::new(&RuntimeConfig::default(), discovery)
             .resolve()
@@ -1135,68 +1285,6 @@ mod tests {
                 .expect("canonical runtime root")
                 .join("bin/vmmon")
         );
-    }
-
-    #[test]
-    fn legacy_fallback_selects_complete_helper_and_asset_directories() {
-        let temp = TempDir::new().expect("tempdir");
-        let bin = temp.path().join("legacy-bin");
-        let home = temp.path().join("home");
-        let assets = home.join(".local/share/silo/assets");
-        for helper in ["vmmon", "netd", "krun"] {
-            let path = write_asset(&bin, helper, 0o755);
-            assert!(path.is_file());
-        }
-        write_asset(&assets, "kernel-default", 0o644);
-        write_asset(&assets, "initramfs", 0o644);
-        write_asset(&assets, "agent", 0o755);
-        let mut discovery = inputs();
-        discovery.current_exe = Some(bin.join("silo"));
-        discovery.home = Some(home.into_os_string());
-
-        let resolved = Resolver::new(&RuntimeConfig::default(), discovery)
-            .resolve()
-            .expect("resolve complete legacy installation");
-        let bin = bin.canonicalize().expect("canonical bin");
-        let assets = assets.canonicalize().expect("canonical assets");
-
-        assert_eq!(resolved.vmmon(), bin.join("vmmon"));
-        assert_eq!(resolved.netd(), bin.join("netd"));
-        assert_eq!(resolved.krun(), bin.join("krun"));
-        assert_eq!(resolved.kernel(), assets.join("kernel-default"));
-        assert_eq!(resolved.initramfs(), assets.join("initramfs"));
-        assert_eq!(resolved.agent(), assets.join("agent"));
-    }
-
-    #[test]
-    fn legacy_asset_symlink_cannot_escape_its_directory() {
-        let temp = TempDir::new().expect("tempdir");
-        let bin = temp.path().join("legacy-bin");
-        let home = temp.path().join("home");
-        let assets = home.join(".local/share/silo/assets");
-        for helper in ["vmmon", "netd", "krun"] {
-            write_asset(&bin, helper, 0o755);
-        }
-        write_asset(&assets, "kernel-default", 0o644);
-        write_asset(&assets, "initramfs", 0o644);
-        let outside = write_asset(temp.path(), "outside-agent", 0o755);
-        std::os::unix::fs::symlink(&outside, assets.join("agent")).expect("symlink agent");
-        let mut discovery = inputs();
-        discovery.current_exe = Some(bin.join("silo"));
-        discovery.home = Some(home.into_os_string());
-
-        let error = Resolver::new(&RuntimeConfig::default(), discovery)
-            .resolve()
-            .expect_err("escaping legacy asset must fail");
-
-        assert!(matches!(
-            error,
-            LibVmError::RuntimeComponentInvalid {
-                component: "agent",
-                ref reason,
-                ..
-            } if reason.contains("escapes runtime root")
-        ));
     }
 
     #[test]

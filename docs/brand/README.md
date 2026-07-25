@@ -20,6 +20,7 @@ This folder contains the selected Silo hardware-badge logo direction and the der
 | Wordmark only | `silo-wordmark-transparent.png`, `silo-wordmark-transparent@2x.png`, `silo-wordmark-transparent@4x.png` | Use when the mark is displayed separately |
 | Social preview | `silo-og-image.png` | `1200x630`, suitable for Open Graph cards |
 | Favicons | `silo-favicon.ico`, `silo-favicon-*.png` | PNG sizes: `16`, `32`, `48`, `64`, `128`, `180`, `192`, `256`, `512`, `1024` |
+| macOS app icon source | `silo-favicon-1024.png` | Source for `packaging/macos/Silo.icns` |
 | Pack preview | `silo-asset-pack-preview.png` | Overview sheet for quick visual inspection |
 
 ## Notes

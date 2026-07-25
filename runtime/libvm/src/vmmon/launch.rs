@@ -35,6 +35,7 @@ pub(crate) struct VmmonLaunch<'a> {
 
 impl Vmmon {
     pub(crate) async fn spawn(&self, launch: &VmmonLaunch<'_>) -> Result<(), LibVmError> {
+        utils::validate_unix_socket_path(launch.socket)?;
         let (start_read, start_write) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
         let (sync_read, sync_write) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
 

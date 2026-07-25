@@ -133,13 +133,6 @@ impl Runtime {
                 store.read_or_seed_db_config(&seed).await?
             }
         };
-        let stored = crate::runtime::migration::migrate_runtime_roots(
-            &config,
-            &store,
-            stored,
-            &state_db_path,
-        )
-        .await?;
         let roots = config.resolve_store_roots(&stored, &state_db_path)?;
         let paths = LocalPaths::from_roots(roots);
         Self::from_store(paths, Arc::new(store), config.networking, components).await
@@ -574,12 +567,7 @@ impl Runtime {
         };
         let stored_pid = runtime.and_then(|runtime| runtime.vmmon_pid);
         let expected_started_at = runtime.and_then(|runtime| runtime.started_at);
-        let live_identity = live_monitor_identity(
-            pid_from_file,
-            stored_pid,
-            expected_started_at,
-            runtime.is_some_and(|runtime| runtime.started_at_is_process_birth),
-        )?;
+        let live_identity = live_monitor_identity(pid_from_file, stored_pid, expected_started_at)?;
         let live_pid = live_identity.as_ref().map(ProcessIdentity::pid);
 
         let current_state = runtime
@@ -665,7 +653,6 @@ impl Runtime {
                 status,
                 vmmon_pid,
                 started_at,
-                started_at_is_process_birth: started_at.is_some(),
                 run_id,
                 last_error,
                 updated_at: now_unix(),
@@ -1445,7 +1432,6 @@ fn live_monitor_identity(
     pid_from_file: Option<i32>,
     stored_pid: Option<i32>,
     expected_started_at: Option<i64>,
-    started_at_is_process_birth: bool,
 ) -> Result<Option<ProcessIdentity>, LibVmError> {
     let mut last_pid = None;
     for pid in [pid_from_file, stored_pid].into_iter().flatten() {
@@ -1457,12 +1443,7 @@ fn live_monitor_identity(
         let Some(identity) = ProcessIdentity::for_pid(pid)? else {
             continue;
         };
-        let matches = if started_at_is_process_birth {
-            identity.matches_started_at(expected_started_at)
-        } else {
-            identity.matches_legacy_started_at(expected_started_at)
-        };
-        if matches {
+        if identity.matches_started_at(expected_started_at) {
             return Ok(Some(identity));
         }
     }
@@ -1526,7 +1507,6 @@ fn machine_state_needs_writeback(
     persisted.status != observed.status
         || persisted.vmmon_pid != observed.vmmon_pid
         || persisted.started_at != observed.started_at
-        || persisted.started_at_is_process_birth != observed.started_at_is_process_birth
         || persisted.run_id.as_deref() != observed.run_id.as_deref()
         || persisted.last_error.as_deref() != observed.last_error.as_deref()
 }
@@ -1597,7 +1577,6 @@ pub(crate) fn stopped_machine_state(
         status: MachineRuntimeState::Stopped,
         vmmon_pid: None,
         started_at: None,
-        started_at_is_process_birth: false,
         run_id: None,
         last_error,
         updated_at: now_unix(),
@@ -1632,8 +1611,8 @@ mod tests {
     use crate::paths::LocalPaths;
     use crate::runtime::components::ResolvedRuntimeComponents;
     use crate::runtime::core::{
-        effective_oci_manifest_digest, machine_state_needs_writeback, materialized_manifest_digest,
-        oci_image_record, read_monitor_pid, stopped_machine_state, write_machine_config, Runtime,
+        effective_oci_manifest_digest, materialized_manifest_digest, oci_image_record,
+        read_monitor_pid, stopped_machine_state, write_machine_config, Runtime,
         STALE_STARTING_TIMEOUT,
     };
     use crate::store::models::{
@@ -1749,22 +1728,10 @@ mod tests {
             status: MachineRuntimeState::Stopped,
             vmmon_pid: None,
             started_at: None,
-            started_at_is_process_birth: false,
             run_id: None,
             last_error: None,
             updated_at: 1,
         }
-    }
-
-    #[test]
-    fn process_birth_marker_requires_state_writeback() {
-        let persisted = stopped_state(MachineId::new());
-        let observed = MachineState {
-            started_at_is_process_birth: true,
-            ..persisted.clone()
-        };
-
-        assert!(machine_state_needs_writeback(Some(&persisted), &observed));
     }
 
     fn expect_empty_refresh(store: &mut MockDataStore) {
@@ -2972,7 +2939,6 @@ mod tests {
                 status: MachineRuntimeState::Starting,
                 vmmon_pid: None,
                 started_at: None,
-                started_at_is_process_birth: false,
                 run_id: Some("run-1".to_string()),
                 last_error: None,
                 updated_at: now_unix() - stale_age - 1,
@@ -3022,7 +2988,6 @@ mod tests {
                 status: MachineRuntimeState::Starting,
                 vmmon_pid: None,
                 started_at: None,
-                started_at_is_process_birth: false,
                 run_id: Some("run-1".to_string()),
                 last_error: None,
                 updated_at: now_unix() - stale_age - 1,

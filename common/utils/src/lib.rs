@@ -1,10 +1,36 @@
 use std::fmt::{Display, Formatter};
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::str::FromStr;
 
 const BYTES_PER_MB: u64 = 1_000_000;
 const BYTES_PER_GB: u64 = 1_000_000_000;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 103;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 103;
+
+pub fn validate_unix_socket_path(path: &Path) -> io::Result<()> {
+    let length = path.as_os_str().as_bytes().len();
+    if length <= UNIX_SOCKET_PATH_MAX_BYTES {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "Unix socket path {} is {length} bytes; maximum on {} is {UNIX_SOCKET_PATH_MAX_BYTES} bytes",
+            path.display(),
+            std::env::consts::OS
+        ),
+    ))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HumanSize {
@@ -200,7 +226,30 @@ pub fn parse_mac(input: &str) -> Result<[u8; 6], String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{format_mac, format_storage_size, parse_mac, HumanSize};
+    use std::path::PathBuf;
+
+    use crate::{
+        format_mac, format_storage_size, parse_mac, validate_unix_socket_path, HumanSize,
+        UNIX_SOCKET_PATH_MAX_BYTES,
+    };
+
+    #[test]
+    fn unix_socket_path_enforces_platform_byte_limit() {
+        let valid = PathBuf::from(format!("/{}", "x".repeat(UNIX_SOCKET_PATH_MAX_BYTES - 1)));
+        validate_unix_socket_path(&valid).expect("accept maximum socket path");
+
+        let invalid = PathBuf::from(format!("/{}", "x".repeat(UNIX_SOCKET_PATH_MAX_BYTES)));
+        let error = validate_unix_socket_path(&invalid).expect_err("reject long socket path");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error
+            .to_string()
+            .contains(&format!("is {} bytes", UNIX_SOCKET_PATH_MAX_BYTES + 1)));
+        assert!(error.to_string().contains(&format!(
+            "maximum on {} is {UNIX_SOCKET_PATH_MAX_BYTES} bytes",
+            std::env::consts::OS
+        )));
+    }
 
     #[test]
     fn formats_mac_as_lowercase_colon_hex() {

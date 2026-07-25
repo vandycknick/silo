@@ -9,6 +9,7 @@ const HELP_TEMPLATE: &str = "{about}\n\n{usage-heading} {usage}\n\n{all-args}{af
 #[command(
     name = "silo",
     about = "Silo VM lifecycle control",
+    version,
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -88,6 +89,14 @@ mod tests {
     #[test]
     fn edit_command_is_not_available() {
         assert!(Cli::try_parse_from(["silo", "edit"]).is_err());
+    }
+
+    #[test]
+    fn version_matches_the_release_package() {
+        assert_eq!(
+            Cli::command().get_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

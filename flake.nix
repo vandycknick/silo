@@ -25,7 +25,7 @@
             inherit system;
             overlays = [ (import rust-overlay) ];
           };
-          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+          rustToolchain = pkgs.rust-bin.stable."1.96.1".default.override {
             targets = [
               "aarch64-unknown-linux-musl"
               "x86_64-unknown-linux-musl"
@@ -37,20 +37,52 @@
               "rust-analyzer"
             ];
           };
-          portableGo = pkgs.go.overrideAttrs (previous: {
-            patches = builtins.filter (
-              patch:
-              let
-                name = builtins.baseNameOf (toString patch);
-              in
-              !builtins.any (runtimePatch: pkgs.lib.hasInfix runtimePatch name) [
-                "iana-etc"
-                "mailcap"
-                "tzdata"
-              ]
-            ) previous.patches;
-          });
-          llvm = pkgs.llvmPackages;
+          goVersion = "1.25.12";
+          goPlatform =
+            {
+              aarch64-darwin = {
+                os = "darwin";
+                arch = "arm64";
+                hash = "sha256-+iyIu89kvTsq7zVfAmz+xtOkoBwTL5mcj4yWTrdnFk8=";
+              };
+              x86_64-darwin = {
+                os = "darwin";
+                arch = "amd64";
+                hash = "sha256-AKLnQ7grzOwDxRxLD35G1f7FIYQHX9bFGDw7s5rp+wA=";
+              };
+              aarch64-linux = {
+                os = "linux";
+                arch = "arm64";
+                hash = "sha256-i1iErviWAK71sLBR+5cfEfSbuZZSHpEfMPAqZohPe9I=";
+              };
+              x86_64-linux = {
+                os = "linux";
+                arch = "amd64";
+                hash = "sha256-I0got6ieDjA9JVYxDuVJ+88lPSjek3usPaE9YpQmKsE=";
+              };
+            }
+            .${system} or (throw "unsupported Go development platform: ${system}");
+           upstreamGo = pkgs.stdenvNoCC.mkDerivation {
+            pname = "go";
+            version = goVersion;
+            src = pkgs.fetchurl {
+              url = "https://go.dev/dl/go${goVersion}.${goPlatform.os}-${goPlatform.arch}.tar.gz";
+              inherit (goPlatform) hash;
+            };
+            sourceRoot = "go";
+            dontConfigure = true;
+            dontBuild = true;
+            dontStrip = true;
+            installPhase = ''
+              runHook preInstall
+              mkdir -p "$out/bin" "$out/share/go"
+              cp -R . "$out/share/go/"
+              ln -s "$out/share/go/bin/go" "$out/bin/go"
+              ln -s "$out/share/go/bin/gofmt" "$out/bin/gofmt"
+              runHook postInstall
+             '';
+           };
+           llvmTools = pkgs.llvmPackages.llvm;
           kernelPackages = [
             pkgs.bash
             pkgs.cacert
@@ -83,42 +115,61 @@
             pkgs.gcc
             pkgs.openssl
           ];
+          developmentPackages = [
+            rustToolchain
+            upstreamGo
+            pkgs.bash
+            pkgs.cacert
+            pkgs.cargo-zigbuild
+            pkgs.cmake
+            pkgs.coreutils
+            pkgs.curl
+            pkgs.docker
+            pkgs.docker-credential-helpers
+            pkgs.git
+            pkgs.gnumake
+            pkgs.gnutar
+            pkgs.grpcurl
+            pkgs.jq
+            llvmTools
+            pkgs.oras
+            pkgs.pkg-config
+            pkgs.zig
+            pkgs.zstd
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.binutils
+            pkgs.e2fsprogs
+            pkgs.gcc
+            pkgs.libcap_ng
+          ];
+          developmentTools = pkgs.buildEnv {
+            name = "silo-development-tools";
+            paths = developmentPackages;
+            pathsToLink = [
+              "/bin"
+              "/share"
+            ];
+          };
         in
         {
-          default = pkgs.mkShell {
-            packages = [
-              rustToolchain
-              portableGo
-              pkgs.grpcurl
-              pkgs.zig
-              pkgs.cargo-zigbuild
-              pkgs.docker
-              pkgs.docker-credential-helpers
-            ]
-            ++ kernelPackages
-            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-              pkgs.dtc
-              pkgs.libcap_ng
-              pkgs.patchelf
-              llvm.clang
-              llvm.bintools
-              llvm.libclang
-            ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-              pkgs.lld
-              llvm.clang
-              llvm.bintools
-              llvm.libclang
-            ];
+          default = pkgs.mkShellNoCC {
+            packages = [ developmentTools ];
 
             shellHook = ''
-              export PATH="$PWD/scripts:$PATH"
-              export LIBCLANG_PATH="${llvm.libclang.lib}/lib"
-              echo "Entering silo dev shell. Run: make build"
+              export PATH="$PWD/target/debug:$PWD/scripts:${developmentTools}/bin:/usr/bin:$PATH"
+              ${pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+                # stdenvNoCC still activates Darwin compiler and SDK hooks.
+                unset CC CXX LD DEVELOPER_DIR SDKROOT LIBCLANG_PATH
+                unset NIX_CFLAGS_COMPILE NIX_CFLAGS_COMPILE_FOR_BUILD
+                unset NIX_LDFLAGS NIX_LDFLAGS_FOR_BUILD
+              ''}
+              echo "Entering silo dev shell. Run: make help"
             '';
           };
-
-          kernel = pkgs.mkShell {
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          kernel = pkgs.mkShellNoCC {
             packages = kernelPackages;
           };
         }

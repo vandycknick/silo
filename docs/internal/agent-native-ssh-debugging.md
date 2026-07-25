@@ -72,8 +72,7 @@ if false && openssh::exists() {
 Then rebuild the guest assets and boot with the rebuilt initramfs:
 
 ```bash
-make build-guest-agent
-make initramfs
+make guest-assets
 cargo run -p cli -- run agent --initramfs target/resources/assets/initramfs --disk-size 300gb -- true
 ```
 

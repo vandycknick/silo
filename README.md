@@ -25,6 +25,29 @@ Build the CLI locally:
 ```bash
 nix develop
 make build
+silo run --image ubuntu:24.04 -- uname -a
+make test
+make verify
+make help
+```
+
+`make build` produces a complete debug development runtime in `target/debug`,
+including the host helpers, guest agent, initramfs, and a cached copy of the
+stable kernel. Bare `make` builds the complete release profile in
+`target/release`. Explicit `PROFILE` values override these defaults.
+
+Use `KERNEL_REFERENCE` to select another kernel artifact, or
+`DEV_KERNEL=/absolute/path/to/kernel` to use a local kernel.
+`make refresh-dev-kernel` refreshes the cached mutable OCI reference. Set
+`CARGO_TARGET_DIR` to move all Cargo and Make-managed development outputs
+together. `make help` lists the supported development and packaging commands.
+
+Build the same credential-free release artifacts as CI from a local checkout:
+
+```bash
+make release \
+  KERNEL_REFERENCE=ghcr.io/vandycknick/silo/kernel:stable \
+  RELEASE_BUILD_NUMBER=1
 ```
 
 Run an ephemeral VM from an image:
@@ -78,5 +101,6 @@ async fn main() -> Result<(), LibVmError> {
 
 ## Docs
 
+- [Packaging and distribution](PACKAGING.md)
 - [Terminology](docs/terminology.md)
 - [Guest agent](guest/agent/README.md)

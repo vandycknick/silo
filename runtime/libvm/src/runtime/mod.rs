@@ -3,7 +3,6 @@ mod builder;
 pub(crate) mod components;
 mod config;
 pub(crate) mod core;
-pub(crate) mod migration;
 mod transitions;
 
 pub use builder::RuntimeBuilder;
