@@ -35,6 +35,20 @@ pub struct RuntimeConfig {
     pub networking: RuntimeNetworkingConfig,
     /// Explicit vmmon executable path.
     pub vmmon_path: Option<PathBuf>,
+    /// Explicit netd executable path.
+    pub netd_path: Option<PathBuf>,
+    /// Explicit krun executable path.
+    pub krun_path: Option<PathBuf>,
+    /// Explicit default kernel path.
+    pub kernel_path: Option<PathBuf>,
+    /// Explicit default initramfs path.
+    pub initramfs_path: Option<PathBuf>,
+    /// Explicit default guest agent path.
+    pub agent_path: Option<PathBuf>,
+    /// Explicit portable runtime root.
+    pub runtime_root: Option<PathBuf>,
+    /// Portable runtime root bundled by an SDK frontend.
+    pub bundled_runtime_root: Option<PathBuf>,
 }
 
 impl RuntimeConfig {
@@ -47,6 +61,13 @@ impl RuntimeConfig {
             image_root: PathChoice::Default,
             networking: RuntimeNetworkingConfig::default(),
             vmmon_path: None,
+            netd_path: None,
+            krun_path: None,
+            kernel_path: None,
+            initramfs_path: None,
+            agent_path: None,
+            runtime_root: None,
+            bundled_runtime_root: None,
         }
     }
 
@@ -83,6 +104,48 @@ impl RuntimeConfig {
     /// Sets the vmmon executable path used to launch machines.
     pub fn with_vmmon_path(mut self, vmmon_path: impl Into<PathBuf>) -> Self {
         self.vmmon_path = Some(vmmon_path.into());
+        self
+    }
+
+    /// Sets the netd executable path used for userspace networking.
+    pub fn with_netd_path(mut self, netd_path: impl Into<PathBuf>) -> Self {
+        self.netd_path = Some(netd_path.into());
+        self
+    }
+
+    /// Sets the krun executable path used by the krun backend.
+    pub fn with_krun_path(mut self, krun_path: impl Into<PathBuf>) -> Self {
+        self.krun_path = Some(krun_path.into());
+        self
+    }
+
+    /// Sets the default kernel path.
+    pub fn with_kernel_path(mut self, kernel_path: impl Into<PathBuf>) -> Self {
+        self.kernel_path = Some(kernel_path.into());
+        self
+    }
+
+    /// Sets the default initramfs path.
+    pub fn with_initramfs_path(mut self, initramfs_path: impl Into<PathBuf>) -> Self {
+        self.initramfs_path = Some(initramfs_path.into());
+        self
+    }
+
+    /// Sets the default guest agent path.
+    pub fn with_agent_path(mut self, agent_path: impl Into<PathBuf>) -> Self {
+        self.agent_path = Some(agent_path.into());
+        self
+    }
+
+    /// Sets an explicit portable runtime root.
+    pub fn with_runtime_root(mut self, runtime_root: impl Into<PathBuf>) -> Self {
+        self.runtime_root = Some(runtime_root.into());
+        self
+    }
+
+    /// Sets a portable runtime root bundled by an SDK frontend.
+    pub fn with_bundled_runtime_root(mut self, bundled_runtime_root: impl Into<PathBuf>) -> Self {
+        self.bundled_runtime_root = Some(bundled_runtime_root.into());
         self
     }
 
@@ -297,6 +360,13 @@ impl Default for RuntimeConfig {
             image_root: PathChoice::Default,
             networking: RuntimeNetworkingConfig::default(),
             vmmon_path: None,
+            netd_path: None,
+            krun_path: None,
+            kernel_path: None,
+            initramfs_path: None,
+            agent_path: None,
+            runtime_root: None,
+            bundled_runtime_root: None,
         }
     }
 }
@@ -386,6 +456,33 @@ mod tests {
     use crate::paths::LocalRoots;
     use crate::store::{ConfigStore, Store};
     use crate::{LibVmError, Runtime, RuntimeConfig};
+
+    fn complete_runtime_root(base: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = base.join("runtime-components");
+        for name in ["vmmon", "netd", "krun"] {
+            let path = root.join("bin").join(name);
+            std::fs::create_dir_all(path.parent().expect("helper parent"))
+                .expect("create helper parent");
+            std::fs::write(&path, b"helper").expect("write helper");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("set helper mode");
+        }
+        for (name, mode) in [
+            ("kernel-default", 0o644),
+            ("initramfs", 0o644),
+            ("agent", 0o755),
+        ] {
+            let path = root.join("assets").join(name);
+            std::fs::create_dir_all(path.parent().expect("asset parent"))
+                .expect("create asset parent");
+            std::fs::write(&path, b"asset").expect("write asset");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("set asset mode");
+        }
+        root
+    }
 
     fn stored_config(data_root: &std::path::Path) -> LocalRoots {
         let roots = LocalRoots::with_roots(
@@ -525,11 +622,13 @@ mod tests {
         let data_root = temp.path().join("data");
         let state_root = temp.path().join("state");
         let image_root = temp.path().join("images");
+        let runtime_root = complete_runtime_root(temp.path());
         let first_run_root = temp.path().join("run-a");
         let second_run_root = temp.path().join("run-b");
         let first = RuntimeConfig::local(&data_root)
             .with_state_root(&state_root)
             .with_image_root(&image_root)
+            .with_runtime_root(&runtime_root)
             .with_run_root(&first_run_root);
 
         let runtime = Runtime::new(first).await.expect("open fresh runtime");
@@ -540,6 +639,7 @@ mod tests {
             RuntimeConfig::local(&data_root)
                 .with_state_root(&state_root)
                 .with_image_root(&image_root)
+                .with_runtime_root(&runtime_root)
                 .with_run_root(&second_run_root),
         )
         .await

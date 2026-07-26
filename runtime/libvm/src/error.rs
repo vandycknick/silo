@@ -81,6 +81,12 @@ pub enum LibVmError {
     #[error("vmmon executable path is not a file: {path}")]
     VmMonExecutableInvalid { path: PathBuf },
 
+    #[error("invalid runtime component input from {input}: {message}")]
+    RuntimeComponentInvalid { input: String, message: String },
+
+    #[error("could not resolve a complete Silo runtime; considered {considered}")]
+    RuntimeComponentsNotFound { considered: String },
+
     #[error("boot asset {asset} not found; checked {checked}")]
     BootAssetNotFound {
         asset: &'static str,

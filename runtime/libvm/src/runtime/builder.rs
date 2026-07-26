@@ -72,6 +72,48 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Sets the netd executable path used for userspace networking.
+    pub fn netd_path(mut self, netd_path: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_netd_path(netd_path);
+        self
+    }
+
+    /// Sets the krun executable path used by the krun backend.
+    pub fn krun_path(mut self, krun_path: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_krun_path(krun_path);
+        self
+    }
+
+    /// Sets the default kernel path.
+    pub fn kernel_path(mut self, kernel_path: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_kernel_path(kernel_path);
+        self
+    }
+
+    /// Sets the default initramfs path.
+    pub fn initramfs_path(mut self, initramfs_path: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_initramfs_path(initramfs_path);
+        self
+    }
+
+    /// Sets the default guest agent path.
+    pub fn agent_path(mut self, agent_path: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_agent_path(agent_path);
+        self
+    }
+
+    /// Sets an explicit portable runtime root.
+    pub fn runtime_root(mut self, runtime_root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_runtime_root(runtime_root);
+        self
+    }
+
+    /// Sets a portable runtime root bundled by an SDK frontend.
+    pub fn bundled_runtime_root(mut self, bundled_runtime_root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_bundled_runtime_root(bundled_runtime_root);
+        self
+    }
+
     /// Opens the runtime.
     pub async fn open(self) -> Result<Runtime, LibVmError> {
         Runtime::new(self.config).await
@@ -80,5 +122,57 @@ impl RuntimeBuilder {
     /// Returns the underlying config without opening the runtime.
     pub fn into_config(self) -> RuntimeConfig {
         self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::RuntimeBuilder;
+
+    #[test]
+    fn component_and_runtime_root_methods_populate_runtime_config() {
+        let config = RuntimeBuilder::new()
+            .vmmon_path("/runtime/bin/vmmon")
+            .netd_path("/runtime/bin/netd")
+            .krun_path("/runtime/bin/krun")
+            .kernel_path("/runtime/assets/kernel-default")
+            .initramfs_path("/runtime/assets/initramfs")
+            .agent_path("/runtime/assets/agent")
+            .runtime_root("/runtime")
+            .bundled_runtime_root("/bundled-runtime")
+            .into_config();
+
+        assert_eq!(
+            config.vmmon_path.as_deref(),
+            Some(std::path::Path::new("/runtime/bin/vmmon"))
+        );
+        assert_eq!(
+            config.netd_path.as_deref(),
+            Some(std::path::Path::new("/runtime/bin/netd"))
+        );
+        assert_eq!(
+            config.krun_path.as_deref(),
+            Some(std::path::Path::new("/runtime/bin/krun"))
+        );
+        assert_eq!(
+            config.kernel_path.as_deref(),
+            Some(std::path::Path::new("/runtime/assets/kernel-default"))
+        );
+        assert_eq!(
+            config.initramfs_path.as_deref(),
+            Some(std::path::Path::new("/runtime/assets/initramfs"))
+        );
+        assert_eq!(
+            config.agent_path.as_deref(),
+            Some(std::path::Path::new("/runtime/assets/agent"))
+        );
+        assert_eq!(
+            config.runtime_root.as_deref(),
+            Some(std::path::Path::new("/runtime"))
+        );
+        assert_eq!(
+            config.bundled_runtime_root.as_deref(),
+            Some(std::path::Path::new("/bundled-runtime"))
+        );
     }
 }

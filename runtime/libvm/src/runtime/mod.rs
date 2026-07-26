@@ -1,5 +1,6 @@
 pub(crate) mod boot_assets;
 mod builder;
+pub(crate) mod components;
 mod config;
 pub(crate) mod core;
 mod transitions;

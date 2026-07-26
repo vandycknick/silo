@@ -686,11 +686,12 @@ mod tests {
     }
 
     async fn runtime_with_mock_store(paths: LocalPaths, store: MockDataStore) -> Runtime {
+        let components = crate::runtime::components::test_components(paths.data_dir());
         Runtime::from_store(
             paths,
             Arc::new(store),
             RuntimeNetworkingConfig::default(),
-            None,
+            components,
         )
         .await
         .expect("create runtime with mock store")

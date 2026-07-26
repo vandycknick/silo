@@ -15,7 +15,7 @@ implementation.
 - [x] Commit 01: Correct and finalize ADR 0012
 - [x] Commit 02: Reset the SQL schema and durable root identity
 - [x] Commit 03: Split data, state, and run paths securely
-- [ ] Commit 04: Centralize runtime component resolution
+- [x] Commit 04: Centralize runtime component resolution
 - [ ] Commit 05: Remove late helper and asset discovery
 - [ ] Commit 06: Establish the Make and xtask build interface
 - [ ] Commit 07: Build adjacent development runtimes and canonical stages
@@ -706,6 +706,20 @@ cargo test -p libvm runtime::builder
 make clippy
 git diff --check
 ```
+
+### Implementation Notes
+
+- `Runtime` resolves and retains one immutable internal component set at open.
+  The existing launch-time helper and asset fallbacks remain temporarily for
+  Commit 05, while vmmon already receives the resolved absolute path through
+  its existing configuration plumbing.
+- The user-approved `plist = { version = "1.10.0", default-features = false }`
+  is used for XML and binary `Info.plist` parsing. This maintained pure-Rust,
+  Rust 1.88-compatible choice locked `plist 1.10.0` and its `quick-xml 0.41.0`
+  dependency.
+- `cargo test -p libvm runtime::builder` initially selected no tests because
+  the builder module had none. Focused builder API coverage was added, so the
+  planned command now runs one test without changing its filter.
 
 ## Commit 05: Remove Late Helper And Asset Discovery
 

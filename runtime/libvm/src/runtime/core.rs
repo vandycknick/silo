@@ -15,6 +15,7 @@ use crate::lock_manager::{LockGuard, LockId, LockManager, ManagedLock};
 use crate::machine::root_disk::resize_raw_disk;
 use crate::paths::{vm_spec_path_in, LocalPaths, MachinePaths};
 use crate::runtime::boot_assets::{self, BootAssetOverrides, ResolvedBootAssets};
+use crate::runtime::components::{resolve_components, ResolvedRuntimeComponents};
 use crate::runtime::{RuntimeConfig, RuntimeNetworkingConfig};
 use nix::{
     errno::Errno,
@@ -95,6 +96,8 @@ pub struct Runtime {
     store: Arc<dyn DataStore>,
     lock_manager: LockManager,
     networking: RuntimeNetworkingConfig,
+    #[allow(dead_code)]
+    components: ResolvedRuntimeComponents,
     vmmon: Vmmon,
     image_pull_policy: ImagePullPolicy,
     image_progress: Option<ImageProgressSender>,
@@ -121,6 +124,7 @@ impl Runtime {
 
     /// Opens a local runtime from explicit configuration.
     pub async fn new(config: RuntimeConfig) -> Result<Self, LibVmError> {
+        let components = resolve_components(&config)?;
         let bootstrap_paths = config.bootstrap_paths()?;
         let store = Store::open(bootstrap_paths.state_db_path()).await?;
         let stored = match store.db_config().await? {
@@ -132,7 +136,7 @@ impl Runtime {
         };
         let roots = config.resolve_store_roots(&stored, bootstrap_paths.state_db_path())?;
         let paths = LocalPaths::from_roots(roots);
-        Self::from_store(paths, Arc::new(store), config.networking, config.vmmon_path).await
+        Self::from_store(paths, Arc::new(store), config.networking, components).await
     }
 
     /// Opens the default local runtime from the process environment.
@@ -146,22 +150,24 @@ impl Runtime {
         networking: RuntimeNetworkingConfig,
     ) -> Result<Self, LibVmError> {
         let store = Store::new(&paths).await?;
-        Self::from_store(paths, Arc::new(store), networking, None).await
+        let components = crate::runtime::components::test_components(paths.data_dir());
+        Self::from_store(paths, Arc::new(store), networking, components).await
     }
 
     pub(crate) async fn from_store(
         paths: LocalPaths,
         store: Arc<dyn DataStore>,
         networking: RuntimeNetworkingConfig,
-        vmmon_path: Option<PathBuf>,
+        components: ResolvedRuntimeComponents,
     ) -> Result<Self, LibVmError> {
         let lock_manager = LockManager::open(paths.locks_dir().to_path_buf())?;
-        let vmmon = Vmmon::new(paths.clone(), vmmon_path);
+        let vmmon = Vmmon::new(paths.clone(), Some(components.vmmon.clone()));
         let runtime = Self {
             paths,
             store,
             lock_manager,
             networking,
+            components,
             vmmon,
             image_pull_policy: ImagePullPolicy::default(),
             image_progress: None,
@@ -1729,11 +1735,12 @@ mod tests {
     }
 
     async fn runtime_with_mock_store(paths: LocalPaths, store: MockDataStore) -> Runtime {
+        let components = crate::runtime::components::test_components(paths.data_dir());
         Runtime::from_store(
             paths,
             Arc::new(store),
             RuntimeNetworkingConfig::default(),
-            None,
+            components,
         )
         .await
         .expect("create runtime with mock store")
