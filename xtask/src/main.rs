@@ -9,13 +9,16 @@ use crate::components::{
     build_all, build_component, clippy, format, test, BuildContext, Component,
 };
 use crate::initramfs::{write_initramfs, InitramfsOptions};
+use crate::kernel::KernelOptions;
 use crate::profiles::Profile;
 use crate::targets::HostTarget;
 
 mod command;
 mod components;
 mod initramfs;
+mod kernel;
 mod profiles;
+mod runtime;
 mod targets;
 mod version;
 
@@ -33,6 +36,8 @@ enum Commands {
     Build {
         #[arg(long, value_enum, default_value_t = Profile::Debug)]
         profile: Profile,
+        #[command(flatten)]
+        kernel: KernelOptions,
     },
     Component {
         #[arg(value_enum)]
@@ -41,8 +46,14 @@ enum Commands {
         profile: Profile,
     },
     Kernel {
-        #[arg(long, default_value = "stable")]
-        track: String,
+        #[command(flatten)]
+        kernel: KernelOptions,
+    },
+    Stage {
+        #[arg(long, value_enum, default_value_t = Profile::Debug)]
+        profile: Profile,
+        #[command(flatten)]
+        kernel: KernelOptions,
     },
     Fmt,
     Clippy,
@@ -84,17 +95,27 @@ fn run() -> Result<(), Box<dyn Error>> {
     let target_dir = target_directory(&workspace_root, args.target_dir)?;
 
     match args.command {
-        Commands::Build { profile } => {
+        Commands::Build { profile, kernel } => {
             let context = build_context(&workspace_root, &target_dir, profile)?;
             build_all(&context)?;
+            let kernel = kernel::resolve(&context, &kernel)?;
+            runtime::assemble_development(&context, &kernel)?;
         }
         Commands::Component { component, profile } => {
             let context = build_context(&workspace_root, &target_dir, profile)?;
             build_component(component, &context)?;
         }
-        Commands::Kernel { track } => {
+        Commands::Kernel { kernel } => {
             let context = build_context(&workspace_root, &target_dir, Profile::Debug)?;
-            components::build_kernel(&context, &track)?;
+            let kernel = kernel::resolve(&context, &kernel)?;
+            println!("{}", kernel.path.display());
+        }
+        Commands::Stage { profile, kernel } => {
+            let context = build_context(&workspace_root, &target_dir, profile)?;
+            build_all(&context)?;
+            let kernel = kernel::resolve(&context, &kernel)?;
+            runtime::assemble_development(&context, &kernel)?;
+            runtime::stage(&context)?;
         }
         Commands::Fmt => format(&workspace_root, &target_dir)?,
         Commands::Clippy => {
@@ -147,9 +168,11 @@ fn target_directory(
         return Err(XtaskError::EmptyTargetDirectory);
     }
 
-    Ok(if target_dir.is_absolute() {
+    let target_dir = if target_dir.is_absolute() {
         target_dir
     } else {
         workspace_root.join(target_dir)
-    })
+    };
+
+    Ok(target_dir)
 }

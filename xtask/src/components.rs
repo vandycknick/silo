@@ -50,6 +50,8 @@ pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         Component::Vmmon,
         Component::Netd,
         Component::Krun,
+        Component::Agent,
+        Component::Init,
     ] {
         build_component(component, context)?;
     }
@@ -113,19 +115,6 @@ pub fn test(
         cargo.args(["--exclude", member]);
     }
     command::run(cargo)
-}
-
-pub fn build_kernel(context: &BuildContext<'_>, track: &str) -> Result<(), command::CommandError> {
-    let mut make = Command::new("make");
-    make.current_dir(context.workspace_root)
-        .env("CARGO_TARGET_DIR", context.target_dir)
-        .args([
-            "-C",
-            "resources/kernels",
-            "kernel",
-            &format!("TRACK={track}"),
-        ]);
-    command::run(make)
 }
 
 fn build_cargo_package(context: &BuildContext<'_>, package: &str) -> Result<(), ComponentError> {

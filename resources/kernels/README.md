@@ -61,6 +61,29 @@ oras manifest fetch-config --oci-layout target/kernels/stable/x86_64:7.1.3 --pre
 oras pull --oci-layout target/kernels/stable/x86_64:7.1.3 --output ./kernel
 ```
 
+## Runtime Acquisition
+
+Ordinary Silo builds consume the published stable OCI index rather than compile
+a kernel. The default reference is
+`ghcr.io/vandycknick/silo/kernel:stable`; it may be replaced for a mirror or
+fork without changing runtime discovery:
+
+```bash
+make KERNEL_REFERENCE=registry.example/silo/kernel:stable
+```
+
+`make KERNEL_PATH=/absolute/path/to/kernel` selects and validates a local
+regular kernel file instead. `make KERNEL_OFFLINE=1` permits no registry access
+and reuses only verified digest-addressed content already below
+`$CARGO_TARGET_DIR/kernel-cache/sha256`. The resolved index, platform manifest,
+config, and kernel descriptors are written outside the runtime payload under
+`$CARGO_TARGET_DIR/kernel-provenance/<target>/<profile>.json`.
+
+The resolver uses ORAS only for OCI registry and digest transport. It validates
+the Silo index, exact `linux/amd64` or `linux/arm64` platform manifest, artifact
+contract, descriptor media types, SHA-256 digests, and sizes before it copies
+only the kernel layer into `assets/kernel-default`.
+
 ## Configuration Model
 
 The maintained inputs are deliberately small, self-documenting miniconfigs:

@@ -18,7 +18,7 @@ implementation.
 - [x] Commit 04: Centralize runtime component resolution
 - [x] Commit 05: Remove late helper and asset discovery
 - [x] Commit 06: Establish the Make and xtask build interface
-- [ ] Commit 07: Build adjacent development runtimes and canonical stages
+- [x] Commit 07: Build adjacent development runtimes and canonical stages
 - [ ] Commit 08: Isolate release linking and audit binaries
 - [ ] Commit 09: Produce common release archives and metadata
 - [ ] Commit 10: Assemble and sign `Silo.app`
@@ -93,6 +93,21 @@ plan-compatible default. Do not add entries without an actual decision point.
   is an existing reusable component rather than a product-version authority,
   and rewriting it would violate this commit's no-unrelated-version-rewrites
   rule.
+- 2026-07-26, Commit 06 follow-up. Question: Use the already-locked direct
+  `serde_json` dependency vs manual JSON parsing vs external npm/node? Options:
+  add the already-locked `serde_json` dependency directly to xtask; manually
+  parse OCI JSON; or depend on external npm/node tooling. Selected default:
+  direct `serde_json`. Rationale: robust structured parsing is necessary for
+  OCI descriptor validation and this adds no new transitive package.
+- 2026-07-26, Commit 07. Question: Which stable OCI reference should ordinary
+  developer builds consume when no fixed consumer reference is authoritative in
+  the repository? Options: require every caller to supply a reference; infer a
+  registry path dynamically from CI ownership; or use
+  `ghcr.io/vandycknick/silo/kernel:stable` while retaining an explicit override.
+  Selected default: `ghcr.io/vandycknick/silo/kernel:stable`. Rationale: the
+  existing publisher constructs `ghcr.io/$owner/silo/kernel`, the repository
+  identity is vandycknick/silo, and an explicit `KERNEL_REFERENCE`/xtask
+  override remains available for forks and mirrors.
 
 ### Breaking-Change Policy
 
@@ -948,6 +963,20 @@ Suggested intent: `build: stage complete Silo runtimes`
 Make ordinary development binaries directly runnable and create the canonical
 portable payload consumed by every packager.
 
+### Ghostty Reference Notes
+
+Inspected Ghostty's `build.zig`, `src/build/Config.zig`, and
+`src/build/GhosttyDist.zig` before changing runtime assembly.
+
+- Reused the assemble-once pattern: generated assets are assembled into one
+  complete temporary tree, validated as that tree, then installed through a
+  final rename. Reused its qualification boundary by validating the assembled
+  layout rather than separately trusting source artifacts after staging.
+- Intentionally did not copy Ghostty's source-tarball flow, app/runtime
+  selection, Xcode/Swift project behavior, XCFramework outputs, macOS app
+  assembly, or signing behavior. Silo retains Make plus Rust xtask and stages
+  its six-file runtime independently of future app packaging.
+
 ### Required Changes
 
 Add production xtask commands for complete development builds and staging.
@@ -1021,6 +1050,28 @@ runtime override variables, and execute that directory's `silo` binary.
 
 Where host virtualization is available, boot one VM from the adjacent debug
 runtime and one from the canonical release stage.
+
+### Implementation Notes
+
+- `make build` now builds the full host and guest closure once, resolves the
+  kernel before assembly, writes a temporary sibling assets tree, validates it,
+  and renames it into the selected profile directory. `make stage` consumes
+  that complete adjacent layout and atomically installs only the three helpers
+  and three assets under `target/silo-runtime/<target>/<profile>` with explicit
+  `0755` and `0644` modes.
+- The OCI resolver defaults to `ghcr.io/vandycknick/silo/kernel:stable`, accepts
+  `KERNEL_REFERENCE`, `KERNEL_PATH`, and `KERNEL_OFFLINE` through Make (and
+  corresponding xtask flags), validates the Silo OCI contract in Rust, caches
+  verified content at `$CARGO_TARGET_DIR/kernel-cache/sha256`, and writes
+  descriptors outside runtime roots at `kernel-provenance/<target>/<profile>.json`.
+- Qualification ran the required debug/release builds, release stage, clippy,
+  formatting, and diff checks. An absolute temporary `CARGO_TARGET_DIR` built
+  and ran with all runtime overrides unset; its offline rebuild reused the
+  verified cache. The release stage was confirmed to contain exactly six files
+  with the required modes and no metadata. On macOS arm64 with VZ support, both
+  the adjacent debug runtime and release CLI using the canonical stage booted
+  `ubuntu:24.04` to guest readiness, then the acceptance machines were stopped
+  and removed.
 
 ## Commit 08: Isolate Release Linking And Audit Binaries
 

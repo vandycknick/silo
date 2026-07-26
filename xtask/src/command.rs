@@ -1,4 +1,4 @@
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Output};
 
 use thiserror::Error;
 
@@ -27,6 +27,23 @@ pub fn run(mut command: Command) -> Result<(), CommandError> {
         Err(CommandError::Failed {
             program,
             status: status_text(status),
+        })
+    }
+}
+
+pub fn output(mut command: Command) -> Result<Output, CommandError> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let output = command.output().map_err(|source| CommandError::Run {
+        program: program.clone(),
+        source,
+    })?;
+
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(CommandError::Failed {
+            program,
+            status: status_text(output.status),
         })
     }
 }

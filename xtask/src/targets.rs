@@ -42,6 +42,28 @@ impl HostTarget {
         }
     }
 
+    pub fn runtime_target(self) -> &'static str {
+        match self {
+            Self::MacosArm64 => "darwin-arm64",
+            Self::LinuxX86_64 => "linux-amd64-gnu",
+            Self::LinuxArm64 => "linux-arm64-gnu",
+        }
+    }
+
+    pub fn oci_architecture(self) -> &'static str {
+        match self {
+            Self::MacosArm64 | Self::LinuxArm64 => "arm64",
+            Self::LinuxX86_64 => "amd64",
+        }
+    }
+
+    pub fn kernel_architecture(self) -> &'static str {
+        match self {
+            Self::MacosArm64 | Self::LinuxArm64 => "arm64",
+            Self::LinuxX86_64 => "x86_64",
+        }
+    }
+
     pub fn workspace_excludes(self) -> &'static [&'static str] {
         match self {
             Self::MacosArm64 => &["agent", "init"],
