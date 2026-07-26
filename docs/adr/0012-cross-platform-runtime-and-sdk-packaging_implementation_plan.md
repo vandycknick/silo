@@ -108,6 +108,16 @@ plan-compatible default. Do not add entries without an actual decision point.
   existing publisher constructs `ghcr.io/$owner/silo/kernel`, the repository
   identity is vandycknick/silo, and an explicit `KERNEL_REFERENCE`/xtask
   override remains available for forks and mirrors.
+- 2026-07-26, Commit 07 follow-up. Question: How should an existing non-empty
+  runtime directory be replaced without a reader-visible missing-path window
+  on both supported host families? Options: retain the non-atomic backup
+  rename; invoke platform commands; or add direct access to the already locked
+  maintained `rustix` and `nix` syscall crates. Selected default: use
+  `rustix::fs::renameat_with` with the native exchange flag and
+  `nix::unistd::geteuid`. Rationale: rustix maps to Linux `renameat2` and Apple
+  `renameatx_np`, keeping both paths in one maintained Rust API, while nix
+  provides the required effective-UID API. No new transitive dependency is
+  introduced and no direct libc call is necessary.
 
 ### Breaking-Change Policy
 
@@ -1072,6 +1082,12 @@ runtime and one from the canonical release stage.
   the adjacent debug runtime and release CLI using the canonical stage booted
   `ubuntu:24.04` to guest readiness, then the acceptance machines were stopped
   and removed.
+- Follow-up hardening verifies every selected platform config and layer blob by
+  descriptor digest before staging, records the complete descriptor set in
+  provenance, validates the boot-kernel representation for OCI and local
+  inputs, and protects offline reference records with owner-only `0600` files.
+  Existing assets and stages exchange atomically through rustix, so readers see
+  either complete tree while the displaced tree is cleaned up afterward.
 
 ## Commit 08: Isolate Release Linking And Audit Binaries
 

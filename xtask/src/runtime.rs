@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -51,9 +51,23 @@ pub enum RuntimeError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to atomically exchange {temporary} and {final_path}")]
+    Exchange {
+        temporary: PathBuf,
+        final_path: PathBuf,
+        #[source]
+        source: rustix::io::Errno,
+    },
     #[error("failed to remove temporary directory {path}")]
     RemoveTemporaryDirectory {
         path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("installed {final_path}, but failed to remove the prior runtime at {previous}")]
+    InstalledButCleanupFailed {
+        final_path: PathBuf,
+        previous: PathBuf,
         #[source]
         source: std::io::Error,
     },
@@ -83,7 +97,10 @@ pub fn assemble_development(
         replace_directory(&temporary, &assets)?;
         validate_adjacent(context)
     })();
-    if result.is_err() && temporary.exists() {
+    if result.is_err()
+        && !matches!(&result, Err(RuntimeError::InstalledButCleanupFailed { .. }))
+        && temporary.exists()
+    {
         fs::remove_dir_all(&temporary).map_err(|source| {
             RuntimeError::RemoveTemporaryDirectory {
                 path: temporary,
@@ -126,7 +143,10 @@ pub fn stage(context: &BuildContext<'_>) -> Result<(), RuntimeError> {
         replace_directory(&temporary, &stage)?;
         validate_stage(&stage)
     })();
-    if result.is_err() && temporary.exists() {
+    if result.is_err()
+        && !matches!(&result, Err(RuntimeError::InstalledButCleanupFailed { .. }))
+        && temporary.exists()
+    {
         fs::remove_dir_all(&temporary).map_err(|source| {
             RuntimeError::RemoveTemporaryDirectory {
                 path: temporary,
@@ -286,47 +306,33 @@ fn replace_directory(temporary: &Path, final_path: &Path) -> Result<(), RuntimeE
             source,
         });
     }
-    let backup = unused_sibling_path(final_path, "previous")?;
-    fs::rename(final_path, &backup).map_err(|source| RuntimeError::Rename {
-        from: final_path.to_path_buf(),
-        to: backup.clone(),
+    let temporary_name = temporary.file_name().ok_or_else(|| {
+        RuntimeError::Invalid(format!("invalid path name: {}", temporary.display()))
+    })?;
+    let final_name = final_path.file_name().ok_or_else(|| {
+        RuntimeError::Invalid(format!("invalid path name: {}", final_path.display()))
+    })?;
+    let parent_file = File::open(parent).map_err(|source| RuntimeError::Metadata {
+        path: parent.to_path_buf(),
         source,
     })?;
-    if let Err(source) = fs::rename(temporary, final_path) {
-        let _ = fs::rename(&backup, final_path);
-        return Err(RuntimeError::Rename {
-            from: temporary.to_path_buf(),
-            to: final_path.to_path_buf(),
-            source,
-        });
-    }
-    fs::remove_dir_all(&backup).map_err(|source| RuntimeError::RemoveTemporaryDirectory {
-        path: backup,
+    rustix::fs::renameat_with(
+        &parent_file,
+        temporary_name,
+        &parent_file,
+        final_name,
+        rustix::fs::RenameFlags::EXCHANGE,
+    )
+    .map_err(|source| RuntimeError::Exchange {
+        temporary: temporary.to_path_buf(),
+        final_path: final_path.to_path_buf(),
+        source,
+    })?;
+    fs::remove_dir_all(temporary).map_err(|source| RuntimeError::InstalledButCleanupFailed {
+        final_path: final_path.to_path_buf(),
+        previous: temporary.to_path_buf(),
         source,
     })
-}
-
-fn unused_sibling_path(path: &Path, purpose: &str) -> Result<PathBuf, RuntimeError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| RuntimeError::Invalid(format!("path has no parent: {}", path.display())))?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| RuntimeError::Invalid(format!("invalid path name: {}", path.display())))?;
-    for attempt in 0..128 {
-        let candidate = parent.join(format!(
-            ".{name}.{purpose}-{}-{attempt}",
-            std::process::id()
-        ));
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    Err(RuntimeError::Invalid(format!(
-        "could not reserve a backup sibling for {}",
-        path.display()
-    )))
 }
 
 fn create_directory(path: &Path) -> Result<(), RuntimeError> {

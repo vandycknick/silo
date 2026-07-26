@@ -73,10 +73,10 @@ make KERNEL_REFERENCE=registry.example/silo/kernel:stable
 ```
 
 `make KERNEL_PATH=/absolute/path/to/kernel` selects and validates a local
-regular kernel file instead. `make KERNEL_OFFLINE=1` permits no registry access
-and reuses only verified digest-addressed content already below
+regular architecture-matched kernel file instead. `make KERNEL_OFFLINE=1`
+permits no registry access and reuses only verified digest-addressed content already below
 `$CARGO_TARGET_DIR/kernel-cache/sha256`. The resolved index, platform manifest,
-config, and kernel descriptors are written outside the runtime payload under
+config, and complete layer descriptor set are written outside the runtime payload under
 `$CARGO_TARGET_DIR/kernel-provenance/<target>/<profile>.json`.
 
 The resolver uses ORAS only for OCI registry and digest transport. It validates
