@@ -19,6 +19,7 @@ in
     packages = [
       rustToolchain
       pkgs.go
+      pkgs.nodejs_24
       pkgs.grpcurl
       pkgs.zig
       pkgs.cargo-zigbuild

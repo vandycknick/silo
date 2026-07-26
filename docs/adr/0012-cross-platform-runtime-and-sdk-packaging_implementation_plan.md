@@ -194,6 +194,14 @@ plan-compatible default. Do not add entries without an actual decision point.
   --count HEAD`. Selected default: the explicit `BUILD_NUMBER` wins, with the
   commit count as the monotonic local default. Rationale: it follows Ghostty's
   release input while keeping `make app` runnable without release credentials.
+- 2026-07-26, Commit 11. Question: How should the pinned `create-dmg` command
+  be provided for local and CI packaging? Options: a committed, locked local npm
+  installation; Nix's legacy package; or direct `npx` execution. Selected
+  default: a committed `packaging/macos/package-lock.json` with local npm
+  installation. Rationale: `create-dmg` 8.1.0 is exactly locked and its local
+  binary can be reused after the first `npm ci --prefer-offline --no-audit
+  --no-fund`; Nix does not provide the selected tool version, and `npx` would
+  silently introduce an unpinned network/global fallback.
 
 ### Breaking-Change Policy
 
@@ -1477,6 +1485,20 @@ Suggested intent: `packaging: add macOS DMG and install commands`
 Use the same proven DMG tool selected by Ghostty and provide a native macOS
 source-install path.
 
+### Ghostty Reference Notes
+
+Inspected `/Users/nickvd/Sources/ghostty/.github/workflows/release-tag.yml`.
+
+- Reused Ghostty's release ordering: assemble and sign the app, hand that app
+  to `create-dmg` with an explicit output directory and Developer ID identity,
+  then hand the resulting DMG to the release-signing/notarization boundary.
+- Intentionally did not copy Ghostty's unpinned global `npm install`, Swift and
+  Xcode app build, Sparkle components, keychain/certificate import,
+  notarization, stapling, artifact publication, or its fixed `Ghostty.dmg`
+  filename. Silo uses the committed local `create-dmg` 8.1.0 binary, its own
+  signed app, normalized versioned artifact name, and defers notarization to
+  Commit 15.
+
 ### Required Changes
 
 Pin `create-dmg` to a reviewed version, initially 8.1.0, in the local packaging
@@ -1537,6 +1559,28 @@ git diff --check
 
 Remove only the installation created for this acceptance check; do not touch
 unrelated user installations.
+
+For a safe local acceptance run, use a unique workspace-owned path instead of
+clobbering `~/Applications` or `~/.local/bin`:
+
+```text
+acceptance_root="$(mktemp -d "$PWD/target/silo-install-XXXXXX")"
+make install APPDIR="$acceptance_root/Applications" BINDIR="$acceptance_root/bin"
+"$acceptance_root/bin/silo" list --format json
+rm -rf "$acceptance_root"
+```
+
+### Implementation Notes
+
+- `make install` was accepted with a unique workspace-owned app and bin root.
+  The installed symlink ran `list --format json` with all runtime overrides
+  unset and isolated XDG roots, then that exact root was removed.
+- The locked local `create-dmg` command was invoked repeatedly against the
+  verified app, including with a `/tmp` output and temporary workspace. On this
+  macOS host, its native `hdiutil convert ... -format ULFO` step consistently
+  fails with `Resource temporarily unavailable` before producing a DMG; no
+  image can therefore be mounted for the required strict checks. Commit 11
+  remains unchecked pending a host where native `hdiutil` completes that step.
 
 ## Commit 12: Build And Qualify Native Linux Packages And Installs
 

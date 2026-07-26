@@ -19,6 +19,7 @@ mod command;
 mod components;
 mod initramfs;
 mod kernel;
+mod macos;
 mod profiles;
 mod release;
 mod release_audit;
@@ -69,6 +70,26 @@ enum Commands {
     },
     VerifyArchive,
     App {
+        #[arg(long, value_name = "NUMBER")]
+        build_number: Option<String>,
+        #[arg(long, value_name = "IDENTITY")]
+        developer_id_application: Option<String>,
+        #[command(flatten)]
+        kernel: KernelOptions,
+    },
+    Package {
+        #[arg(long, value_name = "NUMBER")]
+        build_number: Option<String>,
+        #[arg(long, value_name = "IDENTITY")]
+        developer_id_application: Option<String>,
+        #[command(flatten)]
+        kernel: KernelOptions,
+    },
+    Install {
+        #[arg(long, value_name = "PATH", default_value = "/Applications")]
+        appdir: PathBuf,
+        #[arg(long, value_name = "PATH", default_value = "/usr/local/bin")]
+        bindir: PathBuf,
         #[arg(long, value_name = "NUMBER")]
         build_number: Option<String>,
         #[arg(long, value_name = "IDENTITY")]
@@ -240,6 +261,56 @@ fn run() -> Result<(), Box<dyn Error>> {
                 developer_id_application.as_deref(),
             )?;
         }
+        Commands::Package {
+            build_number,
+            developer_id_application,
+            kernel,
+        } => {
+            require_macos_arm64()?;
+            build_release_or_development(
+                &workspace_root,
+                &target_dir,
+                Profile::Release,
+                kernel,
+                true,
+            )?;
+            release_audit::verify(&workspace_root, &target_dir, Profile::Release)?;
+            app::assemble(
+                &workspace_root,
+                &target_dir,
+                build_number.as_deref(),
+                developer_id_application.as_deref(),
+            )?;
+            macos::package(
+                &workspace_root,
+                &target_dir,
+                developer_id_application.as_deref(),
+            )?;
+        }
+        Commands::Install {
+            appdir,
+            bindir,
+            build_number,
+            developer_id_application,
+            kernel,
+        } => {
+            require_macos_arm64()?;
+            build_release_or_development(
+                &workspace_root,
+                &target_dir,
+                Profile::Release,
+                kernel,
+                true,
+            )?;
+            release_audit::verify(&workspace_root, &target_dir, Profile::Release)?;
+            app::assemble(
+                &workspace_root,
+                &target_dir,
+                build_number.as_deref(),
+                developer_id_application.as_deref(),
+            )?;
+            macos::install(&target_dir, &appdir, &bindir)?;
+        }
         Commands::Fmt => format(&workspace_root, &target_dir)?,
         Commands::Clippy => {
             let host = HostTarget::current()?;
@@ -256,6 +327,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn require_macos_arm64() -> Result<(), Box<dyn Error>> {
+    if HostTarget::current()? == HostTarget::MacosArm64 {
+        Ok(())
+    } else {
+        Err(app::AppError::UnsupportedHost.into())
+    }
 }
 
 fn build_release_or_development(

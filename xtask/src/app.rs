@@ -132,24 +132,10 @@ pub fn assemble(
         }
         sign(&temporary, None, signing)?;
 
-        for name in ["silo", "vmmon", "netd", "krun"] {
-            let path = match name {
-                "silo" => macos.join(name),
-                _ => helpers.join(name),
-            };
-            verify_signature(&path)?;
-        }
-        verify_signature(&temporary)?;
-        verify_entitlements(
-            &helpers.join("vmmon"),
-            &["com.apple.security.virtualization"],
-        )?;
-        verify_entitlements(&helpers.join("krun"), &["com.apple.security.hypervisor"])?;
-        verify_entitlements(&macos.join("silo"), &[])?;
-        verify_entitlements(&helpers.join("netd"), &[])?;
         let app = output.join(APP_NAME);
         replace_directory(&temporary, &app)?;
-        verify_runtime_resolution(&app)?;
+        verify_signed_bundle(&app)?;
+        verify_runtime_resolution(&app, &output, true)?;
         println!(
             "app: {} version={} build={} signing={}",
             app.display(),
@@ -169,7 +155,7 @@ pub fn assemble(
     result
 }
 
-fn product_version(workspace_root: &Path) -> Result<String, AppError> {
+pub fn product_version(workspace_root: &Path) -> Result<String, AppError> {
     let path = workspace_root.join("VERSION");
     let version = fs::read_to_string(&path).map_err(|source| AppError::Io {
         action: "read product version",
@@ -495,8 +481,144 @@ fn entitlement_map(path: &Path, plist: &[u8]) -> Result<BTreeMap<String, bool>, 
         .collect()
 }
 
-fn verify_runtime_resolution(bundle: &Path) -> Result<(), AppError> {
-    let temporary = temporary_directory(bundle.parent().unwrap_or(bundle), "runtime-check")?;
+pub fn verify_distribution(bundle: &Path, temporary_parent: &Path) -> Result<(), AppError> {
+    verify_signed_bundle(bundle)?;
+    verify_runtime_resolution(bundle, temporary_parent, false)
+}
+
+pub fn verify_signed_bundle(bundle: &Path) -> Result<(), AppError> {
+    validate_distribution_layout(bundle)?;
+    for name in ["silo", "vmmon", "netd", "krun"] {
+        let path = match name {
+            "silo" => bundle.join("Contents/MacOS/silo"),
+            _ => bundle.join("Contents/Helpers").join(name),
+        };
+        verify_signature(&path)?;
+    }
+    verify_signature(bundle)?;
+    verify_entitlements(
+        &bundle.join("Contents/Helpers/vmmon"),
+        &["com.apple.security.virtualization"],
+    )?;
+    verify_entitlements(
+        &bundle.join("Contents/Helpers/krun"),
+        &["com.apple.security.hypervisor"],
+    )?;
+    verify_entitlements(&bundle.join("Contents/MacOS/silo"), &[])?;
+    verify_entitlements(&bundle.join("Contents/Helpers/netd"), &[])?;
+    Ok(())
+}
+
+pub fn has_bundle_identifier(bundle: &Path) -> Result<bool, AppError> {
+    Ok(
+        plist_value(&bundle.join("Contents/Info.plist"), "CFBundleIdentifier")?
+            == BUNDLE_IDENTIFIER,
+    )
+}
+
+pub fn is_owned_cli_symlink(path: &Path) -> Result<bool, AppError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(AppError::Io {
+                action: "read installed CLI metadata",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let executable = match fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(_) => return Ok(false),
+    };
+    let Some(macos) = executable.parent() else {
+        return Ok(false);
+    };
+    let Some(contents) = macos.parent() else {
+        return Ok(false);
+    };
+    let Some(bundle) = contents.parent() else {
+        return Ok(false);
+    };
+    if executable.file_name().and_then(|name| name.to_str()) != Some("silo")
+        || macos.file_name().and_then(|name| name.to_str()) != Some("MacOS")
+        || contents.file_name().and_then(|name| name.to_str()) != Some("Contents")
+        || bundle.file_name().and_then(|name| name.to_str()) != Some(APP_NAME)
+    {
+        return Ok(false);
+    }
+    has_bundle_identifier(bundle)
+}
+
+pub fn replace_bundle(temporary: &Path, final_path: &Path) -> Result<(), AppError> {
+    replace_directory(temporary, final_path)
+}
+
+fn validate_distribution_layout(bundle: &Path) -> Result<(), AppError> {
+    validate_directory_entries(bundle, ["Contents"])?;
+    let contents = bundle.join("Contents");
+    validate_directory_entries(
+        &contents,
+        [
+            "_CodeSignature",
+            "Helpers",
+            "Info.plist",
+            "MacOS",
+            "Resources",
+        ],
+    )?;
+    validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
+    validate_directory_entries(&contents.join("Helpers"), ["krun", "netd", "vmmon"])?;
+    validate_directory_entries(&contents.join("Resources"), ["Silo.icns", "assets"])?;
+    validate_directory_entries(
+        &contents.join("Resources/assets"),
+        ["agent", "initramfs", "kernel-default"],
+    )?;
+    validate_regular_file(&contents.join("Info.plist"), None)?;
+    validate_regular_file(&contents.join("MacOS/silo"), Some(0o755))?;
+    for (name, _) in HELPERS {
+        validate_regular_file(&contents.join("Helpers").join(name), Some(0o755))?;
+    }
+    for (name, mode) in ASSETS {
+        validate_regular_file(&contents.join("Resources/assets").join(name), Some(mode))?;
+    }
+    validate_regular_file(&contents.join("Resources/Silo.icns"), None)?;
+    for (key, expected) in [
+        ("CFBundleIdentifier", BUNDLE_IDENTIFIER),
+        ("CFBundleExecutable", "silo"),
+        ("LSArchitecturePriority:0", "arm64"),
+        ("LSMinimumSystemVersion", MINIMUM_SYSTEM_VERSION),
+    ] {
+        let actual = plist_value(&contents.join("Info.plist"), key)?;
+        if actual != expected {
+            return invalid(
+                &contents.join("Info.plist"),
+                format!("{key} is {actual:?}, expected {expected:?}"),
+            );
+        }
+    }
+    for key in ["CFBundleShortVersionString", "CFBundleVersion"] {
+        let value = plist_value(&contents.join("Info.plist"), key)?;
+        if !value.split('.').all(is_decimal_component) {
+            return invalid(
+                &contents.join("Info.plist"),
+                format!("{key} {value:?} is not numeric or dotted-numeric"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_runtime_resolution(
+    bundle: &Path,
+    temporary_parent: &Path,
+    verify_copied_cli: bool,
+) -> Result<(), AppError> {
+    let temporary = temporary_directory(temporary_parent, "runtime-check")?;
     let result = (|| {
         for directory in ["data", "state", "run", "config", "home"] {
             create_directory(&temporary.join(directory))?;
@@ -510,27 +632,29 @@ fn verify_runtime_resolution(bundle: &Path) -> Result<(), AppError> {
             source,
         })?;
         run_list(&linked, &temporary)?;
-        let copied = temporary.join("copied-silo");
-        copy_regular_file(&executable, &copied, 0o755)?;
-        let moved_bundle = temporary.join(APP_NAME);
-        fs::rename(bundle, &moved_bundle).map_err(|source| AppError::Io {
-            action: "move app bundle for copied CLI acceptance check",
-            path: bundle.to_path_buf(),
-            source,
-        })?;
-        let mut command = runtime_command(&copied, &temporary);
-        command.args(["list", "--format", "json"]);
-        let copied_result = command.output().map_err(|source| AppError::Io {
-            action: "run copied CLI runtime acceptance check",
-            path: copied.clone(),
-            source,
-        });
-        fs::rename(&moved_bundle, bundle).map_err(|source| AppError::Io {
-            action: "restore app bundle after copied CLI acceptance check",
-            path: bundle.to_path_buf(),
-            source,
-        })?;
-        copied_result?;
+        if verify_copied_cli {
+            let copied = temporary.join("copied-silo");
+            copy_regular_file(&executable, &copied, 0o755)?;
+            let moved_bundle = temporary.join(APP_NAME);
+            fs::rename(bundle, &moved_bundle).map_err(|source| AppError::Io {
+                action: "move app bundle for copied CLI acceptance check",
+                path: bundle.to_path_buf(),
+                source,
+            })?;
+            let mut command = runtime_command(&copied, &temporary);
+            command.args(["list", "--format", "json"]);
+            let copied_result = command.output().map_err(|source| AppError::Io {
+                action: "run copied CLI runtime acceptance check",
+                path: copied.clone(),
+                source,
+            });
+            fs::rename(&moved_bundle, bundle).map_err(|source| AppError::Io {
+                action: "restore app bundle after copied CLI acceptance check",
+                path: bundle.to_path_buf(),
+                source,
+            })?;
+            copied_result?;
+        }
         Ok(())
     })();
     fs::remove_dir_all(&temporary).map_err(|source| AppError::Io {
