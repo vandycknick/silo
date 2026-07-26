@@ -172,6 +172,15 @@ plan-compatible default. Do not add entries without an actual decision point.
   shells. Rationale: archives remain usable from the existing shell and CI
   without an unbounded installer or a Nix requirement, while every downloaded
   archive is checked against the reviewed official release digest.
+- 2026-07-26, Commit 09 follow-up. Question: Should archive qualification fully
+  re-audit every tar header or validate the release contract directly? Options:
+  a generic header/fingerprint auditor; trust creation flags completely; or
+  validate payload paths, types, modes, bytes, and directly consumed metadata.
+  Selected default: validate the practical release contract. Rationale: fixed
+  tar flags already normalize headers, while byte equality, executable modes,
+  traversal rejection, and archive/SBOM/provenance consistency catch failures
+  that affect packaging without turning local incremental builds into a
+  perfect-audit system.
 
 ### Breaking-Change Policy
 
@@ -1351,8 +1360,12 @@ Inspected Ghostty's `src/build/GhosttyDist.zig`, release-tag workflow, and
   libkrun as top-level release material. These files are not staged runtime
   files. Qualification rejects non-regular entries, unexpected paths, and
   traversal before extraction, compares the six runtime files byte-for-byte,
-  audits extracted binaries, runs portable CLI help with overrides unset, and
-  boots then removes a VZ acceptance VM on macOS.
+  audits extracted binaries, verifies the SPDX JSON/archive name and direct
+  provenance fields, runs the non-mutating `silo list --format json` path with
+  overrides unset to resolve the extracted runtime, and boots then removes a VZ
+  acceptance VM on macOS. It deliberately relies on fixed production tar flags
+  for complete header normalization rather than adding a generic tar-header
+  audit.
 
 ## Commit 10: Assemble And Sign Silo.app
 

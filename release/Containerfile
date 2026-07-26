@@ -4,7 +4,7 @@ FROM ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092
 ARG TARGETARCH
 
 RUN apt-get update && apt-get install --yes --no-install-recommends \
-    binutils build-essential ca-certificates curl file git pkg-config python3 xz-utils \
+    binutils build-essential ca-certificates curl file git pkg-config python3 xz-utils zstd \
     && rm -rf /var/lib/apt/lists/*
 
 COPY release/toolchains.toml /opt/silo/toolchains.toml

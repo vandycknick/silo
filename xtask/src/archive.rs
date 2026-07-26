@@ -8,7 +8,7 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -153,14 +153,23 @@ pub fn verify(workspace_root: &Path, target_dir: &Path) -> Result<(), ArchiveErr
             let root = temporary.join(&root_name);
             validate_extracted(workspace_root, target_dir, &stage, &root, kind)?;
             release_audit::verify_archive_runtime(&root, kind.has_cli(), host)?;
+            verify_sbom(
+                &archive,
+                &output.join(format!("{root_name}.sbom.spdx.json")),
+            )?;
+            verify_provenance(
+                &archive,
+                &output.join(format!("{root_name}.provenance.json")),
+                &version,
+                host,
+            )?;
             if kind.has_cli() {
-                run_portable_cli(&root, &["--help"])?;
+                run_portable_cli(&root, &["list", "--format", "json"])?;
                 if matches!(host, HostTarget::MacosArm64) {
                     boot_portable_vm(&root)?;
                     println!("verify-archive: VZ boot completed and the acceptance VM was removed");
                 }
             }
-            report_size(&output.join(format!("{root_name}.provenance.json")))?;
         }
         Ok(())
     })();
@@ -354,7 +363,21 @@ fn syft_program(
     create_directory(&root)?;
     let archive = root.join(format!("syft_{version}_{platform}.tar.gz"));
     let program = root.join(format!("syft-{version}-{platform}"));
+    if archive.is_file() {
+        match verify_digest(&archive, digest) {
+            Ok(()) => {}
+            Err(ArchiveError::Invalid { .. }) => {
+                fs::remove_file(&archive).map_err(|source| ArchiveError::Io {
+                    action: "remove invalid cached Syft archive",
+                    path: archive.clone(),
+                    source,
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
     if !archive.is_file() {
+        let temporary = temporary_file(&root, "syft-download")?;
         let mut curl = Command::new("/usr/bin/curl");
         curl.args([
             "--fail",
@@ -363,37 +386,69 @@ fn syft_program(
             "--show-error",
             "--output",
         ])
-        .arg(&archive)
+        .arg(&temporary)
         .arg(format!(
             "https://github.com/anchore/syft/releases/download/v{version}/syft_{version}_{platform}.tar.gz"
         ));
-        command::run(curl)?;
+        let result = (|| {
+            command::run(curl)?;
+            verify_digest(&temporary, digest)?;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644)).map_err(
+                |source| ArchiveError::Io {
+                    action: "set cached Syft archive mode",
+                    path: temporary.clone(),
+                    source,
+                },
+            )?;
+            fs::rename(&temporary, &archive).map_err(|source| ArchiveError::Io {
+                action: "install pinned Syft archive",
+                path: archive.clone(),
+                source,
+            })
+        })();
+        if temporary.exists() {
+            fs::remove_file(&temporary).map_err(|source| ArchiveError::Io {
+                action: "remove temporary Syft download",
+                path: temporary,
+                source,
+            })?;
+        }
+        result?;
     }
-    verify_digest(&archive, digest)?;
     if !program.is_file() {
         let temporary = temporary_directory(&root, "syft")?;
-        let tar = release::tool("tar")?;
-        let mut extract = Command::new(tar);
-        extract.args(["-xzf"]);
-        extract.arg(&archive).args(["-C"]).arg(&temporary);
-        command::run(extract)?;
-        let extracted = temporary.join("syft");
-        if !extracted.is_file() {
-            return invalid(
-                &extracted,
-                "pinned Syft archive contains no syft executable".to_string(),
-            );
-        }
-        fs::rename(&extracted, &program).map_err(|source| ArchiveError::Io {
-            action: "install pinned Syft executable",
-            path: program.clone(),
-            source,
-        })?;
+        let result = (|| {
+            let tar = release::tool("tar")?;
+            let mut extract = Command::new(tar);
+            extract.args(["-xzf"]);
+            extract.arg(&archive).args(["-C"]).arg(&temporary);
+            command::run(extract)?;
+            let extracted = temporary.join("syft");
+            if !extracted.is_file() {
+                return invalid(
+                    &extracted,
+                    "pinned Syft archive contains no syft executable".to_string(),
+                );
+            }
+            fs::set_permissions(&extracted, fs::Permissions::from_mode(0o755)).map_err(
+                |source| ArchiveError::Io {
+                    action: "set pinned Syft executable mode",
+                    path: extracted.clone(),
+                    source,
+                },
+            )?;
+            fs::rename(&extracted, &program).map_err(|source| ArchiveError::Io {
+                action: "install pinned Syft executable",
+                path: program.clone(),
+                source,
+            })
+        })();
         fs::remove_dir_all(&temporary).map_err(|source| ArchiveError::Io {
             action: "remove Syft extraction directory",
             path: temporary,
             source,
         })?;
+        result?;
     }
     let reported = tool_output(&program, &["version"])?;
     if reported.contains(version) {
@@ -670,17 +725,169 @@ fn checksum_path(archive: &Path) -> Result<PathBuf, ArchiveError> {
     Ok(archive.with_file_name(checksum))
 }
 
-fn report_size(provenance: &Path) -> Result<(), ArchiveError> {
-    let value: serde_json::Value =
+fn verify_sbom(archive: &Path, sbom: &Path) -> Result<(), ArchiveError> {
+    let value: Value =
+        serde_json::from_slice(&read(sbom)?).map_err(|error| ArchiveError::Invalid {
+            path: sbom.to_path_buf(),
+            reason: format!("cannot parse SPDX JSON SBOM: {error}"),
+        })?;
+    let expected = archive_name(archive)?;
+    let actual = required_string(&value, "/name", sbom, "SBOM name")?;
+    if actual == expected {
+        Ok(())
+    } else {
+        invalid(
+            sbom,
+            format!("names archive {actual:?}, expected {expected:?}"),
+        )
+    }
+}
+
+fn verify_provenance(
+    archive: &Path,
+    provenance: &Path,
+    version: &str,
+    host: HostTarget,
+) -> Result<(), ArchiveError> {
+    let value: Value =
         serde_json::from_slice(&read(provenance)?).map_err(|error| ArchiveError::Invalid {
             path: provenance.to_path_buf(),
-            reason: format!("cannot parse provenance: {error}"),
+            reason: format!("cannot parse archive provenance: {error}"),
         })?;
-    let archive = value["archive"]["name"].as_str().unwrap_or("unknown");
-    let raw = value["archive"]["raw_bytes"].as_u64().unwrap_or(0);
-    let compressed = value["archive"]["compressed_bytes"].as_u64().unwrap_or(0);
-    println!("verify-archive: {archive} raw={raw} compressed={compressed}");
+    let name = archive_name(archive)?;
+    let expected_sha256 = sha256(archive)?;
+    for (pointer, expected, field) in [
+        ("/archive/name", name, "archive name"),
+        (
+            "/archive/sha256",
+            expected_sha256.as_str(),
+            "archive SHA-256",
+        ),
+        ("/version", version, "version"),
+        ("/target", host.runtime_target(), "target"),
+    ] {
+        let actual = required_string(&value, pointer, provenance, field)?;
+        if actual != expected {
+            return invalid(
+                provenance,
+                format!("{field} is {actual:?}, expected {expected:?}"),
+            );
+        }
+    }
+    verify_kernel_descriptors(
+        value
+            .pointer("/kernel")
+            .ok_or_else(|| ArchiveError::Invalid {
+                path: provenance.to_path_buf(),
+                reason: "provenance contains no kernel record".to_string(),
+            })?,
+        provenance,
+    )?;
+    let raw = required_u64(&value, "/archive/raw_bytes", provenance, "raw archive size")?;
+    let compressed = required_u64(
+        &value,
+        "/archive/compressed_bytes",
+        provenance,
+        "compressed archive size",
+    )?;
+    println!("verify-archive: {name} raw={raw} compressed={compressed}");
     Ok(())
+}
+
+fn verify_kernel_descriptors(kernel: &Value, provenance: &Path) -> Result<(), ArchiveError> {
+    match required_string(kernel, "/source", provenance, "kernel source")? {
+        "local" => verify_descriptor(
+            kernel
+                .pointer("/descriptor")
+                .ok_or_else(|| ArchiveError::Invalid {
+                    path: provenance.to_path_buf(),
+                    reason: "local kernel provenance contains no descriptor".to_string(),
+                })?,
+            provenance,
+            "local kernel",
+        ),
+        "oci" => {
+            for name in ["index", "manifest", "config"] {
+                verify_descriptor(
+                    kernel
+                        .pointer(&format!("/{name}"))
+                        .ok_or_else(|| ArchiveError::Invalid {
+                            path: provenance.to_path_buf(),
+                            reason: format!("OCI kernel provenance contains no {name} descriptor"),
+                        })?,
+                    provenance,
+                    name,
+                )?;
+            }
+            let layers = kernel
+                .pointer("/layers")
+                .and_then(Value::as_array)
+                .filter(|layers| !layers.is_empty())
+                .ok_or_else(|| ArchiveError::Invalid {
+                    path: provenance.to_path_buf(),
+                    reason: "OCI kernel provenance contains no layer descriptors".to_string(),
+                })?;
+            for layer in layers {
+                verify_descriptor(layer, provenance, "kernel layer")?;
+            }
+            Ok(())
+        }
+        source => invalid(
+            provenance,
+            format!("kernel source {source:?} has no descriptor contract"),
+        ),
+    }
+}
+
+fn verify_descriptor(
+    descriptor: &Value,
+    provenance: &Path,
+    name: &str,
+) -> Result<(), ArchiveError> {
+    required_string(descriptor, "/digest", provenance, &format!("{name} digest"))?;
+    required_u64(descriptor, "/size", provenance, &format!("{name} size"))?;
+    Ok(())
+}
+
+fn required_string<'a>(
+    value: &'a Value,
+    pointer: &str,
+    path: &Path,
+    field: &str,
+) -> Result<&'a str, ArchiveError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ArchiveError::Invalid {
+            path: path.to_path_buf(),
+            reason: format!("contains no {field}"),
+        })
+}
+
+fn required_u64(
+    value: &Value,
+    pointer: &str,
+    path: &Path,
+    field: &str,
+) -> Result<u64, ArchiveError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ArchiveError::Invalid {
+            path: path.to_path_buf(),
+            reason: format!("contains no {field}"),
+        })
+}
+
+fn archive_name(archive: &Path) -> Result<&str, ArchiveError> {
+    archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ArchiveError::Invalid {
+            path: archive.to_path_buf(),
+            reason: "archive has no UTF-8 file name".to_string(),
+        })
 }
 
 fn source_date_epoch(workspace_root: &Path) -> Result<u64, ArchiveError> {
@@ -900,6 +1107,41 @@ fn temporary_directory(parent: &Path, name: &str) -> Result<PathBuf, ArchiveErro
     invalid(
         parent,
         "could not create a temporary archive directory".to_string(),
+    )
+}
+
+fn temporary_file(parent: &Path, name: &str) -> Result<PathBuf, ArchiveError> {
+    create_directory(parent)?;
+    for attempt in 0..128 {
+        let path = parent.join(format!(".{name}-{}-{attempt}", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(
+                    |source| ArchiveError::Io {
+                        action: "secure temporary archive file",
+                        path: path.clone(),
+                        source,
+                    },
+                )?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(ArchiveError::Io {
+                    action: "create temporary archive file",
+                    path,
+                    source,
+                });
+            }
+        }
+    }
+    invalid(
+        parent,
+        "could not create a temporary archive file".to_string(),
     )
 }
 
