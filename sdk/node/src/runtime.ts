@@ -15,7 +15,9 @@ export class Runtime {
   /**
    * Open a local runtime.
    *
-   * If `vmmonPath` is not set, `vmmon` is resolved from the environment and `PATH`.
+   * `libvm` resolves one complete runtime set. `vmmonPath` replaces only
+   * `vmmon`; `PATH` is considered only with an explicit, complete
+   * `SILO_ASSET_DIR`.
    *
    * @example
    * ```ts

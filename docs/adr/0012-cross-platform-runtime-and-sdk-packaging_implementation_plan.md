@@ -68,6 +68,21 @@ Do not rewrite, reset, revert, or clean unrelated worktree changes. If concurren
 changes conflict directly with the current stage, stop and ask the user rather
 than choosing which work to discard.
 
+### Autonomous Decision Log
+
+From 2026-07-26 onward, when a question would otherwise block progress, the
+implementing agent must record the exact question, concise options, selected
+default, and rationale in this plan, then proceed with the safest
+plan-compatible default. Do not add entries without an actual decision point.
+
+- 2026-07-26, Commit 05 follow-up. Question: How should resolved `krun`
+  propagation be tested without requiring KVM or a guest boot? Options: require
+  a KVM-backed integration test; mock the backend; or execute a temporary
+  `krun` helper through the real Linux backend. Selected default: execute the
+  temporary helper in a Linux-native test. Rationale: it verifies the actual
+  process boundary and forwarded arguments while remaining portable across
+  Linux CI hosts without virtualization support.
+
 ### Breaking-Change Policy
 
 This implementation intentionally abandons compatibility with existing SQL
@@ -809,6 +824,9 @@ git diff --check
   paths across the launch boundaries and clean netd using the current
   data/state/run roots. They exercise helper start handshakes without requiring
   host virtualization or a guest boot.
+- A Linux-native `virt` test launches a temporary resolved `krun` executable
+  through the real backend and verifies its forwarded arguments. It needs no
+  KVM, but executes only on Linux hosts and is therefore a Linux CI/host gate.
 
 ## Commit 06: Establish The Make And Xtask Build Interface
 

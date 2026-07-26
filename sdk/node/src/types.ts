@@ -6,7 +6,9 @@ export type KeyValueMap = Record<string, string>;
 /**
  * Options used when opening a {@link Runtime}.
  *
- * Default VM assets are resolved from Silo's installed asset locations.
+ * `libvm` resolves one complete runtime set, including default boot assets.
+ * `PATH` is disabled unless `SILO_ASSET_DIR` explicitly selects a complete
+ * asset set.
  */
 export interface RuntimeOpenOptions {
   /** Root directory for persistent state. */
@@ -15,7 +17,7 @@ export interface RuntimeOpenOptions {
   runRoot?: string;
   /** Image cache directory. */
   imageRoot?: string;
-  /** Explicit `vmmon` executable path. If unset, `vmmon` is resolved from the environment and `PATH`. */
+  /** Explicit `vmmon` override. Remaining components use centralized discovery. */
   vmmonPath?: string;
 }
 

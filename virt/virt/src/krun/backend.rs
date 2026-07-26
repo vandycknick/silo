@@ -571,3 +571,74 @@ fn invalid_config<T>(config: &VmConfig, reason: &str) -> Result<T, VirtError> {
         reason: reason.to_string(),
     })
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::krun::KrunMachineBackend;
+    use crate::{NetworkMode, VmConfig, VmExit};
+
+    fn test_dir() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "virt-resolved-krun-{}-{timestamp}",
+            std::process::id()
+        ))
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("write executable");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("make executable");
+    }
+
+    #[tokio::test]
+    async fn resolved_krun_path_reaches_the_real_backend_child() {
+        let root = test_dir();
+        fs::create_dir_all(&root).expect("create test root");
+        let kernel = root.join("kernel");
+        fs::write(&kernel, b"kernel").expect("write kernel");
+        let krun = root.join("krun");
+        write_executable(
+            &krun,
+            "#!/bin/sh\nkernel=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--kernel\" ]; then kernel=$arg; fi\n  previous=$arg\ndone\nprintf '%s\\n' \"$0\" > \"${kernel%/*}/krun.program\"\nprintf '%s\\n' \"$@\" > \"${kernel%/*}/krun.args\"\n",
+        );
+        let krun = krun.canonicalize().expect("canonical krun");
+        let kernel = kernel.canonicalize().expect("canonical kernel");
+        let config = VmConfig::builder("resolved-krun")
+            .vm_id("machine-1")
+            .cpus(1)
+            .memory(128)
+            .base_directory(&root)
+            .krun_path(&krun)
+            .kernel(&kernel)
+            .network(NetworkMode::None)
+            .build();
+        let backend = KrunMachineBackend::new(config).expect("create krun backend");
+
+        backend.start().await.expect("spawn resolved krun");
+        assert_eq!(
+            backend.wait().await.expect("wait for krun"),
+            VmExit::Stopped
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("krun.program"))
+                .expect("read executed krun path")
+                .trim(),
+            krun.display().to_string()
+        );
+        let args = fs::read_to_string(root.join("krun.args")).expect("read krun arguments");
+        assert!(args.lines().any(|arg| arg == "--id"));
+        assert!(args.lines().any(|arg| arg == "machine-1"));
+        assert!(args.lines().any(|arg| arg == "--kernel"));
+        assert!(args.lines().any(|arg| arg == kernel.display().to_string()));
+
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+}
