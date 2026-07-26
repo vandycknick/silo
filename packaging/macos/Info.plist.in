@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>Silo</string>
+    <key>CFBundleExecutable</key>
+    <string>silo</string>
+    <key>CFBundleIconFile</key>
+    <string>Silo.icns</string>
+    <key>CFBundleIdentifier</key>
+    <string>sh.silo.app</string>
+    <key>CFBundleName</key>
+    <string>Silo</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@BUILD_NUMBER@</string>
+    <key>LSArchitecturePriority</key>
+    <array>
+        <string>arm64</string>
+    </array>
+    <key>LSMinimumSystemVersion</key>
+    <string>26.0</string>
+</dict>
+</plist>

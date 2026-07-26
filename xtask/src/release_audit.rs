@@ -107,7 +107,7 @@ pub fn verify_archive_runtime(
     audit_extracted_initramfs(&root.join("assets/initramfs"), host)
 }
 
-fn audit_macho(_name: &str, path: &Path) -> Result<(), AuditError> {
+pub fn audit_macho(_name: &str, path: &Path) -> Result<(), AuditError> {
     let load_commands = output("/usr/bin/otool", ["-l"], path)?;
     if load_commands.contains("LC_RPATH") {
         return invalid(path, "contains LC_RPATH".to_string());

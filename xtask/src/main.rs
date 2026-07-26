@@ -13,6 +13,7 @@ use crate::kernel::KernelOptions;
 use crate::profiles::Profile;
 use crate::targets::HostTarget;
 
+mod app;
 mod archive;
 mod command;
 mod components;
@@ -67,6 +68,14 @@ enum Commands {
         kernel: KernelOptions,
     },
     VerifyArchive,
+    App {
+        #[arg(long, value_name = "NUMBER")]
+        build_number: Option<String>,
+        #[arg(long, value_name = "IDENTITY")]
+        developer_id_application: Option<String>,
+        #[command(flatten)]
+        kernel: KernelOptions,
+    },
     Fmt,
     Clippy,
     Test,
@@ -206,6 +215,30 @@ fn run() -> Result<(), Box<dyn Error>> {
                 return Ok(());
             }
             archive::verify(&workspace_root, &target_dir)?;
+        }
+        Commands::App {
+            build_number,
+            developer_id_application,
+            kernel,
+        } => {
+            let host = HostTarget::current()?;
+            if host != HostTarget::MacosArm64 {
+                return Err(app::AppError::UnsupportedHost.into());
+            }
+            build_release_or_development(
+                &workspace_root,
+                &target_dir,
+                Profile::Release,
+                kernel,
+                true,
+            )?;
+            release_audit::verify(&workspace_root, &target_dir, Profile::Release)?;
+            app::assemble(
+                &workspace_root,
+                &target_dir,
+                build_number.as_deref(),
+                developer_id_application.as_deref(),
+            )?;
         }
         Commands::Fmt => format(&workspace_root, &target_dir)?,
         Commands::Clippy => {

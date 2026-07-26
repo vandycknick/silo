@@ -21,7 +21,7 @@ implementation.
 - [x] Commit 07: Build adjacent development runtimes and canonical stages
 - [x] Commit 08: Isolate release linking and audit binaries
 - [x] Commit 09: Produce common release archives and metadata
-- [ ] Commit 10: Assemble and sign `Silo.app`
+- [x] Commit 10: Assemble and sign `Silo.app`
 - [ ] Commit 11: Build the DMG with `create-dmg` and install on macOS
 - [ ] Commit 12: Build and qualify native Linux packages and installs
 - [ ] Commit 13: Split and package the Node SDK
@@ -181,6 +181,19 @@ plan-compatible default. Do not add entries without an actual decision point.
   traversal rejection, and archive/SBOM/provenance consistency catch failures
   that affect packaging without turning local incremental builds into a
   perfect-audit system.
+- 2026-07-26, Commit 10. Question: Should the generated `.icns` be committed,
+  generated during every app assembly, or require an image dependency? Options:
+  commit a binary icon; generate `Silo.icns` deterministically from the existing
+  mark with macOS `sips` and `iconutil`; or add an image library. Selected
+  default: generate it in the ignored app assembly directory with native tools.
+  Rationale: it keeps the repository source-only, has no new dependency, and is
+  inexpensive beside an incremental release stage.
+- 2026-07-26, Commit 10. Question: What should supply `CFBundleVersion` for a
+  local build? Options: require every invocation to provide a build number; use
+  a wall-clock value; or accept `BUILD_NUMBER` and otherwise use `git rev-list
+  --count HEAD`. Selected default: the explicit `BUILD_NUMBER` wins, with the
+  commit count as the monotonic local default. Rationale: it follows Ghostty's
+  release input while keeping `make app` runnable without release credentials.
 
 ### Breaking-Change Policy
 
@@ -1370,6 +1383,23 @@ Inspected Ghostty's `src/build/GhosttyDist.zig`, release-tag workflow, and
 ## Commit 10: Assemble And Sign Silo.app
 
 Suggested intent: `packaging: assemble the macOS application bundle`
+
+### Ghostty Reference Notes
+
+Inspected Ghostty's `.github/workflows/release-tag.yml`, macOS plist and
+entitlement resources, and `src/build/GhosttyDist.zig`.
+
+- Reused Ghostty's high-level handoff: assemble one final product, write final
+  metadata before signing, sign nested code inside-out, strictly verify it, and
+  hand that verified product to later distribution stages.
+- Reused its cache-friendly philosophy for local assembly: Silo rebuilds the
+  existing release stage incrementally and writes only a temporary bundle before
+  atomically exchanging the final app directory.
+- Intentionally did not copy Ghostty's Swift/Xcode app, XCFramework build,
+  Sparkle updater, native app framework, DMG/notarization/stapling flow, or
+  source-tarball implementation. Silo keeps a Rust CLI bundle, Rust xtask, and
+  a simple Make entrypoint; the later DMG commit owns transport and release
+  handoff.
 
 ### Purpose
 
