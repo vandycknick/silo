@@ -15,6 +15,7 @@ use crate::kernel::KernelOptions;
 use crate::targets::HostTarget;
 
 const APPLE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+pub const MACOS_DEPLOYMENT_TARGET: &str = "26.0";
 pub const CONTAINER_MARKER: &str = "SILO_RELEASE_CONTAINER";
 
 #[derive(Debug)]
@@ -264,7 +265,7 @@ pub fn configure_command(
             env::join_paths(paths).map_err(|_| ReleaseError::InvalidXcrunPath { tool: "PATH" })?,
         )
         .env("SDKROOT", sdk)
-        .env("MACOSX_DEPLOYMENT_TARGET", "26.0")
+        .env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET)
         .env("CC", clang)
         .env("CXX", xcrun("clang++")?)
         .env("LD", linker)
@@ -303,6 +304,30 @@ pub fn configure_guest_init_command(
     command
         .env("RUSTFLAGS", flags.join(" "))
         .env("CARGO_ENCODED_RUSTFLAGS", flags.join("\u{1f}"));
+}
+
+pub fn set_macos_build_version(path: &Path) -> Result<(), ReleaseError> {
+    let temporary = path.with_extension(format!("vtool-{}", std::process::id()));
+    let mut vtool = Command::new("/usr/bin/vtool");
+    vtool
+        .args([
+            "-arch",
+            "arm64",
+            "-set-build-version",
+            "macos",
+            MACOS_DEPLOYMENT_TARGET,
+            MACOS_DEPLOYMENT_TARGET,
+            "-replace",
+            "-output",
+        ])
+        .arg(&temporary)
+        .arg(path);
+    command::run(vtool)?;
+    fs::rename(&temporary, path).map_err(|source| ReleaseError::Io {
+        action: "install Mach-O with macOS build version",
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 pub fn verify_linux_toolchain(workspace_root: &Path, host: HostTarget) -> Result<(), ReleaseError> {

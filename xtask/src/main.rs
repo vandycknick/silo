@@ -1,10 +1,13 @@
 use std::env;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::{Parser, Subcommand};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::components::{
@@ -128,7 +131,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 return Ok(());
             }
             let component_target = if profile == Profile::Release {
-                clean_release_target(&target_dir)?
+                release_target(&workspace_root, &target_dir)?
             } else {
                 target_dir.clone()
             };
@@ -218,14 +221,27 @@ fn build_release_or_development(
         return Ok(());
     }
 
-    let clean_target = clean_release_target(target_dir)?;
-    let clean = build_context(workspace_root, &clean_target, profile)?;
-    build_all(&clean)?;
-    let kernel = kernel::resolve(&clean, &kernel_options)?;
-    runtime::assemble_development(&clean, &kernel)?;
+    let host = HostTarget::current()?;
+    let source_fingerprint = release_source_fingerprint(workspace_root, profile, host)?;
+    let build_fingerprint = release_build_fingerprint(&source_fingerprint, &kernel_options);
+    let release_target = release_target_path(target_dir, host);
+    if release_stamp_matches(&release_target, &build_fingerprint)? {
+        println!(
+            "reusing qualified release output: {}",
+            release_target.display()
+        );
+    } else {
+        prepare_release_target(&release_target, &source_fingerprint)?;
+        let clean = build_context(workspace_root, &release_target, profile)?;
+        build_all(&clean)?;
+        let kernel = kernel::resolve(&clean, &kernel_options)?;
+        runtime::assemble_development(&clean, &kernel)?;
+        write_release_stamp(&release_target, &source_fingerprint, &build_fingerprint)?;
+    }
 
     let public = build_context(workspace_root, target_dir, profile)?;
-    runtime::publish_adjacent(&clean, &public)?;
+    let qualified = build_context(workspace_root, &release_target, profile)?;
+    runtime::publish_adjacent(&qualified, &public)?;
     if stage {
         runtime::stage(&public)?;
     }
@@ -251,17 +267,168 @@ fn component_make_target(component: Component) -> &'static str {
     }
 }
 
-fn clean_release_target(target_dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
+fn release_target(workspace_root: &Path, target_dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let host = HostTarget::current()?;
-    let clean_target = target_dir.join("release-build").join(host.runtime_target());
-    if clean_target.exists() {
-        let mut chmod = Command::new("/bin/chmod");
-        chmod.args(["-R", "u+w"]).arg(&clean_target);
-        command::run(chmod)?;
-        fs::remove_dir_all(&clean_target)?;
+    let target = release_target_path(target_dir, host);
+    let source_fingerprint = release_source_fingerprint(workspace_root, Profile::Release, host)?;
+    prepare_release_target(&target, &source_fingerprint)?;
+    Ok(target)
+}
+
+fn release_target_path(target_dir: &Path, host: HostTarget) -> PathBuf {
+    target_dir.join("release-build").join(host.runtime_target())
+}
+
+fn prepare_release_target(target: &Path, source_fingerprint: &str) -> Result<(), Box<dyn Error>> {
+    let stamp = target.join(".silo-release-stamp");
+    if release_stamp_source_matches(target, source_fingerprint)? {
+        fs::remove_file(stamp)?;
+        write_atomically(
+            &target.join(".silo-release-priming"),
+            source_fingerprint.as_bytes(),
+        )?;
+        return Ok(());
     }
-    fs::create_dir_all(&clean_target)?;
-    Ok(clean_target)
+    if !stamp.exists()
+        && read_stamp(&target.join(".silo-release-priming"))?.as_deref() == Some(source_fingerprint)
+    {
+        return Ok(());
+    }
+    clear_release_target(target)?;
+    fs::create_dir_all(target)?;
+    write_atomically(
+        &target.join(".silo-release-priming"),
+        source_fingerprint.as_bytes(),
+    )
+}
+
+fn clear_release_target(target: &Path) -> Result<(), Box<dyn Error>> {
+    if target.exists() {
+        let mut chmod = Command::new("/bin/chmod");
+        chmod.args(["-R", "u+w"]).arg(target);
+        command::run(chmod)?;
+        fs::remove_dir_all(target)?;
+    }
+    Ok(())
+}
+
+fn release_source_fingerprint(
+    workspace_root: &Path,
+    profile: Profile,
+    host: HostTarget,
+) -> Result<String, Box<dyn Error>> {
+    let mut git = Command::new("git");
+    git.current_dir(workspace_root).args(["ls-files", "-z"]);
+    let tracked = command::output(git)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"silo-release-source-v1\0");
+    hasher.update(profile.directory().as_bytes());
+    hasher.update([0]);
+    hasher.update(host.runtime_target().as_bytes());
+    hasher.update([0]);
+    for path in tracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let relative = PathBuf::from(OsString::from_vec(path.to_vec()));
+        let absolute = workspace_root.join(&relative);
+        let metadata = fs::symlink_metadata(&absolute)?;
+        hasher.update(path);
+        hasher.update([0]);
+        if metadata.file_type().is_symlink() {
+            hasher.update(b"symlink\0");
+            hasher.update(fs::read_link(absolute)?.as_os_str().as_bytes());
+        } else if metadata.is_file() {
+            hasher.update(b"file\0");
+            hasher.update(fs::read(absolute)?);
+        } else {
+            return Err(format!(
+                "tracked path is not a file or symlink: {}",
+                relative.display()
+            )
+            .into());
+        }
+        hasher.update([0]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn release_build_fingerprint(source_fingerprint: &str, kernel: &KernelOptions) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"silo-release-build-v1\0");
+    hasher.update(source_fingerprint.as_bytes());
+    hasher.update([0]);
+    hasher.update(kernel.reference().as_bytes());
+    hasher.update([0]);
+    hasher.update(kernel.offline().to_string().as_bytes());
+    hasher.update([0]);
+    if let Some(path) = kernel.local_path() {
+        hasher.update(path.as_os_str().as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn release_stamp_matches(target: &Path, build_fingerprint: &str) -> Result<bool, Box<dyn Error>> {
+    Ok(read_stamp(&target.join(".silo-release-stamp"))?
+        .and_then(|stamp| {
+            stamp
+                .split_once('\n')
+                .map(|(_, build)| build == build_fingerprint)
+        })
+        .unwrap_or(false))
+}
+
+fn release_stamp_source_matches(
+    target: &Path,
+    source_fingerprint: &str,
+) -> Result<bool, Box<dyn Error>> {
+    Ok(read_stamp(&target.join(".silo-release-stamp"))?
+        .and_then(|stamp| {
+            stamp
+                .split_once('\n')
+                .map(|(source, _)| source == source_fingerprint)
+        })
+        .unwrap_or(false))
+}
+
+fn read_stamp(path: &Path) -> Result<Option<String>, Box<dyn Error>> {
+    match fs::read_to_string(path) {
+        Ok(stamp) => Ok(Some(stamp.trim().to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_release_stamp(
+    target: &Path,
+    source_fingerprint: &str,
+    build_fingerprint: &str,
+) -> Result<(), Box<dyn Error>> {
+    write_atomically(
+        &target.join(".silo-release-stamp"),
+        format!("{source_fingerprint}\n{build_fingerprint}\n").as_bytes(),
+    )?;
+    let priming = target.join(".silo-release-priming");
+    if priming.exists() {
+        fs::remove_file(priming)?;
+    }
+    Ok(())
+}
+
+fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), Box<dyn Error>> {
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temporary, contents)?;
+    fs::rename(temporary, path)?;
+    Ok(())
 }
 
 fn build_context<'a>(

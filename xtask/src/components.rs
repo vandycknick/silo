@@ -183,10 +183,12 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     )?;
     go.env("CARGO_TARGET_DIR", context.target_dir);
     context.profile.apply_go(&mut go);
-    go.args(["-o"])
-        .arg(output_dir.join("netd"))
-        .arg("./cmd/netd");
+    let output = output_dir.join("netd");
+    go.args(["-o"]).arg(&output).arg("./cmd/netd");
     command::run(go)?;
+    if context.profile == Profile::Release && context.host == HostTarget::MacosArm64 {
+        release::set_macos_build_version(&output)?;
+    }
     Ok(())
 }
 

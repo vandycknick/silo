@@ -153,11 +153,34 @@ plan-compatible default. Do not add entries without an actual decision point.
   final linking, not duplicate toolchain distribution; accepting arbitrary PATH
   tools was neither required nor safe.
 - 2026-07-26, Commit 08 follow-up. Question: Should the auditor reject all
-  temporary paths despite Silo's documented `/tmp/silo-<uid>` fallback? Options:
-  retain a narrow compiler-prefix list; reject all `/tmp`; or permit only the
-  documented Silo path family. Selected default: reject every temporary path
-  except `/tmp/silo-`. Rationale: this closes compiler/cache false negatives
-  without rejecting the runtime contract.
+  temporary paths despite guest `/tmp` runtime state? Options: retain a narrow
+  compiler-prefix list; reject all `/tmp`; or permit guest `/tmp`. Selected
+  default: permit `/tmp` and reject host-specific compiler, package-manager,
+  workspace, and cache paths. Rationale: raw strings cannot distinguish guest
+  runtime paths from build paths, while the link audit independently rejects
+  RPATH contamination.
+- 2026-07-26, Commit 08 qualification. Question: A cold isolated macOS release
+  exceeded the five-minute command limit while acquiring its separate Cargo and
+  Go dependencies; should qualification remain blocked, retry once with the
+  now-warm verified caches, or weaken isolation by reusing development
+  artifacts? Selected default: retry once with the warm isolated caches.
+  Rationale: this distinguishes one-time acquisition cost from build behavior
+  while preserving the release boundary; development artifact reuse is never an
+  acceptable fallback.
+- 2026-07-26, Commit 08 qualification. Question: The aggregate warm-cache
+  retry also exceeded five minutes. Options: leave qualification blocked; prime
+  the identical isolated release target through public component targets; or
+  weaken the boundary by reusing development artifacts. Selected default: prime
+  the identical isolated target component-by-component. Rationale: bounded
+  commands make qualification observable without changing the resulting build
+  graph or release isolation; development artifact reuse is never an acceptable
+  fallback.
+- 2026-07-26, Commit 08 qualification. Question: Stage repeated a fresh
+  isolated build and timed out. Options: leave qualification blocked; repeatedly
+  prime; or safely reuse only a fingerprint-matching isolated release output.
+  Selected default: fingerprint-matching reuse. Rationale: stage/archive
+  transports must consume already built canonical bytes and development objects
+  remain excluded.
 
 ### Breaking-Change Policy
 

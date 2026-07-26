@@ -593,7 +593,6 @@ fn reject_build_paths(
         "/opt/local/".to_string(),
         "/private/var/folders/".to_string(),
         "/var/folders/".to_string(),
-        "/tmp/".to_string(),
         "/private/tmp/".to_string(),
     ];
     for root in [workspace_root, target_dir] {
@@ -605,20 +604,11 @@ fn reject_build_paths(
         forbidden.push(format!("{}/go/pkg/mod/", home.display()));
     }
     for value in forbidden {
-        if value == "/tmp/" && !contains_forbidden_temporary_path(&strings, "/tmp/") {
-            continue;
-        }
         if strings.contains(&value) {
             return invalid(path, format!("contains build path {value}"));
         }
     }
     Ok(())
-}
-
-fn contains_forbidden_temporary_path(strings: &str, root: &str) -> bool {
-    strings
-        .match_indices(root)
-        .any(|(offset, _)| !strings[offset..].starts_with("/tmp/silo-"))
 }
 
 fn output<'a>(
