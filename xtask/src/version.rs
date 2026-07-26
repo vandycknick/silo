@@ -1,10 +1,12 @@
 use std::fs;
 use std::path::Path;
 
+use serde_json::Value;
 use thiserror::Error;
 
 const RUST_PRODUCT_MANIFESTS: &[&str] = &[
     "app/cli/Cargo.toml",
+    "runtime/libvm/Cargo.toml",
     "runtime/vmmon/Cargo.toml",
     "virt/krun/Cargo.toml",
     "guest/agent/Cargo.toml",
@@ -12,6 +14,7 @@ const RUST_PRODUCT_MANIFESTS: &[&str] = &[
     "sdk/node/Cargo.toml",
 ];
 const NODE_PRODUCT_MANIFEST: &str = "sdk/node/package.json";
+const NODE_PRODUCT_LOCKFILE: &str = "sdk/node/package-lock.json";
 
 #[derive(Debug, Error)]
 pub enum VersionError {
@@ -20,6 +23,12 @@ pub enum VersionError {
         path: String,
         #[source]
         source: std::io::Error,
+    },
+    #[error("failed to parse JSON in {path}")]
+    ParseJson {
+        path: String,
+        #[source]
+        source: serde_json::Error,
     },
     #[error("VERSION must contain a semantic version, found {version:?}")]
     InvalidAuthority { version: String },
@@ -44,10 +53,22 @@ pub fn check(workspace_root: &Path) -> Result<(), VersionError> {
     for manifest in RUST_PRODUCT_MANIFESTS {
         check_declaration(workspace_root, manifest, "version =", &authority)?;
     }
-    check_declaration(
+    check_json_version(
         workspace_root,
         NODE_PRODUCT_MANIFEST,
-        "\"version\":",
+        &["version"],
+        &authority,
+    )?;
+    check_json_version(
+        workspace_root,
+        NODE_PRODUCT_LOCKFILE,
+        &["version"],
+        &authority,
+    )?;
+    check_json_version(
+        workspace_root,
+        NODE_PRODUCT_LOCKFILE,
+        &["packages", "", "version"],
         &authority,
     )?;
 
@@ -72,6 +93,36 @@ fn check_declaration(
             path: relative_path.to_string(),
             expected: expected.to_string(),
             actual,
+        });
+    }
+    Ok(())
+}
+
+fn check_json_version(
+    workspace_root: &Path,
+    relative_path: &str,
+    fields: &[&str],
+    expected: &str,
+) -> Result<(), VersionError> {
+    let path = workspace_root.join(relative_path);
+    let contents = read(&path)?;
+    let json: Value =
+        serde_json::from_str(&contents).map_err(|source| VersionError::ParseJson {
+            path: relative_path.to_string(),
+            source,
+        })?;
+    let actual = fields
+        .iter()
+        .try_fold(&json, |value, field| value.get(*field))
+        .and_then(Value::as_str)
+        .ok_or_else(|| VersionError::MissingDeclaration {
+            path: format!("{relative_path} ({})", fields.join(".")),
+        })?;
+    if actual != expected {
+        return Err(VersionError::Mismatch {
+            path: format!("{relative_path} ({})", fields.join(".")),
+            expected: expected.to_string(),
+            actual: actual.to_string(),
         });
     }
     Ok(())

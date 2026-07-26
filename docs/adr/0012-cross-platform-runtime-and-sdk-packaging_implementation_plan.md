@@ -86,10 +86,13 @@ plan-compatible default. Do not add entries without an actual decision point.
   independently versioned `common/ext4` crate, which is currently `0.1.2`, as
   well as product artifacts? Options: rewrite every workspace crate to `0.1.0`;
   make version-check fail on the existing `ext4` version; or check the shipped
-  Rust product manifests and Node package only. Selected default: check the
-  shipped product manifests and Node package only. Rationale: `ext4` is an
-  existing reusable component rather than a product-version authority, and
-  rewriting it would violate this commit's no-unrelated-version-rewrites rule.
+  Rust product manifests and Node package metadata only. Selected default:
+  check the shipped product manifests, including `runtime/libvm` because its
+  `CARGO_PKG_VERSION` validates the app-bundle version, plus `package.json` and
+  both root package versions in the committed Node lockfile. Rationale: `ext4`
+  is an existing reusable component rather than a product-version authority,
+  and rewriting it would violate this commit's no-unrelated-version-rewrites
+  rule.
 
 ### Breaking-Change Policy
 
