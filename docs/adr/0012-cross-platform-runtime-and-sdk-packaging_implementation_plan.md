@@ -12,7 +12,7 @@ while it is in progress. Check it only after all of that commit's acceptance
 criteria pass, then include the tracker update in the same commit as the
 implementation.
 
-- [ ] Commit 01: Correct and finalize ADR 0012
+- [x] Commit 01: Correct and finalize ADR 0012
 - [ ] Commit 02: Reset the SQL schema and durable root identity
 - [ ] Commit 03: Split data, state, and run paths securely
 - [ ] Commit 04: Centralize runtime component resolution
@@ -377,6 +377,24 @@ Suggested intent: `docs: finalize cross-platform packaging architecture`
 Make the accepted ADR match the final decisions before implementation begins.
 The ADR currently contains the old temporary-directory fallback, compatibility
 migration requirements, and broader transitional discovery.
+
+### Ghostty Reference Notes
+
+Inspected Ghostty's `Makefile`, `build.zig`, `src/build/GhosttyDist.zig`,
+`nix/devShell.nix`, `nix/package.nix`, `PACKAGING.md`, and
+`.github/workflows/release-tag.yml`.
+
+- Reused the high-level separation of typed build orchestration, one assembled
+  artifact qualified before transport, clean native macOS signing handoff, and
+  downstream package staging through explicit prefix and `DESTDIR` boundaries.
+- Reused the release ordering of app assembly, nested signing, `create-dmg`,
+  notarization, stapling, and staged artifact handoff as the model for Silo's
+  documented release flow.
+- Intentionally did not copy Ghostty's peripheral Makefile, Zig build graph,
+  Swift/Xcode app, XCFramework, Sparkle updater, Flatpak, Snap, or its
+  downstream-owned distro packaging. Silo keeps Make as the public interface,
+  Rust xtask as orchestrator, `create-dmg` as the DMG tool, and owns separately
+  qualified deb, rpm, and Arch artifacts.
 
 ### Required Changes
 

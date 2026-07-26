@@ -169,9 +169,36 @@ silo-<version>-<target>/
     agent
 ```
 
-### Portable Staging
+### Development And Release Staging
 
-Developer and release staging use the portable layout in predictable target
+Make is the public repository build interface. Rust xtask owns build and
+packaging orchestration behind Make.
+
+`make` creates a complete adjacent development runtime in the selected Cargo
+profile directory:
+
+```text
+<cargo-target-dir>/debug/
+  silo
+  vmmon
+  netd
+  krun
+  assets/
+    kernel-default
+    initramfs
+    agent
+```
+
+The release-profile developer layout has the same shape below
+`<cargo-target-dir>/release/`. The resolver canonicalizes `current_exe()` and
+checks only its direct directory for this layout. It does not infer a workspace
+root, inspect `CARGO_TARGET_DIR`, identify a Cargo profile, walk ancestors, or
+map a Cargo executable to a stage directory. A raw `cargo build -p cli` may
+produce an incomplete directory; running that executable fails with a diagnostic
+that identifies the missing adjacent components and recommends `make`.
+
+Canonical staging remains separate from adjacent development runtime discovery.
+`make stage` creates the portable six-file payload in predictable target
 directories:
 
 ```text
@@ -182,11 +209,11 @@ target/silo-runtime/linux-arm64-gnu/release/
 ```
 
 Developers select a staged root through `RuntimeConfig` or
-`SILO_RUNTIME_DIR`. `libvm` does not inspect arbitrary Cargo target directories.
-The staged payload is the common input to the app, Linux packages, SDK platform
-packages, and runtime archives. Packagers do not rebuild or substitute
-components after staging, except for required platform signing and container
-metadata.
+`SILO_RUNTIME_DIR`. `libvm` does not infer a stage from an arbitrary Cargo
+executable. The staged payload is the common input to the app, Linux packages,
+SDK platform packages, and runtime archives. Packagers do not rebuild or
+substitute components after staging, except for required platform signing and
+container metadata.
 
 ### Default Kernel Provenance
 
@@ -246,7 +273,7 @@ repository-owned staging command
 GoReleaser Pro is not part of the design. The common contract is the staged
 payload, not one third-party packager.
 
-## Installation Ownership, Mutable XDG State, And Migration
+## Installation Ownership, Mutable XDG State, And Unsupported Old Layouts
 
 Package-owned product files are immutable. Silo never writes mutable state into
 `Silo.app` or package-owned `/usr` paths. Linux and macOS use the same XDG
@@ -254,18 +281,14 @@ conventions for user-owned product files and mutable state; Silo does not use
 `~/Library/Application Support`, `~/Library/Caches`, or `~/Library/Logs` on
 macOS.
 
-| Purpose                            | Environment location           | Fallback on Linux and macOS                              |
-| ---------------------------------- | ------------------------------ | -------------------------------------------------------- |
-| Data root, database, machines      | `$XDG_DATA_HOME/silo`          | `$HOME/.local/share/silo`                                |
-| Images                             | `$XDG_DATA_HOME/silo/images`   | `$HOME/.local/share/silo/images`                         |
-| Downloaded runtimes                | `$XDG_DATA_HOME/silo/runtimes` | `$HOME/.local/share/silo/runtimes`                       |
-| Downloaded kernels                 | `$XDG_DATA_HOME/silo/kernels`  | `$HOME/.local/share/silo/kernels`                        |
-| Configuration                      | `$XDG_CONFIG_HOME/silo`        | `$HOME/.config/silo`                                     |
-| Cache                              | `$XDG_CACHE_HOME/silo`         | `$HOME/.cache/silo`                                      |
-| Logs and durable operational state | `$XDG_STATE_HOME/silo`         | `$HOME/.local/state/silo`                                |
-| Sockets, locks, and PID files      | `$XDG_RUNTIME_DIR/silo`        | An owner-isolated directory below `std::env::temp_dir()` |
+| Purpose                    | Environment or configuration             | Fallback on Linux and macOS       |
+| -------------------------- | ---------------------------------------- | --------------------------------- |
+| Data                       | `$XDG_DATA_HOME/silo`                    | `$HOME/.local/share/silo`         |
+| State and logs             | `$XDG_STATE_HOME/silo`                   | `$HOME/.local/state/silo`         |
+| Images                     | Runtime-configured or data root           | `$HOME/.local/share/silo/images`  |
+| Runtime files              | `$XDG_RUNTIME_DIR/silo`                   | `/tmp/silo-<effective-uid>`       |
 
-The default data tree remains compatible with the existing Linux layout:
+The default data tree is:
 
 ```text
 ${XDG_DATA_HOME:-$HOME/.local/share}/silo/
@@ -310,18 +333,11 @@ canonical machine configuration. PID files, sockets, network runtime files, and
 locks are ephemeral and never belong below the data root in a newly created
 layout.
 
-Existing installations may contain logs, PID files, sockets, and exit records
-inside `data-root/machines/<machine-id>`. Migration runs only while that machine
-is stopped. It moves durable logs and exit records into the state layout, drops
-stale ephemeral files, and leaves canonical machine data in place. If the
-machine is active, migration fails with an actionable stop-and-retry error.
-Legacy files are not silently deleted before their durable replacements have
-moved successfully.
-
-Existing `netd.log` files below a legacy run root move to the network-log state
-layout only after the associated netd process has stopped. Packet captures are
-not covered by this migration contract. Their retention remains a separate
-product decision.
+Existing SQL migration history and old mutable filesystem layouts are
+unsupported after this breaking release. Silo does not migrate, adopt, or read
+old databases or old layouts. With all Silo processes stopped, users must
+manually archive or remove the old state and mutable files before opening the
+new layout.
 
 XDG environment paths and `$HOME` must be absolute when used. Silo rejects a
 relative value rather than interpreting it relative to the process working
@@ -333,36 +349,25 @@ The run-root resolution order is:
 
 1. Explicit `RuntimeConfig` run root.
 2. `$XDG_RUNTIME_DIR/silo`.
-3. An owner-isolated path derived from `std::env::temp_dir()`.
+3. `/tmp/silo-<effective-uid>`.
 
-Silo uses Rust's platform temporary-directory resolution rather than reading
-`TMPDIR` directly. On macOS that API normally returns the user's Darwin
-temporary directory, so the fallback is `<temp-dir>/silo`. Where the returned
-base is shared, including the common Linux `/tmp` case, the fallback includes
-the effective user identity, for example `/tmp/silo-1000`.
-
-The directory is created with mode `0700`. Silo verifies that it is a real
-directory owned by the effective user and rejects symlinks, foreign ownership,
-or unsafe permissions. It never uses a cross-user `/tmp/silo` directory.
+The fallback ignores process temporary-directory settings, including `TMPDIR`.
+Silo obtains the effective UID and creates or validates
+`/tmp/silo-<effective-uid>` as a real, non-symlink directory owned by that
+effective user with exact mode `0700`. It rejects symlinks, foreign ownership,
+non-directories, and unsafe permissions. It never uses a cross-user
+`/tmp/silo` directory.
 
 The run root is ephemeral session placement, not durable database identity.
 `Runtime::open` resolves the default run root from the current environment on
 every open. An explicit `RuntimeConfig` run root applies to that runtime instance
 without requiring the same value on later opens.
 
-Implementation removes `run_root` from the roots that `db_config` permanently
-binds to a state database. Data and image roots remain durable. The database
-migration must detect active processes using the previously stored run root and
-refuse migration with an actionable error rather than split one live runtime
-across two roots. Once no Silo process uses it, old locks, sockets, PID files,
-and network runtime files are ephemeral and are not moved into the newly
-resolved directory.
-
-`RuntimeConfig` gains a state-root choice using the XDG state default, and
-`db_config` persists that durable root beside the data and image roots. The
-schema migration derives and stores it once for an existing database. Later
-explicit data, image, or state roots must match the stored database identity;
-the ephemeral run root is intentionally exempt from that rule.
+`db_config` persists data, state, and image roots as durable database identity;
+it does not persist the run root. `Runtime::open` resolves the current run root
+for every open. Later explicit data, image, or state roots must match the stored
+database identity; the ephemeral run root is intentionally exempt from that
+rule.
 
 ## Runtime Discovery
 
@@ -392,11 +397,12 @@ Resolution follows this order:
 3. Existing per-component environment variables.
 4. `SILO_RUNTIME_DIR` using the portable layout.
 5. A runtime bundled with the caller.
-6. A runtime relative to the canonical current executable, including
+6. A complete development runtime adjacent to the canonical current executable.
+7. A portable runtime relative to the canonical current executable, including
    `Silo.app`.
-7. Conventional native package locations.
-8. Transitional `PATH`, sibling-binary, and historical asset fallbacks.
-9. A missing-runtime error.
+8. One complete helper set from `PATH` when `SILO_ASSET_DIR` is explicit.
+9. Conventional native package locations.
+10. A missing-runtime error.
 
 Existing environment controls remain available while lookup is centralized:
 
@@ -409,22 +415,89 @@ SILO_ASSET_DIR
 
 `SILO_RUNTIME_DIR` selects the complete portable root. Explicit per-component
 paths can replace individual files for testing and embedding. All explicit
-paths are absolute. Portable-root resolution verifies that derived paths remain
-below the selected root and are regular files. `vmmon`, `netd`, `krun`, and
-`agent` must be executable. `kernel-default` and `initramfs` must be readable
-but need not be executable.
+paths are absolute. A malformed authoritative input, including a relative or
+incomplete `SILO_RUNTIME_DIR`, fails immediately instead of falling through to
+lower-precedence discovery. Portable-root resolution verifies that derived paths
+remain below the selected root and are regular files. `vmmon`, `netd`, `krun`,
+and `agent` must be executable. `kernel-default` and `initramfs` must be
+readable but need not be executable.
 
-App-bundle resolution additionally validates bundle identifier `sh.silo.app`,
-exact release compatibility, architecture, and minimum system version. Native
-package resolution checks only a small documented set of platform paths; it does
-not query dpkg, rpm, Homebrew, Spotlight, or mounted volumes.
+Native package resolution checks only a small documented set of platform paths;
+it does not query dpkg, rpm, Homebrew, Spotlight, or mounted volumes.
 
 Explicit machine asset overrides remain independent. An explicit machine kernel,
 initramfs, or agent wins for that asset without replacing the other defaults.
 Every omitted asset comes from the one asset directory selected by the resolved
 installation. `SILO_ASSET_DIR` likewise selects one complete default asset set.
-Transitional asset locations are considered as complete directories and never
-mixed per file.
+
+#### Adjacent Development Runtime
+
+For a canonical executable at `<cargo-target-dir>/debug/silo`, the complete
+adjacent development layout is:
+
+```text
+<cargo-target-dir>/debug/
+  silo
+  vmmon
+  netd
+  krun
+  assets/
+    kernel-default
+    initramfs
+    agent
+```
+
+The release-profile developer layout has the same shape below
+`<cargo-target-dir>/release/`. Discovery checks only the canonical executable's
+direct directory. It does not walk from `target/debug/deps` to `target/debug`;
+tests and consumers in that location use explicit component paths,
+`runtime_root`, or `SILO_RUNTIME_DIR`.
+
+#### Portable Executable-Relative Runtime
+
+For a canonical executable at `<portable-root>/bin/silo`, portable discovery
+derives and validates this fixed layout:
+
+```text
+<portable-root>/
+  bin/
+    silo
+    vmmon
+    netd
+    krun
+  assets/
+    kernel-default
+    initramfs
+    agent
+```
+
+#### Silo.app Executable-Relative Runtime
+
+`Silo.app` is a separate executable-relative layout: a canonical executable at
+`Silo.app/Contents/MacOS/silo` uses helpers from `Contents/Helpers` and assets
+from `Contents/Resources/assets`. App-bundle resolution additionally validates
+bundle identifier `sh.silo.app`, exact release compatibility, architecture, and
+minimum system version.
+
+#### Controlled PATH Resolution
+
+`PATH` is disabled unless `SILO_ASSET_DIR` is explicitly set and successfully
+validates as one complete asset set. When enabled, resolution considers PATH
+entries in order, considers only absolute entries, and requires `vmmon`, `netd`,
+and `krun` to exist and be executable in one entry. It never combines helpers
+from different PATH entries, and higher-precedence explicit helper overrides
+still apply. Empty and relative PATH entries are not resolved against the
+working directory. If no complete helper set is found, the error reports every
+considered absolute candidate.
+
+There is no automatic lookup of historical asset directories, including:
+
+```text
+/usr/local/share/silo/assets
+$HOME/.local/share/silo/assets
+```
+
+Users may select either directory explicitly with `SILO_ASSET_DIR`.
 
 A failure identifies the missing component, candidate locations considered, a
 malformed supplied override, and the expected native or portable layout.
@@ -560,6 +633,10 @@ entitlements are granted only when their need is demonstrated for that
 executable. The CLI and `netd` do not inherit virtualization entitlements merely
 because they share the bundle.
 
+`create-dmg` is the selected DMG builder. Xtask invokes the pinned tool after
+assembling, signing, and verifying `Silo.app`; local builds use `--no-code-sign`
+and protected release builds supply the explicit Developer ID identity.
+
 The release pipeline:
 
 1. Builds arm64 binaries with a macOS 26 deployment target.
@@ -570,7 +647,7 @@ The release pipeline:
 6. Rejects Nix-store, build-prefix, and unavailable non-system dependencies.
 7. Signs nested executables with a Developer ID Application identity.
 8. Signs the outer app with hardened runtime and timestamping.
-9. Builds the DMG.
+9. Builds the DMG with `create-dmg`.
 10. Submits the distribution through `xcrun notarytool`.
 11. Staples and validates the notarization ticket.
 12. Tests the result on a clean macOS 26 machine without development tools.
@@ -628,18 +705,14 @@ installations. A source or administrator installation may use:
 The default assets are architecture-specific: the kernel differs between arm64
 and amd64, the agent is a compiled guest executable, and the initramfs contains
 architecture-specific executables. Package-owned defaults therefore belong below
-a private `lib` directory rather than `/usr/share` or `/usr/local/share`. The
-current `/usr/local/share/silo/assets` location is a transitional lookup
-fallback, not the canonical destination for new packages.
+a private `lib` directory rather than `/usr/share` or `/usr/local/share`.
 
-Release CI produces separate amd64 and arm64 artifacts:
-
-- Debian packages;
-- RPM packages;
-- Arch binary packages;
-- generic `.tar.zst` runtime or CLI archives;
-- detached checksums and signatures; and
-- SBOM and provenance records.
+Release CI produces separately qualified native-format artifacts for Debian,
+Ubuntu, RHEL, and Arch from the same immutable staged bytes for each target
+architecture. Distribution metadata and package formats may differ, but helpers
+and assets are not rebuilt per package. It also produces generic `.tar.zst`
+runtime and CLI archives, detached checksums and signatures, and SBOM and
+provenance records.
 
 Silo uses nFPM directly for deb, rpm, and Arch package construction. The
 payload contains Rust binaries, a Go binary, generated assets, and a kernel
