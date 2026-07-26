@@ -82,6 +82,31 @@ pub fn verify(
     Ok(())
 }
 
+pub fn verify_archive_runtime(
+    root: &Path,
+    portable: bool,
+    host: HostTarget,
+) -> Result<(), AuditError> {
+    let mut binaries = vec!["vmmon", "netd", "krun"];
+    if portable {
+        binaries.push("silo");
+    }
+    match host {
+        HostTarget::MacosArm64 => {
+            for name in binaries {
+                audit_macho(name, &root.join("bin").join(name))?;
+            }
+        }
+        HostTarget::LinuxX86_64 | HostTarget::LinuxArm64 => {
+            for name in binaries {
+                audit_elf(name, &root.join("bin").join(name), host)?;
+            }
+        }
+    }
+    audit_static_elf(&root.join("assets/agent"), host)?;
+    audit_extracted_initramfs(&root.join("assets/initramfs"), host)
+}
+
 fn audit_macho(_name: &str, path: &Path) -> Result<(), AuditError> {
     let load_commands = output("/usr/bin/otool", ["-l"], path)?;
     if load_commands.contains("LC_RPATH") {
@@ -208,6 +233,26 @@ fn audit_staged_initramfs(
         .join(host.guest_target().triple())
         .join("release/init");
     audit_static_elf(&expected, host)?;
+    let init = read_initramfs_init(initramfs)?;
+    let expected_bytes = fs::read(&expected).map_err(|source| AuditError::ReadArtifact {
+        path: expected.clone(),
+        source,
+    })?;
+    if init != expected_bytes {
+        return invalid(
+            initramfs,
+            "embedded init differs from the release init".to_string(),
+        );
+    }
+    audit_static_elf_bytes(&init, initramfs, host)
+}
+
+fn audit_extracted_initramfs(initramfs: &Path, host: HostTarget) -> Result<(), AuditError> {
+    let init = read_initramfs_init(initramfs)?;
+    audit_static_elf_bytes(&init, initramfs, host)
+}
+
+fn read_initramfs_init(initramfs: &Path) -> Result<Vec<u8>, AuditError> {
     let file = File::open(initramfs).map_err(|source| AuditError::ReadArtifact {
         path: initramfs.to_path_buf(),
         source,
@@ -255,21 +300,10 @@ fn audit_staged_initramfs(
             format!("entries are {entries:?}, expected {expected_entries:?}"),
         );
     }
-    let expected_bytes = fs::read(&expected).map_err(|source| AuditError::ReadArtifact {
-        path: expected.clone(),
-        source,
-    })?;
-    let init = init.ok_or_else(|| AuditError::Invalid {
+    init.ok_or_else(|| AuditError::Invalid {
         path: initramfs.to_path_buf(),
         reason: "contains no init entry".to_string(),
-    })?;
-    if init != expected_bytes {
-        return invalid(
-            initramfs,
-            "embedded init differs from the release init".to_string(),
-        );
-    }
-    audit_static_elf_bytes(&init, initramfs, host)
+    })
 }
 
 fn elf_dependencies(name: &str) -> Result<BTreeSet<String>, AuditError> {

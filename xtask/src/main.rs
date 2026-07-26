@@ -13,6 +13,7 @@ use crate::kernel::KernelOptions;
 use crate::profiles::Profile;
 use crate::targets::HostTarget;
 
+mod archive;
 mod command;
 mod components;
 mod initramfs;
@@ -61,6 +62,11 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = Profile::Debug)]
         profile: Profile,
     },
+    Archive {
+        #[command(flatten)]
+        kernel: KernelOptions,
+    },
+    VerifyArchive,
     Fmt,
     Clippy,
     Test,
@@ -166,6 +172,40 @@ fn run() -> Result<(), Box<dyn Error>> {
                 release::verify_linux_toolchain(&workspace_root, HostTarget::current()?)?;
             }
             release_audit::verify(&workspace_root, &target_dir, profile)?
+        }
+        Commands::Archive { kernel } => {
+            if should_use_linux_container()? {
+                release::run_linux_release(
+                    &workspace_root,
+                    &target_dir,
+                    HostTarget::current()?,
+                    "archive",
+                    Some(&kernel),
+                )?;
+                return Ok(());
+            }
+            build_release_or_development(
+                &workspace_root,
+                &target_dir,
+                Profile::Release,
+                kernel,
+                true,
+            )?;
+            release_audit::verify(&workspace_root, &target_dir, Profile::Release)?;
+            archive::produce(&workspace_root, &target_dir)?;
+        }
+        Commands::VerifyArchive => {
+            if should_use_linux_container()? {
+                release::run_linux_release(
+                    &workspace_root,
+                    &target_dir,
+                    HostTarget::current()?,
+                    "verify-archive",
+                    None,
+                )?;
+                return Ok(());
+            }
+            archive::verify(&workspace_root, &target_dir)?;
         }
         Commands::Fmt => format(&workspace_root, &target_dir)?,
         Commands::Clippy => {

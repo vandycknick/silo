@@ -20,7 +20,7 @@ implementation.
 - [x] Commit 06: Establish the Make and xtask build interface
 - [x] Commit 07: Build adjacent development runtimes and canonical stages
 - [x] Commit 08: Isolate release linking and audit binaries
-- [ ] Commit 09: Produce common release archives and metadata
+- [x] Commit 09: Produce common release archives and metadata
 - [ ] Commit 10: Assemble and sign `Silo.app`
 - [ ] Commit 11: Build the DMG with `create-dmg` and install on macOS
 - [ ] Commit 12: Build and qualify native Linux packages and installs
@@ -163,6 +163,15 @@ plan-compatible default. Do not add entries without an actual decision point.
   already the correct dependency-aware rebuild mechanism; clean CI runners and
   targets provide the appropriate release isolation without making every local
   invocation a cold build.
+- 2026-07-26, Commit 09. Question: When Syft is not installed in the active
+  shell, should archive generation require a Nix-only tool, download a pinned
+  binary, or omit local SBOMs? Options: add only a Nix development dependency;
+  download and checksum-verify the official pinned Syft archive into the ignored
+  release-tools cache; or omit local SBOM generation. Selected default: the
+  checksum-verified pinned download, while also adding Syft to future Nix
+  shells. Rationale: archives remain usable from the existing shell and CI
+  without an unbounded installer or a Nix requirement, while every downloaded
+  archive is checked against the reviewed official release digest.
 
 ### Breaking-Change Policy
 
@@ -1314,6 +1323,36 @@ make archive
 make verify-archive
 git diff --check
 ```
+
+### Ghostty Reference Notes
+
+Inspected Ghostty's `src/build/GhosttyDist.zig`, release-tag workflow, and
+`PACKAGING.md` before adding archive production.
+
+- Reused the assemble-once and qualify-after-extraction boundary: Silo stages
+  the complete runtime once, audits that stage, archives it without changing it,
+  then extracts and qualifies the transport artifact. Like Ghostty's
+  `distcheck`, this keeps normal local build caches available rather than
+  forcing a clean rebuild for every archive.
+- Intentionally did not copy Ghostty's `git archive` source-tarball flow,
+  generated source resources, Minisign publication, automatic GitHub source
+  archive warning, or downstream-package build instructions. Silo ships runtime
+  payload archives through Make and Rust xtask, while native package production
+  remains a later commit.
+
+### Implementation Notes
+
+- `make archive` always performs the persistent incremental release build and
+  canonical stage, audits it, then creates runtime and portable CLI archives
+  from that unchanged stage. Archives use fixed ordering, modes, uid/gid, epoch,
+  and `zstd -19 --threads=0`; generated checksums, SPDX SBOMs, and provenance
+  remain beside the archive rather than in the runtime tree.
+- The archive includes `THIRD_PARTY_NOTICES` plus the full Apache-2.0 text for
+  libkrun as top-level release material. These files are not staged runtime
+  files. Qualification rejects non-regular entries, unexpected paths, and
+  traversal before extraction, compares the six runtime files byte-for-byte,
+  audits extracted binaries, runs portable CLI help with overrides unset, and
+  boots then removes a VZ acceptance VM on macOS.
 
 ## Commit 10: Assemble And Sign Silo.app
 

@@ -32,7 +32,7 @@ ifeq ($(KERNEL_REFRESH),1)
 KERNEL_ARGS += --refresh
 endif
 
-.PHONY: build stage verify-runtime release-linux cli vmmon netd krun agent init initramfs kernel fmt clippy test version-check
+.PHONY: build stage verify-runtime archive verify-archive release-linux cli vmmon netd krun agent init initramfs kernel fmt clippy test version-check
 
 build:
 	$(XTASK) build --profile "$(PROFILE)" $(KERNEL_ARGS)
@@ -42,6 +42,12 @@ stage:
 
 verify-runtime:
 	$(XTASK) verify-runtime --profile "$(PROFILE)"
+
+archive:
+	$(XTASK) archive $(KERNEL_ARGS)
+
+verify-archive:
+	$(XTASK) verify-archive
 
 RELEASE_UNAME := $(shell uname -m)
 ifeq ($(RELEASE_UNAME),x86_64)

@@ -24,6 +24,9 @@ in
       pkgs.cargo-zigbuild
       pkgs.docker
       pkgs.docker-credential-helpers
+      pkgs.gnutar
+      pkgs.syft
+      pkgs.zstd
     ]
     ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
       pkgs.dtc

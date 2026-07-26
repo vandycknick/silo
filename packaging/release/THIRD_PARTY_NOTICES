@@ -1,0 +1,11 @@
+Silo release archives include the libkrun virtual-machine monitor backend.
+
+libkrun
+Copyright 2020-2026 The libkrun authors
+https://github.com/vandycknick/libkrun
+
+Silo builds libkrun from the source revision pinned in Cargo.lock:
+1b69e60ed03f58fe13bcd7b6f684aa71a404b0f9.
+
+libkrun is licensed under the Apache License, Version 2.0. The complete
+license text is distributed at LICENSES/libkrun-APACHE-2.0.txt.

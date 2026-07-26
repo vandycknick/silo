@@ -130,6 +130,11 @@ pub fn toolchains(workspace_root: &Path) -> Result<Toolchains, ReleaseError> {
         "tools.oras",
         "tools.oras_linux_amd64_sha256",
         "tools.oras_linux_arm64_sha256",
+        "tools.syft",
+        "tools.syft_darwin_amd64_sha256",
+        "tools.syft_darwin_arm64_sha256",
+        "tools.syft_linux_amd64_sha256",
+        "tools.syft_linux_arm64_sha256",
     ] {
         if !values.contains_key(key) {
             return Err(ReleaseError::Toolchains {
