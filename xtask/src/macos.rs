@@ -1,8 +1,10 @@
 use std::fs::{self, File};
+use std::io::Write;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
 
@@ -10,6 +12,7 @@ use crate::app;
 use crate::command;
 
 const APP_NAME: &str = "Silo.app";
+const CREATE_DMG_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Error)]
 pub enum MacosError {
@@ -40,14 +43,7 @@ pub fn package(
     let create_dmg = ensure_create_dmg(workspace_root)?;
     let temporary_output = temporary_directory(&output, "dmg-output")?;
     let result = (|| {
-        let mut create = Command::new(&create_dmg);
-        create.arg("--overwrite");
-        match identity {
-            Some(identity) => create.arg(format!("--identity={identity}")),
-            None => create.arg("--no-code-sign"),
-        };
-        create.arg(&app_bundle).arg(&temporary_output);
-        command::run(create)?;
+        run_create_dmg(&create_dmg, identity, &app_bundle, &temporary_output)?;
 
         let dmg = only_dmg(&temporary_output)?;
         let normalized = output.join(format!("silo-{version}-darwin-arm64.dmg"));
@@ -70,6 +66,160 @@ pub fn package(
     })();
     remove_directory(&temporary_output, "remove temporary DMG output")?;
     result
+}
+
+fn run_create_dmg(
+    executable: &Path,
+    identity: Option<&str>,
+    app_bundle: &Path,
+    temporary_output: &Path,
+) -> Result<(), MacosError> {
+    for attempt in 1..=CREATE_DMG_ATTEMPTS {
+        let mut create = Command::new(executable);
+        create.arg("--overwrite");
+        match identity {
+            Some(identity) => create.arg(format!("--identity={identity}")),
+            None => create.arg("--no-code-sign"),
+        };
+        create.arg(app_bundle).arg(temporary_output);
+        let output = create.output().map_err(|source| MacosError::Io {
+            action: "run local create-dmg",
+            path: executable.to_path_buf(),
+            source,
+        })?;
+        display_create_dmg_output(executable, &output.stdout, &output.stderr)?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if attempt == CREATE_DMG_ATTEMPTS || !is_transient_conversion_failure(&transcript) {
+            return invalid(
+                executable,
+                format!("create-dmg exited with {}", output.status),
+            );
+        }
+        detach_failed_conversion_image(&transcript)?;
+        reset_temporary_directory(temporary_output)?;
+        println!(
+            "package: retrying transient create-dmg conversion ({attempt}/{CREATE_DMG_ATTEMPTS})"
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
+    invalid(
+        executable,
+        "exhausted create-dmg attempts without a result".to_string(),
+    )
+}
+
+fn display_create_dmg_output(
+    executable: &Path,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<(), MacosError> {
+    std::io::stdout()
+        .write_all(stdout)
+        .map_err(|source| MacosError::Io {
+            action: "display create-dmg stdout",
+            path: executable.to_path_buf(),
+            source,
+        })?;
+    std::io::stderr()
+        .write_all(stderr)
+        .map_err(|source| MacosError::Io {
+            action: "display create-dmg stderr",
+            path: executable.to_path_buf(),
+            source,
+        })?;
+    Ok(())
+}
+
+fn is_transient_conversion_failure(transcript: &str) -> bool {
+    transcript.contains("hdiutil convert")
+        && (transcript.contains("Resource temporarily unavailable")
+            || transcript.contains("EAGAIN"))
+}
+
+fn detach_failed_conversion_image(transcript: &str) -> Result<(), MacosError> {
+    let Some(image) = conversion_image_path(transcript) else {
+        return Ok(());
+    };
+    let mut info = Command::new("/usr/bin/hdiutil");
+    info.args(["info", "-plist"]);
+    let output = command::output(info)?;
+    let plist = String::from_utf8_lossy(&output.stdout);
+    for device in image_devices(&plist, image) {
+        detach_dmg(&device)?;
+    }
+    Ok(())
+}
+
+fn conversion_image_path(transcript: &str) -> Option<&str> {
+    transcript
+        .split_once("hdiutil convert ")?
+        .1
+        .split_whitespace()
+        .next()
+}
+
+fn image_devices(plist: &str, image: &str) -> Vec<String> {
+    let marker = "<key>image-path</key>";
+    let mut remainder = plist;
+    while let Some((_, after_key)) = remainder.split_once(marker) {
+        let Some((before_end, after_end)) = after_key.split_once("</string>") else {
+            return Vec::new();
+        };
+        let Some((_, path)) = before_end.split_once("<string>") else {
+            return Vec::new();
+        };
+        let path = path
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">");
+        if path == image {
+            return plist_strings(
+                after_end.split(marker).next().unwrap_or(after_end),
+                "dev-entry",
+            );
+        }
+        remainder = after_end;
+    }
+    Vec::new()
+}
+
+fn plist_strings(plist: &str, key: &str) -> Vec<String> {
+    let key = format!("<key>{key}</key>");
+    let mut values = Vec::new();
+    let mut remainder = plist;
+    while let Some((_, after_key)) = remainder.split_once(&key) {
+        let Some((before_end, after_end)) = after_key.split_once("</string>") else {
+            break;
+        };
+        let Some((_, value)) = before_end.split_once("<string>") else {
+            break;
+        };
+        values.push(
+            value
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">"),
+        );
+        remainder = after_end;
+    }
+    values
+}
+
+fn reset_temporary_directory(path: &Path) -> Result<(), MacosError> {
+    remove_directory(path, "remove partial create-dmg output")?;
+    fs::create_dir(path).map_err(|source| MacosError::Io {
+        action: "recreate temporary DMG output directory",
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 pub fn install(target_dir: &Path, appdir: &Path, bindir: &Path) -> Result<(), MacosError> {
@@ -292,16 +442,7 @@ fn detach_dmg(device: &str) -> Result<(), MacosError> {
 }
 
 fn plist_string(response: &str, key: &str) -> Option<String> {
-    let key = format!("<key>{key}</key>");
-    let after_key = response.split_once(&key)?.1;
-    let before_end = after_key.split_once("</string>")?.0;
-    let value = before_end.split_once("<string>")?.1;
-    Some(
-        value
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">"),
-    )
+    plist_strings(response, key).into_iter().next()
 }
 
 fn validate_replaced_app(path: &Path) -> Result<(), MacosError> {

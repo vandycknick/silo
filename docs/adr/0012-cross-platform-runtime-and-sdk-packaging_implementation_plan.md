@@ -202,6 +202,16 @@ plan-compatible default. Do not add entries without an actual decision point.
   binary can be reused after the first `npm ci --prefer-offline --no-audit
   --no-fund`; Nix does not provide the selected tool version, and `npx` would
   silently introduce an unpinned network/global fallback.
+- 2026-07-26, Commit 11 follow-up. Question: How should a native `hdiutil`
+  `Resource temporarily unavailable` failure during the selected `create-dmg`
+  ULFO conversion be handled? Options: stop for a fresh host or CI run; retry
+  the same pinned tool a bounded number of times; or replace the tool or its
+  APFS/ULFO format. Selected default: retry the unchanged local `create-dmg`
+  8.1.0 invocation at most three times after a short delay, detaching only an
+  invocation-identified image and cleaning only its temporary package output.
+  Rationale: this transient is outside Silo's app payload, a bounded retry
+  improves local reliability without adding a custom DMG implementation or
+  touching unrelated user images.
 
 ### Breaking-Change Policy
 
@@ -1576,11 +1586,15 @@ rm -rf "$acceptance_root"
   The installed symlink ran `list --format json` with all runtime overrides
   unset and isolated XDG roots, then that exact root was removed.
 - The locked local `create-dmg` command was invoked repeatedly against the
-  verified app, including with a `/tmp` output and temporary workspace. On this
-  macOS host, its native `hdiutil convert ... -format ULFO` step consistently
-  fails with `Resource temporarily unavailable` before producing a DMG; no
-  image can therefore be mounted for the required strict checks. Commit 11
-  remains unchecked pending a host where native `hdiutil` completes that step.
+  verified app, including with a `/tmp` output and temporary workspace. It now
+  retries only `hdiutil convert ... -format ULFO` `Resource temporarily
+  unavailable` failures up to three total same-tool attempts, printing captured
+  command output, cleaning only package-owned temporary output, and detaching
+  only an exactly identified invocation image. On this macOS host all three
+  attempts still failed before producing a DMG, with no invocation image mounted
+  afterward. No image can therefore be mounted for the required strict checks.
+  Commit 11 remains unchecked pending a fresh host where native `hdiutil`
+  completes that step.
 
 ## Commit 12: Build And Qualify Native Linux Packages And Installs
 
