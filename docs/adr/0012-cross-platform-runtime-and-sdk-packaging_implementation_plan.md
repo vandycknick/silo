@@ -134,6 +134,30 @@ plan-compatible default. Do not add entries without an actual decision point.
   temporary roots, while permitting the documented Silo fallback. Rationale: a
   blanket match would reject required production behavior rather than a build
   leak.
+- 2026-07-26, Commit 08 follow-up. Question: Does a separate Linux target
+  directory satisfy the requirement to build releases in the digest-pinned
+  native environment? Options: permit direct Linux release builds after target
+  cleanup; document the container as optional; or make repository orchestration
+  enter the matching native container. Selected default: build, stage, verify,
+  and component release commands enter the matching Docker image, with an
+  explicit internal marker preventing recursion. Rationale: target separation
+  prevents object reuse but cannot prevent an ambient Nix linker, SDK, or tool
+  from participating, so the weaker reading would contradict the required
+  environment boundary.
+- 2026-07-26, Commit 08 follow-up. Question: Must macOS download separate Rust
+  and Zig toolchains, or may the pinned dev-shell executables act as drivers?
+  Options: download every compiler; accept arbitrary PATH tools; or accept only
+  exact-version dev-shell drivers while forcing Apple SDK, clang, ld, and ar for
+  final linkage. Selected default: exact-version drivers plus clean Apple
+  linkage and post-link qualification. Rationale: the plan requires native Apple
+  final linking, not duplicate toolchain distribution; accepting arbitrary PATH
+  tools was neither required nor safe.
+- 2026-07-26, Commit 08 follow-up. Question: Should the auditor reject all
+  temporary paths despite Silo's documented `/tmp/silo-<uid>` fallback? Options:
+  retain a narrow compiler-prefix list; reject all `/tmp`; or permit only the
+  documented Silo path family. Selected default: reject every temporary path
+  except `/tmp/silo-`. Rationale: this closes compiler/cache false negatives
+  without rejecting the runtime contract.
 
 ### Breaking-Change Policy
 
@@ -1192,24 +1216,31 @@ Inspected Ghostty's `nix/devShell.nix`, `nix/package.nix`, `build.zig`,
   `$CARGO_TARGET_DIR/release-build/<target>` for every release invocation.
   Only validated copies populate the existing adjacent `release/` layout and
   canonical six-file stage, so Commit 07 paths remain unchanged.
+- Linux release commands verify a native matching Docker daemon, build the
+  digest-pinned architecture-specific Bake target, and run the requested Make
+  command in that image with a read-only workspace, writable isolated target,
+  and Docker-managed compiler/module cache. The internal marker prevents the
+  container command from entering Docker again; a missing daemon fails closed.
 - macOS release subprocesses clear Nix/compiler/SDK/package-config variables,
-  use clean-environment `xcrun` SDK tools, target arm64 macOS 26.0, remap Rust
-  source paths, and use the pinned official Go compiler for `netd`.
+  accept only exact-version Rust/Zig/cargo-zigbuild drivers, use
+  clean-environment `xcrun` SDK tools, target arm64 macOS 26.0, remap Rust
+  source paths, and use the pinned official Go compiler for `netd`. Its cached
+  archive is retained and hash-verified on every release use.
   `netd` is built with `CGO_ENABLED=0`, `-trimpath`, `-buildvcs=true`, and
   `-ldflags=-s -w`.
 - `make verify-runtime PROFILE=release` audits actual adjacent, staged, and
-  guest artifacts. It records tool and Go module metadata outside the runtime
-  root, and it builds an ambient-Nix CLI into a separate audit target to prove
-  that the production auditor rejects a real contaminated binary.
+  guest artifacts. It requires exact ELF loaders and needed libraries, checks
+  Mach-O arm64/minimum-OS/load paths, reads the shipped gzip/newc initramfs and
+  compares its init byte-for-byte with the generated input, and records actual
+  tool paths, versions, archive digests, and Go module metadata outside the
+  runtime root. It builds a real CLI with an injected RPATH and requires the
+  auditor to reject that exact condition on both host families.
 - `release/Containerfile`, `docker-bake.hcl`, and `toolchains.toml` define the
-  digest-pinned Ubuntu 24.04/glibc 2.39 native Linux environment. Docker was
-  unavailable on this macOS host, so Linux artifact execution is deferred to
-  native Linux CI/builders; the configuration and container syntax were not
-  executed locally.
-- Qualification passed `cargo fmt`, clean release build/stage, release runtime
-  audit including the contamination rejection, `make clippy`, and diff checks.
-  The release CLI resolved its help output. On VZ, a fresh XDG state root and
-  explicit staged runtime booted `ubuntu:24.04` to `uname -a` in 1.2 seconds.
+  digest-pinned Ubuntu 24.04/glibc 2.39 native Linux environment. The container
+  validates toolchain-record values, verifies Rustup, Go, Zig, cargo-zigbuild,
+  and ORAS downloads, then checks installed versions and architecture before
+  use. Docker execution remains a native Linux CI/builder gate when unavailable
+  on the local host.
 
 ## Commit 09: Produce Common Release Archives And Metadata
 

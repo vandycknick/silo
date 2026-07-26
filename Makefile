@@ -36,8 +36,20 @@ stage:
 verify-runtime:
 	$(XTASK) verify-runtime --profile "$(PROFILE)"
 
+RELEASE_UNAME := $(shell uname -m)
+ifeq ($(RELEASE_UNAME),x86_64)
+RELEASE_ARCH ?= amd64
+else ifeq ($(RELEASE_UNAME),aarch64)
+RELEASE_ARCH ?= arm64
+else
+RELEASE_ARCH ?= $(RELEASE_UNAME)
+endif
+ifeq ($(filter $(RELEASE_ARCH),amd64 arm64),)
+$(error RELEASE_ARCH must resolve to amd64 or arm64)
+endif
+
 release-linux:
-	docker buildx bake -f release/docker-bake.hcl silo-release
+	TARGETARCH="$(RELEASE_ARCH)" docker buildx bake --load -f release/docker-bake.hcl silo-release
 
 cli vmmon netd krun agent init initramfs:
 	$(XTASK) component $@ --profile "$(PROFILE)"

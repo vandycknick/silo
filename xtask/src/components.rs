@@ -165,7 +165,11 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         source,
     })?;
 
-    let go_program = release::go_program(context.target_dir, context.profile == Profile::Release)?;
+    let go_program = release::go_program(
+        context.target_dir,
+        context.workspace_root,
+        context.profile == Profile::Release,
+    )?;
     let mut go = Command::new(&go_program);
     go.current_dir(context.workspace_root.join("net/netd"))
         .env("CARGO_TARGET_DIR", context.target_dir)
@@ -255,7 +259,7 @@ fn build_initramfs(context: &BuildContext<'_>) -> Result<(), ComponentError> {
 }
 
 fn cargo_command(context: &BuildContext<'_>) -> Result<Command, ComponentError> {
-    let cargo_program = release::tool("cargo", context.profile == Profile::Release)?;
+    let cargo_program = release::tool("cargo")?;
     let mut cargo = Command::new(&cargo_program);
     cargo
         .current_dir(context.workspace_root)

@@ -41,6 +41,20 @@ pub struct KernelArtifact {
     pub path: PathBuf,
 }
 
+impl KernelOptions {
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    pub fn local_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub fn offline(&self) -> bool {
+        self.offline
+    }
+}
+
 #[derive(Clone)]
 struct Descriptor {
     media_type: String,

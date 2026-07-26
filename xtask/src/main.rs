@@ -2,6 +2,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use clap::{Parser, Subcommand};
 use thiserror::Error;
@@ -103,9 +104,29 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     match args.command {
         Commands::Build { profile, kernel } => {
+            if profile == Profile::Release && should_use_linux_container()? {
+                release::run_linux_release(
+                    &workspace_root,
+                    &target_dir,
+                    HostTarget::current()?,
+                    "build",
+                    Some(&kernel),
+                )?;
+                return Ok(());
+            }
             build_release_or_development(&workspace_root, &target_dir, profile, kernel, false)?;
         }
         Commands::Component { component, profile } => {
+            if profile == Profile::Release && should_use_linux_container()? {
+                release::run_linux_release(
+                    &workspace_root,
+                    &target_dir,
+                    HostTarget::current()?,
+                    component_make_target(component),
+                    None,
+                )?;
+                return Ok(());
+            }
             let component_target = if profile == Profile::Release {
                 clean_release_target(&target_dir)?
             } else {
@@ -120,9 +141,37 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!("{}", kernel.path.display());
         }
         Commands::Stage { profile, kernel } => {
+            if profile == Profile::Release && should_use_linux_container()? {
+                release::run_linux_release(
+                    &workspace_root,
+                    &target_dir,
+                    HostTarget::current()?,
+                    "stage",
+                    Some(&kernel),
+                )?;
+                return Ok(());
+            }
             build_release_or_development(&workspace_root, &target_dir, profile, kernel, true)?;
         }
         Commands::VerifyRuntime { profile } => {
+            if profile == Profile::Release && should_use_linux_container()? {
+                release::run_linux_release(
+                    &workspace_root,
+                    &target_dir,
+                    HostTarget::current()?,
+                    "verify-runtime",
+                    None,
+                )?;
+                return Ok(());
+            }
+            if profile == Profile::Release
+                && matches!(
+                    HostTarget::current()?,
+                    HostTarget::LinuxX86_64 | HostTarget::LinuxArm64
+                )
+            {
+                release::verify_linux_toolchain(&workspace_root, HostTarget::current()?)?;
+            }
             release_audit::verify(&workspace_root, &target_dir, profile)?
         }
         Commands::Fmt => format(&workspace_root, &target_dir)?,
@@ -150,6 +199,14 @@ fn build_release_or_development(
     kernel_options: KernelOptions,
     stage: bool,
 ) -> Result<(), Box<dyn Error>> {
+    if profile == Profile::Release
+        && matches!(
+            HostTarget::current()?,
+            HostTarget::LinuxX86_64 | HostTarget::LinuxArm64
+        )
+    {
+        release::verify_linux_toolchain(workspace_root, HostTarget::current()?)?;
+    }
     if profile == Profile::Debug {
         let context = build_context(workspace_root, target_dir, profile)?;
         build_all(&context)?;
@@ -175,10 +232,32 @@ fn build_release_or_development(
     Ok(())
 }
 
+fn should_use_linux_container() -> Result<bool, Box<dyn Error>> {
+    Ok(matches!(
+        HostTarget::current()?,
+        HostTarget::LinuxX86_64 | HostTarget::LinuxArm64
+    ) && env::var_os(release::CONTAINER_MARKER).is_none())
+}
+
+fn component_make_target(component: Component) -> &'static str {
+    match component {
+        Component::Cli => "cli",
+        Component::Vmmon => "vmmon",
+        Component::Netd => "netd",
+        Component::Krun => "krun",
+        Component::Agent => "agent",
+        Component::Init => "init",
+        Component::Initramfs => "initramfs",
+    }
+}
+
 fn clean_release_target(target_dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let host = HostTarget::current()?;
     let clean_target = target_dir.join("release-build").join(host.runtime_target());
     if clean_target.exists() {
+        let mut chmod = Command::new("/bin/chmod");
+        chmod.args(["-R", "u+w"]).arg(&clean_target);
+        command::run(chmod)?;
         fs::remove_dir_all(&clean_target)?;
     }
     fs::create_dir_all(&clean_target)?;
