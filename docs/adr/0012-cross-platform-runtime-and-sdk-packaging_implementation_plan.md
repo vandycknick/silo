@@ -1592,9 +1592,12 @@ rm -rf "$acceptance_root"
   command output, cleaning only package-owned temporary output, and detaching
   only an exactly identified invocation image. On this macOS host all three
   attempts still failed before producing a DMG, with no invocation image mounted
-  afterward. No image can therefore be mounted for the required strict checks.
-  Commit 11 remains unchecked pending a fresh host where native `hdiutil`
-  completes that step.
+  afterward. A minimal native `/usr/bin/hdiutil` probe independently created a
+  32 MiB APFS image and failed the same ULFO conversion while unmounted; a
+  separate image was attached, written, detached, then failed conversion after
+  both 2 and 7 second delays. No image can therefore be mounted for the required
+  strict checks. Commit 11 remains unchecked pending a fresh host where native
+  `hdiutil` completes that step.
 
 ## Commit 12: Build And Qualify Native Linux Packages And Installs
 
