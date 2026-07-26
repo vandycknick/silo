@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use crate::paths::defaults::{resolve_default_data_dir, resolve_default_run_dir};
+use crate::paths::defaults::{
+    ensure_run_root, resolve_default_data_dir, resolve_default_run_dir, resolve_default_state_dir,
+};
 use crate::paths::machine::MachinePaths;
 use crate::paths::network::NetworkPaths;
 use crate::store::models::MachineId;
@@ -9,8 +11,9 @@ use crate::LibVmError;
 const STATE_DB_FILE_NAME: &str = "state.db";
 const MACHINES_DIR_NAME: &str = "machines";
 const IMAGES_DIR_NAME: &str = "images";
-const NET_DIR_NAME: &str = "net";
+const NETWORKS_DIR_NAME: &str = "networks";
 const LOCKS_DIR_NAME: &str = "locks";
+const LOGS_DIR_NAME: &str = "logs";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalRoots {
@@ -24,8 +27,8 @@ impl LocalRoots {
     #[cfg(test)]
     pub(crate) fn new(data_root: impl Into<PathBuf>) -> Self {
         let data_root = data_root.into();
-        let state_root = data_root.clone();
-        let run_root = data_root.join("run");
+        let state_root = sibling_test_root(&data_root, "state");
+        let run_root = sibling_test_root(&data_root, "run");
         let image_root = data_root.join(IMAGES_DIR_NAME);
         Self::with_roots(data_root, state_root, run_root, image_root)
     }
@@ -46,8 +49,9 @@ impl LocalRoots {
 
     pub(crate) fn from_env() -> Result<Self, LibVmError> {
         let data_root = resolve_default_data_dir()?;
-        let state_root = data_root.clone();
-        let run_root = resolve_default_run_dir(&data_root)?;
+        let state_root = resolve_default_state_dir()?;
+        let run_root = resolve_default_run_dir()?;
+        ensure_run_root(&run_root)?;
         let image_root = data_root.join(IMAGES_DIR_NAME);
         Ok(Self::with_roots(
             data_root, state_root, run_root, image_root,
@@ -87,12 +91,21 @@ impl LocalRoots {
     }
 
     pub(crate) fn net_dir(&self) -> PathBuf {
-        self.run_root().join(NET_DIR_NAME)
+        self.run_root().join(NETWORKS_DIR_NAME)
     }
 
     pub(crate) fn locks_dir(&self) -> PathBuf {
         self.run_root().join(LOCKS_DIR_NAME)
     }
+}
+
+#[cfg(test)]
+fn sibling_test_root(data_root: &Path, kind: &str) -> PathBuf {
+    let parent = data_root.parent().unwrap_or_else(|| Path::new("/tmp"));
+    let name = data_root
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("silo"));
+    parent.join(format!("{}-{kind}", name.to_string_lossy()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,11 +175,27 @@ impl LocalPaths {
     }
 
     pub(crate) fn machine(&self, machine_id: MachineId) -> MachinePaths {
-        MachinePaths::new(self.machines_dir().join(machine_id.to_string()))
+        let id = machine_id.to_string();
+        MachinePaths::new(
+            self.machines_dir().join(&id),
+            self.roots.run_root().join(MACHINES_DIR_NAME).join(&id),
+            self.roots
+                .state_root()
+                .join(LOGS_DIR_NAME)
+                .join(MACHINES_DIR_NAME)
+                .join(id),
+        )
     }
 
     pub(crate) fn network(&self, network_id: &str) -> NetworkPaths {
-        NetworkPaths::new(self.net_dir().join(network_id))
+        NetworkPaths::new(
+            self.net_dir().join(network_id),
+            self.roots
+                .state_root()
+                .join(LOGS_DIR_NAME)
+                .join(NETWORKS_DIR_NAME)
+                .join(network_id),
+        )
     }
 
     pub(crate) fn keys_dir(&self) -> PathBuf {
@@ -187,7 +216,11 @@ mod tests {
 
         assert_eq!(roots.data_dir(), PathBuf::from("/tmp/silo").as_path());
         assert_eq!(roots.data_root(), PathBuf::from("/tmp/silo").as_path());
-        assert_eq!(roots.run_root(), PathBuf::from("/tmp/silo/run").as_path());
+        assert_eq!(roots.run_root(), PathBuf::from("/tmp/silo-run").as_path());
+        assert_eq!(
+            roots.state_root(),
+            PathBuf::from("/tmp/silo-state").as_path()
+        );
         assert_eq!(
             roots.image_root(),
             PathBuf::from("/tmp/silo/images").as_path()
@@ -195,8 +228,8 @@ mod tests {
         assert_eq!(roots.state_db_path(), PathBuf::from("/tmp/silo/state.db"));
         assert_eq!(roots.machines_dir(), PathBuf::from("/tmp/silo/machines"));
         assert_eq!(roots.images_dir(), PathBuf::from("/tmp/silo/images"));
-        assert_eq!(roots.net_dir(), PathBuf::from("/tmp/silo/run/net"));
-        assert_eq!(roots.locks_dir(), PathBuf::from("/tmp/silo/run/locks"));
+        assert_eq!(roots.net_dir(), PathBuf::from("/tmp/silo-run/networks"));
+        assert_eq!(roots.locks_dir(), PathBuf::from("/tmp/silo-run/locks"));
     }
 
     #[test]
@@ -224,7 +257,10 @@ mod tests {
         assert_eq!(roots.state_db_path(), PathBuf::from("/tmp/silo/state.db"));
         assert_eq!(roots.machines_dir(), PathBuf::from("/tmp/silo/machines"));
         assert_eq!(roots.images_dir(), PathBuf::from("/var/lib/silo/images"));
-        assert_eq!(roots.net_dir(), PathBuf::from("/run/user/501/silo/net"));
+        assert_eq!(
+            roots.net_dir(),
+            PathBuf::from("/run/user/501/silo/networks")
+        );
         assert_eq!(roots.locks_dir(), PathBuf::from("/run/user/501/silo/locks"));
     }
 
@@ -240,7 +276,39 @@ mod tests {
             machine.dir(),
             PathBuf::from("/tmp/silo/machines").join(machine_id.to_string())
         );
-        assert_eq!(paths.locks_dir(), PathBuf::from("/tmp/silo/run/locks"));
-        assert_eq!(network.dir(), PathBuf::from("/tmp/silo/run/net/net123"));
+        assert_eq!(
+            machine.run_dir(),
+            PathBuf::from("/tmp/silo-run/machines").join(machine_id.to_string())
+        );
+        assert_eq!(
+            machine.logs_dir(),
+            PathBuf::from("/tmp/silo-state/logs/machines").join(machine_id.to_string())
+        );
+        assert_eq!(paths.locks_dir(), PathBuf::from("/tmp/silo-run/locks"));
+        assert_eq!(
+            network.dir(),
+            PathBuf::from("/tmp/silo-run/networks/net123")
+        );
+        assert_eq!(
+            network.logs_dir(),
+            PathBuf::from("/tmp/silo-state/logs/networks/net123")
+        );
+    }
+
+    #[test]
+    fn default_socket_paths_fit_unix_socket_limits() {
+        let uid = nix::unistd::geteuid().as_raw();
+        let roots = LocalRoots::with_roots(
+            format!("/tmp/silo-data-{uid}"),
+            format!("/tmp/silo-state-{uid}"),
+            format!("/tmp/silo-{uid}"),
+            format!("/tmp/silo-images-{uid}"),
+        );
+        let paths = LocalPaths::from_roots(roots);
+        let machine_socket = paths.machine(MachineId::new()).vmmon_socket_path();
+        let network_socket = paths.network(&MachineId::new().to_string()).socket_path();
+
+        assert!(machine_socket.as_os_str().len() < 104);
+        assert!(network_socket.as_os_str().len() < 104);
     }
 }

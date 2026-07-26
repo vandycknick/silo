@@ -1,5 +1,4 @@
 use std::fs;
-use std::os::unix::fs::symlink;
 use std::path::Path;
 
 mod api;
@@ -124,18 +123,15 @@ pub(crate) async fn reconcile_network_runtime(
         .network_instance(&attachment.network_instance_id)
         .await?
     else {
-        remove_instance_network_link(paths, metadata.id)?;
         store.detach_network(metadata.id).await?;
         return Ok(());
     };
 
     if monitor_running && network_instance_is_alive(&instance) {
-        ensure_instance_network_link(paths, metadata.id, paths.network(&instance.id).dir())?;
         return Ok(());
     }
 
     store.detach_network(metadata.id).await?;
-    remove_instance_network_link(paths, metadata.id)?;
     if store.network_attachment_count(&instance.id).await? == 0 {
         terminate_network_instance(&instance)?;
         store.remove_network_instance(&instance.id).await?;
@@ -176,14 +172,12 @@ pub(super) async fn remove_attached_network(
     machine_id: MachineId,
 ) -> Result<(), LibVmError> {
     let Some(attachment) = store.network_attachment(machine_id).await? else {
-        remove_instance_network_link(paths, machine_id)?;
         return Ok(());
     };
     let instance = store
         .network_instance(&attachment.network_instance_id)
         .await?;
     store.detach_network(machine_id).await?;
-    remove_instance_network_link(paths, machine_id)?;
     if let Some(instance) = instance {
         if store.network_attachment_count(&instance.id).await? == 0 {
             terminate_network_instance(&instance)?;
@@ -241,36 +235,6 @@ pub(super) fn serialize_json<T: Serialize>(value: &T, label: &str) -> Result<Str
     })
 }
 
-pub(super) fn ensure_instance_network_link(
-    paths: &LocalPaths,
-    machine_id: MachineId,
-    runtime_dir: &Path,
-) -> Result<(), LibVmError> {
-    let link = paths.machine(machine_id).network_link();
-    remove_instance_network_link(paths, machine_id)?;
-    symlink(runtime_dir, link)?;
-    Ok(())
-}
-
-pub(super) fn remove_instance_network_link(
-    paths: &LocalPaths,
-    machine_id: MachineId,
-) -> Result<(), LibVmError> {
-    let link = paths.machine(machine_id).network_link();
-    let metadata = match fs::symlink_metadata(&link) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.into()),
-    };
-
-    if metadata.file_type().is_dir() {
-        fs::remove_dir_all(&link)?;
-    } else {
-        fs::remove_file(&link)?;
-    }
-    Ok(())
-}
-
 pub(super) fn remove_runtime_dir(path: &Path) -> Result<(), LibVmError> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
@@ -306,10 +270,7 @@ mod tests {
     use crate::store::{MachineStore, MockDataStore, NetworkStore, Store};
     use crate::{LibVmError, RuntimeNetworkingConfig};
 
-    use super::{
-        ensure_instance_network_link, prepare_network_runtime, reconcile_network_runtime,
-        VmmonNetworkAttachment,
-    };
+    use super::{prepare_network_runtime, reconcile_network_runtime, VmmonNetworkAttachment};
 
     fn machine_config(
         paths: &LocalPaths,
@@ -397,11 +358,6 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp dir");
         let paths = LocalPaths::new(temp.path().join("silo"));
         let machine_id = MachineId::new();
-        let runtime_dir = temp.path().join("missing-runtime");
-        std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
-        std::fs::create_dir_all(paths.machine(machine_id).dir()).expect("create machine dir");
-        ensure_instance_network_link(&paths, machine_id, &runtime_dir)
-            .expect("create network link");
         let metadata = machine_config(
             &paths,
             machine_id,
@@ -428,12 +384,6 @@ mod tests {
         reconcile_network_runtime(&paths, &store, &metadata, false)
             .await
             .expect("reconcile missing instance");
-
-        assert!(!paths.machine(machine_id).network_link().exists());
-        assert!(
-            runtime_dir.exists(),
-            "missing DB instance should not remove unrelated dir"
-        );
     }
 
     #[tokio::test]
@@ -443,9 +393,6 @@ mod tests {
         let machine_id = MachineId::new();
         let runtime_dir = paths.network("net-1").dir().to_path_buf();
         std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
-        std::fs::create_dir_all(paths.machine(machine_id).dir()).expect("create machine dir");
-        ensure_instance_network_link(&paths, machine_id, &runtime_dir)
-            .expect("create network link");
         let instance = instance("net-1");
         let metadata = machine_config(
             &paths,
@@ -485,7 +432,6 @@ mod tests {
             .await
             .expect("reconcile inactive instance");
 
-        assert!(!paths.machine(machine_id).network_link().exists());
         assert!(
             !runtime_dir.exists(),
             "last attachment should remove runtime dir"
@@ -499,9 +445,6 @@ mod tests {
         let machine_id = MachineId::new();
         let runtime_dir = paths.network("net-1").dir().to_path_buf();
         std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
-        std::fs::create_dir_all(paths.machine(machine_id).dir()).expect("create machine dir");
-        ensure_instance_network_link(&paths, machine_id, &runtime_dir)
-            .expect("create network link");
         let instance = instance("net-1");
         let metadata = machine_config(
             &paths,
@@ -535,7 +478,6 @@ mod tests {
             .await
             .expect("reconcile shared instance");
 
-        assert!(!paths.machine(machine_id).network_link().exists());
         assert!(
             runtime_dir.exists(),
             "shared instance runtime dir should stay"
@@ -581,9 +523,6 @@ mod tests {
         let old_runtime_dir = old_run_root.join("net").join(network_id);
         std::fs::create_dir_all(&current_runtime_dir).expect("create current runtime dir");
         std::fs::create_dir_all(&old_runtime_dir).expect("create old runtime dir");
-        std::fs::create_dir_all(paths.machine(machine_id).dir()).expect("create machine dir");
-        ensure_instance_network_link(&paths, machine_id, &current_runtime_dir)
-            .expect("create network link");
         store
             .save_network_instance(&instance(network_id))
             .await

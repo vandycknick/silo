@@ -1344,7 +1344,9 @@ pub(crate) fn validate_root_disk_growth(
     config: &MachineConfig,
     desired_size: u64,
 ) -> Result<(), LibVmError> {
-    let root_disk_path = MachinePaths::new(&config.machine_dir).root_disk_path();
+    let root_disk_path = config
+        .machine_dir
+        .join(crate::paths::root_disk_relative_path());
     let current_size = fs::metadata(&root_disk_path)?.len();
     if desired_size < current_size {
         return Err(LibVmError::InvalidMachineUpdate {
@@ -1366,7 +1368,9 @@ pub(crate) fn reconcile_root_disk_size(
         return Ok(crate::machine::root_disk::RootDiskResizeOutcome::GuestRequired);
     };
 
-    let root_disk_path = MachinePaths::new(&config.machine_dir).root_disk_path();
+    let root_disk_path = config
+        .machine_dir
+        .join(crate::paths::root_disk_relative_path());
     resize_raw_disk(&root_disk_path, desired_size).map_err(Into::into)
 }
 
@@ -1586,7 +1590,7 @@ fn apply_resolved_boot_assets(spec: &mut VmSpec, boot_assets: ResolvedBootAssets
 #[cfg(test)]
 mod tests {
     use crate::lock_manager::LockId;
-    use crate::paths::{LocalPaths, MachinePaths};
+    use crate::paths::LocalPaths;
     use crate::runtime::core::{
         effective_oci_manifest_digest, materialized_manifest_digest, oci_image_record,
         read_monitor_pid, stopped_machine_state, write_machine_config, Runtime,
@@ -1643,6 +1647,12 @@ mod tests {
         spec.hardware
             .as_mut()
             .expect("spec should have hardware section")
+    }
+
+    fn create_machine_runtime_dirs(runtime: &Runtime, machine_id: MachineId) {
+        let paths = runtime.paths.machine(machine_id);
+        std::fs::create_dir_all(paths.run_dir()).expect("create machine run directory");
+        std::fs::create_dir_all(paths.logs_dir()).expect("create machine logs directory");
     }
 
     fn sample_network_policy() -> NetworkPolicy {
@@ -1829,7 +1839,10 @@ mod tests {
 
             let spec = sample_vm_spec();
             write_machine_config(&machine_dir, &self.name, &spec)?;
-            std::fs::write(MachinePaths::new(&machine_dir).root_disk_path(), b"disk")?;
+            std::fs::write(
+                machine_dir.join(crate::paths::root_disk_relative_path()),
+                b"disk",
+            )?;
 
             let lock = match runtime.allocate_machine_lock() {
                 Ok(lock) => lock,
@@ -2282,6 +2295,7 @@ mod tests {
         let mut child = ChildGuard::sleep_ignoring_sigint();
         let pid = child.id() as i32;
         let started_at = child.started_at();
+        create_machine_runtime_dirs(&runtime, machine.id);
         let pid_path = runtime.paths.machine(machine.id).vmmon_pid_path();
         std::fs::write(&pid_path, format!("{pid}\n")).expect("write pid file");
         runtime
@@ -2356,6 +2370,7 @@ mod tests {
             )
             .await
             .expect("set running state");
+        create_machine_runtime_dirs(&runtime, machine.id);
         std::fs::write(
             runtime.paths.machine(machine.id).vmmon_exit_status_path(),
             r#"{"runId":"run-1","pid":12345,"exitedAt":99,"outcome":"error","error":"runtime exploded"}"#,
@@ -2409,6 +2424,7 @@ mod tests {
             .expect("child process should exist")
             .started_at();
         let reaper = std::thread::spawn(move || child.wait());
+        create_machine_runtime_dirs(&runtime, machine.id);
         let pid_path = runtime.paths.machine(machine.id).vmmon_pid_path();
         std::fs::write(&pid_path, format!("{pid}\n")).expect("write pid file");
         runtime
@@ -2541,6 +2557,7 @@ mod tests {
             .commit(&runtime)
             .await
             .expect("commit machine");
+        create_machine_runtime_dirs(&runtime, machine.id);
         let pid_path = runtime.paths.machine(machine.id).vmmon_pid_path();
         std::fs::write(&pid_path, "not-a-pid\n").expect("write malformed pid file");
         runtime
@@ -2726,6 +2743,7 @@ mod tests {
         let child = ChildGuard::sleep();
         let pid = child.id() as i32;
         let started_at = child.started_at();
+        create_machine_runtime_dirs(&runtime, machine.id);
         let pid_path = runtime.paths.machine(machine.id).vmmon_pid_path();
         std::fs::write(&pid_path, format!("{pid}\n")).expect("write pid file");
         runtime
@@ -2822,6 +2840,7 @@ mod tests {
             )
             .await
             .expect("set running state");
+        create_machine_runtime_dirs(&runtime, machine.id);
         std::fs::write(
             runtime.paths.machine(machine.id).vmmon_exit_status_path(),
             r#"{"runId":"run-1","pid":12345,"exitedAt":99,"outcome":"error","error":"runtime exploded"}"#,
@@ -2870,6 +2889,7 @@ mod tests {
             )
             .await
             .expect("set running state");
+        create_machine_runtime_dirs(&runtime, machine.id);
         std::fs::write(
             runtime.paths.machine(machine.id).vmmon_exit_status_path(),
             r#"{"runId":"run-1","pid":12345,"exitedAt":99,"outcome":"error","error":"old runtime exploded"}"#,
@@ -3253,7 +3273,9 @@ mod tests {
             .commit(&runtime)
             .await
             .expect("commit machine");
-        let root_disk = MachinePaths::new(&machine.machine_dir).root_disk_path();
+        let root_disk = machine
+            .machine_dir
+            .join(crate::paths::root_disk_relative_path());
         let root_disk_file = std::fs::OpenOptions::new()
             .write(true)
             .open(root_disk)
@@ -3326,6 +3348,7 @@ mod tests {
             .await
             .expect("commit machine");
 
+        create_machine_runtime_dirs(&runtime, machine.id);
         let pid_path = runtime.paths.machine(machine.id).vmmon_pid_path();
         std::fs::write(&pid_path, format!("{}\n", std::process::id())).expect("write pid file");
 

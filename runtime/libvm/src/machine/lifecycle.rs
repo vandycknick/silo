@@ -60,6 +60,9 @@ impl Machine {
             let trace_path = machine_paths.vmmon_trace_log_path();
             let serial_log_path = machine_paths.serial_log_path();
 
+            fs::create_dir_all(machine_paths.run_dir())?;
+            fs::create_dir_all(machine_paths.logs_dir())?;
+
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             runtime
                 .reconcile_machine_network(&config, status.is_active())

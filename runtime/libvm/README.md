@@ -45,9 +45,14 @@ The persisted root contract stores only main roots:
 
 - `data_root`: durable manager state. `state.db`, machines, assets, keys, and
   `secrets.json` derive from this root.
-- `state_root`: durable operational state. It currently defaults to `data_root`;
-  the state/run filesystem split is completed separately from this schema reset.
+- `state_root`: durable operational state, defaulting to
+  `$XDG_STATE_HOME/silo` or `$HOME/.local/state/silo`.
 - `image_root`: local image and cache storage.
+
+The run root is selected per open from an explicit configuration value,
+`$XDG_RUNTIME_DIR/silo`, or `/tmp/silo-<effective-uid>`. It is never stored in
+the database. Its final directory must be a non-symlink directory owned by the
+effective user with exact mode `0700`.
 
 `db_config` is a singleton row with `id = 1`. It records the host `os`,
 `data_root`, `state_root`, `image_root`, `created_at`, and `modified_at`. Derived
@@ -63,7 +68,11 @@ configurable. The derivation is:
 | `secrets.json` | `data_root/secrets.json` |
 | `images/`      | `image_root`             |
 | `locks/`       | `run_root/locks`         |
-| `net/`         | `run_root/net`           |
+| `machines/<id>/vm.pid` | `run_root/machines/<id>/vm.pid` |
+| `machines/<id>/vm.sock` | `run_root/machines/<id>/vm.sock` |
+| `networks/`    | `run_root/networks`      |
+| machine logs and exit records | `state_root/logs/machines/<id>/` |
+| network logs   | `state_root/logs/networks/<id>/` |
 
 ### State Database Reset
 

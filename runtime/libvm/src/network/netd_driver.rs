@@ -32,8 +32,7 @@ use crate::{LibVmError, NetdRuntimeConfig};
 
 use super::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
 use super::{
-    ensure_instance_network_link, mac_from_machine_id, remove_file_if_exists, remove_runtime_dir,
-    serialize_json, DRIVER_NETD,
+    mac_from_machine_id, remove_file_if_exists, remove_runtime_dir, serialize_json, DRIVER_NETD,
 };
 
 const NETD_BINARY_ENV: &str = "NETD_BIN";
@@ -104,8 +103,8 @@ async fn prepare_netd_runtime(
     let network_paths = paths.network(&network_id);
     let runtime_dir = network_paths.dir().to_path_buf();
     fs::create_dir_all(&runtime_dir)?;
-    ensure_instance_network_link(paths, metadata.id, &runtime_dir)?;
-    let mut startup = NetdStartupGuard::new(paths, metadata.id, runtime_dir.clone());
+    fs::create_dir_all(network_paths.logs_dir())?;
+    let mut startup = NetdStartupGuard::new(runtime_dir.clone());
 
     let socket_path = network_paths.socket_path();
     let log_path = network_paths.log_path();
@@ -672,9 +671,7 @@ impl CapturedStderr {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-struct NetdStartupGuard<'a> {
-    paths: &'a LocalPaths,
-    machine_id: MachineId,
+struct NetdStartupGuard {
     runtime_dir: PathBuf,
     child: Option<Child>,
     stderr_capture: Option<CapturedStderr>,
@@ -682,11 +679,9 @@ struct NetdStartupGuard<'a> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-impl<'a> NetdStartupGuard<'a> {
-    fn new(paths: &'a LocalPaths, machine_id: MachineId, runtime_dir: PathBuf) -> Self {
+impl NetdStartupGuard {
+    fn new(runtime_dir: PathBuf) -> Self {
         Self {
-            paths,
-            machine_id,
             runtime_dir,
             child: None,
             stderr_capture: None,
@@ -735,13 +730,12 @@ impl<'a> NetdStartupGuard<'a> {
     }
 
     fn rollback_files(&mut self) {
-        let _ = super::remove_instance_network_link(self.paths, self.machine_id);
         let _ = remove_runtime_dir(&self.runtime_dir);
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-impl Drop for NetdStartupGuard<'_> {
+impl Drop for NetdStartupGuard {
     fn drop(&mut self) {
         if !self.armed {
             return;

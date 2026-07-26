@@ -14,7 +14,7 @@ implementation.
 
 - [x] Commit 01: Correct and finalize ADR 0012
 - [x] Commit 02: Reset the SQL schema and durable root identity
-- [ ] Commit 03: Split data, state, and run paths securely
+- [x] Commit 03: Split data, state, and run paths securely
 - [ ] Commit 04: Centralize runtime component resolution
 - [ ] Commit 05: Remove late helper and asset discovery
 - [ ] Commit 06: Establish the Make and xtask build interface
@@ -595,6 +595,16 @@ cargo test -p libvm runtime
 make clippy
 git diff --check
 ```
+
+### Implementation Notes
+
+- `LocalRoots` now resolves the durable state root independently. Run-root
+  creation opens the final path with `O_NOFOLLOW | O_DIRECTORY`, validates its
+  effective owner and exact `0700` mode, and uses `nix::unistd::geteuid`.
+- Machine process files use `run-root/machines`, durable machine logs use
+  `state-root/logs/machines`, and network runtime files use
+  `run-root/networks`. The vmmon launch attachment receives the real netd socket
+  path, so no machine-data network symlink remains.
 
 ## Commit 04: Centralize Runtime Component Resolution
 

@@ -8,11 +8,17 @@ pub enum LibVmError {
     #[error("could not resolve Silo data directory from XDG_DATA_HOME or HOME")]
     DataDirUnavailable,
 
+    #[error("could not resolve Silo state directory from XDG_STATE_HOME or HOME")]
+    StateDirUnavailable,
+
     #[error("could not resolve Silo config directory from XDG_CONFIG_HOME or HOME")]
     ConfigDirUnavailable,
 
     #[error("environment variable {name} must be an absolute path, got {path}")]
     RelativeEnvironmentPath { name: &'static str, path: PathBuf },
+
+    #[error("invalid Silo run root {path}: {message}")]
+    InvalidRunRoot { path: PathBuf, message: String },
 
     #[error("invalid machine name {name:?}: {reason}")]
     InvalidMachineName { name: String, reason: String },

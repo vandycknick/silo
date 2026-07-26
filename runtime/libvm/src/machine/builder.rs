@@ -12,7 +12,7 @@ use crate::machine::{
     generate_machine_name, validate_machine_name, GuestBuilder, Machine, MachineGuestConfig, Memory,
 };
 use crate::network::{MachineNetworkBuilder, MachineNetworkConfig};
-use crate::paths::{root_disk_relative_path, MachinePaths};
+use crate::paths::root_disk_relative_path;
 use crate::runtime::core::{stopped_machine_state, write_machine_config};
 use crate::runtime::Runtime;
 use crate::store::models::{
@@ -416,7 +416,7 @@ async fn create_machine_config_with_name(
             reason: "root disk size must be greater than 0".to_string(),
         });
     }
-    let rootfs_path = MachinePaths::new(create.dir()).root_disk_path();
+    let rootfs_path = create.dir().join(root_disk_relative_path());
     clone_or_copy_root_disk(&materialized.rootfs_path, &rootfs_path)?;
 
     if let Some(size_bytes) = request.disk_size_bytes {

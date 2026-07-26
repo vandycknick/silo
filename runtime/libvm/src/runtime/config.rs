@@ -2,7 +2,10 @@ use std::env::consts::OS;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-use crate::paths::{resolve_default_data_dir, resolve_default_run_dir, LocalPaths, LocalRoots};
+use crate::paths::{
+    ensure_run_root, resolve_default_data_dir, resolve_default_run_dir, resolve_default_state_dir,
+    LocalPaths, LocalRoots,
+};
 use crate::store::models::DbConfig;
 use crate::LibVmError;
 
@@ -85,10 +88,11 @@ impl RuntimeConfig {
 
     pub(crate) fn resolve_roots(&self) -> Result<LocalRoots, LibVmError> {
         let (data_root, state_root, image_root) = self.resolve_durable_roots()?;
-        let run_root = self.resolve_run_root(&data_root)?;
-        Ok(LocalRoots::with_roots(
-            data_root, state_root, run_root, image_root,
-        ))
+        let run_root = self.resolve_run_root()?;
+        let roots = LocalRoots::with_roots(data_root, state_root, run_root, image_root);
+        validate_roots_absolute(&roots)?;
+        ensure_run_root(roots.run_root())?;
+        Ok(roots)
     }
 
     pub(crate) fn bootstrap_paths(&self) -> Result<LocalPaths, LibVmError> {
@@ -116,9 +120,10 @@ impl RuntimeConfig {
     ) -> Result<LocalRoots, LibVmError> {
         validate_db_config_header(stored)?;
         let (data_root, state_root, image_root) = merge_durable_roots(self, stored)?;
-        let run_root = self.resolve_run_root(&data_root)?;
+        let run_root = self.resolve_run_root()?;
         let roots = LocalRoots::with_roots(data_root, state_root, run_root, image_root);
         validate_roots_absolute(&roots)?;
+        ensure_run_root(roots.run_root())?;
         validate_durable_roots_match_config(&roots, stored)?;
         compare_path("state_db_path", &roots.state_db_path(), opened_db_path)?;
         Ok(roots)
@@ -134,7 +139,7 @@ impl RuntimeConfig {
     fn resolve_durable_roots(&self) -> Result<(PathBuf, PathBuf, PathBuf), LibVmError> {
         let data_root = self.bootstrap_data_root()?;
         let state_root = match &self.state_root {
-            PathChoice::Default => data_root.clone(),
+            PathChoice::Default => resolve_default_state_dir()?,
             PathChoice::Explicit(path) => path.clone(),
         };
         let image_root = match &self.image_root {
@@ -144,9 +149,9 @@ impl RuntimeConfig {
         Ok((data_root, state_root, image_root))
     }
 
-    fn resolve_run_root(&self, data_root: &Path) -> Result<PathBuf, LibVmError> {
+    fn resolve_run_root(&self) -> Result<PathBuf, LibVmError> {
         match &self.run_root {
-            PathChoice::Default => resolve_default_run_dir(data_root),
+            PathChoice::Default => resolve_default_run_dir(),
             PathChoice::Explicit(path) => Ok(path.clone()),
         }
     }
@@ -404,7 +409,7 @@ mod tests {
         let expected_roots = LocalRoots::with_roots(
             &data_root,
             stored_roots.state_root(),
-            data_root.join("run"),
+            crate::paths::resolve_default_run_dir().expect("resolve default run root"),
             stored_roots.image_root(),
         );
 
