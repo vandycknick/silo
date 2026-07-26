@@ -720,6 +720,13 @@ git diff --check
 - `cargo test -p libvm runtime::builder` initially selected no tests because
   the builder module had none. Focused builder API coverage was added, so the
   planned command now runs one test without changing its filter.
+- A canonical executable in the `Silo.app/Contents/MacOS/silo` shape is an
+  authoritative app candidate. It validates the bundle before adjacent or
+  portable probing, so malformed app metadata cannot fall through to files in
+  `Contents/MacOS`. Missing-runtime diagnostics aggregate invalid components by
+  candidate, describe the fixed layouts, and recommend `make` for an incomplete
+  adjacent development runtime. Linux native locations compile only on Linux;
+  macOS checks only the two documented shared app locations.
 
 ## Commit 05: Remove Late Helper And Asset Discovery
 

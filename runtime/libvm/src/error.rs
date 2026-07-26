@@ -84,8 +84,14 @@ pub enum LibVmError {
     #[error("invalid runtime component input from {input}: {message}")]
     RuntimeComponentInvalid { input: String, message: String },
 
-    #[error("could not resolve a complete Silo runtime; considered {considered}")]
-    RuntimeComponentsNotFound { considered: String },
+    #[error(
+        "could not resolve a complete Silo runtime; missing or invalid components: {considered}. Expected {expected_layouts}.{guidance}"
+    )]
+    RuntimeComponentsNotFound {
+        considered: String,
+        expected_layouts: String,
+        guidance: String,
+    },
 
     #[error("boot asset {asset} not found; checked {checked}")]
     BootAssetNotFound {

@@ -1,6 +1,5 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::runtime::RuntimeConfig;
@@ -106,6 +105,7 @@ impl ComponentPaths {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn rhel(helpers: &Path, assets: &Path) -> Self {
         Self {
             vmmon: helpers.join("vmmon"),
@@ -134,23 +134,32 @@ pub(crate) fn resolve_components(
     config: &RuntimeConfig,
 ) -> Result<ResolvedRuntimeComponents, LibVmError> {
     let mut environment = ProcessEnvironment;
-    resolve_components_with(
+    let mut considered = Vec::new();
+    let canonical_executable = match std::env::current_exe().and_then(fs::canonicalize) {
+        Ok(path) => Some(path),
+        Err(err) => {
+            considered.push(format!("canonical current executable: {err}"));
+            None
+        }
+    };
+    resolve_components_for_executable(
         config,
         &mut environment,
-        std::env::current_exe,
+        canonical_executable.as_deref(),
         &native_candidates(),
+        considered,
     )
 }
 
-fn resolve_components_with<E, F>(
+fn resolve_components_for_executable<E>(
     config: &RuntimeConfig,
     environment: &mut E,
-    current_exe: F,
+    canonical_executable: Option<&Path>,
     native_candidates: &[(String, ComponentPaths)],
+    mut considered: Vec<String>,
 ) -> Result<ResolvedRuntimeComponents, LibVmError>
 where
     E: ComponentEnvironment,
-    F: FnOnce() -> io::Result<PathBuf>,
 {
     let api = explicit_api_overrides(config)?;
     if let Some(root) = config.runtime_root.as_deref() {
@@ -171,17 +180,20 @@ where
         return Ok(overrides.apply_to(components));
     }
 
-    let mut considered = Vec::new();
-    let canonical_exe = match current_exe().and_then(fs::canonicalize) {
-        Ok(path) => Some(path),
-        Err(err) => {
-            considered.push(format!("canonical current executable: {err}"));
-            None
+    let mut attempted_adjacent = false;
+    if let Some(executable) = canonical_executable {
+        if let Some(bundle) = app_bundle_for_executable(executable) {
+            let components = validate_app_bundle(&bundle).map_err(|message| {
+                LibVmError::RuntimeComponentInvalid {
+                    input: "current Silo.app executable".to_string(),
+                    message,
+                }
+            })?;
+            return Ok(overrides.apply_to(components));
         }
-    };
 
-    if let Some(executable) = canonical_exe.as_deref() {
         if let Some(directory) = executable.parent() {
+            attempted_adjacent = true;
             if let Some(components) = consider(
                 &mut considered,
                 "adjacent development runtime",
@@ -202,12 +214,6 @@ where
                 return Ok(overrides.apply_to(components));
             }
         }
-
-        if let Some((bundle, contents)) = app_contents_for_executable(executable) {
-            if let Some(components) = consider_app_bundle(&mut considered, &bundle, &contents) {
-                return Ok(overrides.apply_to(components));
-            }
-        }
     }
 
     if let Some(assets) = path_assets.as_deref() {
@@ -225,14 +231,19 @@ where
     }
     #[cfg(target_os = "macos")]
     for bundle in sdk_app_candidates() {
-        let contents = bundle.join("Contents");
-        if let Some(components) = consider_app_bundle(&mut considered, &bundle, &contents) {
+        if let Some(components) = consider_app_bundle(&mut considered, &bundle) {
             return Ok(overrides.clone().apply_to(components));
         }
     }
 
     Err(LibVmError::RuntimeComponentsNotFound {
         considered: considered.join("; "),
+        expected_layouts: expected_runtime_layouts(),
+        guidance: if attempted_adjacent {
+            " Run `make` to create the complete adjacent development runtime.".to_string()
+        } else {
+            " Configure an explicit runtime root or install a supported runtime.".to_string()
+        },
     })
 }
 
@@ -388,14 +399,58 @@ fn validate_components(
     root: Option<&Path>,
 ) -> Result<ResolvedRuntimeComponents, String> {
     let root = root.map(canonical_root).transpose()?;
-    Ok(ResolvedRuntimeComponents {
-        vmmon: canonical_component("vmmon", &paths.vmmon, true, root.as_deref())?,
-        netd: canonical_component("netd", &paths.netd, true, root.as_deref())?,
-        krun: canonical_component("krun", &paths.krun, true, root.as_deref())?,
-        kernel: canonical_component("kernel-default", &paths.kernel, false, root.as_deref())?,
-        initramfs: canonical_component("initramfs", &paths.initramfs, false, root.as_deref())?,
-        agent: canonical_component("agent", &paths.agent, true, root.as_deref())?,
-    })
+    let mut errors = Vec::new();
+    let vmmon = collect_component("vmmon", &paths.vmmon, true, root.as_deref(), &mut errors);
+    let netd = collect_component("netd", &paths.netd, true, root.as_deref(), &mut errors);
+    let krun = collect_component("krun", &paths.krun, true, root.as_deref(), &mut errors);
+    let kernel = collect_component(
+        "kernel-default",
+        &paths.kernel,
+        false,
+        root.as_deref(),
+        &mut errors,
+    );
+    let initramfs = collect_component(
+        "initramfs",
+        &paths.initramfs,
+        false,
+        root.as_deref(),
+        &mut errors,
+    );
+    let agent = collect_component("agent", &paths.agent, true, root.as_deref(), &mut errors);
+    if !errors.is_empty() {
+        return Err(errors.join(", "));
+    }
+
+    match (vmmon, netd, krun, kernel, initramfs, agent) {
+        (Some(vmmon), Some(netd), Some(krun), Some(kernel), Some(initramfs), Some(agent)) => {
+            Ok(ResolvedRuntimeComponents {
+                vmmon,
+                netd,
+                krun,
+                kernel,
+                initramfs,
+                agent,
+            })
+        }
+        _ => Err("component validation did not produce a complete runtime".to_string()),
+    }
+}
+
+fn collect_component(
+    name: &str,
+    path: &Path,
+    executable: bool,
+    root: Option<&Path>,
+    errors: &mut Vec<String>,
+) -> Option<PathBuf> {
+    match canonical_component(name, path, executable, root) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    }
 }
 
 fn canonical_root(root: &Path) -> Result<PathBuf, String> {
@@ -456,7 +511,7 @@ fn portable_root_for_executable(executable: &Path) -> Option<PathBuf> {
         .then(|| bin.parent().map(Path::to_path_buf))?
 }
 
-fn app_contents_for_executable(executable: &Path) -> Option<(PathBuf, PathBuf)> {
+fn app_bundle_for_executable(executable: &Path) -> Option<PathBuf> {
     let macos = executable.parent()?;
     let contents = macos.parent()?;
     let bundle = contents.parent()?;
@@ -464,15 +519,14 @@ fn app_contents_for_executable(executable: &Path) -> Option<(PathBuf, PathBuf)> 
         && macos.file_name()? == "MacOS"
         && contents.file_name()? == "Contents"
         && bundle.file_name()? == "Silo.app")
-        .then(|| (bundle.to_path_buf(), contents.to_path_buf()))
+        .then(|| bundle.to_path_buf())
 }
 
 fn consider_app_bundle(
     considered: &mut Vec<String>,
     bundle: &Path,
-    contents: &Path,
 ) -> Option<ResolvedRuntimeComponents> {
-    match validate_app_bundle(bundle, contents) {
+    match validate_app_bundle(bundle) {
         Ok(components) => Some(components),
         Err(message) => {
             considered.push(format!("Silo.app {}: {message}", bundle.display()));
@@ -481,12 +535,30 @@ fn consider_app_bundle(
     }
 }
 
-fn validate_app_bundle(
-    bundle: &Path,
-    contents: &Path,
-) -> Result<ResolvedRuntimeComponents, String> {
-    let plist = plist::Value::from_file(contents.join("Info.plist"))
-        .map_err(|err| format!("read Info.plist: {err}"))?;
+fn validate_app_bundle(bundle: &Path) -> Result<ResolvedRuntimeComponents, String> {
+    let bundle = canonical_root(bundle)?;
+    let contents = canonical_root(&bundle.join("Contents"))?;
+    if !contents.starts_with(&bundle) {
+        return Err(format!(
+            "Contents directory {} escapes Silo.app {}",
+            contents.display(),
+            bundle.display()
+        ));
+    }
+    let plist_path = canonical_component(
+        "Info.plist",
+        &contents.join("Info.plist"),
+        false,
+        Some(&bundle),
+    )?;
+    let executable = canonical_component(
+        "Silo.app executable",
+        &contents.join("MacOS/silo"),
+        true,
+        Some(&bundle),
+    )?;
+    let plist =
+        plist::Value::from_file(&plist_path).map_err(|err| format!("read Info.plist: {err}"))?;
     let dictionary = plist
         .as_dictionary()
         .ok_or_else(|| "Info.plist is not a dictionary".to_string())?;
@@ -494,8 +566,7 @@ fn validate_app_bundle(
     require_plist_string(dictionary, "CFBundleExecutable", "silo")?;
     require_plist_string(dictionary, "CFBundleShortVersionString", PRODUCT_VERSION)?;
     require_plist_string(dictionary, "LSMinimumSystemVersion", "26.0")?;
-    validate_arm64_macho(&contents.join("MacOS/silo"))?;
-    let bundle = canonical_root(bundle)?;
+    validate_arm64_macho(&executable)?;
     validate_components(
         ComponentPaths {
             vmmon: contents.join("Helpers/vmmon"),
@@ -646,30 +717,56 @@ fn resolve_path_helpers<E: ComponentEnvironment>(
 }
 
 fn native_candidates() -> Vec<(String, ComponentPaths)> {
-    vec![
-        (
-            "/usr/lib/silo".to_string(),
-            ComponentPaths::portable(Path::new("/usr/lib/silo")),
-        ),
-        (
-            "/usr/libexec/silo with /usr/lib64/silo/assets".to_string(),
-            ComponentPaths::rhel(
-                Path::new("/usr/libexec/silo"),
-                Path::new("/usr/lib64/silo/assets"),
+    #[cfg(target_os = "linux")]
+    {
+        vec![
+            (
+                "/usr/lib/silo".to_string(),
+                ComponentPaths::portable(Path::new("/usr/lib/silo")),
             ),
-        ),
-        (
-            "/usr/libexec/silo with /usr/lib/silo/assets".to_string(),
-            ComponentPaths::rhel(
-                Path::new("/usr/libexec/silo"),
-                Path::new("/usr/lib/silo/assets"),
+            (
+                "/usr/libexec/silo with /usr/lib64/silo/assets".to_string(),
+                ComponentPaths::rhel(
+                    Path::new("/usr/libexec/silo"),
+                    Path::new("/usr/lib64/silo/assets"),
+                ),
             ),
-        ),
-        (
-            "/usr/local/lib/silo".to_string(),
-            ComponentPaths::portable(Path::new("/usr/local/lib/silo")),
-        ),
-    ]
+            (
+                "/usr/libexec/silo with /usr/lib/silo/assets".to_string(),
+                ComponentPaths::rhel(
+                    Path::new("/usr/libexec/silo"),
+                    Path::new("/usr/lib/silo/assets"),
+                ),
+            ),
+            (
+                "/usr/local/lib/silo".to_string(),
+                ComponentPaths::portable(Path::new("/usr/local/lib/silo")),
+            ),
+        ]
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
+fn expected_runtime_layouts() -> String {
+    let mut layouts = vec![
+        "adjacent <exe-dir>/{vmmon,netd,krun,assets/{kernel-default,initramfs,agent}}".to_string(),
+        "portable <root>/{bin/{vmmon,netd,krun},assets/{kernel-default,initramfs,agent}}"
+            .to_string(),
+        "Silo.app/Contents/{MacOS/silo,Helpers/{vmmon,netd,krun},Resources/assets/{kernel-default,initramfs,agent}}".to_string(),
+    ];
+    #[cfg(target_os = "linux")]
+    layouts.push(
+        "Linux native /usr/lib/silo, RHEL /usr/libexec/silo with /usr/lib{,64}/silo/assets, or /usr/local/lib/silo".to_string(),
+    );
+    #[cfg(target_os = "macos")]
+    layouts.push(
+        "macOS SDK shared apps at $HOME/Applications/Silo.app or /Applications/Silo.app"
+            .to_string(),
+    );
+    layouts.join("; ")
 }
 
 #[cfg(test)]
@@ -687,8 +784,13 @@ pub(crate) fn test_components(base: &Path) -> ResolvedRuntimeComponents {
 
 #[cfg(target_os = "macos")]
 fn sdk_app_candidates() -> Vec<PathBuf> {
-    let mut candidates = std::env::var_os("HOME")
-        .map(PathBuf::from)
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    sdk_app_candidates_for_home(home.as_deref())
+}
+
+#[cfg(target_os = "macos")]
+fn sdk_app_candidates_for_home(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = home
         .filter(|home| home.is_absolute())
         .map(|home| vec![home.join("Applications/Silo.app")])
         .unwrap_or_default();
@@ -699,8 +801,8 @@ fn sdk_app_candidates() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_components_with, validate_app_bundle, ComponentEnvironment, ComponentPaths,
-        ResolvedRuntimeComponents,
+        native_candidates, resolve_components_for_executable, validate_app_bundle,
+        ComponentEnvironment, ComponentPaths, ResolvedRuntimeComponents,
     };
     use crate::{LibVmError, RuntimeConfig};
     use std::collections::BTreeMap;
@@ -745,7 +847,14 @@ mod tests {
         executable: PathBuf,
         native: Vec<(String, ComponentPaths)>,
     ) -> Result<ResolvedRuntimeComponents, LibVmError> {
-        resolve_components_with(config, environment, || Ok(executable), &native)
+        let executable = executable.canonicalize().ok();
+        resolve_components_for_executable(
+            config,
+            environment,
+            executable.as_deref(),
+            &native,
+            Vec::new(),
+        )
     }
 
     #[test]
@@ -952,6 +1061,56 @@ mod tests {
     }
 
     #[test]
+    fn missing_runtime_diagnostic_lists_components_candidates_and_make_guidance() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let executable = temp.path().join("debug/silo");
+        write_file(&executable, true);
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+
+        let error = resolve(
+            &RuntimeConfig::default(),
+            &mut TestEnvironment::default(),
+            executable,
+            vec![
+                ("first native".to_string(), ComponentPaths::portable(&first)),
+                (
+                    "second native".to_string(),
+                    ComponentPaths::portable(&second),
+                ),
+            ],
+        )
+        .expect_err("missing runtime must fail");
+        let diagnostic = error.to_string();
+
+        for component in [
+            "vmmon",
+            "netd",
+            "krun",
+            "kernel-default",
+            "initramfs",
+            "agent",
+        ] {
+            assert!(
+                diagnostic.contains(component),
+                "missing {component}: {diagnostic}"
+            );
+        }
+        for candidate in [
+            "adjacent development runtime",
+            "first native",
+            "second native",
+            "portable <root>",
+        ] {
+            assert!(
+                diagnostic.contains(candidate),
+                "missing {candidate}: {diagnostic}"
+            );
+        }
+        assert!(diagnostic.contains("Run `make`"));
+    }
+
+    #[test]
     fn malformed_authoritative_root_stops_resolution() {
         let temp = tempfile::tempdir().expect("temp dir");
         let fallback = temp.path().join("fallback");
@@ -1018,7 +1177,58 @@ mod tests {
         );
     }
 
-    fn app_bundle(base: &Path, binary_plist: bool) -> (PathBuf, PathBuf) {
+    fn write_arm64_macho(path: &Path, architecture: u32, minimum_system: u32) {
+        std::fs::create_dir_all(path.parent().expect("executable parent"))
+            .expect("create executable parent");
+        let mut macho = vec![0_u8; 56];
+        macho[0..4].copy_from_slice(&0xfeed_facfu32.to_le_bytes());
+        macho[4..8].copy_from_slice(&architecture.to_le_bytes());
+        macho[12..16].copy_from_slice(&2_u32.to_le_bytes());
+        macho[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        macho[20..24].copy_from_slice(&24_u32.to_le_bytes());
+        macho[32..36].copy_from_slice(&0x32_u32.to_le_bytes());
+        macho[36..40].copy_from_slice(&24_u32.to_le_bytes());
+        macho[40..44].copy_from_slice(&1_u32.to_le_bytes());
+        macho[44..48].copy_from_slice(&minimum_system.to_le_bytes());
+        std::fs::write(path, macho).expect("write Mach-O executable");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("set executable mode");
+    }
+
+    fn write_info_plist(
+        contents: &Path,
+        binary: bool,
+        identifier: &str,
+        version: &str,
+        minimum_system: &str,
+    ) {
+        let mut info = plist::Dictionary::new();
+        info.insert(
+            "CFBundleIdentifier".to_string(),
+            plist::Value::String(identifier.to_string()),
+        );
+        info.insert(
+            "CFBundleExecutable".to_string(),
+            plist::Value::String("silo".to_string()),
+        );
+        info.insert(
+            "CFBundleShortVersionString".to_string(),
+            plist::Value::String(version.to_string()),
+        );
+        info.insert(
+            "LSMinimumSystemVersion".to_string(),
+            plist::Value::String(minimum_system.to_string()),
+        );
+        let info = plist::Value::Dictionary(info);
+        let info_path = contents.join("Info.plist");
+        if binary {
+            info.to_file_binary(&info_path).expect("write binary plist");
+        } else {
+            info.to_file_xml(&info_path).expect("write XML plist");
+        }
+    }
+
+    fn app_bundle(base: &Path, binary_plist: bool) -> PathBuf {
         let bundle = base.join("Silo.app");
         let contents = bundle.join("Contents");
         let executable = contents.join("MacOS/silo");
@@ -1028,55 +1238,229 @@ mod tests {
         write_file(&contents.join("Resources/assets/kernel-default"), false);
         write_file(&contents.join("Resources/assets/initramfs"), false);
         write_file(&contents.join("Resources/assets/agent"), true);
-        std::fs::create_dir_all(executable.parent().expect("executable parent"))
-            .expect("create executable parent");
-        let mut macho = vec![0_u8; 56];
-        macho[0..4].copy_from_slice(&0xfeed_facfu32.to_le_bytes());
-        macho[4..8].copy_from_slice(&0x0100_000cu32.to_le_bytes());
-        macho[12..16].copy_from_slice(&2_u32.to_le_bytes());
-        macho[16..20].copy_from_slice(&1_u32.to_le_bytes());
-        macho[20..24].copy_from_slice(&24_u32.to_le_bytes());
-        macho[32..36].copy_from_slice(&0x32_u32.to_le_bytes());
-        macho[36..40].copy_from_slice(&24_u32.to_le_bytes());
-        macho[40..44].copy_from_slice(&1_u32.to_le_bytes());
-        macho[44..48].copy_from_slice(&(26_u32 << 16).to_le_bytes());
-        std::fs::write(&executable, macho).expect("write Mach-O executable");
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
-            .expect("set executable mode");
-
-        let mut info = plist::Dictionary::new();
-        info.insert(
-            "CFBundleIdentifier".to_string(),
-            plist::Value::String("sh.silo.app".to_string()),
+        write_arm64_macho(&executable, 0x0100_000c, 26_u32 << 16);
+        write_info_plist(
+            &contents,
+            binary_plist,
+            "sh.silo.app",
+            env!("CARGO_PKG_VERSION"),
+            "26.0",
         );
-        info.insert(
-            "CFBundleExecutable".to_string(),
-            plist::Value::String("silo".to_string()),
-        );
-        info.insert(
-            "CFBundleShortVersionString".to_string(),
-            plist::Value::String(env!("CARGO_PKG_VERSION").to_string()),
-        );
-        info.insert(
-            "LSMinimumSystemVersion".to_string(),
-            plist::Value::String("26.0".to_string()),
-        );
-        let info = plist::Value::Dictionary(info);
-        let info_path = contents.join("Info.plist");
-        if binary_plist {
-            info.to_file_binary(&info_path).expect("write binary plist");
-        } else {
-            info.to_file_xml(&info_path).expect("write XML plist");
-        }
-        (bundle, contents)
+        bundle
     }
 
     #[test]
     fn app_bundle_validation_accepts_xml_and_binary_plists() {
         let temp = tempfile::tempdir().expect("temp dir");
         for (name, binary_plist) in [("xml", false), ("binary", true)] {
-            let (bundle, contents) = app_bundle(&temp.path().join(name), binary_plist);
-            validate_app_bundle(&bundle, &contents).expect("validate app bundle");
+            let bundle = app_bundle(&temp.path().join(name), binary_plist);
+            validate_app_bundle(&bundle).expect("validate app bundle");
         }
+    }
+
+    #[test]
+    fn app_bundle_rejects_malformed_xml_and_binary_plists() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        for (name, contents) in [
+            ("xml", b"<plist><dict>".as_slice()),
+            ("binary", b"bplist00truncated".as_slice()),
+        ] {
+            let bundle = app_bundle(&temp.path().join(name), name == "binary");
+            std::fs::write(bundle.join("Contents/Info.plist"), contents).expect("write plist");
+
+            let error = validate_app_bundle(&bundle).expect_err("malformed plist must fail");
+
+            assert!(error.contains("read Info.plist"));
+        }
+    }
+
+    #[test]
+    fn app_bundle_rejects_wrong_identity_version_and_minimum_os() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        for (name, identifier, version, minimum_system, expected) in [
+            (
+                "identifier",
+                "example.invalid",
+                env!("CARGO_PKG_VERSION"),
+                "26.0",
+                "CFBundleIdentifier",
+            ),
+            (
+                "version",
+                "sh.silo.app",
+                "0.0.0",
+                "26.0",
+                "CFBundleShortVersionString",
+            ),
+            (
+                "minimum-os",
+                "sh.silo.app",
+                env!("CARGO_PKG_VERSION"),
+                "25.0",
+                "LSMinimumSystemVersion",
+            ),
+        ] {
+            let bundle = app_bundle(&temp.path().join(name), false);
+            write_info_plist(
+                &bundle.join("Contents"),
+                false,
+                identifier,
+                version,
+                minimum_system,
+            );
+
+            let error = validate_app_bundle(&bundle).expect_err("invalid app metadata must fail");
+
+            assert!(error.contains(expected));
+        }
+    }
+
+    #[test]
+    fn app_bundle_rejects_non_arm64_and_malformed_macho() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let non_arm64 = app_bundle(&temp.path().join("non-arm64"), false);
+        write_arm64_macho(
+            &non_arm64.join("Contents/MacOS/silo"),
+            0x0100_0007,
+            26_u32 << 16,
+        );
+        let error = validate_app_bundle(&non_arm64).expect_err("non-arm64 app must fail");
+        assert!(error.contains("not an arm64"));
+
+        let old_macos = app_bundle(&temp.path().join("old-macos"), false);
+        write_arm64_macho(
+            &old_macos.join("Contents/MacOS/silo"),
+            0x0100_000c,
+            25_u32 << 16,
+        );
+        let error = validate_app_bundle(&old_macos).expect_err("old macOS app must fail");
+        assert!(error.contains("does not require macOS 26.0"));
+
+        let malformed = app_bundle(&temp.path().join("malformed"), false);
+        std::fs::write(malformed.join("Contents/MacOS/silo"), b"not a Mach-O")
+            .expect("write malformed Mach-O");
+        let error = validate_app_bundle(&malformed).expect_err("malformed app must fail");
+        assert!(error.contains("not a Mach-O"));
+    }
+
+    #[test]
+    fn app_bundle_component_cannot_escape_bundle_root() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bundle = app_bundle(temp.path(), false);
+        let outside = temp.path().join("outside-vmmon");
+        write_file(&outside, true);
+        let helper = bundle.join("Contents/Helpers/vmmon");
+        std::fs::remove_file(&helper).expect("remove helper");
+        symlink(&outside, &helper).expect("link outside helper");
+
+        let error = validate_app_bundle(&bundle).expect_err("bundle escape must fail");
+
+        assert!(error.contains("escapes runtime root"));
+    }
+
+    #[test]
+    fn app_bundle_requires_the_fixed_helper_layout() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bundle = app_bundle(temp.path(), false);
+        std::fs::remove_file(bundle.join("Contents/Helpers/netd")).expect("remove netd");
+
+        let error = validate_app_bundle(&bundle).expect_err("missing helper must fail");
+
+        assert!(error.contains("netd"));
+    }
+
+    #[test]
+    fn app_executable_uses_bundle_layout() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bundle = app_bundle(temp.path(), false);
+        let executable = bundle.join("Contents/MacOS/silo");
+
+        let resolved = resolve(
+            &RuntimeConfig::default(),
+            &mut TestEnvironment::default(),
+            executable,
+            vec![],
+        )
+        .expect("resolve app runtime");
+
+        assert_eq!(
+            resolved.vmmon,
+            bundle
+                .join("Contents/Helpers/vmmon")
+                .canonicalize()
+                .expect("canonical vmmon")
+        );
+    }
+
+    #[test]
+    fn app_executable_validation_is_authoritative_over_adjacent_layout() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bundle = app_bundle(temp.path(), false);
+        let macos = bundle.join("Contents/MacOS");
+        for name in ["vmmon", "netd", "krun"] {
+            write_file(&macos.join(name), true);
+        }
+        write_file(&macos.join("assets/kernel-default"), false);
+        write_file(&macos.join("assets/initramfs"), false);
+        write_file(&macos.join("assets/agent"), true);
+        write_info_plist(
+            &bundle.join("Contents"),
+            false,
+            "example.invalid",
+            env!("CARGO_PKG_VERSION"),
+            "26.0",
+        );
+
+        let error = resolve(
+            &RuntimeConfig::default(),
+            &mut TestEnvironment::default(),
+            macos.join("silo"),
+            vec![],
+        )
+        .expect_err("invalid app bundle must not fall through to adjacent runtime");
+
+        assert!(matches!(error, LibVmError::RuntimeComponentInvalid { .. }));
+        assert!(error.to_string().contains("CFBundleIdentifier"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_candidates_are_linux_only() {
+        let names = native_candidates()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "/usr/lib/silo",
+                "/usr/libexec/silo with /usr/lib64/silo/assets",
+                "/usr/libexec/silo with /usr/lib/silo/assets",
+                "/usr/local/lib/silo",
+            ]
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn native_candidates_are_empty_off_linux() {
+        assert!(native_candidates().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sdk_app_candidates_are_limited_to_documented_locations() {
+        let candidates = super::sdk_app_candidates_for_home(Some(Path::new("/Users/silo")));
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/Users/silo/Applications/Silo.app"),
+                PathBuf::from("/Applications/Silo.app"),
+            ]
+        );
+        assert_eq!(
+            super::sdk_app_candidates_for_home(Some(Path::new("relative"))),
+            vec![PathBuf::from("/Applications/Silo.app")]
+        );
     }
 }
