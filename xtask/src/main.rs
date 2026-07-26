@@ -1,5 +1,6 @@
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -18,6 +19,8 @@ mod components;
 mod initramfs;
 mod kernel;
 mod profiles;
+mod release;
+mod release_audit;
 mod runtime;
 mod targets;
 mod version;
@@ -54,6 +57,10 @@ enum Commands {
         profile: Profile,
         #[command(flatten)]
         kernel: KernelOptions,
+    },
+    VerifyRuntime {
+        #[arg(long, value_enum, default_value_t = Profile::Debug)]
+        profile: Profile,
     },
     Fmt,
     Clippy,
@@ -96,13 +103,15 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     match args.command {
         Commands::Build { profile, kernel } => {
-            let context = build_context(&workspace_root, &target_dir, profile)?;
-            build_all(&context)?;
-            let kernel = kernel::resolve(&context, &kernel)?;
-            runtime::assemble_development(&context, &kernel)?;
+            build_release_or_development(&workspace_root, &target_dir, profile, kernel, false)?;
         }
         Commands::Component { component, profile } => {
-            let context = build_context(&workspace_root, &target_dir, profile)?;
+            let component_target = if profile == Profile::Release {
+                clean_release_target(&target_dir)?
+            } else {
+                target_dir.clone()
+            };
+            let context = build_context(&workspace_root, &component_target, profile)?;
             build_component(component, &context)?;
         }
         Commands::Kernel { kernel } => {
@@ -111,11 +120,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!("{}", kernel.path.display());
         }
         Commands::Stage { profile, kernel } => {
-            let context = build_context(&workspace_root, &target_dir, profile)?;
-            build_all(&context)?;
-            let kernel = kernel::resolve(&context, &kernel)?;
-            runtime::assemble_development(&context, &kernel)?;
-            runtime::stage(&context)?;
+            build_release_or_development(&workspace_root, &target_dir, profile, kernel, true)?;
+        }
+        Commands::VerifyRuntime { profile } => {
+            release_audit::verify(&workspace_root, &target_dir, profile)?
         }
         Commands::Fmt => format(&workspace_root, &target_dir)?,
         Commands::Clippy => {
@@ -133,6 +141,48 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn build_release_or_development(
+    workspace_root: &Path,
+    target_dir: &Path,
+    profile: Profile,
+    kernel_options: KernelOptions,
+    stage: bool,
+) -> Result<(), Box<dyn Error>> {
+    if profile == Profile::Debug {
+        let context = build_context(workspace_root, target_dir, profile)?;
+        build_all(&context)?;
+        let kernel = kernel::resolve(&context, &kernel_options)?;
+        runtime::assemble_development(&context, &kernel)?;
+        if stage {
+            runtime::stage(&context)?;
+        }
+        return Ok(());
+    }
+
+    let clean_target = clean_release_target(target_dir)?;
+    let clean = build_context(workspace_root, &clean_target, profile)?;
+    build_all(&clean)?;
+    let kernel = kernel::resolve(&clean, &kernel_options)?;
+    runtime::assemble_development(&clean, &kernel)?;
+
+    let public = build_context(workspace_root, target_dir, profile)?;
+    runtime::publish_adjacent(&clean, &public)?;
+    if stage {
+        runtime::stage(&public)?;
+    }
+    Ok(())
+}
+
+fn clean_release_target(target_dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let host = HostTarget::current()?;
+    let clean_target = target_dir.join("release-build").join(host.runtime_target());
+    if clean_target.exists() {
+        fs::remove_dir_all(&clean_target)?;
+    }
+    fs::create_dir_all(&clean_target)?;
+    Ok(clean_target)
 }
 
 fn build_context<'a>(

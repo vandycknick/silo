@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::command;
 use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::profiles::Profile;
+use crate::release;
 use crate::targets::HostTarget;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -34,6 +35,8 @@ pub enum ComponentError {
     Command(#[from] command::CommandError),
     #[error(transparent)]
     Initramfs(#[from] crate::initramfs::InitramfsError),
+    #[error(transparent)]
+    Release(#[from] release::ReleaseError),
     #[error("failed to create output directory {path}")]
     CreateOutputDirectory {
         path: std::path::PathBuf,
@@ -74,7 +77,7 @@ pub fn build_component(
 }
 
 pub fn format(workspace_root: &Path, target_dir: &Path) -> Result<(), command::CommandError> {
-    let mut cargo = cargo_command(workspace_root, target_dir);
+    let mut cargo = standard_cargo_command(workspace_root, target_dir);
     cargo.args(["fmt", "--all", "--", "--check"]);
     command::run(cargo)
 }
@@ -84,7 +87,7 @@ pub fn clippy(
     target_dir: &Path,
     host: HostTarget,
 ) -> Result<(), command::CommandError> {
-    let mut cargo = cargo_command(workspace_root, target_dir);
+    let mut cargo = standard_cargo_command(workspace_root, target_dir);
     cargo.args([
         "clippy",
         "--locked",
@@ -103,7 +106,7 @@ pub fn test(
     target_dir: &Path,
     host: HostTarget,
 ) -> Result<(), command::CommandError> {
-    let mut cargo = cargo_command(workspace_root, target_dir);
+    let mut cargo = standard_cargo_command(workspace_root, target_dir);
     cargo.args([
         "test",
         "--locked",
@@ -118,7 +121,7 @@ pub fn test(
 }
 
 fn build_cargo_package(context: &BuildContext<'_>, package: &str) -> Result<(), ComponentError> {
-    let mut cargo = cargo_command(context.workspace_root, context.target_dir);
+    let mut cargo = cargo_command(context)?;
     cargo.args(["build", "--locked", "-p", package]);
     context.profile.apply_cargo(&mut cargo);
     command::run(cargo)?;
@@ -162,10 +165,19 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         source,
     })?;
 
-    let mut go = Command::new("go");
+    let go_program = release::go_program(context.target_dir, context.profile == Profile::Release)?;
+    let mut go = Command::new(&go_program);
     go.current_dir(context.workspace_root.join("net/netd"))
         .env("CARGO_TARGET_DIR", context.target_dir)
         .args(["build", "-mod=readonly"]);
+    release::configure_command(
+        &mut go,
+        context.profile == Profile::Release,
+        &go_program,
+        context.workspace_root,
+        context.target_dir,
+    )?;
+    go.env("CARGO_TARGET_DIR", context.target_dir);
     context.profile.apply_go(&mut go);
     go.args(["-o"])
         .arg(output_dir.join("netd"))
@@ -175,7 +187,7 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
 }
 
 fn build_krun(context: &BuildContext<'_>) -> Result<(), ComponentError> {
-    let mut cargo = cargo_command(context.workspace_root, context.target_dir);
+    let mut cargo = cargo_command(context)?;
     cargo.args([
         "build",
         "--locked",
@@ -192,7 +204,7 @@ fn build_krun(context: &BuildContext<'_>) -> Result<(), ComponentError> {
 }
 
 fn build_guest_agent(context: &BuildContext<'_>) -> Result<(), ComponentError> {
-    let mut cargo = cargo_command(context.workspace_root, context.target_dir);
+    let mut cargo = cargo_command(context)?;
     cargo.args([
         "zigbuild",
         "--locked",
@@ -207,7 +219,7 @@ fn build_guest_agent(context: &BuildContext<'_>) -> Result<(), ComponentError> {
 }
 
 fn build_guest_init(context: &BuildContext<'_>) -> Result<(), ComponentError> {
-    let mut cargo = cargo_command(context.workspace_root, context.target_dir);
+    let mut cargo = cargo_command(context)?;
     cargo.env("RUSTFLAGS", "-C panic=abort").args([
         "zigbuild",
         "--locked",
@@ -216,6 +228,12 @@ fn build_guest_init(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         "--target",
         context.host.guest_target().triple(),
     ]);
+    release::configure_guest_init_command(
+        &mut cargo,
+        context.profile == Profile::Release,
+        context.workspace_root,
+        context.target_dir,
+    );
     context.profile.apply_cargo(&mut cargo);
     command::run(cargo)?;
     Ok(())
@@ -236,7 +254,24 @@ fn build_initramfs(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     Ok(())
 }
 
-fn cargo_command(workspace_root: &Path, target_dir: &Path) -> Command {
+fn cargo_command(context: &BuildContext<'_>) -> Result<Command, ComponentError> {
+    let cargo_program = release::tool("cargo", context.profile == Profile::Release)?;
+    let mut cargo = Command::new(&cargo_program);
+    cargo
+        .current_dir(context.workspace_root)
+        .env("CARGO_TARGET_DIR", context.target_dir);
+    release::configure_command(
+        &mut cargo,
+        context.profile == Profile::Release,
+        &cargo_program,
+        context.workspace_root,
+        context.target_dir,
+    )?;
+    cargo.env("CARGO_TARGET_DIR", context.target_dir);
+    Ok(cargo)
+}
+
+fn standard_cargo_command(workspace_root: &Path, target_dir: &Path) -> Command {
     let mut cargo = Command::new("cargo");
     cargo
         .current_dir(workspace_root)

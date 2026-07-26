@@ -24,7 +24,12 @@ impl Profile {
 
     pub fn apply_go(self, command: &mut Command) {
         if self == Self::Release {
-            command.args(["-ldflags", "-s -w"]);
+            command.env("CGO_ENABLED", "0").args([
+                "-trimpath",
+                "-buildvcs=true",
+                "-ldflags",
+                "-s -w",
+            ]);
         }
     }
 }

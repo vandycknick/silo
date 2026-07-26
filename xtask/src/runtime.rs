@@ -14,6 +14,12 @@ const ASSETS: [(&str, u32); 3] = [
     ("initramfs", 0o644),
     ("agent", 0o755),
 ];
+const ADJACENT_BINARIES: [(&str, u32); 4] = [
+    ("silo", 0o755),
+    ("vmmon", 0o755),
+    ("netd", 0o755),
+    ("krun", 0o755),
+];
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -157,6 +163,49 @@ pub fn stage(context: &BuildContext<'_>) -> Result<(), RuntimeError> {
     result
 }
 
+pub fn publish_adjacent(
+    source: &BuildContext<'_>,
+    destination: &BuildContext<'_>,
+) -> Result<(), RuntimeError> {
+    validate_adjacent(source)?;
+    let source_profile = source.target_dir.join(source.profile.directory());
+    let destination_profile = destination.target_dir.join(destination.profile.directory());
+    create_directory(&destination_profile)?;
+    for (name, mode) in ADJACENT_BINARIES {
+        copy_regular_file(
+            &source_profile.join(name),
+            &destination_profile.join(name),
+            mode,
+        )?;
+    }
+    let assets = destination_profile.join("assets");
+    let temporary = create_sibling_directory(&assets, "release-assets")?;
+    let result = (|| {
+        for (name, mode) in ASSETS {
+            copy_regular_file(
+                &source_profile.join("assets").join(name),
+                &temporary.join(name),
+                mode,
+            )?;
+        }
+        validate_assets(&temporary)?;
+        replace_directory(&temporary, &assets)?;
+        validate_adjacent(destination)
+    })();
+    if result.is_err()
+        && !matches!(&result, Err(RuntimeError::InstalledButCleanupFailed { .. }))
+        && temporary.exists()
+    {
+        fs::remove_dir_all(&temporary).map_err(|source| {
+            RuntimeError::RemoveTemporaryDirectory {
+                path: temporary,
+                source,
+            }
+        })?;
+    }
+    result
+}
+
 fn guest_binary(context: &BuildContext<'_>, name: &str) -> PathBuf {
     let binary = match name {
         "agent" => "silo-agent",
@@ -171,6 +220,7 @@ fn guest_binary(context: &BuildContext<'_>, name: &str) -> PathBuf {
 
 fn validate_adjacent(context: &BuildContext<'_>) -> Result<(), RuntimeError> {
     let profile_dir = context.target_dir.join(context.profile.directory());
+    validate_regular_file(&profile_dir.join("silo"), true, None)?;
     for (name, _) in HELPERS {
         validate_regular_file(&profile_dir.join(name), true, None)?;
     }

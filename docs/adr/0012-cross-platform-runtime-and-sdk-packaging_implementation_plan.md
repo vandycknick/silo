@@ -19,7 +19,7 @@ implementation.
 - [x] Commit 05: Remove late helper and asset discovery
 - [x] Commit 06: Establish the Make and xtask build interface
 - [x] Commit 07: Build adjacent development runtimes and canonical stages
-- [ ] Commit 08: Isolate release linking and audit binaries
+- [x] Commit 08: Isolate release linking and audit binaries
 - [ ] Commit 09: Produce common release archives and metadata
 - [ ] Commit 10: Assemble and sign `Silo.app`
 - [ ] Commit 11: Build the DMG with `create-dmg` and install on macOS
@@ -118,6 +118,22 @@ plan-compatible default. Do not add entries without an actual decision point.
   `renameatx_np`, keeping both paths in one maintained Rust API, while nix
   provides the required effective-UID API. No new transitive dependency is
   introduced and no direct libc call is necessary.
+- 2026-07-26, Commit 08. Question: The validated Nix Go 1.26.4 toolchain embeds
+  Nix-owned timezone and MIME data paths in `netd` even with `-trimpath` and
+  `CGO_ENABLED=0`; should the auditor exempt those paths, keep the Nix compiler,
+  or fetch a pinned upstream compiler? Selected default: download and verify the
+  official Go 1.26.5 darwin-arm64 archive into the ignored release-tools cache.
+  Rationale: allowing Nix strings would weaken the product boundary; Go 1.26.5
+  is the current upstream patch release with a published archive digest and is
+  compatible with the repository's `go 1.25.5` minimum.
+- 2026-07-26, Commit 08. Question: Should the string auditor reject every
+  `/tmp/` occurrence, including the documented `/tmp/silo-<effective-uid>`
+  runtime fallback? Options: reject all temporary strings; exempt all temporary
+  strings; or reject compiler-temporary prefixes while preserving the runtime
+  contract. Selected default: reject `/tmp/rustc` and `/tmp/cargo` plus macOS
+  temporary roots, while permitting the documented Silo fallback. Rationale: a
+  blanket match would reject required production behavior rather than a build
+  leak.
 
 ### Breaking-Change Policy
 
@@ -1155,6 +1171,45 @@ make verify-runtime PROFILE=release
 make clippy
 git diff --check
 ```
+
+### Ghostty Reference Notes
+
+Inspected Ghostty's `nix/devShell.nix`, `nix/package.nix`, `build.zig`,
+`src/build/Config.zig`, and `.github/workflows/release-tag.yml`.
+
+- Reused the clean-native boundary: Ghostty clears Nix SDK/compiler variables
+  before native Apple tooling, keeps Nix development/package concerns separate,
+  and hands its macOS app work to native tooling outside the Nix environment.
+  Silo applies that boundary per release subprocess through `/usr/bin/xcrun`,
+  then qualifies copied output rather than trusting build objects.
+- Intentionally did not copy Ghostty's Zig typed graph, Swift/Xcode project,
+  XCFramework, Sparkle, or nested-app signing flow. Silo retains Make and Rust
+  xtask, has no Xcode project, and defers app/signing work to later commits.
+
+### Implementation Notes
+
+- Release compilation is deleted and rebuilt under
+  `$CARGO_TARGET_DIR/release-build/<target>` for every release invocation.
+  Only validated copies populate the existing adjacent `release/` layout and
+  canonical six-file stage, so Commit 07 paths remain unchanged.
+- macOS release subprocesses clear Nix/compiler/SDK/package-config variables,
+  use clean-environment `xcrun` SDK tools, target arm64 macOS 26.0, remap Rust
+  source paths, and use the pinned official Go compiler for `netd`.
+  `netd` is built with `CGO_ENABLED=0`, `-trimpath`, `-buildvcs=true`, and
+  `-ldflags=-s -w`.
+- `make verify-runtime PROFILE=release` audits actual adjacent, staged, and
+  guest artifacts. It records tool and Go module metadata outside the runtime
+  root, and it builds an ambient-Nix CLI into a separate audit target to prove
+  that the production auditor rejects a real contaminated binary.
+- `release/Containerfile`, `docker-bake.hcl`, and `toolchains.toml` define the
+  digest-pinned Ubuntu 24.04/glibc 2.39 native Linux environment. Docker was
+  unavailable on this macOS host, so Linux artifact execution is deferred to
+  native Linux CI/builders; the configuration and container syntax were not
+  executed locally.
+- Qualification passed `cargo fmt`, clean release build/stage, release runtime
+  audit including the contamination rejection, `make clippy`, and diff checks.
+  The release CLI resolved its help output. On VZ, a fresh XDG state root and
+  explicit staged runtime booted `ubuntu:24.04` to `uname -a` in 1.2 seconds.
 
 ## Commit 09: Produce Common Release Archives And Metadata
 

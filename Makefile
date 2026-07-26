@@ -25,13 +25,19 @@ ifeq ($(KERNEL_OFFLINE),1)
 KERNEL_ARGS += --offline
 endif
 
-.PHONY: build stage cli vmmon netd krun agent init initramfs kernel fmt clippy test version-check
+.PHONY: build stage verify-runtime release-linux cli vmmon netd krun agent init initramfs kernel fmt clippy test version-check
 
 build:
 	$(XTASK) build --profile "$(PROFILE)" $(KERNEL_ARGS)
 
 stage:
 	$(XTASK) stage --profile "$(PROFILE)" $(KERNEL_ARGS)
+
+verify-runtime:
+	$(XTASK) verify-runtime --profile "$(PROFILE)"
+
+release-linux:
+	docker buildx bake -f release/docker-bake.hcl silo-release
 
 cli vmmon netd krun agent init initramfs:
 	$(XTASK) component $@ --profile "$(PROFILE)"
