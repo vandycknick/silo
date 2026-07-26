@@ -302,7 +302,7 @@ pub fn configure_guest_init_command(
 }
 
 pub fn set_macos_build_version(path: &Path) -> Result<(), ReleaseError> {
-    let temporary = path.with_extension(format!("vtool-{}", std::process::id()));
+    let temporary = path.with_extension("vtool");
     let mut vtool = Command::new("/usr/bin/vtool");
     vtool
         .args([

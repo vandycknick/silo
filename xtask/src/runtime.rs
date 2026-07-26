@@ -94,7 +94,17 @@ pub fn assemble_development(
             0o755,
         )?;
         validate_assets(&temporary)?;
-        replace_directory(&temporary, &assets)?;
+        if assets_match(&temporary, &assets)? {
+            fs::remove_dir_all(&temporary).map_err(|source| {
+                RuntimeError::RemoveTemporaryDirectory {
+                    path: temporary.clone(),
+                    source,
+                }
+            })?;
+            println!("runtime assets unchanged: {}", assets.display());
+        } else {
+            replace_directory(&temporary, &assets)?;
+        }
         validate_adjacent(context)
     })();
     if result.is_err()
@@ -123,6 +133,16 @@ pub fn stage(context: &BuildContext<'_>) -> Result<(), RuntimeError> {
         RuntimeError::Invalid(format!("stage path has no parent: {}", stage.display()))
     })?;
     create_directory(parent)?;
+    match validate_stage_against_adjacent(context, &stage) {
+        Ok(()) => {
+            println!("runtime stage unchanged: {}", stage.display());
+            return Ok(());
+        }
+        Err(RuntimeError::Invalid(_)) => {}
+        Err(RuntimeError::Metadata { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     let temporary = create_sibling_directory(&stage, "stage")?;
     let result = (|| {
         let bin = temporary.join("bin");
@@ -203,6 +223,23 @@ fn validate_stage(stage: &Path) -> Result<(), RuntimeError> {
     validate_assets(&assets)
 }
 
+fn assets_match(source: &Path, destination: &Path) -> Result<bool, RuntimeError> {
+    if !directory_entries_match(destination, &["agent", "initramfs", "kernel-default"])? {
+        return Ok(false);
+    }
+    for (name, mode) in ASSETS {
+        if !regular_files_match(
+            &source.join(name),
+            &destination.join(name),
+            name == "agent",
+            mode,
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub fn validate_stage_against_adjacent(
     context: &BuildContext<'_>,
     stage: &Path,
@@ -223,8 +260,44 @@ pub fn validate_stage_against_adjacent(
 }
 
 fn compare_regular_files(source: &Path, destination: &Path, mode: u32) -> Result<(), RuntimeError> {
-    validate_regular_file(source, mode & 0o111 != 0, Some(mode))?;
-    validate_regular_file(destination, mode & 0o111 != 0, Some(mode))?;
+    if regular_files_match(source, destination, mode & 0o111 != 0, mode)? {
+        return Ok(());
+    }
+    Err(RuntimeError::Invalid(format!(
+        "{} does not match {} byte-for-byte",
+        destination.display(),
+        source.display()
+    )))
+}
+
+fn regular_files_match(
+    source: &Path,
+    destination: &Path,
+    executable: bool,
+    mode: u32,
+) -> Result<bool, RuntimeError> {
+    validate_regular_file(source, executable, Some(mode))?;
+    let metadata = match fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(RuntimeError::Metadata {
+                path: destination.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if metadata.permissions().mode() & 0o777 != mode {
+            return Ok(false);
+        }
+    }
     let source_bytes = fs::read(source).map_err(|source_error| RuntimeError::Metadata {
         path: source.to_path_buf(),
         source: source_error,
@@ -234,14 +307,36 @@ fn compare_regular_files(source: &Path, destination: &Path, mode: u32) -> Result
             path: destination.to_path_buf(),
             source: source_error,
         })?;
-    if source_bytes != destination_bytes {
-        return Err(RuntimeError::Invalid(format!(
-            "{} does not match {} byte-for-byte",
-            destination.display(),
-            source.display()
-        )));
+    Ok(source_bytes == destination_bytes)
+}
+
+fn directory_entries_match(directory: &Path, expected: &[&str]) -> Result<bool, RuntimeError> {
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(RuntimeError::Metadata {
+                path: directory.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(false);
     }
-    Ok(())
+    let entries = fs::read_dir(directory).map_err(|source| RuntimeError::Metadata {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    let mut actual = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| RuntimeError::Metadata {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        actual.insert(entry.file_name());
+    }
+    Ok(actual == expected.iter().map(std::ffi::OsString::from).collect())
 }
 
 fn validate_directory_entries(

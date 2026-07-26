@@ -1,8 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
+use std::io::Write;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use thiserror::Error;
 
@@ -141,11 +142,11 @@ pub fn assemble(
         verify_signature(&temporary)?;
         verify_entitlements(
             &helpers.join("vmmon"),
-            Some("com.apple.security.virtualization"),
+            &["com.apple.security.virtualization"],
         )?;
-        verify_entitlements(&helpers.join("krun"), Some("com.apple.security.hypervisor"))?;
-        verify_entitlements(&macos.join("silo"), None)?;
-        verify_entitlements(&helpers.join("netd"), None)?;
+        verify_entitlements(&helpers.join("krun"), &["com.apple.security.hypervisor"])?;
+        verify_entitlements(&macos.join("silo"), &[])?;
+        verify_entitlements(&helpers.join("netd"), &[])?;
         let app = output.join(APP_NAME);
         replace_directory(&temporary, &app)?;
         verify_runtime_resolution(&app)?;
@@ -408,7 +409,7 @@ fn verify_signature(path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn verify_entitlements(path: &Path, expected_key: Option<&str>) -> Result<(), AppError> {
+fn verify_entitlements(path: &Path, expected_keys: &[&str]) -> Result<(), AppError> {
     let mut command = Command::new("/usr/bin/codesign");
     command.args(["-d", "--entitlements", ":-"]).arg(path);
     let output = command.output().map_err(|source| AppError::Io {
@@ -425,25 +426,73 @@ fn verify_entitlements(path: &Path, expected_key: Option<&str>) -> Result<(), Ap
             ),
         );
     }
-    let entitlements = String::from_utf8_lossy(&output.stdout);
-    match expected_key {
-        Some(key) => {
-            if !entitlements.contains(key) || !entitlements.contains("<true/>") {
-                return invalid(path, format!("missing required entitlement {key}"));
-            }
-            if path.file_name().and_then(|name| name.to_str()) == Some("vmmon")
-                && (entitlements.contains("com.apple.security.network.client")
-                    || entitlements.contains("com.apple.security.network.server"))
-            {
-                return invalid(path, "contains unnecessary network entitlement".to_string());
-            }
-        }
-        None if !entitlements.trim().is_empty() => {
-            return invalid(path, "contains an entitlement blob".to_string());
-        }
-        None => {}
+    let actual = entitlement_map(path, &output.stdout)?;
+    let expected = expected_keys
+        .iter()
+        .map(|key| ((*key).to_string(), true))
+        .collect::<BTreeMap<_, _>>();
+    if actual != expected {
+        return invalid(
+            path,
+            format!("entitlements are {actual:?}, expected {expected:?}"),
+        );
     }
     Ok(())
+}
+
+fn entitlement_map(path: &Path, plist: &[u8]) -> Result<BTreeMap<String, bool>, AppError> {
+    if plist.iter().all(u8::is_ascii_whitespace) {
+        return Ok(BTreeMap::new());
+    }
+    let mut command = Command::new("/usr/bin/plutil");
+    command
+        .args(["-convert", "json", "-o", "-", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child = command.spawn().map_err(|source| AppError::Io {
+        action: "convert signed entitlements to JSON",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut input = child.stdin.take().ok_or_else(|| AppError::Invalid {
+        path: path.to_path_buf(),
+        reason: "plutil has no entitlement input pipe".to_string(),
+    })?;
+    input.write_all(plist).map_err(|source| AppError::Io {
+        action: "write signed entitlements to plutil",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    drop(input);
+    let output = child.wait_with_output().map_err(|source| AppError::Io {
+        action: "read converted signed entitlements",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !output.status.success() {
+        return invalid(
+            path,
+            format!(
+                "plutil entitlement conversion exited with {}",
+                output.status
+            ),
+        );
+    }
+    let values = serde_json::from_slice::<BTreeMap<String, serde_json::Value>>(&output.stdout)
+        .map_err(|error| AppError::Invalid {
+            path: path.to_path_buf(),
+            reason: format!("parse signed entitlements as JSON: {error}"),
+        })?;
+    values
+        .into_iter()
+        .map(|(key, value)| match value {
+            serde_json::Value::Bool(value) => Ok((key, value)),
+            value => Err(AppError::Invalid {
+                path: path.to_path_buf(),
+                reason: format!("entitlement {key:?} is not a boolean: {value}"),
+            }),
+        })
+        .collect()
 }
 
 fn verify_runtime_resolution(bundle: &Path) -> Result<(), AppError> {
@@ -463,19 +512,25 @@ fn verify_runtime_resolution(bundle: &Path) -> Result<(), AppError> {
         run_list(&linked, &temporary)?;
         let copied = temporary.join("copied-silo");
         copy_regular_file(&executable, &copied, 0o755)?;
+        let moved_bundle = temporary.join(APP_NAME);
+        fs::rename(bundle, &moved_bundle).map_err(|source| AppError::Io {
+            action: "move app bundle for copied CLI acceptance check",
+            path: bundle.to_path_buf(),
+            source,
+        })?;
         let mut command = runtime_command(&copied, &temporary);
         command.args(["list", "--format", "json"]);
-        let output = command.output().map_err(|source| AppError::Io {
+        let copied_result = command.output().map_err(|source| AppError::Io {
             action: "run copied CLI runtime acceptance check",
             path: copied.clone(),
             source,
+        });
+        fs::rename(&moved_bundle, bundle).map_err(|source| AppError::Io {
+            action: "restore app bundle after copied CLI acceptance check",
+            path: bundle.to_path_buf(),
+            source,
         })?;
-        if output.status.success() {
-            return invalid(
-                &copied,
-                "resolved runtime resources after being copied out of Silo.app".to_string(),
-            );
-        }
+        copied_result?;
         Ok(())
     })();
     fs::remove_dir_all(&temporary).map_err(|source| AppError::Io {
