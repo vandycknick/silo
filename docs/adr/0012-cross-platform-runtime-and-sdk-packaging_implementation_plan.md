@@ -17,7 +17,7 @@ implementation.
 - [x] Commit 03: Split data, state, and run paths securely
 - [x] Commit 04: Centralize runtime component resolution
 - [x] Commit 05: Remove late helper and asset discovery
-- [ ] Commit 06: Establish the Make and xtask build interface
+- [x] Commit 06: Establish the Make and xtask build interface
 - [ ] Commit 07: Build adjacent development runtimes and canonical stages
 - [ ] Commit 08: Isolate release linking and audit binaries
 - [ ] Commit 09: Produce common release archives and metadata
@@ -82,6 +82,14 @@ plan-compatible default. Do not add entries without an actual decision point.
   temporary helper in a Linux-native test. Rationale: it verifies the actual
   process boundary and forwarded arguments while remaining portable across
   Linux CI hosts without virtualization support.
+- 2026-07-26, Commit 06. Question: Must the new `VERSION` authority govern the
+  independently versioned `common/ext4` crate, which is currently `0.1.2`, as
+  well as product artifacts? Options: rewrite every workspace crate to `0.1.0`;
+  make version-check fail on the existing `ext4` version; or check the shipped
+  Rust product manifests and Node package only. Selected default: check the
+  shipped product manifests and Node package only. Rationale: `ext4` is an
+  existing reusable component rather than a product-version authority, and
+  rewriting it would violate this commit's no-unrelated-version-rewrites rule.
 
 ### Breaking-Change Policy
 
@@ -836,6 +844,19 @@ Suggested intent: `build: make xtask the build orchestrator`
 
 Make Make the stable user interface and move component-specific orchestration
 into typed Rust code without creating an xtask test suite.
+
+### Ghostty Reference Notes
+
+Inspected Ghostty's `build.zig`, `src/build/Config.zig`, `flake.nix`,
+`nix/devShell.nix`, `nix/package.nix`, and `PACKAGING.md` before changing build
+or Nix behavior.
+
+- Reused its high-level typed profile and artifact-selection boundary, root
+  version-file preference, and thin-flake/delegated-development-shell layout.
+- Intentionally did not copy Ghostty's Zig build graph, source-tarball and
+  `DESTDIR` packaging flow, dynamic-linker policy, macOS/Xcode behavior, or
+  downstream package derivation details. Silo keeps Make as the public
+  interface and Rust xtask as the orchestrator.
 
 ### Required Changes
 

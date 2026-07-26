@@ -1,107 +1,36 @@
-HOST_ARCH := $(shell uname -m)
-ifeq ($(HOST_ARCH),x86_64)
-DEFAULT_ARCH := x86_64
-else ifneq ($(filter arm64 aarch64,$(HOST_ARCH)),)
-DEFAULT_ARCH := arm64
-endif
+.DEFAULT_GOAL := build
 
-ARCH ?= $(DEFAULT_ARCH)
-TRACK ?= stable
-GUEST_TARGET_x86_64 := x86_64-unknown-linux-musl
-GUEST_TARGET_arm64 := aarch64-unknown-linux-musl
-DEFAULT_GUEST_TARGET := $(GUEST_TARGET_$(ARCH))
-ifeq ($(DEFAULT_GUEST_TARGET),)
-$(error unsupported guest architecture: $(ARCH))
-endif
-
-GUEST_TARGET ?= $(DEFAULT_GUEST_TARGET)
-GUEST_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/silo-agent
-GUEST_INIT_BIN := $(CURDIR)/target/$(GUEST_TARGET)/release/init
-GUEST_ASSETS_DIR := $(CURDIR)/target/resources/assets
-INITRAMFS_OUT := $(GUEST_ASSETS_DIR)/initramfs
 PROFILE ?= debug
-HOST_OS := $(shell uname -s)
-
-ifeq ($(HOST_OS),Darwin)
-HOST_WORKSPACE_EXCLUDES := --exclude agent --exclude init
-HOST_BUILD_COMPONENTS := vmmon netd
-else ifeq ($(HOST_OS),Linux)
-HOST_WORKSPACE_EXCLUDES := --exclude init --exclude vz
-HOST_BUILD_COMPONENTS := vmmon netd krun
-else
-HOST_WORKSPACE_EXCLUDES := --exclude agent --exclude init --exclude vz
-HOST_BUILD_COMPONENTS := vmmon netd
-endif
-
-ifeq ($(PROFILE),release)
-CARGO_PROFILE_FLAGS := --release
-TARGET_PROFILE_DIR := release
-else ifeq ($(PROFILE),debug)
-CARGO_PROFILE_FLAGS :=
-TARGET_PROFILE_DIR := debug
-else
+ifeq ($(filter $(PROFILE),debug release),)
 $(error PROFILE must be debug or release)
 endif
 
-VMMON_BIN := target/$(TARGET_PROFILE_DIR)/vmmon
-NETD_BIN := target/$(TARGET_PROFILE_DIR)/netd
+TRACK ?= stable
+CARGO_TARGET_DIR ?= $(CURDIR)/target
+override CARGO_TARGET_DIR := $(abspath $(CARGO_TARGET_DIR))
+export CARGO_TARGET_DIR
 
-ifeq ($(PROFILE),release)
-GO_BUILD_FLAGS := -ldflags "-s -w"
-else
-GO_BUILD_FLAGS :=
-endif
+XTASK = CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" cargo run --locked -p xtask --
 
-.PHONY: build-guest-agent
-build-guest-agent:
-	cargo zigbuild -p agent --target $(GUEST_TARGET) --release
-	mkdir -p "$(GUEST_ASSETS_DIR)"
-	cp "$(GUEST_BIN)" "$(GUEST_ASSETS_DIR)/agent"
-	@echo "Updated $(GUEST_ASSETS_DIR)/agent"
+.PHONY: build cli vmmon netd krun agent init initramfs kernel fmt clippy test version-check
 
-.PHONY: build-guest-init
-build-guest-init:
-	RUSTFLAGS="-C panic=abort" cargo zigbuild -p init --target $(GUEST_TARGET) --release
-	mkdir -p "$(GUEST_ASSETS_DIR)"
-	cp "$(GUEST_INIT_BIN)" "$(GUEST_ASSETS_DIR)/init"
-	@echo "Updated $(GUEST_ASSETS_DIR)/init"
+build:
+	$(XTASK) build --profile "$(PROFILE)"
 
-.PHONY: build
-build: $(HOST_BUILD_COMPONENTS)
-	cargo build $(CARGO_PROFILE_FLAGS) -p cli
+cli vmmon netd krun agent init initramfs:
+	$(XTASK) component $@ --profile "$(PROFILE)"
 
-.PHONY: clippy
-clippy:
-	cargo clippy --workspace --all-targets --all-features $(HOST_WORKSPACE_EXCLUDES)
-
-.PHONY: test
-test:
-	cargo test --workspace --all-targets --all-features $(HOST_WORKSPACE_EXCLUDES)
-
-.PHONY: vmmon
-vmmon:
-	cargo build $(CARGO_PROFILE_FLAGS) -p vmmon
-	cargo run -p xtask -- sign-vmmon "$(VMMON_BIN)"
-
-.PHONY: krun
-krun:
-	cargo build $(CARGO_PROFILE_FLAGS) -p krun --features krun-bin --bin krun
-
-.PHONY: netd
-netd:
-	@mkdir -p "target/$(TARGET_PROFILE_DIR)"
-	cd net/netd && go build $(GO_BUILD_FLAGS) -o "$(CURDIR)/$(NETD_BIN)" ./cmd/netd
-
-.PHONY: kernel
 kernel:
-	@$(MAKE) -C resources/kernels kernel TRACK="$(TRACK)"
+	$(XTASK) kernel --track "$(TRACK)"
 
-.PHONY: initramfs
-initramfs:
-	cargo run -p xtask -- guest-assets --target "$(GUEST_TARGET)" --assets-dir "$(GUEST_ASSETS_DIR)"
+fmt:
+	$(XTASK) fmt
 
-.PHONY: rootfs
-rootfs:
-	@mkdir -p ./target/resources/rootfs
-	@docker build -f resources/rootfs/Dockerfile -t rootfs .
-	@docker run -it -v $(shell pwd)/target/resources/rootfs:/resources --privileged --cap-add=CAP_MKNOD rootfs
+clippy:
+	$(XTASK) clippy
+
+test:
+	$(XTASK) test
+
+version-check:
+	$(XTASK) version-check
