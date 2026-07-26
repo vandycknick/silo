@@ -10,8 +10,11 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::command;
+use crate::components::BuildContext;
 use crate::profiles::Profile;
 use crate::release;
+use crate::release_record;
+use crate::runtime;
 use crate::targets::HostTarget;
 
 #[derive(Debug, Error)]
@@ -20,6 +23,10 @@ pub enum AuditError {
     Command(#[from] command::CommandError),
     #[error(transparent)]
     Release(#[from] release::ReleaseError),
+    #[error(transparent)]
+    Record(#[from] release_record::RecordError),
+    #[error(transparent)]
+    Runtime(#[from] runtime::RuntimeError),
     #[error("release audit failed for {path}: {reason}")]
     Invalid { path: PathBuf, reason: String },
     #[error("failed to read release artifact {path}")]
@@ -51,6 +58,7 @@ pub fn verify(
         path: target_dir.to_path_buf(),
         reason: error.to_string(),
     })?;
+    release_record::invalidate_qualification(target_dir, host)?;
     let release = target_dir.join("release");
     let stage = target_dir
         .join("silo-runtime")
@@ -93,7 +101,17 @@ pub fn verify(
         target_dir,
     )?;
     verify_contaminated_binary(workspace_root, target_dir, host)?;
-    write_provenance(workspace_root, target_dir, host, &release.join("netd"))
+    runtime::validate_stage_against_adjacent(
+        &BuildContext {
+            workspace_root,
+            target_dir,
+            profile,
+            host,
+        },
+        &stage,
+    )?;
+    write_provenance(workspace_root, target_dir, host, &release.join("netd"))?;
+    Ok(release_record::write_qualification(target_dir, host)?)
 }
 
 fn audit_macho(

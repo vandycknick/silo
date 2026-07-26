@@ -145,9 +145,9 @@ pub fn stage(context: &BuildContext<'_>) -> Result<(), RuntimeError> {
                 mode,
             )?;
         }
-        validate_stage(&temporary)?;
+        validate_stage_against_adjacent(context, &temporary)?;
         replace_directory(&temporary, &stage)?;
-        validate_stage(&stage)
+        validate_stage_against_adjacent(context, &stage)
     })();
     if result.is_err()
         && !matches!(&result, Err(RuntimeError::InstalledButCleanupFailed { .. }))
@@ -190,7 +190,8 @@ pub fn publish_adjacent(
         }
         validate_assets(&temporary)?;
         replace_directory(&temporary, &assets)?;
-        validate_adjacent(destination)
+        validate_adjacent(destination)?;
+        validate_adjacent_matches(source, destination)
     })();
     if result.is_err()
         && !matches!(&result, Err(RuntimeError::InstalledButCleanupFailed { .. }))
@@ -250,6 +251,66 @@ fn validate_stage(stage: &Path) -> Result<(), RuntimeError> {
         validate_regular_file(&bin.join(name), true, Some(mode))?;
     }
     validate_assets(&assets)
+}
+
+pub fn validate_stage_against_adjacent(
+    context: &BuildContext<'_>,
+    stage: &Path,
+) -> Result<(), RuntimeError> {
+    validate_stage(stage)?;
+    let profile = context.target_dir.join(context.profile.directory());
+    for (name, mode) in HELPERS {
+        compare_regular_files(&profile.join(name), &stage.join("bin").join(name), mode)?;
+    }
+    for (name, mode) in ASSETS {
+        compare_regular_files(
+            &profile.join("assets").join(name),
+            &stage.join("assets").join(name),
+            mode,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_adjacent_matches(
+    source: &BuildContext<'_>,
+    destination: &BuildContext<'_>,
+) -> Result<(), RuntimeError> {
+    let source = source.target_dir.join(source.profile.directory());
+    let destination = destination.target_dir.join(destination.profile.directory());
+    for (name, mode) in ADJACENT_BINARIES {
+        compare_regular_files(&source.join(name), &destination.join(name), mode)?;
+    }
+    for (name, mode) in ASSETS {
+        compare_regular_files(
+            &source.join("assets").join(name),
+            &destination.join("assets").join(name),
+            mode,
+        )?;
+    }
+    Ok(())
+}
+
+fn compare_regular_files(source: &Path, destination: &Path, mode: u32) -> Result<(), RuntimeError> {
+    validate_regular_file(source, mode & 0o111 != 0, Some(mode))?;
+    validate_regular_file(destination, mode & 0o111 != 0, Some(mode))?;
+    let source_bytes = fs::read(source).map_err(|source_error| RuntimeError::Metadata {
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
+    let destination_bytes =
+        fs::read(destination).map_err(|source_error| RuntimeError::Metadata {
+            path: destination.to_path_buf(),
+            source: source_error,
+        })?;
+    if source_bytes != destination_bytes {
+        return Err(RuntimeError::Invalid(format!(
+            "{} does not match {} byte-for-byte",
+            destination.display(),
+            source.display()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_directory_entries(

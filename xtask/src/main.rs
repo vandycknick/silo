@@ -25,6 +25,7 @@ mod kernel;
 mod profiles;
 mod release;
 mod release_audit;
+mod release_record;
 mod runtime;
 mod targets;
 mod version;
@@ -64,6 +65,10 @@ enum Commands {
     },
     VerifyRuntime {
         #[arg(long, value_enum, default_value_t = Profile::Debug)]
+        profile: Profile,
+    },
+    CheckRuntimeQualification {
+        #[arg(long, value_enum, default_value_t = Profile::Release)]
         profile: Profile,
     },
     Fmt,
@@ -177,6 +182,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             release_audit::verify(&workspace_root, &target_dir, profile)?
         }
+        Commands::CheckRuntimeQualification { profile } => {
+            if profile != Profile::Release {
+                return Err("runtime qualification is only defined for release outputs".into());
+            }
+            let host = HostTarget::current()?;
+            if !release_record::qualification_matches(&target_dir, host)? {
+                return Err("release runtime qualification is missing, stale, or artifact-bound bytes changed; run make verify-runtime PROFILE=release".into());
+            }
+            println!("release runtime qualification is current");
+        }
         Commands::Fmt => format(&workspace_root, &target_dir)?,
         Commands::Clippy => {
             let host = HostTarget::current()?;
@@ -223,20 +238,44 @@ fn build_release_or_development(
 
     let host = HostTarget::current()?;
     let source_fingerprint = release_source_fingerprint(workspace_root, profile, host)?;
-    let build_fingerprint = release_build_fingerprint(&source_fingerprint, &kernel_options);
+    let toolchain_fingerprint = release_toolchain_fingerprint(workspace_root)?;
     let release_target = release_target_path(target_dir, host);
-    if release_stamp_matches(&release_target, &build_fingerprint)? {
+    if !release_record::complete_source_matches(&release_target, &source_fingerprint)? {
+        prepare_release_target(&release_target, &source_fingerprint)?;
+    }
+    let clean = build_context(workspace_root, &release_target, profile)?;
+    let kernel = kernel::resolve(&clean, &kernel_options)?;
+    if release_record::complete_matches(
+        &release_target,
+        &source_fingerprint,
+        &toolchain_fingerprint,
+        profile,
+        host,
+        &kernel.identity,
+    )? {
         println!(
-            "reusing qualified release output: {}",
+            "reusing complete isolated release output: {}",
             release_target.display()
         );
     } else {
-        prepare_release_target(&release_target, &source_fingerprint)?;
+        clear_release_target(&release_target)?;
+        fs::create_dir_all(&release_target)?;
         let clean = build_context(workspace_root, &release_target, profile)?;
         build_all(&clean)?;
         let kernel = kernel::resolve(&clean, &kernel_options)?;
         runtime::assemble_development(&clean, &kernel)?;
-        write_release_stamp(&release_target, &source_fingerprint, &build_fingerprint)?;
+        release_record::write_complete(
+            &release_target,
+            &source_fingerprint,
+            &toolchain_fingerprint,
+            profile,
+            host,
+            &kernel.identity,
+        )?;
+        let priming = release_target.join(".silo-release-priming");
+        if priming.exists() {
+            fs::remove_file(priming)?;
+        }
     }
 
     let public = build_context(workspace_root, target_dir, profile)?;
@@ -271,6 +310,9 @@ fn release_target(workspace_root: &Path, target_dir: &Path) -> Result<PathBuf, B
     let host = HostTarget::current()?;
     let target = release_target_path(target_dir, host);
     let source_fingerprint = release_source_fingerprint(workspace_root, Profile::Release, host)?;
+    if release_record::complete_source_matches(&target, &source_fingerprint)? {
+        fs::remove_file(target.join(".silo-release-complete.json"))?;
+    }
     prepare_release_target(&target, &source_fingerprint)?;
     Ok(target)
 }
@@ -280,18 +322,14 @@ fn release_target_path(target_dir: &Path, host: HostTarget) -> PathBuf {
 }
 
 fn prepare_release_target(target: &Path, source_fingerprint: &str) -> Result<(), Box<dyn Error>> {
-    let stamp = target.join(".silo-release-stamp");
-    if release_stamp_source_matches(target, source_fingerprint)? {
-        fs::remove_file(stamp)?;
+    if read_stamp(&target.join(".silo-release-priming"))?.as_deref() == Some(source_fingerprint) {
+        return Ok(());
+    }
+    if release_record::complete_source_matches(target, source_fingerprint)? {
         write_atomically(
             &target.join(".silo-release-priming"),
             source_fingerprint.as_bytes(),
         )?;
-        return Ok(());
-    }
-    if !stamp.exists()
-        && read_stamp(&target.join(".silo-release-priming"))?.as_deref() == Some(source_fingerprint)
-    {
         return Ok(());
     }
     clear_release_target(target)?;
@@ -304,10 +342,19 @@ fn prepare_release_target(target: &Path, source_fingerprint: &str) -> Result<(),
 
 fn clear_release_target(target: &Path) -> Result<(), Box<dyn Error>> {
     if target.exists() {
+        let kernel_cache = target.join("kernel-cache");
+        let preserved_cache = target.with_extension(format!("kernel-cache-{}", std::process::id()));
+        if kernel_cache.exists() {
+            fs::rename(&kernel_cache, &preserved_cache)?;
+        }
         let mut chmod = Command::new("/bin/chmod");
         chmod.args(["-R", "u+w"]).arg(target);
         command::run(chmod)?;
         fs::remove_dir_all(target)?;
+        if preserved_cache.exists() {
+            fs::create_dir_all(target)?;
+            fs::rename(preserved_cache, kernel_cache)?;
+        }
     }
     Ok(())
 }
@@ -358,46 +405,20 @@ fn release_source_fingerprint(
         .collect())
 }
 
-fn release_build_fingerprint(source_fingerprint: &str, kernel: &KernelOptions) -> String {
+fn release_toolchain_fingerprint(workspace_root: &Path) -> Result<String, Box<dyn Error>> {
     let mut hasher = Sha256::new();
-    hasher.update(b"silo-release-build-v1\0");
-    hasher.update(source_fingerprint.as_bytes());
-    hasher.update([0]);
-    hasher.update(kernel.reference().as_bytes());
-    hasher.update([0]);
-    hasher.update(kernel.offline().to_string().as_bytes());
-    hasher.update([0]);
-    if let Some(path) = kernel.local_path() {
-        hasher.update(path.as_os_str().as_bytes());
+    hasher.update(b"silo-release-toolchain-v1\0");
+    for (key, value) in release::toolchains(workspace_root)?.values() {
+        hasher.update(key.as_bytes());
+        hasher.update([0]);
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
     }
-    hasher
+    Ok(hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn release_stamp_matches(target: &Path, build_fingerprint: &str) -> Result<bool, Box<dyn Error>> {
-    Ok(read_stamp(&target.join(".silo-release-stamp"))?
-        .and_then(|stamp| {
-            stamp
-                .split_once('\n')
-                .map(|(_, build)| build == build_fingerprint)
-        })
-        .unwrap_or(false))
-}
-
-fn release_stamp_source_matches(
-    target: &Path,
-    source_fingerprint: &str,
-) -> Result<bool, Box<dyn Error>> {
-    Ok(read_stamp(&target.join(".silo-release-stamp"))?
-        .and_then(|stamp| {
-            stamp
-                .split_once('\n')
-                .map(|(source, _)| source == source_fingerprint)
-        })
-        .unwrap_or(false))
+        .collect())
 }
 
 fn read_stamp(path: &Path) -> Result<Option<String>, Box<dyn Error>> {
@@ -406,22 +427,6 @@ fn read_stamp(path: &Path) -> Result<Option<String>, Box<dyn Error>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
-}
-
-fn write_release_stamp(
-    target: &Path,
-    source_fingerprint: &str,
-    build_fingerprint: &str,
-) -> Result<(), Box<dyn Error>> {
-    write_atomically(
-        &target.join(".silo-release-stamp"),
-        format!("{source_fingerprint}\n{build_fingerprint}\n").as_bytes(),
-    )?;
-    let priming = target.join(".silo-release-priming");
-    if priming.exists() {
-        fs::remove_file(priming)?;
-    }
-    Ok(())
 }
 
 fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), Box<dyn Error>> {

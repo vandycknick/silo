@@ -181,6 +181,13 @@ plan-compatible default. Do not add entries without an actual decision point.
   Selected default: fingerprint-matching reuse. Rationale: stage/archive
   transports must consume already built canonical bytes and development objects
   remain excluded.
+- 2026-07-26, Commit 08 follow-up. Question: Should `make stage` always run
+  runtime audits, should the complete record ambiguously imply audit success, or
+  should auditing write a separate byte-bound qualification record? Selected
+  default: a separate qualification record written only after `verify-runtime`
+  succeeds. Rationale: stage remains an explicit public transport operation,
+  while every later transport command can require proof bound to the exact stage
+  and CLI bytes without treating completion as an audit result.
 
 ### Breaking-Change Policy
 

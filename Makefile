@@ -25,7 +25,7 @@ ifeq ($(KERNEL_OFFLINE),1)
 KERNEL_ARGS += --offline
 endif
 
-.PHONY: build stage verify-runtime release-linux cli vmmon netd krun agent init initramfs kernel fmt clippy test version-check
+.PHONY: build stage verify-runtime check-runtime-qualification release-linux cli vmmon netd krun agent init initramfs kernel fmt clippy test version-check
 
 build:
 	$(XTASK) build --profile "$(PROFILE)" $(KERNEL_ARGS)
@@ -35,6 +35,9 @@ stage:
 
 verify-runtime:
 	$(XTASK) verify-runtime --profile "$(PROFILE)"
+
+check-runtime-qualification:
+	$(XTASK) check-runtime-qualification --profile "$(PROFILE)"
 
 RELEASE_UNAME := $(shell uname -m)
 ifeq ($(RELEASE_UNAME),x86_64)

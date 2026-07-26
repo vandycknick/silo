@@ -39,6 +39,7 @@ pub struct KernelOptions {
 
 pub struct KernelArtifact {
     pub path: PathBuf,
+    pub identity: Value,
 }
 
 impl KernelOptions {
@@ -72,6 +73,14 @@ struct ManifestArtifacts {
 pub enum KernelError {
     #[error(transparent)]
     Command(#[from] command::CommandError),
+    #[error(
+        "failed to resolve current OCI kernel reference {reference} online; restore network access or use --offline only with its verified cached binding"
+    )]
+    OnlineResolution {
+        reference: String,
+        #[source]
+        source: command::CommandError,
+    },
     #[error("failed to read {path}")]
     Read {
         path: PathBuf,
@@ -118,12 +127,12 @@ pub fn resolve(
     let cache_root = context.target_dir.join("kernel-cache");
     create_directory(&cache_root)?;
 
-    let (path, provenance) = match options.path.as_deref() {
+    let (path, identity) = match options.path.as_deref() {
         Some(path) => resolve_local_kernel(context, &cache_root, path)?,
         None => resolve_oci_kernel(context, &cache_root, options)?,
     };
-    write_provenance(context, &provenance)?;
-    Ok(KernelArtifact { path })
+    write_provenance(context, &identity)?;
+    Ok(KernelArtifact { path, identity })
 }
 
 fn resolve_local_kernel(
@@ -157,6 +166,7 @@ fn resolve_local_kernel(
         json!({
             "source": "local",
             "path": path,
+            "architecture": context.host.kernel_architecture(),
             "descriptor": {"digest": digest, "size": bytes.len()},
         }),
     ))
@@ -187,8 +197,9 @@ fn resolve_oci_kernel(
                 descriptor.media_type
             )));
         }
-        let index = fetch_manifest(reference)?;
-        cache_bytes(cache_root, &descriptor.digest, &index)?;
+        let repository = repository(reference)?;
+        let immutable_reference = format!("{repository}@{}", descriptor.digest);
+        let _ = fetch_or_cached_manifest(cache_root, &descriptor, &immutable_reference, false)?;
         descriptor
     };
 
@@ -236,6 +247,10 @@ fn resolve_oci_kernel(
         json!({
             "source": "oci",
             "reference": reference,
+            "platform": {
+                "os": "linux",
+                "architecture": context.host.oci_architecture(),
+            },
             "index": index_descriptor.value,
             "manifest": manifest_descriptor.value,
             "config": artifacts.config.value,
@@ -496,6 +511,10 @@ fn fetch_or_cached_manifest(
     if offline {
         return read_cached(cache_root, descriptor);
     }
+    let cache = cache_path(cache_root, &descriptor.digest)?;
+    if cache.exists() {
+        return read_cached(cache_root, descriptor);
+    }
     let bytes = fetch_manifest(reference)?;
     cache_bytes(cache_root, &descriptor.digest, &bytes)
         .and_then(|_| verify_bytes(&bytes, descriptor).map(|_| bytes))
@@ -537,7 +556,10 @@ fn fetch_or_cached_blob(
 fn fetch_manifest_descriptor(reference: &str) -> Result<Descriptor, KernelError> {
     let mut command = Command::new("oras");
     command.args(["manifest", "fetch", "--descriptor", reference]);
-    let output = command::output(command)?;
+    let output = command::output(command).map_err(|source| KernelError::OnlineResolution {
+        reference: reference.to_string(),
+        source,
+    })?;
     let value = parse_json(&output.stdout, "OCI index descriptor")?;
     descriptor(&value, "OCI index descriptor")
 }
