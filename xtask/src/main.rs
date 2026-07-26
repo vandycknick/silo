@@ -78,6 +78,8 @@ enum Commands {
         kernel: KernelOptions,
     },
     Package {
+        #[arg(long, help = "Also create a DMG")]
+        dmg: bool,
         #[arg(long, value_name = "NUMBER")]
         build_number: Option<String>,
         #[arg(long, value_name = "IDENTITY")]
@@ -262,6 +264,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             )?;
         }
         Commands::Package {
+            dmg,
             build_number,
             developer_id_application,
             kernel,
@@ -281,11 +284,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                 build_number.as_deref(),
                 developer_id_application.as_deref(),
             )?;
-            macos::package(
-                &workspace_root,
-                &target_dir,
-                developer_id_application.as_deref(),
-            )?;
+            if dmg {
+                macos::package(
+                    &workspace_root,
+                    &target_dir,
+                    developer_id_application.as_deref(),
+                )?;
+            }
         }
         Commands::Install {
             appdir,

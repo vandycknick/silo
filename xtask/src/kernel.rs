@@ -72,12 +72,8 @@ struct ManifestArtifacts {
 
 #[derive(Debug, Error)]
 pub enum KernelError {
-    #[error(transparent)]
-    Command(#[from] command::CommandError),
-    #[error(
-        "failed to resolve current OCI kernel reference {reference} online; restore network access or use --offline only with its verified cached binding"
-    )]
-    OnlineResolution {
+    #[error("failed to fetch OCI reference {reference} with ORAS")]
+    Oras {
         reference: String,
         #[source]
         source: command::CommandError,
@@ -533,11 +529,11 @@ fn fetch_or_cached_blob(
     let reference = format!("{repository}@{}", descriptor.digest);
     let mut command = Command::new("oras");
     command.args(["blob", "fetch", "--no-tty", "--output"]);
-    command.arg(&temporary).arg(reference);
+    command.arg(&temporary).arg(&reference);
     let result = command::run(command);
-    if let Err(error) = result {
+    if let Err(source) = result {
         let _ = fs::remove_file(&temporary);
-        return Err(KernelError::Command(error));
+        return Err(KernelError::Oras { reference, source });
     }
     let bytes = fs::read(&temporary).map_err(|source| KernelError::Read {
         path: temporary.clone(),
@@ -552,7 +548,7 @@ fn fetch_or_cached_blob(
 fn fetch_manifest_descriptor(reference: &str) -> Result<Descriptor, KernelError> {
     let mut command = Command::new("oras");
     command.args(["manifest", "fetch", "--descriptor", reference]);
-    let output = command::output(command).map_err(|source| KernelError::OnlineResolution {
+    let output = command::output(command).map_err(|source| KernelError::Oras {
         reference: reference.to_string(),
         source,
     })?;
@@ -563,7 +559,10 @@ fn fetch_manifest_descriptor(reference: &str) -> Result<Descriptor, KernelError>
 fn fetch_manifest(reference: &str) -> Result<Vec<u8>, KernelError> {
     let mut command = Command::new("oras");
     command.args(["manifest", "fetch", reference]);
-    let output = command::output(command)?;
+    let output = command::output(command).map_err(|source| KernelError::Oras {
+        reference: reference.to_string(),
+        source,
+    })?;
     Ok(output.stdout)
 }
 

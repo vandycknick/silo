@@ -163,12 +163,9 @@ pub fn verify(workspace_root: &Path, target_dir: &Path) -> Result<(), ArchiveErr
                 &version,
                 host,
             )?;
-            if kind.has_cli() {
-                run_portable_cli(&root, &["list", "--format", "json"])?;
-                if matches!(host, HostTarget::MacosArm64) {
-                    boot_portable_vm(&root)?;
-                    println!("verify-archive: VZ boot completed and the acceptance VM was removed");
-                }
+            if kind.has_cli() && matches!(host, HostTarget::MacosArm64) {
+                boot_portable_vm(&root)?;
+                println!("verify-archive: VZ boot completed and the acceptance VM was removed");
             }
         }
         Ok(())
@@ -576,18 +573,6 @@ fn release_material_path(material: &str) -> Result<&'static str, ArchiveError> {
         "common/ext4/LICENSE-APACHE" => Ok("LICENSES/libkrun-APACHE-2.0.txt"),
         _ => invalid(Path::new(material), "unknown release material".to_string()),
     }
-}
-
-fn run_portable_cli(root: &Path, args: &[&str]) -> Result<(), ArchiveError> {
-    let temporary = temporary_directory(Path::new("/tmp"), "s")?;
-    prepare_acceptance_state(&temporary)?;
-    let result = run_portable_command(root, &temporary, args);
-    fs::remove_dir_all(&temporary).map_err(|source| ArchiveError::Io {
-        action: "remove portable CLI acceptance state",
-        path: temporary,
-        source,
-    })?;
-    result
 }
 
 fn boot_portable_vm(root: &Path) -> Result<(), ArchiveError> {

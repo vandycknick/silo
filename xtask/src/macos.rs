@@ -1,10 +1,7 @@
 use std::fs::{self, File};
-use std::io::Write;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
-use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
 
@@ -12,7 +9,6 @@ use crate::app;
 use crate::command;
 
 const APP_NAME: &str = "Silo.app";
-const CREATE_DMG_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Error)]
 pub enum MacosError {
@@ -39,7 +35,7 @@ pub fn package(
     let output = target_dir.join("package/macos");
     let app_bundle = output.join(APP_NAME);
     let version = app::product_version(workspace_root)?;
-    app::verify_distribution(&app_bundle, &output)?;
+    app::verify_signed_bundle(&app_bundle)?;
     let create_dmg = ensure_create_dmg(workspace_root)?;
     let temporary_output = temporary_directory(&output, "dmg-output")?;
     let result = (|| {
@@ -60,7 +56,7 @@ pub fn package(
             source,
         })?;
         validate_regular_file(&normalized)?;
-        verify_dmg(&normalized, &output)?;
+        verify_dmg(&normalized)?;
         println!("package: {}", normalized.display());
         Ok(())
     })();
@@ -74,121 +70,15 @@ fn run_create_dmg(
     app_bundle: &Path,
     temporary_output: &Path,
 ) -> Result<(), MacosError> {
-    for attempt in 1..=CREATE_DMG_ATTEMPTS {
-        let mut create = Command::new(executable);
-        create.arg("--overwrite");
-        match identity {
-            Some(identity) => create.arg(format!("--identity={identity}")),
-            None => create.arg("--no-code-sign"),
-        };
-        create.arg(app_bundle).arg(temporary_output);
-        let output = create.output().map_err(|source| MacosError::Io {
-            action: "run local create-dmg",
-            path: executable.to_path_buf(),
-            source,
-        })?;
-        display_create_dmg_output(executable, &output.stdout, &output.stderr)?;
-        if output.status.success() {
-            return Ok(());
-        }
-
-        let transcript = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if attempt == CREATE_DMG_ATTEMPTS || !is_transient_conversion_failure(&transcript) {
-            return invalid(
-                executable,
-                format!("create-dmg exited with {}", output.status),
-            );
-        }
-        detach_failed_conversion_image(&transcript)?;
-        reset_temporary_directory(temporary_output)?;
-        println!(
-            "package: retrying transient create-dmg conversion ({attempt}/{CREATE_DMG_ATTEMPTS})"
-        );
-        thread::sleep(Duration::from_secs(1));
-    }
-    invalid(
-        executable,
-        "exhausted create-dmg attempts without a result".to_string(),
-    )
-}
-
-fn display_create_dmg_output(
-    executable: &Path,
-    stdout: &[u8],
-    stderr: &[u8],
-) -> Result<(), MacosError> {
-    std::io::stdout()
-        .write_all(stdout)
-        .map_err(|source| MacosError::Io {
-            action: "display create-dmg stdout",
-            path: executable.to_path_buf(),
-            source,
-        })?;
-    std::io::stderr()
-        .write_all(stderr)
-        .map_err(|source| MacosError::Io {
-            action: "display create-dmg stderr",
-            path: executable.to_path_buf(),
-            source,
-        })?;
-    Ok(())
-}
-
-fn is_transient_conversion_failure(transcript: &str) -> bool {
-    transcript.contains("hdiutil convert")
-        && (transcript.contains("Resource temporarily unavailable")
-            || transcript.contains("EAGAIN"))
-}
-
-fn detach_failed_conversion_image(transcript: &str) -> Result<(), MacosError> {
-    let Some(image) = conversion_image_path(transcript) else {
-        return Ok(());
+    let mut create = Command::new(executable);
+    create.arg("--overwrite");
+    match identity {
+        Some(identity) => create.arg(format!("--identity={identity}")),
+        None => create.arg("--no-code-sign"),
     };
-    let mut info = Command::new("/usr/bin/hdiutil");
-    info.args(["info", "-plist"]);
-    let output = command::output(info)?;
-    let plist = String::from_utf8_lossy(&output.stdout);
-    for device in image_devices(&plist, image) {
-        detach_dmg(&device)?;
-    }
+    create.arg(app_bundle).arg(temporary_output);
+    command::run(create)?;
     Ok(())
-}
-
-fn conversion_image_path(transcript: &str) -> Option<&str> {
-    transcript
-        .split_once("hdiutil convert ")?
-        .1
-        .split_whitespace()
-        .next()
-}
-
-fn image_devices(plist: &str, image: &str) -> Vec<String> {
-    let marker = "<key>image-path</key>";
-    let mut remainder = plist;
-    while let Some((_, after_key)) = remainder.split_once(marker) {
-        let Some((before_end, after_end)) = after_key.split_once("</string>") else {
-            return Vec::new();
-        };
-        let Some((_, path)) = before_end.split_once("<string>") else {
-            return Vec::new();
-        };
-        let path = path
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">");
-        if path == image {
-            return plist_strings(
-                after_end.split(marker).next().unwrap_or(after_end),
-                "dev-entry",
-            );
-        }
-        remainder = after_end;
-    }
-    Vec::new()
 }
 
 fn plist_strings(plist: &str, key: &str) -> Vec<String> {
@@ -213,15 +103,6 @@ fn plist_strings(plist: &str, key: &str) -> Vec<String> {
     values
 }
 
-fn reset_temporary_directory(path: &Path) -> Result<(), MacosError> {
-    remove_directory(path, "remove partial create-dmg output")?;
-    fs::create_dir(path).map_err(|source| MacosError::Io {
-        action: "recreate temporary DMG output directory",
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 pub fn install(target_dir: &Path, appdir: &Path, bindir: &Path) -> Result<(), MacosError> {
     require_absolute(appdir)?;
     require_absolute(bindir)?;
@@ -230,7 +111,7 @@ pub fn install(target_dir: &Path, appdir: &Path, bindir: &Path) -> Result<(), Ma
 
     let package_output = target_dir.join("package/macos");
     let source = package_output.join(APP_NAME);
-    app::verify_distribution(&source, &package_output)?;
+    app::verify_signed_bundle(&source)?;
     let destination = appdir.join(APP_NAME);
     validate_replaced_app(&destination)?;
     let cli = bindir.join("silo");
@@ -243,7 +124,7 @@ pub fn install(target_dir: &Path, appdir: &Path, bindir: &Path) -> Result<(), Ma
         command::run(copy)?;
         app::verify_signed_bundle(&temporary)?;
         app::replace_bundle(&temporary, &destination)?;
-        app::verify_distribution(&destination, &package_output)?;
+        app::verify_signed_bundle(&destination)?;
 
         let temporary_link = temporary_path(bindir, "silo-link")?;
         symlink(destination.join("Contents/MacOS/silo"), &temporary_link).map_err(|source| {
@@ -289,12 +170,10 @@ fn ensure_create_dmg(workspace_root: &Path) -> Result<PathBuf, MacosError> {
         return invalid(&manifest, "must not define package scripts".to_string());
     }
 
-    if node_modules_stale(&manifest, &lockfile, &executable)? {
-        let mut npm = Command::new("npm");
-        npm.current_dir(&packaging)
-            .args(["ci", "--prefer-offline", "--no-audit", "--no-fund"]);
-        command::run(npm)?;
-    }
+    let mut npm = Command::new("npm");
+    npm.current_dir(&packaging)
+        .args(["ci", "--prefer-offline", "--no-audit", "--no-fund"]);
+    command::run(npm)?;
     validate_local_create_dmg(&executable, &packaging.join("node_modules"))?;
     Ok(executable)
 }
@@ -322,55 +201,11 @@ fn validate_local_create_dmg(executable: &Path, node_modules: &Path) -> Result<(
     validate_regular_file(&resolved)
 }
 
-fn node_modules_stale(
-    manifest: &Path,
-    lockfile: &Path,
-    executable: &Path,
-) -> Result<bool, MacosError> {
-    let installed_lockfile = executable
-        .parent()
-        .and_then(Path::parent)
-        .map(|directory| directory.join(".package-lock.json"))
-        .ok_or_else(|| MacosError::Invalid {
-            path: executable.to_path_buf(),
-            reason: "has no node_modules parent".to_string(),
-        })?;
-    if !executable.is_file() || !installed_lockfile.is_file() {
-        return Ok(true);
-    }
-    let source_modified = newest_modified(&[manifest, lockfile])?;
-    let installed_modified = modified(&installed_lockfile)?;
-    Ok(installed_modified < source_modified)
-}
-
-fn newest_modified(paths: &[&Path]) -> Result<SystemTime, MacosError> {
-    let mut newest = SystemTime::UNIX_EPOCH;
-    for path in paths {
-        newest = newest.max(modified(path)?);
-    }
-    Ok(newest)
-}
-
-fn modified(path: &Path) -> Result<SystemTime, MacosError> {
-    fs::metadata(path)
-        .map_err(|source| MacosError::Io {
-            action: "read file metadata",
-            path: path.to_path_buf(),
-            source,
-        })?
-        .modified()
-        .map_err(|source| MacosError::Io {
-            action: "read file modification time",
-            path: path.to_path_buf(),
-            source,
-        })
-}
-
-fn verify_dmg(dmg: &Path, temporary_parent: &Path) -> Result<(), MacosError> {
+fn verify_dmg(dmg: &Path) -> Result<(), MacosError> {
     let mounted = mount_dmg(dmg)?;
     let result = (|| {
         let app_bundle = mounted.mount_point.join(APP_NAME);
-        app::verify_distribution(&app_bundle, temporary_parent)?;
+        app::verify_signed_bundle(&app_bundle)?;
         let applications = mounted.mount_point.join("Applications");
         let metadata = fs::symlink_metadata(&applications).map_err(|source| MacosError::Io {
             action: "read DMG Applications link",

@@ -633,9 +633,14 @@ entitlements are granted only when their need is demonstrated for that
 executable. The CLI and `netd` do not inherit virtualization entitlements merely
 because they share the bundle.
 
-`create-dmg` is the selected DMG builder. Xtask invokes the pinned tool after
-assembling, signing, and verifying `Silo.app`; local builds use `--no-code-sign`
-and protected release builds supply the explicit Developer ID identity.
+`create-dmg` is the selected DMG builder. `make package` assembles, signs, and
+verifies `Silo.app` without creating a disk image by default. `make package
+DMG=1` additionally installs the exact locked npm tree and invokes its unmodified
+`create-dmg`; local builds use `--no-code-sign`, and protected release builds
+supply the explicit Developer ID identity. DMG creation can fail when endpoint
+security software races native `hdiutil` conversion, so affected development
+hosts build the app locally and leave the DMG step to an unaffected release
+runner rather than carrying a divergent Finder-layout implementation.
 
 The release pipeline:
 

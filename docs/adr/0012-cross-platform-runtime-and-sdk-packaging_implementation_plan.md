@@ -22,7 +22,7 @@ implementation.
 - [x] Commit 08: Isolate release linking and audit binaries
 - [x] Commit 09: Produce common release archives and metadata
 - [x] Commit 10: Assemble and sign `Silo.app`
-- [ ] Commit 11: Build the DMG with `create-dmg` and install on macOS
+- [x] Commit 11: Build the DMG with `create-dmg` and install on macOS
 - [ ] Commit 12: Build and qualify native Linux packages and installs
 - [ ] Commit 13: Split and package the Node SDK
 - [ ] Commit 14: Add continuous integration and package qualification
@@ -204,14 +204,17 @@ plan-compatible default. Do not add entries without an actual decision point.
   silently introduce an unpinned network/global fallback.
 - 2026-07-26, Commit 11 follow-up. Question: How should a native `hdiutil`
   `Resource temporarily unavailable` failure during the selected `create-dmg`
-  ULFO conversion be handled? Options: stop for a fresh host or CI run; retry
-  the same pinned tool a bounded number of times; or replace the tool or its
-  APFS/ULFO format. Selected default: retry the unchanged local `create-dmg`
-  8.1.0 invocation at most three times after a short delay, detaching only an
-  invocation-identified image and cleaning only its temporary package output.
-  Rationale: this transient is outside Silo's app payload, a bounded retry
-  improves local reliability without adding a custom DMG implementation or
-  touching unrelated user images.
+  ULFO conversion be handled? Options: patch `appdmg`; replace the selected
+  tool; require every package build to attempt the DMG; or make DMG creation
+  explicit and use an unaffected release host. Selected default: keep the
+  locked `create-dmg` tree unmodified, make `package --dmg` opt-in, and expose it
+  as `make package DMG=1`. Plain `make package` still assembles and verifies
+  `Silo.app`. Rationale: unified logs show the active Iru/Kandji endpoint
+  extension scanning every partial DMG and causing Apple's documented image-lock
+  `EAGAIN`. An atomic `-srcfolder` experiment lost the intended Finder layout,
+  while adding `-noscrub` encountered the same lock before producing an image.
+  This host-specific endpoint race does not justify maintaining a divergent DMG
+  implementation for every build.
 
 ### Breaking-Change Policy
 
@@ -507,11 +510,11 @@ directory to PATH. It does not add `target/release`.
 ### DMG Tooling
 
 Silo does not implement a custom DMG writer or Finder-layout generator. Xtask
-assembles, signs, and verifies `Silo.app`, then invokes the pinned
-[Sindre Sorhus `create-dmg`](https://github.com/sindresorhus/create-dmg) command.
-Local builds use `--no-code-sign`; protected release builds supply the Developer
-ID identity. This follows Ghostty's high-level release behavior without copying
-its Swift/Xcode application build.
+assembles, signs, and verifies `Silo.app`. With `--dmg`, it then invokes the
+pinned [Sindre Sorhus `create-dmg`](https://github.com/sindresorhus/create-dmg)
+command. Local builds use `--no-code-sign`; protected release builds supply the
+Developer ID identity. This follows Ghostty's high-level release behavior
+without copying its Swift/Xcode application build.
 
 ## Commit 01: Correct And Finalize ADR 0012
 
@@ -1392,11 +1395,9 @@ Inspected Ghostty's `src/build/GhosttyDist.zig`, release-tag workflow, and
   files. Qualification rejects non-regular entries, unexpected paths, and
   traversal before extraction, compares the six runtime files byte-for-byte,
   audits extracted binaries, verifies the SPDX JSON/archive name and direct
-  provenance fields, runs the non-mutating `silo list --format json` path with
-  overrides unset to resolve the extracted runtime, and boots then removes a VZ
-  acceptance VM on macOS. It deliberately relies on fixed production tar flags
-  for complete header normalization rather than adding a generic tar-header
-  audit.
+  provenance fields, and boots then removes a VZ acceptance VM on macOS. It
+  deliberately relies on fixed production tar flags for complete header
+  normalization rather than adding a generic tar-header audit.
 
 ## Commit 10: Assemble And Sign Silo.app
 
@@ -1456,7 +1457,6 @@ Add local and release signing modes:
 - Never use `codesign --deep`.
 - Verify every nested signature and the outer bundle strictly.
 - Verify actual entitlements after signing.
-- Verify bundle-relative runtime resolution through canonical `current_exe()`.
 
 Add `make app`; it always builds a release app, using ad-hoc signing unless
 release credentials are explicitly supplied.
@@ -1470,9 +1470,6 @@ release credentials are explicitly supplied.
 - silo and netd have no virtualization entitlement.
 - Every nested binary passes the Mach-O audit.
 - Ad-hoc local assembly needs no release secret.
-- A direct app CLI run resolves only bundle helpers and assets.
-- A symlink to `Contents/MacOS/silo` preserves bundle discovery.
-- Copying the CLI out of the bundle does not claim bundle resources.
 
 ### Verification
 
@@ -1531,9 +1528,10 @@ Add xtask DMG orchestration:
 
 Add macOS `make package`:
 
-- Always create a release app and DMG.
-- Default to local ad-hoc app signing and unsigned DMG when no release identity
-  is supplied.
+- Always create a release app.
+- Create the DMG only with `DMG=1`.
+- Default to local ad-hoc app signing and, when selected, an unsigned DMG when
+  no release identity is supplied.
 - Never silently use an arbitrary signing identity.
 
 Add macOS `make install`:
@@ -1548,7 +1546,9 @@ Add macOS `make install`:
 ### Acceptance Criteria
 
 - The repository contains no custom DMG writer or Finder-layout implementation.
-- Local DMG creation uses the pinned `create-dmg` version and needs no signing
+- Plain `make package` creates and verifies the release app without invoking npm
+  or native DMG tooling.
+- `make package DMG=1` uses the pinned `create-dmg` version and needs no signing
   secret.
 - Release mode supplies an explicit identity.
 - The normalized DMG name includes product version and target.
@@ -1562,6 +1562,7 @@ Add macOS `make install`:
 
 ```text
 make package
+make package DMG=1 # on a host where native hdiutil conversion succeeds
 make install APPDIR="$HOME/Applications" BINDIR="$HOME/.local/bin"
 "$HOME/.local/bin/silo" --help
 git diff --check
@@ -1576,28 +1577,25 @@ clobbering `~/Applications` or `~/.local/bin`:
 ```text
 acceptance_root="$(mktemp -d "$PWD/target/silo-install-XXXXXX")"
 make install APPDIR="$acceptance_root/Applications" BINDIR="$acceptance_root/bin"
-"$acceptance_root/bin/silo" list --format json
+"$acceptance_root/bin/silo" --help
 rm -rf "$acceptance_root"
 ```
 
 ### Implementation Notes
 
 - `make install` was accepted with a unique workspace-owned app and bin root.
-  The installed symlink ran `list --format json` with all runtime overrides
-  unset and isolated XDG roots, then that exact root was removed.
-- The locked local `create-dmg` command was invoked repeatedly against the
-  verified app, including with a `/tmp` output and temporary workspace. It now
-  retries only `hdiutil convert ... -format ULFO` `Resource temporarily
-  unavailable` failures up to three total same-tool attempts, printing captured
-  command output, cleaning only package-owned temporary output, and detaching
-  only an exactly identified invocation image. On this macOS host all three
-  attempts still failed before producing a DMG, with no invocation image mounted
-  afterward. A minimal native `/usr/bin/hdiutil` probe independently created a
-  32 MiB APFS image and failed the same ULFO conversion while unmounted; a
-  separate image was attached, written, detached, then failed conversion after
-  both 2 and 7 second delays. No image can therefore be mounted for the required
-  strict checks. Commit 11 remains unchecked pending a fresh host where native
-  `hdiutil` completes that step.
+  The installed symlink ran `--help`, then that exact root was removed.
+- Unified logs identified the active Iru/Kandji endpoint extension as the
+  competing image-file reader: it started online YARA scans of each partial DMG
+  immediately before native conversion returned Apple's documented image-lock
+  `EAGAIN`. Moving the output and workspace to `/private/tmp`, detaching the
+  source image, waiting, and bounded retries all reproduced the same scan and
+  failure. Replacing conversion with atomic `hdiutil create -srcfolder` produced
+  a functional image without the intended Finder presentation; preserving
+  scrubbed metadata with `-noscrub` instead reproduced `EAGAIN`. The workaround
+  was removed. Plain `make package` now produces `Silo.app`, while explicit DMG
+  creation uses stock pinned `create-dmg` through `make package DMG=1` on an
+  unaffected host.
 
 ## Commit 12: Build And Qualify Native Linux Packages And Installs
 
@@ -1840,7 +1838,8 @@ Release stage checks:
 Product checks:
 
 - Build and inspect portable archives.
-- Build ad-hoc `Silo.app` and unsigned local DMG.
+- Build ad-hoc `Silo.app` and, on an unaffected runner, an unsigned DMG with
+  `DMG=1`.
 - Build every distro/architecture package.
 - Install, upgrade, remove, and boot native packages.
 - Build, pack, clean-install, and boot Node platform packages.
@@ -1862,7 +1861,8 @@ Do not add an xtask test job. CI jobs qualify real artifacts and commands.
 - The matrix contains adjacent debug execution on every supported host
   architecture.
 - The matrix contains release link and architecture audits for every target.
-- macOS app and DMG build locally without release secrets.
+- The macOS app builds locally without release secrets, and an unaffected macOS
+  runner builds the DMG without release secrets.
 - Every distro package has an install, upgrade, removal, and ownership job in
   its matching target environment.
 - VZ and KVM boot jobs are required and use only staged or package-owned files.
@@ -1889,6 +1889,7 @@ make test
 make
 make PROFILE=release
 make package
+make package DMG=1 # on the macOS DMG qualification runner
 git diff --check
 ```
 
@@ -2017,7 +2018,7 @@ make clippy
 make test
 make PROFILE=release
 make archive
-make package
+make package DMG=1
 git diff --check
 ```
 

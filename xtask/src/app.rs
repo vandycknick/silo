@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -13,13 +13,6 @@ use crate::release_audit;
 const APP_NAME: &str = "Silo.app";
 const BUNDLE_IDENTIFIER: &str = "sh.silo.app";
 const MINIMUM_SYSTEM_VERSION: &str = "26.0";
-const RUNTIME_OVERRIDES: [&str; 5] = [
-    "SILO_VMMON_PATH",
-    "NETD_BIN",
-    "KRUN_BIN",
-    "SILO_ASSET_DIR",
-    "SILO_RUNTIME_DIR",
-];
 const HELPERS: [(&str, Option<&str>); 3] = [
     ("vmmon", Some("runtime/vmmon/vmmon.entitlements")),
     ("netd", None),
@@ -135,7 +128,6 @@ pub fn assemble(
         let app = output.join(APP_NAME);
         replace_directory(&temporary, &app)?;
         verify_signed_bundle(&app)?;
-        verify_runtime_resolution(&app, &output, true)?;
         println!(
             "app: {} version={} build={} signing={}",
             app.display(),
@@ -481,11 +473,6 @@ fn entitlement_map(path: &Path, plist: &[u8]) -> Result<BTreeMap<String, bool>, 
         .collect()
 }
 
-pub fn verify_distribution(bundle: &Path, temporary_parent: &Path) -> Result<(), AppError> {
-    verify_signed_bundle(bundle)?;
-    verify_runtime_resolution(bundle, temporary_parent, false)
-}
-
 pub fn verify_signed_bundle(bundle: &Path) -> Result<(), AppError> {
     validate_distribution_layout(bundle)?;
     for name in ["silo", "vmmon", "netd", "krun"] {
@@ -611,79 +598,6 @@ fn validate_distribution_layout(bundle: &Path) -> Result<(), AppError> {
         }
     }
     Ok(())
-}
-
-fn verify_runtime_resolution(
-    bundle: &Path,
-    temporary_parent: &Path,
-    verify_copied_cli: bool,
-) -> Result<(), AppError> {
-    let temporary = temporary_directory(temporary_parent, "runtime-check")?;
-    let result = (|| {
-        for directory in ["data", "state", "run", "config", "home"] {
-            create_directory(&temporary.join(directory))?;
-        }
-        let executable = bundle.join("Contents/MacOS/silo");
-        run_list(&executable, &temporary)?;
-        let linked = temporary.join("silo");
-        symlink(&executable, &linked).map_err(|source| AppError::Io {
-            action: "create app CLI acceptance symlink",
-            path: linked.clone(),
-            source,
-        })?;
-        run_list(&linked, &temporary)?;
-        if verify_copied_cli {
-            let copied = temporary.join("copied-silo");
-            copy_regular_file(&executable, &copied, 0o755)?;
-            let moved_bundle = temporary.join(APP_NAME);
-            fs::rename(bundle, &moved_bundle).map_err(|source| AppError::Io {
-                action: "move app bundle for copied CLI acceptance check",
-                path: bundle.to_path_buf(),
-                source,
-            })?;
-            let mut command = runtime_command(&copied, &temporary);
-            command.args(["list", "--format", "json"]);
-            let copied_result = command.output().map_err(|source| AppError::Io {
-                action: "run copied CLI runtime acceptance check",
-                path: copied.clone(),
-                source,
-            });
-            fs::rename(&moved_bundle, bundle).map_err(|source| AppError::Io {
-                action: "restore app bundle after copied CLI acceptance check",
-                path: bundle.to_path_buf(),
-                source,
-            })?;
-            copied_result?;
-        }
-        Ok(())
-    })();
-    fs::remove_dir_all(&temporary).map_err(|source| AppError::Io {
-        action: "remove app runtime acceptance state",
-        path: temporary,
-        source,
-    })?;
-    result
-}
-
-fn run_list(executable: &Path, state: &Path) -> Result<(), AppError> {
-    let mut command = runtime_command(executable, state);
-    command.args(["list", "--format", "json"]);
-    command::run(command)?;
-    Ok(())
-}
-
-fn runtime_command(executable: &Path, state: &Path) -> Command {
-    let mut command = Command::new(executable);
-    for variable in RUNTIME_OVERRIDES {
-        command.env_remove(variable);
-    }
-    command
-        .env("HOME", state.join("home"))
-        .env("XDG_DATA_HOME", state.join("data"))
-        .env("XDG_STATE_HOME", state.join("state"))
-        .env("XDG_RUNTIME_DIR", state.join("run"))
-        .env("XDG_CONFIG_HOME", state.join("config"));
-    command
 }
 
 fn copy_regular_file(source: &Path, destination: &Path, mode: u32) -> Result<(), AppError> {

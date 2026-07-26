@@ -12,6 +12,12 @@ pub enum CommandError {
     },
     #[error("{program} failed with status {status}")]
     Failed { program: String, status: String },
+    #[error("{program} failed with status {status}: {stderr}")]
+    FailedWithStderr {
+        program: String,
+        status: String,
+        stderr: String,
+    },
 }
 
 pub fn run(mut command: Command) -> Result<(), CommandError> {
@@ -41,10 +47,17 @@ pub fn output(mut command: Command) -> Result<Output, CommandError> {
     if output.status.success() {
         Ok(output)
     } else {
-        Err(CommandError::Failed {
-            program,
-            status: status_text(output.status),
-        })
+        let status = status_text(output.status);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            Err(CommandError::Failed { program, status })
+        } else {
+            Err(CommandError::FailedWithStderr {
+                program,
+                status,
+                stderr,
+            })
+        }
     }
 }
 

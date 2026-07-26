@@ -1,27 +1,80 @@
 .DEFAULT_GOAL := build
 
+# Build configuration
+##? PROFILE=debug|release: Select the build profile (default: debug).
 PROFILE ?= debug
-ifeq ($(filter $(PROFILE),debug release),)
+ifneq ($(PROFILE),debug)
+ifneq ($(PROFILE),release)
 $(error PROFILE must be debug or release)
 endif
+endif
 
+##? CARGO_TARGET_DIR=path: Set the Cargo output directory (default: ./target).
 CARGO_TARGET_DIR ?= $(CURDIR)/target
 override CARGO_TARGET_DIR := $(abspath $(CARGO_TARGET_DIR))
 export CARGO_TARGET_DIR
 
+# Kernel configuration
+##? KERNEL_REFERENCE=reference: Select the kernel OCI reference.
 KERNEL_REFERENCE ?= ghcr.io/vandycknick/silo/kernel:stable
+##? KERNEL_PATH=path: Use a local architecture-matched kernel.
 KERNEL_PATH ?=
+##? KERNEL_OFFLINE=0|1: Disable network access during kernel resolution.
 KERNEL_OFFLINE ?= 0
+##? KERNEL_REFRESH=0|1: Refresh the cached kernel reference.
 KERNEL_REFRESH ?= 0
-ifneq ($(filter $(KERNEL_OFFLINE),0 1),$(KERNEL_OFFLINE))
+
+ifneq ($(KERNEL_OFFLINE),0)
+ifneq ($(KERNEL_OFFLINE),1)
 $(error KERNEL_OFFLINE must be 0 or 1)
 endif
-ifneq ($(filter $(KERNEL_REFRESH),0 1),$(KERNEL_REFRESH))
+endif
+ifneq ($(KERNEL_REFRESH),0)
+ifneq ($(KERNEL_REFRESH),1)
 $(error KERNEL_REFRESH must be 0 or 1)
 endif
+endif
 
-XTASK = CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" cargo run --locked -p xtask --
-KERNEL_ARGS = --reference "$(KERNEL_REFERENCE)"
+# macOS packaging configuration
+##? DMG=0|1: Also create a DMG when packaging (default: 0).
+DMG ?= 0
+##? BUILD_NUMBER=number: Override the macOS application build number.
+BUILD_NUMBER ?=
+##? DEVELOPER_ID_APPLICATION=identity: Sign with a Developer ID Application identity.
+DEVELOPER_ID_APPLICATION ?=
+
+ifneq ($(DMG),0)
+ifneq ($(DMG),1)
+$(error DMG must be 0 or 1)
+endif
+endif
+
+# Installation configuration
+##? APPDIR=path: Set the macOS application install directory.
+APPDIR ?= /Applications
+##? BINDIR=path: Set the CLI symlink install directory.
+BINDIR ?= /usr/local/bin
+
+# Linux release configuration
+HOST_ARCH := $(shell uname -m)
+RELEASE_ARCH_x86_64 := amd64
+RELEASE_ARCH_arm64 := arm64
+RELEASE_ARCH_aarch64 := arm64
+DEFAULT_RELEASE_ARCH := $(RELEASE_ARCH_$(HOST_ARCH))
+RELEASE_ARCH ?= $(DEFAULT_RELEASE_ARCH)
+
+ifeq ($(strip $(RELEASE_ARCH)),)
+$(error unsupported release architecture: $(HOST_ARCH))
+endif
+ifneq ($(RELEASE_ARCH),amd64)
+ifneq ($(RELEASE_ARCH),arm64)
+$(error RELEASE_ARCH must resolve to amd64 or arm64)
+endif
+endif
+
+# Derived commands and arguments
+XTASK := CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" cargo run --locked -p xtask --
+KERNEL_ARGS := --reference "$(KERNEL_REFERENCE)"
 ifneq ($(strip $(KERNEL_PATH)),)
 KERNEL_ARGS += --path "$(abspath $(KERNEL_PATH))"
 endif
@@ -31,51 +84,61 @@ endif
 ifeq ($(KERNEL_REFRESH),1)
 KERNEL_ARGS += --refresh
 endif
+APP_ARGS := $(strip $(if $(strip $(BUILD_NUMBER)),--build-number "$(BUILD_NUMBER)") $(if $(strip $(DEVELOPER_ID_APPLICATION)),--developer-id-application "$(DEVELOPER_ID_APPLICATION)"))
 
-.PHONY: build stage verify-runtime archive verify-archive app package install release-linux cli vmmon netd krun agent init initramfs kernel fmt clippy test version-check
+##@ General
+.PHONY: help
+help: ## Show public targets and configurable options.
+	@awk 'BEGIN { FS = ":.*## "; printf "Usage: make <target> [OPTION=value ...]\n" } \
+		/^##\? / { line = substr($$0, 5); separator = index(line, ":"); option_count++; options[option_count] = substr(line, 1, separator - 1); option_help[option_count] = substr(line, separator + 2); next } \
+		/^##@ / { printf "\n%s:\n", substr($$0, 5); next } \
+		/^[A-Za-z0-9_.-]+:.*## / { printf "  %-20s %s\n", $$1, $$2 } \
+		END { printf "\nOptions:\n"; for (i = 1; i <= option_count; i++) printf "  %-36s %s\n", options[i], option_help[i] }' $(MAKEFILE_LIST)
 
-build:
+##@ Build
+.PHONY: build stage
+build: ## Build the complete adjacent runtime.
 	$(XTASK) build --profile "$(PROFILE)" $(KERNEL_ARGS)
 
-stage:
+stage: ## Build and assemble the portable runtime stage.
 	$(XTASK) stage --profile "$(PROFILE)" $(KERNEL_ARGS)
 
-verify-runtime:
+##@ Distribution
+.PHONY: verify-runtime archive verify-archive app package install
+verify-runtime: ## Audit release runtime artifacts (use PROFILE=release).
 	$(XTASK) verify-runtime --profile "$(PROFILE)"
 
-archive:
+archive: ## Build release runtime and CLI archives.
 	$(XTASK) archive $(KERNEL_ARGS)
 
-verify-archive:
+verify-archive: ## Extract and qualify the generated archives.
 	$(XTASK) verify-archive
 
-BUILD_NUMBER ?=
-DEVELOPER_ID_APPLICATION ?=
-APP_ARGS = $(if $(strip $(BUILD_NUMBER)),--build-number "$(BUILD_NUMBER)") $(if $(strip $(DEVELOPER_ID_APPLICATION)),--developer-id-application "$(DEVELOPER_ID_APPLICATION)")
-
-app:
+app: ## Build and sign the macOS release application.
 	$(XTASK) app $(APP_ARGS) $(KERNEL_ARGS)
 
-package:
-	$(XTASK) package $(APP_ARGS) $(KERNEL_ARGS)
+package: ## Build the macOS release package (use DMG=1 for a DMG).
+	$(XTASK) package $(if $(filter 1,$(DMG)),--dmg) $(APP_ARGS) $(KERNEL_ARGS)
 
-APPDIR ?= /Applications
-BINDIR ?= /usr/local/bin
-install:
+install: ## Install the macOS release application and CLI symlink.
 	$(XTASK) install --appdir "$(APPDIR)" --bindir "$(BINDIR)" $(APP_ARGS) $(KERNEL_ARGS)
 
-RELEASE_UNAME := $(shell uname -m)
-ifeq ($(RELEASE_UNAME),x86_64)
-RELEASE_ARCH ?= amd64
-else ifeq ($(RELEASE_UNAME),aarch64)
-RELEASE_ARCH ?= arm64
-else
-RELEASE_ARCH ?= $(RELEASE_UNAME)
-endif
-ifeq ($(filter $(RELEASE_ARCH),amd64 arm64),)
-$(error RELEASE_ARCH must resolve to amd64 or arm64)
-endif
+##@ Quality
+.PHONY: fmt clippy test version-check
+fmt: ## Format workspace source code.
+	$(XTASK) fmt
 
+clippy: ## Lint all host-supported workspace components.
+	$(XTASK) clippy
+
+test: ## Test all host-supported workspace components.
+	$(XTASK) test
+
+version-check: ## Verify product versions match the version authority.
+	$(XTASK) version-check
+
+# Internal targets
+.PHONY: release-linux cli vmmon netd krun agent init initramfs kernel
 release-linux:
 	TARGETARCH="$(RELEASE_ARCH)" docker buildx bake --load -f release/docker-bake.hcl silo-release
 
@@ -84,15 +147,3 @@ cli vmmon netd krun agent init initramfs:
 
 kernel:
 	$(XTASK) kernel $(KERNEL_ARGS)
-
-fmt:
-	$(XTASK) fmt
-
-clippy:
-	$(XTASK) clippy
-
-test:
-	$(XTASK) test
-
-version-check:
-	$(XTASK) version-check
