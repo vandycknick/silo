@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
@@ -18,8 +17,6 @@ use crate::types::{
     DiskImage, NetworkMode, SharedDirectory, VirtError, VmConfig, VmExit, VsockPortMode,
 };
 
-const KRUN_BINARY_ENV: &str = "KRUN_BIN";
-const KRUN_BINARY_NAME: &str = "krun";
 const VSOCK_DIR_NAME: &str = "krun.vsock";
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -144,7 +141,7 @@ fn prepare(config: &VmConfig) -> Result<(), VirtError> {
 impl KrunMachineBackend {
     pub(crate) fn new(config: VmConfig) -> Result<Self, VirtError> {
         validate(&config)?;
-        let krun_bin = locate_krun_binary()?;
+        let krun_bin = resolved_krun_binary(&config)?;
         let runtime_dir = runtime_dir_for(&config);
         Ok(Self {
             config,
@@ -517,44 +514,24 @@ fn vsock_dir_for(config: &VmConfig) -> PathBuf {
     runtime_dir_for(config).join(VSOCK_DIR_NAME)
 }
 
-fn locate_krun_binary() -> Result<PathBuf, VirtError> {
-    if let Some(path) = env::var_os(KRUN_BINARY_ENV) {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
-        }
-        return Err(VirtError::UnsupportedBackend {
-            kind: "krun",
-            reason: format!(
-                "{KRUN_BINARY_ENV} is set but does not point to a file: {}",
+fn resolved_krun_binary(config: &VmConfig) -> Result<PathBuf, VirtError> {
+    let path = config
+        .krun_path
+        .as_ref()
+        .ok_or_else(|| VirtError::InvalidConfig {
+            name: config.name.clone(),
+            reason: "krun helper path is required".to_string(),
+        })?;
+    if !path.is_absolute() || !path.is_file() {
+        return invalid_config(
+            config,
+            &format!(
+                "krun helper must be an absolute regular file: {}",
                 path.display()
             ),
-        });
+        );
     }
-
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(dir) = current_exe.parent() {
-            let candidate = dir.join(KRUN_BINARY_NAME);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-
-    let path = env::var_os("PATH").ok_or_else(|| VirtError::UnsupportedBackend {
-        kind: "krun",
-        reason: "PATH is not set, so the krun binary cannot be located".to_string(),
-    })?;
-    for entry in env::split_paths(&path) {
-        let candidate = entry.join(KRUN_BINARY_NAME);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    Err(VirtError::UnsupportedBackend {
-        kind: "krun",
-        reason: "krun binary was not found in PATH".to_string(),
-    })
+    Ok(path.clone())
 }
 
 fn runtime_dir_for(config: &VmConfig) -> PathBuf {

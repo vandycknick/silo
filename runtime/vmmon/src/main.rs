@@ -62,6 +62,9 @@ struct Args {
     #[arg(long = "run-id", hide = true)]
     run_id: String,
 
+    #[arg(long = "krun-path", hide = true)]
+    krun_path: PathBuf,
+
     #[arg(long = "exit-command", hide = true)]
     exit_command: Option<PathBuf>,
 
@@ -135,6 +138,7 @@ async fn run(args: Args, start_gate: StartGate, sync_reporter: SyncReporter) -> 
         &args.name,
         &args.network,
         args.agent_enabled,
+        &args.krun_path,
         &mut start_gate,
     )
     .await
@@ -216,7 +220,10 @@ fn daemonize(args: &Args, inherited_fds: InheritedPipeFds) -> eyre::Result<()> {
     for network in &args.network {
         cmd.arg("--network").arg(network);
     }
-    cmd.arg("--run-id").arg(&args.run_id);
+    cmd.arg("--run-id")
+        .arg(&args.run_id)
+        .arg("--krun-path")
+        .arg(&args.krun_path);
     if let Some(exit_command) = &args.exit_command {
         cmd.arg("--exit-command").arg(exit_command);
     }
@@ -284,6 +291,8 @@ mod tests {
             "none",
             "--run-id",
             "run-1",
+            "--krun-path",
+            "/tmp/silo-runtime/bin/krun",
             "--exit-command",
             "silo",
             "--exit-command-arg",
@@ -301,6 +310,7 @@ mod tests {
         .expect("vmmon args");
 
         assert_eq!(args.exit_command, Some(PathBuf::from("silo")));
+        assert_eq!(args.krun_path, PathBuf::from("/tmp/silo-runtime/bin/krun"));
         assert_eq!(
             args.exit_command_args,
             vec![

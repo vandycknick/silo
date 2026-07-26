@@ -35,6 +35,11 @@ The public VM spec does not include a backend field. Callers describe the VM the
 
 `vmmon` owns supervision, monitor APIs, guest readiness, and process lifecycle around one running VM.
 
+On Linux, `vmmon` supplies `virt` with the already resolved absolute `krun`
+helper path for each launch. `virt` does not inspect `KRUN_BIN`, sibling paths,
+or `PATH`; it starts that helper as a separate process so `vmmon` does not link
+libkrun.
+
 `virt` owns only the host virtualization boundary:
 
 - validate host VM configuration

@@ -35,8 +35,6 @@ use super::{
     mac_from_machine_id, remove_file_if_exists, remove_runtime_dir, serialize_json, DRIVER_NETD,
 };
 
-const NETD_BINARY_ENV: &str = "NETD_BIN";
-const NETD_BINARY_NAME: &str = "netd";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
@@ -131,7 +129,7 @@ async fn prepare_netd_runtime(
     let static_lease = format!("{}={mac}", ipv4.address);
 
     let log = File::options().create(true).append(true).open(&log_path)?;
-    let mut command = Command::new(resolve_netd_binary());
+    let mut command = Command::new(ctx.netd_path);
     configure_network_helper_command(
         &mut command,
         &NetworkHelperCommandConfig {
@@ -768,19 +766,6 @@ fn append_bounded_stderr_line(captured: &mut CapturedStderrLines, line: String) 
     captured.lines.push_back(line);
 }
 
-fn resolve_netd_binary() -> String {
-    std::env::var(NETD_BINARY_ENV).unwrap_or_else(|_| resolve_sibling_binary(NETD_BINARY_NAME))
-}
-
-fn resolve_sibling_binary(name: &str) -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join(name)))
-        .filter(|path| path.exists())
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| name.to_string())
-}
-
 pub(super) fn instance_is_alive(instance: &NetworkInstance) -> bool {
     driver_state(instance)
         .map(|state| process_is_alive(state.helper_pid))
@@ -815,21 +800,28 @@ fn terminate_helper(pid: i32) -> Result<(), LibVmError> {
 mod tests {
     use super::{
         append_bounded_stderr_line, configure_network_helper_command,
-        configure_network_launch_environment, format_netd_startup_failure, private_ipv4_config,
-        resolve_certificate_authority_paths, CapturedStderrLines, NetworkHelperCommandConfig,
-        OAUTH_REFRESH_AUTH_ENV, OAUTH_REFRESH_HOOK_ENV, STDERR_CAPTURE_LIMIT,
+        configure_network_launch_environment, format_netd_startup_failure, prepare_netd_runtime,
+        private_ipv4_config, resolve_certificate_authority_paths, CapturedStderrLines,
+        NetworkHelperCommandConfig, OAUTH_REFRESH_AUTH_ENV, OAUTH_REFRESH_HOOK_ENV,
+        STDERR_CAPTURE_LIMIT,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
     use silo_policy::NetworkPolicy;
     use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    use crate::lock_manager::LockId;
     use crate::machine::{NetworkLaunch, OAuthRefreshHook};
-    use crate::paths::LocalPaths;
-    use crate::store::models::MachineId;
-    use crate::NetdRuntimeConfig;
+    use crate::network::core::{NetworkAttachmentRequest, NetworkDriverContext};
+    use crate::paths::{LocalPaths, LocalRoots};
+    use crate::store::models::{
+        MachineConfig, MachineId, MachineNetworkConfig, MachineRuntimeState, MachineState,
+    };
+    use crate::store::{MachineStore, Store};
+    use crate::{NetdRuntimeConfig, RuntimeNetworkingConfig};
 
     fn oauth_policy() -> NetworkPolicy {
         NetworkPolicy::from_json_str(
@@ -849,7 +841,7 @@ mod tests {
 
     #[test]
     fn netd_command_includes_static_lease() {
-        let mut command = Command::new("netd");
+        let mut command = Command::new("/tmp/netd");
         configure_network_helper_command(
             &mut command,
             &NetworkHelperCommandConfig {
@@ -882,7 +874,7 @@ mod tests {
 
     #[test]
     fn netd_command_adds_policy_metadata() {
-        let mut command = Command::new("netd");
+        let mut command = Command::new("/tmp/netd");
         let machine_id = MachineId::new();
         configure_network_helper_command(
             &mut command,
@@ -936,7 +928,7 @@ mod tests {
                     .timeout_ms(2500)
                     .refresh_skew_seconds(120),
             );
-        let mut command = Command::new("netd");
+        let mut command = Command::new("/tmp/netd");
 
         configure_network_launch_environment(&mut command, &launch, Some(&policy), "devbox")
             .expect("configure launch environment");
@@ -1101,5 +1093,94 @@ netd log: /tmp/silo/netd.log";
             .expect_err("small subnet should fail");
 
         assert!(err.to_string().contains("between 1 and 29"));
+    }
+
+    #[tokio::test]
+    async fn netd_launches_the_resolved_absolute_helper() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_root = temp.path().join("data");
+        let state_root = temp.path().join("state");
+        let run_root = temp.path().join("run");
+        let paths = LocalPaths::from_roots(LocalRoots::with_roots(
+            &data_root,
+            &state_root,
+            &run_root,
+            data_root.join("images"),
+        ));
+        let netd = temp.path().join("runtime/bin/netd");
+        std::fs::create_dir_all(netd.parent().expect("netd parent")).expect("create netd parent");
+        std::fs::write(
+            &netd,
+            "#!/bin/sh\nsocket=\nlog=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--listen-vfkit\" ]; then socket=\"${arg#unixgram://}\"; fi\n  if [ \"$previous\" = \"--log-file\" ]; then log=\"$arg\"; fi\n  previous=\"$arg\"\ndone\nprintf '%s\\n' \"$0\" > \"$log.program\"\n: > \"$socket\"\nwhile :; do sleep 1; done\n",
+        )
+        .expect("write netd helper");
+        std::fs::set_permissions(&netd, std::fs::Permissions::from_mode(0o755))
+            .expect("make netd executable");
+        let store = Store::new(&paths).await.expect("open store");
+        let machine_id = MachineId::new();
+        let metadata = MachineConfig {
+            id: machine_id,
+            lock_id: LockId::from(0),
+            name: "netd-resolved-path".to_string(),
+            spec: vm_spec::VmSpec::current(),
+            machine_dir: paths.machine(machine_id).dir().to_path_buf(),
+            created_at: 1,
+            modified_at: 1,
+            image_ref: String::new(),
+            root_disk_size: None,
+            labels: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            network: MachineNetworkConfig::Private { policy: None },
+            guest: crate::machine::MachineGuestConfig::default(),
+        };
+        let state = MachineState {
+            machine_id,
+            status: MachineRuntimeState::Stopped,
+            vmmon_pid: None,
+            started_at: None,
+            run_id: None,
+            last_error: None,
+            updated_at: 1,
+        };
+        store
+            .add_machine(&metadata, &state)
+            .await
+            .expect("save machine");
+        let networking = RuntimeNetworkingConfig::default();
+        let launch = NetworkLaunch::default();
+        let context = NetworkDriverContext {
+            paths: &paths,
+            store: &store,
+            metadata: &metadata,
+            config: &networking,
+            netd_path: &netd,
+            network_launch: &launch,
+        };
+
+        let attachment = prepare_netd_runtime(&context, &NetworkAttachmentRequest::private(None))
+            .await
+            .expect("launch resolved netd");
+
+        let log_path = match attachment {
+            crate::network::VmmonNetworkAttachment::UnixDatagram { path, .. } => {
+                let network_id = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(std::ffi::OsStr::to_str)
+                    .expect("network runtime directory name");
+                paths.network(network_id).log_path()
+            }
+            crate::network::VmmonNetworkAttachment::None => panic!("netd must attach a socket"),
+        };
+        assert_eq!(
+            std::fs::read_to_string(log_path.with_extension("log.program"))
+                .expect("read executed netd path")
+                .trim(),
+            netd.display().to_string()
+        );
+
+        crate::network::reconcile_network_runtime(&paths, &store, &metadata, false)
+            .await
+            .expect("clean netd runtime");
     }
 }

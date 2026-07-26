@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eyre::Context;
@@ -133,6 +133,7 @@ pub async fn init(
     name: &str,
     network_args: &[String],
     agent_enabled: bool,
+    krun_path: &Path,
     start_gate: &mut StartGate,
 ) -> eyre::Result<DaemonContext> {
     let spec = load_spec(runtime)?;
@@ -155,6 +156,7 @@ pub async fn init(
         spec: &spec,
         network: &network,
         guest_services_enabled,
+        krun_path,
     })?;
     let machine = VirtualMachine::new(machine_config.config)?;
     if let Some(machine_identifier) = machine_config.machine_identifier.as_ref() {

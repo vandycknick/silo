@@ -16,7 +16,7 @@ implementation.
 - [x] Commit 02: Reset the SQL schema and durable root identity
 - [x] Commit 03: Split data, state, and run paths securely
 - [x] Commit 04: Centralize runtime component resolution
-- [ ] Commit 05: Remove late helper and asset discovery
+- [x] Commit 05: Remove late helper and asset discovery
 - [ ] Commit 06: Establish the Make and xtask build interface
 - [ ] Commit 07: Build adjacent development runtimes and canonical stages
 - [ ] Commit 08: Isolate release linking and audit binaries
@@ -799,6 +799,16 @@ cargo test -p krun
 make clippy
 git diff --check
 ```
+
+### Implementation Notes
+
+- `Runtime` launches its immutable resolved `vmmon` and `netd` paths directly,
+  passes its resolved `krun` path to vmmon as a private argument, and supplies
+  default boot assets only from the same resolved installation set.
+- Real temporary portable-tree tests record the absolute vmmon, krun, and netd
+  paths across the launch boundaries and clean netd using the current
+  data/state/run roots. They exercise helper start handshakes without requiring
+  host virtualization or a guest boot.
 
 ## Commit 06: Establish The Make And Xtask Build Interface
 

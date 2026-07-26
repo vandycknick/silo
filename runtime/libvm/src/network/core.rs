@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use silo_policy::NetworkPolicy;
+use std::path::Path;
 
 use crate::paths::LocalPaths;
 use crate::store::models::MachineConfig;
@@ -27,6 +28,7 @@ pub(super) struct NetworkDriverContext<'a> {
     pub(super) store: &'a dyn DataStore,
     pub(super) metadata: &'a MachineConfig,
     pub(super) config: &'a RuntimeNetworkingConfig,
+    pub(super) netd_path: &'a Path,
     pub(super) network_launch: &'a NetworkLaunch,
 }
 

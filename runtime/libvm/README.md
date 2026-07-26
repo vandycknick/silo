@@ -81,6 +81,21 @@ history. With every Silo process stopped, manually archive or remove an existing
 `state.db` before opening the new runtime. Silo does not adopt old database or
 runtime files.
 
+## Runtime Components
+
+`Runtime::new` resolves `vmmon`, `netd`, `krun`, `kernel-default`, `initramfs`,
+and `agent` once, validates them as absolute paths, and retains that immutable
+set for the runtime lifetime. Machine starts launch the resolved absolute
+`vmmon` path directly. `vmmon` receives the resolved absolute `krun` path as
+private launch state and keeps the `vmmon -> krun` process boundary intact.
+Private networking launches the resolved absolute `netd` path directly.
+
+Machine kernel, initramfs, and agent overrides remain independent. An omitted
+asset always uses its matching file from the resolved installation set, so one
+launch never combines defaults from separate installations. `libvm` performs
+all component environment and controlled PATH resolution while opening the
+runtime; launched helpers do not repeat discovery.
+
 ## Lifecycle States
 
 `libvm` treats VM lifecycle mutations as lock-owned transactions. Commands

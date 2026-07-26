@@ -26,17 +26,26 @@ pub(crate) use launch_spec::{prepare_launch_spec, write_launch_spec, LaunchSpecI
 #[derive(Debug, Clone)]
 pub(crate) struct Vmmon {
     paths: LocalPaths,
-    executable: Option<PathBuf>,
+    executable: PathBuf,
+    krun_path: PathBuf,
 }
 
 impl Vmmon {
     /// Creates a vmmon adapter bound to the runtime's local paths.
-    pub(crate) fn new(paths: LocalPaths, executable: Option<PathBuf>) -> Self {
-        Self { paths, executable }
+    pub(crate) fn new(paths: LocalPaths, executable: PathBuf, krun_path: PathBuf) -> Self {
+        Self {
+            paths,
+            executable,
+            krun_path,
+        }
     }
 
-    pub(crate) fn executable(&self) -> Option<&std::path::Path> {
-        self.executable.as_deref()
+    pub(crate) fn executable(&self) -> &std::path::Path {
+        &self.executable
+    }
+
+    pub(crate) fn krun_path(&self) -> &std::path::Path {
+        &self.krun_path
     }
 
     pub(crate) fn client(&self, machine_id: MachineId) -> VmmonClient {

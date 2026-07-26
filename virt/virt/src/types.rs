@@ -73,6 +73,7 @@ pub struct VmConfig {
     pub cpus: Option<usize>,
     pub memory_mib: Option<u64>,
     pub base_directory: PathBuf,
+    pub krun_path: Option<PathBuf>,
     pub kernel_path: Option<PathBuf>,
     pub initramfs_path: Option<PathBuf>,
     pub machine_identifier: Option<MachineIdentifier>,
@@ -93,6 +94,7 @@ impl VmConfig {
             cpus: None,
             memory_mib: None,
             base_directory: PathBuf::new(),
+            krun_path: None,
             kernel_path: None,
             initramfs_path: None,
             machine_identifier: None,
@@ -164,6 +166,12 @@ impl VmConfigBuilder {
 
     pub fn vm_id(mut self, vm_id: impl Into<String>) -> Self {
         self.config.vm_id = vm_id.into();
+        self
+    }
+
+    /// Sets the resolved krun helper used by the Linux backend.
+    pub fn krun_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.krun_path = Some(path.into());
         self
     }
 

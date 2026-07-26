@@ -96,7 +96,6 @@ pub struct Runtime {
     store: Arc<dyn DataStore>,
     lock_manager: LockManager,
     networking: RuntimeNetworkingConfig,
-    #[allow(dead_code)]
     components: ResolvedRuntimeComponents,
     vmmon: Vmmon,
     image_pull_policy: ImagePullPolicy,
@@ -161,7 +160,11 @@ impl Runtime {
         components: ResolvedRuntimeComponents,
     ) -> Result<Self, LibVmError> {
         let lock_manager = LockManager::open(paths.locks_dir().to_path_buf())?;
-        let vmmon = Vmmon::new(paths.clone(), Some(components.vmmon.clone()));
+        let vmmon = Vmmon::new(
+            paths.clone(),
+            components.vmmon.clone(),
+            components.krun.clone(),
+        );
         let runtime = Self {
             paths,
             store,
@@ -237,7 +240,11 @@ impl Runtime {
         kernel: Option<&Path>,
         initramfs: Option<&Path>,
     ) -> Result<ResolvedBootAssets, LibVmError> {
-        boot_assets::resolve_boot_assets(BootAssetOverrides { kernel, initramfs })
+        boot_assets::resolve_boot_assets(
+            BootAssetOverrides { kernel, initramfs },
+            &self.components.kernel,
+            &self.components.initramfs,
+        )
     }
 
     fn complete_launch_boot_assets(&self, spec: &mut VmSpec) -> Result<(), LibVmError> {
@@ -860,6 +867,7 @@ impl Runtime {
             self.store.as_ref(),
             config,
             &self.networking,
+            &self.components.netd,
             network_launch,
         )
         .await
@@ -891,7 +899,9 @@ impl Runtime {
             })?;
 
             let agent_enabled = config.guest.agent.enabled();
-            if let Some(agent_path) = boot_assets::resolve_agent(&config.guest.agent)? {
+            if let Some(agent_path) =
+                boot_assets::resolve_agent(&config.guest.agent, &self.components.agent)?
+            {
                 let agent_config = guest_agent::build_config(GuestAgentConfigInput {
                     paths: &self.paths,
                     machine_name: &config.name,
@@ -1610,11 +1620,12 @@ mod tests {
     use crate::vmmon::process::ProcessIdentity;
     use crate::{
         ImageSource, LibVmError, MachineExitOutcome, MachineKillOptions, MachineRef, MachineStatus,
-        MachineUpdate, Memory, RuntimeNetworkingConfig,
+        MachineUpdate, Memory, RuntimeConfig, RuntimeNetworkingConfig,
     };
     use ocidisk::{Platform, RootfsImage, RootfsImageMetadata, RootfsImageSource};
     use silo_policy::NetworkPolicy;
     use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1751,6 +1762,160 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, b"asset").expect("write asset");
         path
+    }
+
+    fn write_complete_portable_runtime(root: &std::path::Path) -> std::path::PathBuf {
+        let bin = root.join("bin");
+        let assets = root.join("assets");
+        std::fs::create_dir_all(&bin).expect("create runtime bin");
+        std::fs::create_dir_all(&assets).expect("create runtime assets");
+        for helper in ["netd", "krun"] {
+            let path = bin.join(helper);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write helper");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make helper executable");
+        }
+        let vmmon = bin.join("vmmon");
+        std::fs::write(
+            &vmmon,
+            "#!/bin/sh\ntrace=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--trace-log\" ]; then trace=\"$arg\"; fi\n  previous=\"$arg\"\ndone\nprintf '%s\\n' \"$0\" > \"$trace.program\"\nprintf '%s\\n' \"$@\" > \"$trace.args\"\n( sleep 1; eval \"printf 'started\\n' >&$_VM_SYNCPIPE\" ) &\nexit 0\n",
+        )
+        .expect("write vmmon helper");
+        std::fs::set_permissions(&vmmon, std::fs::Permissions::from_mode(0o755))
+            .expect("make vmmon executable");
+        for (asset, mode) in [
+            ("kernel-default", 0o644),
+            ("initramfs", 0o644),
+            ("agent", 0o755),
+        ] {
+            let path = assets.join(asset);
+            std::fs::write(&path, asset).expect("write runtime asset");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("set runtime asset mode");
+        }
+        root.to_path_buf()
+    }
+
+    #[tokio::test]
+    async fn complete_portable_runtime_launches_resolved_vmmon_and_propagates_krun() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let runtime_root = write_complete_portable_runtime(&temp.path().join("runtime"));
+        let data_root = temp.path().join("data");
+        let state_root = temp.path().join("state");
+        let run_root = temp.path().join("run");
+        let runtime = Runtime::new(
+            RuntimeConfig::local(&data_root)
+                .with_state_root(&state_root)
+                .with_run_root(&run_root)
+                .with_runtime_root(&runtime_root),
+        )
+        .await
+        .expect("open runtime from complete portable tree");
+        let machine_id = MachineId::new();
+        let machine_paths = runtime.machine_paths(machine_id);
+        std::fs::create_dir_all(machine_paths.dir()).expect("create machine data directory");
+        std::fs::create_dir_all(machine_paths.run_dir()).expect("create machine run directory");
+        std::fs::create_dir_all(machine_paths.logs_dir()).expect("create machine logs directory");
+        let network = crate::network::VmmonNetworkAttachment::None;
+        let pidfile = machine_paths.vmmon_pid_path();
+        let exit_status = machine_paths.vmmon_exit_status_path();
+        let config = machine_paths.vm_spec_path();
+        let socket = machine_paths.vmmon_socket_path();
+        let serial_log = machine_paths.serial_log_path();
+        let trace_log = machine_paths.vmmon_trace_log_path();
+        let launch = crate::vmmon::VmmonLaunch {
+            machine_id,
+            name: "portable-runtime",
+            machine_dir: machine_paths.dir(),
+            pidfile: &pidfile,
+            exit_status: &exit_status,
+            config: &config,
+            socket: &socket,
+            serial_log: &serial_log,
+            trace_log: &trace_log,
+            network: &network,
+            run_id: "portable-run",
+            exit_command: None,
+            agent_enabled: false,
+        };
+
+        runtime
+            .vmmon()
+            .spawn(&launch)
+            .await
+            .expect("launch resolved vmmon");
+
+        let args = std::fs::read_to_string(
+            machine_paths
+                .vmmon_trace_log_path()
+                .with_extension("log.args"),
+        )
+        .expect("read vmmon launch arguments");
+        assert_eq!(
+            std::fs::read_to_string(
+                machine_paths
+                    .vmmon_trace_log_path()
+                    .with_extension("log.program"),
+            )
+            .expect("read launched vmmon path")
+            .trim(),
+            runtime_root
+                .join("bin/vmmon")
+                .canonicalize()
+                .expect("canonical vmmon")
+                .display()
+                .to_string()
+        );
+        assert!(args.contains(
+            &runtime_root
+                .join("bin/krun")
+                .canonicalize()
+                .expect("canonical krun")
+                .display()
+                .to_string()
+        ));
+    }
+
+    #[test]
+    fn resolved_default_assets_stay_together_while_machine_overrides_remain_independent() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let runtime_root = write_complete_portable_runtime(&temp.path().join("runtime"));
+        let components = crate::runtime::components::test_components(&runtime_root);
+        let override_kernel = write_test_asset(temp.path(), "custom-kernel");
+        let assets = crate::runtime::boot_assets::resolve_boot_assets(
+            crate::runtime::boot_assets::BootAssetOverrides {
+                kernel: Some(&override_kernel),
+                initramfs: None,
+            },
+            &components.kernel,
+            &components.initramfs,
+        )
+        .expect("resolve assets");
+
+        assert_eq!(
+            assets.kernel,
+            override_kernel.canonicalize().expect("canonical kernel")
+        );
+        assert_eq!(
+            assets.initramfs,
+            runtime_root
+                .join("assets/initramfs")
+                .canonicalize()
+                .expect("canonical initramfs")
+        );
+        assert_eq!(
+            crate::runtime::boot_assets::resolve_agent(
+                &crate::machine::MachineAgent::Default,
+                &components.agent,
+            )
+            .expect("resolve default agent"),
+            Some(
+                runtime_root
+                    .join("assets/agent")
+                    .canonicalize()
+                    .expect("canonical agent")
+            )
+        );
     }
 
     #[tokio::test]

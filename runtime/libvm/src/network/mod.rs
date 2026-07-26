@@ -74,6 +74,7 @@ pub(crate) async fn prepare_network_runtime(
     store: &dyn DataStore,
     metadata: &MachineConfig,
     config: &RuntimeNetworkingConfig,
+    netd_path: &Path,
     network_launch: &NetworkLaunch,
 ) -> Result<VmmonNetworkAttachment, LibVmError> {
     reconcile_network_runtime(paths, store, metadata, false).await?;
@@ -92,6 +93,7 @@ pub(crate) async fn prepare_network_runtime(
                     store,
                     metadata,
                     config,
+                    netd_path,
                     network_launch,
                 },
                 &request,
@@ -254,6 +256,7 @@ pub(super) fn remove_file_if_exists(path: &Path) -> Result<(), LibVmError> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::Path;
 
     use serde_json::json;
     use vm_spec::VmSpec;
@@ -580,6 +583,7 @@ mod tests {
             &store,
             &metadata,
             &RuntimeNetworkingConfig::default(),
+            Path::new("/tmp/netd"),
             &crate::NetworkLaunch::default(),
         )
         .await
