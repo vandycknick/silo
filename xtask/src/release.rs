@@ -75,10 +75,6 @@ impl Toolchains {
                 reason: format!("missing {key} in release/toolchains.toml"),
             })
     }
-
-    pub fn values(&self) -> &BTreeMap<String, String> {
-        &self.values
-    }
 }
 
 pub fn toolchains(workspace_root: &Path) -> Result<Toolchains, ReleaseError> {
@@ -155,13 +151,7 @@ pub fn go_program(
     let toolchains = toolchains(workspace_root)?;
     let version = toolchains.value("tools.go")?;
     let digest = toolchains.value("tools.go_darwin_arm64_sha256")?;
-    let release_root = target_dir.parent().and_then(Path::parent).ok_or_else(|| {
-        ReleaseError::ToolWithoutParent {
-            tool: "release target",
-            path: target_dir.to_path_buf(),
-        }
-    })?;
-    let tools = release_root.join("release-tools");
+    let tools = target_dir.join("release-tools");
     let toolchain = tools.join(format!("go-{version}"));
     let archive = tools.join(format!("go-{version}.darwin-arm64.tar.gz"));
     fs::create_dir_all(&tools).map_err(|source| ReleaseError::Io {
@@ -476,6 +466,9 @@ pub fn run_linux_release(
         if kernel_options.offline() {
             run.args(["--env", "KERNEL_OFFLINE=1"]);
         }
+        if kernel_options.refresh() {
+            run.args(["--env", "KERNEL_REFRESH=1"]);
+        }
         if let Some(path) = kernel_options.local_path() {
             let path = path.canonicalize().map_err(|source| ReleaseError::Io {
                 action: "resolve local kernel path",
@@ -637,9 +630,7 @@ fn remapped_rustflag_parts(workspace_root: &Path, target_dir: &Path) -> Vec<Stri
 }
 
 fn release_cache_directory(target_dir: &Path, name: &str) -> PathBuf {
-    target_dir
-        .parent()
-        .map_or_else(|| target_dir.join(name), |parent| parent.join(name))
+    target_dir.join("silo-release-cache").join(name)
 }
 
 fn program_directory(program: &Path, tool: &'static str) -> Result<PathBuf, ReleaseError> {

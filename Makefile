@@ -12,8 +12,12 @@ export CARGO_TARGET_DIR
 KERNEL_REFERENCE ?= ghcr.io/vandycknick/silo/kernel:stable
 KERNEL_PATH ?=
 KERNEL_OFFLINE ?= 0
+KERNEL_REFRESH ?= 0
 ifneq ($(filter $(KERNEL_OFFLINE),0 1),$(KERNEL_OFFLINE))
 $(error KERNEL_OFFLINE must be 0 or 1)
+endif
+ifneq ($(filter $(KERNEL_REFRESH),0 1),$(KERNEL_REFRESH))
+$(error KERNEL_REFRESH must be 0 or 1)
 endif
 
 XTASK = CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" cargo run --locked -p xtask --
@@ -24,8 +28,11 @@ endif
 ifeq ($(KERNEL_OFFLINE),1)
 KERNEL_ARGS += --offline
 endif
+ifeq ($(KERNEL_REFRESH),1)
+KERNEL_ARGS += --refresh
+endif
 
-.PHONY: build stage verify-runtime check-runtime-qualification release-linux cli vmmon netd krun agent init initramfs kernel fmt clippy test version-check
+.PHONY: build stage verify-runtime release-linux cli vmmon netd krun agent init initramfs kernel fmt clippy test version-check
 
 build:
 	$(XTASK) build --profile "$(PROFILE)" $(KERNEL_ARGS)
@@ -35,9 +42,6 @@ stage:
 
 verify-runtime:
 	$(XTASK) verify-runtime --profile "$(PROFILE)"
-
-check-runtime-qualification:
-	$(XTASK) check-runtime-qualification --profile "$(PROFILE)"
 
 RELEASE_UNAME := $(shell uname -m)
 ifeq ($(RELEASE_UNAME),x86_64)

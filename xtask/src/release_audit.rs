@@ -1,19 +1,16 @@
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cpio::NewcReader;
 use flate2::read::GzDecoder;
-use serde_json::json;
 use thiserror::Error;
 
 use crate::command;
 use crate::components::BuildContext;
 use crate::profiles::Profile;
-use crate::release;
-use crate::release_record;
 use crate::runtime;
 use crate::targets::HostTarget;
 
@@ -22,21 +19,11 @@ pub enum AuditError {
     #[error(transparent)]
     Command(#[from] command::CommandError),
     #[error(transparent)]
-    Release(#[from] release::ReleaseError),
-    #[error(transparent)]
-    Record(#[from] release_record::RecordError),
-    #[error(transparent)]
     Runtime(#[from] runtime::RuntimeError),
     #[error("release audit failed for {path}: {reason}")]
     Invalid { path: PathBuf, reason: String },
     #[error("failed to read release artifact {path}")]
     ReadArtifact {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to write release provenance {path}")]
-    WriteProvenance {
         path: PathBuf,
         #[source]
         source: std::io::Error,
@@ -51,14 +38,13 @@ pub fn verify(
     if profile != Profile::Release {
         return invalid(
             target_dir,
-            "verify-runtime only qualifies release outputs".to_string(),
+            "verify-runtime only audits release outputs".to_string(),
         );
     }
     let host = HostTarget::current().map_err(|error| AuditError::Invalid {
         path: target_dir.to_path_buf(),
         reason: error.to_string(),
     })?;
-    release_record::invalidate_qualification(target_dir, host)?;
     let release = target_dir.join("release");
     let stage = target_dir
         .join("silo-runtime")
@@ -70,37 +56,20 @@ pub fn verify(
         ("netd", release.join("netd")),
         ("krun", release.join("krun")),
     ];
-    let staged_binaries = [
-        ("vmmon", stage.join("bin/vmmon")),
-        ("netd", stage.join("bin/netd")),
-        ("krun", stage.join("bin/krun")),
-    ];
-
     match host {
         HostTarget::MacosArm64 => {
-            for (name, path) in host_binaries.iter().chain(staged_binaries.iter()) {
-                audit_macho(name, path, workspace_root, target_dir)?;
+            for (name, path) in host_binaries {
+                audit_macho(name, &path)?;
             }
         }
         HostTarget::LinuxX86_64 | HostTarget::LinuxArm64 => {
-            for (name, path) in host_binaries.iter().chain(staged_binaries.iter()) {
-                audit_elf(name, path, host, workspace_root, target_dir)?;
+            for (name, path) in host_binaries {
+                audit_elf(name, &path, host)?;
             }
         }
     }
-    audit_static_elf(
-        &stage.join("assets/agent"),
-        host,
-        workspace_root,
-        target_dir,
-    )?;
-    audit_staged_initramfs(
-        &stage.join("assets/initramfs"),
-        host,
-        workspace_root,
-        target_dir,
-    )?;
-    verify_contaminated_binary(workspace_root, target_dir, host)?;
+    audit_static_elf(&stage.join("assets/agent"), host)?;
+    audit_staged_initramfs(&stage.join("assets/initramfs"), host, target_dir)?;
     runtime::validate_stage_against_adjacent(
         &BuildContext {
             workspace_root,
@@ -110,16 +79,10 @@ pub fn verify(
         },
         &stage,
     )?;
-    write_provenance(workspace_root, target_dir, host, &release.join("netd"))?;
-    Ok(release_record::write_qualification(target_dir, host)?)
+    Ok(())
 }
 
-fn audit_macho(
-    name: &str,
-    path: &Path,
-    workspace_root: &Path,
-    target_dir: &Path,
-) -> Result<(), AuditError> {
+fn audit_macho(_name: &str, path: &Path) -> Result<(), AuditError> {
     let load_commands = output("/usr/bin/otool", ["-l"], path)?;
     if load_commands.contains("LC_RPATH") {
         return invalid(path, "contains LC_RPATH".to_string());
@@ -155,56 +118,15 @@ fn audit_macho(
                 })
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
-    let expected = macho_dependencies(name)?;
-    if actual != expected {
-        return invalid(
-            path,
-            format!("dylibs are {actual:?}, expected {expected:?}"),
-        );
+    if actual.iter().any(|dependency| {
+        !dependency.starts_with("/System/Library/") && !dependency.starts_with("/usr/lib/")
+    }) {
+        return invalid(path, format!("contains a non-system dylib: {actual:?}"));
     }
-    reject_build_paths(path, workspace_root, target_dir)
+    Ok(())
 }
 
-fn macho_dependencies(name: &str) -> Result<BTreeSet<String>, AuditError> {
-    let values: &[&str] = match name {
-        "silo" => &[
-            "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation",
-            "/System/Library/Frameworks/Security.framework/Versions/A/Security",
-            "/usr/lib/libSystem.B.dylib",
-            "/usr/lib/libiconv.2.dylib",
-        ],
-        "vmmon" => &[
-            "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit",
-            "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation",
-            "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation",
-            "/System/Library/Frameworks/Virtualization.framework/Versions/A/Virtualization",
-            "/usr/lib/libSystem.B.dylib",
-            "/usr/lib/libiconv.2.dylib",
-            "/usr/lib/libobjc.A.dylib",
-        ],
-        "netd" => &[
-            "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation",
-            "/System/Library/Frameworks/Security.framework/Versions/A/Security",
-            "/usr/lib/libSystem.B.dylib",
-            "/usr/lib/libresolv.9.dylib",
-        ],
-        "krun" => &[
-            "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
-            "/usr/lib/libSystem.B.dylib",
-            "/usr/lib/libiconv.2.dylib",
-        ],
-        _ => return invalid(Path::new(name), "no Mach-O allowlist".to_string()),
-    };
-    Ok(values.iter().map(|value| (*value).to_string()).collect())
-}
-
-fn audit_elf(
-    name: &str,
-    path: &Path,
-    host: HostTarget,
-    workspace_root: &Path,
-    target_dir: &Path,
-) -> Result<(), AuditError> {
+fn audit_elf(name: &str, path: &Path, host: HostTarget) -> Result<(), AuditError> {
     assert_elf_machine(path, host_machine(host))?;
     let program_headers = output("/usr/bin/readelf", ["-lW"], path)?;
     let dynamic = output("/usr/bin/readelf", ["-dW"], path)?;
@@ -240,21 +162,19 @@ fn audit_elf(
     {
         return invalid(path, "depends on libkrun.so".to_string());
     }
-    reject_glibc_newer_than_239(path, &versions)?;
-    reject_build_paths(path, workspace_root, target_dir)
+    reject_glibc_newer_than_239(path, &versions)
 }
 
-fn audit_static_elf(
-    path: &Path,
-    host: HostTarget,
-    workspace_root: &Path,
-    target_dir: &Path,
-) -> Result<(), AuditError> {
+fn audit_static_elf(path: &Path, host: HostTarget) -> Result<(), AuditError> {
     let bytes = fs::read(path).map_err(|source| AuditError::ReadArtifact {
         path: path.to_path_buf(),
         source,
     })?;
-    let header = elf_header(&bytes, path)?;
+    audit_static_elf_bytes(&bytes, path, host)
+}
+
+fn audit_static_elf_bytes(bytes: &[u8], path: &Path, host: HostTarget) -> Result<(), AuditError> {
+    let header = elf_header(bytes, path)?;
     let expected_machine = match host.guest_target().triple() {
         "x86_64-unknown-linux-musl" => 62,
         "aarch64-unknown-linux-musl" => 183,
@@ -276,21 +196,18 @@ fn audit_static_elf(
     {
         return invalid(path, "guest binary has PT_DYNAMIC or PT_INTERP".to_string());
     }
-    reject_build_paths(path, workspace_root, target_dir)
+    Ok(())
 }
 
 fn audit_staged_initramfs(
     initramfs: &Path,
     host: HostTarget,
-    workspace_root: &Path,
     target_dir: &Path,
 ) -> Result<(), AuditError> {
     let expected = target_dir
-        .join("release-build")
-        .join(host.runtime_target())
         .join(host.guest_target().triple())
         .join("release/init");
-    audit_static_elf(&expected, host, workspace_root, target_dir)?;
+    audit_static_elf(&expected, host)?;
     let file = File::open(initramfs).map_err(|source| AuditError::ReadArtifact {
         path: initramfs.to_path_buf(),
         source,
@@ -349,128 +266,10 @@ fn audit_staged_initramfs(
     if init != expected_bytes {
         return invalid(
             initramfs,
-            "embedded init differs from release-build init".to_string(),
+            "embedded init differs from the release init".to_string(),
         );
     }
-    let temporary = target_dir.join(format!(".release-audit-init-{}", std::process::id()));
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|source| AuditError::WriteProvenance {
-            path: temporary.clone(),
-            source,
-        })?;
-    output
-        .write_all(&init)
-        .map_err(|source| AuditError::WriteProvenance {
-            path: temporary.clone(),
-            source,
-        })?;
-    drop(output);
-    let result = audit_static_elf(&temporary, host, workspace_root, target_dir);
-    let _ = fs::remove_file(&temporary);
-    result
-}
-
-fn verify_contaminated_binary(
-    workspace_root: &Path,
-    target_dir: &Path,
-    host: HostTarget,
-) -> Result<(), AuditError> {
-    let contaminated_target = target_dir.join("release-audit-contaminated");
-    if contaminated_target.exists() {
-        fs::remove_dir_all(&contaminated_target).map_err(|source| AuditError::WriteProvenance {
-            path: contaminated_target.clone(),
-            source,
-        })?;
-    }
-    let cargo = release::tool("cargo")?;
-    let rpath = "/tmp/silo-audit-contaminated";
-    let mut build = Command::new(cargo);
-    build
-        .current_dir(workspace_root)
-        .env("CARGO_TARGET_DIR", &contaminated_target)
-        .env("RUSTFLAGS", format!("-C link-arg=-Wl,-rpath,{rpath}"))
-        .env(
-            "CARGO_ENCODED_RUSTFLAGS",
-            format!("-C\u{1f}link-arg=-Wl,-rpath,{rpath}"),
-        )
-        .args(["build", "--locked", "--release", "-p", "cli"]);
-    command::run(build)?;
-    let contaminated = contaminated_target.join("release/silo");
-    let result = match host {
-        HostTarget::MacosArm64 => audit_macho("silo", &contaminated, workspace_root, target_dir),
-        HostTarget::LinuxX86_64 | HostTarget::LinuxArm64 => {
-            audit_elf("silo", &contaminated, host, workspace_root, target_dir)
-        }
-    };
-    match result {
-        Err(AuditError::Invalid { reason, .. }) if reason.contains("RPATH") => Ok(()),
-        Err(AuditError::Invalid { reason, .. }) => invalid(
-            &contaminated,
-            format!("contaminated binary failed for the wrong reason: {reason}"),
-        ),
-        Err(error) => Err(error),
-        Ok(()) => invalid(
-            &contaminated,
-            "known RPATH contamination passed the audit".to_string(),
-        ),
-    }
-}
-
-fn write_provenance(
-    workspace_root: &Path,
-    target_dir: &Path,
-    host: HostTarget,
-    netd: &Path,
-) -> Result<(), AuditError> {
-    let directory = target_dir
-        .join("release-provenance")
-        .join(host.runtime_target());
-    fs::create_dir_all(&directory).map_err(|source| AuditError::WriteProvenance {
-        path: directory.clone(),
-        source,
-    })?;
-    let release_target = target_dir.join("release-build").join(host.runtime_target());
-    let go = release::go_program(&release_target, workspace_root, true)?;
-    let cargo = release::tool("cargo")?;
-    let rustc = release::tool("rustc")?;
-    let zig = release::tool("zig")?;
-    let cargo_zigbuild = release::tool("cargo-zigbuild")?;
-    let toolchains = release::toolchains(workspace_root)?;
-    let value = json!({
-        "cargo": provenance_tool(&cargo, ["--version"] )?,
-        "rustc": provenance_tool(&rustc, ["--version"] )?,
-        "go": provenance_tool(&go, ["version"] )?,
-        "zig": provenance_tool(&zig, ["version"] )?,
-        "cargo_zigbuild": provenance_tool(&cargo_zigbuild, ["--version"] )?,
-        "go_build": output_program_at(&go, ["version", "-m"], netd)?,
-        "archives": {
-            "go_darwin_arm64_sha256": toolchains.value("tools.go_darwin_arm64_sha256")?,
-            "go_linux_amd64_sha256": toolchains.value("tools.go_linux_amd64_sha256")?,
-            "go_linux_arm64_sha256": toolchains.value("tools.go_linux_arm64_sha256")?,
-        },
-        "release_toolchains": toolchains.values(),
-        "apple_sdk": if matches!(host, HostTarget::MacosArm64) {
-            Some(output_program(Path::new("/usr/bin/xcrun"), ["--sdk", "macosx", "--show-sdk-version"])? )
-        } else {
-            None
-        },
-    });
-    let path = directory.join("toolchains.json");
-    let bytes = serde_json::to_vec_pretty(&value).map_err(|error| AuditError::Invalid {
-        path: path.clone(),
-        reason: error.to_string(),
-    })?;
-    fs::write(&path, bytes).map_err(|source| AuditError::WriteProvenance { path, source })
-}
-
-fn provenance_tool(
-    path: &Path,
-    args: impl IntoIterator<Item = &'static str>,
-) -> Result<serde_json::Value, AuditError> {
-    Ok(json!({"path": path, "version": output_program(path, args)?}))
+    audit_static_elf_bytes(&init, initramfs, host)
 }
 
 fn elf_dependencies(name: &str) -> Result<BTreeSet<String>, AuditError> {
@@ -598,58 +397,8 @@ fn reject_glibc_newer_than_239(path: &Path, output: &str) -> Result<(), AuditErr
     Ok(())
 }
 
-fn reject_build_paths(
-    path: &Path,
-    workspace_root: &Path,
-    target_dir: &Path,
-) -> Result<(), AuditError> {
-    let strings = output("/usr/bin/strings", [], path)?;
-    let mut forbidden = vec![
-        "/nix/store/".to_string(),
-        "/opt/homebrew/".to_string(),
-        "/usr/local/Cellar/".to_string(),
-        "/opt/local/".to_string(),
-        "/private/var/folders/".to_string(),
-        "/var/folders/".to_string(),
-        "/private/tmp/".to_string(),
-    ];
-    for root in [workspace_root, target_dir] {
-        forbidden.push(format!("{}/", root.display()));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        forbidden.push(format!("{}/.cargo/", home.display()));
-        forbidden.push(format!("{}/go/pkg/mod/", home.display()));
-    }
-    for value in forbidden {
-        if strings.contains(&value) {
-            return invalid(path, format!("contains build path {value}"));
-        }
-    }
-    Ok(())
-}
-
 fn output<'a>(
     program: &str,
-    args: impl IntoIterator<Item = &'a str>,
-    path: &Path,
-) -> Result<String, AuditError> {
-    let mut command = Command::new(program);
-    command.args(args).arg(path);
-    output_command(command)
-}
-
-fn output_program<'a>(
-    program: &Path,
-    args: impl IntoIterator<Item = &'a str>,
-) -> Result<String, AuditError> {
-    let mut command = Command::new(program);
-    command.args(args);
-    output_command(command)
-}
-
-fn output_program_at<'a>(
-    program: &Path,
     args: impl IntoIterator<Item = &'a str>,
     path: &Path,
 ) -> Result<String, AuditError> {

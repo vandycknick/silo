@@ -152,42 +152,17 @@ plan-compatible default. Do not add entries without an actual decision point.
   linkage and post-link qualification. Rationale: the plan requires native Apple
   final linking, not duplicate toolchain distribution; accepting arbitrary PATH
   tools was neither required nor safe.
-- 2026-07-26, Commit 08 follow-up. Question: Should the auditor reject all
-  temporary paths despite guest `/tmp` runtime state? Options: retain a narrow
-  compiler-prefix list; reject all `/tmp`; or permit guest `/tmp`. Selected
-  default: permit `/tmp` and reject host-specific compiler, package-manager,
-  workspace, and cache paths. Rationale: raw strings cannot distinguish guest
-  runtime paths from build paths, while the link audit independently rejects
-  RPATH contamination.
-- 2026-07-26, Commit 08 qualification. Question: A cold isolated macOS release
-  exceeded the five-minute command limit while acquiring its separate Cargo and
-  Go dependencies; should qualification remain blocked, retry once with the
-  now-warm verified caches, or weaken isolation by reusing development
-  artifacts? Selected default: retry once with the warm isolated caches.
-  Rationale: this distinguishes one-time acquisition cost from build behavior
-  while preserving the release boundary; development artifact reuse is never an
-  acceptable fallback.
-- 2026-07-26, Commit 08 qualification. Question: The aggregate warm-cache
-  retry also exceeded five minutes. Options: leave qualification blocked; prime
-  the identical isolated release target through public component targets; or
-  weaken the boundary by reusing development artifacts. Selected default: prime
-  the identical isolated target component-by-component. Rationale: bounded
-  commands make qualification observable without changing the resulting build
-  graph or release isolation; development artifact reuse is never an acceptable
-  fallback.
-- 2026-07-26, Commit 08 qualification. Question: Stage repeated a fresh
-  isolated build and timed out. Options: leave qualification blocked; repeatedly
-  prime; or safely reuse only a fingerprint-matching isolated release output.
-  Selected default: fingerprint-matching reuse. Rationale: stage/archive
-  transports must consume already built canonical bytes and development objects
-  remain excluded.
-- 2026-07-26, Commit 08 follow-up. Question: Should `make stage` always run
-  runtime audits, should the complete record ambiguously imply audit success, or
-  should auditing write a separate byte-bound qualification record? Selected
-  default: a separate qualification record written only after `verify-runtime`
-  succeeds. Rationale: stage remains an explicit public transport operation,
-  while every later transport command can require proof bound to the exact stage
-  and CLI bytes without treating completion as an audit result.
+- 2026-07-26, Commit 08 correction. Question: Should local release commands
+  retain tamper/fingerprint-ledger clean rebuilds, or use persistent incremental
+  local builds while protected CI starts from a clean workspace and target?
+  Options: tamper/fingerprint clean rebuilds; persistent incremental local
+  builds plus clean CI. Selected: persistent incremental local builds plus clean
+  CI, by explicit user direction: "prioritize fast compilation/recompilation and
+  easy reliable development/package commands; no tamper prevention or
+  picture-perfect auditing." Rationale: Cargo, Go, Zig, and kernel caches are
+  already the correct dependency-aware rebuild mechanism; clean CI runners and
+  targets provide the appropriate release isolation without making every local
+  invocation a cold build.
 
 ### Breaking-Change Policy
 
@@ -1174,8 +1149,9 @@ absolute Nix `libiconv` dependency, so post-link auditing is mandatory.
 Separate development and release environments:
 
 - Development may use the Nix shell normally.
-- Release builds use a clean target directory and never reuse development
-  objects.
+- Local release builds use the persistent `<CARGO_TARGET_DIR>/release` Cargo
+  layout and persistent Go, Zig, and kernel caches. Protected CI begins with a
+  clean workspace and target when isolation is required.
 - On macOS, clear Nix compiler/linker variables and select Apple's native SDK,
   clang, linker, archiver, and deployment target 26.0.
 - Model the clean Apple environment after Ghostty's `nix/devShell.nix` and
@@ -1189,30 +1165,29 @@ Separate development and release environments:
 Add real artifact auditing commands in xtask:
 
 - Inspect every Mach-O dependency and load command.
-- Reject Nix store, Homebrew, MacPorts, workspace, target, and temporary build
-  paths in shipped Mach-O files.
+- Reject Nix store, package-manager, workspace, target, and temporary paths in
+  shipped Mach-O dependencies.
 - Reject unexpected `LC_RPATH` and non-system dylibs.
-- Use exact per-binary system framework and dylib allowlists.
+- Require Mach-O dependencies to resolve from the system framework and dylib
+  locations.
 - Inspect ELF interpreter, `DT_NEEDED`, RPATH, RUNPATH, and symbol versions.
-- Reject Nix store and build-prefix strings in shipped ELF files.
 - Reject required glibc symbol versions newer than 2.39.
 - Reject `libkrun.so` and `libkrun.dylib` dependencies.
 - Verify guest init and agent have no dynamic interpreter or dependencies.
-- Record Go build metadata and compiler/toolchain versions for provenance.
 
 Do not invent fake audit inputs or unit tests for these commands. Run them on
 real release outputs.
 
 ### Acceptance Criteria
 
-- Release builds use a target directory isolated from debug/development builds.
+- Repeated local release builds reuse the normal Cargo, Go, Zig, and kernel
+  caches without automatically clearing a target directory.
 - macOS release binaries contain no `/nix/store` or other non-system load path.
 - Linux release binaries contain no RPATH/RUNPATH or Nix loader path.
 - Linux host binaries require no glibc symbol newer than 2.39.
 - netd's CGo policy is explicit and its final dependencies match that policy.
 - Guest assets are static for their musl targets.
 - krun does not require a distributed libkrun shared library.
-- The auditor rejects a known contaminated binary.
 - A clean release stage passes all audits.
 
 ### Verification
@@ -1229,26 +1204,35 @@ git diff --check
 ### Ghostty Reference Notes
 
 Inspected Ghostty's `nix/devShell.nix`, `nix/package.nix`, `build.zig`,
-`src/build/Config.zig`, and `.github/workflows/release-tag.yml`.
+`src/build/Config.zig`, `src/build/GhosttyDist.zig`, and its test and release
+workflows.
 
-- Reused the clean-native boundary: Ghostty clears Nix SDK/compiler variables
-  before native Apple tooling, keeps Nix development/package concerns separate,
-  and hands its macOS app work to native tooling outside the Nix environment.
-  Silo applies that boundary per release subprocess through `/usr/bin/xcrun`,
-  then qualifies copied output rather than trusting build objects.
+- Reused Ghostty's cache-aware build graph and CI split: local Zig builds reuse
+  their normal caches (including distcheck), while CI starts from a checkout and
+  explicitly restores tool caches. Its macOS shell clears Nix SDK/compiler
+  variables before native Apple tooling, and its release workflow hands native
+  app work to Xcode outside Nix. Silo applies the same native-link boundary per
+  release subprocess through `/usr/bin/xcrun` while retaining compiler caches.
 - Intentionally did not copy Ghostty's Zig typed graph, Swift/Xcode project,
-  XCFramework, Sparkle, or nested-app signing flow. Silo retains Make and Rust
-  xtask, has no Xcode project, and defers app/signing work to later commits.
+  XCFramework, Sparkle, nested-app signing, or Nix package derivation. Silo
+  retains Make and Rust xtask, has no Xcode project, and defers app/signing work
+  to later commits.
 
 ### Implementation Notes
 
-- Release compilation is deleted and rebuilt under
-  `$CARGO_TARGET_DIR/release-build/<target>` for every release invocation.
-  Only validated copies populate the existing adjacent `release/` layout and
-  canonical six-file stage, so Commit 07 paths remain unchanged.
+- Approved deviation: local release compilation uses the persistent normal
+  `$CARGO_TARGET_DIR/release` layout instead of fingerprinted, per-invocation
+  isolated roots. This deliberately removes source/toolchain/output hash
+  ledgers, complete and qualification records, qualification checks, and the
+  synthetic contaminated-binary build. `make stage PROFILE=release` rebuilds
+  incrementally, atomically stages the six canonical files, and validates their
+  layout and modes. `make verify-runtime PROFILE=release` audits practical
+  release correctness, including architecture, platform minimum, runtime
+  dependencies, RPATH, glibc, libkrun, and static guests, but is not a tamper
+  prevention mechanism.
 - Linux release commands verify a native matching Docker daemon, build the
   digest-pinned architecture-specific Bake target, and run the requested Make
-  command in that image with a read-only workspace, writable isolated target,
+  command in that image with a read-only workspace, writable persistent target,
   and Docker-managed compiler/module cache. The internal marker prevents the
   container command from entering Docker again; a missing daemon fails closed.
 - macOS release subprocesses clear Nix/compiler/SDK/package-config variables,
@@ -1259,18 +1243,17 @@ Inspected Ghostty's `nix/devShell.nix`, `nix/package.nix`, `build.zig`,
   `netd` is built with `CGO_ENABLED=0`, `-trimpath`, `-buildvcs=true`, and
   `-ldflags=-s -w`.
 - `make verify-runtime PROFILE=release` audits actual adjacent, staged, and
-  guest artifacts. It requires exact ELF loaders and needed libraries, checks
-  Mach-O arm64/minimum-OS/load paths, reads the shipped gzip/newc initramfs and
-  compares its init byte-for-byte with the generated input, and records actual
-  tool paths, versions, archive digests, and Go module metadata outside the
-  runtime root. It builds a real CLI with an injected RPATH and requires the
-  auditor to reject that exact condition on both host families.
+  guest artifacts. It requires supported ELF loaders and dependencies, checks
+  Mach-O arm64/minimum-OS/system load paths, and reads the shipped gzip/newc
+  initramfs to confirm it contains the current static guest init.
 - `release/Containerfile`, `docker-bake.hcl`, and `toolchains.toml` define the
   digest-pinned Ubuntu 24.04/glibc 2.39 native Linux environment. The container
   validates toolchain-record values, verifies Rustup, Go, Zig, cargo-zigbuild,
   and ORAS downloads, then checks installed versions and architecture before
-  use. Docker execution remains a native Linux CI/builder gate when unavailable
-  on the local host.
+  use. Kernel resolution is cache-first; `KERNEL_REFRESH=1` updates a mutable
+  reference, while `KERNEL_OFFLINE=1` and `KERNEL_PATH` remain explicit options.
+  Docker execution remains a native Linux CI/builder gate when unavailable on
+  the local host.
 
 ## Commit 09: Produce Common Release Archives And Metadata
 

@@ -1,14 +1,10 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::Args;
-use nix::errno::Errno;
-use nix::fcntl::{open, OFlag};
-use nix::sys::stat::Mode;
-use nix::unistd::geteuid;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -35,11 +31,12 @@ pub struct KernelOptions {
     path: Option<PathBuf>,
     #[arg(long)]
     offline: bool,
+    #[arg(long)]
+    refresh: bool,
 }
 
 pub struct KernelArtifact {
     pub path: PathBuf,
-    pub identity: Value,
 }
 
 impl KernelOptions {
@@ -53,6 +50,10 @@ impl KernelOptions {
 
     pub fn offline(&self) -> bool {
         self.offline
+    }
+
+    pub fn refresh(&self) -> bool {
+        self.refresh
     }
 }
 
@@ -116,8 +117,6 @@ pub enum KernelError {
     LocalPathNotAbsolute { path: PathBuf },
     #[error("kernel path is not a regular non-symlink file: {path}")]
     UnsafeLocalPath { path: PathBuf },
-    #[error("offline kernel reference record is unsafe: {path}")]
-    UnsafeReferenceRecord { path: PathBuf },
 }
 
 pub fn resolve(
@@ -132,7 +131,7 @@ pub fn resolve(
         None => resolve_oci_kernel(context, &cache_root, options)?,
     };
     write_provenance(context, &identity)?;
-    Ok(KernelArtifact { path, identity })
+    Ok(KernelArtifact { path })
 }
 
 fn resolve_local_kernel(
@@ -187,7 +186,7 @@ fn resolve_oci_kernel(
             .unwrap_or(&reference_key),
     );
 
-    let index_descriptor = if options.offline {
+    let index_descriptor = if options.offline || (!options.refresh() && reference_record.exists()) {
         read_reference_record(&reference_record, reference, context)?
     } else {
         let descriptor = fetch_manifest_descriptor(reference)?;
@@ -200,6 +199,7 @@ fn resolve_oci_kernel(
         let repository = repository(reference)?;
         let immutable_reference = format!("{repository}@{}", descriptor.digest);
         let _ = fetch_or_cached_manifest(cache_root, &descriptor, &immutable_reference, false)?;
+        write_reference_record(&reference_record, reference, context, &descriptor)?;
         descriptor
     };
 
@@ -237,10 +237,6 @@ fn resolve_oci_kernel(
     let kernel_path = kernel_path.ok_or_else(|| {
         KernelError::Invalid("OCI manifest has no validated kernel layer".to_string())
     })?;
-
-    if !options.offline {
-        write_reference_record(&reference_record, reference, context, &index_descriptor)?;
-    }
 
     Ok((
         kernel_path,
@@ -659,7 +655,7 @@ fn write_reference_record(
             },
             "index": index.value.clone(),
         }),
-        0o600,
+        0o644,
     )
 }
 
@@ -668,13 +664,9 @@ fn read_reference_record(
     reference: &str,
     context: &BuildContext<'_>,
 ) -> Result<Descriptor, KernelError> {
-    let fd = match open(
-        path,
-        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::ENOENT) => {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             return Err(KernelError::OfflineCacheMiss {
                 reference: reference.to_string(),
             });
@@ -682,29 +674,10 @@ fn read_reference_record(
         Err(source) => {
             return Err(KernelError::Read {
                 path: path.to_path_buf(),
-                source: std::io::Error::from_raw_os_error(source as i32),
+                source,
             });
         }
     };
-    let mut file = File::from(fd);
-    let metadata = file.metadata().map_err(|source| KernelError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !metadata.is_file()
-        || metadata.uid() != geteuid().as_raw()
-        || metadata.permissions().mode() & 0o777 != 0o600
-    {
-        return Err(KernelError::UnsafeReferenceRecord {
-            path: path.to_path_buf(),
-        });
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|source| KernelError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
     let record = parse_json(&bytes, "offline reference record")?;
     if required_string(&record, "reference", "offline reference record")? != reference {
         return Err(KernelError::OfflineCacheMiss {
