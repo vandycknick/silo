@@ -13,7 +13,7 @@ criteria pass, then include the tracker update in the same commit as the
 implementation.
 
 - [x] Commit 01: Correct and finalize ADR 0012
-- [ ] Commit 02: Reset the SQL schema and durable root identity
+- [x] Commit 02: Reset the SQL schema and durable root identity
 - [ ] Commit 03: Split data, state, and run paths securely
 - [ ] Commit 04: Centralize runtime component resolution
 - [ ] Commit 05: Remove late helper and asset discovery
@@ -511,6 +511,18 @@ cargo test -p libvm runtime::config
 make clippy
 git diff --check
 ```
+
+### Implementation Notes
+
+- `runtime/libvm/migrations/0001_initial.sql` is the sole plain-CREATE baseline;
+  it includes the final image and rootfs schema without the old vznat rewrite.
+- `state_root` is durable database identity but currently defaults to `data_root`.
+  Commit 03 owns the filesystem split.
+- Network runtime placement is derived from `LocalPaths::network(network_id)`;
+  database rows contain no runtime directory or absolute runtime paths.
+- Fresh-database coverage includes schema objects, durable-root conflicts, changed
+  run-root reopening, and reconciliation cleanup. `cargo test -p libvm network`
+  was also run for the real cleanup path.
 
 ## Commit 03: Split Data, State, And Run Paths Securely
 

@@ -22,6 +22,8 @@ pub enum PathChoice {
 pub struct RuntimeConfig {
     /// Root containing persistent machine metadata and host-local assets.
     pub data_root: PathChoice,
+    /// Root containing durable operational state.
+    pub state_root: PathChoice,
     /// Root containing host-runtime state such as locks and network sockets.
     pub run_root: PathChoice,
     /// Root containing unpacked machine images.
@@ -37,6 +39,7 @@ impl RuntimeConfig {
     pub fn local(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_root: PathChoice::Explicit(data_dir.into()),
+            state_root: PathChoice::Default,
             run_root: PathChoice::Default,
             image_root: PathChoice::Default,
             networking: RuntimeNetworkingConfig::default(),
@@ -53,6 +56,12 @@ impl RuntimeConfig {
     /// Sets the local runtime root.
     pub fn with_run_root(mut self, run_root: impl Into<PathBuf>) -> Self {
         self.run_root = PathChoice::Explicit(run_root.into());
+        self
+    }
+
+    /// Sets the durable operational state root.
+    pub fn with_state_root(mut self, state_root: impl Into<PathBuf>) -> Self {
+        self.state_root = PathChoice::Explicit(state_root.into());
         self
     }
 
@@ -75,21 +84,17 @@ impl RuntimeConfig {
     }
 
     pub(crate) fn resolve_roots(&self) -> Result<LocalRoots, LibVmError> {
-        let data_root = self.bootstrap_data_root()?;
-        let run_root = match &self.run_root {
-            PathChoice::Default => resolve_default_run_dir(&data_root)?,
-            PathChoice::Explicit(path) => path.clone(),
-        };
-        let image_root = match &self.image_root {
-            PathChoice::Default => data_root.join("images"),
-            PathChoice::Explicit(path) => path.clone(),
-        };
-        Ok(LocalRoots::with_roots(data_root, run_root, image_root))
+        let (data_root, state_root, image_root) = self.resolve_durable_roots()?;
+        let run_root = self.resolve_run_root(&data_root)?;
+        Ok(LocalRoots::with_roots(
+            data_root, state_root, run_root, image_root,
+        ))
     }
 
     pub(crate) fn bootstrap_paths(&self) -> Result<LocalPaths, LibVmError> {
         let data_root = self.bootstrap_data_root()?;
         let roots = LocalRoots::with_roots(
+            data_root.clone(),
             data_root.clone(),
             data_root.join("run"),
             data_root.join("images"),
@@ -110,9 +115,11 @@ impl RuntimeConfig {
         opened_db_path: &Path,
     ) -> Result<LocalRoots, LibVmError> {
         validate_db_config_header(stored)?;
-        let roots = merge_roots(self, stored)?;
+        let (data_root, state_root, image_root) = merge_durable_roots(self, stored)?;
+        let run_root = self.resolve_run_root(&data_root)?;
+        let roots = LocalRoots::with_roots(data_root, state_root, run_root, image_root);
         validate_roots_absolute(&roots)?;
-        validate_roots_match_config(&roots, stored)?;
+        validate_durable_roots_match_config(&roots, stored)?;
         compare_path("state_db_path", &roots.state_db_path(), opened_db_path)?;
         Ok(roots)
     }
@@ -123,25 +130,45 @@ impl RuntimeConfig {
             PathChoice::Explicit(path) => Ok(path.clone()),
         }
     }
+
+    fn resolve_durable_roots(&self) -> Result<(PathBuf, PathBuf, PathBuf), LibVmError> {
+        let data_root = self.bootstrap_data_root()?;
+        let state_root = match &self.state_root {
+            PathChoice::Default => data_root.clone(),
+            PathChoice::Explicit(path) => path.clone(),
+        };
+        let image_root = match &self.image_root {
+            PathChoice::Default => data_root.join("images"),
+            PathChoice::Explicit(path) => path.clone(),
+        };
+        Ok((data_root, state_root, image_root))
+    }
+
+    fn resolve_run_root(&self, data_root: &Path) -> Result<PathBuf, LibVmError> {
+        match &self.run_root {
+            PathChoice::Default => resolve_default_run_dir(data_root),
+            PathChoice::Explicit(path) => Ok(path.clone()),
+        }
+    }
 }
 
 fn validate_db_config_header(config: &DbConfig) -> Result<(), LibVmError> {
     compare_str("os", OS, &config.os)
 }
 
-fn merge_roots(
+fn merge_durable_roots(
     runtime_config: &RuntimeConfig,
     stored: &DbConfig,
-) -> Result<LocalRoots, LibVmError> {
+) -> Result<(PathBuf, PathBuf, PathBuf), LibVmError> {
     let data_root = merge_root(
         "data_root",
         &runtime_config.data_root,
         Path::new(&stored.data_root),
     )?;
-    let run_root = merge_root(
-        "run_root",
-        &runtime_config.run_root,
-        Path::new(&stored.run_root),
+    let state_root = merge_root(
+        "state_root",
+        &runtime_config.state_root,
+        Path::new(&stored.state_root),
     )?;
     let image_root = merge_root(
         "image_root",
@@ -149,7 +176,7 @@ fn merge_roots(
         Path::new(&stored.image_root),
     )?;
 
-    Ok(LocalRoots::with_roots(data_root, run_root, image_root))
+    Ok((data_root, state_root, image_root))
 }
 
 fn merge_root(
@@ -166,9 +193,16 @@ fn merge_root(
     }
 }
 
-fn validate_roots_match_config(roots: &LocalRoots, config: &DbConfig) -> Result<(), LibVmError> {
+fn validate_durable_roots_match_config(
+    roots: &LocalRoots,
+    config: &DbConfig,
+) -> Result<(), LibVmError> {
     compare_path("data_root", roots.data_root(), Path::new(&config.data_root))?;
-    compare_path("run_root", roots.run_root(), Path::new(&config.run_root))?;
+    compare_path(
+        "state_root",
+        roots.state_root(),
+        Path::new(&config.state_root),
+    )?;
     compare_path(
         "image_root",
         roots.image_root(),
@@ -178,6 +212,7 @@ fn validate_roots_match_config(roots: &LocalRoots, config: &DbConfig) -> Result<
 
 fn validate_roots_absolute(roots: &LocalRoots) -> Result<(), LibVmError> {
     validate_absolute_path("data_root", roots.data_root())?;
+    validate_absolute_path("state_root", roots.state_root())?;
     validate_absolute_path("run_root", roots.run_root())?;
     validate_absolute_path("image_root", roots.image_root())
 }
@@ -252,6 +287,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             data_root: PathChoice::Default,
+            state_root: PathChoice::Default,
             run_root: PathChoice::Default,
             image_root: PathChoice::Default,
             networking: RuntimeNetworkingConfig::default(),
@@ -343,23 +379,34 @@ impl NetdRuntimeConfig {
 #[cfg(test)]
 mod tests {
     use crate::paths::LocalRoots;
-    use crate::store::models::DbConfig;
-    use crate::{LibVmError, RuntimeConfig};
+    use crate::store::{ConfigStore, Store};
+    use crate::{LibVmError, Runtime, RuntimeConfig};
 
-    fn stored_config(data_root: &std::path::Path) -> (DbConfig, LocalRoots) {
+    fn stored_config(data_root: &std::path::Path) -> LocalRoots {
         let roots = LocalRoots::with_roots(
             data_root,
+            data_root
+                .parent()
+                .expect("data root parent")
+                .join("state-root"),
             data_root.parent().unwrap().join("runtime-root"),
             data_root.parent().unwrap().join("image-root"),
         );
-        (DbConfig::from_roots(&roots), roots)
+        roots
     }
 
     #[test]
     fn db_config_merges_default_roots_from_existing_contract() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let data_root = temp.path().join("silo");
-        let (stored, expected_roots) = stored_config(&data_root);
+        let stored_roots = stored_config(&data_root);
+        let stored = crate::store::models::DbConfig::from_roots(&stored_roots);
+        let expected_roots = LocalRoots::with_roots(
+            &data_root,
+            stored_roots.state_root(),
+            data_root.join("run"),
+            stored_roots.image_root(),
+        );
 
         let roots = RuntimeConfig::local(&data_root)
             .resolve_store_roots(&stored, &data_root.join("state.db"))
@@ -369,25 +416,19 @@ mod tests {
     }
 
     #[test]
-    fn db_config_rejects_explicit_root_mismatch() {
+    fn db_config_exempts_run_root_from_stored_identity() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let data_root = temp.path().join("silo");
-        let image_root = temp.path().join("image-root");
-        let (stored, _) = stored_config(&data_root);
+        let stored_roots = stored_config(&data_root);
+        let stored = crate::store::models::DbConfig::from_roots(&stored_roots);
+        let run_root = temp.path().join("other-runtime-root");
 
-        let err = RuntimeConfig::local(&data_root)
+        let roots = RuntimeConfig::local(&data_root)
             .with_run_root(temp.path().join("other-runtime-root"))
-            .with_image_root(&image_root)
             .resolve_store_roots(&stored, &data_root.join("state.db"))
-            .expect_err("explicit run root mismatch should fail");
+            .expect("explicit run root should not be compared with stored roots");
 
-        assert!(matches!(
-            err,
-            LibVmError::StateDatabaseConfigMismatch {
-                field: "run_root",
-                ..
-            }
-        ));
+        assert_eq!(roots.run_root(), run_root);
     }
 
     #[test]
@@ -409,7 +450,8 @@ mod tests {
     fn db_config_rejects_state_db_path_mismatch() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let data_root = temp.path().join("silo");
-        let (stored, _) = stored_config(&data_root);
+        let stored_roots = stored_config(&data_root);
+        let stored = crate::store::models::DbConfig::from_roots(&stored_roots);
 
         let err = RuntimeConfig::local(&data_root)
             .resolve_store_roots(&stored, &temp.path().join("other-state.db"))
@@ -422,5 +464,81 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn fresh_database_rejects_conflicting_durable_roots() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_root = temp.path().join("data");
+        let state_root = temp.path().join("state");
+        let image_root = temp.path().join("images");
+        let config = RuntimeConfig::local(&data_root)
+            .with_state_root(&state_root)
+            .with_image_root(&image_root)
+            .with_run_root(temp.path().join("run-a"));
+        let store = Store::open(&data_root.join("state.db"))
+            .await
+            .expect("open fresh database");
+        let stored = store
+            .read_or_seed_db_config(&config.seed_db_config().expect("seed config"))
+            .await
+            .expect("seed fresh database");
+
+        for (field, conflicting) in [
+            (
+                "data_root",
+                RuntimeConfig::local(temp.path().join("other-data"))
+                    .with_state_root(&state_root)
+                    .with_image_root(&image_root),
+            ),
+            (
+                "state_root",
+                RuntimeConfig::local(&data_root)
+                    .with_state_root(temp.path().join("other-state"))
+                    .with_image_root(&image_root),
+            ),
+            (
+                "image_root",
+                RuntimeConfig::local(&data_root)
+                    .with_state_root(&state_root)
+                    .with_image_root(temp.path().join("other-images")),
+            ),
+        ] {
+            let err = conflicting
+                .resolve_store_roots(&stored, &data_root.join("state.db"))
+                .expect_err("conflicting durable root should fail");
+            assert!(matches!(
+                err,
+                LibVmError::StateDatabaseConfigMismatch { field: actual, .. } if actual == field
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_reopens_fresh_database_with_a_new_run_root() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_root = temp.path().join("data");
+        let state_root = temp.path().join("state");
+        let image_root = temp.path().join("images");
+        let first_run_root = temp.path().join("run-a");
+        let second_run_root = temp.path().join("run-b");
+        let first = RuntimeConfig::local(&data_root)
+            .with_state_root(&state_root)
+            .with_image_root(&image_root)
+            .with_run_root(&first_run_root);
+
+        let runtime = Runtime::new(first).await.expect("open fresh runtime");
+        assert_eq!(runtime.local_paths().roots().run_root(), first_run_root);
+        drop(runtime);
+
+        let runtime = Runtime::new(
+            RuntimeConfig::local(&data_root)
+                .with_state_root(&state_root)
+                .with_image_root(&image_root)
+                .with_run_root(&second_run_root),
+        )
+        .await
+        .expect("reopen with a changed run root");
+        assert_eq!(runtime.local_paths().roots().run_root(), second_run_root);
     }
 }

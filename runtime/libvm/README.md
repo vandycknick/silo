@@ -37,19 +37,20 @@ The main shapes are:
 ## Runtime Roots
 
 The first runtime open resolves root defaults from process configuration,
-creates `state.db`, and stores the resolved root contract in `db_config`. Later
-opens use that row to keep existing installs stable even if code defaults change.
+creates `state.db`, and stores the durable root contract in `db_config`.
+Later opens require explicit durable roots to match that contract. The run root
+is resolved again for each open and is intentionally not database identity.
 
 The persisted root contract stores only main roots:
 
 - `data_root`: durable manager state. `state.db`, machines, assets, keys, and
   `secrets.json` derive from this root.
-- `run_root`: transient runtime state. Locks and network runtime directories
-  derive from this root.
+- `state_root`: durable operational state. It currently defaults to `data_root`;
+  the state/run filesystem split is completed separately from this schema reset.
 - `image_root`: local image and cache storage.
 
 `db_config` is a singleton row with `id = 1`. It records the host `os`,
-`data_root`, `run_root`, `image_root`, `created_at`, and `modified_at`. Derived
+`data_root`, `state_root`, `image_root`, `created_at`, and `modified_at`. Derived
 paths are not duplicated in the row unless they become independently
 configurable. The derivation is:
 
@@ -63,6 +64,13 @@ configurable. The derivation is:
 | `images/`      | `image_root`             |
 | `locks/`       | `run_root/locks`         |
 | `net/`         | `run_root/net`           |
+
+### State Database Reset
+
+This release has one new database baseline and does not upgrade old migration
+history. With every Silo process stopped, manually archive or remove an existing
+`state.db` before opening the new runtime. Silo does not adopt old database or
+runtime files.
 
 ## Lifecycle States
 

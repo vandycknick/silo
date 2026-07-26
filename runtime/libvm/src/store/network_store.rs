@@ -28,7 +28,7 @@ impl NetworkStore for Store {
         network_id: &str,
     ) -> Result<Option<NetworkInstance>, LibVmError> {
         let instance = sqlx::query_as::<_, DbNetworkInstance>(
-            "SELECT id, driver, definition_name, runtime_dir, json(attachment_json) AS attachment_json,
+            "SELECT id, driver, definition_name, json(attachment_json) AS attachment_json,
                     json(driver_state_json) AS driver_state_json, state, created_at, modified_at
              FROM network_instances WHERE id = ?1",
         )
@@ -41,14 +41,13 @@ impl NetworkStore for Store {
     async fn save_network_instance(&self, instance: &NetworkInstance) -> Result<(), LibVmError> {
         sqlx::query(
             "INSERT INTO network_instances
-                (id, driver, definition_name, runtime_dir, attachment_json, driver_state_json,
+                (id, driver, definition_name, attachment_json, driver_state_json,
                  state, created_at, modified_at)
-             VALUES (?1, ?2, ?3, ?4, jsonb(?5), jsonb(?6), ?7, ?8, ?9)
+             VALUES (?1, ?2, ?3, jsonb(?4), jsonb(?5), ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
-                driver = excluded.driver,
-                definition_name = excluded.definition_name,
-                runtime_dir = excluded.runtime_dir,
-                attachment_json = excluded.attachment_json,
+                 driver = excluded.driver,
+                 definition_name = excluded.definition_name,
+                 attachment_json = excluded.attachment_json,
                 driver_state_json = excluded.driver_state_json,
                 state = excluded.state,
                 modified_at = excluded.modified_at",
@@ -56,7 +55,6 @@ impl NetworkStore for Store {
         .bind(&instance.id)
         .bind(&instance.driver)
         .bind(&instance.definition_name)
-        .bind(&instance.runtime_dir)
         .bind(&instance.attachment_json)
         .bind(&instance.driver_state_json)
         .bind(instance.state.as_str())

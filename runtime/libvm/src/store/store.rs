@@ -57,7 +57,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
     use vm_spec::{Hardware, VmSpec};
@@ -133,7 +133,6 @@ mod tests {
             id: id.to_string(),
             driver: "netd".to_string(),
             definition_name: definition_name.map(str::to_string),
-            runtime_dir: format!("/tmp/{id}"),
             attachment_json: r#"{"kind":"none"}"#.to_string(),
             driver_state_json: r#"{"helper_pid":1234}"#.to_string(),
             state: NetworkInstanceState::Running,
@@ -173,8 +172,8 @@ mod tests {
 
         let result = sqlx::query(
             "INSERT INTO db_config
-                (id, os, data_root, run_root, image_root, created_at, modified_at)
-             VALUES (2, 'linux', '/tmp/other', '/tmp/other/run', '/tmp/other/images', 1, 1)",
+                (id, os, data_root, state_root, image_root, created_at, modified_at)
+             VALUES (2, 'linux', '/tmp/other', '/tmp/other/state', '/tmp/other/images', 1, 1)",
         )
         .execute(&db.pool)
         .await;
@@ -200,10 +199,99 @@ mod tests {
 
         assert_eq!(config.data_root, paths.data_dir().display().to_string());
         assert_eq!(
-            config.run_root,
-            paths.roots().run_root().display().to_string()
+            config.state_root,
+            paths.roots().state_root().display().to_string()
         );
         assert_eq!(config.image_root, paths.images_dir().display().to_string());
+    }
+
+    #[tokio::test]
+    async fn fresh_database_has_complete_schema_without_runtime_paths() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open fresh database");
+
+        let tables = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("list tables")
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let required_tables = BTreeSet::from([
+            "db_config".to_string(),
+            "machine_config".to_string(),
+            "machine_state".to_string(),
+            "network_instances".to_string(),
+            "network_attachments".to_string(),
+            "network_definitions".to_string(),
+            "image_manifest".to_string(),
+            "image_ref".to_string(),
+            "image_config".to_string(),
+            "image_layer".to_string(),
+            "image_manifest_layer".to_string(),
+            "image_rootfs_artifact".to_string(),
+            "machine_rootfs".to_string(),
+        ]);
+        assert!(required_tables.is_subset(&tables));
+
+        let db_config_columns = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM pragma_table_info('db_config') ORDER BY cid",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("list db_config columns");
+        assert_eq!(
+            db_config_columns,
+            [
+                "id",
+                "os",
+                "data_root",
+                "state_root",
+                "image_root",
+                "created_at",
+                "modified_at",
+            ]
+        );
+
+        let network_columns = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM pragma_table_info('network_instances') ORDER BY cid",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("list network instance columns");
+        assert!(!network_columns.iter().any(|column| column == "runtime_dir"));
+
+        let schema_objects = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master WHERE type IN ('index', 'trigger')",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("list indexes and triggers")
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        for object in [
+            "network_instances_definition_name_unique",
+            "image_ref_manifest_digest_idx",
+            "image_manifest_layer_layer_diff_id_idx",
+            "image_rootfs_artifact_manifest_digest_idx",
+            "machine_rootfs_manifest_digest_idx",
+            "db_config_created_at_immutable",
+            "network_instances_created_at_immutable",
+            "network_attachments_created_at_immutable",
+            "network_definitions_created_at_immutable",
+            "image_manifest_created_at_immutable",
+            "image_ref_created_at_immutable",
+            "image_config_created_at_immutable",
+            "image_layer_created_at_immutable",
+            "image_rootfs_artifact_created_at_immutable",
+            "machine_rootfs_created_at_immutable",
+        ] {
+            assert!(
+                schema_objects.contains(object),
+                "missing schema object {object}"
+            );
+        }
     }
 
     #[tokio::test]

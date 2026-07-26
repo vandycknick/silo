@@ -50,10 +50,15 @@ pub(super) struct NetdDriver;
 struct NetdDriverState {
     helper_pid: i32,
     subnet: String,
-    socket_path: PathBuf,
-    log_path: PathBuf,
-    pid_path: PathBuf,
-    pcap_path: Option<PathBuf>,
+    pcap: bool,
+}
+
+#[derive(Serialize)]
+struct PersistedNetworkAttachment {
+    mac: String,
+    ipv4: NetworkIpv4Config,
+    dns: NetworkDnsConfig,
+    requires_certificate_authority: bool,
 }
 
 #[async_trait]
@@ -207,13 +212,21 @@ async fn prepare_netd_runtime(
         dns,
         requires_certificate_authority,
     };
+    let (ipv4, dns) = match &network {
+        super::VmmonNetworkAttachment::UnixDatagram { ipv4, dns, .. } => {
+            (ipv4.clone(), dns.clone())
+        }
+        super::VmmonNetworkAttachment::None => {
+            return Err(LibVmError::NetworkRuntime {
+                reference: metadata.name.clone(),
+                message: "netd created an invalid network attachment".to_string(),
+            });
+        }
+    };
     let driver_state = NetdDriverState {
         helper_pid: pid,
         subnet: config.subnet.clone(),
-        socket_path: socket_path.clone(),
-        log_path: log_path.clone(),
-        pid_path: pid_path.clone(),
-        pcap_path: pcap_path.clone(),
+        pcap: config.pcap,
     };
     let now = now_unix();
     store
@@ -221,8 +234,15 @@ async fn prepare_netd_runtime(
             id: network_id.clone(),
             driver: DRIVER_NETD.to_string(),
             definition_name: None,
-            runtime_dir: runtime_dir.display().to_string(),
-            attachment_json: serialize_json(&network, "network attachment")?,
+            attachment_json: serialize_json(
+                &PersistedNetworkAttachment {
+                    mac: mac.clone(),
+                    ipv4,
+                    dns,
+                    requires_certificate_authority,
+                },
+                "network attachment",
+            )?,
             driver_state_json: serialize_json(&driver_state, "netd driver state")?,
             state: NetworkInstanceState::Running,
             created_at: now,

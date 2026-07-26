@@ -35,14 +35,14 @@ impl Store {
         let now = now_unix();
         sqlx::query(
             "INSERT INTO db_config
-                (id, os, data_root, run_root, image_root, created_at, modified_at)
+                (id, os, data_root, state_root, image_root, created_at, modified_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(DB_CONFIG_ID)
         .bind(&seed.os)
         .bind(&seed.data_root)
-        .bind(&seed.run_root)
+        .bind(&seed.state_root)
         .bind(&seed.image_root)
         .bind(now)
         .execute(&self.pool)
@@ -52,7 +52,7 @@ impl Store {
 
     async fn read_db_configs(&self) -> Result<Vec<DbConfig>, LibVmError> {
         let rows = sqlx::query(
-            "SELECT os, data_root, run_root, image_root
+            "SELECT os, data_root, state_root, image_root
              FROM db_config",
         )
         .fetch_all(&self.pool)
@@ -63,7 +63,7 @@ impl Store {
                 Ok(DbConfig {
                     os: row.try_get("os")?,
                     data_root: row.try_get("data_root")?,
-                    run_root: row.try_get("run_root")?,
+                    state_root: row.try_get("state_root")?,
                     image_root: row.try_get("image_root")?,
                 })
             })

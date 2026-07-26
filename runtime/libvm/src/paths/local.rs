@@ -15,6 +15,7 @@ const LOCKS_DIR_NAME: &str = "locks";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalRoots {
     data_root: PathBuf,
+    state_root: PathBuf,
     run_root: PathBuf,
     image_root: PathBuf,
 }
@@ -23,18 +24,21 @@ impl LocalRoots {
     #[cfg(test)]
     pub(crate) fn new(data_root: impl Into<PathBuf>) -> Self {
         let data_root = data_root.into();
+        let state_root = data_root.clone();
         let run_root = data_root.join("run");
         let image_root = data_root.join(IMAGES_DIR_NAME);
-        Self::with_roots(data_root, run_root, image_root)
+        Self::with_roots(data_root, state_root, run_root, image_root)
     }
 
     pub(crate) fn with_roots(
         data_root: impl Into<PathBuf>,
+        state_root: impl Into<PathBuf>,
         run_root: impl Into<PathBuf>,
         image_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
             data_root: data_root.into(),
+            state_root: state_root.into(),
             run_root: run_root.into(),
             image_root: image_root.into(),
         }
@@ -42,9 +46,12 @@ impl LocalRoots {
 
     pub(crate) fn from_env() -> Result<Self, LibVmError> {
         let data_root = resolve_default_data_dir()?;
+        let state_root = data_root.clone();
         let run_root = resolve_default_run_dir(&data_root)?;
         let image_root = data_root.join(IMAGES_DIR_NAME);
-        Ok(Self::with_roots(data_root, run_root, image_root))
+        Ok(Self::with_roots(
+            data_root, state_root, run_root, image_root,
+        ))
     }
 
     pub(crate) fn data_root(&self) -> &Path {
@@ -57,6 +64,10 @@ impl LocalRoots {
 
     pub(crate) fn run_root(&self) -> &Path {
         &self.run_root
+    }
+
+    pub(crate) fn state_root(&self) -> &Path {
+        &self.state_root
     }
 
     pub(crate) fn image_root(&self) -> &Path {
@@ -190,10 +201,18 @@ mod tests {
 
     #[test]
     fn local_roots_use_explicit_run_and_image_roots() {
-        let roots =
-            LocalRoots::with_roots("/tmp/silo", "/run/user/501/silo", "/var/lib/silo/images");
+        let roots = LocalRoots::with_roots(
+            "/tmp/silo",
+            "/var/lib/silo/state",
+            "/run/user/501/silo",
+            "/var/lib/silo/images",
+        );
 
         assert_eq!(roots.data_dir(), PathBuf::from("/tmp/silo").as_path());
+        assert_eq!(
+            roots.state_root(),
+            PathBuf::from("/var/lib/silo/state").as_path()
+        );
         assert_eq!(
             roots.run_root(),
             PathBuf::from("/run/user/501/silo").as_path()

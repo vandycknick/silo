@@ -48,6 +48,12 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Sets the durable operational state root.
+    pub fn state_root(mut self, state_root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_state_root(state_root);
+        self
+    }
+
     /// Sets the image root.
     pub fn image_root(mut self, image_root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_image_root(image_root);

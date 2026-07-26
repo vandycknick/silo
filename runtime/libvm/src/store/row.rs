@@ -97,7 +97,6 @@ impl<'row> FromRow<'row, SqliteRow> for DbNetworkInstance {
             id: row.try_get("id")?,
             driver: row.try_get("driver")?,
             definition_name: row.try_get("definition_name")?,
-            runtime_dir: row.try_get("runtime_dir")?,
             attachment_json: row.try_get("attachment_json")?,
             driver_state_json: row.try_get("driver_state_json")?,
             state: parse_network_instance_state(row.try_get("state")?)?,

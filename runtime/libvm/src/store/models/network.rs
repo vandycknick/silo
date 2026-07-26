@@ -13,7 +13,6 @@ pub(crate) struct NetworkInstance {
     pub id: String,
     pub driver: String,
     pub definition_name: Option<String>,
-    pub runtime_dir: String,
     pub attachment_json: String,
     pub driver_state_json: String,
     pub state: NetworkInstanceState,

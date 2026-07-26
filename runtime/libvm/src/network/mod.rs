@@ -130,7 +130,7 @@ pub(crate) async fn reconcile_network_runtime(
     };
 
     if monitor_running && network_instance_is_alive(&instance) {
-        ensure_instance_network_link(paths, metadata.id, Path::new(&instance.runtime_dir))?;
+        ensure_instance_network_link(paths, metadata.id, paths.network(&instance.id).dir())?;
         return Ok(());
     }
 
@@ -139,7 +139,7 @@ pub(crate) async fn reconcile_network_runtime(
     if store.network_attachment_count(&instance.id).await? == 0 {
         terminate_network_instance(&instance)?;
         store.remove_network_instance(&instance.id).await?;
-        remove_runtime_dir(Path::new(&instance.runtime_dir))?;
+        remove_runtime_dir(paths.network(&instance.id).dir())?;
     }
     Ok(())
 }
@@ -188,7 +188,7 @@ pub(super) async fn remove_attached_network(
         if store.network_attachment_count(&instance.id).await? == 0 {
             terminate_network_instance(&instance)?;
             store.remove_network_instance(&instance.id).await?;
-            remove_runtime_dir(Path::new(&instance.runtime_dir))?;
+            remove_runtime_dir(paths.network(&instance.id).dir())?;
         }
     }
     Ok(())
@@ -295,15 +295,15 @@ mod tests {
     use vm_spec::VmSpec;
 
     use crate::lock_manager::LockId;
-    use crate::paths::LocalPaths;
+    use crate::paths::{LocalPaths, LocalRoots};
     use crate::store::models::MachineId;
     use crate::store::models::{
-        MachineConfig, MachineNetworkConfig as ModelMachineNetworkConfig, NetworkAttachment,
-        NetworkDefinition as ModelNetworkDefinition,
+        MachineConfig, MachineNetworkConfig as ModelMachineNetworkConfig, MachineRuntimeState,
+        MachineState, NetworkAttachment, NetworkDefinition as ModelNetworkDefinition,
         NetworkDriverPreference as ModelNetworkDriverPreference, NetworkInstance,
         NetworkInstanceState, NetworkTopology as ModelNetworkTopology,
     };
-    use crate::store::MockDataStore;
+    use crate::store::{MachineStore, MockDataStore, NetworkStore, Store};
     use crate::{LibVmError, RuntimeNetworkingConfig};
 
     use super::{
@@ -344,12 +344,11 @@ mod tests {
         }
     }
 
-    fn instance(id: &str, runtime_dir: &std::path::Path) -> NetworkInstance {
+    fn instance(id: &str) -> NetworkInstance {
         NetworkInstance {
             id: id.to_string(),
             driver: "removed-driver".to_string(),
             definition_name: None,
-            runtime_dir: runtime_dir.display().to_string(),
             attachment_json: r#"{"kind":"none"}"#.to_string(),
             driver_state_json: "{}".to_string(),
             state: NetworkInstanceState::Running,
@@ -442,12 +441,12 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp dir");
         let paths = LocalPaths::new(temp.path().join("silo"));
         let machine_id = MachineId::new();
-        let runtime_dir = temp.path().join("runtime-dir");
+        let runtime_dir = paths.network("net-1").dir().to_path_buf();
         std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
         std::fs::create_dir_all(paths.machine(machine_id).dir()).expect("create machine dir");
         ensure_instance_network_link(&paths, machine_id, &runtime_dir)
             .expect("create network link");
-        let instance = instance("net-1", &runtime_dir);
+        let instance = instance("net-1");
         let metadata = machine_config(
             &paths,
             machine_id,
@@ -498,12 +497,12 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp dir");
         let paths = LocalPaths::new(temp.path().join("silo"));
         let machine_id = MachineId::new();
-        let runtime_dir = temp.path().join("shared-runtime-dir");
+        let runtime_dir = paths.network("net-1").dir().to_path_buf();
         std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
         std::fs::create_dir_all(paths.machine(machine_id).dir()).expect("create machine dir");
         ensure_instance_network_link(&paths, machine_id, &runtime_dir)
             .expect("create network link");
-        let instance = instance("net-1", &runtime_dir);
+        let instance = instance("net-1");
         let metadata = machine_config(
             &paths,
             machine_id,
@@ -541,6 +540,70 @@ mod tests {
             runtime_dir.exists(),
             "shared instance runtime dir should stay"
         );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_uses_current_run_root_for_fresh_database_cleanup() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let data_root = temp.path().join("data");
+        let current_run_root = temp.path().join("run-current");
+        let old_run_root = temp.path().join("run-old");
+        let paths = LocalPaths::from_roots(LocalRoots::with_roots(
+            &data_root,
+            &data_root,
+            &current_run_root,
+            data_root.join("images"),
+        ));
+        let store = Store::new(&paths).await.expect("open fresh database");
+        let machine_id = MachineId::new();
+        let metadata = machine_config(
+            &paths,
+            machine_id,
+            "devbox",
+            ModelMachineNetworkConfig::default(),
+        );
+        let state = MachineState {
+            machine_id,
+            status: MachineRuntimeState::Stopped,
+            vmmon_pid: None,
+            started_at: None,
+            run_id: None,
+            last_error: None,
+            updated_at: 1,
+        };
+        store
+            .add_machine(&metadata, &state)
+            .await
+            .expect("seed machine");
+
+        let network_id = "net-1";
+        let current_runtime_dir = paths.network(network_id).dir().to_path_buf();
+        let old_runtime_dir = old_run_root.join("net").join(network_id);
+        std::fs::create_dir_all(&current_runtime_dir).expect("create current runtime dir");
+        std::fs::create_dir_all(&old_runtime_dir).expect("create old runtime dir");
+        std::fs::create_dir_all(paths.machine(machine_id).dir()).expect("create machine dir");
+        ensure_instance_network_link(&paths, machine_id, &current_runtime_dir)
+            .expect("create network link");
+        store
+            .save_network_instance(&instance(network_id))
+            .await
+            .expect("save network instance");
+        store
+            .attach_network(&attachment(machine_id, network_id))
+            .await
+            .expect("attach network");
+
+        reconcile_network_runtime(&paths, &store, &metadata, false)
+            .await
+            .expect("reconcile inactive network");
+
+        assert!(!current_runtime_dir.exists());
+        assert!(old_runtime_dir.exists());
+        assert!(store
+            .network_instance(network_id)
+            .await
+            .expect("read instance")
+            .is_none());
     }
 
     #[tokio::test]
