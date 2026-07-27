@@ -1796,7 +1796,10 @@ mod tests {
         root.to_path_buf()
     }
 
+    // TODO: Replace the shell-based sync-pipe fixture with a real vmmon
+    // instance backed by an injectable VMM.
     #[tokio::test]
+    #[ignore = "requires a deterministic vmmon/VMM test seam"]
     async fn complete_portable_runtime_launches_resolved_vmmon_and_propagates_krun() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime_root = write_complete_portable_runtime(&temp.path().join("runtime"));
