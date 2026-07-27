@@ -912,7 +912,7 @@ fn stage_path(target_dir: &Path, host: HostTarget) -> PathBuf {
 
 fn artifact_directory(target_dir: &Path, host: HostTarget, version: &str) -> PathBuf {
     target_dir
-        .join("release-artifacts")
+        .join("packages")
         .join(host.runtime_target())
         .join(version)
 }

@@ -32,9 +32,9 @@ pub fn package(
     target_dir: &Path,
     identity: Option<&str>,
 ) -> Result<(), MacosError> {
-    let output = target_dir.join("package/macos");
-    let app_bundle = output.join(APP_NAME);
     let version = app::product_version(workspace_root)?;
+    let output = app::package_directory(target_dir, &version);
+    let app_bundle = output.join(APP_NAME);
     app::verify_signed_bundle(&app_bundle)?;
     let create_dmg = ensure_create_dmg(workspace_root)?;
     let temporary_output = temporary_directory(&output, "dmg-output")?;
@@ -103,13 +103,19 @@ fn plist_strings(plist: &str, key: &str) -> Vec<String> {
     values
 }
 
-pub fn install(target_dir: &Path, appdir: &Path, bindir: &Path) -> Result<(), MacosError> {
+pub fn install(
+    workspace_root: &Path,
+    target_dir: &Path,
+    appdir: &Path,
+    bindir: &Path,
+) -> Result<(), MacosError> {
     require_absolute(appdir)?;
     require_absolute(bindir)?;
     create_directory(appdir)?;
     create_directory(bindir)?;
 
-    let package_output = target_dir.join("package/macos");
+    let version = app::product_version(workspace_root)?;
+    let package_output = app::package_directory(target_dir, &version);
     let source = package_output.join(APP_NAME);
     app::verify_signed_bundle(&source)?;
     let destination = appdir.join(APP_NAME);

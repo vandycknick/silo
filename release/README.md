@@ -12,7 +12,8 @@ TARGETARCH=amd64 docker buildx bake --load -f release/docker-bake.hcl silo-relea
 TARGETARCH=arm64 docker buildx bake --load -f release/docker-bake.hcl silo-release
 ```
 
-On Linux, `make PROFILE=release`, `make stage PROFILE=release`, and
-`make verify-runtime PROFILE=release` invoke the matching native container
-automatically. They fail rather than falling back to an ambient/Nix toolchain.
-The image entrypoint remains `make` for CI builders that need to run it directly.
+On Linux, `make PROFILE=release`, `make stage PROFILE=release`,
+`make verify-runtime PROFILE=release`, `make archive`, and
+`make verify-archive` invoke the matching native container automatically. They
+fail rather than falling back to an ambient/Nix toolchain. The image entrypoint
+remains `make` for CI builders that need to run it directly.

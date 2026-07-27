@@ -24,6 +24,10 @@ const ASSETS: [(&str, u32); 3] = [
     ("agent", 0o755),
 ];
 
+pub(crate) fn package_directory(target_dir: &Path, version: &str) -> PathBuf {
+    target_dir.join("packages/darwin-arm64").join(version)
+}
+
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error(transparent)]
@@ -80,7 +84,7 @@ pub fn assemble(
     let signing = signing_mode(supplied_identity)?;
     let stage = target_dir.join("silo-runtime/darwin-arm64/release");
     let release = target_dir.join("release");
-    let output = target_dir.join("package/macos");
+    let output = package_directory(target_dir, &version);
     create_directory(&output)?;
     let temporary = temporary_directory(&output, "Silo.app")?;
     let result = (|| {

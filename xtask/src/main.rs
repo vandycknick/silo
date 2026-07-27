@@ -314,7 +314,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 build_number.as_deref(),
                 developer_id_application.as_deref(),
             )?;
-            macos::install(&target_dir, &appdir, &bindir)?;
+            macos::install(&workspace_root, &target_dir, &appdir, &bindir)?;
         }
         Commands::Fmt => format(&workspace_root, &target_dir)?,
         Commands::Clippy => {

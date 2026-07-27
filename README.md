@@ -78,5 +78,6 @@ async fn main() -> Result<(), LibVmError> {
 
 ## Docs
 
+- [Packaging](PACKAGING.md)
 - [Terminology](docs/terminology.md)
 - [Guest agent](guest/agent/README.md)
