@@ -54,7 +54,7 @@ pub struct Cmd {
     #[command(flatten)]
     pub(crate) overrides: VmOverrideArgs,
     /// Guest command and arguments to execute after `--`.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(last = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
 }
 
@@ -302,6 +302,27 @@ mod tests {
         assert_eq!(run.profile.as_deref(), Some("dev"));
         assert!(!run.tty);
         assert_eq!(run.image.as_deref(), Some("tar:./target/rootfs.tar"));
+    }
+
+    #[test]
+    fn run_command_parses_image_command_without_profile() {
+        let cli = Cli::try_parse_from([
+            "silo",
+            "run",
+            "--image",
+            "ubuntu:24.04",
+            "--",
+            "uname",
+            "-a",
+        ])
+        .expect("run command should parse");
+        let Command::Run(run) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(run.profile, None);
+        assert_eq!(run.image.as_deref(), Some("ubuntu:24.04"));
+        assert_eq!(run.command, ["uname", "-a"]);
     }
 
     #[test]
