@@ -1,0 +1,130 @@
+name: Release Tip
+
+# Run after Test completes rather than independently of validated source.
+# Do not filter release work: no baseline exists, and commit metadata affects artifacts.
+on:
+  workflow_run:
+    workflows:
+      - Test
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-tip
+  # Set this false when publishing, notarization, release mutation, or feed promotion is non-idempotent.
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    # Automatic runs require a successful main push; manual dispatches remain allowed.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-24.04
+    outputs:
+      release_sha: ${{ steps.release.outputs.release_sha }}
+    steps:
+      - name: Resolve release revision
+        id: release
+        run: |
+          release_sha="${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}"
+          printf 'release_sha=%s\n' "$release_sha" >> "$GITHUB_OUTPUT"
+          {
+            printf '## Release Tip\n\n'
+            printf 'Release SHA: `%s`\n' "$release_sha"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  package:
+    name: release (${{ matrix.cache_scope }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64-gnu
+            runner: ubuntu-24.04
+            artifact_name: silo-linux-amd64-gnu-archives
+            artifact_path: target/packages/linux-amd64-gnu/**
+            cache_scope: linux-amd64-gnu-archives
+            create_dmg: false
+
+          - platform: linux-arm64-gnu
+            runner: ubuntu-26.04-arm
+            artifact_name: silo-linux-arm64-gnu-archives
+            artifact_path: target/packages/linux-arm64-gnu/**
+            cache_scope: linux-arm64-gnu-archives
+            create_dmg: false
+
+          - platform: darwin-arm64
+            runner: macos-26
+            artifact_name: silo-darwin-arm64-archives
+            artifact_path: |
+              target/packages/darwin-arm64/**/*.tar.zst
+              target/packages/darwin-arm64/**/*.tar.zst.sha256
+              target/packages/darwin-arm64/**/*.sbom.spdx.json
+              target/packages/darwin-arm64/**/*.provenance.json
+            cache_scope: darwin-arm64-release
+            create_dmg: true
+    env:
+      CARGO_HOME: ${{ github.workspace }}/.release-tip-cache/${{ matrix.cache_scope }}/cargo-home
+      SILO_RELEASE_CACHE_DIR: ${{ github.workspace }}/.release-tip-cache/${{ matrix.cache_scope }}
+
+    steps:
+      # Package the resolved revision rather than the workflow's default ref.
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      # Cache only release builds, keeping validation independent of release artifacts.
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          cmd-format: nix develop --command {0}
+          workspaces: . -> target
+          prefix-key: release-tip
+          shared-key: ${{ matrix.cache_scope }}-${{ hashFiles('Makefile', 'flake.nix', 'flake.lock', 'nix/**/*.nix', 'release/Containerfile', 'release/docker-bake.hcl', 'release/toolchains.toml', 'xtask/src/**/*.rs') }}
+          cache-bin: false
+
+      - name: Build release archives
+        run: nix develop --command make archive
+
+      # Upload archives first so a later DMG failure does not discard them.
+      - name: Upload release archives
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Build macOS package
+        if: ${{ matrix.create_dmg }}
+        run: nix develop --command make package DMG=1
+
+      - name: Upload macOS DMG
+        if: ${{ matrix.create_dmg }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: silo-darwin-arm64-dmg
+          path: target/packages/darwin-arm64/*/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

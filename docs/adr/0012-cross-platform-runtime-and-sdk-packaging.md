@@ -2,7 +2,7 @@
 
 Date: 2026-07-22
 
-Updated: 2026-07-23
+Updated: 2026-07-28
 
 ## Status
 
@@ -35,9 +35,12 @@ assets. That is not a product installation and cannot provide reliable SDK
 distribution.
 
 The distribution problem spans macOS application bundles, code signing,
-entitlements, notarization, and Homebrew Casks; Debian, Ubuntu, RHEL, and Arch
-layouts; Node platform packages and native addons; future Python wheels and Go
-modules; direct Rust `libvm` consumers; and custom embedders.
+entitlements, notarization, Node platform packages and native addons, future
+Python wheels and Go modules, direct Rust `libvm` consumers, portable GNU/Linux
+archives, and custom embedders. The official GNU/Linux product must be usable on
+both supported architectures without making Silo responsible for the native
+package policy, build matrix, or release qualification of every Linux
+distribution.
 
 The normal path should require no user configuration. Explicit configuration is
 still necessary for tests, development, custom embedding, and unusual
@@ -45,29 +48,39 @@ installations. Silo therefore needs conventions that remain overrideable rather
 than configuration that every consumer must reproduce.
 
 This ADR defines immutable product layout, runtime discovery, SDK runtime
-transport, user-owned product and state paths, release staging, and package
+transport, user-owned product and state paths, release staging, and archive
 qualification. It does not add runtime backend selection, independent component
-updates, or an in-process package manager to `libvm`.
+updates, an in-process package manager to `libvm`, or a Linux archive installer.
 
 ## Terminology
 
-| Term                 | Meaning                                                                                  |
-| -------------------- | ---------------------------------------------------------------------------------------- |
-| Frontend             | The CLI, Rust consumer, Node addon, or future language binding that opens `libvm`.       |
-| Runtime payload      | The co-versioned private helpers and default boot assets required to run VMs.            |
-| Runtime root         | A portable directory containing the fixed `bin/` and `assets/` layout.                   |
-| Product installation | A CLI distribution such as `Silo.app`, a deb, an rpm, or an Arch package.                |
-| Bundled runtime      | A runtime payload carried inside an SDK package or wheel.                                |
-| Shared runtime       | A runtime installed through an OS product channel and used by a frontend.                |
-| Default assets       | `kernel-default`, `initramfs`, and `agent`.                                              |
-| Mutable state        | Databases, images, machine state, sockets, logs, caches, and downloaded optional assets. |
-| Transport            | The ecosystem-specific way in which the canonical runtime payload is delivered.          |
+| Term | Meaning |
+| --- | --- |
+| Frontend | The CLI, Rust consumer, Node addon, or future language binding that opens `libvm`. |
+| Runtime payload | The co-versioned private helpers and default boot assets required to run VMs. |
+| Runtime root | A portable directory containing the fixed `bin/` and `assets/` layout. |
+| Product installation | An official Silo.app, DMG, or exact-version portable archive installation. |
+| Bundled runtime | A runtime payload carried inside an SDK ecosystem package or wheel. |
+| Shared runtime | A runtime installation discovered outside a bundled SDK, including an optional downstream native repackaging. |
+| Default assets | `kernel-default`, `initramfs`, and `agent`. |
+| Mutable state | Databases, images, machine state, sockets, logs, caches, and downloaded optional assets. |
+| Transport | The ecosystem-specific way in which the canonical runtime payload is delivered. |
+| Downstream repackaging | An optional third party repackaging an official Linux archive without changing the runtime payload contract. |
 
 ## Decision
 
 Silo produces one validated, architecture-specific runtime payload for each
-supported target. Product installers and SDK packages for that target consume
-the same staged files rather than rebuilding a transport-specific variation.
+supported target. Official product archives and SDK packages for that target
+consume the same staged files rather than rebuilding a transport-specific
+variation.
+
+The official Linux distribution is binary archive-only. Silo publishes complete
+portable archives for GNU/Linux amd64 and arm64, and does not build, publish, or
+qualify native packages for any Linux distribution or third-party repository.
+Downstream maintainers may repackage an official archive under their own
+policies. Repackaging the official binary archive is the only downstream
+packaging model documented by Silo; source-build packaging guidance is out of
+scope.
 
 `libvm` resolves fixed native and portable layouts to absolute component paths
 and retains them for the lifetime of a `Runtime`. It does not install or download
@@ -88,24 +101,25 @@ a normal first VM start requires no runtime download.
   `--component-info` subprocess protocol.
 - Official runtime components are co-versioned and updated atomically. They are
   not upgraded independently.
+- An official Linux archive set is exact-version and atomic: its runtime-only
+  and portable CLI archives, checksums, SBOMs, and provenance describe the same
+  staged release bytes.
 
 ## Supported Targets And Compatibility
 
-The initial host matrix is:
+The initial official host matrix is:
 
-| Host   | Architecture                 | Initial distribution promise | Active backend | Packaged backends |
-| ------ | ---------------------------- | ---------------------------- | -------------- | ----------------- |
-| macOS  | arm64                        | macOS 26 or newer            | VZ             | VZ and krun       |
-| Debian | amd64, arm64                 | Latest stable                | krun           | krun              |
-| Ubuntu | amd64, arm64                 | Latest stable or LTS         | krun           | krun              |
-| RHEL   | amd64, arm64                 | Latest supported major       | krun           | krun              |
-| Arch   | amd64, arm64 where available | Current rolling release      | krun           | krun              |
+| Host | Architecture | Initial distribution promise | Active backend | Packaged backends |
+| --- | --- | --- | --- | --- |
+| macOS | arm64 | macOS 26 or newer, app/archive/DMG | VZ | VZ and krun |
+| GNU/Linux | amd64, arm64 | glibc 2.39 or newer, runtime and portable CLI archives | krun | krun |
 
 The initial release does not support Intel macOS, macOS before version 26,
 Windows, other Linux architectures, or cross-architecture guest CPU emulation.
-Initial GNU/Linux binaries target glibc 2.39. This covers the selected current
-distribution generation without claiming compatibility with older releases.
-Raising that floor changes the support matrix and requires an ADR update.
+The GNU/Linux glibc 2.39 floor applies to both official architectures. Raising
+that floor changes the support matrix and requires an ADR update. The official
+promise concerns the GNU/Linux ABI baseline and portable archive, not a specific
+Linux distribution release or package manager.
 
 VZ remains the only selected macOS backend. Silo packages and signs the krun
 helper on macOS so a later backend selector does not require a new distribution
@@ -117,10 +131,14 @@ Optional Rosetta support in VZ does not change the guest kernel architecture.
 Official runtime components are co-versioned and updated atomically. The
 initial compatibility policy is deliberately strict:
 
-- Product packages co-install one matching CLI and runtime.
+- An official product installation contains one matching CLI and runtime.
+- Linux archive users select one exact-version archive for their target.
 - Node and Python platform packages use the exact SDK package version.
-- Go downloads the exact runtime release matching the SDK version.
+- Go acquires the exact runtime archive matching the SDK version only through a
+  future explicit installer.
 - Direct Rust consumers use a co-installed runtime or pass an explicit root.
+- Optional downstream native repackagings preserve an exact archive version and
+  do not establish an independent Silo compatibility promise.
 - Custom mixed-version component paths are unsupported and remain the caller's
   responsibility.
 - Runtime components are not upgraded independently.
@@ -152,9 +170,9 @@ Silo libkrun fork directly. The payload does not contain `libkrun.so`,
 process boundary remains `vmmon -> krun`. Neither `vmmon`, `libvm`, nor a
 language binding links libkrun merely by using the launcher library.
 
-The runtime payload does not inherently include the `silo` CLI. Product packages
+The runtime payload does not inherently include the `silo` CLI. Product archives
 add the CLI and SDK packages add their native binding. A complete portable CLI
-archive may place `silo` beside the helpers:
+archive has this layout:
 
 ```text
 silo-<version>-<target>/
@@ -208,12 +226,12 @@ target/silo-runtime/linux-amd64-gnu/release/
 target/silo-runtime/linux-arm64-gnu/release/
 ```
 
-Developers select a staged root through `RuntimeConfig` or
-`SILO_RUNTIME_DIR`. `libvm` does not infer a stage from an arbitrary Cargo
-executable. The staged payload is the common input to the app, Linux packages,
-SDK platform packages, and runtime archives. Packagers do not rebuild or
-substitute components after staging, except for required platform signing and
-container metadata.
+Developers select a staged root through `RuntimeConfig` or `SILO_RUNTIME_DIR`.
+`libvm` does not infer a stage from an arbitrary Cargo executable. The staged
+payload is the common input to the app, official Linux archives, SDK platform
+packages, and runtime archives. Packagers do not rebuild or substitute
+components after staging, except for required platform signing and container
+metadata.
 
 ### Default Kernel Provenance
 
@@ -221,12 +239,12 @@ Release CI obtains the default kernel from Silo's stable OCI artifact during
 staging:
 
 1. Resolve the stable OCI index.
-2. Select the target architecture manifest.
-3. Verify the expected Silo kernel media types.
-4. Verify the platform manifest and layer digests.
-5. Extract the kernel as `assets/kernel-default`.
-6. Record the index, platform manifest, and layer digests in release provenance.
-7. Package those exact bytes into every transport for the target.
+1. Select the target architecture manifest.
+1. Verify the expected Silo kernel media types.
+1. Verify the platform manifest and layer digests.
+1. Extract the kernel as `assets/kernel-default`.
+1. Record the index, platform manifest, and layer digests in release provenance.
+1. Package those exact bytes into every transport for the target.
 
 End users never receive a release whose default kernel depends on when they
 first run it. The installed runtime needs no registry access to boot its default
@@ -235,26 +253,27 @@ release. Staging verifies that all three default assets match the target
 architecture.
 
 Additional user-installed kernels are deferred. When added, they live below the
-XDG data root and never modify `Silo.app` or package-owned `/usr` paths.
+XDG data root and never modify `Silo.app`, an official archive, or optional
+downstream package-owned paths.
 
 ### Release Staging
 
 A repository-owned staging command builds one canonical payload per target:
 
 1. Build `silo`, `vmmon`, `netd`, and `krun`.
-2. Use committed lockfiles and locked dependency resolution.
-3. Build the guest initramfs and standalone agent.
-4. Resolve and verify the target kernel OCI artifact.
-5. Strip release binaries.
-6. Normalize file names, modes, and reproducible timestamps where possible.
-7. Copy components into the portable runtime layout.
-8. Inspect dynamic dependencies and runtime search paths.
-9. Reject build-machine paths and unavailable shared libraries.
-10. Record source and kernel provenance in release metadata.
-11. Generate checksums, SBOMs, and attestations.
-12. Boot a VM using only the staged tree.
-13. Report raw and compressed sizes.
-14. Hand those files to each target packager.
+1. Use committed lockfiles and locked dependency resolution.
+1. Build the guest initramfs and standalone agent.
+1. Resolve and verify the target kernel OCI artifact.
+1. Strip release binaries.
+1. Normalize file names, modes, and reproducible timestamps where possible.
+1. Copy components into the portable runtime layout.
+1. Inspect dynamic dependencies and runtime search paths.
+1. Reject build-machine paths and unavailable shared libraries.
+1. Record source and kernel provenance in release metadata.
+1. Generate checksums, SBOMs, and provenance records.
+1. Boot a VM using only the staged tree.
+1. Report raw and compressed sizes.
+1. Hand the exact staged files to each official archive or SDK transport.
 
 The repository may contain build-time staging configuration. That configuration
 is not installed and `libvm` never consults it. The toolchain is deliberately
@@ -264,10 +283,10 @@ composed because no single free tool safely owns every Silo release concern:
 repository-owned staging command
         |
         +-- Apple native tools -> Silo.app, DMG, notarization
-        +-- nFPM -> deb, rpm, Arch
+        +-- tar/zstd -> official portable archives
         +-- npm tooling -> Node platform packages
         +-- Python tooling -> platform wheels
-        `-- tar/zstd -> portable and Go runtime archives
+        `-- Go SDK release metadata -> future explicit archive installer
 ```
 
 GoReleaser Pro is not part of the design. The common contract is the staged
@@ -275,18 +294,18 @@ payload, not one third-party packager.
 
 ## Installation Ownership, Mutable XDG State, And Unsupported Old Layouts
 
-Package-owned product files are immutable. Silo never writes mutable state into
-`Silo.app` or package-owned `/usr` paths. Linux and macOS use the same XDG
-conventions for user-owned product files and mutable state; Silo does not use
-`~/Library/Application Support`, `~/Library/Caches`, or `~/Library/Logs` on
-macOS.
+Product files are immutable. Silo never writes mutable state into `Silo.app`,
+an official archive installation, or an optional downstream package-owned `/usr`
+path. Linux and macOS use the same XDG conventions for user-owned product files
+and mutable state; Silo does not use `~/Library/Application Support`,
+`~/Library/Caches`, or `~/Library/Logs` on macOS.
 
-| Purpose                    | Environment or configuration             | Fallback on Linux and macOS       |
-| -------------------------- | ---------------------------------------- | --------------------------------- |
-| Data                       | `$XDG_DATA_HOME/silo`                    | `$HOME/.local/share/silo`         |
-| State and logs             | `$XDG_STATE_HOME/silo`                   | `$HOME/.local/state/silo`         |
-| Images                     | Runtime-configured or data root           | `$HOME/.local/share/silo/images`  |
-| Runtime files              | `$XDG_RUNTIME_DIR/silo`                   | `/tmp/silo-<effective-uid>`       |
+| Purpose | Environment or configuration | Fallback on Linux and macOS |
+| --- | --- | --- |
+| Data | `$XDG_DATA_HOME/silo` | `$HOME/.local/share/silo` |
+| State and logs | `$XDG_STATE_HOME/silo` | `$HOME/.local/state/silo` |
+| Images | Runtime-configured or data root | `$HOME/.local/share/silo/images` |
+| Runtime files | `$XDG_RUNTIME_DIR/silo` | `/tmp/silo-<effective-uid>` |
 
 The default data tree is:
 
@@ -348,15 +367,15 @@ directory.
 The run-root resolution order is:
 
 1. Explicit `RuntimeConfig` run root.
-2. `$XDG_RUNTIME_DIR/silo`.
-3. `/tmp/silo-<effective-uid>`.
+1. `$XDG_RUNTIME_DIR/silo`.
+1. `/tmp/silo-<effective-uid>`.
 
 The fallback ignores process temporary-directory settings, including `TMPDIR`.
 Silo obtains the effective UID and creates or validates
 `/tmp/silo-<effective-uid>` as a real, non-symlink directory owned by that
 effective user with exact mode `0700`. It rejects symlinks, foreign ownership,
-non-directories, and unsafe permissions. It never uses a cross-user
-`/tmp/silo` directory.
+non-directories, and unsafe permissions. It never uses a cross-user `/tmp/silo`
+directory.
 
 The run root is ephemeral session placement, not durable database identity.
 `Runtime::open` resolves the default run root from the current environment on
@@ -393,16 +412,17 @@ than mixing helpers and assets from unrelated locations.
 Resolution follows this order:
 
 1. Explicit per-component API paths.
-2. An explicit API `runtime_root` using the portable layout.
-3. Existing per-component environment variables.
-4. `SILO_RUNTIME_DIR` using the portable layout.
-5. A runtime bundled with the caller.
-6. A complete development runtime adjacent to the canonical current executable.
-7. A portable runtime relative to the canonical current executable, including
+1. An explicit API `runtime_root` using the portable layout.
+1. Existing per-component environment variables.
+1. `SILO_RUNTIME_DIR` using the portable layout.
+1. A runtime bundled with the caller.
+1. A complete development runtime adjacent to the canonical current executable.
+1. A portable runtime relative to the canonical current executable, including
    `Silo.app`.
-8. One complete helper set from `PATH` when `SILO_ASSET_DIR` is explicit.
-9. Conventional native package locations.
-10. A missing-runtime error.
+1. One complete helper set from `PATH` when `SILO_ASSET_DIR` is explicit.
+1. Conventional native installation locations, for optional downstream
+   compatibility only.
+1. A missing-runtime error.
 
 Existing environment controls remain available while lookup is centralized:
 
@@ -422,8 +442,11 @@ remain below the selected root and are regular files. `vmmon`, `netd`, `krun`,
 and `agent` must be executable. `kernel-default` and `initramfs` must be
 readable but need not be executable.
 
-Native package resolution checks only a small documented set of platform paths;
-it does not query dpkg, rpm, Homebrew, Spotlight, or mounted volumes.
+Native-location resolution checks only a small documented set of conventional
+paths. It does not query package-manager databases, scan mounted volumes, or
+infer a distribution. This is a compatibility path for downstream archive
+repackaging, not an official package layout or a promise to test native package
+formats.
 
 Explicit machine asset overrides remain independent. An explicit machine kernel,
 initramfs, or agent wins for that asset without replacing the other defaults.
@@ -499,6 +522,15 @@ $HOME/.local/share/silo/assets
 
 Users may select either directory explicitly with `SILO_ASSET_DIR`.
 
+Optional downstream repackagings that choose a conventional native `/usr` layout
+must keep all helpers and assets private to Silo, must not place default assets
+in a shared data directory, and must preserve one complete exact-version
+component set. A conventional layout may use `/usr/bin/silo` with private files
+under `/usr/lib/silo/` or an equivalent architecture-aware private library
+location. `/usr/local` remains reserved for local administrator installations.
+These are resolver compatibility guidelines only, not Silo native-package
+production, publishing, or qualification obligations.
+
 A failure identifies the missing component, candidate locations considered, a
 malformed supplied override, and the expected native or portable layout.
 
@@ -519,8 +551,8 @@ A manifest becomes justified if components are independently installed,
 independently upgraded, content-addressed, supplied by third parties, or chosen
 from coexisting compatibility generations. None applies to the initial runtime.
 There is also no `--component-info` protocol. Release identity and provenance
-belong in application metadata, package metadata, release checksums, SBOMs, and
-attestations, not in a subprocess probe required for discovery.
+belong in application metadata, archive checksums, SBOMs, and provenance records,
+not in a subprocess probe required for discovery.
 
 ## Product Distributions
 
@@ -559,13 +591,13 @@ agent     = Contents/Resources/assets/agent
 `Info.plist` carries standard application identity, version, and minimum-system
 metadata. It does not contain Silo runtime paths. The initial contract is:
 
-| Key                          | Value or meaning                                  |
-| ---------------------------- | ------------------------------------------------- |
-| `CFBundleIdentifier`         | `sh.silo.app`                                     |
-| `CFBundleExecutable`         | `silo`                                            |
-| `CFBundleShortVersionString` | The public Silo release version                   |
-| `CFBundleVersion`            | The monotonically increasing release build number |
-| `LSMinimumSystemVersion`     | `26.0`                                            |
+| Key | Value or meaning |
+| --- | --- |
+| `CFBundleIdentifier` | `sh.silo.app` |
+| `CFBundleExecutable` | `silo` |
+| `CFBundleShortVersionString` | The public Silo release version |
+| `CFBundleVersion` | The monotonically increasing release build number |
+| `LSMinimumSystemVersion` | `26.0` |
 
 An SDK comparing itself with an installed app requires an exact
 `CFBundleShortVersionString` match. `CFBundleVersion` distinguishes rebuilt
@@ -596,15 +628,15 @@ It also preserves relocatability to a user-owned location such as
 `Contents/MacOS/silo` out of the bundle is not a supported command exposure
 method because it loses bundle origin. Command exposure uses a symlink. A copied
 executable may use an explicit runtime root or conventional shared installation,
-but does not claim the copied app's package-owned resources by name alone. The
-app bundle is read-only product content; creating or starting a machine never
-writes into it.
+but does not claim the copied app's product resources by name alone. The app
+bundle is read-only product content; creating or starting a machine never writes
+into it.
 
 The initial macOS channels are:
 
 1. A signed, hardened, notarized, and stapled DMG containing `Silo.app`.
-2. An official Homebrew tap containing a Cask for the same app bundle.
-3. Signed target runtime archives where an SDK transport requires one.
+1. An official Homebrew tap containing a Cask for the same app bundle.
+1. Target runtime archives where an SDK transport requires one.
 
 The Cask installs the app and exposes its CLI with a symlink equivalent to:
 
@@ -645,33 +677,48 @@ runner rather than carrying a divergent Finder-layout implementation.
 The release pipeline:
 
 1. Builds arm64 binaries with a macOS 26 deployment target.
-2. Builds arm64 guest assets.
-3. Resolves the arm64 kernel OCI artifact.
-4. Assembles the complete app.
-5. Inspects every Mach-O dependency.
-6. Rejects Nix-store, build-prefix, and unavailable non-system dependencies.
-7. Signs nested executables with a Developer ID Application identity.
-8. Signs the outer app with hardened runtime and timestamping.
-9. Builds the DMG with `create-dmg`.
-10. Submits the distribution through `xcrun notarytool`.
-11. Staples and validates the notarization ticket.
-12. Tests the result on a clean macOS 26 machine without development tools.
+1. Builds arm64 guest assets.
+1. Resolves the arm64 kernel OCI artifact.
+1. Assembles the complete app.
+1. Inspects every Mach-O dependency.
+1. Rejects Nix-store, build-prefix, and unavailable non-system dependencies.
+1. Signs nested executables with a Developer ID Application identity.
+1. Signs the outer app with hardened runtime and timestamping.
+1. Builds the DMG with `create-dmg`.
+1. Submits the distribution through `xcrun notarytool`.
+1. Staples and validates the notarization ticket.
+1. Tests the result on a clean macOS 26 machine without development tools.
 
 Ad-hoc signing remains a development convenience and is not a release signature.
 
-### Linux Product Layouts And Distribution
+### Linux Archive Distribution
 
-Distro packages install the public frontend at:
+Official Linux releases contain two complete binary archive families for each
+of `linux-amd64-gnu` and `linux-arm64-gnu`. Both architectures and both archive
+families are first-class release outputs:
+
+- `silo-runtime-<version>-<target>.tar.zst` contains the runtime payload for an
+  SDK, embedder, or installer that provides its own frontend.
+- `silo-<version>-<target>.tar.zst` contains the same runtime payload plus the
+  `silo` CLI and is the official direct Linux product distribution.
+
+The portable CLI archives expand to:
 
 ```text
-/usr/bin/silo
-```
-
-Debian, Ubuntu, and Arch packages use:
-
-```text
-/usr/lib/silo/
+silo-<version>-linux-amd64-gnu/
   bin/
+    silo
+    vmmon
+    netd
+    krun
+  assets/
+    kernel-default
+    initramfs
+    agent
+
+silo-<version>-linux-arm64-gnu/
+  bin/
+    silo
     vmmon
     netd
     krun
@@ -681,56 +728,67 @@ Debian, Ubuntu, and Arch packages use:
     agent
 ```
 
-RHEL follows package macros and may split private executables from
-architecture-specific assets:
+The top-level archive directory is the runtime root. The archive is relocatable:
+users may extract it into a user-owned directory and expose `bin/silo` with a
+symlink on `PATH`. It contains no system daemon, service unit, setuid executable,
+or privileged installation helper. Product files remain read-only after
+extraction; mutable state follows the XDG ownership model.
 
-```text
-%{_libexecdir}/silo/
-  vmmon
-  netd
-  krun
-
-%{_libdir}/silo/assets/
-  kernel-default
-  initramfs
-  agent
-```
-
-The resolver models explicit resolved component paths; it does not pretend every
-native installation has one physical runtime root. Distro packages do not
-install into `/usr/local`, which is reserved for local administrator
-installations. A source or administrator installation may use:
-
-```text
-/usr/local/bin/silo
-/usr/local/lib/silo/bin/
-/usr/local/lib/silo/assets/
-```
-
-The default assets are architecture-specific: the kernel differs between arm64
-and amd64, the agent is a compiled guest executable, and the initramfs contains
-architecture-specific executables. Package-owned defaults therefore belong below
-a private `lib` directory rather than `/usr/share` or `/usr/local/share`.
-
-Release CI produces separately qualified native-format artifacts for Debian,
-Ubuntu, RHEL, and Arch from the same immutable staged bytes for each target
-architecture. Distribution metadata and package formats may differ, but helpers
-and assets are not rebuilt per package. It also produces generic `.tar.zst`
-runtime and CLI archives, detached checksums and signatures, and SBOM and
-provenance records.
-
-Silo uses nFPM directly for deb, rpm, and Arch package construction. The
-payload contains Rust binaries, a Go binary, generated assets, and a kernel
-artifact, so separate Rust-only package generators would duplicate layout
-configuration. AUR publication remains separate and requires a reviewed
-`PKGBUILD`. The nFPM-produced Arch package remains useful as a direct binary
-release.
+For each target and exact version, the official release publishes one atomic
+archive set: both compressed archives and each archive's SHA-256 checksum, SBOM,
+and provenance record generated from the same staged payload. A checksum
+identifies its archive bytes; the SBOM and provenance identify how the
+corresponding payload was produced. These records must not be mixed across
+versions, targets, archive families, or rebuilds. Archive signing and signature
+verification are future release capabilities unless a release explicitly
+provides them; checksums, SBOMs, and provenance are the current archive release
+materials.
 
 Linux binaries are built against the glibc 2.39 baseline. CI records the symbol
 versions required by each final ELF file and rejects dependencies on newer glibc
 or libstdc++ symbols. A future baseline change updates the support matrix and
-every Linux transport together. There is no system daemon, service unit, setuid
-executable, or privileged runtime installation helper.
+both official Linux archive targets together.
+
+#### Optional Downstream Repackaging
+
+Downstream maintainers may optionally repackage the official portable CLI
+archive for a Linux distribution. Such a downstream package is not an official
+Silo artifact and must preserve the archive's target, exact version, component
+bytes, executable modes, and atomic runtime relationship. It may add only
+packaging metadata, filesystem placement, and command exposure needed by its
+distribution policy. It must not split, substitute, rebuild, mix versions of,
+or independently update the Silo helpers or default assets.
+
+If a downstream package uses a conventional native layout, `/usr/bin/silo` may
+refer to private runtime files below `/usr/lib/silo/` or an equivalent
+architecture-aware private location. Default assets remain private to Silo and
+architecture-specific, rather than shared data files. This layout supports the
+resolver's optional native compatibility paths. It does not create an official
+native package channel, a native package CI obligation, or a Silo support
+commitment for the downstream distribution.
+
+The downstream maintainer owns its package metadata, signing, repository
+publication, upgrades, removal behavior, and distribution qualification. Silo's
+trust boundary ends at the published official archive set. Users and downstream
+maintainers should verify the official archive checksum before repackaging;
+downstream package trust is established by that downstream's own distribution
+mechanisms.
+
+#### Future Explicit Archive Installer
+
+An official archive installer is deferred and is not implemented by this ADR.
+If introduced, it is an explicit acquisition command or SDK setup API outside
+`libvm`, runtime open, and VM startup. It must select a target and exact version,
+verify the archive digest and verify a signature when one is available, reject
+path traversal, links, and device entries, preserve file modes, extract into a
+temporary directory, and atomically install only a complete verified runtime.
+
+The default install location must be user-owned. When installing a portable CLI
+archive, the installer may create a user-owned `PATH` symlink to `bin/silo`; a
+runtime-only archive has no CLI to expose. The installer must not require
+privilege escalation or delete user machines, images, databases, logs, keys, or
+other user state. System-wide installation, native package management, and
+implicit acquisition remain outside this deferred installer direction.
 
 ## SDK Distributions
 
@@ -774,8 +832,8 @@ The JavaScript loader selects the package from `process.platform` and
 `process.arch`, resolves its package-relative `runtime` directory, and passes
 that bundled candidate to the native addon. An explicit API root and environment
 overrides retain higher precedence. The loader does not use `process.execPath`,
-run a postinstall downloader, download at first VM start, search arbitrary
-global npm locations, or require a separate Silo CLI installation.
+run a postinstall downloader, download at first VM start, search arbitrary global
+npm locations, or require a separate Silo CLI installation.
 
 ### Future Python SDK Compatibility Contract
 
@@ -810,8 +868,10 @@ installation scripts to acquire the default runtime.
 
 Go modules have no clean equivalent to npm optional platform packages or Python
 platform wheels. A future Go SDK therefore exposes an explicit installation API
-such as `InstallRuntime`. Installation never occurs during package import,
-`init()`, runtime open, VM start, or a hidden postinstall hook.
+such as `InstallRuntime`. This is a deferred instance of the explicit archive
+installer direction, not a current runtime capability. Installation never occurs
+during package import, `init()`, runtime open, VM start, or a hidden postinstall
+hook.
 
 The exact SDK-matched runtime is installed using the same XDG location on Linux
 and macOS:
@@ -828,20 +888,14 @@ $HOME/.local/share/silo/runtimes/0.1.0/linux-amd64-gnu/
 $HOME/.local/share/silo/runtimes/0.1.0/linux-arm64-gnu/
 ```
 
-The exact Go SDK release embeds the expected SHA-256 digest and default release
-URL for every supported target archive. The Go module and its normal module
-checksum provenance are therefore the installer's trust root; runtime mirrors
-cannot substitute different bytes. Release publication generates these values
-from the same staged archives before publishing the SDK module.
-
-The installer selects the exact SDK version and host target, verifies the
-archive against the SDK-embedded digest before extraction, rejects archive
-traversal, preserves executable modes, coordinates concurrent installers, and
-atomically renames a completed temporary directory into place. It reuses an
-already verified exact version and supports explicit mirrors and offline
-pre-seeding only when their archive matches the embedded digest. The
-installation API returns the runtime root. `libvm` remains unaware of the
-download.
+A future exact Go SDK release may embed the expected SHA-256 digest and default
+release URL for every supported target archive. It must verify that digest before
+extraction, preserve the archive-installation safety requirements, coordinate
+concurrent installers, atomically rename a completed temporary directory into
+place, and return the runtime root. It may support explicit mirrors and offline
+pre-seeding only when bytes match the expected digest. Signature verification is
+required when the selected release provides a signature. `libvm` remains unaware
+of the download.
 
 ### Direct Rust And Shared SDK Discovery
 
@@ -864,9 +918,9 @@ $HOME/Applications/Silo.app
 It validates bundle identity, host architecture, minimum OS version, and app
 release metadata before use. It does not use Spotlight, scan mounted volumes, or
 execute the first application named `Silo.app`. Linux SDK packages are
-self-contained. Selecting a shared distro installation instead requires an
-explicit override unless compatibility can be established without querying
-package-manager databases.
+self-contained. Selecting a shared native installation instead requires an
+explicit override unless compatibility can be established without querying a
+package-manager database.
 
 ### SDK Size Budget
 
@@ -881,25 +935,23 @@ required runtime files or introducing an implicit first-run downloader.
 
 Distribution channels establish trust differently:
 
-| Channel             | Primary trust mechanism                                                              |
-| ------------------- | ------------------------------------------------------------------------------------ |
-| `Silo.app`          | Apple code signature, hardened runtime, notarization, and stapling                   |
-| Homebrew Cask       | Signed app plus Cask artifact checksum                                               |
-| deb, rpm, Arch      | Signed package or repository plus package-owned installed files                      |
-| npm                 | Registry integrity plus signed Mach-O files on macOS                                 |
-| Python              | Wheel/index integrity plus signed Mach-O files on macOS                              |
-| Go runtime download | Target digest embedded in the exact Go SDK release and Go module checksum provenance |
-| Generic archive     | SHA-256 checksum and keyless Sigstore bundle from the protected release workflow      |
+| Channel | Primary trust mechanism |
+| --- | --- |
+| `Silo.app` | Apple code signature, hardened runtime, notarization, and stapling |
+| Homebrew Cask | Signed app plus Cask artifact checksum |
+| Official Linux archives | SHA-256 checksums, SBOMs, and provenance for both exact-version target archives |
+| npm | Registry integrity plus signed Mach-O files on macOS |
+| Python | Wheel/index integrity plus signed Mach-O files on macOS |
+| Future Go archive installation | SDK-selected target/version digest, and signature verification when available |
 
 Normal VM launch does not rehash the entire runtime. Release materials retain
 required third-party notices, including libkrun's Apache-2.0 attribution.
 
-Each generic archive publishes a detached `*.sigstore.json` bundle. Verification
-requires the GitHub Actions OIDC issuer and the certificate identity
-`https://github.com/vandycknick/silo/.github/workflows/release.yml@refs/tags/v<version>`,
-where `<version>` is the archive's public Silo version. Verification also
-requires a transparency-log inclusion proof. The independently published
-SHA-256 checksum remains part of the release material.
+Archive signatures are not an implied current release guarantee. When official
+archive signing is introduced, the release documentation must identify its trust
+root, signature format, certificate or key identity, and verification procedure;
+until then, archive consumers verify the published SHA-256 checksum and inspect
+associated SBOM and provenance records as appropriate.
 
 Every release passes the relevant target gates.
 
@@ -915,12 +967,16 @@ Every release passes the relevant target gates.
 
 ### Linux amd64 And arm64
 
-- Deb, rpm, and Arch packages install, upgrade, and remove cleanly.
-- Helpers and assets have the intended owners and modes.
+- Each exact-version `linux-amd64-gnu` and `linux-arm64-gnu` archive set contains
+  the complete runtime-only and portable CLI layouts.
+- Each archive checksum, SBOM, and provenance record corresponds to its exact
+  archive family, version, and target.
+- Helpers and assets have the intended modes after archive extraction.
 - Binaries satisfy the release's declared glibc baseline.
-- A KVM VM boots using only package-owned files.
-- The generic archive boots using only its portable root.
+- A krun VM boots using only files from the extracted archive root.
 - No `libkrun.so` dependency remains.
+- No Linux native-package build, install, upgrade, removal, repository, or
+  distribution-specific qualification gate is required of official releases.
 
 ### Current SDKs
 
@@ -929,11 +985,12 @@ Every release passes the relevant target gates.
 - Unsupported targets fail before process spawn.
 - Compressed size is reported and remains within budget unless waived.
 
-The Python wheel and Go installer gates become mandatory when those future SDKs
-are implemented. Before its first release, the Python SDK must boot from a clean
-wheel installation with no system Silo. Before its first release, the Go SDK
-must reject unsupported targets before download, verify its exact runtime
-archive, and boot that installed runtime.
+The Python wheel and future explicit Go installer gates become mandatory when
+those SDKs are implemented. Before its first release, the Python SDK must boot
+from a clean wheel installation with no system Silo. Before its first release,
+the Go SDK must reject unsupported targets before download, verify its exact
+runtime archive, enforce archive extraction safety, and boot that installed
+runtime.
 
 ### General
 
@@ -941,8 +998,8 @@ archive, and boot that installed runtime.
 - Kernel digests and architecture are verified.
 - SBOM and provenance records are generated.
 - The installation requires no first-run network access for its default runtime.
-- Package uninstall does not remove user machines, images, databases, logs, or
-  downloaded optional runtimes without an explicit purge operation.
+- Product removal does not remove user machines, images, databases, logs, or
+  downloaded optional runtimes without an explicit user action.
 
 ## Relationship To ADR 0009
 
@@ -951,7 +1008,8 @@ language SDKs do not install them. This ADR refines the language-package part of
 that statement:
 
 - `libvm` never installs assets.
-- A product package may be the installation that owns default assets.
+- An official product archive or app may be the installation that owns default
+  assets.
 - A language platform package may itself own a bundled runtime.
 - SDK runtime transport is packaging behavior, not runtime-library behavior.
 
@@ -967,24 +1025,29 @@ asset set rather than falling through independently across directories.
 
 - The normal CLI and SDK paths receive one complete, coherent runtime without
   manual configuration.
-- The same staged files are qualified across transports.
-- macOS bundles remain relocatable and Linux packages follow native conventions.
+- The same staged files are qualified across official transports.
+- Both supported Linux architectures receive equivalent first-class official
+  archive releases with one clear glibc contract.
+- Silo avoids distribution-specific native package production and qualification
+  while downstream maintainers can repackage immutable official bytes.
 - `libvm` remains a runtime library rather than a package manager.
 - Compiling the pinned libkrun fork into the krun helper removes a loader, RPATH,
   and nested-signing failure class.
 
 ### Tradeoffs
 
+- Linux users who prefer a native package must use a downstream repackaging or
+  manually extract the official archive.
+- Native package discovery remains a small compatibility surface without an
+  official package test matrix.
 - Node and Python target packages duplicate runtime bytes, and security fixes
   require updated SDK platform packages.
 - macOS releases require native signing infrastructure; Linux releases require
-  amd64 and arm64 builders and KVM qualification; Go requires a secure explicit
-  installer.
+  amd64 and arm64 builders and krun archive qualification; Go requires a secure
+  explicit installer when implemented.
 - Package size is a maintained product constraint.
 - Convention-based discovery must provide strong diagnostics because there is no
   manifest to inspect.
-- Native package layouts require the resolver to model explicit components
-  rather than force every installation into one physical root.
 
 ## Alternatives Considered
 
@@ -1025,11 +1088,19 @@ mirror, and trust policy do not belong in the core runtime library.
 Downloading during import, runtime open, or VM start creates surprising network
 access and nondeterministic offline behavior.
 
+### Official Native Linux Packages
+
+Native Linux packages would multiply official release outputs, package metadata,
+repository trust policy, upgrade semantics, and distribution-specific
+qualification without improving the atomic runtime payload. Official archives
+provide one tested contract per architecture while allowing downstream
+repackaging where it is valuable.
+
 ### One Universal Physical Layout
 
-One layout would reduce resolver cases, but app bundles, FHS packages, SDK
-packages, and user-owned XDG runtimes have distinct ownership and installation
-conventions.
+One layout would reduce resolver cases, but app bundles, portable archives, SDK
+packages, optional downstream native paths, and user-owned XDG runtimes have
+distinct ownership and installation conventions.
 
 ### One Generic Release Tool
 
@@ -1043,6 +1114,10 @@ entitlements, signing order, and clean-machine qualification.
   other Linux architectures, and cross-architecture guest CPU emulation.
 - The initial GNU/Linux glibc 2.39 baseline does not claim compatibility with
   older releases.
+- Official Linux distribution is archive-only; Silo does not publish or qualify
+  native Linux packages.
+- Optional downstream native repackaging has no official Silo support or CI
+  matrix beyond archive byte and layout preservation requirements.
 - macOS packages the dormant krun helper but selects only VZ.
 - zip-only Python imports are unsupported unless the package is first
   materialized into a stable directory.
@@ -1057,21 +1132,25 @@ questions:
 - PKG and enterprise or MDM installation;
 - independently updated runtime components and compatibility ranges;
 - additional downloaded kernel management;
-- final npm scope and Python or Go public API design; and
+- final npm scope and Python or Go public API design;
 - a future Rust convenience installer, which belongs in a separate explicit
-  setup API or crate.
+  setup API or crate; and
+- the archive-signing mechanism, trust root, and release verification procedure.
 
 ## Deferred Implementation Work
 
 The following delivery work remains deferred:
 
+- an explicit user-owned archive installer with target and version selection,
+  digest verification, signature verification when available, safe extraction,
+  atomic installation, and optional `PATH` symlink creation; and
 - a `silo doctor` integrity and diagnostics command that may validate files,
   modes, dynamic dependencies, release checksums, macOS signatures, target
-  architecture, and kernel provenance; and
-- publishing an AUR `PKGBUILD`, which remains separate and requires review.
+  architecture, and kernel provenance.
 
-The layouts, discovery rules, XDG ownership model, and release staging contract
-in this ADR support these additions without replacement.
+These additions must remain outside `libvm`, runtime open, and VM startup. They
+must not delete user state. The layouts, discovery rules, XDG ownership model,
+and release staging contract in this ADR support them without replacement.
 
 ## External References
 
@@ -1084,4 +1163,3 @@ in this ADR support these additions without replacement.
 - [npm: `package.json` platform metadata and optional dependencies](https://docs.npmjs.com/cli/v11/configuring-npm/package-json)
 - [PEP 600: Future `manylinux` platform tags](https://peps.python.org/pep-0600/)
 - [Go Modules Reference: Authenticating modules](https://go.dev/ref/mod#authenticating)
-- [nFPM documentation](https://nfpm.goreleaser.com/)

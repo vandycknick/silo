@@ -20,14 +20,14 @@ implemented yet.
 
 | Platform | Implemented | Planned |
 | --- | --- | --- |
-| macOS arm64 | Runtime and portable archives, `Silo.app`, optional DMG | Notarization, stapling, Homebrew Cask |
-| Linux amd64 | Runtime and portable archives | deb, rpm, Arch, signatures, KVM package qualification |
-| Linux arm64 | Runtime and portable archives on a native host | Main-branch package CI, deb, rpm, Arch |
+| macOS arm64 | Runtime and portable archives, `Silo.app`, optional DMG, main Release Tip CI | Notarization, stapling, Homebrew Cask |
+| Linux amd64 | Runtime and portable archives, main Release Tip CI | KVM archive qualification |
+| Linux arm64 | Runtime and portable archives, main Release Tip CI | KVM archive qualification |
 | SDKs | Node native addon build | Runtime-carrying Node packages, Python wheels, Go runtime installer |
 
-The current commands do not produce native Linux packages, notarized macOS
-artifacts, Sigstore bundles, or published releases. Planned formats below are
-identified explicitly; do not infer a command from an ADR description.
+The current commands do not produce notarized macOS artifacts, release
+signatures, or published releases. Official Linux distribution is archive-only;
+native Linux distribution packages are not planned requirements.
 
 ## Prerequisites
 
@@ -90,9 +90,10 @@ lockfiles will fail rather than silently resolving a different release graph.
 
 ## Packaging Flow
 
-Every transport starts from one architecture-specific runtime payload. Native
-packages and generic archives are sibling consumers of that payload; they do not
-consume or invoke one another.
+Every transport starts from one architecture-specific runtime payload. The
+official Linux transports are the generic runtime and portable CLI archives.
+macOS additionally consumes that payload to build `Silo.app` and an optional
+DMG; no transport consumes or invokes another.
 
 ```text
 Source checkout
@@ -107,17 +108,16 @@ Adjacent release runtime
 Canonical runtime stage
 target/silo-runtime/<target>/release/
       |
-      +----------------------+-----------------------+
-      |                      |                       |
-      v                      v                       v
-Runtime archive       Portable CLI archive      Native package
-runtime + notices     runtime + CLI + notices   platform-specific
-      |                      |                       |
-      |                      |             macOS: Silo.app / DMG
-      |                      |             Linux: deb/rpm/Arch (planned)
-      v                      v
-SDK or embedding      Direct CLI distribution
-transport
+       +----------------------+--------------------------+
+       |                      |                          |
+       v                      v                          v
+Runtime archive       Portable CLI archive       macOS application package
+runtime + notices     runtime + CLI + notices    Silo.app / optional DMG
+       |                      |                          |
+       |                      |                          |
+       v                      v                          v
+SDK or embedding      Direct CLI distribution    macOS distribution
+transport              (official Linux transport)
 ```
 
 The canonical stage contains exactly the private runtime payload:
@@ -266,10 +266,9 @@ a symlink to `Silo.app/Contents/MacOS/silo`.
 
 ## Packaging Linux
 
-Linux currently produces generic runtime and portable CLI archives. Native deb,
-rpm, and Arch packages are specified by ADR 0012 but are not implemented yet.
-When added, `make package` should produce those native packages from the same
-canonical stage; it should not invoke `make archive`.
+Official Linux distribution consists of generic runtime and portable CLI
+archives for amd64 and arm64. It does not provide or require native Linux
+distribution packages.
 
 Run the current archive flow on a native amd64 or arm64 Linux host:
 
@@ -288,9 +287,51 @@ Linux archive verification currently checks archive integrity, layout, modes,
 SBOM and provenance structure, and release binary constraints. KVM boot
 qualification for the generic archive remains planned release work.
 
+## Downstream Repackaging
+
+Downstream maintainers producing a CLI package should repackage the official
+portable CLI archive for the exact revision and target they distribute, not
+rebuild Silo from source. The runtime-only archive remains the input for SDKs
+and embedders that provide their own frontend. This guide is revision-local:
+read the `PACKAGING.md` from the archive's source revision before qualifying a
+package.
+
+Select the exact target, then verify the archive against its adjacent SHA-256
+checksum before extraction. When release signatures are introduced, verify them
+as well. Treat each version and architecture as an atomic qualified set: retain
+the archive's file modes, third-party notices, helpers, assets, and resolved
+kernel together. Do not rebuild, replace, or substitute any component after
+qualification. The resulting distribution package is maintained and qualified
+by its downstream, not by Silo.
+
+Supported downstream layouts are:
+
+- Preserve the portable archive root and expose `<root>/bin/silo` through a
+  downstream-managed symlink.
+- Split the portable archive into `/usr/bin/silo` and
+  `/usr/lib/silo/{bin,assets}`.
+
+Existing runtime discovery support for libexec or multilib resolver layouts may
+be adopted as downstream policy. It is compatibility support, not an official
+Linux distribution layout or promise.
+
+Package uninstallers must not delete user-owned XDG state, including runtime
+data, configuration, caches, or logs.
+
+## Deferred Archive Installer Contract
+
+No archive installer is implemented today. A future installer must select an
+explicit target and version, verify the SHA-256 checksum and any future
+signature, and extract safely without accepting path traversal, links, or device
+files. It must preserve modes, stage into a temporary location, atomically
+install a versioned directory, and default to a user-owned location. A portable
+CLI installation may create a PATH symlink to `bin/silo`; a runtime-only
+installation has no CLI to expose. The installer must not download content at VM
+start or SDK import, and it must never delete user-owned state.
+
 ## Kernel Selection
 
-Release packages include the resolved default kernel bytes. A normal first VM
+Release artifacts include the resolved default kernel bytes. A normal first VM
 start therefore does not download the default kernel.
 
 The default kernel reference can be replaced with another OCI reference:
@@ -329,22 +370,35 @@ see the [kernel documentation](resources/kernels/README.md).
 | `make package DMG=1` | Yes | Versioned `Silo.app` and DMG |
 | `make install` | Yes | Installed app and CLI symlink |
 
-Running `make archive` followed by `make package` repeats release preparation.
-Cargo and staging may reuse unchanged outputs, but both commands independently
-resolve, stage, and audit their inputs. A future aggregate distribution command
-should prepare the release once and feed both archive and native packagers.
+On macOS, running `make archive` followed by `make package` repeats release
+preparation. Cargo and staging may reuse unchanged outputs, but both commands
+independently resolve, stage, and audit their inputs. A future macOS aggregate
+distribution command should prepare the release once and feed both archive and
+application packagers.
 
 ## Continuous Integration
 
-Pull requests and pushes to `main` run formatting, version, Clippy, and test
-checks on Linux and macOS. After those checks pass on `main`:
+`Test` runs formatting, version, Clippy, and test checks on Linux and macOS for
+pull requests, pushes to `main`, and manual dispatches. It intentionally has no
+path filtering: branch protection needs stable validation reports, and changes
+to documentation can be packaging inputs.
+
+`Release Tip` runs after a successful `Test` for a push to `main` (or by manual
+dispatch). Automatic runs package the exact SHA validated by `Test`; manual runs
+package the selected dispatch SHA. Its Rust cache is isolated to release
+packaging and is not used by validation. It also has no path filtering because
+there is no baseline and commit metadata can affect artifacts. Three parallel
+cells then produce:
 
 - Linux amd64 runs `make archive` and uploads both archive families and sidecars.
-- macOS arm64 runs `make package DMG=1` and uploads the DMG.
+- Linux arm64 runs `make archive` and uploads both archive families and sidecars.
+- macOS arm64 runs `make archive`, uploads both archive families and sidecars,
+  then runs `make package DMG=1` on the same runner and uploads the DMG
+  separately.
 
 CI artifacts are retained for 14 days. This is build validation, not release
-publication: CI does not currently sign Linux packages, notarize macOS output,
-publish release assets, or create native Linux packages.
+publication: CI does not currently create release signatures, notarize macOS
+output, or publish release assets.
 
 ## Architecture and Release Internals
 

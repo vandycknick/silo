@@ -17,6 +17,7 @@ use crate::targets::HostTarget;
 const APPLE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 pub const MACOS_DEPLOYMENT_TARGET: &str = "26.0";
 pub const CONTAINER_MARKER: &str = "SILO_RELEASE_CONTAINER";
+const SILO_RELEASE_CACHE_DIR: &str = "SILO_RELEASE_CACHE_DIR";
 
 #[derive(Debug)]
 pub struct Toolchains {
@@ -254,6 +255,9 @@ pub fn configure_command(
             command.env(name, value);
         }
     }
+    let cache_override = release_cache_override();
+    let cache_root = release_cache_root(target_dir, cache_override.as_deref());
+
     command
         .env(
             "PATH",
@@ -267,20 +271,23 @@ pub fn configure_command(
         .env("AR", archiver)
         .env(
             "CARGO_HOME",
-            release_cache_directory(target_dir, "cargo-home"),
+            release_cache_directory(&cache_root, "cargo-home"),
         )
         .env(
             "GOCACHE",
-            release_cache_directory(target_dir, "go-build-cache"),
+            release_cache_directory(&cache_root, "go-build-cache"),
         )
         .env(
             "GOMODCACHE",
-            release_cache_directory(target_dir, "go-module-cache"),
+            release_cache_directory(&cache_root, "go-module-cache"),
         )
-        .env("RUSTFLAGS", remapped_rustflags(workspace_root, target_dir))
+        .env(
+            "RUSTFLAGS",
+            remapped_rustflags(workspace_root, target_dir, &cache_root),
+        )
         .env(
             "CARGO_ENCODED_RUSTFLAGS",
-            remapped_rustflags_encoded(workspace_root, target_dir),
+            remapped_rustflags_encoded(workspace_root, target_dir, &cache_root),
         );
     Ok(())
 }
@@ -295,7 +302,13 @@ pub fn configure_guest_init_command(
         return;
     }
     let mut flags = vec!["-C".to_string(), "panic=abort".to_string()];
-    flags.extend(remapped_rustflag_parts(workspace_root, target_dir));
+    let cache_override = release_cache_override();
+    let cache_root = release_cache_root(target_dir, cache_override.as_deref());
+    flags.extend(remapped_rustflag_parts(
+        workspace_root,
+        target_dir,
+        &cache_root,
+    ));
     command
         .env("RUSTFLAGS", flags.join(" "))
         .env("CARGO_ENCODED_RUSTFLAGS", flags.join("\u{1f}"));
@@ -412,6 +425,7 @@ pub fn run_linux_release(
         .args([
             "buildx",
             "bake",
+            "--allow=fs.read=..",
             "--load",
             "--file",
             "release/docker-bake.hcl",
@@ -433,7 +447,17 @@ pub fn run_linux_release(
             path: target_dir.to_path_buf(),
             source,
         })?;
-    let cache = format!("silo-release-cache-{architecture}");
+    let cache_override = prepare_release_cache_override()?;
+    let cache = release_cache_mount(architecture, cache_override.as_deref());
+    let cache_mount = match cache {
+        ReleaseCacheMount::Bind { source } => format!(
+            "type=bind,source={},target=/release-cache",
+            source.display()
+        ),
+        ReleaseCacheMount::Volume { name } => {
+            format!("type=volume,source={name},target=/release-cache")
+        }
+    };
     let mut run = Command::new(docker);
     run.args(["run", "--rm", "--user"])
         .arg(format!("{}:{}", getuid().as_raw(), getgid().as_raw()))
@@ -448,14 +472,14 @@ pub fn run_linux_release(
             target.display()
         ))
         .args(["--mount"])
-        .arg(format!("type=volume,source={cache},target=/release-cache"))
+        .arg(cache_mount)
         .args([
             "--env",
             "SILO_RELEASE_CONTAINER=1",
             "--env",
             "CARGO_TARGET_DIR=/release-target",
             "--env",
-            "CARGO_HOME=/release-cache/cargo",
+            "CARGO_HOME=/release-cache/cargo-home",
             "--env",
             "GOMODCACHE=/release-cache/go-mod",
             "--env",
@@ -608,15 +632,23 @@ fn matches_native_architecture(actual: &str, expected: &str) -> bool {
     )
 }
 
-fn remapped_rustflags(workspace_root: &Path, target_dir: &Path) -> String {
-    remapped_rustflag_parts(workspace_root, target_dir).join(" ")
+fn remapped_rustflags(workspace_root: &Path, target_dir: &Path, cache_root: &Path) -> String {
+    remapped_rustflag_parts(workspace_root, target_dir, cache_root).join(" ")
 }
 
-fn remapped_rustflags_encoded(workspace_root: &Path, target_dir: &Path) -> String {
-    remapped_rustflag_parts(workspace_root, target_dir).join("\u{1f}")
+fn remapped_rustflags_encoded(
+    workspace_root: &Path,
+    target_dir: &Path,
+    cache_root: &Path,
+) -> String {
+    remapped_rustflag_parts(workspace_root, target_dir, cache_root).join("\u{1f}")
 }
 
-fn remapped_rustflag_parts(workspace_root: &Path, target_dir: &Path) -> Vec<String> {
+fn remapped_rustflag_parts(
+    workspace_root: &Path,
+    target_dir: &Path,
+    cache_root: &Path,
+) -> Vec<String> {
     let mut flags = vec![
         "-C".to_string(),
         "strip=symbols".to_string(),
@@ -629,13 +661,58 @@ fn remapped_rustflag_parts(workspace_root: &Path, target_dir: &Path) -> Vec<Stri
     ];
     flags.push(format!(
         "--remap-path-prefix={}=/usr/src/cargo",
-        release_cache_directory(target_dir, "cargo-home").display()
+        release_cache_directory(cache_root, "cargo-home").display()
     ));
     flags
 }
 
-fn release_cache_directory(target_dir: &Path, name: &str) -> PathBuf {
-    target_dir.join("silo-release-cache").join(name)
+fn release_cache_override() -> Option<PathBuf> {
+    env::var_os(SILO_RELEASE_CACHE_DIR).map(PathBuf::from)
+}
+
+fn release_cache_root(target_dir: &Path, override_dir: Option<&Path>) -> PathBuf {
+    override_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| target_dir.join("silo-release-cache"))
+}
+
+fn release_cache_directory(cache_root: &Path, name: &str) -> PathBuf {
+    cache_root.join(name)
+}
+
+fn prepare_release_cache_override() -> Result<Option<PathBuf>, ReleaseError> {
+    let Some(path) = release_cache_override() else {
+        return Ok(None);
+    };
+    fs::create_dir_all(&path).map_err(|source| ReleaseError::Io {
+        action: "create release cache directory",
+        path: path.clone(),
+        source,
+    })?;
+    path.canonicalize()
+        .map(Some)
+        .map_err(|source| ReleaseError::Io {
+            action: "resolve release cache directory",
+            path,
+            source,
+        })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReleaseCacheMount {
+    Bind { source: PathBuf },
+    Volume { name: String },
+}
+
+fn release_cache_mount(architecture: &str, override_dir: Option<&Path>) -> ReleaseCacheMount {
+    match override_dir {
+        Some(source) => ReleaseCacheMount::Bind {
+            source: source.to_path_buf(),
+        },
+        None => ReleaseCacheMount::Volume {
+            name: format!("silo-release-cache-{architecture}"),
+        },
+    }
 }
 
 fn program_directory(program: &Path, tool: &'static str) -> Result<PathBuf, ReleaseError> {
@@ -674,4 +751,47 @@ fn xcrun_sdk_path() -> Result<PathBuf, ReleaseError> {
         .trim()
         .to_string();
     Ok(PathBuf::from(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use crate::release::{release_cache_mount, release_cache_root, ReleaseCacheMount};
+
+    #[test]
+    fn release_cache_root_defaults_beneath_target_directory() {
+        assert_eq!(
+            release_cache_root(Path::new("/target"), None),
+            PathBuf::from("/target/silo-release-cache")
+        );
+    }
+
+    #[test]
+    fn release_cache_root_uses_override_directory() {
+        assert_eq!(
+            release_cache_root(Path::new("/target"), Some(Path::new("/cache"))),
+            PathBuf::from("/cache")
+        );
+    }
+
+    #[test]
+    fn release_cache_mount_uses_architecture_specific_volume_without_override() {
+        assert_eq!(
+            release_cache_mount("arm64", None),
+            ReleaseCacheMount::Volume {
+                name: "silo-release-cache-arm64".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn release_cache_mount_binds_override_directory() {
+        assert_eq!(
+            release_cache_mount("amd64", Some(Path::new("/cache"))),
+            ReleaseCacheMount::Bind {
+                source: PathBuf::from("/cache"),
+            }
+        );
+    }
 }
