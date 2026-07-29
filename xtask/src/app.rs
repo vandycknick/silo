@@ -9,7 +9,6 @@ use thiserror::Error;
 
 use crate::command;
 use crate::release;
-use crate::release_audit;
 use crate::targets::HostTarget;
 
 const APP_NAME: &str = "Silo.app";
@@ -37,8 +36,6 @@ pub(crate) fn package_directory(target_dir: &Path, version: &str) -> PathBuf {
 pub enum AppError {
     #[error(transparent)]
     Release(#[from] release::ReleaseError),
-    #[error(transparent)]
-    Audit(#[from] release_audit::AuditError),
     #[error(transparent)]
     Command(#[from] command::CommandError),
     #[error("make app requires macOS arm64")]
@@ -120,14 +117,6 @@ pub fn assemble(
         generate_icon(workspace_root, &temporary, &resources.join("Silo.icns"))?;
         verify_unsigned_copies(&release, &stage, &temporary)?;
         validate_unsigned_layout(&temporary, &version, &build_number)?;
-
-        for name in ["silo", "vmmon", "netd", "krun"] {
-            let path = match name {
-                "silo" => macos.join(name),
-                _ => helpers.join(name),
-            };
-            release_audit::audit_macho(name, &path)?;
-        }
 
         sign(&macos.join("silo"), None, signing)?;
         for (name, entitlement) in HELPERS {

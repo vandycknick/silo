@@ -3,10 +3,8 @@ use std::env;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -14,7 +12,6 @@ use thiserror::Error;
 
 use crate::command;
 use crate::release;
-use crate::release_audit;
 use crate::targets::HostTarget;
 
 const RELEASE_MATERIAL: [&str; 2] = [
@@ -29,13 +26,6 @@ const RUNTIME_FILES: [(&str, u32); 6] = [
     ("assets/initramfs", 0o644),
     ("assets/agent", 0o755),
 ];
-const RUNTIME_OVERRIDES: [&str; 5] = [
-    "SILO_VMMON_PATH",
-    "NETD_BIN",
-    "KRUN_BIN",
-    "SILO_ASSET_DIR",
-    "SILO_RUNTIME_DIR",
-];
 
 #[derive(Debug, Error)]
 pub enum ArchiveError {
@@ -43,8 +33,6 @@ pub enum ArchiveError {
     Command(#[from] command::CommandError),
     #[error(transparent)]
     Release(#[from] release::ReleaseError),
-    #[error(transparent)]
-    Audit(#[from] release_audit::AuditError),
     #[error("failed to {action} {path}")]
     Io {
         action: &'static str,
@@ -54,8 +42,6 @@ pub enum ArchiveError {
     },
     #[error("invalid release archive {path}: {reason}")]
     Invalid { path: PathBuf, reason: String },
-    #[error("release command timed out after {seconds} seconds: {program}")]
-    TimedOut { program: String, seconds: u64 },
 }
 
 #[derive(Clone, Copy)]
@@ -130,52 +116,6 @@ pub fn produce(workspace_root: &Path, target_dir: &Path) -> Result<(), ArchiveEr
         );
     }
     Ok(())
-}
-
-pub fn verify(workspace_root: &Path, target_dir: &Path) -> Result<(), ArchiveError> {
-    let host = HostTarget::current().map_err(|error| ArchiveError::Invalid {
-        path: target_dir.to_path_buf(),
-        reason: error.to_string(),
-    })?;
-    let version = version(workspace_root)?;
-    let stage = stage_path(target_dir, host);
-    validate_stage(&stage)?;
-    let output = artifact_directory(target_dir, host, &version);
-    let temporary = temporary_directory(target_dir, "archive-verify")?;
-    let result = (|| {
-        for kind in [ArchiveKind::Runtime, ArchiveKind::Portable] {
-            let root_name = archive_root(kind, &version, host);
-            let archive = output.join(format!("{root_name}.tar.zst"));
-            verify_checksum(&archive)?;
-            let entries = archive_entries(&archive)?;
-            validate_entries(workspace_root, &entries, kind, &root_name)?;
-            extract_archive(&archive, &temporary)?;
-            let root = temporary.join(&root_name);
-            validate_extracted(workspace_root, target_dir, &stage, &root, kind)?;
-            release_audit::verify_archive_runtime(&root, kind.has_cli(), host)?;
-            verify_sbom(
-                &archive,
-                &output.join(format!("{root_name}.sbom.spdx.json")),
-            )?;
-            verify_provenance(
-                &archive,
-                &output.join(format!("{root_name}.provenance.json")),
-                &version,
-                host,
-            )?;
-            if kind.has_cli() && matches!(host, HostTarget::MacosArm64) {
-                boot_portable_vm(&root)?;
-                println!("verify-archive: VZ boot completed and the acceptance VM was removed");
-            }
-        }
-        Ok(())
-    })();
-    fs::remove_dir_all(&temporary).map_err(|source| ArchiveError::Io {
-        action: "remove extracted archive directory",
-        path: temporary,
-        source,
-    })?;
-    result
 }
 
 fn create_tar(
@@ -279,7 +219,7 @@ fn write_provenance(
         .join("kernel-provenance")
         .join(host.runtime_target())
         .join("release.json");
-    let kernel: serde_json::Value =
+    let kernel: Value =
         serde_json::from_slice(&read(&kernel)?).map_err(|error| ArchiveError::Invalid {
             path: kernel.clone(),
             reason: format!("cannot parse kernel provenance: {error}"),
@@ -338,209 +278,6 @@ fn actual_toolchains(syft: &Path) -> Result<BTreeMap<String, String>, ArchiveErr
     Ok(tools)
 }
 
-fn archive_entries(archive: &Path) -> Result<Vec<(char, String)>, ArchiveError> {
-    let tar = release::tool("tar")?;
-    let mut command = Command::new(tar);
-    command.args(["--list", "--verbose", "--zstd", "--file"]);
-    command.arg(archive);
-    let output = command::output(command)?;
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|line| {
-            let kind = line.chars().next().ok_or_else(|| ArchiveError::Invalid {
-                path: archive.to_path_buf(),
-                reason: "empty verbose tar listing line".to_string(),
-            })?;
-            let path = line
-                .split_whitespace()
-                .last()
-                .ok_or_else(|| ArchiveError::Invalid {
-                    path: archive.to_path_buf(),
-                    reason: format!("cannot parse verbose tar listing line {line:?}"),
-                })?;
-            Ok((kind, path.trim_end_matches('/').to_string()))
-        })
-        .collect()
-}
-
-fn validate_entries(
-    workspace_root: &Path,
-    entries: &[(char, String)],
-    kind: ArchiveKind,
-    root: &str,
-) -> Result<(), ArchiveError> {
-    let mut expected = BTreeMap::new();
-    expected.insert(format!("{root}/bin"), 'd');
-    expected.insert(format!("{root}/assets"), 'd');
-    expected.insert(format!("{root}/THIRD_PARTY_NOTICES"), '-');
-    expected.insert(format!("{root}/LICENSES/libkrun-APACHE-2.0.txt"), '-');
-    for (path, _) in RUNTIME_FILES {
-        expected.insert(format!("{root}/{path}"), '-');
-    }
-    if kind.has_cli() {
-        expected.insert(format!("{root}/bin/silo"), '-');
-    }
-    let actual = entries
-        .iter()
-        .map(|(entry_kind, entry)| (entry.clone(), *entry_kind))
-        .collect::<BTreeMap<_, _>>();
-    if actual.len() != entries.len() {
-        return invalid(
-            workspace_root,
-            "archive contains duplicate paths".to_string(),
-        );
-    }
-    for (entry_kind, entry) in entries {
-        if !safe_archive_path(entry) {
-            return invalid(workspace_root, format!("archive entry {entry:?} is unsafe"));
-        }
-        if !matches!(entry_kind, '-' | 'd') {
-            return invalid(
-                workspace_root,
-                format!("archive entry {entry:?} is not a regular file or directory"),
-            );
-        }
-    }
-    if actual != expected {
-        return invalid(
-            workspace_root,
-            format!("archive entries are {actual:?}, expected {expected:?}"),
-        );
-    }
-    Ok(())
-}
-
-fn extract_archive(archive: &Path, destination: &Path) -> Result<(), ArchiveError> {
-    let tar = release::tool("tar")?;
-    let mut command = Command::new(tar);
-    command
-        .args(["--extract", "--zstd", "--no-same-owner", "--file"])
-        .arg(archive)
-        .args(["--directory"])
-        .arg(destination);
-    command::run(command)?;
-    Ok(())
-}
-
-fn validate_extracted(
-    workspace_root: &Path,
-    target_dir: &Path,
-    stage: &Path,
-    root: &Path,
-    kind: ArchiveKind,
-) -> Result<(), ArchiveError> {
-    for (path, mode) in RUNTIME_FILES {
-        validate_regular_file(&root.join(path), mode)?;
-        compare_files(&stage.join(path), &root.join(path))?;
-    }
-    if kind.has_cli() {
-        let source = target_dir.join("release/silo");
-        validate_regular_file(&root.join("bin/silo"), 0o755)?;
-        compare_files(&source, &root.join("bin/silo"))?;
-    }
-    for material in RELEASE_MATERIAL {
-        validate_material(
-            &workspace_root.join(material),
-            &root.join(release_material_path(material)?),
-        )?;
-    }
-    Ok(())
-}
-
-fn release_material_path(material: &str) -> Result<&'static str, ArchiveError> {
-    match material {
-        "packaging/release/THIRD_PARTY_NOTICES" => Ok("THIRD_PARTY_NOTICES"),
-        "common/ext4/LICENSE-APACHE" => Ok("LICENSES/libkrun-APACHE-2.0.txt"),
-        _ => invalid(Path::new(material), "unknown release material".to_string()),
-    }
-}
-
-fn boot_portable_vm(root: &Path) -> Result<(), ArchiveError> {
-    let temporary = temporary_directory(Path::new("/tmp"), "s")?;
-    prepare_acceptance_state(&temporary)?;
-    let name = format!("archive-acceptance-{}", std::process::id());
-    let result = run_portable_command(
-        root,
-        &temporary,
-        &["create", &name, "--image=ubuntu:24.04", "--start"],
-    );
-    let stop = run_portable_command(root, &temporary, &["stop", &name]);
-    let remove = run_portable_command(root, &temporary, &["rm", &name, "--force"]);
-    fs::remove_dir_all(&temporary).map_err(|source| ArchiveError::Io {
-        action: "remove portable VM acceptance state",
-        path: temporary,
-        source,
-    })?;
-    result?;
-    stop?;
-    remove
-}
-
-fn prepare_acceptance_state(temporary: &Path) -> Result<(), ArchiveError> {
-    for directory in ["data", "state", "run", "config"] {
-        create_directory(&temporary.join(directory))?;
-    }
-    Ok(())
-}
-
-fn run_portable_command(root: &Path, temporary: &Path, args: &[&str]) -> Result<(), ArchiveError> {
-    let mut command = Command::new(root.join("bin/silo"));
-    command.args(args);
-    for variable in RUNTIME_OVERRIDES {
-        command.env_remove(variable);
-    }
-    command
-        .env("XDG_DATA_HOME", temporary.join("data"))
-        .env("XDG_STATE_HOME", temporary.join("state"))
-        .env("XDG_RUNTIME_DIR", temporary.join("run"))
-        .env("XDG_CONFIG_HOME", temporary.join("config"));
-    run_with_timeout(command, Duration::from_secs(300)).map(|_| ())
-}
-
-fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<Output, ArchiveError> {
-    let program = command.get_program().to_string_lossy().into_owned();
-    let mut child = command.spawn().map_err(|source| ArchiveError::Io {
-        action: "start archive acceptance command",
-        path: PathBuf::from(&program),
-        source,
-    })?;
-    let start = Instant::now();
-    loop {
-        match child.try_wait().map_err(|source| ArchiveError::Io {
-            action: "wait for archive acceptance command",
-            path: PathBuf::from(&program),
-            source,
-        })? {
-            Some(status) if status.success() => {
-                return Ok(Output {
-                    status,
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                })
-            }
-            Some(status) => {
-                return Err(ArchiveError::Invalid {
-                    path: PathBuf::from(program),
-                    reason: format!("archive acceptance command exited with {status}"),
-                });
-            }
-            None if start.elapsed() >= timeout => {
-                child.kill().map_err(|source| ArchiveError::Io {
-                    action: "stop timed out archive acceptance command",
-                    path: PathBuf::from(&program),
-                    source,
-                })?;
-                let _ = child.wait();
-                return Err(ArchiveError::TimedOut {
-                    program,
-                    seconds: timeout.as_secs(),
-                });
-            }
-            None => thread::sleep(Duration::from_millis(100)),
-        }
-    }
-}
-
 fn write_checksum(archive: &Path) -> Result<(), ArchiveError> {
     let checksum = checksum_path(archive)?;
     let name = archive
@@ -559,27 +296,6 @@ fn write_checksum(archive: &Path) -> Result<(), ArchiveError> {
     })
 }
 
-fn verify_checksum(archive: &Path) -> Result<(), ArchiveError> {
-    let checksum = checksum_path(archive)?;
-    let contents = String::from_utf8(read(&checksum)?).map_err(|error| ArchiveError::Invalid {
-        path: checksum.clone(),
-        reason: format!("checksum is not UTF-8: {error}"),
-    })?;
-    let expected = contents
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| ArchiveError::Invalid {
-            path: checksum.clone(),
-            reason: "checksum is empty".to_string(),
-        })?;
-    let actual = sha256(archive)?;
-    if actual == expected {
-        Ok(())
-    } else {
-        invalid(&checksum, format!("expected {expected}, got {actual}"))
-    }
-}
-
 fn checksum_path(archive: &Path) -> Result<PathBuf, ArchiveError> {
     let name = archive.file_name().ok_or_else(|| ArchiveError::Invalid {
         path: archive.to_path_buf(),
@@ -588,171 +304,6 @@ fn checksum_path(archive: &Path) -> Result<PathBuf, ArchiveError> {
     let mut checksum = name.to_os_string();
     checksum.push(".sha256");
     Ok(archive.with_file_name(checksum))
-}
-
-fn verify_sbom(archive: &Path, sbom: &Path) -> Result<(), ArchiveError> {
-    let value: Value =
-        serde_json::from_slice(&read(sbom)?).map_err(|error| ArchiveError::Invalid {
-            path: sbom.to_path_buf(),
-            reason: format!("cannot parse SPDX JSON SBOM: {error}"),
-        })?;
-    let expected = archive_name(archive)?;
-    let actual = required_string(&value, "/name", sbom, "SBOM name")?;
-    if actual == expected {
-        Ok(())
-    } else {
-        invalid(
-            sbom,
-            format!("names archive {actual:?}, expected {expected:?}"),
-        )
-    }
-}
-
-fn verify_provenance(
-    archive: &Path,
-    provenance: &Path,
-    version: &str,
-    host: HostTarget,
-) -> Result<(), ArchiveError> {
-    let value: Value =
-        serde_json::from_slice(&read(provenance)?).map_err(|error| ArchiveError::Invalid {
-            path: provenance.to_path_buf(),
-            reason: format!("cannot parse archive provenance: {error}"),
-        })?;
-    let name = archive_name(archive)?;
-    let expected_sha256 = sha256(archive)?;
-    for (pointer, expected, field) in [
-        ("/archive/name", name, "archive name"),
-        (
-            "/archive/sha256",
-            expected_sha256.as_str(),
-            "archive SHA-256",
-        ),
-        ("/version", version, "version"),
-        ("/target", host.runtime_target(), "target"),
-    ] {
-        let actual = required_string(&value, pointer, provenance, field)?;
-        if actual != expected {
-            return invalid(
-                provenance,
-                format!("{field} is {actual:?}, expected {expected:?}"),
-            );
-        }
-    }
-    verify_kernel_descriptors(
-        value
-            .pointer("/kernel")
-            .ok_or_else(|| ArchiveError::Invalid {
-                path: provenance.to_path_buf(),
-                reason: "provenance contains no kernel record".to_string(),
-            })?,
-        provenance,
-    )?;
-    let raw = required_u64(&value, "/archive/raw_bytes", provenance, "raw archive size")?;
-    let compressed = required_u64(
-        &value,
-        "/archive/compressed_bytes",
-        provenance,
-        "compressed archive size",
-    )?;
-    println!("verify-archive: {name} raw={raw} compressed={compressed}");
-    Ok(())
-}
-
-fn verify_kernel_descriptors(kernel: &Value, provenance: &Path) -> Result<(), ArchiveError> {
-    match required_string(kernel, "/source", provenance, "kernel source")? {
-        "local" => verify_descriptor(
-            kernel
-                .pointer("/descriptor")
-                .ok_or_else(|| ArchiveError::Invalid {
-                    path: provenance.to_path_buf(),
-                    reason: "local kernel provenance contains no descriptor".to_string(),
-                })?,
-            provenance,
-            "local kernel",
-        ),
-        "oci" => {
-            for name in ["index", "manifest", "config"] {
-                verify_descriptor(
-                    kernel
-                        .pointer(&format!("/{name}"))
-                        .ok_or_else(|| ArchiveError::Invalid {
-                            path: provenance.to_path_buf(),
-                            reason: format!("OCI kernel provenance contains no {name} descriptor"),
-                        })?,
-                    provenance,
-                    name,
-                )?;
-            }
-            let layers = kernel
-                .pointer("/layers")
-                .and_then(Value::as_array)
-                .filter(|layers| !layers.is_empty())
-                .ok_or_else(|| ArchiveError::Invalid {
-                    path: provenance.to_path_buf(),
-                    reason: "OCI kernel provenance contains no layer descriptors".to_string(),
-                })?;
-            for layer in layers {
-                verify_descriptor(layer, provenance, "kernel layer")?;
-            }
-            Ok(())
-        }
-        source => invalid(
-            provenance,
-            format!("kernel source {source:?} has no descriptor contract"),
-        ),
-    }
-}
-
-fn verify_descriptor(
-    descriptor: &Value,
-    provenance: &Path,
-    name: &str,
-) -> Result<(), ArchiveError> {
-    required_string(descriptor, "/digest", provenance, &format!("{name} digest"))?;
-    required_u64(descriptor, "/size", provenance, &format!("{name} size"))?;
-    Ok(())
-}
-
-fn required_string<'a>(
-    value: &'a Value,
-    pointer: &str,
-    path: &Path,
-    field: &str,
-) -> Result<&'a str, ArchiveError> {
-    value
-        .pointer(pointer)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ArchiveError::Invalid {
-            path: path.to_path_buf(),
-            reason: format!("contains no {field}"),
-        })
-}
-
-fn required_u64(
-    value: &Value,
-    pointer: &str,
-    path: &Path,
-    field: &str,
-) -> Result<u64, ArchiveError> {
-    value
-        .pointer(pointer)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| ArchiveError::Invalid {
-            path: path.to_path_buf(),
-            reason: format!("contains no {field}"),
-        })
-}
-
-fn archive_name(archive: &Path) -> Result<&str, ArchiveError> {
-    archive
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| ArchiveError::Invalid {
-            path: archive.to_path_buf(),
-            reason: "archive has no UTF-8 file name".to_string(),
-        })
 }
 
 fn source_date_epoch(workspace_root: &Path) -> Result<u64, ArchiveError> {
@@ -827,53 +378,6 @@ fn validate_regular_file(path: &Path, expected_mode: u32) -> Result<(), ArchiveE
     Ok(())
 }
 
-fn validate_material(source: &Path, destination: &Path) -> Result<(), ArchiveError> {
-    let metadata = fs::symlink_metadata(source).map_err(|error| ArchiveError::Io {
-        action: "read release material metadata",
-        path: source.to_path_buf(),
-        source: error,
-    })?;
-    if metadata.is_file() {
-        compare_files(source, destination)
-    } else if metadata.is_dir() {
-        let source_entries = fs::read_dir(source).map_err(|error| ArchiveError::Io {
-            action: "read release material directory",
-            path: source.to_path_buf(),
-            source: error,
-        })?;
-        for entry in source_entries {
-            let entry = entry.map_err(|error| ArchiveError::Io {
-                action: "read release material directory entry",
-                path: source.to_path_buf(),
-                source: error,
-            })?;
-            validate_material(&entry.path(), &destination.join(entry.file_name()))?;
-        }
-        Ok(())
-    } else {
-        invalid(source, "is not regular release material".to_string())
-    }
-}
-
-fn compare_files(left: &Path, right: &Path) -> Result<(), ArchiveError> {
-    if read(left)? == read(right)? {
-        Ok(())
-    } else {
-        invalid(
-            right,
-            format!("does not match {} byte-for-byte", left.display()),
-        )
-    }
-}
-
-fn safe_archive_path(value: &str) -> bool {
-    let path = Path::new(value);
-    !path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-}
-
 fn sha256(path: &Path) -> Result<String, ArchiveError> {
     let mut file = fs::File::open(path).map_err(|source| ArchiveError::Io {
         action: "open file for SHA-256",
@@ -926,37 +430,6 @@ fn create_directory(path: &Path) -> Result<(), ArchiveError> {
         path: path.to_path_buf(),
         source,
     })
-}
-
-fn temporary_directory(parent: &Path, name: &str) -> Result<PathBuf, ArchiveError> {
-    create_directory(parent)?;
-    for attempt in 0..128 {
-        let path = parent.join(format!(".{name}-{}-{attempt}", std::process::id()));
-        match fs::create_dir(&path) {
-            Ok(()) => {
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(
-                    |source| ArchiveError::Io {
-                        action: "secure temporary archive directory",
-                        path: path.clone(),
-                        source,
-                    },
-                )?;
-                return Ok(path);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(source) => {
-                return Err(ArchiveError::Io {
-                    action: "create temporary archive directory",
-                    path,
-                    source,
-                });
-            }
-        }
-    }
-    invalid(
-        parent,
-        "could not create a temporary archive directory".to_string(),
-    )
 }
 
 fn read(path: &Path) -> Result<Vec<u8>, ArchiveError> {

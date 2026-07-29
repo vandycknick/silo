@@ -101,6 +101,9 @@ jobs:
       - name: Build release archives
         run: nix develop .#release --command make archive
 
+      - name: Smoke test release CLI
+        run: target/release/silo --help
+
       - name: Build macOS package
         if: ${{ matrix.create_dmg }}
         run: nix develop .#release --command make package DMG=1

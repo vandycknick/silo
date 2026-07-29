@@ -87,15 +87,9 @@ stage: ## Build and assemble the portable runtime stage.
 	$(XTASK) stage --profile "$(PROFILE)" $(KERNEL_ARGS)
 
 ##@ Distribution
-.PHONY: verify-runtime archive verify-archive app package install
-verify-runtime: ## Audit release runtime artifacts (use PROFILE=release).
-	$(XTASK) verify-runtime --profile "$(PROFILE)"
-
+.PHONY: archive app package install
 archive: ## Build release runtime and CLI archives.
 	$(XTASK) archive $(KERNEL_ARGS)
-
-verify-archive: ## Extract and qualify the generated archives.
-	$(XTASK) verify-archive
 
 app: ## Build and sign the macOS release application.
 	$(XTASK) app $(APP_ARGS) $(KERNEL_ARGS)

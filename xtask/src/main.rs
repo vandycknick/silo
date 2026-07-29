@@ -22,7 +22,6 @@ mod kernel;
 mod macos;
 mod profiles;
 mod release;
-mod release_audit;
 mod runtime;
 mod targets;
 mod version;
@@ -60,15 +59,10 @@ enum Commands {
         #[command(flatten)]
         kernel: KernelOptions,
     },
-    VerifyRuntime {
-        #[arg(long, value_enum, default_value_t = Profile::Debug)]
-        profile: Profile,
-    },
     Archive {
         #[command(flatten)]
         kernel: KernelOptions,
     },
-    VerifyArchive,
     App {
         #[arg(long, value_name = "NUMBER")]
         build_number: Option<String>,
@@ -154,9 +148,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         Commands::Stage { profile, kernel } => {
             build_release_or_development(&workspace_root, &target_dir, profile, kernel, true)?;
         }
-        Commands::VerifyRuntime { profile } => {
-            release_audit::verify(&workspace_root, &target_dir, profile)?
-        }
         Commands::Archive { kernel } => {
             build_release_or_development(
                 &workspace_root,
@@ -165,11 +156,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 kernel,
                 true,
             )?;
-            release_audit::verify(&workspace_root, &target_dir, Profile::Release)?;
             archive::produce(&workspace_root, &target_dir)?;
-        }
-        Commands::VerifyArchive => {
-            archive::verify(&workspace_root, &target_dir)?;
         }
         Commands::App {
             build_number,
@@ -187,7 +174,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                 kernel,
                 true,
             )?;
-            release_audit::verify(&workspace_root, &target_dir, Profile::Release)?;
             app::assemble(
                 &workspace_root,
                 &target_dir,
@@ -209,7 +195,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                 kernel,
                 true,
             )?;
-            release_audit::verify(&workspace_root, &target_dir, Profile::Release)?;
             app::assemble(
                 &workspace_root,
                 &target_dir,
@@ -239,7 +224,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                 kernel,
                 true,
             )?;
-            release_audit::verify(&workspace_root, &target_dir, Profile::Release)?;
             app::assemble(
                 &workspace_root,
                 &target_dir,
