@@ -425,7 +425,6 @@ pub fn run_linux_release(
         .args([
             "buildx",
             "bake",
-            "--allow=fs.read=..",
             "--load",
             "--file",
             "release/docker-bake.hcl",

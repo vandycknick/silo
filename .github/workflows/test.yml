@@ -44,6 +44,10 @@ jobs:
       - name: Check versions
         run: nix develop --command make version-check
 
+      - name: Check release container definition
+        if: matrix.platform == 'linux'
+        run: nix develop --command docker buildx bake --check --file release/docker-bake.hcl silo-release
+
       - name: Run Clippy
         run: nix develop --command make clippy
 

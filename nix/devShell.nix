@@ -48,6 +48,6 @@ pkgs.mkShell {
     workspace_root="$(pwd -P)"
     export PATH="$workspace_root/target/debug:$workspace_root/scripts:$PATH"
     export LIBCLANG_PATH="${llvm.libclang.lib}/lib"
-    echo "Entering silo dev shell. Run: make build"
+    echo "Entering silo dev shell. Run: make build" >&2
   '';
 }

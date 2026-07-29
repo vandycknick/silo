@@ -3,7 +3,7 @@ variable "TARGETARCH" {
 }
 
 target "silo-release" {
-  context = ".."
+  context = "."
   dockerfile = "release/Containerfile"
   platforms = ["linux/${TARGETARCH}"]
   tags = ["silo-release:linux-${TARGETARCH}"]

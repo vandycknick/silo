@@ -8,8 +8,8 @@ tool versions before it can be used.
 Build a native release environment with Docker Buildx:
 
 ```text
-TARGETARCH=amd64 docker buildx bake --allow=fs.read=.. --load -f release/docker-bake.hcl silo-release
-TARGETARCH=arm64 docker buildx bake --allow=fs.read=.. --load -f release/docker-bake.hcl silo-release
+TARGETARCH=amd64 docker buildx bake --load -f release/docker-bake.hcl silo-release
+TARGETARCH=arm64 docker buildx bake --load -f release/docker-bake.hcl silo-release
 ```
 
 On Linux, `make PROFILE=release`, `make stage PROFILE=release`,
