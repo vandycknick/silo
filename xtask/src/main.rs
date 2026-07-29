@@ -140,29 +140,9 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     match args.command {
         Commands::Build { profile, kernel } => {
-            if profile == Profile::Release && should_use_linux_container()? {
-                release::run_linux_release(
-                    &workspace_root,
-                    &target_dir,
-                    HostTarget::current()?,
-                    "build",
-                    Some(&kernel),
-                )?;
-                return Ok(());
-            }
             build_release_or_development(&workspace_root, &target_dir, profile, kernel, false)?;
         }
         Commands::Component { component, profile } => {
-            if profile == Profile::Release && should_use_linux_container()? {
-                release::run_linux_release(
-                    &workspace_root,
-                    &target_dir,
-                    HostTarget::current()?,
-                    component_make_target(component),
-                    None,
-                )?;
-                return Ok(());
-            }
             let context = build_context(&workspace_root, &target_dir, profile)?;
             build_component(component, &context)?;
         }
@@ -172,50 +152,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!("{}", kernel.path.display());
         }
         Commands::Stage { profile, kernel } => {
-            if profile == Profile::Release && should_use_linux_container()? {
-                release::run_linux_release(
-                    &workspace_root,
-                    &target_dir,
-                    HostTarget::current()?,
-                    "stage",
-                    Some(&kernel),
-                )?;
-                return Ok(());
-            }
             build_release_or_development(&workspace_root, &target_dir, profile, kernel, true)?;
         }
         Commands::VerifyRuntime { profile } => {
-            if profile == Profile::Release && should_use_linux_container()? {
-                release::run_linux_release(
-                    &workspace_root,
-                    &target_dir,
-                    HostTarget::current()?,
-                    "verify-runtime",
-                    None,
-                )?;
-                return Ok(());
-            }
-            if profile == Profile::Release
-                && matches!(
-                    HostTarget::current()?,
-                    HostTarget::LinuxX86_64 | HostTarget::LinuxArm64
-                )
-            {
-                release::verify_linux_toolchain(&workspace_root, HostTarget::current()?)?;
-            }
             release_audit::verify(&workspace_root, &target_dir, profile)?
         }
         Commands::Archive { kernel } => {
-            if should_use_linux_container()? {
-                release::run_linux_release(
-                    &workspace_root,
-                    &target_dir,
-                    HostTarget::current()?,
-                    "archive",
-                    Some(&kernel),
-                )?;
-                return Ok(());
-            }
             build_release_or_development(
                 &workspace_root,
                 &target_dir,
@@ -227,16 +169,6 @@ fn run() -> Result<(), Box<dyn Error>> {
             archive::produce(&workspace_root, &target_dir)?;
         }
         Commands::VerifyArchive => {
-            if should_use_linux_container()? {
-                release::run_linux_release(
-                    &workspace_root,
-                    &target_dir,
-                    HostTarget::current()?,
-                    "verify-archive",
-                    None,
-                )?;
-                return Ok(());
-            }
             archive::verify(&workspace_root, &target_dir)?;
         }
         Commands::App {
@@ -349,14 +281,6 @@ fn build_release_or_development(
     kernel_options: KernelOptions,
     stage: bool,
 ) -> Result<(), Box<dyn Error>> {
-    if profile == Profile::Release
-        && matches!(
-            HostTarget::current()?,
-            HostTarget::LinuxX86_64 | HostTarget::LinuxArm64
-        )
-    {
-        release::verify_linux_toolchain(workspace_root, HostTarget::current()?)?;
-    }
     let context = build_context(workspace_root, target_dir, profile)?;
     build_all(&context)?;
     let kernel = kernel::resolve(&context, &kernel_options)?;
@@ -365,25 +289,6 @@ fn build_release_or_development(
         runtime::stage(&context)?;
     }
     Ok(())
-}
-
-fn should_use_linux_container() -> Result<bool, Box<dyn Error>> {
-    Ok(matches!(
-        HostTarget::current()?,
-        HostTarget::LinuxX86_64 | HostTarget::LinuxArm64
-    ) && env::var_os(release::CONTAINER_MARKER).is_none())
-}
-
-fn component_make_target(component: Component) -> &'static str {
-    match component {
-        Component::Cli => "cli",
-        Component::Vmmon => "vmmon",
-        Component::Netd => "netd",
-        Component::Krun => "krun",
-        Component::Agent => "agent",
-        Component::Init => "init",
-        Component::Initramfs => "initramfs",
-    }
 }
 
 fn build_context<'a>(

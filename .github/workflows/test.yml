@@ -42,11 +42,7 @@ jobs:
         run: nix develop --command make fmt
 
       - name: Check versions
-        run: nix develop --command make version-check
-
-      - name: Check release container definition
-        if: matrix.platform == 'linux'
-        run: nix develop --command docker buildx bake --check --file release/docker-bake.hcl silo-release
+        run: nix develop .#release --command make version-check
 
       - name: Run Clippy
         run: nix develop --command make clippy

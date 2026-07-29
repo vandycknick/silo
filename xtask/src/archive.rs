@@ -88,7 +88,7 @@ pub fn produce(workspace_root: &Path, target_dir: &Path) -> Result<(), ArchiveEr
     validate_stage(&stage)?;
     let output = artifact_directory(target_dir, host, &version);
     create_directory(&output)?;
-    let syft = syft_program(workspace_root, target_dir, host)?;
+    let syft = release::tool("syft")?;
 
     for kind in [ArchiveKind::Runtime, ArchiveKind::Portable] {
         let root = archive_root(kind, &version, host);
@@ -303,7 +303,7 @@ fn write_provenance(
         "kernel": kernel,
         "source_revision": git_output(workspace_root, ["rev-parse", "HEAD"] )?,
         "target": host.runtime_target(),
-        "toolchains": actual_toolchains(workspace_root, target_dir, syft)?,
+        "toolchains": actual_toolchains(syft)?,
         "version": version,
     });
     let bytes = serde_json::to_vec_pretty(&provenance).map_err(|error| ArchiveError::Invalid {
@@ -317,17 +317,12 @@ fn write_provenance(
     })
 }
 
-fn actual_toolchains(
-    workspace_root: &Path,
-    target_dir: &Path,
-    syft: &Path,
-) -> Result<BTreeMap<String, String>, ArchiveError> {
-    let go = release::go_program(target_dir, workspace_root, true)?;
+fn actual_toolchains(syft: &Path) -> Result<BTreeMap<String, String>, ArchiveError> {
     let mut tools = BTreeMap::new();
     for (name, path, args) in [
         ("cargo", release::tool("cargo")?, vec!["--version"]),
         ("rustc", release::tool("rustc")?, vec!["--version"]),
-        ("go", go, vec!["version"]),
+        ("go", release::tool("go")?, vec!["version"]),
         ("zig", release::tool("zig")?, vec!["version"]),
         (
             "cargo-zigbuild",
@@ -338,124 +333,9 @@ fn actual_toolchains(
         ("zstd", release::tool("zstd")?, vec!["--version"]),
         ("syft", syft.to_path_buf(), vec!["version"]),
     ] {
-        tools.insert(name.to_string(), tool_output(&path, &args)?);
+        tools.insert(name.to_string(), release::tool_output(&path, &args)?);
     }
     Ok(tools)
-}
-
-fn syft_program(
-    workspace_root: &Path,
-    target_dir: &Path,
-    host: HostTarget,
-) -> Result<PathBuf, ArchiveError> {
-    let tools = release::toolchains(workspace_root)?;
-    let version = tools.value("tools.syft")?;
-    let platform = match host {
-        HostTarget::MacosArm64 => "darwin_arm64",
-        HostTarget::LinuxX86_64 => "linux_amd64",
-        HostTarget::LinuxArm64 => "linux_arm64",
-    };
-    let digest = tools.value(&format!("tools.syft_{platform}_sha256"))?;
-    let root = target_dir.join("release-tools");
-    create_directory(&root)?;
-    let archive = root.join(format!("syft_{version}_{platform}.tar.gz"));
-    let program = root.join(format!("syft-{version}-{platform}"));
-    if archive.is_file() {
-        match verify_digest(&archive, digest) {
-            Ok(()) => {}
-            Err(ArchiveError::Invalid { .. }) => {
-                fs::remove_file(&archive).map_err(|source| ArchiveError::Io {
-                    action: "remove invalid cached Syft archive",
-                    path: archive.clone(),
-                    source,
-                })?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    if !archive.is_file() {
-        let temporary = temporary_file(&root, "syft-download")?;
-        let mut curl = Command::new("/usr/bin/curl");
-        curl.args([
-            "--fail",
-            "--location",
-            "--silent",
-            "--show-error",
-            "--output",
-        ])
-        .arg(&temporary)
-        .arg(format!(
-            "https://github.com/anchore/syft/releases/download/v{version}/syft_{version}_{platform}.tar.gz"
-        ));
-        let result = (|| {
-            command::run(curl)?;
-            verify_digest(&temporary, digest)?;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644)).map_err(
-                |source| ArchiveError::Io {
-                    action: "set cached Syft archive mode",
-                    path: temporary.clone(),
-                    source,
-                },
-            )?;
-            fs::rename(&temporary, &archive).map_err(|source| ArchiveError::Io {
-                action: "install pinned Syft archive",
-                path: archive.clone(),
-                source,
-            })
-        })();
-        if temporary.exists() {
-            fs::remove_file(&temporary).map_err(|source| ArchiveError::Io {
-                action: "remove temporary Syft download",
-                path: temporary,
-                source,
-            })?;
-        }
-        result?;
-    }
-    if !program.is_file() {
-        let temporary = temporary_directory(&root, "syft")?;
-        let result = (|| {
-            let tar = release::tool("tar")?;
-            let mut extract = Command::new(tar);
-            extract.args(["-xzf"]);
-            extract.arg(&archive).args(["-C"]).arg(&temporary);
-            command::run(extract)?;
-            let extracted = temporary.join("syft");
-            if !extracted.is_file() {
-                return invalid(
-                    &extracted,
-                    "pinned Syft archive contains no syft executable".to_string(),
-                );
-            }
-            fs::set_permissions(&extracted, fs::Permissions::from_mode(0o755)).map_err(
-                |source| ArchiveError::Io {
-                    action: "set pinned Syft executable mode",
-                    path: extracted.clone(),
-                    source,
-                },
-            )?;
-            fs::rename(&extracted, &program).map_err(|source| ArchiveError::Io {
-                action: "install pinned Syft executable",
-                path: program.clone(),
-                source,
-            })
-        })();
-        fs::remove_dir_all(&temporary).map_err(|source| ArchiveError::Io {
-            action: "remove Syft extraction directory",
-            path: temporary,
-            source,
-        })?;
-        result?;
-    }
-    let reported = tool_output(&program, &["version"])?;
-    if reported.contains(version) {
-        Ok(program)
-    } else {
-        invalid(
-            &program,
-            format!("reported {reported:?}, expected Syft {version}"),
-        )
-    }
 }
 
 fn archive_entries(archive: &Path) -> Result<Vec<(char, String)>, ArchiveError> {
@@ -913,8 +793,8 @@ fn stage_path(target_dir: &Path, host: HostTarget) -> PathBuf {
 fn artifact_directory(target_dir: &Path, host: HostTarget, version: &str) -> PathBuf {
     target_dir
         .join("packages")
-        .join(host.runtime_target())
         .join(version)
+        .join(host.runtime_target())
 }
 
 fn archive_root(kind: ArchiveKind, version: &str, host: HostTarget) -> String {
@@ -1020,28 +900,12 @@ fn sha256(path: &Path) -> Result<String, ArchiveError> {
         .collect())
 }
 
-fn verify_digest(path: &Path, expected: &str) -> Result<(), ArchiveError> {
-    let actual = sha256(path)?;
-    if actual == expected {
-        Ok(())
-    } else {
-        invalid(path, format!("expected SHA-256 {expected}, got {actual}"))
-    }
-}
-
 fn git_output(
     workspace_root: &Path,
     args: impl IntoIterator<Item = &'static str>,
 ) -> Result<String, ArchiveError> {
-    let mut command = Command::new("/usr/bin/git");
+    let mut command = Command::new(release::tool("git")?);
     command.current_dir(workspace_root).args(args);
-    let output = command::output(command)?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn tool_output(path: &Path, args: &[&str]) -> Result<String, ArchiveError> {
-    let mut command = Command::new(path);
-    command.args(args);
     let output = command::output(command)?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -1092,41 +956,6 @@ fn temporary_directory(parent: &Path, name: &str) -> Result<PathBuf, ArchiveErro
     invalid(
         parent,
         "could not create a temporary archive directory".to_string(),
-    )
-}
-
-fn temporary_file(parent: &Path, name: &str) -> Result<PathBuf, ArchiveError> {
-    create_directory(parent)?;
-    for attempt in 0..128 {
-        let path = parent.join(format!(".{name}-{}-{attempt}", std::process::id()));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => {
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(
-                    |source| ArchiveError::Io {
-                        action: "secure temporary archive file",
-                        path: path.clone(),
-                        source,
-                    },
-                )?;
-                return Ok(path);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(source) => {
-                return Err(ArchiveError::Io {
-                    action: "create temporary archive file",
-                    path,
-                    source,
-                });
-            }
-        }
-    }
-    invalid(
-        parent,
-        "could not create a temporary archive file".to_string(),
     )
 }
 

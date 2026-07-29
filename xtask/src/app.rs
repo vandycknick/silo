@@ -8,7 +8,9 @@ use std::process::{Command, Stdio};
 use thiserror::Error;
 
 use crate::command;
+use crate::release;
 use crate::release_audit;
+use crate::targets::HostTarget;
 
 const APP_NAME: &str = "Silo.app";
 const BUNDLE_IDENTIFIER: &str = "sh.silo.app";
@@ -25,11 +27,16 @@ const ASSETS: [(&str, u32); 3] = [
 ];
 
 pub(crate) fn package_directory(target_dir: &Path, version: &str) -> PathBuf {
-    target_dir.join("packages/darwin-arm64").join(version)
+    target_dir
+        .join("packages")
+        .join(version)
+        .join(HostTarget::MacosArm64.runtime_target())
 }
 
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error(transparent)]
+    Release(#[from] release::ReleaseError),
     #[error(transparent)]
     Audit(#[from] release_audit::AuditError),
     #[error(transparent)]
@@ -810,7 +817,7 @@ fn git_output(
     workspace_root: &Path,
     args: impl IntoIterator<Item = &'static str>,
 ) -> Result<String, AppError> {
-    let mut command = Command::new("/usr/bin/git");
+    let mut command = Command::new(release::tool("git")?);
     command.current_dir(workspace_root).args(args);
     let output = command::output(command)?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())

@@ -40,18 +40,6 @@ pub struct KernelArtifact {
 }
 
 impl KernelOptions {
-    pub fn reference(&self) -> &str {
-        &self.reference
-    }
-
-    pub fn local_path(&self) -> Option<&Path> {
-        self.path.as_deref()
-    }
-
-    pub fn offline(&self) -> bool {
-        self.offline
-    }
-
     pub fn refresh(&self) -> bool {
         self.refresh
     }
