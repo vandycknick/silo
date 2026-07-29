@@ -10,10 +10,10 @@ path = "native/lib.rs"
 
 [dependencies]
 libvm = { path = "../../runtime/libvm" }
-napi = { version = "3.10.3", features = ["async", "tokio_rt", "napi9"] }
-napi-derive = "3.5.9"
-serde_json = "1.0.150"
+napi = { version = "3.12.0", features = ["async", "tokio_rt", "napi9"] }
+napi-derive = "3.6.1"
+serde_json = "1.0.151"
 vm-spec = { path = "../../specs/vm-spec" }
 
 [build-dependencies]
-napi-build = "2.3.2"
+napi-build = "2.4.0"

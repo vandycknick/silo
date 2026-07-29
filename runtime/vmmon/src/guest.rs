@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use hyper_util::rt::TokioIo;
 use protocol::v1::guest_agent_service_client::GuestAgentServiceClient;
 use protocol::v1::{WatchAgentMetricsRequest, WatchAgentStatusRequest};
-use rand::Rng;
+use rand::RngExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};

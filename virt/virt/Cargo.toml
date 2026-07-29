@@ -4,10 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-protocol = { path = "../../specs/protocol" }
 nix = { version = "0.31.3", features = ["fs", "process", "signal", "socket", "term"] }
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt", "fs", "io-util", "net", "process", "sync", "time"] }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt", "fs", "io-util", "net", "process", "sync", "time"] }
 tracing = "0.1.44"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -17,4 +16,4 @@ vz = { path = "../vz" }
 krun = { path = "../krun" }
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["macros", "rt", "sync"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync"] }

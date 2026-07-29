@@ -13,4 +13,4 @@ alloc = []
 sh = ["alloc"]
 
 [dependencies]
-libc = { version = "0.2.186", default-features = false }
+libc = { version = "0.2.189", default-features = false }
