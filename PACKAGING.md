@@ -21,8 +21,8 @@ implemented yet.
 | Platform | Implemented | Planned |
 | --- | --- | --- |
 | macOS arm64 | Runtime and portable archives, `Silo.app`, optional DMG, main Release Tip CI | Notarization, stapling, Homebrew Cask |
-| Linux amd64 | Runtime and portable archives, main Release Tip CI | KVM archive qualification |
-| Linux arm64 | Runtime and portable archives, main Release Tip CI | KVM archive qualification |
+| Linux amd64 | Runtime and portable archives, main Release Tip CI | Archive signing |
+| Linux arm64 | Runtime and portable archives, main Release Tip CI | Archive signing |
 | SDKs | Node native addon build | Runtime-carrying Node packages, Python wheels, Go runtime installer |
 
 The current commands do not produce notarized macOS artifacts, release
@@ -31,29 +31,39 @@ native Linux distribution packages are not planned requirements.
 
 ## Prerequisites
 
-Enter the repository's Nix development shell before running packaging commands:
+Enter the repository's release shell before running packaging commands:
 
 ```sh
-nix develop
+nix develop .#release
 ```
 
 The shell provides the Rust, Go, Node, Zig, archive, SBOM, and OCI tools used by
-the build. `release/toolchains.toml` is the release-toolchain authority; avoid
-substituting ambient tool versions for release builds.
+the build. `flake.lock` pins the Nix package graph and `rust-toolchain.toml` pins
+the Rust release. Packaging does not download a second compiler toolchain or
+fall back to ambient release tools when Nix evaluation fails.
 
 Additional platform requirements are:
 
 | Platform | Requirements |
 | --- | --- |
-| macOS | Apple silicon, macOS 26 or newer, Xcode command-line and SDK tools |
-| Linux | Native amd64 or arm64 Linux, Docker daemon, Docker Buildx, matching Docker daemon architecture |
+| macOS | Apple silicon, macOS 26 or newer, Xcode 26.6 selected with `xcode-select` |
+| Linux amd64 | Native Ubuntu 24.04 amd64 |
+| Linux arm64 | Native Ubuntu 24.04 arm64 |
 
-Packaging normally needs network access to fetch dependencies, release tools,
-and the default kernel OCI artifact. See [Kernel Selection](#kernel-selection)
-for local and offline kernel options.
+Packaging normally needs network access to fetch dependencies and the default
+kernel OCI artifact. See [Kernel Selection](#kernel-selection) for local and
+offline kernel options.
 
-`CARGO_TARGET_DIR` controls all build, staging, cache, and package output. It
-defaults to the repository's `target` directory.
+`CARGO_TARGET_DIR` controls build, staging, and package output. It defaults to
+the repository's `target` directory. Cargo keeps its registry and Git checkout
+caches below `$HOME/.cargo`; Go uses the standard locations reported by
+`go env GOCACHE GOMODCACHE`. Release packaging does not create a repository-local
+toolchain or dependency cache hierarchy.
+
+Host packages are native-only. The release entry point always selects the
+current host OS and CPU and has no target override. The one cross-build exception
+is the guest Linux payload: `agent` and `init` are built as static musl programs
+for the same CPU as the native host package.
 
 ## Choosing a Version
 
@@ -66,7 +76,7 @@ metadata before building:
 
 ```sh
 git checkout <tag-or-commit>
-nix develop
+nix develop .#release
 make version-check
 ```
 
@@ -186,25 +196,24 @@ Each archive has an adjacent SHA-256 checksum, SPDX JSON SBOM, and provenance
 document:
 
 ```text
-target/packages/<target>/<version>/
+target/packages/<version>/<target>/
   <archive>.tar.zst
   <archive>.tar.zst.sha256
   <archive>.sbom.spdx.json
   <archive>.provenance.json
 ```
 
-Build and verify both archives with:
+Build both archives with:
 
 ```sh
 make version-check
 make archive
-make verify-archive
 ```
 
 `make archive` performs a release build, resolves the kernel, creates the
-canonical stage, audits the release runtime, and produces both archives.
-`make verify-archive` verifies the existing outputs; it does not rebuild them.
-On macOS, verification also boots a VM from the portable CLI archive.
+canonical stage, and produces both archives, checksums, SBOMs, and provenance
+documents. Successful construction in the qualified native release environment
+is the release correctness signal.
 
 ## Packaging macOS
 
@@ -225,7 +234,7 @@ make package DMG=1
 Outputs are versioned together:
 
 ```text
-target/packages/darwin-arm64/<version>/
+target/packages/<version>/darwin-arm64/
   Silo.app/
   silo-<version>-darwin-arm64.dmg
 ```
@@ -234,7 +243,7 @@ The current macOS commands are:
 
 | Command | Result |
 | --- | --- |
-| `make app` | Build, audit, assemble, sign, and verify `Silo.app` |
+| `make app` | Build, assemble, sign, and verify `Silo.app` |
 | `make package` | Currently equivalent to `make app` |
 | `make package DMG=1` | Build the app, then create and verify a DMG |
 | `make install` | Build and install the app plus a CLI symlink |
@@ -273,19 +282,39 @@ distribution packages.
 Run the current archive flow on a native amd64 or arm64 Linux host:
 
 ```sh
-nix develop
+nix develop .#release
 make archive
-make verify-archive
 ```
 
-Release-profile commands automatically build and run the pinned native Linux
-release container. The process refuses a Docker daemon whose architecture does
-not match the host instead of silently using emulation or ambient compilers. See
-the [Linux release environment](release/README.md) for container details.
+Release commands execute directly on the current host and refuse target
+selection through arguments or environment overrides. Linux amd64 packages are
+built on native Ubuntu 24.04 amd64, and Linux arm64 packages are built on native
+Ubuntu 24.04 arm64. Docker and Buildx are not packaging prerequisites or
+fallbacks.
 
-Linux archive verification currently checks archive integrity, layout, modes,
-SBOM and provenance structure, and release binary constraints. KVM boot
-qualification for the generic archive remains planned release work.
+The guest assets remain Linux static-musl binaries for the matching host CPU;
+this does not make the host package a cross-host build.
+
+## Release Environment Qualification
+
+The native release environments are qualified when a platform boundary is
+introduced or intentionally changed. Qualification uses ordinary platform tools
+to inspect one complete native build: `file` and `objdump` on Linux, and `file`,
+`otool`, `codesign`, and `hdiutil` on macOS. The review confirms native host
+architectures and loaders, static Linux guest assets and `netd`, Apple-only
+Darwin dependencies, app signing, DMG mounting, and basic CLI startup.
+
+Repeat that review after changing the Ubuntu baseline, supported CPU, macOS
+deployment target, Xcode major version, native linker strategy, `netd` CGO mode,
+or guest target. Routine source and dependency changes do not need a custom
+binary policy engine. Release builds do not recursively scan arbitrary binary
+contents or reimplement ELF, Mach-O, glibc, or platform-loader behavior.
+
+`scripts/qualify-release-artifacts.sh` is the manual boundary-qualification
+helper. Run it without arguments to inspect artifacts already collected below
+`target/packages`, or pass `--download --run-id <id>` to replace the current
+version's package tree with artifacts from one Release Tip run. It is not part
+of routine CI or archive construction.
 
 ## Downstream Repackaging
 
@@ -362,9 +391,7 @@ see the [kernel documentation](resources/kernels/README.md).
 | Command | Builds or stages | Output or action |
 | --- | --- | --- |
 | `make stage PROFILE=release` | Yes | Canonical runtime stage |
-| `make verify-runtime PROFILE=release` | No | Audit an existing release runtime |
 | `make archive` | Yes | Both generic archives and their sidecars |
-| `make verify-archive` | No | Verify both existing archives |
 | `make app` | Yes | Versioned `Silo.app` |
 | `make package` | Yes | Versioned `Silo.app` |
 | `make package DMG=1` | Yes | Versioned `Silo.app` and DMG |
@@ -372,7 +399,7 @@ see the [kernel documentation](resources/kernels/README.md).
 
 On macOS, running `make archive` followed by `make package` repeats release
 preparation. Cargo and staging may reuse unchanged outputs, but both commands
-independently resolve, stage, and audit their inputs. A future macOS aggregate
+independently resolve and stage their inputs. A future macOS aggregate
 distribution command should prepare the release once and feed both archive and
 application packagers.
 
@@ -386,15 +413,21 @@ to documentation can be packaging inputs.
 `Release Tip` runs after a successful `Test` for a push to `main` (or by manual
 dispatch). Automatic runs package the exact SHA validated by `Test`; manual runs
 package the selected dispatch SHA. Its Rust cache is isolated to release
-packaging and is not used by validation. It also has no path filtering because
-there is no baseline and commit metadata can affect artifacts. Three parallel
-cells then produce:
+packaging and is not used by validation. The cache uses the release shell,
+standard `$HOME/.cargo` locations, and a platform plus `flake.lock` key. It also
+has no path filtering because there is no baseline and commit metadata can
+affect artifacts. Three parallel cells then produce:
 
 - Linux amd64 runs `make archive` and uploads both archive families and sidecars.
 - Linux arm64 runs `make archive` and uploads both archive families and sidecars.
-- macOS arm64 runs `make archive`, uploads both archive families and sidecars,
-  then runs `make package DMG=1` on the same runner and uploads the DMG
-  separately.
+- macOS arm64 runs `make archive`, then `make package DMG=1` on the same runner,
+  and uploads the target-qualified archives, sidecars, app, and DMG together.
+
+Each cell uploads `target/packages/*/<target>/**`. Downloading the three
+target-qualified artifacts into `target/packages` reconstructs one
+`target/packages/<version>` root with sibling `darwin-arm64`,
+`linux-amd64-gnu`, and `linux-arm64-gnu` directories. Targets and versions can
+coexist without path or filename collisions.
 
 CI artifacts are retained for 14 days. This is build validation, not release
 publication: CI does not currently create release signatures, notarize macOS
@@ -406,6 +439,5 @@ Use these documents for details that intentionally do not live in this
 operational guide:
 
 - [ADR 0012](docs/adr/0012-cross-platform-runtime-and-sdk-packaging.md): normative layouts, runtime discovery, ownership, compatibility, and planned transports.
-- [Linux release environment](release/README.md): pinned container and toolchain mechanics.
 - [Kernel artifacts](resources/kernels/README.md): kernel configuration, construction, verification, and publication.
 - [README](README.md): ordinary development and product usage.
