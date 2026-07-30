@@ -55,23 +55,6 @@ APPDIR ?= /Applications
 ##? BINDIR=path: Set the CLI symlink install directory.
 BINDIR ?= /usr/local/bin
 
-# Linux release configuration
-HOST_ARCH := $(shell uname -m)
-RELEASE_ARCH_x86_64 := amd64
-RELEASE_ARCH_arm64 := arm64
-RELEASE_ARCH_aarch64 := arm64
-DEFAULT_RELEASE_ARCH := $(RELEASE_ARCH_$(HOST_ARCH))
-RELEASE_ARCH ?= $(DEFAULT_RELEASE_ARCH)
-
-ifeq ($(strip $(RELEASE_ARCH)),)
-$(error unsupported release architecture: $(HOST_ARCH))
-endif
-ifneq ($(RELEASE_ARCH),amd64)
-ifneq ($(RELEASE_ARCH),arm64)
-$(error RELEASE_ARCH must resolve to amd64 or arm64)
-endif
-endif
-
 # Derived commands and arguments
 XTASK := CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" cargo run --locked -p xtask --
 KERNEL_ARGS := --reference "$(KERNEL_REFERENCE)"
@@ -104,15 +87,9 @@ stage: ## Build and assemble the portable runtime stage.
 	$(XTASK) stage --profile "$(PROFILE)" $(KERNEL_ARGS)
 
 ##@ Distribution
-.PHONY: verify-runtime archive verify-archive app package install
-verify-runtime: ## Audit release runtime artifacts (use PROFILE=release).
-	$(XTASK) verify-runtime --profile "$(PROFILE)"
-
+.PHONY: archive app package install
 archive: ## Build release runtime and CLI archives.
 	$(XTASK) archive $(KERNEL_ARGS)
-
-verify-archive: ## Extract and qualify the generated archives.
-	$(XTASK) verify-archive
 
 app: ## Build and sign the macOS release application.
 	$(XTASK) app $(APP_ARGS) $(KERNEL_ARGS)
@@ -138,10 +115,7 @@ version-check: ## Verify product versions match the version authority.
 	$(XTASK) version-check
 
 # Internal targets
-.PHONY: release-linux cli vmmon netd krun agent init initramfs kernel
-release-linux:
-	TARGETARCH="$(RELEASE_ARCH)" docker buildx bake --load -f release/docker-bake.hcl silo-release
-
+.PHONY: cli vmmon netd krun agent init initramfs kernel
 cli vmmon netd krun agent init initramfs:
 	$(XTASK) component $@ --profile "$(PROFILE)"
 

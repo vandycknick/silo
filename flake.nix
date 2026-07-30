@@ -4,7 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     systems.url = "github:nix-systems/default";
-    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
@@ -18,12 +21,15 @@
     devShells = forEachSystem (system: let
       pkgs = import nixpkgs {
         inherit system;
-        overlays = [ (import rust-overlay) ];
+        overlays = [ rust-overlay.overlays.default ];
       };
-    in {
-      default = pkgs.callPackage ./nix/devShell.nix {
+      rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+      shells = pkgs.callPackage ./nix/devShell.nix {
+        inherit rustToolchain;
         llvm = pkgs.llvmPackages;
       };
+    in {
+      inherit (shells) default release;
       kernel = pkgs.callPackage ./nix/kernelShell.nix { };
     });
   };

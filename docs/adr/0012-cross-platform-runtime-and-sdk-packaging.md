@@ -2,7 +2,7 @@
 
 Date: 2026-07-22
 
-Updated: 2026-07-28
+Updated: 2026-07-30
 
 ## Status
 
@@ -48,9 +48,10 @@ installations. Silo therefore needs conventions that remain overrideable rather
 than configuration that every consumer must reproduce.
 
 This ADR defines immutable product layout, runtime discovery, SDK runtime
-transport, user-owned product and state paths, release staging, and archive
-qualification. It does not add runtime backend selection, independent component
-updates, an in-process package manager to `libvm`, or a Linux archive installer.
+transport, user-owned product and state paths, release staging, and native build
+environment qualification. It does not add runtime backend selection,
+independent component updates, an in-process package manager to `libvm`, or a
+Linux archive installer.
 
 ## Terminology
 
@@ -104,6 +105,9 @@ a normal first VM start requires no runtime download.
 - An official Linux archive set is exact-version and atomic: its runtime-only
   and portable CLI archives, checksums, SBOMs, and provenance describe the same
   staged release bytes.
+- Release host targets always match the current native host OS and architecture.
+  Guest Linux assets are the only cross-built components and use static musl for
+  the same CPU as the host package.
 
 ## Supported Targets And Compatibility
 
@@ -230,7 +234,7 @@ Developers select a staged root through `RuntimeConfig` or `SILO_RUNTIME_DIR`.
 `libvm` does not infer a stage from an arbitrary Cargo executable. The staged
 payload is the common input to the app, official Linux archives, SDK platform
 packages, and runtime archives. Packagers do not rebuild or substitute
-components after staging, except for required platform signing and container
+components after staging, except for required platform signing and package
 metadata.
 
 ### Default Kernel Provenance
@@ -256,31 +260,55 @@ Additional user-installed kernels are deferred. When added, they live below the
 XDG data root and never modify `Silo.app`, an official archive, or optional
 downstream package-owned paths.
 
-### Release Staging
+### Native Release Environment And Staging
 
-A repository-owned staging command builds one canonical payload per target:
+A repository-owned staging command builds one canonical payload for the current
+native host target:
 
-1. Build `silo`, `vmmon`, `netd`, and `krun`.
+1. Enter the Nix `.#release` shell pinned by `flake.lock` and
+   `rust-toolchain.toml`.
+1. Build `silo`, `vmmon`, `netd`, and `krun` for the current host OS and CPU.
 1. Use committed lockfiles and locked dependency resolution.
-1. Build the guest initramfs and standalone agent.
+1. Build the guest initramfs and standalone agent as static-musl Linux programs
+   for the same CPU.
 1. Resolve and verify the target kernel OCI artifact.
-1. Strip release binaries.
 1. Normalize file names, modes, and reproducible timestamps where possible.
 1. Copy components into the portable runtime layout.
-1. Inspect dynamic dependencies and runtime search paths.
-1. Reject build-machine paths and unavailable shared libraries.
-1. Record source and kernel provenance in release metadata.
+1. Record source, toolchain, and kernel provenance in release metadata.
 1. Generate checksums, SBOMs, and provenance records.
-1. Boot a VM using only the staged tree.
 1. Report raw and compressed sizes.
 1. Hand the exact staged files to each official archive or SDK transport.
 
-The repository may contain build-time staging configuration. That configuration
-is not installed and `libvm` never consults it. The toolchain is deliberately
-composed because no single free tool safely owns every Silo release concern:
+Nix supplies release build tools. Native Ubuntu and Apple platform tools supply
+the host ABI, loader, SDK, linker, and signing behavior. The release entry point
+has no host-target argument or environment override and does not use Docker,
+Buildx, emulation, or another process supervisor to select a host package.
+
+Final archives and platform packages are written below:
 
 ```text
-repository-owned staging command
+target/packages/<version>/<target>/
+```
+
+Target-qualified CI artifacts retain the version and target hierarchy. Merging
+all artifacts therefore reconstructs sibling target directories below one
+version without collisions, while another version can coexist beside it.
+
+The native environments are manually qualified when introduced and after an
+intentional change to the Ubuntu baseline, supported CPU, macOS deployment
+target, Xcode major version, linker strategy, `netd` CGO mode, or guest target.
+Qualification uses ordinary platform commands on one completed native build.
+Routine releases do not scan arbitrary binary contents, maintain exact runtime
+library allowlists, parse glibc symbol versions, or reimplement ELF, Mach-O, and
+platform-loader behavior. Successful construction and CLI startup in the
+qualified environment are sufficient.
+
+The repository may contain build-time staging configuration. That configuration
+is not installed and `libvm` never consults it. The release system composes
+native tools around the common staged payload:
+
+```text
+Nix release shell + repository-owned staging command
         |
         +-- Apple native tools -> Silo.app, DMG, notarization
         +-- tar/zstd -> official portable archives
@@ -676,12 +704,12 @@ runner rather than carrying a divergent Finder-layout implementation.
 
 The release pipeline:
 
-1. Builds arm64 binaries with a macOS 26 deployment target.
+1. Selects macOS 26, Xcode 26.6, and the pinned Nix release shell.
+1. Builds arm64 binaries with a macOS 26 deployment target using Apple SDK and
+   linker tools resolved through `xcrun`.
 1. Builds arm64 guest assets.
 1. Resolves the arm64 kernel OCI artifact.
 1. Assembles the complete app.
-1. Inspects every Mach-O dependency.
-1. Rejects Nix-store, build-prefix, and unavailable non-system dependencies.
 1. Signs nested executables with a Developer ID Application identity.
 1. Signs the outer app with hardened runtime and timestamping.
 1. Builds the DMG with `create-dmg`.
@@ -744,10 +772,12 @@ verification are future release capabilities unless a release explicitly
 provides them; checksums, SBOMs, and provenance are the current archive release
 materials.
 
-Linux binaries are built against the glibc 2.39 baseline. CI records the symbol
-versions required by each final ELF file and rejects dependencies on newer glibc
-or libstdc++ symbols. A future baseline change updates the support matrix and
-both official Linux archive targets together.
+Linux binaries are built natively on Ubuntu 24.04 against its glibc 2.39
+baseline. Manual environment qualification confirms the native system loaders
+on both CPUs and static linking for `netd` and the guest programs. Routine CI
+does not parse final ELF symbol versions or maintain an exact shared-library
+allowlist. A future baseline change updates the support matrix, requalifies both
+official Linux archive targets, and updates this ADR.
 
 #### Optional Downstream Repackaging
 
@@ -953,7 +983,9 @@ root, signature format, certificate or key identity, and verification procedure;
 until then, archive consumers verify the published SHA-256 checksum and inspect
 associated SBOM and provenance records as appropriate.
 
-Every release passes the relevant target gates.
+Each platform environment is qualified when introduced or intentionally
+changed. Routine releases then require successful construction and basic startup
+in that environment rather than repeating deep binary qualification.
 
 ### macOS arm64
 
@@ -963,7 +995,8 @@ Every release passes the relevant target gates.
 - Gatekeeper accepts the app and the stapled notarization validates.
 - VZ boots a VM using only packaged files.
 - The dormant krun helper has a valid Hypervisor entitlement and signature.
-- No unexpected non-system dylib, build-prefix, or Nix-store path remains.
+- Boundary qualification confirms that host binaries use Apple system libraries
+  and frameworks and that `netd` has no Nix dynamic-library dependency.
 
 ### Linux amd64 And arm64
 
@@ -972,7 +1005,8 @@ Every release passes the relevant target gates.
 - Each archive checksum, SBOM, and provenance record corresponds to its exact
   archive family, version, and target.
 - Helpers and assets have the intended modes after archive extraction.
-- Binaries satisfy the release's declared glibc baseline.
+- Boundary qualification confirms the native Ubuntu system loaders and declared
+  glibc baseline.
 - A krun VM boots using only files from the extracted archive root.
 - No `libkrun.so` dependency remains.
 - No Linux native-package build, install, upgrade, removal, repository, or
@@ -1025,7 +1059,8 @@ asset set rather than falling through independently across directories.
 
 - The normal CLI and SDK paths receive one complete, coherent runtime without
   manual configuration.
-- The same staged files are qualified across official transports.
+- The same staged files are consumed across official transports, and their
+  native build environment is qualified at platform boundaries.
 - Both supported Linux architectures receive equivalent first-class official
   archive releases with one clear glibc contract.
 - Silo avoids distribution-specific native package production and qualification
@@ -1043,8 +1078,8 @@ asset set rather than falling through independently across directories.
 - Node and Python target packages duplicate runtime bytes, and security fixes
   require updated SDK platform packages.
 - macOS releases require native signing infrastructure; Linux releases require
-  amd64 and arm64 builders and krun archive qualification; Go requires a secure
-  explicit installer when implemented.
+  native amd64 and arm64 Ubuntu builders and boundary qualification; Go requires
+  a secure explicit installer when implemented.
 - Package size is a maintained product constraint.
 - Convention-based discovery must provide strong diagnostics because there is no
   manifest to inspect.

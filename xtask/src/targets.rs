@@ -50,6 +50,14 @@ impl HostTarget {
         }
     }
 
+    pub fn go_target(self) -> (&'static str, &'static str) {
+        match self {
+            Self::MacosArm64 => ("darwin", "arm64"),
+            Self::LinuxX86_64 => ("linux", "amd64"),
+            Self::LinuxArm64 => ("linux", "arm64"),
+        }
+    }
+
     pub fn oci_architecture(self) -> &'static str {
         match self {
             Self::MacosArm64 | Self::LinuxArm64 => "arm64",
