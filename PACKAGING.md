@@ -50,6 +50,16 @@ Additional platform requirements are:
 | Linux amd64 | Native Ubuntu 24.04 amd64 |
 | Linux arm64 | Native Ubuntu 24.04 arm64 |
 
+On Ubuntu Linux hosts, install the native host packages before entering the
+release shell:
+
+```sh
+sudo apt-get install build-essential binutils pkg-config
+```
+
+Nix supplies the release build tools. These Ubuntu packages provide the native
+compiler, linker, archive, and `pkg-config` tools used through `/usr/bin`.
+
 Packaging normally needs network access to fetch dependencies and the default
 kernel OCI artifact. See [Kernel Selection](#kernel-selection) for local and
 offline kernel options.
@@ -421,10 +431,13 @@ affect artifacts. Three parallel cells then produce:
 - Linux amd64 runs `make archive` and uploads both archive families and sidecars.
 - Linux arm64 runs `make archive` and uploads both archive families and sidecars.
 - macOS arm64 runs `make archive`, then `make package DMG=1` on the same runner,
-  and uploads the target-qualified archives, sidecars, app, and DMG together.
+  and uploads the target-qualified archives, sidecars, and DMG.
 
-Each cell uploads `target/packages/*/<target>/**`. Downloading the three
-target-qualified artifacts into `target/packages` reconstructs one
+GitHub zips Actions artifacts and does not preserve executable modes, so the
+DMG is the permission-preserving transport for the runnable macOS app. The
+workflow still builds and verifies the loose `Silo.app` on-runner before it
+creates and verifies the DMG. Downloading the three target-qualified artifacts
+into `target/packages` reconstructs one
 `target/packages/<version>` root with sibling `darwin-arm64`,
 `linux-amd64-gnu`, and `linux-arm64-gnu` directories. Targets and versions can
 coexist without path or filename collisions.

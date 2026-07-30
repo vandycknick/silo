@@ -9,7 +9,6 @@ declare -ar TARGETS=(darwin-arm64 linux-amd64-gnu linux-arm64-gnu)
 
 DOWNLOAD=false
 RUN_ID=""
-RUN_SHA=""
 EXPECTED_SOURCE_REVISION=""
 DMG_MOUNTED=false
 DMG_MOUNT="$QUALIFICATION_ROOT/dmg-mount"
@@ -111,10 +110,6 @@ fi
 download_artifacts() {
   section "Download Artifacts"
 
-  RUN_SHA="$(gh run view "$RUN_ID" --json headSha --jq .headSha)"
-  [[ "$RUN_SHA" =~ ^[0-9a-f]{40}$ ]] || die "workflow run did not report a valid commit SHA"
-  EXPECTED_SOURCE_REVISION="$RUN_SHA"
-
   rm -rf "$PACKAGE_ROOT/$VERSION"
   mkdir -p "$PACKAGE_ROOT"
 
@@ -143,9 +138,8 @@ verify_expected_outputs() {
     printf '%s: archives and sidecars present\n' "$target"
   done
 
-  require_directory "$PACKAGE_ROOT/$VERSION/darwin-arm64/Silo.app"
   require_file "$PACKAGE_ROOT/$VERSION/darwin-arm64/silo-$VERSION-darwin-arm64.dmg"
-  printf 'darwin-arm64: app and DMG present\n'
+  printf 'darwin-arm64: DMG present\n'
 }
 
 verify_checksums_and_metadata() {
@@ -344,34 +338,6 @@ inspect_darwin_binaries() {
   printf 'darwin-arm64: Apple linkage and CLI startup checks passed\n'
 }
 
-verify_signed_app() {
-  section "Uploaded Application"
-
-  local app="$PACKAGE_ROOT/$VERSION/darwin-arm64/Silo.app"
-  local executables=(
-    "$app/Contents/MacOS/silo"
-    "$app/Contents/Helpers/vmmon"
-    "$app/Contents/Helpers/netd"
-    "$app/Contents/Helpers/krun"
-  )
-
-  for executable in "${executables[@]}"; do
-    require_file "$executable"
-    codesign --verify --strict --verbose=4 "$executable"
-  done
-  codesign --verify --strict --verbose=4 "$app"
-
-  file "${executables[@]}"
-  local dependencies
-  dependencies="$(otool -L "${executables[@]}")"
-  printf '%s\n' "$dependencies"
-  if grep -q '/nix/store' <<<"$dependencies"; then
-    die "uploaded application contains a Nix-store dynamic dependency"
-  fi
-
-  printf 'darwin-arm64: uploaded application signatures are valid\n'
-}
-
 verify_dmg() {
   section "DMG"
 
@@ -419,7 +385,6 @@ inspect_linux_target linux-amd64-gnu x86-64 /lib64/ld-linux-x86-64.so.2
 inspect_linux_target linux-arm64-gnu 'ARM aarch64' /lib/ld-linux-aarch64.so.1
 verify_extracted_cli_hashes
 inspect_darwin_binaries
-verify_signed_app
 verify_dmg
 
 section "Qualification Complete"

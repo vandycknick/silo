@@ -67,7 +67,9 @@ jobs:
           - platform: darwin-arm64
             runner: macos-26
             artifact_name: silo-darwin-arm64-archives
-            artifact_path: target/packages/*/darwin-arm64/**
+            artifact_path: |
+              target/packages/*/darwin-arm64/**
+              !target/packages/*/darwin-arm64/Silo.app/**
             create_dmg: true
 
     steps:
