@@ -72,7 +72,49 @@ configurable. The derivation is:
 | `machines/<id>/vm.sock` | `run_root/machines/<id>/vm.sock` |
 | `networks/`    | `run_root/networks`      |
 | machine logs and exit records | `state_root/logs/machines/<id>/` |
-| network logs   | `state_root/logs/networks/<id>/` |
+| private-network logs | `state_root/logs/machines/<id>/network/` |
+
+## Machine Logs
+
+Machine-owned durable logs have one configured state-root layout. The immutable
+machine ID, rather than a display name or changing private-network instance ID,
+selects the owner directory:
+
+```text
+<state-root>/logs/machines/<machine-id>/
+  vm.trace.log
+  serial.log
+  vm.exit.json
+  network/
+    netd.log
+    audit.jsonl
+  executions/
+    <machine-run-id>/<execution-id>/
+```
+
+`vm.trace.log`, `serial.log`, `network/netd.log`, and
+`network/audit.jsonl` append across machine starts. `vm.exit.json` is a private,
+atomically replaced lifecycle record, not a byte-log source. The `executions/`
+subtree is reserved for card 119's startup-execution segments and terminal
+records; ordinary `Machine::exec` sessions never create durable execution
+history.
+
+Use `Machine::logs` to read logs. It selects exactly one semantic
+`MachineLogSource` (`Monitor`, `Serial`, `Network`, or `NetworkAudit`) and
+returns byte chunks with an output channel. It deliberately does not expose log
+paths or filenames. Network sources return `MachineLogSourceUnavailable` when
+the machine has no private network.
+
+With `MachineLogOptions::default()`, the returned stream is a finite snapshot
+of bytes present when the selected file is opened. With `follow: true`, it emits
+that same snapshot and then appended bytes without a snapshot-to-follow gap. A
+missing file is an empty snapshot. A following stream waits for initial file
+creation and remains attached while the machine is stopped and across later
+starts. It ends when the reader drops the stream.
+
+The CLI currently exposes monitor diagnostics through `silo logs [--follow]`.
+Card 120 will map public stream names to the same semantic sources, including
+workload replay added by card 119, without exposing filesystem layout.
 
 ### State Database Reset
 

@@ -1,8 +1,8 @@
 use std::io;
-use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, WriteHalf};
 use tokio::sync::{broadcast, Mutex};
 
 use crate::platform::VmBackend;
@@ -59,7 +59,28 @@ impl SerialHub {
 #[derive(Debug)]
 struct SerialAttachment {
     guest_input: WriteHalf<MachineSerialStream>,
-    reader_task: tokio::task::JoinHandle<()>,
+    reader_task: tokio::task::JoinHandle<Result<(), crate::types::VirtError>>,
+}
+
+struct SerialSink {
+    writer: Pin<Box<dyn AsyncWrite + Send>>,
+}
+
+impl std::fmt::Debug for SerialSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SerialSink").finish_non_exhaustive()
+    }
+}
+
+impl SerialSink {
+    fn new<W>(writer: W) -> Self
+    where
+        W: AsyncWrite + Send + 'static,
+    {
+        Self {
+            writer: Box::pin(writer),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -67,7 +88,7 @@ pub struct SerialConsole {
     backend: Arc<VmBackend>,
     hub: Arc<Mutex<SerialHub>>,
     attachment: Arc<Mutex<Option<SerialAttachment>>>,
-    file_sinks: Arc<Mutex<Vec<tokio::fs::File>>>,
+    sinks: Arc<Mutex<Vec<SerialSink>>>,
     output_tx: broadcast::Sender<Vec<u8>>,
     attach_lock: Arc<Mutex<()>>,
 }
@@ -87,22 +108,21 @@ impl SerialConsole {
             backend,
             hub: Arc::new(Mutex::new(SerialHub::new())),
             attachment: Arc::new(Mutex::new(None)),
-            file_sinks: Arc::new(Mutex::new(Vec::new())),
+            sinks: Arc::new(Mutex::new(Vec::new())),
             output_tx,
             attach_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    pub async fn stream_to_file(&self, path: &Path) -> Result<(), crate::types::VirtError> {
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await
-            .map_err(crate::types::VirtError::from)?;
+    pub async fn add_sink<W>(&self, sink: W)
+    where
+        W: AsyncWrite + Send + 'static,
+    {
+        self.sinks.lock().await.push(SerialSink::new(sink));
+        tracing::info!("serial output sink attached");
+    }
 
-        self.file_sinks.lock().await.push(file);
-        tracing::info!(path = %path.display(), "serial log sink attached");
+    pub async fn start(&self) -> Result<(), crate::types::VirtError> {
         self.ensure_attached().await?;
         Ok(())
     }
@@ -141,10 +161,9 @@ impl SerialConsole {
         tracing::info!("serial backend stream opened");
         let (guest_output, guest_input) = tokio::io::split(stream);
         let output_tx = self.output_tx.clone();
-        let file_sinks = self.file_sinks.clone();
-        let reader_task = tokio::spawn(async move {
-            run_serial_reader(guest_output, file_sinks, output_tx).await;
-        });
+        let sinks = self.sinks.clone();
+        let reader_task =
+            tokio::spawn(async move { run_serial_reader(guest_output, sinks, output_tx).await });
 
         let attachment = SerialAttachment {
             guest_input,
@@ -182,6 +201,20 @@ impl SerialConsole {
     async fn detach(&self, client_id: u64) {
         let mut hub = self.hub.lock().await;
         hub.detach(client_id);
+    }
+
+    pub async fn drain(&self) -> Result<(), crate::types::VirtError> {
+        let Some(mut attachment) = self.attachment.lock().await.take() else {
+            return Ok(());
+        };
+        attachment
+            .guest_input
+            .shutdown()
+            .await
+            .map_err(crate::types::VirtError::from)?;
+        attachment.reader_task.await.map_err(|error| {
+            crate::types::VirtError::Backend(format!("serial reader task failed: {error}"))
+        })?
     }
 }
 
@@ -228,11 +261,14 @@ impl Drop for SerialConsole {
     }
 }
 
-async fn run_serial_reader(
-    mut guest_output: ReadHalf<MachineSerialStream>,
-    file_sinks: Arc<Mutex<Vec<tokio::fs::File>>>,
+async fn run_serial_reader<R>(
+    mut guest_output: R,
+    sinks: Arc<Mutex<Vec<SerialSink>>>,
     output_tx: broadcast::Sender<Vec<u8>>,
-) {
+) -> Result<(), crate::types::VirtError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut buf = [0u8; 8192];
     let mut saw_output = false;
     tracing::info!("serial reader started");
@@ -247,7 +283,7 @@ async fn run_serial_reader(
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => {
                 tracing::error!(error = %err, "serial read failed");
-                break;
+                return Err(err.into());
             }
         };
 
@@ -261,27 +297,31 @@ async fn run_serial_reader(
         let chunk = buf[..n].to_vec();
 
         {
-            let mut sinks = file_sinks.lock().await;
+            let mut sinks = sinks.lock().await;
             let sink_count = sinks.len();
             if sink_count == 0 {
-                tracing::debug!(bytes = chunk.len(), "serial output has no file sinks");
+                tracing::debug!(bytes = chunk.len(), "serial output has no sinks");
             }
             let mut index = 0;
             while index < sinks.len() {
-                let file = &mut sinks[index];
-                match file.write_all(&chunk).await {
+                let sink = &mut sinks[index];
+                let write_result = async {
+                    sink.writer.as_mut().write_all(&chunk).await?;
+                    sink.writer.as_mut().flush().await
+                }
+                .await;
+                match write_result {
                     Ok(()) => {
-                        let _ = file.flush().await;
                         tracing::debug!(
                             bytes = chunk.len(),
                             sink_index = index,
                             sink_count,
-                            "serial log wrote output"
+                            "serial sink wrote output"
                         );
                         index += 1;
                     }
-                    Err(err) => {
-                        tracing::error!(error = %err, "serial log write failed");
+                    Err(error) => {
+                        tracing::error!(%error, sink_index = index, "serial sink write failed");
                         sinks.remove(index);
                     }
                 }
@@ -289,5 +329,109 @@ async fn run_serial_reader(
         }
 
         let _ = output_tx.send(chunk);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::Mutex;
+
+    use crate::serial::SerialSink;
+
+    fn temporary_file(name: &str) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("virt-{name}-{}-{timestamp}", std::process::id()))
+    }
+
+    async fn run_reader(sinks: Arc<Mutex<Vec<SerialSink>>>, output: &[u8]) {
+        let (reader, mut writer) = tokio::io::duplex(1024);
+        let (output_tx, _) = tokio::sync::broadcast::channel(1);
+        let drain = tokio::spawn(crate::serial::run_serial_reader(reader, sinks, output_tx));
+
+        writer.write_all(output).await.expect("write serial output");
+        writer.shutdown().await.expect("close serial producer");
+        drain
+            .await
+            .expect("serial reader joins")
+            .expect("serial reader drains");
+    }
+
+    #[tokio::test]
+    async fn serial_reader_fans_out_and_drains_final_output() {
+        let first_path = temporary_file("fan-out-first");
+        let second_path = temporary_file("fan-out-second");
+        let sinks = Arc::new(Mutex::new(vec![
+            SerialSink::new(tokio::fs::File::from_std(
+                fs::File::create(&first_path).expect("create first serial sink"),
+            )),
+            SerialSink::new(tokio::fs::File::from_std(
+                fs::File::create(&second_path).expect("create second serial sink"),
+            )),
+        ]));
+
+        run_reader(sinks, b"final serial output").await;
+
+        assert_eq!(
+            fs::read(&first_path).expect("read first serial sink"),
+            b"final serial output"
+        );
+        assert_eq!(
+            fs::read(&second_path).expect("read second serial sink"),
+            b"final serial output"
+        );
+        fs::remove_file(first_path).expect("remove first serial sink");
+        fs::remove_file(second_path).expect("remove second serial sink");
+    }
+
+    #[tokio::test]
+    async fn failed_sink_does_not_interrupt_other_sinks() {
+        let path = temporary_file("failure-isolation");
+        let (failed_sink, failed_reader) = tokio::io::duplex(16);
+        drop(failed_reader);
+        let sinks = Arc::new(Mutex::new(vec![
+            SerialSink::new(failed_sink),
+            SerialSink::new(tokio::fs::File::from_std(
+                fs::File::create(&path).expect("create surviving serial sink"),
+            )),
+        ]));
+
+        run_reader(sinks.clone(), b"serial output survives").await;
+
+        assert_eq!(sinks.lock().await.len(), 1);
+        assert_eq!(
+            fs::read(&path).expect("read surviving serial sink"),
+            b"serial output survives"
+        );
+        fs::remove_file(path).expect("remove surviving serial sink");
+    }
+
+    #[tokio::test]
+    async fn sinks_remain_registered_across_reader_sessions() {
+        let path = temporary_file("reattach");
+        let sinks = Arc::new(Mutex::new(vec![SerialSink::new(
+            tokio::fs::File::from_std(
+                fs::File::create(&path).expect("create reusable serial sink"),
+            ),
+        )]));
+
+        run_reader(sinks.clone(), b"first session\n").await;
+        run_reader(sinks, b"second session\n").await;
+
+        assert_eq!(
+            fs::read(&path).expect("read reusable serial sink"),
+            b"first session\nsecond session\n"
+        );
+        fs::remove_file(path).expect("remove reusable serial sink");
     }
 }

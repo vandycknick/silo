@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
@@ -22,18 +22,20 @@ use utils::format_mac;
 
 use crate::host;
 use crate::machine::{NetworkLaunch, OAuthRefreshHook};
-use crate::paths::LocalPaths;
+use crate::paths::{
+    LocalPaths, NETWORK_AUDIT_LOG_FILE_NAME, NETWORK_SERVICE_LOG_FILE_NAME, PCAP_FILE_NAME,
+    PID_FILE_NAME,
+};
 use crate::store::models::MachineId;
 use crate::store::models::{
     MachineConfig, NetworkAttachment, NetworkInstance, NetworkInstanceState,
 };
 use crate::utils::now_unix;
+use crate::vmmon::process::{self, ProcessIdentity};
 use crate::{LibVmError, NetdRuntimeConfig};
 
 use super::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
-use super::{
-    mac_from_machine_id, remove_file_if_exists, remove_runtime_dir, serialize_json, DRIVER_NETD,
-};
+use super::{mac_from_machine_id, serialize_json, DRIVER_NETD};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -46,6 +48,9 @@ pub(super) struct NetdDriver;
 #[derive(Debug, Serialize, Deserialize)]
 struct NetdDriverState {
     helper_pid: i32,
+    helper_started_at: i64,
+    machine_id: MachineId,
+    run_id: String,
     subnet: String,
     pcap: bool,
 }
@@ -98,19 +103,17 @@ async fn prepare_netd_runtime(
     }
 
     let network_id = MachineId::new().to_string();
-    let network_paths = paths.network(&network_id);
-    let runtime_dir = network_paths.dir().to_path_buf();
-    fs::create_dir_all(&runtime_dir)?;
-    fs::create_dir_all(network_paths.logs_dir())?;
-    let mut startup = NetdStartupGuard::new(runtime_dir.clone());
+    let network_paths = paths.network(&network_id)?;
+    let machine_paths = paths.machine(metadata.id);
+    let runtime_directory = paths.ensure_network_run_dir(&network_id)?;
+    let log_directory = paths.ensure_machine_network_logs_dir(metadata.id)?;
+    let mut startup = NetdStartupGuard::new(paths.clone(), network_id.clone());
 
     let socket_path = network_paths.socket_path();
-    let log_path = network_paths.log_path();
-    let pid_path = network_paths.pid_path();
-    let pcap_path = config.pcap.then(|| network_paths.pcap_path());
+    let log_path = machine_paths.network_service_log_path();
     let policy_path = if let Some(policy) = request.policy() {
         let path = network_paths.policy_path();
-        write_runtime_policy_file(metadata, policy, &path)?;
+        write_runtime_policy_file(metadata, policy, &runtime_directory, &path)?;
         Some(path)
     } else {
         None
@@ -121,24 +124,23 @@ async fn prepare_netd_runtime(
     let certificate_authority_paths = requires_certificate_authority
         .then(|| resolve_certificate_authority_paths(paths, &config, &metadata.name))
         .transpose()?;
-    remove_file_if_exists(&socket_path)?;
-    remove_file_if_exists(&pid_path)?;
-
     let mac = format_mac(mac_from_machine_id(metadata.id));
     let (ipv4, dns) = private_ipv4_config(&config.subnet, &metadata.name)?;
     let static_lease = format!("{}={mac}", ipv4.address);
+    let log_directory_fd = log_directory.duplicate_inheritable()?;
+    let runtime_directory_fd = runtime_directory.duplicate_inheritable()?;
 
-    let log = File::options().create(true).append(true).open(&log_path)?;
     let mut command = Command::new(ctx.netd_path);
     configure_network_helper_command(
         &mut command,
         &NetworkHelperCommandConfig {
             socket_path: &socket_path,
             subnet: &config.subnet,
-            log_path: &log_path,
-            pid_path: &pid_path,
-            pcap_path: pcap_path.as_deref(),
+            log_directory_fd: log_directory_fd.as_raw_fd(),
+            runtime_directory_fd: runtime_directory_fd.as_raw_fd(),
+            pcap: config.pcap,
             machine_id: metadata.id,
+            run_id: ctx.run_id,
             network_id: &network_id,
             policy_path: policy_path.as_deref(),
             tls_ca_cert_path: certificate_authority_paths
@@ -158,7 +160,7 @@ async fn prepare_netd_runtime(
     )?;
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log.try_clone()?))
+        .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
     unsafe {
@@ -168,7 +170,10 @@ async fn prepare_netd_runtime(
         });
     }
 
-    let mut child = command.spawn().map_err(|err| LibVmError::NetworkRuntime {
+    let child = command.spawn();
+    drop(log_directory_fd);
+    drop(runtime_directory_fd);
+    let mut child = child.map_err(|err| LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
         message: format!("spawn userspace network helper: {err}"),
     })?;
@@ -183,6 +188,12 @@ async fn prepare_netd_runtime(
         .map_err(|_| LibVmError::NetworkRuntime {
             reference: metadata.name.clone(),
             message: "userspace network helper pid does not fit in i32".to_string(),
+        })?;
+    let helper_started_at = ProcessIdentity::for_pid(pid)?
+        .and_then(|identity| identity.started_at())
+        .ok_or_else(|| LibVmError::NetworkRuntime {
+            reference: metadata.name.clone(),
+            message: format!("netd pid {pid} has no stable process generation"),
         })?;
 
     let startup_result = {
@@ -222,6 +233,9 @@ async fn prepare_netd_runtime(
     };
     let driver_state = NetdDriverState {
         helper_pid: pid,
+        helper_started_at,
+        machine_id: metadata.id,
+        run_id: ctx.run_id.to_string(),
         subnet: config.subnet.clone(),
         pcap: config.pcap,
     };
@@ -295,10 +309,11 @@ fn host_uses_user_network_runtime() -> bool {
 struct NetworkHelperCommandConfig<'a> {
     socket_path: &'a Path,
     subnet: &'a str,
-    log_path: &'a Path,
-    pid_path: &'a Path,
-    pcap_path: Option<&'a Path>,
+    log_directory_fd: i32,
+    runtime_directory_fd: i32,
+    pcap: bool,
     machine_id: MachineId,
+    run_id: &'a str,
     network_id: &'a str,
     policy_path: Option<&'a Path>,
     tls_ca_cert_path: Option<&'a Path>,
@@ -317,16 +332,24 @@ fn configure_network_helper_command(
         .arg(config.subnet)
         .arg("--static-lease")
         .arg(config.static_lease)
+        .arg("--log-dir-fd")
+        .arg(config.log_directory_fd.to_string())
+        .arg("--runtime-dir-fd")
+        .arg(config.runtime_directory_fd.to_string())
         .arg("--log-file")
-        .arg(config.log_path)
+        .arg(NETWORK_SERVICE_LOG_FILE_NAME)
+        .arg("--audit-log-file")
+        .arg(NETWORK_AUDIT_LOG_FILE_NAME)
         .arg("--pid-file")
-        .arg(config.pid_path);
-    if let Some(path) = config.pcap_path {
-        command.arg("--pcap").arg(path);
+        .arg(PID_FILE_NAME);
+    if config.pcap {
+        command.arg("--pcap").arg(PCAP_FILE_NAME);
     }
     command
         .arg("--vm-id")
         .arg(config.machine_id.to_string())
+        .arg("--run-id")
+        .arg(config.run_id)
         .arg("--network-id")
         .arg(config.network_id);
     if let Some(path) = config.policy_path {
@@ -404,6 +427,7 @@ fn validate_policy(
 fn write_runtime_policy_file(
     metadata: &MachineConfig,
     policy: &NetworkPolicy,
+    runtime_directory: &crate::paths::OwnedDirectory,
     path: &Path,
 ) -> Result<(), LibVmError> {
     let normalized = policy.clone().normalized();
@@ -413,10 +437,22 @@ fn write_runtime_policy_file(
             message: format!("serialize generated network policy: {err}"),
         })?;
     bytes.push(b'\n');
-    fs::write(path, bytes).map_err(|err| LibVmError::NetworkRuntime {
-        reference: metadata.name.clone(),
-        message: format!("write generated network policy {}: {err}", path.display()),
-    })
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| LibVmError::NetworkRuntime {
+            reference: metadata.name.clone(),
+            message: format!(
+                "generated network policy path has no filename: {}",
+                path.display()
+            ),
+        })?;
+    runtime_directory
+        .write_file(file_name, &bytes)
+        .map_err(|err| LibVmError::NetworkRuntime {
+            reference: metadata.name.clone(),
+            message: format!("write generated network policy {}: {err}", path.display()),
+        })
 }
 
 fn configure_network_launch_environment(
@@ -670,7 +706,8 @@ impl CapturedStderr {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct NetdStartupGuard {
-    runtime_dir: PathBuf,
+    paths: LocalPaths,
+    network_id: String,
     child: Option<Child>,
     stderr_capture: Option<CapturedStderr>,
     armed: bool,
@@ -678,9 +715,10 @@ struct NetdStartupGuard {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl NetdStartupGuard {
-    fn new(runtime_dir: PathBuf) -> Self {
+    fn new(paths: LocalPaths, network_id: String) -> Self {
         Self {
-            runtime_dir,
+            paths,
+            network_id,
             child: None,
             stderr_capture: None,
             armed: true,
@@ -721,14 +759,16 @@ impl NetdStartupGuard {
             return;
         };
         if let Ok(pid) = i32::try_from(child.id()) {
-            let _ = terminate_helper(pid);
+            if let Ok(Some(identity)) = ProcessIdentity::for_pid(pid) {
+                let _ = terminate_helper(&identity);
+            }
         }
         let _ = child.kill();
         let _ = child.wait();
     }
 
     fn rollback_files(&mut self) {
-        let _ = remove_runtime_dir(&self.runtime_dir);
+        let _ = self.paths.remove_network_run_tree(&self.network_id);
     }
 }
 
@@ -766,32 +806,64 @@ fn append_bounded_stderr_line(captured: &mut CapturedStderrLines, line: String) 
     captured.lines.push_back(line);
 }
 
-pub(super) fn instance_is_alive(instance: &NetworkInstance) -> bool {
-    driver_state(instance)
-        .map(|state| process_is_alive(state.helper_pid))
-        .unwrap_or(false)
+pub(super) fn instance_is_alive(instance: &NetworkInstance) -> Result<bool, LibVmError> {
+    let Some(identity) = instance_process_identity(instance)? else {
+        return Ok(false);
+    };
+    identity.is_alive().map_err(Into::into)
 }
 
-pub(super) fn terminate_instance(instance: &NetworkInstance) -> Result<(), LibVmError> {
-    if let Some(state) = driver_state(instance) {
-        terminate_helper(state.helper_pid)?;
+pub(super) async fn terminate_instance(
+    instance: &NetworkInstance,
+    reference: &str,
+) -> Result<(), LibVmError> {
+    let Some(identity) = instance_process_identity(instance)? else {
+        return Ok(());
+    };
+    if !identity.is_alive()? {
+        return Ok(());
     }
+    terminate_helper(&identity)?;
+    process::wait_for_exit(
+        &identity,
+        reference,
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+    )
+    .await?;
     Ok(())
 }
 
-fn driver_state(instance: &NetworkInstance) -> Option<NetdDriverState> {
-    serde_json::from_str(&instance.driver_state_json).ok()
-}
-
-fn process_is_alive(pid: i32) -> bool {
-    kill(Pid::from_raw(pid), None).is_ok()
-}
-
-fn terminate_helper(pid: i32) -> Result<(), LibVmError> {
-    if pid <= 0 || !process_is_alive(pid) {
-        return Ok(());
+pub(super) fn instance_process_identity(
+    instance: &NetworkInstance,
+) -> Result<Option<ProcessIdentity>, LibVmError> {
+    let state = driver_state(instance)?;
+    let Some(identity) = ProcessIdentity::for_pid(state.helper_pid)? else {
+        return Ok(None);
+    };
+    if !identity.matches_started_at(Some(state.helper_started_at)) {
+        return Err(LibVmError::NetworkRuntime {
+            reference: instance.id.clone(),
+            message: format!(
+                "netd pid {} is a different process generation than persisted runtime {}",
+                state.helper_pid, instance.id
+            ),
+        });
     }
-    let process_group = Pid::from_raw(-pid);
+    Ok(Some(identity))
+}
+
+fn driver_state(instance: &NetworkInstance) -> Result<NetdDriverState, LibVmError> {
+    serde_json::from_str::<NetdDriverState>(&instance.driver_state_json).map_err(|error| {
+        LibVmError::StateDecode {
+            field: "network_instances.driver_state_json",
+            message: format!("decode netd process identity: {error}"),
+        }
+    })
+}
+
+fn terminate_helper(identity: &ProcessIdentity) -> Result<(), LibVmError> {
+    let process_group = Pid::from_raw(-identity.pid());
     let _ = kill(process_group, Signal::SIGTERM);
     Ok(())
 }
@@ -819,6 +891,7 @@ mod tests {
     use crate::paths::{LocalPaths, LocalRoots};
     use crate::store::models::{
         MachineConfig, MachineId, MachineNetworkConfig, MachineRuntimeState, MachineState,
+        NetworkInstance, NetworkInstanceState,
     };
     use crate::store::{MachineStore, Store};
     use crate::{NetdRuntimeConfig, RuntimeNetworkingConfig};
@@ -847,10 +920,11 @@ mod tests {
             &NetworkHelperCommandConfig {
                 socket_path: Path::new("/tmp/silo-net/netd.sock"),
                 subnet: "192.168.105.0/24",
-                log_path: Path::new("/tmp/silo-net/netd.log"),
-                pid_path: Path::new("/tmp/silo-net/netd.pid"),
-                pcap_path: None,
+                log_directory_fd: 31,
+                runtime_directory_fd: 32,
+                pcap: false,
                 machine_id: MachineId::new(),
+                run_id: "run123",
                 network_id: "net123",
                 policy_path: None,
                 tls_ca_cert_path: None,
@@ -881,10 +955,11 @@ mod tests {
             &NetworkHelperCommandConfig {
                 socket_path: Path::new("/tmp/silo-net/netd.sock"),
                 subnet: "192.168.105.0/24",
-                log_path: Path::new("/tmp/silo-net/netd.log"),
-                pid_path: Path::new("/tmp/silo-net/netd.pid"),
-                pcap_path: None,
+                log_directory_fd: 31,
+                runtime_directory_fd: 32,
+                pcap: false,
                 machine_id,
+                run_id: "run123",
                 network_id: "net123",
                 policy_path: Some(Path::new("/tmp/silo-net/network-policy.json")),
                 tls_ca_cert_path: Some(Path::new("/tmp/silo-net/ca.pem")),
@@ -901,6 +976,21 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|window| window[0] == "--vm-id" && window[1] == machine_id.to_string()));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--run-id", "run123"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--log-dir-fd", "31"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--runtime-dir-fd", "32"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--log-file", "netd.log"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--audit-log-file", "audit.jsonl"]));
         assert!(args
             .windows(2)
             .any(|window| window[0] == "--network-id" && window[1] == "net123"));
@@ -1095,6 +1185,42 @@ netd log: /tmp/silo/netd.log";
         assert!(err.to_string().contains("between 1 and 29"));
     }
 
+    #[test]
+    fn netd_identity_rejects_a_live_reused_generation() {
+        let mut child = Command::new("sh")
+            .args(["-c", "while :; do sleep 1; done"])
+            .spawn()
+            .expect("spawn helper");
+        let pid = i32::try_from(child.id()).expect("pid fits i32");
+        let started_at = crate::vmmon::process::ProcessIdentity::for_pid(pid)
+            .expect("read helper identity")
+            .and_then(|identity| identity.started_at())
+            .expect("helper has stable generation");
+        let instance = NetworkInstance {
+            id: "net-stale".to_string(),
+            driver: "netd".to_string(),
+            definition_name: None,
+            attachment_json: "{}".to_string(),
+            driver_state_json: serde_json::json!({
+                "helper_pid": pid,
+                "helper_started_at": started_at.saturating_add(1),
+                "machine_id": MachineId::new(),
+                "run_id": "old-run",
+                "subnet": "192.168.105.0/24",
+                "pcap": false
+            })
+            .to_string(),
+            state: NetworkInstanceState::Running,
+            created_at: 1,
+            modified_at: 1,
+        };
+
+        assert!(super::instance_process_identity(&instance).is_err());
+        assert!(child.try_wait().expect("check helper").is_none());
+        child.kill().expect("stop helper");
+        child.wait().expect("reap helper");
+    }
+
     #[tokio::test]
     async fn netd_launches_the_resolved_absolute_helper() {
         let temp = tempfile::tempdir().expect("create temp dir");
@@ -1111,7 +1237,7 @@ netd log: /tmp/silo/netd.log";
         std::fs::create_dir_all(netd.parent().expect("netd parent")).expect("create netd parent");
         std::fs::write(
             &netd,
-            "#!/bin/sh\nsocket=\nlog=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--listen-vfkit\" ]; then socket=\"${arg#unixgram://}\"; fi\n  if [ \"$previous\" = \"--log-file\" ]; then log=\"$arg\"; fi\n  previous=\"$arg\"\ndone\nprintf '%s\\n' \"$0\" > \"$log.program\"\n: > \"$socket\"\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\nsocket=\nlog_dir_fd=\nruntime_dir_fd=\nlog=\naudit=\nrun=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--listen-vfkit\" ]; then socket=\"${arg#unixgram://}\"; fi\n  if [ \"$previous\" = \"--log-dir-fd\" ]; then log_dir_fd=\"$arg\"; fi\n  if [ \"$previous\" = \"--runtime-dir-fd\" ]; then runtime_dir_fd=\"$arg\"; fi\n  if [ \"$previous\" = \"--log-file\" ]; then log=\"$arg\"; fi\n  if [ \"$previous\" = \"--audit-log-file\" ]; then audit=\"$arg\"; fi\n  if [ \"$previous\" = \"--run-id\" ]; then run=\"$arg\"; fi\n  previous=\"$arg\"\ndone\nif [ \"$log\" != netd.log ] || [ \"$audit\" != audit.jsonl ] || [ ! -d \"/dev/fd/$log_dir_fd\" ] || [ ! -d \"/dev/fd/$runtime_dir_fd\" ]; then exit 42; fi\nprintf '%s\\n' \"$0\" > \"$0.program\"\nprintf '%s\\n' \"$log_dir_fd,$runtime_dir_fd\" > \"$0.directories\"\nprintf '%s\\n' \"$run\" > \"$0.run\"\n: > \"$socket\"\nwhile :; do sleep 1; done\n",
         )
         .expect("write netd helper");
         std::fs::set_permissions(&netd, std::fs::Permissions::from_mode(0o755))
@@ -1152,6 +1278,7 @@ netd log: /tmp/silo/netd.log";
             paths: &paths,
             store: &store,
             metadata: &metadata,
+            run_id: "run-123",
             config: &networking,
             netd_path: &netd,
             network_launch: &launch,
@@ -1162,18 +1289,36 @@ netd log: /tmp/silo/netd.log";
             .expect("launch resolved netd");
 
         let log_path = match attachment {
-            crate::network::VmmonNetworkAttachment::UnixDatagram { path, .. } => {
-                let network_id = path
-                    .parent()
-                    .and_then(Path::file_name)
-                    .and_then(std::ffi::OsStr::to_str)
-                    .expect("network runtime directory name");
-                paths.network(network_id).log_path()
+            crate::network::VmmonNetworkAttachment::UnixDatagram { .. } => {
+                paths.machine(machine_id).network_service_log_path()
             }
             crate::network::VmmonNetworkAttachment::None => panic!("netd must attach a socket"),
         };
         assert_eq!(
-            std::fs::read_to_string(log_path.with_extension("log.program"))
+            log_path,
+            state_root
+                .join("logs/machines")
+                .join(machine_id.to_string())
+                .join("network/netd.log")
+        );
+        assert!(!state_root.join("logs/networks").exists());
+        let directory_fds = std::fs::read_to_string(netd.with_extension("directories"))
+            .expect("read inherited directories");
+        let (log_directory_fd, runtime_directory_fd) = directory_fds
+            .trim()
+            .split_once(',')
+            .expect("recorded directory descriptors");
+        assert!(log_directory_fd.parse::<i32>().is_ok());
+        assert!(runtime_directory_fd.parse::<i32>().is_ok());
+        assert_ne!(log_directory_fd, runtime_directory_fd);
+        assert_eq!(
+            std::fs::read_to_string(netd.with_extension("run"))
+                .expect("read netd run id")
+                .trim(),
+            "run-123"
+        );
+        assert_eq!(
+            std::fs::read_to_string(netd.with_extension("program"))
                 .expect("read executed netd path")
                 .trim(),
             netd.display().to_string()

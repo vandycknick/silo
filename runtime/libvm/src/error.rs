@@ -20,6 +20,9 @@ pub enum LibVmError {
     #[error("invalid Silo run root {path}: {message}")]
     InvalidRunRoot { path: PathBuf, message: String },
 
+    #[error("invalid machine-owned filesystem object {path}: {message}")]
+    InvalidOwnedPath { path: PathBuf, message: String },
+
     #[error("invalid machine name {name:?}: {reason}")]
     InvalidMachineName { name: String, reason: String },
 
@@ -60,6 +63,12 @@ pub enum LibVmError {
     #[error("machine {reference} is not running")]
     MachineNotRunning { reference: String },
 
+    #[error("machine {reference} does not provide {log_source:?} logs")]
+    MachineLogSourceUnavailable {
+        reference: String,
+        log_source: crate::machine::MachineLogSource,
+    },
+
     #[error("monitor connection for {reference} failed: {message}")]
     MonitorConnection { reference: String, message: String },
 
@@ -71,6 +80,9 @@ pub enum LibVmError {
 
     #[error("machine preparation for {reference} failed: {message}")]
     MachinePreparationFailed { reference: String, message: String },
+
+    #[error("machine start failed: {primary}; cleanup also failed: {cleanup}")]
+    MachineStartCleanupFailed { primary: String, cleanup: String },
 
     #[error("network runtime for {reference} failed: {message}")]
     NetworkRuntime { reference: String, message: String },

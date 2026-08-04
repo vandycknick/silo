@@ -1,6 +1,10 @@
-use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use nix::{
+    errno::Errno,
+    sys::signal::{kill, Signal},
+    unistd::Pid,
+};
 use tokio::time::{sleep, Instant};
 use uuid::Uuid;
 
@@ -10,11 +14,13 @@ use crate::machine::{
     MachineStopOptions, MachineWaitOptions,
 };
 use crate::runtime::core::{
-    interrupt_monitor, kill_monitor_process_group, monitor_started_at, pid_file_mtime,
+    interrupt_monitor, kill_monitor_process_group, monitor_identity as monitor_identity_for_pid,
     read_monitor_pid, reconcile_root_disk_size, wait_for_monitor_stop, VmmonRunIdentity,
 };
+use crate::runtime::Runtime;
 use crate::store::models::{MachineConfig, MachineRuntimeState};
 use crate::vmmon::exit_status::{self, VmmonExitOutcome, VmmonExitStatus};
+use crate::vmmon::process::ProcessIdentity;
 use crate::vmmon::VmmonLaunch;
 use crate::LibVmError;
 
@@ -23,8 +29,15 @@ const WAIT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(200);
 struct WaitTarget {
     config: MachineConfig,
     generation: VmmonRunIdentity,
+    identity: ProcessIdentity,
     stop_requested: bool,
     forced: bool,
+}
+
+#[derive(Clone, Copy)]
+enum FailedStartState {
+    Stopped,
+    Error,
 }
 
 impl Machine {
@@ -52,16 +65,16 @@ impl Machine {
         let vmmon = runtime.vmmon();
         let config = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+            runtime.validate_machine_data_dir(&config)?;
             let machine_paths = runtime.machine_paths(config.id);
             let pid_path = machine_paths.vmmon_pid_path();
             let exit_status_path = machine_paths.vmmon_exit_status_path();
             let config_path = machine_paths.vm_spec_path();
             let socket_path = machine_paths.vmmon_socket_path();
-            let trace_path = machine_paths.vmmon_trace_log_path();
+            let trace_path = machine_paths.vm_trace_log_path();
             let serial_log_path = machine_paths.serial_log_path();
 
-            fs::create_dir_all(machine_paths.run_dir())?;
-            fs::create_dir_all(machine_paths.logs_dir())?;
+            runtime.ensure_machine_runtime_directories(config.id)?;
 
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             runtime
@@ -76,19 +89,27 @@ impl Machine {
 
             options.validate_network_launch(&config.network, &config.name)?;
             let root_disk_resize = reconcile_root_disk_size(&config)?;
-            runtime.remove_vmmon_exit_status(&config)?;
             let run_id = Uuid::new_v4().to_string();
 
             let resolved_network = runtime
-                .prepare_machine_network(&config, &options.network)
+                .prepare_machine_network(&config, &run_id, &options.network)
                 .await?;
-            let agent_enabled = runtime.prepare_vmmon_launch_inputs(
+            let agent_enabled = match runtime.prepare_vmmon_launch_inputs(
                 &config,
                 &resolved_network,
                 root_disk_resize == RootDiskResizeOutcome::GuestRequired,
-            )?;
+            ) {
+                Ok(agent_enabled) => agent_enabled,
+                Err(err) => {
+                    return Err(
+                        finish_failed_start(runtime, &config, &run_id, None, None, err).await,
+                    );
+                }
+            };
 
-            runtime.request_machine_start(config.id, &run_id).await?;
+            if let Err(err) = runtime.request_machine_start(config.id, &run_id).await {
+                return Err(finish_failed_start(runtime, &config, &run_id, None, None, err).await);
+            }
 
             let launch = VmmonLaunch {
                 machine_id: config.id,
@@ -106,33 +127,76 @@ impl Machine {
                 agent_enabled,
             };
             if let Err(err) = vmmon.spawn(&launch).await {
-                runtime
-                    .mark_machine_start_stopped(config.id, &run_id, Some(err.to_string()))
-                    .await?;
-                return Err(err);
+                return Err(finish_failed_start(
+                    runtime,
+                    &config,
+                    &run_id,
+                    Some(FailedStartState::Stopped),
+                    None,
+                    err,
+                )
+                .await);
             }
 
             let pid = match read_monitor_pid(&pid_path) {
                 Ok(pid) => pid,
                 Err(err) => {
-                    runtime
-                        .mark_machine_start_error(config.id, &run_id, Some(err.to_string()))
-                        .await?;
-                    return Err(err.into());
+                    return Err(finish_failed_start(
+                        runtime,
+                        &config,
+                        &run_id,
+                        Some(FailedStartState::Error),
+                        None,
+                        err.into(),
+                    )
+                    .await);
                 }
             };
-            let started_at = match monitor_started_at(pid, &pid_path, &config.name) {
-                Ok(started_at) => started_at,
+            let monitor = match monitor_identity_for_pid(pid, &pid_path, &config.name) {
+                Ok(monitor) => monitor,
                 Err(err) => {
-                    runtime
-                        .mark_machine_start_error(config.id, &run_id, Some(err.to_string()))
-                        .await?;
-                    return Err(err);
+                    return Err(finish_failed_start(
+                        runtime,
+                        &config,
+                        &run_id,
+                        Some(FailedStartState::Error),
+                        None,
+                        err,
+                    )
+                    .await);
                 }
             };
-            runtime
-                .mark_machine_monitor_ready(config.id, run_id, pid, started_at)
-                .await?;
+            let Some(started_at) = monitor.started_at() else {
+                return Err(finish_failed_start(
+                    runtime,
+                    &config,
+                    &run_id,
+                    Some(FailedStartState::Error),
+                    Some(&monitor),
+                    LibVmError::MonitorConnection {
+                        reference: config.name.clone(),
+                        message: format!(
+                            "vmmon pid {pid} from {} has no stable process generation",
+                            pid_path.display()
+                        ),
+                    },
+                )
+                .await);
+            };
+            if let Err(err) = runtime
+                .mark_machine_monitor_ready(config.id, run_id.clone(), pid, started_at)
+                .await
+            {
+                return Err(finish_failed_start(
+                    runtime,
+                    &config,
+                    &run_id,
+                    Some(FailedStartState::Error),
+                    Some(&monitor),
+                    err,
+                )
+                .await);
+            }
 
             config
         };
@@ -149,65 +213,61 @@ impl Machine {
         let runtime = self.runtime();
         let wait_target = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
-            let pid_path = runtime.machine_paths(config.id).vmmon_pid_path();
-            let previous_state = runtime.machine_state(config.id).await?;
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             if matches!(
                 status.state,
                 MachineRuntimeState::Stopped | MachineRuntimeState::Error
             ) {
-                if previous_state.status == MachineRuntimeState::Stopping {
-                    runtime.cleanup_machine_resources_locked(&config).await?;
-                    return runtime.machine_inspect_data(config).await;
-                }
-
-                return Err(LibVmError::MachineNotRunning {
-                    reference: config.name.clone(),
-                });
+                runtime.cleanup_machine_resources_locked(&config).await?;
+                return runtime.machine_inspect_data(config).await;
             }
 
             match status.pid {
                 Some(pid) if status.state == MachineRuntimeState::Stopping => {
                     let generation = VmmonRunIdentity {
                         pid,
-                        started_at: Some(
-                            status
-                                .started_at
-                                .unwrap_or_else(|| pid_file_mtime(&pid_path)),
-                        ),
+                        started_at: status.started_at,
                         run_id: status.run_id.clone(),
+                    };
+                    let Some(identity) = monitor_identity(&generation)? else {
+                        runtime.mark_machine_stopped(config.id, None).await?;
+                        runtime.cleanup_machine_resources_locked(&config).await?;
+                        return runtime.machine_inspect_data(config).await;
                     };
                     runtime.request_machine_stop(config.id, &generation).await?;
                     WaitTarget {
                         config,
                         generation,
+                        identity,
                         stop_requested: true,
                         forced: false,
                     }
                 }
-                Some(pid) if interrupt_monitor(pid)? => {
+                Some(pid) => {
                     let generation = VmmonRunIdentity {
                         pid,
-                        started_at: Some(
-                            status
-                                .started_at
-                                .unwrap_or_else(|| pid_file_mtime(&pid_path)),
-                        ),
+                        started_at: status.started_at,
                         run_id: status.run_id.clone(),
                     };
+                    let Some(identity) = monitor_identity(&generation)? else {
+                        runtime.mark_machine_stopped(config.id, None).await?;
+                        runtime.cleanup_machine_resources_locked(&config).await?;
+                        return runtime.machine_inspect_data(config).await;
+                    };
+                    if !interrupt_monitor(&identity)? {
+                        runtime.mark_machine_stopped(config.id, None).await?;
+                        runtime.cleanup_machine_resources_locked(&config).await?;
+                        return runtime.machine_inspect_data(config).await;
+                    }
                     runtime.request_machine_stop(config.id, &generation).await?;
 
                     WaitTarget {
                         config,
                         generation,
+                        identity,
                         stop_requested: true,
                         forced: false,
                     }
-                }
-                Some(_) => {
-                    runtime.mark_machine_stopped(config.id, None).await?;
-                    runtime.cleanup_machine_resources_locked(&config).await?;
-                    return runtime.machine_inspect_data(config).await;
                 }
                 None => {
                     runtime.mark_machine_stopped(config.id, None).await?;
@@ -277,7 +337,6 @@ impl Machine {
         let runtime = self.runtime();
         let wait_target = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
-            let pid_path = runtime.machine_paths(config.id).vmmon_pid_path();
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             if matches!(
                 status.state,
@@ -302,14 +361,18 @@ impl Machine {
 
             let generation = VmmonRunIdentity {
                 pid,
-                started_at: Some(
-                    status
-                        .started_at
-                        .unwrap_or_else(|| pid_file_mtime(&pid_path)),
-                ),
+                started_at: status.started_at,
                 run_id: status.run_id.clone(),
             };
-            if !kill_monitor_process_group(pid)? {
+            let Some(identity) = monitor_identity(&generation)? else {
+                runtime.mark_machine_stopped(config.id, None).await?;
+                runtime.cleanup_machine_resources_locked(&config).await?;
+                let exit_status =
+                    exit_status::read(&runtime.machine_paths(config.id).vmmon_exit_status_path())?;
+                let machine = runtime.machine_inspect_data(config).await?;
+                return Ok(machine_exit(machine, generation, false, exit_status));
+            };
+            if !kill_monitor_process_group(&identity)? {
                 runtime.mark_machine_stopped(config.id, None).await?;
                 runtime.cleanup_machine_resources_locked(&config).await?;
                 let exit_status =
@@ -322,6 +385,7 @@ impl Machine {
             WaitTarget {
                 config,
                 generation,
+                identity,
                 stop_requested: true,
                 forced: true,
             }
@@ -331,34 +395,16 @@ impl Machine {
             .await
     }
 
-    /// Cleans host resources associated with a stopped machine.
-    ///
-    /// This is safe to call repeatedly. If the machine is still active, cleanup
-    /// leaves it alone and returns the current inspect data.
-    pub async fn cleanup(&self) -> Result<MachineData, LibVmError> {
-        let runtime = self.runtime();
-        let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
-        let status = runtime.reconcile_machine_runtime_locked(&config).await?;
-        if status.is_active() {
-            return runtime.machine_inspect_data(config).await;
-        }
-
-        if status.state == MachineRuntimeState::Stopping {
-            runtime.mark_machine_stopped(config.id, None).await?;
-        }
-
-        runtime.cleanup_machine_resources_locked(&config).await?;
-        runtime.machine_inspect_data(config).await
-    }
-
     /// Removes the persistent machine record and files.
     pub async fn remove(self) -> Result<(), LibVmError> {
         let runtime = self.runtime();
+        if runtime.machine_config(self.machine_id()).await?.is_none() {
+            return Ok(());
+        }
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+        runtime.validate_machine_data_dir(&config)?;
+        runtime.ensure_no_live_vmmon_generation(&config).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
-        runtime
-            .reconcile_machine_network(&config, status.is_active())
-            .await?;
 
         if status.is_active() {
             return Err(LibVmError::MachineAlreadyRunning {
@@ -366,13 +412,89 @@ impl Machine {
             });
         }
 
-        match fs::remove_dir_all(&config.machine_dir) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-
+        runtime.cleanup_machine_resources_locked(&config).await?;
+        runtime.local_paths().remove_machine_logs_tree(config.id)?;
+        runtime.local_paths().remove_machine_data_tree(config.id)?;
         runtime.remove_machine_records(&config).await
+    }
+}
+
+async fn finish_failed_start(
+    runtime: &Runtime,
+    config: &MachineConfig,
+    run_id: &str,
+    start_failure: Option<FailedStartState>,
+    monitor: Option<&ProcessIdentity>,
+    primary: LibVmError,
+) -> LibVmError {
+    let primary_message = primary.to_string();
+    let mut cleanup_errors = Vec::new();
+
+    let discovered_monitor = if monitor.is_none() {
+        match read_monitor_pid(&runtime.machine_paths(config.id).vmmon_pid_path()) {
+            Ok(pid) => match ProcessIdentity::for_pid(pid) {
+                Ok(identity) => identity,
+                Err(err) => {
+                    cleanup_errors.push(format!("inspect vmmon for cleanup: {err}"));
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    if let Some(monitor) = monitor.or(discovered_monitor.as_ref()) {
+        if let Err(err) = stop_failed_start_monitor(monitor, &config.name).await {
+            cleanup_errors.push(format!("terminate vmmon: {err}"));
+        }
+    }
+    if let Err(err) = runtime.reconcile_machine_network(config, false).await {
+        cleanup_errors.push(format!("reconcile prepared network: {err}"));
+    }
+    if let Some(start_failure) = start_failure {
+        let result = match start_failure {
+            FailedStartState::Stopped => {
+                runtime
+                    .mark_machine_start_stopped(config.id, run_id, Some(primary_message.clone()))
+                    .await
+            }
+            FailedStartState::Error => {
+                runtime
+                    .mark_machine_start_error(config.id, run_id, Some(primary_message.clone()))
+                    .await
+            }
+        };
+        if let Err(err) = result {
+            cleanup_errors.push(format!("record failed start: {err}"));
+        }
+    }
+
+    if cleanup_errors.is_empty() {
+        primary
+    } else {
+        LibVmError::MachineStartCleanupFailed {
+            primary: primary_message,
+            cleanup: cleanup_errors.join("; "),
+        }
+    }
+}
+
+async fn stop_failed_start_monitor(
+    monitor: &ProcessIdentity,
+    machine_name: &str,
+) -> Result<(), LibVmError> {
+    if kill_monitor_process_group(monitor)? {
+        return wait_for_monitor_stop(monitor, machine_name, Duration::from_secs(5)).await;
+    }
+    if !monitor.is_alive()? {
+        return Ok(());
+    }
+    match kill(Pid::from_raw(monitor.pid()), Some(Signal::SIGKILL)) {
+        Ok(()) | Err(Errno::ESRCH) => {
+            wait_for_monitor_stop(monitor, machine_name, Duration::from_secs(5)).await
+        }
+        Err(err) => Err(std::io::Error::other(err.to_string()).into()),
     }
 }
 
@@ -380,56 +502,27 @@ impl Machine {
     async fn active_wait_target(&self) -> Result<Option<WaitTarget>, LibVmError> {
         let runtime = self.runtime();
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
-        let state = runtime.machine_state(config.id).await?;
-        let stored_target = if matches!(
-            state.status,
-            MachineRuntimeState::Starting
-                | MachineRuntimeState::Running
-                | MachineRuntimeState::Stopping
-        ) {
-            state.vmmon_pid.map(|pid| {
-                let pid_path = runtime.machine_paths(config.id).vmmon_pid_path();
-                WaitTarget {
-                    config: config.clone(),
-                    generation: VmmonRunIdentity {
-                        pid,
-                        started_at: Some(
-                            state
-                                .started_at
-                                .unwrap_or_else(|| pid_file_mtime(&pid_path)),
-                        ),
-                        run_id: state.run_id.clone(),
-                    },
-                    stop_requested: false,
-                    forced: false,
-                }
-            })
-        } else {
-            None
-        };
-
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if !status.is_active() {
-            return Ok(stored_target);
+            return Ok(None);
         }
 
         let Some(pid) = status.pid else {
             return Ok(None);
         };
 
-        let pid_path = runtime.machine_paths(config.id).vmmon_pid_path();
         let generation = VmmonRunIdentity {
             pid,
-            started_at: Some(
-                status
-                    .started_at
-                    .unwrap_or_else(|| pid_file_mtime(&pid_path)),
-            ),
+            started_at: status.started_at,
             run_id: status.run_id.clone(),
+        };
+        let Some(identity) = monitor_identity(&generation)? else {
+            return Ok(None);
         };
         Ok(Some(WaitTarget {
             config,
             generation,
+            identity,
             stop_requested: false,
             forced: false,
         }))
@@ -442,7 +535,7 @@ impl Machine {
     ) -> Result<MachineExit, LibVmError> {
         let runtime = self.runtime();
         wait_for_monitor_stop(
-            &target.generation,
+            &target.identity,
             &target.config.name,
             options.timeout_value(),
         )
@@ -486,8 +579,9 @@ fn machine_exit(
     forced: bool,
     exit_status: Option<VmmonExitStatus>,
 ) -> MachineExit {
-    let matching_exit =
-        exit_status.filter(|status| exit_status_matches_generation(status, &generation));
+    let matching_exit = exit_status.filter(|status| {
+        status.machine_id == machine.id && exit_status_matches_generation(status, &generation)
+    });
     let (exited_at, outcome) = match matching_exit {
         Some(status) => (
             unix_time(status.exited_at),
@@ -511,14 +605,17 @@ fn machine_exit(
 }
 
 fn exit_status_matches_generation(status: &VmmonExitStatus, generation: &VmmonRunIdentity) -> bool {
-    if let Some(run_id) = status.run_id.as_deref() {
-        return generation.run_id.as_deref() == Some(run_id);
-    }
+    generation.run_id.as_deref() == Some(status.run_id.as_str()) && generation.pid == status.pid
+}
 
-    match status.pid {
-        Some(pid) => generation.pid == pid,
-        None => true,
+fn monitor_identity(generation: &VmmonRunIdentity) -> Result<Option<ProcessIdentity>, LibVmError> {
+    let Some(identity) = ProcessIdentity::for_pid(generation.pid)? else {
+        return Ok(None);
+    };
+    if !identity.matches_started_at(generation.started_at) {
+        return Ok(None);
     }
+    Ok(Some(identity))
 }
 
 fn unix_time(timestamp: i64) -> Option<SystemTime> {

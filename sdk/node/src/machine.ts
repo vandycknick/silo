@@ -9,6 +9,11 @@ import {
 } from "./convert.js";
 import { mapNativePromise } from "./errors.js";
 import { ExecHandle, ExecOutput } from "./exec.js";
+import {
+    MachineLogStream,
+    machineLogOptionsToNative,
+    machineLogSourceToNative,
+} from "./logs.js";
 import { MachineNetworkBuilder, type MachineNetworkBuilderCallback } from "./network.js";
 import type {
     AttachOptions,
@@ -17,6 +22,8 @@ import type {
     ImageSource,
     KeyValueMap,
     MachineData,
+    MachineLogOptions,
+    MachineLogSource,
     Mount,
 } from "./types.js";
 import {
@@ -219,6 +226,25 @@ export class Machine {
     /** Remove the machine. */
     async remove(): Promise<void> {
         await mapNativePromise(this.native.remove());
+    }
+
+    /**
+     * Open one semantic stream of persisted machine log chunks.
+     *
+     * This API deliberately does not expose local paths or filenames. Without
+     * `follow`, the stream is a finite snapshot. With `follow`, it continues from
+     * that snapshot without a gap and remains attached while the machine is
+     * stopped and across later starts until the reader closes it.
+     */
+    async logs(source: MachineLogSource, options?: MachineLogOptions): Promise<MachineLogStream> {
+        return new MachineLogStream(
+            await mapNativePromise(
+                this.native.logs(
+                    machineLogSourceToNative(source),
+                    machineLogOptionsToNative(options),
+                ),
+            ),
+        );
     }
 
     /**

@@ -59,6 +59,7 @@ export interface NativeMachine {
   shell(script: string, options?: NativeExecOptionsInput): Promise<NativeExecOutput>;
   attach(program: string, args?: string[], options?: NativeAttachOptionsInput): Promise<NativeExitStatus>;
   attachShell(options?: NativeAttachOptionsInput): Promise<NativeExitStatus>;
+  logs(source: NativeMachineLogSource, options?: NativeMachineLogOptionsInput): Promise<NativeMachineLogHandle>;
 }
 
 export interface NativeImages {
@@ -82,6 +83,11 @@ export interface NativeExecHandle {
 
 export interface NativeExecSink {
   write(data: Uint8Array): Promise<void>;
+  close(): void;
+}
+
+export interface NativeMachineLogHandle {
+  recv(): Promise<NativeMachineLogChunk | null>;
   close(): void;
 }
 
@@ -198,6 +204,17 @@ export interface NativeAttachOptionsInput {
   term?: string;
   detachKeys?: string;
   forwardAgent?: boolean;
+}
+
+export type NativeMachineLogSource = "monitor" | "serial" | "network" | "networkAudit";
+
+export interface NativeMachineLogOptionsInput {
+  follow?: boolean;
+}
+
+export interface NativeMachineLogChunk {
+  output: "stdout" | "stderr";
+  data: Uint8Array;
 }
 
 export interface NativeMachineData {

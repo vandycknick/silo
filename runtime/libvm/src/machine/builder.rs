@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use vm_spec::{Boot, Disk, Guest, GuestOs, Hardware, Kernel, Mount, Storage, VmSpec};
@@ -12,7 +10,7 @@ use crate::machine::{
     generate_machine_name, validate_machine_name, GuestBuilder, Machine, MachineGuestConfig, Memory,
 };
 use crate::network::{MachineNetworkBuilder, MachineNetworkConfig};
-use crate::paths::root_disk_relative_path;
+use crate::paths::{root_disk_relative_path, OwnedDirectory};
 use crate::runtime::core::{stopped_machine_state, write_machine_config};
 use crate::runtime::Runtime;
 use crate::store::models::{
@@ -68,7 +66,7 @@ struct MachineCreateGuard {
     metadata: BTreeMap<String, String>,
     network: ModelMachineNetworkConfig,
     guest: MachineGuestConfig,
-    dir_created: bool,
+    machine_parent: Option<OwnedDirectory>,
     committed: bool,
 }
 
@@ -470,11 +468,11 @@ async fn create_machine_guard(
         metadata,
         network,
         guest,
-        dir_created: false,
+        machine_parent: None,
         committed: false,
     };
 
-    create.create_machine_dir()?;
+    create.create_machine_dir(runtime)?;
     write_machine_config(create.dir(), &create.name, &create.spec)?;
 
     Ok(create)
@@ -542,25 +540,9 @@ impl MachineCreateGuard {
         &self.machine_dir
     }
 
-    fn create_machine_dir(&mut self) -> Result<(), LibVmError> {
-        if let Some(parent) = self.machine_dir.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700);
-        match builder.create(&self.machine_dir) {
-            Ok(()) => {
-                self.dir_created = true;
-                fs::set_permissions(&self.machine_dir, fs::Permissions::from_mode(0o700))?;
-                Ok(())
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(LibVmError::MachineIdAlreadyExists {
-                    id: self.id.to_string(),
-                })
-            }
-            Err(err) => Err(err.into()),
-        }
+    fn create_machine_dir(&mut self, runtime: &Runtime) -> Result<(), LibVmError> {
+        self.machine_parent = Some(runtime.local_paths().create_machine_data_dir(self.id)?);
+        Ok(())
     }
 
     async fn commit(
@@ -610,12 +592,8 @@ impl Drop for MachineCreateGuard {
             return;
         }
 
-        if self.dir_created {
-            match fs::remove_dir_all(&self.machine_dir) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => {}
-            }
+        if let Some(machine_parent) = self.machine_parent.take() {
+            let _ = machine_parent.remove_tree(&self.id.to_string());
         }
 
         if let Some(lock) = self.lock.take() {
@@ -626,7 +604,7 @@ impl Drop for MachineCreateGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -1083,6 +1061,34 @@ mod tests {
         assert!(config.machine_dir.exists());
         assert_eq!(config.machine_dir, machine_dir);
         assert!(config_path.exists());
+    }
+
+    #[tokio::test]
+    async fn create_guard_rejects_a_symlinked_machine_parent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let external = temp.path().join("external");
+        std::fs::create_dir(&external).expect("create external directory");
+        std::fs::create_dir_all(paths.data_dir()).expect("create data directory");
+        symlink(&external, paths.roots().machines_dir()).expect("create machines symlink");
+
+        let mut store = MockDataStore::new();
+        expect_empty_refresh(&mut store);
+        store
+            .expect_machine_config_by_name()
+            .once()
+            .returning(|_| Ok(None));
+        let runtime = runtime_with_mock_store(paths, store).await;
+
+        let error = create_guard_sample(&runtime, "devbox")
+            .await
+            .err()
+            .expect("machines symlink must be rejected");
+        assert!(error.to_string().contains("machines"));
+        assert!(std::fs::read_dir(&external)
+            .expect("read external directory")
+            .next()
+            .is_none());
     }
 
     #[tokio::test]

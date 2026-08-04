@@ -127,15 +127,28 @@ impl SyncReporter {
     }
 }
 
+pub(crate) struct InitInputs<'a> {
+    pub(crate) machine_id: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) network_args: &'a [String],
+    pub(crate) agent_enabled: bool,
+    pub(crate) krun_path: &'a Path,
+    pub(crate) serial_file: File,
+}
+
 pub async fn init(
     runtime: &RuntimeContext,
-    machine_id: &str,
-    name: &str,
-    network_args: &[String],
-    agent_enabled: bool,
-    krun_path: &Path,
+    inputs: InitInputs<'_>,
     start_gate: &mut StartGate,
 ) -> eyre::Result<DaemonContext> {
+    let InitInputs {
+        machine_id,
+        name,
+        network_args,
+        agent_enabled,
+        krun_path,
+        serial_file,
+    } = inputs;
     let spec = load_spec(runtime)?;
     let guest_services_enabled = agent_enabled;
     let network = parse_network_args(network_args)?;
@@ -159,6 +172,10 @@ pub async fn init(
         krun_path,
     })?;
     let machine = VirtualMachine::new(machine_config.config)?;
+    let serial_console = machine.serial();
+    serial_console
+        .add_sink(tokio::fs::File::from_std(serial_file))
+        .await;
     if let Some(machine_identifier) = machine_config.machine_identifier.as_ref() {
         if machine_identifier.was_generated() {
             let machine_identifier_path = machine_identifier_path_from_dir(runtime.dir());
@@ -166,7 +183,6 @@ pub async fn init(
         }
     }
 
-    let serial_console = machine.serial();
     let canonical_machine_id = uuid::Uuid::parse_str(machine_id)
         .map_err(|error| eyre::eyre!("invalid machine UUID {machine_id}: {error}"))?
         .hyphenated()

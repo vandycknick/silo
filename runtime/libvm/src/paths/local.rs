@@ -1,19 +1,21 @@
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use crate::paths::defaults::{
     ensure_run_root, resolve_default_data_dir, resolve_default_run_dir, resolve_default_state_dir,
 };
-use crate::paths::machine::MachinePaths;
-use crate::paths::network::NetworkPaths;
+use crate::paths::machine::{
+    MachinePaths, LOGS_DIR_NAME, MACHINES_DIR_NAME, NETWORK_AUDIT_LOG_FILE_NAME, NETWORK_DIR_NAME,
+    NETWORK_SERVICE_LOG_FILE_NAME, SERIAL_LOG_FILE_NAME, VMMON_TRACE_LOG_FILE_NAME,
+};
+use crate::paths::network::{NetworkPaths, NETWORKS_DIR_NAME};
+use crate::paths::OwnedDirectory;
 use crate::store::models::MachineId;
 use crate::LibVmError;
 
 const STATE_DB_FILE_NAME: &str = "state.db";
-const MACHINES_DIR_NAME: &str = "machines";
 const IMAGES_DIR_NAME: &str = "images";
-const NETWORKS_DIR_NAME: &str = "networks";
 const LOCKS_DIR_NAME: &str = "locks";
-const LOGS_DIR_NAME: &str = "logs";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalRoots {
@@ -82,6 +84,7 @@ impl LocalRoots {
         self.data_root.join(STATE_DB_FILE_NAME)
     }
 
+    #[cfg(test)]
     pub(crate) fn machines_dir(&self) -> PathBuf {
         self.data_root.join(MACHINES_DIR_NAME)
     }
@@ -90,6 +93,7 @@ impl LocalRoots {
         self.image_root().to_path_buf()
     }
 
+    #[cfg(test)]
     pub(crate) fn net_dir(&self) -> PathBuf {
         self.run_root().join(NETWORKS_DIR_NAME)
     }
@@ -112,9 +116,7 @@ fn sibling_test_root(data_root: &Path, kind: &str) -> PathBuf {
 pub(crate) struct LocalPaths {
     roots: LocalRoots,
     state_db_path: PathBuf,
-    machines_dir: PathBuf,
     images_dir: PathBuf,
-    net_dir: PathBuf,
     locks_dir: PathBuf,
 }
 
@@ -130,17 +132,13 @@ impl LocalPaths {
 
     pub(crate) fn from_roots(roots: LocalRoots) -> Self {
         let state_db_path = roots.state_db_path();
-        let machines_dir = roots.machines_dir();
         let images_dir = roots.images_dir();
-        let net_dir = roots.net_dir();
         let locks_dir = roots.locks_dir();
 
         Self {
             roots,
             state_db_path,
-            machines_dir,
             images_dir,
-            net_dir,
             locks_dir,
         }
     }
@@ -158,16 +156,8 @@ impl LocalPaths {
         &self.state_db_path
     }
 
-    pub(crate) fn machines_dir(&self) -> &Path {
-        &self.machines_dir
-    }
-
     pub(crate) fn images_dir(&self) -> &Path {
         &self.images_dir
-    }
-
-    pub(crate) fn net_dir(&self) -> &Path {
-        &self.net_dir
     }
 
     pub(crate) fn locks_dir(&self) -> &Path {
@@ -175,27 +165,177 @@ impl LocalPaths {
     }
 
     pub(crate) fn machine(&self, machine_id: MachineId) -> MachinePaths {
-        let id = machine_id.to_string();
         MachinePaths::new(
-            self.machines_dir().join(&id),
-            self.roots.run_root().join(MACHINES_DIR_NAME).join(&id),
-            self.roots
-                .state_root()
-                .join(LOGS_DIR_NAME)
-                .join(MACHINES_DIR_NAME)
-                .join(id),
+            self.roots.data_root(),
+            self.roots.state_root(),
+            self.roots.run_root(),
+            machine_id,
         )
     }
 
-    pub(crate) fn network(&self, network_id: &str) -> NetworkPaths {
-        NetworkPaths::new(
-            self.net_dir().join(network_id),
-            self.roots
-                .state_root()
-                .join(LOGS_DIR_NAME)
-                .join(NETWORKS_DIR_NAME)
-                .join(network_id),
+    pub(crate) fn network(&self, network_id: &str) -> Result<NetworkPaths, LibVmError> {
+        NetworkPaths::new(self.roots.run_root(), network_id).map_err(|message| {
+            LibVmError::StateDecode {
+                field: "network_instance_id",
+                message,
+            }
+        })
+    }
+
+    pub(crate) fn ensure_machine_run_dir(&self, machine_id: MachineId) -> Result<(), LibVmError> {
+        let root = OwnedDirectory::open_root(self.roots.run_root())?;
+        root.ensure_dir(MACHINES_DIR_NAME)?
+            .ensure_dir(&machine_id.to_string())?;
+        Ok(())
+    }
+
+    /// Creates a machine data directory and returns its validated containing directory.
+    pub(crate) fn create_machine_data_dir(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<OwnedDirectory, LibVmError> {
+        let root = OwnedDirectory::open_root(self.roots.data_root())?;
+        let machines = root.ensure_dir(MACHINES_DIR_NAME)?;
+        if machines.create_dir(&machine_id.to_string())?.is_none() {
+            return Err(LibVmError::MachineIdAlreadyExists {
+                id: machine_id.to_string(),
+            });
+        }
+        Ok(machines)
+    }
+
+    pub(crate) fn ensure_machine_logs_dir(&self, machine_id: MachineId) -> Result<(), LibVmError> {
+        self.machine_logs_tree(machine_id)?;
+        Ok(())
+    }
+
+    pub(crate) fn ensure_machine_network_logs_dir(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<OwnedDirectory, LibVmError> {
+        self.machine_logs_tree(machine_id)?
+            .ensure_dir(NETWORK_DIR_NAME)
+    }
+
+    pub(crate) fn ensure_network_run_dir(
+        &self,
+        network_id: &str,
+    ) -> Result<OwnedDirectory, LibVmError> {
+        let network = self.network(network_id)?;
+        let name = network
+            .runtime_dir()
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| LibVmError::StateDecode {
+                field: "network_instance_id",
+                message: format!("network instance id {network_id:?} is not valid UTF-8"),
+            })?;
+        let root = OwnedDirectory::open_root(self.roots.run_root())?;
+        root.ensure_dir(NETWORKS_DIR_NAME)?.ensure_dir(name)
+    }
+
+    pub(crate) fn remove_machine_run_tree(&self, machine_id: MachineId) -> Result<(), LibVmError> {
+        remove_owned_child(
+            self.roots.run_root(),
+            MACHINES_DIR_NAME,
+            &machine_id.to_string(),
         )
+    }
+
+    pub(crate) fn remove_network_run_tree(&self, network_id: &str) -> Result<(), LibVmError> {
+        let network = self.network(network_id)?;
+        let name = network
+            .runtime_dir()
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| LibVmError::StateDecode {
+                field: "network_instance_id",
+                message: format!("network instance id {network_id:?} is not valid UTF-8"),
+            })?;
+        remove_owned_child(self.roots.run_root(), NETWORKS_DIR_NAME, name)
+    }
+
+    pub(crate) fn remove_machine_logs_tree(&self, machine_id: MachineId) -> Result<(), LibVmError> {
+        let root = OwnedDirectory::open_root(self.roots.state_root())?;
+        let Some(logs) = root.open_dir(LOGS_DIR_NAME)? else {
+            return Ok(());
+        };
+        let Some(machines) = logs.open_dir(MACHINES_DIR_NAME)? else {
+            return Ok(());
+        };
+        machines.remove_tree(&machine_id.to_string())
+    }
+
+    pub(crate) fn open_vm_trace_log(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<Option<File>, LibVmError> {
+        self.open_machine_log(machine_id, false, VMMON_TRACE_LOG_FILE_NAME)
+    }
+
+    pub(crate) fn open_serial_log(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<Option<File>, LibVmError> {
+        self.open_machine_log(machine_id, false, SERIAL_LOG_FILE_NAME)
+    }
+
+    pub(crate) fn open_network_service_log(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<Option<File>, LibVmError> {
+        self.open_machine_log(machine_id, true, NETWORK_SERVICE_LOG_FILE_NAME)
+    }
+
+    pub(crate) fn open_network_audit_log(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<Option<File>, LibVmError> {
+        self.open_machine_log(machine_id, true, NETWORK_AUDIT_LOG_FILE_NAME)
+    }
+
+    fn open_machine_log(
+        &self,
+        machine_id: MachineId,
+        network: bool,
+        name: &str,
+    ) -> Result<Option<File>, LibVmError> {
+        let Some(root) = OwnedDirectory::open_existing_root(self.roots.state_root())? else {
+            return Ok(None);
+        };
+        let Some(logs) = root.open_dir(LOGS_DIR_NAME)? else {
+            return Ok(None);
+        };
+        let Some(machines) = logs.open_dir(MACHINES_DIR_NAME)? else {
+            return Ok(None);
+        };
+        let Some(machine) = machines.open_dir(&machine_id.to_string())? else {
+            return Ok(None);
+        };
+        let directory = if network {
+            let Some(network) = machine.open_dir(NETWORK_DIR_NAME)? else {
+                return Ok(None);
+            };
+            network
+        } else {
+            machine
+        };
+        directory.open_file(name)
+    }
+
+    pub(crate) fn remove_machine_data_tree(&self, machine_id: MachineId) -> Result<(), LibVmError> {
+        remove_owned_child(
+            self.roots.data_root(),
+            MACHINES_DIR_NAME,
+            &machine_id.to_string(),
+        )
+    }
+
+    fn machine_logs_tree(&self, machine_id: MachineId) -> Result<OwnedDirectory, LibVmError> {
+        let root = OwnedDirectory::open_root(self.roots.state_root())?;
+        root.ensure_dir(LOGS_DIR_NAME)?
+            .ensure_dir(MACHINES_DIR_NAME)?
+            .ensure_dir(&machine_id.to_string())
     }
 
     pub(crate) fn keys_dir(&self) -> PathBuf {
@@ -203,8 +343,17 @@ impl LocalPaths {
     }
 }
 
+fn remove_owned_child(root_path: &Path, owner: &str, child: &str) -> Result<(), LibVmError> {
+    let root = OwnedDirectory::open_root(root_path)?;
+    let Some(owner) = root.open_dir(owner)? else {
+        return Ok(());
+    };
+    owner.remove_tree(child)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::PathBuf;
 
     use crate::paths::{LocalPaths, LocalRoots};
@@ -269,7 +418,7 @@ mod tests {
         let paths = LocalPaths::new("/tmp/silo");
         let machine_id = MachineId::new();
         let machine = paths.machine(machine_id);
-        let network = paths.network("net123");
+        let network = paths.network("net123").expect("network paths");
 
         assert_eq!(paths.keys_dir(), PathBuf::from("/tmp/silo/keys"));
         assert_eq!(
@@ -277,22 +426,98 @@ mod tests {
             PathBuf::from("/tmp/silo/machines").join(machine_id.to_string())
         );
         assert_eq!(
-            machine.run_dir(),
+            machine.machine_run_dir(),
             PathBuf::from("/tmp/silo-run/machines").join(machine_id.to_string())
         );
         assert_eq!(
-            machine.logs_dir(),
+            machine.machine_logs_dir(),
             PathBuf::from("/tmp/silo-state/logs/machines").join(machine_id.to_string())
+        );
+        assert_eq!(
+            machine.network_service_log_path(),
+            PathBuf::from("/tmp/silo-state/logs/machines")
+                .join(machine_id.to_string())
+                .join("network/netd.log")
+        );
+        assert_eq!(
+            machine.network_audit_log_path(),
+            PathBuf::from("/tmp/silo-state/logs/machines")
+                .join(machine_id.to_string())
+                .join("network/audit.jsonl")
         );
         assert_eq!(paths.locks_dir(), PathBuf::from("/tmp/silo-run/locks"));
         assert_eq!(
-            network.dir(),
+            network.runtime_dir(),
             PathBuf::from("/tmp/silo-run/networks/net123")
         );
-        assert_eq!(
-            network.logs_dir(),
-            PathBuf::from("/tmp/silo-state/logs/networks/net123")
-        );
+    }
+
+    #[test]
+    fn machine_log_ownership_is_stable_across_network_instances() {
+        let paths = LocalPaths::new("/tmp/silo");
+        let machine_id = MachineId::new();
+        let machine_logs = paths.machine(machine_id).machine_logs_dir().to_path_buf();
+
+        let first = paths.network("first-network").expect("first network paths");
+        let second = paths
+            .network("second-network")
+            .expect("second network paths");
+
+        assert_ne!(first.runtime_dir(), second.runtime_dir());
+        assert_eq!(paths.machine(machine_id).machine_logs_dir(), machine_logs);
+        assert!(!machine_logs.starts_with(paths.roots().run_root()));
+    }
+
+    #[test]
+    fn machine_paths_cannot_collide_through_display_names() {
+        let paths = LocalPaths::new("/tmp/silo");
+        let first = paths.machine(MachineId::new());
+        let second = paths.machine(MachineId::new());
+
+        assert_ne!(first.machine_data_dir(), second.machine_data_dir());
+        assert_ne!(first.machine_logs_dir(), second.machine_logs_dir());
+        assert_ne!(first.machine_run_dir(), second.machine_run_dir());
+    }
+
+    #[test]
+    fn machine_data_directory_creation_rejects_symlinked_parents_and_children() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let paths = LocalPaths::new(temp.path().join("data"));
+        let external = temp.path().join("external");
+        std::fs::create_dir(&external).expect("create external directory");
+        std::fs::create_dir_all(paths.data_dir()).expect("create data root");
+        symlink(&external, paths.roots().machines_dir()).expect("create machines symlink");
+
+        let error = paths
+            .create_machine_data_dir(MachineId::new())
+            .err()
+            .expect("machines symlink must be rejected");
+        assert!(error.to_string().contains("machines"));
+        assert!(std::fs::read_dir(&external)
+            .expect("read external directory")
+            .next()
+            .is_none());
+        std::fs::remove_file(paths.roots().machines_dir()).expect("remove machines symlink");
+
+        std::fs::create_dir(paths.roots().machines_dir()).expect("create machines directory");
+        std::fs::set_permissions(
+            paths.roots().machines_dir(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("secure machines directory");
+        let id = MachineId::new();
+        symlink(&external, paths.roots().machines_dir().join(id.to_string()))
+            .expect("create machine symlink");
+
+        let error = paths
+            .create_machine_data_dir(id)
+            .err()
+            .expect("machine symlink must be rejected");
+        assert!(error.to_string().contains(&id.to_string()));
+        assert!(std::fs::read_dir(&external)
+            .expect("read external directory")
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -306,7 +531,10 @@ mod tests {
         );
         let paths = LocalPaths::from_roots(roots);
         let machine_socket = paths.machine(MachineId::new()).vmmon_socket_path();
-        let network_socket = paths.network(&MachineId::new().to_string()).socket_path();
+        let network_socket = paths
+            .network(&MachineId::new().to_string())
+            .expect("network paths")
+            .socket_path();
 
         assert!(machine_socket.as_os_str().len() < 104);
         assert!(network_socket.as_os_str().len() < 104);

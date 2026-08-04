@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -12,6 +12,7 @@ mod ext;
 mod guest;
 mod lock;
 mod machine;
+mod secure_file;
 mod services;
 mod shutdown;
 mod startup;
@@ -94,11 +95,7 @@ fn main() -> eyre::Result<()> {
     let sync_reporter = SyncReporter::from_fd(inherited_fds.syncpipe)
         .map_err(|err| eyre::eyre!("open syncpipe reporter: {err}"))?;
 
-    let trace_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&args.trace_log)
-        .map_err(|err| eyre::eyre!("open {}: {err}", args.trace_log.display()))?;
+    let trace_file = secure_file::open_append(&args.trace_log)?;
 
     let (writer, _guard) = tracing_appender::non_blocking(trace_file);
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -112,14 +109,41 @@ fn main() -> eyre::Result<()> {
         .try_init()
         .map_err(|err| eyre::eyre!("initialize vmmon tracing: {err}"))?;
 
+    tracing::info!(
+        event = "generation_start",
+        machine_id = %args.id,
+        run_id = %args.run_id,
+        "vmmon generation started"
+    );
+    let mut serial_file = secure_file::open_append(&args.serial_log)?;
+    write_serial_generation_boundary(&mut serial_file, &args.id, &args.run_id)?;
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| eyre::eyre!("build tokio runtime: {err}"))?
-        .block_on(run(args, start_gate, sync_reporter))
+        .block_on(run(args, start_gate, sync_reporter, serial_file))
 }
 
-async fn run(args: Args, start_gate: StartGate, sync_reporter: SyncReporter) -> eyre::Result<()> {
+fn write_serial_generation_boundary(
+    file: &mut std::fs::File,
+    machine_id: &str,
+    run_id: &str,
+) -> eyre::Result<()> {
+    writeln!(
+        file,
+        "--- silo vmmon generation start machine_id={machine_id} run_id={run_id} ---"
+    )
+    .map_err(eyre::Report::from)?;
+    file.flush().map_err(eyre::Report::from)
+}
+
+async fn run(
+    args: Args,
+    start_gate: StartGate,
+    sync_reporter: SyncReporter,
+    serial_file: std::fs::File,
+) -> eyre::Result<()> {
     let mut start_gate = start_gate;
     let mut sync_reporter = sync_reporter;
     let exit_command =
@@ -128,21 +152,18 @@ async fn run(args: Args, start_gate: StartGate, sync_reporter: SyncReporter) -> 
         args.data_dir.clone(),
         args.config.clone(),
         args.socket.clone(),
-        args.serial_log.clone(),
     );
     let pid_guard = PidGuard::create(&args.pidfile).await?;
 
-    let result = match startup::init(
-        &runtime,
-        &args.id,
-        &args.name,
-        &args.network,
-        args.agent_enabled,
-        &args.krun_path,
-        &mut start_gate,
-    )
-    .await
-    {
+    let startup_inputs = startup::InitInputs {
+        machine_id: &args.id,
+        name: &args.name,
+        network_args: &args.network,
+        agent_enabled: args.agent_enabled,
+        krun_path: &args.krun_path,
+        serial_file,
+    };
+    let result = match startup::init(&runtime, startup_inputs, &mut start_gate).await {
         Ok(ctx) => match services::start_services(&runtime, &ctx, &mut sync_reporter).await {
             Ok(handles) => shutdown::run(runtime, ctx, handles).await,
             Err(err) => Err(err),
@@ -161,9 +182,14 @@ async fn run(args: Args, start_gate: StartGate, sync_reporter: SyncReporter) -> 
     } else {
         ExitOutcome::Clean
     };
-    match ExitStatus::new(args.run_id.clone(), outcome, last_error.clone()) {
+    match ExitStatus::new(
+        args.id.clone(),
+        args.run_id.clone(),
+        outcome,
+        last_error.clone(),
+    ) {
         Ok(status) => {
-            if let Err(err) = exit_status::write(&args.exit_status, &status).await {
+            if let Err(err) = exit_status::write(&args.exit_status, &status) {
                 tracing::warn!(error = %err, path = %args.exit_status.display(), "write runtime exit status");
             }
         }
@@ -259,11 +285,35 @@ fn daemonize(_args: &Args, _inherited_fds: InheritedPipeFds) -> eyre::Result<()>
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io::Read;
     use std::path::PathBuf;
 
     use clap::Parser;
 
-    use crate::Args;
+    use crate::{write_serial_generation_boundary, Args};
+
+    #[test]
+    fn serial_generation_boundary_is_stable_and_identifiable() {
+        let path =
+            std::env::temp_dir().join(format!("silo-vmmon-boundary-{}", uuid::Uuid::new_v4()));
+        let mut file = fs::File::create(&path).expect("create serial log");
+
+        write_serial_generation_boundary(&mut file, "machine-1", "run-1")
+            .expect("write serial generation boundary");
+        drop(file);
+
+        let mut contents = String::new();
+        fs::File::open(&path)
+            .expect("open serial log")
+            .read_to_string(&mut contents)
+            .expect("read serial log");
+        assert_eq!(
+            contents,
+            "--- silo vmmon generation start machine_id=machine-1 run_id=run-1 ---\n"
+        );
+        fs::remove_file(path).expect("remove serial log");
+    }
 
     #[test]
     fn parses_hidden_exit_command_as_opaque_argv() {

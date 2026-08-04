@@ -1,45 +1,44 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
+pub(super) const NETWORKS_DIR_NAME: &str = "networks";
 const SOCKET_FILE_NAME: &str = "netd.sock";
-const LOG_FILE_NAME: &str = "netd.log";
-const PID_FILE_NAME: &str = "netd.pid";
-const PCAP_FILE_NAME: &str = "capture.pcap";
+pub(crate) const PID_FILE_NAME: &str = "netd.pid";
+pub(crate) const PCAP_FILE_NAME: &str = "capture.pcap";
 const POLICY_FILE_NAME: &str = "network-policy.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NetworkPaths {
     run_dir: PathBuf,
-    logs_dir: PathBuf,
 }
 
 impl NetworkPaths {
-    pub(crate) fn new(run_dir: impl Into<PathBuf>, logs_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            run_dir: run_dir.into(),
-            logs_dir: logs_dir.into(),
+    pub(crate) fn new(run_root: &Path, network_id: &str) -> Result<Self, String> {
+        let mut components = Path::new(network_id).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            return Err(format!(
+                "network instance id {network_id:?} is not a single path component"
+            ));
         }
+
+        Ok(Self {
+            run_dir: run_root.join(NETWORKS_DIR_NAME).join(network_id),
+        })
     }
 
-    pub(crate) fn dir(&self) -> &Path {
+    pub(crate) fn runtime_dir(&self) -> &Path {
         &self.run_dir
-    }
-
-    pub(crate) fn logs_dir(&self) -> &Path {
-        &self.logs_dir
     }
 
     pub(crate) fn socket_path(&self) -> PathBuf {
         self.run_dir.join(SOCKET_FILE_NAME)
     }
 
-    pub(crate) fn log_path(&self) -> PathBuf {
-        self.logs_dir.join(LOG_FILE_NAME)
-    }
-
+    #[cfg(test)]
     pub(crate) fn pid_path(&self) -> PathBuf {
         self.run_dir.join(PID_FILE_NAME)
     }
 
+    #[cfg(test)]
     pub(crate) fn pcap_path(&self) -> PathBuf {
         self.run_dir.join(PCAP_FILE_NAME)
     }
@@ -57,18 +56,12 @@ mod tests {
 
     #[test]
     fn network_paths_use_expected_filenames() {
-        let paths = NetworkPaths::new(
-            "/tmp/silo-run/networks/net123",
-            "/tmp/silo-state/logs/networks/net123",
-        );
+        let paths = NetworkPaths::new(PathBuf::from("/tmp/silo-run").as_path(), "net123")
+            .expect("network paths");
 
         assert_eq!(
             paths.socket_path(),
             PathBuf::from("/tmp/silo-run/networks/net123/netd.sock")
-        );
-        assert_eq!(
-            paths.log_path(),
-            PathBuf::from("/tmp/silo-state/logs/networks/net123/netd.log")
         );
         assert_eq!(
             paths.pid_path(),
@@ -82,5 +75,15 @@ mod tests {
             paths.policy_path(),
             PathBuf::from("/tmp/silo-run/networks/net123/network-policy.json")
         );
+    }
+
+    #[test]
+    fn network_paths_reject_non_component_ids() {
+        for id in ["", ".", "..", "nested/id", "/absolute"] {
+            assert!(
+                NetworkPaths::new(PathBuf::from("/tmp/silo-run").as_path(), id).is_err(),
+                "network id {id:?} should be rejected"
+            );
+        }
     }
 }

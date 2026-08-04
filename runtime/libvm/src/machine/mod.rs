@@ -5,6 +5,7 @@ mod handle;
 mod inspect;
 mod lifecycle;
 mod lifecycle_options;
+mod logs;
 mod memory;
 mod mounts;
 mod name_generator;
@@ -26,6 +27,9 @@ pub use inspect::{
 pub use lifecycle_options::{
     MachineExit, MachineExitOutcome, MachineKillOptions, MachineStopOptions, MachineWaitOptions,
     DEFAULT_MACHINE_WAIT_TIMEOUT,
+};
+pub use logs::{
+    MachineLogChunk, MachineLogOptions, MachineLogOutput, MachineLogSource, MachineLogStream,
 };
 pub use memory::Memory;
 pub use mounts::resolve_mount_location;

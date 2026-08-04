@@ -13,19 +13,24 @@ import (
 	"testing"
 
 	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
+	"github.com/vandycknick/silo/net/netd/internal/logfile"
+	"golang.org/x/sys/unix"
 )
 
 const testPolicyHash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-func TestOpenAppendsAuditJSONL(t *testing.T) {
-	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+func TestNewAppendsAuditJSONL(t *testing.T) {
+	dir := t.TempDir()
+	auditPath := filepath.Join(dir, "audit.jsonl")
 	for range 2 {
-		logger, err := Open(auditPath, testPolicyHash)
-		if err != nil {
-			t.Fatal(err)
-		}
+		file := openAuditFile(t, dir, "audit.jsonl")
+		logger := New(file, testPolicyHash)
 		logger.RecordFlow(testFlow(), testDenyDecision())
 		if err := logger.Close(); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -46,14 +51,17 @@ func TestOpenAppendsAuditJSONL(t *testing.T) {
 	}
 }
 
-func TestOpenOmitsPolicyHashWhenUnset(t *testing.T) {
-	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	logger, err := Open(auditPath, "")
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestNewOmitsPolicyHashWhenUnset(t *testing.T) {
+	dir := t.TempDir()
+	auditPath := filepath.Join(dir, "audit.jsonl")
+	file := openAuditFile(t, dir, "audit.jsonl")
+	logger := New(file, "")
 	logger.RecordFlow(testFlow(), testDenyDecision())
 	if err := logger.Close(); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -66,13 +74,38 @@ func TestOpenOmitsPolicyHashWhenUnset(t *testing.T) {
 	}
 }
 
+func openAuditFile(t *testing.T, path, name string) *os.File {
+	t.Helper()
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := logfile.OpenDirectory(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := directory.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	file, err := directory.OpenAppend(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return file
+}
+
 func TestWriteFailureIsLoggedAndDoesNotDisableSink(t *testing.T) {
 	logs := captureAuditLogs(t)
 	logger := newLogger(errorWriter{}, nil, testPolicyHash, 2)
 	logger.RecordFlow(testFlow(), testDenyDecision())
 	logger.RecordFlow(testFlow(), testDenyDecision())
-	if err := logger.Close(); err != nil {
-		t.Fatal(err)
+	if err := logger.Close(); err == nil {
+		t.Fatal("expected write failure to be returned from Close")
 	}
 
 	logText := logs.String()
@@ -159,6 +192,7 @@ func testFlow() hooks.Flow {
 		DestIP:     net.ParseIP("203.0.113.10"),
 		DestPort:   443,
 		VMID:       "vm-123",
+		RunID:      "run-789",
 		NetworkID:  "net-456",
 	}
 }

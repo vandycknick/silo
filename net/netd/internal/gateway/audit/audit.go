@@ -2,12 +2,11 @@ package audit
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,7 +18,6 @@ import (
 
 const (
 	defaultQueueCapacity = 1024
-	closeDrainTimeout    = 5 * time.Second
 	redactedHeaderValue  = "<redacted>"
 )
 
@@ -27,12 +25,13 @@ type Logger struct {
 	policyHash string
 	events     chan Event
 	done       chan struct{}
-	closer     io.Closer
+	syncer     interface{ Sync() error }
 	closeOnce  sync.Once
 	closeMu    sync.RWMutex
 	closed     atomic.Bool
 	drops      atomic.Uint64
 	closeErr   error
+	writeErr   error
 }
 
 type Event struct {
@@ -42,6 +41,7 @@ type Event struct {
 	Timestamp    time.Time   `json:"timestamp"`
 	PolicyHash   string      `json:"policy_hash,omitempty"`
 	VMID         string      `json:"vm_id,omitempty"`
+	RunID        string      `json:"run_id,omitempty"`
 	NetworkID    string      `json:"network_id,omitempty"`
 	FlowID       string      `json:"flow_id,omitempty"`
 	ParentFlowID string      `json:"parent_flow_id,omitempty"`
@@ -118,18 +118,17 @@ type AuditError struct {
 	Code string `json:"code,omitempty"`
 }
 
-func Open(path string, policyHash string) (*Logger, error) {
-	if path == "" {
-		return nil, nil
+// New records audit events to an already-open writer. The caller owns closing
+// the writer after Close has drained and synced it.
+func New(writer io.Writer, policyHash string) *Logger {
+	if writer == nil {
+		return nil
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	return newLogger(file, file, policyHash, defaultQueueCapacity), nil
+	syncer, _ := writer.(interface{ Sync() error })
+	return newLogger(writer, syncer, policyHash, defaultQueueCapacity)
 }
 
-func newLogger(writer io.Writer, closer io.Closer, policyHash string, capacity int) *Logger {
+func newLogger(writer io.Writer, syncer interface{ Sync() error }, policyHash string, capacity int) *Logger {
 	if capacity < 1 {
 		capacity = 1
 	}
@@ -137,7 +136,7 @@ func newLogger(writer io.Writer, closer io.Closer, policyHash string, capacity i
 		policyHash: policyHash,
 		events:     make(chan Event, capacity),
 		done:       make(chan struct{}),
-		closer:     closer,
+		syncer:     syncer,
 	}
 	go logger.drain(writer)
 	return logger
@@ -157,21 +156,28 @@ func (l *Logger) Close() error {
 		close(l.events)
 		l.closeMu.Unlock()
 
-		timer := time.NewTimer(closeDrainTimeout)
-		defer timer.Stop()
-		select {
-		case <-l.done:
-		case <-timer.C:
-			l.closeErr = fmt.Errorf("audit close timed out after %s", closeDrainTimeout)
-			slog.Warn("audit close timed out", "timeout", closeDrainTimeout.String())
-		}
-		if l.closer != nil {
-			if err := l.closer.Close(); err != nil && l.closeErr == nil {
-				l.closeErr = err
-			}
+		<-l.done
+		l.closeErr = l.writeErr
+		if l.syncer != nil {
+			l.closeErr = errors.Join(l.closeErr, l.syncer.Sync())
 		}
 	})
 	return l.closeErr
+}
+
+func (l *Logger) RecordGenerationBoundary(phase, vmID, runID, networkID string) {
+	if l == nil {
+		return
+	}
+	l.emit(Event{
+		Version:   1,
+		Phase:     phase,
+		Family:    "netd_generation",
+		Timestamp: time.Now().UTC(),
+		VMID:      vmID,
+		RunID:     runID,
+		NetworkID: networkID,
+	})
 }
 
 func (l *Logger) RecordFlow(flow hooks.Flow, decision hooks.RouteDecision) {
@@ -209,6 +215,7 @@ func (l *Logger) RecordFlowOutcomeForPolicy(policyHash string, flow hooks.Flow, 
 		Timestamp:  time.Now().UTC(),
 		PolicyHash: policyHash,
 		VMID:       flow.VMID,
+		RunID:      flow.RunID,
 		NetworkID:  flow.NetworkID,
 		FlowID:     flowID,
 		Direction:  "egress",
@@ -259,6 +266,7 @@ func (l *Logger) RecordHTTPRequestOutcomeForPolicy(policyHash string, request ho
 		Timestamp:    time.Now().UTC(),
 		PolicyHash:   policyHash,
 		VMID:         request.Flow.VMID,
+		RunID:        request.Flow.RunID,
 		NetworkID:    request.Flow.NetworkID,
 		ParentFlowID: request.Flow.FlowID,
 		RequestID:    requestID,
@@ -315,6 +323,7 @@ func (l *Logger) drain(writer io.Writer) {
 	encoder := json.NewEncoder(writer)
 	for event := range l.events {
 		if err := encoder.Encode(event); err != nil {
+			l.writeErr = errors.Join(l.writeErr, err)
 			slog.Error("audit write failed", "error", err, "phase", event.Phase, "family", event.Family)
 		}
 	}

@@ -6,26 +6,29 @@ socket. Run these commands from `nix develop`, which provides `grpcurl` and
 
 ## Select a running machine
 
-Set the machine name and derive its runtime directory from the CLI:
+Set the machine name, obtain its immutable ID from the CLI, then derive the
+ephemeral runtime socket from the configured run root:
 
 ```bash
 VM=dev
-MACHINE_DIR="$(silo status "$VM" --format json | jq -r '.dir')"
-SOCKET="$MACHINE_DIR/vm.sock"
+MACHINE_ID="$(silo status "$VM" --format json | jq -r '.id')"
+RUN_ROOT="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/silo}"
+RUN_ROOT="${RUN_ROOT:-/tmp/silo-$(id -u)}"
+SOCKET="$RUN_ROOT/machines/$MACHINE_ID/vm.sock"
 GRPC_TARGET="unix://$SOCKET"
 
 test -S "$SOCKET" && printf 'Using %s\n' "$SOCKET"
 ```
 
 `silo status` already exercises `VmMonitorService.GetStatus`. If it fails
-before printing the machine directory, inspect the default machine directory
-directly:
+before printing the machine ID, inspect the configured run root directly:
 
 ```bash
-ls "${XDG_DATA_HOME:-$HOME/.local/share}/silo/machines"/*/vm.sock
+ls "$RUN_ROOT/machines"/*/vm.sock
 ```
 
-Machine directories use the full undashed machine UUID.
+Machine IDs use the full undashed UUID. Sockets are runtime artifacts, so they
+are absent once a machine stops.
 
 ## Reflection
 
@@ -312,12 +315,14 @@ over vsock.
 `ResourceExhausted` means the relevant monitor, access, or filesystem admission
 limit is currently full.
 
-Inspect the monitor trace and serial output when a guest does not become ready:
+Persisted logs are not served by the host gRPC API. `libvm` is the access
+boundary: use the semantic CLI monitor stream when a guest does not become ready:
 
 ```bash
-tail -f "$MACHINE_DIR/vm.trace.log"
+silo logs "$VM" --follow
 ```
 
-```bash
-tail -f "$MACHINE_DIR/serial.log"
-```
+The configured state root retains logs under
+`<state-root>/logs/machines/<machine-id>/`, but callers must not reconstruct
+paths or filenames. Card 120 will expose semantic serial and private-network
+source selection through the same `libvm` boundary.

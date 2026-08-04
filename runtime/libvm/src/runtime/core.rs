@@ -222,13 +222,20 @@ impl Runtime {
         guest_agent::load_or_generate_guest_ssh_keypair(&self.paths)
     }
 
-    #[cfg(test)]
     pub(crate) fn local_paths(&self) -> &LocalPaths {
         &self.paths
     }
 
     pub(crate) fn machine_paths(&self, machine_id: MachineId) -> MachinePaths {
         self.paths.machine(machine_id)
+    }
+
+    pub(crate) fn ensure_machine_runtime_directories(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<(), LibVmError> {
+        self.paths.ensure_machine_run_dir(machine_id)?;
+        self.paths.ensure_machine_logs_dir(machine_id)
     }
 
     pub(crate) fn vmmon(&self) -> &Vmmon {
@@ -594,8 +601,13 @@ impl Runtime {
                     let started_at = live_identity
                         .as_ref()
                         .and_then(ProcessIdentity::started_at)
-                        .or_else(|| runtime.and_then(|runtime| runtime.started_at))
-                        .unwrap_or_else(|| pid_file_mtime(&pid_path));
+                        .ok_or_else(|| LibVmError::MonitorConnection {
+                            reference: metadata.name.clone(),
+                            message: format!(
+                                "vmmon pid {pid} from {} has no stable process generation",
+                                pid_path.display()
+                            ),
+                        })?;
                     let run_id = runtime.and_then(|runtime| runtime.run_id.clone());
                     transitions::reduce(
                         stored_state,
@@ -817,7 +829,57 @@ impl Runtime {
         &self,
         config: &MachineConfig,
     ) -> Result<(), LibVmError> {
-        reconcile_network_runtime(&self.paths, self.store.as_ref(), config, false).await
+        self.validate_machine_data_dir(config)?;
+        reconcile_network_runtime(&self.paths, self.store.as_ref(), config, false).await?;
+        self.paths.remove_machine_run_tree(config.id)
+    }
+
+    pub(crate) fn validate_machine_data_dir(
+        &self,
+        config: &MachineConfig,
+    ) -> Result<(), LibVmError> {
+        let machine_paths = self.paths.machine(config.id);
+        let canonical = machine_paths.machine_data_dir();
+        if config.machine_dir != canonical {
+            return Err(LibVmError::InvalidOwnedPath {
+                path: config.machine_dir.clone(),
+                message: format!(
+                    "persisted machine directory does not equal canonical machine path {}",
+                    canonical.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_no_live_vmmon_generation(
+        &self,
+        config: &MachineConfig,
+    ) -> Result<(), LibVmError> {
+        let state = self.machine_state(config.id).await?;
+        let Some(pid) = state.vmmon_pid else {
+            return Ok(());
+        };
+        let Some(identity) = ProcessIdentity::for_pid(pid)? else {
+            return Ok(());
+        };
+        if !identity.matches_started_at(state.started_at) {
+            return Err(LibVmError::InvalidOwnedPath {
+                path: self
+                    .machine_paths(config.id)
+                    .machine_run_dir()
+                    .to_path_buf(),
+                message: format!(
+                    "vmmon pid {pid} is a different process generation than persisted machine state"
+                ),
+            });
+        }
+        if identity.is_alive()? {
+            return Err(LibVmError::MachineAlreadyRunning {
+                reference: config.name.clone(),
+            });
+        }
+        Ok(())
     }
 
     pub(crate) async fn validate_machine_network_config(
@@ -860,12 +922,14 @@ impl Runtime {
     pub(crate) async fn prepare_machine_network(
         &self,
         config: &MachineConfig,
+        run_id: &str,
         network_launch: &NetworkLaunch,
     ) -> Result<VmmonNetworkAttachment, LibVmError> {
         prepare_network_runtime(
             &self.paths,
             self.store.as_ref(),
             config,
+            run_id,
             &self.networking,
             &self.components.netd,
             network_launch,
@@ -942,15 +1006,6 @@ impl Runtime {
         })
     }
 
-    pub(crate) fn remove_vmmon_exit_status(
-        &self,
-        config: &MachineConfig,
-    ) -> Result<(), LibVmError> {
-        let exit_status_path = self.machine_paths(config.id).vmmon_exit_status_path();
-        exit_status::remove(&exit_status_path)?;
-        Ok(())
-    }
-
     pub(crate) async fn save_machine_config(
         &self,
         config: &MachineConfig,
@@ -1013,6 +1068,13 @@ impl Runtime {
         name: &str,
     ) -> Result<Option<MachineConfig>, LibVmError> {
         self.store.machine_config_by_name(name).await
+    }
+
+    pub(crate) async fn machine_config(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<Option<MachineConfig>, LibVmError> {
+        self.store.machine_config(machine_id).await
     }
 
     pub(crate) async fn remove_machine_records(
@@ -1391,19 +1453,12 @@ pub(crate) fn reconcile_root_disk_size(
 }
 
 pub(crate) async fn wait_for_monitor_stop(
-    generation: &VmmonRunIdentity,
+    identity: &ProcessIdentity,
     machine_name: &str,
     timeout: std::time::Duration,
 ) -> Result<(), LibVmError> {
     let poll_interval = std::time::Duration::from_millis(200);
-    let Some(identity) = ProcessIdentity::for_pid(generation.pid)? else {
-        return Ok(());
-    };
-    if !identity.matches_started_at(generation.started_at) {
-        return Ok(());
-    }
-
-    process::wait_for_exit(&identity, machine_name, timeout, poll_interval)
+    process::wait_for_exit(identity, machine_name, timeout, poll_interval)
         .await
         .map_err(Into::into)
 }
@@ -1449,21 +1504,18 @@ fn live_monitor_identity(
     Ok(None)
 }
 
-pub(crate) fn monitor_started_at(
+pub(crate) fn monitor_identity(
     pid: i32,
     pid_path: &Path,
     machine_name: &str,
-) -> Result<i64, LibVmError> {
+) -> Result<ProcessIdentity, LibVmError> {
     let Some(identity) = ProcessIdentity::for_pid(pid)? else {
         return Err(LibVmError::MonitorConnection {
             reference: machine_name.to_string(),
             message: format!("vmmon pid {pid} from {} is not running", pid_path.display()),
         });
     };
-
-    Ok(identity
-        .started_at()
-        .unwrap_or_else(|| pid_file_mtime(pid_path)))
+    Ok(identity)
 }
 
 fn runtime_exit_matches(status: &VmmonExitStatus, state: Option<&MachineState>) -> bool {
@@ -1471,14 +1523,9 @@ fn runtime_exit_matches(status: &VmmonExitStatus, state: Option<&MachineState>) 
         return true;
     };
 
-    if let Some(run_id) = status.run_id.as_deref() {
-        return state.run_id.as_deref() == Some(run_id);
-    }
-
-    match status.pid {
-        Some(pid) => state.vmmon_pid == Some(pid),
-        None => true,
-    }
+    status.machine_id == state.machine_id.to_string()
+        && state.run_id.as_deref() == Some(status.run_id.as_str())
+        && state.vmmon_pid == Some(status.pid)
 }
 
 fn exit_observed_event(status: &VmmonExitStatus) -> (bool, Option<String>) {
@@ -1537,33 +1584,27 @@ fn transition_error(err: TransitionError) -> LibVmError {
     io::Error::new(io::ErrorKind::InvalidData, err.to_string()).into()
 }
 
-pub(crate) fn interrupt_monitor(pid: i32) -> io::Result<bool> {
-    match kill(Pid::from_raw(pid), Some(Signal::SIGINT)) {
+pub(crate) fn interrupt_monitor(identity: &ProcessIdentity) -> io::Result<bool> {
+    if !identity.is_alive()? {
+        return Ok(false);
+    }
+    match kill(Pid::from_raw(identity.pid()), Some(Signal::SIGINT)) {
         Ok(()) => Ok(true),
         Err(Errno::ESRCH) => Ok(false),
         Err(err) => Err(io::Error::other(err.to_string())),
     }
 }
 
-pub(crate) fn kill_monitor_process_group(pid: i32) -> io::Result<bool> {
-    if pid <= 0 {
+pub(crate) fn kill_monitor_process_group(identity: &ProcessIdentity) -> io::Result<bool> {
+    if !identity.is_alive()? {
         return Ok(false);
     }
 
-    match kill(Pid::from_raw(-pid), Some(Signal::SIGKILL)) {
+    match kill(Pid::from_raw(-identity.pid()), Some(Signal::SIGKILL)) {
         Ok(()) => Ok(true),
         Err(Errno::ESRCH) => Ok(false),
         Err(err) => Err(io::Error::other(err.to_string())),
     }
-}
-
-pub(crate) fn pid_file_mtime(pid_path: &Path) -> i64 {
-    std::fs::metadata(pid_path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 pub(crate) fn stopped_machine_state(
@@ -1615,7 +1656,7 @@ mod tests {
     use crate::store::models::{
         MachineConfig, MachineId, MachineNetworkConfig, MachineRuntimeState, MachineState,
     };
-    use crate::store::MockDataStore;
+    use crate::store::{MockDataStore, Store};
     use crate::utils::now_unix;
     use crate::vmmon::process::ProcessIdentity;
     use crate::{
@@ -1667,9 +1708,9 @@ mod tests {
     }
 
     fn create_machine_runtime_dirs(runtime: &Runtime, machine_id: MachineId) {
-        let paths = runtime.paths.machine(machine_id);
-        std::fs::create_dir_all(paths.run_dir()).expect("create machine run directory");
-        std::fs::create_dir_all(paths.logs_dir()).expect("create machine logs directory");
+        runtime
+            .ensure_machine_runtime_directories(machine_id)
+            .expect("create machine runtime directories");
     }
 
     fn sample_network_policy() -> NetworkPolicy {
@@ -1817,15 +1858,17 @@ mod tests {
         let machine_id = MachineId::new();
         let machine_paths = runtime.machine_paths(machine_id);
         std::fs::create_dir_all(machine_paths.dir()).expect("create machine data directory");
-        std::fs::create_dir_all(machine_paths.run_dir()).expect("create machine run directory");
-        std::fs::create_dir_all(machine_paths.logs_dir()).expect("create machine logs directory");
+        std::fs::create_dir_all(machine_paths.machine_run_dir())
+            .expect("create machine run directory");
+        std::fs::create_dir_all(machine_paths.machine_logs_dir())
+            .expect("create machine logs directory");
         let network = crate::network::VmmonNetworkAttachment::None;
         let pidfile = machine_paths.vmmon_pid_path();
         let exit_status = machine_paths.vmmon_exit_status_path();
         let config = machine_paths.vm_spec_path();
         let socket = machine_paths.vmmon_socket_path();
         let serial_log = machine_paths.serial_log_path();
-        let trace_log = machine_paths.vmmon_trace_log_path();
+        let trace_log = machine_paths.vm_trace_log_path();
         let launch = crate::vmmon::VmmonLaunch {
             machine_id,
             name: "portable-runtime",
@@ -1848,16 +1891,13 @@ mod tests {
             .await
             .expect("launch resolved vmmon");
 
-        let args = std::fs::read_to_string(
-            machine_paths
-                .vmmon_trace_log_path()
-                .with_extension("log.args"),
-        )
-        .expect("read vmmon launch arguments");
+        let args =
+            std::fs::read_to_string(machine_paths.vm_trace_log_path().with_extension("log.args"))
+                .expect("read vmmon launch arguments");
         assert_eq!(
             std::fs::read_to_string(
                 machine_paths
-                    .vmmon_trace_log_path()
+                    .vm_trace_log_path()
                     .with_extension("log.program"),
             )
             .expect("read launched vmmon path")
@@ -2011,6 +2051,15 @@ mod tests {
                 return Err(LibVmError::MachineIdAlreadyExists { id: id.to_string() });
             }
             std::fs::create_dir_all(&machine_dir)?;
+            std::fs::set_permissions(
+                machine_dir
+                    .parent()
+                    .ok_or_else(|| LibVmError::InvalidOwnedPath {
+                        path: machine_dir.clone(),
+                        message: "machine path has no owner directory".to_string(),
+                    })?,
+                std::fs::Permissions::from_mode(0o700),
+            )?;
 
             let spec = sample_vm_spec();
             write_machine_config(&machine_dir, &self.name, &spec)?;
@@ -2062,6 +2111,80 @@ mod tests {
             name: name.to_string(),
             root_disk_size: None,
         })
+    }
+
+    fn write_start_failure_components(paths: &LocalPaths, vmmon: &str) {
+        let root = paths.data_dir();
+        let bin = root.join("bin");
+        let assets = root.join("assets");
+        std::fs::create_dir_all(&bin).expect("create test runtime binaries");
+        std::fs::create_dir_all(&assets).expect("create test runtime assets");
+        let netd = bin.join("netd");
+        std::fs::write(
+            &netd,
+            "#!/bin/sh\nsocket=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--listen-vfkit\" ]; then socket=\"${arg#unixgram://}\"; fi\n  previous=\"$arg\"\ndone\n: > \"$socket\"\nwhile :; do sleep 1; done\n",
+        )
+        .expect("write test netd");
+        std::fs::set_permissions(&netd, std::fs::Permissions::from_mode(0o755))
+            .expect("make test netd executable");
+        let vmmon_path = bin.join("vmmon");
+        std::fs::write(&vmmon_path, vmmon).expect("write test vmmon");
+        std::fs::set_permissions(&vmmon_path, std::fs::Permissions::from_mode(0o755))
+            .expect("make test vmmon executable");
+        for asset in ["kernel-default", "initramfs"] {
+            std::fs::write(assets.join(asset), b"asset").expect("write test boot asset");
+        }
+    }
+
+    async fn start_failure_runtime(
+        temp: &tempfile::TempDir,
+        vmmon: &str,
+    ) -> (Runtime, MachineConfig, Arc<Store>) {
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        write_start_failure_components(&paths, vmmon);
+        let store = Arc::new(Store::new(&paths).await.expect("open test store"));
+        let components = crate::runtime::components::test_components(paths.data_dir());
+        let runtime = Runtime::from_store(
+            paths,
+            store.clone(),
+            RuntimeNetworkingConfig::default(),
+            components,
+        )
+        .await
+        .expect("create runtime");
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+        let mut config = runtime
+            .machine_config(machine.id)
+            .await
+            .expect("read machine config")
+            .expect("machine config exists");
+        config.guest.agent = crate::machine::MachineAgent::Disabled;
+        runtime
+            .save_machine_config(&config)
+            .await
+            .expect("disable test guest agent");
+        (runtime, config, store)
+    }
+
+    async fn assert_failed_start_network_is_clean(runtime: &Runtime, machine_id: MachineId) {
+        assert!(runtime
+            .store
+            .network_attachment(machine_id)
+            .await
+            .expect("read network attachment")
+            .is_none());
+        let network_root = runtime.paths.roots().net_dir();
+        if network_root.exists() {
+            assert!(std::fs::read_dir(network_root)
+                .expect("read network runtime root")
+                .next()
+                .is_none());
+        }
     }
 
     struct ChildGuard {
@@ -2171,6 +2294,146 @@ mod tests {
 
     fn machine_handle(runtime: &Runtime, machine_id: MachineId) -> crate::Machine {
         crate::Machine::new(runtime.clone(), machine_id)
+    }
+
+    #[tokio::test]
+    async fn start_failures_after_network_preparation_remove_network_runtime() {
+        let launch_failure = "#!/bin/sh\nexit 23\n";
+        let missing_pid = "#!/bin/sh\neval \"printf 'started\\n' >&$_VM_SYNCPIPE\"\nexit 0\n";
+        let missing_process = "#!/bin/sh\npidfile=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--pidfile\" ]; then pidfile=\"$arg\"; fi\n  previous=\"$arg\"\ndone\nprintf '999999\\n' > \"$pidfile\"\neval \"printf 'started\\n' >&$_VM_SYNCPIPE\"\nexit 0\n";
+
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let (runtime, mut config, _store) = start_failure_runtime(&temp, launch_failure).await;
+        config.spec.mounts.push(vm_spec::Mount {
+            source: std::path::PathBuf::from("~unsupported"),
+            tag: "invalid".to_string(),
+            read_only: true,
+        });
+        runtime
+            .save_machine_config(&config)
+            .await
+            .expect("persist invalid launch spec");
+
+        machine_handle(&runtime, config.id)
+            .start()
+            .await
+            .expect_err("launch input preparation must fail");
+
+        assert_failed_start_network_is_clean(&runtime, config.id).await;
+
+        for vmmon in [launch_failure, missing_pid, missing_process] {
+            let temp = tempfile::tempdir().expect("create temp dir");
+            let (runtime, config, _store) = start_failure_runtime(&temp, vmmon).await;
+
+            machine_handle(&runtime, config.id)
+                .start()
+                .await
+                .expect_err("test vmmon must fail to start");
+
+            assert_failed_start_network_is_clean(&runtime, config.id).await;
+            assert!(!runtime
+                .machine_state(config.id)
+                .await
+                .expect("read failed start state")
+                .status
+                .is_running());
+            machine_handle(&runtime, config.id)
+                .start()
+                .await
+                .expect_err("failed start must remain retryable");
+            assert_failed_start_network_is_clean(&runtime, config.id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn request_start_failure_after_network_preparation_removes_network_runtime() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let (runtime, config, store) = start_failure_runtime(&temp, "#!/bin/sh\nexit 23\n").await;
+        store
+            .execute_test_sql(
+                "CREATE TRIGGER reject_start_request
+             BEFORE UPDATE ON machine_state WHEN NEW.status = 'starting'
+             BEGIN SELECT RAISE(FAIL, 'forced start request failure'); END",
+            )
+            .await
+            .expect("reject start request state write");
+
+        let error = machine_handle(&runtime, config.id)
+            .start()
+            .await
+            .expect_err("start request state write must fail");
+
+        assert!(error.to_string().contains("forced start request failure"));
+        assert_failed_start_network_is_clean(&runtime, config.id).await;
+    }
+
+    #[tokio::test]
+    async fn monitor_ready_persistence_failure_stops_monitor_and_removes_network_runtime() {
+        let vmmon = "#!/bin/sh\npidfile=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--pidfile\" ]; then pidfile=\"$arg\"; fi\n  previous=\"$arg\"\ndone\nsleep 30 &\npid=$!\nprintf '%s\\n' \"$pid\" > \"$pidfile\"\neval \"printf 'started\\n' >&$_VM_SYNCPIPE\"\nexit 0\n";
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let (runtime, config, store) = start_failure_runtime(&temp, vmmon).await;
+        store
+            .execute_test_sql(
+                "CREATE TRIGGER reject_monitor_ready
+             BEFORE UPDATE ON machine_state WHEN NEW.status = 'running'
+             BEGIN SELECT RAISE(FAIL, 'forced monitor ready failure'); END",
+            )
+            .await
+            .expect("reject monitor-ready state write");
+
+        let error = machine_handle(&runtime, config.id)
+            .start()
+            .await
+            .expect_err("monitor-ready state write must fail");
+
+        assert!(error.to_string().contains("forced monitor ready failure"));
+        assert_failed_start_network_is_clean(&runtime, config.id).await;
+        assert_eq!(
+            runtime
+                .machine_state(config.id)
+                .await
+                .expect("read failed start state")
+                .status,
+            MachineRuntimeState::Error
+        );
+        let pid = read_monitor_pid(&runtime.paths.machine(config.id).vmmon_pid_path())
+            .expect("read fake vmmon pid");
+        if let Some(identity) = ProcessIdentity::for_pid(pid).expect("read fake vmmon identity") {
+            assert!(!identity.is_alive().expect("check fake vmmon liveness"));
+        }
+    }
+
+    #[tokio::test]
+    async fn start_rejects_noncanonical_machine_directory_before_creating_runtime_files() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths, RuntimeNetworkingConfig::default())
+            .await
+            .expect("create runtime");
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+        let mut config = runtime
+            .machine_config(machine.id)
+            .await
+            .expect("read machine config")
+            .expect("machine config exists");
+        config.machine_dir = temp.path().join("outside-machine-data");
+        runtime
+            .save_machine_config(&config)
+            .await
+            .expect("persist invalid machine directory");
+
+        let error = machine_handle(&runtime, config.id)
+            .start()
+            .await
+            .expect_err("noncanonical machine directory must fail start");
+
+        assert!(matches!(error, LibVmError::InvalidOwnedPath { .. }));
+        assert!(!runtime.paths.machine(config.id).machine_run_dir().exists());
     }
 
     async fn inspect_machine(
@@ -2484,7 +2747,6 @@ mod tests {
             )
             .await
             .expect("set running state");
-
         let machine_id = machine.id;
         let stop_machine = machine_handle(&runtime, machine_id);
         let stop_task = tokio::spawn(async move { stop_machine.stop().await });
@@ -2546,11 +2808,17 @@ mod tests {
             .await
             .expect("set running state");
         create_machine_runtime_dirs(&runtime, machine.id);
+        let exit_status_path = runtime.paths.machine(machine.id).vmmon_exit_status_path();
         std::fs::write(
-            runtime.paths.machine(machine.id).vmmon_exit_status_path(),
-            r#"{"runId":"run-1","pid":12345,"exitedAt":99,"outcome":"error","error":"runtime exploded"}"#,
+            &exit_status_path,
+            format!(
+                r#"{{"machineId":"{}","runId":"run-1","pid":12345,"exitedAt":99,"outcome":"error","error":"runtime exploded"}}"#,
+                machine.id
+            ),
         )
         .expect("write exit status");
+        std::fs::set_permissions(&exit_status_path, std::fs::Permissions::from_mode(0o600))
+            .expect("secure exit status");
 
         let exit = machine_handle(&runtime, machine.id)
             .wait()
@@ -2561,14 +2829,8 @@ mod tests {
             .await
             .expect("read machine state");
 
-        assert_eq!(exit.run_id.as_deref(), Some("run-1"));
-        assert!(exit.exited_at.is_some());
-        assert_eq!(
-            exit.outcome,
-            MachineExitOutcome::Error {
-                message: Some("runtime exploded".to_string())
-            }
-        );
+        assert_eq!(exit.run_id, None);
+        assert_eq!(exit.outcome, MachineExitOutcome::AlreadyStopped);
         assert_eq!(exit.machine.status.label(), "error");
         assert_eq!(state.status, MachineRuntimeState::Error);
         assert_eq!(state.last_error.as_deref(), Some("runtime exploded"));
@@ -2775,7 +3037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_reconciles_stopped_runtime_and_cleans_resources() {
+    async fn stop_reconciles_stopped_runtime_and_cleans_resources() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
             LocalPaths::new(temp.path().join("silo")),
@@ -2801,11 +3063,23 @@ mod tests {
             )
             .await
             .expect("set running state");
+        runtime
+            .ensure_machine_runtime_directories(machine.id)
+            .expect("create runtime trees");
+        let machine_paths = runtime.machine_paths(machine.id);
+        std::fs::write(machine_paths.vmmon_socket_path(), b"runtime")
+            .expect("write runtime sentinel");
+        std::fs::write(machine_paths.serial_log_path(), b"durable log").expect("write durable log");
+        std::fs::set_permissions(
+            machine_paths.serial_log_path(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("secure durable log");
 
         let inspect_data = machine_handle(&runtime, machine.id)
-            .cleanup()
+            .stop()
             .await
-            .expect("cleanup machine");
+            .expect("stop machine");
         let state = runtime
             .machine_state(machine.id)
             .await
@@ -2814,10 +3088,15 @@ mod tests {
         assert_eq!(inspect_data.status, MachineStatus::Stopped);
         assert_eq!(state.status, MachineRuntimeState::Stopped);
         assert_eq!(state.vmmon_pid, None);
+        assert!(!machine_paths.machine_run_dir().exists());
+        assert_eq!(
+            std::fs::read(machine_paths.serial_log_path()).expect("read durable log"),
+            b"durable log"
+        );
     }
 
     #[tokio::test]
-    async fn cleanup_keeps_starting_machine_active_without_live_runtime() {
+    async fn stop_finishes_starting_machine_without_live_runtime() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
             LocalPaths::new(temp.path().join("silo")),
@@ -2845,20 +3124,20 @@ mod tests {
             .expect("set starting state");
 
         let inspect_data = machine_handle(&runtime, machine.id)
-            .cleanup()
+            .stop()
             .await
-            .expect("cleanup machine");
+            .expect("stop machine");
         let state = runtime
             .machine_state(machine.id)
             .await
             .expect("read machine state");
 
-        assert_eq!(inspect_data.status.label(), "starting");
-        assert_eq!(state.status, MachineRuntimeState::Starting);
+        assert_eq!(inspect_data.status, MachineStatus::Stopped);
+        assert_eq!(state.status, MachineRuntimeState::Stopped);
     }
 
     #[tokio::test]
-    async fn cleanup_finishes_stopping_machine_without_live_runtime() {
+    async fn stop_finishes_stopping_machine_without_live_runtime() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
             LocalPaths::new(temp.path().join("silo")),
@@ -2886,9 +3165,9 @@ mod tests {
             .expect("set stopping state");
 
         let inspect_data = machine_handle(&runtime, machine.id)
-            .cleanup()
+            .stop()
             .await
-            .expect("cleanup machine");
+            .expect("stop machine");
         let state = runtime
             .machine_state(machine.id)
             .await
@@ -2900,7 +3179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_ignores_live_runtime() {
+    async fn stop_interrupts_live_runtime() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
             LocalPaths::new(temp.path().join("silo")),
@@ -2934,17 +3213,17 @@ mod tests {
             .expect("set running state");
 
         let inspect_data = machine_handle(&runtime, machine.id)
-            .cleanup()
+            .stop()
             .await
-            .expect("cleanup machine");
+            .expect("stop machine");
         let state = runtime
             .machine_state(machine.id)
             .await
             .expect("read machine state");
 
-        assert!(inspect_data.status.is_running());
-        assert_eq!(state.status, MachineRuntimeState::Running);
-        assert_eq!(state.vmmon_pid, Some(pid));
+        assert_eq!(inspect_data.status, MachineStatus::Stopped);
+        assert_eq!(state.status, MachineRuntimeState::Stopped);
+        assert_eq!(state.vmmon_pid, None);
         drop(child);
     }
 
@@ -3016,11 +3295,17 @@ mod tests {
             .await
             .expect("set running state");
         create_machine_runtime_dirs(&runtime, machine.id);
+        let exit_status_path = runtime.paths.machine(machine.id).vmmon_exit_status_path();
         std::fs::write(
-            runtime.paths.machine(machine.id).vmmon_exit_status_path(),
-            r#"{"runId":"run-1","pid":12345,"exitedAt":99,"outcome":"error","error":"runtime exploded"}"#,
+            &exit_status_path,
+            format!(
+                r#"{{"machineId":"{}","runId":"run-1","pid":12345,"exitedAt":99,"outcome":"error","error":"runtime exploded"}}"#,
+                machine.id
+            ),
         )
         .expect("write exit status");
+        std::fs::set_permissions(&exit_status_path, std::fs::Permissions::from_mode(0o600))
+            .expect("secure exit status");
 
         let inspect_data = inspect_machine(&runtime, MachineRef::id(machine.id))
             .await
@@ -3065,11 +3350,17 @@ mod tests {
             .await
             .expect("set running state");
         create_machine_runtime_dirs(&runtime, machine.id);
+        let exit_status_path = runtime.paths.machine(machine.id).vmmon_exit_status_path();
         std::fs::write(
-            runtime.paths.machine(machine.id).vmmon_exit_status_path(),
-            r#"{"runId":"run-1","pid":12345,"exitedAt":99,"outcome":"error","error":"old runtime exploded"}"#,
+            &exit_status_path,
+            format!(
+                r#"{{"machineId":"{}","runId":"run-1","pid":12345,"exitedAt":99,"outcome":"error","error":"old runtime exploded"}}"#,
+                machine.id
+            ),
         )
         .expect("write stale exit status");
+        std::fs::set_permissions(&exit_status_path, std::fs::Permissions::from_mode(0o600))
+            .expect("secure stale exit status");
 
         let inspect_data = inspect_machine(&runtime, MachineRef::id(machine.id))
             .await
@@ -3491,19 +3782,100 @@ mod tests {
             .await
             .expect("commit machine");
         let lock_path = runtime.lock_manager.lock_path(machine.lock_id);
+        runtime
+            .ensure_machine_runtime_directories(machine.id)
+            .expect("create runtime trees");
+        let machine_paths = runtime.machine_paths(machine.id);
+        std::fs::write(machine_paths.serial_log_path(), b"remove me").expect("write machine log");
+        std::fs::set_permissions(
+            machine_paths.serial_log_path(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("secure machine log");
 
+        let retry = machine_handle(&runtime, machine.id);
         machine_handle(&runtime, machine.id)
             .remove()
             .await
             .expect("remove machine");
+        retry.remove().await.expect("repeat removal");
 
         assert!(!machine.machine_dir.exists());
+        assert!(!machine_paths.machine_run_dir().exists());
+        assert!(!machine_paths.machine_logs_dir().exists());
         assert!(!lock_path.exists());
         assert!(runtime
             .list_machine_configs()
             .await
             .expect("list machines")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn removal_retains_machine_identity_after_partial_cleanup_and_retries() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let runtime = Runtime::open(
+            LocalPaths::new(temp.path().join("silo")),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .expect("create runtime");
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+        let machine_paths = runtime.machine_paths(machine.id);
+        create_machine_runtime_dirs(&runtime, machine.id);
+        std::fs::write(
+            machine_paths.serial_log_path(),
+            b"retain until removal succeeds",
+        )
+        .expect("write machine log");
+        std::fs::set_permissions(
+            machine_paths.serial_log_path(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("secure machine log");
+
+        let logs_root = machine_paths
+            .machine_logs_dir()
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("machine logs have a logs root");
+        std::fs::set_permissions(logs_root, std::fs::Permissions::from_mode(0o755))
+            .expect("make logs root unsafe");
+
+        let retry = machine_handle(&runtime, machine.id);
+        let error = machine_handle(&runtime, machine.id)
+            .remove()
+            .await
+            .expect_err("unsafe logs root must stop removal");
+        assert!(matches!(
+            error,
+            LibVmError::InvalidOwnedPath { ref path, .. } if path.as_path() == logs_root
+        ));
+        assert!(!machine_paths.machine_run_dir().exists());
+        assert!(machine.machine_dir.exists());
+        assert!(machine_paths.machine_logs_dir().exists());
+        assert!(runtime
+            .machine_config(machine.id)
+            .await
+            .expect("read retained machine")
+            .is_some());
+
+        std::fs::set_permissions(logs_root, std::fs::Permissions::from_mode(0o700))
+            .expect("restore logs root");
+        retry.remove().await.expect("retry removal");
+
+        assert!(!machine.machine_dir.exists());
+        assert!(!machine_paths.machine_logs_dir().exists());
+        assert!(runtime
+            .machine_config(machine.id)
+            .await
+            .expect("read removed machine")
+            .is_none());
     }
 
     #[tokio::test]
@@ -3526,6 +3898,21 @@ mod tests {
         create_machine_runtime_dirs(&runtime, machine.id);
         let pid_path = runtime.paths.machine(machine.id).vmmon_pid_path();
         std::fs::write(&pid_path, format!("{}\n", std::process::id())).expect("write pid file");
+        let started_at = ProcessIdentity::for_pid(std::process::id() as i32)
+            .expect("read current process")
+            .and_then(|identity| identity.started_at())
+            .expect("current process generation");
+        runtime
+            .set_machine_state(
+                machine.id,
+                MachineRuntimeState::Running,
+                Some(std::process::id() as i32),
+                Some(started_at),
+                Some("test-run".to_string()),
+                None,
+            )
+            .await
+            .expect("set running state");
 
         let err = machine_handle(&runtime, machine.id)
             .remove()

@@ -21,6 +21,7 @@ const linkLocalSubnet = "169.254.0.0/16"
 
 type TCPMetadata struct {
 	VMID      string
+	RunID     string
 	NetworkID string
 }
 
@@ -35,6 +36,7 @@ func TCP(ctx context.Context, s *stack.Stack, nat map[tcpip.Address]tcpip.Addres
 			DestIP:     addressIP(localAddress),
 			DestPort:   id.LocalPort,
 			VMID:       metadata.VMID,
+			RunID:      metadata.RunID,
 			NetworkID:  metadata.NetworkID,
 		}
 		flow = route.WithFlowID(flow)

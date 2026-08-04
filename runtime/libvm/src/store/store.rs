@@ -27,6 +27,12 @@ impl Store {
         Ok(store)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn execute_test_sql(&self, statement: &'static str) -> Result<(), LibVmError> {
+        sqlx::raw_sql(statement).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub(crate) async fn open(state_db_path: &Path) -> Result<Self, LibVmError> {
         if let Some(parent) = state_db_path.parent() {
             std::fs::create_dir_all(parent)?;

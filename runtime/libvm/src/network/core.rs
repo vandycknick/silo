@@ -27,6 +27,7 @@ pub(super) struct NetworkDriverContext<'a> {
     pub(super) paths: &'a LocalPaths,
     pub(super) store: &'a dyn DataStore,
     pub(super) metadata: &'a MachineConfig,
+    pub(super) run_id: &'a str,
     pub(super) config: &'a RuntimeNetworkingConfig,
     pub(super) netd_path: &'a Path,
     pub(super) network_launch: &'a NetworkLaunch,

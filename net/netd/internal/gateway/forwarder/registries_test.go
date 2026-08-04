@@ -235,10 +235,7 @@ func TestRegistryProxyDoesNotFilterMalwareMetadata(t *testing.T) {
 		t.Fatalf("load policy: %v", err)
 	}
 	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	auditLog, err := audit.Open(auditPath, compiled.PolicyHash())
-	if err != nil {
-		t.Fatal(err)
-	}
+	auditLog := testAuditLogger(t, auditPath, compiled.PolicyHash())
 	route := router.New(compiled, auditLog)
 	certPath, keyPath, rootCAs := writeTestCA(t, t.TempDir())
 	ca, err := LoadCertificateAuthority(certPath, keyPath)

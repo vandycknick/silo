@@ -7,7 +7,8 @@ use libvm::{
     AttachOptionsBuilder, ExecControl, ExecEvent, ExecHandle, ExecOptionsBuilder, ExecOutput,
     ExecSink, ExitStatus, ImageDetail, ImageHandle, ImageLayerDetail, ImagePruneReport,
     ImagePullOptions, ImagePullPolicy, ImageRemoveOptions, ImageSource, Images, LibVmError,
-    Machine, MachineBuilder, MachineData, MachineNetworkBuilder, MachineNetworkConfig, MachineRef,
+    Machine, MachineBuilder, MachineData, MachineLogChunk, MachineLogOptions, MachineLogOutput,
+    MachineLogSource, MachineLogStream, MachineNetworkBuilder, MachineNetworkConfig, MachineRef,
     MachineStatus, Memory, NetworkAuditBuilder, NetworkCredentialBuilder, NetworkEndpointBuilder,
     NetworkForwardBuilder, NetworkPolicy, NetworkRuleBuilder, Runtime, RuntimeConfig,
     TailscaleTunnelBuilder,
@@ -15,6 +16,8 @@ use libvm::{
 use napi::bindgen_prelude::Uint8Array;
 use napi::{Error, Result, Status};
 use napi_derive::napi;
+use tokio::sync::watch;
+use tokio_stream::StreamExt;
 use vm_spec::Mount;
 
 #[napi(object)]
@@ -155,6 +158,17 @@ pub struct NativeAttachOptionsInput {
 }
 
 #[napi(object)]
+pub struct NativeMachineLogOptionsInput {
+    pub follow: Option<bool>,
+}
+
+#[napi(object)]
+pub struct NativeMachineLogChunk {
+    pub output: String,
+    pub data: Uint8Array,
+}
+
+#[napi(object)]
 pub struct NativeMachineData {
     pub id: String,
     pub name: String,
@@ -275,6 +289,18 @@ pub struct NativeExecHandle {
 #[napi(js_name = "NativeExecSink")]
 pub struct NativeExecSink {
     inner: Mutex<Option<ExecSink>>,
+}
+
+#[napi(js_name = "NativeMachineLogHandle")]
+pub struct NativeMachineLogHandle {
+    inner: Mutex<MachineLogHandleState>,
+}
+
+struct MachineLogHandleState {
+    stream: Option<MachineLogStream>,
+    receive_in_flight: bool,
+    closed: bool,
+    cancellation: watch::Sender<bool>,
 }
 
 #[napi(js_name = "openRuntime")]
@@ -596,6 +622,145 @@ impl NativeMachine {
         let machine = self.inner.clone();
         let status = attach_shell(machine, options).await?;
         Ok(exit_status_to_native(status))
+    }
+
+    #[napi]
+    pub async fn logs(
+        &self,
+        source: String,
+        options: Option<NativeMachineLogOptionsInput>,
+    ) -> Result<NativeMachineLogHandle> {
+        let machine = self.inner.clone();
+        let source = machine_log_source_from_native(&source)?;
+        let stream = machine
+            .logs(
+                source,
+                MachineLogOptions {
+                    follow: options.and_then(|options| options.follow).unwrap_or(false),
+                },
+            )
+            .await
+            .map_err(to_napi_error)?;
+        Ok(NativeMachineLogHandle {
+            inner: Mutex::new(MachineLogHandleState::new(stream)),
+        })
+    }
+}
+
+#[napi]
+impl NativeMachineLogHandle {
+    #[napi]
+    pub async fn recv(&self) -> Result<Option<NativeMachineLogChunk>> {
+        let (mut stream, mut cancellation) = self.begin_recv()?;
+        let chunk = tokio::select! {
+            biased;
+            _ = cancellation.changed() => {
+                self.finish_recv(None)?;
+                return Err(machine_log_handle_closed());
+            }
+            chunk = stream.next() => chunk,
+        };
+
+        match chunk {
+            Some(Ok(chunk)) => {
+                let converted = machine_log_chunk_to_native(chunk);
+                let keep_stream = converted.is_ok();
+                if !self.finish_recv(keep_stream.then_some(stream))? {
+                    return Err(machine_log_handle_closed());
+                }
+                converted.map(Some)
+            }
+            Some(Err(error)) => {
+                self.finish_recv(None)?;
+                Err(to_napi_error(error))
+            }
+            None => {
+                self.finish_recv(None)?;
+                Ok(None)
+            }
+        }
+    }
+
+    #[napi]
+    pub fn close(&self) -> Result<()> {
+        self.inner
+            .lock()
+            .map_err(|_| invalid_state("machine log handle lock is poisoned"))?
+            .close();
+        Ok(())
+    }
+}
+
+impl NativeMachineLogHandle {
+    fn begin_recv(&self) -> Result<(MachineLogStream, watch::Receiver<bool>)> {
+        self.inner
+            .lock()
+            .map_err(|_| invalid_state("machine log handle lock is poisoned"))?
+            .begin_recv()
+    }
+
+    fn finish_recv(&self, stream: Option<MachineLogStream>) -> Result<bool> {
+        self.inner
+            .lock()
+            .map_err(|_| invalid_state("machine log handle lock is poisoned"))?
+            .finish_recv(stream)
+    }
+}
+
+impl MachineLogHandleState {
+    fn new(stream: MachineLogStream) -> Self {
+        let (cancellation, _) = watch::channel(false);
+        Self {
+            stream: Some(stream),
+            receive_in_flight: false,
+            closed: false,
+            cancellation,
+        }
+    }
+
+    fn begin_recv(&mut self) -> Result<(MachineLogStream, watch::Receiver<bool>)> {
+        if self.closed {
+            return Err(machine_log_handle_closed());
+        }
+        if self.receive_in_flight {
+            return Err(machine_log_handle_busy());
+        }
+
+        let stream = self.stream.take().ok_or_else(machine_log_handle_closed)?;
+        self.receive_in_flight = true;
+        Ok((stream, self.cancellation.subscribe()))
+    }
+
+    fn finish_recv(&mut self, stream: Option<MachineLogStream>) -> Result<bool> {
+        if !self.receive_in_flight {
+            return Err(invalid_state("machine log handle has no active receive"));
+        }
+
+        self.receive_in_flight = false;
+        if self.closed {
+            return Ok(false);
+        }
+
+        match stream {
+            Some(stream) => {
+                self.stream = Some(stream);
+                Ok(true)
+            }
+            None => {
+                self.closed = true;
+                Ok(true)
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+
+        self.closed = true;
+        self.stream = None;
+        self.cancellation.send_replace(true);
     }
 }
 
@@ -1490,6 +1655,30 @@ fn exec_event_to_native(event: ExecEvent) -> NativeExecEvent {
     }
 }
 
+fn machine_log_source_from_native(source: &str) -> Result<MachineLogSource> {
+    match source {
+        "monitor" => Ok(MachineLogSource::Monitor),
+        "serial" => Ok(MachineLogSource::Serial),
+        "network" => Ok(MachineLogSource::Network),
+        "networkAudit" => Ok(MachineLogSource::NetworkAudit),
+        _ => Err(invalid_arg(format!(
+            "unsupported machine log source {source:?}"
+        ))),
+    }
+}
+
+fn machine_log_chunk_to_native(chunk: MachineLogChunk) -> Result<NativeMachineLogChunk> {
+    let output = match chunk.output {
+        MachineLogOutput::Stdout => "stdout",
+        MachineLogOutput::Stderr => "stderr",
+        _ => return Err(invalid_state("unsupported machine log output")),
+    };
+    Ok(NativeMachineLogChunk {
+        output: output.to_string(),
+        data: chunk.data.to_vec().into(),
+    })
+}
+
 fn image_handle_to_native(handle: ImageHandle) -> NativeImageHandle {
     NativeImageHandle {
         reference: handle.reference,
@@ -1570,6 +1759,7 @@ fn to_napi_error(error: LibVmError) -> Error {
         LibVmError::MachineIdAlreadyExists { .. } => "MachineIdAlreadyExists",
         LibVmError::MachineAlreadyRunning { .. } => "MachineAlreadyRunning",
         LibVmError::MachineNotRunning { .. } => "MachineNotRunning",
+        LibVmError::MachineLogSourceUnavailable { .. } => "MachineLogSourceUnavailable",
         LibVmError::MonitorConnection { .. } => "MonitorConnection",
         LibVmError::MonitorProtocol { .. } => "MonitorProtocol",
         LibVmError::GuestSession { .. } => "GuestSession",
@@ -1605,13 +1795,23 @@ fn invalid_state(message: impl Into<String>) -> Error {
     Error::new(Status::GenericFailure, message.into())
 }
 
+fn machine_log_handle_closed() -> Error {
+    invalid_state("machine log handle is closed")
+}
+
+fn machine_log_handle_busy() -> Error {
+    invalid_state("machine log handle is busy")
+}
+
 #[cfg(test)]
 mod tests {
-    use libvm::{MachineNetworkConfig, NetworkPolicy};
+    use libvm::{MachineLogChunk, MachineLogOutput, MachineNetworkConfig, NetworkPolicy};
     use serde_json::json;
+    use tokio::sync::watch;
 
     use crate::{
-        network_policy_from_input, network_to_native, NativeKeyValue, NativeNetworkInput,
+        machine_log_chunk_to_native, machine_log_source_from_native, network_policy_from_input,
+        network_to_native, MachineLogHandleState, NativeKeyValue, NativeNetworkInput,
         NativeNetworkPolicyInput, ParsedNativeNetworkInput,
     };
 
@@ -1667,5 +1867,71 @@ mod tests {
         let policy_json = native.policy_json.expect("policy json");
         let parsed = NetworkPolicy::from_json_str(&policy_json).expect("parse output policy json");
         assert_eq!(parsed.metadata()["source"], "test");
+    }
+
+    #[test]
+    fn machine_log_source_requires_one_semantic_source() {
+        assert!(machine_log_source_from_native("monitor").is_ok());
+        assert!(machine_log_source_from_native("serial").is_ok());
+        assert!(machine_log_source_from_native("network").is_ok());
+        assert!(machine_log_source_from_native("networkAudit").is_ok());
+        assert!(machine_log_source_from_native("network_audit").is_err());
+        assert!(machine_log_source_from_native("path").is_err());
+    }
+
+    #[test]
+    fn machine_log_chunks_preserve_bytes_and_output_channels() {
+        let stdout = machine_log_chunk_to_native(MachineLogChunk {
+            output: MachineLogOutput::Stdout,
+            data: vec![0, 255, 128, 10].into(),
+        })
+        .expect("convert stdout chunk");
+        let stderr = machine_log_chunk_to_native(MachineLogChunk {
+            output: MachineLogOutput::Stderr,
+            data: vec![1, 2, 3].into(),
+        })
+        .expect("convert stderr chunk");
+
+        assert_eq!(stdout.output, "stdout");
+        assert_eq!(stdout.data.as_ref(), &[0, 255, 128, 10]);
+        assert_eq!(stderr.output, "stderr");
+        assert_eq!(stderr.data.as_ref(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn machine_log_handle_rejects_concurrent_receives_as_busy() {
+        let (cancellation, _) = watch::channel(false);
+        let mut state = MachineLogHandleState {
+            stream: None,
+            receive_in_flight: true,
+            closed: false,
+            cancellation,
+        };
+
+        let result = state.begin_recv();
+
+        match result {
+            Err(error) => assert!(error.to_string().contains("machine log handle is busy")),
+            Ok(_) => panic!("concurrent receive must fail"),
+        }
+    }
+
+    #[test]
+    fn machine_log_handle_close_is_idempotent_and_cancels_pending_receive() {
+        let (cancellation, _) = watch::channel(false);
+        let mut state = MachineLogHandleState {
+            stream: None,
+            receive_in_flight: true,
+            closed: false,
+            cancellation,
+        };
+        let receiver = state.cancellation.subscribe();
+
+        state.close();
+        state.close();
+
+        assert!(state.closed);
+        assert!(state.stream.is_none());
+        assert!(*receiver.borrow());
     }
 }

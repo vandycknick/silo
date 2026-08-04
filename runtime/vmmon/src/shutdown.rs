@@ -35,7 +35,7 @@ pub async fn run(
 
     handles.mark_not_serving().await;
     handles.server_shutdown.cancel();
-    drain(&mut handles).await;
+    drain(&mut handles, &ctx.machine).await;
     cleanup(&runtime, &ctx).await?;
 
     if forced {
@@ -72,7 +72,7 @@ async fn graceful_stop(ctx: &DaemonContext) -> eyre::Result<bool> {
     }
 }
 
-async fn drain(handles: &mut ServiceHandles) {
+async fn drain(handles: &mut ServiceHandles, machine: &virt::VirtualMachine) {
     if let Some(task) = handles.guest_monitor.take() {
         drain_task(task, "guest monitor").await;
     }
@@ -83,8 +83,11 @@ async fn drain(handles: &mut ServiceHandles) {
 
     drain_result_task(&mut handles.control_socket, "control socket").await;
 
-    handles.serial_log.abort();
-    let _ = (&mut handles.serial_log).await;
+    match tokio::time::timeout(SERVICE_DRAIN_TIMEOUT, machine.drain_serial()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(%error, "serial log drain failed during shutdown"),
+        Err(_) => tracing::warn!("serial log drain exceeded shutdown drain timeout"),
+    }
 }
 
 async fn drain_task(mut task: tokio::task::JoinHandle<()>, label: &'static str) {

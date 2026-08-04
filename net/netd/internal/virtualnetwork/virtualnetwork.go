@@ -20,6 +20,7 @@ import (
 	"github.com/vandycknick/silo/net/netd/internal/config"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/packet"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
+	"github.com/vandycknick/silo/net/netd/internal/logfile"
 	"golang.org/x/sync/errgroup"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -34,6 +35,7 @@ import (
 
 type Metadata struct {
 	VMID      string
+	RunID     string
 	NetworkID string
 }
 
@@ -56,7 +58,9 @@ type networkService struct {
 	close func() error
 }
 
-func New(ctx context.Context, networkConfig *config.NetworkConfig, route *router.Router, dispatcher *packet.TCPDispatcher, flows *packet.FlowTracker, metadata Metadata) (*VirtualNetwork, error) {
+// New takes ownership of captureFile when it succeeds. Callers retain it when
+// construction fails.
+func New(ctx context.Context, networkConfig *config.NetworkConfig, captureFile *os.File, route *router.Router, dispatcher *packet.TCPDispatcher, flows *packet.FlowTracker, metadata Metadata) (*VirtualNetwork, error) {
 	if networkConfig == nil {
 		return nil, errors.New("network configuration is required")
 	}
@@ -85,35 +89,21 @@ func New(ctx context.Context, networkConfig *config.NetworkConfig, route *router
 	networkSwitch.Connect(tapEndpoint)
 
 	var endpoint stack.LinkEndpoint = tapEndpoint
-	var captureFile *os.File
-	if configuration.CaptureFile != "" {
-		_ = os.Remove(configuration.CaptureFile)
-		fd, err := os.Create(configuration.CaptureFile)
+	if captureFile != nil {
+		endpoint, err = sniffer.NewWithWriter(tapEndpoint, captureFile, math.MaxUint32)
 		if err != nil {
-			return nil, fmt.Errorf("cannot create capture file: %w", err)
-		}
-		endpoint, err = sniffer.NewWithWriter(tapEndpoint, fd, math.MaxUint32)
-		if err != nil {
-			_ = fd.Close()
 			return nil, fmt.Errorf("cannot create sniffer: %w", err)
 		}
-		captureFile = fd
 	}
 
 	stack, err := createStack(configuration, endpoint)
 	if err != nil {
-		if captureFile != nil {
-			_ = captureFile.Close()
-		}
 		return nil, fmt.Errorf("cannot create network stack: %w", err)
 	}
 
 	mux, services, err := addServices(ctx, configuration, stack, ipPool, route, dispatcher, flows, metadata)
 	if err != nil {
 		stack.Close()
-		if captureFile != nil {
-			_ = captureFile.Close()
-		}
 		return nil, fmt.Errorf("cannot add network services: %w", err)
 	}
 
@@ -130,7 +120,6 @@ func upstreamConfiguration(configuration *config.NetworkConfig) *types.Configura
 		zones = append(zones, types.Zone{Name: zone.Name, Records: records})
 	}
 	return &types.Configuration{
-		CaptureFile:       configuration.CaptureFile,
 		Debug:             configuration.Debug,
 		MTU:               configuration.MTU,
 		Subnet:            configuration.Subnet,
@@ -218,7 +207,7 @@ func (n *VirtualNetwork) Close() error {
 			n.stack.Close()
 		}
 		if n.captureFile != nil {
-			n.closeErr = errors.Join(n.closeErr, n.captureFile.Close())
+			n.closeErr = errors.Join(n.closeErr, logfile.SyncClose(n.captureFile))
 		}
 	})
 	return n.closeErr

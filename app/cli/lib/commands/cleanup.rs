@@ -27,7 +27,7 @@ impl Cmd {
             .context("initialize libvm")?;
         let machine_ref = MachineRef::parse(self.machine_id)?;
         let machine = runtime.get_machine(&machine_ref).await?;
-        machine.cleanup().await?;
+        machine.remove().await?;
         Ok(())
     }
 }

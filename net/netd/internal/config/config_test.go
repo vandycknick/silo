@@ -66,17 +66,59 @@ func TestParseRejectsRemovedSSHPortFlag(t *testing.T) {
 	}
 }
 
-func TestParseRejectsRemovedAuditAndProfileFlags(t *testing.T) {
+func TestParseAcceptsExplicitLogFilesAndRunMetadata(t *testing.T) {
+	dir := t.TempDir()
+	logFile := "service.jsonl"
+	auditLogFile := "audit.jsonl"
+	captureFile := "capture.pcap"
+	cfg, err := Parse([]string{
+		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
+		"--log-dir-fd", "3",
+		"--runtime-dir-fd", "4",
+		"--log-file", logFile,
+		"--audit-log-file", auditLogFile,
+		"--pcap", captureFile,
+		"--vm-id", "vm-123",
+		"--run-id", "run-456",
+		"--network-id", "network-789",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LogFile != logFile || cfg.AuditLogFile != auditLogFile {
+		t.Fatalf("unexpected explicit log files: %#v", cfg)
+	}
+	if cfg.CaptureFile != captureFile {
+		t.Fatalf("capture file = %q, want %q", cfg.CaptureFile, captureFile)
+	}
+	if cfg.LogDirFD != 3 || cfg.RuntimeDirFD != 4 {
+		t.Fatalf("unexpected directory descriptors: %#v", cfg)
+	}
+	if cfg.Metadata != (Metadata{VMID: "vm-123", RunID: "run-456", NetworkID: "network-789"}) {
+		t.Fatalf("unexpected metadata: %#v", cfg.Metadata)
+	}
+}
+
+func TestParseRequiresLogFilesAndGenerationMetadata(t *testing.T) {
+	for _, missing := range []string{"--log-dir-fd", "--runtime-dir-fd", "--log-file", "--audit-log-file", "--vm-id", "--run-id", "--network-id"} {
+		t.Run(missing, func(t *testing.T) {
+			args := configArgs(t)
+			filtered := make([]string, 0, len(args)-2)
+			for index := 0; index < len(args); index += 2 {
+				if args[index] != missing {
+					filtered = append(filtered, args[index], args[index+1])
+				}
+			}
+			if _, err := Parse(filtered); err == nil {
+				t.Fatalf("expected missing %s to be rejected", missing)
+			}
+		})
+	}
+}
+
+func TestParseRejectsRemovedProfileAndAuditAliases(t *testing.T) {
 	dir := t.TempDir()
 	_, err := Parse([]string{
-		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
-		"--audit-log", filepath.Join(dir, "audit.jsonl"),
-	})
-	if err == nil {
-		t.Fatal("expected removed --audit-log flag to be rejected")
-	}
-
-	_, err = Parse([]string{
 		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
 		"--profile-name", "default",
 	})
@@ -84,7 +126,7 @@ func TestParseRejectsRemovedAuditAndProfileFlags(t *testing.T) {
 		t.Fatal("expected removed --profile-name flag to be rejected")
 	}
 
-	for _, flag := range []string{"--audit-path", "--audit-file", "--secret-store-file"} {
+	for _, flag := range []string{"--audit-log", "--audit-path", "--audit-file", "--secret-store-file"} {
 		_, err = Parse([]string{
 			"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
 			flag, filepath.Join(dir, "audit.jsonl"),
@@ -95,11 +137,18 @@ func TestParseRejectsRemovedAuditAndProfileFlags(t *testing.T) {
 	}
 }
 
+func TestParseRejectsPathNamesForDescriptorRelativeFiles(t *testing.T) {
+	for _, flag := range []string{"--log-file", "--audit-log-file", "--pid-file", "--pcap"} {
+		t.Run(flag, func(t *testing.T) {
+			if _, err := Parse(append(configArgs(t), flag, "nested/file")); err == nil {
+				t.Fatalf("expected %s path to be rejected", flag)
+			}
+		})
+	}
+}
+
 func TestLoadPolicyUsesDefaultPolicyWithoutHash(t *testing.T) {
-	dir := t.TempDir()
-	cfg, err := Parse([]string{
-		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
-	})
+	cfg, err := Parse(configArgs(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,10 +180,9 @@ func TestLoadPolicyRequiresTLSCAForHTTPSEndpoints(t *testing.T) {
 }
 `)
 
-	cfg, err := Parse([]string{
-		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
+	cfg, err := Parse(append(configArgs(t),
 		"--policy-file", policyPath,
-	})
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,10 +211,9 @@ func TestLoadPolicyRequiresTLSCAForRegistryEndpoints(t *testing.T) {
   }]
 }
 `)
-	cfg, err := Parse([]string{
-		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
+	cfg, err := Parse(append(configArgs(t),
 		"--policy-file", policyPath,
-	})
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,12 +238,11 @@ func TestLoadPolicyDoesNotRequireSecretStoreForCredentials(t *testing.T) {
 }
 `)
 
-	cfg, err := Parse([]string{
-		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
+	cfg, err := Parse(append(configArgs(t),
 		"--policy-file", policyPath,
 		"--tls-ca-cert", filepath.Join(dir, "ca.pem"),
 		"--tls-ca-key", filepath.Join(dir, "ca-key.pem"),
-	})
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,13 +253,13 @@ func TestLoadPolicyDoesNotRequireSecretStoreForCredentials(t *testing.T) {
 }
 
 func TestParseKeepsLogFileOnValidationError(t *testing.T) {
-	dir := t.TempDir()
-	logFile := filepath.Join(dir, "netd.log")
-	cfg, err := Parse([]string{"--log-file", logFile})
+	logFile := "netd.log"
+	auditLogFile := "audit.jsonl"
+	cfg, err := Parse([]string{"--log-file", logFile, "--audit-log-file", auditLogFile})
 	if err == nil {
 		t.Fatal("expected missing listen socket to be rejected")
 	}
-	if cfg == nil || cfg.LogFile != logFile {
+	if cfg == nil || cfg.LogFile != logFile || cfg.AuditLogFile != auditLogFile {
 		t.Fatalf("expected parser-owned log file on validation error, got %#v", cfg)
 	}
 }
@@ -229,7 +275,17 @@ func parseConfig(t *testing.T, args ...string) *Config {
 
 func configArgs(t *testing.T) []string {
 	t.Helper()
-	return []string{"--listen-vfkit", "unixgram://" + filepath.Join(t.TempDir(), "net.sock")}
+	dir := t.TempDir()
+	return []string{
+		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
+		"--log-dir-fd", "3",
+		"--runtime-dir-fd", "4",
+		"--log-file", "netd.log",
+		"--audit-log-file", "audit.jsonl",
+		"--vm-id", "vm-test",
+		"--run-id", "run-test",
+		"--network-id", "network-test",
+	}
 }
 
 func writeConfigPolicy(t *testing.T, path string, text string) {

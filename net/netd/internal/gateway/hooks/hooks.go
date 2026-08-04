@@ -21,6 +21,7 @@ type Flow struct {
 	DestIP     net.IP
 	DestPort   uint16
 	VMID       string
+	RunID      string
 	NetworkID  string
 }
 

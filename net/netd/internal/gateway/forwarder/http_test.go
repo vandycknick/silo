@@ -19,8 +19,10 @@ import (
 	"github.com/vandycknick/silo/net/netd/internal/gateway/audit"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
+	"github.com/vandycknick/silo/net/netd/internal/logfile"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
 	"github.com/vandycknick/silo/net/netd/internal/policy/policytest"
+	"golang.org/x/sys/unix"
 )
 
 func TestHTTPProxyInterceptsAllowedRequest(t *testing.T) {
@@ -886,11 +888,42 @@ func testRouteWithAudit(t *testing.T, text string) (*router.Router, *audit.Logge
 	t.Helper()
 	compiled := testPolicy(t, text)
 	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	auditLog, err := audit.Open(auditPath, compiled.PolicyHash())
+	auditLog := testAuditLogger(t, auditPath, compiled.PolicyHash())
+	return router.New(compiled, auditLog), auditLog, auditPath, compiled.PolicyHash()
+}
+
+func testAuditLogger(t *testing.T, path, policyHash string) *audit.Logger {
+	t.Helper()
+	directoryPath := filepath.Dir(path)
+	if err := os.Chmod(directoryPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Open(directoryPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return router.New(compiled, auditLog), auditLog, auditPath, compiled.PolicyHash()
+	directory, err := logfile.OpenDirectory(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := directory.OpenAppend(filepath.Base(path))
+	if err != nil {
+		_ = directory.Close()
+		t.Fatal(err)
+	}
+	logger := audit.New(file, policyHash)
+	t.Cleanup(func() {
+		if err := logger.Close(); err != nil {
+			t.Error(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Error(err)
+		}
+		if err := directory.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return logger
 }
 
 func testPolicy(t *testing.T, text string) *policy.Policy {

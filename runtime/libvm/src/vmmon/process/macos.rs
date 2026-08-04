@@ -29,7 +29,7 @@ impl ProcessIdentity {
     }
 
     pub(crate) fn matches_started_at(&self, expected: Option<i64>) -> bool {
-        expected.is_none() || self.started_at == expected
+        self.started_at == expected
     }
 
     pub(crate) fn is_alive(&self) -> io::Result<bool> {
@@ -106,5 +106,19 @@ fn process_started_at(pid: i32) -> io::Result<Option<i64>> {
     }
 
     let info = unsafe { info.assume_init() };
-    Ok(Some(info.pbi_start_tvsec as i64))
+    let seconds = i64::try_from(info.pbi_start_tvsec).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process start seconds overflow i64",
+        )
+    })?;
+    let micros = i64::try_from(info.pbi_start_tvusec).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process start microseconds overflow i64",
+        )
+    })?;
+    Ok(seconds
+        .checked_mul(1_000_000)
+        .and_then(|value| value.checked_add(micros)))
 }

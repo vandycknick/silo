@@ -104,11 +104,6 @@ impl MachineData {
     pub fn is_running(&self) -> bool {
         self.status.is_running()
     }
-
-    /// Returns the runtime trace log path for this machine.
-    pub fn trace_log_path(&self) -> PathBuf {
-        crate::paths::vmmon_trace_log_path_in(&self.machine_dir)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

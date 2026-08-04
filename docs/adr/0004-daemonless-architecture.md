@@ -39,7 +39,7 @@ This architecture is intentionally daemonless by default. A future daemon or tun
 - Keep one `vmmon` process responsible for one VM.
 - Make `silo` a thin consumer of `libvm`.
 - Keep `vmmon` focused on runtime supervision instead of manager concerns.
-- Make machine startup config-driven from the per-instance `config.yaml`.
+- Make machine startup config-driven from the per-instance `config.json`.
 - Keep `libvm` as the architectural boundary between daemonless local ABI mode and future daemon or tunnel mode.
 - Keep one machine-scoped gRPC control socket for monitor, filesystem, serial, and shell access.
 - Keep machine identity and manager metadata in manager-owned state, not in the monitor.
@@ -48,7 +48,7 @@ This architecture is intentionally daemonless by default. A future daemon or tun
 
 - Introducing a central always-on daemon as the primary architecture.
 - Moving global machine inventory into `vmmon`.
-- Replacing `config.yaml` with database-only machine definitions.
+- Replacing `config.json` with database-only machine definitions.
 - Defining the detailed host and guest gRPC contract, which belongs to [ADR 0008](0008-vmmon-host-and-guest-grpc-api.md).
 - Defining the final future daemon API in this ADR.
 
@@ -105,7 +105,7 @@ It owns:
 - the top-level data directory and per-instance layout,
 - SQLite manager state at `state.db`,
 - UUID allocation,
-- canonical `config.yaml` writing from `silo-core::VmSpec`,
+- canonical `config.json` writing from `silo-core::VmSpec`,
 - image resolution and instance materialization,
 - bootstrap and guest runtime materialization,
 - spawning `vmmon`,
@@ -127,7 +127,7 @@ The manager API is currently a library boundary implemented by `libvm`. A future
 
 It owns:
 
-- reading `config.yaml` from the instance directory,
+- reading `config.json` from the instance directory,
 - self-daemonization by default,
 - a foreground mode for tests and debugging,
 - creating and supervising one VM,
@@ -177,9 +177,9 @@ It does not own:
 
 ### Machine configuration
 
-- `config.yaml` in the instance directory is the canonical machine configuration.
-- `config.yaml` is written by `libvm` from `silo-core::VmSpec`.
-- `vmmon` is data-dir-driven. It accepts `--data-dir` and reads `config.yaml` from that directory.
+- `config.json` in the instance directory is the canonical machine configuration.
+- `config.json` is written by `libvm` from `silo-core::VmSpec`.
+- `vmmon` receives the explicit configuration path from `libvm`.
 
 ### Manager metadata
 
@@ -190,7 +190,7 @@ It does not own:
 - creation time,
 - machine directory path.
 
-SQLite does not replace `config.yaml` as the canonical VM boot contract.
+SQLite does not replace `config.json` as the canonical VM boot contract.
 
 ### Runtime truth
 
@@ -202,30 +202,57 @@ SQLite does not replace `config.yaml` as the canonical VM boot contract.
 The current canonical layout is:
 
 ```text
-~/.local/share/silo/
+<data-root>/
   state.db
   machines/
-    <uuid>/
-      config.yaml
-      vm.pid
-      vm.sock
-      vm.trace.log
-      serial.log
-      apple-machine-id
+    <machine-id>/
+      config.json
       rootfs.img
-      cidata.img
   images/
-    ...
+
+<state-root>/
+  logs/
+    machines/
+      <machine-id>/
+        vm.trace.log
+        serial.log
+        vm.exit.json
+        network/
+          netd.log
+          audit.jsonl
+        executions/                 # startup-execution storage
+
+<run-root>/
+  machines/<machine-id>/
+    vm.pid
+    vm.sock
+  networks/<network-instance-id>/
+    netd.sock
+    netd.pid
+    network-policy.json
+    capture.pcap
 ```
 
-`images/` remains manager-owned data.
+`data-root`, `state-root`, and `run-root` are the configured `RuntimeConfig`
+roots. Their defaults are `$XDG_DATA_HOME/silo`, `$XDG_STATE_HOME/silo`, and
+`$XDG_RUNTIME_DIR/silo` (or `$HOME/.local/share/silo`,
+`$HOME/.local/state/silo`, and `/tmp/silo-<effective-uid>`). macOS intentionally
+uses those XDG paths rather than `~/Library/Logs`. Durable data and state roots
+are persisted database identity; the run root is resolved per open.
 
-Future work:
+The private machine log tree is selected only by immutable machine ID. Private
+network instance IDs select ephemeral runtime files, not durable logs. `vmmon`
+and `netd` are each the sole writers for their append-only logs;
+`vm.exit.json` is an atomically replaced lifecycle record. The `executions/`
+subtree is reserved for startup-execution storage, not ordinary exec history.
 
-- runtime artifact filenames use `vm.pid`, `vm.sock`, and `vm.trace.log`,
-- add a durable exit-state file if we decide that belongs in the canonical runtime contract.
-
-Those filenames are part of the current implementation and should be treated as the canonical runtime contract.
+Clients do not receive log paths or filenames. `Machine::logs` selects one of
+the monitor, serial, network, or network-audit semantic sources. A snapshot is
+finite; follow emits that snapshot, then append bytes without a gap and remains
+attached while the machine is stopped and across later starts until the reader
+drops it. The host gRPC endpoint does not serve persisted logs. CLI stream
+values and workload replay use this semantic API without duplicating path
+policy.
 
 ## Canonical `VmSpec`
 

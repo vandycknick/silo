@@ -16,13 +16,17 @@ import (
 )
 
 type Config struct {
-	ListenVfkit string
-	PIDFile     string
-	LogFile     string
-	Stack       NetworkConfig
-	PolicyFile  string
-	TLS         TLSConfig
-	Metadata    Metadata
+	ListenVfkit  string
+	LogDirFD     int
+	RuntimeDirFD int
+	PIDFile      string
+	LogFile      string
+	AuditLogFile string
+	CaptureFile  string
+	Stack        NetworkConfig
+	PolicyFile   string
+	TLS          TLSConfig
+	Metadata     Metadata
 }
 
 type TLSConfig struct {
@@ -32,11 +36,11 @@ type TLSConfig struct {
 
 type Metadata struct {
 	VMID      string
+	RunID     string
 	NetworkID string
 }
 
 type NetworkConfig struct {
-	CaptureFile       string
 	Debug             bool
 	MTU               int
 	Subnet            string
@@ -65,20 +69,24 @@ type DNSRecord struct {
 
 func Parse(args []string) (*Config, error) {
 	cfg := &Config{}
-	var subnet, pcapFile, staticLease string
+	var subnet, staticLease string
 
 	flags := flag.NewFlagSet("netd", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.StringVar(&cfg.ListenVfkit, "listen-vfkit", "", "unixgram socket used by vfkit-compatible applications")
 	flags.StringVar(&subnet, "subnet", "192.168.127.0/24", "guest network subnet")
 	flags.StringVar(&staticLease, "static-lease", "", "guest DHCP lease in IP=MAC form")
+	flags.IntVar(&cfg.LogDirFD, "log-dir-fd", -1, "inherited descriptor for the network log directory")
+	flags.IntVar(&cfg.RuntimeDirFD, "runtime-dir-fd", -1, "inherited descriptor for the network runtime directory")
 	flags.StringVar(&cfg.PIDFile, "pid-file", "", "write process ID to this file")
 	flags.StringVar(&cfg.LogFile, "log-file", "", "write logs to this file")
-	flags.StringVar(&pcapFile, "pcap", "", "capture network traffic to a pcap file")
+	flags.StringVar(&cfg.AuditLogFile, "audit-log-file", "", "write audit records to this file")
+	flags.StringVar(&cfg.CaptureFile, "pcap", "", "capture network traffic to a pcap file")
 	flags.StringVar(&cfg.PolicyFile, "policy-file", "", "canonical network policy JSON file")
 	flags.StringVar(&cfg.TLS.CACert, "tls-ca-cert", "", "CA certificate used for HTTPS interception")
 	flags.StringVar(&cfg.TLS.CAKey, "tls-ca-key", "", "CA private key used for HTTPS interception")
 	flags.StringVar(&cfg.Metadata.VMID, "vm-id", "", "VM identifier added to flow logs")
+	flags.StringVar(&cfg.Metadata.RunID, "run-id", "", "run identifier added to flow logs")
 	flags.StringVar(&cfg.Metadata.NetworkID, "network-id", "", "network identifier added to flow logs")
 	if err := flags.Parse(args); err != nil {
 		return cfg, err
@@ -89,7 +97,45 @@ func Parse(args []string) (*Config, error) {
 	if !strings.HasPrefix(cfg.ListenVfkit, "unixgram://") {
 		return cfg, errors.New("--listen-vfkit must use unixgram://")
 	}
-	stack, err := stackConfig(subnet, staticLease, pcapFile)
+	if cfg.LogDirFD < 0 {
+		return cfg, errors.New("--log-dir-fd is required")
+	}
+	if cfg.RuntimeDirFD < 0 {
+		return cfg, errors.New("--runtime-dir-fd is required")
+	}
+	if cfg.LogDirFD == cfg.RuntimeDirFD {
+		return cfg, errors.New("--log-dir-fd and --runtime-dir-fd must differ")
+	}
+	for flag, value := range map[string]string{
+		"--log-file":       cfg.LogFile,
+		"--audit-log-file": cfg.AuditLogFile,
+		"--vm-id":          cfg.Metadata.VMID,
+		"--run-id":         cfg.Metadata.RunID,
+		"--network-id":     cfg.Metadata.NetworkID,
+	} {
+		if value == "" {
+			return cfg, fmt.Errorf("%s is required", flag)
+		}
+	}
+	for flag, value := range map[string]string{
+		"--log-file":       cfg.LogFile,
+		"--audit-log-file": cfg.AuditLogFile,
+	} {
+		if err := validateLeafName(flag, value); err != nil {
+			return cfg, err
+		}
+	}
+	if cfg.PIDFile != "" {
+		if err := validateLeafName("--pid-file", cfg.PIDFile); err != nil {
+			return cfg, err
+		}
+	}
+	if cfg.CaptureFile != "" {
+		if err := validateLeafName("--pcap", cfg.CaptureFile); err != nil {
+			return cfg, err
+		}
+	}
+	stack, err := stackConfig(subnet, staticLease)
 	if err != nil {
 		return cfg, err
 	}
@@ -98,6 +144,13 @@ func Parse(args []string) (*Config, error) {
 		return cfg, errors.New("--tls-ca-cert and --tls-ca-key must be provided together")
 	}
 	return cfg, nil
+}
+
+func validateLeafName(flag, value string) error {
+	if value == "." || value == ".." || strings.Contains(value, "/") {
+		return fmt.Errorf("%s must be one path component", flag)
+	}
+	return nil
 }
 
 func LoadPolicy(cfg *Config) (*policy.Policy, error) {
@@ -122,7 +175,7 @@ func LoadPolicy(cfg *Config) (*policy.Policy, error) {
 	return compiledPolicy, nil
 }
 
-func stackConfig(subnetText, staticLease, pcapFile string) (NetworkConfig, error) {
+func stackConfig(subnetText, staticLease string) (NetworkConfig, error) {
 	subnet, err := netip.ParsePrefix(subnetText)
 	if err != nil {
 		return NetworkConfig{}, fmt.Errorf("parse subnet: %w", err)
@@ -153,7 +206,6 @@ func stackConfig(subnetText, staticLease, pcapFile string) (NetworkConfig, error
 	}
 
 	return NetworkConfig{
-		CaptureFile:       pcapFile,
 		MTU:               1500,
 		Subnet:            subnetText,
 		GatewayIP:         gatewayIP.String(),

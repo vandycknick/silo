@@ -107,6 +107,28 @@ export interface AttachOptions {
   forwardAgent?: boolean;
 }
 
+/** Selects one persisted machine log source. */
+export type MachineLogSource = "monitor" | "serial" | "network" | "networkAudit";
+
+/** Options for reading persisted machine logs. */
+export interface MachineLogOptions {
+  /**
+   * Continue after the snapshot until the reader closes the stream.
+   * The stream remains attached while the machine is stopped and across later starts.
+   */
+  follow?: boolean;
+}
+
+/** Output channel associated with a machine log chunk. */
+export type MachineLogOutput = "stdout" | "stderr";
+
+/** Raw bytes read from a persisted machine log source. */
+export interface MachineLogChunk {
+  output: MachineLogOutput;
+  /** Log bytes are preserved without text decoding. */
+  data: Uint8Array;
+}
+
 /** Guest process exit status. */
 export interface ExitStatus {
   /** Numeric exit code reported by the guest process. */

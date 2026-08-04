@@ -8,7 +8,7 @@ Implemented
 
 ## Context
 
-`vmmon` already owns per-VM runtime supervision. It reads `config.yaml`, starts the VM, exposes the monitor control surface, and tracks VM and guest readiness.
+`vmmon` already owns per-VM runtime supervision. It reads `config.json`, starts the VM, exposes the monitor control surface, and tracks VM and guest readiness.
 
 Today, host to guest stream integrations are implemented as built-ins. `vmmon` already connects to guest vsock ports for things like the guest agent and shell access. That works for a small fixed set of features, but it does not scale well for arbitrary host to guest services. Every new service would require more built-in `vmmon` logic, more coupling to host virtualization details, and more monitor-specific code for behavior that does not belong in the core VM supervisor.
 
@@ -103,7 +103,7 @@ sequenceDiagram
   participant plugin as plugin
 
   libvm->>vmmon: spawn vmmon (startup-fd pipe)
-  vmmon->>virt: load config.yaml (VmSpec) and create VM
+  vmmon->>virt: load config.json (VmSpec) and create VM
   virt-->>vmmon: VM handle
   vmmon->>virt: start VM
   vmmon->>vmmon: start control socket + agent monitor

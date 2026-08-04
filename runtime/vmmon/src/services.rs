@@ -41,7 +41,6 @@ pub struct ServiceHandles {
     pub(crate) control_socket: JoinHandle<eyre::Result<()>>,
     pub(crate) guest_monitor: Option<JoinHandle<()>>,
     pub(crate) endpoint_supervisor: Option<JoinHandle<()>>,
-    pub(crate) serial_log: JoinHandle<()>,
     pub(crate) health: HealthReporter,
     pub(crate) server_shutdown: CancellationToken,
 }
@@ -352,13 +351,6 @@ pub async fn start_services(
             .map_err(eyre::Report::from)
     });
 
-    let serial_log_path = runtime.serial_log().to_path_buf();
-    let serial_console = ctx.serial_console.clone();
-    let serial_log = tokio::spawn(async move {
-        if let Err(error) = serial_console.stream_to_file(&serial_log_path).await {
-            tracing::warn!(%error, path = %serial_log_path.display(), "serial log attachment failed");
-        }
-    });
     let guest_monitor = if ctx.guest_services_enabled {
         Some(spawn_guest_services(&ctx.machine, ctx.store.clone(), ctx.shutdown.clone()).await?)
     } else {
@@ -375,7 +367,6 @@ pub async fn start_services(
         control_socket,
         guest_monitor,
         endpoint_supervisor,
-        serial_log,
         health,
         server_shutdown,
     })

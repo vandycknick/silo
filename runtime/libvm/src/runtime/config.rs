@@ -454,6 +454,7 @@ impl NetdRuntimeConfig {
 #[cfg(test)]
 mod tests {
     use crate::paths::LocalRoots;
+    use crate::store::models::MachineId;
     use crate::store::{ConfigStore, Store};
     use crate::{LibVmError, Runtime, RuntimeConfig};
 
@@ -632,7 +633,19 @@ mod tests {
             .with_run_root(&first_run_root);
 
         let runtime = Runtime::new(first).await.expect("open fresh runtime");
+        let machine_id = MachineId::new();
+        let first_machine_paths = runtime.local_paths().machine(machine_id);
         assert_eq!(runtime.local_paths().roots().run_root(), first_run_root);
+        assert_eq!(
+            first_machine_paths.machine_logs_dir(),
+            state_root
+                .join("logs/machines")
+                .join(machine_id.to_string())
+        );
+        assert_eq!(
+            first_machine_paths.machine_run_dir(),
+            first_run_root.join("machines").join(machine_id.to_string())
+        );
         drop(runtime);
 
         let runtime = Runtime::new(
@@ -644,6 +657,17 @@ mod tests {
         )
         .await
         .expect("reopen with a changed run root");
+        let reopened_machine_paths = runtime.local_paths().machine(machine_id);
         assert_eq!(runtime.local_paths().roots().run_root(), second_run_root);
+        assert_eq!(
+            reopened_machine_paths.machine_logs_dir(),
+            first_machine_paths.machine_logs_dir()
+        );
+        assert_eq!(
+            reopened_machine_paths.machine_run_dir(),
+            second_run_root
+                .join("machines")
+                .join(machine_id.to_string())
+        );
     }
 }

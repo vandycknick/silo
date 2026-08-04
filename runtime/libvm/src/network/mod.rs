@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 
 mod api;
@@ -73,6 +72,7 @@ pub(crate) async fn prepare_network_runtime(
     paths: &LocalPaths,
     store: &dyn DataStore,
     metadata: &MachineConfig,
+    run_id: &str,
     config: &RuntimeNetworkingConfig,
     netd_path: &Path,
     network_launch: &NetworkLaunch,
@@ -92,6 +92,7 @@ pub(crate) async fn prepare_network_runtime(
                     paths,
                     store,
                     metadata,
+                    run_id,
                     config,
                     netd_path,
                     network_launch,
@@ -107,7 +108,16 @@ pub(crate) async fn prepare_network_runtime(
                     message: format!("named network {:?} is not defined", name),
                 }
             })?;
-            resolve_named_network(paths, store, metadata, &definition, config, network_launch).await
+            resolve_named_network(
+                paths,
+                store,
+                metadata,
+                run_id,
+                &definition,
+                config,
+                network_launch,
+            )
+            .await
         }
     }
 }
@@ -125,32 +135,42 @@ pub(crate) async fn reconcile_network_runtime(
         .network_instance(&attachment.network_instance_id)
         .await?
     else {
-        store.detach_network(metadata.id).await?;
-        return Ok(());
+        return teardown_network_attachment(
+            paths,
+            store,
+            metadata.id,
+            &metadata.name,
+            attachment,
+            None,
+        )
+        .await;
     };
 
-    if monitor_running && network_instance_is_alive(&instance) {
+    if monitor_running && network_instance_is_alive(&instance)? {
         return Ok(());
     }
 
-    store.detach_network(metadata.id).await?;
-    if store.network_attachment_count(&instance.id).await? == 0 {
-        terminate_network_instance(&instance)?;
-        store.remove_network_instance(&instance.id).await?;
-        remove_runtime_dir(paths.network(&instance.id).dir())?;
-    }
-    Ok(())
+    teardown_network_attachment(
+        paths,
+        store,
+        metadata.id,
+        &metadata.name,
+        attachment,
+        Some(instance),
+    )
+    .await
 }
 
 async fn resolve_named_network(
     paths: &LocalPaths,
     store: &dyn DataStore,
     metadata: &MachineConfig,
+    run_id: &str,
     definition: &ModelNetworkDefinition,
     config: &RuntimeNetworkingConfig,
     network_launch: &NetworkLaunch,
 ) -> Result<VmmonNetworkAttachment, LibVmError> {
-    let _ = (paths, store, config, network_launch, definition);
+    let _ = (paths, store, run_id, config, network_launch, definition);
     Err(LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
         message:
@@ -179,15 +199,15 @@ pub(super) async fn remove_attached_network(
     let instance = store
         .network_instance(&attachment.network_instance_id)
         .await?;
-    store.detach_network(machine_id).await?;
-    if let Some(instance) = instance {
-        if store.network_attachment_count(&instance.id).await? == 0 {
-            terminate_network_instance(&instance)?;
-            store.remove_network_instance(&instance.id).await?;
-            remove_runtime_dir(paths.network(&instance.id).dir())?;
-        }
-    }
-    Ok(())
+    teardown_network_attachment(
+        paths,
+        store,
+        machine_id,
+        &machine_id.to_string(),
+        attachment,
+        instance,
+    )
+    .await
 }
 
 pub(crate) fn mac_from_machine_id(machine_id: MachineId) -> [u8; 6] {
@@ -216,17 +236,47 @@ fn hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
-fn network_instance_is_alive(instance: &NetworkInstance) -> bool {
+fn network_instance_is_alive(instance: &NetworkInstance) -> Result<bool, LibVmError> {
     match instance.driver.as_str() {
         DRIVER_NETD => netd_driver::instance_is_alive(instance),
-        _ => false,
+        _ => Ok(false),
     }
 }
 
-fn terminate_network_instance(instance: &NetworkInstance) -> Result<(), LibVmError> {
+async fn terminate_network_instance(
+    instance: &NetworkInstance,
+    reference: &str,
+) -> Result<(), LibVmError> {
     if instance.driver == DRIVER_NETD {
-        netd_driver::terminate_instance(instance)?;
+        netd_driver::terminate_instance(instance, reference).await?;
     }
+    Ok(())
+}
+
+async fn teardown_network_attachment(
+    paths: &LocalPaths,
+    store: &dyn DataStore,
+    machine_id: MachineId,
+    reference: &str,
+    attachment: crate::store::models::NetworkAttachment,
+    instance: Option<NetworkInstance>,
+) -> Result<(), LibVmError> {
+    let Some(instance) = instance else {
+        paths.remove_network_run_tree(&attachment.network_instance_id)?;
+        store.detach_network(machine_id).await?;
+        return Ok(());
+    };
+
+    if store.network_attachment_count(&instance.id).await? > 1 {
+        store.detach_network(machine_id).await?;
+        return Ok(());
+    }
+
+    // Keep the attachment and instance rows until their external generation and
+    // all runtime artifacts are gone. A failed cleanup is therefore retryable.
+    terminate_network_instance(&instance, reference).await?;
+    paths.remove_network_run_tree(&instance.id)?;
+    store.remove_network_instance(&instance.id).await?;
     Ok(())
 }
 
@@ -235,22 +285,6 @@ pub(super) fn serialize_json<T: Serialize>(value: &T, label: &str) -> Result<Str
         reference: label.to_string(),
         message: format!("serialize {label}: {err}"),
     })
-}
-
-pub(super) fn remove_runtime_dir(path: &Path) -> Result<(), LibVmError> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
-    }
-}
-
-pub(super) fn remove_file_if_exists(path: &Path) -> Result<(), LibVmError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
-    }
 }
 
 #[cfg(test)]
@@ -394,8 +428,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp dir");
         let paths = LocalPaths::new(temp.path().join("silo"));
         let machine_id = MachineId::new();
-        let runtime_dir = paths.network("net-1").dir().to_path_buf();
-        std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+        let runtime_dir = paths
+            .network("net-1")
+            .expect("network paths")
+            .runtime_dir()
+            .to_path_buf();
+        paths
+            .ensure_network_run_dir("net-1")
+            .expect("create runtime dir");
         let instance = instance("net-1");
         let metadata = machine_config(
             &paths,
@@ -415,11 +455,6 @@ mod tests {
             .withf(|network_id| network_id == "net-1")
             .once()
             .return_once(move |_| Ok(Some(instance_for_lookup)));
-        store
-            .expect_detach_network()
-            .withf(move |id| *id == machine_id)
-            .once()
-            .returning(|_| Ok(()));
         store
             .expect_network_attachment_count()
             .withf(|network_id| network_id == "net-1")
@@ -446,8 +481,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp dir");
         let paths = LocalPaths::new(temp.path().join("silo"));
         let machine_id = MachineId::new();
-        let runtime_dir = paths.network("net-1").dir().to_path_buf();
-        std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+        let runtime_dir = paths
+            .network("net-1")
+            .expect("network paths")
+            .runtime_dir()
+            .to_path_buf();
+        paths
+            .ensure_network_run_dir("net-1")
+            .expect("create runtime dir");
         let instance = instance("net-1");
         let metadata = machine_config(
             &paths,
@@ -475,7 +516,7 @@ mod tests {
             .expect_network_attachment_count()
             .withf(|network_id| network_id == "net-1")
             .once()
-            .returning(|_| Ok(1));
+            .returning(|_| Ok(2));
 
         reconcile_network_runtime(&paths, &store, &metadata, false)
             .await
@@ -522,9 +563,15 @@ mod tests {
             .expect("seed machine");
 
         let network_id = "net-1";
-        let current_runtime_dir = paths.network(network_id).dir().to_path_buf();
+        let current_runtime_dir = paths
+            .network(network_id)
+            .expect("network paths")
+            .runtime_dir()
+            .to_path_buf();
         let old_runtime_dir = old_run_root.join("net").join(network_id);
-        std::fs::create_dir_all(&current_runtime_dir).expect("create current runtime dir");
+        paths
+            .ensure_network_run_dir(network_id)
+            .expect("create current runtime dir");
         std::fs::create_dir_all(&old_runtime_dir).expect("create old runtime dir");
         store
             .save_network_instance(&instance(network_id))
@@ -582,6 +629,7 @@ mod tests {
             &paths,
             &store,
             &metadata,
+            "run-123",
             &RuntimeNetworkingConfig::default(),
             Path::new("/tmp/netd"),
             &crate::NetworkLaunch::default(),

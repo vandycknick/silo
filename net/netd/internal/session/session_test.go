@@ -3,11 +3,13 @@ package session
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/vandycknick/silo/net/netd/internal/config"
+	"github.com/vandycknick/silo/net/netd/internal/logfile"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
 )
 
@@ -50,15 +52,88 @@ func TestSessionRunAfterCloseClosesConnection(t *testing.T) {
 	}
 }
 
-func newTestSession(t *testing.T) *Session {
-	t.Helper()
-	cfg, err := config.Parse([]string{"--listen-vfkit", "unixgram://" + filepath.Join(t.TempDir(), "net.sock")})
+func TestSessionCloseSyncsAndClosesCapture(t *testing.T) {
+	dir := t.TempDir()
+	capturePath := filepath.Join(dir, "capture.pcap")
+	runtimeDirectory := testDirectory(t, dir)
+	capture, err := runtimeDirectory.OpenTruncate("capture.pcap")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := New(Spec{VMID: "vm-test", NetworkID: "net-test", Stack: cfg.Stack, Policy: policy.Default()}, Shared{})
+	cfg, err := config.Parse(testConfigArgs(dir))
+	if err != nil {
+		_ = logfile.SyncClose(capture)
+		t.Fatal(err)
+	}
+	s, err := New(Spec{
+		VMID:        "vm-test",
+		RunID:       "run-test",
+		NetworkID:   "net-test",
+		CaptureFile: capture,
+		Stack:       cfg.Stack,
+		Policy:      policy.Default(),
+	}, Shared{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := capture.Sync(); err == nil {
+		t.Fatal("expected capture file to be closed with the session")
+	}
+	info, err := os.Stat(capturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("capture mode = %04o, want 0600", got)
+	}
+}
+
+func newTestSession(t *testing.T) *Session {
+	t.Helper()
+	cfg, err := config.Parse(testConfigArgs(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Spec{VMID: "vm-test", RunID: "run-test", NetworkID: "net-test", Stack: cfg.Stack, Policy: policy.Default()}, Shared{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return s
+}
+
+func testConfigArgs(dir string) []string {
+	return []string{
+		"--listen-vfkit", "unixgram://" + filepath.Join(dir, "net.sock"),
+		"--log-dir-fd", "3",
+		"--runtime-dir-fd", "4",
+		"--log-file", "netd.log",
+		"--audit-log-file", "audit.jsonl",
+		"--vm-id", "vm-test",
+		"--run-id", "run-test",
+		"--network-id", "net-test",
+	}
+}
+
+func testDirectory(t *testing.T, path string) *logfile.Directory {
+	t.Helper()
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := logfile.OpenDirectory(int(file.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := directory.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return directory
 }

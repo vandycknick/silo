@@ -38,16 +38,17 @@ impl VirtualMachine {
     }
 
     pub async fn start(&self) -> Result<(), VirtError> {
-        self.backend.start().await
+        self.backend.start().await?;
+        if let Err(error) = self.serial_console.start().await {
+            let _ = self.backend.stop().await;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub async fn stop(&self) -> Result<(), VirtError> {
-        self.backend.stop().await
-    }
-
-    pub async fn restart(&self) -> Result<(), VirtError> {
-        self.stop().await?;
-        self.start().await
+        self.backend.stop().await?;
+        self.serial_console.drain().await
     }
 
     pub async fn connect_vsock(&self, port: u32) -> Result<VsockStream, VirtError> {
@@ -72,6 +73,10 @@ impl VirtualMachine {
 
     pub fn serial(&self) -> Arc<SerialConsole> {
         self.serial_console.clone()
+    }
+
+    pub async fn drain_serial(&self) -> Result<(), VirtError> {
+        self.serial_console.drain().await
     }
 }
 

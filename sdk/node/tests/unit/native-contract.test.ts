@@ -16,6 +16,9 @@ describe("native addon contract", () => {
     const native = plainRecord(exported, "native exports");
 
     expect(typeof native.openRuntime).toBe("function");
+    expect(typeof native.NativeMachine.prototype.logs).toBe("function");
+    expect(typeof native.NativeMachineLogHandle.prototype.recv).toBe("function");
+    expect(typeof native.NativeMachineLogHandle.prototype.close).toBe("function");
   });
 });
 

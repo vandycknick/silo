@@ -12,16 +12,14 @@ pub(crate) struct RuntimeContext {
     dir: PathBuf,
     config: PathBuf,
     socket: PathBuf,
-    serial_log: PathBuf,
 }
 
 impl RuntimeContext {
-    pub(crate) fn new(dir: PathBuf, config: PathBuf, socket: PathBuf, serial_log: PathBuf) -> Self {
+    pub(crate) fn new(dir: PathBuf, config: PathBuf, socket: PathBuf) -> Self {
         Self {
             dir,
             config,
             socket,
-            serial_log,
         }
     }
 
@@ -35,10 +33,6 @@ impl RuntimeContext {
 
     pub(crate) fn socket(&self) -> &Path {
         &self.socket
-    }
-
-    pub(crate) fn serial_log(&self) -> &Path {
-        &self.serial_log
     }
 }
 

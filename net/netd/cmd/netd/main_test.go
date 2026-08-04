@@ -6,12 +6,15 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/vandycknick/silo/net/netd/internal/logfile"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
+	"golang.org/x/sys/unix"
 )
 
 func TestLogPolicyDiagnosticsUsesServiceLogger(t *testing.T) {
@@ -43,42 +46,44 @@ func TestLogPolicyDiagnosticsUsesServiceLogger(t *testing.T) {
 	}
 }
 
-func TestOpenAuditLoggerUsesLogFileSibling(t *testing.T) {
+func TestOpenAuditLogUsesExplicitPath(t *testing.T) {
 	dir := t.TempDir()
-	logFile := filepath.Join(dir, "netd.log")
+	auditPath := filepath.Join(dir, "audit.jsonl")
+	directory := testDirectory(t, dir)
 
-	auditLog, err := openAuditLogger(logFile)
+	auditLog, err := openAuditLog(directory, "audit.jsonl")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if auditLog == nil {
-		t.Fatal("expected audit logger for log file")
+		t.Fatal("expected audit log file")
 	}
 	if err := auditLog.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "audit.jsonl")); err != nil {
+	if _, err := os.Stat(auditPath); err != nil {
 		t.Fatal(err)
 	}
-	if auditPathForLogFile("") != "" {
-		t.Fatal("expected empty audit path without a log file")
+	if _, err := openAuditLog(directory, ""); err == nil {
+		t.Fatal("expected an empty explicit audit path to be rejected")
 	}
 }
 
-func TestOpenLogFileTightensPermissions(t *testing.T) {
-	logFile := filepath.Join(t.TempDir(), "netd.log")
-	if err := os.WriteFile(logFile, []byte("old log"), 0o600); err != nil {
+func TestConfigureLoggingAppendsToExistingServiceLog(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "netd.log")
+	directory := testDirectory(t, dir)
+	if err := os.WriteFile(logFile, []byte("old log\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(logFile, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	file, err := openLogFile(logFile)
+	file, err := configureLogging(directory, "netd.log")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	slog.Info("new log")
+	if err := closeServiceLog(file); err != nil {
+		t.Fatal(err)
+	}
 
 	info, err := os.Stat(logFile)
 	if err != nil {
@@ -87,8 +92,66 @@ func TestOpenLogFileTightensPermissions(t *testing.T) {
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("expected log file mode 0600, got %o", got)
 	}
-	if info.Size() != 0 {
-		t.Fatalf("expected existing log file to be truncated, size is %d", info.Size())
+	contents, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(contents), "old log\n") || !strings.Contains(string(contents), `"msg":"new log"`) {
+		t.Fatalf("expected retained and appended service logs, got %q", contents)
+	}
+}
+
+func testDirectory(t *testing.T, path string) *logfile.Directory {
+	t.Helper()
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := logfile.OpenDirectory(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := directory.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return directory
+}
+
+func TestSecureEndpointRequiresAnOwnedPrivateSocket(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "netd-socket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "netd.sock")
+	connection, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: path, Net: "unixgram"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+
+	if err := secureEndpoint("unixgram://" + path); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("socket mode = %04o, want 0600", got)
+	}
+
+	regular := filepath.Join(t.TempDir(), "not-a-socket")
+	if err := os.WriteFile(regular, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := secureEndpoint("unixgram://" + regular); err == nil {
+		t.Fatal("expected regular file endpoint to be rejected")
 	}
 }
 

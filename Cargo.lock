@@ -679,6 +679,7 @@ dependencies = [
  "serde_yaml_ng",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "utils",
  "vm-spec",
 ]
@@ -4566,6 +4567,8 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "serde_json",
+ "tokio",
+ "tokio-stream",
  "vm-spec",
 ]
 

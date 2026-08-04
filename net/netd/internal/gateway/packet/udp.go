@@ -32,6 +32,7 @@ func UDP(ctx context.Context, s *stack.Stack, nat map[tcpip.Address]tcpip.Addres
 			DestIP:     addressIP(localAddress),
 			DestPort:   id.LocalPort,
 			VMID:       metadata.VMID,
+			RunID:      metadata.RunID,
 			NetworkID:  metadata.NetworkID,
 		}
 		flow = route.WithFlowID(flow)

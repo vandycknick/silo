@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"sync"
 
 	"github.com/vandycknick/silo/net/netd/internal/config"
@@ -13,18 +14,21 @@ import (
 	"github.com/vandycknick/silo/net/netd/internal/gateway/forwarder"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/packet"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
+	"github.com/vandycknick/silo/net/netd/internal/logfile"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
 	"github.com/vandycknick/silo/net/netd/internal/registry"
 	"github.com/vandycknick/silo/net/netd/internal/virtualnetwork"
 )
 
 type Spec struct {
-	VMID      string
-	NetworkID string
-	Stack     config.NetworkConfig
-	Policy    *policy.Policy
-	CACert    string
-	CAKey     string
+	VMID        string
+	RunID       string
+	NetworkID   string
+	CaptureFile *os.File
+	Stack       config.NetworkConfig
+	Policy      *policy.Policy
+	CACert      string
+	CAKey       string
 }
 
 type Shared struct {
@@ -48,7 +52,13 @@ type Session struct {
 	closeErr  error
 }
 
-func New(spec Spec, shared Shared) (*Session, error) {
+func New(spec Spec, shared Shared) (session *Session, err error) {
+	captureFile := spec.CaptureFile
+	defer func() {
+		if captureFile != nil {
+			err = errors.Join(err, logfile.SyncClose(captureFile))
+		}
+	}()
 	if spec.Policy == nil {
 		return nil, errors.New("session policy is required")
 	}
@@ -105,15 +115,17 @@ func New(spec Spec, shared Shared) (*Session, error) {
 	network, err := virtualnetwork.New(
 		lifetimeCtx,
 		&spec.Stack,
+		captureFile,
 		route,
 		dispatcher,
 		flows,
-		virtualnetwork.Metadata{VMID: spec.VMID, NetworkID: spec.NetworkID},
+		virtualnetwork.Metadata{VMID: spec.VMID, RunID: spec.RunID, NetworkID: spec.NetworkID},
 	)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
+	captureFile = nil
 	return &Session{
 		ctx:     lifetimeCtx,
 		cancel:  cancel,
@@ -176,9 +188,7 @@ func (s *Session) Close() error {
 		if conn != nil {
 			s.closeErr = conn.Close()
 		}
-		if err := s.network.Close(); err != nil && s.closeErr == nil {
-			s.closeErr = err
-		}
+		s.closeErr = errors.Join(s.closeErr, s.network.Close())
 	})
 	return s.closeErr
 }

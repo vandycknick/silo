@@ -1,6 +1,7 @@
 export { SiloError } from "./errors.js";
 export { ExecHandle, ExecOutput, ExecSink, type ExecEvent } from "./exec.js";
 export { Images } from "./images.js";
+export { MachineLogStream } from "./logs.js";
 export { GuestBuilder, Machine, MachineBuilder } from "./machine.js";
 export {
   MachineNetworkBuilder,
@@ -42,6 +43,10 @@ export {
   type ImagePullPolicy,
   type KeyValueMap,
   type MachineData,
+  type MachineLogChunk,
+  type MachineLogOptions,
+  type MachineLogOutput,
+  type MachineLogSource,
   type MachineStatus,
   type Mount,
   type Network,
