@@ -612,7 +612,7 @@ fn monitor_identity(generation: &VmmonRunIdentity) -> Result<Option<ProcessIdent
     let Some(identity) = ProcessIdentity::for_pid(generation.pid)? else {
         return Ok(None);
     };
-    if !identity.matches_started_at(generation.started_at) {
+    if !identity.matches_started_at(generation.started_at) || !identity.is_alive()? {
         return Ok(None);
     }
     Ok(Some(identity))

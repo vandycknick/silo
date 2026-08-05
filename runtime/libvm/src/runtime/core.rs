@@ -1496,7 +1496,7 @@ fn live_monitor_identity(
         let Some(identity) = ProcessIdentity::for_pid(pid)? else {
             continue;
         };
-        if identity.matches_started_at(expected_started_at) {
+        if identity.matches_started_at(expected_started_at) && identity.is_alive()? {
             return Ok(Some(identity));
         }
     }
@@ -1515,6 +1515,12 @@ pub(crate) fn monitor_identity(
             message: format!("vmmon pid {pid} from {} is not running", pid_path.display()),
         });
     };
+    if !identity.is_alive()? {
+        return Err(LibVmError::MonitorConnection {
+            reference: machine_name.to_string(),
+            message: format!("vmmon pid {pid} from {} is not running", pid_path.display()),
+        });
+    }
     Ok(identity)
 }
 
@@ -1577,7 +1583,7 @@ fn vmmon_run_is_alive(generation: &VmmonRunIdentity) -> Result<bool, LibVmError>
     let Some(identity) = ProcessIdentity::for_pid(generation.pid)? else {
         return Ok(false);
     };
-    Ok(identity.matches_started_at(generation.started_at))
+    Ok(identity.matches_started_at(generation.started_at) && identity.is_alive()?)
 }
 
 fn transition_error(err: TransitionError) -> LibVmError {
@@ -2369,7 +2375,7 @@ mod tests {
 
     #[tokio::test]
     async fn monitor_ready_persistence_failure_stops_monitor_and_removes_network_runtime() {
-        let vmmon = "#!/bin/sh\npidfile=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--pidfile\" ]; then pidfile=\"$arg\"; fi\n  previous=\"$arg\"\ndone\nsleep 30 &\npid=$!\nprintf '%s\\n' \"$pid\" > \"$pidfile\"\neval \"printf 'started\\n' >&$_VM_SYNCPIPE\"\nexit 0\n";
+        let vmmon = "#!/bin/sh\npidfile=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--pidfile\" ]; then pidfile=\"$arg\"; fi\n  previous=\"$arg\"\ndone\nif [ \"${SILO_LIBVM_FAKE_VMMON_DAEMON:-0}\" != \"1\" ]; then\n  SILO_LIBVM_FAKE_VMMON_DAEMON=1 \"$0\" \"$@\" &\n  pid=$!\n  printf '%s\\n' \"$pid\" > \"$pidfile\"\n  exit 0\nfi\neval \"printf 'started\\n' >&$_VM_SYNCPIPE\"\nexec sleep 30\n";
         let temp = tempfile::tempdir().expect("create temp dir");
         let (runtime, config, store) = start_failure_runtime(&temp, vmmon).await;
         store
@@ -2386,7 +2392,10 @@ mod tests {
             .await
             .expect_err("monitor-ready state write must fail");
 
-        assert!(error.to_string().contains("forced monitor ready failure"));
+        assert!(
+            error.to_string().contains("forced monitor ready failure"),
+            "unexpected start error: {error}"
+        );
         assert_failed_start_network_is_clean(&runtime, config.id).await;
         assert_eq!(
             runtime
