@@ -12,8 +12,8 @@ use nix::unistd::{ftruncate, geteuid};
 
 use crate::LibVmError;
 
-const PRIVATE_DIRECTORY_MODE: u16 = 0o700;
-const PRIVATE_FILE_MODE: u16 = 0o600;
+const PRIVATE_DIRECTORY_MODE: Mode = Mode::S_IRWXU;
+const PRIVATE_FILE_MODE: Mode = Mode::S_IRUSR.union(Mode::S_IWUSR);
 
 pub(crate) struct OwnedDirectory {
     fd: OwnedFd,
@@ -36,7 +36,7 @@ impl OwnedDirectory {
         fs::create_dir_all(parent).map_err(|error| invalid(path, error))?;
 
         let created = match fs::DirBuilder::new()
-            .mode(u32::from(PRIVATE_DIRECTORY_MODE))
+            .mode(u32::from(PRIVATE_DIRECTORY_MODE.bits()))
             .create(path)
         {
             Ok(()) => true,
@@ -45,8 +45,7 @@ impl OwnedDirectory {
         };
         let fd = open_directory(path)?;
         if created {
-            fchmod(&fd, Mode::from_bits_retain(PRIVATE_DIRECTORY_MODE))
-                .map_err(|error| invalid(path, error))?;
+            fchmod(&fd, PRIVATE_DIRECTORY_MODE).map_err(|error| invalid(path, error))?;
         }
         validate_directory(&fd, path, created)?;
         Ok(Self {
@@ -81,11 +80,7 @@ impl OwnedDirectory {
             ));
         }
         let path = self.path.join(name);
-        let created = match mkdirat(
-            &self.fd,
-            name,
-            Mode::from_bits_retain(PRIVATE_DIRECTORY_MODE),
-        ) {
+        let created = match mkdirat(&self.fd, name, PRIVATE_DIRECTORY_MODE) {
             Ok(()) => true,
             Err(nix::errno::Errno::EEXIST) => false,
             Err(error) => return Err(invalid(&path, error)),
@@ -98,8 +93,7 @@ impl OwnedDirectory {
         )
         .map_err(|error| invalid(&path, error))?;
         if created {
-            fchmod(&fd, Mode::from_bits_retain(PRIVATE_DIRECTORY_MODE))
-                .map_err(|error| invalid(&path, error))?;
+            fchmod(&fd, PRIVATE_DIRECTORY_MODE).map_err(|error| invalid(&path, error))?;
         }
         validate_directory(&fd, &path, true)?;
         Ok(Self { fd, path })
@@ -114,11 +108,7 @@ impl OwnedDirectory {
             ));
         }
         let path = self.path.join(name);
-        match mkdirat(
-            &self.fd,
-            name,
-            Mode::from_bits_retain(PRIVATE_DIRECTORY_MODE),
-        ) {
+        match mkdirat(&self.fd, name, PRIVATE_DIRECTORY_MODE) {
             Ok(()) => {}
             Err(nix::errno::Errno::EEXIST) => {
                 // Validate an existing entry instead of treating a symlink as a collision.
@@ -134,8 +124,7 @@ impl OwnedDirectory {
             Mode::empty(),
         )
         .map_err(|error| invalid(&path, error))?;
-        fchmod(&fd, Mode::from_bits_retain(PRIVATE_DIRECTORY_MODE))
-            .map_err(|error| invalid(&path, error))?;
+        fchmod(&fd, PRIVATE_DIRECTORY_MODE).map_err(|error| invalid(&path, error))?;
         validate_directory(&fd, &path, true)?;
         Ok(Some(Self { fd, path }))
     }
@@ -209,7 +198,7 @@ impl OwnedDirectory {
             &self.fd,
             name,
             flags | OFlag::O_CREAT | OFlag::O_EXCL,
-            Mode::from_bits_retain(PRIVATE_FILE_MODE),
+            PRIVATE_FILE_MODE,
         ) {
             Ok(fd) => (fd, true),
             Err(nix::errno::Errno::EEXIST) => (
@@ -220,8 +209,7 @@ impl OwnedDirectory {
             Err(error) => return Err(invalid(&path, error)),
         };
         if created {
-            fchmod(&fd, Mode::from_bits_retain(PRIVATE_FILE_MODE))
-                .map_err(|error| invalid(&path, error))?;
+            fchmod(&fd, PRIVATE_FILE_MODE).map_err(|error| invalid(&path, error))?;
         }
         validate_file(&fd, &path)?;
         ftruncate(&fd, 0).map_err(|error| invalid(&path, error))?;
@@ -352,14 +340,14 @@ fn validate_directory(fd: &OwnedFd, path: &Path, require_private: bool) -> Resul
             ),
         ));
     }
-    let mode = stat.st_mode & 0o7777;
+    let mode = Mode::from_bits_retain(stat.st_mode & 0o7777);
     if require_private && mode != PRIVATE_DIRECTORY_MODE {
         return Err(invalid(
             path,
             format!("has mode {mode:o}, expected {PRIVATE_DIRECTORY_MODE:o}"),
         ));
     }
-    if !require_private && mode & 0o022 != 0 {
+    if !require_private && mode.intersects(Mode::S_IWGRP | Mode::S_IWOTH) {
         return Err(invalid(
             path,
             format!("has group or other write permissions in mode {mode:o}"),
@@ -383,7 +371,7 @@ fn validate_file(fd: &OwnedFd, path: &Path) -> Result<(), LibVmError> {
             ),
         ));
     }
-    let mode = stat.st_mode & 0o7777;
+    let mode = Mode::from_bits_retain(stat.st_mode & 0o7777);
     if mode != PRIVATE_FILE_MODE {
         return Err(invalid(
             path,
