@@ -1,0 +1,168 @@
+use libvm::{
+    ExecutionLaunchFailureReason, ExecutionResult, ImageSource, LibVmError, MachineLogOptions,
+    MachineLogSource, MachineReadinessOutcome, MachineStartupCommand, MachineUserConfig, Runtime,
+};
+use std::time::Duration;
+use tokio_stream::StreamExt as _;
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let image = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "ubuntu:26.04".to_string());
+    let executable = std::env::current_exe()?;
+    let adjacent = executable
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or("example executable has no adjacent runtime parent")?;
+    let runtime = Runtime::builder()
+        .vmmon_path(adjacent.join("vmmon"))
+        .netd_path(adjacent.join("netd"))
+        .krun_path(adjacent.join("krun"))
+        .kernel_path(adjacent.join("assets/kernel-default"))
+        .initramfs_path(adjacent.join("assets/initramfs"))
+        .agent_path(adjacent.join("assets/agent"))
+        .open()
+        .await?;
+    let machine = runtime
+        .machine()
+        .image_source(ImageSource::oci(image.clone()))
+        .create()
+        .await?;
+
+    let start = machine
+        .start_with(|options| {
+            options.startup_command(MachineStartupCommand {
+                argv: vec![
+                    "/usr/bin/printf".to_string(),
+                    "startup-command-output\n".to_string(),
+                ],
+                working_directory: None,
+                environment: Vec::new(),
+                user: None,
+            })
+        })
+        .await;
+    if let Err(error) = start {
+        let _ = machine.remove().await;
+        return Err(error.into());
+    }
+
+    let exit = machine.wait().await?;
+    if !exec_log_contains(&machine, "startup-command-output\n").await? {
+        let _ = machine.remove().await;
+        return Err("exec.log did not capture detached startup stdout".into());
+    }
+
+    eprintln!("startup command acknowledged Started and vmmon exited: {exit:?}");
+    eprintln!("exec.log captured detached startup output");
+    machine.remove().await?;
+
+    let machine = runtime
+        .machine()
+        .image_source(ImageSource::oci(image.clone()))
+        .create()
+        .await?;
+    let failure = machine
+        .start_with(|options| {
+            options.startup_command(MachineStartupCommand {
+                argv: vec!["/silo-missing-startup-command".to_string()],
+                working_directory: None,
+                environment: Vec::new(),
+                user: None,
+            })
+        })
+        .await;
+    match failure {
+        Err(LibVmError::StartupCommandLaunchFailed { failure })
+            if failure.reason == ExecutionLaunchFailureReason::CommandNotFound => {}
+        Err(error) => {
+            let _ = machine.remove().await;
+            return Err(format!("unexpected startup launch failure: {error}").into());
+        }
+        Ok(_) => {
+            let _ = machine.stop().await;
+            let _ = machine.remove().await;
+            return Err("missing startup command unexpectedly reached Started".into());
+        }
+    }
+    if machine.inspect().await?.is_running() {
+        let _ = machine.stop().await;
+        let _ = machine.remove().await;
+        return Err("failed startup command left the VM running".into());
+    }
+    eprintln!("startup launch failure remained typed and stopped the VM");
+    machine.remove().await?;
+
+    let machine = runtime
+        .machine()
+        .image_source(ImageSource::oci(image))
+        .guest(|guest| {
+            guest.user(MachineUserConfig::new(
+                "silo-stage5",
+                12345,
+                12345,
+                "/home/silo-stage5",
+            ))
+        })
+        .create()
+        .await?;
+    machine.start().await?;
+    let readiness = machine.wait_ready(Duration::from_secs(5 * 60)).await?;
+    if readiness.outcome != MachineReadinessOutcome::Ready {
+        let _ = machine.remove().await;
+        return Err(format!("ordinary execution machine was not ready: {readiness:?}").into());
+    }
+    let identity = machine.exec("/usr/bin/id", ["-u"]).await?;
+    if identity.stdout_bytes() != b"12345\n" {
+        let _ = machine.stop().await;
+        let _ = machine.remove().await;
+        return Err(format!(
+            "ordinary execution ignored the configured guest user: {:?}",
+            identity.stdout_bytes()
+        )
+        .into());
+    }
+    let output = machine
+        .exec_with("/usr/bin/cat", |options| {
+            options.stdin_bytes("ordinary-execution-output\n")
+        })
+        .await?;
+    if !matches!(output.result(), ExecutionResult::Exited { code: Some(0) }) {
+        let _ = machine.stop().await;
+        let _ = machine.remove().await;
+        return Err("ordinary execution failed".into());
+    }
+    if output.stdout_bytes() != b"ordinary-execution-output\n" {
+        let _ = machine.stop().await;
+        let _ = machine.remove().await;
+        return Err("fixed stdin was not delivered after guest Started".into());
+    }
+    machine.stop().await?;
+    if !exec_log_contains(&machine, "ordinary-execution-output\n").await? {
+        let _ = machine.remove().await;
+        return Err("exec.log did not capture ordinary execution stdout".into());
+    }
+    eprintln!("ordinary execution preserved default user and fixed stdin");
+    eprintln!("exec.log captured ordinary execution output");
+    machine.remove().await?;
+    Ok(())
+}
+
+async fn exec_log_contains(
+    machine: &libvm::Machine,
+    expected: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut logs = machine
+        .logs(MachineLogSource::Exec, MachineLogOptions::default())
+        .await?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = logs.next().await {
+        bytes.extend_from_slice(&chunk?.data);
+    }
+    Ok(bytes.split(|byte| *byte == b'\n').any(|line| {
+        serde_json::from_slice::<serde_json::Value>(line)
+            .ok()
+            .is_some_and(|record| record["s"] == "stdout" && record["d"] == expected)
+    }))
+}

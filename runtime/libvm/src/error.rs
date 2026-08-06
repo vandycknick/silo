@@ -84,6 +84,11 @@ pub enum LibVmError {
     #[error("machine start failed: {primary}; cleanup also failed: {cleanup}")]
     MachineStartCleanupFailed { primary: String, cleanup: String },
 
+    #[error("startup command {failure}")]
+    StartupCommandLaunchFailed {
+        failure: crate::machine::ExecutionLaunchFailure,
+    },
+
     #[error("network runtime for {reference} failed: {message}")]
     NetworkRuntime { reference: String, message: String },
 

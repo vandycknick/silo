@@ -202,6 +202,18 @@ where
             ) {
                 return Ok(overrides.apply_to(components));
             }
+            if directory.file_name() == Some(std::ffi::OsStr::new("examples")) {
+                if let Some(parent) = directory.parent() {
+                    if let Some(components) = consider(
+                        &mut considered,
+                        "Cargo example adjacent runtime",
+                        ComponentPaths::adjacent(parent),
+                        None,
+                    ) {
+                        return Ok(overrides.apply_to(components));
+                    }
+                }
+            }
         }
 
         if let Some(root) = portable_root_for_executable(executable) {

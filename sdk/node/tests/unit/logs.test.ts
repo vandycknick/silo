@@ -13,6 +13,7 @@ describe("machine log conversion", () => {
   it("accepts only semantic log sources and options", () => {
     expect(machineLogSourceToNative("monitor")).toBe("monitor");
     expect(machineLogSourceToNative("serial")).toBe("serial");
+    expect(machineLogSourceToNative("exec")).toBe("exec");
     expect(machineLogSourceToNative("network")).toBe("network");
     expect(machineLogSourceToNative("networkAudit")).toBe("networkAudit");
     expect(() => machineLogSourceToNative("audit")).toThrow(TypeError);
@@ -78,7 +79,7 @@ describe("machine log conversion", () => {
 
   it("exports the typed logs surface", () => {
     expectTypeOf<Machine["logs"]>().returns.toEqualTypeOf<Promise<MachineLogStream>>();
-    expectTypeOf<MachineLogSource>().toEqualTypeOf<"monitor" | "serial" | "network" | "networkAudit">();
+    expectTypeOf<MachineLogSource>().toEqualTypeOf<"monitor" | "serial" | "exec" | "network" | "networkAudit">();
     expectTypeOf<MachineLogOptions>().toEqualTypeOf<{ follow?: boolean }>();
     expectTypeOf<MachineLogChunk>().toEqualTypeOf<{ output: "stdout" | "stderr"; data: Uint8Array }>();
   });

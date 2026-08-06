@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -17,6 +18,7 @@ use crate::LibVmError;
 const LOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LOG_CHUNK_SIZE: usize = 8 * 1024;
 const LOG_STREAM_BUFFER: usize = 8;
+const EXEC_LOG_SNAPSHOT_RETRIES: usize = 8;
 
 /// Selects one persisted machine log source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +28,8 @@ pub enum MachineLogSource {
     Monitor,
     /// VM serial console output.
     Serial,
+    /// Structured best-effort guest execution records.
+    Exec,
     /// Private network service diagnostics.
     Network,
     /// Private network audit events.
@@ -94,19 +98,26 @@ impl Machine {
         let (_lock, config) = runtime.lock_machine_config(machine_id).await?;
         validate_log_source(&config, source)?;
         let paths = runtime.local_paths().clone();
-        let file = open_log(&paths, machine_id, source)?;
+        let file = (source != MachineLogSource::Exec)
+            .then(|| open_log(&paths, machine_id, source))
+            .transpose()?
+            .flatten();
         let (sender, receiver) = mpsc::channel(LOG_STREAM_BUFFER);
 
         tokio::spawn(async move {
-            let result = stream_log(
-                paths,
-                machine_id,
-                source,
-                file,
-                options.follow,
-                sender.clone(),
-            )
-            .await;
+            let result = if source == MachineLogSource::Exec {
+                stream_exec_log(paths, machine_id, options.follow, sender.clone()).await
+            } else {
+                stream_log(
+                    paths,
+                    machine_id,
+                    source,
+                    file,
+                    options.follow,
+                    sender.clone(),
+                )
+                .await
+            };
             if let Err(error) = result {
                 let _ = sender.send(Err(error)).await;
             }
@@ -123,7 +134,7 @@ fn validate_log_source(
     source: MachineLogSource,
 ) -> Result<(), LibVmError> {
     match source {
-        MachineLogSource::Monitor | MachineLogSource::Serial => Ok(()),
+        MachineLogSource::Monitor | MachineLogSource::Serial | MachineLogSource::Exec => Ok(()),
         MachineLogSource::Network | MachineLogSource::NetworkAudit => {
             if !matches!(&config.network, MachineNetworkConfig::Private { .. }) {
                 return Err(LibVmError::MachineLogSourceUnavailable {
@@ -181,6 +192,21 @@ async fn wait_for_log(sender: &mpsc::Sender<Result<MachineLogChunk, LibVmError>>
 struct OpenedLog {
     file: File,
     snapshot_len: u64,
+    identity: FileIdentity,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+type ExecLogSignature = [Option<FileIdentity>; 4];
+
+struct ExecLogSnapshot {
+    archives: Vec<OpenedLog>,
+    active: Option<OpenedLog>,
+    signature: ExecLogSignature,
 }
 
 fn open_log(
@@ -191,14 +217,156 @@ fn open_log(
     let file = match source {
         MachineLogSource::Monitor => paths.open_vm_trace_log(machine_id)?,
         MachineLogSource::Serial => paths.open_serial_log(machine_id)?,
+        MachineLogSource::Exec => paths.open_exec_log(machine_id)?,
         MachineLogSource::Network => paths.open_network_service_log(machine_id)?,
         MachineLogSource::NetworkAudit => paths.open_network_audit_log(machine_id)?,
     };
     let Some(file) = file else {
         return Ok(None);
     };
-    let snapshot_len = file.metadata()?.len();
-    Ok(Some(OpenedLog { file, snapshot_len }))
+    let metadata = file.metadata()?;
+    Ok(Some(OpenedLog {
+        file,
+        snapshot_len: metadata.len(),
+        identity: FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+    }))
+}
+
+async fn stream_exec_log(
+    paths: crate::paths::LocalPaths,
+    machine_id: crate::store::models::MachineId,
+    follow: bool,
+    sender: mpsc::Sender<Result<MachineLogChunk, LibVmError>>,
+) -> Result<(), LibVmError> {
+    let (archives, mut active) = open_exec_log_snapshots(&paths, machine_id)?;
+    for mut archive in archives {
+        send_snapshot(&mut archive, &sender).await?;
+    }
+
+    if let Some(active_file) = active.as_mut() {
+        send_snapshot(active_file, &sender).await?;
+    }
+    if !follow {
+        return Ok(());
+    }
+
+    loop {
+        if let Some(active_file) = active.as_mut() {
+            if read_append(&mut active_file.file, &sender).await? {
+                continue;
+            }
+        }
+        if !wait_for_log(&sender).await {
+            return Ok(());
+        }
+
+        let (mut archives, replacement) = open_exec_log_snapshots(&paths, machine_id)?;
+        let Some(mut replacement) = replacement else {
+            continue;
+        };
+        if let Some(active_file) = active.as_mut() {
+            if active_file.identity == replacement.identity {
+                continue;
+            }
+            while read_append(&mut active_file.file, &sender).await? {}
+            let first_newer_archive = archives
+                .iter()
+                .position(|archive| archive.identity == active_file.identity)
+                .map_or(0, |index| index + 1);
+            for archive in archives.iter_mut().skip(first_newer_archive) {
+                send_snapshot(archive, &sender).await?;
+            }
+        } else {
+            for archive in &mut archives {
+                send_snapshot(archive, &sender).await?;
+            }
+        }
+        send_snapshot(&mut replacement, &sender).await?;
+        active = Some(replacement);
+    }
+}
+
+fn open_exec_log_snapshots(
+    paths: &crate::paths::LocalPaths,
+    machine_id: crate::store::models::MachineId,
+) -> Result<(Vec<OpenedLog>, Option<OpenedLog>), LibVmError> {
+    for _ in 0..EXEC_LOG_SNAPSHOT_RETRIES {
+        let snapshot = open_exec_log_snapshots_once(paths, machine_id)?;
+        if snapshot.signature == exec_log_signature(paths, machine_id)? {
+            return Ok((snapshot.archives, snapshot.active));
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "exec log rotated continuously while opening a stable snapshot",
+    )
+    .into())
+}
+
+fn open_exec_log_snapshots_once(
+    paths: &crate::paths::LocalPaths,
+    machine_id: crate::store::models::MachineId,
+) -> Result<ExecLogSnapshot, LibVmError> {
+    let mut archives = Vec::with_capacity(3);
+    let mut signature = [None; 4];
+    for (index, generation) in [3, 2, 1].into_iter().enumerate() {
+        if let Some(file) = paths.open_exec_log_archive(machine_id, generation)? {
+            let file = opened_log(file)?;
+            signature[index] = Some(file.identity);
+            archives.push(file);
+        }
+    }
+    let active = paths
+        .open_exec_log(machine_id)?
+        .map(opened_log)
+        .transpose()?;
+    signature[3] = active.as_ref().map(|file| file.identity);
+    Ok(ExecLogSnapshot {
+        archives,
+        active,
+        signature,
+    })
+}
+
+fn exec_log_signature(
+    paths: &crate::paths::LocalPaths,
+    machine_id: crate::store::models::MachineId,
+) -> Result<ExecLogSignature, LibVmError> {
+    let mut signature = [None; 4];
+    for (index, generation) in [3, 2, 1].into_iter().enumerate() {
+        signature[index] = paths
+            .open_exec_log_archive(machine_id, generation)?
+            .map(file_identity)
+            .transpose()?;
+    }
+    signature[3] = paths
+        .open_exec_log(machine_id)?
+        .map(file_identity)
+        .transpose()?;
+    Ok(signature)
+}
+
+fn opened_log(file: File) -> Result<OpenedLog, LibVmError> {
+    let metadata = file.metadata()?;
+    Ok(OpenedLog {
+        file,
+        snapshot_len: metadata.len(),
+        identity: FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+    })
+}
+
+fn file_identity(file: File) -> Result<FileIdentity, LibVmError> {
+    let metadata = file.metadata()?;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
 async fn send_snapshot(
@@ -501,6 +669,128 @@ mod tests {
 
         let bytes = read_bytes(&mut stream, b"before-after".len()).await;
         assert_eq!(bytes, b"before-after");
+    }
+
+    #[tokio::test]
+    async fn exec_snapshot_reads_archives_before_the_active_log() {
+        let (_temp, runtime, machine, id) =
+            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+        let paths = runtime.machine_paths(id);
+        write_log(&paths.exec_log_archive_path(3), b"three\n");
+        write_log(&paths.exec_log_archive_path(2), b"two\n");
+        write_log(&paths.exec_log_archive_path(1), b"one\n");
+        write_log(&paths.exec_log_path(), b"active\n");
+
+        let snapshot = collect(
+            machine
+                .logs(MachineLogSource::Exec, MachineLogOptions::default())
+                .await
+                .expect("open exec snapshot"),
+        )
+        .await;
+
+        assert_eq!(snapshot, b"three\ntwo\none\nactive\n");
+    }
+
+    #[tokio::test]
+    async fn exec_follow_switches_to_a_rotated_active_file() {
+        let (_temp, runtime, machine, id) =
+            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+        let path = runtime.machine_paths(id).exec_log_path();
+        write_log(&path, b"old\n");
+        let mut stream = machine
+            .logs(MachineLogSource::Exec, MachineLogOptions { follow: true })
+            .await
+            .expect("open exec follow stream");
+
+        assert_eq!(read_bytes(&mut stream, b"old\n".len()).await, b"old\n");
+        std::fs::rename(&path, path.with_extension("log.1")).expect("rotate exec log");
+        write_log(&path, b"new\n");
+
+        assert_eq!(read_bytes(&mut stream, b"new\n".len()).await, b"new\n");
+    }
+
+    #[tokio::test]
+    async fn exec_follow_drains_bytes_appended_immediately_before_rotation() {
+        let (_temp, runtime, machine, id) =
+            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+        let path = runtime.machine_paths(id).exec_log_path();
+        write_log(&path, b"old\n");
+        let mut stream = machine
+            .logs(MachineLogSource::Exec, MachineLogOptions { follow: true })
+            .await
+            .expect("open exec follow stream");
+        assert_eq!(read_bytes(&mut stream, b"old\n".len()).await, b"old\n");
+        assert!(timeout(Duration::from_millis(100), stream.next())
+            .await
+            .is_err());
+
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open old active log")
+            .write_all(b"late\n")
+            .expect("append before rotation");
+        std::fs::rename(&path, path.with_extension("log.1")).expect("rotate exec log");
+        write_log(&path, b"new\n");
+
+        assert_eq!(
+            read_bytes(&mut stream, b"late\nnew\n".len()).await,
+            b"late\nnew\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_follow_reads_intermediate_archives_after_multiple_rotations() {
+        let (_temp, runtime, machine, id) =
+            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+        let paths = runtime.machine_paths(id);
+        let active = paths.exec_log_path();
+        write_log(&active, b"a\n");
+        let mut stream = machine
+            .logs(MachineLogSource::Exec, MachineLogOptions { follow: true })
+            .await
+            .expect("open exec follow stream");
+        assert_eq!(read_bytes(&mut stream, 2).await, b"a\n");
+        assert!(timeout(Duration::from_millis(100), stream.next())
+            .await
+            .is_err());
+
+        std::fs::rename(&active, paths.exec_log_archive_path(1)).expect("first rotation");
+        write_log(&active, b"b\n");
+        std::fs::rename(
+            paths.exec_log_archive_path(1),
+            paths.exec_log_archive_path(2),
+        )
+        .expect("shift first archive");
+        std::fs::rename(&active, paths.exec_log_archive_path(1)).expect("second rotation");
+        write_log(&active, b"c\n");
+
+        assert_eq!(read_bytes(&mut stream, 4).await, b"b\nc\n");
+    }
+
+    #[tokio::test]
+    async fn exec_follow_discovers_archives_created_before_the_active_log() {
+        let (_temp, runtime, machine, id) =
+            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+        let paths = runtime.machine_paths(id);
+        let mut stream = machine
+            .logs(MachineLogSource::Exec, MachineLogOptions { follow: true })
+            .await
+            .expect("open missing exec follow stream");
+        assert!(timeout(Duration::from_millis(100), stream.next())
+            .await
+            .is_err());
+
+        write_log(&paths.exec_log_archive_path(2), b"two\n");
+        write_log(&paths.exec_log_archive_path(1), b"one\n");
+        write_log(&paths.exec_log_path(), b"active\n");
+
+        assert_eq!(
+            read_bytes(&mut stream, b"two\none\nactive\n".len()).await,
+            b"two\none\nactive\n"
+        );
     }
 
     #[tokio::test]

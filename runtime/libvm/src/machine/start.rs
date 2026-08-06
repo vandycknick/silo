@@ -24,6 +24,60 @@ pub struct MachineStartOptions {
     /// validated against the persisted network policy before a network runtime
     /// is launched.
     pub network: NetworkLaunch,
+    /// Optional vmmon-owned command launched after the managed guest agent is ready.
+    ///
+    /// Machine startup is acknowledged only after the guest reports that this
+    /// command started. The command then continues independently, its output is
+    /// captured best-effort in the machine execution log, and vmmon stops the VM
+    /// when it ends. It cannot be attached to or controlled after startup.
+    pub startup_command: Option<MachineStartupCommand>,
+}
+
+/// A non-interactive command owned by vmmon for one machine run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineStartupCommand {
+    /// Exact guest argv, without shell parsing.
+    pub argv: Vec<String>,
+    /// Guest working directory, or `/` when omitted.
+    pub working_directory: Option<String>,
+    /// Explicit environment variables for the guest process; host ambient
+    /// variables are never inherited.
+    pub environment: Vec<(String, String)>,
+    /// Optional OCI-style user and group selector.
+    pub user: Option<String>,
+}
+
+impl MachineStartOptions {
+    /// Sets the vmmon-owned command for this machine run.
+    pub fn startup_command(mut self, command: MachineStartupCommand) -> Self {
+        self.startup_command = Some(command);
+        self
+    }
+
+    pub(crate) fn vmmon_startup_command(
+        &self,
+    ) -> Option<crate::vmmon::start_request::VmmonStartupCommand> {
+        self.startup_command.as_ref().map(|command| {
+            crate::vmmon::start_request::VmmonStartupCommand {
+                execution_id: uuid::Uuid::new_v4(),
+                process: crate::vmmon::start_request::VmmonProcessSpec {
+                    argv: command.argv.clone(),
+                    working_directory: command.working_directory.clone(),
+                    environment: command
+                        .environment
+                        .iter()
+                        .map(|(name, value)| {
+                            crate::vmmon::start_request::VmmonEnvironmentVariable {
+                                name: name.clone(),
+                                value: value.clone(),
+                            }
+                        })
+                        .collect(),
+                    user: command.user.clone(),
+                },
+            }
+        })
+    }
 }
 
 /// Launch-only network material supplied when starting a machine.
@@ -421,6 +475,20 @@ impl MachineStartOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_command_gets_a_fresh_internal_execution_id_per_launch() {
+        let options = MachineStartOptions::default().startup_command(MachineStartupCommand {
+            argv: vec!["/usr/bin/true".to_string()],
+            working_directory: None,
+            environment: Vec::new(),
+            user: None,
+        });
+        let first = options.vmmon_startup_command().expect("first command");
+        let second = options.vmmon_startup_command().expect("second command");
+        assert_ne!(first.execution_id, second.execution_id);
+        assert_eq!(first.process, second.process);
+    }
 
     fn oauth_policy() -> NetworkPolicy {
         NetworkPolicy::from_json_str(

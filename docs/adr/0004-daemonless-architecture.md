@@ -216,11 +216,12 @@ The current canonical layout is:
       <machine-id>/
         vm.trace.log
         serial.log
+        exec.log                    # active best-effort execution output
+        exec.log.{1,2,3}            # bounded rotations
         vm.exit.json
         network/
           netd.log
           audit.jsonl
-        executions/                 # startup-execution storage
 
 <run-root>/
   machines/<machine-id>/
@@ -242,17 +243,17 @@ are persisted database identity; the run root is resolved per open.
 
 The private machine log tree is selected only by immutable machine ID. Private
 network instance IDs select ephemeral runtime files, not durable logs. `vmmon`
-and `netd` are each the sole writers for their append-only logs;
-`vm.exit.json` is an atomically replaced lifecycle record. The `executions/`
-subtree is reserved for startup-execution storage, not ordinary exec history.
+and `netd` are each the sole writers for their logs; `vm.exit.json` is an
+atomically replaced lifecycle record. `exec.log` is a bounded best-effort JSON
+Lines output capture and does not provide process attachment or execution
+history.
 
 Clients do not receive log paths or filenames. `Machine::logs` selects one of
-the monitor, serial, network, or network-audit semantic sources. A snapshot is
-finite; follow emits that snapshot, then append bytes without a gap and remains
-attached while the machine is stopped and across later starts until the reader
-drops it. The host gRPC endpoint does not serve persisted logs. CLI stream
-values and workload replay use this semantic API without duplicating path
-policy.
+the monitor, serial, execution, network, or network-audit semantic sources. A
+snapshot is finite; follow emits that snapshot, then append bytes without a gap
+and remains attached while the machine is stopped and across later starts until
+the reader drops it. The host gRPC endpoint does not serve persisted logs. CLI
+stream values use this semantic API without duplicating path policy.
 
 ## Canonical `VmSpec`
 

@@ -1,5 +1,5 @@
 export { SiloError } from "./errors.js";
-export { ExecHandle, ExecOutput, ExecSink, type ExecEvent } from "./exec.js";
+export { ExecutionSession, ExecutionOutput, ExecutionStdin, type ExecutionEvent } from "./exec.js";
 export { Images } from "./images.js";
 export { MachineLogStream } from "./logs.js";
 export { GuestBuilder, Machine, MachineBuilder } from "./machine.js";
@@ -33,9 +33,10 @@ export {
 export { Runtime } from "./runtime.js";
 export {
   ImageSource,
-  type AttachOptions,
-  type ExecOptions,
-  type ExitStatus,
+  type ExecutionOptions,
+  type ExecutionLaunchFailureReason,
+  type ExecutionLostReason,
+  type ExecutionResult,
   type ImageDetail,
   type ImageHandle,
   type ImageLayerDetail,
@@ -51,4 +52,6 @@ export {
   type Mount,
   type Network,
   type RuntimeOpenOptions,
+  type SshExitStatus,
+  type SshShellOptions,
 } from "./types.js";

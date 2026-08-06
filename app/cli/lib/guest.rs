@@ -2,7 +2,8 @@ use std::io::Write;
 
 use eyre::Context as _;
 use libvm::{
-    AttachOptionsBuilder, ExecEvent, ExecHandle, ExecOptionsBuilder, ExecSink, ExitStatus, Machine,
+    ExecutionControl, ExecutionEvent, ExecutionOptionsBuilder, ExecutionResult, ExecutionSession,
+    ExecutionStdin, Machine, SshExitStatus,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -10,15 +11,28 @@ pub(crate) async fn attach_shell(
     machine: &Machine,
     user: Option<&str>,
     forward_agent: bool,
-) -> eyre::Result<ExitStatus> {
-    let script = format!(
-        "{}; exec \"${{SHELL:-/bin/bash}}\" -l || exec /bin/sh",
-        current_dir_prologue()?
-    );
+) -> eyre::Result<SshExitStatus> {
+    let cwd = std::env::current_dir().context("resolve current working directory")?;
     machine
-        .attach_with("/bin/sh", |attach| {
-            with_attach_user(attach.arg("-lc").arg(script), user).forward_agent(forward_agent)
+        .attach_shell_with(|options| {
+            let options = options.cwd(cwd.to_string_lossy()).best_effort_cwd();
+            let options = match user {
+                Some(user) => options.user(user),
+                None => options,
+            };
+            options.forward_agent(forward_agent)
         })
+        .await
+        .map_err(Into::into)
+}
+
+pub(crate) async fn run_legacy_command(
+    machine: &Machine,
+    argv: &[String],
+    tty: bool,
+) -> eyre::Result<SshExitStatus> {
+    machine
+        .run_legacy_ssh_command(argv, tty)
         .await
         .map_err(Into::into)
 }
@@ -27,171 +41,149 @@ pub(crate) async fn run_command_streaming(
     machine: &Machine,
     user: Option<&str>,
     argv: &[String],
-    forward_agent: bool,
-) -> eyre::Result<ExitStatus> {
-    if argv.is_empty() {
-        eyre::bail!("guest command is required");
-    }
-
-    let script = command_script(argv)?;
-    let mut handle = machine
-        .spawn_with("/bin/sh", |command| {
-            with_exec_user(command.arg("-lc").arg(script).stdin_pipe(), user)
-                .forward_agent(forward_agent)
+) -> eyre::Result<ExecutionResult> {
+    let (program, args) = command_argv(argv)?;
+    let mut session = machine
+        .spawn_with(program, |options| {
+            with_exec_user(options.args(args), user).stdin_pipe()
         })
         .await?;
-    if let Some(stdin) = handle.take_stdin() {
-        let _stdin_forward = tokio::spawn(forward_stdin(stdin));
+    let stdin = session.stdin();
+    if let Some(stdin) = stdin {
+        tokio::spawn(forward_stdin(stdin));
     }
-    stream_events(&mut handle).await
+    stream_events(&mut session).await
 }
 
 pub(crate) async fn attach_command(
     machine: &Machine,
     user: Option<&str>,
     argv: &[String],
-    forward_agent: bool,
-) -> eyre::Result<ExitStatus> {
-    if argv.is_empty() {
-        eyre::bail!("guest command is required");
-    }
-
-    let script = command_script(argv)?;
+) -> eyre::Result<ExecutionResult> {
+    let (program, args) = command_argv(argv)?;
     machine
-        .attach_with("/bin/sh", |attach| {
-            with_attach_user(attach.arg("-lc").arg(script), user).forward_agent(forward_agent)
-        })
+        .attach_with(program, |options| with_exec_user(options.args(args), user))
         .await
         .map_err(Into::into)
 }
 
-async fn forward_stdin(sink: ExecSink) {
-    let mut stdin = tokio::io::stdin();
+async fn forward_stdin(stdin: ExecutionStdin) {
+    let mut host_stdin = tokio::io::stdin();
     let mut buffer = [0_u8; 8192];
-
     loop {
-        match stdin.read(&mut buffer).await {
+        match host_stdin.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => {
-                if let Err(error) = sink.write(buffer[..read].to_vec()).await {
+                if let Err(error) = stdin.write(buffer[..read].to_vec()).await {
                     let _ = writeln!(std::io::stderr(), "guest stdin warning: {error}");
-                    break;
+                    return;
                 }
             }
             Err(error) => {
                 let _ = writeln!(std::io::stderr(), "guest stdin warning: {error}");
-                break;
+                return;
             }
         }
     }
-
-    sink.close();
+    if let Err(error) = stdin.close().await {
+        let _ = writeln!(std::io::stderr(), "guest stdin warning: {error}");
+    }
 }
 
-async fn stream_events(handle: &mut ExecHandle) -> eyre::Result<ExitStatus> {
+async fn stream_events(session: &mut ExecutionSession) -> eyre::Result<ExecutionResult> {
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
-    while let Some(event) = handle.recv().await {
+    let control = session.control();
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("listen for host interrupt")?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("listen for host termination")?;
+    loop {
+        let event = tokio::select! {
+            event = session.recv() => event?,
+            signal = interrupt.recv() => {
+                if signal.is_some() {
+                    forward_signal(&control, libc::SIGINT as u32).await?;
+                }
+                continue;
+            }
+            signal = terminate.recv() => {
+                if signal.is_some() {
+                    forward_signal(&control, libc::SIGTERM as u32).await?;
+                }
+                continue;
+            }
+        };
+        let Some(event) = event else {
+            break;
+        };
         match event {
-            ExecEvent::Started => {}
-            ExecEvent::Stdout(data) => {
+            ExecutionEvent::Accepted | ExecutionEvent::Started => {}
+            ExecutionEvent::Stdout(data) => {
                 stdout
                     .write_all(&data)
                     .await
                     .context("write guest stdout")?;
                 stdout.flush().await.context("flush guest stdout")?;
             }
-            ExecEvent::Stderr(data) => {
+            ExecutionEvent::Stderr(data) => {
                 stderr
                     .write_all(&data)
                     .await
                     .context("write guest stderr")?;
                 stderr.flush().await.context("flush guest stderr")?;
             }
-            ExecEvent::Exited { code } => {
-                return Ok(ExitStatus {
-                    code,
-                    success: code == 0,
-                });
+            ExecutionEvent::TerminalOutput(data) => {
+                stdout
+                    .write_all(&data)
+                    .await
+                    .context("write guest terminal output")?;
+                stdout
+                    .flush()
+                    .await
+                    .context("flush guest terminal output")?;
             }
-            ExecEvent::Failed { message } => {
-                eyre::bail!("guest command failed: {message}");
-            }
-            ExecEvent::StdinError { message } => {
-                writeln!(std::io::stderr(), "guest stdin warning: {message}")
-                    .context("write guest stdin warning")?;
-            }
+            ExecutionEvent::Terminal(result) => return Ok(result),
         }
     }
-
-    eyre::bail!("guest command ended without an exit status")
+    eyre::bail!("guest command ended without a terminal result")
 }
 
-fn with_exec_user(builder: ExecOptionsBuilder, user: Option<&str>) -> ExecOptionsBuilder {
+async fn forward_signal(control: &ExecutionControl, signal: u32) -> eyre::Result<()> {
+    control
+        .signal(signal)
+        .await
+        .wrap_err_with(|| format!("forward host signal {signal} to guest"))
+}
+
+fn command_argv(argv: &[String]) -> eyre::Result<(String, Vec<String>)> {
+    let Some((program, args)) = argv.split_first() else {
+        eyre::bail!("guest command is required");
+    };
+    Ok((program.clone(), args.to_vec()))
+}
+
+fn with_exec_user(builder: ExecutionOptionsBuilder, user: Option<&str>) -> ExecutionOptionsBuilder {
     match user {
         Some(user) => builder.user(user),
         None => builder,
     }
-}
-
-fn with_attach_user(builder: AttachOptionsBuilder, user: Option<&str>) -> AttachOptionsBuilder {
-    match user {
-        Some(user) => builder.user(user),
-        None => builder,
-    }
-}
-
-fn current_dir_prologue() -> eyre::Result<String> {
-    let cwd = std::env::current_dir().context("resolve current working directory")?;
-    Ok(format!(
-        "cd {} 2>/dev/null || true",
-        shell_quote(&cwd.to_string_lossy())
-    ))
-}
-
-fn command_script(argv: &[String]) -> eyre::Result<String> {
-    Ok(format!(
-        "{}; exec {}",
-        current_dir_prologue()?,
-        shell_join(argv)
-    ))
-}
-
-fn shell_join(argv: &[String]) -> String {
-    argv.iter()
-        .map(|arg| shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn shell_quote(input: &str) -> String {
-    format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::guest::{command_script, shell_join, shell_quote};
+    use crate::guest::command_argv;
 
     #[test]
-    fn shell_quote_handles_single_quotes() {
-        assert_eq!(shell_quote("it's"), "'it'\"'\"'s'");
+    fn command_argv_preserves_the_exact_argv_vector() {
+        let argv = vec!["cargo test".to_string(), "name with spaces".to_string()];
+        let (program, args) = command_argv(&argv).expect("command argv");
+        assert_eq!(program, "cargo test");
+        assert_eq!(args, ["name with spaces"]);
     }
 
     #[test]
-    fn shell_join_quotes_each_argument() {
-        assert_eq!(
-            shell_join(&["cargo".to_string(), "test name".to_string()]),
-            "'cargo' 'test name'"
-        );
-    }
-
-    #[test]
-    fn command_script_execs_quoted_argv_after_cwd_prologue() {
-        let script = command_script(&["opencode".to_string(), "it's alive".to_string()])
-            .expect("command script");
-
-        assert!(script.starts_with("cd '"));
-        assert!(script.contains("' 2>/dev/null || true; exec "));
-        assert!(script.ends_with("'opencode' 'it'\"'\"'s alive'"));
+    fn command_argv_rejects_empty_command() {
+        assert!(command_argv(&[]).is_err());
     }
 }

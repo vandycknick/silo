@@ -1,11 +1,12 @@
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eyre::Context;
+use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use virt::VirtualMachine;
 use vm_spec::VmSpec;
@@ -14,16 +15,19 @@ use crate::context::{DaemonContext, RuntimeContext};
 use crate::machine::{
     machine_identifier_path_from_dir, vm_spec_machine_config, RuntimeNetwork, VmSpecInputs,
 };
+use crate::start_request::StartRequestPipe;
 use crate::state::new_instance_store;
 use protocol::v1::VmState;
 
 pub const ENV_STARTPIPE: &str = "_VM_STARTPIPE";
 pub const ENV_SYNCPIPE: &str = "_VM_SYNCPIPE";
+pub const ENV_MACHINE_LOG_DIR: &str = "_VM_MACHINE_LOG_DIR";
 
 #[derive(Clone, Copy, Debug)]
 pub struct InheritedPipeFds {
     pub startpipe: Option<RawFd>,
     pub syncpipe: Option<RawFd>,
+    pub machine_log_dir: Option<RawFd>,
 }
 
 impl InheritedPipeFds {
@@ -31,6 +35,7 @@ impl InheritedPipeFds {
         Ok(Self {
             startpipe: parse_env_fd(ENV_STARTPIPE)?,
             syncpipe: parse_env_fd(ENV_SYNCPIPE)?,
+            machine_log_dir: parse_env_fd(ENV_MACHINE_LOG_DIR)?,
         })
     }
 
@@ -45,47 +50,25 @@ impl InheritedPipeFds {
 
     #[cfg(target_os = "macos")]
     pub fn clear_cloexec(self) -> eyre::Result<()> {
-        for fd in [self.startpipe, self.syncpipe].into_iter().flatten() {
+        for fd in [self.startpipe, self.syncpipe, self.machine_log_dir]
+            .into_iter()
+            .flatten()
+        {
             set_cloexec(fd, false).map_err(|err| eyre::eyre!("clear CLOEXEC on fd {fd}: {err}"))?;
         }
         Ok(())
     }
 }
 
-pub struct StartGate {
-    file: Option<File>,
-}
-
-impl StartGate {
-    pub fn from_fd(fd: Option<RawFd>) -> io::Result<Self> {
-        match fd {
-            Some(fd) => {
-                set_cloexec(fd, true)?;
-                let file = unsafe { File::from_raw_fd(fd) };
-                Ok(Self { file: Some(file) })
-            }
-            None => Ok(Self { file: None }),
-        }
-    }
-
-    pub async fn wait_for_release(&mut self) -> io::Result<()> {
-        let Some(mut file) = self.file.take() else {
-            return Ok(());
-        };
-
-        tokio::task::spawn_blocking(move || {
-            let mut byte = [0_u8; 1];
-            file.read_exact(&mut byte)
-        })
-        .await
-        .map_err(|err| io::Error::other(format!("join startpipe wait task: {err}")))??;
-
-        Ok(())
-    }
-}
-
 pub struct SyncReporter {
     file: Option<File>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupCommandLaunchFailure<'a> {
+    reason: Option<i32>,
+    message: Option<&'a str>,
 }
 
 impl SyncReporter {
@@ -117,6 +100,16 @@ impl SyncReporter {
         self.write_message(&format!("failed\t{message}\n"))
     }
 
+    pub fn report_startup_command_launch_failed(
+        &mut self,
+        reason: Option<i32>,
+        message: Option<&str>,
+    ) -> io::Result<()> {
+        let failure = serde_json::to_string(&StartupCommandLaunchFailure { reason, message })
+            .map_err(io::Error::other)?;
+        self.write_message(&format!("startup-command-launch-failed\t{failure}\n"))
+    }
+
     fn write_message(&mut self, message: &str) -> io::Result<()> {
         let Some(mut file) = self.file.take() else {
             return Ok(());
@@ -129,6 +122,7 @@ impl SyncReporter {
 
 pub(crate) struct InitInputs<'a> {
     pub(crate) machine_id: &'a str,
+    pub(crate) machine_run_id: &'a str,
     pub(crate) name: &'a str,
     pub(crate) network_args: &'a [String],
     pub(crate) agent_enabled: bool,
@@ -136,19 +130,26 @@ pub(crate) struct InitInputs<'a> {
     pub(crate) serial_file: File,
 }
 
+pub(crate) struct InitResult {
+    pub(crate) context: DaemonContext,
+    pub(crate) startup_command: Option<crate::start_request::StartupCommand>,
+}
+
 pub async fn init(
     runtime: &RuntimeContext,
     inputs: InitInputs<'_>,
-    start_gate: &mut StartGate,
-) -> eyre::Result<DaemonContext> {
+    start_request: &mut StartRequestPipe,
+) -> eyre::Result<InitResult> {
     let InitInputs {
         machine_id,
+        machine_run_id,
         name,
         network_args,
         agent_enabled,
         krun_path,
         serial_file,
     } = inputs;
+    let start_request = start_request.read(machine_id, machine_run_id).await?;
     let spec = load_spec(runtime)?;
     let guest_services_enabled = agent_enabled;
     let network = parse_network_args(network_args)?;
@@ -183,28 +184,32 @@ pub async fn init(
         }
     }
 
-    let canonical_machine_id = uuid::Uuid::parse_str(machine_id)
-        .map_err(|error| eyre::eyre!("invalid machine UUID {machine_id}: {error}"))?
-        .hyphenated()
-        .to_string();
+    let machine_id = uuid::Uuid::parse_str(machine_id)
+        .map_err(|error| eyre::eyre!("invalid machine UUID {machine_id}: {error}"))?;
+    let machine_run_id = uuid::Uuid::parse_str(machine_run_id)
+        .map_err(|error| eyre::eyre!("invalid machine run UUID {machine_run_id}: {error}"))?;
     let store = Arc::new(new_instance_store(
-        canonical_machine_id,
+        machine_id.hyphenated().to_string(),
         name.to_string(),
         guest_services_enabled,
     ));
 
     store.set_vm_state(VmState::Starting, "vm starting")?;
-    start_gate.wait_for_release().await?;
     machine.start().await?;
     store.set_vm_state(VmState::Running, "vm running")?;
 
-    Ok(DaemonContext {
-        spec,
-        guest_services_enabled,
-        machine,
-        serial_console,
-        store,
-        shutdown: CancellationToken::new(),
+    Ok(InitResult {
+        context: DaemonContext {
+            machine_id,
+            machine_run_id,
+            spec,
+            guest_services_enabled,
+            machine,
+            serial_console,
+            store,
+            shutdown: CancellationToken::new(),
+        },
+        startup_command: start_request.startup_command,
     })
 }
 
@@ -286,7 +291,7 @@ fn parse_env_fd(name: &str) -> eyre::Result<Option<RawFd>> {
     Ok(Some(fd))
 }
 
-fn set_cloexec(fd: RawFd, enabled: bool) -> io::Result<()> {
+pub(crate) fn set_cloexec(fd: RawFd, enabled: bool) -> io::Result<()> {
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let flags =
         nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_GETFD).map_err(io::Error::other)?;
@@ -303,7 +308,7 @@ fn set_cloexec(fd: RawFd, enabled: bool) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::os::fd::IntoRawFd;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -311,7 +316,242 @@ mod tests {
     use nix::unistd::pipe;
 
     use crate::machine::RuntimeNetwork;
-    use crate::startup::{parse_network_arg, secure_machine_dir, StartGate, SyncReporter};
+    use crate::startup::{parse_network_arg, secure_machine_dir, SyncReporter};
+
+    #[tokio::test]
+    async fn malformed_start_request_fails_before_vm_spec_or_vmm_construction() {
+        use crate::context::RuntimeContext;
+        use crate::start_request::StartRequestPipe;
+        use crate::startup::{init, InitInputs};
+
+        let directory =
+            std::env::temp_dir().join(format!("silo-vmmon-order-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).expect("create test directory");
+        let serial_path = directory.join("serial.log");
+        let serial_file = std::fs::File::create(&serial_path).expect("create serial file");
+        let (read_fd, write_fd) = pipe().expect("create start pipe");
+        let mut writer = std::fs::File::from(write_fd);
+        std::io::Write::write_all(&mut writer, b"{invalid}\n").expect("write malformed request");
+        drop(writer);
+        let mut start_request = StartRequestPipe::from_fd(Some(read_fd.into_raw_fd()))
+            .expect("open start request pipe");
+        let machine_id = uuid::Uuid::new_v4().to_string();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let runtime = RuntimeContext::new(
+            directory.clone(),
+            directory.join("missing-vm-spec.json"),
+            directory.join("vm.sock"),
+        );
+        let network = vec!["none".to_string()];
+        let krun_path = directory.join("missing-krun");
+
+        let result = init(
+            &runtime,
+            InitInputs {
+                machine_id: &machine_id,
+                machine_run_id: &run_id,
+                name: "ordering-test",
+                network_args: &network,
+                agent_enabled: false,
+                krun_path: &krun_path,
+                serial_file,
+            },
+            &mut start_request,
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("malformed request must fail"),
+        };
+
+        assert!(error.to_string().contains("parse vmmon start request"));
+        assert!(!error.to_string().contains("read vm spec"));
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[tokio::test]
+    async fn identity_and_size_boundaries_are_enforced_before_vm_spec_or_vmm_construction() {
+        use crate::start_request::{VMMON_START_REQUEST_MAX_BYTES, VMMON_START_REQUEST_VERSION};
+
+        let machine_id = uuid::Uuid::new_v4().to_string();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mismatch = encode_start_request(serde_json::json!({
+            "version": VMMON_START_REQUEST_VERSION,
+            "machineId": uuid::Uuid::new_v4().to_string(),
+            "machineRunId": run_id,
+        }));
+        let mismatch_error = init_error_for_start_request(mismatch, &machine_id, &run_id).await;
+        assert!(mismatch_error.contains("machineId does not match --id"));
+        assert!(!mismatch_error.contains("read vm spec"));
+
+        let base = serde_json::json!({
+            "version": VMMON_START_REQUEST_VERSION,
+            "machineId": machine_id,
+            "machineRunId": run_id,
+            "startupCommand": {
+                "executionId": uuid::Uuid::new_v4().to_string(),
+                "process": {
+                    "argv": ["true"],
+                    "environment": [{"name": "VALUE", "value": ""}]
+                }
+            }
+        });
+        let base_len = encode_start_request(base.clone()).len();
+        let mut exact = base.clone();
+        exact["startupCommand"]["process"]["environment"][0]["value"] =
+            serde_json::json!("x".repeat(VMMON_START_REQUEST_MAX_BYTES - base_len));
+        let exact_error =
+            init_error_for_start_request(encode_start_request(exact), &machine_id, &run_id).await;
+        assert!(exact_error.contains("read vm spec"));
+
+        let mut oversized = base;
+        oversized["startupCommand"]["process"]["environment"][0]["value"] =
+            serde_json::json!("x".repeat(VMMON_START_REQUEST_MAX_BYTES - base_len + 1));
+        let oversized_error =
+            init_error_for_start_request(encode_start_request(oversized), &machine_id, &run_id)
+                .await;
+        assert!(oversized_error.contains("exceeds 16777216 bytes"));
+        assert!(!oversized_error.contains("read vm spec"));
+    }
+
+    async fn init_error_for_start_request(
+        encoded: Vec<u8>,
+        machine_id: &str,
+        run_id: &str,
+    ) -> String {
+        use crate::context::RuntimeContext;
+        use crate::start_request::StartRequestPipe;
+        use crate::startup::{init, InitInputs};
+
+        let directory = std::env::temp_dir().join(format!(
+            "silo-vmmon-start-order-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).expect("create test directory");
+        let serial_file =
+            std::fs::File::create(directory.join("serial.log")).expect("create serial file");
+        let (read_fd, write_fd) = pipe().expect("create start pipe");
+        let writer = tokio::task::spawn_blocking(move || {
+            let mut writer = std::fs::File::from(write_fd);
+            std::io::Write::write_all(&mut writer, &encoded).expect("write start request");
+        });
+        let mut start_request = StartRequestPipe::from_fd(Some(read_fd.into_raw_fd()))
+            .expect("open start request pipe");
+        let runtime = RuntimeContext::new(
+            directory.clone(),
+            directory.join("missing-vm-spec.json"),
+            directory.join("vm.sock"),
+        );
+        let network = vec!["none".to_string()];
+        let krun_path = directory.join("missing-krun");
+        let result = init(
+            &runtime,
+            InitInputs {
+                machine_id,
+                machine_run_id: run_id,
+                name: "start-order-test",
+                network_args: &network,
+                agent_enabled: false,
+                krun_path: &krun_path,
+                serial_file,
+            },
+            &mut start_request,
+        )
+        .await;
+        writer.await.expect("join start request writer");
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("start request should fail before VM construction"),
+        };
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+        error
+    }
+
+    fn encode_start_request(value: serde_json::Value) -> Vec<u8> {
+        let mut encoded = serde_json::to_vec(&value).expect("encode start request");
+        encoded.push(b'\n');
+        encoded
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherited_pipes_survive_macos_self_spawn() {
+        use std::os::fd::AsRawFd;
+
+        use crate::startup::{set_cloexec, InheritedPipeFds};
+
+        let (start_read, _start_write) = pipe().expect("create start pipe");
+        let (_sync_read, sync_write) = pipe().expect("create sync pipe");
+        set_cloexec(start_read.as_raw_fd(), true).expect("set start CLOEXEC");
+        set_cloexec(sync_write.as_raw_fd(), true).expect("set sync CLOEXEC");
+
+        InheritedPipeFds {
+            startpipe: Some(start_read.as_raw_fd()),
+            syncpipe: Some(sync_write.as_raw_fd()),
+            machine_log_dir: None,
+        }
+        .clear_cloexec()
+        .expect("preserve inherited pipes");
+
+        for fd in [start_read.as_raw_fd(), sync_write.as_raw_fd()] {
+            let flags = nix::fcntl::fcntl(
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+                nix::fcntl::FcntlArg::F_GETFD,
+            )
+            .expect("read fd flags");
+            assert!(!nix::fcntl::FdFlag::from_bits_retain(flags)
+                .contains(nix::fcntl::FdFlag::FD_CLOEXEC));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherited_pipes_deliver_request_and_sync_across_exec() {
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::AsRawFd;
+        use std::process::{Command, Stdio};
+
+        use crate::startup::InheritedPipeFds;
+
+        let (start_read, start_write) = pipe().expect("create start pipe");
+        let (sync_read, sync_write) = pipe().expect("create sync pipe");
+        InheritedPipeFds {
+            startpipe: Some(start_read.as_raw_fd()),
+            syncpipe: Some(sync_write.as_raw_fd()),
+            machine_log_dir: None,
+        }
+        .clear_cloexec()
+        .expect("preserve inherited pipes");
+        let script = format!(
+            "IFS= read -r line <&{}; printf 'received:%s\\n' \"$line\" >&{}",
+            start_read.as_raw_fd(),
+            sync_write.as_raw_fd()
+        );
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn inherited-fd child");
+        drop(start_read);
+        drop(sync_write);
+
+        let mut writer = std::fs::File::from(start_write);
+        writer
+            .write_all(b"{\"version\":1}\n")
+            .expect("write start request");
+        drop(writer);
+        let mut reader = std::fs::File::from(sync_read);
+        let mut response = String::new();
+        reader
+            .read_to_string(&mut response)
+            .expect("read sync response");
+
+        assert!(child.wait().expect("wait for child").success());
+        assert_eq!(response, "received:{\"version\":1}\n");
+    }
 
     #[test]
     fn machine_directory_is_restricted_to_its_owner() {
@@ -332,23 +572,6 @@ mod tests {
             0o700
         );
         std::fs::remove_dir(directory).expect("remove test machine directory");
-    }
-
-    #[tokio::test]
-    async fn start_gate_waits_for_release_byte() {
-        let (read_fd, write_fd) = pipe().expect("create pipe");
-        let mut gate = StartGate::from_fd(Some(read_fd.into_raw_fd())).expect("open start gate");
-
-        let waiter = tokio::spawn(async move { gate.wait_for_release().await });
-
-        let mut write_file = std::fs::File::from(write_fd);
-        write_file.write_all(&[1]).expect("write release byte");
-        drop(write_file);
-
-        waiter
-            .await
-            .expect("join wait task")
-            .expect("wait for release");
     }
 
     #[test]
@@ -377,6 +600,25 @@ mod tests {
         let mut message = String::new();
         file.read_to_string(&mut message).expect("read message");
         assert_eq!(message, "failed\tvz failed\n");
+    }
+
+    #[test]
+    fn sync_reporter_writes_structured_startup_command_launch_failure() {
+        let (read_fd, write_fd) = pipe().expect("create pipe");
+        let mut reporter =
+            SyncReporter::from_fd(Some(write_fd.into_raw_fd())).expect("open sync reporter");
+
+        reporter
+            .report_startup_command_launch_failed(Some(1), Some("command was not found"))
+            .expect("report startup command launch failure");
+
+        let mut file = std::fs::File::from(read_fd);
+        let mut message = String::new();
+        file.read_to_string(&mut message).expect("read message");
+        assert_eq!(
+            message,
+            "startup-command-launch-failed\t{\"reason\":1,\"message\":\"command was not found\"}\n"
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ type MachineLogsReturnsStream = Assert<
   Equal<ReturnType<Machine["logs"]>, Promise<MachineLogStream>>
 >;
 type MachineLogSourceHasOnlySemanticSources = Assert<
-  Equal<MachineLogSource, "monitor" | "serial" | "network" | "networkAudit">
+  Equal<MachineLogSource, "monitor" | "serial" | "exec" | "network" | "networkAudit">
 >;
 type MachineLogOptionsAcceptsFollow = Assert<Equal<MachineLogOptions, { follow?: boolean }>>;
 type MachineLogChunkPreservesBytes = Assert<

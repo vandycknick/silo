@@ -89,7 +89,8 @@ impl Machine {
 
             options.validate_network_launch(&config.network, &config.name)?;
             let root_disk_resize = reconcile_root_disk_size(&config)?;
-            let run_id = Uuid::new_v4().to_string();
+            let run_uuid = Uuid::new_v4();
+            let run_id = run_uuid.to_string();
 
             let resolved_network = runtime
                 .prepare_machine_network(&config, &run_id, &options.network)
@@ -106,6 +107,24 @@ impl Machine {
                     );
                 }
             };
+            if options.startup_command.is_some() && !agent_enabled {
+                let error = LibVmError::MachinePreparationFailed {
+                    reference: config.name.clone(),
+                    message: "startup command requires the managed guest agent".to_string(),
+                };
+                return Err(
+                    finish_failed_start(runtime, &config, &run_id, None, None, error).await,
+                );
+            }
+            let machine_log_dir = match runtime.local_paths().machine_logs_directory(config.id) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    return Err(
+                        finish_failed_start(runtime, &config, &run_id, None, None, error).await,
+                    )
+                }
+            };
+            let startup_command = options.vmmon_startup_command();
 
             if let Err(err) = runtime.request_machine_start(config.id, &run_id).await {
                 return Err(finish_failed_start(runtime, &config, &run_id, None, None, err).await);
@@ -125,6 +144,8 @@ impl Machine {
                 run_id: &run_id,
                 exit_command: options.exit_command.as_ref(),
                 agent_enabled,
+                startup_command: startup_command.as_ref(),
+                machine_log_dir: &machine_log_dir,
             };
             if let Err(err) = vmmon.spawn(&launch).await {
                 return Err(finish_failed_start(
@@ -444,29 +465,42 @@ async fn finish_failed_start(
     } else {
         None
     };
-    if let Some(monitor) = monitor.or(discovered_monitor.as_ref()) {
-        if let Err(err) = stop_failed_start_monitor(monitor, &config.name).await {
-            cleanup_errors.push(format!("terminate vmmon: {err}"));
+    let monitor_stopped = match monitor.or(discovered_monitor.as_ref()) {
+        Some(monitor) => match stop_failed_start_monitor(monitor, &config.name).await {
+            Ok(()) => true,
+            Err(err) => {
+                cleanup_errors.push(format!("terminate vmmon: {err}"));
+                false
+            }
+        },
+        None => true,
+    };
+    if monitor_stopped {
+        if let Err(err) = runtime.reconcile_machine_network(config, false).await {
+            cleanup_errors.push(format!("reconcile prepared network: {err}"));
         }
     }
-    if let Err(err) = runtime.reconcile_machine_network(config, false).await {
-        cleanup_errors.push(format!("reconcile prepared network: {err}"));
-    }
-    if let Some(start_failure) = start_failure {
-        let result = match start_failure {
-            FailedStartState::Stopped => {
-                runtime
-                    .mark_machine_start_stopped(config.id, run_id, Some(primary_message.clone()))
-                    .await
+    if monitor_stopped {
+        if let Some(start_failure) = start_failure {
+            let result = match start_failure {
+                FailedStartState::Stopped => {
+                    runtime
+                        .mark_machine_start_stopped(
+                            config.id,
+                            run_id,
+                            Some(primary_message.clone()),
+                        )
+                        .await
+                }
+                FailedStartState::Error => {
+                    runtime
+                        .mark_machine_start_error(config.id, run_id, Some(primary_message.clone()))
+                        .await
+                }
+            };
+            if let Err(err) = result {
+                cleanup_errors.push(format!("record failed start: {err}"));
             }
-            FailedStartState::Error => {
-                runtime
-                    .mark_machine_start_error(config.id, run_id, Some(primary_message.clone()))
-                    .await
-            }
-        };
-        if let Err(err) = result {
-            cleanup_errors.push(format!("record failed start: {err}"));
         }
     }
 

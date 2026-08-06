@@ -6,7 +6,7 @@ use tokio_vsock::VsockStream;
 
 use crate::pid1::ProcessSupervisor;
 
-mod agent;
+pub(crate) mod agent;
 mod openssh;
 
 #[derive(Clone)]

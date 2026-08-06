@@ -143,6 +143,10 @@ impl Runtime {
         Self::new(RuntimeConfig::from_env()?).await
     }
 
+    pub(crate) fn execution_client(&self, machine_id: MachineId) -> crate::vmmon::VmmonClient {
+        self.vmmon.client(machine_id)
+    }
+
     #[cfg(test)]
     pub(crate) async fn open(
         paths: LocalPaths,
@@ -1875,6 +1879,10 @@ mod tests {
         let socket = machine_paths.vmmon_socket_path();
         let serial_log = machine_paths.serial_log_path();
         let trace_log = machine_paths.vm_trace_log_path();
+        let machine_log_dir = runtime
+            .local_paths()
+            .machine_logs_directory(machine_id)
+            .expect("open machine log directory");
         let launch = crate::vmmon::VmmonLaunch {
             machine_id,
             name: "portable-runtime",
@@ -1889,6 +1897,8 @@ mod tests {
             run_id: "portable-run",
             exit_command: None,
             agent_enabled: false,
+            startup_command: None,
+            machine_log_dir: &machine_log_dir,
         };
 
         runtime
@@ -2870,6 +2880,7 @@ mod tests {
             .expect("child process should exist")
             .started_at();
         let reaper = std::thread::spawn(move || child.wait());
+        let run_id = uuid::Uuid::new_v4();
         create_machine_runtime_dirs(&runtime, machine.id);
         let pid_path = runtime.paths.machine(machine.id).vmmon_pid_path();
         std::fs::write(&pid_path, format!("{pid}\n")).expect("write pid file");
@@ -2879,7 +2890,7 @@ mod tests {
                 MachineRuntimeState::Running,
                 Some(pid),
                 started_at,
-                Some("run-1".to_string()),
+                Some(run_id.to_string()),
                 None,
             )
             .await
@@ -2899,7 +2910,7 @@ mod tests {
             .expect("read machine state");
 
         assert!(!wait_status.success());
-        assert_eq!(exit.run_id.as_deref(), Some("run-1"));
+        assert_eq!(exit.run_id, Some(run_id.to_string()));
         assert_eq!(exit.outcome, MachineExitOutcome::Forced);
         assert_eq!(exit.machine.status, MachineStatus::Stopped);
         assert_eq!(state.status, MachineRuntimeState::Stopped);

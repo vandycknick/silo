@@ -1,8 +1,10 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/common.proto");
+    println!("cargo:rerun-if-changed=proto/execution.proto");
     println!("cargo:rerun-if-changed=proto/errors.proto");
     println!("cargo:rerun-if-changed=proto/filesystem.proto");
     println!("cargo:rerun-if-changed=proto/guest.proto");
+    println!("cargo:rerun-if-changed=proto/guest_process.proto");
     println!("cargo:rerun-if-changed=proto/vm_monitor.proto");
 
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
@@ -17,13 +19,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .file_descriptor_set_path(descriptor_path)
         .bytes(".silo.v1.ByteChunk.data")
+        .bytes(".silo.v1.StdinData.data")
+        .bytes(".silo.v1.GuestProcessStdout.data")
+        .bytes(".silo.v1.GuestProcessStderr.data")
+        .bytes(".silo.v1.GuestProcessTerminalOutput.data")
+        .bytes(".silo.v1.ExecutionStdout.data")
+        .bytes(".silo.v1.ExecutionStderr.data")
+        .bytes(".silo.v1.ExecutionTerminalOutput.data")
         .compile_with_config(
             config,
             &[
                 "proto/common.proto",
+                "proto/execution.proto",
                 "proto/errors.proto",
                 "proto/filesystem.proto",
                 "proto/guest.proto",
+                "proto/guest_process.proto",
                 "proto/vm_monitor.proto",
             ],
             &["proto"],

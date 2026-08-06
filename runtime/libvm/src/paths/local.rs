@@ -5,8 +5,9 @@ use crate::paths::defaults::{
     ensure_run_root, resolve_default_data_dir, resolve_default_run_dir, resolve_default_state_dir,
 };
 use crate::paths::machine::{
-    MachinePaths, LOGS_DIR_NAME, MACHINES_DIR_NAME, NETWORK_AUDIT_LOG_FILE_NAME, NETWORK_DIR_NAME,
-    NETWORK_SERVICE_LOG_FILE_NAME, SERIAL_LOG_FILE_NAME, VMMON_TRACE_LOG_FILE_NAME,
+    MachinePaths, EXEC_LOG_FILE_NAME, LOGS_DIR_NAME, MACHINES_DIR_NAME,
+    NETWORK_AUDIT_LOG_FILE_NAME, NETWORK_DIR_NAME, NETWORK_SERVICE_LOG_FILE_NAME,
+    SERIAL_LOG_FILE_NAME, VMMON_TRACE_LOG_FILE_NAME,
 };
 use crate::paths::network::{NetworkPaths, NETWORKS_DIR_NAME};
 use crate::paths::OwnedDirectory;
@@ -209,6 +210,13 @@ impl LocalPaths {
         Ok(())
     }
 
+    pub(crate) fn machine_logs_directory(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<OwnedDirectory, LibVmError> {
+        self.machine_logs_tree(machine_id)
+    }
+
     pub(crate) fn ensure_machine_network_logs_dir(
         &self,
         machine_id: MachineId,
@@ -278,6 +286,29 @@ impl LocalPaths {
         machine_id: MachineId,
     ) -> Result<Option<File>, LibVmError> {
         self.open_machine_log(machine_id, false, SERIAL_LOG_FILE_NAME)
+    }
+
+    pub(crate) fn open_exec_log(&self, machine_id: MachineId) -> Result<Option<File>, LibVmError> {
+        self.open_machine_log(machine_id, false, EXEC_LOG_FILE_NAME)
+    }
+
+    pub(crate) fn open_exec_log_archive(
+        &self,
+        machine_id: MachineId,
+        generation: u8,
+    ) -> Result<Option<File>, LibVmError> {
+        let name = match generation {
+            1 => "exec.log.1",
+            2 => "exec.log.2",
+            3 => "exec.log.3",
+            _ => {
+                return Err(LibVmError::StateDecode {
+                    field: "exec_log_generation",
+                    message: format!("unsupported exec log archive generation {generation}"),
+                })
+            }
+        };
+        self.open_machine_log(machine_id, false, name)
     }
 
     pub(crate) fn open_network_service_log(
@@ -444,6 +475,12 @@ mod tests {
             PathBuf::from("/tmp/silo-state/logs/machines")
                 .join(machine_id.to_string())
                 .join("network/audit.jsonl")
+        );
+        assert_eq!(
+            machine.exec_log_path(),
+            PathBuf::from("/tmp/silo-state/logs/machines")
+                .join(machine_id.to_string())
+                .join("exec.log")
         );
         assert_eq!(paths.locks_dir(), PathBuf::from("/tmp/silo-run/locks"));
         assert_eq!(

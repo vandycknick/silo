@@ -35,6 +35,12 @@ pub(crate) enum WaitOutcome {
     TimedOut,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadyAgentIdentity {
+    pub(crate) instance_id: uuid::Uuid,
+    pub(crate) boot_id: uuid::Uuid,
+}
+
 #[derive(Debug, Clone)]
 struct Observation<T> {
     received_at: SystemTime,
@@ -85,6 +91,7 @@ pub(crate) struct InstanceStore {
     state: Mutex<State>,
     generation: watch::Sender<u64>,
     identity_reset: watch::Sender<u64>,
+    ready_agent_identity: watch::Sender<Option<ReadyAgentIdentity>>,
 }
 
 impl InstanceStore {
@@ -92,6 +99,7 @@ impl InstanceStore {
         let now = SystemTime::now();
         let (generation, _) = watch::channel(0);
         let (identity_reset, _) = watch::channel(0);
+        let (ready_agent_identity, _) = watch::channel(None);
         let mut state = State {
             machine_id,
             name,
@@ -117,6 +125,7 @@ impl InstanceStore {
             state: Mutex::new(state),
             generation,
             identity_reset,
+            ready_agent_identity,
         }
     }
 
@@ -126,6 +135,30 @@ impl InstanceStore {
 
     pub(crate) fn subscribe_identity_reset(&self) -> watch::Receiver<u64> {
         self.identity_reset.subscribe()
+    }
+
+    pub(crate) fn ready_agent_identity(&self) -> Result<ReadyAgentIdentity, StoreError> {
+        self.state
+            .lock()
+            .map_err(|_| StoreError::Poisoned)
+            .and_then(|state| {
+                ready_agent_identity(&state, Instant::now()).ok_or_else(|| {
+                    StoreError::Protocol("a ready guest agent identity is required".to_string())
+                })
+            })
+    }
+
+    pub(crate) fn is_stopping(&self) -> Result<bool, StoreError> {
+        self.state
+            .lock()
+            .map(|state| state.stopping)
+            .map_err(|_| StoreError::Poisoned)
+    }
+
+    pub(crate) fn subscribe_ready_agent_identity(
+        &self,
+    ) -> watch::Receiver<Option<ReadyAgentIdentity>> {
+        self.ready_agent_identity.subscribe()
     }
 
     pub(crate) fn status(&self) -> Result<HostStatus, StoreError> {
@@ -215,15 +248,15 @@ impl InstanceStore {
 
         self.mutate(|state| {
             if let Some(current) = &state.identity {
-                if current.instance_id != identity.instance_id {
-                    // A new agent instance supersedes every observation from the old one.
+                if current.instance_id != identity.instance_id
+                    || current.boot_id != identity.boot_id
+                {
+                    // A new agent instance or boot supersedes every old observation.
                     state.status = None;
                     state.metrics = None;
-                } else if current.version != identity.version || current.boot_id != identity.boot_id
-                {
+                } else if current.version != identity.version {
                     return Err(StoreError::Protocol(
-                        "agent version or boot ID changed without an instance replacement"
-                            .to_string(),
+                        "agent version changed without an instance replacement".to_string(),
                     ));
                 }
             }
@@ -279,6 +312,8 @@ impl InstanceStore {
             (result, before, after)
         };
         if matches!(result, Err(StoreError::IdentityMismatch)) {
+            self.ready_agent_identity
+                .send_replace(ready_agent_identity_from_snapshot(&after));
             self.generation
                 .send_modify(|generation| *generation = generation.wrapping_add(1));
             self.identity_reset
@@ -303,11 +338,30 @@ impl InstanceStore {
             state.last_log_snapshot = Some(after.clone());
             (before, after)
         };
+        self.ready_agent_identity
+            .send_replace(ready_agent_identity_from_snapshot(&after));
         self.generation
             .send_modify(|generation| *generation = generation.wrapping_add(1));
         log_state_changes(&before, &after);
         Ok(())
     }
+}
+
+fn ready_agent_identity_from_snapshot(snapshot: &StateLogSnapshot) -> Option<ReadyAgentIdentity> {
+    if !snapshot.ready {
+        return None;
+    }
+    let instance_id = snapshot.agent_instance_id.as_deref()?;
+    let boot_id = snapshot.agent_boot_id.as_deref()?;
+    Some(ReadyAgentIdentity {
+        instance_id: uuid::Uuid::parse_str(instance_id).ok()?,
+        boot_id: uuid::Uuid::parse_str(boot_id).ok()?,
+    })
+}
+
+fn ready_agent_identity(state: &State, now: Instant) -> Option<ReadyAgentIdentity> {
+    let snapshot = state_log_snapshot(state, now);
+    ready_agent_identity_from_snapshot(&snapshot)
 }
 
 pub(crate) fn new_instance_store(
@@ -1218,6 +1272,47 @@ mod tests {
             )
             .expect("replacement");
         assert!(store.metrics().expect("metrics").metrics.is_none());
+    }
+
+    #[tokio::test]
+    async fn ready_identity_subscription_observes_instance_and_boot_replacement() {
+        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        store
+            .set_vm_state(VmState::Running, "running")
+            .expect("vm state");
+        let mut identity = store.subscribe_ready_agent_identity();
+        let instance = "00000000-0000-4000-8000-000000000002";
+        store
+            .observe_status(ready_status(instance), Duration::from_secs(15))
+            .expect("first identity");
+        identity
+            .changed()
+            .await
+            .expect("first identity notification");
+        let first = identity
+            .borrow_and_update()
+            .clone()
+            .expect("first identity");
+
+        let mut boot_replacement = ready_status(instance);
+        boot_replacement
+            .identity
+            .as_mut()
+            .expect("identity")
+            .boot_id = Some("00000000-0000-4000-8000-000000000004".to_string());
+        store
+            .observe_status(boot_replacement, Duration::from_secs(15))
+            .expect("boot replacement");
+        identity
+            .changed()
+            .await
+            .expect("boot replacement notification");
+        let replacement = identity
+            .borrow_and_update()
+            .clone()
+            .expect("replacement identity");
+        assert_eq!(first.instance_id, replacement.instance_id);
+        assert_ne!(first.boot_id, replacement.boot_id);
     }
 
     #[test]

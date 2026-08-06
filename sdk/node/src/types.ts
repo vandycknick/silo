@@ -67,8 +67,8 @@ export type Network =
   /** Inspection-only fallback for network kinds this SDK does not know yet. */
   | { kind: "unknown" };
 
-/** Options for a guest command started by `exec`, `spawn`, or `shell`. */
-export interface ExecOptions {
+/** Options for a structured guest process started by `exec`, `spawn`, or `shell`. */
+export interface ExecutionOptions {
   /** Additional argv values appended to the command. */
   args?: string[];
   /** Guest working directory. */
@@ -79,20 +79,16 @@ export interface ExecOptions {
   env?: KeyValueMap;
   /** Command timeout in seconds. */
   timeout?: number;
-  /** Bytes or UTF-8 text sent to stdin, then EOF. */
+  /** Bytes or UTF-8 text sent to input. Pipe mode then receives EOF; PTYs do not. */
   stdin?: Uint8Array | string;
   /** Open a writable stdin pipe. Mutually exclusive with `stdin`. */
   pipeStdin?: boolean;
   /** Request a guest PTY for the command. */
   tty?: boolean;
-  /** Forward the host agent into the guest when supported. */
-  forwardAgent?: boolean;
 }
 
-/** Options for an interactive terminal attachment. */
-export interface AttachOptions {
-  /** Additional argv values for the attached process. */
-  args?: string[];
+/** Options for the SSH-only interactive guest shell. */
+export interface SshShellOptions {
   /** Guest working directory. */
   cwd?: string;
   /** Guest user. */
@@ -103,12 +99,12 @@ export interface AttachOptions {
   term?: string;
   /** Docker-style detach key sequence, for example `ctrl-]` or `ctrl-p,ctrl-q`. */
   detachKeys?: string;
-  /** Forward the host agent into the guest when supported. */
+  /** Forward the host SSH agent into the guest shell. */
   forwardAgent?: boolean;
 }
 
 /** Selects one persisted machine log source. */
-export type MachineLogSource = "monitor" | "serial" | "network" | "networkAudit";
+export type MachineLogSource = "monitor" | "serial" | "exec" | "network" | "networkAudit";
 
 /** Options for reading persisted machine logs. */
 export interface MachineLogOptions {
@@ -129,11 +125,37 @@ export interface MachineLogChunk {
   data: Uint8Array;
 }
 
-/** Guest process exit status. */
-export interface ExitStatus {
-  /** Numeric exit code reported by the guest process. */
+/** Exact terminal result reported by the execution service. */
+export type ExecutionResult =
+  | { kind: "exited"; code?: number }
+  | { kind: "signaled"; signal?: number }
+  | { kind: "launch_failed"; reason: ExecutionLaunchFailureReason; message?: string }
+  | { kind: "lost"; reason: ExecutionLostReason; message?: string };
+
+export type ExecutionLaunchFailureReason =
+  | "unspecified"
+  | "command_not_found"
+  | "invalid_process_spec"
+  | "working_directory_not_found"
+  | "working_directory_not_directory"
+  | "invalid_identity"
+  | "identity_not_found"
+  | "permission_denied"
+  | "spawn_failed"
+  | "cancelled_before_start";
+
+export type ExecutionLostReason =
+  | "unspecified"
+  | "agent_instance_replaced"
+  | "agent_boot_replaced"
+  | "agent_unavailable"
+  | "guest_stream_lost"
+  | "vm_stopped"
+  | "vmmon_exited";
+
+/** Exit status reported by an SSH shell attachment. */
+export interface SshExitStatus {
   code: number;
-  /** True when `code === 0`. */
   success: boolean;
 }
 

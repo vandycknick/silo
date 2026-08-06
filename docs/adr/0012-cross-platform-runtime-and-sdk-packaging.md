@@ -356,12 +356,12 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/silo/
       <machine-id>/
         vm.trace.log
         serial.log
+        exec.log
+        exec.log.{1,2,3}
         vm.exit.json
         network/
           netd.log
           audit.jsonl
-        executions/
-          <machine-run-id>/<execution-id>/ # startup executions
 ```
 
 Ephemeral per-machine process files use the run root:
@@ -387,16 +387,13 @@ changing runtime instance ID owns only its run-root socket, PID, policy, and
 optional capture files, never a durable log directory. `vmmon` and `netd` write
 the durable files; neither provides persisted-log RPCs. `libvm`, including its
 Node binding, reads one semantic source at a time (`monitor`, `serial`,
-`network`, or `network-audit`) without exposing paths or filenames. Snapshot
-reads are finite. Follow reads emit the snapshot, hand off without a byte gap,
-and remain attached while the machine is stopped and across later starts until
-the reader drops the stream.
-
-The execution subtree is reserved for startup-event segments and terminal
-results. It does not record ordinary execution history. Public CLI stream
-values and workload replay map onto the same semantic `libvm` access API. These
-interfaces do not create an additional root, a compatibility reader, or a
-public path configuration surface.
+`exec`, `network`, or `network-audit`) without exposing paths or filenames.
+Snapshot reads are finite. Follow reads emit the snapshot, hand off without a
+byte gap, and remain attached while the machine is stopped and across later
+starts until the reader drops the stream. `exec.log` is bounded, lossy JSON
+Lines output from structured executions, not process history or an
+authoritative result. These interfaces do not create an additional root, a
+compatibility reader, or a public path configuration surface.
 
 Existing SQL migration history and old mutable filesystem layouts are
 unsupported after this breaking release. Silo does not migrate, adopt, or read

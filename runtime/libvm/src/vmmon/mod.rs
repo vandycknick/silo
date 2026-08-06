@@ -16,6 +16,7 @@ pub(crate) mod exit_status;
 mod launch;
 mod launch_spec;
 pub(crate) mod process;
+pub(crate) mod start_request;
 
 pub(crate) use client::VmmonClient;
 pub use client::DEFAULT_GUEST_READINESS_TIMEOUT;

@@ -38,6 +38,8 @@ impl RuntimeContext {
 
 #[derive(Clone)]
 pub struct DaemonContext {
+    pub(crate) machine_id: uuid::Uuid,
+    pub(crate) machine_run_id: uuid::Uuid,
     pub(crate) spec: VmSpec,
     pub(crate) guest_services_enabled: bool,
     pub(crate) machine: VirtualMachine,

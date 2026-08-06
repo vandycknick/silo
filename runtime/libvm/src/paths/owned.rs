@@ -94,6 +94,7 @@ impl OwnedDirectory {
         .map_err(|error| invalid(&path, error))?;
         if created {
             fchmod(&fd, PRIVATE_DIRECTORY_MODE).map_err(|error| invalid(&path, error))?;
+            sync_directory(&self.fd, &self.path)?;
         }
         validate_directory(&fd, &path, true)?;
         Ok(Self { fd, path })
@@ -126,6 +127,7 @@ impl OwnedDirectory {
         .map_err(|error| invalid(&path, error))?;
         fchmod(&fd, PRIVATE_DIRECTORY_MODE).map_err(|error| invalid(&path, error))?;
         validate_directory(&fd, &path, true)?;
+        sync_directory(&self.fd, &self.path)?;
         Ok(Some(Self { fd, path }))
     }
 
@@ -216,8 +218,15 @@ impl OwnedDirectory {
         let mut file = File::from(fd);
         file.write_all(contents)
             .map_err(|error| invalid(&path, error))?;
-        file.sync_all().map_err(|error| invalid(&path, error))
+        file.sync_all().map_err(|error| invalid(&path, error))?;
+        sync_directory(&self.fd, &self.path)
     }
+}
+
+fn sync_directory(fd: &OwnedFd, path: &Path) -> Result<(), LibVmError> {
+    File::from(fd.try_clone().map_err(|error| invalid(path, error))?)
+        .sync_all()
+        .map_err(|error| invalid(path, error))
 }
 
 fn remove_entry(

@@ -54,11 +54,11 @@ export interface NativeMachine {
   start(): Promise<NativeMachineData>;
   stop(): Promise<NativeMachineData>;
   remove(): Promise<void>;
-  exec(program: string, args?: string[], options?: NativeExecOptionsInput): Promise<NativeExecOutput>;
-  spawn(program: string, args?: string[], options?: NativeExecOptionsInput): Promise<NativeExecHandle>;
-  shell(script: string, options?: NativeExecOptionsInput): Promise<NativeExecOutput>;
-  attach(program: string, args?: string[], options?: NativeAttachOptionsInput): Promise<NativeExitStatus>;
-  attachShell(options?: NativeAttachOptionsInput): Promise<NativeExitStatus>;
+  exec(program: string, args?: string[], options?: NativeExecutionOptionsInput): Promise<NativeExecutionOutput>;
+  spawn(program: string, args?: string[], options?: NativeExecutionOptionsInput): Promise<NativeExecutionSession>;
+  shell(script: string, options?: NativeExecutionOptionsInput): Promise<NativeExecutionOutput>;
+  attach(program: string, args?: string[], options?: NativeExecutionOptionsInput): Promise<NativeExecutionResult>;
+  attachShell(options?: NativeSshShellOptionsInput): Promise<NativeSshExitStatus>;
   logs(source: NativeMachineLogSource, options?: NativeMachineLogOptionsInput): Promise<NativeMachineLogHandle>;
 }
 
@@ -71,19 +71,20 @@ export interface NativeImages {
   prune(): Promise<NativeImagePruneReport>;
 }
 
-export interface NativeExecHandle {
-  recv(): Promise<NativeExecEvent | null>;
-  takeStdin(): NativeExecSink | null;
-  wait(): Promise<NativeExitStatus>;
-  collect(): Promise<NativeExecOutput>;
+export interface NativeExecutionSession {
+  recv(): Promise<NativeExecutionEvent | null>;
+  stdin(): NativeExecutionStdin | null;
+  wait(): Promise<NativeExecutionResult>;
+  collect(): Promise<NativeExecutionOutput>;
   signal(signal: number): Promise<void>;
-  kill(): Promise<void>;
-  resize(rows: number, cols: number): Promise<void>;
+  resizePty(rows: number, cols: number): Promise<void>;
+  closeRequests(): void;
+  cancel(): void;
 }
 
-export interface NativeExecSink {
+export interface NativeExecutionStdin {
   write(data: Uint8Array): Promise<void>;
-  close(): void;
+  close(): Promise<void>;
 }
 
 export interface NativeMachineLogHandle {
@@ -184,7 +185,7 @@ export interface NativeNetworkForwardInput {
   tunnel?: string;
 }
 
-export interface NativeExecOptionsInput {
+export interface NativeExecutionOptionsInput {
   args?: string[];
   cwd?: string;
   user?: string;
@@ -193,11 +194,9 @@ export interface NativeExecOptionsInput {
   stdin?: Uint8Array;
   pipeStdin?: boolean;
   tty?: boolean;
-  forwardAgent?: boolean;
 }
 
-export interface NativeAttachOptionsInput {
-  args?: string[];
+export interface NativeSshShellOptionsInput {
   cwd?: string;
   user?: string;
   env?: NativeKeyValue[];
@@ -206,7 +205,7 @@ export interface NativeAttachOptionsInput {
   forwardAgent?: boolean;
 }
 
-export type NativeMachineLogSource = "monitor" | "serial" | "network" | "networkAudit";
+export type NativeMachineLogSource = "monitor" | "serial" | "exec" | "network" | "networkAudit";
 
 export interface NativeMachineLogOptionsInput {
   follow?: boolean;
@@ -249,21 +248,32 @@ export interface NativeNetworkData {
   policyJson?: string | null;
 }
 
-export interface NativeExitStatus {
+export interface NativeExecutionResult {
+  kind: "exited" | "signaled" | "launch_failed" | "lost";
+  code?: number | null;
+  signal?: number | null;
+  reason?: string | null;
+  message?: string | null;
+}
+
+export interface NativeSshExitStatus {
   code: number;
   success: boolean;
 }
 
-export interface NativeExecOutput {
-  status: NativeExitStatus;
+export interface NativeExecutionOutput {
+  result: NativeExecutionResult;
   stdout: Uint8Array;
   stderr: Uint8Array;
+  terminalOutput: Uint8Array;
 }
 
-export interface NativeExecEvent {
-  kind: "started" | "stdout" | "stderr" | "exited" | "failed" | "stdin_error";
+export interface NativeExecutionEvent {
+  kind: "accepted" | "started" | "stdout" | "stderr" | "terminal_output" | "exited" | "signaled" | "launch_failed" | "lost";
   data?: Uint8Array | null;
   code?: number | null;
+  signal?: number | null;
+  reason?: string | null;
   message?: string | null;
 }
 

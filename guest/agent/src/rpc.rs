@@ -17,6 +17,7 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::filesystem::FilesystemService;
+use crate::guest_process::GuestProcessServiceImpl;
 use crate::host::info::get_system_info;
 use crate::metrics;
 
@@ -34,12 +35,18 @@ pub(crate) struct AgentServer {
 #[derive(Clone)]
 struct AgentState {
     instance_id: String,
+    boot_id: String,
+    process_supervisor: crate::pid1::ProcessSupervisor,
     status: watch::Sender<AgentStatus>,
     shutdown: watch::Sender<bool>,
 }
 
 impl AgentServer {
-    pub(crate) async fn start(port: u32, boot: GuestBootReport) -> eyre::Result<Self> {
+    pub(crate) async fn start(
+        port: u32,
+        boot: GuestBootReport,
+        process_supervisor: crate::pid1::ProcessSupervisor,
+    ) -> eyre::Result<Self> {
         let instance_id = Uuid::new_v4().to_string();
         let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .context("read Linux boot ID")?
@@ -48,7 +55,7 @@ impl AgentServer {
         Uuid::parse_str(&boot_id).context("parse Linux boot ID")?;
         let starting = status(
             &instance_id,
-            boot_id,
+            boot_id.clone(),
             AgentStatusState::Starting,
             boot,
             None,
@@ -61,6 +68,8 @@ impl AgentServer {
         let server = Self {
             state: AgentState {
                 instance_id,
+                boot_id,
+                process_supervisor,
                 status: sender,
                 shutdown: shutdown.clone(),
             },
@@ -81,6 +90,7 @@ impl AgentServer {
         let reflection_descriptors = protocol::reflection_descriptor_set(&[
             "silo.v1.GuestAgentService",
             "silo.v1.GuestFilesystemService",
+            "silo.v1.GuestProcessService",
         ])
         .context("filter guest gRPC reflection descriptors")?;
         let reflection = tonic_reflection::server::Builder::configure()
@@ -88,6 +98,7 @@ impl AgentServer {
             .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
             .with_service_name("silo.v1.GuestAgentService")
             .with_service_name("silo.v1.GuestFilesystemService")
+            .with_service_name("silo.v1.GuestProcessService")
             .with_service_name("grpc.health.v1.Health")
             .with_service_name("grpc.reflection.v1.ServerReflection")
             .build_v1()
@@ -125,12 +136,22 @@ impl AgentServer {
             metric_watches: std::sync::Arc::new(Semaphore::new(4)),
         };
         let filesystem = FilesystemService::new("/", self.state.instance_id.clone());
+        let guest_process = GuestProcessServiceImpl::new(
+            self.state.instance_id.clone(),
+            self.state.boot_id.clone(),
+            self.state.process_supervisor.clone(),
+        );
         let (health, health_service) = tonic_health::server::health_reporter();
         health
             .set_serving::<GuestAgentServiceServer<AgentService>>()
             .await;
         health
             .set_serving::<protocol::v1::guest_filesystem_service_server::GuestFilesystemServiceServer<FilesystemService>>()
+            .await;
+        health
+            .set_serving::<protocol::v1::guest_process_service_server::GuestProcessServiceServer<
+                GuestProcessServiceImpl,
+            >>()
             .await;
         health
             .set_service_status(
@@ -151,12 +172,19 @@ impl AgentServer {
                 )
                 .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
                 .max_encoding_message_size(protocol::STRUCTURED_16_MIB);
+            let guest_process =
+                protocol::v1::guest_process_service_server::GuestProcessServiceServer::new(
+                    guest_process,
+                )
+                .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
+                .max_encoding_message_size(protocol::STRUCTURED_16_MIB);
             let result = tonic::transport::Server::builder()
                 .trace_fn(|request| tracing::info_span!("grpc", method = %request.uri()))
                 .add_service(health_service)
                 .add_service(reflection)
                 .add_service(agent)
                 .add_service(filesystem)
+                .add_service(guest_process)
                 .serve_with_incoming_shutdown(ReceiverStream::new(receiver), async move {
                     let mut shutdown_rx = shutdown_rx;
                     while !*shutdown_rx.borrow() {
@@ -181,6 +209,7 @@ impl AgentServer {
                 "",
                 "silo.v1.GuestAgentService",
                 "silo.v1.GuestFilesystemService",
+                "silo.v1.GuestProcessService",
                 "grpc.reflection.v1.ServerReflection",
             ] {
                 health

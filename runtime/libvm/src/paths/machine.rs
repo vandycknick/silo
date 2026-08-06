@@ -1,19 +1,17 @@
 use std::path::{Path, PathBuf};
 
-use uuid::Uuid;
-
 use crate::store::models::MachineId;
 
 pub(super) const MACHINES_DIR_NAME: &str = "machines";
 pub(super) const LOGS_DIR_NAME: &str = "logs";
 pub(super) const NETWORK_DIR_NAME: &str = "network";
-const EXECUTIONS_DIR_NAME: &str = "executions";
 const VM_SPEC_FILE_NAME: &str = "config.json";
 const VMMON_PID_FILE_NAME: &str = "vm.pid";
 const VMMON_SOCKET_FILE_NAME: &str = "vm.sock";
 pub(super) const VMMON_TRACE_LOG_FILE_NAME: &str = "vm.trace.log";
 const VMMON_EXIT_STATUS_FILE_NAME: &str = "vm.exit.json";
 pub(super) const SERIAL_LOG_FILE_NAME: &str = "serial.log";
+pub(super) const EXEC_LOG_FILE_NAME: &str = "exec.log";
 pub(crate) const NETWORK_SERVICE_LOG_FILE_NAME: &str = "netd.log";
 pub(crate) const NETWORK_AUDIT_LOG_FILE_NAME: &str = "audit.jsonl";
 const ROOT_DISK_FILE_NAME: &str = "rootfs.img";
@@ -95,6 +93,17 @@ impl MachinePaths {
         self.logs_dir.join(SERIAL_LOG_FILE_NAME)
     }
 
+    #[cfg(test)]
+    pub(crate) fn exec_log_path(&self) -> PathBuf {
+        self.logs_dir.join(EXEC_LOG_FILE_NAME)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exec_log_archive_path(&self, generation: u8) -> PathBuf {
+        self.logs_dir
+            .join(format!("{EXEC_LOG_FILE_NAME}.{generation}"))
+    }
+
     pub(crate) fn network_logs_dir(&self) -> PathBuf {
         self.logs_dir.join(NETWORK_DIR_NAME)
     }
@@ -106,17 +115,6 @@ impl MachinePaths {
     #[cfg(test)]
     pub(crate) fn network_audit_log_path(&self) -> PathBuf {
         self.network_logs_dir().join(NETWORK_AUDIT_LOG_FILE_NAME)
-    }
-
-    pub(crate) fn executions_dir(&self) -> PathBuf {
-        self.logs_dir.join(EXECUTIONS_DIR_NAME)
-    }
-
-    #[allow(dead_code, reason = "reserved for card 119 startup execution storage")]
-    pub(crate) fn execution_dir(&self, machine_run_id: Uuid, execution_id: Uuid) -> PathBuf {
-        self.executions_dir()
-            .join(machine_run_id.simple().to_string())
-            .join(execution_id.simple().to_string())
     }
 }
 
@@ -198,6 +196,18 @@ mod tests {
                 .join("serial.log")
         );
         assert_eq!(
+            paths.exec_log_path(),
+            PathBuf::from("/tmp/silo-state/logs/machines")
+                .join(&id)
+                .join("exec.log")
+        );
+        assert_eq!(
+            paths.exec_log_archive_path(3),
+            PathBuf::from("/tmp/silo-state/logs/machines")
+                .join(&id)
+                .join("exec.log.3")
+        );
+        assert_eq!(
             paths.network_service_log_path(),
             PathBuf::from("/tmp/silo-state/logs/machines")
                 .join(&id)
@@ -208,17 +218,6 @@ mod tests {
             PathBuf::from("/tmp/silo-state/logs/machines")
                 .join(&id)
                 .join("network/audit.jsonl")
-        );
-        let machine_run_id =
-            Uuid::parse_str("a7c67871-61eb-4eec-a3f5-1ef3e479270e").expect("machine run id");
-        let execution_id =
-            Uuid::parse_str("8a36bd9b-b124-46af-99b5-7880ef1911b9").expect("execution id");
-        assert_eq!(
-            paths.execution_dir(machine_run_id, execution_id),
-            PathBuf::from("/tmp/silo-state/logs/machines")
-                .join(id)
-                .join("executions/a7c6787161eb4eeca3f51ef3e479270e")
-                .join("8a36bd9bb12446af99b57880ef1911b9")
         );
         assert_eq!(root_disk_relative_path(), PathBuf::from("rootfs.img"));
     }

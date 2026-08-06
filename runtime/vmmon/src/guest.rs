@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use hyper_util::rt::TokioIo;
 use protocol::v1::guest_agent_service_client::GuestAgentServiceClient;
+use protocol::v1::guest_process_service_client::GuestProcessServiceClient;
 use protocol::v1::{WatchAgentMetricsRequest, WatchAgentStatusRequest};
 use rand::RngExt;
 use tokio::task::JoinHandle;
@@ -399,6 +400,14 @@ async fn connect(machine: &VirtualMachine) -> Result<Channel, tonic::Status> {
         }))
         .await
         .map_err(|error| tonic::Status::unavailable(error.to_string()))
+}
+
+pub(crate) async fn process_client(
+    machine: &VirtualMachine,
+) -> Result<GuestProcessServiceClient<Channel>, tonic::Status> {
+    Ok(GuestProcessServiceClient::new(connect(machine).await?)
+        .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
+        .max_encoding_message_size(protocol::STRUCTURED_16_MIB))
 }
 
 fn duration(value: Duration) -> prost_types::Duration {

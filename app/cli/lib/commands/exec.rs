@@ -16,10 +16,6 @@ pub struct Cmd {
     #[arg(long, short = 'u')]
     pub user: Option<String>,
 
-    /// Forward the host SSH agent into the guest command.
-    #[arg(long, short = 'A')]
-    pub forward_agent: bool,
-
     /// Attach a TTY to the guest command.
     #[arg(long, short = 't')]
     pub tty: bool,
@@ -42,23 +38,70 @@ impl Cmd {
         ensure_guest_ready(&inspect_data)?;
 
         let status = if self.tty {
-            guest::attach_command(
-                &machine,
-                self.user.as_deref(),
-                &self.command,
-                self.forward_agent,
-            )
-            .await?
+            guest::attach_command(&machine, self.user.as_deref(), &self.command).await?
         } else {
-            guest::run_command_streaming(
-                &machine,
-                self.user.as_deref(),
-                &self.command,
-                self.forward_agent,
-            )
-            .await?
+            guest::run_command_streaming(&machine, self.user.as_deref(), &self.command).await?
         };
-        std::process::exit(status.code);
+        if let Some(message) = execution_failure_message(&status) {
+            eprintln!("{} {message}", crate::ui::error_label());
+        }
+        std::process::exit(execution_exit_code(status));
+    }
+}
+
+fn execution_failure_message(result: &libvm::ExecutionResult) -> Option<String> {
+    match result {
+        libvm::ExecutionResult::LaunchFailed(failure) => {
+            let reason = match failure.reason {
+                libvm::ExecutionLaunchFailureReason::Unspecified => "unspecified launch failure",
+                libvm::ExecutionLaunchFailureReason::CommandNotFound => "command not found",
+                libvm::ExecutionLaunchFailureReason::InvalidProcessSpec => {
+                    "invalid process specification"
+                }
+                libvm::ExecutionLaunchFailureReason::WorkingDirectoryNotFound => {
+                    "working directory not found"
+                }
+                libvm::ExecutionLaunchFailureReason::WorkingDirectoryNotDirectory => {
+                    "working directory is not a directory"
+                }
+                libvm::ExecutionLaunchFailureReason::InvalidIdentity => "invalid user or group",
+                libvm::ExecutionLaunchFailureReason::IdentityNotFound => "user or group not found",
+                libvm::ExecutionLaunchFailureReason::PermissionDenied => "permission denied",
+                libvm::ExecutionLaunchFailureReason::SpawnFailed => "process spawn failed",
+                libvm::ExecutionLaunchFailureReason::CancelledBeforeStart => {
+                    "cancelled before start"
+                }
+            };
+            Some(match failure.message.as_deref() {
+                Some(message) => format!("guest command launch failed ({reason}): {message}"),
+                None => format!("guest command launch failed ({reason})"),
+            })
+        }
+        libvm::ExecutionResult::Lost(lost) => Some(match lost.message.as_deref() {
+            Some(message) => format!("guest command was lost: {message}"),
+            None => format!("guest command was lost ({:?})", lost.reason),
+        }),
+        libvm::ExecutionResult::Exited { .. } | libvm::ExecutionResult::Signaled { .. } => None,
+    }
+}
+
+fn execution_exit_code(result: libvm::ExecutionResult) -> i32 {
+    match result {
+        libvm::ExecutionResult::Exited { code: Some(code) } => {
+            i32::try_from(code).map_or(125, |code| code)
+        }
+        libvm::ExecutionResult::Exited { code: None }
+        | libvm::ExecutionResult::Signaled { signal: None }
+        | libvm::ExecutionResult::Lost(_) => 125,
+        libvm::ExecutionResult::Signaled {
+            signal: Some(signal),
+        } => i32::try_from(128_u32.saturating_add(signal)).map_or(125, |code| code),
+        libvm::ExecutionResult::LaunchFailed(failure)
+            if failure.reason == libvm::ExecutionLaunchFailureReason::CommandNotFound =>
+        {
+            127
+        }
+        libvm::ExecutionResult::LaunchFailed(_) => 126,
     }
 }
 
@@ -92,6 +135,7 @@ mod tests {
     use clap::Parser;
 
     use crate::app::Cli;
+    use crate::commands::exec::{execution_exit_code, execution_failure_message};
     use crate::commands::Command;
 
     #[test]
@@ -113,7 +157,6 @@ mod tests {
         };
 
         assert_eq!(exec.name.as_deref(), Some("arch"));
-        assert!(!exec.forward_agent);
         assert!(!exec.tty);
         assert_eq!(
             exec.command,
@@ -136,38 +179,77 @@ mod tests {
         };
 
         assert_eq!(exec.name, None);
-        assert!(!exec.forward_agent);
         assert!(!exec.tty);
         assert_eq!(exec.command, vec!["make".to_string(), "kernel".to_string()]);
     }
 
     #[test]
-    fn exec_command_parses_forward_agent() {
-        let cli = Cli::try_parse_from(["silo", "exec", "-A", "arch", "--", "git", "fetch"])
-            .expect("exec command should parse");
-
-        let Command::Exec(exec) = cli.command else {
-            panic!("expected exec command");
-        };
-
-        assert_eq!(exec.name.as_deref(), Some("arch"));
-        assert!(exec.forward_agent);
-        assert!(!exec.tty);
-        assert_eq!(exec.command, vec!["git".to_string(), "fetch".to_string()]);
+    fn exec_command_rejects_ssh_agent_forwarding() {
+        assert!(Cli::try_parse_from(["silo", "exec", "-A", "arch", "--", "git", "fetch"]).is_err());
     }
 
     #[test]
-    fn exec_command_parses_tty_and_forward_agent() {
-        let cli = Cli::try_parse_from(["silo", "exec", "-A", "-t", "dev", "--", "opencode"])
-            .expect("exec command should parse");
+    fn execution_results_use_the_documented_cli_exit_codes() {
+        assert_eq!(
+            execution_exit_code(libvm::ExecutionResult::Exited { code: Some(42) }),
+            42
+        );
+        assert_eq!(
+            execution_exit_code(libvm::ExecutionResult::Signaled { signal: Some(15) }),
+            143
+        );
+        assert_eq!(
+            execution_exit_code(libvm::ExecutionResult::LaunchFailed(
+                libvm::ExecutionLaunchFailure {
+                    reason: libvm::ExecutionLaunchFailureReason::CommandNotFound,
+                    message: None,
+                }
+            )),
+            127
+        );
+        assert_eq!(
+            execution_exit_code(libvm::ExecutionResult::LaunchFailed(
+                libvm::ExecutionLaunchFailure {
+                    reason: libvm::ExecutionLaunchFailureReason::SpawnFailed,
+                    message: None,
+                }
+            )),
+            126
+        );
+        assert_eq!(
+            execution_exit_code(libvm::ExecutionResult::Lost(libvm::ExecutionLost {
+                reason: libvm::ExecutionLostReason::GuestStreamLost,
+                message: None,
+            })),
+            125
+        );
+    }
 
-        let Command::Exec(exec) = cli.command else {
-            panic!("expected exec command");
-        };
+    #[test]
+    fn launch_failures_and_lost_executions_have_stderr_messages() {
+        let launch_failure = libvm::ExecutionResult::LaunchFailed(libvm::ExecutionLaunchFailure {
+            reason: libvm::ExecutionLaunchFailureReason::IdentityNotFound,
+            message: Some("user `nickvd` was not found".to_string()),
+        });
+        assert_eq!(
+            execution_failure_message(&launch_failure).as_deref(),
+            Some(
+                "guest command launch failed (user or group not found): user `nickvd` was not found"
+            )
+        );
 
-        assert_eq!(exec.name.as_deref(), Some("dev"));
-        assert!(exec.forward_agent);
-        assert!(exec.tty);
-        assert_eq!(exec.command, vec!["opencode".to_string()]);
+        let lost = libvm::ExecutionResult::Lost(libvm::ExecutionLost {
+            reason: libvm::ExecutionLostReason::AgentUnavailable,
+            message: Some("guest agent is no longer ready".to_string()),
+        });
+        assert_eq!(
+            execution_failure_message(&lost).as_deref(),
+            Some("guest command was lost: guest agent is no longer ready")
+        );
+
+        assert_eq!(
+            execution_failure_message(&libvm::ExecutionResult::Exited { code: Some(1) }),
+            None
+        );
     }
 }

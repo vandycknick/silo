@@ -73,6 +73,10 @@ async fn graceful_stop(ctx: &DaemonContext) -> eyre::Result<bool> {
 }
 
 async fn drain(handles: &mut ServiceHandles, machine: &virt::VirtualMachine) {
+    if let Some(task) = handles.startup_command.take() {
+        drain_task(task, "startup command supervisor").await;
+    }
+
     if let Some(task) = handles.guest_monitor.take() {
         drain_task(task, "guest monitor").await;
     }

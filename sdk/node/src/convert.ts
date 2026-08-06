@@ -1,7 +1,7 @@
 import type {
-  NativeAttachOptionsInput,
-  NativeExecEvent,
-  NativeExecOptionsInput,
+  NativeExecutionEvent,
+  NativeExecutionOptionsInput,
+  NativeExecutionResult,
   NativeImageDetail,
   NativeImageHandle,
   NativeImageLayerDetail,
@@ -13,10 +13,13 @@ import type {
   NativeNetworkData,
   NativeNetworkInput,
   NativeRuntimeOpenOptions,
+  NativeSshShellOptionsInput,
 } from "./internal/napi.js";
 import type {
-  AttachOptions,
-  ExecOptions,
+  ExecutionOptions,
+  ExecutionLaunchFailureReason,
+  ExecutionLostReason,
+  ExecutionResult,
   ImageDetail,
   ImageHandle,
   ImageLayerDetail,
@@ -27,6 +30,7 @@ import type {
   Mount,
   Network,
   RuntimeOpenOptions,
+  SshShellOptions,
 } from "./types.js";
 import {
   assertBoolean,
@@ -49,10 +53,10 @@ export function runtimeOptionsToNative(options?: RuntimeOpenOptions): NativeRunt
   };
 }
 
-export function mapToKeyValues(value?: KeyValueMap): NativeKeyValue[] | undefined {
+export function mapToKeyValues(value?: unknown): NativeKeyValue[] | undefined {
   if (!value) return undefined;
   const record = assertRecord(value, "value");
-  return Object.entries(record).map(([key, entryValue]) => ({ key, value: entryValue as string }));
+  return Object.entries(record).map(([key, entryValue]) => ({ key, value: assertString(entryValue, `value.${key}`) }));
 }
 
 export function keyValuesToMap(values: NativeKeyValue[]): KeyValueMap {
@@ -64,9 +68,9 @@ export function mountsToNative(mounts: Mount[]): NativeMountInput[] {
   return mounts.map((mount, index) => {
     const record = assertRecord(mount, `mounts[${index}]`);
     return {
-      source: record.source as string,
-      tag: record.tag as string,
-      readOnly: record.readOnly as boolean | undefined,
+      source: assertNonEmptyString(record.source, `mounts[${index}].source`),
+      tag: assertNonEmptyString(record.tag, `mounts[${index}].tag`),
+      readOnly: optionalBoolean(record.readOnly, `mounts[${index}].readOnly`),
     };
   });
 }
@@ -133,7 +137,7 @@ export function machineDataFromNative(data: NativeMachineData): MachineData {
   };
 }
 
-export function execOptionsToNative(options?: ExecOptions): NativeExecOptionsInput | undefined {
+export function executionOptionsToNative(options?: ExecutionOptions): NativeExecutionOptionsInput | undefined {
   if (!options) return undefined;
   const record = assertRecord(options, "options");
   const stdin = optionalStdin(record.stdin, "options.stdin");
@@ -145,25 +149,23 @@ export function execOptionsToNative(options?: ExecOptions): NativeExecOptionsInp
     args: optionalStringArray(record.args, "options.args"),
     cwd: optionalString(record.cwd, "options.cwd"),
     user: optionalString(record.user, "options.user"),
-    env: record.env === undefined ? undefined : mapToKeyValues(record.env as KeyValueMap),
+    env: record.env === undefined ? undefined : mapToKeyValues(record.env),
     timeout: optionalPositiveInteger(record.timeout, "options.timeout"),
     stdin,
     pipeStdin,
     tty: optionalBoolean(record.tty, "options.tty"),
-    forwardAgent: optionalBoolean(record.forwardAgent, "options.forwardAgent"),
   };
 }
 
-export function attachOptionsToNative(options?: AttachOptions): NativeAttachOptionsInput | undefined {
+export function sshShellOptionsToNative(options?: SshShellOptions): NativeSshShellOptionsInput | undefined {
   if (!options) return undefined;
   const record = assertRecord(options, "options");
   return {
-    args: optionalStringArray(record.args, "options.args"),
     cwd: optionalString(record.cwd, "options.cwd"),
     user: optionalString(record.user, "options.user"),
-    env: record.env === undefined ? undefined : mapToKeyValues(record.env as KeyValueMap),
-    term: optionalNonEmptyString(record.term, "options.term"),
-    detachKeys: optionalNonEmptyString(record.detachKeys, "options.detachKeys"),
+    env: record.env === undefined ? undefined : mapToKeyValues(record.env),
+    term: optionalString(record.term, "options.term"),
+    detachKeys: optionalString(record.detachKeys, "options.detachKeys"),
     forwardAgent: optionalBoolean(record.forwardAgent, "options.forwardAgent"),
   };
 }
@@ -200,26 +202,94 @@ export function imagePruneReportFromNative(report: NativeImagePruneReport): Imag
   };
 }
 
-export type ExecEvent =
+export type ExecutionEvent =
+  | { kind: "accepted" }
   | { kind: "started" }
   | { kind: "stdout"; data: Uint8Array }
   | { kind: "stderr"; data: Uint8Array }
-  | { kind: "exited"; code: number }
-  | { kind: "failed"; message: string }
-  | { kind: "stdin_error"; message: string };
+  | { kind: "terminal_output"; data: Uint8Array }
+  | ExecutionResult;
 
-export function execEventFromNative(event: NativeExecEvent): ExecEvent {
+export function executionEventFromNative(event: NativeExecutionEvent): ExecutionEvent {
   switch (event.kind) {
     case "stdout":
     case "stderr":
+    case "terminal_output":
       return { kind: event.kind, data: assertUint8Array(event.data, `exec event ${event.kind}.data`) };
     case "exited":
-      return { kind: "exited", code: assertExitCode(event.code, "exec event exited.code") };
-    case "failed":
-    case "stdin_error":
-      return { kind: event.kind, message: assertString(event.message, `exec event ${event.kind}.message`) };
+    case "signaled":
+    case "launch_failed":
+    case "lost":
+      return executionResultFromFields(event.kind, event.code, event.signal, event.reason, event.message);
+    case "accepted":
     case "started":
-      return { kind: "started" };
+      return { kind: event.kind };
+  }
+}
+
+export function executionResultFromNative(result: NativeExecutionResult): ExecutionResult {
+  return executionResultFromFields(result.kind, result.code, result.signal, result.reason, result.message);
+}
+
+function executionResultFromFields(
+  kind: ExecutionResult["kind"],
+  code: number | null | undefined,
+  signal: number | null | undefined,
+  reason: string | null | undefined,
+  message: string | null | undefined,
+): ExecutionResult {
+  switch (kind) {
+    case "exited":
+      return { kind: "exited", code: code === undefined || code === null ? undefined : assertExitCode(code, "execution result code") };
+    case "signaled":
+      return { kind: "signaled", signal: signal === undefined || signal === null ? undefined : assertPositiveInteger(signal, "execution result signal") };
+    case "launch_failed":
+      return {
+        kind: "launch_failed",
+        reason: executionLaunchFailureReason(reason),
+        message: message === undefined || message === null ? undefined : assertString(message, "execution result message"),
+      };
+    case "lost":
+      return {
+        kind: "lost",
+        reason: executionLostReason(reason),
+        message: message === undefined || message === null ? undefined : assertString(message, "execution result message"),
+      };
+  }
+}
+
+function executionLaunchFailureReason(value: unknown): ExecutionLaunchFailureReason {
+  const reason = assertString(value, "execution launch failure reason");
+  switch (reason) {
+    case "unspecified":
+    case "command_not_found":
+    case "invalid_process_spec":
+    case "working_directory_not_found":
+    case "working_directory_not_directory":
+    case "invalid_identity":
+    case "identity_not_found":
+    case "permission_denied":
+    case "spawn_failed":
+    case "cancelled_before_start":
+      return reason;
+    default:
+      throw new TypeError(`unsupported execution launch failure reason ${JSON.stringify(reason)}`);
+  }
+}
+
+function executionLostReason(value: unknown): ExecutionLostReason {
+  const reason = assertString(value, "execution lost reason");
+  switch (reason) {
+    case "unspecified":
+    case "agent_instance_replaced":
+    case "agent_boot_replaced":
+    case "agent_unavailable":
+    case "guest_stream_lost":
+    case "vm_stopped":
+    case "vmmon_exited":
+      return reason;
+    default:
+      throw new TypeError(`unsupported execution lost reason ${JSON.stringify(reason)}`);
   }
 }
 

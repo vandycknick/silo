@@ -5,11 +5,12 @@ use std::time::Duration;
 use hyper_util::rt::TokioIo;
 use protocol::v1::guest_filesystem_service_client::GuestFilesystemServiceClient;
 use protocol::v1::vm_access_service_client::VmAccessServiceClient;
+use protocol::v1::vm_execution_service_client::VmExecutionServiceClient;
 use protocol::v1::vm_monitor_service_client::VmMonitorServiceClient;
 use protocol::v1::{
-    CreateDirectoryRequest, DownloadFileRequest, GetEntryRequest, GetMetricsRequest,
-    GetStatusRequest, HostMetrics, HostStatus, ListDirectoryRequest, RemoveEntryRequest,
-    UploadFileRequest, WaitReadyRequest, WaitReadyResponse,
+    CreateDirectoryRequest, DownloadFileRequest, ExecuteInput, ExecutionEvent, GetEntryRequest,
+    GetMetricsRequest, GetStatusRequest, HostMetrics, HostStatus, ListDirectoryRequest,
+    RemoveEntryRequest, UploadFileRequest, WaitReadyRequest, WaitReadyResponse,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -169,6 +170,18 @@ impl VmmonClient {
         .map_err(|error| rpc_error("open SSH RPC failed", error))
     }
 
+    pub(crate) async fn execute(
+        &self,
+        requests: ReceiverStream<ExecuteInput>,
+    ) -> Result<tonic::Streaming<ExecutionEvent>, String> {
+        let mut client = execution_client(self.channel().await?);
+        client
+            .execute(Request::new(requests))
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|error| rpc_error("execute RPC failed", error))
+    }
+
     async fn channel(&self) -> Result<Channel, String> {
         let socket_path = self.socket_path.clone();
         let connector = service_fn(move |_| {
@@ -207,6 +220,12 @@ fn access_client(channel: Channel) -> VmAccessServiceClient<Channel> {
 
 fn filesystem_client(channel: Channel) -> GuestFilesystemServiceClient<Channel> {
     GuestFilesystemServiceClient::new(channel)
+        .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
+        .max_encoding_message_size(protocol::STRUCTURED_16_MIB)
+}
+
+fn execution_client(channel: Channel) -> VmExecutionServiceClient<Channel> {
+    VmExecutionServiceClient::new(channel)
         .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
         .max_encoding_message_size(protocol::STRUCTURED_16_MIB)
 }

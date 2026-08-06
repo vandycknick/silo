@@ -7,6 +7,7 @@ use agent_spec::SSH_VSOCK_PORT;
 use eyre::Context;
 use futures::{Stream, StreamExt};
 use protocol::v1::vm_access_service_server::{VmAccessService, VmAccessServiceServer};
+use protocol::v1::vm_execution_service_server::VmExecutionServiceServer;
 use protocol::v1::vm_monitor_service_server::{VmMonitorService, VmMonitorServiceServer};
 use protocol::v1::{
     ByteChunk, GetMetricsRequest, GetStatusRequest, HostMetrics, HostStatus, WaitReadyOutcome,
@@ -24,6 +25,7 @@ use virt::{SerialAccess, SerialConsole, SerialStream, VirtualMachine};
 
 use crate::context::{DaemonContext, RuntimeContext};
 use crate::endpoints::start_endpoint_supervisor;
+use crate::execution::ExecutionService;
 use crate::guest::spawn_guest_services;
 use crate::startup::SyncReporter;
 use crate::state::{InstanceStore, StoreError, WaitOutcome};
@@ -43,6 +45,7 @@ pub struct ServiceHandles {
     pub(crate) endpoint_supervisor: Option<JoinHandle<()>>,
     pub(crate) health: HealthReporter,
     pub(crate) server_shutdown: CancellationToken,
+    pub(crate) startup_command: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -206,6 +209,7 @@ impl ServiceHandles {
     pub(crate) async fn mark_stopping(&self) {
         for service in [
             "silo.v1.VmAccessService",
+            "silo.v1.VmExecutionService",
             "silo.v1.GuestFilesystemService",
             "grpc.reflection.v1.ServerReflection",
         ] {
@@ -232,6 +236,8 @@ impl ServiceHandles {
 pub async fn start_services(
     runtime: &RuntimeContext,
     ctx: &DaemonContext,
+    startup_command: Option<crate::start_request::StartupCommand>,
+    exec_log: Option<crate::exec_log::ExecLogWriter>,
     sync_reporter: &mut SyncReporter,
 ) -> eyre::Result<ServiceHandles> {
     let path = runtime.socket().to_path_buf();
@@ -250,6 +256,9 @@ pub async fn start_services(
         .set_serving::<VmAccessServiceServer<AccessService>>()
         .await;
     health
+        .set_serving::<VmExecutionServiceServer<ExecutionService>>()
+        .await;
+    health
         .set_serving::<protocol::v1::guest_filesystem_service_server::GuestFilesystemServiceServer<
             FilesystemProxy,
         >>()
@@ -266,6 +275,7 @@ pub async fn start_services(
     let reflection_descriptors = protocol::reflection_descriptor_set(&[
         "silo.v1.VmMonitorService",
         "silo.v1.VmAccessService",
+        "silo.v1.VmExecutionService",
         "silo.v1.GuestFilesystemService",
     ])
     .context("filter host gRPC reflection descriptors")?;
@@ -274,6 +284,7 @@ pub async fn start_services(
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .with_service_name("silo.v1.VmMonitorService")
         .with_service_name("silo.v1.VmAccessService")
+        .with_service_name("silo.v1.VmExecutionService")
         .with_service_name("silo.v1.GuestFilesystemService")
         .with_service_name("grpc.health.v1.Health")
         .with_service_name("grpc.reflection.v1.ServerReflection")
@@ -292,12 +303,16 @@ pub async fn start_services(
         shutdown: ctx.shutdown.clone(),
         ssh_capacity: Arc::new(Semaphore::new(32)),
     };
+    let execution = ExecutionService::new(ctx, exec_log.clone());
     let filesystem = FilesystemProxy::new(ctx.machine.clone(), ctx.shutdown.clone());
     let control_socket = tokio::spawn(async move {
         let monitor = VmMonitorServiceServer::new(monitor)
             .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
             .max_encoding_message_size(protocol::STRUCTURED_16_MIB);
         let access = VmAccessServiceServer::new(access)
+            .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
+            .max_encoding_message_size(protocol::STRUCTURED_16_MIB);
+        let execution = VmExecutionServiceServer::new(execution)
             .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
             .max_encoding_message_size(protocol::STRUCTURED_16_MIB);
         let filesystem =
@@ -345,6 +360,7 @@ pub async fn start_services(
             .add_service(reflection)
             .add_service(monitor)
             .add_service(access)
+            .add_service(execution)
             .add_service(filesystem)
             .serve_with_incoming_shutdown(incoming, server_shutdown_signal.cancelled())
             .await
@@ -355,6 +371,40 @@ pub async fn start_services(
         Some(spawn_guest_services(&ctx.machine, ctx.store.clone(), ctx.shutdown.clone()).await?)
     } else {
         None
+    };
+    if let Some(exec_log) = &exec_log {
+        exec_log.generation(
+            &ctx.machine_id.hyphenated().to_string(),
+            &ctx.machine_run_id.hyphenated().to_string(),
+            "started",
+        );
+    }
+    let startup_command = startup_command
+        .map(|command| crate::execution::spawn_startup_command(ctx, command, exec_log));
+    let startup_command = match startup_command {
+        Some(crate::execution::StartupCommandHandle { task, started }) => match started.await {
+            Ok(Ok(())) => Some(task),
+            Ok(Err(error)) => {
+                let _ = task.await;
+                if let crate::execution::StartupCommandStartError::LaunchFailed {
+                    reason,
+                    message,
+                } = &error
+                {
+                    sync_reporter.report_startup_command_launch_failed(*reason, Some(message))?;
+                }
+                return Err(eyre::eyre!(
+                    "startup command failed before Started: {error}"
+                ));
+            }
+            Err(_) => {
+                let _ = task.await;
+                return Err(eyre::eyre!(
+                    "startup command supervisor ended before reporting Started"
+                ));
+            }
+        },
+        None => None,
     };
     let endpoint_supervisor = start_endpoint_supervisor(ctx.clone(), runtime.dir().to_path_buf());
     tracing::info!(
@@ -369,6 +419,7 @@ pub async fn start_services(
         endpoint_supervisor,
         health,
         server_shutdown,
+        startup_command,
     })
 }
 

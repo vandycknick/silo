@@ -3,6 +3,7 @@ compile_error!("silo-agent only supports Linux guests");
 
 mod filesystem;
 mod forward;
+mod guest_process;
 mod handoff;
 mod host;
 mod metrics;
@@ -149,7 +150,12 @@ async fn run_agent(
     tracing::info!(boot_mode = ?boot_mode, "agent starting");
 
     let boot_report = boot_mode.report();
-    let agent_server = AgentServer::start(from_kernel_cmdline(), boot_report.clone()).await?;
+    let agent_server = AgentServer::start(
+        from_kernel_cmdline(),
+        boot_report.clone(),
+        process_supervisor.clone(),
+    )
+    .await?;
     let provision_report = match run_provisioning(
         &agent_config.provision,
         &agent_config.ssh,

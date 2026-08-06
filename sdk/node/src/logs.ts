@@ -12,11 +12,12 @@ export function machineLogSourceToNative(source: unknown): NativeMachineLogSourc
   switch (source) {
     case "monitor":
     case "serial":
+    case "exec":
     case "network":
     case "networkAudit":
       return source;
     default:
-      throw new TypeError("source must be monitor, serial, network, or networkAudit");
+      throw new TypeError("source must be monitor, serial, exec, network, or networkAudit");
   }
 }
 

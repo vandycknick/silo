@@ -73,11 +73,11 @@ for await (const chunk of await machine.logs("monitor", { follow: true })) {
 }
 ```
 
-The supported sources are `"monitor"`, `"serial"`, `"network"`, and
-`"networkAudit"`. Chunks preserve bytes in `Uint8Array` and identify an output
-channel. Current machine-owned sources use `"stdout"`; `"stderr"` is reserved
-for future workload replay. Network sources reject machines without private
-networking.
+The supported sources are `"monitor"`, `"serial"`, `"exec"`, `"network"`, and
+`"networkAudit"`. Chunks preserve bytes in `Uint8Array` and identify a transport
+output channel. The `"exec"` source is bounded, best-effort JSON Lines output,
+not a process attachment or authoritative execution result. Network sources
+reject machines without private networking.
 
 Without `follow`, the stream is a finite snapshot. With `follow: true`, it
 emits the same snapshot then appended bytes without a handoff gap. The stream
@@ -85,6 +85,6 @@ remains attached while the machine is stopped and across later starts until the
 reader closes it. Async iteration closes automatically, including when a
 `for await` loop exits early. Code that calls `recv()` directly must call
 `close()` when it is finished. Filesystem paths, offsets, and retained log names
-are intentionally not part of the Node API. Card 119 reserves durable startup
-execution storage, and card 120 will add public source mapping without changing
-this boundary.
+are intentionally not part of the Node API. Detached startup commands and
+ordinary structured executions both contribute output to the same lossy,
+bounded `"exec"` source without creating process history or a durable result.

@@ -1,14 +1,15 @@
 import type { NativeMachine, NativeMachineBuilder } from "./internal/napi.js";
 import {
-    attachOptionsToNative,
-    execOptionsToNative,
+    executionOptionsToNative,
+    executionResultFromNative,
     imageSourceToNative,
     machineDataFromNative,
     mapToKeyValues,
     mountsToNative,
+    sshShellOptionsToNative,
 } from "./convert.js";
 import { mapNativePromise } from "./errors.js";
-import { ExecHandle, ExecOutput } from "./exec.js";
+import { ExecutionOutput, ExecutionSession } from "./exec.js";
 import {
     MachineLogStream,
     machineLogOptionsToNative,
@@ -16,15 +17,16 @@ import {
 } from "./logs.js";
 import { MachineNetworkBuilder, type MachineNetworkBuilderCallback } from "./network.js";
 import type {
-    AttachOptions,
-    ExecOptions,
-    ExitStatus,
+    ExecutionOptions,
+    ExecutionResult,
     ImageSource,
     KeyValueMap,
     MachineData,
     MachineLogOptions,
     MachineLogSource,
     Mount,
+    SshExitStatus,
+    SshShellOptions,
 } from "./types.js";
 import {
     assertBoolean,
@@ -254,14 +256,14 @@ export class Machine {
     async exec(
         program: string,
         args: string[] = [],
-        options?: ExecOptions,
-    ): Promise<ExecOutput> {
-        return new ExecOutput(
+        options?: ExecutionOptions,
+    ): Promise<ExecutionOutput> {
+        return new ExecutionOutput(
             await mapNativePromise(
                 this.native.exec(
                     assertNonEmptyString(program, "program"),
                     assertStringArray(args, "args"),
-                    execOptionsToNative(options),
+                    executionOptionsToNative(options),
                 ),
             ),
         );
@@ -271,50 +273,51 @@ export class Machine {
     async spawn(
         program: string,
         args: string[] = [],
-        options?: ExecOptions,
-    ): Promise<ExecHandle> {
-        return new ExecHandle(
+        options?: ExecutionOptions,
+    ): Promise<ExecutionSession> {
+        return new ExecutionSession(
             await mapNativePromise(
                 this.native.spawn(
                     assertNonEmptyString(program, "program"),
                     assertStringArray(args, "args"),
-                    execOptionsToNative(options),
+                    executionOptionsToNative(options),
                 ),
             ),
         );
     }
 
     /** Run a script through the guest shell and capture output. */
-    async shell(script: string, options?: ExecOptions): Promise<ExecOutput> {
-        return new ExecOutput(
+    async shell(script: string, options?: ExecutionOptions): Promise<ExecutionOutput> {
+        return new ExecutionOutput(
             await mapNativePromise(
                 this.native.shell(
                     assertString(script, "script"),
-                    execOptionsToNative(options),
+                    executionOptionsToNative(options),
                 ),
             ),
         );
     }
 
-    /** Attach the current terminal to an interactive guest process. */
+    /** Attach the current terminal to an interactive structured guest process. */
     async attach(
         program: string,
         args: string[] = [],
-        options?: AttachOptions,
-    ): Promise<ExitStatus> {
-        return await mapNativePromise(
-            this.native.attach(
+        options?: ExecutionOptions,
+    ): Promise<ExecutionResult> {
+        return executionResultFromNative(
+            await mapNativePromise(this.native.attach(
                 assertNonEmptyString(program, "program"),
                 assertStringArray(args, "args"),
-                attachOptionsToNative(options),
-            ),
+                executionOptionsToNative(options),
+            )),
         );
     }
 
-    /** Attach the current terminal to the guest's default shell. */
-    async attachShell(options?: AttachOptions): Promise<ExitStatus> {
+    /** Attach the current terminal to the guest's SSH shell. */
+    async attachShell(options?: SshShellOptions): Promise<SshExitStatus> {
         return await mapNativePromise(
-            this.native.attachShell(attachOptionsToNative(options)),
+            this.native.attachShell(sshShellOptionsToNative(options)),
         );
     }
+
 }

@@ -1,162 +1,535 @@
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use protocol::v1::execute_input::Message as ExecuteMessage;
+use protocol::v1::execution_event::Event as ExecutionWireEvent;
+use protocol::v1::{
+    CloseStdin, EnvironmentVariable, ExecuteInput, ExecutionEvent as WireExecutionEvent, PipeStdio,
+    ProcessSpec, PtyStdio, ResizePty, SignalProcess, StartExecution, StdinData, TerminalSize,
+};
 use russh::client::Msg as ClientMsg;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
-use russh::{Channel, ChannelMsg, ChannelWriteHalf, Sig};
+use russh::{Channel, ChannelMsg, ChannelWriteHalf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
+use tokio_stream::wrappers::ReceiverStream;
+use uuid::Uuid;
 
-use crate::machine::{Machine, MachineRef};
+use crate::machine::{Machine, MachineRef, MachineUserConfig};
+use crate::runtime::core::RuntimeStatus;
+use crate::store::models::MachineRuntimeState;
 use crate::LibVmError;
 
 const DEFAULT_TERM: &str = "xterm-256color";
 const DEFAULT_ATTACH_DETACH_KEY: u8 = 0x1d;
 const DEFAULT_LOGIN_SHELL_SCRIPT: &str = "exec \"${SHELL:-/bin/bash}\" -l || exec /bin/sh";
-const EXEC_EVENT_QUEUE_CAPACITY: usize = 64;
-const EXEC_STDIN_QUEUE_CAPACITY: usize = 64;
+const EXECUTION_REQUEST_QUEUE_CAPACITY: usize = 64;
+const EXECUTION_CHUNK_SIZE: usize = protocol::CHUNK_64_KIB;
 const SSH_HANDSHAKE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
-/// Options for running a guest command.
-///
-/// These options describe the process that runs inside the guest VM. The host
-/// process only opens an internal transport to the guest and forwards data.
+/// Options for one structured guest process execution.
 #[derive(Debug, Clone)]
-pub struct ExecOptions {
-    /// Command-line arguments passed after the executable.
+pub struct ExecutionOptions {
     pub args: Vec<String>,
-    /// Guest working directory for the command.
     pub cwd: Option<String>,
-    /// Guest user for the command. Defaults to the configured guest user, then root.
     pub user: Option<String>,
-    /// Environment variables set for the command.
     pub env: Vec<(String, String)>,
-    /// Maximum runtime for captured execution.
     pub timeout: Option<Duration>,
-    /// Stdin behavior for the command.
     pub stdin: StdinMode,
-    /// Whether to allocate a guest PTY.
     pub tty: bool,
-    /// Whether to forward the host SSH agent into the guest session.
-    pub forward_agent: bool,
+    pub term: String,
 }
 
-/// Builder for [`ExecOptions`].
 #[derive(Debug, Default)]
-pub struct ExecOptionsBuilder {
-    options: ExecOptions,
+pub struct ExecutionOptionsBuilder {
+    options: ExecutionOptions,
 }
 
-/// Stdin behavior for guest execution.
+/// Structured process stdin mode.
 #[derive(Debug, Clone, Default)]
 pub enum StdinMode {
-    /// Close stdin immediately.
     #[default]
     Null,
-    /// Return an [`ExecSink`] so the caller can stream stdin.
     Pipe,
-    /// Send these bytes to stdin, then close it.
     Bytes(Vec<u8>),
 }
 
-/// Output captured from a completed guest command.
-#[derive(Debug, Clone)]
-pub struct ExecOutput {
-    status: ExitStatus,
+/// The exact terminal result reported by vmmon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionResult {
+    Exited { code: Option<u32> },
+    Signaled { signal: Option<u32> },
+    LaunchFailed(ExecutionLaunchFailure),
+    Lost(ExecutionLost),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionLaunchFailure {
+    pub reason: ExecutionLaunchFailureReason,
+    pub message: Option<String>,
+}
+
+impl std::fmt::Display for ExecutionLaunchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "launch failed ({:?})", self.reason)?;
+        if let Some(message) = &self.message {
+            write!(formatter, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionLaunchFailureReason {
+    Unspecified,
+    CommandNotFound,
+    InvalidProcessSpec,
+    WorkingDirectoryNotFound,
+    WorkingDirectoryNotDirectory,
+    InvalidIdentity,
+    IdentityNotFound,
+    PermissionDenied,
+    SpawnFailed,
+    CancelledBeforeStart,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionLost {
+    pub reason: ExecutionLostReason,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionLostReason {
+    Unspecified,
+    AgentInstanceReplaced,
+    AgentBootReplaced,
+    AgentUnavailable,
+    GuestStreamLost,
+    VmStopped,
+    VmmonExited,
+}
+
+/// One event from the host execution service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionEvent {
+    Accepted,
+    Started,
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    TerminalOutput(Vec<u8>),
+    Terminal(ExecutionResult),
+}
+
+/// Captured structured execution output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionOutput {
+    result: ExecutionResult,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    terminal_output: Vec<u8>,
 }
 
-/// Exit status for a guest command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExitStatus {
-    /// Numeric process exit code.
-    pub code: i32,
-    /// Whether the command exited with code 0.
-    pub success: bool,
+impl ExecutionOutput {
+    pub fn result(&self) -> &ExecutionResult {
+        &self.result
+    }
+    pub fn stdout_bytes(&self) -> &[u8] {
+        &self.stdout
+    }
+    pub fn stderr_bytes(&self) -> &[u8] {
+        &self.stderr
+    }
+    pub fn terminal_output_bytes(&self) -> &[u8] {
+        &self.terminal_output
+    }
+    pub fn stdout(&self) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(self.stdout.clone())
+    }
+    pub fn stderr(&self) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(self.stderr.clone())
+    }
+    pub fn terminal_output(&self) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(self.terminal_output.clone())
+    }
 }
 
-/// Streaming event from a guest command.
-#[derive(Debug)]
-pub enum ExecEvent {
-    /// The SSH exec request was accepted by the guest.
-    Started,
-    /// Bytes written by the guest process to stdout.
-    Stdout(Vec<u8>),
-    /// Bytes written by the guest process to stderr.
-    Stderr(Vec<u8>),
-    /// The guest process exited.
-    Exited { code: i32 },
-    /// The guest failed the session before a normal exit status was available.
-    Failed { message: String },
-    /// Writing to stdin failed. The process may still emit more events.
-    StdinError { message: String },
-}
-
-/// Handle for a streaming guest command.
-pub struct ExecHandle {
+/// A live bidirectional structured execution call.
+pub struct ExecutionSession {
     reference: String,
-    events: mpsc::Receiver<ExecEvent>,
-    stdin: Option<ExecSink>,
-    control: ExecControl,
-    _client: GuestSshClient,
+    requests: Arc<Mutex<Option<mpsc::Sender<ExecuteInput>>>>,
+    input_open: Arc<AtomicBool>,
+    input_order: Arc<AsyncMutex<()>>,
+    request_closed: Arc<watch::Sender<bool>>,
+    pipe_stdin: bool,
+    events: Option<tonic::Streaming<WireExecutionEvent>>,
 }
 
-/// Stdin writer for a streaming guest command.
-pub struct ExecSink {
-    reference: String,
-    tx: mpsc::Sender<Vec<u8>>,
-}
-
-/// Cloneable control handle for a streaming guest command.
+/// Cloneable request-side controls for a live structured execution.
 #[derive(Clone)]
-pub struct ExecControl {
+pub struct ExecutionControl {
     reference: String,
-    channel: Arc<ChannelWriteHalf<ClientMsg>>,
+    requests: Arc<Mutex<Option<mpsc::Sender<ExecuteInput>>>>,
+    input_open: Arc<AtomicBool>,
+    input_order: Arc<AsyncMutex<()>>,
+    request_closed: Arc<watch::Sender<bool>>,
+    pipe_stdin: bool,
 }
 
-/// Options for attaching the host terminal to a guest process.
-///
-/// Attach requests a guest PTY, switches the host terminal to raw mode while
-/// attached, forwards stdin/stdout, and returns the guest process exit code.
-#[derive(Debug, Clone)]
-pub struct AttachOptions {
-    /// Command-line arguments passed after the executable.
-    pub args: Vec<String>,
-    /// Guest working directory for the attached process.
-    pub cwd: Option<String>,
-    /// Guest user for the attached process. Defaults to the provisioned Silo user.
-    pub user: Option<String>,
-    /// Environment variables set for the attached process.
-    pub env: Vec<(String, String)>,
-    /// Terminal name requested from the guest.
-    pub term: String,
-    /// Detach key sequence. Defaults to Ctrl+].
-    pub detach_keys: Option<String>,
-    /// Whether to forward the host SSH agent into the guest session.
-    pub forward_agent: bool,
-}
-
-/// Builder for [`AttachOptions`].
-#[derive(Debug, Default)]
-pub struct AttachOptionsBuilder {
-    options: AttachOptions,
-}
-
-struct GuestSshClient {
-    reference: String,
-    handle: russh::client::Handle<SshClientHandler>,
-}
-
+/// Cloneable writer for a structured execution's stdin or PTY input.
 #[derive(Clone)]
-struct SshClientHandler {
-    agent_socket: Option<PathBuf>,
+pub struct ExecutionStdin {
+    reference: String,
+    requests: Arc<Mutex<Option<mpsc::Sender<ExecuteInput>>>>,
+    input_open: Arc<AtomicBool>,
+    input_order: Arc<AsyncMutex<()>>,
+    request_closed: Arc<watch::Sender<bool>>,
+    pipe_stdin: bool,
 }
 
-impl Default for ExecOptions {
+impl ExecutionSession {
+    /// Returns controls that remain usable while another task receives events.
+    pub fn control(&self) -> ExecutionControl {
+        ExecutionControl {
+            reference: self.reference.clone(),
+            requests: Arc::clone(&self.requests),
+            input_open: Arc::clone(&self.input_open),
+            input_order: Arc::clone(&self.input_order),
+            request_closed: Arc::clone(&self.request_closed),
+            pipe_stdin: self.pipe_stdin,
+        }
+    }
+
+    /// Returns a stdin writer while the request half remains open.
+    pub fn stdin(&self) -> Option<ExecutionStdin> {
+        self.control().stdin()
+    }
+    pub async fn recv(&mut self) -> Result<Option<ExecutionEvent>, LibVmError> {
+        let Some(events) = self.events.as_mut() else {
+            return Ok(None);
+        };
+        match events.message().await {
+            Ok(Some(wire)) => {
+                let event = execution_event_from_wire(wire);
+                if matches!(event, ExecutionEvent::Terminal(_)) {
+                    self.close_requests();
+                    self.events = None;
+                }
+                Ok(Some(event))
+            }
+            Ok(None) => {
+                self.events = None;
+                self.close_requests();
+                Ok(None)
+            }
+            Err(error) => {
+                self.events = None;
+                self.close_requests();
+                if caller_status(error.code()) {
+                    Err(guest_session_error(
+                        &self.reference,
+                        format!("execution request failed: {error}"),
+                    ))
+                } else {
+                    Ok(Some(ExecutionEvent::Terminal(ExecutionResult::Lost(
+                        ExecutionLost {
+                            reason: ExecutionLostReason::GuestStreamLost,
+                            message: Some(format!("execution event stream failed: {error}")),
+                        },
+                    ))))
+                }
+            }
+        }
+    }
+
+    /// Writes bytes to the process stdin or PTY.
+    pub async fn write_stdin(&self, data: impl Into<Vec<u8>>) -> Result<(), LibVmError> {
+        self.control().write_stdin(data).await
+    }
+
+    /// Sends EOF to the process stdin while keeping the execution call open.
+    pub async fn close_stdin(&self) -> Result<(), LibVmError> {
+        self.control().close_stdin().await
+    }
+
+    /// Resizes the process PTY.
+    pub async fn resize_pty(&self, rows: u16, columns: u16) -> Result<(), LibVmError> {
+        self.control().resize_pty(rows, columns).await
+    }
+
+    /// Delivers a positive Linux signal number to the process group.
+    pub async fn signal(&self, signal: u32) -> Result<(), LibVmError> {
+        self.control().signal(signal).await
+    }
+
+    /// Finishes the request half of the bidirectional call.
+    pub fn close_requests(&self) {
+        self.control().close_requests();
+    }
+
+    /// Cancels the complete bidirectional call, including the response stream.
+    pub fn cancel(&mut self) {
+        self.close_requests();
+        self.events = None;
+    }
+
+    pub async fn wait(&mut self) -> Result<ExecutionResult, LibVmError> {
+        while let Some(event) = self.recv().await? {
+            if let ExecutionEvent::Terminal(result) = event {
+                return Ok(result);
+            }
+        }
+        Err(guest_session_error(
+            &self.reference,
+            "execution ended without a terminal result",
+        ))
+    }
+
+    pub async fn collect(&mut self) -> Result<ExecutionOutput, LibVmError> {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut terminal_output = Vec::new();
+        while let Some(event) = self.recv().await? {
+            match event {
+                ExecutionEvent::Stdout(data) => stdout.extend(data),
+                ExecutionEvent::Stderr(data) => stderr.extend(data),
+                ExecutionEvent::TerminalOutput(data) => terminal_output.extend(data),
+                ExecutionEvent::Terminal(result) => {
+                    return Ok(ExecutionOutput {
+                        result,
+                        stdout,
+                        stderr,
+                        terminal_output,
+                    })
+                }
+                ExecutionEvent::Accepted | ExecutionEvent::Started => {}
+            }
+        }
+        Err(guest_session_error(
+            &self.reference,
+            "execution ended without a terminal result",
+        ))
+    }
+}
+
+impl ExecutionControl {
+    /// Returns a stdin writer while the request half remains open.
+    pub fn stdin(&self) -> Option<ExecutionStdin> {
+        self.requests.lock().ok()?.as_ref()?;
+        if !self.input_open.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(ExecutionStdin {
+            reference: self.reference.clone(),
+            requests: Arc::clone(&self.requests),
+            input_open: Arc::clone(&self.input_open),
+            input_order: Arc::clone(&self.input_order),
+            request_closed: Arc::clone(&self.request_closed),
+            pipe_stdin: self.pipe_stdin,
+        })
+    }
+
+    /// Writes bytes to the process stdin or PTY.
+    pub async fn write_stdin(&self, data: impl Into<Vec<u8>>) -> Result<(), LibVmError> {
+        self.send_stdin_data(data.into()).await
+    }
+
+    /// Sends EOF to pipe stdin while leaving the response stream open.
+    pub async fn close_stdin(&self) -> Result<(), LibVmError> {
+        if !self.pipe_stdin {
+            return Err(guest_session_error(
+                &self.reference,
+                "explicit EOF is only valid for pipe stdin",
+            ));
+        }
+        let _order = self.input_order.lock().await;
+        if !self.input_open.load(Ordering::Acquire) {
+            return Err(guest_session_error(
+                &self.reference,
+                "execution input is closed",
+            ));
+        }
+        self.send(ExecuteMessage::CloseStdin(CloseStdin {})).await?;
+        self.input_open.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Resizes the process PTY.
+    pub async fn resize_pty(&self, rows: u16, columns: u16) -> Result<(), LibVmError> {
+        self.send(ExecuteMessage::ResizePty(ResizePty {
+            size: Some(TerminalSize {
+                columns: u32::from(columns),
+                rows: u32::from(rows),
+            }),
+        }))
+        .await
+    }
+
+    /// Delivers a Linux signal number to the process group.
+    pub async fn signal(&self, signal: u32) -> Result<(), LibVmError> {
+        if !(1..=64).contains(&signal) {
+            return Err(guest_session_error(
+                &self.reference,
+                "signal must be a Linux signal number from 1 through 64",
+            ));
+        }
+        self.send(ExecuteMessage::SignalProcess(SignalProcess {
+            signal: Some(signal),
+        }))
+        .await
+    }
+
+    /// Finishes the request half without closing process stdin.
+    pub fn close_requests(&self) {
+        self.request_closed.send_replace(true);
+        if let Ok(mut requests) = self.requests.lock() {
+            requests.take();
+        }
+        self.input_open.store(false, Ordering::Release);
+    }
+
+    async fn send(&self, message: ExecuteMessage) -> Result<(), LibVmError> {
+        let requests = self
+            .requests
+            .lock()
+            .map_err(|_| {
+                guest_session_error(&self.reference, "execution request lock is poisoned")
+            })?
+            .clone();
+        let Some(requests) = requests else {
+            return Err(guest_session_error(
+                &self.reference,
+                "execution request stream is closed",
+            ));
+        };
+        let mut request_closed = self.request_closed.subscribe();
+        if *request_closed.borrow() {
+            return Err(guest_session_error(
+                &self.reference,
+                "execution request stream is closed",
+            ));
+        }
+        tokio::select! {
+            biased;
+            _ = request_closed.changed() => Err(guest_session_error(
+                &self.reference,
+                "execution request stream is closed",
+            )),
+            result = requests.send(ExecuteInput { message: Some(message) }) => result.map_err(|_| {
+                guest_session_error(&self.reference, "execution request stream is closed")
+            }),
+        }
+    }
+
+    async fn send_stdin_data(&self, data: Vec<u8>) -> Result<(), LibVmError> {
+        let _order = self.input_order.lock().await;
+        if !self.input_open.load(Ordering::Acquire) {
+            return Err(guest_session_error(
+                &self.reference,
+                "execution input is closed",
+            ));
+        }
+        if data.is_empty() {
+            return self
+                .send(ExecuteMessage::StdinData(StdinData {
+                    data: Vec::new().into(),
+                }))
+                .await;
+        }
+        for chunk in data.chunks(EXECUTION_CHUNK_SIZE) {
+            self.send(ExecuteMessage::StdinData(StdinData {
+                data: chunk.to_vec().into(),
+            }))
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+impl ExecutionStdin {
+    pub async fn write(&self, data: impl Into<Vec<u8>>) -> Result<(), LibVmError> {
+        let _order = self.input_order.lock().await;
+        if !self.input_open.load(Ordering::Acquire) {
+            return Err(guest_session_error(
+                &self.reference,
+                "execution input is closed",
+            ));
+        }
+        let data = data.into();
+        if data.is_empty() {
+            return self
+                .send(ExecuteMessage::StdinData(StdinData {
+                    data: Vec::new().into(),
+                }))
+                .await;
+        }
+        for chunk in data.chunks(EXECUTION_CHUNK_SIZE) {
+            self.send(ExecuteMessage::StdinData(StdinData {
+                data: chunk.to_vec().into(),
+            }))
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn close(&self) -> Result<(), LibVmError> {
+        if !self.pipe_stdin {
+            return Err(guest_session_error(
+                &self.reference,
+                "explicit EOF is only valid for pipe stdin",
+            ));
+        }
+        let _order = self.input_order.lock().await;
+        if !self.input_open.load(Ordering::Acquire) {
+            return Err(guest_session_error(
+                &self.reference,
+                "execution input is closed",
+            ));
+        }
+        self.send(ExecuteMessage::CloseStdin(CloseStdin {})).await?;
+        self.input_open.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    async fn send(&self, message: ExecuteMessage) -> Result<(), LibVmError> {
+        let requests = self
+            .requests
+            .lock()
+            .map_err(|_| {
+                guest_session_error(&self.reference, "execution request lock is poisoned")
+            })?
+            .clone();
+        let Some(requests) = requests else {
+            return Err(guest_session_error(
+                &self.reference,
+                "execution request stream is closed",
+            ));
+        };
+        let mut request_closed = self.request_closed.subscribe();
+        if *request_closed.borrow() {
+            return Err(guest_session_error(
+                &self.reference,
+                "execution request stream is closed",
+            ));
+        }
+        tokio::select! {
+            biased;
+            _ = request_closed.changed() => Err(guest_session_error(
+                &self.reference,
+                "execution request stream is closed",
+            )),
+            result = requests.send(ExecuteInput { message: Some(message) }) => result.map_err(|_| {
+                guest_session_error(&self.reference, "execution request stream is closed")
+            }),
+        }
+    }
+}
+
+impl Default for ExecutionOptions {
     fn default() -> Self {
         Self {
             args: Vec::new(),
@@ -166,19 +539,16 @@ impl Default for ExecOptions {
             timeout: None,
             stdin: StdinMode::Null,
             tty: false,
-            forward_agent: false,
+            term: DEFAULT_TERM.to_string(),
         }
     }
 }
 
-impl ExecOptionsBuilder {
-    /// Append one command-line argument.
+impl ExecutionOptionsBuilder {
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.options.args.push(arg.into());
         self
     }
-
-    /// Append multiple command-line arguments.
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -187,595 +557,375 @@ impl ExecOptionsBuilder {
         self.options.args.extend(args.into_iter().map(Into::into));
         self
     }
-
-    /// Set the guest working directory.
     pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
         self.options.cwd = Some(cwd.into());
         self
     }
-
-    /// Run as a different guest user.
     pub fn user(mut self, user: impl Into<String>) -> Self {
         self.options.user = Some(user.into());
         self
     }
-
-    /// Add an environment variable.
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.options.env.push((key.into(), value.into()));
         self
     }
-
-    /// Add multiple environment variables.
     pub fn envs<I, K, V>(mut self, vars: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<String>,
         V: Into<String>,
     {
-        self.options.env.extend(
-            vars.into_iter()
-                .map(|(key, value)| (key.into(), value.into())),
-        );
+        self.options
+            .env
+            .extend(vars.into_iter().map(|(k, v)| (k.into(), v.into())));
         self
     }
-
-    /// Set a timeout for captured execution.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.options.timeout = Some(timeout);
         self
     }
-
-    /// Close stdin immediately.
     pub fn stdin_null(mut self) -> Self {
         self.options.stdin = StdinMode::Null;
         self
     }
-
-    /// Pipe stdin through [`ExecHandle::take_stdin`].
     pub fn stdin_pipe(mut self) -> Self {
         self.options.stdin = StdinMode::Pipe;
         self
     }
-
-    /// Send fixed bytes to stdin, then close it.
     pub fn stdin_bytes(mut self, data: impl Into<Vec<u8>>) -> Self {
         self.options.stdin = StdinMode::Bytes(data.into());
         self
     }
-
-    /// Allocate a guest PTY.
     pub fn tty(mut self, enabled: bool) -> Self {
         self.options.tty = enabled;
         self
     }
-
-    /// Forward the host SSH agent into the guest session.
-    pub fn forward_agent(mut self, enabled: bool) -> Self {
-        self.options.forward_agent = enabled;
+    pub fn term(mut self, term: impl Into<String>) -> Self {
+        self.options.term = term.into();
         self
     }
-
-    /// Finalize the options.
-    pub fn build(self) -> ExecOptions {
+    pub fn build(self) -> ExecutionOptions {
         self.options
     }
 }
 
-impl ExecOutput {
-    fn from_parts(status: ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
-        Self {
-            status,
-            stdout,
-            stderr,
-        }
-    }
-
-    /// Returns the exit status.
-    pub fn status(&self) -> ExitStatus {
-        self.status
-    }
-
-    /// Returns stdout as bytes.
-    pub fn stdout_bytes(&self) -> &[u8] {
-        &self.stdout
-    }
-
-    /// Returns stderr as bytes.
-    pub fn stderr_bytes(&self) -> &[u8] {
-        &self.stderr
-    }
-
-    /// Decodes stdout as UTF-8.
-    pub fn stdout(&self) -> Result<String, std::string::FromUtf8Error> {
-        String::from_utf8(self.stdout.clone())
-    }
-
-    /// Decodes stderr as UTF-8.
-    pub fn stderr(&self) -> Result<String, std::string::FromUtf8Error> {
-        String::from_utf8(self.stderr.clone())
-    }
+/// SSH-only shell attachment options. Agent forwarding is intentionally kept here.
+#[derive(Debug, Clone)]
+pub struct SshShellOptions {
+    pub cwd: Option<String>,
+    pub user: Option<String>,
+    pub env: Vec<(String, String)>,
+    pub term: String,
+    pub detach_keys: Option<String>,
+    pub forward_agent: bool,
+    best_effort_cwd: bool,
 }
 
-impl ExecHandle {
-    /// Receives the next event, or `None` when the session has ended.
-    pub async fn recv(&mut self) -> Option<ExecEvent> {
-        self.events.recv().await
-    }
-
-    /// Takes the stdin sink when this command was spawned with piped stdin.
-    pub fn take_stdin(&mut self) -> Option<ExecSink> {
-        self.stdin.take()
-    }
-
-    /// Returns a cloneable control handle for signals and PTY resize events.
-    pub fn control(&self) -> ExecControl {
-        self.control.clone()
-    }
-
-    /// Waits for process exit and returns its status.
-    pub async fn wait(&mut self) -> Result<ExitStatus, LibVmError> {
-        while let Some(event) = self.events.recv().await {
-            match event {
-                ExecEvent::Exited { code } => {
-                    return Ok(ExitStatus {
-                        code,
-                        success: code == 0,
-                    });
-                }
-                ExecEvent::Failed { message } => {
-                    return Err(guest_session_error(&self.reference, message));
-                }
-                _ => {}
-            }
-        }
-
-        Err(guest_session_error(
-            &self.reference,
-            "guest command ended without an exit status",
-        ))
-    }
-
-    /// Waits for process exit and captures stdout/stderr.
-    pub async fn collect(&mut self) -> Result<ExecOutput, LibVmError> {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut exit_code = None;
-
-        while let Some(event) = self.events.recv().await {
-            match event {
-                ExecEvent::Started => {}
-                ExecEvent::Stdout(data) => stdout.extend_from_slice(&data),
-                ExecEvent::Stderr(data) => stderr.extend_from_slice(&data),
-                ExecEvent::Exited { code } => {
-                    exit_code = Some(code);
-                    break;
-                }
-                ExecEvent::Failed { message } => {
-                    return Err(guest_session_error(&self.reference, message));
-                }
-                ExecEvent::StdinError { .. } => {}
-            }
-        }
-
-        let code = exit_code.ok_or_else(|| {
-            guest_session_error(
-                &self.reference,
-                "guest command ended without an exit status",
-            )
-        })?;
-        Ok(ExecOutput::from_parts(
-            ExitStatus {
-                code,
-                success: code == 0,
-            },
-            stdout,
-            stderr,
-        ))
-    }
-
-    /// Sends a Unix signal to the guest process.
-    pub async fn signal(&self, signal: i32) -> Result<(), LibVmError> {
-        self.control.signal(signal).await
-    }
-
-    /// Sends SIGKILL to the guest process.
-    pub async fn kill(&self) -> Result<(), LibVmError> {
-        self.control.kill().await
-    }
-
-    /// Resizes the guest PTY.
-    pub async fn resize(&self, rows: u16, cols: u16) -> Result<(), LibVmError> {
-        self.control.resize(rows, cols).await
-    }
+#[derive(Debug, Default)]
+pub struct SshShellOptionsBuilder {
+    options: SshShellOptions,
 }
 
-impl ExecSink {
-    /// Writes bytes to the guest process stdin.
-    pub async fn write(&self, data: impl Into<Vec<u8>>) -> Result<(), LibVmError> {
-        self.tx
-            .send(data.into())
-            .await
-            .map_err(|_| guest_session_error(&self.reference, "guest stdin is closed"))
-    }
-
-    /// Closes stdin by dropping the sink.
-    pub fn close(self) {}
-}
-
-impl ExecControl {
-    /// Sends a Unix signal to the guest process.
-    pub async fn signal(&self, signal: i32) -> Result<(), LibVmError> {
-        let signal = ssh_signal(signal).ok_or_else(|| {
-            guest_session_error(
-                &self.reference,
-                format!("unsupported guest signal number {signal}"),
-            )
-        })?;
-        self.channel
-            .signal(signal)
-            .await
-            .map_err(|error| ssh_error(&self.reference, "send signal", error))
-    }
-
-    /// Sends SIGKILL to the guest process.
-    pub async fn kill(&self) -> Result<(), LibVmError> {
-        self.signal(libc::SIGKILL).await
-    }
-
-    /// Resizes the guest PTY.
-    pub async fn resize(&self, rows: u16, cols: u16) -> Result<(), LibVmError> {
-        self.channel
-            .window_change(u32::from(cols), u32::from(rows), 0, 0)
-            .await
-            .map_err(|error| ssh_error(&self.reference, "resize PTY", error))
-    }
-}
-
-impl Default for AttachOptions {
+impl Default for SshShellOptions {
     fn default() -> Self {
         Self {
-            args: Vec::new(),
             cwd: None,
             user: None,
             env: Vec::new(),
             term: std::env::var("TERM").unwrap_or_else(|_| DEFAULT_TERM.to_string()),
             detach_keys: None,
             forward_agent: false,
+            best_effort_cwd: false,
         }
     }
 }
-
-impl AttachOptionsBuilder {
-    /// Append one command-line argument.
-    pub fn arg(mut self, arg: impl Into<String>) -> Self {
-        self.options.args.push(arg.into());
-        self
-    }
-
-    /// Append multiple command-line arguments.
-    pub fn args<I, S>(mut self, args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.options.args.extend(args.into_iter().map(Into::into));
-        self
-    }
-
-    /// Set the guest working directory.
+impl SshShellOptionsBuilder {
     pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
         self.options.cwd = Some(cwd.into());
         self
     }
-
-    /// Run as a different guest user.
     pub fn user(mut self, user: impl Into<String>) -> Self {
         self.options.user = Some(user.into());
         self
     }
-
-    /// Add an environment variable.
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.options.env.push((key.into(), value.into()));
         self
     }
-
-    /// Add multiple environment variables.
-    pub fn envs<I, K, V>(mut self, vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<String>,
-    {
-        self.options.env.extend(
-            vars.into_iter()
-                .map(|(key, value)| (key.into(), value.into())),
-        );
-        self
-    }
-
-    /// Set the terminal type requested from the guest.
     pub fn term(mut self, term: impl Into<String>) -> Self {
         self.options.term = term.into();
         self
     }
-
-    /// Set Docker-style detach keys such as `ctrl-]` or `ctrl-p,ctrl-q`.
     pub fn detach_keys(mut self, keys: impl Into<String>) -> Self {
         self.options.detach_keys = Some(keys.into());
         self
     }
-
-    /// Forward the host SSH agent into the guest session.
     pub fn forward_agent(mut self, enabled: bool) -> Self {
         self.options.forward_agent = enabled;
         self
     }
-
-    /// Finalize the options.
-    pub fn build(self) -> AttachOptions {
+    #[doc(hidden)]
+    pub fn best_effort_cwd(mut self) -> Self {
+        self.options.best_effort_cwd = true;
+        self
+    }
+    pub fn build(self) -> SshShellOptions {
         self.options
     }
 }
 
+/// SSH shell exit status, used only by SSH shell attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SshExitStatus {
+    pub code: i32,
+    pub success: bool,
+}
+
 impl Machine {
-    /// Runs a guest executable, captures stdout/stderr, and returns its exit status.
-    ///
-    /// The `program` and `args` describe guest argv. They are shell-quoted before
-    /// being sent through the current SSH-backed transport, so callers should pass
-    /// arguments as separate values instead of building a shell string. Use
-    /// [`Machine::shell`] when you intentionally want pipes, redirects, or other
-    /// shell syntax.
     pub async fn exec<I, S>(
         &self,
         program: impl Into<String>,
         args: I,
-    ) -> Result<ExecOutput, LibVmError>
+    ) -> Result<ExecutionOutput, LibVmError>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
-        self.exec_with(program, |command| command.args(args)).await
+        self.exec_with(program, |options| options.args(args)).await
     }
 
-    /// Runs a guest executable with custom options and captures output.
     pub async fn exec_with(
         &self,
         program: impl Into<String>,
-        configure: impl FnOnce(ExecOptionsBuilder) -> ExecOptionsBuilder,
-    ) -> Result<ExecOutput, LibVmError> {
-        let options = configure(ExecOptionsBuilder::default()).build();
+        configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
+    ) -> Result<ExecutionOutput, LibVmError> {
+        let options = configure(ExecutionOptionsBuilder::default()).build();
         let timeout = options.timeout;
-        let mut handle = self.start_exec(program.into(), options).await?;
+        let mut session = self.start_execution(program.into(), options).await?;
         if let Some(timeout) = timeout {
-            match tokio::time::timeout(timeout, handle.collect()).await {
-                Ok(result) => result,
+            match tokio::time::timeout(timeout, session.collect()).await {
+                Ok(output) => output,
                 Err(_) => {
-                    let _ = handle.kill().await;
+                    session.cancel();
                     Err(guest_session_error(
-                        &handle.reference,
+                        &self.inspect().await?.name,
                         format!("guest command timed out after {}s", timeout.as_secs()),
                     ))
                 }
             }
         } else {
-            handle.collect().await
+            session.collect().await
         }
     }
 
-    /// Spawns a guest executable and returns a streaming handle.
     pub async fn spawn<I, S>(
         &self,
         program: impl Into<String>,
         args: I,
-    ) -> Result<ExecHandle, LibVmError>
+    ) -> Result<ExecutionSession, LibVmError>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
-        self.spawn_with(program, |command| command.args(args)).await
+        self.spawn_with(program, |options| options.args(args)).await
     }
 
-    /// Spawns a guest executable with custom options and returns a streaming handle.
     pub async fn spawn_with(
         &self,
         program: impl Into<String>,
-        configure: impl FnOnce(ExecOptionsBuilder) -> ExecOptionsBuilder,
-    ) -> Result<ExecHandle, LibVmError> {
-        let options = configure(ExecOptionsBuilder::default()).build();
-        self.start_exec(program.into(), options).await
+        configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
+    ) -> Result<ExecutionSession, LibVmError> {
+        self.start_execution(
+            program.into(),
+            configure(ExecutionOptionsBuilder::default()).build(),
+        )
+        .await
     }
 
-    /// Runs a shell script inside the guest and captures output.
-    ///
-    /// This uses `/bin/sh -lc <script>` in the guest. Prefer [`Machine::exec`]
-    /// for argv-safe command execution when shell syntax is not needed.
-    pub async fn shell(&self, script: impl Into<String>) -> Result<ExecOutput, LibVmError> {
-        self.shell_with(script, |command| command).await
+    pub async fn shell(&self, script: impl Into<String>) -> Result<ExecutionOutput, LibVmError> {
+        self.shell_with(script, |options| options).await
     }
-
-    /// Runs a shell script inside the guest with custom options.
     pub async fn shell_with(
         &self,
         script: impl Into<String>,
-        configure: impl FnOnce(ExecOptionsBuilder) -> ExecOptionsBuilder,
-    ) -> Result<ExecOutput, LibVmError> {
-        let script = script.into();
-        self.exec_with("/bin/sh", |command| {
-            configure(command).arg("-lc").arg(script)
+        configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
+    ) -> Result<ExecutionOutput, LibVmError> {
+        self.exec_with("/bin/sh", |options| {
+            configure(options).arg("-lc").arg(script.into())
         })
         .await
     }
 
-    /// Attaches the host terminal to a guest executable running in a PTY.
     pub async fn attach<I, S>(
         &self,
         program: impl Into<String>,
         args: I,
-    ) -> Result<ExitStatus, LibVmError>
+    ) -> Result<ExecutionResult, LibVmError>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
-        self.attach_with(program, |attach| attach.args(args)).await
+        self.attach_with(program, |options| options.args(args))
+            .await
     }
 
-    /// Attaches the host terminal to a guest executable with custom options.
     pub async fn attach_with(
         &self,
         program: impl Into<String>,
-        configure: impl FnOnce(AttachOptionsBuilder) -> AttachOptionsBuilder,
-    ) -> Result<ExitStatus, LibVmError> {
-        let options = configure(AttachOptionsBuilder::default()).build();
-        self.attach_command(Some(program.into()), options).await
+        configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
+    ) -> Result<ExecutionResult, LibVmError> {
+        let options = configure(ExecutionOptionsBuilder::default())
+            .stdin_pipe()
+            .tty(true)
+            .build();
+        let mut session = self.start_execution(program.into(), options).await?;
+        attach_execution_stdio(&mut session).await
     }
 
-    /// Attaches the host terminal to the guest user's default shell.
-    pub async fn attach_shell(&self) -> Result<ExitStatus, LibVmError> {
-        self.attach_shell_with(|attach| attach).await
+    pub async fn attach_shell(&self) -> Result<SshExitStatus, LibVmError> {
+        self.attach_shell_with(|options| options).await
     }
-
-    /// Attaches the host terminal to the guest user's default shell with options.
     pub async fn attach_shell_with(
         &self,
-        configure: impl FnOnce(AttachOptionsBuilder) -> AttachOptionsBuilder,
-    ) -> Result<ExitStatus, LibVmError> {
-        let options = configure(AttachOptionsBuilder::default()).build();
-        self.attach_command(None, options).await
+        configure: impl FnOnce(SshShellOptionsBuilder) -> SshShellOptionsBuilder,
+    ) -> Result<SshExitStatus, LibVmError> {
+        let options = configure(SshShellOptionsBuilder::default()).build();
+        self.attach_ssh_shell(options).await
     }
 
-    async fn start_exec(
+    /// Runs one command through the pre-cutover SSH transport used only by `silo run`.
+    #[doc(hidden)]
+    pub async fn run_legacy_ssh_command(
         &self,
-        program: String,
-        options: ExecOptions,
-    ) -> Result<ExecHandle, LibVmError> {
+        argv: &[String],
+        tty: bool,
+    ) -> Result<SshExitStatus, LibVmError> {
+        if argv.is_empty() {
+            return Err(guest_session_error("run", "guest command is required"));
+        }
         let reference = self.inspect().await?.name;
-        let client = self
-            .connect_guest_ssh(&reference, options.user.as_deref(), options.forward_agent)
-            .await?;
+        let client = self.connect_guest_ssh(&reference, None, false).await?;
         let mut channel = open_session_channel(&client).await?;
-        if options.tty {
-            let (cols, rows) = current_terminal_size();
+        if tty {
+            let (columns, rows) = current_terminal_size();
             channel
-                .request_pty(true, DEFAULT_TERM, cols, rows, 0, 0, &[])
+                .request_pty(true, DEFAULT_TERM, columns, rows, 0, 0, &[])
                 .await
                 .map_err(|error| ssh_error(&reference, "request PTY", error))?;
             wait_channel_success(&mut channel, &reference, "request PTY").await?;
         }
-        if options.forward_agent {
-            request_agent_forward(&mut channel, &reference).await?;
-        }
-
-        let stdin = options.stdin.clone();
-        let command = command_line(&program, &options.args, &options);
         channel
-            .exec(true, command)
+            .exec(true, legacy_ssh_command(argv)?)
             .await
             .map_err(|error| ssh_error(&reference, "send exec request", error))?;
         wait_channel_success(&mut channel, &reference, "exec request").await?;
+        if tty {
+            attach_ssh_stdio(reference, channel, vec![DEFAULT_ATTACH_DETACH_KEY], client).await
+        } else {
+            stream_ssh_stdio(reference, channel, client).await
+        }
+    }
 
-        let (mut channel_rx, channel_tx) = channel.split();
-        let channel_tx = Arc::new(channel_tx);
-        let (events_tx, events_rx) = mpsc::channel(EXEC_EVENT_QUEUE_CAPACITY);
-        events_tx
-            .send(ExecEvent::Started)
-            .await
-            .map_err(|_| guest_session_error(&reference, "guest event stream is closed"))?;
-        let reader_events_tx = events_tx.clone();
-        spawn_exec_reader(reference.clone(), reader_events_tx.clone(), async move {
-            while let Some(msg) = channel_rx.wait().await {
-                if handle_exec_channel_msg(&reader_events_tx, msg).await {
-                    break;
-                }
-            }
-        });
-
-        let stdin_sink = match stdin {
-            StdinMode::Null => {
-                channel_tx
-                    .eof()
-                    .await
-                    .map_err(|error| ssh_error(&reference, "close stdin", error))?;
-                None
-            }
-            StdinMode::Bytes(data) => {
-                if !data.is_empty() {
-                    channel_tx
-                        .data_bytes(data)
-                        .await
-                        .map_err(|error| ssh_error(&reference, "write stdin", error))?;
-                }
-                channel_tx
-                    .eof()
-                    .await
-                    .map_err(|error| ssh_error(&reference, "close stdin", error))?;
-                None
-            }
-            StdinMode::Pipe => {
-                let (stdin_tx, stdin_rx) = mpsc::channel(EXEC_STDIN_QUEUE_CAPACITY);
-                spawn_stdin_writer(
-                    reference.clone(),
-                    Arc::clone(&channel_tx),
-                    stdin_rx,
-                    events_tx,
-                );
-                Some(ExecSink {
-                    reference: reference.clone(),
-                    tx: stdin_tx,
-                })
-            }
+    async fn start_execution(
+        &self,
+        program: String,
+        mut options: ExecutionOptions,
+    ) -> Result<ExecutionSession, LibVmError> {
+        let config = self
+            .runtime()
+            .resolve_machine_config(&MachineRef::id(self.machine_id()))
+            .await?;
+        let status = self
+            .runtime()
+            .reconcile_machine_runtime_best_effort(&config)
+            .await?;
+        let run_id = current_run_id(&config.name, &status)?;
+        apply_default_execution_user(&mut options, config.guest.user.as_ref());
+        let reference = config.name;
+        let stdin = options.stdin.clone();
+        let tty = options.tty;
+        let pipe_stdin = !tty && matches!(stdin, StdinMode::Pipe | StdinMode::Bytes(_));
+        let input_open = match &stdin {
+            StdinMode::Null => tty,
+            StdinMode::Pipe => true,
+            StdinMode::Bytes(_) => false,
         };
-
-        Ok(ExecHandle {
-            reference: reference.clone(),
-            events: events_rx,
-            stdin: stdin_sink,
-            control: ExecControl {
-                reference,
-                channel: channel_tx,
-            },
-            _client: client,
+        let process = process_spec(program, options);
+        let (requests, receiver) = mpsc::channel(EXECUTION_REQUEST_QUEUE_CAPACITY);
+        let execution_id = Uuid::new_v4();
+        requests
+            .send(ExecuteInput {
+                message: Some(ExecuteMessage::Start(StartExecution {
+                    machine_id: self.machine_id().to_string(),
+                    machine_run_id: run_id.to_string(),
+                    execution_id: execution_id.to_string(),
+                    process: Some(process),
+                })),
+            })
+            .await
+            .map_err(|_| guest_session_error(&reference, "execution request stream is closed"))?;
+        let events = self
+            .runtime()
+            .execution_client(self.machine_id())
+            .execute(ReceiverStream::new(receiver))
+            .await
+            .map_err(|message| guest_session_error(&reference, message))?;
+        if let StdinMode::Bytes(data) = stdin {
+            for chunk in data.chunks(EXECUTION_CHUNK_SIZE) {
+                requests
+                    .send(ExecuteInput {
+                        message: Some(ExecuteMessage::StdinData(StdinData {
+                            data: chunk.to_vec().into(),
+                        })),
+                    })
+                    .await
+                    .map_err(|_| {
+                        guest_session_error(&reference, "execution request stream is closed")
+                    })?;
+            }
+            if pipe_stdin {
+                requests
+                    .send(ExecuteInput {
+                        message: Some(ExecuteMessage::CloseStdin(CloseStdin {})),
+                    })
+                    .await
+                    .map_err(|_| {
+                        guest_session_error(&reference, "execution request stream is closed")
+                    })?;
+            }
+        }
+        Ok(ExecutionSession {
+            reference,
+            requests: Arc::new(Mutex::new(Some(requests))),
+            input_open: Arc::new(AtomicBool::new(input_open)),
+            input_order: Arc::new(AsyncMutex::new(())),
+            request_closed: Arc::new(watch::channel(false).0),
+            pipe_stdin,
+            events: Some(events),
         })
     }
 
-    async fn attach_command(
+    async fn attach_ssh_shell(
         &self,
-        program: Option<String>,
-        options: AttachOptions,
-    ) -> Result<ExitStatus, LibVmError> {
+        options: SshShellOptions,
+    ) -> Result<SshExitStatus, LibVmError> {
         let reference = self.inspect().await?.name;
-        let detach_keys = detach_sequence(options.detach_keys.as_deref()).map_err(|message| {
-            guest_session_error(&reference, format!("invalid detach keys: {message}"))
-        })?;
         let client = self
             .connect_guest_ssh(&reference, options.user.as_deref(), options.forward_agent)
             .await?;
         let mut channel = open_session_channel(&client).await?;
-        let (cols, rows) = current_terminal_size();
+        let (columns, rows) = current_terminal_size();
         channel
-            .request_pty(true, &options.term, cols, rows, 0, 0, &[])
+            .request_pty(true, &options.term, columns, rows, 0, 0, &[])
             .await
             .map_err(|error| ssh_error(&reference, "request PTY", error))?;
         wait_channel_success(&mut channel, &reference, "request PTY").await?;
         if options.forward_agent {
             request_agent_forward(&mut channel, &reference).await?;
         }
-
-        if let Some(program) = program {
-            let command = command_line(&program, &options.args, &attach_as_exec_options(&options));
+        if options.cwd.is_some() || !options.env.is_empty() {
             channel
-                .exec(true, command)
-                .await
-                .map_err(|error| ssh_error(&reference, "send exec request", error))?;
-            wait_channel_success(&mut channel, &reference, "exec request").await?;
-        } else if attach_shell_needs_exec(&options) {
-            let command = attach_shell_command_line(&options);
-            channel
-                .exec(true, command)
+                .exec(true, ssh_shell_command(&options)?)
                 .await
                 .map_err(|error| ssh_error(&reference, "send shell exec request", error))?;
             wait_channel_success(&mut channel, &reference, "shell exec request").await?;
@@ -786,8 +936,13 @@ impl Machine {
                 .map_err(|error| ssh_error(&reference, "request shell", error))?;
             wait_channel_success(&mut channel, &reference, "request shell").await?;
         }
-
-        attach_stdio(reference, channel, detach_keys, client).await
+        attach_ssh_stdio(
+            reference,
+            channel,
+            detach_sequence(options.detach_keys.as_deref())?,
+            client,
+        )
+        .await
     }
 
     async fn connect_guest_ssh(
@@ -814,7 +969,7 @@ impl Machine {
         let private_key = load_secret_key(&keypair.private_key_path, None).map_err(|error| {
             guest_session_error(reference, format!("load SSH private key: {error}"))
         })?;
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let mut handle = loop {
             let stream = self.open_shell_stream().await?;
             match russh::client::connect_stream(
@@ -827,22 +982,13 @@ impl Machine {
             .await
             {
                 Ok(handle) => break handle,
-                Err(error) => {
-                    let message = error.to_string();
-                    if !is_transient_ssh_handshake_error(&message) {
-                        return Err(ssh_error(reference, "client handshake", error));
-                    }
-                    if started.elapsed() >= SSH_HANDSHAKE_READY_TIMEOUT {
-                        return Err(guest_session_error(
-                            reference,
-                            format!(
-                                "SSH endpoint did not become handshake-ready within {:?}; last error: {message}",
-                                SSH_HANDSHAKE_READY_TIMEOUT
-                            ),
-                        ));
-                    }
-                    tokio::time::sleep(SSH_HANDSHAKE_RETRY_DELAY).await;
+                Err(error)
+                    if is_transient_ssh_handshake_error(&error.to_string())
+                        && started.elapsed() < SSH_HANDSHAKE_READY_TIMEOUT =>
+                {
+                    tokio::time::sleep(SSH_HANDSHAKE_RETRY_DELAY).await
                 }
+                Err(error) => return Err(ssh_error(reference, "client handshake", error)),
             }
         };
         let hash_alg = handle
@@ -863,7 +1009,6 @@ impl Machine {
                 "SSH public-key authentication failed",
             ));
         }
-
         Ok(GuestSshClient {
             reference: reference.to_string(),
             handle,
@@ -871,21 +1016,262 @@ impl Machine {
     }
 }
 
+fn current_run_id(reference: &str, status: &RuntimeStatus) -> Result<Uuid, LibVmError> {
+    if status.state != MachineRuntimeState::Running {
+        return Err(guest_session_error(reference, "machine is not running"));
+    }
+    let run_id = status
+        .run_id
+        .as_deref()
+        .ok_or_else(|| guest_session_error(reference, "running machine has no run ID"))?;
+    Uuid::parse_str(run_id).map_err(|error| {
+        guest_session_error(
+            reference,
+            format!("running machine has invalid run ID: {error}"),
+        )
+    })
+}
+
+fn process_spec(program: String, options: ExecutionOptions) -> ProcessSpec {
+    let mut argv = Vec::with_capacity(options.args.len() + 1);
+    argv.push(program);
+    argv.extend(options.args);
+    let stdio = if options.tty {
+        Some(protocol::v1::process_spec::Stdio::Pty(PtyStdio {
+            initial_size: Some(terminal_size()),
+            terminal: Some(options.term),
+        }))
+    } else {
+        Some(protocol::v1::process_spec::Stdio::Pipes(PipeStdio {
+            stdin: matches!(options.stdin, StdinMode::Pipe | StdinMode::Bytes(_)),
+        }))
+    };
+    ProcessSpec {
+        argv,
+        environment: options
+            .env
+            .into_iter()
+            .map(|(name, value)| EnvironmentVariable { name, value })
+            .collect(),
+        working_directory: options.cwd,
+        user: options.user,
+        stdio,
+    }
+}
+
+fn apply_default_execution_user(
+    options: &mut ExecutionOptions,
+    configured_user: Option<&MachineUserConfig>,
+) {
+    if options.user.is_none() {
+        options.user = configured_user.map(|user| user.name.clone());
+    }
+}
+
+fn terminal_size() -> TerminalSize {
+    let (columns, rows) = current_terminal_size();
+    TerminalSize { columns, rows }
+}
+
+pub(crate) fn execution_event_from_wire(event: WireExecutionEvent) -> ExecutionEvent {
+    match event.event {
+        Some(ExecutionWireEvent::Accepted(_)) => ExecutionEvent::Accepted,
+        Some(ExecutionWireEvent::Started(_)) => ExecutionEvent::Started,
+        Some(ExecutionWireEvent::Stdout(output)) => ExecutionEvent::Stdout(output.data.to_vec()),
+        Some(ExecutionWireEvent::Stderr(output)) => ExecutionEvent::Stderr(output.data.to_vec()),
+        Some(ExecutionWireEvent::TerminalOutput(output)) => {
+            ExecutionEvent::TerminalOutput(output.data.to_vec())
+        }
+        Some(ExecutionWireEvent::Exited(exited)) => {
+            ExecutionEvent::Terminal(ExecutionResult::Exited { code: exited.code })
+        }
+        Some(ExecutionWireEvent::Signaled(signaled)) => {
+            ExecutionEvent::Terminal(ExecutionResult::Signaled {
+                signal: signaled.signal,
+            })
+        }
+        Some(ExecutionWireEvent::LaunchFailed(failure)) => {
+            ExecutionEvent::Terminal(ExecutionResult::LaunchFailed(ExecutionLaunchFailure {
+                reason: launch_failure_reason(failure.reason),
+                message: failure.message,
+            }))
+        }
+        Some(ExecutionWireEvent::Lost(lost)) => {
+            ExecutionEvent::Terminal(ExecutionResult::Lost(ExecutionLost {
+                reason: lost_reason(lost.reason),
+                message: lost.message,
+            }))
+        }
+        None => ExecutionEvent::Terminal(ExecutionResult::Lost(ExecutionLost {
+            reason: ExecutionLostReason::Unspecified,
+            message: Some("execution event has no payload".to_string()),
+        })),
+    }
+}
+
+fn caller_status(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::InvalidArgument
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::OutOfRange
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::AlreadyExists
+            | tonic::Code::NotFound
+            | tonic::Code::PermissionDenied
+            | tonic::Code::Unauthenticated
+    )
+}
+
+pub(crate) fn launch_failure_reason(value: Option<i32>) -> ExecutionLaunchFailureReason {
+    match protocol::v1::LaunchFailureReason::try_from(value.unwrap_or_default())
+        .unwrap_or(protocol::v1::LaunchFailureReason::Unspecified)
+    {
+        protocol::v1::LaunchFailureReason::CommandNotFound => {
+            ExecutionLaunchFailureReason::CommandNotFound
+        }
+        protocol::v1::LaunchFailureReason::InvalidProcessSpec => {
+            ExecutionLaunchFailureReason::InvalidProcessSpec
+        }
+        protocol::v1::LaunchFailureReason::WorkingDirectoryNotFound => {
+            ExecutionLaunchFailureReason::WorkingDirectoryNotFound
+        }
+        protocol::v1::LaunchFailureReason::WorkingDirectoryNotDirectory => {
+            ExecutionLaunchFailureReason::WorkingDirectoryNotDirectory
+        }
+        protocol::v1::LaunchFailureReason::InvalidIdentity => {
+            ExecutionLaunchFailureReason::InvalidIdentity
+        }
+        protocol::v1::LaunchFailureReason::IdentityNotFound => {
+            ExecutionLaunchFailureReason::IdentityNotFound
+        }
+        protocol::v1::LaunchFailureReason::PermissionDenied => {
+            ExecutionLaunchFailureReason::PermissionDenied
+        }
+        protocol::v1::LaunchFailureReason::SpawnFailed => ExecutionLaunchFailureReason::SpawnFailed,
+        protocol::v1::LaunchFailureReason::CancelledBeforeStart => {
+            ExecutionLaunchFailureReason::CancelledBeforeStart
+        }
+        _ => ExecutionLaunchFailureReason::Unspecified,
+    }
+}
+pub(crate) fn lost_reason(value: Option<i32>) -> ExecutionLostReason {
+    match protocol::v1::LostReason::try_from(value.unwrap_or_default())
+        .unwrap_or(protocol::v1::LostReason::Unspecified)
+    {
+        protocol::v1::LostReason::AgentInstanceReplaced => {
+            ExecutionLostReason::AgentInstanceReplaced
+        }
+        protocol::v1::LostReason::AgentBootReplaced => ExecutionLostReason::AgentBootReplaced,
+        protocol::v1::LostReason::AgentUnavailable => ExecutionLostReason::AgentUnavailable,
+        protocol::v1::LostReason::GuestStreamLost => ExecutionLostReason::GuestStreamLost,
+        protocol::v1::LostReason::VmStopped => ExecutionLostReason::VmStopped,
+        protocol::v1::LostReason::VmmonExited => ExecutionLostReason::VmmonExited,
+        _ => ExecutionLostReason::Unspecified,
+    }
+}
+
+async fn attach_execution_stdio(
+    session: &mut ExecutionSession,
+) -> Result<ExecutionResult, LibVmError> {
+    let _terminal = RawTerminalGuard::new().map_err(|error| {
+        guest_session_error(&session.reference, format!("enable raw terminal: {error}"))
+    })?;
+    let stdin = session
+        .stdin()
+        .ok_or_else(|| guest_session_error(&session.reference, "execution stdin is closed"))?;
+    let mut host_stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut input = [0_u8; 1024];
+    let mut stdin_closed = false;
+    let mut resize_signal = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::window_change(),
+    )
+    .map_err(|error| {
+        guest_session_error(
+            &session.reference,
+            format!("listen for terminal resize: {error}"),
+        )
+    })?;
+    let mut resize_signal_open = true;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .map_err(|error| {
+        guest_session_error(
+            &session.reference,
+            format!("listen for terminal interrupt: {error}"),
+        )
+    })?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|error| {
+        guest_session_error(
+            &session.reference,
+            format!("listen for terminal termination: {error}"),
+        )
+    })?;
+    loop {
+        tokio::select! {
+            read = host_stdin.read(&mut input), if !stdin_closed => {
+                let read = read.map_err(|error| guest_session_error(&session.reference, format!("read terminal input: {error}")))?;
+                if read == 0 {
+                    stdin_closed = true;
+                } else {
+                    stdin.write(input[..read].to_vec()).await?;
+                }
+            }
+            resized = resize_signal.recv(), if resize_signal_open => {
+                if resized.is_none() {
+                    resize_signal_open = false;
+                } else {
+                    let (columns, rows) = current_terminal_size();
+                    let rows = u16::try_from(rows).map_err(|_| guest_session_error(&session.reference, "terminal rows exceed 65535"))?;
+                    let columns = u16::try_from(columns).map_err(|_| guest_session_error(&session.reference, "terminal columns exceed 65535"))?;
+                    session.resize_pty(rows, columns).await?;
+                }
+            }
+            signal = interrupt.recv() => {
+                if signal.is_some() {
+                    session.signal(libc::SIGINT as u32).await?;
+                }
+            }
+            signal = terminate.recv() => {
+                if signal.is_some() {
+                    session.signal(libc::SIGTERM as u32).await?;
+                }
+            }
+            event = session.recv() => match event? {
+                Some(ExecutionEvent::Stdout(data)) | Some(ExecutionEvent::Stderr(data)) | Some(ExecutionEvent::TerminalOutput(data)) => {
+                    stdout.write_all(&data).await.map_err(|error| guest_session_error(&session.reference, format!("write terminal output: {error}")))?;
+                    stdout.flush().await.map_err(|error| guest_session_error(&session.reference, format!("flush terminal output: {error}")))?;
+                }
+                Some(ExecutionEvent::Terminal(result)) => return Ok(result),
+                Some(ExecutionEvent::Accepted | ExecutionEvent::Started) => {}
+                None => return Err(guest_session_error(&session.reference, "execution ended without a terminal result")),
+            }
+        }
+    }
+}
+
+struct GuestSshClient {
+    reference: String,
+    handle: russh::client::Handle<SshClientHandler>,
+}
+#[derive(Clone)]
+struct SshClientHandler {
+    agent_socket: Option<PathBuf>,
+}
 impl russh::client::Handler for SshClientHandler {
     type Error = russh::Error;
-
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
+        _: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
-
     async fn server_channel_open_agent_forward(
         &mut self,
         channel: Channel<ClientMsg>,
-        _open_handle: russh::ChannelOpenHandleInner<ClientMsg>,
-        _session: &mut russh::client::Session,
+        _: russh::ChannelOpenHandleInner<ClientMsg>,
+        _: &mut russh::client::Session,
     ) -> Result<(), Self::Error> {
         #[cfg(unix)]
         if let Some(agent_socket) = self.agent_socket.clone() {
@@ -896,14 +1282,11 @@ impl russh::client::Handler for SshClientHandler {
                 }
             });
         }
-
         #[cfg(not(unix))]
         let _ = channel;
-
         Ok(())
     }
 }
-
 async fn open_session_channel(client: &GuestSshClient) -> Result<Channel<ClientMsg>, LibVmError> {
     client
         .handle
@@ -911,7 +1294,6 @@ async fn open_session_channel(client: &GuestSshClient) -> Result<Channel<ClientM
         .await
         .map_err(|error| ssh_error(&client.reference, "open session channel", error))
 }
-
 async fn wait_channel_success(
     channel: &mut Channel<ClientMsg>,
     reference: &str,
@@ -924,19 +1306,18 @@ async fn wait_channel_success(
                 return Err(guest_session_error(
                     reference,
                     format!("SSH {context} failed"),
-                ));
+                ))
             }
             Some(ChannelMsg::Close) | None => {
                 return Err(guest_session_error(
                     reference,
                     format!("SSH channel closed during {context}"),
-                ));
+                ))
             }
             _ => {}
         }
     }
 }
-
 async fn request_agent_forward(
     channel: &mut Channel<ClientMsg>,
     reference: &str,
@@ -948,162 +1329,79 @@ async fn request_agent_forward(
     wait_channel_success(channel, reference, "request SSH agent forwarding").await
 }
 
-fn command_line(program: &str, args: &[String], options: &ExecOptions) -> String {
+fn ssh_shell_command(options: &SshShellOptions) -> Result<String, LibVmError> {
     let mut command = String::new();
     if let Some(cwd) = &options.cwd {
         command.push_str("cd ");
         command.push_str(&shell_quote(cwd));
-        command.push_str(" && ");
+        if options.best_effort_cwd {
+            command.push_str(" 2>/dev/null || true; ");
+        } else {
+            command.push_str(" && ");
+        }
     }
     command.push_str("exec ");
     if !options.env.is_empty() {
         command.push_str("env");
         for (key, value) in &options.env {
+            if !valid_environment_name(key) {
+                return Err(guest_session_error(
+                    "shell",
+                    format!("invalid environment variable name {key:?}"),
+                ));
+            }
             command.push(' ');
-            command.push_str(&shell_env_assignment(key, value));
+            command.push_str(key);
+            command.push('=');
+            command.push_str(&shell_quote(value));
         }
         command.push(' ');
     }
-    command.push_str(&shell_quote(program));
-    for arg in args {
-        command.push(' ');
-        command.push_str(&shell_quote(arg));
-    }
-    command
+    command.push_str("/bin/sh -lc ");
+    command.push_str(&shell_quote(DEFAULT_LOGIN_SHELL_SCRIPT));
+    Ok(command)
 }
 
-fn attach_shell_needs_exec(options: &AttachOptions) -> bool {
-    options.cwd.is_some() || !options.env.is_empty()
+fn valid_environment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphabetic() || index > 0 && byte.is_ascii_digit()
+        })
 }
 
-fn attach_shell_command_line(options: &AttachOptions) -> String {
-    let args = vec!["-lc".to_string(), DEFAULT_LOGIN_SHELL_SCRIPT.to_string()];
-    command_line("/bin/sh", &args, &attach_as_exec_options(options))
+fn legacy_ssh_command(argv: &[String]) -> Result<String, LibVmError> {
+    let cwd = std::env::current_dir().map_err(|error| {
+        guest_session_error("run", format!("resolve current working directory: {error}"))
+    })?;
+    let command = argv
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!(
+        "cd {} 2>/dev/null || true; exec {command}",
+        shell_quote(&cwd.to_string_lossy())
+    ))
 }
-
-fn attach_as_exec_options(options: &AttachOptions) -> ExecOptions {
-    ExecOptions {
-        args: options.args.clone(),
-        cwd: options.cwd.clone(),
-        user: options.user.clone(),
-        env: options.env.clone(),
-        timeout: None,
-        stdin: StdinMode::Pipe,
-        tty: true,
-        forward_agent: options.forward_agent,
-    }
-}
-
-fn shell_env_assignment(key: &str, value: &str) -> String {
-    format!("{}={}", shell_env_key(key), shell_quote(value))
-}
-
-fn shell_env_key(key: &str) -> String {
-    key.chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-        .collect::<String>()
-}
-
 fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
-fn spawn_exec_reader<F>(reference: String, events_tx: mpsc::Sender<ExecEvent>, future: F)
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    tokio::spawn(async move {
-        future.await;
-        drop(events_tx);
-        drop(reference);
-    });
-}
-
-async fn handle_exec_channel_msg(events_tx: &mpsc::Sender<ExecEvent>, msg: ChannelMsg) -> bool {
-    match msg {
-        ChannelMsg::Data { data } => events_tx
-            .send(ExecEvent::Stdout(data.to_vec()))
-            .await
-            .is_err(),
-        ChannelMsg::ExtendedData { data, .. } => events_tx
-            .send(ExecEvent::Stderr(data.to_vec()))
-            .await
-            .is_err(),
-        ChannelMsg::ExitStatus { exit_status } => events_tx
-            .send(ExecEvent::Exited {
-                code: exit_status as i32,
-            })
-            .await
-            .is_err(),
-        ChannelMsg::ExitSignal {
-            signal_name,
-            error_message,
-            ..
-        } => {
-            let message = if error_message.is_empty() {
-                format!("guest process exited by signal {signal_name:?}")
-            } else {
-                error_message
-            };
-            if events_tx
-                .send(ExecEvent::Stderr(message.into_bytes()))
-                .await
-                .is_err()
-            {
-                return true;
-            }
-            events_tx
-                .send(ExecEvent::Exited { code: 128 })
-                .await
-                .is_err()
-        }
-        ChannelMsg::Close => true,
-        _ => false,
-    }
-}
-
-fn spawn_stdin_writer(
-    reference: String,
-    channel: Arc<ChannelWriteHalf<ClientMsg>>,
-    mut stdin_rx: mpsc::Receiver<Vec<u8>>,
-    events_tx: mpsc::Sender<ExecEvent>,
-) {
-    tokio::spawn(async move {
-        while let Some(data) = stdin_rx.recv().await {
-            if let Err(error) = channel.data_bytes(data).await {
-                let _ = events_tx
-                    .send(ExecEvent::StdinError {
-                        message: format!("write stdin for {reference}: {error}"),
-                    })
-                    .await;
-                return;
-            }
-        }
-        if let Err(error) = channel.eof().await {
-            let _ = events_tx
-                .send(ExecEvent::StdinError {
-                    message: format!("close stdin for {reference}: {error}"),
-                })
-                .await;
-        }
-    });
-}
-
-async fn attach_stdio(
+async fn attach_ssh_stdio(
     reference: String,
     channel: Channel<ClientMsg>,
     detach_keys: Vec<u8>,
     _client: GuestSshClient,
-) -> Result<ExitStatus, LibVmError> {
-    let _raw_terminal = RawTerminalGuard::new().map_err(|error| {
+) -> Result<SshExitStatus, LibVmError> {
+    let _terminal = RawTerminalGuard::new().map_err(|error| {
         guest_session_error(&reference, format!("enable raw terminal: {error}"))
     })?;
-    let (mut channel_rx, channel_tx) = channel.split();
-    let channel_tx = Arc::new(channel_tx);
+    let (mut rx, tx) = channel.split();
+    let tx = Arc::new(tx);
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let mut input_buf = [0_u8; 1024];
-    let mut match_pos = 0usize;
+    let mut input = [0_u8; 1024];
+    let mut match_pos = 0;
     let mut exit_code = None;
     let mut detached = false;
     let mut stdin_closed = false;
@@ -1112,104 +1410,119 @@ async fn attach_stdio(
             |error| guest_session_error(&reference, format!("listen for terminal resize: {error}")),
         )?;
     let mut resize_signal_open = true;
-
     loop {
         tokio::select! {
-            read = stdin.read(&mut input_buf), if !stdin_closed => {
+            read = stdin.read(&mut input), if !stdin_closed => {
                 let read = read.map_err(|error| guest_session_error(&reference, format!("read terminal input: {error}")))?;
                 if read == 0 {
                     stdin_closed = true;
-                    channel_tx
-                        .eof()
-                        .await
-                        .map_err(|error| ssh_error(&reference, "close terminal input", error))?;
-                    continue;
-                }
-                let data = &input_buf[..read];
-                if input_contains_detach_sequence(data, &detach_keys, &mut match_pos) {
+                    tx.eof().await.map_err(|error| ssh_error(&reference, "close terminal input", error))?;
+                } else if input_contains_detach_sequence(&input[..read], &detach_keys, &mut match_pos) {
                     detached = true;
                     break;
+                } else {
+                    tx.data_bytes(input[..read].to_vec()).await.map_err(|error| ssh_error(&reference, "write terminal input", error))?;
                 }
-                channel_tx
-                    .data_bytes(data.to_vec())
-                    .await
-                    .map_err(|error| ssh_error(&reference, "write terminal input", error))?;
             }
             resized = resize_signal.recv(), if resize_signal_open => {
                 if resized.is_none() {
                     resize_signal_open = false;
-                    continue;
+                } else {
+                    resize_attached_pty(&reference, tx.as_ref()).await?;
                 }
-                resize_attached_pty(&reference, channel_tx.as_ref()).await?;
             }
-            msg = channel_rx.wait() => {
-                let Some(msg) = msg else {
-                    break;
-                };
-                match msg {
-                    ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
-                        stdout
-                            .write_all(&data)
-                            .await
-                            .map_err(|error| guest_session_error(&reference, format!("write terminal output: {error}")))?;
-                        stdout
-                            .flush()
-                            .await
-                            .map_err(|error| guest_session_error(&reference, format!("flush terminal output: {error}")))?;
-                    }
-                    ChannelMsg::ExitStatus { exit_status } => {
-                        exit_code = Some(exit_status as i32);
-                    }
-                    ChannelMsg::ExitSignal { .. } => {
-                        exit_code = Some(128);
-                    }
-                    ChannelMsg::Close => break,
-                    _ => {}
+            message = rx.wait() => match message {
+                Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    stdout.write_all(&data).await.map_err(|error| guest_session_error(&reference, format!("write terminal output: {error}")))?;
+                    stdout.flush().await.map_err(|error| guest_session_error(&reference, format!("flush terminal output: {error}")))?;
                 }
+                Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status as i32),
+                Some(ChannelMsg::ExitSignal { .. }) => exit_code = Some(128),
+                Some(ChannelMsg::Close) | None => break,
+                _ => {}
             }
         }
     }
-
-    attached_exit_status(&reference, exit_code, detached)
+    ssh_exit_status(&reference, exit_code, detached)
 }
 
-fn attached_exit_status(
+async fn stream_ssh_stdio(
+    reference: String,
+    channel: Channel<ClientMsg>,
+    _client: GuestSshClient,
+) -> Result<SshExitStatus, LibVmError> {
+    let (mut rx, tx) = channel.split();
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut stderr = tokio::io::stderr();
+    let mut input = [0_u8; 8192];
+    let mut stdin_closed = false;
+    let mut exit_code = None;
+    loop {
+        tokio::select! {
+            read = stdin.read(&mut input), if !stdin_closed => {
+                let read = read.map_err(|error| guest_session_error(&reference, format!("read command input: {error}")))?;
+                if read == 0 {
+                    stdin_closed = true;
+                    tx.eof().await.map_err(|error| ssh_error(&reference, "close command input", error))?;
+                } else {
+                    tx.data_bytes(input[..read].to_vec()).await.map_err(|error| ssh_error(&reference, "write command input", error))?;
+                }
+            }
+            message = rx.wait() => match message {
+                Some(ChannelMsg::Data { data }) => {
+                    stdout.write_all(&data).await.map_err(|error| guest_session_error(&reference, format!("write command stdout: {error}")))?;
+                    stdout.flush().await.map_err(|error| guest_session_error(&reference, format!("flush command stdout: {error}")))?;
+                }
+                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    stderr.write_all(&data).await.map_err(|error| guest_session_error(&reference, format!("write command stderr: {error}")))?;
+                    stderr.flush().await.map_err(|error| guest_session_error(&reference, format!("flush command stderr: {error}")))?;
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status as i32),
+                Some(ChannelMsg::ExitSignal { .. }) => exit_code = Some(128),
+                Some(ChannelMsg::Close) | None => break,
+                _ => {}
+            }
+        }
+    }
+    ssh_exit_status(&reference, exit_code, false)
+}
+
+fn ssh_exit_status(
     reference: &str,
     exit_code: Option<i32>,
     detached: bool,
-) -> Result<ExitStatus, LibVmError> {
-    if let Some(code) = exit_code {
-        return Ok(ExitStatus {
-            code,
-            success: code == 0,
-        });
-    }
-
+) -> Result<SshExitStatus, LibVmError> {
     if detached {
-        return Ok(ExitStatus {
+        return Ok(SshExitStatus {
             code: 0,
             success: true,
         });
     }
-
-    Err(guest_session_error(
-        reference,
-        "attached guest session ended without an exit status",
-    ))
+    let code = exit_code.ok_or_else(|| {
+        guest_session_error(
+            reference,
+            "attached SSH session ended without an exit status",
+        )
+    })?;
+    Ok(SshExitStatus {
+        code,
+        success: code == 0,
+    })
 }
 
 async fn resize_attached_pty(
     reference: &str,
     channel: &ChannelWriteHalf<ClientMsg>,
 ) -> Result<(), LibVmError> {
-    let (cols, rows) = current_terminal_size();
+    let (columns, rows) = current_terminal_size();
     channel
-        .window_change(cols, rows, 0, 0)
+        .window_change(columns, rows, 0, 0)
         .await
         .map_err(|error| ssh_error(reference, "resize PTY", error))
 }
 
-fn detach_sequence(spec: Option<&str>) -> Result<Vec<u8>, String> {
+fn detach_sequence(spec: Option<&str>) -> Result<Vec<u8>, LibVmError> {
     let Some(spec) = spec else {
         return Ok(vec![DEFAULT_ATTACH_DETACH_KEY]);
     };
@@ -1231,50 +1544,50 @@ fn detach_sequence(spec: Option<&str>) -> Result<Vec<u8>, String> {
                     } else if byte.is_ascii_uppercase() {
                         byte - b'A' + 1
                     } else {
-                        return Err(format!("invalid detach key {part:?}"));
+                        return Err(invalid_detach_key(part));
                     }
                 }
-                _ => return Err(format!("invalid detach key {part:?}")),
+                _ => return Err(invalid_detach_key(part)),
             };
             sequence.push(byte);
         } else if part.len() == 1 {
             sequence.push(part.as_bytes()[0]);
         } else {
-            return Err(format!("invalid detach key {part:?}"));
+            return Err(invalid_detach_key(part));
         }
     }
-
     if sequence.is_empty() {
         sequence.push(DEFAULT_ATTACH_DETACH_KEY);
     }
     Ok(sequence)
 }
 
-fn input_contains_detach_sequence(data: &[u8], sequence: &[u8], match_pos: &mut usize) -> bool {
-    for &byte in data {
-        if byte == sequence[*match_pos] {
-            *match_pos += 1;
-            if *match_pos == sequence.len() {
-                *match_pos = 0;
+fn invalid_detach_key(key: &str) -> LibVmError {
+    guest_session_error("shell", format!("invalid detach key {key:?}"))
+}
+fn input_contains_detach_sequence(data: &[u8], sequence: &[u8], position: &mut usize) -> bool {
+    for byte in data {
+        if *byte == sequence[*position] {
+            *position += 1;
+            if *position == sequence.len() {
+                *position = 0;
                 return true;
             }
         } else {
-            *match_pos = usize::from(byte == sequence[0]);
+            *position = usize::from(*byte == sequence[0]);
         }
     }
     false
 }
-
 fn current_terminal_size() -> (u32, u32) {
     let stdout = std::io::stdout();
-    let fd = stdout.as_raw_fd();
     let mut size = libc::winsize {
         ws_row: 0,
         ws_col: 0,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } == 0
+    if unsafe { libc::ioctl(stdout.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == 0
         && size.ws_col > 0
         && size.ws_row > 0
     {
@@ -1283,68 +1596,39 @@ fn current_terminal_size() -> (u32, u32) {
         (80, 24)
     }
 }
-
-fn ssh_signal(signal: i32) -> Option<Sig> {
-    match signal {
-        libc::SIGABRT => Some(Sig::ABRT),
-        libc::SIGALRM => Some(Sig::ALRM),
-        libc::SIGFPE => Some(Sig::FPE),
-        libc::SIGHUP => Some(Sig::HUP),
-        libc::SIGILL => Some(Sig::ILL),
-        libc::SIGINT => Some(Sig::INT),
-        libc::SIGKILL => Some(Sig::KILL),
-        libc::SIGPIPE => Some(Sig::PIPE),
-        libc::SIGQUIT => Some(Sig::QUIT),
-        libc::SIGSEGV => Some(Sig::SEGV),
-        libc::SIGTERM => Some(Sig::TERM),
-        libc::SIGUSR1 => Some(Sig::USR1),
-        _ => None,
-    }
-}
-
 fn resolve_agent_socket(
     reference: &str,
     forward_agent: bool,
 ) -> Result<Option<PathBuf>, LibVmError> {
-    resolve_agent_socket_from_env(reference, forward_agent, std::env::var_os("SSH_AUTH_SOCK"))
-}
-
-fn resolve_agent_socket_from_env(
-    reference: &str,
-    forward_agent: bool,
-    socket: Option<std::ffi::OsString>,
-) -> Result<Option<PathBuf>, LibVmError> {
     if !forward_agent {
         return Ok(None);
     }
-
     #[cfg(unix)]
     {
-        let socket = socket.filter(|value| !value.as_os_str().is_empty());
-        socket.map(PathBuf::from).map(Some).ok_or_else(|| {
-            guest_session_error(
-                reference,
-                "SSH agent forwarding requested, but SSH_AUTH_SOCK is not set",
-            )
-        })
+        std::env::var_os("SSH_AUTH_SOCK")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(Some)
+            .ok_or_else(|| {
+                guest_session_error(
+                    reference,
+                    "SSH agent forwarding requested, but SSH_AUTH_SOCK is not set",
+                )
+            })
     }
-
     #[cfg(not(unix))]
     {
-        let _ = socket;
         Err(guest_session_error(
             reference,
             "SSH agent forwarding is only supported on Unix hosts",
         ))
     }
 }
-
 fn ssh_error(reference: &str, context: &str, error: russh::Error) -> LibVmError {
     guest_session_error(reference, format!("SSH {context}: {error}"))
 }
-
 fn is_transient_ssh_handshake_error(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
+    let value = message.to_ascii_lowercase();
     [
         "disconnected",
         "connection reset",
@@ -1353,11 +1637,10 @@ fn is_transient_ssh_handshake_error(message: &str) -> bool {
         "connection refused",
     ]
     .iter()
-    .any(|needle| message.contains(needle))
-        || message == "eof"
-        || message.ends_with(" eof")
+    .any(|needle| value.contains(needle))
+        || value == "eof"
+        || value.ends_with(" eof")
 }
-
 fn guest_session_error(reference: &str, message: impl Into<String>) -> LibVmError {
     LibVmError::GuestSession {
         reference: reference.to_string(),
@@ -1370,11 +1653,9 @@ struct RawTerminalGuard {
     original: libc::termios,
     enabled: bool,
 }
-
 impl RawTerminalGuard {
     fn new() -> std::io::Result<Self> {
-        let stdin = std::io::stdin();
-        let fd = stdin.as_fd().try_clone_to_owned()?;
+        let fd = std::io::stdin().as_fd().try_clone_to_owned()?;
         if unsafe { libc::isatty(fd.as_raw_fd()) } == 0 {
             return Ok(Self {
                 fd,
@@ -1382,12 +1663,10 @@ impl RawTerminalGuard {
                 enabled: false,
             });
         }
-
         let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
         if unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut original) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-
         let mut raw = original;
         raw.c_iflag &= !(libc::IGNBRK
             | libc::BRKINT
@@ -1403,11 +1682,9 @@ impl RawTerminalGuard {
         raw.c_cflag |= libc::CS8;
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
-
         if unsafe { libc::tcsetattr(fd.as_raw_fd(), libc::TCSAFLUSH, &raw) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-
         Ok(Self {
             fd,
             original,
@@ -1415,7 +1692,6 @@ impl RawTerminalGuard {
         })
     }
 }
-
 impl Drop for RawTerminalGuard {
     fn drop(&mut self) {
         if self.enabled {
@@ -1427,180 +1703,205 @@ impl Drop for RawTerminalGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use protocol::v1::execute_input::Message as ExecuteMessage;
+    use tokio::sync::{watch, Mutex as AsyncMutex};
+
     use crate::machine::session::{
-        attach_shell_command_line, attached_exit_status, command_line, detach_sequence,
-        input_contains_detach_sequence, is_transient_ssh_handshake_error,
-        resolve_agent_socket_from_env, AttachOptions, AttachOptionsBuilder, ExecOptions,
-        ExecOptionsBuilder, StdinMode,
+        apply_default_execution_user, execution_event_from_wire, process_spec, ssh_shell_command,
+        ExecutionControl, ExecutionEvent, ExecutionLostReason, ExecutionOptions, ExecutionResult,
+        SshShellOptions, StdinMode,
     };
-    use crate::LibVmError;
+    use crate::machine::MachineUserConfig;
 
     #[test]
-    fn command_line_quotes_argv_and_options() {
-        let options = ExecOptions {
-            args: vec!["hello world".to_string(), "it's fine".to_string()],
-            cwd: Some("/work dir".to_string()),
-            user: None,
-            env: vec![("RUST_LOG".to_string(), "info debug".to_string())],
-            timeout: None,
-            stdin: StdinMode::Null,
-            tty: false,
-            forward_agent: false,
-        };
-
-        assert_eq!(
-            command_line("cargo test", &options.args, &options),
-            "cd '/work dir' && exec env RUST_LOG='info debug' 'cargo test' 'hello world' 'it'\"'\"'s fine'"
+    fn vmmon_execution_process_spec_preserves_argv_environment_and_pipe_stdin() {
+        let spec = process_spec(
+            "program with spaces".to_string(),
+            ExecutionOptions {
+                args: vec!["one two".to_string()],
+                cwd: Some("/work".to_string()),
+                user: Some("alice".to_string()),
+                env: vec![("KEY".to_string(), "value".to_string())],
+                timeout: None,
+                stdin: StdinMode::Pipe,
+                tty: false,
+                term: "xterm".to_string(),
+            },
         );
-    }
-
-    #[test]
-    fn exec_options_builder_sets_forward_agent() {
-        let options = ExecOptionsBuilder::default().forward_agent(true).build();
-
-        assert!(options.forward_agent);
-    }
-
-    #[test]
-    fn attach_options_builder_sets_forward_agent() {
-        let options = AttachOptionsBuilder::default().forward_agent(true).build();
-
-        assert!(options.forward_agent);
-    }
-
-    #[test]
-    fn transient_ssh_handshake_errors_are_retried() {
-        assert!(is_transient_ssh_handshake_error("Disconnected"));
-        assert!(is_transient_ssh_handshake_error("connection reset by peer"));
-        assert!(is_transient_ssh_handshake_error("unexpected EOF"));
-        assert!(!is_transient_ssh_handshake_error(
-            "public-key authentication failed"
-        ));
-        assert!(!is_transient_ssh_handshake_error(
-            "invalid SSH identification string"
+        assert_eq!(spec.argv, ["program with spaces", "one two"]);
+        assert_eq!(spec.environment[0].name, "KEY");
+        assert_eq!(spec.working_directory.as_deref(), Some("/work"));
+        assert!(matches!(
+            spec.stdio,
+            Some(protocol::v1::process_spec::Stdio::Pipes(
+                protocol::v1::PipeStdio { stdin: true }
+            ))
         ));
     }
 
     #[test]
-    fn attach_shell_command_line_applies_cwd_and_env() {
-        let options = AttachOptions {
-            args: Vec::new(),
-            cwd: Some("/work dir".to_string()),
-            user: None,
-            env: vec![("FOO".to_string(), "bar baz".to_string())],
-            term: "xterm".to_string(),
-            detach_keys: None,
-            forward_agent: false,
+    fn vmmon_execution_process_spec_uses_current_terminal_fallback_for_pty() {
+        let spec = process_spec(
+            "sh".to_string(),
+            ExecutionOptions {
+                tty: true,
+                ..ExecutionOptions::default()
+            },
+        );
+        let Some(protocol::v1::process_spec::Stdio::Pty(pty)) = spec.stdio else {
+            panic!("expected pty");
+        };
+        let size = pty.initial_size.expect("pty size");
+        assert!(size.columns > 0 && size.rows > 0);
+        assert_eq!(pty.terminal.as_deref(), Some("xterm-256color"));
+    }
+
+    #[test]
+    fn structured_execution_inherits_configured_user_without_overriding_explicit_user() {
+        let configured = MachineUserConfig::new("configured", 1000, 1000, "/home/configured");
+        let mut inherited = ExecutionOptions::default();
+        apply_default_execution_user(&mut inherited, Some(&configured));
+        assert_eq!(inherited.user.as_deref(), Some("configured"));
+
+        let mut explicit = ExecutionOptions {
+            user: Some("override".to_string()),
+            ..ExecutionOptions::default()
+        };
+        apply_default_execution_user(&mut explicit, Some(&configured));
+        assert_eq!(explicit.user.as_deref(), Some("override"));
+    }
+
+    #[test]
+    fn vmmon_execution_wire_lost_event_stays_a_lost_terminal_result() {
+        let event = execution_event_from_wire(protocol::v1::ExecutionEvent {
+            event: Some(protocol::v1::execution_event::Event::Lost(
+                protocol::v1::ExecutionLost {
+                    reason: Some(protocol::v1::LostReason::VmmonExited as i32),
+                    message: Some("monitor exited".to_string()),
+                },
+            )),
+        });
+
+        assert_eq!(
+            event,
+            ExecutionEvent::Terminal(ExecutionResult::Lost(crate::machine::ExecutionLost {
+                reason: ExecutionLostReason::VmmonExited,
+                message: Some("monitor exited".to_string()),
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn vmmon_execution_control_splits_large_stdin_without_losing_bytes() {
+        let (requests, mut receiver) = tokio::sync::mpsc::channel(4);
+        let control = ExecutionControl {
+            reference: "dev".to_string(),
+            requests: Arc::new(Mutex::new(Some(requests))),
+            input_open: Arc::new(AtomicBool::new(true)),
+            input_order: Arc::new(AsyncMutex::new(())),
+            request_closed: Arc::new(watch::channel(false).0),
+            pipe_stdin: true,
+        };
+        let input = vec![7; protocol::CHUNK_64_KIB + 3];
+
+        control
+            .write_stdin(input.clone())
+            .await
+            .expect("write stdin");
+
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let request = receiver.recv().await.expect("stdin request");
+            let Some(protocol::v1::execute_input::Message::StdinData(data)) = request.message
+            else {
+                panic!("expected stdin data");
+            };
+            assert!(data.data.len() <= protocol::CHUNK_64_KIB);
+            received.extend_from_slice(&data.data);
+        }
+        assert_eq!(received, input);
+    }
+
+    #[test]
+    fn vmmon_execution_control_hides_unavailable_stdin() {
+        let (requests, _receiver) = tokio::sync::mpsc::channel(1);
+        let control = ExecutionControl {
+            reference: "dev".to_string(),
+            requests: Arc::new(Mutex::new(Some(requests))),
+            input_open: Arc::new(AtomicBool::new(false)),
+            input_order: Arc::new(AsyncMutex::new(())),
+            request_closed: Arc::new(watch::channel(false).0),
+            pipe_stdin: false,
         };
 
-        assert_eq!(
-            attach_shell_command_line(&options),
-            "cd '/work dir' && exec env FOO='bar baz' '/bin/sh' '-lc' 'exec \"${SHELL:-/bin/bash}\" -l || exec /bin/sh'"
-        );
+        assert!(control.stdin().is_none());
     }
 
-    #[test]
-    fn attached_exit_status_uses_observed_status() {
-        let status = attached_exit_status("dev", Some(42), false).expect("status should resolve");
-
-        assert_eq!(status.code, 42);
-        assert!(!status.success);
-    }
-
-    #[test]
-    fn attached_exit_status_allows_explicit_detach_without_guest_status() {
-        let status = attached_exit_status("dev", None, true).expect("detach should resolve");
-
-        assert_eq!(status.code, 0);
-        assert!(status.success);
-    }
-
-    #[test]
-    fn attached_exit_status_errors_without_status_or_detach() {
-        let error = attached_exit_status("dev", None, false)
-            .expect_err("missing status should fail attached session");
-
-        let LibVmError::GuestSession { reference, message } = error else {
-            panic!("expected guest session error");
+    #[tokio::test]
+    async fn concurrent_stdin_closes_publish_exactly_one_eof() {
+        let (requests, mut receiver) = tokio::sync::mpsc::channel(4);
+        let control = ExecutionControl {
+            reference: "dev".to_string(),
+            requests: Arc::new(Mutex::new(Some(requests))),
+            input_open: Arc::new(AtomicBool::new(true)),
+            input_order: Arc::new(AsyncMutex::new(())),
+            request_closed: Arc::new(watch::channel(false).0),
+            pipe_stdin: true,
         };
-        assert_eq!(reference, "dev");
-        assert_eq!(
-            message,
-            "attached guest session ended without an exit status"
-        );
-    }
+        let stdin = control.stdin().expect("stdin writer");
 
-    #[test]
-    fn agent_socket_not_required_when_forwarding_is_disabled() {
-        let socket = resolve_agent_socket_from_env("dev", false, None)
-            .expect("disabled forwarding should not inspect SSH_AUTH_SOCK");
-
-        assert_eq!(socket, None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn agent_socket_uses_ssh_auth_sock_when_forwarding_is_enabled() {
-        let socket = resolve_agent_socket_from_env(
-            "dev",
-            true,
-            Some(std::ffi::OsString::from("/tmp/agent.sock")),
-        )
-        .expect("socket should resolve");
-
-        assert_eq!(socket, Some(std::path::PathBuf::from("/tmp/agent.sock")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn agent_socket_requires_ssh_auth_sock_when_forwarding_is_enabled() {
-        let error = resolve_agent_socket_from_env("dev", true, None)
-            .expect_err("missing socket should fail");
-
-        let LibVmError::GuestSession { reference, message } = error else {
-            panic!("expected guest session error");
-        };
-        assert_eq!(reference, "dev");
-        assert_eq!(
-            message,
-            "SSH agent forwarding requested, but SSH_AUTH_SOCK is not set"
-        );
-    }
-
-    #[cfg(not(unix))]
-    #[test]
-    fn agent_socket_rejects_forwarding_on_non_unix_hosts() {
-        let error = resolve_agent_socket_from_env("dev", true, None)
-            .expect_err("non-Unix hosts should fail");
-
-        let LibVmError::GuestSession { reference, message } = error else {
-            panic!("expected guest session error");
-        };
-        assert_eq!(reference, "dev");
-        assert_eq!(
-            message,
-            "SSH agent forwarding is only supported on Unix hosts"
-        );
-    }
-
-    #[test]
-    fn detach_sequence_defaults_to_ctrl_bracket() {
-        assert_eq!(detach_sequence(None).expect("default keys"), vec![0x1d]);
-        assert_eq!(
-            detach_sequence(Some("ctrl-p,ctrl-q")).expect("keys"),
-            vec![0x10, 0x11]
-        );
-    }
-
-    #[test]
-    fn input_detects_detach_sequence_across_chunks() {
-        let sequence = vec![0x10, 0x11];
-        let mut pos = 0;
-        assert!(!input_contains_detach_sequence(
-            b"abc\x10", &sequence, &mut pos
+        let (control_result, stdin_result) = tokio::join!(control.close_stdin(), stdin.close());
+        assert_ne!(control_result.is_ok(), stdin_result.is_ok());
+        assert!(matches!(
+            receiver.recv().await.and_then(|request| request.message),
+            Some(ExecuteMessage::CloseStdin(_))
         ));
-        assert!(input_contains_detach_sequence(
-            b"\x11def", &sequence, &mut pos
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn closing_requests_cancels_backpressured_eof() {
+        let (requests, mut receiver) = tokio::sync::mpsc::channel(1);
+        requests
+            .try_send(protocol::v1::ExecuteInput {
+                message: Some(ExecuteMessage::StdinData(protocol::v1::StdinData {
+                    data: vec![1].into(),
+                })),
+            })
+            .expect("fill request queue");
+        let control = ExecutionControl {
+            reference: "dev".to_string(),
+            requests: Arc::new(Mutex::new(Some(requests))),
+            input_open: Arc::new(AtomicBool::new(true)),
+            input_order: Arc::new(AsyncMutex::new(())),
+            request_closed: Arc::new(watch::channel(false).0),
+            pipe_stdin: true,
+        };
+        let pending = tokio::spawn({
+            let control = control.clone();
+            async move { control.close_stdin().await }
+        });
+        tokio::task::yield_now().await;
+
+        control.close_requests();
+        assert!(pending.await.expect("join pending EOF").is_err());
+        assert!(matches!(
+            receiver.recv().await.and_then(|request| request.message),
+            Some(ExecuteMessage::StdinData(_))
         ));
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[test]
+    fn ssh_shell_rejects_environment_names_that_change_the_command() {
+        let mut options = SshShellOptions::default();
+        options
+            .env
+            .push(("GOOD; touch /tmp/nope".to_string(), "value".to_string()));
+
+        assert!(ssh_shell_command(&options).is_err());
     }
 }

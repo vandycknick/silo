@@ -55,6 +55,14 @@ pub fn decode_error_detail(bytes: &[u8]) -> Result<v1::ErrorDetail, prost::Decod
     prost::Message::decode(bytes)
 }
 
+pub fn encode_execution_event(event: &v1::ExecutionEvent) -> Vec<u8> {
+    prost::Message::encode_length_delimited_to_vec(event)
+}
+
+pub fn decode_execution_event(bytes: &mut &[u8]) -> Result<v1::ExecutionEvent, prost::DecodeError> {
+    prost::Message::decode_length_delimited(bytes)
+}
+
 pub fn reflection_descriptor_set(
     admitted_services: &[&str],
 ) -> Result<prost_types::FileDescriptorSet, prost::DecodeError> {
@@ -127,7 +135,7 @@ fn truncate_utf8(value: &str, maximum: usize) -> String {
 #[cfg(test)]
 mod tests {
     use prost::Message;
-    use prost_types::FileDescriptorSet;
+    use prost_types::{FileDescriptorProto, FileDescriptorSet};
 
     use crate::{
         decode_error_detail, encode_error_detail, parse_guest_port_args, v1, CHUNK_64_KIB,
@@ -179,9 +187,11 @@ mod tests {
             .filter_map(|file| file.name.as_deref())
             .collect();
         assert!(files.contains(&"common.proto"));
+        assert!(files.contains(&"execution.proto"));
         assert!(files.contains(&"errors.proto"));
         assert!(files.contains(&"filesystem.proto"));
         assert!(files.contains(&"guest.proto"));
+        assert!(files.contains(&"guest_process.proto"));
         assert!(files.contains(&"vm_monitor.proto"));
         assert!(descriptors
             .file
@@ -212,6 +222,8 @@ mod tests {
             service_methods("GuestAgentService"),
             ["GetStatus", "WatchStatus", "GetMetrics", "WatchMetrics"]
         );
+        assert_eq!(service_methods("GuestProcessService"), ["Execute"]);
+        assert_eq!(service_methods("VmExecutionService"), ["Execute"]);
         assert_eq!(
             service_methods("GuestFilesystemService"),
             [
@@ -231,6 +243,126 @@ mod tests {
             data: Some(bytes::Bytes::from_static(b"chunk")),
         };
         assert_eq!(chunk.data.as_deref(), Some(b"chunk".as_slice()));
+    }
+
+    #[test]
+    fn execution_binary_payloads_use_bytes() {
+        let data = bytes::Bytes::from_static(b"payload");
+        assert_eq!(v1::StdinData { data: data.clone() }.data, data);
+        assert_eq!(v1::GuestProcessStdout { data: data.clone() }.data, data);
+        assert_eq!(v1::GuestProcessStderr { data: data.clone() }.data, data);
+        assert_eq!(
+            v1::GuestProcessTerminalOutput { data: data.clone() }.data,
+            data
+        );
+        assert_eq!(v1::ExecutionStdout { data: data.clone() }.data, data);
+        assert_eq!(v1::ExecutionStderr { data: data.clone() }.data, data);
+        assert_eq!(
+            v1::ExecutionTerminalOutput { data: data.clone() }.data,
+            data
+        );
+    }
+
+    #[test]
+    fn execution_streams_have_exact_start_and_control_shapes() {
+        let descriptors =
+            FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).expect("decode descriptors");
+        let message = |name: &str| {
+            descriptors
+                .file
+                .iter()
+                .flat_map(|file| &file.message_type)
+                .find(|message| message.name.as_deref() == Some(name))
+                .expect("message in descriptor")
+        };
+        let field_names = |message: &prost_types::DescriptorProto| {
+            message
+                .field
+                .iter()
+                .filter_map(|field| field.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            field_names(message("GuestProcessInput")),
+            [
+                "start",
+                "stdin_data",
+                "close_stdin",
+                "resize_pty",
+                "signal_process"
+            ]
+        );
+        assert_eq!(
+            field_names(message("ExecuteInput")),
+            [
+                "start",
+                "stdin_data",
+                "close_stdin",
+                "resize_pty",
+                "signal_process"
+            ]
+        );
+        assert_eq!(
+            field_names(message("StartGuestProcess")),
+            [
+                "execution_id",
+                "expected_agent_instance_id",
+                "expected_agent_boot_id",
+                "process"
+            ]
+        );
+        assert_eq!(
+            field_names(message("StartExecution")),
+            ["machine_id", "machine_run_id", "execution_id", "process"]
+        );
+        assert_eq!(
+            field_names(message("GuestProcessEvent")),
+            [
+                "started",
+                "stdout",
+                "stderr",
+                "terminal_output",
+                "exited",
+                "signaled",
+                "launch_failed"
+            ]
+        );
+        assert_eq!(
+            field_names(message("ExecutionEvent")),
+            [
+                "accepted",
+                "started",
+                "stdout",
+                "stderr",
+                "terminal_output",
+                "exited",
+                "signaled",
+                "launch_failed",
+                "lost"
+            ]
+        );
+        assert_eq!(
+            field_names(message("ExecutionTerminalResult")),
+            ["exited", "signaled", "launch_failed", "lost"]
+        );
+
+        let service = |name: &str| {
+            descriptors
+                .file
+                .iter()
+                .flat_map(|file: &FileDescriptorProto| &file.service)
+                .find(|service| service.name.as_deref() == Some(name))
+                .expect("service in descriptor")
+        };
+        for method in &service("GuestProcessService").method {
+            assert_eq!(method.client_streaming, Some(true));
+            assert_eq!(method.server_streaming, Some(true));
+        }
+        for method in &service("VmExecutionService").method {
+            assert_eq!(method.client_streaming, Some(true));
+            assert_eq!(method.server_streaming, Some(true));
+        }
     }
 
     #[test]

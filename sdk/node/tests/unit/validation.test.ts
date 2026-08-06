@@ -3,12 +3,14 @@ import { MachineBuilder } from "../../src/machine.js";
 import { NetworkPolicy } from "../../src/network.js";
 import { ImageSource, type ImageSource as ImageSourceValue, type RuntimeOpenOptions } from "../../src/types.js";
 import {
-  execEventFromNative,
-  execOptionsToNative,
+  executionEventFromNative,
+  executionOptionsToNative,
+  executionResultFromNative,
   imageSourceToNative,
   machineDataFromNative,
   networkToNative,
   runtimeOptionsToNative,
+  sshShellOptionsToNative,
 } from "../../src/convert.js";
 import type { NativeMachineBuilder } from "../../src/internal/napi.js";
 
@@ -177,18 +179,40 @@ describe("NetworkPolicy.define", () => {
 
 describe("exec option and event validation", () => {
   it("converts string stdin into bytes", () => {
-    const native = execOptionsToNative({ stdin: "hello" });
+    const native = executionOptionsToNative({ stdin: "hello" });
     expect(native?.stdin).toBeInstanceOf(Uint8Array);
     expect(new TextDecoder().decode(native?.stdin)).toBe("hello");
   });
 
   it("rejects stdin bytes and pipe stdin together", () => {
-    expect(() => execOptionsToNative({ stdin: "hello", pipeStdin: true })).toThrow(TypeError);
+    expect(() => executionOptionsToNative({ stdin: "hello", pipeStdin: true })).toThrow(TypeError);
   });
 
   it("rejects malformed native exec events instead of inventing values", () => {
-    expect(() => execEventFromNative({ kind: "stdout" })).toThrow(TypeError);
-    expect(() => execEventFromNative({ kind: "exited" })).toThrow(TypeError);
+    expect(() => executionEventFromNative({ kind: "stdout" })).toThrow(TypeError);
+    expect(executionEventFromNative({ kind: "exited" })).toEqual({
+      kind: "exited",
+      code: undefined,
+    });
+  });
+
+  it("preserves signaled and lost terminal results without exit-code fallbacks", () => {
+    expect(executionResultFromNative({ kind: "signaled", signal: 15 })).toEqual({ kind: "signaled", signal: 15 });
+    expect(executionResultFromNative({ kind: "lost", reason: "vmmon_exited" })).toEqual({ kind: "lost", reason: "vmmon_exited", message: undefined });
+  });
+
+  it("keeps SSH agent forwarding on the SSH-only shell options", () => {
+    expect(sshShellOptionsToNative({
+      cwd: "/workspace",
+      forwardAgent: true,
+    })).toEqual({
+      cwd: "/workspace",
+      user: undefined,
+      env: undefined,
+      term: undefined,
+      detachKeys: undefined,
+      forwardAgent: true,
+    });
   });
 });
 

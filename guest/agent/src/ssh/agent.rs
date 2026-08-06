@@ -956,7 +956,22 @@ fn open_session_pty(pty: &PtyRequest) -> nix::Result<OpenptyResult> {
     openpty(Some(&winsize), None)
 }
 
-fn attach_pty_slave(command: &mut Command, slave: OwnedFd) -> io::Result<()> {
+pub(crate) fn open_process_pty(
+    columns: u32,
+    rows: u32,
+    width_px: u32,
+    height_px: u32,
+) -> nix::Result<OpenptyResult> {
+    open_session_pty(&PtyRequest {
+        term: String::new(),
+        cols: columns,
+        rows,
+        width_px,
+        height_px,
+    })
+}
+
+pub(crate) fn attach_pty_slave(command: &mut Command, slave: OwnedFd) -> io::Result<()> {
     let stdin = dup(&slave).map_err(io::Error::from)?;
     let stdout = dup(&slave).map_err(io::Error::from)?;
     command.stdin(Stdio::from(stdin));
@@ -966,9 +981,12 @@ fn attach_pty_slave(command: &mut Command, slave: OwnedFd) -> io::Result<()> {
 }
 
 fn prepare_user_child(command: &mut Command, user: &UserEntry) {
-    let groups = user.groups.clone();
-    let gid = Gid::from_raw(user.gid);
-    let uid = Uid::from_raw(user.uid);
+    prepare_identity_child(command, user.uid, user.gid, user.groups.clone());
+}
+
+pub(crate) fn prepare_identity_child(command: &mut Command, uid: u32, gid: u32, groups: Vec<Gid>) {
+    let gid = Gid::from_raw(gid);
+    let uid = Uid::from_raw(uid);
 
     unsafe {
         command.pre_exec(move || {
@@ -990,7 +1008,7 @@ fn login_shell_arg0(shell: &str) -> OsString {
     arg0
 }
 
-fn prepare_pty_child(command: &mut Command) {
+pub(crate) fn prepare_pty_child(command: &mut Command) {
     unsafe {
         command.pre_exec(|| {
             setsid().map_err(io::Error::from)?;
@@ -1021,6 +1039,25 @@ fn resize_pty(master: &File, pty: &PtyRequest) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+pub(crate) fn resize_process_pty(
+    master: &File,
+    columns: u32,
+    rows: u32,
+    width_px: u32,
+    height_px: u32,
+) -> io::Result<()> {
+    resize_pty(
+        master,
+        &PtyRequest {
+            term: String::new(),
+            cols: columns,
+            rows,
+            width_px,
+            height_px,
+        },
+    )
 }
 
 fn start_agent_forward(
@@ -1218,7 +1255,7 @@ enum OutputStream {
     Stderr,
 }
 
-fn valid_environment_name(name: &str) -> bool {
+pub(crate) fn valid_environment_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -1235,7 +1272,7 @@ fn process_group_from_child(child: &Child) -> eyre::Result<i32> {
     i32::try_from(child.id()).context("SSH session child pid does not fit in i32")
 }
 
-fn signal_process_group(process_group: i32, signal: Signal) {
+pub(crate) fn signal_process_group(process_group: i32, signal: Signal) {
     if process_group <= 0 {
         return;
     }

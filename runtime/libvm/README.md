@@ -84,23 +84,25 @@ selects the owner directory:
 <state-root>/logs/machines/<machine-id>/
   vm.trace.log
   serial.log
+  exec.log
+  exec.log.1
+  exec.log.2
+  exec.log.3
   vm.exit.json
   network/
     netd.log
     audit.jsonl
-  executions/
-    <machine-run-id>/<execution-id>/
 ```
 
-`vm.trace.log`, `serial.log`, `network/netd.log`, and
+`vm.trace.log`, `serial.log`, `exec.log`, `network/netd.log`, and
 `network/audit.jsonl` append across machine starts. `vm.exit.json` is a private,
-atomically replaced lifecycle record, not a byte-log source. The `executions/`
-subtree is reserved for card 119's startup-execution segments and terminal
-records; ordinary `Machine::exec` sessions never create durable execution
-history.
+atomically replaced lifecycle record, not a byte-log source. `exec.log` is a
+best-effort JSON Lines capture of structured execution output. It rotates at 10
+MiB and retains three archives; it is observability, not durable execution
+history, process attachment, or an authoritative terminal result.
 
 Use `Machine::logs` to read logs. It selects exactly one semantic
-`MachineLogSource` (`Monitor`, `Serial`, `Network`, or `NetworkAudit`) and
+`MachineLogSource` (`Monitor`, `Serial`, `Exec`, `Network`, or `NetworkAudit`) and
 returns byte chunks with an output channel. It deliberately does not expose log
 paths or filenames. Network sources return `MachineLogSourceUnavailable` when
 the machine has no private network.
@@ -113,8 +115,8 @@ creation and remains attached while the machine is stopped and across later
 starts. It ends when the reader drops the stream.
 
 The CLI currently exposes monitor diagnostics through `silo logs [--follow]`.
-Card 120 will map public stream names to the same semantic sources, including
-workload replay added by card 119, without exposing filesystem layout.
+Card 120 will map public stream names to the same semantic sources without
+exposing filesystem layout.
 
 ### State Database Reset
 

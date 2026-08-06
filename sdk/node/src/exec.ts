@@ -1,124 +1,87 @@
-import type { NativeExecHandle, NativeExecSink, NativeExecOutput } from "./internal/napi.js";
-import { execEventFromNative, type ExecEvent } from "./convert.js";
+import type {
+  NativeExecutionOutput,
+  NativeExecutionSession,
+  NativeExecutionStdin,
+} from "./internal/napi.js";
+import { executionEventFromNative, executionResultFromNative, type ExecutionEvent } from "./convert.js";
 import { mapNativePromise } from "./errors.js";
-import type { ExitStatus } from "./types.js";
-import { assertPositiveI32, assertPositiveU16, assertUint8Array } from "./validation.js";
+import type { ExecutionResult } from "./types.js";
+import { assertPositiveInteger, assertPositiveU16, assertUint8Array } from "./validation.js";
 
-/** Captured output from `Machine.exec()` or `Machine.shell()`. */
-export class ExecOutput {
-  constructor(private readonly native: NativeExecOutput) {}
+/** Captured bytes and the exact terminal result of a structured execution. */
+export class ExecutionOutput {
+  constructor(private readonly native: NativeExecutionOutput) {}
 
-  /** Guest process exit status. */
-  get status(): ExitStatus {
-    return this.native.status;
+  get result(): ExecutionResult {
+    return executionResultFromNative(this.native.result);
   }
 
-  /** Guest process exit code. */
-  get code(): number {
-    return this.native.status.code;
-  }
-
-  /** True when the guest process exited with code 0. */
-  get success(): boolean {
-    return this.native.status.success;
-  }
-
-  /** Raw stdout bytes. */
-  stdoutBytes(): Uint8Array {
-    return this.native.stdout;
-  }
-
-  /** Raw stderr bytes. */
-  stderrBytes(): Uint8Array {
-    return this.native.stderr;
-  }
-
-  /** Decode stdout as UTF-8. Invalid sequences are replaced. */
-  stdout(): string {
-    return new TextDecoder().decode(this.native.stdout);
-  }
-
-  /** Decode stderr as UTF-8. Invalid sequences are replaced. */
-  stderr(): string {
-    return new TextDecoder().decode(this.native.stderr);
-  }
+  stdoutBytes(): Uint8Array { return this.native.stdout; }
+  stderrBytes(): Uint8Array { return this.native.stderr; }
+  terminalOutputBytes(): Uint8Array { return this.native.terminalOutput; }
+  stdout(): string { return new TextDecoder().decode(this.native.stdout); }
+  stderr(): string { return new TextDecoder().decode(this.native.stderr); }
+  terminalOutput(): string { return new TextDecoder().decode(this.native.terminalOutput); }
 }
 
-/** Writable stdin pipe for a streamed guest command. */
-export class ExecSink {
+/** Writable stdin or PTY input for a structured execution. */
+export class ExecutionStdin {
   private closed = false;
+  constructor(private readonly native: NativeExecutionStdin) {}
 
-  constructor(private readonly native: NativeExecSink) {}
-
-  /** Write UTF-8 text or raw bytes to guest stdin. */
   async write(data: Uint8Array | string): Promise<void> {
-    if (this.closed) throw new Error("exec stdin is closed");
+    if (this.closed) throw new Error("execution stdin is closed");
     const bytes = typeof data === "string" ? new TextEncoder().encode(data) : assertUint8Array(data, "data");
     await mapNativePromise(this.native.write(bytes));
   }
 
-  /** Close stdin. Idempotent. */
-  close(): void {
+  async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    this.native.close();
+    await mapNativePromise(this.native.close());
   }
 }
 
-/** Streaming handle returned by `Machine.spawn()`. */
-export class ExecHandle implements AsyncIterable<ExecEvent> {
-  private stdinTaken = false;
+/** Bidirectional execution call returned by `Machine.spawn()`. */
+export class ExecutionSession implements AsyncIterable<ExecutionEvent> {
+  constructor(private readonly native: NativeExecutionSession) {}
 
-  constructor(private readonly native: NativeExecHandle) {}
-
-  /** Receive the next event, or `null` once the stream has ended. */
-  async recv(): Promise<ExecEvent | null> {
+  async recv(): Promise<ExecutionEvent | null> {
     const event = await mapNativePromise(this.native.recv());
-    return event ? execEventFromNative(event) : null;
+    return event === null ? null : executionEventFromNative(event);
   }
 
-  /** Take ownership of the stdin sink. Returns `null` after the first call. */
-  takeStdin(): ExecSink | null {
-    if (this.stdinTaken) return null;
-    const sink = this.native.takeStdin();
-    if (sink) this.stdinTaken = true;
-    return sink ? new ExecSink(sink) : null;
+  stdin(): ExecutionStdin | null {
+    const stdin = this.native.stdin();
+    return stdin === null ? null : new ExecutionStdin(stdin);
   }
 
-  /** Wait for the guest process to exit. */
-  async wait(): Promise<ExitStatus> {
-    return await mapNativePromise(this.native.wait());
+  async wait(): Promise<ExecutionResult> {
+    return executionResultFromNative(await mapNativePromise(this.native.wait()));
   }
 
-  /** Drain stdout/stderr and wait for the guest process to exit. */
-  async collect(): Promise<ExecOutput> {
-    return new ExecOutput(await mapNativePromise(this.native.collect()));
+  async collect(): Promise<ExecutionOutput> {
+    return new ExecutionOutput(await mapNativePromise(this.native.collect()));
   }
 
-  /** Send a POSIX signal number to the guest process. */
   async signal(signal: number): Promise<void> {
-    await mapNativePromise(this.native.signal(assertPositiveI32(signal, "signal")));
+    await mapNativePromise(this.native.signal(assertPositiveInteger(signal, "signal", 64)));
   }
 
-  /** Kill the guest process. */
-  async kill(): Promise<void> {
-    await mapNativePromise(this.native.kill());
+  async resizePty(rows: number, columns: number): Promise<void> {
+    await mapNativePromise(this.native.resizePty(assertPositiveU16(rows, "rows"), assertPositiveU16(columns, "columns")));
   }
 
-  /** Resize the guest PTY. */
-  async resize(rows: number, cols: number): Promise<void> {
-    await mapNativePromise(this.native.resize(assertPositiveU16(rows, "rows"), assertPositiveU16(cols, "cols")));
-  }
+  closeRequests(): void { this.native.closeRequests(); }
+  cancel(): void { this.native.cancel(); }
 
-  /** Iterate over streamed exec events. */
-  async *[Symbol.asyncIterator](): AsyncIterator<ExecEvent> {
+  async *[Symbol.asyncIterator](): AsyncIterator<ExecutionEvent> {
     while (true) {
       const event = await this.recv();
-      if (!event) return;
+      if (event === null) return;
       yield event;
     }
   }
 }
 
-/** Event emitted by streamed guest commands. */
-export type { ExecEvent } from "./convert.js";
+export type { ExecutionEvent } from "./convert.js";

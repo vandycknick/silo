@@ -9,6 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }
+base64 = "0.23.0"
+chrono = "0.4.45"
 virt = { path = "../../virt/virt" }
 protocol = { path = "../../specs/protocol" }
 vm-spec = { path = "../../specs/vm-spec" }
@@ -35,4 +37,4 @@ thiserror = "2.0.19"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
-uuid = { version = "1.24.0", features = ["v4"] }
+uuid = { version = "1.24.0", features = ["v4", "serde"] }

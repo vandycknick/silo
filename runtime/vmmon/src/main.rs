@@ -6,6 +6,8 @@ use clap::Parser;
 
 mod context;
 mod endpoints;
+mod exec_log;
+mod execution;
 mod exit_command;
 mod exit_status;
 mod ext;
@@ -15,6 +17,7 @@ mod machine;
 mod secure_file;
 mod services;
 mod shutdown;
+mod start_request;
 mod startup;
 mod state;
 
@@ -22,7 +25,8 @@ use crate::context::RuntimeContext;
 use crate::exit_command::ExitCommand;
 use crate::exit_status::{ExitOutcome, ExitStatus};
 use crate::lock::pid::PidGuard;
-use crate::startup::{InheritedPipeFds, StartGate, SyncReporter};
+use crate::start_request::StartRequestPipe;
+use crate::startup::{InheritedPipeFds, SyncReporter};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "vmmon", disable_help_subcommand = true)]
@@ -90,10 +94,11 @@ fn main() -> eyre::Result<()> {
         daemonize(&args, inherited_fds)?;
     }
 
-    let start_gate = StartGate::from_fd(inherited_fds.startpipe)
-        .map_err(|err| eyre::eyre!("open startpipe gate: {err}"))?;
+    let start_request = StartRequestPipe::from_fd(inherited_fds.startpipe)
+        .map_err(|err| eyre::eyre!("open start request pipe: {err}"))?;
     let sync_reporter = SyncReporter::from_fd(inherited_fds.syncpipe)
         .map_err(|err| eyre::eyre!("open syncpipe reporter: {err}"))?;
+    let machine_log_dir = inherited_fds.machine_log_dir;
 
     let trace_file = secure_file::open_append(&args.trace_log)?;
 
@@ -122,7 +127,13 @@ fn main() -> eyre::Result<()> {
         .enable_all()
         .build()
         .map_err(|err| eyre::eyre!("build tokio runtime: {err}"))?
-        .block_on(run(args, start_gate, sync_reporter, serial_file))
+        .block_on(run(
+            args,
+            start_request,
+            sync_reporter,
+            serial_file,
+            machine_log_dir,
+        ))
 }
 
 fn write_serial_generation_boundary(
@@ -140,11 +151,12 @@ fn write_serial_generation_boundary(
 
 async fn run(
     args: Args,
-    start_gate: StartGate,
+    start_request: StartRequestPipe,
     sync_reporter: SyncReporter,
     serial_file: std::fs::File,
+    machine_log_dir: Option<std::os::fd::RawFd>,
 ) -> eyre::Result<()> {
-    let mut start_gate = start_gate;
+    let mut start_request = start_request;
     let mut sync_reporter = sync_reporter;
     let exit_command =
         ExitCommand::from_cli(args.exit_command.clone(), args.exit_command_args.clone())?;
@@ -155,23 +167,47 @@ async fn run(
     );
     let pid_guard = PidGuard::create(&args.pidfile).await?;
 
+    let (exec_log, _exec_log_guard) = match machine_log_dir {
+        Some(fd) => match crate::exec_log::ExecLogDirectory::from_fd(fd)
+            .and_then(crate::exec_log::ExecLogWriter::start)
+        {
+            Ok((writer, guard)) => (Some(writer), Some(guard)),
+            Err(error) => {
+                tracing::warn!(%error, "exec.log is unavailable; execution will continue without capture");
+                (None, None)
+            }
+        },
+        None => (None, None),
+    };
     let startup_inputs = startup::InitInputs {
         machine_id: &args.id,
+        machine_run_id: &args.run_id,
         name: &args.name,
         network_args: &args.network,
         agent_enabled: args.agent_enabled,
         krun_path: &args.krun_path,
         serial_file,
     };
-    let result = match startup::init(&runtime, startup_inputs, &mut start_gate).await {
-        Ok(ctx) => match services::start_services(&runtime, &ctx, &mut sync_reporter).await {
-            Ok(handles) => shutdown::run(runtime, ctx, handles).await,
+    let result = match startup::init(&runtime, startup_inputs, &mut start_request).await {
+        Ok(initialized) => match services::start_services(
+            &runtime,
+            &initialized.context,
+            initialized.startup_command,
+            exec_log.clone(),
+            &mut sync_reporter,
+        )
+        .await
+        {
+            Ok(handles) => shutdown::run(runtime, initialized.context, handles).await,
             Err(err) => Err(err),
         },
         Err(err) => Err(err),
     };
 
     let last_error = result.as_ref().err().map(format_error_chain);
+    if let Some(exec_log) = &exec_log {
+        exec_log.generation(&args.id, &args.run_id, "stopped");
+    }
     if let Some(full_error) = &last_error {
         tracing::error!(error = %full_error, data_dir = %args.data_dir.display(), "vmmon exiting with error");
         let _ = sync_reporter.report_failed(full_error);

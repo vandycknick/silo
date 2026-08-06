@@ -97,14 +97,13 @@ impl Cmd {
         progress.step("Ready", &machine_name);
         progress.finish_success("Started");
 
-        let status = if self.command.is_empty() {
-            guest::attach_shell(&machine, None, false).await?
-        } else if self.tty {
-            guest::attach_command(&machine, None, &self.command, false).await?
+        let code = if self.command.is_empty() {
+            guest::attach_shell(&machine, None, false).await?.code
         } else {
-            guest::run_command_streaming(&machine, None, &self.command, false).await?
+            guest::run_legacy_command(&machine, &self.command, self.tty)
+                .await?
+                .code
         };
-        let code = status.code;
         let should_keep = self.keep || (self.keep_on_failure && code != 0);
 
         if !should_keep {

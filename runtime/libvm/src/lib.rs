@@ -42,8 +42,9 @@ pub use crate::image::{
     ImageSource, ImageSourceKind, Images,
 };
 pub use crate::machine::{
-    resolve_mount_location, AttachOptions, AttachOptionsBuilder, ExecControl, ExecEvent,
-    ExecHandle, ExecOptions, ExecOptionsBuilder, ExecOutput, ExecSink, ExitStatus,
+    resolve_mount_location, ExecutionControl, ExecutionEvent, ExecutionLaunchFailure,
+    ExecutionLaunchFailureReason, ExecutionLost, ExecutionLostReason, ExecutionOptions,
+    ExecutionOptionsBuilder, ExecutionOutput, ExecutionResult, ExecutionSession, ExecutionStdin,
     FileWriteDisposition, GuestBuilder, Machine, MachineAgent, MachineAgentConnection,
     MachineAgentConnectionState, MachineAgentIdentity, MachineAgentMetricReport,
     MachineAgentMetricsObservation, MachineAgentProvisionFailurePolicy,
@@ -61,10 +62,11 @@ pub use crate::machine::{
     MachineProvisionReport, MachineProvisionStatus, MachineProvisionStepReport,
     MachineProvisionStepStatus, MachineProvisioningReport, MachineReadiness,
     MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState, MachineRef,
-    MachineStaleReason, MachineStartOptions, MachineStatus, MachineStopOptions, MachineSystemInfo,
-    MachineUpdate, MachineUserConfig, MachineUserUpdate, MachineVmSnapshot, MachineVmState,
-    MachineWaitOptions, Memory, NetworkLaunch, NetworkLaunchSecret, NetworkPolicyUpdate,
-    OAuthRefreshHook, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
+    MachineStaleReason, MachineStartOptions, MachineStartupCommand, MachineStatus,
+    MachineStopOptions, MachineSystemInfo, MachineUpdate, MachineUserConfig, MachineUserUpdate,
+    MachineVmSnapshot, MachineVmState, MachineWaitOptions, Memory, NetworkLaunch,
+    NetworkLaunchSecret, NetworkPolicyUpdate, OAuthRefreshHook, SshExitStatus, SshShellOptions,
+    SshShellOptionsBuilder, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
     MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition, NetworkDriver,

@@ -4,14 +4,14 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use libvm::{
-    AttachOptionsBuilder, ExecControl, ExecEvent, ExecHandle, ExecOptionsBuilder, ExecOutput,
-    ExecSink, ExitStatus, ImageDetail, ImageHandle, ImageLayerDetail, ImagePruneReport,
+    ExecutionControl, ExecutionEvent, ExecutionOptionsBuilder, ExecutionOutput, ExecutionResult,
+    ExecutionSession, ExecutionStdin, ImageDetail, ImageHandle, ImageLayerDetail, ImagePruneReport,
     ImagePullOptions, ImagePullPolicy, ImageRemoveOptions, ImageSource, Images, LibVmError,
     Machine, MachineBuilder, MachineData, MachineLogChunk, MachineLogOptions, MachineLogOutput,
     MachineLogSource, MachineLogStream, MachineNetworkBuilder, MachineNetworkConfig, MachineRef,
     MachineStatus, Memory, NetworkAuditBuilder, NetworkCredentialBuilder, NetworkEndpointBuilder,
     NetworkForwardBuilder, NetworkPolicy, NetworkRuleBuilder, Runtime, RuntimeConfig,
-    TailscaleTunnelBuilder,
+    SshExitStatus, SshShellOptionsBuilder, TailscaleTunnelBuilder,
 };
 use napi::bindgen_prelude::Uint8Array;
 use napi::{Error, Result, Status};
@@ -134,7 +134,7 @@ pub struct NativeNetworkForwardInput {
 }
 
 #[napi(object)]
-pub struct NativeExecOptionsInput {
+pub struct NativeExecutionOptionsInput {
     pub args: Option<Vec<String>>,
     pub cwd: Option<String>,
     pub user: Option<String>,
@@ -143,12 +143,10 @@ pub struct NativeExecOptionsInput {
     pub stdin: Option<Uint8Array>,
     pub pipe_stdin: Option<bool>,
     pub tty: Option<bool>,
-    pub forward_agent: Option<bool>,
 }
 
 #[napi(object)]
-pub struct NativeAttachOptionsInput {
-    pub args: Option<Vec<String>>,
+pub struct NativeSshShellOptionsInput {
     pub cwd: Option<String>,
     pub user: Option<String>,
     pub env: Option<Vec<NativeKeyValue>>,
@@ -204,23 +202,35 @@ pub struct NativeNetworkData {
 }
 
 #[napi(object)]
-pub struct NativeExitStatus {
+pub struct NativeExecutionResult {
+    pub kind: String,
+    pub code: Option<u32>,
+    pub signal: Option<u32>,
+    pub reason: Option<String>,
+    pub message: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeSshExitStatus {
     pub code: i32,
     pub success: bool,
 }
 
 #[napi(object)]
-pub struct NativeExecOutput {
-    pub status: NativeExitStatus,
+pub struct NativeExecutionOutput {
+    pub result: NativeExecutionResult,
     pub stdout: Uint8Array,
     pub stderr: Uint8Array,
+    pub terminal_output: Uint8Array,
 }
 
 #[napi(object)]
-pub struct NativeExecEvent {
+pub struct NativeExecutionEvent {
     pub kind: String,
     pub data: Option<Uint8Array>,
-    pub code: Option<i32>,
+    pub code: Option<u32>,
+    pub signal: Option<u32>,
+    pub reason: Option<String>,
     pub message: Option<String>,
 }
 
@@ -281,14 +291,22 @@ pub struct NativeImages {
     inner: Images,
 }
 
-#[napi(js_name = "NativeExecHandle")]
-pub struct NativeExecHandle {
-    inner: Mutex<Option<ExecHandle>>,
+#[napi(js_name = "NativeExecutionSession")]
+pub struct NativeExecutionSession {
+    inner: Mutex<ExecutionSessionState>,
+    control: ExecutionControl,
 }
 
-#[napi(js_name = "NativeExecSink")]
-pub struct NativeExecSink {
-    inner: Mutex<Option<ExecSink>>,
+#[napi(js_name = "NativeExecutionStdin")]
+pub struct NativeExecutionStdin {
+    inner: ExecutionStdin,
+}
+
+struct ExecutionSessionState {
+    session: Option<ExecutionSession>,
+    operation_in_flight: bool,
+    closed: bool,
+    cancellation: watch::Sender<bool>,
 }
 
 #[napi(js_name = "NativeMachineLogHandle")]
@@ -570,11 +588,11 @@ impl NativeMachine {
         &self,
         program: String,
         args: Option<Vec<String>>,
-        options: Option<NativeExecOptionsInput>,
-    ) -> Result<NativeExecOutput> {
+        options: Option<NativeExecutionOptionsInput>,
+    ) -> Result<NativeExecutionOutput> {
         let machine = self.inner.clone();
         let output = run_exec(machine, program, args.unwrap_or_default(), options).await?;
-        Ok(exec_output_to_native(output))
+        Ok(execution_output_to_native(output))
     }
 
     #[napi]
@@ -582,12 +600,14 @@ impl NativeMachine {
         &self,
         program: String,
         args: Option<Vec<String>>,
-        options: Option<NativeExecOptionsInput>,
-    ) -> Result<NativeExecHandle> {
+        options: Option<NativeExecutionOptionsInput>,
+    ) -> Result<NativeExecutionSession> {
         let machine = self.inner.clone();
-        let handle = spawn_exec(machine, program, args.unwrap_or_default(), options).await?;
-        Ok(NativeExecHandle {
-            inner: Mutex::new(Some(handle)),
+        let session = spawn_exec(machine, program, args.unwrap_or_default(), options).await?;
+        let control = session.control();
+        Ok(NativeExecutionSession {
+            inner: Mutex::new(ExecutionSessionState::new(session)),
+            control,
         })
     }
 
@@ -595,11 +615,11 @@ impl NativeMachine {
     pub async fn shell(
         &self,
         script: String,
-        options: Option<NativeExecOptionsInput>,
-    ) -> Result<NativeExecOutput> {
+        options: Option<NativeExecutionOptionsInput>,
+    ) -> Result<NativeExecutionOutput> {
         let machine = self.inner.clone();
         let output = run_shell(machine, script, options).await?;
-        Ok(exec_output_to_native(output))
+        Ok(execution_output_to_native(output))
     }
 
     #[napi]
@@ -607,21 +627,22 @@ impl NativeMachine {
         &self,
         program: String,
         args: Option<Vec<String>>,
-        options: Option<NativeAttachOptionsInput>,
-    ) -> Result<NativeExitStatus> {
+        options: Option<NativeExecutionOptionsInput>,
+    ) -> Result<NativeExecutionResult> {
         let machine = self.inner.clone();
         let status = attach(machine, program, args.unwrap_or_default(), options).await?;
-        Ok(exit_status_to_native(status))
+        Ok(execution_result_to_native(status))
     }
 
     #[napi(js_name = "attachShell")]
     pub async fn attach_shell(
         &self,
-        options: Option<NativeAttachOptionsInput>,
-    ) -> Result<NativeExitStatus> {
+        options: Option<NativeSshShellOptionsInput>,
+    ) -> Result<NativeSshExitStatus> {
         let machine = self.inner.clone();
-        let status = attach_shell(machine, options).await?;
-        Ok(exit_status_to_native(status))
+        attach_shell(machine, options)
+            .await
+            .map(ssh_exit_status_to_native)
     }
 
     #[napi]
@@ -765,134 +786,178 @@ impl MachineLogHandleState {
 }
 
 #[napi]
-impl NativeExecHandle {
+impl NativeExecutionSession {
     #[napi]
-    pub async fn recv(&self) -> Result<Option<NativeExecEvent>> {
-        let mut handle = self.take_handle()?;
-        let event = handle.recv().await.map(exec_event_to_native);
-        if event.is_some() {
-            self.replace_handle(handle)?;
+    pub async fn recv(&self) -> Result<Option<NativeExecutionEvent>> {
+        let (mut session, mut cancellation) = self.begin_operation()?;
+        let event = tokio::select! {
+            biased;
+            _ = cancellation.changed() => {
+                self.finish_operation(None)?;
+                return Err(execution_session_closed());
+            }
+            event = session.recv() => event,
+        };
+        match event {
+            Ok(Some(event)) => {
+                let terminal = matches!(event, ExecutionEvent::Terminal(_));
+                let event = execution_event_to_native(event);
+                self.finish_operation((!terminal).then_some(session))?;
+                Ok(Some(event))
+            }
+            Ok(None) => {
+                self.finish_operation(None)?;
+                Ok(None)
+            }
+            Err(error) => {
+                self.finish_operation(None)?;
+                Err(to_napi_error(error))
+            }
         }
-        Ok(event)
     }
 
-    #[napi(js_name = "takeStdin")]
-    pub fn take_stdin(&self) -> Result<Option<NativeExecSink>> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| invalid_state("exec handle lock is poisoned"))?;
-        let handle = guard
-            .as_mut()
-            .ok_or_else(|| invalid_state("exec handle is closed"))?;
-        Ok(handle.take_stdin().map(|inner| NativeExecSink {
-            inner: Mutex::new(Some(inner)),
-        }))
+    #[napi(js_name = "stdin")]
+    pub fn stdin(&self) -> Result<Option<NativeExecutionStdin>> {
+        Ok(self
+            .control
+            .stdin()
+            .map(|inner| NativeExecutionStdin { inner }))
     }
 
     #[napi]
-    pub async fn wait(&self) -> Result<NativeExitStatus> {
-        let mut handle = self.take_handle()?;
-        handle
-            .wait()
-            .await
-            .map(exit_status_to_native)
-            .map_err(to_napi_error)
+    pub async fn wait(&self) -> Result<NativeExecutionResult> {
+        let (mut session, mut cancellation) = self.begin_operation()?;
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.changed() => Err(execution_session_closed()),
+            result = session.wait() => result.map(execution_result_to_native).map_err(to_napi_error),
+        };
+        self.finish_operation(None)?;
+        result
     }
 
     #[napi]
-    pub async fn collect(&self) -> Result<NativeExecOutput> {
-        let mut handle = self.take_handle()?;
-        handle
-            .collect()
-            .await
-            .map(exec_output_to_native)
-            .map_err(to_napi_error)
+    pub async fn collect(&self) -> Result<NativeExecutionOutput> {
+        let (mut session, mut cancellation) = self.begin_operation()?;
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.changed() => Err(execution_session_closed()),
+            result = session.collect() => result.map(execution_output_to_native).map_err(to_napi_error),
+        };
+        self.finish_operation(None)?;
+        result
     }
 
     #[napi]
-    pub async fn signal(&self, signal: i32) -> Result<()> {
-        let control = self.control()?;
-        control.signal(signal).await.map_err(to_napi_error)
+    pub async fn signal(&self, signal: u32) -> Result<()> {
+        self.control.signal(signal).await.map_err(to_napi_error)
     }
 
-    #[napi]
-    pub async fn kill(&self) -> Result<()> {
-        let control = self.control()?;
-        control.kill().await.map_err(to_napi_error)
-    }
-
-    #[napi]
-    pub async fn resize(&self, rows: u32, cols: u32) -> Result<()> {
+    #[napi(js_name = "resizePty")]
+    pub async fn resize_pty(&self, rows: u32, cols: u32) -> Result<()> {
         let rows = u16::try_from(rows).map_err(|_| invalid_arg("rows must fit in u16"))?;
         let cols = u16::try_from(cols).map_err(|_| invalid_arg("cols must fit in u16"))?;
-        let control = self.control()?;
-        control.resize(rows, cols).await.map_err(to_napi_error)
+        self.control
+            .resize_pty(rows, cols)
+            .await
+            .map_err(to_napi_error)
+    }
+
+    #[napi(js_name = "closeRequests")]
+    pub fn close_requests(&self) {
+        self.control.close_requests();
+    }
+
+    #[napi]
+    pub fn cancel(&self) -> Result<()> {
+        self.control.close_requests();
+        self.inner
+            .lock()
+            .map_err(|_| invalid_state("execution session lock is poisoned"))?
+            .close();
+        Ok(())
     }
 }
 
-impl NativeExecHandle {
-    fn take_handle(&self) -> Result<ExecHandle> {
+impl NativeExecutionSession {
+    fn begin_operation(&self) -> Result<(ExecutionSession, watch::Receiver<bool>)> {
         self.inner
             .lock()
-            .map_err(|_| invalid_state("exec handle lock is poisoned"))?
-            .take()
-            .ok_or_else(|| invalid_state("exec handle is closed"))
+            .map_err(|_| invalid_state("execution session lock is poisoned"))?
+            .begin_operation()
     }
 
-    fn replace_handle(&self, handle: ExecHandle) -> Result<()> {
-        *self
-            .inner
+    fn finish_operation(&self, session: Option<ExecutionSession>) -> Result<()> {
+        self.inner
             .lock()
-            .map_err(|_| invalid_state("exec handle lock is poisoned"))? = Some(handle);
+            .map_err(|_| invalid_state("execution session lock is poisoned"))?
+            .finish_operation(session)
+    }
+}
+
+impl ExecutionSessionState {
+    fn new(session: ExecutionSession) -> Self {
+        let (cancellation, _) = watch::channel(false);
+        Self {
+            session: Some(session),
+            operation_in_flight: false,
+            closed: false,
+            cancellation,
+        }
+    }
+
+    fn begin_operation(&mut self) -> Result<(ExecutionSession, watch::Receiver<bool>)> {
+        if self.closed {
+            return Err(execution_session_closed());
+        }
+        if self.operation_in_flight {
+            return Err(invalid_state(
+                "execution session already has an active receiver",
+            ));
+        }
+        let session = self.session.take().ok_or_else(execution_session_closed)?;
+        self.operation_in_flight = true;
+        Ok((session, self.cancellation.subscribe()))
+    }
+
+    fn finish_operation(&mut self, session: Option<ExecutionSession>) -> Result<()> {
+        if !self.operation_in_flight {
+            return Err(invalid_state("execution session has no active receiver"));
+        }
+        self.operation_in_flight = false;
+        if self.closed {
+            return Ok(());
+        }
+        match session {
+            Some(session) => self.session = Some(session),
+            None => self.close(),
+        }
         Ok(())
     }
 
-    fn control(&self) -> Result<ExecControl> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| invalid_state("exec handle lock is poisoned"))?;
-        guard
-            .as_ref()
-            .map(ExecHandle::control)
-            .ok_or_else(|| invalid_state("exec handle is closed"))
+    fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        self.session = None;
+        self.cancellation.send_replace(true);
     }
 }
 
 #[napi]
-impl NativeExecSink {
+impl NativeExecutionStdin {
     #[napi]
     pub async fn write(&self, data: Uint8Array) -> Result<()> {
-        let sink = self.take_sink()?;
-        let result = sink.write(data.as_ref().to_vec()).await;
-        if result.is_ok() {
-            self.replace_sink(sink)?;
-        }
-        result.map_err(to_napi_error)
+        self.inner
+            .write(data.as_ref().to_vec())
+            .await
+            .map_err(to_napi_error)
     }
 
     #[napi]
-    pub fn close(&self) -> Result<()> {
-        self.take_sink().map(|_| ())
-    }
-}
-
-impl NativeExecSink {
-    fn take_sink(&self) -> Result<ExecSink> {
-        self.inner
-            .lock()
-            .map_err(|_| invalid_state("exec stdin lock is poisoned"))?
-            .take()
-            .ok_or_else(|| invalid_state("exec stdin is closed"))
-    }
-
-    fn replace_sink(&self, sink: ExecSink) -> Result<()> {
-        *self
-            .inner
-            .lock()
-            .map_err(|_| invalid_state("exec stdin lock is poisoned"))? = Some(sink);
-        Ok(())
+    pub async fn close(&self) -> Result<()> {
+        self.inner.close().await.map_err(to_napi_error)
     }
 }
 
@@ -980,11 +1045,11 @@ async fn run_exec(
     machine: Machine,
     program: String,
     args: Vec<String>,
-    options: Option<NativeExecOptionsInput>,
-) -> Result<ExecOutput> {
+    options: Option<NativeExecutionOptionsInput>,
+) -> Result<ExecutionOutput> {
     machine
         .exec_with(program, |builder| {
-            apply_exec_options(builder.args(args), options)
+            apply_execution_options(builder.args(args), options)
         })
         .await
         .map_err(to_napi_error)
@@ -994,11 +1059,11 @@ async fn spawn_exec(
     machine: Machine,
     program: String,
     args: Vec<String>,
-    options: Option<NativeExecOptionsInput>,
-) -> Result<ExecHandle> {
+    options: Option<NativeExecutionOptionsInput>,
+) -> Result<ExecutionSession> {
     machine
         .spawn_with(program, |builder| {
-            apply_exec_options(builder.args(args), options)
+            apply_execution_options(builder.args(args), options)
         })
         .await
         .map_err(to_napi_error)
@@ -1007,10 +1072,10 @@ async fn spawn_exec(
 async fn run_shell(
     machine: Machine,
     script: String,
-    options: Option<NativeExecOptionsInput>,
-) -> Result<ExecOutput> {
+    options: Option<NativeExecutionOptionsInput>,
+) -> Result<ExecutionOutput> {
     machine
-        .shell_with(script, |builder| apply_exec_options(builder, options))
+        .shell_with(script, |builder| apply_execution_options(builder, options))
         .await
         .map_err(to_napi_error)
 }
@@ -1019,11 +1084,11 @@ async fn attach(
     machine: Machine,
     program: String,
     args: Vec<String>,
-    options: Option<NativeAttachOptionsInput>,
-) -> Result<ExitStatus> {
+    options: Option<NativeExecutionOptionsInput>,
+) -> Result<ExecutionResult> {
     machine
         .attach_with(program, |builder| {
-            apply_attach_options(builder.args(args), options)
+            apply_execution_options(builder.args(args), options).tty(true)
         })
         .await
         .map_err(to_napi_error)
@@ -1031,18 +1096,18 @@ async fn attach(
 
 async fn attach_shell(
     machine: Machine,
-    options: Option<NativeAttachOptionsInput>,
-) -> Result<ExitStatus> {
+    options: Option<NativeSshShellOptionsInput>,
+) -> Result<SshExitStatus> {
     machine
-        .attach_shell_with(|builder| apply_attach_options(builder, options))
+        .attach_shell_with(|builder| apply_ssh_shell_options(builder, options))
         .await
         .map_err(to_napi_error)
 }
 
-fn apply_exec_options(
-    mut builder: ExecOptionsBuilder,
-    options: Option<NativeExecOptionsInput>,
-) -> ExecOptionsBuilder {
+fn apply_execution_options(
+    mut builder: ExecutionOptionsBuilder,
+    options: Option<NativeExecutionOptionsInput>,
+) -> ExecutionOptionsBuilder {
     let Some(options) = options else {
         return builder;
     };
@@ -1071,22 +1136,16 @@ fn apply_exec_options(
     if let Some(tty) = options.tty {
         builder = builder.tty(tty);
     }
-    if let Some(forward_agent) = options.forward_agent {
-        builder = builder.forward_agent(forward_agent);
-    }
     builder
 }
 
-fn apply_attach_options(
-    mut builder: AttachOptionsBuilder,
-    options: Option<NativeAttachOptionsInput>,
-) -> AttachOptionsBuilder {
+fn apply_ssh_shell_options(
+    mut builder: SshShellOptionsBuilder,
+    options: Option<NativeSshShellOptionsInput>,
+) -> SshShellOptionsBuilder {
     let Some(options) = options else {
         return builder;
     };
-    if let Some(args) = options.args {
-        builder = builder.args(args);
-    }
     if let Some(cwd) = options.cwd {
         builder = builder.cwd(cwd);
     }
@@ -1256,7 +1315,7 @@ fn validate_endpoint_input(input: &NativeNetworkEndpointInput) -> Result<()> {
             _ => {
                 return Err(invalid_arg(format!(
                     "unsupported endpoint protocol {protocol:?}"
-                )))
+                )));
             }
         }
     }
@@ -1599,59 +1658,139 @@ fn network_to_native(network: MachineNetworkConfig) -> NativeNetworkData {
     }
 }
 
-fn exec_output_to_native(output: ExecOutput) -> NativeExecOutput {
-    NativeExecOutput {
-        status: exit_status_to_native(output.status()),
+fn execution_output_to_native(output: ExecutionOutput) -> NativeExecutionOutput {
+    NativeExecutionOutput {
+        result: execution_result_to_native(output.result().clone()),
         stdout: output.stdout_bytes().to_vec().into(),
         stderr: output.stderr_bytes().to_vec().into(),
+        terminal_output: output.terminal_output_bytes().to_vec().into(),
     }
 }
 
-fn exit_status_to_native(status: ExitStatus) -> NativeExitStatus {
-    NativeExitStatus {
+fn execution_result_to_native(result: ExecutionResult) -> NativeExecutionResult {
+    match result {
+        ExecutionResult::Exited { code } => NativeExecutionResult {
+            kind: "exited".to_string(),
+            code,
+            signal: None,
+            reason: None,
+            message: None,
+        },
+        ExecutionResult::Signaled { signal } => NativeExecutionResult {
+            kind: "signaled".to_string(),
+            code: None,
+            signal,
+            reason: None,
+            message: None,
+        },
+        ExecutionResult::LaunchFailed(failure) => NativeExecutionResult {
+            kind: "launch_failed".to_string(),
+            code: None,
+            signal: None,
+            reason: Some(execution_launch_failure_reason(failure.reason).to_string()),
+            message: failure.message,
+        },
+        ExecutionResult::Lost(lost) => NativeExecutionResult {
+            kind: "lost".to_string(),
+            code: None,
+            signal: None,
+            reason: Some(execution_lost_reason(lost.reason).to_string()),
+            message: lost.message,
+        },
+    }
+}
+
+fn execution_launch_failure_reason(reason: libvm::ExecutionLaunchFailureReason) -> &'static str {
+    match reason {
+        libvm::ExecutionLaunchFailureReason::Unspecified => "unspecified",
+        libvm::ExecutionLaunchFailureReason::CommandNotFound => "command_not_found",
+        libvm::ExecutionLaunchFailureReason::InvalidProcessSpec => "invalid_process_spec",
+        libvm::ExecutionLaunchFailureReason::WorkingDirectoryNotFound => {
+            "working_directory_not_found"
+        }
+        libvm::ExecutionLaunchFailureReason::WorkingDirectoryNotDirectory => {
+            "working_directory_not_directory"
+        }
+        libvm::ExecutionLaunchFailureReason::InvalidIdentity => "invalid_identity",
+        libvm::ExecutionLaunchFailureReason::IdentityNotFound => "identity_not_found",
+        libvm::ExecutionLaunchFailureReason::PermissionDenied => "permission_denied",
+        libvm::ExecutionLaunchFailureReason::SpawnFailed => "spawn_failed",
+        libvm::ExecutionLaunchFailureReason::CancelledBeforeStart => "cancelled_before_start",
+    }
+}
+
+fn execution_lost_reason(reason: libvm::ExecutionLostReason) -> &'static str {
+    match reason {
+        libvm::ExecutionLostReason::Unspecified => "unspecified",
+        libvm::ExecutionLostReason::AgentInstanceReplaced => "agent_instance_replaced",
+        libvm::ExecutionLostReason::AgentBootReplaced => "agent_boot_replaced",
+        libvm::ExecutionLostReason::AgentUnavailable => "agent_unavailable",
+        libvm::ExecutionLostReason::GuestStreamLost => "guest_stream_lost",
+        libvm::ExecutionLostReason::VmStopped => "vm_stopped",
+        libvm::ExecutionLostReason::VmmonExited => "vmmon_exited",
+    }
+}
+
+fn ssh_exit_status_to_native(status: SshExitStatus) -> NativeSshExitStatus {
+    NativeSshExitStatus {
         code: status.code,
         success: status.success,
     }
 }
 
-fn exec_event_to_native(event: ExecEvent) -> NativeExecEvent {
+fn execution_event_to_native(event: ExecutionEvent) -> NativeExecutionEvent {
     match event {
-        ExecEvent::Started => NativeExecEvent {
+        ExecutionEvent::Accepted => NativeExecutionEvent {
+            kind: "accepted".to_string(),
+            data: None,
+            code: None,
+            signal: None,
+            reason: None,
+            message: None,
+        },
+        ExecutionEvent::Started => NativeExecutionEvent {
             kind: "started".to_string(),
             data: None,
             code: None,
+            signal: None,
+            reason: None,
             message: None,
         },
-        ExecEvent::Stdout(data) => NativeExecEvent {
+        ExecutionEvent::Stdout(data) => NativeExecutionEvent {
             kind: "stdout".to_string(),
             data: Some(data.into()),
             code: None,
+            signal: None,
+            reason: None,
             message: None,
         },
-        ExecEvent::Stderr(data) => NativeExecEvent {
+        ExecutionEvent::Stderr(data) => NativeExecutionEvent {
             kind: "stderr".to_string(),
             data: Some(data.into()),
             code: None,
+            signal: None,
+            reason: None,
             message: None,
         },
-        ExecEvent::Exited { code } => NativeExecEvent {
-            kind: "exited".to_string(),
-            data: None,
-            code: Some(code),
+        ExecutionEvent::TerminalOutput(data) => NativeExecutionEvent {
+            kind: "terminal_output".to_string(),
+            data: Some(data.into()),
+            code: None,
+            signal: None,
+            reason: None,
             message: None,
         },
-        ExecEvent::Failed { message } => NativeExecEvent {
-            kind: "failed".to_string(),
-            data: None,
-            code: None,
-            message: Some(message),
-        },
-        ExecEvent::StdinError { message } => NativeExecEvent {
-            kind: "stdin_error".to_string(),
-            data: None,
-            code: None,
-            message: Some(message),
-        },
+        ExecutionEvent::Terminal(result) => {
+            let result = execution_result_to_native(result);
+            NativeExecutionEvent {
+                kind: result.kind,
+                data: None,
+                code: result.code,
+                signal: result.signal,
+                reason: result.reason,
+                message: result.message,
+            }
+        }
     }
 }
 
@@ -1659,6 +1798,7 @@ fn machine_log_source_from_native(source: &str) -> Result<MachineLogSource> {
     match source {
         "monitor" => Ok(MachineLogSource::Monitor),
         "serial" => Ok(MachineLogSource::Serial),
+        "exec" => Ok(MachineLogSource::Exec),
         "network" => Ok(MachineLogSource::Network),
         "networkAudit" => Ok(MachineLogSource::NetworkAudit),
         _ => Err(invalid_arg(format!(
@@ -1803,6 +1943,10 @@ fn machine_log_handle_busy() -> Error {
     invalid_state("machine log handle is busy")
 }
 
+fn execution_session_closed() -> Error {
+    invalid_state("execution session is closed")
+}
+
 #[cfg(test)]
 mod tests {
     use libvm::{MachineLogChunk, MachineLogOutput, MachineNetworkConfig, NetworkPolicy};
@@ -1873,6 +2017,7 @@ mod tests {
     fn machine_log_source_requires_one_semantic_source() {
         assert!(machine_log_source_from_native("monitor").is_ok());
         assert!(machine_log_source_from_native("serial").is_ok());
+        assert!(machine_log_source_from_native("exec").is_ok());
         assert!(machine_log_source_from_native("network").is_ok());
         assert!(machine_log_source_from_native("networkAudit").is_ok());
         assert!(machine_log_source_from_native("network_audit").is_err());

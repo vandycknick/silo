@@ -34,12 +34,16 @@ pub use logs::{
 pub use memory::Memory;
 pub use mounts::resolve_mount_location;
 pub use reference::MachineRef;
+pub(crate) use session::launch_failure_reason;
 pub use session::{
-    AttachOptions, AttachOptionsBuilder, ExecControl, ExecEvent, ExecHandle, ExecOptions,
-    ExecOptionsBuilder, ExecOutput, ExecSink, ExitStatus, StdinMode,
+    ExecutionControl, ExecutionEvent, ExecutionLaunchFailure, ExecutionLaunchFailureReason,
+    ExecutionLost, ExecutionLostReason, ExecutionOptions, ExecutionOptionsBuilder, ExecutionOutput,
+    ExecutionResult, ExecutionSession, ExecutionStdin, SshExitStatus, SshShellOptions,
+    SshShellOptionsBuilder, StdinMode,
 };
 pub use start::{
-    MachineExitCommand, MachineStartOptions, NetworkLaunch, NetworkLaunchSecret, OAuthRefreshHook,
+    MachineExitCommand, MachineStartOptions, MachineStartupCommand, NetworkLaunch,
+    NetworkLaunchSecret, OAuthRefreshHook,
 };
 pub use streams::{
     FileWriteDisposition, MachineAgentConnection, MachineAgentConnectionState,
