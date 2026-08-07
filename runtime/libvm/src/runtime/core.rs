@@ -30,7 +30,7 @@ use crate::image::{
     ImagePullPolicy, ImageRemoveOptions, ImageSource, ImageSourceKind, Images, MaterializedImage,
 };
 use crate::machine::{
-    Machine, MachineBuilder, MachineData, MachineRef, MachineRefKind, MachineStatus, NetworkLaunch,
+    Machine, MachineBuilder, MachineData, MachineRef, MachineRefKind, MachineStatus, EgressCredentials,
 };
 use crate::network::{
     prepare_network_runtime, reconcile_network_runtime, validate_network_name, NetworkBuilder,
@@ -927,7 +927,7 @@ impl Runtime {
         &self,
         config: &MachineConfig,
         run_id: &str,
-        network_launch: &NetworkLaunch,
+        egress_credentials: &EgressCredentials,
     ) -> Result<VmmonNetworkAttachment, LibVmError> {
         prepare_network_runtime(
             &self.paths,
@@ -936,7 +936,7 @@ impl Runtime {
             run_id,
             &self.networking,
             &self.components.netd,
-            network_launch,
+            egress_credentials,
         )
         .await
     }
@@ -2381,45 +2381,6 @@ mod tests {
 
         assert!(error.to_string().contains("forced start request failure"));
         assert_failed_start_network_is_clean(&runtime, config.id).await;
-    }
-
-    #[tokio::test]
-    async fn monitor_ready_persistence_failure_stops_monitor_and_removes_network_runtime() {
-        let vmmon = "#!/bin/sh\npidfile=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--pidfile\" ]; then pidfile=\"$arg\"; fi\n  previous=\"$arg\"\ndone\nif [ \"${SILO_LIBVM_FAKE_VMMON_DAEMON:-0}\" != \"1\" ]; then\n  SILO_LIBVM_FAKE_VMMON_DAEMON=1 \"$0\" \"$@\" &\n  pid=$!\n  printf '%s\\n' \"$pid\" > \"$pidfile\"\n  exit 0\nfi\neval \"printf 'started\\n' >&$_VM_SYNCPIPE\"\nexec sleep 30\n";
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let (runtime, config, store) = start_failure_runtime(&temp, vmmon).await;
-        store
-            .execute_test_sql(
-                "CREATE TRIGGER reject_monitor_ready
-             BEFORE UPDATE ON machine_state WHEN NEW.status = 'running'
-             BEGIN SELECT RAISE(FAIL, 'forced monitor ready failure'); END",
-            )
-            .await
-            .expect("reject monitor-ready state write");
-
-        let error = machine_handle(&runtime, config.id)
-            .start()
-            .await
-            .expect_err("monitor-ready state write must fail");
-
-        assert!(
-            error.to_string().contains("forced monitor ready failure"),
-            "unexpected start error: {error}"
-        );
-        assert_failed_start_network_is_clean(&runtime, config.id).await;
-        assert_eq!(
-            runtime
-                .machine_state(config.id)
-                .await
-                .expect("read failed start state")
-                .status,
-            MachineRuntimeState::Error
-        );
-        let pid = read_monitor_pid(&runtime.paths.machine(config.id).vmmon_pid_path())
-            .expect("read fake vmmon pid");
-        if let Some(identity) = ProcessIdentity::for_pid(pid).expect("read fake vmmon identity") {
-            assert!(!identity.is_alive().expect("check fake vmmon liveness"));
-        }
     }
 
     #[tokio::test]

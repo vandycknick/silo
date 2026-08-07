@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::paths::LocalPaths;
 use crate::store::models::MachineConfig;
 use crate::store::DataStore;
-use crate::{LibVmError, NetworkLaunch, RuntimeNetworkingConfig};
+use crate::{LibVmError, EgressCredentials, RuntimeNetworkingConfig};
 
 use super::VmmonNetworkAttachment;
 
@@ -30,7 +30,7 @@ pub(super) struct NetworkDriverContext<'a> {
     pub(super) run_id: &'a str,
     pub(super) config: &'a RuntimeNetworkingConfig,
     pub(super) netd_path: &'a Path,
-    pub(super) network_launch: &'a NetworkLaunch,
+    pub(super) egress_credentials: &'a EgressCredentials,
 }
 
 #[async_trait]

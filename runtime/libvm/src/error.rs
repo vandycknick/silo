@@ -84,8 +84,8 @@ pub enum LibVmError {
     #[error("machine start failed: {primary}; cleanup also failed: {cleanup}")]
     MachineStartCleanupFailed { primary: String, cleanup: String },
 
-    #[error("startup command {failure}")]
-    StartupCommandLaunchFailed {
+    #[error("entrypoint {failure}")]
+    EntrypointLaunchFailed {
         failure: crate::machine::ExecutionLaunchFailure,
     },
 

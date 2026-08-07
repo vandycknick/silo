@@ -8,7 +8,7 @@ use nix::unistd::pipe;
 use serde::Deserialize;
 use tokio::io::unix::AsyncFd;
 
-use crate::machine::{ExecutionLaunchFailure, MachineExitCommand};
+use crate::machine::{ExecutionLaunchFailure, HostCommand};
 use crate::network::VmmonNetworkAttachment;
 use crate::paths::OwnedDirectory;
 use crate::store::models::MachineId;
@@ -34,7 +34,7 @@ pub(crate) struct VmmonLaunch<'a> {
     pub(crate) trace_log: &'a Path,
     pub(crate) network: &'a VmmonNetworkAttachment,
     pub(crate) run_id: &'a str,
-    pub(crate) exit_command: Option<&'a MachineExitCommand>,
+    pub(crate) exit_command: Option<&'a HostCommand>,
     pub(crate) agent_enabled: bool,
     pub(crate) startup_command: Option<&'a VmmonStartupCommand>,
     pub(crate) machine_log_dir: &'a OwnedDirectory,
@@ -113,7 +113,7 @@ impl Vmmon {
     }
 }
 
-fn append_exit_command_args(command: &mut Command, exit_command: &MachineExitCommand) {
+fn append_exit_command_args(command: &mut Command, exit_command: &HostCommand) {
     command.arg("--exit-command").arg(&exit_command.command);
     for arg in &exit_command.args {
         command.arg("--exit-command-arg").arg(arg);
@@ -188,7 +188,7 @@ fn startup_result(result: StartupResult) -> Result<(), LibVmError> {
         StartupResult::Started => Ok(()),
         StartupResult::Failed(message) => Err(io::Error::other(message).into()),
         StartupResult::StartupCommandLaunchFailed { reason, message } => {
-            Err(LibVmError::StartupCommandLaunchFailed {
+            Err(LibVmError::EntrypointLaunchFailed {
                 failure: ExecutionLaunchFailure {
                     reason: crate::machine::launch_failure_reason(reason),
                     message,
@@ -338,7 +338,7 @@ mod tests {
 
     use nix::unistd::pipe;
 
-    use crate::machine::{ExecutionLaunchFailureReason, MachineExitCommand};
+    use crate::machine::{ExecutionLaunchFailureReason, HostCommand};
 
     use crate::vmmon::start_request::{
         encode_start_request, VmmonEnvironmentVariable, VmmonProcessSpec, VmmonStartRequest,
@@ -560,7 +560,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            crate::LibVmError::StartupCommandLaunchFailed { failure }
+            crate::LibVmError::EntrypointLaunchFailed { failure }
                 if failure.reason == ExecutionLaunchFailureReason::CommandNotFound
                     && failure.message.as_deref() == Some("missing")
         ));
@@ -569,16 +569,13 @@ mod tests {
     #[test]
     fn append_exit_command_args_preserves_structured_argv() {
         let mut command = Command::new("/tmp/vmmon");
-        let exit_command = MachineExitCommand::new(
-            "/usr/local/bin/silo",
-            [
-                OsString::from("cleanup"),
-                OsString::from("--data-dir"),
-                OsString::from("/tmp/silo"),
-                OsString::from("--machine-id"),
-                OsString::from("0123456789abcdef0123456789abcdef"),
-            ],
-        );
+        let exit_command = HostCommand::new("/usr/local/bin/silo").args([
+            OsString::from("cleanup"),
+            OsString::from("--data-dir"),
+            OsString::from("/tmp/silo"),
+            OsString::from("--machine-id"),
+            OsString::from("0123456789abcdef0123456789abcdef"),
+        ]);
 
         append_exit_command_args(&mut command, &exit_command);
 

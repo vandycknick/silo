@@ -1,6 +1,6 @@
 use libvm::{
     ExecutionLaunchFailureReason, ExecutionResult, ImageSource, LibVmError, MachineLogOptions,
-    MachineLogSource, MachineReadinessOutcome, MachineStartupCommand, MachineUserConfig, Runtime,
+    MachineLogSource, MachineReadinessOutcome, MachineUserConfig, Runtime,
 };
 use std::time::Duration;
 use tokio_stream::StreamExt as _;
@@ -32,14 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let start = machine
         .start_with(|options| {
-            options.startup_command(MachineStartupCommand {
-                argv: vec![
-                    "/usr/bin/printf".to_string(),
-                    "startup-command-output\n".to_string(),
-                ],
-                working_directory: None,
-                environment: Vec::new(),
-                user: None,
+            options.entrypoint("/usr/bin/printf", |entrypoint| {
+                entrypoint.arg("entrypoint-output\n")
             })
         })
         .await;
@@ -49,13 +43,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let exit = machine.wait().await?;
-    if !exec_log_contains(&machine, "startup-command-output\n").await? {
+    if !exec_log_contains(&machine, "entrypoint-output\n").await? {
         let _ = machine.remove().await;
-        return Err("exec.log did not capture detached startup stdout".into());
+        return Err("exec.log did not capture detached entrypoint stdout".into());
     }
 
-    eprintln!("startup command acknowledged Started and vmmon exited: {exit:?}");
-    eprintln!("exec.log captured detached startup output");
+    eprintln!("entrypoint acknowledged Started and vmmon exited: {exit:?}");
+    eprintln!("exec.log captured detached entrypoint output");
     machine.remove().await?;
 
     let machine = runtime
@@ -65,33 +59,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let failure = machine
         .start_with(|options| {
-            options.startup_command(MachineStartupCommand {
-                argv: vec!["/silo-missing-startup-command".to_string()],
-                working_directory: None,
-                environment: Vec::new(),
-                user: None,
-            })
+            options.entrypoint("/silo-missing-entrypoint", |entrypoint| entrypoint)
         })
         .await;
     match failure {
-        Err(LibVmError::StartupCommandLaunchFailed { failure })
+        Err(LibVmError::EntrypointLaunchFailed { failure })
             if failure.reason == ExecutionLaunchFailureReason::CommandNotFound => {}
         Err(error) => {
             let _ = machine.remove().await;
-            return Err(format!("unexpected startup launch failure: {error}").into());
+            return Err(format!("unexpected entrypoint launch failure: {error}").into());
         }
         Ok(_) => {
             let _ = machine.stop().await;
             let _ = machine.remove().await;
-            return Err("missing startup command unexpectedly reached Started".into());
+            return Err("missing entrypoint unexpectedly reached Started".into());
         }
     }
     if machine.inspect().await?.is_running() {
         let _ = machine.stop().await;
         let _ = machine.remove().await;
-        return Err("failed startup command left the VM running".into());
+        return Err("failed entrypoint left the VM running".into());
     }
-    eprintln!("startup launch failure remained typed and stopped the VM");
+    eprintln!("entrypoint launch failure remained typed and stopped the VM");
     machine.remove().await?;
 
     let machine = runtime

@@ -87,13 +87,13 @@ impl Machine {
                 });
             }
 
-            options.validate_network_launch(&config.network, &config.name)?;
+            options.validate_egress_credentials(&config.network, &config.name)?;
             let root_disk_resize = reconcile_root_disk_size(&config)?;
             let run_uuid = Uuid::new_v4();
             let run_id = run_uuid.to_string();
 
             let resolved_network = runtime
-                .prepare_machine_network(&config, &run_id, &options.network)
+                .prepare_machine_network(&config, &run_id, &options.egress_credentials)
                 .await?;
             let agent_enabled = match runtime.prepare_vmmon_launch_inputs(
                 &config,
@@ -107,10 +107,10 @@ impl Machine {
                     );
                 }
             };
-            if options.startup_command.is_some() && !agent_enabled {
+            if options.entrypoint.is_some() && !agent_enabled {
                 let error = LibVmError::MachinePreparationFailed {
                     reference: config.name.clone(),
-                    message: "startup command requires the managed guest agent".to_string(),
+                    message: "an entrypoint requires the managed guest agent".to_string(),
                 };
                 return Err(
                     finish_failed_start(runtime, &config, &run_id, None, None, error).await,
@@ -142,7 +142,7 @@ impl Machine {
                 trace_log: &trace_path,
                 network: &resolved_network,
                 run_id: &run_id,
-                exit_command: options.exit_command.as_ref(),
+                exit_command: options.on_exit.as_ref(),
                 agent_enabled,
                 startup_command: startup_command.as_ref(),
                 machine_log_dir: &machine_log_dir,

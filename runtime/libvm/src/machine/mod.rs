@@ -42,8 +42,8 @@ pub use session::{
     SshShellOptionsBuilder, StdinMode,
 };
 pub use start::{
-    MachineExitCommand, MachineStartOptions, MachineStartupCommand, NetworkLaunch,
-    NetworkLaunchSecret, OAuthRefreshHook,
+    EgressCredentials, EgressSecret, Entrypoint, HostCommand, LaunchCredentials,
+    MachineStartOptions, OAuthRefreshHook,
 };
 pub use streams::{
     FileWriteDisposition, MachineAgentConnection, MachineAgentConnectionState,

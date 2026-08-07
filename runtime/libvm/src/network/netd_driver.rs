@@ -21,7 +21,7 @@ use tokio::time::sleep;
 use utils::format_mac;
 
 use crate::host;
-use crate::machine::{NetworkLaunch, OAuthRefreshHook};
+use crate::machine::{EgressCredentials, OAuthRefreshHook};
 use crate::paths::{
     LocalPaths, NETWORK_AUDIT_LOG_FILE_NAME, NETWORK_SERVICE_LOG_FILE_NAME, PCAP_FILE_NAME,
     PID_FILE_NAME,
@@ -152,9 +152,9 @@ async fn prepare_netd_runtime(
             static_lease: &static_lease,
         },
     );
-    configure_network_launch_environment(
+    configure_egress_credentials_environment(
         &mut command,
-        ctx.network_launch,
+        ctx.egress_credentials,
         request.policy(),
         &metadata.name,
     )?;
@@ -455,9 +455,9 @@ fn write_runtime_policy_file(
         })
 }
 
-fn configure_network_launch_environment(
+fn configure_egress_credentials_environment(
     command: &mut Command,
-    launch: &NetworkLaunch,
+    launch: &EgressCredentials,
     policy: Option<&NetworkPolicy>,
     reference: &str,
 ) -> Result<(), LibVmError> {
@@ -872,7 +872,7 @@ fn terminate_helper(identity: &ProcessIdentity) -> Result<(), LibVmError> {
 mod tests {
     use super::{
         append_bounded_stderr_line, configure_network_helper_command,
-        configure_network_launch_environment, format_netd_startup_failure, prepare_netd_runtime,
+        configure_egress_credentials_environment, format_netd_startup_failure, prepare_netd_runtime,
         private_ipv4_config, resolve_certificate_authority_paths, CapturedStderrLines,
         NetworkHelperCommandConfig, OAUTH_REFRESH_AUTH_ENV, OAUTH_REFRESH_HOOK_ENV,
         STDERR_CAPTURE_LIMIT,
@@ -886,7 +886,7 @@ mod tests {
     use std::process::Command;
 
     use crate::lock_manager::LockId;
-    use crate::machine::{NetworkLaunch, OAuthRefreshHook};
+    use crate::machine::{EgressCredentials, OAuthRefreshHook};
     use crate::network::core::{NetworkAttachmentRequest, NetworkDriverContext};
     use crate::paths::{LocalPaths, LocalRoots};
     use crate::store::models::{
@@ -1006,9 +1006,9 @@ mod tests {
     }
 
     #[test]
-    fn netd_command_sets_network_launch_environment() {
+    fn netd_command_sets_egress_credentials_environment() {
         let policy = oauth_policy();
-        let launch = NetworkLaunch::new()
+        let launch = EgressCredentials::new()
             .secret("codex.oauth.access_token", "token")
             .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
             .oauth_refresh_hook(
@@ -1020,7 +1020,7 @@ mod tests {
             );
         let mut command = Command::new("/tmp/netd");
 
-        configure_network_launch_environment(&mut command, &launch, Some(&policy), "devbox")
+        configure_egress_credentials_environment(&mut command, &launch, Some(&policy), "devbox")
             .expect("configure launch environment");
 
         let env = command
@@ -1273,7 +1273,7 @@ netd log: /tmp/silo/netd.log";
             .await
             .expect("save machine");
         let networking = RuntimeNetworkingConfig::default();
-        let launch = NetworkLaunch::default();
+        let launch = EgressCredentials::default();
         let context = NetworkDriverContext {
             paths: &paths,
             store: &store,
@@ -1281,7 +1281,7 @@ netd log: /tmp/silo/netd.log";
             run_id: "run-123",
             config: &networking,
             netd_path: &netd,
-            network_launch: &launch,
+            egress_credentials: &launch,
         };
 
         let attachment = prepare_netd_runtime(&context, &NetworkAttachmentRequest::private(None))

@@ -9,62 +9,171 @@ use silo_policy::{NetworkPolicy, NetworkSecretKind};
 use crate::store::models::MachineNetworkConfig;
 use crate::LibVmError;
 
+mod sealed {
+    pub trait Sealed {}
+}
+
 /// Optional settings for starting a machine.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MachineStartOptions {
-    /// Command executed by the local machine monitor after the runtime exits.
+    /// Host command executed by the local machine monitor after the runtime
+    /// exits.
     ///
-    /// When unset, no exit command is registered. The command is passed as
-    /// structured argv and is never interpreted by a shell.
-    pub exit_command: Option<MachineExitCommand>,
-    /// Launch-only network material for this run.
+    /// When unset, no exit hook is registered.
+    pub on_exit: Option<HostCommand>,
+    /// Launch-only egress credentials for this run.
     ///
-    /// Secret values are never persisted in durable machine config. They are
+    /// Credential material is never persisted in durable machine config. It is
     /// validated against the persisted network policy before a network runtime
     /// is launched.
-    pub network: NetworkLaunch,
-    /// Optional vmmon-owned command launched after the managed guest agent is ready.
+    pub egress_credentials: EgressCredentials,
+    /// Optional vmmon-owned guest process this machine run exists to execute.
     ///
-    /// Machine startup is acknowledged only after the guest reports that this
-    /// command started. The command then continues independently, its output is
-    /// captured best-effort in the machine execution log, and vmmon stops the VM
-    /// when it ends. It cannot be attached to or controlled after startup.
-    pub startup_command: Option<MachineStartupCommand>,
+    /// Machine startup is acknowledged only after the guest reports that the
+    /// entrypoint started. The process then continues independently, its
+    /// output is captured best-effort in the machine execution log, and vmmon
+    /// stops the VM when it ends. It cannot be attached to or controlled after
+    /// startup.
+    pub entrypoint: Option<Entrypoint>,
 }
 
-/// A non-interactive command owned by vmmon for one machine run.
+/// Launch-only credential material supplied when starting a machine.
+///
+/// Credentials are consumed on the host for one machine run and are never
+/// persisted in durable machine config. Each implementor's documentation
+/// states which subsystem consumes it and where the material is visible.
+///
+/// This trait is sealed; the set of credential kinds is defined by libvm.
+pub trait LaunchCredentials: sealed::Sealed {
+    #[doc(hidden)]
+    fn apply(self, options: &mut MachineStartOptions);
+}
+
+/// A vmmon-owned guest process that a machine run exists to execute.
+///
+/// Machine start is acknowledged only after the entrypoint launches in the
+/// guest, and vmmon stops the VM when it exits.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MachineStartupCommand {
-    /// Exact guest argv, without shell parsing.
-    pub argv: Vec<String>,
-    /// Guest working directory, or `/` when omitted.
-    pub working_directory: Option<String>,
-    /// Explicit environment variables for the guest process; host ambient
-    /// variables are never inherited.
-    pub environment: Vec<(String, String)>,
-    /// Optional OCI-style user and group selector.
-    pub user: Option<String>,
+pub struct Entrypoint {
+    program: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    env: Vec<(String, String)>,
+    user: Option<String>,
+}
+
+impl Entrypoint {
+    /// Creates an entrypoint for the given guest program path.
+    pub fn new(program: impl Into<String>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            user: None,
+        }
+    }
+
+    /// Appends one argument. Arguments form exact guest argv, without shell
+    /// parsing.
+    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    /// Appends arguments. Arguments form exact guest argv, without shell
+    /// parsing.
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Sets the guest working directory, `/` when unset.
+    pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Adds one explicit guest environment variable; host ambient variables
+    /// are never inherited.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Adds explicit guest environment variables; host ambient variables are
+    /// never inherited.
+    pub fn envs<I, K, V>(mut self, vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.env
+            .extend(vars.into_iter().map(|(key, value)| (key.into(), value.into())));
+        self
+    }
+
+    /// Sets the OCI-style user and group selector.
+    pub fn user(mut self, user: impl Into<String>) -> Self {
+        self.user = Some(user.into());
+        self
+    }
 }
 
 impl MachineStartOptions {
-    /// Sets the vmmon-owned command for this machine run.
-    pub fn startup_command(mut self, command: MachineStartupCommand) -> Self {
-        self.startup_command = Some(command);
+    /// Creates default start options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the guest process this machine run exists to execute.
+    ///
+    /// Machine start is acknowledged only after the entrypoint launches in the
+    /// guest, and vmmon stops the VM when it exits.
+    pub fn entrypoint<F>(mut self, program: impl Into<String>, configure: F) -> Self
+    where
+        F: FnOnce(Entrypoint) -> Entrypoint,
+    {
+        self.entrypoint = Some(configure(Entrypoint::new(program)));
+        self
+    }
+
+    /// Registers a host command for vmmon to execute after this machine run
+    /// exits.
+    pub fn on_exit(mut self, command: HostCommand) -> Self {
+        self.on_exit = Some(command);
+        self
+    }
+
+    /// Supplies launch-only credentials for this run.
+    ///
+    /// The credential type determines which host subsystem consumes the
+    /// material. Different credential kinds compose; a repeated kind replaces
+    /// the earlier value.
+    pub fn credentials(mut self, credentials: impl LaunchCredentials) -> Self {
+        credentials.apply(&mut self);
         self
     }
 
     pub(crate) fn vmmon_startup_command(
         &self,
     ) -> Option<crate::vmmon::start_request::VmmonStartupCommand> {
-        self.startup_command.as_ref().map(|command| {
+        self.entrypoint.as_ref().map(|entrypoint| {
             crate::vmmon::start_request::VmmonStartupCommand {
                 execution_id: uuid::Uuid::new_v4(),
                 process: crate::vmmon::start_request::VmmonProcessSpec {
-                    argv: command.argv.clone(),
-                    working_directory: command.working_directory.clone(),
-                    environment: command
-                        .environment
+                    argv: std::iter::once(entrypoint.program.clone())
+                        .chain(entrypoint.args.iter().cloned())
+                        .collect(),
+                    working_directory: entrypoint.cwd.clone(),
+                    environment: entrypoint
+                        .env
                         .iter()
                         .map(|(name, value)| {
                             crate::vmmon::start_request::VmmonEnvironmentVariable {
@@ -73,27 +182,49 @@ impl MachineStartOptions {
                             }
                         })
                         .collect(),
-                    user: command.user.clone(),
+                    user: entrypoint.user.clone(),
                 },
             }
         })
     }
+
+    pub(crate) fn validate_egress_credentials(
+        &self,
+        network: &MachineNetworkConfig,
+        reference: &str,
+    ) -> Result<(), LibVmError> {
+        self.egress_credentials
+            .validate_for_network_config(network, reference)
+    }
 }
 
-/// Launch-only network material supplied when starting a machine.
+/// Credentials injected into policy-allowed outbound connections by the host
+/// networking component. Never exposed inside the guest.
+///
+/// Secret values are validated against the persisted network policy before a
+/// network runtime is launched and are never persisted in durable machine
+/// config.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct NetworkLaunch {
+pub struct EgressCredentials {
     /// Secret values keyed by canonical network secret slot name.
-    pub secrets: Vec<NetworkLaunchSecret>,
+    pub secrets: Vec<EgressSecret>,
     /// Optional OAuth refresh hook shared by OAuth credentials in this network.
     pub oauth_refresh_hook: Option<OAuthRefreshHook>,
+}
+
+impl sealed::Sealed for EgressCredentials {}
+
+impl LaunchCredentials for EgressCredentials {
+    fn apply(self, options: &mut MachineStartOptions) {
+        options.egress_credentials = self;
+    }
 }
 
 /// Secret value for one canonical network secret slot.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct NetworkLaunchSecret {
+pub struct EgressSecret {
     /// Canonical slot name, for example `codex.oauth.access_token`.
     pub slot: String,
     /// Raw secret bytes. libvm base64-encodes this before handing it to a
@@ -101,10 +232,10 @@ pub struct NetworkLaunchSecret {
     pub value: Vec<u8>,
 }
 
-impl fmt::Debug for NetworkLaunchSecret {
+impl fmt::Debug for EgressSecret {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("NetworkLaunchSecret")
+            .debug_struct("EgressSecret")
             .field("slot", &self.slot)
             .field("value", &"<redacted>")
             .finish()
@@ -140,32 +271,47 @@ impl fmt::Debug for OAuthRefreshHook {
     }
 }
 
-/// Structured command to run after the machine runtime exits.
+/// A command executed on the host by the local machine monitor.
+///
+/// The command is passed as structured argv and is never interpreted by a
+/// shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct MachineExitCommand {
+pub struct HostCommand {
     /// Executable path or binary name.
     pub command: PathBuf,
     /// Arguments passed to the executable.
     pub args: Vec<OsString>,
 }
 
-impl MachineExitCommand {
-    /// Creates a structured exit command.
-    pub fn new<I, A>(command: impl Into<PathBuf>, args: I) -> Self
+impl HostCommand {
+    /// Creates a host command for the given executable.
+    pub fn new(command: impl Into<PathBuf>) -> Self {
+        Self {
+            command: command.into(),
+            args: Vec::new(),
+        }
+    }
+
+    /// Appends one argument.
+    pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    /// Appends arguments.
+    pub fn args<I, A>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = A>,
         A: Into<OsString>,
     {
-        Self {
-            command: command.into(),
-            args: args.into_iter().map(Into::into).collect(),
-        }
+        self.args.extend(args.into_iter().map(Into::into));
+        self
     }
 }
 
-impl NetworkLaunch {
-    /// Creates empty network launch material.
+impl EgressCredentials {
+    /// Creates empty egress credentials.
     pub fn new() -> Self {
         Self::default()
     }
@@ -177,25 +323,16 @@ impl NetworkLaunch {
 
     /// Adds raw secret bytes for a canonical network secret slot.
     pub fn secret_bytes(mut self, slot: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
-        self.secrets.push(NetworkLaunchSecret {
+        self.secrets.push(EgressSecret {
             slot: slot.into(),
             value: value.into(),
         });
         self
     }
 
-    /// Registers the OAuth refresh hook for this network launch.
+    /// Registers the OAuth refresh hook for these credentials.
     pub fn oauth_refresh_hook(mut self, hook: OAuthRefreshHook) -> Self {
         self.oauth_refresh_hook = Some(hook);
-        self
-    }
-
-    /// Merges prebuilt launch material into this builder.
-    pub fn apply(mut self, launch: NetworkLaunch) -> Self {
-        self.secrets.extend(launch.secrets);
-        if launch.oauth_refresh_hook.is_some() {
-            self.oauth_refresh_hook = launch.oauth_refresh_hook;
-        }
         self
     }
 
@@ -218,8 +355,7 @@ impl NetworkLaunch {
                 } else {
                     Err(LibVmError::NetworkRuntime {
                         reference: reference.to_string(),
-                        message: "network launch material requires a private network policy"
-                            .to_string(),
+                        message: "egress credentials require a private network policy".to_string(),
                     })
                 }
             }
@@ -237,7 +373,7 @@ impl NetworkLaunch {
             }
             return Err(LibVmError::NetworkRuntime {
                 reference: reference.to_string(),
-                message: "network launch material requires a persisted network policy".to_string(),
+                message: "egress credentials require a persisted network policy".to_string(),
             });
         };
 
@@ -442,52 +578,40 @@ impl OAuthRefreshHook {
     }
 }
 
-impl MachineStartOptions {
-    /// Creates start options with no exit command.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Registers a command for vmmon to execute after this machine run exits.
-    pub fn exit_command(mut self, exit_command: MachineExitCommand) -> Self {
-        self.exit_command = Some(exit_command);
-        self
-    }
-
-    /// Configures launch-only network material for this machine run.
-    pub fn network<F>(mut self, configure: F) -> Self
-    where
-        F: FnOnce(NetworkLaunch) -> NetworkLaunch,
-    {
-        self.network = configure(self.network);
-        self
-    }
-
-    pub(crate) fn validate_network_launch(
-        &self,
-        network: &MachineNetworkConfig,
-        reference: &str,
-    ) -> Result<(), LibVmError> {
-        self.network.validate_for_network_config(network, reference)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn startup_command_gets_a_fresh_internal_execution_id_per_launch() {
-        let options = MachineStartOptions::default().startup_command(MachineStartupCommand {
-            argv: vec!["/usr/bin/true".to_string()],
-            working_directory: None,
-            environment: Vec::new(),
-            user: None,
-        });
+    fn entrypoint_gets_a_fresh_internal_execution_id_per_launch() {
+        let options =
+            MachineStartOptions::default().entrypoint("/usr/bin/true", |entrypoint| entrypoint);
         let first = options.vmmon_startup_command().expect("first command");
         let second = options.vmmon_startup_command().expect("second command");
         assert_ne!(first.execution_id, second.execution_id);
         assert_eq!(first.process, second.process);
+    }
+
+    #[test]
+    fn entrypoint_builder_produces_exact_guest_argv() {
+        let options = MachineStartOptions::default().entrypoint("/usr/bin/env", |entrypoint| {
+            entrypoint
+                .arg("--split-string=echo hi")
+                .cwd("/app")
+                .env("MODE", "ci")
+                .user("app")
+        });
+        let command = options.vmmon_startup_command().expect("command");
+        assert_eq!(
+            command.process.argv,
+            vec![
+                "/usr/bin/env".to_string(),
+                "--split-string=echo hi".to_string()
+            ]
+        );
+        assert_eq!(command.process.working_directory.as_deref(), Some("/app"));
+        assert_eq!(command.process.environment.len(), 1);
+        assert_eq!(command.process.user.as_deref(), Some("app"));
     }
 
     fn oauth_policy() -> NetworkPolicy {
@@ -538,24 +662,37 @@ mod tests {
         }
 
         let options = accept(|start| {
-            start.network(|network| {
-                network
+            start.credentials(
+                EgressCredentials::new()
                     .secret("codex.oauth.access_token", "token")
-                    .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
-            })
+                    .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z"),
+            )
         });
 
-        assert_eq!(options.network.secrets.len(), 2);
-        assert_eq!(options.network.secrets[0].slot, "codex.oauth.access_token");
-        assert_eq!(options.network.secrets[0].value, b"token");
+        assert_eq!(options.egress_credentials.secrets.len(), 2);
+        assert_eq!(
+            options.egress_credentials.secrets[0].slot,
+            "codex.oauth.access_token"
+        );
+        assert_eq!(options.egress_credentials.secrets[0].value, b"token");
     }
 
     #[test]
-    fn network_launch_requires_required_policy_slots() {
-        let policy = oauth_policy();
-        let launch = NetworkLaunch::new().secret("codex.oauth.access_token", "token");
+    fn repeated_credentials_of_the_same_kind_replace_the_earlier_value() {
+        let options = MachineStartOptions::default()
+            .credentials(EgressCredentials::new().secret("codex.oauth.access_token", "old"))
+            .credentials(EgressCredentials::new().secret("codex.oauth.access_token", "new"));
 
-        let err = launch
+        assert_eq!(options.egress_credentials.secrets.len(), 1);
+        assert_eq!(options.egress_credentials.secrets[0].value, b"new");
+    }
+
+    #[test]
+    fn egress_credentials_require_required_policy_slots() {
+        let policy = oauth_policy();
+        let credentials = EgressCredentials::new().secret("codex.oauth.access_token", "token");
+
+        let err = credentials
             .validate_for_policy(Some(&policy), "devbox")
             .expect_err("missing expires_at should fail");
 
@@ -567,34 +704,34 @@ mod tests {
     }
 
     #[test]
-    fn network_launch_accepts_aws_profile_secret() {
+    fn egress_credentials_accept_aws_profile_secret() {
         let policy = aws_policy();
-        let launch = NetworkLaunch::new().secret("prod.profile", "production-admin");
+        let credentials = EgressCredentials::new().secret("prod.profile", "production-admin");
 
-        launch
+        credentials
             .validate_for_policy(Some(&policy), "devbox")
             .expect("profile should satisfy aws credential requirement");
     }
 
     #[test]
-    fn network_launch_accepts_aws_static_secrets() {
+    fn egress_credentials_accept_aws_static_secrets() {
         let policy = aws_policy();
-        let launch = NetworkLaunch::new()
+        let credentials = EgressCredentials::new()
             .secret("prod.access_key_id", "AKIAEXAMPLE")
             .secret("prod.secret_access_key", "secret")
             .secret("prod.session_token", "session");
 
-        launch
+        credentials
             .validate_for_policy(Some(&policy), "devbox")
             .expect("static keys should satisfy aws credential requirement");
     }
 
     #[test]
-    fn network_launch_rejects_aws_session_token_without_profile_or_static_keys() {
+    fn egress_credentials_reject_aws_session_token_without_profile_or_static_keys() {
         let policy = aws_policy();
-        let launch = NetworkLaunch::new().secret("prod.session_token", "session");
+        let credentials = EgressCredentials::new().secret("prod.session_token", "session");
 
-        let err = launch
+        let err = credentials
             .validate_for_policy(Some(&policy), "devbox")
             .expect_err("session token alone should fail");
 
@@ -608,14 +745,14 @@ mod tests {
     }
 
     #[test]
-    fn network_launch_rejects_unknown_secret_slots() {
+    fn egress_credentials_reject_unknown_secret_slots() {
         let policy = oauth_policy();
-        let launch = NetworkLaunch::new()
+        let credentials = EgressCredentials::new()
             .secret("codex.oauth.access_token", "token")
             .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
             .secret("codex.oauth.refresh_token", "nope");
 
-        let err = launch
+        let err = credentials
             .validate_for_policy(Some(&policy), "devbox")
             .expect_err("unknown refresh token slot should fail");
 
@@ -627,13 +764,13 @@ mod tests {
     }
 
     #[test]
-    fn network_launch_encodes_secret_environment() {
+    fn egress_credentials_encode_secret_environment() {
         let policy = oauth_policy();
-        let launch = NetworkLaunch::new()
+        let credentials = EgressCredentials::new()
             .secret("codex.oauth.access_token", "token")
             .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z");
 
-        let env = launch
+        let env = credentials
             .secret_environment(&policy, "devbox")
             .expect("secret env");
 
@@ -644,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn network_launch_rejects_policy_secret_env_name_collisions() {
+    fn egress_credentials_reject_policy_secret_env_name_collisions() {
         let policy: NetworkPolicy = serde_json::from_str(
             r#"
             {
@@ -660,11 +797,11 @@ mod tests {
             "#,
         )
         .expect("deserialize invalid policy fixture");
-        let launch = NetworkLaunch::new()
+        let credentials = EgressCredentials::new()
             .secret("api-key.token", "left")
             .secret("api_key.token", "right");
 
-        let err = launch
+        let err = credentials
             .validate_for_policy(Some(&policy), "devbox")
             .expect_err("colliding env names should fail before spawning netd");
 
@@ -680,12 +817,12 @@ mod tests {
     #[test]
     fn oauth_refresh_hook_requires_absolute_command_and_auth() {
         let policy = oauth_policy();
-        let launch = NetworkLaunch::new()
+        let credentials = EgressCredentials::new()
             .secret("codex.oauth.access_token", "token")
             .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
             .oauth_refresh_hook(OAuthRefreshHook::new("silo", Vec::<u8>::new()));
 
-        let err = launch
+        let err = credentials
             .validate_for_policy(Some(&policy), "devbox")
             .expect_err("invalid hook should fail");
 
@@ -697,34 +834,34 @@ mod tests {
     }
 
     #[test]
-    fn network_launch_rejects_material_without_private_policy() {
-        let launch = NetworkLaunch::new().secret("codex.oauth.access_token", "token");
+    fn egress_credentials_reject_material_without_private_policy() {
+        let credentials = EgressCredentials::new().secret("codex.oauth.access_token", "token");
 
-        let err = launch
+        let err = credentials
             .validate_for_network_config(&MachineNetworkConfig::None, "devbox")
-            .expect_err("network material without policy should fail");
+            .expect_err("egress credentials without policy should fail");
 
         assert!(matches!(
             err,
             LibVmError::NetworkRuntime { ref message, .. }
-                if message.contains("requires a private network policy")
+                if message.contains("require a private network policy")
         ));
     }
 
     #[test]
-    fn start_options_validate_network_launch_against_private_policy() {
+    fn start_options_validate_egress_credentials_against_private_policy() {
         let policy = oauth_policy();
-        let options = MachineStartOptions::new().network(|network| {
-            network
+        let options = MachineStartOptions::new().credentials(
+            EgressCredentials::new()
                 .secret("codex.oauth.access_token", "token")
                 .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
                 .oauth_refresh_hook(
                     OAuthRefreshHook::new("/usr/bin/silo", b"auth".to_vec()).arg("refresh"),
-                )
-        });
+                ),
+        );
 
         options
-            .validate_network_launch(&private_network(policy), "devbox")
+            .validate_egress_credentials(&private_network(policy), "devbox")
             .expect("valid launch material");
     }
 }

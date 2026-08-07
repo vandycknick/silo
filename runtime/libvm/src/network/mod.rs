@@ -21,7 +21,7 @@ use crate::store::models::{
     NetworkDefinition as ModelNetworkDefinition, NetworkInstance,
 };
 use crate::store::DataStore;
-use crate::{LibVmError, NetworkLaunch, RuntimeNetworkingConfig};
+use crate::{LibVmError, EgressCredentials, RuntimeNetworkingConfig};
 
 use self::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
 use self::netd_driver::NetdDriver;
@@ -75,7 +75,7 @@ pub(crate) async fn prepare_network_runtime(
     run_id: &str,
     config: &RuntimeNetworkingConfig,
     netd_path: &Path,
-    network_launch: &NetworkLaunch,
+    egress_credentials: &EgressCredentials,
 ) -> Result<VmmonNetworkAttachment, LibVmError> {
     reconcile_network_runtime(paths, store, metadata, false).await?;
 
@@ -95,7 +95,7 @@ pub(crate) async fn prepare_network_runtime(
                     run_id,
                     config,
                     netd_path,
-                    network_launch,
+                    egress_credentials,
                 },
                 &request,
             )
@@ -115,7 +115,7 @@ pub(crate) async fn prepare_network_runtime(
                 run_id,
                 &definition,
                 config,
-                network_launch,
+                egress_credentials,
             )
             .await
         }
@@ -168,9 +168,9 @@ async fn resolve_named_network(
     run_id: &str,
     definition: &ModelNetworkDefinition,
     config: &RuntimeNetworkingConfig,
-    network_launch: &NetworkLaunch,
+    egress_credentials: &EgressCredentials,
 ) -> Result<VmmonNetworkAttachment, LibVmError> {
-    let _ = (paths, store, run_id, config, network_launch, definition);
+    let _ = (paths, store, run_id, config, egress_credentials, definition);
     Err(LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
         message:
@@ -632,7 +632,7 @@ mod tests {
             "run-123",
             &RuntimeNetworkingConfig::default(),
             Path::new("/tmp/netd"),
-            &crate::NetworkLaunch::default(),
+            &crate::EgressCredentials::default(),
         )
         .await
         .expect_err("named attachment API should be required");
