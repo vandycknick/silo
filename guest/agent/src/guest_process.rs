@@ -1073,6 +1073,7 @@ fn terminal_event(status: ExitStatus) -> GuestProcessEvent {
     }
 }
 
+#[derive(Debug)]
 struct LaunchFailure {
     reason: LaunchFailureReason,
     message: String,
@@ -1412,7 +1413,7 @@ mod tests {
             })
             .expect("pwd output");
         task.join().expect("driver thread");
-        assert_eq!(output.as_deref(), Some(b"/tmp\n".as_slice()));
+        assert_eq!(output.as_ref(), b"/tmp\n".as_slice());
     }
 
     #[tokio::test]
