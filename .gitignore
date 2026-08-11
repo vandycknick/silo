@@ -45,6 +45,9 @@ downloads/
 eggs/
 .eggs/
 lib/
+# Rust sources under app/cli/lib are not Python library artifacts.
+!app/cli/lib/
+!app/cli/lib/*.rs
 lib64/
 parts/
 sdist/

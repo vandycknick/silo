@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::paths::LocalPaths;
 use crate::store::models::MachineConfig;
 use crate::store::DataStore;
-use crate::{LibVmError, EgressCredentials, RuntimeNetworkingConfig};
+use crate::{EgressCredentials, LibVmError, RuntimeNetworkingConfig};
 
 use super::VmmonNetworkAttachment;
 

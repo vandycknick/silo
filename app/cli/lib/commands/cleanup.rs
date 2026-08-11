@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use eyre::Context as _;
-use libvm::{MachineRef, Runtime, RuntimeConfig};
+use libvm::{MachineRef, MachineRetention, Runtime, RuntimeConfig};
 
 use crate::config::GlobalConfig;
 use crate::context::Context;
@@ -25,9 +25,11 @@ impl Cmd {
         let runtime = Runtime::new(runtime_config)
             .await
             .context("initialize libvm")?;
-        let machine_ref = MachineRef::parse(self.machine_id)?;
-        let machine = runtime.get_machine(&machine_ref).await?;
-        machine.remove().await?;
+        let reference = MachineRef::parse(self.machine_id)?;
+        let machine = runtime.get_machine(&reference).await?;
+        if machine.inspect().await?.retention == MachineRetention::Ephemeral {
+            machine.remove().await?;
+        }
         Ok(())
     }
 }

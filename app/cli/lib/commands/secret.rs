@@ -7,8 +7,8 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{SecondsFormat, Utc};
 use clap::{Args, Subcommand};
 use libvm::{
-    NetworkCredential, NetworkLaunch, NetworkPolicy, NetworkSecretAlternative, NetworkSecretKind,
-    NetworkSecretRequirement, NetworkSecretSlot, OAuthRefreshHook,
+    EgressCredentials, NetworkCredential, NetworkPolicy, NetworkSecretAlternative,
+    NetworkSecretKind, NetworkSecretRequirement, NetworkSecretSlot, OAuthRefreshHook,
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -675,23 +675,23 @@ struct OAuthRefreshGrantCredential {
     secret_key: String,
 }
 
-pub(crate) fn network_launch_from_secret_store(
+pub(crate) fn egress_credentials_from_secret_store(
     policy: &NetworkPolicy,
-) -> eyre::Result<NetworkLaunch> {
+) -> eyre::Result<EgressCredentials> {
     if policy.secret_slots().is_empty() {
-        return Ok(NetworkLaunch::new());
+        return Ok(EgressCredentials::new());
     }
     let hook_command = std::env::current_exe()?;
     let store = SecretStore::from_env()?;
-    network_launch_from_store(policy, &store, &hook_command)
+    egress_credentials_from_store(policy, &store, &hook_command)
 }
 
-fn network_launch_from_store(
+fn egress_credentials_from_store(
     policy: &NetworkPolicy,
     store: &SecretStore,
     hook_command: &Path,
-) -> eyre::Result<NetworkLaunch> {
-    let mut launch = NetworkLaunch::new();
+) -> eyre::Result<EgressCredentials> {
+    let mut credentials = EgressCredentials::new();
     let mut supplied_slots = std::collections::BTreeSet::new();
     for slot in policy.secret_slots() {
         if should_skip_network_slot(policy, store, &slot)? {
@@ -699,7 +699,7 @@ fn network_launch_from_store(
         }
         if let Some(value) = network_secret_value(policy, store, &slot)? {
             supplied_slots.insert(slot.name.clone());
-            launch = launch.secret(slot.name, value);
+            credentials = credentials.secret(slot.name, value);
         }
     }
     let missing = missing_network_secret_requirements(policy, &supplied_slots);
@@ -707,9 +707,9 @@ fn network_launch_from_store(
         eyre::bail!(format_missing_network_secrets(&missing, store.path()));
     }
     if let Some(hook) = oauth_refresh_hook_from_store(policy, store, hook_command)? {
-        launch = launch.oauth_refresh_hook(hook);
+        credentials = credentials.oauth_refresh_hook(hook);
     }
-    Ok(launch)
+    Ok(credentials)
 }
 
 fn oauth_refresh_hook_from_store(
@@ -1949,7 +1949,7 @@ mod tests {
     use crate::commands::Command;
 
     use super::{
-        is_pending_device_poll_response, network_launch_from_store, plain_secret_value,
+        egress_credentials_from_store, is_pending_device_poll_response, plain_secret_value,
         read_json_frame, set_plain_secret, slot_key, write_json_frame, write_plain_secret,
         LoginProvider, OAuthRefreshGrant, OAuthRefreshHookRequest, Secret, SecretStore,
         SecretSubcommand, SetCmd, OPENAI_CODEX_KIND,
@@ -2141,7 +2141,7 @@ mod tests {
     }
 
     #[test]
-    fn network_launch_reads_openai_oauth_secret() {
+    fn egress_credentials_read_openai_oauth_secret() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SecretStore::new(dir.path().join("secrets.json"));
         let key = slot_key(OPENAI_CODEX_KIND, "personal", "oauth");
@@ -2170,13 +2170,16 @@ mod tests {
             }"#,
         );
 
-        let launch =
-            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/silo").as_path())
-                .expect("network launch");
+        let launch = egress_credentials_from_store(
+            &policy,
+            &store,
+            PathBuf::from("/usr/bin/silo").as_path(),
+        )
+        .expect("egress credentials");
 
-        assert_network_secret(&launch, "personal.oauth.access_token", "access-token");
-        assert_network_secret(&launch, "personal.oauth.expires_at", "2026-07-04T00:00:00Z");
-        assert_network_secret(&launch, "personal.oauth.account_id", "acct_123");
+        assert_egress_secret(&launch, "personal.oauth.access_token", "access-token");
+        assert_egress_secret(&launch, "personal.oauth.expires_at", "2026-07-04T00:00:00Z");
+        assert_egress_secret(&launch, "personal.oauth.account_id", "acct_123");
         assert!(!launch
             .secrets
             .iter()
@@ -2203,7 +2206,7 @@ mod tests {
     }
 
     #[test]
-    fn network_launch_reports_missing_oauth_secret_with_hint() {
+    fn egress_credentials_report_missing_oauth_secret_with_hint() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SecretStore::new(dir.path().join("secrets.json"));
         let policy = network_policy(
@@ -2218,9 +2221,12 @@ mod tests {
             }"#,
         );
 
-        let error =
-            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/silo").as_path())
-                .expect_err("missing secret");
+        let error = egress_credentials_from_store(
+            &policy,
+            &store,
+            PathBuf::from("/usr/bin/silo").as_path(),
+        )
+        .expect_err("missing secret");
         let message = error.to_string();
 
         assert!(message.contains("personal.oauth.access_token"));
@@ -2230,7 +2236,7 @@ mod tests {
     }
 
     #[test]
-    fn network_launch_reads_provider_plain_secret() {
+    fn egress_credentials_read_provider_plain_secret() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SecretStore::new(dir.path().join("secrets.json"));
         store
@@ -2253,16 +2259,19 @@ mod tests {
             }"#,
         );
 
-        let launch =
-            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/silo").as_path())
-                .expect("network launch");
+        let launch = egress_credentials_from_store(
+            &policy,
+            &store,
+            PathBuf::from("/usr/bin/silo").as_path(),
+        )
+        .expect("egress credentials");
 
-        assert_network_secret(&launch, "github-api.token", "github-token");
+        assert_egress_secret(&launch, "github-api.token", "github-token");
         assert!(launch.oauth_refresh_hook.is_none());
     }
 
     #[test]
-    fn network_launch_reads_aws_profile_secret() {
+    fn egress_credentials_read_aws_profile_secret() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SecretStore::new(dir.path().join("secrets.json"));
         store
@@ -2291,11 +2300,14 @@ mod tests {
             .expect("write ignored secret key");
         let policy = aws_network_policy();
 
-        let launch =
-            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/silo").as_path())
-                .expect("network launch");
+        let launch = egress_credentials_from_store(
+            &policy,
+            &store,
+            PathBuf::from("/usr/bin/silo").as_path(),
+        )
+        .expect("egress credentials");
 
-        assert_network_secret(&launch, "prod.profile", "production-admin");
+        assert_egress_secret(&launch, "prod.profile", "production-admin");
         assert!(!launch
             .secrets
             .iter()
@@ -2307,7 +2319,7 @@ mod tests {
     }
 
     #[test]
-    fn network_launch_reads_aws_static_secret_pair() {
+    fn egress_credentials_read_aws_static_secret_pair() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SecretStore::new(dir.path().join("secrets.json"));
         store
@@ -2336,17 +2348,20 @@ mod tests {
             .expect("write session token");
         let policy = aws_network_policy();
 
-        let launch =
-            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/silo").as_path())
-                .expect("network launch");
+        let launch = egress_credentials_from_store(
+            &policy,
+            &store,
+            PathBuf::from("/usr/bin/silo").as_path(),
+        )
+        .expect("egress credentials");
 
-        assert_network_secret(&launch, "prod.access_key_id", "AKIAEXAMPLE");
-        assert_network_secret(&launch, "prod.secret_access_key", "secret");
-        assert_network_secret(&launch, "prod.session_token", "session");
+        assert_egress_secret(&launch, "prod.access_key_id", "AKIAEXAMPLE");
+        assert_egress_secret(&launch, "prod.secret_access_key", "secret");
+        assert_egress_secret(&launch, "prod.session_token", "session");
     }
 
     #[test]
-    fn network_launch_reports_missing_aws_profile_or_static_pair() {
+    fn egress_credentials_report_missing_aws_profile_or_static_pair() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SecretStore::new(dir.path().join("secrets.json"));
         store
@@ -2359,9 +2374,12 @@ mod tests {
             .expect("write session token");
         let policy = aws_network_policy();
 
-        let error =
-            network_launch_from_store(&policy, &store, PathBuf::from("/usr/bin/silo").as_path())
-                .expect_err("missing aws credential material");
+        let error = egress_credentials_from_store(
+            &policy,
+            &store,
+            PathBuf::from("/usr/bin/silo").as_path(),
+        )
+        .expect_err("missing aws credential material");
         let message = error.to_string();
 
         assert!(message.contains("aws_credential.prod.profile"));
@@ -2584,12 +2602,12 @@ mod tests {
         )
     }
 
-    fn assert_network_secret(launch: &libvm::NetworkLaunch, slot: &str, expected: &str) {
-        let secret = launch
+    fn assert_egress_secret(credentials: &libvm::EgressCredentials, slot: &str, expected: &str) {
+        let secret = credentials
             .secrets
             .iter()
             .find(|secret| secret.slot == slot)
-            .unwrap_or_else(|| panic!("missing network secret {slot}"));
+            .unwrap_or_else(|| panic!("missing egress secret {slot}"));
         assert_eq!(secret.value, expected.as_bytes());
     }
 

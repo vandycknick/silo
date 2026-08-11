@@ -1,214 +1,426 @@
+use std::collections::BTreeMap;
+use std::io::IsTerminal;
+use std::path::PathBuf;
+
 use clap::Args;
 use libvm::{
-    ImageProgressSender, MachineReadinessOutcome, MachineRef, Runtime,
-    DEFAULT_GUEST_READINESS_TIMEOUT,
+    ImageProgressSender, MachineReadinessOutcome, MachineRetention, MachineRunId,
+    MachineStartOptions, ReadOnlyRuntime, RuntimeConfig, DEFAULT_GUEST_READINESS_TIMEOUT,
 };
-use std::collections::BTreeMap;
-use vm_spec::Mount;
 
 use crate::commands::create::{
-    apply_resolved_machine_options, profile_mount_to_mount, read_userdata_path,
-    ResolvedMachineOptions, VmOverrideArgs,
+    create_machine, ensure_name_available, ensure_read_only_name_available, load_template,
+    machine_settings, parse_environment, read_environment_layers, render_plan, resolve_plan,
+    resolve_read_only_source, resolve_source, selected_image_reference, validate_process_overrides,
+    MachineCliOptions, PlanInputs, Pull, VmOverrideArgs,
 };
-use crate::commands::rootfs_image::parse_cli_image_source;
-use crate::commands::start_options::machine_start_options;
-use crate::constants::{DEFAULT_PROFILE_NAME, PROFILE_METADATA_KEY};
-use crate::context::Context;
-use crate::guest;
-use crate::profile::{ProfileStore, ResolvedMachineNetwork};
-use crate::ui::{watch_image_progress, Spinner};
-
-const EXAMPLES: &[&str] = &[
-    "silo run",
-    "silo run dev",
-    "silo run dev -- cargo test",
-    "silo run -t agent -- opencode",
-    "silo run dev --image disk:./target/rootfs.img -- cargo test",
-    "silo run dev --keep-on-failure -- cargo test",
-];
+use crate::commands::start_options::machine_start_options_without_cleanup;
+use crate::environment::EnvironmentOverride;
+use crate::planning::{Plan, PlanKind, ProcessOverrides, RunOptions, TtyCapabilities, TtyMode};
+use crate::ui::{watch_image_progress, OutputFormat, Spinner};
 
 #[derive(Debug, Args)]
-#[command(
-    about = "Run an ephemeral VM from a profile or image",
-    after_help = crate::help::examples(EXAMPLES)
-)]
+#[command(about = "Run an image or template workload")]
 pub struct Cmd {
-    /// Profile to run. Defaults to the default profile when omitted.
-    #[arg(value_name = "PROFILE")]
-    pub profile: Option<String>,
-    /// Profile name. Alternative to the positional profile argument.
-    #[arg(long = "profile")]
-    pub profile_name: Option<String>,
-    /// Image reference to run. Overrides the profile image when both are set.
+    /// OCI registry reference or disk:PATH. Overrides the template image.
+    #[arg(value_name = "IMAGE")]
+    image: Option<String>,
+    /// Template providing VM defaults.
+    #[arg(long, value_name = "TEMPLATE")]
+    template: Option<String>,
+    /// Persist the VM under this name. Unnamed runs are ephemeral.
+    #[arg(short = 'n', long, value_name = "NAME")]
+    name: Option<String>,
+    /// Return after vmmon starts the workload.
+    #[arg(short = 'd', long, conflicts_with = "tty")]
+    detach: bool,
+    /// Attach a TTY to the guest workload.
+    #[arg(short = 't', long, conflicts_with_all = ["no_tty", "detach"])]
+    tty: bool,
+    /// Disable a TTY even when stdin and stdout are terminals.
+    #[arg(long, conflicts_with = "tty")]
+    no_tty: bool,
+    /// Replace the OCI entrypoint with this program.
+    #[arg(long, value_name = "PROGRAM", value_parser = parse_entrypoint)]
+    entrypoint: Option<String>,
+    /// Set an environment variable, or import a host variable by name.
+    #[arg(short = 'e', long = "env", value_name = "KEY[=VALUE]", value_parser = parse_environment)]
+    env: Vec<EnvironmentOverride>,
+    /// Read environment values from this file. May be repeated.
+    #[arg(long, value_name = "PATH")]
+    env_file: Vec<PathBuf>,
+    /// Guest working directory.
+    #[arg(short = 'w', long = "workdir", value_name = "DIR")]
+    workdir: Option<String>,
+    /// Guest user for the workload.
+    #[arg(short = 'u', long)]
+    user: Option<String>,
+    /// Fallback shell for an otherwise-empty foreground interactive run.
+    #[arg(long, value_name = "PATH")]
+    shell: Option<String>,
+    /// Path to a custom managed guest agent.
+    #[arg(long, value_name = "PATH")]
+    agent: Option<PathBuf>,
+    /// Image pull policy.
+    #[arg(long, value_enum)]
+    pull: Option<Pull>,
+    /// Render the resolved plan without creating a machine.
     #[arg(long)]
-    pub image: Option<String>,
-    /// Keep the ephemeral VM after the shell or command exits.
-    #[arg(long)]
-    pub keep: bool,
-    /// Keep the ephemeral VM only when the guest command exits non-zero.
-    #[arg(long)]
-    pub keep_on_failure: bool,
-    /// Attach a TTY to the guest command.
-    #[arg(long, short = 't')]
-    pub tty: bool,
+    dry_run: bool,
+    /// Plan output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Plain)]
+    format: OutputFormat,
     #[command(flatten)]
-    pub(crate) overrides: VmOverrideArgs,
+    overrides: VmOverrideArgs,
     /// Guest command and arguments to execute after `--`.
     #[arg(last = true, allow_hyphen_values = true)]
-    pub command: Vec<String>,
+    command: Vec<String>,
 }
 
 impl Cmd {
-    pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        if self.keep_on_failure && self.command.is_empty() {
-            eyre::bail!("--keep-on-failure requires a command");
-        }
-
-        let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
-        let progress = Spinner::start("Reading", "run recipe");
-        let resolved = self.resolve(policy_config_dir.as_deref())?;
-        let runtime = context.runtime().await?;
-        progress.finish_clear();
-        let image_source = parse_cli_image_source(&resolved.image_ref)?;
-        let (image_progress, image_events) = ImageProgressSender::default_channel();
-        let image_progress_task = watch_image_progress(resolved.image_ref.clone(), image_events);
-        let machine_options = resolved.options;
-        let machine = {
-            let runtime_with_progress = (*runtime).clone().with_image_progress(image_progress);
-            let builder = runtime_with_progress.machine().image_source(image_source);
-
-            apply_resolved_machine_options(builder, machine_options)
-                .create()
-                .await
+    pub async fn run(self, context: &mut crate::context::Context) -> eyre::Result<()> {
+        let template = load_template(self.template.as_deref())?;
+        let mut machine = self.overrides.resolve()?;
+        machine.agent = self.agent;
+        validate_options(&machine, self.detach, self.tty)?;
+        let host_environment = std::env::vars().collect::<BTreeMap<_, _>>();
+        let environment_files = read_environment_layers(&self.env_file, &host_environment)?;
+        let process_overrides = ProcessOverrides {
+            entrypoint: self.entrypoint.map(|program| vec![program]),
+            working_directory: self.workdir,
+            user: self.user,
         };
-        let _ = image_progress_task.await;
-        let machine = machine?;
-        let machine_name = machine.inspect().await?.name;
-        let mut progress = Spinner::start("Starting", &machine_name);
-        machine
-            .start_with_options(machine_start_options(runtime, &machine).await?)
-            .await?;
-        progress.step("Waiting", &machine_name);
-        let readiness = machine.wait_ready(DEFAULT_GUEST_READINESS_TIMEOUT).await?;
-        if readiness.outcome != MachineReadinessOutcome::Ready {
-            eyre::bail!("guest readiness check ended with {:?}", readiness.outcome);
-        }
-
-        progress.step("Ready", &machine_name);
-        progress.finish_success("Started");
-
-        let code = if self.command.is_empty() {
-            guest::attach_shell(&machine, None, false).await?.code
-        } else {
-            guest::run_legacy_command(&machine, &self.command, self.tty)
-                .await?
-                .code
-        };
-        let should_keep = self.keep || (self.keep_on_failure && code != 0);
-
-        if !should_keep {
-            cleanup_ephemeral(runtime, &machine_name).await?;
-        }
-
-        std::process::exit(code);
-    }
-
-    fn resolve(&self, policy_config_dir: Option<&std::path::Path>) -> eyre::Result<ResolvedRun> {
-        if self.profile.is_some() && self.profile_name.is_some() {
-            eyre::bail!("profile specified twice; use either positional profile or --profile");
-        }
-
-        let mut labels = BTreeMap::new();
-        let mut metadata = BTreeMap::new();
-        let mut mounts = Vec::<Mount>::new();
-        let mut network = ResolvedMachineNetwork::default();
-        let mut userdata = None;
-        let mut cpus = None;
-        let mut memory_mib = None;
-        let mut disk_size_bytes = None;
-
-        let selected_profile = self.profile.clone().or_else(|| self.profile_name.clone());
-        let mut image_ref = if selected_profile.is_some() || self.image.is_none() {
-            let selected = selected_profile.unwrap_or_else(|| DEFAULT_PROFILE_NAME.to_string());
-            let store = ProfileStore::from_env()?;
-            let named = store.resolve(&selected)?;
-            network = named.profile.machine_network(policy_config_dir)?;
-            userdata = named.profile.userdata.clone();
-            cpus = named.profile.cpus();
-            memory_mib = named.profile.memory_mib()?;
-            disk_size_bytes = named.profile.disk_size_bytes()?;
-            labels = named.profile.labels.clone();
-            metadata.insert(PROFILE_METADATA_KEY.to_string(), named.name.clone());
-            mounts = named.profile.resolved_mounts()?;
-            named.profile.image.clone()
-        } else if let Some(image) = &self.image {
-            image.clone()
-        } else {
-            eyre::bail!("either a profile or image is required");
-        };
-
-        if let Some(image) = &self.image {
-            image_ref = image.clone();
-        }
-
-        for (key, value) in &self.overrides.labels {
-            labels.insert(key.clone(), value.clone());
-        }
-        for mount in &self.overrides.mounts {
-            mounts.push(profile_mount_to_mount(mount)?);
-        }
-        if let Some(network_override) = self.overrides.network.clone() {
-            network = network_override.into();
-        }
-        if let Some(userdata_path) = self.overrides.userdata.as_deref() {
-            userdata = Some(read_userdata_path(userdata_path)?);
-        }
-
-        Ok(ResolvedRun {
-            image_ref,
-            options: ResolvedMachineOptions {
-                labels,
-                metadata,
-                mounts,
-                network,
-                userdata,
-                cpus: self.overrides.cpus.or(cpus),
-                memory_mib: self.overrides.memory_mib()?.or(memory_mib),
-                disk_size_bytes: self.overrides.disk_size_bytes()?.or(disk_size_bytes),
-                nested_virtualization: self.overrides.nested_virtualization,
-                rosetta: self.overrides.rosetta,
-                kernel: self.overrides.kernel.clone(),
-                initramfs: self.overrides.initramfs.clone(),
-                kernel_args: self.overrides.kernel_args.clone(),
-                agent: None,
-                disks: self.overrides.disks.clone(),
-                user: self
-                    .overrides
-                    .user
-                    .as_ref()
-                    .map(crate::commands::create::resolve_user_arg)
-                    .transpose()?,
+        let run_options = RunOptions {
+            detached: self.detach,
+            tty: tty_mode(self.tty, self.no_tty),
+            capabilities: TtyCapabilities {
+                stdin: std::io::stdin().is_terminal(),
+                stdout: std::io::stdout().is_terminal(),
             },
-        })
+            shell: self.shell,
+        };
+        validate_process_overrides(
+            process_overrides.working_directory.as_deref(),
+            process_overrides.user.as_deref(),
+            run_options.shell.as_deref(),
+        )?;
+        let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
+        crate::commands::create::preflight_create(
+            &template.template,
+            &machine,
+            self.image.as_deref(),
+            policy_config_dir.as_deref(),
+        )?;
+        let retention = if self.name.is_some() {
+            MachineRetention::Persistent
+        } else {
+            MachineRetention::Ephemeral
+        };
+
+        if self.dry_run {
+            let runtime = ReadOnlyRuntime::open(RuntimeConfig::from_env()?)
+                .await
+                .map_err(|error| execution_infrastructure(error.into()))?;
+            let name = match self.name {
+                Some(name) => {
+                    ensure_read_only_name_available(&runtime, &name).await?;
+                    name
+                }
+                None => runtime.propose_machine_name()?,
+            };
+            let source = resolve_read_only_source(
+                &runtime,
+                self.image.as_deref(),
+                &template.template,
+                self.pull,
+            )
+            .await
+            .map_err(execution_infrastructure)?;
+            let settings = machine_settings(&machine);
+            let plan = resolve_plan(PlanInputs {
+                kind: PlanKind::Run(run_options),
+                template,
+                image: source.plan_image,
+                image_is_positional: source.is_positional,
+                machine_overrides: machine.overrides,
+                machine_settings: settings,
+                process_overrides,
+                command_tail: self.command,
+                retention,
+                name: Some(name),
+                environment_files,
+                host_environment,
+                environment_overrides: self.env,
+            })?;
+            return render_plan(&plan, self.format);
+        }
+
+        let image_reference = selected_image_reference(self.image.as_deref(), &template.template)?;
+        let recipe_progress = Spinner::start("Reading", "run recipe");
+        let runtime = context
+            .runtime()
+            .await
+            .map_err(execution_infrastructure)?
+            .clone();
+        if let Some(name) = &self.name {
+            ensure_name_available(&runtime, name).await?;
+        }
+        recipe_progress.finish_clear();
+
+        let (image_progress, image_events) = ImageProgressSender::default_channel();
+        let image_progress_task = watch_image_progress(&image_reference, image_events);
+        let progress_runtime = runtime.clone().with_image_progress(image_progress);
+        let image_result = async {
+            let source = resolve_source(
+                &progress_runtime,
+                self.image.as_deref(),
+                &template.template,
+                self.pull,
+            )
+            .await
+            .map_err(execution_infrastructure)?;
+            let settings = machine_settings(&machine);
+            let plan = resolve_plan(PlanInputs {
+                kind: PlanKind::Run(run_options),
+                template,
+                image: source.plan_image.clone(),
+                image_is_positional: source.is_positional,
+                machine_overrides: machine.overrides.clone(),
+                machine_settings: settings,
+                process_overrides,
+                command_tail: self.command,
+                retention,
+                name: self.name,
+                environment_files,
+                host_environment,
+                environment_overrides: self.env,
+            })?;
+            let Plan::Run(plan) = plan else {
+                unreachable!("run resolution returns a run plan")
+            };
+            let machine = create_machine(&progress_runtime, &plan.create, source, context)
+                .await
+                .map_err(execution_infrastructure)?;
+            Ok::<_, eyre::Report>((plan, machine))
+        };
+        let image_result = image_result.await;
+        drop(progress_runtime);
+        let _ = image_progress_task.await;
+        let (plan, machine) = image_result?;
+        let name = match machine.inspect().await {
+            Ok(data) => data.name,
+            Err(error) => {
+                return Err(cleanup_foreground_failure(
+                    &machine,
+                    plan.create.retention,
+                    error.into(),
+                )
+                .await)
+            }
+        };
+        if plan.detached {
+            let progress = Spinner::start("Starting", &name);
+            let options = match detached_start_options(&runtime, &machine, &plan).await {
+                Ok(options) => options,
+                Err(error) => {
+                    return Err(
+                        cleanup_foreground_failure(&machine, plan.create.retention, error).await,
+                    )
+                }
+            };
+            if let Err(error) = machine.start_with_options(options).await {
+                cleanup_ephemeral_best_effort(&machine, plan.create.retention).await;
+                return Err(start_failure(error));
+            }
+            progress.finish_success("Started");
+            println!("{name}");
+            return Ok(());
+        }
+
+        let mut progress = Spinner::start("Starting", &name);
+        let options = match machine_start_options_without_cleanup(&runtime, &machine).await {
+            Ok(options) => options,
+            Err(error) => {
+                return Err(
+                    cleanup_foreground_failure(&machine, plan.create.retention, error).await,
+                )
+            }
+        };
+        let start = match machine.start_with_options(options).await {
+            Ok(start) => start,
+            Err(error) => {
+                return Err(cleanup_foreground_failure(
+                    &machine,
+                    plan.create.retention,
+                    error.into(),
+                )
+                .await)
+            }
+        };
+        progress.step("Waiting", &name);
+        let readiness = match machine.wait_ready(DEFAULT_GUEST_READINESS_TIMEOUT).await {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                return Err(cleanup_foreground_failure(
+                    &machine,
+                    plan.create.retention,
+                    error.into(),
+                )
+                .await)
+            }
+        };
+        if readiness.outcome != MachineReadinessOutcome::Ready {
+            let error = eyre::eyre!("guest readiness check ended with {:?}", readiness.outcome);
+            let stop = stop_run(&machine, start.run_id, plan.create.retention).await;
+            return Err(
+                foreground_stop_failure(&machine, plan.create.retention, stop, error).await,
+            );
+        }
+        progress.step("Ready", &name);
+        progress.finish_success("Started");
+        let execution =
+            crate::guest::run_process(&machine, &plan.create.process, &plan.argv, plan.tty).await;
+        let stop = stop_run(&machine, start.run_id, plan.create.retention).await;
+        let result = match execution {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(
+                    foreground_stop_failure(&machine, plan.create.retention, stop, error).await,
+                );
+            }
+        };
+        if let Err(error) = stop {
+            return Err(cleanup_foreground_failure(&machine, plan.create.retention, error).await);
+        }
+        if let Some(message) = crate::commands::exec::execution_failure_message(&result) {
+            eprintln!("{} {message}", crate::ui::error_label());
+        }
+        std::process::exit(crate::commands::exec::execution_exit_code(result));
     }
 }
 
-struct ResolvedRun {
-    image_ref: String,
-    options: ResolvedMachineOptions,
+fn validate_options(machine: &MachineCliOptions, detached: bool, tty: bool) -> eyre::Result<()> {
+    if machine.no_agent && machine.provision_user.is_some() {
+        eyre::bail!("--no-agent cannot be combined with --provision-user");
+    }
+    if detached && tty {
+        eyre::bail!("--detach cannot be combined with --tty");
+    }
+    Ok(())
 }
 
-async fn cleanup_ephemeral(runtime: &Runtime, name: &str) -> eyre::Result<()> {
-    let machine = runtime
-        .get_machine(&MachineRef::parse(name.to_string())?)
-        .await?;
-    match machine.stop().await {
-        Ok(_) => {}
-        Err(error) if error.to_string().contains("is not running") => {}
+fn tty_mode(tty: bool, no_tty: bool) -> TtyMode {
+    if tty {
+        TtyMode::Enabled
+    } else if no_tty {
+        TtyMode::Disabled
+    } else {
+        TtyMode::Auto
+    }
+}
+
+fn parse_entrypoint(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("entrypoint cannot be empty".to_string());
+    }
+    Ok(value.to_string())
+}
+
+async fn detached_start_options(
+    runtime: &libvm::Runtime,
+    machine: &libvm::Machine,
+    plan: &crate::planning::RunPlan,
+) -> eyre::Result<MachineStartOptions> {
+    let process = &plan.create.process;
+    let (program, args) = plan
+        .argv
+        .split_first()
+        .ok_or_else(|| eyre::eyre!("guest command is required"))?;
+    let options = crate::commands::start_options::machine_start_options(runtime, machine).await?;
+    let process = process.clone();
+    let program = program.clone();
+    let args = args.to_vec();
+    Ok(options.entrypoint(program, |entrypoint| {
+        let entrypoint = entrypoint
+            .args(args)
+            .cwd(process.working_directory.clone())
+            .envs(process.environment.clone());
+        match &process.user {
+            Some(user) => entrypoint.user(user),
+            None => entrypoint,
+        }
+    }))
+}
+
+async fn stop_run(
+    machine: &libvm::Machine,
+    run_id: MachineRunId,
+    retention: MachineRetention,
+) -> eyre::Result<()> {
+    match machine.stop_run(run_id).await {
+        Ok(_) | Err(libvm::LibVmError::MachineNotRunning { .. }) => {}
         Err(error) => return Err(error.into()),
     }
-    machine.remove().await?;
+    cleanup_ephemeral_best_effort(machine, retention).await;
     Ok(())
+}
+
+fn start_failure(error: libvm::LibVmError) -> eyre::Report {
+    let exit_code = match &error {
+        libvm::LibVmError::EntrypointLaunchFailed { failure }
+            if failure.reason == libvm::ExecutionLaunchFailureReason::CommandNotFound =>
+        {
+            127
+        }
+        libvm::LibVmError::EntrypointLaunchFailed { .. } => 126,
+        _ => 125,
+    };
+    eyre::Report::from(error).wrap_err(crate::errors::ExecutionExit::new(exit_code))
+}
+
+fn execution_infrastructure(error: eyre::Report) -> eyre::Report {
+    error.wrap_err(crate::errors::ExecutionExit::new(125))
+}
+
+async fn cleanup_foreground_failure(
+    machine: &libvm::Machine,
+    retention: MachineRetention,
+    error: eyre::Report,
+) -> eyre::Report {
+    cleanup_ephemeral_best_effort(machine, retention).await;
+    error.wrap_err(crate::errors::ExecutionExit::new(125))
+}
+
+async fn foreground_stop_failure(
+    machine: &libvm::Machine,
+    retention: MachineRetention,
+    stop: eyre::Result<()>,
+    error: eyre::Report,
+) -> eyre::Report {
+    match stop {
+        Ok(()) => execution_infrastructure(error),
+        Err(stop_error) => {
+            cleanup_foreground_failure(
+                machine,
+                retention,
+                error.wrap_err(format!("stop foreground machine: {stop_error}")),
+            )
+            .await
+        }
+    }
+}
+
+async fn cleanup_ephemeral_best_effort(machine: &libvm::Machine, retention: MachineRetention) {
+    if retention != MachineRetention::Ephemeral {
+        return;
+    }
+    if let Err(error) = machine.clone().remove().await {
+        crate::ui::warn(format!(
+            "could not remove ephemeral machine {}: {error}; remove it later with `silo rm {}`",
+            machine.id(),
+            machine.id()
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -216,179 +428,111 @@ mod tests {
     use clap::Parser;
 
     use crate::app::Cli;
+    use crate::commands::run::start_failure;
     use crate::commands::Command;
 
     #[test]
-    fn run_command_parses_create_parity_overrides() {
+    fn run_parses_the_final_image_first_form() {
         let cli = Cli::try_parse_from([
             "silo",
             "run",
+            "-d",
+            "--no-tty",
+            "-n",
+            "worker",
+            "--template",
             "dev",
-            "--cpus",
-            "4",
-            "--memory",
-            "4gb",
-            "--kernel",
-            "./vmlinuz",
-            "--initrd",
-            "./initrd.img",
-            "--kernel-arg",
-            "systemd.firstboot=off",
-            "--kernel-arg",
-            "quiet",
-            "--disk-size",
-            "40gb",
-            "--nested-virtualization",
-            "--rosetta",
-            "--userdata",
-            "./user-data.yaml",
-            "--disk",
-            "./data.raw",
-            "--mount",
-            ".:/workspace:rw",
-            "--network",
-            "none",
-            "--label",
-            "env=dev",
-        ])
-        .expect("run command should parse");
-        let Command::Run(run) = cli.command else {
-            panic!("expected run command");
-        };
-
-        assert_eq!(run.profile.as_deref(), Some("dev"));
-        assert_eq!(run.overrides.cpus, Some(4));
-        assert_eq!(run.overrides.memory_mib().expect("memory mib"), Some(4096));
-        assert_eq!(
-            run.overrides.disk_size_bytes().expect("disk size bytes"),
-            Some(40 * 1024 * 1024 * 1024)
-        );
-        assert!(run.overrides.nested_virtualization);
-        assert!(run.overrides.rosetta);
-        assert_eq!(run.overrides.kernel.as_deref(), Some("./vmlinuz".as_ref()));
-        assert_eq!(
-            run.overrides.initramfs.as_deref(),
-            Some("./initrd.img".as_ref())
-        );
-        assert_eq!(
-            run.overrides.kernel_args,
-            ["systemd.firstboot=off", "quiet"]
-        );
-        assert_eq!(run.overrides.disks.len(), 1);
-        assert_eq!(run.overrides.mounts.len(), 1);
-        assert_eq!(
-            run.overrides.labels,
-            vec![("env".to_string(), "dev".to_string())]
-        );
-    }
-
-    #[test]
-    fn run_command_accepts_image_override_with_profile() {
-        let cli = Cli::try_parse_from([
-            "silo",
-            "run",
-            "dev",
-            "--image",
-            "tar:./target/rootfs.tar",
-            "--",
-            "true",
-        ])
-        .expect("run command should parse");
-        let Command::Run(run) = cli.command else {
-            panic!("expected run command");
-        };
-
-        assert_eq!(run.profile.as_deref(), Some("dev"));
-        assert!(!run.tty);
-        assert_eq!(run.image.as_deref(), Some("tar:./target/rootfs.tar"));
-    }
-
-    #[test]
-    fn run_command_parses_image_command_without_profile() {
-        let cli = Cli::try_parse_from([
-            "silo",
-            "run",
-            "--image",
             "ubuntu:24.04",
+            "--entrypoint",
+            "runner",
+            "-e",
+            "A=one",
+            "-e",
+            "HOST",
+            "--env-file",
+            "env",
+            "-w",
+            "/work",
+            "-u",
+            "1000",
             "--",
-            "uname",
-            "-a",
+            "test",
+            "one",
         ])
-        .expect("run command should parse");
+        .expect("run parses");
         let Command::Run(run) = cli.command else {
-            panic!("expected run command");
+            panic!("expected run")
         };
-
-        assert_eq!(run.profile, None);
         assert_eq!(run.image.as_deref(), Some("ubuntu:24.04"));
-        assert_eq!(run.command, ["uname", "-a"]);
+        assert!(run.detach);
+        assert!(run.no_tty);
+        assert_eq!(run.command, ["test", "one"]);
+        assert_eq!(run.env.len(), 2);
     }
 
     #[test]
-    fn run_command_parses_tty_command() {
-        let cli = Cli::try_parse_from(["silo", "run", "-t", "agent", "--", "opencode"])
-            .expect("run command should parse");
-        let Command::Run(run) = cli.command else {
-            panic!("expected run command");
-        };
-
-        assert_eq!(run.profile.as_deref(), Some("agent"));
-        assert!(run.tty);
-        assert_eq!(run.command, vec!["opencode".to_string()]);
+    fn run_rejects_removed_flags_and_detached_tty() {
+        assert!(Cli::try_parse_from(["silo", "run", "--image", "ubuntu"]).is_err());
+        assert!(Cli::try_parse_from(["silo", "run", "-d", "-t", "ubuntu"]).is_err());
     }
 
     #[test]
-    fn run_bare_user_flag_does_not_consume_command() {
-        let cli = Cli::try_parse_from(["silo", "run", "dev", "--user", "--", "id"])
-            .expect("parse bare user flag and command");
-        let Command::Run(run) = cli.command else {
-            panic!("expected run command");
-        };
-
-        assert!(matches!(
-            run.overrides.user,
-            Some(crate::commands::create::UserArg::Auto)
-        ));
-        assert_eq!(run.command, ["id"]);
-    }
-
-    #[test]
-    fn run_command_keeps_boot_overrides_for_libvm() {
+    fn run_keeps_commands_after_the_separator_verbatim() {
         let cli = Cli::try_parse_from([
             "silo",
             "run",
-            "dev",
-            "--kernel",
-            "./vmlinuz",
-            "--initrd",
-            "./initrd.img",
-            "--kernel-arg",
-            "systemd.firstboot=off",
-            "--kernel-arg",
-            "quiet",
+            "disk:rootfs.img",
             "--",
-            "true",
+            "printf",
+            "%s",
+            "hello world",
         ])
-        .expect("run command should parse");
+        .expect("run parses");
         let Command::Run(run) = cli.command else {
-            panic!("expected run command");
+            panic!("expected run")
         };
-
-        assert_eq!(run.overrides.kernel.as_deref(), Some("./vmlinuz".as_ref()));
-        assert_eq!(
-            run.overrides.initramfs.as_deref(),
-            Some("./initrd.img".as_ref())
-        );
-        assert_eq!(
-            run.overrides.kernel_args,
-            ["systemd.firstboot=off", "quiet"]
-        );
-        assert_eq!(run.command, ["true"]);
+        assert_eq!(run.command, ["printf", "%s", "hello world"]);
     }
 
     #[test]
-    fn run_command_rejects_bare_memory_and_disk_size() {
-        assert!(Cli::try_parse_from(["silo", "run", "dev", "--memory", "4096"]).is_err());
-        assert!(Cli::try_parse_from(["silo", "run", "dev", "--disk-size", "40"]).is_err());
+    fn run_parses_a_shell_fallback_path() {
+        let cli = Cli::try_parse_from(["silo", "run", "--shell", "/bin/bash", "disk:rootfs.img"])
+            .expect("run parses shell");
+        let Command::Run(run) = cli.command else {
+            panic!("expected run")
+        };
+        assert_eq!(run.shell.as_deref(), Some("/bin/bash"));
+    }
+
+    #[test]
+    fn run_rejects_an_empty_entrypoint() {
+        assert!(
+            Cli::try_parse_from(["silo", "run", "--entrypoint", "", "disk:rootfs.img"]).is_err()
+        );
+    }
+
+    #[test]
+    fn detached_entrypoint_launch_failures_preserve_shell_exit_conventions() {
+        let command_not_found = libvm::LibVmError::EntrypointLaunchFailed {
+            failure: libvm::ExecutionLaunchFailure {
+                reason: libvm::ExecutionLaunchFailureReason::CommandNotFound,
+                message: None,
+            },
+        };
+        let launch_failure = libvm::LibVmError::EntrypointLaunchFailed {
+            failure: libvm::ExecutionLaunchFailure {
+                reason: libvm::ExecutionLaunchFailureReason::SpawnFailed,
+                message: None,
+            },
+        };
+
+        assert_eq!(
+            crate::errors::execution_exit_code(&start_failure(command_not_found)),
+            Some(127)
+        );
+        assert_eq!(
+            crate::errors::execution_exit_code(&start_failure(launch_failure)),
+            Some(126)
+        );
     }
 }

@@ -12,5 +12,5 @@ mod traits;
 
 #[cfg(test)]
 pub(crate) use mock_store::MockDataStore;
-pub(crate) use storage::Store;
+pub(crate) use storage::{ReadOnlyStore, Store};
 pub(crate) use traits::{ConfigStore, DataStore, ImageStore, MachineStore, NetworkStore};

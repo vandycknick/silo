@@ -6,7 +6,7 @@ use crate::context::Context;
 use crate::ui::{self, Spinner};
 
 #[derive(Debug, Args)]
-#[command(about = "Remove a persistent VM")]
+#[command(about = "Remove a VM")]
 pub struct Cmd {
     /// Name or ID of the VM to remove.
     #[arg(value_name = "VM")]

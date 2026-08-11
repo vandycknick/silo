@@ -4,24 +4,31 @@
 It gives callers a `Runtime` entry point, then returns `Machine` handles for
 lifecycle operations.
 
-Use it when you need to create, resolve, inspect, start, stop, or remove Silo
-VMs from Rust code. The crate keeps database rows, runtime state files, and
-process details behind the API boundary.
+Use it when you need to create, resolve, inspect, start, stop, restart, or
+remove Silo VMs from Rust code. The crate keeps database rows, runtime state
+files, image materialization, and monitor processes behind the API boundary.
 
-```rust
-use libvm::{MachineRef, Runtime};
+```rust,no_run
+use libvm::{Memory, Runtime};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), libvm::LibVmError> {
     let runtime = Runtime::from_env().await?;
-    let machine = runtime.get_machine(&MachineRef::parse("devbox")?).await?;
+    let machine = runtime
+        .machine()
+        .image("docker.io/library/alpine:latest")
+        .name("devbox")
+        .cpus(2)
+        .memory(Memory::mebibytes(1024))
+        .create()
+        .await?;
 
+    // A normal start boots an idle machine.
+    machine.start().await?;
     let data = machine.inspect().await?;
     println!("{} is {:?}", data.name, data.status);
 
-    if !data.is_running() {
-        machine.start().await?;
-    }
+    machine.stop().await?;
 
     Ok(())
 }
@@ -30,9 +37,55 @@ async fn main() -> Result<(), libvm::LibVmError> {
 The main shapes are:
 
 - `Runtime`, the service entry point.
+- `MachineBuilder`, the durable image-first creation request.
 - `Machine`, an operable handle for one VM.
-- `MachineCreate` and `MachineUpdate`, request DTOs for caller input.
-- `MachineInspectData`, an owned snapshot returned by inspect and mutation calls.
+- `MachineData`, an owned snapshot returned by inspect and lifecycle calls.
+
+## Creation And Lifecycle
+
+`MachineBuilder::image` always accepts an OCI reference. Use
+`image_source(ImageSource::disk(path))` for a local disk. `create` materializes
+the selected root disk and persists a stopped machine; it never starts the VM.
+
+`Machine::start` and `Machine::stop` manage a persisted machine. A normal start
+creates an idle VM. `Machine::start_with` can instead set one
+`Entrypoint`; startup succeeds only after that guest program launches, and
+`vmmon` stops the VM when the program exits:
+
+```rust,no_run
+use libvm::Runtime;
+
+# async fn example(runtime: Runtime) -> Result<(), libvm::LibVmError> {
+# let machine = runtime.machine().image("docker.io/library/alpine:latest").create().await?;
+let start = machine
+    .start_with(|options| {
+        options.entrypoint("/usr/bin/printf", |entrypoint| {
+            entrypoint.arg("hello from silo\\n")
+        })
+    })
+    .await?;
+let exit = machine.wait().await?;
+println!("run {} ended: {:?}", start.run_id, exit.outcome);
+# Ok(())
+# }
+```
+
+`MachineRetention::Persistent` keeps a machine until removal.
+`MachineRetention::Ephemeral` permits a lifecycle owner to attempt removal after
+the run exits. Cleanup is best effort and is not persisted or retried.
+
+## Process Configuration
+
+`ProcessConfig` is durable desired process configuration stored with the
+machine. It preserves OCI `Entrypoint` and `Cmd` separately, including the
+distinction between omitted and explicitly empty values, plus the environment,
+working directory, and user selector. Configure it at creation with
+`MachineBuilder::process`, or with the individual process builder methods, and
+read it from `MachineData::process`.
+
+The process configuration does not turn an ordinary `start` into a workload
+launch. It lets higher-level callers retain and resolve their intended process
+without reconstructing image metadata.
 
 ## Runtime Roots
 
@@ -74,56 +127,13 @@ configurable. The derivation is:
 | machine logs and exit records | `state_root/logs/machines/<id>/` |
 | private-network logs | `state_root/logs/machines/<id>/network/` |
 
-## Machine Logs
-
-Machine-owned durable logs have one configured state-root layout. The immutable
-machine ID, rather than a display name or changing private-network instance ID,
-selects the owner directory:
-
-```text
-<state-root>/logs/machines/<machine-id>/
-  vm.trace.log
-  serial.log
-  exec.log
-  exec.log.1
-  exec.log.2
-  exec.log.3
-  vm.exit.json
-  network/
-    netd.log
-    audit.jsonl
-```
-
-`vm.trace.log`, `serial.log`, `exec.log`, `network/netd.log`, and
-`network/audit.jsonl` append across machine starts. `vm.exit.json` is a private,
-atomically replaced lifecycle record, not a byte-log source. `exec.log` is a
-best-effort JSON Lines capture of structured execution output. It rotates at 10
-MiB and retains three archives; it is observability, not durable execution
-history, process attachment, or an authoritative terminal result.
-
-Use `Machine::logs` to read logs. It selects exactly one semantic
-`MachineLogSource` (`Monitor`, `Serial`, `Exec`, `Network`, or `NetworkAudit`) and
-returns byte chunks with an output channel. It deliberately does not expose log
-paths or filenames. Network sources return `MachineLogSourceUnavailable` when
-the machine has no private network.
-
-With `MachineLogOptions::default()`, the returned stream is a finite snapshot
-of bytes present when the selected file is opened. With `follow: true`, it emits
-that same snapshot and then appended bytes without a snapshot-to-follow gap. A
-missing file is an empty snapshot. A following stream waits for initial file
-creation and remains attached while the machine is stopped and across later
-starts. It ends when the reader drops the stream.
-
-The CLI currently exposes monitor diagnostics through `silo logs [--follow]`.
-Card 120 will map public stream names to the same semantic sources without
-exposing filesystem layout.
-
 ### State Database Reset
 
-This release has one new database baseline and does not upgrade old migration
-history. With every Silo process stopped, manually archive or remove an existing
-`state.db` before opening the new runtime. Silo does not adopt old database or
-runtime files.
+This release has one new state and image-cache baseline and does not upgrade old
+migrations or cache metadata. With every Silo process stopped, remove all local
+Silo state from the previous release, including `state.db`, machine directories,
+logs, and the image cache, before opening the new runtime. Silo does not adopt old
+database, machine, runtime, or cache files.
 
 ## Runtime Components
 

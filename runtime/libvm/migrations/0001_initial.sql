@@ -83,7 +83,7 @@ CREATE TABLE image_manifest (
     platform_os             TEXT NOT NULL,
     platform_architecture   TEXT NOT NULL,
     platform_variant        TEXT,
-    config_digest           TEXT,
+    config_digest           TEXT NOT NULL,
     layer_count             INTEGER NOT NULL,
     total_size_bytes        INTEGER NOT NULL,
     created_at              INTEGER NOT NULL,
@@ -91,7 +91,8 @@ CREATE TABLE image_manifest (
 );
 
 CREATE TABLE image_ref (
-    reference               TEXT PRIMARY KEY,
+    requested_reference     TEXT PRIMARY KEY,
+    selected_reference      TEXT NOT NULL,
     manifest_digest         TEXT NOT NULL REFERENCES image_manifest(digest) ON DELETE RESTRICT,
     created_at              INTEGER NOT NULL,
     updated_at              INTEGER NOT NULL,
@@ -100,13 +101,14 @@ CREATE TABLE image_ref (
 
 CREATE TABLE image_config (
     manifest_digest         TEXT PRIMARY KEY REFERENCES image_manifest(digest) ON DELETE CASCADE,
-    digest                  TEXT,
-    env_json                BLOB NOT NULL,
-    cmd_json                BLOB NOT NULL,
-    entrypoint_json         BLOB NOT NULL,
+    digest                  TEXT NOT NULL,
+    env_json                BLOB,
+    cmd_json                BLOB,
+    entrypoint_json         BLOB,
     working_dir             TEXT,
     user                    TEXT,
-    labels_json             BLOB NOT NULL,
+    labels_json             BLOB,
+    stop_signal             TEXT,
     created_at              INTEGER NOT NULL
 );
 
@@ -130,9 +132,8 @@ CREATE TABLE image_manifest_layer (
 
 CREATE TABLE image_rootfs_artifact (
     image_id                TEXT PRIMARY KEY,
-    source_kind             TEXT NOT NULL,
-    manifest_digest         TEXT REFERENCES image_manifest(digest) ON DELETE RESTRICT,
-    source_reference        TEXT NOT NULL,
+    manifest_digest         TEXT NOT NULL REFERENCES image_manifest(digest) ON DELETE RESTRICT,
+    config_digest           TEXT NOT NULL,
     platform_os             TEXT NOT NULL,
     platform_architecture   TEXT NOT NULL,
     platform_variant        TEXT,
@@ -145,9 +146,11 @@ CREATE TABLE image_rootfs_artifact (
 
 CREATE TABLE machine_rootfs (
     machine_id              TEXT PRIMARY KEY REFERENCES machine_config(id) ON DELETE CASCADE,
-    source_kind             TEXT NOT NULL,
-    source_reference        TEXT NOT NULL,
+    source_kind             TEXT NOT NULL CHECK (source_kind IN ('oci', 'disk')),
+    requested_reference     TEXT NOT NULL,
+    selected_reference      TEXT,
     manifest_digest         TEXT REFERENCES image_manifest(digest) ON DELETE RESTRICT,
+    config_digest           TEXT,
     image_id                TEXT,
     root_disk_path          TEXT NOT NULL,
     root_disk_size_bytes    INTEGER NOT NULL,

@@ -93,7 +93,7 @@ export interface NativeMachineLogHandle {
 }
 
 export interface NativeImageSourceInput {
-  kind: "oci" | "disk" | "tar";
+  kind: "oci" | "disk";
   reference?: string;
   path?: string;
 }
@@ -223,6 +223,11 @@ export interface NativeMachineData {
   createdAt: number;
   modifiedAt: number;
   imageRef: string;
+  retention: "persistent" | "ephemeral" | "unknown";
+  process: NativeProcessConfig;
+  templateName?: string | null;
+  configuredAgent?: NativeMachineAgent | null;
+  rootfs?: NativeMachineRootfs | null;
   rootDiskSize?: number | null;
   labels: NativeKeyValue[];
   metadata: NativeKeyValue[];
@@ -230,9 +235,55 @@ export interface NativeMachineData {
   agentMode: "default" | "custom" | "disabled" | "unknown";
   agentPath?: string | null;
   status: NativeMachineStatus;
+  bootReport?: NativeMachineBootReport | null;
+  provisionReport?: NativeMachineProvisionReport | null;
   startedAt?: number | null;
   lastError?: string | null;
   updatedAt: number;
+}
+
+export interface NativeMachineBootReport {
+  mode: "unspecified" | "standard" | "agent-pid1" | "init-child" | "unknown";
+  requestedInit?: string | null;
+  handoffInitPath?: string | null;
+  probedInitPaths: string[];
+  agentPath?: string | null;
+  agentPid: number;
+  agentIsPid1: boolean;
+  message?: string | null;
+}
+
+export interface NativeMachineProvisionReport {
+  status: "unspecified" | "succeeded" | "degraded" | "skipped" | "failed-boot" | "unknown";
+  startedUnixMs: number;
+  finishedUnixMs: number;
+  durationMs: number;
+  steps: NativeMachineProvisionStepReport[];
+  message?: string | null;
+}
+
+export interface NativeMachineProvisionStepReport {
+  id: string;
+  status: "unspecified" | "succeeded" | "failed" | "skipped" | "unsupported" | "unknown";
+  failurePolicy: "unspecified" | "best-effort" | "fail-boot" | "unknown";
+  changed: boolean;
+  backend?: string | null;
+  durationMs: number;
+  message?: string | null;
+  errorChain?: string | null;
+}
+
+export interface NativeProcessConfig {
+  entrypoint?: string[] | null;
+  command?: string[] | null;
+  environment: NativeKeyValue[];
+  workingDirectory: string;
+  user?: string | null;
+}
+
+export interface NativeMachineAgent {
+  mode: "default" | "custom" | "disabled" | "unknown";
+  path?: string | null;
 }
 
 export interface NativeMachineStatus {
@@ -240,6 +291,18 @@ export interface NativeMachineStatus {
   ready?: boolean | null;
   guestReady?: boolean | null;
   message?: string | null;
+}
+
+export interface NativeMachineRootfs {
+  sourceKind: "oci" | "disk";
+  requestedReference: string;
+  selectedReference?: string | null;
+  selectedManifestDigest?: string | null;
+  configDigest?: string | null;
+  imageId?: string | null;
+  rootDiskPath: string;
+  rootDiskSizeBytes: number;
+  createdAt: number;
 }
 
 export interface NativeNetworkData {
@@ -278,9 +341,11 @@ export interface NativeExecutionEvent {
 }
 
 export interface NativeImageHandle {
-  reference: string;
+  requestedReference: string;
+  selectedReference: string;
+  selectedManifestDigest: string;
+  configDigest: string;
   imageId: string;
-  manifestDigest?: string | null;
   platformOs: string;
   platformArchitecture: string;
   platformVariant?: string | null;
@@ -292,7 +357,18 @@ export interface NativeImageHandle {
 
 export interface NativeImageDetail {
   handle: NativeImageHandle;
+  config: NativeOciImageConfig;
   layers: NativeImageLayerDetail[];
+}
+
+export interface NativeOciImageConfig {
+  entrypoint?: string[] | null;
+  cmd?: string[] | null;
+  env?: string[] | null;
+  workingDir?: string | null;
+  user?: string | null;
+  labels?: NativeKeyValue[] | null;
+  stopSignal?: string | null;
 }
 
 export interface NativeImageLayerDetail {

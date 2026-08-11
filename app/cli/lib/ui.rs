@@ -291,16 +291,6 @@ impl PullProgressDisplay {
                 ));
                 self.ensure_layer_bars(layer_count);
             }
-            ImageProgress::HashingSource { image_ref } => {
-                self.reference = image_ref;
-                self.header
-                    .set_message(format!("{:<12} {}", "Hashing", self.reference));
-            }
-            ImageProgress::ReadingArchive { image_ref } => {
-                self.reference = image_ref;
-                self.header
-                    .set_message(format!("{:<12} {}", "Reading", self.reference));
-            }
             ImageProgress::CheckingCache { image_ref } => {
                 self.reference = image_ref;
                 self.header
@@ -686,7 +676,9 @@ fn write_columns(out: &mut impl Write, values: &[String], widths: &[usize]) -> e
 
 #[cfg(test)]
 mod tests {
-    use super::{relative_time, short_id};
+    use libvm::ImageProgress;
+
+    use super::{relative_time, short_id, PullProgressDisplay};
 
     #[test]
     fn relative_time_formatting() {
@@ -711,5 +703,68 @@ mod tests {
     fn short_id_uses_first_eight_characters_when_available() {
         assert_eq!(short_id("1234567890abcdef"), "12345678");
         assert_eq!(short_id("1234"), "1234");
+    }
+
+    #[test]
+    fn pull_progress_display_handles_the_complete_image_event_sequence() {
+        let mut display = PullProgressDisplay::quiet("ubuntu:24.04");
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        for event in [
+            ImageProgress::ResolvingManifest {
+                image_ref: "docker.io/library/ubuntu:24.04".to_string(),
+            },
+            ImageProgress::ResolvedManifest {
+                image_ref: "docker.io/library/ubuntu:24.04".to_string(),
+                manifest_digest: digest.to_string(),
+                layer_count: 1,
+                total_download_bytes: Some(1024),
+            },
+            ImageProgress::CheckingCache {
+                image_ref: "docker.io/library/ubuntu:24.04".to_string(),
+            },
+            ImageProgress::CacheMiss {
+                image_ref: "docker.io/library/ubuntu:24.04".to_string(),
+            },
+            ImageProgress::LayerDownloadStarted {
+                index: 1,
+                total: 1,
+                digest: digest.to_string(),
+                size_bytes: Some(1024),
+            },
+            ImageProgress::LayerDownloadProgress {
+                index: 1,
+                total: 1,
+                digest: digest.to_string(),
+                downloaded_bytes: 512,
+                size_bytes: Some(1024),
+            },
+            ImageProgress::LayerDownloadVerifying {
+                index: 1,
+                total: 1,
+                digest: digest.to_string(),
+            },
+            ImageProgress::LayerDownloadFinished {
+                index: 1,
+                total: 1,
+                digest: digest.to_string(),
+            },
+            ImageProgress::ApplyingLayer {
+                index: 1,
+                total: 1,
+                digest: Some(digest.to_string()),
+            },
+            ImageProgress::WritingExt4,
+            ImageProgress::SavingBaseImage,
+            ImageProgress::Complete,
+        ] {
+            display.handle_event(event);
+        }
+
+        assert_eq!(display.reference, "docker.io/library/ubuntu:24.04");
+        assert_eq!(display.layer_bars.len(), 1);
+        assert_eq!(display.layer_bars[0].position(), 1);
+        assert_eq!(display.current_applying_layer, None);
+        display.finish();
     }
 }

@@ -9,10 +9,8 @@ pub mod exec;
 pub mod list;
 pub mod logs;
 pub mod network;
-pub mod profile;
 pub mod restart;
 pub mod rm;
-mod rootfs_image;
 pub mod run;
 pub mod secret;
 pub mod set;
@@ -21,6 +19,7 @@ pub mod show;
 pub mod start;
 mod start_options;
 pub mod stop;
+pub mod template;
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -44,7 +43,7 @@ pub enum Command {
     Show(show::Cmd),
     Logs(logs::Cmd),
     Network(network::Cmd),
-    Profile(profile::Cmd),
+    Template(template::Cmd),
     Set(set::Cmd),
 }
 
@@ -66,7 +65,7 @@ impl Command {
             Self::Show(command) => command.run(context).await,
             Self::Logs(command) => command.run(context).await,
             Self::Network(command) => command.run(context).await,
-            Self::Profile(command) => command.run(context).await,
+            Self::Template(command) => command.run(context).await,
             Self::Set(command) => command.run(context).await,
         }
     }

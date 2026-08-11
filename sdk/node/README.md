@@ -2,10 +2,9 @@
 
 Native Node.js bindings for Silo's `libvm` runtime.
 
-The SDK is a thin TypeScript facade over a napi-rs addon. VM creation,
-image materialization, datastore updates, lifecycle, and guest sessions all
-delegate to `libvm`; the TypeScript layer only provides idiomatic method names,
-types, and error mapping.
+The SDK is a thin TypeScript facade over a napi-rs addon. VM creation, image
+materialization, lifecycle, and guest operations all delegate to `libvm`; the
+TypeScript layer only provides idiomatic method names, types, and error mapping.
 
 The current SDK does not bundle a runtime payload. `libvm` resolves one complete
 co-versioned runtime set containing `vmmon`, `netd`, `krun`, the kernel,
@@ -50,7 +49,7 @@ const policyMachine = await runtime
   .create();
 
 await machine.start();
-const output = await machine.shell("uname -a");
+const output = await machine.exec("/usr/bin/uname", ["-a"]);
 console.log(output.stdout());
 
 const diskMachine = await runtime
@@ -62,29 +61,22 @@ await diskMachine.remove();
 await policyMachine.remove();
 ```
 
-## Persisted Machine Logs
+## Lifecycle And Process Data
 
-`Machine.logs(source, options)` is the SDK access boundary for retained
-machine-owned logs. Sources are semantic, never paths or filenames:
+`create()` materializes an image and persists a stopped machine. `start()` boots
+that machine without launching an application workload; `stop()` returns it to
+the stopped state. `exec`, `spawn`, and `shell` run structured guest commands on
+an already-running machine.
+
+`inspect()` returns the durable process configuration in `MachineData.process`.
+It keeps the selected entrypoint, command, environment, working directory, and
+user separate from the VM lifecycle state:
 
 ```ts
-for await (const chunk of await machine.logs("monitor", { follow: true })) {
-  process.stdout.write(chunk.data);
-}
+const data = await machine.inspect();
+console.log(data.process.entrypoint, data.process.command);
 ```
 
-The supported sources are `"monitor"`, `"serial"`, `"exec"`, `"network"`, and
-`"networkAudit"`. Chunks preserve bytes in `Uint8Array` and identify a transport
-output channel. The `"exec"` source is bounded, best-effort JSON Lines output,
-not a process attachment or authoritative execution result. Network sources
-reject machines without private networking.
-
-Without `follow`, the stream is a finite snapshot. With `follow: true`, it
-emits the same snapshot then appended bytes without a handoff gap. The stream
-remains attached while the machine is stopped and across later starts until the
-reader closes it. Async iteration closes automatically, including when a
-`for await` loop exits early. Code that calls `recv()` directly must call
-`close()` when it is finished. Filesystem paths, offsets, and retained log names
-are intentionally not part of the Node API. Detached startup commands and
-ordinary structured executions both contribute output to the same lossy,
-bounded `"exec"` source without creating process history or a durable result.
+For diagnostics, `Machine.logs(source, options)` reads one semantic machine log
+stream. The available sources are `"monitor"`, `"serial"`, `"exec"`, `"network"`,
+and `"networkAudit"`; chunks preserve raw bytes in `Uint8Array`.

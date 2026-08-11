@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use crate::machine::root_disk::RootDiskResizeOutcome;
 use crate::machine::{
-    Machine, MachineData, MachineExit, MachineExitOutcome, MachineKillOptions, MachineStartOptions,
-    MachineStopOptions, MachineWaitOptions,
+    Machine, MachineData, MachineExit, MachineExitOutcome, MachineKillOptions, MachineRunId,
+    MachineStart, MachineStartOptions, MachineStopOptions, MachineWaitOptions,
 };
 use crate::runtime::core::{
     interrupt_monitor, kill_monitor_process_group, monitor_identity as monitor_identity_for_pid,
@@ -41,14 +41,14 @@ enum FailedStartState {
 }
 
 impl Machine {
-    /// Starts the machine and returns its updated inspect data.
-    pub async fn start(&self) -> Result<MachineData, LibVmError> {
+    /// Starts the machine and returns its acknowledged generation and snapshot.
+    pub async fn start(&self) -> Result<MachineStart, LibVmError> {
         self.start_with_options(MachineStartOptions::default())
             .await
     }
 
     /// Starts the machine with explicit start options.
-    pub async fn start_with<F>(&self, configure: F) -> Result<MachineData, LibVmError>
+    pub async fn start_with<F>(&self, configure: F) -> Result<MachineStart, LibVmError>
     where
         F: FnOnce(MachineStartOptions) -> MachineStartOptions,
     {
@@ -60,10 +60,10 @@ impl Machine {
     pub async fn start_with_options(
         &self,
         options: MachineStartOptions,
-    ) -> Result<MachineData, LibVmError> {
+    ) -> Result<MachineStart, LibVmError> {
         let runtime = self.runtime();
         let vmmon = runtime.vmmon();
-        let config = {
+        let (config, run_id) = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             runtime.validate_machine_data_dir(&config)?;
             let machine_paths = runtime.machine_paths(config.id);
@@ -87,14 +87,45 @@ impl Machine {
                 });
             }
 
-            options.validate_egress_credentials(&config.network, &config.name)?;
-            let root_disk_resize = reconcile_root_disk_size(&config)?;
             let run_uuid = Uuid::new_v4();
             let run_id = run_uuid.to_string();
 
-            let resolved_network = runtime
+            runtime.request_machine_start(&config, &run_id).await?;
+            let root_disk_resize = match (|| {
+                options.validate_egress_credentials(&config.network, &config.name)?;
+                reconcile_root_disk_size(&config)
+            })() {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return Err(finish_failed_start(
+                        runtime,
+                        &config,
+                        &run_id,
+                        Some(FailedStartState::Stopped),
+                        None,
+                        error,
+                    )
+                    .await);
+                }
+            };
+
+            let resolved_network = match runtime
                 .prepare_machine_network(&config, &run_id, &options.egress_credentials)
-                .await?;
+                .await
+            {
+                Ok(network) => network,
+                Err(error) => {
+                    return Err(finish_failed_start(
+                        runtime,
+                        &config,
+                        &run_id,
+                        Some(FailedStartState::Stopped),
+                        None,
+                        error,
+                    )
+                    .await);
+                }
+            };
             let agent_enabled = match runtime.prepare_vmmon_launch_inputs(
                 &config,
                 &resolved_network,
@@ -102,9 +133,15 @@ impl Machine {
             ) {
                 Ok(agent_enabled) => agent_enabled,
                 Err(err) => {
-                    return Err(
-                        finish_failed_start(runtime, &config, &run_id, None, None, err).await,
-                    );
+                    return Err(finish_failed_start(
+                        runtime,
+                        &config,
+                        &run_id,
+                        Some(FailedStartState::Stopped),
+                        None,
+                        err,
+                    )
+                    .await);
                 }
             };
             if options.entrypoint.is_some() && !agent_enabled {
@@ -112,23 +149,31 @@ impl Machine {
                     reference: config.name.clone(),
                     message: "an entrypoint requires the managed guest agent".to_string(),
                 };
-                return Err(
-                    finish_failed_start(runtime, &config, &run_id, None, None, error).await,
-                );
+                return Err(finish_failed_start(
+                    runtime,
+                    &config,
+                    &run_id,
+                    Some(FailedStartState::Stopped),
+                    None,
+                    error,
+                )
+                .await);
             }
             let machine_log_dir = match runtime.local_paths().machine_logs_directory(config.id) {
                 Ok(directory) => directory,
                 Err(error) => {
-                    return Err(
-                        finish_failed_start(runtime, &config, &run_id, None, None, error).await,
+                    return Err(finish_failed_start(
+                        runtime,
+                        &config,
+                        &run_id,
+                        Some(FailedStartState::Stopped),
+                        None,
+                        error,
                     )
+                    .await)
                 }
             };
             let startup_command = options.vmmon_startup_command();
-
-            if let Err(err) = runtime.request_machine_start(config.id, &run_id).await {
-                return Err(finish_failed_start(runtime, &config, &run_id, None, None, err).await);
-            }
 
             let launch = VmmonLaunch {
                 machine_id: config.id,
@@ -219,22 +264,49 @@ impl Machine {
                 .await);
             }
 
-            config
+            (config, MachineRunId::from_raw(run_id))
         };
-        runtime.machine_inspect_data(config).await
+        Ok(MachineStart {
+            machine: runtime.machine_inspect_data(config).await?,
+            run_id,
+        })
     }
 
     /// Stops the machine and returns its updated inspect data.
     pub async fn stop(&self) -> Result<MachineData, LibVmError> {
-        self.stop_with(MachineStopOptions::default()).await
+        self.stop_impl(None, MachineStopOptions::default()).await
     }
 
     /// Stops the machine with explicit stop options.
     pub async fn stop_with(&self, options: MachineStopOptions) -> Result<MachineData, LibVmError> {
+        self.stop_impl(None, options).await
+    }
+
+    /// Stops this exact machine run without affecting a replacement run.
+    pub async fn stop_run(&self, run_id: MachineRunId) -> Result<MachineData, LibVmError> {
+        self.stop_impl(Some(&run_id), MachineStopOptions::default())
+            .await
+    }
+
+    /// Stops this exact machine run with explicit stop options.
+    pub async fn stop_run_with(
+        &self,
+        run_id: MachineRunId,
+        options: MachineStopOptions,
+    ) -> Result<MachineData, LibVmError> {
+        self.stop_impl(Some(&run_id), options).await
+    }
+
+    async fn stop_impl(
+        &self,
+        expected_run_id: Option<&MachineRunId>,
+        options: MachineStopOptions,
+    ) -> Result<MachineData, LibVmError> {
         let runtime = self.runtime();
         let wait_target = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
+            require_current_run(&config, &status, expected_run_id)?;
             if matches!(
                 status.state,
                 MachineRuntimeState::Stopped | MachineRuntimeState::Error
@@ -298,43 +370,73 @@ impl Machine {
             }
         };
 
-        self.wait_for_target_exit(wait_target, options.wait_options())
+        self.wait_for_target_exit(wait_target, options.wait_options(), expected_run_id)
             .await
             .map(|exit| exit.machine)
     }
 
     /// Waits for the current machine run to exit without sending a stop signal.
     pub async fn wait(&self) -> Result<MachineExit, LibVmError> {
-        self.wait_with(MachineWaitOptions::default()).await
+        self.wait_impl(None, MachineWaitOptions::default()).await
     }
 
     /// Waits for the current machine run with explicit wait options.
     pub async fn wait_with(&self, options: MachineWaitOptions) -> Result<MachineExit, LibVmError> {
+        self.wait_impl(None, options).await
+    }
+
+    /// Waits for this exact machine run without observing a replacement run.
+    pub async fn wait_for_run(&self, run_id: MachineRunId) -> Result<MachineExit, LibVmError> {
+        self.wait_impl(Some(&run_id), MachineWaitOptions::default())
+            .await
+    }
+
+    /// Waits for this exact machine run with explicit wait options.
+    pub async fn wait_for_run_with(
+        &self,
+        run_id: MachineRunId,
+        options: MachineWaitOptions,
+    ) -> Result<MachineExit, LibVmError> {
+        self.wait_impl(Some(&run_id), options).await
+    }
+
+    async fn wait_impl(
+        &self,
+        expected_run_id: Option<&MachineRunId>,
+        options: MachineWaitOptions,
+    ) -> Result<MachineExit, LibVmError> {
         let deadline = Instant::now()
             .checked_add(options.timeout_value())
             .unwrap_or_else(Instant::now);
 
         loop {
-            if let Some(wait_target) = self.active_wait_target().await? {
+            if let Some(wait_target) = self.active_wait_target(expected_run_id).await? {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 return self
-                    .wait_for_target_exit(wait_target, MachineWaitOptions::new().timeout(remaining))
+                    .wait_for_target_exit(
+                        wait_target,
+                        MachineWaitOptions::new().timeout(remaining),
+                        expected_run_id,
+                    )
                     .await;
             }
 
             let runtime = self.runtime();
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
-            let machine = runtime.machine_inspect_data(config).await?;
             if !status.is_active() {
-                return Ok(MachineExit::already_stopped(machine));
+                return Ok(MachineExit::already_stopped(
+                    runtime.machine_inspect_data(config).await?,
+                ));
             }
+            require_current_run(&config, &status, expected_run_id)?;
+            let machine = runtime.machine_inspect_data(config).await?;
 
             let now = Instant::now();
             if now >= deadline {
                 return Ok(MachineExit {
                     machine,
-                    run_id: status.run_id,
+                    run_id: status.run_id.map(MachineRunId::from_raw),
                     exited_at: None,
                     outcome: MachineExitOutcome::Unknown,
                 });
@@ -350,15 +452,39 @@ impl Machine {
 
     /// Forcefully stops the machine and waits for the monitor to exit.
     pub async fn kill(&self) -> Result<MachineExit, LibVmError> {
-        self.kill_with(MachineKillOptions::default()).await
+        self.kill_impl(None, MachineKillOptions::default()).await
     }
 
     /// Forcefully stops the machine with explicit kill options.
     pub async fn kill_with(&self, options: MachineKillOptions) -> Result<MachineExit, LibVmError> {
+        self.kill_impl(None, options).await
+    }
+
+    /// Forcefully stops this exact machine run without affecting a replacement run.
+    pub async fn kill_run(&self, run_id: MachineRunId) -> Result<MachineExit, LibVmError> {
+        self.kill_impl(Some(&run_id), MachineKillOptions::default())
+            .await
+    }
+
+    /// Forcefully stops this exact machine run with explicit kill options.
+    pub async fn kill_run_with(
+        &self,
+        run_id: MachineRunId,
+        options: MachineKillOptions,
+    ) -> Result<MachineExit, LibVmError> {
+        self.kill_impl(Some(&run_id), options).await
+    }
+
+    async fn kill_impl(
+        &self,
+        expected_run_id: Option<&MachineRunId>,
+        options: MachineKillOptions,
+    ) -> Result<MachineExit, LibVmError> {
         let runtime = self.runtime();
         let wait_target = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
+            require_current_run(&config, &status, expected_run_id)?;
             if matches!(
                 status.state,
                 MachineRuntimeState::Stopped | MachineRuntimeState::Error
@@ -374,7 +500,7 @@ impl Machine {
                 let machine = runtime.machine_inspect_data(config).await?;
                 return Ok(MachineExit {
                     machine,
-                    run_id: status.run_id,
+                    run_id: status.run_id.map(MachineRunId::from_raw),
                     exited_at: None,
                     outcome: MachineExitOutcome::Unknown,
                 });
@@ -412,11 +538,11 @@ impl Machine {
             }
         };
 
-        self.wait_for_target_exit(wait_target, options.wait_options())
+        self.wait_for_target_exit(wait_target, options.wait_options(), expected_run_id)
             .await
     }
 
-    /// Removes the persistent machine record and files.
+    /// Removes a stopped machine's durable records and files.
     pub async fn remove(self) -> Result<(), LibVmError> {
         let runtime = self.runtime();
         if runtime.machine_config(self.machine_id()).await?.is_none() {
@@ -480,6 +606,7 @@ async fn finish_failed_start(
             cleanup_errors.push(format!("reconcile prepared network: {err}"));
         }
     }
+    let mut terminal_transitioned = false;
     if monitor_stopped {
         if let Some(start_failure) = start_failure {
             let result = match start_failure {
@@ -498,10 +625,20 @@ async fn finish_failed_start(
                         .await
                 }
             };
-            if let Err(err) = result {
-                cleanup_errors.push(format!("record failed start: {err}"));
+            match result {
+                Ok(()) => terminal_transitioned = true,
+                Err(err) => cleanup_errors.push(format!("record failed start: {err}")),
             }
         }
+    }
+    if terminal_transitioned && config.retention == crate::MachineRetention::Ephemeral {
+        let _: Result<(), LibVmError> = async {
+            runtime.cleanup_machine_resources_locked(config).await?;
+            runtime.local_paths().remove_machine_logs_tree(config.id)?;
+            runtime.local_paths().remove_machine_data_tree(config.id)?;
+            runtime.remove_machine_records(config).await
+        }
+        .await;
     }
 
     if cleanup_errors.is_empty() {
@@ -533,13 +670,17 @@ async fn stop_failed_start_monitor(
 }
 
 impl Machine {
-    async fn active_wait_target(&self) -> Result<Option<WaitTarget>, LibVmError> {
+    async fn active_wait_target(
+        &self,
+        expected_run_id: Option<&MachineRunId>,
+    ) -> Result<Option<WaitTarget>, LibVmError> {
         let runtime = self.runtime();
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if !status.is_active() {
             return Ok(None);
         }
+        require_current_run(&config, &status, expected_run_id)?;
 
         let Some(pid) = status.pid else {
             return Ok(None);
@@ -566,6 +707,7 @@ impl Machine {
         &self,
         target: WaitTarget,
         options: MachineWaitOptions,
+        expected_run_id: Option<&MachineRunId>,
     ) -> Result<MachineExit, LibVmError> {
         let runtime = self.runtime();
         wait_for_monitor_stop(
@@ -577,14 +719,33 @@ impl Machine {
         {
             let (_lock, _) = runtime.lock_machine_config(target.config.id).await?;
             if target.stop_requested {
-                runtime
+                let completed = runtime
                     .complete_stop_locked(&target.config, target.generation.clone(), None)
                     .await?;
+                if !completed {
+                    if let Some(expected_run_id) = expected_run_id {
+                        return Err(stale_generation(
+                            &target.config,
+                            expected_run_id,
+                            runtime.machine_state(target.config.id).await?.run_id,
+                        ));
+                    }
+                }
             } else {
                 let status = runtime
                     .reconcile_machine_runtime_locked(&target.config)
                     .await?;
-                if !status.is_active() {
+                if let Some(expected_run_id) = expected_run_id {
+                    if status.is_active()
+                        && status.run_id.as_deref() != Some(expected_run_id.as_str())
+                    {
+                        return Err(stale_generation(
+                            &target.config,
+                            expected_run_id,
+                            status.run_id,
+                        ));
+                    }
+                } else if !status.is_active() {
                     runtime
                         .cleanup_machine_resources_locked(&target.config)
                         .await?;
@@ -632,9 +793,39 @@ fn machine_exit(
 
     MachineExit {
         machine,
-        run_id: generation.run_id,
+        run_id: generation.run_id.map(MachineRunId::from_raw),
         exited_at,
         outcome,
+    }
+}
+
+fn require_current_run(
+    config: &MachineConfig,
+    status: &crate::runtime::core::RuntimeStatus,
+    expected_run_id: Option<&MachineRunId>,
+) -> Result<(), LibVmError> {
+    let Some(expected_run_id) = expected_run_id else {
+        return Ok(());
+    };
+    if status.run_id.as_deref() == Some(expected_run_id.as_str()) {
+        return Ok(());
+    }
+    Err(stale_generation(
+        config,
+        expected_run_id,
+        status.run_id.clone(),
+    ))
+}
+
+fn stale_generation(
+    config: &MachineConfig,
+    requested: &MachineRunId,
+    current: Option<String>,
+) -> LibVmError {
+    LibVmError::MachineStaleGeneration {
+        reference: config.name.clone(),
+        requested: requested.clone(),
+        current: current.map(MachineRunId::from_raw),
     }
 }
 
@@ -646,7 +837,9 @@ fn monitor_identity(generation: &VmmonRunIdentity) -> Result<Option<ProcessIdent
     let Some(identity) = ProcessIdentity::for_pid(generation.pid)? else {
         return Ok(None);
     };
-    if !identity.matches_started_at(generation.started_at) || !identity.is_alive()? {
+    if (generation.started_at.is_some() && !identity.matches_started_at(generation.started_at))
+        || !identity.is_alive()?
+    {
         return Ok(None);
     }
     Ok(Some(identity))

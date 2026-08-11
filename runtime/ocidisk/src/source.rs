@@ -6,8 +6,6 @@ use crate::{OciDiskError, OciDiskResult};
 pub(crate) enum ImageSource {
     RemoteOci(String),
     LocalDisk(PathBuf),
-    RootfsTar(PathBuf),
-    OciArchive(PathBuf),
 }
 
 impl ImageSource {
@@ -23,13 +21,6 @@ impl ImageSource {
         if let Some(path) = image_ref.strip_prefix("disk:") {
             return Ok(Self::LocalDisk(parse_local_path(image_ref, path)?));
         }
-        if let Some(path) = image_ref.strip_prefix("tar:") {
-            return Ok(Self::RootfsTar(parse_local_path(image_ref, path)?));
-        }
-        if let Some(path) = image_ref.strip_prefix("oci:") {
-            return Ok(Self::OciArchive(parse_local_path(image_ref, path)?));
-        }
-
         Ok(Self::RemoteOci(image_ref.to_string()))
     }
 }
@@ -50,25 +41,16 @@ mod tests {
     use crate::source::ImageSource;
 
     #[test]
-    fn parses_local_image_sources() {
+    fn parses_supported_image_sources() {
         assert!(matches!(
             ImageSource::parse("disk:./rootfs.img").expect("parse disk"),
             ImageSource::LocalDisk(_)
-        ));
-        assert!(matches!(
-            ImageSource::parse("tar:./rootfs.tar").expect("parse tar"),
-            ImageSource::RootfsTar(_)
-        ));
-        assert!(matches!(
-            ImageSource::parse("oci:./image.tar").expect("parse oci"),
-            ImageSource::OciArchive(_)
         ));
         assert!(matches!(
             ImageSource::parse("ghcr.io/org/image:latest").expect("parse remote"),
             ImageSource::RemoteOci(_)
         ));
     }
-
     #[test]
     fn rejects_empty_local_paths() {
         let err = ImageSource::parse("disk:").expect_err("empty local path should fail");

@@ -50,14 +50,14 @@ export class MachineBuilder {
 
     /**
      * Set an OCI image reference. Strings always mean OCI references.
-     * Use {@link ImageSource.disk} or {@link ImageSource.tar} for local paths.
+     * Use {@link ImageSource.disk} for local paths.
      */
     image(reference: string): this {
         this.native.image(assertNonEmptyString(reference, "reference"));
         return this;
     }
 
-    /** Set an explicit OCI, disk, or tar image source. */
+    /** Set an explicit OCI or disk image source. */
     imageSource(source: ImageSource): this {
         this.native.imageSource(imageSourceToNative(source));
         return this;

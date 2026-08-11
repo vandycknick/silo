@@ -163,6 +163,7 @@ pub struct ExecutionSession {
     reference: String,
     requests: Arc<Mutex<Option<mpsc::Sender<ExecuteInput>>>>,
     input_open: Arc<AtomicBool>,
+    started: Arc<AtomicBool>,
     input_order: Arc<AsyncMutex<()>>,
     request_closed: Arc<watch::Sender<bool>>,
     pipe_stdin: bool,
@@ -175,6 +176,7 @@ pub struct ExecutionControl {
     reference: String,
     requests: Arc<Mutex<Option<mpsc::Sender<ExecuteInput>>>>,
     input_open: Arc<AtomicBool>,
+    started: Arc<AtomicBool>,
     input_order: Arc<AsyncMutex<()>>,
     request_closed: Arc<watch::Sender<bool>>,
     pipe_stdin: bool,
@@ -186,6 +188,7 @@ pub struct ExecutionStdin {
     reference: String,
     requests: Arc<Mutex<Option<mpsc::Sender<ExecuteInput>>>>,
     input_open: Arc<AtomicBool>,
+    started: Arc<AtomicBool>,
     input_order: Arc<AsyncMutex<()>>,
     request_closed: Arc<watch::Sender<bool>>,
     pipe_stdin: bool,
@@ -198,6 +201,7 @@ impl ExecutionSession {
             reference: self.reference.clone(),
             requests: Arc::clone(&self.requests),
             input_open: Arc::clone(&self.input_open),
+            started: Arc::clone(&self.started),
             input_order: Arc::clone(&self.input_order),
             request_closed: Arc::clone(&self.request_closed),
             pipe_stdin: self.pipe_stdin,
@@ -215,6 +219,7 @@ impl ExecutionSession {
         match events.message().await {
             Ok(Some(wire)) => {
                 let event = execution_event_from_wire(wire);
+                mark_execution_started(&event, &self.started);
                 if matches!(event, ExecutionEvent::Terminal(_)) {
                     self.close_requests();
                     self.events = None;
@@ -304,7 +309,7 @@ impl ExecutionSession {
                         stdout,
                         stderr,
                         terminal_output,
-                    })
+                    });
                 }
                 ExecutionEvent::Accepted | ExecutionEvent::Started => {}
             }
@@ -320,13 +325,14 @@ impl ExecutionControl {
     /// Returns a stdin writer while the request half remains open.
     pub fn stdin(&self) -> Option<ExecutionStdin> {
         self.requests.lock().ok()?.as_ref()?;
-        if !self.input_open.load(Ordering::Acquire) {
+        if !self.started.load(Ordering::Acquire) || !self.input_open.load(Ordering::Acquire) {
             return None;
         }
         Some(ExecutionStdin {
             reference: self.reference.clone(),
             requests: Arc::clone(&self.requests),
             input_open: Arc::clone(&self.input_open),
+            started: Arc::clone(&self.started),
             input_order: Arc::clone(&self.input_order),
             request_closed: Arc::clone(&self.request_closed),
             pipe_stdin: self.pipe_stdin,
@@ -347,6 +353,7 @@ impl ExecutionControl {
             ));
         }
         let _order = self.input_order.lock().await;
+        self.ensure_started()?;
         if !self.input_open.load(Ordering::Acquire) {
             return Err(guest_session_error(
                 &self.reference,
@@ -360,6 +367,7 @@ impl ExecutionControl {
 
     /// Resizes the process PTY.
     pub async fn resize_pty(&self, rows: u16, columns: u16) -> Result<(), LibVmError> {
+        self.ensure_started()?;
         self.send(ExecuteMessage::ResizePty(ResizePty {
             size: Some(TerminalSize {
                 columns: u32::from(columns),
@@ -376,6 +384,10 @@ impl ExecutionControl {
                 &self.reference,
                 "signal must be a Linux signal number from 1 through 64",
             ));
+        }
+        if !self.started.load(Ordering::Acquire) {
+            self.close_requests();
+            return Ok(());
         }
         self.send(ExecuteMessage::SignalProcess(SignalProcess {
             signal: Some(signal),
@@ -427,6 +439,7 @@ impl ExecutionControl {
 
     async fn send_stdin_data(&self, data: Vec<u8>) -> Result<(), LibVmError> {
         let _order = self.input_order.lock().await;
+        self.ensure_started()?;
         if !self.input_open.load(Ordering::Acquire) {
             return Err(guest_session_error(
                 &self.reference,
@@ -448,11 +461,22 @@ impl ExecutionControl {
         }
         Ok(())
     }
+
+    fn ensure_started(&self) -> Result<(), LibVmError> {
+        if self.started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Err(guest_session_error(
+            &self.reference,
+            "execution has not started",
+        ))
+    }
 }
 
 impl ExecutionStdin {
     pub async fn write(&self, data: impl Into<Vec<u8>>) -> Result<(), LibVmError> {
         let _order = self.input_order.lock().await;
+        self.ensure_started()?;
         if !self.input_open.load(Ordering::Acquire) {
             return Err(guest_session_error(
                 &self.reference,
@@ -484,6 +508,7 @@ impl ExecutionStdin {
             ));
         }
         let _order = self.input_order.lock().await;
+        self.ensure_started()?;
         if !self.input_open.load(Ordering::Acquire) {
             return Err(guest_session_error(
                 &self.reference,
@@ -526,6 +551,16 @@ impl ExecutionStdin {
                 guest_session_error(&self.reference, "execution request stream is closed")
             }),
         }
+    }
+
+    fn ensure_started(&self) -> Result<(), LibVmError> {
+        if self.started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Err(guest_session_error(
+            &self.reference,
+            "execution has not started",
+        ))
     }
 }
 
@@ -793,39 +828,6 @@ impl Machine {
         self.attach_ssh_shell(options).await
     }
 
-    /// Runs one command through the pre-cutover SSH transport used only by `silo run`.
-    #[doc(hidden)]
-    pub async fn run_legacy_ssh_command(
-        &self,
-        argv: &[String],
-        tty: bool,
-    ) -> Result<SshExitStatus, LibVmError> {
-        if argv.is_empty() {
-            return Err(guest_session_error("run", "guest command is required"));
-        }
-        let reference = self.inspect().await?.name;
-        let client = self.connect_guest_ssh(&reference, None, false).await?;
-        let mut channel = open_session_channel(&client).await?;
-        if tty {
-            let (columns, rows) = current_terminal_size();
-            channel
-                .request_pty(true, DEFAULT_TERM, columns, rows, 0, 0, &[])
-                .await
-                .map_err(|error| ssh_error(&reference, "request PTY", error))?;
-            wait_channel_success(&mut channel, &reference, "request PTY").await?;
-        }
-        channel
-            .exec(true, legacy_ssh_command(argv)?)
-            .await
-            .map_err(|error| ssh_error(&reference, "send exec request", error))?;
-        wait_channel_success(&mut channel, &reference, "exec request").await?;
-        if tty {
-            attach_ssh_stdio(reference, channel, vec![DEFAULT_ATTACH_DETACH_KEY], client).await
-        } else {
-            stream_ssh_stdio(reference, channel, client).await
-        }
-    }
-
     async fn start_execution(
         &self,
         program: String,
@@ -898,6 +900,7 @@ impl Machine {
             reference,
             requests: Arc::new(Mutex::new(Some(requests))),
             input_open: Arc::new(AtomicBool::new(input_open)),
+            started: Arc::new(AtomicBool::new(false)),
             input_order: Arc::new(AsyncMutex::new(())),
             request_closed: Arc::new(watch::channel(false).0),
             pipe_stdin,
@@ -1109,6 +1112,12 @@ pub(crate) fn execution_event_from_wire(event: WireExecutionEvent) -> ExecutionE
     }
 }
 
+fn mark_execution_started(event: &ExecutionEvent, started: &AtomicBool) {
+    if matches!(event, ExecutionEvent::Started) {
+        started.store(true, Ordering::Release);
+    }
+}
+
 fn caller_status(code: tonic::Code) -> bool {
     matches!(
         code,
@@ -1174,16 +1183,14 @@ pub(crate) fn lost_reason(value: Option<i32>) -> ExecutionLostReason {
 async fn attach_execution_stdio(
     session: &mut ExecutionSession,
 ) -> Result<ExecutionResult, LibVmError> {
-    let _terminal = RawTerminalGuard::new().map_err(|error| {
-        guest_session_error(&session.reference, format!("enable raw terminal: {error}"))
-    })?;
-    let stdin = session
-        .stdin()
-        .ok_or_else(|| guest_session_error(&session.reference, "execution stdin is closed"))?;
     let mut host_stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut input = [0_u8; 1024];
+    let mut _terminal = None;
+    let mut stdin: Option<ExecutionStdin> = None;
     let mut stdin_closed = false;
+    let mut started = false;
+    let mut launch_cancelled = false;
     let mut resize_signal = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::window_change(),
     )
@@ -1194,31 +1201,21 @@ async fn attach_execution_stdio(
         )
     })?;
     let mut resize_signal_open = true;
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .map_err(|error| {
-        guest_session_error(
-            &session.reference,
-            format!("listen for terminal interrupt: {error}"),
-        )
-    })?;
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|error| {
-        guest_session_error(
-            &session.reference,
-            format!("listen for terminal termination: {error}"),
-        )
-    })?;
+    let mut signals = HostSignalForwarders::new(&session.reference)?;
     loop {
         tokio::select! {
-            read = host_stdin.read(&mut input), if !stdin_closed => {
+            read = host_stdin.read(&mut input), if started && !launch_cancelled && !stdin_closed => {
                 let read = read.map_err(|error| guest_session_error(&session.reference, format!("read terminal input: {error}")))?;
                 if read == 0 {
                     stdin_closed = true;
                 } else {
+                    let Some(stdin) = stdin.as_ref() else {
+                        continue;
+                    };
                     stdin.write(input[..read].to_vec()).await?;
                 }
             }
-            resized = resize_signal.recv(), if resize_signal_open => {
+            resized = resize_signal.recv(), if started && !launch_cancelled && resize_signal_open => {
                 if resized.is_none() {
                     resize_signal_open = false;
                 } else {
@@ -1228,14 +1225,15 @@ async fn attach_execution_stdio(
                     session.resize_pty(rows, columns).await?;
                 }
             }
-            signal = interrupt.recv() => {
-                if signal.is_some() {
-                    session.signal(libc::SIGINT as u32).await?;
-                }
-            }
-            signal = terminate.recv() => {
-                if signal.is_some() {
-                    session.signal(libc::SIGTERM as u32).await?;
+            signal = signals.recv() => {
+                let Some(signal) = signal else {
+                    return Err(guest_session_error(&session.reference, "host signal listeners stopped"));
+                };
+                if started && !launch_cancelled {
+                    session.signal(signal).await?;
+                } else if !launch_cancelled {
+                    session.close_requests();
+                    launch_cancelled = true;
                 }
             }
             event = session.recv() => match event? {
@@ -1244,11 +1242,80 @@ async fn attach_execution_stdio(
                     stdout.flush().await.map_err(|error| guest_session_error(&session.reference, format!("flush terminal output: {error}")))?;
                 }
                 Some(ExecutionEvent::Terminal(result)) => return Ok(result),
-                Some(ExecutionEvent::Accepted | ExecutionEvent::Started) => {}
+                Some(ExecutionEvent::Accepted) => {}
+                Some(ExecutionEvent::Started) if !launch_cancelled => {
+                    let raw_terminal = RawTerminalGuard::new().map_err(|error| {
+                        guest_session_error(&session.reference, format!("enable raw terminal: {error}"))
+                    })?;
+                    let execution_stdin = session
+                        .stdin()
+                        .ok_or_else(|| guest_session_error(&session.reference, "execution stdin is closed"))?;
+                    let (columns, rows) = current_terminal_size();
+                    let rows = u16::try_from(rows).map_err(|_| guest_session_error(&session.reference, "terminal rows exceed 65535"))?;
+                    let columns = u16::try_from(columns).map_err(|_| guest_session_error(&session.reference, "terminal columns exceed 65535"))?;
+                    session.resize_pty(rows, columns).await?;
+                    _terminal = Some(raw_terminal);
+                    stdin = Some(execution_stdin);
+                    started = true;
+                }
+                Some(ExecutionEvent::Started) => started = true,
                 None => return Err(guest_session_error(&session.reference, "execution ended without a terminal result")),
             }
         }
     }
+}
+
+struct HostSignalForwarders {
+    receiver: mpsc::Receiver<u32>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl HostSignalForwarders {
+    fn new(reference: &str) -> Result<Self, LibVmError> {
+        let (sender, receiver) = mpsc::channel(64);
+        let mut tasks = Vec::new();
+        for signal in forwardable_signals() {
+            let Ok(mut listener) = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::from_raw(signal as i32),
+            ) else {
+                continue;
+            };
+            let sender = sender.clone();
+            tasks.push(tokio::spawn(async move {
+                while listener.recv().await.is_some() {
+                    if sender.send(signal).await.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(sender);
+        if tasks.is_empty() {
+            return Err(guest_session_error(reference, "listen for host signals"));
+        }
+        Ok(Self { receiver, tasks })
+    }
+
+    async fn recv(&mut self) -> Option<u32> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for HostSignalForwarders {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+fn forwardable_signals() -> impl Iterator<Item = u32> {
+    (1..=64).filter(|signal| {
+        !matches!(
+            *signal as i32,
+            libc::SIGKILL | libc::SIGSTOP | libc::SIGCHLD | libc::SIGWINCH
+        )
+    })
 }
 
 struct GuestSshClient {
@@ -1306,13 +1373,13 @@ async fn wait_channel_success(
                 return Err(guest_session_error(
                     reference,
                     format!("SSH {context} failed"),
-                ))
+                ));
             }
             Some(ChannelMsg::Close) | None => {
                 return Err(guest_session_error(
                     reference,
                     format!("SSH channel closed during {context}"),
-                ))
+                ));
             }
             _ => {}
         }
@@ -1333,7 +1400,7 @@ fn ssh_shell_command(options: &SshShellOptions) -> Result<String, LibVmError> {
     let mut command = String::new();
     if let Some(cwd) = &options.cwd {
         command.push_str("cd ");
-        command.push_str(&shell_quote(cwd));
+        command.push_str(&quote_ssh_shell_argument(cwd));
         if options.best_effort_cwd {
             command.push_str(" 2>/dev/null || true; ");
         } else {
@@ -1353,12 +1420,12 @@ fn ssh_shell_command(options: &SshShellOptions) -> Result<String, LibVmError> {
             command.push(' ');
             command.push_str(key);
             command.push('=');
-            command.push_str(&shell_quote(value));
+            command.push_str(&quote_ssh_shell_argument(value));
         }
         command.push(' ');
     }
     command.push_str("/bin/sh -lc ");
-    command.push_str(&shell_quote(DEFAULT_LOGIN_SHELL_SCRIPT));
+    command.push_str(&quote_ssh_shell_argument(DEFAULT_LOGIN_SHELL_SCRIPT));
     Ok(command)
 }
 
@@ -1369,21 +1436,7 @@ fn valid_environment_name(name: &str) -> bool {
         })
 }
 
-fn legacy_ssh_command(argv: &[String]) -> Result<String, LibVmError> {
-    let cwd = std::env::current_dir().map_err(|error| {
-        guest_session_error("run", format!("resolve current working directory: {error}"))
-    })?;
-    let command = argv
-        .iter()
-        .map(|arg| shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    Ok(format!(
-        "cd {} 2>/dev/null || true; exec {command}",
-        shell_quote(&cwd.to_string_lossy())
-    ))
-}
-fn shell_quote(input: &str) -> String {
+fn quote_ssh_shell_argument(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
@@ -1444,48 +1497,6 @@ async fn attach_ssh_stdio(
         }
     }
     ssh_exit_status(&reference, exit_code, detached)
-}
-
-async fn stream_ssh_stdio(
-    reference: String,
-    channel: Channel<ClientMsg>,
-    _client: GuestSshClient,
-) -> Result<SshExitStatus, LibVmError> {
-    let (mut rx, tx) = channel.split();
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut stderr = tokio::io::stderr();
-    let mut input = [0_u8; 8192];
-    let mut stdin_closed = false;
-    let mut exit_code = None;
-    loop {
-        tokio::select! {
-            read = stdin.read(&mut input), if !stdin_closed => {
-                let read = read.map_err(|error| guest_session_error(&reference, format!("read command input: {error}")))?;
-                if read == 0 {
-                    stdin_closed = true;
-                    tx.eof().await.map_err(|error| ssh_error(&reference, "close command input", error))?;
-                } else {
-                    tx.data_bytes(input[..read].to_vec()).await.map_err(|error| ssh_error(&reference, "write command input", error))?;
-                }
-            }
-            message = rx.wait() => match message {
-                Some(ChannelMsg::Data { data }) => {
-                    stdout.write_all(&data).await.map_err(|error| guest_session_error(&reference, format!("write command stdout: {error}")))?;
-                    stdout.flush().await.map_err(|error| guest_session_error(&reference, format!("flush command stdout: {error}")))?;
-                }
-                Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    stderr.write_all(&data).await.map_err(|error| guest_session_error(&reference, format!("write command stderr: {error}")))?;
-                    stderr.flush().await.map_err(|error| guest_session_error(&reference, format!("flush command stderr: {error}")))?;
-                }
-                Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status as i32),
-                Some(ChannelMsg::ExitSignal { .. }) => exit_code = Some(128),
-                Some(ChannelMsg::Close) | None => break,
-                _ => {}
-            }
-        }
-    }
-    ssh_exit_status(&reference, exit_code, false)
 }
 
 fn ssh_exit_status(
@@ -1703,15 +1714,19 @@ impl Drop for RawTerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
+    use nix::sys::signal::{raise, Signal};
     use protocol::v1::execute_input::Message as ExecuteMessage;
     use tokio::sync::{watch, Mutex as AsyncMutex};
+    use tokio::time::timeout;
 
     use crate::machine::session::{
-        apply_default_execution_user, execution_event_from_wire, process_spec, ssh_shell_command,
-        ExecutionControl, ExecutionEvent, ExecutionLostReason, ExecutionOptions, ExecutionResult,
+        apply_default_execution_user, execution_event_from_wire, forwardable_signals,
+        mark_execution_started, process_spec, ssh_shell_command, ExecutionControl, ExecutionEvent,
+        ExecutionLostReason, ExecutionOptions, ExecutionResult, HostSignalForwarders,
         SshShellOptions, StdinMode,
     };
     use crate::machine::MachineUserConfig;
@@ -1795,12 +1810,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foreground_controls_follow_the_started_event_before_sending_input_or_resize() {
+        let (requests, mut receiver) = tokio::sync::mpsc::channel(4);
+        let started = Arc::new(AtomicBool::new(false));
+        let control = ExecutionControl {
+            reference: "dev".to_string(),
+            requests: Arc::new(Mutex::new(Some(requests))),
+            input_open: Arc::new(AtomicBool::new(true)),
+            started: Arc::clone(&started),
+            input_order: Arc::new(AsyncMutex::new(())),
+            request_closed: Arc::new(watch::channel(false).0),
+            pipe_stdin: true,
+        };
+
+        assert!(control.stdin().is_none());
+        assert!(control.write_stdin(b"before").await.is_err());
+        assert!(control.resize_pty(24, 80).await.is_err());
+        assert!(receiver.try_recv().is_err());
+
+        mark_execution_started(&ExecutionEvent::Accepted, &started);
+        assert!(!started.load(Ordering::Acquire));
+        mark_execution_started(&ExecutionEvent::Started, &started);
+        assert!(started.load(Ordering::Acquire));
+
+        control
+            .write_stdin(b"after")
+            .await
+            .expect("write after Started");
+        control
+            .resize_pty(24, 80)
+            .await
+            .expect("resize after Started");
+
+        assert!(matches!(
+            receiver.recv().await.and_then(|request| request.message),
+            Some(ExecuteMessage::StdinData(data)) if data.data.as_ref() == b"after"
+        ));
+        assert!(matches!(
+            receiver.recv().await.and_then(|request| request.message),
+            Some(ExecuteMessage::ResizePty(resize))
+                if matches!(resize.size, Some(protocol::v1::TerminalSize { rows: 24, columns: 80 }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn foreground_signal_closes_pending_request_and_forwards_only_after_started() {
+        let (pending_requests, mut pending_receiver) = tokio::sync::mpsc::channel(1);
+        let pending = ExecutionControl {
+            reference: "dev".to_string(),
+            requests: Arc::new(Mutex::new(Some(pending_requests))),
+            input_open: Arc::new(AtomicBool::new(true)),
+            started: Arc::new(AtomicBool::new(false)),
+            input_order: Arc::new(AsyncMutex::new(())),
+            request_closed: Arc::new(watch::channel(false).0),
+            pipe_stdin: true,
+        };
+
+        pending
+            .signal(libc::SIGINT as u32)
+            .await
+            .expect("cancel pending execution");
+        assert!(pending_receiver.recv().await.is_none());
+
+        let (running_requests, mut running_receiver) = tokio::sync::mpsc::channel(1);
+        let running = ExecutionControl {
+            reference: "dev".to_string(),
+            requests: Arc::new(Mutex::new(Some(running_requests))),
+            input_open: Arc::new(AtomicBool::new(true)),
+            started: Arc::new(AtomicBool::new(true)),
+            input_order: Arc::new(AsyncMutex::new(())),
+            request_closed: Arc::new(watch::channel(false).0),
+            pipe_stdin: true,
+        };
+
+        running
+            .signal(libc::SIGTERM as u32)
+            .await
+            .expect("forward running execution signal");
+        assert!(matches!(
+            running_receiver.recv().await.and_then(|request| request.message),
+            Some(ExecuteMessage::SignalProcess(signal)) if signal.signal == Some(libc::SIGTERM as u32)
+        ));
+    }
+
+    #[test]
+    fn pty_signal_forwarding_excludes_only_unforwardable_signals() {
+        let signals = forwardable_signals().collect::<Vec<_>>();
+
+        for signal in 1..=64 {
+            let excluded = matches!(
+                signal,
+                value if value == libc::SIGKILL as u32
+                    || value == libc::SIGSTOP as u32
+                    || value == libc::SIGCHLD as u32
+                    || value == libc::SIGWINCH as u32
+            );
+            assert_eq!(signals.contains(&signal), !excluded, "signal {signal}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pty_signal_forwarder_receives_registered_host_signals() {
+        let mut forwarders = HostSignalForwarders::new("dev").expect("register host signals");
+
+        raise(Signal::SIGUSR1).expect("raise SIGUSR1");
+        let signal = timeout(Duration::from_secs(1), forwarders.recv())
+            .await
+            .expect("receive SIGUSR1")
+            .expect("signal relay is open");
+
+        assert_eq!(signal, libc::SIGUSR1 as u32);
+    }
+
+    #[tokio::test]
     async fn vmmon_execution_control_splits_large_stdin_without_losing_bytes() {
         let (requests, mut receiver) = tokio::sync::mpsc::channel(4);
         let control = ExecutionControl {
             reference: "dev".to_string(),
             requests: Arc::new(Mutex::new(Some(requests))),
             input_open: Arc::new(AtomicBool::new(true)),
+            started: Arc::new(AtomicBool::new(true)),
             input_order: Arc::new(AsyncMutex::new(())),
             request_closed: Arc::new(watch::channel(false).0),
             pipe_stdin: true,
@@ -1832,6 +1961,7 @@ mod tests {
             reference: "dev".to_string(),
             requests: Arc::new(Mutex::new(Some(requests))),
             input_open: Arc::new(AtomicBool::new(false)),
+            started: Arc::new(AtomicBool::new(true)),
             input_order: Arc::new(AsyncMutex::new(())),
             request_closed: Arc::new(watch::channel(false).0),
             pipe_stdin: false,
@@ -1847,6 +1977,7 @@ mod tests {
             reference: "dev".to_string(),
             requests: Arc::new(Mutex::new(Some(requests))),
             input_open: Arc::new(AtomicBool::new(true)),
+            started: Arc::new(AtomicBool::new(true)),
             input_order: Arc::new(AsyncMutex::new(())),
             request_closed: Arc::new(watch::channel(false).0),
             pipe_stdin: true,
@@ -1876,6 +2007,7 @@ mod tests {
             reference: "dev".to_string(),
             requests: Arc::new(Mutex::new(Some(requests))),
             input_open: Arc::new(AtomicBool::new(true)),
+            started: Arc::new(AtomicBool::new(true)),
             input_order: Arc::new(AsyncMutex::new(())),
             request_closed: Arc::new(watch::channel(false).0),
             pipe_stdin: true,

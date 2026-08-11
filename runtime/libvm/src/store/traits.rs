@@ -1,10 +1,9 @@
 use async_trait::async_trait;
 
 use crate::image::{ImageDetail, ImageHandle, ImagePruneReport, ImageRemoveOptions};
-use crate::store::models::MachineId;
 use crate::store::models::{
-    DbConfig, ImageRootfsArtifactRecord, MachineConfig, MachineRootfsRecord, MachineState,
-    NetworkAttachment, NetworkDefinition, NetworkInstance, OciImageRecord,
+    DbConfig, MachineConfig, MachineId, MachineRootfsRecord, MachineState, NetworkAttachment,
+    NetworkDefinition, NetworkInstance, OciImageRecord,
 };
 use crate::LibVmError;
 
@@ -55,6 +54,12 @@ pub(crate) trait MachineStore: std::fmt::Debug + Send + Sync {
         machine_id: MachineId,
     ) -> Result<Option<MachineState>, LibVmError>;
 
+    /// Reads the durable rootfs pin for an existing machine, if present.
+    async fn machine_rootfs(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<Option<MachineRootfsRecord>, LibVmError>;
+
     /// Upserts runtime state for an existing machine.
     ///
     /// The machine config row must already exist; SQLite enforces that through a
@@ -98,12 +103,6 @@ pub(crate) trait ImageStore: std::fmt::Debug + Send + Sync {
     /// Upserts OCI manifest metadata, its mutable reference, layers, and rootfs artifact.
     async fn save_oci_image(&self, image: &OciImageRecord) -> Result<(), LibVmError>;
 
-    /// Upserts a non-OCI managed rootfs artifact, currently used by tar sources.
-    async fn save_rootfs_artifact(
-        &self,
-        artifact: &ImageRootfsArtifactRecord,
-    ) -> Result<(), LibVmError>;
-
     /// Reads a lightweight image reference by exact reference.
     async fn image_handle(&self, reference: &str) -> Result<Option<ImageHandle>, LibVmError>;
 
@@ -112,6 +111,13 @@ pub(crate) trait ImageStore: std::fmt::Debug + Send + Sync {
 
     /// Reads image detail by exact reference.
     async fn image_detail(&self, reference: &str) -> Result<Option<ImageDetail>, LibVmError>;
+
+    /// Verifies that an image reference can be removed without changing durable state.
+    async fn ensure_image_removable(
+        &self,
+        reference: &str,
+        options: ImageRemoveOptions,
+    ) -> Result<ImageHandle, LibVmError>;
 
     /// Removes an image reference.
     async fn remove_image(

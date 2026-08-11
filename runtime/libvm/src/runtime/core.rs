@@ -26,11 +26,13 @@ use utils::format_storage_size;
 use vm_spec::{Boot, Hardware, Kernel, VmSpec};
 
 use crate::image::{
-    ImageDetail, ImageHandle, ImageProgress, ImageProgressSender, ImagePruneReport,
-    ImagePullPolicy, ImageRemoveOptions, ImageSource, ImageSourceKind, Images, MaterializedImage,
+    ImageCacheState, ImageDetail, ImageHandle, ImageProgress, ImageProgressSender,
+    ImagePruneReport, ImagePullPolicy, ImageRemoveOptions, ImageSource, ImageSourceKind, Images,
+    MaterializedImage, ResolvedOciImage, ResolvedOciImageMaterialization,
 };
 use crate::machine::{
-    Machine, MachineBuilder, MachineData, MachineRef, MachineRefKind, MachineStatus, EgressCredentials,
+    EgressCredentials, Machine, MachineBuilder, MachineData, MachineRef, MachineRefKind,
+    MachineStatus,
 };
 use crate::network::{
     prepare_network_runtime, reconcile_network_runtime, validate_network_name, NetworkBuilder,
@@ -106,8 +108,8 @@ pub struct Runtime {
 ///
 /// PID alone is not enough because host PIDs can be reused. When the platform
 /// can expose process birth time we include it, and we also carry the runtime
-/// run ID written into persisted state and vmmon exit files. Stop and cleanup
-/// paths use this to avoid applying stale transitions to a newer machine run.
+/// run ID written into persisted state and vmmon exit files. Lifecycle paths use
+/// this to avoid applying stale transitions to a newer machine run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VmmonRunIdentity {
     pub(crate) pid: i32,
@@ -179,7 +181,7 @@ impl Runtime {
             image_pull_policy: ImagePullPolicy::default(),
             image_progress: None,
         };
-        runtime.refresh_active_machine_states().await?;
+        runtime.refresh_machine_states().await?;
         Ok(runtime)
     }
 
@@ -206,6 +208,10 @@ impl Runtime {
     pub fn with_image_pull_policy(mut self, policy: ImagePullPolicy) -> Self {
         self.image_pull_policy = policy;
         self
+    }
+
+    pub(crate) fn image_pull_policy(&self) -> ImagePullPolicy {
+        self.image_pull_policy
     }
 
     /// Returns a runtime handle that reports future image materialization progress.
@@ -302,6 +308,7 @@ impl Runtime {
         &self,
         source: &ImageSource,
     ) -> Result<MaterializedImage, LibVmError> {
+        validate_image_pull_policy(source, self.image_pull_policy)?;
         let cache_reference = source.cache_reference();
         let store = RootfsImageStore::open(self.local_images_dir())
             .map_err(|err| image_error(&cache_reference, err))?;
@@ -341,19 +348,135 @@ impl Runtime {
             .rootfs_metadata(&rootfs)
             .map_err(|err| image_error(&rootfs.image_ref, err))?;
         let size_bytes = fs::metadata(&rootfs.path)?.len();
-        let manifest_digest = materialized_manifest_digest(source, &rootfs, metadata.as_ref())?;
-        self.persist_materialized_image(source, &rootfs, metadata.as_ref(), size_bytes)
-            .await?;
-
-        Ok(MaterializedImage {
-            rootfs_path: rootfs.path,
-            image_ref: rootfs.image_ref,
-            source_kind: source.kind(),
-            source_reference: source.source_reference(),
-            image_id: Some(rootfs.image_id),
-            manifest_digest,
+        let identity = materialized_image_identity(source, &rootfs, metadata.as_ref())?;
+        self.persist_materialized_image(
+            source,
+            &rootfs,
+            metadata.as_ref(),
             size_bytes,
-        })
+            &identity.requested_reference,
+        )
+        .await?;
+
+        let image = MaterializedImage {
+            rootfs_path: rootfs.path,
+            requested_reference: identity.requested_reference,
+            selected_reference: identity.selected_reference,
+            source_kind: source.kind(),
+            image_id: Some(rootfs.image_id),
+            manifest_digest: identity.manifest_digest,
+            config_digest: identity.config_digest,
+            size_bytes,
+        };
+        emit_image_progress_complete(self.image_progress.as_ref());
+        Ok(image)
+    }
+
+    pub(crate) async fn resolve_oci_image(
+        &self,
+        reference: String,
+        policy: ImagePullPolicy,
+    ) -> Result<ResolvedOciImage, LibVmError> {
+        let store = RootfsImageStore::open(self.local_images_dir())
+            .map_err(|err| image_error(&reference, err))?;
+        let options = RootfsOptions::for_host().map_err(|err| image_error(&reference, err))?;
+
+        match policy {
+            ImagePullPolicy::IfMissing => {
+                if let Some(image) = cached_resolved_oci_image(&store, &reference, options.clone())?
+                {
+                    return Ok(image);
+                }
+                resolve_oci_image_from_registry(
+                    &store,
+                    reference,
+                    options,
+                    self.image_progress.clone(),
+                )
+                .await
+            }
+            ImagePullPolicy::Always => {
+                resolve_oci_image_from_registry(
+                    &store,
+                    reference,
+                    options,
+                    self.image_progress.clone(),
+                )
+                .await
+            }
+            ImagePullPolicy::Never => cached_resolved_oci_image(&store, &reference, options)?
+                .ok_or(LibVmError::ImageNotFound { reference }),
+        }
+    }
+
+    pub(crate) async fn materialize_resolved_oci_image(
+        &self,
+        resolved: &ResolvedOciImage,
+    ) -> Result<MaterializedImage, LibVmError> {
+        let source = ImageSource::oci(resolved.requested_reference.clone());
+        let store = RootfsImageStore::open(self.local_images_dir())
+            .map_err(|err| image_error(&resolved.requested_reference, err))?;
+        let options = RootfsOptions::for_host()
+            .map_err(|err| image_error(&resolved.requested_reference, err))?;
+        if options.platform != resolved.platform {
+            return Err(image_error(
+                &resolved.requested_reference,
+                ocidisk::OciDiskError::PlatformMismatch {
+                    reference: resolved.requested_reference.clone(),
+                    requested: options.platform.to_string(),
+                    actual: resolved.platform.to_string(),
+                },
+            ));
+        }
+
+        let rootfs = match &resolved.materialization {
+            ResolvedOciImageMaterialization::Cached => {
+                emit_cached_image_progress(
+                    self.image_progress.as_ref(),
+                    &resolved.requested_reference,
+                );
+                store
+                    .get_cached_oci(&resolved.selected_reference, options.clone())
+                    .map_err(|err| image_error(&resolved.selected_reference, err))?
+                    .ok_or_else(|| LibVmError::ImageNotFound {
+                        reference: resolved.selected_reference.clone(),
+                    })?
+            }
+            ResolvedOciImageMaterialization::Registry(image) => store
+                .materialize_oci(image, options, self.image_progress.clone())
+                .await
+                .map_err(|err| image_error(&resolved.requested_reference, err))?,
+        };
+        let metadata = store
+            .rootfs_metadata(&rootfs)
+            .map_err(|err| image_error(&rootfs.image_ref, err))?
+            .ok_or_else(|| LibVmError::StateDecode {
+                field: "image.metadata",
+                message: format!("OCI image {} is missing rootfs metadata", rootfs.image_ref),
+            })?;
+        ensure_resolved_oci_identity(resolved, &rootfs, &metadata)?;
+        let size_bytes = fs::metadata(&rootfs.path)?.len();
+        self.persist_materialized_image(
+            &source,
+            &rootfs,
+            Some(&metadata),
+            size_bytes,
+            &resolved.requested_reference,
+        )
+        .await?;
+
+        let image = MaterializedImage {
+            rootfs_path: rootfs.path,
+            requested_reference: resolved.requested_reference.clone(),
+            selected_reference: Some(resolved.selected_reference.clone()),
+            source_kind: ImageSourceKind::Oci,
+            image_id: Some(rootfs.image_id),
+            manifest_digest: Some(resolved.manifest_digest.clone()),
+            config_digest: Some(resolved.config_digest.clone()),
+            size_bytes,
+        };
+        emit_image_progress_complete(self.image_progress.as_ref());
+        Ok(image)
     }
 
     async fn persist_materialized_image(
@@ -362,32 +485,18 @@ impl Runtime {
         rootfs: &RootfsImage,
         metadata: Option<&RootfsImageMetadata>,
         size_bytes: u64,
+        requested_reference: &str,
     ) -> Result<(), LibVmError> {
-        match source.kind() {
-            ImageSourceKind::Oci => {
+        match source {
+            ImageSource::Oci(_) => {
                 let metadata = metadata.ok_or_else(|| LibVmError::StateDecode {
                     field: "image.metadata",
                     message: format!("OCI image {} is missing rootfs metadata", rootfs.image_ref),
                 })?;
-                let record = oci_image_record(source, rootfs, metadata, size_bytes)?;
+                let record = oci_image_record(rootfs, metadata, size_bytes, requested_reference)?;
                 self.store.save_oci_image(&record).await
             }
-            ImageSourceKind::Tar => {
-                let metadata = metadata.ok_or_else(|| LibVmError::StateDecode {
-                    field: "image.metadata",
-                    message: format!("tar image {} is missing rootfs metadata", rootfs.image_ref),
-                })?;
-                let artifact = image_artifact_record(
-                    source.kind(),
-                    source.source_reference(),
-                    rootfs,
-                    metadata,
-                    None,
-                    size_bytes,
-                );
-                self.store.save_rootfs_artifact(&artifact).await
-            }
-            ImageSourceKind::Disk => Ok(()),
+            ImageSource::Disk(_) => Ok(()),
         }
     }
 
@@ -537,24 +646,15 @@ impl Runtime {
         Ok(RuntimeStatus::from_machine_state(&observed))
     }
 
-    async fn refresh_active_machine_states(&self) -> Result<(), LibVmError> {
+    async fn refresh_machine_states(&self) -> Result<(), LibVmError> {
         for config in self.store.list_machine_configs().await? {
-            let state = self.machine_state(config.id).await?;
-            if !RuntimeStatus::from_machine_state(&state).is_active() {
-                continue;
-            }
-
             let Some(_lock) = self.try_acquire_machine_lock(config.lock_id)? else {
                 continue;
             };
             let status = self.reconcile_machine_runtime_locked(&config).await?;
-            reconcile_network_runtime(
-                &self.paths,
-                self.store.as_ref(),
-                &config,
-                status.is_active(),
-            )
-            .await?;
+            if status.is_active() {
+                reconcile_network_runtime(&self.paths, self.store.as_ref(), &config, true).await?;
+            }
         }
         Ok(())
     }
@@ -571,9 +671,7 @@ impl Runtime {
             Err(err) if err.kind() == io::ErrorKind::NotFound => None,
             Err(err) => return Err(err.into()),
         };
-        let stored_pid = runtime.and_then(|runtime| runtime.vmmon_pid);
-        let expected_started_at = runtime.and_then(|runtime| runtime.started_at);
-        let live_identity = live_monitor_identity(pid_from_file, stored_pid, expected_started_at)?;
+        let live_identity = live_monitor_identity(pid_from_file, runtime)?;
         let live_pid = live_identity.as_ref().map(ProcessIdentity::pid);
 
         let current_state = runtime
@@ -602,16 +700,7 @@ impl Runtime {
             }
             None => match live_pid {
                 Some(pid) => {
-                    let started_at = live_identity
-                        .as_ref()
-                        .and_then(ProcessIdentity::started_at)
-                        .ok_or_else(|| LibVmError::MonitorConnection {
-                            reference: metadata.name.clone(),
-                            message: format!(
-                                "vmmon pid {pid} from {} has no stable process generation",
-                                pid_path.display()
-                            ),
-                        })?;
+                    let started_at = live_identity.as_ref().and_then(ProcessIdentity::started_at);
                     let run_id = runtime.and_then(|runtime| runtime.run_id.clone());
                     transitions::reduce(
                         stored_state,
@@ -692,17 +781,19 @@ impl Runtime {
 
     pub(crate) async fn request_machine_start(
         &self,
-        machine_id: MachineId,
+        config: &MachineConfig,
         run_id: &str,
     ) -> Result<(), LibVmError> {
-        self.transition_current_machine_state(
-            machine_id,
+        let state = self.machine_state(config.id).await?;
+        let next = transitions::reduce(
+            state,
             transitions::Event::StartRequested {
                 run_id: run_id.to_string(),
             },
+            now_unix(),
         )
-        .await
-        .map(|_| ())
+        .map_err(transition_error)?;
+        self.store.save_machine_state(&next).await
     }
 
     pub(crate) async fn mark_machine_monitor_ready(
@@ -801,14 +892,22 @@ impl Runtime {
         config: &MachineConfig,
         generation: VmmonRunIdentity,
         last_error: Option<String>,
-    ) -> Result<(), LibVmError> {
+    ) -> Result<bool, LibVmError> {
         let state = self.machine_state(config.id).await?;
+        if !matches!(
+            state.status,
+            MachineRuntimeState::Starting
+                | MachineRuntimeState::Running
+                | MachineRuntimeState::Stopping
+        ) {
+            return Ok(true);
+        }
         if !vmmon_run_identity_matches(&state, &generation) {
-            return Ok(());
+            return Ok(false);
         }
 
         if vmmon_run_is_alive(&generation)? {
-            return Ok(());
+            return Ok(false);
         }
 
         let next = match transitions::reduce(
@@ -822,11 +921,12 @@ impl Runtime {
             now_unix(),
         ) {
             Ok(next) => next,
-            Err(TransitionError::StaleGeneration) => return Ok(()),
+            Err(TransitionError::StaleGeneration) => return Ok(false),
             Err(err) => return Err(transition_error(err)),
         };
         self.store.save_machine_state(&next).await?;
-        self.cleanup_machine_resources_locked(config).await
+        self.cleanup_machine_resources_locked(config).await?;
+        Ok(true)
     }
 
     pub(crate) async fn cleanup_machine_resources_locked(
@@ -867,7 +967,7 @@ impl Runtime {
         let Some(identity) = ProcessIdentity::for_pid(pid)? else {
             return Ok(());
         };
-        if !identity.matches_started_at(state.started_at) {
+        if !identity_matches_generation(&identity, state.started_at) {
             return Err(LibVmError::InvalidOwnedPath {
                 path: self
                     .machine_paths(config.id)
@@ -1060,6 +1160,17 @@ impl Runtime {
         reference: &str,
         options: ImageRemoveOptions,
     ) -> Result<(), LibVmError> {
+        let image = self
+            .store
+            .ensure_image_removable(reference, options.clone())
+            .await?;
+        let rootfs_store = RootfsImageStore::open(self.local_images_dir())
+            .map_err(|err| image_error(&image.requested_reference, err))?;
+        let rootfs_options = RootfsOptions::for_host()
+            .map_err(|err| image_error(&image.requested_reference, err))?;
+        rootfs_store
+            .remove_oci_reference(&image.requested_reference, rootfs_options)
+            .map_err(|err| image_error(&image.requested_reference, err))?;
         self.store.remove_image(reference, options).await
     }
 
@@ -1155,14 +1266,14 @@ impl Runtime {
             )
         };
 
+        let rootfs = self.store.machine_rootfs(config.id).await?;
         Ok(MachineData::from_models_with_status(
             config,
+            rootfs,
             status,
             boot_report,
             provision_report,
-            state.started_at,
-            state.last_error,
-            state.updated_at,
+            state,
         ))
     }
 }
@@ -1197,6 +1308,19 @@ fn image_error(reference: &str, source: ocidisk::OciDiskError) -> LibVmError {
     }
 }
 
+fn validate_image_pull_policy(
+    source: &ImageSource,
+    policy: ImagePullPolicy,
+) -> Result<(), LibVmError> {
+    if matches!(source, ImageSource::Disk(_)) && policy != ImagePullPolicy::IfMissing {
+        return Err(LibVmError::ImagePullPolicyUnsupported {
+            policy,
+            source_kind: ImageSourceKind::Disk,
+        });
+    }
+    Ok(())
+}
+
 fn get_cached_rootfs(
     store: &RootfsImageStore,
     source: &ImageSource,
@@ -1205,7 +1329,7 @@ fn get_cached_rootfs(
 ) -> OciDiskResult<Option<RootfsImage>> {
     match source {
         ImageSource::Oci(reference) => store.get_cached_oci(reference, options),
-        ImageSource::Disk(_) | ImageSource::Tar(_) => store.get_cached(cache_reference, options),
+        ImageSource::Disk(_) => store.get_cached(cache_reference, options),
     }
 }
 
@@ -1218,12 +1342,82 @@ async fn get_or_create_rootfs(
 ) -> OciDiskResult<RootfsImage> {
     match source {
         ImageSource::Oci(reference) => store.get_or_create_oci(reference, options, progress).await,
-        ImageSource::Disk(_) | ImageSource::Tar(_) => {
+        ImageSource::Disk(_) => {
             store
                 .get_or_create(cache_reference, options, progress)
                 .await
         }
     }
+}
+
+fn cached_resolved_oci_image(
+    store: &RootfsImageStore,
+    reference: &str,
+    options: RootfsOptions,
+) -> Result<Option<ResolvedOciImage>, LibVmError> {
+    let Some(rootfs) = store
+        .get_cached_oci(reference, options)
+        .map_err(|err| image_error(reference, err))?
+    else {
+        return Ok(None);
+    };
+    let metadata = store
+        .rootfs_metadata(&rootfs)
+        .map_err(|err| image_error(&rootfs.image_ref, err))?
+        .ok_or_else(|| LibVmError::StateDecode {
+            field: "image.metadata",
+            message: format!("OCI image {} is missing rootfs metadata", rootfs.image_ref),
+        })?;
+    if rootfs.image_id != metadata.manifest_digest {
+        return Err(LibVmError::StateDecode {
+            field: "image.metadata.manifest_digest",
+            message: format!(
+                "cached rootfs image ID {} does not match manifest {}",
+                rootfs.image_id, metadata.manifest_digest
+            ),
+        });
+    }
+
+    Ok(Some(ResolvedOciImage {
+        requested_reference: rootfs.image_ref,
+        selected_reference: metadata.selected_reference.clone(),
+        manifest_digest: metadata.manifest_digest.clone(),
+        config_digest: metadata.config_digest.clone(),
+        config: metadata.config.clone(),
+        platform: metadata.platform.clone(),
+        cache_state: ImageCacheState::Complete,
+        materialization: ResolvedOciImageMaterialization::Cached,
+    }))
+}
+
+async fn resolve_oci_image_from_registry(
+    store: &RootfsImageStore,
+    reference: String,
+    options: RootfsOptions,
+    progress: Option<ImageProgressSender>,
+) -> Result<ResolvedOciImage, LibVmError> {
+    let image = store
+        .resolve_oci(&reference, &options, progress)
+        .await
+        .map_err(|err| image_error(&reference, err))?;
+    let cache_state = match store
+        .get_cached_oci(&image.selected_reference, options)
+        .map_err(|err| image_error(&image.selected_reference, err))?
+    {
+        Some(_) => ImageCacheState::Complete,
+        None => ImageCacheState::Missing,
+    };
+
+    Ok(ResolvedOciImage {
+        requested_reference: image.requested_reference.clone(),
+        selected_reference: image.selected_reference.clone(),
+        manifest_digest: image.manifest_digest.clone(),
+        config_digest: image.config_digest.clone(),
+        config: image.config.clone(),
+        platform: image.platform.clone(),
+        cache_state,
+        materialization: ResolvedOciImageMaterialization::Registry(Box::new(image)),
+    })
 }
 
 fn emit_cached_image_progress(progress: Option<&ImageProgressSender>, image_ref: &str) {
@@ -1238,11 +1432,41 @@ fn emit_cached_image_progress(progress: Option<&ImageProgressSender>, image_ref:
     });
 }
 
+fn emit_image_progress_complete(progress: Option<&ImageProgressSender>) {
+    if let Some(progress) = progress {
+        progress.send(ImageProgress::Complete);
+    }
+}
+
+fn ensure_resolved_oci_identity(
+    resolved: &ResolvedOciImage,
+    rootfs: &RootfsImage,
+    metadata: &RootfsImageMetadata,
+) -> Result<(), LibVmError> {
+    if rootfs.image_id == resolved.manifest_digest
+        && metadata.selected_reference == resolved.selected_reference
+        && metadata.manifest_digest == resolved.manifest_digest
+        && metadata.config_digest == resolved.config_digest
+        && metadata.config == resolved.config
+        && metadata.platform == resolved.platform
+    {
+        return Ok(());
+    }
+
+    Err(LibVmError::StateDecode {
+        field: "resolved_oci_image",
+        message: format!(
+            "materialized OCI image {} does not match resolved manifest {}",
+            metadata.manifest_digest, resolved.manifest_digest
+        ),
+    })
+}
+
 fn oci_image_record(
-    source: &ImageSource,
     rootfs: &RootfsImage,
     metadata: &RootfsImageMetadata,
     size_bytes: u64,
+    requested_reference: &str,
 ) -> Result<OciImageRecord, LibVmError> {
     if rootfs.source != RootfsImageSource::OciRegistry {
         return Err(LibVmError::StateDecode {
@@ -1299,14 +1523,15 @@ fn oci_image_record(
             platform_os: rootfs.platform.os.clone(),
             platform_architecture: rootfs.platform.architecture.clone(),
             platform_variant: rootfs.platform.variant.clone(),
-            config_digest: metadata.config_digest.clone(),
+            config_digest: Some(metadata.config_digest.clone()),
             layer_count,
             total_size_bytes,
             created_at,
             last_used_at: Some(now),
         },
         reference: ImageRefRecord {
-            reference: rootfs.image_ref.clone(),
+            requested_reference: requested_reference.to_string(),
+            selected_reference: metadata.selected_reference.clone(),
             manifest_digest: manifest_digest.clone(),
             image_id: rootfs.image_id.clone(),
             platform_os: rootfs.platform.os.clone(),
@@ -1320,67 +1545,64 @@ fn oci_image_record(
         config: ImageConfigRecord {
             manifest_digest: manifest_digest.clone(),
             digest: metadata.config_digest.clone(),
-            env_json: "[]".to_string(),
-            cmd_json: "[]".to_string(),
-            entrypoint_json: "[]".to_string(),
-            working_dir: None,
-            user: None,
-            labels_json: "{}".to_string(),
+            metadata: metadata.config.clone(),
             created_at,
         },
         layers,
         manifest_layers,
-        artifact: image_artifact_record(
-            ImageSourceKind::Oci,
-            source.source_reference(),
-            rootfs,
-            metadata,
-            Some(manifest_digest),
-            size_bytes,
-        ),
+        artifact: image_artifact_record(rootfs, metadata, manifest_digest, size_bytes),
     })
 }
 
-fn materialized_manifest_digest(
+struct MaterializedImageIdentity {
+    requested_reference: String,
+    selected_reference: Option<String>,
+    manifest_digest: Option<String>,
+    config_digest: Option<String>,
+}
+
+fn materialized_image_identity(
     source: &ImageSource,
     rootfs: &RootfsImage,
     metadata: Option<&RootfsImageMetadata>,
-) -> Result<Option<String>, LibVmError> {
+) -> Result<MaterializedImageIdentity, LibVmError> {
     match source.kind() {
         ImageSourceKind::Oci => {
             let metadata = metadata.ok_or_else(|| LibVmError::StateDecode {
                 field: "image.metadata",
                 message: format!("OCI image {} is missing rootfs metadata", rootfs.image_ref),
             })?;
-            Ok(Some(effective_oci_manifest_digest(rootfs, metadata)))
+            Ok(MaterializedImageIdentity {
+                requested_reference: metadata.requested_reference.clone(),
+                selected_reference: Some(metadata.selected_reference.clone()),
+                manifest_digest: Some(effective_oci_manifest_digest(rootfs, metadata)),
+                config_digest: Some(metadata.config_digest.clone()),
+            })
         }
-        ImageSourceKind::Disk | ImageSourceKind::Tar => {
-            Ok(metadata.and_then(|metadata| metadata.manifest_digest.clone()))
-        }
+        ImageSourceKind::Disk => Ok(MaterializedImageIdentity {
+            requested_reference: source.source_reference(),
+            selected_reference: None,
+            manifest_digest: None,
+            config_digest: None,
+        }),
     }
 }
 
-fn effective_oci_manifest_digest(rootfs: &RootfsImage, metadata: &RootfsImageMetadata) -> String {
-    metadata
-        .manifest_digest
-        .clone()
-        .unwrap_or_else(|| rootfs.image_id.clone())
+fn effective_oci_manifest_digest(_rootfs: &RootfsImage, metadata: &RootfsImageMetadata) -> String {
+    metadata.manifest_digest.clone()
 }
 
 fn image_artifact_record(
-    source_kind: ImageSourceKind,
-    source_reference: String,
     rootfs: &RootfsImage,
     metadata: &RootfsImageMetadata,
-    manifest_digest: Option<String>,
+    manifest_digest: String,
     size_bytes: u64,
 ) -> ImageRootfsArtifactRecord {
     let now = now_unix();
     ImageRootfsArtifactRecord {
         image_id: rootfs.image_id.clone(),
-        source_kind,
         manifest_digest,
-        source_reference,
+        config_digest: metadata.config_digest.clone(),
         platform_os: rootfs.platform.os.clone(),
         platform_architecture: rootfs.platform.architecture.clone(),
         platform_variant: rootfs.platform.variant.clone(),
@@ -1487,9 +1709,14 @@ pub(crate) fn read_monitor_pid(pid_path: &Path) -> io::Result<i32> {
 
 fn live_monitor_identity(
     pid_from_file: Option<i32>,
-    stored_pid: Option<i32>,
-    expected_started_at: Option<i64>,
+    runtime: Option<&MachineState>,
 ) -> Result<Option<ProcessIdentity>, LibVmError> {
+    let stored_pid = runtime.and_then(|state| state.vmmon_pid);
+    let expected_started_at = runtime.and_then(|state| state.started_at);
+    let recovering_prearmed_start = runtime.is_some_and(|state| {
+        state.status == MachineRuntimeState::Starting
+            && (state.vmmon_pid.is_none() || state.started_at.is_none())
+    });
     let mut last_pid = None;
     for pid in [pid_from_file, stored_pid].into_iter().flatten() {
         if last_pid == Some(pid) {
@@ -1500,7 +1727,10 @@ fn live_monitor_identity(
         let Some(identity) = ProcessIdentity::for_pid(pid)? else {
             continue;
         };
-        if identity.matches_started_at(expected_started_at) && identity.is_alive()? {
+        if identity.is_alive()?
+            && (identity_matches_generation(&identity, expected_started_at)
+                || recovering_prearmed_start)
+        {
             return Ok(Some(identity));
         }
     }
@@ -1587,7 +1817,14 @@ fn vmmon_run_is_alive(generation: &VmmonRunIdentity) -> Result<bool, LibVmError>
     let Some(identity) = ProcessIdentity::for_pid(generation.pid)? else {
         return Ok(false);
     };
-    Ok(identity.matches_started_at(generation.started_at) && identity.is_alive()?)
+    Ok(identity_matches_generation(&identity, generation.started_at) && identity.is_alive()?)
+}
+
+fn identity_matches_generation(
+    identity: &ProcessIdentity,
+    expected_started_at: Option<i64>,
+) -> bool {
+    expected_started_at.is_none() || identity.matches_started_at(expected_started_at)
 }
 
 fn transition_error(err: TransitionError) -> LibVmError {
@@ -1659,21 +1896,26 @@ mod tests {
     use crate::lock_manager::LockId;
     use crate::paths::LocalPaths;
     use crate::runtime::core::{
-        effective_oci_manifest_digest, materialized_manifest_digest, oci_image_record,
-        read_monitor_pid, stopped_machine_state, write_machine_config, Runtime,
-        STALE_STARTING_TIMEOUT,
+        effective_oci_manifest_digest, materialized_image_identity, oci_image_record,
+        read_monitor_pid, stopped_machine_state, validate_image_pull_policy, write_machine_config,
+        Runtime, STALE_STARTING_TIMEOUT,
     };
     use crate::store::models::{
-        MachineConfig, MachineId, MachineNetworkConfig, MachineRuntimeState, MachineState,
+        MachineConfig, MachineId, MachineNetworkConfig, MachineRootfsRecord, MachineRuntimeState,
+        MachineState,
     };
-    use crate::store::{MockDataStore, Store};
+    use crate::store::{MachineStore, MockDataStore, Store};
     use crate::utils::now_unix;
     use crate::vmmon::process::ProcessIdentity;
     use crate::{
-        ImageSource, LibVmError, MachineExitOutcome, MachineKillOptions, MachineRef, MachineStatus,
-        MachineUpdate, Memory, RuntimeConfig, RuntimeNetworkingConfig,
+        ImageCacheState, ImageProgress, ImageProgressSender, ImagePullOptions, ImagePullPolicy,
+        ImageResolveOptions, ImageSource, LibVmError, MachineExitOutcome, MachineKillOptions,
+        MachineRef, MachineRetention, MachineRunId, MachineStatus, MachineUpdate, Memory,
+        RuntimeConfig, RuntimeNetworkingConfig,
     };
-    use ocidisk::{Platform, RootfsImage, RootfsImageMetadata, RootfsImageSource};
+    use ocidisk::{
+        OciImageConfigMetadata, Platform, RootfsImage, RootfsImageMetadata, RootfsImageSource,
+    };
     use silo_policy::NetworkPolicy;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::fs::PermissionsExt;
@@ -1739,6 +1981,10 @@ mod tests {
             lock_id: LockId::from(0),
             name: name.to_string(),
             spec: sample_vm_spec(),
+            retention: crate::MachineRetention::Persistent,
+            process: crate::ProcessConfig::default(),
+            template_name: None,
+            agent_mode: None,
             machine_dir: paths.machine(id).dir().to_path_buf(),
             created_at: 1,
             modified_at: 1,
@@ -1761,20 +2007,85 @@ mod tests {
         }
     }
 
-    fn sample_oci_rootfs_metadata(manifest_digest: Option<&str>) -> RootfsImageMetadata {
+    fn sample_oci_rootfs_metadata(manifest_digest: &str) -> RootfsImageMetadata {
         RootfsImageMetadata {
-            version: 1,
+            version: 2,
             image_ref: "ubuntu:latest".to_string(),
             image_id: "sha256:imageid".to_string(),
             source: RootfsImageSource::OciRegistry,
-            manifest_digest: manifest_digest.map(str::to_string),
-            config_digest: Some("sha256:config".to_string()),
+            requested_reference: "ubuntu:latest".to_string(),
+            selected_reference: format!("ubuntu@{manifest_digest}"),
+            manifest_digest: manifest_digest.to_string(),
+            config_digest: "sha256:config".to_string(),
+            config: OciImageConfigMetadata::default(),
             layers: Vec::new(),
             platform: Platform::linux_arm64(),
             filesystem: "ext4".to_string(),
             rootfs_file: "rootfs.img".to_string(),
             created_at_unix: 1,
         }
+    }
+
+    fn write_cached_oci_rootfs(
+        paths: &LocalPaths,
+        requested_reference: &str,
+        manifest_digest: &str,
+        config_digest: &str,
+    ) -> RootfsImageMetadata {
+        let platform = Platform::host().expect("host platform");
+        let mut cache_key = format!("{}-{}", platform.os, platform.architecture);
+        if let Some(variant) = &platform.variant {
+            cache_key.push('-');
+            cache_key.push_str(variant);
+        }
+        let image_dir = paths
+            .images_dir()
+            .join(manifest_digest.replace(':', "-"))
+            .join(&cache_key);
+        std::fs::create_dir_all(&image_dir).expect("create cached image directory");
+        std::fs::write(image_dir.join("rootfs.img"), b"cached rootfs").expect("write rootfs");
+        let metadata = RootfsImageMetadata {
+            version: 2,
+            image_ref: requested_reference.to_string(),
+            image_id: manifest_digest.to_string(),
+            source: RootfsImageSource::OciRegistry,
+            requested_reference: requested_reference.to_string(),
+            selected_reference: format!("example.invalid/demo@{manifest_digest}"),
+            manifest_digest: manifest_digest.to_string(),
+            config_digest: config_digest.to_string(),
+            config: OciImageConfigMetadata {
+                cmd: Some(vec!["serve".to_string()]),
+                ..OciImageConfigMetadata::default()
+            },
+            layers: Vec::new(),
+            platform: platform.clone(),
+            filesystem: "ext4".to_string(),
+            rootfs_file: "rootfs.img".to_string(),
+            created_at_unix: 7,
+        };
+        std::fs::write(
+            image_dir.join("metadata.json"),
+            serde_json::to_vec(&metadata).expect("serialize cache metadata"),
+        )
+        .expect("write cache metadata");
+        let tag_key = format!("{requested_reference}|{cache_key}");
+        std::fs::write(
+            paths.images_dir().join("index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "tags": {
+                    tag_key: {
+                        "image_ref": requested_reference,
+                        "platform": platform,
+                        "manifest_digest": manifest_digest,
+                        "updated_at_unix": 7
+                    }
+                }
+            }))
+            .expect("serialize cache index"),
+        )
+        .expect("write cache index");
+        metadata
     }
 
     fn stopped_state(machine_id: MachineId) -> MachineState {
@@ -2022,7 +2333,7 @@ mod tests {
     #[test]
     fn effective_oci_manifest_digest_prefers_metadata_digest() {
         let rootfs = sample_oci_rootfs_image();
-        let metadata = sample_oci_rootfs_metadata(Some("sha256:manifest"));
+        let metadata = sample_oci_rootfs_metadata("sha256:manifest");
 
         let digest = effective_oci_manifest_digest(&rootfs, &metadata);
 
@@ -2030,22 +2341,288 @@ mod tests {
     }
 
     #[test]
-    fn materialized_oci_manifest_digest_matches_record_fallback() {
+    fn materialized_oci_manifest_digest_matches_record_metadata() {
         let source = ImageSource::oci("ubuntu:latest");
         let rootfs = sample_oci_rootfs_image();
-        let metadata = sample_oci_rootfs_metadata(None);
+        let metadata = sample_oci_rootfs_metadata("sha256:manifest");
 
-        let digest = materialized_manifest_digest(&source, &rootfs, Some(&metadata))
-            .expect("materialized digest should resolve");
-        let record = oci_image_record(&source, &rootfs, &metadata, 4)
+        let identity = materialized_image_identity(&source, &rootfs, Some(&metadata))
+            .expect("materialized identity should resolve");
+        let record = oci_image_record(&rootfs, &metadata, 4, "ubuntu:latest")
             .expect("OCI image record should resolve");
 
-        assert_eq!(digest.as_deref(), Some("sha256:imageid"));
-        assert_eq!(record.manifest.digest, "sha256:imageid");
-        assert_eq!(record.reference.manifest_digest, "sha256:imageid");
+        assert_eq!(identity.manifest_digest.as_deref(), Some("sha256:manifest"));
+        assert_eq!(identity.config_digest.as_deref(), Some("sha256:config"));
         assert_eq!(
-            record.artifact.manifest_digest.as_deref(),
-            Some("sha256:imageid")
+            identity.selected_reference.as_deref(),
+            Some("ubuntu@sha256:manifest")
+        );
+        assert_eq!(record.manifest.digest, "sha256:manifest");
+        assert_eq!(record.reference.manifest_digest, "sha256:manifest");
+        assert_eq!(record.artifact.manifest_digest, "sha256:manifest");
+    }
+
+    #[test]
+    fn disk_sources_reject_oci_pull_policies() {
+        let disk = ImageSource::disk("rootfs.img");
+
+        for policy in [
+            crate::ImagePullPolicy::Always,
+            crate::ImagePullPolicy::Never,
+        ] {
+            let error = validate_image_pull_policy(&disk, policy)
+                .expect_err("disk source must reject OCI pull policy");
+            assert!(matches!(
+                error,
+                LibVmError::ImagePullPolicyUnsupported {
+                    policy: actual,
+                    source_kind: crate::ImageSourceKind::Disk,
+                } if actual == policy
+            ));
+        }
+        validate_image_pull_policy(&disk, crate::ImagePullPolicy::IfMissing)
+            .expect("default disk materialization remains supported");
+    }
+
+    #[tokio::test]
+    async fn resolve_uses_complete_cache_without_writing_or_contacting_registry() {
+        const REFERENCE: &str = "example.invalid/demo:mutable";
+        const MANIFEST: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const CONFIG: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .expect("open runtime");
+        let metadata = write_cached_oci_rootfs(&paths, REFERENCE, MANIFEST, CONFIG);
+        let index_before =
+            std::fs::read(paths.images_dir().join("index.json")).expect("read index");
+        let metadata_before = std::fs::read(
+            paths
+                .images_dir()
+                .join(MANIFEST.replace(':', "-"))
+                .join(format!(
+                    "{}-{}",
+                    metadata.platform.os, metadata.platform.architecture
+                ))
+                .join("metadata.json"),
+        )
+        .expect("read metadata");
+
+        for policy in [ImagePullPolicy::IfMissing, ImagePullPolicy::Never] {
+            let resolved = runtime
+                .images()
+                .resolve_with(
+                    REFERENCE,
+                    ImageResolveOptions {
+                        policy: Some(policy),
+                    },
+                )
+                .await
+                .expect("complete cache must avoid example.invalid");
+            assert_eq!(resolved.requested_reference, REFERENCE);
+            assert_eq!(resolved.selected_reference, metadata.selected_reference);
+            assert_eq!(resolved.manifest_digest, MANIFEST);
+            assert_eq!(resolved.config, metadata.config);
+            assert_eq!(resolved.cache_state, ImageCacheState::Complete);
+        }
+
+        assert!(runtime
+            .images()
+            .list()
+            .await
+            .expect("list images")
+            .is_empty());
+        assert_eq!(
+            std::fs::read(paths.images_dir().join("index.json")).expect("read index"),
+            index_before
+        );
+        assert_eq!(
+            std::fs::read(
+                paths
+                    .images_dir()
+                    .join(MANIFEST.replace(':', "-"))
+                    .join(format!(
+                        "{}-{}",
+                        metadata.platform.os, metadata.platform.architecture
+                    ))
+                    .join("metadata.json"),
+            )
+            .expect("read metadata"),
+            metadata_before
+        );
+
+        let error = runtime
+            .images()
+            .resolve_with(
+                "example.invalid/missing:mutable",
+                ImageResolveOptions {
+                    policy: Some(ImagePullPolicy::Never),
+                },
+            )
+            .await
+            .expect_err("Never must not contact a missing registry reference");
+        assert!(matches!(error, LibVmError::ImageNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn removing_an_image_clears_the_cache_reference_until_prune() {
+        const REFERENCE: &str = "example.invalid/demo:mutable";
+        const MANIFEST: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const CONFIG: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .expect("open runtime");
+        let metadata = write_cached_oci_rootfs(&paths, REFERENCE, MANIFEST, CONFIG);
+        let artifact_dir = paths
+            .images_dir()
+            .join(MANIFEST.replace(':', "-"))
+            .join(format!(
+                "{}-{}",
+                metadata.platform.os, metadata.platform.architecture
+            ));
+
+        runtime
+            .images()
+            .pull_with(
+                REFERENCE,
+                ImagePullOptions {
+                    policy: Some(ImagePullPolicy::Never),
+                },
+            )
+            .await
+            .expect("persist cached image reference");
+        runtime
+            .images()
+            .remove(REFERENCE)
+            .await
+            .expect("remove image reference");
+
+        let index: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(paths.images_dir().join("index.json")).expect("read cache index"),
+        )
+        .expect("decode cache index");
+        assert!(
+            index["tags"]
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty),
+            "removal must clear the OCI tag mapping: {index}"
+        );
+
+        assert!(runtime
+            .images()
+            .get(REFERENCE)
+            .await
+            .expect("look up removed image")
+            .is_none());
+        let error = runtime
+            .images()
+            .pull_with(
+                REFERENCE,
+                ImagePullOptions {
+                    policy: Some(ImagePullPolicy::Never),
+                },
+            )
+            .await
+            .expect_err("removed reference must miss the Never cache");
+        assert!(matches!(error, LibVmError::ImageNotFound { .. }));
+        assert!(
+            artifact_dir.exists(),
+            "removal must retain artifact until prune"
+        );
+
+        let report = runtime
+            .images()
+            .prune()
+            .await
+            .expect("prune image artifacts");
+        assert_eq!(report.artifacts_removed, 1);
+        assert!(!artifact_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn resolved_image_builder_persists_the_selected_identity() {
+        const REFERENCE: &str = "example.invalid/demo:mutable";
+        const MANIFEST: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const CONFIG: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .expect("open runtime");
+        let metadata = write_cached_oci_rootfs(&paths, REFERENCE, MANIFEST, CONFIG);
+        let (progress, mut progress_events) = ImageProgressSender::default_channel();
+        let progress_runtime = runtime.clone().with_image_progress(progress);
+        let resolved = progress_runtime
+            .images()
+            .resolve_with(
+                REFERENCE,
+                ImageResolveOptions {
+                    policy: Some(ImagePullPolicy::Never),
+                },
+            )
+            .await
+            .expect("resolve cached image");
+        let selected_reference = resolved.selected_reference.clone();
+
+        let machine = progress_runtime
+            .machine()
+            .name("resolved-image")
+            .resolved_image(resolved)
+            .create()
+            .await
+            .expect("create machine from resolved image");
+        drop(progress_runtime);
+        let mut events = Vec::new();
+        while let Some(event) = progress_events.recv().await {
+            events.push(event);
+        }
+        assert_eq!(
+            events,
+            [
+                ImageProgress::CheckingCache {
+                    image_ref: REFERENCE.to_string(),
+                },
+                ImageProgress::CacheHit {
+                    image_ref: REFERENCE.to_string(),
+                },
+                ImageProgress::Complete,
+            ]
+        );
+        let rootfs = runtime
+            .store
+            .machine_rootfs(machine.machine_id())
+            .await
+            .expect("read rootfs pin")
+            .expect("machine rootfs pin");
+
+        assert_eq!(rootfs.requested_reference, REFERENCE);
+        assert_eq!(
+            rootfs.selected_reference.as_deref(),
+            Some(selected_reference.as_str())
+        );
+        assert_eq!(rootfs.manifest_digest.as_deref(), Some(MANIFEST));
+        assert_eq!(rootfs.config_digest.as_deref(), Some(CONFIG));
+        assert_eq!(
+            runtime
+                .images()
+                .get(REFERENCE)
+                .await
+                .expect("read persisted image")
+                .expect("persisted image")
+                .selected_reference,
+            metadata.selected_reference
         );
     }
 
@@ -2098,6 +2675,10 @@ mod tests {
                 lock_id: lock.id(),
                 name: self.name,
                 spec,
+                retention: crate::MachineRetention::Persistent,
+                process: crate::ProcessConfig::default(),
+                template_name: None,
+                agent_mode: None,
                 machine_dir: machine_dir.clone(),
                 created_at: now,
                 modified_at: now,
@@ -2605,6 +3186,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inspect_exposes_the_durable_oci_rootfs_pin() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .expect("create runtime");
+        let id = MachineId::new();
+        let config = sample_machine_config(&paths, id, "rootfs-inspect");
+        std::fs::create_dir_all(&config.machine_dir).expect("create machine directory");
+        runtime
+            .store
+            .save_oci_image(
+                &oci_image_record(
+                    &sample_oci_rootfs_image(),
+                    &sample_oci_rootfs_metadata("sha256:manifest"),
+                    4,
+                    "ubuntu:latest",
+                )
+                .expect("build OCI image record"),
+            )
+            .await
+            .expect("persist OCI image");
+        runtime
+            .add_machine_record_with_rootfs(
+                &config,
+                &stopped_state(id),
+                &MachineRootfsRecord {
+                    machine_id: id,
+                    source_kind: crate::ImageSourceKind::Oci,
+                    requested_reference: "example.test/demo:latest".to_string(),
+                    selected_reference: Some("example.test/demo@sha256:manifest".to_string()),
+                    manifest_digest: Some("sha256:manifest".to_string()),
+                    config_digest: Some("sha256:config".to_string()),
+                    image_id: Some("sha256:image-id".to_string()),
+                    root_disk_path: config.machine_dir.join("rootfs.img"),
+                    root_disk_size_bytes: 64 * 1024 * 1024,
+                    created_at: 7,
+                },
+            )
+            .await
+            .expect("persist machine rootfs pin");
+
+        let data = runtime
+            .machine_inspect_data(config)
+            .await
+            .expect("inspect machine");
+        let rootfs = data.rootfs.expect("rootfs pin is present");
+        assert_eq!(rootfs.requested_reference, "example.test/demo:latest");
+        assert_eq!(
+            rootfs.selected_reference.as_deref(),
+            Some("example.test/demo@sha256:manifest")
+        );
+        assert_eq!(
+            rootfs.selected_manifest_digest.as_deref(),
+            Some("sha256:manifest")
+        );
+        assert_eq!(rootfs.config_digest.as_deref(), Some("sha256:config"));
+        assert_eq!(rootfs.image_id.as_deref(), Some("sha256:image-id"));
+    }
+
+    #[tokio::test]
     async fn inspect_and_list_use_name_and_id_lookup() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
@@ -2710,15 +3352,16 @@ mod tests {
             .commit(&runtime)
             .await
             .expect("commit machine");
+        let machine_id = machine.id;
         let mut child = ChildGuard::sleep_ignoring_sigint();
         let pid = child.id() as i32;
         let started_at = child.started_at();
-        create_machine_runtime_dirs(&runtime, machine.id);
-        let pid_path = runtime.paths.machine(machine.id).vmmon_pid_path();
+        create_machine_runtime_dirs(&runtime, machine_id);
+        let pid_path = runtime.paths.machine(machine_id).vmmon_pid_path();
         std::fs::write(&pid_path, format!("{pid}\n")).expect("write pid file");
         runtime
             .set_machine_state(
-                machine.id,
+                machine_id,
                 MachineRuntimeState::Running,
                 Some(pid),
                 started_at,
@@ -2727,7 +3370,6 @@ mod tests {
             )
             .await
             .expect("set running state");
-        let machine_id = machine.id;
         let stop_machine = machine_handle(&runtime, machine_id);
         let stop_task = tokio::spawn(async move { stop_machine.stop().await });
 
@@ -2758,6 +3400,171 @@ mod tests {
 
         assert_eq!(inspect_data.status, MachineStatus::Stopped);
         assert_eq!(state.status, MachineRuntimeState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn generation_checked_stop_does_not_clean_up_a_replacement_run() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let runtime = Runtime::open(
+            LocalPaths::new(temp.path().join("silo")),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .expect("create runtime");
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+        let mut old_monitor = ChildGuard::sleep_ignoring_sigint();
+        let old_pid = old_monitor.id() as i32;
+        let old_started_at = old_monitor.started_at();
+        create_machine_runtime_dirs(&runtime, machine.id);
+        let machine_paths = runtime.machine_paths(machine.id);
+        std::fs::write(machine_paths.vmmon_pid_path(), format!("{old_pid}\n"))
+            .expect("write old pid file");
+        std::fs::write(machine_paths.vmmon_socket_path(), b"replacement sentinel")
+            .expect("write runtime sentinel");
+        runtime
+            .set_machine_state(
+                machine.id,
+                MachineRuntimeState::Running,
+                Some(old_pid),
+                old_started_at,
+                Some("run-old".to_string()),
+                None,
+            )
+            .await
+            .expect("set old generation");
+
+        let old_machine = machine_handle(&runtime, machine.id);
+        let old_run = MachineRunId::from_raw("run-old".to_string());
+        let stop_task = tokio::spawn(async move { old_machine.stop_run(old_run).await });
+        wait_for_machine_state(&runtime, machine.id, MachineRuntimeState::Stopping).await;
+
+        let replacement_monitor = ChildGuard::sleep_ignoring_sigint();
+        let replacement_pid = replacement_monitor.id() as i32;
+        let replacement_started_at = replacement_monitor.started_at();
+        runtime
+            .set_machine_state(
+                machine.id,
+                MachineRuntimeState::Running,
+                Some(replacement_pid),
+                replacement_started_at,
+                Some("run-new".to_string()),
+                None,
+            )
+            .await
+            .expect("install replacement generation");
+
+        old_monitor.kill();
+        let error = stop_task
+            .await
+            .expect("join old stop")
+            .expect_err("old stop must not clean up the replacement run");
+        assert!(matches!(
+            error,
+            LibVmError::MachineStaleGeneration {
+                requested,
+                current: Some(current),
+                ..
+            } if requested.as_str() == "run-old" && current.as_str() == "run-new"
+        ));
+        let state = runtime
+            .machine_state(machine.id)
+            .await
+            .expect("read replacement state");
+
+        let wait_error = machine_handle(&runtime, machine.id)
+            .wait_for_run(MachineRunId::from_raw("run-old".to_string()))
+            .await
+            .expect_err("old wait must not observe the replacement run");
+        assert!(matches!(
+            wait_error,
+            LibVmError::MachineStaleGeneration { .. }
+        ));
+        let kill_error = machine_handle(&runtime, machine.id)
+            .kill_run(MachineRunId::from_raw("run-old".to_string()))
+            .await
+            .expect_err("old kill must not signal the replacement run");
+        assert!(matches!(
+            kill_error,
+            LibVmError::MachineStaleGeneration { .. }
+        ));
+
+        assert_eq!(state.status, MachineRuntimeState::Running);
+        assert_eq!(state.run_id.as_deref(), Some("run-new"));
+        assert!(ProcessIdentity::for_pid(replacement_pid)
+            .expect("read replacement monitor")
+            .expect("replacement monitor should exist")
+            .is_alive()
+            .expect("check replacement monitor"));
+        assert!(machine_paths.vmmon_socket_path().exists());
+    }
+
+    #[tokio::test]
+    async fn generation_checked_stop_accepts_a_concurrent_terminal_completion() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .expect("create runtime");
+        let concurrent_store = Store::new(&paths)
+            .await
+            .expect("open concurrent SQLite connection");
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+        let machine_id = machine.id;
+        let mut monitor = ChildGuard::sleep_ignoring_sigint();
+        let pid = monitor.id() as i32;
+        let started_at = monitor.started_at();
+        create_machine_runtime_dirs(&runtime, machine_id);
+        let pid_path = runtime.paths.machine(machine_id).vmmon_pid_path();
+        std::fs::write(&pid_path, format!("{pid}\n")).expect("write pid file");
+        runtime
+            .set_machine_state(
+                machine_id,
+                MachineRuntimeState::Running,
+                Some(pid),
+                started_at,
+                Some("run-old".to_string()),
+                None,
+            )
+            .await
+            .expect("set running state");
+
+        let stopping_machine = machine_handle(&runtime, machine_id);
+        let stop_task = tokio::spawn(async move {
+            stopping_machine
+                .stop_run(MachineRunId::from_raw("run-old".to_string()))
+                .await
+        });
+        wait_for_machine_state(&runtime, machine_id, MachineRuntimeState::Stopping).await;
+
+        concurrent_store
+            .save_machine_state(&stopped_machine_state(machine_id, None))
+            .await
+            .expect("record concurrent terminal completion");
+        monitor.kill();
+
+        let machine = stop_task
+            .await
+            .expect("join stop task")
+            .expect("captured terminal completion should be idempotent");
+        assert_eq!(machine.status, MachineStatus::Stopped);
+        assert_eq!(
+            runtime
+                .machine_state(machine_id)
+                .await
+                .expect("read terminal state")
+                .status,
+            MachineRuntimeState::Stopped
+        );
     }
 
     #[tokio::test]
@@ -2871,7 +3678,11 @@ mod tests {
             .expect("read machine state");
 
         assert!(!wait_status.success());
-        assert_eq!(exit.run_id, Some(run_id.to_string()));
+        let expected_run_id = run_id.to_string();
+        assert_eq!(
+            exit.run_id.as_ref().map(|run_id| run_id.as_str()),
+            Some(expected_run_id.as_str())
+        );
         assert_eq!(exit.outcome, MachineExitOutcome::Forced);
         assert_eq!(exit.machine.status, MachineStatus::Stopped);
         assert_eq!(state.status, MachineRuntimeState::Stopped);
@@ -3457,6 +4268,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reopened_prearmed_ephemeral_start_recovers_a_live_pidfile() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .expect("create runtime");
+        let config = add_ephemeral_machine(&runtime, "prearmed-live-pidfile").await;
+        runtime
+            .request_machine_start(&config, "run-one")
+            .await
+            .expect("pre-arm ephemeral start");
+        let stale_age = i64::try_from(STALE_STARTING_TIMEOUT.as_secs()).expect("timeout fits i64");
+        runtime
+            .store
+            .save_machine_state(&MachineState {
+                machine_id: config.id,
+                status: MachineRuntimeState::Starting,
+                vmmon_pid: None,
+                started_at: None,
+                run_id: Some("run-one".to_string()),
+                last_error: None,
+                updated_at: now_unix() - stale_age - 1,
+            })
+            .await
+            .expect("simulate crash after pre-arm");
+        create_machine_runtime_dirs(&runtime, config.id);
+        let mut monitor = ChildGuard::sleep();
+        std::fs::write(
+            runtime.machine_paths(config.id).vmmon_pid_path(),
+            format!("{}\n", monitor.id()),
+        )
+        .expect("write live vmmon pidfile");
+        drop(runtime);
+
+        let reopened = Runtime::open(paths, RuntimeNetworkingConfig::default())
+            .await
+            .expect("reopen after pre-arm crash");
+        let recovered = reopened
+            .machine_state(config.id)
+            .await
+            .expect("recover runtime state");
+        assert_eq!(recovered.status, MachineRuntimeState::Starting);
+        assert_eq!(recovered.vmmon_pid, Some(monitor.id() as i32));
+        assert_eq!(recovered.run_id.as_deref(), Some("run-one"));
+        assert!(reopened
+            .machine_config(config.id)
+            .await
+            .expect("read machine config")
+            .is_some());
+        assert!(config.machine_dir.exists());
+
+        let recovered_at = recovered.updated_at;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        reopened
+            .reconcile_machine_runtime_best_effort(&config)
+            .await
+            .expect("reconcile recovered monitor");
+        assert_eq!(
+            reopened
+                .machine_state(config.id)
+                .await
+                .expect("read recovered state")
+                .updated_at,
+            recovered_at,
+            "reconciliation must not keep refreshing a recovered starting state"
+        );
+        monitor.kill();
+    }
+
+    #[tokio::test]
+    async fn ephemeral_pre_vmmon_start_failure_cleans_up_immediately() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let (runtime, mut config, _store) =
+            start_failure_runtime(&temp, "#!/bin/sh\nexit 23\n").await;
+        config.retention = MachineRetention::Ephemeral;
+        config.spec.mounts.push(vm_spec::Mount {
+            source: std::path::PathBuf::from("~unsupported"),
+            tag: "invalid".to_string(),
+            read_only: true,
+        });
+        runtime
+            .save_machine_config(&config)
+            .await
+            .expect("persist ephemeral invalid launch spec");
+
+        let error = machine_handle(&runtime, config.id)
+            .start()
+            .await
+            .expect_err("pre-vmmon preparation must fail");
+        assert!(matches!(error, LibVmError::MachinePreparationFailed { .. }));
+        assert!(runtime
+            .machine_config(config.id)
+            .await
+            .expect("read cleaned machine")
+            .is_none());
+        assert!(!config.machine_dir.exists());
+    }
+
+    #[tokio::test]
     async fn inspect_uses_sqlite_config_when_config_file_is_missing() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
@@ -3793,7 +4703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removal_retains_machine_identity_after_partial_cleanup_and_retries() {
+    async fn failed_removal_retains_machine_identity_for_manual_retry() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
             LocalPaths::new(temp.path().join("silo")),
@@ -3947,5 +4857,27 @@ mod tests {
 
         assert_eq!(next_machine.lock_id, lock_id);
         assert!(lock_path.exists());
+    }
+
+    async fn add_ephemeral_machine(runtime: &Runtime, name: &str) -> MachineConfig {
+        let id = MachineId::new();
+        let lock = runtime
+            .allocate_machine_lock()
+            .expect("allocate machine lock");
+        let mut config = sample_machine_config(runtime.local_paths(), id, name);
+        config.lock_id = lock.id();
+        config.retention = MachineRetention::Ephemeral;
+        drop(lock);
+        runtime
+            .local_paths()
+            .create_machine_data_dir(id)
+            .expect("create owned machine data root");
+        std::fs::write(config.machine_dir.join("data.txt"), b"machine data")
+            .expect("write machine data");
+        runtime
+            .add_machine_record(&config, &stopped_machine_state(id, None))
+            .await
+            .expect("persist ephemeral machine");
+        config
     }
 }

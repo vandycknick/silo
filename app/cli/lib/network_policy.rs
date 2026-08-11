@@ -67,10 +67,6 @@ fn looks_like_relative_path(path: &Path) -> bool {
     }) && (path.components().count() > 1 || path.extension().is_some())
 }
 
-pub(crate) fn policy_source_display(source: &str) -> &str {
-    source
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;

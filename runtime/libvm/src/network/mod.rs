@@ -21,7 +21,7 @@ use crate::store::models::{
     NetworkDefinition as ModelNetworkDefinition, NetworkInstance,
 };
 use crate::store::DataStore;
-use crate::{LibVmError, EgressCredentials, RuntimeNetworkingConfig};
+use crate::{EgressCredentials, LibVmError, RuntimeNetworkingConfig};
 
 use self::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
 use self::netd_driver::NetdDriver;
@@ -320,6 +320,10 @@ mod tests {
             lock_id: LockId::from(0),
             name: name.to_string(),
             spec: VmSpec::current(),
+            retention: crate::MachineRetention::Persistent,
+            process: crate::ProcessConfig::default(),
+            template_name: None,
+            agent_mode: None,
             machine_dir: paths.machine(id).dir().to_path_buf(),
             created_at: 1,
             modified_at: 1,

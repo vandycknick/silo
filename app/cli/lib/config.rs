@@ -56,7 +56,7 @@ impl GlobalConfig {
     }
 }
 
-fn resolve_default_config_dir() -> eyre::Result<PathBuf> {
+pub(crate) fn resolve_default_config_dir() -> eyre::Result<PathBuf> {
     let home = env_absolute_path("HOME")?;
     let config_home = env_absolute_path("XDG_CONFIG_HOME")?
         .or_else(|| home.as_ref().map(|path| path.join(".config")));

@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 
 #[cfg(test)]
 use crate::paths::LocalPaths;
@@ -11,6 +11,8 @@ use crate::store::models::DbConfig;
 #[cfg(test)]
 use crate::store::ConfigStore;
 use crate::LibVmError;
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
@@ -33,12 +35,17 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn close(self) {
+        self.pool.close().await;
+    }
+
     pub(crate) async fn open(state_db_path: &Path) -> Result<Self, LibVmError> {
         if let Some(parent) = state_db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let pool = Self::connect(state_db_path).await?;
-        sqlx::migrate!("./migrations").run(&pool).await?;
+        MIGRATOR.run(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -61,6 +68,108 @@ impl Store {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReadOnlyStore {
+    pool: SqlitePool,
+}
+
+impl ReadOnlyStore {
+    pub(crate) async fn open_if_exists(state_db_path: &Path) -> Result<Option<Self>, LibVmError> {
+        match std::fs::metadata(state_db_path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(std::io::Error::other("state database is not a regular file").into())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let mut wal_name = state_db_path.as_os_str().to_os_string();
+        wal_name.push("-wal");
+        if std::fs::exists(std::path::Path::new(&wal_name))? {
+            return Err(std::io::Error::other(format!(
+                "state database {} has an active WAL and cannot be planned without local writes",
+                state_db_path.display()
+            ))
+            .into());
+        }
+
+        let options = SqliteConnectOptions::new()
+            .filename(state_db_path)
+            .read_only(true)
+            .immutable(true)
+            .create_if_missing(false)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(30))
+            .connect_with(options)
+            .await?;
+        validate_embedded_migration_history(&pool).await?;
+        Ok(Some(Self { pool }))
+    }
+
+    pub(crate) async fn db_config(
+        &self,
+    ) -> Result<Option<crate::store::models::DbConfig>, LibVmError> {
+        let row =
+            sqlx::query("SELECT os, data_root, state_root, image_root FROM db_config WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|row| crate::store::models::DbConfig {
+            os: row.get("os"),
+            data_root: row.get("data_root"),
+            state_root: row.get("state_root"),
+            image_root: row.get("image_root"),
+        }))
+    }
+
+    pub(crate) async fn machine_name_exists(&self, name: &str) -> Result<bool, LibVmError> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM machine_config WHERE name = ?1)",
+        )
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+}
+
+async fn validate_embedded_migration_history(pool: &SqlitePool) -> Result<(), LibVmError> {
+    let rows = sqlx::query(
+        "SELECT version, description, success, checksum FROM _sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await?;
+    let expected = MIGRATOR.iter().collect::<Vec<_>>();
+    if rows.len() != expected.len() {
+        return Err(LibVmError::StateDecode {
+            field: "state_db.migrations",
+            message: format!(
+                "applied migration count {} does not match embedded migration count {}",
+                rows.len(),
+                expected.len()
+            ),
+        });
+    }
+    for (row, migration) in rows.iter().zip(expected) {
+        let version: i64 = row.get("version");
+        let description: String = row.get("description");
+        let success: bool = row.get("success");
+        let checksum: Vec<u8> = row.get("checksum");
+        if version != migration.version
+            || description != migration.description
+            || !success
+            || migration.checksum != checksum
+        {
+            return Err(LibVmError::StateDecode {
+                field: "state_db.migrations",
+                message: format!("migration {version} does not match the embedded schema"),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -72,9 +181,9 @@ mod tests {
     use crate::paths::LocalPaths;
     use crate::store::models::MachineId;
     use crate::store::models::{
-        MachineConfig, MachineNetworkConfig, MachineRuntimeState, MachineState, NetworkAttachment,
-        NetworkDefinition, NetworkDriverPreference, NetworkInstance, NetworkInstanceState,
-        NetworkTopology,
+        MachineConfig, MachineNetworkConfig, MachineRootfsRecord, MachineRuntimeState,
+        MachineState, NetworkAttachment, NetworkDefinition, NetworkDriverPreference,
+        NetworkInstance, NetworkInstanceState, NetworkTopology,
     };
     use crate::store::{ConfigStore, MachineStore, NetworkStore, Store};
     use crate::LibVmError;
@@ -91,6 +200,10 @@ mod tests {
             lock_id: LockId::from(0),
             name,
             spec: sample_vm_spec(),
+            retention: crate::MachineRetention::Persistent,
+            process: crate::ProcessConfig::default(),
+            template_name: None,
+            agent_mode: None,
             machine_dir: machine_dir.to_path_buf(),
             created_at: 1,
             modified_at: 1,
@@ -301,6 +414,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn old_migration_history_is_rejected() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let state_db = dir.path().join("state.db");
+        std::fs::File::create(&state_db).expect("create old state database");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", state_db.display()))
+            .await
+            .expect("open old state database");
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create migration history");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations
+                (version, description, success, checksum, execution_time)
+             VALUES (1, 'initial', TRUE, x'00', 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("record old migration");
+        pool.close().await;
+
+        let error = Store::open(&state_db)
+            .await
+            .expect_err("old state database must not be adopted");
+        assert!(
+            error.to_string().contains("migration") || error.to_string().contains("checksum"),
+            "unexpected migration rejection: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn add_machine_inserts_config_and_initial_state() {
         let (_dir, paths) = temp_paths();
         let db = Store::new(&paths).await.expect("open db");
@@ -319,6 +472,49 @@ mod tests {
         assert_eq!(
             db.machine_state(id).await.expect("lookup state"),
             Some(state)
+        );
+    }
+
+    #[tokio::test]
+    async fn machine_rootfs_round_trips_oci_identity_and_local_disk_pin() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id = MachineId::new();
+        let machine = machine_from_path(id, "rootfs-pin".to_string(), paths.machine(id).dir());
+        sqlx::query(
+            "INSERT INTO image_manifest
+                (digest, media_type, image_id, platform_os, platform_architecture,
+                 config_digest, layer_count, total_size_bytes, created_at)
+             VALUES ('sha256:manifest', 'application/vnd.oci.image.manifest.v1+json',
+                     'sha256:image-id', 'linux', 'amd64', 'sha256:config', 0, 0, 1)",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("insert manifest pin target");
+        let rootfs = MachineRootfsRecord {
+            machine_id: id,
+            source_kind: crate::ImageSourceKind::Oci,
+            requested_reference: "example.test/demo:latest".to_string(),
+            selected_reference: Some("example.test/demo@sha256:manifest".to_string()),
+            manifest_digest: Some("sha256:manifest".to_string()),
+            config_digest: Some("sha256:config".to_string()),
+            image_id: Some("sha256:image-id".to_string()),
+            root_disk_path: paths.machine(id).dir().join("rootfs.img"),
+            root_disk_size_bytes: 64 * 1024 * 1024,
+            created_at: 7,
+        };
+
+        db.add_machine_with_rootfs(
+            &machine,
+            &machine_state(id, MachineRuntimeState::Stopped),
+            &rootfs,
+        )
+        .await
+        .expect("insert machine rootfs pin");
+
+        assert_eq!(
+            db.machine_rootfs(id).await.expect("read rootfs pin"),
+            Some(rootfs)
         );
     }
 
@@ -459,13 +655,17 @@ mod tests {
         let mut labels = BTreeMap::new();
         labels.insert("owner".to_string(), "test".to_string());
         let mut metadata = BTreeMap::new();
-        metadata.insert("silo.profile".to_string(), "rust-dev".to_string());
+        metadata.insert("silo.note".to_string(), "test value".to_string());
 
         let machine = MachineConfig {
             id,
             lock_id: LockId::from(42),
             name: "jsonb-test".to_string(),
             spec: sample_vm_spec(),
+            retention: crate::MachineRetention::Persistent,
+            process: crate::ProcessConfig::default(),
+            template_name: None,
+            agent_mode: None,
             machine_dir: paths.machine(id).dir().to_path_buf(),
             created_at: 1,
             modified_at: 1,
@@ -487,8 +687,8 @@ mod tests {
         assert_eq!(found.labels.get("owner").map(String::as_str), Some("test"));
         assert_eq!(found.name, "jsonb-test");
         assert_eq!(
-            found.metadata.get("silo.profile").map(String::as_str),
-            Some("rust-dev")
+            found.metadata.get("silo.note").map(String::as_str),
+            Some("test value")
         );
         assert_eq!(found.network, MachineNetworkConfig::default());
         let storage_type: String =
@@ -538,6 +738,49 @@ mod tests {
         .await
         .expect("query modified_at");
         assert_eq!(modified_at, Some(1));
+    }
+
+    #[tokio::test]
+    async fn process_and_retention_survive_sqlite_reopen() {
+        let (_dir, paths) = temp_paths();
+        let db = Store::new(&paths).await.expect("open db");
+        let id = MachineId::new();
+        let mut environment = BTreeMap::new();
+        environment.insert("ZED".to_string(), "last".to_string());
+        environment.insert("ALPHA".to_string(), "first".to_string());
+        let machine = MachineConfig {
+            id,
+            lock_id: LockId::from(42),
+            name: "reopen-stage-two".to_string(),
+            spec: sample_vm_spec(),
+            retention: crate::MachineRetention::Ephemeral,
+            process: crate::ProcessConfig {
+                entrypoint: Some(Vec::new()),
+                command: Some(vec!["/bin/echo".to_string(), "hello".to_string()]),
+                environment,
+                working_directory: "/workspace".to_string(),
+                user: Some("1000:1000".to_string()),
+            },
+            template_name: Some("rust-worker".to_string()),
+            agent_mode: Some(crate::MachineAgent::Disabled),
+            machine_dir: paths.machine(id).dir().to_path_buf(),
+            created_at: 1,
+            modified_at: 1,
+            image_ref: "test-image:latest".to_string(),
+            root_disk_size: None,
+            labels: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            network: MachineNetworkConfig::default(),
+            guest: crate::machine::MachineGuestConfig::default(),
+        };
+        seed_machine(&db, &machine).await;
+        db.pool.close().await;
+
+        let reopened = Store::open(paths.state_db_path()).await.expect("reopen db");
+        assert_eq!(
+            reopened.machine_config(id).await.expect("read config"),
+            Some(machine)
+        );
     }
 
     #[tokio::test]

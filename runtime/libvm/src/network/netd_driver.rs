@@ -467,7 +467,7 @@ fn configure_egress_credentials_environment(
         }
         return Err(LibVmError::NetworkRuntime {
             reference: reference.to_string(),
-            message: "network launch material requires a persisted network policy".to_string(),
+            message: "egress credentials require a persisted network policy".to_string(),
         });
     };
 
@@ -871,8 +871,8 @@ fn terminate_helper(identity: &ProcessIdentity) -> Result<(), LibVmError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_bounded_stderr_line, configure_network_helper_command,
-        configure_egress_credentials_environment, format_netd_startup_failure, prepare_netd_runtime,
+        append_bounded_stderr_line, configure_egress_credentials_environment,
+        configure_network_helper_command, format_netd_startup_failure, prepare_netd_runtime,
         private_ipv4_config, resolve_certificate_authority_paths, CapturedStderrLines,
         NetworkHelperCommandConfig, OAUTH_REFRESH_AUTH_ENV, OAUTH_REFRESH_HOOK_ENV,
         STDERR_CAPTURE_LIMIT,
@@ -1249,6 +1249,10 @@ netd log: /tmp/silo/netd.log";
             lock_id: LockId::from(0),
             name: "netd-resolved-path".to_string(),
             spec: vm_spec::VmSpec::current(),
+            retention: crate::MachineRetention::Persistent,
+            process: crate::ProcessConfig::default(),
+            template_name: None,
+            agent_mode: None,
             machine_dir: paths.machine(machine_id).dir().to_path_buf(),
             created_at: 1,
             modified_at: 1,

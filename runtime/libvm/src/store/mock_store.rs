@@ -4,8 +4,8 @@ use mockall::mock;
 use crate::image::{ImageDetail, ImageHandle, ImagePruneReport, ImageRemoveOptions};
 use crate::store::models::MachineId;
 use crate::store::models::{
-    DbConfig, ImageRootfsArtifactRecord, MachineConfig, MachineRootfsRecord, MachineState,
-    NetworkAttachment, NetworkDefinition, NetworkInstance, OciImageRecord,
+    DbConfig, MachineConfig, MachineRootfsRecord, MachineState, NetworkAttachment,
+    NetworkDefinition, NetworkInstance, OciImageRecord,
 };
 use crate::store::{ConfigStore, ImageStore, MachineStore, NetworkStore};
 use crate::LibVmError;
@@ -42,6 +42,11 @@ mock! {
             machine_id: MachineId,
         ) -> Result<Option<MachineState>, LibVmError>;
 
+        async fn machine_rootfs(
+            &self,
+            machine_id: MachineId,
+        ) -> Result<Option<MachineRootfsRecord>, LibVmError>;
+
         async fn save_machine_state(&self, state: &MachineState) -> Result<(), LibVmError>;
 
         async fn save_machine_config(&self, config: &MachineConfig) -> Result<(), LibVmError>;
@@ -64,22 +69,24 @@ mock! {
         async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError>;
 
         async fn remove_machine(&self, machine: &MachineConfig) -> Result<(), LibVmError>;
+
     }
 
     #[async_trait]
     impl ImageStore for DataStore {
         async fn save_oci_image(&self, image: &OciImageRecord) -> Result<(), LibVmError>;
 
-        async fn save_rootfs_artifact(
-            &self,
-            artifact: &ImageRootfsArtifactRecord,
-        ) -> Result<(), LibVmError>;
-
         async fn image_handle(&self, reference: &str) -> Result<Option<ImageHandle>, LibVmError>;
 
         async fn list_image_handles(&self) -> Result<Vec<ImageHandle>, LibVmError>;
 
         async fn image_detail(&self, reference: &str) -> Result<Option<ImageDetail>, LibVmError>;
+
+        async fn ensure_image_removable(
+            &self,
+            reference: &str,
+            options: ImageRemoveOptions,
+        ) -> Result<ImageHandle, LibVmError>;
 
         async fn remove_image(
             &self,

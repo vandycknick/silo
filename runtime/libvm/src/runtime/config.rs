@@ -192,6 +192,29 @@ impl RuntimeConfig {
         Ok(roots)
     }
 
+    pub(crate) fn resolve_durable_roots_read_only(
+        &self,
+        stored: Option<&DbConfig>,
+        opened_db_path: &Path,
+    ) -> Result<(PathBuf, PathBuf, PathBuf), LibVmError> {
+        let (data_root, state_root, image_root) = match stored {
+            Some(stored) => {
+                validate_db_config_header(stored)?;
+                merge_durable_roots(self, stored)?
+            }
+            None => self.resolve_durable_roots()?,
+        };
+        for (field, path) in [
+            ("data_root", &data_root),
+            ("state_root", &state_root),
+            ("image_root", &image_root),
+        ] {
+            validate_absolute_path(field, path)?;
+        }
+        compare_path("state_db_path", &data_root.join("state.db"), opened_db_path)?;
+        Ok((data_root, state_root, image_root))
+    }
+
     pub(crate) fn bootstrap_data_root(&self) -> Result<PathBuf, LibVmError> {
         match &self.data_root {
             PathChoice::Default => resolve_default_data_dir(),

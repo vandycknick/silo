@@ -1,4 +1,5 @@
 use clap::Args;
+use libvm::MachineRetention;
 
 use crate::config::GlobalConfig;
 use crate::context::Context;
@@ -35,8 +36,29 @@ impl Cmd {
 
         let (_name, machine) = context.machine(Some(name)).await?;
         let inspect_data = machine.inspect().await?;
+        ensure_defaultable(inspect_data.retention, &inspect_data.name)?;
         GlobalConfig::write_default_machine(Some(inspect_data.name.as_str()))?;
         println!("default machine is {}", inspect_data.name);
         Ok(())
+    }
+}
+
+fn ensure_defaultable(retention: MachineRetention, name: &str) -> eyre::Result<()> {
+    if retention == MachineRetention::Ephemeral {
+        eyre::bail!("machine `{name}` is ephemeral and cannot be the default; use a persistent VM");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use libvm::MachineRetention;
+
+    use crate::commands::default::ensure_defaultable;
+
+    #[test]
+    fn rejects_ephemeral_default_machine() {
+        assert!(ensure_defaultable(MachineRetention::Ephemeral, "temporary").is_err());
+        assert!(ensure_defaultable(MachineRetention::Persistent, "development").is_ok());
     }
 }

@@ -33,3 +33,4 @@ and review standards for new and substantially revised records.
 | 0010 | Static guest network configuration                            | Accepted    | 2026-07-11 | `docs/adr/0010-static-guest-network-configuration.md` |
 | 0011 | Package registry endpoint semantics                          | Draft       | 2026-07-16 | `docs/adr/0011-package-registry-endpoint-semantics.md` |
 | 0012 | Cross-platform runtime and SDK packaging                     | Accepted    | 2026-07-22 | `docs/adr/0012-cross-platform-runtime-and-sdk-packaging.md` |
+| 0013 | Image-first machine lifecycle                                | Implemented | 2026-08-07 | `docs/adr/0013-image-first-machine-lifecycle.md` |

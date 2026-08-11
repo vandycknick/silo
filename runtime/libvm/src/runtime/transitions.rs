@@ -14,7 +14,7 @@ pub(crate) enum Event {
     },
     MonitorObserved {
         pid: i32,
-        started_at: i64,
+        started_at: Option<i64>,
         run_id: Option<String>,
     },
     StartFailed {
@@ -147,7 +147,7 @@ fn monitor_ready(
 fn monitor_observed(
     state: MachineState,
     pid: i32,
-    started_at: i64,
+    started_at: Option<i64>,
     run_id: Option<String>,
     now: i64,
 ) -> Result<MachineState, TransitionError> {
@@ -161,7 +161,7 @@ fn monitor_observed(
         state,
         status,
         Some(pid),
-        Some(started_at),
+        started_at,
         run_id,
         None,
         now,
@@ -198,6 +198,7 @@ fn stop_requested(
     ) {
         return Err(TransitionError::NotRunning);
     }
+    require_generation(&state, pid, started_at, run_id.as_deref())?;
 
     Ok(replace_runtime(
         state,
@@ -457,7 +458,7 @@ mod tests {
             starting,
             Event::MonitorObserved {
                 pid: 123,
-                started_at: 42,
+                started_at: Some(42),
                 run_id: Some("run-1".to_string()),
             },
             NOW,
@@ -467,6 +468,28 @@ mod tests {
         assert_eq!(next.status, MachineRuntimeState::Starting);
         assert_eq!(next.vmmon_pid, Some(123));
         assert_eq!(next.started_at, Some(42));
+        assert_eq!(next.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn observed_live_monitor_without_a_birth_time_remains_starting() {
+        let mut starting = state(MachineRuntimeState::Starting);
+        starting.run_id = Some("run-1".to_string());
+
+        let next = reduce(
+            starting,
+            Event::MonitorObserved {
+                pid: 123,
+                started_at: None,
+                run_id: Some("run-1".to_string()),
+            },
+            NOW,
+        )
+        .expect("unresolved live monitor should remain active");
+
+        assert_eq!(next.status, MachineRuntimeState::Starting);
+        assert_eq!(next.vmmon_pid, Some(123));
+        assert_eq!(next.started_at, None);
         assert_eq!(next.run_id.as_deref(), Some("run-1"));
     }
 
@@ -534,6 +557,22 @@ mod tests {
         assert_eq!(next.vmmon_pid, Some(123));
         assert_eq!(next.started_at, Some(42));
         assert_eq!(next.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn stop_request_rejects_a_stale_generation() {
+        let err = reduce(
+            running(),
+            Event::StopRequested {
+                pid: 123,
+                started_at: Some(42),
+                run_id: Some("run-2".to_string()),
+            },
+            NOW,
+        )
+        .expect_err("stale stop request should be rejected");
+
+        assert_eq!(err, TransitionError::StaleGeneration);
     }
 
     #[test]

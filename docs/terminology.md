@@ -84,9 +84,15 @@ The guest OS believes it is running on real hardware, even though a VMM and host
 
 In user-facing Silo documentation, use "VM" when referring to an instance created, started, stopped, or deleted by Silo.
 
+For `silo create` and `silo run`, the positional operand is an image source. A
+bare value is an OCI reference; `disk:PATH` selects an existing local disk.
+Templates are selected separately with `--template` and can supply the image
+when no positional source is given.
+
 Examples:
 
-- `silo create dev rust-dev`
+- `silo create ubuntu:24.04 --name dev`
+- `silo create --template rust-dev --name dev`
 - `silo start dev`
 - `silo stop dev`
 

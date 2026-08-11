@@ -13,12 +13,6 @@ pub enum ImageProgress {
         layer_count: usize,
         total_download_bytes: Option<u64>,
     },
-    HashingSource {
-        image_ref: String,
-    },
-    ReadingArchive {
-        image_ref: String,
-    },
     CheckingCache {
         image_ref: String,
     },

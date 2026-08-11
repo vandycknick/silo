@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use vm_spec::VmSpec;
 
 use crate::lock_manager::LockId;
-use crate::machine::MachineGuestConfig;
+use crate::machine::{MachineAgent, MachineGuestConfig, MachineRetention, ProcessConfig};
 
 use super::{MachineId, MachineNetworkConfig};
 
@@ -21,6 +21,10 @@ pub(crate) struct MachineConfig {
     pub lock_id: LockId,
     pub name: String,
     pub spec: VmSpec,
+    pub retention: MachineRetention,
+    pub process: ProcessConfig,
+    pub template_name: Option<String>,
+    pub agent_mode: Option<MachineAgent>,
     #[serde(default, skip_serializing_if = "MachineGuestConfig::is_default")]
     pub guest: MachineGuestConfig,
     #[serde(alias = "instanceDir")]
@@ -99,7 +103,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::lock_manager::LockId;
-    use crate::machine::{MachineAgent, MachineGuestConfig};
+    use crate::machine::{MachineAgent, MachineGuestConfig, MachineRetention, ProcessConfig};
     use crate::store::models::{MachineConfig, MachineId, MachineNetworkConfig};
     use vm_spec::VmSpec;
 
@@ -135,6 +139,10 @@ mod tests {
             lock_id: LockId::from(1),
             name: "test".to_string(),
             spec: VmSpec::current(),
+            retention: MachineRetention::Persistent,
+            process: ProcessConfig::default(),
+            template_name: None,
+            agent_mode: None,
             guest: MachineGuestConfig::default(),
             machine_dir: PathBuf::from("/tmp/test"),
             created_at: 1,
@@ -155,5 +163,35 @@ mod tests {
         let custom = serde_json::to_value(&config).expect("serialize custom config");
         assert_eq!(custom["guest"]["agent"]["mode"], "custom");
         assert_eq!(custom["guest"]["agent"]["path"], "/custom/agent");
+    }
+
+    #[test]
+    fn durable_machine_config_requires_retention() {
+        let config = MachineConfig {
+            id: MachineId::new(),
+            lock_id: LockId::from(1),
+            name: "test".to_string(),
+            spec: VmSpec::current(),
+            retention: MachineRetention::Persistent,
+            process: ProcessConfig::default(),
+            template_name: None,
+            agent_mode: None,
+            guest: MachineGuestConfig::default(),
+            machine_dir: PathBuf::from("/tmp/test"),
+            created_at: 1,
+            modified_at: 1,
+            image_ref: "image".to_string(),
+            root_disk_size: None,
+            labels: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            network: MachineNetworkConfig::default(),
+        };
+        let mut serialized = serde_json::to_value(config).expect("serialize config");
+        serialized
+            .as_object_mut()
+            .expect("machine config is an object")
+            .remove("retention");
+
+        assert!(serde_json::from_value::<MachineConfig>(serialized).is_err());
     }
 }

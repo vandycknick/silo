@@ -1,9 +1,8 @@
 use libvm::{
-    ExecutionLaunchFailureReason, ExecutionResult, ImageSource, LibVmError, MachineLogOptions,
-    MachineLogSource, MachineReadinessOutcome, MachineUserConfig, Runtime,
+    ExecutionLaunchFailureReason, ExecutionResult, ImageSource, LibVmError,
+    MachineReadinessOutcome, MachineUserConfig, Runtime,
 };
 use std::time::Duration;
-use tokio_stream::StreamExt as _;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,13 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let exit = machine.wait().await?;
-    if !exec_log_contains(&machine, "entrypoint-output\n").await? {
-        let _ = machine.remove().await;
-        return Err("exec.log did not capture detached entrypoint stdout".into());
-    }
-
     eprintln!("entrypoint acknowledged Started and vmmon exited: {exit:?}");
-    eprintln!("exec.log captured detached entrypoint output");
     machine.remove().await?;
 
     let machine = runtime
@@ -128,30 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("fixed stdin was not delivered after guest Started".into());
     }
     machine.stop().await?;
-    if !exec_log_contains(&machine, "ordinary-execution-output\n").await? {
-        let _ = machine.remove().await;
-        return Err("exec.log did not capture ordinary execution stdout".into());
-    }
     eprintln!("ordinary execution preserved default user and fixed stdin");
-    eprintln!("exec.log captured ordinary execution output");
     machine.remove().await?;
     Ok(())
-}
-
-async fn exec_log_contains(
-    machine: &libvm::Machine,
-    expected: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut logs = machine
-        .logs(MachineLogSource::Exec, MachineLogOptions::default())
-        .await?;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = logs.next().await {
-        bytes.extend_from_slice(&chunk?.data);
-    }
-    Ok(bytes.split(|byte| *byte == b'\n').any(|line| {
-        serde_json::from_slice::<serde_json::Value>(line)
-            .ok()
-            .is_some_and(|record| record["s"] == "stdout" && record["d"] == expected)
-    }))
 }

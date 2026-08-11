@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use clap::Args;
 use eyre::bail;
 use libvm::MachineData;
@@ -16,31 +18,58 @@ pub struct Cmd {
     #[arg(long, short = 'u')]
     pub user: Option<String>,
 
+    /// Guest working directory for the command.
+    #[arg(long, value_name = "DIR")]
+    pub workdir: Option<String>,
+
+    /// Set a guest environment variable. May be repeated.
+    #[arg(
+        long = "env",
+        short = 'e',
+        value_name = "KEY=VALUE",
+        value_parser = parse_environment
+    )]
+    pub environment: Vec<(String, String)>,
+
     /// Attach a TTY to the guest command.
     #[arg(long, short = 't')]
     pub tty: bool,
 
     /// Guest command and arguments to execute after `--`.
-    #[arg(required = true, last = true, allow_hyphen_values = true)]
+    #[arg(last = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
 }
 
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        if self.command.is_empty() {
-            bail!("command is required; pass it after `--`");
-        }
-
         let (_reference, machine) = context.machine(self.name.as_deref()).await?;
         let inspect_data = machine.inspect().await?;
 
         ensure_running(&inspect_data)?;
         ensure_guest_ready(&inspect_data)?;
+        let command = resolve_command(
+            inspect_data.process.entrypoint.as_deref(),
+            inspect_data.process.command.as_deref(),
+            self.command,
+        )?;
+        let environment = resolve_environment(&inspect_data.process.environment, self.environment);
+        let working_directory = self
+            .workdir
+            .as_deref()
+            .unwrap_or(&inspect_data.process.working_directory);
+        let user = self
+            .user
+            .as_deref()
+            .or(inspect_data.process.user.as_deref());
 
         let status = if self.tty {
-            guest::attach_command(&machine, self.user.as_deref(), &self.command).await?
+            guest::attach_command(&machine, user, &command, working_directory, &environment)
+                .await
+                .map_err(execution_infrastructure)?
         } else {
-            guest::run_command_streaming(&machine, self.user.as_deref(), &self.command).await?
+            guest::run_command_streaming(&machine, user, &command, working_directory, &environment)
+                .await
+                .map_err(execution_infrastructure)?
         };
         if let Some(message) = execution_failure_message(&status) {
             eprintln!("{} {message}", crate::ui::error_label());
@@ -49,7 +78,55 @@ impl Cmd {
     }
 }
 
-fn execution_failure_message(result: &libvm::ExecutionResult) -> Option<String> {
+fn execution_infrastructure(error: eyre::Report) -> eyre::Report {
+    error.wrap_err(crate::errors::ExecutionExit::new(125))
+}
+
+fn resolve_command(
+    entrypoint: Option<&[String]>,
+    configured_command: Option<&[String]>,
+    command: Vec<String>,
+) -> eyre::Result<Vec<String>> {
+    if !command.is_empty() {
+        return Ok(command);
+    }
+
+    let mut resolved = entrypoint.unwrap_or_default().to_vec();
+    resolved.extend_from_slice(configured_command.unwrap_or_default());
+    if resolved.is_empty() {
+        bail!("no command was provided and the machine has no configured entrypoint or command");
+    }
+    Ok(resolved)
+}
+
+fn resolve_environment(
+    persisted: &BTreeMap<String, String>,
+    overrides: Vec<(String, String)>,
+) -> BTreeMap<String, String> {
+    let mut environment = persisted.clone();
+    environment.extend(overrides);
+    environment
+}
+
+fn parse_environment(value: &str) -> Result<(String, String), String> {
+    let Some((key, value)) = value.split_once('=') else {
+        return Err("environment must be KEY=VALUE".to_string());
+    };
+    if key.is_empty()
+        || !key.bytes().enumerate().all(|(index, character)| {
+            (index == 0 && (character.is_ascii_alphabetic() || character == b'_'))
+                || (index > 0 && (character.is_ascii_alphanumeric() || character == b'_'))
+        })
+    {
+        return Err(format!("invalid environment variable name {key:?}"));
+    }
+    if value.contains('\0') {
+        return Err("environment value cannot contain NUL".to_string());
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+pub(crate) fn execution_failure_message(result: &libvm::ExecutionResult) -> Option<String> {
     match result {
         libvm::ExecutionResult::LaunchFailed(failure) => {
             let reason = match failure.reason {
@@ -85,7 +162,7 @@ fn execution_failure_message(result: &libvm::ExecutionResult) -> Option<String> 
     }
 }
 
-fn execution_exit_code(result: libvm::ExecutionResult) -> i32 {
+pub(crate) fn execution_exit_code(result: libvm::ExecutionResult) -> i32 {
     match result {
         libvm::ExecutionResult::Exited { code: Some(code) } => {
             i32::try_from(code).map_or(125, |code| code)
@@ -132,11 +209,15 @@ fn ensure_guest_ready(data: &MachineData) -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use std::collections::BTreeMap;
 
     use crate::app::Cli;
-    use crate::commands::exec::{execution_exit_code, execution_failure_message};
+    use crate::commands::exec::{
+        execution_exit_code, execution_failure_message, parse_environment, resolve_command,
+        resolve_environment,
+    };
     use crate::commands::Command;
+    use clap::Parser;
 
     #[test]
     fn exec_command_parses_trailing_args() {
@@ -181,6 +262,81 @@ mod tests {
         assert_eq!(exec.name, None);
         assert!(!exec.tty);
         assert_eq!(exec.command, vec!["make".to_string(), "kernel".to_string()]);
+    }
+
+    #[test]
+    fn exec_command_allows_the_persisted_process_form() {
+        let cli =
+            Cli::try_parse_from(["silo", "exec", "arch"]).expect("commandless exec should parse");
+
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec command");
+        };
+        assert_eq!(exec.name.as_deref(), Some("arch"));
+        assert!(exec.command.is_empty());
+    }
+
+    #[test]
+    fn exec_command_parses_process_overrides() {
+        let cli = Cli::try_parse_from([
+            "silo",
+            "exec",
+            "arch",
+            "--user",
+            "root",
+            "--workdir",
+            "/workspace",
+            "--env",
+            "MODE=test",
+            "--",
+            "cargo",
+            "test",
+        ])
+        .expect("exec command should parse");
+
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec command");
+        };
+        assert_eq!(exec.user.as_deref(), Some("root"));
+        assert_eq!(exec.workdir.as_deref(), Some("/workspace"));
+        assert_eq!(
+            exec.environment,
+            vec![("MODE".to_string(), "test".to_string())]
+        );
+    }
+
+    #[test]
+    fn commandless_exec_combines_persisted_entrypoint_and_command() {
+        let entrypoint = vec!["/entrypoint".to_string(), "--quiet".to_string()];
+        let command = vec!["serve".to_string()];
+
+        assert_eq!(
+            resolve_command(Some(&entrypoint), Some(&command), Vec::new())
+                .expect("persisted command"),
+            ["/entrypoint", "--quiet", "serve"]
+        );
+        assert_eq!(
+            resolve_command(Some(&entrypoint), Some(&command), vec!["test".to_string()])
+                .expect("explicit command"),
+            ["test"]
+        );
+        assert!(resolve_command(None, None, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn exec_environment_overrides_persisted_values() {
+        let resolved = resolve_environment(
+            &BTreeMap::from([
+                ("PATH".to_string(), "/bin".to_string()),
+                ("MODE".to_string(), "dev".to_string()),
+            ]),
+            vec![("MODE".to_string(), "test".to_string())],
+        );
+
+        assert_eq!(resolved["PATH"], "/bin");
+        assert_eq!(resolved["MODE"], "test");
+        assert!(parse_environment("MODE=test").is_ok());
+        assert!(parse_environment("MODE").is_err());
     }
 
     #[test]

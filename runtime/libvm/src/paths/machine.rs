@@ -51,12 +51,11 @@ impl MachinePaths {
         self.machine_data_dir()
     }
 
-    #[allow(dead_code, reason = "used by Stage 4 runtime cleanup")]
     pub(crate) fn machine_run_dir(&self) -> &Path {
         &self.run_dir
     }
 
-    #[allow(dead_code, reason = "used by Stage 3 semantic log access")]
+    #[cfg(test)]
     pub(crate) fn machine_logs_dir(&self) -> &Path {
         &self.logs_dir
     }

@@ -47,6 +47,12 @@ pub enum LibVmError {
         machine_count: u64,
     },
 
+    #[error("image pull policy {policy:?} does not apply to {source_kind:?} image sources")]
+    ImagePullPolicyUnsupported {
+        policy: crate::ImagePullPolicy,
+        source_kind: crate::ImageSourceKind,
+    },
+
     #[error("image operation for {reference} failed")]
     Image {
         reference: String,
@@ -62,6 +68,13 @@ pub enum LibVmError {
 
     #[error("machine {reference} is not running")]
     MachineNotRunning { reference: String },
+
+    #[error("machine {reference} run {requested} is no longer current")]
+    MachineStaleGeneration {
+        reference: String,
+        requested: crate::MachineRunId,
+        current: Option<crate::MachineRunId>,
+    },
 
     #[error("machine {reference} does not provide {log_source:?} logs")]
     MachineLogSourceUnavailable {

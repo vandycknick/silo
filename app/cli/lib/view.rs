@@ -2,13 +2,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use libvm::{
-    MachineAgent, MachineBootReport, MachineData, MachineNetworkConfig, MachineProvisionReport,
-    MachineStatus, MachineUserConfig,
+    ImageSourceKind, MachineAgent, MachineBootReport, MachineData, MachineNetworkConfig,
+    MachineProvisionReport, MachineRetention, MachineRootfs, MachineStatus, MachineUserConfig,
+    ProcessConfig,
 };
 use serde::Serialize;
 use vm_spec::VmSpec;
-
-use crate::constants::PROFILE_METADATA_KEY;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MachineView {
@@ -16,7 +15,11 @@ pub struct MachineView {
     pub name: String,
     pub state: &'static str,
     pub default: bool,
-    pub profile: Option<String>,
+    pub template_name: Option<String>,
+    pub retention: String,
+    pub process: ProcessConfig,
+    pub rootfs: Option<MachineRootfsView>,
+    pub agent_mode: String,
     pub image: String,
     pub network: MachineNetworkConfig,
     pub created_at: i64,
@@ -38,6 +41,19 @@ pub struct MachineView {
 pub struct MachineResourcesView {
     pub cpus: u8,
     pub memory_mib: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MachineRootfsView {
+    pub source_kind: String,
+    pub requested_reference: String,
+    pub selected_reference: Option<String>,
+    pub selected_manifest_digest: Option<String>,
+    pub config_digest: Option<String>,
+    pub image_id: Option<String>,
+    pub root_disk_path: PathBuf,
+    pub root_disk_size_bytes: u64,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,7 +101,11 @@ impl MachineView {
             name: data.name.clone(),
             state: state_label(&data.status),
             default,
-            profile: data.metadata.get(PROFILE_METADATA_KEY).cloned(),
+            template_name: data.template_name.clone(),
+            retention: retention_label(data.retention).to_string(),
+            process: data.process.clone(),
+            rootfs: data.rootfs.as_ref().map(MachineRootfsView::new),
+            agent_mode: agent_label(data.agent_mode.as_ref()).to_string(),
             image: data.image_ref.clone(),
             network: data.network.clone(),
             created_at: data.created_at,
@@ -116,6 +136,22 @@ impl MachineView {
             metadata: data.metadata.clone(),
             dir: data.machine_dir.clone(),
             spec: data.spec.clone(),
+        }
+    }
+}
+
+impl MachineRootfsView {
+    fn new(rootfs: &MachineRootfs) -> Self {
+        Self {
+            source_kind: image_source_kind_label(rootfs.source_kind).to_string(),
+            requested_reference: rootfs.requested_reference.clone(),
+            selected_reference: rootfs.selected_reference.clone(),
+            selected_manifest_digest: rootfs.selected_manifest_digest.clone(),
+            config_digest: rootfs.config_digest.clone(),
+            image_id: rootfs.image_id.clone(),
+            root_disk_path: rootfs.root_disk_path.clone(),
+            root_disk_size_bytes: rootfs.root_disk_size_bytes,
+            created_at: rootfs.created_at,
         }
     }
 }
@@ -170,6 +206,29 @@ fn guest_settings(data: &MachineData) -> MachineGuestSettingsView {
     }
 }
 
+pub fn retention_label(retention: MachineRetention) -> &'static str {
+    match retention {
+        MachineRetention::Persistent => "persistent",
+        MachineRetention::Ephemeral => "ephemeral",
+    }
+}
+
+pub fn agent_label(agent: Option<&MachineAgent>) -> &'static str {
+    match agent {
+        Some(MachineAgent::Default) => "default",
+        Some(MachineAgent::Custom { .. }) => "custom",
+        Some(MachineAgent::Disabled) => "disabled",
+        Some(_) | None => "unknown",
+    }
+}
+
+fn image_source_kind_label(source: ImageSourceKind) -> &'static str {
+    match source {
+        ImageSourceKind::Oci => "oci",
+        ImageSourceKind::Disk => "disk",
+    }
+}
+
 fn initramfs_path_exists(spec: &VmSpec, machine_dir: &Path) -> bool {
     let Some(initramfs) = spec
         .boot
@@ -184,5 +243,20 @@ fn initramfs_path_exists(spec: &VmSpec, machine_dir: &Path) -> bool {
         initramfs.is_file()
     } else {
         machine_dir.join(initramfs).is_file()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use libvm::{MachineAgent, MachineRetention};
+
+    use crate::view::{agent_label, retention_label};
+
+    #[test]
+    fn labels_persisted_machine_lifecycle_fields() {
+        assert_eq!(retention_label(MachineRetention::Ephemeral), "ephemeral");
+        assert_eq!(retention_label(MachineRetention::Persistent), "persistent");
+        assert_eq!(agent_label(Some(&MachineAgent::Default)), "default");
+        assert_eq!(agent_label(Some(&MachineAgent::Disabled)), "disabled");
     }
 }

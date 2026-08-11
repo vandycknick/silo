@@ -36,6 +36,8 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
         ("ID".to_string(), view.id.clone()),
         ("State".to_string(), view.state.to_string()),
         ("Default".to_string(), ui::yes_no(view.default).to_string()),
+        ("Retention".to_string(), view.retention.clone()),
+        ("Agent mode".to_string(), view.agent_mode.clone()),
         ("Ready".to_string(), ui::yes_no(view.ready).to_string()),
         ("Guest".to_string(), view.guest.status.clone()),
         ("CPUs".to_string(), view.resources.cpus.to_string()),
@@ -45,14 +47,25 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
         ),
         ("Disk".to_string(), ui::human_bytes(view.root_disk_size)),
         ("Network".to_string(), view.network.name()),
+        (
+            "Template".to_string(),
+            view.template_name
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
     ];
 
-    if let Some(profile) = &view.profile {
-        rows.push(("Profile".to_string(), profile.clone()));
-    }
     if !view.image.is_empty() {
         rows.push(("Image".to_string(), view.image.clone()));
     }
+    rows.push(("Process".to_string(), process_summary(&view.process)));
+    rows.push((
+        "Rootfs".to_string(),
+        view.rootfs
+            .as_ref()
+            .map(rootfs_summary)
+            .unwrap_or_else(|| "none".to_string()),
+    ));
     rows.push((
         "User".to_string(),
         view.guest
@@ -77,6 +90,20 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
     }
 
     ui::print_detail_rows(&rows)
+}
+
+fn process_summary(process: &libvm::ProcessConfig) -> String {
+    format!(
+        "entrypoint={:?} command={:?} cwd={:?} user={:?}",
+        process.entrypoint, process.command, process.working_directory, process.user
+    )
+}
+
+fn rootfs_summary(rootfs: &crate::view::MachineRootfsView) -> String {
+    match &rootfs.selected_reference {
+        Some(reference) => format!("{} ({reference})", rootfs.source_kind),
+        None => format!("{} ({})", rootfs.source_kind, rootfs.requested_reference),
+    }
 }
 
 fn boot_summary(boot: &crate::view::MachineGuestBootReportView) -> String {

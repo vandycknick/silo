@@ -2,8 +2,8 @@ use clap::{Args, Subcommand};
 use libvm::{MachineRef, NetworkDriver, NetworkTopology};
 
 use crate::context::Context;
+use crate::machine_defaults::{MachineNetworkSelection, ResolvedMachineNetwork};
 use crate::network_policy::resolve_network_policy_source;
-use crate::profile::{MachineNetworkSelection, ResolvedMachineNetwork};
 use crate::ui::{self, OutputFormat, Table};
 
 const EXAMPLES: &[&str] = &[
@@ -89,7 +89,7 @@ struct SetCmd {
     vm: String,
 
     /// Network to use. Allowed: private, none, name:NETWORK, or NETWORK.
-    #[arg(value_name = "NETWORK", value_parser = parse_machine_network_config)]
+    #[arg(value_name = "NETWORK", value_parser = MachineNetworkSelection::parse)]
     network: MachineNetworkSelection,
 
     /// Network policy to apply to private networks.
@@ -226,10 +226,6 @@ fn machine_network_with_policy(
     }
 }
 
-fn parse_machine_network_config(input: &str) -> Result<MachineNetworkSelection, String> {
-    MachineNetworkSelection::parse(input)
-}
-
 fn parse_network_topology(input: &str) -> Result<NetworkTopology, String> {
     match input {
         "nat" => Ok(NetworkTopology::Nat),
@@ -274,7 +270,7 @@ mod tests {
 
     use crate::app::Cli;
     use crate::commands::Command;
-    use crate::profile::{MachineNetworkSelection, ResolvedMachineNetwork};
+    use crate::machine_defaults::{MachineNetworkSelection, ResolvedMachineNetwork};
     use clap::Parser;
 
     use super::{machine_network_with_policy, NetworkSubcommand};

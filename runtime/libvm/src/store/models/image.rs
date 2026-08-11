@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::image::ImageSourceKind;
+use crate::image::{ImageSourceKind, OciImageConfigMetadata};
 
 use super::MachineId;
 
@@ -21,7 +21,8 @@ pub(crate) struct ImageManifestRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageRefRecord {
-    pub reference: String,
+    pub requested_reference: String,
+    pub selected_reference: String,
     pub manifest_digest: String,
     pub image_id: String,
     pub platform_os: String,
@@ -36,13 +37,8 @@ pub(crate) struct ImageRefRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageConfigRecord {
     pub manifest_digest: String,
-    pub digest: Option<String>,
-    pub env_json: String,
-    pub cmd_json: String,
-    pub entrypoint_json: String,
-    pub working_dir: Option<String>,
-    pub user: Option<String>,
-    pub labels_json: String,
+    pub digest: String,
+    pub metadata: OciImageConfigMetadata,
     pub created_at: i64,
 }
 
@@ -67,9 +63,8 @@ pub(crate) struct ImageManifestLayerRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageRootfsArtifactRecord {
     pub image_id: String,
-    pub source_kind: ImageSourceKind,
-    pub manifest_digest: Option<String>,
-    pub source_reference: String,
+    pub manifest_digest: String,
+    pub config_digest: String,
     pub platform_os: String,
     pub platform_architecture: String,
     pub platform_variant: Option<String>,
@@ -84,8 +79,10 @@ pub(crate) struct ImageRootfsArtifactRecord {
 pub(crate) struct MachineRootfsRecord {
     pub machine_id: MachineId,
     pub source_kind: ImageSourceKind,
-    pub source_reference: String,
+    pub requested_reference: String,
+    pub selected_reference: Option<String>,
     pub manifest_digest: Option<String>,
+    pub config_digest: Option<String>,
     pub image_id: Option<String>,
     pub root_disk_path: PathBuf,
     pub root_disk_size_bytes: u64,

@@ -1,11 +1,12 @@
-use std::io::Write;
+use std::collections::BTreeMap;
 
 use eyre::Context as _;
 use libvm::{
     ExecutionControl, ExecutionEvent, ExecutionOptionsBuilder, ExecutionResult, ExecutionSession,
-    ExecutionStdin, Machine, SshExitStatus,
+    Machine, ProcessConfig, SshExitStatus,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 pub(crate) async fn attach_shell(
     machine: &Machine,
@@ -26,32 +27,19 @@ pub(crate) async fn attach_shell(
         .map_err(Into::into)
 }
 
-pub(crate) async fn run_legacy_command(
-    machine: &Machine,
-    argv: &[String],
-    tty: bool,
-) -> eyre::Result<SshExitStatus> {
-    machine
-        .run_legacy_ssh_command(argv, tty)
-        .await
-        .map_err(Into::into)
-}
-
 pub(crate) async fn run_command_streaming(
     machine: &Machine,
     user: Option<&str>,
     argv: &[String],
+    working_directory: &str,
+    environment: &BTreeMap<String, String>,
 ) -> eyre::Result<ExecutionResult> {
     let (program, args) = command_argv(argv)?;
     let mut session = machine
         .spawn_with(program, |options| {
-            with_exec_user(options.args(args), user).stdin_pipe()
+            with_exec_options(options.args(args), user, working_directory, environment).stdin_pipe()
         })
         .await?;
-    let stdin = session.stdin();
-    if let Some(stdin) = stdin {
-        tokio::spawn(forward_stdin(stdin));
-    }
     stream_events(&mut session).await
 }
 
@@ -59,57 +47,75 @@ pub(crate) async fn attach_command(
     machine: &Machine,
     user: Option<&str>,
     argv: &[String],
+    working_directory: &str,
+    environment: &BTreeMap<String, String>,
 ) -> eyre::Result<ExecutionResult> {
     let (program, args) = command_argv(argv)?;
     machine
-        .attach_with(program, |options| with_exec_user(options.args(args), user))
+        .attach_with(program, |options| {
+            with_exec_options(options.args(args), user, working_directory, environment)
+        })
         .await
         .map_err(Into::into)
 }
 
-async fn forward_stdin(stdin: ExecutionStdin) {
-    let mut host_stdin = tokio::io::stdin();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        match host_stdin.read(&mut buffer).await {
-            Ok(0) => break,
-            Ok(read) => {
-                if let Err(error) = stdin.write(buffer[..read].to_vec()).await {
-                    let _ = writeln!(std::io::stderr(), "guest stdin warning: {error}");
-                    return;
-                }
-            }
-            Err(error) => {
-                let _ = writeln!(std::io::stderr(), "guest stdin warning: {error}");
-                return;
-            }
-        }
+/// Runs one exact process configuration through the structured guest protocol.
+/// The caller owns machine lifecycle; this function owns only process I/O.
+pub(crate) async fn run_process(
+    machine: &Machine,
+    process: &ProcessConfig,
+    argv: &[String],
+    tty: bool,
+) -> eyre::Result<ExecutionResult> {
+    if tty {
+        return attach_command(
+            machine,
+            process.user.as_deref(),
+            argv,
+            &process.working_directory,
+            &process.environment,
+        )
+        .await;
     }
-    if let Err(error) = stdin.close().await {
-        let _ = writeln!(std::io::stderr(), "guest stdin warning: {error}");
-    }
+    run_command_streaming(
+        machine,
+        process.user.as_deref(),
+        argv,
+        &process.working_directory,
+        &process.environment,
+    )
+    .await
 }
 
 async fn stream_events(session: &mut ExecutionSession) -> eyre::Result<ExecutionResult> {
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
+    let mut host_stdin = tokio::io::stdin();
+    let mut input = [0_u8; 8192];
     let control = session.control();
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("listen for host interrupt")?;
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("listen for host termination")?;
+    let mut stdin: Option<libvm::ExecutionStdin> = None;
+    let mut stdin_closed = false;
+    let mut started = false;
+    let mut launch_cancelled = false;
+    let mut signals = HostSignalForwarders::new()?;
     loop {
         let event = tokio::select! {
             event = session.recv() => event?,
-            signal = interrupt.recv() => {
-                if signal.is_some() {
-                    forward_signal(&control, libc::SIGINT as u32).await?;
+            read = host_stdin.read(&mut input), if started && !launch_cancelled && !stdin_closed => {
+                let read = read.context("read host stdin")?;
+                if read == 0 {
+                    stdin_closed = true;
+                    if let Some(stdin) = stdin.as_ref() {
+                        stdin.close().await.context("close guest stdin")?;
+                    }
+                } else if let Some(stdin) = stdin.as_ref() {
+                    stdin.write(input[..read].to_vec()).await.context("write guest stdin")?;
                 }
                 continue;
             }
-            signal = terminate.recv() => {
-                if signal.is_some() {
-                    forward_signal(&control, libc::SIGTERM as u32).await?;
+            signal = signals.recv() => {
+                if let Some(signal) = signal {
+                    forward_signal(&control, started, &mut launch_cancelled, signal).await?;
                 }
                 continue;
             }
@@ -118,7 +124,12 @@ async fn stream_events(session: &mut ExecutionSession) -> eyre::Result<Execution
             break;
         };
         match event {
-            ExecutionEvent::Accepted | ExecutionEvent::Started => {}
+            ExecutionEvent::Accepted => {}
+            ExecutionEvent::Started if !launch_cancelled => {
+                stdin = control.stdin();
+                started = true;
+            }
+            ExecutionEvent::Started => started = true,
             ExecutionEvent::Stdout(data) => {
                 stdout
                     .write_all(&data)
@@ -149,7 +160,75 @@ async fn stream_events(session: &mut ExecutionSession) -> eyre::Result<Execution
     eyre::bail!("guest command ended without a terminal result")
 }
 
-async fn forward_signal(control: &ExecutionControl, signal: u32) -> eyre::Result<()> {
+struct HostSignalForwarders {
+    receiver: mpsc::Receiver<u32>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl HostSignalForwarders {
+    fn new() -> eyre::Result<Self> {
+        let (sender, receiver) = mpsc::channel(64);
+        let mut tasks = Vec::new();
+        for signal in forwardable_signals() {
+            let Ok(mut listener) = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::from_raw(signal as i32),
+            ) else {
+                continue;
+            };
+            let sender = sender.clone();
+            tasks.push(tokio::spawn(async move {
+                while listener.recv().await.is_some() {
+                    if sender.send(signal).await.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(sender);
+        if tasks.is_empty() {
+            eyre::bail!("listen for host signals");
+        }
+        Ok(Self { receiver, tasks })
+    }
+
+    async fn recv(&mut self) -> Option<u32> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for HostSignalForwarders {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+fn forwardable_signals() -> impl Iterator<Item = u32> {
+    (1..=64).filter(|signal| {
+        !matches!(
+            *signal as i32,
+            libc::SIGKILL | libc::SIGSTOP | libc::SIGCHLD | libc::SIGWINCH
+        )
+    })
+}
+
+async fn forward_signal(
+    control: &ExecutionControl,
+    started: bool,
+    launch_cancelled: &mut bool,
+    signal: u32,
+) -> eyre::Result<()> {
+    if !started {
+        if !*launch_cancelled {
+            control.close_requests();
+            *launch_cancelled = true;
+        }
+        return Ok(());
+    }
+    if *launch_cancelled {
+        return Ok(());
+    }
     control
         .signal(signal)
         .await
@@ -163,7 +242,17 @@ fn command_argv(argv: &[String]) -> eyre::Result<(String, Vec<String>)> {
     Ok((program.clone(), args.to_vec()))
 }
 
-fn with_exec_user(builder: ExecutionOptionsBuilder, user: Option<&str>) -> ExecutionOptionsBuilder {
+fn with_exec_options(
+    builder: ExecutionOptionsBuilder,
+    user: Option<&str>,
+    working_directory: &str,
+    environment: &BTreeMap<String, String>,
+) -> ExecutionOptionsBuilder {
+    let builder = builder.cwd(working_directory).envs(
+        environment
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
     match user {
         Some(user) => builder.user(user),
         None => builder,
@@ -172,7 +261,7 @@ fn with_exec_user(builder: ExecutionOptionsBuilder, user: Option<&str>) -> Execu
 
 #[cfg(test)]
 mod tests {
-    use crate::guest::command_argv;
+    use crate::guest::{command_argv, forwardable_signals};
 
     #[test]
     fn command_argv_preserves_the_exact_argv_vector() {
@@ -185,5 +274,16 @@ mod tests {
     #[test]
     fn command_argv_rejects_empty_command() {
         assert!(command_argv(&[]).is_err());
+    }
+
+    #[test]
+    fn pipe_signal_forwarding_excludes_unforwardable_signals() {
+        let signals = forwardable_signals().collect::<Vec<_>>();
+
+        for signal in [libc::SIGKILL, libc::SIGSTOP, libc::SIGCHLD, libc::SIGWINCH] {
+            assert!(!signals.contains(&(signal as u32)));
+        }
+        assert!(signals.contains(&(libc::SIGINT as u32)));
+        assert!(signals.contains(&(libc::SIGTERM as u32)));
     }
 }

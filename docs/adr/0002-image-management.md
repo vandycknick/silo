@@ -103,7 +103,7 @@ backend-neutral instead of depending on host-specific ISO tooling.
 
 ### Instance creation from images
 
-`silo create <ref> <name>` resolves a local image or pulls it on demand, then:
+`silo create [OPTIONS] [IMAGE]` resolves a local image or pulls it on demand, then:
 
 - applies image metadata defaults for CPU, memory, and bootstrap support unless CLI
   overrides them

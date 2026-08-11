@@ -72,7 +72,7 @@ The policy lifecycle has four distinct artifacts.
 1. An authored input is what a user or tool writes.
 2. A `NetworkPolicy` is the typed policy value.
 3. A normalized policy is the durable machine network configuration.
-4. Network launch material is the per-start secret and hook configuration.
+4. Egress credentials are the per-start secret and hook configuration.
 
 First, an authored input is turned into a typed `NetworkPolicy`. That can happen through Rust builders, canonical JSON loading, CLI operations, tests, or any future frontend.
 
@@ -80,7 +80,7 @@ Second, the policy is validated and normalized. Defaults become explicit. Unknow
 
 Third, the normalized policy is persisted as part of durable machine network configuration. Persisting the normalized value avoids changes in future frontend defaults from changing stop/start behavior.
 
-Fourth, start options supply launch-time material only. They do not alter the durable policy. If a policy requires secret material, the caller starting the machine supplies the required network secret slots for that launch.
+Fourth, start options supply launch-time egress credentials only. They do not alter the durable policy. If a policy requires secret material, the caller starting the machine supplies the required network secret slots for that launch.
 
 Finally, `libvm` writes the normalized policy to a runtime JSON file and starts the selected networking component with:
 
@@ -148,36 +148,37 @@ let policy = NetworkPolicy::from_json_str(source)?;
 let policy = NetworkPolicy::from_json_slice(bytes)?;
 ```
 
-Start uses one closure shape. Launch material can be supplied inline:
+Start uses one closure shape. Egress credentials can be supplied inline:
 
 ```rust
 machine
     .start_with(|s| {
-        s.network(|n| {
-            n.secret("codex.oauth.access_token", access_token)
+        s.credentials(
+            EgressCredentials::new()
+                .secret("codex.oauth.access_token", access_token)
                 .secret("codex.oauth.expires_at", expires_at)
                 .oauth_refresh_hook(refresh_hook)
-        })
+        )
     })
     .await?;
 ```
 
-The same launch material can be prepared separately and applied through the same builder:
+The same egress credentials can be prepared separately and supplied to the start options:
 
 ```rust
-let network_launch = NetworkLaunch::new()
+let credentials = EgressCredentials::new()
     .secret("codex.oauth.access_token", access_token)
     .secret("codex.oauth.expires_at", expires_at)
     .oauth_refresh_hook(refresh_hook);
 
 machine
     .start_with(|s| {
-        s.network(|n| n.apply(network_launch))
+        s.credentials(credentials)
     })
     .await?;
 ```
 
-`NetworkStartBuilder` supports `.secret(...)`, `.secret_bytes(...)`, `.oauth_refresh_hook(...)`, and `.apply(NetworkLaunch)`.
+`EgressCredentials` supports `.secret(...)`, `.secret_bytes(...)`, and `.oauth_refresh_hook(...)`.
 
 Policy changes use durable update helpers. They do not require callers to rebuild the entire network attachment just to change policy:
 
@@ -691,7 +692,7 @@ A hash is useful only when the hashing input is clear. Different authoring front
 
 ### No Secret References In Policy
 
-Putting secret reference names in policy would make the policy a partial secret-resolution document. That would couple networking components to the caller's secret store. Instead, credentials imply required slots by credential kind and name, and launch material supplies values for those slots.
+Putting secret reference names in policy would make the policy a partial secret-resolution document. That would couple networking components to the caller's secret store. Instead, credentials imply required slots by credential kind and name, and egress credentials supply values for those slots.
 
 ### No Partial Policy Patches
 

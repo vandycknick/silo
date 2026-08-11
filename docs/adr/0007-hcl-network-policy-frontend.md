@@ -107,15 +107,16 @@ let machine = runtime
     .await?;
 ```
 
-Secrets are not part of the HCL document. They are supplied as launch-time network material:
+Secrets are not part of the HCL document. They are supplied as launch-time egress credentials:
 
 ```rust
 machine
     .start_with(|s| {
-        s.network(|n| {
-            n.secret("codex.oauth.access_token", access_token)
+        s.credentials(
+            EgressCredentials::new()
+                .secret("codex.oauth.access_token", access_token)
                 .secret("codex.oauth.expires_at", expires_at)
-        })
+        )
     })
     .await?;
 ```

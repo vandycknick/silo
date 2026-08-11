@@ -417,6 +417,11 @@ async fn run_execution(
                     }
                     }
                 },
+                Ok(None) if !guest_state.started => {
+                    cancel_guest(&mut disconnect_term, &mut disconnect_kill, &mut guest_events).await;
+                    let _ = events.send(Ok(cancelled_before_start_event())).await;
+                    return;
+                }
                 Ok(None) => input_open = false,
                 Err(_) => {
                     cancel_guest(&mut disconnect_term, &mut disconnect_kill, &mut guest_events).await;
@@ -424,6 +429,15 @@ async fn run_execution(
                 }
             }
         }
+    }
+}
+
+fn cancelled_before_start_event() -> ExecutionEvent {
+    ExecutionEvent {
+        event: Some(ExecutionEventKind::LaunchFailed(ExecutionLaunchFailed {
+            reason: Some(protocol::v1::LaunchFailureReason::CancelledBeforeStart as i32),
+            message: Some("execution request closed before process start".to_string()),
+        })),
     }
 }
 
@@ -597,7 +611,7 @@ pub(super) fn translate_event(
             )
         }
         Some(GuestEventKind::Stdout(_)) if !state.started => {
-            return Err("guest process emitted stdout before Started")
+            return Err("guest process emitted stdout before Started");
         }
         Some(GuestEventKind::Stdout(_)) => return Err("guest process stdout exceeds 64 KiB"),
         Some(GuestEventKind::Stderr(stderr))
@@ -609,7 +623,7 @@ pub(super) fn translate_event(
             )
         }
         Some(GuestEventKind::Stderr(_)) if !state.started => {
-            return Err("guest process emitted stderr before Started")
+            return Err("guest process emitted stderr before Started");
         }
         Some(GuestEventKind::Stderr(_)) => return Err("guest process stderr exceeds 64 KiB"),
         Some(GuestEventKind::TerminalOutput(output))
@@ -621,10 +635,10 @@ pub(super) fn translate_event(
             )
         }
         Some(GuestEventKind::TerminalOutput(_)) if !state.started => {
-            return Err("guest process emitted terminal output before Started")
+            return Err("guest process emitted terminal output before Started");
         }
         Some(GuestEventKind::TerminalOutput(_)) => {
-            return Err("guest process terminal output exceeds 64 KiB")
+            return Err("guest process terminal output exceeds 64 KiB");
         }
         Some(GuestEventKind::Exited(exited)) if state.started => (
             ExecutionEventKind::Exited(ExecutionExited { code: exited.code }),
@@ -645,7 +659,7 @@ pub(super) fn translate_event(
             )
         }
         Some(GuestEventKind::Signaled(_)) if !state.started => {
-            return Err("guest process was signaled before Started")
+            return Err("guest process was signaled before Started");
         }
         Some(GuestEventKind::Signaled(_)) => return Err("guest process emitted an invalid signal"),
         Some(GuestEventKind::LaunchFailed(failure)) if !state.started => (
@@ -656,7 +670,7 @@ pub(super) fn translate_event(
             true,
         ),
         Some(GuestEventKind::LaunchFailed(_)) => {
-            return Err("guest process emitted LaunchFailed after Started")
+            return Err("guest process emitted LaunchFailed after Started");
         }
         None => return Err("guest process event is missing its message"),
     };
@@ -874,8 +888,9 @@ mod tests {
     };
 
     use crate::execution::{
-        guest_control, identity_loss, translate_event, validate_identity_tuple,
-        validate_process_spec, ActiveExecutions, GuestEventState, HostEventStream,
+        cancelled_before_start_event, guest_control, identity_loss, translate_event,
+        validate_identity_tuple, validate_process_spec, ActiveExecutions, GuestEventState,
+        HostEventStream,
     };
     use crate::state::ReadyAgentIdentity;
 
@@ -999,6 +1014,17 @@ mod tests {
             &mut state,
         )
         .is_err());
+    }
+
+    #[test]
+    fn closing_a_pending_execution_reports_cancelled_before_start() {
+        let event = cancelled_before_start_event();
+
+        assert!(matches!(
+            event.event,
+            Some(ExecutionEventKind::LaunchFailed(failure))
+                if failure.reason == Some(protocol::v1::LaunchFailureReason::CancelledBeforeStart as i32)
+        ));
     }
 
     #[test]

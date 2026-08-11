@@ -8,9 +8,53 @@ use protocol::v1::{
 };
 use vm_spec::VmSpec;
 
-use crate::machine::MachineGuestConfig;
+use crate::machine::{MachineAgent, MachineGuestConfig, MachineRetention, ProcessConfig};
 use crate::network::MachineNetworkConfig;
-use crate::store::models::{MachineConfig, MachineRuntimeState};
+use crate::store::models::{MachineConfig, MachineRootfsRecord, MachineRuntimeState, MachineState};
+use crate::ImageSourceKind;
+
+/// Durable pin for the root disk cloned into a machine directory.
+///
+/// OCI fields are absent for caller-owned local disks. The launch-time
+/// `Entrypoint` API is intentionally separate from this image metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MachineRootfs {
+    /// Source category used when the root disk was created.
+    pub source_kind: ImageSourceKind,
+    /// OCI reference or disk path requested by the caller.
+    pub requested_reference: String,
+    /// Digest-pinned OCI reference selected for the host platform.
+    pub selected_reference: Option<String>,
+    /// Selected OCI manifest digest.
+    pub selected_manifest_digest: Option<String>,
+    /// OCI configuration digest.
+    pub config_digest: Option<String>,
+    /// Materialized rootfs image ID.
+    pub image_id: Option<String>,
+    /// Machine-local root disk path.
+    pub root_disk_path: PathBuf,
+    /// Size of the machine-local root disk in bytes.
+    pub root_disk_size_bytes: u64,
+    /// Unix timestamp for when this pin was created.
+    pub created_at: i64,
+}
+
+impl From<MachineRootfsRecord> for MachineRootfs {
+    fn from(value: MachineRootfsRecord) -> Self {
+        Self {
+            source_kind: value.source_kind,
+            requested_reference: value.requested_reference,
+            selected_reference: value.selected_reference,
+            selected_manifest_digest: value.manifest_digest,
+            config_digest: value.config_digest,
+            image_id: value.image_id,
+            root_disk_path: value.root_disk_path,
+            root_disk_size_bytes: value.root_disk_size_bytes,
+            created_at: value.created_at,
+        }
+    }
+}
 
 /// Public machine snapshot returned by inspect and mutation operations.
 ///
@@ -30,6 +74,14 @@ pub struct MachineData {
     pub name: String,
     /// VM specification used to start the machine.
     pub spec: VmSpec,
+    /// Retention policy recorded for this machine.
+    pub retention: MachineRetention,
+    /// Durable desired process settings. This is not applied by this stage.
+    pub process: ProcessConfig,
+    /// Selected machine template, when creation used one.
+    pub template_name: Option<String>,
+    /// Explicit agent mode selection, when set independently of guest settings.
+    pub agent_mode: Option<MachineAgent>,
     /// Directory containing this machine's persistent runtime files.
     pub machine_dir: PathBuf,
     /// Unix timestamp for when the machine was created.
@@ -38,6 +90,8 @@ pub struct MachineData {
     pub modified_at: i64,
     /// Image reference used to create the machine.
     pub image_ref: String,
+    /// Durable rootfs identity and machine-local disk pin, when available.
+    pub rootfs: Option<MachineRootfs>,
     /// Requested root disk size in bytes, when explicitly configured.
     pub root_disk_size: Option<u64>,
     /// User-defined labels attached to the machine.
@@ -71,21 +125,25 @@ pub struct MachineData {
 impl MachineData {
     pub(crate) fn from_models_with_status(
         config: MachineConfig,
+        rootfs: Option<MachineRootfsRecord>,
         status: MachineStatus,
         boot_report: Option<MachineBootReport>,
         provision_report: Option<MachineProvisionReport>,
-        started_at: Option<i64>,
-        last_error: Option<String>,
-        updated_at: i64,
+        state: MachineState,
     ) -> Self {
         Self {
             id: config.id.to_string(),
             name: config.name,
             spec: config.spec,
+            retention: config.retention,
+            process: config.process,
+            template_name: config.template_name,
+            agent_mode: config.agent_mode,
             machine_dir: config.machine_dir,
             created_at: config.created_at,
             modified_at: config.modified_at,
             image_ref: config.image_ref,
+            rootfs: rootfs.map(Into::into),
             root_disk_size: config.root_disk_size,
             labels: config.labels,
             metadata: config.metadata,
@@ -94,9 +152,9 @@ impl MachineData {
             status,
             boot_report,
             provision_report,
-            started_at,
-            last_error,
-            updated_at,
+            started_at: state.started_at,
+            last_error: state.last_error,
+            updated_at: state.updated_at,
         }
     }
 

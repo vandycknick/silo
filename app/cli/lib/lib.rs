@@ -1,13 +1,15 @@
 pub mod app;
 pub mod commands;
 pub mod config;
-pub mod constants;
 pub mod context;
+pub mod environment;
 pub mod errors;
 pub mod guest;
 pub mod help;
+pub mod machine_defaults;
 mod network_policy;
-pub mod profile;
+pub mod planning;
+pub mod template;
 pub mod terminal;
 pub mod ui;
 pub mod view;
@@ -24,7 +26,10 @@ pub async fn run() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             errors::print(&error, verbose);
-            ExitCode::FAILURE
+            errors::execution_exit_code(&error)
+                .and_then(|code| u8::try_from(code).ok())
+                .map(ExitCode::from)
+                .unwrap_or(ExitCode::FAILURE)
         }
     }
 }

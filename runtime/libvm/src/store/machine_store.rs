@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use sqlx::Row;
 
 use crate::store::models::MachineId;
 use crate::store::models::{MachineConfig, MachineRootfsRecord, MachineState};
@@ -64,6 +65,22 @@ impl MachineStore for Store {
         .fetch_optional(&self.pool)
         .await?;
         Ok(state.map(|DbMachineState(state)| state))
+    }
+
+    async fn machine_rootfs(
+        &self,
+        machine_id: MachineId,
+    ) -> Result<Option<MachineRootfsRecord>, LibVmError> {
+        let row = sqlx::query(
+            "SELECT machine_id, source_kind, requested_reference, selected_reference,
+                    manifest_digest, config_digest, image_id, root_disk_path,
+                    root_disk_size_bytes, created_at
+             FROM machine_rootfs WHERE machine_id = ?1",
+        )
+        .bind(machine_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(machine_rootfs_from_row).transpose()
     }
 
     async fn save_machine_state(&self, state: &MachineState) -> Result<(), LibVmError> {
@@ -206,14 +223,17 @@ impl Store {
     ) -> Result<(), LibVmError> {
         sqlx::query(
             "INSERT INTO machine_rootfs
-                (machine_id, source_kind, source_reference, manifest_digest, image_id,
-                 root_disk_path, root_disk_size_bytes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (machine_id, source_kind, requested_reference, selected_reference,
+                 manifest_digest, config_digest, image_id, root_disk_path,
+                 root_disk_size_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )
         .bind(rootfs.machine_id.to_string())
         .bind(rootfs.source_kind.as_str())
-        .bind(&rootfs.source_reference)
+        .bind(&rootfs.requested_reference)
+        .bind(&rootfs.selected_reference)
         .bind(&rootfs.manifest_digest)
+        .bind(&rootfs.config_digest)
         .bind(&rootfs.image_id)
         .bind(rootfs.root_disk_path.to_string_lossy().as_ref())
         .bind(Self::i64_from_u64(
@@ -286,4 +306,44 @@ impl Store {
             message: format!("value {value} does not fit in i64"),
         })
     }
+}
+
+fn machine_rootfs_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<MachineRootfsRecord, LibVmError> {
+    let source_kind: String = row.try_get("source_kind")?;
+    let source_kind = match source_kind.as_str() {
+        "oci" => crate::ImageSourceKind::Oci,
+        "disk" => crate::ImageSourceKind::Disk,
+        _ => {
+            return Err(LibVmError::StateDecode {
+                field: "machine_rootfs.source_kind",
+                message: format!("unknown image source kind {source_kind:?}"),
+            });
+        }
+    };
+    let root_disk_size_bytes = row.try_get::<i64, _>("root_disk_size_bytes")?;
+    Ok(MachineRootfsRecord {
+        machine_id: row
+            .try_get::<String, _>("machine_id")?
+            .parse::<MachineId>()
+            .map_err(|error| LibVmError::StateDecode {
+                field: "machine_rootfs.machine_id",
+                message: error.to_string(),
+            })?,
+        source_kind,
+        requested_reference: row.try_get("requested_reference")?,
+        selected_reference: row.try_get("selected_reference")?,
+        manifest_digest: row.try_get("manifest_digest")?,
+        config_digest: row.try_get("config_digest")?,
+        image_id: row.try_get("image_id")?,
+        root_disk_path: row.try_get::<String, _>("root_disk_path")?.into(),
+        root_disk_size_bytes: u64::try_from(root_disk_size_bytes).map_err(|_| {
+            LibVmError::StateDecode {
+                field: "machine_rootfs.root_disk_size_bytes",
+                message: format!("value {root_disk_size_bytes} is negative"),
+            }
+        })?,
+        created_at: row.try_get("created_at")?,
+    })
 }

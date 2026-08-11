@@ -1,9 +1,45 @@
+use std::fmt;
 use std::time::{Duration, SystemTime};
 
 use crate::machine::MachineData;
 
 /// Default time libvm waits for vmmon to exit after a lifecycle action.
 pub const DEFAULT_MACHINE_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Opaque identifier for one acknowledged machine run.
+///
+/// A run ID is issued by [`Machine::start`](crate::Machine::start) and can be
+/// supplied to generation-checked lifecycle methods. It is distinct from a
+/// machine ID and cannot be constructed from arbitrary caller input.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MachineRunId(String);
+
+impl MachineRunId {
+    pub(crate) fn from_raw(value: String) -> Self {
+        Self(value)
+    }
+
+    /// Returns the stable textual representation sent to vmmon for this run.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for MachineRunId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Result of an acknowledged machine start.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct MachineStart {
+    /// Machine snapshot after vmmon acknowledged this start.
+    pub machine: MachineData,
+    /// Exact generation created by this start.
+    pub run_id: MachineRunId,
+}
 
 /// Options for waiting on a machine run to exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +125,7 @@ pub struct MachineExit {
     /// Machine snapshot after libvm reconciled the exited run.
     pub machine: MachineData,
     /// Run ID for the exited vmmon generation, when one was known.
-    pub run_id: Option<String>,
+    pub run_id: Option<MachineRunId>,
     /// Time vmmon reported for the exit, when available.
     pub exited_at: Option<SystemTime>,
     /// High-level exit outcome.

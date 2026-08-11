@@ -114,8 +114,10 @@ impl Entrypoint {
         K: Into<String>,
         V: Into<String>,
     {
-        self.env
-            .extend(vars.into_iter().map(|(key, value)| (key.into(), value.into())));
+        self.env.extend(
+            vars.into_iter()
+                .map(|(key, value)| (key.into(), value.into())),
+        );
         self
     }
 

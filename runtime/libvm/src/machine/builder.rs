@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 
 use vm_spec::{Boot, Disk, Guest, GuestOs, Hardware, Kernel, Mount, Storage, VmSpec};
 
-use crate::image::{ImageBuilder, ImageSource, MaterializedImage};
+use crate::image::{ImageBuilder, ImageSource, MaterializedImage, ResolvedOciImage};
 use crate::lock_manager::ManagedLock;
 use crate::machine::root_disk::{clone_or_copy_root_disk, resize_raw_disk};
 use crate::machine::{
-    generate_machine_name, validate_machine_name, GuestBuilder, Machine, MachineGuestConfig, Memory,
+    generate_machine_name, validate_machine_name, GuestBuilder, Machine, MachineAgent,
+    MachineGuestConfig, MachineRetention, Memory, ProcessConfig,
 };
 use crate::network::{MachineNetworkBuilder, MachineNetworkConfig};
 use crate::paths::{root_disk_relative_path, OwnedDirectory};
@@ -28,6 +29,7 @@ const GENERATED_NAME_ATTEMPTS: u32 = 3;
 #[derive(Debug, Clone)]
 struct MachineCreateRequest {
     image_source: Option<ImageSource>,
+    resolved_oci_image: Option<ResolvedOciImage>,
     name: Option<String>,
     labels: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
@@ -45,6 +47,10 @@ struct MachineCreateRequest {
     network: Option<MachineNetworkConfig>,
     network_error: Option<String>,
     guest: MachineGuestConfig,
+    retention: MachineRetention,
+    process: ProcessConfig,
+    template_name: Option<String>,
+    agent_mode: Option<MachineAgent>,
 }
 
 struct MachineCreatePlan {
@@ -54,6 +60,10 @@ struct MachineCreatePlan {
     metadata: BTreeMap<String, String>,
     network: ModelMachineNetworkConfig,
     guest: MachineGuestConfig,
+    retention: MachineRetention,
+    process: ProcessConfig,
+    template_name: Option<String>,
+    agent_mode: Option<MachineAgent>,
 }
 
 struct MachineCreateGuard {
@@ -66,6 +76,10 @@ struct MachineCreateGuard {
     metadata: BTreeMap<String, String>,
     network: ModelMachineNetworkConfig,
     guest: MachineGuestConfig,
+    retention: MachineRetention,
+    process: ProcessConfig,
+    template_name: Option<String>,
+    agent_mode: Option<MachineAgent>,
     machine_parent: Option<OwnedDirectory>,
     committed: bool,
 }
@@ -111,6 +125,7 @@ impl MachineBuilder {
             runtime,
             request: MachineCreateRequest {
                 image_source: None,
+                resolved_oci_image: None,
                 name: None,
                 labels: BTreeMap::new(),
                 metadata: BTreeMap::new(),
@@ -128,6 +143,10 @@ impl MachineBuilder {
                 network: None,
                 network_error: None,
                 guest: MachineGuestConfig::default(),
+                retention: MachineRetention::Persistent,
+                process: ProcessConfig::default(),
+                template_name: None,
+                agent_mode: None,
             },
         }
     }
@@ -135,21 +154,34 @@ impl MachineBuilder {
     /// Selects an OCI image reference for this machine.
     ///
     /// The string is always interpreted as OCI. Use `image_source` or
-    /// `image_with` for local disk and tar sources.
+    /// `image_with` for local disk sources.
     pub fn image(mut self, reference: impl Into<String>) -> Self {
         self.request.image_source = Some(ImageSource::oci(reference));
+        self.request.resolved_oci_image = None;
         self
     }
 
     /// Selects an explicit image source.
     pub fn image_source(mut self, source: ImageSource) -> Self {
         self.request.image_source = Some(source);
+        self.request.resolved_oci_image = None;
         self
     }
 
     /// Selects an image source using a dedicated image builder.
     pub fn image_with(mut self, configure: impl FnOnce(ImageBuilder) -> ImageBuilder) -> Self {
         self.request.image_source = configure(ImageBuilder::new()).finish();
+        self.request.resolved_oci_image = None;
+        self
+    }
+
+    /// Uses an immutable OCI selection returned by `Runtime::images().resolve`.
+    ///
+    /// Creation materializes this exact selection and never resolves the original
+    /// mutable reference again.
+    pub fn resolved_image(mut self, image: ResolvedOciImage) -> Self {
+        self.request.image_source = Some(ImageSource::oci(image.requested_reference.clone()));
+        self.request.resolved_oci_image = Some(image);
         self
     }
 
@@ -216,6 +248,60 @@ impl MachineBuilder {
     /// Configures durable guest behavior outside the VMM specification.
     pub fn guest(mut self, configure: impl FnOnce(GuestBuilder) -> GuestBuilder) -> Self {
         self.request.guest = configure(GuestBuilder::new()).build();
+        self
+    }
+
+    /// Sets the machine retention policy.
+    pub fn retention(mut self, retention: MachineRetention) -> Self {
+        self.request.retention = retention;
+        self
+    }
+
+    /// Replaces durable process settings.
+    pub fn process(mut self, process: ProcessConfig) -> Self {
+        self.request.process = process;
+        self
+    }
+
+    /// Sets the durable OCI entrypoint, preserving unset and empty values distinctly.
+    pub fn entrypoint(mut self, entrypoint: Option<Vec<String>>) -> Self {
+        self.request.process.entrypoint = entrypoint;
+        self
+    }
+
+    /// Sets the durable OCI command, preserving unset and empty values distinctly.
+    pub fn command(mut self, command: Option<Vec<String>>) -> Self {
+        self.request.process.command = command;
+        self
+    }
+
+    /// Replaces the deterministic process environment.
+    pub fn environment(mut self, environment: BTreeMap<String, String>) -> Self {
+        self.request.process.environment = environment;
+        self
+    }
+
+    /// Sets the durable process working directory.
+    pub fn working_directory(mut self, working_directory: impl Into<String>) -> Self {
+        self.request.process.working_directory = working_directory.into();
+        self
+    }
+
+    /// Sets the durable optional OCI-style process user selector.
+    pub fn process_user(mut self, user: Option<String>) -> Self {
+        self.request.process.user = user;
+        self
+    }
+
+    /// Records the selected machine template.
+    pub fn template_name(mut self, template_name: Option<String>) -> Self {
+        self.request.template_name = template_name;
+        self
+    }
+
+    /// Records an explicit agent mode independently of current guest launch behavior.
+    pub fn agent_mode(mut self, agent_mode: Option<MachineAgent>) -> Self {
+        self.request.agent_mode = agent_mode;
         self
     }
 
@@ -314,6 +400,12 @@ async fn create_machine_config_with_name(
             reason: "root disk size must be greater than 0".to_string(),
         });
     }
+    if matches!(request.cpus, Some(0)) {
+        return Err(LibVmError::InvalidCreateRequest {
+            name,
+            reason: "cpus must be greater than 0".to_string(),
+        });
+    }
     let Some(image_source) = request.image_source.clone() else {
         return Err(LibVmError::InvalidCreateRequest {
             name,
@@ -402,11 +494,18 @@ async fn create_machine_config_with_name(
             metadata: request.metadata,
             network,
             guest: request.guest,
+            retention: request.retention,
+            process: request.process,
+            template_name: request.template_name,
+            agent_mode: request.agent_mode,
         },
     )
     .await?;
 
-    let materialized = runtime.materialize_image(&image_source).await?;
+    let materialized = match request.resolved_oci_image.as_ref() {
+        Some(image) => runtime.materialize_resolved_oci_image(image).await?,
+        None => runtime.materialize_image(&image_source).await?,
+    };
     let root_disk_size = request.disk_size_bytes.unwrap_or(materialized.size_bytes);
     if root_disk_size == 0 {
         return Err(LibVmError::InvalidCreateRequest {
@@ -426,7 +525,7 @@ async fn create_machine_config_with_name(
         .commit(
             runtime,
             rootfs,
-            materialized.image_ref,
+            materialized.requested_reference,
             Some(root_disk_size),
         )
         .await
@@ -443,6 +542,10 @@ async fn create_machine_guard(
         metadata,
         network,
         guest,
+        retention,
+        process,
+        template_name,
+        agent_mode,
     } = plan;
 
     validate_machine_name(&name)?;
@@ -468,6 +571,10 @@ async fn create_machine_guard(
         metadata,
         network,
         guest,
+        retention,
+        process,
+        template_name,
+        agent_mode,
         machine_parent: None,
         committed: false,
     };
@@ -526,8 +633,10 @@ fn machine_rootfs_record(
     MachineRootfsRecord {
         machine_id: create.id,
         source_kind: image.source_kind,
-        source_reference: image.source_reference.clone(),
+        requested_reference: image.requested_reference.clone(),
+        selected_reference: image.selected_reference.clone(),
         manifest_digest: image.manifest_digest.clone(),
+        config_digest: image.config_digest.clone(),
         image_id: image.image_id.clone(),
         root_disk_path,
         root_disk_size_bytes,
@@ -573,6 +682,10 @@ impl MachineCreateGuard {
                 .id(),
             name: self.name.clone(),
             spec: self.spec.clone(),
+            retention: self.retention,
+            process: self.process.clone(),
+            template_name: self.template_name.clone(),
+            agent_mode: self.agent_mode.clone(),
             machine_dir: self.machine_dir.clone(),
             created_at: now,
             modified_at: now,
@@ -604,6 +717,7 @@ impl Drop for MachineCreateGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -617,8 +731,10 @@ mod tests {
     use crate::paths::{root_disk_relative_path, LocalPaths};
     use crate::runtime::Runtime;
     use crate::store::models::{MachineId, MachineNetworkConfig, MachineRootfsRecord};
-    use crate::store::MockDataStore;
-    use crate::{ImageSource, LibVmError, Memory, RuntimeNetworkingConfig};
+    use crate::store::{MachineStore, MockDataStore, Store};
+    use crate::{
+        ImageSource, LibVmError, MachineRetention, Memory, ProcessConfig, RuntimeNetworkingConfig,
+    };
 
     fn sample_vm_spec() -> VmSpec {
         VmSpec {
@@ -675,6 +791,20 @@ mod tests {
         .expect("create runtime with mock store")
     }
 
+    async fn runtime_with_sqlite_store(paths: LocalPaths) -> (Runtime, Arc<Store>) {
+        let store = Arc::new(Store::new(&paths).await.expect("open sqlite store"));
+        let components = crate::runtime::components::test_components(paths.data_dir());
+        let runtime = Runtime::from_store(
+            paths,
+            store.clone(),
+            RuntimeNetworkingConfig::default(),
+            components,
+        )
+        .await
+        .expect("create runtime with sqlite store");
+        (runtime, store)
+    }
+
     async fn create_guard_sample(
         runtime: &Runtime,
         name: &str,
@@ -688,6 +818,10 @@ mod tests {
                 metadata: std::collections::BTreeMap::new(),
                 network: crate::store::models::MachineNetworkConfig::default(),
                 guest: crate::machine::MachineGuestConfig::default(),
+                retention: MachineRetention::Persistent,
+                process: ProcessConfig::default(),
+                template_name: None,
+                agent_mode: None,
             },
         )
         .await
@@ -706,6 +840,7 @@ mod tests {
 
         MachineCreateRequest {
             image_source: Some(ImageSource::disk(base_rootfs_path)),
+            resolved_oci_image: None,
             name: Some(name.to_string()),
             labels: std::collections::BTreeMap::new(),
             metadata: std::collections::BTreeMap::new(),
@@ -723,6 +858,10 @@ mod tests {
             network: None,
             network_error: None,
             guest: crate::machine::MachineGuestConfig::default(),
+            retention: MachineRetention::Persistent,
+            process: ProcessConfig::default(),
+            template_name: None,
+            agent_mode: None,
         }
     }
 
@@ -730,8 +869,10 @@ mod tests {
         MachineRootfsRecord {
             machine_id: create.id,
             source_kind: crate::ImageSourceKind::Disk,
-            source_reference: "/tmp/rootfs.img".to_string(),
+            requested_reference: "/tmp/rootfs.img".to_string(),
+            selected_reference: None,
             manifest_digest: None,
+            config_digest: None,
             image_id: None,
             root_disk_path: create.dir().join(root_disk_relative_path()),
             root_disk_size_bytes: 4,
@@ -793,6 +934,53 @@ mod tests {
         assert!(spec_kernel(&machine.spec).path.is_none());
         assert!(spec_kernel(&machine.spec).initramfs.is_none());
         assert_eq!(machine.root_disk_size, Some(4));
+    }
+
+    #[tokio::test]
+    async fn builder_persists_process_and_retention_across_sqlite_reopen() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let (runtime, store) = runtime_with_sqlite_store(paths.clone()).await;
+        let rootfs = write_base_rootfs(temp.path());
+        let mut environment = BTreeMap::new();
+        environment.insert("ZED".to_string(), "last".to_string());
+        environment.insert("ALPHA".to_string(), "first".to_string());
+        let process = ProcessConfig {
+            entrypoint: Some(Vec::new()),
+            command: Some(vec!["/bin/echo".to_string(), "hello".to_string()]),
+            environment,
+            working_directory: "/workspace".to_string(),
+            user: Some("1000:1000".to_string()),
+        };
+
+        let machine = runtime
+            .machine()
+            .image_source(ImageSource::disk(rootfs))
+            .name("durable-state")
+            .retention(MachineRetention::Ephemeral)
+            .process(process.clone())
+            .template_name(Some("rust-worker".to_string()))
+            .agent_mode(Some(crate::MachineAgent::Disabled))
+            .create()
+            .await
+            .expect("create machine");
+        let id = machine.machine_id();
+        drop(machine);
+        drop(runtime);
+        drop(store);
+
+        let reopened = Store::open(paths.state_db_path())
+            .await
+            .expect("reopen sqlite store");
+        let config = reopened
+            .machine_config(id)
+            .await
+            .expect("read durable config")
+            .expect("machine config exists");
+        assert_eq!(config.retention, MachineRetention::Ephemeral);
+        assert_eq!(config.process, process);
+        assert_eq!(config.template_name.as_deref(), Some("rust-worker"));
+        assert_eq!(config.agent_mode, Some(crate::MachineAgent::Disabled));
     }
 
     #[test]
@@ -866,6 +1054,10 @@ mod tests {
                             metadata: std::collections::BTreeMap::new(),
                             network: MachineNetworkConfig::default(),
                             guest: crate::machine::MachineGuestConfig::default(),
+                            retention: MachineRetention::Persistent,
+                            process: ProcessConfig::default(),
+                            template_name: None,
+                            agent_mode: None,
                         }));
                     }
                 }
@@ -960,6 +1152,24 @@ mod tests {
         let err = create_machine_config(&runtime, request)
             .await
             .expect_err("zero memory should be rejected");
+
+        assert!(matches!(err, LibVmError::InvalidCreateRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_machine_config_rejects_zero_cpus() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let mut store = MockDataStore::new();
+        expect_empty_refresh(&mut store);
+        let runtime = runtime_with_mock_store(paths, store).await;
+        let base_rootfs_path = write_base_rootfs(temp.path());
+        let mut request = create_request(base_rootfs_path, "devbox");
+        request.cpus = Some(0);
+
+        let err = create_machine_config(&runtime, request)
+            .await
+            .expect_err("zero CPUs should be rejected");
 
         assert!(matches!(err, LibVmError::InvalidCreateRequest { .. }));
     }

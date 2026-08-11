@@ -26,9 +26,7 @@ export type ImageSource =
   /** Pull and materialize an OCI image reference. */
   | { kind: "oci"; reference: string }
   /** Clone/copy an existing local disk image into the machine. */
-  | { kind: "disk"; path: string }
-  /** Convert a local rootfs tar archive into a machine root disk. */
-  | { kind: "tar"; path: string };
+  | { kind: "disk"; path: string };
 
 /** Constructors for explicit machine image sources. */
 export const ImageSource = {
@@ -39,10 +37,6 @@ export const ImageSource = {
   /** Create a local disk image source. */
   disk(path: string): ImageSource {
     return { kind: "disk", path: assertNonEmptyString(path, "path") };
-  },
-  /** Create a local rootfs tar source. */
-  tar(path: string): ImageSource {
-    return { kind: "tar", path: assertNonEmptyString(path, "path") };
   },
 };
 
@@ -170,6 +164,77 @@ export interface MachineStatus {
   message?: string;
 }
 
+/** Retention policy recorded for a machine. */
+export type MachineRetention = "persistent" | "ephemeral" | "unknown";
+
+/** Agent executable selection recorded for a machine. */
+export type MachineAgent =
+  | { mode: "default" }
+  | { mode: "custom"; path: string }
+  | { mode: "disabled" }
+  /** Inspection-only fallback for agent selections this SDK does not know yet. */
+  | { mode: "unknown" };
+
+/** Guest boot mode reported by the managed guest agent. */
+export type MachineBootMode = "unspecified" | "standard" | "agent-pid1" | "init-child" | "unknown";
+
+/** Latest managed guest boot report, when the guest agent registered one. */
+export interface MachineBootReport {
+  mode: MachineBootMode;
+  requestedInit?: string;
+  handoffInitPath?: string;
+  probedInitPaths: string[];
+  agentPath?: string;
+  agentPid: number;
+  agentIsPid1: boolean;
+  message?: string;
+}
+
+/** Overall result reported by managed guest provisioning. */
+export type MachineProvisionStatus = "unspecified" | "succeeded" | "degraded" | "skipped" | "failed-boot" | "unknown";
+
+/** Result reported by one managed guest provisioning step. */
+export type MachineProvisionStepStatus = "unspecified" | "succeeded" | "failed" | "skipped" | "unsupported" | "unknown";
+
+/** Failure policy applied to one managed guest provisioning step. */
+export type MachineProvisionFailurePolicy = "unspecified" | "best-effort" | "fail-boot" | "unknown";
+
+/** Result reported by one managed guest provisioning step. */
+export interface MachineProvisionStepReport {
+  id: string;
+  status: MachineProvisionStepStatus;
+  failurePolicy: MachineProvisionFailurePolicy;
+  changed: boolean;
+  backend?: string;
+  durationMs: number;
+  message?: string;
+  errorChain?: string;
+}
+
+/** Latest managed guest provisioning report, when the guest agent registered one. */
+export interface MachineProvisionReport {
+  status: MachineProvisionStatus;
+  startedAt: Date;
+  finishedAt: Date;
+  durationMs: number;
+  steps: MachineProvisionStepReport[];
+  message?: string;
+}
+
+/** Durable desired process settings. They do not configure current execution APIs. */
+export interface ProcessConfig {
+  /** OCI entrypoint. Unset and explicitly empty values remain distinct. */
+  entrypoint?: string[];
+  /** OCI command. Unset and explicitly empty values remain distinct. */
+  command?: string[];
+  /** Explicit process environment, including an explicitly empty map. */
+  environment: KeyValueMap;
+  /** Process working directory. */
+  workingDirectory: string;
+  /** Optional OCI-style user selector. */
+  user?: string;
+}
+
 /** Snapshot of persisted machine config plus runtime state. */
 export interface MachineData {
   id: string;
@@ -178,12 +243,25 @@ export interface MachineData {
   createdAt: Date;
   modifiedAt: Date;
   imageRef: string;
+  retention: MachineRetention;
+  process: ProcessConfig;
+  /** Selected machine template, when one was used. */
+  templateName?: string;
+  /** Explicit agent mode selection, when set independently of guest settings. */
+  agentMode?: MachineAgent;
+  /** Durable source identity and local root disk pin, when available. */
+  rootfs?: MachineRootfs;
   rootDiskSize?: number;
   labels: KeyValueMap;
   metadata: KeyValueMap;
   network: Network;
-  agent: { mode: "default" | "custom" | "disabled" | "unknown"; path?: string };
+  /** Guest agent configuration currently used by machine startup. */
+  agent: MachineAgent;
   status: MachineStatus;
+  /** Latest managed guest boot report, when the guest registered one. */
+  bootReport?: MachineBootReport;
+  /** Latest managed guest provisioning report, when the guest registered one. */
+  provisionReport?: MachineProvisionReport;
   startedAt?: Date;
   lastError?: string;
   updatedAt: Date;
@@ -192,11 +270,17 @@ export interface MachineData {
 /** Runtime image pull policy. */
 export type ImagePullPolicy = "ifMissing" | "always" | "never";
 
-/** Lightweight image cache handle. */
+/** Lightweight image cache handle with the OCI identity selected for this host. */
 export interface ImageHandle {
-  reference: string;
+  /** OCI reference requested by the caller. */
+  requestedReference: string;
+  /** Digest-pinned OCI reference selected for the host platform. */
+  selectedReference: string;
+  /** Immutable OCI manifest digest selected for the reference. */
+  selectedManifestDigest: string;
+  /** Digest of the OCI image configuration document. */
+  configDigest: string;
   imageId: string;
-  manifestDigest?: string;
   platform: {
     os: string;
     architecture: string;
@@ -211,7 +295,40 @@ export interface ImageHandle {
 /** Full image detail, including layer metadata. */
 export interface ImageDetail {
   handle: ImageHandle;
+  /** Inspection-only OCI image configuration metadata. */
+  config: OciImageConfig;
   layers: ImageLayerDetail[];
+}
+
+/** OCI image configuration retained with a cached image. */
+export interface OciImageConfig {
+  /** OCI `Entrypoint` metadata. It does not configure guest execution APIs. */
+  entrypoint?: string[];
+  /** OCI `Cmd` metadata. */
+  cmd?: string[];
+  /** OCI `Env` metadata. */
+  env?: string[];
+  /** OCI `WorkingDir` metadata. */
+  workingDir?: string;
+  /** OCI `User` metadata. */
+  user?: string;
+  /** OCI `Labels` metadata. */
+  labels?: KeyValueMap;
+  /** OCI `StopSignal` metadata. It does not change `Machine.stop()`. */
+  stopSignal?: string;
+}
+
+/** Durable source identity and machine-local root disk pin. */
+export interface MachineRootfs {
+  sourceKind: "oci" | "disk";
+  requestedReference: string;
+  selectedReference?: string;
+  selectedManifestDigest?: string;
+  configDigest?: string;
+  imageId?: string;
+  rootDiskPath: string;
+  rootDiskSizeBytes: number;
+  createdAt: Date;
 }
 
 /** OCI layer metadata. */

@@ -7,11 +7,13 @@ use libvm::{
     ExecutionControl, ExecutionEvent, ExecutionOptionsBuilder, ExecutionOutput, ExecutionResult,
     ExecutionSession, ExecutionStdin, ImageDetail, ImageHandle, ImageLayerDetail, ImagePruneReport,
     ImagePullOptions, ImagePullPolicy, ImageRemoveOptions, ImageSource, Images, LibVmError,
-    Machine, MachineBuilder, MachineData, MachineLogChunk, MachineLogOptions, MachineLogOutput,
-    MachineLogSource, MachineLogStream, MachineNetworkBuilder, MachineNetworkConfig, MachineRef,
-    MachineStatus, Memory, NetworkAuditBuilder, NetworkCredentialBuilder, NetworkEndpointBuilder,
-    NetworkForwardBuilder, NetworkPolicy, NetworkRuleBuilder, Runtime, RuntimeConfig,
-    SshExitStatus, SshShellOptionsBuilder, TailscaleTunnelBuilder,
+    Machine, MachineBootReport, MachineBuilder, MachineData, MachineLogChunk, MachineLogOptions,
+    MachineLogOutput, MachineLogSource, MachineLogStream, MachineNetworkBuilder,
+    MachineNetworkConfig, MachineProvisionReport, MachineProvisionStepReport, MachineRef,
+    MachineRootfs, MachineStatus, Memory, NetworkAuditBuilder, NetworkCredentialBuilder,
+    NetworkEndpointBuilder, NetworkForwardBuilder, NetworkPolicy, NetworkRuleBuilder,
+    OciImageConfigMetadata, Runtime, RuntimeConfig, SshExitStatus, SshShellOptionsBuilder,
+    TailscaleTunnelBuilder,
 };
 use napi::bindgen_prelude::Uint8Array;
 use napi::{Error, Result, Status};
@@ -174,6 +176,11 @@ pub struct NativeMachineData {
     pub created_at: i64,
     pub modified_at: i64,
     pub image_ref: String,
+    pub retention: String,
+    pub process: NativeProcessConfig,
+    pub template_name: Option<String>,
+    pub configured_agent: Option<NativeMachineAgent>,
+    pub rootfs: Option<NativeMachineRootfs>,
     pub root_disk_size: Option<i64>,
     pub labels: Vec<NativeKeyValue>,
     pub metadata: Vec<NativeKeyValue>,
@@ -181,9 +188,73 @@ pub struct NativeMachineData {
     pub agent_mode: String,
     pub agent_path: Option<String>,
     pub status: NativeMachineStatus,
+    pub boot_report: Option<NativeMachineBootReport>,
+    pub provision_report: Option<NativeMachineProvisionReport>,
     pub started_at: Option<i64>,
     pub last_error: Option<String>,
     pub updated_at: i64,
+}
+
+#[napi(object)]
+pub struct NativeMachineBootReport {
+    pub mode: String,
+    pub requested_init: Option<String>,
+    pub handoff_init_path: Option<String>,
+    pub probed_init_paths: Vec<String>,
+    pub agent_path: Option<String>,
+    pub agent_pid: u32,
+    pub agent_is_pid1: bool,
+    pub message: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeMachineProvisionReport {
+    pub status: String,
+    pub started_unix_ms: i64,
+    pub finished_unix_ms: i64,
+    pub duration_ms: i64,
+    pub steps: Vec<NativeMachineProvisionStepReport>,
+    pub message: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeMachineProvisionStepReport {
+    pub id: String,
+    pub status: String,
+    pub failure_policy: String,
+    pub changed: bool,
+    pub backend: Option<String>,
+    pub duration_ms: i64,
+    pub message: Option<String>,
+    pub error_chain: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeProcessConfig {
+    pub entrypoint: Option<Vec<String>>,
+    pub command: Option<Vec<String>>,
+    pub environment: Vec<NativeKeyValue>,
+    pub working_directory: String,
+    pub user: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeMachineAgent {
+    pub mode: String,
+    pub path: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeMachineRootfs {
+    pub source_kind: String,
+    pub requested_reference: String,
+    pub selected_reference: Option<String>,
+    pub selected_manifest_digest: Option<String>,
+    pub config_digest: Option<String>,
+    pub image_id: Option<String>,
+    pub root_disk_path: String,
+    pub root_disk_size_bytes: i64,
+    pub created_at: i64,
 }
 
 #[napi(object)]
@@ -236,9 +307,11 @@ pub struct NativeExecutionEvent {
 
 #[napi(object)]
 pub struct NativeImageHandle {
-    pub reference: String,
+    pub requested_reference: String,
+    pub selected_reference: String,
+    pub selected_manifest_digest: String,
+    pub config_digest: String,
     pub image_id: String,
-    pub manifest_digest: Option<String>,
     pub platform_os: String,
     pub platform_architecture: String,
     pub platform_variant: Option<String>,
@@ -251,7 +324,19 @@ pub struct NativeImageHandle {
 #[napi(object)]
 pub struct NativeImageDetail {
     pub handle: NativeImageHandle,
+    pub config: NativeOciImageConfig,
     pub layers: Vec<NativeImageLayerDetail>,
+}
+
+#[napi(object)]
+pub struct NativeOciImageConfig {
+    pub entrypoint: Option<Vec<String>>,
+    pub cmd: Option<Vec<String>>,
+    pub env: Option<Vec<String>>,
+    pub working_dir: Option<String>,
+    pub user: Option<String>,
+    pub labels: Option<Vec<NativeKeyValue>>,
+    pub stop_signal: Option<String>,
 }
 
 #[napi(object)]
@@ -563,7 +648,7 @@ impl NativeMachine {
         machine
             .start()
             .await
-            .map(machine_data_to_native)
+            .map(|start| machine_data_to_native(start.machine))
             .map_err(to_napi_error)
     }
 
@@ -1179,10 +1264,6 @@ fn image_source_from_input(input: NativeImageSourceInput) -> Result<ImageSource>
             .path
             .map(ImageSource::disk)
             .ok_or_else(|| invalid_arg("disk image source requires path")),
-        "tar" => input
-            .path
-            .map(ImageSource::tar)
-            .ok_or_else(|| invalid_arg("tar image source requires path")),
         kind => Err(invalid_arg(format!(
             "unsupported image source kind {kind:?}"
         ))),
@@ -1575,6 +1656,11 @@ fn machine_data_to_native(data: MachineData) -> NativeMachineData {
         created_at: data.created_at,
         modified_at: data.modified_at,
         image_ref: data.image_ref,
+        retention: machine_retention_to_native(data.retention),
+        process: process_config_to_native(data.process),
+        template_name: data.template_name,
+        configured_agent: data.agent_mode.map(machine_agent_to_native),
+        rootfs: data.rootfs.map(machine_rootfs_to_native),
         root_disk_size: data.root_disk_size.map(u64_to_i64),
         labels: key_values_from_map(data.labels),
         metadata: key_values_from_map(data.metadata),
@@ -1582,9 +1668,113 @@ fn machine_data_to_native(data: MachineData) -> NativeMachineData {
         agent_mode,
         agent_path,
         status: machine_status_to_native(data.status),
+        boot_report: data.boot_report.map(machine_boot_report_to_native),
+        provision_report: data
+            .provision_report
+            .map(machine_provision_report_to_native),
         started_at: data.started_at,
         last_error: data.last_error,
         updated_at: data.updated_at,
+    }
+}
+
+fn machine_boot_report_to_native(report: MachineBootReport) -> NativeMachineBootReport {
+    NativeMachineBootReport {
+        mode: report.mode.label().to_string(),
+        requested_init: report.requested_init,
+        handoff_init_path: report.handoff_init_path,
+        probed_init_paths: report.probed_init_paths,
+        agent_path: report.agent_path,
+        agent_pid: report.agent_pid,
+        agent_is_pid1: report.agent_is_pid1,
+        message: report.message,
+    }
+}
+
+fn machine_provision_report_to_native(
+    report: MachineProvisionReport,
+) -> NativeMachineProvisionReport {
+    NativeMachineProvisionReport {
+        status: report.status.label().to_string(),
+        started_unix_ms: report.started_unix_ms,
+        finished_unix_ms: report.finished_unix_ms,
+        duration_ms: u64_to_i64(report.duration_ms),
+        steps: report
+            .steps
+            .into_iter()
+            .map(machine_provision_step_report_to_native)
+            .collect(),
+        message: report.message,
+    }
+}
+
+fn machine_provision_step_report_to_native(
+    report: MachineProvisionStepReport,
+) -> NativeMachineProvisionStepReport {
+    NativeMachineProvisionStepReport {
+        id: report.id,
+        status: report.status.label().to_string(),
+        failure_policy: report.failure_policy.label().to_string(),
+        changed: report.changed,
+        backend: report.backend,
+        duration_ms: u64_to_i64(report.duration_ms),
+        message: report.message,
+        error_chain: report.error_chain,
+    }
+}
+
+fn machine_retention_to_native(retention: libvm::MachineRetention) -> String {
+    match retention {
+        libvm::MachineRetention::Persistent => "persistent".to_string(),
+        libvm::MachineRetention::Ephemeral => "ephemeral".to_string(),
+    }
+}
+
+fn process_config_to_native(process: libvm::ProcessConfig) -> NativeProcessConfig {
+    NativeProcessConfig {
+        entrypoint: process.entrypoint,
+        command: process.command,
+        environment: key_values_from_map(process.environment),
+        working_directory: process.working_directory,
+        user: process.user,
+    }
+}
+
+fn machine_agent_to_native(agent: libvm::MachineAgent) -> NativeMachineAgent {
+    match agent {
+        libvm::MachineAgent::Default => NativeMachineAgent {
+            mode: "default".to_string(),
+            path: None,
+        },
+        libvm::MachineAgent::Custom { path } => NativeMachineAgent {
+            mode: "custom".to_string(),
+            path: Some(path.display().to_string()),
+        },
+        libvm::MachineAgent::Disabled => NativeMachineAgent {
+            mode: "disabled".to_string(),
+            path: None,
+        },
+        _ => NativeMachineAgent {
+            mode: "unknown".to_string(),
+            path: None,
+        },
+    }
+}
+
+fn machine_rootfs_to_native(rootfs: MachineRootfs) -> NativeMachineRootfs {
+    NativeMachineRootfs {
+        source_kind: match rootfs.source_kind {
+            libvm::ImageSourceKind::Oci => "oci".to_string(),
+            libvm::ImageSourceKind::Disk => "disk".to_string(),
+        },
+        requested_reference: rootfs.requested_reference,
+        selected_reference: rootfs.selected_reference,
+        selected_manifest_digest: rootfs.selected_manifest_digest,
+        config_digest: rootfs.config_digest,
+        image_id: rootfs.image_id,
+        root_disk_path: rootfs.root_disk_path.display().to_string(),
+        root_disk_size_bytes: u64_to_i64(rootfs.root_disk_size_bytes),
+        created_at: rootfs.created_at,
     }
 }
 
@@ -1821,9 +2011,11 @@ fn machine_log_chunk_to_native(chunk: MachineLogChunk) -> Result<NativeMachineLo
 
 fn image_handle_to_native(handle: ImageHandle) -> NativeImageHandle {
     NativeImageHandle {
-        reference: handle.reference,
+        requested_reference: handle.requested_reference,
+        selected_reference: handle.selected_reference,
+        selected_manifest_digest: handle.selected_manifest_digest,
+        config_digest: handle.config_digest,
         image_id: handle.image_id,
-        manifest_digest: handle.manifest_digest,
         platform_os: handle.platform_os,
         platform_architecture: handle.platform_architecture,
         platform_variant: handle.platform_variant,
@@ -1837,11 +2029,24 @@ fn image_handle_to_native(handle: ImageHandle) -> NativeImageHandle {
 fn image_detail_to_native(detail: ImageDetail) -> NativeImageDetail {
     NativeImageDetail {
         handle: image_handle_to_native(detail.handle),
+        config: oci_image_config_to_native(detail.config),
         layers: detail
             .layers
             .into_iter()
             .map(image_layer_to_native)
             .collect(),
+    }
+}
+
+fn oci_image_config_to_native(config: OciImageConfigMetadata) -> NativeOciImageConfig {
+    NativeOciImageConfig {
+        entrypoint: config.entrypoint,
+        cmd: config.cmd,
+        env: config.env,
+        working_dir: config.working_dir,
+        user: config.user,
+        labels: config.labels.map(key_values_from_map),
+        stop_signal: config.stop_signal,
     }
 }
 
@@ -1949,14 +2154,22 @@ fn execution_session_closed() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use libvm::{MachineLogChunk, MachineLogOutput, MachineNetworkConfig, NetworkPolicy};
+    use std::collections::BTreeMap;
+
+    use libvm::{
+        MachineBootMode, MachineBootReport, MachineLogChunk, MachineLogOutput,
+        MachineNetworkConfig, MachineProvisionFailurePolicy, MachineProvisionReport,
+        MachineProvisionStatus, MachineProvisionStepReport, MachineProvisionStepStatus,
+        NetworkPolicy, OciImageConfigMetadata, ProcessConfig,
+    };
     use serde_json::json;
     use tokio::sync::watch;
 
     use crate::{
-        machine_log_chunk_to_native, machine_log_source_from_native, network_policy_from_input,
-        network_to_native, MachineLogHandleState, NativeKeyValue, NativeNetworkInput,
-        NativeNetworkPolicyInput, ParsedNativeNetworkInput,
+        machine_boot_report_to_native, machine_log_chunk_to_native, machine_log_source_from_native,
+        machine_provision_report_to_native, network_policy_from_input, network_to_native,
+        oci_image_config_to_native, process_config_to_native, MachineLogHandleState,
+        NativeKeyValue, NativeNetworkInput, NativeNetworkPolicyInput, ParsedNativeNetworkInput,
     };
 
     fn sample_policy_json() -> String {
@@ -2041,6 +2254,102 @@ mod tests {
         assert_eq!(stdout.data.as_ref(), &[0, 255, 128, 10]);
         assert_eq!(stderr.output, "stderr");
         assert_eq!(stderr.data.as_ref(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn oci_image_config_preserves_absent_and_empty_collections() {
+        let absent = oci_image_config_to_native(OciImageConfigMetadata::default());
+        let empty = oci_image_config_to_native(OciImageConfigMetadata {
+            entrypoint: Some(Vec::new()),
+            cmd: Some(Vec::new()),
+            env: Some(Vec::new()),
+            labels: Some(BTreeMap::new()),
+            ..OciImageConfigMetadata::default()
+        });
+
+        assert!(absent.entrypoint.is_none());
+        assert!(absent.labels.is_none());
+        assert_eq!(empty.entrypoint, Some(Vec::new()));
+        assert_eq!(empty.cmd, Some(Vec::new()));
+        assert_eq!(empty.env, Some(Vec::new()));
+        assert!(empty.labels.is_some_and(|labels| labels.is_empty()));
+    }
+
+    #[test]
+    fn process_config_preserves_unset_and_empty_command_arrays() {
+        let unset = process_config_to_native(ProcessConfig::default());
+        let process = ProcessConfig {
+            entrypoint: Some(Vec::new()),
+            command: Some(Vec::new()),
+            environment: BTreeMap::new(),
+            working_directory: "/workspace".to_string(),
+            user: Some("1000:1000".to_string()),
+        };
+        let empty = process_config_to_native(process);
+
+        assert!(unset.entrypoint.is_none());
+        assert!(unset.command.is_none());
+        assert!(unset.environment.is_empty());
+        assert_eq!(empty.entrypoint, Some(Vec::new()));
+        assert_eq!(empty.command, Some(Vec::new()));
+        assert!(empty.environment.is_empty());
+        assert_eq!(empty.working_directory, "/workspace");
+        assert_eq!(empty.user.as_deref(), Some("1000:1000"));
+    }
+
+    #[test]
+    fn guest_reports_preserve_fields_and_optional_values() {
+        let boot = machine_boot_report_to_native(MachineBootReport {
+            mode: MachineBootMode::InitChild,
+            requested_init: Some("/sbin/init".to_string()),
+            handoff_init_path: None,
+            probed_init_paths: vec!["/sbin/init".to_string(), "/init".to_string()],
+            agent_path: Some("/usr/bin/silo-agent".to_string()),
+            agent_pid: 42,
+            agent_is_pid1: false,
+            message: None,
+        });
+        let provision = machine_provision_report_to_native(MachineProvisionReport {
+            status: MachineProvisionStatus::Degraded,
+            started_unix_ms: 1_700_000_000_001,
+            finished_unix_ms: 1_700_000_000_123,
+            duration_ms: 122,
+            steps: vec![MachineProvisionStepReport {
+                id: "packages".to_string(),
+                status: MachineProvisionStepStatus::Failed,
+                failure_policy: MachineProvisionFailurePolicy::BestEffort,
+                changed: true,
+                backend: None,
+                duration_ms: 122,
+                message: Some("package mirror unavailable".to_string()),
+                error_chain: None,
+            }],
+            message: None,
+        });
+
+        assert_eq!(boot.mode, "init-child");
+        assert_eq!(boot.requested_init.as_deref(), Some("/sbin/init"));
+        assert_eq!(boot.handoff_init_path, None);
+        assert_eq!(boot.probed_init_paths, ["/sbin/init", "/init"]);
+        assert_eq!(boot.agent_path.as_deref(), Some("/usr/bin/silo-agent"));
+        assert_eq!(boot.agent_pid, 42);
+        assert!(!boot.agent_is_pid1);
+        assert_eq!(boot.message, None);
+        assert_eq!(provision.status, "degraded");
+        assert_eq!(provision.started_unix_ms, 1_700_000_000_001);
+        assert_eq!(provision.finished_unix_ms, 1_700_000_000_123);
+        assert_eq!(provision.duration_ms, 122);
+        assert_eq!(provision.message, None);
+        assert_eq!(provision.steps.len(), 1);
+        let step = &provision.steps[0];
+        assert_eq!(step.id, "packages");
+        assert_eq!(step.status, "failed");
+        assert_eq!(step.failure_policy, "best-effort");
+        assert!(step.changed);
+        assert_eq!(step.backend, None);
+        assert_eq!(step.duration_ms, 122);
+        assert_eq!(step.message.as_deref(), Some("package mirror unavailable"));
+        assert_eq!(step.error_chain, None);
     }
 
     #[test]

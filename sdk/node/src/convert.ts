@@ -8,10 +8,16 @@ import type {
   NativeImagePruneReport,
   NativeImageSourceInput,
   NativeKeyValue,
+  NativeMachineAgent,
+  NativeMachineBootReport,
   NativeMachineData,
+  NativeMachineProvisionReport,
+  NativeMachineProvisionStepReport,
+  NativeMachineRootfs,
   NativeMountInput,
   NativeNetworkData,
   NativeNetworkInput,
+  NativeOciImageConfig,
   NativeRuntimeOpenOptions,
   NativeSshShellOptionsInput,
 } from "./internal/napi.js";
@@ -27,8 +33,20 @@ import type {
   ImageSource,
   KeyValueMap,
   MachineData,
+  MachineAgent,
+  MachineBootMode,
+  MachineBootReport,
+  MachineRetention,
+  MachineProvisionFailurePolicy,
+  MachineProvisionReport,
+  MachineProvisionStatus,
+  MachineProvisionStepReport,
+  MachineProvisionStepStatus,
+  MachineRootfs,
   Mount,
   Network,
+  OciImageConfig,
+  ProcessConfig,
   RuntimeOpenOptions,
   SshShellOptions,
 } from "./types.js";
@@ -102,10 +120,9 @@ export function imageSourceToNative(source: ImageSource): NativeImageSourceInput
     case "oci":
       return { kind, reference: assertNonEmptyString(record.reference, "source.reference") };
     case "disk":
-    case "tar":
       return { kind, path: assertNonEmptyString(record.path, "source.path") };
     default:
-      throw new TypeError("source.kind must be oci, disk, or tar");
+      throw new TypeError("source.kind must be oci or disk");
   }
 }
 
@@ -117,24 +134,159 @@ export function machineDataFromNative(data: NativeMachineData): MachineData {
     createdAt: unixDate(data.createdAt),
     modifiedAt: unixDate(data.modifiedAt),
     imageRef: data.imageRef,
+    retention: machineRetentionFromNative(data.retention),
+    process: processConfigFromNative(data.process),
+    templateName: data.templateName ?? undefined,
+    agentMode: optionalMachineAgentFromNative(data.configuredAgent),
+    rootfs: machineRootfsFromNative(data.rootfs),
     rootDiskSize: data.rootDiskSize ?? undefined,
     labels: keyValuesToMap(data.labels),
     metadata: keyValuesToMap(data.metadata),
     network: networkFromNative(data.network),
-    agent: {
-      mode: data.agentMode,
-      path: data.agentPath ?? undefined,
-    },
+    agent: machineAgentFromNative({ mode: data.agentMode, path: data.agentPath }),
     status: {
       kind: data.status.kind,
       ready: data.status.ready ?? undefined,
       guestReady: data.status.guestReady ?? undefined,
       message: data.status.message ?? undefined,
     },
+    bootReport: machineBootReportFromNative(data.bootReport),
+    provisionReport: machineProvisionReportFromNative(data.provisionReport),
     startedAt: optionalUnixDate(data.startedAt),
     lastError: data.lastError ?? undefined,
     updatedAt: unixDate(data.updatedAt),
   };
+}
+
+function machineBootReportFromNative(
+  report: NativeMachineBootReport | null | undefined,
+): MachineBootReport | undefined {
+  if (report == null) return undefined;
+  return {
+    mode: machineBootModeFromNative(report.mode),
+    requestedInit: report.requestedInit ?? undefined,
+    handoffInitPath: report.handoffInitPath ?? undefined,
+    probedInitPaths: report.probedInitPaths,
+    agentPath: report.agentPath ?? undefined,
+    agentPid: report.agentPid,
+    agentIsPid1: report.agentIsPid1,
+    message: report.message ?? undefined,
+  };
+}
+
+function machineBootModeFromNative(mode: NativeMachineBootReport["mode"]): MachineBootMode {
+  switch (mode) {
+    case "unspecified":
+    case "standard":
+    case "agent-pid1":
+    case "init-child":
+      return mode;
+    default:
+      return "unknown";
+  }
+}
+
+function machineProvisionReportFromNative(
+  report: NativeMachineProvisionReport | null | undefined,
+): MachineProvisionReport | undefined {
+  if (report == null) return undefined;
+  return {
+    status: machineProvisionStatusFromNative(report.status),
+    startedAt: unixMillisecondsDate(report.startedUnixMs),
+    finishedAt: unixMillisecondsDate(report.finishedUnixMs),
+    durationMs: report.durationMs,
+    steps: report.steps.map(machineProvisionStepReportFromNative),
+    message: report.message ?? undefined,
+  };
+}
+
+function machineProvisionStatusFromNative(
+  status: NativeMachineProvisionReport["status"],
+): MachineProvisionStatus {
+  switch (status) {
+    case "unspecified":
+    case "succeeded":
+    case "degraded":
+    case "skipped":
+    case "failed-boot":
+      return status;
+    default:
+      return "unknown";
+  }
+}
+
+function machineProvisionStepReportFromNative(
+  report: NativeMachineProvisionStepReport,
+): MachineProvisionStepReport {
+  return {
+    id: report.id,
+    status: machineProvisionStepStatusFromNative(report.status),
+    failurePolicy: machineProvisionFailurePolicyFromNative(report.failurePolicy),
+    changed: report.changed,
+    backend: report.backend ?? undefined,
+    durationMs: report.durationMs,
+    message: report.message ?? undefined,
+    errorChain: report.errorChain ?? undefined,
+  };
+}
+
+function machineProvisionStepStatusFromNative(
+  status: NativeMachineProvisionStepReport["status"],
+): MachineProvisionStepStatus {
+  switch (status) {
+    case "unspecified":
+    case "succeeded":
+    case "failed":
+    case "skipped":
+    case "unsupported":
+      return status;
+    default:
+      return "unknown";
+  }
+}
+
+function machineProvisionFailurePolicyFromNative(
+  policy: NativeMachineProvisionStepReport["failurePolicy"],
+): MachineProvisionFailurePolicy {
+  switch (policy) {
+    case "unspecified":
+    case "best-effort":
+    case "fail-boot":
+      return policy;
+    default:
+      return "unknown";
+  }
+}
+
+function machineRetentionFromNative(retention: MachineRetention): MachineRetention {
+  return retention;
+}
+
+function processConfigFromNative(process: NativeMachineData["process"]): ProcessConfig {
+  return {
+    entrypoint: optionalNativeStringArray(process.entrypoint, "machine process entrypoint"),
+    command: optionalNativeStringArray(process.command, "machine process command"),
+    environment: keyValuesToMap(process.environment),
+    workingDirectory: process.workingDirectory,
+    user: optionalNullableString(process.user, "machine process user"),
+  };
+}
+
+function optionalMachineAgentFromNative(agent: NativeMachineAgent | null | undefined): MachineAgent | undefined {
+  return agent == null ? undefined : machineAgentFromNative(agent);
+}
+
+function machineAgentFromNative(agent: NativeMachineAgent): MachineAgent {
+  switch (agent.mode) {
+    case "default":
+      return { mode: "default" };
+    case "custom":
+      return { mode: "custom", path: assertString(agent.path, "machine agent path") };
+    case "disabled":
+      return { mode: "disabled" };
+    case "unknown":
+      return { mode: "unknown" };
+  }
 }
 
 export function executionOptionsToNative(options?: ExecutionOptions): NativeExecutionOptionsInput | undefined {
@@ -172,9 +324,11 @@ export function sshShellOptionsToNative(options?: SshShellOptions): NativeSshShe
 
 export function imageHandleFromNative(handle: NativeImageHandle): ImageHandle {
   return {
-    reference: handle.reference,
+    requestedReference: handle.requestedReference,
+    selectedReference: handle.selectedReference,
+    selectedManifestDigest: handle.selectedManifestDigest,
+    configDigest: handle.configDigest,
     imageId: handle.imageId,
-    manifestDigest: handle.manifestDigest ?? undefined,
     platform: {
       os: handle.platformOs,
       architecture: handle.platformArchitecture,
@@ -190,7 +344,35 @@ export function imageHandleFromNative(handle: NativeImageHandle): ImageHandle {
 export function imageDetailFromNative(detail: NativeImageDetail): ImageDetail {
   return {
     handle: imageHandleFromNative(detail.handle),
+    config: ociImageConfigFromNative(detail.config),
     layers: detail.layers.map(imageLayerFromNative),
+  };
+}
+
+function machineRootfsFromNative(rootfs: NativeMachineRootfs | null | undefined): MachineRootfs | undefined {
+  if (rootfs == null) return undefined;
+  return {
+    sourceKind: rootfs.sourceKind,
+    requestedReference: rootfs.requestedReference,
+    selectedReference: rootfs.selectedReference ?? undefined,
+    selectedManifestDigest: rootfs.selectedManifestDigest ?? undefined,
+    configDigest: rootfs.configDigest ?? undefined,
+    imageId: rootfs.imageId ?? undefined,
+    rootDiskPath: rootfs.rootDiskPath,
+    rootDiskSizeBytes: rootfs.rootDiskSizeBytes,
+    createdAt: unixDate(rootfs.createdAt),
+  };
+}
+
+function ociImageConfigFromNative(config: NativeOciImageConfig): OciImageConfig {
+  return {
+    entrypoint: optionalNativeStringArray(config.entrypoint, "image config entrypoint"),
+    cmd: optionalNativeStringArray(config.cmd, "image config cmd"),
+    env: optionalNativeStringArray(config.env, "image config env"),
+    workingDir: optionalNullableString(config.workingDir, "image config workingDir"),
+    user: optionalNullableString(config.user, "image config user"),
+    labels: optionalNativeKeyValuesToMap(config.labels),
+    stopSignal: optionalNullableString(config.stopSignal, "image config stopSignal"),
   };
 }
 
@@ -319,6 +501,10 @@ function optionalString(value: unknown, name: string): string | undefined {
   return value === undefined ? undefined : assertString(value, name);
 }
 
+function optionalNullableString(value: unknown, name: string): string | undefined {
+  return value == null ? undefined : assertString(value, name);
+}
+
 function optionalNonEmptyString(value: unknown, name: string): string | undefined {
   return value === undefined ? undefined : assertNonEmptyString(value, name);
 }
@@ -333,6 +519,14 @@ function optionalBoolean(value: unknown, name: string): boolean | undefined {
 
 function optionalStringArray(value: unknown, name: string): string[] | undefined {
   return value === undefined ? undefined : assertStringArray(value, name);
+}
+
+function optionalNativeStringArray(value: string[] | null | undefined, name: string): string[] | undefined {
+  return value == null ? undefined : assertStringArray(value, name);
+}
+
+function optionalNativeKeyValuesToMap(values: NativeKeyValue[] | null | undefined): KeyValueMap | undefined {
+  return values == null ? undefined : keyValuesToMap(values);
 }
 
 function optionalPositiveInteger(value: unknown, name: string): number | undefined {
@@ -360,6 +554,10 @@ function assertIntegerInRange(value: unknown, name: string, min: number, max: nu
 
 function unixDate(value: number): Date {
   return new Date(value * 1000);
+}
+
+function unixMillisecondsDate(value: number): Date {
+  return new Date(value);
 }
 
 function optionalUnixDate(value: number | null | undefined): Date | undefined {

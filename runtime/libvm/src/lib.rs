@@ -37,9 +37,10 @@ mod vmmon;
 pub use crate::error::LibVmError;
 pub use crate::host::{ensure_certificate_authority, CertificateAuthority};
 pub use crate::image::{
-    ImageBuilder, ImageDetail, ImageHandle, ImageLayerDetail, ImageProgress, ImageProgressReceiver,
-    ImageProgressSender, ImagePruneReport, ImagePullOptions, ImagePullPolicy, ImageRemoveOptions,
-    ImageSource, ImageSourceKind, Images,
+    ImageBuilder, ImageCacheState, ImageDetail, ImageHandle, ImageLayerDetail, ImageProgress,
+    ImageProgressReceiver, ImageProgressSender, ImagePruneReport, ImagePullOptions,
+    ImagePullPolicy, ImageRemoveOptions, ImageResolveOptions, ImageSource, ImageSourceKind, Images,
+    OciImageConfigMetadata, Platform, ResolvedOciImage,
 };
 pub use crate::machine::{
     resolve_mount_location, EgressCredentials, EgressSecret, Entrypoint, ExecutionControl,
@@ -54,26 +55,28 @@ pub use crate::machine::{
     MachineBlockDeviceMetrics, MachineBootMode, MachineBootReport, MachineBuilder,
     MachineByteStream, MachineCpuMetrics, MachineData, MachineDirectoryCreateDisposition,
     MachineDirectoryPage, MachineEnabledAgent, MachineEntryKind, MachineExit, MachineExitOutcome,
-    MachineFileDownload, MachineFileEntry, MachineFileUploadOptions,
-    MachineFilesystemMetrics, MachineFreshness, MachineGuestBootMode, MachineGuestBootReport,
-    MachineGuestConfig, MachineKillOptions, MachineLoadAverageMetrics, MachineLogChunk,
-    MachineLogOptions, MachineLogOutput, MachineLogSource, MachineLogStream, MachineMemoryMetrics,
+    MachineFileDownload, MachineFileEntry, MachineFileUploadOptions, MachineFilesystemMetrics,
+    MachineFreshness, MachineGuestBootMode, MachineGuestBootReport, MachineGuestConfig,
+    MachineKillOptions, MachineLoadAverageMetrics, MachineLogChunk, MachineLogOptions,
+    MachineLogOutput, MachineLogSource, MachineLogStream, MachineMemoryMetrics,
     MachineMetricSnapshot, MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus,
     MachineNetworkInterfaceMetrics, MachineProvisionFailurePolicy, MachineProvisionOverallStatus,
     MachineProvisionReport, MachineProvisionStatus, MachineProvisionStepReport,
     MachineProvisionStepStatus, MachineProvisioningReport, MachineReadiness,
     MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState, MachineRef,
-    MachineStaleReason, MachineStartOptions, MachineStatus, MachineStopOptions, MachineSystemInfo,
-    MachineUpdate, MachineUserConfig, MachineUserUpdate, MachineVmSnapshot, MachineVmState,
-    MachineWaitOptions, Memory, NetworkPolicyUpdate, OAuthRefreshHook, SshExitStatus,
-    SshShellOptions, SshShellOptionsBuilder, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
+    MachineRetention, MachineRootfs, MachineRunId, MachineStaleReason, MachineStart,
+    MachineStartOptions, MachineStatus, MachineStopOptions, MachineSystemInfo, MachineUpdate,
+    MachineUserConfig, MachineUserUpdate, MachineVmSnapshot, MachineVmState, MachineWaitOptions,
+    Memory, NetworkPolicyUpdate, OAuthRefreshHook, ProcessConfig, SshExitStatus, SshShellOptions,
+    SshShellOptionsBuilder, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
     MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition, NetworkDriver,
     NetworkTopology,
 };
 pub use crate::runtime::{
-    NetdRuntimeConfig, PathChoice, Runtime, RuntimeBuilder, RuntimeConfig, RuntimeNetworkingConfig,
+    NetdRuntimeConfig, PathChoice, ReadOnlyRuntime, Runtime, RuntimeBuilder, RuntimeConfig,
+    RuntimeNetworkingConfig,
 };
 pub use crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub use silo_policy::{

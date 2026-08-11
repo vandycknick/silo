@@ -3,9 +3,9 @@ use libvm::{MachineUpdate, Memory};
 use std::path::PathBuf;
 use utils::HumanSize;
 
-use crate::commands::profile::parse_machine_network_config;
 use crate::config::GlobalConfig;
 use crate::context::Context;
+use crate::machine_defaults::MachineNetworkSelection;
 use crate::ui;
 
 const SETTINGS: &[(&str, &str)] = &[
@@ -134,7 +134,8 @@ impl ParsedSet {
                 "memory" => update = update.memory(parse_memory(value)?),
                 "disk" => update = update.root_disk_size(parse_disk(value)?),
                 "network" => {
-                    let network = parse_machine_network_config(value).map_err(eyre::Report::msg)?;
+                    let network =
+                        MachineNetworkSelection::parse(value).map_err(eyre::Report::msg)?;
                     update = update.network(|builder| network.apply(builder));
                 }
                 "nested-virtualization" => {

@@ -6,13 +6,15 @@ import {
   executionEventFromNative,
   executionOptionsToNative,
   executionResultFromNative,
+  imageDetailFromNative,
+  imageHandleFromNative,
   imageSourceToNative,
   machineDataFromNative,
   networkToNative,
   runtimeOptionsToNative,
   sshShellOptionsToNative,
 } from "../../src/convert.js";
-import type { NativeMachineBuilder } from "../../src/internal/napi.js";
+import type { NativeImageHandle, NativeMachineBuilder, NativeMachineData } from "../../src/internal/napi.js";
 
 const policyJson = `{ "version": 1, "metadata": { "source": "test" } }`;
 
@@ -20,19 +22,52 @@ describe("ImageSource", () => {
   it("constructs explicit image sources", () => {
     expect(ImageSource.oci("ubuntu:24.04")).toEqual({ kind: "oci", reference: "ubuntu:24.04" });
     expect(ImageSource.disk("./rootfs.raw")).toEqual({ kind: "disk", path: "./rootfs.raw" });
-    expect(ImageSource.tar("./rootfs.tar")).toEqual({ kind: "tar", path: "./rootfs.tar" });
   });
 
   it("rejects empty image source values", () => {
     expect(() => ImageSource.oci("")).toThrow(TypeError);
     expect(() => ImageSource.disk("")).toThrow(TypeError);
-    expect(() => ImageSource.tar("")).toThrow(TypeError);
   });
 
   it("rejects missing structured image source values", () => {
     const missingReference: ImageSourceValue = { kind: "oci", reference: "" };
 
     expect(() => imageSourceToNative(missingReference)).toThrow(TypeError);
+  });
+});
+
+describe("image inspection", () => {
+  it("preserves requested and selected OCI identities", () => {
+    expect(imageHandleFromNative(nativeImageHandle())).toMatchObject({
+      requestedReference: "alpine:3.21",
+      selectedReference: "docker.io/library/alpine@sha256:manifest",
+      selectedManifestDigest: "sha256:manifest",
+      configDigest: "sha256:config",
+    });
+  });
+
+  it("preserves absent and explicitly empty OCI configuration collections", () => {
+    const absent = imageDetailFromNative({
+      handle: nativeImageHandle(),
+      config: {},
+      layers: [],
+    });
+    const empty = imageDetailFromNative({
+      handle: nativeImageHandle(),
+      config: { entrypoint: [], cmd: [], env: [], labels: [] },
+      layers: [],
+    });
+
+    expect(absent.config).toEqual({
+      entrypoint: undefined,
+      cmd: undefined,
+      env: undefined,
+      workingDir: undefined,
+      user: undefined,
+      labels: undefined,
+      stopSignal: undefined,
+    });
+    expect(empty.config).toMatchObject({ entrypoint: [], cmd: [], env: [], labels: {} });
   });
 });
 
@@ -74,15 +109,178 @@ describe("Network", () => {
         createdAt: 1,
         modifiedAt: 1,
         imageRef: "ubuntu:24.04",
+        retention: "ephemeral",
+        process: {
+          entrypoint: [],
+          command: [],
+          environment: [
+            { key: "ALPHA", value: "first" },
+            { key: "ZED", value: "last" },
+          ],
+          workingDirectory: "/workspace",
+          user: "1000:1000",
+        },
+        templateName: "rust-worker",
+        configuredAgent: { mode: "disabled" },
+        rootfs: {
+          sourceKind: "oci",
+          requestedReference: "ubuntu:24.04",
+          selectedReference: "docker.io/library/ubuntu@sha256:manifest",
+          selectedManifestDigest: "sha256:manifest",
+          configDigest: "sha256:config",
+          imageId: "sha256:image",
+          rootDiskPath: "/tmp/silo/machines/machine-id/rootfs.img",
+          rootDiskSizeBytes: 1024,
+          createdAt: 1,
+        },
         labels: [],
         metadata: [],
         network: { kind: "private", policyJson },
         agentMode: "default",
         status: { kind: "stopped" },
         updatedAt: 1,
-      }).network,
-    ).toEqual({ kind: "private", policyJson });
+      }),
+    ).toMatchObject({
+      network: { kind: "private", policyJson },
+      retention: "ephemeral",
+      process: {
+        entrypoint: [],
+        command: [],
+        environment: { ALPHA: "first", ZED: "last" },
+        workingDirectory: "/workspace",
+        user: "1000:1000",
+      },
+      templateName: "rust-worker",
+      agentMode: { mode: "disabled" },
+      rootfs: {
+        requestedReference: "ubuntu:24.04",
+        selectedManifestDigest: "sha256:manifest",
+        rootDiskSizeBytes: 1024,
+      },
+    });
   });
+
+  it("preserves unset process arrays and a concrete empty environment map", () => {
+    const machine = machineDataFromNative({
+      id: "machine-id",
+      name: "machine-name",
+      machineDir: "/tmp/silo/machines/machine-id",
+      createdAt: 1,
+      modifiedAt: 1,
+      imageRef: "ubuntu:24.04",
+      retention: "persistent",
+      process: {
+        environment: [],
+        workingDirectory: "/",
+      },
+      labels: [],
+      metadata: [],
+      network: { kind: "none" },
+      agentMode: "default",
+      status: { kind: "stopped" },
+      updatedAt: 1,
+    });
+
+    expect(machine.process).toEqual({
+      entrypoint: undefined,
+      command: undefined,
+      environment: {},
+      workingDirectory: "/",
+      user: undefined,
+    });
+  });
+
+  it("converts guest boot and provisioning reports with millisecond timestamps", () => {
+    const machine = machineDataFromNative({
+      ...nativeMachineData(),
+      bootReport: {
+        mode: "init-child",
+        requestedInit: "/sbin/init",
+        probedInitPaths: ["/sbin/init", "/init"],
+        agentPath: "/usr/bin/silo-agent",
+        agentPid: 42,
+        agentIsPid1: false,
+      },
+      provisionReport: {
+        status: "degraded",
+        startedUnixMs: 1_700_000_000_001,
+        finishedUnixMs: 1_700_000_000_123,
+        durationMs: 122,
+        steps: [{
+          id: "packages",
+          status: "failed",
+          failurePolicy: "best-effort",
+          changed: true,
+          durationMs: 122,
+          message: "package mirror unavailable",
+        }],
+      },
+    });
+
+    expect(machine.bootReport).toEqual({
+      mode: "init-child",
+      requestedInit: "/sbin/init",
+      handoffInitPath: undefined,
+      probedInitPaths: ["/sbin/init", "/init"],
+      agentPath: "/usr/bin/silo-agent",
+      agentPid: 42,
+      agentIsPid1: false,
+      message: undefined,
+    });
+    expect(machine.provisionReport).toEqual({
+      status: "degraded",
+      startedAt: new Date(1_700_000_000_001),
+      finishedAt: new Date(1_700_000_000_123),
+      durationMs: 122,
+      steps: [{
+        id: "packages",
+        status: "failed",
+        failurePolicy: "best-effort",
+        changed: true,
+        backend: undefined,
+        durationMs: 122,
+        message: "package mirror unavailable",
+        errorChain: undefined,
+      }],
+      message: undefined,
+    });
+  });
+
+  it("preserves absent reports and falls back for unknown report enums", () => {
+    const absent = machineDataFromNative(nativeMachineData());
+    const unknown = machineDataFromNative({
+      ...nativeMachineData(),
+      bootReport: {
+        mode: "unknown",
+        probedInitPaths: [],
+        agentPid: 0,
+        agentIsPid1: false,
+      },
+      provisionReport: {
+        status: "unknown",
+        startedUnixMs: 0,
+        finishedUnixMs: 0,
+        durationMs: 0,
+        steps: [{
+          id: "future-step",
+          status: "unknown",
+          failurePolicy: "unknown",
+          changed: false,
+          durationMs: 0,
+        }],
+      },
+    });
+
+    expect(absent.bootReport).toBeUndefined();
+    expect(absent.provisionReport).toBeUndefined();
+    expect(unknown.bootReport?.mode).toBe("unknown");
+    expect(unknown.provisionReport?.status).toBe("unknown");
+    expect(unknown.provisionReport?.steps[0]).toMatchObject({
+      status: "unknown",
+      failurePolicy: "unknown",
+    });
+  });
+
 });
 
 describe("NetworkPolicy.define", () => {
@@ -284,6 +482,42 @@ function fakeNativeBuilder(overrides: Partial<NativeMachineBuilder> = {}): Nativ
       throw new Error("not used by validation tests");
     },
     ...overrides,
+  };
+}
+
+function nativeImageHandle(): NativeImageHandle {
+  return {
+    requestedReference: "alpine:3.21",
+    selectedReference: "docker.io/library/alpine@sha256:manifest",
+    selectedManifestDigest: "sha256:manifest",
+    configDigest: "sha256:config",
+    imageId: "sha256:image",
+    platformOs: "linux",
+    platformArchitecture: "arm64",
+    createdAt: 1,
+    updatedAt: 2,
+  };
+}
+
+function nativeMachineData(): NativeMachineData {
+  return {
+    id: "machine-id",
+    name: "machine-name",
+    machineDir: "/tmp/silo/machines/machine-id",
+    createdAt: 1,
+    modifiedAt: 1,
+    imageRef: "ubuntu:24.04",
+    retention: "ephemeral",
+    process: {
+      environment: [],
+      workingDirectory: "/",
+    },
+    labels: [],
+    metadata: [],
+    network: { kind: "none" },
+    agentMode: "default",
+    status: { kind: "stopped" },
+    updatedAt: 1,
   };
 }
 

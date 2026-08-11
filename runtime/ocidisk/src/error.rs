@@ -25,16 +25,6 @@ pub enum OciDiskError {
         message: String,
     },
 
-    #[error("tar source {reference:?} at {path} uses {compression} compression; only plain tar files are supported right now")]
-    UnsupportedTarCompression {
-        reference: String,
-        path: PathBuf,
-        compression: &'static str,
-    },
-
-    #[error("OCI archive {path} is invalid: {message}")]
-    OciArchive { path: PathBuf, message: String },
-
     #[error("registry request for image {reference:?} failed: {source}")]
     Registry {
         reference: String,
@@ -70,6 +60,21 @@ pub enum OciDiskError {
         path: PathBuf,
         expected: u64,
         actual: u64,
+    },
+
+    #[error("{content} for image {reference:?} has digest {actual}; expected {expected}")]
+    DescriptorDigestMismatch {
+        reference: String,
+        content: &'static str,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("manifest response for image {reference:?} has digest {actual}; expected {expected}")]
+    ManifestDigestMismatch {
+        reference: String,
+        expected: String,
+        actual: String,
     },
 
     #[error("image {reference:?} does not provide {requested}; available platforms: {available}")]

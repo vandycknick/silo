@@ -9,6 +9,7 @@ mod logs;
 mod memory;
 mod mounts;
 mod name_generator;
+mod process;
 mod reference;
 pub(crate) mod root_disk;
 mod session;
@@ -22,17 +23,18 @@ pub use handle::Machine;
 pub use inspect::{
     MachineBootMode, MachineBootReport, MachineData, MachineProvisionFailurePolicy,
     MachineProvisionReport, MachineProvisionStatus, MachineProvisionStepReport,
-    MachineProvisionStepStatus, MachineStatus,
+    MachineProvisionStepStatus, MachineRootfs, MachineStatus,
 };
 pub use lifecycle_options::{
-    MachineExit, MachineExitOutcome, MachineKillOptions, MachineStopOptions, MachineWaitOptions,
-    DEFAULT_MACHINE_WAIT_TIMEOUT,
+    MachineExit, MachineExitOutcome, MachineKillOptions, MachineRunId, MachineStart,
+    MachineStopOptions, MachineWaitOptions, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use logs::{
     MachineLogChunk, MachineLogOptions, MachineLogOutput, MachineLogSource, MachineLogStream,
 };
 pub use memory::Memory;
 pub use mounts::resolve_mount_location;
+pub use process::{MachineRetention, ProcessConfig};
 pub use reference::MachineRef;
 pub(crate) use session::launch_failure_reason;
 pub use session::{

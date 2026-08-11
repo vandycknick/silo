@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::runtime::Runtime;
 use crate::LibVmError;
 
+pub use ocidisk::OciImageConfigMetadata;
+pub use ocidisk::Platform;
 pub use ocidisk::{ImageProgress, ImageProgressReceiver, ImageProgressSender};
 
 /// Source used to create a machine root disk.
@@ -35,10 +37,11 @@ pub use ocidisk::{ImageProgress, ImageProgressReceiver, ImageProgressSender};
 pub enum ImageSource {
     /// Pull and materialize an OCI image reference.
     Oci(String),
-    /// Clone or copy an existing local disk image into the machine directory.
+    /// Clone or copy an existing caller-owned local disk image into the machine directory.
+    ///
+    /// The source path is resolved when creation is planned, but its mutable file
+    /// contents remain owned by the caller until materialization begins.
     Disk(PathBuf),
-    /// Convert an uncompressed rootfs tar archive into an ext4 image.
-    Tar(PathBuf),
 }
 
 impl ImageSource {
@@ -52,23 +55,17 @@ impl ImageSource {
         Self::Disk(path.into())
     }
 
-    /// Creates an uncompressed rootfs tar source.
-    pub fn tar(path: impl Into<PathBuf>) -> Self {
-        Self::Tar(path.into())
-    }
-
     pub(crate) fn kind(&self) -> ImageSourceKind {
         match self {
             Self::Oci(_) => ImageSourceKind::Oci,
             Self::Disk(_) => ImageSourceKind::Disk,
-            Self::Tar(_) => ImageSourceKind::Tar,
         }
     }
 
     pub(crate) fn source_reference(&self) -> String {
         match self {
             Self::Oci(reference) => reference.clone(),
-            Self::Disk(path) | Self::Tar(path) => path.display().to_string(),
+            Self::Disk(path) => path.display().to_string(),
         }
     }
 
@@ -76,7 +73,6 @@ impl ImageSource {
         match self {
             Self::Oci(reference) => reference.clone(),
             Self::Disk(path) => format!("disk:{}", path.display()),
-            Self::Tar(path) => format!("tar:{}", path.display()),
         }
     }
 }
@@ -89,8 +85,6 @@ pub enum ImageSourceKind {
     Oci,
     /// The machine was created from a caller-owned local disk image.
     Disk,
-    /// The machine was created from an uncompressed rootfs tar archive.
-    Tar,
 }
 
 impl ImageSourceKind {
@@ -98,7 +92,6 @@ impl ImageSourceKind {
         match self {
             Self::Oci => "oci",
             Self::Disk => "disk",
-            Self::Tar => "tar",
         }
     }
 }
@@ -126,12 +119,6 @@ impl ImageBuilder {
         self
     }
 
-    /// Selects an uncompressed rootfs tar archive.
-    pub fn tar(mut self, path: impl Into<PathBuf>) -> Self {
-        self.source = Some(ImageSource::tar(path));
-        self
-    }
-
     pub(crate) fn finish(self) -> Option<ImageSource> {
         self.source
     }
@@ -156,6 +143,52 @@ pub struct ImagePullOptions {
     pub policy: Option<ImagePullPolicy>,
 }
 
+/// Options for read-only `Runtime::images().resolve_with` calls.
+#[derive(Debug, Clone, Default)]
+pub struct ImageResolveOptions {
+    /// Optional policy override for this operation.
+    pub policy: Option<ImagePullPolicy>,
+}
+
+/// Whether the resolved immutable image already has a complete local rootfs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageCacheState {
+    /// The selected manifest has a complete rootfs in the local cache.
+    Complete,
+    /// The selected manifest must be materialized before it can be used.
+    Missing,
+}
+
+/// An immutable OCI image selection that can be materialized without resolving again.
+///
+/// Values are created by `Images::resolve` and retain private registry resolution
+/// data when needed for a later `MachineBuilder::resolved_image` call.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ResolvedOciImage {
+    /// Canonical OCI reference requested by the caller.
+    pub requested_reference: String,
+    /// Digest-pinned OCI reference selected for the requested platform.
+    pub selected_reference: String,
+    /// Digest of the selected OCI image manifest.
+    pub manifest_digest: String,
+    /// Digest of the selected OCI image configuration.
+    pub config_digest: String,
+    /// Execution defaults declared by the OCI image configuration.
+    pub config: OciImageConfigMetadata,
+    /// Platform selected for this image.
+    pub platform: Platform,
+    /// Whether the selected identity is already completely cached.
+    pub cache_state: ImageCacheState,
+    pub(crate) materialization: ResolvedOciImageMaterialization,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ResolvedOciImageMaterialization {
+    Cached,
+    Registry(Box<ocidisk::ResolvedOciImage>),
+}
+
 /// Options for removing image references.
 #[derive(Debug, Clone, Default)]
 pub struct ImageRemoveOptions {
@@ -167,12 +200,16 @@ pub struct ImageRemoveOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ImageHandle {
-    /// User-facing image reference, for example `ubuntu:24.04`.
-    pub reference: String,
+    /// OCI reference requested by the caller, for example `ubuntu:24.04`.
+    pub requested_reference: String,
+    /// Digest-pinned OCI reference selected for the host platform.
+    pub selected_reference: String,
+    /// Immutable OCI manifest digest selected for this reference.
+    pub selected_manifest_digest: String,
+    /// Digest of the OCI image configuration document.
+    pub config_digest: String,
     /// Immutable image ID for the resolved artifact.
     pub image_id: String,
-    /// Resolved OCI manifest digest when this is an OCI image.
-    pub manifest_digest: Option<String>,
     /// Platform operating system.
     pub platform_os: String,
     /// Platform CPU architecture.
@@ -195,7 +232,11 @@ pub struct ImageHandle {
 pub struct ImageDetail {
     /// Basic image reference metadata.
     pub handle: ImageHandle,
-    /// Ordered OCI layers. Tar and disk sources currently have no layer rows.
+    /// OCI image configuration metadata. Optional collection fields preserve the
+    /// distinction between an absent field and an explicitly empty value.
+    /// `StopSignal` is inspection-only; it does not alter `Machine::stop`.
+    pub config: OciImageConfigMetadata,
+    /// Ordered OCI layers.
     pub layers: Vec<ImageLayerDetail>,
 }
 
@@ -264,11 +305,34 @@ impl Images {
             .materialize_image(&ImageSource::oci(reference.clone()))
             .await?;
         runtime
-            .image_handle(&image.image_ref)
+            .image_handle(&image.requested_reference)
             .await?
             .ok_or(LibVmError::ImageNotFound {
-                reference: image.image_ref,
+                reference: image.requested_reference,
             })
+    }
+
+    /// Resolves an OCI reference according to the runtime pull policy without
+    /// writing cache or datastore state.
+    pub async fn resolve(
+        &self,
+        reference: impl Into<String>,
+    ) -> Result<ResolvedOciImage, LibVmError> {
+        self.resolve_with(reference, ImageResolveOptions::default())
+            .await
+    }
+
+    /// Resolves an OCI reference with an operation-specific policy without
+    /// materializing or updating image state.
+    pub async fn resolve_with(
+        &self,
+        reference: impl Into<String>,
+        options: ImageResolveOptions,
+    ) -> Result<ResolvedOciImage, LibVmError> {
+        let policy = options.policy.unwrap_or(self.runtime.image_pull_policy());
+        self.runtime
+            .resolve_oci_image(reference.into(), policy)
+            .await
     }
 
     /// Returns a cached image reference without pulling.
@@ -309,10 +373,11 @@ impl Images {
 
 pub(crate) struct MaterializedImage {
     pub(crate) rootfs_path: PathBuf,
-    pub(crate) image_ref: String,
+    pub(crate) requested_reference: String,
+    pub(crate) selected_reference: Option<String>,
     pub(crate) source_kind: ImageSourceKind,
-    pub(crate) source_reference: String,
     pub(crate) image_id: Option<String>,
     pub(crate) manifest_digest: Option<String>,
+    pub(crate) config_digest: Option<String>,
     pub(crate) size_bytes: u64,
 }
