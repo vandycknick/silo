@@ -101,15 +101,21 @@ install: ## Install the macOS release application and CLI symlink.
 	$(XTASK) install --appdir "$(APPDIR)" --bindir "$(BINDIR)" $(APP_ARGS) $(KERNEL_ARGS)
 
 ##@ Quality
-.PHONY: fmt clippy test version-check
+.PHONY: fmt clippy test test-unit test-integration version-check
 fmt: ## Format workspace source code.
 	$(XTASK) fmt
 
 clippy: ## Lint all host-supported workspace components.
 	$(XTASK) clippy
 
-test: ## Test all host-supported workspace components.
+test: ## Run unit and integration tests for all host-supported workspace components.
 	$(XTASK) test
+
+test-unit: ## Run unit tests for all host-supported workspace components.
+	$(XTASK) test-unit
+
+test-integration: ## Run Cargo integration tests for all host-supported workspace components.
+	$(XTASK) test-integration
 
 version-check: ## Verify product versions match the version authority.
 	$(XTASK) version-check

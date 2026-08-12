@@ -1,29 +1,35 @@
+//! Apple Virtualization.framework backend, built on the `vz` bindings crate.
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use vz::device::{
     EntropyDeviceConfiguration, LinuxRosettaDirectoryShare, MemoryBalloonDeviceConfiguration,
     NetworkDeviceConfiguration, SerialPortConfiguration, SharedDirectory, SingleDirectoryShare,
     SocketDevice, SocketDeviceConfiguration, StorageDeviceConfiguration,
-    VirtioFileSystemDeviceConfiguration,
+    VirtioFileSystemDeviceConfiguration, VirtioSocketDevice,
 };
 use vz::{
     GenericMachineIdentifier, GenericPlatform, LinuxBootLoader, RosettaAvailability,
     VirtualMachine, VirtualMachineDelegate, VirtualMachineState, VzError,
 };
 
-use crate::stream::{MachineSerialStream, VsockListener, VsockStream};
-use crate::types::{MachineIdentifier, NetworkMode, VirtError, VmConfig, VmExit};
+use super::VirtBackend;
+use crate::virt::config::{validate_common, MachineIdentifier, NetworkMode, VmConfig};
+use crate::virt::error::VirtError;
+use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
+use crate::virt::VmExit;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const SILO_ROSETTA_TAG: &str = "silo-rosetta";
 
 #[derive(Debug)]
-pub(crate) struct VzMachineBackend {
+pub(crate) struct VzBackend {
     config: VmConfig,
     inner: AsyncMutex<VzMachineState>,
     exit: Arc<Mutex<Option<VmExit>>>,
@@ -36,7 +42,7 @@ struct VzMachineState {
     serial_port: Option<SerialPortConfiguration>,
 }
 
-impl VzMachineBackend {
+impl VzBackend {
     pub(crate) fn new(config: VmConfig) -> Result<Self, VirtError> {
         validate(&config)?;
         Ok(Self {
@@ -50,12 +56,40 @@ impl VzMachineBackend {
         })
     }
 
-    pub(crate) async fn start(&self) -> Result<(), VirtError> {
+    fn cached_exit(&self) -> Option<VmExit> {
+        self.exit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn cache_exit(&self, exit: VmExit) {
+        let mut slot = self.exit.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(exit);
+            self.exit_notify.notify_waiters();
+        }
+    }
+
+    fn try_cache_exit_from_vm(&self, vm: &VirtualMachine) {
+        match vm.state() {
+            VirtualMachineState::Stopped => self.cache_exit(VmExit::Stopped),
+            VirtualMachineState::Error => self.cache_exit(VmExit::StoppedWithError(
+                "virtual machine entered error state".to_string(),
+            )),
+            _ => {}
+        }
+    }
+}
+
+#[async_trait]
+impl VirtBackend for VzBackend {
+    async fn start(&self) -> Result<(), VirtError> {
         validate_support()?;
         let mut state = self.inner.lock().await;
         if state.vm.is_some() {
             return Err(VirtError::AlreadyRunning {
-                name: self.config.name.clone(),
+                name: self.config.name().to_string(),
             });
         }
 
@@ -81,19 +115,19 @@ impl VzMachineBackend {
         Ok(())
     }
 
-    pub(crate) async fn stop(&self) -> Result<(), VirtError> {
+    async fn stop(&self) -> Result<(), VirtError> {
         let mut state = self.inner.lock().await;
         if let Some(vm) = state.vm.as_ref() {
             if vm.state() != VirtualMachineState::Stopped {
                 let mut state_events = vm.subscribe_state();
                 tracing::debug!(
-                    machine_id = self.config.name.as_str(),
+                    machine_id = self.config.name(),
                     current_state = %vm.state(),
                     "starting VZ shutdown flow"
                 );
                 let graceful_stop_completed = if vm.can_request_stop() {
                     tracing::debug!(
-                        machine_id = self.config.name.as_str(),
+                        machine_id = self.config.name(),
                         timeout = ?SHUTDOWN_TIMEOUT,
                         "requesting graceful VZ shutdown"
                     );
@@ -108,13 +142,13 @@ impl VzMachineBackend {
                     match &graceful_result {
                         Ok(()) => {
                             tracing::debug!(
-                                machine_id = self.config.name.as_str(),
+                                machine_id = self.config.name(),
                                 "graceful VZ shutdown completed"
                             );
                         }
                         Err(err) => {
                             tracing::warn!(
-                                machine_id = self.config.name.as_str(),
+                                machine_id = self.config.name(),
                                 error = %err,
                                 timeout = ?SHUTDOWN_TIMEOUT,
                                 "graceful VZ shutdown did not complete before timeout, falling back to hard stop"
@@ -124,7 +158,7 @@ impl VzMachineBackend {
                     graceful_result.is_ok()
                 } else {
                     tracing::debug!(
-                        machine_id = self.config.name.as_str(),
+                        machine_id = self.config.name(),
                         "guest does not support graceful request_stop, using hard stop"
                     );
                     false
@@ -132,7 +166,7 @@ impl VzMachineBackend {
 
                 if !graceful_stop_completed {
                     tracing::warn!(
-                        machine_id = self.config.name.as_str(),
+                        machine_id = self.config.name(),
                         timeout = ?SHUTDOWN_TIMEOUT,
                         "executing hard VZ stop"
                     );
@@ -144,76 +178,20 @@ impl VzMachineBackend {
                         SHUTDOWN_TIMEOUT,
                     )
                     .await?;
-                    tracing::debug!(
-                        machine_id = self.config.name.as_str(),
-                        "hard VZ stop completed"
-                    );
+                    tracing::debug!(machine_id = self.config.name(), "hard VZ stop completed");
                 }
             }
         }
 
         state.vm = None;
         state.serial_port = None;
-        self.cache_exit(VmExit::Stopped)?;
+        self.cache_exit(VmExit::Stopped);
         Ok(())
     }
 
-    pub(crate) async fn connect_vsock(&self, port: u32) -> Result<VsockStream, VirtError> {
-        let vm = {
-            let state = self.inner.lock().await;
-            state.vm.clone().ok_or_else(|| {
-                VirtError::Backend(format!(
-                    "cannot open vsock stream because machine {:?} is not running",
-                    self.config.name.as_str()
-                ))
-            })?
-        };
-
-        let device = vm.open_devices().into_iter().next().ok_or_else(|| {
-            VirtError::Backend("no virtio socket device configured in VM".to_string())
-        })?;
-
-        let stream = device.connect(port).await.map_err(vz_error)?;
-        Ok(VsockStream::from_vz(stream))
-    }
-
-    pub(crate) async fn listen_vsock(&self, port: u32) -> Result<VsockListener, VirtError> {
-        let vm = {
-            let state = self.inner.lock().await;
-            state.vm.clone().ok_or_else(|| {
-                VirtError::Backend(format!(
-                    "cannot listen on vsock port because machine {:?} is not running",
-                    self.config.name.as_str()
-                ))
-            })?
-        };
-
-        let device = vm.open_devices().into_iter().next().ok_or_else(|| {
-            VirtError::Backend("no virtio socket device configured in VM".to_string())
-        })?;
-
-        let listener = device.listen(port).map_err(vz_error)?;
-        Ok(VsockListener::from_vz(listener))
-    }
-
-    pub(crate) async fn open_serial(&self) -> Result<MachineSerialStream, VirtError> {
-        let serial_port = {
-            let state = self.inner.lock().await;
-            state.serial_port.clone().ok_or_else(|| {
-                VirtError::Backend(format!(
-                    "cannot open serial stream because machine {:?} is not running",
-                    self.config.name.as_str()
-                ))
-            })?
-        };
-
-        let stream = serial_port.open_stream().map_err(vz_error)?;
-        Ok(MachineSerialStream::from_vz(stream))
-    }
-
-    pub(crate) async fn wait(&self) -> Result<VmExit, VirtError> {
+    async fn wait(&self) -> Result<VmExit, VirtError> {
         loop {
-            if let Some(exit) = self.cached_exit()? {
+            if let Some(exit) = self.cached_exit() {
                 return Ok(exit);
             }
 
@@ -223,13 +201,13 @@ impl VzMachineBackend {
             };
 
             let Some(vm) = maybe_vm else {
-                return Err(VirtError::Backend(
-                    "cannot wait for a virtual machine that has not been started".to_string(),
-                ));
+                return Err(VirtError::NotRunning {
+                    name: self.config.name().to_string(),
+                });
             };
 
-            self.try_cache_exit_from_vm(&vm)?;
-            if let Some(exit) = self.cached_exit()? {
+            self.try_cache_exit_from_vm(&vm);
+            if let Some(exit) = self.cached_exit() {
                 return Ok(exit);
             }
 
@@ -237,8 +215,8 @@ impl VzMachineBackend {
         }
     }
 
-    pub(crate) async fn try_wait(&self) -> Result<Option<VmExit>, VirtError> {
-        if let Some(exit) = self.cached_exit()? {
+    async fn try_wait(&self) -> Result<Option<VmExit>, VirtError> {
+        if let Some(exit) = self.cached_exit() {
             return Ok(Some(exit));
         }
 
@@ -251,35 +229,54 @@ impl VzMachineBackend {
             return Ok(None);
         };
 
-        self.try_cache_exit_from_vm(&vm)?;
-        self.cached_exit()
+        self.try_cache_exit_from_vm(&vm);
+        Ok(self.cached_exit())
     }
 
-    fn cached_exit(&self) -> Result<Option<VmExit>, VirtError> {
-        self.exit
-            .lock()
-            .map(|exit| exit.clone())
-            .map_err(|_| VirtError::RegistryPoisoned)
+    async fn connect_vsock(&self, port: u32) -> Result<VsockStream, VirtError> {
+        let vm = self.running_vm().await?;
+        let device = socket_device(&vm)?;
+        let stream = device.connect(port).await.map_err(vz_error)?;
+        Ok(VsockStream::from_vz(stream))
     }
 
-    fn cache_exit(&self, exit: VmExit) -> Result<(), VirtError> {
-        let mut slot = self.exit.lock().map_err(|_| VirtError::RegistryPoisoned)?;
-        if slot.is_none() {
-            *slot = Some(exit);
-            self.exit_notify.notify_waiters();
-        }
-        Ok(())
+    async fn listen_vsock(&self, port: u32) -> Result<VsockListener, VirtError> {
+        let vm = self.running_vm().await?;
+        let device = socket_device(&vm)?;
+        let listener = device.listen(port).map_err(vz_error)?;
+        Ok(VsockListener::from_vz(listener))
     }
 
-    fn try_cache_exit_from_vm(&self, vm: &VirtualMachine) -> Result<(), VirtError> {
-        match vm.state() {
-            VirtualMachineState::Stopped => self.cache_exit(VmExit::Stopped),
-            VirtualMachineState::Error => self.cache_exit(VmExit::StoppedWithError(
-                "virtual machine entered error state".to_string(),
-            )),
-            _ => Ok(()),
-        }
+    async fn open_serial(&self) -> Result<SerialDevice, VirtError> {
+        let serial_port = {
+            let state = self.inner.lock().await;
+            state
+                .serial_port
+                .clone()
+                .ok_or_else(|| VirtError::NotRunning {
+                    name: self.config.name().to_string(),
+                })?
+        };
+
+        let stream = serial_port.open_stream().map_err(vz_error)?;
+        Ok(SerialDevice::from_vz(stream))
     }
+}
+
+impl VzBackend {
+    async fn running_vm(&self) -> Result<VirtualMachine, VirtError> {
+        let state = self.inner.lock().await;
+        state.vm.clone().ok_or_else(|| VirtError::NotRunning {
+            name: self.config.name().to_string(),
+        })
+    }
+}
+
+fn socket_device(vm: &VirtualMachine) -> Result<VirtioSocketDevice, VirtError> {
+    vm.open_devices()
+        .into_iter()
+        .next()
+        .ok_or_else(|| VirtError::Backend("no virtio socket device configured in VM".to_string()))
 }
 
 #[derive(Clone)]
@@ -290,27 +287,28 @@ struct ExitDelegate {
 
 impl VirtualMachineDelegate for ExitDelegate {
     fn guest_did_stop(&self) {
-        if let Ok(mut slot) = self.exit.lock() {
-            if slot.is_none() {
-                *slot = Some(VmExit::Stopped);
-            }
+        let mut slot = self.exit.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(VmExit::Stopped);
         }
+        drop(slot);
         self.notify.notify_waiters();
     }
 
     fn did_stop_with_error(&self, error: VzError) {
-        if let Ok(mut slot) = self.exit.lock() {
-            if slot.is_none() {
-                *slot = Some(VmExit::StoppedWithError(error.to_string()));
-            }
+        let mut slot = self.exit.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(VmExit::StoppedWithError(error.to_string()));
         }
+        drop(slot);
         self.notify.notify_waiters();
     }
 }
 
-fn validate(spec: &VmConfig) -> Result<(), VirtError> {
+fn validate(config: &VmConfig) -> Result<(), VirtError> {
     validate_support()?;
-    validate_machine_config(spec)
+    validate_common(config)?;
+    validate_machine_config(config)
 }
 
 fn validate_support() -> Result<(), VirtError> {
@@ -318,38 +316,38 @@ fn validate_support() -> Result<(), VirtError> {
     Ok(())
 }
 
-fn build_vm(spec: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguration), VirtError> {
+fn build_vm(config: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguration), VirtError> {
     let serial_port = SerialPortConfiguration::virtio_console();
 
     let mut builder = VirtualMachine::builder()
         .map_err(vz_error)?
-        .set_cpu_count(spec.cpus.unwrap_or(2))
-        .set_memory_size(spec.memory_mib.unwrap_or(2048) * 1024 * 1024)
-        .set_platform(build_platform(spec)?)
-        .set_boot_loader(build_boot_loader(spec)?)
+        .set_cpu_count(config.cpus().unwrap_or(2))
+        .set_memory_size(config.memory_mib().unwrap_or(2048) * 1024 * 1024)
+        .set_platform(build_platform(config)?)
+        .set_boot_loader(build_boot_loader(config)?)
         .add_entropy_device(EntropyDeviceConfiguration::new())
         .add_memory_balloon_device(MemoryBalloonDeviceConfiguration::new())
         .add_serial_port(serial_port.clone())
         .add_socket_device(SocketDeviceConfiguration::new());
 
-    match &spec.network {
+    match config.network() {
         NetworkMode::None => {}
         NetworkMode::UnixDatagram { peer_path, mac } => {
             builder = builder.add_network_device(
-                NetworkDeviceConfiguration::unix_datagram(peer_path, &spec.vm_id, *mac)
+                NetworkDeviceConfiguration::unix_datagram(peer_path, config.vm_id(), *mac)
                     .map_err(vz_error)?,
             );
         }
         NetworkMode::UnixStream { .. } | NetworkMode::Tap { .. } => {}
     }
 
-    for disk in &spec.disks {
+    for disk in config.disks() {
         builder = builder.add_storage_device(
             StorageDeviceConfiguration::new(disk.path.clone(), disk.read_only).map_err(vz_error)?,
         );
     }
 
-    for mount in &spec.mounts {
+    for mount in config.mounts() {
         let shared_dir = SharedDirectory::new(mount.host_path.clone(), mount.read_only);
         let single_share = SingleDirectoryShare::new(shared_dir);
         let mut fs_config = VirtioFileSystemDeviceConfiguration::new(mount.tag.clone());
@@ -357,7 +355,7 @@ fn build_vm(spec: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguration)
         builder = builder.add_directory_share(fs_config);
     }
 
-    if spec.rosetta {
+    if config.vz().rosetta {
         let mut rosetta_config = VirtioFileSystemDeviceConfiguration::new(SILO_ROSETTA_TAG);
         rosetta_config.set_rosetta_share(LinuxRosettaDirectoryShare::new().map_err(vz_error)?);
         builder = builder.add_directory_share(rosetta_config);
@@ -367,135 +365,107 @@ fn build_vm(spec: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguration)
     Ok((vm, serial_port))
 }
 
-fn build_platform(spec: &VmConfig) -> Result<GenericPlatform, VirtError> {
+fn build_platform(config: &VmConfig) -> Result<GenericPlatform, VirtError> {
     let mut platform = GenericPlatform::new();
-    let machine_identifier = resolve_machine_identifier(spec)?;
+    let machine_identifier = resolve_machine_identifier(config)?;
     platform.set_machine_identifier(machine_identifier);
-    platform.set_nested_virtualization_enabled(spec.nested_virtualization);
+    platform.set_nested_virtualization_enabled(config.nested_virtualization());
     Ok(platform)
 }
 
-fn build_boot_loader(spec: &VmConfig) -> Result<LinuxBootLoader, VirtError> {
-    let kernel_path = required_path(&spec.name, spec.kernel_path.as_ref(), "kernel_path")?;
+fn build_boot_loader(config: &VmConfig) -> Result<LinuxBootLoader, VirtError> {
+    let kernel_path = required_path(config.name(), config.kernel_path(), "kernel_path")?;
 
     let mut boot_loader = LinuxBootLoader::new(kernel_path);
-    if let Some(initramfs_path) = spec.initramfs_path.as_ref() {
+    if let Some(initramfs_path) = config.initramfs_path() {
         boot_loader.set_initial_ramdisk(initramfs_path);
     }
 
     let mut args = vec!["console=hvc0".to_string(), "rd.break=initqueue".to_string()];
-    args.extend(spec.kernel_cmdline.iter().cloned());
+    args.extend(config.kernel_cmdline().iter().cloned());
     let command_line = args.join(" ");
     boot_loader.set_command_line(&command_line);
     Ok(boot_loader)
 }
 
+/// Resolve the platform identity, generating one on first boot and writing
+/// the generated bytes back into the config's [`MachineIdentifier`] so the
+/// caller can persist them.
 fn resolve_machine_identifier(config: &VmConfig) -> Result<GenericMachineIdentifier, VirtError> {
-    let Some(machine_identifier) = config.machine_identifier.as_ref() else {
+    let Some(machine_identifier) = config.vz().machine_identifier.as_ref() else {
         return Ok(GenericMachineIdentifier::new());
     };
 
     if machine_identifier.is_empty() {
         let generated = GenericMachineIdentifier::new();
-        machine_identifier.set_generated_bytes(generated.data())?;
+        machine_identifier.set_generated_bytes(generated.data());
         return Ok(generated);
     }
 
     GenericMachineIdentifier::from_bytes(&machine_identifier.bytes()).map_err(vz_error)
 }
 
-fn validate_machine_config(spec: &VmConfig) -> Result<(), VirtError> {
-    if spec.base_directory.as_os_str().is_empty() {
-        return Err(VirtError::InvalidConfig {
-            name: spec.name.clone(),
-            reason: "base_directory must be set".to_string(),
-        });
+fn validate_machine_config(config: &VmConfig) -> Result<(), VirtError> {
+    let invalid = |reason: String| VirtError::InvalidConfig {
+        name: config.name().to_string(),
+        reason,
+    };
+
+    if let Some(machine_identifier) = config.vz().machine_identifier.as_ref() {
+        validate_machine_identifier(config.name(), machine_identifier)?;
     }
 
-    if spec.cpus == Some(0) {
-        return Err(VirtError::InvalidConfig {
-            name: spec.name.clone(),
-            reason: "cpu count must be greater than zero".to_string(),
-        });
-    }
+    validate_nested_virtualization(config)?;
+    validate_rosetta(config)?;
 
-    if spec.memory_mib == Some(0) {
-        return Err(VirtError::InvalidConfig {
-            name: spec.name.clone(),
-            reason: "memory_mib must be greater than zero".to_string(),
-        });
-    }
-
-    let _ = required_path(&spec.name, spec.kernel_path.as_ref(), "kernel_path")?;
-
-    if let Some(machine_identifier) = spec.machine_identifier.as_ref() {
-        validate_machine_identifier(&spec.name, machine_identifier)?;
-    }
-
-    validate_nested_virtualization(spec)?;
-    validate_rosetta(spec)?;
-
-    match &spec.network {
+    match config.network() {
         NetworkMode::None => {}
         NetworkMode::UnixDatagram { peer_path, .. } => {
-            validate_unix_datagram_network(spec, peer_path)?
+            if peer_path.as_os_str().is_empty() || config.vm_id().is_empty() {
+                return Err(invalid(
+                    "unixdatagram networking requires a non-empty VM id and peer socket path"
+                        .to_string(),
+                ));
+            }
         }
         NetworkMode::UnixStream { .. } => {
-            return Err(VirtError::InvalidConfig {
-                name: spec.name.clone(),
-                reason: "unixstream networking is not supported by the VZ backend".to_string(),
-            });
+            return Err(invalid(
+                "unixstream networking is not supported by the VZ backend".to_string(),
+            ));
         }
         NetworkMode::Tap { .. } => {
-            return Err(VirtError::InvalidConfig {
-                name: spec.name.clone(),
-                reason: "tap networking is not supported by the VZ backend".to_string(),
-            });
+            return Err(invalid(
+                "tap networking is not supported by the VZ backend".to_string(),
+            ));
         }
     }
 
-    for mount in &spec.mounts {
-        let metadata = fs::metadata(&mount.host_path).map_err(|err| VirtError::InvalidConfig {
-            name: spec.name.clone(),
-            reason: format!(
+    for mount in config.mounts() {
+        let metadata = fs::metadata(&mount.host_path).map_err(|err| {
+            invalid(format!(
                 "failed to access shared directory {}: {err}",
                 mount.host_path.display()
-            ),
+            ))
         })?;
         if !metadata.is_dir() {
-            return Err(VirtError::InvalidConfig {
-                name: spec.name.clone(),
-                reason: format!(
-                    "shared directory path is not a directory: {}",
-                    mount.host_path.display()
-                ),
-            });
+            return Err(invalid(format!(
+                "shared directory path is not a directory: {}",
+                mount.host_path.display()
+            )));
         }
     }
 
     Ok(())
 }
 
-fn validate_unix_datagram_network(spec: &VmConfig, peer_path: &Path) -> Result<(), VirtError> {
-    if !peer_path.as_os_str().is_empty() && !spec.vm_id.is_empty() {
-        return Ok(());
-    }
-
-    Err(VirtError::InvalidConfig {
-        name: spec.name.clone(),
-        reason: "unixdatagram networking requires a non-empty VM id and peer socket path"
-            .to_string(),
-    })
-}
-
-fn validate_nested_virtualization(spec: &VmConfig) -> Result<(), VirtError> {
-    if !spec.nested_virtualization {
+fn validate_nested_virtualization(config: &VmConfig) -> Result<(), VirtError> {
+    if !config.nested_virtualization() {
         return Ok(());
     }
 
     if !GenericPlatform::is_nested_virtualization_supported() {
         return Err(VirtError::InvalidConfig {
-            name: spec.name.clone(),
+            name: config.name().to_string(),
             reason: "nested virtualization is not supported on this host".to_string(),
         });
     }
@@ -503,20 +473,20 @@ fn validate_nested_virtualization(spec: &VmConfig) -> Result<(), VirtError> {
     Ok(())
 }
 
-fn validate_rosetta(spec: &VmConfig) -> Result<(), VirtError> {
-    if !spec.rosetta {
+fn validate_rosetta(config: &VmConfig) -> Result<(), VirtError> {
+    if !config.vz().rosetta {
         return Ok(());
     }
 
     match vz::rosetta_availability() {
         RosettaAvailability::Installed => Ok(()),
         RosettaAvailability::NotInstalled => Err(VirtError::InvalidConfig {
-            name: spec.name.clone(),
+            name: config.name().to_string(),
             reason: "Rosetta for Linux VMs is not installed on this host. Install it with: softwareupdate --install-rosetta"
                 .to_string(),
         }),
         RosettaAvailability::NotSupported => Err(VirtError::InvalidConfig {
-            name: spec.name.clone(),
+            name: config.name().to_string(),
             reason: "Rosetta is not supported on this host".to_string(),
         }),
     }
@@ -540,14 +510,13 @@ fn validate_machine_identifier(
 
 fn required_path<'a>(
     name: &str,
-    path: Option<&'a PathBuf>,
+    path: Option<&'a Path>,
     field: &'static str,
 ) -> Result<&'a Path, VirtError> {
-    path.map(|path| path.as_path())
-        .ok_or_else(|| VirtError::InvalidConfig {
-            name: name.to_string(),
-            reason: format!("{field} must be set"),
-        })
+    path.ok_or_else(|| VirtError::InvalidConfig {
+        name: name.to_string(),
+        reason: format!("{field} must be set"),
+    })
 }
 
 async fn wait_for_state(
@@ -575,8 +544,7 @@ async fn wait_for_state(
         let now = tokio::time::Instant::now();
         if now >= deadline {
             return Err(VirtError::Backend(format!(
-                "timed out after {:?} waiting for machine to enter {target} (current state: {state})",
-                timeout
+                "timed out after {timeout:?} waiting for machine to enter {target} (current state: {state})"
             )));
         }
 
@@ -590,8 +558,7 @@ async fn wait_for_state(
             }
             Err(_) => {
                 return Err(VirtError::Backend(format!(
-                    "timed out after {:?} waiting for machine to enter {target} (current state: {})",
-                    timeout,
+                    "timed out after {timeout:?} waiting for machine to enter {target} (current state: {})",
                     vm.state()
                 )));
             }
@@ -599,6 +566,6 @@ async fn wait_for_state(
     }
 }
 
-fn vz_error(err: vz::VzError) -> VirtError {
+fn vz_error(err: VzError) -> VirtError {
     VirtError::Backend(err.to_string())
 }

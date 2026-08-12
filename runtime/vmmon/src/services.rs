@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::virt::{SerialAccess, SerialConsole, SerialStream, VirtualMachine};
 use agent_spec::SSH_VSOCK_PORT;
 use eyre::Context;
 use futures::{Stream, StreamExt};
@@ -21,7 +22,6 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use tonic_health::server::{health_reporter, HealthReporter};
-use virt::{SerialAccess, SerialConsole, SerialStream, VirtualMachine};
 
 use crate::context::{DaemonContext, RuntimeContext};
 use crate::endpoints::start_endpoint_supervisor;

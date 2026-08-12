@@ -137,7 +137,14 @@ impl Runtime {
         };
         let roots = config.resolve_store_roots(&stored, bootstrap_paths.state_db_path())?;
         let paths = LocalPaths::from_roots(roots);
-        Self::from_store(paths, Arc::new(store), config.networking, components).await
+        Self::from_store(
+            paths,
+            Arc::new(store),
+            config.networking,
+            components,
+            config.virt_backend,
+        )
+        .await
     }
 
     /// Opens the default local runtime from the process environment.
@@ -156,7 +163,7 @@ impl Runtime {
     ) -> Result<Self, LibVmError> {
         let store = Store::new(&paths).await?;
         let components = crate::runtime::components::test_components(paths.data_dir());
-        Self::from_store(paths, Arc::new(store), networking, components).await
+        Self::from_store(paths, Arc::new(store), networking, components, None).await
     }
 
     pub(crate) async fn from_store(
@@ -164,12 +171,14 @@ impl Runtime {
         store: Arc<dyn DataStore>,
         networking: RuntimeNetworkingConfig,
         components: ResolvedRuntimeComponents,
+        virt_backend: Option<crate::runtime::VirtBackendOverride>,
     ) -> Result<Self, LibVmError> {
         let lock_manager = LockManager::open(paths.locks_dir().to_path_buf())?;
         let vmmon = Vmmon::new(
             paths.clone(),
             components.vmmon.clone(),
             components.krun.clone(),
+            virt_backend,
         );
         let runtime = Self {
             paths,
@@ -1911,7 +1920,7 @@ mod tests {
         ImageCacheState, ImageProgress, ImageProgressSender, ImagePullOptions, ImagePullPolicy,
         ImageResolveOptions, ImageSource, LibVmError, MachineExitOutcome, MachineKillOptions,
         MachineRef, MachineRetention, MachineRunId, MachineStatus, MachineUpdate, Memory,
-        RuntimeConfig, RuntimeNetworkingConfig,
+        RuntimeNetworkingConfig,
     };
     use ocidisk::{
         OciImageConfigMetadata, Platform, RootfsImage, RootfsImageMetadata, RootfsImageSource,
@@ -2114,6 +2123,7 @@ mod tests {
             Arc::new(store),
             RuntimeNetworkingConfig::default(),
             components,
+            None,
         )
         .await
         .expect("create runtime with mock store")
@@ -2156,94 +2166,6 @@ mod tests {
                 .expect("set runtime asset mode");
         }
         root.to_path_buf()
-    }
-
-    // TODO: Replace the shell-based sync-pipe fixture with a real vmmon
-    // instance backed by an injectable VMM.
-    #[tokio::test]
-    #[ignore = "requires a deterministic vmmon/VMM test seam"]
-    async fn complete_portable_runtime_launches_resolved_vmmon_and_propagates_krun() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let runtime_root = write_complete_portable_runtime(&temp.path().join("runtime"));
-        let data_root = temp.path().join("data");
-        let state_root = temp.path().join("state");
-        let run_root = temp.path().join("run");
-        let runtime = Runtime::new(
-            RuntimeConfig::local(&data_root)
-                .with_state_root(&state_root)
-                .with_run_root(&run_root)
-                .with_runtime_root(&runtime_root),
-        )
-        .await
-        .expect("open runtime from complete portable tree");
-        let machine_id = MachineId::new();
-        let machine_paths = runtime.machine_paths(machine_id);
-        std::fs::create_dir_all(machine_paths.dir()).expect("create machine data directory");
-        std::fs::create_dir_all(machine_paths.machine_run_dir())
-            .expect("create machine run directory");
-        std::fs::create_dir_all(machine_paths.machine_logs_dir())
-            .expect("create machine logs directory");
-        let network = crate::network::VmmonNetworkAttachment::None;
-        let pidfile = machine_paths.vmmon_pid_path();
-        let exit_status = machine_paths.vmmon_exit_status_path();
-        let config = machine_paths.vm_spec_path();
-        let socket = machine_paths.vmmon_socket_path();
-        let serial_log = machine_paths.serial_log_path();
-        let trace_log = machine_paths.vm_trace_log_path();
-        let machine_log_dir = runtime
-            .local_paths()
-            .machine_logs_directory(machine_id)
-            .expect("open machine log directory");
-        let launch = crate::vmmon::VmmonLaunch {
-            machine_id,
-            name: "portable-runtime",
-            machine_dir: machine_paths.dir(),
-            pidfile: &pidfile,
-            exit_status: &exit_status,
-            config: &config,
-            socket: &socket,
-            serial_log: &serial_log,
-            trace_log: &trace_log,
-            network: &network,
-            run_id: "portable-run",
-            exit_command: None,
-            agent_enabled: false,
-            startup_command: None,
-            machine_log_dir: &machine_log_dir,
-        };
-
-        runtime
-            .vmmon()
-            .spawn(&launch)
-            .await
-            .expect("launch resolved vmmon");
-
-        let args =
-            std::fs::read_to_string(machine_paths.vm_trace_log_path().with_extension("log.args"))
-                .expect("read vmmon launch arguments");
-        assert_eq!(
-            std::fs::read_to_string(
-                machine_paths
-                    .vm_trace_log_path()
-                    .with_extension("log.program"),
-            )
-            .expect("read launched vmmon path")
-            .trim(),
-            runtime_root
-                .join("bin/vmmon")
-                .canonicalize()
-                .expect("canonical vmmon")
-                .display()
-                .to_string()
-        );
-        assert!(args.contains(
-            &runtime_root
-                .join("bin/krun")
-                .canonicalize()
-                .expect("canonical krun")
-                .display()
-                .to_string()
-        ));
     }
 
     #[test]
@@ -2746,6 +2668,7 @@ mod tests {
             store.clone(),
             RuntimeNetworkingConfig::default(),
             components,
+            None,
         )
         .await
         .expect("create runtime");

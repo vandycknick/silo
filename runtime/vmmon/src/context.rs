@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::virt::{SerialConsole, VirtualMachine};
 use tokio_util::sync::CancellationToken;
-use virt::{SerialConsole, VirtualMachine};
 use vm_spec::VmSpec;
 
 use crate::state::InstanceStore;

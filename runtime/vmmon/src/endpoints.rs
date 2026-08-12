@@ -503,7 +503,7 @@ async fn run_connect_broker(
 async fn run_listen_dispatch(
     ctx: DaemonContext,
     endpoint: VsockEndpoint,
-    mut listener: virt::VsockListener,
+    mut listener: crate::virt::VsockListener,
     control: OwnedFd,
 ) -> Result<(), String> {
     let mut conn_id = 0_u64;

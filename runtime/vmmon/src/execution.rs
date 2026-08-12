@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::virt::VirtualMachine;
 use futures::Stream;
 use protocol::v1::execute_input::Message as ExecuteMessage;
 use protocol::v1::execution_event::Event as ExecutionEventKind;
@@ -19,7 +20,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
-use virt::VirtualMachine;
 
 use crate::context::DaemonContext;
 use crate::exec_log::{ExecLogSource, ExecLogWriter};

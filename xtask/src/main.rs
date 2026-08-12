@@ -6,7 +6,8 @@ use clap::{Parser, Subcommand};
 use thiserror::Error;
 
 use crate::components::{
-    build_all, build_component, clippy, format, test, BuildContext, Component,
+    build_all, build_component, clippy, format, test_integration, test_units, BuildContext,
+    Component,
 };
 use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::kernel::KernelOptions;
@@ -96,6 +97,8 @@ enum Commands {
     Fmt,
     Clippy,
     Test,
+    TestUnit,
+    TestIntegration,
     VersionCheck,
     PackInitramfs {
         #[arg(long, value_name = "PATH")]
@@ -239,7 +242,16 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Commands::Test => {
             let host = HostTarget::current()?;
-            test(&workspace_root, &target_dir, host)?;
+            test_units(&workspace_root, &target_dir, host)?;
+            test_integration(&workspace_root, &target_dir, host)?;
+        }
+        Commands::TestUnit => {
+            let host = HostTarget::current()?;
+            test_units(&workspace_root, &target_dir, host)?;
+        }
+        Commands::TestIntegration => {
+            let host = HostTarget::current()?;
+            test_integration(&workspace_root, &target_dir, host)?;
         }
         Commands::VersionCheck => version::check(&workspace_root)?,
         Commands::PackInitramfs { init, out } => {

@@ -1,3 +1,13 @@
+//! Serial console: pumps the backend serial device into log sinks and live
+//! client streams.
+//!
+//! One console exists per machine. On first attach (machine start or first
+//! stream open) it opens the backend serial device exactly once, splits it,
+//! and spawns a single reader task that fans guest output out to every
+//! registered sink and to a broadcast channel for live streams. At most one
+//! `Interactive` stream may exist at a time and only it may write guest
+//! input; `Watch` streams are unlimited and their writes are ignored.
+
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -5,12 +15,16 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, WriteHalf};
 use tokio::sync::{broadcast, Mutex};
 
-use crate::platform::VmBackend;
-use crate::stream::MachineSerialStream;
+use super::backend::VirtBackend;
+use super::error::VirtError;
+use super::stream::SerialDevice;
 
+/// Access level of a serial client stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SerialAccess {
+    /// Exclusive read/write client; only one may be attached at a time.
     Interactive,
+    /// Read-only observer; input writes are silently ignored.
     Watch,
 }
 
@@ -28,9 +42,9 @@ impl SerialHub {
         }
     }
 
-    fn attach(&mut self, access: SerialAccess) -> Result<u64, crate::types::VirtError> {
+    fn attach(&mut self, access: SerialAccess) -> Result<u64, VirtError> {
         if access == SerialAccess::Interactive && self.interactive_owner.is_some() {
-            return Err(crate::types::VirtError::Backend(
+            return Err(VirtError::Backend(
                 "interactive serial client is already attached".to_string(),
             ));
         }
@@ -58,8 +72,8 @@ impl SerialHub {
 
 #[derive(Debug)]
 struct SerialAttachment {
-    guest_input: WriteHalf<MachineSerialStream>,
-    reader_task: tokio::task::JoinHandle<Result<(), crate::types::VirtError>>,
+    guest_input: WriteHalf<SerialDevice>,
+    reader_task: tokio::task::JoinHandle<Result<(), VirtError>>,
 }
 
 struct SerialSink {
@@ -83,9 +97,11 @@ impl SerialSink {
     }
 }
 
+/// Fan-out hub for a machine's serial device. Obtain via
+/// [`super::VirtualMachine::serial`].
 #[derive(Debug)]
 pub struct SerialConsole {
-    backend: Arc<VmBackend>,
+    backend: Arc<dyn VirtBackend>,
     hub: Arc<Mutex<SerialHub>>,
     attachment: Arc<Mutex<Option<SerialAttachment>>>,
     sinks: Arc<Mutex<Vec<SerialSink>>>,
@@ -93,16 +109,8 @@ pub struct SerialConsole {
     attach_lock: Arc<Mutex<()>>,
 }
 
-#[derive(Debug)]
-pub struct SerialStream {
-    console: Arc<SerialConsole>,
-    client_id: u64,
-    access: SerialAccess,
-    output_rx: broadcast::Receiver<Vec<u8>>,
-}
-
 impl SerialConsole {
-    pub(crate) fn new(backend: Arc<VmBackend>) -> Self {
+    pub(crate) fn new(backend: Arc<dyn VirtBackend>) -> Self {
         let (output_tx, _) = broadcast::channel(256);
         Self {
             backend,
@@ -114,6 +122,9 @@ impl SerialConsole {
         }
     }
 
+    /// Register a writer that receives all guest serial output (e.g. a log
+    /// file). Failing sinks are dropped; others keep receiving. Sinks stay
+    /// registered across machine restarts.
     pub async fn add_sink<W>(&self, sink: W)
     where
         W: AsyncWrite + Send + 'static,
@@ -122,16 +133,39 @@ impl SerialConsole {
         tracing::info!("serial output sink attached");
     }
 
-    pub async fn start(&self) -> Result<(), crate::types::VirtError> {
-        self.ensure_attached().await?;
+    /// Open the backend serial device and start pumping output. Idempotent;
+    /// called by machine start and lazily by `open_stream`.
+    pub(crate) async fn attach(&self) -> Result<(), VirtError> {
+        if self.attachment.lock().await.is_some() {
+            return Ok(());
+        }
+
+        let _guard = self.attach_lock.lock().await;
+        if self.attachment.lock().await.is_some() {
+            return Ok(());
+        }
+
+        let device = self.backend.open_serial().await?;
+        tracing::info!("serial backend stream opened");
+        let (guest_output, guest_input) = tokio::io::split(device);
+        let output_tx = self.output_tx.clone();
+        let sinks = self.sinks.clone();
+        let reader_task =
+            tokio::spawn(async move { run_serial_reader(guest_output, sinks, output_tx).await });
+
+        *self.attachment.lock().await = Some(SerialAttachment {
+            guest_input,
+            reader_task,
+        });
         Ok(())
     }
 
+    /// Open a live client stream over the serial console.
     pub async fn open_stream(
         self: &Arc<Self>,
         access: SerialAccess,
-    ) -> Result<SerialStream, crate::types::VirtError> {
-        self.ensure_attached().await?;
+    ) -> Result<SerialStream, VirtError> {
+        self.attach().await?;
 
         let client_id = {
             let mut hub = self.hub.lock().await;
@@ -145,37 +179,6 @@ impl SerialConsole {
             access,
             output_rx: self.output_tx.subscribe(),
         })
-    }
-
-    async fn ensure_attached(&self) -> Result<(), crate::types::VirtError> {
-        if self.attachment.lock().await.is_some() {
-            return Ok(());
-        }
-
-        let _guard = self.attach_lock.lock().await;
-        if self.attachment.lock().await.is_some() {
-            return Ok(());
-        }
-
-        let stream = self.open_serial_device().await?;
-        tracing::info!("serial backend stream opened");
-        let (guest_output, guest_input) = tokio::io::split(stream);
-        let output_tx = self.output_tx.clone();
-        let sinks = self.sinks.clone();
-        let reader_task =
-            tokio::spawn(async move { run_serial_reader(guest_output, sinks, output_tx).await });
-
-        let attachment = SerialAttachment {
-            guest_input,
-            reader_task,
-        };
-
-        *self.attachment.lock().await = Some(attachment);
-        Ok(())
-    }
-
-    async fn open_serial_device(&self) -> Result<MachineSerialStream, crate::types::VirtError> {
-        self.backend.open_serial().await
     }
 
     async fn write_input(&self, client_id: u64, chunk: &[u8]) -> io::Result<()> {
@@ -198,12 +201,13 @@ impl SerialConsole {
         attachment.guest_input.flush().await
     }
 
-    async fn detach(&self, client_id: u64) {
-        let mut hub = self.hub.lock().await;
-        hub.detach(client_id);
+    async fn detach_client(&self, client_id: u64) {
+        self.hub.lock().await.detach(client_id);
     }
 
-    pub async fn drain(&self) -> Result<(), crate::types::VirtError> {
+    /// Detach from the device and wait for the reader task to flush the final
+    /// output to all sinks. Idempotent; called on machine stop.
+    pub async fn drain(&self) -> Result<(), VirtError> {
         let Some(mut attachment) = self.attachment.lock().await.take() else {
             return Ok(());
         };
@@ -211,43 +215,11 @@ impl SerialConsole {
             .guest_input
             .shutdown()
             .await
-            .map_err(crate::types::VirtError::from)?;
-        attachment.reader_task.await.map_err(|error| {
-            crate::types::VirtError::Backend(format!("serial reader task failed: {error}"))
-        })?
-    }
-}
-
-impl SerialStream {
-    /// Reads the next output chunk. Lagged consumers are disconnected rather
-    /// than silently losing serial output.
-    pub async fn read_output(&mut self) -> io::Result<Option<Vec<u8>>> {
-        match self.output_rx.recv().await {
-            Ok(chunk) => Ok(Some(chunk)),
-            Err(broadcast::error::RecvError::Closed) => Ok(None),
-            Err(broadcast::error::RecvError::Lagged(skipped)) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("serial consumer lagged by {skipped} chunks"),
-            )),
-        }
-    }
-
-    /// Writes interactive input to the guest. Watch-only streams ignore input.
-    pub async fn write_input(&self, chunk: &[u8]) -> io::Result<()> {
-        match self.access {
-            SerialAccess::Interactive => self.console.write_input(self.client_id, chunk).await,
-            SerialAccess::Watch => Ok(()),
-        }
-    }
-}
-
-impl Drop for SerialStream {
-    fn drop(&mut self) {
-        let console = self.console.clone();
-        let client_id = self.client_id;
-        tokio::spawn(async move {
-            console.detach(client_id).await;
-        });
+            .map_err(VirtError::from)?;
+        attachment
+            .reader_task
+            .await
+            .map_err(|error| VirtError::Backend(format!("serial reader task failed: {error}")))?
     }
 }
 
@@ -261,11 +233,53 @@ impl Drop for SerialConsole {
     }
 }
 
+/// A live client stream over the serial console.
+#[derive(Debug)]
+pub struct SerialStream {
+    console: Arc<SerialConsole>,
+    client_id: u64,
+    access: SerialAccess,
+    output_rx: broadcast::Receiver<Vec<u8>>,
+}
+
+impl SerialStream {
+    /// Read the next output chunk; `None` once the console shuts down.
+    /// Lagged consumers are disconnected rather than silently losing output.
+    pub async fn read_output(&mut self) -> io::Result<Option<Vec<u8>>> {
+        match self.output_rx.recv().await {
+            Ok(chunk) => Ok(Some(chunk)),
+            Err(broadcast::error::RecvError::Closed) => Ok(None),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("serial consumer lagged by {skipped} chunks"),
+            )),
+        }
+    }
+
+    /// Write interactive input to the guest. Watch-only streams ignore input.
+    pub async fn write_input(&self, chunk: &[u8]) -> io::Result<()> {
+        match self.access {
+            SerialAccess::Interactive => self.console.write_input(self.client_id, chunk).await,
+            SerialAccess::Watch => Ok(()),
+        }
+    }
+}
+
+impl Drop for SerialStream {
+    fn drop(&mut self) {
+        let console = self.console.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            console.detach_client(client_id).await;
+        });
+    }
+}
+
 async fn run_serial_reader<R>(
     mut guest_output: R,
     sinks: Arc<Mutex<Vec<SerialSink>>>,
     output_tx: broadcast::Sender<Vec<u8>>,
-) -> Result<(), crate::types::VirtError>
+) -> Result<(), VirtError>
 where
     R: AsyncRead + Unpin,
 {
@@ -344,20 +358,23 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::sync::Mutex;
 
-    use crate::serial::SerialSink;
+    use super::{run_serial_reader, SerialSink};
 
     fn temporary_file(name: &str) -> PathBuf {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("virt-{name}-{}-{timestamp}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "vmmon-serial-{name}-{}-{timestamp}",
+            std::process::id()
+        ))
     }
 
     async fn run_reader(sinks: Arc<Mutex<Vec<SerialSink>>>, output: &[u8]) {
         let (reader, mut writer) = tokio::io::duplex(1024);
         let (output_tx, _) = tokio::sync::broadcast::channel(1);
-        let drain = tokio::spawn(crate::serial::run_serial_reader(reader, sinks, output_tx));
+        let drain = tokio::spawn(run_serial_reader(reader, sinks, output_tx));
 
         writer.write_all(output).await.expect("write serial output");
         writer.shutdown().await.expect("close serial producer");

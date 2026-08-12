@@ -101,7 +101,7 @@ pub fn clippy(
     command::run(cargo)
 }
 
-pub fn test(
+pub fn test_units(
     workspace_root: &Path,
     target_dir: &Path,
     host: HostTarget,
@@ -111,7 +111,28 @@ pub fn test(
         "test",
         "--locked",
         "--workspace",
-        "--all-targets",
+        "--lib",
+        "--bins",
+        "--all-features",
+    ]);
+    for member in host.workspace_excludes() {
+        cargo.args(["--exclude", member]);
+    }
+    command::run(cargo)
+}
+
+pub fn test_integration(
+    workspace_root: &Path,
+    target_dir: &Path,
+    host: HostTarget,
+) -> Result<(), command::CommandError> {
+    let mut cargo = standard_cargo_command(workspace_root, target_dir);
+    cargo.args([
+        "test",
+        "--locked",
+        "--workspace",
+        "--test",
+        "*",
         "--all-features",
     ]);
     for member in host.workspace_excludes() {

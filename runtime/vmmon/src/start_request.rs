@@ -15,6 +15,22 @@ pub(crate) struct VmmonStartRequest {
     machine_id: String,
     machine_run_id: String,
     pub(crate) startup_command: Option<StartupCommand>,
+    // Optional additive field within version 1: absent means the
+    // platform-default backend. NEVER feature-gate this field — both sides of
+    // the pipe must parse the same schema regardless of compiled features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) virt_backend: Option<VirtBackendRequest>,
+}
+
+/// Explicit virtualization backend selection carried in the start request.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct VirtBackendRequest {
+    /// Backend name; today only "mock" is meaningful.
+    pub(crate) kind: String,
+    /// Absolute path to a mock scenario file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) scenario: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -72,6 +88,7 @@ impl StartRequestPipe {
                     machine_id: expected_machine_id.to_string(),
                     machine_run_id: expected_machine_run_id.to_string(),
                     startup_command: None,
+                    virt_backend: None,
                 },
                 expected_machine_id,
                 expected_machine_run_id,

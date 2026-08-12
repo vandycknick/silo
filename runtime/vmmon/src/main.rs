@@ -20,6 +20,10 @@ mod shutdown;
 mod start_request;
 mod startup;
 mod state;
+// Library-style module: parts of its surface are only used on one platform,
+// behind the mock-backend feature, or from tests.
+#[allow(dead_code)]
+mod virt;
 
 use crate::context::RuntimeContext;
 use crate::exit_command::ExitCommand;

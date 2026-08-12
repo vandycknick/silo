@@ -49,6 +49,21 @@ pub struct RuntimeConfig {
     pub runtime_root: Option<PathBuf>,
     /// Portable runtime root bundled by an SDK frontend.
     pub bundled_runtime_root: Option<PathBuf>,
+    /// Testing-only override of vmmon's virtualization backend.
+    pub virt_backend: Option<VirtBackendOverride>,
+}
+
+/// Testing-only override of vmmon's virtualization backend.
+///
+/// Set via [`RuntimeConfig::with_mock_vmm`]; requires a vmmon binary built
+/// with its `mock-backend` feature (see the `test-utils` crate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VirtBackendOverride {
+    /// vmmon's in-process mock backend: no real VM runs, the guest side is
+    /// faked in-process. `scenario` is an absolute path to a scenario file
+    /// scripting the mock's behavior; absent means the happy path.
+    Mock { scenario: Option<PathBuf> },
 }
 
 impl RuntimeConfig {
@@ -68,6 +83,7 @@ impl RuntimeConfig {
             agent_path: None,
             runtime_root: None,
             bundled_runtime_root: None,
+            virt_backend: None,
         }
     }
 
@@ -146,6 +162,18 @@ impl RuntimeConfig {
     /// Sets a portable runtime root bundled by an SDK frontend.
     pub fn with_bundled_runtime_root(mut self, bundled_runtime_root: impl Into<PathBuf>) -> Self {
         self.bundled_runtime_root = Some(bundled_runtime_root.into());
+        self
+    }
+
+    /// Testing only: run machines on vmmon's mock virtualization backend.
+    ///
+    /// `scenario` is an absolute path to a mock scenario file (see the
+    /// `test-utils` crate, which also builds a mock-enabled vmmon binary to
+    /// pass to [`RuntimeConfig::with_vmmon_path`]). No real VM will run.
+    pub fn with_mock_vmm(mut self, scenario: impl Into<PathBuf>) -> Self {
+        self.virt_backend = Some(VirtBackendOverride::Mock {
+            scenario: Some(scenario.into()),
+        });
         self
     }
 
@@ -390,6 +418,7 @@ impl Default for RuntimeConfig {
             agent_path: None,
             runtime_root: None,
             bundled_runtime_root: None,
+            virt_backend: None,
         }
     }
 }

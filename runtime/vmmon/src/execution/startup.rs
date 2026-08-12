@@ -154,7 +154,7 @@ async fn wait_for_ready_agent(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_guest(
-    machine: &virt::VirtualMachine,
+    machine: &crate::virt::VirtualMachine,
     store: &Arc<InstanceStore>,
     shutdown: &tokio_util::sync::CancellationToken,
     expected_agent: ReadyAgentIdentity,
@@ -279,7 +279,7 @@ fn unavailable(message: impl Into<String>) -> StartupCommandStartError {
 }
 
 async fn stop_machine(
-    machine: &virt::VirtualMachine,
+    machine: &crate::virt::VirtualMachine,
     shutdown: &tokio_util::sync::CancellationToken,
 ) {
     if shutdown.is_cancelled() {
