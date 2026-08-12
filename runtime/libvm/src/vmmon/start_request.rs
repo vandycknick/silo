@@ -14,6 +14,19 @@ pub(crate) struct VmmonStartRequest {
     machine_run_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     startup_command: Option<VmmonStartupCommand>,
+    // Optional additive field within version 1; must stay schema-compatible
+    // with vmmon's strict (deny_unknown_fields) reader.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    virt_backend: Option<VmmonVirtBackend>,
+}
+
+/// Explicit virtualization backend selection (testing only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct VmmonVirtBackend {
+    pub(crate) kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scenario: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -51,7 +64,13 @@ impl VmmonStartRequest {
             machine_id: machine_id.into(),
             machine_run_id: machine_run_id.into(),
             startup_command,
+            virt_backend: None,
         }
+    }
+
+    pub(crate) fn with_virt_backend(mut self, virt_backend: Option<VmmonVirtBackend>) -> Self {
+        self.virt_backend = virt_backend;
+        self
     }
 }
 

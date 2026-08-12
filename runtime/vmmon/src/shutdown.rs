@@ -1,8 +1,8 @@
 use std::time::Duration;
 
+use crate::virt::VmExit;
 use protocol::v1::VmState;
 use tokio::signal;
-use virt::VmExit;
 
 use crate::context::{DaemonContext, RuntimeContext};
 use crate::services::ServiceHandles;
@@ -72,7 +72,7 @@ async fn graceful_stop(ctx: &DaemonContext) -> eyre::Result<bool> {
     }
 }
 
-async fn drain(handles: &mut ServiceHandles, machine: &virt::VirtualMachine) {
+async fn drain(handles: &mut ServiceHandles, machine: &crate::virt::VirtualMachine) {
     if let Some(task) = handles.startup_command.take() {
         drain_task(task, "startup command supervisor").await;
     }
@@ -138,7 +138,9 @@ struct VmStopInfo {
     message: String,
 }
 
-async fn wait_for_machine_stop(machine: &virt::VirtualMachine) -> Result<VmStopInfo, eyre::Report> {
+async fn wait_for_machine_stop(
+    machine: &crate::virt::VirtualMachine,
+) -> Result<VmStopInfo, eyre::Report> {
     let exit = machine.wait().await?;
     let message = match exit {
         VmExit::Stopped => String::from("machine stopped"),

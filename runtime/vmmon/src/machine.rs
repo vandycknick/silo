@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 
+use crate::virt::{
+    DiskImage, MachineIdentifier, SharedDirectory, VirtError, VmConfig, VmConfigBuilder, VsockPort,
+    VsockPortMode,
+};
 use agent_spec::SSH_VSOCK_PORT;
 use protocol::guest_port_arg;
 use thiserror::Error;
 use utils::parse_mac;
-use virt::{
-    DiskImage, MachineIdentifier, SharedDirectory, VirtError, VmConfig, VmConfigBuilder, VsockPort,
-    VsockPortMode,
-};
 use vm_spec::{VmSpec, VsockEndpointMode};
 
 use crate::ext::VmSpecExt;
@@ -274,11 +274,11 @@ fn load_host_machine_identifier(
 #[cfg(test)]
 mod tests {
     use super::{apply_runtime_network, vm_spec_machine_config, RuntimeNetwork, VmSpecInputs};
+    use crate::virt::{VmConfig, VsockPortMode};
     use agent_spec::SSH_VSOCK_PORT;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use virt::{VmConfig, VsockPortMode};
     use vm_spec::{Boot, Disk, Hardware, Kernel, Storage, VmSpec};
 
     const DATA_DISK: &str = "data.img";
@@ -381,7 +381,7 @@ mod tests {
         .expect("machine config should resolve");
 
         assert_eq!(
-            machine_config.config.kernel_cmdline,
+            machine_config.config.kernel_cmdline().to_vec(),
             vec![
                 "root=/dev/vda".to_string(),
                 "systemd.firstboot=off".to_string(),
@@ -390,17 +390,17 @@ mod tests {
         );
         assert_eq!(machine_config.config.vm_id(), "vm123");
         assert_eq!(
-            machine_config.config.krun_path.as_deref(),
+            machine_config.config.krun().helper_path.as_deref(),
             Some(Path::new("/tmp/krun"))
         );
         assert!(machine_config
             .config
-            .vsock_ports
+            .vsock_ports()
             .iter()
             .any(|port| port.port == 1027 && port.mode == VsockPortMode::Connect));
         assert!(machine_config
             .config
-            .vsock_ports
+            .vsock_ports()
             .iter()
             .any(|port| port.port == SSH_VSOCK_PORT && port.mode == VsockPortMode::Connect));
 
@@ -425,7 +425,7 @@ mod tests {
         })
         .expect("machine config should resolve");
 
-        assert!(machine_config.config.disks.is_empty());
+        assert!(machine_config.config.disks().is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -460,11 +460,14 @@ mod tests {
         })
         .expect("machine config should resolve");
 
-        assert_eq!(machine_config.config.disks.len(), 2);
-        assert_eq!(machine_config.config.disks[0].path, dir.join("rootfs.img"));
-        assert!(!machine_config.config.disks[0].read_only);
-        assert_eq!(machine_config.config.disks[1].path, dir.join(DATA_DISK));
-        assert!(machine_config.config.disks[1].read_only);
+        assert_eq!(machine_config.config.disks().len(), 2);
+        assert_eq!(
+            machine_config.config.disks()[0].path,
+            dir.join("rootfs.img")
+        );
+        assert!(!machine_config.config.disks()[0].read_only);
+        assert_eq!(machine_config.config.disks()[1].path, dir.join(DATA_DISK));
+        assert!(machine_config.config.disks()[1].read_only);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -520,11 +523,11 @@ mod tests {
         })
         .expect("machine config should resolve");
 
-        assert_eq!(machine_config.config.cpus, Some(1));
-        assert_eq!(machine_config.config.memory_mib, Some(512));
-        assert!(machine_config.config.initramfs_path.is_none());
-        assert!(machine_config.config.kernel_cmdline.is_empty());
-        assert!(machine_config.config.disks.is_empty());
+        assert_eq!(machine_config.config.cpus(), Some(1));
+        assert_eq!(machine_config.config.memory_mib(), Some(512));
+        assert!(machine_config.config.initramfs_path().is_none());
+        assert!(machine_config.config.kernel_cmdline().is_empty());
+        assert!(machine_config.config.disks().is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -549,7 +552,7 @@ mod tests {
         })
         .expect("machine config should resolve");
 
-        assert!(machine_config.config.initramfs_path.is_none());
+        assert!(machine_config.config.initramfs_path().is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }

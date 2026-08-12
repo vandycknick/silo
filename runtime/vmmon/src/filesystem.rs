@@ -1,6 +1,7 @@
 use std::pin::Pin;
 use std::time::Duration;
 
+use crate::virt::VirtualMachine;
 use futures::{Stream, StreamExt};
 use hyper_util::rt::TokioIo;
 use protocol::v1::guest_filesystem_service_client::GuestFilesystemServiceClient;
@@ -18,7 +19,6 @@ use tokio_util::task::AbortOnDropHandle;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Response, Status};
 use tower::service_fn;
-use virt::VirtualMachine;
 
 const MAX_TRANSFER_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const RELAY_CAPACITY: usize = 8;

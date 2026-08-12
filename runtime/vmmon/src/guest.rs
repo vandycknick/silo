@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::virt::VirtualMachine;
 use hyper_util::rt::TokioIo;
 use protocol::v1::guest_agent_service_client::GuestAgentServiceClient;
 use protocol::v1::guest_process_service_client::GuestProcessServiceClient;
@@ -10,7 +11,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
-use virt::VirtualMachine;
 
 use crate::state::{InstanceStore, StoreError};
 

@@ -5,10 +5,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::virt::VirtualMachine;
 use eyre::Context;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
-use virt::VirtualMachine;
 use vm_spec::VmSpec;
 
 use crate::context::{DaemonContext, RuntimeContext};
@@ -172,7 +172,8 @@ pub async fn init(
         guest_services_enabled,
         krun_path,
     })?;
-    let machine = VirtualMachine::new(machine_config.config)?;
+    let machine =
+        create_virtual_machine(start_request.virt_backend.as_ref(), machine_config.config)?;
     let serial_console = machine.serial();
     serial_console
         .add_sink(tokio::fs::File::from_std(serial_file))
@@ -211,6 +212,45 @@ pub async fn init(
         },
         startup_command: start_request.startup_command,
     })
+}
+
+/// Construct the machine on the backend the start request selects; absent
+/// selection means the platform default. Selecting "mock" in a vmmon built
+/// without the mock-backend feature fails cleanly (surfaced on the syncpipe
+/// as a start failure).
+fn create_virtual_machine(
+    virt_backend: Option<&crate::start_request::VirtBackendRequest>,
+    config: crate::virt::VmConfig,
+) -> eyre::Result<VirtualMachine> {
+    match virt_backend {
+        None => Ok(VirtualMachine::new(config)?),
+        Some(backend) if backend.kind == "mock" => {
+            #[cfg(feature = "mock-backend")]
+            {
+                let mut config = config;
+                if let Some(scenario) = backend.scenario.as_ref() {
+                    config.set_mock_scenario(scenario.clone());
+                }
+                Ok(VirtualMachine::with_backend(
+                    crate::virt::BackendKind::Mock,
+                    config,
+                )?)
+            }
+            #[cfg(not(feature = "mock-backend"))]
+            {
+                let _ = config;
+                Err(crate::virt::VirtError::UnsupportedBackend {
+                    kind: "mock",
+                    reason: "vmmon was built without the mock-backend feature".to_string(),
+                }
+                .into())
+            }
+        }
+        Some(backend) => Err(eyre::eyre!(
+            "start request selected unknown virt backend {:?}",
+            backend.kind
+        )),
+    }
 }
 
 fn secure_machine_dir(path: &std::path::Path) -> eyre::Result<()> {

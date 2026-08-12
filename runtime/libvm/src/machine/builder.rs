@@ -786,6 +786,7 @@ mod tests {
             Arc::new(store),
             RuntimeNetworkingConfig::default(),
             components,
+            None,
         )
         .await
         .expect("create runtime with mock store")
@@ -799,6 +800,7 @@ mod tests {
             store.clone(),
             RuntimeNetworkingConfig::default(),
             components,
+            None,
         )
         .await
         .expect("create runtime with sqlite store");

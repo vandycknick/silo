@@ -2597,6 +2597,7 @@ dependencies = [
  "sqlx",
  "ssh-key",
  "tempfile",
+ "test-utils",
  "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
@@ -5014,6 +5015,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
+name = "test-utils"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5590,18 +5599,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "virt"
-version = "0.1.0"
-dependencies = [
- "krun",
- "nix 0.31.3",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "vz",
-]
-
-[[package]]
 name = "virtio-bindings"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5664,6 +5661,7 @@ name = "vmmon"
 version = "0.1.0"
 dependencies = [
  "agent-spec",
+ "async-trait",
  "base64 0.23.0",
  "bytes",
  "chrono",
@@ -5671,6 +5669,7 @@ dependencies = [
  "eyre",
  "futures",
  "hyper-util",
+ "krun",
  "libc",
  "nix 0.31.3",
  "prost-types",
@@ -5678,6 +5677,7 @@ dependencies = [
  "rand 0.10.2",
  "serde",
  "serde_json",
+ "test-utils",
  "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
@@ -5691,8 +5691,8 @@ dependencies = [
  "tracing-subscriber",
  "utils",
  "uuid",
- "virt",
  "vm-spec",
+ "vz",
 ]
 
 [[package]]
