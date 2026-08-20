@@ -9,6 +9,8 @@ use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
 use utils::format_mac;
 
 use crate::config::{validate_config, Disk, KrunConfig, Network};
+#[cfg(target_os = "linux")]
+use crate::error::KrunBackendError;
 use crate::error::Result;
 use crate::serial::SerialConnection;
 use crate::vm::VirtualMachine;
@@ -113,6 +115,9 @@ impl VirtualMachineBuilder {
     pub fn start(self) -> Result<VirtualMachine> {
         validate_config(&self.config)?;
 
+        #[cfg(target_os = "linux")]
+        check_krun_host(&self.krun_binary)?;
+
         let args = command_args(&self.config);
         let (watchdog_fd, watchdog_keepalive) = crate::watchdog::create()?;
         let mut command = Command::new(&self.krun_binary);
@@ -150,6 +155,30 @@ impl VirtualMachineBuilder {
             Some(watchdog_keepalive),
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn check_krun_host(binary: &std::path::Path) -> Result<()> {
+    let output = Command::new(binary)
+        .arg("--check-host-basic")
+        .stdin(Stdio::null())
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    Err(KrunBackendError::HostCheck {
+        binary: binary.display().to_string(),
+        status: output.status.to_string(),
+        message: if message.is_empty() {
+            "helper returned no diagnostic output".to_string()
+        } else {
+            message
+        },
+    })
 }
 
 impl Default for VirtualMachineBuilder {

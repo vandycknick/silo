@@ -13,6 +13,13 @@ pub enum KrunBackendError {
     #[error("krun serial stream is not configured; enable stdio_console first")]
     SerialNotConfigured,
 
+    #[error("krun host check through {binary} failed with {status}: {message}")]
+    HostCheck {
+        binary: String,
+        status: String,
+        message: String,
+    },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

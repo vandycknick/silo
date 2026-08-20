@@ -24,3 +24,6 @@ tracing = "0.1.44"
 # libkrun supports Image.bz2 kernels. Keep its bzip2 dependency inside the
 # self-contained helper instead of resolving a host libbz2 at runtime.
 bzip2 = { version = "0.5.2", features = ["static"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-ioctls = "0.22.1"

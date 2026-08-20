@@ -5,6 +5,8 @@
 mod builder;
 mod config;
 mod error;
+#[cfg(target_os = "linux")]
+mod host;
 mod serial;
 mod vm;
 mod watchdog;
@@ -15,5 +17,7 @@ pub use crate::config::{
     VsockPort, DEFAULT_ID,
 };
 pub use crate::error::{KrunBackendError, Result};
+#[cfg(target_os = "linux")]
+pub use crate::host::{check_host, check_host_with_vm_creation, KvmHostError, KvmHostInfo};
 pub use crate::serial::SerialConnection;
 pub use crate::vm::VirtualMachine;

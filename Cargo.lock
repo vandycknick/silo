@@ -2333,6 +2333,7 @@ dependencies = [
  "bzip2",
  "clap",
  "eyre",
+ "kvm-ioctls",
  "libkrun",
  "nix 0.31.3",
  "thiserror 2.0.19",

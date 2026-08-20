@@ -31,6 +31,13 @@ const SOCKET_SNDBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
     after_help = "Examples:\n  krun --kernel ./vmlinux --initramfs ./initramfs.img --network none\n  krun --kernel ./vmlinux --net-peer \"$TMPDIR/gvproxy.sock\" --net-mac 02:94:ef:e4:0c:ee --network unixgram\n  krun --kernel ./vmlinux --net-peer \"$TMPDIR/passt.sock\" --net-mac 02:94:ef:e4:0c:ef --network unixstream\n  krun --kernel ./vmlinux --net-tap-name tap0 --net-mac 02:94:ef:e4:0c:f0 --network tap\n"
 )]
 struct Cli {
+    /// Validate KVM access, required capabilities, and empty VM creation.
+    #[cfg(target_os = "linux")]
+    #[arg(long, exclusive = true)]
+    check_host: bool,
+    #[cfg(target_os = "linux")]
+    #[arg(long, exclusive = true, hide = true)]
+    check_host_basic: bool,
     /// Stable VM identifier used for helper-owned socket names.
     #[arg(long, default_value = DEFAULT_ID)]
     id: String,
@@ -186,6 +193,23 @@ fn reject_arg(present: bool, flag: &'static str, mode: &'static str) -> eyre::Re
 fn main() -> eyre::Result<()> {
     watchdog::start_from_env();
     let cli = Cli::parse();
+    #[cfg(target_os = "linux")]
+    {
+        if cli.check_host {
+            let info = krun::check_host_with_vm_creation()
+                .map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
+            println!(
+                "KVM host check passed: API version {}; required capabilities available; empty VM creation succeeded",
+                info.api_version
+            );
+            return Ok(());
+        }
+        if cli.check_host_basic {
+            krun::check_host().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
+            return Ok(());
+        }
+        krun::check_host().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
+    }
     let config = cli.into_config()?;
     validate_config(&config)?;
     start_enter(&config)?;
@@ -305,7 +329,10 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 mod tests {
     use std::path::Path;
 
+    use clap::Parser;
+
     use super::context::KernelFormat;
+    use super::Cli;
     use super::{external_kernel_format, local_unix_datagram_path};
 
     #[test]
@@ -335,5 +362,12 @@ mod tests {
             local_unix_datagram_path(Path::new("/tmp/silo-net/gvproxy.sock"), "vm123", "krun"),
             Path::new("/tmp/silo-net/vm123-krun.sock")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_check_is_exclusive_with_vm_arguments() {
+        assert!(Cli::try_parse_from(["krun", "--check-host"]).is_ok());
+        assert!(Cli::try_parse_from(["krun", "--check-host", "--cpus", "2"]).is_err());
     }
 }

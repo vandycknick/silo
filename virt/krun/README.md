@@ -9,7 +9,7 @@ The crate exposes:
 - a `SerialConnection` wrapper for helper stdio access
 - typed disk, mount, and vsock configuration structs
 
-The `krun` binary is intentionally small. It parses Silo's flat helper arguments, configures libkrun directly, and then enters the VM. It does not use the library builder and does not expose subcommands.
+The `krun` binary is intentionally small. It parses Silo's flat helper arguments, configures libkrun directly, and then enters the VM. It does not use the library builder and does not expose subcommands. On Linux, `krun --check-host` runs the deeper KVM host check without starting a guest.
 
 ## Boundary
 
@@ -23,6 +23,7 @@ Library responsibilities:
 - spawn and manage the `krun` helper process
 - set up PTY-backed stdio when `stdio_console(true)` is requested
 - expose process lifecycle and serial ownership handles
+- run the helper's lightweight host admission check before spawning a VM
 
 Binary responsibilities:
 
@@ -30,6 +31,25 @@ Binary responsibilities:
 - call the source-integrated libkrun APIs through a helper-private adapter
 - convert paths, strings, and libkrun return codes into contextual errors
 - enter the VM
+- validate Linux KVM access, API compatibility, and required capabilities
+
+## Linux Host Checks
+
+Every Linux VM launch performs a lightweight check through the same `krun`
+helper that will run the guest. It opens `/dev/kvm`, requires stable KVM API
+version 12, and verifies the capabilities libkrun needs. Failure is returned to
+vmmon before the VM helper process is spawned.
+
+For a deeper operational check, run:
+
+```sh
+krun --check-host
+```
+
+The explicit check also executes `KVM_CREATE_VM` and immediately closes the
+empty VM descriptor. It allocates no guest memory or vCPUs and runs no guest
+code. This detects ioctl restrictions and nested-virtualization failures that
+opening `/dev/kvm` alone cannot prove.
 
 Do not import `libkrun` from library modules. Direct libkrun access belongs in the helper-private adapter below `src/bin/krun`. The library is a launcher/wrapper around the helper binary, not a libkrun API facade.
 
@@ -55,6 +75,7 @@ Planned follow-up scope includes:
 - Rust toolchain
 - access to the pinned public libkrun fork when Cargo dependencies are fetched
 - Linux or macOS host support matching the compiled libkrun backend
+- on Linux, access to a KVM device with the required API and capabilities
 
 ## Source Integration
 

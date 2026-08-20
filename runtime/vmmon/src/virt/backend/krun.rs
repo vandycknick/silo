@@ -424,6 +424,10 @@ fn krun_error(config: &VmConfig, err: KrunBackendError) -> VirtError {
             name: config.name().to_string(),
             reason,
         },
+        err @ KrunBackendError::HostCheck { .. } => VirtError::UnsupportedBackend {
+            kind: "krun",
+            reason: err.to_string(),
+        },
         KrunBackendError::Io(err) => VirtError::Io(err),
         err => VirtError::Backend(err.to_string()),
     }
@@ -591,7 +595,7 @@ mod tests {
         let krun = root.join("krun");
         write_executable(
             &krun,
-            "#!/bin/sh\nkernel=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--kernel\" ]; then kernel=$arg; fi\n  previous=$arg\ndone\nprintf '%s\\n' \"$0\" > \"${kernel%/*}/krun.program\"\nprintf '%s\\n' \"$@\" > \"${kernel%/*}/krun.args\"\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--check-host-basic\" ]; then exit 0; fi\nkernel=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--kernel\" ]; then kernel=$arg; fi\n  previous=$arg\ndone\nprintf '%s\\n' \"$0\" > \"${kernel%/*}/krun.program\"\nprintf '%s\\n' \"$@\" > \"${kernel%/*}/krun.args\"\n",
         );
         let krun = krun.canonicalize().expect("canonical krun");
         let kernel = kernel.canonicalize().expect("canonical kernel");
@@ -622,6 +626,39 @@ mod tests {
         assert!(args.lines().any(|arg| arg == "machine-1"));
         assert!(args.lines().any(|arg| arg == "--kernel"));
         assert!(args.lines().any(|arg| arg == kernel.display().to_string()));
+
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[tokio::test]
+    async fn failed_host_check_prevents_krun_vm_launch() {
+        let root = test_dir();
+        fs::create_dir_all(&root).expect("create test root");
+        let kernel = root.join("kernel");
+        fs::write(&kernel, b"kernel").expect("write kernel");
+        let krun = root.join("krun");
+        write_executable(
+            &krun,
+            "#!/bin/sh\nif [ \"$1\" = \"--check-host-basic\" ]; then echo 'open /dev/kvm: Permission denied. Hint: check device-cgroup policy' >&2; exit 1; fi\ntouch \"$0.launched\"\n",
+        );
+        let krun = krun.canonicalize().expect("canonical krun");
+        let kernel = kernel.canonicalize().expect("canonical kernel");
+        let config = VmConfig::builder("unavailable-krun")
+            .vm_id("machine-1")
+            .cpus(1)
+            .memory(128)
+            .base_directory(&root)
+            .krun_path(&krun)
+            .kernel(&kernel)
+            .network(NetworkMode::None)
+            .build();
+        let backend = KrunBackend::new(config).expect("create krun backend");
+
+        let error = backend.start().await.expect_err("host check must fail");
+        let message = error.to_string();
+        assert!(message.contains("open /dev/kvm: Permission denied"));
+        assert!(message.contains("device-cgroup policy"));
+        assert!(!krun.with_extension("launched").exists());
 
         fs::remove_dir_all(root).expect("remove test root");
     }
