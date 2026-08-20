@@ -69,7 +69,12 @@ cargo build --locked --release -p krun --features krun-bin --bin krun
 The plain `krun` library does not activate the optional libkrun dependency.
 Only the `krun-bin` feature used by the helper does so.
 
-On Linux, `ldd` and `readelf -d` must not report `libkrun.so`. On macOS,
+On x86-64, `krun-bin` also activates bzip2's `static` feature. Libkrun uses
+bzip2 to load `Image.bz2` kernels, and the helper must not depend on a host
+`libbz2.so` that is absent from the portable runtime.
+
+On Linux, `ldd` and `readelf -d` must not report `libkrun.so` or `libbz2.so`.
+On macOS,
 `otool -L` must not report `libkrun.dylib`. The macOS helper still uses
 Hypervisor.framework and must be signed with the
 `com.apple.security.hypervisor` entitlement before distribution.

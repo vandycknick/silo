@@ -220,6 +220,14 @@ fn build_krun(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     ]);
     context.profile.apply_cargo(&mut cargo);
     command::run(cargo)?;
+
+    let krun = context
+        .target_dir
+        .join(context.profile.directory())
+        .join("krun");
+    let mut smoke = Command::new(krun);
+    smoke.arg("--help");
+    command::output(smoke)?;
     Ok(())
 }
 

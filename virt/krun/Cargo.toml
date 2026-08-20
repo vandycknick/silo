@@ -9,7 +9,7 @@ path = "src/bin/krun.rs"
 required-features = ["krun-bin"]
 
 [features]
-krun-bin = ["dep:libkrun"]
+krun-bin = ["dep:bzip2", "dep:libkrun"]
 
 [dependencies]
 utils = { path = "../../common/utils" }
@@ -19,3 +19,8 @@ eyre = "0.6.12"
 nix = { version = "0.31.3", features = ["fs", "poll", "socket", "term"] }
 thiserror = "2.0.19"
 tracing = "0.1.44"
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+# libkrun supports Image.bz2 kernels. Keep its bzip2 dependency inside the
+# self-contained helper instead of resolving a host libbz2 at runtime.
+bzip2 = { version = "0.5.2", features = ["static"], optional = true }
