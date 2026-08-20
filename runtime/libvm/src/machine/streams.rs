@@ -17,6 +17,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::machine::{Machine, MachineData, MachineRef};
 use crate::store::models::MachineConfig;
+use crate::vmmon::VmmonClientError;
 use crate::LibVmError;
 
 const PRODUCER_CHUNK_BYTES: usize = 32 * 1024;
@@ -506,7 +507,7 @@ impl Machine {
             .client(self.machine_id())
             .status()
             .await
-            .and_then(MachineMonitorStatus::try_from)
+            .and_then(|value| MachineMonitorStatus::try_from(value).map_err(Into::into))
             .map_err(|message| monitor_error(config.name, message))
     }
     pub async fn wait_ready(&self, timeout: Duration) -> Result<MachineReadiness, LibVmError> {
@@ -516,7 +517,7 @@ impl Machine {
             .client(self.machine_id())
             .wait_ready(timeout)
             .await
-            .and_then(MachineReadiness::try_from)
+            .and_then(|value| MachineReadiness::try_from(value).map_err(Into::into))
             .map_err(|message| monitor_error(config.name, message))
     }
     pub async fn metrics(&self) -> Result<MachineMetrics, LibVmError> {
@@ -526,7 +527,7 @@ impl Machine {
             .client(self.machine_id())
             .metrics()
             .await
-            .and_then(MachineMetrics::try_from)
+            .and_then(|value| MachineMetrics::try_from(value).map_err(Into::into))
             .map_err(|message| monitor_error(config.name, message))
     }
     pub async fn get_file_entry(
@@ -540,7 +541,7 @@ impl Machine {
             .client(self.machine_id())
             .get_entry(GetEntryRequest { path: Some(path) })
             .await
-            .and_then(MachineFileEntry::try_from)
+            .and_then(|value| MachineFileEntry::try_from(value).map_err(Into::into))
             .map_err(|message| monitor_error(config.name, message))
     }
     pub async fn remove_file_entry(
@@ -579,7 +580,7 @@ impl Machine {
                 cursor: cursor.map(|value| value.to_vec()),
             })
             .await
-            .and_then(MachineDirectoryPage::try_from)
+            .and_then(|value| MachineDirectoryPage::try_from(value).map_err(Into::into))
             .map_err(|message| monitor_error(config.name, message))
     }
     pub async fn create_directory(
@@ -605,7 +606,9 @@ impl Machine {
                 gid,
             })
             .await
-            .and_then(|value| MachineDirectoryCreateDisposition::try_from(value.disposition))
+            .and_then(|value| {
+                MachineDirectoryCreateDisposition::try_from(value.disposition).map_err(Into::into)
+            })
             .map_err(|message| monitor_error(config.name, message))
     }
     pub async fn download_file(
@@ -655,13 +658,17 @@ impl Machine {
                 producer.abort();
                 let _ = producer.await;
                 response
-                    .and_then(|value| FileWriteDisposition::try_from(value.disposition))
+                    .and_then(|value| {
+                        FileWriteDisposition::try_from(value.disposition).map_err(Into::into)
+                    })
                     .map_err(|message| monitor_error(config.name, message))
             }
             UploadOutcome::Producer(Ok(Ok(()))) => {
                 drop(request_guard);
                 rpc.await
-                    .and_then(|value| FileWriteDisposition::try_from(value.disposition))
+                    .and_then(|value| {
+                        FileWriteDisposition::try_from(value.disposition).map_err(Into::into)
+                    })
                     .map_err(|message| monitor_error(config.name, message))
             }
             UploadOutcome::Producer(Ok(Err(error))) => {
@@ -778,8 +785,13 @@ where
     (producer, completion_rx)
 }
 
-fn monitor_error(reference: String, message: String) -> LibVmError {
-    LibVmError::MonitorProtocol { reference, message }
+fn monitor_error(reference: String, error: impl Into<VmmonClientError>) -> LibVmError {
+    match error.into() {
+        VmmonClientError::Connection(message) => {
+            LibVmError::MonitorConnection { reference, message }
+        }
+        VmmonClientError::Protocol(message) => LibVmError::MonitorProtocol { reference, message },
+    }
 }
 fn request_error(message: impl Into<String>) -> LibVmError {
     LibVmError::MonitorProtocol {

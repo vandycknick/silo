@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Args;
 use libvm::{
-    ImageProgressSender, MachineReadinessOutcome, MachineRetention, MachineRunId,
-    MachineStartOptions, ReadOnlyRuntime, RuntimeConfig, DEFAULT_GUEST_READINESS_TIMEOUT,
+    ImageProgressSender, MachineExitOutcome, MachineReadinessOutcome, MachineRetention,
+    MachineRunId, MachineStartOptions, MachineWaitOptions, ReadOnlyRuntime, RuntimeConfig,
+    DEFAULT_GUEST_READINESS_TIMEOUT,
 };
 
 use crate::commands::create::{
@@ -18,6 +20,8 @@ use crate::commands::start_options::machine_start_options_without_cleanup;
 use crate::environment::EnvironmentOverride;
 use crate::planning::{Plan, PlanKind, ProcessOverrides, RunOptions, TtyCapabilities, TtyMode};
 use crate::ui::{watch_image_progress, OutputFormat, Spinner};
+
+const FAILED_READINESS_EXIT_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Args)]
 #[command(about = "Run an image or template workload")]
@@ -261,16 +265,29 @@ impl Cmd {
         let readiness = match machine.wait_ready(DEFAULT_GUEST_READINESS_TIMEOUT).await {
             Ok(readiness) => readiness,
             Err(error) => {
-                return Err(cleanup_foreground_failure(
+                let error = diagnose_readiness_failure(
                     &machine,
+                    start.run_id.clone(),
                     plan.create.retention,
-                    error.into(),
+                    error,
                 )
-                .await)
+                .await;
+                let stop = stop_run(&machine, start.run_id, plan.create.retention).await;
+                return Err(
+                    foreground_stop_failure(&machine, plan.create.retention, stop, error).await,
+                );
             }
         };
         if readiness.outcome != MachineReadinessOutcome::Ready {
-            let error = eyre::eyre!("guest readiness check ended with {:?}", readiness.outcome);
+            let error = if readiness.outcome == MachineReadinessOutcome::Terminal {
+                diagnose_backend_exit(&machine, start.run_id.clone(), plan.create.retention)
+                    .await
+                    .unwrap_or_else(|| {
+                        eyre::eyre!("guest readiness check ended with {:?}", readiness.outcome)
+                    })
+            } else {
+                eyre::eyre!("guest readiness check ended with {:?}", readiness.outcome)
+            };
             let stop = stop_run(&machine, start.run_id, plan.create.retention).await;
             return Err(
                 foreground_stop_failure(&machine, plan.create.retention, stop, error).await,
@@ -358,11 +375,63 @@ async fn stop_run(
     retention: MachineRetention,
 ) -> eyre::Result<()> {
     match machine.stop_run(run_id).await {
-        Ok(_) | Err(libvm::LibVmError::MachineNotRunning { .. }) => {}
+        Ok(_)
+        | Err(libvm::LibVmError::MachineNotRunning { .. })
+        | Err(libvm::LibVmError::MachineStaleGeneration { current: None, .. }) => {}
         Err(error) => return Err(error.into()),
     }
     cleanup_ephemeral_best_effort(machine, retention).await;
     Ok(())
+}
+
+async fn diagnose_readiness_failure(
+    machine: &libvm::Machine,
+    run_id: MachineRunId,
+    retention: MachineRetention,
+    error: libvm::LibVmError,
+) -> eyre::Report {
+    if !matches!(&error, libvm::LibVmError::MonitorConnection { .. }) {
+        return error.into();
+    }
+
+    diagnose_backend_exit(machine, run_id, retention)
+        .await
+        .unwrap_or_else(|| error.into())
+}
+
+async fn diagnose_backend_exit(
+    machine: &libvm::Machine,
+    run_id: MachineRunId,
+    retention: MachineRetention,
+) -> Option<eyre::Report> {
+    let exit = machine
+        .wait_for_run_with(
+            run_id,
+            MachineWaitOptions::new().timeout(FAILED_READINESS_EXIT_WAIT),
+        )
+        .await;
+    let Ok(exit) = exit else {
+        return None;
+    };
+    let backend_error = match exit.outcome {
+        MachineExitOutcome::Error { message } => message.or(exit.machine.last_error),
+        MachineExitOutcome::AlreadyStopped => exit.machine.last_error,
+        _ => None,
+    };
+    let backend_error = backend_error?;
+
+    let hint = if retention == MachineRetention::Ephemeral {
+        "rerun with `--name` to retain the machine's serial log".to_string()
+    } else {
+        format!(
+            "inspect backend output with `silo logs {} --stream serial`",
+            machine.id()
+        )
+    };
+    Some(eyre::eyre!(
+        "machine {} stopped during startup: {backend_error}\n\nhint: {hint}",
+        exit.machine.name,
+    ))
 }
 
 fn start_failure(error: libvm::LibVmError) -> eyre::Report {

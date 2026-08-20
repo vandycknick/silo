@@ -871,7 +871,7 @@ impl Machine {
             .execution_client(self.machine_id())
             .execute(ReceiverStream::new(receiver))
             .await
-            .map_err(|message| guest_session_error(&reference, message))?;
+            .map_err(|error| guest_session_error(&reference, error.to_string()))?;
         if let StdinMode::Bytes(data) = stdin {
             for chunk in data.chunks(EXECUTION_CHUNK_SIZE) {
                 requests

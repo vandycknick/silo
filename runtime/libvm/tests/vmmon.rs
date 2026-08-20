@@ -12,7 +12,7 @@ use std::time::Duration;
 use libvm::{
     ExecutionLaunchFailureReason, ExecutionLostReason, ExecutionResult, FileWriteDisposition,
     ImageSource, LibVmError, Machine, MachineAgentStatus, MachineDirectoryCreateDisposition,
-    MachineFileUploadOptions, MachineReadinessOutcome, Runtime, RuntimeConfig,
+    MachineExitOutcome, MachineFileUploadOptions, MachineReadinessOutcome, Runtime, RuntimeConfig,
 };
 use test_utils::Scenario;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -336,6 +336,15 @@ async fn machine_wait_reconciles_vmmon_crash_and_marks_machine_stopped() {
         "machine must be inactive after the crash: {:?}",
         exit.machine.status
     );
+    match exit.outcome {
+        MachineExitOutcome::Error { message } => assert!(
+            message
+                .as_deref()
+                .is_some_and(|message| message.contains("scripted vmm crash")),
+            "backend crash must survive vmmon exit reconciliation: {message:?}"
+        ),
+        other => panic!("backend crash must produce an error exit, got {other:?}"),
+    }
 
     machine.remove().await.expect("remove machine");
 }

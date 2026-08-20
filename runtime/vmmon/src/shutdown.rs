@@ -15,13 +15,13 @@ pub async fn run(
     ctx: DaemonContext,
     mut handles: ServiceHandles,
 ) -> eyre::Result<()> {
-    let forced = tokio::select! {
+    let (forced, backend_error) = tokio::select! {
         _ = wait_for_signal() => {
             tracing::info!(instance = %ctx.machine.name(), "shutdown signal received");
             ctx.store.set_vm_state(VmState::Stopping, "shutdown requested")?;
             handles.mark_stopping().await;
             ctx.shutdown.cancel();
-            graceful_stop(&ctx).await?
+            (graceful_stop(&ctx).await?, None)
         }
         result = wait_for_machine_stop(&ctx.machine) => {
             let stop_info = result?;
@@ -29,7 +29,7 @@ pub async fn run(
             ctx.store.set_vm_state(VmState::Stopped, stop_info.message)?;
             handles.mark_stopping().await;
             ctx.shutdown.cancel();
-            false
+            (false, stop_info.error)
         }
     };
 
@@ -40,6 +40,10 @@ pub async fn run(
 
     if forced {
         tracing::warn!(instance = %ctx.machine.name(), "forced shutdown completed");
+    }
+
+    if let Some(error) = backend_error {
+        return Err(eyre::eyre!("virtual machine exited with error: {error}"));
     }
 
     Ok(())
@@ -136,17 +140,27 @@ async fn drain_result_task(
 
 struct VmStopInfo {
     message: String,
+    error: Option<String>,
 }
 
 async fn wait_for_machine_stop(
     machine: &crate::virt::VirtualMachine,
 ) -> Result<VmStopInfo, eyre::Report> {
     let exit = machine.wait().await?;
-    let message = match exit {
-        VmExit::Stopped => String::from("machine stopped"),
-        VmExit::StoppedWithError(error) => format!("machine stopped with error: {error}"),
-    };
-    Ok(VmStopInfo { message })
+    Ok(vm_stop_info(exit))
+}
+
+fn vm_stop_info(exit: VmExit) -> VmStopInfo {
+    match exit {
+        VmExit::Stopped => VmStopInfo {
+            message: String::from("machine stopped"),
+            error: None,
+        },
+        VmExit::StoppedWithError(error) => VmStopInfo {
+            message: format!("machine stopped with error: {error}"),
+            error: Some(error),
+        },
+    }
 }
 
 async fn cleanup(_runtime: &RuntimeContext, ctx: &DaemonContext) -> eyre::Result<()> {
@@ -176,5 +190,34 @@ async fn wait_for_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::virt::VmExit;
+
+    #[test]
+    fn backend_failure_is_preserved_for_monitor_exit_status() {
+        let info = crate::shutdown::vm_stop_info(VmExit::StoppedWithError(
+            "krun exited with status code 127".to_string(),
+        ));
+
+        assert_eq!(
+            info.message,
+            "machine stopped with error: krun exited with status code 127"
+        );
+        assert_eq!(
+            info.error.as_deref(),
+            Some("krun exited with status code 127")
+        );
+    }
+
+    #[test]
+    fn normal_backend_stop_remains_clean() {
+        let info = crate::shutdown::vm_stop_info(VmExit::Stopped);
+
+        assert_eq!(info.message, "machine stopped");
+        assert_eq!(info.error, None);
     }
 }
