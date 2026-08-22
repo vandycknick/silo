@@ -451,6 +451,15 @@ pub fn success(message: impl AsRef<str>) {
     eprintln!("   {check} {}", message.as_ref());
 }
 
+pub fn hint(message: impl AsRef<str>) {
+    let arrow = if should_style_stderr() {
+        style("→").cyan().to_string()
+    } else {
+        "→".to_string()
+    };
+    eprintln!("   {arrow} {}", message.as_ref());
+}
+
 pub fn warn(message: impl AsRef<str>) {
     let label = if should_style_stderr() {
         style("warn:").yellow().bold().to_string()

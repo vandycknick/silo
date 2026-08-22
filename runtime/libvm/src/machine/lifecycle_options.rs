@@ -10,7 +10,8 @@ pub const DEFAULT_MACHINE_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
 ///
 /// A run ID is issued by [`Machine::start`](crate::Machine::start) and can be
 /// supplied to generation-checked lifecycle methods. It is distinct from a
-/// machine ID and cannot be constructed from arbitrary caller input.
+/// machine ID. Its textual form can be parsed when transferring the token
+/// across a process boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MachineRunId(String);
 
@@ -22,6 +23,15 @@ impl MachineRunId {
     /// Returns the stable textual representation sent to vmmon for this run.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl std::str::FromStr for MachineRunId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let run_id = uuid::Uuid::parse_str(value)?;
+        Ok(Self(run_id.hyphenated().to_string()))
     }
 }
 
@@ -159,5 +169,24 @@ impl MachineExit {
             exited_at: None,
             outcome: MachineExitOutcome::AlreadyStopped,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::MachineRunId;
+
+    #[test]
+    fn machine_run_id_round_trips_across_process_boundaries() {
+        let value = "0198c783-cd1c-77c2-b66a-c06275f20d1f";
+        let run_id = value.parse::<MachineRunId>().expect("parse run ID");
+
+        assert_eq!(run_id.as_str(), value);
+        assert_eq!(run_id.to_string(), value);
+    }
+
+    #[test]
+    fn machine_run_id_rejects_invalid_values() {
+        assert!("not-a-run-id".parse::<MachineRunId>().is_err());
     }
 }

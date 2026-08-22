@@ -196,7 +196,7 @@ pub(crate) struct SerialDevice {
 
 enum SerialDeviceInner {
     #[allow(dead_code)] // constructed only by the Linux backend
-    Files(SplitFileStream),
+    Pty(PtyFileStream),
     #[allow(dead_code)] // constructed only by the mock backend
     Duplex(DuplexStream),
     #[cfg(target_os = "macos")]
@@ -205,9 +205,9 @@ enum SerialDeviceInner {
 
 impl SerialDevice {
     #[allow(dead_code)]
-    pub(crate) fn from_files(read: File, write: File) -> io::Result<Self> {
+    pub(crate) fn from_pty_files(read: File, write: File) -> io::Result<Self> {
         Ok(Self {
-            inner: SerialDeviceInner::Files(SplitFileStream::new(read, write)?),
+            inner: SerialDeviceInner::Pty(PtyFileStream::new(read, write)?),
         })
     }
 
@@ -239,7 +239,7 @@ impl AsyncRead for SerialDevice {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match &mut self.inner {
-            SerialDeviceInner::Files(stream) => Pin::new(stream).poll_read(cx, buf),
+            SerialDeviceInner::Pty(stream) => Pin::new(stream).poll_read(cx, buf),
             SerialDeviceInner::Duplex(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(target_os = "macos")]
             SerialDeviceInner::Vz(stream) => Pin::new(stream).poll_read(cx, buf),
@@ -254,7 +254,7 @@ impl AsyncWrite for SerialDevice {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match &mut self.inner {
-            SerialDeviceInner::Files(stream) => Pin::new(stream).poll_write(cx, buf),
+            SerialDeviceInner::Pty(stream) => Pin::new(stream).poll_write(cx, buf),
             SerialDeviceInner::Duplex(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(target_os = "macos")]
             SerialDeviceInner::Vz(stream) => Pin::new(stream).poll_write(cx, buf),
@@ -263,7 +263,7 @@ impl AsyncWrite for SerialDevice {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut self.inner {
-            SerialDeviceInner::Files(stream) => Pin::new(stream).poll_flush(cx),
+            SerialDeviceInner::Pty(stream) => Pin::new(stream).poll_flush(cx),
             SerialDeviceInner::Duplex(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(target_os = "macos")]
             SerialDeviceInner::Vz(stream) => Pin::new(stream).poll_flush(cx),
@@ -272,7 +272,7 @@ impl AsyncWrite for SerialDevice {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut self.inner {
-            SerialDeviceInner::Files(stream) => Pin::new(stream).poll_shutdown(cx),
+            SerialDeviceInner::Pty(stream) => Pin::new(stream).poll_shutdown(cx),
             SerialDeviceInner::Duplex(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(target_os = "macos")]
             SerialDeviceInner::Vz(stream) => Pin::new(stream).poll_shutdown(cx),
@@ -296,14 +296,14 @@ fn try_accept_unix(listener: &UnixListener) -> io::Result<Option<UnixStream>> {
     }
 }
 
-/// Async adapter over a (read, write) file pair, e.g. pipes to a helper process.
+/// Async adapter over the krun console PTY master file pair.
 #[derive(Debug)]
-struct SplitFileStream {
+struct PtyFileStream {
     read: tokio::io::unix::AsyncFd<File>,
     write: tokio::io::unix::AsyncFd<File>,
 }
 
-impl SplitFileStream {
+impl PtyFileStream {
     fn new(read: File, write: File) -> io::Result<Self> {
         set_nonblocking(&read)?;
         set_nonblocking(&write)?;
@@ -314,7 +314,7 @@ impl SplitFileStream {
     }
 }
 
-impl AsyncRead for SplitFileStream {
+impl AsyncRead for PtyFileStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -334,6 +334,8 @@ impl AsyncRead for SplitFileStream {
                     return Poll::Ready(Ok(()));
                 }
                 Ok(Err(err)) if err.kind() == io::ErrorKind::Interrupted => continue,
+                // Linux reports a closed PTY slave as EIO on the master.
+                Ok(Err(err)) if pty_read_reached_eof(&err) => return Poll::Ready(Ok(())),
                 Ok(Err(err)) => return Poll::Ready(Err(err)),
                 Err(_) => continue,
             }
@@ -341,7 +343,7 @@ impl AsyncRead for SplitFileStream {
     }
 }
 
-impl AsyncWrite for SplitFileStream {
+impl AsyncWrite for PtyFileStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -368,6 +370,16 @@ impl AsyncWrite for SplitFileStream {
         shutdown_write(self.write.get_ref())?;
         Poll::Ready(Ok(()))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn pty_read_reached_eof(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(nix::errno::Errno::EIO as i32)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pty_read_reached_eof(_error: &io::Error) -> bool {
+    false
 }
 
 fn duplicate_nonblocking_fd<F: AsRawFd>(fd_owner: &F) -> io::Result<OwnedFd> {
@@ -398,6 +410,7 @@ fn shutdown_write<F: AsRawFd>(file: &F) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::io::{self, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream as StdUnixStream;
@@ -506,5 +519,24 @@ mod tests {
             .await
             .expect("guest read should succeed");
         assert_eq!(&echo, b"input");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn closed_pty_slave_is_reported_as_serial_eof() {
+        let pty = nix::pty::openpty(None, None).expect("create PTY");
+        let master = File::from(pty.master);
+        let write_master = master.try_clone().expect("clone PTY master");
+        drop(pty.slave);
+        let mut device = SerialDevice::from_pty_files(master, write_master).expect("wrap PTY");
+        let mut buffer = [0_u8; 1];
+
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(1), device.read(&mut buffer))
+                .await
+                .expect("PTY read resolves")
+                .expect("closed PTY is EOF");
+
+        assert_eq!(read, 0);
     }
 }

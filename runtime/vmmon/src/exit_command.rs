@@ -2,19 +2,16 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
 
 use eyre::Context;
-use tokio::io::AsyncReadExt;
 
-const EXIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_STDERR_BYTES: u64 = 16 * 1024;
+const MACHINE_ID_ENV: &str = "SILO_MACHINE_ID";
+const MACHINE_RUN_ID_ENV: &str = "SILO_MACHINE_RUN_ID";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExitCommand {
     command: PathBuf,
     args: Vec<OsString>,
-    timeout: Duration,
 }
 
 impl ExitCommand {
@@ -23,99 +20,51 @@ impl ExitCommand {
         args: Vec<OsString>,
     ) -> eyre::Result<Option<Self>> {
         match command {
-            Some(command) => Ok(Some(Self {
-                command,
-                args,
-                timeout: EXIT_COMMAND_TIMEOUT,
-            })),
+            Some(command) => Ok(Some(Self { command, args })),
             None if args.is_empty() => Ok(None),
             None => eyre::bail!("--exit-command-arg requires --exit-command"),
         }
     }
 
-    pub(crate) async fn run(&self) {
-        if let Err(err) = self.run_inner().await {
+    pub(crate) fn spawn(&self, machine_id: &str, machine_run_id: &str) {
+        if let Err(err) = self.spawn_inner(machine_id, machine_run_id) {
             tracing::warn!(error = %err, command = %self.command.display(), "exit command failed");
         }
     }
 
-    async fn run_inner(&self) -> eyre::Result<()> {
+    fn spawn_inner(&self, machine_id: &str, machine_run_id: &str) -> eyre::Result<()> {
         let resolve_context = ResolveContext::current()?;
         tracing::debug!(
             command = %self.command.display(),
             args = ?self.args,
             cwd = %resolve_context.cwd.display(),
-            timeout = ?self.timeout,
             "resolving exit command"
         );
         let executable = resolve_exit_command_with_context(&self.command, &resolve_context)?;
-        let started = Instant::now();
 
         tracing::info!(
             command = %self.command.display(),
             executable = %executable.display(),
             args = ?self.args,
             cwd = %resolve_context.cwd.display(),
-            timeout = ?self.timeout,
-            "running exit command"
+            "spawning exit command"
         );
 
         let mut command = tokio::process::Command::new(&executable);
         command
             .args(&self.args)
+            .env(MACHINE_ID_ENV, machine_id)
+            .env(MACHINE_RUN_ID_ENV, machine_run_id)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
 
-        let mut child = command
+        let child = command
             .spawn()
             .with_context(|| format!("spawn exit command {}", executable.display()))?;
-
-        match tokio::time::timeout(self.timeout, child.wait()).await {
-            Ok(Ok(status)) if status.success() => {
-                tracing::info!(
-                    %status,
-                    elapsed = ?started.elapsed(),
-                    executable = %executable.display(),
-                    "exit command completed"
-                );
-                Ok(())
-            }
-            Ok(Ok(status)) => {
-                let stderr = read_child_stderr(&mut child).await;
-                tracing::warn!(
-                    %status,
-                    elapsed = ?started.elapsed(),
-                    executable = %executable.display(),
-                    stderr = %stderr,
-                    "exit command exited unsuccessfully"
-                );
-                Ok(())
-            }
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    error = %err,
-                    elapsed = ?started.elapsed(),
-                    executable = %executable.display(),
-                    "wait for exit command"
-                );
-                Ok(())
-            }
-            Err(_) => {
-                let kill_result = child.kill().await;
-                let wait_result = child.wait().await;
-                tracing::warn!(
-                    timeout = ?self.timeout,
-                    elapsed = ?started.elapsed(),
-                    executable = %executable.display(),
-                    kill_error = ?kill_result.err(),
-                    wait_error = ?wait_result.err(),
-                    "exit command timed out"
-                );
-                Ok(())
-            }
-        }
+        tracing::info!(pid = child.id(), executable = %executable.display(), "exit command spawned");
+        Ok(())
     }
 }
 
@@ -210,23 +159,11 @@ fn is_executable_metadata(_metadata: &fs::Metadata) -> bool {
     true
 }
 
-async fn read_child_stderr(child: &mut tokio::process::Child) -> String {
-    let Some(stderr) = child.stderr.take() else {
-        return String::new();
-    };
-    let mut stderr = stderr.take(MAX_STDERR_BYTES);
-    let mut output = Vec::new();
-    match stderr.read_to_end(&mut output).await {
-        Ok(_) => String::from_utf8_lossy(&output).trim().to_string(),
-        Err(err) => format!("<failed to read stderr: {err}>"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::exit_command::{resolve_exit_command_with_context, ExitCommand, ResolveContext};
 
@@ -280,7 +217,7 @@ mod tests {
         let fixture = Fixture::new("path-first");
         let path_dir = fixture.dir.join("path-bin");
         fs::create_dir_all(&path_dir).unwrap();
-        let path_command = make_executable(path_dir.join("hook"));
+        let path_command = make_executable(path_dir.join("hook"), "#!/bin/sh\nexit 0\n");
         let sibling_command = fixture.executable("hook");
         let context = fixture.context(vec![path_dir]);
 
@@ -309,6 +246,34 @@ mod tests {
         assert!(resolve_exit_command_with_context(Path::new("missing-hook"), &context).is_err());
     }
 
+    #[tokio::test]
+    async fn spawned_command_outlives_the_handle_and_receives_generation() {
+        let fixture = Fixture::new("spawned-watcher");
+        let output = fixture.dir.join("generation");
+        let script = fixture.executable_with(
+            "watcher",
+            "#!/bin/sh\nsleep 0.1\nprintf '%s\\n%s\\n' \"$SILO_MACHINE_ID\" \"$SILO_MACHINE_RUN_ID\" > \"$1\"\n",
+        );
+        let command = ExitCommand::from_cli(Some(script), vec![output.clone().into_os_string()])
+            .expect("parse exit command")
+            .expect("exit command exists");
+
+        command.spawn("machine-id", "0198c783-cd1c-77c2-b66a-c06275f20d1f");
+        drop(command);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !output.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("spawned watcher writes output");
+        assert_eq!(
+            fs::read_to_string(output).expect("read watcher output"),
+            "machine-id\n0198c783-cd1c-77c2-b66a-c06275f20d1f\n"
+        );
+    }
+
     struct Fixture {
         dir: PathBuf,
     }
@@ -328,7 +293,11 @@ mod tests {
         }
 
         fn executable(&self, relative: &str) -> PathBuf {
-            make_executable(self.dir.join(relative))
+            self.executable_with(relative, "#!/bin/sh\nexit 0\n")
+        }
+
+        fn executable_with(&self, relative: &str, contents: &str) -> PathBuf {
+            make_executable(self.dir.join(relative), contents)
         }
 
         fn context(&self, path_entries: Vec<PathBuf>) -> ResolveContext {
@@ -346,11 +315,11 @@ mod tests {
         }
     }
 
-    fn make_executable(path: PathBuf) -> PathBuf {
+    fn make_executable(path: PathBuf, contents: &str) -> PathBuf {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
-        fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(&path, contents).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

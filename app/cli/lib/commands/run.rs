@@ -19,12 +19,23 @@ use crate::commands::create::{
 use crate::commands::start_options::machine_start_options_without_cleanup;
 use crate::environment::EnvironmentOverride;
 use crate::planning::{Plan, PlanKind, ProcessOverrides, RunOptions, TtyCapabilities, TtyMode};
-use crate::ui::{watch_image_progress, OutputFormat, Spinner};
+use crate::ui::{self, watch_image_progress, OutputFormat, Spinner};
 
 const FAILED_READINESS_EXIT_WAIT: Duration = Duration::from_secs(2);
+const EXAMPLES: &[&str] = &[
+    "silo run ubuntu:26.04 -- uname -a",
+    "silo run --detach ubuntu:26.04 -- sleep 300",
+    "silo run --detach --name worker ubuntu:26.04 -- sleep 300",
+    "silo logs worker --stream exec --follow",
+    "silo create --name dev ubuntu:26.04 && silo start dev",
+];
 
 #[derive(Debug, Args)]
-#[command(about = "Run an image or template workload")]
+#[command(
+    about = "Run a workload in a new machine",
+    long_about = "Run a workload in a new machine.\n\nRuns COMMAND, or the resolved image workload when COMMAND is omitted. The VM stops when that workload exits, including in detached mode. Use `silo create` followed by `silo start` to boot an idle VM.",
+    after_help = after_help()
+)]
 pub struct Cmd {
     /// OCI registry reference or disk:PATH. Overrides the template image.
     #[arg(value_name = "IMAGE")]
@@ -32,10 +43,10 @@ pub struct Cmd {
     /// Template providing VM defaults.
     #[arg(long, value_name = "TEMPLATE")]
     template: Option<String>,
-    /// Persist the VM under this name. Unnamed runs are ephemeral.
+    /// Name and retain the VM after the workload exits. Without this flag, the VM is ephemeral.
     #[arg(short = 'n', long, value_name = "NAME")]
     name: Option<String>,
-    /// Return after vmmon starts the workload.
+    /// Run the workload in the background. The VM still stops when the workload exits.
     #[arg(short = 'd', long, conflicts_with = "tty")]
     detach: bool,
     /// Attach a TTY to the guest workload.
@@ -45,6 +56,8 @@ pub struct Cmd {
     #[arg(long, conflicts_with = "tty")]
     no_tty: bool,
     /// Replace the OCI entrypoint with this program.
+    ///
+    /// Arguments follow `--`. Without a trailing command, the image command is omitted.
     #[arg(long, value_name = "PROGRAM", value_parser = parse_entrypoint)]
     entrypoint: Option<String>,
     /// Set an environment variable, or import a host variable by name.
@@ -76,13 +89,25 @@ pub struct Cmd {
     format: OutputFormat,
     #[command(flatten)]
     overrides: VmOverrideArgs,
-    /// Guest command and arguments to execute after `--`.
+    /// Guest command and arguments. Replaces the image command while preserving its entrypoint.
     #[arg(last = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
 
+fn after_help() -> clap::builder::StyledStr {
+    crate::help::HelpDoc::new()
+        .section("Lifecycle")
+        .text("The VM stops when the run workload exits, including in detached mode.")
+        .text("Without --name, the generated VM is removed after exit; named VMs are retained.")
+        .text("For an idle VM, use `silo create` followed by `silo start`.")
+        .section("Examples")
+        .examples(EXAMPLES)
+        .build()
+}
+
 impl Cmd {
     pub async fn run(self, context: &mut crate::context::Context) -> eyre::Result<()> {
+        let uses_default_workload = self.command.is_empty() && self.entrypoint.is_none();
         let template = load_template(self.template.as_deref())?;
         let mut machine = self.overrides.resolve()?;
         machine.agent = self.agent;
@@ -120,7 +145,6 @@ impl Cmd {
         } else {
             MachineRetention::Ephemeral
         };
-
         if self.dry_run {
             let runtime = ReadOnlyRuntime::open(RuntimeConfig::from_env()?)
                 .await
@@ -237,6 +261,10 @@ impl Cmd {
                 return Err(start_failure(error));
             }
             progress.finish_success("Started");
+            if let Some(message) = detached_default_workload_hint(uses_default_workload) {
+                ui::hint(message);
+            }
+            ui::hint(detached_lifecycle_hint(plan.create.retention));
             println!("{name}");
             return Ok(());
         }
@@ -313,6 +341,22 @@ impl Cmd {
             eprintln!("{} {message}", crate::ui::error_label());
         }
         std::process::exit(crate::commands::exec::execution_exit_code(result));
+    }
+}
+
+fn detached_default_workload_hint(uses_default_workload: bool) -> Option<&'static str> {
+    uses_default_workload
+        .then_some("No command followed `--`; running the resolved default workload.")
+}
+
+fn detached_lifecycle_hint(retention: MachineRetention) -> &'static str {
+    match retention {
+        MachineRetention::Ephemeral => {
+            "VM lifetime follows the detached workload; the VM will be removed after it exits."
+        }
+        MachineRetention::Persistent => {
+            "VM lifetime follows the detached workload; the stopped VM will be retained."
+        }
     }
 }
 
@@ -495,9 +539,12 @@ async fn cleanup_ephemeral_best_effort(machine: &libvm::Machine, retention: Mach
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use libvm::MachineRetention;
 
     use crate::app::Cli;
-    use crate::commands::run::start_failure;
+    use crate::commands::run::{
+        detached_default_workload_hint, detached_lifecycle_hint, start_failure,
+    };
     use crate::commands::Command;
 
     #[test]
@@ -577,6 +624,37 @@ mod tests {
     fn run_rejects_an_empty_entrypoint() {
         assert!(
             Cli::try_parse_from(["silo", "run", "--entrypoint", "", "disk:rootfs.img"]).is_err()
+        );
+    }
+
+    #[test]
+    fn run_help_explains_detached_lifecycle_and_idle_vms() {
+        let mut command = Cli::command();
+        let run = command
+            .find_subcommand_mut("run")
+            .expect("run subcommand exists");
+        let help = run.render_long_help().to_string();
+
+        assert!(help.contains("The VM stops when that workload exits"));
+        assert!(help.contains("The VM still stops when the workload exits"));
+        assert!(help.contains("Without --name, the generated VM is removed after exit"));
+        assert!(help.contains("silo create --name dev ubuntu:26.04 && silo start dev"));
+    }
+
+    #[test]
+    fn detached_launch_hints_explain_workload_and_retention() {
+        assert_eq!(
+            detached_default_workload_hint(true),
+            Some("No command followed `--`; running the resolved default workload.")
+        );
+        assert_eq!(detached_default_workload_hint(false), None);
+        assert_eq!(
+            detached_lifecycle_hint(MachineRetention::Ephemeral),
+            "VM lifetime follows the detached workload; the VM will be removed after it exits."
+        );
+        assert_eq!(
+            detached_lifecycle_hint(MachineRetention::Persistent),
+            "VM lifetime follows the detached workload; the stopped VM will be retained."
         );
     }
 

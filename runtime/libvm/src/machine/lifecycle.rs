@@ -544,6 +544,16 @@ impl Machine {
 
     /// Removes a stopped machine's durable records and files.
     pub async fn remove(self) -> Result<(), LibVmError> {
+        self.remove_impl(None).await
+    }
+
+    /// Removes a stopped machine only when its latest exit belongs to the
+    /// supplied run generation.
+    pub async fn remove_after_run(self, run_id: MachineRunId) -> Result<(), LibVmError> {
+        self.remove_impl(Some(run_id)).await
+    }
+
+    async fn remove_impl(self, expected_run_id: Option<MachineRunId>) -> Result<(), LibVmError> {
         let runtime = self.runtime();
         if runtime.machine_config(self.machine_id()).await?.is_none() {
             return Ok(());
@@ -554,9 +564,29 @@ impl Machine {
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
 
         if status.is_active() {
+            if let Some(expected_run_id) = expected_run_id.as_ref() {
+                require_current_run(&config, &status, Some(expected_run_id))?;
+            }
             return Err(LibVmError::MachineAlreadyRunning {
                 reference: config.name.clone(),
             });
+        }
+
+        if let Some(expected_run_id) = expected_run_id {
+            let exit_status =
+                exit_status::read(&runtime.machine_paths(config.id).vmmon_exit_status_path())?;
+            let machine_id = config.id.to_string();
+            let current = exit_status
+                .as_ref()
+                .filter(|exit| exit.machine_id == machine_id)
+                .map(|exit| MachineRunId::from_raw(exit.run_id.clone()));
+            if current.as_ref() != Some(&expected_run_id) {
+                return Err(LibVmError::MachineStaleGeneration {
+                    reference: config.name.clone(),
+                    requested: expected_run_id,
+                    current,
+                });
+            }
         }
 
         runtime.cleanup_machine_resources_locked(&config).await?;

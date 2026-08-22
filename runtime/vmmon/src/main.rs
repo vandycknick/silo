@@ -238,7 +238,7 @@ async fn run(
 
     drop(pid_guard);
     if let Some(exit_command) = &exit_command {
-        exit_command.run().await;
+        exit_command.spawn(&args.id, &args.run_id);
     }
 
     result

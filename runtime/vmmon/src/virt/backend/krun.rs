@@ -246,7 +246,7 @@ impl VirtBackend for KrunBackend {
         };
 
         let (read, write) = serial.into_files();
-        Ok(SerialDevice::from_files(read, write)?)
+        Ok(SerialDevice::from_pty_files(read, write)?)
     }
 }
 

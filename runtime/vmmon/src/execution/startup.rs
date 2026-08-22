@@ -47,6 +47,7 @@ pub(crate) fn spawn_startup_command(
     let (started, started_receiver) = oneshot::channel();
     let machine = ctx.machine.clone();
     let store = ctx.store.clone();
+    let stop_requested = ctx.stop_requested.clone();
     let shutdown = ctx.shutdown.clone();
     let task = tokio::spawn(async move {
         let mut started = Some(started);
@@ -110,6 +111,8 @@ pub(crate) fn spawn_startup_command(
                 _ = tokio::time::sleep(START_HANDOFF_GRACE) => {}
                 _ = shutdown.cancelled() => return,
             }
+            stop_requested.cancel();
+            return;
         }
         stop_machine(&machine, &shutdown).await;
         report_start_failure(

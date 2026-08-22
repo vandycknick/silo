@@ -17,8 +17,8 @@ mod sealed {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MachineStartOptions {
-    /// Host command executed by the local machine monitor after the runtime
-    /// exits.
+    /// Host command spawned by the local machine monitor after runtime
+    /// shutdown. The command may outlive the monitor process.
     ///
     /// When unset, no exit hook is registered.
     pub on_exit: Option<HostCommand>,

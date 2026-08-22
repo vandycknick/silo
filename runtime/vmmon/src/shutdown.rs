@@ -23,6 +23,13 @@ pub async fn run(
             ctx.shutdown.cancel();
             (graceful_stop(&ctx).await?, None)
         }
+        _ = ctx.stop_requested.cancelled() => {
+            tracing::info!(instance = %ctx.machine.name(), "startup command completed");
+            ctx.store.set_vm_state(VmState::Stopping, "startup command completed")?;
+            handles.mark_stopping().await;
+            ctx.shutdown.cancel();
+            (graceful_stop(&ctx).await?, None)
+        }
         result = wait_for_machine_stop(&ctx.machine) => {
             let stop_info = result?;
             tracing::info!(instance = %ctx.machine.name(), message = %stop_info.message, "machine exited");

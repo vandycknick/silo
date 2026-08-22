@@ -9,7 +9,7 @@ use crate::context::Context;
 use crate::ui::Spinner;
 
 #[derive(Debug, Args)]
-#[command(about = "Start a persistent VM")]
+#[command(about = "Start a persistent VM in idle mode")]
 pub struct Cmd {
     /// Name or ID of the VM to start. Defaults to the configured default VM.
     #[arg(value_name = "VM")]

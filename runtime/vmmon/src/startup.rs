@@ -208,6 +208,7 @@ pub async fn init(
             machine,
             serial_console,
             store,
+            stop_requested: CancellationToken::new(),
             shutdown: CancellationToken::new(),
         },
         startup_command: start_request.startup_command,

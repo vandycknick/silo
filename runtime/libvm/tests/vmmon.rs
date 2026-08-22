@@ -12,7 +12,8 @@ use std::time::Duration;
 use libvm::{
     ExecutionLaunchFailureReason, ExecutionLostReason, ExecutionResult, FileWriteDisposition,
     ImageSource, LibVmError, Machine, MachineAgentStatus, MachineDirectoryCreateDisposition,
-    MachineExitOutcome, MachineFileUploadOptions, MachineReadinessOutcome, Runtime, RuntimeConfig,
+    MachineExitOutcome, MachineFileUploadOptions, MachineReadinessOutcome, MachineStatus, Runtime,
+    RuntimeConfig,
 };
 use test_utils::Scenario;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -384,6 +385,64 @@ async fn machine_start_reports_entrypoint_command_not_found() {
 
     let _ = machine.stop().await;
     machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn machine_entrypoint_completion_stops_with_a_clean_exit() {
+    let env = test_env("startup-command-completion", &Scenario::default()).await;
+    let machine = create_machine(&env, "mock-startup-command-completion").await;
+
+    let start = machine
+        .start_with(|options| options.entrypoint("/usr/bin/true", |entrypoint| entrypoint))
+        .await
+        .expect("start machine with entrypoint");
+    let exit = tokio::time::timeout(READY_TIMEOUT, machine.wait_for_run(start.run_id.clone()))
+        .await
+        .expect("entrypoint completion stops vmmon before timeout")
+        .expect("reconcile entrypoint completion");
+
+    assert_eq!(exit.outcome, MachineExitOutcome::Clean);
+    assert_eq!(exit.machine.status, MachineStatus::Stopped);
+
+    machine
+        .remove_after_run(start.run_id)
+        .await
+        .expect("remove completed run");
+}
+
+#[tokio::test]
+async fn cleanup_for_an_old_entrypoint_run_cannot_remove_a_replacement() {
+    let env = test_env("startup-command-replacement", &Scenario::default()).await;
+    let machine = create_machine(&env, "mock-startup-command-replacement").await;
+
+    let first = machine
+        .start_with(|options| options.entrypoint("/usr/bin/true", |entrypoint| entrypoint))
+        .await
+        .expect("start first entrypoint run");
+    machine
+        .wait_for_run(first.run_id.clone())
+        .await
+        .expect("wait for first entrypoint run");
+
+    let second = machine
+        .start_with(|options| options.entrypoint("/usr/bin/true", |entrypoint| entrypoint))
+        .await
+        .expect("start replacement entrypoint run");
+    machine
+        .wait_for_run(second.run_id.clone())
+        .await
+        .expect("wait for replacement entrypoint run");
+
+    let stale = machine
+        .clone()
+        .remove_after_run(first.run_id)
+        .await
+        .expect_err("old cleanup generation must be rejected");
+    assert!(matches!(stale, LibVmError::MachineStaleGeneration { .. }));
+    machine
+        .remove_after_run(second.run_id)
+        .await
+        .expect("current cleanup generation removes machine");
 }
 
 #[tokio::test]

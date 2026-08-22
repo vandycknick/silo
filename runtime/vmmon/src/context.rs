@@ -45,5 +45,6 @@ pub struct DaemonContext {
     pub(crate) machine: VirtualMachine,
     pub(crate) serial_console: Arc<SerialConsole>,
     pub(crate) store: Arc<InstanceStore>,
+    pub(crate) stop_requested: CancellationToken,
     pub(crate) shutdown: CancellationToken,
 }

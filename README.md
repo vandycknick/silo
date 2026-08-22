@@ -27,15 +27,30 @@ nix develop
 make build
 ```
 
-Run an unnamed workload from an image:
+Run a temporary workload from an image:
 
 ```bash
 silo run ubuntu:24.04 -- uname -a
 ```
 
 Image operands are OCI registry references, or local disk images written as
-`disk:PATH`. `run` creates an unnamed machine for this invocation and removes it
-after the foreground workload finishes.
+`disk:PATH`. Without `--name`, `run` creates a generated ephemeral machine and
+removes it after the workload finishes.
+
+Detached mode runs the workload in the background. It does not make the VM
+independent of that workload: the VM still stops when the workload exits.
+
+```bash
+silo run --detach ubuntu:24.04 -- sleep 300
+silo run --detach --name worker ubuntu:24.04 -- sleep 300
+silo logs worker --stream exec --follow
+```
+
+The first detached machine is removed after `sleep` exits. The named machine is
+stopped but retained for later inspection. If no command follows `--`, `run`
+uses the image's resolved default workload; an interactive shell may exit
+immediately when detached because it has no attached terminal or input. See the
+[run lifecycle guide](docs/run-lifecycle.md) for the complete behavior matrix.
 
 Create a persistent VM, then start it when you need an idle development
 environment:
@@ -50,16 +65,6 @@ silo shell dev
 VM without starting an application workload. Image process settings are retained
 with the machine and provide the default command for `silo exec dev` when no
 command follows `--`.
-
-Name a `run` when its disk and configuration should remain after the workload
-finishes. A detached run asks `vmmon` to launch the resolved command, prints the
-machine name after startup is acknowledged, and leaves a named machine for later
-inspection:
-
-```bash
-silo run --name worker --detach ubuntu:24.04 -- /usr/bin/sleep 300
-silo show worker
-```
 
 ## Templates
 

@@ -13,7 +13,7 @@ use crate::context::Context;
 use crate::ui::Spinner;
 
 #[derive(Debug, Args)]
-#[command(about = "Restart a persistent VM")]
+#[command(about = "Restart a persistent VM in idle mode")]
 pub struct Cmd {
     /// Name or ID of the VM to restart. Defaults to the configured default VM.
     #[arg(value_name = "VM")]
