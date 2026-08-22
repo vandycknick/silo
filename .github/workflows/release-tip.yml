@@ -86,7 +86,7 @@ jobs:
 
       # Cache only release builds, keeping validation independent of release artifacts.
       - name: Cache Rust build outputs
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
         with:
           cmd-format: nix develop .#release --command {0}
           workspaces: . -> target
