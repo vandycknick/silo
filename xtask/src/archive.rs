@@ -14,10 +14,8 @@ use crate::command;
 use crate::release;
 use crate::targets::HostTarget;
 
-const RELEASE_MATERIAL: [&str; 2] = [
-    "packaging/release/THIRD_PARTY_NOTICES",
-    "common/ext4/LICENSE-APACHE",
-];
+const DISK_IMAGE_LICENSE: &str = "common/disk-image/LICENSE-APACHE";
+const RELEASE_MATERIAL: [&str; 2] = ["packaging/release/THIRD_PARTY_NOTICES", DISK_IMAGE_LICENSE];
 const RUNTIME_FILES: [(&str, u32); 6] = [
     ("bin/vmmon", 0o755),
     ("bin/netd", 0o755),
@@ -148,7 +146,7 @@ fn create_tar(
             "--transform",
             &format!("s,^packaging/release/,{root}/,"),
             "--transform",
-            &format!("s,^common/ext4/LICENSE-APACHE$,{root}/LICENSES/libkrun-APACHE-2.0.txt,"),
+            &disk_image_license_transform(root),
             "--transform",
             &format!("s,^silo$,{root}/bin/silo,"),
         ])
@@ -163,6 +161,10 @@ fn create_tar(
     }
     command::run(command)?;
     Ok(())
+}
+
+fn disk_image_license_transform(root: &str) -> String {
+    format!("s,^{DISK_IMAGE_LICENSE}$,{root}/LICENSES/libkrun-APACHE-2.0.txt,")
 }
 
 fn compress_tar(raw: &Path, archive: &Path) -> Result<(), ArchiveError> {
@@ -445,4 +447,24 @@ fn invalid<T>(path: &Path, reason: String) -> Result<T, ArchiveError> {
         path: path.to_path_buf(),
         reason,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use crate::archive::{disk_image_license_transform, DISK_IMAGE_LICENSE, RELEASE_MATERIAL};
+
+    #[test]
+    fn release_material_includes_the_disk_image_license() {
+        assert!(RELEASE_MATERIAL.contains(&DISK_IMAGE_LICENSE));
+        assert!(Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(DISK_IMAGE_LICENSE)
+            .is_file());
+        assert_eq!(
+            disk_image_license_transform("silo-runtime-1.0.0-linux-amd64"),
+            "s,^common/disk-image/LICENSE-APACHE$,silo-runtime-1.0.0-linux-amd64/LICENSES/libkrun-APACHE-2.0.txt,"
+        );
+    }
 }

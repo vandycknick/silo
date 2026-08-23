@@ -1,0 +1,20 @@
+[package]
+name = "disk-image"
+version = "0.1.2"
+edition = "2024"
+rust-version = "1.85"
+description = "Synchronous disk image formatting, inspection, and mutation"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/vandycknick/silo"
+homepage = "https://github.com/vandycknick/silo/tree/main/common/disk-image"
+readme = "README.md"
+keywords = ["disk-image", "ext4", "filesystem"]
+categories = ["filesystem", "os"]
+exclude = ["/tests", "/.github"]
+
+[dependencies]
+thiserror = "2.0.19"
+uuid = { version = "1.24.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

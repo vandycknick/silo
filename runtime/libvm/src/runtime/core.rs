@@ -5,9 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::Context;
-use ocidisk::{
-    ImageStore as RootfsImageStore, OciDiskResult, RootfsImage, RootfsImageMetadata,
-    RootfsImageSource, RootfsOptions,
+use oci::{
+    ImageStore as RootfsImageStore, MaterializeOptions, OciError, PublishedRootfs, RootfsMetadata,
 };
 
 use crate::guest_agent::{self, GuestAgentConfigInput};
@@ -26,9 +25,15 @@ use utils::format_storage_size;
 use vm_spec::{Boot, Hardware, Kernel, VmSpec};
 
 use crate::image::{
-    ImageCacheState, ImageDetail, ImageHandle, ImageProgress, ImageProgressSender,
-    ImagePruneReport, ImagePullPolicy, ImageRemoveOptions, ImageSource, ImageSourceKind, Images,
-    MaterializedImage, ResolvedOciImage, ResolvedOciImageMaterialization,
+    local_disk::resolve_local_disk,
+    oci::{
+        cached_resolved_oci_image, ensure_resolved_oci_identity, image_error,
+        resolve_oci_image_from_registry,
+    },
+    progress::oci_progress_reporter,
+    ImageDetail, ImageHandle, ImageProgress, ImageProgressSender, ImagePruneReport,
+    ImagePullPolicy, ImageRemoveOptions, ImageSource, ImageSourceKind, Images, MaterializedImage,
+    ResolvedOciImage, ResolvedOciImageMaterialization,
 };
 use crate::machine::{
     EgressCredentials, Machine, MachineBuilder, MachineData, MachineRef, MachineRefKind,
@@ -318,63 +323,96 @@ impl Runtime {
         source: &ImageSource,
     ) -> Result<MaterializedImage, LibVmError> {
         validate_image_pull_policy(source, self.image_pull_policy)?;
-        let cache_reference = source.cache_reference();
+        match source {
+            ImageSource::Oci(reference) => self.materialize_oci_image(reference).await,
+            ImageSource::Disk(path) => self.materialize_local_disk(path),
+        }
+    }
+
+    async fn materialize_oci_image(
+        &self,
+        reference: &str,
+    ) -> Result<MaterializedImage, LibVmError> {
         let store = RootfsImageStore::open(self.local_images_dir())
-            .map_err(|err| image_error(&cache_reference, err))?;
-        let options =
-            RootfsOptions::for_host().map_err(|err| image_error(&cache_reference, err))?;
+            .map_err(|err| image_error(reference, err))?;
+        let options = MaterializeOptions::for_host().map_err(|err| image_error(reference, err))?;
         let progress = self.image_progress.clone();
 
         let rootfs = match self.image_pull_policy {
             ImagePullPolicy::IfMissing => {
-                match get_cached_rootfs(&store, source, &cache_reference, options.clone())
-                    .map_err(|err| image_error(&cache_reference, err))?
+                match store
+                    .get_cached(reference, &options)
+                    .map_err(|err| image_error(reference, err))?
                 {
                     Some(image) => {
-                        emit_cached_image_progress(progress.as_ref(), &image.image_ref);
+                        emit_cached_image_progress(
+                            progress.as_ref(),
+                            &image.flat_ext4().requested_reference,
+                        );
                         image
                     }
-                    None => {
-                        get_or_create_rootfs(&store, source, &cache_reference, options, progress)
-                            .await
-                            .map_err(|err| image_error(&cache_reference, err))?
-                    }
+                    None => store
+                        .get_or_create(reference, &options, oci_progress_reporter(progress))
+                        .await
+                        .map_err(|err| image_error(reference, err))?,
                 }
             }
-            ImagePullPolicy::Always => {
-                get_or_create_rootfs(&store, source, &cache_reference, options, progress)
-                    .await
-                    .map_err(|err| image_error(&cache_reference, err))?
-            }
-            ImagePullPolicy::Never => get_cached_rootfs(&store, source, &cache_reference, options)
-                .map_err(|err| image_error(&cache_reference, err))?
+            ImagePullPolicy::Always => store
+                .get_or_create(reference, &options, oci_progress_reporter(progress))
+                .await
+                .map_err(|err| image_error(reference, err))?,
+            ImagePullPolicy::Never => store
+                .get_cached(reference, &options)
+                .map_err(|err| image_error(reference, err))?
                 .ok_or_else(|| LibVmError::ImageNotFound {
-                    reference: source.source_reference(),
+                    reference: reference.to_string(),
                 })?,
         };
 
         let metadata = store
-            .rootfs_metadata(&rootfs)
-            .map_err(|err| image_error(&rootfs.image_ref, err))?;
-        let size_bytes = fs::metadata(&rootfs.path)?.len();
-        let identity = materialized_image_identity(source, &rootfs, metadata.as_ref())?;
+            .metadata(&rootfs)
+            .map_err(|err| image_error(&rootfs.flat_ext4().requested_reference, err))?;
+        let size_bytes = fs::metadata(&rootfs.flat_ext4().path)?.len();
+        let source = ImageSource::oci(reference);
+        let identity = materialized_image_identity(&source, &rootfs, Some(&metadata))?;
         self.persist_materialized_image(
-            source,
+            &source,
             &rootfs,
-            metadata.as_ref(),
+            Some(&metadata),
             size_bytes,
             &identity.requested_reference,
         )
         .await?;
 
         let image = MaterializedImage {
-            rootfs_path: rootfs.path,
+            rootfs_path: rootfs.flat_ext4().path.clone(),
             requested_reference: identity.requested_reference,
             selected_reference: identity.selected_reference,
-            source_kind: source.kind(),
-            image_id: Some(rootfs.image_id),
+            source_kind: ImageSourceKind::Oci,
+            image_id: Some(rootfs.flat_ext4().image_id.clone()),
             manifest_digest: identity.manifest_digest,
             config_digest: identity.config_digest,
+            size_bytes,
+        };
+        emit_image_progress_complete(self.image_progress.as_ref());
+        Ok(image)
+    }
+
+    fn materialize_local_disk(&self, path: &Path) -> Result<MaterializedImage, LibVmError> {
+        let image_ref = format!("disk:{}", path.display());
+        if let Some(progress) = &self.image_progress {
+            progress.send(ImageProgress::UsingLocalDisk { image_ref });
+        }
+        let source = resolve_local_disk(path)?;
+        let size_bytes = fs::metadata(&source.canonical_path)?.len();
+        let image = MaterializedImage {
+            rootfs_path: source.canonical_path,
+            requested_reference: path.display().to_string(),
+            selected_reference: None,
+            source_kind: ImageSourceKind::Disk,
+            image_id: Some(source.image_id),
+            manifest_digest: None,
+            config_digest: None,
             size_bytes,
         };
         emit_image_progress_complete(self.image_progress.as_ref());
@@ -388,7 +426,7 @@ impl Runtime {
     ) -> Result<ResolvedOciImage, LibVmError> {
         let store = RootfsImageStore::open(self.local_images_dir())
             .map_err(|err| image_error(&reference, err))?;
-        let options = RootfsOptions::for_host().map_err(|err| image_error(&reference, err))?;
+        let options = MaterializeOptions::for_host().map_err(|err| image_error(&reference, err))?;
 
         match policy {
             ImagePullPolicy::IfMissing => {
@@ -425,12 +463,12 @@ impl Runtime {
         let source = ImageSource::oci(resolved.requested_reference.clone());
         let store = RootfsImageStore::open(self.local_images_dir())
             .map_err(|err| image_error(&resolved.requested_reference, err))?;
-        let options = RootfsOptions::for_host()
+        let options = MaterializeOptions::for_host()
             .map_err(|err| image_error(&resolved.requested_reference, err))?;
         if options.platform != resolved.platform {
             return Err(image_error(
                 &resolved.requested_reference,
-                ocidisk::OciDiskError::PlatformMismatch {
+                OciError::PlatformMismatch {
                     reference: resolved.requested_reference.clone(),
                     requested: options.platform.to_string(),
                     actual: resolved.platform.to_string(),
@@ -445,26 +483,26 @@ impl Runtime {
                     &resolved.requested_reference,
                 );
                 store
-                    .get_cached_oci(&resolved.selected_reference, options.clone())
+                    .get_cached(&resolved.selected_reference, &options)
                     .map_err(|err| image_error(&resolved.selected_reference, err))?
                     .ok_or_else(|| LibVmError::ImageNotFound {
                         reference: resolved.selected_reference.clone(),
                     })?
             }
             ResolvedOciImageMaterialization::Registry(image) => store
-                .materialize_oci(image, options, self.image_progress.clone())
+                .materialize(
+                    image,
+                    &options,
+                    oci_progress_reporter(self.image_progress.clone()),
+                )
                 .await
                 .map_err(|err| image_error(&resolved.requested_reference, err))?,
         };
         let metadata = store
-            .rootfs_metadata(&rootfs)
-            .map_err(|err| image_error(&rootfs.image_ref, err))?
-            .ok_or_else(|| LibVmError::StateDecode {
-                field: "image.metadata",
-                message: format!("OCI image {} is missing rootfs metadata", rootfs.image_ref),
-            })?;
+            .metadata(&rootfs)
+            .map_err(|err| image_error(&rootfs.flat_ext4().requested_reference, err))?;
         ensure_resolved_oci_identity(resolved, &rootfs, &metadata)?;
-        let size_bytes = fs::metadata(&rootfs.path)?.len();
+        let size_bytes = fs::metadata(&rootfs.flat_ext4().path)?.len();
         self.persist_materialized_image(
             &source,
             &rootfs,
@@ -475,11 +513,11 @@ impl Runtime {
         .await?;
 
         let image = MaterializedImage {
-            rootfs_path: rootfs.path,
+            rootfs_path: rootfs.flat_ext4().path.clone(),
             requested_reference: resolved.requested_reference.clone(),
             selected_reference: Some(resolved.selected_reference.clone()),
             source_kind: ImageSourceKind::Oci,
-            image_id: Some(rootfs.image_id),
+            image_id: Some(rootfs.flat_ext4().image_id.clone()),
             manifest_digest: Some(resolved.manifest_digest.clone()),
             config_digest: Some(resolved.config_digest.clone()),
             size_bytes,
@@ -491,8 +529,8 @@ impl Runtime {
     async fn persist_materialized_image(
         &self,
         source: &ImageSource,
-        rootfs: &RootfsImage,
-        metadata: Option<&RootfsImageMetadata>,
+        rootfs: &PublishedRootfs,
+        metadata: Option<&RootfsMetadata>,
         size_bytes: u64,
         requested_reference: &str,
     ) -> Result<(), LibVmError> {
@@ -500,7 +538,10 @@ impl Runtime {
             ImageSource::Oci(_) => {
                 let metadata = metadata.ok_or_else(|| LibVmError::StateDecode {
                     field: "image.metadata",
-                    message: format!("OCI image {} is missing rootfs metadata", rootfs.image_ref),
+                    message: format!(
+                        "OCI image {} is missing rootfs metadata",
+                        rootfs.flat_ext4().requested_reference
+                    ),
                 })?;
                 let record = oci_image_record(rootfs, metadata, size_bytes, requested_reference)?;
                 self.store.save_oci_image(&record).await
@@ -1175,10 +1216,10 @@ impl Runtime {
             .await?;
         let rootfs_store = RootfsImageStore::open(self.local_images_dir())
             .map_err(|err| image_error(&image.requested_reference, err))?;
-        let rootfs_options = RootfsOptions::for_host()
+        let rootfs_options = MaterializeOptions::for_host()
             .map_err(|err| image_error(&image.requested_reference, err))?;
         rootfs_store
-            .remove_oci_reference(&image.requested_reference, rootfs_options)
+            .remove_reference(&image.requested_reference, &rootfs_options.platform)
             .map_err(|err| image_error(&image.requested_reference, err))?;
         self.store.remove_image(reference, options).await
     }
@@ -1310,13 +1351,6 @@ fn remove_file_if_exists(path: &Path) -> eyre::Result<()> {
 
 const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
-fn image_error(reference: &str, source: ocidisk::OciDiskError) -> LibVmError {
-    LibVmError::Image {
-        reference: reference.to_string(),
-        source,
-    }
-}
-
 fn validate_image_pull_policy(
     source: &ImageSource,
     policy: ImagePullPolicy,
@@ -1328,105 +1362,6 @@ fn validate_image_pull_policy(
         });
     }
     Ok(())
-}
-
-fn get_cached_rootfs(
-    store: &RootfsImageStore,
-    source: &ImageSource,
-    cache_reference: &str,
-    options: RootfsOptions,
-) -> OciDiskResult<Option<RootfsImage>> {
-    match source {
-        ImageSource::Oci(reference) => store.get_cached_oci(reference, options),
-        ImageSource::Disk(_) => store.get_cached(cache_reference, options),
-    }
-}
-
-async fn get_or_create_rootfs(
-    store: &RootfsImageStore,
-    source: &ImageSource,
-    cache_reference: &str,
-    options: RootfsOptions,
-    progress: Option<ImageProgressSender>,
-) -> OciDiskResult<RootfsImage> {
-    match source {
-        ImageSource::Oci(reference) => store.get_or_create_oci(reference, options, progress).await,
-        ImageSource::Disk(_) => {
-            store
-                .get_or_create(cache_reference, options, progress)
-                .await
-        }
-    }
-}
-
-fn cached_resolved_oci_image(
-    store: &RootfsImageStore,
-    reference: &str,
-    options: RootfsOptions,
-) -> Result<Option<ResolvedOciImage>, LibVmError> {
-    let Some(rootfs) = store
-        .get_cached_oci(reference, options)
-        .map_err(|err| image_error(reference, err))?
-    else {
-        return Ok(None);
-    };
-    let metadata = store
-        .rootfs_metadata(&rootfs)
-        .map_err(|err| image_error(&rootfs.image_ref, err))?
-        .ok_or_else(|| LibVmError::StateDecode {
-            field: "image.metadata",
-            message: format!("OCI image {} is missing rootfs metadata", rootfs.image_ref),
-        })?;
-    if rootfs.image_id != metadata.manifest_digest {
-        return Err(LibVmError::StateDecode {
-            field: "image.metadata.manifest_digest",
-            message: format!(
-                "cached rootfs image ID {} does not match manifest {}",
-                rootfs.image_id, metadata.manifest_digest
-            ),
-        });
-    }
-
-    Ok(Some(ResolvedOciImage {
-        requested_reference: rootfs.image_ref,
-        selected_reference: metadata.selected_reference.clone(),
-        manifest_digest: metadata.manifest_digest.clone(),
-        config_digest: metadata.config_digest.clone(),
-        config: metadata.config.clone(),
-        platform: metadata.platform.clone(),
-        cache_state: ImageCacheState::Complete,
-        materialization: ResolvedOciImageMaterialization::Cached,
-    }))
-}
-
-async fn resolve_oci_image_from_registry(
-    store: &RootfsImageStore,
-    reference: String,
-    options: RootfsOptions,
-    progress: Option<ImageProgressSender>,
-) -> Result<ResolvedOciImage, LibVmError> {
-    let image = store
-        .resolve_oci(&reference, &options, progress)
-        .await
-        .map_err(|err| image_error(&reference, err))?;
-    let cache_state = match store
-        .get_cached_oci(&image.selected_reference, options)
-        .map_err(|err| image_error(&image.selected_reference, err))?
-    {
-        Some(_) => ImageCacheState::Complete,
-        None => ImageCacheState::Missing,
-    };
-
-    Ok(ResolvedOciImage {
-        requested_reference: image.requested_reference.clone(),
-        selected_reference: image.selected_reference.clone(),
-        manifest_digest: image.manifest_digest.clone(),
-        config_digest: image.config_digest.clone(),
-        config: image.config.clone(),
-        platform: image.platform.clone(),
-        cache_state,
-        materialization: ResolvedOciImageMaterialization::Registry(Box::new(image)),
-    })
 }
 
 fn emit_cached_image_progress(progress: Option<&ImageProgressSender>, image_ref: &str) {
@@ -1447,43 +1382,12 @@ fn emit_image_progress_complete(progress: Option<&ImageProgressSender>) {
     }
 }
 
-fn ensure_resolved_oci_identity(
-    resolved: &ResolvedOciImage,
-    rootfs: &RootfsImage,
-    metadata: &RootfsImageMetadata,
-) -> Result<(), LibVmError> {
-    if rootfs.image_id == resolved.manifest_digest
-        && metadata.selected_reference == resolved.selected_reference
-        && metadata.manifest_digest == resolved.manifest_digest
-        && metadata.config_digest == resolved.config_digest
-        && metadata.config == resolved.config
-        && metadata.platform == resolved.platform
-    {
-        return Ok(());
-    }
-
-    Err(LibVmError::StateDecode {
-        field: "resolved_oci_image",
-        message: format!(
-            "materialized OCI image {} does not match resolved manifest {}",
-            metadata.manifest_digest, resolved.manifest_digest
-        ),
-    })
-}
-
 fn oci_image_record(
-    rootfs: &RootfsImage,
-    metadata: &RootfsImageMetadata,
+    rootfs: &PublishedRootfs,
+    metadata: &RootfsMetadata,
     size_bytes: u64,
     requested_reference: &str,
 ) -> Result<OciImageRecord, LibVmError> {
-    if rootfs.source != RootfsImageSource::OciRegistry {
-        return Err(LibVmError::StateDecode {
-            field: "image.source",
-            message: format!("expected OCI rootfs source, found {}", rootfs.source),
-        });
-    }
-
     let now = now_unix();
     let manifest_digest = effective_oci_manifest_digest(rootfs, metadata);
     let created_at = metadata.created_at_unix;
@@ -1528,10 +1432,10 @@ fn oci_image_record(
         manifest: ImageManifestRecord {
             digest: manifest_digest.clone(),
             media_type: OCI_MANIFEST_MEDIA_TYPE.to_string(),
-            image_id: rootfs.image_id.clone(),
-            platform_os: rootfs.platform.os.clone(),
-            platform_architecture: rootfs.platform.architecture.clone(),
-            platform_variant: rootfs.platform.variant.clone(),
+            image_id: rootfs.flat_ext4().image_id.clone(),
+            platform_os: rootfs.flat_ext4().platform.os.clone(),
+            platform_architecture: rootfs.flat_ext4().platform.architecture.clone(),
+            platform_variant: rootfs.flat_ext4().platform.variant.clone(),
             config_digest: Some(metadata.config_digest.clone()),
             layer_count,
             total_size_bytes,
@@ -1542,10 +1446,10 @@ fn oci_image_record(
             requested_reference: requested_reference.to_string(),
             selected_reference: metadata.selected_reference.clone(),
             manifest_digest: manifest_digest.clone(),
-            image_id: rootfs.image_id.clone(),
-            platform_os: rootfs.platform.os.clone(),
-            platform_architecture: rootfs.platform.architecture.clone(),
-            platform_variant: rootfs.platform.variant.clone(),
+            image_id: rootfs.flat_ext4().image_id.clone(),
+            platform_os: rootfs.flat_ext4().platform.os.clone(),
+            platform_architecture: rootfs.flat_ext4().platform.architecture.clone(),
+            platform_variant: rootfs.flat_ext4().platform.variant.clone(),
             size_bytes: Some(size_bytes),
             created_at,
             updated_at: now,
@@ -1572,17 +1476,20 @@ struct MaterializedImageIdentity {
 
 fn materialized_image_identity(
     source: &ImageSource,
-    rootfs: &RootfsImage,
-    metadata: Option<&RootfsImageMetadata>,
+    rootfs: &PublishedRootfs,
+    metadata: Option<&RootfsMetadata>,
 ) -> Result<MaterializedImageIdentity, LibVmError> {
     match source.kind() {
         ImageSourceKind::Oci => {
             let metadata = metadata.ok_or_else(|| LibVmError::StateDecode {
                 field: "image.metadata",
-                message: format!("OCI image {} is missing rootfs metadata", rootfs.image_ref),
+                message: format!(
+                    "OCI image {} is missing rootfs metadata",
+                    rootfs.flat_ext4().requested_reference
+                ),
             })?;
             Ok(MaterializedImageIdentity {
-                requested_reference: metadata.requested_reference.clone(),
+                requested_reference: rootfs.flat_ext4().requested_reference.clone(),
                 selected_reference: Some(metadata.selected_reference.clone()),
                 manifest_digest: Some(effective_oci_manifest_digest(rootfs, metadata)),
                 config_digest: Some(metadata.config_digest.clone()),
@@ -1597,26 +1504,26 @@ fn materialized_image_identity(
     }
 }
 
-fn effective_oci_manifest_digest(_rootfs: &RootfsImage, metadata: &RootfsImageMetadata) -> String {
+fn effective_oci_manifest_digest(_rootfs: &PublishedRootfs, metadata: &RootfsMetadata) -> String {
     metadata.manifest_digest.clone()
 }
 
 fn image_artifact_record(
-    rootfs: &RootfsImage,
-    metadata: &RootfsImageMetadata,
+    rootfs: &PublishedRootfs,
+    metadata: &RootfsMetadata,
     manifest_digest: String,
     size_bytes: u64,
 ) -> ImageRootfsArtifactRecord {
     let now = now_unix();
     ImageRootfsArtifactRecord {
-        image_id: rootfs.image_id.clone(),
+        image_id: rootfs.flat_ext4().image_id.clone(),
         manifest_digest,
         config_digest: metadata.config_digest.clone(),
-        platform_os: rootfs.platform.os.clone(),
-        platform_architecture: rootfs.platform.architecture.clone(),
-        platform_variant: rootfs.platform.variant.clone(),
+        platform_os: rootfs.flat_ext4().platform.os.clone(),
+        platform_architecture: rootfs.flat_ext4().platform.architecture.clone(),
+        platform_variant: rootfs.flat_ext4().platform.variant.clone(),
         filesystem: metadata.filesystem.clone(),
-        rootfs_path: rootfs.path.clone(),
+        rootfs_path: rootfs.flat_ext4().path.clone(),
         size_bytes,
         created_at: metadata.created_at_unix,
         last_used_at: Some(now),
@@ -1916,15 +1823,15 @@ mod tests {
     use crate::store::{MachineStore, MockDataStore, Store};
     use crate::utils::now_unix;
     use crate::vmmon::process::ProcessIdentity;
+    use crate::OciImageConfigMetadata;
+    use crate::Platform;
     use crate::{
         ImageCacheState, ImageProgress, ImageProgressSender, ImagePullOptions, ImagePullPolicy,
         ImageResolveOptions, ImageSource, LibVmError, MachineExitOutcome, MachineKillOptions,
         MachineRef, MachineRetention, MachineRunId, MachineStatus, MachineUpdate, Memory,
         RuntimeNetworkingConfig,
     };
-    use ocidisk::{
-        OciImageConfigMetadata, Platform, RootfsImage, RootfsImageMetadata, RootfsImageSource,
-    };
+    use oci::{FlatExt4Artifact, PublishedRootfs, RootfsMetadata};
     use silo_policy::NetworkPolicy;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::fs::PermissionsExt;
@@ -2006,22 +1913,21 @@ mod tests {
         }
     }
 
-    fn sample_oci_rootfs_image() -> RootfsImage {
-        RootfsImage {
+    fn sample_oci_rootfs_image() -> PublishedRootfs {
+        PublishedRootfs::FlatExt4(FlatExt4Artifact {
             path: std::path::PathBuf::from("/tmp/rootfs.img"),
-            image_ref: "ubuntu:latest".to_string(),
+            requested_reference: "ubuntu:latest".to_string(),
             image_id: "sha256:imageid".to_string(),
+            manifest_digest: "sha256:imageid".to_string(),
             platform: Platform::linux_arm64(),
-            source: RootfsImageSource::OciRegistry,
-        }
+        })
     }
 
-    fn sample_oci_rootfs_metadata(manifest_digest: &str) -> RootfsImageMetadata {
-        RootfsImageMetadata {
+    fn sample_oci_rootfs_metadata(manifest_digest: &str) -> RootfsMetadata {
+        RootfsMetadata {
             version: 2,
             image_ref: "ubuntu:latest".to_string(),
             image_id: "sha256:imageid".to_string(),
-            source: RootfsImageSource::OciRegistry,
             requested_reference: "ubuntu:latest".to_string(),
             selected_reference: format!("ubuntu@{manifest_digest}"),
             manifest_digest: manifest_digest.to_string(),
@@ -2040,7 +1946,7 @@ mod tests {
         requested_reference: &str,
         manifest_digest: &str,
         config_digest: &str,
-    ) -> RootfsImageMetadata {
+    ) -> RootfsMetadata {
         let platform = Platform::host().expect("host platform");
         let mut cache_key = format!("{}-{}", platform.os, platform.architecture);
         if let Some(variant) = &platform.variant {
@@ -2053,11 +1959,10 @@ mod tests {
             .join(&cache_key);
         std::fs::create_dir_all(&image_dir).expect("create cached image directory");
         std::fs::write(image_dir.join("rootfs.img"), b"cached rootfs").expect("write rootfs");
-        let metadata = RootfsImageMetadata {
+        let metadata = RootfsMetadata {
             version: 2,
             image_ref: requested_reference.to_string(),
             image_id: manifest_digest.to_string(),
-            source: RootfsImageSource::OciRegistry,
             requested_reference: requested_reference.to_string(),
             selected_reference: format!("example.invalid/demo@{manifest_digest}"),
             manifest_digest: manifest_digest.to_string(),
@@ -2072,9 +1977,18 @@ mod tests {
             rootfs_file: "rootfs.img".to_string(),
             created_at_unix: 7,
         };
+        let mut stored_metadata =
+            serde_json::to_value(&metadata).expect("serialize cache metadata");
+        stored_metadata
+            .as_object_mut()
+            .expect("metadata object")
+            .insert(
+                "source".to_string(),
+                serde_json::Value::String("oci-registry".to_string()),
+            );
         std::fs::write(
             image_dir.join("metadata.json"),
-            serde_json::to_vec(&metadata).expect("serialize cache metadata"),
+            serde_json::to_vec(&stored_metadata).expect("serialize stored metadata"),
         )
         .expect("write cache metadata");
         let tag_key = format!("{requested_reference}|{cache_key}");
@@ -2307,6 +2221,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materializing_a_local_disk_skips_the_oci_cache() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .expect("open runtime");
+        let disk = temp.path().join("rootfs.img");
+        std::fs::write(&disk, b"caller-owned disk").expect("write local disk");
+
+        let image = runtime
+            .materialize_image(&ImageSource::disk(&disk))
+            .await
+            .expect("materialize local disk");
+
+        assert_eq!(
+            image.rootfs_path,
+            disk.canonicalize().expect("canonical local disk")
+        );
+        assert_eq!(image.source_kind, crate::ImageSourceKind::Disk);
+        assert!(image.image_id.is_some());
+        assert!(!paths.images_dir().exists());
+    }
+
+    #[tokio::test]
     async fn resolve_uses_complete_cache_without_writing_or_contacting_registry() {
         const REFERENCE: &str = "example.invalid/demo:mutable";
         const MANIFEST: &str =
@@ -2388,6 +2326,69 @@ mod tests {
             .await
             .expect_err("Never must not contact a missing registry reference");
         assert!(matches!(error, LibVmError::ImageNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn pulling_a_second_tag_for_a_cached_manifest_preserves_the_requested_tag() {
+        const FIRST_REFERENCE: &str = "example.invalid/demo:first";
+        const SECOND_REFERENCE: &str = "example.invalid/demo:second";
+        const MANIFEST: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const CONFIG: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .expect("open runtime");
+        let metadata = write_cached_oci_rootfs(&paths, FIRST_REFERENCE, MANIFEST, CONFIG);
+        let cache_key = format!(
+            "{}-{}",
+            metadata.platform.os, metadata.platform.architecture
+        );
+        let index_path = paths.images_dir().join("index.json");
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index_path).expect("read cache index"))
+                .expect("decode cache index");
+        let first_key = format!("{FIRST_REFERENCE}|{cache_key}");
+        let mut second_tag = index["tags"][&first_key].clone();
+        second_tag["image_ref"] = serde_json::Value::String(SECOND_REFERENCE.to_string());
+        index["tags"]
+            .as_object_mut()
+            .expect("cache tags")
+            .insert(format!("{SECOND_REFERENCE}|{cache_key}"), second_tag);
+        std::fs::write(
+            &index_path,
+            serde_json::to_vec_pretty(&index).expect("encode cache index"),
+        )
+        .expect("write cache index");
+
+        let handle = runtime
+            .images()
+            .pull_with(
+                SECOND_REFERENCE,
+                ImagePullOptions {
+                    policy: Some(ImagePullPolicy::Never),
+                },
+            )
+            .await
+            .expect("pull second cached tag");
+
+        assert_eq!(handle.requested_reference, SECOND_REFERENCE);
+        assert_eq!(handle.selected_manifest_digest, MANIFEST);
+        assert!(runtime
+            .images()
+            .get(FIRST_REFERENCE)
+            .await
+            .expect("get first tag")
+            .is_none());
+        assert!(runtime
+            .images()
+            .get(SECOND_REFERENCE)
+            .await
+            .expect("get second tag")
+            .is_some());
     }
 
     #[tokio::test]

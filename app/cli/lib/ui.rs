@@ -373,12 +373,12 @@ impl PullProgressDisplay {
                 }
                 self.current_applying_layer = Some(index);
             }
-            ImageProgress::WritingExt4 => {
+            ImageProgress::MaterializingRootfs => {
                 self.finish_current_applying_layer();
                 self.header
                     .set_message(format!("{:<12} {}", "Writing", self.reference));
             }
-            ImageProgress::SavingBaseImage => {
+            ImageProgress::PublishingRootfs => {
                 self.header
                     .set_message(format!("{:<12} {}", "Saving", self.reference));
             }
@@ -763,12 +763,27 @@ mod tests {
                 total: 1,
                 digest: Some(digest.to_string()),
             },
-            ImageProgress::WritingExt4,
-            ImageProgress::SavingBaseImage,
-            ImageProgress::Complete,
         ] {
             display.handle_event(event);
         }
+
+        display.handle_event(ImageProgress::MaterializingRootfs);
+        assert_eq!(
+            display.header.message(),
+            "Writing      docker.io/library/ubuntu:24.04"
+        );
+
+        display.handle_event(ImageProgress::PublishingRootfs);
+        assert_eq!(
+            display.header.message(),
+            "Saving       docker.io/library/ubuntu:24.04"
+        );
+
+        display.handle_event(ImageProgress::Complete);
+        assert_eq!(
+            display.header.message(),
+            "Pulled       docker.io/library/ubuntu:24.04"
+        );
 
         assert_eq!(display.reference, "docker.io/library/ubuntu:24.04");
         assert_eq!(display.layer_bars.len(), 1);

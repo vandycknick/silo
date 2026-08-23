@@ -1,0 +1,40 @@
+{
+  "version": 2,
+  "image_ref": "registry.example.test/team/demo:stable",
+  "image_id": "sha256:4d4f7f6821da902de46af93c73ed48c25e923fae1c762985953269c1b02de8ea",
+  "source": "oci-registry",
+  "requested_reference": "registry.example.test/team/demo:stable",
+  "selected_reference": "registry.example.test/team/demo@sha256:4d4f7f6821da902de46af93c73ed48c25e923fae1c762985953269c1b02de8ea",
+  "manifest_digest": "sha256:4d4f7f6821da902de46af93c73ed48c25e923fae1c762985953269c1b02de8ea",
+  "config_digest": "sha256:660f54c55d10d61af8e1e3375d2acf5a75a723f80ac03d6cee8ff985b3ff0ef3",
+  "config": {
+    "Entrypoint": [
+      "/usr/local/bin/demo"
+    ],
+    "Cmd": [],
+    "Env": [
+      "PATH=/usr/local/bin:/usr/bin"
+    ],
+    "WorkingDir": "/workspace",
+    "User": "10001",
+    "Labels": {
+      "org.opencontainers.image.title": "demo"
+    },
+    "StopSignal": "SIGTERM"
+  },
+  "layers": [
+    {
+      "digest": "sha256:f403e6f4f3926678a492eb3564af327bea286d2c1603665754d4dd97c1a1140d",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size_bytes": 1234,
+      "diff_id": "sha256:36fd3992cb1b927373416111efb1d1e8e5029e87222e674337a5b5c0670d50c2"
+    }
+  ],
+  "platform": {
+    "os": "linux",
+    "architecture": "amd64"
+  },
+  "filesystem": "ext4",
+  "rootfs_file": "rootfs.img",
+  "created_at_unix": 1710000000
+}

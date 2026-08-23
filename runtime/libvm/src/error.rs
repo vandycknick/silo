@@ -53,11 +53,35 @@ pub enum LibVmError {
         source_kind: crate::ImageSourceKind,
     },
 
+    #[error("could not canonicalize local disk {path}: {source}")]
+    LocalDiskCanonicalize {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("could not inspect local disk {path}: {source}")]
+    LocalDiskMetadata {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("local disk {path} is invalid: path must point to a regular file")]
+    LocalDiskNotRegularFile { path: PathBuf },
+
+    #[error("could not read local disk {path}: {source}")]
+    LocalDiskUnreadable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("image operation for {reference} failed")]
     Image {
         reference: String,
         #[source]
-        source: ocidisk::OciDiskError,
+        source: oci::OciError,
     },
 
     #[error("machine {id} already exists")]

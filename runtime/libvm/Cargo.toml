@@ -5,9 +5,9 @@ edition = "2021"
 
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }
-ext4 = { path = "../../common/ext4" }
+disk-image = { path = "../../common/disk-image" }
 silo_policy = { package = "policy", path = "../../common/policy" }
-ocidisk = { path = "../ocidisk" }
+oci = { path = "../oci" }
 protocol = { path = "../../specs/protocol" }
 vm-spec = { path = "../../specs/vm-spec" }
 utils = { path = "../../common/utils" }
@@ -24,6 +24,7 @@ rustix = { version = "1.1.4", features = ["event", "process"] }
 russh = "0.62.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 nix = { version = "0.31.3", features = ["process", "signal", "fs", "user"] }
 plist = { version = "1.10.0", default-features = false }
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono", "uuid", "json"] }

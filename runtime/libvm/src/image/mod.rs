@@ -2,12 +2,16 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod local_disk;
+pub(crate) mod oci;
+pub(crate) mod progress;
+
 use crate::runtime::Runtime;
 use crate::LibVmError;
 
-pub use ocidisk::OciImageConfigMetadata;
-pub use ocidisk::Platform;
-pub use ocidisk::{ImageProgress, ImageProgressReceiver, ImageProgressSender};
+pub use ::oci::ImageConfig as OciImageConfigMetadata;
+pub use ::oci::Platform;
+pub use progress::{ImageProgress, ImageProgressReceiver, ImageProgressSender};
 
 /// Source used to create a machine root disk.
 ///
@@ -66,13 +70,6 @@ impl ImageSource {
         match self {
             Self::Oci(reference) => reference.clone(),
             Self::Disk(path) => path.display().to_string(),
-        }
-    }
-
-    pub(crate) fn cache_reference(&self) -> String {
-        match self {
-            Self::Oci(reference) => reference.clone(),
-            Self::Disk(path) => format!("disk:{}", path.display()),
         }
     }
 }
@@ -186,7 +183,7 @@ pub struct ResolvedOciImage {
 #[derive(Debug, Clone)]
 pub(crate) enum ResolvedOciImageMaterialization {
     Cached,
-    Registry(Box<ocidisk::ResolvedOciImage>),
+    Registry(Box<::oci::ResolvedImage>),
 }
 
 /// Options for removing image references.

@@ -1,0 +1,2326 @@
+// Core ext4 image formatter.
+//
+// Creates ext4 filesystem images from scratch using a single-pass sequential
+// write strategy.  The public entry point is `Formatter::new()` followed by
+// repeated `create()` / `link()` / `remove()` calls, finalized with `close()`.
+
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+use uuid::Uuid;
+
+use crate::ext4::checksum;
+use crate::ext4::constants::*;
+use crate::ext4::dir;
+use crate::ext4::error::{FormatError, FormatResult};
+use crate::ext4::extent;
+use crate::ext4::file_tree::{BlockRange, FileTree, FileTreeNode, InodeNumber};
+use crate::ext4::journal;
+use crate::ext4::types::*;
+use crate::ext4::xattr::{ExtendedAttribute, XattrState};
+
+/// Maximum bytes that fit in the ext4 superblock's `volume_name` field.
+const VOLUME_NAME_LEN: usize = 16;
+/// Reserved inode number used by ext2/3/4 for online-resize metadata.
+const RESIZE_INODE_NUMBER: u32 = 7;
+/// `i_block[13]` is the double-indirect block pointer in legacy inode layout.
+const EXT2_DIND_BLOCK: usize = 13;
+/// Number of direct block pointers before indirect pointers in legacy layout.
+const EXT2_NDIR_BLOCKS: u64 = 12;
+/// Match e2fsprogs' default online-resize headroom of roughly 1024x growth.
+const RESERVED_GDT_MULTIPLIER: u32 = 32;
+
+// ---------------------------------------------------------------------------
+// FormatOptions
+// ---------------------------------------------------------------------------
+
+/// Parameters for creating a new ext4 image.
+///
+/// Construct via [`FormatOptions::new`] and layer on [`uuid`] / [`label`] as
+/// needed. The resulting options are passed to [`Formatter::with_options`].
+///
+/// [`uuid`]: Self::uuid
+/// [`label`]: Self::label
+#[derive(Clone, Debug)]
+pub struct FormatOptions {
+    /// Block size in bytes. Only 4096 is currently accepted; the field is
+    /// explicit so future versions can widen the accepted set without another
+    /// API break.
+    pub block_size: u32,
+    /// Total size of the image file in bytes.
+    pub size: u64,
+    /// UUID written to the superblock. `None` picks a random v4 UUID at
+    /// format time.
+    pub uuid: Option<Uuid>,
+    /// Volume label. Must be ≤ 16 bytes UTF-8 and contain no NUL bytes.
+    /// `None` leaves the field zeroed.
+    pub label: Option<String>,
+}
+
+impl FormatOptions {
+    /// Create options for an image of the given size, with default
+    /// `block_size = 4096`, random UUID, no label.
+    pub fn new(size: u64) -> Self {
+        Self {
+            block_size: 4096,
+            size,
+            uuid: None,
+            label: None,
+        }
+    }
+
+    /// Set an explicit UUID instead of a randomly generated one.
+    pub fn uuid(mut self, uuid: Uuid) -> Self {
+        self.uuid = Some(uuid);
+        self
+    }
+
+    /// Set the volume label.
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+}
+
+fn validate_label(label: &str) -> FormatResult<()> {
+    if label.len() > VOLUME_NAME_LEN {
+        return Err(FormatError::InvalidLabel(format!(
+            "label {label:?} is {} bytes, ext4 limit is {VOLUME_NAME_LEN}",
+            label.len()
+        )));
+    }
+    if label.contains('\0') {
+        return Err(FormatError::InvalidLabel(format!(
+            "label {label:?} contains a NUL byte"
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// FileTimestamps
+// ---------------------------------------------------------------------------
+
+/// Timestamps to apply to a newly created inode.
+///
+/// Each pair is `(seconds_lo, extra)` in ext4 format -- the same layout
+/// returned by `timestamp_now()`.
+pub struct FileTimestamps {
+    pub access_lo: u32,
+    pub access_hi: u32,
+    pub modification_lo: u32,
+    pub modification_hi: u32,
+    pub creation_lo: u32,
+    pub creation_hi: u32,
+    pub now_lo: u32,
+    pub now_hi: u32,
+}
+
+impl Default for FileTimestamps {
+    fn default() -> Self {
+        let (lo, hi) = timestamp_now();
+        Self {
+            access_lo: lo,
+            access_hi: hi,
+            modification_lo: lo,
+            modification_hi: hi,
+            creation_lo: lo,
+            creation_hi: hi,
+            now_lo: lo,
+            now_hi: hi,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Formatter
+// ---------------------------------------------------------------------------
+
+/// Single-pass ext4 image builder.
+pub struct Formatter {
+    file: File,
+    block_size: u32,
+    size: u64,
+    inodes: Vec<Inode>,
+    tree: FileTree,
+    deleted_blocks: Vec<BlockRange>,
+    /// Block ranges owned by inodes that still have links_count > 0 but
+    /// whose original tree node has been detached.  Keyed by inode number.
+    /// Used to reclaim blocks when the last hard-link reference is removed.
+    deferred_blocks: HashMap<u32, Vec<BlockRange>>,
+    /// UUID shared by ext4 metadata and the internal journal.
+    uuid: Uuid,
+    /// Volume label to copy into the superblock's `volume_name` field. Validated
+    /// on construction.
+    label: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FlexMetadataLayout {
+    block_groups: u32,
+    inode_table_offset: u32,
+    bitmap_offset: u32,
+    data_size: u32,
+    total_groups: u32,
+    gd_block_count: u32,
+    gd_area_blocks: u32,
+    size_bytes: u64,
+}
+
+impl Formatter {
+    // -- Computed properties ------------------------------------------------
+
+    #[inline]
+    fn blocks_per_group(&self) -> u32 {
+        self.block_size * 8
+    }
+
+    #[inline]
+    fn max_inodes_per_group(&self) -> u32 {
+        self.block_size * 8
+    }
+
+    #[inline]
+    fn groups_per_descriptor_block(&self) -> u32 {
+        self.block_size / 32
+    }
+
+    #[inline]
+    fn block_count(&self) -> u32 {
+        ((self.size - 1) / self.block_size as u64 + 1) as u32
+    }
+
+    #[inline]
+    fn group_count(&self) -> u32 {
+        (self.block_count() - 1) / self.blocks_per_group() + 1
+    }
+
+    #[inline]
+    fn descriptor_blocks_for_groups(&self, groups: u32) -> u32 {
+        (groups - 1) / self.groups_per_descriptor_block() + 1
+    }
+
+    #[inline]
+    fn reserved_gdt_blocks_for_descriptor_blocks(&self, descriptor_blocks: u32) -> u32 {
+        let addr_per_block = self.block_size / 4;
+        descriptor_blocks
+            .saturating_mul(RESERVED_GDT_MULTIPLIER - 1)
+            .min(addr_per_block.saturating_sub(descriptor_blocks))
+    }
+
+    #[inline]
+    fn group_descriptor_area_blocks_for_groups(&self, groups: u32) -> u32 {
+        let descriptor_blocks = self.descriptor_blocks_for_groups(groups);
+        descriptor_blocks + self.reserved_gdt_blocks_for_descriptor_blocks(descriptor_blocks)
+    }
+
+    #[inline]
+    fn group_descriptor_blocks(&self) -> u32 {
+        self.group_descriptor_area_blocks_for_groups(self.group_count())
+    }
+
+    #[inline]
+    fn pos(&mut self) -> io::Result<u64> {
+        self.file.stream_position()
+    }
+
+    #[inline]
+    fn current_block(&mut self) -> io::Result<u32> {
+        let block = self.pos()? / self.block_size as u64;
+        u32::try_from(block).map_err(|_| io::Error::other("filesystem exceeds 32-bit block limit"))
+    }
+
+    fn seek_to_block(&mut self, block: u32) -> io::Result<()> {
+        self.file
+            .seek(SeekFrom::Start(block as u64 * self.block_size as u64))?;
+        Ok(())
+    }
+
+    fn align_to_block(&mut self) -> io::Result<()> {
+        let p = self.pos()?;
+        if p % self.block_size as u64 != 0 {
+            let blk = self
+                .current_block()?
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("filesystem exceeds 32-bit block limit"))?;
+            self.seek_to_block(blk)?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn is_power_of(mut n: u32, base: u32) -> bool {
+        if n < base {
+            return false;
+        }
+        while n % base == 0 {
+            n /= base;
+        }
+        n == 1
+    }
+
+    #[inline]
+    fn has_sparse_super(group: u32) -> bool {
+        group == 0
+            || group == 1
+            || Self::is_power_of(group, 3)
+            || Self::is_power_of(group, 5)
+            || Self::is_power_of(group, 7)
+    }
+
+    #[inline]
+    fn has_sparse_super_backup(group: u32) -> bool {
+        group != 0 && Self::has_sparse_super(group)
+    }
+
+    #[inline]
+    fn static_metadata_blocks_in_group_for_area(&self, group: u32, gd_area_blocks: u32) -> u32 {
+        if Self::has_sparse_super(group) {
+            1 + gd_area_blocks
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    fn static_metadata_blocks_in_group(&self, group: u32) -> u32 {
+        self.static_metadata_blocks_in_group_for_area(group, self.group_descriptor_blocks())
+    }
+
+    fn reserved_metadata_end_for_block(&self, block: u32) -> u32 {
+        let group = block / self.blocks_per_group();
+        let group_start = group * self.blocks_per_group();
+        let metadata_blocks = self.static_metadata_blocks_in_group(group);
+        let metadata_end = group_start + metadata_blocks;
+
+        if block >= group_start && block < metadata_end {
+            metadata_end
+        } else {
+            block
+        }
+    }
+
+    fn skip_reserved_metadata_blocks(&mut self) -> io::Result<()> {
+        if self.pos()? % self.block_size as u64 != 0 {
+            return Ok(());
+        }
+
+        loop {
+            let block = self.current_block()?;
+            let next = self.reserved_metadata_end_for_block(block);
+            if next == block {
+                return Ok(());
+            }
+            self.seek_to_block(next)?;
+        }
+    }
+
+    fn total_groups_for_data_end(&self, data_end: u64, minimum_disk_size_blocks: u32) -> u32 {
+        let current_size_blocks = self.size.div_ceil(self.block_size as u64);
+        let required_blocks = data_end
+            .max(minimum_disk_size_blocks as u64)
+            .max(current_size_blocks)
+            .max(1);
+
+        ((required_blocks - 1) / self.blocks_per_group() as u64 + 1) as u32
+    }
+
+    fn metadata_run_start_after_static_ranges(
+        &self,
+        mut start: u64,
+        blocks: u64,
+        total_groups: u32,
+        gd_area_blocks: u32,
+    ) -> u64 {
+        loop {
+            let end = start + blocks;
+            let mut next_start = start;
+
+            for group in 0..total_groups {
+                let metadata_blocks =
+                    self.static_metadata_blocks_in_group_for_area(group, gd_area_blocks) as u64;
+                if metadata_blocks == 0 {
+                    continue;
+                }
+
+                let group_start = group as u64 * self.blocks_per_group() as u64;
+                let metadata_end = group_start + metadata_blocks;
+                if block_ranges_overlap(start, end, group_start, metadata_end) {
+                    next_start = metadata_end;
+                    break;
+                }
+            }
+
+            if next_start == start {
+                return start;
+            }
+            start = next_start;
+        }
+    }
+
+    fn flex_metadata_layout(
+        &self,
+        start_min: u32,
+        mut block_groups: u32,
+        inode_table_size_per_group: u32,
+        minimum_disk_size_blocks: u32,
+    ) -> FlexMetadataLayout {
+        let mut start = start_min as u64;
+
+        loop {
+            let inode_table_blocks = block_groups as u64 * inode_table_size_per_group as u64;
+            let metadata_blocks = inode_table_blocks + block_groups as u64 * 2;
+            let data_end = start + metadata_blocks;
+            let total_groups = self.total_groups_for_data_end(data_end, minimum_disk_size_blocks);
+            let gd_area_blocks = self.group_descriptor_area_blocks_for_groups(total_groups);
+            let adjusted_start = self.metadata_run_start_after_static_ranges(
+                start,
+                metadata_blocks,
+                total_groups,
+                gd_area_blocks,
+            );
+            let adjusted_data_end = adjusted_start + metadata_blocks;
+            // Every group occupied by the shared run must use the shared
+            // layout. Otherwise close() gives it overlapping local metadata.
+            let adjusted_block_groups = block_groups
+                .max(((adjusted_data_end - 1) / self.blocks_per_group() as u64 + 1) as u32);
+            let adjusted_total_groups =
+                self.total_groups_for_data_end(adjusted_data_end, minimum_disk_size_blocks);
+            let adjusted_gd_area_blocks =
+                self.group_descriptor_area_blocks_for_groups(adjusted_total_groups);
+
+            if adjusted_start == start
+                && adjusted_block_groups == block_groups
+                && adjusted_total_groups == total_groups
+                && adjusted_gd_area_blocks == gd_area_blocks
+            {
+                return FlexMetadataLayout {
+                    block_groups: adjusted_block_groups,
+                    inode_table_offset: adjusted_start as u32,
+                    bitmap_offset: (adjusted_start + inode_table_blocks) as u32,
+                    data_size: adjusted_data_end as u32,
+                    total_groups: adjusted_total_groups,
+                    gd_block_count: self.descriptor_blocks_for_groups(adjusted_total_groups),
+                    gd_area_blocks: adjusted_gd_area_blocks,
+                    size_bytes: adjusted_total_groups as u64
+                        * self.blocks_per_group() as u64
+                        * self.block_size as u64,
+                };
+            }
+
+            start = adjusted_start;
+            block_groups = adjusted_block_groups;
+        }
+    }
+
+    fn free_ranges_before_shifted_metadata(
+        &self,
+        start: u32,
+        end: u32,
+        total_groups: u32,
+        gd_area_blocks: u32,
+    ) -> Vec<BlockRange> {
+        let mut ranges = Vec::new();
+        let mut cursor = start;
+
+        while cursor < end {
+            let group = cursor / self.blocks_per_group();
+            if group >= total_groups {
+                break;
+            }
+
+            let group_start = group * self.blocks_per_group();
+            let group_end = group_start + self.blocks_per_group();
+            let static_metadata_end = group_start
+                + self
+                    .static_metadata_blocks_in_group_for_area(group, gd_area_blocks)
+                    .min(self.blocks_per_group());
+
+            if cursor < static_metadata_end {
+                cursor = static_metadata_end.min(end);
+                continue;
+            }
+
+            let range_end = group_end.min(end);
+            if cursor < range_end {
+                ranges.push(BlockRange {
+                    start: cursor,
+                    end: range_end,
+                });
+            }
+            cursor = range_end;
+        }
+
+        ranges
+    }
+
+    fn clear_block_range_from_bitmap(
+        bitmap: &mut [u8],
+        group_start: u32,
+        group_end: u32,
+        range: &BlockRange,
+        used_blocks: &mut u32,
+    ) {
+        let start = range.start.max(group_start);
+        let end = range.end.min(group_end);
+
+        for block in start..end {
+            let offset = block - group_start;
+            let was_set = (bitmap[(offset / 8) as usize] >> (offset % 8)) & 1;
+            bitmap[(offset / 8) as usize] &= !(1 << (offset % 8));
+            if was_set != 0 {
+                *used_blocks -= 1;
+            }
+        }
+    }
+
+    fn record_block_range(ranges: &mut Vec<BlockRange>, block: u32) {
+        if let Some(last) = ranges.last_mut() {
+            if block >= last.start && block < last.end {
+                return;
+            }
+            if last.end == block {
+                last.end += 1;
+                return;
+            }
+        }
+
+        ranges.push(BlockRange {
+            start: block,
+            end: block + 1,
+        });
+    }
+
+    fn write_payload_bytes(
+        &mut self,
+        bytes: &[u8],
+        ranges: &mut Vec<BlockRange>,
+    ) -> io::Result<()> {
+        let mut offset = 0usize;
+        let block_size = self.block_size as usize;
+
+        while offset < bytes.len() {
+            self.skip_reserved_metadata_blocks()?;
+
+            let block = self.current_block()?;
+            let block_offset = (self.pos()? % self.block_size as u64) as usize;
+            let writable = (block_size - block_offset).min(bytes.len() - offset);
+            self.file.write_all(&bytes[offset..offset + writable])?;
+            self.size = self.size.max(self.file.stream_position()?);
+            Self::record_block_range(ranges, block);
+            offset += writable;
+        }
+
+        Ok(())
+    }
+
+    fn write_payload_from_reader(
+        &mut self,
+        reader: &mut dyn Read,
+        ranges: &mut Vec<BlockRange>,
+    ) -> FormatResult<u64> {
+        let mut size = 0u64;
+        let mut buf = vec![0u8; self.block_size as usize];
+
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            size += n as u64;
+            if size > MAX_FILE_SIZE {
+                return Err(FormatError::FileTooBig(size));
+            }
+            self.write_payload_bytes(&buf[..n], ranges)?;
+        }
+
+        Ok(size)
+    }
+
+    fn write_aligned_payload_bytes(&mut self, bytes: &[u8]) -> FormatResult<Vec<BlockRange>> {
+        self.align_to_block()?;
+        self.skip_reserved_metadata_blocks()?;
+        let mut ranges = Vec::new();
+        self.write_payload_bytes(bytes, &mut ranges)?;
+        self.align_to_block()?;
+        Ok(ranges)
+    }
+
+    fn allocate_sparse_blocks(&mut self, block_count: u32) -> FormatResult<Vec<BlockRange>> {
+        self.align_to_block()?;
+        let mut remaining = block_count;
+        let mut ranges = Vec::new();
+
+        while remaining > 0 {
+            self.skip_reserved_metadata_blocks()?;
+            let start = self.current_block()?;
+            let group_end = (start / self.blocks_per_group() + 1)
+                .checked_mul(self.blocks_per_group())
+                .ok_or_else(|| io::Error::other("filesystem exceeds 32-bit block limit"))?;
+            let count = remaining.min(group_end - start);
+            let end = start
+                .checked_add(count)
+                .ok_or_else(|| io::Error::other("filesystem exceeds 32-bit block limit"))?;
+            ranges.push(BlockRange { start, end });
+            self.seek_to_block(end)?;
+            remaining -= count;
+        }
+
+        Ok(ranges)
+    }
+
+    fn initialize_journal(&mut self) -> FormatResult<()> {
+        let initial_blocks = self
+            .size
+            .div_ceil(self.block_size as u64)
+            .max(self.blocks_per_group() as u64);
+        let journal_blocks = journal::default_journal_blocks(initial_blocks);
+        let ranges = self.allocate_sparse_blocks(journal_blocks)?;
+        let journal_start = ranges
+            .first()
+            .ok_or(FormatError::InsufficientSpaceForGroupDescriptorBlocks)?
+            .start;
+
+        let (time_lo, time_extra) = timestamp_now();
+        let mut inode = Inode {
+            mode: file_mode::S_IFREG | 0o600,
+            links_count: 1,
+            extra_isize: EXTRA_ISIZE,
+            atime: time_lo,
+            ctime: time_lo,
+            mtime: time_lo,
+            crtime: time_lo,
+            atime_extra: time_extra,
+            ctime_extra: time_extra,
+            mtime_extra: time_extra,
+            crtime_extra: time_extra,
+            ..Inode::default()
+        };
+        inode.set_file_size(journal_blocks as u64 * self.block_size as u64);
+
+        self.skip_reserved_metadata_blocks()?;
+        let mut next_block = self.current_block()?;
+        extent::write_extents(
+            &mut inode,
+            &ranges,
+            self.block_size,
+            &mut self.file,
+            &mut next_block,
+        )?;
+        self.seek_to_block(next_block)?;
+        self.inodes[(journal::JOURNAL_INODE_NUMBER - 1) as usize] = inode;
+
+        let end_position = self.pos()?;
+        self.seek_to_block(journal_start)?;
+        self.file.write_all(&journal::superblock(
+            self.block_size,
+            journal_blocks,
+            self.uuid,
+        ))?;
+        self.file.seek(SeekFrom::Start(end_position))?;
+        Ok(())
+    }
+
+    fn assign_node_ranges(node: &mut FileTreeNode, ranges: &[BlockRange]) {
+        node.blocks = ranges.first().copied();
+        node.additional_blocks = ranges.iter().skip(1).copied().collect();
+    }
+
+    // -- Constructor -------------------------------------------------------
+
+    /// Create a new formatter that writes an ext4 image to `path`.
+    ///
+    /// The file is truncated and re-created as a sparse file of `opts.size`
+    /// bytes. The root directory (inode 2) and the `/lost+found` directory
+    /// (required by e2fsck) are created automatically.
+    ///
+    /// Only `opts.block_size == 4096` is currently accepted; other values
+    /// return [`FormatError::UnsupportedBlockSize`]. Labels are validated
+    /// eagerly — an oversize or NUL-containing label returns
+    /// [`FormatError::InvalidLabel`] before any file work happens.
+    pub fn with_options(path: &Path, opts: FormatOptions) -> FormatResult<Self> {
+        // Only 4096-byte blocks are supported.  Supporting smaller block sizes
+        // (1024, 2048) would require first_data_block=1 and different group
+        // descriptor offset calculations throughout the formatter and reader.
+        if opts.block_size != 4096 {
+            return Err(FormatError::UnsupportedBlockSize(opts.block_size));
+        }
+
+        if opts.size == 0 {
+            return Err(FormatError::InvalidSize {
+                size: opts.size,
+                reason: "size must be greater than zero",
+            });
+        }
+        let blocks_per_group = opts.block_size * 8;
+        let maximum_blocks = (u32::MAX / blocks_per_group) as u64 * blocks_per_group as u64;
+        if opts.size.div_ceil(opts.block_size as u64) > maximum_blocks {
+            return Err(FormatError::InvalidSize {
+                size: opts.size,
+                reason: "size exceeds the 32-bit block layout",
+            });
+        }
+
+        if let Some(label) = &opts.label {
+            validate_label(label)?;
+        }
+
+        let uuid = opts.uuid.unwrap_or_else(Uuid::new_v4);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+
+        // Create a sparse file.
+        file.set_len(opts.size)?;
+
+        // Reserve the first 10 inodes (indices 0..9  =>  inode numbers 1..10).
+        //   [0] = defective block inode  (empty / default)
+        //   [1] = root inode             (inode 2)
+        //   [2..9] = reserved            (empty / default)
+        let mut inodes = Vec::with_capacity(16);
+        inodes.push(Inode::default()); // inode 1 -- defective blocks
+        inodes.push(Inode::root_inode()); // inode 2 -- root directory
+        for _ in 2..10 {
+            inodes.push(Inode::default()); // inodes 3..10
+        }
+
+        let tree = FileTree::new(ROOT_INODE, "/");
+
+        let mut fmt = Self {
+            file,
+            block_size: opts.block_size,
+            size: opts.size,
+            inodes,
+            tree,
+            deleted_blocks: Vec::new(),
+            deferred_blocks: HashMap::new(),
+            uuid,
+            label: opts.label,
+        };
+
+        // Seek past the superblock (block 0) and the group descriptor table.
+        let gdb = fmt.group_descriptor_blocks();
+        fmt.seek_to_block(gdb + 1)?;
+
+        fmt.initialize_journal()?;
+
+        // /lost+found is required by e2fsck.
+        fmt.create(
+            "/lost+found",
+            make_mode(file_mode::S_IFDIR, 0o700),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        Ok(fmt)
+    }
+
+    /// Create a new formatter with defaults for UUID (random) and label (empty).
+    ///
+    /// Thin shim over [`Formatter::with_options`] for the common case where
+    /// only the image size matters. Callers that need a specific UUID or
+    /// volume label should use `with_options` directly.
+    pub fn new(path: &Path, block_size: u32, min_disk_size: u64) -> FormatResult<Self> {
+        Self::with_options(
+            path,
+            FormatOptions {
+                block_size,
+                size: min_disk_size,
+                uuid: None,
+                label: None,
+            },
+        )
+    }
+
+    // -- create() ----------------------------------------------------------
+
+    /// Create a file, directory, or symlink at `path`.
+    ///
+    /// Parent directories are created recursively with mode 0755, inheriting
+    /// uid/gid from the nearest existing parent (like `mkdir -p`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create(
+        &mut self,
+        path: &str,
+        mode: u16,
+        link: Option<&str>,
+        ts: Option<FileTimestamps>,
+        data: Option<&mut dyn Read>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        xattrs: Option<&HashMap<String, Vec<u8>>>,
+    ) -> FormatResult<()> {
+        validate_path_component_names(path)?;
+
+        if !is_dir(mode) && !is_reg(mode) && !is_link(mode) {
+            return Err(FormatError::UnsupportedFiletype);
+        }
+        if is_link(mode) != link.is_some() {
+            return Err(FormatError::InvalidLink(std::path::PathBuf::from(path)));
+        }
+
+        let path_buf = std::path::PathBuf::from(path);
+
+        // ------- Handle "already exists" cases -------
+        if let Some(existing_idx) = self.tree.lookup(&path_buf) {
+            let existing_inode_num = self.tree.node(existing_idx).inode;
+            let existing_inode = &self.inodes[(existing_inode_num - 1) as usize];
+
+            if is_dir(mode) {
+                if existing_inode.is_dir() {
+                    // mkdir -p: directory already exists.  Only update mode
+                    // and ownership when the caller explicitly provided them
+                    // (uid/gid != None).  This prevents recursive parent-
+                    // creation from silently downgrading permissions set by
+                    // an earlier explicit create() call.
+                    if self.tree.node(existing_idx).name == basename(path) {
+                        if uid.is_some() || gid.is_some() {
+                            let inode = &mut self.inodes[(existing_inode_num - 1) as usize];
+                            inode.mode = mode;
+                            if let Some(u) = uid {
+                                inode.set_uid(u);
+                            }
+                            if let Some(g) = gid {
+                                inode.set_gid(g);
+                            }
+                        }
+                        return Ok(());
+                    }
+                } else {
+                    // A regular file (or other non-dir) blocks directory creation.
+                    return Err(FormatError::NotDirectory(path_buf));
+                }
+            } else if self.tree.node(existing_idx).link.is_some() {
+                // Hard-link entries can always be overwritten.
+                self.remove(path)?;
+            } else {
+                // File or symlink replacing an existing entry.
+                if existing_inode.is_dir() && !is_link(mode) {
+                    return Err(FormatError::NotFile(path_buf));
+                }
+                self.remove(path)?;
+            }
+        }
+
+        // ------- Ensure parent directories exist -------
+        let parent_path = parent_of(path);
+        if parent_path != path {
+            self.create(
+                parent_path,
+                make_mode(file_mode::S_IFDIR, 0o755),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+        }
+
+        let parent_path_buf = std::path::PathBuf::from(parent_path);
+        let parent_idx = self
+            .tree
+            .lookup(&parent_path_buf)
+            .ok_or_else(|| FormatError::NotFound(parent_path_buf.clone()))?;
+        let parent_inode_num = self.tree.node(parent_idx).inode;
+        let parent_inode = &self.inodes[(parent_inode_num - 1) as usize];
+
+        if parent_inode.links_count as u32 >= MAX_LINKS {
+            return Err(FormatError::MaximumLinksExceeded(parent_path_buf));
+        }
+
+        // ------- Build the child inode -------
+        let mut child_inode = Inode {
+            mode,
+            flags: inode_flags::HUGE_FILE,
+            ..Default::default()
+        };
+
+        // uid / gid -- inherit from parent when not specified.
+        if let Some(u) = uid {
+            child_inode.set_uid(u);
+        } else {
+            child_inode.uid = parent_inode.uid;
+            child_inode.uid_hi = parent_inode.uid_hi;
+        }
+        if let Some(g) = gid {
+            child_inode.set_gid(g);
+        } else {
+            child_inode.gid = parent_inode.gid;
+            child_inode.gid_hi = parent_inode.gid_hi;
+        }
+
+        // Extended attributes.
+        if let Some(xattr_map) = xattrs {
+            if !xattr_map.is_empty() {
+                let child_ino = self.inodes.len() as u32 + 1;
+                let mut state = XattrState::new(child_ino, INODE_EXTRA_SIZE, self.block_size);
+                // The reference implementation adds a sentinel "system.data" attribute.
+                state.add(ExtendedAttribute::new("system.data", Vec::new()))?;
+                for (name, value) in xattr_map {
+                    state.add(ExtendedAttribute::new(name, value.clone()))?;
+                }
+                if state.has_inline() {
+                    let buf = state.write_inline()?;
+                    child_inode.inline_xattrs.copy_from_slice(&buf);
+                }
+                if state.has_block() {
+                    let block_buf = state.write_block()?;
+                    let ranges = self.write_aligned_payload_bytes(&block_buf)?;
+                    if let Some(range) = ranges.first() {
+                        child_inode.xattr_block_lo = range.start;
+                    }
+                    // Account for the xattr block.  When HUGE_FILE is set,
+                    // blocks_lo is in filesystem-block units; otherwise sectors.
+                    if child_inode.flags & inode_flags::HUGE_FILE != 0 {
+                        child_inode.blocks_lo += 1;
+                    } else {
+                        child_inode.blocks_lo += self.block_size / 512;
+                    }
+                }
+            }
+        }
+
+        // Timestamps.
+        let ts = ts.unwrap_or_default();
+        child_inode.atime = ts.access_lo;
+        child_inode.atime_extra = ts.access_hi;
+        child_inode.ctime = ts.now_lo;
+        child_inode.ctime_extra = ts.now_hi;
+        child_inode.mtime = ts.modification_lo;
+        child_inode.mtime_extra = ts.modification_hi;
+        child_inode.crtime = ts.creation_lo;
+        child_inode.crtime_extra = ts.creation_hi;
+        child_inode.links_count = 1;
+        child_inode.extra_isize = EXTRA_ISIZE;
+
+        let mut ranges: Vec<BlockRange> = Vec::new();
+
+        // ------- Handle by file type -------
+        if is_dir(mode) {
+            // Directory: bump link counts; directory entries are deferred to
+            // close() so they can be sorted.
+            child_inode.links_count = 2;
+            self.inodes[(parent_inode_num - 1) as usize].links_count += 1;
+        } else if is_link(mode) {
+            // Symbolic link.
+            let link_target = link.ok_or_else(|| FormatError::InvalidLink(path_buf.clone()))?;
+            let link_bytes = link_target.as_bytes();
+
+            let size = if link_bytes.len() < 60 {
+                // Short symlink: store inline in the inode's block field.
+                child_inode.block[..link_bytes.len()].copy_from_slice(link_bytes);
+                link_bytes.len() as u64
+            } else {
+                // Long symlink: write to data blocks.
+                ranges = self.write_aligned_payload_bytes(link_bytes)?;
+                link_bytes.len() as u64
+            };
+
+            child_inode.set_file_size(size);
+            child_inode.mode |= 0o777;
+            child_inode.flags = 0;
+
+            if link_bytes.len() < 60 {
+                child_inode.blocks_lo = 0;
+            } else {
+                self.skip_reserved_metadata_blocks()?;
+                let mut cur = self.current_block()?;
+                extent::write_extents(
+                    &mut child_inode,
+                    &ranges,
+                    self.block_size,
+                    &mut self.file,
+                    &mut cur,
+                )?;
+            }
+        } else if is_reg(mode) {
+            // Regular file.
+            let mut size = 0u64;
+
+            if let Some(reader) = data {
+                self.align_to_block()?;
+                self.skip_reserved_metadata_blocks()?;
+                size = self.write_payload_from_reader(reader, &mut ranges)?;
+                self.align_to_block()?;
+            }
+
+            child_inode.set_file_size(size);
+
+            self.skip_reserved_metadata_blocks()?;
+            let mut cur = self.current_block()?;
+            extent::write_extents(
+                &mut child_inode,
+                &ranges,
+                self.block_size,
+                &mut self.file,
+                &mut cur,
+            )?;
+        } else {
+            return Err(FormatError::UnsupportedFiletype);
+        }
+
+        // ------- Register the new inode and tree node -------
+        self.inodes.push(child_inode);
+        let child_inode_num = self.inodes.len() as InodeNumber;
+
+        let mut child_node = FileTreeNode {
+            inode: child_inode_num,
+            name: basename(path).to_string(),
+            children: Vec::new(),
+            parent: None,
+            blocks: None,
+            additional_blocks: Vec::new(),
+            link: None,
+        };
+        Self::assign_node_ranges(&mut child_node, &ranges);
+        self.tree.add_child(parent_idx, child_node);
+
+        Ok(())
+    }
+
+    // -- Query helpers for incremental writers -------------------------------
+
+    /// Check whether `path` exists in the in-memory file tree.
+    pub fn exists(&self, path: &str) -> bool {
+        self.tree.lookup(&std::path::PathBuf::from(path)).is_some()
+    }
+
+    /// Check whether `path` exists and is a directory.
+    pub fn is_dir(&self, path: &str) -> bool {
+        let path_buf = std::path::PathBuf::from(path);
+        if let Some(idx) = self.tree.lookup(&path_buf) {
+            let ino = self.tree.node(idx).inode;
+            self.inodes[(ino - 1) as usize].is_dir()
+        } else {
+            false
+        }
+    }
+
+    /// List the names of immediate children of a directory (excluding `.`
+    /// and `..`).  Returns an empty vec if `path` is not a directory.
+    pub fn list_dir(&self, path: &str) -> Vec<String> {
+        let path_buf = std::path::PathBuf::from(path);
+        let Some(idx) = self.tree.lookup(&path_buf) else {
+            return Vec::new();
+        };
+        self.tree
+            .node(idx)
+            .children
+            .iter()
+            .map(|&ci| self.tree.node(ci).name.clone())
+            .collect()
+    }
+
+    /// Update the permission bits of an existing entry.
+    pub fn set_permissions(&mut self, path: &str, mode: u16) -> FormatResult<()> {
+        let path_buf = std::path::PathBuf::from(path);
+        let idx = self
+            .tree
+            .lookup(&path_buf)
+            .ok_or(FormatError::NotFound(path_buf))?;
+        let ino = self.tree.node(idx).inode;
+        let inode = &mut self.inodes[(ino - 1) as usize];
+        // Preserve the file-type bits, replace the permission bits.
+        inode.mode = (inode.mode & file_mode::TYPE_MASK) | (mode & !file_mode::TYPE_MASK);
+        Ok(())
+    }
+
+    /// Update the owner uid/gid of an existing entry.
+    pub fn set_owner(&mut self, path: &str, uid: u32, gid: u32) -> FormatResult<()> {
+        let path_buf = std::path::PathBuf::from(path);
+        let idx = self
+            .tree
+            .lookup(&path_buf)
+            .ok_or(FormatError::NotFound(path_buf))?;
+        let ino = self.tree.node(idx).inode;
+        let inode = &mut self.inodes[(ino - 1) as usize];
+        inode.set_uid(uid);
+        inode.set_gid(gid);
+        Ok(())
+    }
+
+    // -- link() ------------------------------------------------------------
+
+    /// Create a hard link at `link_path` pointing to `target_path`.
+    pub fn link(&mut self, link_path: &str, target_path: &str) -> FormatResult<()> {
+        validate_path_component_names(link_path)?;
+
+        let target_buf = std::path::PathBuf::from(target_path);
+        let target_idx = self
+            .tree
+            .lookup(&target_buf)
+            .ok_or_else(|| FormatError::NotFound(target_buf.clone()))?;
+        let target_inode_num = self.tree.node(target_idx).inode;
+        let target_inode = &self.inodes[(target_inode_num - 1) as usize];
+
+        if target_inode.is_dir() {
+            return Err(FormatError::CannotHardlinkDirectory(target_buf));
+        }
+
+        let link_buf = std::path::PathBuf::from(link_path);
+        let existing_target = self.tree.lookup(&link_buf).map(|idx| {
+            let node = self.tree.node(idx);
+            node.link.unwrap_or(node.inode)
+        });
+        if existing_target == Some(target_inode_num) {
+            return Ok(());
+        }
+
+        let parent_path = parent_of(link_path);
+        let parent_path_buf = std::path::PathBuf::from(parent_path);
+        let parent_idx = self
+            .tree
+            .lookup(&parent_path_buf)
+            .ok_or_else(|| FormatError::NotFound(parent_path_buf.clone()))?;
+
+        let parent_inode_num = self.tree.node(parent_idx).inode;
+        if self.inodes[(parent_inode_num - 1) as usize].links_count as u32 >= MAX_LINKS {
+            return Err(FormatError::MaximumLinksExceeded(parent_path_buf));
+        }
+
+        // If the link path already exists, remove it after all validation so a
+        // failed link creation cannot mutate the target inode's link count.
+        if existing_target.is_some() {
+            self.remove(link_path)?;
+        }
+
+        self.inodes[(target_inode_num - 1) as usize].links_count += 1;
+
+        let link_node = FileTreeNode {
+            inode: ROOT_INODE, // placeholder, not used for hard links
+            name: basename(link_path).to_string(),
+            children: Vec::new(),
+            parent: None,
+            blocks: None,
+            additional_blocks: Vec::new(),
+            link: Some(target_inode_num),
+        };
+        self.tree.add_child(parent_idx, link_node);
+
+        Ok(())
+    }
+
+    // -- removal ------------------------------------------------------------
+
+    /// Remove the entry at `path` and all of its children.
+    pub fn remove(&mut self, path: &str) -> FormatResult<()> {
+        self.remove_inner(path, true)
+    }
+
+    /// Remove all children of the directory at `path`, preserving the directory.
+    pub fn remove_children(&mut self, path: &str) -> FormatResult<()> {
+        self.remove_inner(path, false)
+    }
+
+    fn remove_inner(&mut self, path: &str, remove_self: bool) -> FormatResult<()> {
+        let path_buf = std::path::PathBuf::from(path);
+        let node_idx = match self.tree.lookup(&path_buf) {
+            Some(idx) => idx,
+            None => return Ok(()), // nothing to remove
+        };
+
+        let inode_num = self.tree.node(node_idx).inode;
+        let inode_idx = (inode_num - 1) as usize;
+        let linked_ino = self.tree.node(node_idx).link;
+        let (target_ino, target_idx) = if let Some(linked_ino) = linked_ino {
+            (linked_ino, (linked_ino - 1) as usize)
+        } else {
+            (inode_num, inode_idx)
+        };
+        let node_is_dir = linked_ino.is_none() && self.inodes[inode_idx].is_dir();
+
+        if !remove_self && !node_is_dir {
+            return Err(FormatError::NotDirectory(path_buf));
+        }
+
+        // Recursively remove children.
+        let child_names: Vec<String> = self
+            .tree
+            .node(node_idx)
+            .children
+            .iter()
+            .map(|&ci| self.tree.node(ci).name.clone())
+            .collect();
+        for child_name in child_names {
+            let child_path = if path == "/" {
+                format!("/{child_name}")
+            } else {
+                format!("{path}/{child_name}")
+            };
+            self.remove(&child_path)?;
+        }
+
+        if !remove_self {
+            return Ok(());
+        }
+
+        // Detach from parent and update parent's link count for directories.
+        let parent_path = parent_of(path);
+        let parent_path_buf = std::path::PathBuf::from(parent_path);
+        if let Some(parent_idx) = self.tree.lookup(&parent_path_buf) {
+            let parent_inode_num = self.tree.node(parent_idx).inode;
+            if node_is_dir && self.inodes[(parent_inode_num - 1) as usize].links_count > 2 {
+                self.inodes[(parent_inode_num - 1) as usize].links_count -= 1;
+            }
+            self.tree.remove_child(parent_idx, basename(path));
+        }
+
+        if target_ino > FIRST_INODE - 1 {
+            if self.inodes[target_idx].links_count > 0 {
+                self.inodes[target_idx].links_count -= 1;
+            }
+
+            // Collect block ranges from this tree node (if any).
+            let node = self.tree.node(node_idx);
+            let mut node_blocks: Vec<BlockRange> = Vec::new();
+            if let Some(b) = node.blocks {
+                if b.start != b.end {
+                    node_blocks.push(b);
+                }
+            }
+            for blk in &node.additional_blocks {
+                node_blocks.push(*blk);
+            }
+            let xattr_block = self.inodes[target_idx].xattr_block_lo;
+
+            if self.inodes[target_idx].links_count == 0 {
+                // Last reference removed -- reclaim blocks and mark deleted.
+                // Blocks may come from this node (if it is the original) or
+                // from deferred_blocks (if the original was unlinked earlier
+                // while hard links still existed).
+                for blk in &node_blocks {
+                    self.deleted_blocks.push(*blk);
+                }
+                if let Some(deferred) = self.deferred_blocks.remove(&target_ino) {
+                    for blk in deferred {
+                        self.deleted_blocks.push(blk);
+                    }
+                }
+                if xattr_block != 0 {
+                    self.deleted_blocks.push(BlockRange {
+                        start: xattr_block,
+                        end: xattr_block + 1,
+                    });
+                }
+
+                let (now_lo, _) = timestamp_now();
+                self.inodes[target_idx] = Inode::default();
+                self.inodes[target_idx].dtime = now_lo;
+            } else if !node_blocks.is_empty() {
+                // The original node is being removed but the inode still has
+                // remaining hard-link references.  Stash the block ranges so
+                // they can be reclaimed when the last link is finally deleted.
+                self.deferred_blocks
+                    .entry(target_ino)
+                    .or_default()
+                    .extend(node_blocks);
+            }
+        }
+
+        Ok(())
+    }
+
+    // -- close() -----------------------------------------------------------
+
+    /// Finalize the ext4 image.
+    ///
+    /// Writes directory entries (BFS order), the inode table, block/inode
+    /// bitmaps, group descriptors, and the superblock.  Consumes `self`.
+    pub fn close(mut self) -> FormatResult<()> {
+        // -- Step 1: BFS-commit directory entries --
+        self.commit_directories()?;
+
+        // -- Step 2: Allocate the resize inode's double-indirect block --
+        let allocated_descriptor_area_blocks = self.group_descriptor_blocks();
+        let resize_dind_block = self.allocate_resize_inode_dind_block()?;
+
+        // -- Step 3: Optimize block group layout --
+        self.size = self.size.max(self.file.metadata()?.len());
+        let current_blk = self.current_block()?;
+        let inode_count = self.inodes.len() as u32;
+        let (block_groups, inodes_per_group) =
+            self.optimize_block_group_layout(current_blk, inode_count);
+
+        self.align_to_block()?;
+        let metadata_start = self.current_block()?;
+        let inode_table_size_per_group = inodes_per_group * INODE_SIZE / self.block_size;
+
+        // Ensure the disk is large enough.
+        let minimum_disk_size = if block_groups == 1 {
+            self.blocks_per_group()
+        } else {
+            (block_groups - 1) * self.blocks_per_group() + 1
+        };
+
+        let layout = self.flex_metadata_layout(
+            metadata_start,
+            block_groups,
+            inode_table_size_per_group,
+            minimum_disk_size,
+        );
+        let block_groups = layout.block_groups;
+        let inode_table_offset = layout.inode_table_offset;
+        let expected_bitmap_offset = layout.bitmap_offset;
+        let data_size = layout.data_size;
+
+        if self.size != layout.size_bytes {
+            let saved_pos = self.pos()?;
+            self.size = layout.size_bytes;
+            self.file.set_len(self.size)?;
+            self.file.seek(SeekFrom::Start(saved_pos))?;
+        }
+
+        let total_groups_u32 = layout.total_groups;
+
+        // Verify group descriptor space.
+        let gd_block_count = layout.gd_block_count;
+        let gd_area_blocks = layout.gd_area_blocks;
+        if gd_area_blocks > allocated_descriptor_area_blocks {
+            return Err(FormatError::InsufficientSpaceForGroupDescriptorBlocks);
+        }
+        let metadata_gap_ranges = self.free_ranges_before_shifted_metadata(
+            metadata_start,
+            inode_table_offset,
+            total_groups_u32,
+            gd_area_blocks,
+        );
+        let reserved_gdt_blocks = gd_area_blocks - gd_block_count;
+        let backup_groups = self.backup_groups(total_groups_u32);
+        self.configure_resize_inode(
+            resize_dind_block,
+            reserved_gdt_blocks,
+            backup_groups.len() as u32,
+        );
+        self.write_resize_inode_blocks(
+            resize_dind_block,
+            gd_block_count,
+            reserved_gdt_blocks,
+            &backup_groups,
+        )?;
+
+        // -- Step 4: Write inode table --
+        self.seek_to_block(inode_table_offset)?;
+        let inode_table_offset = self.commit_inode_table(block_groups, inodes_per_group)?;
+
+        self.align_to_block()?;
+        let bitmap_offset = self.current_block()?;
+        if bitmap_offset != expected_bitmap_offset {
+            return Err(FormatError::InsufficientSpaceForGroupDescriptorBlocks);
+        }
+
+        let mut total_used_blocks: u32 = 0;
+        let mut total_used_inodes: u32 = 0;
+        let mut group_descriptors = Vec::with_capacity(total_groups_u32 as usize);
+
+        // Write bitmaps for groups that contain data.
+        for group in 0..block_groups {
+            let mut dirs: u32 = 0;
+            let mut used_inodes: u32 = 0;
+            let mut last_used_inode_index: u32 = 0;
+            let mut used_blocks: u32 = 0;
+
+            // Two bitmaps per group: block bitmap + inode bitmap, each one
+            // block in size.
+            let mut bitmap = vec![0u8; self.block_size as usize * 2];
+
+            // -- Block bitmap --
+            let group_start = group * self.blocks_per_group();
+            let group_end = group_start + self.blocks_per_group();
+
+            if group_end <= data_size {
+                // Fully allocated group.
+                for byte in bitmap[..self.block_size as usize].iter_mut() {
+                    *byte = 0xFF;
+                }
+                used_blocks = self.blocks_per_group();
+            } else if group_start < data_size {
+                // Partially allocated group.
+                let used = data_size - group_start;
+                for i in 0..used {
+                    bitmap[(i / 8) as usize] |= 1 << (i % 8);
+                    used_blocks += 1;
+                }
+            }
+
+            // Classic sparse-super groups reserve the group-start block for a
+            // superblock copy and the following descriptor/reserved-GDT area.
+            let metadata_blocks = self.static_metadata_blocks_in_group(group);
+            for i in 0..metadata_blocks.min(self.blocks_per_group()) {
+                let was_set = (bitmap[(i / 8) as usize] >> (i % 8)) & 1;
+                bitmap[(i / 8) as usize] |= 1 << (i % 8);
+                if was_set == 0 {
+                    used_blocks += 1;
+                }
+            }
+
+            // Mark deleted payloads and normal blocks skipped while shifting
+            // flex metadata past sparse-super system zones as free.
+            for freed in self.deleted_blocks.iter().chain(metadata_gap_ranges.iter()) {
+                Self::clear_block_range_from_bitmap(
+                    &mut bitmap[..self.block_size as usize],
+                    group_start,
+                    group_end,
+                    freed,
+                    &mut used_blocks,
+                );
+            }
+
+            // -- Inode bitmap (stored in the second block of the pair) --
+            let inode_bitmap_start = self.block_size as usize;
+            for i in 0..inodes_per_group {
+                let ino = 1 + group * inodes_per_group + i;
+                if ino > self.inodes.len() as u32 {
+                    continue;
+                }
+                let inode = &self.inodes[(ino - 1) as usize];
+                // Reserved inodes (1..10) are always marked used.
+                if ino > 10 && inode.links_count == 0 {
+                    continue;
+                }
+                bitmap[inode_bitmap_start + (i / 8) as usize] |= 1 << (i % 8);
+                used_inodes += 1;
+                last_used_inode_index = i + 1;
+                if inode.is_dir() {
+                    dirs += 1;
+                }
+            }
+            // Mark remaining inode-bitmap bits (past inodes_per_group) as occupied
+            // so the kernel does not try to allocate them.
+            for i in (inodes_per_group / 8)..self.block_size {
+                bitmap[inode_bitmap_start + i as usize] = 0xFF;
+            }
+
+            self.file.write_all(&bitmap)?;
+
+            // -- Build group descriptor --
+            let free_blocks = if self.blocks_per_group() >= used_blocks {
+                self.blocks_per_group() - used_blocks
+            } else {
+                0
+            };
+            let free_inodes = inodes_per_group - used_inodes;
+            let itable_unused = inodes_per_group - last_used_inode_index;
+            let block_bitmap_lo = bitmap_offset + 2 * group;
+            let inode_bitmap_lo = block_bitmap_lo + 1;
+            let inode_table_lo = (inode_table_offset as u32) + group * inode_table_size_per_group;
+
+            group_descriptors.push(GroupDescriptor {
+                block_bitmap_lo,
+                inode_bitmap_lo,
+                inode_table_lo,
+                free_blocks_count_lo: free_blocks as u16,
+                free_inodes_count_lo: free_inodes as u16,
+                used_dirs_count_lo: dirs as u16,
+                flags: 0,
+                exclude_bitmap_lo: 0,
+                block_bitmap_csum_lo: 0,
+                inode_bitmap_csum_lo: 0,
+                itable_unused_lo: itable_unused as u16,
+                checksum: 0,
+            });
+
+            total_used_blocks += used_blocks;
+            total_used_inodes += used_inodes;
+        }
+
+        // -- Step 5: Extra (empty) block groups beyond data --
+        let empty_inode_bitmap = {
+            let mut bm = vec![0xFFu8; self.blocks_per_group() as usize / 8];
+            for i in 0..inodes_per_group as u16 {
+                bm[(i / 8) as usize] &= !(1 << (i % 8));
+            }
+            bm
+        };
+
+        for group in block_groups..total_groups_u32 {
+            let blocks_in_group = if group == total_groups_u32 - 1 {
+                let rem = (self.size / self.block_size as u64) % self.blocks_per_group() as u64;
+                if rem == 0 {
+                    self.blocks_per_group()
+                } else {
+                    rem as u32
+                }
+            } else {
+                self.blocks_per_group()
+            };
+
+            let group_start = group * self.blocks_per_group();
+            let metadata_blocks = self
+                .static_metadata_blocks_in_group(group)
+                .min(blocks_in_group);
+            let used_empty_blocks = metadata_blocks + inode_table_size_per_group + 2;
+            let it_offset = group_start + metadata_blocks;
+            let bb_offset = it_offset + inode_table_size_per_group;
+            let ib_offset = bb_offset + 1;
+            let free_blocks_count = blocks_in_group.saturating_sub(used_empty_blocks);
+            let free_inodes_count = inodes_per_group;
+
+            // BLOCK_UNINIT lets the bitmap be reconstructed on demand;
+            // INODE_UNINIT, paired with itable_unused_lo, lets the entire
+            // inode table be treated as uninitialized.  Together they let
+            // resize2fs extend the filesystem without fallocating the new
+            // inode tables -- a ~2 MiB-per-added-group cost on btrfs.
+            let mut flags = bg_flags::INODE_UNINIT;
+            if group != total_groups_u32 - 1 {
+                flags |= bg_flags::BLOCK_UNINIT;
+            }
+
+            group_descriptors.push(GroupDescriptor {
+                block_bitmap_lo: bb_offset,
+                inode_bitmap_lo: ib_offset,
+                inode_table_lo: it_offset,
+                free_blocks_count_lo: free_blocks_count as u16,
+                free_inodes_count_lo: free_inodes_count as u16,
+                used_dirs_count_lo: 0,
+                flags,
+                exclude_bitmap_lo: 0,
+                block_bitmap_csum_lo: 0,
+                inode_bitmap_csum_lo: 0,
+                itable_unused_lo: inodes_per_group as u16,
+                checksum: 0,
+            });
+
+            total_used_blocks += used_empty_blocks.min(blocks_in_group);
+
+            // Write block bitmap + inode bitmap at the right offset.
+            self.seek_to_block(bb_offset)?;
+
+            let mut block_bitmap = vec![0u8; self.blocks_per_group() as usize / 8];
+            for i in 0..used_empty_blocks.min(blocks_in_group) {
+                block_bitmap[(i / 8) as usize] |= 1 << (i % 8);
+            }
+            if group == total_groups_u32 - 1 && blocks_in_group < self.blocks_per_group() {
+                // Last partial group: mark out-of-range blocks as used.
+                for i in blocks_in_group..self.blocks_per_group() {
+                    block_bitmap[(i / 8) as usize] |= 1 << (i % 8);
+                }
+            }
+            self.file.write_all(&block_bitmap)?;
+            self.file.write_all(&empty_inode_bitmap)?;
+        }
+
+        // Settle the UUID now so the group descriptor checksums and the
+        // superblock agree on it.
+        let uuid = self.uuid;
+        let uuid_bytes = *uuid.as_bytes();
+
+        // -- Step 6: Build group descriptor table --
+        // With `gdt_csum`, each descriptor carries a CRC-16 over the
+        // filesystem UUID, its group number, and the descriptor body.
+        let mut gd_table_buf = vec![0u8; gd_block_count as usize * self.block_size as usize];
+        for (group_nr, gd) in group_descriptors.iter_mut().enumerate() {
+            gd.checksum = checksum::group_descriptor(&uuid_bytes, group_nr as u32, gd);
+            let offset = group_nr * GroupDescriptor::SIZE;
+            gd.write_to(&mut gd_table_buf[offset..offset + GroupDescriptor::SIZE]);
+        }
+
+        self.seek_to_block(1)?;
+        self.file.write_all(&gd_table_buf)?;
+
+        // -- Step 7: Write superblock --
+        let computed_inodes = total_groups_u32 as u64 * inodes_per_group as u64;
+        let mut blocks_count = total_groups_u32 as u64 * self.blocks_per_group() as u64;
+        if blocks_count < total_used_blocks as u64 {
+            blocks_count = total_used_blocks as u64;
+        }
+        let total_free_blocks = blocks_count.saturating_sub(total_used_blocks as u64);
+        let free_inodes = computed_inodes as u32 - total_used_inodes;
+
+        let mut sb = SuperBlock {
+            inodes_count: computed_inodes as u32,
+            blocks_count_lo: blocks_count as u32,
+            blocks_count_hi: (blocks_count >> 32) as u32,
+            free_blocks_count_lo: total_free_blocks as u32,
+            free_blocks_count_hi: (total_free_blocks >> 32) as u32,
+            free_inodes_count: free_inodes,
+            first_data_block: 0,
+            ..Default::default()
+        };
+        // log_block_size = log2(block_size / 1024).  E.g. 1024->0, 2048->1, 4096->2.
+        let log_bs = (self.block_size / 1024).trailing_zeros();
+        sb.log_block_size = log_bs;
+        sb.log_cluster_size = log_bs;
+        sb.blocks_per_group = self.blocks_per_group();
+        sb.clusters_per_group = self.blocks_per_group();
+        sb.inodes_per_group = inodes_per_group;
+        sb.magic = SUPERBLOCK_MAGIC;
+        sb.state = 1; // cleanly unmounted
+        sb.errors = 1; // continue on error
+        sb.creator_os = 0; // Linux inode osd2 layout (uid/gid high bits, block counts).
+        sb.rev_level = 1; // dynamic inode sizes
+        sb.first_ino = FIRST_INODE;
+        sb.lpf_ino = LOST_AND_FOUND_INODE;
+        sb.inode_size = INODE_SIZE as u16;
+        sb.feature_compat = compat::HAS_JOURNAL | compat::EXT_ATTR | compat::RESIZE_INODE;
+        sb.feature_incompat = incompat::FILETYPE | incompat::EXTENTS | incompat::FLEX_BG;
+        sb.feature_ro_compat = ro_compat::LARGE_FILE
+            | ro_compat::HUGE_FILE
+            | ro_compat::SPARSE_SUPER
+            | ro_compat::EXTRA_ISIZE
+            // `gdt_csum` (group-descriptor CRC-16) is what makes resize2fs
+            // honour BG_*_UNINIT flags on the new groups it creates -- and
+            // therefore skip the per-group fallocate that otherwise burns
+            // ~2 MiB per added block group on btrfs.
+            | ro_compat::GDT_CSUM;
+        sb.reserved_gdt_blocks = reserved_gdt_blocks as u16;
+        sb.min_extra_isize = EXTRA_ISIZE;
+        sb.want_extra_isize = EXTRA_ISIZE;
+        sb.log_groups_per_flex = 31;
+        sb.uuid = uuid_bytes;
+        sb.journal_inum = journal::JOURNAL_INODE_NUMBER;
+        sb.journal_backup_type = journal::JOURNAL_BACKUP_BLOCKS;
+        let journal_inode = &self.inodes[(journal::JOURNAL_INODE_NUMBER - 1) as usize];
+        for (index, chunk) in journal_inode.block.chunks_exact(4).enumerate() {
+            sb.journal_blocks[index] = u32::from_le_bytes(
+                chunk
+                    .try_into()
+                    .map_err(|_| io::Error::other("invalid journal inode block field"))?,
+            );
+        }
+        sb.journal_blocks[15] = journal_inode.size_hi;
+        sb.journal_blocks[16] = journal_inode.size_lo;
+        if let Some(label) = &self.label {
+            let bytes = label.as_bytes();
+            sb.volume_name[..bytes.len()].copy_from_slice(bytes);
+        }
+
+        // Write: 1024 zero bytes (boot sector) + superblock + 2048 zero bytes.
+        self.seek_to_block(0)?;
+        self.file.write_all(&[0u8; 1024])?;
+        let mut sb_buf = [0u8; SUPERBLOCK_SIZE];
+        sb.write_to(&mut sb_buf);
+        self.file.write_all(&sb_buf)?;
+        self.file.write_all(&[0u8; 2048])?;
+
+        // Classic sparse-super groups carry backup superblocks and descriptor
+        // tables. The reserved-GDT blocks after each backup table stay sparse,
+        // but are marked allocated and referenced by inode 7 for online grow.
+        for group in &backup_groups {
+            let group_start = group * self.blocks_per_group();
+
+            let mut backup_sb = sb.clone();
+            backup_sb.block_group_nr = *group as u16;
+            backup_sb.write_to(&mut sb_buf);
+
+            self.seek_to_block(group_start)?;
+            self.file.write_all(&sb_buf)?;
+
+            self.seek_to_block(group_start + 1)?;
+            self.file.write_all(&gd_table_buf)?;
+        }
+
+        self.file.flush()?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helpers
+    // -----------------------------------------------------------------------
+
+    /// BFS-walk the file tree and write directory entries for every directory
+    /// inode.  Updates each directory inode's size and extent tree.
+    fn commit_directories(&mut self) -> FormatResult<()> {
+        // Collect BFS order: (parent_idx_opt, node_idx).
+        let mut queue: std::collections::VecDeque<(Option<usize>, usize)> =
+            std::collections::VecDeque::new();
+        queue.push_back((None, self.tree.root()));
+
+        let mut bfs_order: Vec<(Option<usize>, usize)> = Vec::new();
+        while let Some((parent, node)) = queue.pop_front() {
+            bfs_order.push((parent, node));
+            // Skip hardlink nodes (no children to descend into).
+            if self.tree.node(node).link.is_some() {
+                continue;
+            }
+            let children: Vec<usize> = self.tree.node(node).children.clone();
+            for &child in &children {
+                queue.push_back((Some(node), child));
+            }
+        }
+
+        // Commit each directory.
+        for (parent_opt, node_idx) in bfs_order {
+            let inode_num = self.tree.node(node_idx).inode;
+            let inode = &self.inodes[(inode_num - 1) as usize];
+
+            if inode.links_count == 0 {
+                continue;
+            }
+            if self.tree.node(node_idx).link.is_some() {
+                continue;
+            }
+            if !inode.is_dir() {
+                continue;
+            }
+
+            let mut dir_buf = Vec::new();
+            let mut left = self.block_size as i32;
+
+            // Write "." entry.
+            dir::write_dir_entry(
+                &mut dir_buf,
+                ".",
+                inode_num,
+                self.inodes[(inode_num - 1) as usize].mode,
+                None,
+                None,
+                self.block_size,
+                &mut left,
+            )?;
+
+            // Write ".." entry.
+            let parent_ino = match parent_opt {
+                Some(pidx) => self.tree.node(pidx).inode,
+                None => inode_num, // root's ".." points to itself
+            };
+            dir::write_dir_entry(
+                &mut dir_buf,
+                "..",
+                parent_ino,
+                self.inodes[(parent_ino - 1) as usize].mode,
+                None,
+                None,
+                self.block_size,
+                &mut left,
+            )?;
+
+            // Sort children by inode number for e2fsck compatibility.
+            let mut sorted_children: Vec<usize> = self.tree.node(node_idx).children.clone();
+            sorted_children.sort_by_key(|&ci| self.tree.node(ci).inode);
+
+            for &child_idx in &sorted_children {
+                let child_ino = self.tree.node(child_idx).inode;
+                let child_name = self.tree.node(child_idx).name.clone();
+
+                // Check that the inode has links (not deleted).
+                let effective_ino;
+                let effective_mode;
+                if let Some(linked_ino) = self.tree.node(child_idx).link {
+                    if self.inodes[(linked_ino - 1) as usize].links_count == 0 {
+                        continue;
+                    }
+                    effective_ino = linked_ino;
+                    effective_mode = self.inodes[(linked_ino - 1) as usize].mode;
+                } else {
+                    if self.inodes[(child_ino - 1) as usize].links_count == 0 {
+                        continue;
+                    }
+                    effective_ino = child_ino;
+                    effective_mode = self.inodes[(child_ino - 1) as usize].mode;
+                }
+
+                let (link_inode, link_mode) = if self.tree.node(child_idx).link.is_some() {
+                    (Some(effective_ino), Some(effective_mode))
+                } else {
+                    (None, None)
+                };
+
+                dir::write_dir_entry(
+                    &mut dir_buf,
+                    &child_name,
+                    child_ino,
+                    self.inodes[(child_ino.max(1) - 1) as usize].mode,
+                    link_inode,
+                    link_mode,
+                    self.block_size,
+                    &mut left,
+                )?;
+            }
+
+            dir::finish_dir_entry_block(&mut dir_buf, &mut left, self.block_size)?;
+
+            let ranges = self.write_aligned_payload_bytes(&dir_buf)?;
+            let size = dir_buf.len() as u64;
+            self.inodes[(inode_num - 1) as usize].set_file_size(size);
+
+            // Store block range in the tree node.
+            Self::assign_node_ranges(self.tree.node_mut(node_idx), &ranges);
+
+            // Write extent tree for this directory.
+            self.skip_reserved_metadata_blocks()?;
+            let mut cur = self.current_block()?;
+            extent::write_extents(
+                &mut self.inodes[(inode_num - 1) as usize],
+                &ranges,
+                self.block_size,
+                &mut self.file,
+                &mut cur,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Write all inodes sequentially, padding to fill inode tables for all
+    /// block groups.
+    fn commit_inode_table(
+        &mut self,
+        block_groups: u32,
+        inodes_per_group: u32,
+    ) -> FormatResult<u64> {
+        self.align_to_block()?;
+        let inode_table_offset = self.pos()? / self.block_size as u64;
+
+        // Write the actual inodes.
+        let mut inode_buf = [0u8; Inode::SIZE];
+        for inode in &self.inodes {
+            inode.write_to(&mut inode_buf);
+            self.file.write_all(&inode_buf)?;
+        }
+
+        // Pad the rest of the table with zeros.
+        let table_size = INODE_SIZE as u64 * block_groups as u64 * inodes_per_group as u64;
+        let written = self.inodes.len() as u64 * INODE_SIZE as u64;
+        let rest = table_size - written;
+        if rest > 0 {
+            let zero_block = vec![0u8; self.block_size as usize];
+            let full_blocks = rest / self.block_size as u64;
+            for _ in 0..full_blocks {
+                self.file.write_all(&zero_block)?;
+            }
+            let remainder = (rest % self.block_size as u64) as usize;
+            if remainder > 0 {
+                self.file.write_all(&vec![0u8; remainder])?;
+            }
+        }
+
+        Ok(inode_table_offset)
+    }
+
+    fn allocate_resize_inode_dind_block(&mut self) -> FormatResult<u32> {
+        let zero_block = vec![0u8; self.block_size as usize];
+        let ranges = self.write_aligned_payload_bytes(&zero_block)?;
+        let range = ranges
+            .first()
+            .ok_or(FormatError::InsufficientSpaceForGroupDescriptorBlocks)?;
+        Ok(range.start)
+    }
+
+    fn configure_resize_inode(
+        &mut self,
+        dind_block: u32,
+        reserved_gdt_blocks: u32,
+        backup_group_count: u32,
+    ) {
+        let (time_lo, time_extra) = timestamp_now();
+        let addr_per_block = (self.block_size / 4) as u64;
+        let inode_size = (addr_per_block * addr_per_block + addr_per_block + EXT2_NDIR_BLOCKS)
+            * self.block_size as u64;
+        let owned_blocks = 1 + reserved_gdt_blocks * (1 + backup_group_count);
+
+        let mut inode = Inode {
+            mode: file_mode::S_IFREG | 0o600,
+            links_count: 1,
+            extra_isize: EXTRA_ISIZE,
+            atime: time_lo,
+            ctime: time_lo,
+            mtime: time_lo,
+            crtime: time_lo,
+            atime_extra: time_extra,
+            ctime_extra: time_extra,
+            mtime_extra: time_extra,
+            crtime_extra: time_extra,
+            ..Inode::default()
+        };
+        inode.set_file_size(inode_size);
+        inode.blocks_lo = owned_blocks * (self.block_size / 512);
+        let offset = EXT2_DIND_BLOCK * 4;
+        inode.block[offset..offset + 4].copy_from_slice(&dind_block.to_le_bytes());
+
+        self.inodes[(RESIZE_INODE_NUMBER - 1) as usize] = inode;
+    }
+
+    fn backup_groups(&self, total_groups: u32) -> Vec<u32> {
+        (1..total_groups)
+            .filter(|group| Self::has_sparse_super_backup(*group))
+            .collect()
+    }
+
+    fn write_resize_inode_blocks(
+        &mut self,
+        dind_block: u32,
+        descriptor_blocks: u32,
+        reserved_gdt_blocks: u32,
+        backup_groups: &[u32],
+    ) -> FormatResult<()> {
+        let mut dind_buf = vec![0u8; self.block_size as usize];
+        let blocks_per_group = self.blocks_per_group();
+
+        for rsv_off in 0..reserved_gdt_blocks {
+            let gdt_blk = 1 + descriptor_blocks + rsv_off;
+            let dind_index = descriptor_blocks + rsv_off;
+            let dind_offset = dind_index as usize * 4;
+            dind_buf[dind_offset..dind_offset + 4].copy_from_slice(&gdt_blk.to_le_bytes());
+
+            let mut gdt_buf = vec![0u8; self.block_size as usize];
+            for (idx, group) in backup_groups.iter().enumerate() {
+                let backup_gdt_block = gdt_blk + group * blocks_per_group;
+                let offset = idx * 4;
+                gdt_buf[offset..offset + 4].copy_from_slice(&backup_gdt_block.to_le_bytes());
+            }
+
+            self.seek_to_block(gdt_blk)?;
+            self.file.write_all(&gdt_buf)?;
+        }
+
+        self.seek_to_block(dind_block)?;
+        self.file.write_all(&dind_buf)?;
+        self.seek_to_block(dind_block + 1)?;
+        Ok(())
+    }
+
+    /// Find the (block_groups, inodes_per_group) pair that minimizes the
+    /// number of block groups needed to hold all inodes and all data blocks.
+    fn optimize_block_group_layout(&self, blocks: u32, inodes: u32) -> (u32, u32) {
+        let group_count = |blocks: u32, inodes: u32, ipg: u32| -> u32 {
+            let inode_blocks_per_group = ipg * INODE_SIZE / self.block_size;
+            // 2 blocks reserved for bitmaps.
+            let data_blocks_per_group = self.blocks_per_group() - inode_blocks_per_group - 2;
+            // Ensure enough groups for all the inodes.
+            let min_blocks = (inodes.saturating_sub(1)) / ipg * data_blocks_per_group + 1;
+            let effective_blocks = blocks.max(min_blocks);
+            effective_blocks.div_ceil(data_blocks_per_group)
+        };
+
+        let inc = (self.block_size * 512 / INODE_SIZE) as usize;
+        let mut best_groups = u32::MAX;
+        let mut best_ipg: u32 = inc as u32;
+
+        let mut ipg = inc;
+        while ipg <= self.max_inodes_per_group() as usize {
+            let g = group_count(blocks, inodes, ipg as u32);
+            if g < best_groups {
+                best_groups = g;
+                best_ipg = ipg as u32;
+            }
+            ipg += inc;
+        }
+
+        (best_groups, best_ipg)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free-standing helpers
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn block_ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+/// Reject path components that cannot be represented in ext4 dir entries.
+fn validate_path_component_names(path: &str) -> FormatResult<()> {
+    for name in path.split('/') {
+        if name == "." || name == ".." {
+            return Err(FormatError::InvalidPathEncoding(path.to_string()));
+        }
+        if name.len() > EXT4_NAME_LEN {
+            return Err(FormatError::InvalidName(name.to_string()));
+        }
+    }
+
+    Ok(())
+}
+
+/// Return the parent directory of `path`.
+///
+/// `"/foo/bar"` -> `"/foo"`, `"/foo"` -> `"/"`, `"/"` -> `"/"`.
+fn parent_of(path: &str) -> &str {
+    if path == "/" {
+        return "/";
+    }
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) => "/",
+        Some(pos) => &trimmed[..pos],
+        None => "/",
+    }
+}
+
+/// Return the last path component.
+///
+/// `"/foo/bar"` -> `"bar"`, `"/"` -> `"/"`.
+fn basename(path: &str) -> &str {
+    if path == "/" {
+        return "/";
+    }
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(pos) => &trimmed[pos + 1..],
+        None => trimmed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parent_of() {
+        assert_eq!(parent_of("/"), "/");
+        assert_eq!(parent_of("/foo"), "/");
+        assert_eq!(parent_of("/foo/bar"), "/foo");
+        assert_eq!(parent_of("/a/b/c"), "/a/b");
+    }
+
+    #[test]
+    fn test_basename() {
+        assert_eq!(basename("/"), "/");
+        assert_eq!(basename("/foo"), "foo");
+        assert_eq!(basename("/foo/bar"), "bar");
+        assert_eq!(basename("/a/b/c"), "c");
+    }
+
+    #[test]
+    fn test_formatter_new_and_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ext4");
+        let fmt = Formatter::new(&path, 4096, 256 * 1024).unwrap();
+        fmt.close().unwrap();
+
+        // The file should exist and have non-zero size.
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(meta.len() > 0);
+    }
+
+    #[test]
+    fn close_preserves_payloads_written_past_requested_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ext4");
+        let mut fmt = Formatter::new(&path, 4096, 128 * 1024 * 1024).unwrap();
+
+        // Simulate regular file payloads filling the requested size and pushing
+        // the directory payload region into the next block group without paying
+        // the test cost of writing a large tarball.
+        let root_directory_block = fmt.blocks_per_group() + 100;
+        fmt.seek_to_block(root_directory_block).unwrap();
+
+        fmt.close().unwrap();
+
+        let mut reader = crate::ext4::Reader::new(&path).unwrap();
+        let root_entries = reader.children_of(ROOT_INODE).unwrap();
+        assert!(root_entries.iter().any(|(name, _)| name == "."));
+        assert!(root_entries.iter().any(|(name, _)| name == ".."));
+        assert!(root_entries.iter().any(|(name, _)| name == "lost+found"));
+    }
+
+    #[test]
+    fn flex_metadata_does_not_overlap_sparse_super_system_zones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ext4");
+        let mut fmt = Formatter::new(&path, 4096, 768 * 1024 * 1024).unwrap();
+
+        // Push the final inode-table/bitmap run near the group-5 sparse-super
+        // backup area without writing a huge fixture. Linux rejects overlapping
+        // system zones during ext4_setup_system_zone().
+        let root_directory_block = 5 * fmt.blocks_per_group() - 64;
+        fmt.seek_to_block(root_directory_block).unwrap();
+        fmt.close().unwrap();
+
+        let mut reader = crate::ext4::Reader::new(&path).unwrap();
+        let sb = reader.superblock().clone();
+        let block_size = 1024u64 * (1 << sb.log_block_size);
+        let group_count = (sb.blocks_count_lo - 1) / sb.blocks_per_group + 1;
+        let groups_per_descriptor_block = block_size as u32 / GroupDescriptor::SIZE as u32;
+        let descriptor_blocks = (group_count - 1) / groups_per_descriptor_block + 1;
+        let static_metadata_blocks = 1 + descriptor_blocks + sb.reserved_gdt_blocks as u32;
+        let inode_table_blocks = sb.inodes_per_group * INODE_SIZE / block_size as u32;
+
+        assert!(group_count >= 6, "test image must reach sparse group 5");
+
+        for group in 0..group_count {
+            let gd = reader.get_group_descriptor(group).unwrap();
+            let metadata_ranges = [
+                ("block bitmap", gd.block_bitmap_lo, gd.block_bitmap_lo + 1),
+                ("inode bitmap", gd.inode_bitmap_lo, gd.inode_bitmap_lo + 1),
+                (
+                    "inode table",
+                    gd.inode_table_lo,
+                    gd.inode_table_lo + inode_table_blocks,
+                ),
+            ];
+
+            for protected_group in 0..group_count {
+                if !Formatter::has_sparse_super(protected_group) {
+                    continue;
+                }
+
+                let protected_start = protected_group * sb.blocks_per_group;
+                let protected_end = protected_start + static_metadata_blocks;
+
+                for (name, start, end) in metadata_ranges {
+                    assert!(
+                        !block_ranges_overlap(
+                            start as u64,
+                            end as u64,
+                            protected_start as u64,
+                            protected_end as u64
+                        ),
+                        "group {group} {name} range {start}..{end} overlaps sparse-super system zone {protected_start}..{protected_end} in group {protected_group}",
+                    );
+                }
+            }
+        }
+
+        let mut image = std::fs::File::open(&path).unwrap();
+        let skipped_gap_block = 5 * sb.blocks_per_group - 1;
+        let skipped_gap_group = skipped_gap_block / sb.blocks_per_group;
+        let skipped_gap_gd = reader.get_group_descriptor(skipped_gap_group).unwrap();
+        let mut skipped_gap_bitmap = vec![0u8; block_size as usize];
+        image
+            .seek(SeekFrom::Start(
+                skipped_gap_gd.block_bitmap_lo as u64 * block_size,
+            ))
+            .unwrap();
+        image.read_exact(&mut skipped_gap_bitmap).unwrap();
+        let skipped_gap_bit = skipped_gap_block % sb.blocks_per_group;
+        assert_eq!(
+            skipped_gap_bitmap[(skipped_gap_bit / 8) as usize] & (1u8 << (skipped_gap_bit % 8)),
+            0,
+            "normal block {skipped_gap_block} skipped before group 5's sparse-super zone must remain free",
+        );
+
+        let protected_gd = reader.get_group_descriptor(5).unwrap();
+        let mut protected_bitmap = vec![0u8; block_size as usize];
+        image
+            .seek(SeekFrom::Start(
+                protected_gd.block_bitmap_lo as u64 * block_size,
+            ))
+            .unwrap();
+        image.read_exact(&mut protected_bitmap).unwrap();
+        assert_ne!(
+            protected_bitmap[0] & 1,
+            0,
+            "group 5 sparse-super block must stay allocated",
+        );
+    }
+
+    #[test]
+    fn flex_metadata_relocation_promotes_overlapped_extra_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ext4");
+        let mut fmt = Formatter::new(&path, 4096, 256 * 1024).unwrap();
+        let blocks_per_group = fmt.blocks_per_group();
+        let initial_block_groups = 82;
+        let initial_inodes_per_group = 8192;
+        let initial_inode_table_blocks = initial_inodes_per_group * INODE_SIZE / fmt.block_size;
+        let data_blocks_per_group = blocks_per_group - initial_inode_table_blocks - 2;
+        let metadata_start = initial_block_groups * data_blocks_per_group;
+
+        let (block_groups, inodes_per_group) =
+            fmt.optimize_block_group_layout(metadata_start, fmt.inodes.len() as u32);
+        assert_eq!(block_groups, initial_block_groups);
+        assert_eq!(inodes_per_group, initial_inodes_per_group);
+
+        let inode_table_size_per_group = inodes_per_group * INODE_SIZE / fmt.block_size;
+        let unshifted_metadata_end =
+            metadata_start + block_groups * (inode_table_size_per_group + 2);
+        assert_eq!(
+            unshifted_metadata_end,
+            block_groups * blocks_per_group,
+            "the shared metadata run must initially end at the group-82 boundary",
+        );
+
+        // Keep one genuinely empty group after the group promoted by relocation.
+        fmt.size = 84u64 * blocks_per_group as u64 * fmt.block_size as u64;
+        let minimum_disk_size = (block_groups - 1) * blocks_per_group + 1;
+        let layout = fmt.flex_metadata_layout(
+            metadata_start,
+            block_groups,
+            inode_table_size_per_group,
+            minimum_disk_size,
+        );
+
+        assert!(
+            layout.inode_table_offset > metadata_start,
+            "group 81's sparse-super zone must shift the shared metadata run",
+        );
+        assert_eq!(
+            layout.block_groups, 83,
+            "the group crossed by the shifted shared run must be promoted",
+        );
+        assert_eq!(layout.total_groups, 84);
+
+        let first_extra_group_start = layout.block_groups * blocks_per_group;
+        let first_extra_metadata_end = first_extra_group_start
+            + fmt.static_metadata_blocks_in_group_for_area(
+                layout.block_groups,
+                layout.gd_area_blocks,
+            )
+            + inode_table_size_per_group
+            + 2;
+        assert!(
+            !block_ranges_overlap(
+                layout.inode_table_offset as u64,
+                layout.data_size as u64,
+                first_extra_group_start as u64,
+                first_extra_metadata_end as u64,
+            ),
+            "shared metadata must not overlap the first extra group's local metadata",
+        );
+    }
+
+    #[test]
+    fn test_create_file_and_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ext4");
+        let mut fmt = Formatter::new(&path, 4096, 1024 * 1024).unwrap();
+
+        // Create a nested directory.
+        fmt.create(
+            "/etc",
+            make_mode(file_mode::S_IFDIR, 0o755),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Create a regular file with content.
+        let data = b"hello world\n";
+        let mut cursor = std::io::Cursor::new(&data[..]);
+        fmt.create(
+            "/etc/motd",
+            make_mode(file_mode::S_IFREG, 0o644),
+            None,
+            None,
+            Some(&mut cursor),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Create a symlink.
+        fmt.create(
+            "/etc/motd.link",
+            make_mode(file_mode::S_IFLNK, 0o777),
+            Some("motd"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        fmt.close().unwrap();
+    }
+
+    #[test]
+    fn test_hard_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ext4");
+        let mut fmt = Formatter::new(&path, 4096, 1024 * 1024).unwrap();
+
+        let data = b"content";
+        let mut cursor = std::io::Cursor::new(&data[..]);
+        fmt.create(
+            "/file",
+            make_mode(file_mode::S_IFREG, 0o644),
+            None,
+            None,
+            Some(&mut cursor),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        fmt.link("/hardlink", "/file").unwrap();
+        fmt.close().unwrap();
+    }
+
+    #[test]
+    fn test_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ext4");
+        let mut fmt = Formatter::new(&path, 4096, 1024 * 1024).unwrap();
+
+        fmt.create(
+            "/dir/nested",
+            make_mode(file_mode::S_IFDIR, 0o755),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        fmt.remove("/dir").unwrap();
+        fmt.close().unwrap();
+    }
+
+    #[test]
+    fn test_mkdir_p_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ext4");
+        let mut fmt = Formatter::new(&path, 4096, 1024 * 1024).unwrap();
+
+        // Creating the same directory twice should succeed (mkdir -p semantics).
+        fmt.create(
+            "/var/log",
+            make_mode(file_mode::S_IFDIR, 0o755),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        fmt.create(
+            "/var/log",
+            make_mode(file_mode::S_IFDIR, 0o755),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        fmt.close().unwrap();
+    }
+
+    #[test]
+    fn test_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ext4");
+        let mut fmt = Formatter::new(&path, 4096, 4 * 1024 * 1024).unwrap();
+
+        // Create a file larger than one block.
+        let data = vec![0xABu8; 8192];
+        let mut cursor = std::io::Cursor::new(&data[..]);
+        fmt.create(
+            "/big",
+            make_mode(file_mode::S_IFREG, 0o644),
+            None,
+            None,
+            Some(&mut cursor),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        fmt.close().unwrap();
+    }
+}

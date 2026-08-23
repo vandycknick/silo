@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -43,7 +43,14 @@ pub(crate) enum RootDiskError {
     Ext4 {
         path: PathBuf,
         #[source]
-        source: ext4::error::ResizeError,
+        source: disk_image::ext4::ResizeError,
+    },
+
+    #[error("failed to inspect ext4 filesystem in {path}")]
+    Ext4Probe {
+        path: PathBuf,
+        #[source]
+        source: disk_image::ext4::ReadError,
     },
 
     #[error("I/O failure")]
@@ -81,7 +88,7 @@ pub(crate) fn resize_raw_disk(
     path: &Path,
     size_bytes: u64,
 ) -> Result<RootDiskResizeOutcome, RootDiskError> {
-    let mut file = File::options().read(true).write(true).open(path)?;
+    let file = File::options().read(true).write(true).open(path)?;
     let current_size = file.metadata()?.len();
     if size_bytes < current_size {
         return Err(RootDiskError::RawDiskShrinkUnsupported {
@@ -91,12 +98,21 @@ pub(crate) fn resize_raw_disk(
         });
     }
 
-    let is_ext4 = has_ext4_superblock(&mut file)?;
+    let is_ext4 = match disk_image::ext4::probe(path) {
+        Ok(disk_image::ext4::ProbeResult::Ext4) => true,
+        Ok(disk_image::ext4::ProbeResult::NotExt4) => false,
+        Err(source) => {
+            return Err(RootDiskError::Ext4Probe {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
     drop(file);
 
     let outcome = if is_ext4 {
         let filesystem_size = size_bytes - size_bytes % 4096;
-        match ext4::grow_image(path, filesystem_size) {
+        match disk_image::ext4::grow_image(path, filesystem_size) {
             Ok(_) => RootDiskResizeOutcome::OfflineComplete,
             Err(err) if err.can_fallback_online() => RootDiskResizeOutcome::GuestRequired,
             Err(source) => {
@@ -115,18 +131,6 @@ pub(crate) fn resize_raw_disk(
         .open(path)?
         .set_len(size_bytes)?;
     Ok(outcome)
-}
-
-fn has_ext4_superblock(file: &mut File) -> io::Result<bool> {
-    const MAGIC_OFFSET: u64 = ext4::constants::SUPERBLOCK_OFFSET + 0x38;
-
-    file.seek(SeekFrom::Start(MAGIC_OFFSET))?;
-    let mut magic = [0u8; 2];
-    match file.read_exact(&mut magic) {
-        Ok(()) => Ok(u16::from_le_bytes(magic) == ext4::constants::SUPERBLOCK_MAGIC),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(error) => Err(error),
-    }
 }
 
 fn validate_base_rootfs(path: &Path) -> Result<(), RootDiskError> {
@@ -227,7 +231,7 @@ mod tests {
     fn resize_raw_disk_grows_sparse_file() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let path = temp.path().join("rootfs.img");
-        ext4::Formatter::new(&path, 4096, 256 * 1024)
+        disk_image::ext4::Formatter::new(&path, 4096, 256 * 1024)
             .expect("create ext4 image")
             .close()
             .expect("finish ext4 image");
@@ -238,7 +242,7 @@ mod tests {
 
         assert_eq!(outcome, RootDiskResizeOutcome::OfflineComplete);
         assert_eq!(fs::metadata(&path).expect("metadata").len(), new_size);
-        let reader = ext4::Reader::new(&path).expect("open grown ext4 image");
+        let reader = disk_image::ext4::Reader::new(&path).expect("open grown ext4 image");
         assert_eq!(reader.superblock().blocks_count_lo as u64 * 4096, new_size);
     }
 
@@ -260,7 +264,7 @@ mod tests {
     fn resize_raw_disk_does_not_extend_ext4_after_fatal_validation_error() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let path = temp.path().join("rootfs.img");
-        ext4::Formatter::new(&path, 4096, 256 * 1024)
+        disk_image::ext4::Formatter::new(&path, 4096, 256 * 1024)
             .expect("create ext4 image")
             .close()
             .expect("finish ext4 image");
@@ -272,7 +276,7 @@ mod tests {
         assert!(matches!(
             error,
             RootDiskError::Ext4 {
-                source: ext4::error::ResizeError::TooLarge { .. },
+                source: disk_image::ext4::ResizeError::TooLarge { .. },
                 ..
             }
         ));
@@ -296,7 +300,7 @@ mod tests {
     fn resize_raw_disk_leaves_dirty_filesystem_for_online_recovery() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let path = temp.path().join("rootfs.img");
-        ext4::Formatter::new(&path, 4096, 256 * 1024)
+        disk_image::ext4::Formatter::new(&path, 4096, 256 * 1024)
             .expect("create ext4 image")
             .close()
             .expect("finish ext4 image");
@@ -320,7 +324,7 @@ mod tests {
 
         assert_eq!(outcome, RootDiskResizeOutcome::GuestRequired);
         assert_eq!(fs::metadata(&path).expect("metadata").len(), new_size);
-        let reader = ext4::Reader::new(&path).expect("open unchanged ext4 image");
+        let reader = disk_image::ext4::Reader::new(&path).expect("open unchanged ext4 image");
         assert_eq!(reader.superblock().blocks_count_lo as u64 * 4096, old_size);
         assert_ne!(reader.superblock().feature_incompat & 0x4, 0);
     }

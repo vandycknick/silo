@@ -1148,6 +1148,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk-image"
+version = "0.1.2"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1335,16 +1344,6 @@ checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
  "parking",
  "pin-project-lite",
-]
-
-[[package]]
-name = "ext4"
-version = "0.1.2"
-dependencies = [
- "tar",
- "tempfile",
- "thiserror 2.0.19",
- "uuid",
 ]
 
 [[package]]
@@ -2579,14 +2578,14 @@ dependencies = [
  "base64 0.23.0",
  "bytes",
  "cpio",
- "ext4",
+ "disk-image",
  "eyre",
  "getrandom 0.4.3",
  "hyper-util",
  "libc",
  "mockall",
  "nix 0.31.3",
- "ocidisk",
+ "oci",
  "plist",
  "policy",
  "prost-types",
@@ -2596,6 +2595,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "ssh-key",
  "tempfile",
@@ -3086,6 +3086,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "oci"
+version = "0.1.0"
+dependencies = [
+ "containerregistry-image",
+ "disk-image",
+ "flate2",
+ "futures-util",
+ "nix 0.31.3",
+ "oci-client",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
 name = "oci-client"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3127,27 +3148,6 @@ dependencies = [
  "strum",
  "strum_macros",
  "thiserror 2.0.19",
-]
-
-[[package]]
-name = "ocidisk"
-version = "0.1.0"
-dependencies = [
- "containerregistry-image",
- "ext4",
- "flate2",
- "futures-util",
- "nix 0.31.3",
- "oci-client",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tar",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "zstd",
 ]
 
 [[package]]

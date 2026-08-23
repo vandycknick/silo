@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "tags": {
+    "registry.example.test/team/demo:stable|linux-amd64": {
+      "image_ref": "registry.example.test/team/demo:stable",
+      "platform": {
+        "os": "linux",
+        "architecture": "amd64"
+      },
+      "manifest_digest": "sha256:4d4f7f6821da902de46af93c73ed48c25e923fae1c762985953269c1b02de8ea",
+      "updated_at_unix": 1710000001
+    }
+  }
+}

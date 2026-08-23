@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use nix::unistd::{access, AccessFlags};
-use ocidisk::{ImageStore as RootfsImageStore, RootfsImage, RootfsImageMetadata, RootfsOptions};
+use oci::{ImageStore as RootfsImageStore, MaterializeOptions};
 
 use crate::image::{
-    ImageCacheState, ImagePullPolicy, ResolvedOciImage, ResolvedOciImageMaterialization,
+    local_disk::resolve_local_disk,
+    oci::{cached_resolved_oci_image, image_error, resolve_oci_image_from_registry},
+    ImagePullPolicy, ResolvedOciImage,
 };
 use crate::machine::generate_machine_name;
 use crate::runtime::RuntimeConfig;
@@ -62,18 +64,19 @@ impl ReadOnlyRuntime {
     ) -> Result<ResolvedOciImage, LibVmError> {
         let store = RootfsImageStore::open(&self.image_root)
             .map_err(|error| image_error(&reference, error))?;
-        let options = RootfsOptions::for_host().map_err(|error| image_error(&reference, error))?;
+        let options =
+            MaterializeOptions::for_host().map_err(|error| image_error(&reference, error))?;
         match policy {
             ImagePullPolicy::IfMissing => {
                 if let Some(image) = cached_resolved_oci_image(&store, &reference, options.clone())?
                 {
                     Ok(image)
                 } else {
-                    resolve_oci_image_from_registry(&store, reference, options).await
+                    resolve_oci_image_from_registry(&store, reference, options, None).await
                 }
             }
             ImagePullPolicy::Always => {
-                resolve_oci_image_from_registry(&store, reference, options).await
+                resolve_oci_image_from_registry(&store, reference, options, None).await
             }
             ImagePullPolicy::Never => cached_resolved_oci_image(&store, &reference, options)?
                 .ok_or(LibVmError::ImageNotFound { reference }),
@@ -82,14 +85,8 @@ impl ReadOnlyRuntime {
 
     /// Validates that a disk can be read and that its future machine parent can be created.
     pub fn validate_disk_source(&self, path: &Path) -> Result<PathBuf, LibVmError> {
-        let reference = format!("disk:{}", path.display());
-        let store = RootfsImageStore::open(&self.image_root)
-            .map_err(|error| image_error(&reference, error))?;
-        let image = store
-            .validate_local_disk(&reference)
-            .map_err(|error| image_error(&reference, error))?;
         validate_create_parent(&self.data_root.join("machines"))?;
-        Ok(image.path)
+        Ok(resolve_local_disk(path)?.canonical_path)
     }
 }
 
@@ -122,96 +119,14 @@ fn validate_create_parent(path: &Path) -> Result<(), LibVmError> {
     }
 }
 
-pub(crate) fn image_error(reference: &str, source: ocidisk::OciDiskError) -> LibVmError {
-    LibVmError::Image {
-        reference: reference.to_string(),
-        source,
-    }
-}
-
-pub(crate) fn cached_resolved_oci_image(
-    store: &RootfsImageStore,
-    reference: &str,
-    options: RootfsOptions,
-) -> Result<Option<ResolvedOciImage>, LibVmError> {
-    let Some(rootfs) = store
-        .get_cached_oci(reference, options)
-        .map_err(|error| image_error(reference, error))?
-    else {
-        return Ok(None);
-    };
-    let metadata = store
-        .rootfs_metadata(&rootfs)
-        .map_err(|error| image_error(&rootfs.image_ref, error))?
-        .ok_or_else(|| LibVmError::StateDecode {
-            field: "image.metadata",
-            message: format!("OCI image {} is missing rootfs metadata", rootfs.image_ref),
-        })?;
-    if rootfs.image_id != metadata.manifest_digest {
-        return Err(LibVmError::StateDecode {
-            field: "image.metadata.manifest_digest",
-            message: format!(
-                "cached rootfs image ID {} does not match manifest {}",
-                rootfs.image_id, metadata.manifest_digest
-            ),
-        });
-    }
-
-    Ok(Some(resolved_cached_image(rootfs, metadata)))
-}
-
-fn resolved_cached_image(rootfs: RootfsImage, metadata: RootfsImageMetadata) -> ResolvedOciImage {
-    ResolvedOciImage {
-        requested_reference: rootfs.image_ref,
-        selected_reference: metadata.selected_reference.clone(),
-        manifest_digest: metadata.manifest_digest.clone(),
-        config_digest: metadata.config_digest.clone(),
-        config: metadata.config.clone(),
-        platform: metadata.platform.clone(),
-        cache_state: ImageCacheState::Complete,
-        materialization: ResolvedOciImageMaterialization::Cached,
-    }
-}
-
-pub(crate) async fn resolve_oci_image_from_registry(
-    store: &RootfsImageStore,
-    reference: String,
-    options: RootfsOptions,
-) -> Result<ResolvedOciImage, LibVmError> {
-    let image = store
-        .resolve_oci(&reference, &options, None)
-        .await
-        .map_err(|error| image_error(&reference, error))?;
-    let cache_state = match store
-        .get_cached_oci(&image.selected_reference, options)
-        .map_err(|error| image_error(&image.selected_reference, error))?
-    {
-        Some(_) => ImageCacheState::Complete,
-        None => ImageCacheState::Missing,
-    };
-
-    Ok(ResolvedOciImage {
-        requested_reference: image.requested_reference.clone(),
-        selected_reference: image.selected_reference.clone(),
-        manifest_digest: image.manifest_digest.clone(),
-        config_digest: image.config_digest.clone(),
-        config: image.config.clone(),
-        platform: image.platform.clone(),
-        cache_state,
-        materialization: ResolvedOciImageMaterialization::Registry(Box::new(image)),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
-    use ocidisk::{
-        OciImageConfigMetadata, Platform, RootfsImageLayerMetadata, RootfsImageMetadata,
-        RootfsImageSource,
-    };
+    use crate::{OciImageConfigMetadata, Platform};
+    use oci::{RootfsLayerMetadata, RootfsMetadata};
 
     use crate::paths::LocalRoots;
     use crate::store::models::DbConfig;
@@ -400,25 +315,33 @@ mod tests {
             .join(format!("{}-{}", platform.os, platform.architecture));
         std::fs::create_dir_all(&image_dir).expect("create cached image directory");
         std::fs::write(image_dir.join("rootfs.img"), b"rootfs").expect("write cached rootfs");
-        let metadata = RootfsImageMetadata {
+        let metadata = RootfsMetadata {
             version: 2,
             image_ref: reference.clone(),
             image_id: digest.clone(),
-            source: RootfsImageSource::OciRegistry,
             requested_reference: reference.clone(),
             selected_reference: reference.clone(),
             manifest_digest: digest.clone(),
             config_digest: format!("sha256:{}", "b".repeat(64)),
             config: OciImageConfigMetadata::default(),
-            layers: Vec::<RootfsImageLayerMetadata>::new(),
+            layers: Vec::<RootfsLayerMetadata>::new(),
             platform,
             filesystem: "ext4".to_string(),
             rootfs_file: "rootfs.img".to_string(),
             created_at_unix: 1,
         };
+        let mut stored_metadata =
+            serde_json::to_value(&metadata).expect("serialize cached metadata");
+        stored_metadata
+            .as_object_mut()
+            .expect("metadata object")
+            .insert(
+                "source".to_string(),
+                serde_json::Value::String("oci-registry".to_string()),
+            );
         std::fs::write(
             image_dir.join("metadata.json"),
-            serde_json::to_vec_pretty(&metadata).expect("serialize cached metadata"),
+            serde_json::to_vec_pretty(&stored_metadata).expect("serialize stored metadata"),
         )
         .expect("write cached metadata");
         let before = snapshot(temp.path());
