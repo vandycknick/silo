@@ -212,6 +212,67 @@ pub enum LibVmError {
     RootDisk { message: String },
 }
 
+impl LibVmError {
+    /// Returns the stable Rust variant name for language bindings.
+    ///
+    /// This match deliberately remains exhaustive so adding an error variant
+    /// cannot silently degrade a binding to message parsing or an unknown kind.
+    pub fn variant(&self) -> &'static str {
+        match self {
+            Self::DataDirUnavailable => "DataDirUnavailable",
+            Self::StateDirUnavailable => "StateDirUnavailable",
+            Self::ConfigDirUnavailable => "ConfigDirUnavailable",
+            Self::RelativeEnvironmentPath { .. } => "RelativeEnvironmentPath",
+            Self::InvalidRunRoot { .. } => "InvalidRunRoot",
+            Self::InvalidOwnedPath { .. } => "InvalidOwnedPath",
+            Self::InvalidMachineName { .. } => "InvalidMachineName",
+            Self::InvalidMachineIdPrefix { .. } => "InvalidMachineIdPrefix",
+            Self::MachineAlreadyExists { .. } => "MachineAlreadyExists",
+            Self::MachineNameGenerationFailed { .. } => "MachineNameGenerationFailed",
+            Self::MachineNotFound { .. } => "MachineNotFound",
+            Self::ImageNotFound { .. } => "ImageNotFound",
+            Self::ImageInUse { .. } => "ImageInUse",
+            Self::ImagePullPolicyUnsupported { .. } => "ImagePullPolicyUnsupported",
+            Self::LocalDiskCanonicalize { .. } => "LocalDiskCanonicalize",
+            Self::LocalDiskMetadata { .. } => "LocalDiskMetadata",
+            Self::LocalDiskNotRegularFile { .. } => "LocalDiskNotRegularFile",
+            Self::LocalDiskUnreadable { .. } => "LocalDiskUnreadable",
+            Self::Image { .. } => "Image",
+            Self::MachineIdAlreadyExists { .. } => "MachineIdAlreadyExists",
+            Self::MachineAlreadyRunning { .. } => "MachineAlreadyRunning",
+            Self::MachineNotRunning { .. } => "MachineNotRunning",
+            Self::MachineStaleGeneration { .. } => "MachineStaleGeneration",
+            Self::MachineLogSourceUnavailable { .. } => "MachineLogSourceUnavailable",
+            Self::MonitorConnection { .. } => "MonitorConnection",
+            Self::MonitorProtocol { .. } => "MonitorProtocol",
+            Self::GuestSession { .. } => "GuestSession",
+            Self::MachinePreparationFailed { .. } => "MachinePreparationFailed",
+            Self::MachineStartCleanupFailed { .. } => "MachineStartCleanupFailed",
+            Self::EntrypointLaunchFailed { .. } => "EntrypointLaunchFailed",
+            Self::NetworkRuntime { .. } => "NetworkRuntime",
+            Self::VmMonExecutableNotFound { .. } => "VmMonExecutableNotFound",
+            Self::VmMonExecutableInvalid { .. } => "VmMonExecutableInvalid",
+            Self::RuntimeComponentInvalid { .. } => "RuntimeComponentInvalid",
+            Self::RuntimeComponentsNotFound { .. } => "RuntimeComponentsNotFound",
+            Self::BootAssetNotFound { .. } => "BootAssetNotFound",
+            Self::BootAssetInvalid { .. } => "BootAssetInvalid",
+            Self::InvalidCreateRequest { .. } => "InvalidCreateRequest",
+            Self::InvalidMachineUpdate { .. } => "InvalidMachineUpdate",
+            Self::UnsupportedHostArchitecture { .. } => "UnsupportedHostArchitecture",
+            Self::CorruptState { .. } => "CorruptState",
+            Self::VmSpecSerializeFailed { .. } => "VmSpecSerializeFailed",
+            Self::VmSpecLoadFailed { .. } => "VmSpecLoadFailed",
+            Self::AmbiguousIdPrefix { .. } => "AmbiguousIdPrefix",
+            Self::StateDecode { .. } => "StateDecode",
+            Self::StateDatabaseConfigMismatch { .. } => "StateDatabaseConfigMismatch",
+            Self::Database(_) => "Database",
+            Self::DatabaseMigration(_) => "DatabaseMigration",
+            Self::Io(_) => "Io",
+            Self::RootDisk { .. } => "RootDisk",
+        }
+    }
+}
+
 impl From<crate::machine::root_disk::RootDiskError> for LibVmError {
     fn from(source: crate::machine::root_disk::RootDiskError) -> Self {
         Self::RootDisk {

@@ -1,7 +1,7 @@
 name: Release Tip
 
 # Run after Test completes rather than independently of validated source.
-# Do not filter release work: no baseline exists, and commit metadata affects artifacts.
+# Do not filter release work: commit metadata affects release artifacts.
 on:
   workflow_run:
     workflows:
@@ -17,12 +17,11 @@ permissions:
 
 concurrency:
   group: release-tip
-  # Set this false when publishing, notarization, release mutation, or feed promotion is non-idempotent.
   cancel-in-progress: true
 
 jobs:
   prepare:
-    # Automatic runs require a successful main push; manual dispatches remain allowed.
+    name: prepare release
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'workflow_run' &&
@@ -32,19 +31,28 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       release_sha: ${{ steps.release.outputs.release_sha }}
+      version: ${{ steps.release.outputs.version }}
     steps:
+      - name: Check out release revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+
       - name: Resolve release revision
         id: release
+        env:
+          RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
         run: |
-          release_sha="${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}"
-          printf 'release_sha=%s\n' "$release_sha" >> "$GITHUB_OUTPUT"
+          printf 'release_sha=%s\n' "$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$(tr -d '\n' < VERSION)" >> "$GITHUB_OUTPUT"
           {
             printf '## Release Tip\n\n'
-            printf 'Release SHA: `%s`\n' "$release_sha"
+            printf 'Release SHA: `%s`\n' "$RELEASE_SHA"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  package:
-    name: release (${{ matrix.platform }})
+  core:
+    name: core (${{ matrix.platform }})
     needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -54,26 +62,15 @@ jobs:
         include:
           - platform: linux-amd64-gnu
             runner: ubuntu-24.04
-            artifact_name: silo-linux-amd64-gnu-archives
-            artifact_path: target/packages/*/linux-amd64-gnu/**
             create_dmg: false
-
           - platform: linux-arm64-gnu
             runner: ubuntu-24.04-arm
-            artifact_name: silo-linux-arm64-gnu-archives
-            artifact_path: target/packages/*/linux-arm64-gnu/**
             create_dmg: false
-
           - platform: darwin-arm64
             runner: macos-26
-            artifact_name: silo-darwin-arm64-archives
-            artifact_path: |
-              target/packages/*/darwin-arm64/**
-              !target/packages/*/darwin-arm64/Silo.app/**
             create_dmg: true
 
     steps:
-      # Package the resolved revision rather than the workflow's default ref.
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -84,13 +81,12 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
-      # Cache only release builds, keeping validation independent of release artifacts.
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
           cmd-format: nix develop .#release --command {0}
           workspaces: . -> target
-          prefix-key: release-tip
+          prefix-key: release-tip-platform
           key: ${{ matrix.platform }}-${{ hashFiles('flake.lock') }}
           cache-bin: false
 
@@ -110,11 +106,275 @@ jobs:
         if: ${{ matrix.create_dmg }}
         run: nix develop .#release --command make package DMG=1
 
-      - name: Upload release artifacts
+      - name: Stage core artifacts for transfer
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p target/upload/core
+          cp -R "target/packages/$VERSION/$PLATFORM/." target/upload/core/
+          rm -rf target/upload/core/Silo.app
+
+      - name: Upload core artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_path }}
+          name: silo-${{ matrix.platform }}-core
+          path: target/upload/core
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+
+  sdk-native:
+    name: SDK native (${{ matrix.platform }})
+    needs:
+      - prepare
+      - core
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64-gnu
+            runner: ubuntu-24.04
+            go_library: libsilo_go_ffi.so
+            sign_go_library: false
+          - platform: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+            go_library: libsilo_go_ffi.so
+            sign_go_library: false
+          - platform: darwin-arm64
+            runner: macos-26
+            go_library: libsilo_go_ffi.dylib
+            sign_go_library: true
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          cmd-format: nix develop .#release --command {0}
+          workspaces: . -> target
+          prefix-key: release-tip-platform
+          key: ${{ matrix.platform }}-${{ hashFiles('flake.lock') }}
+          cache-bin: false
+
+      - name: Install Node SDK dependencies
+        run: nix develop .#release --command npm --prefix sdk/node ci
+
+      - name: Build Go FFI bridge
+        run: nix develop .#release --command cargo build --locked --release -p silo-go-ffi
+
+      - name: Build Node native addon
+        run: nix develop .#release --command npm --prefix sdk/node run build:native
+
+      - name: Stage native SDK artifacts
+        env:
+          GO_LIBRARY: ${{ matrix.go_library }}
+          SIGN_GO_LIBRARY: ${{ matrix.sign_go_library }}
+        run: |
+          root="target/upload/sdk-native"
+          mkdir -p "$root/go-ffi" "$root/node"
+          if [ "$SIGN_GO_LIBRARY" = true ]; then
+            codesign --force --sign - "target/release/$GO_LIBRARY"
+          fi
+          install -m755 "target/release/$GO_LIBRARY" "$root/go-ffi/$GO_LIBRARY"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$root/go-ffi/$GO_LIBRARY" > "$root/go-ffi/$GO_LIBRARY.sha256"
+          else
+            shasum -a 256 "$root/go-ffi/$GO_LIBRARY" > "$root/go-ffi/$GO_LIBRARY.sha256"
+          fi
+          install -m644 sdk/node/native/index.cjs sdk/node/native/index.d.ts "$root/node/"
+          for addon in sdk/node/native/*.node; do
+            test -f "$addon"
+            install -m755 "$addon" "$root/node/"
+          done
+
+      - name: Smoke test native Go bridge
+        env:
+          CGO_ENABLED: "1"
+          SILO_GO_FFI_PATH: ${{ github.workspace }}/target/release/${{ matrix.go_library }}
+        run: nix develop .#release --command go -C sdk/go test -count=1 ./internal/ffi
+
+      - name: Smoke test Node native addon
+        run: nix develop .#release --command node -e "require('./sdk/node/native/index.cjs')"
+
+      - name: Upload native SDK artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: silo-${{ matrix.platform }}-sdk-native
+          path: target/upload/sdk-native
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  package-go-sdk:
+    name: package Go SDK
+    needs:
+      - prepare
+      - core
+      - sdk-native
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Download Linux amd64 core artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: silo-linux-amd64-gnu-core
+          path: target/packages/${{ needs.prepare.outputs.version }}/linux-amd64-gnu
+
+      - name: Download Linux arm64 core artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: silo-linux-arm64-gnu-core
+          path: target/packages/${{ needs.prepare.outputs.version }}/linux-arm64-gnu
+
+      - name: Download macOS arm64 core artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: silo-darwin-arm64-core
+          path: target/packages/${{ needs.prepare.outputs.version }}/darwin-arm64
+
+      - name: Download Linux amd64 native SDK artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: silo-linux-amd64-gnu-sdk-native
+          path: target/packages/${{ needs.prepare.outputs.version }}/linux-amd64-gnu
+
+      - name: Download Linux arm64 native SDK artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: silo-linux-arm64-gnu-sdk-native
+          path: target/packages/${{ needs.prepare.outputs.version }}/linux-arm64-gnu
+
+      - name: Download macOS arm64 native SDK artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: silo-darwin-arm64-sdk-native
+          path: target/packages/${{ needs.prepare.outputs.version }}/darwin-arm64
+
+      - name: Generate Go release metadata and embedded bridges
+        run: nix develop .#release --command make assemble-go-sdk
+
+      - name: Test assembled Go SDK
+        env:
+          CGO_ENABLED: "1"
+          SILO_TEST_EMBEDDED_FFI: "1"
+        run: nix develop .#release --command go -C sdk/go test -count=1 ./...
+
+      - name: Upload generated Go SDK release source
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: silo-go-sdk-release-source
+          path: |
+            sdk/go/internal/bundle/bundle_*_*.go
+            sdk/go/internal/bundle/bundles/libsilo_go_ffi-*
+            sdk/go/runtime_metadata.go
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  package-node-sdk:
+    name: package Node SDK
+    needs:
+      - prepare
+      - sdk-native
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Download Linux amd64 native SDK artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: silo-linux-amd64-gnu-sdk-native
+          path: target/packages/${{ needs.prepare.outputs.version }}/linux-amd64-gnu
+
+      - name: Download Linux arm64 native SDK artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: silo-linux-arm64-gnu-sdk-native
+          path: target/packages/${{ needs.prepare.outputs.version }}/linux-arm64-gnu
+
+      - name: Download macOS arm64 native SDK artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: silo-darwin-arm64-sdk-native
+          path: target/packages/${{ needs.prepare.outputs.version }}/darwin-arm64
+
+      - name: Assemble Node package source
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          linux_node="target/packages/$VERSION/linux-amd64-gnu/node"
+          install -m644 "$linux_node/index.cjs" "$linux_node/index.d.ts" sdk/node/native/
+          for directory in target/packages/$VERSION/*/node; do
+            for addon in "$directory"/*.node; do
+              test -f "$addon"
+              install -m755 "$addon" sdk/node/native/
+            done
+          done
+          test "$(find sdk/node/native -maxdepth 1 -name '*.node' | wc -l)" -eq 3
+
+      - name: Install Node SDK dependencies
+        run: nix develop .#release --command npm --prefix sdk/node ci
+
+      - name: Build Node TypeScript facade
+        run: nix develop .#release --command npm --prefix sdk/node run build:ts
+
+      - name: Verify assembled native addon loads
+        run: nix develop .#release --command node -e "require('./sdk/node/native/index.cjs')"
+
+      - name: Pack publish-ready npm package
+        run: |
+          mkdir -p target/npm
+          nix develop .#release --command npm pack ./sdk/node --pack-destination "$GITHUB_WORKSPACE/target/npm"
+          tar -tzf target/npm/*.tgz
+
+      - name: Upload npm package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: silo-node-sdk-npm-package
+          path: target/npm/*.tgz
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  summary:
+    name: release summary
+    if: always()
+    needs:
+      - prepare
+      - core
+      - sdk-native
+      - package-go-sdk
+      - package-node-sdk
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require successful release preparation
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          printf '%s\n' "$RESULTS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")'

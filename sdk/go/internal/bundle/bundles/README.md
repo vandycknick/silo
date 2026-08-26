@@ -1,0 +1,1 @@
+Release preparation places the exact target bridge libraries in this directory and rewrites the matching platform bundle source with `go:embed` and the bridge SHA-256 digest. Ordinary development uses the absolute `SILO_GO_FFI_PATH` override; placeholder binaries are deliberately not committed.

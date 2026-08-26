@@ -1,6 +1,5 @@
 name: Test
 
-# Keep this unfiltered: branch protection needs stable checks, and docs contain package inputs.
 on:
   push:
     branches:
@@ -14,8 +13,62 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
+  changes:
+    name: detect SDK changes
+    runs-on: ubuntu-24.04
+    outputs:
+      node: ${{ steps.result.outputs.node }}
+      go: ${{ steps.result.outputs.go }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Detect SDK-relevant changes
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            node:
+              - '.github/workflows/test.yml'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'Makefile'
+              - 'VERSION'
+              - 'flake.lock'
+              - 'flake.nix'
+              - 'runtime/libvm/**'
+              - 'specs/**'
+              - 'sdk/node/**'
+            go:
+              - '.github/workflows/test.yml'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'Makefile'
+              - 'VERSION'
+              - 'flake.lock'
+              - 'flake.nix'
+              - 'runtime/libvm/**'
+              - 'specs/**'
+              - 'sdk/go/**'
+              - 'xtask/**'
+
+      - name: Select SDK checks
+        id: result
+        env:
+          NODE_CHANGED: ${{ steps.filter.outputs.node }}
+          GO_CHANGED: ${{ steps.filter.outputs.go }}
+        run: |
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            printf 'node=true\ngo=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'node=%s\ngo=%s\n' "$NODE_CHANGED" "$GO_CHANGED" >> "$GITHUB_OUTPUT"
+          fi
+
   checks:
     name: checks (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
@@ -52,6 +105,10 @@ jobs:
 
   node-sdk:
     name: node SDK (${{ matrix.platform }})
+    needs:
+      - changes
+      - checks
+    if: needs.changes.outputs.node == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -83,3 +140,87 @@ jobs:
 
       - name: Test Node SDK
         run: nix develop --command npm --prefix sdk/node test
+
+  go-sdk:
+    name: go SDK (${{ matrix.platform }})
+    needs:
+      - changes
+      - checks
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: macos-arm64
+            runner: macos-26
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Check Go SDK formatting
+        run: test -z "$(nix develop --command gofmt -l sdk/go)"
+
+      - name: Build native Go bridge
+        run: nix develop --command cargo build --locked -p silo-go-ffi
+
+      - name: Verify generated Go FFI header is current
+        run: git diff --exit-code -- sdk/go/native/include/silo_go_ffi.h
+
+      - name: Test Go SDK
+        env:
+          CGO_ENABLED: "1"
+          SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/${{ runner.os == 'macOS' && 'libsilo_go_ffi.dylib' || 'libsilo_go_ffi.so' }}
+        run: nix develop --command go -C sdk/go test -race -count=1 ./...
+
+      - name: Vet Go SDK
+        env:
+          CGO_ENABLED: "1"
+          SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/${{ runner.os == 'macOS' && 'libsilo_go_ffi.dylib' || 'libsilo_go_ffi.so' }}
+        run: nix develop --command go -C sdk/go vet ./...
+
+      - name: Build a clean consumer module
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          consumer="$(mktemp -d)"
+          cd "$consumer"
+          nix develop "$GITHUB_WORKSPACE" --command go mod init example.com/silo-consumer
+          nix develop "$GITHUB_WORKSPACE" --command go mod edit -replace github.com/vandycknick/silo/sdk/go="$GITHUB_WORKSPACE/sdk/go"
+          cat > main.go <<'EOF'
+          package main
+          import (
+            "context"
+            "github.com/vandycknick/silo/sdk/go"
+          )
+          func main() { _, _ = silo.InstalledRuntime(); _ = context.Background() }
+          EOF
+          nix develop "$GITHUB_WORKSPACE" --command go mod tidy
+          nix develop "$GITHUB_WORKSPACE" --command go build ./...
+
+  summary:
+    name: test summary
+    if: always()
+    needs:
+      - changes
+      - checks
+      - node-sdk
+      - go-sdk
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require successful checks
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          printf '%s\n' "$RESULTS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")'

@@ -1,0 +1,20 @@
+[package]
+name = "silo-go-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libvm = { path = "../../../runtime/libvm" }
+base64 = "0.23.0"
+vm-spec = { path = "../../../specs/vm-spec" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time"] }
+tokio-stream = "0.1.19"
+
+[build-dependencies]
+cbindgen = "0.29.4"

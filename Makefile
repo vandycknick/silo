@@ -11,6 +11,8 @@ endif
 
 ##? CARGO_TARGET_DIR=path: Set the Cargo output directory (default: ./target).
 CARGO_TARGET_DIR ?= $(CURDIR)/target
+##? EXAMPLE=name: Select the Go SDK example for `make go-sdk-example` (default: basic).
+EXAMPLE ?= basic
 override CARGO_TARGET_DIR := $(abspath $(CARGO_TARGET_DIR))
 export CARGO_TARGET_DIR
 
@@ -79,15 +81,18 @@ help: ## Show public targets and configurable options.
 		END { printf "\nOptions:\n"; for (i = 1; i <= option_count; i++) printf "  %-36s %s\n", options[i], option_help[i] }' $(MAKEFILE_LIST)
 
 ##@ Build
-.PHONY: build stage
+.PHONY: build stage go-sdk-example
 build: ## Build the complete adjacent runtime.
 	$(XTASK) build --profile "$(PROFILE)" $(KERNEL_ARGS)
 
 stage: ## Build and assemble the portable runtime stage.
 	$(XTASK) stage --profile "$(PROFILE)" $(KERNEL_ARGS)
 
+go-sdk-example: ## Build the runtime and Go bridge, then run EXAMPLE (default: basic).
+	$(XTASK) go-sdk-example "$(EXAMPLE)" --profile "$(PROFILE)" $(KERNEL_ARGS)
+
 ##@ Distribution
-.PHONY: archive app package install
+.PHONY: archive app package assemble-go-sdk install
 archive: ## Build release runtime and CLI archives.
 	$(XTASK) archive $(KERNEL_ARGS)
 
@@ -96,6 +101,9 @@ app: ## Build and sign the macOS release application.
 
 package: ## Build the macOS release package (use DMG=1 for a DMG).
 	$(XTASK) package $(if $(filter 1,$(DMG)),--dmg) $(APP_ARGS) $(KERNEL_ARGS)
+
+assemble-go-sdk: ## Assemble Go SDK release source from all qualified target artifacts (release-only).
+	$(XTASK) assemble-go-sdk
 
 install: ## Install the macOS release application and CLI symlink.
 	$(XTASK) install --appdir "$(APPDIR)" --bindir "$(BINDIR)" $(APP_ARGS) $(KERNEL_ARGS)
@@ -121,8 +129,8 @@ version-check: ## Verify product versions match the version authority.
 	$(XTASK) version-check
 
 # Internal targets
-.PHONY: cli vmmon netd krun agent init initramfs kernel
-cli vmmon netd krun agent init initramfs:
+.PHONY: cli vmmon netd krun agent init initramfs go-ffi kernel
+cli vmmon netd krun agent init initramfs go-ffi:
 	$(XTASK) component $@ --profile "$(PROFILE)"
 
 kernel:

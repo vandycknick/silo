@@ -18,6 +18,7 @@ mod app;
 mod archive;
 mod command;
 mod components;
+mod go_sdk;
 mod initramfs;
 mod kernel;
 mod macos;
@@ -100,6 +101,18 @@ enum Commands {
     TestUnit,
     TestIntegration,
     VersionCheck,
+    AssembleGoSdk {
+        #[arg(long, value_name = "PATH")]
+        packages_root: Option<PathBuf>,
+    },
+    GoSdkExample {
+        #[arg(value_name = "NAME", default_value = "basic")]
+        example: String,
+        #[arg(long, value_enum, default_value_t = Profile::Debug)]
+        profile: Profile,
+        #[command(flatten)]
+        kernel: KernelOptions,
+    },
     PackInitramfs {
         #[arg(long, value_name = "PATH")]
         init: PathBuf,
@@ -254,6 +267,28 @@ fn run() -> Result<(), Box<dyn Error>> {
             test_integration(&workspace_root, &target_dir, host)?;
         }
         Commands::VersionCheck => version::check(&workspace_root)?,
+        Commands::AssembleGoSdk { packages_root } => {
+            let packages_root = packages_root
+                .map(|path| {
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        workspace_root.join(path)
+                    }
+                })
+                .unwrap_or_else(|| target_dir.join("packages"));
+            go_sdk::assemble(&workspace_root, &packages_root)?;
+        }
+        Commands::GoSdkExample {
+            example,
+            profile,
+            kernel,
+        } => {
+            build_release_or_development(&workspace_root, &target_dir, profile, kernel, true)?;
+            let context = build_context(&workspace_root, &target_dir, profile)?;
+            build_component(Component::GoFfi, &context)?;
+            go_sdk::run_example(&context, &example)?;
+        }
         Commands::PackInitramfs { init, out } => {
             write_initramfs(&InitramfsOptions::new(init, out))?;
         }
