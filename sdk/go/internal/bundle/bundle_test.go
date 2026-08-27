@@ -14,12 +14,40 @@ func TestPathUsesAbsoluteDevelopmentOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("SILO_GO_FFI_PATH", bridge)
+	want, err := filepath.EvalSymlinks(bridge)
+	if err != nil {
+		t.Fatalf("resolve bridge path: %v", err)
+	}
 	got, err := Path()
 	if err != nil {
 		t.Fatalf("Path() failed: %v", err)
 	}
-	if got != bridge {
-		t.Fatalf("Path() = %q, want %q", got, bridge)
+	if got != want {
+		t.Fatalf("Path() = %q, want resolved path %q", got, want)
+	}
+}
+
+func TestPathResolvesDevelopmentOverrideSymlink(t *testing.T) {
+	directory := t.TempDir()
+	bridge := filepath.Join(directory, platformFilename)
+	if err := os.WriteFile(bridge, []byte("bridge"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(directory, "bridge-alias")
+	if err := os.Symlink(bridge, alias); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SILO_GO_FFI_PATH", alias)
+	want, err := filepath.EvalSymlinks(bridge)
+	if err != nil {
+		t.Fatalf("resolve bridge path: %v", err)
+	}
+	got, err := Path()
+	if err != nil {
+		t.Fatalf("Path() failed: %v", err)
+	}
+	if got != want {
+		t.Fatalf("Path() = %q, want symlink target %q", got, want)
 	}
 }
 
