@@ -69,6 +69,41 @@ jobs:
             printf 'node=%s\ngo=%s\n' "$NODE_CHANGED" "$GO_CHANGED" >> "$GITHUB_OUTPUT"
           fi
 
+  # Platform-independent style and consistency checks run once on Linux.
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          cmd-format: nix develop --command {0}
+          workspaces: . -> target
+          prefix-key: test
+          key: lint-${{ hashFiles('flake.lock') }}
+          cache-bin: false
+
+      - name: Check Rust formatting
+        run: nix develop --command make fmt
+
+      - name: Check Go formatting
+        run: test -z "$(nix develop --command gofmt -l sdk/go)"
+
+      - name: Check versions
+        run: nix develop .#release --command make version-check
+
+  # Clippy and Cargo tests stay per-OS: the workspace has platform-only
+  # crates (virt/vz on macOS, virt/krun on Linux) that a single lane
+  # would silently stop covering.
   checks:
     name: checks (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
@@ -91,11 +126,14 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
-      - name: Check formatting
-        run: nix develop --command make fmt
-
-      - name: Check versions
-        run: nix develop .#release --command make version-check
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          cmd-format: nix develop --command {0}
+          workspaces: . -> target
+          prefix-key: test
+          key: checks-${{ matrix.platform }}-${{ hashFiles('flake.lock') }}
+          cache-bin: false
 
       - name: Run Clippy
         run: nix develop --command make clippy
@@ -105,9 +143,7 @@ jobs:
 
   node-sdk:
     name: node SDK (${{ matrix.platform }})
-    needs:
-      - changes
-      - checks
+    needs: changes
     if: needs.changes.outputs.node == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -129,23 +165,29 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          cmd-format: nix develop --command {0}
+          workspaces: . -> target
+          prefix-key: test
+          key: node-sdk-${{ matrix.platform }}-${{ hashFiles('flake.lock') }}
+          cache-bin: false
+
       - name: Install Node SDK dependencies
         run: nix develop --command npm --prefix sdk/node ci
 
+      # Building the TypeScript facade already typechecks it; there is no
+      # separate typecheck step.
       - name: Build Node SDK
         run: nix develop --command npm --prefix sdk/node run build
-
-      - name: Typecheck Node SDK
-        run: nix develop --command npm --prefix sdk/node run typecheck
 
       - name: Test Node SDK
         run: nix develop --command npm --prefix sdk/node test
 
   go-sdk:
     name: go SDK (${{ matrix.platform }})
-    needs:
-      - changes
-      - checks
+    needs: changes
     if: needs.changes.outputs.go == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -153,12 +195,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Every cell builds the native bridge and runs the full suite;
+          # platform-independent checks run only on the primary cell.
           - platform: linux-amd64
             runner: ubuntu-24.04
+            primary: true
           - platform: linux-arm64
             runner: ubuntu-24.04-arm
+            primary: false
           - platform: macos-arm64
             runner: macos-26
+            primary: false
 
     steps:
       - name: Check out repository
@@ -169,13 +216,20 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
-      - name: Check Go SDK formatting
-        run: test -z "$(nix develop --command gofmt -l sdk/go)"
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          cmd-format: nix develop --command {0}
+          workspaces: . -> target
+          prefix-key: test
+          key: go-sdk-${{ matrix.platform }}-${{ hashFiles('flake.lock') }}
+          cache-bin: false
 
       - name: Build native Go bridge
         run: nix develop --command cargo build --locked -p silo-go-ffi
 
       - name: Verify generated Go FFI header is current
+        if: ${{ matrix.primary }}
         run: git diff --exit-code -- sdk/go/native/include/silo_go_ffi.h
 
       - name: Test Go SDK
@@ -185,12 +239,14 @@ jobs:
         run: nix develop --command go -C sdk/go test -race -count=1 ./...
 
       - name: Vet Go SDK
+        if: ${{ matrix.primary }}
         env:
           CGO_ENABLED: "1"
-          SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/${{ runner.os == 'macOS' && 'libsilo_go_ffi.dylib' || 'libsilo_go_ffi.so' }}
+          SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/libsilo_go_ffi.so
         run: nix develop --command go -C sdk/go vet ./...
 
       - name: Build a clean consumer module
+        if: ${{ matrix.primary }}
         env:
           CGO_ENABLED: "1"
         run: |
@@ -214,6 +270,7 @@ jobs:
     if: always()
     needs:
       - changes
+      - lint
       - checks
       - node-sdk
       - go-sdk
