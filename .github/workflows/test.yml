@@ -98,26 +98,12 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
-      - name: Cache Nix store
-        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
-        with:
-          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'nix/devShell.nix', 'rust-toolchain.toml') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
-          gc-max-store-size: 5G
-          # Pull requests restore main's cache but never write their own,
-          # so the repository keeps one set of entries instead of one per ref.
-          save: ${{ github.ref == 'refs/heads/main' }}
-          purge: ${{ github.ref == 'refs/heads/main' }}
-          purge-prefixes: nix-${{ runner.os }}-${{ runner.arch }}-
-          purge-created: P7D
-
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
           cmd-format: nix develop .#ci --command {0}
           workspaces: . -> target
           prefix-key: test
-          key: checks-${{ matrix.platform }}-${{ hashFiles('flake.lock') }}
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -163,26 +149,12 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
-      - name: Cache Nix store
-        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
-        with:
-          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'nix/devShell.nix', 'rust-toolchain.toml') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
-          gc-max-store-size: 5G
-          # Pull requests restore main's cache but never write their own,
-          # so the repository keeps one set of entries instead of one per ref.
-          save: ${{ github.ref == 'refs/heads/main' }}
-          purge: ${{ github.ref == 'refs/heads/main' }}
-          purge-prefixes: nix-${{ runner.os }}-${{ runner.arch }}-
-          purge-created: P7D
-
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
           cmd-format: nix develop .#ci --command {0}
           workspaces: . -> target
           prefix-key: test
-          key: node-sdk-${{ matrix.platform }}-${{ hashFiles('flake.lock') }}
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -228,26 +200,12 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
-      - name: Cache Nix store
-        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
-        with:
-          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'nix/devShell.nix', 'rust-toolchain.toml') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
-          gc-max-store-size: 5G
-          # Pull requests restore main's cache but never write their own,
-          # so the repository keeps one set of entries instead of one per ref.
-          save: ${{ github.ref == 'refs/heads/main' }}
-          purge: ${{ github.ref == 'refs/heads/main' }}
-          purge-prefixes: nix-${{ runner.os }}-${{ runner.arch }}-
-          purge-created: P7D
-
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
           cmd-format: nix develop .#ci --command {0}
           workspaces: . -> target
           prefix-key: test
-          key: go-sdk-${{ matrix.platform }}-${{ hashFiles('flake.lock') }}
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
