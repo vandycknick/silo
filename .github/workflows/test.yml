@@ -4,7 +4,13 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'resources/kernels/**'
+      - '.github/workflows/kernel.yml'
   pull_request:
+    paths-ignore:
+      - 'resources/kernels/**'
+      - '.github/workflows/kernel.yml'
   workflow_dispatch:
 
 concurrency:
