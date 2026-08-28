@@ -104,6 +104,7 @@ jobs:
           cmd-format: nix develop .#ci --command {0}
           workspaces: . -> target
           prefix-key: test
+          shared-key: workspace
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -181,15 +182,21 @@ jobs:
         include:
           # Every cell builds the native bridge and runs the full suite;
           # platform-independent checks run only on the primary cell.
+          # saves_cache marks the cells with no Checks counterpart on the same
+          # architecture, which therefore have to populate the shared cache
+          # themselves instead of restoring one Checks already wrote.
           - platform: linux-amd64
             runner: ubuntu-24.04
             primary: true
+            saves_cache: false
           - platform: linux-arm64
             runner: ubuntu-24.04-arm
             primary: false
+            saves_cache: true
           - platform: macos-arm64
             runner: macos-26
             primary: false
+            saves_cache: false
 
     steps:
       - name: Check out repository
@@ -200,14 +207,18 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
+      # Checks builds the whole workspace in the same dev profile, so its cache
+      # is a superset of what the bridge needs. Share it rather than keeping a
+      # second copy, and let only one job per architecture write it.
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
           cmd-format: nix develop .#ci --command {0}
           workspaces: . -> target
           prefix-key: test
+          shared-key: workspace
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ matrix.saves_cache && github.ref == 'refs/heads/main' }}
 
       - name: Build native Go bridge
         run: nix develop .#ci --command cargo build --locked -p silo-go-ffi
