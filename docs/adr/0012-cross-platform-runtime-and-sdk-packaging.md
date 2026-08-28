@@ -2,7 +2,7 @@
 
 Date: 2026-07-22
 
-Updated: 2026-07-30
+Updated: 2026-08-18
 
 ## Status
 
@@ -909,12 +909,11 @@ The initial wheel matrix mirrors the supported targets: macOS arm64,
 the runtime's glibc floor. Wheels do not use first-run downloaders or
 installation scripts to acquire the default runtime.
 
-### Future Go SDK Compatibility Contract
+### Go SDK Compatibility Contract
 
 Go modules have no clean equivalent to npm optional platform packages or Python
-platform wheels. A future Go SDK therefore exposes an explicit installation API
-such as `InstallRuntime`. This is a deferred instance of the explicit archive
-installer direction, not a current runtime capability. Installation never occurs
+platform wheels. The Go SDK therefore exposes an explicit `InstallRuntime` API.
+This is packaging behavior outside `libvm`, not a runtime capability. Installation never occurs
 during package import, `init()`, runtime open, VM start, or a hidden postinstall
 hook.
 
@@ -933,8 +932,8 @@ $HOME/.local/share/silo/runtimes/0.1.0/linux-amd64-gnu/
 $HOME/.local/share/silo/runtimes/0.1.0/linux-arm64-gnu/
 ```
 
-A future exact Go SDK release may embed the expected SHA-256 digest and default
-release URL for every supported target archive. It must verify that digest before
+Each exact Go SDK release embeds the expected SHA-256 digest and default
+release URL for every supported target archive. It verifies that digest before
 extraction, preserve the archive-installation safety requirements, coordinate
 concurrent installers, atomically rename a completed temporary directory into
 place, and return the runtime root. It may support explicit mirrors and offline
@@ -1034,10 +1033,10 @@ in that environment rather than repeating deep binary qualification.
 - Unsupported targets fail before process spawn.
 - Compressed size is reported and remains within budget unless waived.
 
-The Python wheel and future explicit Go installer gates become mandatory when
-those SDKs are implemented. Before its first release, the Python SDK must boot
-from a clean wheel installation with no system Silo. Before its first release,
-the Go SDK must reject unsupported targets before download, verify its exact
+The Python wheel gates become mandatory when that SDK is implemented. Before
+its first release, the Python SDK must boot from a clean wheel installation with
+no system Silo. Before each Go SDK release, the Go SDK must reject unsupported
+targets before download, verify its exact
 runtime archive, enforce archive extraction safety, and boot that installed
 runtime.
 
@@ -1191,14 +1190,11 @@ questions:
 
 The following delivery work remains deferred:
 
-- an explicit user-owned archive installer with target and version selection,
-  digest verification, signature verification when available, safe extraction,
-  atomic installation, and optional `PATH` symlink creation; and
 - a `silo doctor` integrity and diagnostics command that may validate files,
   modes, dynamic dependencies, release checksums, macOS signatures, target
   architecture, and kernel provenance.
 
-These additions must remain outside `libvm`, runtime open, and VM startup. They
+This diagnostic capability must remain outside `libvm`, runtime open, and VM startup. It
 must not delete user state. The layouts, discovery rules, XDG ownership model,
 and release staging contract in this ADR support them without replacement.
 

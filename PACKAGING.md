@@ -23,7 +23,7 @@ implemented yet.
 | macOS arm64 | Runtime and portable archives, `Silo.app`, optional DMG, main Release Tip CI | Notarization, stapling, Homebrew Cask |
 | Linux amd64 | Runtime and portable archives, main Release Tip CI | Archive signing |
 | Linux arm64 | Runtime and portable archives, main Release Tip CI | Archive signing |
-| SDKs | Node native addon build | Runtime-carrying Node packages, Python wheels, Go runtime installer |
+| SDKs | Node native addon build; Go SDK, native bridge, and explicit runtime installer | Runtime-carrying Node packages, Python wheels, published Go release metadata |
 
 The current commands do not produce notarized macOS artifacts, release
 signatures, or published releases. Official Linux distribution is archive-only;
@@ -357,16 +357,21 @@ Linux distribution layout or promise.
 Package uninstallers must not delete user-owned XDG state, including runtime
 data, configuration, caches, or logs.
 
-## Deferred Archive Installer Contract
+## Go Runtime Installer Contract
 
-No archive installer is implemented today. A future installer must select an
-explicit target and version, verify the SHA-256 checksum and any future
-signature, and extract safely without accepting path traversal, links, or device
-files. It must preserve modes, stage into a temporary location, atomically
-install a versioned directory, and default to a user-owned location. A portable
-CLI installation may create a PATH symlink to `bin/silo`; a runtime-only
-installation has no CLI to expose. The installer must not download content at VM
-start or SDK import, and it must never delete user-owned state.
+The Go SDK implements the explicit runtime-only archive installer specified by ADR 0012. It
+selects the current supported target and exact SDK version, verifies the release-compiled SHA-256
+digest, rejects path traversal, links, devices, and unexpected files, preserves and validates
+modes and notices, stages into a temporary sibling, and atomically installs a complete runtime
+below the user-owned XDG data root. It supports exact offline archives and mirrors without
+allowing callers to replace the expected digest. Installation never occurs at SDK import,
+runtime open, machine creation, or VM start, and it never deletes user-owned state.
+
+Release preparation builds the private Go FFI bridge on each native target. After the qualified
+target artifacts are collected under `target/packages`, `make assemble-go-sdk` verifies their
+checksum sidecars and combines the bridge binaries and runtime archive digests into generated Go
+SDK release source before the nested module tag is created. Ordinary development uses
+`SILO_GO_FFI_PATH` instead of committing placeholder native binaries.
 
 ## Kernel Selection
 
@@ -415,36 +420,63 @@ application packagers.
 
 ## Continuous Integration
 
-`Test` runs formatting, version, Clippy, and test checks on Linux and macOS for
-pull requests, pushes to `main`, and manual dispatches. It intentionally has no
-path filtering: branch protection needs stable validation reports, and changes
-to documentation can be packaging inputs.
+`Test` validates pull requests, pushes to `main`, and manual dispatches as a
+left-to-right pipeline: change detection fans out to parallel per-OS core check
+jobs (Clippy, Cargo tests, and on the primary Linux cell also formatting and
+version consistency) and to Node and Go SDK matrices that run only when their
+SDK source or shared native contracts changed (manual dispatches run both).
+Native SDK bridges build and test on every supported target, while
+platform-independent SDK checks run on one primary cell. Everything flows into
+a final summary job that gives branch protection one stable result even when an
+SDK matrix is skipped.
+
+CI enters the `.#ci` shell rather than `.#default`. That shell carries the
+toolchain needed to compile, lint, and test the workspace but omits the
+cross-compilation and packaging tools (`zig`, `cargo-zigbuild`, `oras`, `syft`)
+and the local conveniences (`docker`, `grpcurl`) that no check invokes, which
+is roughly 1.2 GiB of closure every runner would otherwise download.
+
+Rust build outputs are cached per job, because the jobs build different crate
+sets and profiles. `rust-cache` already namespaces entries by job, operating
+system, architecture, compiler version, and `Cargo.lock`, so the workflow adds
+only a prefix that separates validation from release packaging. The Nix store
+is deliberately not cached: measured against the lean `ci` shell, restoring a
+gigabyte-scale store from the Actions cache costs about as long as fetching it
+from the binary cache, and it consumed a third of the repository quota.
+
+Only pushes to `main` write caches. Pull requests restore them and never save,
+which keeps the repository at one set of entries instead of one set per open
+pull request. GitHub also scopes any pull request cache to the pull request
+itself, so it can never feed `main` or release runs.
 
 `Release Tip` runs after a successful `Test` for a push to `main` (or by manual
 dispatch). Automatic runs package the exact SHA validated by `Test`; manual runs
-package the selected dispatch SHA. Its Rust cache is isolated to release
-packaging and is not used by validation. The cache uses the release shell,
-standard `$HOME/.cargo` locations, and a platform plus `flake.lock` key. It also
-has no path filtering because there is no baseline and commit metadata can
-affect artifacts. Three parallel cells then produce:
+package the selected dispatch SHA. Release preparation has four stages:
 
-- Linux amd64 runs `make archive` and uploads both archive families and sidecars.
-- Linux arm64 runs `make archive` and uploads both archive families and sidecars.
-- macOS arm64 runs `make archive`, then `make package DMG=1` on the same runner,
-  and uploads the target-qualified archives, sidecars, and DMG.
+1. Resolve the exact source revision and version.
+2. Build core archives on Linux amd64, Linux arm64, and macOS arm64; the macOS
+   cell also builds the application package and DMG.
+3. Build the Go FFI bridge and Node native addon on every supported target.
+4. Assemble and test the embedded Go release source and a publish-ready npm
+   package containing all three Node addons.
+
+The Rust caches are isolated by core/SDK stage and platform. Release work has no
+path filtering because commit metadata affects artifacts and every SDK package
+must use the same qualified core revision.
 
 GitHub zips Actions artifacts and does not preserve executable modes, so the
 DMG is the permission-preserving transport for the runnable macOS app. The
 workflow still builds and verifies the loose `Silo.app` on-runner before it
-creates and verifies the DMG. Downloading the three target-qualified artifacts
-into `target/packages` reconstructs one
-`target/packages/<version>` root with sibling `darwin-arm64`,
-`linux-amd64-gnu`, and `linux-arm64-gnu` directories. Targets and versions can
-coexist without path or filename collisions.
+creates and verifies the DMG. Downloading the core and native-SDK artifact for
+each target into `target/packages` reconstructs one `target/packages/<version>`
+root with sibling `darwin-arm64`, `linux-amd64-gnu`, and `linux-arm64-gnu`
+directories. Targets and versions can coexist without path or filename
+collisions. The SDK packaging jobs additionally upload generated Go module
+source and an npm `.tgz` that is ready for a later publication step.
 
-CI artifacts are retained for 14 days. This is build validation, not release
-publication: CI does not currently create release signatures, notarize macOS
-output, or publish release assets.
+CI artifacts are retained for 14 days. This is build validation and packaging,
+not release publication: CI does not currently create release signatures,
+notarize macOS output, run `npm publish`, or publish release assets.
 
 ## Architecture and Release Internals
 

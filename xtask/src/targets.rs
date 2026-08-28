@@ -50,6 +50,13 @@ impl HostTarget {
         }
     }
 
+    pub fn go_ffi_library(self) -> &'static str {
+        match self {
+            Self::MacosArm64 => "libsilo_go_ffi.dylib",
+            Self::LinuxX86_64 | Self::LinuxArm64 => "libsilo_go_ffi.so",
+        }
+    }
+
     pub fn go_target(self) -> (&'static str, &'static str) {
         match self {
             Self::MacosArm64 => ("darwin", "arm64"),

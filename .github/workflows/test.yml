@@ -1,6 +1,5 @@
 name: Test
 
-# Keep this unfiltered: branch protection needs stable checks, and docs contain package inputs.
 on:
   push:
     branches:
@@ -14,10 +13,69 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-24.04
+    outputs:
+      node: ${{ steps.result.outputs.node }}
+      go: ${{ steps.result.outputs.go }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Detect SDK-relevant changes
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            node:
+              - '.github/workflows/test.yml'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'Makefile'
+              - 'VERSION'
+              - 'flake.lock'
+              - 'flake.nix'
+              - 'runtime/libvm/**'
+              - 'specs/**'
+              - 'sdk/node/**'
+            go:
+              - '.github/workflows/test.yml'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'Makefile'
+              - 'VERSION'
+              - 'flake.lock'
+              - 'flake.nix'
+              - 'runtime/libvm/**'
+              - 'specs/**'
+              - 'sdk/go/**'
+              - 'xtask/**'
+
+      - name: Select SDK checks
+        id: result
+        env:
+          NODE_CHANGED: ${{ steps.filter.outputs.node }}
+          GO_CHANGED: ${{ steps.filter.outputs.go }}
+        run: |
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            printf 'node=true\ngo=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'node=%s\ngo=%s\n' "$NODE_CHANGED" "$GO_CHANGED" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Clippy and Cargo tests stay per-OS: the workspace has platform-only
+  # crates (virt/vz on macOS, virt/krun on Linux) that a single lane
+  # would silently stop covering. Platform-independent style and
+  # consistency checks run once, on the Linux cell.
   checks:
-    name: checks (${{ matrix.platform }})
+    name: Checks (${{ matrix.platform }})
+    needs: changes
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -26,8 +84,10 @@ jobs:
         include:
           - platform: linux
             runner: ubuntu-24.04
+            primary: true
           - platform: macos
             runner: macos-26
+            primary: false
 
     steps:
       - name: Check out repository
@@ -38,20 +98,38 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
-      - name: Check formatting
-        run: nix develop --command make fmt
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          cmd-format: nix develop .#ci --command {0}
+          workspaces: . -> target
+          prefix-key: test
+          shared-key: workspace
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check Rust formatting
+        if: ${{ matrix.primary }}
+        run: nix develop .#ci --command make fmt
+
+      - name: Check Go formatting
+        if: ${{ matrix.primary }}
+        run: test -z "$(nix develop .#ci --command gofmt -l sdk/go)"
 
       - name: Check versions
-        run: nix develop .#release --command make version-check
+        if: ${{ matrix.primary }}
+        run: nix develop .#ci --command make version-check
 
       - name: Run Clippy
-        run: nix develop --command make clippy
+        run: nix develop .#ci --command make clippy
 
       - name: Run tests
-        run: nix develop --command make test
+        run: nix develop .#ci --command make test
 
   node-sdk:
-    name: node SDK (${{ matrix.platform }})
+    name: Node SDK (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.node == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -72,14 +150,128 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          cmd-format: nix develop .#ci --command {0}
+          workspaces: . -> target
+          prefix-key: test
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Install Node SDK dependencies
-        run: nix develop --command npm --prefix sdk/node ci
+        run: nix develop .#ci --command npm --prefix sdk/node ci
 
+      # Building the TypeScript facade already typechecks it; there is no
+      # separate typecheck step.
       - name: Build Node SDK
-        run: nix develop --command npm --prefix sdk/node run build
-
-      - name: Typecheck Node SDK
-        run: nix develop --command npm --prefix sdk/node run typecheck
+        run: nix develop .#ci --command npm --prefix sdk/node run build
 
       - name: Test Node SDK
-        run: nix develop --command npm --prefix sdk/node test
+        run: nix develop .#ci --command npm --prefix sdk/node test
+
+  go-sdk:
+    name: Go SDK (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every cell builds the native bridge and runs the full suite;
+          # platform-independent checks run only on the primary cell.
+          # saves_cache marks the cells with no Checks counterpart on the same
+          # architecture, which therefore have to populate the shared cache
+          # themselves instead of restoring one Checks already wrote.
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+            primary: true
+            saves_cache: false
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            primary: false
+            saves_cache: true
+          - platform: macos-arm64
+            runner: macos-26
+            primary: false
+            saves_cache: false
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      # Checks builds the whole workspace in the same dev profile, so its cache
+      # is a superset of what the bridge needs. Share it rather than keeping a
+      # second copy, and let only one job per architecture write it.
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          cmd-format: nix develop .#ci --command {0}
+          workspaces: . -> target
+          prefix-key: test
+          shared-key: workspace
+          cache-bin: false
+          save-if: ${{ matrix.saves_cache && github.ref == 'refs/heads/main' }}
+
+      - name: Build native Go bridge
+        run: nix develop .#ci --command cargo build --locked -p silo-go-ffi
+
+      - name: Verify generated Go FFI header is current
+        if: ${{ matrix.primary }}
+        run: git diff --exit-code -- sdk/go/native/include/silo_go_ffi.h
+
+      - name: Test Go SDK
+        env:
+          CGO_ENABLED: "1"
+          SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/${{ runner.os == 'macOS' && 'libsilo_go_ffi.dylib' || 'libsilo_go_ffi.so' }}
+        run: nix develop .#ci --command go -C sdk/go test -race -count=1 ./...
+
+      - name: Vet Go SDK
+        if: ${{ matrix.primary }}
+        env:
+          CGO_ENABLED: "1"
+          SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/libsilo_go_ffi.so
+        run: nix develop .#ci --command go -C sdk/go vet ./...
+
+      - name: Build a clean consumer module
+        if: ${{ matrix.primary }}
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          consumer="$(mktemp -d)"
+          cd "$consumer"
+          nix develop "$GITHUB_WORKSPACE#ci" --command go mod init example.com/silo-consumer
+          nix develop "$GITHUB_WORKSPACE#ci" --command go mod edit -replace github.com/vandycknick/silo/sdk/go="$GITHUB_WORKSPACE/sdk/go"
+          cat > main.go <<'EOF'
+          package main
+          import (
+            "context"
+            "github.com/vandycknick/silo/sdk/go"
+          )
+          func main() { _, _ = silo.InstalledRuntime(); _ = context.Background() }
+          EOF
+          nix develop "$GITHUB_WORKSPACE#ci" --command go mod tidy
+          nix develop "$GITHUB_WORKSPACE#ci" --command go build ./...
+
+  summary:
+    name: Summary
+    if: always()
+    needs:
+      - changes
+      - checks
+      - node-sdk
+      - go-sdk
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require successful checks
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          printf '%s\n' "$RESULTS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")'

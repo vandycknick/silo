@@ -20,6 +20,7 @@ pub enum Component {
     Agent,
     Init,
     Initramfs,
+    GoFfi,
 }
 
 pub struct BuildContext<'a> {
@@ -73,6 +74,7 @@ pub fn build_component(
         Component::Agent => build_guest_agent(context),
         Component::Init => build_guest_init(context),
         Component::Initramfs => build_initramfs(context),
+        Component::GoFfi => build_cargo_package(context, "silo-go-ffi"),
     }
 }
 

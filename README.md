@@ -108,8 +108,9 @@ silo rm dev
 ## SDK
 
 Use `libvm` when you want to create and manage machines directly from Rust. See
-the [libvm guide](runtime/libvm/README.md) and the [Node SDK guide](sdk/node/README.md)
-for lifecycle and process details.
+the [libvm guide](runtime/libvm/README.md), [Node SDK guide](sdk/node/README.md), and
+[Go SDK guide](sdk/go/README.md) for lifecycle and process details. The Go SDK includes an
+explicit, digest-verified installer for the exact matching runtime archive.
 
 ```rust
 use libvm::{LibVmError, Memory, Runtime};

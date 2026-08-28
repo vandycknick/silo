@@ -12,8 +12,11 @@ const RUST_PRODUCT_MANIFESTS: &[&str] = &[
     "guest/agent/Cargo.toml",
     "guest/init/Cargo.toml",
     "sdk/node/Cargo.toml",
+    "sdk/go/native/Cargo.toml",
 ];
 const NODE_PRODUCT_MANIFEST: &str = "sdk/node/package.json";
+const GO_PRODUCT_VERSION: &str = "sdk/go/version.go";
+const GO_NATIVE_ABI: &str = "sdk/go/native/src/abi.rs";
 const NODE_PRODUCT_LOCKFILE: &str = "sdk/node/package-lock.json";
 
 #[derive(Debug, Error)]
@@ -71,6 +74,26 @@ pub fn check(workspace_root: &Path) -> Result<(), VersionError> {
         &["packages", "", "version"],
         &authority,
     )?;
+    check_declaration(
+        workspace_root,
+        GO_PRODUCT_VERSION,
+        "const Version =",
+        &authority,
+    )?;
+    let go_abi = unquoted_declaration(
+        workspace_root,
+        GO_PRODUCT_VERSION,
+        "const ffiABIVersion uint32 =",
+    )?;
+    let native_abi =
+        unquoted_declaration(workspace_root, GO_NATIVE_ABI, "const ABI_VERSION: u32 =")?;
+    if go_abi != native_abi {
+        return Err(VersionError::Mismatch {
+            path: GO_NATIVE_ABI.to_string(),
+            expected: go_abi,
+            actual: native_abi,
+        });
+    }
 
     println!("version-check: {authority}");
     Ok(())
@@ -96,6 +119,23 @@ fn check_declaration(
         });
     }
     Ok(())
+}
+
+fn unquoted_declaration(
+    workspace_root: &Path,
+    relative_path: &str,
+    prefix: &str,
+) -> Result<String, VersionError> {
+    let contents = read(&workspace_root.join(relative_path))?;
+    contents
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(prefix).map(str::trim))
+        .map(|value| value.trim_end_matches(';').trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| VersionError::MissingDeclaration {
+            path: relative_path.to_string(),
+        })
 }
 
 fn check_json_version(

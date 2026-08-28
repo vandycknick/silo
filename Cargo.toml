@@ -13,6 +13,7 @@ members = [
     "runtime/test-utils",
     "runtime/vmmon",
     "sdk/node",
+    "sdk/go/native",
     "virt/krun",
     "virt/vz",
     "specs/agent-spec",

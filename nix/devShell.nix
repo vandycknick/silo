@@ -18,11 +18,17 @@ let
     pkgs.syft
     pkgs.zstd
   ];
-  developmentPackages = releasePackages
-    ++ [
-      pkgs.docker
-      pkgs.docker-credential-helpers
-      pkgs.grpcurl
+  # Everything needed to compile, lint, and test the workspace. Deliberately
+  # omits the cross-compilation and packaging tools that only release builds
+  # invoke, because CI pays to download this closure on every runner.
+  ciPackages = [
+      rustToolchain
+      pkgs.go
+      pkgs.nodejs_26
+      pkgs.git
+      pkgs.gnumake
+      pkgs.gnutar
+      pkgs.zstd
     ]
     ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
       pkgs.dtc
@@ -36,17 +42,36 @@ let
       llvm.clang
       llvm.libclang
     ];
+  developmentPackages = ciPackages
+    ++ [
+      zig
+      pkgs.cargo-zigbuild
+      pkgs.oras
+      pkgs.syft
+      pkgs.docker
+      pkgs.docker-credential-helpers
+      pkgs.grpcurl
+    ];
+  workspaceHook = ''
+    workspace_root="$(pwd -P)"
+    export PATH="$workspace_root/target/debug:$workspace_root/scripts:$PATH"
+    export LIBCLANG_PATH="${llvm.libclang.lib}/lib"
+  '';
 in
 {
   default = pkgs.mkShell {
     packages = developmentPackages;
 
     shellHook = ''
-      workspace_root="$(pwd -P)"
-      export PATH="$workspace_root/target/debug:$workspace_root/scripts:$PATH"
-      export LIBCLANG_PATH="${llvm.libclang.lib}/lib"
+      ${workspaceHook}
       echo "Entering silo dev shell. Run: make build" >&2
     '';
+  };
+
+  ci = pkgs.mkShell {
+    packages = ciPackages;
+
+    shellHook = workspaceHook;
   };
 
   release = pkgs.mkShellNoCC {
