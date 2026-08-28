@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   changes:
-    name: detect SDK changes
+    name: Detect Changes
     runs-on: ubuntu-24.04
     outputs:
       node: ${{ steps.result.outputs.node }}
@@ -69,43 +69,13 @@ jobs:
             printf 'node=%s\ngo=%s\n' "$NODE_CHANGED" "$GO_CHANGED" >> "$GITHUB_OUTPUT"
           fi
 
-  # Platform-independent style and consistency checks run once on Linux.
-  lint:
-    name: lint
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-
-      - name: Cache Rust build outputs
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
-        with:
-          cmd-format: nix develop --command {0}
-          workspaces: . -> target
-          prefix-key: test
-          key: lint-${{ hashFiles('flake.lock') }}
-          cache-bin: false
-
-      - name: Check Rust formatting
-        run: nix develop --command make fmt
-
-      - name: Check Go formatting
-        run: test -z "$(nix develop --command gofmt -l sdk/go)"
-
-      - name: Check versions
-        run: nix develop .#release --command make version-check
-
   # Clippy and Cargo tests stay per-OS: the workspace has platform-only
   # crates (virt/vz on macOS, virt/krun on Linux) that a single lane
-  # would silently stop covering.
+  # would silently stop covering. Platform-independent style and
+  # consistency checks run once, on the Linux cell.
   checks:
-    name: checks (${{ matrix.platform }})
+    name: Checks (${{ matrix.platform }})
+    needs: changes
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -114,8 +84,10 @@ jobs:
         include:
           - platform: linux
             runner: ubuntu-24.04
+            primary: true
           - platform: macos
             runner: macos-26
+            primary: false
 
     steps:
       - name: Check out repository
@@ -135,6 +107,18 @@ jobs:
           key: checks-${{ matrix.platform }}-${{ hashFiles('flake.lock') }}
           cache-bin: false
 
+      - name: Check Rust formatting
+        if: ${{ matrix.primary }}
+        run: nix develop --command make fmt
+
+      - name: Check Go formatting
+        if: ${{ matrix.primary }}
+        run: test -z "$(nix develop --command gofmt -l sdk/go)"
+
+      - name: Check versions
+        if: ${{ matrix.primary }}
+        run: nix develop .#release --command make version-check
+
       - name: Run Clippy
         run: nix develop --command make clippy
 
@@ -142,7 +126,7 @@ jobs:
         run: nix develop --command make test
 
   node-sdk:
-    name: node SDK (${{ matrix.platform }})
+    name: Node SDK (${{ matrix.platform }})
     needs: changes
     if: needs.changes.outputs.node == 'true'
     runs-on: ${{ matrix.runner }}
@@ -186,7 +170,7 @@ jobs:
         run: nix develop --command npm --prefix sdk/node test
 
   go-sdk:
-    name: go SDK (${{ matrix.platform }})
+    name: Go SDK (${{ matrix.platform }})
     needs: changes
     if: needs.changes.outputs.go == 'true'
     runs-on: ${{ matrix.runner }}
@@ -266,11 +250,10 @@ jobs:
           nix develop "$GITHUB_WORKSPACE" --command go build ./...
 
   summary:
-    name: test summary
+    name: Summary
     if: always()
     needs:
       - changes
-      - lint
       - checks
       - node-sdk
       - go-sdk

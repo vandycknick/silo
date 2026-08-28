@@ -420,16 +420,17 @@ application packagers.
 
 ## Continuous Integration
 
-`Test` validates pull requests, pushes to `main`, and manual dispatches with
-parallel lanes: one Linux lint job for platform-independent style and version
-checks, per-OS Clippy and Cargo test jobs, and Node and Go SDK matrices that
-run only when their SDK source or shared native contracts changed (manual
-dispatches run both). Native SDK bridges build and test on every supported
-target, while platform-independent SDK checks run on one primary cell. Rust
-build caches are keyed per job and platform; GitHub scopes pull request caches
-to the pull request itself, so they can never feed `main` or release runs. A
-final summary job gives branch protection one stable result even when an SDK
-matrix is skipped.
+`Test` validates pull requests, pushes to `main`, and manual dispatches as a
+left-to-right pipeline: change detection fans out to parallel per-OS core check
+jobs (Clippy, Cargo tests, and on the primary Linux cell also formatting and
+version consistency) and to Node and Go SDK matrices that run only when their
+SDK source or shared native contracts changed (manual dispatches run both).
+Native SDK bridges build and test on every supported target, while
+platform-independent SDK checks run on one primary cell. Rust build caches are
+keyed per job and platform; GitHub scopes pull request caches to the pull
+request itself, so they can never feed `main` or release runs. Everything flows
+into a final summary job that gives branch protection one stable result even
+when an SDK matrix is skipped.
 
 `Release Tip` runs after a successful `Test` for a push to `main` (or by manual
 dispatch). Automatic runs package the exact SHA validated by `Test`; manual runs
