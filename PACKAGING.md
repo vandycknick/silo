@@ -434,10 +434,16 @@ CI enters the `.#ci` shell rather than `.#default`. That shell carries the
 toolchain needed to compile, lint, and test the workspace but omits the
 cross-compilation and packaging tools (`zig`, `cargo-zigbuild`, `oras`, `syft`)
 and the local conveniences (`docker`, `grpcurl`) that no check invokes, which
-is roughly 1.2 GiB of closure every runner would otherwise download. Both the
-Nix store and the Rust build outputs are cached per job and platform. GitHub
-scopes pull request caches to the pull request itself, so they can never feed
-`main` or release runs.
+is roughly 1.2 GiB of closure every runner would otherwise download.
+
+Both the Nix store and the Rust build outputs are cached. The Nix store cache
+is keyed only by operating system and architecture, so every job on a runner
+shares one entry; the Rust caches stay per job because the jobs build different
+crate sets and profiles. Only pushes to `main` write caches. Pull requests
+restore them and never save, which keeps the repository at one set of entries
+instead of one set per open pull request, well inside the 10 GiB quota. GitHub
+also scopes any pull request cache to the pull request itself, so it can never
+feed `main` or release runs.
 
 `Release Tip` runs after a successful `Test` for a push to `main` (or by manual
 dispatch). Automatic runs package the exact SHA validated by `Test`; manual runs
