@@ -29,7 +29,7 @@
         llvm = pkgs.llvmPackages;
       };
     in {
-      inherit (shells) default release;
+      inherit (shells) default ci release;
       kernel = pkgs.callPackage ./nix/kernelShell.nix { };
     });
   };

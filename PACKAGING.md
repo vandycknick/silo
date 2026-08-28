@@ -426,11 +426,18 @@ jobs (Clippy, Cargo tests, and on the primary Linux cell also formatting and
 version consistency) and to Node and Go SDK matrices that run only when their
 SDK source or shared native contracts changed (manual dispatches run both).
 Native SDK bridges build and test on every supported target, while
-platform-independent SDK checks run on one primary cell. Rust build caches are
-keyed per job and platform; GitHub scopes pull request caches to the pull
-request itself, so they can never feed `main` or release runs. Everything flows
-into a final summary job that gives branch protection one stable result even
-when an SDK matrix is skipped.
+platform-independent SDK checks run on one primary cell. Everything flows into
+a final summary job that gives branch protection one stable result even when an
+SDK matrix is skipped.
+
+CI enters the `.#ci` shell rather than `.#default`. That shell carries the
+toolchain needed to compile, lint, and test the workspace but omits the
+cross-compilation and packaging tools (`zig`, `cargo-zigbuild`, `oras`, `syft`)
+and the local conveniences (`docker`, `grpcurl`) that no check invokes, which
+is roughly 1.2 GiB of closure every runner would otherwise download. Both the
+Nix store and the Rust build outputs are cached per job and platform. GitHub
+scopes pull request caches to the pull request itself, so they can never feed
+`main` or release runs.
 
 `Release Tip` runs after a successful `Test` for a push to `main` (or by manual
 dispatch). Automatic runs package the exact SHA validated by `Test`; manual runs
