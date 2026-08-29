@@ -60,7 +60,6 @@ dependencies = [
  "rtnetlink",
  "russh",
  "rustix",
- "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
@@ -3485,23 +3484,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "plugins"
-version = "0.1.0"
-dependencies = [
- "agent-spec",
- "bytes",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "nix 0.31.3",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "policy"
 version = "0.1.0"
 dependencies = [
@@ -5715,6 +5697,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
 ]
 
 [[package]]

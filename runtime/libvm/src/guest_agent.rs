@@ -2,19 +2,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_spec::{
-    AgentConfig, AgentForwardConfig, AgentRosettaConfig, AgentSshAuthorizedUser, AgentSshConfig,
-    AgentUdsForwardConfig, CertificateAuthorityConfig, MountConfig as ProvisionMountConfig,
+    AgentConfig, AgentRosettaConfig, AgentSshAuthorizedUser, AgentSshConfig,
+    CertificateAuthorityConfig, MountConfig as ProvisionMountConfig,
     NetworkConfig as ProvisionNetworkConfig, NetworkInterfaceConfig, ProvisionConfig,
     ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType, UserdataRunPolicy,
 };
 use eyre::Context;
-use serde::Deserialize;
 use ssh_key::PrivateKey;
 use utils::format_mac;
 use vm_spec::VmSpec;
 
 use crate::constants::{
-    FORWARD_ENDPOINT_NAME, GUEST_CERTIFICATE_AUTHORITY_PATH, GUEST_SSH_PRIVATE_KEY_FILE_NAME,
+    GUEST_CERTIFICATE_AUTHORITY_PATH, GUEST_SSH_PRIVATE_KEY_FILE_NAME,
     GUEST_SSH_PUBLIC_KEY_FILE_NAME, GUEST_USER_SHELL, GUEST_USER_SUDO_RULE, MOUNT_OPTION_NOFAIL,
     MOUNT_OPTION_READ_ONLY, MOUNT_OPTION_READ_WRITE, USERDATA_CONTENT_TYPE_CLOUD_CONFIG,
     USERDATA_CONTENT_TYPE_PLAIN_TEXT, USERDATA_CONTENT_TYPE_SHELL_SCRIPT, VIRTIOFS_FSTYPE,
@@ -41,17 +40,6 @@ struct GuestAgentHostContext {
     certificate_authority_pem: Option<String>,
     timezone: String,
     locale: String,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct ForwardPluginConfig {
-    #[serde(default)]
-    uds: Vec<ForwardPluginUdsConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ForwardPluginUdsConfig {
-    guest_path: String,
 }
 
 pub(crate) fn build_config(input: GuestAgentConfigInput<'_>) -> eyre::Result<AgentConfig> {
@@ -99,7 +87,6 @@ fn build_config_with_host_context(
     host_context: &GuestAgentHostContext,
 ) -> eyre::Result<AgentConfig> {
     Ok(AgentConfig {
-        forward: build_forward_config(spec)?,
         provision: build_provision_config(
             machine_name,
             spec,
@@ -108,38 +95,6 @@ fn build_config_with_host_context(
             host_context,
         )?,
         ssh: build_ssh_config(host_context),
-    })
-}
-
-fn build_forward_config(spec: &VmSpec) -> eyre::Result<AgentForwardConfig> {
-    let Some(endpoint) = spec.vsock.as_ref().and_then(|vsock| {
-        vsock
-            .endpoints
-            .iter()
-            .find(|endpoint| endpoint.name == FORWARD_ENDPOINT_NAME)
-    }) else {
-        return Ok(AgentForwardConfig::default());
-    };
-
-    let config = endpoint
-        .plugin
-        .config
-        .clone()
-        .map(serde_json::from_value::<ForwardPluginConfig>)
-        .transpose()
-        .context("decode forward endpoint plugin config")?
-        .unwrap_or_default();
-
-    Ok(AgentForwardConfig {
-        enabled: true,
-        port: endpoint.port,
-        uds: config
-            .uds
-            .into_iter()
-            .map(|uds| AgentUdsForwardConfig {
-                guest_path: uds.guest_path,
-            })
-            .collect(),
     })
 }
 
@@ -363,21 +318,15 @@ fn parse_mac_string(mac: &str) -> eyre::Result<[u8; 6]> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
 
     use agent_spec::{AgentConfig, UserdataContentType, UserdataRunPolicy};
-    use serde_json::json;
-    use vm_spec::{
-        Boot, Guest, GuestOs, Hardware, Kernel, Lifecycle, Mount, Plugin, Storage, VmSpec, Vsock,
-        VsockEndpoint, VsockEndpointMode,
-    };
+    use vm_spec::{Boot, Guest, GuestOs, Hardware, Kernel, Mount, Storage, VmSpec};
 
     use crate::guest_agent::{
-        build_config_with_host_context, build_forward_config, build_provision_config,
-        build_provision_network_config, guest_ssh_key_paths, load_or_generate_guest_ssh_keypair,
-        GuestAgentHostContext,
+        build_config_with_host_context, build_provision_config, build_provision_network_config,
+        guest_ssh_key_paths, load_or_generate_guest_ssh_keypair, GuestAgentHostContext,
     };
     use crate::host;
     use crate::machine::MachineUserConfig;
@@ -415,31 +364,6 @@ mod tests {
 
     fn hardware_mut(spec: &mut VmSpec) -> &mut Hardware {
         spec.hardware.as_mut().expect("sample spec hardware")
-    }
-
-    fn push_vsock_endpoint(spec: &mut VmSpec, endpoint: VsockEndpoint) {
-        spec.vsock
-            .get_or_insert_with(|| Vsock {
-                endpoints: Vec::new(),
-            })
-            .endpoints
-            .push(endpoint);
-    }
-
-    fn forward_endpoint(port: u32, config: Option<serde_json::Value>) -> VsockEndpoint {
-        VsockEndpoint {
-            name: "forward".to_string(),
-            port,
-            mode: VsockEndpointMode::Connect,
-            plugin: Plugin {
-                command: PathBuf::from("/usr/local/bin/forward"),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                working_dir: None,
-                config,
-            },
-            lifecycle: Lifecycle::default(),
-        }
     }
 
     fn host_context() -> GuestAgentHostContext {
@@ -558,13 +482,6 @@ mod tests {
             .expect("network provision config should render");
 
         assert!(config.is_none());
-    }
-
-    #[test]
-    fn guest_agent_has_no_forward_without_endpoint() {
-        let config = build_forward_config(&sample_spec(Vec::new())).expect("forward config");
-
-        assert!(!config.enabled);
     }
 
     #[test]
@@ -784,66 +701,16 @@ mod tests {
     }
 
     #[test]
-    fn guest_agent_enables_forward_from_named_endpoint() {
-        let mut spec = sample_spec(Vec::new());
-        push_vsock_endpoint(&mut spec, forward_endpoint(4100, None));
-
-        let config = build_forward_config(&spec).expect("forward config should resolve");
-
-        assert!(config.enabled);
-        assert_eq!(config.port, 4100);
-        assert!(config.uds.is_empty());
-    }
-
-    #[test]
-    fn guest_agent_injects_forward_uds_guest_paths() {
-        let mut spec = sample_spec(Vec::new());
-        push_vsock_endpoint(
-            &mut spec,
-            forward_endpoint(
-                4100,
-                Some(json!({
-                    "tcp": {
-                        "auto_discover": true,
-                        "ports": [
-                            { "guest_port": 8080, "host_port": 8080 }
-                        ]
-                    },
-                    "uds": [
-                        { "guest_path": "/var/run/docker.sock", "host_path": "docker.sock" },
-                        { "guest_path": "/tmp/app.sock", "host_path": "app.sock" }
-                    ]
-                })),
-            ),
-        );
-
-        let config = build_forward_config(&spec).expect("forward config should resolve");
-
-        assert_eq!(
-            config
-                .uds
-                .iter()
-                .map(|uds| uds.guest_path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["/var/run/docker.sock", "/tmp/app.sock"]
-        );
-    }
-
-    #[test]
-    fn build_config_combines_forward_and_provision_config() {
-        let mut spec = sample_spec(Vec::new());
-        push_vsock_endpoint(&mut spec, forward_endpoint(4100, None));
-
+    fn build_config_combines_provision_and_ssh_config() {
         let config = build_config_with_host_context(
             "demo",
-            &spec,
+            &sample_spec(Vec::new()),
             &VmmonNetworkAttachment::None,
             true,
             &host_context(),
         )
         .expect("build agent config");
 
-        assert!(config.forward.enabled);
         assert!(config.provision.enabled);
         assert_eq!(config.provision.hostname.as_deref(), Some("demo"));
         assert_eq!(

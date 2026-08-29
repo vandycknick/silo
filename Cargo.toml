@@ -9,7 +9,6 @@ members = [
     "guest/init",
     "runtime/oci",
     "runtime/libvm",
-    "runtime/plugins",
     "runtime/test-utils",
     "runtime/vmmon",
     "sdk/node",

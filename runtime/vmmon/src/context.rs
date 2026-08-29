@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use crate::virt::{SerialConsole, VirtualMachine};
 use tokio_util::sync::CancellationToken;
-use vm_spec::VmSpec;
 
 use crate::state::InstanceStore;
 
@@ -40,7 +39,6 @@ impl RuntimeContext {
 pub struct DaemonContext {
     pub(crate) machine_id: uuid::Uuid,
     pub(crate) machine_run_id: uuid::Uuid,
-    pub(crate) spec: VmSpec,
     pub(crate) guest_services_enabled: bool,
     pub(crate) machine: VirtualMachine,
     pub(crate) serial_console: Arc<SerialConsole>,

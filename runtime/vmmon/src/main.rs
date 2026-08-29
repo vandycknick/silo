@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use clap::Parser;
 
 mod context;
-mod endpoints;
 mod exec_log;
 mod execution;
 mod exit_command;

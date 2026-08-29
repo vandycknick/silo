@@ -86,7 +86,7 @@ The helper uses a narrow private adapter rather than generated C bindings. It ow
 
 The `blk`, `net`, and `vhost-user` APIs are selected at compile time through fixed Cargo features. Runtime feature probing is unnecessary because a helper missing a required API cannot compile.
 
-Libkrun v2 starts contexts without implicit console or vsock devices and no longer injects a default init binary. The helper therefore supplies its kernel and optional initramfs directly, adds hvc0 only for `--stdio-console`, and temporarily adds the built-in vsock device only when `--vsock-port` mappings are present. The built-in port bridge remains the backend for vmmon ports 22 and 1027 during this API-migration phase; the embedded vhost-user backend is later work and ADR 0015's public host surface is not complete here.
+Libkrun v2 starts contexts without implicit console or vsock devices and no longer injects a default init binary. The helper therefore supplies its kernel and optional initramfs directly, adds hvc0 only for `--stdio-console`, and temporarily adds the built-in vsock device when vmmon supplies its core `--vsock-port` mappings. Vmmon always declares exactly guest destinations 22 and 1027 as connect mappings, independently of managed guest services and the public `VmSpec.vsock.enabled` setting. No endpoint-derived or guest-listen mapping reaches this transitional bridge. The embedded vhost-user backend and ADR 0015 public host surface remain later work.
 
 ## libkrun Build Features
 

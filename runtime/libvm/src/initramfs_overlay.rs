@@ -206,7 +206,7 @@ mod tests {
         std::fs::write(&base, b"base-bytes").expect("write base");
         std::fs::write(&agent, b"agent-bytes").expect("write agent");
 
-        write_composite(&base, &agent, br#"{"forward":{}}"#, &output).expect("compose initramfs");
+        write_composite(&base, &agent, br#"{}"#, &output).expect("compose initramfs");
 
         let bytes = std::fs::read(&output).expect("read output");
         assert_eq!(&bytes[..10], b"base-bytes");
@@ -240,7 +240,7 @@ mod tests {
         assert_eq!(entries[1].5, b"agent-bytes");
         assert_eq!(entries[2].0, "agent/config.json");
         assert_eq!(entries[2].1 & 0o777, 0o600);
-        assert_eq!(entries[2].5, br#"{"forward":{}}"#);
+        assert_eq!(entries[2].5, br#"{}"#);
         assert!(entries
             .iter()
             .all(|(_, _, uid, gid, mtime, _)| *uid == 0 && *gid == 0 && *mtime == 0));

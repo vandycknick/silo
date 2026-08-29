@@ -8,9 +8,9 @@ Every helper-created context does the following:
 
 1. Set the VM CPU and memory configuration.
 2. Set the explicit kernel, optional initramfs, and kernel command line.
-3. Add disks, mounts, networking, console, and vsock only when configured.
+3. Add disks, mounts, networking, and console only when configured, plus vmmon's unconditional transitional core vsock bridge.
 
-The v1 `krun_disable_implicit_console()` and `krun_disable_implicit_vsock()` APIs do not exist in v2 because those devices are explicit. `krun_disable_implicit_init()` remains only as an `-ENOTSUP` compatibility stub and must not be called. If a console is needed, the helper adds one explicitly with `krun_add_virtio_console_default()` and selects `hvc0` with `krun_set_kernel_console()`. During the transitional S2 backend, configured vsock ports cause the helper to call `krun_add_vsock(ctx, 0)` before `krun_add_vsock_port2()`, keeping TSI hijacking disabled and preserving vmmon's port 22 and 1027 bridge.
+The v1 `krun_disable_implicit_console()` and `krun_disable_implicit_vsock()` APIs do not exist in v2 because those devices are explicit. `krun_disable_implicit_init()` remains only as an `-ENOTSUP` compatibility stub and must not be called. If a console is needed, the helper adds one explicitly with `krun_add_virtio_console_default()` and selects `hvc0` with `krun_set_kernel_console()`. During the transitional backend, vmmon always passes exactly two connect mappings, guest destinations 22 and 1027. Those mappings cause the helper to call `krun_add_vsock(ctx, 0)` before `krun_add_vsock_port2()`, keeping TSI hijacking disabled. They do not depend on managed guest-service enablement or `VmSpec.vsock.enabled`, and no endpoint-derived or listen mappings remain.
 
 `krun_set_port_map()` is intentionally not part of Silo's startup path. It controls TSI stream remapping, not explicit virtio-net backends or Silo's explicit per-port Unix-socket bridge.
 
@@ -20,7 +20,7 @@ The v1 `krun_disable_implicit_console()` and `krun_disable_implicit_vsock()` API
 | --- | --- | --- | --- | --- |
 | Console device | Call `krun_add_virtio_console_default()` | No console device | Added only for `--stdio-console`, then selected as `hvc0` | Applies on Linux and macOS |
 | Init binary | Load and apply `libkrun_init` configuration | No injected init binary | Not used; Silo supplies an explicit kernel and optional initramfs | `krun_disable_implicit_init()` returns `-ENOTSUP` in v2 |
-| Vsock device | Call `krun_add_vsock()` | No vsock device | Temporarily added with TSI features `0` when built-in port mappings exist | Replaced by Silo's embedded backend in S7, not S2 |
+| Vsock device | Call `krun_add_vsock()` | No vsock device | Temporarily added with TSI features `0` for unconditional vmmon connect mappings to guest ports 22 and 1027 | Replaced by Silo's embedded backend in S7; the public vsock setting does not alter this bridge |
 | TSI networking | Enable TSI flags on an explicit vsock device | No TSI fallback | Disabled by passing TSI features `0` and using explicit virtio-net | Applies on Linux and macOS |
 | TSI port remapping | Use TSI stream listens through libkrun's vsock path | May rewrite guest listen ports according to a libkrun port map | Not used; TSI is disabled and explicit virtio-net backends do not consume this map | Applies only to libkrun's vsock/TSI stream path |
 | Environment inheritance | Call `krun_set_exec()` or `krun_set_env()` with `NULL` | Inherits host process environment | Current helper does not use exec-mode APIs; future exec-mode code must pass an explicit env array | Applies on Linux and macOS |

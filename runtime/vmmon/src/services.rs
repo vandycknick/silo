@@ -24,7 +24,6 @@ use tonic::{Request, Response, Status};
 use tonic_health::server::{health_reporter, HealthReporter};
 
 use crate::context::{DaemonContext, RuntimeContext};
-use crate::endpoints::start_endpoint_supervisor;
 use crate::execution::ExecutionService;
 use crate::guest::spawn_guest_services;
 use crate::startup::SyncReporter;
@@ -42,7 +41,6 @@ const BACKEND_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct ServiceHandles {
     pub(crate) control_socket: JoinHandle<eyre::Result<()>>,
     pub(crate) guest_monitor: Option<JoinHandle<()>>,
-    pub(crate) endpoint_supervisor: Option<JoinHandle<()>>,
     pub(crate) health: HealthReporter,
     pub(crate) server_shutdown: CancellationToken,
     pub(crate) startup_command: Option<JoinHandle<()>>,
@@ -406,7 +404,6 @@ pub async fn start_services(
         },
         None => None,
     };
-    let endpoint_supervisor = start_endpoint_supervisor(ctx.clone(), runtime.dir().to_path_buf());
     tracing::info!(
         socket = %path.display(),
         guest_services_enabled = ctx.guest_services_enabled,
@@ -416,7 +413,6 @@ pub async fn start_services(
     Ok(ServiceHandles {
         control_socket,
         guest_monitor,
-        endpoint_supervisor,
         health,
         server_shutdown,
         startup_command,

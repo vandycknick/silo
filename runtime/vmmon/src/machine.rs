@@ -8,7 +8,7 @@ use agent_spec::SSH_VSOCK_PORT;
 use protocol::guest_port_arg;
 use thiserror::Error;
 use utils::parse_mac;
-use vm_spec::{VmSpec, VsockEndpointMode};
+use vm_spec::VmSpec;
 
 use crate::ext::VmSpecExt;
 use crate::guest::GUEST_CONTROL_PORT;
@@ -105,7 +105,7 @@ pub(crate) fn vm_spec_machine_config(
         });
     }
 
-    for port in vm_spec_vsock_ports(inputs.spec, inputs.guest_services_enabled) {
+    for port in core_vsock_ports() {
         builder = builder.vsock_port(port);
     }
 
@@ -115,29 +115,17 @@ pub(crate) fn vm_spec_machine_config(
     })
 }
 
-fn vm_spec_vsock_ports(spec: &VmSpec, guest_services_enabled: bool) -> Vec<VsockPort> {
-    let mut ports = Vec::new();
-    if let Some(vsock) = spec.vsock.as_ref() {
-        for endpoint in &vsock.endpoints {
-            ports.push(VsockPort {
-                port: endpoint.port,
-                mode: map_vsock_endpoint_mode(endpoint.mode),
-            });
-        }
-    }
-
-    if guest_services_enabled {
-        ports.push(VsockPort {
-            port: GUEST_CONTROL_PORT,
-            mode: VsockPortMode::Connect,
-        });
-        ports.push(VsockPort {
+fn core_vsock_ports() -> [VsockPort; 2] {
+    [
+        VsockPort {
             port: SSH_VSOCK_PORT,
             mode: VsockPortMode::Connect,
-        });
-    }
-
-    ports
+        },
+        VsockPort {
+            port: GUEST_CONTROL_PORT,
+            mode: VsockPortMode::Connect,
+        },
+    ]
 }
 
 fn vm_spec_kernel_cmdline(spec: &VmSpec, guest_services_enabled: bool) -> Vec<String> {
@@ -151,13 +139,6 @@ fn vm_spec_kernel_cmdline(spec: &VmSpec, guest_services_enabled: bool) -> Vec<St
         kernel_cmdline.push(guest_port_arg(GUEST_CONTROL_PORT));
     }
     kernel_cmdline
-}
-
-fn map_vsock_endpoint_mode(mode: VsockEndpointMode) -> VsockPortMode {
-    match mode {
-        VsockEndpointMode::Connect => VsockPortMode::Connect,
-        VsockEndpointMode::Listen => VsockPortMode::Listen,
-    }
 }
 
 pub(crate) fn machine_identifier_path_from_dir(data_dir: &Path) -> PathBuf {
@@ -273,13 +254,16 @@ fn load_host_machine_identifier(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_runtime_network, vm_spec_machine_config, RuntimeNetwork, VmSpecInputs};
+    use crate::guest::GUEST_CONTROL_PORT;
+    use crate::machine::{
+        apply_runtime_network, vm_spec_machine_config, RuntimeNetwork, VmSpecInputs,
+    };
     use crate::virt::{VmConfig, VsockPortMode};
     use agent_spec::SSH_VSOCK_PORT;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use vm_spec::{Boot, Disk, Hardware, Kernel, Storage, VmSpec};
+    use vm_spec::{Boot, Disk, Hardware, Kernel, Storage, VmSpec, Vsock};
 
     const DATA_DISK: &str = "data.img";
 
@@ -393,16 +377,18 @@ mod tests {
             machine_config.config.krun().helper_path.as_deref(),
             Some(Path::new("/tmp/krun"))
         );
-        assert!(machine_config
-            .config
-            .vsock_ports()
-            .iter()
-            .any(|port| port.port == 1027 && port.mode == VsockPortMode::Connect));
-        assert!(machine_config
-            .config
-            .vsock_ports()
-            .iter()
-            .any(|port| port.port == SSH_VSOCK_PORT && port.mode == VsockPortMode::Connect));
+        assert_eq!(
+            machine_config
+                .config
+                .vsock_ports()
+                .iter()
+                .map(|port| (port.port, port.mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (SSH_VSOCK_PORT, VsockPortMode::Connect),
+                (GUEST_CONTROL_PORT, VsockPortMode::Connect),
+            ]
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -426,6 +412,70 @@ mod tests {
         .expect("machine config should resolve");
 
         assert!(machine_config.config.disks().is_empty());
+        assert!(machine_config.config.kernel_cmdline().is_empty());
+        assert_eq!(
+            machine_config
+                .config
+                .vsock_ports()
+                .iter()
+                .map(|port| (port.port, port.mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (SSH_VSOCK_PORT, VsockPortMode::Connect),
+                (GUEST_CONTROL_PORT, VsockPortMode::Connect),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn public_vsock_enablement_does_not_change_core_ports() {
+        let dir = temp_dir("public-vsock-core-ports");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        for vsock in [
+            None,
+            Some(Vsock {
+                enabled: false,
+                uds: None,
+            }),
+            Some(Vsock {
+                enabled: true,
+                uds: None,
+            }),
+            Some(Vsock {
+                enabled: true,
+                uds: Some(PathBuf::from("custom.sock")),
+            }),
+        ] {
+            let mut spec = sample_spec(&dir);
+            spec.vsock = vsock;
+            let machine_config = vm_spec_machine_config(VmSpecInputs {
+                name: "devbox",
+                id: "vm-vsock",
+                data_dir: &dir,
+                spec: &spec,
+                network: &RuntimeNetwork::None,
+                guest_services_enabled: false,
+                krun_path: Path::new("/tmp/krun"),
+            })
+            .expect("machine config should resolve");
+
+            assert_eq!(
+                machine_config
+                    .config
+                    .vsock_ports()
+                    .iter()
+                    .map(|port| (port.port, port.mode))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (SSH_VSOCK_PORT, VsockPortMode::Connect),
+                    (GUEST_CONTROL_PORT, VsockPortMode::Connect),
+                ]
+            );
+            assert!(machine_config.config.kernel_cmdline().is_empty());
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

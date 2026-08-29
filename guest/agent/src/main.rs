@@ -2,7 +2,6 @@
 compile_error!("silo-agent only supports Linux guests");
 
 mod filesystem;
-mod forward;
 mod guest_process;
 mod handoff;
 mod host;
@@ -27,7 +26,6 @@ use nix::errno::Errno;
 use nix::mount::{mount, MsFlags};
 use protocol::v1::ProvisionOverallStatus;
 
-use crate::forward::ForwardService;
 use crate::handoff::BootMode;
 use crate::pid1::ProcessSupervisor;
 use crate::port::from_kernel_cmdline;
@@ -227,37 +225,6 @@ async fn run_agent(
             agent_server.fail(format!("SSH startup failed: {error}"));
             error
         })?;
-    }
-
-    if agent_config.forward.enabled {
-        if agent_config.forward.port == 0 {
-            agent_server
-                .fail("forward guest runtime is enabled but no endpoint port was configured");
-            return Err(eyre::eyre!(
-                "forward guest runtime is enabled but no 'forward' endpoint port was configured"
-            ));
-        }
-
-        let forward_service =
-            ForwardService::new(agent_config.forward.clone()).map_err(|error| {
-                agent_server.fail(format!("forward startup failed: {error}"));
-                error
-            })?;
-        let forward_server = VsockServer::create(move |stream| {
-            let forward_service = forward_service.clone();
-            async move { forward_service.handle_connection(stream).await }
-        })
-        .with_concurrency(256)
-        .with_tracing(tracing::info_span!("vsock_server", service = "forward"))
-        .listen(agent_config.forward.port)
-        .map_err(|error| {
-            agent_server.fail(format!("forward listener startup failed: {error}"));
-            error
-        })?;
-        if let Some(abort_handle) = forward_server.abort_handle() {
-            server_abort_handles.push(abort_handle);
-        }
-        running_servers.push(forward_server);
     }
 
     agent_server.ready(boot_report, provision_report);

@@ -92,10 +92,6 @@ async fn drain(handles: &mut ServiceHandles, machine: &crate::virt::VirtualMachi
         drain_task(task, "guest monitor").await;
     }
 
-    if let Some(task) = handles.endpoint_supervisor.take() {
-        drain_task(task, "endpoint supervisor").await;
-    }
-
     drain_result_task(&mut handles.control_socket, "control socket").await;
 
     match tokio::time::timeout(SERVICE_DRAIN_TIMEOUT, machine.drain_serial()).await {

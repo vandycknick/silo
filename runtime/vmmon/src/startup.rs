@@ -203,7 +203,6 @@ pub async fn init(
         context: DaemonContext {
             machine_id,
             machine_run_id,
-            spec,
             guest_services_enabled,
             machine,
             serial_console,
