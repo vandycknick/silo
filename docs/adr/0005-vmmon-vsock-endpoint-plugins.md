@@ -4,7 +4,7 @@ Date: 2026-04-12
 
 ## Status
 
-Implemented
+Superseded by [ADR 0015](0015-hybrid-vsock-host-surface.md)
 
 ## Context
 
