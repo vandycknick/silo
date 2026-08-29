@@ -258,11 +258,7 @@ impl VirtBackend for MockBackend {
                     "mock vsock port {port} is declared for listen, not connect"
                 )));
             }
-            None => {
-                return Err(VirtError::Backend(format!(
-                    "mock vsock port {port} was not declared before boot"
-                )));
-            }
+            None => {}
         }
         if self.scenario.vsock.refuse_ports.contains(&port) {
             return Err(VirtError::Backend(format!(
@@ -325,11 +321,7 @@ impl VirtBackend for MockBackend {
                     "mock vsock port {port} is declared for connect, not listen"
                 )));
             }
-            None => {
-                return Err(VirtError::Backend(format!(
-                    "mock vsock port {port} was not declared before boot"
-                )));
-            }
+            None => {}
         }
 
         let path = self

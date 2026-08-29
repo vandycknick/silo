@@ -9,14 +9,21 @@ use crate::state::InstanceStore;
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeContext {
     dir: PathBuf,
+    runtime_dir: PathBuf,
     config: PathBuf,
     socket: PathBuf,
 }
 
 impl RuntimeContext {
-    pub(crate) fn new(dir: PathBuf, config: PathBuf, socket: PathBuf) -> Self {
+    pub(crate) fn new(
+        dir: PathBuf,
+        runtime_dir: PathBuf,
+        config: PathBuf,
+        socket: PathBuf,
+    ) -> Self {
         Self {
             dir,
+            runtime_dir,
             config,
             socket,
         }
@@ -28,6 +35,10 @@ impl RuntimeContext {
 
     pub(crate) fn config(&self) -> &Path {
         &self.config
+    }
+
+    pub(crate) fn runtime_dir(&self) -> &Path {
+        &self.runtime_dir
     }
 
     pub(crate) fn socket(&self) -> &Path {

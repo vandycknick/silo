@@ -8,6 +8,7 @@ use nix::{
 use tokio::time::{sleep, Instant};
 use uuid::Uuid;
 
+use crate::lock_manager::MachineLifetimeLock;
 use crate::machine::root_disk::RootDiskResizeOutcome;
 use crate::machine::{
     Machine, MachineData, MachineExit, MachineExitOutcome, MachineKillOptions, MachineRunId,
@@ -75,6 +76,10 @@ impl Machine {
             let serial_log_path = machine_paths.serial_log_path();
 
             runtime.ensure_machine_runtime_directories(config.id)?;
+            let lifetime_lock = MachineLifetimeLock::try_acquire(&machine_paths.vmmon_lock_path())?
+                .ok_or_else(|| LibVmError::MachineAlreadyRunning {
+                    reference: config.name.clone(),
+                })?;
 
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             runtime
@@ -179,6 +184,7 @@ impl Machine {
                 machine_id: config.id,
                 name: &config.name,
                 machine_dir: &config.machine_dir,
+                machine_runtime_dir: machine_paths.machine_run_dir(),
                 pidfile: &pid_path,
                 exit_status: &exit_status_path,
                 config: &config_path,
@@ -191,6 +197,7 @@ impl Machine {
                 agent_enabled,
                 startup_command: startup_command.as_ref(),
                 machine_log_dir: &machine_log_dir,
+                machine_lock: &lifetime_lock,
             };
             if let Err(err) = vmmon.spawn(&launch).await {
                 return Err(finish_failed_start(

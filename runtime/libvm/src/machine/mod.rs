@@ -16,6 +16,7 @@ mod session;
 mod start;
 mod streams;
 mod update;
+mod vsock;
 
 pub use builder::MachineBuilder;
 pub use guest::{GuestBuilder, MachineAgent, MachineGuestConfig, MachineUserConfig};

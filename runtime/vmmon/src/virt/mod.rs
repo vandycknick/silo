@@ -27,6 +27,7 @@ mod serial;
 mod stream;
 
 pub use backend::{Availability, BackendKind};
+pub(crate) use capacity::VsockLease;
 pub use config::{
     DiskImage, KrunOptions, MachineIdentifier, MockOptions, NetworkMode, SharedDirectory, VmConfig,
     VmConfigBuilder, VmExit, VsockPort, VsockPortMode, VzOptions,

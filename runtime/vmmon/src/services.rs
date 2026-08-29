@@ -44,6 +44,7 @@ pub struct ServiceHandles {
     pub(crate) health: HealthReporter,
     pub(crate) server_shutdown: CancellationToken,
     pub(crate) startup_command: Option<JoinHandle<()>>,
+    pub(crate) vsock_surface: Option<crate::vsock::VsockSurface>,
 }
 
 #[derive(Clone)]
@@ -243,6 +244,7 @@ pub async fn start_services(
     ctx: &DaemonContext,
     startup_command: Option<crate::start_request::StartupCommand>,
     exec_log: Option<crate::exec_log::ExecLogWriter>,
+    vsock_surface: Option<crate::vsock::VsockSurface>,
     sync_reporter: &mut SyncReporter,
 ) -> eyre::Result<ServiceHandles> {
     let path = runtime.socket().to_path_buf();
@@ -423,6 +425,7 @@ pub async fn start_services(
         health,
         server_shutdown,
         startup_command,
+        vsock_surface,
     })
 }
 

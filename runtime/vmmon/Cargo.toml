@@ -26,6 +26,7 @@ futures = "0.3.33"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 libc = "0.2.189"
 nix = { version = "0.31.3", features = ["signal", "fs", "socket", "process", "term", "user"] }
+notify = "8.2.0"
 bytes = "1.12.1"
 prost-types = "0.14.4"
 rand = "0.10.2"

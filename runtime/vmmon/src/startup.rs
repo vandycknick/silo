@@ -22,12 +22,14 @@ use protocol::v1::VmState;
 pub const ENV_STARTPIPE: &str = "_VM_STARTPIPE";
 pub const ENV_SYNCPIPE: &str = "_VM_SYNCPIPE";
 pub const ENV_MACHINE_LOG_DIR: &str = "_VM_MACHINE_LOG_DIR";
+pub const ENV_MACHINE_LOCK: &str = "_VM_MACHINE_LOCK";
 
 #[derive(Clone, Copy, Debug)]
 pub struct InheritedPipeFds {
     pub startpipe: Option<RawFd>,
     pub syncpipe: Option<RawFd>,
     pub machine_log_dir: Option<RawFd>,
+    pub machine_lock: Option<RawFd>,
 }
 
 impl InheritedPipeFds {
@@ -36,13 +38,14 @@ impl InheritedPipeFds {
             startpipe: parse_env_fd(ENV_STARTPIPE)?,
             syncpipe: parse_env_fd(ENV_SYNCPIPE)?,
             machine_log_dir: parse_env_fd(ENV_MACHINE_LOG_DIR)?,
+            machine_lock: parse_env_fd(ENV_MACHINE_LOCK)?,
         })
     }
 
     pub fn require_for_daemon(self) -> eyre::Result<Self> {
-        if self.startpipe.is_none() || self.syncpipe.is_none() {
+        if self.startpipe.is_none() || self.syncpipe.is_none() || self.machine_lock.is_none() {
             return Err(eyre::eyre!(
-                "{ENV_STARTPIPE} and {ENV_SYNCPIPE} are required unless running with --foreground"
+                "{ENV_STARTPIPE}, {ENV_SYNCPIPE}, and {ENV_MACHINE_LOCK} are required unless running with --foreground"
             ));
         }
         Ok(self)
@@ -50,13 +53,27 @@ impl InheritedPipeFds {
 
     #[cfg(target_os = "macos")]
     pub fn clear_cloexec(self) -> eyre::Result<()> {
-        for fd in [self.startpipe, self.syncpipe, self.machine_log_dir]
-            .into_iter()
-            .flatten()
+        for fd in [
+            self.startpipe,
+            self.syncpipe,
+            self.machine_log_dir,
+            self.machine_lock,
+        ]
+        .into_iter()
+        .flatten()
         {
             set_cloexec(fd, false).map_err(|err| eyre::eyre!("clear CLOEXEC on fd {fd}: {err}"))?;
         }
         Ok(())
+    }
+
+    pub fn take_machine_lock(self) -> eyre::Result<Option<File>> {
+        let Some(fd) = self.machine_lock else {
+            return Ok(None);
+        };
+        set_cloexec(fd, true)
+            .map_err(|err| eyre::eyre!("set CLOEXEC on inherited machine lock fd {fd}: {err}"))?;
+        Ok(Some(unsafe { File::from_raw_fd(fd) }))
     }
 }
 
@@ -133,6 +150,7 @@ pub(crate) struct InitInputs<'a> {
 pub(crate) struct InitResult {
     pub(crate) context: DaemonContext,
     pub(crate) startup_command: Option<crate::start_request::StartupCommand>,
+    pub(crate) vsock_surface: Option<crate::vsock::VsockSurface>,
 }
 
 pub async fn init(
@@ -161,7 +179,14 @@ pub async fn init(
         "vmmon starting"
     );
     secure_machine_dir(runtime.dir())?;
+    secure_machine_dir(runtime.runtime_dir())?;
     remove_stale_socket(runtime.socket())?;
+
+    let prepared_vsock = vm_spec::effective_vsock_filename(spec.vsock.as_ref())
+        .map(|filename| {
+            crate::vsock::PreparedVsockSurface::prepare(runtime.runtime_dir(), filename)
+        })
+        .transpose()?;
 
     let machine_config = vm_spec_machine_config(VmSpecInputs {
         name,
@@ -197,7 +222,25 @@ pub async fn init(
 
     store.set_vm_state(VmState::Starting, "vm starting")?;
     machine.start().await?;
-    store.set_vm_state(VmState::Running, "vm running")?;
+    let vsock_surface = match prepared_vsock {
+        Some(prepared) => match prepared.activate(machine.clone()).await {
+            Ok(surface) => Some(surface),
+            Err(error) => {
+                if let Err(stop_error) = machine.stop().await {
+                    tracing::error!(%stop_error, "failed to stop VM after vsock surface startup failure");
+                }
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+    if let Err(error) = store.set_vm_state(VmState::Running, "vm running") {
+        drop(vsock_surface);
+        if let Err(stop_error) = machine.stop().await {
+            tracing::error!(%stop_error, "failed to stop VM after state initialization failure");
+        }
+        return Err(error.into());
+    }
 
     Ok(InitResult {
         context: DaemonContext {
@@ -211,6 +254,7 @@ pub async fn init(
             shutdown: CancellationToken::new(),
         },
         startup_command: start_request.startup_command,
+        vsock_surface,
     })
 }
 
@@ -379,6 +423,7 @@ mod tests {
         let run_id = uuid::Uuid::new_v4().to_string();
         let runtime = RuntimeContext::new(
             directory.clone(),
+            directory.clone(),
             directory.join("missing-vm-spec.json"),
             directory.join("vm.sock"),
         );
@@ -479,6 +524,7 @@ mod tests {
             .expect("open start request pipe");
         let runtime = RuntimeContext::new(
             directory.clone(),
+            directory.clone(),
             directory.join("missing-vm-spec.json"),
             directory.join("vm.sock"),
         );
@@ -529,6 +575,7 @@ mod tests {
             startpipe: Some(start_read.as_raw_fd()),
             syncpipe: Some(sync_write.as_raw_fd()),
             machine_log_dir: None,
+            machine_lock: None,
         }
         .clear_cloexec()
         .expect("preserve inherited pipes");
@@ -559,6 +606,7 @@ mod tests {
             startpipe: Some(start_read.as_raw_fd()),
             syncpipe: Some(sync_write.as_raw_fd()),
             machine_log_dir: None,
+            machine_lock: None,
         }
         .clear_cloexec()
         .expect("preserve inherited pipes");
