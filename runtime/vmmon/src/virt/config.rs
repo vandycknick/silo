@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use super::error::VirtError;
+use crate::virt::error::VirtError;
 
 /// Opaque, persistable machine identity.
 ///
@@ -85,6 +85,8 @@ pub struct SharedDirectory {
 /// A guest vsock port the host intends to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VsockPort {
+    /// Transitional preboot declaration used only by the krun core bridge.
+    /// S7 removes this after the embedded backend makes ports fully dynamic.
     pub port: u32,
     pub mode: VsockPortMode,
 }

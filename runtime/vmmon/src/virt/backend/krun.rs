@@ -1,7 +1,6 @@
 //! libkrun backend (Linux), driving the spawned `krun` helper binary through
-//! the `krun` crate. Vsock ports are unix sockets in a per-machine directory:
-//! `Connect` ports are listened on by the helper (we dial), `Listen` ports
-//! are pre-bound here before boot (the guest dials).
+//! the `krun` crate. The common API is dynamic, but until S7 this backend can
+//! only reach the core ports predeclared through libkrun's Unix bridge.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,7 +17,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, timeout};
 
-use super::VirtBackend;
+use crate::virt::backend::VirtBackend;
+use crate::virt::capacity::{VsockCapacity, VsockLease};
 use crate::virt::config::{
     validate_common, DiskImage, NetworkMode, SharedDirectory, VmConfig, VsockPortMode,
 };
@@ -181,7 +181,7 @@ impl VirtBackend for KrunBackend {
         Ok(Some(exit))
     }
 
-    async fn connect_vsock(&self, port: u32) -> Result<VsockStream, VirtError> {
+    async fn connect_vsock(&self, port: u32, lease: VsockLease) -> Result<VsockStream, VirtError> {
         {
             let runtime = self.runtime.lock().await;
             if runtime.is_none() {
@@ -203,10 +203,19 @@ impl VirtBackend for KrunBackend {
         }
 
         let stream = UnixStream::connect(vsock_path(&self.config, port, mode)).await?;
-        Ok(VsockStream::from_unix_stream(stream))
+        Ok(VsockStream::from_unix_stream(
+            stream,
+            None,
+            port,
+            Some(lease),
+        ))
     }
 
-    async fn listen_vsock(&self, port: u32) -> Result<VsockListener, VirtError> {
+    async fn listen_vsock(
+        &self,
+        port: u32,
+        capacity: VsockCapacity,
+    ) -> Result<VsockListener, VirtError> {
         let Some(mode) = declared_vsock_mode(&self.config, port) else {
             return Err(VirtError::Backend(format!(
                 "krun vsock port {port} was not declared before boot"
@@ -232,7 +241,7 @@ impl VirtBackend for KrunBackend {
             })?
         };
 
-        Ok(VsockListener::from_unix_listener(listener))
+        Ok(VsockListener::from_unix_listener(listener, port, capacity))
     }
 
     async fn open_serial(&self) -> Result<SerialDevice, VirtError> {

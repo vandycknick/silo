@@ -146,14 +146,7 @@ impl VmAccessService for AccessService {
                 None,
             )
         })?
-        .map_err(|error| {
-            protocol::status_with_error(
-                tonic::Code::Unavailable,
-                protocol::v1::ErrorCode::BackendUnavailable,
-                format!("SSH backend unavailable: {error}"),
-                None,
-            )
-        })?;
+        .map_err(ssh_backend_status)?;
         Ok(Response::new(Box::pin(relay(
             stream,
             request.into_inner(),
@@ -200,6 +193,20 @@ impl VmAccessService for AccessService {
             request.into_inner(),
             self.shutdown.clone(),
         ))))
+    }
+}
+
+fn ssh_backend_status(error: crate::virt::VirtError) -> Status {
+    match error {
+        crate::virt::VirtError::VsockCapacityExhausted { .. } => {
+            protocol::detailed_status(Status::resource_exhausted(error.to_string()))
+        }
+        error => protocol::status_with_error(
+            tonic::Code::Unavailable,
+            protocol::v1::ErrorCode::BackendUnavailable,
+            format!("SSH backend unavailable: {error}"),
+            None,
+        ),
     }
 }
 
@@ -600,12 +607,26 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tokio_util::sync::CancellationToken;
 
-    use crate::services::{peer_uid_authorized, relay};
+    use crate::services::{peer_uid_authorized, relay, ssh_backend_status};
+    use crate::virt::VirtError;
 
     #[test]
     fn socket_peer_must_match_its_owner() {
         assert!(peer_uid_authorized(501, 501));
         assert!(!peer_uid_authorized(501, 502));
+    }
+
+    #[test]
+    fn ssh_capacity_exhaustion_has_specific_rpc_mapping() {
+        let exhausted = ssh_backend_status(VirtError::VsockCapacityExhausted {
+            machine: "test".to_string(),
+            limit: 1024,
+        });
+        let backend = ssh_backend_status(VirtError::Backend("offline".to_string()));
+
+        assert_eq!(exhausted.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(backend.code(), tonic::Code::Unavailable);
+        assert!(backend.message().contains("SSH backend unavailable"));
     }
 
     #[tokio::test]

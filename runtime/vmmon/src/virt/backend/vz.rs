@@ -18,7 +18,8 @@ use vz::{
     VirtualMachine, VirtualMachineDelegate, VirtualMachineState, VzError,
 };
 
-use super::VirtBackend;
+use crate::virt::backend::VirtBackend;
+use crate::virt::capacity::{VsockCapacity, VsockLease};
 use crate::virt::config::{validate_common, MachineIdentifier, NetworkMode, VmConfig};
 use crate::virt::error::VirtError;
 use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
@@ -233,18 +234,22 @@ impl VirtBackend for VzBackend {
         Ok(self.cached_exit())
     }
 
-    async fn connect_vsock(&self, port: u32) -> Result<VsockStream, VirtError> {
+    async fn connect_vsock(&self, port: u32, lease: VsockLease) -> Result<VsockStream, VirtError> {
         let vm = self.running_vm().await?;
         let device = socket_device(&vm)?;
         let stream = device.connect(port).await.map_err(vz_error)?;
-        Ok(VsockStream::from_vz(stream))
+        Ok(VsockStream::from_vz(stream, Some(lease)))
     }
 
-    async fn listen_vsock(&self, port: u32) -> Result<VsockListener, VirtError> {
+    async fn listen_vsock(
+        &self,
+        port: u32,
+        capacity: VsockCapacity,
+    ) -> Result<VsockListener, VirtError> {
         let vm = self.running_vm().await?;
         let device = socket_device(&vm)?;
         let listener = device.listen(port).map_err(vz_error)?;
-        Ok(VsockListener::from_vz(listener))
+        Ok(VsockListener::from_vz(listener, port, capacity))
     }
 
     async fn open_serial(&self) -> Result<SerialDevice, VirtError> {

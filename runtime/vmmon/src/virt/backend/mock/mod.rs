@@ -26,11 +26,12 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 
-use super::{BackendKind, VirtBackend};
+use crate::virt::backend::{BackendKind, VirtBackend};
+use crate::virt::capacity::{VsockCapacity, VsockLease};
 use crate::virt::config::{validate_common, VmConfig, VsockPortMode};
 use crate::virt::error::VirtError;
 use crate::virt::machine::VirtualMachine;
-use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
+use crate::virt::stream::{SerialDevice, SyntheticPortAllocator, VsockListener, VsockStream};
 use crate::virt::VmExit;
 
 const GUEST_ROOT_DIR: &str = "mock-guest-root";
@@ -52,6 +53,7 @@ pub(crate) struct MockBackend {
     /// watches it.
     shutdown: watch::Sender<bool>,
     started_once: Mutex<bool>,
+    source_ports: SyntheticPortAllocator,
 }
 
 #[derive(Debug)]
@@ -96,6 +98,7 @@ impl MockBackend {
             exit_notify: Arc::new(Notify::new()),
             shutdown,
             started_once: Mutex::new(false),
+            source_ports: SyntheticPortAllocator::new(),
         })
     }
 
@@ -232,7 +235,7 @@ impl VirtBackend for MockBackend {
         Ok(self.cached_exit())
     }
 
-    async fn connect_vsock(&self, port: u32) -> Result<VsockStream, VirtError> {
+    async fn connect_vsock(&self, port: u32, lease: VsockLease) -> Result<VsockStream, VirtError> {
         let incoming_tx = {
             let running = self.running.lock().await;
             let Some(running) = running.as_ref() else {
@@ -304,10 +307,17 @@ impl VirtBackend for MockBackend {
             ));
         }
 
-        Ok(VsockStream::from_unix_stream(client))
+        let source = self.source_ports.allocate()?;
+        Ok(VsockStream::from_synthetic_unix_stream(
+            client, source, port, lease,
+        ))
     }
 
-    async fn listen_vsock(&self, port: u32) -> Result<VsockListener, VirtError> {
+    async fn listen_vsock(
+        &self,
+        port: u32,
+        capacity: VsockCapacity,
+    ) -> Result<VsockListener, VirtError> {
         match self.declared_mode(port) {
             Some(VsockPortMode::Listen) => {}
             Some(VsockPortMode::Connect) => {
@@ -329,9 +339,12 @@ impl VirtBackend for MockBackend {
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
-        Ok(VsockListener::from_unix_listener(UnixListener::bind(
-            &path,
-        )?))
+        Ok(VsockListener::from_mock_unix_listener(
+            UnixListener::bind(&path)?,
+            port,
+            capacity,
+            self.source_ports.clone(),
+        ))
     }
 
     async fn open_serial(&self) -> Result<SerialDevice, VirtError> {
@@ -435,4 +448,99 @@ fn limited_stream(
         // Dropping both halves hard-closes the relay.
     });
     Ok(near)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use tokio::net::UnixStream;
+
+    use crate::virt::backend::mock::MockBackend;
+    use crate::virt::backend::VirtBackend;
+    use crate::virt::capacity::VsockCapacity;
+    use crate::virt::{VmConfig, VsockPort, VsockPortMode};
+
+    #[tokio::test]
+    async fn mock_connect_reports_unique_reusable_synthetic_source_metadata() {
+        let root = std::env::temp_dir().join(format!("vmmon-mock-metadata-{}", std::process::id()));
+        let config = VmConfig::builder("mock-metadata")
+            .base_directory(&root)
+            .kernel(Path::new("/mock-kernel"))
+            .vsock_port(VsockPort {
+                port: agent_spec::SSH_VSOCK_PORT,
+                mode: VsockPortMode::Connect,
+            })
+            .build();
+        let backend = MockBackend::new(config).expect("mock backend");
+        backend.start().await.expect("start mock");
+        let capacity = VsockCapacity::test_with_limit("mock-metadata", 2);
+
+        let first = backend
+            .connect_vsock(
+                agent_spec::SSH_VSOCK_PORT,
+                capacity.reserve().expect("first capacity"),
+            )
+            .await
+            .expect("first stream");
+        let second = backend
+            .connect_vsock(
+                agent_spec::SSH_VSOCK_PORT,
+                capacity.reserve().expect("second capacity"),
+            )
+            .await
+            .expect("second stream");
+
+        assert_eq!(first.source_port(), Some(1 << 30));
+        assert_eq!(second.source_port(), Some((1 << 30) + 1));
+        assert_eq!(first.destination_port(), agent_spec::SSH_VSOCK_PORT);
+        drop(first);
+        drop(second);
+
+        let reused = backend
+            .connect_vsock(
+                agent_spec::SSH_VSOCK_PORT,
+                capacity.reserve().expect("reused capacity"),
+            )
+            .await
+            .expect("reused stream");
+        assert_eq!(reused.source_port(), Some(1 << 30));
+
+        backend.stop().await.expect("stop mock");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn mock_listener_reports_registered_destination_and_synthetic_source() {
+        let root = std::env::temp_dir().join(format!(
+            "vmmon-mock-listener-metadata-{}",
+            std::process::id()
+        ));
+        let port = 7000;
+        let config = VmConfig::builder("mock-listener-metadata")
+            .base_directory(&root)
+            .kernel(Path::new("/mock-kernel"))
+            .vsock_port(VsockPort {
+                port,
+                mode: VsockPortMode::Listen,
+            })
+            .build();
+        let backend = MockBackend::new(config).expect("mock backend");
+        backend.start().await.expect("start mock");
+        let capacity = VsockCapacity::test_with_limit("mock-listener-metadata", 1);
+        let mut listener = backend
+            .listen_vsock(port, capacity)
+            .await
+            .expect("mock listener");
+        let path = root.join(format!("mock-vsock-listen-{port}.sock"));
+
+        let _client = UnixStream::connect(path).await.expect("guest connection");
+        let stream = listener.accept().await.expect("accepted stream");
+        assert_eq!(stream.source_port(), Some(1 << 30));
+        assert_eq!(stream.destination_port(), port);
+
+        backend.stop().await.expect("stop mock");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

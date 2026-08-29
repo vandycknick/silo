@@ -1,7 +1,7 @@
 //! Backend contract and selection.
 //!
 //! Each virtualization backend implements [`VirtBackend`]; everything above
-//! this module (the [`super::VirtualMachine`] handle, the serial console)
+//! this module (the [`crate::virt::VirtualMachine`] handle, the serial console)
 //! works purely against the trait. [`create_backend`] is the single
 //! cfg-aware construction point — no other code in the module branches on
 //! target platform or features.
@@ -19,10 +19,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::config::VmConfig;
-use super::error::VirtError;
-use super::stream::{SerialDevice, VsockListener, VsockStream};
-use super::VmExit;
+use crate::virt::capacity::{VsockCapacity, VsockLease};
+use crate::virt::config::VmConfig;
+use crate::virt::error::VirtError;
+use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
+use crate::virt::VmExit;
 
 #[cfg(target_os = "linux")]
 mod krun;
@@ -50,11 +51,15 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
     /// Non-blocking exit check.
     async fn try_wait(&self) -> Result<Option<VmExit>, VirtError>;
 
-    /// Host-initiated connection to a guest vsock port declared `Connect`.
-    async fn connect_vsock(&self, port: u32) -> Result<VsockStream, VirtError>;
+    /// Dynamically connect to a guest endpoint port, consuming its admission lease.
+    async fn connect_vsock(&self, port: u32, lease: VsockLease) -> Result<VsockStream, VirtError>;
 
-    /// Claim the host listener for a guest vsock port declared `Listen`.
-    async fn listen_vsock(&self, port: u32) -> Result<VsockListener, VirtError>;
+    /// Dynamically register a host endpoint port for guest-initiated connections.
+    async fn listen_vsock(
+        &self,
+        port: u32,
+        capacity: VsockCapacity,
+    ) -> Result<VsockListener, VirtError>;
 
     /// Open the guest serial device. Called once per boot by the serial console.
     async fn open_serial(&self) -> Result<SerialDevice, VirtError>;

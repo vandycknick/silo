@@ -6,16 +6,24 @@
 //! [`VsockListener::try_accept`] requires listener-specific non-blocking
 //! accept semantics. Backends built on unix sockets (krun, mock) share the
 //! `Unix` variants; the Virtualization.framework backend has its own.
+//!
+//! Listener admission is enforced before a stream leaves this abstraction.
+//! VZ currently performs that check after its delegate has accepted and queued
+//! the connection; callback-time admission and a bounded delegate queue are S6.
 
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{ready, Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
+
+use crate::virt::capacity::{VsockCapacity, VsockLease};
+use crate::virt::error::VirtError;
 
 #[cfg(not(unix))]
 compile_error!("virt stream support requires a Unix host");
@@ -23,6 +31,10 @@ compile_error!("virt stream support requires a Unix host");
 /// A host-side connection to a guest vsock port.
 pub struct VsockStream {
     inner: VsockStreamInner,
+    source_port: Option<u32>,
+    destination_port: u32,
+    _lease: Option<VsockLease>,
+    _synthetic_source: Option<SyntheticPortLease>,
 }
 
 enum VsockStreamInner {
@@ -32,35 +44,66 @@ enum VsockStreamInner {
 }
 
 impl VsockStream {
-    pub fn from_unix_stream(stream: UnixStream) -> Self {
+    pub(crate) fn from_unix_stream(
+        stream: UnixStream,
+        source_port: Option<u32>,
+        destination_port: u32,
+        lease: Option<VsockLease>,
+    ) -> Self {
         Self {
             inner: VsockStreamInner::Unix(stream),
+            source_port,
+            destination_port,
+            _lease: lease,
+            _synthetic_source: None,
+        }
+    }
+
+    pub(crate) fn from_synthetic_unix_stream(
+        stream: UnixStream,
+        source: SyntheticPortLease,
+        destination_port: u32,
+        lease: VsockLease,
+    ) -> Self {
+        Self {
+            inner: VsockStreamInner::Unix(stream),
+            source_port: Some(source.port()),
+            destination_port,
+            _lease: Some(lease),
+            _synthetic_source: Some(source),
         }
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn from_vz(stream: vz::device::VirtioSocketConnection) -> Self {
+    pub(crate) fn from_vz(
+        stream: vz::device::VirtioSocketConnection,
+        lease: Option<VsockLease>,
+    ) -> Self {
+        let source_port = stream.source_port();
+        let destination_port = stream.destination_port();
         Self {
             inner: VsockStreamInner::Vz(stream),
+            source_port: Some(source_port),
+            destination_port,
+            _lease: lease,
+            _synthetic_source: None,
         }
     }
 
-    /// Guest-side source port, when the transport reports one.
+    /// Source endpoint port, when the backend reports or synthesizes one.
     pub fn source_port(&self) -> Option<u32> {
-        match &self.inner {
-            VsockStreamInner::Unix(_) => None,
-            #[cfg(target_os = "macos")]
-            VsockStreamInner::Vz(stream) => Some(stream.source_port()),
-        }
+        self.source_port
     }
 
-    /// Guest-side destination port; `0` when the transport does not track it.
+    /// Destination endpoint port for this connection.
     pub fn destination_port(&self) -> u32 {
-        match &self.inner {
-            VsockStreamInner::Unix(_) => 0,
-            #[cfg(target_os = "macos")]
-            VsockStreamInner::Vz(stream) => stream.destination_port(),
-        }
+        self.destination_port
+    }
+
+    pub(crate) fn owns_capacity(&self, capacity: &VsockCapacity) -> bool {
+        self._lease
+            .as_ref()
+            .is_some_and(|lease| capacity.owns(lease))
     }
 
     /// Duplicate the underlying descriptor as an owned, non-blocking fd.
@@ -71,11 +114,53 @@ impl VsockStream {
             VsockStreamInner::Vz(stream) => duplicate_nonblocking_fd(stream),
         }
     }
+
+    fn attach_listener_lease(
+        mut self,
+        registered_port: u32,
+        capacity: &VsockCapacity,
+    ) -> Result<Self, VirtError> {
+        if self.destination_port != registered_port {
+            return Err(VirtError::Backend(format!(
+                "backend accepted vsock destination {} on listener port {registered_port}",
+                self.destination_port
+            )));
+        }
+        match self._lease.as_ref() {
+            Some(lease) if capacity.owns(lease) => Ok(self),
+            Some(_) => Err(VirtError::Backend(
+                "backend returned a vsock stream with a foreign capacity lease".to_string(),
+            )),
+            None => {
+                self._lease = Some(capacity.reserve()?);
+                Ok(self)
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn into_unix_stream(self) -> Result<UnixStream, VirtError> {
+        let VsockStreamInner::Unix(stream) = self.inner;
+        Ok(stream)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn into_unix_stream(self) -> Result<UnixStream, VirtError> {
+        match self.inner {
+            VsockStreamInner::Unix(stream) => Ok(stream),
+            VsockStreamInner::Vz(_) => Err(VirtError::Backend(
+                "synthetic source ports require a Unix stream".to_string(),
+            )),
+        }
+    }
 }
 
 impl fmt::Debug for VsockStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VsockStream").finish_non_exhaustive()
+        f.debug_struct("VsockStream")
+            .field("source_port", &self.source_port)
+            .field("destination_port", &self.destination_port)
+            .finish_non_exhaustive()
     }
 }
 
@@ -123,9 +208,16 @@ impl AsyncWrite for VsockStream {
     }
 }
 
-/// A host-side listener for guest-initiated vsock connections.
+/// A retained registration for one host endpoint port.
+///
+/// Each accepted guest-initiated connection consumes capacity shared with all
+/// host-initiated connections for the same machine. Dropping the listener also
+/// drops the backend registration.
 pub struct VsockListener {
     inner: VsockListenerInner,
+    registered_port: u32,
+    capacity: VsockCapacity,
+    synthetic_sources: Option<SyntheticPortAllocator>,
 }
 
 enum VsockListenerInner {
@@ -135,53 +227,174 @@ enum VsockListenerInner {
 }
 
 impl VsockListener {
-    pub fn from_unix_listener(listener: UnixListener) -> Self {
+    pub(crate) fn from_unix_listener(
+        listener: UnixListener,
+        registered_port: u32,
+        capacity: VsockCapacity,
+    ) -> Self {
         Self {
             inner: VsockListenerInner::Unix(listener),
+            registered_port,
+            capacity,
+            synthetic_sources: None,
+        }
+    }
+
+    pub(crate) fn from_mock_unix_listener(
+        listener: UnixListener,
+        registered_port: u32,
+        capacity: VsockCapacity,
+        synthetic_sources: SyntheticPortAllocator,
+    ) -> Self {
+        Self {
+            inner: VsockListenerInner::Unix(listener),
+            registered_port,
+            capacity,
+            synthetic_sources: Some(synthetic_sources),
         }
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn from_vz(listener: vz::device::VirtioSocketListener) -> Self {
+    pub(crate) fn from_vz(
+        listener: vz::device::VirtioSocketListener,
+        registered_port: u32,
+        capacity: VsockCapacity,
+    ) -> Self {
         Self {
             inner: VsockListenerInner::Vz(listener),
+            registered_port,
+            capacity,
+            synthetic_sources: None,
         }
+    }
+
+    pub fn port(&self) -> u32 {
+        self.registered_port
+    }
+
+    pub(crate) fn owns_capacity(&self, capacity: &VsockCapacity) -> bool {
+        self.capacity.shares_limit_with(capacity)
     }
 
     /// Wait for the next guest-initiated connection.
-    pub async fn accept(&mut self) -> io::Result<VsockStream> {
-        match &mut self.inner {
-            VsockListenerInner::Unix(listener) => listener
-                .accept()
-                .await
-                .map(|(stream, _)| VsockStream::from_unix_stream(stream)),
+    pub async fn accept(&mut self) -> Result<VsockStream, VirtError> {
+        let stream = match &mut self.inner {
+            VsockListenerInner::Unix(listener) => listener.accept().await.map(|(stream, _)| {
+                VsockStream::from_unix_stream(stream, None, self.registered_port, None)
+            })?,
             #[cfg(target_os = "macos")]
             VsockListenerInner::Vz(listener) => listener
                 .accept()
                 .await
-                .map(VsockStream::from_vz)
-                .map_err(io::Error::other),
-        }
+                .map(|stream| VsockStream::from_vz(stream, None))
+                .map_err(io::Error::other)?,
+        };
+        self.admit(stream)
     }
 
     /// Accept a queued connection without waiting; `Ok(None)` when none is pending.
-    pub fn try_accept(&mut self) -> io::Result<Option<VsockStream>> {
-        match &mut self.inner {
-            VsockListenerInner::Unix(listener) => {
-                try_accept_unix(listener).map(|stream| stream.map(VsockStream::from_unix_stream))
-            }
+    pub fn try_accept(&mut self) -> Result<Option<VsockStream>, VirtError> {
+        let stream = match &mut self.inner {
+            VsockListenerInner::Unix(listener) => try_accept_unix(listener)?.map(|stream| {
+                VsockStream::from_unix_stream(stream, None, self.registered_port, None)
+            }),
             #[cfg(target_os = "macos")]
             VsockListenerInner::Vz(listener) => listener
                 .try_accept()
-                .map(|stream| stream.map(VsockStream::from_vz))
-                .map_err(io::Error::other),
+                .map(|stream| stream.map(|stream| VsockStream::from_vz(stream, None)))
+                .map_err(io::Error::other)?,
+        };
+        stream.map(|stream| self.admit(stream)).transpose()
+    }
+
+    fn admit(&self, stream: VsockStream) -> Result<VsockStream, VirtError> {
+        let Some(synthetic_sources) = self.synthetic_sources.as_ref() else {
+            return stream.attach_listener_lease(self.registered_port, &self.capacity);
+        };
+
+        if stream.destination_port() != self.registered_port {
+            return Err(VirtError::Backend(format!(
+                "backend accepted vsock destination {} on listener port {}",
+                stream.destination_port(),
+                self.registered_port
+            )));
         }
+        let lease = self.capacity.reserve()?;
+        let source = synthetic_sources.allocate()?;
+        let stream = stream.into_unix_stream()?;
+        Ok(VsockStream::from_synthetic_unix_stream(
+            stream,
+            source,
+            self.registered_port,
+            lease,
+        ))
     }
 }
 
 impl fmt::Debug for VsockListener {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VsockListener").finish_non_exhaustive()
+        f.debug_struct("VsockListener")
+            .field("registered_port", &self.registered_port)
+            .finish_non_exhaustive()
+    }
+}
+
+const SYNTHETIC_SOURCE_BASE: u32 = 1 << 30;
+const SYNTHETIC_SOURCE_COUNT: usize = 1024;
+
+/// Per-mock-machine deterministic high-range source ports for protocol tests.
+#[derive(Clone, Debug)]
+pub(crate) struct SyntheticPortAllocator {
+    slots: Arc<Mutex<Vec<bool>>>,
+}
+
+impl SyntheticPortAllocator {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: Arc::new(Mutex::new(vec![false; SYNTHETIC_SOURCE_COUNT])),
+        }
+    }
+
+    pub(crate) fn allocate(&self) -> Result<SyntheticPortLease, VirtError> {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let index = slots
+            .iter()
+            .position(|used| !used)
+            .ok_or_else(|| VirtError::Backend("mock source port range exhausted".to_string()))?;
+        slots[index] = true;
+        drop(slots);
+        Ok(SyntheticPortLease {
+            slots: self.slots.clone(),
+            index,
+        })
+    }
+}
+
+pub(crate) struct SyntheticPortLease {
+    slots: Arc<Mutex<Vec<bool>>>,
+    index: usize,
+}
+
+impl SyntheticPortLease {
+    fn port(&self) -> u32 {
+        SYNTHETIC_SOURCE_BASE + u32::try_from(self.index).map_or(0, |index| index)
+    }
+}
+
+impl Drop for SyntheticPortLease {
+    fn drop(&mut self) {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = slots.get_mut(self.index) {
+            *slot = false;
+        }
+    }
+}
+
+impl fmt::Debug for SyntheticPortLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SyntheticPortLease")
+            .field("port", &self.port())
+            .finish()
     }
 }
 
@@ -421,7 +634,11 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{UnixListener, UnixStream};
 
-    use super::{SerialDevice, VsockListener, VsockStream};
+    use crate::virt::capacity::VsockCapacity;
+    use crate::virt::stream::{
+        SerialDevice, SyntheticPortAllocator, VsockListener, VsockStream, SYNTHETIC_SOURCE_BASE,
+    };
+    use crate::virt::VirtError;
 
     fn temp_socket_path(name: &str) -> PathBuf {
         let now = SystemTime::now()
@@ -439,8 +656,11 @@ mod tests {
             .expect("right stream should be nonblocking");
 
         let stream = UnixStream::from_std(right).expect("tokio unix stream should wrap std stream");
-        let stream = VsockStream::from_unix_stream(stream);
+        let stream = VsockStream::from_unix_stream(stream, None, 7000, None);
         let duplicated = stream.dup_fd().expect("dup fd should succeed");
+
+        assert_eq!(stream.source_port(), None);
+        assert_eq!(stream.destination_port(), 7000);
 
         let raw_flags = unsafe { libc::fcntl(duplicated.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(raw_flags, -1, "fcntl should succeed");
@@ -466,7 +686,8 @@ mod tests {
     async fn unix_listener_accepts_vsock_streams() {
         let path = temp_socket_path("accept");
         let listener = UnixListener::bind(&path).expect("listener should bind");
-        let mut listener = VsockListener::from_unix_listener(listener);
+        let capacity = VsockCapacity::test_with_limit("listener", 1);
+        let mut listener = VsockListener::from_unix_listener(listener, 7001, capacity);
 
         let client = tokio::spawn(UnixStream::connect(path.clone()));
         let accepted = listener.accept().await.expect("accept should succeed");
@@ -475,7 +696,9 @@ mod tests {
             .expect("client task should complete")
             .expect("client should connect");
 
-        assert_eq!(accepted.destination_port(), 0);
+        assert_eq!(listener.port(), 7001);
+        assert_eq!(accepted.source_port(), None);
+        assert_eq!(accepted.destination_port(), 7001);
         let _ = std::fs::remove_file(path);
     }
 
@@ -483,13 +706,88 @@ mod tests {
     async fn try_accept_returns_none_when_no_connection_is_pending() {
         let path = temp_socket_path("try-accept");
         let listener = UnixListener::bind(&path).expect("listener should bind");
-        let mut listener = VsockListener::from_unix_listener(listener);
+        let capacity = VsockCapacity::test_with_limit("listener", 1);
+        let mut listener = VsockListener::from_unix_listener(listener, 7002, capacity);
 
         assert!(listener
             .try_accept()
             .expect("try_accept should succeed")
             .is_none());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn listener_rejects_overload_and_recovers_after_stream_drop() {
+        let path = temp_socket_path("capacity");
+        let listener = UnixListener::bind(&path).expect("listener should bind");
+        let capacity = VsockCapacity::test_with_limit("listener-capacity", 1);
+        let mut listener = VsockListener::from_unix_listener(listener, 7003, capacity.clone());
+
+        let first_client = UnixStream::connect(&path).await.expect("first connect");
+        let first = listener.accept().await.expect("first accept");
+        assert_eq!(capacity.available_permits(), 0);
+
+        let mut overloaded_client = UnixStream::connect(&path).await.expect("second connect");
+        let error = listener
+            .accept()
+            .await
+            .expect_err("second accept is rejected");
+        assert!(matches!(
+            error,
+            VirtError::VsockCapacityExhausted { machine, limit }
+                if machine == "listener-capacity" && limit == 1
+        ));
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            overloaded_client
+                .read(&mut byte)
+                .await
+                .expect("rejected stream closes"),
+            0
+        );
+
+        drop(first);
+        drop(first_client);
+        let _third_client = UnixStream::connect(&path).await.expect("third connect");
+        let third = listener.accept().await.expect("capacity was released");
+        assert_eq!(third.destination_port(), 7003);
+        drop(third);
+        assert_eq!(capacity.available_permits(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn synthetic_source_ports_are_bounded_unique_and_reused() {
+        let allocator = SyntheticPortAllocator::new();
+        let leases = (0..1024)
+            .map(|_| allocator.allocate().expect("source port in range"))
+            .collect::<Vec<_>>();
+        let ports = leases.iter().map(|lease| lease.port()).collect::<Vec<_>>();
+
+        assert_eq!(ports[0], SYNTHETIC_SOURCE_BASE);
+        assert_eq!(ports[1023], SYNTHETIC_SOURCE_BASE + 1023);
+        assert!(allocator.allocate().is_err());
+
+        drop(leases);
+        assert_eq!(
+            allocator.allocate().expect("released source port").port(),
+            SYNTHETIC_SOURCE_BASE
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_does_not_double_account_an_existing_lease() {
+        let (stream, _peer) = UnixStream::pair().expect("unix stream pair");
+        let capacity = VsockCapacity::test_with_limit("existing-lease", 1);
+        let lease = capacity.reserve().expect("reserve listener stream");
+        let stream = VsockStream::from_unix_stream(stream, Some(8000), 7004, Some(lease));
+
+        let stream = stream
+            .attach_listener_lease(7004, &capacity)
+            .expect("existing lease is retained");
+        assert_eq!(capacity.available_permits(), 0);
+        drop(stream);
+        assert_eq!(capacity.available_permits(), 1);
     }
 
     #[tokio::test]
