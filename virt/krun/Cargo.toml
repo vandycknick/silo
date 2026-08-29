@@ -9,11 +9,13 @@ path = "src/bin/krun.rs"
 required-features = ["krun-bin"]
 
 [features]
-krun-bin = ["dep:bzip2", "dep:libkrun"]
+krun-bin = ["dep:bzip2", "dep:libkrun", "dep:libkrun-nix-features"]
 
 [dependencies]
 utils = { path = "../../common/utils" }
 libkrun = { workspace = true, optional = true }
+# libkrun v2's vhost-user code uses ancillary messages without enabling nix's uio feature.
+libkrun-nix-features = { package = "nix", version = "0.30.1", features = ["uio"], optional = true }
 clap = { version = "4.6.4", features = ["derive"] }
 eyre = "0.6.12"
 nix = { version = "0.31.3", features = ["fs", "poll", "socket", "term"] }

@@ -12,16 +12,31 @@ The workspace dependency is pinned by full Git commit in the root
 
 ```text
 repository: https://github.com/vandycknick/libkrun.git
-branch:     silo/stable-1.19.x
-upstream:   v1.19.4
-revision:   1b69e60ed03f58fe13bcd7b6f684aa71a404b0f9
+branch:     silo/v2 (local until manually published)
+upstream:   0d75eb4b9d7f742e9b290b7372e4be491e68b173 (v2 main)
+revision:   10b6f752ba8ea735c3d9edaa549599dcf3f98d18
 ```
 
 Release builds must use the committed `Cargo.lock` with `--locked`. A branch
 or tag is useful for reviewing the fork, but neither replaces the immutable
 commit pin.
 
-The fork carries two fixes on top of upstream `v1.19.4`:
+Until the branch is published, Cargo commands that activate `krun-bin` must
+resolve the normal repository URL through the local checkout without modifying
+repository or user configuration:
+
+```bash
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=url.file:///home/nickvd/Projects/libkrun.insteadOf
+export GIT_CONFIG_VALUE_0=https://github.com/vandycknick/libkrun.git
+```
+
+These variables are temporary implementation plumbing. Once the exact revision
+is available from the fork, unset them and verify the build through the normal
+GitHub source before publishing Silo.
+
+The fork carries two fixes on top of the recorded upstream v2 commit:
 
 1. Released Unix vsock proxies close their host endpoint immediately while
    retaining deferred proxy cleanup. This fixes the five-second EOF delay in
@@ -40,17 +55,34 @@ Silo disables libkrun's default features and enables only:
 ```text
 blk
 net
+vhost-user
 ```
 
 `blk` provides the raw virtio-block path used by Silo disks. `net` provides
-the Unix datagram, Unix stream, and Linux TAP networking paths. The helper's
-private adapter calls those APIs directly, so Cargo compilation verifies that
-both features are present.
+the Unix datagram, Unix stream, and Linux TAP networking paths. `vhost-user`
+provides the explicit device API needed by ADR 0015's later Linux backend; S2
+enables the API but retains libkrun's built-in per-port vsock bridge. The
+helper's private adapter calls the block and network APIs directly.
 
-The upstream `init-blob` default feature remains disabled. Silo supplies an
-explicit kernel and optional initramfs, disables libkrun's implicit devices,
-and does not use the fallback firmware path. Consequently, Silo neither
-builds nor packages `libkrunfw`.
+The `krun-bin` feature also unifies nix 0.30's `uio` feature into libkrun's
+device graph. The pinned v2 `krun-devices` manifest enables `socket` for its
+vhost-user frontend but omits the `uio` feature required by `sendmsg` and
+`ControlMessage`. This private feature carrier can be removed when that
+dependency edge is fixed in the pinned fork or upstream.
+
+The committed lockfile also retains `kvm-bindings 0.14.0` and `imago 0.2.3`
+for libkrun's graph, matching the fork's tested lockfile. `kvm-bindings 0.14.1`
+selects an incompatible `vmm-sys-util` type for libkrun's CPUID code, while
+`imago 0.2.4` selects `vm-memory 0.18` instead of the `0.17` types used by
+libkrun devices. Review these pins on every libkrun update rather than allowing
+an incidental transitive update.
+
+Libkrun v2 has no implicit console or vsock devices and no longer injects a
+default init binary. Its retained `krun_disable_implicit_init()` symbol returns
+`-ENOTSUP`, so Silo does not call it. Silo supplies an explicit kernel and
+optional initramfs, adds its console and transitional vsock device explicitly,
+and does not use the fallback firmware path. Consequently, Silo neither builds
+nor packages `libkrunfw`.
 
 ## Build
 
@@ -59,6 +91,9 @@ Build the self-contained helper with:
 ```bash
 cargo build --locked -p krun --features krun-bin --bin krun
 ```
+
+While the pinned revision remains unpublished, set the process-scoped rewrite
+variables from [Source Pin](#source-pin) in the shell running this command.
 
 For a release build:
 
@@ -87,7 +122,7 @@ For each upstream update:
 2. Check whether each downstream fix has landed upstream.
 3. Apply only the fixes that remain necessary as focused commits.
 4. Run the fork's targeted regression tests on x86_64 Linux and arm64 macOS.
-5. Build the fork with default features disabled and `blk,net` enabled.
+5. Build the fork with default features disabled and `blk,net,vhost-user` enabled.
 6. Update the full Git revision in the root `Cargo.toml`.
 7. Regenerate and commit `Cargo.lock`.
 8. Review the helper's private constants against upstream `include/libkrun.h`.

@@ -61,27 +61,6 @@ impl Context {
         )
     }
 
-    pub(crate) fn disable_implicit_console(&self) -> Result<(), Error> {
-        check(
-            "disable_implicit_console",
-            libkrun::krun_disable_implicit_console(self.id),
-        )
-    }
-
-    pub(crate) fn disable_implicit_init(&self) -> Result<(), Error> {
-        check(
-            "disable_implicit_init",
-            libkrun::krun_disable_implicit_init(self.id),
-        )
-    }
-
-    pub(crate) fn disable_implicit_vsock(&self) -> Result<(), Error> {
-        check(
-            "disable_implicit_vsock",
-            libkrun::krun_disable_implicit_vsock(self.id),
-        )
-    }
-
     pub(crate) fn set_kernel(
         &self,
         kernel: &Path,

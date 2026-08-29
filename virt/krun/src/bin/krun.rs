@@ -225,9 +225,6 @@ fn start_enter(config: &KrunConfig) -> eyre::Result<()> {
 
 fn configure_ctx(context: &context::Context, config: &KrunConfig) -> eyre::Result<()> {
     context.set_vm_config(config.cpus, config.memory_mib)?;
-    context.disable_implicit_console()?;
-    context.disable_implicit_init()?;
-    context.disable_implicit_vsock()?;
 
     if let Some(kernel) = config.kernel.as_ref() {
         let cmdline = (!config.cmdline.is_empty()).then(|| config.cmdline.join(" "));
@@ -369,5 +366,29 @@ mod tests {
     fn host_check_is_exclusive_with_vm_arguments() {
         assert!(Cli::try_parse_from(["krun", "--check-host"]).is_ok());
         assert!(Cli::try_parse_from(["krun", "--check-host", "--cpus", "2"]).is_err());
+    }
+
+    #[test]
+    fn parses_transitional_core_vsock_ports() {
+        let config = Cli::try_parse_from([
+            "krun",
+            "--kernel",
+            "/kernel",
+            "--vsock-port",
+            "22:/tmp/ssh.sock:connect",
+            "--vsock-port",
+            "1027:/tmp/agent.sock:connect",
+        ])
+        .expect("core vsock arguments should parse")
+        .into_config()
+        .expect("core vsock arguments should produce a config");
+
+        assert_eq!(config.vsock_ports.len(), 2);
+        assert_eq!(config.vsock_ports[0].port, 22);
+        assert_eq!(config.vsock_ports[0].path, Path::new("/tmp/ssh.sock"));
+        assert!(config.vsock_ports[0].listen);
+        assert_eq!(config.vsock_ports[1].port, 1027);
+        assert_eq!(config.vsock_ports[1].path, Path::new("/tmp/agent.sock"));
+        assert!(config.vsock_ports[1].listen);
     }
 }

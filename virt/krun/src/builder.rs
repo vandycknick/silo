@@ -323,10 +323,10 @@ fn open_krun_serial_pty() -> io::Result<KrunSerialPty> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
-    use crate::{Disk, VirtualMachineBuilder};
+    use crate::{Disk, VirtualMachineBuilder, VsockPort};
 
     use crate::builder::{command_args, format_command};
 
@@ -394,6 +394,39 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "vm123"));
         assert!(args.iter().any(|arg| arg == "/tmp/gvproxy.sock"));
         assert!(args.iter().any(|arg| arg == "02:94:ef:e4:0c:ee"));
+    }
+
+    #[test]
+    fn start_arguments_preserve_transitional_core_vsock_ports() {
+        let config = VirtualMachineBuilder::new("krun")
+            .kernel("/kernel")
+            .vsock_port(VsockPort {
+                port: 22,
+                path: PathBuf::from("/tmp/ssh.sock"),
+                listen: true,
+            })
+            .vsock_port(VsockPort {
+                port: 1027,
+                path: PathBuf::from("/tmp/agent.sock"),
+                listen: true,
+            })
+            .build()
+            .expect("config should be valid");
+
+        let args = command_args(&config);
+        let mappings = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--vsock-port")
+            .map(|pair| pair[1].clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            mappings,
+            [
+                OsString::from("22:/tmp/ssh.sock:connect"),
+                OsString::from("1027:/tmp/agent.sock:connect"),
+            ]
+        );
     }
 
     #[test]
