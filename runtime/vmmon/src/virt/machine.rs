@@ -99,6 +99,10 @@ impl VirtualMachine {
         self.inner.vsock_capacity.reserve()
     }
 
+    pub(crate) fn vsock_capacity_exhausted(&self) -> bool {
+        self.inner.vsock_capacity.is_exhausted()
+    }
+
     /// Connect using a reservation acquired by an earlier protocol stage.
     pub(crate) async fn connect_vsock_reserved(
         &self,

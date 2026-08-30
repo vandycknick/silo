@@ -8,8 +8,8 @@
 //! `Unix` variants; the Virtualization.framework backend has its own.
 //!
 //! Listener admission is enforced before a stream leaves this abstraction.
-//! VZ currently performs that check after its delegate has accepted and queued
-//! the connection; callback-time admission and a bounded delegate queue are S6.
+//! VZ reserves capacity in its synchronous framework callback and transports
+//! the same lease into this common stream wrapper without double accounting.
 
 use std::fmt;
 use std::fs::File;
@@ -18,6 +18,9 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{ready, Context, Poll};
+
+#[cfg(target_os = "macos")]
+use std::collections::VecDeque;
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
@@ -223,7 +226,10 @@ pub struct VsockListener {
 enum VsockListenerInner {
     Unix(UnixListener),
     #[cfg(target_os = "macos")]
-    Vz(vz::device::VirtioSocketListener),
+    Vz {
+        listener: vz::device::VirtioSocketListener,
+        accepted_leases: Arc<Mutex<VecDeque<VsockLease>>>,
+    },
 }
 
 impl VsockListener {
@@ -259,9 +265,13 @@ impl VsockListener {
         listener: vz::device::VirtioSocketListener,
         registered_port: u32,
         capacity: VsockCapacity,
+        accepted_leases: Arc<Mutex<VecDeque<VsockLease>>>,
     ) -> Self {
         Self {
-            inner: VsockListenerInner::Vz(listener),
+            inner: VsockListenerInner::Vz {
+                listener,
+                accepted_leases,
+            },
             registered_port,
             capacity,
             synthetic_sources: None,
@@ -283,11 +293,22 @@ impl VsockListener {
                 VsockStream::from_unix_stream(stream, None, self.registered_port, None)
             })?,
             #[cfg(target_os = "macos")]
-            VsockListenerInner::Vz(listener) => listener
-                .accept()
-                .await
-                .map(|stream| VsockStream::from_vz(stream, None))
-                .map_err(io::Error::other)?,
+            VsockListenerInner::Vz {
+                listener,
+                accepted_leases,
+            } => {
+                let accepted = listener.accept().await;
+                let lease = take_vz_accepted_lease(accepted_leases);
+                match (accepted, lease) {
+                    (Ok(stream), Some(lease)) => VsockStream::from_vz(stream, Some(lease)),
+                    (Ok(_), None) => {
+                        return Err(VirtError::Backend(
+                            "VZ accepted a vsock connection without vmmon admission".to_string(),
+                        ));
+                    }
+                    (Err(error), _) => return Err(io::Error::other(error).into()),
+                }
+            }
         };
         self.admit(stream)
     }
@@ -299,10 +320,24 @@ impl VsockListener {
                 VsockStream::from_unix_stream(stream, None, self.registered_port, None)
             }),
             #[cfg(target_os = "macos")]
-            VsockListenerInner::Vz(listener) => listener
-                .try_accept()
-                .map(|stream| stream.map(|stream| VsockStream::from_vz(stream, None)))
-                .map_err(io::Error::other)?,
+            VsockListenerInner::Vz {
+                listener,
+                accepted_leases,
+            } => match listener.try_accept() {
+                Ok(Some(stream)) => {
+                    let lease = take_vz_accepted_lease(accepted_leases).ok_or_else(|| {
+                        VirtError::Backend(
+                            "VZ accepted a vsock connection without vmmon admission".to_string(),
+                        )
+                    })?;
+                    Some(VsockStream::from_vz(stream, Some(lease)))
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    let _ = take_vz_accepted_lease(accepted_leases);
+                    return Err(io::Error::other(error).into());
+                }
+            },
         };
         stream.map(|stream| self.admit(stream)).transpose()
     }
@@ -329,6 +364,14 @@ impl VsockListener {
             lease,
         ))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn take_vz_accepted_lease(accepted_leases: &Mutex<VecDeque<VsockLease>>) -> Option<VsockLease> {
+    accepted_leases
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .pop_front()
 }
 
 impl fmt::Debug for VsockListener {

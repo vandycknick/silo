@@ -5,10 +5,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::virt::{VirtualMachine, VsockLease};
+use crate::virt::VirtualMachine;
 use crate::vsock::relay;
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_COMMAND_BYTES: usize = 32;
 
 pub(crate) async fn serve(
@@ -34,18 +34,15 @@ pub(crate) async fn serve(
                             continue;
                         }
                     };
-                    let lease = match machine.reserve_vsock() {
-                        Ok(lease) => lease,
-                        Err(error) => {
-                            tracing::warn!(machine = machine.name(), %error, "rejected vsock mux connection at stream limit");
-                            continue;
-                        }
-                    };
+                    if machine.vsock_capacity_exhausted() {
+                        tracing::warn!(machine = machine.name(), "rejected vsock mux connection at active connection limit");
+                        continue;
+                    }
                     tracing::debug!(uid = credentials.uid(), pid = ?credentials.pid(), "accepted vsock mux connection");
                     let machine = machine.clone();
                     let shutdown = shutdown.clone();
                     connections.spawn(async move {
-                        if let Err(error) = handle_connection(stream, machine, lease, shutdown).await {
+                        if let Err(error) = handle_connection(stream, machine, shutdown).await {
                             tracing::debug!(%error, "closed vsock mux connection without acknowledgement");
                         }
                     });
@@ -69,17 +66,16 @@ fn peer_uid_authorized(owner_uid: u32, peer_uid: u32) -> bool {
 async fn handle_connection(
     mut client: UnixStream,
     machine: VirtualMachine,
-    lease: VsockLease,
     shutdown: CancellationToken,
 ) -> eyre::Result<()> {
     let port = tokio::select! {
-        result = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_command(&mut client)) => result
-            .map_err(|_| eyre::eyre!("vsock mux handshake timed out"))??,
+        result = read_command(&mut client) => result?,
         _ = shutdown.cancelled() => return Ok(()),
     };
+    let lease = machine.reserve_vsock()?;
     let mut guest = tokio::select! {
         result = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
+            CONNECTION_REQUEST_TIMEOUT,
             machine.connect_vsock_reserved(port, lease),
         ) => result.map_err(|_| eyre::eyre!("guest vsock connection timed out"))??,
         _ = shutdown.cancelled() => return Ok(()),

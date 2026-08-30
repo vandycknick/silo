@@ -1,8 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{ready, Context, Poll};
 
@@ -10,7 +13,7 @@ use block2::StackBlock;
 use nix::unistd::dup;
 use objc2::{
     define_class, msg_send, rc::Retained, runtime::ProtocolObject, AllocAnyThread, ClassType,
-    DefinedClass,
+    DefinedClass, Message,
 };
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
 use objc2_virtualization::{
@@ -25,18 +28,76 @@ use tokio::sync::{mpsc, oneshot};
 use crate::dispatch::{DispatchQueueExt, Queue};
 use crate::error::VzError;
 
-type ListenerRegistry = Arc<Mutex<HashMap<usize, HashSet<u32>>>>;
-type ListenerDelegate = Retained<ProtocolObject<dyn VZVirtioSocketListenerDelegate>>;
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SocketListenerRegistry {
+    entries: Arc<Mutex<HashMap<(usize, u32), u64>>>,
+    next_generation: Arc<AtomicU64>,
+    operation: Arc<Mutex<()>>,
+}
+
+/// Port metadata for a guest connection proposed by Virtualization.framework.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketConnectionRequest {
+    source_port: u32,
+    destination_port: u32,
+}
+
+impl SocketConnectionRequest {
+    pub fn source_port(&self) -> u32 {
+        self.source_port
+    }
+
+    pub fn destination_port(&self) -> u32 {
+        self.destination_port
+    }
+}
+
+type ShouldAcceptConnection = Arc<dyn Fn(SocketConnectionRequest) -> bool + Send + Sync + 'static>;
 
 struct VsockListenerDelegateIvars {
-    sender: mpsc::UnboundedSender<Result<PendingConnection, VzError>>,
+    sender: mpsc::UnboundedSender<PendingConnection>,
+    should_accept: ShouldAcceptConnection,
+    queue: Queue,
 }
 
 struct PendingConnection {
     fd: OwnedFd,
     source_port: u32,
     destination_port: u32,
+    connection: QueueRetained<VZVirtioSocketConnection>,
 }
+
+struct QueueRetained<T: Message + 'static> {
+    pointer: usize,
+    queue: Queue,
+    marker: PhantomData<Retained<T>>,
+}
+
+impl<T: Message + 'static> QueueRetained<T> {
+    fn new(value: Retained<T>, queue: Queue) -> Self {
+        Self {
+            pointer: Retained::into_raw(value) as usize,
+            queue,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Message + 'static> Drop for QueueRetained<T> {
+    fn drop(&mut self) {
+        let pointer = self.pointer;
+        self.queue
+            .exec_block_async(&StackBlock::new(move || unsafe {
+                if let Some(value) = Retained::from_raw(pointer as *mut T) {
+                    drop(value);
+                }
+            }));
+    }
+}
+
+// SAFETY: Tokio threads carry only a +1 raw retain token. Drop schedules the
+// matching release on the VM queue, and the framework object is never accessed.
+unsafe impl<T: Message + 'static> Send for QueueRetained<T> {}
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -56,16 +117,37 @@ define_class!(
             let borrowed = BorrowedFd::borrow_raw(file_descriptor);
             let source_port = connection.sourcePort();
             let destination_port = connection.destinationPort();
+            let fd = match dup(borrowed) {
+                Ok(fd) => fd,
+                Err(err) => {
+                    tracing::warn!(%err, "rejected VZ vsock connection whose fd could not be duplicated");
+                    return false;
+                }
+            };
+            let connection = QueueRetained::new(
+                connection.retain(),
+                self.ivars().queue.clone(),
+            );
+            let request = SocketConnectionRequest {
+                source_port,
+                destination_port,
+            };
+            match catch_unwind(AssertUnwindSafe(|| (self.ivars().should_accept)(request))) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(_) => {
+                    tracing::warn!("rejected VZ vsock connection after acceptance hook panicked");
+                    return false;
+                }
+            }
+            let pending = PendingConnection {
+                fd,
+                source_port,
+                destination_port,
+                connection,
+            };
 
-            let result = dup(borrowed)
-                .map_err(|err| VzError::Backend(format!("duplicate vsock fd: {err}")))
-                .map(|fd| PendingConnection {
-                    fd,
-                    source_port,
-                    destination_port,
-                });
-
-            match self.ivars().sender.send(result) {
+            match self.ivars().sender.send(pending) {
                 Ok(()) => true,
                 Err(err) => {
                     tracing::warn!(error = %err, "dropping accepted vsock connection because listener is gone");
@@ -81,41 +163,17 @@ define_class!(
 
 impl VsockListenerDelegate {
     fn new_protocol_object(
-        sender: mpsc::UnboundedSender<Result<PendingConnection, VzError>>,
-    ) -> ListenerDelegate {
-        let delegate = Self::alloc().set_ivars(VsockListenerDelegateIvars { sender });
-        let delegate: Retained<Self> = unsafe { msg_send![super(delegate), init] };
-        ProtocolObject::from_retained(delegate)
+        sender: mpsc::UnboundedSender<PendingConnection>,
+        should_accept: ShouldAcceptConnection,
+        queue: Queue,
+    ) -> Retained<Self> {
+        let delegate = Self::alloc().set_ivars(VsockListenerDelegateIvars {
+            sender,
+            should_accept,
+            queue,
+        });
+        unsafe { msg_send![super(delegate), init] }
     }
-}
-
-#[allow(async_fn_in_trait)]
-pub trait SocketDevice: Send + Sync {
-    type Connection: AsyncRead + AsyncWrite + AsRawFd + Send + Unpin + 'static;
-
-    type Listener;
-
-    /// Connect to a guest vsock port.
-    ///
-    /// Requests a connection to the specified port in the guest.
-    ///
-    /// Returns a connection object on success. The connection contains a source
-    /// port, a destination port, and a file descriptor that can be used to read
-    /// and write data.
-    async fn connect(&self, port: u32) -> Result<Self::Connection, VzError>;
-
-    /// Register a host-side listener for a guest-accessible vsock port.
-    ///
-    /// The listener receives connections initiated by the guest for the
-    /// specified port. Only one listener may be active for a given port on a
-    /// device at a time.
-    fn listen(&self, port: u32) -> Result<Self::Listener, VzError>;
-
-    /// Remove a previously-registered host-side listener.
-    ///
-    /// After removal, new guest connections to the specified port are no longer
-    /// accepted by the host.
-    fn remove_listener(&self, port: u32) -> Result<(), VzError>;
 }
 
 #[derive(Debug, Clone)]
@@ -147,7 +205,7 @@ pub struct VirtioSocketDevice {
     machine: Retained<VZVirtualMachine>,
     queue: Queue,
     index: usize,
-    listeners: ListenerRegistry,
+    listeners: SocketListenerRegistry,
 }
 
 // SAFETY: The device is only touched via the VM's serial dispatch queue.
@@ -160,7 +218,7 @@ impl VirtioSocketDevice {
         machine: Retained<VZVirtualMachine>,
         queue: Queue,
         index: usize,
-        listeners: ListenerRegistry,
+        listeners: SocketListenerRegistry,
     ) -> Self {
         Self {
             machine,
@@ -170,48 +228,33 @@ impl VirtioSocketDevice {
         }
     }
 
-    fn reserve_listener_port(&self, port: u32) -> Result<(), VzError> {
-        let mut guard = self
+    fn unregister_listener(&self, port: u32, generation: Option<u64>) -> Result<(), VzError> {
+        let _operation = self
             .listeners
+            .operation
             .lock()
-            .map_err(|_| VzError::Backend("listener registry lock poisoned".to_string()))?;
-
-        let ports = guard.entry(self.index).or_insert_with(HashSet::new);
-        if !ports.insert(port) {
-            return Err(VzError::Backend(format!(
-                "listener already registered on port {port} for device {}",
-                self.index
-            )));
-        }
-
-        Ok(())
-    }
-
-    fn release_listener_port(&self, port: u32) -> Result<bool, VzError> {
-        let mut guard = self
-            .listeners
-            .lock()
-            .map_err(|_| VzError::Backend("listener registry lock poisoned".to_string()))?;
-
-        let Some(ports) = guard.get_mut(&self.index) else {
-            return Ok(false);
+            .map_err(|_| VzError::Backend("listener operation lock poisoned".to_string()))?;
+        let should_remove = {
+            let mut entries = self
+                .listeners
+                .entries
+                .lock()
+                .map_err(|_| VzError::Backend("listener registry lock poisoned".to_string()))?;
+            let key = (self.index, port);
+            match generation {
+                Some(generation) if entries.get(&key) == Some(&generation) => {
+                    entries.remove(&key);
+                    true
+                }
+                Some(_) => false,
+                None => {
+                    entries.remove(&key);
+                    true
+                }
+            }
         };
-
-        let removed = ports.remove(&port);
-        if ports.is_empty() {
-            guard.remove(&self.index);
-        }
-
-        Ok(removed)
-    }
-
-    fn unregister_listener(&self, port: u32, require_registered: bool) -> Result<(), VzError> {
-        let removed = self.release_listener_port(port)?;
-        if require_registered && !removed {
-            return Err(VzError::Backend(format!(
-                "no listener on port {port} for device {}",
-                self.index
-            )));
+        if !should_remove {
+            return Ok(());
         }
 
         let machine = self.machine.clone();
@@ -255,13 +298,12 @@ impl VirtioSocketDevice {
     }
 }
 
-impl SocketDevice for VirtioSocketDevice {
-    type Connection = VirtioSocketConnection;
-    type Listener = VirtioSocketListener;
-
-    async fn connect(&self, port: u32) -> Result<Self::Connection, VzError> {
+impl VirtioSocketDevice {
+    /// Connect to a guest vsock port.
+    pub async fn connect(&self, port: u32) -> Result<VirtioSocketConnection, VzError> {
         let machine = self.machine.clone();
         let queue = self.queue.clone();
+        let connection_queue = self.queue.clone();
         let index = self.index;
         let (sender, receiver) = oneshot::channel();
         let shared_sender = Arc::new(Mutex::new(Some(sender)));
@@ -315,9 +357,11 @@ impl SocketDevice for VirtioSocketDevice {
                     let file_descriptor = connection.fileDescriptor();
                     let borrowed = BorrowedFd::borrow_raw(file_descriptor);
                     let source_port = connection.sourcePort();
+                    let connection =
+                        QueueRetained::new(connection.retain(), connection_queue.clone());
                     let result = dup(borrowed)
                         .map_err(|err| VzError::Backend(format!("duplicate vsock fd: {err}")))
-                        .map(|fd| (fd, source_port, port));
+                        .map(|fd| (fd, source_port, port, connection));
                     send_completion_once(&completion_sender, result);
                 },
             );
@@ -332,25 +376,45 @@ impl SocketDevice for VirtioSocketDevice {
                     "vsock completion channel closed before result was delivered".to_string(),
                 )
             })?
-            .and_then(|(fd, source_port, destination_port)| {
-                VirtioSocketConnection::new(fd, source_port, destination_port)
+            .and_then(|(fd, source_port, destination_port, connection)| {
+                VirtioSocketConnection::new(fd, source_port, destination_port, connection)
             })
     }
 
-    fn listen(&self, port: u32) -> Result<Self::Listener, VzError> {
-        self.reserve_listener_port(port)?;
+    /// Listen for guest connections to a host vsock port.
+    ///
+    /// `should_accept` is invoked synchronously on the VM queue for each proposed
+    /// connection and must return promptly. Registering again replaces the
+    /// existing listener on the port, matching Virtualization.framework.
+    pub fn listen<F>(&self, port: u32, should_accept: F) -> Result<VirtioSocketListener, VzError>
+    where
+        F: Fn(SocketConnectionRequest) -> bool + Send + Sync + 'static,
+    {
+        let _operation = self
+            .listeners
+            .operation
+            .lock()
+            .map_err(|_| VzError::Backend("listener operation lock poisoned".to_string()))?;
+        let generation = self
+            .listeners
+            .next_generation
+            .fetch_add(1, Ordering::Relaxed);
+        let should_accept: ShouldAcceptConnection = Arc::new(should_accept);
 
         let (sender, receiver) = mpsc::unbounded_channel();
-        let delegate = VsockListenerDelegate::new_protocol_object(sender);
-        let delegate_for_set = delegate.clone();
-
         let machine = self.machine.clone();
+        let retention_queue = self.queue.clone();
+        let delegate_queue = self.queue.clone();
         let index = self.index;
-        #[allow(clippy::arc_with_non_send_sync)]
         let listener_result = Arc::new(Mutex::new(None));
         let listener_result_out = listener_result.clone();
 
         self.queue.exec_block_sync(&StackBlock::new(move || unsafe {
+            let delegate = VsockListenerDelegate::new_protocol_object(
+                sender.clone(),
+                should_accept.clone(),
+                delegate_queue.clone(),
+            );
             let devices = machine.socketDevices();
             let result = if index >= devices.count() {
                 Err(VzError::Backend(
@@ -368,9 +432,13 @@ impl SocketDevice for VirtioSocketDevice {
                 };
 
                 let listener = VZVirtioSocketListener::new();
-                listener.setDelegate(Some(&*delegate_for_set));
+                let protocol_delegate = ProtocolObject::from_ref(&*delegate);
+                listener.setDelegate(Some(protocol_delegate));
                 vsock.setSocketListener_forPort(&listener, port);
-                Ok(listener)
+                Ok((
+                    QueueRetained::new(listener, retention_queue.clone()),
+                    QueueRetained::new(delegate, retention_queue.clone()),
+                ))
             };
 
             *listener_result_out
@@ -386,25 +454,26 @@ impl SocketDevice for VirtioSocketDevice {
                 VzError::Backend("failed to capture listener registration result".to_string())
             })?;
 
-        let listener = match listener {
-            Ok(listener) => listener,
-            Err(err) => {
-                let _ = self.release_listener_port(port);
-                return Err(err);
-            }
-        };
+        let (listener, delegate) = listener?;
+        self.listeners
+            .entries
+            .lock()
+            .map_err(|_| VzError::Backend("listener registry lock poisoned".to_string()))?
+            .insert((self.index, port), generation);
 
         Ok(VirtioSocketListener {
             device: self.clone(),
             port,
+            generation,
             receiver,
             _listener: listener,
             _delegate: delegate,
         })
     }
 
-    fn remove_listener(&self, port: u32) -> Result<(), VzError> {
-        self.unregister_listener(port, true)
+    /// Remove the listener at `port`, doing nothing if none is registered.
+    pub fn remove_listener(&self, port: u32) -> Result<(), VzError> {
+        self.unregister_listener(port, None)
     }
 }
 
@@ -412,6 +481,7 @@ pub struct VirtioSocketConnection {
     file: AsyncFd<std::fs::File>,
     source_port: u32,
     destination_port: u32,
+    _connection: QueueRetained<VZVirtioSocketConnection>,
 }
 
 impl fmt::Debug for VirtioSocketConnection {
@@ -425,13 +495,19 @@ impl fmt::Debug for VirtioSocketConnection {
 }
 
 impl VirtioSocketConnection {
-    fn new(fd: OwnedFd, source_port: u32, destination_port: u32) -> Result<Self, VzError> {
+    fn new(
+        fd: OwnedFd,
+        source_port: u32,
+        destination_port: u32,
+        connection: QueueRetained<VZVirtioSocketConnection>,
+    ) -> Result<Self, VzError> {
         let file = std::fs::File::from(fd);
         super::serial::set_nonblocking(&file)?;
         Ok(Self {
             file: AsyncFd::new(file).map_err(VzError::from)?,
             source_port,
             destination_port,
+            _connection: connection,
         })
     }
 
@@ -523,9 +599,10 @@ impl AsyncWrite for VirtioSocketConnection {
 ///
 /// ```rust,no_run
 /// # use std::os::fd::AsRawFd;
-/// # use vz::device::SocketDevice;
 /// # async fn example(device: &vz::device::VirtioSocketDevice) -> Result<(), vz::VzError> {
-/// let mut listener = device.listen(1024)?;
+/// let mut listener = device.listen(1024, |connection| {
+///     connection.destination_port() == 1024
+/// })?;
 ///
 /// loop {
 ///     let conn = listener.accept().await?;
@@ -539,20 +616,20 @@ impl AsyncWrite for VirtioSocketConnection {
 ///
 /// When the listener is dropped, it automatically:
 /// - Unregisters listener from the socket device
-/// - Drops _listener
-/// - Drops _delegate
+/// - Releases the listener and delegate on the VM queue
 ///
 /// See also [Apple's documentation](https://developer.apple.com/documentation/virtualization/vzvirtiosocketlistener?language=objc)
 pub struct VirtioSocketListener {
     device: VirtioSocketDevice,
     port: u32,
-    receiver: mpsc::UnboundedReceiver<Result<PendingConnection, VzError>>,
-    _listener: Retained<VZVirtioSocketListener>,
-    _delegate: ListenerDelegate,
+    generation: u64,
+    receiver: mpsc::UnboundedReceiver<PendingConnection>,
+    _listener: QueueRetained<VZVirtioSocketListener>,
+    _delegate: QueueRetained<VsockListenerDelegate>,
 }
 
-// SAFETY: The Objective-C objects are only accessed from the main thread
-// through Virtualization.framework's dispatch queue.
+// SAFETY: Objective-C ownership is represented by queue-retained tokens, and
+// the device only accesses framework objects through the VM's serial queue.
 unsafe impl Send for VirtioSocketListener {}
 
 impl fmt::Debug for VirtioSocketListener {
@@ -578,8 +655,13 @@ impl VirtioSocketListener {
             .receiver
             .recv()
             .await
-            .ok_or_else(|| VzError::Backend("listener closed".to_string()))??;
-        VirtioSocketConnection::new(accepted.fd, accepted.source_port, accepted.destination_port)
+            .ok_or_else(|| VzError::Backend("listener closed".to_string()))?;
+        VirtioSocketConnection::new(
+            accepted.fd,
+            accepted.source_port,
+            accepted.destination_port,
+            accepted.connection,
+        )
     }
 
     /// Attempt to accept a queued connection without waiting.
@@ -587,14 +669,12 @@ impl VirtioSocketListener {
     /// Returns `Ok(None)` if no connection is currently available.
     pub fn try_accept(&mut self) -> Result<Option<VirtioSocketConnection>, VzError> {
         match self.receiver.try_recv() {
-            Ok(result) => {
-                let accepted = result?;
-                Ok(Some(VirtioSocketConnection::new(
-                    accepted.fd,
-                    accepted.source_port,
-                    accepted.destination_port,
-                )?))
-            }
+            Ok(accepted) => Ok(Some(VirtioSocketConnection::new(
+                accepted.fd,
+                accepted.source_port,
+                accepted.destination_port,
+                accepted.connection,
+            )?)),
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 Err(VzError::Backend("listener closed".to_string()))
@@ -605,7 +685,10 @@ impl VirtioSocketListener {
 
 impl Drop for VirtioSocketListener {
     fn drop(&mut self) {
-        if let Err(err) = self.device.unregister_listener(self.port, false) {
+        if let Err(err) = self
+            .device
+            .unregister_listener(self.port, Some(self.generation))
+        {
             tracing::debug!(port = self.port, error = %err, "failed to remove vsock listener during drop");
         }
     }
@@ -614,5 +697,20 @@ impl Drop for VirtioSocketListener {
 fn send_completion_once<T>(sender: &Arc<Mutex<Option<oneshot::Sender<T>>>>, value: T) {
     if let Some(sender) = sender.lock().ok().and_then(|mut guard| guard.take()) {
         let _ = sender.send(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::device::SocketConnectionRequest;
+
+    #[test]
+    fn connection_request_exposes_port_metadata() {
+        let request = SocketConnectionRequest {
+            source_port: 4000,
+            destination_port: 9000,
+        };
+        assert_eq!(request.source_port(), 4000);
+        assert_eq!(request.destination_port(), 9000);
     }
 }

@@ -10,7 +10,7 @@ pub enum VirtError {
     #[error("machine {name} is not running")]
     NotRunning { name: String },
 
-    #[error("machine {machine} has reached its vsock stream limit of {limit}")]
+    #[error("machine {machine} has reached its active vsock connection limit of {limit}")]
     VsockCapacityExhausted { machine: String, limit: usize },
 
     #[error("machine backend {kind} is unsupported on this host: {reason}")]

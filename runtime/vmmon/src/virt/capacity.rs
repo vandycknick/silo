@@ -4,7 +4,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::virt::error::VirtError;
 
-pub(crate) const MACHINE_VSOCK_CAPACITY: usize = 1024;
+pub(crate) const MAX_ACTIVE_VSOCK_CONNECTIONS: usize = 1023;
 
 /// Admission shared by every vsock path for one virtual machine.
 #[derive(Clone, Debug)]
@@ -16,7 +16,7 @@ pub(crate) struct VsockCapacity {
 
 impl VsockCapacity {
     pub(crate) fn new(machine: impl Into<Arc<str>>) -> Self {
-        Self::with_limit(machine, MACHINE_VSOCK_CAPACITY)
+        Self::with_limit(machine, MAX_ACTIVE_VSOCK_CONNECTIONS)
     }
 
     fn with_limit(machine: impl Into<Arc<str>>, limit: usize) -> Self {
@@ -48,6 +48,10 @@ impl VsockCapacity {
         Arc::ptr_eq(&self.semaphore, &other.semaphore)
     }
 
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.semaphore.available_permits() == 0
+    }
+
     #[cfg(test)]
     pub(crate) fn test_with_limit(machine: impl Into<Arc<str>>, limit: usize) -> Self {
         Self::with_limit(machine, limit)
@@ -68,24 +72,24 @@ pub(crate) struct VsockLease {
 
 #[cfg(test)]
 mod tests {
-    use crate::virt::capacity::{VsockCapacity, MACHINE_VSOCK_CAPACITY};
+    use crate::virt::capacity::{VsockCapacity, MAX_ACTIVE_VSOCK_CONNECTIONS};
     use crate::virt::VirtError;
 
     #[test]
     fn exact_machine_limit_and_release() {
         let capacity = VsockCapacity::new("boundary");
-        let leases = (0..MACHINE_VSOCK_CAPACITY)
+        let leases = (0..MAX_ACTIVE_VSOCK_CONNECTIONS)
             .map(|_| capacity.reserve().expect("capacity through exact limit"))
             .collect::<Vec<_>>();
 
         assert!(matches!(
             capacity.reserve(),
             Err(VirtError::VsockCapacityExhausted { machine, limit })
-                if machine == "boundary" && limit == MACHINE_VSOCK_CAPACITY
+                if machine == "boundary" && limit == MAX_ACTIVE_VSOCK_CONNECTIONS
         ));
 
         drop(leases);
-        assert_eq!(capacity.available_permits(), MACHINE_VSOCK_CAPACITY);
+        assert_eq!(capacity.available_permits(), MAX_ACTIVE_VSOCK_CONNECTIONS);
     }
 
     #[test]

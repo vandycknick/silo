@@ -1,5 +1,6 @@
 //! Apple Virtualization.framework backend, built on the `vz` bindings crate.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -10,8 +11,8 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use vz::device::{
     EntropyDeviceConfiguration, LinuxRosettaDirectoryShare, MemoryBalloonDeviceConfiguration,
     NetworkDeviceConfiguration, SerialPortConfiguration, SharedDirectory, SingleDirectoryShare,
-    SocketDevice, SocketDeviceConfiguration, StorageDeviceConfiguration,
-    VirtioFileSystemDeviceConfiguration, VirtioSocketDevice,
+    SocketDeviceConfiguration, StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
+    VirtioSocketDevice,
 };
 use vz::{
     GenericMachineIdentifier, GenericPlatform, LinuxBootLoader, RosettaAvailability,
@@ -248,8 +249,33 @@ impl VirtBackend for VzBackend {
     ) -> Result<VsockListener, VirtError> {
         let vm = self.running_vm().await?;
         let device = socket_device(&vm)?;
-        let listener = device.listen(port).map_err(vz_error)?;
-        Ok(VsockListener::from_vz(listener, port, capacity))
+        let admission_capacity = capacity.clone();
+        let accepted_leases = Arc::new(Mutex::new(VecDeque::new()));
+        let accepted_leases_out = accepted_leases.clone();
+        let machine = self.config.name().to_string();
+        let listener = device
+            .listen(port, move |request| {
+                match admission_capacity.reserve() {
+                    Ok(lease) => {
+                        accepted_leases_out
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push_back(lease);
+                        true
+                    }
+                    Err(error) => {
+                        tracing::warn!(machine, port, source_port = request.source_port(), destination_port = request.destination_port(), %error, "rejected VZ guest vsock connection at active connection limit");
+                        false
+                    }
+                }
+            })
+            .map_err(vz_error)?;
+        Ok(VsockListener::from_vz(
+            listener,
+            port,
+            capacity,
+            accepted_leases,
+        ))
     }
 
     async fn open_serial(&self) -> Result<SerialDevice, VirtError> {

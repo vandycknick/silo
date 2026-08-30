@@ -263,6 +263,10 @@ connection:
    Unix connection without a reply.
 
 The command, acknowledgement, and 32-byte command bound match Firecracker.
+Like Firecracker, `vmmon` does not apply an application-level count or timeout
+while an accepted mux client has not yet supplied a complete command. After a
+valid command, connection establishment has Firecracker's two-second request
+timeout.
 
 `vmmon` accepts `CONNECT` for guest port 1027. Reservation of that guest port
 governs service allocation, not access control. Silo's host tooling reaches the
@@ -287,11 +291,19 @@ Unix connection is dialed per guest connection.
 
 ### Resource Limits
 
-`vmmon` permits at most 1024 pending or established vsock streams per machine,
-including mux handshakes and guest-initiated connections. At the limit it
-closes a new mux connection without a reply or resets a new guest connection.
-Closing a stream releases its slot. The 1024-port discovery limit is independent
-of this concurrent-stream limit.
+Matching Firecracker's single device connection map, `vmmon` permits at most
+1023 active vsock connections per machine. This is one device-wide allowance
+shared by every port, both connection directions, the public surface, and
+vmmon's internal SSH and guest-agent traffic. A connection becomes active after
+a mux client supplies a valid `CONNECT` command or when a guest connection
+request reaches the backend. A raw mux client awaiting its command is not an
+active vsock connection and consumes no slot.
+
+When all 1023 slots are active, `vmmon` closes a newly accepted mux connection
+without a reply, rejects a valid command that raced with another connection,
+and resets a new guest connection. Closing or failing a connection releases its
+slot. The 1024-port discovery limit is independent of this active-connection
+limit; listener registration does not consume a connection slot.
 
 ## Responsibilities
 
@@ -409,7 +421,7 @@ is available and installs newly discovered listeners while the VM runs.
   startup. A runtime registration failure logs the machine, port, path, and
   backend error; later rescans retry it. Guest attempts reset until registration
   succeeds.
-- Reaching a listener-registration or concurrent-stream limit logs the machine,
+- Reaching a listener-registration or active-connection limit logs the machine,
   rejected port when known, and applicable limit.
 - Either half of a spliced stream reaching EOF or error causes `vmmon` to shut
   down the opposite half and release both ends.
