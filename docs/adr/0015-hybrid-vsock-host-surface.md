@@ -55,6 +55,10 @@ This ADR replaces the plugin model with that convention.
 | Guest-initiated | A connection dialed by the guest toward a host port on CID 2. |
 | Mux socket | The single Unix socket through which all host-initiated connections enter, using the `CONNECT` command. |
 | Listener socket | A Unix socket at `<uds>_<port>` that receives guest-initiated connections for one host port. |
+| Vhost-user frontend | The `krun`/libkrun component that exposes the VM's virtqueues and interrupt plumbing to another userspace process. |
+| Vhost-user backend | The embedded `vmmon` component that consumes the shared virtqueues and implements the virtio-vsock device behavior. |
+| Vhost-user control socket | The private, persistent Unix socket between the vhost-user frontend and backend. It carries protocol negotiation, configuration, and file descriptors, not normal vsock stream payloads. |
+| libkrun built-in vsock port-path API | Libkrun's own virtio-vsock backend configured with `krun_add_vsock` and predeclared port-to-Unix-socket mappings through `krun_add_vsock_port2`. |
 
 ## Decision
 
@@ -363,13 +367,141 @@ runtime directory; the `krun` helper attaches it with
 so the guest receives exactly one explicitly configured vsock device. Guest RAM
 uses memfd-backed regions so the backend can map the virtqueues.
 
+The private `krun.vsock/vhost.sock` is the vhost-user control socket, not the
+public hybrid mux and not a per-port stream endpoint. It remains connected for
+the lifetime of the device. The `krun`/libkrun frontend uses it to negotiate
+features, read device configuration, describe and enable the three virtqueues,
+and pass guest-memory memfds plus queue kick and call eventfds to `vmmon` with
+`SCM_RIGHTS`. Closing it means that the frontend or backend has disconnected;
+it cannot be removed after initialization while leaving the device operational.
+
+Initialization separates the persistent control channel from the resources it
+establishes:
+
+```text
+vmmon (vhost-user backend)                 krun/libkrun (vhost-user frontend)
+        |                                                   |
+        |  bind/listen krun.vsock/vhost.sock                |
+        |<------------------- connect ----------------------|
+        |                                                   |
+        |<-------- feature and protocol negotiation ------->|
+        |<--------- device configuration requests --------->|
+        |                                                   |
+        |<--- SET_MEM_TABLE + guest-memory memfd FDs -------|
+        |<--- SET_VRING_* + kick/call eventfd FDs ----------|
+        |<--- SET_VRING_ENABLE ------------------------------|
+        |                                                   |
+        |==== shared memfd-backed guest RAM and vrings =====|
+        |<--- guest queue kicks through eventfds ------------|
+        |---- used-queue calls through eventfds ------------>|
+```
+
+Normal `VIRTIO_VSOCK_OP_REQUEST`, `VIRTIO_VSOCK_OP_RESPONSE`, and
+`VIRTIO_VSOCK_OP_RW` packets do not traverse the control socket. `vmmon` reads
+and writes them in the shared virtqueues and uses the passed eventfds for queue
+notifications. The control socket may still carry device lifecycle or
+configuration messages, but it is not in the steady-state byte-stream path.
+
+The runtime paths are:
+
+```text
+Host-initiated
+
+vmmon caller or public mux
+        |
+        | endpoint stream (an unnamed socket pair for the internal seam)
+        v
+vmmon vhost-user-vsock backend
+        |
+        | write RX descriptors in shared guest RAM
+        | signal call eventfd
+        v
+krun virtio interrupt delivery
+        |
+        v
+guest AF_VSOCK service
+```
+
+```text
+Guest-initiated
+
+guest AF_VSOCK client
+        |
+        | write TX descriptors and signal kick eventfd
+        v
+vmmon vhost-user-vsock backend
+        |
+        | route by destination port through an unnamed socket pair
+        v
+vmmon internal consumer
+        or
+vmmon stream splice <----> public <uds>_<port> listener
+```
+
 Terminating the device inside `vmmon` removes the constraints that motivated
 ADR 0005's indirection: no per-port Unix sockets owned by the `krun` child, no
-ports declared before boot, and no userspace relay between two Unix sockets per
-stream. `vmmon` sees the destination port in each guest
+ports declared before boot, and no mandatory relay through a krun-owned
+per-port socket. It does not make the host stream path socketless. The internal
+`VirtBackend` stream seam uses unnamed Unix socket pairs, and the public surface
+splices those streams to the mux or listener socket. `vmmon` sees the
+destination port in each guest
 `VIRTIO_VSOCK_OP_REQUEST`. It accepts requests for ports registered by the
 common discovery loop, dials the corresponding listener socket, and sends
 `VIRTIO_VSOCK_OP_RST` for other user ports.
+
+The selected Linux implementation compares with libkrun's built-in port-path
+API as follows:
+
+| Concern | Vhost-user-vsock (`krun_add_vhost_user_device`) | Libkrun built-in vsock port-path API (`krun_add_vsock` and `krun_add_vsock_port2`) |
+| --- | --- | --- |
+| Vsock protocol backend owner | `vmmon` | `krun`/libkrun |
+| VM-facing device model | Generic vhost-user frontend in `krun`/libkrun, backed by `vmmon` | Built-in virtio-vsock device and backend in `krun`/libkrun |
+| Backend attachment | One vhost-user device for the VM | One built-in libkrun vsock device |
+| Unix-socket topology | One private control socket per VM; no krun-owned per-port listeners | One predeclared path mapping per configured port; krun listens for host-initiated mappings |
+| Port lifecycle | Host and guest ports are registered or dialed dynamically after boot | Every usable port and direction must be declared before boot |
+| Guest memory access | Memfd-backed guest regions are mapped into both processes | The backend accesses guest memory directly inside krun |
+| Queue notification | Kick and call eventfds cross the process boundary | Queue handling and interrupt delivery stay inside krun |
+| Host stream dataplane | Endpoint stream bytes are copied between a host stream and shared virtqueues in `vmmon`; the control socket is not the payload path | Endpoint stream bytes are copied between a configured per-port Unix socket and virtqueues in libkrun |
+| Public hybrid surface | One mux supports arbitrary host-initiated ports; listener discovery supports runtime guest-initiated publication | Requires an additional adaptation layer over fixed port-path mappings |
+| krun-owned UDS listeners | None for vsock | One for each host-initiated port mapping |
+
+#### Performance Characteristics
+
+This decision does not assume that vhost-user-vsock is unconditionally faster
+than libkrun's built-in port-path API. Its primary benefits are dynamic routing,
+ownership, and a cross-platform host contract. The relevant performance effects
+are:
+
+- Vhost-user negotiation, descriptor passing, and guest-memory mapping add
+  one-time startup work. They replace per-port startup configuration rather
+  than adding a per-connection control exchange.
+- Mapping a guest-memory memfd into `vmmon` does not duplicate the guest RAM.
+  It does add another virtual mapping and its page-table and address-space
+  bookkeeping.
+- Normal stream bytes bypass the vhost-user control socket. The backend copies
+  bytes directly between endpoint streams and shared guest-memory descriptors.
+- Compared with a backend inside krun, queue processing crosses a process
+  boundary through kick and call eventfds. Scheduler wakeups, context switches,
+  cache migration, and interrupt-delivery handoffs can increase small-message
+  latency and CPU cost.
+- Internal `connect_vsock` and `listen_vsock` streams use unnamed Unix socket
+  pairs to preserve the common `VsockStream` abstraction. This still incurs a
+  kernel socket-buffer copy; vhost-user does not make the host endpoint path
+  zero-copy.
+- Public host-initiated and guest-initiated streams are spliced with
+  `copy_bidirectional` between the public Unix socket and the backend stream.
+  That extra relay can cost additional syscalls and copies compared with an
+  internal vmmon consumer.
+- The vhost-user backend negotiates `VIRTIO_RING_F_EVENT_IDX`, allowing the
+  guest and backend to suppress unnecessary notifications under load.
+- The selected vhost-user device uses three queues of depth 128. Libkrun's
+  built-in vsock device uses depth 256. The smaller depth reduces queue metadata
+  but may reduce burst tolerance or in-flight work under high concurrency.
+
+These are architectural expectations, not benchmark results. Changes that
+target throughput or latency must measure connection setup, bidirectional
+small-message latency, bulk throughput, CPU time, context switches, and
+concurrency against both implementations on the same host and guest kernel.
 
 This requires a libkrun version that includes vhost-user device support. The
 `krun` crate drops its `VsockPort` plumbing in favor of one vhost-user device
@@ -539,3 +671,4 @@ directly.
 - [Apple: registering a `VZVirtioSocketListener`](https://developer.apple.com/documentation/virtualization/vzvirtiosocketdevice/setsocketlistener(_:forport:))
 - [libkrun PR #642: vhost-user device support](https://github.com/libkrun/libkrun/pull/642)
 - [vhost-device-vsock reference implementation](https://github.com/rust-vmm/vhost-device/blob/main/vhost-device-vsock/README.md)
+- [QEMU: vhost-user protocol](https://qemu-project.gitlab.io/qemu/interop/vhost-user.html)
