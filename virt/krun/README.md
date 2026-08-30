@@ -73,8 +73,8 @@ Planned follow-up scope includes:
 ## Requirements
 
 - Rust toolchain
-- access to the pinned libkrun fork, or the process-scoped local Git rewrite
-  documented in `docs/libkrun-deps.md` while its exact revision is unpublished
+- access to the pinned libkrun fork revision documented in
+  `docs/libkrun-deps.md`
 - Linux or macOS host support matching the compiled libkrun backend
 - on Linux, access to a KVM device with the required API and capabilities
 

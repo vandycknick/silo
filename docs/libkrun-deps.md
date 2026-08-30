@@ -12,7 +12,7 @@ The workspace dependency is pinned by full Git commit in the root
 
 ```text
 repository: https://github.com/vandycknick/libkrun.git
-branch:     silo/v2 (local until manually published)
+branch:     silo/v2
 upstream:   0d75eb4b9d7f742e9b290b7372e4be491e68b173 (v2 main)
 revision:   10b6f752ba8ea735c3d9edaa549599dcf3f98d18
 ```
@@ -21,20 +21,11 @@ Release builds must use the committed `Cargo.lock` with `--locked`. A branch
 or tag is useful for reviewing the fork, but neither replaces the immutable
 commit pin.
 
-Until the branch is published, Cargo commands that activate `krun-bin` must
-resolve the normal repository URL through the local checkout without modifying
-repository or user configuration:
-
-```bash
-export CARGO_NET_GIT_FETCH_WITH_CLI=true
-export GIT_CONFIG_COUNT=1
-export GIT_CONFIG_KEY_0=url.file:///home/nickvd/Projects/libkrun.insteadOf
-export GIT_CONFIG_VALUE_0=https://github.com/vandycknick/libkrun.git
-```
-
-These variables are temporary implementation plumbing. Once the exact revision
-is available from the fork, unset them and verify the build through the normal
-GitHub source before publishing Silo.
+The branch and pinned revision are public. Cargo resolves the revision directly
+from GitHub; builds require no local libkrun checkout, URL rewrite, or custom Git
+configuration. A local checkout may still be selected temporarily for fork
+development, but release verification must use the committed GitHub source and
+lockfile.
 
 The fork carries two fixes on top of the recorded upstream v2 commit:
 
@@ -92,9 +83,6 @@ Build the self-contained helper with:
 ```bash
 cargo build --locked -p krun --features krun-bin --bin krun
 ```
-
-While the pinned revision remains unpublished, set the process-scoped rewrite
-variables from [Source Pin](#source-pin) in the shell running this command.
 
 For a release build:
 
