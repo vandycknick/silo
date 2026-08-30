@@ -252,6 +252,11 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
                         self.rx_queue.enqueue(RxOps::Reset);
                         return Ok(());
                     }
+                    log::debug!(
+                        "vsock: guest accepted host port {} connection to guest port {}",
+                        self.local_port,
+                        self.peer_port
+                    );
                 }
                 self.connect = true;
             }

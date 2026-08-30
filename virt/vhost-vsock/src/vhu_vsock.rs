@@ -5,14 +5,15 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use log::warn;
+use log::{debug, warn};
 use thiserror::Error as ThisError;
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
-use vhost_user_backend::{VhostUserBackend, VringRwLock};
+use vhost_user_backend::{VhostUserBackend, VringRwLock, VringT};
 use virtio_bindings::bindings::{
     virtio_config::{VIRTIO_F_NOTIFY_ON_EMPTY, VIRTIO_F_VERSION_1},
     virtio_ring::VIRTIO_RING_F_EVENT_IDX,
 };
+use virtio_queue::QueueT;
 use vm_memory::{ByteValued, GuestMemoryAtomic, GuestMemoryMmap, Le64};
 use vmm_sys_util::{
     epoll::EventSet,
@@ -331,14 +332,18 @@ impl VhostUserBackend for VhostUserVsockBackend {
             }
             BACKEND_EVENT => {
                 thread.process_backend_evt(evset);
-                if let Err(e) = thread.process_tx(vring_tx, evt_idx) {
-                    match e {
-                        Error::NoMemoryConfigured => {
-                            warn!("Received a backend event before vring initialization")
-                        }
-                        _ => return Err(e.into()),
-                    }
+                if thread.mem.is_none() {
+                    debug!("Received a backend event before vring initialization; deferring it");
+                    return Ok(());
                 }
+                if [vring_rx, vring_tx].iter().any(|vring| {
+                    let state = vring.get_ref();
+                    !state.get_queue().ready() || !state.is_enabled()
+                }) {
+                    debug!("Received a backend event before vring activation; deferring it");
+                    return Ok(());
+                }
+                thread.process_tx(vring_tx, evt_idx)?;
             }
             _ => {
                 return Err(Error::HandleUnknownEvent.into());
@@ -380,6 +385,7 @@ impl VhostUserBackend for VhostUserVsockBackend {
 mod tests {
     use std::collections::VecDeque;
     use std::convert::TryInto;
+    use std::os::unix::net::UnixStream;
     use std::sync::Arc;
 
     use vhost_user_backend::VringT;
@@ -495,6 +501,69 @@ mod tests {
                 .to_string(),
             Error::HandleUnknownEvent.to_string()
         );
+    }
+
+    #[test]
+    fn backend_event_before_memory_is_replayed_after_initialization() {
+        const CID: u64 = 3;
+
+        let host_connections = host_connections();
+        let config = VsockConfig::new(CID, CONN_TX_BUF_SIZE, QUEUE_SIZE, host_connections.clone());
+        let backend = VhostUserVsockBackend::new(config).unwrap();
+        let mem = GuestMemoryAtomic::new(
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+        );
+        let vrings = [
+            VringRwLock::new(mem.clone(), 0x1000).unwrap(),
+            VringRwLock::new(mem.clone(), 0x2000).unwrap(),
+        ];
+
+        let (_client, stream) = UnixStream::pair().unwrap();
+        host_connections
+            .requests
+            .lock()
+            .unwrap()
+            .push_back(crate::HostConnectionRequest {
+                stream,
+                destination_port: 7000,
+            });
+        host_connections.event.write(1).unwrap();
+
+        backend
+            .handle_event(BACKEND_EVENT, EventSet::IN, &vrings, 0)
+            .expect("pre-initialization event must not stop the worker");
+        assert_eq!(host_connections.requests.lock().unwrap().len(), 1);
+        assert!(backend.threads[0]
+            .lock()
+            .unwrap()
+            .thread_backend
+            .conn_map
+            .is_empty());
+
+        backend.update_memory(mem).unwrap();
+        backend
+            .handle_event(BACKEND_EVENT, EventSet::IN, &vrings, 0)
+            .expect("memory update before vring activation must not stop the worker");
+        assert!(host_connections.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            backend.threads[0]
+                .lock()
+                .unwrap()
+                .thread_backend
+                .conn_map
+                .len(),
+            1
+        );
+
+        vrings[0].set_queue_info(0x100, 0x200, 0x300).unwrap();
+        vrings[0].set_queue_ready(true);
+        vrings[0].set_enabled(true);
+        vrings[1].set_queue_info(0x1100, 0x1200, 0x1300).unwrap();
+        vrings[1].set_queue_ready(true);
+        vrings[1].set_enabled(true);
+        backend
+            .handle_event(RX_QUEUE_EVENT, EventSet::IN, &vrings, 0)
+            .expect("activated vring must process the pending connection");
     }
 
     #[test]

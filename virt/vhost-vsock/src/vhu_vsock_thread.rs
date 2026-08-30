@@ -350,6 +350,10 @@ impl VhostUserVsockThread {
                 local_port,
                 request.destination_port,
             );
+            log::debug!(
+                "vsock: queued host port {local_port} connection to guest port {}",
+                request.destination_port
+            );
         }
     }
 

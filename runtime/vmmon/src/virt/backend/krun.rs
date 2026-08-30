@@ -34,6 +34,7 @@ const VHOST_SOCKET_NAME: &str = "vhost.sock";
 const MAX_VSOCK_LISTENERS: usize = 1024;
 const GUEST_CID: u64 = 3;
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const VSOCK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) struct KrunBackend {
@@ -560,15 +561,25 @@ fn krun_error(config: &VmConfig, err: KrunBackendError) -> VirtError {
 async fn read_vhost_connect_response(stream: &mut UnixStream) -> io::Result<u32> {
     const MAX_RESPONSE_BYTES: usize = 64;
 
-    let mut response = Vec::with_capacity(MAX_RESPONSE_BYTES);
-    while response.len() < MAX_RESPONSE_BYTES {
-        let mut byte = [0_u8; 1];
-        stream.read_exact(&mut byte).await?;
-        response.push(byte[0]);
-        if byte[0] == b'\n' {
-            break;
+    let response = timeout(VSOCK_CONNECT_TIMEOUT, async {
+        let mut response = Vec::with_capacity(MAX_RESPONSE_BYTES);
+        while response.len() < MAX_RESPONSE_BYTES {
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte).await?;
+            response.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
         }
-    }
+        Ok::<_, io::Error>(response)
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for the vhost-user vsock connection response",
+        )
+    })??;
 
     let response = std::str::from_utf8(&response)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -929,6 +940,17 @@ mod tests {
             .await
             .expect_err("invalid response must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn connect_response_wait_is_bounded() {
+        let (mut client, _backend) = UnixStream::pair().expect("create stream pair");
+
+        let error = read_vhost_connect_response(&mut client)
+            .await
+            .expect_err("missing response must time out");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]
