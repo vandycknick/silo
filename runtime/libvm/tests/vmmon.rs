@@ -120,6 +120,31 @@ async fn vsock_path_accessors_are_store_backed_and_follow_enablement() {
     let machine_run_dir = env._run_root.path().join("machines").join(machine.id());
     assert!(
         !machine_run_dir.exists(),
+        "omitted path accessors must not create runtime state"
+    );
+
+    let mut spec = machine.inspect().await.expect("inspect machine").spec;
+    spec.vsock = Some(vm_spec::Vsock {
+        enabled: false,
+        uds: None,
+    });
+    machine
+        .replace_config(spec)
+        .await
+        .expect("explicitly disable vsock");
+    assert_eq!(
+        machine.vsock_socket().await.expect("disabled mux path"),
+        None
+    );
+    assert_eq!(
+        machine
+            .vsock_listener_socket(5000)
+            .await
+            .expect("disabled listener path"),
+        None
+    );
+    assert!(
+        !machine_run_dir.exists(),
         "disabled path accessors must not create runtime state"
     );
 
@@ -162,15 +187,22 @@ async fn vsock_path_accessors_are_store_backed_and_follow_enablement() {
         .replace_config(spec)
         .await
         .expect("customize vsock path");
+    let custom_mux = env
+        ._run_root
+        .path()
+        .join("machines")
+        .join(machine.id())
+        .join("custom.sock");
     assert_eq!(
         machine.vsock_socket().await.expect("custom mux path"),
-        Some(
-            env._run_root
-                .path()
-                .join("machines")
-                .join(machine.id())
-                .join("custom.sock")
-        )
+        Some(custom_mux.clone())
+    );
+    assert_eq!(
+        machine
+            .vsock_listener_socket(5000)
+            .await
+            .expect("custom listener path"),
+        Some(PathBuf::from(format!("{}_5000", custom_mux.display())))
     );
 
     machine.clone().remove().await.expect("remove machine");
@@ -354,43 +386,86 @@ async fn hybrid_vsock_surface_serves_mux_and_preboot_listener_end_to_end() {
 }
 
 #[tokio::test]
-async fn initial_vsock_registration_failure_rolls_back_vm_and_mux() {
-    let env = test_env("hybrid-vsock-rollback", &Scenario::default()).await;
-    let machine = create_machine(&env, "integration-hybrid-vsock-rollback").await;
-    let mut spec = machine.inspect().await.expect("inspect machine").spec;
+async fn host_port_22_listener_is_independent_of_host_to_guest_ssh() {
+    let env = test_env("hybrid-vsock-port-22", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-hybrid-vsock-port-22").await;
+    let inspected = machine.inspect().await.expect("inspect machine");
+    let machine_dir = inspected.machine_dir;
+    let mut spec = inspected.spec;
     spec.vsock = Some(vm_spec::Vsock {
         enabled: true,
         uds: None,
     });
     machine.replace_config(spec).await.expect("enable vsock");
+    let listener_path = machine
+        .vsock_listener_socket(agent_spec::SSH_VSOCK_PORT)
+        .await
+        .expect("resolve SSH host listener")
+        .expect("SSH host listener path");
+    let listener = UnixListener::bind(&listener_path).expect("publish host port 22 listener");
+
+    start_ready(&machine).await;
+    let guest_path = machine_dir.join(format!(
+        "mock-vsock-listen-{}.sock",
+        agent_spec::SSH_VSOCK_PORT
+    ));
+    let guest = UnixStream::connect(guest_path)
+        .await
+        .expect("guest connection to host port 22");
+    let (_host, _) = listener.accept().await.expect("accept host port 22 stream");
+    drop(guest);
+
     let mux_path = machine
         .vsock_socket()
         .await
         .expect("resolve mux path")
         .expect("enabled mux path");
-    let conflicting_path = machine
-        .vsock_listener_socket(agent_spec::SSH_VSOCK_PORT)
+    let mut ssh = UnixStream::connect(mux_path)
         .await
-        .expect("resolve conflicting listener")
-        .expect("SSH host listener path");
-    let conflicting_listener =
-        UnixListener::bind(&conflicting_path).expect("publish conflicting listener");
+        .expect("connect host mux");
+    ssh.write_all(b"CONNECT 22\nssh")
+        .await
+        .expect("dial guest SSH");
+    let mut acknowledgement = Vec::new();
+    loop {
+        let byte = ssh.read_u8().await.expect("read SSH acknowledgement");
+        acknowledgement.push(byte);
+        if byte == b'\n' {
+            break;
+        }
+    }
+    assert!(acknowledgement.starts_with(b"OK "));
+    let mut echo = [0_u8; 3];
+    ssh.read_exact(&mut echo).await.expect("read SSH echo");
+    assert_eq!(&echo, b"ssh");
 
-    let error = machine
-        .start()
+    let mut guest_control = UnixStream::connect(
+        machine
+            .vsock_socket()
+            .await
+            .expect("resolve control mux path")
+            .expect("enabled control mux path"),
+    )
+    .await
+    .expect("connect control mux");
+    guest_control
+        .write_all(b"CONNECT 1027\n")
         .await
-        .expect_err("initial registration must fail");
-    assert!(error
-        .to_string()
-        .contains("declared for connect, not listen"));
-    assert!(!mux_path.exists(), "failed startup must clean the mux");
-    assert!(!machine
-        .inspect()
-        .await
-        .expect("inspect failed start")
-        .is_running());
+        .expect("dial guest control service");
+    let mut acknowledgement = Vec::new();
+    loop {
+        let byte = guest_control
+            .read_u8()
+            .await
+            .expect("read guest control acknowledgement");
+        acknowledgement.push(byte);
+        if byte == b'\n' {
+            break;
+        }
+    }
+    assert!(acknowledgement.starts_with(b"OK "));
 
-    drop(conflicting_listener);
+    machine.stop().await.expect("stop machine");
     machine.remove().await.expect("remove machine");
 }
 

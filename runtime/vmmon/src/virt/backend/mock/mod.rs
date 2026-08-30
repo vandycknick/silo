@@ -28,7 +28,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::virt::backend::{BackendKind, VirtBackend};
 use crate::virt::capacity::{VsockCapacity, VsockLease};
-use crate::virt::config::{validate_common, VmConfig, VsockPortMode};
+use crate::virt::config::{validate_common, VmConfig};
 use crate::virt::error::VirtError;
 use crate::virt::machine::VirtualMachine;
 use crate::virt::stream::{SerialDevice, SyntheticPortAllocator, VsockListener, VsockStream};
@@ -111,14 +111,6 @@ impl MockBackend {
 
     fn cache_exit(&self, exit: VmExit) {
         cache_exit_in(&self.exit, &self.exit_notify, exit);
-    }
-
-    fn declared_mode(&self, port: u32) -> Option<VsockPortMode> {
-        self.config
-            .vsock_ports()
-            .iter()
-            .find(|candidate| candidate.port == port)
-            .map(|candidate| candidate.mode)
     }
 }
 
@@ -251,15 +243,6 @@ impl VirtBackend for MockBackend {
             ));
         }
 
-        match self.declared_mode(port) {
-            Some(VsockPortMode::Connect) => {}
-            Some(VsockPortMode::Listen) => {
-                return Err(VirtError::Backend(format!(
-                    "mock vsock port {port} is declared for listen, not connect"
-                )));
-            }
-            None => {}
-        }
         if self.scenario.vsock.refuse_ports.contains(&port) {
             return Err(VirtError::Backend(format!(
                 "mock vsock port {port} refused connection (scripted)"
@@ -314,16 +297,6 @@ impl VirtBackend for MockBackend {
         port: u32,
         capacity: VsockCapacity,
     ) -> Result<VsockListener, VirtError> {
-        match self.declared_mode(port) {
-            Some(VsockPortMode::Listen) => {}
-            Some(VsockPortMode::Connect) => {
-                return Err(VirtError::Backend(format!(
-                    "mock vsock port {port} is declared for connect, not listen"
-                )));
-            }
-            None => {}
-        }
-
         let path = self
             .config
             .base_directory()
@@ -451,7 +424,7 @@ mod tests {
     use crate::virt::backend::mock::MockBackend;
     use crate::virt::backend::VirtBackend;
     use crate::virt::capacity::VsockCapacity;
-    use crate::virt::{VmConfig, VsockPort, VsockPortMode};
+    use crate::virt::VmConfig;
 
     #[tokio::test]
     async fn mock_connect_reports_unique_reusable_synthetic_source_metadata() {
@@ -459,10 +432,6 @@ mod tests {
         let config = VmConfig::builder("mock-metadata")
             .base_directory(&root)
             .kernel(Path::new("/mock-kernel"))
-            .vsock_port(VsockPort {
-                port: agent_spec::SSH_VSOCK_PORT,
-                mode: VsockPortMode::Connect,
-            })
             .build();
         let backend = MockBackend::new(config).expect("mock backend");
         backend.start().await.expect("start mock");
@@ -512,10 +481,6 @@ mod tests {
         let config = VmConfig::builder("mock-listener-metadata")
             .base_directory(&root)
             .kernel(Path::new("/mock-kernel"))
-            .vsock_port(VsockPort {
-                port,
-                mode: VsockPortMode::Listen,
-            })
             .build();
         let backend = MockBackend::new(config).expect("mock backend");
         backend.start().await.expect("start mock");

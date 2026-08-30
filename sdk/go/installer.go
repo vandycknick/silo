@@ -322,14 +322,14 @@ func (reader *contextReader) Read(buffer []byte) (int, error) {
 }
 
 var runtimeFiles = map[string]os.FileMode{
-	"bin/vmmon":                       0o755,
-	"bin/netd":                        0o755,
-	"bin/krun":                        0o755,
-	"assets/kernel-default":           0o644,
-	"assets/initramfs":                0o644,
-	"assets/agent":                    0o755,
-	"THIRD_PARTY_NOTICES":             0o644,
-	"LICENSES/libkrun-APACHE-2.0.txt": 0o644,
+	"bin/vmmon":               0o755,
+	"bin/netd":                0o755,
+	"bin/krun":                0o755,
+	"assets/kernel-default":   0o644,
+	"assets/initramfs":        0o644,
+	"assets/agent":            0o755,
+	"THIRD_PARTY_NOTICES":     0o644,
+	"LICENSES/APACHE-2.0.txt": 0o644,
 }
 
 var runtimeDirectories = map[string]struct{}{

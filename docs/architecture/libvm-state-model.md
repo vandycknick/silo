@@ -60,7 +60,7 @@ The CLI still uses the default local root through `Runtime::from_env()`, but the
 
 The relational `id` and `name` columns must match the same fields in `config_json`. Decode paths validate that invariant so the indexed values and object document cannot silently drift.
 
-`spec` is not exploded into relational tables. Boot, hardware, storage, mounts, public vsock settings, and annotations remain part of the VM spec because they are object-shaped launch data, not fields the manager currently needs for uniqueness or relationship constraints. The current transitional runtime bridge ignores the public vsock setting and always declares only vmmon's core guest destinations 22 and 1027; the hybrid public surface is implemented in later ADR 0015 phases.
+`spec` is not exploded into relational tables. Boot, hardware, storage, mounts, public vsock settings, and annotations remain part of the VM spec because they are object-shaped launch data, not fields the manager currently needs for uniqueness or relationship constraints. Vmmon always attaches the backend vsock device for internal guest destinations 22 and 1027. The stored public setting independently controls the hybrid mux and listener discovery surface; libvm resolves those effective runtime paths from the latest stored spec.
 
 ## Mutable State
 

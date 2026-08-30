@@ -24,9 +24,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::virt::backend::VirtBackend;
 use crate::virt::capacity::{VsockCapacity, VsockLease, MAX_ACTIVE_VSOCK_CONNECTIONS};
-use crate::virt::config::{
-    validate_common, DiskImage, NetworkMode, SharedDirectory, VmConfig, VsockPortMode,
-};
+use crate::virt::config::{validate_common, DiskImage, NetworkMode, SharedDirectory, VmConfig};
 use crate::virt::error::VirtError;
 use crate::virt::stream::{PendingUnixVsock, SerialDevice, VsockListener, VsockStream};
 use crate::virt::VmExit;
@@ -430,8 +428,6 @@ fn validate(config: &VmConfig) -> Result<(), VirtError> {
         }
     }
 
-    validate_vsock_ports(config)?;
-
     Ok(())
 }
 
@@ -600,36 +596,6 @@ async fn shutdown_vsock(mut server: vhost_vsock::BackendServer) -> Result<(), Vi
     .await
     .map_err(|error| VirtError::Backend(format!("vhost-user shutdown task failed: {error}")))?
     .map_err(|error| VirtError::Backend(error.to_string()))
-}
-
-fn validate_vsock_ports(config: &VmConfig) -> Result<(), VirtError> {
-    let _ = unique_vsock_ports(config)?;
-    Ok(())
-}
-
-fn unique_vsock_ports(config: &VmConfig) -> Result<Vec<(u32, VsockPortMode)>, VirtError> {
-    let mut ports = HashMap::new();
-    for port in config.vsock_ports() {
-        if port.port == 0 {
-            return invalid_config(config, "vsock port must be greater than zero");
-        }
-        match ports.insert(port.port, port.mode) {
-            Some(existing) if existing != port.mode => {
-                return invalid_config(
-                    config,
-                    &format!(
-                        "vsock port {} is declared for both {:?} and {:?}",
-                        port.port, existing, port.mode
-                    ),
-                )
-            }
-            _ => {}
-        }
-    }
-
-    let mut ports = ports.into_iter().collect::<Vec<_>>();
-    ports.sort_by_key(|(port, _)| *port);
-    Ok(ports)
 }
 
 fn vhost_socket_for(config: &VmConfig) -> PathBuf {

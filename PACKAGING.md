@@ -181,7 +181,7 @@ silo-runtime-<version>-<target>/
     agent
   THIRD_PARTY_NOTICES
   LICENSES/
-    libkrun-APACHE-2.0.txt
+    APACHE-2.0.txt
 ```
 
 The portable CLI archive contains the same files plus `bin/silo`:
@@ -199,7 +199,7 @@ silo-<version>-<target>/
     agent
   THIRD_PARTY_NOTICES
   LICENSES/
-    libkrun-APACHE-2.0.txt
+    APACHE-2.0.txt
 ```
 
 Each archive has an adjacent SHA-256 checksum, SPDX JSON SBOM, and provenance

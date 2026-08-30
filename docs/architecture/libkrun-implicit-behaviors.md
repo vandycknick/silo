@@ -8,11 +8,11 @@ Every helper-created context does the following:
 
 1. Set the VM CPU and memory configuration.
 2. Set the explicit kernel, optional initramfs, and kernel command line.
-3. Add disks, mounts, networking, and console only when configured, plus vmmon's unconditional transitional core vsock bridge.
+3. Add disks, mounts, networking, and console only when configured, plus vmmon's unconditional vhost-user-vsock device.
 
-The v1 `krun_disable_implicit_console()` and `krun_disable_implicit_vsock()` APIs do not exist in v2 because those devices are explicit. `krun_disable_implicit_init()` remains only as an `-ENOTSUP` compatibility stub and must not be called. If a console is needed, the helper adds one explicitly with `krun_add_virtio_console_default()` and selects `hvc0` with `krun_set_kernel_console()`. During the transitional backend, vmmon always passes exactly two connect mappings, guest destinations 22 and 1027. Those mappings cause the helper to call `krun_add_vsock(ctx, 0)` before `krun_add_vsock_port2()`, keeping TSI hijacking disabled. They do not depend on managed guest-service enablement or `VmSpec.vsock.enabled`, and no endpoint-derived or listen mappings remain.
+The v1 `krun_disable_implicit_console()` and `krun_disable_implicit_vsock()` APIs do not exist in v2 because those devices are explicit. `krun_disable_implicit_init()` remains only as an `-ENOTSUP` compatibility stub and must not be called. If a console is needed, the helper adds one explicitly with `krun_add_virtio_console_default()` and selects `hvc0` with `krun_set_kernel_console()`. Vmmon passes one vhost-user socket to the helper, which attaches device type 19 with three queues. The helper never calls `krun_add_vsock` or configures per-port mappings; vmmon's embedded backend handles arbitrary host and guest ports dynamically.
 
-`krun_set_port_map()` is intentionally not part of Silo's startup path. It controls TSI stream remapping, not explicit virtio-net backends or Silo's explicit per-port Unix-socket bridge.
+`krun_set_port_map()` is intentionally not part of Silo's startup path. It controls TSI stream remapping, not explicit virtio-net backends or Silo's vhost-user-vsock device.
 
 ## Inventory
 
@@ -20,8 +20,8 @@ The v1 `krun_disable_implicit_console()` and `krun_disable_implicit_vsock()` API
 | --- | --- | --- | --- | --- |
 | Console device | Call `krun_add_virtio_console_default()` | No console device | Added only for `--stdio-console`, then selected as `hvc0` | Applies on Linux and macOS |
 | Init binary | Load and apply `libkrun_init` configuration | No injected init binary | Not used; Silo supplies an explicit kernel and optional initramfs | `krun_disable_implicit_init()` returns `-ENOTSUP` in v2 |
-| Vsock device | Call `krun_add_vsock()` | No vsock device | Temporarily added with TSI features `0` for unconditional vmmon connect mappings to guest ports 22 and 1027 | Replaced by Silo's embedded backend in S7; the public vsock setting does not alter this bridge |
-| TSI networking | Enable TSI flags on an explicit vsock device | No TSI fallback | Disabled by passing TSI features `0` and using explicit virtio-net | Applies on Linux and macOS |
+| Vsock device | Attach a vhost-user device | No vsock device | Device type 19, three queues, terminated by vmmon's embedded backend | Unconditional for internal ports; public enablement controls only the host surface |
+| TSI networking | Enable TSI flags on libkrun's built-in vsock device | No TSI fallback | Not used; Silo attaches vhost-user-vsock and explicit virtio-net | Applies on Linux and macOS |
 | TSI port remapping | Use TSI stream listens through libkrun's vsock path | May rewrite guest listen ports according to a libkrun port map | Not used; TSI is disabled and explicit virtio-net backends do not consume this map | Applies only to libkrun's vsock/TSI stream path |
 | Environment inheritance | Call `krun_set_exec()` or `krun_set_env()` with `NULL` | Inherits host process environment | Current helper does not use exec-mode APIs; future exec-mode code must pass an explicit env array | Applies on Linux and macOS |
 | Unixgram networking | Call `krun_add_net_unixgram()` | Adds explicit virtio-net and prevents TSI fallback | Available via `--network unixgram` with `--net-peer` and `--net-mac` | Current Silo gvproxy path |

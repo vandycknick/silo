@@ -30,7 +30,7 @@ pub use backend::{Availability, BackendKind};
 pub(crate) use capacity::VsockLease;
 pub use config::{
     DiskImage, KrunOptions, MachineIdentifier, MockOptions, NetworkMode, SharedDirectory, VmConfig,
-    VmConfigBuilder, VmExit, VsockPort, VsockPortMode, VzOptions,
+    VmConfigBuilder, VmExit, VzOptions,
 };
 pub use error::VirtError;
 pub use machine::VirtualMachine;

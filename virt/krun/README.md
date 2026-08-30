@@ -7,7 +7,7 @@ The crate exposes:
 - a process-backed `VirtualMachineBuilder`
 - a `VirtualMachine` handle for lifecycle management
 - a `SerialConnection` wrapper for helper stdio access
-- typed disk, mount, and vsock configuration structs
+- typed disk, mount, network, and vhost-user-vsock configuration structs
 
 The `krun` binary is intentionally small. It parses Silo's flat helper arguments, configures libkrun directly, and then enters the VM. It does not use the library builder and does not expose subcommands. On Linux, `krun --check-host` runs the deeper KVM host check without starting a guest.
 
@@ -60,7 +60,7 @@ Current scope focuses on the libkrun path used by Silo today:
 - direct kernel and initramfs boot
 - raw block devices
 - virtiofs mounts
-- vsock ports backed by Unix sockets
+- one explicit vhost-user-vsock device terminated by vmmon
 - stdio console output
 - process-backed VM lifecycle management from Rust callers
 
@@ -86,7 +86,7 @@ The helper uses a narrow private adapter rather than generated C bindings. It ow
 
 The `blk`, `net`, and `vhost-user` APIs are selected at compile time through fixed Cargo features. Runtime feature probing is unnecessary because a helper missing a required API cannot compile.
 
-Libkrun v2 starts contexts without implicit console or vsock devices and no longer injects a default init binary. The helper therefore supplies its kernel and optional initramfs directly, adds hvc0 only for `--stdio-console`, and temporarily adds the built-in vsock device when vmmon supplies its core `--vsock-port` mappings. Vmmon always declares exactly guest destinations 22 and 1027 as connect mappings, independently of managed guest services and the public `VmSpec.vsock.enabled` setting. No endpoint-derived or guest-listen mapping reaches this transitional bridge. The embedded vhost-user backend and ADR 0015 public host surface remain later work.
+Libkrun v2 starts contexts without implicit console or vsock devices and no longer injects a default init binary. The helper therefore supplies its kernel and optional initramfs directly, adds hvc0 only for `--stdio-console`, and attaches vmmon's explicit vhost-user-vsock frontend with `--vhost-user-vsock`. It never calls `krun_add_vsock` and has no per-port vsock arguments. Vmmon's embedded backend provides unconditional dynamic dials to guest ports 22 and 1027 while the public `VmSpec.vsock.enabled` setting independently controls the host mux and guest-to-host listener discovery.
 
 ## libkrun Build Features
 
@@ -102,7 +102,7 @@ That means Silo intentionally builds libkrun with these features enabled:
 | --- | --- | --- |
 | `blk` | Enables virtio-block devices. | Keep. Required for `--disk` and Silo disk images. |
 | `net` | Enables virtio-net devices for unixgram, unixstream, and tap networking. | Keep. Required for Silo networking modes. |
-| `vhost-user` | Enables explicit vhost-user device attachment. | Keep compiled in for the later embedded vsock backend. S2 does not attach that backend yet. |
+| `vhost-user` | Enables explicit vhost-user device attachment. | Keep. Required for vmmon's vhost-user-vsock backend. |
 
 Silo intentionally leaves these libkrun v2 features and optional components disabled for now:
 

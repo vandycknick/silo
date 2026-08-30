@@ -60,9 +60,9 @@ vhost-user
 
 `blk` provides the raw virtio-block path used by Silo disks. `net` provides
 the Unix datagram, Unix stream, and Linux TAP networking paths. `vhost-user`
-provides the explicit device API needed by ADR 0015's later Linux backend; S2
-enables the API but retains libkrun's built-in per-port vsock bridge. The
-helper's private adapter calls the block and network APIs directly.
+provides the explicit device API used to attach vmmon's embedded
+vhost-user-vsock backend. The helper's private adapter calls the block, network,
+and vhost-user APIs directly.
 
 The `krun-bin` feature also unifies nix 0.30's `uio` feature into libkrun's
 device graph. The pinned v2 `krun-devices` manifest enables `socket` for its
@@ -80,9 +80,10 @@ an incidental transitive update.
 Libkrun v2 has no implicit console or vsock devices and no longer injects a
 default init binary. Its retained `krun_disable_implicit_init()` symbol returns
 `-ENOTSUP`, so Silo does not call it. Silo supplies an explicit kernel and
-optional initramfs, adds its console and transitional vsock device explicitly,
-and does not use the fallback firmware path. Consequently, Silo neither builds
-nor packages `libkrunfw`.
+optional initramfs, adds its console when requested, and attaches one explicit
+vhost-user-vsock device. It does not call `krun_add_vsock`, create per-port
+libkrun mappings, or use the fallback firmware path. Consequently, Silo neither
+builds nor packages `libkrunfw`.
 
 ## Build
 

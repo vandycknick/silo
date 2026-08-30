@@ -356,7 +356,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
-    use crate::virt::{BackendKind, VirtualMachine, VmConfig, VsockPort, VsockPortMode};
+    use crate::virt::{BackendKind, VirtualMachine, VmConfig};
     use crate::vsock::{registration_limit_reached, PreparedVsockSurface};
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
@@ -384,10 +384,6 @@ mod tests {
         let config = VmConfig::builder("surface-mux")
             .base_directory(&root)
             .kernel(Path::new("/mock-kernel"))
-            .vsock_port(VsockPort {
-                port: agent_spec::SSH_VSOCK_PORT,
-                mode: VsockPortMode::Connect,
-            })
             .build();
         let machine =
             VirtualMachine::with_backend(BackendKind::Mock, config).expect("create mock machine");

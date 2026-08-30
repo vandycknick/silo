@@ -82,24 +82,6 @@ pub struct SharedDirectory {
     pub read_only: bool,
 }
 
-/// A guest vsock port the host intends to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VsockPort {
-    /// Transitional preboot declaration used only by the krun core bridge.
-    /// S7 removes this after the embedded backend makes ports fully dynamic.
-    pub port: u32,
-    pub mode: VsockPortMode,
-}
-
-/// Direction of a declared vsock port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VsockPortMode {
-    /// Host dials the guest on this port (`connect_vsock`).
-    Connect,
-    /// Guest dials the host; the host accepts via `listen_vsock`.
-    Listen,
-}
-
 /// Guest network attachment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -170,7 +152,6 @@ pub struct VmConfig {
     network: NetworkMode,
     disks: Vec<DiskImage>,
     mounts: Vec<SharedDirectory>,
-    vsock_ports: Vec<VsockPort>,
     krun: KrunOptions,
     vz: VzOptions,
     mock: MockOptions,
@@ -232,10 +213,6 @@ impl VmConfig {
 
     pub fn mounts(&self) -> &[SharedDirectory] {
         &self.mounts
-    }
-
-    pub fn vsock_ports(&self) -> &[VsockPort] {
-        &self.vsock_ports
     }
 
     pub fn krun(&self) -> &KrunOptions {
@@ -355,11 +332,6 @@ impl VmConfigBuilder {
         self
     }
 
-    pub fn vsock_port(mut self, port: VsockPort) -> Self {
-        self.config.vsock_ports.push(port);
-        self
-    }
-
     /// Path to the krun helper binary (Linux backend only; ignored elsewhere).
     pub fn krun_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.krun.helper_path = Some(path.into());
@@ -404,19 +376,6 @@ pub(crate) fn validate_common(config: &VmConfig) -> Result<(), VirtError> {
     }
     if config.memory_mib == Some(0) {
         return Err(invalid("memory size must be nonzero".to_string()));
-    }
-
-    let mut seen_ports = std::collections::HashSet::new();
-    for vsock_port in &config.vsock_ports {
-        if vsock_port.port == 0 {
-            return Err(invalid("vsock port must be nonzero".to_string()));
-        }
-        if !seen_ports.insert(vsock_port.port) {
-            return Err(invalid(format!(
-                "vsock port {} is declared more than once",
-                vsock_port.port
-            )));
-        }
     }
 
     Ok(())
@@ -466,17 +425,12 @@ mod tests {
                 tag: "share".into(),
                 read_only: true,
             })
-            .vsock_port(VsockPort {
-                port: 1027,
-                mode: VsockPortMode::Connect,
-            })
             .build();
 
         assert_eq!(config.disks().len(), 2);
         assert_eq!(config.disks()[0].path, PathBuf::from("/tmp/a.img"));
         assert!(config.disks()[1].read_only);
         assert_eq!(config.mounts()[0].tag, "share");
-        assert_eq!(config.vsock_ports()[0].port, 1027);
     }
 
     #[test]
@@ -490,24 +444,6 @@ mod tests {
         let config = VmConfig::builder("test-vm")
             .vm_id("vm-1")
             .base_directory("/tmp/test-vm")
-            .build();
-        assert!(matches!(
-            validate_common(&config),
-            Err(VirtError::InvalidConfig { .. })
-        ));
-    }
-
-    #[test]
-    fn validate_common_rejects_duplicate_vsock_ports() {
-        let config = base_builder()
-            .vsock_port(VsockPort {
-                port: 1027,
-                mode: VsockPortMode::Connect,
-            })
-            .vsock_port(VsockPort {
-                port: 1027,
-                mode: VsockPortMode::Listen,
-            })
             .build();
         assert!(matches!(
             validate_common(&config),
