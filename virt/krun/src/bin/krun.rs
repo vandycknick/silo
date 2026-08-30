@@ -62,9 +62,9 @@ struct Cli {
     /// Add a virtiofs mount. Format: TAG:PATH:ro|rw.
     #[arg(long = "mount", value_parser = parse::mount)]
     mounts: Vec<krun::Mount>,
-    /// Add a vsock port mapping. Format: PORT:PATH:connect|listen.
-    #[arg(long = "vsock-port", value_parser = parse::vsock_port)]
-    vsock_ports: Vec<krun::VsockPort>,
+    /// Attach a vhost-user virtio-vsock device at this Unix socket.
+    #[arg(long = "vhost-user-vsock")]
+    vhost_user_vsock: Option<PathBuf>,
     /// Explicit networking backend. Defaults to no guest networking.
     #[arg(long = "network", value_enum, default_value_t = NetworkArg::None)]
     network: NetworkArg,
@@ -109,7 +109,7 @@ impl Cli {
             cmdline: self.cmdline,
             disks: self.disks,
             mounts: self.mounts,
-            vsock_ports: self.vsock_ports,
+            vhost_user_vsock: self.vhost_user_vsock,
             network,
             stdio_console: self.stdio_console,
         })
@@ -244,11 +244,8 @@ fn configure_ctx(context: &context::Context, config: &KrunConfig) -> eyre::Resul
         context.add_virtiofs(&mount.tag, &mount.path, mount.read_only)?;
     }
 
-    if !config.vsock_ports.is_empty() {
-        context.add_vsock()?;
-    }
-    for port in &config.vsock_ports {
-        context.add_vsock_port(port.port, &port.path, port.listen)?;
+    if let Some(socket) = &config.vhost_user_vsock {
+        context.add_vhost_user_vsock(socket)?;
     }
 
     match &config.network {
@@ -369,26 +366,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_transitional_core_vsock_ports() {
+    fn parses_vhost_user_vsock() {
         let config = Cli::try_parse_from([
             "krun",
             "--kernel",
             "/kernel",
-            "--vsock-port",
-            "22:/tmp/ssh.sock:connect",
-            "--vsock-port",
-            "1027:/tmp/agent.sock:connect",
+            "--vhost-user-vsock",
+            "/tmp/vhost-vsock.sock",
         ])
-        .expect("core vsock arguments should parse")
+        .expect("vhost-user argument should parse")
         .into_config()
-        .expect("core vsock arguments should produce a config");
+        .expect("vhost-user argument should produce a config");
 
-        assert_eq!(config.vsock_ports.len(), 2);
-        assert_eq!(config.vsock_ports[0].port, 22);
-        assert_eq!(config.vsock_ports[0].path, Path::new("/tmp/ssh.sock"));
-        assert!(config.vsock_ports[0].listen);
-        assert_eq!(config.vsock_ports[1].port, 1027);
-        assert_eq!(config.vsock_ports[1].path, Path::new("/tmp/agent.sock"));
-        assert!(config.vsock_ports[1].listen);
+        assert_eq!(
+            config.vhost_user_vsock.as_deref(),
+            Some(Path::new("/tmp/vhost-vsock.sock"))
+        );
     }
 }

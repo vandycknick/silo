@@ -48,6 +48,7 @@ test-utils = { path = "../test-utils", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 krun = { path = "../../virt/krun" }
+vhost-vsock = { path = "../../virt/vhost-vsock" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 vz = { path = "../../virt/vz" }

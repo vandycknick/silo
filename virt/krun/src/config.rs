@@ -14,7 +14,7 @@ pub struct KrunConfig {
     pub cmdline: Vec<String>,
     pub disks: Vec<Disk>,
     pub mounts: Vec<Mount>,
-    pub vsock_ports: Vec<VsockPort>,
+    pub vhost_user_vsock: Option<PathBuf>,
     pub network: Network,
     pub stdio_console: bool,
 }
@@ -31,13 +31,6 @@ pub struct Mount {
     pub tag: String,
     pub path: PathBuf,
     pub read_only: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VsockPort {
-    pub port: u32,
-    pub path: PathBuf,
-    pub listen: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +70,7 @@ impl Default for KrunConfig {
             cmdline: Vec::new(),
             disks: Vec::new(),
             mounts: Vec::new(),
-            vsock_ports: Vec::new(),
+            vhost_user_vsock: None,
             network: Network::None,
             stdio_console: false,
         }
@@ -98,6 +91,15 @@ pub fn validate_config(config: &KrunConfig) -> Result<()> {
     if config.kernel.is_none() {
         return Err(KrunBackendError::InvalidConfig(
             "krun requires a kernel".to_string(),
+        ));
+    }
+    if config
+        .vhost_user_vsock
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(KrunBackendError::InvalidConfig(
+            "vhost-user vsock socket path cannot be empty".to_string(),
         ));
     }
     match &config.network {

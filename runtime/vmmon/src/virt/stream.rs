@@ -15,7 +15,11 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::pin::Pin;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{ready, Context, Poll};
 
@@ -24,6 +28,8 @@ use std::collections::VecDeque;
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(target_os = "linux")]
+use tokio::sync::mpsc;
 
 use crate::virt::capacity::{VsockCapacity, VsockLease};
 use crate::virt::error::VirtError;
@@ -221,15 +227,37 @@ pub struct VsockListener {
     registered_port: u32,
     capacity: VsockCapacity,
     synthetic_sources: Option<SyntheticPortAllocator>,
+    _cleanup: Option<ListenerCleanup>,
 }
 
 enum VsockListenerInner {
     Unix(UnixListener),
+    #[cfg(target_os = "linux")]
+    Krun(mpsc::Receiver<PendingUnixVsock>),
     #[cfg(target_os = "macos")]
     Vz {
         listener: vz::device::VirtioSocketListener,
         accepted_leases: Arc<Mutex<VecDeque<VsockLease>>>,
     },
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct PendingUnixVsock {
+    pub(crate) stream: StdUnixStream,
+    pub(crate) source_port: u32,
+    pub(crate) destination_port: u32,
+    pub(crate) lease: VsockLease,
+    pub(crate) session_active: Arc<AtomicBool>,
+}
+
+struct ListenerCleanup(Option<Box<dyn FnOnce() + Send>>);
+
+impl Drop for ListenerCleanup {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.0.take() {
+            cleanup();
+        }
+    }
 }
 
 impl VsockListener {
@@ -243,6 +271,7 @@ impl VsockListener {
             registered_port,
             capacity,
             synthetic_sources: None,
+            _cleanup: None,
         }
     }
 
@@ -257,6 +286,26 @@ impl VsockListener {
             registered_port,
             capacity,
             synthetic_sources: Some(synthetic_sources),
+            _cleanup: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_krun_channel<F>(
+        receiver: mpsc::Receiver<PendingUnixVsock>,
+        registered_port: u32,
+        capacity: VsockCapacity,
+        cleanup: F,
+    ) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        Self {
+            inner: VsockListenerInner::Krun(receiver),
+            registered_port,
+            capacity,
+            synthetic_sources: None,
+            _cleanup: Some(ListenerCleanup(Some(Box::new(cleanup)))),
         }
     }
 
@@ -275,6 +324,7 @@ impl VsockListener {
             registered_port,
             capacity,
             synthetic_sources: None,
+            _cleanup: None,
         }
     }
 
@@ -292,6 +342,20 @@ impl VsockListener {
             VsockListenerInner::Unix(listener) => listener.accept().await.map(|(stream, _)| {
                 VsockStream::from_unix_stream(stream, None, self.registered_port, None)
             })?,
+            #[cfg(target_os = "linux")]
+            VsockListenerInner::Krun(receiver) => loop {
+                let pending = receiver.recv().await.ok_or_else(|| {
+                    VirtError::Backend("krun vsock backend stopped while listening".to_string())
+                })?;
+                if pending.session_active.load(Ordering::Acquire) {
+                    break VsockStream::from_unix_stream(
+                        UnixStream::from_std(pending.stream)?,
+                        Some(pending.source_port),
+                        pending.destination_port,
+                        Some(pending.lease),
+                    );
+                }
+            },
             #[cfg(target_os = "macos")]
             VsockListenerInner::Vz {
                 listener,
@@ -319,6 +383,26 @@ impl VsockListener {
             VsockListenerInner::Unix(listener) => try_accept_unix(listener)?.map(|stream| {
                 VsockStream::from_unix_stream(stream, None, self.registered_port, None)
             }),
+            #[cfg(target_os = "linux")]
+            VsockListenerInner::Krun(receiver) => loop {
+                match receiver.try_recv() {
+                    Ok(pending) if pending.session_active.load(Ordering::Acquire) => {
+                        break Some(VsockStream::from_unix_stream(
+                            UnixStream::from_std(pending.stream)?,
+                            Some(pending.source_port),
+                            pending.destination_port,
+                            Some(pending.lease),
+                        ));
+                    }
+                    Ok(_) => continue,
+                    Err(mpsc::error::TryRecvError::Empty) => break None,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        return Err(VirtError::Backend(
+                            "krun vsock backend stopped while listening".to_string(),
+                        ));
+                    }
+                }
+            },
             #[cfg(target_os = "macos")]
             VsockListenerInner::Vz {
                 listener,

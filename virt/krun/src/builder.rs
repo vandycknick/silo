@@ -77,8 +77,8 @@ impl VirtualMachineBuilder {
         self
     }
 
-    pub fn vsock_port(mut self, port: crate::VsockPort) -> Self {
-        self.config.vsock_ports.push(port);
+    pub fn vhost_user_vsock(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.config.vhost_user_vsock = Some(socket.into());
         self
     }
 
@@ -208,8 +208,8 @@ pub(crate) fn command_args(config: &KrunConfig) -> Vec<OsString> {
     for mount in &config.mounts {
         push_arg(&mut args, "--mount", format_mount(mount));
     }
-    for port in &config.vsock_ports {
-        push_arg(&mut args, "--vsock-port", format_vsock_port(port));
+    if let Some(socket) = &config.vhost_user_vsock {
+        push_arg(&mut args, "--vhost-user-vsock", socket.as_os_str());
     }
     match &config.network {
         Network::None => {
@@ -285,15 +285,6 @@ fn format_mount(mount: &crate::Mount) -> String {
     )
 }
 
-fn format_vsock_port(port: &crate::VsockPort) -> String {
-    format!(
-        "{}:{}:{}",
-        port.port,
-        port.path.display(),
-        if port.listen { "connect" } else { "listen" }
-    )
-}
-
 fn format_ro(read_only: bool) -> &'static str {
     if read_only {
         "ro"
@@ -326,7 +317,7 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
-    use crate::{Disk, VirtualMachineBuilder, VsockPort};
+    use crate::{Disk, VirtualMachineBuilder};
 
     use crate::builder::{command_args, format_command};
 
@@ -397,36 +388,21 @@ mod tests {
     }
 
     #[test]
-    fn start_arguments_preserve_transitional_core_vsock_ports() {
+    fn start_arguments_attach_vhost_user_vsock() {
         let config = VirtualMachineBuilder::new("krun")
             .kernel("/kernel")
-            .vsock_port(VsockPort {
-                port: 22,
-                path: PathBuf::from("/tmp/ssh.sock"),
-                listen: true,
-            })
-            .vsock_port(VsockPort {
-                port: 1027,
-                path: PathBuf::from("/tmp/agent.sock"),
-                listen: true,
-            })
+            .vhost_user_vsock("/tmp/vhost-vsock.sock")
             .build()
-            .expect("config should be valid");
+            .expect("vhost-user vsock config should be valid");
 
         let args = command_args(&config);
-        let mappings = args
-            .windows(2)
-            .filter(|pair| pair[0] == "--vsock-port")
-            .map(|pair| pair[1].clone())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            mappings,
-            [
-                OsString::from("22:/tmp/ssh.sock:connect"),
-                OsString::from("1027:/tmp/agent.sock:connect"),
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                OsString::from("--vhost-user-vsock"),
+                OsString::from("/tmp/vhost-vsock.sock"),
             ]
-        );
+        }));
+        assert!(!args.iter().any(|argument| argument == "--vsock-port"));
     }
 
     #[test]
