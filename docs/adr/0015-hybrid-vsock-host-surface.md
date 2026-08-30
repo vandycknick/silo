@@ -169,10 +169,12 @@ Semantics:
 - `uds` must contain exactly one normal path
   component. `vmmon` rejects absolute paths, empty paths, `.` and `..`, and
   paths containing directory separators. The resolved mux and listener paths
-  therefore remain inside the machine runtime directory. At startup, `vmmon`
-  also verifies that the resolved mux path and the longest possible listener
-  path fit the platform's Unix-socket path limit. A failure identifies the
-  invalid path and platform limit in the user-facing diagnostic.
+  therefore remain inside the machine runtime directory. The runtime-owned
+  names `vm.sock`, `vm.pid`, `vm.lock`, and `krun.vsock` are also rejected to
+  prevent collisions with vmmon control, lifecycle, and backend artifacts. At
+  startup, `vmmon` verifies that the resolved mux path and the longest possible
+  listener path fit the platform's Unix-socket path limit. A failure identifies
+  the invalid path and platform limit in the user-facing diagnostic.
 - Listener sockets derive from the mux path by suffixing `_<port>`, where
   `<port>` is the canonical decimal representation of a `u32`. Discovery
   ignores non-canonical names, non-socket filesystem entries, and symbolic

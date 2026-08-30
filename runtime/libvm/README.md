@@ -157,9 +157,11 @@ paths also return `None` for Silo's reserved host port 1027.
 
 Resolving an enabled path creates the owner-only machine runtime directory so an
 extension can bind a listener before VM startup. The extension owns that
-listener and must close and unlink it; vmmon owns and cleans up only its mux and
-private backend sockets. See the [hybrid vsock guide](../../docs/hybrid-vsock.md)
-for protocol examples, retries, security, limits, and shutdown behavior.
+listener and must close it during shutdown. Vmmon cleans up its mux and private
+backend sockets, then libvm removes the complete machine runtime tree; extension
+unlink attempts must therefore tolerate an already-removed path. See the
+[hybrid vsock guide](../../docs/hybrid-vsock.md) for protocol examples, retries,
+security, limits, and shutdown behavior.
 
 Machine kernel, initramfs, and agent overrides remain independent. An omitted
 asset always uses its matching file from the resolved installation set, so one

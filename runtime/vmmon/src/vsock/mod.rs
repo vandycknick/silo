@@ -357,7 +357,7 @@ mod tests {
     use tokio::net::UnixStream;
 
     use crate::virt::{BackendKind, VirtualMachine, VmConfig};
-    use crate::vsock::{registration_limit_reached, PreparedVsockSurface};
+    use crate::vsock::{register_discovered, registration_limit_reached, PreparedVsockSurface};
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -374,6 +374,69 @@ mod tests {
         assert!(!registration_limit_reached(1023));
         assert!(registration_limit_reached(1024));
         assert!(registration_limit_reached(1025));
+    }
+
+    #[tokio::test]
+    async fn listener_registration_limit_is_deterministic_and_monotonic() {
+        const FIRST_NEW_PORT: u32 = 2000;
+        const SECOND_NEW_PORT: u32 = 2001;
+        const REPLACEMENT_PORT: u32 = 2002;
+
+        let root = std::env::temp_dir().join(format!(
+            "vsr-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&root).expect("create short temp directory");
+        let config = VmConfig::builder("surface-registration-limit")
+            .base_directory(&root)
+            .kernel(Path::new("/mock-kernel"))
+            .build();
+        let machine =
+            VirtualMachine::with_backend(BackendKind::Mock, config).expect("create mock machine");
+        machine.start().await.expect("start mock machine");
+        let discovered = vec![
+            (
+                FIRST_NEW_PORT,
+                root.join(format!("vsock.sock_{FIRST_NEW_PORT}")),
+            ),
+            (
+                SECOND_NEW_PORT,
+                root.join(format!("vsock.sock_{SECOND_NEW_PORT}")),
+            ),
+        ];
+        let mut registered = (1..=1023).collect::<std::collections::BTreeSet<_>>();
+        let mut listeners = Vec::new();
+
+        assert!(
+            !register_discovered(&machine, &mut registered, &mut listeners, discovered, false,)
+                .await
+                .expect("register listeners")
+        );
+        assert_eq!(registered.len(), 1024);
+        assert_eq!(listeners.len(), 1);
+        assert!(registered.contains(&FIRST_NEW_PORT));
+        assert!(!registered.contains(&SECOND_NEW_PORT));
+
+        assert!(!register_discovered(
+            &machine,
+            &mut registered,
+            &mut listeners,
+            vec![(
+                REPLACEMENT_PORT,
+                root.join(format!("vsock.sock_{REPLACEMENT_PORT}")),
+            )],
+            false,
+        )
+        .await
+        .expect("reconcile after reaching the limit"));
+        assert_eq!(registered.len(), 1024);
+        assert_eq!(listeners.len(), 1);
+        assert!(!registered.contains(&REPLACEMENT_PORT));
+
+        drop(listeners);
+        machine.stop().await.expect("stop mock machine");
+        std::fs::remove_dir_all(root).expect("remove temp directory");
     }
 
     #[tokio::test]

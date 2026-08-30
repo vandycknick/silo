@@ -417,6 +417,7 @@ pub(crate) const fn connection_capacity_available(active_connections: usize) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::{Arc, Mutex};
 
     use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
@@ -427,6 +428,12 @@ mod tests {
     const DATA_LEN: usize = 16;
     const CONN_TX_BUF_SIZE: u32 = 64 * 1024;
     const VSOCK_PEER_PORT: u32 = 1234;
+
+    fn owned_epoll() -> OwnedFd {
+        let fd = epoll::create(false).expect("create epoll");
+        // SAFETY: epoll::create returns a fresh descriptor owned by this test.
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
 
     #[test]
     fn test_vsock_thread_backend_unix() {
@@ -480,8 +487,9 @@ mod tests {
 
         let accepted = Arc::new(Mutex::new(Vec::new()));
         let accepted_for_callback = accepted.clone();
+        let epoll_fd = owned_epoll();
         let mut backend = VsockThreadBackend::new_with_acceptor(
-            epoll::create(false).expect("create epoll"),
+            epoll_fd.as_raw_fd(),
             CID,
             CONN_TX_BUF_SIZE,
             Arc::new(move |request| {
@@ -511,6 +519,46 @@ mod tests {
 
         assert_eq!(backend.conn_map.len(), 1);
         assert_eq!(accepted.lock().expect("lock accepted streams").len(), 1);
+        drop(backend);
+    }
+
+    #[test]
+    fn rejected_guest_request_returns_reset_without_allocating_connection() {
+        const CID: u64 = 3;
+        const SOURCE_PORT: u32 = 4000;
+        const DESTINATION_PORT: u32 = 7000;
+
+        let epoll_fd = owned_epoll();
+        let mut backend = VsockThreadBackend::new_with_acceptor(
+            epoll_fd.as_raw_fd(),
+            CID,
+            CONN_TX_BUF_SIZE,
+            Arc::new(|_| None),
+        );
+        let mut packet_bytes = [0_u8; PKT_HEADER_SIZE];
+        // SAFETY: packet_bytes contains the complete fixed-size vsock header.
+        let mut packet = unsafe { VsockPacket::new(&mut packet_bytes, None).expect("packet") };
+        packet
+            .set_src_cid(CID)
+            .set_dst_cid(VSOCK_HOST_CID)
+            .set_src_port(SOURCE_PORT)
+            .set_dst_port(DESTINATION_PORT)
+            .set_type(VSOCK_TYPE_STREAM)
+            .set_op(VSOCK_OP_REQUEST)
+            .set_buf_alloc(CONN_TX_BUF_SIZE);
+
+        backend.send_pkt(&packet).expect("reject guest request");
+        assert!(backend.conn_map.is_empty());
+        assert!(backend.pending_rx());
+
+        backend.recv_pkt(&mut packet).expect("receive reset");
+        assert_eq!(packet.op(), VSOCK_OP_RST);
+        assert_eq!(packet.src_cid(), VSOCK_HOST_CID);
+        assert_eq!(packet.dst_cid(), CID);
+        assert_eq!(packet.src_port(), DESTINATION_PORT);
+        assert_eq!(packet.dst_port(), SOURCE_PORT);
+        assert!(!backend.pending_rx());
+        drop(backend);
     }
 
     #[test]

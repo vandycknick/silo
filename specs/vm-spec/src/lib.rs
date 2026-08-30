@@ -11,6 +11,8 @@ use serde_json::Value;
 /// Default filename for the public hybrid vsock mux.
 pub const DEFAULT_VSOCK_MUX_FILENAME: &str = "vsock.sock";
 
+const RESERVED_VSOCK_MUX_FILENAMES: [&str; 4] = ["vm.sock", "vm.pid", "vm.lock", "krun.vsock"];
+
 /// Top-level Silo virtual machine specification.
 ///
 /// This type is intentionally permissive for persistence: sections may be
@@ -441,6 +443,10 @@ fn validate_vsock_filename(filename: &Path) -> Result<(), &'static str> {
         return Err("vsock.uds must be exactly one normal portable filename component");
     }
 
+    if RESERVED_VSOCK_MUX_FILENAMES.contains(&filename_str) {
+        return Err("vsock.uds conflicts with a reserved machine runtime filename");
+    }
+
     Ok(())
 }
 
@@ -769,6 +775,26 @@ mod tests {
             let error =
                 serde_json::to_value(invalid).expect_err("invalid uds must fail serialization");
             assert!(error.to_string().contains("normal portable filename"));
+        }
+    }
+
+    #[test]
+    fn runtime_owned_uds_filenames_fail_deserialization_and_serialization() {
+        for filename in ["vm.sock", "vm.pid", "vm.lock", "krun.vsock"] {
+            let error = serde_json::from_value::<Vsock>(json!({
+                "enabled": true,
+                "uds": filename
+            }))
+            .expect_err("runtime-owned uds must fail deserialization");
+            assert!(error.to_string().contains("reserved machine runtime"));
+
+            let invalid = Vsock {
+                enabled: true,
+                uds: Some(PathBuf::from(filename)),
+            };
+            let error = serde_json::to_value(invalid)
+                .expect_err("runtime-owned uds must fail serialization");
+            assert!(error.to_string().contains("reserved machine runtime"));
         }
     }
 
