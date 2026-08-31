@@ -295,7 +295,7 @@ mod tests {
                 return Err(VirtError::Backend("listener unused in test".to_string()));
             };
             let path = std::env::temp_dir().join(format!(
-                "vmmon-machine-listener-{}-{}.sock",
+                "vl-{:x}-{:x}.sock",
                 std::process::id(),
                 NEXT_LISTENER.fetch_add(1, Ordering::Relaxed)
             ));

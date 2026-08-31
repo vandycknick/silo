@@ -60,9 +60,12 @@ struct TestEnv {
 }
 
 async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
-    let temp = tempfile::tempdir().expect("create temp dir");
-    // Unix socket paths live under the run root and must stay below SUN_LEN
-    // (104 bytes on macOS); the default TMPDIR can be too deep for that.
+    // The mock backend and runtime both create Unix sockets below these roots.
+    // Keep them short enough for macOS's 104-byte sockaddr_un limit.
+    let temp = tempfile::Builder::new()
+        .prefix("silo-test")
+        .tempdir_in("/tmp")
+        .expect("create short temp dir");
     let run_root = tempfile::Builder::new()
         .prefix("silo-mock")
         .tempdir_in("/tmp")
@@ -497,10 +500,7 @@ async fn reserved_host_listener_is_ignored_and_remains_extension_owned() {
     start_ready(&machine).await;
     assert!(
         !machine_dir
-            .join(format!(
-                "mock-vsock-listen-{}.sock",
-                protocol::DEFAULT_GUEST_CONTROL_PORT
-            ))
+            .join(format!(".v_{}", protocol::DEFAULT_GUEST_CONTROL_PORT))
             .exists(),
         "reserved host port must not be registered"
     );
@@ -603,7 +603,7 @@ async fn hybrid_vsock_surface_serves_mux_and_preboot_listener_end_to_end() {
         .expect("dial arbitrary guest port through default mux");
     assert!(read_mux_acknowledgement(&mut arbitrary).await >= 1_u32 << 30);
 
-    let guest_path = machine_dir.join("mock-vsock-listen-5000.sock");
+    let guest_path = machine_dir.join(".v_5000");
     let mut guest = UnixStream::connect(&guest_path)
         .await
         .expect("connect mock guest to host port");
@@ -629,7 +629,7 @@ async fn hybrid_vsock_surface_serves_mux_and_preboot_listener_end_to_end() {
         .expect("dynamic listener path");
     let dynamic_listener =
         UnixListener::bind(&dynamic_listener_path).expect("publish dynamic host listener");
-    let dynamic_guest_path = machine_dir.join("mock-vsock-listen-5001.sock");
+    let dynamic_guest_path = machine_dir.join(".v_5001");
     tokio::time::timeout(Duration::from_secs(5), async {
         while !dynamic_guest_path.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -707,10 +707,7 @@ async fn host_port_22_listener_is_independent_of_host_to_guest_ssh() {
     let listener = UnixListener::bind(&listener_path).expect("publish host port 22 listener");
 
     start_ready(&machine).await;
-    let guest_path = machine_dir.join(format!(
-        "mock-vsock-listen-{}.sock",
-        agent_spec::SSH_VSOCK_PORT
-    ));
+    let guest_path = machine_dir.join(format!(".v_{}", agent_spec::SSH_VSOCK_PORT));
     let guest = UnixStream::connect(guest_path)
         .await
         .expect("guest connection to host port 22");

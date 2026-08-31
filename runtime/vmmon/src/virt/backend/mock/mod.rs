@@ -297,15 +297,18 @@ impl VirtBackend for MockBackend {
         port: u32,
         capacity: VsockCapacity,
     ) -> Result<VsockListener, VirtError> {
-        let path = self
-            .config
-            .base_directory()
-            .join(format!("mock-vsock-listen-{port}.sock"));
+        let path = self.config.base_directory().join(format!(".v_{port}"));
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
+        let listener = UnixListener::bind(&path).map_err(|error| {
+            VirtError::Backend(format!(
+                "bind mock vsock listener {}: {error}",
+                path.display()
+            ))
+        })?;
         Ok(VsockListener::from_mock_unix_listener(
-            UnixListener::bind(&path)?,
+            listener,
             port,
             capacity,
             self.source_ports.clone(),
@@ -428,7 +431,11 @@ mod tests {
 
     #[tokio::test]
     async fn mock_connect_reports_unique_reusable_synthetic_source_metadata() {
-        let root = std::env::temp_dir().join(format!("vmmon-mock-metadata-{}", std::process::id()));
+        let root = std::path::Path::new("/tmp").join(format!(
+            "mm-{:x}-{:x}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
         let config = VmConfig::builder("mock-metadata")
             .base_directory(&root)
             .kernel(Path::new("/mock-kernel"))
@@ -473,9 +480,10 @@ mod tests {
 
     #[tokio::test]
     async fn mock_listener_reports_registered_destination_and_synthetic_source() {
-        let root = std::env::temp_dir().join(format!(
-            "vmmon-mock-listener-metadata-{}",
-            std::process::id()
+        let root = std::path::Path::new("/tmp").join(format!(
+            "ml-{:x}-{:x}",
+            std::process::id(),
+            rand::random::<u32>()
         ));
         let port = 7000;
         let config = VmConfig::builder("mock-listener-metadata")
@@ -489,7 +497,7 @@ mod tests {
             .listen_vsock(port, capacity)
             .await
             .expect("mock listener");
-        let path = root.join(format!("mock-vsock-listen-{port}.sock"));
+        let path = root.join(format!(".v_{port}"));
 
         let _client = UnixStream::connect(path).await.expect("guest connection");
         let stream = listener.accept().await.expect("accepted stream");

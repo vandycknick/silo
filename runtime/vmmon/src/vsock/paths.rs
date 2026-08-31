@@ -219,11 +219,11 @@ mod tests {
 
     use crate::vsock::paths::{listener_path, unix_socket_path_limit, OwnedMux};
 
-    fn temp_dir(label: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "vmmon-vsock-{label}-{}-{}",
+    fn temp_dir(_label: &str) -> std::path::PathBuf {
+        let path = std::path::Path::new("/tmp").join(format!(
+            "vp-{:x}-{:x}",
             std::process::id(),
-            rand::random::<u64>()
+            rand::random::<u32>()
         ));
         std::fs::create_dir(&path).expect("create temp directory");
         path

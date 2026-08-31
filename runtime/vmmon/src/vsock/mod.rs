@@ -359,11 +359,11 @@ mod tests {
     use crate::virt::{BackendKind, VirtualMachine, VmConfig};
     use crate::vsock::{register_discovered, registration_limit_reached, PreparedVsockSurface};
 
-    fn temp_dir(label: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "vmmon-vsock-surface-{label}-{}-{}",
+    fn temp_dir(_label: &str) -> std::path::PathBuf {
+        let path = std::path::Path::new("/tmp").join(format!(
+            "vs-{:x}-{:x}",
             std::process::id(),
-            rand::random::<u64>()
+            rand::random::<u32>()
         ));
         std::fs::create_dir(&path).expect("create temp directory");
         path
@@ -382,7 +382,7 @@ mod tests {
         const SECOND_NEW_PORT: u32 = 2001;
         const REPLACEMENT_PORT: u32 = 2002;
 
-        let root = std::env::temp_dir().join(format!(
+        let root = std::path::Path::new("/tmp").join(format!(
             "vsr-{}-{}",
             std::process::id(),
             rand::random::<u64>()

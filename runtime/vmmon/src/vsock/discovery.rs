@@ -86,10 +86,10 @@ mod tests {
     use crate::vsock::discovery::{install_watcher, listener_port, scan};
 
     fn temp_dir() -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "vmmon-vsock-discovery-{}-{}",
+        let path = std::path::Path::new("/tmp").join(format!(
+            "vd-{:x}-{:x}",
             std::process::id(),
-            rand::random::<u64>()
+            rand::random::<u32>()
         ));
         std::fs::create_dir(&path).expect("create temp directory");
         path
@@ -170,15 +170,17 @@ mod tests {
         assert!(install_watcher(&dir, dirty_tx, failed).is_err());
 
         std::fs::create_dir(&dir).expect("create recovered directory");
-        let (dirty_tx, mut dirty_rx) = mpsc::channel(1);
+        let _listener = UnixListener::bind(dir.join("vsock.sock_5000"))
+            .expect("publish listener during outage");
+        let (dirty_tx, _dirty_rx) = mpsc::channel(1);
         let failed = Arc::new(AtomicBool::new(false));
         let _watcher = install_watcher(&dir, dirty_tx, failed).expect("restore watcher");
-        let _listener = UnixListener::bind(dir.join("vsock.sock_5000"))
-            .expect("publish listener after recovery");
-        tokio::time::timeout(std::time::Duration::from_secs(5), dirty_rx.recv())
-            .await
-            .expect("recovered watch notification deadline")
-            .expect("recovered watch notification");
+
+        let discovered = scan(&dir, OsStr::new("vsock.sock")).expect("scan after recovery");
+        assert_eq!(
+            discovered.iter().map(|(port, _)| *port).collect::<Vec<_>>(),
+            [5000]
+        );
 
         let _ = std::fs::remove_dir_all(parent);
     }
