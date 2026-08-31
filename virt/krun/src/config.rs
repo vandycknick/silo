@@ -102,6 +102,12 @@ pub fn validate_config(config: &KrunConfig) -> Result<()> {
             "vhost-user vsock socket path cannot be empty".to_string(),
         ));
     }
+    #[cfg(not(target_os = "linux"))]
+    if config.vhost_user_vsock.is_some() {
+        return Err(KrunBackendError::InvalidConfig(
+            "vhost-user vsock is only supported on Linux".to_string(),
+        ));
+    }
     match &config.network {
         Network::None => {}
         Network::Unixgram(net) => {

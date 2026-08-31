@@ -314,7 +314,9 @@ fn open_krun_serial_pty() -> io::Result<KrunSerialPty> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{OsStr, OsString};
+    use std::ffi::OsStr;
+    #[cfg(target_os = "linux")]
+    use std::ffi::OsString;
     use std::path::PathBuf;
 
     use crate::{Disk, VirtualMachineBuilder};
@@ -387,6 +389,7 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "02:94:ef:e4:0c:ee"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn start_arguments_attach_vhost_user_vsock() {
         let config = VirtualMachineBuilder::new("krun")

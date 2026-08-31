@@ -13,8 +13,8 @@ use tokio::net::UnixListener;
 #[derive(Debug)]
 pub(crate) struct OwnedMux {
     path: PathBuf,
-    device: u64,
-    inode: u64,
+    device: libc::dev_t,
+    inode: libc::ino_t,
     owner_uid: u32,
     directory: OwnedFd,
     filename: OsString,
@@ -176,8 +176,8 @@ fn remove_stale_socket(
 fn unlink_if_matches(
     directory: &OwnedFd,
     filename: &std::ffi::OsStr,
-    device: u64,
-    inode: u64,
+    device: libc::dev_t,
+    inode: libc::ino_t,
 ) -> io::Result<()> {
     let metadata = match fstatat(directory, filename, AtFlags::AT_SYMLINK_NOFOLLOW) {
         Ok(metadata) => metadata,

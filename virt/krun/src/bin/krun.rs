@@ -244,6 +244,7 @@ fn configure_ctx(context: &context::Context, config: &KrunConfig) -> eyre::Resul
         context.add_virtiofs(&mount.tag, &mount.path, mount.read_only)?;
     }
 
+    #[cfg(target_os = "linux")]
     if let Some(socket) = &config.vhost_user_vsock {
         context.add_vhost_user_vsock(socket)?;
     }
@@ -323,9 +324,11 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 mod tests {
     use std::path::Path;
 
+    #[cfg(target_os = "linux")]
     use clap::Parser;
 
     use super::context::KernelFormat;
+    #[cfg(target_os = "linux")]
     use super::Cli;
     use super::{external_kernel_format, local_unix_datagram_path};
 
@@ -365,6 +368,7 @@ mod tests {
         assert!(Cli::try_parse_from(["krun", "--check-host", "--cpus", "2"]).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn parses_vhost_user_vsock() {
         let config = Cli::try_parse_from([

@@ -121,7 +121,7 @@ define_class!(
                 Ok(fd) => fd,
                 Err(err) => {
                     tracing::warn!(%err, "rejected VZ vsock connection whose fd could not be duplicated");
-                    return false;
+                    return false.into();
                 }
             };
             let connection = QueueRetained::new(
@@ -134,10 +134,10 @@ define_class!(
             };
             match catch_unwind(AssertUnwindSafe(|| (self.ivars().should_accept)(request))) {
                 Ok(true) => {}
-                Ok(false) => return false,
+                Ok(false) => return false.into(),
                 Err(_) => {
                     tracing::warn!("rejected VZ vsock connection after acceptance hook panicked");
-                    return false;
+                    return false.into();
                 }
             }
             let pending = PendingConnection {
@@ -332,6 +332,7 @@ impl VirtioSocketDevice {
                 return;
             };
 
+            let connection_queue = connection_queue.clone();
             let completion_handler = StackBlock::new(
                 move |connection: *mut VZVirtioSocketConnection, err: *mut NSError| {
                     let err = err.as_ref();
