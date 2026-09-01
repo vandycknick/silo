@@ -713,31 +713,50 @@ impl Machine {
     ) -> Result<Option<WaitTarget>, LibVmError> {
         let runtime = self.runtime();
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+
+        // vmmon removes its pidfile during shutdown before releasing its lifetime lock and
+        // exiting. Preserve the persisted process identity long enough to wait for that final
+        // shutdown work instead of reconciling the missing pidfile as an already-stopped run.
+        let persisted = runtime.machine_state(config.id).await?;
+        if matches!(
+            persisted.status,
+            MachineRuntimeState::Starting
+                | MachineRuntimeState::Running
+                | MachineRuntimeState::Stopping
+        ) {
+            if let Some(pid) = persisted.vmmon_pid {
+                let generation = VmmonRunIdentity {
+                    pid,
+                    started_at: persisted.started_at,
+                    run_id: persisted.run_id.clone(),
+                };
+                if let Some(identity) = monitor_identity(&generation)? {
+                    if let Some(expected_run_id) = expected_run_id {
+                        if generation.run_id.as_deref() != Some(expected_run_id.as_str()) {
+                            return Err(stale_generation(
+                                &config,
+                                expected_run_id,
+                                generation.run_id,
+                            ));
+                        }
+                    }
+                    return Ok(Some(WaitTarget {
+                        config,
+                        generation,
+                        identity,
+                        stop_requested: false,
+                        forced: false,
+                    }));
+                }
+            }
+        }
+
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if !status.is_active() {
             return Ok(None);
         }
         require_current_run(&config, &status, expected_run_id)?;
-
-        let Some(pid) = status.pid else {
-            return Ok(None);
-        };
-
-        let generation = VmmonRunIdentity {
-            pid,
-            started_at: status.started_at,
-            run_id: status.run_id.clone(),
-        };
-        let Some(identity) = monitor_identity(&generation)? else {
-            return Ok(None);
-        };
-        Ok(Some(WaitTarget {
-            config,
-            generation,
-            identity,
-            stop_requested: false,
-            forced: false,
-        }))
+        Ok(None)
     }
 
     async fn wait_for_target_exit(
