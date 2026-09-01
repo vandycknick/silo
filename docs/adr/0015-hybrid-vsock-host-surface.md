@@ -8,6 +8,11 @@ Accepted
 
 Supersedes [ADR 0005](0005-vmmon-vsock-endpoint-plugins.md)
 
+Amended by [ADR 0016](0016-vsock-forwards-and-netd-publications.md): port
+1028 is reserved in both namespaces, `vmmon` binds host listeners for declared
+and held forwards, and 16 of the 1023 connection slots are reserved for
+internal traffic.
+
 ## The Problem
 
 Silo needs a generic way for host software to exchange byte streams with guest
