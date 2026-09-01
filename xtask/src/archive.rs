@@ -164,7 +164,7 @@ fn create_tar(
 }
 
 fn disk_image_license_transform(root: &str) -> String {
-    format!("s,^{DISK_IMAGE_LICENSE}$,{root}/LICENSES/libkrun-APACHE-2.0.txt,")
+    format!("s,^{DISK_IMAGE_LICENSE}$,{root}/LICENSES/APACHE-2.0.txt,")
 }
 
 fn compress_tar(raw: &Path, archive: &Path) -> Result<(), ArchiveError> {
@@ -464,7 +464,7 @@ mod tests {
             .is_file());
         assert_eq!(
             disk_image_license_transform("silo-runtime-1.0.0-linux-amd64"),
-            "s,^common/disk-image/LICENSE-APACHE$,silo-runtime-1.0.0-linux-amd64/LICENSES/libkrun-APACHE-2.0.txt,"
+            "s,^common/disk-image/LICENSE-APACHE$,silo-runtime-1.0.0-linux-amd64/LICENSES/APACHE-2.0.txt,"
         );
     }
 }

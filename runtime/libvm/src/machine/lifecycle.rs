@@ -8,6 +8,7 @@ use nix::{
 use tokio::time::{sleep, Instant};
 use uuid::Uuid;
 
+use crate::lock_manager::MachineLifetimeLock;
 use crate::machine::root_disk::RootDiskResizeOutcome;
 use crate::machine::{
     Machine, MachineData, MachineExit, MachineExitOutcome, MachineKillOptions, MachineRunId,
@@ -75,6 +76,10 @@ impl Machine {
             let serial_log_path = machine_paths.serial_log_path();
 
             runtime.ensure_machine_runtime_directories(config.id)?;
+            let lifetime_lock = MachineLifetimeLock::try_acquire(&machine_paths.vmmon_lock_path())?
+                .ok_or_else(|| LibVmError::MachineAlreadyRunning {
+                    reference: config.name.clone(),
+                })?;
 
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             runtime
@@ -179,6 +184,7 @@ impl Machine {
                 machine_id: config.id,
                 name: &config.name,
                 machine_dir: &config.machine_dir,
+                machine_runtime_dir: machine_paths.machine_run_dir(),
                 pidfile: &pid_path,
                 exit_status: &exit_status_path,
                 config: &config_path,
@@ -191,6 +197,7 @@ impl Machine {
                 agent_enabled,
                 startup_command: startup_command.as_ref(),
                 machine_log_dir: &machine_log_dir,
+                machine_lock: &lifetime_lock,
             };
             if let Err(err) = vmmon.spawn(&launch).await {
                 return Err(finish_failed_start(
@@ -706,31 +713,50 @@ impl Machine {
     ) -> Result<Option<WaitTarget>, LibVmError> {
         let runtime = self.runtime();
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
+
+        // vmmon removes its pidfile during shutdown before releasing its lifetime lock and
+        // exiting. Preserve the persisted process identity long enough to wait for that final
+        // shutdown work instead of reconciling the missing pidfile as an already-stopped run.
+        let persisted = runtime.machine_state(config.id).await?;
+        if matches!(
+            persisted.status,
+            MachineRuntimeState::Starting
+                | MachineRuntimeState::Running
+                | MachineRuntimeState::Stopping
+        ) {
+            if let Some(pid) = persisted.vmmon_pid {
+                let generation = VmmonRunIdentity {
+                    pid,
+                    started_at: persisted.started_at,
+                    run_id: persisted.run_id.clone(),
+                };
+                if let Some(identity) = monitor_identity(&generation)? {
+                    if let Some(expected_run_id) = expected_run_id {
+                        if generation.run_id.as_deref() != Some(expected_run_id.as_str()) {
+                            return Err(stale_generation(
+                                &config,
+                                expected_run_id,
+                                generation.run_id,
+                            ));
+                        }
+                    }
+                    return Ok(Some(WaitTarget {
+                        config,
+                        generation,
+                        identity,
+                        stop_requested: false,
+                        forced: false,
+                    }));
+                }
+            }
+        }
+
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
         if !status.is_active() {
             return Ok(None);
         }
         require_current_run(&config, &status, expected_run_id)?;
-
-        let Some(pid) = status.pid else {
-            return Ok(None);
-        };
-
-        let generation = VmmonRunIdentity {
-            pid,
-            started_at: status.started_at,
-            run_id: status.run_id.clone(),
-        };
-        let Some(identity) = monitor_identity(&generation)? else {
-            return Ok(None);
-        };
-        Ok(Some(WaitTarget {
-            config,
-            generation,
-            identity,
-            stop_requested: false,
-            forced: false,
-        }))
+        Ok(None)
     }
 
     async fn wait_for_target_exit(

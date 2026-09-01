@@ -7,6 +7,10 @@ use thiserror::Error;
 
 const KRUN_DISK_FORMAT_RAW: u32 = 0;
 const KRUN_SYNC_RELAXED: u32 = 1;
+#[cfg(target_os = "linux")]
+const VIRTIO_DEVICE_VSOCK: u32 = 19;
+#[cfg(target_os = "linux")]
+const VHOST_USER_VSOCK_QUEUE_SIZES: [u16; 3] = [128, 128, 128];
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const KRUN_KERNEL_FORMAT_RAW: u32 = 0;
 #[cfg(target_arch = "x86_64")]
@@ -58,27 +62,6 @@ impl Context {
         check(
             "set_vm_config",
             libkrun::krun_set_vm_config(self.id, vcpus, ram_mib),
-        )
-    }
-
-    pub(crate) fn disable_implicit_console(&self) -> Result<(), Error> {
-        check(
-            "disable_implicit_console",
-            libkrun::krun_disable_implicit_console(self.id),
-        )
-    }
-
-    pub(crate) fn disable_implicit_init(&self) -> Result<(), Error> {
-        check(
-            "disable_implicit_init",
-            libkrun::krun_disable_implicit_init(self.id),
-        )
-    }
-
-    pub(crate) fn disable_implicit_vsock(&self) -> Result<(), Error> {
-        check(
-            "disable_implicit_vsock",
-            libkrun::krun_disable_implicit_vsock(self.id),
         )
     }
 
@@ -137,14 +120,19 @@ impl Context {
         })
     }
 
-    pub(crate) fn add_vsock(&self) -> Result<(), Error> {
-        check("add_vsock", libkrun::krun_add_vsock(self.id, 0))
-    }
-
-    pub(crate) fn add_vsock_port(&self, port: u32, path: &Path, listen: bool) -> Result<(), Error> {
-        let path = path_cstring(path)?;
-        check("add_vsock_port2", unsafe {
-            libkrun::krun_add_vsock_port2(self.id, port, path.as_ptr(), listen)
+    #[cfg(target_os = "linux")]
+    pub(crate) fn add_vhost_user_vsock(&self, socket: &Path) -> Result<(), Error> {
+        let socket = path_cstring(socket)?;
+        check("add_vhost_user_vsock", unsafe {
+            libkrun::krun_add_vhost_user_device(
+                self.id,
+                VIRTIO_DEVICE_VSOCK,
+                socket.as_ptr(),
+                std::ptr::null(),
+                VHOST_USER_VSOCK_QUEUE_SIZES.len() as u16,
+                VHOST_USER_VSOCK_QUEUE_SIZES.as_ptr(),
+                0,
+            )
         })
     }
 
@@ -253,6 +241,8 @@ mod tests {
     use crate::context::{
         COMPAT_NET_FEATURES, KRUN_DISK_FORMAT_RAW, KRUN_SYNC_RELAXED, NET_FLAG_DHCP_CLIENT,
     };
+    #[cfg(target_os = "linux")]
+    use crate::context::{VHOST_USER_VSOCK_QUEUE_SIZES, VIRTIO_DEVICE_VSOCK};
 
     #[test]
     fn constants_match_libkrun_api() {
@@ -260,6 +250,11 @@ mod tests {
         assert_eq!(KRUN_SYNC_RELAXED, 1);
         assert_eq!(COMPAT_NET_FEATURES, 19_587);
         assert_eq!(NET_FLAG_DHCP_CLIENT, 2);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(VIRTIO_DEVICE_VSOCK, 19);
+            assert_eq!(VHOST_USER_VSOCK_QUEUE_SIZES, [128, 128, 128]);
+        }
     }
 
     #[test]

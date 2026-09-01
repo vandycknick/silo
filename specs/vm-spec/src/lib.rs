@@ -1,15 +1,23 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Component, Path, PathBuf};
 
 use semver::Version;
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as _, IgnoredAny, MapAccess, Visitor};
+use serde::ser::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+
+/// Default filename for the public hybrid vsock mux.
+pub const DEFAULT_VSOCK_MUX_FILENAME: &str = "vsock.sock";
+
+const RESERVED_VSOCK_MUX_FILENAMES: [&str; 4] = ["vm.sock", "vm.pid", "vm.lock", "krun.vsock"];
 
 /// Top-level Silo virtual machine specification.
 ///
 /// This type is intentionally permissive for persistence: sections may be
 /// absent and are resolved by the runtime boundary that launches the VM.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VmSpec {
     /// Semantic version of the VM specification format.
@@ -29,7 +37,7 @@ pub struct VmSpec {
     /// Host directories mounted into the guest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<Mount>,
-    /// Vsock endpoints supervised alongside the VM.
+    /// Public hybrid vsock host surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vsock: Option<Vsock>,
     /// Free-form metadata for callers that need non-standard annotations.
@@ -50,6 +58,127 @@ impl VmSpec {
             vsock: None,
             annotations: BTreeMap::new(),
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for VmSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(VmSpecVisitor)
+    }
+}
+
+struct VmSpecVisitor;
+
+impl<'de> Visitor<'de> for VmSpecVisitor {
+    type Value = VmSpec;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a VM specification map")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut spec_version = None;
+        let mut guest = None;
+        let mut boot = None;
+        let mut hardware = None;
+        let mut storage = None;
+        let mut mounts = None;
+        let mut vsock = None;
+        let mut annotations = None;
+        let mut removed_paths = Vec::new();
+
+        while let Some(field) = map.next_key::<String>()? {
+            match field.as_str() {
+                "specVersion" => {
+                    if spec_version.is_some() {
+                        return Err(A::Error::duplicate_field("specVersion"));
+                    }
+                    spec_version = Some(map.next_value()?);
+                }
+                "guest" => {
+                    if guest.is_some() {
+                        return Err(A::Error::duplicate_field("guest"));
+                    }
+                    guest = Some(map.next_value()?);
+                }
+                "boot" => {
+                    if boot.is_some() {
+                        return Err(A::Error::duplicate_field("boot"));
+                    }
+                    boot = Some(map.next_value()?);
+                }
+                "hardware" => {
+                    if hardware.is_some() {
+                        return Err(A::Error::duplicate_field("hardware"));
+                    }
+                    hardware = Some(map.next_value()?);
+                }
+                "storage" => {
+                    if storage.is_some() {
+                        return Err(A::Error::duplicate_field("storage"));
+                    }
+                    storage = Some(map.next_value()?);
+                }
+                "mounts" => {
+                    if mounts.is_some() {
+                        return Err(A::Error::duplicate_field("mounts"));
+                    }
+                    mounts = Some(map.next_value()?);
+                }
+                "vsock" => {
+                    if vsock.is_some() {
+                        return Err(A::Error::duplicate_field("vsock"));
+                    }
+                    let parsed = map.next_value::<Option<ParsedVsock>>()?;
+                    if let Some(parsed) = &parsed {
+                        removed_paths.extend(parsed.removed_paths.iter().cloned());
+                    }
+                    vsock = Some(parsed);
+                }
+                "annotations" => {
+                    if annotations.is_some() {
+                        return Err(A::Error::duplicate_field("annotations"));
+                    }
+                    annotations = Some(map.next_value()?);
+                }
+                "vsock_endpoints" | "vsockEndpoints" => {
+                    let removed = map.next_value::<Value>()?;
+                    removed_paths.push(field.clone());
+                    collect_removed_paths(&removed, &field, &mut removed_paths);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        if !removed_paths.is_empty() {
+            return Err(A::Error::custom(removed_fields_error(&removed_paths)));
+        }
+
+        let vsock = vsock.flatten();
+        if let Some(parsed) = &vsock {
+            if let Some(error) = parsed.validation_error {
+                return Err(A::Error::custom(error));
+            }
+        }
+
+        Ok(VmSpec {
+            spec_version: spec_version.ok_or_else(|| A::Error::missing_field("specVersion"))?,
+            guest: guest.flatten(),
+            boot: boot.flatten(),
+            hardware: hardware.flatten(),
+            storage: storage.flatten(),
+            mounts: mounts.unwrap_or_default(),
+            vsock: vsock.map(|parsed| parsed.value),
+            annotations: annotations.unwrap_or_default(),
+        })
     }
 }
 
@@ -148,118 +277,201 @@ pub struct Mount {
     pub read_only: bool,
 }
 
-/// Vsock endpoint collection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Public hybrid vsock host surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vsock {
-    /// Endpoints supervised for this VM.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub endpoints: Vec<VsockEndpoint>,
+    /// Expose the user-facing hybrid vsock Unix-socket surface.
+    pub enabled: bool,
+    /// Mux socket filename within the machine runtime directory.
+    pub uds: Option<PathBuf>,
 }
 
-/// A host-side service bound to a guest vsock port.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct VsockEndpoint {
-    /// Stable endpoint name.
-    pub name: String,
-    /// Guest vsock port number.
-    pub port: u32,
-    /// Direction of the vsock connection from the plugin perspective.
-    pub mode: VsockEndpointMode,
-    /// Plugin process that implements the endpoint.
-    pub plugin: Plugin,
-    /// Process lifecycle policy for the plugin.
-    #[serde(default)]
-    pub lifecycle: Lifecycle,
+struct VsockRef<'a> {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uds: Option<&'a Path>,
 }
 
-/// Vsock endpoint connection mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VsockEndpointMode {
-    /// Plugin connects to a listening guest service.
-    Connect,
-    /// Plugin listens for guest connections.
-    Listen,
-}
-
-/// Host plugin process definition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Plugin {
-    /// Command to execute for the plugin process.
-    pub command: PathBuf,
-    /// Command-line arguments passed to the plugin.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub args: Vec<String>,
-    /// Environment variables added for the plugin process.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
-    /// Optional working directory for the plugin process.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_dir: Option<PathBuf>,
-    /// Plugin-specific JSON configuration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config: Option<Value>,
-}
-
-/// Supervision policy for a plugin process.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Lifecycle {
-    /// Start the plugin automatically with the VM.
-    pub autostart: bool,
-    /// Startup timeout in milliseconds.
-    pub startup_timeout_ms: u64,
-    /// Restart behavior when the process exits.
-    #[serde(default)]
-    pub restart: RestartPolicy,
-    /// Restart backoff timing in milliseconds.
-    #[serde(default)]
-    pub backoff_ms: Backoff,
-}
-
-impl Default for Lifecycle {
-    fn default() -> Self {
-        Self {
-            autostart: true,
-            startup_timeout_ms: 5_000,
-            restart: RestartPolicy::default(),
-            backoff_ms: Backoff::default(),
+impl Vsock {
+    /// Validate the public vsock configuration.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.enabled && self.uds.is_some() {
+            return Err("vsock.uds cannot be configured while vsock.enabled is false");
         }
+
+        if let Some(filename) = &self.uds {
+            validate_vsock_filename(filename)?;
+        }
+
+        Ok(())
     }
 }
 
-/// Plugin restart policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum RestartPolicy {
-    /// Never restart the plugin.
-    Never,
-    /// Restart when the plugin exits unsuccessfully.
-    #[default]
-    OnFailure,
-    /// Restart after every plugin exit.
-    Always,
-}
-
-/// Restart backoff timing in milliseconds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Backoff {
-    /// Initial restart delay in milliseconds.
-    pub initial: u64,
-    /// Maximum restart delay in milliseconds.
-    pub max: u64,
-}
-
-impl Default for Backoff {
-    fn default() -> Self {
-        Self {
-            initial: 200,
-            max: 5_000,
+impl Serialize for Vsock {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(S::Error::custom)?;
+        VsockRef {
+            enabled: self.enabled,
+            uds: self.uds.as_deref(),
         }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Vsock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let parsed = ParsedVsock::deserialize(deserializer)?;
+        if !parsed.removed_paths.is_empty() {
+            return Err(D::Error::custom(removed_fields_error(
+                &parsed.removed_paths,
+            )));
+        }
+        if let Some(error) = parsed.validation_error {
+            return Err(D::Error::custom(error));
+        }
+        Ok(parsed.value)
+    }
+}
+
+struct ParsedVsock {
+    value: Vsock,
+    removed_paths: Vec<String>,
+    validation_error: Option<&'static str>,
+}
+
+impl<'de> Deserialize<'de> for ParsedVsock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(VsockVisitor)
+    }
+}
+
+struct VsockVisitor;
+
+impl<'de> Visitor<'de> for VsockVisitor {
+    type Value = ParsedVsock;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a vsock configuration map")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut enabled = None;
+        let mut uds = None;
+        let mut removed_paths = Vec::new();
+
+        while let Some(field) = map.next_key::<String>()? {
+            match field.as_str() {
+                "enabled" => {
+                    if enabled.is_some() {
+                        return Err(A::Error::duplicate_field("enabled"));
+                    }
+                    enabled = Some(map.next_value()?);
+                }
+                "uds" => {
+                    if uds.is_some() {
+                        return Err(A::Error::duplicate_field("uds"));
+                    }
+                    uds = Some(map.next_value()?);
+                }
+                "endpoints" | "plugin" | "lifecycle" => {
+                    let removed = map.next_value::<Value>()?;
+                    let path = format!("vsock.{field}");
+                    removed_paths.push(path.clone());
+                    collect_removed_paths(&removed, &path, &mut removed_paths);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        let value = Vsock {
+            enabled: enabled.unwrap_or_default(),
+            uds: uds.flatten(),
+        };
+        let validation_error = value.validate().err();
+        Ok(ParsedVsock {
+            value,
+            removed_paths,
+            validation_error,
+        })
+    }
+}
+
+/// Return whether the public vsock surface is effectively enabled.
+pub fn effective_vsock_enabled(vsock: Option<&Vsock>) -> bool {
+    vsock.is_some_and(|vsock| vsock.enabled)
+}
+
+/// Return the effective mux filename when the public vsock surface is enabled.
+pub fn effective_vsock_filename(vsock: Option<&Vsock>) -> Option<&Path> {
+    let vsock = vsock.filter(|vsock| vsock.enabled)?;
+    Some(
+        vsock
+            .uds
+            .as_deref()
+            .unwrap_or_else(|| Path::new(DEFAULT_VSOCK_MUX_FILENAME)),
+    )
+}
+
+fn validate_vsock_filename(filename: &Path) -> Result<(), &'static str> {
+    let Some(filename_str) = filename.to_str() else {
+        return Err("vsock.uds must be valid UTF-8");
+    };
+
+    if filename_str.is_empty() || filename_str.contains(['/', '\\']) || filename_str.contains('\0')
+    {
+        return Err("vsock.uds must be exactly one normal portable filename component");
+    }
+
+    let mut components = filename.components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err("vsock.uds must be exactly one normal portable filename component");
+    }
+
+    if RESERVED_VSOCK_MUX_FILENAMES.contains(&filename_str) {
+        return Err("vsock.uds conflicts with a reserved machine runtime filename");
+    }
+
+    Ok(())
+}
+
+fn removed_fields_error(paths: &[String]) -> String {
+    format!(
+        "removed ADR 0005 fields are not supported: {}",
+        paths.join(", ")
+    )
+}
+
+fn collect_removed_paths(value: &Value, path: &str, paths: &mut Vec<String>) {
+    match value {
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                collect_removed_paths(value, &format!("{path}[{index}]"), paths);
+            }
+        }
+        Value::Object(fields) => {
+            for (field, value) in fields {
+                let field_path = format!("{path}.{field}");
+                paths.push(field_path.clone());
+                collect_removed_paths(value, &field_path, paths);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -271,8 +483,8 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        Backoff, Boot, Disk, Guest, GuestOs, Hardware, Kernel, Lifecycle, Mount, Plugin,
-        RestartPolicy, Storage, VmSpec, Vsock, VsockEndpoint, VsockEndpointMode,
+        effective_vsock_enabled, effective_vsock_filename, Boot, Disk, Guest, GuestOs, Hardware,
+        Kernel, Mount, Storage, VmSpec, Vsock, DEFAULT_VSOCK_MUX_FILENAME,
     };
 
     #[test]
@@ -292,6 +504,11 @@ mod tests {
         .expect("deserialize vm spec");
 
         assert_eq!(spec, VmSpec::current());
+    }
+
+    #[test]
+    fn current_spec_version_remains_0_1_0() {
+        assert_eq!(VmSpec::current().spec_version.to_string(), "0.1.0");
     }
 
     #[test]
@@ -326,27 +543,8 @@ mod tests {
                 read_only: false,
             }],
             vsock: Some(Vsock {
-                endpoints: vec![VsockEndpoint {
-                    name: "api".to_string(),
-                    port: 8080,
-                    mode: VsockEndpointMode::Connect,
-                    plugin: Plugin {
-                        command: PathBuf::from("/usr/local/bin/silo-endpoint"),
-                        args: vec!["--serve".to_string()],
-                        env: BTreeMap::from([("RUST_LOG".to_string(), "info".to_string())]),
-                        working_dir: Some(PathBuf::from("/tmp")),
-                        config: None,
-                    },
-                    lifecycle: Lifecycle {
-                        autostart: true,
-                        startup_timeout_ms: 5_000,
-                        restart: RestartPolicy::OnFailure,
-                        backoff_ms: Backoff {
-                            initial: 200,
-                            max: 5_000,
-                        },
-                    },
-                }],
+                enabled: true,
+                uds: Some(PathBuf::from("custom.sock")),
             }),
             annotations: BTreeMap::from([("io.silo.demo".to_string(), "true".to_string())]),
             ..VmSpec::current()
@@ -382,25 +580,8 @@ mod tests {
                     { "source": "/workspace", "tag": "workspace", "readOnly": false }
                 ],
                 "vsock": {
-                    "endpoints": [
-                        {
-                            "name": "api",
-                            "port": 8080,
-                            "mode": "connect",
-                            "plugin": {
-                                "command": "/usr/local/bin/silo-endpoint",
-                                "args": ["--serve"],
-                                "env": { "RUST_LOG": "info" },
-                                "workingDir": "/tmp"
-                            },
-                            "lifecycle": {
-                                "autostart": true,
-                                "startupTimeoutMs": 5000,
-                                "restart": "on_failure",
-                                "backoffMs": { "initial": 200, "max": 5000 }
-                            }
-                        }
-                    ]
+                    "enabled": true,
+                    "uds": "custom.sock"
                 },
                 "annotations": { "io.silo.demo": "true" }
             })
@@ -435,6 +616,480 @@ mod tests {
                 "boot": { "kernel": { "path": "/kernel" } },
                 "storage": {}
             })
+        );
+    }
+
+    #[test]
+    fn omitted_and_disabled_vsock_have_no_effective_surface() {
+        let disabled = Vsock {
+            enabled: false,
+            uds: None,
+        };
+
+        assert!(!effective_vsock_enabled(None));
+        assert_eq!(effective_vsock_filename(None), None);
+        assert!(!effective_vsock_enabled(Some(&disabled)));
+        assert_eq!(effective_vsock_filename(Some(&disabled)), None);
+        assert_eq!(
+            serde_json::to_value(&disabled).expect("serialize disabled vsock"),
+            json!({ "enabled": false })
+        );
+    }
+
+    #[test]
+    fn enabled_vsock_uses_default_or_custom_filename() {
+        let default = Vsock {
+            enabled: true,
+            uds: None,
+        };
+        let custom = Vsock {
+            enabled: true,
+            uds: Some(PathBuf::from("api.sock")),
+        };
+
+        assert!(effective_vsock_enabled(Some(&default)));
+        assert_eq!(
+            effective_vsock_filename(Some(&default)),
+            Some(std::path::Path::new(DEFAULT_VSOCK_MUX_FILENAME))
+        );
+        assert_eq!(
+            effective_vsock_filename(Some(&custom)),
+            Some(std::path::Path::new("api.sock"))
+        );
+        assert_eq!(
+            serde_json::from_value::<Vsock>(json!({ "enabled": true }))
+                .expect("deserialize default filename"),
+            default
+        );
+        assert_eq!(
+            serde_json::from_value::<Vsock>(json!({
+                "enabled": true,
+                "uds": "api.sock"
+            }))
+            .expect("deserialize custom filename"),
+            custom
+        );
+    }
+
+    #[test]
+    fn dot_prefixed_and_unicode_filenames_are_valid() {
+        for filename in [".vsock.sock", "套接字.sock"] {
+            let vsock = Vsock {
+                enabled: true,
+                uds: Some(PathBuf::from(filename)),
+            };
+
+            let encoded = serde_json::to_string(&vsock).expect("serialize valid filename");
+            assert_eq!(
+                serde_json::from_str::<Vsock>(&encoded).expect("deserialize valid filename"),
+                vsock
+            );
+        }
+    }
+
+    #[test]
+    fn new_vsock_shape_and_validation_work_through_yaml() {
+        let yaml = "specVersion: 0.1.0\nfutureTopLevel:\n  nested: true\nvsock:\n  enabled: true\n  uds: custom.sock\n  futureVsockField: 42\n";
+        let spec = serde_yaml_ng::from_str::<VmSpec>(yaml).expect("deserialize YAML VM spec");
+        assert_eq!(
+            spec.vsock,
+            Some(Vsock {
+                enabled: true,
+                uds: Some(PathBuf::from("custom.sock"))
+            })
+        );
+
+        let encoded = serde_yaml_ng::to_string(&spec).expect("serialize YAML VM spec");
+        assert!(encoded.contains("enabled: true"));
+        assert!(encoded.contains("uds: custom.sock"));
+        assert!(!encoded.contains("futureTopLevel"));
+        assert!(!encoded.contains("futureVsockField"));
+        assert_eq!(
+            serde_yaml_ng::from_str::<VmSpec>(&encoded).expect("round-trip YAML VM spec"),
+            spec
+        );
+
+        let error = serde_yaml_ng::from_str::<VmSpec>(
+            "specVersion: 0.1.0\nvsock:\n  enabled: false\n  uds: ignored.sock\n",
+        )
+        .expect_err("invalid YAML vsock must fail validation");
+        assert!(error.to_string().contains("enabled is false"));
+    }
+
+    #[test]
+    fn enabled_defaults_to_false() {
+        let vsock = serde_json::from_value::<Vsock>(json!({})).expect("deserialize empty vsock");
+
+        assert_eq!(
+            vsock,
+            Vsock {
+                enabled: false,
+                uds: None
+            }
+        );
+    }
+
+    #[test]
+    fn uds_is_rejected_while_disabled_during_deserialization_and_serialization() {
+        let error = serde_json::from_value::<Vsock>(json!({ "uds": "api.sock" }))
+            .expect_err("disabled uds must fail deserialization");
+        assert!(error.to_string().contains("enabled is false"));
+
+        let invalid = Vsock {
+            enabled: false,
+            uds: Some(PathBuf::from("api.sock")),
+        };
+        let invalid_spec = VmSpec {
+            vsock: Some(invalid),
+            ..VmSpec::current()
+        };
+        let error = serde_json::to_value(invalid_spec)
+            .expect_err("programmatically invalid VM spec must fail serialization");
+        assert!(error.to_string().contains("enabled is false"));
+    }
+
+    #[test]
+    fn invalid_uds_filenames_fail_deserialization_and_serialization() {
+        for filename in [
+            "",
+            ".",
+            "..",
+            "/absolute.sock",
+            "dir/socket",
+            "dir\\socket",
+            "socket/",
+            "socket\\",
+            "nul\0socket",
+        ] {
+            let error = serde_json::from_value::<Vsock>(json!({
+                "enabled": true,
+                "uds": filename
+            }))
+            .expect_err("invalid uds must fail deserialization");
+            assert!(error.to_string().contains("normal portable filename"));
+
+            let invalid = Vsock {
+                enabled: true,
+                uds: Some(PathBuf::from(filename)),
+            };
+            let error =
+                serde_json::to_value(invalid).expect_err("invalid uds must fail serialization");
+            assert!(error.to_string().contains("normal portable filename"));
+        }
+    }
+
+    #[test]
+    fn runtime_owned_uds_filenames_fail_deserialization_and_serialization() {
+        for filename in ["vm.sock", "vm.pid", "vm.lock", "krun.vsock"] {
+            let error = serde_json::from_value::<Vsock>(json!({
+                "enabled": true,
+                "uds": filename
+            }))
+            .expect_err("runtime-owned uds must fail deserialization");
+            assert!(error.to_string().contains("reserved machine runtime"));
+
+            let invalid = Vsock {
+                enabled: true,
+                uds: Some(PathBuf::from(filename)),
+            };
+            let error = serde_json::to_value(invalid)
+                .expect_err("runtime-owned uds must fail serialization");
+            assert!(error.to_string().contains("reserved machine runtime"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_uds_fails_serialization() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = Vsock {
+            enabled: true,
+            uds: Some(PathBuf::from(OsString::from_vec(vec![0xff]))),
+        };
+
+        let error =
+            serde_json::to_value(invalid).expect_err("non-UTF-8 uds must fail serialization");
+        assert!(error.to_string().contains("valid UTF-8"));
+    }
+
+    #[test]
+    fn removed_endpoint_fields_are_reported_comprehensively() {
+        let error = serde_json::from_value::<VmSpec>(json!({
+            "specVersion": "0.1.0",
+            "vsock": {
+                "endpoints": [
+                    {
+                        "name": "first",
+                        "plugin": {
+                            "command": "/bin/first",
+                            "config": { "kind": "one" }
+                        },
+                        "lifecycle": {
+                            "restart": "always",
+                            "backoffMs": { "initial": 1, "max": 2 }
+                        }
+                    },
+                    {
+                        "name": "second",
+                        "plugin": { "command": "/bin/second" },
+                        "lifecycle": { "autostart": false }
+                    }
+                ],
+                "plugin": { "command": "/bin/root" },
+                "lifecycle": { "restart": "never" }
+            }
+        }))
+        .expect_err("removed endpoint fields must fail");
+        let message = error.to_string();
+
+        for path in [
+            "vsock.endpoints",
+            "vsock.endpoints[0].name",
+            "vsock.endpoints[0].plugin",
+            "vsock.endpoints[0].plugin.command",
+            "vsock.endpoints[0].plugin.config.kind",
+            "vsock.endpoints[0].lifecycle.restart",
+            "vsock.endpoints[0].lifecycle.backoffMs.initial",
+            "vsock.endpoints[0].lifecycle.backoffMs.max",
+            "vsock.endpoints[1].name",
+            "vsock.endpoints[1].plugin.command",
+            "vsock.endpoints[1].lifecycle.autostart",
+            "vsock.plugin.command",
+            "vsock.lifecycle.restart",
+        ] {
+            assert!(
+                message.contains(path),
+                "missing removed path {path}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_legacy_endpoint_forms_are_rejected_comprehensively_in_json() {
+        for field in ["vsock_endpoints", "vsockEndpoints"] {
+            let input = format!(
+                r#"{{
+                    "specVersion": "0.1.0",
+                    "{field}": [
+                        {{
+                            "name": "first",
+                            "plugin": {{ "command": "/bin/first", "config": {{ "kind": "one" }} }},
+                            "lifecycle": {{ "restart": "always", "backoffMs": {{ "initial": 1 }} }}
+                        }},
+                        {{
+                            "name": "second",
+                            "plugin": {{ "command": "/bin/second" }},
+                            "lifecycle": {{ "autostart": false }}
+                        }}
+                    ]
+                }}"#
+            );
+            let error = serde_json::from_str::<VmSpec>(&input)
+                .expect_err("top-level legacy endpoints must fail");
+            let message = error.to_string();
+
+            for suffix in [
+                "",
+                "[0].name",
+                "[0].plugin",
+                "[0].plugin.command",
+                "[0].plugin.config.kind",
+                "[0].lifecycle",
+                "[0].lifecycle.restart",
+                "[0].lifecycle.backoffMs.initial",
+                "[1].name",
+                "[1].plugin.command",
+                "[1].lifecycle.autostart",
+            ] {
+                let path = format!("{field}{suffix}");
+                assert!(
+                    message.contains(&path),
+                    "missing removed path {path}: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_legacy_forms_are_aggregated_into_one_error() {
+        let error = serde_json::from_value::<VmSpec>(json!({
+            "specVersion": "0.1.0",
+            "vsock_endpoints": [{
+                "plugin": { "command": "/bin/snake" },
+                "lifecycle": { "restart": "always" }
+            }],
+            "vsockEndpoints": [{
+                "plugin": { "command": "/bin/camel" },
+                "lifecycle": { "autostart": true }
+            }],
+            "vsock": {
+                "endpoints": [{
+                    "plugin": { "command": "/bin/nested" },
+                    "lifecycle": { "backoffMs": { "max": 5 } }
+                }]
+            }
+        }))
+        .expect_err("all legacy forms must fail together");
+        let message = error.to_string();
+
+        for path in [
+            "vsock_endpoints[0].plugin.command",
+            "vsock_endpoints[0].lifecycle.restart",
+            "vsockEndpoints[0].plugin.command",
+            "vsockEndpoints[0].lifecycle.autostart",
+            "vsock.endpoints[0].plugin.command",
+            "vsock.endpoints[0].lifecycle.backoffMs.max",
+        ] {
+            assert!(
+                message.contains(path),
+                "missing removed path {path}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_vsock_cannot_hide_legacy_json_or_yaml_data() {
+        let json = r#"{
+            "specVersion": "0.1.0",
+            "vsock": { "endpoints": [{ "plugin": { "command": "/bin/old" } }] },
+            "vsock": { "enabled": true }
+        }"#;
+        let json_error = serde_json::from_str::<VmSpec>(json)
+            .expect_err("duplicate JSON vsock must not hide old data");
+        assert!(json_error.to_string().contains("duplicate field `vsock`"));
+
+        let yaml = "specVersion: 0.1.0\nvsock:\n  endpoints:\n    - plugin:\n        command: /bin/old\nvsock:\n  enabled: true\n";
+        let yaml_error = serde_yaml_ng::from_str::<VmSpec>(yaml)
+            .expect_err("duplicate YAML vsock must not hide old data");
+        assert!(yaml_error.to_string().contains("duplicate field `vsock`"));
+    }
+
+    #[test]
+    fn duplicate_known_vsock_fields_are_rejected() {
+        for json in [
+            r#"{"enabled": false, "enabled": true}"#,
+            r#"{"enabled": true, "uds": "first.sock", "uds": "second.sock"}"#,
+        ] {
+            let error = serde_json::from_str::<Vsock>(json)
+                .expect_err("duplicate JSON vsock field must fail");
+            assert!(error.to_string().contains("duplicate field"));
+        }
+
+        for yaml in [
+            "enabled: false\nenabled: true\n",
+            "enabled: true\nuds: first.sock\nuds: second.sock\n",
+        ] {
+            let error = serde_yaml_ng::from_str::<Vsock>(yaml)
+                .expect_err("duplicate YAML vsock field must fail");
+            assert!(error.to_string().contains("duplicate field"));
+        }
+    }
+
+    #[test]
+    fn standalone_vsock_retains_removed_field_diagnostics() {
+        let error = serde_json::from_value::<Vsock>(json!({
+            "endpoints": [{
+                "plugin": { "command": "/bin/old" },
+                "lifecycle": { "restart": "always" }
+            }]
+        }))
+        .expect_err("standalone legacy vsock must fail");
+        let message = error.to_string();
+
+        for path in [
+            "vsock.endpoints[0].plugin.command",
+            "vsock.endpoints[0].lifecycle.restart",
+        ] {
+            assert!(
+                message.contains(path),
+                "missing removed path {path}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_legacy_endpoint_forms_are_rejected_comprehensively_in_yaml() {
+        for field in ["vsock_endpoints", "vsockEndpoints"] {
+            let input = format!(
+                "specVersion: 0.1.0\n{field}:\n{}",
+                [
+                    "  - name: first",
+                    "    plugin:",
+                    "      command: /bin/first",
+                    "      config:",
+                    "        kind: one",
+                    "    lifecycle:",
+                    "      restart: always",
+                    "      backoffMs:",
+                    "        initial: 1",
+                    "  - name: second",
+                    "    plugin:",
+                    "      command: /bin/second",
+                    "    lifecycle:",
+                    "      autostart: false",
+                    "",
+                ]
+                .join("\n")
+            );
+            let error = serde_yaml_ng::from_str::<VmSpec>(&input)
+                .expect_err("top-level legacy YAML endpoints must fail");
+            let message = error.to_string();
+
+            for suffix in [
+                "",
+                "[0].name",
+                "[0].plugin",
+                "[0].plugin.command",
+                "[0].plugin.config.kind",
+                "[0].lifecycle",
+                "[0].lifecycle.restart",
+                "[0].lifecycle.backoffMs.initial",
+                "[1].name",
+                "[1].plugin.command",
+                "[1].lifecycle.autostart",
+            ] {
+                let path = format!("{field}{suffix}");
+                assert!(
+                    message.contains(&path),
+                    "missing removed path {path}: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_unknown_fields_remain_permissive() {
+        let spec = serde_json::from_value::<VmSpec>(json!({
+            "specVersion": "0.1.0",
+            "futureTopLevel": { "nested": true },
+            "vsock": { "enabled": true, "futureVsockField": 42 }
+        }))
+        .expect("unknown fields remain permitted");
+
+        assert_eq!(
+            spec.vsock,
+            Some(Vsock {
+                enabled: true,
+                uds: None
+            })
+        );
+    }
+
+    #[test]
+    fn non_vsock_sections_still_round_trip() {
+        let value = json!({
+            "specVersion": "0.1.0",
+            "guest": { "os": "linux" },
+            "hardware": { "cpus": 2, "memory": 1024 },
+            "annotations": { "owner": "test" }
+        });
+        let spec = serde_json::from_value::<VmSpec>(value.clone()).expect("deserialize vm spec");
+
+        assert_eq!(
+            serde_json::to_value(spec).expect("serialize vm spec"),
+            value
         );
     }
 }

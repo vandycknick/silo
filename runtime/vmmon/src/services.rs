@@ -24,7 +24,6 @@ use tonic::{Request, Response, Status};
 use tonic_health::server::{health_reporter, HealthReporter};
 
 use crate::context::{DaemonContext, RuntimeContext};
-use crate::endpoints::start_endpoint_supervisor;
 use crate::execution::ExecutionService;
 use crate::guest::spawn_guest_services;
 use crate::startup::SyncReporter;
@@ -42,10 +41,10 @@ const BACKEND_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct ServiceHandles {
     pub(crate) control_socket: JoinHandle<eyre::Result<()>>,
     pub(crate) guest_monitor: Option<JoinHandle<()>>,
-    pub(crate) endpoint_supervisor: Option<JoinHandle<()>>,
     pub(crate) health: HealthReporter,
     pub(crate) server_shutdown: CancellationToken,
     pub(crate) startup_command: Option<JoinHandle<()>>,
+    pub(crate) vsock_surface: Option<crate::vsock::VsockSurface>,
 }
 
 #[derive(Clone)]
@@ -148,14 +147,7 @@ impl VmAccessService for AccessService {
                 None,
             )
         })?
-        .map_err(|error| {
-            protocol::status_with_error(
-                tonic::Code::Unavailable,
-                protocol::v1::ErrorCode::BackendUnavailable,
-                format!("SSH backend unavailable: {error}"),
-                None,
-            )
-        })?;
+        .map_err(ssh_backend_status)?;
         Ok(Response::new(Box::pin(relay(
             stream,
             request.into_inner(),
@@ -205,6 +197,20 @@ impl VmAccessService for AccessService {
     }
 }
 
+fn ssh_backend_status(error: crate::virt::VirtError) -> Status {
+    match error {
+        crate::virt::VirtError::VsockCapacityExhausted { .. } => {
+            protocol::detailed_status(Status::resource_exhausted(error.to_string()))
+        }
+        error => protocol::status_with_error(
+            tonic::Code::Unavailable,
+            protocol::v1::ErrorCode::BackendUnavailable,
+            format!("SSH backend unavailable: {error}"),
+            None,
+        ),
+    }
+}
+
 impl ServiceHandles {
     pub(crate) async fn mark_stopping(&self) {
         for service in [
@@ -238,6 +244,7 @@ pub async fn start_services(
     ctx: &DaemonContext,
     startup_command: Option<crate::start_request::StartupCommand>,
     exec_log: Option<crate::exec_log::ExecLogWriter>,
+    vsock_surface: Option<crate::vsock::VsockSurface>,
     sync_reporter: &mut SyncReporter,
 ) -> eyre::Result<ServiceHandles> {
     let path = runtime.socket().to_path_buf();
@@ -406,7 +413,6 @@ pub async fn start_services(
         },
         None => None,
     };
-    let endpoint_supervisor = start_endpoint_supervisor(ctx.clone(), runtime.dir().to_path_buf());
     tracing::info!(
         socket = %path.display(),
         guest_services_enabled = ctx.guest_services_enabled,
@@ -416,10 +422,10 @@ pub async fn start_services(
     Ok(ServiceHandles {
         control_socket,
         guest_monitor,
-        endpoint_supervisor,
         health,
         server_shutdown,
         startup_command,
+        vsock_surface,
     })
 }
 
@@ -604,12 +610,26 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tokio_util::sync::CancellationToken;
 
-    use crate::services::{peer_uid_authorized, relay};
+    use crate::services::{peer_uid_authorized, relay, ssh_backend_status};
+    use crate::virt::VirtError;
 
     #[test]
     fn socket_peer_must_match_its_owner() {
         assert!(peer_uid_authorized(501, 501));
         assert!(!peer_uid_authorized(501, 502));
+    }
+
+    #[test]
+    fn ssh_capacity_exhaustion_has_specific_rpc_mapping() {
+        let exhausted = ssh_backend_status(VirtError::VsockCapacityExhausted {
+            machine: "test".to_string(),
+            limit: 1024,
+        });
+        let backend = ssh_backend_status(VirtError::Backend("offline".to_string()));
+
+        assert_eq!(exhausted.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(backend.code(), tonic::Code::Unavailable);
+        assert!(backend.message().contains("SSH backend unavailable"));
     }
 
     #[tokio::test]

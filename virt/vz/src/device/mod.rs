@@ -14,8 +14,9 @@ pub use filesystem::{
 };
 pub use network::NetworkDeviceConfiguration;
 pub use serial::{SerialPortConfiguration, SerialPortStream};
+pub(crate) use socket::SocketListenerRegistry;
 pub use socket::{
-    SocketDevice, SocketDeviceConfiguration, VirtioSocketConnection, VirtioSocketDevice,
+    SocketConnectionRequest, SocketDeviceConfiguration, VirtioSocketConnection, VirtioSocketDevice,
     VirtioSocketListener,
 };
 pub use storage::StorageDeviceConfiguration;

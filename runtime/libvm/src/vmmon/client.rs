@@ -296,8 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_socket_is_reported_as_a_connection_error() {
-        let socket =
-            std::env::temp_dir().join(format!("silo-missing-vmmon-{}.sock", uuid::Uuid::new_v4()));
+        let socket = std::env::temp_dir().join(format!("m-{}.sock", std::process::id()));
         let error = VmmonClient::new(&socket)
             .status()
             .await

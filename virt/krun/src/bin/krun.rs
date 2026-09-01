@@ -62,9 +62,9 @@ struct Cli {
     /// Add a virtiofs mount. Format: TAG:PATH:ro|rw.
     #[arg(long = "mount", value_parser = parse::mount)]
     mounts: Vec<krun::Mount>,
-    /// Add a vsock port mapping. Format: PORT:PATH:connect|listen.
-    #[arg(long = "vsock-port", value_parser = parse::vsock_port)]
-    vsock_ports: Vec<krun::VsockPort>,
+    /// Attach a vhost-user virtio-vsock device at this Unix socket.
+    #[arg(long = "vhost-user-vsock")]
+    vhost_user_vsock: Option<PathBuf>,
     /// Explicit networking backend. Defaults to no guest networking.
     #[arg(long = "network", value_enum, default_value_t = NetworkArg::None)]
     network: NetworkArg,
@@ -109,7 +109,7 @@ impl Cli {
             cmdline: self.cmdline,
             disks: self.disks,
             mounts: self.mounts,
-            vsock_ports: self.vsock_ports,
+            vhost_user_vsock: self.vhost_user_vsock,
             network,
             stdio_console: self.stdio_console,
         })
@@ -225,9 +225,6 @@ fn start_enter(config: &KrunConfig) -> eyre::Result<()> {
 
 fn configure_ctx(context: &context::Context, config: &KrunConfig) -> eyre::Result<()> {
     context.set_vm_config(config.cpus, config.memory_mib)?;
-    context.disable_implicit_console()?;
-    context.disable_implicit_init()?;
-    context.disable_implicit_vsock()?;
 
     if let Some(kernel) = config.kernel.as_ref() {
         let cmdline = (!config.cmdline.is_empty()).then(|| config.cmdline.join(" "));
@@ -247,11 +244,9 @@ fn configure_ctx(context: &context::Context, config: &KrunConfig) -> eyre::Resul
         context.add_virtiofs(&mount.tag, &mount.path, mount.read_only)?;
     }
 
-    if !config.vsock_ports.is_empty() {
-        context.add_vsock()?;
-    }
-    for port in &config.vsock_ports {
-        context.add_vsock_port(port.port, &port.path, port.listen)?;
+    #[cfg(target_os = "linux")]
+    if let Some(socket) = &config.vhost_user_vsock {
+        context.add_vhost_user_vsock(socket)?;
     }
 
     match &config.network {
@@ -329,9 +324,11 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 mod tests {
     use std::path::Path;
 
+    #[cfg(target_os = "linux")]
     use clap::Parser;
 
     use super::context::KernelFormat;
+    #[cfg(target_os = "linux")]
     use super::Cli;
     use super::{external_kernel_format, local_unix_datagram_path};
 
@@ -369,5 +366,25 @@ mod tests {
     fn host_check_is_exclusive_with_vm_arguments() {
         assert!(Cli::try_parse_from(["krun", "--check-host"]).is_ok());
         assert!(Cli::try_parse_from(["krun", "--check-host", "--cpus", "2"]).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_vhost_user_vsock() {
+        let config = Cli::try_parse_from([
+            "krun",
+            "--kernel",
+            "/kernel",
+            "--vhost-user-vsock",
+            "/tmp/vhost-vsock.sock",
+        ])
+        .expect("vhost-user argument should parse")
+        .into_config()
+        .expect("vhost-user argument should produce a config");
+
+        assert_eq!(
+            config.vhost_user_vsock.as_deref(),
+            Some(Path::new("/tmp/vhost-vsock.sock"))
+        );
     }
 }

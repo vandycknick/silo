@@ -7,7 +7,7 @@ The crate exposes:
 - a process-backed `VirtualMachineBuilder`
 - a `VirtualMachine` handle for lifecycle management
 - a `SerialConnection` wrapper for helper stdio access
-- typed disk, mount, and vsock configuration structs
+- typed disk, mount, network, and vhost-user-vsock configuration structs
 
 The `krun` binary is intentionally small. It parses Silo's flat helper arguments, configures libkrun directly, and then enters the VM. It does not use the library builder and does not expose subcommands. On Linux, `krun --check-host` runs the deeper KVM host check without starting a guest.
 
@@ -60,7 +60,7 @@ Current scope focuses on the libkrun path used by Silo today:
 - direct kernel and initramfs boot
 - raw block devices
 - virtiofs mounts
-- vsock ports backed by Unix sockets
+- one explicit vhost-user-vsock device terminated by vmmon
 - stdio console output
 - process-backed VM lifecycle management from Rust callers
 
@@ -73,7 +73,8 @@ Planned follow-up scope includes:
 ## Requirements
 
 - Rust toolchain
-- access to the pinned public libkrun fork when Cargo dependencies are fetched
+- access to the pinned libkrun fork revision documented in
+  `docs/libkrun-deps.md`
 - Linux or macOS host support matching the compiled libkrun backend
 - on Linux, access to a KVM device with the required API and capabilities
 
@@ -83,14 +84,16 @@ The optional `krun-bin` Cargo feature compiles the pinned libkrun fork directly 
 
 The helper uses a narrow private adapter rather than generated C bindings. It owns context cleanup, string conversion, the small set of C API constants Silo uses, and negative return-code handling. The resulting runtime does not require `libkrun.so`, `libkrun.dylib`, or `libkrunfw`.
 
-The `blk` and `net` APIs are selected at compile time through fixed Cargo features. Runtime feature probing is unnecessary because a helper missing either API cannot compile.
+The `blk`, `net`, and `vhost-user` APIs are selected at compile time through fixed Cargo features. Runtime feature probing is unnecessary because a helper missing a required API cannot compile.
+
+Libkrun v2 starts contexts without implicit console or vsock devices and no longer injects a default init binary. The helper therefore supplies its kernel and optional initramfs directly, adds hvc0 only for `--stdio-console`, and attaches vmmon's explicit vhost-user-vsock frontend with `--vhost-user-vsock`. It never calls `krun_add_vsock` and has no per-port vsock arguments. Vmmon's embedded backend provides unconditional dynamic dials to guest ports 22 and 1027 while the public `VmSpec.vsock.enabled` setting independently controls the host mux and guest-to-host listener discovery.
 
 ## libkrun Build Features
 
 Silo's intended libkrun build keeps the upstream library narrow while preserving the current krun backend behavior:
 
 ```text
---no-default-features --features blk --features net
+--no-default-features --features blk --features net --features vhost-user
 ```
 
 That means Silo intentionally builds libkrun with these features enabled:
@@ -99,16 +102,16 @@ That means Silo intentionally builds libkrun with these features enabled:
 | --- | --- | --- |
 | `blk` | Enables virtio-block devices. | Keep. Required for `--disk` and Silo disk images. |
 | `net` | Enables virtio-net devices for unixgram, unixstream, and tap networking. | Keep. Required for Silo networking modes. |
+| `vhost-user` | Enables explicit vhost-user device attachment. | Keep. Required for vmmon's vhost-user-vsock backend. |
 
-Silo intentionally leaves these libkrun features disabled for now:
+Silo intentionally leaves these libkrun v2 features and optional components disabled for now:
 
 | Feature | Purpose | Silo policy |
 | --- | --- | --- |
-| `init-blob` | Embeds libkrun's default guest init binary. This is an upstream default feature. | Disable with `--no-default-features`. Silo requires explicit boot inputs and the helper disables implicit init. |
+| Default init injection | Moved out of libkrun v2; `krun_disable_implicit_init()` is an `-ENOTSUP` compatibility stub. | Do not call the stub. Silo supplies explicit boot inputs and does not use `libkrun_init`. |
 | `gpu` | Enables virtio-gpu, Venus, and native-context graphics support. | Disable. Silo has no krun GPU path today. |
-| `snd` | Enables virtio-snd audio support. | Disable. Silo has no krun audio path today. |
 | `input` | Enables input device support for GUI/input passthrough. | Disable. Silo has no krun input-device path today. |
-| `efi` | Enables EFI boot support and implies `blk` and `net`. | Disable. Silo uses explicit external kernel/initramfs boot instead of EFI firmware boot. |
+| `timesync` | Enables the libkrun guest time synchronization device. | Disable. Silo does not configure this device. |
 | `tee` | Enables trusted execution environment plumbing. | Disable unless Silo grows a confidential-compute krun backend. |
 | `amd-sev` | Enables AMD SEV, SEV-ES, and SEV-SNP support. Implies `blk` and `tee`. | Disable unless Silo grows an SEV backend. |
 | `tdx` | Enables Intel TDX support. Implies `blk` and `tee`. | Disable unless Silo grows a TDX backend. |

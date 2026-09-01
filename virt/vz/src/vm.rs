@@ -13,7 +13,6 @@ use objc2_virtualization::{
     VZNetworkDevice, VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
     VZVirtualMachineState,
 };
-use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fmt::{Debug, Display};
 use std::sync::{Arc, Mutex};
@@ -22,16 +21,14 @@ use tokio::sync::{oneshot, watch};
 use crate::configuration::VirtualMachineConfiguration;
 use crate::device::{
     EntropyDeviceConfiguration, MemoryBalloonDeviceConfiguration, NetworkDeviceConfiguration,
-    SerialPortConfiguration, SocketDeviceConfiguration, StorageDeviceConfiguration,
-    VirtioFileSystemDeviceConfiguration, VirtioSocketDevice,
+    SerialPortConfiguration, SocketDeviceConfiguration, SocketListenerRegistry,
+    StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration, VirtioSocketDevice,
 };
 use crate::dispatch::{serial_queue, DispatchQueueExt, Queue};
 use crate::error::VzError;
 use crate::{GenericPlatform, LinuxBootLoader};
 
 type ObjectiveCDelegate = Retained<ProtocolObject<dyn VZVirtualMachineDelegate>>;
-
-type SocketListenerRegistry = Arc<Mutex<HashMap<usize, HashSet<u32>>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VirtualMachineState {
@@ -149,7 +146,7 @@ impl VirtualMachine {
         });
         #[allow(clippy::arc_with_non_send_sync)]
         let delegate = Arc::new(Mutex::new(None));
-        let socket_listener_registry = Arc::new(Mutex::new(HashMap::new()));
+        let socket_listener_registry = SocketListenerRegistry::default();
 
         Self {
             queue,

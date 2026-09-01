@@ -19,6 +19,7 @@
 #![allow(unused_imports)]
 
 mod backend;
+mod capacity;
 mod config;
 mod error;
 mod machine;
@@ -26,9 +27,10 @@ mod serial;
 mod stream;
 
 pub use backend::{Availability, BackendKind};
+pub(crate) use capacity::VsockLease;
 pub use config::{
     DiskImage, KrunOptions, MachineIdentifier, MockOptions, NetworkMode, SharedDirectory, VmConfig,
-    VmConfigBuilder, VmExit, VsockPort, VsockPortMode, VzOptions,
+    VmConfigBuilder, VmExit, VzOptions,
 };
 pub use error::VirtError;
 pub use machine::VirtualMachine;

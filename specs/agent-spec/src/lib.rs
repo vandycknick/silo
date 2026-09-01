@@ -15,8 +15,6 @@ pub const MAX_AGENT_CONFIG_SIZE_BYTES: usize = 16 * 1024 * 1024;
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     #[serde(default)]
-    pub forward: AgentForwardConfig,
-    #[serde(default)]
     pub provision: ProvisionConfig,
     #[serde(default)]
     pub ssh: AgentSshConfig,
@@ -24,22 +22,6 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     pub fn validate(&self) -> Result<(), AgentConfigError> {
-        if self.forward.enabled && self.forward.port == 0 {
-            return Err(AgentConfigError::new(
-                "forward.port must be nonzero when enabled",
-            ));
-        }
-        validate_unique_nonempty(
-            self.forward
-                .uds
-                .iter()
-                .map(|entry| entry.guest_path.as_str()),
-            "forward.uds guest_path",
-        )?;
-        for entry in &self.forward.uds {
-            validate_absolute_path(&entry.guest_path, "forward.uds guest_path")?;
-        }
-
         validate_unique_nonempty(
             self.ssh
                 .authorized_users
@@ -460,52 +442,13 @@ pub enum UserdataRunPolicy {
     Always,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct AgentForwardConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub port: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub uds: Vec<AgentUdsForwardConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AgentUdsForwardConfig {
-    pub guest_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ForwardStreamRequest {
-    Api { request: ForwardApiRequest },
-    Tcp { guest_port: u16 },
-    Uds { guest_path: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ForwardApiRequest {
-    ListTcpPorts,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ForwardApiResponse {
-    TcpPorts { ports: Vec<u16> },
-    Error { message: String },
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{
-        AgentConfig, AgentForwardConfig, AgentRosettaConfig, AgentSshAuthorizedUser,
-        AgentSshConfig, AgentUdsForwardConfig, CertificateAuthorityConfig, MountConfig,
-        NetworkConfig, NetworkDnsConfig, NetworkInterfaceConfig, NetworkIpv4Config,
-        ProvisionConfig, ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType,
-        UserdataRunPolicy,
+        AgentConfig, AgentRosettaConfig, AgentSshAuthorizedUser, AgentSshConfig,
+        CertificateAuthorityConfig, MountConfig, NetworkConfig, NetworkDnsConfig,
+        NetworkInterfaceConfig, NetworkIpv4Config, ProvisionConfig, ResizeRootfsConfig, UserConfig,
+        UserdataConfig, UserdataContentType, UserdataRunPolicy,
     };
 
     #[test]
@@ -554,6 +497,15 @@ provision:
     }
 
     #[test]
+    fn removed_forward_config_is_rejected() {
+        let error =
+            serde_yaml_ng::from_str::<AgentConfig>("forward:\n  enabled: true\n  port: 4000\n")
+                .expect_err("removed forward config must be rejected");
+
+        assert!(error.to_string().contains("unknown field `forward`"));
+    }
+
+    #[test]
     fn userdata_run_defaults_to_once() {
         let raw = r#"
 provision:
@@ -574,13 +526,6 @@ provision:
     #[test]
     fn agent_config_round_trips_through_json() {
         let original = AgentConfig {
-            forward: AgentForwardConfig {
-                enabled: true,
-                port: 65_535,
-                uds: vec![AgentUdsForwardConfig {
-                    guest_path: "/var/run/docker.sock".to_string(),
-                }],
-            },
             provision: ProvisionConfig {
                 enabled: true,
                 hostname: Some("demo".to_string()),
@@ -647,21 +592,6 @@ provision:
             serde_json::from_slice(&encoded).expect("deserialize agent config");
 
         assert_eq!(round_tripped, original);
-    }
-
-    #[test]
-    fn validation_rejects_enabled_forward_without_port() {
-        let config = AgentConfig {
-            forward: AgentForwardConfig {
-                enabled: true,
-                ..AgentForwardConfig::default()
-            },
-            ..AgentConfig::default()
-        };
-
-        let error = config.validate().expect_err("invalid forward config");
-
-        assert!(error.to_string().contains("forward.port"));
     }
 
     #[test]

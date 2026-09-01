@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use clap::Parser;
 
 mod context;
-mod endpoints;
 mod exec_log;
 mod execution;
 mod exit_command;
@@ -20,6 +19,7 @@ mod shutdown;
 mod start_request;
 mod startup;
 mod state;
+mod vsock;
 // Library-style module: parts of its surface are only used on one platform,
 // behind the mock-backend feature, or from tests.
 #[allow(dead_code)]
@@ -43,6 +43,9 @@ struct Args {
 
     #[arg(long = "data-dir")]
     data_dir: PathBuf,
+
+    #[arg(long = "runtime-dir")]
+    runtime_dir: PathBuf,
 
     #[arg(long = "pidfile")]
     pidfile: PathBuf,
@@ -103,6 +106,7 @@ fn main() -> eyre::Result<()> {
     let sync_reporter = SyncReporter::from_fd(inherited_fds.syncpipe)
         .map_err(|err| eyre::eyre!("open syncpipe reporter: {err}"))?;
     let machine_log_dir = inherited_fds.machine_log_dir;
+    let _machine_lock = inherited_fds.take_machine_lock()?;
 
     let trace_file = secure_file::open_append(&args.trace_log)?;
 
@@ -166,6 +170,7 @@ async fn run(
         ExitCommand::from_cli(args.exit_command.clone(), args.exit_command_args.clone())?;
     let runtime = RuntimeContext::new(
         args.data_dir.clone(),
+        args.runtime_dir.clone(),
         args.config.clone(),
         args.socket.clone(),
     );
@@ -198,12 +203,18 @@ async fn run(
             &initialized.context,
             initialized.startup_command,
             exec_log.clone(),
+            initialized.vsock_surface,
             &mut sync_reporter,
         )
         .await
         {
             Ok(handles) => shutdown::run(runtime, initialized.context, handles).await,
-            Err(err) => Err(err),
+            Err(err) => {
+                if let Err(stop_error) = initialized.context.machine.stop().await {
+                    tracing::error!(%stop_error, "failed to stop VM after service startup failure");
+                }
+                Err(err)
+            }
         },
         Err(err) => Err(err),
     };
@@ -268,6 +279,8 @@ fn daemonize(args: &Args, inherited_fds: InheritedPipeFds) -> eyre::Result<()> {
         .arg(&args.name)
         .arg("--data-dir")
         .arg(&args.data_dir)
+        .arg("--runtime-dir")
+        .arg(&args.runtime_dir)
         .arg("--pidfile")
         .arg(&args.pidfile)
         .arg("--exit-status")
@@ -365,6 +378,8 @@ mod tests {
             "ubuntu",
             "--data-dir",
             "/tmp/silo/machines/03147ec30bd748f4ad8574539c2e75ea",
+            "--runtime-dir",
+            "/tmp/silo-run/machines/03147ec30bd748f4ad8574539c2e75ea",
             "--pidfile",
             "/tmp/silo/machines/03147ec30bd748f4ad8574539c2e75ea/vm.pid",
             "--exit-status",

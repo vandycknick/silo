@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use krun::{Disk, Mount, VsockPort};
+use krun::{Disk, Mount};
 use utils::parse_mac;
 
 pub(crate) fn disk(input: &str) -> Result<Disk, String> {
@@ -27,26 +27,6 @@ pub(crate) fn mount(input: &str) -> Result<Mount, String> {
     })
 }
 
-pub(crate) fn vsock_port(input: &str) -> Result<VsockPort, String> {
-    let parts: Vec<&str> = input.split(':').collect();
-    if parts.len() != 3 {
-        return Err("expected PORT:PATH:connect|listen".to_string());
-    }
-    let port = parts[0]
-        .parse::<u32>()
-        .map_err(|err| format!("invalid port: {err}"))?;
-    let listen = match parts[2] {
-        "connect" => true,
-        "listen" => false,
-        other => return Err(format!("invalid vsock direction {other:?}")),
-    };
-    Ok(VsockPort {
-        port,
-        path: PathBuf::from(parts[1]),
-        listen,
-    })
-}
-
 pub(crate) fn mac(input: &str) -> Result<[u8; 6], String> {
     parse_mac(input)
 }
@@ -61,21 +41,13 @@ fn read_only(input: &str) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::parse::{disk, mac, vsock_port};
+    use crate::parse::{disk, mac};
 
     #[test]
     fn parses_disk_arg() {
         let disk = disk("root:/tmp/root.img:rw").expect("valid disk");
         assert_eq!(disk.block_id, "root");
         assert!(!disk.read_only);
-    }
-
-    #[test]
-    fn parses_vsock_direction_for_libkrun() {
-        let connect = vsock_port("1027:/tmp/agent.sock:connect").expect("valid port");
-        let listen = vsock_port("2000:/tmp/shell.sock:listen").expect("valid port");
-        assert!(connect.listen);
-        assert!(!listen.listen);
     }
 
     #[test]

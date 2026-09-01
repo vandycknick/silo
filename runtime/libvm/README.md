@@ -123,6 +123,8 @@ configurable. The derivation is:
 | `locks/`       | `run_root/locks`         |
 | `machines/<id>/vm.pid` | `run_root/machines/<id>/vm.pid` |
 | `machines/<id>/vm.sock` | `run_root/machines/<id>/vm.sock` |
+| `machines/<id>/<uds>` | enabled public vsock mux |
+| `machines/<id>/<uds>_<port>` | extension-owned guest-to-host listener |
 | `networks/`    | `run_root/networks`      |
 | machine logs and exit records | `state_root/logs/machines/<id>/` |
 | private-network logs | `state_root/logs/machines/<id>/network/` |
@@ -143,6 +145,23 @@ set for the runtime lifetime. Machine starts launch the resolved absolute
 `vmmon` path directly. `vmmon` receives the resolved absolute `krun` path as
 private launch state and keeps the `vmmon -> krun` process boundary intact.
 Private networking launches the resolved absolute `netd` path directly.
+
+## Hybrid Vsock Paths
+
+`Machine::vsock_socket()` returns the public host-to-guest mux path when
+`VmSpec.vsock.enabled` is true. `Machine::vsock_listener_socket(port)` returns
+the path an extension can bind for guest-to-host traffic. Both methods read the
+current stored configuration, use the default `vsock.sock` filename or the
+configured `uds`, and return `None` when vsock is omitted or disabled. Listener
+paths also return `None` for Silo's reserved host port 1027.
+
+Resolving an enabled path creates the owner-only machine runtime directory so an
+extension can bind a listener before VM startup. The extension owns that
+listener and must close it during shutdown. Vmmon cleans up its mux and private
+backend sockets, then libvm removes the complete machine runtime tree; extension
+unlink attempts must therefore tolerate an already-removed path. See the
+[hybrid vsock guide](../../docs/hybrid-vsock.md) for protocol examples, retries,
+security, limits, and shutdown behavior.
 
 Machine kernel, initramfs, and agent overrides remain independent. An omitted
 asset always uses its matching file from the resolved installation set, so one

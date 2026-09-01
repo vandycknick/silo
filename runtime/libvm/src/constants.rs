@@ -21,9 +21,6 @@ pub(crate) const DEFAULT_HOST_TIMEZONE: &str = "UTC";
 /// Locale used when no host locale environment variable is available.
 pub(crate) const DEFAULT_HOST_LOCALE: &str = "en_US.UTF-8";
 
-/// Vsock endpoint name reserved for the guest forward service.
-pub(crate) const FORWARD_ENDPOINT_NAME: &str = "forward";
-
 /// Certificate authority path installed inside the guest for provisioning trust.
 pub(crate) const GUEST_CERTIFICATE_AUTHORITY_PATH: &str =
     "/usr/local/share/ca-certificates/silo-ca.crt";

@@ -1,6 +1,8 @@
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use nix::errno::Errno;
@@ -73,6 +75,37 @@ pub(crate) struct ManagedLock {
 #[must_use = "lock releases when dropped"]
 pub(crate) struct LockGuard {
     _file: Flock<File>,
+}
+
+#[must_use = "lifetime lock releases when every descriptor is closed"]
+pub(crate) struct MachineLifetimeLock {
+    file: File,
+}
+
+impl MachineLifetimeLock {
+    pub(crate) fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
+        let file = open_lock_file(path)?;
+        loop {
+            #[allow(deprecated)]
+            match nix::fcntl::flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
+                Ok(()) => return Ok(Some(Self { file })),
+                Err(err) if err == Errno::EAGAIN || err == Errno::EWOULDBLOCK => return Ok(None),
+                Err(Errno::EINTR) => continue,
+                Err(err) => return Err(lock_error(err)),
+            }
+        }
+    }
+
+    pub(crate) fn duplicate_inheritable(&self) -> io::Result<OwnedFd> {
+        let duplicate = nix::unistd::dup(&self.file).map_err(io::Error::other)?;
+        let flags = nix::fcntl::fcntl(&duplicate, nix::fcntl::FcntlArg::F_GETFD)
+            .map_err(io::Error::other)?;
+        let flags =
+            nix::fcntl::FdFlag::from_bits_retain(flags).difference(nix::fcntl::FdFlag::FD_CLOEXEC);
+        nix::fcntl::fcntl(&duplicate, nix::fcntl::FcntlArg::F_SETFD(flags))
+            .map_err(io::Error::other)?;
+        Ok(duplicate)
+    }
 }
 
 impl LockManager {
@@ -183,6 +216,7 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         .write(true)
         .create(true)
         .truncate(false)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)
 }
 
@@ -195,7 +229,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::{Arc, Barrier};
 
-    use crate::lock_manager::{LockId, LockManager};
+    use crate::lock_manager::{LockId, LockManager, MachineLifetimeLock};
 
     #[test]
     fn lock_id_serializes_as_number() {
@@ -286,6 +320,28 @@ mod tests {
             .try_lock()
             .expect("try lock allocation")
             .is_none());
+    }
+
+    #[test]
+    fn inherited_duplicate_keeps_the_machine_lifetime_lock_held() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let path = temp.path().join("machine-lifetime.lock");
+        let guard = MachineLifetimeLock::try_acquire(&path)
+            .expect("acquire lifetime lock")
+            .expect("lifetime lock available");
+        let inherited = guard
+            .duplicate_inheritable()
+            .expect("duplicate inherited lock descriptor");
+
+        drop(guard);
+        assert!(MachineLifetimeLock::try_acquire(&path)
+            .expect("try inherited lock")
+            .is_none());
+
+        drop(inherited);
+        assert!(MachineLifetimeLock::try_acquire(&path)
+            .expect("try released lock")
+            .is_some());
     }
 
     #[test]

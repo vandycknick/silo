@@ -1,33 +1,40 @@
-//! libkrun backend (Linux), driving the spawned `krun` helper binary through
-//! the `krun` crate. Vsock ports are unix sockets in a per-machine directory:
-//! `Connect` ports are listened on by the helper (we dial), `Listen` ports
-//! are pre-bound here before boot (the guest dials).
+//! libkrun backend (Linux), using an embedded vhost-user vsock device for the
+//! same dynamic host surface exposed by the other virtualization backends.
 
 use std::collections::HashMap;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use krun::{
     Disk as KrunDisk, KrunBackendError, Mount as KrunMount, NetUnixgram as KrunNetUnixgram,
-    VirtualMachine, VirtualMachineBuilder, VsockPort as KrunVsockPort,
+    VirtualMachine, VirtualMachineBuilder,
 };
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::AsyncReadExt;
+use tokio::net::UnixStream;
+use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, timeout};
 
-use super::VirtBackend;
-use crate::virt::config::{
-    validate_common, DiskImage, NetworkMode, SharedDirectory, VmConfig, VsockPortMode,
-};
+use crate::virt::backend::VirtBackend;
+use crate::virt::capacity::{VsockCapacity, VsockLease, MAX_ACTIVE_VSOCK_CONNECTIONS};
+use crate::virt::config::{validate_common, DiskImage, NetworkMode, SharedDirectory, VmConfig};
 use crate::virt::error::VirtError;
-use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
+use crate::virt::stream::{PendingUnixVsock, SerialDevice, VsockListener, VsockStream};
 use crate::virt::VmExit;
 
 const VSOCK_DIR_NAME: &str = "krun.vsock";
+const VHOST_SOCKET_NAME: &str = "vhost.sock";
+const MAX_VSOCK_LISTENERS: usize = 1024;
+const GUEST_CID: u64 = 3;
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const VSOCK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) struct KrunBackend {
@@ -36,11 +43,121 @@ pub(crate) struct KrunBackend {
     runtime_dir: PathBuf,
     exit: Arc<Mutex<Option<VmExit>>>,
     runtime: AsyncMutex<Option<RunningKrun>>,
+    vsock_registry: KrunVsockRegistry,
 }
 
 struct RunningKrun {
     vm: Arc<AsyncMutex<VirtualMachine>>,
-    listeners: HashMap<u32, UnixListener>,
+    vsock: vhost_vsock::BackendServer,
+    host_connector: vhost_vsock::HostConnector,
+    vsock_session: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Default)]
+struct KrunVsockRegistry {
+    listeners: Arc<Mutex<HashMap<u32, KrunVsockListener>>>,
+}
+
+#[derive(Clone)]
+struct KrunVsockListener {
+    sender: mpsc::Sender<PendingUnixVsock>,
+    capacity: VsockCapacity,
+    session_active: Arc<AtomicBool>,
+}
+
+impl KrunVsockRegistry {
+    fn connect_guest(
+        &self,
+        request: vhost_vsock::ConnectionRequest,
+        session_active: Arc<AtomicBool>,
+    ) -> Option<StdUnixStream> {
+        if !session_active.load(Ordering::Acquire) {
+            return None;
+        }
+        let listener = self
+            .listeners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&request.destination_port)
+            .cloned()?;
+        if !Arc::ptr_eq(&listener.session_active, &session_active)
+            || !listener.session_active.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let lease = listener.capacity.reserve().ok()?;
+        let (backend_stream, vmmon_stream) = StdUnixStream::pair().ok()?;
+        vmmon_stream.set_nonblocking(true).ok()?;
+        listener
+            .sender
+            .try_send(PendingUnixVsock {
+                stream: vmmon_stream,
+                source_port: request.source_port,
+                destination_port: request.destination_port,
+                lease,
+                session_active,
+            })
+            .ok()?;
+        Some(backend_stream)
+    }
+
+    fn register(
+        &self,
+        port: u32,
+        capacity: VsockCapacity,
+        session_active: Arc<AtomicBool>,
+    ) -> Result<VsockListener, VirtError> {
+        if !session_active.load(Ordering::Acquire) {
+            return Err(VirtError::Backend(
+                "krun vsock frontend stopped while registering listener".to_string(),
+            ));
+        }
+        let (sender, receiver) = mpsc::channel(MAX_ACTIVE_VSOCK_CONNECTIONS);
+        {
+            let mut listeners = self
+                .listeners
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if listeners
+                .get(&port)
+                .is_some_and(|listener| listener.session_active.load(Ordering::Acquire))
+            {
+                return Err(VirtError::Backend(format!(
+                    "krun vsock port {port} already has a listener"
+                )));
+            }
+            listeners.remove(&port);
+            if listeners.len() >= MAX_VSOCK_LISTENERS {
+                return Err(VirtError::Backend(format!(
+                    "krun has reached its listener registration limit of {MAX_VSOCK_LISTENERS}"
+                )));
+            }
+            listeners.insert(
+                port,
+                KrunVsockListener {
+                    sender: sender.clone(),
+                    capacity: capacity.clone(),
+                    session_active: session_active.clone(),
+                },
+            );
+        }
+
+        let listeners = self.listeners.clone();
+        Ok(VsockListener::from_krun_channel(
+            receiver,
+            port,
+            capacity,
+            move || {
+                let mut listeners = listeners.lock().unwrap_or_else(PoisonError::into_inner);
+                if listeners
+                    .get(&port)
+                    .is_some_and(|listener| listener.sender.same_channel(&sender))
+                {
+                    listeners.remove(&port);
+                }
+            },
+        ))
+    }
 }
 
 impl std::fmt::Debug for KrunBackend {
@@ -63,6 +180,7 @@ impl KrunBackend {
             runtime_dir,
             exit: Arc::new(Mutex::new(None)),
             runtime: AsyncMutex::new(None),
+            vsock_registry: KrunVsockRegistry::default(),
         })
     }
 
@@ -98,14 +216,30 @@ impl VirtBackend for KrunBackend {
         prepare(&self.config)?;
         self.clear_exit_cache();
 
-        let listeners = prepare_vsock_ports(&self.config)?;
-        let vm = build_krun_vm(&self.krun_bin, &self.config)?
-            .start()
-            .map_err(|err| krun_error(&self.config, err))?;
+        let registry = self.vsock_registry.clone();
+        let vsock_session = Arc::new(AtomicBool::new(true));
+        let session_for_connections = vsock_session.clone();
+        let vsock = vhost_vsock::BackendServer::start(
+            vhost_socket_for(&self.config),
+            GUEST_CID,
+            move |request| registry.connect_guest(request, session_for_connections.clone()),
+        )
+        .map_err(|error| VirtError::Backend(error.to_string()))?;
+        let vm = match build_krun_vm(&self.krun_bin, &self.config, vsock.vhost_socket())?.start() {
+            Ok(vm) => vm,
+            Err(error) => {
+                vsock_session.store(false, Ordering::Release);
+                let _ = shutdown_vsock(vsock).await;
+                return Err(krun_error(&self.config, error));
+            }
+        };
         tracing::info!(machine = %self.config.name(), "krun process started");
+        let host_connector = vsock.host_connector();
         *runtime = Some(RunningKrun {
             vm: Arc::new(AsyncMutex::new(vm)),
-            listeners,
+            vsock,
+            host_connector,
+            vsock_session,
         });
         Ok(())
     }
@@ -119,8 +253,15 @@ impl VirtBackend for KrunBackend {
             self.cache_exit(VmExit::Stopped);
             return Ok(());
         };
+        let RunningKrun {
+            vm,
+            vsock,
+            host_connector: _,
+            vsock_session,
+        } = running;
+        vsock_session.store(false, Ordering::Release);
         {
-            let mut vm = running.vm.lock().await;
+            let mut vm = vm.lock().await;
             if vm
                 .try_wait()
                 .map_err(|err| krun_error(&self.config, err))?
@@ -129,7 +270,8 @@ impl VirtBackend for KrunBackend {
                 let _ = vm.kill();
             }
         }
-        let _ = timeout(STOP_TIMEOUT, wait_for_vm_exit(running.vm.clone())).await;
+        let _ = timeout(STOP_TIMEOUT, wait_for_vm_exit(vm)).await;
+        shutdown_vsock(vsock).await?;
         self.cache_exit(VmExit::Stopped);
         Ok(())
     }
@@ -150,7 +292,10 @@ impl VirtBackend for KrunBackend {
 
         let status = wait_for_vm_exit(vm).await?;
         let exit = vm_exit_from_status(status);
-        let _ = self.runtime.lock().await.take();
+        if let Some(running) = self.runtime.lock().await.take() {
+            running.vsock_session.store(false, Ordering::Release);
+            shutdown_vsock(running.vsock).await?;
+        }
         self.cache_exit(exit.clone());
         Ok(exit)
     }
@@ -176,63 +321,45 @@ impl VirtBackend for KrunBackend {
             return Ok(None);
         };
         let exit = vm_exit_from_status(status);
-        let _ = self.runtime.lock().await.take();
+        if let Some(running) = self.runtime.lock().await.take() {
+            running.vsock_session.store(false, Ordering::Release);
+            shutdown_vsock(running.vsock).await?;
+        }
         self.cache_exit(exit.clone());
         Ok(Some(exit))
     }
 
-    async fn connect_vsock(&self, port: u32) -> Result<VsockStream, VirtError> {
-        {
+    async fn connect_vsock(&self, port: u32, lease: VsockLease) -> Result<VsockStream, VirtError> {
+        let host_connector = {
             let runtime = self.runtime.lock().await;
-            if runtime.is_none() {
-                return Err(VirtError::NotRunning {
-                    name: self.config.name().to_string(),
-                });
-            }
-        }
-
-        let Some(mode) = declared_vsock_mode(&self.config, port) else {
-            return Err(VirtError::Backend(format!(
-                "krun vsock port {port} was not declared before boot"
-            )));
+            let running = runtime.as_ref().ok_or_else(|| VirtError::NotRunning {
+                name: self.config.name().to_string(),
+            })?;
+            running.host_connector.clone()
         };
-        if mode != VsockPortMode::Connect {
-            return Err(VirtError::Backend(format!(
-                "krun vsock port {port} is declared for listen, not connect"
-            )));
-        }
 
-        let stream = UnixStream::connect(vsock_path(&self.config, port, mode)).await?;
-        Ok(VsockStream::from_unix_stream(stream))
+        let mut stream = UnixStream::from_std(host_connector.connect(port)?)?;
+        let source_port = read_vhost_connect_response(&mut stream).await?;
+        Ok(VsockStream::from_unix_stream(
+            stream,
+            Some(source_port),
+            port,
+            Some(lease),
+        ))
     }
 
-    async fn listen_vsock(&self, port: u32) -> Result<VsockListener, VirtError> {
-        let Some(mode) = declared_vsock_mode(&self.config, port) else {
-            return Err(VirtError::Backend(format!(
-                "krun vsock port {port} was not declared before boot"
-            )));
-        };
-        if mode != VsockPortMode::Listen {
-            return Err(VirtError::Backend(format!(
-                "krun vsock port {port} is declared for connect, not listen"
-            )));
-        }
+    async fn listen_vsock(
+        &self,
+        port: u32,
+        capacity: VsockCapacity,
+    ) -> Result<VsockListener, VirtError> {
+        let runtime = self.runtime.lock().await;
+        let running = runtime.as_ref().ok_or_else(|| VirtError::NotRunning {
+            name: self.config.name().to_string(),
+        })?;
 
-        let listener = {
-            let mut runtime = self.runtime.lock().await;
-            let Some(running) = runtime.as_mut() else {
-                return Err(VirtError::NotRunning {
-                    name: self.config.name().to_string(),
-                });
-            };
-            running.listeners.remove(&port).ok_or_else(|| {
-                VirtError::Backend(format!(
-                    "krun vsock listener for port {port} was already claimed"
-                ))
-            })?
-        };
-
-        Ok(VsockListener::from_unix_listener(listener))
+        self.vsock_registry
+            .register(port, capacity, running.vsock_session.clone())
     }
 
     async fn open_serial(&self) -> Result<SerialDevice, VirtError> {
@@ -302,8 +429,6 @@ fn validate(config: &VmConfig) -> Result<(), VirtError> {
         }
     }
 
-    validate_vsock_ports(config)?;
-
     Ok(())
 }
 
@@ -320,6 +445,8 @@ fn prepare(config: &VmConfig) -> Result<(), VirtError> {
         ensure_path_exists(config, &mount.host_path, &format!("mount {}", mount.tag))?;
     }
     std::fs::create_dir_all(runtime_dir_for(config))?;
+    std::fs::create_dir_all(vsock_dir_for(config))?;
+    validate_private_vsock_paths(config)?;
     Ok(())
 }
 
@@ -329,7 +456,11 @@ fn build_boot_args(config: &VmConfig) -> Vec<String> {
     args
 }
 
-fn build_krun_vm(krun_bin: &Path, config: &VmConfig) -> Result<VirtualMachineBuilder, VirtError> {
+fn build_krun_vm(
+    krun_bin: &Path,
+    config: &VmConfig,
+    vhost_socket: &Path,
+) -> Result<VirtualMachineBuilder, VirtError> {
     let cpus = config.cpus().ok_or_else(|| VirtError::InvalidConfig {
         name: config.name().to_string(),
         reason: "krun requires a CPU count".to_string(),
@@ -360,6 +491,7 @@ fn build_krun_vm(krun_bin: &Path, config: &VmConfig) -> Result<VirtualMachineBui
         .memory_mib(memory_mib)
         .kernel(kernel)
         .cmdline(build_boot_args(config))
+        .vhost_user_vsock(vhost_socket)
         .stdio_console(true);
 
     if let Some(initramfs) = config.initramfs_path() {
@@ -370,13 +502,6 @@ fn build_krun_vm(krun_bin: &Path, config: &VmConfig) -> Result<VirtualMachineBui
     }
     for mount in config.mounts() {
         builder = builder.mount(krun_mount(mount));
-    }
-    for (port, mode) in unique_vsock_ports(config)? {
-        builder = builder.vsock_port(KrunVsockPort {
-            port,
-            path: vsock_path(config, port, mode),
-            listen: mode == VsockPortMode::Connect,
-        });
     }
     if let NetworkMode::UnixDatagram { peer_path, mac } = config.network() {
         builder = builder.net_unixgram(KrunNetUnixgram {
@@ -433,68 +558,77 @@ fn krun_error(config: &VmConfig, err: KrunBackendError) -> VirtError {
     }
 }
 
-fn prepare_vsock_ports(config: &VmConfig) -> Result<HashMap<u32, UnixListener>, VirtError> {
-    validate_vsock_ports(config)?;
-    let vsock_dir = vsock_dir_for(config);
-    std::fs::create_dir_all(&vsock_dir)?;
+async fn read_vhost_connect_response(stream: &mut UnixStream) -> io::Result<u32> {
+    const MAX_RESPONSE_BYTES: usize = 64;
 
-    let mut listeners = HashMap::new();
-    for (port, mode) in unique_vsock_ports(config)? {
-        let path = vsock_path(config, port, mode);
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-        }
-        if mode == VsockPortMode::Listen {
-            listeners.insert(port, UnixListener::bind(&path)?);
-        }
-    }
-    Ok(listeners)
-}
-
-fn validate_vsock_ports(config: &VmConfig) -> Result<(), VirtError> {
-    let _ = unique_vsock_ports(config)?;
-    Ok(())
-}
-
-fn unique_vsock_ports(config: &VmConfig) -> Result<Vec<(u32, VsockPortMode)>, VirtError> {
-    let mut ports = HashMap::new();
-    for port in config.vsock_ports() {
-        if port.port == 0 {
-            return invalid_config(config, "vsock port must be greater than zero");
-        }
-        match ports.insert(port.port, port.mode) {
-            Some(existing) if existing != port.mode => {
-                return invalid_config(
-                    config,
-                    &format!(
-                        "vsock port {} is declared for both {:?} and {:?}",
-                        port.port, existing, port.mode
-                    ),
-                )
+    let response = timeout(VSOCK_CONNECT_TIMEOUT, async {
+        let mut response = Vec::with_capacity(MAX_RESPONSE_BYTES);
+        while response.len() < MAX_RESPONSE_BYTES {
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte).await?;
+            response.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
             }
-            _ => {}
         }
+        Ok::<_, io::Error>(response)
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for the vhost-user vsock connection response",
+        )
+    })??;
+
+    let response = std::str::from_utf8(&response)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if let Some(port) = response
+        .strip_suffix('\n')
+        .and_then(|response| response.strip_prefix("OK "))
+        .and_then(|port| port.parse::<u32>().ok())
+        .filter(|port| ((1_u32 << 30)..(1_u32 << 31)).contains(port))
+    {
+        return Ok(port);
     }
-
-    let mut ports = ports.into_iter().collect::<Vec<_>>();
-    ports.sort_by_key(|(port, _)| *port);
-    Ok(ports)
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("invalid vhost-user vsock response: {response:?}"),
+    ))
 }
 
-fn declared_vsock_mode(config: &VmConfig, port: u32) -> Option<VsockPortMode> {
-    config
-        .vsock_ports()
-        .iter()
-        .find(|candidate| candidate.port == port)
-        .map(|candidate| candidate.mode)
+async fn shutdown_vsock(mut server: vhost_vsock::BackendServer) -> Result<(), VirtError> {
+    tokio::task::spawn_blocking(move || loop {
+        match server.shutdown() {
+            Err(vhost_vsock::BackendError::ShutdownTimeout) => continue,
+            result => break result,
+        }
+    })
+    .await
+    .map_err(|error| VirtError::Backend(format!("vhost-user shutdown task failed: {error}")))?
+    .map_err(|error| VirtError::Backend(error.to_string()))
 }
 
-fn vsock_path(config: &VmConfig, port: u32, mode: VsockPortMode) -> PathBuf {
-    let direction = match mode {
-        VsockPortMode::Connect => "connect",
-        VsockPortMode::Listen => "listen",
-    };
-    vsock_dir_for(config).join(format!("{direction}-{port}.sock"))
+fn vhost_socket_for(config: &VmConfig) -> PathBuf {
+    vsock_dir_for(config).join(VHOST_SOCKET_NAME)
+}
+
+fn validate_private_vsock_paths(config: &VmConfig) -> Result<(), VirtError> {
+    let limit = std::mem::size_of::<libc::sockaddr_un>()
+        - std::mem::offset_of!(libc::sockaddr_un, sun_path)
+        - 1;
+    let path = vhost_socket_for(config);
+    let length = path.as_os_str().as_bytes().len();
+    if length > limit {
+        return invalid_config(
+            config,
+            &format!(
+                "private vsock path is {length} bytes, exceeding the Unix socket limit of {limit}: {}",
+                path.display()
+            ),
+        );
+    }
+    Ok(())
 }
 
 fn vsock_dir_for(config: &VmConfig) -> PathBuf {
@@ -564,10 +698,19 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::KrunBackend;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    use super::{
+        read_vhost_connect_response, validate_private_vsock_paths, KrunBackend, KrunVsockRegistry,
+        MAX_VSOCK_LISTENERS,
+    };
     use crate::virt::backend::VirtBackend;
+    use crate::virt::capacity::VsockCapacity;
     use crate::virt::{NetworkMode, VmConfig, VmExit};
 
     fn test_dir() -> PathBuf {
@@ -626,6 +769,8 @@ mod tests {
         assert!(args.lines().any(|arg| arg == "machine-1"));
         assert!(args.lines().any(|arg| arg == "--kernel"));
         assert!(args.lines().any(|arg| arg == kernel.display().to_string()));
+        assert!(args.lines().any(|arg| arg == "--vhost-user-vsock"));
+        assert!(!args.lines().any(|arg| arg == "--vsock-port"));
 
         fs::remove_dir_all(root).expect("remove test root");
     }
@@ -661,5 +806,181 @@ mod tests {
         assert!(!krun.with_extension("launched").exists());
 
         fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[tokio::test]
+    async fn registry_routes_dynamic_guest_connections_and_releases_capacity() {
+        let registry = KrunVsockRegistry::default();
+        let capacity = VsockCapacity::test_with_limit("krun-registry", 1);
+        let session = Arc::new(AtomicBool::new(true));
+        let mut listener = registry
+            .register(7000, capacity.clone(), session.clone())
+            .expect("register listener");
+
+        let backend_stream = registry
+            .connect_guest(
+                vhost_vsock::ConnectionRequest {
+                    source_port: 4000,
+                    destination_port: 7000,
+                },
+                session.clone(),
+            )
+            .expect("route first guest connection");
+        let accepted = listener.accept().await.expect("accept routed connection");
+        assert_eq!(accepted.source_port(), Some(4000));
+        assert_eq!(accepted.destination_port(), 7000);
+        assert!(accepted.owns_capacity(&capacity));
+        assert!(registry
+            .connect_guest(
+                vhost_vsock::ConnectionRequest {
+                    source_port: 4001,
+                    destination_port: 7000,
+                },
+                session.clone(),
+            )
+            .is_none());
+
+        drop(backend_stream);
+        drop(accepted);
+        assert!(registry
+            .connect_guest(
+                vhost_vsock::ConnectionRequest {
+                    source_port: 4001,
+                    destination_port: 7000,
+                },
+                session.clone(),
+            )
+            .is_some());
+
+        drop(listener);
+        assert!(registry
+            .connect_guest(
+                vhost_vsock::ConnectionRequest {
+                    source_port: 4002,
+                    destination_port: 7000,
+                },
+                session,
+            )
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_response_is_consumed_without_buffering_guest_data() {
+        let (mut client, mut backend) = UnixStream::pair().expect("create stream pair");
+        backend
+            .write_all(b"OK 1073741824\nguest payload")
+            .await
+            .expect("write response and payload");
+
+        let source_port = read_vhost_connect_response(&mut client)
+            .await
+            .expect("read connect response");
+        assert_eq!(source_port, 1_u32 << 30);
+        let mut payload = vec![0_u8; "guest payload".len()];
+        client
+            .read_exact(&mut payload)
+            .await
+            .expect("read preserved guest payload");
+        assert_eq!(payload, b"guest payload");
+    }
+
+    #[test]
+    fn listener_discards_pending_connections_from_a_stopped_frontend() {
+        let registry = KrunVsockRegistry::default();
+        let capacity = VsockCapacity::test_with_limit("krun-session", 1);
+        let session = Arc::new(AtomicBool::new(true));
+        let mut listener = registry
+            .register(7000, capacity.clone(), session.clone())
+            .expect("register listener");
+        let backend_stream = registry
+            .connect_guest(
+                vhost_vsock::ConnectionRequest {
+                    source_port: 4000,
+                    destination_port: 7000,
+                },
+                session.clone(),
+            )
+            .expect("queue guest connection");
+
+        session.store(false, Ordering::Release);
+        drop(backend_stream);
+        assert!(listener
+            .try_accept()
+            .expect("discard stopped-session connection")
+            .is_none());
+        assert_eq!(capacity.available_permits(), 1);
+
+        let next_session = Arc::new(AtomicBool::new(true));
+        assert!(registry
+            .connect_guest(
+                vhost_vsock::ConnectionRequest {
+                    source_port: 4001,
+                    destination_port: 7000,
+                },
+                next_session.clone(),
+            )
+            .is_none());
+        let replacement = registry
+            .register(7000, capacity, next_session)
+            .expect("replace stopped-session listener");
+        drop(listener);
+        assert!(registry.listeners.lock().unwrap().contains_key(&7000));
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn invalid_connect_response_is_rejected() {
+        let (mut client, mut backend) = UnixStream::pair().expect("create stream pair");
+        backend
+            .write_all(b"NO 7000\n")
+            .await
+            .expect("write invalid response");
+
+        let error = read_vhost_connect_response(&mut client)
+            .await
+            .expect_err("invalid response must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn connect_response_wait_is_bounded() {
+        let (mut client, _backend) = UnixStream::pair().expect("create stream pair");
+
+        let error = read_vhost_connect_response(&mut client)
+            .await
+            .expect_err("missing response must time out");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn registry_enforces_listener_limit_separately_from_connection_capacity() {
+        let registry = KrunVsockRegistry::default();
+        let capacity = VsockCapacity::new("krun-listeners");
+        let session = Arc::new(AtomicBool::new(true));
+        let listeners = (0..MAX_VSOCK_LISTENERS)
+            .map(|port| {
+                registry
+                    .register(port as u32 + 1, capacity.clone(), session.clone())
+                    .expect("register through exact listener limit")
+            })
+            .collect::<Vec<_>>();
+
+        let error = registry
+            .register(MAX_VSOCK_LISTENERS as u32 + 1, capacity, session)
+            .expect_err("listener after exact limit must fail");
+        assert!(error.to_string().contains("listener registration limit"));
+        drop(listeners);
+    }
+
+    #[test]
+    fn private_socket_paths_are_validated_before_launch() {
+        let config = VmConfig::builder("long-runtime-path")
+            .base_directory(PathBuf::from("/").join("x".repeat(200)))
+            .build();
+
+        let error = validate_private_vsock_paths(&config)
+            .expect_err("overlong private socket path must fail");
+        assert!(error.to_string().contains("Unix socket limit"));
     }
 }

@@ -2,18 +2,17 @@
 
 Guest-side agent for Silo VMs.
 
-`silo-agent` runs inside the Linux guest and connects back to Silo's guest control plane over vsock. It is responsible for registration, SSH access, guest-side forwarding, and optional guest provisioning.
+`silo-agent` runs inside the Linux guest and connects back to Silo's guest control plane over vsock. It is responsible for registration, SSH access, and optional guest provisioning.
 
 ## Overview
 
-`silo-agent` currently does four main jobs inside the guest:
+`silo-agent` currently does three main jobs inside the guest:
 
 - registers with the host-side control service over vsock
 - serves SSH on guest `vsock::22` when that port is free
-- runs the guest-side forward service used by the `forward` plugin
 - runs optional guest provisioning tasks
 
-The control RPC port is selected from the kernel command line via `silo.agent.port`. If that kernel arg is missing or invalid, the agent falls back to Silo's default control port.
+The control RPC port is selected from the kernel command line via `silo.guest.port`. If that kernel arg is missing or invalid, the agent falls back to Silo's default control port.
 
 At startup the agent:
 
@@ -22,8 +21,7 @@ At startup the agent:
 3. reads the control port from `/proc/cmdline`
 4. runs provisioning if enabled, with loopback and optional static networking first
 5. attempts to bind guest `vsock::22` for SSH, unless another listener already owns it
-6. starts the forward service if enabled
-7. registers with the host-side control service
+6. registers with the host-side control service
 
 ## Config
 
@@ -38,11 +36,6 @@ If the file is missing, the agent falls back to its built-in defaults.
 Current config shape:
 
 ```yaml
-forward:
-  enabled: false
-  port: 0
-  uds: []
-
 provision:
   enabled: false
 ```
@@ -50,12 +43,6 @@ provision:
 Example with all supported sections populated:
 
 ```yaml
-forward:
-  enabled: true
-  port: 4000
-  uds:
-    - guest_path: /var/run/docker.sock
-
 provision:
   enabled: true
   network:
@@ -76,8 +63,6 @@ provision:
 Notes:
 
 - SSH is not configured here. The agent attempts to bind guest `vsock::22`; if another listener already owns `vsock::22`, the agent leaves it alone.
-- `forward.port` must be set when `forward.enabled` is true. This is the guest-side vsock port used by the host `forward` plugin endpoint.
-- `forward.uds` is an allowlist of guest Unix socket paths the forward service may connect to.
 - `provision` controls optional guest provisioning work such as static networking, hostname, and root filesystem resizing.
 - `provision.network` is omitted for a machine without a network attachment. When provisioning is enabled, the network provisioner still brings up loopback but leaves non-loopback links, routes, and `/etc/resolv.conf` untouched.
 - Networking is the first provisioner. It brings up loopback, then matches and configures the optional static interface through Linux rtnetlink without invoking DHCP, `ip`, or a network manager.

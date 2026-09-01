@@ -8,6 +8,7 @@ use nix::unistd::pipe;
 use serde::Deserialize;
 use tokio::io::unix::AsyncFd;
 
+use crate::lock_manager::MachineLifetimeLock;
 use crate::machine::{ExecutionLaunchFailure, HostCommand};
 use crate::network::VmmonNetworkAttachment;
 use crate::paths::OwnedDirectory;
@@ -19,6 +20,7 @@ use crate::LibVmError;
 const ENV_VM_STARTPIPE: &str = "_VM_STARTPIPE";
 const ENV_VM_SYNCPIPE: &str = "_VM_SYNCPIPE";
 const ENV_VM_MACHINE_LOG_DIR: &str = "_VM_MACHINE_LOG_DIR";
+const ENV_VM_MACHINE_LOCK: &str = "_VM_MACHINE_LOCK";
 const VMMON_LAUNCHER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const VMMON_START_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -26,6 +28,7 @@ pub(crate) struct VmmonLaunch<'a> {
     pub(crate) machine_id: MachineId,
     pub(crate) name: &'a str,
     pub(crate) machine_dir: &'a Path,
+    pub(crate) machine_runtime_dir: &'a Path,
     pub(crate) pidfile: &'a Path,
     pub(crate) exit_status: &'a Path,
     pub(crate) config: &'a Path,
@@ -38,6 +41,7 @@ pub(crate) struct VmmonLaunch<'a> {
     pub(crate) agent_enabled: bool,
     pub(crate) startup_command: Option<&'a VmmonStartupCommand>,
     pub(crate) machine_log_dir: &'a OwnedDirectory,
+    pub(crate) machine_lock: &'a MachineLifetimeLock,
 }
 
 impl Vmmon {
@@ -46,6 +50,7 @@ impl Vmmon {
         let (sync_read, sync_write) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
         configure_pipe_inheritance(&start_read, &start_write, &sync_read, &sync_write)?;
         let machine_log_dir = launch.machine_log_dir.duplicate_inheritable()?;
+        let machine_lock = launch.machine_lock.duplicate_inheritable()?;
 
         let mut command = Command::new(self.executable());
         command
@@ -55,6 +60,8 @@ impl Vmmon {
             .arg(launch.name)
             .arg("--data-dir")
             .arg(launch.machine_dir)
+            .arg("--runtime-dir")
+            .arg(launch.machine_runtime_dir)
             .arg("--pidfile")
             .arg(launch.pidfile)
             .arg("--exit-status")
@@ -86,6 +93,7 @@ impl Vmmon {
             ENV_VM_MACHINE_LOG_DIR,
             machine_log_dir.as_raw_fd().to_string(),
         );
+        command.env(ENV_VM_MACHINE_LOCK, machine_lock.as_raw_fd().to_string());
 
         let child = command
             .stdin(Stdio::null())
@@ -96,6 +104,7 @@ impl Vmmon {
         drop(start_read);
         drop(sync_write);
         drop(machine_log_dir);
+        drop(machine_lock);
         wait_for_vmmon_launcher(child).await?;
 
         let start_request = VmmonStartRequest::new(

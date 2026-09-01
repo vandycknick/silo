@@ -9,14 +9,20 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use hyper_util::rt::TokioIo;
 use libvm::{
     ExecutionLaunchFailureReason, ExecutionLostReason, ExecutionResult, FileWriteDisposition,
-    ImageSource, LibVmError, Machine, MachineAgentStatus, MachineDirectoryCreateDisposition,
-    MachineExitOutcome, MachineFileUploadOptions, MachineReadinessOutcome, MachineStatus, Runtime,
-    RuntimeConfig,
+    ImageSource, LibVmError, Machine, MachineAgent, MachineAgentStatus,
+    MachineDirectoryCreateDisposition, MachineExitOutcome, MachineFileUploadOptions,
+    MachineReadinessOutcome, MachineStatus, Runtime, RuntimeConfig,
 };
 use test_utils::Scenario;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::Endpoint;
+use tower::service_fn;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -54,9 +60,12 @@ struct TestEnv {
 }
 
 async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
-    let temp = tempfile::tempdir().expect("create temp dir");
-    // Unix socket paths live under the run root and must stay below SUN_LEN
-    // (104 bytes on macOS); the default TMPDIR can be too deep for that.
+    // The mock backend and runtime both create Unix sockets below these roots.
+    // Keep them short enough for macOS's 104-byte sockaddr_un limit.
+    let temp = tempfile::Builder::new()
+        .prefix("silo-test")
+        .tempdir_in("/tmp")
+        .expect("create short temp dir");
     let run_root = tempfile::Builder::new()
         .prefix("silo-mock")
         .tempdir_in("/tmp")
@@ -100,6 +109,134 @@ async fn create_machine(env: &TestEnv, name: &str) -> Machine {
         .expect("create machine")
 }
 
+#[tokio::test]
+async fn vsock_path_accessors_are_store_backed_and_follow_enablement() {
+    let env = test_env("vsock-paths", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-vsock-paths").await;
+
+    assert_eq!(
+        machine.vsock_socket().await.expect("disabled mux path"),
+        None
+    );
+    assert_eq!(
+        machine
+            .vsock_listener_socket(5000)
+            .await
+            .expect("disabled listener path"),
+        None
+    );
+    let machine_run_dir = env._run_root.path().join("machines").join(machine.id());
+    assert!(
+        !machine_run_dir.exists(),
+        "omitted path accessors must not create runtime state"
+    );
+
+    let mut spec = machine.inspect().await.expect("inspect machine").spec;
+    spec.vsock = Some(vm_spec::Vsock {
+        enabled: false,
+        uds: None,
+    });
+    machine
+        .replace_config(spec)
+        .await
+        .expect("explicitly disable vsock");
+    assert_eq!(
+        machine.vsock_socket().await.expect("disabled mux path"),
+        None
+    );
+    assert_eq!(
+        machine
+            .vsock_listener_socket(5000)
+            .await
+            .expect("disabled listener path"),
+        None
+    );
+    assert!(
+        !machine_run_dir.exists(),
+        "disabled path accessors must not create runtime state"
+    );
+
+    let mut spec = machine.inspect().await.expect("inspect machine").spec;
+    spec.vsock = Some(vm_spec::Vsock {
+        enabled: true,
+        uds: None,
+    });
+    machine.replace_config(spec).await.expect("enable vsock");
+    let expected_mux = machine_run_dir.join(vm_spec::DEFAULT_VSOCK_MUX_FILENAME);
+    assert_eq!(
+        machine.vsock_socket().await.expect("default mux path"),
+        Some(expected_mux.clone())
+    );
+    assert_eq!(
+        machine
+            .vsock_listener_socket(5000)
+            .await
+            .expect("default listener path"),
+        Some(PathBuf::from(format!("{}_5000", expected_mux.display())))
+    );
+    assert_eq!(
+        machine
+            .vsock_listener_socket(protocol::DEFAULT_GUEST_CONTROL_PORT)
+            .await
+            .expect("reserved listener path"),
+        None
+    );
+
+    let mut spec = machine
+        .inspect()
+        .await
+        .expect("inspect enabled machine")
+        .spec;
+    spec.vsock = Some(vm_spec::Vsock {
+        enabled: true,
+        uds: Some(PathBuf::from("custom.sock")),
+    });
+    machine
+        .replace_config(spec)
+        .await
+        .expect("customize vsock path");
+    let custom_mux = env
+        ._run_root
+        .path()
+        .join("machines")
+        .join(machine.id())
+        .join("custom.sock");
+    assert_eq!(
+        machine.vsock_socket().await.expect("custom mux path"),
+        Some(custom_mux.clone())
+    );
+    assert_eq!(
+        machine
+            .vsock_listener_socket(5000)
+            .await
+            .expect("custom listener path"),
+        Some(PathBuf::from(format!("{}_5000", custom_mux.display())))
+    );
+
+    for reserved in ["vm.sock", "vm.pid", "vm.lock", "krun.vsock"] {
+        let mut spec = machine
+            .inspect()
+            .await
+            .expect("inspect custom machine")
+            .spec;
+        spec.vsock = Some(vm_spec::Vsock {
+            enabled: true,
+            uds: Some(PathBuf::from(reserved)),
+        });
+        let error = machine
+            .replace_config(spec)
+            .await
+            .expect_err("reserved mux filename must be rejected");
+        assert!(matches!(error, LibVmError::VmSpecSerializeFailed { .. }));
+    }
+
+    machine.clone().remove().await.expect("remove machine");
+    assert!(matches!(
+        machine.vsock_socket().await,
+        Err(LibVmError::MachineNotFound { .. })
+    ));
+}
+
 async fn start_ready(machine: &Machine) {
     machine.start().await.expect("start machine");
     let readiness = machine
@@ -107,6 +244,58 @@ async fn start_ready(machine: &Machine) {
         .await
         .expect("wait for readiness");
     assert_eq!(readiness.outcome, MachineReadinessOutcome::Ready);
+}
+
+async fn read_mux_acknowledgement(stream: &mut UnixStream) -> u32 {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut acknowledgement = Vec::new();
+        loop {
+            let byte = stream.read_u8().await.expect("read mux acknowledgement");
+            acknowledgement.push(byte);
+            if byte == b'\n' {
+                break;
+            }
+        }
+        std::str::from_utf8(&acknowledgement)
+            .expect("UTF-8 acknowledgement")
+            .strip_prefix("OK ")
+            .and_then(|value| value.strip_suffix('\n'))
+            .and_then(|value| value.parse::<u32>().ok())
+            .expect("canonical OK source port")
+    })
+    .await
+    .expect("mux acknowledgement deadline")
+}
+
+async fn open_raw_ssh(
+    vmmon_socket: PathBuf,
+) -> (
+    mpsc::Sender<protocol::v1::ByteChunk>,
+    tonic::Streaming<protocol::v1::ByteChunk>,
+) {
+    let channel = tokio::time::timeout(
+        Duration::from_secs(2),
+        Endpoint::try_from("http://[::]:50051")
+            .expect("vmmon endpoint")
+            .connect_with_connector(service_fn(move |_| {
+                let vmmon_socket = vmmon_socket.clone();
+                async move { UnixStream::connect(vmmon_socket).await.map(TokioIo::new) }
+            })),
+    )
+    .await
+    .expect("vmmon connection deadline")
+    .expect("connect vmmon");
+    let mut client = protocol::v1::vm_access_service_client::VmAccessServiceClient::new(channel);
+    let (sender, receiver) = mpsc::channel(1);
+    let stream = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.open_ssh(ReceiverStream::new(receiver)),
+    )
+    .await
+    .expect("SSH setup deadline")
+    .expect("open SSH stream")
+    .into_inner();
+    (sender, stream)
 }
 
 #[tokio::test]
@@ -123,10 +312,443 @@ async fn machine_lifecycle_uses_vmmon_from_portable_runtime() {
             .is_running(),
         "machine must be running after readiness"
     );
+    assert!(
+        !env._run_root
+            .path()
+            .join("machines")
+            .join(machine.id())
+            .join(vm_spec::DEFAULT_VSOCK_MUX_FILENAME)
+            .exists(),
+        "disabled public vsock must create no mux"
+    );
 
     machine.stop().await.expect("stop machine");
     let inspected = machine.inspect().await.expect("inspect after stop");
     assert!(!inspected.is_running(), "machine must be stopped");
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn agent_disabled_machine_runs_without_public_vsock() {
+    let env = test_env("agent-disabled", &Scenario::default()).await;
+    let machine = env
+        .runtime
+        .machine()
+        .name("integration-agent-disabled")
+        .image_source(ImageSource::Disk(env.disk.clone()))
+        .network(|network| network.none())
+        .agent_mode(Some(MachineAgent::Disabled))
+        .create()
+        .await
+        .expect("create agent-disabled machine");
+
+    machine.start().await.expect("start agent-disabled machine");
+    assert!(machine
+        .inspect()
+        .await
+        .expect("inspect agent-disabled machine")
+        .is_running());
+    assert_eq!(machine.vsock_socket().await.expect("disabled mux"), None);
+
+    machine.stop().await.expect("stop agent-disabled machine");
+    machine
+        .remove()
+        .await
+        .expect("remove agent-disabled machine");
+}
+
+#[tokio::test]
+async fn explicitly_disabled_public_vsock_preserves_internal_ssh_and_agent_services() {
+    let env = test_env("disabled-vsock-services", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-disabled-vsock-services").await;
+    let mut spec = machine.inspect().await.expect("inspect machine").spec;
+    spec.vsock = Some(vm_spec::Vsock {
+        enabled: false,
+        uds: None,
+    });
+    machine
+        .replace_config(spec)
+        .await
+        .expect("disable public vsock");
+
+    start_ready(&machine).await;
+    assert_eq!(machine.vsock_socket().await.expect("disabled mux"), None);
+
+    let output = machine
+        .exec("/bin/echo", ["agent-over-internal-vsock"])
+        .await
+        .expect("guest agent request");
+    assert_eq!(output.stdout_bytes(), b"agent-over-internal-vsock\n");
+
+    let vmmon_socket = env
+        ._run_root
+        .path()
+        .join("machines")
+        .join(machine.id())
+        .join("vm.sock");
+    let (ssh_input, mut ssh_output) = open_raw_ssh(vmmon_socket).await;
+    ssh_input
+        .send(protocol::v1::ByteChunk {
+            data: Some(b"ssh-over-internal-vsock".to_vec().into()),
+        })
+        .await
+        .expect("write SSH bytes");
+    let echoed = tokio::time::timeout(Duration::from_secs(2), ssh_output.message())
+        .await
+        .expect("SSH echo deadline")
+        .expect("read SSH stream")
+        .expect("SSH echo");
+    assert_eq!(
+        echoed.data.as_deref(),
+        Some(&b"ssh-over-internal-vsock"[..])
+    );
+
+    machine.stop().await.expect("stop machine");
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn custom_mux_connects_to_core_and_arbitrary_guest_ports() {
+    let mut scenario = Scenario::default();
+    scenario.vsock.refuse_ports.push(7001);
+    let env = test_env("custom-vsock-mux", &scenario).await;
+    let machine = create_machine(&env, "integration-custom-vsock-mux").await;
+    let mut spec = machine.inspect().await.expect("inspect machine").spec;
+    spec.vsock = Some(vm_spec::Vsock {
+        enabled: true,
+        uds: Some(PathBuf::from("custom-vsock.sock")),
+    });
+    machine.replace_config(spec).await.expect("set custom mux");
+    let mux_path = machine
+        .vsock_socket()
+        .await
+        .expect("resolve custom mux")
+        .expect("enabled custom mux");
+
+    start_ready(&machine).await;
+    let mut ssh = UnixStream::connect(&mux_path)
+        .await
+        .expect("connect custom mux");
+    ssh.write_all(b"CONNECT 22\ncustom")
+        .await
+        .expect("dial SSH through custom mux");
+    assert!(read_mux_acknowledgement(&mut ssh).await >= 1_u32 << 30);
+    let mut echo = [0_u8; 6];
+    tokio::time::timeout(Duration::from_secs(2), ssh.read_exact(&mut echo))
+        .await
+        .expect("custom mux echo deadline")
+        .expect("read custom mux echo");
+    assert_eq!(&echo, b"custom");
+
+    let mut arbitrary = UnixStream::connect(&mux_path)
+        .await
+        .expect("connect arbitrary-port mux");
+    arbitrary
+        .write_all(b"CONNECT 7000\n")
+        .await
+        .expect("dial arbitrary guest port");
+    assert!(read_mux_acknowledgement(&mut arbitrary).await >= 1_u32 << 30);
+
+    let mut refused = UnixStream::connect(&mux_path)
+        .await
+        .expect("connect refused-port mux");
+    refused
+        .write_all(b"CONNECT 7001\n")
+        .await
+        .expect("dial refused guest port");
+    refused.shutdown().await.expect("close refused mux input");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), refused.read_to_end(&mut response))
+        .await
+        .expect("refused mux close deadline")
+        .expect("read refused mux closure");
+    assert!(
+        response.is_empty(),
+        "refused guest port receives no OK reply"
+    );
+
+    machine.stop().await.expect("stop machine");
+    assert!(!mux_path.exists(), "vmmon must clean the custom mux");
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn reserved_host_listener_is_ignored_and_remains_extension_owned() {
+    let env = test_env("reserved-vsock-listener", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-reserved-vsock-listener").await;
+    let inspected = machine.inspect().await.expect("inspect machine");
+    let machine_dir = inspected.machine_dir;
+    let mut spec = inspected.spec;
+    spec.vsock = Some(vm_spec::Vsock {
+        enabled: true,
+        uds: None,
+    });
+    machine.replace_config(spec).await.expect("enable vsock");
+    let mux_path = machine
+        .vsock_socket()
+        .await
+        .expect("resolve mux")
+        .expect("enabled mux");
+    let reserved_path = PathBuf::from(format!(
+        "{}_{}",
+        mux_path.display(),
+        protocol::DEFAULT_GUEST_CONTROL_PORT
+    ));
+    let reserved_listener =
+        UnixListener::bind(&reserved_path).expect("publish reserved listener-shaped socket");
+
+    start_ready(&machine).await;
+    assert!(
+        !machine_dir
+            .join(format!(".v_{}", protocol::DEFAULT_GUEST_CONTROL_PORT))
+            .exists(),
+        "reserved host port must not be registered"
+    );
+
+    machine.stop().await.expect("stop machine");
+    assert!(
+        !reserved_path.exists(),
+        "libvm must remove the machine runtime tree after vmmon stops"
+    );
+    drop(reserved_listener);
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn mux_closes_malformed_and_oversized_commands_without_reply() {
+    let env = test_env("invalid-vsock-mux", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-invalid-vsock-mux").await;
+    let mut spec = machine.inspect().await.expect("inspect machine").spec;
+    spec.vsock = Some(vm_spec::Vsock {
+        enabled: true,
+        uds: None,
+    });
+    machine.replace_config(spec).await.expect("enable vsock");
+    let mux_path = machine
+        .vsock_socket()
+        .await
+        .expect("resolve mux")
+        .expect("enabled mux");
+    start_ready(&machine).await;
+
+    for command in [&b"CONNECT 22 \n"[..], &[b'x'; 32][..]] {
+        let mut client = UnixStream::connect(&mux_path)
+            .await
+            .expect("connect invalid mux client");
+        client
+            .write_all(command)
+            .await
+            .expect("write invalid command");
+        client
+            .shutdown()
+            .await
+            .expect("close invalid command input");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .expect("invalid mux close deadline")
+            .expect("read invalid mux closure");
+        assert!(response.is_empty(), "invalid commands receive no reply");
+    }
+
+    machine.stop().await.expect("stop machine");
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn hybrid_vsock_surface_serves_mux_and_preboot_listener_end_to_end() {
+    let env = test_env("hybrid-vsock", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-hybrid-vsock").await;
+    let inspected = machine.inspect().await.expect("inspect machine");
+    let machine_dir = inspected.machine_dir.clone();
+    let mut spec = inspected.spec;
+    spec.vsock = Some(vm_spec::Vsock {
+        enabled: true,
+        uds: None,
+    });
+    machine.replace_config(spec).await.expect("enable vsock");
+
+    let mux_path = machine
+        .vsock_socket()
+        .await
+        .expect("resolve mux path")
+        .expect("enabled mux path");
+    let listener_path = machine
+        .vsock_listener_socket(5000)
+        .await
+        .expect("resolve listener path")
+        .expect("enabled listener path");
+    let user_listener = UnixListener::bind(&listener_path).expect("bind preboot host listener");
+
+    start_ready(&machine).await;
+
+    let mut mux = UnixStream::connect(&mux_path).await.expect("connect mux");
+    mux.write_all(b"CONNECT 22\nhello")
+        .await
+        .expect("write mux request");
+    assert!(read_mux_acknowledgement(&mut mux).await >= 1_u32 << 30);
+    let mut echoed = [0_u8; 5];
+    tokio::time::timeout(Duration::from_secs(2), mux.read_exact(&mut echoed))
+        .await
+        .expect("mux echo deadline")
+        .expect("read mux echo");
+    assert_eq!(&echoed, b"hello");
+
+    let mut arbitrary = UnixStream::connect(&mux_path)
+        .await
+        .expect("connect arbitrary default mux");
+    arbitrary
+        .write_all(b"CONNECT 7000\n")
+        .await
+        .expect("dial arbitrary guest port through default mux");
+    assert!(read_mux_acknowledgement(&mut arbitrary).await >= 1_u32 << 30);
+
+    let guest_path = machine_dir.join(".v_5000");
+    let mut guest = UnixStream::connect(&guest_path)
+        .await
+        .expect("connect mock guest to host port");
+    let (mut host, _) = user_listener.accept().await.expect("accept relayed guest");
+    guest.write_all(b"guest").await.expect("write guest bytes");
+    let mut guest_bytes = [0_u8; 5];
+    host.read_exact(&mut guest_bytes)
+        .await
+        .expect("read guest bytes");
+    assert_eq!(&guest_bytes, b"guest");
+    host.write_all(b"host").await.expect("write host bytes");
+    let mut host_bytes = [0_u8; 4];
+    guest
+        .read_exact(&mut host_bytes)
+        .await
+        .expect("read host bytes");
+    assert_eq!(&host_bytes, b"host");
+
+    let dynamic_listener_path = machine
+        .vsock_listener_socket(5001)
+        .await
+        .expect("resolve dynamic listener path")
+        .expect("dynamic listener path");
+    let dynamic_listener =
+        UnixListener::bind(&dynamic_listener_path).expect("publish dynamic host listener");
+    let dynamic_guest_path = machine_dir.join(".v_5001");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !dynamic_guest_path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dynamic listener registration deadline");
+    let mut dynamic_guest = UnixStream::connect(&dynamic_guest_path)
+        .await
+        .expect("connect guest to dynamic listener");
+    let (mut dynamic_host, _) = dynamic_listener
+        .accept()
+        .await
+        .expect("accept dynamic guest");
+    dynamic_guest
+        .write_all(b"dynamic")
+        .await
+        .expect("write dynamic guest bytes");
+    let mut dynamic_bytes = [0_u8; 7];
+    dynamic_host
+        .read_exact(&mut dynamic_bytes)
+        .await
+        .expect("read dynamic guest bytes");
+    assert_eq!(&dynamic_bytes, b"dynamic");
+
+    drop(dynamic_host);
+    drop(dynamic_guest);
+    drop(dynamic_listener);
+    let mut stale_guest = UnixStream::connect(&dynamic_guest_path)
+        .await
+        .expect("registered guest port remains available");
+    let mut closed = [0_u8; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), stale_guest.read(&mut closed))
+            .await
+            .expect("stale listener reset deadline")
+            .expect("read stale listener reset"),
+        0
+    );
+
+    std::fs::remove_file(&dynamic_listener_path).expect("remove stale listener socket");
+    let replacement_listener =
+        UnixListener::bind(&dynamic_listener_path).expect("bind replacement listener");
+    let replacement_guest = UnixStream::connect(&dynamic_guest_path)
+        .await
+        .expect("connect guest after listener replacement");
+    let (_replacement_host, _) = replacement_listener
+        .accept()
+        .await
+        .expect("accept guest through retained registration");
+    drop(replacement_guest);
+
+    machine.stop().await.expect("stop machine");
+    assert!(!mux_path.exists(), "vmmon must clean its mux socket");
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn host_port_22_listener_is_independent_of_host_to_guest_ssh() {
+    let env = test_env("hybrid-vsock-port-22", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-hybrid-vsock-port-22").await;
+    let inspected = machine.inspect().await.expect("inspect machine");
+    let machine_dir = inspected.machine_dir;
+    let mut spec = inspected.spec;
+    spec.vsock = Some(vm_spec::Vsock {
+        enabled: true,
+        uds: None,
+    });
+    machine.replace_config(spec).await.expect("enable vsock");
+    let listener_path = machine
+        .vsock_listener_socket(agent_spec::SSH_VSOCK_PORT)
+        .await
+        .expect("resolve SSH host listener")
+        .expect("SSH host listener path");
+    let listener = UnixListener::bind(&listener_path).expect("publish host port 22 listener");
+
+    start_ready(&machine).await;
+    let guest_path = machine_dir.join(format!(".v_{}", agent_spec::SSH_VSOCK_PORT));
+    let guest = UnixStream::connect(guest_path)
+        .await
+        .expect("guest connection to host port 22");
+    let (_host, _) = listener.accept().await.expect("accept host port 22 stream");
+    drop(guest);
+
+    let mux_path = machine
+        .vsock_socket()
+        .await
+        .expect("resolve mux path")
+        .expect("enabled mux path");
+    let mut ssh = UnixStream::connect(mux_path)
+        .await
+        .expect("connect host mux");
+    ssh.write_all(b"CONNECT 22\nssh")
+        .await
+        .expect("dial guest SSH");
+    assert!(read_mux_acknowledgement(&mut ssh).await >= 1_u32 << 30);
+    let mut echo = [0_u8; 3];
+    tokio::time::timeout(Duration::from_secs(2), ssh.read_exact(&mut echo))
+        .await
+        .expect("SSH echo deadline")
+        .expect("read SSH echo");
+    assert_eq!(&echo, b"ssh");
+
+    let mut guest_control = UnixStream::connect(
+        machine
+            .vsock_socket()
+            .await
+            .expect("resolve control mux path")
+            .expect("enabled control mux path"),
+    )
+    .await
+    .expect("connect control mux");
+    guest_control
+        .write_all(b"CONNECT 1027\n")
+        .await
+        .expect("dial guest control service");
+    assert!(read_mux_acknowledgement(&mut guest_control).await >= 1_u32 << 30);
+
+    machine.stop().await.expect("stop machine");
     machine.remove().await.expect("remove machine");
 }
 

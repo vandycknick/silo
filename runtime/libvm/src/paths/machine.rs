@@ -8,6 +8,7 @@ pub(super) const NETWORK_DIR_NAME: &str = "network";
 const VM_SPEC_FILE_NAME: &str = "config.json";
 const VMMON_PID_FILE_NAME: &str = "vm.pid";
 const VMMON_SOCKET_FILE_NAME: &str = "vm.sock";
+const VMMON_LOCK_FILE_NAME: &str = "vm.lock";
 pub(super) const VMMON_TRACE_LOG_FILE_NAME: &str = "vm.trace.log";
 const VMMON_EXIT_STATUS_FILE_NAME: &str = "vm.exit.json";
 pub(super) const SERIAL_LOG_FILE_NAME: &str = "serial.log";
@@ -78,6 +79,20 @@ impl MachinePaths {
 
     pub(crate) fn vmmon_socket_path(&self) -> PathBuf {
         self.run_dir.join(VMMON_SOCKET_FILE_NAME)
+    }
+
+    pub(crate) fn vmmon_lock_path(&self) -> PathBuf {
+        self.run_dir.join(VMMON_LOCK_FILE_NAME)
+    }
+
+    pub(crate) fn vsock_mux_path(&self, filename: &Path) -> PathBuf {
+        self.run_dir.join(filename)
+    }
+
+    pub(crate) fn vsock_listener_path(&self, filename: &Path, port: u32) -> PathBuf {
+        let mut path = self.vsock_mux_path(filename).into_os_string();
+        path.push(format!("_{port}"));
+        PathBuf::from(path)
     }
 
     pub(crate) fn vm_trace_log_path(&self) -> PathBuf {
@@ -175,6 +190,24 @@ mod tests {
             PathBuf::from("/tmp/silo-run/machines")
                 .join(&id)
                 .join("vm.sock")
+        );
+        assert_eq!(
+            paths.vmmon_lock_path(),
+            PathBuf::from("/tmp/silo-run/machines")
+                .join(&id)
+                .join("vm.lock")
+        );
+        assert_eq!(
+            paths.vsock_mux_path(PathBuf::from("vsock.sock").as_path()),
+            PathBuf::from("/tmp/silo-run/machines")
+                .join(&id)
+                .join("vsock.sock")
+        );
+        assert_eq!(
+            paths.vsock_listener_path(PathBuf::from("vsock.sock").as_path(), 5000),
+            PathBuf::from("/tmp/silo-run/machines")
+                .join(&id)
+                .join("vsock.sock_5000")
         );
         assert_eq!(
             paths.vm_trace_log_path(),

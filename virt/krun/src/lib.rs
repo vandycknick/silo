@@ -14,7 +14,7 @@ mod watchdog;
 pub use crate::builder::VirtualMachineBuilder;
 pub use crate::config::{
     validate_config, Disk, KrunConfig, Mount, NetTap, NetUnixgram, NetUnixstream, Network,
-    VsockPort, DEFAULT_ID,
+    DEFAULT_ID,
 };
 pub use crate::error::{KrunBackendError, Result};
 #[cfg(target_os = "linux")]

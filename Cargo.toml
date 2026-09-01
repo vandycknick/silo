@@ -9,12 +9,12 @@ members = [
     "guest/init",
     "runtime/oci",
     "runtime/libvm",
-    "runtime/plugins",
     "runtime/test-utils",
     "runtime/vmmon",
     "sdk/node",
     "sdk/go/native",
     "virt/krun",
+    "virt/vhost-vsock",
     "virt/vz",
     "specs/agent-spec",
     "specs/protocol",
@@ -24,7 +24,7 @@ default-members = ["app/cli", "runtime/vmmon"]
 resolver = "2"
 
 [workspace.dependencies]
-libkrun = { package = "libkrun", git = "https://github.com/vandycknick/libkrun.git", rev = "1b69e60ed03f58fe13bcd7b6f684aa71a404b0f9", default-features = false, features = ["blk", "net"] }
+libkrun = { package = "libkrun", git = "https://github.com/vandycknick/libkrun.git", rev = "10b6f752ba8ea735c3d9edaa549599dcf3f98d18", default-features = false, features = ["blk", "net"] }
 
 [profile.dev.package.sha2]
 opt-level = 3

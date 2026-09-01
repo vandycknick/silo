@@ -15,27 +15,33 @@ pub async fn run(
     ctx: DaemonContext,
     mut handles: ServiceHandles,
 ) -> eyre::Result<()> {
-    let (forced, backend_error) = tokio::select! {
+    let trigger = tokio::select! {
         _ = wait_for_signal() => {
             tracing::info!(instance = %ctx.machine.name(), "shutdown signal received");
-            ctx.store.set_vm_state(VmState::Stopping, "shutdown requested")?;
-            handles.mark_stopping().await;
-            ctx.shutdown.cancel();
-            (graceful_stop(&ctx).await?, None)
+            ShutdownTrigger::Requested("shutdown requested")
         }
         _ = ctx.stop_requested.cancelled() => {
             tracing::info!(instance = %ctx.machine.name(), "startup command completed");
-            ctx.store.set_vm_state(VmState::Stopping, "startup command completed")?;
-            handles.mark_stopping().await;
-            ctx.shutdown.cancel();
-            (graceful_stop(&ctx).await?, None)
+            ShutdownTrigger::Requested("startup command completed")
         }
         result = wait_for_machine_stop(&ctx.machine) => {
             let stop_info = result?;
             tracing::info!(instance = %ctx.machine.name(), message = %stop_info.message, "machine exited");
-            ctx.store.set_vm_state(VmState::Stopped, stop_info.message)?;
-            handles.mark_stopping().await;
-            ctx.shutdown.cancel();
+            ShutdownTrigger::Backend(stop_info)
+        }
+    };
+
+    handles.mark_stopping().await;
+    ctx.shutdown.cancel();
+    stop_vsock_surface(&mut handles).await;
+    let (forced, backend_error) = match trigger {
+        ShutdownTrigger::Requested(message) => {
+            ctx.store.set_vm_state(VmState::Stopping, message)?;
+            (graceful_stop(&ctx).await?, None)
+        }
+        ShutdownTrigger::Backend(stop_info) => {
+            ctx.store
+                .set_vm_state(VmState::Stopped, stop_info.message)?;
             (false, stop_info.error)
         }
     };
@@ -54,6 +60,22 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+enum ShutdownTrigger {
+    Requested(&'static str),
+    Backend(VmStopInfo),
+}
+
+async fn stop_vsock_surface(handles: &mut ServiceHandles) {
+    let Some(mut surface) = handles.vsock_surface.take() else {
+        return;
+    };
+    match tokio::time::timeout(SERVICE_DRAIN_TIMEOUT, surface.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(%error, "vsock surface shutdown failed"),
+        Err(_) => tracing::warn!("vsock surface exceeded shutdown drain timeout"),
+    }
 }
 
 async fn graceful_stop(ctx: &DaemonContext) -> eyre::Result<bool> {
@@ -90,10 +112,6 @@ async fn drain(handles: &mut ServiceHandles, machine: &crate::virt::VirtualMachi
 
     if let Some(task) = handles.guest_monitor.take() {
         drain_task(task, "guest monitor").await;
-    }
-
-    if let Some(task) = handles.endpoint_supervisor.take() {
-        drain_task(task, "endpoint supervisor").await;
     }
 
     drain_result_task(&mut handles.control_socket, "control socket").await;
