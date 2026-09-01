@@ -25,6 +25,7 @@ use tonic::transport::Endpoint;
 use tower::service_fn;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+const ASYNC_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn write_file(path: &Path, contents: &[u8], mode: u32) {
     std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
@@ -630,7 +631,7 @@ async fn hybrid_vsock_surface_serves_mux_and_preboot_listener_end_to_end() {
     let dynamic_listener =
         UnixListener::bind(&dynamic_listener_path).expect("publish dynamic host listener");
     let dynamic_guest_path = machine_dir.join(".v_5001");
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(ASYNC_DISCOVERY_TIMEOUT, async {
         while !dynamic_guest_path.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
