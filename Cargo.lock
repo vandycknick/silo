@@ -53,6 +53,7 @@ dependencies = [
  "bytes",
  "clap",
  "eyre",
+ "forward-spec",
  "futures",
  "nix 0.31.3",
  "prost-types",
