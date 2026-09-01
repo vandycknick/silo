@@ -1737,6 +1737,7 @@ mod tests {
                             }),
                         }),
                     }),
+                    services: Vec::new(),
                 })),
             }),
         }

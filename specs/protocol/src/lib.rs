@@ -23,6 +23,7 @@ pub const DEFAULT_DIRECTORY_PAGE_SIZE: u32 = 256;
 pub const MAX_DIRECTORY_PAGE_SIZE: u32 = 1024;
 
 pub const DEFAULT_GUEST_CONTROL_PORT: u32 = 1027;
+pub const FORWARD_VSOCK_PORT: u32 = 1028;
 pub const KERNEL_PARAM_GUEST_PORT: &str = "silo.guest.port";
 
 pub fn guest_port_arg(port: u32) -> String {
@@ -140,9 +141,10 @@ mod tests {
     use crate::{
         decode_error_detail, encode_error_detail, parse_guest_port_args, v1, CHUNK_64_KIB,
         DEFAULT_DIRECTORY_PAGE_SIZE, DEFAULT_GUEST_CONTROL_PORT, FILE_DESCRIPTOR_SET,
-        MAX_AGENT_IP_ADDRESSES, MAX_CODE_BYTES, MAX_CURSOR_BYTES, MAX_DIAGNOSTIC_BYTES,
-        MAX_DIRECTORY_PAGE_SIZE, MAX_FILENAME_BYTES, MAX_INFO_BYTES, MAX_METRIC_ARRAY_ENTRIES,
-        MAX_PATH_BYTES, MAX_PROBED_INIT_PATHS, MAX_PROVISIONING_STEPS, STRUCTURED_16_MIB,
+        FORWARD_VSOCK_PORT, MAX_AGENT_IP_ADDRESSES, MAX_CODE_BYTES, MAX_CURSOR_BYTES,
+        MAX_DIAGNOSTIC_BYTES, MAX_DIRECTORY_PAGE_SIZE, MAX_FILENAME_BYTES, MAX_INFO_BYTES,
+        MAX_METRIC_ARRAY_ENTRIES, MAX_PATH_BYTES, MAX_PROBED_INIT_PATHS, MAX_PROVISIONING_STEPS,
+        STRUCTURED_16_MIB,
     };
 
     #[test]
@@ -190,6 +192,7 @@ mod tests {
         assert!(files.contains(&"execution.proto"));
         assert!(files.contains(&"errors.proto"));
         assert!(files.contains(&"filesystem.proto"));
+        assert!(files.contains(&"forward.proto"));
         assert!(files.contains(&"guest.proto"));
         assert!(files.contains(&"guest_process.proto"));
         assert!(files.contains(&"vm_monitor.proto"));
@@ -224,6 +227,8 @@ mod tests {
         );
         assert_eq!(service_methods("GuestProcessService"), ["Execute"]);
         assert_eq!(service_methods("VmExecutionService"), ["Execute"]);
+        assert_eq!(service_methods("GuestForwardService"), ["Listen"]);
+        assert_eq!(service_methods("VmForwardService"), ["Hold", "List"]);
         assert_eq!(
             service_methods("GuestFilesystemService"),
             [
@@ -243,6 +248,75 @@ mod tests {
             data: Some(bytes::Bytes::from_static(b"chunk")),
         };
         assert_eq!(chunk.data.as_deref(), Some(b"chunk".as_slice()));
+    }
+
+    #[test]
+    fn forward_tokens_use_bytes() {
+        let token = bytes::Bytes::from_static(b"0123456789abcdef");
+        assert_eq!(
+            v1::ListenRequest {
+                listen: "tcp:127.0.0.1:80".to_string(),
+                token: token.clone(),
+                unix_mode: None,
+            }
+            .token,
+            token
+        );
+    }
+
+    #[test]
+    fn forward_descriptor_field_numbers_are_stable() {
+        let descriptors =
+            FileDescriptorSet::decode(FILE_DESCRIPTOR_SET).expect("decode descriptors");
+        let message = |name: &str| {
+            descriptors
+                .file
+                .iter()
+                .flat_map(|file| &file.message_type)
+                .find(|message| message.name.as_deref() == Some(name))
+                .expect("message in descriptor")
+        };
+        let fields = |name: &str| {
+            message(name)
+                .field
+                .iter()
+                .map(|field| {
+                    (
+                        field.name.as_deref().expect("field name"),
+                        field.number.expect("field number"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            fields("ForwardStatus"),
+            [
+                ("forward", 1),
+                ("direction", 2),
+                ("owner", 3),
+                ("state", 4),
+                ("bound", 5),
+                ("active_connections", 6),
+                ("refused_connections", 7),
+                ("error", 8),
+            ]
+        );
+        assert!(fields("EnabledAgent").contains(&("services", 4)));
+    }
+
+    #[test]
+    fn forward_error_codes_are_stable() {
+        assert_eq!(v1::ErrorCode::ForwardInvalid as i32, 25);
+        assert_eq!(v1::ErrorCode::ForwardAddressInUse as i32, 26);
+        assert_eq!(v1::ErrorCode::ForwardUnsupported as i32, 27);
+        assert_eq!(v1::ErrorCode::ForwardLimit as i32, 28);
+    }
+
+    #[test]
+    fn forward_vsock_port_is_reserved() {
+        assert_eq!(FORWARD_VSOCK_PORT, 1028);
+        assert_ne!(FORWARD_VSOCK_PORT, DEFAULT_GUEST_CONTROL_PORT);
     }
 
     #[test]

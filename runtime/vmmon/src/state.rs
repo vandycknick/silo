@@ -987,6 +987,7 @@ fn project_status(state: &State, now: Instant, observed_at: SystemTime) -> HostS
                     .status
                     .as_ref()
                     .map(|status| status_observation(state, status, now)),
+                services: Vec::new(),
             })),
         }
     } else {
