@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
 use crate::rxops::RxOps;
 

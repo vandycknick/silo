@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
 use std::{
     io::Result as IoResult,
@@ -109,6 +109,8 @@ pub(crate) enum Error {
     EmptyBackendRxQ,
     #[error("Failed to create an EventFd")]
     EventFdCreate(std::io::Error),
+    #[error("Failed to spawn the completion worker")]
+    CompletionWorkerSpawn(std::io::Error),
     #[error("Vring operation failed: {0}")]
     Vring(String),
     #[error("Vring completion worker stopped")]

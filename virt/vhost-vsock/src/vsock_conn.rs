@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
 use std::{
     io::{ErrorKind, Write},
@@ -185,14 +185,13 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
                         )
                         .is_err()
                         {
-                            if let Err(e) = VhostUserVsockThread::epoll_register(
+                            if let Err(error) = VhostUserVsockThread::epoll_register(
                                 self.epoll_fd,
                                 self.stream.as_raw_fd(),
                                 epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
                             ) {
-                                // TODO: let's move this logic out of this func, and handle it
-                                // properly
-                                error!("epoll_register failed: {e:?}, but proceed further.");
+                                self.rx_queue.enqueue(RxOps::Reset);
+                                return Err(error);
                             }
                         };
                         self.rx_cnt += Wrapping(pkt.len());
@@ -290,13 +289,13 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
                 )
                 .is_err()
                 {
-                    if let Err(e) = VhostUserVsockThread::epoll_register(
+                    if let Err(error) = VhostUserVsockThread::epoll_register(
                         self.epoll_fd,
                         self.stream.as_raw_fd(),
                         epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
                     ) {
-                        // TODO: let's move this logic out of this func, and handle it properly
-                        error!("epoll_register failed: {e:?}, but proceed further.");
+                        log::debug!("failed to monitor credited host stream: {error:?}");
+                        self.rx_queue.enqueue(RxOps::Reset);
                     }
                 };
             }
@@ -841,11 +840,11 @@ mod tests {
         let payload = b"hello";
         host_socket.write_all(payload).unwrap();
         conn_local.rx_queue.enqueue(RxOps::Rw);
-        let op_zero_read = conn_local.recv_pkt(&mut pkt);
-        op_zero_read.unwrap();
+        let failed_monitoring = conn_local.recv_pkt(&mut pkt);
+        assert!(failed_monitoring.is_err());
+        assert_eq!(conn_local.rx_queue.dequeue(), Some(RxOps::Reset));
         assert_eq!(pkt.op(), VSOCK_OP_RW);
-        assert!(!conn_local.rx_queue.pending_rx());
-        assert_eq!(conn_local.rx_cnt, Wrapping(payload.len() as u32));
+        assert_eq!(conn_local.rx_cnt, Wrapping(0));
         assert_eq!(conn_local.last_fwd_cnt, Wrapping(1024));
         assert_eq!(pkt.len(), 5);
         let buf = &mut [0u8; 5];
@@ -930,7 +929,12 @@ mod tests {
         pkt.set_op(VSOCK_OP_CREDIT_REQUEST);
         let credit_response = conn_local.send_pkt(&pkt);
         credit_response.unwrap();
-        assert_eq!(conn_local.rx_queue.peek().unwrap(), RxOps::CreditUpdate);
+        assert_eq!(conn_local.rx_queue.dequeue(), Some(RxOps::CreditUpdate));
+
+        // A monitoring failure after a credit update resets rather than stalls.
+        pkt.set_op(VSOCK_OP_CREDIT_UPDATE);
+        conn_local.send_pkt(&pkt).expect("consume credit update");
+        assert_eq!(conn_local.rx_queue.dequeue(), Some(RxOps::Reset));
 
         // VSOCK_OP_SHUTDOWN
         pkt.set_op(VSOCK_OP_SHUTDOWN);

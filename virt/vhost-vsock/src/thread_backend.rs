@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -274,8 +274,6 @@ impl VsockThreadBackend {
 
         let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
 
-        // TODO: Handle cases where connection does not exist and packet op
-        // is not VSOCK_OP_REQUEST
         if !self.conn_map.contains_key(&key) {
             // The packet contains a new connection request
             if pkt.op() == VSOCK_OP_REQUEST {
@@ -315,16 +313,7 @@ impl VsockThreadBackend {
         Ok(())
     }
 
-    /// Handle a new guest initiated connection, i.e from the peer, the guest
-    /// driver.
-    ///
-    /// In case of proxying using unix domain socket, attempts to connect to a
-    /// host side unix socket listening on a path corresponding to the
-    /// destination port as follows:
-    /// - "{self.host_sock_path}_{local_port}""
-    ///
-    /// In case of proxying using vosck, attempts to connect to the
-    /// {forward_cid, local_port}
+    /// Ask the embedding host to accept a new guest-initiated connection.
     fn handle_new_guest_conn<B: BitmapSlice>(&mut self, pkt: &VsockPacket<B>) {
         if !connection_capacity_available(self.conn_map.len()) {
             self.enq_rst(pkt.dst_port(), pkt.src_port());

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
 use std::{
     fs::File,
@@ -10,7 +10,7 @@ use std::{
         mpsc::{self, SyncSender},
         Arc,
     },
-    thread,
+    thread::{self, JoinHandle},
 };
 
 use log::{error, warn};
@@ -53,8 +53,10 @@ pub(crate) struct VhostUserVsockThread {
     pub thread_backend: VsockThreadBackend,
     /// CID of the guest.
     guest_cid: u64,
-    /// Channel to a worker which handles event idx.
-    sender: SyncSender<EventData>,
+    /// Channel to a worker which completes used-ring entries without holding
+    /// the queue lock taken by packet processing.
+    sender: Option<SyncSender<EventData>>,
+    completion_worker: Option<JoinHandle<()>>,
     /// host side port on which application listens.
     local_port: Wrapping<u32>,
     /// The tx buffer size
@@ -95,14 +97,14 @@ impl VhostUserVsockThread {
             guest_acceptor,
         );
         let (sender, receiver) = mpsc::sync_channel::<EventData>(MAX_CONNECTIONS);
-        thread::spawn(move || loop {
-            // TODO: Understand why doing the following in the background thread works.
-            // maybe we'd better have thread pool for the entire application if necessary.
-            let Ok(event_data) = receiver.recv() else {
-                break;
-            };
-            Self::vring_handle_event(event_data);
-        });
+        let completion_worker = thread::Builder::new()
+            .name("silo-vhost-vsock-completions".to_string())
+            .spawn(move || {
+                while let Ok(event_data) = receiver.recv() {
+                    Self::vring_handle_event(event_data);
+                }
+            })
+            .map_err(Error::CompletionWorkerSpawn)?;
 
         let thread = VhostUserVsockThread {
             mem: None,
@@ -111,7 +113,8 @@ impl VhostUserVsockThread {
             epoll_file,
             thread_backend,
             guest_cid,
-            sender,
+            sender: Some(sender),
+            completion_worker: Some(completion_worker),
             local_port: Wrapping(MIN_HOST_PORT),
             tx_buffer_size,
         };
@@ -474,14 +477,12 @@ impl VhostUserVsockThread {
 
             let vring = vring.clone();
             let event_idx = self.event_idx;
-            self.sender
-                .send(EventData {
-                    vring,
-                    event_idx,
-                    head_idx,
-                    used_len,
-                })
-                .map_err(|_| Error::EventChannelClosed)?;
+            self.send_completion(EventData {
+                vring,
+                event_idx,
+                head_idx,
+                used_len,
+            })?;
 
             if !self.thread_backend.pending_rx() {
                 break;
@@ -557,22 +558,29 @@ impl VhostUserVsockThread {
                 Err(error) => log::debug!("vsock: error reading TX packet: {error:?}"),
             }
 
-            // TODO: Check if the protocol requires read length to be correct
+            // TX descriptors are device-readable, so the device writes zero
+            // bytes into the descriptor chain.
             let used_len = 0;
 
             let vring = vring.clone();
             let event_idx = self.event_idx;
-            self.sender
-                .send(EventData {
-                    vring,
-                    event_idx,
-                    head_idx,
-                    used_len,
-                })
-                .map_err(|_| Error::EventChannelClosed)?;
+            self.send_completion(EventData {
+                vring,
+                event_idx,
+                head_idx,
+                used_len,
+            })?;
         }
 
         Ok(())
+    }
+
+    fn send_completion(&self, event: EventData) -> Result<()> {
+        self.sender
+            .as_ref()
+            .ok_or(Error::EventChannelClosed)?
+            .send(event)
+            .map_err(|_| Error::EventChannelClosed)
     }
 
     /// Wrapper to process tx queue based on whether event idx is enabled or
@@ -599,6 +607,17 @@ impl VhostUserVsockThread {
             self.process_tx_queue(vring_lock)?;
         }
         Ok(())
+    }
+}
+
+impl Drop for VhostUserVsockThread {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.completion_worker.take() {
+            if worker.join().is_err() {
+                warn!("vhost-user vsock completion worker panicked");
+            }
+        }
     }
 }
 
