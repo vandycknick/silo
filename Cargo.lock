@@ -5848,6 +5848,7 @@ dependencies = [
 name = "vm-spec"
 version = "0.1.0"
 dependencies = [
+ "forward-spec",
  "semver",
  "serde",
  "serde_json",
