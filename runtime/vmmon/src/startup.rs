@@ -238,9 +238,13 @@ pub async fn init(
     ));
 
     store.set_vm_state(VmState::Starting, "vm starting")?;
+    forwards.register_outbound(&machine).await?;
     machine.start().await?;
     let vsock_surface = match prepared_vsock {
-        Some(prepared) => match prepared.activate(machine.clone()).await {
+        Some(prepared) => match prepared
+            .activate(machine.clone(), forwards.registered_ports().clone())
+            .await
+        {
             Ok(surface) => Some(surface),
             Err(error) => {
                 if let Err(stop_error) = machine.stop().await {

@@ -61,9 +61,13 @@ impl PreparedVsockSurface {
         })
     }
 
-    pub(crate) async fn activate(mut self, machine: VirtualMachine) -> eyre::Result<VsockSurface> {
+    pub(crate) async fn activate(
+        mut self,
+        machine: VirtualMachine,
+        reserved_ports: BTreeSet<u32>,
+    ) -> eyre::Result<VsockSurface> {
         let discovered = discovery::scan(&self.runtime_dir, &self.mux_filename)?;
-        let mut registered = BTreeSet::new();
+        let mut registered = reserved_ports;
         let mut listeners = Vec::new();
         let _ = register_discovered(&machine, &mut registered, &mut listeners, discovered, true)
             .await?;
@@ -455,7 +459,7 @@ mod tests {
             .expect("prepare surface");
         machine.start().await.expect("start mock machine");
         let mut surface = prepared
-            .activate(machine.clone())
+            .activate(machine.clone(), std::collections::BTreeSet::new())
             .await
             .expect("activate surface");
 

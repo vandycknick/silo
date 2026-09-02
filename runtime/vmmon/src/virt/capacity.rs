@@ -18,6 +18,19 @@ pub(crate) struct VsockCapacity {
     limit: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListenerAdmissionClass {
+    Internal,
+    Public,
+}
+
+/// Capacity view carried by a listener into backend-specific accept paths.
+#[derive(Clone, Debug)]
+pub(crate) struct VsockListenerAdmission {
+    capacity: VsockCapacity,
+    class: ListenerAdmissionClass,
+}
+
 impl VsockCapacity {
     pub(crate) fn new(machine: impl Into<Arc<str>>) -> Self {
         Self::with_limit(machine, MAX_ACTIVE_VSOCK_CONNECTIONS)
@@ -74,6 +87,13 @@ impl VsockCapacity {
         Arc::ptr_eq(&self.total, &other.total)
     }
 
+    pub(crate) fn listener(&self, class: ListenerAdmissionClass) -> VsockListenerAdmission {
+        VsockListenerAdmission {
+            capacity: self.clone(),
+            class,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_with_limit(machine: impl Into<Arc<str>>, limit: usize) -> Self {
         Self::with_limit(machine, limit)
@@ -82,6 +102,28 @@ impl VsockCapacity {
     #[cfg(test)]
     pub(crate) fn available_permits(&self) -> usize {
         self.total.available_permits()
+    }
+}
+
+impl VsockListenerAdmission {
+    pub(crate) fn reserve(&self) -> Result<VsockLease, VirtError> {
+        match self.class {
+            ListenerAdmissionClass::Internal => self.capacity.reserve(),
+            ListenerAdmissionClass::Public => self.capacity.reserve_public(),
+        }
+    }
+
+    pub(crate) fn owns(&self, lease: &VsockLease) -> bool {
+        self.capacity.owns(lease)
+    }
+
+    pub(crate) fn shares_limit_with(&self, capacity: &VsockCapacity) -> bool {
+        self.capacity.shares_limit_with(capacity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn class(&self) -> ListenerAdmissionClass {
+        self.class
     }
 }
 
@@ -96,7 +138,7 @@ pub(crate) struct VsockLease {
 #[cfg(test)]
 mod tests {
     use crate::virt::capacity::{
-        VsockCapacity, INTERNAL_HEADROOM, MAX_ACTIVE_VSOCK_CONNECTIONS,
+        ListenerAdmissionClass, VsockCapacity, INTERNAL_HEADROOM, MAX_ACTIVE_VSOCK_CONNECTIONS,
         MAX_PUBLIC_VSOCK_CONNECTIONS,
     };
     use crate::virt::VirtError;
@@ -161,5 +203,23 @@ mod tests {
                 if machine == "diagnostic" && limit == MAX_PUBLIC_VSOCK_CONNECTIONS
         ));
         drop(internal);
+    }
+
+    #[test]
+    fn listener_views_preserve_admission_class_and_shared_ownership() {
+        let capacity = VsockCapacity::new("listeners");
+        let internal = capacity.listener(ListenerAdmissionClass::Internal);
+        let public = capacity.listener(ListenerAdmissionClass::Public);
+        assert_eq!(internal.class(), ListenerAdmissionClass::Internal);
+        assert_eq!(public.class(), ListenerAdmissionClass::Public);
+        assert!(internal.shares_limit_with(&capacity));
+        assert!(public.shares_limit_with(&capacity));
+
+        let public_leases = (0..MAX_PUBLIC_VSOCK_CONNECTIONS)
+            .map(|_| public.reserve().expect("public listener capacity"))
+            .collect::<Vec<_>>();
+        assert!(public.reserve().is_err());
+        assert!(internal.reserve().is_ok());
+        drop(public_leases);
     }
 }

@@ -1,12 +1,15 @@
 mod agent;
 mod host_socket;
 mod inbound;
+mod outbound;
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use forward_spec::{Forward, ForwardShape, GuestHalf};
+use forward_spec::{Address, Forward, ForwardShape, GuestHalf, Token};
+use rand::RngExt;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -45,18 +48,24 @@ pub(crate) struct ForwardEntry {
     pub(crate) name: String,
     pub(crate) shape: ForwardShape,
     pub(crate) guest_half: GuestHalf,
+    pub(crate) host_target: Option<Address>,
+    pub(crate) token: Option<Token>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) availability: watch::Sender<GuestHalfAvailability>,
     status: watch::Sender<ForwardStatusSnapshot>,
     active: AtomicU32,
     refused: AtomicU32,
     listener: Mutex<Option<OwnedHostListener>>,
+    vsock_listener: Mutex<Option<crate::virt::VsockListener>>,
 }
 
 pub(crate) struct ForwardTable {
     entries: Vec<Arc<ForwardEntry>>,
     shutdown: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    return_listener: Mutex<Option<crate::virt::VsockListener>>,
+    registered_ports: BTreeSet<u32>,
+    invalid_warning: Mutex<Option<std::time::Instant>>,
 }
 
 impl ForwardTable {
@@ -78,6 +87,14 @@ impl ForwardTable {
             let shape = spec.validate()?;
             let name = spec.display_name();
             let guest_half = spec.guest_half()?;
+            let host_target = resolve_host_target(spec, runtime_dir)?;
+            let token = if shape == ForwardShape::OutboundAgent {
+                let mut bytes = [0_u8; 16];
+                rand::rng().fill(&mut bytes);
+                Some(Token::new(bytes))
+            } else {
+                None
+            };
             let listener = match shape {
                 ForwardShape::InboundAgent | ForwardShape::InboundVsock => {
                     let address = match &spec.listen {
@@ -125,19 +142,70 @@ impl ForwardTable {
                 name,
                 shape,
                 guest_half,
+                host_target,
+                token,
                 shutdown: shutdown.child_token(),
                 availability,
                 status,
                 active: AtomicU32::new(0),
                 refused: AtomicU32::new(0),
                 listener: Mutex::new(listener),
+                vsock_listener: Mutex::new(None),
             }));
+        }
+        let mut registered_ports: BTreeSet<_> = entries
+            .iter()
+            .filter_map(|entry| match entry.spec.listen {
+                forward_spec::Endpoint::Vsock(port) => Some(port),
+                _ => None,
+            })
+            .collect();
+        if entries
+            .iter()
+            .any(|entry| entry.shape == ForwardShape::OutboundAgent)
+        {
+            registered_ports.insert(forward_spec::FORWARD_VSOCK_PORT);
         }
         Ok(Arc::new(Self {
             entries,
             shutdown,
             tasks: Mutex::new(Vec::new()),
+            return_listener: Mutex::new(None),
+            registered_ports,
+            invalid_warning: Mutex::new(None),
         }))
+    }
+
+    pub(crate) async fn register_outbound(&self, machine: &VirtualMachine) -> eyre::Result<()> {
+        for entry in &self.entries {
+            if let forward_spec::Endpoint::Vsock(port) = entry.spec.listen {
+                let listener = machine.listen_public_vsock(port).await.map_err(|error| {
+                    eyre::eyre!(
+                        "register outbound forward {} on vsock port {port}: {error}",
+                        entry.name
+                    )
+                })?;
+                *entry
+                    .vsock_listener
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(listener);
+            }
+        }
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.shape == ForwardShape::OutboundAgent)
+        {
+            let listener = machine
+                .listen_public_vsock(forward_spec::FORWARD_VSOCK_PORT)
+                .await
+                .map_err(|error| eyre::eyre!("register forward return port 1028: {error}"))?;
+            *self
+                .return_listener
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(listener);
+        }
+        Ok(())
     }
 
     pub(crate) fn activate(self: &Arc<Self>, machine: VirtualMachine) {
@@ -155,6 +223,55 @@ impl ForwardTable {
                     machine.clone(),
                 )));
             }
+            let vsock_listener = entry
+                .vsock_listener
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(listener) = vsock_listener {
+                entry.set_state(ForwardState::Active, None);
+                tasks.push(tokio::spawn(outbound::serve_raw(listener, entry.clone())));
+            }
+            if entry.shape == ForwardShape::OutboundAgent {
+                tasks.push(tokio::spawn(agent::supervise_listener(
+                    machine.clone(),
+                    entry.clone(),
+                )));
+            }
+        }
+        let return_listener = self
+            .return_listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(listener) = return_listener {
+            tasks.push(tokio::spawn(outbound::serve_return(listener, self.clone())));
+        }
+    }
+
+    pub(crate) fn registered_ports(&self) -> &BTreeSet<u32> {
+        &self.registered_ports
+    }
+
+    fn token_entry(&self, token: Token) -> Option<Arc<ForwardEntry>> {
+        self.entries
+            .iter()
+            .find(|entry| entry.token == Some(token))
+            .cloned()
+    }
+
+    fn warn_invalid_token(&self) {
+        const WARNING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        let now = std::time::Instant::now();
+        let mut previous = self
+            .invalid_warning
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if previous
+            .is_none_or(|previous| now.saturating_duration_since(previous) >= WARNING_INTERVAL)
+        {
+            tracing::warn!("rejected malformed or unknown forward return token");
+            *previous = Some(now);
         }
     }
 
@@ -189,6 +306,17 @@ impl ForwardTable {
         }
         Ok(())
     }
+}
+
+fn resolve_host_target(spec: &Forward, runtime_dir: &Path) -> eyre::Result<Option<Address>> {
+    let forward_spec::Endpoint::Host(address) = &spec.connect else {
+        return Ok(None);
+    };
+    Ok(Some(match address {
+        Address::Tcp(address) => Address::Tcp(*address),
+        Address::Unix(path) if path.is_relative() => Address::Unix(runtime_dir.join(path)),
+        Address::Unix(path) => Address::Unix(path.clone()),
+    }))
 }
 
 pub(crate) fn spawn_capability_supervisor(
@@ -294,6 +422,9 @@ mod tests {
             .expect("prepare outbound forward");
         let entry = &table.entries[0];
         assert_eq!(entry.shape, ForwardShape::OutboundAgent);
+        assert!(table
+            .registered_ports()
+            .contains(&forward_spec::FORWARD_VSOCK_PORT));
 
         table.set_agent_availability(GuestHalfAvailability::Available(None));
         assert_eq!(entry.status.borrow().state, ForwardState::Pending);

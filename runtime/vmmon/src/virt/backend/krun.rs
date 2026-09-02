@@ -23,7 +23,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, timeout};
 
 use crate::virt::backend::VirtBackend;
-use crate::virt::capacity::{VsockCapacity, VsockLease, MAX_ACTIVE_VSOCK_CONNECTIONS};
+use crate::virt::capacity::{VsockLease, VsockListenerAdmission, MAX_ACTIVE_VSOCK_CONNECTIONS};
 use crate::virt::config::{validate_common, DiskImage, NetworkMode, SharedDirectory, VmConfig};
 use crate::virt::error::VirtError;
 use crate::virt::stream::{PendingUnixVsock, SerialDevice, VsockListener, VsockStream};
@@ -44,6 +44,7 @@ pub(crate) struct KrunBackend {
     exit: Arc<Mutex<Option<VmExit>>>,
     runtime: AsyncMutex<Option<RunningKrun>>,
     vsock_registry: KrunVsockRegistry,
+    vsock_session: Arc<AtomicBool>,
 }
 
 struct RunningKrun {
@@ -61,7 +62,7 @@ struct KrunVsockRegistry {
 #[derive(Clone)]
 struct KrunVsockListener {
     sender: mpsc::Sender<PendingUnixVsock>,
-    capacity: VsockCapacity,
+    admission: VsockListenerAdmission,
     session_active: Arc<AtomicBool>,
 }
 
@@ -85,7 +86,7 @@ impl KrunVsockRegistry {
         {
             return None;
         }
-        let lease = listener.capacity.reserve().ok()?;
+        let lease = listener.admission.reserve().ok()?;
         let (backend_stream, vmmon_stream) = StdUnixStream::pair().ok()?;
         vmmon_stream.set_nonblocking(true).ok()?;
         listener
@@ -104,7 +105,7 @@ impl KrunVsockRegistry {
     fn register(
         &self,
         port: u32,
-        capacity: VsockCapacity,
+        admission: VsockListenerAdmission,
         session_active: Arc<AtomicBool>,
     ) -> Result<VsockListener, VirtError> {
         if !session_active.load(Ordering::Acquire) {
@@ -136,7 +137,7 @@ impl KrunVsockRegistry {
                 port,
                 KrunVsockListener {
                     sender: sender.clone(),
-                    capacity: capacity.clone(),
+                    admission: admission.clone(),
                     session_active: session_active.clone(),
                 },
             );
@@ -146,7 +147,7 @@ impl KrunVsockRegistry {
         Ok(VsockListener::from_krun_channel(
             receiver,
             port,
-            capacity,
+            admission,
             move || {
                 let mut listeners = listeners.lock().unwrap_or_else(PoisonError::into_inner);
                 if listeners
@@ -181,6 +182,7 @@ impl KrunBackend {
             exit: Arc::new(Mutex::new(None)),
             runtime: AsyncMutex::new(None),
             vsock_registry: KrunVsockRegistry::default(),
+            vsock_session: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -217,7 +219,8 @@ impl VirtBackend for KrunBackend {
         self.clear_exit_cache();
 
         let registry = self.vsock_registry.clone();
-        let vsock_session = Arc::new(AtomicBool::new(true));
+        let vsock_session = self.vsock_session.clone();
+        vsock_session.store(true, Ordering::Release);
         let session_for_connections = vsock_session.clone();
         let vsock = vhost_vsock::BackendServer::start(
             vhost_socket_for(&self.config),
@@ -351,15 +354,10 @@ impl VirtBackend for KrunBackend {
     async fn listen_vsock(
         &self,
         port: u32,
-        capacity: VsockCapacity,
+        admission: VsockListenerAdmission,
     ) -> Result<VsockListener, VirtError> {
-        let runtime = self.runtime.lock().await;
-        let running = runtime.as_ref().ok_or_else(|| VirtError::NotRunning {
-            name: self.config.name().to_string(),
-        })?;
-
         self.vsock_registry
-            .register(port, capacity, running.vsock_session.clone())
+            .register(port, admission, self.vsock_session.clone())
     }
 
     async fn open_serial(&self) -> Result<SerialDevice, VirtError> {
@@ -814,7 +812,11 @@ mod tests {
         let capacity = VsockCapacity::test_with_limit("krun-registry", 1);
         let session = Arc::new(AtomicBool::new(true));
         let mut listener = registry
-            .register(7000, capacity.clone(), session.clone())
+            .register(
+                7000,
+                capacity.listener(crate::virt::capacity::ListenerAdmissionClass::Internal),
+                session.clone(),
+            )
             .expect("register listener");
 
         let backend_stream = registry
@@ -890,7 +892,11 @@ mod tests {
         let capacity = VsockCapacity::test_with_limit("krun-session", 1);
         let session = Arc::new(AtomicBool::new(true));
         let mut listener = registry
-            .register(7000, capacity.clone(), session.clone())
+            .register(
+                7000,
+                capacity.listener(crate::virt::capacity::ListenerAdmissionClass::Internal),
+                session.clone(),
+            )
             .expect("register listener");
         let backend_stream = registry
             .connect_guest(
@@ -921,7 +927,11 @@ mod tests {
             )
             .is_none());
         let replacement = registry
-            .register(7000, capacity, next_session)
+            .register(
+                7000,
+                capacity.listener(crate::virt::capacity::ListenerAdmissionClass::Internal),
+                next_session,
+            )
             .expect("replace stopped-session listener");
         drop(listener);
         assert!(registry.listeners.lock().unwrap().contains_key(&7000));
@@ -961,13 +971,21 @@ mod tests {
         let listeners = (0..MAX_VSOCK_LISTENERS)
             .map(|port| {
                 registry
-                    .register(port as u32 + 1, capacity.clone(), session.clone())
+                    .register(
+                        port as u32 + 1,
+                        capacity.listener(crate::virt::capacity::ListenerAdmissionClass::Internal),
+                        session.clone(),
+                    )
                     .expect("register through exact listener limit")
             })
             .collect::<Vec<_>>();
 
         let error = registry
-            .register(MAX_VSOCK_LISTENERS as u32 + 1, capacity, session)
+            .register(
+                MAX_VSOCK_LISTENERS as u32 + 1,
+                capacity.listener(crate::virt::capacity::ListenerAdmissionClass::Internal),
+                session,
+            )
             .expect_err("listener after exact limit must fail");
         assert!(error.to_string().contains("listener registration limit"));
         drop(listeners);

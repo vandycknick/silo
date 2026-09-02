@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::virt::backend::{create_backend, BackendKind, VirtBackend};
-use crate::virt::capacity::{VsockCapacity, VsockLease};
+use crate::virt::capacity::{ListenerAdmissionClass, VsockCapacity, VsockLease};
 use crate::virt::config::VmConfig;
 use crate::virt::error::VirtError;
 use crate::virt::serial::SerialConsole;
@@ -136,10 +136,24 @@ impl VirtualMachine {
     /// Dropping the returned listener stops accepting new connections for
     /// the port.
     pub async fn listen_vsock(&self, port: u32) -> Result<VsockListener, VirtError> {
+        self.listen_vsock_with_admission(port, ListenerAdmissionClass::Internal)
+            .await
+    }
+
+    pub(crate) async fn listen_public_vsock(&self, port: u32) -> Result<VsockListener, VirtError> {
+        self.listen_vsock_with_admission(port, ListenerAdmissionClass::Public)
+            .await
+    }
+
+    async fn listen_vsock_with_admission(
+        &self,
+        port: u32,
+        class: ListenerAdmissionClass,
+    ) -> Result<VsockListener, VirtError> {
         let listener = self
             .inner
             .backend
-            .listen_vsock(port, self.inner.vsock_capacity.clone())
+            .listen_vsock(port, self.inner.vsock_capacity.listener(class))
             .await?;
         if !listener.owns_capacity(&self.inner.vsock_capacity) {
             return Err(VirtError::Backend(format!(
@@ -185,7 +199,7 @@ mod tests {
     use tokio::net::UnixStream;
 
     use crate::virt::backend::{BackendKind, VirtBackend};
-    use crate::virt::capacity::{VsockCapacity, VsockLease};
+    use crate::virt::capacity::{VsockCapacity, VsockLease, VsockListenerAdmission};
     use crate::virt::error::VirtError;
     use crate::virt::machine::{MachineInner, VirtualMachine};
     use crate::virt::serial::SerialConsole;
@@ -287,7 +301,7 @@ mod tests {
         async fn listen_vsock(
             &self,
             port: u32,
-            capacity: VsockCapacity,
+            admission: VsockListenerAdmission,
         ) -> Result<VsockListener, VirtError> {
             static NEXT_LISTENER: AtomicUsize = AtomicUsize::new(0);
 
@@ -302,9 +316,13 @@ mod tests {
             let listener = tokio::net::UnixListener::bind(&path)?;
             std::fs::remove_file(path)?;
             let (registered_port, capacity) = match behavior {
-                ListenBehavior::WrongPort => (port + 1, capacity),
+                ListenBehavior::WrongPort => (port + 1, admission),
                 ListenBehavior::ForeignCapacity => {
-                    (port, VsockCapacity::test_with_limit("foreign-listener", 1))
+                    let foreign = VsockCapacity::test_with_limit("foreign-listener", 1);
+                    (
+                        port,
+                        foreign.listener(crate::virt::capacity::ListenerAdmissionClass::Internal),
+                    )
                 }
             };
             Ok(VsockListener::from_unix_listener(

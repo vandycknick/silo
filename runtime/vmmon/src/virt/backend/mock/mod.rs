@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::virt::backend::{BackendKind, VirtBackend};
-use crate::virt::capacity::{VsockCapacity, VsockLease};
+use crate::virt::capacity::{VsockLease, VsockListenerAdmission};
 use crate::virt::config::{validate_common, VmConfig};
 use crate::virt::error::VirtError;
 use crate::virt::machine::VirtualMachine;
@@ -315,7 +315,7 @@ impl VirtBackend for MockBackend {
     async fn listen_vsock(
         &self,
         port: u32,
-        capacity: VsockCapacity,
+        admission: VsockListenerAdmission,
     ) -> Result<VsockListener, VirtError> {
         let path = self.config.base_directory().join(format!(".v_{port}"));
         if path.exists() {
@@ -330,7 +330,7 @@ impl VirtBackend for MockBackend {
         Ok(VsockListener::from_mock_unix_listener(
             listener,
             port,
-            capacity,
+            admission,
             self.source_ports.clone(),
         ))
     }
@@ -583,7 +583,10 @@ mod tests {
         backend.start().await.expect("start mock");
         let capacity = VsockCapacity::test_with_limit("mock-listener-metadata", 1);
         let mut listener = backend
-            .listen_vsock(port, capacity)
+            .listen_vsock(
+                port,
+                capacity.listener(crate::virt::capacity::ListenerAdmissionClass::Internal),
+            )
             .await
             .expect("mock listener");
         let path = root.join(format!(".v_{port}"));
