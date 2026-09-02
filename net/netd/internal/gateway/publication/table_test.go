@@ -5,7 +5,6 @@ import (
 	"net"
 	"testing"
 
-	upstreamForwarder "github.com/containers/gvisor-tap-vsock/pkg/services/forwarder"
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -18,7 +17,7 @@ func TestTableUsesRealListenersAndTracksScope(t *testing.T) {
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
 	t.Cleanup(networkStack.Close)
-	table := NewTable(upstreamForwarder.NewPortsForwarder(networkStack))
+	table := NewTable(NewTCPForwarder(networkStack))
 	t.Cleanup(func() {
 		if err := table.Close(); err != nil {
 			t.Error(err)

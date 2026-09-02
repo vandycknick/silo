@@ -244,14 +244,13 @@ func addServices(ctx context.Context, configuration *types.Configuration, s *sta
 		return nil, nil, errors.Join(err, closeNetworkServices(dnsServices))
 	}
 	services := append(dnsServices, dhcpService)
-	portsForwarder, err := forwardHostVM(configuration, s)
-	if err != nil {
+	if err := forwardHostVM(configuration, s); err != nil {
 		return nil, nil, errors.Join(err, closeNetworkServices(services))
 	}
 	if !publicationOptions.Enabled {
 		return services, nil, nil
 	}
-	publicationTable := publication.NewTable(portsForwarder)
+	publicationTable := publication.NewTable(publication.NewTCPForwarder(s))
 	publicationService, err := publicationServer(configuration, s, publicationTable, publicationOptions)
 	if err != nil {
 		return nil, nil, errors.Join(err, publicationTable.Close(), closeNetworkServices(services))
@@ -309,18 +308,18 @@ func dhcpServer(configuration *types.Configuration, s *stack.Stack, ipPool *tap.
 	return networkService{name: "dhcp server", serve: server.Serve, close: server.Underlying.Close}, nil
 }
 
-func forwardHostVM(configuration *types.Configuration, s *stack.Stack) (*upstreamForwarder.PortsForwarder, error) {
+func forwardHostVM(configuration *types.Configuration, s *stack.Stack) error {
 	fw := upstreamForwarder.NewPortsForwarder(s)
 	for local, remote := range configuration.Forwards {
 		if strings.HasPrefix(local, "udp:") {
 			if err := fw.Expose(types.UDP, strings.TrimPrefix(local, "udp:"), remote); err != nil {
-				return nil, err
+				return err
 			}
 		} else if err := fw.Expose(types.TCP, local, remote); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return fw, nil
+	return nil
 }
 
 func publicationServer(configuration *types.Configuration, s *stack.Stack, table *publication.Table, options PublicationOptions) (networkService, error) {
