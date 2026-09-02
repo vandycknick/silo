@@ -18,6 +18,7 @@ pub enum Component {
     Netd,
     Krun,
     Agent,
+    Portd,
     Init,
     Initramfs,
     GoFfi,
@@ -72,6 +73,7 @@ pub fn build_component(
         Component::Netd => build_netd(context),
         Component::Krun => build_krun(context),
         Component::Agent => build_guest_agent(context),
+        Component::Portd => build_guest_portd(context),
         Component::Init => build_guest_init(context),
         Component::Initramfs => build_initramfs(context),
         Component::GoFfi => build_cargo_package(context, "silo-go-ffi"),
@@ -260,6 +262,21 @@ fn build_guest_agent(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         "--locked",
         "-p",
         "agent",
+        "--target",
+        context.host.guest_target().triple(),
+    ]);
+    context.profile.apply_cargo(&mut cargo);
+    command::run(cargo)?;
+    Ok(())
+}
+
+fn build_guest_portd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
+    let mut cargo = cargo_command(context)?;
+    cargo.args([
+        "zigbuild",
+        "--locked",
+        "-p",
+        "silo-portd",
         "--target",
         context.host.guest_target().triple(),
     ]);

@@ -129,8 +129,8 @@ version-check: ## Verify product versions match the version authority.
 	$(XTASK) version-check
 
 # Internal targets
-.PHONY: cli vmmon netd krun agent init initramfs go-ffi kernel
-cli vmmon netd krun agent init initramfs go-ffi:
+.PHONY: cli vmmon netd krun agent portd init initramfs go-ffi kernel
+cli vmmon netd krun agent portd init initramfs go-ffi:
 	$(XTASK) component $@ --profile "$(PROFILE)"
 
 kernel:

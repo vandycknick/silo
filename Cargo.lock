@@ -4672,6 +4672,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "silo-portd"
+version = "0.1.0"
+dependencies = [
+ "nix 0.31.3",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
