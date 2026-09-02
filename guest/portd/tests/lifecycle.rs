@@ -4,9 +4,11 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
-use std::process::Command;
-use std::sync::mpsc;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::Path;
+use std::process::{Child, Command};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use nix::sys::signal::{kill, Signal};
@@ -59,67 +61,10 @@ fn holds_publication_and_forwards_stop_signal_to_proxy() {
     std::fs::set_permissions(&proxy_path, std::fs::Permissions::from_mode(0o755))
         .expect("make proxy executable");
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind netd fixture");
-    let endpoint = format!("http://{}", listener.local_addr().expect("fixture address"));
-    let (request_seen_tx, request_seen_rx) = mpsc::channel();
-    let (connection_closed_tx, connection_closed_rx) = mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept publication request");
-        read_request(&mut stream);
-        request_seen_tx.send(()).expect("report request");
-        let publication = b"{\"local\":\"0.0.0.0:8080\",\"remote\":\"192.168.127.2:8080\",\"protocol\":\"tcp\"}\n";
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
-            publication.len()
-        )
-        .expect("write response headers");
-        stream.write_all(publication).expect("write publication");
-        stream.write_all(b"\r\n").expect("write chunk terminator");
-        let mut byte = [0; 1];
-        while stream.read(&mut byte).expect("read publication hold") != 0 {}
-        connection_closed_tx.send(()).expect("report close");
-    });
-
-    let (status_read, status_write) = pipe().expect("create status pipe");
-    let inherited_listener = TcpListener::bind("127.0.0.1:0").expect("bind inherited listener");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_silo-portd"));
-    command
-        .args([
-            "-proto",
-            "tcp",
-            "-host-ip",
-            "0.0.0.0",
-            "-host-port",
-            "8080",
-            "-container-ip",
-            "172.17.0.2",
-            "-container-port",
-            "80",
-            "-use-listen-fd",
-        ])
-        .env("SILO_PORTD_ENDPOINT", endpoint)
-        .env("SILO_PORTD_DOCKER_PROXY", &proxy_path)
-        .env("SILO_PORTD_TEST_SIGNAL_FILE", &signal_path);
-    unsafe {
-        command.pre_exec(move || {
-            let status_fd = dup2_raw(&status_write, 3).map_err(std::io::Error::other)?;
-            std::mem::forget(status_fd);
-            let listener_fd = dup2_raw(&inherited_listener, 4).map_err(std::io::Error::other)?;
-            std::mem::forget(listener_fd);
-            Ok(())
-        });
-    }
-    let mut portd = command.spawn().expect("spawn silo-portd");
-    let status_file = File::from(status_read);
-    let (status_tx, status_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        BufReader::new(status_file)
-            .read_line(&mut line)
-            .expect("read Docker status");
-        status_tx.send(line).expect("report Docker status");
-    });
+    let (endpoint, request_seen_rx, connection_closed_rx, server) = publication_server();
+    let mut command = portd_command(&endpoint, &proxy_path);
+    command.env("SILO_PORTD_TEST_SIGNAL_FILE", &signal_path);
+    let (mut portd, status_rx) = spawn_portd(command);
 
     request_seen_rx
         .recv_timeout(Duration::from_secs(5))
@@ -146,6 +91,144 @@ fn holds_publication_and_forwards_stop_signal_to_proxy() {
         .recv_timeout(Duration::from_secs(5))
         .expect("publication connection stayed open");
     server.join().expect("join netd fixture");
+}
+
+#[test]
+fn killing_portd_terminates_proxy_and_closes_publication() {
+    let temporary = tempfile::tempdir().expect("create tempdir");
+    let signal_path = temporary.path().join("signal-received");
+    let pid_path = temporary.path().join("proxy-pid");
+    let proxy_path = temporary.path().join("docker-proxy-fixture");
+    std::fs::write(
+        &proxy_path,
+        "#!/bin/sh\ntrap 'printf term > \"$SILO_PORTD_TEST_SIGNAL_FILE\"; exit 0' TERM\nprintf '%s' \"$$\" > \"$SILO_PORTD_TEST_PID_FILE\"\nif [ ! -e /proc/self/fd/4 ]; then printf '1\\nmissing fd 4' >&3; exit 1; fi\nprintf '0\\n' >&3\nwhile :; do sleep 1; done\n",
+    )
+    .expect("write proxy fixture");
+    std::fs::set_permissions(&proxy_path, std::fs::Permissions::from_mode(0o755))
+        .expect("make proxy executable");
+
+    let (endpoint, request_seen_rx, connection_closed_rx, server) = publication_server();
+    let mut command = portd_command(&endpoint, &proxy_path);
+    command
+        .env("SILO_PORTD_TEST_SIGNAL_FILE", &signal_path)
+        .env("SILO_PORTD_TEST_PID_FILE", &pid_path);
+    let (mut portd, status_rx) = spawn_portd(command);
+
+    request_seen_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("netd request was not received");
+    assert_eq!(
+        status_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("docker-proxy did not report readiness"),
+        "0\n"
+    );
+    wait_for(Duration::from_secs(5), || pid_path.exists());
+    let proxy_pid = Pid::from_raw(
+        std::fs::read_to_string(&pid_path)
+            .expect("read proxy PID")
+            .parse::<i32>()
+            .expect("parse proxy PID"),
+    );
+
+    let portd_pid = Pid::from_raw(i32::try_from(portd.id()).expect("portd PID fits i32"));
+    kill(portd_pid, Signal::SIGKILL).expect("kill silo-portd");
+    let exit = portd.wait().expect("wait for silo-portd");
+    assert_eq!(exit.signal(), Some(Signal::SIGKILL as i32));
+    connection_closed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("publication connection stayed open");
+    wait_for(Duration::from_secs(5), || signal_path.exists());
+    assert_eq!(
+        std::fs::read_to_string(&signal_path).expect("proxy signal marker"),
+        "term"
+    );
+    wait_for(Duration::from_secs(5), || {
+        kill(proxy_pid, None::<Signal>).is_err()
+    });
+    server.join().expect("join netd fixture");
+}
+
+fn portd_command(endpoint: &str, proxy_path: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_silo-portd"));
+    command
+        .args([
+            "-proto",
+            "tcp",
+            "-host-ip",
+            "0.0.0.0",
+            "-host-port",
+            "8080",
+            "-container-ip",
+            "172.17.0.2",
+            "-container-port",
+            "80",
+            "-use-listen-fd",
+        ])
+        .env("SILO_PORTD_ENDPOINT", endpoint)
+        .env("SILO_PORTD_DOCKER_PROXY", proxy_path);
+    command
+}
+
+fn spawn_portd(mut command: Command) -> (Child, Receiver<String>) {
+    let (status_read, status_write) = pipe().expect("create status pipe");
+    let inherited_listener = TcpListener::bind("127.0.0.1:0").expect("bind inherited listener");
+    unsafe {
+        command.pre_exec(move || {
+            let status_fd = dup2_raw(&status_write, 3).map_err(std::io::Error::other)?;
+            std::mem::forget(status_fd);
+            let listener_fd = dup2_raw(&inherited_listener, 4).map_err(std::io::Error::other)?;
+            std::mem::forget(listener_fd);
+            Ok(())
+        });
+    }
+    let portd = command.spawn().expect("spawn silo-portd");
+    let status_file = File::from(status_read);
+    let (status_tx, status_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        BufReader::new(status_file)
+            .read_line(&mut line)
+            .expect("read Docker status");
+        status_tx.send(line).expect("report Docker status");
+    });
+    (portd, status_rx)
+}
+
+fn publication_server() -> (String, Receiver<()>, Receiver<()>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind netd fixture");
+    let endpoint = format!("http://{}", listener.local_addr().expect("fixture address"));
+    let (request_seen_tx, request_seen_rx) = mpsc::channel();
+    let (connection_closed_tx, connection_closed_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept publication request");
+        read_request(&mut stream);
+        request_seen_tx.send(()).expect("report request");
+        let publication = b"{\"local\":\"0.0.0.0:8080\",\"remote\":\"192.168.127.2:8080\",\"protocol\":\"tcp\"}\n";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            publication.len()
+        )
+        .expect("write response headers");
+        stream.write_all(publication).expect("write publication");
+        stream.write_all(b"\r\n").expect("write chunk terminator");
+        let mut byte = [0; 1];
+        while stream.read(&mut byte).expect("read publication hold") != 0 {}
+        connection_closed_tx.send(()).expect("report close");
+    });
+    (endpoint, request_seen_rx, connection_closed_rx, server)
+}
+
+fn wait_for(timeout: Duration, condition: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if condition() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("condition did not become true before timeout");
 }
 
 fn read_request(stream: &mut TcpStream) {

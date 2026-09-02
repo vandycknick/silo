@@ -12,9 +12,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+use nix::sys::prctl;
 use nix::sys::signal::{kill, pthread_sigmask, SigSet, SigmaskHow, Signal};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
-use nix::unistd::Pid;
+use nix::unistd::{getpid, getppid, Pid};
 
 const DEFAULT_ENDPOINT: &str = "http://gateway.containers.internal:80";
 const DEFAULT_DOCKER_PROXY: &str = "/usr/bin/docker-proxy";
@@ -60,8 +61,15 @@ fn run() -> Result<i32, String> {
         std::env::var_os("SILO_PORTD_DOCKER_PROXY").unwrap_or_else(|| DEFAULT_DOCKER_PROXY.into());
     let mut command = Command::new(proxy);
     command.args(&config.proxy_args);
+    let parent_pid = getpid();
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
+            prctl::set_pdeathsig(Signal::SIGTERM).map_err(std::io::Error::other)?;
+            if getppid() != parent_pid {
+                return Err(std::io::Error::other(
+                    "silo-portd exited before docker-proxy supervision was established",
+                ));
+            }
             pthread_sigmask(SigmaskHow::SIG_UNBLOCK, Some(&stop_signals()), None)
                 .map_err(std::io::Error::other)
         });
