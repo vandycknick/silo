@@ -228,7 +228,7 @@ mod tests {
         assert_eq!(service_methods("GuestProcessService"), ["Execute"]);
         assert_eq!(service_methods("VmExecutionService"), ["Execute"]);
         assert_eq!(service_methods("GuestForwardService"), ["Listen"]);
-        assert_eq!(service_methods("VmForwardService"), ["Hold", "List"]);
+        assert_eq!(service_methods("VmForwardService"), ["Open", "List"]);
         assert_eq!(
             service_methods("GuestFilesystemService"),
             [
@@ -294,7 +294,7 @@ mod tests {
             [
                 ("forward", 1),
                 ("direction", 2),
-                ("owner", 3),
+                ("scope", 3),
                 ("state", 4),
                 ("bound", 5),
                 ("active_connections", 6),

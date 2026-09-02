@@ -46,7 +46,7 @@ pub struct MachineUpdate {
     pub nested_virtualization: Option<bool>,
     /// New Rosetta setting.
     pub rosetta: Option<bool>,
-    /// Replacement declared forwards.
+    /// Replacement machine-scoped forwards.
     pub forwards: Option<Vec<forward_spec::Forward>>,
     /// Replacement public vsock configuration.
     pub vsock: Option<vm_spec::Vsock>,
@@ -103,7 +103,7 @@ impl MachineUpdate {
         self
     }
 
-    /// Replaces all declared forwards.
+    /// Replaces all machine-scoped forwards.
     pub fn forwards(mut self, forwards: Vec<forward_spec::Forward>) -> Self {
         self.forwards = Some(forwards);
         self

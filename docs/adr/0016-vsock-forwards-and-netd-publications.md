@@ -1,4 +1,4 @@
-# 16. Forwarding: Host-Declared Vsock Forwards And Guest-Requested netd Publications
+# 16. Forwarding: Machine- And Session-Scoped Vsock Forwards And Guest-Requested netd Publications
 
 Date: 2026-09-01
 
@@ -62,26 +62,27 @@ and the system VM compose those pieces.
 
 | Term | Meaning |
 | --- | --- |
-| Forward | A host-declared rule with a listen endpoint and a connect endpoint. `vmmon` and the guest agent accept connections at the listen endpoint and connect each one to the connect endpoint over one vsock stream. |
+| Forward | A host-configured rule with a listen endpoint and a connect endpoint. `vmmon` and the guest agent accept connections at the listen endpoint and connect each one to the connect endpoint over one vsock stream. |
 | Listen endpoint | Where a forward accepts new connections. |
 | Connect endpoint | Where a forward connects each accepted connection. Also called the target. |
 | Endpoint side | The `host:` or `guest:` prefix on an endpoint. The side names the process that performs the socket operation: `vmmon` for `host:`, the guest agent for `guest:`. |
 | Vsock endpoint | An endpoint written `vsock:<port>` that names a raw vsock port instead of a socket the agent operates. It replaces the guest half of a forward when the guest speaks vsock natively. |
 | Inbound forward | A forward whose listen endpoint is on the host. Connections are host-initiated in ADR 0015 terms; a guest service becomes reachable from the host. |
 | Outbound forward | A forward whose listen endpoint is in the guest. Connections are guest-initiated; a host service becomes reachable from inside the guest. |
-| Declared forward | A forward in the `VmSpec`. It exists for the life of the machine run. |
-| Held forward | A forward created through the `vmmon` host API. It exists exactly as long as the gRPC stream that created it. |
+| Machine-scoped forward | A forward in the `VmSpec`. Its configuration persists with the machine, and its listener exists for the life of each machine run. |
+| Session-scoped forward | A forward created through the `vmmon` host API. It exists exactly as long as the gRPC stream that created it. |
 | Forward dialer | The guest agent's listener on guest vsock port 1028. It reads one target line and connects to that guest address. |
 | Forward return port | Host vsock port 1028, served by `vmmon`. The agent dials it for every connection accepted by an outbound forward and presents that forward's token. |
 | Forward token | A 128-bit random value `vmmon` issues per outbound forward. The agent presents it on the return port. |
 | Publication | A host TCP listener that netd binds because the guest asked for it. Connections are dialed to the guest's interface address through the netstack. |
 | Publication endpoint | The gvproxy-compatible HTTP API netd serves on the gateway IP inside the virtual network. |
-| Held publication | A publication that lives exactly as long as the HTTP connection that requested it. |
-| `silo-portd` | The guest binary a container engine execs per published port. It requests a held publication, then chains the engine's own userland proxy. |
+| Attachment-scoped publication | A publication created through the gvproxy-compatible API. It lives until an explicit unexpose or the guest attachment ends. |
+| Session-scoped publication | A publication that lives exactly as long as the HTTP connection that requested it. |
+| `silo-portd` | The guest binary a container engine execs per published port. It requests a session-scoped publication, then chains the engine's own userland proxy. |
 | System VM | A long-lived machine built from a Silo-controlled image that runs a container engine. |
 
 The words "forward" and "publication" are never interchangeable in this ADR.
-A forward is declared by the host and carried by vsock. A publication is
+A forward is configured by the host and carried by vsock. A publication is
 requested by the guest and carried by netd.
 
 ## Decision
@@ -94,9 +95,9 @@ Silo provides two mechanisms with a fixed division of labor:
    agent operates or a raw `vsock:` port. Each accepted connection becomes one
    vsock stream. Forwards carry TCP and Unix-socket streams, work with
    `network: none`, reach guest loopback addresses, and never involve netd.
-   Forwards are declared in the `VmSpec` for the machine's lifetime or held
-   through a `vmmon` gRPC stream for the caller's lifetime. `silo forward` is a
-   held forward.
+   Forwards are machine-scoped in the `VmSpec` or session-scoped through a
+   `vmmon` gRPC stream for the caller's lifetime. `silo forward` opens a
+   session-scoped forward.
 2. **Publications are a netd capability for container engines.** A guest
    process asks netd, through the gvproxy-compatible publication endpoint, to
    bind a host TCP address and dial the guest's interface address. The
@@ -113,12 +114,14 @@ Core invariants:
   connection to the host over vsock. It has no forward table, no policy, and
   no knowledge of host addresses.
 - `vmmon` owns every host-side socket a forward needs and the complete
-  forward table. It binds a host TCP or Unix listener only for a declared or
-  held forward. The hybrid surface itself still never exposes vsock on TCP.
-- Every forward and publication has an owner whose end removes it: the
-  machine run for declared forwards, a `vmmon` gRPC stream for held forwards,
-  the guest attachment for publications, and an HTTP connection for held
-  publications. There are no orphan listeners and no lease protocol.
+  forward table. It binds a host TCP or Unix listener only for a machine- or
+  session-scoped forward. The hybrid surface itself still never exposes vsock
+  on TCP.
+- Every forward and publication has an explicit scope whose end removes it:
+  the machine run for machine-scoped forwards, a `vmmon` gRPC stream for
+  session-scoped forwards, the guest attachment for attachment-scoped
+  publications, and an HTTP connection for session-scoped publications. There
+  are no orphan listeners and no lease protocol.
 - The guest is untrusted. It can never name a host address. An outbound
   forward's host target is selected on the host, and the guest presents only
   an opaque token to reach it. A publication's host bind address is
@@ -132,8 +135,8 @@ Core invariants:
 
 | Case | Mechanism | Path |
 | --- | --- | --- |
-| `silo forward` in either direction | Forward (held) | CLI holds a `vmmon` stream |
-| Host `docker.sock` for a guest engine | Forward (declared) | `VmSpec` `forwards` entry |
+| `silo forward` in either direction | Forward (session scope) | CLI keeps a `vmmon` stream open |
+| Host `docker.sock` for a guest engine | Forward (machine scope) | `VmSpec` `forwards` entry |
 | Host service reachable inside the guest | Forward | `listen: guest:...`, `connect: host:...` |
 | Guest AF_VSOCK service, no agent involvement | Forward | `connect: vsock:<port>` |
 | Container `-p` publication | Publication | `silo-portd` or podman calls the publication endpoint |
@@ -151,7 +154,7 @@ flowchart LR
     subgraph vmmon
       direction TB
       spec["VmSpec forwards"] --> table["forward table"]
-      hold["silo forward · Hold stream"] --> table
+      hold["silo forward · Open stream"] --> table
       table --> hl["host listeners"]
       table --> ht["host targets"]
       table --> rp["return port · host vsock 1028"]
@@ -182,7 +185,7 @@ flowchart LR
   listen -->|binds| gl
   gl ==>|"vsock · CONNECT token"| rp
   rp -->|connects| ht
-  dockerd -->|"HTTP · POST /services/forwarder/hold"| pe
+  dockerd -->|"HTTP · POST /services/forwarder/expose/session"| pe
   tl -->|"netstack · dial guest-ip:port"| eth0
   classDef host stroke:#2b69b3,stroke-width:2px,fill:none
   classDef guest stroke:#b5602a,stroke-width:2px,fill:none
@@ -324,7 +327,7 @@ sequenceDiagram
   participant S as silo forward dev 8080:80
   participant V as vmmon (host)
   participant A as guest agent
-  S->>V: VmForwardService.Hold(forward)
+  S->>V: VmForwardService.Open(forward)
   V->>V: validate, bind 127.0.0.1:8080 before the first response
   V-->>S: ForwardStatus{ACTIVE, bound 127.0.0.1:8080}
   Note over S: prints the bound endpoint, stays in the foreground
@@ -350,7 +353,7 @@ sequenceDiagram
   participant N as netd (host)
   participant H as host client
   D->>S: exec -proto tcp -host-ip 0.0.0.0 -host-port 8080 -container-ip … -container-port 80, fd 3 status pipe, fd 4 listener
-  S->>N: POST /services/forwarder/hold {local 0.0.0.0:8080, remote :8080, tcp}
+  S->>N: POST /services/forwarder/expose/session {local 0.0.0.0:8080, remote :8080, tcp}
   N->>N: check protocol, bind policy, remote equals guest ip
   alt refused or bind failed
     N-->>S: 4xx or 5xx with the reason
@@ -364,14 +367,14 @@ sequenceDiagram
     N->>D: netstack dial guest-ip:8080, DNAT delivers to the container
     D->>S: SIGINT when the container stops
     S->>X: SIGINT, wait for exit
-    S--xN: held connection closes
+    S--xN: session connection closes
     N->>N: release the publication
   end
 ```
 
 1. dockerd execs `silo-portd` with docker-proxy's argument contract and status
    pipe.
-2. `silo-portd` opens a held publication. netd validates the bind address
+2. `silo-portd` opens a session-scoped publication. netd validates the bind address
    against the machine's publication policy, binds the host listener, and
    answers `200`. On any other answer, `silo-portd` reports the failure to
    dockerd through the status pipe and exits; `docker run` fails exactly as a
@@ -380,7 +383,7 @@ sequenceDiagram
    arguments and inherited descriptors, so the published port also remains
    reachable on the guest's own loopback, which DNAT does not cover.
 4. When dockerd stops the container it signals `silo-portd`; `silo-portd`
-   stops the chained proxy, closes the held HTTP connection, and exits. netd
+   stops the chained proxy, closes the session HTTP connection, and exits. netd
    removes the publication when the connection closes. A `SIGKILL` closes the
    connection just the same.
 5. Per host connection, netd dials `<guest-ip>:8080` through the netstack; the
@@ -514,7 +517,7 @@ forwards:
 Rust shape:
 
 ```rust
-/// One host-declared forward.
+/// One machine-scoped forward.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Forward {
@@ -635,14 +638,14 @@ guest-agent status stream, SSH, exec, or filesystem RPCs. A forward connection
 refused for capacity is closed without a reply and logged with the forward's
 name and the limit.
 
-Limits per machine: 128 forwards in total, of which at most 64 are held; 64
-parked connections per forward. Reaching a limit fails the `Hold` RPC or, for
-declared forwards, fails machine start with a diagnostic that names the
-limit.
+Limits per machine: 128 forwards in total, of which at most 64 are
+session-scoped; 64 parked connections per forward. Reaching a limit fails the
+`Open` RPC or, for machine-scoped forwards, fails machine start with a
+diagnostic that names the limit.
 
 ## Forward Lifecycle
 
-### Declared Forwards
+### Machine-Scoped Forwards
 
 ```mermaid
 stateDiagram-v2
@@ -667,7 +670,7 @@ stateDiagram-v2
   end note
 ```
 
-- `vmmon` prepares every declared forward's host half before the VM starts:
+- `vmmon` prepares every machine-scoped forward's host half before the VM starts:
   it binds `host:*` listen sockets and registers `vsock:` listen ports. A
   failure names the forward, the endpoint, and the error, and the machine
   does not start. This matches ADR 0015's treatment of the initial listener
@@ -691,9 +694,9 @@ stateDiagram-v2
   the ones it bound. Absolute Unix paths follow the same rule; `vmmon` never
   removes a socket it did not create.
 
-### Held Forwards
+### Session-Scoped Forwards
 
-A held forward is created with `VmForwardService.Hold`, a server-streaming
+A session-scoped forward is created with `VmForwardService.Open`, a server-streaming
 RPC on the machine's `vm.sock`. The request carries one `Forward`; the response
 stream carries `ForwardStatus` snapshots on every state change.
 
@@ -706,14 +709,14 @@ stream carries `ForwardStatus` snapshots on every state change.
 - The forward exists exactly as long as the stream. The client ending the
   stream, the client process exiting, or `vmmon` shutting down removes the
   forward, closes its listener, and closes every connection it spliced.
-- A held forward that names a host Unix path resolves relative paths against
-  the machine runtime directory, exactly like a declared forward. Clients
+- A session-scoped forward that names a host Unix path resolves relative paths
+  against the machine runtime directory, exactly like a machine-scoped forward. Clients
   that mean a path relative to their own working directory must send an
   absolute path.
-- Held forwards are not persisted and do not survive `vmmon` restart. A
-  client that wants a durable forward declares it.
+- Session-scoped forwards are not persisted and do not survive `vmmon`
+  restart. A client that wants a durable forward configures it on the machine.
 
-`VmForwardService.List` returns the status of every declared and held
+`VmForwardService.List` returns the status of every machine- and session-scoped
 forward, including its derived direction, bound address, state, and active
 connection count.
 
@@ -809,13 +812,13 @@ service inventory ADR 0008 already exposes and adds no negotiation protocol.
 
 ```proto
 service VmForwardService {
-  // Create a forward that exists while this stream is open.
-  rpc Hold(HoldForwardRequest) returns (stream ForwardStatus);
-  // Status of every declared and held forward.
+  // Open a session-scoped forward that exists while this stream is open.
+  rpc Open(OpenForwardRequest) returns (stream ForwardStatus);
+  // Status of every machine- and session-scoped forward.
   rpc List(ListForwardsRequest) returns (ListForwardsResponse);
 }
 
-message HoldForwardRequest { Forward forward = 1; }
+message OpenForwardRequest { Forward forward = 1; }
 
 message Forward {
   optional string name = 1;
@@ -825,14 +828,14 @@ message Forward {
 }
 
 enum ForwardDirection { FORWARD_DIRECTION_UNSPECIFIED = 0; INBOUND = 1; OUTBOUND = 2; }
-enum ForwardOwner     { FORWARD_OWNER_UNSPECIFIED = 0; DECLARED = 1; HELD = 2; }
+enum ForwardScope     { FORWARD_SCOPE_UNSPECIFIED = 0; MACHINE = 1; SESSION = 2; }
 enum ForwardState     { FORWARD_STATE_UNSPECIFIED = 0; PENDING = 1; ACTIVE = 2;
                         UNSUPPORTED = 3; CLOSED = 4; }
 
 message ForwardStatus {
   Forward forward = 1;
   optional ForwardDirection direction = 2;
-  optional ForwardOwner owner = 3;
+  optional ForwardScope scope = 3;
   optional ForwardState state = 4;
   optional string bound = 5;       // actual listen endpoint after bind
   optional uint32 active_connections = 6;
@@ -844,7 +847,7 @@ message ForwardStatus {
 This is the contract's shape; field numbering and the exact `ErrorCode`
 additions (`FORWARD_INVALID`, `FORWARD_ADDRESS_IN_USE`,
 `FORWARD_UNSUPPORTED`, `FORWARD_LIMIT`) follow ADR 0008's versioning rules
-when the proto lands. `Hold` fails with `INVALID_ARGUMENT` for a grammar or
+when the proto lands. `Open` fails with `INVALID_ARGUMENT` for a grammar or
 validity violation, `ALREADY_EXISTS` for a listen endpoint another forward
 holds, `FAILED_PRECONDITION` when the VM is not running, and
 `RESOURCE_EXHAUSTED` at a limit.
@@ -866,7 +869,7 @@ service names observed for the current agent instance.
   because the owner chose the location.
 - TCP listeners bind exactly the requested address. `vmmon` never widens a
   bind address and never binds a TCP address for any reason other than a
-  declared or held forward.
+  machine- or session-scoped forward.
 - `vmmon` applies the peer-credential check to every default-mode Unix
   listener it owns, with one shared helper for the mux, the host API socket,
   and forwards. A forward with an explicit `mode` is exempt by design.
@@ -891,7 +894,7 @@ is updated to point here.
    1027, with the routing rules in the table above.
 2. **TCP exposure.** "vmmon never exposes vsock on TCP" becomes: the hybrid
    surface never exposes vsock on TCP, and `vmmon` binds a host TCP or Unix
-   listener only for a forward the machine owner declared in the `VmSpec` or
+   listener only for a forward the machine owner configured in the `VmSpec` or
    holds through the authenticated host API. Bridging remains a deliberate
    act of the owner; it no longer requires an external process.
 3. **Capacity headroom.** Of the 1023-connection allowance, 16 slots are
@@ -944,7 +947,7 @@ works:
 | `POST /services/forwarder/expose` | `{"local","remote","protocol"}` | Bind `local`, dial `remote` per connection. Lives until `unexpose` or attachment end. |
 | `POST /services/forwarder/unexpose` | `{"local","protocol"}` | Remove the publication. |
 | `GET /services/forwarder/all` | | JSON array of publications for reconciliation. |
-| `POST /services/forwarder/hold` | `{"local","remote","protocol"}` | Silo extension. Bind, answer `200` with the publication as the first chunk, keep the response open. Closing the connection removes the publication. |
+| `POST /services/forwarder/expose/session` | `{"local","remote","protocol"}` | Silo extension. Bind, answer `200` with the publication as the first chunk, keep the response open. Closing the connection removes the session-scoped publication. |
 
 Request validation, applied identically to every route:
 
@@ -961,16 +964,16 @@ Request validation, applied identically to every route:
   address.
 - `expose` is idempotent for an identical `(protocol, local, remote)` and
   answers `409` when `local` is already published with a different `remote`
-  or by a held publication.
+  or by a session-scoped publication.
 - A bind failure answers `500` with the operating-system error text, which is
   what gvproxy does and what podman expects.
 
-### Ownership
+### Scope
 
-Every publication belongs to the guest attachment. netd is one process per
+Every standard publication is attachment-scoped. netd is one process per
 attached machine, so the table dies with the machine; there is nothing to
-persist and nothing to reconcile after restart. A held publication is
-additionally removed the moment its HTTP connection closes, which happens
+persist and nothing to reconcile after restart. A session-scoped publication
+is additionally removed the moment its HTTP connection closes, which happens
 when the requesting guest process exits for any reason, including `SIGKILL`,
 because the guest kernel closes the socket and the netstack observes it.
 
@@ -978,7 +981,7 @@ because the guest kernel closes the socket and the netstack observes it.
 
 Every publication change produces an ADR 0006 audit record with
 `family: "publication"`, a `phase` of `exposed`, `released`, or `denied`, the
-owner kind (`attachment` or `held`), `local`, `remote`, and, for `denied`, the
+scope (`attachment` or `session`), `local`, `remote`, and, for `denied`, the
 reason (`protocol`, `bind_policy`, `conflict`, `bind_failed`).
 
 ### Data Path
@@ -998,13 +1001,13 @@ implements dockerd's userland-proxy contract exactly:
   -container-ip <ip> -container-port <port> [-use-listen-fd]`, with a status
   pipe on descriptor 3 and, with `-use-listen-fd`, a bound listening socket
   on descriptor 4.
-- `silo-portd` requests a held publication of `host-ip:host-port`. On
+- `silo-portd` requests a session-scoped publication of `host-ip:host-port`. On
   success it spawns the engine's real `docker-proxy` (default
   `/usr/bin/docker-proxy`, overridable with `SILO_PORTD_DOCKER_PROXY`) with
   the same arguments and both descriptors inherited, so `docker-proxy`
   performs the `0\n` status handshake and keeps the port reachable on guest
   loopback. `silo-portd` forwards `SIGINT` and `SIGTERM` to the child, waits
-  for it, closes the held connection, and exits with the child's status.
+  for it, closes the session connection, and exits with the child's status.
 - On a failed publication it writes `1\n<message>` to descriptor 3 and exits
   non-zero without starting a proxy, so `docker run` fails with netd's
   message.
@@ -1012,7 +1015,7 @@ implements dockerd's userland-proxy contract exactly:
   publication is an accepted limitation, not a silent no-op.
 
 The system VM composes existing pieces and owns nothing exclusive. Its
-machine configuration declares the docker socket forward, enables publications
+machine configuration includes the docker socket forward, enables publications
 with `bind: any` because Docker's default `-p` binds `0.0.0.0`, and its image
 sets `"userland-proxy-path": "/usr/bin/silo-portd"` in `daemon.json`. A
 `silo system up` command that assembles this configuration is future work
@@ -1034,13 +1037,13 @@ silo forward <machine> --list
 - A relative `host:unix:` path is resolved against the CLI's working
   directory before it is sent, so the user's intuition and the RPC's
   absolute-path rule agree.
-- The command requires a running machine, holds `VmForwardService.Hold`,
+- The command requires a running machine, opens `VmForwardService.Open`,
   prints the bound endpoint once the forward is `ACTIVE`, and stays in the
   foreground. `Ctrl-C` or `SIGTERM` ends the stream and exits 0. A forward
   that becomes `UNSUPPORTED` exits non-zero with the agent's identity in the
   message. A machine that stops ends the stream and the command exits
   non-zero.
-- `--list` prints `VmForwardService.List` with direction, owner, state, and
+- `--list` prints `VmForwardService.List` with direction, scope, state, and
   bound endpoint.
 
 Non-normative examples:
@@ -1061,13 +1064,13 @@ silo forward dev host:tcp:2222 vsock:22                    # raw vsock target, n
 | Forward table, host listeners, host targets, return port 1028, parking, capacity, `VmForwardService`, capability caching in `HostStatus` | `vmmon` |
 | Forward dialer on guest port 1028, `GuestForwardService.Listen`, health registration | guest agent |
 | Plumbing `forwards` and `vsock` through `MachineBuilder`, templates, and `config.json`; `publish` in `MachineNetworkConfig`; netd flag | `libvm` |
-| `silo forward`, holding the stream, endpoint parsing and shorthand | CLI |
-| Publication endpoint, bind policy, held publications, audit records, netstack dialing | netd |
+| `silo forward`, keeping the session stream open, endpoint parsing and shorthand | CLI |
+| Publication endpoint, bind policy, scoped publications, audit records, netstack dialing | netd |
 | `silo-portd`, `daemon.json`, DNAT delivery | the guest image (system VM image for Docker) |
 | Calling the publication endpoint natively | podman (unmodified) |
 
 `libvm` does not proxy streams and does not speak the target line. It gains a
-`Machine::hold_forward` wrapper over the RPC and exposes `forwards` and
+`Machine::open_forward` wrapper over the RPC and exposes `forwards` and
 `publish` through its builders, the CLI, and the SDK DTOs; today nothing
 writes `spec.vsock`, and forwards must not inherit that gap.
 
@@ -1087,8 +1090,8 @@ writes `spec.vsock`, and forwards must not inherit that gap.
   owner widens them with `mode`, which also disables the UID check for that
   socket. TCP listeners bind exactly the address the owner wrote; the default
   for a bare port is loopback on both sides.
-- Held forwards and `List` are served on `vm.sock` under the ADR 0008 peer-UID
-  check. A user who can hold a forward can already exec in the guest.
+- Session-scoped forwards and `List` are served on `vm.sock` under the ADR 0008
+  peer-UID check. A user who can open a forward can already exec in the guest.
 - Publications widen the guest's authority: it can make netd bind host ports.
   The per-machine gate, the bind policy, and audit records bound that
   exposure. A sandbox machine never enables `publish`.
@@ -1097,10 +1100,10 @@ writes `spec.vsock`, and forwards must not inherit that gap.
 
 ## Failure Semantics And Diagnostics
 
-- A declared forward whose host half cannot be bound or registered prevents
+- A machine-scoped forward whose host half cannot be bound or registered prevents
   machine start; the diagnostic names the forward, the endpoint, and the
   error.
-- A held forward whose host half cannot be bound fails the `Hold` RPC with
+- A session-scoped forward whose host half cannot be bound fails the `Open` RPC with
   the statuses listed above; nothing stays bound.
 - An inbound connection whose guest half refuses, times out, or answers
   `ERR` is closed without any bytes written to the client. `vmmon` logs the
@@ -1114,7 +1117,7 @@ writes `spec.vsock`, and forwards must not inherit that gap.
   new instance is ready. Parked connections outlive the transition up to
   their 30-second bound.
 - An agent without `GuestForwardService` produces one warn log per agent
-  instance and `UNSUPPORTED` in `List` and in `Hold` responses. It does not
+  instance and `UNSUPPORTED` in `List` and in `Open` responses. It does not
   affect readiness, matching ADR 0015's rule that vsock activity never
   changes `HostStatus.readiness`.
 - A publication request refused by policy produces a `denied` audit record
@@ -1200,7 +1203,7 @@ sees it at an address an unmodified client already expects.
   address, or listen on a guest address and return connections. Neither
   holds a table, and the dialer holds no state at all.
 - Forwards work without networking, reach guest loopback and Unix sockets,
-  and are identical in code path whether declared or held, so `docker.sock`
+  and are identical in code path for machine and session scopes, so `docker.sock`
   and `silo forward` share every test.
 - Teardown is structural everywhere: process exit, stream close, HTTP
   connection close, attachment end.
@@ -1316,14 +1319,14 @@ host bind. The section stays rejected; see the non-decisions below.
 - Hostnames are not accepted in endpoints; addresses are IP literals.
 - Guest listeners bind in the root network namespace. Reaching into a
   container's namespace is not supported.
-- Held forwards do not survive `vmmon` restart, by construction.
+- Session-scoped forwards do not survive `vmmon` restart, by construction.
 - A forward whose guest half depends on the agent is unavailable to images
   launched with the agent disabled.
 - Port 1028 cannot be published by users in either namespace.
 
 ## Open Questions
 
-- Whether the SDKs expose held forwards as a first-class object with a
+- Whether the SDKs expose session-scoped forwards as a first-class object with a
   cancellation-safe handle, given the Go FFI's current mutation-cancellation
   constraints.
 - Whether `silo show` should display active forwards and publications, which

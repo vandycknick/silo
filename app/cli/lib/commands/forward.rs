@@ -4,7 +4,7 @@ use std::path::Path;
 use clap::Args;
 use libvm::{
     Forward, ForwardAddress, ForwardDirection, ForwardEndpoint, ForwardShape, MachineAgentStatus,
-    MachineForwardOwner, MachineForwardState, MachineForwardStatus,
+    MachineForwardScope, MachineForwardState, MachineForwardStatus,
 };
 
 use crate::context::Context;
@@ -13,8 +13,8 @@ use crate::ui::Table;
 
 #[derive(Debug, Args)]
 #[command(
-    about = "Hold or list forwards for a running VM",
-    long_about = "Hold a forward for a running VM. Use two full endpoints, or HOST-PORT:GUEST-PORT as shorthand for loopback TCP forwarding.",
+    about = "Open or list forwards for a running VM",
+    long_about = "Open a session-scoped forward for a running VM. Use two full endpoints, or HOST-PORT:GUEST-PORT as shorthand for loopback TCP forwarding.",
     after_help = "Examples:\n  silo forward dev 8080:80\n  silo forward dev host:tcp:8080 guest:tcp:80\n  silo forward dev --list"
 )]
 pub struct Cmd {
@@ -35,7 +35,7 @@ pub struct Cmd {
     #[arg(long, value_name = "NAME", conflicts_with = "list")]
     name: Option<String>,
 
-    /// List declared and held forwards instead of holding one.
+    /// List machine- and session-scoped forwards instead of opening one.
     #[arg(long)]
     list: bool,
 }
@@ -64,7 +64,7 @@ impl Cmd {
             guest::ensure_guest_ready(&inspect)?;
         }
 
-        let mut hold = machine.hold_forward(forward).await?;
+        let mut session = machine.open_forward(forward).await?;
         let mut signals = guest::HostSignals::termination()?;
         let mut previous = None;
         loop {
@@ -73,7 +73,7 @@ impl Cmd {
                     Some(_) => return Ok(()),
                     None => eyre::bail!("host termination signal listeners ended"),
                 },
-                status = hold.next_status() => match status? {
+                status = session.next_status() => match status? {
                     Some(status) => {
                         if previous != Some(status.state) {
                             report_status(&machine, &status).await?;
@@ -184,7 +184,7 @@ fn print_forwards(forwards: &[MachineForwardStatus]) -> eyre::Result<()> {
     let mut table = Table::new([
         "NAME",
         "DIRECTION",
-        "OWNER",
+        "SCOPE",
         "STATE",
         "LISTEN",
         "CONNECT",
@@ -199,7 +199,7 @@ fn print_forwards(forwards: &[MachineForwardStatus]) -> eyre::Result<()> {
                 .clone()
                 .unwrap_or_else(|| "-".to_string()),
             direction(status.direction).to_string(),
-            owner(status.owner).to_string(),
+            scope(status.scope).to_string(),
             state(status.state).to_string(),
             status
                 .bound
@@ -221,10 +221,10 @@ fn direction(value: ForwardDirection) -> &'static str {
     }
 }
 
-fn owner(value: MachineForwardOwner) -> &'static str {
+fn scope(value: MachineForwardScope) -> &'static str {
     match value {
-        MachineForwardOwner::Declared => "declared",
-        MachineForwardOwner::Held => "held",
+        MachineForwardScope::Machine => "machine",
+        MachineForwardScope::Session => "session",
     }
 }
 

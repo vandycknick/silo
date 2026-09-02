@@ -345,7 +345,7 @@ impl MachineBuilder {
         self
     }
 
-    /// Replaces the declared forwards activated on every machine start.
+    /// Replaces the machine-scoped forwards activated on every machine start.
     pub fn forwards(mut self, forwards: Vec<forward_spec::Forward>) -> Self {
         self.request.forwards = forwards;
         self

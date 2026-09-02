@@ -195,7 +195,7 @@ pub async fn init(
         .transpose()?;
     let mux_filename =
         vm_spec::effective_vsock_filename(spec.vsock.as_ref()).and_then(|path| path.to_str());
-    let forwards = crate::forward::ForwardTable::prepare_declared(
+    let forwards = crate::forward::ForwardTable::prepare_machine(
         &spec.forwards,
         runtime.runtime_dir(),
         mux_filename,

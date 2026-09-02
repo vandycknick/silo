@@ -5,9 +5,9 @@ use crate::vmmon::{forward_rpc_error, ForwardClientError, VmmonClientError};
 use crate::LibVmError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MachineForwardOwner {
-    Declared,
-    Held,
+pub enum MachineForwardScope {
+    Machine,
+    Session,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,7 @@ pub enum MachineForwardErrorDetail {
 pub struct MachineForwardStatus {
     pub forward: forward_spec::Forward,
     pub direction: forward_spec::Direction,
-    pub owner: MachineForwardOwner,
+    pub scope: MachineForwardScope,
     pub state: MachineForwardState,
     pub bound: Option<forward_spec::Endpoint>,
     pub active_connections: u32,
@@ -43,12 +43,12 @@ pub struct MachineForwardStatus {
 }
 
 #[derive(Debug)]
-pub struct MachineForwardHold {
+pub struct MachineForwardSession {
     reference: String,
     stream: tonic::Streaming<v1::ForwardStatus>,
 }
 
-impl MachineForwardHold {
+impl MachineForwardSession {
     pub async fn next_status(&mut self) -> Result<Option<MachineForwardStatus>, LibVmError> {
         self.stream
             .message()
@@ -64,19 +64,19 @@ impl MachineForwardHold {
 }
 
 impl Machine {
-    pub async fn hold_forward(
+    pub async fn open_forward(
         &self,
         forward: forward_spec::Forward,
-    ) -> Result<MachineForwardHold, LibVmError> {
+    ) -> Result<MachineForwardSession, LibVmError> {
         let config = self.running_config().await?;
         let stream = self
             .runtime()
             .vmmon()
             .client(self.machine_id())
-            .hold_forward(forward)
+            .open_forward(forward)
             .await
             .map_err(|error| map_client_error(config.name.clone(), error))?;
-        Ok(MachineForwardHold {
+        Ok(MachineForwardSession {
             reference: config.name,
             stream,
         })
@@ -158,11 +158,11 @@ impl TryFrom<v1::ForwardStatus> for MachineForwardStatus {
         if direction != expected_direction {
             return Err("forward status direction does not match its endpoints".to_string());
         }
-        let owner = match required_enum::<v1::ForwardOwner>(value.owner, "owner")? {
-            v1::ForwardOwner::Declared => MachineForwardOwner::Declared,
-            v1::ForwardOwner::Held => MachineForwardOwner::Held,
-            v1::ForwardOwner::Unspecified => {
-                return Err("forward status has unspecified owner".to_string())
+        let scope = match required_enum::<v1::ForwardScope>(value.scope, "scope")? {
+            v1::ForwardScope::Machine => MachineForwardScope::Machine,
+            v1::ForwardScope::Session => MachineForwardScope::Session,
+            v1::ForwardScope::Unspecified => {
+                return Err("forward status has unspecified scope".to_string())
             }
         };
         let state = match required_enum::<v1::ForwardState>(value.state, "state")? {
@@ -182,7 +182,7 @@ impl TryFrom<v1::ForwardStatus> for MachineForwardStatus {
         Ok(Self {
             forward,
             direction,
-            owner,
+            scope,
             state,
             bound,
             active_connections: value

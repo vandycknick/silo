@@ -10,8 +10,8 @@ use protocol::v1::vm_forward_service_client::VmForwardServiceClient;
 use protocol::v1::vm_monitor_service_client::VmMonitorServiceClient;
 use protocol::v1::{
     CreateDirectoryRequest, DownloadFileRequest, ExecuteInput, ExecutionEvent, GetEntryRequest,
-    GetMetricsRequest, GetStatusRequest, HoldForwardRequest, HostMetrics, HostStatus,
-    ListDirectoryRequest, ListForwardsRequest, RemoveEntryRequest, UploadFileRequest,
+    GetMetricsRequest, GetStatusRequest, HostMetrics, HostStatus, ListDirectoryRequest,
+    ListForwardsRequest, OpenForwardRequest, RemoveEntryRequest, UploadFileRequest,
     WaitReadyRequest, WaitReadyResponse,
 };
 use tokio::sync::mpsc;
@@ -219,18 +219,18 @@ impl VmmonClient {
             .map_err(|error| rpc_error("execute RPC failed", error))
     }
 
-    pub(crate) async fn hold_forward(
+    pub(crate) async fn open_forward(
         &self,
         forward: forward_spec::Forward,
     ) -> Result<tonic::Streaming<protocol::v1::ForwardStatus>, VmmonClientError> {
         let mut client = forward_client(self.channel().await?);
-        let request = Request::new(HoldForwardRequest {
+        let request = Request::new(OpenForwardRequest {
             forward: Some(encode_forward(forward)),
         });
-        tokio::time::timeout(FORWARD_SETUP_TIMEOUT, client.hold(request))
+        tokio::time::timeout(FORWARD_SETUP_TIMEOUT, client.open(request))
             .await
             .map_err(|_| {
-                VmmonClientError::Protocol("forward Hold RPC setup timed out".to_string())
+                VmmonClientError::Protocol("forward Open RPC setup timed out".to_string())
             })?
             .map(|response| response.into_inner())
             .map_err(|status| VmmonClientError::Forward(forward_rpc_error(status)))

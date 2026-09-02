@@ -4,14 +4,14 @@ use std::sync::Arc;
 use futures::Stream;
 use protocol::v1::vm_forward_service_server::VmForwardService;
 use protocol::v1::{
-    ErrorCode, ForwardDirection, ForwardOwner as WireOwner, ForwardState as WireState,
-    ForwardStatus, HoldForwardRequest, ListForwardsRequest, ListForwardsResponse,
+    ErrorCode, ForwardDirection, ForwardScope as WireScope, ForwardState as WireState,
+    ForwardStatus, ListForwardsRequest, ListForwardsResponse, OpenForwardRequest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use crate::forward::{ForwardEntry, ForwardOwner, ForwardState, ForwardTable, HoldError};
+use crate::forward::{ForwardEntry, ForwardScope, ForwardState, ForwardTable, OpenError};
 
 #[derive(Clone)]
 pub(crate) struct ForwardService {
@@ -24,16 +24,16 @@ impl ForwardService {
     }
 }
 
-type HoldStream = Pin<Box<dyn Stream<Item = Result<ForwardStatus, Status>> + Send>>;
+type OpenStream = Pin<Box<dyn Stream<Item = Result<ForwardStatus, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl VmForwardService for ForwardService {
-    type HoldStream = HoldStream;
+    type OpenStream = OpenStream;
 
-    async fn hold(
+    async fn open(
         &self,
-        request: Request<HoldForwardRequest>,
-    ) -> Result<Response<Self::HoldStream>, Status> {
+        request: Request<OpenForwardRequest>,
+    ) -> Result<Response<Self::OpenStream>, Status> {
         let request = request.into_inner();
         let forward = parse_forward(request.forward.ok_or_else(|| {
             forward_status(
@@ -42,14 +42,18 @@ impl VmForwardService for ForwardService {
                 "forward is required",
             )
         })?)?;
-        let entry = self.table.add_held(forward).await.map_err(map_hold_error)?;
+        let entry = self
+            .table
+            .add_session(forward)
+            .await
+            .map_err(map_open_error)?;
         let mut snapshots = entry.status.subscribe();
         let (tx, rx) = mpsc::channel(8);
         let table = self.table.clone();
         if tx.send(Ok(render(&entry))).await.is_err() {
             table.remove(entry.id()).await;
             return Err(Status::cancelled(
-                "forward hold receiver closed during setup",
+                "forward session receiver closed during setup",
             ));
         }
         tokio::spawn(async move {
@@ -146,9 +150,9 @@ fn render(entry: &ForwardEntry) -> ForwardStatus {
         forward_spec::Direction::Inbound => ForwardDirection::Inbound,
         forward_spec::Direction::Outbound => ForwardDirection::Outbound,
     };
-    let owner = match entry.owner {
-        ForwardOwner::Declared => WireOwner::Declared,
-        ForwardOwner::Held => WireOwner::Held,
+    let scope = match entry.scope {
+        ForwardScope::Machine => WireScope::Machine,
+        ForwardScope::Session => WireScope::Session,
     };
     let state = match snapshot.state {
         ForwardState::Pending => WireState::Pending,
@@ -164,7 +168,7 @@ fn render(entry: &ForwardEntry) -> ForwardStatus {
             unix_mode: entry.spec.mode.map(forward_spec::UnixMode::get),
         }),
         direction: Some(direction as i32),
-        owner: Some(owner as i32),
+        scope: Some(scope as i32),
         state: Some(state as i32),
         bound: snapshot.bound.map(|endpoint| endpoint.to_string()),
         active_connections: Some(snapshot.active_connections),
@@ -173,29 +177,29 @@ fn render(entry: &ForwardEntry) -> ForwardStatus {
     }
 }
 
-fn map_hold_error(error: HoldError) -> Status {
+fn map_open_error(error: OpenError) -> Status {
     match error {
-        HoldError::Invalid(message) => forward_status(
+        OpenError::Invalid(message) => forward_status(
             tonic::Code::InvalidArgument,
             ErrorCode::ForwardInvalid,
             message,
         ),
-        HoldError::AddressInUse(message) => forward_status(
+        OpenError::AddressInUse(message) => forward_status(
             tonic::Code::AlreadyExists,
             ErrorCode::ForwardAddressInUse,
             message,
         ),
-        HoldError::Limit(message) => forward_status(
+        OpenError::Limit(message) => forward_status(
             tonic::Code::ResourceExhausted,
             ErrorCode::ForwardLimit,
             message,
         ),
-        HoldError::NotRunning(message) => forward_status(
+        OpenError::NotRunning(message) => forward_status(
             tonic::Code::FailedPrecondition,
             ErrorCode::PreconditionFailed,
             message,
         ),
-        HoldError::Unavailable(message) => forward_status(
+        OpenError::Unavailable(message) => forward_status(
             tonic::Code::Unavailable,
             ErrorCode::BackendUnavailable,
             message,

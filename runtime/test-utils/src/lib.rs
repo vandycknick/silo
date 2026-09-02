@@ -112,7 +112,7 @@ pub struct ExecScenario {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct VsockScenario {
-    /// Ports that refuse host connections even when declared.
+    /// Ports that refuse host connections even when configured.
     pub refuse_ports: Vec<u32>,
     /// Hard-close a port's streams after relaying this many bytes.
     pub drop_after_bytes: HashMap<u32, u64>,

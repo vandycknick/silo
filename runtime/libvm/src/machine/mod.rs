@@ -21,7 +21,7 @@ mod vsock;
 
 pub use builder::MachineBuilder;
 pub use forward::{
-    MachineForwardErrorDetail, MachineForwardHold, MachineForwardOwner, MachineForwardState,
+    MachineForwardErrorDetail, MachineForwardScope, MachineForwardSession, MachineForwardState,
     MachineForwardStatus,
 };
 pub use guest::{GuestBuilder, MachineAgent, MachineGuestConfig, MachineUserConfig};

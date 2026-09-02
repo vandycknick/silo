@@ -41,9 +41,9 @@ message ListenerFailed {
 
 // Host side, served by vmmon on vm.sock.
 service VmForwardService {
-  // Create a forward that exists while this stream is open.
-  rpc Hold(HoldForwardRequest) returns (stream ForwardStatus);
-  // Return the status of every declared and held forward.
+  // Open a session-scoped forward that exists while this stream is open.
+  rpc Open(OpenForwardRequest) returns (stream ForwardStatus);
+  // Return the status of every machine- and session-scoped forward.
   rpc List(ListForwardsRequest) returns (ListForwardsResponse);
 }
 
@@ -54,7 +54,7 @@ message Forward {
   optional uint32 unix_mode = 4;
 }
 
-message HoldForwardRequest {
+message OpenForwardRequest {
   Forward forward = 1;
 }
 
@@ -70,10 +70,10 @@ enum ForwardDirection {
   FORWARD_DIRECTION_OUTBOUND = 2;
 }
 
-enum ForwardOwner {
-  FORWARD_OWNER_UNSPECIFIED = 0;
-  FORWARD_OWNER_DECLARED = 1;
-  FORWARD_OWNER_HELD = 2;
+enum ForwardScope {
+  FORWARD_SCOPE_UNSPECIFIED = 0;
+  FORWARD_SCOPE_MACHINE = 1;
+  FORWARD_SCOPE_SESSION = 2;
 }
 
 enum ForwardState {
@@ -87,7 +87,7 @@ enum ForwardState {
 message ForwardStatus {
   Forward forward = 1;
   optional ForwardDirection direction = 2;
-  optional ForwardOwner owner = 3;
+  optional ForwardScope scope = 3;
   optional ForwardState state = 4;
   // Actual listen endpoint after binding.
   optional string bound = 5;

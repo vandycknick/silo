@@ -19,12 +19,12 @@ use crate::forward::host_socket::OwnedHostListener;
 use crate::virt::VirtualMachine;
 
 const MAX_FORWARDS: usize = 128;
-const MAX_HELD_FORWARDS: usize = 64;
+const MAX_SESSION_FORWARDS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ForwardOwner {
-    Declared,
-    Held,
+pub(crate) enum ForwardScope {
+    Machine,
+    Session,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +53,7 @@ pub(crate) enum GuestHalfAvailability {
 
 pub(crate) struct ForwardEntry {
     id: u64,
-    pub(crate) owner: ForwardOwner,
+    pub(crate) scope: ForwardScope,
     pub(crate) spec: Forward,
     pub(crate) name: String,
     pub(crate) shape: ForwardShape,
@@ -68,7 +68,7 @@ pub(crate) struct ForwardEntry {
     listener: Mutex<Option<OwnedHostListener>>,
     vsock_listener: Mutex<Option<crate::virt::VsockListener>>,
     total_permit: Mutex<Option<OwnedSemaphorePermit>>,
-    held_permit: Mutex<Option<OwnedSemaphorePermit>>,
+    session_permit: Mutex<Option<OwnedSemaphorePermit>>,
 }
 
 struct RetainedRawPort {
@@ -84,7 +84,7 @@ pub(crate) struct ForwardTable {
     running: AtomicBool,
     next_id: AtomicU64,
     total_capacity: Arc<Semaphore>,
-    held_capacity: Arc<Semaphore>,
+    session_capacity: Arc<Semaphore>,
     availability: watch::Sender<GuestHalfAvailability>,
     pub(crate) shutdown: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -96,7 +96,7 @@ pub(crate) struct ForwardTable {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum HoldError {
+pub(crate) enum OpenError {
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]
@@ -110,16 +110,16 @@ pub(crate) enum HoldError {
 }
 
 impl ForwardTable {
-    pub(crate) async fn prepare_declared(
+    pub(crate) async fn prepare_machine(
         forwards: &[Forward],
         runtime_dir: &Path,
         mux_filename: Option<&str>,
     ) -> eyre::Result<Arc<Self>> {
         forward_spec::validate_forwards(forwards, mux_filename)
-            .map_err(|error| eyre::eyre!("validate declared forwards: {error}"))?;
+            .map_err(|error| eyre::eyre!("validate machine-scoped forwards: {error}"))?;
         if forwards.len() > MAX_FORWARDS {
             return Err(eyre::eyre!(
-                "declared forwards exceed the limit of {MAX_FORWARDS}"
+                "machine-scoped forwards exceed the limit of {MAX_FORWARDS}"
             ));
         }
         let shutdown = CancellationToken::new();
@@ -133,7 +133,7 @@ impl ForwardTable {
             running: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             total_capacity: Arc::new(Semaphore::new(MAX_FORWARDS - forwards.len())),
-            held_capacity: Arc::new(Semaphore::new(MAX_HELD_FORWARDS)),
+            session_capacity: Arc::new(Semaphore::new(MAX_SESSION_FORWARDS)),
             availability,
             shutdown,
             tasks: Mutex::new(Vec::new()),
@@ -145,7 +145,7 @@ impl ForwardTable {
         });
         for spec in forwards {
             let entry = table
-                .build_entry(spec.clone(), ForwardOwner::Declared, None, None)
+                .build_entry(spec.clone(), ForwardScope::Machine, None, None)
                 .await
                 .map_err(|error| eyre::eyre!(error.to_string()))?;
             table
@@ -160,19 +160,19 @@ impl ForwardTable {
     async fn build_entry(
         &self,
         spec: Forward,
-        owner: ForwardOwner,
+        scope: ForwardScope,
         total_permit: Option<OwnedSemaphorePermit>,
-        held_permit: Option<OwnedSemaphorePermit>,
-    ) -> Result<Arc<ForwardEntry>, HoldError> {
+        session_permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<Arc<ForwardEntry>, OpenError> {
         let shape = spec
             .validate()
-            .map_err(|error| HoldError::Invalid(error.to_string()))?;
+            .map_err(|error| OpenError::Invalid(error.to_string()))?;
         let name = spec.display_name();
         let guest_half = spec
             .guest_half()
-            .map_err(|error| HoldError::Invalid(error.to_string()))?;
+            .map_err(|error| OpenError::Invalid(error.to_string()))?;
         let host_target = resolve_host_target(&spec, &self.runtime_dir)
-            .map_err(|error| HoldError::Invalid(error.to_string()))?;
+            .map_err(|error| OpenError::Invalid(error.to_string()))?;
         let token = if shape == ForwardShape::OutboundAgent {
             let mut bytes = [0_u8; 16];
             rand::rng().fill(&mut bytes);
@@ -183,7 +183,7 @@ impl ForwardTable {
         let listener = match shape {
             ForwardShape::InboundAgent | ForwardShape::InboundVsock => {
                 let forward_spec::Endpoint::Host(address) = &spec.listen else {
-                    return Err(HoldError::Invalid(
+                    return Err(OpenError::Invalid(
                         "validated inbound forward has no host listener".to_string(),
                     ));
                 };
@@ -221,7 +221,7 @@ impl ForwardTable {
         });
         Ok(Arc::new(ForwardEntry {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
-            owner,
+            scope,
             spec,
             name,
             shape,
@@ -236,7 +236,7 @@ impl ForwardTable {
             listener: Mutex::new(listener),
             vsock_listener: Mutex::new(None),
             total_permit: Mutex::new(total_permit),
-            held_permit: Mutex::new(held_permit),
+            session_permit: Mutex::new(session_permit),
         }))
     }
 
@@ -350,13 +350,13 @@ impl ForwardTable {
         }
     }
 
-    pub(crate) async fn add_held(
+    pub(crate) async fn add_session(
         self: &Arc<Self>,
         spec: Forward,
-    ) -> Result<Arc<ForwardEntry>, HoldError> {
+    ) -> Result<Arc<ForwardEntry>, OpenError> {
         let _operation = self.operation.lock().await;
         if !self.running.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
-            return Err(HoldError::NotRunning("VM is not running".to_string()));
+            return Err(OpenError::NotRunning("VM is not running".to_string()));
         }
         let entries = self.entries();
         let mut specs = entries
@@ -367,16 +367,16 @@ impl ForwardTable {
         if let Err(error) = forward_spec::validate_forwards(&specs, self.mux_filename.as_deref()) {
             return match error {
                 forward_spec::ForwardError::DuplicateVsockListenPort(_) => {
-                    Err(HoldError::AddressInUse(error.to_string()))
+                    Err(OpenError::AddressInUse(error.to_string()))
                 }
-                _ => Err(HoldError::Invalid(error.to_string())),
+                _ => Err(OpenError::Invalid(error.to_string())),
             };
         }
         if entries
             .iter()
             .any(|entry| listen_conflicts(&entry.spec.listen, &spec.listen))
         {
-            return Err(HoldError::AddressInUse(format!(
+            return Err(OpenError::AddressInUse(format!(
                 "listen endpoint {} is already owned",
                 spec.listen
             )));
@@ -386,25 +386,25 @@ impl ForwardTable {
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                HoldError::Limit(format!("forward limit of {MAX_FORWARDS} is exhausted"))
+                OpenError::Limit(format!("forward limit of {MAX_FORWARDS} is exhausted"))
             })?;
-        let held = self
-            .held_capacity
+        let session = self
+            .session_capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                HoldError::Limit(format!(
-                    "held forward limit of {MAX_HELD_FORWARDS} is exhausted"
+                OpenError::Limit(format!(
+                    "session-scoped forward limit of {MAX_SESSION_FORWARDS} is exhausted"
                 ))
             })?;
         let entry = self
-            .build_entry(spec, ForwardOwner::Held, Some(total), Some(held))
+            .build_entry(spec, ForwardScope::Session, Some(total), Some(session))
             .await?;
         let machine = self
             .machine
             .get()
             .cloned()
-            .ok_or_else(|| HoldError::Unavailable("VM backend is unavailable".to_string()))?;
+            .ok_or_else(|| OpenError::Unavailable("VM backend is unavailable".to_string()))?;
         match entry.shape {
             ForwardShape::OutboundVsock => self.attach_raw(&machine, entry.clone()).await?,
             ForwardShape::OutboundAgent => self.ensure_return_listener(&machine).await?,
@@ -422,9 +422,9 @@ impl ForwardTable {
         self: &Arc<Self>,
         machine: &VirtualMachine,
         entry: Arc<ForwardEntry>,
-    ) -> Result<(), HoldError> {
+    ) -> Result<(), OpenError> {
         let forward_spec::Endpoint::Vsock(port) = entry.spec.listen else {
-            return Err(HoldError::Invalid(
+            return Err(OpenError::Invalid(
                 "raw forward has no vsock listener".to_string(),
             ));
         };
@@ -443,7 +443,7 @@ impl ForwardTable {
             return Ok(());
         }
         let listener = machine.listen_public_vsock(port).await.map_err(|error| {
-            HoldError::Unavailable(format!("register vsock port {port}: {error}"))
+            OpenError::Unavailable(format!("register vsock port {port}: {error}"))
         })?;
         entry.set_state(ForwardState::Active, None);
         let target = Arc::new(RwLock::new(Some(entry)));
@@ -471,7 +471,7 @@ impl ForwardTable {
     async fn ensure_return_listener(
         self: &Arc<Self>,
         machine: &VirtualMachine,
-    ) -> Result<(), HoldError> {
+    ) -> Result<(), OpenError> {
         if self.return_registered.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -479,7 +479,7 @@ impl ForwardTable {
             .listen_public_vsock(forward_spec::FORWARD_VSOCK_PORT)
             .await
             .map_err(|error| {
-                HoldError::Unavailable(format!("register forward return port 1028: {error}"))
+                OpenError::Unavailable(format!("register forward return port 1028: {error}"))
             })?;
         self.return_registered.store(true, Ordering::Release);
         self.registered_ports
@@ -510,7 +510,7 @@ impl ForwardTable {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         entry
-            .held_permit
+            .session_permit
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
@@ -604,7 +604,7 @@ impl ForwardTable {
     }
 }
 
-fn bind_error(name: &str, endpoint: &forward_spec::Endpoint, error: eyre::Report) -> HoldError {
+fn bind_error(name: &str, endpoint: &forward_spec::Endpoint, error: eyre::Report) -> OpenError {
     let address_in_use = error.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
@@ -612,9 +612,9 @@ fn bind_error(name: &str, endpoint: &forward_spec::Endpoint, error: eyre::Report
     });
     let message = format!("bind forward {name} at {endpoint}: {error}");
     if address_in_use {
-        HoldError::AddressInUse(message)
+        OpenError::AddressInUse(message)
     } else {
-        HoldError::Unavailable(message)
+        OpenError::Unavailable(message)
     }
 }
 

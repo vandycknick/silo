@@ -35,7 +35,7 @@ pub struct VmSpec {
     /// Host directories mounted into the guest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<Mount>,
-    /// Host-declared forwards carried over vsock (ADR 0016).
+    /// Machine-scoped forwards carried over vsock (ADR 0016).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<forward_spec::Forward>,
     /// Public hybrid vsock host surface.

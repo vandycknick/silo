@@ -93,7 +93,7 @@ pub enum UnixModeError {
     OutOfRange(u32),
 }
 
-/// One host-declared or stream-held forward.
+/// One machine- or session-scoped forward.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Forward {

@@ -56,7 +56,7 @@ pub use crate::machine::{
     MachineByteStream, MachineCpuMetrics, MachineData, MachineDirectoryCreateDisposition,
     MachineDirectoryPage, MachineEnabledAgent, MachineEntryKind, MachineExit, MachineExitOutcome,
     MachineFileDownload, MachineFileEntry, MachineFileUploadOptions, MachineFilesystemMetrics,
-    MachineForwardErrorDetail, MachineForwardHold, MachineForwardOwner, MachineForwardState,
+    MachineForwardErrorDetail, MachineForwardScope, MachineForwardSession, MachineForwardState,
     MachineForwardStatus, MachineFreshness, MachineGuestBootMode, MachineGuestBootReport,
     MachineGuestConfig, MachineKillOptions, MachineLoadAverageMetrics, MachineLogChunk,
     MachineLogOptions, MachineLogOutput, MachineLogSource, MachineLogStream, MachineMemoryMetrics,

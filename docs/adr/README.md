@@ -35,4 +35,4 @@ and review standards for new and substantially revised records.
 | 0012 | Cross-platform runtime and SDK packaging                     | Accepted    | 2026-07-22 | `docs/adr/0012-cross-platform-runtime-and-sdk-packaging.md` |
 | 0013 | Image-first machine lifecycle                                | Implemented | 2026-08-07 | `docs/adr/0013-image-first-machine-lifecycle.md` |
 | 0015 | Firecracker-compatible hybrid vsock host surface             | Accepted    | 2026-08-25 | `docs/adr/0015-hybrid-vsock-host-surface.md`     |
-| 0016 | Forwarding: host-declared vsock forwards and guest-requested netd publications | Draft | 2026-09-01 | `docs/adr/0016-vsock-forwards-and-netd-publications.md` |
+| 0016 | Forwarding: machine- and session-scoped vsock forwards and guest-requested netd publications | Draft | 2026-09-01 | `docs/adr/0016-vsock-forwards-and-netd-publications.md` |
