@@ -170,6 +170,9 @@ pub enum LibVmError {
     #[error("invalid update for machine {reference:?}: {reason}")]
     InvalidMachineUpdate { reference: String, reason: String },
 
+    #[error("invalid machine configuration for {reference:?}: {reason}")]
+    InvalidMachineConfig { reference: String, reason: String },
+
     #[error("unsupported host architecture {arch:?}")]
     UnsupportedHostArchitecture { arch: String },
 
@@ -267,6 +270,7 @@ impl LibVmError {
             Self::BootAssetInvalid { .. } => "BootAssetInvalid",
             Self::InvalidCreateRequest { .. } => "InvalidCreateRequest",
             Self::InvalidMachineUpdate { .. } => "InvalidMachineUpdate",
+            Self::InvalidMachineConfig { .. } => "InvalidMachineConfig",
             Self::UnsupportedHostArchitecture { .. } => "UnsupportedHostArchitecture",
             Self::CorruptState { .. } => "CorruptState",
             Self::VmSpecSerializeFailed { .. } => "VmSpecSerializeFailed",

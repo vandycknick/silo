@@ -196,6 +196,23 @@ fn print_template_details(named: &NamedTemplate) -> eyre::Result<()> {
             format_template_mounts(&template.mounts),
         ),
         (
+            "forwards".to_string(),
+            if template.forwards.is_empty() {
+                "-".to_string()
+            } else {
+                template
+                    .forwards
+                    .iter()
+                    .map(|forward| format!("{}={}", forward.listen, forward.connect))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        ),
+        (
+            "vsock".to_string(),
+            template.vsock.map(ui::yes_no).unwrap_or("-").to_string(),
+        ),
+        (
             "labels".to_string(),
             format_template_labels(&template.labels),
         ),
@@ -212,6 +229,8 @@ fn create_template(store: &TemplateStore, command: CreateCmd) -> eyre::Result<()
         disk_size: None,
         userdata: None,
         mounts: Vec::new(),
+        forwards: Vec::new(),
+        vsock: None,
         network: None,
         labels: Default::default(),
     };

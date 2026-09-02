@@ -82,7 +82,7 @@ pub use crate::runtime::{
 pub use crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub use forward_spec::{
     Address as ForwardAddress, Direction as ForwardDirection, Endpoint as ForwardEndpoint, Forward,
-    UnixMode,
+    ForwardShape, UnixMode,
 };
 pub use silo_policy::{
     NetworkAuditBuilder, NetworkCredential, NetworkCredentialBuilder, NetworkEndpointBuilder,

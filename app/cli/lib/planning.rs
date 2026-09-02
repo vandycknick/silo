@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use eyre::bail;
 use libvm::{
-    MachineAgent, MachineRetention, MachineUserConfig, OciImageConfigMetadata, Platform,
+    Forward, MachineAgent, MachineRetention, MachineUserConfig, OciImageConfigMetadata, Platform,
     ProcessConfig,
 };
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use crate::environment::{
 use crate::machine_defaults::{
     validate_machine_defaults, MachineMount, MachineNetwork, MachineResources,
 };
-use crate::template::{validate_template, Template};
+use crate::template::{validate_template, Template, TemplateForward};
 
 /// Immutable OCI identity retained by a plan without materializing a root disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +79,10 @@ pub(crate) struct MachineOverrides {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) mounts: Vec<MachineMount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) forwards: Option<Vec<Forward>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vsock: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) network: Option<MachineNetwork>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) labels: BTreeMap<String, String>,
@@ -92,6 +96,10 @@ pub(crate) struct MachinePlan {
     pub(crate) disk_size: Option<String>,
     pub(crate) userdata: Option<String>,
     pub(crate) mounts: Vec<MachineMount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) forwards: Vec<Forward>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vsock: Option<bool>,
     pub(crate) network: Option<MachineNetwork>,
     pub(crate) labels: BTreeMap<String, String>,
 }
@@ -349,6 +357,14 @@ fn resolve_machine(template: &Template, overrides: MachineOverrides) -> eyre::Re
         .resources
         .or_else(|| template.resources.clone())
         .unwrap_or_default();
+    let forwards = match overrides.forwards {
+        Some(forwards) => forwards,
+        None => template
+            .forwards
+            .iter()
+            .map(parse_template_forward)
+            .collect::<eyre::Result<Vec<_>>>()?,
+    };
     let machine = MachinePlan {
         resources: Some(MachineResources {
             cpus: Some(selected_resources.cpus.unwrap_or(1)),
@@ -361,6 +377,8 @@ fn resolve_machine(template: &Template, overrides: MachineOverrides) -> eyre::Re
         disk_size: overrides.disk_size.or_else(|| template.disk_size.clone()),
         userdata: overrides.userdata.or_else(|| template.userdata.clone()),
         mounts,
+        forwards,
+        vsock: overrides.vsock.or(template.vsock),
         network: Some(
             overrides
                 .network
@@ -566,6 +584,15 @@ fn validate_machine_plan(machine: &MachinePlan) -> eyre::Result<()> {
             MachineNetwork::None => {}
         }
     }
+    vm_spec::VmSpec {
+        vsock: machine
+            .vsock
+            .map(|enabled| vm_spec::Vsock { enabled, uds: None }),
+        forwards: machine.forwards.clone(),
+        ..vm_spec::VmSpec::current()
+    }
+    .validate()
+    .map_err(|error| eyre::eyre!(error))?;
     Ok(())
 }
 
@@ -581,9 +608,48 @@ fn validate_template_nuls(template: &Template) -> eyre::Result<()> {
         disk_size: template.disk_size.clone(),
         userdata: template.userdata.clone(),
         mounts: template.mounts.clone(),
+        forwards: Vec::new(),
+        vsock: None,
         network: template.network.clone(),
         labels: template.labels.clone(),
-    })
+    })?;
+    for forward in &template.forwards {
+        for value in [
+            forward.name.as_deref(),
+            Some(forward.listen.as_str()),
+            Some(forward.connect.as_str()),
+            forward.mode.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validate_no_nul(value, "template forward")?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_template_forward(value: &TemplateForward) -> eyre::Result<Forward> {
+    let forward =
+        Forward {
+            name: value.name.clone(),
+            listen: value.listen.parse().map_err(|error| {
+                eyre::eyre!("invalid template forward listen endpoint: {error}")
+            })?,
+            connect: value.connect.parse().map_err(|error| {
+                eyre::eyre!("invalid template forward connect endpoint: {error}")
+            })?,
+            mode: value
+                .mode
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .map_err(|error| eyre::eyre!("invalid template forward mode: {error}"))?,
+        };
+    forward
+        .validate()
+        .map_err(|error| eyre::eyre!("invalid template forward: {error}"))?;
+    Ok(forward)
 }
 
 fn validate_oci_metadata(metadata: &OciImageConfigMetadata) -> eyre::Result<()> {
@@ -664,7 +730,7 @@ mod tests {
         MachineOverrides, OciImageIdentity, Plan, PlanKind, ProcessOverrides, PullPolicy,
         ResolveRequest, ResolvedImage, RunOptions, TtyCapabilities, TtyMode,
     };
-    use crate::template::Template;
+    use crate::template::{Template, TemplateForward};
 
     fn template(image: Option<&str>) -> Template {
         Template {
@@ -675,6 +741,8 @@ mod tests {
             disk_size: None,
             userdata: None,
             mounts: Vec::new(),
+            forwards: Vec::new(),
+            vsock: None,
             network: None,
             labels: BTreeMap::from([("template".to_string(), "yes".to_string())]),
         }
@@ -693,6 +761,68 @@ mod tests {
             },
             metadata: Box::new(metadata),
         }
+    }
+
+    #[test]
+    fn cli_forwards_replace_template_forwards_and_vsock_overrides_template() {
+        let mut request = request(PlanKind::Create, OciImageConfigMetadata::default());
+        request.template.forwards = vec![TemplateForward {
+            name: Some("template".to_string()),
+            listen: "host:tcp:8000".to_string(),
+            connect: "guest:tcp:80".to_string(),
+            mode: None,
+        }];
+        request.template.vsock = Some(false);
+        let override_forward = libvm::Forward::new(
+            "guest:tcp:5432".parse().expect("override listen"),
+            "host:tcp:5432".parse().expect("override connect"),
+        )
+        .with_name("override");
+        request.machine_overrides.forwards = Some(vec![override_forward.clone()]);
+        request.machine_overrides.vsock = Some(true);
+
+        let Plan::Create(plan) = resolve(request).expect("resolve plan") else {
+            panic!("expected create plan")
+        };
+        assert_eq!(plan.machine.forwards, vec![override_forward]);
+        assert_eq!(plan.machine.vsock, Some(true));
+    }
+
+    #[test]
+    fn invalid_template_forward_fails_during_planning() {
+        let mut request = request(PlanKind::Create, OciImageConfigMetadata::default());
+        request.template.forwards = vec![TemplateForward {
+            name: None,
+            listen: "host:tcp:not-a-port".to_string(),
+            connect: "guest:tcp:80".to_string(),
+            mode: None,
+        }];
+
+        let error = resolve(request).expect_err("invalid template forward must fail");
+        assert!(error.to_string().contains("template forward listen"));
+    }
+
+    #[test]
+    fn template_forward_endpoints_and_mode_are_parsed_into_the_plan() {
+        let mut request = request(PlanKind::Create, OciImageConfigMetadata::default());
+        request.template.forwards = vec![TemplateForward {
+            name: Some("socket".to_string()),
+            listen: "host:unix:socket.sock".to_string(),
+            connect: "guest:unix:/run/socket.sock".to_string(),
+            mode: Some("0660".to_string()),
+        }];
+
+        let Plan::Create(plan) = resolve(request).expect("resolve template forward") else {
+            panic!("expected create plan")
+        };
+        assert_eq!(plan.machine.forwards.len(), 1);
+        assert_eq!(
+            plan.machine.forwards[0]
+                .mode
+                .expect("parsed Unix mode")
+                .to_string(),
+            "0660"
+        );
     }
 
     fn request(kind: PlanKind, metadata: OciImageConfigMetadata) -> ResolveRequest {

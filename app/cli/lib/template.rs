@@ -35,10 +35,25 @@ pub(crate) struct Template {
     pub(crate) userdata: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) mounts: Vec<MachineMount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) forwards: Vec<TemplateForward>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vsock: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) network: Option<MachineNetwork>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TemplateForward {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    pub(crate) listen: String,
+    pub(crate) connect: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<String>,
 }
 
 pub(crate) struct TemplateStore {
@@ -258,6 +273,8 @@ mod tests {
                 target: "/workspace".to_string(),
                 mode: MountMode::Ro,
             }],
+            forwards: Vec::new(),
+            vsock: None,
             network: Some(MachineNetwork::None),
             labels: BTreeMap::from([("team".to_string(), "runtime".to_string())]),
         }
@@ -280,6 +297,12 @@ mounts:
   - source: ./workspace
     target: /workspace
     mode: rw
+forwards:
+  - name: web
+    listen: host:tcp:8080
+    connect: guest:tcp:80
+    mode: null
+vsock: true
 network:
   kind: private
 labels:
@@ -291,6 +314,9 @@ labels:
         assert_eq!(template.image, None);
         assert_eq!(template.resources.expect("resources").cpus, Some(2));
         assert_eq!(template.mounts.len(), 1);
+        assert_eq!(template.forwards.len(), 1);
+        assert_eq!(template.forwards[0].name.as_deref(), Some("web"));
+        assert_eq!(template.vsock, Some(true));
     }
 
     #[test]

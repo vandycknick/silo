@@ -44,6 +44,8 @@ struct MachineCreateRequest {
     userdata: Option<String>,
     disks: Vec<PathBuf>,
     mounts: Vec<Mount>,
+    forwards: Vec<forward_spec::Forward>,
+    vsock: Option<vm_spec::Vsock>,
     network: Option<MachineNetworkConfig>,
     network_error: Option<String>,
     guest: MachineGuestConfig,
@@ -140,6 +142,8 @@ impl MachineBuilder {
                 userdata: None,
                 disks: Vec::new(),
                 mounts: Vec::new(),
+                forwards: Vec::new(),
+                vsock: None,
                 network: None,
                 network_error: None,
                 guest: MachineGuestConfig::default(),
@@ -341,6 +345,18 @@ impl MachineBuilder {
         self
     }
 
+    /// Replaces the declared forwards activated on every machine start.
+    pub fn forwards(mut self, forwards: Vec<forward_spec::Forward>) -> Self {
+        self.request.forwards = forwards;
+        self
+    }
+
+    /// Enables or disables the public vsock surface with its default socket name.
+    pub fn vsock(mut self, enabled: bool) -> Self {
+        self.request.vsock = Some(vm_spec::Vsock { enabled, uds: None });
+        self
+    }
+
     /// Configures the durable network attachment.
     pub fn network(
         mut self,
@@ -480,8 +496,15 @@ async fn create_machine_config_with_name(
         }),
         storage: Some(Storage { disks }),
         mounts,
+        vsock: request.vsock,
+        forwards: request.forwards,
         ..VmSpec::current()
     };
+    spec.validate()
+        .map_err(|error| LibVmError::InvalidMachineConfig {
+            reference: name.clone(),
+            reason: error.to_string(),
+        })?;
 
     let network = request.network.unwrap_or_default().into();
     runtime.validate_machine_network_config(&network).await?;
@@ -857,6 +880,8 @@ mod tests {
             userdata: None,
             disks: Vec::new(),
             mounts: Vec::new(),
+            forwards: Vec::new(),
+            vsock: None,
             network: None,
             network_error: None,
             guest: crate::machine::MachineGuestConfig::default(),
@@ -954,6 +979,10 @@ mod tests {
             working_directory: "/workspace".to_string(),
             user: Some("1000:1000".to_string()),
         };
+        let forward = forward_spec::Forward::new(
+            "host:tcp:8080".parse().expect("listen endpoint"),
+            "guest:tcp:80".parse().expect("connect endpoint"),
+        );
 
         let machine = runtime
             .machine()
@@ -961,6 +990,8 @@ mod tests {
             .name("durable-state")
             .retention(MachineRetention::Ephemeral)
             .process(process.clone())
+            .forwards(vec![forward.clone()])
+            .vsock(true)
             .template_name(Some("rust-worker".to_string()))
             .agent_mode(Some(crate::MachineAgent::Disabled))
             .create()
@@ -983,6 +1014,43 @@ mod tests {
         assert_eq!(config.process, process);
         assert_eq!(config.template_name.as_deref(), Some("rust-worker"));
         assert_eq!(config.agent_mode, Some(crate::MachineAgent::Disabled));
+        assert_eq!(config.spec.forwards, vec![forward]);
+        assert!(config.spec.vsock.expect("vsock config").enabled);
+    }
+
+    #[tokio::test]
+    async fn builder_rejects_invalid_forward_sets_before_persisting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let mut store = MockDataStore::new();
+        expect_empty_refresh(&mut store);
+        let runtime = runtime_with_mock_store(paths, store).await;
+        let rootfs = write_base_rootfs(temp.path());
+        let first = forward_spec::Forward::new(
+            "host:tcp:0".parse().expect("listen endpoint"),
+            "guest:tcp:80".parse().expect("connect endpoint"),
+        )
+        .with_name("duplicate");
+        let second = forward_spec::Forward::new(
+            "host:tcp:0".parse().expect("listen endpoint"),
+            "guest:tcp:81".parse().expect("connect endpoint"),
+        )
+        .with_name("duplicate");
+
+        let error = runtime
+            .machine()
+            .image_source(ImageSource::disk(rootfs))
+            .name("invalid-forwards")
+            .forwards(vec![first, second])
+            .create()
+            .await
+            .expect_err("duplicate forward names must fail");
+
+        assert!(matches!(
+            error,
+            LibVmError::InvalidMachineConfig { ref reason, .. }
+                if reason.contains("forward name") && reason.contains("is repeated")
+        ));
     }
 
     #[test]

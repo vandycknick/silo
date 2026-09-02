@@ -33,6 +33,11 @@ impl Machine {
                 reference: config.name.clone(),
             });
         }
+        spec.validate()
+            .map_err(|error| LibVmError::InvalidMachineConfig {
+                reference: config.name.clone(),
+                reason: error.to_string(),
+            })?;
 
         let previous_spec = config.spec.clone();
         config.spec = spec;
@@ -181,6 +186,14 @@ impl Machine {
             }
             spec_changed = true;
         }
+        if let Some(forwards) = update.forwards {
+            config.spec.forwards = forwards;
+            spec_changed = true;
+        }
+        if let Some(vsock) = update.vsock {
+            config.spec.vsock = Some(vsock);
+            spec_changed = true;
+        }
         if let Some(network) = replacement_network {
             config.network = network;
         }
@@ -210,6 +223,13 @@ impl Machine {
 
         config.modified_at = now_unix();
         if spec_changed {
+            config
+                .spec
+                .validate()
+                .map_err(|error| LibVmError::InvalidMachineConfig {
+                    reference: config.name.clone(),
+                    reason: error.to_string(),
+                })?;
             write_machine_config(&config.machine_dir, &config.name, &config.spec)?;
         }
         if let Err(err) = runtime.save_machine_config(&config).await {

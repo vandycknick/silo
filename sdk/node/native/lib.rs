@@ -2116,6 +2116,7 @@ fn to_napi_error(error: LibVmError) -> Error {
         LibVmError::BootAssetInvalid { .. } => "BootAssetInvalid",
         LibVmError::InvalidCreateRequest { .. } => "InvalidCreateRequest",
         LibVmError::InvalidMachineUpdate { .. } => "InvalidMachineUpdate",
+        LibVmError::InvalidMachineConfig { .. } => "InvalidMachineConfig",
         LibVmError::UnsupportedHostArchitecture { .. } => "UnsupportedHostArchitecture",
         LibVmError::CorruptState { .. } => "CorruptState",
         LibVmError::VmSpecSerializeFailed { .. } => "VmSpecSerializeFailed",

@@ -15,7 +15,7 @@ use libvm::{
     ImageSource, LibVmError, Machine, MachineAgent, MachineAgentStatus,
     MachineDirectoryCreateDisposition, MachineExitOutcome, MachineFileUploadOptions,
     MachineForwardErrorDetail, MachineForwardOwner, MachineForwardState, MachineReadinessOutcome,
-    MachineStatus, Runtime, RuntimeConfig,
+    MachineStatus, MachineUpdate, Runtime, RuntimeConfig,
 };
 use test_utils::Scenario;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -273,6 +273,96 @@ async fn declared_inbound_unix_forward_reaches_guest_unix_target_and_cleans_up()
     machine.stop().await.expect("stop machine");
     assert!(!listen.exists(), "owned Unix listener must be removed");
     echo.abort();
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn builder_and_update_persist_declared_forwards_and_vsock_while_stopped() {
+    let env = test_env("builder-forwards", &Scenario::default()).await;
+    let initial = forward_spec::Forward::new(
+        forward_spec::Endpoint::Host(forward_spec::Address::Tcp(
+            "127.0.0.1:0".parse().expect("initial listen"),
+        )),
+        forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+    )
+    .with_name("initial");
+    let machine = env
+        .runtime
+        .machine()
+        .name("integration-builder-forwards")
+        .image_source(ImageSource::Disk(env.disk.clone()))
+        .network(|network| network.none())
+        .forwards(vec![initial.clone()])
+        .vsock(true)
+        .create()
+        .await
+        .expect("create machine with forwards");
+
+    let created = machine.inspect().await.expect("inspect created machine");
+    assert_eq!(created.spec.forwards, vec![initial.clone()]);
+    assert!(created.spec.vsock.expect("created vsock config").enabled);
+    start_ready(&machine).await;
+    let listed = machine.list_forwards().await.expect("list initial forward");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].forward.name.as_deref(), Some("initial"));
+    assert_eq!(listed[0].state, MachineForwardState::Active);
+
+    let replacement = forward_spec::Forward::new(
+        forward_spec::Endpoint::Host(forward_spec::Address::Tcp(
+            "127.0.0.1:0".parse().expect("replacement listen"),
+        )),
+        forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+    )
+    .with_name("replacement");
+    let error = machine
+        .update(MachineUpdate::new().forwards(vec![replacement.clone()]))
+        .await
+        .expect_err("running machine update must fail");
+    assert!(matches!(error, LibVmError::MachineAlreadyRunning { .. }));
+
+    machine.stop().await.expect("stop before update");
+    let duplicate = replacement.clone().with_name("initial");
+    let error = machine
+        .update(MachineUpdate::new().forwards(vec![initial, duplicate]))
+        .await
+        .expect_err("invalid stopped update must fail validation");
+    assert!(matches!(error, LibVmError::InvalidMachineConfig { .. }));
+    assert_eq!(
+        machine
+            .inspect()
+            .await
+            .expect("inspect after rejected update")
+            .spec
+            .forwards[0]
+            .name
+            .as_deref(),
+        Some("initial")
+    );
+    let updated = machine
+        .update(
+            MachineUpdate::new()
+                .forwards(vec![replacement.clone()])
+                .vsock(false),
+        )
+        .await
+        .expect("replace stopped forward config");
+    assert_eq!(updated.spec.forwards, vec![replacement]);
+    assert!(!updated.spec.vsock.expect("updated vsock config").enabled);
+    assert_eq!(
+        machine.vsock_socket().await.expect("disabled vsock path"),
+        None
+    );
+
+    start_ready(&machine).await;
+    let listed = machine
+        .list_forwards()
+        .await
+        .expect("list replacement forward");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].forward.name.as_deref(), Some("replacement"));
+    assert_eq!(listed[0].state, MachineForwardState::Active);
+
+    machine.stop().await.expect("stop machine");
     machine.remove().await.expect("remove machine");
 }
 
@@ -1364,7 +1454,7 @@ async fn vsock_path_accessors_are_store_backed_and_follow_enablement() {
             .replace_config(spec)
             .await
             .expect_err("reserved mux filename must be rejected");
-        assert!(matches!(error, LibVmError::VmSpecSerializeFailed { .. }));
+        assert!(matches!(error, LibVmError::InvalidMachineConfig { .. }));
     }
 
     machine.clone().remove().await.expect("remove machine");

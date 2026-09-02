@@ -593,6 +593,24 @@ mod tests {
     }
 
     #[test]
+    fn run_parses_forward_and_vsock_overrides() {
+        let cli = Cli::try_parse_from([
+            "silo",
+            "run",
+            "--forward",
+            "host:tcp:8080=guest:tcp:80",
+            "--vsock",
+            "disk:rootfs.img",
+        ])
+        .expect("run parses forwarding overrides");
+        let Command::Run(run) = cli.command else {
+            panic!("expected run")
+        };
+        assert_eq!(run.overrides.forwards.len(), 1);
+        assert!(run.overrides.vsock);
+    }
+
+    #[test]
     fn run_keeps_commands_after_the_separator_verbatim() {
         let cli = Cli::try_parse_from([
             "silo",

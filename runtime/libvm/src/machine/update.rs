@@ -46,6 +46,10 @@ pub struct MachineUpdate {
     pub nested_virtualization: Option<bool>,
     /// New Rosetta setting.
     pub rosetta: Option<bool>,
+    /// Replacement declared forwards.
+    pub forwards: Option<Vec<forward_spec::Forward>>,
+    /// Replacement public vsock configuration.
+    pub vsock: Option<vm_spec::Vsock>,
     /// New durable network config.
     pub network: Option<MachineNetworkConfig>,
     pub(crate) network_error: Option<String>,
@@ -99,6 +103,18 @@ impl MachineUpdate {
         self
     }
 
+    /// Replaces all declared forwards.
+    pub fn forwards(mut self, forwards: Vec<forward_spec::Forward>) -> Self {
+        self.forwards = Some(forwards);
+        self
+    }
+
+    /// Enables or disables the public vsock surface with its default socket name.
+    pub fn vsock(mut self, enabled: bool) -> Self {
+        self.vsock = Some(vm_spec::Vsock { enabled, uds: None });
+        self
+    }
+
     /// Replaces durable guest settings.
     pub fn guest(mut self, configure: impl FnOnce(GuestBuilder) -> GuestBuilder) -> Self {
         self.guest = Some(configure(GuestBuilder::new()).build());
@@ -149,10 +165,32 @@ impl MachineUpdate {
             && self.root_disk_size.is_none()
             && self.nested_virtualization.is_none()
             && self.rosetta.is_none()
+            && self.forwards.is_none()
+            && self.vsock.is_none()
             && self.network.is_none()
             && self.network_error.is_none()
             && self.network_policy.is_none()
             && self.guest.is_none()
             && self.user.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::MachineUpdate;
+
+    #[test]
+    fn forward_and_vsock_setters_are_nonempty_replacements() {
+        let forward = forward_spec::Forward::new(
+            "host:tcp:8080".parse().expect("listen endpoint"),
+            "guest:tcp:80".parse().expect("connect endpoint"),
+        );
+        let update = MachineUpdate::new()
+            .forwards(vec![forward.clone()])
+            .vsock(true);
+
+        assert!(!update.is_empty());
+        assert_eq!(update.forwards, Some(vec![forward]));
+        assert!(update.vsock.expect("vsock update").enabled);
     }
 }
