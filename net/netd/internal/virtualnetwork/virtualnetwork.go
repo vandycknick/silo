@@ -7,10 +7,12 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/services/dhcp"
 	"github.com/containers/gvisor-tap-vsock/pkg/services/dns"
@@ -18,7 +20,9 @@ import (
 	"github.com/containers/gvisor-tap-vsock/pkg/tap"
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
 	"github.com/vandycknick/silo/net/netd/internal/config"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/audit"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/packet"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/publication"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
 	"github.com/vandycknick/silo/net/netd/internal/logfile"
 	"golang.org/x/sync/errgroup"
@@ -39,12 +43,19 @@ type Metadata struct {
 	NetworkID string
 }
 
+type PublicationOptions struct {
+	Enabled bool
+	Bind    publication.BindPolicy
+	GuestIP netip.Addr
+	Audit   *audit.Logger
+}
+
 type VirtualNetwork struct {
 	configuration *types.Configuration
 	stack         *stack.Stack
 	networkSwitch *tap.Switch
-	servicesMux   http.Handler
 	services      []networkService
+	publications  *publication.Table
 	ipPool        *tap.IPPool
 	captureFile   *os.File
 	closeOnce     sync.Once
@@ -60,7 +71,7 @@ type networkService struct {
 
 // New takes ownership of captureFile when it succeeds. Callers retain it when
 // construction fails.
-func New(ctx context.Context, networkConfig *config.NetworkConfig, captureFile *os.File, route *router.Router, dispatcher *packet.TCPDispatcher, flows *packet.FlowTracker, metadata Metadata) (*VirtualNetwork, error) {
+func New(ctx context.Context, networkConfig *config.NetworkConfig, captureFile *os.File, route *router.Router, dispatcher *packet.TCPDispatcher, flows *packet.FlowTracker, metadata Metadata, publicationOptions PublicationOptions) (*VirtualNetwork, error) {
 	if networkConfig == nil {
 		return nil, errors.New("network configuration is required")
 	}
@@ -101,13 +112,13 @@ func New(ctx context.Context, networkConfig *config.NetworkConfig, captureFile *
 		return nil, fmt.Errorf("cannot create network stack: %w", err)
 	}
 
-	mux, services, err := addServices(ctx, configuration, stack, ipPool, route, dispatcher, flows, metadata)
+	services, publications, err := addServices(ctx, configuration, stack, ipPool, route, dispatcher, flows, metadata, publicationOptions)
 	if err != nil {
 		stack.Close()
 		return nil, fmt.Errorf("cannot add network services: %w", err)
 	}
 
-	return &VirtualNetwork{configuration: configuration, stack: stack, networkSwitch: networkSwitch, servicesMux: mux, services: services, ipPool: ipPool, captureFile: captureFile}, nil
+	return &VirtualNetwork{configuration: configuration, stack: stack, networkSwitch: networkSwitch, services: services, publications: publications, ipPool: ipPool, captureFile: captureFile}, nil
 }
 
 func upstreamConfiguration(configuration *config.NetworkConfig) *types.Configuration {
@@ -213,7 +224,7 @@ func (n *VirtualNetwork) Close() error {
 	return n.closeErr
 }
 
-func addServices(ctx context.Context, configuration *types.Configuration, s *stack.Stack, ipPool *tap.IPPool, route *router.Router, dispatcher *packet.TCPDispatcher, flows *packet.FlowTracker, metadata Metadata) (http.Handler, []networkService, error) {
+func addServices(ctx context.Context, configuration *types.Configuration, s *stack.Stack, ipPool *tap.IPPool, route *router.Router, dispatcher *packet.TCPDispatcher, flows *packet.FlowTracker, metadata Metadata, publicationOptions PublicationOptions) ([]networkService, *publication.Table, error) {
 	var natLock sync.Mutex
 	translation := parseNATTable(configuration)
 
@@ -224,24 +235,29 @@ func addServices(ctx context.Context, configuration *types.Configuration, s *sta
 	icmpForwarder := upstreamForwarder.ICMP(s, translation, &natLock)
 	s.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpForwarder.HandlePacket)
 
-	dnsMux, dnsServices, err := dnsServer(configuration, s)
+	dnsServices, err := dnsServer(configuration, s)
 	if err != nil {
 		return nil, nil, err
 	}
-	dhcpMux, dhcpService, err := dhcpServer(configuration, s, ipPool)
+	dhcpService, err := dhcpServer(configuration, s, ipPool)
 	if err != nil {
 		return nil, nil, errors.Join(err, closeNetworkServices(dnsServices))
 	}
 	services := append(dnsServices, dhcpService)
-	forwarderMux, err := forwardHostVM(configuration, s)
+	portsForwarder, err := forwardHostVM(configuration, s)
 	if err != nil {
 		return nil, nil, errors.Join(err, closeNetworkServices(services))
 	}
-	mux := http.NewServeMux()
-	mux.Handle("/forwarder/", http.StripPrefix("/forwarder", forwarderMux))
-	mux.Handle("/dhcp/", http.StripPrefix("/dhcp", dhcpMux))
-	mux.Handle("/dns/", http.StripPrefix("/dns", dnsMux))
-	return mux, services, nil
+	if !publicationOptions.Enabled {
+		return services, nil, nil
+	}
+	publicationTable := publication.NewTable(portsForwarder)
+	publicationService, err := publicationServer(configuration, s, publicationTable, publicationOptions)
+	if err != nil {
+		return nil, nil, errors.Join(err, publicationTable.Close(), closeNetworkServices(services))
+	}
+	services = append(services, publicationService)
+	return services, publicationTable, nil
 }
 
 func closeNetworkServices(services []networkService) error {
@@ -262,38 +278,38 @@ func parseNATTable(configuration *types.Configuration) map[tcpip.Address]tcpip.A
 	return translation
 }
 
-func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler, []networkService, error) {
+func dnsServer(configuration *types.Configuration, s *stack.Stack) ([]networkService, error) {
 	udpConn, err := gonet.DialUDP(s, &tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4Slice(net.ParseIP(configuration.GatewayIP).To4()), Port: uint16(53)}, nil, ipv4.ProtocolNumber)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	tcpLn, err := gonet.ListenTCP(s, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4Slice(net.ParseIP(configuration.GatewayIP).To4()), Port: uint16(53)}, ipv4.ProtocolNumber)
 	if err != nil {
 		_ = udpConn.Close()
-		return nil, nil, err
+		return nil, err
 	}
 	server, err := dns.New(udpConn, tcpLn, configuration.DNS)
 	if err != nil {
 		_ = udpConn.Close()
 		_ = tcpLn.Close()
-		return nil, nil, err
+		return nil, err
 	}
 	services := []networkService{
 		{name: "dns udp server", serve: server.Serve, close: udpConn.Close},
 		{name: "dns tcp server", serve: server.ServeTCP, close: tcpLn.Close},
 	}
-	return server.Mux(), services, nil
+	return services, nil
 }
 
-func dhcpServer(configuration *types.Configuration, s *stack.Stack, ipPool *tap.IPPool) (http.Handler, networkService, error) {
+func dhcpServer(configuration *types.Configuration, s *stack.Stack, ipPool *tap.IPPool) (networkService, error) {
 	server, err := dhcp.New(configuration, s, ipPool)
 	if err != nil {
-		return nil, networkService{}, err
+		return networkService{}, err
 	}
-	return server.Mux(), networkService{name: "dhcp server", serve: server.Serve, close: server.Underlying.Close}, nil
+	return networkService{name: "dhcp server", serve: server.Serve, close: server.Underlying.Close}, nil
 }
 
-func forwardHostVM(configuration *types.Configuration, s *stack.Stack) (http.Handler, error) {
+func forwardHostVM(configuration *types.Configuration, s *stack.Stack) (*upstreamForwarder.PortsForwarder, error) {
 	fw := upstreamForwarder.NewPortsForwarder(s)
 	for local, remote := range configuration.Forwards {
 		if strings.HasPrefix(local, "udp:") {
@@ -304,7 +320,41 @@ func forwardHostVM(configuration *types.Configuration, s *stack.Stack) (http.Han
 			return nil, err
 		}
 	}
-	return fw.Mux(), nil
+	return fw, nil
+}
+
+func publicationServer(configuration *types.Configuration, s *stack.Stack, table *publication.Table, options PublicationOptions) (networkService, error) {
+	gatewayIP := net.ParseIP(configuration.GatewayIP).To4()
+	if gatewayIP == nil {
+		return networkService{}, fmt.Errorf("invalid publication gateway IPv4 address %q", configuration.GatewayIP)
+	}
+	listener, err := gonet.ListenTCP(s, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4Slice(gatewayIP), Port: 80}, ipv4.ProtocolNumber)
+	if err != nil {
+		return networkService{}, err
+	}
+	server := &http.Server{
+		Handler:           publication.Handler(table, publication.Policy{Bind: options.Bind, GuestIP: options.GuestIP}, options.Audit),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	return networkService{
+		name: "publication endpoint",
+		serve: func() error {
+			err := server.Serve(listener)
+			if errors.Is(err, http.ErrServerClosed) {
+				return nil
+			}
+			return err
+		},
+		close: func() error {
+			serverErr := server.Close()
+			entries := table.All()
+			tableErr := table.Close()
+			for _, entry := range entries {
+				options.Audit.RecordPublication("released", entry.Scope.AuditName(), entry.Local, entry.Remote, "allow", "")
+			}
+			return errors.Join(serverErr, tableErr)
+		},
+	}, nil
 }
 
 func createStack(configuration *types.Configuration, endpoint stack.LinkEndpoint) (*stack.Stack, error) {

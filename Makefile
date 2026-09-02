@@ -122,7 +122,7 @@ test: ## Run unit and integration tests for all host-supported workspace compone
 test-unit: ## Run unit tests for all host-supported workspace components.
 	$(XTASK) test-unit
 
-test-integration: ## Run Cargo integration tests for all host-supported workspace components.
+test-integration: ## Run integration tests for all host-supported workspace components.
 	$(XTASK) test-integration
 
 version-check: ## Verify product versions match the version authority.

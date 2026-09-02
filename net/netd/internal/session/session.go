@@ -4,7 +4,9 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/vandycknick/silo/net/netd/internal/gateway/audit"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/forwarder"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/packet"
+	"github.com/vandycknick/silo/net/netd/internal/gateway/publication"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
 	"github.com/vandycknick/silo/net/netd/internal/logfile"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
@@ -21,14 +24,15 @@ import (
 )
 
 type Spec struct {
-	VMID        string
-	RunID       string
-	NetworkID   string
-	CaptureFile *os.File
-	Stack       config.NetworkConfig
-	Policy      *policy.Policy
-	CACert      string
-	CAKey       string
+	VMID         string
+	RunID        string
+	NetworkID    string
+	CaptureFile  *os.File
+	Stack        config.NetworkConfig
+	Policy       *policy.Policy
+	CACert       string
+	CAKey        string
+	GuestPublish config.PublishBind
 }
 
 type Shared struct {
@@ -67,6 +71,11 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 	}
 	lifetimeCtx, cancel := context.WithCancel(context.Background())
 	flows := packet.NewFlowTracker()
+	publicationOptions, err := publicationOptions(spec, shared.Audit)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	route := router.New(spec.Policy, shared.Audit)
 	credentialManager, err := credentials.NewManagerFromEnvironment()
 	if err != nil {
@@ -120,6 +129,7 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 		dispatcher,
 		flows,
 		virtualnetwork.Metadata{VMID: spec.VMID, RunID: spec.RunID, NetworkID: spec.NetworkID},
+		publicationOptions,
 	)
 	if err != nil {
 		cancel()
@@ -132,6 +142,25 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 		flows:   flows,
 		network: network,
 		runDone: make(chan struct{}),
+	}, nil
+}
+
+func publicationOptions(spec Spec, auditLog *audit.Logger) (virtualnetwork.PublicationOptions, error) {
+	if spec.GuestPublish == "" {
+		return virtualnetwork.PublicationOptions{}, nil
+	}
+	if spec.GuestPublish != config.PublishBindLoopback && spec.GuestPublish != config.PublishBindAny {
+		return virtualnetwork.PublicationOptions{}, fmt.Errorf("invalid guest publication bind %q", spec.GuestPublish)
+	}
+	guestIP, err := netip.ParseAddr(spec.Stack.DeviceIP)
+	if err != nil || !guestIP.Is4() {
+		return virtualnetwork.PublicationOptions{}, fmt.Errorf("invalid guest publication IPv4 address %q", spec.Stack.DeviceIP)
+	}
+	return virtualnetwork.PublicationOptions{
+		Enabled: true,
+		Bind:    publication.BindPolicy(spec.GuestPublish),
+		GuestIP: guestIP,
+		Audit:   auditLog,
 	}, nil
 }
 
