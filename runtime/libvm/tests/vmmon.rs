@@ -7,6 +7,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
@@ -17,6 +18,7 @@ use libvm::{
     MachineForwardErrorDetail, MachineForwardOwner, MachineForwardState, MachineReadinessOutcome,
     MachineStatus, MachineUpdate, Runtime, RuntimeConfig,
 };
+use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
 use test_utils::Scenario;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -58,6 +60,47 @@ struct TestEnv {
     _run_root: tempfile::TempDir,
     runtime: Runtime,
     disk: PathBuf,
+    machines: Mutex<Vec<Machine>>,
+}
+
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        let machines = std::mem::take(
+            self.machines
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        if machines.is_empty() {
+            return;
+        }
+        let cleanup = std::thread::Builder::new()
+            .name("vmmon-test-cleanup".to_string())
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                runtime.block_on(async move {
+                    for machine in machines {
+                        let stopped = tokio::time::timeout(Duration::from_secs(5), machine.stop())
+                            .await
+                            .is_ok_and(|result| result.is_ok());
+                        if !stopped {
+                            let _ =
+                                tokio::time::timeout(Duration::from_secs(5), machine.kill()).await;
+                        }
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), machine.clone().remove())
+                                .await;
+                    }
+                });
+            });
+        if let Ok(cleanup) = cleanup {
+            let _ = cleanup.join();
+        }
+    }
 }
 
 async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
@@ -96,18 +139,25 @@ async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
         _run_root: run_root,
         runtime,
         disk,
+        machines: Mutex::new(Vec::new()),
     }
 }
 
 async fn create_machine(env: &TestEnv, name: &str) -> Machine {
-    env.runtime
+    let machine = env
+        .runtime
         .machine()
         .name(name)
         .image_source(ImageSource::Disk(env.disk.clone()))
         .network(|network| network.none())
         .create()
         .await
-        .expect("create machine")
+        .expect("create machine");
+    env.machines
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(machine.clone());
+    machine
 }
 
 async fn set_forwards(machine: &Machine, forwards: Vec<forward_spec::Forward>) {
@@ -231,6 +281,30 @@ where
         Ok(Err(error)) => panic!("unexpected forward close error: {error}"),
         Err(_) => panic!("forward did not close within deadline"),
     }
+}
+
+#[tokio::test]
+async fn dropping_test_environment_stops_a_running_monitor() {
+    let env = test_env("drop-cleanup", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-drop-cleanup").await;
+    start_ready(&machine).await;
+    let pid_path = env
+        ._run_root
+        .path()
+        .join("machines")
+        .join(machine.id())
+        .join("vm.pid");
+    let pid = std::fs::read_to_string(pid_path)
+        .expect("read vmmon pid")
+        .trim()
+        .parse::<i32>()
+        .expect("parse vmmon pid");
+    assert!(kill(Pid::from_raw(pid), None).is_ok());
+
+    drop(machine);
+    drop(env);
+
+    assert_eq!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
 }
 
 #[tokio::test]
