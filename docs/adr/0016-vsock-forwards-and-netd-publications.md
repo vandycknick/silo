@@ -391,7 +391,9 @@ sequenceDiagram
 
 Podman in the same VM needs no `silo-portd`: it posts to
 `gateway.containers.internal/services/forwarder/expose` natively, and its
-publications live as long as the guest attachment.
+publications live as long as the guest attachment. The image must carry
+Podman Machine's `/etc/podman-machine` marker so an unmodified Podman enables
+its gvproxy publication path.
 
 ## The Forward Model
 
@@ -792,7 +794,7 @@ library:
 ```sh
 # host: two preambles, then bytes
 printf 'CONNECT 1028\nCONNECT tcp:127.0.0.1:80\nGET / HTTP/1.0\r\n\r\n' \
-  | socat - UNIX-CONNECT:/run/user/1000/silo/machines/<id>/vsock.sock
+  | socat STDIO,ignoreeof UNIX-CONNECT:/run/user/1000/silo/machines/<id>/vsock.sock
 ```
 
 ### Capability Discovery
@@ -1008,6 +1010,8 @@ implements dockerd's userland-proxy contract exactly:
   performs the `0\n` status handshake and keeps the port reachable on guest
   loopback. `silo-portd` forwards `SIGINT` and `SIGTERM` to the child, waits
   for it, closes the session connection, and exits with the child's status.
+  Linux parent-death signaling also terminates the child if `silo-portd` is
+  killed before it can forward a stop signal.
 - On a failed publication it writes `1\n<message>` to descriptor 3 and exits
   non-zero without starting a proxy, so `docker run` fails with netd's
   message.
@@ -1229,8 +1233,8 @@ sees it at an address an unmodified client already expects.
 - Outbound forwards need the agent to be ready. A guest client that connects
   before the agent binds sees a refused connection, which is the same as any
   service that has not started yet.
-- Publications are TCP only and IPv4 only, and do not reach guest
-  loopback-only services.
+- Publications are TCP only and dial the guest over IPv4. Host listeners may
+  be IPv4 or IPv6, and do not reach guest loopback-only services.
 - Port 1028 joins 1027 as a reserved port in both namespaces, one more name
   users cannot publish.
 
@@ -1311,7 +1315,8 @@ host bind. The section stays rejected; see the non-decisions below.
 
 ## Accepted Limitations
 
-- Publications carry TCP over IPv4 only. `-p 53:53/udp` fails with a message
+- Publications carry TCP to the guest over IPv4. IPv4 and IPv6 host listeners
+  are supported. `-p 53:53/udp` fails with a message
   naming the protocol.
 - Publications reach only addresses on the guest's interface. Guest loopback
   services need a forward.
