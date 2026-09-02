@@ -6,11 +6,13 @@ use hyper_util::rt::TokioIo;
 use protocol::v1::guest_filesystem_service_client::GuestFilesystemServiceClient;
 use protocol::v1::vm_access_service_client::VmAccessServiceClient;
 use protocol::v1::vm_execution_service_client::VmExecutionServiceClient;
+use protocol::v1::vm_forward_service_client::VmForwardServiceClient;
 use protocol::v1::vm_monitor_service_client::VmMonitorServiceClient;
 use protocol::v1::{
     CreateDirectoryRequest, DownloadFileRequest, ExecuteInput, ExecutionEvent, GetEntryRequest,
-    GetMetricsRequest, GetStatusRequest, HostMetrics, HostStatus, ListDirectoryRequest,
-    RemoveEntryRequest, UploadFileRequest, WaitReadyRequest, WaitReadyResponse,
+    GetMetricsRequest, GetStatusRequest, HoldForwardRequest, HostMetrics, HostStatus,
+    ListDirectoryRequest, ListForwardsRequest, RemoveEntryRequest, UploadFileRequest,
+    WaitReadyRequest, WaitReadyResponse,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -26,6 +28,16 @@ pub(crate) enum VmmonClientError {
     Connection(String),
     #[error("{0}")]
     Protocol(String),
+    #[error("forward RPC failed: {0}")]
+    Forward(ForwardClientError),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{grpc_code}: {reason}")]
+pub(crate) struct ForwardClientError {
+    pub(crate) grpc_code: tonic::Code,
+    pub(crate) detail: Option<i32>,
+    pub(crate) reason: String,
 }
 
 impl From<String> for VmmonClientError {
@@ -38,6 +50,7 @@ pub const DEFAULT_GUEST_READINESS_TIMEOUT: Duration = Duration::from_secs(60 * 5
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_RPC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const ACCESS_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+const FORWARD_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_READY_MARGIN: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -206,6 +219,34 @@ impl VmmonClient {
             .map_err(|error| rpc_error("execute RPC failed", error))
     }
 
+    pub(crate) async fn hold_forward(
+        &self,
+        forward: forward_spec::Forward,
+    ) -> Result<tonic::Streaming<protocol::v1::ForwardStatus>, VmmonClientError> {
+        let mut client = forward_client(self.channel().await?);
+        let request = Request::new(HoldForwardRequest {
+            forward: Some(encode_forward(forward)),
+        });
+        tokio::time::timeout(FORWARD_SETUP_TIMEOUT, client.hold(request))
+            .await
+            .map_err(|_| {
+                VmmonClientError::Protocol("forward Hold RPC setup timed out".to_string())
+            })?
+            .map(|response| response.into_inner())
+            .map_err(|status| VmmonClientError::Forward(forward_rpc_error(status)))
+    }
+
+    pub(crate) async fn list_forwards(
+        &self,
+    ) -> Result<Vec<protocol::v1::ForwardStatus>, VmmonClientError> {
+        let mut client = forward_client(self.channel().await?);
+        client
+            .list(timed_request(ListForwardsRequest {}, RPC_TIMEOUT))
+            .await
+            .map(|response| response.into_inner().forwards)
+            .map_err(|status| VmmonClientError::Forward(forward_rpc_error(status)))
+    }
+
     async fn channel(&self) -> Result<Channel, VmmonClientError> {
         let socket_path = self.socket_path.clone();
         let connector = service_fn(move |_| {
@@ -260,6 +301,32 @@ fn execution_client(channel: Channel) -> VmExecutionServiceClient<Channel> {
         .max_encoding_message_size(protocol::STRUCTURED_16_MIB)
 }
 
+fn forward_client(channel: Channel) -> VmForwardServiceClient<Channel> {
+    VmForwardServiceClient::new(channel)
+        .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
+        .max_encoding_message_size(protocol::STRUCTURED_16_MIB)
+}
+
+fn encode_forward(value: forward_spec::Forward) -> protocol::v1::Forward {
+    protocol::v1::Forward {
+        name: value.name,
+        listen: value.listen.to_string(),
+        connect: value.connect.to_string(),
+        unix_mode: value.mode.map(forward_spec::UnixMode::get),
+    }
+}
+
+pub(crate) fn forward_rpc_error(status: Status) -> ForwardClientError {
+    let detail = protocol::decode_error_detail(status.details())
+        .ok()
+        .and_then(|detail| detail.code);
+    ForwardClientError {
+        grpc_code: status.code(),
+        detail,
+        reason: status.message().to_string(),
+    }
+}
+
 fn timed_request<T>(message: T, timeout: Duration) -> Request<T> {
     let mut request = Request::new(message);
     request.set_timeout(timeout);
@@ -312,6 +379,9 @@ mod tests {
             }
             VmmonClientError::Protocol(message) => {
                 panic!("missing socket was misclassified as a protocol error: {message}")
+            }
+            VmmonClientError::Forward(error) => {
+                panic!("missing socket was misclassified as a forward error: {error}")
             }
         }
     }

@@ -28,7 +28,10 @@ impl Machine {
         let Some(filename) = vm_spec::effective_vsock_filename(config.spec.vsock.as_ref()) else {
             return Ok(None);
         };
-        if port == protocol::DEFAULT_GUEST_CONTROL_PORT {
+        if matches!(
+            port,
+            protocol::DEFAULT_GUEST_CONTROL_PORT | protocol::FORWARD_VSOCK_PORT
+        ) {
             return Ok(None);
         }
         runtime.local_paths().ensure_machine_run_dir(config.id)?;

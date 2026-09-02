@@ -241,10 +241,7 @@ pub async fn init(
     forwards.register_outbound(&machine).await?;
     machine.start().await?;
     let vsock_surface = match prepared_vsock {
-        Some(prepared) => match prepared
-            .activate(machine.clone(), forwards.registered_ports().clone())
-            .await
-        {
+        Some(prepared) => match prepared.activate(machine.clone(), forwards.clone()).await {
             Ok(surface) => Some(surface),
             Err(error) => {
                 if let Err(stop_error) = machine.stop().await {

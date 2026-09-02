@@ -792,6 +792,10 @@ fn monitor_error(reference: String, error: impl Into<VmmonClientError>) -> LibVm
             LibVmError::MonitorConnection { reference, message }
         }
         VmmonClientError::Protocol(message) => LibVmError::MonitorProtocol { reference, message },
+        VmmonClientError::Forward(error) => LibVmError::MonitorProtocol {
+            reference,
+            message: error.to_string(),
+        },
     }
 }
 fn request_error(message: impl Into<String>) -> LibVmError {

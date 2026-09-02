@@ -19,9 +19,6 @@ pub(crate) async fn supervise(
     forwards: Arc<ForwardTable>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    if !forwards.has_agent_forwards() {
-        return;
-    }
     let mut identities = store.subscribe_ready_agent_identity();
     let mut checked_identity = None;
     loop {
@@ -181,7 +178,15 @@ pub(crate) async fn supervise_listener(machine: VirtualMachine, entry: Arc<Forwa
                 break;
             }
             if let Err(error) = result {
-                entry.set_state(ForwardState::Pending, Some(error.to_string()));
+                if entry.status.borrow().error.is_none() {
+                    entry.set_state(
+                        ForwardState::Pending,
+                        Some(protocol::v1::ErrorDetail {
+                            code: Some(protocol::v1::ErrorCode::BackendUnavailable as i32),
+                            retry_after: None,
+                        }),
+                    );
+                }
                 tracing::debug!(forward = %entry.name, %error, "guest forward listener ended; retrying");
             }
             let delay = backoff.next_delay();
@@ -244,6 +249,10 @@ async fn listen_once(
             });
         }
         Some(Event::Failed(failed)) => {
+            entry.status.send_modify(|snapshot| {
+                snapshot.state = ForwardState::Pending;
+                snapshot.error = failed.error;
+            });
             let detail = failed.error.map_or_else(
                 || "listener failed without detail".to_string(),
                 |error| format!("listener failed with code {:?}", error.code),

@@ -1,5 +1,6 @@
 mod builder;
 mod config;
+mod forward;
 mod guest;
 mod handle;
 mod inspect;
@@ -19,6 +20,10 @@ mod update;
 mod vsock;
 
 pub use builder::MachineBuilder;
+pub use forward::{
+    MachineForwardErrorDetail, MachineForwardHold, MachineForwardOwner, MachineForwardState,
+    MachineForwardStatus,
+};
 pub use guest::{GuestBuilder, MachineAgent, MachineGuestConfig, MachineUserConfig};
 pub use handle::Machine;
 pub use inspect::{

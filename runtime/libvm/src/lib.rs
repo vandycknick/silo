@@ -56,9 +56,10 @@ pub use crate::machine::{
     MachineByteStream, MachineCpuMetrics, MachineData, MachineDirectoryCreateDisposition,
     MachineDirectoryPage, MachineEnabledAgent, MachineEntryKind, MachineExit, MachineExitOutcome,
     MachineFileDownload, MachineFileEntry, MachineFileUploadOptions, MachineFilesystemMetrics,
-    MachineFreshness, MachineGuestBootMode, MachineGuestBootReport, MachineGuestConfig,
-    MachineKillOptions, MachineLoadAverageMetrics, MachineLogChunk, MachineLogOptions,
-    MachineLogOutput, MachineLogSource, MachineLogStream, MachineMemoryMetrics,
+    MachineForwardErrorDetail, MachineForwardHold, MachineForwardOwner, MachineForwardState,
+    MachineForwardStatus, MachineFreshness, MachineGuestBootMode, MachineGuestBootReport,
+    MachineGuestConfig, MachineKillOptions, MachineLoadAverageMetrics, MachineLogChunk,
+    MachineLogOptions, MachineLogOutput, MachineLogSource, MachineLogStream, MachineMemoryMetrics,
     MachineMetricSnapshot, MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus,
     MachineNetworkInterfaceMetrics, MachineProvisionFailurePolicy, MachineProvisionOverallStatus,
     MachineProvisionReport, MachineProvisionStatus, MachineProvisionStepReport,
@@ -79,6 +80,10 @@ pub use crate::runtime::{
     RuntimeNetworkingConfig,
 };
 pub use crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT;
+pub use forward_spec::{
+    Address as ForwardAddress, Direction as ForwardDirection, Endpoint as ForwardEndpoint, Forward,
+    UnixMode,
+};
 pub use silo_policy::{
     NetworkAuditBuilder, NetworkCredential, NetworkCredentialBuilder, NetworkEndpointBuilder,
     NetworkForwardBuilder, NetworkPolicy, NetworkPolicyBuildError, NetworkPolicyBuilder,

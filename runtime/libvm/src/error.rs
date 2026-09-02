@@ -112,6 +112,14 @@ pub enum LibVmError {
     #[error("monitor protocol for {reference} failed: {message}")]
     MonitorProtocol { reference: String, message: String },
 
+    #[error("forward request for {reference} was rejected ({grpc_code:?}, {detail:?}): {reason}")]
+    ForwardRejected {
+        reference: String,
+        grpc_code: tonic::Code,
+        detail: Option<crate::MachineForwardErrorDetail>,
+        reason: String,
+    },
+
     #[error("guest session for {reference} failed: {message}")]
     GuestSession { reference: String, message: String },
 
@@ -245,6 +253,7 @@ impl LibVmError {
             Self::MachineLogSourceUnavailable { .. } => "MachineLogSourceUnavailable",
             Self::MonitorConnection { .. } => "MonitorConnection",
             Self::MonitorProtocol { .. } => "MonitorProtocol",
+            Self::ForwardRejected { .. } => "ForwardRejected",
             Self::GuestSession { .. } => "GuestSession",
             Self::MachinePreparationFailed { .. } => "MachinePreparationFailed",
             Self::MachineStartCleanupFailed { .. } => "MachineStartCleanupFailed",

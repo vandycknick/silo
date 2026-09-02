@@ -2,22 +2,30 @@ mod agent;
 mod host_socket;
 mod inbound;
 mod outbound;
+pub(crate) mod service;
 
-use std::collections::BTreeSet;
-use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use forward_spec::{Address, Forward, ForwardShape, GuestHalf, Token};
 use rand::RngExt;
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::forward::host_socket::OwnedHostListener;
 use crate::virt::VirtualMachine;
 
-const MAX_DECLARED_FORWARDS: usize = 128;
+const MAX_FORWARDS: usize = 128;
+const MAX_HELD_FORWARDS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardOwner {
+    Declared,
+    Held,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForwardState {
@@ -33,7 +41,7 @@ pub(crate) struct ForwardStatusSnapshot {
     pub(crate) bound: Option<forward_spec::Endpoint>,
     pub(crate) active_connections: u32,
     pub(crate) refused_connections: u32,
-    pub(crate) error: Option<String>,
+    pub(crate) error: Option<protocol::v1::ErrorDetail>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +52,8 @@ pub(crate) enum GuestHalfAvailability {
 }
 
 pub(crate) struct ForwardEntry {
+    id: u64,
+    pub(crate) owner: ForwardOwner,
     pub(crate) spec: Forward,
     pub(crate) name: String,
     pub(crate) shape: ForwardShape,
@@ -52,20 +62,51 @@ pub(crate) struct ForwardEntry {
     pub(crate) token: Option<Token>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) availability: watch::Sender<GuestHalfAvailability>,
-    status: watch::Sender<ForwardStatusSnapshot>,
+    pub(crate) status: watch::Sender<ForwardStatusSnapshot>,
     active: AtomicU32,
     refused: AtomicU32,
     listener: Mutex<Option<OwnedHostListener>>,
     vsock_listener: Mutex<Option<crate::virt::VsockListener>>,
+    total_permit: Mutex<Option<OwnedSemaphorePermit>>,
+    held_permit: Mutex<Option<OwnedSemaphorePermit>>,
+}
+
+struct RetainedRawPort {
+    target: Arc<RwLock<Option<Arc<ForwardEntry>>>>,
 }
 
 pub(crate) struct ForwardTable {
-    entries: Vec<Arc<ForwardEntry>>,
-    shutdown: CancellationToken,
+    entries: Mutex<Vec<Arc<ForwardEntry>>>,
+    operation: tokio::sync::Mutex<()>,
+    runtime_dir: PathBuf,
+    mux_filename: Option<String>,
+    machine: std::sync::OnceLock<VirtualMachine>,
+    running: AtomicBool,
+    next_id: AtomicU64,
+    total_capacity: Arc<Semaphore>,
+    held_capacity: Arc<Semaphore>,
+    availability: watch::Sender<GuestHalfAvailability>,
+    pub(crate) shutdown: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    return_registered: AtomicBool,
     return_listener: Mutex<Option<crate::virt::VsockListener>>,
-    registered_ports: BTreeSet<u32>,
+    raw_ports: Mutex<BTreeMap<u32, Arc<RetainedRawPort>>>,
+    registered_ports: Mutex<BTreeSet<u32>>,
     invalid_warning: Mutex<Option<std::time::Instant>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum HoldError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    AddressInUse(String),
+    #[error("{0}")]
+    Limit(String),
+    #[error("{0}")]
+    NotRunning(String),
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 impl ForwardTable {
@@ -76,108 +117,136 @@ impl ForwardTable {
     ) -> eyre::Result<Arc<Self>> {
         forward_spec::validate_forwards(forwards, mux_filename)
             .map_err(|error| eyre::eyre!("validate declared forwards: {error}"))?;
-        if forwards.len() > MAX_DECLARED_FORWARDS {
+        if forwards.len() > MAX_FORWARDS {
             return Err(eyre::eyre!(
-                "declared forwards exceed the limit of {MAX_DECLARED_FORWARDS}"
+                "declared forwards exceed the limit of {MAX_FORWARDS}"
             ));
         }
         let shutdown = CancellationToken::new();
-        let mut entries = Vec::with_capacity(forwards.len());
-        for spec in forwards {
-            let shape = spec.validate()?;
-            let name = spec.display_name();
-            let guest_half = spec.guest_half()?;
-            let host_target = resolve_host_target(spec, runtime_dir)?;
-            let token = if shape == ForwardShape::OutboundAgent {
-                let mut bytes = [0_u8; 16];
-                rand::rng().fill(&mut bytes);
-                Some(Token::new(bytes))
-            } else {
-                None
-            };
-            let listener = match shape {
-                ForwardShape::InboundAgent | ForwardShape::InboundVsock => {
-                    let address = match &spec.listen {
-                        forward_spec::Endpoint::Host(address) => address,
-                        _ => {
-                            return Err(eyre::eyre!(
-                                "validated inbound forward has no host listener"
-                            ))
-                        }
-                    };
-                    Some(
-                        OwnedHostListener::bind(address, spec.mode, runtime_dir)
-                            .await
-                            .map_err(|error| {
-                                eyre::eyre!("prepare forward {name} at {}: {error}", spec.listen)
-                            })?,
-                    )
-                }
-                ForwardShape::OutboundAgent | ForwardShape::OutboundVsock => {
-                    tracing::info!(forward = %name, "declared outbound forward remains pending until outbound support is enabled");
-                    None
-                }
-            };
-            let bound = listener.as_ref().map(OwnedHostListener::bound_endpoint);
-            let initial_availability = match guest_half {
-                GuestHalf::Vsock(_) if listener.is_some() => GuestHalfAvailability::Available(None),
-                _ => GuestHalfAvailability::Unknown,
-            };
-            let initial_state =
-                if matches!(initial_availability, GuestHalfAvailability::Available(_)) {
-                    ForwardState::Active
-                } else {
-                    ForwardState::Pending
-                };
-            let (availability, _) = watch::channel(initial_availability);
-            let (status, _) = watch::channel(ForwardStatusSnapshot {
-                state: initial_state,
-                bound,
-                active_connections: 0,
-                refused_connections: 0,
-                error: None,
-            });
-            entries.push(Arc::new(ForwardEntry {
-                spec: spec.clone(),
-                name,
-                shape,
-                guest_half,
-                host_target,
-                token,
-                shutdown: shutdown.child_token(),
-                availability,
-                status,
-                active: AtomicU32::new(0),
-                refused: AtomicU32::new(0),
-                listener: Mutex::new(listener),
-                vsock_listener: Mutex::new(None),
-            }));
-        }
-        let mut registered_ports: BTreeSet<_> = entries
-            .iter()
-            .filter_map(|entry| match entry.spec.listen {
-                forward_spec::Endpoint::Vsock(port) => Some(port),
-                _ => None,
-            })
-            .collect();
-        if entries
-            .iter()
-            .any(|entry| entry.shape == ForwardShape::OutboundAgent)
-        {
-            registered_ports.insert(forward_spec::FORWARD_VSOCK_PORT);
-        }
-        Ok(Arc::new(Self {
-            entries,
+        let (availability, _) = watch::channel(GuestHalfAvailability::Unknown);
+        let table = Arc::new(Self {
+            entries: Mutex::new(Vec::with_capacity(forwards.len())),
+            operation: tokio::sync::Mutex::new(()),
+            runtime_dir: runtime_dir.to_path_buf(),
+            mux_filename: mux_filename.map(str::to_owned),
+            machine: std::sync::OnceLock::new(),
+            running: AtomicBool::new(false),
+            next_id: AtomicU64::new(1),
+            total_capacity: Arc::new(Semaphore::new(MAX_FORWARDS - forwards.len())),
+            held_capacity: Arc::new(Semaphore::new(MAX_HELD_FORWARDS)),
+            availability,
             shutdown,
             tasks: Mutex::new(Vec::new()),
+            return_registered: AtomicBool::new(false),
             return_listener: Mutex::new(None),
-            registered_ports,
+            raw_ports: Mutex::new(BTreeMap::new()),
+            registered_ports: Mutex::new(BTreeSet::new()),
             invalid_warning: Mutex::new(None),
+        });
+        for spec in forwards {
+            let entry = table
+                .build_entry(spec.clone(), ForwardOwner::Declared, None, None)
+                .await
+                .map_err(|error| eyre::eyre!(error.to_string()))?;
+            table
+                .entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(entry);
+        }
+        Ok(table)
+    }
+
+    async fn build_entry(
+        &self,
+        spec: Forward,
+        owner: ForwardOwner,
+        total_permit: Option<OwnedSemaphorePermit>,
+        held_permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<Arc<ForwardEntry>, HoldError> {
+        let shape = spec
+            .validate()
+            .map_err(|error| HoldError::Invalid(error.to_string()))?;
+        let name = spec.display_name();
+        let guest_half = spec
+            .guest_half()
+            .map_err(|error| HoldError::Invalid(error.to_string()))?;
+        let host_target = resolve_host_target(&spec, &self.runtime_dir)
+            .map_err(|error| HoldError::Invalid(error.to_string()))?;
+        let token = if shape == ForwardShape::OutboundAgent {
+            let mut bytes = [0_u8; 16];
+            rand::rng().fill(&mut bytes);
+            Some(Token::new(bytes))
+        } else {
+            None
+        };
+        let listener = match shape {
+            ForwardShape::InboundAgent | ForwardShape::InboundVsock => {
+                let forward_spec::Endpoint::Host(address) = &spec.listen else {
+                    return Err(HoldError::Invalid(
+                        "validated inbound forward has no host listener".to_string(),
+                    ));
+                };
+                Some(
+                    OwnedHostListener::bind(address, spec.mode, &self.runtime_dir)
+                        .await
+                        .map_err(|error| bind_error(&name, &spec.listen, error))?,
+                )
+            }
+            ForwardShape::OutboundAgent | ForwardShape::OutboundVsock => None,
+        };
+        let bound = listener.as_ref().map(OwnedHostListener::bound_endpoint);
+        let initial_availability = match guest_half {
+            GuestHalf::Vsock(_) if listener.is_some() => GuestHalfAvailability::Available(None),
+            GuestHalf::Vsock(_) => GuestHalfAvailability::Unknown,
+            GuestHalf::Agent(_) => self.availability.borrow().clone(),
+        };
+        let initial_state = match initial_availability {
+            GuestHalfAvailability::Available(_) if shape == ForwardShape::InboundAgent => {
+                ForwardState::Active
+            }
+            GuestHalfAvailability::Available(_) if shape == ForwardShape::InboundVsock => {
+                ForwardState::Active
+            }
+            GuestHalfAvailability::Unsupported => ForwardState::Unsupported,
+            _ => ForwardState::Pending,
+        };
+        let (entry_availability, _) = watch::channel(initial_availability);
+        let (status, _) = watch::channel(ForwardStatusSnapshot {
+            state: initial_state,
+            bound,
+            active_connections: 0,
+            refused_connections: 0,
+            error: (initial_state == ForwardState::Unsupported).then(unsupported_detail),
+        });
+        Ok(Arc::new(ForwardEntry {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            owner,
+            spec,
+            name,
+            shape,
+            guest_half,
+            host_target,
+            token,
+            shutdown: self.shutdown.child_token(),
+            availability: entry_availability,
+            status,
+            active: AtomicU32::new(0),
+            refused: AtomicU32::new(0),
+            listener: Mutex::new(listener),
+            vsock_listener: Mutex::new(None),
+            total_permit: Mutex::new(total_permit),
+            held_permit: Mutex::new(held_permit),
         }))
     }
 
-    pub(crate) async fn register_outbound(&self, machine: &VirtualMachine) -> eyre::Result<()> {
-        for entry in &self.entries {
+    pub(crate) async fn register_outbound(
+        self: &Arc<Self>,
+        machine: &VirtualMachine,
+    ) -> eyre::Result<()> {
+        let _operation = self.operation.lock().await;
+        let entries = self.entries();
+        for entry in entries {
             if let forward_spec::Endpoint::Vsock(port) = entry.spec.listen {
                 let listener = machine.listen_public_vsock(port).await.map_err(|error| {
                     eyre::eyre!(
@@ -189,10 +258,14 @@ impl ForwardTable {
                     .vsock_listener
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Some(listener);
+                self.registered_ports
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(port);
             }
         }
         if self
-            .entries
+            .entries()
             .iter()
             .any(|entry| entry.shape == ForwardShape::OutboundAgent)
         {
@@ -204,60 +277,286 @@ impl ForwardTable {
                 .return_listener
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(listener);
+            self.return_registered.store(true, Ordering::Release);
+            self.registered_ports
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(forward_spec::FORWARD_VSOCK_PORT);
         }
         Ok(())
     }
 
     pub(crate) fn activate(self: &Arc<Self>, machine: VirtualMachine) {
-        let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
-        for entry in &self.entries {
-            let listener = entry
-                .listener
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            if let Some(listener) = listener {
-                tasks.push(tokio::spawn(inbound::serve(
-                    listener,
-                    entry.clone(),
-                    machine.clone(),
-                )));
-            }
-            let vsock_listener = entry
-                .vsock_listener
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            if let Some(listener) = vsock_listener {
-                entry.set_state(ForwardState::Active, None);
-                tasks.push(tokio::spawn(outbound::serve_raw(listener, entry.clone())));
-            }
-            if entry.shape == ForwardShape::OutboundAgent {
-                tasks.push(tokio::spawn(agent::supervise_listener(
-                    machine.clone(),
-                    entry.clone(),
-                )));
-            }
+        let _ = self.machine.set(machine.clone());
+        self.running.store(true, Ordering::Release);
+        for entry in self.entries() {
+            self.activate_entry(entry, machine.clone());
         }
-        let return_listener = self
+        if let Some(listener) = self
             .return_listener
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(listener) = return_listener {
-            tasks.push(tokio::spawn(outbound::serve_return(listener, self.clone())));
+            .take()
+        {
+            self.spawn(outbound::serve_return(listener, self.clone()));
         }
     }
 
-    pub(crate) fn registered_ports(&self) -> &BTreeSet<u32> {
-        &self.registered_ports
+    pub(crate) fn mark_stopping(&self) {
+        self.running.store(false, Ordering::Release);
+    }
+
+    pub(crate) async fn lock_registrations(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.operation.lock().await
+    }
+
+    fn activate_entry(self: &Arc<Self>, entry: Arc<ForwardEntry>, machine: VirtualMachine) {
+        if let Some(listener) = entry
+            .listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            self.spawn(inbound::serve(listener, entry.clone(), machine.clone()));
+        }
+        if let Some(listener) = entry
+            .vsock_listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            entry.set_state(ForwardState::Active, None);
+            let target = Arc::new(RwLock::new(Some(entry.clone())));
+            self.raw_ports
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(
+                    match entry.spec.listen {
+                        forward_spec::Endpoint::Vsock(port) => port,
+                        _ => return,
+                    },
+                    Arc::new(RetainedRawPort {
+                        target: target.clone(),
+                    }),
+                );
+            self.spawn(outbound::serve_raw_retained(
+                listener,
+                target,
+                self.shutdown.clone(),
+            ));
+        }
+        if entry.shape == ForwardShape::OutboundAgent {
+            self.spawn(agent::supervise_listener(machine, entry));
+        }
+    }
+
+    pub(crate) async fn add_held(
+        self: &Arc<Self>,
+        spec: Forward,
+    ) -> Result<Arc<ForwardEntry>, HoldError> {
+        let _operation = self.operation.lock().await;
+        if !self.running.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
+            return Err(HoldError::NotRunning("VM is not running".to_string()));
+        }
+        let entries = self.entries();
+        let mut specs = entries
+            .iter()
+            .map(|entry| entry.spec.clone())
+            .collect::<Vec<_>>();
+        specs.push(spec.clone());
+        if let Err(error) = forward_spec::validate_forwards(&specs, self.mux_filename.as_deref()) {
+            return match error {
+                forward_spec::ForwardError::DuplicateVsockListenPort(_) => {
+                    Err(HoldError::AddressInUse(error.to_string()))
+                }
+                _ => Err(HoldError::Invalid(error.to_string())),
+            };
+        }
+        if entries
+            .iter()
+            .any(|entry| listen_conflicts(&entry.spec.listen, &spec.listen))
+        {
+            return Err(HoldError::AddressInUse(format!(
+                "listen endpoint {} is already owned",
+                spec.listen
+            )));
+        }
+        let total = self
+            .total_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                HoldError::Limit(format!("forward limit of {MAX_FORWARDS} is exhausted"))
+            })?;
+        let held = self
+            .held_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                HoldError::Limit(format!(
+                    "held forward limit of {MAX_HELD_FORWARDS} is exhausted"
+                ))
+            })?;
+        let entry = self
+            .build_entry(spec, ForwardOwner::Held, Some(total), Some(held))
+            .await?;
+        let machine = self
+            .machine
+            .get()
+            .cloned()
+            .ok_or_else(|| HoldError::Unavailable("VM backend is unavailable".to_string()))?;
+        match entry.shape {
+            ForwardShape::OutboundVsock => self.attach_raw(&machine, entry.clone()).await?,
+            ForwardShape::OutboundAgent => self.ensure_return_listener(&machine).await?,
+            ForwardShape::InboundAgent | ForwardShape::InboundVsock => {}
+        }
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(entry.clone());
+        self.activate_entry(entry.clone(), machine);
+        Ok(entry)
+    }
+
+    async fn attach_raw(
+        self: &Arc<Self>,
+        machine: &VirtualMachine,
+        entry: Arc<ForwardEntry>,
+    ) -> Result<(), HoldError> {
+        let forward_spec::Endpoint::Vsock(port) = entry.spec.listen else {
+            return Err(HoldError::Invalid(
+                "raw forward has no vsock listener".to_string(),
+            ));
+        };
+        if let Some(retained) = self
+            .raw_ports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&port)
+            .cloned()
+        {
+            entry.set_state(ForwardState::Active, None);
+            *retained
+                .target
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = Some(entry);
+            return Ok(());
+        }
+        let listener = machine.listen_public_vsock(port).await.map_err(|error| {
+            HoldError::Unavailable(format!("register vsock port {port}: {error}"))
+        })?;
+        entry.set_state(ForwardState::Active, None);
+        let target = Arc::new(RwLock::new(Some(entry)));
+        self.raw_ports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                port,
+                Arc::new(RetainedRawPort {
+                    target: target.clone(),
+                }),
+            );
+        self.registered_ports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(port);
+        self.spawn(outbound::serve_raw_retained(
+            listener,
+            target,
+            self.shutdown.clone(),
+        ));
+        Ok(())
+    }
+
+    async fn ensure_return_listener(
+        self: &Arc<Self>,
+        machine: &VirtualMachine,
+    ) -> Result<(), HoldError> {
+        if self.return_registered.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let listener = machine
+            .listen_public_vsock(forward_spec::FORWARD_VSOCK_PORT)
+            .await
+            .map_err(|error| {
+                HoldError::Unavailable(format!("register forward return port 1028: {error}"))
+            })?;
+        self.return_registered.store(true, Ordering::Release);
+        self.registered_ports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(forward_spec::FORWARD_VSOCK_PORT);
+        self.spawn(outbound::serve_return(listener, self.clone()));
+        Ok(())
+    }
+
+    pub(crate) async fn remove(self: &Arc<Self>, id: u64) {
+        let _operation = self.operation.lock().await;
+        let removed = {
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            entries
+                .iter()
+                .position(|entry| entry.id == id)
+                .map(|index| entries.remove(index))
+        };
+        let Some(entry) = removed else {
+            return;
+        };
+        entry.shutdown.cancel();
+        entry.set_state(ForwardState::Closed, None);
+        entry
+            .total_permit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        entry
+            .held_permit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let forward_spec::Endpoint::Vsock(port) = entry.spec.listen {
+            if let Some(retained) = self
+                .raw_ports
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&port)
+            {
+                let mut target = retained
+                    .target
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if target.as_ref().is_some_and(|target| target.id == id) {
+                    *target = None;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn entries(&self) -> Vec<Arc<ForwardEntry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn registered_ports(&self) -> BTreeSet<u32> {
+        self.registered_ports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(tokio::spawn(task));
     }
 
     fn token_entry(&self, token: Token) -> Option<Arc<ForwardEntry>> {
-        self.entries
-            .iter()
+        self.entries()
+            .into_iter()
             .find(|entry| entry.token == Some(token))
-            .cloned()
     }
 
     fn warn_invalid_token(&self) {
@@ -275,14 +574,9 @@ impl ForwardTable {
         }
     }
 
-    pub(crate) fn has_agent_forwards(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|entry| matches!(entry.guest_half, GuestHalf::Agent(_)))
-    }
-
     pub(crate) fn set_agent_availability(&self, availability: GuestHalfAvailability) {
-        for entry in &self.entries {
+        self.availability.send_replace(availability.clone());
+        for entry in self.entries() {
             if matches!(&entry.guest_half, GuestHalf::Agent(_)) {
                 entry.availability.send_replace(availability.clone());
                 entry.apply_availability(availability.clone());
@@ -291,21 +585,49 @@ impl ForwardTable {
     }
 
     pub(crate) async fn shutdown(&self) -> eyre::Result<()> {
+        self.running.store(false, Ordering::Release);
         self.shutdown.cancel();
-        for entry in &self.entries {
+        for entry in self.entries() {
             entry.shutdown.cancel();
             entry.set_state(ForwardState::Closed, None);
         }
-        let tasks = {
-            let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
-            std::mem::take(&mut *tasks)
-        };
+        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner));
         for task in tasks {
             task.await
                 .map_err(|error| eyre::eyre!("forward task failed: {error}"))?;
         }
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         Ok(())
     }
+}
+
+fn bind_error(name: &str, endpoint: &forward_spec::Endpoint, error: eyre::Report) -> HoldError {
+    let address_in_use = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+    });
+    let message = format!("bind forward {name} at {endpoint}: {error}");
+    if address_in_use {
+        HoldError::AddressInUse(message)
+    } else {
+        HoldError::Unavailable(message)
+    }
+}
+
+fn listen_conflicts(left: &forward_spec::Endpoint, right: &forward_spec::Endpoint) -> bool {
+    if left != right {
+        return false;
+    }
+    !matches!(
+        left,
+        forward_spec::Endpoint::Host(Address::Tcp(address))
+            | forward_spec::Endpoint::Guest(Address::Tcp(address))
+            if address.port() == 0
+    )
 }
 
 fn resolve_host_target(spec: &Forward, runtime_dir: &Path) -> eyre::Result<Option<Address>> {
@@ -329,7 +651,15 @@ pub(crate) fn spawn_capability_supervisor(
 }
 
 impl ForwardEntry {
-    fn set_state(&self, state: ForwardState, error: Option<String>) {
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn snapshot(&self) -> ForwardStatusSnapshot {
+        self.status.borrow().clone()
+    }
+
+    fn set_state(&self, state: ForwardState, error: Option<protocol::v1::ErrorDetail>) {
         self.status.send_modify(|snapshot| {
             snapshot.state = state;
             snapshot.error = error;
@@ -344,10 +674,9 @@ impl ForwardEntry {
                 ForwardShape::OutboundAgent => self.set_state(ForwardState::Pending, None),
                 ForwardShape::InboundVsock | ForwardShape::OutboundVsock => {}
             },
-            GuestHalfAvailability::Unsupported => self.set_state(
-                ForwardState::Unsupported,
-                Some("agent does not serve silo.v1.GuestForwardService".to_string()),
-            ),
+            GuestHalfAvailability::Unsupported => {
+                self.set_state(ForwardState::Unsupported, Some(unsupported_detail()))
+            }
         }
     }
 
@@ -361,8 +690,10 @@ impl ForwardEntry {
             .refused
             .fetch_add(increment, Ordering::Relaxed)
             .saturating_add(increment);
-        self.status
-            .send_modify(|snapshot| snapshot.refused_connections = value);
+        self.status.send_modify(|snapshot| {
+            snapshot.refused_connections = value;
+            snapshot.error = Some(error_detail(protocol::v1::ErrorCode::BackendUnavailable));
+        });
     }
 
     pub(crate) fn connection_opened(&self) {
@@ -375,17 +706,34 @@ impl ForwardEntry {
     }
 
     pub(crate) fn connection_closed(&self) {
-        let previous = self.active.fetch_sub(1, Ordering::Relaxed);
-        let value = previous.saturating_sub(1);
+        let value = self
+            .active
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
         self.status
             .send_modify(|snapshot| snapshot.active_connections = value);
     }
 }
 
+fn error_detail(code: protocol::v1::ErrorCode) -> protocol::v1::ErrorDetail {
+    protocol::v1::ErrorDetail {
+        code: Some(code as i32),
+        retry_after: None,
+    }
+}
+
+fn unsupported_detail() -> protocol::v1::ErrorDetail {
+    error_detail(protocol::v1::ErrorCode::ForwardUnsupported)
+}
+
 impl Drop for ForwardTable {
     fn drop(&mut self) {
         self.shutdown.cancel();
-        for entry in &self.entries {
+        for entry in self
+            .entries
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
             entry.shutdown.cancel();
         }
         for task in self
@@ -396,40 +744,5 @@ impl Drop for ForwardTable {
         {
             task.abort();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use forward_spec::{Address, Endpoint, Forward, ForwardShape};
-
-    use crate::forward::{ForwardState, ForwardTable, GuestHalfAvailability};
-
-    #[tokio::test]
-    async fn supported_outbound_agent_forward_stays_pending_until_listener_support_exists() {
-        let forward = Forward::new(
-            Endpoint::Guest(Address::Tcp(
-                "127.0.0.1:18080".parse().expect("guest listen address"),
-            )),
-            Endpoint::Host(Address::Tcp(
-                "127.0.0.1:18081".parse().expect("host target address"),
-            )),
-        );
-        let table = ForwardTable::prepare_declared(&[forward], Path::new("/tmp"), None)
-            .await
-            .expect("prepare outbound forward");
-        let entry = &table.entries[0];
-        assert_eq!(entry.shape, ForwardShape::OutboundAgent);
-        assert!(table
-            .registered_ports()
-            .contains(&forward_spec::FORWARD_VSOCK_PORT));
-
-        table.set_agent_availability(GuestHalfAvailability::Available(None));
-        assert_eq!(entry.status.borrow().state, ForwardState::Pending);
-
-        table.set_agent_availability(GuestHalfAvailability::Unsupported);
-        assert_eq!(entry.status.borrow().state, ForwardState::Unsupported);
     }
 }

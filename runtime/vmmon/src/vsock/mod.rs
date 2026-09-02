@@ -64,13 +64,15 @@ impl PreparedVsockSurface {
     pub(crate) async fn activate(
         mut self,
         machine: VirtualMachine,
-        reserved_ports: BTreeSet<u32>,
+        forwards: Arc<crate::forward::ForwardTable>,
     ) -> eyre::Result<VsockSurface> {
+        let _registration = forwards.lock_registrations().await;
         let discovered = discovery::scan(&self.runtime_dir, &self.mux_filename)?;
-        let mut registered = reserved_ports;
+        let mut registered = forwards.registered_ports();
         let mut listeners = Vec::new();
         let _ = register_discovered(&machine, &mut registered, &mut listeners, discovered, true)
             .await?;
+        drop(_registration);
 
         let mux_listener = self.mux.take_listener()?;
         let mux_owner_uid = self.mux.owner_uid();
@@ -85,6 +87,7 @@ impl PreparedVsockSurface {
                 mux_listener,
                 mux_owner_uid,
                 machine,
+                forwards,
                 registered,
                 listeners,
                 self.watcher,
@@ -145,6 +148,7 @@ async fn run_surface(
     mux_listener: UnixListener,
     mux_owner_uid: u32,
     machine: VirtualMachine,
+    forwards: Arc<crate::forward::ForwardTable>,
     mut registered: BTreeSet<u32>,
     listeners: Vec<(u32, PathBuf, VsockListener)>,
     mut watcher: Option<RecommendedWatcher>,
@@ -180,6 +184,7 @@ async fn run_surface(
                 }
                 registration_retry = reconcile_runtime(
                     &machine,
+                    &forwards,
                     &runtime_dir,
                     &mux_filename,
                     &mut registered,
@@ -206,6 +211,7 @@ async fn run_surface(
                 if watcher_restored || registration_retry {
                     registration_retry = reconcile_runtime(
                         &machine,
+                        &forwards,
                         &runtime_dir,
                         &mux_filename,
                         &mut registered,
@@ -229,12 +235,15 @@ async fn run_surface(
 
 async fn reconcile_runtime(
     machine: &VirtualMachine,
+    forwards: &Arc<crate::forward::ForwardTable>,
     runtime_dir: &Path,
     mux_filename: &std::ffi::OsStr,
     registered: &mut BTreeSet<u32>,
     tasks: &mut JoinSet<()>,
     shutdown: &CancellationToken,
 ) -> bool {
+    let _registration = forwards.lock_registrations().await;
+    registered.extend(forwards.registered_ports());
     let discovered = match discovery::scan(runtime_dir, mux_filename) {
         Ok(discovered) => discovered,
         Err(error) => {
@@ -458,8 +467,11 @@ mod tests {
         let prepared = PreparedVsockSurface::prepare(&runtime_dir, Path::new("vsock.sock"))
             .expect("prepare surface");
         machine.start().await.expect("start mock machine");
+        let forwards = crate::forward::ForwardTable::prepare_declared(&[], &runtime_dir, None)
+            .await
+            .expect("prepare empty forward table");
         let mut surface = prepared
-            .activate(machine.clone(), std::collections::BTreeSet::new())
+            .activate(machine.clone(), forwards)
             .await
             .expect("activate surface");
 

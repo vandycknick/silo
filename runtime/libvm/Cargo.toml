@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }
 disk-image = { path = "../../common/disk-image" }
+forward-spec = { path = "../../specs/forward-spec" }
 silo_policy = { package = "policy", path = "../../common/policy" }
 oci = { path = "../oci" }
 protocol = { path = "../../specs/protocol" }
@@ -39,7 +40,6 @@ uuid = { version = "1.24.0", features = ["v4", "serde"] }
 prost-types = "0.14.4"
 
 [dev-dependencies]
-forward-spec = { path = "../../specs/forward-spec" }
 test-utils = { path = "../test-utils" }
 mockall = "0.15.0"
 tempfile = "3.27.0"

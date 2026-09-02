@@ -14,7 +14,8 @@ use libvm::{
     ExecutionLaunchFailureReason, ExecutionLostReason, ExecutionResult, FileWriteDisposition,
     ImageSource, LibVmError, Machine, MachineAgent, MachineAgentStatus,
     MachineDirectoryCreateDisposition, MachineExitOutcome, MachineFileUploadOptions,
-    MachineReadinessOutcome, MachineStatus, Runtime, RuntimeConfig,
+    MachineForwardErrorDetail, MachineForwardOwner, MachineForwardState, MachineReadinessOutcome,
+    MachineStatus, Runtime, RuntimeConfig,
 };
 use test_utils::Scenario;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -172,6 +173,29 @@ async fn connect_tcp_eventually(address: std::net::SocketAddr) -> TcpStream {
     }
 }
 
+async fn declared_tcp_bound(machine: &Machine) -> std::net::SocketAddr {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let forwards = machine.list_forwards().await.expect("list forwards");
+        if let Some(address) = forwards.into_iter().find_map(|status| match status.bound {
+            Some(forward_spec::Endpoint::Host(forward_spec::Address::Tcp(address)))
+            | Some(forward_spec::Endpoint::Guest(forward_spec::Address::Tcp(address)))
+                if status.state == MachineForwardState::Active =>
+            {
+                Some(address)
+            }
+            _ => None,
+        }) {
+            return address;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "forward did not report an active TCP bound address"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn assert_echo<S>(stream: &mut S, payload: &[u8])
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -257,7 +281,7 @@ async fn declared_inbound_tcp_forward_reaches_guest_tcp_target() {
     let env = test_env("forward-tcp", &Scenario::default()).await;
     let machine = create_machine(&env, "integration-forward-tcp").await;
     let (target, echo) = spawn_tcp_echo().await;
-    let listen = available_tcp_address();
+    let listen = "127.0.0.1:0".parse().expect("ephemeral listen address");
     set_forwards(
         &machine,
         vec![forward_spec::Forward::new(
@@ -268,6 +292,7 @@ async fn declared_inbound_tcp_forward_reaches_guest_tcp_target() {
     .await;
 
     start_ready(&machine).await;
+    let listen = declared_tcp_bound(&machine).await;
     let mut client = TcpStream::connect(listen)
         .await
         .expect("connect TCP forward");
@@ -577,7 +602,7 @@ async fn declared_outbound_tcp_forward_reaches_host_service() {
     let env = test_env("outbound-tcp", &Scenario::default()).await;
     let machine = create_machine(&env, "integration-outbound-tcp").await;
     let (target, echo) = spawn_tcp_echo().await;
-    let listen = available_tcp_address();
+    let listen = "127.0.0.1:0".parse().expect("ephemeral listen address");
     set_forwards(
         &machine,
         vec![forward_spec::Forward::new(
@@ -588,6 +613,7 @@ async fn declared_outbound_tcp_forward_reaches_host_service() {
     .await;
 
     start_ready(&machine).await;
+    let listen = declared_tcp_bound(&machine).await;
     let mut client = connect_tcp_eventually(listen).await;
     assert_echo(&mut client, b"outbound-tcp").await;
 
@@ -611,6 +637,29 @@ async fn declared_outbound_unix_forward_applies_mode_and_reaches_host_service() 
     set_forwards(&machine, vec![forward]).await;
 
     start_ready(&machine).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let active = machine
+            .list_forwards()
+            .await
+            .expect("list outbound Unix forward")
+            .into_iter()
+            .any(|status| {
+                status.state == MachineForwardState::Active
+                    && status.bound
+                        == Some(forward_spec::Endpoint::Guest(forward_spec::Address::Unix(
+                            listen.clone(),
+                        )))
+            });
+        if active {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "outbound Unix forward did not become active"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let mut client = UnixStream::connect(&listen)
         .await
         .expect("connect guest Unix listener");
@@ -680,7 +729,7 @@ async fn outbound_agent_restart_reopens_listener_and_unknown_token_is_rejected()
     let env = test_env("outbound-restart", &scenario).await;
     let machine = create_machine(&env, "integration-outbound-restart").await;
     let (target, echo) = spawn_tcp_echo().await;
-    let listen = available_tcp_address();
+    let listen = "127.0.0.1:0".parse().expect("ephemeral listen address");
     set_forwards(
         &machine,
         vec![forward_spec::Forward::new(
@@ -691,9 +740,11 @@ async fn outbound_agent_restart_reopens_listener_and_unknown_token_is_rejected()
     .await;
     start_ready(&machine).await;
 
+    let listen = declared_tcp_bound(&machine).await;
     let mut first = connect_tcp_eventually(listen).await;
     assert_echo(&mut first, b"before-restart").await;
     tokio::time::sleep(Duration::from_secs(2)).await;
+    let listen = declared_tcp_bound(&machine).await;
     let mut second = connect_tcp_eventually(listen).await;
     assert_echo(&mut second, b"after-restart").await;
 
@@ -772,6 +823,426 @@ async fn unsupported_agent_never_binds_declared_outbound_listener() {
     assert!(status.readiness.ready);
 
     machine.stop().await.expect("stop machine");
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn held_forward_lifecycle_is_the_response_stream_and_port_zero_holds_coexist() {
+    let env = test_env("held-lifecycle", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-held-lifecycle").await;
+    start_ready(&machine).await;
+    let forward = forward_spec::Forward::new(
+        forward_spec::Endpoint::Host(forward_spec::Address::Tcp(
+            "127.0.0.1:0".parse().expect("ephemeral listen"),
+        )),
+        forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+    );
+
+    let mut first = machine
+        .hold_forward(forward.clone())
+        .await
+        .expect("hold first forward");
+    let first_status = first
+        .next_status()
+        .await
+        .expect("first status")
+        .expect("first snapshot");
+    assert_eq!(first_status.owner, MachineForwardOwner::Held);
+    assert_eq!(first_status.state, MachineForwardState::Active);
+    assert_eq!(first_status.active_connections, 0);
+    assert_eq!(first_status.refused_connections, 0);
+    let Some(forward_spec::Endpoint::Host(forward_spec::Address::Tcp(first_bound))) =
+        first_status.bound
+    else {
+        panic!("held forward must report its actual host TCP address");
+    };
+    assert_ne!(first_bound.port(), 0);
+
+    let mut second = machine
+        .hold_forward(forward)
+        .await
+        .expect("a second port-zero hold must coexist");
+    let second_status = second
+        .next_status()
+        .await
+        .expect("second status")
+        .expect("second snapshot");
+    let Some(forward_spec::Endpoint::Host(forward_spec::Address::Tcp(second_bound))) =
+        second_status.bound
+    else {
+        panic!("second hold must report its actual address");
+    };
+    assert_ne!(first_bound, second_bound);
+    drop(second);
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut client = TcpStream::connect(first_bound)
+        .await
+        .expect("silent hold remains alive");
+    assert_echo(&mut client, b"held-forward").await;
+    drop(client);
+    drop(first);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let listed = machine.list_forwards().await.expect("list after drop");
+        if listed.is_empty() && TcpStream::connect(first_bound).await.is_err() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "dropped hold remained visible or bound"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    machine.stop().await.expect("stop machine");
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn hold_rejections_are_typed_and_capacity_recovers() {
+    let env = test_env("held-errors", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-held-errors").await;
+    start_ready(&machine).await;
+
+    let invalid = forward_spec::Forward::new(
+        forward_spec::Endpoint::Host(forward_spec::Address::Tcp(
+            "127.0.0.1:0".parse().expect("listen"),
+        )),
+        forward_spec::Endpoint::Host(forward_spec::Address::Tcp(
+            "127.0.0.1:1".parse().expect("connect"),
+        )),
+    );
+    let error = machine
+        .hold_forward(invalid)
+        .await
+        .expect_err("invalid shape must fail");
+    assert!(matches!(
+        error,
+        LibVmError::ForwardRejected {
+            detail: Some(MachineForwardErrorDetail::Invalid),
+            ..
+        }
+    ));
+
+    let named = forward_spec::Forward::new(
+        forward_spec::Endpoint::Host(forward_spec::Address::Tcp(
+            "127.0.0.1:0".parse().expect("named listen"),
+        )),
+        forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+    )
+    .with_name("duplicate");
+    let named_owner = machine
+        .hold_forward(named.clone())
+        .await
+        .expect("hold named owner");
+    let error = machine
+        .hold_forward(named)
+        .await
+        .expect_err("duplicate name must fail validation");
+    assert!(matches!(
+        error,
+        LibVmError::ForwardRejected {
+            detail: Some(MachineForwardErrorDetail::Invalid),
+            ..
+        }
+    ));
+    drop(named_owner);
+
+    let occupied = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind occupied address");
+    let occupied_address = occupied.local_addr().expect("occupied address");
+    let error = machine
+        .hold_forward(forward_spec::Forward::new(
+            forward_spec::Endpoint::Host(forward_spec::Address::Tcp(occupied_address)),
+            forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+        ))
+        .await
+        .expect_err("occupied host address must fail");
+    assert!(matches!(
+        error,
+        LibVmError::ForwardRejected {
+            detail: Some(MachineForwardErrorDetail::AddressInUse),
+            ..
+        }
+    ));
+    drop(occupied);
+
+    let conflict_path = env._temp.path().join("held-conflict.sock");
+    let conflict = forward_spec::Forward::new(
+        forward_spec::Endpoint::Host(forward_spec::Address::Unix(conflict_path)),
+        forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+    );
+    let first = machine
+        .hold_forward(conflict.clone())
+        .await
+        .expect("hold conflict owner");
+    let error = machine
+        .hold_forward(conflict)
+        .await
+        .expect_err("duplicate listen must fail");
+    assert!(matches!(
+        error,
+        LibVmError::ForwardRejected {
+            detail: Some(MachineForwardErrorDetail::AddressInUse),
+            ..
+        }
+    ));
+    drop(first);
+    let removal_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !machine
+        .list_forwards()
+        .await
+        .expect("list conflict cleanup")
+        .is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < removal_deadline,
+            "conflicting hold was not removed"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let forward = forward_spec::Forward::new(
+        forward_spec::Endpoint::Host(forward_spec::Address::Tcp(
+            "127.0.0.1:0".parse().expect("ephemeral listen"),
+        )),
+        forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+    );
+    let mut holds = Vec::new();
+    for _ in 0..64 {
+        holds.push(
+            machine
+                .hold_forward(forward.clone())
+                .await
+                .expect("hold within limit"),
+        );
+    }
+    let error = machine
+        .hold_forward(forward.clone())
+        .await
+        .expect_err("65th hold must fail");
+    assert!(matches!(
+        error,
+        LibVmError::ForwardRejected {
+            detail: Some(MachineForwardErrorDetail::Limit),
+            ..
+        }
+    ));
+    drop(holds.pop());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let recovered = loop {
+        match machine.hold_forward(forward.clone()).await {
+            Ok(hold) => break hold,
+            Err(LibVmError::ForwardRejected {
+                detail: Some(MachineForwardErrorDetail::Limit),
+                ..
+            }) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => panic!("held capacity did not recover: {error}"),
+        }
+    };
+    drop(recovered);
+    drop(holds);
+    machine.stop().await.expect("stop machine");
+    machine.remove().await.expect("remove machine");
+
+    let stopped = create_machine(&env, "integration-held-stopped").await;
+    let error = stopped
+        .hold_forward(forward)
+        .await
+        .expect_err("stopped machine must reject hold");
+    assert!(matches!(error, LibVmError::MachineNotRunning { .. }));
+    stopped.remove().await.expect("remove stopped machine");
+}
+
+#[tokio::test]
+async fn held_outbound_return_port_is_lazy_reusable_and_shutdown_closes_stream() {
+    let env = test_env("held-outbound", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-held-outbound").await;
+    let (target, echo) = spawn_tcp_echo().await;
+    start_ready(&machine).await;
+    let forward = forward_spec::Forward::new(
+        forward_spec::Endpoint::Guest(forward_spec::Address::Tcp(
+            "127.0.0.1:0".parse().expect("ephemeral guest listen"),
+        )),
+        forward_spec::Endpoint::Host(forward_spec::Address::Tcp(target)),
+    );
+
+    for iteration in 0..2 {
+        let mut hold = machine
+            .hold_forward(forward.clone())
+            .await
+            .expect("hold outbound forward");
+        let bound = loop {
+            let status = hold
+                .next_status()
+                .await
+                .expect("outbound status")
+                .expect("outbound snapshot");
+            if status.state == MachineForwardState::Active {
+                let Some(forward_spec::Endpoint::Guest(forward_spec::Address::Tcp(bound))) =
+                    status.bound
+                else {
+                    panic!("active outbound hold must report guest TCP bound address");
+                };
+                break bound;
+            }
+        };
+        let mut client = TcpStream::connect(bound)
+            .await
+            .expect("connect held outbound listener");
+        assert_echo(&mut client, format!("outbound-{iteration}").as_bytes()).await;
+        drop(client);
+        if iteration == 0 {
+            drop(hold);
+        } else {
+            machine.stop().await.expect("stop with held stream");
+            let closed = tokio::time::timeout(Duration::from_secs(2), async {
+                while let Ok(Some(_)) = hold.next_status().await {}
+            })
+            .await;
+            assert!(
+                closed.is_ok(),
+                "held stream remained open after vmmon shutdown"
+            );
+        }
+    }
+    echo.abort();
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn list_reports_declared_and_held_and_port_1028_has_no_public_socket() {
+    let env = test_env("forward-list", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-forward-list").await;
+    let declared_path = env._temp.path().join("declared-list.sock");
+    set_forwards(
+        &machine,
+        vec![forward_spec::Forward::new(
+            forward_spec::Endpoint::Host(forward_spec::Address::Unix(declared_path)),
+            forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+        )
+        .with_name("declared")],
+    )
+    .await;
+    start_ready(&machine).await;
+    let mut held = machine
+        .hold_forward(
+            forward_spec::Forward::new(
+                forward_spec::Endpoint::Host(forward_spec::Address::Tcp(
+                    "127.0.0.1:0".parse().expect("ephemeral listen"),
+                )),
+                forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+            )
+            .with_name("held"),
+        )
+        .await
+        .expect("hold listed forward");
+    let _ = held.next_status().await.expect("held status");
+
+    let listed = machine
+        .list_forwards()
+        .await
+        .expect("list declared and held");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].forward.name.as_deref(), Some("declared"));
+    assert_eq!(listed[0].owner, MachineForwardOwner::Declared);
+    assert_eq!(listed[1].forward.name.as_deref(), Some("held"));
+    assert_eq!(listed[1].owner, MachineForwardOwner::Held);
+    assert!(listed.iter().all(|status| {
+        status.state == MachineForwardState::Active
+            && status.bound.is_some()
+            && status.active_connections == 0
+            && status.refused_connections == 0
+            && status.error.is_none()
+    }));
+    assert_eq!(
+        machine
+            .vsock_listener_socket(forward_spec::FORWARD_VSOCK_PORT)
+            .await
+            .expect("reserved listener accessor"),
+        None
+    );
+
+    drop(held);
+    machine.stop().await.expect("stop machine");
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn held_raw_vsock_port_detaches_and_reattaches_without_reregistering() {
+    const PORT: u32 = 5017;
+    let env = test_env("held-raw-reattach", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-held-raw-reattach").await;
+    let target = env._temp.path().join("held-raw-target.sock");
+    let echo = spawn_unix_echo(&target).await;
+    start_ready(&machine).await;
+    let forward = forward_spec::Forward::new(
+        forward_spec::Endpoint::Vsock(PORT),
+        forward_spec::Endpoint::Host(forward_spec::Address::Unix(target)),
+    );
+    let guest_path = env
+        ._temp
+        .path()
+        .join("data/machines")
+        .join(machine.id())
+        .join(format!(".v_{PORT}"));
+
+    let mut first = machine
+        .hold_forward(forward.clone())
+        .await
+        .expect("hold raw forward");
+    assert_eq!(
+        first
+            .next_status()
+            .await
+            .expect("raw status")
+            .expect("raw snapshot")
+            .state,
+        MachineForwardState::Active
+    );
+    let mut guest = UnixStream::connect(&guest_path)
+        .await
+        .expect("dial first raw owner");
+    assert_echo(&mut guest, b"first-owner").await;
+    drop(guest);
+    drop(first);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !machine
+        .list_forwards()
+        .await
+        .expect("list raw cleanup")
+        .is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "raw owner was not detached"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let mut ownerless = UnixStream::connect(&guest_path)
+        .await
+        .expect("retained raw registration remains present");
+    assert_closed_without_bytes(&mut ownerless).await;
+    let mut second = machine
+        .hold_forward(forward)
+        .await
+        .expect("reattach raw forward");
+    let _ = second.next_status().await.expect("reattached status");
+    let mut guest = UnixStream::connect(&guest_path)
+        .await
+        .expect("dial reattached raw owner");
+    assert_echo(&mut guest, b"second-owner").await;
+
+    drop(guest);
+    drop(second);
+    machine.stop().await.expect("stop machine");
+    echo.abort();
     machine.remove().await.expect("remove machine");
 }
 
