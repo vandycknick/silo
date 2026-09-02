@@ -20,7 +20,7 @@ pub(crate) use image::{
 pub(crate) use machine::{MachineConfig, MachineRuntimeState, MachineState};
 pub(crate) use machine_id::{looks_like_id_prefix, MachineId};
 pub(crate) use network::{
-    MachineNetworkConfig, NetworkDefinition, NetworkDriverPreference, NetworkInstanceState,
-    NetworkTopology,
+    GuestPublish, MachineNetworkConfig, NetworkDefinition, NetworkDriverPreference,
+    NetworkInstanceState, NetworkTopology, PublishBind,
 };
 pub(crate) use network::{NetworkAttachment, NetworkInstance};

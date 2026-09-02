@@ -1825,7 +1825,7 @@ fn machine_status_to_native(status: MachineStatus) -> NativeMachineStatus {
 
 fn network_to_native(network: MachineNetworkConfig) -> NativeNetworkData {
     match network {
-        MachineNetworkConfig::Private { policy } => NativeNetworkData {
+        MachineNetworkConfig::Private { policy, .. } => NativeNetworkData {
             kind: "private".to_string(),
             name: None,
             policy_json: policy.and_then(|policy| serde_json::to_string(&policy.normalized()).ok()),

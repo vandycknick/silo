@@ -6,7 +6,8 @@ mod core;
 mod netd_driver;
 
 pub use api::{
-    MachineNetworkBuilder, MachineNetworkConfig, NetworkDefinition, NetworkDriver, NetworkTopology,
+    GuestPublish, MachineNetworkBuilder, MachineNetworkConfig, NetworkDefinition, NetworkDriver,
+    NetworkTopology, PublishBind,
 };
 pub use builder::NetworkBuilder;
 
@@ -84,8 +85,9 @@ pub(crate) async fn prepare_network_runtime(
             remove_attached_network(paths, store, metadata.id).await?;
             Ok(VmmonNetworkAttachment::None)
         }
-        ModelMachineNetworkConfig::Private { policy } => {
-            let request = NetworkAttachmentRequest::private(policy.as_ref());
+        ModelMachineNetworkConfig::Private { policy, publish } => {
+            let request =
+                NetworkAttachmentRequest::private(policy.as_ref(), publish.map(Into::into));
             prepare_with_driver(
                 NetdDriver,
                 &NetworkDriverContext {

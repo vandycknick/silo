@@ -5,8 +5,8 @@ use clap::{Args, ValueEnum};
 use eyre::Context as _;
 use libvm::{
     ImageProgressSender, ImagePullPolicy, ImageResolveOptions, ImageSource, MachineAgent,
-    MachineBuilder, MachineRetention, MachineUserConfig, Memory, ReadOnlyRuntime, ResolvedOciImage,
-    Runtime, RuntimeConfig,
+    MachineBuilder, MachineRetention, MachineUserConfig, Memory, PublishBind, ReadOnlyRuntime,
+    ResolvedOciImage, Runtime, RuntimeConfig,
 };
 use nix::unistd::{Uid, User};
 
@@ -91,6 +91,9 @@ pub(crate) struct VmOverrideArgs {
     /// Override the network target. Allowed: private, none, NAME, or name:NAME.
     #[arg(long, value_parser = MachineNetworkSelection::parse)]
     pub(crate) network: Option<MachineNetworkSelection>,
+    /// Allow guest requests for host TCP publications.
+    #[arg(long, value_name = "loopback|any")]
+    pub(crate) guest_publish: Option<PublishBind>,
     /// Add or override a label. Format: KEY=VALUE.
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
     pub(crate) labels: Vec<(String, String)>,
@@ -153,6 +156,7 @@ impl VmOverrideArgs {
                     .network
                     .clone()
                     .map(MachineNetworkSelection::into_machine_network),
+                guest_publish: self.guest_publish,
                 labels: self.labels.iter().cloned().collect(),
             },
             kernel: self.kernel.clone(),
@@ -742,6 +746,7 @@ pub(crate) fn preflight_create(
         .or(template.network.as_ref());
     if let Some(MachineNetwork::Private {
         policy_ref: Some(policy_ref),
+        ..
     }) = network
     {
         // Resolving here makes dry runs and real runs reject the same missing,
@@ -1036,6 +1041,35 @@ mod tests {
         );
         assert_eq!(options.overrides.vsock, Some(true));
         assert_eq!(options.overrides.labels["a"], "b");
+    }
+
+    #[test]
+    fn create_parses_guest_publish() {
+        let cli = Cli::try_parse_from([
+            "silo",
+            "create",
+            "disk:rootfs.img",
+            "--guest-publish",
+            "any",
+        ])
+        .expect("create parses guest publication");
+        let Command::Create(create) = cli.command else {
+            panic!("expected create")
+        };
+        let options = create.overrides.resolve().expect("resolve overrides");
+
+        assert_eq!(
+            options.overrides.guest_publish,
+            Some(libvm::PublishBind::Any)
+        );
+        assert!(Cli::try_parse_from([
+            "silo",
+            "create",
+            "disk:rootfs.img",
+            "--guest-publish",
+            "everything",
+        ])
+        .is_err());
     }
 
     #[tokio::test]

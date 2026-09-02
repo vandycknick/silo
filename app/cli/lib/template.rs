@@ -305,6 +305,7 @@ forwards:
 vsock: true
 network:
   kind: private
+  publish: any
 labels:
   environment: development
 "#,
@@ -317,6 +318,10 @@ labels:
         assert_eq!(template.forwards.len(), 1);
         assert_eq!(template.forwards[0].name.as_deref(), Some("web"));
         assert_eq!(template.vsock, Some(true));
+        let Some(MachineNetwork::Private { publish, .. }) = template.network else {
+            panic!("expected private network");
+        };
+        assert_eq!(publish, Some(libvm::PublishBind::Any));
     }
 
     #[test]

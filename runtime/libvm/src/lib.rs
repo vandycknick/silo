@@ -47,9 +47,9 @@ pub use crate::machine::{
     ExecutionEvent, ExecutionLaunchFailure, ExecutionLaunchFailureReason, ExecutionLost,
     ExecutionLostReason, ExecutionOptions, ExecutionOptionsBuilder, ExecutionOutput,
     ExecutionResult, ExecutionSession, ExecutionStdin, FileWriteDisposition, GuestBuilder,
-    HostCommand, LaunchCredentials, Machine, MachineAgent, MachineAgentConnection,
-    MachineAgentConnectionState, MachineAgentIdentity, MachineAgentMetricReport,
-    MachineAgentMetricsObservation, MachineAgentProvisionFailurePolicy,
+    GuestPublishUpdate, HostCommand, LaunchCredentials, Machine, MachineAgent,
+    MachineAgentConnection, MachineAgentConnectionState, MachineAgentIdentity,
+    MachineAgentMetricReport, MachineAgentMetricsObservation, MachineAgentProvisionFailurePolicy,
     MachineAgentProvisionStepStatus, MachineAgentProvisioningStepReport, MachineAgentStatus,
     MachineAgentStatusObservation, MachineAgentStatusReport, MachineAgentStatusState,
     MachineBlockDeviceMetrics, MachineBootMode, MachineBootReport, MachineBuilder,
@@ -72,8 +72,8 @@ pub use crate::machine::{
     SshShellOptionsBuilder, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
-    MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition, NetworkDriver,
-    NetworkTopology,
+    GuestPublish, MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition,
+    NetworkDriver, NetworkTopology, PublishBind,
 };
 pub use crate::runtime::{
     NetdRuntimeConfig, PathChoice, ReadOnlyRuntime, Runtime, RuntimeBuilder, RuntimeConfig,

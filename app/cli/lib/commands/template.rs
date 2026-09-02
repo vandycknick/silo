@@ -287,10 +287,25 @@ fn remove_template(store: &TemplateStore, command: RmCmd) -> eyre::Result<()> {
 fn format_template_network(network: Option<&MachineNetwork>) -> String {
     match network {
         None => "-".to_string(),
-        Some(MachineNetwork::Private { policy_ref: None }) => "private".to_string(),
         Some(MachineNetwork::Private {
-            policy_ref: Some(policy_ref),
-        }) => format!("private (policy {policy_ref})"),
+            policy_ref,
+            publish,
+        }) => {
+            let settings = policy_ref
+                .iter()
+                .map(|policy| format!("policy {policy}"))
+                .chain(
+                    publish
+                        .iter()
+                        .map(|bind| format!("publish {}", bind.as_str())),
+                )
+                .collect::<Vec<_>>();
+            if settings.is_empty() {
+                "private".to_string()
+            } else {
+                format!("private ({})", settings.join(", "))
+            }
+        }
         Some(MachineNetwork::None) => "none".to_string(),
         Some(MachineNetwork::Named { name }) => format!("named ({name})"),
     }

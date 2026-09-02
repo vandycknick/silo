@@ -68,7 +68,7 @@ pub use streams::{
     MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState, MachineStaleReason,
     MachineSystemInfo, MachineVmSnapshot, MachineVmState,
 };
-pub use update::{MachineUpdate, MachineUserUpdate, NetworkPolicyUpdate};
+pub use update::{GuestPublishUpdate, MachineUpdate, MachineUserUpdate, NetworkPolicyUpdate};
 
 pub(crate) use name_generator::generate_machine_name;
 pub(crate) use reference::{validate_machine_name, MachineRefKind};

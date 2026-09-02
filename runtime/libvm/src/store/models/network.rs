@@ -41,27 +41,6 @@ impl NetworkInstanceState {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::NetworkInstanceState;
-
-    #[test]
-    fn network_instance_state_round_trips_through_storage_string() {
-        assert_eq!(
-            NetworkInstanceState::parse(NetworkInstanceState::Running.as_str())
-                .expect("parse network state"),
-            NetworkInstanceState::Running
-        );
-    }
-
-    #[test]
-    fn network_instance_state_rejects_unknown_storage_string() {
-        let err = NetworkInstanceState::parse("stopped").expect_err("unknown state should fail");
-
-        assert!(err.contains("unknown network instance state"));
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Persisted attachment between one machine and one network instance.
 pub(crate) struct NetworkAttachment {
@@ -82,6 +61,8 @@ pub(crate) enum MachineNetworkConfig {
     Private {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy: Option<NetworkPolicy>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        publish: Option<GuestPublish>,
     },
     None,
     Named {
@@ -91,8 +72,24 @@ pub(crate) enum MachineNetworkConfig {
 
 impl Default for MachineNetworkConfig {
     fn default() -> Self {
-        Self::Private { policy: None }
+        Self::Private {
+            policy: None,
+            publish: None,
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GuestPublish {
+    pub(crate) bind: PublishBind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PublishBind {
+    Loopback,
+    Any,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,5 +131,53 @@ impl Default for NetworkDefinition {
             created_at: 0,
             modified_at: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::store::models::network::{
+        GuestPublish, MachineNetworkConfig, NetworkInstanceState, PublishBind,
+    };
+
+    #[test]
+    fn network_instance_state_round_trips_through_storage_string() {
+        assert_eq!(
+            NetworkInstanceState::parse(NetworkInstanceState::Running.as_str())
+                .expect("parse network state"),
+            NetworkInstanceState::Running
+        );
+    }
+
+    #[test]
+    fn network_instance_state_rejects_unknown_storage_string() {
+        let err = NetworkInstanceState::parse("stopped").expect_err("unknown state should fail");
+
+        assert!(err.contains("unknown network instance state"));
+    }
+
+    #[test]
+    fn persisted_guest_publish_round_trips_through_json() {
+        let network = MachineNetworkConfig::Private {
+            policy: None,
+            publish: Some(GuestPublish {
+                bind: PublishBind::Any,
+            }),
+        };
+
+        let json = serde_json::to_string(&network).expect("serialize stored network");
+        assert_eq!(
+            serde_json::from_str::<MachineNetworkConfig>(&json)
+                .expect("deserialize stored network"),
+            network
+        );
+    }
+
+    #[test]
+    fn persisted_private_network_without_publish_still_deserializes() {
+        let network = serde_json::from_str::<MachineNetworkConfig>(r#"{"kind":"private"}"#)
+            .expect("deserialize old stored network");
+
+        assert_eq!(network, MachineNetworkConfig::default());
     }
 }

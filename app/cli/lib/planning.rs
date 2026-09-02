@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use eyre::bail;
 use libvm::{
     Forward, MachineAgent, MachineRetention, MachineUserConfig, OciImageConfigMetadata, Platform,
-    ProcessConfig,
+    ProcessConfig, PublishBind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +84,8 @@ pub(crate) struct MachineOverrides {
     pub(crate) vsock: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) network: Option<MachineNetwork>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) guest_publish: Option<PublishBind>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) labels: BTreeMap<String, String>,
 }
@@ -365,6 +367,22 @@ fn resolve_machine(template: &Template, overrides: MachineOverrides) -> eyre::Re
             .map(parse_template_forward)
             .collect::<eyre::Result<Vec<_>>>()?,
     };
+    let mut network = overrides
+        .network
+        .or_else(|| template.network.clone())
+        .unwrap_or(MachineNetwork::Private {
+            policy_ref: None,
+            publish: None,
+        });
+    if let Some(publish) = overrides.guest_publish {
+        let MachineNetwork::Private {
+            publish: selected, ..
+        } = &mut network
+        else {
+            bail!("--guest-publish requires --network private");
+        };
+        *selected = Some(publish);
+    }
     let machine = MachinePlan {
         resources: Some(MachineResources {
             cpus: Some(selected_resources.cpus.unwrap_or(1)),
@@ -379,12 +397,7 @@ fn resolve_machine(template: &Template, overrides: MachineOverrides) -> eyre::Re
         mounts,
         forwards,
         vsock: overrides.vsock.or(template.vsock),
-        network: Some(
-            overrides
-                .network
-                .or_else(|| template.network.clone())
-                .unwrap_or(MachineNetwork::Private { policy_ref: None }),
-        ),
+        network: Some(network),
         labels,
     };
     validate_machine_plan(&machine)?;
@@ -575,7 +588,7 @@ fn validate_machine_plan(machine: &MachinePlan) -> eyre::Result<()> {
     }
     if let Some(network) = &machine.network {
         match network {
-            MachineNetwork::Private { policy_ref } => {
+            MachineNetwork::Private { policy_ref, .. } => {
                 if let Some(policy_ref) = policy_ref {
                     validate_no_nul(policy_ref, "network policy reference")?;
                 }
@@ -721,10 +734,10 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use libvm::{MachineAgent, MachineRetention, OciImageConfigMetadata, Platform};
+    use libvm::{MachineAgent, MachineRetention, OciImageConfigMetadata, Platform, PublishBind};
 
     use crate::environment::{EnvironmentLayer, EnvironmentOverride, MINIMAL_LINUX_PATH};
-    use crate::machine_defaults::{MachineMount, MountMode};
+    use crate::machine_defaults::{MachineMount, MachineNetwork, MountMode};
     use crate::planning::{
         resolve, CreatePlan, ImageCacheState, ImageIdentity, MachineCreationSettings,
         MachineOverrides, OciImageIdentity, Plan, PlanKind, ProcessOverrides, PullPolicy,
@@ -786,6 +799,42 @@ mod tests {
         };
         assert_eq!(plan.machine.forwards, vec![override_forward]);
         assert_eq!(plan.machine.vsock, Some(true));
+    }
+
+    #[test]
+    fn guest_publish_rejects_non_private_effective_network() {
+        let mut request = request(PlanKind::Create, OciImageConfigMetadata::default());
+        request.machine_overrides.network = Some(MachineNetwork::None);
+        request.machine_overrides.guest_publish = Some(PublishBind::Any);
+
+        let error = resolve(request).expect_err("network none must reject guest publication");
+
+        assert_eq!(
+            error.to_string(),
+            "--guest-publish requires --network private"
+        );
+    }
+
+    #[test]
+    fn guest_publish_augments_template_private_network() {
+        let mut request = request(PlanKind::Create, OciImageConfigMetadata::default());
+        request.template.network = Some(MachineNetwork::Private {
+            policy_ref: Some("development".to_string()),
+            publish: None,
+        });
+        request.machine_overrides.guest_publish = Some(PublishBind::Any);
+
+        let Plan::Create(plan) = resolve(request).expect("resolve guest publication") else {
+            panic!("expected create plan")
+        };
+
+        assert_eq!(
+            plan.machine.network,
+            Some(MachineNetwork::Private {
+                policy_ref: Some("development".to_string()),
+                publish: Some(PublishBind::Any),
+            })
+        );
     }
 
     #[test]

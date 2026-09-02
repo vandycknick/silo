@@ -1,10 +1,10 @@
 use vm_spec::VmSpec;
 
 use crate::machine::{
-    validate_machine_name, Machine, MachineData, MachineUpdate, MachineUserUpdate,
-    NetworkPolicyUpdate,
+    validate_machine_name, GuestPublishUpdate, Machine, MachineData, MachineUpdate,
+    MachineUserUpdate, NetworkPolicyUpdate,
 };
-use crate::network::MachineNetworkBuilder;
+use crate::network::{GuestPublish, MachineNetworkBuilder};
 use crate::runtime::core::{empty_hardware, validate_root_disk_growth, write_machine_config};
 use crate::store::models::MachineNetworkConfig as ModelMachineNetworkConfig;
 use crate::utils::now_unix;
@@ -103,10 +103,13 @@ impl Machine {
         if let Some(network) = &replacement_network {
             runtime.validate_machine_network_config(network).await?;
         }
-        if replacement_network.is_some() && update.network_policy.is_some() {
+        if replacement_network.is_some()
+            && (update.network_policy.is_some() || update.guest_publish.is_some())
+        {
             return Err(LibVmError::InvalidMachineUpdate {
                 reference: self.id(),
-                reason: "network and network policy updates cannot be combined".to_string(),
+                reason: "network replacement and partial network updates cannot be combined"
+                    .to_string(),
             });
         }
         if let Some(name) = update.name.as_deref() {
@@ -208,6 +211,14 @@ impl Machine {
                 .validate_machine_network_config(&config.network)
                 .await?;
         }
+        if let Some(publish) = update.guest_publish {
+            apply_guest_publish_update(&mut config.network, publish).map_err(|reason| {
+                LibVmError::InvalidMachineUpdate {
+                    reference: config.name.clone(),
+                    reason,
+                }
+            })?;
+        }
         if let Some(mut guest) = replacement_guest {
             if update.user.is_none() {
                 guest.user = config.guest.user.clone();
@@ -247,7 +258,7 @@ fn apply_network_policy_update(
     update: NetworkPolicyUpdate,
 ) -> Result<(), String> {
     match network {
-        ModelMachineNetworkConfig::Private { policy } => {
+        ModelMachineNetworkConfig::Private { policy, .. } => {
             match update {
                 NetworkPolicyUpdate::Set(next) => {
                     *policy = Some(next.normalized());
@@ -264,6 +275,28 @@ fn apply_network_policy_update(
         ),
         ModelMachineNetworkConfig::Named { name } => Err(format!(
             "network policy updates require a private network attachment, but machine uses named network {name:?}"
+        )),
+    }
+}
+
+fn apply_guest_publish_update(
+    network: &mut ModelMachineNetworkConfig,
+    update: GuestPublishUpdate,
+) -> Result<(), String> {
+    match network {
+        ModelMachineNetworkConfig::Private { publish, .. } => {
+            *publish = match update {
+                GuestPublishUpdate::Set(bind) => Some(GuestPublish { bind }.into()),
+                GuestPublishUpdate::Clear => None,
+            };
+            Ok(())
+        }
+        ModelMachineNetworkConfig::None => Err(
+            "guest publication updates require a private network attachment, but machine networking is disabled"
+                .to_string(),
+        ),
+        ModelMachineNetworkConfig::Named { name } => Err(format!(
+            "guest publication updates require a private network attachment, but machine uses named network {name:?}"
         )),
     }
 }

@@ -70,7 +70,7 @@ fn machine_rootfs(rootfs: MachineRootfs) -> Value {
 
 fn machine_network(network: MachineNetworkConfig) -> Value {
     match network {
-        MachineNetworkConfig::Private { policy } => json!({
+        MachineNetworkConfig::Private { policy, .. } => json!({
             "kind": "private",
             "policy_json": policy.and_then(|policy| serde_json::to_string(&policy.normalized()).ok()),
         }),
