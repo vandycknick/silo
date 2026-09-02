@@ -5,12 +5,16 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::virt::error::VirtError;
 
 pub(crate) const MAX_ACTIVE_VSOCK_CONNECTIONS: usize = 1023;
+pub(crate) const INTERNAL_HEADROOM: usize = 16;
+pub(crate) const MAX_PUBLIC_VSOCK_CONNECTIONS: usize =
+    MAX_ACTIVE_VSOCK_CONNECTIONS - INTERNAL_HEADROOM;
 
 /// Admission shared by every vsock path for one virtual machine.
 #[derive(Clone, Debug)]
 pub(crate) struct VsockCapacity {
     machine: Arc<str>,
-    semaphore: Arc<Semaphore>,
+    total: Arc<Semaphore>,
+    public: Arc<Semaphore>,
     limit: usize,
 }
 
@@ -22,34 +26,52 @@ impl VsockCapacity {
     fn with_limit(machine: impl Into<Arc<str>>, limit: usize) -> Self {
         Self {
             machine: machine.into(),
-            semaphore: Arc::new(Semaphore::new(limit)),
+            total: Arc::new(Semaphore::new(limit)),
+            public: Arc::new(Semaphore::new(limit.saturating_sub(INTERNAL_HEADROOM))),
             limit,
         }
     }
 
     pub(crate) fn reserve(&self) -> Result<VsockLease, VirtError> {
-        let permit = self.semaphore.clone().try_acquire_owned().map_err(|_| {
+        let permit = self.total.clone().try_acquire_owned().map_err(|_| {
             VirtError::VsockCapacityExhausted {
                 machine: self.machine.to_string(),
                 limit: self.limit,
             }
         })?;
         Ok(VsockLease {
-            semaphore: self.semaphore.clone(),
-            _permit: permit,
+            total: self.total.clone(),
+            _total_permit: permit,
+            _public_permit: None,
+        })
+    }
+
+    pub(crate) fn reserve_public(&self) -> Result<VsockLease, VirtError> {
+        let public = self.public.clone().try_acquire_owned().map_err(|_| {
+            VirtError::VsockCapacityExhausted {
+                machine: self.machine.to_string(),
+                limit: self.limit.saturating_sub(INTERNAL_HEADROOM),
+            }
+        })?;
+        let total = self.total.clone().try_acquire_owned().map_err(|_| {
+            VirtError::VsockCapacityExhausted {
+                machine: self.machine.to_string(),
+                limit: self.limit.saturating_sub(INTERNAL_HEADROOM),
+            }
+        })?;
+        Ok(VsockLease {
+            total: self.total.clone(),
+            _total_permit: total,
+            _public_permit: Some(public),
         })
     }
 
     pub(crate) fn owns(&self, lease: &VsockLease) -> bool {
-        Arc::ptr_eq(&self.semaphore, &lease.semaphore)
+        Arc::ptr_eq(&self.total, &lease.total)
     }
 
     pub(crate) fn shares_limit_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.semaphore, &other.semaphore)
-    }
-
-    pub(crate) fn is_exhausted(&self) -> bool {
-        self.semaphore.available_permits() == 0
+        Arc::ptr_eq(&self.total, &other.total)
     }
 
     #[cfg(test)]
@@ -59,20 +81,24 @@ impl VsockCapacity {
 
     #[cfg(test)]
     pub(crate) fn available_permits(&self) -> usize {
-        self.semaphore.available_permits()
+        self.total.available_permits()
     }
 }
 
 /// A move-only reservation for one pending or established vsock stream.
 #[derive(Debug)]
 pub(crate) struct VsockLease {
-    semaphore: Arc<Semaphore>,
-    _permit: OwnedSemaphorePermit,
+    total: Arc<Semaphore>,
+    _total_permit: OwnedSemaphorePermit,
+    _public_permit: Option<OwnedSemaphorePermit>,
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::virt::capacity::{VsockCapacity, MAX_ACTIVE_VSOCK_CONNECTIONS};
+    use crate::virt::capacity::{
+        VsockCapacity, INTERNAL_HEADROOM, MAX_ACTIVE_VSOCK_CONNECTIONS,
+        MAX_PUBLIC_VSOCK_CONNECTIONS,
+    };
     use crate::virt::VirtError;
 
     #[test]
@@ -104,5 +130,36 @@ mod tests {
         ));
         drop(lease);
         assert!(clone.reserve().is_ok());
+    }
+
+    #[test]
+    fn public_users_leave_internal_headroom() {
+        let capacity = VsockCapacity::new("headroom");
+        let public = (0..MAX_PUBLIC_VSOCK_CONNECTIONS)
+            .map(|_| capacity.reserve_public().expect("public capacity"))
+            .collect::<Vec<_>>();
+        assert!(capacity.reserve_public().is_err());
+        let internal = (0..INTERNAL_HEADROOM)
+            .map(|_| capacity.reserve().expect("internal headroom"))
+            .collect::<Vec<_>>();
+        assert!(capacity.reserve().is_err());
+        drop(internal);
+        drop(public);
+        assert_eq!(capacity.available_permits(), MAX_ACTIVE_VSOCK_CONNECTIONS);
+    }
+
+    #[test]
+    fn public_failure_reports_the_public_limit_even_when_total_is_exhausted() {
+        let capacity = VsockCapacity::new("diagnostic");
+        let internal = (0..MAX_ACTIVE_VSOCK_CONNECTIONS)
+            .map(|_| capacity.reserve().expect("internal capacity"))
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            capacity.reserve_public(),
+            Err(VirtError::VsockCapacityExhausted { machine, limit })
+                if machine == "diagnostic" && limit == MAX_PUBLIC_VSOCK_CONNECTIONS
+        ));
+        drop(internal);
     }
 }

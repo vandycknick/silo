@@ -161,7 +161,7 @@ impl VirtBackend for MockBackend {
         // Guest gRPC server over in-process connections.
         let (incoming_tx, incoming_rx) = mpsc::channel::<io::Result<UnixStream>>(64);
         let mut server_shutdown = self.shutdown.subscribe();
-        let router = guest::guest_router(self.guest.clone());
+        let router = guest::guest_router(self.guest.clone()).await;
         tokio::spawn(async move {
             let result = router
                 .serve_with_incoming_shutdown(ReceiverStream::new(incoming_rx), async move {
@@ -248,6 +248,11 @@ impl VirtBackend for MockBackend {
                 "mock vsock port {port} refused connection (scripted)"
             )));
         }
+        if port == forward_spec::FORWARD_VSOCK_PORT && self.scenario.forward.unsupported {
+            return Err(VirtError::Backend(
+                "mock guest forward dialer is unsupported".to_string(),
+            ));
+        }
 
         let (client, server) = UnixStream::pair()?;
         let server = match self.scenario.vsock.drop_after_bytes.get(&port) {
@@ -255,7 +260,22 @@ impl VirtBackend for MockBackend {
             None => server,
         };
 
-        if port == SSH_PORT {
+        if port == forward_spec::FORWARD_VSOCK_PORT {
+            let scenario = self.scenario.forward.clone();
+            let mut shutdown = self.shutdown.subscribe();
+            tokio::spawn(async move {
+                tokio::select! {
+                    result = serve_forward_dialer(server, scenario) => {
+                        if let Err(error) = result {
+                            tracing::debug!(%error, "mock guest forward dialer connection ended");
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        let _ = changed;
+                    }
+                }
+            });
+        } else if port == SSH_PORT {
             // vmmon relays raw bytes for SSH; a byte echo server is full
             // fidelity for relay and half-close behavior.
             let mut shutdown = self.shutdown.subscribe();
@@ -367,6 +387,74 @@ impl VirtBackend for MockBackend {
     }
 }
 
+async fn serve_forward_dialer(
+    mut stream: UnixStream,
+    scenario: test_utils::ForwardScenario,
+) -> eyre::Result<()> {
+    let line =
+        forward_spec::io::read_line(&mut stream, forward_spec::MAX_TARGET_LINE_BYTES).await?;
+    let target = match forward_spec::parse_connect(&line)? {
+        forward_spec::TargetLine::Address(address) => address,
+        forward_spec::TargetLine::Token(_) => {
+            stream
+                .write_all(forward_spec::encode_reply(&forward_spec::Reply::Err(
+                    forward_spec::ErrReason::Invalid,
+                )))
+                .await?;
+            return Ok(());
+        }
+    };
+    if scenario
+        .refuse_targets
+        .iter()
+        .any(|value| value == &target.to_string())
+    {
+        stream
+            .write_all(forward_spec::encode_reply(&forward_spec::Reply::Err(
+                forward_spec::ErrReason::Refused,
+            )))
+            .await?;
+        return Ok(());
+    }
+    let connected: io::Result<Box<dyn MockDialStream>> = match target {
+        forward_spec::Address::Tcp(address) => tokio::net::TcpStream::connect(address)
+            .await
+            .map(|target| Box::new(target) as Box<dyn MockDialStream>),
+        forward_spec::Address::Unix(path) => UnixStream::connect(path)
+            .await
+            .map(|target| Box::new(target) as Box<dyn MockDialStream>),
+    };
+    let mut target = match connected {
+        Ok(target) => target,
+        Err(error) => {
+            let reason = match error.kind() {
+                io::ErrorKind::NotFound => forward_spec::ErrReason::NotFound,
+                io::ErrorKind::PermissionDenied => forward_spec::ErrReason::Permission,
+                io::ErrorKind::TimedOut => forward_spec::ErrReason::Timeout,
+                io::ErrorKind::HostUnreachable
+                | io::ErrorKind::NetworkUnreachable
+                | io::ErrorKind::AddrNotAvailable => forward_spec::ErrReason::Unreachable,
+                _ => forward_spec::ErrReason::Refused,
+            };
+            stream
+                .write_all(forward_spec::encode_reply(&forward_spec::Reply::Err(
+                    reason,
+                )))
+                .await?;
+            return Ok(());
+        }
+    };
+    stream
+        .write_all(forward_spec::encode_reply(&forward_spec::Reply::Ok))
+        .await?;
+    tokio::io::copy_bidirectional(&mut stream, &mut target).await?;
+    Ok(())
+}
+
+trait MockDialStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+impl<T> MockDialStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
 /// Wrap a stream so it hard-closes after relaying `limit` total bytes,
 /// simulating a scripted mid-stream connection loss.
 fn limited_stream(
@@ -422,6 +510,7 @@ fn limited_stream(
 mod tests {
     use std::path::Path;
 
+    use test_utils::Scenario;
     use tokio::net::UnixStream;
 
     use crate::virt::backend::mock::MockBackend;
@@ -507,5 +596,46 @@ mod tests {
         backend.stop().await.expect("stop mock");
         drop(listener);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unsupported_forward_scenario_refuses_the_guest_dialer_port() {
+        let root = std::path::Path::new("/tmp").join(format!(
+            "mu-{:x}-{:x}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir(&root).expect("create mock root");
+        let scenario_path = root.join("scenario.json");
+        let mut scenario = Scenario::default();
+        scenario.forward.unsupported = true;
+        scenario.write_to(&scenario_path).expect("write scenario");
+        let mut config = VmConfig::builder("mock-unsupported-forward")
+            .base_directory(&root)
+            .kernel(Path::new("/mock-kernel"))
+            .build();
+        config.set_mock_scenario(&scenario_path);
+        let backend = MockBackend::new(config).expect("mock backend");
+        backend.start().await.expect("start mock");
+        let capacity = VsockCapacity::test_with_limit("mock-unsupported-forward", 2);
+
+        let error = backend
+            .connect_vsock(
+                forward_spec::FORWARD_VSOCK_PORT,
+                capacity.reserve().expect("dialer capacity"),
+            )
+            .await
+            .expect_err("unsupported dialer must refuse direct connections");
+        assert!(error.to_string().contains("forward dialer is unsupported"));
+        assert!(backend
+            .connect_vsock(
+                agent_spec::SSH_VSOCK_PORT,
+                capacity.reserve().expect("raw capacity"),
+            )
+            .await
+            .is_ok());
+
+        backend.stop().await.expect("stop mock");
+        std::fs::remove_dir_all(root).expect("remove mock root");
     }
 }

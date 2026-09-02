@@ -45,6 +45,7 @@ pub struct ServiceHandles {
     pub(crate) server_shutdown: CancellationToken,
     pub(crate) startup_command: Option<JoinHandle<()>>,
     pub(crate) vsock_surface: Option<crate::vsock::VsockSurface>,
+    pub(crate) forwards: Option<Arc<crate::forward::ForwardTable>>,
 }
 
 #[derive(Clone)]
@@ -332,7 +333,7 @@ pub async fn start_services(
             match connection {
                 Ok(stream) => match stream.peer_cred() {
                     Ok(credentials)
-                        if peer_uid_authorized(socket_owner_uid, credentials.uid()) =>
+                        if crate::vsock::peer::peer_uid_authorized(socket_owner_uid, credentials.uid()) =>
                     {
                         tracing::debug!(
                             uid = credentials.uid(),
@@ -375,7 +376,15 @@ pub async fn start_services(
     });
 
     let guest_monitor = if ctx.guest_services_enabled {
-        Some(spawn_guest_services(&ctx.machine, ctx.store.clone(), ctx.shutdown.clone()).await?)
+        Some(
+            spawn_guest_services(
+                &ctx.machine,
+                ctx.store.clone(),
+                ctx.forwards.clone(),
+                ctx.shutdown.clone(),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -426,11 +435,8 @@ pub async fn start_services(
         server_shutdown,
         startup_command,
         vsock_surface,
+        forwards: Some(ctx.forwards.clone()),
     })
-}
-
-fn peer_uid_authorized(socket_owner_uid: u32, peer_uid: u32) -> bool {
-    socket_owner_uid == peer_uid
 }
 
 fn relay<S, I>(
@@ -610,14 +616,8 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tokio_util::sync::CancellationToken;
 
-    use crate::services::{peer_uid_authorized, relay, ssh_backend_status};
+    use crate::services::{relay, ssh_backend_status};
     use crate::virt::VirtError;
-
-    #[test]
-    fn socket_peer_must_match_its_owner() {
-        assert!(peer_uid_authorized(501, 501));
-        assert!(!peer_uid_authorized(501, 502));
-    }
 
     #[test]
     fn ssh_capacity_exhaustion_has_specific_rpc_mapping() {

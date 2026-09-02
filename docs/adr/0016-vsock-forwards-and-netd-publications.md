@@ -2,6 +2,8 @@
 
 Date: 2026-09-01
 
+Updated: 2026-09-02
+
 ## Status
 
 Draft
@@ -856,10 +858,12 @@ service names observed for the current agent instance.
   stale-socket, `0600`, and device-inode identity rules as the mux. The
   default mode is `0600`; `mode` may widen it, because a socket like
   `docker.sock` is sometimes shared with a group by its owner's choice.
-- An absolute Unix path is bound through its parent directory descriptor with
-  the same symlink refusal. `vmmon` requires the parent directory to be owned
-  by its own effective UID; it does not require mode `0700`, because the
-  owner chose the location.
+- For an absolute Unix path, `vmmon` opens the parent with `O_NOFOLLOW`,
+  requires it to be owned by its own effective UID, and records its device and
+  inode. POSIX provides no dirfd-relative AF_UNIX bind, so after binding the
+  pathname `vmmon` reopens the parent with `O_NOFOLLOW` and requires the same
+  identity before accepting the listener. It does not require mode `0700`,
+  because the owner chose the location.
 - TCP listeners bind exactly the requested address. `vmmon` never widens a
   bind address and never binds a TCP address for any reason other than a
   declared or held forward.

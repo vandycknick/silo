@@ -169,6 +169,12 @@ pub async fn init(
     } = inputs;
     let start_request = start_request.read(machine_id, machine_run_id).await?;
     let spec = load_spec(runtime)?;
+    spec.validate().map_err(|error| {
+        eyre::eyre!(
+            "validate vm spec at {}: {error}",
+            runtime.config().display()
+        )
+    })?;
     let guest_services_enabled = agent_enabled;
     let network = parse_network_args(network_args)?;
 
@@ -187,6 +193,17 @@ pub async fn init(
             crate::vsock::PreparedVsockSurface::prepare(runtime.runtime_dir(), filename)
         })
         .transpose()?;
+    let mux_filename =
+        vm_spec::effective_vsock_filename(spec.vsock.as_ref()).and_then(|path| path.to_str());
+    let forwards = crate::forward::ForwardTable::prepare_declared(
+        &spec.forwards,
+        runtime.runtime_dir(),
+        mux_filename,
+    )
+    .await?;
+    if !guest_services_enabled {
+        forwards.set_agent_availability(crate::forward::GuestHalfAvailability::Unsupported);
+    }
 
     let machine_config = vm_spec_machine_config(VmSpecInputs {
         name,
@@ -234,7 +251,11 @@ pub async fn init(
         },
         None => None,
     };
+    forwards.activate(machine.clone());
     if let Err(error) = store.set_vm_state(VmState::Running, "vm running") {
+        if let Err(shutdown_error) = forwards.shutdown().await {
+            tracing::error!(%shutdown_error, "failed to stop forwards after state initialization failure");
+        }
         drop(vsock_surface);
         if let Err(stop_error) = machine.stop().await {
             tracing::error!(%stop_error, "failed to stop VM after state initialization failure");
@@ -250,6 +271,7 @@ pub async fn init(
             machine,
             serial_console,
             store,
+            forwards,
             stop_requested: CancellationToken::new(),
             shutdown: CancellationToken::new(),
         },

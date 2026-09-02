@@ -147,19 +147,39 @@ impl MockGuest {
 }
 
 /// Assemble the tonic router serving the fake guest services.
-pub(crate) fn guest_router(guest: Arc<MockGuest>) -> Router {
+pub(crate) async fn guest_router(guest: Arc<MockGuest>) -> Router {
     let agent = AgentService {
         guest: guest.clone(),
     };
     let process = ProcessService {
         guest: guest.clone(),
     };
-    let filesystem = super::fs::MockFilesystemService::new(
+    let filesystem = crate::virt::backend::mock::fs::MockFilesystemService::new(
         guest.guest_root().to_path_buf(),
         guest.scenario.filesystem.clone(),
     );
 
+    let (health, health_service) = tonic_health::server::health_reporter();
+    for service in [
+        "silo.v1.GuestAgentService",
+        "silo.v1.GuestFilesystemService",
+        "silo.v1.GuestProcessService",
+    ] {
+        health
+            .set_service_status(service, tonic_health::ServingStatus::Serving)
+            .await;
+    }
+    if !guest.scenario.forward.unsupported {
+        health
+            .set_service_status(
+                "silo.v1.GuestForwardService",
+                tonic_health::ServingStatus::Serving,
+            )
+            .await;
+    }
+
     tonic::transport::Server::builder()
+        .add_service(health_service)
         .add_service(
             GuestAgentServiceServer::new(agent)
                 .max_decoding_message_size(protocol::STRUCTURED_16_MIB)

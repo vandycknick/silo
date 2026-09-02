@@ -29,6 +29,7 @@ pub struct Scenario {
     pub exec: ExecScenario,
     pub vsock: VsockScenario,
     pub filesystem: FilesystemScenario,
+    pub forward: ForwardScenario,
 }
 
 /// Behavior of `machine.start()`.
@@ -124,6 +125,16 @@ pub struct FilesystemScenario {
     /// Guest paths that fail with a structured error code.
     /// Matches `ErrorCode` names, e.g. "PERMISSION_DENIED".
     pub errors: HashMap<String, String>,
+}
+
+/// Behavior of the mock guest forward dialer and capability check.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct ForwardScenario {
+    /// Canonical guest target addresses answered with `ERR refused`.
+    pub refuse_targets: Vec<String>,
+    /// Omit GuestForwardService from health discovery.
+    pub unsupported: bool,
 }
 
 impl Scenario {

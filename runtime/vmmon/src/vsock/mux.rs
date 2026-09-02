@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -24,7 +24,7 @@ pub(crate) async fn serve(
             result = listener.accept() => match result {
                 Ok((stream, _)) => {
                     let credentials = match stream.peer_cred() {
-                        Ok(credentials) if peer_uid_authorized(owner_uid, credentials.uid()) => credentials,
+                        Ok(credentials) if crate::vsock::peer::peer_uid_authorized(owner_uid, credentials.uid()) => credentials,
                         Ok(credentials) => {
                             tracing::warn!(uid = credentials.uid(), expected_uid = owner_uid, "rejected vsock mux connection from unauthorized UID");
                             continue;
@@ -34,10 +34,6 @@ pub(crate) async fn serve(
                             continue;
                         }
                     };
-                    if machine.vsock_capacity_exhausted() {
-                        tracing::warn!(machine = machine.name(), "rejected vsock mux connection at active connection limit");
-                        continue;
-                    }
                     tracing::debug!(uid = credentials.uid(), pid = ?credentials.pid(), "accepted vsock mux connection");
                     let machine = machine.clone();
                     let shutdown = shutdown.clone();
@@ -59,10 +55,6 @@ pub(crate) async fn serve(
     while connections.join_next().await.is_some() {}
 }
 
-fn peer_uid_authorized(owner_uid: u32, peer_uid: u32) -> bool {
-    owner_uid == peer_uid
-}
-
 async fn handle_connection(
     mut client: UnixStream,
     machine: VirtualMachine,
@@ -72,7 +64,7 @@ async fn handle_connection(
         result = read_command(&mut client) => result?,
         _ = shutdown.cancelled() => return Ok(()),
     };
-    let lease = machine.reserve_vsock()?;
+    let lease = machine.reserve_public_vsock()?;
     let mut guest = tokio::select! {
         result = tokio::time::timeout(
             CONNECTION_REQUEST_TIMEOUT,
@@ -91,15 +83,8 @@ async fn handle_connection(
 }
 
 async fn read_command(stream: &mut UnixStream) -> eyre::Result<u32> {
-    let mut command = Vec::with_capacity(MAX_COMMAND_BYTES);
-    for _ in 0..MAX_COMMAND_BYTES {
-        let byte = stream.read_u8().await?;
-        command.push(byte);
-        if byte == b'\n' {
-            return parse_command(&command);
-        }
-    }
-    Err(eyre::eyre!("vsock mux command exceeds 32 bytes"))
+    let command = forward_spec::io::read_line(stream, MAX_COMMAND_BYTES).await?;
+    parse_command(&command)
 }
 
 fn parse_command(command: &[u8]) -> eyre::Result<u32> {
@@ -122,7 +107,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
-    use crate::vsock::mux::{parse_command, peer_uid_authorized, read_command, MAX_COMMAND_BYTES};
+    use crate::vsock::mux::{parse_command, read_command, MAX_COMMAND_BYTES};
 
     #[test]
     fn command_parser_accepts_only_the_canonical_protocol() {
@@ -186,8 +171,11 @@ mod tests {
         let (client, _server) = UnixStream::pair().expect("socket pair");
         let credentials = client.peer_cred().expect("read peer credentials");
         assert_eq!(credentials.uid(), nix::unistd::geteuid().as_raw());
-        assert!(peer_uid_authorized(credentials.uid(), credentials.uid()));
-        assert!(!peer_uid_authorized(
+        assert!(crate::vsock::peer::peer_uid_authorized(
+            credentials.uid(),
+            credentials.uid()
+        ));
+        assert!(!crate::vsock::peer::peer_uid_authorized(
             credentials.uid(),
             credentials.uid().wrapping_add(1)
         ));

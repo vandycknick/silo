@@ -33,6 +33,7 @@ pub async fn run(
 
     handles.mark_stopping().await;
     ctx.shutdown.cancel();
+    stop_forwards(&mut handles).await;
     stop_vsock_surface(&mut handles).await;
     let (forced, backend_error) = match trigger {
         ShutdownTrigger::Requested(message) => {
@@ -75,6 +76,17 @@ async fn stop_vsock_surface(handles: &mut ServiceHandles) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::error!(%error, "vsock surface shutdown failed"),
         Err(_) => tracing::warn!("vsock surface exceeded shutdown drain timeout"),
+    }
+}
+
+async fn stop_forwards(handles: &mut ServiceHandles) {
+    let Some(forwards) = handles.forwards.take() else {
+        return;
+    };
+    match tokio::time::timeout(SERVICE_DRAIN_TIMEOUT, forwards.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(%error, "forward shutdown failed"),
+        Err(_) => tracing::warn!("forwards exceeded shutdown drain timeout"),
     }
 }
 

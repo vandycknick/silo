@@ -18,7 +18,7 @@ use libvm::{
 };
 use test_utils::Scenario;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Endpoint;
@@ -107,6 +107,453 @@ async fn create_machine(env: &TestEnv, name: &str) -> Machine {
         .create()
         .await
         .expect("create machine")
+}
+
+async fn set_forwards(machine: &Machine, forwards: Vec<forward_spec::Forward>) {
+    let mut spec = machine.inspect().await.expect("inspect machine").spec;
+    spec.forwards = forwards;
+    machine
+        .replace_config(spec)
+        .await
+        .expect("set declared forwards");
+}
+
+fn inbound_unix(listen: impl Into<PathBuf>, connect: impl Into<PathBuf>) -> forward_spec::Forward {
+    forward_spec::Forward::new(
+        forward_spec::Endpoint::Host(forward_spec::Address::Unix(listen.into())),
+        forward_spec::Endpoint::Guest(forward_spec::Address::Unix(connect.into())),
+    )
+}
+
+async fn spawn_unix_echo(path: &Path) -> tokio::task::JoinHandle<()> {
+    let listener = UnixListener::bind(path).expect("bind Unix echo target");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (mut read, mut write) = stream.split();
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    })
+}
+
+async fn spawn_tcp_echo() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind TCP echo target");
+    let address = listener.local_addr().expect("TCP echo address");
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (mut read, mut write) = stream.split();
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+    (address, task)
+}
+
+fn available_tcp_address() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+    listener.local_addr().expect("reserved test address")
+}
+
+async fn assert_echo<S>(stream: &mut S, payload: &[u8])
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    stream
+        .write_all(payload)
+        .await
+        .expect("write forwarded bytes");
+    let mut echoed = vec![0_u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut echoed))
+        .await
+        .expect("forward echo deadline")
+        .expect("read forwarded bytes");
+    assert_eq!(echoed, payload);
+}
+
+async fn assert_closed_without_bytes<S>(stream: &mut S)
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    assert_closed_without_bytes_within(stream, Duration::from_secs(2)).await;
+}
+
+async fn assert_closed_without_bytes_within<S>(stream: &mut S, timeout: Duration)
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut byte = [0_u8; 1];
+    match tokio::time::timeout(timeout, stream.read(&mut byte)).await {
+        Ok(Ok(0)) => {}
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Ok(Ok(count)) => panic!("forward wrote {count} bytes before closing"),
+        Ok(Err(error)) => panic!("unexpected forward close error: {error}"),
+        Err(_) => panic!("forward did not close within deadline"),
+    }
+}
+
+#[tokio::test]
+async fn declared_inbound_unix_forward_reaches_guest_unix_target_and_cleans_up() {
+    let env = test_env("forward-unix", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-forward-unix").await;
+    let target = env._temp.path().join("guest-target.sock");
+    let echo = spawn_unix_echo(&target).await;
+    set_forwards(&machine, vec![inbound_unix("svc.sock", &target)]).await;
+    let listen = env
+        ._run_root
+        .path()
+        .join("machines")
+        .join(machine.id())
+        .join("svc.sock");
+
+    start_ready(&machine).await;
+    let mut client = UnixStream::connect(&listen)
+        .await
+        .expect("connect Unix forward");
+    assert_echo(&mut client, b"unix-forward").await;
+    assert_eq!(
+        std::fs::metadata(&listen)
+            .expect("forward metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let status = machine.monitor_status().await.expect("monitor status");
+    let services = match status.agent {
+        MachineAgentStatus::Enabled(enabled) => enabled.services,
+        MachineAgentStatus::Disabled => panic!("agent unexpectedly disabled"),
+    };
+    assert!(services.contains(&"silo.v1.GuestAgentService".to_string()));
+    assert!(services.contains(&"silo.v1.GuestFilesystemService".to_string()));
+    assert!(services.contains(&"silo.v1.GuestProcessService".to_string()));
+    assert!(services.contains(&"silo.v1.GuestForwardService".to_string()));
+
+    machine.stop().await.expect("stop machine");
+    assert!(!listen.exists(), "owned Unix listener must be removed");
+    echo.abort();
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn declared_inbound_tcp_forward_reaches_guest_tcp_target() {
+    let env = test_env("forward-tcp", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-forward-tcp").await;
+    let (target, echo) = spawn_tcp_echo().await;
+    let listen = available_tcp_address();
+    set_forwards(
+        &machine,
+        vec![forward_spec::Forward::new(
+            forward_spec::Endpoint::Host(forward_spec::Address::Tcp(listen)),
+            forward_spec::Endpoint::Guest(forward_spec::Address::Tcp(target)),
+        )],
+    )
+    .await;
+
+    start_ready(&machine).await;
+    let mut client = TcpStream::connect(listen)
+        .await
+        .expect("connect TCP forward");
+    assert_echo(&mut client, b"tcp-forward").await;
+
+    machine.stop().await.expect("stop machine");
+    echo.abort();
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn agent_disabled_rejects_agent_forward_immediately_while_raw_vsock_works() {
+    let env = test_env("forward-raw", &Scenario::default()).await;
+    let machine = env
+        .runtime
+        .machine()
+        .name("integration-forward-raw")
+        .image_source(ImageSource::Disk(env.disk.clone()))
+        .network(|network| network.none())
+        .agent_mode(Some(MachineAgent::Disabled))
+        .create()
+        .await
+        .expect("create agent-disabled machine");
+    let raw_listen = env._temp.path().join("raw.sock");
+    let agent_listen = env._temp.path().join("agent.sock");
+    set_forwards(
+        &machine,
+        vec![
+            forward_spec::Forward::new(
+                forward_spec::Endpoint::Host(forward_spec::Address::Unix(agent_listen.clone())),
+                forward_spec::Endpoint::Guest(forward_spec::Address::Unix(
+                    env._temp.path().join("unavailable-guest.sock"),
+                )),
+            ),
+            forward_spec::Forward::new(
+                forward_spec::Endpoint::Host(forward_spec::Address::Unix(raw_listen.clone())),
+                forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+            ),
+        ],
+    )
+    .await;
+
+    machine.start().await.expect("start agent-disabled machine");
+    let mut agent_client = UnixStream::connect(&agent_listen)
+        .await
+        .expect("connect disabled agent forward");
+    let refusal_started = std::time::Instant::now();
+    assert_closed_without_bytes(&mut agent_client).await;
+    assert!(refusal_started.elapsed() < Duration::from_secs(1));
+
+    let mut raw_client = UnixStream::connect(&raw_listen)
+        .await
+        .expect("connect raw forward");
+    assert_echo(&mut raw_client, b"raw-vsock").await;
+    machine.stop().await.expect("stop machine");
+    assert!(!agent_listen.exists());
+    assert!(!raw_listen.exists());
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn inbound_connection_before_agent_ready_is_parked_then_served() {
+    let mut scenario = Scenario::default();
+    scenario.agent.ready_delay_ms = Some(750);
+    let env = test_env("forward-park", &scenario).await;
+    let machine = create_machine(&env, "integration-forward-park").await;
+    let target = env._temp.path().join("park-target.sock");
+    let echo = spawn_unix_echo(&target).await;
+    let listen = env._temp.path().join("park-listen.sock");
+    set_forwards(&machine, vec![inbound_unix(&listen, &target)]).await;
+
+    machine
+        .start()
+        .await
+        .expect("start machine before agent ready");
+    let mut client = UnixStream::connect(&listen)
+        .await
+        .expect("connect pending forward");
+    let started = std::time::Instant::now();
+    assert_echo(&mut client, b"parked").await;
+    assert!(started.elapsed() >= Duration::from_millis(500));
+
+    machine.stop().await.expect("stop machine");
+    echo.abort();
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn inbound_refusal_closes_host_connection_without_bytes() {
+    let target = PathBuf::from("/tmp/refused-forward-target.sock");
+    let mut scenario = Scenario::default();
+    scenario
+        .forward
+        .refuse_targets
+        .push(format!("unix:{}", target.display()));
+    let env = test_env("forward-refused", &scenario).await;
+    let machine = create_machine(&env, "integration-forward-refused").await;
+    let listen = env._temp.path().join("refused-listen.sock");
+    set_forwards(&machine, vec![inbound_unix(&listen, &target)]).await;
+
+    start_ready(&machine).await;
+    let mut client = UnixStream::connect(&listen)
+        .await
+        .expect("connect refused forward");
+    client
+        .write_all(b"must-not-return")
+        .await
+        .expect("write request");
+    assert_closed_without_bytes(&mut client).await;
+
+    machine.stop().await.expect("stop machine");
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn forward_bind_failure_fails_machine_start_and_rolls_back() {
+    let env = test_env("forward-bind-failure", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-forward-bind-failure").await;
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy TCP port");
+    let address = occupied.local_addr().expect("occupied address");
+    let rollback = env._temp.path().join("rollback.sock");
+    set_forwards(
+        &machine,
+        vec![
+            forward_spec::Forward::new(
+                forward_spec::Endpoint::Host(forward_spec::Address::Unix(rollback.clone())),
+                forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+            ),
+            forward_spec::Forward::new(
+                forward_spec::Endpoint::Host(forward_spec::Address::Tcp(address)),
+                forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+            )
+            .with_name("occupied"),
+        ],
+    )
+    .await;
+
+    let error = machine.start().await.expect_err("occupied bind must fail");
+    let message = error.to_string();
+    assert!(message.contains("occupied"), "{message}");
+    assert!(message.contains(&address.to_string()), "{message}");
+    assert!(
+        !rollback.exists(),
+        "earlier prepared listener must roll back"
+    );
+    drop(occupied);
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn explicit_mode_widens_unix_forward_socket() {
+    let env = test_env("forward-mode", &Scenario::default()).await;
+    let machine = create_machine(&env, "integration-forward-mode").await;
+    let listen = env._temp.path().join("shared.sock");
+    let forward = forward_spec::Forward::new(
+        forward_spec::Endpoint::Host(forward_spec::Address::Unix(listen.clone())),
+        forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+    )
+    .with_mode(forward_spec::UnixMode::new(0o666).expect("valid mode"));
+    set_forwards(&machine, vec![forward]).await;
+
+    machine.start().await.expect("start machine");
+    assert_eq!(
+        std::fs::metadata(&listen)
+            .expect("shared listener metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o666
+    );
+    machine.stop().await.expect("stop machine");
+    assert!(!listen.exists());
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn unsupported_agent_closes_forward_without_changing_readiness() {
+    let mut scenario = Scenario::default();
+    scenario.forward.unsupported = true;
+    let env = test_env("forward-unsupported", &scenario).await;
+    let machine = create_machine(&env, "integration-forward-unsupported").await;
+    let listen = env._temp.path().join("unsupported.sock");
+    let target = env._temp.path().join("unused-target.sock");
+    set_forwards(&machine, vec![inbound_unix(&listen, &target)]).await;
+
+    start_ready(&machine).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let status = machine.monitor_status().await.expect("monitor status");
+    assert!(status.readiness.ready);
+    let services = match status.agent {
+        MachineAgentStatus::Enabled(enabled) => enabled.services,
+        MachineAgentStatus::Disabled => panic!("agent unexpectedly disabled"),
+    };
+    assert!(!services.contains(&"silo.v1.GuestForwardService".to_string()));
+    let mut client = UnixStream::connect(&listen)
+        .await
+        .expect("connect unsupported forward");
+    assert_closed_without_bytes(&mut client).await;
+
+    machine.stop().await.expect("stop machine");
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn pending_forward_parking_is_bounded_and_expires_after_thirty_seconds() {
+    let mut scenario = Scenario::default();
+    scenario.agent.ready_delay_ms = Some(40_000);
+    let env = test_env("forward-parking-limit", &scenario).await;
+    let machine = create_machine(&env, "integration-forward-parking-limit").await;
+    let listen = env._temp.path().join("parking-limit.sock");
+    let target = env._temp.path().join("parking-target.sock");
+    set_forwards(&machine, vec![inbound_unix(&listen, &target)]).await;
+    machine.start().await.expect("start pending machine");
+
+    let mut parked = Vec::new();
+    for _ in 0..64 {
+        parked.push(
+            UnixStream::connect(&listen)
+                .await
+                .expect("connect parked client"),
+        );
+    }
+    let mut overflow = UnixStream::connect(&listen)
+        .await
+        .expect("connect overflow client");
+    assert_closed_without_bytes(&mut overflow).await;
+
+    let started = std::time::Instant::now();
+    assert_closed_without_bytes_within(&mut parked[0], Duration::from_secs(35)).await;
+    assert!(started.elapsed() >= Duration::from_secs(27));
+    assert!(started.elapsed() <= Duration::from_secs(35));
+
+    machine.stop().await.expect("stop machine");
+    machine.remove().await.expect("remove machine");
+}
+
+#[tokio::test]
+async fn mux_and_forward_streams_share_public_capacity_and_leave_headroom() {
+    let env = test_env("forward-capacity", &Scenario::default()).await;
+    let machine = env
+        .runtime
+        .machine()
+        .name("integration-forward-capacity")
+        .image_source(ImageSource::Disk(env.disk.clone()))
+        .network(|network| network.none())
+        .agent_mode(Some(MachineAgent::Disabled))
+        .create()
+        .await
+        .expect("create capacity machine");
+    let listen = env._temp.path().join("capacity.sock");
+    let mut spec = machine
+        .inspect()
+        .await
+        .expect("inspect capacity machine")
+        .spec;
+    spec.vsock = Some(vm_spec::Vsock {
+        enabled: true,
+        uds: None,
+    });
+    spec.forwards = vec![forward_spec::Forward::new(
+        forward_spec::Endpoint::Host(forward_spec::Address::Unix(listen.clone())),
+        forward_spec::Endpoint::Vsock(agent_spec::SSH_VSOCK_PORT),
+    )];
+    machine
+        .replace_config(spec)
+        .await
+        .expect("configure capacity machine");
+    let mux = machine
+        .vsock_socket()
+        .await
+        .expect("resolve mux")
+        .expect("enabled mux");
+    machine.start().await.expect("start capacity machine");
+
+    let mut mux_client = UnixStream::connect(mux)
+        .await
+        .expect("connect mux capacity slot");
+    mux_client
+        .write_all(b"CONNECT 22\n")
+        .await
+        .expect("open mux capacity slot");
+    read_mux_acknowledgement(&mut mux_client).await;
+
+    let mut clients = Vec::with_capacity(1006);
+    for _ in 0..1006 {
+        let mut client = UnixStream::connect(&listen)
+            .await
+            .expect("connect forward capacity slot");
+        assert_echo(&mut client, b"x").await;
+        clients.push(client);
+    }
+    let mut exhausted = UnixStream::connect(&listen)
+        .await
+        .expect("connect exhausted forward");
+    assert_closed_without_bytes(&mut exhausted).await;
+
+    drop(clients);
+    drop(mux_client);
+    machine.stop().await.expect("stop capacity machine");
+    machine.remove().await.expect("remove capacity machine");
 }
 
 #[tokio::test]

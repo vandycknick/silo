@@ -1,7 +1,8 @@
 mod discovery;
 mod mux;
-mod paths;
-mod relay;
+pub(crate) mod paths;
+pub(crate) mod peer;
+pub(crate) mod relay;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

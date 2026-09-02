@@ -237,6 +237,7 @@ pub struct MachineEnabledAgent {
     pub connection: MachineAgentConnection,
     pub identity: Option<MachineAgentIdentity>,
     pub status: Option<MachineAgentStatusObservation>,
+    pub services: Vec<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineAgentConnection {
@@ -1040,6 +1041,7 @@ impl TryFrom<v1::EnabledAgent> for MachineEnabledAgent {
             connection: required(value.connection, "agent.connection")?.try_into()?,
             identity: value.identity.map(TryInto::try_into).transpose()?,
             status: value.status.map(TryInto::try_into).transpose()?,
+            services: value.services,
         })
     }
 }
