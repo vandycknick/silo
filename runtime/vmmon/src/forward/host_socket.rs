@@ -122,7 +122,7 @@ impl OwnedHostListener {
                 path.display()
             ));
         }
-        let socket_mode = mode.map_or(0o600, UnixMode::get);
+        let socket_mode = platform_socket_mode(mode.map_or(0o600, UnixMode::get))?;
         if let Err(error) = fchmodat(
             &directory,
             filename.as_os_str(),
@@ -219,6 +219,17 @@ impl OwnedHostListener {
             },
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_socket_mode(mode: u32) -> eyre::Result<u32> {
+    Ok(mode)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_socket_mode(mode: u32) -> eyre::Result<u16> {
+    mode.try_into()
+        .map_err(|_| eyre::eyre!("Unix forward mode is not representable on this host: {mode:#o}"))
 }
 
 fn directory_identity(directory: &OwnedFd) -> eyre::Result<(libc::dev_t, libc::ino_t)> {
