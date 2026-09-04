@@ -126,6 +126,11 @@ impl Forward {
     }
 
     pub fn validate(&self) -> Result<ForwardShape, ForwardError> {
+        for endpoint in [&self.listen, &self.connect] {
+            if let Some(address) = endpoint.address() {
+                address.validate()?;
+            }
+        }
         let shape = match (&self.listen, &self.connect) {
             (Endpoint::Host(_), Endpoint::Guest(_)) => ForwardShape::InboundAgent,
             (Endpoint::Host(_), Endpoint::Vsock(_)) => ForwardShape::InboundVsock,
@@ -236,6 +241,8 @@ pub enum GuestHalf {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ForwardError {
+    #[error(transparent)]
+    Address(#[from] crate::AddressError),
     #[error("invalid forward sides: listen {listen}, connect {connect}")]
     InvalidSides { listen: String, connect: String },
     #[error("vsock listen port {0} is reserved")]

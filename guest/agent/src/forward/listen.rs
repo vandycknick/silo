@@ -225,7 +225,7 @@ async fn relay_connection(
     let mut remote = tokio::time::timeout(SETUP_TIMEOUT, async {
         let mut remote = connector.connect().await?;
         remote
-            .write_all(&encode_connect(&TargetLine::Token(token)))
+            .write_all(&encode_connect(&TargetLine::Token(token)).map_err(io::Error::other)?)
             .await?;
         let line = forward_spec::io::read_line(&mut remote, MAX_TARGET_LINE_BYTES)
             .await

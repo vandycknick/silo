@@ -411,8 +411,12 @@ address         = "tcp:" [ ip ":" ] port / "unix:" path
 ip              = IPv4address / "[" IPv6address "]"
 port            = canonical decimal, 0..65535
 vsock-port      = canonical decimal u32
-path            = one or more non-NUL characters
+path            = one or more UTF-8 characters other than NUL, CR, or LF
 ```
+
+Every address must fit in a 512-byte `CONNECT <address>\n` target line,
+including the prefix and terminator. Programmatically constructed addresses
+are subject to the same validation before a forward binds any socket.
 
 A `tcp:` address without an IP means the loopback address of that side
 (`127.0.0.1`). The IP is a literal; hostnames are not resolved by either

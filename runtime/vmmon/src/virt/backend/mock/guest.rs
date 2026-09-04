@@ -278,7 +278,7 @@ impl GuestForwardService for ForwardService {
                             connections.spawn(async move {
                                 let setup = tokio::time::timeout(Duration::from_secs(5), async {
                                     let mut remote = UnixStream::connect(return_path).await?;
-                                    remote.write_all(&forward_spec::encode_connect(&forward_spec::TargetLine::Token(token))).await?;
+                                    remote.write_all(&forward_spec::encode_connect(&forward_spec::TargetLine::Token(token)).map_err(std::io::Error::other)?).await?;
                                     let line = forward_spec::io::read_line(&mut remote, forward_spec::MAX_TARGET_LINE_BYTES)
                                         .await
                                         .map_err(std::io::Error::other)?;

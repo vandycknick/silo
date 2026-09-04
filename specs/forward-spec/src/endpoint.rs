@@ -14,6 +14,27 @@ pub enum Address {
 }
 
 impl Address {
+    /// Checks that this address can be represented losslessly by the target-line protocol.
+    pub fn validate(&self) -> Result<(), AddressError> {
+        if let Self::Unix(path) = self {
+            let text = path.to_str().ok_or(AddressError::UnixPathNotUtf8)?;
+            if text.is_empty() {
+                return Err(AddressError::EmptyUnixPath);
+            }
+            if text.contains('\0') {
+                return Err(AddressError::UnixPathContainsNul);
+            }
+            if text.contains(['\r', '\n']) {
+                return Err(AddressError::UnixPathContainsLineBreak);
+            }
+        }
+        let bytes = "CONNECT ".len() + self.to_string().len() + 1;
+        if bytes > crate::MAX_TARGET_LINE_BYTES {
+            return Err(AddressError::TargetTooLong(bytes));
+        }
+        Ok(())
+    }
+
     pub fn tcp(address: SocketAddr) -> Self {
         Self::Tcp(address)
     }
@@ -66,13 +87,9 @@ impl FromStr for Address {
             return parse_tcp(value).map(Self::Tcp);
         }
         if let Some(value) = value.strip_prefix("unix:") {
-            if value.is_empty() {
-                return Err(AddressError::EmptyUnixPath);
-            }
-            if value.contains('\0') {
-                return Err(AddressError::UnixPathContainsNul);
-            }
-            return Ok(Self::Unix(PathBuf::from(value)));
+            let address = Self::Unix(PathBuf::from(value));
+            address.validate()?;
+            return Ok(address);
         }
         Err(AddressError::InvalidAddress(value.to_owned()))
     }
@@ -115,6 +132,15 @@ pub enum AddressError {
     EmptyUnixPath,
     #[error("Unix socket path must not contain NUL")]
     UnixPathContainsNul,
+    #[error("Unix socket path must not contain CR or LF")]
+    UnixPathContainsLineBreak,
+    #[error("Unix socket path must be UTF-8")]
+    UnixPathNotUtf8,
+    #[error(
+        "address requires a {0}-byte target line; maximum is {limit}",
+        limit = crate::MAX_TARGET_LINE_BYTES
+    )]
+    TargetTooLong(usize),
 }
 
 fn parse_tcp(value: &str) -> Result<SocketAddr, AddressError> {

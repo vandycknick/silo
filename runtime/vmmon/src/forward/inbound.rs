@@ -148,7 +148,9 @@ async fn handle_connection(
                     .connect_vsock_reserved(forward_spec::FORWARD_VSOCK_PORT, lease)
                     .await?;
                 stream
-                    .write_all(&forward_spec::encode_connect(&TargetLine::Address(address)))
+                    .write_all(&forward_spec::encode_connect(&TargetLine::Address(
+                        address,
+                    ))?)
                     .await?;
                 let reply = forward_spec::io::read_line(&mut stream, MAX_TARGET_LINE_BYTES).await?;
                 match forward_spec::parse_reply(&reply)? {

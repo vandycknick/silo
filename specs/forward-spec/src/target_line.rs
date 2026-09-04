@@ -157,12 +157,17 @@ impl FromStr for ErrReason {
     }
 }
 
-pub fn encode_connect(target: &TargetLine) -> Vec<u8> {
+pub fn encode_connect(target: &TargetLine) -> Result<Vec<u8>, TargetLineError> {
     let target = match target {
-        TargetLine::Address(address) => address.to_string(),
+        TargetLine::Address(address) => {
+            address.validate().map_err(TargetLineError::Address)?;
+            address.to_string()
+        }
         TargetLine::Token(token) => token.to_string(),
     };
-    format!("CONNECT {target}\n").into_bytes()
+    let line = format!("CONNECT {target}\n").into_bytes();
+    validate_complete_line(&line)?;
+    Ok(line)
 }
 
 pub fn parse_connect(line: &[u8]) -> Result<TargetLine, TargetLineError> {
@@ -226,6 +231,8 @@ fn validate_complete_line(line: &[u8]) -> Result<(), TargetLineError> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TargetLineError {
+    #[error(transparent)]
+    Address(crate::AddressError),
     #[error("target line is {0} bytes; maximum is {MAX_TARGET_LINE_BYTES}")]
     TooLong(usize),
     #[error("target line must contain exactly one trailing newline")]
@@ -244,6 +251,42 @@ pub enum TargetLineError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_programmatic_paths_cannot_enter_the_wire() {
+        use crate::{Address, Endpoint, Forward, TargetLine, MAX_TARGET_LINE_BYTES};
+        use std::os::unix::ffi::OsStringExt;
+        let paths = [
+            std::path::PathBuf::from("/run/service.sock\nextra"),
+            "/run/service.sock\rextra".into(),
+            "/run/service\0.sock".into(),
+            "".into(),
+            format!("/{}", "x".repeat(MAX_TARGET_LINE_BYTES)).into(),
+            std::ffi::OsString::from_vec(vec![b'/', 0xff]).into(),
+        ];
+        for path in paths {
+            let address = Address::Unix(path);
+            assert!(crate::encode_connect(&TargetLine::Address(address.clone())).is_err());
+            let forward = Forward::new("host:tcp:0".parse().unwrap(), Endpoint::Guest(address));
+            assert!(forward.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn target_length_limit_includes_prefix_and_terminator() {
+        let address = format!(
+            "unix:/{}",
+            "x".repeat(crate::MAX_TARGET_LINE_BYTES - "CONNECT unix:/\n".len())
+        );
+        let target = crate::TargetLine::Address(address.parse().unwrap());
+        let encoded = crate::encode_connect(&target).unwrap();
+        assert_eq!(encoded.len(), crate::MAX_TARGET_LINE_BYTES);
+        assert_eq!(crate::parse_connect(&encoded).unwrap(), target);
+        assert!(format!("{address}x").parse::<crate::Address>().is_err());
+        for path in ["unix:/run/a\nb", "unix:/run/a\rb"] {
+            assert!(path.parse::<crate::Address>().is_err());
+        }
+    }
+
     use crate::{
         encode_connect, encode_reply, parse_connect, parse_reply, ErrReason, Reply, TargetLine,
         Token,
@@ -256,7 +299,7 @@ mod tests {
             b"CONNECT unix:/var/run/docker.sock\n".as_slice(),
         ] {
             let target = parse_connect(line).unwrap();
-            assert_eq!(encode_connect(&target), line);
+            assert_eq!(encode_connect(&target).expect("encode target"), line);
             assert!(matches!(target, TargetLine::Address(_)));
         }
     }
@@ -267,7 +310,7 @@ mod tests {
         assert_eq!(token.to_string(), "abababababababababababababababab");
         assert_eq!(token.to_string().parse::<Token>().unwrap(), token);
         assert_eq!(format!("{token:?}"), "Token(..)");
-        let line = encode_connect(&TargetLine::Token(token));
+        let line = encode_connect(&TargetLine::Token(token)).expect("encode token");
         assert_eq!(parse_connect(&line).unwrap(), TargetLine::Token(token));
     }
 
