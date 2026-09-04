@@ -1338,7 +1338,7 @@ async fn list_reports_machine_and_session_scopes_and_port_1028_has_no_public_soc
 }
 
 #[tokio::test]
-async fn session_raw_vsock_port_detaches_and_reattaches_without_reregistering() {
+async fn session_raw_vsock_port_unregisters_and_can_be_reopened() {
     const PORT: u32 = 5017;
     let env = test_env("session-raw-reattach", &Scenario::default()).await;
     let machine = create_machine(&env, "integration-session-raw-reattach").await;
@@ -1389,10 +1389,13 @@ async fn session_raw_vsock_port_detaches_and_reattaches_without_reregistering() 
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    let mut ownerless = UnixStream::connect(&guest_path)
-        .await
-        .expect("retained raw registration remains present");
-    assert_closed_without_bytes(&mut ownerless).await;
+    while UnixStream::connect(&guest_path).await.is_ok() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "raw registration survived session teardown"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let mut second = machine
         .open_forward(forward)
         .await

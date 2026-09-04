@@ -3,11 +3,12 @@ mod host_socket;
 mod inbound;
 mod outbound;
 pub(crate) mod service;
+mod task;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use forward_spec::{Address, Forward, ForwardShape, GuestHalf, Token};
 use rand::RngExt;
@@ -16,6 +17,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::forward::host_socket::OwnedHostListener;
+use crate::forward::task::OwnedTask;
 use crate::virt::VirtualMachine;
 
 const MAX_FORWARDS: usize = 128;
@@ -69,10 +71,7 @@ pub(crate) struct ForwardEntry {
     vsock_listener: Mutex<Option<crate::virt::VsockListener>>,
     total_permit: Mutex<Option<OwnedSemaphorePermit>>,
     session_permit: Mutex<Option<OwnedSemaphorePermit>>,
-}
-
-struct RetainedRawPort {
-    target: Arc<RwLock<Option<Arc<ForwardEntry>>>>,
+    task: Mutex<Option<OwnedTask>>,
 }
 
 pub(crate) struct ForwardTable {
@@ -87,11 +86,9 @@ pub(crate) struct ForwardTable {
     session_capacity: Arc<Semaphore>,
     availability: watch::Sender<GuestHalfAvailability>,
     pub(crate) shutdown: CancellationToken,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
     return_registered: AtomicBool,
     return_listener: Mutex<Option<crate::virt::VsockListener>>,
-    raw_ports: Mutex<BTreeMap<u32, Arc<RetainedRawPort>>>,
-    registered_ports: Mutex<BTreeSet<u32>>,
+    return_task: Mutex<Option<OwnedTask>>,
     invalid_warning: Mutex<Option<std::time::Instant>>,
 }
 
@@ -136,11 +133,9 @@ impl ForwardTable {
             session_capacity: Arc::new(Semaphore::new(MAX_SESSION_FORWARDS)),
             availability,
             shutdown,
-            tasks: Mutex::new(Vec::new()),
             return_registered: AtomicBool::new(false),
             return_listener: Mutex::new(None),
-            raw_ports: Mutex::new(BTreeMap::new()),
-            registered_ports: Mutex::new(BTreeSet::new()),
+            return_task: Mutex::new(None),
             invalid_warning: Mutex::new(None),
         });
         for spec in forwards {
@@ -237,6 +232,7 @@ impl ForwardTable {
             vsock_listener: Mutex::new(None),
             total_permit: Mutex::new(total_permit),
             session_permit: Mutex::new(session_permit),
+            task: Mutex::new(None),
         }))
     }
 
@@ -258,10 +254,6 @@ impl ForwardTable {
                     .vsock_listener
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Some(listener);
-                self.registered_ports
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(port);
             }
         }
         if self
@@ -278,10 +270,6 @@ impl ForwardTable {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(listener);
             self.return_registered.store(true, Ordering::Release);
-            self.registered_ports
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(forward_spec::FORWARD_VSOCK_PORT);
         }
         Ok(())
     }
@@ -298,7 +286,7 @@ impl ForwardTable {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
         {
-            self.spawn(outbound::serve_return(listener, self.clone()));
+            self.start_return_task(listener);
         }
     }
 
@@ -317,7 +305,7 @@ impl ForwardTable {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
         {
-            self.spawn(inbound::serve(listener, entry.clone(), machine.clone()));
+            entry.spawn(inbound::serve(listener, entry.clone(), machine.clone()));
         }
         if let Some(listener) = entry
             .vsock_listener
@@ -326,27 +314,10 @@ impl ForwardTable {
             .take()
         {
             entry.set_state(ForwardState::Active, None);
-            let target = Arc::new(RwLock::new(Some(entry.clone())));
-            self.raw_ports
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(
-                    match entry.spec.listen {
-                        forward_spec::Endpoint::Vsock(port) => port,
-                        _ => return,
-                    },
-                    Arc::new(RetainedRawPort {
-                        target: target.clone(),
-                    }),
-                );
-            self.spawn(outbound::serve_raw_retained(
-                listener,
-                target,
-                self.shutdown.clone(),
-            ));
+            entry.spawn(outbound::serve_raw(listener, entry.clone()));
         }
         if entry.shape == ForwardShape::OutboundAgent {
-            self.spawn(agent::supervise_listener(machine, entry));
+            entry.spawn(agent::supervise_listener(machine, entry.clone()));
         }
     }
 
@@ -428,43 +399,13 @@ impl ForwardTable {
                 "raw forward has no vsock listener".to_string(),
             ));
         };
-        if let Some(retained) = self
-            .raw_ports
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&port)
-            .cloned()
-        {
-            entry.set_state(ForwardState::Active, None);
-            *retained
-                .target
-                .write()
-                .unwrap_or_else(PoisonError::into_inner) = Some(entry);
-            return Ok(());
-        }
         let listener = machine.listen_public_vsock(port).await.map_err(|error| {
             OpenError::Unavailable(format!("register vsock port {port}: {error}"))
         })?;
-        entry.set_state(ForwardState::Active, None);
-        let target = Arc::new(RwLock::new(Some(entry)));
-        self.raw_ports
+        *entry
+            .vsock_listener
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                port,
-                Arc::new(RetainedRawPort {
-                    target: target.clone(),
-                }),
-            );
-        self.registered_ports
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(port);
-        self.spawn(outbound::serve_raw_retained(
-            listener,
-            target,
-            self.shutdown.clone(),
-        ));
+            .unwrap_or_else(PoisonError::into_inner) = Some(listener);
         Ok(())
     }
 
@@ -482,11 +423,7 @@ impl ForwardTable {
                 OpenError::Unavailable(format!("register forward return port 1028: {error}"))
             })?;
         self.return_registered.store(true, Ordering::Release);
-        self.registered_ports
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(forward_spec::FORWARD_VSOCK_PORT);
-        self.spawn(outbound::serve_return(listener, self.clone()));
+        self.start_return_task(listener);
         Ok(())
     }
 
@@ -502,8 +439,7 @@ impl ForwardTable {
         let Some(entry) = removed else {
             return;
         };
-        entry.shutdown.cancel();
-        entry.set_state(ForwardState::Closed, None);
+        entry.stop().await;
         entry
             .total_permit
             .lock()
@@ -514,21 +450,12 @@ impl ForwardTable {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let forward_spec::Endpoint::Vsock(port) = entry.spec.listen {
-            if let Some(retained) = self
-                .raw_ports
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&port)
-            {
-                let mut target = retained
-                    .target
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner);
-                if target.as_ref().is_some_and(|target| target.id == id) {
-                    *target = None;
-                }
-            }
+        if !self
+            .entries()
+            .iter()
+            .any(|entry| entry.shape == ForwardShape::OutboundAgent)
+        {
+            self.stop_return_task().await;
         }
     }
 
@@ -540,17 +467,46 @@ impl ForwardTable {
     }
 
     pub(crate) fn registered_ports(&self) -> BTreeSet<u32> {
-        self.registered_ports
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        let mut ports = self
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry.spec.listen {
+                forward_spec::Endpoint::Vsock(port) => Some(port),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if self.return_registered.load(Ordering::Acquire) {
+            ports.insert(forward_spec::FORWARD_VSOCK_PORT);
+        }
+        ports
     }
 
-    fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
-        self.tasks
+    fn start_return_task(self: &Arc<Self>, listener: crate::virt::VsockListener) {
+        let shutdown = self.shutdown.child_token();
+        let task = OwnedTask::spawn(
+            shutdown.clone(),
+            outbound::serve_return(listener, self.clone(), shutdown),
+        );
+        *self
+            .return_task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(task);
+    }
+
+    async fn stop_return_task(&self) {
+        let task = self
+            .return_task
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(tokio::spawn(task));
+            .take();
+        if let Some(task) = task {
+            task.stop().await;
+        }
+        self.return_listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        self.return_registered.store(false, Ordering::Release);
     }
 
     fn token_entry(&self, token: Token) -> Option<Arc<ForwardEntry>> {
@@ -595,15 +551,11 @@ impl ForwardTable {
     pub(crate) async fn shutdown(&self) -> eyre::Result<()> {
         self.running.store(false, Ordering::Release);
         self.shutdown.cancel();
+        let _operation = self.operation.lock().await;
         for entry in self.entries() {
-            entry.shutdown.cancel();
-            entry.set_state(ForwardState::Closed, None);
+            entry.stop().await;
         }
-        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner));
-        for task in tasks {
-            task.await
-                .map_err(|error| eyre::eyre!("forward task failed: {error}"))?;
-        }
+        self.stop_return_task().await;
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -659,6 +611,32 @@ pub(crate) fn spawn_capability_supervisor(
 }
 
 impl ForwardEntry {
+    fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        *self.task.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(OwnedTask::spawn(self.shutdown.clone(), future));
+    }
+
+    async fn stop(&self) {
+        self.shutdown.cancel();
+        self.set_state(ForwardState::Closed, None);
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.stop().await;
+        }
+        self.listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        self.vsock_listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -737,9 +715,61 @@ fn unsupported_detail() -> protocol::v1::ErrorDetail {
     error_detail(protocol::v1::ErrorCode::ForwardUnsupported)
 }
 
+impl Drop for ForwardTable {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        for entry in self
+            .entries
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            entry.shutdown.cancel();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::forward::{ForwardState, ForwardTable};
+    use crate::forward::{ForwardScope, ForwardState, ForwardTable};
+
+    #[tokio::test]
+    async fn removing_raw_sessions_reclaims_the_task_and_registration() {
+        use crate::virt::capacity::{ListenerAdmissionClass, VsockCapacity};
+        let root =
+            std::path::Path::new("/tmp").join(format!("fr-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("listen");
+        let table = ForwardTable::prepare_machine(&[], &root, None)
+            .await
+            .unwrap();
+        let capacity = VsockCapacity::new("forward-unit-test");
+        for port in 5000..6100 {
+            let spec = forward_spec::Forward::new(
+                forward_spec::Endpoint::Vsock(port),
+                "host:tcp:1".parse().unwrap(),
+            );
+            let entry = table
+                .build_entry(spec, ForwardScope::Session, None, None)
+                .await
+                .unwrap();
+            let socket = tokio::net::UnixListener::bind(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let listener = crate::virt::VsockListener::from_unix_listener(
+                socket,
+                port,
+                capacity.listener(ListenerAdmissionClass::Public),
+            );
+            entry.spawn(crate::forward::outbound::serve_raw(listener, entry.clone()));
+            table.entries.lock().unwrap().push(entry.clone());
+            assert!(table.registered_ports().contains(&port));
+            table.remove(entry.id()).await;
+            assert!(table.registered_ports().is_empty());
+            assert!(entry.task.lock().unwrap().is_none());
+            assert_eq!(entry.snapshot().state, ForwardState::Closed);
+            assert_eq!(std::sync::Arc::strong_count(&entry), 1);
+        }
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[tokio::test]
     async fn activated_raw_listener_reports_its_registered_port() {
@@ -757,26 +787,5 @@ mod tests {
             entry.snapshot().bound,
             Some(forward_spec::Endpoint::Vsock(5000))
         );
-    }
-}
-
-impl Drop for ForwardTable {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-        for entry in self
-            .entries
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-        {
-            entry.shutdown.cancel();
-        }
-        for task in self
-            .tasks
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .drain(..)
-        {
-            task.abort();
-        }
     }
 }

@@ -1,5 +1,5 @@
 use std::io;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use forward_spec::{Address, ErrReason, Reply, TargetLine, MAX_TARGET_LINE_BYTES};
@@ -12,26 +12,20 @@ use crate::virt::VsockListener;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) async fn serve_raw_retained(
-    mut listener: VsockListener,
-    target: Arc<RwLock<Option<Arc<ForwardEntry>>>>,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
+pub(crate) async fn serve_raw(mut listener: VsockListener, entry: Arc<ForwardEntry>) {
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
-            _ = shutdown.cancelled() => break,
+            _ = entry.shutdown.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok(guest) => {
-                    let entry = target.read().unwrap_or_else(PoisonError::into_inner).clone();
-                    if let Some(entry) = entry {
-                        connections.spawn(async move {
-                            if let Err(error) = relay_to_target(guest, entry.clone()).await {
-                                entry.refuse();
-                                tracing::debug!(forward = %entry.name, %error, "raw outbound forward connection failed");
-                            }
-                        });
-                    }
+                    let entry = entry.clone();
+                    connections.spawn(async move {
+                        if let Err(error) = relay_to_target(guest, entry.clone()).await {
+                            entry.refuse();
+                            tracing::debug!(forward = %entry.name, %error, "raw outbound forward connection failed");
+                        }
+                    });
                 }
                 Err(error) => tracing::warn!(%error, "raw outbound forward accept failed"),
             },
@@ -46,11 +40,15 @@ pub(crate) async fn serve_raw_retained(
     while connections.join_next().await.is_some() {}
 }
 
-pub(crate) async fn serve_return(mut listener: VsockListener, table: Arc<ForwardTable>) {
+pub(crate) async fn serve_return(
+    mut listener: VsockListener,
+    table: Arc<ForwardTable>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
-            _ = table.shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok(stream) => {
                     let table = table.clone();

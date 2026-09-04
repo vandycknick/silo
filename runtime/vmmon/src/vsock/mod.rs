@@ -68,10 +68,17 @@ impl PreparedVsockSurface {
     ) -> eyre::Result<VsockSurface> {
         let _registration = forwards.lock_registrations().await;
         let discovered = discovery::scan(&self.runtime_dir, &self.mux_filename)?;
-        let mut registered = forwards.registered_ports();
+        let mut registered = BTreeSet::new();
         let mut listeners = Vec::new();
-        let _ = register_discovered(&machine, &mut registered, &mut listeners, discovered, true)
-            .await?;
+        let _ = register_discovered(
+            &machine,
+            &mut registered,
+            &mut listeners,
+            discovered,
+            true,
+            &forwards.registered_ports(),
+        )
+        .await?;
         drop(_registration);
 
         let mux_listener = self.mux.take_listener()?;
@@ -170,7 +177,6 @@ async fn run_surface(
 
     let mut retry = tokio::time::interval(WATCHER_RETRY_INTERVAL);
     retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut registration_retry = false;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -182,7 +188,7 @@ async fn run_surface(
                     tracing::warn!(path = %runtime_dir.display(), "vsock listener watcher reported an error; retrying");
                     watcher = None;
                 }
-                registration_retry = reconcile_runtime(
+                reconcile_runtime(
                     &machine,
                     &forwards,
                     &runtime_dir,
@@ -193,7 +199,6 @@ async fn run_surface(
                 ).await;
             }
             _ = retry.tick() => {
-                let mut watcher_restored = false;
                 if watcher.is_none() {
                     match discovery::install_watcher(
                         &runtime_dir,
@@ -202,23 +207,21 @@ async fn run_surface(
                     ) {
                         Ok(restored) => {
                             watcher = Some(restored);
-                            watcher_restored = true;
                             tracing::info!(path = %runtime_dir.display(), "vsock listener discovery watcher restored");
                         }
                         Err(error) => tracing::warn!(path = %runtime_dir.display(), %error, "vsock listener discovery watcher remains unavailable"),
                     }
                 }
-                if watcher_restored || registration_retry {
-                    registration_retry = reconcile_runtime(
-                        &machine,
-                        &forwards,
-                        &runtime_dir,
-                        &mux_filename,
-                        &mut registered,
-                        &mut tasks,
-                        &shutdown,
-                    ).await;
-                }
+                // A session can release a vsock port without a filesystem event.
+                reconcile_runtime(
+                    &machine,
+                    &forwards,
+                    &runtime_dir,
+                    &mux_filename,
+                    &mut registered,
+                    &mut tasks,
+                    &shutdown,
+                ).await;
             }
             result = tasks.join_next(), if !tasks.is_empty() => {
                 if let Some(Err(error)) = result {
@@ -243,7 +246,7 @@ async fn reconcile_runtime(
     shutdown: &CancellationToken,
 ) -> bool {
     let _registration = forwards.lock_registrations().await;
-    registered.extend(forwards.registered_ports());
+    let forward_ports = forwards.registered_ports();
     let discovered = match discovery::scan(runtime_dir, mux_filename) {
         Ok(discovered) => discovered,
         Err(error) => {
@@ -252,8 +255,15 @@ async fn reconcile_runtime(
         }
     };
     let mut listeners = Vec::new();
-    let retry = match register_discovered(machine, registered, &mut listeners, discovered, false)
-        .await
+    let retry = match register_discovered(
+        machine,
+        registered,
+        &mut listeners,
+        discovered,
+        false,
+        &forward_ports,
+    )
+    .await
     {
         Ok(retry) => retry,
         Err(error) => {
@@ -273,13 +283,14 @@ async fn register_discovered(
     listeners: &mut Vec<(u32, PathBuf, VsockListener)>,
     discovered: Vec<(u32, PathBuf)>,
     initial: bool,
+    forward_ports: &BTreeSet<u32>,
 ) -> eyre::Result<bool> {
     let mut retry = false;
     for (port, path) in discovered {
-        if registered.contains(&port) {
+        if registered.contains(&port) || forward_ports.contains(&port) {
             continue;
         }
-        if registration_limit_reached(registered.len()) {
+        if registration_limit_reached(registered.len() + forward_ports.len()) {
             tracing::warn!(machine = machine.name(), port, path = %path.display(), limit = MAX_LISTENER_REGISTRATIONS, "ignored vsock listener at registration limit");
             continue;
         }
@@ -422,11 +433,16 @@ mod tests {
         let mut registered = (1..=1023).collect::<std::collections::BTreeSet<_>>();
         let mut listeners = Vec::new();
 
-        assert!(
-            !register_discovered(&machine, &mut registered, &mut listeners, discovered, false,)
-                .await
-                .expect("register listeners")
-        );
+        assert!(!register_discovered(
+            &machine,
+            &mut registered,
+            &mut listeners,
+            discovered,
+            false,
+            &Default::default()
+        )
+        .await
+        .expect("register listeners"));
         assert_eq!(registered.len(), 1024);
         assert_eq!(listeners.len(), 1);
         assert!(registered.contains(&FIRST_NEW_PORT));
@@ -441,6 +457,7 @@ mod tests {
                 root.join(format!("vsock.sock_{REPLACEMENT_PORT}")),
             )],
             false,
+            &Default::default(),
         )
         .await
         .expect("reconcile after reaching the limit"));

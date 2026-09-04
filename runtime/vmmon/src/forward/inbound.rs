@@ -80,7 +80,9 @@ pub(crate) async fn serve(
             }
         }
     }
+    drop(listener);
     parked.clear();
+    connections.abort_all();
     while connections.join_next().await.is_some() {}
 }
 
