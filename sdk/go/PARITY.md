@@ -13,6 +13,8 @@ This inventory is completed alongside implementation. A checked item has a publi
 | machine kernel/initramfs/agent/disk size | machine options | create request DTO | option + creation tests | implemented |
 | nested virtualization/Rosetta/userdata | machine options | create request DTO | option + creation tests | implemented |
 | disks/mounts/network | machine options | create request DTO | option + creation tests | implemented |
+| machine `forwards` / `vsock` | `WithForwards` / `WithVsock` | create request + inspect DTOs | option + native validation tests | implemented |
+| network `publish` | `MachineNetwork.WithPublish` | create request + inspect DTOs | policy + round-trip tests | implemented |
 | `Machine.id` | `Machine.ID` | local/native handle ID | runtime tests | implemented |
 | `inspect` | `Machine.Inspect` | `silo_machine_inspect` | lifecycle tests | implemented |
 | `start` | `Machine.Start` | `silo_machine_start` | lifecycle tests | implemented |

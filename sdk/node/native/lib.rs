@@ -51,7 +51,65 @@ pub struct NativeMountInput {
 }
 
 #[napi(object)]
+pub struct NativeForward {
+    pub name: Option<String>,
+    pub listen: String,
+    pub connect: String,
+    pub mode: Option<String>,
+}
+
+impl TryFrom<NativeForward> for libvm::Forward {
+    type Error = Error;
+
+    fn try_from(value: NativeForward) -> Result<Self> {
+        let forward = Self {
+            name: value.name,
+            listen: value
+                .listen
+                .parse()
+                .map_err(|error| invalid_arg(format!("invalid forward listen: {error}")))?,
+            connect: value
+                .connect
+                .parse()
+                .map_err(|error| invalid_arg(format!("invalid forward connect: {error}")))?,
+            mode: value
+                .mode
+                .map(|mode| mode.parse())
+                .transpose()
+                .map_err(|error| invalid_arg(format!("invalid forward mode: {error}")))?,
+        };
+        forward
+            .validate()
+            .map_err(|error| invalid_arg(error.to_string()))?;
+        Ok(forward)
+    }
+}
+
+impl From<libvm::Forward> for NativeForward {
+    fn from(value: libvm::Forward) -> Self {
+        Self {
+            name: value.name,
+            listen: value.listen.to_string(),
+            connect: value.connect.to_string(),
+            mode: value.mode.map(|mode| mode.to_string()),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct NativeVsockConfig {
+    pub enabled: bool,
+    pub uds: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeGuestPublish {
+    pub bind: String,
+}
+
+#[napi(object)]
 pub struct NativeNetworkInput {
+    pub publish: Option<NativeGuestPublish>,
     pub kind: String,
     pub name: Option<String>,
     pub policy_json: Option<String>,
@@ -185,6 +243,8 @@ pub struct NativeMachineData {
     pub labels: Vec<NativeKeyValue>,
     pub metadata: Vec<NativeKeyValue>,
     pub network: NativeNetworkData,
+    pub forwards: Vec<NativeForward>,
+    pub vsock: Option<NativeVsockConfig>,
     pub agent_mode: String,
     pub agent_path: Option<String>,
     pub status: NativeMachineStatus,
@@ -267,6 +327,7 @@ pub struct NativeMachineStatus {
 
 #[napi(object)]
 pub struct NativeNetworkData {
+    pub publish: Option<NativeGuestPublish>,
     pub kind: String,
     pub name: Option<String>,
     pub policy_json: Option<String>,
@@ -586,6 +647,20 @@ impl NativeMachineBuilder {
             })
             .collect();
         self.update(|builder| builder.mounts(mounts))
+    }
+
+    #[napi]
+    pub fn forwards(&self, forwards: Vec<NativeForward>) -> Result<()> {
+        let forwards = forwards
+            .into_iter()
+            .map(libvm::Forward::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        self.update(|builder| builder.forwards(forwards))
+    }
+
+    #[napi]
+    pub fn vsock(&self, enabled: bool) -> Result<()> {
+        self.update(|builder| builder.vsock(enabled))
     }
 
     #[napi]
@@ -1273,6 +1348,7 @@ fn image_source_from_input(input: NativeImageSourceInput) -> Result<ImageSource>
 struct ParsedNativeNetworkInput {
     selection: NativeNetworkSelection,
     policy: Option<NetworkPolicy>,
+    publish: Option<libvm::PublishBind>,
 }
 
 enum NativeNetworkSelection {
@@ -1293,6 +1369,18 @@ impl ParsedNativeNetworkInput {
             ),
             kind => return Err(invalid_arg(format!("unsupported network kind {kind:?}"))),
         };
+        let publish = input
+            .publish
+            .map(|publish| {
+                publish
+                    .bind
+                    .parse::<libvm::PublishBind>()
+                    .map_err(invalid_arg)
+            })
+            .transpose()?;
+        if publish.is_some() && !matches!(selection, NativeNetworkSelection::Private) {
+            return Err(invalid_arg("guest publication requires a private network"));
+        }
         let policy = input
             .policy_json
             .map(|policy_json| {
@@ -1300,7 +1388,11 @@ impl ParsedNativeNetworkInput {
                     .map_err(|err| invalid_arg(format!("invalid network.policyJson: {err}")))
             })
             .transpose()?;
-        Ok(Self { selection, policy })
+        Ok(Self {
+            selection,
+            policy,
+            publish,
+        })
     }
 
     fn apply(self, builder: MachineNetworkBuilder) -> MachineNetworkBuilder {
@@ -1309,10 +1401,13 @@ impl ParsedNativeNetworkInput {
             NativeNetworkSelection::None => builder.none(),
             NativeNetworkSelection::Named(name) => builder.named(name),
         };
-        if let Some(policy) = self.policy {
-            builder.policy(policy)
-        } else {
-            builder
+        let builder = match self.policy {
+            Some(policy) => builder.policy(policy),
+            None => builder,
+        };
+        match self.publish {
+            Some(bind) => builder.publish(bind),
+            None => builder,
         }
     }
 }
@@ -1665,6 +1760,16 @@ fn machine_data_to_native(data: MachineData) -> NativeMachineData {
         labels: key_values_from_map(data.labels),
         metadata: key_values_from_map(data.metadata),
         network: network_to_native(data.network),
+        forwards: data
+            .spec
+            .forwards
+            .into_iter()
+            .map(NativeForward::from)
+            .collect(),
+        vsock: data.spec.vsock.map(|vsock| NativeVsockConfig {
+            enabled: vsock.enabled,
+            uds: vsock.uds.map(|path| path.to_string_lossy().into_owned()),
+        }),
         agent_mode,
         agent_path,
         status: machine_status_to_native(data.status),
@@ -1825,22 +1930,28 @@ fn machine_status_to_native(status: MachineStatus) -> NativeMachineStatus {
 
 fn network_to_native(network: MachineNetworkConfig) -> NativeNetworkData {
     match network {
-        MachineNetworkConfig::Private { policy, .. } => NativeNetworkData {
+        MachineNetworkConfig::Private { policy, publish } => NativeNetworkData {
+            publish: publish.map(|publish| NativeGuestPublish {
+                bind: publish.bind.as_str().to_string(),
+            }),
             kind: "private".to_string(),
             name: None,
             policy_json: policy.and_then(|policy| serde_json::to_string(&policy.normalized()).ok()),
         },
         MachineNetworkConfig::None => NativeNetworkData {
+            publish: None,
             kind: "none".to_string(),
             name: None,
             policy_json: None,
         },
         MachineNetworkConfig::Named { name } => NativeNetworkData {
+            publish: None,
             kind: "named".to_string(),
             name: Some(name),
             policy_json: None,
         },
         _ => NativeNetworkData {
+            publish: None,
             kind: "unknown".to_string(),
             name: None,
             policy_json: None,
@@ -2178,11 +2289,79 @@ mod tests {
     }
 
     #[test]
+    fn forwards_round_trip_and_reject_invalid_endpoints() {
+        for (listen, connect, mode) in [
+            (
+                "host:unix:docker.sock",
+                "guest:unix:/run/docker.sock",
+                Some("0660"),
+            ),
+            ("guest:tcp:5432", "host:tcp:5432", None),
+            ("vsock:5000", "host:tcp:80", None),
+            ("host:tcp:0", "vsock:22", None),
+        ] {
+            let forward = libvm::Forward::try_from(crate::NativeForward {
+                name: Some("test".into()),
+                listen: listen.into(),
+                connect: connect.into(),
+                mode: mode.map(str::to_owned),
+            })
+            .unwrap();
+            let expected = forward.clone();
+            assert_eq!(
+                libvm::Forward::try_from(crate::NativeForward::from(forward)).unwrap(),
+                expected
+            );
+        }
+        for target in ["host:tcp:80", "guest:tcp:0", "guest:unix:/run/x\nextra"] {
+            assert!(libvm::Forward::try_from(crate::NativeForward {
+                name: None,
+                listen: "host:tcp:0".into(),
+                connect: target.into(),
+                mode: None
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn guest_publication_round_trips_and_requires_private_network() {
+        for bind in [libvm::PublishBind::Any, libvm::PublishBind::Loopback] {
+            let data = network_to_native(libvm::MachineNetworkConfig::Private {
+                policy: None,
+                publish: Some(libvm::GuestPublish { bind }),
+            });
+            let parsed = ParsedNativeNetworkInput::parse(NativeNetworkInput {
+                kind: data.kind,
+                name: data.name,
+                policy_json: data.policy_json,
+                publish: data.publish,
+            })
+            .unwrap();
+            assert_eq!(parsed.publish, Some(bind));
+        }
+        for (kind, bind) in [
+            ("none", "any"),
+            ("named", "loopback"),
+            ("private", "invalid"),
+        ] {
+            assert!(ParsedNativeNetworkInput::parse(NativeNetworkInput {
+                kind: kind.into(),
+                name: Some("shared".into()),
+                policy_json: None,
+                publish: Some(crate::NativeGuestPublish { bind: bind.into() })
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
     fn network_input_preserves_private_policy_json() {
         let network = ParsedNativeNetworkInput::parse(NativeNetworkInput {
             kind: "private".to_string(),
             name: None,
             policy_json: Some(sample_policy_json()),
+            publish: None,
         })
         .expect("private network with policy json");
 

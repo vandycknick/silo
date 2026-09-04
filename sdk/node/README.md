@@ -20,6 +20,24 @@ files in the same absolute `PATH` entry. Historical asset directories are not
 searched automatically. Bundled Node runtime packaging is deferred to Commit
 13.
 
+Machine builders also expose `.forwards([...])`, `.vsock(enabled)`, and
+`.network(n => n.private().publish("loopback"))`. Publications are disabled
+unless explicitly enabled on a private network. Use `"any"` only when the
+guest should be allowed to bind wildcard host addresses.
+
+```ts
+const engine = await runtime.machine().image("my-docker-image")
+  .forwards([{ name: "docker", listen: "host:unix:docker.sock", connect: "guest:unix:/var/run/docker.sock" }])
+  .vsock(true)
+  .network(n => n.private().publish("any"))
+  .create();
+```
+
+`inspect()` returns `forwards`, `vsock`, and `network.publish`. Relative host
+Unix paths resolve inside the machine runtime directory. Forward `mode` is a
+four-digit octal Unix permission string, default `"0600"`. SDK session-scoped
+forward handles are not yet exposed.
+
 ```ts
 import { ImageSource, NetworkPolicy, Runtime } from "silo";
 
