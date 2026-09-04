@@ -575,11 +575,19 @@ impl ForwardTable {
     }
 
     pub(crate) fn set_agent_availability(&self, availability: GuestHalfAvailability) {
-        self.availability.send_replace(availability.clone());
-        for entry in self.entries() {
-            if matches!(&entry.guest_half, GuestHalf::Agent(_)) {
-                entry.availability.send_replace(availability.clone());
-                entry.apply_availability(availability.clone());
+        let changed = self.availability.send_if_modified(|current| {
+            if *current == availability {
+                return false;
+            }
+            *current = availability.clone();
+            true
+        });
+        if changed {
+            for entry in self.entries() {
+                if matches!(&entry.guest_half, GuestHalf::Agent(_)) {
+                    entry.availability.send_replace(availability.clone());
+                    entry.apply_availability(availability.clone());
+                }
             }
         }
     }

@@ -20,26 +20,20 @@ pub(crate) async fn supervise(
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut identities = store.subscribe_ready_agent_identity();
-    let mut checked_identity = None;
+    let mut capability = CapabilityCache::default();
     loop {
-        if identities.borrow().is_none() {
+        let identity = identities.borrow_and_update().clone();
+        forwards.set_agent_availability(capability.availability(identity.as_ref()));
+        if identity.is_none() || capability.checked(identity.as_ref()) {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 changed = identities.changed() => if changed.is_err() { return; },
             }
             continue;
         }
-        let Some(identity) = identities.borrow_and_update().clone() else {
+        let Some(identity) = identity else {
             continue;
         };
-        if checked_identity.as_ref() == Some(&identity) {
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                changed = identities.changed() => if changed.is_err() { return; },
-            }
-            continue;
-        }
-        forwards.set_agent_availability(GuestHalfAvailability::Unknown);
         let mut backoff = ReconnectBackoff::new();
         let result = 'checks: loop {
             let mut check = Box::pin(check_capability(&machine));
@@ -84,7 +78,7 @@ pub(crate) async fn supervise(
         if identities.borrow().as_ref() != Some(&identity) {
             continue;
         }
-        checked_identity = Some(identity.clone());
+        capability.observation = Some((identity.clone(), supported));
         if let Err(error) = store.set_forward_service(identity.clone(), supported) {
             tracing::error!(%error, "failed to cache guest forward capability");
             return;
@@ -92,26 +86,37 @@ pub(crate) async fn supervise(
         if identities.borrow().as_ref() != Some(&identity) {
             continue;
         }
-        match supported {
-            true => {
-                forwards.set_agent_availability(GuestHalfAvailability::Available(Some(
-                    identity.clone(),
-                )));
-            }
-            false => {
-                tracing::warn!(agent_instance_id = %identity.instance_id, "guest agent does not serve GuestForwardService");
-                forwards.set_agent_availability(GuestHalfAvailability::Unsupported);
-            }
+        if !supported {
+            tracing::warn!(agent_instance_id = %identity.instance_id, "guest agent does not serve GuestForwardService");
         }
-        tokio::select! {
-            _ = shutdown.cancelled() => return,
-            changed = identities.changed() => {
-                if changed.is_err() { return; }
-                let current = identities.borrow_and_update().clone();
-                if current.as_ref() != checked_identity.as_ref() {
-                    forwards.set_agent_availability(GuestHalfAvailability::Unknown);
+    }
+}
+
+#[derive(Default)]
+struct CapabilityCache {
+    observation: Option<(crate::state::ReadyAgentIdentity, bool)>,
+}
+
+impl CapabilityCache {
+    fn checked(&self, identity: Option<&crate::state::ReadyAgentIdentity>) -> bool {
+        self.observation
+            .as_ref()
+            .is_some_and(|(checked, _)| Some(checked) == identity)
+    }
+
+    fn availability(
+        &self,
+        identity: Option<&crate::state::ReadyAgentIdentity>,
+    ) -> GuestHalfAvailability {
+        match (&self.observation, identity) {
+            (Some((checked, supported)), Some(ready)) if checked == ready => {
+                if *supported {
+                    GuestHalfAvailability::Available(Some(ready.clone()))
+                } else {
+                    GuestHalfAvailability::Unsupported
                 }
             }
+            _ => GuestHalfAvailability::Unknown,
         }
     }
 }
@@ -137,11 +142,14 @@ impl ReconnectBackoff {
 async fn check_capability(machine: &VirtualMachine) -> Result<bool, tonic::Status> {
     let channel = crate::guest::connect(machine).await?;
     let mut health = tonic_health::pb::health_client::HealthClient::new(channel);
-    match health
-        .check(HealthCheckRequest {
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        health.check(HealthCheckRequest {
             service: "silo.v1.GuestForwardService".to_string(),
-        })
-        .await
+        }),
+    )
+    .await
+    .map_err(|_| tonic::Status::deadline_exceeded("forward health check timed out"))?
     {
         Ok(response) => Ok(response.into_inner().status == ServingStatus::Serving as i32),
         Err(status)
@@ -316,7 +324,39 @@ pub(crate) fn spawn(
 mod tests {
     use std::time::Duration;
 
-    use crate::forward::agent::ReconnectBackoff;
+    use crate::forward::agent::{CapabilityCache, ReconnectBackoff};
+    use crate::forward::GuestHalfAvailability;
+
+    #[test]
+    fn cached_capability_tracks_readiness_loss_recovery_and_replacement() {
+        let identity = crate::state::ReadyAgentIdentity {
+            instance_id: uuid::Uuid::new_v4(),
+            boot_id: uuid::Uuid::new_v4(),
+        };
+        for supported in [true, false] {
+            let cache = CapabilityCache {
+                observation: Some((identity.clone(), supported)),
+            };
+            let expected = if supported {
+                GuestHalfAvailability::Available(Some(identity.clone()))
+            } else {
+                GuestHalfAvailability::Unsupported
+            };
+            assert_eq!(cache.availability(Some(&identity)), expected);
+            assert_eq!(cache.availability(None), GuestHalfAvailability::Unknown);
+            assert_eq!(cache.availability(Some(&identity)), expected);
+            assert!(cache.checked(Some(&identity)));
+            let replacement = crate::state::ReadyAgentIdentity {
+                instance_id: uuid::Uuid::new_v4(),
+                ..identity.clone()
+            };
+            assert!(!cache.checked(Some(&replacement)));
+            assert_eq!(
+                cache.availability(Some(&replacement)),
+                GuestHalfAvailability::Unknown
+            );
+        }
+    }
 
     #[test]
     fn capability_reconnect_backoff_doubles_and_caps_at_five_seconds() {
