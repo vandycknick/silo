@@ -40,7 +40,6 @@ pub(crate) async fn serve(
             changed = availability.changed() => {
                 if changed.is_err() { break; }
                 let current = availability.borrow().clone();
-                entry.apply_availability(current.clone());
                 match current {
                     GuestHalfAvailability::Available(_) => {
                         let now = Instant::now();
@@ -54,7 +53,6 @@ pub(crate) async fn serve(
                                 parked_connection.stream,
                                 entry.clone(),
                                 machine.clone(),
-                                availability.clone(),
                                 &mut connections,
                             );
                         }
@@ -96,13 +94,9 @@ async fn admit(
 ) {
     let current = availability.borrow().clone();
     match current {
-        GuestHalfAvailability::Available(_) => spawn_connection(
-            stream,
-            entry.clone(),
-            machine.clone(),
-            availability.clone(),
-            connections,
-        ),
+        GuestHalfAvailability::Available(_) => {
+            spawn_connection(stream, entry.clone(), machine.clone(), connections)
+        }
         GuestHalfAvailability::Unknown if parked.len() < MAX_PARKED_PER_FORWARD => {
             parked.push_back(Parked {
                 stream,
@@ -120,11 +114,10 @@ fn spawn_connection(
     stream: HostStream,
     entry: Arc<ForwardEntry>,
     machine: VirtualMachine,
-    availability: tokio::sync::watch::Receiver<GuestHalfAvailability>,
     connections: &mut JoinSet<()>,
 ) {
     connections.spawn(async move {
-        if let Err(error) = handle_connection(stream, entry.clone(), machine, availability).await {
+        if let Err(error) = handle_connection(stream, entry.clone(), machine).await {
             entry.refuse();
             tracing::debug!(forward = %entry.name, target = %entry.spec.connect, %error, "forward connection refused");
         }
@@ -135,10 +128,13 @@ async fn handle_connection(
     mut client: HostStream,
     entry: Arc<ForwardEntry>,
     machine: VirtualMachine,
-    mut availability: tokio::sync::watch::Receiver<GuestHalfAvailability>,
 ) -> eyre::Result<()> {
-    let expected = availability.borrow().clone();
-    let mut guest = tokio::time::timeout(FORWARD_SETUP_TIMEOUT, async {
+    let lifetime = entry
+        .connection_lifetime()
+        .ok_or_else(|| eyre::eyre!("guest half is unavailable"))?;
+    let mut guest = tokio::select! {
+        _ = lifetime.cancelled() => return Ok(()),
+        result = tokio::time::timeout(FORWARD_SETUP_TIMEOUT, async {
         let lease = machine.reserve_public_vsock()?;
         match entry.guest_half.clone() {
             GuestHalf::Vsock(port) => machine
@@ -161,27 +157,10 @@ async fn handle_connection(
                 }
             }
         }
-    })
-    .await
-    .map_err(|_| eyre::eyre!("forward setup timed out"))??;
-
-    entry.connection_opened();
-    let result = match &entry.guest_half {
-        GuestHalf::Agent(_) => tokio::select! {
-            result = crate::vsock::relay::relay(&mut client, &mut guest, entry.shutdown.clone()) => result,
-            changed = availability.changed() => {
-                let _ = changed;
-                if *availability.borrow() == expected {
-                    entry.connection_closed();
-                    return Ok(());
-                }
-                Ok(())
-            }
-        },
-        GuestHalf::Vsock(_) => {
-            crate::vsock::relay::relay(&mut client, &mut guest, entry.shutdown.clone()).await
-        }
+        }) => result.map_err(|_| eyre::eyre!("forward setup timed out"))??,
     };
-    entry.connection_closed();
-    result.map_err(eyre::Report::from)
+    let _connection = entry.connection_opened();
+    crate::vsock::relay::relay(&mut client, &mut guest, lifetime)
+        .await
+        .map_err(eyre::Report::from)
 }

@@ -7,7 +7,7 @@ mod task;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use forward_spec::{Address, Forward, ForwardShape, GuestHalf, Token};
@@ -65,8 +65,7 @@ pub(crate) struct ForwardEntry {
     pub(crate) shutdown: CancellationToken,
     pub(crate) availability: watch::Sender<GuestHalfAvailability>,
     pub(crate) status: watch::Sender<ForwardStatusSnapshot>,
-    active: AtomicU32,
-    refused: AtomicU32,
+    connection_generation: Mutex<Option<CancellationToken>>,
     listener: Mutex<Option<OwnedHostListener>>,
     vsock_listener: Mutex<Option<crate::virt::VsockListener>>,
     total_permit: Mutex<Option<OwnedSemaphorePermit>>,
@@ -214,6 +213,10 @@ impl ForwardTable {
             refused_connections: 0,
             error: (initial_state == ForwardState::Unsupported).then(unsupported_detail),
         });
+        let entry_shutdown = self.shutdown.child_token();
+        let connection_generation = (shape == ForwardShape::InboundAgent
+            && initial_state == ForwardState::Active)
+            .then(|| entry_shutdown.child_token());
         Ok(Arc::new(ForwardEntry {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             scope,
@@ -223,11 +226,10 @@ impl ForwardTable {
             guest_half,
             host_target,
             token,
-            shutdown: self.shutdown.child_token(),
+            shutdown: entry_shutdown,
             availability: entry_availability,
             status,
-            active: AtomicU32::new(0),
-            refused: AtomicU32::new(0),
+            connection_generation: Mutex::new(connection_generation),
             listener: Mutex::new(listener),
             vsock_listener: Mutex::new(None),
             total_permit: Mutex::new(total_permit),
@@ -385,6 +387,9 @@ impl ForwardTable {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(entry.clone());
+        if matches!(entry.guest_half, GuestHalf::Agent(_)) {
+            entry.set_availability(self.availability.borrow().clone());
+        }
         self.activate_entry(entry.clone(), machine);
         Ok(entry)
     }
@@ -541,8 +546,7 @@ impl ForwardTable {
         if changed {
             for entry in self.entries() {
                 if matches!(&entry.guest_half, GuestHalf::Agent(_)) {
-                    entry.availability.send_replace(availability.clone());
-                    entry.apply_availability(availability.clone());
+                    entry.set_availability(availability.clone());
                 }
             }
         }
@@ -655,7 +659,84 @@ impl ForwardEntry {
         });
     }
 
-    pub(crate) fn apply_availability(&self, availability: GuestHalfAvailability) {
+    fn set_availability(&self, availability: GuestHalfAvailability) {
+        let mut generation = self
+            .connection_generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *self.availability.borrow() == availability {
+            return;
+        }
+        if let Some(previous) = generation.take() {
+            previous.cancel();
+        }
+        if self.shape == ForwardShape::InboundAgent
+            && matches!(availability, GuestHalfAvailability::Available(_))
+        {
+            *generation = Some(self.shutdown.child_token());
+        }
+        self.apply_availability(availability.clone());
+        self.availability.send_replace(availability);
+    }
+
+    pub(crate) fn connection_lifetime(&self) -> Option<CancellationToken> {
+        if matches!(self.guest_half, GuestHalf::Vsock(_)) {
+            return Some(self.shutdown.clone());
+        }
+        self.connection_generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|token| !token.is_cancelled())
+            .cloned()
+    }
+
+    pub(crate) fn activate_guest_listener(
+        &self,
+        identity: &crate::state::ReadyAgentIdentity,
+        bound: forward_spec::Address,
+    ) -> bool {
+        let mut generation = self
+            .connection_generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.shutdown.is_cancelled()
+            || *self.availability.borrow()
+                != GuestHalfAvailability::Available(Some(identity.clone()))
+        {
+            return false;
+        }
+        if let Some(previous) = generation.replace(self.shutdown.child_token()) {
+            previous.cancel();
+        }
+        self.status.send_modify(|snapshot| {
+            snapshot.state = ForwardState::Active;
+            snapshot.bound = Some(forward_spec::Endpoint::Guest(bound));
+            snapshot.error = None;
+        });
+        true
+    }
+
+    pub(crate) fn end_guest_listener(&self) {
+        let mut generation = self
+            .connection_generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(previous) = generation.take() {
+            previous.cancel();
+        }
+        if !self.shutdown.is_cancelled()
+            && matches!(
+                *self.availability.borrow(),
+                GuestHalfAvailability::Available(_)
+            )
+        {
+            self.status
+                .send_modify(|snapshot| snapshot.state = ForwardState::Pending);
+        }
+    }
+
+    fn apply_availability(&self, availability: GuestHalfAvailability) {
         match availability {
             GuestHalfAvailability::Unknown => self.set_state(ForwardState::Pending, None),
             GuestHalfAvailability::Available(_) => match self.shape {
@@ -675,32 +756,26 @@ impl ForwardEntry {
 
     pub(crate) fn refuse_by(&self, count: usize) {
         let increment = u32::try_from(count).unwrap_or(u32::MAX);
-        let value = self
-            .refused
-            .fetch_add(increment, Ordering::Relaxed)
-            .saturating_add(increment);
         self.status.send_modify(|snapshot| {
-            snapshot.refused_connections = value;
+            snapshot.refused_connections = snapshot.refused_connections.saturating_add(increment);
             snapshot.error = Some(error_detail(protocol::v1::ErrorCode::BackendUnavailable));
         });
     }
 
-    pub(crate) fn connection_opened(&self) {
-        let value = self
-            .active
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
+    pub(crate) fn connection_opened(self: &Arc<Self>) -> ConnectionGuard {
         self.status
-            .send_modify(|snapshot| snapshot.active_connections = value);
+            .send_modify(|snapshot| snapshot.active_connections += 1);
+        ConnectionGuard(self.clone())
     }
+}
 
-    pub(crate) fn connection_closed(&self) {
-        let value = self
-            .active
-            .fetch_sub(1, Ordering::Relaxed)
-            .saturating_sub(1);
-        self.status
-            .send_modify(|snapshot| snapshot.active_connections = value);
+pub(crate) struct ConnectionGuard(Arc<ForwardEntry>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.status.send_modify(|snapshot| {
+            snapshot.active_connections = snapshot.active_connections.saturating_sub(1);
+        });
     }
 }
 

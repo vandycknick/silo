@@ -180,6 +180,7 @@ pub(crate) async fn supervise_listener(machine: VirtualMachine, entry: Arc<Forwa
                 _ = entry.shutdown.cancelled() => return,
                 result = listen_once(&machine, &entry, &identity, &mut availability) => result,
             };
+            entry.end_guest_listener();
             if availability.borrow().clone()
                 != GuestHalfAvailability::Available(Some(identity.clone()))
             {
@@ -238,7 +239,7 @@ async fn listen_once(
     .map_err(|_| eyre::eyre!("guest forward Listen setup timed out"))??;
     let mut stream = response.into_inner();
     let first = tokio::select! {
-        message = stream.message() => message?,
+        message = tokio::time::timeout(Duration::from_secs(5), stream.message()) => message.map_err(|_| eyre::eyre!("guest forward ListenerBound timed out"))??,
         changed = availability.changed() => {
             let _ = changed;
             return Ok(());
@@ -250,11 +251,9 @@ async fn listen_once(
         Some(Event::Bound(bound)) => {
             let actual = bound.address.parse::<forward_spec::Address>()?;
             validate_bound(requested, &actual)?;
-            entry.status.send_modify(|snapshot| {
-                snapshot.state = ForwardState::Active;
-                snapshot.bound = Some(forward_spec::Endpoint::Guest(actual.clone()));
-                snapshot.error = None;
-            });
+            if !entry.activate_guest_listener(identity, actual) {
+                return Ok(());
+            }
         }
         Some(Event::Failed(failed)) => {
             entry.status.send_modify(|snapshot| {
