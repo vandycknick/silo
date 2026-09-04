@@ -671,6 +671,9 @@ impl ForwardEntry {
         self.status.send_modify(|snapshot| {
             snapshot.state = state;
             snapshot.error = error;
+            if state == ForwardState::Active && self.shape == ForwardShape::OutboundVsock {
+                snapshot.bound = Some(self.spec.listen.clone());
+            }
         });
     }
 
@@ -732,6 +735,29 @@ fn error_detail(code: protocol::v1::ErrorCode) -> protocol::v1::ErrorDetail {
 
 fn unsupported_detail() -> protocol::v1::ErrorDetail {
     error_detail(protocol::v1::ErrorCode::ForwardUnsupported)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::forward::{ForwardState, ForwardTable};
+
+    #[tokio::test]
+    async fn activated_raw_listener_reports_its_registered_port() {
+        let forward = forward_spec::Forward::new(
+            "vsock:5000".parse().unwrap(),
+            "host:tcp:5432".parse().unwrap(),
+        );
+        let table =
+            ForwardTable::prepare_machine(&[forward], std::path::Path::new("/unused"), None)
+                .await
+                .unwrap();
+        let entry = &table.entries()[0];
+        entry.set_state(ForwardState::Active, None);
+        assert_eq!(
+            entry.snapshot().bound,
+            Some(forward_spec::Endpoint::Vsock(5000))
+        );
+    }
 }
 
 impl Drop for ForwardTable {

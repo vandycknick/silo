@@ -3,7 +3,7 @@ use std::path::Path;
 
 use clap::Args;
 use libvm::{
-    Forward, ForwardAddress, ForwardDirection, ForwardEndpoint, ForwardShape, MachineAgentStatus,
+    Forward, ForwardAddress, ForwardDirection, ForwardEndpoint, MachineAgentStatus,
     MachineForwardScope, MachineForwardState, MachineForwardStatus,
 };
 
@@ -56,14 +56,6 @@ impl Cmd {
         }
 
         let forward = forward.ok_or_else(|| eyre::eyre!("forward endpoints are required"))?;
-        let shape = forward.validate()?;
-        if matches!(
-            shape,
-            ForwardShape::InboundAgent | ForwardShape::OutboundAgent
-        ) {
-            guest::ensure_guest_ready(&inspect)?;
-        }
-
         let mut session = machine.open_forward(forward).await?;
         let mut signals = guest::HostSignals::termination()?;
         let mut previous = None;
