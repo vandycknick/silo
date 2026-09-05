@@ -49,8 +49,9 @@ Two transports exist and each is right for a different job:
   about IP addresses inside the guest.
 - The **netd virtual network** embeds `gvisor-tap-vsock`'s netstack. It can
   bind a host TCP address and dial the guest's interface address with no
-  guest-side component, which is exactly how a container engine's DNAT rules
-  expect to be reached. netd already constructs the upstream `PortsForwarder`
+  guest-side component. Docker publications add a per-publication ingress relay
+  on that interface so delivery does not depend on Docker's DNAT bind rules.
+  netd already constructs the upstream `PortsForwarder`
   and its HTTP mux (`net/netd/internal/virtualnetwork/virtualnetwork.go`) and
   serves them nowhere.
 
@@ -78,7 +79,7 @@ and the system VM compose those pieces.
 | Publication endpoint | The gvproxy-compatible HTTP API netd serves on the gateway IP inside the virtual network. |
 | Attachment-scoped publication | A publication created through the gvproxy-compatible API. It lives until an explicit unexpose or the guest attachment ends. |
 | Session-scoped publication | A publication that lives exactly as long as the HTTP connection that requested it. |
-| `silo-portd` | The guest binary a container engine execs per published port. It requests a session-scoped publication, then chains the engine's own userland proxy. |
+| `silo-portd` | The guest binary Docker execs per published port. It owns a private-interface ingress relay and a session-scoped publication, and supervises Docker's own userland proxy. |
 | System VM | A long-lived machine built from a Silo-controlled image that runs a container engine. |
 
 The words "forward" and "publication" are never interchangeable in this ADR.
@@ -176,7 +177,7 @@ flowchart LR
     subgraph engine["container engine"]
       direction TB
       dockerd["dockerd → silo-portd"]
-      eth0["eth0:port → DNAT → container"]
+      eth0["eth0:allocated-port → portd relay → container"]
     end
   end
   hl ==>|"vsock · CONNECT tcp:… or unix:…"| dialer
@@ -352,8 +353,10 @@ sequenceDiagram
   participant X as docker-proxy (guest)
   participant N as netd (host)
   participant H as host client
+  participant C as container
   D->>S: exec -proto tcp -host-ip 0.0.0.0 -host-port 8080 -container-ip … -container-port 80, fd 3 status pipe, fd 4 listener
-  S->>N: POST /services/forwarder/expose/session {local 0.0.0.0:8080, remote :8080, tcp}
+  S->>S: bind guest-ip:allocated-port, allow only the control connection's gateway IP
+  S->>N: POST /services/forwarder/expose/session {local 0.0.0.0:8080, remote guest-ip:allocated-port, tcp}
   N->>N: check protocol, bind policy, remote equals guest ip
   alt refused or bind failed
     N-->>S: 4xx or 5xx with the reason
@@ -364,30 +367,37 @@ sequenceDiagram
     S->>X: spawn with the same argv, fds 3 and 4 inherited
     X-->>D: 0 on fd 3
     H->>N: connect 0.0.0.0:8080
-    N->>D: netstack dial guest-ip:8080, DNAT delivers to the container
+    N->>S: netstack dial guest-ip:allocated-port
+    S->>C: connect container-ip:80 and relay bytes
     D->>S: SIGINT when the container stops
-    S->>X: SIGINT, wait for exit
     S--xN: session connection closes
+    S->>S: close ingress and active connections
+    S->>X: SIGINT, wait for exit (bounded)
     N->>N: release the publication
   end
 ```
 
 1. dockerd execs `silo-portd` with docker-proxy's argument contract and status
    pipe.
-2. `silo-portd` opens a session-scoped publication. netd validates the bind address
-   against the machine's publication policy, binds the host listener, and
+2. `silo-portd` connects to the gateway and binds a relay on the control
+   connection's local IPv4 address, using an automatically allocated port. It
+   opens a session-scoped publication targeting that ingress. netd validates the
+   bind address against the machine's publication policy, binds the host listener, and
    answers `200`. On any other answer, `silo-portd` reports the failure to
    dockerd through the status pipe and exits; `docker run` fails exactly as a
-   native bind failure would.
+   native bind failure would. The unadvertised ingress is also closed.
 3. `silo-portd` then spawns the engine's real `docker-proxy` with the same
    arguments and inherited descriptors, so the published port also remains
-   reachable on the guest's own loopback, which DNAT does not cover.
+   reachable inside the guest according to Docker's original bind settings.
 4. When dockerd stops the container it signals `silo-portd`; `silo-portd`
-   stops the chained proxy, closes the session HTTP connection, and exits. netd
-   removes the publication when the connection closes. A `SIGKILL` closes the
-   connection just the same.
-5. Per host connection, netd dials `<guest-ip>:8080` through the netstack; the
-   engine's DNAT rule delivers it to the container.
+   closes the session HTTP connection, the ingress, and its active connections,
+   then stops and reaps the chained proxy. netd removes the publication when the
+   connection closes. A `SIGKILL` closes the sockets just the same.
+5. Per host connection, netd dials the allocated ingress through the netstack.
+   The relay checks the source IP against the gateway and connects directly to
+   Docker's `container-ip:container-port`, using IPv4 or IPv6 as appropriate.
+   Host loopback, IPv6-only, and dual-stack binds no longer rely on a matching
+   IPv4 DNAT rule inside the guest.
 
 Podman in the same VM needs no `silo-portd`: it posts to
 `gateway.containers.internal/services/forwarder/expose` natively, and its
@@ -992,11 +1002,12 @@ reason (`protocol`, `bind_policy`, `conflict`, `bind_failed`).
 
 ### Data Path
 
-Per host connection netd dials `remote` through the netstack and splices,
-using the upstream `PortsForwarder`. Traffic arrives on the guest's interface
-address, where a container engine's DNAT rules deliver it to the container. A
-service bound only to guest loopback is not reachable through a publication;
-that is what forwards are for.
+Per host connection netd dials `remote` through its IPv4 netstack and splices
+TCP bytes. Traffic arrives on the guest's interface address, never directly at
+an arbitrary container or guest loopback address. For Docker, `remote` names
+`portd`'s per-publication ingress, which connects to the container. Other
+engines must supply an interface-reachable destination themselves. A generic
+service bound only to guest loopback still needs a forward.
 
 ## `silo-portd` And The System VM
 
@@ -1007,15 +1018,36 @@ implements dockerd's userland-proxy contract exactly:
   -container-ip <ip> -container-port <port> [-use-listen-fd]`, with a status
   pipe on descriptor 3 and, with `-use-listen-fd`, a bound listening socket
   on descriptor 4.
-- `silo-portd` requests a session-scoped publication of `host-ip:host-port`. On
-  success it spawns the engine's real `docker-proxy` (default
+- `silo-portd` first connects to the publication endpoint over IPv4. It binds
+  an ingress listener on that connection's local IP and an allocated port,
+  accepting traffic only from the connection's gateway peer IP. No wildcard
+  guest listener, hard-coded guest address, or container-route authority is
+  added to netd. The peer check prevents ordinary direct guest/container access;
+  it is not an isolation boundary against a privileged guest that controls
+  routing or can impersonate the gateway.
+- `silo-portd` requests a session-scoped publication of `host-ip:host-port`,
+  with `remote` set to the ingress address rather than `:host-port`. The host
+  bind and machine publication policy are unchanged. On success it spawns the
+  engine's real `docker-proxy` (default
   `/usr/bin/docker-proxy`, overridable with `SILO_PORTD_DOCKER_PROXY`) with
   the same arguments and both descriptors inherited, so `docker-proxy`
   performs the `0\n` status handshake and keeps the port reachable on guest
-  loopback. `silo-portd` forwards `SIGINT` and `SIGTERM` to the child, waits
-  for it, closes the session connection, and exits with the child's status.
-  Linux parent-death signaling also terminates the child if `silo-portd` is
-  killed before it can forward a stop signal.
+  loopback. The ingress separately connects to Docker's container address,
+  supporting both IPv4 and IPv6 targets without depending on Docker DNAT.
+- Each ingress has one nonblocking reactor thread, a maximum of 256 active or
+  connecting streams, and 16 KiB of buffering per direction per stream. Excess
+  connections are closed. Container dials expire after five seconds. Relays
+  preserve TCP half-close and do not impose an idle timeout on established data
+  streams.
+- On `SIGINT`, `SIGTERM`, hold failure, or relay failure, `silo-portd` closes
+  the publication, ingress, and active relay connections. It signals the proxy,
+  escalates to `SIGKILL` after two seconds if needed, and reaps it. A proxy exit
+  also closes all publication resources. Hold or relay failure exits non-zero;
+  otherwise the proxy's exit status is preserved. Linux parent-death signaling
+  also terminates the proxy if `silo-portd` is killed.
+- The control connection uses TCP keepalive (five idle seconds, one-second
+  probe interval, three probes), detecting a silently lost gateway in roughly
+  eight seconds. This is transport liveness, not a renewable publication lease.
 - On a failed publication it writes `1\n<message>` to descriptor 3 and exits
   non-zero without starting a proxy, so `docker run` fails with netd's
   message.
@@ -1074,7 +1106,7 @@ silo forward dev host:tcp:2222 vsock:22                    # raw vsock target, n
 | Plumbing `forwards` and `vsock` through `MachineBuilder`, templates, and `config.json`; `publish` in `MachineNetworkConfig`; netd flag | `libvm` |
 | `silo forward`, keeping the session stream open, endpoint parsing and shorthand | CLI |
 | Publication endpoint, bind policy, scoped publications, audit records, netstack dialing | netd |
-| `silo-portd`, `daemon.json`, DNAT delivery | the guest image (system VM image for Docker) |
+| `silo-portd`, its ingress relay, `daemon.json`, Docker proxy | the guest image (system VM image for Docker) |
 | Calling the publication endpoint natively | podman (unmodified) |
 
 `libvm` does not proxy streams and does not speak the target line. It gains a
@@ -1253,8 +1285,8 @@ at all, because it cannot reach loopback-bound guest services, which is what
 `silo forward 8080:80` overwhelmingly means, because it cannot carry Unix
 sockets, and because it would require a second host-side control surface on
 netd whose only client was the CLI. The netstack's strength, dialing the
-guest's interface address with no guest cooperation, is exactly what
-container publication needs and nothing else does.
+guest's interface address, provides the transport for container publication.
+Docker's bind-specific mappings additionally require `portd`'s ingress relay.
 
 ### A Direction Field
 
@@ -1295,11 +1327,12 @@ guest-resident program that knows a host port.
 ### Docker Desktop's Vsock Demultiplexer For Publications
 
 Docker Desktop carries published ports over vsock to an in-VM demultiplexer.
-Silo could route `-p` through the forward dialer instead of netd. It loses
-because the dialer connects to guest loopback, and Docker's DNAT rules do not
-apply to loopback destinations; the connection would have to target the
-guest's interface address, at which point netd already does this with no
-guest-side hop and with the address knowledge the netstack has anyway.
+Silo could route `-p` through a vsock demultiplexer instead of netd. It loses
+because publications belong to the network attachment and its bind policy,
+not to agent readiness or the public vsock surface. The Docker ingress relay
+now adds a guest-side hop, but does not introduce agent RPCs, reserved vsock
+ports, or host access to arbitrary guest destinations. netd still dials only
+the attached guest's IPv4 interface.
 
 ### Scanning The Guest For Bound Ports
 
@@ -1322,8 +1355,12 @@ host bind. The section stays rejected; see the non-decisions below.
 - Publications carry TCP to the guest over IPv4. IPv4 and IPv6 host listeners
   are supported. `-p 53:53/udp` fails with a message
   naming the protocol.
-- Publications reach only addresses on the guest's interface. Guest loopback
-  services need a forward.
+- netd publication destinations remain restricted to the guest's IPv4
+  interface. Docker's ingress relay can then reach IPv4 or IPv6 container
+  addresses. Generic guest loopback services need a forward.
+- A Docker publication permits at most 256 active or connecting relay streams.
+  Silent gateway failure follows the control connection's keepalive detection
+  (roughly eight seconds), not instantaneous link-loss notification.
 - Forwards carry stream sockets only. UDP has no place in this design.
 - Hostnames are not accepted in endpoints; addresses are IP literals.
 - Guest listeners bind in the root network namespace. Reaching into a

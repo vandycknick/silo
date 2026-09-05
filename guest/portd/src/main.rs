@@ -2,14 +2,16 @@
 
 mod args;
 mod http;
+mod relay;
 mod status;
 
 use std::io::Read;
+use std::net::SocketAddr;
 use std::os::fd::BorrowedFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::sys::prctl;
@@ -38,13 +40,12 @@ fn run() -> Result<i32, String> {
     if config.protocol != "tcp" {
         return Err(format!("{} publication is not supported", config.protocol));
     }
-    let endpoint =
-        std::env::var("SILO_PORTD_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
-    let hold = http::expose(&endpoint, config.host_ip, config.host_port)?;
-    let mut drain = hold
-        .drain_stream()
-        .map_err(|error| format!("clone publication hold: {error}"))?;
-
+    inherit_fd(status::STATUS_FD)?;
+    if config.use_listen_fd {
+        inherit_fd(status::LISTENER_FD)?;
+    }
+    // Block before creating the relay and hold-reader threads so stop signals
+    // are handled by the supervisor, not delivered to an arbitrary worker.
     let mut signals = SigSet::empty();
     signals.add(Signal::SIGINT);
     signals.add(Signal::SIGTERM);
@@ -53,10 +54,22 @@ fn run() -> Result<i32, String> {
     let signal_fd = SignalFd::with_flags(&signals, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)
         .map_err(|error| format!("create signal descriptor: {error}"))?;
 
-    inherit_fd(status::STATUS_FD)?;
-    if config.use_listen_fd {
-        inherit_fd(status::LISTENER_FD)?;
-    }
+    let endpoint =
+        std::env::var("SILO_PORTD_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
+    let client = http::PublicationClient::connect(&endpoint)?;
+    let (guest, gateway) = client.addresses()?;
+    let relay = relay::Relay::start(
+        guest,
+        gateway,
+        SocketAddr::new(config.container_ip, config.container_port),
+    )
+    .map_err(|error| format!("start publication ingress: {error}"))?;
+    let hold = client.expose(config.host_ip, config.host_port, relay.address())?;
+    let mut drain = hold
+        .drain_stream()
+        .map_err(|error| format!("clone publication hold: {error}"))?;
+    let mut relay = Some(relay);
+
     let proxy =
         std::env::var_os("SILO_PORTD_DOCKER_PROXY").unwrap_or_else(|| DEFAULT_DOCKER_PROXY.into());
     let mut command = Command::new(proxy);
@@ -74,59 +87,116 @@ fn run() -> Result<i32, String> {
                 .map_err(std::io::Error::other)
         });
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("start docker-proxy: {error}"))?;
-    let child_pid = Pid::from_raw(
-        i32::try_from(child.id()).map_err(|error| format!("invalid docker-proxy PID: {error}"))?,
+    let mut child = Proxy(
+        command
+            .spawn()
+            .map_err(|error| format!("start docker-proxy: {error}"))?,
     );
-
-    enum Event {
-        Child(ExitStatus),
-        HoldClosed(String),
-    }
+    let child_pid = Pid::from_raw(
+        i32::try_from(child.0.id())
+            .map_err(|error| format!("invalid docker-proxy PID: {error}"))?,
+    );
     let (events, receiver) = mpsc::channel();
-    let child_events = events.clone();
-    std::thread::spawn(move || {
-        let result = child
-            .wait()
-            .map(Event::Child)
-            .unwrap_or_else(|error| Event::HoldClosed(format!("wait for docker-proxy: {error}")));
-        let _ = child_events.send(result);
-    });
-    std::thread::spawn(move || {
-        let mut byte = [0; 1];
-        let reason = match drain.read(&mut byte) {
-            Ok(0) => "publication hold closed unexpectedly".to_string(),
-            Ok(_) => "publication endpoint sent unexpected data".to_string(),
-            Err(error) => format!("publication hold failed: {error}"),
-        };
-        let _ = events.send(Event::HoldClosed(reason));
-    });
+    let watcher = std::thread::Builder::new()
+        .name("publication-hold".into())
+        .spawn(move || {
+            let mut byte = [0; 1];
+            let reason = match drain.read(&mut byte) {
+                Ok(0) => "publication hold closed unexpectedly".to_string(),
+                Ok(_) => "publication endpoint sent unexpected data".to_string(),
+                Err(error) => format!("publication hold failed: {error}"),
+            };
+            let _ = events.send(reason);
+        })
+        .map_err(|error| format!("watch publication hold: {error}"))?;
 
+    let mut stopping = None;
+    let mut failure = None;
     let status = loop {
         while let Some(info) = signal_fd
             .read_signal()
             .map_err(|error| format!("read stop signal: {error}"))?
         {
             if let Ok(signal) = Signal::try_from(info.ssi_signo as i32) {
-                let _ = kill(child_pid, signal);
+                stop_publication(&hold, &mut relay, child_pid, &mut stopping, signal);
             }
         }
-        match receiver.recv_timeout(Duration::from_millis(50)) {
-            Ok(Event::Child(status)) => break status,
-            Ok(Event::HoldClosed(reason)) => {
-                eprintln!("silo-portd: {reason}");
-                let _ = kill(child_pid, Signal::SIGTERM);
+        if let Some(status) = child
+            .0
+            .try_wait()
+            .map_err(|error| format!("wait for docker-proxy: {error}"))?
+        {
+            break status;
+        }
+        if stopping.is_none() {
+            if relay.as_ref().is_some_and(relay::Relay::is_finished) {
+                failure = Some("publication relay stopped unexpectedly".to_string());
+                stop_publication(&hold, &mut relay, child_pid, &mut stopping, Signal::SIGTERM);
+            } else {
+                match receiver.recv_timeout(Duration::from_millis(50)) {
+                    Ok(reason) => {
+                        failure = Some(reason);
+                        stop_publication(
+                            &hold,
+                            &mut relay,
+                            child_pid,
+                            &mut stopping,
+                            Signal::SIGTERM,
+                        );
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        failure = Some("publication hold watcher stopped unexpectedly".to_string());
+                        stop_publication(
+                            &hold,
+                            &mut relay,
+                            child_pid,
+                            &mut stopping,
+                            Signal::SIGTERM,
+                        );
+                    }
+                }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("docker-proxy supervision stopped unexpectedly".to_string());
+        } else {
+            if stopping.is_some_and(|started: Instant| started.elapsed() >= Duration::from_secs(2))
+            {
+                let _ = kill(child_pid, Signal::SIGKILL);
             }
+            std::thread::sleep(Duration::from_millis(50));
         }
     };
     hold.close();
-    Ok(exit_code(status))
+    drop(relay);
+    let _ = watcher.join();
+    match failure {
+        Some(reason) => Err(reason),
+        None => Ok(exit_code(status)),
+    }
+}
+
+fn stop_publication(
+    hold: &http::PublicationHold,
+    relay: &mut Option<relay::Relay>,
+    child: Pid,
+    stopping: &mut Option<Instant>,
+    signal: Signal,
+) {
+    stopping.get_or_insert_with(Instant::now);
+    hold.close();
+    drop(relay.take());
+    let _ = kill(child, signal);
+}
+
+/// Reap the proxy on every error path, including supervisor setup failures.
+struct Proxy(Child);
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 }
 
 fn inherit_fd(raw_fd: i32) -> Result<(), String> {

@@ -305,7 +305,11 @@ Expected results:
 - netd listens on both `0.0.0.0:18081` and `[::]:18081`.
 - There are two `dockerd -> silo-portd -> docker-proxy` chains, one per family.
 - The table contains `0.0.0.0:18081` and `[::]:18081`.
-- Both entries dial the guest's private IPv4 address on port `18081`.
+- Each entry dials a different allocated port on the guest's private IPv4
+  address, not the Docker host port `18081`.
+- `ss -ltnp` inside the guest shows the portd ingress listeners on that private
+  address. A direct guest connection to an ingress is closed without reaching
+  the container; only netd's gateway source address is accepted.
 - Audit contains two session-scoped `exposed` records.
 
 Remove the container and verify both listeners disappear:
@@ -318,6 +322,42 @@ curl --noproxy '*' --max-time 2 'http://[::1]:18081'
 
 Both curls must fail. The table must return to `[]`, both process chains must
 be gone, and audit must contain two `released` records.
+
+### 6.1 Explicit loopback and IPv6-only publications
+
+Keep the main VM's `any` policy for this test. Unlike the default dual-stack
+case, the last mapping below must work without a matching IPv4 publication:
+
+```bash
+docker run -d --name adr16-explicit \
+  --publish 127.0.0.1:18085:80 \
+  --publish '[::1]:18086:80' \
+  --publish '[::]:18087:80' \
+  docker.io/library/busybox:1.37.0 \
+  sh -c 'mkdir -p /www; echo explicit-ok >/www/index.html; exec httpd -f -p 80 -h /www'
+
+curl --noproxy '*' --fail http://127.0.0.1:18085
+curl --noproxy '*' --fail 'http://[::1]:18086'
+curl --noproxy '*' --fail 'http://[::1]:18087'
+ss -ltnp
+```
+
+All three requests must return `explicit-ok`. Host listeners must be exactly
+`127.0.0.1:18085`, `[::1]:18086`, and `[::]:18087`. In particular, there must
+not be a `0.0.0.0:18087` companion or a wildcard listener for either localhost
+mapping. This request must fail:
+
+```bash
+curl --noproxy '*' --max-time 2 http://127.0.0.1:18087
+```
+
+The publication table must contain three distinct IPv4 guest ingress targets.
+Guest-local access through the original Docker listeners must still work.
+Remove the container and verify all host and ingress listeners disappear:
+
+```bash
+docker rm --force adr16-explicit
+```
 
 ## 7. Publish through the host Docker CLI
 
@@ -492,6 +532,7 @@ Expected results for the selected family:
 - Its host publication disappears within five seconds.
 - Its session entry disappears from `/services/forwarder/all`.
 - Audit records a release.
+- Its ingress listener and active relay connections are closed.
 - Its chained `docker-proxy` terminates through Linux parent-death signaling.
 - The other family remains independently owned until its portd exits.
 
@@ -517,9 +558,21 @@ Expected results:
 - No host listener or table entry remains.
 - Audit records a denied publication with reason `bind_policy`.
 
-An explicit `127.0.0.1` Docker bind is diagnostic rather than part of this
-test's required system-VM behavior. The Docker system VM intentionally uses
-the `any` publication policy.
+Explicit loopback publications are required to work under this policy:
+
+```bash
+docker run -d --name adr16-loopback-policy \
+  --publish 127.0.0.1:18085:80 --publish '[::1]:18086:80' \
+  docker.io/library/busybox:1.37.0 \
+  sh -c 'mkdir -p /www; echo loopback-ok >/www/index.html; exec httpd -f -p 80 -h /www'
+curl --noproxy '*' --fail http://127.0.0.1:18085
+curl --noproxy '*' --fail 'http://[::1]:18086'
+docker rm --force adr16-loopback-policy
+```
+
+Both requests must return `loopback-ok`. The host listeners must remain
+loopback-only. Removal must release both allocated guest ingresses as well as
+the host listeners. A publication denial must not leave an ingress behind.
 
 ## 13. Optional external-interface test
 
@@ -572,7 +625,10 @@ The smoke test passes only when all of the following are true:
 - VM stop removes listeners and the Docker API socket.
 - VM start recreates the machine-scoped socket and restart-policy publication.
 - Killing one portd releases its session without releasing the other family.
-- Loopback policy rejects Docker's default wildcard publication.
+- Explicit IPv4/IPv6 loopback and unpaired IPv6-only publications reach the
+  container without widening the host bind.
+- Loopback policy rejects Docker's default wildcard publication but permits
+  working explicit loopback publications.
 - Audit records agree with every exposed, released, and denied transition.
 
 Any leaked host listener, publication table entry, `silo-portd`, or
@@ -589,7 +645,7 @@ Any leaked host listener, publication table entry, `silo-portd`, or
 | `start docker-proxy` reports a missing file             | Guest `docker-proxy` path                                     |
 | `docker run -p` hangs                                   | Docker status pipe or inherited listener descriptor           |
 | IPv4 succeeds and IPv6 reports address in use           | Host listener family was not constrained to `tcp4` and `tcp6` |
-| Guest loopback works but host traffic fails             | netd listener, gVisor dial, or Docker DNAT                    |
+| Guest loopback works but host traffic fails             | netd listener, gVisor dial, ingress source check, or relay target |
 | Host traffic works but guest loopback fails             | Chained `docker-proxy` or descriptor inheritance              |
 | Port remains after container removal                    | Signal forwarding or session disconnect cleanup               |
 | Port remains after VM stop                              | Publication table or netd attachment cleanup                  |

@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
@@ -66,7 +66,7 @@ fn holds_publication_and_forwards_stop_signal_to_proxy() {
     command.env("SILO_PORTD_TEST_SIGNAL_FILE", &signal_path);
     let (mut portd, status_rx) = spawn_portd(command);
 
-    request_seen_rx
+    let ingress = request_seen_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("netd request was not received");
     assert_eq!(
@@ -83,6 +83,10 @@ fn holds_publication_and_forwards_stop_signal_to_proxy() {
     kill(pid, Signal::SIGTERM).expect("signal silo-portd");
     let exit = portd.wait().expect("wait for silo-portd");
     assert!(exit.success(), "unexpected silo-portd exit: {exit}");
+    assert!(
+        TcpStream::connect(ingress).is_err(),
+        "ingress survived stop"
+    );
     assert_eq!(
         std::fs::read_to_string(&signal_path).expect("proxy signal marker"),
         "term"
@@ -114,7 +118,7 @@ fn killing_portd_terminates_proxy_and_closes_publication() {
         .env("SILO_PORTD_TEST_PID_FILE", &pid_path);
     let (mut portd, status_rx) = spawn_portd(command);
 
-    request_seen_rx
+    let ingress = request_seen_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("netd request was not received");
     assert_eq!(
@@ -135,6 +139,10 @@ fn killing_portd_terminates_proxy_and_closes_publication() {
     kill(portd_pid, Signal::SIGKILL).expect("kill silo-portd");
     let exit = portd.wait().expect("wait for silo-portd");
     assert_eq!(exit.signal(), Some(Signal::SIGKILL as i32));
+    assert!(
+        TcpStream::connect(ingress).is_err(),
+        "ingress survived kill"
+    );
     connection_closed_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("publication connection stayed open");
@@ -195,23 +203,27 @@ fn spawn_portd(mut command: Command) -> (Child, Receiver<String>) {
     (portd, status_rx)
 }
 
-fn publication_server() -> (String, Receiver<()>, Receiver<()>, JoinHandle<()>) {
+fn publication_server() -> (String, Receiver<SocketAddrV4>, Receiver<()>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind netd fixture");
     let endpoint = format!("http://{}", listener.local_addr().expect("fixture address"));
     let (request_seen_tx, request_seen_rx) = mpsc::channel();
     let (connection_closed_tx, connection_closed_rx) = mpsc::channel();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept publication request");
-        read_request(&mut stream);
-        request_seen_tx.send(()).expect("report request");
-        let publication = b"{\"local\":\"0.0.0.0:8080\",\"remote\":\"192.168.127.2:8080\",\"protocol\":\"tcp\"}\n";
+        let ingress = read_request(&mut stream);
+        request_seen_tx.send(ingress).expect("report request");
+        let publication = format!(
+            "{{\"local\":\"0.0.0.0:8080\",\"remote\":\"{ingress}\",\"protocol\":\"tcp\"}}\n"
+        );
         write!(
             stream,
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
             publication.len()
         )
         .expect("write response headers");
-        stream.write_all(publication).expect("write publication");
+        stream
+            .write_all(publication.as_bytes())
+            .expect("write publication");
         stream.write_all(b"\r\n").expect("write chunk terminator");
         let mut byte = [0; 1];
         while stream.read(&mut byte).expect("read publication hold") != 0 {}
@@ -231,7 +243,7 @@ fn wait_for(timeout: Duration, condition: impl Fn() -> bool) {
     panic!("condition did not become true before timeout");
 }
 
-fn read_request(stream: &mut TcpStream) {
+fn read_request(stream: &mut TcpStream) -> SocketAddrV4 {
     let mut reader = BufReader::new(stream.try_clone().expect("clone request stream"));
     let mut content_length = None;
     loop {
@@ -246,8 +258,11 @@ fn read_request(stream: &mut TcpStream) {
     }
     let mut body = vec![0; content_length.expect("request content length")];
     reader.read_exact(&mut body).expect("read request body");
-    assert_eq!(
-        body,
-        br#"{"local":"0.0.0.0:8080","remote":":8080","protocol":"tcp"}"#
-    );
+    let request: serde_json::Value = serde_json::from_slice(&body).expect("publication JSON");
+    assert_eq!(request["local"], "0.0.0.0:8080");
+    assert_eq!(request["protocol"], "tcp");
+    let ingress: SocketAddrV4 = request["remote"].as_str().unwrap().parse().unwrap();
+    assert_eq!(ingress.ip(), &Ipv4Addr::LOCALHOST);
+    assert_ne!(ingress.port(), 0);
+    ingress
 }
