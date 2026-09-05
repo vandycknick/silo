@@ -6,6 +6,7 @@ pub mod cleanup;
 pub mod create;
 pub mod default;
 pub mod exec;
+pub mod forward;
 pub mod list;
 pub mod logs;
 pub mod network;
@@ -37,6 +38,7 @@ pub enum Command {
     Rm(rm::Cmd),
     Shell(shell::Cmd),
     Exec(exec::Cmd),
+    Forward(forward::Cmd),
     #[command(visible_alias = "ls")]
     List(list::Cmd),
     #[command(visible_alias = "status")]
@@ -61,6 +63,7 @@ impl Command {
             Self::Rm(command) => command.run(context).await,
             Self::Shell(command) => command.run(context).await,
             Self::Exec(command) => command.run(context).await,
+            Self::Forward(command) => command.run(context).await,
             Self::List(command) => command.run(context).await,
             Self::Show(command) => command.run(context).await,
             Self::Logs(command) => command.run(context).await,

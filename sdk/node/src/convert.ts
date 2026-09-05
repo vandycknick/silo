@@ -1,5 +1,6 @@
 import type {
   NativeExecutionEvent,
+  NativeForward,
   NativeExecutionOptionsInput,
   NativeExecutionResult,
   NativeImageDetail,
@@ -23,6 +24,9 @@ import type {
 } from "./internal/napi.js";
 import type {
   ExecutionOptions,
+  Forward,
+  ForwardEndpoint,
+  GuestPublish,
   ExecutionLaunchFailureReason,
   ExecutionLostReason,
   ExecutionResult,
@@ -93,6 +97,39 @@ export function mountsToNative(mounts: Mount[]): NativeMountInput[] {
   });
 }
 
+function forwardEndpoint(value: unknown, name: string): ForwardEndpoint {
+  const text = assertNonEmptyString(value, name);
+  if (/[\0\r\n]/u.test(text)) throw new TypeError(`${name} must not contain NUL, CR, or LF`);
+  if (text.startsWith("host:")) return `host:${text.slice(5)}`;
+  if (text.startsWith("guest:")) return `guest:${text.slice(6)}`;
+  if (text.startsWith("vsock:")) return `vsock:${text.slice(6)}`;
+  throw new TypeError(`${name} must start with host:, guest:, or vsock:`);
+}
+
+function forwardFromValue(value: unknown, name: string): Forward {
+  const record = assertRecord(value, name);
+  const mode = optionalNullableString(record.mode, `${name}.mode`);
+  if (mode !== undefined && !/^0[0-7]{3}$/u.test(mode)) throw new TypeError(`${name}.mode must be a four-digit octal permission string`);
+  return {
+    name: optionalNullableString(record.name, `${name}.name`),
+    listen: forwardEndpoint(record.listen, `${name}.listen`),
+    connect: forwardEndpoint(record.connect, `${name}.connect`),
+    mode,
+  };
+}
+
+export function forwardsToNative(forwards: Forward[]): NativeForward[] {
+  if (!Array.isArray(forwards)) throw new TypeError("forwards must be an array");
+  return forwards.map((forward, index) => forwardFromValue(forward, `forwards[${index}]`));
+}
+
+function guestPublish(value: unknown): GuestPublish | undefined {
+  if (value == null) return undefined;
+  const record = assertRecord(value, "network.publish");
+  if (record.bind !== "loopback" && record.bind !== "any") throw new TypeError("network.publish.bind must be loopback or any");
+  return { bind: record.bind };
+}
+
 export function networkToNative(network: Network): NativeNetworkInput {
   const record = assertRecord(network, "network");
   const kind = assertString(record.kind, "network.kind");
@@ -101,10 +138,13 @@ export function networkToNative(network: Network): NativeNetworkInput {
       return {
         kind,
         policyJson: optionalNonEmptyString(record.policyJson, "network.policyJson"),
+        ...(record.publish == null ? {} : { publish: guestPublish(record.publish) }),
       };
     case "none":
+      if (record.publish != null) throw new TypeError("guest publication requires a private network");
       return { kind };
     case "named":
+      if (record.publish != null) throw new TypeError("guest publication requires a private network");
       return { kind: "named", name: assertNonEmptyString(record.name, "network.name") };
     case "unknown":
       throw new TypeError("unknown network data cannot be used as a machine builder input");
@@ -143,6 +183,8 @@ export function machineDataFromNative(data: NativeMachineData): MachineData {
     labels: keyValuesToMap(data.labels),
     metadata: keyValuesToMap(data.metadata),
     network: networkFromNative(data.network),
+    forwards: data.forwards.map((forward, index) => forwardFromValue(forward, `forwards[${index}]`)),
+    vsock: data.vsock == null ? undefined : { enabled: data.vsock.enabled, uds: data.vsock.uds ?? undefined },
     agent: machineAgentFromNative({ mode: data.agentMode, path: data.agentPath }),
     status: {
       kind: data.status.kind,
@@ -489,7 +531,8 @@ function imageLayerFromNative(layer: NativeImageLayerDetail): ImageLayerDetail {
 function networkFromNative(network: NativeNetworkData): Network {
   if (network.kind === "private") {
     const policyJson = optionalNullableNonEmptyString(network.policyJson, "network.policyJson");
-    return policyJson === undefined ? { kind: "private" } : { kind: "private", policyJson };
+    const publish = guestPublish(network.publish);
+    return { kind: "private", ...(policyJson === undefined ? {} : { policyJson }), ...(publish === undefined ? {} : { publish }) };
   }
   if (network.kind === "named") {
     return { kind: "named", name: network.name ?? "" };

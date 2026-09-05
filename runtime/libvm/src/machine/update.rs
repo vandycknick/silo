@@ -1,5 +1,5 @@
 use crate::machine::{GuestBuilder, MachineGuestConfig, MachineUserConfig, Memory};
-use crate::network::{MachineNetworkBuilder, MachineNetworkConfig};
+use crate::network::{MachineNetworkBuilder, MachineNetworkConfig, PublishBind};
 
 use silo_policy::NetworkPolicy;
 
@@ -7,6 +7,13 @@ use silo_policy::NetworkPolicy;
 #[non_exhaustive]
 pub enum NetworkPolicyUpdate {
     Set(NetworkPolicy),
+    Clear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GuestPublishUpdate {
+    Set(PublishBind),
     Clear,
 }
 
@@ -46,11 +53,17 @@ pub struct MachineUpdate {
     pub nested_virtualization: Option<bool>,
     /// New Rosetta setting.
     pub rosetta: Option<bool>,
+    /// Replacement machine-scoped forwards.
+    pub forwards: Option<Vec<forward_spec::Forward>>,
+    /// Replacement public vsock configuration.
+    pub vsock: Option<vm_spec::Vsock>,
     /// New durable network config.
     pub network: Option<MachineNetworkConfig>,
     pub(crate) network_error: Option<String>,
     /// Policy-only update for the current durable network config.
     pub network_policy: Option<NetworkPolicyUpdate>,
+    /// Publication-only update for the current durable network config.
+    pub guest_publish: Option<GuestPublishUpdate>,
     /// Replacement durable guest settings.
     pub guest: Option<MachineGuestConfig>,
     /// Partial update to the managed guest user.
@@ -99,6 +112,18 @@ impl MachineUpdate {
         self
     }
 
+    /// Replaces all machine-scoped forwards.
+    pub fn forwards(mut self, forwards: Vec<forward_spec::Forward>) -> Self {
+        self.forwards = Some(forwards);
+        self
+    }
+
+    /// Enables or disables the public vsock surface with its default socket name.
+    pub fn vsock(mut self, enabled: bool) -> Self {
+        self.vsock = Some(vm_spec::Vsock { enabled, uds: None });
+        self
+    }
+
     /// Replaces durable guest settings.
     pub fn guest(mut self, configure: impl FnOnce(GuestBuilder) -> GuestBuilder) -> Self {
         self.guest = Some(configure(GuestBuilder::new()).build());
@@ -141,6 +166,15 @@ impl MachineUpdate {
         self
     }
 
+    /// Changes whether the guest may request host TCP publications.
+    pub fn publish(mut self, bind: Option<PublishBind>) -> Self {
+        self.guest_publish = Some(match bind {
+            Some(bind) => GuestPublishUpdate::Set(bind),
+            None => GuestPublishUpdate::Clear,
+        });
+        self
+    }
+
     /// Returns true when no settings are present.
     pub fn is_empty(&self) -> bool {
         self.name.is_none()
@@ -149,10 +183,48 @@ impl MachineUpdate {
             && self.root_disk_size.is_none()
             && self.nested_virtualization.is_none()
             && self.rosetta.is_none()
+            && self.forwards.is_none()
+            && self.vsock.is_none()
             && self.network.is_none()
             && self.network_error.is_none()
             && self.network_policy.is_none()
+            && self.guest_publish.is_none()
             && self.guest.is_none()
             && self.user.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{GuestPublishUpdate, MachineUpdate, PublishBind};
+
+    #[test]
+    fn forward_and_vsock_setters_are_nonempty_replacements() {
+        let forward = forward_spec::Forward::new(
+            "host:tcp:8080".parse().expect("listen endpoint"),
+            "guest:tcp:80".parse().expect("connect endpoint"),
+        );
+        let update = MachineUpdate::new()
+            .forwards(vec![forward.clone()])
+            .vsock(true);
+
+        assert!(!update.is_empty());
+        assert_eq!(update.forwards, Some(vec![forward]));
+        assert!(update.vsock.expect("vsock update").enabled);
+    }
+
+    #[test]
+    fn guest_publish_setter_is_a_nonempty_partial_network_update() {
+        let update = MachineUpdate::new().publish(Some(PublishBind::Loopback));
+
+        assert!(!update.is_empty());
+        assert!(matches!(
+            update.guest_publish,
+            Some(GuestPublishUpdate::Set(PublishBind::Loopback))
+        ));
+        assert!(matches!(
+            MachineUpdate::new().publish(None).guest_publish,
+            Some(GuestPublishUpdate::Clear)
+        ));
     }
 }

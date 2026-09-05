@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 use silo_policy::NetworkPolicy;
 
@@ -6,6 +7,48 @@ use crate::store::models;
 use crate::utils::{validate_identifier, IdentifierPolicy};
 
 const RESERVED_NETWORK_NAMES: &[&str] = &["private", "none"];
+
+/// Guest authority to request host TCP publications through its private network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestPublish {
+    /// Host addresses the guest may request netd to bind.
+    pub bind: PublishBind,
+}
+
+/// Host bind policy for guest-requested publications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishBind {
+    /// Permit host loopback listeners only.
+    Loopback,
+    /// Permit loopback and wildcard host listeners.
+    Any,
+}
+
+impl PublishBind {
+    /// Returns the stable command-line and serialization spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::Any => "any",
+        }
+    }
+}
+
+impl FromStr for PublishBind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "loopback" => Ok(Self::Loopback),
+            "any" => Ok(Self::Any),
+            _ => Err(format!(
+                "invalid guest publication bind {value:?}; expected loopback or any"
+            )),
+        }
+    }
+}
 
 /// Durable network configuration for a machine.
 ///
@@ -22,6 +65,9 @@ pub enum MachineNetworkConfig {
         /// Resolved canonical policy for the private network.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy: Option<NetworkPolicy>,
+        /// Guest-requested publication authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        publish: Option<GuestPublish>,
     },
     /// Start the machine with no network attachment.
     None,
@@ -34,13 +80,19 @@ pub enum MachineNetworkConfig {
 
 impl Default for MachineNetworkConfig {
     fn default() -> Self {
-        Self::Private { policy: None }
+        Self::Private {
+            policy: None,
+            publish: None,
+        }
     }
 }
 
 impl MachineNetworkConfig {
     pub(crate) fn private() -> Self {
-        Self::Private { policy: None }
+        Self::Private {
+            policy: None,
+            publish: None,
+        }
     }
 
     pub(crate) fn none() -> Self {
@@ -64,6 +116,14 @@ impl MachineNetworkConfig {
     pub fn policy(&self) -> Option<&NetworkPolicy> {
         match self {
             Self::Private { policy, .. } => policy.as_ref(),
+            Self::None | Self::Named { .. } => None,
+        }
+    }
+
+    /// Returns the guest publication setting, when enabled.
+    pub fn publish(&self) -> Option<GuestPublish> {
+        match self {
+            Self::Private { publish, .. } => *publish,
             Self::None | Self::Named { .. } => None,
         }
     }
@@ -115,8 +175,30 @@ impl MachineNetworkBuilder {
         };
         if let Some(error) = error {
             self.record_error(error);
-        } else if let MachineNetworkConfig::Private { policy: existing } = &mut self.config {
+        } else if let MachineNetworkConfig::Private {
+            policy: existing, ..
+        } = &mut self.config
+        {
             *existing = Some(policy.normalized());
+        }
+        self
+    }
+
+    /// Allows the guest to request host TCP publications through netd.
+    pub fn publish(mut self, bind: PublishBind) -> Self {
+        let error = match &self.config {
+            MachineNetworkConfig::Private { .. } => None,
+            MachineNetworkConfig::None => {
+                Some("guest publications require a private network attachment".to_string())
+            }
+            MachineNetworkConfig::Named { name } => Some(format!(
+                "guest publications require a private network attachment, but named network {name:?} was selected"
+            )),
+        };
+        if let Some(error) = error {
+            self.record_error(error);
+        } else if let MachineNetworkConfig::Private { publish, .. } = &mut self.config {
+            *publish = Some(GuestPublish { bind });
         }
         self
     }
@@ -144,7 +226,10 @@ impl Default for MachineNetworkBuilder {
 impl From<MachineNetworkConfig> for models::MachineNetworkConfig {
     fn from(value: MachineNetworkConfig) -> Self {
         match value {
-            MachineNetworkConfig::Private { policy } => Self::Private { policy },
+            MachineNetworkConfig::Private { policy, publish } => Self::Private {
+                policy,
+                publish: publish.map(Into::into),
+            },
             MachineNetworkConfig::None => Self::None,
             MachineNetworkConfig::Named { name } => Self::Named { name },
         }
@@ -154,9 +239,46 @@ impl From<MachineNetworkConfig> for models::MachineNetworkConfig {
 impl From<models::MachineNetworkConfig> for MachineNetworkConfig {
     fn from(value: models::MachineNetworkConfig) -> Self {
         match value {
-            models::MachineNetworkConfig::Private { policy } => Self::Private { policy },
+            models::MachineNetworkConfig::Private { policy, publish } => Self::Private {
+                policy,
+                publish: publish.map(Into::into),
+            },
             models::MachineNetworkConfig::None => Self::None,
             models::MachineNetworkConfig::Named { name } => Self::Named { name },
+        }
+    }
+}
+
+impl From<GuestPublish> for models::GuestPublish {
+    fn from(value: GuestPublish) -> Self {
+        Self {
+            bind: value.bind.into(),
+        }
+    }
+}
+
+impl From<models::GuestPublish> for GuestPublish {
+    fn from(value: models::GuestPublish) -> Self {
+        Self {
+            bind: value.bind.into(),
+        }
+    }
+}
+
+impl From<PublishBind> for models::PublishBind {
+    fn from(value: PublishBind) -> Self {
+        match value {
+            PublishBind::Loopback => Self::Loopback,
+            PublishBind::Any => Self::Any,
+        }
+    }
+}
+
+impl From<models::PublishBind> for PublishBind {
+    fn from(value: models::PublishBind) -> Self {
+        match value {
+            models::PublishBind::Loopback => Self::Loopback,
+            models::PublishBind::Any => Self::Any,
         }
     }
 }
@@ -322,7 +444,64 @@ impl From<models::NetworkDriverPreference> for NetworkDriver {
 
 #[cfg(test)]
 mod tests {
-    use super::{NetworkDefinition, NetworkDriver, NetworkTopology};
+    use super::{
+        GuestPublish, MachineNetworkBuilder, MachineNetworkConfig, NetworkDefinition,
+        NetworkDriver, NetworkTopology, PublishBind,
+    };
+
+    #[test]
+    fn private_network_guest_publish_round_trips_through_json() {
+        let network = MachineNetworkConfig::Private {
+            policy: None,
+            publish: Some(GuestPublish {
+                bind: PublishBind::Any,
+            }),
+        };
+
+        let json = serde_json::to_string(&network).expect("serialize network");
+        assert_eq!(json, r#"{"kind":"private","publish":{"bind":"any"}}"#);
+        assert_eq!(
+            serde_json::from_str::<MachineNetworkConfig>(&json).expect("deserialize network"),
+            network
+        );
+    }
+
+    #[test]
+    fn private_network_without_guest_publish_still_deserializes() {
+        let network = serde_json::from_str::<MachineNetworkConfig>(r#"{"kind":"private"}"#)
+            .expect("deserialize old network config");
+
+        assert_eq!(network, MachineNetworkConfig::default());
+    }
+
+    #[test]
+    fn guest_publish_requires_private_network() {
+        let error = MachineNetworkBuilder::new()
+            .none()
+            .publish(PublishBind::Loopback)
+            .build()
+            .expect_err("network none must reject guest publication");
+
+        assert_eq!(
+            error,
+            "guest publications require a private network attachment"
+        );
+    }
+
+    #[test]
+    fn guest_publish_builder_sets_private_network_authority() {
+        let network = MachineNetworkBuilder::new()
+            .publish(PublishBind::Loopback)
+            .build()
+            .expect("private network should allow guest publication");
+
+        assert_eq!(
+            network.publish(),
+            Some(GuestPublish {
+                bind: PublishBind::Loopback
+            })
+        );
+    }
 
     #[test]
     fn netd_driver_allows_nat_named_networks() {

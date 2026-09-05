@@ -9,6 +9,7 @@ use eyre::Context;
 use futures::{Stream, StreamExt};
 use protocol::v1::vm_access_service_server::{VmAccessService, VmAccessServiceServer};
 use protocol::v1::vm_execution_service_server::VmExecutionServiceServer;
+use protocol::v1::vm_forward_service_server::VmForwardServiceServer;
 use protocol::v1::vm_monitor_service_server::{VmMonitorService, VmMonitorServiceServer};
 use protocol::v1::{
     ByteChunk, GetMetricsRequest, GetStatusRequest, HostMetrics, HostStatus, WaitReadyOutcome,
@@ -45,6 +46,7 @@ pub struct ServiceHandles {
     pub(crate) server_shutdown: CancellationToken,
     pub(crate) startup_command: Option<JoinHandle<()>>,
     pub(crate) vsock_surface: Option<crate::vsock::VsockSurface>,
+    pub(crate) forwards: Option<Arc<crate::forward::ForwardTable>>,
 }
 
 #[derive(Clone)]
@@ -213,9 +215,13 @@ fn ssh_backend_status(error: crate::virt::VirtError) -> Status {
 
 impl ServiceHandles {
     pub(crate) async fn mark_stopping(&self) {
+        if let Some(forwards) = &self.forwards {
+            forwards.mark_stopping();
+        }
         for service in [
             "silo.v1.VmAccessService",
             "silo.v1.VmExecutionService",
+            "silo.v1.VmForwardService",
             "silo.v1.GuestFilesystemService",
             "grpc.reflection.v1.ServerReflection",
         ] {
@@ -266,6 +272,9 @@ pub async fn start_services(
         .set_serving::<VmExecutionServiceServer<ExecutionService>>()
         .await;
     health
+        .set_serving::<VmForwardServiceServer<crate::forward::service::ForwardService>>()
+        .await;
+    health
         .set_serving::<protocol::v1::guest_filesystem_service_server::GuestFilesystemServiceServer<
             FilesystemProxy,
         >>()
@@ -283,6 +292,7 @@ pub async fn start_services(
         "silo.v1.VmMonitorService",
         "silo.v1.VmAccessService",
         "silo.v1.VmExecutionService",
+        "silo.v1.VmForwardService",
         "silo.v1.GuestFilesystemService",
     ])
     .context("filter host gRPC reflection descriptors")?;
@@ -292,6 +302,7 @@ pub async fn start_services(
         .with_service_name("silo.v1.VmMonitorService")
         .with_service_name("silo.v1.VmAccessService")
         .with_service_name("silo.v1.VmExecutionService")
+        .with_service_name("silo.v1.VmForwardService")
         .with_service_name("silo.v1.GuestFilesystemService")
         .with_service_name("grpc.health.v1.Health")
         .with_service_name("grpc.reflection.v1.ServerReflection")
@@ -312,6 +323,7 @@ pub async fn start_services(
     };
     let execution = ExecutionService::new(ctx, exec_log.clone());
     let filesystem = FilesystemProxy::new(ctx.machine.clone(), ctx.shutdown.clone());
+    let forwards = crate::forward::service::ForwardService::new(ctx.forwards.clone());
     let control_socket = tokio::spawn(async move {
         let monitor = VmMonitorServiceServer::new(monitor)
             .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
@@ -320,6 +332,9 @@ pub async fn start_services(
             .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
             .max_encoding_message_size(protocol::STRUCTURED_16_MIB);
         let execution = VmExecutionServiceServer::new(execution)
+            .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
+            .max_encoding_message_size(protocol::STRUCTURED_16_MIB);
+        let forwards = VmForwardServiceServer::new(forwards)
             .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
             .max_encoding_message_size(protocol::STRUCTURED_16_MIB);
         let filesystem =
@@ -332,7 +347,7 @@ pub async fn start_services(
             match connection {
                 Ok(stream) => match stream.peer_cred() {
                     Ok(credentials)
-                        if peer_uid_authorized(socket_owner_uid, credentials.uid()) =>
+                        if crate::vsock::peer::peer_uid_authorized(socket_owner_uid, credentials.uid()) =>
                     {
                         tracing::debug!(
                             uid = credentials.uid(),
@@ -368,6 +383,7 @@ pub async fn start_services(
             .add_service(monitor)
             .add_service(access)
             .add_service(execution)
+            .add_service(forwards)
             .add_service(filesystem)
             .serve_with_incoming_shutdown(incoming, server_shutdown_signal.cancelled())
             .await
@@ -375,7 +391,15 @@ pub async fn start_services(
     });
 
     let guest_monitor = if ctx.guest_services_enabled {
-        Some(spawn_guest_services(&ctx.machine, ctx.store.clone(), ctx.shutdown.clone()).await?)
+        Some(
+            spawn_guest_services(
+                &ctx.machine,
+                ctx.store.clone(),
+                ctx.forwards.clone(),
+                ctx.shutdown.clone(),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -426,11 +450,8 @@ pub async fn start_services(
         server_shutdown,
         startup_command,
         vsock_surface,
+        forwards: Some(ctx.forwards.clone()),
     })
-}
-
-fn peer_uid_authorized(socket_owner_uid: u32, peer_uid: u32) -> bool {
-    socket_owner_uid == peer_uid
 }
 
 fn relay<S, I>(
@@ -610,14 +631,8 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tokio_util::sync::CancellationToken;
 
-    use crate::services::{peer_uid_authorized, relay, ssh_backend_status};
+    use crate::services::{relay, ssh_backend_status};
     use crate::virt::VirtError;
-
-    #[test]
-    fn socket_peer_must_match_its_owner() {
-        assert!(peer_uid_authorized(501, 501));
-        assert!(!peer_uid_authorized(501, 502));
-    }
 
     #[test]
     fn ssh_capacity_exhaustion_has_specific_rpc_mapping() {

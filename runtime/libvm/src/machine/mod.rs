@@ -1,5 +1,6 @@
 mod builder;
 mod config;
+mod forward;
 mod guest;
 mod handle;
 mod inspect;
@@ -19,6 +20,10 @@ mod update;
 mod vsock;
 
 pub use builder::MachineBuilder;
+pub use forward::{
+    MachineForwardErrorDetail, MachineForwardScope, MachineForwardSession, MachineForwardState,
+    MachineForwardStatus,
+};
 pub use guest::{GuestBuilder, MachineAgent, MachineGuestConfig, MachineUserConfig};
 pub use handle::Machine;
 pub use inspect::{
@@ -63,7 +68,7 @@ pub use streams::{
     MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState, MachineStaleReason,
     MachineSystemInfo, MachineVmSnapshot, MachineVmState,
 };
-pub use update::{MachineUpdate, MachineUserUpdate, NetworkPolicyUpdate};
+pub use update::{GuestPublishUpdate, MachineUpdate, MachineUserUpdate, NetworkPolicyUpdate};
 
 pub(crate) use name_generator::generate_machine_name;
 pub(crate) use reference::{validate_machine_name, MachineRefKind};

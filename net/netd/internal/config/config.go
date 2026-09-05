@@ -27,7 +27,15 @@ type Config struct {
 	PolicyFile   string
 	TLS          TLSConfig
 	Metadata     Metadata
+	GuestPublish PublishBind
 }
+
+type PublishBind string
+
+const (
+	PublishBindLoopback PublishBind = "loopback"
+	PublishBindAny      PublishBind = "any"
+)
 
 type TLSConfig struct {
 	CACert string
@@ -69,7 +77,7 @@ type DNSRecord struct {
 
 func Parse(args []string) (*Config, error) {
 	cfg := &Config{}
-	var subnet, staticLease string
+	var subnet, staticLease, guestPublish string
 
 	flags := flag.NewFlagSet("netd", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -88,6 +96,7 @@ func Parse(args []string) (*Config, error) {
 	flags.StringVar(&cfg.Metadata.VMID, "vm-id", "", "VM identifier added to flow logs")
 	flags.StringVar(&cfg.Metadata.RunID, "run-id", "", "run identifier added to flow logs")
 	flags.StringVar(&cfg.Metadata.NetworkID, "network-id", "", "network identifier added to flow logs")
+	flags.StringVar(&guestPublish, "guest-publish", "", "allow the guest to request host TCP publications: loopback or any")
 	if err := flags.Parse(args); err != nil {
 		return cfg, err
 	}
@@ -105,6 +114,13 @@ func Parse(args []string) (*Config, error) {
 	}
 	if cfg.LogDirFD == cfg.RuntimeDirFD {
 		return cfg, errors.New("--log-dir-fd and --runtime-dir-fd must differ")
+	}
+	switch guestPublish {
+	case "":
+	case string(PublishBindLoopback), string(PublishBindAny):
+		cfg.GuestPublish = PublishBind(guestPublish)
+	default:
+		return cfg, errors.New("--guest-publish must be loopback or any")
 	}
 	for flag, value := range map[string]string{
 		"--log-file":       cfg.LogFile,

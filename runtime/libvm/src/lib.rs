@@ -47,18 +47,19 @@ pub use crate::machine::{
     ExecutionEvent, ExecutionLaunchFailure, ExecutionLaunchFailureReason, ExecutionLost,
     ExecutionLostReason, ExecutionOptions, ExecutionOptionsBuilder, ExecutionOutput,
     ExecutionResult, ExecutionSession, ExecutionStdin, FileWriteDisposition, GuestBuilder,
-    HostCommand, LaunchCredentials, Machine, MachineAgent, MachineAgentConnection,
-    MachineAgentConnectionState, MachineAgentIdentity, MachineAgentMetricReport,
-    MachineAgentMetricsObservation, MachineAgentProvisionFailurePolicy,
+    GuestPublishUpdate, HostCommand, LaunchCredentials, Machine, MachineAgent,
+    MachineAgentConnection, MachineAgentConnectionState, MachineAgentIdentity,
+    MachineAgentMetricReport, MachineAgentMetricsObservation, MachineAgentProvisionFailurePolicy,
     MachineAgentProvisionStepStatus, MachineAgentProvisioningStepReport, MachineAgentStatus,
     MachineAgentStatusObservation, MachineAgentStatusReport, MachineAgentStatusState,
     MachineBlockDeviceMetrics, MachineBootMode, MachineBootReport, MachineBuilder,
     MachineByteStream, MachineCpuMetrics, MachineData, MachineDirectoryCreateDisposition,
     MachineDirectoryPage, MachineEnabledAgent, MachineEntryKind, MachineExit, MachineExitOutcome,
     MachineFileDownload, MachineFileEntry, MachineFileUploadOptions, MachineFilesystemMetrics,
-    MachineFreshness, MachineGuestBootMode, MachineGuestBootReport, MachineGuestConfig,
-    MachineKillOptions, MachineLoadAverageMetrics, MachineLogChunk, MachineLogOptions,
-    MachineLogOutput, MachineLogSource, MachineLogStream, MachineMemoryMetrics,
+    MachineForwardErrorDetail, MachineForwardScope, MachineForwardSession, MachineForwardState,
+    MachineForwardStatus, MachineFreshness, MachineGuestBootMode, MachineGuestBootReport,
+    MachineGuestConfig, MachineKillOptions, MachineLoadAverageMetrics, MachineLogChunk,
+    MachineLogOptions, MachineLogOutput, MachineLogSource, MachineLogStream, MachineMemoryMetrics,
     MachineMetricSnapshot, MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus,
     MachineNetworkInterfaceMetrics, MachineProvisionFailurePolicy, MachineProvisionOverallStatus,
     MachineProvisionReport, MachineProvisionStatus, MachineProvisionStepReport,
@@ -71,14 +72,18 @@ pub use crate::machine::{
     SshShellOptionsBuilder, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
-    MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition, NetworkDriver,
-    NetworkTopology,
+    GuestPublish, MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition,
+    NetworkDriver, NetworkTopology, PublishBind,
 };
 pub use crate::runtime::{
     NetdRuntimeConfig, PathChoice, ReadOnlyRuntime, Runtime, RuntimeBuilder, RuntimeConfig,
     RuntimeNetworkingConfig,
 };
 pub use crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT;
+pub use forward_spec::{
+    Address as ForwardAddress, Direction as ForwardDirection, Endpoint as ForwardEndpoint, Forward,
+    ForwardShape, UnixMode,
+};
 pub use silo_policy::{
     NetworkAuditBuilder, NetworkCredential, NetworkCredentialBuilder, NetworkEndpointBuilder,
     NetworkForwardBuilder, NetworkPolicy, NetworkPolicyBuildError, NetworkPolicyBuilder,

@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use clap::Args;
 use eyre::bail;
-use libvm::MachineData;
 
 use crate::context::Context;
 use crate::guest;
@@ -45,8 +44,8 @@ impl Cmd {
         let (_reference, machine) = context.machine(self.name.as_deref()).await?;
         let inspect_data = machine.inspect().await?;
 
-        ensure_running(&inspect_data)?;
-        ensure_guest_ready(&inspect_data)?;
+        guest::ensure_running(&inspect_data)?;
+        guest::ensure_guest_ready(&inspect_data)?;
         let command = resolve_command(
             inspect_data.process.entrypoint.as_deref(),
             inspect_data.process.command.as_deref(),
@@ -180,31 +179,6 @@ pub(crate) fn execution_exit_code(result: libvm::ExecutionResult) -> i32 {
         }
         libvm::ExecutionResult::LaunchFailed(_) => 126,
     }
-}
-
-fn ensure_running(data: &MachineData) -> eyre::Result<()> {
-    if data.is_running() {
-        return Ok(());
-    }
-
-    Err(eyre::eyre!(
-        "machine `{}` is not running; start it with `silo start {}`",
-        data.name,
-        data.name
-    ))
-}
-
-fn ensure_guest_ready(data: &MachineData) -> eyre::Result<()> {
-    if data.status.guest_ready() {
-        return Ok(());
-    }
-
-    let summary = data
-        .status
-        .message()
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("machine state is {}", data.status.label()));
-    bail!("guest service is not ready: {summary}");
 }
 
 #[cfg(test)]

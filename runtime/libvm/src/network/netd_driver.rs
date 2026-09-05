@@ -150,6 +150,7 @@ async fn prepare_netd_runtime(
                 .as_ref()
                 .map(|(_, private_key)| private_key.as_path()),
             static_lease: &static_lease,
+            guest_publish: request.publish().map(|publish| publish.bind.as_str()),
         },
     );
     configure_egress_credentials_environment(
@@ -319,6 +320,7 @@ struct NetworkHelperCommandConfig<'a> {
     tls_ca_cert_path: Option<&'a Path>,
     tls_ca_key_path: Option<&'a Path>,
     static_lease: &'a str,
+    guest_publish: Option<&'a str>,
 }
 
 fn configure_network_helper_command(
@@ -360,6 +362,9 @@ fn configure_network_helper_command(
     }
     if let Some(path) = config.tls_ca_key_path {
         command.arg("--tls-ca-key").arg(path);
+    }
+    if let Some(bind) = config.guest_publish {
+        command.arg("--guest-publish").arg(bind);
     }
 }
 
@@ -930,6 +935,7 @@ mod tests {
                 tls_ca_cert_path: None,
                 tls_ca_key_path: None,
                 static_lease: "192.168.105.2=02:00:00:00:00:02",
+                guest_publish: None,
             },
         );
 
@@ -944,6 +950,7 @@ mod tests {
         assert!(args.iter().all(|arg| arg != "--ssh-port"));
         assert!(args.iter().all(|arg| arg != "--tls-ca-cert"));
         assert!(args.iter().all(|arg| arg != "--tls-ca-key"));
+        assert!(args.iter().all(|arg| arg != "--guest-publish"));
     }
 
     #[test]
@@ -965,6 +972,7 @@ mod tests {
                 tls_ca_cert_path: Some(Path::new("/tmp/silo-net/ca.pem")),
                 tls_ca_key_path: Some(Path::new("/tmp/silo-net/ca-key.pem")),
                 static_lease: "192.168.105.2=02:00:00:00:00:02",
+                guest_publish: Some("any"),
             },
         );
 
@@ -979,6 +987,9 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|window| window == ["--run-id", "run123"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--guest-publish", "any"]));
         assert!(args
             .windows(2)
             .any(|window| window == ["--log-dir-fd", "31"]));
@@ -1260,7 +1271,10 @@ netd log: /tmp/silo/netd.log";
             root_disk_size: None,
             labels: BTreeMap::new(),
             metadata: BTreeMap::new(),
-            network: MachineNetworkConfig::Private { policy: None },
+            network: MachineNetworkConfig::Private {
+                policy: None,
+                publish: None,
+            },
             guest: crate::machine::MachineGuestConfig::default(),
         };
         let state = MachineState {
@@ -1288,9 +1302,10 @@ netd log: /tmp/silo/netd.log";
             egress_credentials: &launch,
         };
 
-        let attachment = prepare_netd_runtime(&context, &NetworkAttachmentRequest::private(None))
-            .await
-            .expect("launch resolved netd");
+        let attachment =
+            prepare_netd_runtime(&context, &NetworkAttachmentRequest::private(None, None))
+                .await
+                .expect("launch resolved netd");
 
         let log_path = match attachment {
             crate::network::VmmonNetworkAttachment::UnixDatagram { .. } => {

@@ -11,8 +11,6 @@ use serde_json::Value;
 /// Default filename for the public hybrid vsock mux.
 pub const DEFAULT_VSOCK_MUX_FILENAME: &str = "vsock.sock";
 
-const RESERVED_VSOCK_MUX_FILENAMES: [&str; 4] = ["vm.sock", "vm.pid", "vm.lock", "krun.vsock"];
-
 /// Top-level Silo virtual machine specification.
 ///
 /// This type is intentionally permissive for persistence: sections may be
@@ -37,6 +35,9 @@ pub struct VmSpec {
     /// Host directories mounted into the guest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<Mount>,
+    /// Machine-scoped forwards carried over vsock (ADR 0016).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<forward_spec::Forward>,
     /// Public hybrid vsock host surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vsock: Option<Vsock>,
@@ -55,9 +56,23 @@ impl VmSpec {
             hardware: None,
             storage: None,
             mounts: Vec::new(),
+            forwards: Vec::new(),
             vsock: None,
             annotations: BTreeMap::new(),
         }
+    }
+
+    /// Validate constraints that span VM specification sections.
+    ///
+    /// Call this before persisting a programmatically constructed or modified
+    /// specification. Deserialization performs the same validation.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(vsock) = &self.vsock {
+            vsock.validate().map_err(str::to_owned)?;
+        }
+        let mux_filename = effective_vsock_filename(self.vsock.as_ref()).and_then(Path::to_str);
+        forward_spec::validate_forwards(&self.forwards, mux_filename)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -89,6 +104,7 @@ impl<'de> Visitor<'de> for VmSpecVisitor {
         let mut hardware = None;
         let mut storage = None;
         let mut mounts = None;
+        let mut forwards: Option<Vec<forward_spec::Forward>> = None;
         let mut vsock = None;
         let mut annotations = None;
         let mut removed_paths = Vec::new();
@@ -131,6 +147,12 @@ impl<'de> Visitor<'de> for VmSpecVisitor {
                     }
                     mounts = Some(map.next_value()?);
                 }
+                "forwards" => {
+                    if forwards.is_some() {
+                        return Err(A::Error::duplicate_field("forwards"));
+                    }
+                    forwards = Some(map.next_value()?);
+                }
                 "vsock" => {
                     if vsock.is_some() {
                         return Err(A::Error::duplicate_field("vsock"));
@@ -169,6 +191,11 @@ impl<'de> Visitor<'de> for VmSpecVisitor {
             }
         }
 
+        let forwards = forwards.unwrap_or_default();
+        let mux_filename = effective_vsock_filename(vsock.as_ref().map(|parsed| &parsed.value))
+            .and_then(Path::to_str);
+        forward_spec::validate_forwards(&forwards, mux_filename).map_err(A::Error::custom)?;
+
         Ok(VmSpec {
             spec_version: spec_version.ok_or_else(|| A::Error::missing_field("specVersion"))?,
             guest: guest.flatten(),
@@ -176,6 +203,7 @@ impl<'de> Visitor<'de> for VmSpecVisitor {
             hardware: hardware.flatten(),
             storage: storage.flatten(),
             mounts: mounts.unwrap_or_default(),
+            forwards,
             vsock: vsock.map(|parsed| parsed.value),
             annotations: annotations.unwrap_or_default(),
         })
@@ -443,7 +471,7 @@ fn validate_vsock_filename(filename: &Path) -> Result<(), &'static str> {
         return Err("vsock.uds must be exactly one normal portable filename component");
     }
 
-    if RESERVED_VSOCK_MUX_FILENAMES.contains(&filename_str) {
+    if forward_spec::RESERVED_RUNTIME_FILENAMES.contains(&filename_str) {
         return Err("vsock.uds conflicts with a reserved machine runtime filename");
     }
 
@@ -486,6 +514,13 @@ mod tests {
         effective_vsock_enabled, effective_vsock_filename, Boot, Disk, Guest, GuestOs, Hardware,
         Kernel, Mount, Storage, VmSpec, Vsock, DEFAULT_VSOCK_MUX_FILENAME,
     };
+
+    fn forward(listen: &str, connect: &str) -> forward_spec::Forward {
+        forward_spec::Forward::new(
+            listen.parse().expect("valid listen endpoint"),
+            connect.parse().expect("valid connect endpoint"),
+        )
+    }
 
     #[test]
     fn minimal_spec_serializes_without_empty_sections() {
@@ -542,6 +577,10 @@ mod tests {
                 tag: "workspace".to_string(),
                 read_only: false,
             }],
+            forwards: vec![
+                forward("host:tcp:127.0.0.1:8080", "guest:tcp:80").with_name("web"),
+                forward("vsock:5000", "host:unix:/var/run/service.sock"),
+            ],
             vsock: Some(Vsock {
                 enabled: true,
                 uds: Some(PathBuf::from("custom.sock")),
@@ -579,6 +618,17 @@ mod tests {
                 "mounts": [
                     { "source": "/workspace", "tag": "workspace", "readOnly": false }
                 ],
+                "forwards": [
+                    {
+                        "name": "web",
+                        "listen": "host:tcp:127.0.0.1:8080",
+                        "connect": "guest:tcp:127.0.0.1:80"
+                    },
+                    {
+                        "listen": "vsock:5000",
+                        "connect": "host:unix:/var/run/service.sock"
+                    }
+                ],
                 "vsock": {
                     "enabled": true,
                     "uds": "custom.sock"
@@ -609,6 +659,7 @@ mod tests {
         assert!(!encoded.contains("cmdline"));
         assert!(!encoded.contains("initramfs"));
         assert!(!encoded.contains("mounts"));
+        assert!(!encoded.contains("forwards"));
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&encoded).expect("decode json"),
             json!({
@@ -714,6 +765,151 @@ mod tests {
         )
         .expect_err("invalid YAML vsock must fail validation");
         assert!(error.to_string().contains("enabled is false"));
+    }
+
+    #[test]
+    fn all_four_forward_shapes_round_trip_through_yaml() {
+        let yaml = r#"specVersion: 0.1.0
+forwards:
+  - name: inbound-agent
+    listen: host:unix:docker.sock
+    connect: guest:unix:/var/run/docker.sock
+  - name: inbound-vsock
+    listen: host:tcp:127.0.0.1:2222
+    connect: vsock:22
+  - name: outbound-agent
+    listen: guest:tcp:127.0.0.1:5432
+    connect: host:tcp:127.0.0.1:5432
+  - name: outbound-vsock
+    listen: vsock:5000
+    connect: host:unix:/var/run/service.sock
+"#;
+        let spec = serde_yaml_ng::from_str::<VmSpec>(yaml).expect("deserialize forwards");
+
+        assert_eq!(spec.forwards.len(), 4);
+        spec.validate().expect("validate forwards");
+        let encoded = serde_yaml_ng::to_string(&spec).expect("serialize forwards");
+        assert_eq!(
+            serde_yaml_ng::from_str::<VmSpec>(&encoded).expect("round-trip forwards"),
+            spec
+        );
+    }
+
+    #[test]
+    fn forwards_cannot_conflict_with_default_or_custom_mux_sockets() {
+        let default_error = serde_yaml_ng::from_str::<VmSpec>(
+            "specVersion: 0.1.0\nforwards:\n  - listen: host:unix:vsock.sock\n    connect: guest:tcp:80\nvsock:\n  enabled: true\n",
+        )
+        .expect_err("default mux conflict must fail");
+        assert!(default_error
+            .to_string()
+            .contains("conflicts with vsock mux"));
+
+        let custom_error = serde_yaml_ng::from_str::<VmSpec>(
+            "specVersion: 0.1.0\nforwards:\n  - listen: host:unix:custom.sock_5000\n    connect: guest:tcp:80\nvsock:\n  enabled: true\n  uds: custom.sock\n",
+        )
+        .expect_err("custom mux listener conflict must fail");
+        assert!(custom_error.to_string().contains("custom.sock"));
+
+        let disabled = serde_yaml_ng::from_str::<VmSpec>(
+            "specVersion: 0.1.0\nforwards:\n  - listen: host:unix:vsock.sock\n    connect: guest:tcp:80\nvsock:\n  enabled: false\n",
+        )
+        .expect("disabled mux has no filename conflict");
+        assert_eq!(disabled.forwards.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_forward_names_and_vsock_listen_ports_are_rejected() {
+        let duplicate_name = serde_yaml_ng::from_str::<VmSpec>(
+            "specVersion: 0.1.0\nforwards:\n  - name: api\n    listen: host:tcp:80\n    connect: guest:tcp:80\n  - name: api\n    listen: host:tcp:81\n    connect: guest:tcp:81\n",
+        )
+        .expect_err("duplicate name must fail");
+        assert!(duplicate_name
+            .to_string()
+            .contains("forward name \"api\" is repeated"));
+
+        let duplicate_port = serde_yaml_ng::from_str::<VmSpec>(
+            "specVersion: 0.1.0\nforwards:\n  - listen: vsock:5000\n    connect: host:tcp:80\n  - listen: vsock:5000\n    connect: host:tcp:81\n",
+        )
+        .expect_err("duplicate vsock listen port must fail");
+        assert!(duplicate_port
+            .to_string()
+            .contains("vsock listen port 5000 is repeated"));
+    }
+
+    #[test]
+    fn forward_entries_reject_unknown_fields_but_top_level_remains_permissive() {
+        let error = serde_yaml_ng::from_str::<VmSpec>(
+            "specVersion: 0.1.0\nfutureTopLevel: true\nforwards:\n  - listen: host:tcp:80\n    connect: guest:tcp:80\n    nam: typo\n",
+        )
+        .expect_err("unknown forward field must fail");
+        assert!(error.to_string().contains("nam"));
+
+        let spec = serde_yaml_ng::from_str::<VmSpec>(
+            "specVersion: 0.1.0\nfutureTopLevel: true\nforwards:\n  - listen: host:tcp:80\n    connect: guest:tcp:80\n",
+        )
+        .expect("unknown top-level field remains permitted");
+        assert_eq!(spec.forwards.len(), 1);
+    }
+
+    #[test]
+    fn removed_fields_are_reported_before_invalid_forwards() {
+        let error = serde_yaml_ng::from_str::<VmSpec>(
+            "specVersion: 0.1.0\nvsockEndpoints:\n  - plugin:\n      command: /bin/old\nforwards:\n  - listen: host:tcp:80\n    connect: host:tcp:81\n",
+        )
+        .expect_err("removed field and invalid forward must fail");
+        let message = error.to_string();
+
+        assert!(message.contains("removed ADR 0005 fields"));
+        assert!(message.contains("vsockEndpoints[0].plugin.command"));
+        assert!(!message.contains("invalid forward sides"));
+    }
+
+    #[test]
+    fn validate_rejects_programmatically_invalid_forwards() {
+        let spec = VmSpec {
+            forwards: vec![
+                forward("host:tcp:80", "guest:tcp:80").with_name("api"),
+                forward("host:tcp:81", "guest:tcp:81").with_name("api"),
+            ],
+            ..VmSpec::current()
+        };
+
+        let error = spec
+            .validate()
+            .expect_err("invalid spec must fail validation");
+        assert!(error.contains("forward name \"api\" is repeated"));
+    }
+
+    #[test]
+    fn scoped_ipv6_forwards_cannot_be_persisted() {
+        for (flowinfo, scope_id) in [(0, 2), (1, 0)] {
+            let address =
+                std::net::SocketAddrV6::new("fe80::1".parse().unwrap(), 80, flowinfo, scope_id);
+            let spec = VmSpec {
+                forwards: vec![forward_spec::Forward::new(
+                    forward_spec::Endpoint::Host(forward_spec::Address::Tcp(address.into())),
+                    "guest:tcp:80".parse().unwrap(),
+                )],
+                ..VmSpec::current()
+            };
+            assert!(spec.validate().is_err());
+            assert!(serde_json::to_string(&spec).is_err());
+            assert!(serde_yaml_ng::to_string(&spec).is_err());
+        }
+    }
+
+    #[test]
+    fn duplicate_unix_listeners_are_rejected_when_loading_a_spec() {
+        let error = serde_json::from_value::<VmSpec>(json!({
+            "specVersion": "0.1.0",
+            "forwards": [
+                {"listen": "host:unix:service.sock", "connect": "guest:tcp:80"},
+                {"listen": "host:unix:service.sock", "connect": "guest:tcp:81"}
+            ]
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("Unix listen endpoint"));
     }
 
     #[test]

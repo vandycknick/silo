@@ -64,6 +64,7 @@ struct State {
     identity: Option<AgentIdentity>,
     status: Option<Observation<AgentStatusReport>>,
     metrics: Option<Observation<(String, AgentMetricReport)>>,
+    agent_services: Vec<String>,
     stopping: bool,
     last_log_snapshot: Option<StateLogSnapshot>,
 }
@@ -117,6 +118,7 @@ impl InstanceStore {
             identity: None,
             status: None,
             metrics: None,
+            agent_services: Vec::new(),
             stopping: false,
             last_log_snapshot: None,
         };
@@ -254,6 +256,7 @@ impl InstanceStore {
                     // A new agent instance or boot supersedes every old observation.
                     state.status = None;
                     state.metrics = None;
+                    state.agent_services = known_agent_services();
                 } else if current.version != identity.version {
                     return Err(StoreError::Protocol(
                         "agent version changed without an instance replacement".to_string(),
@@ -261,6 +264,9 @@ impl InstanceStore {
                 }
             }
             let received_at = observation.received_at;
+            if state.identity.is_none() {
+                state.agent_services = known_agent_services();
+            }
             state.identity = Some(identity);
             state.connection.state = Some(AgentConnectionState::Responsive as i32);
             state.connection.last_success_at = Some(timestamp(received_at));
@@ -302,6 +308,7 @@ impl InstanceStore {
                 state.identity = None;
                 state.status = None;
                 state.metrics = None;
+                state.agent_services.clear();
                 Err(StoreError::IdentityMismatch)
             } else {
                 state.metrics = Some(observation);
@@ -345,6 +352,49 @@ impl InstanceStore {
         log_state_changes(&before, &after);
         Ok(())
     }
+
+    pub(crate) fn set_forward_service(
+        &self,
+        identity: ReadyAgentIdentity,
+        serving: bool,
+    ) -> Result<(), StoreError> {
+        self.mutate(|state| {
+            let Some(current) = &state.identity else {
+                return Ok(());
+            };
+            let current_instance = current
+                .instance_id
+                .as_deref()
+                .and_then(|value| uuid::Uuid::parse_str(value).ok());
+            let current_boot = current
+                .boot_id
+                .as_deref()
+                .and_then(|value| uuid::Uuid::parse_str(value).ok());
+            if current_instance != Some(identity.instance_id)
+                || current_boot != Some(identity.boot_id)
+            {
+                return Ok(());
+            }
+            state.agent_services = known_agent_services();
+            if serving {
+                state
+                    .agent_services
+                    .push("silo.v1.GuestForwardService".to_string());
+            }
+            Ok(())
+        })
+    }
+}
+
+fn known_agent_services() -> Vec<String> {
+    [
+        "silo.v1.GuestAgentService",
+        "silo.v1.GuestFilesystemService",
+        "silo.v1.GuestProcessService",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 fn ready_agent_identity_from_snapshot(snapshot: &StateLogSnapshot) -> Option<ReadyAgentIdentity> {
@@ -987,6 +1037,7 @@ fn project_status(state: &State, now: Instant, observed_at: SystemTime) -> HostS
                     .status
                     .as_ref()
                     .map(|status| status_observation(state, status, now)),
+                services: state.agent_services.clone(),
             })),
         }
     } else {
@@ -1272,6 +1323,55 @@ mod tests {
             )
             .expect("replacement");
         assert!(store.metrics().expect("metrics").metrics.is_none());
+    }
+
+    #[test]
+    fn capability_cache_is_identity_scoped_and_does_not_change_readiness() {
+        let store = new_instance_store("machine-1".to_string(), "test".to_string(), true);
+        store
+            .set_vm_state(VmState::Running, "running")
+            .expect("vm state");
+        let instance = "00000000-0000-4000-8000-000000000002";
+        store
+            .observe_status(ready_status(instance), Duration::from_secs(15))
+            .expect("ready status");
+        let before = store.readiness().expect("readiness before capability");
+        let identity = store.ready_agent_identity().expect("ready identity");
+        store
+            .set_forward_service(identity, true)
+            .expect("cache forward service");
+
+        let status = store.status().expect("status with services");
+        let services = match status.agent.expect("agent").mode.expect("agent mode") {
+            protocol::v1::host_agent::Mode::Enabled(enabled) => enabled.services,
+            protocol::v1::host_agent::Mode::Disabled(_) => panic!("agent unexpectedly disabled"),
+        };
+        assert_eq!(
+            services,
+            [
+                "silo.v1.GuestAgentService",
+                "silo.v1.GuestFilesystemService",
+                "silo.v1.GuestProcessService",
+                "silo.v1.GuestForwardService",
+            ]
+        );
+        assert_eq!(
+            store.readiness().expect("readiness after capability"),
+            before
+        );
+
+        store
+            .observe_status(
+                ready_status("00000000-0000-4000-8000-000000000003"),
+                Duration::from_secs(15),
+            )
+            .expect("replacement identity");
+        let status = store.status().expect("replacement status");
+        let services = match status.agent.expect("agent").mode.expect("agent mode") {
+            protocol::v1::host_agent::Mode::Enabled(enabled) => enabled.services,
+            protocol::v1::host_agent::Mode::Disabled(_) => panic!("agent unexpectedly disabled"),
+        };
+        assert!(!services.contains(&"silo.v1.GuestForwardService".to_string()));
     }
 
     #[tokio::test]

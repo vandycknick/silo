@@ -18,6 +18,7 @@ pub enum Component {
     Netd,
     Krun,
     Agent,
+    Portd,
     Init,
     Initramfs,
     GoFfi,
@@ -72,6 +73,7 @@ pub fn build_component(
         Component::Netd => build_netd(context),
         Component::Krun => build_krun(context),
         Component::Agent => build_guest_agent(context),
+        Component::Portd => build_guest_portd(context),
         Component::Init => build_guest_init(context),
         Component::Initramfs => build_initramfs(context),
         Component::GoFfi => build_cargo_package(context, "silo-go-ffi"),
@@ -81,7 +83,22 @@ pub fn build_component(
 pub fn format(workspace_root: &Path, target_dir: &Path) -> Result<(), command::CommandError> {
     let mut cargo = standard_cargo_command(workspace_root, target_dir);
     cargo.args(["fmt", "--all", "--", "--check"]);
-    command::run(cargo)
+    command::run(cargo)?;
+
+    let mut gofmt = Command::new("gofmt");
+    gofmt
+        .current_dir(workspace_root.join("net/netd"))
+        .args(["-l", "."]);
+    let output = command::output(gofmt)?;
+    if output.stdout.is_empty() {
+        Ok(())
+    } else {
+        Err(command::CommandError::FailedWithStderr {
+            program: "gofmt".to_string(),
+            status: "unformatted files".to_string(),
+            stderr: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        })
+    }
 }
 
 pub fn clippy(
@@ -140,7 +157,12 @@ pub fn test_integration(
     for member in host.workspace_excludes() {
         cargo.args(["--exclude", member]);
     }
-    command::run(cargo)
+    command::run(cargo)?;
+
+    let mut go = Command::new("go");
+    go.current_dir(workspace_root.join("net/netd"))
+        .args(["test", "./..."]);
+    command::run(go)
 }
 
 fn build_cargo_package(context: &BuildContext<'_>, package: &str) -> Result<(), ComponentError> {
@@ -240,6 +262,21 @@ fn build_guest_agent(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         "--locked",
         "-p",
         "agent",
+        "--target",
+        context.host.guest_target().triple(),
+    ]);
+    context.profile.apply_cargo(&mut cargo);
+    command::run(cargo)?;
+    Ok(())
+}
+
+fn build_guest_portd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
+    let mut cargo = cargo_command(context)?;
+    cargo.args([
+        "zigbuild",
+        "--locked",
+        "-p",
+        "silo-portd",
         "--target",
         context.host.guest_target().triple(),
     ]);

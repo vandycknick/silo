@@ -19,7 +19,7 @@ pub(crate) mod process;
 pub(crate) mod start_request;
 
 pub use client::DEFAULT_GUEST_READINESS_TIMEOUT;
-pub(crate) use client::{VmmonClient, VmmonClientError};
+pub(crate) use client::{forward_rpc_error, ForwardClientError, VmmonClient, VmmonClientError};
 pub(crate) use launch::VmmonLaunch;
 pub(crate) use launch_spec::{prepare_launch_spec, write_launch_spec, LaunchSpecInput};
 

@@ -37,6 +37,9 @@ struct MachineCreateRequest {
     disks: Vec<String>,
     #[serde(default)]
     mounts: Vec<MountRequest>,
+    #[serde(default)]
+    forwards: Vec<libvm::Forward>,
+    vsock: Option<bool>,
     network: Option<NetworkRequest>,
 }
 
@@ -62,6 +65,7 @@ struct NetworkRequest {
     kind: String,
     name: Option<String>,
     policy_json: Option<String>,
+    publish: Option<libvm::GuestPublish>,
 }
 
 #[no_mangle]
@@ -240,6 +244,10 @@ fn apply_create_request(
             })
             .collect(),
     );
+    builder = builder.forwards(request.forwards);
+    if let Some(enabled) = request.vsock {
+        builder = builder.vsock(enabled);
+    }
     if let Some(network) = request.network {
         let parsed = parse_network(network)?;
         builder = builder.network(|network_builder| parsed.apply(network_builder));
@@ -251,6 +259,7 @@ struct ParsedNetwork {
     kind: String,
     name: Option<String>,
     policy: Option<NetworkPolicy>,
+    publish: Option<libvm::GuestPublish>,
 }
 
 impl ParsedNetwork {
@@ -261,8 +270,14 @@ impl ParsedNetwork {
             "named" => builder.named(self.name.unwrap_or_default()),
             _ => builder,
         };
-        self.policy
-            .map_or(builder.clone(), |policy| builder.policy(policy))
+        let builder = match self.policy {
+            Some(policy) => builder.policy(policy),
+            None => builder,
+        };
+        match self.publish {
+            Some(publish) => builder.publish(publish.bind),
+            None => builder,
+        }
     }
 }
 
@@ -272,6 +287,11 @@ fn parse_network(network: NetworkRequest) -> Result<ParsedNetwork, *mut SiloErro
         "named" if network.name.as_ref().is_some_and(|name| !name.is_empty()) => {}
         "named" => return Err(invalid_argument("named network requires name")),
         _ => return Err(invalid_argument("unsupported machine network kind")),
+    }
+    if network.publish.is_some() && network.kind != "private" {
+        return Err(invalid_argument(
+            "guest publication requires a private network",
+        ));
     }
     let policy = network
         .policy_json
@@ -284,6 +304,7 @@ fn parse_network(network: NetworkRequest) -> Result<ParsedNetwork, *mut SiloErro
         kind: network.kind,
         name: network.name,
         policy,
+        publish: network.publish,
     })
 }
 
@@ -292,6 +313,39 @@ mod tests {
     use std::ptr;
 
     use crate::machine::silo_machine_id;
+
+    #[test]
+    fn forwarding_create_contract_preserves_typed_configuration() {
+        let request: crate::machine::MachineCreateRequest = serde_json::from_str(r#"{
+            "source":{"kind":"disk","path":"root.img"},
+            "forwards":[{"listen":"host:unix:docker.sock","connect":"guest:unix:/run/docker.sock","mode":"0660"}],
+            "vsock":false,
+            "network":{"kind":"private","publish":{"bind":"loopback"}}
+        }"#).unwrap();
+        assert_eq!(request.forwards.len(), 1);
+        assert_eq!(request.forwards[0].mode.unwrap().get(), 0o660);
+        assert_eq!(request.vsock, Some(false));
+        let network = crate::machine::parse_network(request.network.unwrap())
+            .ok()
+            .unwrap();
+        assert_eq!(network.publish.unwrap().bind, libvm::PublishBind::Loopback);
+        for kind in ["none", "named"] {
+            let network = crate::machine::NetworkRequest {
+                kind: kind.to_string(),
+                name: Some("shared".into()),
+                policy_json: None,
+                publish: Some(libvm::GuestPublish {
+                    bind: libvm::PublishBind::Any,
+                }),
+            };
+            let error = crate::machine::parse_network(network).err().unwrap();
+            unsafe { crate::silo_error_free(error) };
+        }
+        assert!(serde_json::from_str::<crate::machine::NetworkRequest>(
+            r#"{"kind":"private","publish":{"bind":"invalid"}}"#
+        )
+        .is_err());
+    }
 
     #[test]
     fn rejects_null_machine() {

@@ -635,12 +635,14 @@ fn valid_error_detail(code: ErrorCode, retry_after: Option<&prost_types::Duratio
 
 fn error_status(code: ErrorCode) -> Code {
     match code {
-        ErrorCode::InvalidRequest | ErrorCode::InvalidPath | ErrorCode::InvalidCursor => {
-            Code::InvalidArgument
-        }
-        ErrorCode::ResourceExhausted | ErrorCode::RequestTooLarge | ErrorCode::SerialInUse => {
-            Code::ResourceExhausted
-        }
+        ErrorCode::InvalidRequest
+        | ErrorCode::InvalidPath
+        | ErrorCode::InvalidCursor
+        | ErrorCode::ForwardInvalid => Code::InvalidArgument,
+        ErrorCode::ResourceExhausted
+        | ErrorCode::RequestTooLarge
+        | ErrorCode::SerialInUse
+        | ErrorCode::ForwardLimit => Code::ResourceExhausted,
         ErrorCode::PathNotFound | ErrorCode::ParentNotFound => Code::NotFound,
         ErrorCode::PermissionDenied => Code::PermissionDenied,
         ErrorCode::NotRegularFile
@@ -656,8 +658,8 @@ fn error_status(code: ErrorCode) -> Code {
         ErrorCode::Internal => Code::Internal,
         ErrorCode::OperationCancelled => Code::Cancelled,
         ErrorCode::PreconditionFailed => Code::FailedPrecondition,
-        ErrorCode::AlreadyExists => Code::AlreadyExists,
-        ErrorCode::Unsupported => Code::Unimplemented,
+        ErrorCode::AlreadyExists | ErrorCode::ForwardAddressInUse => Code::AlreadyExists,
+        ErrorCode::Unsupported | ErrorCode::ForwardUnsupported => Code::Unimplemented,
         ErrorCode::Unspecified => Code::Unknown,
     }
 }

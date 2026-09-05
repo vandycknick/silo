@@ -2,6 +2,7 @@
 compile_error!("silo-agent only supports Linux guests");
 
 mod filesystem;
+mod forward;
 mod guest_process;
 mod handoff;
 mod host;
@@ -226,6 +227,32 @@ async fn run_agent(
             error
         })?;
     }
+
+    let forward_server = VsockServer::create(crate::forward::dialer::handle)
+        .with_concurrency(1024)
+        .with_tracing(tracing::info_span!(
+            "vsock_server",
+            service = "forward-dialer"
+        ))
+        .listen(forward_spec::FORWARD_VSOCK_PORT)
+        .map_err(|error| {
+            agent_server.fail(format!(
+                "forward dialer startup failed on port {}: {error}",
+                forward_spec::FORWARD_VSOCK_PORT
+            ));
+            eyre::eyre!(
+                "listen for forward dialer vsock connections on port {}: {error}",
+                forward_spec::FORWARD_VSOCK_PORT
+            )
+        })?;
+    tracing::info!(
+        port = forward_spec::FORWARD_VSOCK_PORT,
+        "listening for forward dialer vsock connections"
+    );
+    if let Some(abort_handle) = forward_server.abort_handle() {
+        server_abort_handles.push(abort_handle);
+    }
+    running_servers.push(forward_server);
 
     agent_server.ready(boot_report, provision_report);
 

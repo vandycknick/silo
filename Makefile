@@ -122,15 +122,15 @@ test: ## Run unit and integration tests for all host-supported workspace compone
 test-unit: ## Run unit tests for all host-supported workspace components.
 	$(XTASK) test-unit
 
-test-integration: ## Run Cargo integration tests for all host-supported workspace components.
+test-integration: ## Run integration tests for all host-supported workspace components.
 	$(XTASK) test-integration
 
 version-check: ## Verify product versions match the version authority.
 	$(XTASK) version-check
 
 # Internal targets
-.PHONY: cli vmmon netd krun agent init initramfs go-ffi kernel
-cli vmmon netd krun agent init initramfs go-ffi:
+.PHONY: cli vmmon netd krun agent portd init initramfs go-ffi kernel
+cli vmmon netd krun agent portd init initramfs go-ffi:
 	$(XTASK) component $@ --profile "$(PROFILE)"
 
 kernel:

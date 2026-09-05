@@ -3,6 +3,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/execution.proto");
     println!("cargo:rerun-if-changed=proto/errors.proto");
     println!("cargo:rerun-if-changed=proto/filesystem.proto");
+    println!("cargo:rerun-if-changed=proto/forward.proto");
     println!("cargo:rerun-if-changed=proto/guest.proto");
     println!("cargo:rerun-if-changed=proto/guest_process.proto");
     println!("cargo:rerun-if-changed=proto/vm_monitor.proto");
@@ -26,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bytes(".silo.v1.ExecutionStdout.data")
         .bytes(".silo.v1.ExecutionStderr.data")
         .bytes(".silo.v1.ExecutionTerminalOutput.data")
+        .bytes(".silo.v1.ListenRequest.token")
         .compile_with_config(
             config,
             &[
@@ -33,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/execution.proto",
                 "proto/errors.proto",
                 "proto/filesystem.proto",
+                "proto/forward.proto",
                 "proto/guest.proto",
                 "proto/guest_process.proto",
                 "proto/vm_monitor.proto",

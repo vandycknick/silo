@@ -14,6 +14,7 @@ mock-backend = ["dep:test-utils"]
 
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }
+forward-spec = { path = "../../specs/forward-spec", features = ["tokio"] }
 async-trait = "0.1"
 base64 = "0.23.0"
 chrono = "0.4.45"

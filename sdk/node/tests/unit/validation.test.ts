@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { MachineBuilder } from "../../src/machine.js";
-import { NetworkPolicy } from "../../src/network.js";
+import { NetworkPolicy, MachineNetworkBuilder } from "../../src/network.js";
 import { ImageSource, type ImageSource as ImageSourceValue, type RuntimeOpenOptions } from "../../src/types.js";
 import {
   executionEventFromNative,
+  forwardsToNative,
   executionOptionsToNative,
   executionResultFromNative,
   imageDetailFromNative,
@@ -88,6 +89,30 @@ describe("runtime options", () => {
   });
 });
 
+describe("forwarding configuration", () => {
+  it("preserves forward modes, public vsock settings, and publication authority", () => {
+    const data = nativeMachineData();
+    data.forwards = [{ name: "docker", listen: "host:unix:docker.sock", connect: "guest:unix:/run/docker.sock", mode: "0660" }];
+    data.vsock = { enabled: true, uds: "custom.sock" };
+    data.network = { kind: "private", publish: { bind: "loopback" } };
+    const inspected = machineDataFromNative(data);
+    expect(forwardsToNative(inspected.forwards)).toEqual(data.forwards);
+    expect(inspected.vsock).toEqual(data.vsock);
+    expect(networkToNative(inspected.network)).toMatchObject(data.network);
+    expect(new MachineNetworkBuilder().publish("any").toNative()).toEqual({ kind: "private", publish: { bind: "any" } });
+    expect(() => new MachineNetworkBuilder().none().publish("any")).toThrow(TypeError);
+    expect(() => new MachineNetworkBuilder().named("shared").publish("loopback")).toThrow(TypeError);
+  });
+
+  it("rejects line injection and invalid Unix modes before reaching native code", () => {
+    expect(() => forwardsToNative([{ listen: "host:tcp:0", connect: "guest:unix:/run/x\nextra" }])).toThrow(TypeError);
+    expect(() => forwardsToNative([{ listen: "host:unix:socket", connect: "vsock:22", mode: "8888" }])).toThrow(TypeError);
+    const data = nativeMachineData();
+    data.network = { kind: "private", publish: { bind: "invalid" } };
+    expect(() => machineDataFromNative(data)).toThrow(TypeError);
+  });
+});
+
 describe("Network", () => {
   it("converts private policy JSON to native input", () => {
     expect(networkToNative({ kind: "private", policyJson })).toEqual({
@@ -135,6 +160,7 @@ describe("Network", () => {
         },
         labels: [],
         metadata: [],
+        forwards: [],
         network: { kind: "private", policyJson },
         agentMode: "default",
         status: { kind: "stopped" },
@@ -175,6 +201,7 @@ describe("Network", () => {
       },
       labels: [],
       metadata: [],
+      forwards: [],
       network: { kind: "none" },
       agentMode: "default",
       status: { kind: "stopped" },
@@ -477,6 +504,8 @@ function fakeNativeBuilder(overrides: Partial<NativeMachineBuilder> = {}): Nativ
     userdata: () => undefined,
     disks: () => undefined,
     mounts: () => undefined,
+    forwards: () => undefined,
+    vsock: () => undefined,
     network: () => undefined,
     create: async () => {
       throw new Error("not used by validation tests");
@@ -514,6 +543,7 @@ function nativeMachineData(): NativeMachineData {
     },
     labels: [],
     metadata: [],
+    forwards: [],
     network: { kind: "none" },
     agentMode: "default",
     status: { kind: "stopped" },

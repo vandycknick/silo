@@ -20,6 +20,8 @@ type machineDataWire struct {
 	RootDiskSize    *uint64              `json:"root_disk_size_bytes"`
 	Labels          map[string]string    `json:"labels"`
 	Metadata        map[string]string    `json:"metadata"`
+	Forwards        []Forward            `json:"forwards"`
+	Vsock           *VsockConfig         `json:"vsock"`
 	Network         machineNetworkWire   `json:"network"`
 	Agent           MachineAgent         `json:"agent"`
 	Status          MachineStatus        `json:"status"`
@@ -65,6 +67,9 @@ func decodeMachineData(data []byte) (*MachineData, error) {
 		return nil, newError(ErrorUnknown, "", "decode native machine data: "+err.Error())
 	}
 	result := &MachineData{ID: wire.ID, Name: wire.Name, MachineDir: wire.MachineDir, CreatedAt: time.UnixMilli(wire.CreatedAt), ModifiedAt: time.UnixMilli(wire.ModifiedAt), ImageRef: wire.ImageRef, Retention: wire.Retention, Process: wire.Process, TemplateName: wire.TemplateName, AgentMode: wire.AgentMode, Labels: wire.Labels, Metadata: wire.Metadata, Network: MachineNetwork{Kind: wire.Network.Kind, Name: wire.Network.Name}, Agent: wire.Agent, Status: wire.Status, BootReport: wire.BootReport, LastError: wire.LastError, UpdatedAt: time.UnixMilli(wire.UpdatedAt)}
+	result.Forwards = wire.Forwards
+	result.Vsock = wire.Vsock
+	result.Network.Publish = wire.Network.Publish
 	if wire.Network.PolicyJSON != "" {
 		result.Network.Policy = &NetworkPolicy{canonicalJSON: wire.Network.PolicyJSON}
 	}
