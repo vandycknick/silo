@@ -1,6 +1,7 @@
 use std::fs;
 use std::future::Future;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -11,6 +12,7 @@ use forward_spec::{
     encode_connect, parse_reply, Address, Reply, TargetLine, Token, MAX_TARGET_LINE_BYTES,
 };
 use futures::Stream;
+use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, UnixAddr};
 use protocol::v1::guest_forward_service_server::GuestForwardService;
 use protocol::v1::listen_event::Event;
 use protocol::v1::{
@@ -349,7 +351,38 @@ impl Drop for OwnedUnixSocket {
 
 fn remove_existing_socket(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path),
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            let occupied = || {
+                io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "Unix listener {} is active or cannot be proven stale",
+                        path.display()
+                    ),
+                )
+            };
+            let probe = socket(
+                AddressFamily::Unix,
+                SockType::Stream,
+                SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+                None,
+            )?;
+            // Only a positively refused nonblocking connection proves staleness.
+            // A full backlog or inaccessible socket must never be unlinked.
+            if connect(probe.as_raw_fd(), &UnixAddr::new(path)?)
+                != Err(nix::errno::Errno::ECONNREFUSED)
+            {
+                return Err(occupied());
+            }
+            let current = fs::symlink_metadata(path)?;
+            if !current.file_type().is_socket()
+                || current.dev() != metadata.dev()
+                || current.ino() != metadata.ino()
+            {
+                return Err(occupied());
+            }
+            fs::remove_file(path)
+        }
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("refusing to replace non-socket path {}", path.display()),
@@ -561,6 +594,42 @@ mod tests {
             .expect("accepted connection read");
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unix_listener_refuses_a_live_socket_without_replacing_its_inode() {
+        use futures::StreamExt;
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("live.sock");
+        let _original = UnixListener::bind(&path).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let service = GuestForwardServiceImpl::new();
+        let mut stream = service
+            .listen(Request::new(request(
+                format!("unix:{}", path.display()),
+                [7; 16],
+                Some(0o666),
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        let event = stream.next().await.unwrap().unwrap();
+        let Some(Event::Failed(failed)) = event.event else {
+            panic!("live socket must fail binding");
+        };
+        assert_eq!(
+            failed.error.unwrap().code,
+            Some(protocol::v1::ErrorCode::ForwardAddressInUse as i32)
+        );
+        assert!(stream.next().await.is_none());
+        let preserved = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(preserved.ino(), metadata.ino());
+        assert_eq!(
+            preserved.permissions().mode(),
+            metadata.permissions().mode()
+        );
+        assert_eq!(service.listen_capacity.available_permits(), 64);
     }
 
     #[tokio::test]

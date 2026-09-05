@@ -111,7 +111,7 @@ impl ForwardTable {
         runtime_dir: &Path,
         mux_filename: Option<&str>,
     ) -> eyre::Result<Arc<Self>> {
-        forward_spec::validate_forwards(forwards, mux_filename)
+        validate_forward_set(forwards, runtime_dir, mux_filename)
             .map_err(|error| eyre::eyre!("validate machine-scoped forwards: {error}"))?;
         if forwards.len() > MAX_FORWARDS {
             return Err(eyre::eyre!(
@@ -337,9 +337,12 @@ impl ForwardTable {
             .map(|entry| entry.spec.clone())
             .collect::<Vec<_>>();
         specs.push(spec.clone());
-        if let Err(error) = forward_spec::validate_forwards(&specs, self.mux_filename.as_deref()) {
+        if let Err(error) =
+            validate_forward_set(&specs, &self.runtime_dir, self.mux_filename.as_deref())
+        {
             return match error {
-                forward_spec::ForwardError::DuplicateVsockListenPort(_) => {
+                forward_spec::ForwardError::DuplicateVsockListenPort(_)
+                | forward_spec::ForwardError::DuplicateUnixListenEndpoint(_) => {
                     Err(OpenError::AddressInUse(error.to_string()))
                 }
                 _ => Err(OpenError::Invalid(error.to_string())),
@@ -566,6 +569,34 @@ impl ForwardTable {
             .clear();
         Ok(())
     }
+}
+
+fn validate_forward_set(
+    forwards: &[Forward],
+    runtime_dir: &Path,
+    mux_filename: Option<&str>,
+) -> Result<(), forward_spec::ForwardError> {
+    forward_spec::validate_forwards(forwards, mux_filename)?;
+    let resolved = forwards
+        .iter()
+        .cloned()
+        .map(|mut forward| {
+            if let forward_spec::Endpoint::Host(Address::Unix(path)) = &mut forward.listen {
+                if path.is_relative() {
+                    *path = runtime_dir.join(&*path);
+                }
+                // Resolve existing parent aliases, but never follow a final socket
+                // symlink. Missing/inaccessible parents are diagnosed by bind.
+                if let Some((parent, name)) = path.parent().zip(path.file_name()) {
+                    if let Ok(parent) = std::fs::canonicalize(parent) {
+                        *path = parent.join(name);
+                    }
+                }
+            }
+            forward
+        })
+        .collect::<Vec<_>>();
+    forward_spec::validate_forwards(&resolved, None)
 }
 
 fn bind_error(name: &str, endpoint: &forward_spec::Endpoint, error: eyre::Report) -> OpenError {
@@ -806,6 +837,44 @@ impl Drop for ForwardTable {
 #[cfg(test)]
 mod tests {
     use crate::forward::{ForwardScope, ForwardState, ForwardTable};
+
+    #[tokio::test]
+    async fn duplicate_resolved_unix_listeners_fail_before_replacing_stale_paths() {
+        use std::os::unix::fs::MetadataExt;
+        let root =
+            std::path::Path::new("/tmp").join(format!("fu-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::os::unix::fs::symlink(root.join("nested"), root.join("alias")).unwrap();
+        let path = root.join("service.sock");
+        drop(tokio::net::UnixListener::bind(&path).unwrap());
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        for alias in [
+            path.clone(),
+            root.join("nested/../service.sock"),
+            root.join("alias/../service.sock"),
+        ] {
+            let forwards = [
+                forward_spec::Forward::new(
+                    "host:unix:service.sock".parse().unwrap(),
+                    "guest:tcp:80".parse().unwrap(),
+                ),
+                forward_spec::Forward::new(
+                    forward_spec::Endpoint::Host(forward_spec::Address::Unix(alias)),
+                    "guest:tcp:81".parse().unwrap(),
+                ),
+            ];
+            let error = ForwardTable::prepare_machine(&forwards, &root, None)
+                .await
+                .err()
+                .expect("duplicate listener must fail");
+            assert!(
+                error.to_string().contains("Unix listen endpoint"),
+                "{error}"
+            );
+            assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn removing_raw_sessions_reclaims_the_task_and_registration() {

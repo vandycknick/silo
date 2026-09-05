@@ -882,6 +882,37 @@ forwards:
     }
 
     #[test]
+    fn scoped_ipv6_forwards_cannot_be_persisted() {
+        for (flowinfo, scope_id) in [(0, 2), (1, 0)] {
+            let address =
+                std::net::SocketAddrV6::new("fe80::1".parse().unwrap(), 80, flowinfo, scope_id);
+            let spec = VmSpec {
+                forwards: vec![forward_spec::Forward::new(
+                    forward_spec::Endpoint::Host(forward_spec::Address::Tcp(address.into())),
+                    "guest:tcp:80".parse().unwrap(),
+                )],
+                ..VmSpec::current()
+            };
+            assert!(spec.validate().is_err());
+            assert!(serde_json::to_string(&spec).is_err());
+            assert!(serde_yaml_ng::to_string(&spec).is_err());
+        }
+    }
+
+    #[test]
+    fn duplicate_unix_listeners_are_rejected_when_loading_a_spec() {
+        let error = serde_json::from_value::<VmSpec>(json!({
+            "specVersion": "0.1.0",
+            "forwards": [
+                {"listen": "host:unix:service.sock", "connect": "guest:tcp:80"},
+                {"listen": "host:unix:service.sock", "connect": "guest:tcp:81"}
+            ]
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("Unix listen endpoint"));
+    }
+
+    #[test]
     fn enabled_defaults_to_false() {
         let vsock = serde_json::from_value::<Vsock>(json!({})).expect("deserialize empty vsock");
 

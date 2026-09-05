@@ -249,6 +249,8 @@ pub enum ForwardError {
     ReservedVsockListenPort(u32),
     #[error("vsock listen port {0} is repeated")]
     DuplicateVsockListenPort(u32),
+    #[error("Unix listen endpoint {0} is repeated")]
+    DuplicateUnixListenEndpoint(String),
     #[error("TCP connect endpoint {0} must use a non-zero port")]
     ZeroTcpConnectPort(String),
     #[error("guest Unix path {0:?} must be absolute")]
@@ -271,6 +273,7 @@ pub fn validate_forwards(
 ) -> Result<(), ForwardError> {
     let mut names = HashSet::new();
     let mut listen_ports = HashSet::new();
+    let mut unix_listeners = HashSet::new();
     for forward in forwards {
         forward.validate()?;
         if let Some(name) = &forward.name {
@@ -282,6 +285,15 @@ pub fn validate_forwards(
             if !listen_ports.insert(port) {
                 return Err(ForwardError::DuplicateVsockListenPort(port));
             }
+        }
+        if matches!(
+            &forward.listen,
+            Endpoint::Host(Address::Unix(_)) | Endpoint::Guest(Address::Unix(_))
+        ) && !unix_listeners.insert(&forward.listen)
+        {
+            return Err(ForwardError::DuplicateUnixListenEndpoint(
+                forward.listen.to_string(),
+            ));
         }
         validate_runtime_path(&forward.listen, mux_filename)?;
         validate_runtime_path(&forward.connect, mux_filename)?;
@@ -371,6 +383,37 @@ mod tests {
 
     fn forward(listen: &str, connect: &str) -> Forward {
         Forward::new(listen.parse().unwrap(), connect.parse().unwrap())
+    }
+
+    #[test]
+    fn duplicate_unix_listeners_are_rejected_without_conflating_sides_or_targets() {
+        for (listen, connect) in [
+            ("host:unix:/run/service.sock", "guest:tcp:80"),
+            ("guest:unix:/run/service.sock", "host:tcp:80"),
+        ] {
+            let first = forward(listen, connect);
+            let second = first.clone().with_name("another");
+            assert!(matches!(
+                crate::validate_forwards(&[first, second], None),
+                Err(crate::ForwardError::DuplicateUnixListenEndpoint(_))
+            ));
+        }
+        crate::validate_forwards(
+            &[
+                forward(
+                    "host:unix:/run/service.sock",
+                    "guest:unix:/run/service.sock",
+                ),
+                forward(
+                    "guest:unix:/run/service.sock",
+                    "host:unix:/run/service.sock",
+                ),
+                forward("host:tcp:0", "guest:unix:/run/service.sock"),
+                forward("host:tcp:0", "guest:unix:/run/service.sock"),
+            ],
+            None,
+        )
+        .unwrap();
     }
 
     #[test]

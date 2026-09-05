@@ -1,11 +1,14 @@
 use std::ffi::OsString;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use eyre::Context;
-use nix::fcntl::{open, AtFlags, OFlag};
+#[cfg(target_os = "macos")]
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+use nix::fcntl::{open, AtFlags, OFlag, AT_FDCWD};
+use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, UnixAddr};
 use nix::sys::stat::{fchmod, fchmodat, fstat, fstatat, FchmodatFlags, Mode, SFlag};
 use nix::unistd::{unlinkat, UnlinkatFlags};
 use tokio::net::UnixListener;
@@ -171,7 +174,42 @@ pub(crate) fn remove_stale_socket(
             path.display()
         ));
     }
-    unlinkat(directory, filename, UnlinkatFlags::NoRemoveDir)
+    let occupied = || {
+        io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "{kind} {} is active or cannot be proven stale",
+                path.display()
+            ),
+        )
+    };
+    let matches_path = || {
+        fstatat(AT_FDCWD, path, AtFlags::AT_SYMLINK_NOFOLLOW).is_ok_and(|current| {
+            current.st_dev == metadata.st_dev && current.st_ino == metadata.st_ino
+        })
+    };
+    if !matches_path() {
+        return Err(occupied().into());
+    }
+    // A nonblocking probe must positively refuse the connection. Success,
+    // backlog exhaustion, permissions, and all other errors preserve the path.
+    #[cfg(target_os = "linux")]
+    let flags = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = SockFlag::empty();
+    let probe = socket(AddressFamily::Unix, SockType::Stream, flags, None)?;
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin has no SOCK_NONBLOCK/CLOEXEC flags for socket creation.
+        fcntl(&probe, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        fcntl(&probe, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+    }
+    if connect(probe.as_raw_fd(), &UnixAddr::new(path)?) != Err(nix::errno::Errno::ECONNREFUSED)
+        || !matches_path()
+    {
+        return Err(occupied().into());
+    }
+    unlink_if_matches(directory, filename, metadata.st_dev, metadata.st_ino)
         .map_err(eyre::Report::from)
         .wrap_err_with(|| format!("remove stale {kind} {}", path.display()))
 }
@@ -216,7 +254,7 @@ fn unix_socket_path_limit() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
     use tokio::net::UnixListener;
 
@@ -267,6 +305,34 @@ mod tests {
         mux.cleanup().expect("clean owned mux");
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn bind_preserves_live_and_unprobeable_sockets() {
+        for label in ["live", "permissions", "datagram"] {
+            let dir = temp_dir(label);
+            let path = dir.join("mux");
+            let stream = (label != "datagram").then(|| UnixListener::bind(&path).unwrap());
+            let datagram = (label == "datagram")
+                .then(|| std::os::unix::net::UnixDatagram::bind(&path).unwrap());
+            if label == "permissions" {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            }
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            let error = OwnedMux::bind(&dir, std::path::Path::new("mux"))
+                .expect_err("socket must be preserved");
+            assert!(error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)));
+            let preserved = std::fs::symlink_metadata(&path).unwrap();
+            assert_eq!(preserved.ino(), metadata.ino());
+            assert_eq!(
+                preserved.permissions().mode(),
+                metadata.permissions().mode()
+            );
+            drop((stream, datagram));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

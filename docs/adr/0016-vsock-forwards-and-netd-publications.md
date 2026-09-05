@@ -431,7 +431,11 @@ are subject to the same validation before a forward binds any socket.
 A `tcp:` address without an IP means the loopback address of that side
 (`127.0.0.1`). The IP is a literal; hostnames are not resolved by either
 side, because name resolution inside the guest is a policy question this ADR
-does not decide.
+does not decide. IPv6 zone/scope identifiers and flow information are not
+represented in this grammar. Programmatic IPv6 socket addresses must have
+zero `scope_id` and `flowinfo`; validation, target-line encoding, and
+serialization reject nonzero values rather than persisting an unreadable or
+lossy address.
 
 ### Validity Rules
 
@@ -453,6 +457,10 @@ parse time and `vmmon` enforces them again on the host API:
 7. `mode` is present only when `listen` is a `unix:` endpoint and is an
    octal permission string.
 8. `name`, when present, is unique among the machine's forwards.
+9. Unix listen endpoints are unique on each side. Before binding any host
+   listener, `vmmon` also resolves relative names against the runtime directory
+   and existing parent-directory aliases, rejecting duplicate resolved paths.
+   A session cannot replace a machine-scoped listener by spelling it differently.
 
 The resulting matrix is the complete set of forward shapes:
 
@@ -777,9 +785,11 @@ message ListenerFailed { ErrorDetail error = 1; }
 Semantics:
 
 - The agent binds in the guest's root network namespace as root. For `tcp:`
-  it sets `SO_REUSEADDR`. For `unix:` it removes an existing socket inode at
-  the path before binding, never a non-socket entry, and applies
-  `unix_mode`.
+  it sets `SO_REUSEADDR`. For `unix:` it removes an existing socket inode only
+  after a nonblocking stream connection probe returns `ECONNREFUSED` and the
+  inode still matches. Live listeners, full backlogs, permission failures,
+  non-stream sockets, and non-socket entries are preserved. On successful bind
+  it applies `unix_mode`.
 - Port 0 is permitted and the bound port is reported in `ListenerBound`.
 - Per accepted connection the agent dials `(2, 1028)`, writes
   `CONNECT <token-hex>\n`, and waits at most five seconds for `OK`. Anything
@@ -877,6 +887,11 @@ service names observed for the current agent instance.
   stale-socket, `0600`, and device-inode identity rules as the mux. The
   default mode is `0600`; `mode` may widen it, because a socket like
   `docker.sock` is sometimes shared with a group by its owner's choice.
+- An existing Unix socket is considered stale only when a nonblocking stream
+  connection probe returns `ECONNREFUSED`. All other outcomes, including a
+  successful connection, a full backlog, or a permission error, fail the bind
+  without unlinking or changing the socket's mode. Probes send no data. Cleanup
+  rechecks the pathname and inode; it never blindly removes a replacement.
 - For an absolute Unix path, `vmmon` opens the parent with `O_NOFOLLOW`,
   requires it to be owned by its own effective UID, and records its device and
   inode. POSIX provides no dirfd-relative AF_UNIX bind, so after binding the

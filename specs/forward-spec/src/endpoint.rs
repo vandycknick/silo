@@ -16,6 +16,14 @@ pub enum Address {
 impl Address {
     /// Checks that this address can be represented losslessly by the target-line protocol.
     pub fn validate(&self) -> Result<(), AddressError> {
+        if let Self::Tcp(SocketAddr::V6(address)) = self {
+            if address.scope_id() != 0 || address.flowinfo() != 0 {
+                return Err(AddressError::UnsupportedIpv6Metadata {
+                    scope_id: address.scope_id(),
+                    flowinfo: address.flowinfo(),
+                });
+            }
+        }
         if let Self::Unix(path) = self {
             let text = path.to_str().ok_or(AddressError::UnixPathNotUtf8)?;
             if text.is_empty() {
@@ -100,13 +108,8 @@ impl Serialize for Address {
     where
         S: Serializer,
     {
-        match self {
-            Self::Tcp(address) => serializer.serialize_str(&format!("tcp:{address}")),
-            Self::Unix(path) => path
-                .to_str()
-                .map(|path| serializer.serialize_str(&format!("unix:{path}")))
-                .unwrap_or_else(|| Err(serde::ser::Error::custom("Unix path is not UTF-8"))),
-        }
+        self.validate().map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -126,6 +129,8 @@ pub enum AddressError {
     InvalidAddress(String),
     #[error("TCP address {0:?} has an invalid IP literal")]
     InvalidIp(String),
+    #[error("TCP IPv6 addresses require zero scope_id and flowinfo; got scope_id={scope_id}, flowinfo={flowinfo}")]
+    UnsupportedIpv6Metadata { scope_id: u32, flowinfo: u32 },
     #[error("TCP port {0:?} is not canonical decimal in the range 0..=65535")]
     InvalidTcpPort(String),
     #[error("Unix socket path must not be empty")]
@@ -262,23 +267,10 @@ impl Serialize for Endpoint {
     where
         S: Serializer,
     {
-        match self {
-            Self::Host(Address::Tcp(address)) => {
-                serializer.serialize_str(&format!("host:tcp:{address}"))
-            }
-            Self::Guest(Address::Tcp(address)) => {
-                serializer.serialize_str(&format!("guest:tcp:{address}"))
-            }
-            Self::Host(Address::Unix(path)) => path
-                .to_str()
-                .map(|path| serializer.serialize_str(&format!("host:unix:{path}")))
-                .unwrap_or_else(|| Err(serde::ser::Error::custom("Unix path is not UTF-8"))),
-            Self::Guest(Address::Unix(path)) => path
-                .to_str()
-                .map(|path| serializer.serialize_str(&format!("guest:unix:{path}")))
-                .unwrap_or_else(|| Err(serde::ser::Error::custom("Unix path is not UTF-8"))),
-            Self::Vsock(port) => serializer.serialize_str(&format!("vsock:{port}")),
+        if let Some(address) = self.address() {
+            address.validate().map_err(serde::ser::Error::custom)?;
         }
+        serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -366,6 +358,52 @@ mod tests {
                 endpoint
             );
         }
+    }
+
+    #[test]
+    fn ipv6_metadata_is_rejected_at_validation_encoding_and_serialization_boundaries() {
+        use crate::{AddressError, Forward, TargetLine};
+        use std::net::{SocketAddr, SocketAddrV6};
+
+        for (flowinfo, scope_id) in [(0, 2), (1, 0), (42, 3)] {
+            let address = Address::Tcp(SocketAddr::V6(SocketAddrV6::new(
+                "fe80::1".parse().unwrap(),
+                80,
+                flowinfo,
+                scope_id,
+            )));
+            assert_eq!(
+                address.validate(),
+                Err(AddressError::UnsupportedIpv6Metadata { flowinfo, scope_id })
+            );
+            assert!(serde_json::to_string(&address).is_err());
+            assert!(crate::encode_connect(&TargetLine::Address(address.clone())).is_err());
+            for endpoint in [
+                Endpoint::Host(address.clone()),
+                Endpoint::Guest(address.clone()),
+            ] {
+                assert!(serde_json::to_string(&endpoint).is_err());
+                assert!(serde_yaml_ng::to_string(&endpoint).is_err());
+                let other = match &endpoint {
+                    Endpoint::Host(_) => "guest:tcp:80",
+                    _ => "host:tcp:80",
+                }
+                .parse()
+                .unwrap();
+                let forward = Forward::new(endpoint, other);
+                assert!(forward.validate().is_err());
+                assert!(serde_json::to_string(&forward).is_err());
+            }
+        }
+        let address = Address::Tcp(SocketAddr::V6(SocketAddrV6::new(
+            "::1".parse().unwrap(),
+            80,
+            0,
+            0,
+        )));
+        address.validate().unwrap();
+        let encoded = serde_json::to_string(&address).unwrap();
+        assert_eq!(serde_json::from_str::<Address>(&encoded).unwrap(), address);
     }
 
     #[test]

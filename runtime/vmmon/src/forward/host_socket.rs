@@ -291,6 +291,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_unix_listener_is_preserved_for_absolute_and_relative_paths() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory =
+            std::path::Path::new("/tmp").join(format!("fl-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("service.sock");
+        let original = tokio::net::UnixListener::bind(&path).unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        for address in [
+            Address::Unix(path.clone()),
+            Address::Unix("service.sock".into()),
+        ] {
+            let error =
+                OwnedHostListener::bind(&address, Some(UnixMode::new(0o666).unwrap()), &directory)
+                    .await
+                    .err()
+                    .expect("live listener must not be replaced");
+            assert!(
+                error.chain().any(|cause| cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)),
+                "{error:?}"
+            );
+            let preserved = std::fs::symlink_metadata(&path).unwrap();
+            assert_eq!(preserved.ino(), metadata.ino());
+            assert_eq!(
+                preserved.permissions().mode(),
+                metadata.permissions().mode()
+            );
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let client = async {
+                let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+                client.write_all(b"ping").await.unwrap();
+                client.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                client.read_to_end(&mut reply).await.unwrap();
+                assert_eq!(reply, b"pong");
+            };
+            let server = async {
+                loop {
+                    let (mut client, _) = original.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    client.read_to_end(&mut request).await.unwrap();
+                    if request.is_empty() {
+                        continue;
+                    } // Closed liveness probes carry no data.
+                    assert_eq!(request, b"ping");
+                    client.write_all(b"pong").await.unwrap();
+                    break;
+                }
+            };
+            tokio::join!(client, server);
+        })
+        .await
+        .unwrap();
+        drop(original);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_full_unix_backlog_is_not_mistaken_for_a_stale_socket() {
+        use nix::sys::socket::{
+            connect, listen, socket, AddressFamily, Backlog, SockFlag, SockType, UnixAddr,
+        };
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let directory =
+            std::path::Path::new("/tmp").join(format!("fb-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("service.sock");
+        let original = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listen(&original, Backlog::new(1).unwrap()).unwrap();
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        let mut queued = Vec::new();
+        let mut full = false;
+        for _ in 0..16 {
+            let stream = socket(
+                AddressFamily::Unix,
+                SockType::Stream,
+                SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+                None,
+            )
+            .unwrap();
+            match connect(stream.as_raw_fd(), &UnixAddr::new(&path).unwrap()) {
+                Ok(()) => queued.push(stream),
+                Err(nix::errno::Errno::EAGAIN) => {
+                    full = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected connection failure: {error}"),
+            }
+        }
+        assert!(full, "test must fill the accept backlog");
+        let started = std::time::Instant::now();
+        assert!(
+            OwnedHostListener::bind(&Address::Unix(path.clone()), None, &directory)
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        drop(queued);
+        drop(original);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn unix_listener_applies_mode_and_preserves_replacement_inode() {
         let directory = std::path::Path::new("/tmp").join(format!(
             "fh-{:x}-{:x}",
