@@ -25,15 +25,35 @@ func (policy *NetworkPolicy) JSON() string {
 }
 func (policy *NetworkPolicy) String() string { return policy.JSON() }
 
+// PublishBind constrains host addresses a guest may publish through netd.
+type PublishBind string
+
+const (
+	PublishLoopback PublishBind = "loopback"
+	PublishAny      PublishBind = "any"
+)
+
+type GuestPublish struct {
+	Bind PublishBind `json:"bind"`
+}
+
 type MachineNetwork struct {
-	Kind   MachineNetworkKind
-	Name   string
-	Policy *NetworkPolicy
+	Kind    MachineNetworkKind
+	Name    string
+	Policy  *NetworkPolicy
+	Publish *GuestPublish
 }
 
 func PrivateNetwork(policy *NetworkPolicy) MachineNetwork {
 	return MachineNetwork{Kind: MachineNetworkPrivate, Policy: policy}
 }
+
+// WithPublish grants publication authority. Only private networks support it.
+func (network MachineNetwork) WithPublish(bind PublishBind) MachineNetwork {
+	network.Publish = &GuestPublish{Bind: bind}
+	return network
+}
+
 func NoNetwork() MachineNetwork { return MachineNetwork{Kind: MachineNetworkNone} }
 func NamedNetwork(name string) MachineNetwork {
 	return MachineNetwork{Kind: MachineNetworkNamed, Name: name}
@@ -43,10 +63,18 @@ type machineNetworkWire struct {
 	Kind       MachineNetworkKind `json:"kind"`
 	Name       string             `json:"name,omitempty"`
 	PolicyJSON string             `json:"policy_json,omitempty"`
+	Publish    *GuestPublish      `json:"publish,omitempty"`
 }
 
 func (network MachineNetwork) wire() (machineNetworkWire, error) {
 	wire := machineNetworkWire{Kind: network.Kind, Name: network.Name}
+	if network.Publish != nil {
+		if network.Kind != MachineNetworkPrivate || (network.Publish.Bind != PublishLoopback && network.Publish.Bind != PublishAny) {
+			return machineNetworkWire{}, newError(ErrorInvalidArgument, "", "guest publication requires a private network and loopback or any bind policy")
+		}
+		publish := *network.Publish
+		wire.Publish = &publish
+	}
 	if network.Policy != nil {
 		wire.PolicyJSON = network.Policy.JSON()
 	}

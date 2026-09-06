@@ -44,6 +44,8 @@ export interface NativeMachineBuilder {
   userdata(userdata: string): void;
   disks(disks: string[]): void;
   mounts(mounts: NativeMountInput[]): void;
+  forwards(forwards: NativeForward[]): void;
+  vsock(enabled: boolean): void;
   network(network: NativeNetworkInput): void;
   create(): Promise<NativeMachine>;
 }
@@ -109,7 +111,22 @@ export interface NativeMountInput {
   readOnly?: boolean;
 }
 
+export interface NativeForward {
+  name?: string | null;
+  listen: string;
+  connect: string;
+  mode?: string | null;
+}
+
+export interface NativeVsockConfig {
+  enabled: boolean;
+  uds?: string | null;
+}
+
+export interface NativeGuestPublish { bind: string }
+
 export interface NativeNetworkInput {
+  publish?: NativeGuestPublish;
   kind: "private" | "none" | "named";
   name?: string;
   policyJson?: string;
@@ -232,6 +249,8 @@ export interface NativeMachineData {
   labels: NativeKeyValue[];
   metadata: NativeKeyValue[];
   network: NativeNetworkData;
+  forwards: NativeForward[];
+  vsock?: NativeVsockConfig | null;
   agentMode: "default" | "custom" | "disabled" | "unknown";
   agentPath?: string | null;
   status: NativeMachineStatus;
@@ -306,6 +325,7 @@ export interface NativeMachineRootfs {
 }
 
 export interface NativeNetworkData {
+  publish?: NativeGuestPublish | null;
   kind: "private" | "none" | "named" | "unknown";
   name?: string | null;
   policyJson?: string | null;

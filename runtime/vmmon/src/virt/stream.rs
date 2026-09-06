@@ -31,7 +31,7 @@ use tokio::net::{UnixListener, UnixStream};
 #[cfg(target_os = "linux")]
 use tokio::sync::mpsc;
 
-use crate::virt::capacity::{VsockCapacity, VsockLease};
+use crate::virt::capacity::{VsockCapacity, VsockLease, VsockListenerAdmission};
 use crate::virt::error::VirtError;
 
 #[cfg(not(unix))]
@@ -127,7 +127,7 @@ impl VsockStream {
     fn attach_listener_lease(
         mut self,
         registered_port: u32,
-        capacity: &VsockCapacity,
+        admission: &VsockListenerAdmission,
     ) -> Result<Self, VirtError> {
         if self.destination_port != registered_port {
             return Err(VirtError::Backend(format!(
@@ -136,12 +136,12 @@ impl VsockStream {
             )));
         }
         match self._lease.as_ref() {
-            Some(lease) if capacity.owns(lease) => Ok(self),
+            Some(lease) if admission.owns(lease) => Ok(self),
             Some(_) => Err(VirtError::Backend(
                 "backend returned a vsock stream with a foreign capacity lease".to_string(),
             )),
             None => {
-                self._lease = Some(capacity.reserve()?);
+                self._lease = Some(admission.reserve()?);
                 Ok(self)
             }
         }
@@ -225,7 +225,7 @@ impl AsyncWrite for VsockStream {
 pub struct VsockListener {
     inner: VsockListenerInner,
     registered_port: u32,
-    capacity: VsockCapacity,
+    admission: VsockListenerAdmission,
     synthetic_sources: Option<SyntheticPortAllocator>,
     _cleanup: Option<ListenerCleanup>,
 }
@@ -264,12 +264,12 @@ impl VsockListener {
     pub(crate) fn from_unix_listener(
         listener: UnixListener,
         registered_port: u32,
-        capacity: VsockCapacity,
+        admission: VsockListenerAdmission,
     ) -> Self {
         Self {
             inner: VsockListenerInner::Unix(listener),
             registered_port,
-            capacity,
+            admission,
             synthetic_sources: None,
             _cleanup: None,
         }
@@ -278,13 +278,13 @@ impl VsockListener {
     pub(crate) fn from_mock_unix_listener(
         listener: UnixListener,
         registered_port: u32,
-        capacity: VsockCapacity,
+        admission: VsockListenerAdmission,
         synthetic_sources: SyntheticPortAllocator,
     ) -> Self {
         Self {
             inner: VsockListenerInner::Unix(listener),
             registered_port,
-            capacity,
+            admission,
             synthetic_sources: Some(synthetic_sources),
             _cleanup: None,
         }
@@ -294,7 +294,7 @@ impl VsockListener {
     pub(crate) fn from_krun_channel<F>(
         receiver: mpsc::Receiver<PendingUnixVsock>,
         registered_port: u32,
-        capacity: VsockCapacity,
+        admission: VsockListenerAdmission,
         cleanup: F,
     ) -> Self
     where
@@ -303,7 +303,7 @@ impl VsockListener {
         Self {
             inner: VsockListenerInner::Krun(receiver),
             registered_port,
-            capacity,
+            admission,
             synthetic_sources: None,
             _cleanup: Some(ListenerCleanup(Some(Box::new(cleanup)))),
         }
@@ -313,7 +313,7 @@ impl VsockListener {
     pub(crate) fn from_vz(
         listener: vz::device::VirtioSocketListener,
         registered_port: u32,
-        capacity: VsockCapacity,
+        admission: VsockListenerAdmission,
         accepted_leases: Arc<Mutex<VecDeque<VsockLease>>>,
     ) -> Self {
         Self {
@@ -322,7 +322,7 @@ impl VsockListener {
                 accepted_leases,
             },
             registered_port,
-            capacity,
+            admission,
             synthetic_sources: None,
             _cleanup: None,
         }
@@ -333,7 +333,7 @@ impl VsockListener {
     }
 
     pub(crate) fn owns_capacity(&self, capacity: &VsockCapacity) -> bool {
-        self.capacity.shares_limit_with(capacity)
+        self.admission.shares_limit_with(capacity)
     }
 
     /// Wait for the next guest-initiated connection.
@@ -428,7 +428,7 @@ impl VsockListener {
 
     fn admit(&self, stream: VsockStream) -> Result<VsockStream, VirtError> {
         let Some(synthetic_sources) = self.synthetic_sources.as_ref() else {
-            return stream.attach_listener_lease(self.registered_port, &self.capacity);
+            return stream.attach_listener_lease(self.registered_port, &self.admission);
         };
 
         if stream.destination_port() != self.registered_port {
@@ -438,7 +438,7 @@ impl VsockListener {
                 self.registered_port
             )));
         }
-        let lease = self.capacity.reserve()?;
+        let lease = self.admission.reserve()?;
         let source = synthetic_sources.allocate()?;
         let stream = stream.into_unix_stream()?;
         Ok(VsockStream::from_synthetic_unix_stream(
@@ -814,7 +814,11 @@ mod tests {
         let path = temp_socket_path("accept");
         let listener = UnixListener::bind(&path).expect("listener should bind");
         let capacity = VsockCapacity::test_with_limit("listener", 1);
-        let mut listener = VsockListener::from_unix_listener(listener, 7001, capacity);
+        let mut listener = VsockListener::from_unix_listener(
+            listener,
+            7001,
+            capacity.listener(crate::virt::capacity::ListenerAdmissionClass::Internal),
+        );
 
         let client = tokio::spawn(UnixStream::connect(path.clone()));
         let accepted = listener.accept().await.expect("accept should succeed");
@@ -834,7 +838,11 @@ mod tests {
         let path = temp_socket_path("try-accept");
         let listener = UnixListener::bind(&path).expect("listener should bind");
         let capacity = VsockCapacity::test_with_limit("listener", 1);
-        let mut listener = VsockListener::from_unix_listener(listener, 7002, capacity);
+        let mut listener = VsockListener::from_unix_listener(
+            listener,
+            7002,
+            capacity.listener(crate::virt::capacity::ListenerAdmissionClass::Internal),
+        );
 
         assert!(listener
             .try_accept()
@@ -848,7 +856,11 @@ mod tests {
         let path = temp_socket_path("capacity");
         let listener = UnixListener::bind(&path).expect("listener should bind");
         let capacity = VsockCapacity::test_with_limit("listener-capacity", 1);
-        let mut listener = VsockListener::from_unix_listener(listener, 7003, capacity.clone());
+        let mut listener = VsockListener::from_unix_listener(
+            listener,
+            7003,
+            capacity.listener(crate::virt::capacity::ListenerAdmissionClass::Internal),
+        );
 
         let first_client = UnixStream::connect(&path).await.expect("first connect");
         let first = listener.accept().await.expect("first accept");
@@ -883,6 +895,34 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[tokio::test]
+    async fn public_listener_consumes_public_and_total_capacity_once() {
+        let path = temp_socket_path("public-capacity");
+        let listener = UnixListener::bind(&path).expect("listener should bind");
+        let capacity = VsockCapacity::test_with_limit("public-listener", 17);
+        let admission = capacity.listener(crate::virt::capacity::ListenerAdmissionClass::Public);
+        let mut listener = VsockListener::from_unix_listener(listener, 7005, admission);
+
+        let first_client = UnixStream::connect(&path).await.expect("first client");
+        let first = listener.accept().await.expect("public listener admission");
+        assert_eq!(capacity.available_permits(), 16);
+        let mut rejected_client = UnixStream::connect(&path).await.expect("second client");
+        assert!(listener.accept().await.is_err());
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            rejected_client.read(&mut byte).await.expect("rejected EOF"),
+            0
+        );
+
+        let internal = capacity.reserve().expect("internal headroom remains");
+        assert_eq!(capacity.available_permits(), 15);
+        drop(internal);
+        drop(first);
+        drop(first_client);
+        assert_eq!(capacity.available_permits(), 17);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn synthetic_source_ports_are_bounded_unique_and_reused() {
         let allocator = SyntheticPortAllocator::new();
@@ -910,7 +950,10 @@ mod tests {
         let stream = VsockStream::from_unix_stream(stream, Some(8000), 7004, Some(lease));
 
         let stream = stream
-            .attach_listener_lease(7004, &capacity)
+            .attach_listener_lease(
+                7004,
+                &capacity.listener(crate::virt::capacity::ListenerAdmissionClass::Internal),
+            )
             .expect("existing lease is retained");
         assert_eq!(capacity.available_permits(), 0);
         drop(stream);

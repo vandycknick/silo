@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 agent-spec = { path = "../../specs/agent-spec" }
+forward-spec = { path = "../../specs/forward-spec", features = ["tokio"] }
 protocol = { path = "../../specs/protocol" }
 eyre = "0.6.12"
 futures = "0.3.33"

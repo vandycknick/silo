@@ -53,7 +53,7 @@ export interface Mount {
 /** Inspectable machine network attachment data. Configure networking with `MachineBuilder.network(...)`. */
 export type Network =
   /** Private NAT-backed network, optionally constrained by canonical `NetworkPolicy` JSON. */
-  | { kind: "private"; policyJson?: string }
+  | { kind: "private"; policyJson?: string; publish?: GuestPublish }
   /** No network attachment. */
   | { kind: "none" }
   /** Attach to a named network. */
@@ -236,6 +236,28 @@ export interface ProcessConfig {
 }
 
 /** Snapshot of persisted machine config plus runtime state. */
+export type PublishBind = "loopback" | "any";
+
+export interface GuestPublish { bind: PublishBind }
+
+/** Endpoint grammar validated by the native layer, with literal IP addresses only. */
+export type ForwardEndpoint = `host:${string}` | `guest:${string}` | `vsock:${string}`;
+
+/** Machine-scoped forward. Relative host Unix paths resolve inside the runtime directory. */
+export interface Forward {
+  name?: string;
+  listen: ForwardEndpoint;
+  connect: ForwardEndpoint;
+  /** Four-digit octal Unix listener mode, default "0600". */
+  mode?: string;
+}
+
+export interface VsockConfig {
+  enabled: boolean;
+  /** Omitted for the default mux filename. */
+  uds?: string;
+}
+
 export interface MachineData {
   id: string;
   name: string;
@@ -255,6 +277,8 @@ export interface MachineData {
   labels: KeyValueMap;
   metadata: KeyValueMap;
   network: Network;
+  forwards: Forward[];
+  vsock?: VsockConfig;
   /** Guest agent configuration currently used by machine startup. */
   agent: MachineAgent;
   status: MachineStatus;

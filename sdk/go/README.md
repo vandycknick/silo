@@ -47,6 +47,28 @@ silo.WithRootDiskSize(silo.Gigabytes(40))
 
 Decimal (`Gigabytes`) and binary (`Gibibytes`) constructors are intentionally distinct.
 
+## Forwards and guest publications
+
+Machine-scoped forwards work without networking and persist across starts:
+
+```go
+machine, err := runtime.CreateMachine(ctx, silo.DiskImage("rootfs.img"),
+    silo.WithForwards(silo.Forward{
+        Name: "docker",
+        Listen: "host:unix:docker.sock",
+        Connect: "guest:unix:/var/run/docker.sock",
+    }),
+    silo.WithVsock(true),
+    silo.WithMachineNetwork(silo.PrivateNetwork(nil).WithPublish(silo.PublishAny)),
+)
+```
+
+Relative host Unix paths resolve inside the machine runtime directory. Unix
+listener `Mode` is a four-digit octal string and defaults to `0600`.
+`Machine.Inspect` returns `Forwards`, `Vsock`, and `Network.Publish`.
+Publications are off by default; `PublishLoopback` and `PublishAny` apply only
+to private networks. SDK session-scoped forward handles are not yet exposed.
+
 ## Execution
 
 Non-zero guest exit status is an `ExecutionResult`, not a Go error. Errors report validation, transport, runtime, or lifecycle failures. Output byte methods preserve arbitrary bytes; string methods perform ordinary Go byte-to-string conversion.

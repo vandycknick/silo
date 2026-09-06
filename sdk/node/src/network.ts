@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import type { PublishBind } from "./types.js";
 import type { NativeNetworkAuditInput, NativeNetworkCredentialInput, NativeNetworkEndpointInput, NativeNetworkForwardInput, NativeNetworkInput, NativeNetworkPolicyInput, NativeNetworkRuleInput, NativeTailscaleTunnelInput } from "./internal/napi.js";
 import {
   assertBoolean,
@@ -1027,8 +1028,17 @@ export class MachineNetworkBuilder {
     return this;
   }
 
+  /** Allow guest-requested TCP publications on this private network. */
+  publish(bind: PublishBind): this {
+    if (this.input.kind !== "private" || (bind !== "loopback" && bind !== "any")) {
+      throw new TypeError("guest publication requires a private network and loopback or any bind policy");
+    }
+    this.input = { ...this.input, publish: { bind } };
+    return this;
+  }
+
   toNative(): NativeNetworkInput {
-    return { ...this.input };
+    return { ...this.input, ...(this.input.publish ? { publish: { ...this.input.publish } } : {}) };
   }
 }
 

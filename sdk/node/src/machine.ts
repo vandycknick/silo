@@ -1,6 +1,7 @@
 import type { NativeMachine, NativeMachineBuilder } from "./internal/napi.js";
 import {
     executionOptionsToNative,
+    forwardsToNative,
     executionResultFromNative,
     imageSourceToNative,
     machineDataFromNative,
@@ -18,6 +19,7 @@ import {
 import { MachineNetworkBuilder, type MachineNetworkBuilderCallback } from "./network.js";
 import type {
     ExecutionOptions,
+    Forward,
     ExecutionResult,
     ImageSource,
     KeyValueMap,
@@ -163,6 +165,18 @@ export class MachineBuilder {
     /** Configure guest mounts. */
     mounts(mounts: Mount[]): this {
         this.native.mounts(mountsToNative(mounts));
+        return this;
+    }
+
+    /** Replace the machine-scoped forwards, independently of networking. */
+    forwards(forwards: Forward[]): this {
+        this.native.forwards(forwardsToNative(forwards));
+        return this;
+    }
+
+    /** Enable or disable the public hybrid vsock surface. */
+    vsock(enabled: boolean): this {
+        this.native.vsock(assertBoolean(enabled, "enabled"));
         return this;
     }
 

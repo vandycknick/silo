@@ -119,6 +119,9 @@ message EnabledAgent {
   AgentConnection connection = 1;
   AgentIdentity identity = 2;
   AgentStatusObservation status = 3;
+  // Serving Silo service names observed for the current agent instance via
+  // gRPC health.
+  repeated string services = 4;
 }
 
 message HostAgent {

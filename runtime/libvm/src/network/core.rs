@@ -8,18 +8,27 @@ use crate::store::DataStore;
 use crate::{EgressCredentials, LibVmError, RuntimeNetworkingConfig};
 
 use super::VmmonNetworkAttachment;
+use crate::network::GuestPublish;
 
 pub(super) struct NetworkAttachmentRequest<'a> {
     policy: Option<&'a NetworkPolicy>,
+    publish: Option<GuestPublish>,
 }
 
 impl<'a> NetworkAttachmentRequest<'a> {
-    pub(super) fn private(policy: Option<&'a NetworkPolicy>) -> Self {
-        Self { policy }
+    pub(super) fn private(
+        policy: Option<&'a NetworkPolicy>,
+        publish: Option<GuestPublish>,
+    ) -> Self {
+        Self { policy, publish }
     }
 
     pub(super) fn policy(&self) -> Option<&'a NetworkPolicy> {
         self.policy
+    }
+
+    pub(super) fn publish(&self) -> Option<GuestPublish> {
+        self.publish
     }
 }
 

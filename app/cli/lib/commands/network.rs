@@ -216,11 +216,13 @@ fn machine_network_with_policy(
             let policy = resolve_network_policy_source(source, policy_config_dir)?;
             Ok(ResolvedMachineNetwork::Private {
                 policy: Some(policy),
+                publish: None,
             })
         }
-        (MachineNetworkSelection::Private, None) => {
-            Ok(ResolvedMachineNetwork::Private { policy: None })
-        }
+        (MachineNetworkSelection::Private, None) => Ok(ResolvedMachineNetwork::Private {
+            policy: None,
+            publish: None,
+        }),
         (network, None) => Ok(network.into()),
         (_, Some(_)) => eyre::bail!("--policy is only supported with private networks"),
     }
@@ -311,7 +313,7 @@ mod tests {
         )
         .expect("policy should apply");
 
-        let ResolvedMachineNetwork::Private { policy } = network else {
+        let ResolvedMachineNetwork::Private { policy, .. } = network else {
             panic!("expected private network");
         };
         assert_eq!(policy.expect("policy").metadata()["source"], "test");

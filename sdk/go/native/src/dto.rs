@@ -30,6 +30,8 @@ pub fn machine_data(data: MachineData) -> Value {
         "labels": data.labels,
         "metadata": data.metadata,
         "network": machine_network(data.network),
+        "forwards": data.spec.forwards,
+        "vsock": data.spec.vsock,
         "agent": machine_agent(data.guest.agent),
         "status": machine_status(data.status),
         "boot_report": data.boot_report.map(boot_report),
@@ -70,7 +72,8 @@ fn machine_rootfs(rootfs: MachineRootfs) -> Value {
 
 fn machine_network(network: MachineNetworkConfig) -> Value {
     match network {
-        MachineNetworkConfig::Private { policy } => json!({
+        MachineNetworkConfig::Private { policy, publish } => json!({
+            "publish": publish,
             "kind": "private",
             "policy_json": policy.and_then(|policy| serde_json::to_string(&policy.normalized()).ok()),
         }),

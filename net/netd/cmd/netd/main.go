@@ -136,14 +136,15 @@ func run(cfg *config.Config, compiledPolicy *policy.Policy, auditLog *audit.Logg
 
 	intelligencePool := registry.NewIntelligencePool(nil)
 	vmSession, err := session.New(session.Spec{
-		VMID:        cfg.Metadata.VMID,
-		RunID:       cfg.Metadata.RunID,
-		NetworkID:   cfg.Metadata.NetworkID,
-		CaptureFile: captureFile,
-		Stack:       cfg.Stack,
-		Policy:      compiledPolicy,
-		CACert:      cfg.TLS.CACert,
-		CAKey:       cfg.TLS.CAKey,
+		VMID:         cfg.Metadata.VMID,
+		RunID:        cfg.Metadata.RunID,
+		NetworkID:    cfg.Metadata.NetworkID,
+		CaptureFile:  captureFile,
+		Stack:        cfg.Stack,
+		Policy:       compiledPolicy,
+		CACert:       cfg.TLS.CACert,
+		CAKey:        cfg.TLS.CAKey,
+		GuestPublish: cfg.GuestPublish,
 	}, session.Shared{Audit: auditLog, Intelligence: intelligencePool})
 	captureFile = nil
 	if err != nil {

@@ -45,6 +45,8 @@ type machineConfig struct {
 	Userdata             *string             `json:"userdata,omitempty"`
 	Disks                []string            `json:"disks,omitempty"`
 	Mounts               []Mount             `json:"mounts,omitempty"`
+	Forwards             []Forward           `json:"forwards,omitempty"`
+	Vsock                *bool               `json:"vsock,omitempty"`
 	Network              *machineNetworkWire `json:"network,omitempty"`
 	error                error
 }
@@ -133,6 +135,17 @@ func WithDisks(paths ...string) MachineOption {
 func WithMounts(mounts ...Mount) MachineOption {
 	return func(config *machineConfig) { config.Mounts = append([]Mount(nil), mounts...) }
 }
+
+// WithForwards replaces the machine-scoped forwards. Endpoints use the ADR 0016 grammar.
+func WithForwards(forwards ...Forward) MachineOption {
+	return func(config *machineConfig) { config.Forwards = append([]Forward(nil), forwards...) }
+}
+
+// WithVsock enables or disables the public hybrid vsock surface.
+func WithVsock(enabled bool) MachineOption {
+	return func(config *machineConfig) { config.Vsock = &enabled }
+}
+
 func WithMachineNetwork(network MachineNetwork) MachineOption {
 	return func(config *machineConfig) {
 		wire, err := network.wire()

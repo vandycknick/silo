@@ -10,6 +10,7 @@ mod execution;
 mod exit_command;
 mod exit_status;
 mod ext;
+mod forward;
 mod guest;
 mod lock;
 mod machine;
@@ -210,6 +211,9 @@ async fn run(
         {
             Ok(handles) => shutdown::run(runtime, initialized.context, handles).await,
             Err(err) => {
+                if let Err(forward_error) = initialized.context.forwards.shutdown().await {
+                    tracing::error!(%forward_error, "failed to stop forwards after service startup failure");
+                }
                 if let Err(stop_error) = initialized.context.machine.stop().await {
                     tracing::error!(%stop_error, "failed to stop VM after service startup failure");
                 }

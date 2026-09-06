@@ -5,8 +5,8 @@ use clap::{Args, ValueEnum};
 use eyre::Context as _;
 use libvm::{
     ImageProgressSender, ImagePullPolicy, ImageResolveOptions, ImageSource, MachineAgent,
-    MachineBuilder, MachineRetention, MachineUserConfig, Memory, ReadOnlyRuntime, ResolvedOciImage,
-    Runtime, RuntimeConfig,
+    MachineBuilder, MachineRetention, MachineUserConfig, Memory, PublishBind, ReadOnlyRuntime,
+    ResolvedOciImage, Runtime, RuntimeConfig,
 };
 use nix::unistd::{Uid, User};
 
@@ -82,9 +82,18 @@ pub(crate) struct VmOverrideArgs {
     /// Add a host mount. Format: SRC:DST[:ro|rw].
     #[arg(long = "mount", value_name = "SRC:DST[:MODE]", value_parser = parse_mount)]
     pub(crate) mounts: Vec<MachineMount>,
+    /// Declare a forward. Format: LISTEN=CONNECT. May be repeated.
+    #[arg(long = "forward", value_name = "LISTEN=CONNECT", value_parser = parse_forward)]
+    pub(crate) forwards: Vec<libvm::Forward>,
+    /// Enable the public vsock surface.
+    #[arg(long)]
+    pub(crate) vsock: bool,
     /// Override the network target. Allowed: private, none, NAME, or name:NAME.
     #[arg(long, value_parser = MachineNetworkSelection::parse)]
     pub(crate) network: Option<MachineNetworkSelection>,
+    /// Allow guest requests for host TCP publications.
+    #[arg(long, value_name = "loopback|any")]
+    pub(crate) guest_publish: Option<PublishBind>,
     /// Add or override a label. Format: KEY=VALUE.
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
     pub(crate) labels: Vec<(String, String)>,
@@ -141,10 +150,13 @@ impl VmOverrideArgs {
                 disk_size: self.disk_size.clone(),
                 userdata,
                 mounts: self.mounts.clone(),
+                forwards: (!self.forwards.is_empty()).then(|| self.forwards.clone()),
+                vsock: self.vsock.then_some(true),
                 network: self
                     .network
                     .clone()
                     .map(MachineNetworkSelection::into_machine_network),
+                guest_publish: self.guest_publish,
                 labels: self.labels.iter().cloned().collect(),
             },
             kernel: self.kernel.clone(),
@@ -545,7 +557,11 @@ fn apply_plan(
         .nested_virtualization(plan.machine_settings.nested_virtualization)
         .rosetta(plan.machine_settings.rosetta)
         .disks(plan.machine_settings.disks.clone())
-        .mounts(resolve_machine_mounts(&plan.machine.mounts)?);
+        .mounts(resolve_machine_mounts(&plan.machine.mounts)?)
+        .forwards(plan.machine.forwards.clone());
+    if let Some(vsock) = plan.machine.vsock {
+        builder = builder.vsock(vsock);
+    }
     if let Some(resources) = &plan.machine.resources {
         if let Some(cpus) = resources.cpus {
             builder = builder.cpus(cpus);
@@ -682,6 +698,8 @@ fn empty_template() -> Template {
         disk_size: None,
         userdata: None,
         mounts: Vec::new(),
+        forwards: Vec::new(),
+        vsock: None,
         network: None,
         labels: BTreeMap::new(),
     }
@@ -728,6 +746,7 @@ pub(crate) fn preflight_create(
         .or(template.network.as_ref());
     if let Some(MachineNetwork::Private {
         policy_ref: Some(policy_ref),
+        ..
     }) = network
     {
         // Resolving here makes dry runs and real runs reject the same missing,
@@ -853,6 +872,27 @@ pub(crate) fn parse_label(input: &str) -> Result<(String, String), String> {
     Ok((key.to_string(), value.to_string()))
 }
 
+fn parse_forward(input: &str) -> Result<libvm::Forward, String> {
+    let Some((listen, connect)) = input.split_once('=') else {
+        return Err("forward must be LISTEN=CONNECT".to_string());
+    };
+    if listen.is_empty() || connect.is_empty() {
+        return Err("forward must contain a non-empty LISTEN=CONNECT pair".to_string());
+    }
+    let forward = libvm::Forward::new(
+        listen
+            .parse()
+            .map_err(|error| format!("invalid forward listen endpoint: {error}"))?,
+        connect
+            .parse()
+            .map_err(|error| format!("invalid forward connect endpoint: {error}"))?,
+    );
+    forward
+        .validate()
+        .map_err(|error| format!("invalid forward: {error}"))?;
+    Ok(forward)
+}
+
 pub(crate) fn parse_user_arg(value: &str) -> Result<UserArg, String> {
     if value == "auto" {
         return Ok(UserArg::Auto);
@@ -971,6 +1011,9 @@ mod tests {
             "2gb",
             "--mount",
             ".:/workspace:ro",
+            "--forward",
+            "host:tcp:8080=guest:tcp:80",
+            "--vsock",
             "--network",
             "none",
             "--label",
@@ -986,7 +1029,47 @@ mod tests {
             Some(2)
         );
         assert_eq!(options.overrides.mounts.len(), 1);
+        assert_eq!(
+            options
+                .overrides
+                .forwards
+                .as_ref()
+                .expect("forward override")[0]
+                .listen
+                .to_string(),
+            "host:tcp:127.0.0.1:8080"
+        );
+        assert_eq!(options.overrides.vsock, Some(true));
         assert_eq!(options.overrides.labels["a"], "b");
+    }
+
+    #[test]
+    fn create_parses_guest_publish() {
+        let cli = Cli::try_parse_from([
+            "silo",
+            "create",
+            "disk:rootfs.img",
+            "--guest-publish",
+            "any",
+        ])
+        .expect("create parses guest publication");
+        let Command::Create(create) = cli.command else {
+            panic!("expected create")
+        };
+        let options = create.overrides.resolve().expect("resolve overrides");
+
+        assert_eq!(
+            options.overrides.guest_publish,
+            Some(libvm::PublishBind::Any)
+        );
+        assert!(Cli::try_parse_from([
+            "silo",
+            "create",
+            "disk:rootfs.img",
+            "--guest-publish",
+            "everything",
+        ])
+        .is_err());
     }
 
     #[tokio::test]

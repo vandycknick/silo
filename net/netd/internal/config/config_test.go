@@ -66,6 +66,39 @@ func TestParseRejectsRemovedSSHPortFlag(t *testing.T) {
 	}
 }
 
+func TestParseGuestPublish(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+		want  PublishBind
+	}{
+		{name: "disabled"},
+		{name: "loopback", value: "loopback", want: PublishBindLoopback},
+		{name: "any", value: "any", want: PublishBindAny},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			args := configArgs(t)
+			if test.value != "" {
+				args = append(args, "--guest-publish", test.value)
+			}
+			cfg, err := Parse(args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.GuestPublish != test.want {
+				t.Fatalf("guest publication bind = %q, want %q", cfg.GuestPublish, test.want)
+			}
+		})
+	}
+}
+
+func TestParseRejectsInvalidGuestPublish(t *testing.T) {
+	_, err := Parse(append(configArgs(t), "--guest-publish", "everything"))
+	if err == nil {
+		t.Fatal("expected invalid guest publication bind to be rejected")
+	}
+}
+
 func TestParseAcceptsExplicitLogFilesAndRunMetadata(t *testing.T) {
 	dir := t.TempDir()
 	logFile := "service.jsonl"

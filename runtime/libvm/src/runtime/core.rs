@@ -1826,10 +1826,10 @@ mod tests {
     use crate::OciImageConfigMetadata;
     use crate::Platform;
     use crate::{
-        ImageCacheState, ImageProgress, ImageProgressSender, ImagePullOptions, ImagePullPolicy,
-        ImageResolveOptions, ImageSource, LibVmError, MachineExitOutcome, MachineKillOptions,
-        MachineRef, MachineRetention, MachineRunId, MachineStatus, MachineUpdate, Memory,
-        RuntimeNetworkingConfig,
+        GuestPublish, ImageCacheState, ImageProgress, ImageProgressSender, ImagePullOptions,
+        ImagePullPolicy, ImageResolveOptions, ImageSource, LibVmError, MachineExitOutcome,
+        MachineKillOptions, MachineRef, MachineRetention, MachineRunId, MachineStatus,
+        MachineUpdate, Memory, PublishBind, RuntimeNetworkingConfig,
     };
     use oci::{FlatExt4Artifact, PublishedRootfs, RootfsMetadata};
     use silo_policy::NetworkPolicy;
@@ -4534,6 +4534,81 @@ mod tests {
 
         assert!(matches!(
             err,
+            LibVmError::InvalidMachineUpdate { ref reason, .. }
+                if reason.contains("machine networking is disabled")
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_sets_and_clears_guest_publication() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let runtime = Runtime::open(
+            LocalPaths::new(temp.path().join("silo")),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .expect("create runtime");
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+
+        let updated = machine_handle(&runtime, machine.id)
+            .update(MachineUpdate::new().publish(Some(PublishBind::Any)))
+            .await
+            .expect("set guest publication");
+
+        assert_eq!(
+            updated.network.publish(),
+            Some(GuestPublish {
+                bind: PublishBind::Any
+            })
+        );
+        let persisted = inspect_machine(
+            &runtime,
+            MachineRef::parse("devbox").expect("parse machine ref"),
+        )
+        .await
+        .expect("inspect persisted publication");
+        assert_eq!(persisted.network.publish(), updated.network.publish());
+
+        let cleared = machine_handle(&runtime, machine.id)
+            .update(MachineUpdate::new().publish(None))
+            .await
+            .expect("clear guest publication");
+
+        assert!(cleared.network.publish().is_none());
+    }
+
+    #[tokio::test]
+    async fn update_rejects_guest_publication_when_network_is_disabled() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let runtime = Runtime::open(
+            LocalPaths::new(temp.path().join("silo")),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .expect("create runtime");
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+        machine_handle(&runtime, machine.id)
+            .set_network(|network| network.none())
+            .await
+            .expect("disable network");
+
+        let error = machine_handle(&runtime, machine.id)
+            .update(MachineUpdate::new().publish(Some(PublishBind::Loopback)))
+            .await
+            .expect_err("guest publication should require private network");
+
+        assert!(matches!(
+            error,
             LibVmError::InvalidMachineUpdate { ref reason, .. }
                 if reason.contains("machine networking is disabled")
         ));

@@ -20,7 +20,7 @@ use vz::{
 };
 
 use crate::virt::backend::VirtBackend;
-use crate::virt::capacity::{VsockCapacity, VsockLease};
+use crate::virt::capacity::{VsockLease, VsockListenerAdmission};
 use crate::virt::config::{validate_common, MachineIdentifier, NetworkMode, VmConfig};
 use crate::virt::error::VirtError;
 use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
@@ -42,6 +42,7 @@ pub(crate) struct VzBackend {
 struct VzMachineState {
     vm: Option<VirtualMachine>,
     serial_port: Option<SerialPortConfiguration>,
+    started: bool,
 }
 
 impl VzBackend {
@@ -52,6 +53,7 @@ impl VzBackend {
             inner: AsyncMutex::new(VzMachineState {
                 vm: None,
                 serial_port: None,
+                started: false,
             }),
             exit: Arc::new(Mutex::new(None)),
             exit_notify: Arc::new(Notify::new()),
@@ -89,13 +91,17 @@ impl VirtBackend for VzBackend {
     async fn start(&self) -> Result<(), VirtError> {
         validate_support()?;
         let mut state = self.inner.lock().await;
-        if state.vm.is_some() {
+        if state.started {
             return Err(VirtError::AlreadyRunning {
                 name: self.config.name().to_string(),
             });
         }
 
-        let (vm, serial_port) = build_vm(&self.config)?;
+        let (vm, serial_port) = match (state.vm.take(), state.serial_port.take()) {
+            (Some(vm), Some(serial_port)) => (vm, serial_port),
+            _ => build_vm(&self.config)?,
+        };
+        state.started = true;
         vm.set_delegate(ExitDelegate {
             exit: self.exit.clone(),
             notify: self.exit_notify.clone(),
@@ -245,17 +251,29 @@ impl VirtBackend for VzBackend {
     async fn listen_vsock(
         &self,
         port: u32,
-        capacity: VsockCapacity,
+        admission: VsockListenerAdmission,
     ) -> Result<VsockListener, VirtError> {
-        let vm = self.running_vm().await?;
+        let vm = {
+            let mut state = self.inner.lock().await;
+            if state.vm.is_none() {
+                let (vm, serial_port) = build_vm(&self.config)?;
+                state.vm = Some(vm);
+                state.serial_port = Some(serial_port);
+            }
+            state.vm.clone().ok_or_else(|| {
+                VirtError::Backend(
+                    "VZ machine preparation did not retain the virtual machine".to_string(),
+                )
+            })?
+        };
         let device = socket_device(&vm)?;
-        let admission_capacity = capacity.clone();
+        let listener_admission = admission.clone();
         let accepted_leases = Arc::new(Mutex::new(VecDeque::new()));
         let accepted_leases_out = accepted_leases.clone();
         let machine = self.config.name().to_string();
         let listener = device
             .listen(port, move |request| {
-                match admission_capacity.reserve() {
+                match listener_admission.reserve() {
                     Ok(lease) => {
                         accepted_leases_out
                             .lock()
@@ -273,7 +291,7 @@ impl VirtBackend for VzBackend {
         Ok(VsockListener::from_vz(
             listener,
             port,
-            capacity,
+            admission,
             accepted_leases,
         ))
     }

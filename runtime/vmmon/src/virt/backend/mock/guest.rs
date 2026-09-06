@@ -1,6 +1,7 @@
 //! The fake guest: in-process implementations of the gRPC services the real
 //! `silo-agent` serves over vsock, plus the process execution sandbox.
 
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -11,6 +12,7 @@ use futures::{stream, Stream};
 use prost_types::Timestamp;
 use protocol::v1::guest_agent_service_server::{GuestAgentService, GuestAgentServiceServer};
 use protocol::v1::guest_filesystem_service_server::GuestFilesystemServiceServer;
+use protocol::v1::guest_forward_service_server::{GuestForwardService, GuestForwardServiceServer};
 use protocol::v1::guest_process_service_server::{GuestProcessService, GuestProcessServiceServer};
 use protocol::v1::{
     guest_process_event, guest_process_input, AgentIdentity, AgentMetricReport, AgentMetrics,
@@ -18,11 +20,12 @@ use protocol::v1::{
     GetAgentStatusRequest, GuestBootMode, GuestBootReport, GuestProcessEvent, GuestProcessExited,
     GuestProcessInput, GuestProcessLaunchFailed, GuestProcessSignaled, GuestProcessStarted,
     GuestProcessStderr, GuestProcessStdout, GuestProcessTerminalOutput, LaunchFailureReason,
-    LoadAverageMetrics, MemoryMetrics, MetricSnapshot, SystemInfo, WatchAgentMetricsRequest,
-    WatchAgentStatusRequest,
+    ListenEvent, ListenRequest, ListenerBound, ListenerFailed, LoadAverageMetrics, MemoryMetrics,
+    MetricSnapshot, SystemInfo, WatchAgentMetricsRequest, WatchAgentStatusRequest,
 };
 use test_utils::Scenario;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -33,6 +36,7 @@ use uuid::Uuid;
 type StatusStream = Pin<Box<dyn Stream<Item = Result<AgentStatus, Status>> + Send + 'static>>;
 type MetricsStream = Pin<Box<dyn Stream<Item = Result<AgentMetrics, Status>> + Send + 'static>>;
 type EventStream = Pin<Box<dyn Stream<Item = Result<GuestProcessEvent, Status>> + Send + 'static>>;
+type ListenStream = Pin<Box<dyn Stream<Item = Result<ListenEvent, Status>> + Send + 'static>>;
 
 const MOCK_AGENT_VERSION: &str = "mock";
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(5);
@@ -147,19 +151,44 @@ impl MockGuest {
 }
 
 /// Assemble the tonic router serving the fake guest services.
-pub(crate) fn guest_router(guest: Arc<MockGuest>) -> Router {
+pub(crate) async fn guest_router(guest: Arc<MockGuest>) -> Router {
     let agent = AgentService {
         guest: guest.clone(),
     };
     let process = ProcessService {
         guest: guest.clone(),
     };
-    let filesystem = super::fs::MockFilesystemService::new(
+    let filesystem = crate::virt::backend::mock::fs::MockFilesystemService::new(
         guest.guest_root().to_path_buf(),
         guest.scenario.filesystem.clone(),
     );
+    let forward = (!guest.scenario.forward.unsupported).then(|| {
+        GuestForwardServiceServer::new(ForwardService {
+            guest: guest.clone(),
+        })
+    });
+
+    let (health, health_service) = tonic_health::server::health_reporter();
+    for service in [
+        "silo.v1.GuestAgentService",
+        "silo.v1.GuestFilesystemService",
+        "silo.v1.GuestProcessService",
+    ] {
+        health
+            .set_service_status(service, tonic_health::ServingStatus::Serving)
+            .await;
+    }
+    if !guest.scenario.forward.unsupported {
+        health
+            .set_service_status(
+                "silo.v1.GuestForwardService",
+                tonic_health::ServingStatus::Serving,
+            )
+            .await;
+    }
 
     tonic::transport::Server::builder()
+        .add_service(health_service)
         .add_service(
             GuestAgentServiceServer::new(agent)
                 .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
@@ -175,6 +204,175 @@ pub(crate) fn guest_router(guest: Arc<MockGuest>) -> Router {
                 .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
                 .max_encoding_message_size(protocol::STRUCTURED_16_MIB),
         )
+        .add_optional_service(forward)
+}
+
+#[derive(Clone)]
+struct ForwardService {
+    guest: Arc<MockGuest>,
+}
+
+#[tonic::async_trait]
+impl GuestForwardService for ForwardService {
+    type ListenStream = ListenStream;
+
+    async fn listen(
+        &self,
+        request: Request<ListenRequest>,
+    ) -> Result<Response<Self::ListenStream>, Status> {
+        let request = request.into_inner();
+        let token = forward_spec::Token::try_from(request.token.as_ref())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let address = request
+            .listen
+            .parse::<forward_spec::Address>()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if request.unix_mode.is_some_and(|mode| mode > 0o777)
+            || matches!(address, forward_spec::Address::Tcp(_)) && request.unix_mode.is_some()
+            || matches!(&address, forward_spec::Address::Unix(path) if !path.is_absolute())
+        {
+            return Err(Status::invalid_argument(
+                "invalid forward listen address or mode",
+            ));
+        }
+        let listener = match MockForwardListener::bind(address, request.unix_mode).await {
+            Ok(listener) => listener,
+            Err(_error) => {
+                let event = ListenEvent {
+                    event: Some(protocol::v1::listen_event::Event::Failed(ListenerFailed {
+                        error: Some(protocol::v1::ErrorDetail {
+                            code: Some(protocol::v1::ErrorCode::ForwardAddressInUse as i32),
+                            retry_after: None,
+                        }),
+                    })),
+                };
+                return Ok(Response::new(Box::pin(tokio_stream::iter([Ok(event)]))));
+            }
+        };
+        let bound = listener.address().to_string();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(Ok(ListenEvent {
+                event: Some(protocol::v1::listen_event::Event::Bound(ListenerBound {
+                    address: bound,
+                })),
+            }))
+            .await
+            .map_err(|_| Status::cancelled("forward listener cancelled"))?;
+        let return_path = self
+            .guest
+            .guest_root
+            .parent()
+            .ok_or_else(|| Status::internal("mock guest root has no parent"))?
+            .join(format!(".v_{}", forward_spec::FORWARD_VSOCK_PORT));
+        let mut generation = self.guest.stream_generation.subscribe();
+        tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = sender.closed() => break,
+                    _ = generation.changed() => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok(mut client) => {
+                            let return_path = return_path.clone();
+                            connections.spawn(async move {
+                                let setup = tokio::time::timeout(Duration::from_secs(5), async {
+                                    let mut remote = UnixStream::connect(return_path).await?;
+                                    remote.write_all(&forward_spec::encode_connect(&forward_spec::TargetLine::Token(token)).map_err(std::io::Error::other)?).await?;
+                                    let line = forward_spec::io::read_line(&mut remote, forward_spec::MAX_TARGET_LINE_BYTES)
+                                        .await
+                                        .map_err(std::io::Error::other)?;
+                                    if forward_spec::parse_reply(&line) != Ok(forward_spec::Reply::Ok) {
+                                        return Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "return port rejected token"));
+                                    }
+                                    Ok::<_, std::io::Error>(remote)
+                                }).await;
+                                if let Ok(Ok(mut remote)) = setup {
+                                    let _ = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
+                                }
+                            });
+                        }
+                        Err(_) => break,
+                    },
+                    completed = connections.join_next(), if !connections.is_empty() => {
+                        let _ = completed;
+                    }
+                }
+            }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+}
+
+enum MockForwardListener {
+    Tcp(TcpListener, std::net::SocketAddr),
+    Unix(UnixListener, MockUnixSocket),
+}
+
+struct MockUnixSocket(PathBuf);
+
+impl MockForwardListener {
+    async fn bind(address: forward_spec::Address, mode: Option<u32>) -> std::io::Result<Self> {
+        match address {
+            forward_spec::Address::Tcp(address) => {
+                let listener = TcpListener::bind(address).await?;
+                let bound = listener.local_addr()?;
+                Ok(Self::Tcp(listener, bound))
+            }
+            forward_spec::Address::Unix(path) => {
+                match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.file_type().is_socket() => {
+                        std::fs::remove_file(&path)?
+                    }
+                    Ok(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "Unix listen path exists and is not a socket",
+                        ))
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                let listener = UnixListener::bind(&path)?;
+                std::fs::set_permissions(
+                    &path,
+                    std::fs::Permissions::from_mode(mode.unwrap_or(0o600)),
+                )?;
+                Ok(Self::Unix(listener, MockUnixSocket(path)))
+            }
+        }
+    }
+
+    fn address(&self) -> forward_spec::Address {
+        match self {
+            Self::Tcp(_, address) => forward_spec::Address::Tcp(*address),
+            Self::Unix(_, socket) => forward_spec::Address::Unix(socket.0.clone()),
+        }
+    }
+
+    async fn accept(&self) -> std::io::Result<Box<dyn MockForwardStream>> {
+        match self {
+            Self::Tcp(listener, _) => listener
+                .accept()
+                .await
+                .map(|(stream, _)| Box::new(stream) as Box<dyn MockForwardStream>),
+            Self::Unix(listener, _) => listener
+                .accept()
+                .await
+                .map(|(stream, _)| Box::new(stream) as Box<dyn MockForwardStream>),
+        }
+    }
+}
+
+trait MockForwardStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T> MockForwardStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+impl Drop for MockUnixSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn now() -> Timestamp {

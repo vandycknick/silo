@@ -565,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_returns_exact_bytes_and_stopped_missing_log_is_empty() {
         let (_temp, runtime, machine, id) =
-            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+            test_machine(StoredMachineNetworkConfig::default()).await;
         let path = runtime.machine_paths(id).vm_trace_log_path();
         write_log(&path, b"first\0line\n");
 
@@ -614,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn missing_log_snapshot_does_not_create_the_log_tree() {
         let (_temp, runtime, machine, id) =
-            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+            test_machine(StoredMachineNetworkConfig::default()).await;
         let log_dir = runtime.machine_paths(id).machine_logs_dir().to_path_buf();
         assert!(!log_dir.exists());
 
@@ -633,7 +633,7 @@ mod tests {
     #[tokio::test]
     async fn follow_waits_for_initial_file_then_reads_it() {
         let (_temp, runtime, machine, id) =
-            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+            test_machine(StoredMachineNetworkConfig::default()).await;
         let path = runtime.machine_paths(id).serial_log_path();
         let mut stream = machine
             .logs(MachineLogSource::Serial, MachineLogOptions { follow: true })
@@ -652,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn follow_has_no_snapshot_to_append_gap() {
         let (_temp, runtime, machine, id) =
-            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+            test_machine(StoredMachineNetworkConfig::default()).await;
         let path = runtime.machine_paths(id).vm_trace_log_path();
         write_log(&path, b"before-");
 
@@ -678,7 +678,7 @@ mod tests {
     #[tokio::test]
     async fn exec_snapshot_reads_archives_before_the_active_log() {
         let (_temp, runtime, machine, id) =
-            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+            test_machine(StoredMachineNetworkConfig::default()).await;
         let paths = runtime.machine_paths(id);
         write_log(&paths.exec_log_archive_path(3), b"three\n");
         write_log(&paths.exec_log_archive_path(2), b"two\n");
@@ -699,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn exec_follow_switches_to_a_rotated_active_file() {
         let (_temp, runtime, machine, id) =
-            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+            test_machine(StoredMachineNetworkConfig::default()).await;
         let path = runtime.machine_paths(id).exec_log_path();
         write_log(&path, b"old\n");
         let mut stream = machine
@@ -717,7 +717,7 @@ mod tests {
     #[tokio::test]
     async fn exec_follow_drains_bytes_appended_immediately_before_rotation() {
         let (_temp, runtime, machine, id) =
-            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+            test_machine(StoredMachineNetworkConfig::default()).await;
         let path = runtime.machine_paths(id).exec_log_path();
         write_log(&path, b"old\n");
         let mut stream = machine
@@ -748,7 +748,7 @@ mod tests {
     #[tokio::test]
     async fn exec_follow_reads_intermediate_archives_after_multiple_rotations() {
         let (_temp, runtime, machine, id) =
-            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+            test_machine(StoredMachineNetworkConfig::default()).await;
         let paths = runtime.machine_paths(id);
         let active = paths.exec_log_path();
         write_log(&active, b"a\n");
@@ -777,7 +777,7 @@ mod tests {
     #[tokio::test]
     async fn exec_follow_discovers_archives_created_before_the_active_log() {
         let (_temp, runtime, machine, id) =
-            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+            test_machine(StoredMachineNetworkConfig::default()).await;
         let paths = runtime.machine_paths(id);
         let mut stream = machine
             .logs(MachineLogSource::Exec, MachineLogOptions { follow: true })
@@ -800,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn follow_continues_across_a_replacement_generation() {
         let (_temp, runtime, machine, id) =
-            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+            test_machine(StoredMachineNetworkConfig::default()).await;
         let path = runtime.machine_paths(id).vm_trace_log_path();
         write_log(&path, b"old");
         let mut old = spawn_producer();
@@ -862,7 +862,7 @@ mod tests {
     #[tokio::test]
     async fn unsafe_log_objects_are_rejected() {
         let (_temp, runtime, machine, id) =
-            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+            test_machine(StoredMachineNetworkConfig::default()).await;
         let path = runtime.machine_paths(id).vm_trace_log_path();
         std::fs::create_dir_all(path.parent().expect("log parent")).expect("create log parent");
 
@@ -894,7 +894,7 @@ mod tests {
     #[tokio::test]
     async fn log_directory_symlinks_are_rejected_without_following_them() {
         let (temp, runtime, machine, id) =
-            test_machine(StoredMachineNetworkConfig::Private { policy: None }).await;
+            test_machine(StoredMachineNetworkConfig::default()).await;
         let state_root = runtime.local_paths().roots().state_root().to_path_buf();
         let external = temp.path().join("external");
         std::fs::create_dir(&external).expect("create external directory");

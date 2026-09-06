@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use eyre::Context as _;
 use libvm::{
     ExecutionControl, ExecutionEvent, ExecutionOptionsBuilder, ExecutionResult, ExecutionSession,
-    Machine, ProcessConfig, SshExitStatus,
+    Machine, MachineData, ProcessConfig, SshExitStatus,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -25,6 +25,29 @@ pub(crate) async fn attach_shell(
         })
         .await
         .map_err(Into::into)
+}
+
+pub(crate) fn ensure_running(data: &MachineData) -> eyre::Result<()> {
+    if data.is_running() {
+        return Ok(());
+    }
+    Err(eyre::eyre!(
+        "machine `{}` is not running; start it with `silo start {}`",
+        data.name,
+        data.name
+    ))
+}
+
+pub(crate) fn ensure_guest_ready(data: &MachineData) -> eyre::Result<()> {
+    if data.status.guest_ready() {
+        return Ok(());
+    }
+    let summary = data
+        .status
+        .message()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("machine state is {}", data.status.label()));
+    eyre::bail!("guest service is not ready: {summary}")
 }
 
 pub(crate) async fn run_command_streaming(
@@ -97,7 +120,7 @@ async fn stream_events(session: &mut ExecutionSession) -> eyre::Result<Execution
     let mut stdin_closed = false;
     let mut started = false;
     let mut launch_cancelled = false;
-    let mut signals = HostSignalForwarders::new()?;
+    let mut signals = HostSignals::forwardable()?;
     loop {
         let event = tokio::select! {
             event = session.recv() => event?,
@@ -160,16 +183,16 @@ async fn stream_events(session: &mut ExecutionSession) -> eyre::Result<Execution
     eyre::bail!("guest command ended without a terminal result")
 }
 
-struct HostSignalForwarders {
+pub(crate) struct HostSignals {
     receiver: mpsc::Receiver<u32>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-impl HostSignalForwarders {
-    fn new() -> eyre::Result<Self> {
+impl HostSignals {
+    fn new(signals: impl IntoIterator<Item = u32>) -> eyre::Result<Self> {
         let (sender, receiver) = mpsc::channel(64);
         let mut tasks = Vec::new();
-        for signal in forwardable_signals() {
+        for signal in signals {
             let Ok(mut listener) = tokio::signal::unix::signal(
                 tokio::signal::unix::SignalKind::from_raw(signal as i32),
             ) else {
@@ -191,12 +214,20 @@ impl HostSignalForwarders {
         Ok(Self { receiver, tasks })
     }
 
-    async fn recv(&mut self) -> Option<u32> {
+    fn forwardable() -> eyre::Result<Self> {
+        Self::new(forwardable_signals())
+    }
+
+    pub(crate) fn termination() -> eyre::Result<Self> {
+        Self::new([libc::SIGINT as u32, libc::SIGTERM as u32])
+    }
+
+    pub(crate) async fn recv(&mut self) -> Option<u32> {
         self.receiver.recv().await
     }
 }
 
-impl Drop for HostSignalForwarders {
+impl Drop for HostSignals {
     fn drop(&mut self) {
         for task in &self.tasks {
             task.abort();

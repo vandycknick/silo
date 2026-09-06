@@ -11,6 +11,7 @@ const RUST_PRODUCT_MANIFESTS: &[&str] = &[
     "virt/krun/Cargo.toml",
     "guest/agent/Cargo.toml",
     "guest/init/Cargo.toml",
+    "guest/portd/Cargo.toml",
     "sdk/node/Cargo.toml",
     "sdk/go/native/Cargo.toml",
 ];

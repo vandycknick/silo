@@ -35,32 +35,33 @@ type Logger struct {
 }
 
 type Event struct {
-	Version      int         `json:"version"`
-	Phase        string      `json:"phase"`
-	Family       string      `json:"family"`
-	Timestamp    time.Time   `json:"timestamp"`
-	PolicyHash   string      `json:"policy_hash,omitempty"`
-	VMID         string      `json:"vm_id,omitempty"`
-	RunID        string      `json:"run_id,omitempty"`
-	NetworkID    string      `json:"network_id,omitempty"`
-	FlowID       string      `json:"flow_id,omitempty"`
-	ParentFlowID string      `json:"parent_flow_id,omitempty"`
-	RequestID    string      `json:"request_id,omitempty"`
-	Direction    string      `json:"direction,omitempty"`
-	Protocol     string      `json:"protocol,omitempty"`
-	IPVersion    string      `json:"ip_version,omitempty"`
-	SourceIP     string      `json:"source_ip,omitempty"`
-	SourcePort   uint16      `json:"source_port,omitempty"`
-	DestIP       string      `json:"destination_ip,omitempty"`
-	DestPort     uint16      `json:"destination_port,omitempty"`
-	Policy       *Policy     `json:"policy,omitempty"`
-	HTTP         *HTTP       `json:"http,omitempty"`
-	Package      *Package    `json:"package,omitempty"`
-	Credential   *Credential `json:"credential,omitempty"`
-	Tunnel       *Tunnel     `json:"tunnel,omitempty"`
-	Error        *AuditError `json:"error,omitempty"`
-	Verdict      string      `json:"verdict"`
-	Reason       string      `json:"reason,omitempty"`
+	Version      int          `json:"version"`
+	Phase        string       `json:"phase"`
+	Family       string       `json:"family"`
+	Timestamp    time.Time    `json:"timestamp"`
+	PolicyHash   string       `json:"policy_hash,omitempty"`
+	VMID         string       `json:"vm_id,omitempty"`
+	RunID        string       `json:"run_id,omitempty"`
+	NetworkID    string       `json:"network_id,omitempty"`
+	FlowID       string       `json:"flow_id,omitempty"`
+	ParentFlowID string       `json:"parent_flow_id,omitempty"`
+	RequestID    string       `json:"request_id,omitempty"`
+	Direction    string       `json:"direction,omitempty"`
+	Protocol     string       `json:"protocol,omitempty"`
+	IPVersion    string       `json:"ip_version,omitempty"`
+	SourceIP     string       `json:"source_ip,omitempty"`
+	SourcePort   uint16       `json:"source_port,omitempty"`
+	DestIP       string       `json:"destination_ip,omitempty"`
+	DestPort     uint16       `json:"destination_port,omitempty"`
+	Policy       *Policy      `json:"policy,omitempty"`
+	HTTP         *HTTP        `json:"http,omitempty"`
+	Package      *Package     `json:"package,omitempty"`
+	Credential   *Credential  `json:"credential,omitempty"`
+	Tunnel       *Tunnel      `json:"tunnel,omitempty"`
+	Publication  *Publication `json:"publication,omitempty"`
+	Error        *AuditError  `json:"error,omitempty"`
+	Verdict      string       `json:"verdict"`
+	Reason       string       `json:"reason,omitempty"`
 }
 
 type Policy struct {
@@ -112,6 +113,12 @@ type Credential struct {
 type Tunnel struct {
 	Kind string `json:"kind,omitempty"`
 	Name string `json:"name,omitempty"`
+}
+
+type Publication struct {
+	Scope  string `json:"scope"`
+	Local  string `json:"local"`
+	Remote string `json:"remote"`
 }
 
 type AuditError struct {
@@ -177,6 +184,22 @@ func (l *Logger) RecordGenerationBoundary(phase, vmID, runID, networkID string) 
 		VMID:      vmID,
 		RunID:     runID,
 		NetworkID: networkID,
+	})
+}
+
+func (l *Logger) RecordPublication(phase, scope, local, remote, verdict, reason string) {
+	if l == nil {
+		return
+	}
+	l.emit(Event{
+		Version:     1,
+		Phase:       phase,
+		Family:      "publication",
+		Timestamp:   time.Now().UTC(),
+		PolicyHash:  l.policyHash,
+		Publication: &Publication{Scope: scope, Local: local, Remote: remote},
+		Verdict:     verdict,
+		Reason:      reason,
 	})
 }
 

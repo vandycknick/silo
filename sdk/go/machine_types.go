@@ -124,6 +124,25 @@ type MachineRootFS struct {
 	CreatedAt              time.Time
 }
 
+// ForwardEndpoint is host:ADDRESS, guest:ADDRESS, or vsock:PORT.
+// ADDRESS is tcp:[IP:]PORT or unix:PATH. The native layer validates the grammar.
+type ForwardEndpoint string
+
+// Forward is a machine-scoped stream forward, independent of networking.
+type Forward struct {
+	Name    string          `json:"name,omitempty"`
+	Listen  ForwardEndpoint `json:"listen"`
+	Connect ForwardEndpoint `json:"connect"`
+	// Mode is a four-digit octal permission string for Unix listeners, default 0600.
+	Mode string `json:"mode,omitempty"`
+}
+
+// VsockConfig describes the public hybrid vsock surface. An empty UDS uses the default filename.
+type VsockConfig struct {
+	Enabled bool   `json:"enabled"`
+	UDS     string `json:"uds,omitempty"`
+}
+
 type MachineData struct {
 	ID              string
 	Name            string
@@ -139,6 +158,8 @@ type MachineData struct {
 	RootDiskSize    *ByteSize
 	Labels          map[string]string
 	Metadata        map[string]string
+	Forwards        []Forward
+	Vsock           *VsockConfig
 	Network         MachineNetwork
 	Agent           MachineAgent
 	Status          MachineStatus

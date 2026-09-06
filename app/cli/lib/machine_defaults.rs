@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use eyre::bail;
-use libvm::{MachineNetworkBuilder, NetworkPolicy};
+use libvm::{MachineNetworkBuilder, NetworkPolicy, PublishBind};
 use serde::{Deserialize, Serialize};
 use utils::HumanSize;
 use vm_spec::Mount;
@@ -44,6 +44,8 @@ struct MachineNetworkConfig {
     policy: Option<serde_yaml_ng::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publish: Option<PublishBind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +62,8 @@ pub(crate) enum MachineNetwork {
     Private {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        publish: Option<PublishBind>,
     },
     None,
     Named {
@@ -94,7 +98,10 @@ impl MachineNetworkSelection {
 
     pub(crate) fn into_machine_network(self) -> MachineNetwork {
         match self {
-            Self::Private => MachineNetwork::Private { policy_ref: None },
+            Self::Private => MachineNetwork::Private {
+                policy_ref: None,
+                publish: None,
+            },
             Self::None => MachineNetwork::None,
             Self::Named { name } => MachineNetwork::Named { name },
         }
@@ -115,18 +122,28 @@ impl MachineNetworkSelection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedMachineNetwork {
-    Private { policy: Option<NetworkPolicy> },
+    Private {
+        policy: Option<NetworkPolicy>,
+        publish: Option<PublishBind>,
+    },
     None,
-    Named { name: String },
+    Named {
+        name: String,
+    },
 }
 
 impl ResolvedMachineNetwork {
     pub(crate) fn apply(self, builder: MachineNetworkBuilder) -> MachineNetworkBuilder {
         match self {
-            Self::Private { policy } => {
+            Self::Private { policy, publish } => {
                 let builder = builder.private();
-                if let Some(policy) = policy {
+                let builder = if let Some(policy) = policy {
                     builder.policy(policy)
+                } else {
+                    builder
+                };
+                if let Some(bind) = publish {
+                    builder.publish(bind)
                 } else {
                     builder
                 }
@@ -139,14 +156,20 @@ impl ResolvedMachineNetwork {
 
 impl Default for ResolvedMachineNetwork {
     fn default() -> Self {
-        Self::Private { policy: None }
+        Self::Private {
+            policy: None,
+            publish: None,
+        }
     }
 }
 
 impl From<MachineNetworkSelection> for ResolvedMachineNetwork {
     fn from(selection: MachineNetworkSelection) -> Self {
         match selection {
-            MachineNetworkSelection::Private => Self::Private { policy: None },
+            MachineNetworkSelection::Private => Self::Private {
+                policy: None,
+                publish: None,
+            },
             MachineNetworkSelection::None => Self::None,
             MachineNetworkSelection::Named { name } => Self::Named { name },
         }
@@ -159,12 +182,15 @@ impl MachineNetwork {
         policy_config_dir: Option<&Path>,
     ) -> eyre::Result<ResolvedMachineNetwork> {
         match self {
-            Self::Private { policy_ref } => {
+            Self::Private {
+                policy_ref,
+                publish,
+            } => {
                 let policy = policy_ref
                     .as_deref()
                     .map(|source| resolve_network_policy_source(source, policy_config_dir))
                     .transpose()?;
-                Ok(ResolvedMachineNetwork::Private { policy })
+                Ok(ResolvedMachineNetwork::Private { policy, publish })
             }
             Self::None => Ok(ResolvedMachineNetwork::None),
             Self::Named { name } => Ok(ResolvedMachineNetwork::Named { name }),
@@ -279,7 +305,14 @@ fn normalize_network(raw: MachineNetworkConfig) -> eyre::Result<MachineNetwork> 
             "invalid network config: inline network.policy is no longer supported; use policy_ref"
         );
     }
-    match (raw.kind, raw.name, raw.policy_ref) {
+    let MachineNetworkConfig {
+        kind,
+        name,
+        policy: _,
+        policy_ref,
+        publish,
+    } = raw;
+    match (kind, name, policy_ref) {
         (Some(MachineNetworkKind::Private), Some(name), _) => bail!(
             "invalid network config: kind \"private\" cannot be combined with name {:?}",
             name
@@ -291,26 +324,40 @@ fn normalize_network(raw: MachineNetworkConfig) -> eyre::Result<MachineNetwork> 
         (Some(MachineNetworkKind::Named), None, _) => {
             bail!("invalid network config: kind \"named\" requires field \"name\"")
         }
-        (Some(MachineNetworkKind::Private), None, policy_ref) => {
-            Ok(MachineNetwork::Private { policy_ref })
+        (Some(MachineNetworkKind::Private), None, policy_ref) => Ok(MachineNetwork::Private {
+            policy_ref,
+            publish,
+        }),
+        (Some(MachineNetworkKind::None), None, None) if publish.is_none() => {
+            Ok(MachineNetwork::None)
         }
-        (Some(MachineNetworkKind::None), None, None) => Ok(MachineNetwork::None),
         (Some(MachineNetworkKind::None), None, Some(_)) => {
             bail!("invalid network config: kind \"none\" cannot be combined with policy_ref")
         }
-        (Some(MachineNetworkKind::Named), Some(name), None) | (None, Some(name), None) => {
+        (Some(MachineNetworkKind::Named), Some(name), None) | (None, Some(name), None)
+            if publish.is_none() =>
+        {
             Ok(MachineNetwork::Named { name })
         }
         (Some(MachineNetworkKind::Named), Some(_), Some(_)) | (None, Some(_), Some(_)) => {
             bail!("invalid network config: named networks do not support policy_ref")
         }
-        (None, None, policy_ref) => Ok(MachineNetwork::Private { policy_ref }),
+        (Some(MachineNetworkKind::None), None, None) => {
+            bail!("invalid network config: guest publication requires kind \"private\"")
+        }
+        (Some(MachineNetworkKind::Named), Some(_), None) | (None, Some(_), None) => {
+            bail!("invalid network config: guest publication requires kind \"private\"")
+        }
+        (None, None, policy_ref) => Ok(MachineNetwork::Private {
+            policy_ref,
+            publish,
+        }),
     }
 }
 
 fn validate_machine_network(network: &MachineNetwork) -> eyre::Result<()> {
     match network {
-        MachineNetwork::Private { policy_ref } => {
+        MachineNetwork::Private { policy_ref, .. } => {
             if policy_ref
                 .as_deref()
                 .is_some_and(|policy_ref| policy_ref.trim().is_empty())

@@ -7,6 +7,7 @@ members = [
     "common/utils",
     "guest/agent",
     "guest/init",
+    "guest/portd",
     "runtime/oci",
     "runtime/libvm",
     "runtime/test-utils",
@@ -17,6 +18,7 @@ members = [
     "virt/vhost-vsock",
     "virt/vz",
     "specs/agent-spec",
+    "specs/forward-spec",
     "specs/protocol",
     "specs/vm-spec",
 ]

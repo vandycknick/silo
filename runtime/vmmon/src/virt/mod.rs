@@ -19,7 +19,7 @@
 #![allow(unused_imports)]
 
 mod backend;
-mod capacity;
+pub(crate) mod capacity;
 mod config;
 mod error;
 mod machine;

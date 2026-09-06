@@ -5,7 +5,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use tokio::sync::Semaphore;
 use tokio::task::{AbortHandle, JoinHandle};
-use tokio_vsock::{VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY};
+use tokio_vsock::{VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY, VMADDR_CID_HOST};
 use tracing::{Instrument, Span};
 
 pub struct RunningServer {
@@ -71,7 +71,7 @@ where
 
                 loop {
                     match incoming.next().await {
-                        Some(Ok(stream)) => {
+                        Some(Ok(stream)) if stream.peer_addr().is_ok_and(|peer| peer.cid() == VMADDR_CID_HOST) => {
                             let permit = match Arc::clone(&semaphore).acquire_owned().await {
                                 Ok(permit) => permit,
                                 Err(err) => {
@@ -87,6 +87,9 @@ where
                                     tracing::error!(error = %err, "connection handler failed");
                                 }
                             });
+                        }
+                        Some(Ok(stream)) => {
+                            tracing::warn!(peer = ?stream.peer_addr().ok(), "rejected non-host vsock peer");
                         }
                         Some(Err(err)) => {
                             tracing::warn!(error = %err, "accept failed");

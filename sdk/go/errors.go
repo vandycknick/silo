@@ -55,6 +55,7 @@ const (
 	ErrorBootAssetInvalid            ErrorKind = "BootAssetInvalid"
 	ErrorInvalidCreateRequest        ErrorKind = "InvalidCreateRequest"
 	ErrorInvalidMachineUpdate        ErrorKind = "InvalidMachineUpdate"
+	ErrorInvalidMachineConfig        ErrorKind = "InvalidMachineConfig"
 	ErrorUnsupportedHostArchitecture ErrorKind = "UnsupportedHostArchitecture"
 	ErrorCorruptState                ErrorKind = "CorruptState"
 	ErrorVMSpecSerializeFailed       ErrorKind = "VmSpecSerializeFailed"

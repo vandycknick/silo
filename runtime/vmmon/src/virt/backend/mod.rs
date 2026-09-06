@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::virt::capacity::{VsockCapacity, VsockLease};
+use crate::virt::capacity::{VsockLease, VsockListenerAdmission};
 use crate::virt::config::VmConfig;
 use crate::virt::error::VirtError;
 use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
@@ -58,7 +58,7 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
     async fn listen_vsock(
         &self,
         port: u32,
-        capacity: VsockCapacity,
+        admission: VsockListenerAdmission,
     ) -> Result<VsockListener, VirtError>;
 
     /// Open the guest serial device. Called once per boot by the serial console.

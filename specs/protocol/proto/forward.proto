@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package silo.v1;
+
+import "errors.proto";
+
+// Wire compatibility follows ADR 0008: existing field numbers and meanings
+// must not change, and removed fields must reserve their numbers and names.
+
+// Guest side, served by the agent on vsock port 1027.
+service GuestForwardService {
+  // Bind a guest listener and return accepted connections through vsock port
+  // 1028. The listener exists while this stream is open.
+  rpc Listen(ListenRequest) returns (stream ListenEvent);
+}
+
+message ListenRequest {
+  // Guest address in the endpoint grammar without the side prefix.
+  string listen = 1;
+  // 16 random bytes issued by vmmon and presented on the return port as hex.
+  bytes token = 2;
+  // Permission bits for a Unix listener. Defaults to 0600.
+  optional uint32 unix_mode = 3;
+}
+
+message ListenEvent {
+  oneof event {
+    ListenerBound bound = 1;
+    ListenerFailed failed = 2;
+  }
+}
+
+message ListenerBound {
+  // Actual address, with port 0 resolved.
+  string address = 1;
+}
+
+message ListenerFailed {
+  ErrorDetail error = 1;
+}
+
+// Host side, served by vmmon on vm.sock.
+service VmForwardService {
+  // Open a session-scoped forward that exists while this stream is open.
+  rpc Open(OpenForwardRequest) returns (stream ForwardStatus);
+  // Return the status of every machine- and session-scoped forward.
+  rpc List(ListForwardsRequest) returns (ListForwardsResponse);
+}
+
+message Forward {
+  optional string name = 1;
+  string listen = 2;
+  string connect = 3;
+  optional uint32 unix_mode = 4;
+}
+
+message OpenForwardRequest {
+  Forward forward = 1;
+}
+
+message ListForwardsRequest {}
+
+message ListForwardsResponse {
+  repeated ForwardStatus forwards = 1;
+}
+
+enum ForwardDirection {
+  FORWARD_DIRECTION_UNSPECIFIED = 0;
+  FORWARD_DIRECTION_INBOUND = 1;
+  FORWARD_DIRECTION_OUTBOUND = 2;
+}
+
+enum ForwardScope {
+  FORWARD_SCOPE_UNSPECIFIED = 0;
+  FORWARD_SCOPE_MACHINE = 1;
+  FORWARD_SCOPE_SESSION = 2;
+}
+
+enum ForwardState {
+  FORWARD_STATE_UNSPECIFIED = 0;
+  FORWARD_STATE_PENDING = 1;
+  FORWARD_STATE_ACTIVE = 2;
+  FORWARD_STATE_UNSUPPORTED = 3;
+  FORWARD_STATE_CLOSED = 4;
+}
+
+message ForwardStatus {
+  Forward forward = 1;
+  optional ForwardDirection direction = 2;
+  optional ForwardScope scope = 3;
+  optional ForwardState state = 4;
+  // Actual listen endpoint after binding.
+  optional string bound = 5;
+  optional uint32 active_connections = 6;
+  optional uint32 refused_connections = 7;
+  // Present for unsupported forwards and connection refusals.
+  ErrorDetail error = 8;
+}

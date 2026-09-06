@@ -26,6 +26,7 @@ var nativeErrorKinds = map[string]ErrorKind{
 	"RuntimeComponentInvalid": ErrorRuntimeComponentInvalid, "RuntimeComponentsNotFound": ErrorRuntimeComponentsNotFound,
 	"BootAssetNotFound": ErrorBootAssetNotFound, "BootAssetInvalid": ErrorBootAssetInvalid,
 	"InvalidCreateRequest": ErrorInvalidCreateRequest, "InvalidMachineUpdate": ErrorInvalidMachineUpdate,
+	"InvalidMachineConfig":        ErrorInvalidMachineConfig,
 	"UnsupportedHostArchitecture": ErrorUnsupportedHostArchitecture, "CorruptState": ErrorCorruptState,
 	"VmSpecSerializeFailed": ErrorVMSpecSerializeFailed, "VmSpecLoadFailed": ErrorVMSpecLoadFailed,
 	"AmbiguousIdPrefix": ErrorAmbiguousIDPrefix, "StateDecode": ErrorStateDecode,

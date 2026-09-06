@@ -20,7 +20,10 @@ pub(crate) fn scan(
         let Some(port) = listener_port(mux_filename, &entry.file_name()) else {
             continue;
         };
-        if port == protocol::DEFAULT_GUEST_CONTROL_PORT {
+        if matches!(
+            port,
+            protocol::DEFAULT_GUEST_CONTROL_PORT | protocol::FORWARD_VSOCK_PORT
+        ) {
             continue;
         }
         let metadata = match std::fs::symlink_metadata(entry.path()) {
@@ -122,7 +125,12 @@ mod tests {
     async fn scan_returns_only_real_canonical_sockets_in_port_order() {
         let dir = temp_dir();
         let mut sockets = Vec::new();
-        for port in [5000, 22, protocol::DEFAULT_GUEST_CONTROL_PORT] {
+        for port in [
+            5000,
+            22,
+            protocol::DEFAULT_GUEST_CONTROL_PORT,
+            protocol::FORWARD_VSOCK_PORT,
+        ] {
             sockets.push(
                 UnixListener::bind(dir.join(format!("vsock.sock_{port}")))
                     .expect("bind listener socket"),

@@ -26,6 +26,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 pub(crate) async fn spawn_guest_services(
     machine: &VirtualMachine,
     store: Arc<InstanceStore>,
+    forwards: Arc<crate::forward::ForwardTable>,
     shutdown: CancellationToken,
 ) -> eyre::Result<JoinHandle<()>> {
     tracing::info!(
@@ -35,8 +36,13 @@ pub(crate) async fn spawn_guest_services(
     let machine = machine.clone();
     Ok(tokio::spawn(async move {
         let status = supervise_status(machine.clone(), store.clone(), shutdown.clone());
-        let metrics = supervise_metrics(machine, store, shutdown);
+        let metrics = supervise_metrics(machine.clone(), store.clone(), shutdown.clone());
+        let capability =
+            crate::forward::spawn_capability_supervisor(machine, store, forwards, shutdown);
         tokio::join!(status, metrics);
+        if let Err(error) = capability.await {
+            tracing::warn!(%error, "guest forward capability supervisor failed");
+        }
     }))
 }
 
@@ -385,7 +391,7 @@ async fn retry_sleep(shutdown: &CancellationToken, plan: RetryPlan, stream: &'st
     tokio::select! { _ = shutdown.cancelled() => false, _ = tokio::time::sleep(sleep) => true }
 }
 
-async fn connect(machine: &VirtualMachine) -> Result<Channel, tonic::Status> {
+pub(crate) async fn connect(machine: &VirtualMachine) -> Result<Channel, tonic::Status> {
     let machine = machine.clone();
     Endpoint::from_static("http://guest-agent.invalid")
         .connect_timeout(Duration::from_secs(5))
