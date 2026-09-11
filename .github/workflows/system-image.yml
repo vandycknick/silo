@@ -79,7 +79,7 @@ jobs:
 
       - name: Build native image archive
         run: >-
-          nix develop .#ci --command make -C resources/images/system archive
+          nix develop --command make -C resources/images/system archive
           ARCH=${{ matrix.arch }}
           IMAGE=system-candidate:${{ github.sha }}-${{ matrix.arch }}
           SOURCE_REVISION=${{ github.sha }}
@@ -189,15 +189,15 @@ jobs:
       - name: Log in to candidate registry
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: printf '%s' "$GHCR_TOKEN" | nix develop .#ci --command docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+        run: printf '%s' "$GHCR_TOKEN" | nix develop --command docker login ghcr.io --username "${{ github.actor }}" --password-stdin
 
       - name: Build matching Silo runtime
-        run: nix develop .#ci --command make build PROFILE=release
+        run: nix develop --command make build PROFILE=release
 
       - name: Qualify boot, Docker, shutdown, and persistence
         env:
           SILO_BIN: target/release/silo
-        run: DOCKER_CONFIG="$HOME/.docker" nix develop .#ci --command resources/images/system/qualify.sh "${{ needs.push-candidates.outputs.reference }}"
+        run: DOCKER_CONFIG="$HOME/.docker" nix develop --command resources/images/system/qualify.sh "${{ needs.push-candidates.outputs.reference }}"
 
   publish:
     name: publish qualified index
