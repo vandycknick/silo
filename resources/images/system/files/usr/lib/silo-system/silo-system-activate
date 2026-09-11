@@ -1,0 +1,170 @@
+#!/bin/sh
+set -eu
+
+MANIFEST=/usr/lib/silo-system/manifest.json
+REQUEST=/run/silo-system/activation.json
+DATA_ROOT=/var/lib/silo-data
+MAX_REQUEST_BYTES=65536
+
+fail() {
+    printf 'silo-system-activate: %s\n' "$*" >&2
+    exit 1
+}
+
+require_manifest() {
+    jq --exit-status --from-file /usr/lib/silo-system/image-manifest.jq "$MANIFEST" \
+        >/dev/null 2>&1 || fail "invalid image manifest"
+    case "$(uname -m):$(jq -r .architecture "$MANIFEST")" in
+        x86_64:amd64|aarch64:arm64) ;;
+        *) fail "image architecture does not match the guest" ;;
+    esac
+}
+
+require_request() {
+    jq --exit-status --from-file /usr/lib/silo-system/activation-request.jq "$REQUEST" \
+        >/dev/null 2>&1 || fail "invalid activation request"
+}
+
+require_cgroup_v2() {
+    [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = cgroup2fs ] || fail "cgroup v2 is not mounted"
+    controllers=$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null) || fail "cannot read cgroup v2 controllers"
+    for controller in cpu cpuset io memory pids; do
+        case " $controllers " in
+            *" $controller "*) ;;
+            *) fail "cgroup v2 controller is unavailable: $controller" ;;
+        esac
+    done
+}
+
+require_network() {
+    ip route show default | grep -q . || fail "guest default route is unavailable"
+    getent ahostsv4 gateway.containers.internal >/dev/null 2>&1 \
+        || fail "guest DNS cannot resolve the Silo gateway"
+}
+
+require_shares() {
+    jq -c '.required_shares[]' "$REQUEST" |
+    while IFS= read -r share; do
+        path=$(printf '%s' "$share" | jq -r .path)
+        tag=$(printf '%s' "$share" | jq -r .tag)
+        writable=$(printf '%s' "$share" | jq -r .writable)
+        target=$(findmnt --noheadings --output TARGET --target "$path" 2>/dev/null) \
+            || fail "required share is not mounted: $path"
+        fstype=$(findmnt --noheadings --output FSTYPE --target "$path")
+        source=$(findmnt --noheadings --output SOURCE --target "$path")
+        options=$(findmnt --noheadings --output OPTIONS --target "$path")
+        [ "$target" = "$path" ] || fail "required share path is not its mountpoint: $path"
+        [ "$fstype" = virtiofs ] || fail "required share is not virtiofs: $path"
+        [ "$source" = "$tag" ] || fail "required share tag mismatch: $path"
+        if [ "$writable" = true ]; then
+            case ",$options," in
+                *,rw,*) ;;
+                *) fail "required share is not writable: $path" ;;
+            esac
+        fi
+    done
+}
+
+require_data_mount() {
+    expected_uuid=$(jq -r .data_uuid "$REQUEST")
+    actual_uuid=$(findmnt --noheadings --output UUID --target "$DATA_ROOT" 2>/dev/null) \
+        || fail "data volume is not mounted"
+    [ "$(printf '%s' "$actual_uuid" | tr 'A-F' 'a-f')" = "$(printf '%s' "$expected_uuid" | tr 'A-F' 'a-f')" ] \
+        || fail "mounted data UUID does not match activation request"
+    [ "$(findmnt --noheadings --output FSTYPE --target "$DATA_ROOT")" = ext4 ] \
+        || fail "data volume is not ext4"
+    jq --exit-status --arg uuid "$expected_uuid" \
+        --from-file /usr/lib/silo-system/data-layout.jq "$DATA_ROOT/layout.json" \
+        >/dev/null 2>&1 || fail "invalid data-layout marker"
+    [ -d "$DATA_ROOT/docker" ] || fail "Docker data directory is missing"
+    [ -d "$DATA_ROOT/containerd" ] || fail "containerd data directory is missing"
+}
+
+require_engine_mounts() {
+    expected_uuid=$(jq -r .data_uuid "$REQUEST")
+    for name in docker containerd; do
+        target=$(findmnt --noheadings --output TARGET --target "/var/lib/$name" 2>/dev/null) \
+            || fail "$name data directory is not mounted"
+        uuid=$(findmnt --noheadings --output UUID --target "/var/lib/$name")
+        fsroot=$(findmnt --noheadings --output FSROOT --target "/var/lib/$name")
+        [ "$target" = "/var/lib/$name" ] || fail "$name data directory is not its mountpoint"
+        [ "$(printf '%s' "$uuid" | tr 'A-F' 'a-f')" = "$(printf '%s' "$expected_uuid" | tr 'A-F' 'a-f')" ] \
+            || fail "$name data directory has the wrong filesystem"
+        [ "$fsroot" = "/$name" ] || fail "$name data directory has the wrong filesystem root"
+    done
+}
+
+check() {
+    [ "$(id -u)" -eq 0 ] || fail "must run as root"
+    require_manifest
+    [ -s "$REQUEST" ] || fail "activation request is unavailable"
+    require_request
+    require_cgroup_v2
+    require_network
+    require_shares
+    require_data_mount
+    require_engine_mounts
+    dockerd --validate --config-file=/etc/docker/daemon.json >/dev/null 2>&1 \
+        || fail "invalid Docker configuration"
+    [ -x /usr/bin/docker-proxy ] || fail "real docker-proxy is unavailable"
+    [ -x /usr/bin/silo-portd ] || fail "silo-portd is unavailable"
+    [ "$(readlink -f /usr/bin/docker-proxy)" != "$(readlink -f /usr/bin/silo-portd)" ] \
+        || fail "silo-portd cannot chain to itself"
+}
+
+activate() {
+    [ "$(id -u)" -eq 0 ] || fail "must run as root"
+    install -d -m 0700 /run/silo-system
+    umask 077
+    request_tmp=$(mktemp /run/silo-system/activation.XXXXXX)
+    trap 'rm -f "$request_tmp"' EXIT HUP INT TERM
+    dd bs=1 count=$((MAX_REQUEST_BYTES + 1)) of="$request_tmp" 2>/dev/null
+    [ "$(wc -c < "$request_tmp")" -le "$MAX_REQUEST_BYTES" ] || fail "activation request is too large"
+    mv "$request_tmp" "$REQUEST"
+    trap - EXIT HUP INT TERM
+
+    require_manifest
+    require_request
+    require_cgroup_v2
+    require_network
+    require_shares
+
+    expected_uuid=$(jq -r .data_uuid "$REQUEST")
+    device=$(blkid -U "$expected_uuid" 2>/dev/null) || fail "expected data disk was not found"
+    [ "$(blkid -s TYPE -o value "$device")" = ext4 ] || fail "data disk is not ext4"
+    if ! mountpoint -q "$DATA_ROOT"; then
+        fsck.ext4 -p "$device" || status=$?
+        [ "${status:-0}" -lt 2 ] || fail "data filesystem check failed"
+        mount -t ext4 -o rw,nodev,nosuid "$device" "$DATA_ROOT"
+    fi
+    require_data_mount
+
+    for name in docker containerd; do
+        if mountpoint -q "/var/lib/$name"; then
+            continue
+        fi
+        mount --bind "$DATA_ROOT/$name" "/var/lib/$name"
+    done
+    require_engine_mounts
+
+    if systemctl is-active --quiet docker.service; then
+        docker info >/dev/null 2>&1 || fail "Docker is active but unhealthy"
+        return 0
+    fi
+    systemctl start silo-system-docker.target
+    systemctl is-active --quiet silo-system-docker.target \
+        || fail "Docker target did not become active"
+    docker info >/dev/null 2>&1 || fail "Docker health check failed"
+}
+
+case "${1:-}" in
+    activate)
+        [ "$#" -eq 1 ] || fail "activate accepts no additional arguments"
+        activate
+        ;;
+    check)
+        [ "$#" -eq 1 ] || fail "check accepts no additional arguments"
+        check
+        ;;
+    *) fail "usage: silo-system-activate activate|check" ;;
+esac

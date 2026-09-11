@@ -1,0 +1,8 @@
+[Unit]
+Description=Validate Silo Docker data mounts
+Before=containerd.service docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/silo-system-activate check
+RemainAfterExit=yes
