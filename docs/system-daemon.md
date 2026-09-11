@@ -32,7 +32,7 @@ equivalent `XDG_CONFIG_HOME` path):
 daemon:
   version: "1"
   system:
-    image: ghcr.io/vandycknick/system@sha256:<qualified-digest>
+    image: ghcr.io/vandycknick/silo/system@sha256:<qualified-digest>
     resources:
       cpus: 4
       memory: 4GiB
@@ -106,7 +106,7 @@ not background itself or install a service. Stop it with SIGINT or SIGTERM.
 ## Upgrade And Recovery
 
 ```bash
-silo daemon upgrade --image ghcr.io/vandycknick/system@sha256:<digest>
+silo daemon upgrade --image ghcr.io/vandycknick/silo/system@sha256:<digest>
 silo daemon upgrade --recover
 ```
 

@@ -58,7 +58,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/system
+  IMAGE: ghcr.io/${{ github.repository_owner }}/silo/system
 
 jobs:
   build:
