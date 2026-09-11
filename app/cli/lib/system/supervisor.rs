@@ -119,9 +119,51 @@ pub(crate) async fn serve(
     publish(&paths, &mut status)?;
     append_log(&paths, "preparing installation storage")?;
 
-    status.phase = DaemonPhase::Creating;
-    publish(&paths, &mut status)?;
-    let (record, machine_data) = match ensure_system_machine(api, &paths, config.clone()).await {
+    let startup = {
+        let startup = reconcile_ready(api, &paths, &config, &mut status);
+        tokio::pin!(startup);
+        tokio::select! {
+            result = &mut startup => Some(result),
+            signal = shutdown_signal() => {
+                signal?;
+                None
+            }
+        }
+    };
+    let Some(startup) = startup else {
+        status.phase = DaemonPhase::Stopping;
+        publish(&paths, &mut status)?;
+        if let Some(record) =
+            load_record::<crate::system::record::SystemRecord>(&paths.system_record())?
+        {
+            status.machine_id = Some(record.active_machine_id.clone());
+            let machine = api.inspect_machine(&record.active_machine_id).await?;
+            if matches!(
+                machine.status,
+                MachineStatus::Running { .. }
+                    | MachineStatus::Starting { .. }
+                    | MachineStatus::Stopping { .. }
+            ) {
+                if let Err(error) = api
+                    .stop_machine(&record.active_machine_id, false, Duration::from_secs(60))
+                    .await
+                {
+                    status.phase = DaemonPhase::Failed;
+                    status.last_error = Some(format!(
+                        "startup cancellation could not stop the system VM: {error:#}"
+                    ));
+                    publish(&paths, &mut status)?;
+                    return Err(error);
+                }
+            }
+        }
+        status.phase = DaemonPhase::Stopped;
+        status.run_id = None;
+        publish(&paths, &mut status)?;
+        append_log(&paths, "system daemon cancelled during startup")?;
+        return Ok(());
+    };
+    let (machine, run_id) = match startup {
         Ok(value) => value,
         Err(error) => {
             status.phase = DaemonPhase::Failed;
@@ -130,35 +172,6 @@ pub(crate) async fn serve(
             return Err(error);
         }
     };
-    status.machine_id = Some(record.active_machine_id.clone());
-    status.image_digest = Some(record.image_digest.clone());
-    let machine = api.machine(&record.active_machine_id).await?;
-    let run_id = match machine_data.status {
-        MachineStatus::Running { .. } | MachineStatus::Starting { .. } => {
-            machine.current_run_id().await?
-        }
-        MachineStatus::Stopping { .. } => bail!("recorded system VM is stopping; wait and retry"),
-        _ => {
-            status.phase = DaemonPhase::StartingVm;
-            publish(&paths, &mut status)?;
-            let options = api.machine_start_options(&machine, false).await?;
-            machine.start_with_options(options).await?.run_id
-        }
-    };
-    status.run_id = Some(run_id.to_string());
-    status.phase = DaemonPhase::WaitingGuest;
-    publish(&paths, &mut status)?;
-    let readiness = machine.wait_ready(READY_TIMEOUT).await?;
-    if readiness.outcome != MachineReadinessOutcome::Ready {
-        bail!("system guest readiness ended with {:?}", readiness.outcome);
-    }
-    status.phase = DaemonPhase::ActivatingEngine;
-    publish(&paths, &mut status)?;
-    activate(&machine, &config, record.data_uuid).await?;
-    probe_docker_socket(&config.docker_socket)?;
-    status.phase = DaemonPhase::Ready;
-    publish(&paths, &mut status)?;
-    append_log(&paths, "system Docker engine ready")?;
 
     let mut consecutive_failures = 0_u8;
     loop {
@@ -207,6 +220,47 @@ pub(crate) async fn serve(
     publish(&paths, &mut status)?;
     append_log(&paths, "system daemon stopped")?;
     Ok(())
+}
+
+async fn reconcile_ready(
+    api: &mut AppApi,
+    paths: &SystemPaths,
+    config: &ResolvedSystemConfig,
+    status: &mut DaemonStatus,
+) -> eyre::Result<(crate::api::machine::AppMachine, libvm::MachineRunId)> {
+    status.phase = DaemonPhase::Creating;
+    publish(paths, status)?;
+    let (record, machine_data) = ensure_system_machine(api, paths, config.clone()).await?;
+    status.machine_id = Some(record.active_machine_id.clone());
+    status.image_digest = Some(record.image_digest.clone());
+    let machine = api.machine(&record.active_machine_id).await?;
+    let run_id = match machine_data.status {
+        MachineStatus::Running { .. } | MachineStatus::Starting { .. } => {
+            machine.current_run_id().await?
+        }
+        MachineStatus::Stopping { .. } => bail!("recorded system VM is stopping; wait and retry"),
+        _ => {
+            status.phase = DaemonPhase::StartingVm;
+            publish(paths, status)?;
+            let options = api.machine_start_options(&machine, false).await?;
+            machine.start_with_options(options).await?.run_id
+        }
+    };
+    status.run_id = Some(run_id.to_string());
+    status.phase = DaemonPhase::WaitingGuest;
+    publish(paths, status)?;
+    let readiness = machine.wait_ready(READY_TIMEOUT).await?;
+    if readiness.outcome != MachineReadinessOutcome::Ready {
+        bail!("system guest readiness ended with {:?}", readiness.outcome);
+    }
+    status.phase = DaemonPhase::ActivatingEngine;
+    publish(paths, status)?;
+    activate(&machine, config, record.data_uuid).await?;
+    probe_docker_socket(&config.docker_socket)?;
+    status.phase = DaemonPhase::Ready;
+    publish(paths, status)?;
+    append_log(paths, "system Docker engine ready")?;
+    Ok((machine, run_id))
 }
 
 pub(crate) async fn activate(
