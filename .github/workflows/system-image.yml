@@ -3,7 +3,6 @@ name: System Image
 on:
   push:
     branches:
-      - feat/silod
       - main
     paths:
       - 'resources/images/system/**'
@@ -126,10 +125,7 @@ jobs:
 
   publish-dev:
     name: publish dev index
-    if: >-
-      ${{ github.repository == 'vandycknick/silo' &&
-          ((github.event_name == 'workflow_dispatch' && inputs.publish_dev) ||
-           (github.event_name == 'push' && github.ref == 'refs/heads/feat/silod')) }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_dev && github.repository == 'vandycknick/silo' }}
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 30
