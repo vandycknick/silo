@@ -10,12 +10,12 @@ use libvm::{
     DEFAULT_GUEST_READINESS_TIMEOUT,
 };
 
+use crate::api::machine::AppMachine;
 use crate::commands::create::{
     load_template, machine_settings, parse_environment, read_environment_layers, render_plan,
     resolve_plan, selected_image_reference, validate_process_overrides, MachineCliOptions,
     PlanInputs, Pull, VmOverrideArgs,
 };
-use crate::commands::start_options::machine_start_options_without_cleanup;
 use crate::environment::EnvironmentOverride;
 use crate::planning::{Plan, PlanKind, ProcessOverrides, RunOptions, TtyCapabilities, TtyMode};
 use crate::ui::{self, watch_image_progress, OutputFormat, Spinner};
@@ -226,15 +226,10 @@ impl Cmd {
         let _ = image_progress_task.await;
         let (plan, created) = image_result?;
         let name = created.name;
-        let runtime = context
-            .runtime()
-            .await
-            .map_err(execution_infrastructure)?
-            .clone();
         let (_reference, machine) = context.machine(Some(&created.id)).await?;
         if plan.detached {
             let progress = Spinner::start("Starting", &name);
-            let options = match detached_start_options(&runtime, &machine, &plan).await {
+            let options = match detached_start_options(context, &machine, &plan).await {
                 Ok(options) => options,
                 Err(error) => {
                     return Err(
@@ -256,7 +251,12 @@ impl Cmd {
         }
 
         let mut progress = Spinner::start("Starting", &name);
-        let options = match machine_start_options_without_cleanup(&runtime, &machine).await {
+        let options = match context
+            .app_api()
+            .await?
+            .machine_start_options(&machine, false)
+            .await
+        {
             Ok(options) => options,
             Err(error) => {
                 return Err(
@@ -310,7 +310,8 @@ impl Cmd {
         progress.step("Ready", &name);
         progress.finish_success("Started");
         let execution =
-            crate::guest::run_process(&machine, &plan.create.process, &plan.argv, plan.tty).await;
+            crate::api::streams::run_process(&machine, &plan.create.process, &plan.argv, plan.tty)
+                .await;
         let stop = stop_run(&machine, start.run_id, plan.create.retention).await;
         let result = match execution {
             Ok(result) => result,
@@ -374,8 +375,8 @@ fn parse_entrypoint(value: &str) -> Result<String, String> {
 }
 
 async fn detached_start_options(
-    runtime: &libvm::Runtime,
-    machine: &libvm::Machine,
+    context: &mut crate::context::Context,
+    machine: &AppMachine,
     plan: &crate::planning::RunPlan,
 ) -> eyre::Result<MachineStartOptions> {
     let process = &plan.create.process;
@@ -383,7 +384,11 @@ async fn detached_start_options(
         .argv
         .split_first()
         .ok_or_else(|| eyre::eyre!("guest command is required"))?;
-    let options = crate::commands::start_options::machine_start_options(runtime, machine).await?;
+    let options = context
+        .app_api()
+        .await?
+        .machine_start_options(machine, true)
+        .await?;
     let process = process.clone();
     let program = program.clone();
     let args = args.to_vec();
@@ -400,7 +405,7 @@ async fn detached_start_options(
 }
 
 async fn stop_run(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     run_id: MachineRunId,
     retention: MachineRetention,
 ) -> eyre::Result<()> {
@@ -415,7 +420,7 @@ async fn stop_run(
 }
 
 async fn diagnose_readiness_failure(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     run_id: MachineRunId,
     retention: MachineRetention,
     error: libvm::LibVmError,
@@ -430,7 +435,7 @@ async fn diagnose_readiness_failure(
 }
 
 async fn diagnose_backend_exit(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     run_id: MachineRunId,
     retention: MachineRetention,
 ) -> Option<eyre::Report> {
@@ -482,7 +487,7 @@ fn execution_infrastructure(error: eyre::Report) -> eyre::Report {
 }
 
 async fn cleanup_foreground_failure(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     retention: MachineRetention,
     error: eyre::Report,
 ) -> eyre::Report {
@@ -491,7 +496,7 @@ async fn cleanup_foreground_failure(
 }
 
 async fn foreground_stop_failure(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     retention: MachineRetention,
     stop: eyre::Result<()>,
     error: eyre::Report,
@@ -509,7 +514,7 @@ async fn foreground_stop_failure(
     }
 }
 
-async fn cleanup_ephemeral_best_effort(machine: &libvm::Machine, retention: MachineRetention) {
+async fn cleanup_ephemeral_best_effort(machine: &AppMachine, retention: MachineRetention) {
     if retention != MachineRetention::Ephemeral {
         return;
     }

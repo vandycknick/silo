@@ -2,13 +2,14 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use eyre::Context as _;
-use libvm::{HostCommand, Machine, MachineStartOptions, Runtime};
+use libvm::{HostCommand, MachineStartOptions, Runtime};
 
+use crate::api::machine::AppMachine;
 use crate::commands::secret::egress_credentials_from_secret_store;
 
 pub(crate) async fn machine_start_options(
     runtime: &Runtime,
-    machine: &Machine,
+    machine: &AppMachine,
 ) -> eyre::Result<MachineStartOptions> {
     let data = machine
         .inspect()
@@ -29,7 +30,7 @@ pub(crate) async fn machine_start_options(
 /// Builds start options for a foreground owner that removes an ephemeral VM itself.
 pub(crate) async fn machine_start_options_without_cleanup(
     _runtime: &Runtime,
-    machine: &Machine,
+    machine: &AppMachine,
 ) -> eyre::Result<MachineStartOptions> {
     let data = machine
         .inspect()
@@ -62,7 +63,7 @@ mod tests {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
-    use crate::commands::start_options::cleanup_on_exit_options;
+    use crate::api::start_options::cleanup_on_exit_options;
 
     #[test]
     fn cleanup_on_exit_uses_current_executable_shape() {

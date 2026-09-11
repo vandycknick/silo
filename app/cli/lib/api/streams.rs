@@ -3,18 +3,21 @@ use std::collections::BTreeMap;
 use eyre::Context as _;
 use libvm::{
     ExecutionControl, ExecutionEvent, ExecutionOptionsBuilder, ExecutionResult, ExecutionSession,
-    Machine, MachineData, ProcessConfig, SshExitStatus,
+    MachineData, ProcessConfig, SshExitStatus,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use crate::api::machine::AppMachine;
+
 pub(crate) async fn attach_shell(
-    machine: &Machine,
+    machine: &AppMachine,
     user: Option<&str>,
     forward_agent: bool,
 ) -> eyre::Result<SshExitStatus> {
     let cwd = std::env::current_dir().context("resolve current working directory")?;
     machine
+        .inner()
         .attach_shell_with(|options| {
             let options = options.cwd(cwd.to_string_lossy()).best_effort_cwd();
             let options = match user {
@@ -51,7 +54,7 @@ pub(crate) fn ensure_guest_ready(data: &MachineData) -> eyre::Result<()> {
 }
 
 pub(crate) async fn run_command_streaming(
-    machine: &Machine,
+    machine: &AppMachine,
     user: Option<&str>,
     argv: &[String],
     working_directory: &str,
@@ -59,6 +62,7 @@ pub(crate) async fn run_command_streaming(
 ) -> eyre::Result<ExecutionResult> {
     let (program, args) = command_argv(argv)?;
     let mut session = machine
+        .inner()
         .spawn_with(program, |options| {
             with_exec_options(options.args(args), user, working_directory, environment).stdin_pipe()
         })
@@ -67,7 +71,7 @@ pub(crate) async fn run_command_streaming(
 }
 
 pub(crate) async fn attach_command(
-    machine: &Machine,
+    machine: &AppMachine,
     user: Option<&str>,
     argv: &[String],
     working_directory: &str,
@@ -75,6 +79,7 @@ pub(crate) async fn attach_command(
 ) -> eyre::Result<ExecutionResult> {
     let (program, args) = command_argv(argv)?;
     machine
+        .inner()
         .attach_with(program, |options| {
             with_exec_options(options.args(args), user, working_directory, environment)
         })
@@ -85,7 +90,7 @@ pub(crate) async fn attach_command(
 /// Runs one exact process configuration through the structured guest protocol.
 /// The caller owns machine lifecycle; this function owns only process I/O.
 pub(crate) async fn run_process(
-    machine: &Machine,
+    machine: &AppMachine,
     process: &ProcessConfig,
     argv: &[String],
     tty: bool,
@@ -292,7 +297,7 @@ fn with_exec_options(
 
 #[cfg(test)]
 mod tests {
-    use crate::guest::{command_argv, forwardable_signals};
+    use crate::api::streams::{command_argv, forwardable_signals};
 
     #[test]
     fn command_argv_preserves_the_exact_argv_vector() {
