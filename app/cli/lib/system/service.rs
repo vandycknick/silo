@@ -13,6 +13,7 @@ use crate::system::provision::prepare_installation;
 use crate::system::record::{load_record, write_record, SystemPaths};
 use crate::system::supervisor::{read_status, DaemonPhase, DaemonStatus};
 
+#[cfg(target_os = "linux")]
 const SERVICE_NAME: &str = "silo-system.service";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,10 +203,10 @@ fn reject_root() -> eyre::Result<()> {
     Ok(())
 }
 
-fn default_service_path(paths: &SystemPaths) -> eyre::Result<PathBuf> {
+fn default_service_path(_paths: &SystemPaths) -> eyre::Result<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        let config_home = paths
+        let config_home = _paths
             .config_root
             .parent()
             .ok_or_else(|| eyre::eyre!("invalid Silo config root"))?;
@@ -479,7 +480,10 @@ fn native_enabled() -> eyre::Result<bool> {
         .args(["print-disabled", &domain])
         .output()?;
     if !output.status.success() {
-        bail!("query launchd enablement failed: {}", stderr(&output));
+        bail!(
+            "query launchd enablement failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     for line in String::from_utf8(output.stdout)?.lines() {
         if line.contains("\"io.silo.system\"") {
