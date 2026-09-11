@@ -36,6 +36,8 @@ daemon:
     resources:
       cpus: 4
       memory: 8GiB
+      memory-reclaim: auto   # auto | off
+      memory-floor: 2GiB
     storage:
       root-size: 20GiB
       data-size: 500GiB
@@ -48,6 +50,16 @@ daemon:
       compatibility-socket: auto
     # rosetta: true
 ```
+
+`memory` is the ceiling the VM can use. On Apple silicon the daemon also drives
+the VM's memory balloon: every ten seconds it reads the guest's memory use and
+moves the balloon target toward "in use plus 1GiB", shrinking by at most
+512MiB every five seconds and never below `memory-floor`, so an idle engine
+hands its page cache back to the host instead of pinning the full `memory`.
+When the guest runs short the target grows immediately, up to `memory`, and
+holds there for a minute before shrinking resumes. Set
+`memory-reclaim: off` to keep the guest at its full size. Linux hosts have no
+balloon and ignore the setting.
 
 `rosetta` enables x86_64 container execution through Rosetta. Left unset, it is
 on when the host is Apple silicon with Rosetta installed (`softwareupdate
@@ -144,6 +156,7 @@ State:      failed (retrying; 3 attempts so far)
 Autostart:  enabled
 Endpoint:   unix:///Users/me/.docker/run/silo.sock
 PID:        80954
+Memory:     8 GiB configured, 2.5 GiB currently given to the guest
 Updated:    2026-09-11 10:37:29 UTC (12 seconds ago)
 Error:      could not fetch the system image: registry denied anonymous access to image "ghcr.io/example/system:dev"; it may not exist or may be private
 ```

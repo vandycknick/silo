@@ -267,6 +267,8 @@ mod tests {
             compatibility_socket: policy,
             docker_socket: socket,
             rosetta: false,
+            memory_reclaim: false,
+            memory_floor_bytes: 512 * 1024 * 1024,
             identity: "test".to_string(),
         }
     }

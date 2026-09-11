@@ -46,6 +46,9 @@ pub(crate) struct DaemonStatus {
     pub(crate) updated_at: String,
     pub(crate) last_error: Option<String>,
     pub(crate) restart_count: u32,
+    /// Guest memory target the balloon controller last applied, in bytes.
+    #[serde(default)]
+    pub(crate) memory_target_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +119,7 @@ pub(crate) async fn serve(
         updated_at: now(),
         last_error: None,
         restart_count: 0,
+        memory_target_bytes: None,
     };
     publish(&paths, &mut status)?;
     append_log(&paths, "preparing installation storage")?;
@@ -201,13 +205,22 @@ pub(crate) async fn serve(
     };
 
     let mut consecutive_failures = 0_u8;
+    let mut reclaimer = MemoryReclaimer::new(&config);
+    let mut ticks = 0_u64;
     loop {
         tokio::select! {
             signal = shutdown_signal() => {
                 signal?;
                 break;
             }
-            () = tokio::time::sleep(Duration::from_secs(10)) => {
+            () = tokio::time::sleep(RECLAIM_INTERVAL) => {
+                ticks += 1;
+                // Memory pressure is exactly when the Docker probe tends to stall, so the
+                // balloon controller runs on every tick regardless of engine health.
+                reclaimer.tick(&machine, &paths, &mut status).await?;
+                if !ticks.is_multiple_of(HEALTH_INTERVAL.as_secs() / RECLAIM_INTERVAL.as_secs()) {
+                    continue;
+                }
                 match probe_docker_socket(&config.docker_socket) {
                     Ok(()) => {
                         consecutive_failures = 0;
@@ -291,6 +304,147 @@ async fn reconcile_ready(
     publish(paths, status)?;
     append_log(paths, "system Docker engine ready")?;
     Ok((machine, run_id))
+}
+
+/// Engine health probe cadence.
+const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+/// Balloon controller cadence; the guest agent reports metrics every 5 seconds.
+const RECLAIM_INTERVAL: Duration = Duration::from_secs(5);
+const MIB: u64 = 1024 * 1024;
+/// Memory kept free in the guest above what it currently uses.
+const RECLAIM_HEADROOM: u64 = 1024 * MIB;
+/// Largest shrink per tick, so the guest sheds page cache gradually.
+const RECLAIM_STEP: u64 = 512 * MIB;
+/// Smallest shrink worth a balloon request.
+const RECLAIM_MIN_CHANGE: u64 = 64 * MIB;
+/// After the target had to grow, leave it alone this long before shrinking again so a
+/// bursty workload is not squeezed between its bursts.
+const RECLAIM_HOLDOFF: Duration = Duration::from_secs(60);
+
+/// Drives the guest's memory balloon so a mostly idle engine does not pin its whole
+/// configured memory on the host. Every healthy tick reads the guest's memory metrics
+/// and moves the balloon target toward "in use plus headroom", shrinking in steps and
+/// growing at once when the guest runs short. Only Virtualization.framework has a
+/// balloon; on other backends the first request reports unsupported and the
+/// controller switches itself off.
+pub(crate) struct MemoryReclaimer {
+    max_bytes: u64,
+    floor_bytes: u64,
+    target_bytes: u64,
+    enabled: bool,
+    hold_until: Option<tokio::time::Instant>,
+}
+
+impl MemoryReclaimer {
+    pub(crate) fn new(config: &ResolvedSystemConfig) -> Self {
+        Self {
+            max_bytes: config.memory_bytes,
+            floor_bytes: config.memory_floor_bytes.min(config.memory_bytes),
+            target_bytes: config.memory_bytes,
+            enabled: config.memory_reclaim,
+            hold_until: None,
+        }
+    }
+
+    /// Returns the next target, or `None` when the current one should stay.
+    ///
+    /// `total_bytes` and `available_bytes` are the guest's own view. Inflated balloon
+    /// pages count as used inside the guest, so they are subtracted to recover what
+    /// the guest really needs.
+    pub(crate) fn plan(&self, total_bytes: u64, available_bytes: u64) -> Option<u64> {
+        let withheld = self.max_bytes.saturating_sub(self.target_bytes);
+        let used = total_bytes
+            .saturating_sub(available_bytes)
+            .saturating_sub(withheld);
+        let desired = used
+            .saturating_add(RECLAIM_HEADROOM)
+            .clamp(self.floor_bytes, self.max_bytes)
+            / MIB
+            * MIB;
+        if desired > self.target_bytes {
+            // The guest is running short: give memory back immediately. Under real
+            // pressure release everything rather than chasing the estimate.
+            let next = if available_bytes < RECLAIM_HEADROOM / 2 {
+                self.max_bytes
+            } else {
+                desired
+            };
+            return (next != self.target_bytes).then_some(next);
+        }
+        let next = desired.max(self.target_bytes.saturating_sub(RECLAIM_STEP));
+        (self.target_bytes.saturating_sub(next) >= RECLAIM_MIN_CHANGE).then_some(next)
+    }
+
+    async fn tick(
+        &mut self,
+        machine: &crate::api::machine::AppMachine,
+        paths: &SystemPaths,
+        status: &mut DaemonStatus,
+    ) -> eyre::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let metrics = match machine.metrics().await {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                append_log(paths, &format!("memory reclaim skipped: {error}"))?;
+                return Ok(());
+            }
+        };
+        let Some(memory) = metrics
+            .metrics
+            .and_then(|observation| observation.report.snapshot.memory)
+        else {
+            return Ok(());
+        };
+        let Some(next) = self.plan(memory.total_bytes, memory.available_bytes) else {
+            return Ok(());
+        };
+        let now = tokio::time::Instant::now();
+        if next < self.target_bytes && self.hold_until.is_some_and(|until| now < until) {
+            return Ok(());
+        }
+        if next > self.target_bytes {
+            self.hold_until = Some(now + RECLAIM_HOLDOFF);
+        }
+        // Balloon pages show up as used inside the guest; report what the guest itself uses.
+        let withheld = self.max_bytes.saturating_sub(self.target_bytes);
+        let guest_used = memory
+            .total_bytes
+            .saturating_sub(memory.available_bytes)
+            .saturating_sub(withheld);
+        match machine.set_memory_target(next).await {
+            Ok(applied) => {
+                let direction = if applied < self.target_bytes {
+                    "shrunk"
+                } else {
+                    "grew"
+                };
+                self.target_bytes = applied;
+                status.memory_target_bytes = Some(applied);
+                publish(paths, status)?;
+                append_log(
+                    paths,
+                    &format!(
+                        "memory target {direction} to {} MiB (guest uses {} MiB)",
+                        applied / MIB,
+                        guest_used / MIB
+                    ),
+                )?;
+            }
+            Err(libvm::LibVmError::MonitorUnsupported { .. }) => {
+                self.enabled = false;
+                append_log(
+                    paths,
+                    "memory reclaim disabled: this virtualization backend has no memory balloon",
+                )?;
+            }
+            Err(error) => {
+                append_log(paths, &format!("memory target change failed: {error}"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Renders an error as its distinct causes, outermost first, skipping causes whose text
@@ -560,6 +714,38 @@ mod tests {
             "could not fetch the system image"
         );
         assert_eq!(error_summary(&[]), "unknown failure");
+    }
+
+    #[test]
+    fn memory_reclaimer_shrinks_in_steps_and_grows_at_once() {
+        use crate::system::supervisor::{MemoryReclaimer, MIB};
+        let mut reclaimer = MemoryReclaimer {
+            max_bytes: 8192 * MIB,
+            floor_bytes: 2048 * MIB,
+            target_bytes: 8192 * MIB,
+            enabled: true,
+            hold_until: None,
+        };
+        // Idle guest: 700 MiB used, wants 1700 MiB; shrinks by at most 512 MiB per tick.
+        let total = 7900 * MIB;
+        assert_eq!(reclaimer.plan(total, total - 700 * MIB), Some(7680 * MIB));
+        reclaimer.target_bytes = 2560 * MIB;
+        // Balloon holds 5632 MiB, which the guest reports as used; real use is 700 MiB.
+        let available = total - 700 * MIB - 5632 * MIB;
+        assert_eq!(reclaimer.plan(total, available), Some(2048 * MIB));
+        reclaimer.target_bytes = 2048 * MIB;
+        // At the floor nothing more happens.
+        assert_eq!(reclaimer.plan(total, total - 700 * MIB - 6144 * MIB), None);
+        // A build starts: 1200 MiB in use with the balloon holding 6 GiB; use plus the
+        // 1 GiB headroom is demanded right away.
+        let available = total - 1200 * MIB - 6144 * MIB;
+        assert_eq!(reclaimer.plan(total, available), Some(2224 * MIB));
+        // Under real pressure (almost nothing available) release everything.
+        assert_eq!(reclaimer.plan(total, 100 * MIB), Some(8192 * MIB));
+        // Tiny differences are ignored.
+        reclaimer.target_bytes = 3500 * MIB;
+        let available = total - 2470 * MIB - 4692 * MIB;
+        assert_eq!(reclaimer.plan(total, available), None);
     }
 
     #[test]

@@ -97,6 +97,17 @@ impl AppMachine {
         self.inner.logs(source, options).await
     }
 
+    pub(crate) async fn metrics(&self) -> Result<libvm::MachineMetrics, libvm::LibVmError> {
+        self.inner.metrics().await
+    }
+
+    pub(crate) async fn set_memory_target(
+        &self,
+        target_bytes: u64,
+    ) -> Result<u64, libvm::LibVmError> {
+        self.inner.set_memory_target(target_bytes).await
+    }
+
     pub(crate) async fn list_forwards(
         &self,
     ) -> Result<Vec<MachineForwardStatus>, libvm::LibVmError> {

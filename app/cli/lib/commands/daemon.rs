@@ -144,6 +144,8 @@ struct DaemonStatusView {
     autostart: Option<bool>,
     /// Docker endpoint the daemon serves (or is registered to serve).
     endpoint: Option<String>,
+    /// Configured guest memory, in bytes, from the registration.
+    memory_bytes: Option<u64>,
     /// Live supervisor record; absent when no daemon process is running.
     daemon: Option<crate::system::supervisor::DaemonStatus>,
 }
@@ -154,11 +156,17 @@ impl DaemonStatusView {
 
         let daemon = crate::system::service::status(paths)?;
         let autostart = crate::system::service::is_enabled().ok();
+        let registration =
+            crate::system::service::load_optional_registration(&paths.registration())?;
         let endpoint = match &daemon {
             Some(status) => Some(status.docker_socket.clone()),
-            None => crate::system::service::load_optional_registration(&paths.registration())?
+            None => registration
+                .as_ref()
                 .map(|registration| registration.config.docker_socket.display().to_string()),
         };
+        let memory_bytes = registration
+            .as_ref()
+            .map(|registration| registration.config.memory_bytes);
         let state = match daemon.as_ref().map(|status| status.phase) {
             None | Some(DaemonPhase::Stopped) => "stopped",
             Some(DaemonPhase::Ready) => "ready",
@@ -177,6 +185,7 @@ impl DaemonStatusView {
             state,
             autostart,
             endpoint,
+            memory_bytes,
             daemon,
         })
     }
@@ -222,6 +231,16 @@ impl DaemonStatusView {
             }
             if let Some(digest) = &status.image_digest {
                 rows.push(("Image".to_string(), digest.clone()));
+            }
+            if let (Some(memory), Some(target)) = (self.memory_bytes, status.memory_target_bytes) {
+                rows.push((
+                    "Memory".to_string(),
+                    format!(
+                        "{} configured, {} currently given to the guest",
+                        crate::ui::human_bytes(Some(memory)),
+                        crate::ui::human_bytes(Some(target))
+                    ),
+                ));
             }
             if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&status.updated_at) {
                 let timestamp = updated.timestamp();

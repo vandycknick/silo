@@ -70,6 +70,21 @@ pub(crate) struct SystemResources {
     pub(crate) cpus: u8,
     #[serde(default = "default_memory")]
     pub(crate) memory: String,
+    /// Hand idle guest memory back to the host through the memory balloon. Only
+    /// Virtualization.framework hosts have a balloon; elsewhere this is inert.
+    #[serde(default, rename = "memory-reclaim")]
+    pub(crate) memory_reclaim: MemoryReclaim,
+    /// The least memory the reclaim controller leaves to the guest.
+    #[serde(default = "default_memory_floor", rename = "memory-floor")]
+    pub(crate) memory_floor: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum MemoryReclaim {
+    #[default]
+    Auto,
+    Off,
 }
 
 impl Default for SystemResources {
@@ -77,6 +92,8 @@ impl Default for SystemResources {
         Self {
             cpus: default_cpus(),
             memory: default_memory(),
+            memory_reclaim: MemoryReclaim::default(),
+            memory_floor: default_memory_floor(),
         }
     }
 }
@@ -185,6 +202,12 @@ pub(crate) struct ResolvedSystemConfig {
     pub(crate) docker_socket: PathBuf,
     #[serde(default)]
     pub(crate) rosetta: bool,
+    /// Whether the daemon drives the memory balloon to return idle guest memory.
+    #[serde(default = "default_memory_reclaim_enabled")]
+    pub(crate) memory_reclaim: bool,
+    /// Lower bound the reclaim controller keeps the guest at, in bytes.
+    #[serde(default = "default_memory_floor_bytes")]
+    pub(crate) memory_floor_bytes: u64,
     pub(crate) identity: String,
 }
 
@@ -211,6 +234,13 @@ impl SystemConfig {
             bail!("daemon.system.resources.cpus must be greater than zero");
         }
         let memory_bytes = parse_size(&self.system.resources.memory, "memory")?;
+        let memory_floor_bytes = parse_size(&self.system.resources.memory_floor, "memory-floor")?;
+        if memory_floor_bytes < 512 * 1024 * 1024 {
+            bail!("daemon.system.resources.memory-floor must be at least 512MiB");
+        }
+        if memory_floor_bytes > memory_bytes {
+            bail!("daemon.system.resources.memory-floor cannot exceed memory");
+        }
         let root_size_bytes = parse_size(
             self.system
                 .storage
@@ -304,6 +334,8 @@ impl SystemConfig {
             compatibility_socket: self.system.docker.compatibility_socket,
             docker_socket,
             rosetta: self.system.rosetta.unwrap_or_else(rosetta_available),
+            memory_reclaim: self.system.resources.memory_reclaim == MemoryReclaim::Auto,
+            memory_floor_bytes,
             identity: String::new(),
         };
         let bytes = serde_json::to_vec(&resolved).context("serialize resolved system config")?;
@@ -374,6 +406,15 @@ const fn default_cpus() -> u8 {
 fn default_memory() -> String {
     "8GiB".to_string()
 }
+fn default_memory_floor() -> String {
+    "2GiB".to_string()
+}
+const fn default_memory_reclaim_enabled() -> bool {
+    true
+}
+const fn default_memory_floor_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
 /// Rosetta's Linux runtime, installed by `softwareupdate --install-rosetta`. vmmon
 /// performs the authoritative Virtualization.framework check at start; this only picks
 /// a sensible default so hosts without Rosetta keep working.
@@ -411,6 +452,20 @@ mod tests {
         let resolved = config.resolve(temp.path(), None).expect("resolve");
         assert_eq!(resolved.shares.len(), 1);
         assert_eq!(resolved.memory_bytes, 8 * 1024 * 1024 * 1024);
+        assert!(resolved.memory_reclaim);
+        assert_eq!(resolved.memory_floor_bytes, 2 * 1024 * 1024 * 1024);
+        let reclaim_off: SystemConfig = serde_yaml_ng::from_str(
+            "version: '1'\nsystem:\n  resources:\n    memory-reclaim: off\n    memory-floor: 1GiB\n",
+        )
+        .expect("config");
+        let reclaim_off = reclaim_off.resolve(temp.path(), None).expect("resolve");
+        assert!(!reclaim_off.memory_reclaim);
+        assert_eq!(reclaim_off.memory_floor_bytes, 1024 * 1024 * 1024);
+        let bad_floor: SystemConfig = serde_yaml_ng::from_str(
+            "version: '1'\nsystem:\n  resources:\n    memory: 2GiB\n    memory-floor: 4GiB\n",
+        )
+        .expect("config");
+        assert!(bad_floor.resolve(temp.path(), None).is_err());
         assert_eq!(resolved.root_size_bytes, 20 * 1024 * 1024 * 1024);
         assert_eq!(resolved.data_size_bytes, 500 * 1024 * 1024 * 1024);
         assert!(!config.system.storage.explicit_data_size());
