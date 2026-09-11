@@ -1,0 +1,236 @@
+name: System Image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'resources/images/system/**'
+      - 'guest/portd/**'
+      - 'app/cli/**'
+      - 'runtime/vmmon/**'
+      - 'runtime/netd/**'
+      - 'guest/agent/**'
+      - 'guest/init/**'
+      - 'specs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.github/workflows/system-image.yml'
+  pull_request:
+    paths:
+      - 'resources/images/system/**'
+      - 'guest/portd/**'
+      - 'app/cli/**'
+      - 'runtime/vmmon/**'
+      - 'runtime/netd/**'
+      - 'guest/agent/**'
+      - 'guest/init/**'
+      - 'specs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.github/workflows/system-image.yml'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish only after all native qualification jobs pass
+        required: true
+        default: false
+        type: boolean
+      tag:
+        description: Final GHCR tag (for example, v0.4.0)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/system
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Build native image archive
+        run: >-
+          nix develop .#ci --command make -C resources/images/system archive
+          ARCH=${{ matrix.arch }}
+          IMAGE=system-candidate:${{ github.sha }}-${{ matrix.arch }}
+          SOURCE_REVISION=${{ github.sha }}
+
+      - name: Inspect image contract
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          TAG: system-candidate:${{ github.sha }}-${{ matrix.arch }}
+        run: |
+          docker load --input resources/images/system/.dist/system-image.tar
+          test "$(docker image inspect "$TAG" --format '{{.Architecture}}')" = "$EXPECTED_ARCH"
+          test "$(docker image inspect "$TAG" --format '{{index .Config.Labels "io.silo.system.schema"}}')" = 1
+          docker run --rm --entrypoint jq "$TAG" -e \
+            --arg architecture "$EXPECTED_ARCH" \
+            '.schema == 1 and .architecture == $architecture and .engine == "docker"' \
+            /usr/lib/silo-system/manifest.json
+          docker run --rm --entrypoint dockerd "$TAG" --validate --config-file=/etc/docker/daemon.json
+          docker run --rm --entrypoint cat "$TAG" /usr/lib/silo-system/packages.tsv \
+            > resources/images/system/.dist/packages.tsv
+          sha256sum resources/images/system/.dist/system-image.tar \
+            resources/images/system/.dist/packages.tsv \
+            resources/images/system/.dist/build-metadata.json \
+            > resources/images/system/.dist/SHA256SUMS
+
+      - name: Upload inspected image inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: system-image-${{ matrix.arch }}
+          path: resources/images/system/.dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  push-candidates:
+    name: push candidate images
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && inputs.tag != '' }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: system-image-release
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      reference: ${{ steps.candidate.outputs.reference }}
+    steps:
+      - name: Download image archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: system-image-*
+          path: target/system-images
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Push architecture candidates and index
+        id: candidate
+        run: |
+          for arch in amd64 arm64; do
+            docker load --input "target/system-images/system-image-$arch/system-image.tar"
+            source="system-candidate:${GITHUB_SHA}-$arch"
+            target="$IMAGE:candidate-${GITHUB_SHA}-$arch"
+            docker tag "$source" "$target"
+            docker push "$target"
+          done
+          docker buildx imagetools create \
+            --tag "$IMAGE:candidate-$GITHUB_SHA" \
+            "$IMAGE:candidate-${GITHUB_SHA}-amd64" \
+            "$IMAGE:candidate-${GITHUB_SHA}-arm64"
+          digest="sha256:$(docker buildx imagetools inspect "$IMAGE:candidate-$GITHUB_SHA" --raw | sha256sum | cut -d ' ' -f 1)"
+          printf 'reference=%s@%s\n' "$IMAGE" "$digest" >> "$GITHUB_OUTPUT"
+
+  qualify:
+    name: qualify ${{ matrix.platform }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && inputs.tag != '' }}
+    needs: push-candidates
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: macos-arm64
+            runner: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Require native virtualization
+        run: |
+          if [ "${{ runner.os }}" = Linux ]; then test -r /dev/kvm -a -w /dev/kvm; fi
+          if [ "${{ runner.os }}" = macOS ]; then test "$(uname -m)" = arm64; fi
+
+      - name: Log in to candidate registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | nix develop .#ci --command docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Build matching Silo runtime
+        run: nix develop .#ci --command make build PROFILE=release
+
+      - name: Qualify boot, Docker, shutdown, and persistence
+        env:
+          SILO_BIN: target/release/silo
+        run: DOCKER_CONFIG="$HOME/.docker" nix develop .#ci --command resources/images/system/qualify.sh "${{ needs.push-candidates.outputs.reference }}"
+
+  publish:
+    name: publish qualified index
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && inputs.tag != '' }}
+    needs:
+      - push-candidates
+      - qualify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: system-image-release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Publish qualified tag and release input
+        env:
+          FINAL_TAG: ${{ inputs.tag }}
+          CANDIDATE: ${{ needs.push-candidates.outputs.reference }}
+        run: |
+          docker buildx imagetools create --tag "$IMAGE:$FINAL_TAG" "$CANDIDATE"
+          digest="sha256:$(docker buildx imagetools inspect "$IMAGE:$FINAL_TAG" --raw | sha256sum | cut -d ' ' -f 1)"
+          printf 'SILO_SYSTEM_IMAGE=%s@%s\n' "$IMAGE" "$digest" > system-image.env
+          cat system-image.env >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload qualified release input
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: system-image-release-input
+          path: system-image.env
+          if-no-files-found: error
+          retention-days: 30

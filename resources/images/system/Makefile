@@ -17,7 +17,7 @@ ROOT := ../../..
 PORTD := $(ROOT)/target/$(RUST_TARGET)/release/silo-portd
 HOST_ARCH := $(shell uname -m)
 
-.PHONY: portd build rootfs verify clean
+.PHONY: portd build archive rootfs verify clean
 portd:
 	@test "$(ARCH):$(HOST_ARCH)" = "amd64:x86_64" -o "$(ARCH):$(HOST_ARCH)" = "arm64:aarch64" || \
 		{ printf 'ARCH=%s requires a native matching build host (found %s)\n' "$(ARCH)" "$(HOST_ARCH)" >&2; exit 1; }
@@ -33,6 +33,14 @@ build: portd
 		--network $(BUILD_NETWORK) \
 		--build-arg SOURCE_REVISION=$(SOURCE_REVISION) \
 		--tag $(IMAGE) -f Containerfile .
+
+archive: portd
+	mkdir -p .dist
+	docker buildx build --platform $(DOCKER_PLATFORM) \
+		--network $(BUILD_NETWORK) \
+		--build-arg SOURCE_REVISION=$(SOURCE_REVISION) \
+		--tag $(IMAGE) --output type=docker,dest=.dist/system-image.tar \
+		--metadata-file .dist/build-metadata.json -f Containerfile .
 
 rootfs: portd
 	mkdir -p .dist
