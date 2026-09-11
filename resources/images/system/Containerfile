@@ -18,11 +18,12 @@ LABEL org.opencontainers.image.source="https://github.com/vandycknick/silo" \
 
 COPY files/usr/sbin/policy-rc.d /usr/sbin/policy-rc.d
 
+# APT signatures authenticate the snapshot while current CA roots are bootstrapped.
 RUN set -eux; \
     chmod 0755 /usr/sbin/policy-rc.d; \
     printf '%s\n' \
-      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
-      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
+      "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
       > /etc/apt/sources.list; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
     apt-get update; \
