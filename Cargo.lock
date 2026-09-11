@@ -696,6 +696,7 @@ dependencies = [
  "chrono",
  "clap",
  "console",
+ "disk-image",
  "eyre",
  "indicatif",
  "libc",
@@ -709,6 +710,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "utils",
+ "uuid",
  "vm-spec",
 ]
 
