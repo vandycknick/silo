@@ -14,6 +14,7 @@ $(error ARCH must be amd64 or arm64)
 endif
 
 ROOT := ../../..
+CARGO_TARGET_DIR := $(abspath $(ROOT)/target)
 PORTD := $(ROOT)/target/$(RUST_TARGET)/release/silo-portd
 HOST_ARCH := $(shell uname -m)
 
@@ -21,7 +22,8 @@ HOST_ARCH := $(shell uname -m)
 portd:
 	@test "$(ARCH):$(HOST_ARCH)" = "amd64:x86_64" -o "$(ARCH):$(HOST_ARCH)" = "arm64:aarch64" || \
 		{ printf 'ARCH=%s requires a native matching build host (found %s)\n' "$(ARCH)" "$(HOST_ARCH)" >&2; exit 1; }
-	$(MAKE) -C $(ROOT) portd PROFILE=release
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" cargo zigbuild --locked \
+		--manifest-path $(ROOT)/Cargo.toml -p silo-portd --target $(RUST_TARGET) --release
 	mkdir -p .dist
 	cp $(PORTD) .dist/silo-portd
 	@file .dist/silo-portd | grep -q 'statically linked\|static-pie linked'
