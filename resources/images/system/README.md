@@ -1,6 +1,6 @@
 # Silo system appliance
 
-This directory builds `ghcr.io/vandycknick/system`, the Debian 13 appliance
+This directory builds `ghcr.io/vandycknick/silo/system`, the Debian 13 appliance
 used by the optional per-user Silo system service. It is an OCI root filesystem,
 not a Docker-in-Docker bootstrap container. Silo materializes and boots it as a
 normal persistent VM.

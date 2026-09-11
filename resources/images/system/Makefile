@@ -1,5 +1,5 @@
 ARCH ?= amd64
-IMAGE ?= ghcr.io/vandycknick/system:dev
+IMAGE ?= ghcr.io/vandycknick/silo/system:dev
 SOURCE_REVISION ?= $(shell git rev-parse HEAD)
 BUILD_NETWORK ?= default
 

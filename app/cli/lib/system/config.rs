@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use utils::HumanSize;
 
 #[cfg(debug_assertions)]
-const DEVELOPMENT_IMAGE: &str = "ghcr.io/vandycknick/system:dev";
+const DEVELOPMENT_IMAGE: &str = "ghcr.io/vandycknick/silo/system:dev";
 const RELEASE_IMAGE: Option<&str> = option_env!("SILO_SYSTEM_IMAGE");
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -371,7 +371,7 @@ mod tests {
             serde_yaml_ng::from_str("version: '1'\nsystem: {}\n").expect("config");
         assert_eq!(
             config.resolve(temp.path(), None).expect("resolve").image,
-            "ghcr.io/vandycknick/system:dev"
+            "ghcr.io/vandycknick/silo/system:dev"
         );
     }
 
