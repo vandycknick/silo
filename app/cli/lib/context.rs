@@ -1,13 +1,14 @@
 use eyre::Context as _;
 use libvm::{Machine, MachineRef, Runtime, RuntimeConfig};
 
+use crate::api::AppApi;
 use crate::config::GlobalConfig;
 
 #[derive(Debug)]
 pub struct Context {
     verbose: u8,
     config: Option<GlobalConfig>,
-    runtime: Option<Runtime>,
+    api: Option<AppApi>,
 }
 
 impl Context {
@@ -15,7 +16,7 @@ impl Context {
         Self {
             verbose,
             config: None,
-            runtime: None,
+            api: None,
         }
     }
 
@@ -34,20 +35,19 @@ impl Context {
     }
 
     pub(crate) async fn runtime(&mut self) -> eyre::Result<&Runtime> {
-        if self.runtime.is_none() {
+        if self.api.is_none() {
             let networking = self.config()?.networking.clone();
             let runtime_config = RuntimeConfig::from_env()
                 .context("resolve libvm runtime config")?
                 .with_networking(networking);
-            let runtime = Runtime::new(runtime_config)
-                .await
-                .context("initialize libvm")?;
-            self.runtime = Some(runtime);
+            self.api = Some(AppApi::local(runtime_config));
         }
 
-        self.runtime
-            .as_ref()
-            .ok_or_else(|| eyre::eyre!("libvm runtime was not initialized"))
+        self.api
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("application API was not initialized"))?
+            .runtime()
+            .await
     }
 
     pub(crate) fn resolve_machine_name(&mut self, name: Option<&str>) -> eyre::Result<String> {
