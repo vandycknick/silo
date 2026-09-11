@@ -1,4 +1,6 @@
+mod api;
 pub mod app;
+mod boundary;
 pub mod commands;
 pub mod config;
 pub mod context;
