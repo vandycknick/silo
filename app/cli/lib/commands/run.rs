@@ -6,17 +6,16 @@ use std::time::Duration;
 use clap::Args;
 use libvm::{
     ImageProgressSender, MachineExitOutcome, MachineReadinessOutcome, MachineRetention,
-    MachineRunId, MachineStartOptions, MachineWaitOptions, ReadOnlyRuntime, RuntimeConfig,
+    MachineRunId, MachineStartOptions, MachineWaitOptions, RuntimeConfig,
     DEFAULT_GUEST_READINESS_TIMEOUT,
 };
 
+use crate::api::machine::AppMachine;
 use crate::commands::create::{
-    create_machine, ensure_name_available, ensure_read_only_name_available, load_template,
-    machine_settings, parse_environment, read_environment_layers, render_plan, resolve_plan,
-    resolve_read_only_source, resolve_source, selected_image_reference, validate_process_overrides,
-    MachineCliOptions, PlanInputs, Pull, VmOverrideArgs,
+    load_template, machine_settings, parse_environment, read_environment_layers, render_plan,
+    resolve_plan, selected_image_reference, validate_process_overrides, MachineCliOptions,
+    PlanInputs, Pull, VmOverrideArgs,
 };
-use crate::commands::start_options::machine_start_options_without_cleanup;
 use crate::environment::EnvironmentOverride;
 use crate::planning::{Plan, PlanKind, ProcessOverrides, RunOptions, TtyCapabilities, TtyMode};
 use crate::ui::{self, watch_image_progress, OutputFormat, Spinner};
@@ -146,21 +145,12 @@ impl Cmd {
             MachineRetention::Ephemeral
         };
         if self.dry_run {
-            let runtime = ReadOnlyRuntime::open(RuntimeConfig::from_env()?)
-                .await
-                .map_err(|error| execution_infrastructure(error.into()))?;
-            let name = match self.name {
-                Some(name) => {
-                    ensure_read_only_name_available(&runtime, &name).await?;
-                    name
-                }
-                None => runtime.propose_machine_name()?,
-            };
-            let source = resolve_read_only_source(
-                &runtime,
+            let resolution = crate::api::AppApi::resolve_read_only_creation(
+                RuntimeConfig::from_env()?,
+                self.name,
                 self.image.as_deref(),
                 &template.template,
-                self.pull,
+                self.pull.map(Pull::policies),
             )
             .await
             .map_err(execution_infrastructure)?;
@@ -168,14 +158,14 @@ impl Cmd {
             let plan = resolve_plan(PlanInputs {
                 kind: PlanKind::Run(run_options),
                 template,
-                image: source.plan_image,
-                image_is_positional: source.is_positional,
+                image: resolution.source.plan_image,
+                image_is_positional: resolution.source.is_positional,
                 machine_overrides: machine.overrides,
                 machine_settings: settings,
                 process_overrides,
                 command_tail: self.command,
                 retention,
-                name: Some(name),
+                name: Some(resolution.name),
                 environment_files,
                 host_environment,
                 environment_overrides: self.env,
@@ -185,28 +175,25 @@ impl Cmd {
 
         let image_reference = selected_image_reference(self.image.as_deref(), &template.template)?;
         let recipe_progress = Spinner::start("Reading", "run recipe");
-        let runtime = context
-            .runtime()
-            .await
-            .map_err(execution_infrastructure)?
-            .clone();
         if let Some(name) = &self.name {
-            ensure_name_available(&runtime, name).await?;
+            context.app_api().await?.ensure_name_available(name).await?;
         }
         recipe_progress.finish_clear();
 
         let (image_progress, image_events) = ImageProgressSender::default_channel();
         let image_progress_task = watch_image_progress(&image_reference, image_events);
-        let progress_runtime = runtime.clone().with_image_progress(image_progress);
         let image_result = async {
-            let source = resolve_source(
-                &progress_runtime,
-                self.image.as_deref(),
-                &template.template,
-                self.pull,
-            )
-            .await
-            .map_err(execution_infrastructure)?;
+            let source = context
+                .app_api()
+                .await?
+                .resolve_source(
+                    self.image.as_deref(),
+                    &template.template,
+                    self.pull.map(Pull::policies),
+                    image_progress,
+                )
+                .await
+                .map_err(execution_infrastructure)?;
             let settings = machine_settings(&machine);
             let plan = resolve_plan(PlanInputs {
                 kind: PlanKind::Run(run_options),
@@ -226,29 +213,23 @@ impl Cmd {
             let Plan::Run(plan) = plan else {
                 unreachable!("run resolution returns a run plan")
             };
-            let machine = create_machine(&progress_runtime, &plan.create, source, context)
+            let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
+            let data = context
+                .app_api()
+                .await?
+                .create_machine(&plan.create, source, policy_config_dir.as_deref())
                 .await
                 .map_err(execution_infrastructure)?;
-            Ok::<_, eyre::Report>((plan, machine))
+            Ok::<_, eyre::Report>((plan, data))
         };
         let image_result = image_result.await;
-        drop(progress_runtime);
         let _ = image_progress_task.await;
-        let (plan, machine) = image_result?;
-        let name = match machine.inspect().await {
-            Ok(data) => data.name,
-            Err(error) => {
-                return Err(cleanup_foreground_failure(
-                    &machine,
-                    plan.create.retention,
-                    error.into(),
-                )
-                .await)
-            }
-        };
+        let (plan, created) = image_result?;
+        let name = created.name;
+        let (_reference, machine) = context.machine(Some(&created.id)).await?;
         if plan.detached {
             let progress = Spinner::start("Starting", &name);
-            let options = match detached_start_options(&runtime, &machine, &plan).await {
+            let options = match detached_start_options(context, &machine, &plan).await {
                 Ok(options) => options,
                 Err(error) => {
                     return Err(
@@ -270,7 +251,12 @@ impl Cmd {
         }
 
         let mut progress = Spinner::start("Starting", &name);
-        let options = match machine_start_options_without_cleanup(&runtime, &machine).await {
+        let options = match context
+            .app_api()
+            .await?
+            .machine_start_options(&machine, false)
+            .await
+        {
             Ok(options) => options,
             Err(error) => {
                 return Err(
@@ -324,7 +310,8 @@ impl Cmd {
         progress.step("Ready", &name);
         progress.finish_success("Started");
         let execution =
-            crate::guest::run_process(&machine, &plan.create.process, &plan.argv, plan.tty).await;
+            crate::api::streams::run_process(&machine, &plan.create.process, &plan.argv, plan.tty)
+                .await;
         let stop = stop_run(&machine, start.run_id, plan.create.retention).await;
         let result = match execution {
             Ok(result) => result,
@@ -388,8 +375,8 @@ fn parse_entrypoint(value: &str) -> Result<String, String> {
 }
 
 async fn detached_start_options(
-    runtime: &libvm::Runtime,
-    machine: &libvm::Machine,
+    context: &mut crate::context::Context,
+    machine: &AppMachine,
     plan: &crate::planning::RunPlan,
 ) -> eyre::Result<MachineStartOptions> {
     let process = &plan.create.process;
@@ -397,7 +384,11 @@ async fn detached_start_options(
         .argv
         .split_first()
         .ok_or_else(|| eyre::eyre!("guest command is required"))?;
-    let options = crate::commands::start_options::machine_start_options(runtime, machine).await?;
+    let options = context
+        .app_api()
+        .await?
+        .machine_start_options(machine, true)
+        .await?;
     let process = process.clone();
     let program = program.clone();
     let args = args.to_vec();
@@ -414,7 +405,7 @@ async fn detached_start_options(
 }
 
 async fn stop_run(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     run_id: MachineRunId,
     retention: MachineRetention,
 ) -> eyre::Result<()> {
@@ -429,7 +420,7 @@ async fn stop_run(
 }
 
 async fn diagnose_readiness_failure(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     run_id: MachineRunId,
     retention: MachineRetention,
     error: libvm::LibVmError,
@@ -444,7 +435,7 @@ async fn diagnose_readiness_failure(
 }
 
 async fn diagnose_backend_exit(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     run_id: MachineRunId,
     retention: MachineRetention,
 ) -> Option<eyre::Report> {
@@ -496,7 +487,7 @@ fn execution_infrastructure(error: eyre::Report) -> eyre::Report {
 }
 
 async fn cleanup_foreground_failure(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     retention: MachineRetention,
     error: eyre::Report,
 ) -> eyre::Report {
@@ -505,7 +496,7 @@ async fn cleanup_foreground_failure(
 }
 
 async fn foreground_stop_failure(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     retention: MachineRetention,
     stop: eyre::Result<()>,
     error: eyre::Report,
@@ -523,7 +514,7 @@ async fn foreground_stop_failure(
     }
 }
 
-async fn cleanup_ephemeral_best_effort(machine: &libvm::Machine, retention: MachineRetention) {
+async fn cleanup_ephemeral_best_effort(machine: &AppMachine, retention: MachineRetention) {
     if retention != MachineRetention::Ephemeral {
         return;
     }

@@ -34,8 +34,7 @@ impl Cmd {
             return Ok(());
         };
 
-        let (_name, machine) = context.machine(Some(name)).await?;
-        let inspect_data = machine.inspect().await?;
+        let inspect_data = context.app_api().await?.inspect_machine(name).await?;
         ensure_defaultable(inspect_data.retention, &inspect_data.name)?;
         GlobalConfig::write_default_machine(Some(inspect_data.name.as_str()))?;
         println!("default machine is {}", inspect_data.name);

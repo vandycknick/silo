@@ -1,8 +1,8 @@
 use clap::{Args, ValueEnum};
 use eyre::bail;
 
+use crate::api::streams as guest;
 use crate::context::Context;
-use crate::guest;
 use crate::terminal;
 use crate::ui;
 
@@ -49,8 +49,9 @@ impl Cmd {
         }
 
         guest::ensure_guest_ready(&inspect_data)?;
-        let status =
-            guest::attach_shell(&machine, self.user.as_deref(), self.forward_agent).await?;
+        let status = machine
+            .attach_shell(self.user.as_deref(), self.forward_agent)
+            .await?;
         std::process::exit(status.code);
     }
 }

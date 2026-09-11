@@ -1,0 +1,16 @@
+{
+  "data-root": "/var/lib/docker",
+  "features": {
+    "containerd-snapshotter": true
+  },
+  "iptables": true,
+  "ip6tables": true,
+  "live-restore": false,
+  "log-driver": "local",
+  "log-opts": {
+    "max-file": "3",
+    "max-size": "10m"
+  },
+  "userland-proxy": true,
+  "userland-proxy-path": "/usr/bin/silo-portd"
+}
