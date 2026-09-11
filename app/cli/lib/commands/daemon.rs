@@ -57,9 +57,11 @@ impl Cmd {
                 if command.foreground {
                     return run_foreground(context).await;
                 }
-                let _ = command.no_switch_context;
                 let (paths, config) = context.resolved_system_config(None)?;
-                crate::system::service::up(&paths, config)
+                let daemon_live = crate::system::service::status(&paths)?.is_some();
+                crate::system::docker::preflight(&config, daemon_live)?;
+                crate::system::service::up(&paths, config.clone())?;
+                crate::system::docker::integrate(&config, !command.no_switch_context)
             }
             DaemonCommand::Down => {
                 let paths = crate::system::ownership::default_system_paths()?;
