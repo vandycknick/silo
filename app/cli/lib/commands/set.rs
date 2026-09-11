@@ -63,9 +63,16 @@ fn after_help() -> clap::builder::StyledStr {
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         let parsed = ParsedSet::parse(&self.args)?;
-        let (_reference, machine) = context.machine(parsed.machine.as_deref()).await?;
+        let reference = context.resolve_machine_name(parsed.machine.as_deref())?;
         let old_name = if parsed.update.name.is_some() {
-            Some(machine.inspect().await?.name)
+            Some(
+                context
+                    .app_api()
+                    .await?
+                    .inspect_machine(&reference)
+                    .await?
+                    .name,
+            )
         } else {
             None
         };
@@ -74,11 +81,12 @@ impl Cmd {
             .as_deref()
             .is_some_and(|name| default_machine.as_deref() == Some(name));
 
-        let data = machine.update(parsed.update).await.map_err(|err| match err {
-            libvm::LibVmError::MachineAlreadyRunning { reference } => eyre::eyre!(
+        let data = context.app_api().await?.update_machine(&reference, parsed.update).await.map_err(|err| match err.downcast::<libvm::LibVmError>() {
+            Ok(libvm::LibVmError::MachineAlreadyRunning { reference }) => eyre::eyre!(
                 "{reference} is running\n\nhint: stop it with `silo stop {reference}` before changing settings"
             ),
-            other => eyre::Report::from(other),
+            Ok(other) => eyre::Report::from(other),
+            Err(other) => other,
         })?;
 
         if update_default {

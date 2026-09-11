@@ -43,7 +43,7 @@ pub(crate) async fn machine_start_options_without_cleanup(
     Ok(options)
 }
 
-fn cleanup_on_exit_options(
+pub(crate) fn cleanup_on_exit_options(
     executable: PathBuf,
     data_dir: &Path,
     machine_id: &str,
