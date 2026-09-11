@@ -14,8 +14,6 @@ pub(crate) struct SourceResolution {
 
 #[derive(Debug)]
 pub(crate) struct SystemImageResolution {
-    pub(crate) reference: String,
-    pub(crate) digest: String,
     pub(crate) image: libvm::ResolvedOciImage,
 }
 

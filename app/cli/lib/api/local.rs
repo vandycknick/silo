@@ -407,11 +407,7 @@ impl LocalVmService {
                 },
             )
             .await?;
-        Ok(SystemImageResolution {
-            reference: image.selected_reference.clone(),
-            digest: image.manifest_digest.clone(),
-            image,
-        })
+        Ok(SystemImageResolution { image })
     }
 
     pub(crate) async fn create_system_machine(

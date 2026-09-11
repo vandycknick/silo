@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use eyre::{bail, Context as _};
+use eyre::bail;
 use libvm::MachineData;
 
 use crate::system::record::{load_record, SystemRecord};
@@ -77,14 +77,6 @@ fn absolute(name: &'static str, value: std::ffi::OsString) -> eyre::Result<PathB
         );
     }
     Ok(path)
-}
-
-pub(crate) fn require_local_path(path: &Path) -> eyre::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| eyre::eyre!("path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    Ok(())
 }
 
 #[cfg(test)]
