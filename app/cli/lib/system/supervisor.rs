@@ -331,6 +331,47 @@ pub(crate) fn read_status(paths: &SystemPaths) -> eyre::Result<Option<DaemonStat
     load_record(&paths.status())
 }
 
+pub(crate) fn last_run_root(paths: &SystemPaths) -> eyre::Result<Option<std::path::PathBuf>> {
+    let Some(owner) = load_record::<OwnerRecord>(&paths.owner())? else {
+        return Ok(None);
+    };
+    let run_root = std::path::PathBuf::from(owner.run_root);
+    if !run_root.is_absolute() {
+        bail!("recorded daemon run root is not absolute");
+    }
+    Ok(Some(run_root))
+}
+
+pub(crate) fn status_owner_is_live(
+    paths: &SystemPaths,
+    status: &DaemonStatus,
+) -> eyre::Result<bool> {
+    let Some(owner) = load_record::<OwnerRecord>(&paths.owner())? else {
+        return Ok(false);
+    };
+    if owner.generation != status.generation || owner.pid != status.pid {
+        return Ok(false);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = match std::fs::read_to_string(format!("/proc/{}/stat", owner.pid)) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let end = stat
+            .rfind(')')
+            .ok_or_else(|| eyre::eyre!("invalid process stat for daemon PID {}", owner.pid))?;
+        let start = stat[end + 2..]
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(|| eyre::eyre!("missing daemon process start time"))?;
+        Ok(start == owner.process_start)
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::system::supervisor::LifetimeLock;

@@ -10,12 +10,13 @@ use crate::system::config::ResolvedSystemConfig;
 
 const MAX_RECORD_BYTES: u64 = 256 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SystemPaths {
     pub(crate) config_root: PathBuf,
     pub(crate) data_root: PathBuf,
     pub(crate) state_root: PathBuf,
     pub(crate) run_root: PathBuf,
+    pub(crate) image_root: PathBuf,
 }
 
 impl SystemPaths {
@@ -24,12 +25,14 @@ impl SystemPaths {
         data_root: PathBuf,
         state_root: PathBuf,
         run_root: PathBuf,
+        image_root: PathBuf,
     ) -> Self {
         Self {
             config_root,
             data_root,
             state_root,
             run_root,
+            image_root,
         }
     }
 

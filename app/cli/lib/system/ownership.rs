@@ -50,12 +50,13 @@ pub(crate) fn default_system_paths() -> eyre::Result<crate::system::record::Syst
     let config = xdg_root("XDG_CONFIG_HOME", ".config")?.join("silo");
     let data = xdg_root("XDG_DATA_HOME", ".local/share")?.join("silo");
     let state = xdg_root("XDG_STATE_HOME", ".local/state")?.join("silo");
+    let image = xdg_root("XDG_CACHE_HOME", ".cache")?.join("silo/images");
     let run = match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(value) => absolute("XDG_RUNTIME_DIR", value)?.join("silo"),
         None => PathBuf::from(format!("/tmp/silo-{}", nix::unistd::geteuid().as_raw())),
     };
     Ok(crate::system::record::SystemPaths::new(
-        config, data, state, run,
+        config, data, state, run, image,
     ))
 }
 

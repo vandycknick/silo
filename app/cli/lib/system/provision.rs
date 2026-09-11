@@ -15,9 +15,18 @@ pub(crate) async fn ensure_system_machine(
     paths: &SystemPaths,
     config: ResolvedSystemConfig,
 ) -> eyre::Result<(SystemRecord, MachineData)> {
+    let installation = prepare_installation(paths, &config)?;
+
+    ensure_system_machine_for_installation(api, paths, config, installation).await
+}
+
+pub(crate) fn prepare_installation(
+    paths: &SystemPaths,
+    config: &ResolvedSystemConfig,
+) -> eyre::Result<InstallationRecord> {
     let installation = match load_record::<InstallationRecord>(&paths.installation())? {
         Some(record) => {
-            validate_installation(&record, &config)?;
+            validate_installation(&record, config)?;
             record
         }
         None => {
@@ -41,6 +50,15 @@ pub(crate) async fn ensure_system_machine(
         installation.data_uuid,
     )?;
 
+    Ok(installation)
+}
+
+async fn ensure_system_machine_for_installation(
+    api: &mut AppApi,
+    paths: &SystemPaths,
+    config: ResolvedSystemConfig,
+    installation: InstallationRecord,
+) -> eyre::Result<(SystemRecord, MachineData)> {
     if let Some(record) = load_record::<SystemRecord>(&paths.system_record())? {
         validate_system_record(&record, &installation, &config)?;
         let machine = api
