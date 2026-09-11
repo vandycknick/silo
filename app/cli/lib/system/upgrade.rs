@@ -559,9 +559,10 @@ fn sparse_copy(source_path: &Path, destination_path: &Path) -> eyre::Result<u64>
         .parent()
         .ok_or_else(|| eyre::eyre!("backup path has no parent"))?;
     let filesystem = nix::sys::statvfs::statvfs(parent)?;
-    let available = filesystem
-        .blocks_available()
-        .saturating_mul(filesystem.fragment_size());
+    // fsblkcnt_t is u32 on macOS and u64 on Linux.
+    #[allow(clippy::useless_conversion)]
+    let available =
+        u64::from(filesystem.blocks_available()).saturating_mul(filesystem.fragment_size());
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt as _;
     let required = std::fs::metadata(source_path)?.blocks().saturating_mul(512);
