@@ -15,6 +15,7 @@ use protocol::v1::{
     ByteChunk, GetMetricsRequest, GetStatusRequest, HostMetrics, HostStatus, WaitReadyOutcome,
     WaitReadyRequest, WaitReadyResponse,
 };
+use protocol::v1::{SetMemoryTargetRequest, SetMemoryTargetResponse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
@@ -52,6 +53,7 @@ pub struct ServiceHandles {
 #[derive(Clone)]
 struct MonitorService {
     store: Arc<InstanceStore>,
+    machine: VirtualMachine,
     finite_capacity: Arc<Semaphore>,
     waiter_capacity: Arc<Semaphore>,
 }
@@ -105,6 +107,55 @@ impl VmMonitorService for MonitorService {
     ) -> Result<Response<HostMetrics>, Status> {
         let _permit = admission(&self.finite_capacity, "monitor finite RPC")?;
         Ok(Response::new(self.store.metrics().map_err(store_status)?))
+    }
+
+    async fn set_memory_target(
+        &self,
+        request: Request<SetMemoryTargetRequest>,
+    ) -> Result<Response<SetMemoryTargetResponse>, Status> {
+        let _permit = admission(&self.finite_capacity, "monitor finite RPC")?;
+        let target_bytes = request
+            .into_inner()
+            .target_bytes
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| {
+                protocol::status_with_error(
+                    tonic::Code::InvalidArgument,
+                    protocol::v1::ErrorCode::InvalidRequest,
+                    "target_bytes must be a positive byte count",
+                    None,
+                )
+            })?;
+        match self.machine.set_memory_target(target_bytes).await {
+            Ok(target_bytes) => Ok(Response::new(SetMemoryTargetResponse {
+                target_bytes: Some(target_bytes),
+            })),
+            Err(error) => Err(memory_target_status(error)),
+        }
+    }
+}
+
+fn memory_target_status(error: crate::virt::VirtError) -> Status {
+    use crate::virt::VirtError;
+    match error {
+        VirtError::UnsupportedBackend { reason, .. } => protocol::status_with_error(
+            tonic::Code::Unimplemented,
+            protocol::v1::ErrorCode::Unsupported,
+            reason,
+            None,
+        ),
+        VirtError::NotRunning { .. } => protocol::status_with_error(
+            tonic::Code::FailedPrecondition,
+            protocol::v1::ErrorCode::PreconditionFailed,
+            "machine is not running",
+            None,
+        ),
+        error => protocol::status_with_error(
+            tonic::Code::Unavailable,
+            protocol::v1::ErrorCode::BackendUnavailable,
+            error.to_string(),
+            None,
+        ),
     }
 }
 
@@ -312,6 +363,7 @@ pub async fn start_services(
     let server_shutdown_signal = server_shutdown.clone();
     let monitor = MonitorService {
         store: ctx.store.clone(),
+        machine: ctx.machine.clone(),
         finite_capacity: Arc::new(Semaphore::new(64)),
         waiter_capacity: Arc::new(Semaphore::new(64)),
     };

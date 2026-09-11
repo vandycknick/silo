@@ -11,8 +11,8 @@ use protocol::v1::vm_monitor_service_client::VmMonitorServiceClient;
 use protocol::v1::{
     CreateDirectoryRequest, DownloadFileRequest, ExecuteInput, ExecutionEvent, GetEntryRequest,
     GetMetricsRequest, GetStatusRequest, HostMetrics, HostStatus, ListDirectoryRequest,
-    ListForwardsRequest, OpenForwardRequest, RemoveEntryRequest, UploadFileRequest,
-    WaitReadyRequest, WaitReadyResponse,
+    ListForwardsRequest, OpenForwardRequest, RemoveEntryRequest, SetMemoryTargetRequest,
+    UploadFileRequest, WaitReadyRequest, WaitReadyResponse,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -28,6 +28,9 @@ pub(crate) enum VmmonClientError {
     Connection(String),
     #[error("{0}")]
     Protocol(String),
+    /// The monitor rejected the operation as unsupported by its backend.
+    #[error("{0}")]
+    Unsupported(String),
     #[error("forward RPC failed: {0}")]
     Forward(ForwardClientError),
 }
@@ -97,6 +100,34 @@ impl VmmonClient {
             .await
             .map(|response| response.into_inner())
             .map_err(|error| rpc_error("vm monitor wait_ready RPC failed", error))
+    }
+
+    pub(crate) async fn set_memory_target(
+        &self,
+        target_bytes: u64,
+    ) -> Result<u64, VmmonClientError> {
+        let mut client = monitor_client(self.channel().await?);
+        let response = client
+            .set_memory_target(timed_request(
+                SetMemoryTargetRequest {
+                    target_bytes: Some(target_bytes),
+                },
+                RPC_TIMEOUT,
+            ))
+            .await
+            .map_err(|error| {
+                if error.code() == tonic::Code::Unimplemented {
+                    VmmonClientError::Unsupported(error.message().to_string())
+                } else {
+                    rpc_error("vm monitor set_memory_target RPC failed", error)
+                }
+            })?
+            .into_inner();
+        response.target_bytes.ok_or_else(|| {
+            VmmonClientError::Protocol(
+                "vm monitor set_memory_target response omitted target_bytes".to_string(),
+            )
+        })
     }
 
     pub(crate) async fn metrics(&self) -> Result<HostMetrics, VmmonClientError> {
@@ -379,6 +410,9 @@ mod tests {
             }
             VmmonClientError::Protocol(message) => {
                 panic!("missing socket was misclassified as a protocol error: {message}")
+            }
+            VmmonClientError::Unsupported(message) => {
+                panic!("missing socket was misclassified as unsupported: {message}")
             }
             VmmonClientError::Forward(error) => {
                 panic!("missing socket was misclassified as a forward error: {error}")

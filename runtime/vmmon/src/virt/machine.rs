@@ -88,6 +88,11 @@ impl VirtualMachine {
         self.inner.serial_console.drain().await
     }
 
+    /// Move the guest to `target_bytes` of memory through the memory balloon.
+    pub async fn set_memory_target(&self, target_bytes: u64) -> Result<u64, VirtError> {
+        self.inner.backend.set_memory_target(target_bytes).await
+    }
+
     /// Dynamically connect to a guest endpoint port.
     pub async fn connect_vsock(&self, port: u32) -> Result<VsockStream, VirtError> {
         let lease = self.reserve_vsock()?;

@@ -521,6 +521,18 @@ impl Machine {
             .and_then(|value| MachineReadiness::try_from(value).map_err(Into::into))
             .map_err(|message| monitor_error(config.name, message))
     }
+    /// Moves the guest to `target_bytes` of memory through its memory balloon and
+    /// returns the target now in effect. Fails with [`LibVmError::MonitorUnsupported`]
+    /// on backends without a balloon.
+    pub async fn set_memory_target(&self, target_bytes: u64) -> Result<u64, LibVmError> {
+        let config = self.running_config().await?;
+        self.runtime()
+            .vmmon()
+            .client(self.machine_id())
+            .set_memory_target(target_bytes)
+            .await
+            .map_err(|error| monitor_error(config.name, error))
+    }
     pub async fn metrics(&self) -> Result<MachineMetrics, LibVmError> {
         let config = self.running_config().await?;
         self.runtime()
@@ -792,6 +804,9 @@ fn monitor_error(reference: String, error: impl Into<VmmonClientError>) -> LibVm
             LibVmError::MonitorConnection { reference, message }
         }
         VmmonClientError::Protocol(message) => LibVmError::MonitorProtocol { reference, message },
+        VmmonClientError::Unsupported(message) => {
+            LibVmError::MonitorUnsupported { reference, message }
+        }
         VmmonClientError::Forward(error) => LibVmError::MonitorProtocol {
             reference,
             message: error.to_string(),

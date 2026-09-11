@@ -10,8 +10,8 @@ use objc2_foundation::{
     NSObject, NSObjectNSKeyValueObserverRegistration, NSObjectProtocol, NSString,
 };
 use objc2_virtualization::{
-    VZNetworkDevice, VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
-    VZVirtualMachineState,
+    VZNetworkDevice, VZVirtioTraditionalMemoryBalloonDevice, VZVirtualMachine,
+    VZVirtualMachineConfiguration, VZVirtualMachineDelegate, VZVirtualMachineState,
 };
 use std::ffi::c_void;
 use std::fmt::{Debug, Display};
@@ -299,6 +299,29 @@ impl VirtualMachine {
 
     pub fn subscribe_state(&self) -> watch::Receiver<VirtualMachineState> {
         self.state_tx.subscribe()
+    }
+
+    /// Asks the traditional memory balloon to move the guest to `target_bytes` of
+    /// memory. Lowering the target inflates the balloon and hands pages back to the
+    /// host; raising it (up to the configured memory size) deflates it. Returns the
+    /// target now recorded on the device.
+    pub fn set_memory_target(&self, target_bytes: u64) -> Result<u64, VzError> {
+        self.queue.exec_sync_with_result(move || unsafe {
+            let Some(device) = self.machine.memoryBalloonDevices().firstObject() else {
+                return Err(VzError::Backend(
+                    "virtual machine has no memory balloon device".to_string(),
+                ));
+            };
+            let device = device
+                .downcast::<VZVirtioTraditionalMemoryBalloonDevice>()
+                .map_err(|_| {
+                    VzError::Backend(
+                        "memory balloon device is not a traditional virtio balloon".to_string(),
+                    )
+                })?;
+            device.setTargetVirtualMachineMemorySize(target_bytes);
+            Ok(device.targetVirtualMachineMemorySize())
+        })
     }
 
     pub fn open_devices(&self) -> Vec<VirtioSocketDevice> {

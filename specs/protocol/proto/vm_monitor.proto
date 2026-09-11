@@ -10,6 +10,9 @@ service VmMonitorService {
   rpc GetStatus(GetStatusRequest) returns (HostStatus);
   rpc WaitReady(WaitReadyRequest) returns (WaitReadyResponse);
   rpc GetMetrics(GetMetricsRequest) returns (HostMetrics);
+  // Moves the guest to the requested amount of memory through its memory
+  // balloon. Unimplemented on backends without a balloon.
+  rpc SetMemoryTarget(SetMemoryTargetRequest) returns (SetMemoryTargetResponse);
 }
 
 service VmAccessService {
@@ -36,6 +39,16 @@ message WaitReadyResponse {
 }
 
 message GetMetricsRequest {}
+
+message SetMemoryTargetRequest {
+  // Guest memory target in bytes, at most the configured memory size.
+  optional uint64 target_bytes = 1;
+}
+
+message SetMemoryTargetResponse {
+  // Target now recorded on the balloon device.
+  optional uint64 target_bytes = 1;
+}
 
 enum VmState {
   VM_STATE_UNSPECIFIED = 0;

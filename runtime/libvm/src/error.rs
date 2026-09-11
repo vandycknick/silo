@@ -112,6 +112,9 @@ pub enum LibVmError {
     #[error("monitor protocol for {reference} failed: {message}")]
     MonitorProtocol { reference: String, message: String },
 
+    #[error("the monitor for {reference} does not support this operation: {message}")]
+    MonitorUnsupported { reference: String, message: String },
+
     #[error("forward request for {reference} was rejected ({grpc_code:?}, {detail:?}): {reason}")]
     ForwardRejected {
         reference: String,
@@ -256,6 +259,7 @@ impl LibVmError {
             Self::MachineLogSourceUnavailable { .. } => "MachineLogSourceUnavailable",
             Self::MonitorConnection { .. } => "MonitorConnection",
             Self::MonitorProtocol { .. } => "MonitorProtocol",
+            Self::MonitorUnsupported { .. } => "MonitorUnsupported",
             Self::ForwardRejected { .. } => "ForwardRejected",
             Self::GuestSession { .. } => "GuestSession",
             Self::MachinePreparationFailed { .. } => "MachinePreparationFailed",

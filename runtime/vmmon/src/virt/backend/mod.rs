@@ -63,6 +63,17 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
 
     /// Open the guest serial device. Called once per boot by the serial console.
     async fn open_serial(&self) -> Result<SerialDevice, VirtError>;
+
+    /// Move the guest to `target_bytes` of memory through its memory balloon and
+    /// return the target now in effect. Backends without a balloon report
+    /// [`VirtError::UnsupportedBackend`]; only Virtualization.framework implements it.
+    async fn set_memory_target(&self, target_bytes: u64) -> Result<u64, VirtError> {
+        let _ = target_bytes;
+        Err(VirtError::UnsupportedBackend {
+            kind: "memory-balloon",
+            reason: "this virtualization backend has no memory balloon".to_string(),
+        })
+    }
 }
 
 /// Identifies a virtualization backend implementation.
