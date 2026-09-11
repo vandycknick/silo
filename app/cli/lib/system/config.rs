@@ -6,7 +6,9 @@ use libvm::PublishBind;
 use serde::{Deserialize, Serialize};
 use utils::HumanSize;
 
-const DEFAULT_IMAGE: &str = "ghcr.io/vandycknick/system:dev";
+#[cfg(debug_assertions)]
+const DEVELOPMENT_IMAGE: &str = "ghcr.io/vandycknick/system:dev";
+const RELEASE_IMAGE: Option<&str> = option_env!("SILO_SYSTEM_IMAGE");
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -257,7 +259,8 @@ impl SystemConfig {
         let image = image_override
             .map(str::to_owned)
             .or_else(|| self.system.image.clone())
-            .unwrap_or_else(|| DEFAULT_IMAGE.to_string());
+            .map(Ok)
+            .unwrap_or_else(default_image)?;
         if image.trim().is_empty() {
             bail!("daemon.system.image cannot be empty");
         }
@@ -280,6 +283,21 @@ impl SystemConfig {
         resolved.identity = format!("fnv1a64:{:016x}", fnv1a64(&bytes));
         Ok(resolved)
     }
+}
+
+fn default_image() -> eyre::Result<String> {
+    if let Some(image) = RELEASE_IMAGE {
+        if !image.contains("@sha256:") {
+            bail!("the build-time SILO_SYSTEM_IMAGE must use an immutable sha256 digest");
+        }
+        return Ok(image.to_string());
+    }
+    #[cfg(debug_assertions)]
+    {
+        Ok(DEVELOPMENT_IMAGE.to_string())
+    }
+    #[cfg(not(debug_assertions))]
+    bail!("this release has no qualified default system image; configure daemon.system.image explicitly")
 }
 
 fn parse_size(value: &str, field: &str) -> eyre::Result<u64> {
@@ -324,13 +342,27 @@ mod tests {
     #[test]
     fn strict_config_resolves_home_and_defaults() {
         let temp = tempfile::tempdir().expect("temp home");
-        let config: SystemConfig =
-            serde_yaml_ng::from_str("version: '1'\nsystem: {}\n").expect("config");
+        let config: SystemConfig = serde_yaml_ng::from_str(
+            "version: '1'\nsystem:\n  image: 'registry.example/system@sha256:test'\n",
+        )
+        .expect("config");
         let resolved = config.resolve(temp.path(), None).expect("resolve");
         assert_eq!(resolved.shares.len(), 1);
         assert_eq!(resolved.data_size_bytes, 64 * 1024 * 1024 * 1024);
         assert_eq!(resolved.compatibility_socket, CompatibilitySocket::Auto);
         assert!(resolved.identity.starts_with("fnv1a64:"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_build_has_an_explicit_development_image() {
+        let temp = tempfile::tempdir().expect("temp home");
+        let config: SystemConfig =
+            serde_yaml_ng::from_str("version: '1'\nsystem: {}\n").expect("config");
+        assert_eq!(
+            config.resolve(temp.path(), None).expect("resolve").image,
+            "ghcr.io/vandycknick/system:dev"
+        );
     }
 
     #[test]

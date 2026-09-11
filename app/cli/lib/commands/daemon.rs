@@ -155,6 +155,7 @@ async fn follow_logs(path: &std::path::Path) -> eyre::Result<()> {
 
 async fn run_foreground(context: &mut Context) -> eyre::Result<()> {
     let (paths, config) = context.resolved_system_config(None)?;
+    crate::system::docker::preflight(&config, false)?;
     let api = context.app_api().await?;
     crate::system::supervisor::serve(api, paths, config).await
 }

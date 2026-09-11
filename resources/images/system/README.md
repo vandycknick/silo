@@ -36,6 +36,14 @@ publishes the two images by digest and creates the multi-platform index only
 after both builds and qualification lanes pass. `make rootfs` emits the OCI
 root filesystem tar consumed by the existing image-to-ext4 path.
 
+Publication is manual and protected by the `system-image-release` GitHub
+environment. It first publishes revision-scoped candidates, boots the resulting
+immutable index on native Linux amd64, Linux arm64, and macOS arm64 runners, and
+only then creates the requested release tag. The workflow emits
+`system-image.env`; release CLI builds consume its immutable
+`SILO_SYSTEM_IMAGE=...@sha256:...` value. Unqualified release builds have no
+floating image default. Debug builds alone retain the explicit `:dev` default.
+
 `make verify` checks the source contract without requiring a running Docker
 daemon. A container build additionally validates packages, configuration,
 units, proxy binaries, static portd installation, and records the package lock.
