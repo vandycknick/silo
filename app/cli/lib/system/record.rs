@@ -69,6 +69,9 @@ impl SystemPaths {
     pub(crate) fn upgrade(&self) -> PathBuf {
         self.daemon_data().join("upgrade.json")
     }
+    pub(crate) fn completed_upgrade(&self) -> PathBuf {
+        self.daemon_data().join("upgrade-completed.json")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +82,7 @@ pub(crate) struct InstallationRecord {
     pub(crate) data_uuid: Uuid,
     pub(crate) data_layout: u32,
     pub(crate) data_size_bytes: u64,
+    pub(crate) configured_image: String,
     pub(crate) config: ResolvedSystemConfig,
 }
 

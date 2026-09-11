@@ -412,6 +412,7 @@ impl LocalVmService {
 
     pub(crate) async fn create_system_machine(
         &mut self,
+        name: &str,
         config: &crate::system::config::ResolvedSystemConfig,
         installation_id: uuid::Uuid,
         data_image: &std::path::Path,
@@ -439,7 +440,7 @@ impl LocalVmService {
             .runtime()
             .await?
             .machine()
-            .name(crate::system::SYSTEM_MACHINE_NAME)
+            .name(name)
             .resolved_image(source.image)
             .label(
                 crate::system::MANAGED_ROLE_LABEL,

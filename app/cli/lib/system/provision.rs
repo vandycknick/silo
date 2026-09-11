@@ -36,6 +36,7 @@ pub(crate) fn prepare_installation(
                 data_uuid: Uuid::new_v4(),
                 data_layout: 1,
                 data_size_bytes: config.data_size_bytes,
+                configured_image: config.image.clone(),
                 config: config.clone(),
             };
             write_record(&paths.installation(), &record)?;
@@ -87,6 +88,7 @@ async fn ensure_system_machine_for_installation(
             let (progress, _receiver) = ImageProgressSender::channel(1);
             let source = api.resolve_system_image(&config.image, progress).await?;
             api.create_system_machine(
+                crate::system::SYSTEM_MACHINE_NAME,
                 &config,
                 installation.installation_id,
                 &paths.data_image(),
@@ -218,6 +220,7 @@ mod tests {
             data_uuid: uuid::Uuid::new_v4(),
             data_layout: 1,
             data_size_bytes: resolved.data_size_bytes,
+            configured_image: resolved.image.clone(),
             config: resolved.clone(),
         };
         assert!(validate_installation(&record, &resolved).is_ok());

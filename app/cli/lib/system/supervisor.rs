@@ -14,7 +14,7 @@ use crate::system::config::ResolvedSystemConfig;
 use crate::system::provision::ensure_system_machine;
 use crate::system::record::{load_record, write_record, SystemPaths};
 
-const READY_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -209,7 +209,7 @@ pub(crate) async fn serve(
     Ok(())
 }
 
-async fn activate(
+pub(crate) async fn activate(
     machine: &crate::api::machine::AppMachine,
     config: &ResolvedSystemConfig,
     data_uuid: Uuid,
@@ -242,7 +242,7 @@ async fn activate(
     Ok(())
 }
 
-fn probe_docker_socket(path: &Path) -> eyre::Result<()> {
+pub(crate) fn probe_docker_socket(path: &Path) -> eyre::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::net::UnixStream;

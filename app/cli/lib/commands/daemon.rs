@@ -18,6 +18,8 @@ enum DaemonCommand {
     Status(Status),
     /// Read bounded daemon supervisor logs.
     Logs(Logs),
+    /// Replace the system image while retaining installation-owned engine data.
+    Upgrade(Upgrade),
     #[command(hide = true)]
     Serve(Serve),
 }
@@ -42,6 +44,14 @@ struct Logs {
     follow: bool,
     #[arg(long, default_value_t = 200)]
     lines: usize,
+}
+
+#[derive(Debug, Args)]
+struct Upgrade {
+    #[arg(long, required_unless_present = "recover", conflicts_with = "recover")]
+    image: Option<String>,
+    #[arg(long, conflicts_with = "image")]
+    recover: bool,
 }
 
 #[derive(Debug, Args)]
@@ -97,6 +107,18 @@ impl Cmd {
                     follow_logs(&paths.log()).await?;
                 }
                 Ok(())
+            }
+            DaemonCommand::Upgrade(command) => {
+                let paths = crate::system::ownership::default_system_paths()?;
+                if command.recover {
+                    return crate::system::upgrade::recover(context.app_api().await?, &paths).await;
+                }
+                let image = command
+                    .image
+                    .ok_or_else(|| eyre::eyre!("--image is required"))?;
+                let (_, config) = context.resolved_system_config(None)?;
+                crate::system::upgrade::upgrade(context.app_api().await?, &paths, config, &image)
+                    .await
             }
         }
     }
@@ -177,5 +199,17 @@ mod tests {
         .is_ok());
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "down"]).is_ok());
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "logs", "--follow"]).is_ok());
+        assert!(crate::app::Cli::try_parse_from([
+            "silo",
+            "daemon",
+            "upgrade",
+            "--image",
+            "registry.example/system@sha256:test"
+        ])
+        .is_ok());
+        assert!(
+            crate::app::Cli::try_parse_from(["silo", "daemon", "upgrade", "--recover"]).is_ok()
+        );
+        assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "upgrade"]).is_err());
     }
 }

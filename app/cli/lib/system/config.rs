@@ -285,6 +285,16 @@ impl SystemConfig {
     }
 }
 
+impl ResolvedSystemConfig {
+    pub(crate) fn with_image(mut self, image: String) -> eyre::Result<Self> {
+        self.image = image;
+        self.identity.clear();
+        let bytes = serde_json::to_vec(&self).context("serialize resolved system config")?;
+        self.identity = format!("fnv1a64:{:016x}", fnv1a64(&bytes));
+        Ok(self)
+    }
+}
+
 fn default_image() -> eyre::Result<String> {
     if let Some(image) = RELEASE_IMAGE {
         if !image.contains("@sha256:") {
