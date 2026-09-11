@@ -33,5 +33,6 @@ test "$(grep -c '^ARG DOCKER_CE_VERSION=' Containerfile)" -eq 1
 test "$(grep -c '^ARG CONTAINERD_VERSION=' Containerfile)" -eq 1
 test "$(grep -c 'systemctl disable containerd.service docker.service docker.socket' Containerfile)" -eq 1
 test "$(grep -c 'ln -sf /dev/null /etc/systemd/system/ssh.socket' Containerfile)" -eq 1
-test "$(grep -c '^Requires=$' files/etc/systemd/system/docker.service.d/10-silo-system.conf)" -eq 1
+test "$(grep -c '^Requires=silo-system-docker-preflight.service containerd.service$' files/etc/systemd/system/docker.service)" -eq 1
+test "$(grep -c 'docker.socket' files/etc/systemd/system/docker.service)" -eq 0
 printf 'system image source contract verified\n'
