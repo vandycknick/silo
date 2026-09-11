@@ -88,9 +88,20 @@ impl Context {
         let config = self.config()?.daemon().cloned().ok_or_else(|| {
             eyre::eyre!("system daemon is not configured\n\nhint: add `daemon: {{ version: \"1\", system: {{}} }}` to the Silo config")
         })?;
-        Ok((
-            default_system_paths()?,
-            config.resolve(&home, image_override)?,
-        ))
+        let paths = default_system_paths()?;
+        let mut resolved = config.resolve(&home, image_override)?;
+        if image_override.is_none() {
+            if let Some(installation) = crate::system::record::load_record::<
+                crate::system::record::InstallationRecord,
+            >(&paths.installation())?
+            {
+                if resolved.image == installation.configured_image
+                    && resolved.image != installation.config.image
+                {
+                    resolved = resolved.with_image(installation.config.image)?;
+                }
+            }
+        }
+        Ok((paths, resolved))
     }
 }

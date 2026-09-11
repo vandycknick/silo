@@ -45,12 +45,12 @@ impl Registration {
     }
 }
 
-struct OperationLock {
+pub(crate) struct OperationLock {
     _file: Flock<File>,
 }
 
 impl OperationLock {
-    fn acquire(path: &Path) -> eyre::Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> eyre::Result<Self> {
         let parent = path
             .parent()
             .ok_or_else(|| eyre::eyre!("operation lock has no parent"))?;
@@ -125,8 +125,21 @@ pub(crate) fn up(paths: &SystemPaths, config: ResolvedSystemConfig) -> eyre::Res
 pub(crate) fn down(registration: &Registration, paths: &SystemPaths) -> eyre::Result<()> {
     reject_root()?;
     let _lock = OperationLock::acquire(&paths.operation_lock())?;
+    stop_locked(registration)
+}
+
+pub(crate) fn stop_locked(registration: &Registration) -> eyre::Result<()> {
     verify_native_owned(registration)?;
     native_stop()
+}
+
+pub(crate) fn start_locked(registration: &Registration) -> eyre::Result<()> {
+    install_native(registration)?;
+    native_start(registration)
+}
+
+pub(crate) fn is_enabled() -> eyre::Result<bool> {
+    native_enabled()
 }
 
 pub(crate) fn status(paths: &SystemPaths) -> eyre::Result<Option<DaemonStatus>> {
@@ -176,6 +189,10 @@ fn wait_ready(paths: &SystemPaths, timeout: Duration) -> eyre::Result<()> {
         std::thread::sleep(Duration::from_millis(250));
     }
     bail!("timed out waiting for readiness; the native service may still be running")
+}
+
+pub(crate) fn wait_ready_locked(paths: &SystemPaths, timeout: Duration) -> eyre::Result<()> {
+    wait_ready(paths, timeout)
 }
 
 fn reject_root() -> eyre::Result<()> {
@@ -364,6 +381,23 @@ fn native_pid() -> eyre::Result<Option<u32>> {
     let pid = String::from_utf8(output.stdout)?.trim().parse::<u32>()?;
     Ok((pid != 0).then_some(pid))
 }
+#[cfg(target_os = "linux")]
+fn native_enabled() -> eyre::Result<bool> {
+    let output = Command::new("systemctl")
+        .args(["--user", "is-enabled", SERVICE_NAME])
+        .output()?;
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "enabled" | "enabled-runtime" | "linked" | "linked-runtime" => Ok(true),
+        "disabled" | "not-found" | "masked" | "masked-runtime" | "static" => Ok(false),
+        state if !output.status.success() && state.is_empty() => {
+            bail!(
+                "query systemd user-service enablement failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+        state => bail!("unsupported systemd enablement state {state:?}"),
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn reload_native() -> eyre::Result<()> {
@@ -437,6 +471,22 @@ fn native_pid() -> eyre::Result<Option<u32>> {
     Ok(text
         .lines()
         .find_map(|line| line.trim().strip_prefix("pid = ")?.parse().ok()))
+}
+#[cfg(target_os = "macos")]
+fn native_enabled() -> eyre::Result<bool> {
+    let domain = format!("gui/{}", nix::unistd::geteuid().as_raw());
+    let output = Command::new("launchctl")
+        .args(["print-disabled", &domain])
+        .output()?;
+    if !output.status.success() {
+        bail!("query launchd enablement failed: {}", stderr(&output));
+    }
+    for line in String::from_utf8(output.stdout)?.lines() {
+        if line.contains("\"io.silo.system\"") {
+            return Ok(!line.contains("=> true"));
+        }
+    }
+    Ok(true)
 }
 
 fn run(command: &mut Command, action: &str) -> eyre::Result<()> {

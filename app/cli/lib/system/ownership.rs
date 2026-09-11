@@ -13,6 +13,9 @@ pub(crate) fn guard_ordinary_mutation(machine: &MachineData) -> eyre::Result<()>
     if machine.id == record.active_machine_id {
         bail!("machine {:?} is managed by the Silo system daemon; use `silo daemon down`, `upgrade`, or system configuration instead", machine.name);
     }
+    if crate::system::upgrade::is_pending_candidate(&default_system_paths()?, &machine.id)? {
+        bail!("machine {:?} belongs to a pending system image upgrade; run `silo daemon upgrade --recover`", machine.name);
+    }
     Ok(())
 }
 
@@ -22,6 +25,9 @@ pub(crate) fn guard_ordinary_machine_id(machine_id: &str) -> eyre::Result<()> {
     };
     if machine_id == record.active_machine_id {
         bail!("machine {machine_id:?} is managed by the Silo system daemon; use `silo daemon down` instead");
+    }
+    if crate::system::upgrade::is_pending_candidate(&default_system_paths()?, machine_id)? {
+        bail!("machine {machine_id:?} belongs to a pending system image upgrade; run `silo daemon upgrade --recover`");
     }
     Ok(())
 }

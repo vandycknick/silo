@@ -151,13 +151,14 @@ impl AppApi {
 
     pub(crate) async fn create_system_machine(
         &mut self,
+        name: &str,
         config: &crate::system::config::ResolvedSystemConfig,
         installation_id: uuid::Uuid,
         data_image: &std::path::Path,
         source: SystemImageResolution,
     ) -> eyre::Result<MachineData> {
         self.local
-            .create_system_machine(config, installation_id, data_image, source)
+            .create_system_machine(name, config, installation_id, data_image, source)
             .await
     }
 
