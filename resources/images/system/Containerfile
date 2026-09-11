@@ -1,0 +1,82 @@
+ARG DEBIAN_BASE=debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+FROM ${DEBIAN_BASE}
+
+ARG TARGETARCH
+ARG SOURCE_REVISION=unknown
+ARG DEBIAN_SNAPSHOT=20260825T000000Z
+ARG DOCKER_CE_VERSION=5:29.8.0-1~debian.13~trixie
+ARG CONTAINERD_VERSION=2.3.5-1~debian.13~trixie
+ARG DOCKER_APT_KEY_SHA256=1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570
+
+LABEL org.opencontainers.image.source="https://github.com/vandycknick/silo" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.opencontainers.image.base.name="debian:13-slim" \
+      io.silo.system.schema="1" \
+      io.silo.system.activation-contract="1" \
+      io.silo.system.data-layout="1" \
+      io.silo.system.engine="docker"
+
+COPY files/usr/sbin/policy-rc.d /usr/sbin/policy-rc.d
+
+RUN set -eux; \
+    chmod 0755 /usr/sbin/policy-rc.d; \
+    printf '%s\n' \
+      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
+      > /etc/apt/sources.list; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl e2fsprogs iproute2 iptables jq kmod mount openssh-server \
+      procps systemd systemd-sysv udev; \
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl --fail --show-error --location https://download.docker.com/linux/debian/gpg \
+      -o /etc/apt/keyrings/docker.asc; \
+    printf '%s  %s\n' "${DOCKER_APT_KEY_SHA256}" /etc/apt/keyrings/docker.asc | sha256sum --check; \
+    printf '%s\n' \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian trixie stable" \
+      > /etc/apt/sources.list.d/docker.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      "containerd.io=${CONTAINERD_VERSION}" \
+      "docker-ce=${DOCKER_CE_VERSION}" \
+      "docker-ce-cli=${DOCKER_CE_VERSION}"; \
+    apt-mark hold containerd.io docker-ce docker-ce-cli; \
+    rm -f /usr/sbin/policy-rc.d; \
+    systemctl disable containerd.service docker.service docker.socket ssh.service ssh.socket || true; \
+    ln -sf /dev/null /etc/systemd/system/docker.socket; \
+    ln -sf /dev/null /etc/systemd/system/ssh.socket; \
+    rm -f /etc/machine-id /var/lib/dbus/machine-id; \
+    touch /etc/machine-id; \
+    rm -f /etc/ssh/ssh_host_*; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/* /tmp/* /var/tmp/*
+
+COPY .dist/silo-portd /usr/bin/silo-portd
+COPY files/ /
+
+RUN set -eux; \
+    test "${TARGETARCH}" = amd64 -o "${TARGETARCH}" = arm64; \
+    install -d -m 0755 /var/lib/silo-data /var/lib/docker /var/lib/containerd; \
+    install -m 0755 /usr/lib/silo-system/silo-system-activate /usr/sbin/silo-system-activate; \
+    jq \
+      --arg architecture "${TARGETARCH}" \
+      --arg source_revision "${SOURCE_REVISION}" \
+      --arg docker "${DOCKER_CE_VERSION}" \
+      --arg containerd "${CONTAINERD_VERSION}" \
+      '.architecture = $architecture | .source_revision = $source_revision | .versions.docker = $docker | .versions.containerd = $containerd' \
+      /usr/lib/silo-system/manifest.json > /usr/lib/silo-system/manifest.json.new; \
+    mv /usr/lib/silo-system/manifest.json.new /usr/lib/silo-system/manifest.json; \
+    docker-proxy --help >/dev/null 2>&1 || test $? -eq 1; \
+    dockerd --validate --config-file=/etc/docker/daemon.json; \
+    dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n' \
+      | LC_ALL=C sort > /usr/lib/silo-system/packages.tsv; \
+    systemd-analyze verify \
+      /etc/systemd/system/silo-system-docker-preflight.service \
+      /etc/systemd/system/silo-system-docker.target; \
+    test -x /usr/bin/silo-portd; \
+    test -x /usr/bin/docker-proxy; \
+    test -x /usr/bin/dockerd
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
