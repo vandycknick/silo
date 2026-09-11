@@ -19,6 +19,9 @@ LABEL org.opencontainers.image.source="https://github.com/vandycknick/silo" \
 COPY files/usr/sbin/policy-rc.d /usr/sbin/policy-rc.d
 
 # APT signatures authenticate the snapshot while current CA roots are bootstrapped.
+# No OpenSSH server is installed: the injected Silo agent serves `silo shell` and
+# `silo exec` over vsock with its built-in SSH backend, and would defer to sshd if
+# one were present. The build asserts sshd did not arrive as a dependency.
 RUN set -eux; \
     chmod 0755 /usr/sbin/policy-rc.d; \
     printf '%s\n' \
@@ -28,7 +31,7 @@ RUN set -eux; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl e2fsprogs iproute2 iptables jq kmod mount openssh-server \
+      ca-certificates curl e2fsprogs iproute2 iptables jq kmod mount \
       procps systemd systemd-sysv udev; \
     install -m 0755 -d /etc/apt/keyrings; \
     curl --fail --show-error --location https://download.docker.com/linux/debian/gpg \
@@ -44,12 +47,11 @@ RUN set -eux; \
       "docker-ce-cli=${DOCKER_CE_VERSION}"; \
     apt-mark hold containerd.io docker-ce docker-ce-cli; \
     rm -f /usr/sbin/policy-rc.d; \
-    systemctl disable containerd.service docker.service docker.socket ssh.service ssh.socket || true; \
+    systemctl disable containerd.service docker.service docker.socket || true; \
     ln -sf /dev/null /etc/systemd/system/docker.socket; \
-    ln -sf /dev/null /etc/systemd/system/ssh.socket; \
     rm -f /etc/machine-id /var/lib/dbus/machine-id; \
     touch /etc/machine-id; \
-    rm -f /etc/ssh/ssh_host_*; \
+    test ! -e /usr/sbin/sshd; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/* /tmp/* /var/tmp/*
 
