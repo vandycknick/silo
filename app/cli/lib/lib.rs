@@ -10,6 +10,7 @@ pub mod help;
 pub mod machine_defaults;
 mod network_policy;
 pub mod planning;
+pub(crate) mod system;
 pub mod template;
 pub mod terminal;
 pub mod ui;

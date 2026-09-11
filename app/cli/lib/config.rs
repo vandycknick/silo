@@ -6,6 +6,8 @@ use libvm::{NetdRuntimeConfig, RuntimeNetworkingConfig};
 use serde::Deserialize;
 use serde_yaml_ng::{Mapping, Value};
 
+use crate::system::config::SystemConfig;
+
 const APP_DIR_NAME: &str = "silo";
 const CONFIG_FILE_NAME: &str = "config.yaml";
 
@@ -13,6 +15,7 @@ const CONFIG_FILE_NAME: &str = "config.yaml";
 pub struct GlobalConfig {
     pub(crate) default_machine: Option<String>,
     pub(crate) networking: RuntimeNetworkingConfig,
+    pub(crate) daemon: Option<SystemConfig>,
 }
 
 impl GlobalConfig {
@@ -40,6 +43,10 @@ impl GlobalConfig {
         self.default_machine.as_deref()
     }
 
+    pub(crate) fn daemon(&self) -> Option<&SystemConfig> {
+        self.daemon.as_ref()
+    }
+
     pub(crate) fn write_default_machine(default_machine: Option<&str>) -> eyre::Result<()> {
         let config_dir = resolve_default_config_dir()?;
         std::fs::create_dir_all(&config_dir)
@@ -52,6 +59,7 @@ impl GlobalConfig {
         Self {
             default_machine: None,
             networking: RuntimeNetworkingConfig::default().with_policy_config_dir(config_dir),
+            daemon: None,
         }
     }
 }
@@ -105,13 +113,16 @@ fn parse_global_config(input: &str) -> eyre::Result<GlobalConfig> {
     Ok(GlobalConfig {
         default_machine,
         networking: RuntimeNetworkingConfig::default().with_netd(netd),
+        daemon: parsed.daemon,
     })
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawGlobalConfig {
     default_machine: Option<String>,
     networking: Option<RawNetworkingConfig>,
+    daemon: Option<SystemConfig>,
 }
 
 #[derive(Debug, Deserialize)]

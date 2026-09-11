@@ -21,7 +21,7 @@ use crate::planning::{CreatePlan, PullPolicy};
 use crate::template::Template;
 
 use self::machine::AppMachine;
-use self::types::{ReadOnlyCreationResolution, SourceResolution};
+use self::types::{ReadOnlyCreationResolution, SourceResolution, SystemImageResolution};
 
 #[derive(Debug)]
 pub(crate) struct AppApi {
@@ -139,6 +139,26 @@ impl AppApi {
 
     pub(crate) async fn ensure_name_available(&mut self, name: &str) -> eyre::Result<()> {
         self.local.ensure_name_available(name).await
+    }
+
+    pub(crate) async fn resolve_system_image(
+        &mut self,
+        reference: &str,
+        progress: ImageProgressSender,
+    ) -> eyre::Result<SystemImageResolution> {
+        self.local.resolve_system_image(reference, progress).await
+    }
+
+    pub(crate) async fn create_system_machine(
+        &mut self,
+        config: &crate::system::config::ResolvedSystemConfig,
+        installation_id: uuid::Uuid,
+        data_image: &std::path::Path,
+        source: SystemImageResolution,
+    ) -> eyre::Result<MachineData> {
+        self.local
+            .create_system_machine(config, installation_id, data_image, source)
+            .await
     }
 
     pub(crate) async fn create_machine(
