@@ -4,19 +4,23 @@
 //! Rust calls within the CLI process, not a C ABI, FFI surface, or wire protocol.
 
 mod local;
+pub(crate) mod machine;
+pub(crate) mod start_options;
+pub(crate) mod streams;
 pub(crate) mod types;
 
 use std::time::Duration;
 
 use libvm::{
-    ImageProgressSender, ImagePullPolicy, MachineData, MachineUpdate, NetworkDefinition,
-    NetworkDriver, NetworkTopology, Runtime, RuntimeConfig,
+    ImageProgressSender, ImagePullPolicy, MachineData, MachineStartOptions, MachineUpdate,
+    NetworkDefinition, NetworkDriver, NetworkTopology, RuntimeConfig,
 };
 
 use crate::machine_defaults::ResolvedMachineNetwork;
 use crate::planning::{CreatePlan, PullPolicy};
 use crate::template::Template;
 
+use self::machine::AppMachine;
 use self::types::{ReadOnlyCreationResolution, SourceResolution};
 
 #[derive(Debug)]
@@ -29,10 +33,6 @@ impl AppApi {
         Self {
             local: local::LocalVmService::new(config),
         }
-    }
-
-    pub(crate) async fn runtime(&mut self) -> eyre::Result<&Runtime> {
-        self.local.runtime().await
     }
 
     pub(crate) async fn list_machines(&mut self) -> eyre::Result<Vec<MachineData>> {
@@ -151,6 +151,28 @@ impl AppApi {
             .create_machine(plan, source, policy_config_dir)
             .await
     }
+
+    pub(crate) async fn machine(&mut self, reference: &str) -> eyre::Result<AppMachine> {
+        self.local.machine_handle(reference).await
+    }
+
+    pub(crate) async fn machine_start_options(
+        &mut self,
+        machine: &AppMachine,
+        detached_cleanup: bool,
+    ) -> eyre::Result<MachineStartOptions> {
+        self.local
+            .machine_start_options(machine, detached_cleanup)
+            .await
+    }
+
+    pub(crate) async fn cleanup_local(
+        config: RuntimeConfig,
+        machine_id: String,
+        run_id: libvm::MachineRunId,
+    ) -> eyre::Result<()> {
+        local::LocalVmService::cleanup_local(config, machine_id, run_id).await
+    }
 }
 
 #[cfg(test)]
@@ -189,12 +211,9 @@ mod tests {
         let mut api = AppApi::local(config);
 
         let machines = api
-            .runtime()
-            .await
-            .expect("open isolated local API")
             .list_machines()
             .await
-            .expect("list isolated machines");
+            .expect("open and list isolated local API");
 
         assert!(machines.is_empty());
         assert!(data.join("state.db").is_file());

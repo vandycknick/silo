@@ -1,6 +1,7 @@
 use eyre::Context as _;
-use libvm::{Machine, MachineRef, Runtime, RuntimeConfig};
+use libvm::RuntimeConfig;
 
+use crate::api::machine::AppMachine;
 use crate::api::AppApi;
 use crate::config::GlobalConfig;
 
@@ -34,10 +35,6 @@ impl Context {
             .ok_or_else(|| eyre::eyre!("global config was not initialized"))
     }
 
-    pub(crate) async fn runtime(&mut self) -> eyre::Result<&Runtime> {
-        self.app_api().await?.runtime().await
-    }
-
     pub(crate) async fn app_api(&mut self) -> eyre::Result<&mut AppApi> {
         if self.api.is_none() {
             let networking = self.config()?.networking.clone();
@@ -64,10 +61,12 @@ impl Context {
         })
     }
 
-    pub(crate) async fn machine(&mut self, name: Option<&str>) -> eyre::Result<(String, Machine)> {
+    pub(crate) async fn machine(
+        &mut self,
+        name: Option<&str>,
+    ) -> eyre::Result<(String, AppMachine)> {
         let resolved = self.resolve_machine_name(name)?;
-        let machine_ref = MachineRef::parse(resolved.clone())?;
-        let machine = self.runtime().await?.get_machine(&machine_ref).await?;
+        let machine = self.app_api().await?.machine(&resolved).await?;
         Ok((resolved, machine))
     }
 }

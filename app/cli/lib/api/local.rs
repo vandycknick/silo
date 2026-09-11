@@ -3,11 +3,13 @@ use std::time::Duration;
 
 use libvm::{
     ImageProgressSender, ImagePullPolicy, ImageResolveOptions, ImageSource, MachineAgent,
-    MachineBuilder, MachineData, MachineKillOptions, MachineReadinessOutcome, MachineRef,
-    MachineRetention, MachineStartOptions, MachineStopOptions, MachineUpdate, Memory,
-    NetworkDefinition, NetworkDriver, NetworkTopology, ReadOnlyRuntime, Runtime, RuntimeConfig,
+    MachineBuilder, MachineData, MachineExitOutcome, MachineKillOptions, MachineReadinessOutcome,
+    MachineRef, MachineRetention, MachineRunId, MachineStartOptions, MachineStatus,
+    MachineStopOptions, MachineUpdate, MachineWaitOptions, Memory, NetworkDefinition,
+    NetworkDriver, NetworkTopology, ReadOnlyRuntime, Runtime, RuntimeConfig,
 };
 
+use crate::api::machine::AppMachine;
 use crate::api::types::{ReadOnlyCreationResolution, SourceResolution};
 use crate::machine_defaults::{
     disk_size_bytes, memory_mib, resolve_machine_mounts, ResolvedMachineNetwork,
@@ -195,7 +197,7 @@ impl LocalVmService {
         let mut options = MachineStartOptions::new();
         if detached_cleanup && data.retention == MachineRetention::Ephemeral {
             let executable = std::env::current_exe().context("resolve CLI binary path")?;
-            options = crate::commands::start_options::cleanup_on_exit_options(
+            options = crate::api::start_options::cleanup_on_exit_options(
                 executable,
                 self.runtime().await?.local_data_dir(),
                 &machine.id(),
@@ -207,6 +209,66 @@ impl LocalVmService {
             );
         }
         Ok(options)
+    }
+
+    pub(crate) async fn machine_handle(&mut self, reference: &str) -> eyre::Result<AppMachine> {
+        Ok(AppMachine::new(self.machine(reference).await?))
+    }
+
+    pub(crate) async fn machine_start_options(
+        &mut self,
+        machine: &AppMachine,
+        detached_cleanup: bool,
+    ) -> eyre::Result<MachineStartOptions> {
+        if detached_cleanup {
+            crate::api::start_options::machine_start_options(self.runtime().await?, machine).await
+        } else {
+            crate::api::start_options::machine_start_options_without_cleanup(
+                self.runtime().await?,
+                machine,
+            )
+            .await
+        }
+    }
+
+    pub(crate) async fn cleanup_local(
+        config: RuntimeConfig,
+        machine_id: String,
+        run_id: MachineRunId,
+    ) -> eyre::Result<()> {
+        const WAIT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+        let runtime = Runtime::new(config).await.context("initialize libvm")?;
+        let machine = runtime.get_machine(&MachineRef::parse(machine_id)?).await?;
+        loop {
+            match machine
+                .wait_for_run_with(
+                    run_id.clone(),
+                    MachineWaitOptions::new().timeout(WAIT_INTERVAL),
+                )
+                .await
+            {
+                Ok(exit)
+                    if exit.outcome == MachineExitOutcome::Unknown
+                        && matches!(
+                            exit.machine.status,
+                            MachineStatus::Starting { .. }
+                                | MachineStatus::Running { .. }
+                                | MachineStatus::Stopping { .. }
+                        ) => {}
+                Ok(_) => break,
+                Err(libvm::LibVmError::MachineStaleGeneration { .. }) => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if machine.inspect().await?.retention == MachineRetention::Ephemeral {
+            match machine.remove_after_run(run_id).await {
+                Ok(())
+                | Err(libvm::LibVmError::MachineAlreadyRunning { .. })
+                | Err(libvm::LibVmError::MachineStaleGeneration { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn resolve_source(

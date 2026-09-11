@@ -18,7 +18,6 @@ pub mod set;
 pub mod shell;
 pub mod show;
 pub mod start;
-pub(crate) mod start_options;
 pub mod stop;
 pub mod template;
 

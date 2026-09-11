@@ -17,16 +17,7 @@ mod tests {
 
     // This is the phase-one migration inventory. Remove entries as commands move
     // behind AppApi; adding a new direct-call site requires an explicit review.
-    const TRANSITIONAL_FILES: &[&str] = &[
-        "commands/cleanup.rs",
-        "commands/forward.rs",
-        "commands/logs.rs",
-        "commands/run.rs",
-        "commands/shell.rs",
-        "commands/start_options.rs",
-        "context.rs",
-        "guest.rs",
-    ];
+    const TRANSITIONAL_FILES: &[&str] = &[];
 
     #[test]
     fn runtime_bound_handles_do_not_spread_beyond_the_migration_inventory() {
