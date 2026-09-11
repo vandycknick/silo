@@ -4,8 +4,20 @@
 //! Rust calls within the CLI process, not a C ABI, FFI surface, or wire protocol.
 
 mod local;
+pub(crate) mod types;
 
-use libvm::{Runtime, RuntimeConfig};
+use std::time::Duration;
+
+use libvm::{
+    ImageProgressSender, ImagePullPolicy, MachineData, MachineUpdate, NetworkDefinition,
+    NetworkDriver, NetworkTopology, Runtime, RuntimeConfig,
+};
+
+use crate::machine_defaults::ResolvedMachineNetwork;
+use crate::planning::{CreatePlan, PullPolicy};
+use crate::template::Template;
+
+use self::types::{ReadOnlyCreationResolution, SourceResolution};
 
 #[derive(Debug)]
 pub(crate) struct AppApi {
@@ -21,6 +33,123 @@ impl AppApi {
 
     pub(crate) async fn runtime(&mut self) -> eyre::Result<&Runtime> {
         self.local.runtime().await
+    }
+
+    pub(crate) async fn list_machines(&mut self) -> eyre::Result<Vec<MachineData>> {
+        self.local.list_machines().await
+    }
+
+    pub(crate) async fn inspect_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {
+        self.local.inspect_machine(reference).await
+    }
+
+    pub(crate) async fn start_machine(
+        &mut self,
+        reference: &str,
+        readiness_timeout: Duration,
+    ) -> eyre::Result<MachineData> {
+        self.local.start_machine(reference, readiness_timeout).await
+    }
+
+    pub(crate) async fn stop_machine(
+        &mut self,
+        reference: &str,
+        force: bool,
+        timeout: Duration,
+    ) -> eyre::Result<MachineData> {
+        self.local.stop_machine(reference, force, timeout).await
+    }
+
+    pub(crate) async fn remove_machine(
+        &mut self,
+        reference: &str,
+        force: bool,
+    ) -> eyre::Result<MachineData> {
+        self.local.remove_machine(reference, force).await
+    }
+
+    pub(crate) async fn update_machine(
+        &mut self,
+        reference: &str,
+        update: MachineUpdate,
+    ) -> eyre::Result<MachineData> {
+        self.local.update_machine(reference, update).await
+    }
+
+    pub(crate) async fn list_networks(&mut self) -> eyre::Result<Vec<NetworkDefinition>> {
+        self.local.list_networks().await
+    }
+
+    pub(crate) async fn inspect_network(
+        &mut self,
+        name: &str,
+    ) -> eyre::Result<Option<NetworkDefinition>> {
+        self.local.inspect_network(name).await
+    }
+
+    pub(crate) async fn create_network(
+        &mut self,
+        name: String,
+        topology: NetworkTopology,
+        driver: NetworkDriver,
+    ) -> eyre::Result<()> {
+        self.local.create_network(name, topology, driver).await
+    }
+
+    pub(crate) async fn remove_network(&mut self, name: &str) -> eyre::Result<()> {
+        self.local.remove_network(name).await
+    }
+
+    pub(crate) async fn set_machine_network(
+        &mut self,
+        reference: &str,
+        network: ResolvedMachineNetwork,
+    ) -> eyre::Result<MachineData> {
+        self.local.set_machine_network(reference, network).await
+    }
+
+    pub(crate) async fn resolve_source(
+        &mut self,
+        positional: Option<&str>,
+        template: &Template,
+        pull: Option<(ImagePullPolicy, PullPolicy)>,
+        progress: ImageProgressSender,
+    ) -> eyre::Result<SourceResolution> {
+        self.local
+            .resolve_source(positional, template, pull, progress)
+            .await
+    }
+
+    pub(crate) async fn resolve_read_only_creation(
+        config: RuntimeConfig,
+        requested_name: Option<String>,
+        positional: Option<&str>,
+        template: &Template,
+        pull: Option<(ImagePullPolicy, PullPolicy)>,
+    ) -> eyre::Result<ReadOnlyCreationResolution> {
+        local::LocalVmService::resolve_read_only_creation(
+            config,
+            requested_name,
+            positional,
+            template,
+            pull,
+        )
+        .await
+    }
+
+    pub(crate) async fn ensure_name_available(&mut self, name: &str) -> eyre::Result<()> {
+        self.local.ensure_name_available(name).await
+    }
+
+    pub(crate) async fn create_machine(
+        &mut self,
+        plan: &CreatePlan,
+        source: SourceResolution,
+        policy_config_dir: Option<&std::path::Path>,
+    ) -> eyre::Result<MachineData> {
+        self.local
+            .create_machine(plan, source, policy_config_dir)
+            .await
     }
 }
 

@@ -19,20 +19,11 @@ mod tests {
     // behind AppApi; adding a new direct-call site requires an explicit review.
     const TRANSITIONAL_FILES: &[&str] = &[
         "commands/cleanup.rs",
-        "commands/create.rs",
         "commands/forward.rs",
-        "commands/list.rs",
         "commands/logs.rs",
-        "commands/network.rs",
-        "commands/restart.rs",
-        "commands/rm.rs",
         "commands/run.rs",
-        "commands/set.rs",
         "commands/shell.rs",
-        "commands/show.rs",
-        "commands/start.rs",
         "commands/start_options.rs",
-        "commands/stop.rs",
         "context.rs",
         "guest.rs",
     ];

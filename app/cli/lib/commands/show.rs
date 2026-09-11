@@ -18,8 +18,8 @@ pub struct Cmd {
 
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
-        let (_name, machine) = context.machine(self.name.as_deref()).await?;
-        let data = machine.inspect().await?;
+        let name = context.resolve_machine_name(self.name.as_deref())?;
+        let data = context.app_api().await?.inspect_machine(&name).await?;
         let default = context.config()?.default_machine() == Some(data.name.as_str());
         let view = MachineView::new(&data, default);
 

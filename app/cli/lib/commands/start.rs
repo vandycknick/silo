@@ -1,10 +1,8 @@
 use clap::Args;
 use libvm::{
-    MachineAgent, MachineData, MachineReadinessOutcome, MachineRetention, MachineStatus,
-    DEFAULT_GUEST_READINESS_TIMEOUT,
+    MachineAgent, MachineData, MachineRetention, MachineStatus, DEFAULT_GUEST_READINESS_TIMEOUT,
 };
 
-use crate::commands::start_options::machine_start_options;
 use crate::context::Context;
 use crate::ui::Spinner;
 
@@ -19,23 +17,16 @@ pub struct Cmd {
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         let mut spinner = Spinner::start("Finding", self.name.as_deref().unwrap_or("default VM"));
-        let (name, machine) = context.machine(self.name.as_deref()).await?;
-        let data = machine.inspect().await?;
-        ensure_startable(&data)?;
+        let name = context.resolve_machine_name(self.name.as_deref())?;
 
         spinner.step("Starting", &name);
-        let options = machine_start_options(context.runtime().await?, &machine).await?;
-        let start = machine.start_with_options(options).await?;
+        let data = context
+            .app_api()
+            .await?
+            .start_machine(&name, DEFAULT_GUEST_READINESS_TIMEOUT)
+            .await?;
 
-        if requires_guest_readiness(&start.machine) {
-            spinner.step("Waiting", &name);
-            let readiness = machine.wait_ready(DEFAULT_GUEST_READINESS_TIMEOUT).await?;
-            if readiness.outcome != MachineReadinessOutcome::Ready {
-                eyre::bail!("guest readiness check ended with {:?}", readiness.outcome);
-            }
-        }
-
-        spinner.step("Ready", &start.machine.name);
+        spinner.step("Ready", &data.name);
         spinner.finish_success("Started");
         Ok(())
     }

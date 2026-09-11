@@ -35,6 +35,10 @@ impl Context {
     }
 
     pub(crate) async fn runtime(&mut self) -> eyre::Result<&Runtime> {
+        self.app_api().await?.runtime().await
+    }
+
+    pub(crate) async fn app_api(&mut self) -> eyre::Result<&mut AppApi> {
         if self.api.is_none() {
             let networking = self.config()?.networking.clone();
             let runtime_config = RuntimeConfig::from_env()
@@ -45,9 +49,7 @@ impl Context {
 
         self.api
             .as_mut()
-            .ok_or_else(|| eyre::eyre!("application API was not initialized"))?
-            .runtime()
-            .await
+            .ok_or_else(|| eyre::eyre!("application API was not initialized"))
     }
 
     pub(crate) fn resolve_machine_name(&mut self, name: Option<&str>) -> eyre::Result<String> {

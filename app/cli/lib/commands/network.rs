@@ -1,5 +1,5 @@
 use clap::{Args, Subcommand};
-use libvm::{MachineRef, NetworkDriver, NetworkTopology};
+use libvm::{NetworkDriver, NetworkTopology};
 
 use crate::context::Context;
 use crate::machine_defaults::{MachineNetworkSelection, ResolvedMachineNetwork};
@@ -110,7 +110,7 @@ impl Cmd {
 }
 
 async fn list_networks(context: &mut Context, command: ListCmd) -> eyre::Result<()> {
-    let definitions = context.runtime().await?.list_network_definitions().await?;
+    let definitions = context.app_api().await?.list_networks().await?;
     match command.format {
         OutputFormat::Json => ui::print_json(&definitions),
         OutputFormat::Plain => {
@@ -129,9 +129,9 @@ async fn list_networks(context: &mut Context, command: ListCmd) -> eyre::Result<
 
 async fn show_network(context: &mut Context, command: ShowCmd) -> eyre::Result<()> {
     let definition = context
-        .runtime()
+        .app_api()
         .await?
-        .get_network_definition(&command.name)
+        .inspect_network(&command.name)
         .await?
         .ok_or_else(|| eyre::eyre!("network `{}` not found", command.name))?;
 
@@ -150,12 +150,9 @@ async fn show_network(context: &mut Context, command: ShowCmd) -> eyre::Result<(
 
 async fn create_network(context: &mut Context, command: CreateCmd) -> eyre::Result<()> {
     context
-        .runtime()
+        .app_api()
         .await?
-        .network(command.name.clone())
-        .topology(command.topology)
-        .driver(command.driver)
-        .create()
+        .create_network(command.name.clone(), command.topology, command.driver)
         .await?;
     ui::success(format!("created {}", command.name));
     Ok(())
@@ -168,15 +165,11 @@ async fn remove_network(context: &mut Context, command: RmCmd) -> eyre::Result<(
             command.name
         );
     }
-    let runtime = context.runtime().await?;
-    if runtime
-        .get_network_definition(&command.name)
-        .await?
-        .is_none()
-    {
+    let api = context.app_api().await?;
+    if api.inspect_network(&command.name).await?.is_none() {
         eyre::bail!("network `{}` not found", command.name);
     }
-    runtime.remove_network_definition(&command.name).await?;
+    api.remove_network(&command.name).await?;
     ui::success(format!("removed {}", command.name));
     Ok(())
 }
@@ -188,12 +181,10 @@ async fn set_machine_network(context: &mut Context, command: SetCmd) -> eyre::Re
         command.policy.as_deref(),
         policy_config_dir.as_deref(),
     )?;
-    let runtime = context.runtime().await?;
-    let machine = runtime
-        .get_machine(&MachineRef::parse(command.vm.clone())?)
-        .await?;
-    let data = machine
-        .set_network(|builder| network.apply(builder))
+    let data = context
+        .app_api()
+        .await?
+        .set_machine_network(&command.vm, network)
         .await?;
     ui::success(format!(
         "network for {} set to {}",

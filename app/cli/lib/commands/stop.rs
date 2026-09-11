@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use clap::Args;
-use libvm::{MachineKillOptions, MachineStatus, MachineStopOptions};
 
 use crate::context::Context;
 use crate::ui::Spinner;
@@ -25,29 +24,18 @@ pub struct Cmd {
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         let mut spinner = Spinner::start("Finding", self.name.as_deref().unwrap_or("default VM"));
-        let (name, machine) = context.machine(self.name.as_deref()).await?;
-        let data = machine.inspect().await?;
-
-        if matches!(
-            data.status,
-            MachineStatus::Stopped | MachineStatus::Error { .. }
-        ) {
-            spinner.step("Stopped", &name);
-            spinner.finish_success("Stopped");
-            return Ok(());
-        }
+        let name = context.resolve_machine_name(self.name.as_deref())?;
 
         if self.force {
             spinner.step("Killing", &name);
-            machine
-                .kill_with(MachineKillOptions::new().timeout(self.timeout))
-                .await?;
         } else {
             spinner.step("Stopping", &name);
-            machine
-                .stop_with(MachineStopOptions::new().timeout(self.timeout))
-                .await?;
         }
+        context
+            .app_api()
+            .await?
+            .stop_machine(&name, self.force, self.timeout)
+            .await?;
 
         spinner.step("Stopped", &name);
         spinner.finish_success("Stopped");
