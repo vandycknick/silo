@@ -21,6 +21,10 @@ pub struct GlobalConfig {
 impl GlobalConfig {
     pub(crate) fn load() -> eyre::Result<Self> {
         let config_dir = resolve_default_config_dir()?;
+        Self::load_from_dir(config_dir)
+    }
+
+    pub(crate) fn load_from_dir(config_dir: PathBuf) -> eyre::Result<Self> {
         let config_path = config_dir.join(CONFIG_FILE_NAME);
         let raw = match std::fs::read_to_string(&config_path) {
             Ok(raw) => raw,
