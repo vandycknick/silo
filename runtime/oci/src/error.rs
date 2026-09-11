@@ -15,7 +15,7 @@ pub enum OciError {
     #[error("invalid OCI image reference {reference:?}: {message}")]
     InvalidReference { reference: String, message: String },
 
-    #[error("registry request for image {reference:?} failed: {source}")]
+    #[error("registry request for image {reference:?} failed")]
     Registry {
         reference: String,
         #[source]
@@ -30,6 +30,9 @@ pub enum OciError {
 
     #[error("image {reference:?} was not found: {message}")]
     RegistryImageDigestNotFound { reference: String, message: String },
+
+    #[error("registry denied anonymous access to image {reference:?}; it may not exist or may be private")]
+    RegistryAccessDenied { reference: String },
 
     #[error("unsupported OCI digest algorithm in {digest:?}; only sha256 is supported")]
     UnsupportedDigestAlgorithm { digest: String },
@@ -100,7 +103,7 @@ pub enum OciError {
     #[error("cache entry at {path} is corrupt: {reason}")]
     CorruptCacheEntry { path: PathBuf, reason: String },
 
-    #[error("ext4 rootfs conversion failed: {source}")]
+    #[error("ext4 rootfs conversion failed")]
     FlatExt4 {
         #[source]
         source: disk_image::ext4::FormatError,
@@ -118,6 +121,9 @@ impl OciError {
         let reference = reference.into();
         if let Some(error) = registry_envelope_image_not_found(&reference, &source) {
             return error;
+        }
+        if matches!(source, OciDistributionError::UnauthorizedError { .. }) {
+            return Self::RegistryAccessDenied { reference };
         }
 
         Self::Registry { reference, source }
@@ -137,6 +143,9 @@ impl OciError {
                 | OciDistributionError::ServerError { code: 404, .. }
         ) {
             return image_not_found_error(&reference);
+        }
+        if matches!(source, OciDistributionError::UnauthorizedError { .. }) {
+            return Self::RegistryAccessDenied { reference };
         }
 
         Self::Registry { reference, source }
