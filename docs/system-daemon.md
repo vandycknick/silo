@@ -35,10 +35,10 @@ daemon:
     image: ghcr.io/vandycknick/silo/system@sha256:<qualified-digest>
     resources:
       cpus: 4
-      memory: 4GiB
+      memory: 8GiB
     storage:
-      root-size: 8GiB
-      data-size: 64GiB
+      root-size: 20GiB
+      data-size: 500GiB
     mounts:
       home: true
       additional: []
@@ -46,13 +46,24 @@ daemon:
       publish-bind: any
     docker:
       compatibility-socket: auto
+    # rosetta: true
 ```
+
+`rosetta` enables x86_64 container execution through Rosetta. Left unset, it is
+on when the host is Apple silicon with Rosetta installed (`softwareupdate
+--install-rosetta`) and off otherwise. The setting is applied to the system VM
+the next time the daemon starts it from stopped.
 
 The home share is enabled read/write by default and appears at the same absolute
 path in the guest. Disable it if the engine must not access the host home.
-Additional shares must be absolute, non-overlapping directories. Share changes
-and data-disk growth are not supported after installation. Resource changes are
-supported only while stopped. Image changes use the explicit upgrade command.
+Additional shares must be absolute, non-overlapping directories. Both disks are
+sparse files, so their sizes only cap what the guest may use and cost host space
+as data is written. Sizes are fixed at creation: unset sizes follow the existing
+installation even if the defaults change, and setting a different size for an
+existing installation is rejected. Share changes and data-disk growth are not
+supported after installation. CPU, memory, and Rosetta changes are applied
+the next time the daemon starts the VM from stopped (`silo daemon down`, then
+`up`). Image changes use the explicit upgrade command.
 
 `compatibility-socket` accepts:
 
@@ -123,15 +134,61 @@ writes made after that backup, so it is intentionally never automatic.
 
 ## Diagnostics
 
+`daemon status` reports the summary state, whether the service autostarts at
+login, the Docker endpoint, and, while a daemon runs, its PID, machine, image,
+last update, and a one-line summary of the last failure. The full cause chain
+is in `daemon logs`.
+
+```
+State:      failed (retrying; 3 attempts so far)
+Autostart:  enabled
+Endpoint:   unix:///Users/me/.docker/run/silo.sock
+PID:        80954
+Updated:    2026-09-11 10:37:29 UTC (12 seconds ago)
+Error:      could not fetch the system image: registry denied anonymous access to image "ghcr.io/example/system:dev"; it may not exist or may be private
+```
+
+`--format json` returns the same view with the raw supervisor record under
+`daemon`.
+
+The appliance ships no OpenSSH server. `silo shell silo-system` and
+`silo exec silo-system` go through the injected Silo agent's built-in SSH
+service over vsock, so they need no guest configuration or host keys.
+
 `daemon status` and `daemon logs` do not initialize libvm or start the engine.
 The live status is corroborated with native service PID, daemon generation, and
 process-start identity rather than trusting an old `ready` file. Logs are
 bounded and rotated under `XDG_STATE_HOME/silo/logs/daemon`.
 
+If the engine cannot be brought up, for example because the system image is
+not available yet, the daemon stays running: it records the failure in
+`daemon status` and its log and retries with exponential backoff, at most every
+60 seconds. `up` reports the first such failure it observes and exits non-zero
+without stopping the service; rerun `up` once the daemon is ready to finish
+Docker integration.
+
+If the daemon process itself exits during startup (a fatal condition such as a
+pending upgrade or a foreign lock), `up` reports the recorded failure at once
+instead of waiting for the readiness timeout, and stops the native service so
+the service manager does not relaunch it in a loop. The service stays enabled;
+the next `up` or login starts it again. On macOS the process's stdout/stderr
+are captured in `XDG_STATE_HOME/silo/logs/daemon/native.log`, which is where
+panics and failures that happen before the supervisor publishes a status record
+appear; on Linux use `journalctl --user -u silo-system.service`.
+
+The launchd agent restarts only after an unsuccessful exit, waits 90 seconds for
+a graceful VM shutdown before SIGKILL, and runs with the `Background` process
+type. macOS lists it under System Settings > General > Login Items & Extensions
+as an item allowed to run in the background; a debug build shows the bare
+executable name because it is not signed with a Developer ID.
+
 Common failures are actionable:
 
 - Missing Linux user bus or macOS GUI domain: use a normal login session, or use
   explicit foreground mode for development.
+- macOS refuses to load the agent (`Domain does not support specified action`):
+  background execution of `silo` was turned off in Login Items & Extensions;
+  allow it and rerun `up`.
 - Missing KVM/helper/runtime assets: inspect `daemon logs` and the machine's
   semantic monitor/network logs.
 - Missing Docker CLI: install the native CLI/plugins, then use the explicit
@@ -148,8 +205,9 @@ Common failures are actionable:
   and binding a specific host interface are not v1 features.
 - Docker `--network host` means the guest's network namespace, not the physical
   host network.
-- Native-architecture containers are the baseline. Cross-architecture execution
-  needs a separately installed and qualified binfmt/emulation path.
+- Native-architecture containers are the baseline. On Apple silicon, x86_64
+  containers run through Rosetta when it is installed; other cross-architecture
+  combinations need a separately installed binfmt/emulation path.
 - Unix socket bind mounts and filesystem notifications across shared paths do
   not have native-host filesystem semantics in every tool.
 - No root daemon, global socket takeover, automatic host-tool installation,

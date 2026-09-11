@@ -266,6 +266,7 @@ mod tests {
             publish_bind: libvm::PublishBind::Loopback,
             compatibility_socket: policy,
             docker_socket: socket,
+            rosetta: false,
             identity: "test".to_string(),
         }
     }

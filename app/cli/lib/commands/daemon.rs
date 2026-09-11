@@ -80,22 +80,32 @@ impl Cmd {
                 else {
                     return Ok(());
                 };
-                crate::system::service::down(&registration, &paths)
+                crate::system::service::down(&registration, &paths)?;
+                // A daemon that was running has stopped its VM on SIGTERM by now. Cover the
+                // case where none was running but an earlier interrupted start left the VM up.
+                if let Some(installation) = crate::system::record::load_record::<
+                    crate::system::record::InstallationRecord,
+                >(&paths.installation())?
+                {
+                    let api = context.app_api().await?;
+                    crate::system::provision::stop_system_machine(
+                        api,
+                        &paths,
+                        installation.installation_id,
+                        std::time::Duration::from_secs(60),
+                    )
+                    .await?;
+                }
+                Ok(())
             }
             DaemonCommand::Serve(command) => run_registered(command.config).await,
             DaemonCommand::Status(command) => {
                 let paths = crate::system::ownership::default_system_paths()?;
-                let status = crate::system::service::status(&paths)?;
+                let view = DaemonStatusView::collect(&paths)?;
                 match command.format {
-                    crate::ui::OutputFormat::Json => {
-                        println!("{}", serde_json::to_string_pretty(&status)?)
-                    }
-                    crate::ui::OutputFormat::Plain => match status {
-                        Some(status) => println!("{:?}\t{}", status.phase, status.docker_socket),
-                        None => println!("stopped"),
-                    },
+                    crate::ui::OutputFormat::Json => crate::ui::print_json(&view),
+                    crate::ui::OutputFormat::Plain => view.print_human(),
                 }
-                Ok(())
             }
             DaemonCommand::Logs(command) => {
                 let paths = crate::system::ownership::default_system_paths()?;
@@ -121,6 +131,116 @@ impl Cmd {
                     .await
             }
         }
+    }
+}
+
+/// Operator-facing daemon status: the live supervisor record plus what the service
+/// manager and registration say when no daemon is running.
+#[derive(Debug, serde::Serialize)]
+struct DaemonStatusView {
+    /// Summary state: `stopped`, `starting`, `ready`, `degraded`, `failed`, `stopping`.
+    state: &'static str,
+    /// Whether the native user service starts the daemon at login.
+    autostart: Option<bool>,
+    /// Docker endpoint the daemon serves (or is registered to serve).
+    endpoint: Option<String>,
+    /// Live supervisor record; absent when no daemon process is running.
+    daemon: Option<crate::system::supervisor::DaemonStatus>,
+}
+
+impl DaemonStatusView {
+    fn collect(paths: &crate::system::record::SystemPaths) -> eyre::Result<Self> {
+        use crate::system::supervisor::DaemonPhase;
+
+        let daemon = crate::system::service::status(paths)?;
+        let autostart = crate::system::service::is_enabled().ok();
+        let endpoint = match &daemon {
+            Some(status) => Some(status.docker_socket.clone()),
+            None => crate::system::service::load_optional_registration(&paths.registration())?
+                .map(|registration| registration.config.docker_socket.display().to_string()),
+        };
+        let state = match daemon.as_ref().map(|status| status.phase) {
+            None | Some(DaemonPhase::Stopped) => "stopped",
+            Some(DaemonPhase::Ready) => "ready",
+            Some(DaemonPhase::Degraded) => "degraded",
+            Some(DaemonPhase::Failed) => "failed",
+            Some(DaemonPhase::Stopping) => "stopping",
+            Some(
+                DaemonPhase::PreparingStorage
+                | DaemonPhase::Creating
+                | DaemonPhase::StartingVm
+                | DaemonPhase::WaitingGuest
+                | DaemonPhase::ActivatingEngine,
+            ) => "starting",
+        };
+        Ok(Self {
+            state,
+            autostart,
+            endpoint,
+            daemon,
+        })
+    }
+
+    fn print_human(&self) -> eyre::Result<()> {
+        use crate::system::supervisor::DaemonPhase;
+
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let state = match &self.daemon {
+            Some(status) => match status.phase {
+                DaemonPhase::PreparingStorage => "starting (preparing storage)".to_string(),
+                DaemonPhase::Creating => "starting (creating system machine)".to_string(),
+                DaemonPhase::StartingVm => "starting (booting VM)".to_string(),
+                DaemonPhase::WaitingGuest => "starting (waiting for guest)".to_string(),
+                DaemonPhase::ActivatingEngine => "starting (activating Docker)".to_string(),
+                DaemonPhase::Ready => "ready".to_string(),
+                DaemonPhase::Degraded => "degraded (Docker health probe failing)".to_string(),
+                DaemonPhase::Failed => match status.restart_count {
+                    0 | 1 => "failed (retrying)".to_string(),
+                    attempts => format!("failed (retrying; {attempts} attempts so far)"),
+                },
+                DaemonPhase::Stopping => "stopping".to_string(),
+                DaemonPhase::Stopped => "stopped".to_string(),
+            },
+            None => "stopped".to_string(),
+        };
+        rows.push(("State".to_string(), state));
+        rows.push((
+            "Autostart".to_string(),
+            match self.autostart {
+                Some(true) => "enabled".to_string(),
+                Some(false) => "disabled".to_string(),
+                None => "unknown".to_string(),
+            },
+        ));
+        if let Some(endpoint) = &self.endpoint {
+            rows.push(("Endpoint".to_string(), format!("unix://{endpoint}")));
+        }
+        if let Some(status) = &self.daemon {
+            rows.push(("PID".to_string(), status.pid.to_string()));
+            if let Some(machine_id) = &status.machine_id {
+                rows.push(("Machine".to_string(), machine_id.clone()));
+            }
+            if let Some(digest) = &status.image_digest {
+                rows.push(("Image".to_string(), digest.clone()));
+            }
+            if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&status.updated_at) {
+                let timestamp = updated.timestamp();
+                let relative = crate::ui::relative_time(timestamp, crate::ui::now_unix());
+                let mut relative = relative.chars();
+                let relative = relative
+                    .next()
+                    .map(|first| first.to_lowercase().chain(relative).collect::<String>())
+                    .unwrap_or_default();
+                rows.push((
+                    "Updated".to_string(),
+                    format!("{} ({relative})", crate::ui::format_unix(timestamp)),
+                ));
+            }
+            if let Some(error) = &status.last_error {
+                rows.push(("Error".to_string(), error.clone()));
+            }
+        }
+        crate::ui::print_detail_rows(&rows)
     }
 }
 

@@ -90,16 +90,30 @@ impl Context {
         })?;
         let paths = default_system_paths()?;
         let mut resolved = config.resolve(&home, image_override)?;
-        if image_override.is_none() {
-            if let Some(installation) = crate::system::record::load_record::<
-                crate::system::record::InstallationRecord,
-            >(&paths.installation())?
+        if let Some(installation) = crate::system::record::load_record::<
+            crate::system::record::InstallationRecord,
+        >(&paths.installation())?
+        {
+            if image_override.is_none()
+                && resolved.image == installation.configured_image
+                && resolved.image != installation.config.image
             {
-                if resolved.image == installation.configured_image
-                    && resolved.image != installation.config.image
-                {
-                    resolved = resolved.with_image(installation.config.image)?;
-                }
+                resolved = resolved.with_image(installation.config.image)?;
+            }
+            // Disk sizes are fixed at creation. Unless the user pinned them, follow the
+            // installation so a changed default never reads as a config change.
+            let root_size = if config.system.storage.explicit_root_size() {
+                resolved.root_size_bytes
+            } else {
+                installation.config.root_size_bytes
+            };
+            let data_size = if config.system.storage.explicit_data_size() {
+                resolved.data_size_bytes
+            } else {
+                installation.data_size_bytes
+            };
+            if (root_size, data_size) != (resolved.root_size_bytes, resolved.data_size_bytes) {
+                resolved = resolved.with_disk_sizes(root_size, data_size)?;
             }
         }
         Ok((paths, resolved))

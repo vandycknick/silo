@@ -66,6 +66,12 @@ impl SystemPaths {
     pub(crate) fn log(&self) -> PathBuf {
         self.state_root.join("logs/daemon/daemon.log")
     }
+    /// Captured stdout/stderr of the native service process (launchd only; systemd
+    /// keeps it in the journal). Surfaces panics and failures that happen before the
+    /// supervisor publishes a status record.
+    pub(crate) fn native_log(&self) -> PathBuf {
+        self.state_root.join("logs/daemon/native.log")
+    }
     pub(crate) fn upgrade(&self) -> PathBuf {
         self.daemon_data().join("upgrade.json")
     }

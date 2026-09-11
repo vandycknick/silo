@@ -15,6 +15,7 @@ use crate::system::provision::ensure_system_machine;
 use crate::system::record::{load_record, write_record, SystemPaths};
 
 pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(60);
+const ENGINE_REACHABLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,35 +120,70 @@ pub(crate) async fn serve(
     publish(&paths, &mut status)?;
     append_log(&paths, "preparing installation storage")?;
 
-    let startup = {
-        let startup = reconcile_ready(api, &paths, &config, &mut status);
-        tokio::pin!(startup);
-        tokio::select! {
-            result = &mut startup => Some(result),
-            signal = shutdown_signal() => {
-                signal?;
-                None
+    let mut failed_attempts = 0_u32;
+    let startup = loop {
+        let outcome = {
+            let startup = reconcile_ready(api, &paths, &config, &mut status);
+            tokio::pin!(startup);
+            tokio::select! {
+                result = &mut startup => Some(result),
+                signal = shutdown_signal() => {
+                    signal?;
+                    None
+                }
+            }
+        };
+        match outcome {
+            None => break None,
+            Some(Ok(value)) => break Some(value),
+            Some(Err(error)) => {
+                // Startup problems such as an unavailable system image are often
+                // transient. Stay alive, publish the failure for `daemon status`, and
+                // retry with backoff instead of exiting and leaving the service manager
+                // to relaunch the process in a loop.
+                failed_attempts = failed_attempts.saturating_add(1);
+                let delay = startup_retry_delay(failed_attempts);
+                let causes = error_causes(&error);
+                status.phase = DaemonPhase::Failed;
+                status.last_error = Some(error_summary(&causes));
+                status.restart_count = failed_attempts;
+                publish(&paths, &mut status)?;
+                append_log(
+                    &paths,
+                    &format!(
+                        "startup attempt {failed_attempts} failed: {}; retrying in {}s",
+                        causes.join(": "),
+                        delay.as_secs()
+                    ),
+                )?;
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    signal = shutdown_signal() => {
+                        signal?;
+                        break None;
+                    }
+                }
             }
         }
     };
-    let Some(startup) = startup else {
+    let Some((machine, run_id)) = startup else {
         status.phase = DaemonPhase::Stopping;
         publish(&paths, &mut status)?;
-        if let Some(record) =
-            load_record::<crate::system::record::SystemRecord>(&paths.system_record())?
+        // Stop the VM even when startup never got as far as writing the system record;
+        // otherwise an interrupted first start leaves it running unattended.
+        if let Some(installation) =
+            load_record::<crate::system::record::InstallationRecord>(&paths.installation())?
         {
-            status.machine_id = Some(record.active_machine_id.clone());
-            let machine = api.inspect_machine(&record.active_machine_id).await?;
-            if matches!(
-                machine.status,
-                MachineStatus::Running { .. }
-                    | MachineStatus::Starting { .. }
-                    | MachineStatus::Stopping { .. }
-            ) {
-                if let Err(error) = api
-                    .stop_machine(&record.active_machine_id, false, Duration::from_secs(60))
-                    .await
-                {
+            match crate::system::provision::stop_system_machine(
+                api,
+                &paths,
+                installation.installation_id,
+                Duration::from_secs(60),
+            )
+            .await
+            {
+                Ok(machine_id) => status.machine_id = machine_id,
+                Err(error) => {
                     status.phase = DaemonPhase::Failed;
                     status.last_error = Some(format!(
                         "startup cancellation could not stop the system VM: {error:#}"
@@ -162,15 +198,6 @@ pub(crate) async fn serve(
         publish(&paths, &mut status)?;
         append_log(&paths, "system daemon cancelled during startup")?;
         return Ok(());
-    };
-    let (machine, run_id) = match startup {
-        Ok(value) => value,
-        Err(error) => {
-            status.phase = DaemonPhase::Failed;
-            status.last_error = Some(format!("{error:#}"));
-            publish(&paths, &mut status)?;
-            return Err(error);
-        }
     };
 
     let mut consecutive_failures = 0_u8;
@@ -256,11 +283,55 @@ async fn reconcile_ready(
     status.phase = DaemonPhase::ActivatingEngine;
     publish(paths, status)?;
     activate(&machine, config, record.data_uuid).await?;
-    probe_docker_socket(&config.docker_socket)?;
+    // Activation returns once the guest units are up; the host-side socket forward
+    // becomes live shortly after the guest half exists, so poll rather than probe once.
+    wait_docker_socket(&config.docker_socket, ENGINE_REACHABLE_TIMEOUT).await?;
     status.phase = DaemonPhase::Ready;
+    status.last_error = None;
     publish(paths, status)?;
     append_log(paths, "system Docker engine ready")?;
     Ok((machine, run_id))
+}
+
+/// Renders an error as its distinct causes, outermost first, skipping causes whose text
+/// the previous cause already repeats.
+pub(crate) fn error_causes(error: &eyre::Report) -> Vec<String> {
+    let mut causes: Vec<String> = Vec::new();
+    for cause in error.chain() {
+        let text = cause.to_string();
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if causes
+            .last()
+            .is_some_and(|previous| previous.contains(text))
+        {
+            continue;
+        }
+        causes.push(text.to_string());
+    }
+    if causes.is_empty() {
+        causes.push("unknown failure".to_string());
+    }
+    causes
+}
+
+/// One-line operator summary of a cause chain: what failed, and the root cause.
+pub(crate) fn error_summary(causes: &[String]) -> String {
+    match (causes.first(), causes.last()) {
+        (Some(first), Some(last)) if causes.len() > 1 => format!("{first}: {last}"),
+        (Some(first), _) => first.clone(),
+        (None, _) => "unknown failure".to_string(),
+    }
+}
+
+/// Exponential backoff between failed startup attempts: 5s, 10s, 20s, 40s, then 60s.
+fn startup_retry_delay(failed_attempts: u32) -> Duration {
+    const BASE: Duration = Duration::from_secs(5);
+    const MAX: Duration = Duration::from_secs(60);
+    let exponent = failed_attempts.saturating_sub(1).min(8);
+    BASE.saturating_mul(1 << exponent).min(MAX)
 }
 
 pub(crate) async fn activate(
@@ -294,6 +365,25 @@ pub(crate) async fn activate(
         );
     }
     Ok(())
+}
+
+async fn wait_docker_socket(path: &Path, timeout: Duration) -> eyre::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_error = None;
+    while tokio::time::Instant::now() < deadline {
+        match probe_docker_socket(path) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(last_error
+        .unwrap_or_else(|| eyre::eyre!("no probe attempted"))
+        .wrap_err(format!(
+            "Docker engine did not become reachable at {} within {}s",
+            path.display(),
+            timeout.as_secs()
+        )))
 }
 
 pub(crate) fn probe_docker_socket(path: &Path) -> eyre::Result<()> {
@@ -428,7 +518,58 @@ pub(crate) fn status_owner_is_live(
 
 #[cfg(test)]
 mod tests {
-    use crate::system::supervisor::LifetimeLock;
+    use std::time::Duration;
+
+    use crate::system::supervisor::{
+        error_causes, error_summary, startup_retry_delay, LifetimeLock,
+    };
+
+    #[test]
+    fn error_causes_list_each_distinct_cause_once() {
+        use eyre::WrapErr as _;
+        let inner = std::io::Error::other("Not authorized: url https://example/manifests/dev");
+        let wrapped: eyre::Result<()> = Err(inner)
+            .wrap_err("registry request failed")
+            .wrap_err("image operation for example:dev failed");
+        assert_eq!(
+            error_causes(&wrapped.unwrap_err()),
+            vec![
+                "image operation for example:dev failed",
+                "registry request failed",
+                "Not authorized: url https://example/manifests/dev",
+            ]
+        );
+        let duplicated = eyre::eyre!("outer: inner detail").wrap_err("outer: inner detail");
+        assert_eq!(error_causes(&duplicated), vec!["outer: inner detail"]);
+    }
+
+    #[test]
+    fn error_summary_keeps_only_what_failed_and_why() {
+        let causes = [
+            "could not fetch the system image",
+            "image operation failed",
+            "denied",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            error_summary(&causes),
+            "could not fetch the system image: denied"
+        );
+        assert_eq!(
+            error_summary(&causes[..1]),
+            "could not fetch the system image"
+        );
+        assert_eq!(error_summary(&[]), "unknown failure");
+    }
+
+    #[test]
+    fn startup_retries_back_off_and_cap() {
+        assert_eq!(startup_retry_delay(1), Duration::from_secs(5));
+        assert_eq!(startup_retry_delay(2), Duration::from_secs(10));
+        assert_eq!(startup_retry_delay(4), Duration::from_secs(40));
+        assert_eq!(startup_retry_delay(5), Duration::from_secs(60));
+        assert_eq!(startup_retry_delay(u32::MAX), Duration::from_secs(60));
+    }
 
     #[test]
     fn lifetime_lock_is_exclusive_and_file_is_stable() {

@@ -106,6 +106,36 @@ impl LocalVmService {
         Ok(machine.inspect().await?)
     }
 
+    /// Updates the daemon-managed system machine's configuration; see
+    /// [`Self::stop_system_machine`] for why this bypasses the ordinary-mutation guard.
+    pub(crate) async fn update_system_machine(
+        &mut self,
+        reference: &str,
+        update: MachineUpdate,
+    ) -> eyre::Result<MachineData> {
+        let machine = self.machine(reference).await?;
+        machine.update(update).await.map_err(Into::into)
+    }
+
+    /// Stops the daemon-managed system machine. Bypasses the ordinary-mutation guard,
+    /// which exists to keep `silo stop`/`rm` away from that machine; callers here are
+    /// the daemon lifecycle paths that own it.
+    pub(crate) async fn stop_system_machine(
+        &mut self,
+        reference: &str,
+        timeout: Duration,
+    ) -> eyre::Result<MachineData> {
+        let machine = self.machine(reference).await?;
+        let data = machine.inspect().await?;
+        if !data.is_running() {
+            return Ok(data);
+        }
+        machine
+            .stop_with(MachineStopOptions::new().timeout(timeout))
+            .await?;
+        Ok(machine.inspect().await?)
+    }
+
     pub(crate) async fn remove_machine(
         &mut self,
         reference: &str,
@@ -456,6 +486,7 @@ impl LocalVmService {
             .memory(Memory::bytes(config.memory_bytes))
             .root_disk_size(config.root_size_bytes)
             .disks(vec![data_image.to_path_buf()])
+            .rosetta(config.rosetta)
             .mounts(mounts)
             .forwards(vec![forward])
             .network(|network| network.private().publish(config.publish_bind))

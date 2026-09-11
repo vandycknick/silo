@@ -572,7 +572,14 @@ pub fn print_detail_rows(rows: &[(impl AsRef<str>, impl AsRef<str>)]) -> eyre::R
         for _ in 0..padding {
             write!(out, " ")?;
         }
-        writeln!(out, "{value}")?;
+        let mut lines = value.lines();
+        writeln!(out, "{}", lines.next().unwrap_or_default())?;
+        for line in lines {
+            for _ in 0..label_width + 3 {
+                write!(out, " ")?;
+            }
+            writeln!(out, "{line}")?;
+        }
     }
 
     Ok(())

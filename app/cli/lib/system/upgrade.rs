@@ -204,8 +204,9 @@ pub(crate) async fn upgrade(
     drop(lifetime);
 
     if service_was_enabled {
+        let started = chrono::Utc::now();
         crate::system::service::start_locked(&new_registration)?;
-        crate::system::service::wait_ready_locked(paths, Duration::from_secs(120))?;
+        crate::system::service::wait_ready_locked(paths, started, Duration::from_secs(120))?;
     }
     Ok(())
 }
@@ -524,7 +525,7 @@ async fn ensure_machine_stopped(api: &mut AppApi, id: &str) -> eyre::Result<()> 
             | MachineStatus::Starting { .. }
             | MachineStatus::Stopping { .. }
     ) {
-        api.stop_machine(id, false, Duration::from_secs(60)).await?;
+        api.stop_system_machine(id, Duration::from_secs(60)).await?;
     }
     let machine = api.inspect_machine(id).await?;
     if matches!(

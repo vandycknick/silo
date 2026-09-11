@@ -35,6 +35,10 @@ pub(crate) struct SystemOptions {
     pub(crate) networking: SystemNetworking,
     #[serde(default)]
     pub(crate) docker: DockerIntegration,
+    /// Rosetta translation for x86_64 containers. Unset means on when the host is
+    /// Apple silicon with Rosetta installed, off otherwise.
+    #[serde(default)]
+    pub(crate) rosetta: Option<bool>,
 }
 
 impl Default for SystemOptions {
@@ -47,6 +51,7 @@ impl Default for SystemOptions {
             mounts: SystemMounts::default(),
             networking: SystemNetworking::default(),
             docker: DockerIntegration::default(),
+            rosetta: None,
         }
     }
 }
@@ -78,19 +83,24 @@ impl Default for SystemResources {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub(crate) struct SystemStorage {
-    #[serde(default = "default_root_size", rename = "root-size")]
-    pub(crate) root_size: String,
-    #[serde(default = "default_data_size", rename = "data-size")]
-    pub(crate) data_size: String,
+    /// Appliance root disk size. Fixed once the system machine exists.
+    #[serde(default, rename = "root-size")]
+    pub(crate) root_size: Option<String>,
+    /// Installation data disk size. Fixed once the data disk exists.
+    #[serde(default, rename = "data-size")]
+    pub(crate) data_size: Option<String>,
 }
 
-impl Default for SystemStorage {
-    fn default() -> Self {
-        Self {
-            root_size: default_root_size(),
-            data_size: default_data_size(),
-        }
+impl SystemStorage {
+    /// Whether the user pinned sizes; unset sizes follow the recorded installation
+    /// rather than whatever the current default happens to be.
+    pub(crate) fn explicit_root_size(&self) -> bool {
+        self.root_size.is_some()
+    }
+    pub(crate) fn explicit_data_size(&self) -> bool {
+        self.data_size.is_some()
     }
 }
 
@@ -173,6 +183,8 @@ pub(crate) struct ResolvedSystemConfig {
     pub(crate) publish_bind: PublishBind,
     pub(crate) compatibility_socket: CompatibilitySocket,
     pub(crate) docker_socket: PathBuf,
+    #[serde(default)]
+    pub(crate) rosetta: bool,
     pub(crate) identity: String,
 }
 
@@ -199,8 +211,22 @@ impl SystemConfig {
             bail!("daemon.system.resources.cpus must be greater than zero");
         }
         let memory_bytes = parse_size(&self.system.resources.memory, "memory")?;
-        let root_size_bytes = parse_size(&self.system.storage.root_size, "root-size")?;
-        let data_size_bytes = parse_size(&self.system.storage.data_size, "data-size")?;
+        let root_size_bytes = parse_size(
+            self.system
+                .storage
+                .root_size
+                .as_deref()
+                .unwrap_or(DEFAULT_ROOT_SIZE),
+            "root-size",
+        )?;
+        let data_size_bytes = parse_size(
+            self.system
+                .storage
+                .data_size
+                .as_deref()
+                .unwrap_or(DEFAULT_DATA_SIZE),
+            "data-size",
+        )?;
         if root_size_bytes < 512 * 1024 * 1024 {
             bail!("daemon.system.storage.root-size must be at least 512MiB");
         }
@@ -277,6 +303,7 @@ impl SystemConfig {
             publish_bind: self.system.networking.publish_bind,
             compatibility_socket: self.system.docker.compatibility_socket,
             docker_socket,
+            rosetta: self.system.rosetta.unwrap_or_else(rosetta_available),
             identity: String::new(),
         };
         let bytes = serde_json::to_vec(&resolved).context("serialize resolved system config")?;
@@ -288,6 +315,21 @@ impl SystemConfig {
 impl ResolvedSystemConfig {
     pub(crate) fn with_image(mut self, image: String) -> eyre::Result<Self> {
         self.image = image;
+        self.recompute_identity()
+    }
+
+    /// Adopts the disk sizes an existing installation was created with.
+    pub(crate) fn with_disk_sizes(
+        mut self,
+        root_size_bytes: u64,
+        data_size_bytes: u64,
+    ) -> eyre::Result<Self> {
+        self.root_size_bytes = root_size_bytes;
+        self.data_size_bytes = data_size_bytes;
+        self.recompute_identity()
+    }
+
+    fn recompute_identity(mut self) -> eyre::Result<Self> {
         self.identity.clear();
         let bytes = serde_json::to_vec(&self).context("serialize resolved system config")?;
         self.identity = format!("fnv1a64:{:016x}", fnv1a64(&bytes));
@@ -330,14 +372,24 @@ const fn default_cpus() -> u8 {
     4
 }
 fn default_memory() -> String {
-    "4GiB".to_string()
-}
-fn default_root_size() -> String {
     "8GiB".to_string()
 }
-fn default_data_size() -> String {
-    "64GiB".to_string()
+/// Rosetta's Linux runtime, installed by `softwareupdate --install-rosetta`. vmmon
+/// performs the authoritative Virtualization.framework check at start; this only picks
+/// a sensible default so hosts without Rosetta keep working.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn rosetta_available() -> bool {
+    Path::new("/Library/Apple/usr/share/rosetta/rosetta").is_file()
 }
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn rosetta_available() -> bool {
+    false
+}
+
+// Both disks are sparse files: the sizes only bound what the guest may grow into and
+// cost nothing on the host until written, so they are generous by default.
+const DEFAULT_ROOT_SIZE: &str = "20GiB";
+const DEFAULT_DATA_SIZE: &str = "500GiB";
 const fn default_true() -> bool {
     true
 }
@@ -358,7 +410,24 @@ mod tests {
         .expect("config");
         let resolved = config.resolve(temp.path(), None).expect("resolve");
         assert_eq!(resolved.shares.len(), 1);
-        assert_eq!(resolved.data_size_bytes, 64 * 1024 * 1024 * 1024);
+        assert_eq!(resolved.memory_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(resolved.root_size_bytes, 20 * 1024 * 1024 * 1024);
+        assert_eq!(resolved.data_size_bytes, 500 * 1024 * 1024 * 1024);
+        assert!(!config.system.storage.explicit_data_size());
+        let pinned_off: SystemConfig =
+            serde_yaml_ng::from_str("version: '1'\nsystem:\n  rosetta: false\n").expect("config");
+        assert!(
+            !pinned_off
+                .resolve(temp.path(), None)
+                .expect("resolve")
+                .rosetta
+        );
+        let pinned = resolved
+            .clone()
+            .with_disk_sizes(8 << 30, 64 << 30)
+            .expect("adopt sizes");
+        assert_eq!(pinned.data_size_bytes, 64 << 30);
+        assert_ne!(pinned.identity, resolved.identity);
         assert_eq!(resolved.compatibility_socket, CompatibilitySocket::Auto);
         assert!(resolved.identity.starts_with("fnv1a64:"));
     }

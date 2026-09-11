@@ -60,6 +60,22 @@ impl AppApi {
         self.local.stop_machine(reference, force, timeout).await
     }
 
+    pub(crate) async fn update_system_machine(
+        &mut self,
+        reference: &str,
+        update: MachineUpdate,
+    ) -> eyre::Result<MachineData> {
+        self.local.update_system_machine(reference, update).await
+    }
+
+    pub(crate) async fn stop_system_machine(
+        &mut self,
+        reference: &str,
+        timeout: Duration,
+    ) -> eyre::Result<MachineData> {
+        self.local.stop_system_machine(reference, timeout).await
+    }
+
     pub(crate) async fn remove_machine(
         &mut self,
         reference: &str,
