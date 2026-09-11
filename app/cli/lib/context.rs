@@ -4,6 +4,9 @@ use libvm::RuntimeConfig;
 use crate::api::machine::AppMachine;
 use crate::api::AppApi;
 use crate::config::GlobalConfig;
+use crate::system::config::ResolvedSystemConfig;
+use crate::system::ownership::default_system_paths;
+use crate::system::record::SystemPaths;
 
 #[derive(Debug)]
 pub struct Context {
@@ -68,5 +71,26 @@ impl Context {
         let resolved = self.resolve_machine_name(name)?;
         let machine = self.app_api().await?.machine(&resolved).await?;
         Ok((resolved, machine))
+    }
+
+    pub(crate) fn resolved_system_config(
+        &mut self,
+        image_override: Option<&str>,
+    ) -> eyre::Result<(SystemPaths, ResolvedSystemConfig)> {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                eyre::eyre!("HOME is required for the system VM share and Docker endpoint")
+            })?;
+        if !home.is_absolute() {
+            return Err(eyre::eyre!("HOME must be absolute: {}", home.display()));
+        }
+        let config = self.config()?.daemon().cloned().ok_or_else(|| {
+            eyre::eyre!("system daemon is not configured\n\nhint: add `daemon: {{ version: \"1\", system: {{}} }}` to the Silo config")
+        })?;
+        Ok((
+            default_system_paths()?,
+            config.resolve(&home, image_override)?,
+        ))
     }
 }

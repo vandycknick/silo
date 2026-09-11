@@ -1,7 +1,7 @@
 use libvm::{
-    Forward, MachineData, MachineExit, MachineForwardSession, MachineForwardStatus,
-    MachineLogOptions, MachineLogSource, MachineReadiness, MachineRunId, MachineStart,
-    MachineStartOptions, MachineWaitOptions, SshExitStatus,
+    ExecutionOutput, Forward, MachineData, MachineExit, MachineForwardSession,
+    MachineForwardStatus, MachineLogOptions, MachineLogSource, MachineReadiness, MachineRunId,
+    MachineStart, MachineStartOptions, MachineWaitOptions, SshExitStatus,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_stream::Stream;
@@ -47,6 +47,25 @@ impl AppMachine {
         run_id: MachineRunId,
     ) -> Result<MachineData, libvm::LibVmError> {
         self.inner.stop_run(run_id).await
+    }
+
+    pub(crate) async fn exec_with_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        user: &str,
+        input: Vec<u8>,
+        timeout: std::time::Duration,
+    ) -> Result<ExecutionOutput, libvm::LibVmError> {
+        self.inner
+            .exec_with(program, |options| {
+                options
+                    .args(args.iter().copied())
+                    .user(user)
+                    .stdin_bytes(input)
+                    .timeout(timeout)
+            })
+            .await
     }
 
     pub(crate) async fn wait_for_run_with(
@@ -102,6 +121,16 @@ impl AppMachine {
                 }
                 libvm::MachineAgentStatus::Disabled => None,
             })
+    }
+
+    pub(crate) async fn current_run_id(&self) -> eyre::Result<MachineRunId> {
+        Ok(self
+            .inner
+            .monitor_status()
+            .await?
+            .monitor
+            .instance_id
+            .parse()?)
     }
 
     pub(crate) async fn attach_shell(

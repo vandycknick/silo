@@ -4,6 +4,7 @@ use crate::context::Context;
 
 pub mod cleanup;
 pub mod create;
+pub mod daemon;
 pub mod default;
 pub mod exec;
 pub mod forward;
@@ -32,6 +33,7 @@ pub enum Command {
     Restart(restart::Cmd),
     #[command(name = "default")]
     Default(default::Cmd),
+    Daemon(daemon::Cmd),
     Secret(secret::Cmd),
     #[command(name = "rm")]
     Rm(rm::Cmd),
@@ -58,6 +60,7 @@ impl Command {
             Self::Stop(command) => command.run(context).await,
             Self::Restart(command) => command.run(context).await,
             Self::Default(command) => command.run(context).await,
+            Self::Daemon(command) => command.run(context).await,
             Self::Secret(command) => command.run(context).await,
             Self::Rm(command) => command.run(context).await,
             Self::Shell(command) => command.run(context).await,
