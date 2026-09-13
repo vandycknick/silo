@@ -1,32 +1,35 @@
 # libkrun Implicit Behaviors
 
-Silo treats the `krun` helper as an explicit VM launcher. Libkrun v2 contexts start without implicit console or vsock devices and no longer inject a default init binary. Silo adds only the devices required by its configuration.
+Silo treats the `krun` helper as an explicit VM launcher. At the pinned native Rust API revision, `VmmBuilder` starts without implicit console, vsock, balloon, or RNG devices and does not inject a default init binary. Silo adds every required device explicitly.
 
 ## Runtime Defaults
 
-Every helper-created context does the following:
+Every helper-created VMM does the following:
 
 1. Set the VM CPU and memory configuration.
 2. Set the explicit kernel, optional initramfs, and kernel command line.
-3. Add disks, mounts, networking, and console only when configured, plus vmmon's unconditional vhost-user-vsock device.
+3. Add console, disks, mounts, Linux vhost-user-vsock, and networking when configured, in that deterministic order.
+4. Add an explicit RNG device. Balloon attachment remains deferred to the memory-reclaim phase.
 
-The v1 `krun_disable_implicit_console()` and `krun_disable_implicit_vsock()` APIs do not exist in v2 because those devices are explicit. `krun_disable_implicit_init()` remains only as an `-ENOTSUP` compatibility stub and must not be called. If a console is needed, the helper adds one explicitly with `krun_add_virtio_console_default()` and selects `hvc0` with `krun_set_kernel_console()`. Vmmon passes one vhost-user socket to the helper, which attaches device type 19 with three queues. The helper never calls `krun_add_vsock` or configures per-port mappings; vmmon's embedded backend handles arbitrary host and guest ports dynamically.
+The helper does not use the compatibility C API. If a console is needed, it builds `ConsoleDevice::builder().add_default_console(...)` with borrowed stdio descriptors and selects `hvc0` on `VmmBuilder`. On Linux, vmmon passes one vhost-user socket to the helper, which constructs device type 19 with three 128-entry queues. The helper does not construct the native vsock/TSI device or configure per-port mappings; vmmon's embedded backend handles arbitrary host and guest ports dynamically.
 
-`krun_set_port_map()` is intentionally not part of Silo's startup path. It controls TSI stream remapping, not explicit virtio-net backends or Silo's vhost-user-vsock device.
+The historical `krun_set_port_map()` API is intentionally not part of Silo's startup path. It controls TSI stream remapping, not explicit virtio-net backends or Silo's vhost-user-vsock device.
 
 ## Inventory
 
 | Behavior | Trigger | Default libkrun behavior | Silo behavior | Platform notes |
 | --- | --- | --- | --- | --- |
-| Console device | Call `krun_add_virtio_console_default()` | No console device | Added only for `--stdio-console`, then selected as `hvc0` | Applies on Linux and macOS |
-| Init binary | Load and apply `libkrun_init` configuration | No injected init binary | Not used; Silo supplies an explicit kernel and optional initramfs | `krun_disable_implicit_init()` returns `-ENOTSUP` in v2 |
-| Vsock device | Attach a vhost-user device | No vsock device | Device type 19, three queues, terminated by vmmon's embedded backend | Unconditional for internal ports; public enablement controls only the host surface |
-| TSI networking | Enable TSI flags on libkrun's built-in vsock device | No TSI fallback | Not used; Silo attaches vhost-user-vsock and explicit virtio-net | Applies on Linux and macOS |
+| Console device | Add `ConsoleDevice` | No console device | Added only for `--stdio-console`, then selected as `hvc0` | Applies on Linux and macOS |
+| Init binary | Select a payload | No injected init binary | Silo loads an external kernel and optional initramfs | Applies on Linux and macOS |
+| Vsock device | Add `VsockDevice` or a vhost-user device | No vsock device | Linux interim: device type 19, three queues, terminated by vmmon's embedded backend | Not attached on macOS yet; the native mux is a later phase |
+| RNG device | Add `RngDevice` | No RNG device | Always added explicitly | Applies on Linux and macOS |
+| Balloon device | Add `BalloonDevice` | No balloon device | Not attached until the memory-reclaim phase | Applies on Linux and macOS |
+| TSI networking | Enable TSI flags on libkrun's built-in vsock device | No TSI fallback | Not used; Linux uses vhost-user-vsock and configured hosts may add explicit virtio-net | Applies on Linux and macOS |
 | TSI port remapping | Use TSI stream listens through libkrun's vsock path | May rewrite guest listen ports according to a libkrun port map | Not used; TSI is disabled and explicit virtio-net backends do not consume this map | Applies only to libkrun's vsock/TSI stream path |
-| Environment inheritance | Call `krun_set_exec()` or `krun_set_env()` with `NULL` | Inherits host process environment | Current helper does not use exec-mode APIs; future exec-mode code must pass an explicit env array | Applies on Linux and macOS |
-| Unixgram networking | Call `krun_add_net_unixgram()` | Adds explicit virtio-net and prevents TSI fallback | Available via `--network unixgram` with `--net-peer` and `--net-mac` | Current Silo gvproxy path |
-| Unixstream networking | Call `krun_add_net_unixstream()` | Adds explicit virtio-net and prevents TSI fallback | Available via `--network unixstream` with `--net-peer` and `--net-mac` | Suitable for passt/socket_vmnet-style peers |
-| TAP networking | Call `krun_add_net_tap()` | Adds explicit virtio-net and prevents TSI fallback | Available via `--network tap` with `--net-tap-name` and `--net-mac` | Linux only |
+| Exec-mode environment | Use the compatibility C exec APIs | Not exposed by the native `VmmBuilder` API | Not used; Silo direct-boots its kernel and initramfs | Applies on Linux and macOS |
+| Unixgram networking | Add `NetDevice::new_unixgram_fd()` | No network device | Available via `--network unixgram` with `--net-peer` and `--net-mac` | Current Silo gvproxy path; the fd is owned by libkrun |
+| Unixstream networking | Add `NetDevice::new_unixstream_path()` | No network device | Available via `--network unixstream` with `--net-peer` and `--net-mac` | Suitable for passt/socket_vmnet-style peers |
+| TAP networking | Add `NetDevice::new_tap()` | No network device | Available via `--network tap` with `--net-tap-name` and `--net-mac` | Linux only |
 
 ## Networking Modes
 
