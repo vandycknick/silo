@@ -36,8 +36,8 @@ daemon:
     resources:
       cpus: 4
       memory: 8GiB
-      memory-reclaim: auto   # auto | off
-      memory-floor: 2GiB
+      memory-reclaim: off         # experimental: auto | off
+      memory-reclaim-after: 2m
     storage:
       root-size: 20GiB
       data-size: 500GiB
@@ -51,15 +51,17 @@ daemon:
     # rosetta: true
 ```
 
-`memory` is the ceiling the VM can use. On Apple silicon the daemon also drives
-the VM's memory balloon: every ten seconds it reads the guest's memory use and
-moves the balloon target toward "in use plus 1GiB", shrinking by at most
-512MiB every five seconds and never below `memory-floor`, so an idle engine
-hands its page cache back to the host instead of pinning the full `memory`.
-When the guest runs short the target grows immediately, up to `memory`, and
-holds there for a minute before shrinking resumes. Set
-`memory-reclaim: off` to keep the guest at its full size. Linux hosts have no
-balloon and ignore the setting.
+`memory` is the ceiling the VM can use. A Linux guest fills spare memory with
+page cache, and the host keeps every page the guest has touched, so a busy
+engine's host footprint grows toward `memory` and stays there while idle.
+
+`memory-reclaim: auto` enables an experimental idle reclaim modelled on WSL2's
+`autoMemoryReclaim`: after the guest has been idle for `memory-reclaim-after`
+it drops its page cache and pulses the memory balloon so the host can discard
+the freed pages. It is off by default because on macOS 26 the
+Virtualization.framework balloon accepted the pages but the host footprint of
+the VM did not shrink in our measurements, while the guest still paid for a
+cold page cache. The plumbing stays in place for further investigation.
 
 `rosetta` enables x86_64 container execution through Rosetta. Left unset, it is
 on when the host is Apple silicon with Rosetta installed (`softwareupdate
@@ -156,7 +158,7 @@ State:      failed (retrying; 3 attempts so far)
 Autostart:  enabled
 Endpoint:   unix:///Users/me/.docker/run/silo.sock
 PID:        80954
-Memory:     8 GiB configured, 2.5 GiB currently given to the guest
+Memory:     8 GiB; last idle reclaim returned 5.2 GiB to the host 12 minutes ago
 Updated:    2026-09-11 10:37:29 UTC (12 seconds ago)
 Error:      could not fetch the system image: registry denied anonymous access to image "ghcr.io/example/system:dev"; it may not exist or may be private
 ```

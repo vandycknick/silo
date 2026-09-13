@@ -186,6 +186,10 @@ message MetricSnapshot {
 message MemoryMetrics {
   optional uint64 total_bytes = 1;
   optional uint64 available_bytes = 2;
+  // MemFree: pages the guest kernel holds on its free lists.
+  optional uint64 free_bytes = 3;
+  // Cached: page cache the guest could drop under pressure.
+  optional uint64 cached_bytes = 4;
 }
 
 message CpuMetrics {

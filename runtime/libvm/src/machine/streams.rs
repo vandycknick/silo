@@ -394,6 +394,10 @@ pub struct MachineMetricSnapshot {
 pub struct MachineMemoryMetrics {
     pub total_bytes: u64,
     pub available_bytes: u64,
+    /// Pages on the guest kernel's free lists, when the agent reports them.
+    pub free_bytes: Option<u64>,
+    /// Page cache the guest could drop under pressure, when the agent reports it.
+    pub cached_bytes: Option<u64>,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct MachineCpuMetrics {
@@ -1425,6 +1429,8 @@ impl TryFrom<v1::MemoryMetrics> for MachineMemoryMetrics {
         Ok(Self {
             total_bytes,
             available_bytes,
+            free_bytes: value.free_bytes,
+            cached_bytes: value.cached_bytes,
         })
     }
 }
@@ -1810,6 +1816,8 @@ mod tests {
         assert!(MachineMemoryMetrics::try_from(v1::MemoryMetrics {
             total_bytes: Some(1),
             available_bytes: Some(2),
+            free_bytes: None,
+            cached_bytes: None,
         })
         .is_err());
         assert!(MachineCpuMetrics::try_from(v1::CpuMetrics {
@@ -1873,6 +1881,8 @@ mod tests {
                         memory: Some(v1::MemoryMetrics {
                             total_bytes: Some(2),
                             available_bytes: Some(2),
+                            free_bytes: None,
+                            cached_bytes: None,
                         }),
                         cpu: Some(v1::CpuMetrics {
                             logical_cpu_count: Some(3),

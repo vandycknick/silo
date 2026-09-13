@@ -22,6 +22,16 @@ enum DaemonCommand {
     Upgrade(Upgrade),
     #[command(hide = true)]
     Serve(Serve),
+    /// Set the system VM's memory balloon target directly (debugging aid).
+    #[command(hide = true)]
+    Balloon(Balloon),
+}
+
+#[derive(Debug, Args)]
+struct Balloon {
+    /// Guest memory target, e.g. 2GiB. Defaults to the configured memory (fully deflated).
+    #[arg(long)]
+    target: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -99,6 +109,27 @@ impl Cmd {
                 Ok(())
             }
             DaemonCommand::Serve(command) => run_registered(command.config).await,
+            DaemonCommand::Balloon(command) => {
+                use std::str::FromStr as _;
+                let paths = crate::system::ownership::default_system_paths()?;
+                let registration =
+                    crate::system::service::load_registration(&paths.registration())?;
+                let record = crate::system::record::load_record::<
+                    crate::system::record::SystemRecord,
+                >(&paths.system_record())?
+                .ok_or_else(|| eyre::eyre!("no system machine is recorded"))?;
+                let target = match command.target {
+                    Some(size) => utils::HumanSize::from_str(&size)
+                        .and_then(|size| size.bytes())
+                        .map_err(|error| eyre::eyre!("invalid --target {size:?}: {error}"))?,
+                    None => registration.config.memory_bytes,
+                };
+                let api = context.app_api().await?;
+                let machine = api.machine(&record.active_machine_id).await?;
+                let applied = machine.set_memory_target(target).await?;
+                println!("{}", crate::ui::human_bytes(Some(applied)));
+                Ok(())
+            }
             DaemonCommand::Status(command) => {
                 let paths = crate::system::ownership::default_system_paths()?;
                 let view = DaemonStatusView::collect(&paths)?;
@@ -232,14 +263,22 @@ impl DaemonStatusView {
             if let Some(digest) = &status.image_digest {
                 rows.push(("Image".to_string(), digest.clone()));
             }
-            if let (Some(memory), Some(target)) = (self.memory_bytes, status.memory_target_bytes) {
+            if let Some(memory) = self.memory_bytes {
+                let reclaimed = status
+                    .memory_reclaimed_bytes
+                    .zip(status.memory_reclaimed_at.as_deref())
+                    .and_then(|(bytes, at)| {
+                        let at = chrono::DateTime::parse_from_rfc3339(at).ok()?.timestamp();
+                        Some(format!(
+                            "; last idle reclaim returned {} to the host {}",
+                            crate::ui::human_bytes(Some(bytes)),
+                            crate::ui::relative_time(at, crate::ui::now_unix()).to_lowercase()
+                        ))
+                    })
+                    .unwrap_or_default();
                 rows.push((
                     "Memory".to_string(),
-                    format!(
-                        "{} configured, {} currently given to the guest",
-                        crate::ui::human_bytes(Some(memory)),
-                        crate::ui::human_bytes(Some(target))
-                    ),
+                    format!("{}{reclaimed}", crate::ui::human_bytes(Some(memory))),
                 ));
             }
             if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&status.updated_at) {

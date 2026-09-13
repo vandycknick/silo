@@ -32,8 +32,10 @@ pub(crate) enum DaemonPhase {
     Stopped,
 }
 
+/// Live supervisor state, republished on every change. Unlike the installation
+/// records this is not strict: a newer or older daemon may have written it, and a
+/// field it does not know must not stop `status`, `up`, or `down` from working.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct DaemonStatus {
     pub(crate) schema: u32,
     pub(crate) generation: Uuid,
@@ -46,9 +48,12 @@ pub(crate) struct DaemonStatus {
     pub(crate) updated_at: String,
     pub(crate) last_error: Option<String>,
     pub(crate) restart_count: u32,
-    /// Guest memory target the balloon controller last applied, in bytes.
+    /// Page cache the last idle reclaim handed back to the host, in bytes.
     #[serde(default)]
-    pub(crate) memory_target_bytes: Option<u64>,
+    pub(crate) memory_reclaimed_bytes: Option<u64>,
+    /// When the last idle reclaim ran (RFC 3339).
+    #[serde(default)]
+    pub(crate) memory_reclaimed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,7 +124,8 @@ pub(crate) async fn serve(
         updated_at: now(),
         last_error: None,
         restart_count: 0,
-        memory_target_bytes: None,
+        memory_reclaimed_bytes: None,
+        memory_reclaimed_at: None,
     };
     publish(&paths, &mut status)?;
     append_log(&paths, "preparing installation storage")?;
@@ -205,7 +211,7 @@ pub(crate) async fn serve(
     };
 
     let mut consecutive_failures = 0_u8;
-    let mut reclaimer = MemoryReclaimer::new(&config);
+    let mut reclaimer = IdleReclaimer::new(&config);
     let mut ticks = 0_u64;
     loop {
         tokio::select! {
@@ -215,8 +221,6 @@ pub(crate) async fn serve(
             }
             () = tokio::time::sleep(RECLAIM_INTERVAL) => {
                 ticks += 1;
-                // Memory pressure is exactly when the Docker probe tends to stall, so the
-                // balloon controller runs on every tick regardless of engine health.
                 reclaimer.tick(&machine, &paths, &mut status).await?;
                 if !ticks.is_multiple_of(HEALTH_INTERVAL.as_secs() / RECLAIM_INTERVAL.as_secs()) {
                     continue;
@@ -308,71 +312,118 @@ async fn reconcile_ready(
 
 /// Engine health probe cadence.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
-/// Balloon controller cadence; the guest agent reports metrics every 5 seconds.
+/// Idle-detector cadence; the guest agent reports metrics every 5 seconds.
 const RECLAIM_INTERVAL: Duration = Duration::from_secs(5);
 const MIB: u64 = 1024 * 1024;
-/// Memory kept free in the guest above what it currently uses.
-const RECLAIM_HEADROOM: u64 = 1024 * MIB;
-/// Largest shrink per tick, so the guest sheds page cache gradually.
-const RECLAIM_STEP: u64 = 512 * MIB;
-/// Smallest shrink worth a balloon request.
-const RECLAIM_MIN_CHANGE: u64 = 64 * MIB;
-/// After the target had to grow, leave it alone this long before shrinking again so a
-/// bursty workload is not squeezed between its bursts.
-const RECLAIM_HOLDOFF: Duration = Duration::from_secs(60);
+/// Guest CPU busy fraction (of all vCPUs) at or below which the guest counts as idle.
+const IDLE_CPU_FRACTION: f64 = 0.05;
+/// Guest block I/O rate at or below which the guest counts as idle.
+const IDLE_IO_BYTES_PER_SEC: u64 = MIB;
+/// Page cache worth a reclaim pulse.
+const RECLAIM_MIN_CACHE: u64 = 512 * MIB;
+/// Free memory left to the guest while the balloon is inflated during a pulse.
+const PULSE_KEEP_FREE: u64 = 256 * MIB;
+/// Longest a pulse waits for the guest to hand its freed pages to the balloon.
+const PULSE_SETTLE: Duration = Duration::from_secs(30);
+/// Guest-side reclaim: cgroup v2 proactive reclaim first, the global cache drop as a
+/// fallback on older kernels. `%BYTES%` is replaced with the amount to reclaim.
+const GUEST_RECLAIM_SCRIPT: &str = "echo %BYTES% > /sys/fs/cgroup/memory.reclaim 2>/dev/null || sync; echo 1 > /proc/sys/vm/drop_caches";
 
-/// Drives the guest's memory balloon so a mostly idle engine does not pin its whole
-/// configured memory on the host. Every healthy tick reads the guest's memory metrics
-/// and moves the balloon target toward "in use plus headroom", shrinking in steps and
-/// growing at once when the guest runs short. Only Virtualization.framework has a
-/// balloon; on other backends the first request reports unsupported and the
-/// controller switches itself off.
-pub(crate) struct MemoryReclaimer {
-    max_bytes: u64,
-    floor_bytes: u64,
-    target_bytes: u64,
+/// Returns idle guest page cache to the host, the way WSL2's `autoMemoryReclaim` does.
+///
+/// Every tick reads the guest's metrics. Once CPU and block I/O have stayed idle for
+/// the configured window and the guest holds enough page cache, the controller asks
+/// the guest kernel to reclaim that cache (turning it into free pages) and then
+/// pulses the memory balloon: inflate over the freed pages so the host can discard
+/// them, then deflate straight back to the full size. The guest sees its full memory
+/// again within seconds and the host keeps only what the guest actually uses until
+/// the cache fills up and the guest goes idle again. Bursts never wait on a balloon.
+/// Only Virtualization.framework has a balloon; on other backends the first pulse
+/// reports unsupported and the controller switches itself off.
+pub(crate) struct IdleReclaimer {
     enabled: bool,
-    hold_until: Option<tokio::time::Instant>,
+    max_bytes: u64,
+    idle_after: Duration,
+    last_sample: Option<ActivitySample>,
+    idle_since: Option<tokio::time::Instant>,
 }
 
-impl MemoryReclaimer {
+/// Cumulative guest activity counters at one instant.
+#[derive(Debug, Clone, Copy)]
+struct ActivitySample {
+    at: tokio::time::Instant,
+    busy_seconds: f64,
+    io_bytes: u64,
+}
+
+impl ActivitySample {
+    fn from_snapshot(at: tokio::time::Instant, snapshot: &libvm::MachineMetricSnapshot) -> Self {
+        let busy_seconds = snapshot
+            .cpu
+            .as_ref()
+            .map(|cpu| {
+                cpu.user_seconds
+                    + cpu.nice_seconds
+                    + cpu.system_seconds
+                    + cpu.irq_seconds
+                    + cpu.softirq_seconds
+                    + cpu.steal_seconds
+            })
+            .unwrap_or_default();
+        let io_bytes = snapshot
+            .block_devices
+            .iter()
+            .map(|device| device.read_bytes.saturating_add(device.write_bytes))
+            .fold(0_u64, u64::saturating_add);
+        Self {
+            at,
+            busy_seconds,
+            io_bytes,
+        }
+    }
+}
+
+impl IdleReclaimer {
     pub(crate) fn new(config: &ResolvedSystemConfig) -> Self {
         Self {
-            max_bytes: config.memory_bytes,
-            floor_bytes: config.memory_floor_bytes.min(config.memory_bytes),
-            target_bytes: config.memory_bytes,
             enabled: config.memory_reclaim,
-            hold_until: None,
+            max_bytes: config.memory_bytes,
+            idle_after: Duration::from_secs(config.memory_reclaim_after_secs),
+            last_sample: None,
+            idle_since: None,
         }
     }
 
-    /// Returns the next target, or `None` when the current one should stay.
-    ///
-    /// `total_bytes` and `available_bytes` are the guest's own view. Inflated balloon
-    /// pages count as used inside the guest, so they are subtracted to recover what
-    /// the guest really needs.
-    pub(crate) fn plan(&self, total_bytes: u64, available_bytes: u64) -> Option<u64> {
-        let withheld = self.max_bytes.saturating_sub(self.target_bytes);
-        let used = total_bytes
-            .saturating_sub(available_bytes)
-            .saturating_sub(withheld);
-        let desired = used
-            .saturating_add(RECLAIM_HEADROOM)
-            .clamp(self.floor_bytes, self.max_bytes)
-            / MIB
-            * MIB;
-        if desired > self.target_bytes {
-            // The guest is running short: give memory back immediately. Under real
-            // pressure release everything rather than chasing the estimate.
-            let next = if available_bytes < RECLAIM_HEADROOM / 2 {
-                self.max_bytes
-            } else {
-                desired
-            };
-            return (next != self.target_bytes).then_some(next);
+    /// Records one metrics sample and returns how long the guest has been idle, if
+    /// it is idle now. Activity between two samples is judged against the CPU and
+    /// I/O thresholds; any busy interval resets the idle clock.
+    fn observe(&mut self, sample: ActivitySample, cpus: u32) -> Option<Duration> {
+        let previous = self.last_sample.replace(sample)?;
+        let elapsed = sample
+            .at
+            .saturating_duration_since(previous.at)
+            .as_secs_f64();
+        if elapsed <= 0.0 {
+            return self
+                .idle_since
+                .map(|since| sample.at.saturating_duration_since(since));
         }
-        let next = desired.max(self.target_bytes.saturating_sub(RECLAIM_STEP));
-        (self.target_bytes.saturating_sub(next) >= RECLAIM_MIN_CHANGE).then_some(next)
+        let busy = (sample.busy_seconds - previous.busy_seconds).max(0.0)
+            / (elapsed * f64::from(cpus.max(1)));
+        let io_rate = sample.io_bytes.saturating_sub(previous.io_bytes) as f64 / elapsed;
+        if busy <= IDLE_CPU_FRACTION && io_rate <= IDLE_IO_BYTES_PER_SEC as f64 {
+            let since = *self.idle_since.get_or_insert(previous.at);
+            Some(sample.at.saturating_duration_since(since))
+        } else {
+            self.idle_since = None;
+            None
+        }
+    }
+
+    /// Bytes to inflate the balloon by, given the guest's free memory after reclaim.
+    fn pulse_inflate(free_bytes: u64) -> Option<u64> {
+        let inflate = free_bytes.saturating_sub(PULSE_KEEP_FREE) / MIB * MIB;
+        (inflate >= RECLAIM_MIN_CACHE / 2).then_some(inflate)
     }
 
     async fn tick(
@@ -384,67 +435,136 @@ impl MemoryReclaimer {
         if !self.enabled {
             return Ok(());
         }
-        let metrics = match machine.metrics().await {
-            Ok(metrics) => metrics,
-            Err(error) => {
-                append_log(paths, &format!("memory reclaim skipped: {error}"))?;
-                return Ok(());
-            }
-        };
-        let Some(memory) = metrics
-            .metrics
-            .and_then(|observation| observation.report.snapshot.memory)
-        else {
-            return Ok(());
-        };
-        let Some(next) = self.plan(memory.total_bytes, memory.available_bytes) else {
+        let Some(snapshot) = fetch_snapshot(machine).await else {
             return Ok(());
         };
         let now = tokio::time::Instant::now();
-        if next < self.target_bytes && self.hold_until.is_some_and(|until| now < until) {
+        let cpus = snapshot
+            .cpu
+            .as_ref()
+            .map(|cpu| cpu.logical_cpu_count)
+            .unwrap_or(1);
+        let idle_for = self.observe(ActivitySample::from_snapshot(now, &snapshot), cpus);
+        if idle_for.is_none_or(|idle_for| idle_for < self.idle_after) {
             return Ok(());
         }
-        if next > self.target_bytes {
-            self.hold_until = Some(now + RECLAIM_HOLDOFF);
+        let Some(memory) = snapshot.memory.as_ref() else {
+            return Ok(());
+        };
+        let cached = memory.cached_bytes.unwrap_or_else(|| {
+            memory
+                .available_bytes
+                .saturating_sub(memory.free_bytes.unwrap_or(memory.available_bytes))
+        });
+        if cached < RECLAIM_MIN_CACHE {
+            return Ok(());
         }
-        // Balloon pages show up as used inside the guest; report what the guest itself uses.
-        let withheld = self.max_bytes.saturating_sub(self.target_bytes);
-        let guest_used = memory
-            .total_bytes
-            .saturating_sub(memory.available_bytes)
-            .saturating_sub(withheld);
-        match machine.set_memory_target(next).await {
-            Ok(applied) => {
-                let direction = if applied < self.target_bytes {
-                    "shrunk"
-                } else {
-                    "grew"
-                };
-                self.target_bytes = applied;
-                status.memory_target_bytes = Some(applied);
-                publish(paths, status)?;
-                append_log(
-                    paths,
-                    &format!(
-                        "memory target {direction} to {} MiB (guest uses {} MiB)",
-                        applied / MIB,
-                        guest_used / MIB
-                    ),
-                )?;
-            }
+        // Require a fresh idle window before the next pulse whatever happens now.
+        self.idle_since = None;
+        self.pulse(machine, paths, status, cached).await
+    }
+
+    async fn pulse(
+        &mut self,
+        machine: &crate::api::machine::AppMachine,
+        paths: &SystemPaths,
+        status: &mut DaemonStatus,
+        cached: u64,
+    ) -> eyre::Result<()> {
+        // 1. Ask the guest kernel to turn its idle page cache into free pages, so the
+        //    balloon inflates over pages nobody is using and causes no pressure.
+        let script = GUEST_RECLAIM_SCRIPT.replace("%BYTES%", &cached.to_string());
+        if let Err(error) = machine
+            .exec_with_input(
+                "/bin/sh",
+                &["-c", &script],
+                "root",
+                Vec::new(),
+                Duration::from_secs(60),
+            )
+            .await
+        {
+            append_log(
+                paths,
+                &format!("memory reclaim: guest cache drop failed: {error}"),
+            )?;
+            return Ok(());
+        }
+        let Some(memory) = fetch_snapshot(machine)
+            .await
+            .and_then(|snapshot| snapshot.memory)
+        else {
+            return Ok(());
+        };
+        let free_before = memory.free_bytes.unwrap_or(memory.available_bytes);
+        let Some(inflate) = Self::pulse_inflate(free_before) else {
+            return Ok(());
+        };
+        // 2. Inflate: the guest hands the freed pages to the host, which discards them.
+        let target = self.max_bytes.saturating_sub(inflate).max(PULSE_KEEP_FREE);
+        match machine.set_memory_target(target).await {
+            Ok(_) => {}
             Err(libvm::LibVmError::MonitorUnsupported { .. }) => {
                 self.enabled = false;
                 append_log(
                     paths,
                     "memory reclaim disabled: this virtualization backend has no memory balloon",
                 )?;
+                return Ok(());
             }
             Err(error) => {
-                append_log(paths, &format!("memory target change failed: {error}"))?;
+                append_log(
+                    paths,
+                    &format!("memory reclaim: balloon inflate failed: {error}"),
+                )?;
+                return Ok(());
             }
         }
-        Ok(())
+        // 3. Wait for the guest to absorb the balloon, then deflate immediately: the
+        //    pages come back to the guest untouched and stay unbacked on the host.
+        let settle_deadline = tokio::time::Instant::now() + PULSE_SETTLE;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let free_now = fetch_snapshot(machine)
+                .await
+                .and_then(|snapshot| snapshot.memory)
+                .map(|memory| memory.free_bytes.unwrap_or(memory.available_bytes));
+            if free_now
+                .is_some_and(|free| free <= free_before.saturating_sub(inflate) + PULSE_KEEP_FREE)
+                || tokio::time::Instant::now() >= settle_deadline
+            {
+                break;
+            }
+        }
+        if let Err(error) = machine.set_memory_target(self.max_bytes).await {
+            append_log(
+                paths,
+                &format!("memory reclaim: balloon deflate failed: {error}"),
+            )?;
+            return Ok(());
+        }
+        status.memory_reclaimed_bytes = Some(inflate);
+        status.memory_reclaimed_at = Some(now());
+        publish(paths, status)?;
+        append_log(
+            paths,
+            &format!(
+                "memory reclaim: returned {} MiB of idle page cache to the host",
+                inflate / MIB
+            ),
+        )
     }
+}
+
+async fn fetch_snapshot(
+    machine: &crate::api::machine::AppMachine,
+) -> Option<libvm::MachineMetricSnapshot> {
+    machine
+        .metrics()
+        .await
+        .ok()?
+        .metrics
+        .map(|observation| observation.report.snapshot)
 }
 
 /// Renders an error as its distinct causes, outermost first, skipping causes whose text
@@ -625,8 +745,11 @@ async fn shutdown_signal() -> eyre::Result<()> {
     }
 }
 
+/// Reads the published status. A file this binary cannot parse is treated as
+/// absent rather than fatal: it is transient runtime state, and the PID and owner
+/// checks that follow decide whether anything is actually running.
 pub(crate) fn read_status(paths: &SystemPaths) -> eyre::Result<Option<DaemonStatus>> {
-    load_record(&paths.status())
+    Ok(load_record(&paths.status()).unwrap_or_default())
 }
 
 pub(crate) fn last_run_root(paths: &SystemPaths) -> eyre::Result<Option<std::path::PathBuf>> {
@@ -717,35 +840,48 @@ mod tests {
     }
 
     #[test]
-    fn memory_reclaimer_shrinks_in_steps_and_grows_at_once() {
-        use crate::system::supervisor::{MemoryReclaimer, MIB};
-        let mut reclaimer = MemoryReclaimer {
-            max_bytes: 8192 * MIB,
-            floor_bytes: 2048 * MIB,
-            target_bytes: 8192 * MIB,
+    fn idle_reclaimer_tracks_idle_windows_and_pulse_size() {
+        use std::time::Duration;
+
+        use crate::system::supervisor::{ActivitySample, IdleReclaimer, MIB};
+        let mut reclaimer = IdleReclaimer {
             enabled: true,
-            hold_until: None,
+            max_bytes: 8192 * MIB,
+            idle_after: Duration::from_secs(120),
+            last_sample: None,
+            idle_since: None,
         };
-        // Idle guest: 700 MiB used, wants 1700 MiB; shrinks by at most 512 MiB per tick.
-        let total = 7900 * MIB;
-        assert_eq!(reclaimer.plan(total, total - 700 * MIB), Some(7680 * MIB));
-        reclaimer.target_bytes = 2560 * MIB;
-        // Balloon holds 5632 MiB, which the guest reports as used; real use is 700 MiB.
-        let available = total - 700 * MIB - 5632 * MIB;
-        assert_eq!(reclaimer.plan(total, available), Some(2048 * MIB));
-        reclaimer.target_bytes = 2048 * MIB;
-        // At the floor nothing more happens.
-        assert_eq!(reclaimer.plan(total, total - 700 * MIB - 6144 * MIB), None);
-        // A build starts: 1200 MiB in use with the balloon holding 6 GiB; use plus the
-        // 1 GiB headroom is demanded right away.
-        let available = total - 1200 * MIB - 6144 * MIB;
-        assert_eq!(reclaimer.plan(total, available), Some(2224 * MIB));
-        // Under real pressure (almost nothing available) release everything.
-        assert_eq!(reclaimer.plan(total, 100 * MIB), Some(8192 * MIB));
-        // Tiny differences are ignored.
-        reclaimer.target_bytes = 3500 * MIB;
-        let available = total - 2470 * MIB - 4692 * MIB;
-        assert_eq!(reclaimer.plan(total, available), None);
+        let start = tokio::time::Instant::now();
+        let sample = |offset: u64, busy: f64, io: u64| ActivitySample {
+            at: start + Duration::from_secs(offset),
+            busy_seconds: busy,
+            io_bytes: io,
+        };
+        // The first sample only establishes a baseline.
+        assert_eq!(reclaimer.observe(sample(0, 100.0, 0), 4), None);
+        // 4 vCPUs, 5 seconds: 0.5 busy seconds is 2.5%, idle.
+        assert_eq!(
+            reclaimer.observe(sample(5, 100.5, 100 * 1024), 4),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            reclaimer.observe(sample(10, 101.0, 200 * 1024), 4),
+            Some(Duration::from_secs(10))
+        );
+        // A busy interval (3 of 20 CPU-seconds) resets the idle clock.
+        assert_eq!(reclaimer.observe(sample(15, 104.0, 200 * 1024), 4), None);
+        // Heavy I/O alone also counts as activity.
+        assert_eq!(reclaimer.observe(sample(20, 104.1, 200 * MIB), 4), None);
+        assert_eq!(
+            reclaimer.observe(sample(25, 104.2, 200 * MIB), 4),
+            Some(Duration::from_secs(5))
+        );
+
+        assert_eq!(IdleReclaimer::pulse_inflate(100 * MIB), None);
+        assert_eq!(
+            IdleReclaimer::pulse_inflate(6 * 1024 * MIB),
+            Some(5888 * MIB)
+        );
     }
 
     #[test]

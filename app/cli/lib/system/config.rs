@@ -70,20 +70,23 @@ pub(crate) struct SystemResources {
     pub(crate) cpus: u8,
     #[serde(default = "default_memory")]
     pub(crate) memory: String,
-    /// Hand idle guest memory back to the host through the memory balloon. Only
+    /// Hand idle guest page cache back to the host through the memory balloon. Only
     /// Virtualization.framework hosts have a balloon; elsewhere this is inert.
     #[serde(default, rename = "memory-reclaim")]
     pub(crate) memory_reclaim: MemoryReclaim,
-    /// The least memory the reclaim controller leaves to the guest.
-    #[serde(default = "default_memory_floor", rename = "memory-floor")]
-    pub(crate) memory_floor: String,
+    /// How long the guest must sit idle before its page cache is reclaimed.
+    #[serde(
+        default = "default_memory_reclaim_after",
+        rename = "memory-reclaim-after"
+    )]
+    pub(crate) memory_reclaim_after: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum MemoryReclaim {
-    #[default]
     Auto,
+    #[default]
     Off,
 }
 
@@ -93,7 +96,7 @@ impl Default for SystemResources {
             cpus: default_cpus(),
             memory: default_memory(),
             memory_reclaim: MemoryReclaim::default(),
-            memory_floor: default_memory_floor(),
+            memory_reclaim_after: default_memory_reclaim_after(),
         }
     }
 }
@@ -202,12 +205,12 @@ pub(crate) struct ResolvedSystemConfig {
     pub(crate) docker_socket: PathBuf,
     #[serde(default)]
     pub(crate) rosetta: bool,
-    /// Whether the daemon drives the memory balloon to return idle guest memory.
+    /// Whether the daemon returns idle guest page cache to the host.
     #[serde(default = "default_memory_reclaim_enabled")]
     pub(crate) memory_reclaim: bool,
-    /// Lower bound the reclaim controller keeps the guest at, in bytes.
-    #[serde(default = "default_memory_floor_bytes")]
-    pub(crate) memory_floor_bytes: u64,
+    /// Idle time before a reclaim, in seconds.
+    #[serde(default = "default_memory_reclaim_after_secs")]
+    pub(crate) memory_reclaim_after_secs: u64,
     pub(crate) identity: String,
 }
 
@@ -234,12 +237,12 @@ impl SystemConfig {
             bail!("daemon.system.resources.cpus must be greater than zero");
         }
         let memory_bytes = parse_size(&self.system.resources.memory, "memory")?;
-        let memory_floor_bytes = parse_size(&self.system.resources.memory_floor, "memory-floor")?;
-        if memory_floor_bytes < 512 * 1024 * 1024 {
-            bail!("daemon.system.resources.memory-floor must be at least 512MiB");
-        }
-        if memory_floor_bytes > memory_bytes {
-            bail!("daemon.system.resources.memory-floor cannot exceed memory");
+        let memory_reclaim_after_secs = parse_duration_secs(
+            &self.system.resources.memory_reclaim_after,
+            "memory-reclaim-after",
+        )?;
+        if memory_reclaim_after_secs < 30 {
+            bail!("daemon.system.resources.memory-reclaim-after must be at least 30s");
         }
         let root_size_bytes = parse_size(
             self.system
@@ -335,7 +338,7 @@ impl SystemConfig {
             docker_socket,
             rosetta: self.system.rosetta.unwrap_or_else(rosetta_available),
             memory_reclaim: self.system.resources.memory_reclaim == MemoryReclaim::Auto,
-            memory_floor_bytes,
+            memory_reclaim_after_secs,
             identity: String::new(),
         };
         let bytes = serde_json::to_vec(&resolved).context("serialize resolved system config")?;
@@ -406,14 +409,37 @@ const fn default_cpus() -> u8 {
 fn default_memory() -> String {
     "8GiB".to_string()
 }
-fn default_memory_floor() -> String {
-    "2GiB".to_string()
+fn default_memory_reclaim_after() -> String {
+    "2m".to_string()
 }
 const fn default_memory_reclaim_enabled() -> bool {
-    true
+    false
 }
-const fn default_memory_floor_bytes() -> u64 {
-    2 * 1024 * 1024 * 1024
+const fn default_memory_reclaim_after_secs() -> u64 {
+    120
+}
+
+/// Parses a duration such as `90s`, `2m`, or `1h` into seconds.
+fn parse_duration_secs(value: &str, field: &str) -> eyre::Result<u64> {
+    let value = value.trim();
+    let (number, unit) = value.split_at(
+        value
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(value.len()),
+    );
+    let multiplier = match unit.trim() {
+        "s" | "sec" | "secs" => 1,
+        "m" | "min" | "mins" => 60,
+        "h" | "hr" | "hrs" => 3600,
+        _ => bail!("daemon.system.resources.{field} must look like 90s, 2m, or 1h, got {value:?}"),
+    };
+    number
+        .parse::<u64>()
+        .ok()
+        .and_then(|number| number.checked_mul(multiplier))
+        .ok_or_else(|| {
+            eyre::eyre!("daemon.system.resources.{field} has an invalid number: {value:?}")
+        })
 }
 /// Rosetta's Linux runtime, installed by `softwareupdate --install-rosetta`. vmmon
 /// performs the authoritative Virtualization.framework check at start; this only picks
@@ -452,20 +478,22 @@ mod tests {
         let resolved = config.resolve(temp.path(), None).expect("resolve");
         assert_eq!(resolved.shares.len(), 1);
         assert_eq!(resolved.memory_bytes, 8 * 1024 * 1024 * 1024);
-        assert!(resolved.memory_reclaim);
-        assert_eq!(resolved.memory_floor_bytes, 2 * 1024 * 1024 * 1024);
-        let reclaim_off: SystemConfig = serde_yaml_ng::from_str(
-            "version: '1'\nsystem:\n  resources:\n    memory-reclaim: off\n    memory-floor: 1GiB\n",
+        assert!(!resolved.memory_reclaim);
+        assert_eq!(resolved.memory_reclaim_after_secs, 120);
+        let reclaim_on: SystemConfig = serde_yaml_ng::from_str(
+            "version: '1'\nsystem:\n  resources:\n    memory-reclaim: auto\n    memory-reclaim-after: 5m\n",
         )
         .expect("config");
-        let reclaim_off = reclaim_off.resolve(temp.path(), None).expect("resolve");
-        assert!(!reclaim_off.memory_reclaim);
-        assert_eq!(reclaim_off.memory_floor_bytes, 1024 * 1024 * 1024);
-        let bad_floor: SystemConfig = serde_yaml_ng::from_str(
-            "version: '1'\nsystem:\n  resources:\n    memory: 2GiB\n    memory-floor: 4GiB\n",
-        )
-        .expect("config");
-        assert!(bad_floor.resolve(temp.path(), None).is_err());
+        let reclaim_on = reclaim_on.resolve(temp.path(), None).expect("resolve");
+        assert!(reclaim_on.memory_reclaim);
+        assert_eq!(reclaim_on.memory_reclaim_after_secs, 300);
+        for bad in ["memory-reclaim-after: 10s", "memory-reclaim-after: soon"] {
+            let bad: SystemConfig = serde_yaml_ng::from_str(&format!(
+                "version: '1'\nsystem:\n  resources:\n    {bad}\n"
+            ))
+            .expect("config");
+            assert!(bad.resolve(temp.path(), None).is_err());
+        }
         assert_eq!(resolved.root_size_bytes, 20 * 1024 * 1024 * 1024);
         assert_eq!(resolved.data_size_bytes, 500 * 1024 * 1024 * 1024);
         assert!(!config.system.storage.explicit_data_size());
