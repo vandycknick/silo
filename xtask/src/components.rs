@@ -47,6 +47,8 @@ pub enum ComponentError {
     },
     #[error("vmmon binary not found after build: {path}")]
     MissingVmmonBinary { path: std::path::PathBuf },
+    #[error("krun binary not found after build: {path}")]
+    MissingKrunBinary { path: std::path::PathBuf },
 }
 
 pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
@@ -245,11 +247,31 @@ fn build_krun(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     context.profile.apply_cargo(&mut cargo);
     command::run(cargo)?;
 
-    let krun = context
+    let binary = context
         .target_dir
         .join(context.profile.directory())
         .join("krun");
-    let mut smoke = Command::new(krun);
+    if !binary.is_file() {
+        return Err(ComponentError::MissingKrunBinary { path: binary });
+    }
+
+    if context.host == HostTarget::MacosArm64 {
+        let entitlements = context
+            .workspace_root
+            .join("packaging/macos/krun.entitlements");
+        let mut sign = Command::new("/usr/bin/codesign");
+        sign.args(["-f", "--entitlements"])
+            .arg(entitlements)
+            .args(["-s", "-"])
+            .arg(&binary);
+        command::run(sign)?;
+
+        let mut verify = Command::new("/usr/bin/codesign");
+        verify.args(["--verify", "--verbose=4"]).arg(&binary);
+        command::run(verify)?;
+    }
+
+    let mut smoke = Command::new(binary);
     smoke.arg("--help");
     command::output(smoke)?;
     Ok(())
