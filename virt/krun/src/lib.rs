@@ -7,6 +7,7 @@ mod config;
 mod error;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod host;
+mod rosetta;
 mod serial;
 mod vm;
 mod watchdog;
@@ -21,5 +22,8 @@ pub use crate::error::{KrunBackendError, Result};
 pub use crate::host::{check_host, check_host_with_vm_creation, KvmHostError, KvmHostInfo};
 #[cfg(target_os = "macos")]
 pub use crate::host::{check_host, HvfHostError, HvfHostInfo};
+pub use crate::rosetta::{
+    CapturedResponse, RosettaConfigError, RosettaLaunchConfig, RosettaProfileId,
+};
 pub use crate::serial::SerialConnection;
 pub use crate::vm::VirtualMachine;
