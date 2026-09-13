@@ -9,7 +9,7 @@ use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
 use utils::format_mac;
 
 use crate::config::{validate_config, Disk, KrunConfig, Network};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::error::KrunBackendError;
 use crate::error::Result;
 use crate::serial::SerialConnection;
@@ -115,7 +115,7 @@ impl VirtualMachineBuilder {
     pub fn start(self) -> Result<VirtualMachine> {
         validate_config(&self.config)?;
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         check_krun_host(&self.krun_binary)?;
 
         let args = command_args(&self.config);
@@ -157,7 +157,7 @@ impl VirtualMachineBuilder {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn check_krun_host(binary: &std::path::Path) -> Result<()> {
     let output = Command::new(binary)
         .arg("--check-host-basic")

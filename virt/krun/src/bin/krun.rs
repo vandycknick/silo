@@ -8,6 +8,8 @@ use clap::{Parser, ValueEnum};
 use krun::{validate_config, KrunConfig, NetTap, NetUnixgram, NetUnixstream, Network, DEFAULT_ID};
 use nix::sys::socket::{setsockopt, sockopt};
 
+#[path = "krun/admission.rs"]
+mod admission;
 #[path = "../internal/parse.rs"]
 mod parse;
 #[path = "krun/vmm.rs"]
@@ -32,11 +34,11 @@ const SOCKET_SNDBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
     after_help = "Examples:\n  krun --kernel ./vmlinux --initramfs ./initramfs.img --network none\n  krun --kernel ./vmlinux --net-peer \"$TMPDIR/gvproxy.sock\" --net-mac 02:94:ef:e4:0c:ee --network unixgram\n  krun --kernel ./vmlinux --net-peer \"$TMPDIR/passt.sock\" --net-mac 02:94:ef:e4:0c:ef --network unixstream\n  krun --kernel ./vmlinux --net-tap-name tap0 --net-mac 02:94:ef:e4:0c:f0 --network tap\n"
 )]
 struct Cli {
-    /// Validate KVM access, required capabilities, and empty VM creation.
-    #[cfg(target_os = "linux")]
+    /// Validate host virtualization access and empty VM creation.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[arg(long, exclusive = true)]
     check_host: bool,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[arg(long, exclusive = true, hide = true)]
     check_host_basic: bool,
     /// Stable VM identifier used for helper-owned socket names.
@@ -211,6 +213,23 @@ fn main() -> eyre::Result<()> {
         }
         krun::check_host().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
     }
+    #[cfg(target_os = "macos")]
+    {
+        if cli.check_host {
+            admission::check_hvf()
+                .map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
+            println!(
+                "Hypervisor.framework host check passed: kern.hv_support=1; empty VM creation and destruction succeeded"
+            );
+            return Ok(());
+        }
+        if cli.check_host_basic {
+            admission::check_hvf()
+                .map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
+            return Ok(());
+        }
+        admission::check_hvf().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
+    }
     let config = cli.into_config()?;
     validate_config(&config)?;
     let stdin = io::stdin();
@@ -274,11 +293,11 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 mod tests {
     use std::path::Path;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use clap::Parser;
 
     use crate::local_unix_datagram_path;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::Cli;
 
     #[test]
@@ -301,7 +320,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn host_check_is_exclusive_with_vm_arguments() {
         assert!(Cli::try_parse_from(["krun", "--check-host"]).is_ok());
