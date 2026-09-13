@@ -1,5 +1,6 @@
 use std::fs;
-use std::os::fd::IntoRawFd;
+use std::io;
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 
@@ -7,10 +8,10 @@ use clap::{Parser, ValueEnum};
 use krun::{validate_config, KrunConfig, NetTap, NetUnixgram, NetUnixstream, Network, DEFAULT_ID};
 use nix::sys::socket::{setsockopt, sockopt};
 
-#[path = "krun/context.rs"]
-mod context;
 #[path = "../internal/parse.rs"]
 mod parse;
+#[path = "krun/vmm.rs"]
+mod vmm;
 #[path = "../watchdog.rs"]
 mod watchdog;
 
@@ -212,81 +213,30 @@ fn main() -> eyre::Result<()> {
     }
     let config = cli.into_config()?;
     validate_config(&config)?;
-    start_enter(&config)?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    start_enter(
+        &config,
+        vmm::ConsoleFds {
+            stdin: stdin.as_fd(),
+            stdout: stdout.as_fd(),
+            stderr: stderr.as_fd(),
+        },
+    )?;
     Ok(())
 }
 
-fn start_enter(config: &KrunConfig) -> eyre::Result<()> {
-    let context = context::Context::create()?;
-    configure_ctx(&context, config)?;
-    context.start_enter()?;
+fn start_enter(config: &KrunConfig, console_fds: vmm::ConsoleFds<'_>) -> eyre::Result<()> {
+    vmm::run(config, console_fds)?;
     Ok(())
-}
-
-fn configure_ctx(context: &context::Context, config: &KrunConfig) -> eyre::Result<()> {
-    context.set_vm_config(config.cpus, config.memory_mib)?;
-
-    if let Some(kernel) = config.kernel.as_ref() {
-        let cmdline = (!config.cmdline.is_empty()).then(|| config.cmdline.join(" "));
-        context.set_kernel(
-            kernel,
-            external_kernel_format(),
-            config.initramfs.as_deref(),
-            cmdline.as_deref(),
-        )?;
-    }
-
-    for disk in &config.disks {
-        context.add_raw_disk(&disk.block_id, &disk.path, disk.read_only)?;
-    }
-
-    for mount in &config.mounts {
-        context.add_virtiofs(&mount.tag, &mount.path, mount.read_only)?;
-    }
-
-    #[cfg(target_os = "linux")]
-    if let Some(socket) = &config.vhost_user_vsock {
-        context.add_vhost_user_vsock(socket)?;
-    }
-
-    match &config.network {
-        Network::None => {}
-        Network::Unixgram(net) => {
-            let socket = open_local_unix_datagram_socket(&net.peer_path, &config.id, "krun")?;
-            context.add_net_unixgram_fd(socket.into_raw_fd(), net.mac)?;
-        }
-        Network::Unixstream(net) => {
-            context.add_net_unixstream(&net.peer_path, net.mac)?;
-        }
-        Network::Tap(net) => {
-            context.add_net_tap(&net.name, net.mac)?;
-        }
-    }
-
-    if config.stdio_console {
-        context.add_virtio_console_default(0, 1, 2)?;
-        context.set_kernel_console("hvc0")?;
-    }
-
-    Ok(())
-}
-
-fn external_kernel_format() -> context::KernelFormat {
-    #[cfg(target_arch = "x86_64")]
-    {
-        context::KernelFormat::Elf
-    }
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    {
-        context::KernelFormat::Raw
-    }
 }
 
 fn open_local_unix_datagram_socket(
     peer_path: &Path,
     vm_id: &str,
     backend: &str,
-) -> eyre::Result<UnixDatagram> {
+) -> io::Result<UnixDatagram> {
     let local_path = local_unix_datagram_path(peer_path, vm_id, backend);
     remove_file_if_exists(&local_path)?;
     let socket = UnixDatagram::bind(&local_path)?;
@@ -327,19 +277,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     use clap::Parser;
 
-    use super::context::KernelFormat;
+    use crate::local_unix_datagram_path;
     #[cfg(target_os = "linux")]
-    use super::Cli;
-    use super::{external_kernel_format, local_unix_datagram_path};
-
-    #[test]
-    fn external_kernel_format_matches_host_architecture() {
-        #[cfg(target_arch = "x86_64")]
-        assert_eq!(external_kernel_format(), KernelFormat::Elf);
-
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        assert_eq!(external_kernel_format(), KernelFormat::Raw);
-    }
+    use crate::Cli;
 
     #[test]
     fn local_unix_datagram_path_uses_short_vm_id_and_backend() {
