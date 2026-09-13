@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{KrunBackendError, Result};
 
 pub const DEFAULT_ID: &str = "anonymous-instance";
+const STANDALONE_VSOCK_CID: u64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KrunConfig {
@@ -15,6 +16,7 @@ pub struct KrunConfig {
     pub disks: Vec<Disk>,
     pub mounts: Vec<Mount>,
     pub vhost_user_vsock: Option<PathBuf>,
+    pub vsock_cid: Option<u64>,
     pub network: Network,
     pub stdio_console: bool,
 }
@@ -71,6 +73,7 @@ impl Default for KrunConfig {
             disks: Vec::new(),
             mounts: Vec::new(),
             vhost_user_vsock: None,
+            vsock_cid: None,
             network: Network::None,
             stdio_console: false,
         }
@@ -101,6 +104,19 @@ pub fn validate_config(config: &KrunConfig) -> Result<()> {
         return Err(KrunBackendError::InvalidConfig(
             "vhost-user vsock socket path cannot be empty".to_string(),
         ));
+    }
+    if config.vsock_cid.is_some() && config.vhost_user_vsock.is_some() {
+        return Err(KrunBackendError::InvalidConfig(
+            "native vsock and vhost-user vsock cannot be used together".to_string(),
+        ));
+    }
+    if config
+        .vsock_cid
+        .is_some_and(|cid| cid != STANDALONE_VSOCK_CID)
+    {
+        return Err(KrunBackendError::InvalidConfig(format!(
+            "native vsock currently requires guest CID {STANDALONE_VSOCK_CID}"
+        )));
     }
     #[cfg(not(target_os = "linux"))]
     if config.vhost_user_vsock.is_some() {
@@ -165,4 +181,51 @@ fn validate_mac(mac: [u8; 6], name: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::config::{validate_config, KrunConfig};
+
+    fn valid_config() -> KrunConfig {
+        KrunConfig {
+            kernel: Some(PathBuf::from("/kernel")),
+            ..KrunConfig::default()
+        }
+    }
+
+    #[test]
+    fn standalone_vsock_accepts_guest_cid_three() {
+        let config = KrunConfig {
+            vsock_cid: Some(3),
+            ..valid_config()
+        };
+
+        validate_config(&config).expect("guest CID 3 should be valid");
+    }
+
+    #[test]
+    fn standalone_vsock_rejects_other_guest_cids() {
+        let config = KrunConfig {
+            vsock_cid: Some(4),
+            ..valid_config()
+        };
+
+        let error = validate_config(&config).expect_err("guest CID 4 should be invalid");
+        assert!(error.to_string().contains("guest CID 3"));
+    }
+
+    #[test]
+    fn standalone_and_vhost_user_vsock_are_mutually_exclusive() {
+        let config = KrunConfig {
+            vhost_user_vsock: Some(PathBuf::from("/tmp/vhost-vsock.sock")),
+            vsock_cid: Some(3),
+            ..valid_config()
+        };
+
+        let error = validate_config(&config).expect_err("vsock devices should conflict");
+        assert!(error.to_string().contains("cannot be used together"));
+    }
 }

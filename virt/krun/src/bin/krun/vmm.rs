@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use krun::{Disk, KrunConfig, Mount, Network};
 use libkrun::{
     init_log, BlockDevice, ConsoleDevice, DiskFormat, FsDevice, KernelFormat, LogLevel, LogOptions,
-    LogStyle, MmioDeviceManager, NetDevice, NetFlags, Payload, RngDevice, SyncMode, VmmBuilder,
-    VmmError,
+    LogStyle, MmioDeviceManager, NetDevice, NetFlags, Payload, RngDevice, SyncMode, TsiFlags,
+    VmmBuilder, VmmError, VsockDevice,
 };
 use thiserror::Error;
 
@@ -68,6 +68,7 @@ enum DeviceKind {
     Mount,
     #[cfg(target_os = "linux")]
     VhostUserVsock,
+    Vsock,
     Network,
     Rng,
 }
@@ -79,6 +80,7 @@ enum DeviceConfig<'a> {
     Mount(&'a Mount),
     #[cfg(target_os = "linux")]
     VhostUserVsock(&'a Path),
+    Vsock(u64),
     Network(&'a Network),
     Rng,
 }
@@ -92,6 +94,7 @@ impl DeviceConfig<'_> {
             Self::Mount(_) => DeviceKind::Mount,
             #[cfg(target_os = "linux")]
             Self::VhostUserVsock(_) => DeviceKind::VhostUserVsock,
+            Self::Vsock(_) => DeviceKind::Vsock,
             Self::Network(_) => DeviceKind::Network,
             Self::Rng => DeviceKind::Rng,
         }
@@ -170,6 +173,12 @@ pub(crate) fn run(config: &KrunConfig, console_fds: ConsoleFds<'_>) -> Result<()
                     .map_err(|source| libkrun_error("create vhost-user vsock", source))?,
                 );
             }
+            DeviceConfig::Vsock(cid) => {
+                devices.add(
+                    VsockDevice::new(cid, TsiFlags::empty())
+                        .map_err(|source| libkrun_error("create native vsock", source))?,
+                );
+            }
             DeviceConfig::Network(network) => {
                 let device = match network {
                     Network::None => {
@@ -244,6 +253,7 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
             + config.disks.len()
             + config.mounts.len()
             + usize::from(config.vhost_user_vsock.is_some())
+            + usize::from(config.vsock_cid.is_some())
             + usize::from(!matches!(config.network, Network::None))
             + 1,
     );
@@ -255,6 +265,9 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
     #[cfg(target_os = "linux")]
     if let Some(socket) = config.vhost_user_vsock.as_deref() {
         devices.push(DeviceConfig::VhostUserVsock(socket));
+    }
+    if let Some(cid) = config.vsock_cid {
+        devices.push(DeviceConfig::Vsock(cid));
     }
     if !matches!(config.network, Network::None) {
         devices.push(DeviceConfig::Network(&config.network));
@@ -372,6 +385,43 @@ mod tests {
                 .map(DeviceConfig::kind)
                 .collect::<Vec<_>>(),
             expected
+        );
+    }
+
+    #[test]
+    fn standalone_vsock_precedes_network_without_changing_the_default_plan() {
+        let network = Network::Unixstream(NetUnixstream {
+            peer_path: PathBuf::from("net.sock"),
+            mac: [0x02, 0, 0, 0, 0, 1],
+        });
+        let default_config = KrunConfig {
+            network: network.clone(),
+            ..KrunConfig::default()
+        };
+        let standalone_config = KrunConfig {
+            vsock_cid: Some(3),
+            network,
+            ..KrunConfig::default()
+        };
+        let standalone_plan = device_plan(&standalone_config);
+
+        assert_eq!(
+            device_plan(&default_config)
+                .iter()
+                .map(DeviceConfig::kind)
+                .collect::<Vec<_>>(),
+            vec![DeviceKind::Network, DeviceKind::Rng]
+        );
+        assert!(matches!(
+            standalone_plan.first(),
+            Some(DeviceConfig::Vsock(3))
+        ));
+        assert_eq!(
+            standalone_plan
+                .iter()
+                .map(DeviceConfig::kind)
+                .collect::<Vec<_>>(),
+            vec![DeviceKind::Vsock, DeviceKind::Network, DeviceKind::Rng]
         );
     }
 }

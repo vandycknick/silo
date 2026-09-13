@@ -86,6 +86,8 @@ The helper uses a narrow private adapter over `VmmBuilder` and the native device
 
 The adapter initializes libkrun's stderr logger at error level while honoring its standard environment filter. `Vmm::run()` owns the event loop and returns `()` only after a fatal event-loop error. The helper converts that return into a controlled error so the process exits nonzero instead of falsely reporting a successful VM exit.
 
+The hidden developer option `--vsock-cid 3` attaches one standalone native `VsockDevice` before networking. This prerequisite path has no port mappings and uses empty TSI flags. It is mutually exclusive with `--vhost-user-vsock`; no other guest CID is admitted during this phase. Omitting both options preserves the existing device plan.
+
 The `blk`, `net`, and `vhost-user` APIs are selected at compile time through fixed Cargo features. Runtime feature probing is unnecessary because a helper missing a required API cannot compile.
 
 Libkrun v2 starts VMM builders without implicit console, vsock, balloon, or RNG devices and no longer injects a default init binary. The helper therefore supplies its kernel and optional initramfs directly, adds hvc0 only for `--stdio-console`, adds an explicit RNG, and on Linux attaches vmmon's explicit vhost-user-vsock frontend with `--vhost-user-vsock`. Balloon attachment remains deferred to the memory-reclaim phase. Vmmon's embedded backend provides unconditional dynamic dials to guest ports 22 and 1027 while the public `VmSpec.vsock.enabled` setting independently controls the host mux and guest-to-host listener discovery.

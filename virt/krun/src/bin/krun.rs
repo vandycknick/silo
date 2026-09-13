@@ -66,8 +66,16 @@ struct Cli {
     #[arg(long = "mount", value_parser = parse::mount)]
     mounts: Vec<krun::Mount>,
     /// Attach a vhost-user virtio-vsock device at this Unix socket.
-    #[arg(long = "vhost-user-vsock")]
+    #[arg(long = "vhost-user-vsock", conflicts_with = "vsock_cid")]
     vhost_user_vsock: Option<PathBuf>,
+    /// Attach a standalone native virtio-vsock device with this guest CID.
+    #[arg(
+        long = "vsock-cid",
+        hide = true,
+        conflicts_with = "vhost_user_vsock",
+        value_parser = clap::value_parser!(u64).range(3..=3)
+    )]
+    vsock_cid: Option<u64>,
     /// Explicit networking backend. Defaults to no guest networking.
     #[arg(long = "network", value_enum, default_value_t = NetworkArg::None)]
     network: NetworkArg,
@@ -113,6 +121,7 @@ impl Cli {
             disks: self.disks,
             mounts: self.mounts,
             vhost_user_vsock: self.vhost_user_vsock,
+            vsock_cid: self.vsock_cid,
             network,
             stdio_console: self.stdio_console,
         })
@@ -345,5 +354,34 @@ mod tests {
             config.vhost_user_vsock.as_deref(),
             Some(Path::new("/tmp/vhost-vsock.sock"))
         );
+    }
+
+    #[test]
+    fn parses_standalone_vsock_guest_cid() {
+        let config = Cli::try_parse_from(["krun", "--kernel", "/kernel", "--vsock-cid", "3"])
+            .expect("standalone vsock argument should parse")
+            .into_config()
+            .expect("standalone vsock argument should produce a config");
+
+        assert_eq!(config.vsock_cid, Some(3));
+    }
+
+    #[test]
+    fn rejects_standalone_and_vhost_user_vsock_together() {
+        assert!(Cli::try_parse_from([
+            "krun",
+            "--kernel",
+            "/kernel",
+            "--vsock-cid",
+            "3",
+            "--vhost-user-vsock",
+            "/tmp/vhost-vsock.sock",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_standalone_vsock_guest_cid() {
+        assert!(Cli::try_parse_from(["krun", "--kernel", "/kernel", "--vsock-cid", "4"]).is_err());
     }
 }
