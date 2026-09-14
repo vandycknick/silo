@@ -403,6 +403,7 @@ async fn validate_committed_candidate(
     on_started: impl FnOnce(&libvm::MachineRunId) -> eyre::Result<()>,
 ) -> eyre::Result<()> {
     let machine = api.machine(&record.active_machine_id).await?;
+    let machine_data = machine.inspect().await?;
     let options = api.machine_start_options(&machine, false).await?;
     let run_id = machine.start_with_options(options).await?.run_id;
     let validation = async {
@@ -415,7 +416,8 @@ async fn validate_committed_candidate(
             );
         }
         validate_guest_manifest(&machine).await?;
-        crate::system::supervisor::activate(&machine, config, record.data_uuid).await?;
+        crate::system::supervisor::activate(&machine, config, &machine_data.spec, record.data_uuid)
+            .await?;
         crate::system::supervisor::probe_docker_socket(&config.docker_socket)
     }
     .await;

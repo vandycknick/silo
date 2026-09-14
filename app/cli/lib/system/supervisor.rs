@@ -338,7 +338,7 @@ async fn reconcile_ready(
     }
     status.phase = DaemonPhase::ActivatingEngine;
     publish(paths, status)?;
-    activate(&machine, config, record.data_uuid).await?;
+    activate(&machine, config, &machine_data.spec, record.data_uuid).await?;
     // Activation returns once the guest units are up; the host-side socket forward
     // becomes live shortly after the guest half exists, so poll rather than probe once.
     wait_docker_socket(&config.docker_socket, ENGINE_REACHABLE_TIMEOUT).await?;
@@ -681,18 +681,10 @@ fn startup_retry_delay(failed_attempts: u32) -> Duration {
 pub(crate) async fn activate(
     machine: &crate::api::machine::AppMachine,
     config: &ResolvedSystemConfig,
+    machine_spec: &vm_spec::VmSpec,
     data_uuid: Uuid,
 ) -> eyre::Result<()> {
-    let request = serde_json::json!({
-        "schema": 1,
-        "data_uuid": data_uuid,
-        "data_layout": 1,
-        "required_shares": config.shares.iter().map(|share| serde_json::json!({
-            "path": share.path,
-            "tag": share.path.to_string_lossy(),
-            "writable": !share.read_only,
-        })).collect::<Vec<_>>(),
-    });
+    let request = activation_request(config, machine_spec, data_uuid)?;
     let output = machine
         .exec_with_input(
             "/usr/sbin/silo-system-activate",
@@ -709,6 +701,73 @@ pub(crate) async fn activate(
         );
     }
     Ok(())
+}
+
+fn activation_request(
+    config: &ResolvedSystemConfig,
+    machine_spec: &vm_spec::VmSpec,
+    data_uuid: Uuid,
+) -> eyre::Result<serde_json::Value> {
+    let projected = vm_spec::project_mounts(&machine_spec.mounts)
+        .map_err(eyre::Report::msg)
+        .context("project actual system machine shares for activation")?;
+    if projected.len() != config.shares.len() {
+        bail!(
+            "system activation configuration/spec mismatch: actual machine has {} shares, configuration requires {}",
+            projected.len(),
+            config.shares.len()
+        );
+    }
+
+    let required_shares = config
+        .shares
+        .iter()
+        .map(|share| {
+            let mut matching = projected
+                .iter()
+                .filter(|mount| mount.host_source == share.path);
+            let mount = matching.next().ok_or_else(|| {
+                eyre::eyre!(
+                    "system activation configuration/spec mismatch: required host share {} is missing from the actual machine",
+                    share.path.display()
+                )
+            })?;
+            if matching.next().is_some() {
+                bail!(
+                    "system activation configuration/spec mismatch: required host share {} is ambiguous in the actual machine",
+                    share.path.display()
+                );
+            }
+            if mount.guest_path != share.path {
+                bail!(
+                    "system activation configuration/spec mismatch: host share {} has guest path {}, expected {}",
+                    share.path.display(),
+                    mount.guest_path.display(),
+                    share.path.display()
+                );
+            }
+            if mount.read_only != share.read_only {
+                bail!(
+                    "system activation configuration/spec mismatch: share {} is {} in the actual machine, expected {}",
+                    share.path.display(),
+                    if mount.read_only { "read-only" } else { "read-write" },
+                    if share.read_only { "read-only" } else { "read-write" }
+                );
+            }
+            Ok(serde_json::json!({
+                "path": mount.guest_path,
+                "tag": mount.backend_tag,
+                "writable": !mount.read_only,
+            }))
+        })
+        .collect::<eyre::Result<Vec<_>>>()?;
+
+    Ok(serde_json::json!({
+        "schema": 1,
+        "data_uuid": data_uuid,
+        "data_layout": 1,
+        "required_shares": required_shares,
+    }))
 }
 
 async fn wait_docker_socket(path: &Path, timeout: Duration) -> eyre::Result<()> {
@@ -869,11 +928,132 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
 
+    use crate::system::config::{ResolvedShare, SystemConfig};
     use crate::system::supervisor::{
-        error_causes, error_summary, guest_reclaim_script, initial_host_memory_reclaim_effective,
-        parse_reclaim_branch, startup_retry_delay, ActivitySample, IdleReclaimer, LifetimeLock,
-        ReclaimBranch, MIB,
+        activation_request, error_causes, error_summary, guest_reclaim_script,
+        initial_host_memory_reclaim_effective, parse_reclaim_branch, startup_retry_delay,
+        ActivitySample, IdleReclaimer, LifetimeLock, ReclaimBranch, MIB,
     };
+    use vm_spec::Mount;
+
+    fn activation_config(
+        shares: Vec<ResolvedShare>,
+    ) -> crate::system::config::ResolvedSystemConfig {
+        let home = tempfile::tempdir().expect("home");
+        let config: SystemConfig =
+            serde_yaml_ng::from_str("version: '1'\nsystem: {}\n").expect("config");
+        let mut config = config
+            .resolve(home.path(), None)
+            .expect("resolve system config");
+        config.shares = shares;
+        config
+    }
+
+    #[test]
+    fn activation_uses_full_machine_mount_projection() {
+        let long_one = "/guest/a/very/long/workspace/destination/that/exceeds/the/tag/field";
+        let long_two = "/guest/another/long/read-only/destination/that/exceeds/the/tag/field";
+        let shares = vec![
+            ResolvedShare {
+                path: long_one.into(),
+                read_only: false,
+            },
+            ResolvedShare {
+                path: "/literal".into(),
+                read_only: false,
+            },
+            ResolvedShare {
+                path: long_two.into(),
+                read_only: true,
+            },
+            ResolvedShare {
+                path: "/cache".into(),
+                read_only: true,
+            },
+        ];
+        let config = activation_config(shares.clone());
+        let mut spec = vm_spec::VmSpec::current();
+        spec.mounts = vec![
+            Mount {
+                source: long_one.into(),
+                tag: long_one.to_string(),
+                read_only: false,
+            },
+            Mount {
+                source: "/literal".into(),
+                tag: "silo-mount-0".to_string(),
+                read_only: false,
+            },
+            Mount {
+                source: long_two.into(),
+                tag: long_two.to_string(),
+                read_only: true,
+            },
+            Mount {
+                source: "/cache".into(),
+                tag: "/cache".to_string(),
+                read_only: true,
+            },
+        ];
+
+        let request = activation_request(&config, &spec, uuid::Uuid::nil())
+            .expect("build activation request");
+
+        assert_eq!(
+            request["required_shares"],
+            serde_json::json!([
+                { "path": long_one, "tag": "silo-mount-1", "writable": true },
+                { "path": "/literal", "tag": "silo-mount-0", "writable": true },
+                { "path": long_two, "tag": "silo-mount-2", "writable": false },
+                { "path": "/cache", "tag": "/cache", "writable": false }
+            ])
+        );
+        assert_eq!(spec.mounts[0].source, shares[0].path);
+        assert_eq!(spec.mounts[0].tag, long_one);
+    }
+
+    #[test]
+    fn activation_rejects_required_share_configuration_spec_mismatches() {
+        let config = activation_config(vec![ResolvedShare {
+            path: "/required".into(),
+            read_only: true,
+        }]);
+        let spec_with = |source: &str, tag: &str, read_only| {
+            let mut spec = vm_spec::VmSpec::current();
+            spec.mounts.push(Mount {
+                source: source.into(),
+                tag: tag.to_string(),
+                read_only,
+            });
+            spec
+        };
+
+        for (spec, expected) in [
+            (
+                spec_with("/other", "/required", true),
+                "required host share /required is missing",
+            ),
+            (
+                spec_with("/required", "/other", true),
+                "has guest path /other, expected /required",
+            ),
+            (
+                spec_with("/required", "/required", false),
+                "is read-write in the actual machine, expected read-only",
+            ),
+        ] {
+            let error = activation_request(&config, &spec, uuid::Uuid::nil())
+                .expect_err("mismatched activation share must fail");
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+
+        let empty = vm_spec::VmSpec::current();
+        let error = activation_request(&config, &empty, uuid::Uuid::nil())
+            .expect_err("missing machine share must fail");
+        assert!(error
+            .to_string()
+            .contains("actual machine has 0 shares, configuration requires 1"));
+    }
 
     #[test]
     fn error_causes_list_each_distinct_cause_once() {
