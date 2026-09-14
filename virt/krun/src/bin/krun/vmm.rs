@@ -290,19 +290,19 @@ pub(crate) fn run(
             .name("silo-krun-shutdown".to_string())
             .spawn(move || match shutdown_signals.wait() {
                 Ok(Signal::SIGTERM) => {
-                    tracing::info!("krun helper received SIGTERM");
+                    eprintln!("krun helper received SIGTERM");
                     match handle.shutdown() {
-                        Ok(()) => tracing::info!("krun helper sent guest shutdown request"),
+                        Ok(()) => eprintln!("krun helper sent guest shutdown request"),
                         Err(err) => {
-                            tracing::error!(error = %err, "failed to request guest shutdown");
+                            eprintln!("krun helper failed to request guest shutdown: {err}");
                         }
                     }
                 }
                 Ok(signal) => {
-                    tracing::error!(?signal, "unexpected signal reached shutdown waiter");
+                    eprintln!("krun helper shutdown waiter received unexpected signal: {signal:?}");
                 }
                 Err(err) => {
-                    tracing::error!(error = %err, "shutdown signal wait failed");
+                    eprintln!("krun helper shutdown signal wait failed: {err}");
                 }
             })
             .map_err(Error::ShutdownThread)?;
