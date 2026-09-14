@@ -267,7 +267,11 @@ fn provision_mount_entries(spec: &VmSpec) -> Vec<ProvisionMountConfig> {
         .iter()
         .map(|mount| ProvisionMountConfig {
             tag: mount.tag.clone(),
-            path: mount.source.to_string_lossy().to_string(),
+            path: if mount.tag.starts_with('/') {
+                mount.tag.clone()
+            } else {
+                mount.source.to_string_lossy().to_string()
+            },
             fstype: VIRTIOFS_FSTYPE.to_string(),
             options: if mount.read_only {
                 vec![
@@ -326,7 +330,8 @@ mod tests {
 
     use crate::guest_agent::{
         build_config_with_host_context, build_provision_config, build_provision_network_config,
-        guest_ssh_key_paths, load_or_generate_guest_ssh_keypair, GuestAgentHostContext,
+        guest_ssh_key_paths, load_or_generate_guest_ssh_keypair, provision_mount_entries,
+        GuestAgentHostContext,
     };
     use crate::host;
     use crate::machine::MachineUserConfig;
@@ -665,6 +670,46 @@ mod tests {
                 .map(|userdata| &userdata.run),
             Some(&UserdataRunPolicy::Once)
         );
+    }
+
+    #[test]
+    fn provision_mounts_resolve_guest_paths_without_changing_export_tags() {
+        let mut spec = sample_spec(Vec::new());
+        spec.mounts = vec![
+            Mount {
+                source: PathBuf::from("/host/project"),
+                tag: "/workspace".to_string(),
+                read_only: false,
+            },
+            Mount {
+                source: PathBuf::from("/host/cache"),
+                tag: "/var/cache/project".to_string(),
+                read_only: true,
+            },
+            Mount {
+                source: PathBuf::from("/sdk/worktree"),
+                tag: "workspace".to_string(),
+                read_only: false,
+            },
+            Mount {
+                source: PathBuf::from("/srv/shared"),
+                tag: "/srv/shared".to_string(),
+                read_only: true,
+            },
+        ];
+
+        let mounts = provision_mount_entries(&spec);
+
+        assert_eq!(mounts[0].tag, "/workspace");
+        assert_eq!(mounts[0].path, "/workspace");
+        assert_eq!(mounts[0].options, ["rw", "nofail"]);
+        assert_eq!(mounts[1].tag, "/var/cache/project");
+        assert_eq!(mounts[1].path, "/var/cache/project");
+        assert_eq!(mounts[1].options, ["ro", "nofail"]);
+        assert_eq!(mounts[2].tag, "workspace");
+        assert_eq!(mounts[2].path, "/sdk/worktree");
+        assert_eq!(mounts[3].tag, "/srv/shared");
+        assert_eq!(mounts[3].path, "/srv/shared");
     }
 
     #[test]
