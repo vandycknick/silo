@@ -7,7 +7,7 @@ The crate exposes:
 - a process-backed `VirtualMachineBuilder`
 - a `VirtualMachine` handle for lifecycle management
 - a `SerialConnection` wrapper for helper stdio access
-- typed disk, mount, network, and vhost-user-vsock configuration structs
+- typed disk, mount, network, and inherited-vsock configuration
 
 The `krun` binary is intentionally small. It parses Silo's flat helper arguments, configures libkrun directly, and then enters the VM. It does not use the library builder and does not expose subcommands. On Linux, `krun --check-host` runs the deeper KVM host check without starting a guest.
 
@@ -60,7 +60,8 @@ Current scope focuses on the libkrun path used by Silo today:
 - direct kernel and initramfs boot
 - raw block devices
 - virtiofs mounts
-- one explicit vhost-user-vsock device terminated by vmmon
+- one explicit native vsock device connected to vmmon by an inherited control
+  socket
 - stdio console output
 - process-backed VM lifecycle management from Rust callers
 
@@ -84,13 +85,17 @@ The optional `krun-bin` Cargo feature compiles the pinned libkrun fork directly 
 
 The helper uses a narrow private adapter over `VmmBuilder` and the native device constructors. It transfers owned network descriptors to libkrun, borrows console descriptors for the VMM lifetime, and rejects non-UTF-8 paths rather than changing them. The `ffi` feature and generated C exports stay disabled. The resulting runtime does not require `libkrun.so`, `libkrun.dylib`, or `libkrunfw`.
 
-The adapter initializes libkrun's stderr logger at error level while honoring its standard environment filter. `Vmm::run()` owns the event loop and returns `()` only after a fatal event-loop error. The helper converts that return into a controlled error so the process exits nonzero instead of falsely reporting a successful VM exit.
+The adapter initializes libkrun's stderr logger at info level while honoring its standard environment filter, so startup qualification diagnostics are visible. `Vmm::run()` owns the event loop and returns `()` only after a fatal event-loop error. The helper converts that return into a controlled error so the process exits nonzero instead of falsely reporting a successful VM exit.
 
-The hidden developer option `--vsock-cid 3` attaches one standalone native `VsockDevice` before networking. This prerequisite path has no port mappings and uses empty TSI flags. It is mutually exclusive with `--vhost-user-vsock`; no other guest CID is admitted during this phase. Omitting both options preserves the existing device plan.
+The hidden developer option `--vsock-cid 3` attaches one standalone native `VsockDevice` before networking. This fixture-only path has no port mappings and uses empty TSI flags. It is mutually exclusive with `--vsock-mux-fd`; no other guest CID is admitted. Production callers use `--vsock-mux-fd`, which names a helper-inherited Unix stream descriptor rather than a filesystem path.
 
-The `blk`, `net`, and `vhost-user` APIs are selected at compile time through fixed Cargo features. Runtime feature probing is unnecessary because a helper missing a required API cannot compile.
+The `blk` and `net` APIs are selected at compile time through fixed Cargo features. Runtime feature probing is unnecessary because a helper missing a required API cannot compile.
 
-Libkrun v2 starts VMM builders without implicit console, vsock, balloon, or RNG devices and no longer injects a default init binary. The helper therefore supplies its kernel and optional initramfs directly, adds hvc0 only for `--stdio-console`, adds an explicit RNG, and on Linux attaches vmmon's explicit vhost-user-vsock frontend with `--vhost-user-vsock`. Balloon attachment remains deferred to the memory-reclaim phase. Vmmon's embedded backend provides unconditional dynamic dials to guest ports 22 and 1027 while the public `VmSpec.vsock.enabled` setting independently controls the host mux and guest-to-host listener discovery.
+Libkrun v2 starts VMM builders without implicit console, vsock, balloon, or RNG devices and no longer injects a default init binary. The helper therefore supplies its kernel and optional initramfs directly, adds hvc0 only for `--stdio-console`, adds explicit RNG and balloon devices, and attaches one native vsock device when vmmon supplies `--vsock-mux-fd`. Vmmon and the helper inherit opposite ends of a private socketpair; per-connection stream descriptors cross it with `SCM_RIGHTS`, while payload bytes stay on those streams. This is the same krun transport on Linux and macOS, with no private filesystem socket path. Vmmon retains its existing dynamic registry, admission, leases, and relays, while `VmSpec.vsock.enabled` independently controls only the public host mux and guest-to-host listener discovery.
+
+Krun is the Linux backend. On macOS it is compiled as an experimental backend,
+while Virtualization.framework remains the default. Runtime backend selection
+is owned by libvm and vmmon, outside this launcher crate.
 
 ## libkrun Build Features
 
@@ -98,7 +103,6 @@ Silo's intended libkrun build keeps the upstream library narrow while preserving
 
 ```text
 --no-default-features --features blk --features net
-# Linux additionally enables: --features vhost-user
 ```
 
 That means Silo intentionally builds libkrun with these features enabled:
@@ -107,7 +111,6 @@ That means Silo intentionally builds libkrun with these features enabled:
 | --- | --- | --- |
 | `blk` | Enables virtio-block devices. | Keep. Required for `--disk` and Silo disk images. |
 | `net` | Enables virtio-net devices for unixgram, unixstream, and tap networking. | Keep. Required for Silo networking modes. |
-| `vhost-user` | Enables explicit vhost-user device attachment. | Keep on Linux until the native vsock mux replaces vmmon's vhost-user-vsock backend. |
 
 Silo intentionally leaves these libkrun v2 features and optional components disabled for now:
 

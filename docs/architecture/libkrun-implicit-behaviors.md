@@ -8,12 +8,12 @@ Every helper-created VMM does the following:
 
 1. Set the VM CPU and memory configuration.
 2. Set the explicit kernel, optional initramfs, and kernel command line.
-3. Add console, disks, mounts, Linux vhost-user-vsock, and networking when configured, in that deterministic order.
-4. Add an explicit RNG device. Balloon attachment remains deferred to the memory-reclaim phase.
+3. Add console, disks, mounts, the native vsock control-channel device, and networking when configured, in that deterministic order.
+4. Add explicit RNG and balloon devices. Host memory release remains disabled unless the separate reclaim policy and startup qualification enable it.
 
-The helper does not use the compatibility C API. If a console is needed, it builds `ConsoleDevice::builder().add_default_console(...)` with borrowed stdio descriptors and selects `hvc0` on `VmmBuilder`. On Linux, vmmon passes one vhost-user socket to the helper, which constructs device type 19 with three 128-entry queues. The helper does not construct the native vsock/TSI device or configure per-port mappings; vmmon's embedded backend handles arbitrary host and guest ports dynamically.
+The helper does not use the compatibility C API. If a console is needed, it builds `ConsoleDevice::builder().add_default_console(...)` with borrowed stdio descriptors and selects `hvc0` on `VmmBuilder`. On Linux and macOS, vmmon passes one inherited Unix stream descriptor to the helper, which constructs a native `VsockDevice` with CID 3 and empty TSI flags, then gives the descriptor to libkrun's control-channel mux. Per-connection descriptors cross that private channel with `SCM_RIGHTS`; stream payloads do not. The helper configures no per-port mappings and the transport binds no filesystem path.
 
-The historical `krun_set_port_map()` API is intentionally not part of Silo's startup path. It controls TSI stream remapping, not explicit virtio-net backends or Silo's vhost-user-vsock device.
+The historical `krun_set_port_map()` API is intentionally not part of Silo's startup path. It controls TSI stream remapping, not explicit virtio-net backends or Silo's native control-channel vsock device.
 
 ## Inventory
 
@@ -21,10 +21,10 @@ The historical `krun_set_port_map()` API is intentionally not part of Silo's sta
 | --- | --- | --- | --- | --- |
 | Console device | Add `ConsoleDevice` | No console device | Added only for `--stdio-console`, then selected as `hvc0` | Applies on Linux and macOS |
 | Init binary | Select a payload | No injected init binary | Silo loads an external kernel and optional initramfs | Applies on Linux and macOS |
-| Vsock device | Add `VsockDevice` or a vhost-user device | No vsock device | Linux interim: device type 19, three queues, terminated by vmmon's embedded backend | Not attached on macOS yet; the native mux is a later phase |
+| Vsock device | Add `VsockDevice` | No vsock device | Native CID 3 device with TSI disabled and an inherited control-channel fd | Same krun implementation on Linux and macOS; VZ remains the macOS default |
 | RNG device | Add `RngDevice` | No RNG device | Always added explicitly | Applies on Linux and macOS |
-| Balloon device | Add `BalloonDevice` | No balloon device | Not attached until the memory-reclaim phase | Applies on Linux and macOS |
-| TSI networking | Enable TSI flags on libkrun's built-in vsock device | No TSI fallback | Not used; Linux uses vhost-user-vsock and configured hosts may add explicit virtio-net | Applies on Linux and macOS |
+| Balloon device | Add `BalloonDevice` | No balloon device | Added explicitly; host reclaim is configured independently and remains qualification-gated | Applies on Linux and macOS |
+| TSI networking | Enable TSI flags on libkrun's built-in vsock device | No TSI fallback | Not used; the native vsock device has empty TSI flags and configured hosts may add explicit virtio-net | Applies on Linux and macOS |
 | TSI port remapping | Use TSI stream listens through libkrun's vsock path | May rewrite guest listen ports according to a libkrun port map | Not used; TSI is disabled and explicit virtio-net backends do not consume this map | Applies only to libkrun's vsock/TSI stream path |
 | Exec-mode environment | Use the compatibility C exec APIs | Not exposed by the native `VmmBuilder` API | Not used; Silo direct-boots its kernel and initramfs | Applies on Linux and macOS |
 | Unixgram networking | Add `NetDevice::new_unixgram_fd()` | No network device | Available via `--network unixgram` with `--net-peer` and `--net-mac` | Current Silo gvproxy path; the fd is owned by libkrun |

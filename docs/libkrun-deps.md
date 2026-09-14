@@ -12,31 +12,35 @@ The workspace dependency is pinned by full Git commit in the root
 
 ```text
 repository: https://github.com/vandycknick/libkrun.git
-local branch:      silo/v2 @ 24d714b5dce8e8dd91afb9e0f64ebf6f3e1e846e
-remote silo/v2:    10b6f752ba8ea735c3d9edaa549599dcf3f98d18
-upstream:   24d714b5dce8e8dd91afb9e0f64ebf6f3e1e846e (main)
-revision:   24d714b5dce8e8dd91afb9e0f64ebf6f3e1e846e
+tracked revision: 24d714b5dce8e8dd91afb9e0f64ebf6f3e1e846e
+fetchable: yes
+next revision: pending publication of the reviewed fork commits
 ```
 
 Release builds must use the committed `Cargo.lock` with `--locked`. A branch
 or tag is useful for reviewing the fork, but neither replaces the immutable
 commit pin.
 
-The pinned upstream revision is reachable through the fork URL: a direct
+The committed revision is reachable through the fork URL: a direct
 `git fetch https://github.com/vandycknick/libkrun.git 24d714b5dce8e8dd91afb9e0f64ebf6f3e1e846e`
-succeeds. Cargo therefore resolves it directly from GitHub with no local
-checkout, URL rewrite, path patch, or development-only lockfile. The local
-`silo/v2` branch was moved to this revision after preserving
-`10b6f752ba8ea735c3d9edaa549599dcf3f98d18` as
-`backup/silo-v2-2026-09-13`; the remote branch has not been rewritten or pushed.
+succeeds. Cargo therefore resolves the tracked pin directly from GitHub with no
+path patch or URL rewrite.
+
+Development currently uses an untracked Cargo path override and development
+lockfile to test unpublished fork work, including the native vsock control
+channel. Those machine-local files must not be committed. The tracked revision
+and lockfile will move only after the fork commit is published and fetchable;
+until then, this development branch's helper requires the explicit local
+override. The tracked remote pin alone does not provide its new native APIs,
+and no remote `--locked` build success is claimed for this integration.
 
 The previous fork tip carried an x86_64 initrd placement patch and immediate
 Unix-vsock endpoint release. Upstream now contains its own initrd placement fix
 and 3330/4096 MiB regression tests, but Silo's x86_64 runtime verification is
-deferred, so no x86 boot claim is made here. The immediate-release behavior is
-not present at this upstream revision; it remains a pending fork fix before the
-interim Linux vhost-user phase can be accepted. Silo does not retain duplicate
-patch files or generated C bindings.
+deferred, so no x86 boot claim is made here. The old endpoint-release behavior
+belonged to the unused port-path API and is not part of the native control-
+channel transport. Silo does not retain duplicate patch files or generated C
+bindings.
 
 ## Cargo Features
 
@@ -45,21 +49,16 @@ Silo disables libkrun's default features and enables only:
 ```text
 blk
 net
-vhost-user (Linux only)
 ```
 
 `blk` provides the raw virtio-block path used by Silo disks. `net` provides
-the Unix datagram, Unix stream, and Linux TAP networking paths. `vhost-user`
-provides the explicit device API used to attach vmmon's embedded
-vhost-user-vsock backend. The helper's private adapter calls the safe native
-Rust block, network, and vhost-user device constructors directly. Libkrun's
-`ffi` feature is disabled.
-
-The `krun-bin` feature also unifies nix 0.30's `uio` feature into libkrun's
-device graph. The pinned v2 `krun-devices` manifest enables `socket` for its
-vhost-user frontend but omits the `uio` feature required by `sendmsg` and
-`ControlMessage`. This private feature carrier can be removed when that
-dependency edge is fixed in the pinned fork or upstream.
+the Unix datagram, Unix stream, and Linux TAP networking paths. The helper's
+private adapter calls the safe native Rust block, network, and vsock device
+constructors directly. Libkrun's `ffi` and `vhost-user` features are disabled.
+The former Silo-side nix `uio` feature carrier for libkrun's vhost-user graph
+has been removed. The updated fork enables `uio` in its own devices manifest;
+Silo's own control-channel implementation enables the nix
+socket and `uio` APIs directly where it uses `sendmsg` and `SCM_RIGHTS`.
 
 The resynced graph uses `kvm-bindings 0.14.1`, `imago 0.2.4`, and
 `vm-memory 0.18`. This removes the old `vm-memory 0.17` duplicate from the
@@ -68,10 +67,10 @@ transitive versions on every libkrun update.
 
 Libkrun's native builder has no implicit console, vsock, balloon, or RNG device
 and no longer injects a default init binary. Silo supplies an explicit kernel
-and optional initramfs, adds its console when requested, always adds an RNG, and
-on Linux attaches one explicit vhost-user-vsock device. It does not configure
-the native vsock/TSI path or use fallback firmware. Consequently, Silo neither
-builds nor packages `libkrunfw`.
+and optional initramfs, adds its console when requested, always adds RNG and
+balloon devices, and attaches one native vsock device when vmmon supplies the
+inherited control descriptor. TSI and per-port mappings remain disabled.
+Consequently, Silo neither builds nor packages `libkrunfw`.
 
 ## Build
 
@@ -108,7 +107,7 @@ For each upstream update:
 2. Check whether each downstream fix has landed upstream.
 3. Apply only the fixes that remain necessary as focused commits.
 4. Run the fork's targeted regression tests on x86_64 Linux and arm64 macOS.
-5. Build the fork with default features disabled and `blk,net,vhost-user` enabled.
+5. Build the fork with default features disabled and `blk,net` enabled.
 6. Update the full Git revision in the root `Cargo.toml`.
 7. Regenerate and commit `Cargo.lock`.
 8. Review the helper adapter against the native Rust API signatures.
