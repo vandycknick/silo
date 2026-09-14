@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 
@@ -65,14 +65,14 @@ struct Cli {
     /// Add a virtiofs mount. Format: TAG:PATH:ro|rw.
     #[arg(long = "mount", value_parser = parse::mount)]
     mounts: Vec<krun::Mount>,
-    /// Attach a vhost-user virtio-vsock device at this Unix socket.
-    #[arg(long = "vhost-user-vsock", conflicts_with = "vsock_cid")]
-    vhost_user_vsock: Option<PathBuf>,
+    /// Inherited Unix stream descriptor for the private vsock control mux.
+    #[arg(long = "vsock-mux-fd", conflicts_with = "vsock_cid")]
+    vsock_mux_fd: Option<RawFd>,
     /// Attach a standalone native virtio-vsock device with this guest CID.
     #[arg(
         long = "vsock-cid",
         hide = true,
-        conflicts_with = "vhost_user_vsock",
+        conflicts_with = "vsock_mux_fd",
         value_parser = clap::value_parser!(u64).range(3..=3)
     )]
     vsock_cid: Option<u64>,
@@ -111,7 +111,7 @@ enum HostMemoryReclaimArg {
 }
 
 impl Cli {
-    fn into_config(self) -> eyre::Result<KrunConfig> {
+    fn into_launch(self) -> eyre::Result<(KrunConfig, Option<OwnedFd>)> {
         let network = self.network()?;
         reject_unused_network_args(
             &network,
@@ -120,21 +120,28 @@ impl Cli {
             self.net_tap_name.as_deref(),
         )?;
 
-        Ok(KrunConfig {
-            id: self.id,
-            cpus: self.cpus,
-            memory_mib: self.memory_mib,
-            kernel: self.kernel,
-            initramfs: self.initramfs,
-            cmdline: self.cmdline,
-            disks: self.disks,
-            mounts: self.mounts,
-            vhost_user_vsock: self.vhost_user_vsock,
-            vsock_cid: self.vsock_cid,
-            network,
-            stdio_console: self.stdio_console,
-            host_memory_reclaim: self.host_memory_reclaim == HostMemoryReclaimArg::On,
-        })
+        let vsock_mux_fd = self
+            .vsock_mux_fd
+            .map(validate_inherited_stream_fd)
+            .transpose()?;
+        Ok((
+            KrunConfig {
+                id: self.id,
+                cpus: self.cpus,
+                memory_mib: self.memory_mib,
+                kernel: self.kernel,
+                initramfs: self.initramfs,
+                cmdline: self.cmdline,
+                disks: self.disks,
+                mounts: self.mounts,
+                vsock_mux: vsock_mux_fd.is_some(),
+                vsock_cid: self.vsock_cid,
+                network,
+                stdio_console: self.stdio_console,
+                host_memory_reclaim: self.host_memory_reclaim == HostMemoryReclaimArg::On,
+            },
+            vsock_mux_fd,
+        ))
     }
 
     fn network(&self) -> eyre::Result<Network> {
@@ -213,7 +220,7 @@ fn reject_arg(present: bool, flag: &'static str, mode: &'static str) -> eyre::Re
 }
 
 fn main() -> eyre::Result<()> {
-    watchdog::start_from_env();
+    let watchdog_fd = watchdog::take_from_env()?;
     let cli = Cli::parse();
     #[cfg(target_os = "linux")]
     {
@@ -249,13 +256,15 @@ fn main() -> eyre::Result<()> {
         }
         admission::check_hvf().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
     }
-    let config = cli.into_config()?;
+    let (config, vsock_mux_fd) = cli.into_launch()?;
     validate_config(&config)?;
     let stdin = io::stdin();
     let stdout = io::stdout();
     let stderr = io::stderr();
     start_enter(
         &config,
+        vsock_mux_fd,
+        watchdog_fd,
         vmm::ConsoleFds {
             stdin: stdin.as_fd(),
             stdout: stdout.as_fd(),
@@ -265,9 +274,37 @@ fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-fn start_enter(config: &KrunConfig, console_fds: vmm::ConsoleFds<'_>) -> eyre::Result<()> {
-    vmm::run(config, console_fds)?;
+fn start_enter(
+    config: &KrunConfig,
+    vsock_mux_fd: Option<OwnedFd>,
+    watchdog_fd: Option<OwnedFd>,
+    console_fds: vmm::ConsoleFds<'_>,
+) -> eyre::Result<()> {
+    vmm::run(config, vsock_mux_fd, watchdog_fd, console_fds)?;
     Ok(())
+}
+
+fn validate_inherited_stream_fd(fd: RawFd) -> eyre::Result<OwnedFd> {
+    if fd < 0 {
+        eyre::bail!("--vsock-mux-fd must name an open Unix stream socket");
+    }
+    // SAFETY: the numeric descriptor is transferred exactly once from argv ownership.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    nix::sys::stat::fstat(&fd)
+        .map_err(|error| eyre::eyre!("--vsock-mux-fd is not open: {error}"))?;
+    if nix::sys::socket::getsockopt(&fd, sockopt::SockType)? != nix::sys::socket::SockType::Stream
+        || nix::sys::socket::getsockname::<nix::sys::socket::UnixAddr>(fd.as_fd().as_raw_fd())
+            .is_err()
+    {
+        eyre::bail!("--vsock-mux-fd must name an open Unix stream socket");
+    }
+    let mut flags = nix::fcntl::FdFlag::from_bits_retain(nix::fcntl::fcntl(
+        &fd,
+        nix::fcntl::FcntlArg::F_GETFD,
+    )?);
+    flags.insert(nix::fcntl::FdFlag::FD_CLOEXEC);
+    nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFD(flags))?;
+    Ok(fd)
 }
 
 fn open_local_unix_datagram_socket(
@@ -310,6 +347,7 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
     use std::path::Path;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -346,31 +384,33 @@ mod tests {
         assert!(Cli::try_parse_from(["krun", "--check-host", "--cpus", "2"]).is_err());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn parses_vhost_user_vsock() {
-        let config = Cli::try_parse_from([
+    fn parses_vsock_mux_fd() {
+        use std::os::fd::IntoRawFd;
+
+        let (fd, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let raw = fd.into_raw_fd();
+        let (config, fd) = Cli::try_parse_from([
             "krun",
             "--kernel",
             "/kernel",
-            "--vhost-user-vsock",
-            "/tmp/vhost-vsock.sock",
+            "--vsock-mux-fd",
+            &raw.to_string(),
         ])
-        .expect("vhost-user argument should parse")
-        .into_config()
-        .expect("vhost-user argument should produce a config");
+        .expect("mux argument should parse")
+        .into_launch()
+        .expect("mux argument should produce a launch");
 
-        assert_eq!(
-            config.vhost_user_vsock.as_deref(),
-            Some(Path::new("/tmp/vhost-vsock.sock"))
-        );
+        assert!(config.vsock_mux);
+        assert_eq!(fd.expect("owned mux fd").as_raw_fd(), raw);
     }
 
     #[test]
     fn parses_standalone_vsock_guest_cid() {
         let config = Cli::try_parse_from(["krun", "--kernel", "/kernel", "--vsock-cid", "3"])
             .expect("standalone vsock argument should parse")
-            .into_config()
+            .into_launch()
+            .map(|launch| launch.0)
             .expect("standalone vsock argument should produce a config");
 
         assert_eq!(config.vsock_cid, Some(3));
@@ -380,12 +420,14 @@ mod tests {
     fn host_memory_reclaim_requires_an_explicit_on_value() {
         let default = Cli::try_parse_from(["krun", "--kernel", "/kernel"])
             .expect("default arguments should parse")
-            .into_config()
+            .into_launch()
+            .map(|launch| launch.0)
             .expect("default arguments should produce a config");
         let requested =
             Cli::try_parse_from(["krun", "--kernel", "/kernel", "--host-memory-reclaim=on"])
                 .expect("host reclaim argument should parse")
-                .into_config()
+                .into_launch()
+                .map(|launch| launch.0)
                 .expect("host reclaim argument should produce a config");
 
         assert!(!default.host_memory_reclaim);
@@ -396,15 +438,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_standalone_and_vhost_user_vsock_together() {
+    fn rejects_standalone_and_mux_vsock_together() {
         assert!(Cli::try_parse_from([
             "krun",
             "--kernel",
             "/kernel",
             "--vsock-cid",
             "3",
-            "--vhost-user-vsock",
-            "/tmp/vhost-vsock.sock",
+            "--vsock-mux-fd",
+            "9",
         ])
         .is_err());
     }

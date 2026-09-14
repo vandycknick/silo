@@ -9,14 +9,14 @@ path = "src/bin/krun.rs"
 required-features = ["krun-bin"]
 
 [features]
-krun-bin = ["dep:bzip2", "dep:libkrun", "dep:libkrun-nix-features"]
+krun-bin = ["dep:bzip2", "dep:libkrun"]
 
 [dependencies]
 utils = { path = "../../common/utils" }
 libkrun = { workspace = true, optional = true }
 clap = { version = "4.6.4", features = ["derive"] }
 eyre = "0.6.12"
-nix = { version = "0.31.3", features = ["fs", "poll", "socket", "term"] }
+nix = { version = "0.31.3", features = ["fs", "poll", "socket", "uio", "term"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.19"
@@ -29,6 +29,3 @@ bzip2 = { version = "0.5.2", features = ["static"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-ioctls = "0.22.1"
-libkrun = { workspace = true, optional = true, features = ["vhost-user"] }
-# libkrun v2's vhost-user code uses ancillary messages without enabling nix's uio feature.
-libkrun-nix-features = { package = "nix", version = "0.30.1", features = ["uio"], optional = true }

@@ -15,7 +15,7 @@ pub struct KrunConfig {
     pub cmdline: Vec<String>,
     pub disks: Vec<Disk>,
     pub mounts: Vec<Mount>,
-    pub vhost_user_vsock: Option<PathBuf>,
+    pub vsock_mux: bool,
     pub vsock_cid: Option<u64>,
     pub network: Network,
     pub stdio_console: bool,
@@ -73,7 +73,7 @@ impl Default for KrunConfig {
             cmdline: Vec::new(),
             disks: Vec::new(),
             mounts: Vec::new(),
-            vhost_user_vsock: None,
+            vsock_mux: false,
             vsock_cid: None,
             network: Network::None,
             stdio_console: false,
@@ -98,18 +98,9 @@ pub fn validate_config(config: &KrunConfig) -> Result<()> {
             "krun requires a kernel".to_string(),
         ));
     }
-    if config
-        .vhost_user_vsock
-        .as_ref()
-        .is_some_and(|path| path.as_os_str().is_empty())
-    {
+    if config.vsock_cid.is_some() && config.vsock_mux {
         return Err(KrunBackendError::InvalidConfig(
-            "vhost-user vsock socket path cannot be empty".to_string(),
-        ));
-    }
-    if config.vsock_cid.is_some() && config.vhost_user_vsock.is_some() {
-        return Err(KrunBackendError::InvalidConfig(
-            "native vsock and vhost-user vsock cannot be used together".to_string(),
+            "standalone vsock and the vsock mux cannot be used together".to_string(),
         ));
     }
     if config
@@ -119,12 +110,6 @@ pub fn validate_config(config: &KrunConfig) -> Result<()> {
         return Err(KrunBackendError::InvalidConfig(format!(
             "native vsock currently requires guest CID {STANDALONE_VSOCK_CID}"
         )));
-    }
-    #[cfg(not(target_os = "linux"))]
-    if config.vhost_user_vsock.is_some() {
-        return Err(KrunBackendError::InvalidConfig(
-            "vhost-user vsock is only supported on Linux".to_string(),
-        ));
     }
     match &config.network {
         Network::None => {}
@@ -220,9 +205,9 @@ mod tests {
     }
 
     #[test]
-    fn standalone_and_vhost_user_vsock_are_mutually_exclusive() {
+    fn standalone_and_mux_vsock_are_mutually_exclusive() {
         let config = KrunConfig {
-            vhost_user_vsock: Some(PathBuf::from("/tmp/vhost-vsock.sock")),
+            vsock_mux: true,
             vsock_cid: Some(3),
             ..valid_config()
         };

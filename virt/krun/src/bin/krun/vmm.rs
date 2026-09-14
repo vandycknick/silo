@@ -1,5 +1,5 @@
 use std::io;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use krun::{Disk, KrunConfig, Mount, Network};
@@ -9,9 +9,6 @@ use libkrun::{
     SyncMode, TsiFlags, VmmBuilder, VmmError, VsockDevice,
 };
 use thiserror::Error;
-
-#[cfg(target_os = "linux")]
-use libkrun::VhostUserDevice;
 
 const NET_FEATURE_CSUM: u32 = 1 << 0;
 const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
@@ -25,11 +22,6 @@ const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_GUEST_UFO
     | NET_FEATURE_HOST_TSO4
     | NET_FEATURE_HOST_UFO;
-
-#[cfg(target_os = "linux")]
-const VIRTIO_DEVICE_VSOCK: u32 = 19;
-#[cfg(target_os = "linux")]
-const VHOST_USER_VSOCK_QUEUE_SIZES: [u16; 3] = [128, 128, 128];
 
 #[derive(Clone, Copy)]
 pub(crate) struct ConsoleFds<'a> {
@@ -66,8 +58,7 @@ enum DeviceKind {
     Console,
     Disk,
     Mount,
-    #[cfg(target_os = "linux")]
-    VhostUserVsock,
+    VsockMux,
     Vsock,
     Network,
     Rng,
@@ -79,8 +70,7 @@ enum DeviceConfig<'a> {
     Console,
     Disk(&'a Disk),
     Mount(&'a Mount),
-    #[cfg(target_os = "linux")]
-    VhostUserVsock(&'a Path),
+    VsockMux,
     Vsock(u64),
     Network(&'a Network),
     Rng,
@@ -94,8 +84,7 @@ impl DeviceConfig<'_> {
             Self::Console => DeviceKind::Console,
             Self::Disk(_) => DeviceKind::Disk,
             Self::Mount(_) => DeviceKind::Mount,
-            #[cfg(target_os = "linux")]
-            Self::VhostUserVsock(_) => DeviceKind::VhostUserVsock,
+            Self::VsockMux => DeviceKind::VsockMux,
             Self::Vsock(_) => DeviceKind::Vsock,
             Self::Network(_) => DeviceKind::Network,
             Self::Rng => DeviceKind::Rng,
@@ -104,7 +93,12 @@ impl DeviceConfig<'_> {
     }
 }
 
-pub(crate) fn run(config: &KrunConfig, console_fds: ConsoleFds<'_>) -> Result<(), Error> {
+pub(crate) fn run(
+    config: &KrunConfig,
+    mut vsock_mux_fd: Option<OwnedFd>,
+    watchdog_fd: Option<OwnedFd>,
+    console_fds: ConsoleFds<'_>,
+) -> Result<(), Error> {
     init_log(None, LogLevel::Info, LogStyle::Auto, LogOptions::empty())
         .map_err(|source| libkrun_error("initialize logging", source))?;
     if config.host_memory_reclaim {
@@ -170,18 +164,23 @@ pub(crate) fn run(config: &KrunConfig, console_fds: ConsoleFds<'_>) -> Result<()
                 .map_err(|source| libkrun_error("create filesystem device", source))?;
                 devices.add(device);
             }
-            #[cfg(target_os = "linux")]
-            DeviceConfig::VhostUserVsock(socket) => {
-                devices.add(
-                    VhostUserDevice::new(
-                        VIRTIO_DEVICE_VSOCK,
-                        path_str(socket, "vhost-user vsock")?,
-                        "vhost-user-vsock",
-                        VHOST_USER_VSOCK_QUEUE_SIZES.len() as u16,
-                        &VHOST_USER_VSOCK_QUEUE_SIZES,
+            DeviceConfig::VsockMux => {
+                let fd = vsock_mux_fd.take().ok_or_else(|| {
+                    libkrun_error(
+                        "create vsock mux",
+                        VmmError::Internal("vsock mux descriptor was not supplied".to_string()),
                     )
-                    .map_err(|source| libkrun_error("create vhost-user vsock", source))?,
-                );
+                })?;
+                let mut device = VsockDevice::new(GUEST_CID, TsiFlags::empty())
+                    .map_err(|source| libkrun_error("create native vsock", source))?;
+                protect_stream_socket(&mut device, console_fds.stdin)?;
+                protect_stream_socket(&mut device, console_fds.stdout)?;
+                protect_stream_socket(&mut device, console_fds.stderr)?;
+                if let Some(watchdog_fd) = watchdog_fd.as_ref() {
+                    protect_stream_socket(&mut device, watchdog_fd.as_fd())?;
+                }
+                device.set_unix_mux_fd(fd);
+                devices.add(device);
             }
             DeviceConfig::Vsock(cid) => {
                 devices.add(
@@ -242,6 +241,10 @@ pub(crate) fn run(config: &KrunConfig, console_fds: ConsoleFds<'_>) -> Result<()
         }
     }
 
+    if let Some(watchdog_fd) = watchdog_fd {
+        crate::watchdog::start(watchdog_fd);
+    }
+
     let mut builder = VmmBuilder::new()
         .vcpus(config.cpus)
         .map_err(|source| libkrun_error("set vCPU count", source))?
@@ -269,7 +272,7 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
         usize::from(config.stdio_console)
             + config.disks.len()
             + config.mounts.len()
-            + usize::from(config.vhost_user_vsock.is_some())
+            + usize::from(config.vsock_mux)
             + usize::from(config.vsock_cid.is_some())
             + usize::from(!matches!(config.network, Network::None))
             + 2,
@@ -279,9 +282,8 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
     }
     devices.extend(config.disks.iter().map(DeviceConfig::Disk));
     devices.extend(config.mounts.iter().map(DeviceConfig::Mount));
-    #[cfg(target_os = "linux")]
-    if let Some(socket) = config.vhost_user_vsock.as_deref() {
-        devices.push(DeviceConfig::VhostUserVsock(socket));
+    if config.vsock_mux {
+        devices.push(DeviceConfig::VsockMux);
     }
     if let Some(cid) = config.vsock_cid {
         devices.push(DeviceConfig::Vsock(cid));
@@ -292,6 +294,23 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
     devices.push(DeviceConfig::Rng);
     devices.push(DeviceConfig::Balloon(config.host_memory_reclaim));
     devices
+}
+
+const GUEST_CID: u64 = 3;
+
+fn protect_stream_socket(device: &mut VsockDevice, fd: BorrowedFd<'_>) -> Result<(), Error> {
+    if nix::sys::socket::getsockopt(&fd, nix::sys::socket::sockopt::SockType)
+        .is_ok_and(|kind| kind == nix::sys::socket::SockType::Stream)
+        && nix::sys::socket::getsockname::<nix::sys::socket::UnixAddr>(
+            std::os::fd::AsRawFd::as_raw_fd(&fd),
+        )
+        .is_ok()
+    {
+        device
+            .add_unix_mux_protected_fd(fd)
+            .map_err(|source| libkrun_error("protect vsock descriptor", source))?;
+    }
+    Ok(())
 }
 
 fn external_kernel_format() -> KernelFormat {
@@ -382,9 +401,8 @@ mod tests {
             }),
             ..KrunConfig::default()
         };
-        #[cfg(target_os = "linux")]
         let config = KrunConfig {
-            vhost_user_vsock: Some(PathBuf::from("vsock.sock")),
+            vsock_mux: true,
             ..config
         };
 
@@ -392,8 +410,7 @@ mod tests {
             DeviceKind::Console,
             DeviceKind::Disk,
             DeviceKind::Mount,
-            #[cfg(target_os = "linux")]
-            DeviceKind::VhostUserVsock,
+            DeviceKind::VsockMux,
             DeviceKind::Network,
             DeviceKind::Rng,
             DeviceKind::Balloon,

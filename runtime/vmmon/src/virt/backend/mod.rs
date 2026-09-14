@@ -25,7 +25,6 @@ use crate::virt::error::VirtError;
 use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
 use crate::virt::VmExit;
 
-#[cfg(target_os = "linux")]
 mod krun;
 #[cfg(feature = "mock-backend")]
 pub(crate) mod mock;
@@ -69,7 +68,7 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BackendKind {
-    /// libkrun via the spawned `krun` helper binary (Linux).
+    /// libkrun via the spawned `krun` helper binary.
     Krun,
     /// Apple Virtualization.framework (macOS).
     Vz,
@@ -99,7 +98,7 @@ impl BackendKind {
     /// Backends compiled into this binary (target- and feature-dependent).
     pub fn compiled() -> &'static [BackendKind] {
         &[
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             BackendKind::Krun,
             #[cfg(target_os = "macos")]
             BackendKind::Vz,
@@ -160,7 +159,7 @@ pub(crate) fn create_backend(
     config: VmConfig,
 ) -> Result<Arc<dyn VirtBackend>, VirtError> {
     match kind {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         BackendKind::Krun => Ok(Arc::new(krun::KrunBackend::new(config)?)),
         #[cfg(target_os = "macos")]
         BackendKind::Vz => Ok(Arc::new(vz::VzBackend::new(config)?)),
