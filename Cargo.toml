@@ -15,7 +15,6 @@ members = [
     "sdk/node",
     "sdk/go/native",
     "virt/krun",
-    "virt/vhost-vsock",
     "virt/vz",
     "specs/agent-spec",
     "specs/forward-spec",
