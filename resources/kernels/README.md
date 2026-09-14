@@ -6,15 +6,16 @@ formats and the stable OCI contract.
 
 ## Supported Tracks
 
-- `stable`: `7.1.3`, supported and validated
-- `longterm`: `6.18.33`, best effort
-- `longterm5`: `5.15.208`, best effort
+- `stable`: `7.2.2`, supported and validated
+- `longterm`: `6.18.48`, best effort for workload kernels
+- `longterm5`: `5.15.219`, best effort for workload kernels
 
 `sources.mk` maps each track to an upstream kernel version and kernel.org
 archive checksum. It deliberately contains no architecture or packaging
 metadata. Stable is the only track whose Kconfig contract is enforced and
-built in CI. Older tracks consume the same miniconfigs and may omit symbols
-that their Kconfig version does not provide.
+built in CI. Older workload tracks consume the same miniconfigs and may omit
+symbols that their Kconfig version does not provide. The ARM64-only `rprobe`
+profile validates every requested setting strictly on every pinned track.
 
 ## Building
 
@@ -24,6 +25,13 @@ toolchain. Enter it on Linux before building:
 ```bash
 nix develop .#kernel
 make kernel TRACK=stable
+```
+
+`KERNEL_PROFILE` is `workload` by default. The isolated acquisition-probe
+kernel uses only its two probe fragments and must be built natively on ARM64:
+
+```bash
+make -C resources/kernels KERNEL_PROFILE=rprobe TRACK=stable kernel
 ```
 
 The build detects the native Linux architecture; architecture is not a build
@@ -43,7 +51,18 @@ silo exec arch -- make kernel TRACK=stable
 ```
 
 Kernel source and build state live under `$HOME/.cache/silo/kernels/`.
-Downloaded archives are verified against `sources.mk` before extraction.
+Downloaded archives are verified against `sources.mk`; pristine extractions
+are read-only. Builds use separate derived sources keyed by profile,
+architecture, source, ordered patches, configuration, toolchain selectors,
+build flags, and reproducibility environment.
+When callers do not supply reproducibility metadata, local builds use epoch 0,
+build version 1, and `silo` as the build user and host. CI-provided values
+override those deterministic defaults and therefore receive distinct keys.
+Owned markers protect pristine, derived-source, canonical OCI, and workload
+compatibility directories. Existing unmarked destinations are never deleted;
+only a validated Silo OCI artifact may be atomically migrated to a marked
+destination. Unsafe roots, symlinks, and invalid overridden downloads fail
+without removing the pre-existing path.
 
 A successful build creates a platform-specific OCI image layout at:
 
@@ -51,15 +70,25 @@ A successful build creates a platform-specific OCI image layout at:
 target/kernels/<track>/<architecture>/
 ```
 
-The directory is an OCI layout containing `oci-layout`, `index.json`, and
+This workload compatibility export and its `<kernel-version>` reference remain
+the interface consumed by CI and publication. The build first creates an
+identity-keyed canonical layout below `target/kernels/.canonical/workload/`,
+then copies that verified artifact to the compatibility path. The directory is
+an OCI layout containing `oci-layout`, `index.json`, and
 content-addressed blobs. It is not a loose directory of kernel files. Inspect
 or pull a local artifact with:
 
 ```bash
-oras manifest fetch --oci-layout target/kernels/stable/x86_64:7.1.3 --pretty
-oras manifest fetch-config --oci-layout target/kernels/stable/x86_64:7.1.3 --pretty
-oras pull --oci-layout target/kernels/stable/x86_64:7.1.3 --output ./kernel
+oras manifest fetch --oci-layout target/kernels/stable/x86_64:7.2.2 --pretty
+oras manifest fetch-config --oci-layout target/kernels/stable/x86_64:7.2.2 --pretty
+oras pull --oci-layout target/kernels/stable/x86_64:7.2.2 --output ./kernel
 ```
+
+Probe layouts remain identity-keyed below
+`target/kernels/.canonical/rprobe/<track>/arm64/`. They use a distinct purpose,
+reference, artifact type, and image media type. They are local build artifacts:
+`make publish KERNEL_PROFILE=rprobe` is rejected, and dedicated probe asset
+resolution/publication remains future Phase 7.4/12 work.
 
 ## Runtime Acquisition
 
@@ -92,7 +121,9 @@ The maintained inputs are deliberately small, self-documenting miniconfigs:
 configs/
 |-- common.config
 |-- arm64.config
-`-- x86_64.config
+|-- x86_64.config
+|-- rprobe.common.config
+`-- rprobe.arm64.config
 ```
 
 `common.config` owns shared product capabilities such as direct boot, Docker,
@@ -104,6 +135,12 @@ The build resolves:
 
 ```text
 alldefconfig + common.config + <architecture>.config = generated .config
+```
+
+For the probe, the independent equation is:
+
+```text
+alldefconfig + rprobe.common.config + rprobe.arm64.config = generated .config
 ```
 
 The generated `.config` contains thousands of transitive dependencies and

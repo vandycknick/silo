@@ -2,6 +2,11 @@
 
 set -eu
 
+if [ "${KERNEL_PROFILE:-workload}" != workload ]; then
+    printf 'only workload kernels may be published\n' >&2
+    exit 1
+fi
+
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 kernel_root=$(dirname "$script_dir")
 repo_root=$(CDPATH='' cd -- "$kernel_root/../.." && pwd)
