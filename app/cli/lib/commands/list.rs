@@ -15,11 +15,10 @@ pub struct Cmd {
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         let default_machine = context.config()?.default_machine().map(str::to_string);
-        let machines = context.runtime().await?.list_machines().await?;
+        let machines = context.app_api().await?.list_machines().await?;
         let mut views = Vec::with_capacity(machines.len());
 
-        for machine in machines {
-            let data = machine.inspect().await?;
+        for data in machines {
             views.push(MachineView::new(
                 &data,
                 default_machine.as_deref() == Some(data.name.as_str()),

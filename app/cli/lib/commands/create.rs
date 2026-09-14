@@ -4,20 +4,18 @@ use std::path::{Path, PathBuf};
 use clap::{Args, ValueEnum};
 use eyre::Context as _;
 use libvm::{
-    ImageProgressSender, ImagePullPolicy, ImageResolveOptions, ImageSource, MachineAgent,
-    MachineBuilder, MachineRetention, MachineUserConfig, Memory, PublishBind, ReadOnlyRuntime,
-    ResolvedOciImage, Runtime, RuntimeConfig,
+    ImageProgressSender, ImagePullPolicy, MachineAgent, MachineRetention, MachineUserConfig,
+    PublishBind, RuntimeConfig,
 };
 use nix::unistd::{Uid, User};
 
 use crate::environment::{read_environment_file, EnvironmentLayer, EnvironmentOverride};
 use crate::machine_defaults::{
-    disk_size_bytes, memory_mib, resolve_host_path, resolve_machine_mounts, MachineMount,
-    MachineNetwork, MachineNetworkSelection, MachineResources,
+    resolve_host_path, MachineMount, MachineNetwork, MachineNetworkSelection, MachineResources,
 };
 use crate::planning::{
-    self, ImageCacheState, MachineCreationSettings, MachineOverrides, Plan, PlanKind,
-    ProcessOverrides, PullPolicy, ResolveRequest, ResolvedImage,
+    self, MachineCreationSettings, MachineOverrides, Plan, PlanKind, ProcessOverrides, PullPolicy,
+    ResolveRequest, ResolvedImage,
 };
 use crate::template::{Template, TemplateStore};
 use crate::ui::{success, watch_image_progress, OutputFormat, Spinner};
@@ -44,6 +42,10 @@ impl Pull {
             Self::Missing => PullPolicy::IfMissing,
             Self::Never => PullPolicy::Never,
         }
+    }
+
+    pub(crate) fn policies(self) -> (ImagePullPolicy, PullPolicy) {
+        (self.policy(), self.plan_policy())
     }
 }
 
@@ -225,33 +227,26 @@ impl Cmd {
         )?;
 
         if self.dry_run {
-            let runtime = ReadOnlyRuntime::open(RuntimeConfig::from_env()?).await?;
-            let name = match requested_name {
-                Some(name) => {
-                    ensure_read_only_name_available(&runtime, &name).await?;
-                    name
-                }
-                None => runtime.propose_machine_name()?,
-            };
-            let source = resolve_read_only_source(
-                &runtime,
+            let resolution = crate::api::AppApi::resolve_read_only_creation(
+                RuntimeConfig::from_env()?,
+                requested_name,
                 self.image.as_deref(),
                 &template.template,
-                self.pull,
+                self.pull.map(Pull::policies),
             )
             .await?;
             let settings = machine_settings(&machine);
             let plan = resolve_plan(PlanInputs {
                 kind: PlanKind::Create,
                 template,
-                image: source.plan_image,
-                image_is_positional: source.is_positional,
+                image: resolution.source.plan_image,
+                image_is_positional: resolution.source.is_positional,
                 machine_overrides: machine.overrides,
                 machine_settings: settings,
                 process_overrides: ProcessOverrides::default(),
                 command_tail: Vec::new(),
                 retention: MachineRetention::Persistent,
-                name: Some(name),
+                name: Some(resolution.name),
                 environment_files: Vec::new(),
                 host_environment: BTreeMap::new(),
                 environment_overrides: Vec::new(),
@@ -261,23 +256,24 @@ impl Cmd {
 
         let image_reference = selected_image_reference(self.image.as_deref(), &template.template)?;
         let recipe_progress = Spinner::start("Reading", "VM recipe");
-        let runtime = context.runtime().await?.clone();
         if let Some(name) = &requested_name {
-            ensure_name_available(&runtime, name).await?;
+            context.app_api().await?.ensure_name_available(name).await?;
         }
         recipe_progress.finish_clear();
 
         let (image_progress, image_events) = ImageProgressSender::default_channel();
         let image_progress_task = watch_image_progress(&image_reference, image_events);
-        let progress_runtime = runtime.with_image_progress(image_progress);
         let image_result = async {
-            let source = resolve_source(
-                &progress_runtime,
-                self.image.as_deref(),
-                &template.template,
-                self.pull,
-            )
-            .await?;
+            let source = context
+                .app_api()
+                .await?
+                .resolve_source(
+                    self.image.as_deref(),
+                    &template.template,
+                    self.pull.map(Pull::policies),
+                    image_progress,
+                )
+                .await?;
             let settings = machine_settings(&machine);
             let plan = resolve_plan(PlanInputs {
                 kind: PlanKind::Create,
@@ -297,13 +293,16 @@ impl Cmd {
             let Plan::Create(plan) = plan else {
                 unreachable!("create resolution returns a create plan")
             };
-            create_machine(&progress_runtime, &plan, source, context).await
+            let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
+            context
+                .app_api()
+                .await?
+                .create_machine(&plan, source, policy_config_dir.as_deref())
+                .await
         };
         let image_result = image_result.await;
-        drop(progress_runtime);
         let _ = image_progress_task.await;
-        let machine = image_result?;
-        let name = machine.inspect().await?.name;
+        let name = image_result?.name;
         success(format!("Created {name}"));
         if self.set_default {
             crate::config::GlobalConfig::write_default_machine(Some(&name))?;
@@ -311,14 +310,6 @@ impl Cmd {
         println!("{name}");
         Ok(())
     }
-}
-
-#[derive(Debug)]
-pub(crate) struct SourceResolution {
-    pub(crate) plan_image: ResolvedImage,
-    pub(crate) is_positional: bool,
-    resolved_oci: Option<ResolvedOciImage>,
-    disk: Option<PathBuf>,
 }
 
 pub(crate) fn load_template(name: Option<&str>) -> eyre::Result<crate::template::NamedTemplate> {
@@ -330,98 +321,6 @@ pub(crate) fn load_template(name: Option<&str>) -> eyre::Result<crate::template:
             template: empty_template(),
         }),
     }
-}
-
-pub(crate) async fn resolve_source(
-    runtime: &Runtime,
-    positional: Option<&str>,
-    template: &Template,
-    pull: Option<Pull>,
-) -> eyre::Result<SourceResolution> {
-    let reference = selected_image_reference(positional, template)?;
-    if let Some(path) = reference.strip_prefix("disk:") {
-        if pull.is_some() {
-            eyre::bail!("--pull is only supported for OCI image sources");
-        }
-        let path = canonical_disk_source(&reference, path)?;
-        return Ok(SourceResolution {
-            plan_image: ResolvedImage::Disk { path: path.clone() },
-            is_positional: positional.is_some(),
-            resolved_oci: None,
-            disk: Some(path),
-        });
-    }
-    let pull = pull.unwrap_or(Pull::Missing);
-    let resolved = runtime
-        .images()
-        .resolve_with(
-            reference.clone(),
-            ImageResolveOptions {
-                policy: Some(pull.policy()),
-            },
-        )
-        .await?;
-    let plan_image = ResolvedImage::Oci {
-        identity: planning::OciImageIdentity {
-            requested_reference: reference,
-            selected_reference: resolved.selected_reference.clone(),
-            platform: resolved.platform.clone(),
-            manifest_digest: resolved.manifest_digest.clone(),
-            config_digest: resolved.config_digest.clone(),
-            cache_state: image_cache_state(resolved.cache_state),
-            pull_policy: pull.plan_policy(),
-        },
-        metadata: Box::new(resolved.config.clone()),
-    };
-    Ok(SourceResolution {
-        plan_image,
-        is_positional: positional.is_some(),
-        resolved_oci: Some(resolved),
-        disk: None,
-    })
-}
-
-pub(crate) async fn resolve_read_only_source(
-    runtime: &ReadOnlyRuntime,
-    positional: Option<&str>,
-    template: &Template,
-    pull: Option<Pull>,
-) -> eyre::Result<SourceResolution> {
-    let reference = selected_image_reference(positional, template)?;
-    if let Some(path) = reference.strip_prefix("disk:") {
-        if pull.is_some() {
-            eyre::bail!("--pull is only supported for OCI image sources");
-        }
-        let path = canonical_disk_source(&reference, path)?;
-        let path = runtime.validate_disk_source(&path)?;
-        return Ok(SourceResolution {
-            plan_image: ResolvedImage::Disk { path: path.clone() },
-            is_positional: positional.is_some(),
-            resolved_oci: None,
-            disk: Some(path),
-        });
-    }
-    let pull = pull.unwrap_or(Pull::Missing);
-    let resolved = runtime
-        .resolve_oci_image(reference.clone(), pull.policy())
-        .await?;
-    Ok(SourceResolution {
-        plan_image: ResolvedImage::Oci {
-            identity: planning::OciImageIdentity {
-                requested_reference: reference,
-                selected_reference: resolved.selected_reference.clone(),
-                platform: resolved.platform,
-                manifest_digest: resolved.manifest_digest,
-                config_digest: resolved.config_digest,
-                cache_state: image_cache_state(resolved.cache_state),
-                pull_policy: pull.plan_policy(),
-            },
-            metadata: Box::new(resolved.config),
-        },
-        is_positional: positional.is_some(),
-        resolved_oci: None,
-        disk: None,
-    })
 }
 
 pub(crate) fn selected_image_reference(
@@ -442,7 +341,7 @@ fn disk_path(reference: &str, path: &str) -> eyre::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-fn canonical_disk_source(reference: &str, path: &str) -> eyre::Result<PathBuf> {
+pub(crate) fn canonical_disk_source(reference: &str, path: &str) -> eyre::Result<PathBuf> {
     let path = resolve_host_path(&disk_path(reference, path)?)?;
     let path = std::fs::canonicalize(&path)
         .with_context(|| format!("resolve local image disk {}", path.display()))?;
@@ -516,121 +415,6 @@ pub(crate) fn read_environment_layers(
         .collect()
 }
 
-pub(crate) async fn create_machine(
-    runtime: &Runtime,
-    plan: &planning::CreatePlan,
-    source: SourceResolution,
-    context: &mut crate::context::Context,
-) -> eyre::Result<libvm::Machine> {
-    ensure_source_matches_plan(plan, &source)?;
-    let mut builder = runtime.machine();
-    if let Some(name) = &plan.proposed_name {
-        builder = builder.name(name);
-    }
-    builder = match source.resolved_oci {
-        Some(image) => builder.resolved_image(image),
-        None => builder.image_source(ImageSource::disk(
-            source
-                .disk
-                .ok_or_else(|| eyre::eyre!("machine source was not resolved"))?,
-        )),
-    };
-    builder = apply_plan(
-        builder,
-        plan,
-        context.config()?.networking.policy_config_dir.as_deref(),
-    )?;
-    builder.create().await.map_err(Into::into)
-}
-
-fn apply_plan(
-    mut builder: MachineBuilder,
-    plan: &planning::CreatePlan,
-    policy_config_dir: Option<&Path>,
-) -> eyre::Result<MachineBuilder> {
-    builder = builder
-        .labels(plan.machine.labels.clone())
-        .process(plan.process.clone())
-        .retention(plan.retention)
-        .template_name(plan.template.name.clone())
-        .kernel_args(plan.machine_settings.kernel_args.clone())
-        .nested_virtualization(plan.machine_settings.nested_virtualization)
-        .rosetta(plan.machine_settings.rosetta)
-        .disks(plan.machine_settings.disks.clone())
-        .mounts(resolve_machine_mounts(&plan.machine.mounts)?)
-        .forwards(plan.machine.forwards.clone());
-    if let Some(vsock) = plan.machine.vsock {
-        builder = builder.vsock(vsock);
-    }
-    if let Some(resources) = &plan.machine.resources {
-        if let Some(cpus) = resources.cpus {
-            builder = builder.cpus(cpus);
-        }
-        if let Some(memory) = memory_mib(Some(resources))? {
-            builder = builder.memory(Memory::mebibytes(u64::from(memory)));
-        }
-    }
-    if let Some(bytes) = disk_size_bytes(plan.machine.disk_size.as_deref())? {
-        builder = builder.root_disk_size(bytes);
-    }
-    if let Some(userdata) = &plan.machine.userdata {
-        builder = builder.userdata(userdata);
-    }
-    if let Some(network) = plan.machine.network.clone() {
-        let network = network.resolve_machine_network(policy_config_dir)?;
-        builder = builder.network(|network_builder| network.apply(network_builder));
-    }
-    if let Some(kernel) = &plan.machine_settings.kernel {
-        builder = builder.kernel(kernel);
-    }
-    if let Some(initramfs) = &plan.machine_settings.initramfs {
-        builder = builder.initramfs(initramfs);
-    }
-    let agent = plan.machine_settings.agent.clone();
-    let user = plan.machine_settings.provision_user.clone();
-    builder = builder.guest(|guest| {
-        let guest = match agent.clone() {
-            MachineAgent::Default => guest,
-            MachineAgent::Custom { path } => guest.agent(Some(path)),
-            MachineAgent::Disabled => guest.agent(None),
-            _ => guest,
-        };
-        match user {
-            Some(user) => guest.user(user),
-            None => guest,
-        }
-    });
-    builder = builder.agent_mode(Some(agent));
-    Ok(builder)
-}
-
-fn ensure_source_matches_plan(
-    plan: &planning::CreatePlan,
-    source: &SourceResolution,
-) -> eyre::Result<()> {
-    let matches = match (&plan.image, &source.plan_image) {
-        (planning::ImageIdentity::Oci(plan), ResolvedImage::Oci { identity, .. }) => {
-            plan == identity
-                && source.resolved_oci.as_ref().is_some_and(|image| {
-                    image.selected_reference == plan.selected_reference
-                        && image.platform == plan.platform
-                        && image.manifest_digest == plan.manifest_digest
-                        && image.config_digest == plan.config_digest
-                        && image_cache_state(image.cache_state) == plan.cache_state
-                })
-        }
-        (planning::ImageIdentity::Disk { path: plan }, ResolvedImage::Disk { path }) => {
-            plan == path && source.resolved_oci.is_none() && source.disk.as_ref() == Some(path)
-        }
-        _ => false,
-    };
-    if matches {
-        Ok(())
-    } else {
-        eyre::bail!("resolved image no longer matches the planned immutable identity")
-    }
-}
-
 pub(crate) fn machine_settings(options: &MachineCliOptions) -> MachineCreationSettings {
     let agent = if options.no_agent {
         MachineAgent::Disabled
@@ -648,34 +432,6 @@ pub(crate) fn machine_settings(options: &MachineCliOptions) -> MachineCreationSe
         disks: options.disks.clone(),
         agent,
         provision_user: options.provision_user.clone(),
-    }
-}
-
-fn image_cache_state(state: libvm::ImageCacheState) -> ImageCacheState {
-    match state {
-        libvm::ImageCacheState::Complete => ImageCacheState::Complete,
-        libvm::ImageCacheState::Missing => ImageCacheState::Missing,
-    }
-}
-
-pub(crate) async fn ensure_name_available(runtime: &Runtime, name: &str) -> eyre::Result<()> {
-    let reference = libvm::MachineRef::parse(name)?;
-    match runtime.get_machine(&reference).await {
-        Ok(_) => eyre::bail!("machine {name:?} already exists"),
-        Err(libvm::LibVmError::MachineNotFound { .. }) => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-pub(crate) async fn ensure_read_only_name_available(
-    runtime: &ReadOnlyRuntime,
-    name: &str,
-) -> eyre::Result<()> {
-    let _ = libvm::MachineRef::parse(name)?;
-    if runtime.machine_name_available(name).await? {
-        Ok(())
-    } else {
-        eyre::bail!("machine {name:?} already exists")
     }
 }
 
@@ -944,14 +700,15 @@ fn read_userdata_path(path: &Path) -> eyre::Result<String> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use libvm::{ReadOnlyRuntime, RuntimeConfig};
+    use libvm::RuntimeConfig;
 
+    use crate::api::AppApi;
     use crate::app::Cli;
     use crate::commands::Command;
 
     use crate::commands::create::{
-        canonical_disk_source, empty_template, preflight_create, resolve_read_only_source,
-        validate_process_overrides, Pull, VmOverrideArgs,
+        canonical_disk_source, empty_template, preflight_create, validate_process_overrides, Pull,
+        VmOverrideArgs,
     };
 
     #[test]
@@ -1078,29 +835,28 @@ mod tests {
         let data_root = temp.path().join("data");
         let disk = temp.path().join("disk.img");
         std::fs::write(&disk, b"disk").expect("write disk");
-        let runtime = ReadOnlyRuntime::open(RuntimeConfig::local(&data_root))
-            .await
-            .expect("open read-only runtime");
-
-        let disk_source = resolve_read_only_source(
-            &runtime,
+        let disk_source = AppApi::resolve_read_only_creation(
+            RuntimeConfig::local(&data_root),
+            None,
             Some(&format!("disk:{}", disk.display())),
             &empty_template(),
             None,
         )
         .await
-        .expect("resolve disk source");
+        .expect("resolve disk source")
+        .source;
         let crate::planning::ResolvedImage::Disk { path } = &disk_source.plan_image else {
             panic!("expected disk source")
         };
         assert_eq!(path, &std::fs::canonicalize(&disk).expect("canonical disk"));
         assert_eq!(disk_source.disk.as_ref(), Some(path));
 
-        let oci_result = resolve_read_only_source(
-            &runtime,
+        let oci_result = AppApi::resolve_read_only_creation(
+            RuntimeConfig::local(&data_root),
+            None,
             Some("example.test/missing:latest"),
             &empty_template(),
-            Some(Pull::Never),
+            Some(Pull::Never.policies()),
         )
         .await;
         let Err(oci_error) = oci_result else {
@@ -1117,16 +873,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp root");
         let disk = temp.path().join("disk.img");
         std::fs::write(&disk, b"disk").expect("write disk");
-        let runtime = ReadOnlyRuntime::open(RuntimeConfig::local(temp.path().join("data")))
-            .await
-            .expect("open read-only runtime");
-
         for pull in [Pull::Missing, Pull::Always, Pull::Never] {
-            let error = resolve_read_only_source(
-                &runtime,
+            let error = AppApi::resolve_read_only_creation(
+                RuntimeConfig::local(temp.path().join("data")),
+                None,
                 Some(&format!("disk:{}", disk.display())),
                 &empty_template(),
-                Some(pull),
+                Some(pull.policies()),
             )
             .await
             .expect_err("explicit disk pull policy must fail");

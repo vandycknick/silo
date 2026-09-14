@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "engine": "docker",
+  "activation_contract": 1,
+  "publication_contract": 1,
+  "data_layout": 1,
+  "storage": "containerd-snapshotter",
+  "architecture": "build-required",
+  "source_revision": "build-required",
+  "qualified_silo": ">=0.1.0 <0.2.0",
+  "versions": {
+    "docker": "build-required",
+    "containerd": "build-required"
+  }
+}
