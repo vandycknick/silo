@@ -22,16 +22,6 @@ enum DaemonCommand {
     Upgrade(Upgrade),
     #[command(hide = true)]
     Serve(Serve),
-    /// Set the system VM's memory balloon target directly (debugging aid).
-    #[command(hide = true)]
-    Balloon(Balloon),
-}
-
-#[derive(Debug, Args)]
-struct Balloon {
-    /// Guest memory target, e.g. 2GiB. Defaults to the configured memory (fully deflated).
-    #[arg(long)]
-    target: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -109,27 +99,6 @@ impl Cmd {
                 Ok(())
             }
             DaemonCommand::Serve(command) => run_registered(command.config).await,
-            DaemonCommand::Balloon(command) => {
-                use std::str::FromStr as _;
-                let paths = crate::system::ownership::default_system_paths()?;
-                let registration =
-                    crate::system::service::load_registration(&paths.registration())?;
-                let record = crate::system::record::load_record::<
-                    crate::system::record::SystemRecord,
-                >(&paths.system_record())?
-                .ok_or_else(|| eyre::eyre!("no system machine is recorded"))?;
-                let target = match command.target {
-                    Some(size) => utils::HumanSize::from_str(&size)
-                        .and_then(|size| size.bytes())
-                        .map_err(|error| eyre::eyre!("invalid --target {size:?}: {error}"))?,
-                    None => registration.config.memory_bytes,
-                };
-                let api = context.app_api().await?;
-                let machine = api.machine(&record.active_machine_id).await?;
-                let applied = machine.set_memory_target(target).await?;
-                println!("{}", crate::ui::human_bytes(Some(applied)));
-                Ok(())
-            }
             DaemonCommand::Status(command) => {
                 let paths = crate::system::ownership::default_system_paths()?;
                 let view = DaemonStatusView::collect(&paths)?;
@@ -264,21 +233,43 @@ impl DaemonStatusView {
                 rows.push(("Image".to_string(), digest.clone()));
             }
             if let Some(memory) = self.memory_bytes {
-                let reclaimed = status
-                    .memory_reclaimed_bytes
-                    .zip(status.memory_reclaimed_at.as_deref())
-                    .and_then(|(bytes, at)| {
+                let reclaim = status
+                    .memory_reclaim_outcome
+                    .zip(status.memory_reclaim_at.as_deref())
+                    .and_then(|(outcome, at)| {
                         let at = chrono::DateTime::parse_from_rfc3339(at).ok()?.timestamp();
+                        let outcome = match outcome {
+                            crate::system::supervisor::MemoryReclaimOutcome::Bounded => {
+                                "used bounded cgroup reclaim".to_string()
+                            }
+                            crate::system::supervisor::MemoryReclaimOutcome::Fallback => status
+                                .memory_reclaim_bounded_exit_code
+                                .map(|code| {
+                                    format!("used global fallback after bounded exit {code}")
+                                })
+                                .unwrap_or_else(|| "used global fallback".to_string()),
+                            crate::system::supervisor::MemoryReclaimOutcome::Failed => {
+                                "failed".to_string()
+                            }
+                        };
+                        let observed = status
+                            .memory_reclaim_observed_cache_delta_bytes
+                            .map(|bytes| {
+                                format!(
+                                    ", observed guest cache delta {}",
+                                    crate::ui::human_bytes(Some(bytes))
+                                )
+                            })
+                            .unwrap_or_default();
                         Some(format!(
-                            "; last idle reclaim returned {} to the host {}",
-                            crate::ui::human_bytes(Some(bytes)),
-                            crate::ui::relative_time(at, crate::ui::now_unix()).to_lowercase()
+                            "; last idle cache reclaim {outcome} {}{observed}",
+                            crate::ui::relative_time(at, crate::ui::now_unix()).to_lowercase(),
                         ))
                     })
                     .unwrap_or_default();
                 rows.push((
                     "Memory".to_string(),
-                    format!("{}{reclaimed}", crate::ui::human_bytes(Some(memory))),
+                    format!("{}{reclaim}", crate::ui::human_bytes(Some(memory))),
                 ));
             }
             if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&status.updated_at) {
@@ -389,5 +380,9 @@ mod tests {
             crate::app::Cli::try_parse_from(["silo", "daemon", "upgrade", "--recover"]).is_ok()
         );
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "upgrade"]).is_err());
+        assert!(
+            crate::app::Cli::try_parse_from(["silo", "daemon", "balloon", "--target", "1GiB"])
+                .is_err()
+        );
     }
 }

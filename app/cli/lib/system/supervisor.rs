@@ -48,12 +48,26 @@ pub(crate) struct DaemonStatus {
     pub(crate) updated_at: String,
     pub(crate) last_error: Option<String>,
     pub(crate) restart_count: u32,
-    /// Page cache the last idle reclaim handed back to the host, in bytes.
+    /// How the last guest cache-reclaim attempt ended.
     #[serde(default)]
-    pub(crate) memory_reclaimed_bytes: Option<u64>,
-    /// When the last idle reclaim ran (RFC 3339).
+    pub(crate) memory_reclaim_outcome: Option<MemoryReclaimOutcome>,
+    /// Exit status from a bounded reclaim that required the global fallback.
     #[serde(default)]
-    pub(crate) memory_reclaimed_at: Option<String>,
+    pub(crate) memory_reclaim_bounded_exit_code: Option<u32>,
+    /// Guest cached-byte decrease observed after the attempt, not host memory returned.
+    #[serde(default)]
+    pub(crate) memory_reclaim_observed_cache_delta_bytes: Option<u64>,
+    /// When the last guest cache-reclaim attempt ran (RFC 3339).
+    #[serde(default)]
+    pub(crate) memory_reclaim_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoryReclaimOutcome {
+    Bounded,
+    Fallback,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,8 +138,10 @@ pub(crate) async fn serve(
         updated_at: now(),
         last_error: None,
         restart_count: 0,
-        memory_reclaimed_bytes: None,
-        memory_reclaimed_at: None,
+        memory_reclaim_outcome: None,
+        memory_reclaim_bounded_exit_code: None,
+        memory_reclaim_observed_cache_delta_bytes: None,
+        memory_reclaim_at: None,
     };
     publish(&paths, &mut status)?;
     append_log(&paths, "preparing installation storage")?;
@@ -319,30 +335,22 @@ const MIB: u64 = 1024 * 1024;
 const IDLE_CPU_FRACTION: f64 = 0.05;
 /// Guest block I/O rate at or below which the guest counts as idle.
 const IDLE_IO_BYTES_PER_SEC: u64 = MIB;
-/// Page cache worth a reclaim pulse.
+/// Page cache worth a reclaim attempt.
 const RECLAIM_MIN_CACHE: u64 = 512 * MIB;
-/// Free memory left to the guest while the balloon is inflated during a pulse.
-const PULSE_KEEP_FREE: u64 = 256 * MIB;
-/// Longest a pulse waits for the guest to hand its freed pages to the balloon.
-const PULSE_SETTLE: Duration = Duration::from_secs(30);
 /// Guest-side reclaim: cgroup v2 proactive reclaim first, the global cache drop as a
 /// fallback on older kernels. `%BYTES%` is replaced with the amount to reclaim.
-const GUEST_RECLAIM_SCRIPT: &str = "echo %BYTES% > /sys/fs/cgroup/memory.reclaim 2>/dev/null || sync; echo 1 > /proc/sys/vm/drop_caches";
+const GUEST_RECLAIM_SCRIPT: &str = "echo %BYTES% > %CGROUP_RECLAIM% 2>/dev/null || { bounded_status=$?; printf 'fallback:%s\\n' \"$bounded_status\"; sync; echo 1 > %DROP_CACHES%; exit $?; }; printf 'bounded\\n'";
+const CGROUP_RECLAIM_PATH: &str = "/sys/fs/cgroup/memory.reclaim";
+const DROP_CACHES_PATH: &str = "/proc/sys/vm/drop_caches";
 
-/// Returns idle guest page cache to the host, the way WSL2's `autoMemoryReclaim` does.
+/// Reclaims idle guest page cache, the way WSL2's `autoMemoryReclaim` does.
 ///
 /// Every tick reads the guest's metrics. Once CPU and block I/O have stayed idle for
 /// the configured window and the guest holds enough page cache, the controller asks
-/// the guest kernel to reclaim that cache (turning it into free pages) and then
-/// pulses the memory balloon: inflate over the freed pages so the host can discard
-/// them, then deflate straight back to the full size. The guest sees its full memory
-/// again within seconds and the host keeps only what the guest actually uses until
-/// the cache fills up and the guest goes idle again. Bursts never wait on a balloon.
-/// Only Virtualization.framework has a balloon; on other backends the first pulse
-/// reports unsupported and the controller switches itself off.
+/// the guest kernel to reclaim that cache. This does not claim that the host released
+/// the same number of bytes.
 pub(crate) struct IdleReclaimer {
     enabled: bool,
-    max_bytes: u64,
     idle_after: Duration,
     last_sample: Option<ActivitySample>,
     idle_since: Option<tokio::time::Instant>,
@@ -387,7 +395,6 @@ impl IdleReclaimer {
     pub(crate) fn new(config: &ResolvedSystemConfig) -> Self {
         Self {
             enabled: config.memory_reclaim,
-            max_bytes: config.memory_bytes,
             idle_after: Duration::from_secs(config.memory_reclaim_after_secs),
             last_sample: None,
             idle_since: None,
@@ -420,12 +427,6 @@ impl IdleReclaimer {
         }
     }
 
-    /// Bytes to inflate the balloon by, given the guest's free memory after reclaim.
-    fn pulse_inflate(free_bytes: u64) -> Option<u64> {
-        let inflate = free_bytes.saturating_sub(PULSE_KEEP_FREE) / MIB * MIB;
-        (inflate >= RECLAIM_MIN_CACHE / 2).then_some(inflate)
-    }
-
     async fn tick(
         &mut self,
         machine: &crate::api::machine::AppMachine,
@@ -451,30 +452,24 @@ impl IdleReclaimer {
         let Some(memory) = snapshot.memory.as_ref() else {
             return Ok(());
         };
-        let cached = memory.cached_bytes.unwrap_or_else(|| {
-            memory
-                .available_bytes
-                .saturating_sub(memory.free_bytes.unwrap_or(memory.available_bytes))
-        });
+        let cached = cached_bytes(memory);
         if cached < RECLAIM_MIN_CACHE {
             return Ok(());
         }
-        // Require a fresh idle window before the next pulse whatever happens now.
+        // Require a fresh idle window before the next attempt whatever happens now.
         self.idle_since = None;
-        self.pulse(machine, paths, status, cached).await
+        self.reclaim(machine, paths, status, cached).await
     }
 
-    async fn pulse(
+    async fn reclaim(
         &mut self,
         machine: &crate::api::machine::AppMachine,
         paths: &SystemPaths,
         status: &mut DaemonStatus,
         cached: u64,
     ) -> eyre::Result<()> {
-        // 1. Ask the guest kernel to turn its idle page cache into free pages, so the
-        //    balloon inflates over pages nobody is using and causes no pressure.
-        let script = GUEST_RECLAIM_SCRIPT.replace("%BYTES%", &cached.to_string());
-        if let Err(error) = machine
+        let script = guest_reclaim_script(cached, CGROUP_RECLAIM_PATH, DROP_CACHES_PATH);
+        let output = match machine
             .exec_with_input(
                 "/bin/sh",
                 &["-c", &script],
@@ -484,76 +479,128 @@ impl IdleReclaimer {
             )
             .await
         {
+            Ok(output) => output,
+            Err(error) => {
+                record_reclaim(status, MemoryReclaimOutcome::Failed, None, None);
+                publish(paths, status)?;
+                append_log(
+                    paths,
+                    &format!("memory reclaim: guest execution failed: {error}"),
+                )?;
+                return Ok(());
+            }
+        };
+        let branch = parse_reclaim_branch(output.stdout_bytes());
+        if !matches!(output.result(), ExecutionResult::Exited { code: Some(0) }) {
+            let bounded_exit_code = branch.and_then(ReclaimBranch::bounded_exit_code);
+            record_reclaim(
+                status,
+                MemoryReclaimOutcome::Failed,
+                bounded_exit_code,
+                None,
+            );
+            publish(paths, status)?;
             append_log(
                 paths,
-                &format!("memory reclaim: guest cache drop failed: {error}"),
+                &format!(
+                    "memory reclaim: guest cache reclaim failed ({:?}): {}",
+                    output.result(),
+                    String::from_utf8_lossy(output.stderr_bytes()).trim()
+                ),
             )?;
             return Ok(());
         }
-        let Some(memory) = fetch_snapshot(machine)
+        let Some(branch) = branch else {
+            record_reclaim(status, MemoryReclaimOutcome::Failed, None, None);
+            publish(paths, status)?;
+            append_log(
+                paths,
+                "memory reclaim: guest returned an invalid branch result",
+            )?;
+            return Ok(());
+        };
+        let observed_delta = fetch_snapshot(machine)
             .await
             .and_then(|snapshot| snapshot.memory)
-        else {
-            return Ok(());
+            .map(|memory| cached.saturating_sub(cached_bytes(&memory)));
+        let (outcome, bounded_exit_code, description) = match branch {
+            ReclaimBranch::Bounded => (
+                MemoryReclaimOutcome::Bounded,
+                None,
+                "bounded guest cgroup reclaim completed".to_string(),
+            ),
+            ReclaimBranch::Fallback { bounded_exit_code } => (
+                MemoryReclaimOutcome::Fallback,
+                Some(bounded_exit_code),
+                format!(
+                    "bounded guest cgroup reclaim was incomplete or failed with exit {bounded_exit_code}; global cache-drop fallback completed"
+                ),
+            ),
         };
-        let free_before = memory.free_bytes.unwrap_or(memory.available_bytes);
-        let Some(inflate) = Self::pulse_inflate(free_before) else {
-            return Ok(());
-        };
-        // 2. Inflate: the guest hands the freed pages to the host, which discards them.
-        let target = self.max_bytes.saturating_sub(inflate).max(PULSE_KEEP_FREE);
-        match machine.set_memory_target(target).await {
-            Ok(_) => {}
-            Err(libvm::LibVmError::MonitorUnsupported { .. }) => {
-                self.enabled = false;
-                append_log(
-                    paths,
-                    "memory reclaim disabled: this virtualization backend has no memory balloon",
-                )?;
-                return Ok(());
-            }
-            Err(error) => {
-                append_log(
-                    paths,
-                    &format!("memory reclaim: balloon inflate failed: {error}"),
-                )?;
-                return Ok(());
-            }
-        }
-        // 3. Wait for the guest to absorb the balloon, then deflate immediately: the
-        //    pages come back to the guest untouched and stay unbacked on the host.
-        let settle_deadline = tokio::time::Instant::now() + PULSE_SETTLE;
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let free_now = fetch_snapshot(machine)
-                .await
-                .and_then(|snapshot| snapshot.memory)
-                .map(|memory| memory.free_bytes.unwrap_or(memory.available_bytes));
-            if free_now
-                .is_some_and(|free| free <= free_before.saturating_sub(inflate) + PULSE_KEEP_FREE)
-                || tokio::time::Instant::now() >= settle_deadline
-            {
-                break;
-            }
-        }
-        if let Err(error) = machine.set_memory_target(self.max_bytes).await {
-            append_log(
-                paths,
-                &format!("memory reclaim: balloon deflate failed: {error}"),
-            )?;
-            return Ok(());
-        }
-        status.memory_reclaimed_bytes = Some(inflate);
-        status.memory_reclaimed_at = Some(now());
+        record_reclaim(status, outcome, bounded_exit_code, observed_delta);
         publish(paths, status)?;
+        let observation = observed_delta
+            .map(|bytes| format!("; observed guest cache delta {} MiB", bytes / MIB))
+            .unwrap_or_default();
         append_log(
             paths,
-            &format!(
-                "memory reclaim: returned {} MiB of idle page cache to the host",
-                inflate / MIB
-            ),
+            &format!("memory reclaim: {description}{observation}"),
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimBranch {
+    Bounded,
+    Fallback { bounded_exit_code: u32 },
+}
+
+impl ReclaimBranch {
+    fn bounded_exit_code(self) -> Option<u32> {
+        match self {
+            Self::Bounded => None,
+            Self::Fallback { bounded_exit_code } => Some(bounded_exit_code),
+        }
+    }
+}
+
+fn guest_reclaim_script(bytes: u64, cgroup_reclaim: &str, drop_caches: &str) -> String {
+    GUEST_RECLAIM_SCRIPT
+        .replace("%BYTES%", &bytes.to_string())
+        .replace("%CGROUP_RECLAIM%", cgroup_reclaim)
+        .replace("%DROP_CACHES%", drop_caches)
+}
+
+fn parse_reclaim_branch(stdout: &[u8]) -> Option<ReclaimBranch> {
+    let output = std::str::from_utf8(stdout).ok()?.trim();
+    if output == "bounded" {
+        return Some(ReclaimBranch::Bounded);
+    }
+    output
+        .strip_prefix("fallback:")?
+        .parse()
+        .ok()
+        .map(|bounded_exit_code| ReclaimBranch::Fallback { bounded_exit_code })
+}
+
+fn cached_bytes(memory: &libvm::MachineMemoryMetrics) -> u64 {
+    memory.cached_bytes.unwrap_or_else(|| {
+        memory
+            .available_bytes
+            .saturating_sub(memory.free_bytes.unwrap_or(memory.available_bytes))
+    })
+}
+
+fn record_reclaim(
+    status: &mut DaemonStatus,
+    outcome: MemoryReclaimOutcome,
+    bounded_exit_code: Option<u32>,
+    observed_delta: Option<u64>,
+) {
+    status.memory_reclaim_outcome = Some(outcome);
+    status.memory_reclaim_bounded_exit_code = bounded_exit_code;
+    status.memory_reclaim_observed_cache_delta_bytes = observed_delta;
+    status.memory_reclaim_at = Some(now());
 }
 
 async fn fetch_snapshot(
@@ -795,10 +842,13 @@ pub(crate) fn status_owner_is_live(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::process::Command;
     use std::time::Duration;
 
     use crate::system::supervisor::{
-        error_causes, error_summary, startup_retry_delay, LifetimeLock,
+        error_causes, error_summary, guest_reclaim_script, parse_reclaim_branch,
+        startup_retry_delay, ActivitySample, IdleReclaimer, LifetimeLock, ReclaimBranch, MIB,
     };
 
     #[test]
@@ -840,13 +890,9 @@ mod tests {
     }
 
     #[test]
-    fn idle_reclaimer_tracks_idle_windows_and_pulse_size() {
-        use std::time::Duration;
-
-        use crate::system::supervisor::{ActivitySample, IdleReclaimer, MIB};
+    fn idle_reclaimer_tracks_idle_windows() {
         let mut reclaimer = IdleReclaimer {
             enabled: true,
-            max_bytes: 8192 * MIB,
             idle_after: Duration::from_secs(120),
             last_sample: None,
             idle_since: None,
@@ -876,12 +922,95 @@ mod tests {
             reclaimer.observe(sample(25, 104.2, 200 * MIB), 4),
             Some(Duration::from_secs(5))
         );
+    }
 
-        assert_eq!(IdleReclaimer::pulse_inflate(100 * MIB), None);
+    #[test]
+    fn guest_reclaim_success_never_drops_global_caches() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bounded = temp.path().join("memory.reclaim");
+        let global = temp.path().join("drop_caches");
+        fs::write(&bounded, "before").expect("bounded fixture");
+        fs::write(&global, "untouched").expect("global fixture");
+        let script = guest_reclaim_script(4096, "memory.reclaim", "drop_caches");
+
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .current_dir(temp.path())
+            .output()
+            .expect("run shell");
+
+        assert!(output.status.success(), "stderr: {:?}", output.stderr);
         assert_eq!(
-            IdleReclaimer::pulse_inflate(6 * 1024 * MIB),
-            Some(5888 * MIB)
+            parse_reclaim_branch(&output.stdout),
+            Some(ReclaimBranch::Bounded)
         );
+        assert_eq!(
+            fs::read_to_string(bounded).expect("bounded result"),
+            "4096\n"
+        );
+        assert_eq!(
+            fs::read_to_string(global).expect("global result"),
+            "untouched"
+        );
+    }
+
+    #[test]
+    fn guest_reclaim_falls_back_only_after_bounded_failure() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bounded = temp.path().join("memory.reclaim");
+        let global = temp.path().join("drop_caches");
+        fs::create_dir(&bounded).expect("unwritable bounded fixture");
+        fs::write(&global, "before").expect("global fixture");
+        let script = guest_reclaim_script(4096, "memory.reclaim", "drop_caches");
+
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .current_dir(temp.path())
+            .output()
+            .expect("run shell");
+
+        assert!(output.status.success(), "stderr: {:?}", output.stderr);
+        assert!(matches!(
+            parse_reclaim_branch(&output.stdout),
+            Some(ReclaimBranch::Fallback {
+                bounded_exit_code
+            }) if bounded_exit_code != 0
+        ));
+        assert_eq!(fs::read_to_string(global).expect("global result"), "1\n");
+    }
+
+    #[test]
+    fn reclaim_branch_preserves_incomplete_bounded_exit_status() {
+        assert_eq!(
+            parse_reclaim_branch(b"fallback:11\n"),
+            Some(ReclaimBranch::Fallback {
+                bounded_exit_code: 11
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_status_defaults_absent_reclaim_fields() {
+        let status: crate::system::supervisor::DaemonStatus =
+            serde_json::from_value(serde_json::json!({
+                "schema": 1,
+                "generation": "12345678-1234-1234-1234-123456789abc",
+                "pid": 42,
+                "phase": "ready",
+                "machine_id": null,
+                "run_id": null,
+                "image_digest": null,
+                "docker_socket": "/tmp/silo.sock",
+                "updated_at": "2026-09-14T00:00:00Z",
+                "last_error": null,
+                "restart_count": 0
+            }))
+            .expect("status");
+
+        assert_eq!(status.memory_reclaim_outcome, None);
+        assert_eq!(status.memory_reclaim_bounded_exit_code, None);
+        assert_eq!(status.memory_reclaim_observed_cache_delta_bytes, None);
+        assert_eq!(status.memory_reclaim_at, None);
     }
 
     #[test]

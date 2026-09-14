@@ -42,7 +42,6 @@ const (
 	ErrorMachineLogSourceUnavailable ErrorKind = "MachineLogSourceUnavailable"
 	ErrorMonitorConnection           ErrorKind = "MonitorConnection"
 	ErrorMonitorProtocol             ErrorKind = "MonitorProtocol"
-	ErrorMonitorUnsupported          ErrorKind = "MonitorUnsupported"
 	ErrorGuestSession                ErrorKind = "GuestSession"
 	ErrorMachinePreparationFailed    ErrorKind = "MachinePreparationFailed"
 	ErrorMachineStartCleanupFailed   ErrorKind = "MachineStartCleanupFailed"

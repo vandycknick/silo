@@ -57,11 +57,12 @@ engine's host footprint grows toward `memory` and stays there while idle.
 
 `memory-reclaim: auto` enables an experimental idle reclaim modelled on WSL2's
 `autoMemoryReclaim`: after the guest has been idle for `memory-reclaim-after`
-it drops its page cache and pulses the memory balloon so the host can discard
-the freed pages. It is off by default because on macOS 26 the
-Virtualization.framework balloon accepted the pages but the host footprint of
-the VM did not shrink in our measurements, while the guest still paid for a
-cold page cache. The plumbing stays in place for further investigation.
+it asks the guest's cgroup v2 controller to reclaim the currently observed
+cached bytes. If bounded cgroup reclaim is unavailable or incomplete, including
+an `EAGAIN` partial reclaim, it falls back to a synchronized guest-wide cache
+drop. It is off by default until both branches have passed the guest workload
+gates. This setting controls guest cache cleanup only; it does not report or
+promise that the same number of bytes were returned to the host.
 
 `rosetta` enables x86_64 container execution through Rosetta. Left unset, it is
 on when the host is Apple silicon with Rosetta installed (`softwareupdate
@@ -158,7 +159,7 @@ State:      failed (retrying; 3 attempts so far)
 Autostart:  enabled
 Endpoint:   unix:///Users/me/.docker/run/silo.sock
 PID:        80954
-Memory:     8 GiB; last idle reclaim returned 5.2 GiB to the host 12 minutes ago
+Memory:     8 GiB; last idle cache reclaim used bounded cgroup reclaim 12 minutes ago, observed guest cache delta 5.2 GiB
 Updated:    2026-09-11 10:37:29 UTC (12 seconds ago)
 Error:      could not fetch the system image: registry denied anonymous access to image "ghcr.io/example/system:dev"; it may not exist or may be private
 ```

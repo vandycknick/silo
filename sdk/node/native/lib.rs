@@ -2218,7 +2218,6 @@ fn to_napi_error(error: LibVmError) -> Error {
         LibVmError::MachineLogSourceUnavailable { .. } => "MachineLogSourceUnavailable",
         LibVmError::MonitorConnection { .. } => "MonitorConnection",
         LibVmError::MonitorProtocol { .. } => "MonitorProtocol",
-        LibVmError::MonitorUnsupported { .. } => "MonitorUnsupported",
         LibVmError::GuestSession { .. } => "GuestSession",
         LibVmError::MachinePreparationFailed { .. } => "MachinePreparationFailed",
         LibVmError::NetworkRuntime { .. } => "NetworkRuntime",

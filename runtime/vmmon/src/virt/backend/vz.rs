@@ -88,11 +88,6 @@ impl VzBackend {
 
 #[async_trait]
 impl VirtBackend for VzBackend {
-    async fn set_memory_target(&self, target_bytes: u64) -> Result<u64, VirtError> {
-        let vm = self.running_vm().await?;
-        vm.set_memory_target(target_bytes).map_err(vz_error)
-    }
-
     async fn start(&self) -> Result<(), VirtError> {
         validate_support()?;
         let mut state = self.inner.lock().await;

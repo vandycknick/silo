@@ -70,8 +70,7 @@ pub(crate) struct SystemResources {
     pub(crate) cpus: u8,
     #[serde(default = "default_memory")]
     pub(crate) memory: String,
-    /// Hand idle guest page cache back to the host through the memory balloon. Only
-    /// Virtualization.framework hosts have a balloon; elsewhere this is inert.
+    /// Reclaim idle guest page cache. Host memory reclaim is controlled separately.
     #[serde(default, rename = "memory-reclaim")]
     pub(crate) memory_reclaim: MemoryReclaim,
     /// How long the guest must sit idle before its page cache is reclaimed.
@@ -205,7 +204,7 @@ pub(crate) struct ResolvedSystemConfig {
     pub(crate) docker_socket: PathBuf,
     #[serde(default)]
     pub(crate) rosetta: bool,
-    /// Whether the daemon returns idle guest page cache to the host.
+    /// Whether the daemon reclaims idle guest page cache.
     #[serde(default = "default_memory_reclaim_enabled")]
     pub(crate) memory_reclaim: bool,
     /// Idle time before a reclaim, in seconds.

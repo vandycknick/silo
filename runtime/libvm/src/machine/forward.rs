@@ -109,9 +109,6 @@ fn map_client_error(reference: String, error: VmmonClientError) -> LibVmError {
             LibVmError::MonitorConnection { reference, message }
         }
         VmmonClientError::Protocol(message) => LibVmError::MonitorProtocol { reference, message },
-        VmmonClientError::Unsupported(message) => {
-            LibVmError::MonitorUnsupported { reference, message }
-        }
         VmmonClientError::Forward(error) => rejected(reference, error),
     }
 }
