@@ -271,6 +271,13 @@ impl DaemonStatusView {
                     "Memory".to_string(),
                     format!("{}{reclaim}", crate::ui::human_bytes(Some(memory))),
                 ));
+                rows.push((
+                    "Host memory reclaim".to_string(),
+                    format_host_memory_reclaim(
+                        status.host_memory_reclaim_requested,
+                        status.host_memory_reclaim_effective,
+                    ),
+                ));
             }
             if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&status.updated_at) {
                 let timestamp = updated.timestamp();
@@ -291,6 +298,16 @@ impl DaemonStatusView {
         }
         crate::ui::print_detail_rows(&rows)
     }
+}
+
+fn format_host_memory_reclaim(requested: bool, effective: Option<bool>) -> String {
+    let requested = if requested { "auto" } else { "off" };
+    let effective = match effective {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "unknown (see bounded VM diagnostics)",
+    };
+    format!("requested {requested}; effective {effective}")
 }
 
 async fn run_registered(path: std::path::PathBuf) -> eyre::Result<()> {
@@ -314,7 +331,12 @@ async fn run_registered(path: std::path::PathBuf) -> eyre::Result<()> {
         .with_state_root(&registration.state_root)
         .with_run_root(&paths.run_root)
         .with_image_root(&registration.image_root)
-        .with_networking(networking);
+        .with_networking(networking)
+        .with_host_memory_reclaim(if registration.config.host_memory_reclaim {
+            libvm::HostMemoryReclaim::Auto
+        } else {
+            libvm::HostMemoryReclaim::Off
+        });
     let mut api = crate::api::AppApi::local(runtime);
     crate::system::supervisor::serve(&mut api, paths, registration.config).await
 }
@@ -347,13 +369,21 @@ async fn follow_logs(path: &std::path::Path) -> eyre::Result<()> {
 async fn run_foreground(context: &mut Context) -> eyre::Result<()> {
     let (paths, config) = context.resolved_system_config(None)?;
     crate::system::docker::preflight(&config, false)?;
-    let api = context.app_api().await?;
+    let api = context
+        .app_api_with_host_memory_reclaim(if config.host_memory_reclaim {
+            libvm::HostMemoryReclaim::Auto
+        } else {
+            libvm::HostMemoryReclaim::Off
+        })
+        .await?;
     crate::system::supervisor::serve(api, paths, config).await
 }
 
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
+
+    use crate::commands::daemon::format_host_memory_reclaim;
 
     #[test]
     fn parses_foreground_and_hidden_serve() {
@@ -384,5 +414,27 @@ mod tests {
             crate::app::Cli::try_parse_from(["silo", "daemon", "balloon", "--target", "1GiB"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn host_memory_reclaim_status_keeps_requested_and_effective_axes_separate() {
+        for (requested, effective, expected) in [
+            (false, Some(false), "requested off; effective off"),
+            (false, Some(true), "requested off; effective on"),
+            (
+                false,
+                None,
+                "requested off; effective unknown (see bounded VM diagnostics)",
+            ),
+            (true, Some(false), "requested auto; effective off"),
+            (true, Some(true), "requested auto; effective on"),
+            (
+                true,
+                None,
+                "requested auto; effective unknown (see bounded VM diagnostics)",
+            ),
+        ] {
+            assert_eq!(format_host_memory_reclaim(requested, effective), expected);
+        }
     }
 }

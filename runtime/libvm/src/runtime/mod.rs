@@ -9,7 +9,8 @@ mod transitions;
 pub use builder::RuntimeBuilder;
 pub(crate) use config::normalize_absolute_path;
 pub use config::{
-    NetdRuntimeConfig, PathChoice, RuntimeConfig, RuntimeNetworkingConfig, VirtBackendOverride,
+    HostMemoryReclaim, NetdRuntimeConfig, PathChoice, RuntimeConfig, RuntimeNetworkingConfig,
+    VirtBackendOverride,
 };
 pub use core::Runtime;
 pub use planning::ReadOnlyRuntime;

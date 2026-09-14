@@ -114,6 +114,15 @@ pub enum VmExit {
 pub struct KrunOptions {
     /// Absolute path to the spawned `krun` helper binary.
     pub helper_path: Option<PathBuf>,
+    /// Whether the helper should request per-VM host reclaim qualification.
+    pub host_memory_reclaim: HostMemoryReclaim,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HostMemoryReclaim {
+    Auto,
+    #[default]
+    Off,
 }
 
 /// Options consumed only by the Virtualization.framework (macOS) backend.
@@ -338,6 +347,11 @@ impl VmConfigBuilder {
         self
     }
 
+    pub fn host_memory_reclaim(mut self, policy: HostMemoryReclaim) -> Self {
+        self.config.krun.host_memory_reclaim = policy;
+        self
+    }
+
     /// Enable a Rosetta share (macOS backend only; ignored elsewhere).
     pub fn rosetta(mut self, enabled: bool) -> Self {
         self.config.vz.rosetta = enabled;
@@ -397,6 +411,7 @@ mod tests {
         let identifier = MachineIdentifier::from_bytes(vec![1, 2, 3]);
         let config = base_builder()
             .krun_path("/usr/libexec/krun")
+            .host_memory_reclaim(HostMemoryReclaim::Auto)
             .rosetta(true)
             .machine_identifier(identifier.clone())
             .build();
@@ -406,7 +421,16 @@ mod tests {
             Some(Path::new("/usr/libexec/krun"))
         );
         assert!(config.vz().rosetta);
+        assert_eq!(config.krun().host_memory_reclaim, HostMemoryReclaim::Auto);
         assert_eq!(config.vz().machine_identifier, Some(identifier));
+    }
+
+    #[test]
+    fn host_memory_reclaim_defaults_off_without_changing_rosetta_intent() {
+        let config = base_builder().rosetta(true).build();
+
+        assert_eq!(config.krun().host_memory_reclaim, HostMemoryReclaim::Off);
+        assert!(config.vz().rosetta);
     }
 
     #[test]

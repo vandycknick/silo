@@ -268,6 +268,7 @@ mod tests {
             docker_socket: socket,
             rosetta: false,
             memory_reclaim: false,
+            host_memory_reclaim: false,
             memory_reclaim_after_secs: 120,
             identity: "test".to_string(),
         }

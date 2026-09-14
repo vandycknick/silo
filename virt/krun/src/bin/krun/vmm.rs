@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use krun::{Disk, KrunConfig, Mount, Network};
 use libkrun::{
-    init_log, BlockDevice, ConsoleDevice, DiskFormat, FsDevice, KernelFormat, LogLevel, LogOptions,
-    LogStyle, MmioDeviceManager, NetDevice, NetFlags, Payload, RngDevice, SyncMode, TsiFlags,
-    VmmBuilder, VmmError, VsockDevice,
+    init_log, BalloonDevice, BlockDevice, ConsoleDevice, DiskFormat, FsDevice, KernelFormat,
+    LogLevel, LogOptions, LogStyle, MmioDeviceManager, NetDevice, NetFlags, Payload, RngDevice,
+    SyncMode, TsiFlags, VmmBuilder, VmmError, VsockDevice,
 };
 use thiserror::Error;
 
@@ -71,6 +71,7 @@ enum DeviceKind {
     Vsock,
     Network,
     Rng,
+    Balloon,
 }
 
 #[derive(Clone, Copy)]
@@ -83,6 +84,7 @@ enum DeviceConfig<'a> {
     Vsock(u64),
     Network(&'a Network),
     Rng,
+    Balloon(bool),
 }
 
 #[cfg(test)]
@@ -97,13 +99,21 @@ impl DeviceConfig<'_> {
             Self::Vsock(_) => DeviceKind::Vsock,
             Self::Network(_) => DeviceKind::Network,
             Self::Rng => DeviceKind::Rng,
+            Self::Balloon(_) => DeviceKind::Balloon,
         }
     }
 }
 
 pub(crate) fn run(config: &KrunConfig, console_fds: ConsoleFds<'_>) -> Result<(), Error> {
-    init_log(None, LogLevel::Error, LogStyle::Auto, LogOptions::empty())
+    init_log(None, LogLevel::Info, LogStyle::Auto, LogOptions::empty())
         .map_err(|source| libkrun_error("initialize logging", source))?;
+    if config.host_memory_reclaim {
+        eprintln!(
+            "host memory reclaim requested=on effective=pending; startup probe result follows"
+        );
+    } else {
+        eprintln!("host memory reclaim requested=off effective=off probe=not-run");
+    }
 
     let kernel = config.kernel.as_deref().ok_or(Error::MissingKernel)?;
     let cmdline = config.cmdline.join(" ");
@@ -222,6 +232,13 @@ pub(crate) fn run(config: &KrunConfig, console_fds: ConsoleFds<'_>) -> Result<()
                         .map_err(|source| libkrun_error("create RNG device", source))?,
                 );
             }
+            DeviceConfig::Balloon(host_reclaim) => {
+                devices.add(
+                    BalloonDevice::new()
+                        .map_err(|source| libkrun_error("create balloon device", source))?
+                        .host_reclaim(host_reclaim),
+                );
+            }
         }
     }
 
@@ -255,7 +272,7 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
             + usize::from(config.vhost_user_vsock.is_some())
             + usize::from(config.vsock_cid.is_some())
             + usize::from(!matches!(config.network, Network::None))
-            + 1,
+            + 2,
     );
     if config.stdio_console {
         devices.push(DeviceConfig::Console);
@@ -273,6 +290,7 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
         devices.push(DeviceConfig::Network(&config.network));
     }
     devices.push(DeviceConfig::Rng);
+    devices.push(DeviceConfig::Balloon(config.host_memory_reclaim));
     devices
 }
 
@@ -378,6 +396,7 @@ mod tests {
             DeviceKind::VhostUserVsock,
             DeviceKind::Network,
             DeviceKind::Rng,
+            DeviceKind::Balloon,
         ];
         assert_eq!(
             device_plan(&config)
@@ -410,7 +429,7 @@ mod tests {
                 .iter()
                 .map(DeviceConfig::kind)
                 .collect::<Vec<_>>(),
-            vec![DeviceKind::Network, DeviceKind::Rng]
+            vec![DeviceKind::Network, DeviceKind::Rng, DeviceKind::Balloon]
         );
         assert!(matches!(
             standalone_plan.first(),
@@ -421,7 +440,26 @@ mod tests {
                 .iter()
                 .map(DeviceConfig::kind)
                 .collect::<Vec<_>>(),
-            vec![DeviceKind::Vsock, DeviceKind::Network, DeviceKind::Rng]
+            vec![
+                DeviceKind::Vsock,
+                DeviceKind::Network,
+                DeviceKind::Rng,
+                DeviceKind::Balloon,
+            ]
         );
+    }
+
+    #[test]
+    fn balloon_is_always_attached_with_the_requested_host_policy() {
+        for requested in [false, true] {
+            let config = KrunConfig {
+                host_memory_reclaim: requested,
+                ..KrunConfig::default()
+            };
+            assert!(matches!(
+                device_plan(&config).last(),
+                Some(DeviceConfig::Balloon(actual)) if *actual == requested
+            ));
+        }
     }
 }

@@ -73,6 +73,9 @@ pub(crate) struct SystemResources {
     /// Reclaim idle guest page cache. Host memory reclaim is controlled separately.
     #[serde(default, rename = "memory-reclaim")]
     pub(crate) memory_reclaim: MemoryReclaim,
+    /// Request per-VM host memory reclaim qualification independently of guest cache reclaim.
+    #[serde(default, rename = "host-memory-reclaim")]
+    pub(crate) host_memory_reclaim: HostMemoryReclaim,
     /// How long the guest must sit idle before its page cache is reclaimed.
     #[serde(
         default = "default_memory_reclaim_after",
@@ -89,12 +92,21 @@ pub(crate) enum MemoryReclaim {
     Off,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum HostMemoryReclaim {
+    Auto,
+    #[default]
+    Off,
+}
+
 impl Default for SystemResources {
     fn default() -> Self {
         Self {
             cpus: default_cpus(),
             memory: default_memory(),
             memory_reclaim: MemoryReclaim::default(),
+            host_memory_reclaim: HostMemoryReclaim::default(),
             memory_reclaim_after: default_memory_reclaim_after(),
         }
     }
@@ -207,6 +219,9 @@ pub(crate) struct ResolvedSystemConfig {
     /// Whether the daemon reclaims idle guest page cache.
     #[serde(default = "default_memory_reclaim_enabled")]
     pub(crate) memory_reclaim: bool,
+    /// Whether host memory reclaim was requested for the VM.
+    #[serde(default)]
+    pub(crate) host_memory_reclaim: bool,
     /// Idle time before a reclaim, in seconds.
     #[serde(default = "default_memory_reclaim_after_secs")]
     pub(crate) memory_reclaim_after_secs: u64,
@@ -337,6 +352,8 @@ impl SystemConfig {
             docker_socket,
             rosetta: self.system.rosetta.unwrap_or_else(rosetta_available),
             memory_reclaim: self.system.resources.memory_reclaim == MemoryReclaim::Auto,
+            host_memory_reclaim: self.system.resources.host_memory_reclaim
+                == HostMemoryReclaim::Auto,
             memory_reclaim_after_secs,
             identity: String::new(),
         };
@@ -478,6 +495,7 @@ mod tests {
         assert_eq!(resolved.shares.len(), 1);
         assert_eq!(resolved.memory_bytes, 8 * 1024 * 1024 * 1024);
         assert!(!resolved.memory_reclaim);
+        assert!(!resolved.host_memory_reclaim);
         assert_eq!(resolved.memory_reclaim_after_secs, 120);
         let reclaim_on: SystemConfig = serde_yaml_ng::from_str(
             "version: '1'\nsystem:\n  resources:\n    memory-reclaim: auto\n    memory-reclaim-after: 5m\n",
@@ -485,7 +503,15 @@ mod tests {
         .expect("config");
         let reclaim_on = reclaim_on.resolve(temp.path(), None).expect("resolve");
         assert!(reclaim_on.memory_reclaim);
+        assert!(!reclaim_on.host_memory_reclaim);
         assert_eq!(reclaim_on.memory_reclaim_after_secs, 300);
+        let host_reclaim: SystemConfig = serde_yaml_ng::from_str(
+            "version: '1'\nsystem:\n  resources:\n    host-memory-reclaim: auto\n",
+        )
+        .expect("config");
+        let host_reclaim = host_reclaim.resolve(temp.path(), None).expect("resolve");
+        assert!(host_reclaim.host_memory_reclaim);
+        assert!(!host_reclaim.memory_reclaim);
         for bad in ["memory-reclaim-after: 10s", "memory-reclaim-after: soon"] {
             let bad: SystemConfig = serde_yaml_ng::from_str(&format!(
                 "version: '1'\nsystem:\n  resources:\n    {bad}\n"

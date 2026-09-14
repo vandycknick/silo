@@ -107,6 +107,11 @@ impl VirtualMachineBuilder {
         self
     }
 
+    pub fn host_memory_reclaim(mut self, enabled: bool) -> Self {
+        self.config.host_memory_reclaim = enabled;
+        self
+    }
+
     pub fn build(self) -> Result<KrunConfig> {
         validate_config(&self.config)?;
         Ok(self.config)
@@ -192,6 +197,15 @@ pub(crate) fn command_args(config: &KrunConfig) -> Vec<OsString> {
     push_arg(&mut args, "--id", &config.id);
     push_arg(&mut args, "--cpus", config.cpus.to_string());
     push_arg(&mut args, "--memory-mib", config.memory_mib.to_string());
+    push_arg(
+        &mut args,
+        "--host-memory-reclaim",
+        if config.host_memory_reclaim {
+            "on"
+        } else {
+            "off"
+        },
+    );
 
     if let Some(kernel) = config.kernel.as_ref() {
         push_arg(&mut args, "--kernel", kernel.as_os_str());
@@ -361,6 +375,29 @@ mod tests {
 
         assert!(!args.iter().any(|arg| arg == "run"));
         assert!(args.iter().any(|arg| arg == "--stdio-console"));
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                std::ffi::OsString::from("--host-memory-reclaim"),
+                std::ffi::OsString::from("off"),
+            ]
+        }));
+    }
+
+    #[test]
+    fn start_arguments_request_host_memory_reclaim_explicitly() {
+        let config = VirtualMachineBuilder::new("krun")
+            .kernel("/kernel")
+            .host_memory_reclaim(true)
+            .build()
+            .expect("config should be valid");
+
+        let args = command_args(&config);
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                std::ffi::OsString::from("--host-memory-reclaim"),
+                std::ffi::OsString::from("on"),
+            ]
+        }));
     }
 
     #[test]

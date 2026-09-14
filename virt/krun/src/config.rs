@@ -19,6 +19,7 @@ pub struct KrunConfig {
     pub vsock_cid: Option<u64>,
     pub network: Network,
     pub stdio_console: bool,
+    pub host_memory_reclaim: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +77,7 @@ impl Default for KrunConfig {
             vsock_cid: None,
             network: Network::None,
             stdio_console: false,
+            host_memory_reclaim: false,
         }
     }
 }

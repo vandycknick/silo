@@ -60,6 +60,12 @@ pub(crate) struct DaemonStatus {
     /// When the last guest cache-reclaim attempt ran (RFC 3339).
     #[serde(default)]
     pub(crate) memory_reclaim_at: Option<String>,
+    /// Whether the runtime requested per-VM host memory reclaim qualification.
+    #[serde(default)]
+    pub(crate) host_memory_reclaim_requested: bool,
+    /// Observed effective state. `None` means no acknowledgement channel exists.
+    #[serde(default)]
+    pub(crate) host_memory_reclaim_effective: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +148,10 @@ pub(crate) async fn serve(
         memory_reclaim_bounded_exit_code: None,
         memory_reclaim_observed_cache_delta_bytes: None,
         memory_reclaim_at: None,
+        host_memory_reclaim_requested: config.host_memory_reclaim,
+        host_memory_reclaim_effective: initial_host_memory_reclaim_effective(
+            config.host_memory_reclaim,
+        ),
     };
     publish(&paths, &mut status)?;
     append_log(&paths, "preparing installation storage")?;
@@ -280,6 +290,14 @@ pub(crate) async fn serve(
     publish(&paths, &mut status)?;
     append_log(&paths, "system daemon stopped")?;
     Ok(())
+}
+
+const fn initial_host_memory_reclaim_effective(requested: bool) -> Option<bool> {
+    if requested {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 async fn reconcile_ready(
@@ -847,8 +865,9 @@ mod tests {
     use std::time::Duration;
 
     use crate::system::supervisor::{
-        error_causes, error_summary, guest_reclaim_script, parse_reclaim_branch,
-        startup_retry_delay, ActivitySample, IdleReclaimer, LifetimeLock, ReclaimBranch, MIB,
+        error_causes, error_summary, guest_reclaim_script, initial_host_memory_reclaim_effective,
+        parse_reclaim_branch, startup_retry_delay, ActivitySample, IdleReclaimer, LifetimeLock,
+        ReclaimBranch, MIB,
     };
 
     #[test]
@@ -1011,6 +1030,14 @@ mod tests {
         assert_eq!(status.memory_reclaim_bounded_exit_code, None);
         assert_eq!(status.memory_reclaim_observed_cache_delta_bytes, None);
         assert_eq!(status.memory_reclaim_at, None);
+        assert!(!status.host_memory_reclaim_requested);
+        assert_eq!(status.host_memory_reclaim_effective, None);
+    }
+
+    #[test]
+    fn host_memory_reclaim_auto_does_not_invent_an_effective_backend_state() {
+        assert_eq!(initial_host_memory_reclaim_effective(true), None);
+        assert_eq!(initial_host_memory_reclaim_effective(false), Some(false));
     }
 
     #[test]

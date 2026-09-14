@@ -30,6 +30,7 @@ pub(crate) struct Vmmon {
     executable: PathBuf,
     krun_path: PathBuf,
     virt_backend: Option<crate::runtime::VirtBackendOverride>,
+    host_memory_reclaim: crate::runtime::HostMemoryReclaim,
 }
 
 impl Vmmon {
@@ -39,12 +40,14 @@ impl Vmmon {
         executable: PathBuf,
         krun_path: PathBuf,
         virt_backend: Option<crate::runtime::VirtBackendOverride>,
+        host_memory_reclaim: crate::runtime::HostMemoryReclaim,
     ) -> Self {
         Self {
             paths,
             executable,
             krun_path,
             virt_backend,
+            host_memory_reclaim,
         }
     }
 
@@ -66,6 +69,13 @@ impl Vmmon {
                 }
             }
         })
+    }
+
+    pub(crate) fn host_memory_reclaim_request(&self) -> start_request::VmmonHostMemoryReclaim {
+        match self.host_memory_reclaim {
+            crate::runtime::HostMemoryReclaim::Off => start_request::VmmonHostMemoryReclaim::Off,
+            crate::runtime::HostMemoryReclaim::Auto => start_request::VmmonHostMemoryReclaim::Auto,
+        }
     }
 
     pub(crate) fn client(&self, machine_id: MachineId) -> VmmonClient {

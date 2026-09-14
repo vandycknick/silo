@@ -810,6 +810,7 @@ mod tests {
             RuntimeNetworkingConfig::default(),
             components,
             None,
+            crate::runtime::HostMemoryReclaim::Off,
         )
         .await
         .expect("create runtime with mock store")
@@ -824,6 +825,7 @@ mod tests {
             RuntimeNetworkingConfig::default(),
             components,
             None,
+            crate::runtime::HostMemoryReclaim::Off,
         )
         .await
         .expect("create runtime with sqlite store");

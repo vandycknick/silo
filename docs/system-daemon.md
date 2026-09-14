@@ -37,6 +37,7 @@ daemon:
       cpus: 4
       memory: 8GiB
       memory-reclaim: off         # experimental: auto | off
+      host-memory-reclaim: off    # experimental: auto | off
       memory-reclaim-after: 2m
     storage:
       root-size: 20GiB
@@ -63,6 +64,15 @@ an `EAGAIN` partial reclaim, it falls back to a synchronized guest-wide cache
 drop. It is off by default until both branches have passed the guest workload
 gates. This setting controls guest cache cleanup only; it does not report or
 promise that the same number of bytes were returned to the host.
+
+`host-memory-reclaim: auto` separately asks the krun helper to attach a balloon
+and run its per-VM host-reclaim qualification probe. A passing probe enables
+host reclaim for that VM; failed or inconclusive probes leave ordinary guest
+memory active. It defaults to `off` until the release, refault, and cost gates
+are complete. The current macOS default remains Virtualization.framework, so
+this setting does not change backend selection, vsock, native execution, or
+Rosetta intent. `daemon status` reports requested and observed effective state
+separately and never treats `auto` as proof that reclaim became effective.
 
 `rosetta` enables x86_64 container execution through Rosetta. Left unset, it is
 on when the host is Apple silicon with Rosetta installed (`softwareupdate

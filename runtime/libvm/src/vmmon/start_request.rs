@@ -18,6 +18,22 @@ pub(crate) struct VmmonStartRequest {
     // with vmmon's strict (deny_unknown_fields) reader.
     #[serde(skip_serializing_if = "Option::is_none")]
     virt_backend: Option<VmmonVirtBackend>,
+    #[serde(skip_serializing_if = "VmmonHostMemoryReclaim::is_off")]
+    host_memory_reclaim: VmmonHostMemoryReclaim,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum VmmonHostMemoryReclaim {
+    Auto,
+    #[default]
+    Off,
+}
+
+impl VmmonHostMemoryReclaim {
+    fn is_off(&self) -> bool {
+        *self == Self::Off
+    }
 }
 
 /// Explicit virtualization backend selection (testing only).
@@ -65,11 +81,17 @@ impl VmmonStartRequest {
             machine_run_id: machine_run_id.into(),
             startup_command,
             virt_backend: None,
+            host_memory_reclaim: VmmonHostMemoryReclaim::Off,
         }
     }
 
     pub(crate) fn with_virt_backend(mut self, virt_backend: Option<VmmonVirtBackend>) -> Self {
         self.virt_backend = virt_backend;
+        self
+    }
+
+    pub(crate) fn with_host_memory_reclaim(mut self, policy: VmmonHostMemoryReclaim) -> Self {
+        self.host_memory_reclaim = policy;
         self
     }
 }
@@ -96,8 +118,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::vmmon::start_request::{
-        encode_start_request, VmmonEnvironmentVariable, VmmonProcessSpec, VmmonStartRequest,
-        VmmonStartupCommand, VMMON_START_REQUEST_MAX_BYTES,
+        encode_start_request, VmmonEnvironmentVariable, VmmonHostMemoryReclaim, VmmonProcessSpec,
+        VmmonStartRequest, VmmonStartupCommand, VMMON_START_REQUEST_MAX_BYTES,
     };
 
     #[test]
@@ -143,6 +165,21 @@ mod tests {
         );
         assert_eq!(value["startupCommand"]["process"]["argv"][1], "--all");
         assert!(value["startupCommand"]["process"].get("stdio").is_none());
+    }
+
+    #[test]
+    fn host_memory_reclaim_auto_is_an_explicit_additive_field() {
+        let request = VmmonStartRequest::new(
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
+            None,
+        )
+        .with_host_memory_reclaim(VmmonHostMemoryReclaim::Auto);
+        let encoded = encode_start_request(&request).expect("encode request");
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded[..encoded.len() - 1]).expect("parse request");
+
+        assert_eq!(value["hostMemoryReclaim"], "auto");
     }
 
     #[test]

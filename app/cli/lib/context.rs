@@ -39,11 +39,20 @@ impl Context {
     }
 
     pub(crate) async fn app_api(&mut self) -> eyre::Result<&mut AppApi> {
+        self.app_api_with_host_memory_reclaim(libvm::HostMemoryReclaim::Off)
+            .await
+    }
+
+    pub(crate) async fn app_api_with_host_memory_reclaim(
+        &mut self,
+        host_memory_reclaim: libvm::HostMemoryReclaim,
+    ) -> eyre::Result<&mut AppApi> {
         if self.api.is_none() {
             let networking = self.config()?.networking.clone();
             let runtime_config = RuntimeConfig::from_env()
                 .context("resolve libvm runtime config")?
-                .with_networking(networking);
+                .with_networking(networking)
+                .with_host_memory_reclaim(host_memory_reclaim);
             self.api = Some(AppApi::local(runtime_config));
         }
 

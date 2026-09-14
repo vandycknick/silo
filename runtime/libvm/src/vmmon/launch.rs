@@ -112,7 +112,8 @@ impl Vmmon {
             launch.run_id,
             launch.startup_command.cloned(),
         )
-        .with_virt_backend(self.virt_backend_request());
+        .with_virt_backend(self.virt_backend_request())
+        .with_host_memory_reclaim(self.host_memory_reclaim_request());
         handoff_start_request(start_write, &start_request, VMMON_START_REQUEST_TIMEOUT).await?;
         let readiness_timeout = if launch.startup_command.is_some() {
             Duration::from_secs(5 * 60 + 30)

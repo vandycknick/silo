@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::runtime::{Runtime, RuntimeConfig, RuntimeNetworkingConfig};
+use crate::runtime::{HostMemoryReclaim, Runtime, RuntimeConfig, RuntimeNetworkingConfig};
 use crate::LibVmError;
 
 /// Builder for opening a local libvm runtime.
@@ -84,6 +84,12 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Sets the per-VM host memory reclaim policy.
+    pub fn host_memory_reclaim(mut self, policy: HostMemoryReclaim) -> Self {
+        self.config = self.config.with_host_memory_reclaim(policy);
+        self
+    }
+
     /// Sets the default kernel path.
     pub fn kernel_path(mut self, kernel_path: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_kernel_path(kernel_path);
@@ -127,7 +133,7 @@ impl RuntimeBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::RuntimeBuilder;
+    use crate::{HostMemoryReclaim, RuntimeBuilder};
 
     #[test]
     fn component_and_runtime_root_methods_populate_runtime_config() {
@@ -135,6 +141,7 @@ mod tests {
             .vmmon_path("/runtime/bin/vmmon")
             .netd_path("/runtime/bin/netd")
             .krun_path("/runtime/bin/krun")
+            .host_memory_reclaim(HostMemoryReclaim::Auto)
             .kernel_path("/runtime/assets/kernel-default")
             .initramfs_path("/runtime/assets/initramfs")
             .agent_path("/runtime/assets/agent")
@@ -146,6 +153,7 @@ mod tests {
             config.vmmon_path.as_deref(),
             Some(std::path::Path::new("/runtime/bin/vmmon"))
         );
+        assert_eq!(config.host_memory_reclaim, HostMemoryReclaim::Auto);
         assert_eq!(
             config.netd_path.as_deref(),
             Some(std::path::Path::new("/runtime/bin/netd"))
