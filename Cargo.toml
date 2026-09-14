@@ -8,6 +8,7 @@ members = [
     "guest/agent",
     "guest/init",
     "guest/portd",
+    "guest/rprobe",
     "runtime/oci",
     "runtime/libvm",
     "runtime/test-utils",

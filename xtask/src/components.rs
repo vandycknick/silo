@@ -21,6 +21,7 @@ pub enum Component {
     Portd,
     Init,
     Initramfs,
+    Rprobe,
     GoFfi,
 }
 
@@ -49,6 +50,8 @@ pub enum ComponentError {
     MissingVmmonBinary { path: std::path::PathBuf },
     #[error("krun binary not found after build: {path}")]
     MissingKrunBinary { path: std::path::PathBuf },
+    #[error("rprobe must be built natively on Linux ARM64")]
+    UnsupportedRprobeHost,
 }
 
 pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
@@ -78,6 +81,7 @@ pub fn build_component(
         Component::Portd => build_guest_portd(context),
         Component::Init => build_guest_init(context),
         Component::Initramfs => build_initramfs(context),
+        Component::Rprobe => build_rprobe(context),
         Component::GoFfi => build_cargo_package(context, "silo-go-ffi"),
     }
 }
@@ -119,7 +123,18 @@ pub fn clippy(
     for member in host.workspace_excludes() {
         cargo.args(["--exclude", member]);
     }
-    command::run(cargo)
+    command::run(cargo)?;
+
+    let mut rprobe = standard_cargo_command(workspace_root, target_dir);
+    rprobe.args([
+        "clippy",
+        "--locked",
+        "-p",
+        "rprobe",
+        "--lib",
+        "--no-default-features",
+    ]);
+    command::run(rprobe)
 }
 
 pub fn test_units(
@@ -139,7 +154,18 @@ pub fn test_units(
     for member in host.workspace_excludes() {
         cargo.args(["--exclude", member]);
     }
-    command::run(cargo)
+    command::run(cargo)?;
+
+    let mut rprobe = standard_cargo_command(workspace_root, target_dir);
+    rprobe.args([
+        "test",
+        "--locked",
+        "-p",
+        "rprobe",
+        "--lib",
+        "--no-default-features",
+    ]);
+    command::run(rprobe)
 }
 
 pub fn test_integration(
@@ -316,6 +342,30 @@ fn build_guest_init(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         "init",
         "--target",
         context.host.guest_target().triple(),
+    ]);
+    release::configure_guest_init_command(&mut cargo, context.profile == Profile::Release);
+    context.profile.apply_cargo(&mut cargo);
+    command::run(cargo)?;
+    Ok(())
+}
+
+fn build_rprobe(context: &BuildContext<'_>) -> Result<(), ComponentError> {
+    if context.host != HostTarget::LinuxArm64 {
+        return Err(ComponentError::UnsupportedRprobeHost);
+    }
+
+    let mut cargo = cargo_command(context)?;
+    cargo.args([
+        "build",
+        "--locked",
+        "-p",
+        "rprobe",
+        "--features",
+        "probe-bin",
+        "--bin",
+        "silo-rprobe",
+        "--target",
+        "aarch64-unknown-linux-musl",
     ]);
     release::configure_guest_init_command(&mut cargo, context.profile == Profile::Release);
     context.profile.apply_cargo(&mut cargo);

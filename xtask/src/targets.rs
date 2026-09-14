@@ -81,8 +81,8 @@ impl HostTarget {
 
     pub fn workspace_excludes(self) -> &'static [&'static str] {
         match self {
-            Self::MacosArm64 => &["agent", "init", "silo-portd"],
-            Self::LinuxX86_64 | Self::LinuxArm64 => &["init", "vz"],
+            Self::MacosArm64 => &["agent", "init", "rprobe", "silo-portd"],
+            Self::LinuxX86_64 | Self::LinuxArm64 => &["init", "rprobe", "vz"],
         }
     }
 }
