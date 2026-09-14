@@ -151,7 +151,7 @@ fn build_provision_config(
                 .unwrap_or(false),
             ..AgentRosettaConfig::default()
         },
-        mounts: provision_mount_entries(spec),
+        mounts: provision_mount_entries(spec)?,
         userdata: provision_userdata(spec)?,
     })
 }
@@ -262,16 +262,13 @@ fn build_provision_network_config(
     }
 }
 
-fn provision_mount_entries(spec: &VmSpec) -> Vec<ProvisionMountConfig> {
-    spec.mounts
-        .iter()
+fn provision_mount_entries(spec: &VmSpec) -> eyre::Result<Vec<ProvisionMountConfig>> {
+    Ok(vm_spec::project_mounts(&spec.mounts)
+        .map_err(eyre::Report::msg)?
+        .into_iter()
         .map(|mount| ProvisionMountConfig {
-            tag: mount.tag.clone(),
-            path: if mount.tag.starts_with('/') {
-                mount.tag.clone()
-            } else {
-                mount.source.to_string_lossy().to_string()
-            },
+            tag: mount.backend_tag,
+            path: mount.guest_path.to_string_lossy().to_string(),
             fstype: VIRTIOFS_FSTYPE.to_string(),
             options: if mount.read_only {
                 vec![
@@ -285,7 +282,7 @@ fn provision_mount_entries(spec: &VmSpec) -> Vec<ProvisionMountConfig> {
                 ]
             },
         })
-        .collect()
+        .collect())
 }
 
 fn certificate_authority_pem_for_config(
@@ -698,7 +695,7 @@ mod tests {
             },
         ];
 
-        let mounts = provision_mount_entries(&spec);
+        let mounts = provision_mount_entries(&spec).expect("project provision mounts");
 
         assert_eq!(mounts[0].tag, "/workspace");
         assert_eq!(mounts[0].path, "/workspace");
@@ -710,6 +707,46 @@ mod tests {
         assert_eq!(mounts[2].path, "/sdk/worktree");
         assert_eq!(mounts[3].tag, "/srv/shared");
         assert_eq!(mounts[3].path, "/srv/shared");
+    }
+
+    #[test]
+    fn provision_mounts_use_projected_backend_tags_and_original_guest_paths() {
+        let mut spec = sample_spec(Vec::new());
+        let destination = "/guest/workspace/destination/that/is/longer/than/virtiofs/allows";
+        spec.mounts = vec![Mount {
+            source: PathBuf::from("/host/workspace/source/that/must/remain/unchanged"),
+            tag: destination.to_string(),
+            read_only: false,
+        }];
+
+        let mounts = provision_mount_entries(&spec).expect("project provision mounts");
+
+        assert_eq!(mounts[0].tag, "silo-mount-0");
+        assert_eq!(mounts[0].path, destination);
+        assert_eq!(mounts[0].options, ["rw", "nofail"]);
+    }
+
+    #[test]
+    fn provision_mounts_propagate_duplicate_original_tag_errors() {
+        let mut spec = sample_spec(Vec::new());
+        spec.mounts = vec![
+            Mount {
+                source: PathBuf::from("/one"),
+                tag: "workspace".to_string(),
+                read_only: false,
+            },
+            Mount {
+                source: PathBuf::from("/two"),
+                tag: "workspace".to_string(),
+                read_only: false,
+            },
+        ];
+
+        let error = provision_mount_entries(&spec).expect_err("duplicate tags must fail");
+
+        assert!(error
+            .to_string()
+            .contains("mount tag \"workspace\" is repeated"));
     }
 
     #[test]
