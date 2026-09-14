@@ -34,6 +34,7 @@ const INPUT_EVENT_VALUE_OFFSET: usize = INPUT_EVENT_CODE_OFFSET + 2;
 const INPUT_EVENT_SIZE: usize = INPUT_EVENT_VALUE_OFFSET + 4;
 const EV_KEY: u16 = 0x01;
 const KEY_POWER: u16 = 116;
+const KEY_RESTART: u16 = 408;
 
 #[derive(Clone, Default)]
 pub(crate) struct ProcessSupervisor {
@@ -453,9 +454,11 @@ fn read_power_button_events(supervisor: Arc<Pid1Supervisor>, path: PathBuf) {
     loop {
         match file.read_exact(&mut bytes) {
             Ok(()) => {
-                if parse_input_event(&bytes).is_some_and(|event| event.is_power_button_press()) {
-                    tracing::warn!(path = %path.display(), "virtual power button event received");
-                    supervisor.request_shutdown("received virtual power button".to_string());
+                if let Some(key) =
+                    parse_input_event(&bytes).and_then(InputEvent::shutdown_key_press)
+                {
+                    tracing::warn!(path = %path.display(), ?key, "virtual shutdown key press received");
+                    supervisor.request_shutdown(format!("received virtual {key:?} key press"));
                     return;
                 }
             }
@@ -513,9 +516,22 @@ struct InputEvent {
 }
 
 impl InputEvent {
-    fn is_power_button_press(self) -> bool {
-        self.event_type == EV_KEY && self.code == KEY_POWER && self.value != 0
+    fn shutdown_key_press(self) -> Option<ShutdownKey> {
+        if self.event_type != EV_KEY || self.value != 1 {
+            return None;
+        }
+        match self.code {
+            KEY_POWER => Some(ShutdownKey::Power),
+            KEY_RESTART => Some(ShutdownKey::Restart),
+            _ => None,
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownKey {
+    Power,
+    Restart,
 }
 
 fn parse_input_event(bytes: &[u8]) -> Option<InputEvent> {
@@ -682,9 +698,9 @@ mod tests {
 
     use crate::pid1::{
         is_input_event_device_name, is_shutdown_signal, parse_input_event, parse_status_ppid,
-        pid1_signals, should_log_adopted_exit, shutdown_grace_ticks, InputEvent, EV_KEY,
-        INPUT_EVENT_CODE_OFFSET, INPUT_EVENT_SIZE, INPUT_EVENT_TYPE_OFFSET,
-        INPUT_EVENT_VALUE_OFFSET, KEY_POWER,
+        pid1_signals, should_log_adopted_exit, shutdown_grace_ticks, InputEvent, ShutdownKey,
+        EV_KEY, INPUT_EVENT_CODE_OFFSET, INPUT_EVENT_SIZE, INPUT_EVENT_TYPE_OFFSET,
+        INPUT_EVENT_VALUE_OFFSET, KEY_POWER, KEY_RESTART,
     };
 
     #[test]
@@ -731,18 +747,32 @@ mod tests {
                 value: 1,
             }
         );
-        assert!(event.is_power_button_press());
+        assert_eq!(event.shutdown_key_press(), Some(ShutdownKey::Power));
     }
 
     #[test]
-    fn input_event_parser_ignores_non_power_presses() {
+    fn input_event_parser_detects_restart_key_press() {
+        let event = parse_input_event(&input_event_bytes(EV_KEY, KEY_RESTART, 1))
+            .expect("restart event should parse");
+
+        assert_eq!(event.shutdown_key_press(), Some(ShutdownKey::Restart));
+    }
+
+    #[test]
+    fn input_event_parser_ignores_releases_repeats_and_unrelated_events() {
         let release = parse_input_event(&input_event_bytes(EV_KEY, KEY_POWER, 0))
             .expect("release event should parse");
+        let repeat = parse_input_event(&input_event_bytes(EV_KEY, KEY_RESTART, 2))
+            .expect("repeat event should parse");
         let other_key = parse_input_event(&input_event_bytes(EV_KEY, KEY_POWER + 1, 1))
             .expect("other key event should parse");
+        let other_type = parse_input_event(&input_event_bytes(EV_KEY + 1, KEY_POWER, 1))
+            .expect("other event type should parse");
 
-        assert!(!release.is_power_button_press());
-        assert!(!other_key.is_power_button_press());
+        assert_eq!(release.shutdown_key_press(), None);
+        assert_eq!(repeat.shutdown_key_press(), None);
+        assert_eq!(other_key.shutdown_key_press(), None);
+        assert_eq!(other_type.shutdown_key_press(), None);
     }
 
     #[test]

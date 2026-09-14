@@ -64,11 +64,12 @@ Current scope focuses on the libkrun path used by Silo today:
   socket
 - stdio console output
 - process-backed VM lifecycle management from Rust callers
+- graceful macOS aarch64 guest shutdown through a blocked `SIGTERM` and
+  libkrun's host-side shutdown request
 
 Planned follow-up scope includes:
 
 - richer `VirtualMachine` lifecycle state
-- graceful shutdown when libkrun exposes a host-side shutdown path we can rely on
 - higher-level serial and vsock convenience helpers
 
 ## Requirements

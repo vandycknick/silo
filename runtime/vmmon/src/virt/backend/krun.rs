@@ -33,7 +33,8 @@ use crate::virt::stream::{
 use crate::virt::VmExit;
 
 const MAX_VSOCK_LISTENERS: usize = 1024;
-const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const FORCED_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const VSOCK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -285,32 +286,27 @@ impl VirtBackend for KrunBackend {
     }
 
     async fn stop(&self) -> Result<(), VirtError> {
-        let running = {
-            let mut runtime = self.runtime.lock().await;
-            runtime.take()
-        };
-        let Some(running) = running else {
+        let mut runtime = self.runtime.lock().await;
+        let Some(running) = runtime.as_ref() else {
             self.cache_exit(VmExit::Stopped);
             return Ok(());
         };
-        let RunningKrun {
-            vm,
-            mux,
-            mux_task,
-            session: _,
-        } = running;
+        stop_vm(
+            &self.config,
+            running.vm.clone(),
+            GRACEFUL_STOP_TIMEOUT,
+            FORCED_STOP_TIMEOUT,
+        )
+        .await?;
+
+        let Some(running) = runtime.take() else {
+            return Err(VirtError::Backend(
+                "krun runtime disappeared after stopping".to_string(),
+            ));
+        };
+        drop(runtime);
+        let RunningKrun { mux, mux_task, .. } = running;
         mux.shutdown().await;
-        {
-            let mut vm = vm.lock().await;
-            if vm
-                .try_wait()
-                .map_err(|err| krun_error(&self.config, err))?
-                .is_none()
-            {
-                let _ = vm.kill();
-            }
-        }
-        let _ = timeout(STOP_TIMEOUT, wait_for_vm_exit(vm)).await;
         mux_task.join().await?;
         self.cache_exit(VmExit::Stopped);
         Ok(())
@@ -595,6 +591,106 @@ async fn wait_for_vm_exit(vm: Arc<AsyncMutex<VirtualMachine>>) -> Result<ExitSta
     }
 }
 
+async fn stop_vm(
+    config: &VmConfig,
+    vm: Arc<AsyncMutex<VirtualMachine>>,
+    graceful_timeout: Duration,
+    forced_timeout: Duration,
+) -> Result<ExitStatus, VirtError> {
+    let request_error = {
+        let mut vm = vm.lock().await;
+        match vm.try_wait() {
+            Ok(Some(status)) => {
+                tracing::info!(machine = %config.name(), "krun helper exited before stop request");
+                return Ok(status);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    machine = %config.name(),
+                    error = %err,
+                    "failed to probe krun helper before graceful stop"
+                );
+            }
+        }
+        match vm.shutdown() {
+            Ok(()) => {
+                tracing::info!(machine = %config.name(), "krun graceful shutdown request issued");
+                None
+            }
+            Err(err) => Some(err),
+        }
+    };
+
+    let graceful_failure = if let Some(err) = request_error {
+        format!("graceful shutdown request failed: {err}")
+    } else {
+        match timeout(graceful_timeout, wait_for_vm_exit(vm.clone())).await {
+            Ok(Ok(status)) => {
+                tracing::info!(machine = %config.name(), "krun helper exited after graceful shutdown request");
+                return Ok(status);
+            }
+            Ok(Err(err)) => format!("waiting for graceful shutdown failed: {err}"),
+            Err(_) => format!(
+                "graceful shutdown exceeded {} seconds",
+                graceful_timeout.as_secs()
+            ),
+        }
+    };
+    tracing::warn!(
+        machine = %config.name(),
+        failure = %graceful_failure,
+        "krun graceful stop failed; forcing helper exit"
+    );
+
+    let mut pre_kill_probe_error = None;
+    {
+        let mut vm = vm.lock().await;
+        match vm.try_wait() {
+            Ok(Some(status)) => {
+                tracing::info!(machine = %config.name(), "krun helper exited before forced kill");
+                return Ok(status);
+            }
+            Ok(None) => {}
+            Err(err) => pre_kill_probe_error = Some(err.to_string()),
+        }
+        if let Err(kill_error) = vm.kill() {
+            return match vm.try_wait() {
+                Ok(Some(status)) => {
+                    tracing::info!(machine = %config.name(), "krun helper exit confirmed after forced-kill race");
+                    Ok(status)
+                }
+                Ok(None) => Err(VirtError::Backend(format!(
+                    "krun graceful stop failed ({graceful_failure}); forced kill failed: {kill_error}"
+                ))),
+                Err(wait_error) => Err(VirtError::Backend(format!(
+                    "krun graceful stop failed ({graceful_failure}); forced kill failed: {kill_error}; exit probe failed: {wait_error}"
+                ))),
+            };
+        }
+        tracing::info!(machine = %config.name(), "krun forced kill requested");
+    }
+
+    match timeout(forced_timeout, wait_for_vm_exit(vm)).await {
+        Ok(Ok(status)) => {
+            tracing::info!(machine = %config.name(), "krun forced kill completed");
+            Ok(status)
+        }
+        Ok(Err(wait_error)) => Err(VirtError::Backend(format!(
+            "krun graceful stop failed ({graceful_failure}); forced kill was requested but exit could not be confirmed: {wait_error}"
+        ))),
+        Err(_) => {
+            let probe_context = pre_kill_probe_error
+                .map(|error| format!("; pre-kill exit probe failed: {error}"))
+                .unwrap_or_default();
+            Err(VirtError::Backend(format!(
+                "krun graceful stop failed ({graceful_failure}); helper remained alive after {} seconds following forced kill{probe_context}",
+                forced_timeout.as_secs()
+            )))
+        }
+    }
+}
+
 fn krun_error(config: &VmConfig, err: KrunBackendError) -> VirtError {
     match err {
         KrunBackendError::InvalidConfig(reason) => VirtError::InvalidConfig {
@@ -711,6 +807,8 @@ fn invalid_config<T>(config: &VmConfig, reason: &str) -> Result<T, VirtError> {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "macos")]
+    use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -723,6 +821,8 @@ mod tests {
         read_connect_response, validate, ConnectionRequest, KrunBackend, KrunVsockRegistry,
         MAX_VSOCK_LISTENERS, VSOCK_CONNECT_TIMEOUT,
     };
+    #[cfg(target_os = "macos")]
+    use crate::virt::backend::krun::stop_vm;
     use crate::virt::backend::VirtBackend;
     use crate::virt::capacity::VsockCapacity;
     use crate::virt::stream::KrunVsockSession;
@@ -883,6 +983,67 @@ mod tests {
             .is_err());
 
         backend.stop().await.expect("stop helper process");
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn graceful_stop_falls_back_to_sigkill_for_term_resistant_helper() {
+        let root = test_dir();
+        fs::create_dir_all(&root).expect("create test root");
+        let kernel = root.join("kernel");
+        fs::write(&kernel, b"kernel").expect("write kernel");
+        let term_seen = root.join("term-seen");
+        let ready = root.join("ready");
+        let krun = root.join("krun");
+        write_executable(
+            &krun,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--check-host-basic\" ]; then exit 0; fi\ntrap 'touch {}' TERM\ntouch {}\nwhile :; do :; done\n",
+                term_seen.display(),
+                ready.display()
+            ),
+        );
+        let config = VmConfig::builder("term-resistant")
+            .vm_id("machine-1")
+            .cpus(1)
+            .memory(128)
+            .base_directory(&root)
+            .krun_path(krun.canonicalize().expect("canonical helper"))
+            .kernel(kernel.canonicalize().expect("canonical kernel"))
+            .network(NetworkMode::None)
+            .build();
+        let backend = KrunBackend::new(config).expect("create backend");
+        backend.start().await.expect("start helper process");
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "helper did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let vm = backend
+            .runtime
+            .lock()
+            .await
+            .as_ref()
+            .expect("running helper")
+            .vm
+            .clone();
+
+        let status = stop_vm(
+            &backend.config,
+            vm,
+            Duration::from_millis(250),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("force stopped helper");
+
+        assert!(term_seen.exists(), "helper did not observe SIGTERM");
+        assert_eq!(status.signal(), Some(9));
+        backend.stop().await.expect("clean stopped runtime");
         fs::remove_dir_all(root).expect("remove test root");
     }
 

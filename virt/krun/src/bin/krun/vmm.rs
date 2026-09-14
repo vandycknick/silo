@@ -10,6 +10,9 @@ use libkrun::{
 };
 use thiserror::Error;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use nix::sys::signal::{self, SigSet, SigmaskHow, Signal};
+
 const NET_FEATURE_CSUM: u32 = 1 << 0;
 const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
 const NET_FEATURE_GUEST_TSO4: u32 = 1 << 7;
@@ -50,6 +53,18 @@ pub(crate) enum Error {
 
     #[error("libkrun event loop terminated")]
     EventLoopTerminated,
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[error("failed to {operation} shutdown signal handling: {source}")]
+    ShutdownSignal {
+        operation: &'static str,
+        #[source]
+        source: nix::errno::Errno,
+    },
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[error("failed to spawn shutdown signal thread: {0}")]
+    ShutdownThread(#[source] io::Error),
 }
 
 #[cfg(test)]
@@ -99,6 +114,9 @@ pub(crate) fn run(
     watchdog_fd: Option<OwnedFd>,
     console_fds: ConsoleFds<'_>,
 ) -> Result<(), Error> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let shutdown_signals = block_shutdown_signal()?;
+
     init_log(None, LogLevel::Info, LogStyle::Auto, LogOptions::empty())
         .map_err(|source| libkrun_error("initialize logging", source))?;
     if config.host_memory_reclaim {
@@ -263,8 +281,47 @@ pub(crate) fn run(
     let vmm = builder
         .build()
         .map_err(|source| libkrun_error("build VMM", source))?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let handle = vmm
+            .handle()
+            .map_err(|source| libkrun_error("obtain VMM shutdown handle", source))?;
+        std::thread::Builder::new()
+            .name("silo-krun-shutdown".to_string())
+            .spawn(move || match shutdown_signals.wait() {
+                Ok(Signal::SIGTERM) => {
+                    tracing::info!("krun helper received SIGTERM");
+                    match handle.shutdown() {
+                        Ok(()) => tracing::info!("krun helper sent guest shutdown request"),
+                        Err(err) => {
+                            tracing::error!(error = %err, "failed to request guest shutdown");
+                        }
+                    }
+                }
+                Ok(signal) => {
+                    tracing::error!(?signal, "unexpected signal reached shutdown waiter");
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "shutdown signal wait failed");
+                }
+            })
+            .map_err(Error::ShutdownThread)?;
+    }
     vmm.run();
     Err(Error::EventLoopTerminated)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn block_shutdown_signal() -> Result<SigSet, Error> {
+    let mut signals = SigSet::empty();
+    signals.add(Signal::SIGTERM);
+    signal::pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&signals), None).map_err(|source| {
+        Error::ShutdownSignal {
+            operation: "block",
+            source,
+        }
+    })?;
+    Ok(signals)
 }
 
 fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
