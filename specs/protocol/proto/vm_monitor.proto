@@ -162,4 +162,6 @@ message HostMetrics {
   optional string name = 2;
   MonitorSnapshot monitor = 3;
   AgentMetricsObservation metrics = 4;
+  // Backend that constructed this running monitor, never a requested/default guess.
+  optional string actual_backend = 5;
 }

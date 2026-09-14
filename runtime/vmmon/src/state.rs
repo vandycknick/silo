@@ -53,6 +53,7 @@ struct Observation<T> {
 struct State {
     machine_id: String,
     name: String,
+    actual_backend: String,
     monitor_id: String,
     vm_state: VmState,
     vm_changed_at: SystemTime,
@@ -96,7 +97,12 @@ pub(crate) struct InstanceStore {
 }
 
 impl InstanceStore {
-    pub(crate) fn new(machine_id: String, name: String, agent_enabled: bool) -> Self {
+    pub(crate) fn new(
+        machine_id: String,
+        name: String,
+        agent_enabled: bool,
+        actual_backend: String,
+    ) -> Self {
         let now = SystemTime::now();
         let (generation, _) = watch::channel(0);
         let (identity_reset, _) = watch::channel(0);
@@ -104,6 +110,7 @@ impl InstanceStore {
         let mut state = State {
             machine_id,
             name,
+            actual_backend,
             monitor_id: uuid::Uuid::new_v4().to_string(),
             vm_state: VmState::Starting,
             vm_changed_at: now,
@@ -414,12 +421,22 @@ fn ready_agent_identity(state: &State, now: Instant) -> Option<ReadyAgentIdentit
     ready_agent_identity_from_snapshot(&snapshot)
 }
 
+#[cfg(test)]
 pub(crate) fn new_instance_store(
     machine_id: String,
     name: String,
     agent_enabled: bool,
 ) -> InstanceStore {
-    InstanceStore::new(machine_id, name, agent_enabled)
+    new_instance_store_with_backend(machine_id, name, agent_enabled, "mock".to_string())
+}
+
+pub(crate) fn new_instance_store_with_backend(
+    machine_id: String,
+    name: String,
+    agent_enabled: bool,
+    actual_backend: String,
+) -> InstanceStore {
+    InstanceStore::new(machine_id, name, agent_enabled, actual_backend)
 }
 
 fn observation<T>(value: T, freshness: Duration) -> Result<Observation<T>, StoreError> {
@@ -1087,6 +1104,7 @@ fn project_metrics(state: &State, now: Instant, observed_at: SystemTime) -> Host
                     .map(|reason| reason as i32),
                 report: Some(metrics.value.1.clone()),
             }),
+        actual_backend: Some(state.actual_backend.clone()),
     }
 }
 
@@ -1452,5 +1470,19 @@ mod tests {
                 Duration::from_secs(15),
             )
             .expect("partial metrics");
+    }
+
+    #[test]
+    fn metrics_report_the_backend_that_created_the_monitor() {
+        let store = crate::state::new_instance_store_with_backend(
+            "machine-1".to_string(),
+            "test".to_string(),
+            true,
+            "krun".to_string(),
+        );
+        assert_eq!(
+            store.metrics().expect("metrics").actual_backend.as_deref(),
+            Some("krun")
+        );
     }
 }

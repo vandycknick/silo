@@ -31,6 +31,7 @@ equivalent `XDG_CONFIG_HOME` path):
 ```yaml
 daemon:
   version: "1"
+  backend: vz                    # experimental: krun | vz
   system:
     image: ghcr.io/vandycknick/silo/system@sha256:<qualified-digest>
     resources:
@@ -74,10 +75,20 @@ this setting does not change backend selection, vsock, native execution, or
 Rosetta intent. `daemon status` reports requested and observed effective state
 separately and never treats `auto` as proof that reclaim became effective.
 
+`backend` explicitly selects `krun` or Apple Virtualization.framework (`vz`).
+The macOS default remains `vz`. If the key is omitted, `SILO_VIRT_BACKEND=krun`
+or `SILO_VIRT_BACKEND=vz` on `silo daemon up` is copied into the resolved daemon
+registration, including login-item starts. An explicit `backend` key wins over
+that environment variable. The environment variable also selects the backend
+for direct CLI machine starts.
+
 `rosetta` enables x86_64 container execution through Rosetta. Left unset, it is
-on when the host is Apple silicon with Rosetta installed (`softwareupdate
---install-rosetta`) and off otherwise. The setting is applied to the system VM
-the next time the daemon starts it from stopped.
+on for `vz` when the host is Apple silicon with Rosetta installed
+(`softwareupdate --install-rosetta`) and off otherwise. It defaults off for
+`krun`, where Rosetta is not supported yet; explicit or previously persisted
+true intent is rejected with a hint to select `vz`, never silently disabled.
+The setting is applied to the system VM the next time the daemon starts it from
+stopped.
 
 The home share is enabled read/write by default and appears at the same absolute
 path in the guest. Disable it if the engine must not access the host home.

@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use crate::runtime::{HostMemoryReclaim, Runtime, RuntimeConfig, RuntimeNetworkingConfig};
+use crate::runtime::{
+    HostMemoryReclaim, Runtime, RuntimeConfig, RuntimeNetworkingConfig, VirtBackendOverride,
+};
 use crate::LibVmError;
 
 /// Builder for opening a local libvm runtime.
@@ -90,6 +92,12 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Selects the virtualization backend used for machines started by this runtime.
+    pub fn virt_backend(mut self, backend: VirtBackendOverride) -> Self {
+        self.config = self.config.with_virt_backend(backend);
+        self
+    }
+
     /// Sets the default kernel path.
     pub fn kernel_path(mut self, kernel_path: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_kernel_path(kernel_path);
@@ -133,7 +141,7 @@ impl RuntimeBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::{HostMemoryReclaim, RuntimeBuilder};
+    use crate::{HostMemoryReclaim, RuntimeBuilder, VirtBackendOverride};
 
     #[test]
     fn component_and_runtime_root_methods_populate_runtime_config() {
@@ -142,6 +150,7 @@ mod tests {
             .netd_path("/runtime/bin/netd")
             .krun_path("/runtime/bin/krun")
             .host_memory_reclaim(HostMemoryReclaim::Auto)
+            .virt_backend(VirtBackendOverride::Krun)
             .kernel_path("/runtime/assets/kernel-default")
             .initramfs_path("/runtime/assets/initramfs")
             .agent_path("/runtime/assets/agent")
@@ -154,6 +163,7 @@ mod tests {
             Some(std::path::Path::new("/runtime/bin/vmmon"))
         );
         assert_eq!(config.host_memory_reclaim, HostMemoryReclaim::Auto);
+        assert_eq!(config.virt_backend, Some(VirtBackendOverride::Krun));
         assert_eq!(
             config.netd_path.as_deref(),
             Some(std::path::Path::new("/runtime/bin/netd"))

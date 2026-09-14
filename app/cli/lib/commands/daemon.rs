@@ -121,14 +121,13 @@ impl Cmd {
             DaemonCommand::Upgrade(command) => {
                 let paths = crate::system::ownership::default_system_paths()?;
                 if command.recover {
-                    return crate::system::upgrade::recover(context.app_api().await?, &paths).await;
+                    return crate::system::upgrade::recover(&paths).await;
                 }
                 let image = command
                     .image
                     .ok_or_else(|| eyre::eyre!("--image is required"))?;
                 let (_, config) = context.resolved_system_config(None)?;
-                crate::system::upgrade::upgrade(context.app_api().await?, &paths, config, &image)
-                    .await
+                crate::system::upgrade::upgrade(&paths, config, &image).await
             }
         }
     }
@@ -232,6 +231,10 @@ impl DaemonStatusView {
             if let Some(digest) = &status.image_digest {
                 rows.push(("Image".to_string(), digest.clone()));
             }
+            rows.push((
+                "Backend".to_string(),
+                format_actual_backend(status.actual_backend.as_deref()).to_string(),
+            ));
             if let Some(memory) = self.memory_bytes {
                 let reclaim = status
                     .memory_reclaim_outcome
@@ -300,6 +303,10 @@ impl DaemonStatusView {
     }
 }
 
+fn format_actual_backend(backend: Option<&str>) -> &str {
+    backend.unwrap_or("unknown")
+}
+
 fn format_host_memory_reclaim(requested: bool, effective: Option<bool>) -> String {
     let requested = if requested { "auto" } else { "off" };
     let effective = match effective {
@@ -327,16 +334,7 @@ async fn run_registered(path: std::path::PathBuf) -> eyre::Result<()> {
         return Err(eyre::eyre!("registration installation identity mismatch"));
     }
     let networking = registration.global_config()?.networking;
-    let runtime = libvm::RuntimeConfig::local(&registration.data_root)
-        .with_state_root(&registration.state_root)
-        .with_run_root(&paths.run_root)
-        .with_image_root(&registration.image_root)
-        .with_networking(networking)
-        .with_host_memory_reclaim(if registration.config.host_memory_reclaim {
-            libvm::HostMemoryReclaim::Auto
-        } else {
-            libvm::HostMemoryReclaim::Off
-        });
+    let runtime = registration.runtime_config(&paths.run_root, &registration.config, networking);
     let mut api = crate::api::AppApi::local(runtime);
     crate::system::supervisor::serve(&mut api, paths, registration.config).await
 }
@@ -370,11 +368,14 @@ async fn run_foreground(context: &mut Context) -> eyre::Result<()> {
     let (paths, config) = context.resolved_system_config(None)?;
     crate::system::docker::preflight(&config, false)?;
     let api = context
-        .app_api_with_host_memory_reclaim(if config.host_memory_reclaim {
-            libvm::HostMemoryReclaim::Auto
-        } else {
-            libvm::HostMemoryReclaim::Off
-        })
+        .app_api_with_host_memory_reclaim(
+            if config.host_memory_reclaim {
+                libvm::HostMemoryReclaim::Auto
+            } else {
+                libvm::HostMemoryReclaim::Off
+            },
+            config.backend.runtime_override(),
+        )
         .await?;
     crate::system::supervisor::serve(api, paths, config).await
 }
@@ -383,7 +384,7 @@ async fn run_foreground(context: &mut Context) -> eyre::Result<()> {
 mod tests {
     use clap::Parser as _;
 
-    use crate::commands::daemon::format_host_memory_reclaim;
+    use crate::commands::daemon::{format_actual_backend, format_host_memory_reclaim};
 
     #[test]
     fn parses_foreground_and_hidden_serve() {
@@ -436,5 +437,11 @@ mod tests {
         ] {
             assert_eq!(format_host_memory_reclaim(requested, effective), expected);
         }
+    }
+
+    #[test]
+    fn missing_actual_backend_is_reported_as_unknown() {
+        assert_eq!(format_actual_backend(None), "unknown");
+        assert_eq!(format_actual_backend(Some("krun")), "krun");
     }
 }

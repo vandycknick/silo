@@ -50,7 +50,6 @@ struct UpgradeRecord {
 }
 
 pub(crate) async fn upgrade(
-    api: &mut AppApi,
     paths: &SystemPaths,
     config: ResolvedSystemConfig,
     image: &str,
@@ -63,6 +62,9 @@ pub(crate) async fn upgrade(
     let old_installation =
         load_required::<InstallationRecord>(&paths.installation(), "installation record")?;
     let old_registration = crate::system::service::load_registration(&paths.registration())?;
+    let networking = old_registration.global_config()?.networking;
+    let runtime = old_registration.runtime_config(&paths.run_root, &config, networking);
+    let mut api = AppApi::local(runtime);
 
     let (progress, _receiver) = ImageProgressSender::channel(1);
     let source = api.resolve_system_image(image, progress).await?;
@@ -73,7 +75,7 @@ pub(crate) async fn upgrade(
     let target_reference = source.image.selected_reference.clone();
     let target_digest = source.image.manifest_digest.clone();
     let target_config = config.with_image(target_reference.clone())?;
-    qualify_candidate_image(api, paths, &target_config, source.image.clone()).await?;
+    qualify_candidate_image(&mut api, paths, &target_config, source.image.clone()).await?;
     let service_was_enabled = crate::system::service::is_enabled()?;
     let old_machine = api.inspect_machine(&old_system.active_machine_id).await?;
     let old_run_id = if matches!(
@@ -126,7 +128,7 @@ pub(crate) async fn upgrade(
             return Err(error);
         }
     };
-    if let Err(error) = ensure_machine_stopped(api, &old_system.active_machine_id).await {
+    if let Err(error) = ensure_machine_stopped(&mut api, &old_system.active_machine_id).await {
         drop(lifetime);
         rollback_before_backup(paths, &old_registration, service_was_enabled)?;
         return Err(error);
@@ -193,7 +195,7 @@ pub(crate) async fn upgrade(
     pending.step = UpgradeStep::RecordsCommitted;
     write_record(&paths.upgrade(), &pending)?;
 
-    validate_committed_candidate(api, &new_system, &target_config, |run_id| {
+    validate_committed_candidate(&mut api, &new_system, &target_config, |run_id| {
         pending.candidate_run_id = Some(run_id.to_string());
         write_record(&paths.upgrade(), &pending)
     })
@@ -211,7 +213,7 @@ pub(crate) async fn upgrade(
     Ok(())
 }
 
-pub(crate) async fn recover(api: &mut AppApi, paths: &SystemPaths) -> eyre::Result<()> {
+pub(crate) async fn recover(paths: &SystemPaths) -> eyre::Result<()> {
     let _operation = OperationLock::acquire(&paths.operation_lock())?;
     let (pending_path, record) = if let Some(record) = load_record(&paths.upgrade())? {
         (paths.upgrade(), record)
@@ -222,12 +224,19 @@ pub(crate) async fn recover(api: &mut AppApi, paths: &SystemPaths) -> eyre::Resu
     };
     let record: UpgradeRecord = record;
     validate_recovery_record(paths, &record)?;
+    let networking = record.old_registration.global_config()?.networking;
+    let runtime = record.old_registration.runtime_config(
+        &paths.run_root,
+        &record.old_registration.config,
+        networking,
+    );
+    let mut api = AppApi::local(runtime);
     crate::system::service::stop_locked(&record.old_registration)?;
     let lifetime = acquire_lifetime(paths, Duration::from_secs(90))?;
     if let Some(candidate) = &record.candidate_machine_id {
-        ensure_machine_stopped(api, candidate).await?;
+        ensure_machine_stopped(&mut api, candidate).await?;
     }
-    ensure_machine_stopped(api, &record.old_system.active_machine_id).await?;
+    ensure_machine_stopped(&mut api, &record.old_system.active_machine_id).await?;
     if !record.backup_complete {
         if record.candidate_machine_id.is_some() {
             bail!("incomplete backup unexpectedly records a candidate machine; refusing ambiguous recovery");

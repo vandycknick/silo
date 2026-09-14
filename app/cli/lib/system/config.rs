@@ -14,8 +14,50 @@ const RELEASE_IMAGE: Option<&str> = option_env!("SILO_SYSTEM_IMAGE");
 #[serde(deny_unknown_fields)]
 pub(crate) struct SystemConfig {
     pub(crate) version: String,
+    /// Backend selected for this daemon registration. Explicit config wins over the environment.
+    #[serde(default)]
+    pub(crate) backend: Option<SystemBackend>,
     #[serde(default)]
     pub(crate) system: SystemOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SystemBackend {
+    Krun,
+    Vz,
+}
+
+impl SystemBackend {
+    pub(crate) fn runtime_override(self) -> libvm::VirtBackendOverride {
+        match self {
+            Self::Krun => libvm::VirtBackendOverride::Krun,
+            Self::Vz => libvm::VirtBackendOverride::Vz,
+        }
+    }
+
+    fn default_for_host() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Vz
+        } else {
+            Self::Krun
+        }
+    }
+}
+
+impl TryFrom<libvm::VirtBackendOverride> for SystemBackend {
+    type Error = eyre::Report;
+
+    fn try_from(value: libvm::VirtBackendOverride) -> Result<Self, Self::Error> {
+        match value {
+            libvm::VirtBackendOverride::Krun => Ok(Self::Krun),
+            libvm::VirtBackendOverride::Vz => Ok(Self::Vz),
+            libvm::VirtBackendOverride::Mock { .. } => {
+                bail!("the mock backend cannot be used by the system daemon")
+            }
+            _ => bail!("the selected backend cannot be used by the system daemon"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -214,8 +256,13 @@ pub(crate) struct ResolvedSystemConfig {
     pub(crate) publish_bind: PublishBind,
     pub(crate) compatibility_socket: CompatibilitySocket,
     pub(crate) docker_socket: PathBuf,
+    #[serde(default = "SystemBackend::default_for_host")]
+    pub(crate) backend: SystemBackend,
     #[serde(default)]
     pub(crate) rosetta: bool,
+    /// Whether `rosetta` was explicitly configured. Old registrations preserve their value.
+    #[serde(default = "default_true")]
+    pub(crate) rosetta_explicit: bool,
     /// Whether the daemon reclaims idle guest page cache.
     #[serde(default = "default_memory_reclaim_enabled")]
     pub(crate) memory_reclaim: bool,
@@ -240,6 +287,22 @@ impl SystemConfig {
         &self,
         home: &Path,
         image_override: Option<&str>,
+    ) -> eyre::Result<ResolvedSystemConfig> {
+        let environment_backend = if self.backend.is_some() {
+            None
+        } else {
+            libvm::VirtBackendOverride::from_env()?
+                .map(SystemBackend::try_from)
+                .transpose()?
+        };
+        self.resolve_with_backend_override(home, image_override, environment_backend)
+    }
+
+    fn resolve_with_backend_override(
+        &self,
+        home: &Path,
+        image_override: Option<&str>,
+        environment_backend: Option<SystemBackend>,
     ) -> eyre::Result<ResolvedSystemConfig> {
         if self.version != "1" {
             bail!(
@@ -338,6 +401,19 @@ impl SystemConfig {
             bail!("daemon.system.image cannot be empty");
         }
         let docker_socket = home.join(".docker/run/silo.sock");
+        let backend = self
+            .backend
+            .or(environment_backend)
+            .unwrap_or_else(SystemBackend::default_for_host);
+        let rosetta = self
+            .system
+            .rosetta
+            .unwrap_or_else(|| backend == SystemBackend::Vz && rosetta_available());
+        if backend == SystemBackend::Krun && self.system.rosetta == Some(true) {
+            bail!(
+                "rosetta is not supported on the krun backend yet\n\nhint: select the vz backend"
+            );
+        }
         let mut resolved = ResolvedSystemConfig {
             schema: 1,
             engine: self.system.engine,
@@ -350,7 +426,9 @@ impl SystemConfig {
             publish_bind: self.system.networking.publish_bind,
             compatibility_socket: self.system.docker.compatibility_socket,
             docker_socket,
-            rosetta: self.system.rosetta.unwrap_or_else(rosetta_available),
+            backend,
+            rosetta,
+            rosetta_explicit: self.system.rosetta.is_some(),
             memory_reclaim: self.system.resources.memory_reclaim == MemoryReclaim::Auto,
             host_memory_reclaim: self.system.resources.host_memory_reclaim
                 == HostMemoryReclaim::Auto,
@@ -482,7 +560,7 @@ const fn default_publish_bind() -> PublishBind {
 
 #[cfg(test)]
 mod tests {
-    use crate::system::config::{CompatibilitySocket, SystemConfig};
+    use crate::system::config::{CompatibilitySocket, SystemBackend, SystemConfig};
 
     #[test]
     fn strict_config_resolves_home_and_defaults() {
@@ -537,7 +615,63 @@ mod tests {
         assert_eq!(pinned.data_size_bytes, 64 << 30);
         assert_ne!(pinned.identity, resolved.identity);
         assert_eq!(resolved.compatibility_socket, CompatibilitySocket::Auto);
+        assert_eq!(resolved.backend, SystemBackend::default_for_host());
         assert!(resolved.identity.starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn krun_defaults_rosetta_off_and_rejects_explicit_enablement() {
+        let home = tempfile::tempdir().expect("temp home");
+        let config: SystemConfig = serde_yaml_ng::from_str(
+            "version: '1'\nbackend: krun\nsystem:\n  image: registry.example/system@sha256:test\n",
+        )
+        .expect("config");
+        let resolved = config.resolve(home.path(), None).expect("resolve");
+        assert_eq!(resolved.backend, SystemBackend::Krun);
+        assert!(!resolved.rosetta);
+        assert!(!resolved.rosetta_explicit);
+
+        let enabled: SystemConfig = serde_yaml_ng::from_str(
+            "version: '1'\nbackend: krun\nsystem:\n  image: registry.example/system@sha256:test\n  rosetta: true\n",
+        )
+        .expect("config");
+        let error = enabled
+            .resolve(home.path(), None)
+            .expect_err("reject Rosetta");
+        assert!(error.to_string().contains("select the vz backend"));
+    }
+
+    #[test]
+    fn explicit_backend_wins_over_environment_and_resolved_value_is_persistable() {
+        let home = tempfile::tempdir().expect("temp home");
+        let config: SystemConfig = serde_yaml_ng::from_str(
+            "version: '1'\nbackend: vz\nsystem:\n  image: registry.example/system@sha256:test\n",
+        )
+        .expect("config");
+        let resolved = config
+            .resolve_with_backend_override(home.path(), None, Some(SystemBackend::Krun))
+            .expect("resolve explicit VZ");
+        assert_eq!(resolved.backend, SystemBackend::Vz);
+        assert_eq!(
+            serde_json::from_slice::<crate::system::config::ResolvedSystemConfig>(
+                &serde_json::to_vec(&resolved).expect("serialize")
+            )
+            .expect("deserialize")
+            .backend,
+            SystemBackend::Vz
+        );
+
+        let environment_selected: SystemConfig = serde_yaml_ng::from_str(
+            "version: '1'\nsystem:\n  image: registry.example/system@sha256:test\n",
+        )
+        .expect("config");
+        assert_eq!(
+            environment_selected
+                .resolve_with_backend_override(home.path(), None, Some(SystemBackend::Krun))
+                .expect("resolve environment krun")
+                .backend,
+            SystemBackend::Krun
+        );
     }
 
     #[cfg(debug_assertions)]

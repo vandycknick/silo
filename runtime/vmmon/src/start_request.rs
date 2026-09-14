@@ -36,7 +36,7 @@ pub(crate) enum HostMemoryReclaimRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct VirtBackendRequest {
-    /// Backend name; today only "mock" is meaningful.
+    /// Backend name: "krun", "vz", or "mock".
     pub(crate) kind: String,
     /// Absolute path to a mock scenario file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,7 +201,25 @@ fn validate_start_request(
         parse_uuid("startupCommand.executionId", &command.execution_id)?;
         validate_process(&command.process)?;
     }
+    if let Some(backend) = &request.virt_backend {
+        validate_backend_request(backend)?;
+    }
     Ok(request)
+}
+
+fn validate_backend_request(backend: &VirtBackendRequest) -> io::Result<()> {
+    match backend.kind.as_str() {
+        "mock" => Ok(()),
+        "krun" | "vz" if backend.scenario.is_none() => Ok(()),
+        "krun" | "vz" => Err(invalid_data(format!(
+            "vmmon start request backend {:?} cannot include a mock scenario",
+            backend.kind
+        ))),
+        _ => Err(invalid_data(format!(
+            "vmmon start request selected unknown virt backend {:?}",
+            backend.kind
+        ))),
+    }
 }
 
 fn validate_process(process: &StartupProcess) -> io::Result<()> {
@@ -330,6 +348,29 @@ mod tests {
         let request = decode_start_request(&encoded, &machine_id, &run_id)
             .expect("decode host reclaim request");
         assert_eq!(request.host_memory_reclaim, HostMemoryReclaimRequest::Auto);
+    }
+
+    #[test]
+    fn strict_reader_accepts_real_backends_only_without_mock_scenarios() {
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        for kind in ["krun", "vz"] {
+            let request = encode(json!({
+                "version": VMMON_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+                "virtBackend": { "kind": kind }
+            }));
+            decode_start_request(&request, &machine_id, &run_id).expect("accept real backend");
+
+            let invalid = encode(json!({
+                "version": VMMON_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+                "virtBackend": { "kind": kind, "scenario": "/tmp/mock.json" }
+            }));
+            assert!(decode_start_request(&invalid, &machine_id, &run_id).is_err());
+        }
     }
 
     #[test]

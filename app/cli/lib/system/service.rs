@@ -53,6 +53,25 @@ impl Registration {
     pub(crate) fn global_config(&self) -> eyre::Result<GlobalConfig> {
         GlobalConfig::load_from_dir(self.config_root.clone())
     }
+
+    pub(crate) fn runtime_config(
+        &self,
+        run_root: &Path,
+        config: &ResolvedSystemConfig,
+        networking: libvm::RuntimeNetworkingConfig,
+    ) -> libvm::RuntimeConfig {
+        libvm::RuntimeConfig::local(&self.data_root)
+            .with_state_root(&self.state_root)
+            .with_run_root(run_root)
+            .with_image_root(&self.image_root)
+            .with_networking(networking)
+            .with_virt_backend(config.backend.runtime_override())
+            .with_host_memory_reclaim(if config.host_memory_reclaim {
+                libvm::HostMemoryReclaim::Auto
+            } else {
+                libvm::HostMemoryReclaim::Off
+            })
+    }
 }
 
 pub(crate) struct OperationLock {
@@ -708,6 +727,47 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::system::service::systemd_arg;
     use crate::system::service::{logs, validate_existing_service};
+
+    #[test]
+    fn registered_runtime_uses_resolved_backend_and_reclaim_policy() {
+        let config: crate::system::config::ResolvedSystemConfig =
+            serde_json::from_value(serde_json::json!({
+                "schema": 1,
+                "engine": "docker",
+                "image": "registry.example/system@sha256:test",
+                "cpus": 2,
+                "memory_bytes": 1073741824,
+                "root_size_bytes": 1073741824,
+                "data_size_bytes": 1073741824,
+                "shares": [],
+                "publish_bind": "any",
+                "compatibility_socket": "disabled",
+                "docker_socket": "/tmp/silo.sock",
+                "backend": "vz",
+                "host_memory_reclaim": true,
+                "identity": "fnv1a64:test"
+            }))
+            .expect("config");
+        let registration = crate::system::service::Registration {
+            schema: 1,
+            executable: "/bin/silo".into(),
+            config_root: "/config".into(),
+            data_root: "/data".into(),
+            state_root: "/state".into(),
+            image_root: "/images".into(),
+            native_service_path: "/service".into(),
+            config: config.clone(),
+            installation_id: uuid::Uuid::nil(),
+        };
+
+        let runtime = registration.runtime_config(
+            std::path::Path::new("/run"),
+            &config,
+            libvm::RuntimeNetworkingConfig::default(),
+        );
+        assert_eq!(runtime.virt_backend, Some(libvm::VirtBackendOverride::Vz));
+        assert_eq!(runtime.host_memory_reclaim, libvm::HostMemoryReclaim::Auto);
+    }
 
     #[test]
     fn logs_are_bounded_by_requested_lines() {

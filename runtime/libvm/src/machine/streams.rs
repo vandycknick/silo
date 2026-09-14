@@ -363,6 +363,8 @@ pub enum MachineAgentProvisionFailurePolicy {
 pub struct MachineMetrics {
     pub machine_id: String,
     pub name: String,
+    /// Backend that constructed the running VM monitor, when reported by vmmon.
+    pub actual_backend: Option<String>,
     pub monitor: MachineMonitorSnapshot,
     pub metrics: Option<MachineAgentMetricsObservation>,
 }
@@ -1330,6 +1332,11 @@ impl TryFrom<v1::HostMetrics> for MachineMetrics {
         Ok(Self {
             machine_id: canonical_uuid(value.machine_id, "machine_id")?,
             name: required_text(value.name, "name", protocol::MAX_INFO_BYTES)?,
+            actual_backend: optional_text(
+                value.actual_backend,
+                "actual_backend",
+                protocol::MAX_INFO_BYTES,
+            )?,
             monitor: required(value.monitor, "monitor")?.try_into()?,
             metrics: value.metrics.map(TryInto::try_into).transpose()?,
         })
@@ -1851,6 +1858,7 @@ mod tests {
         let metrics = MachineMetrics::try_from(v1::HostMetrics {
             machine_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             name: Some("machine".to_string()),
+            actual_backend: Some("krun".to_string()),
             monitor: Some(v1::MonitorSnapshot {
                 instance_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
                 observed_at: Some(timestamp()),
@@ -1913,6 +1921,7 @@ mod tests {
             }),
         })
         .expect("valid metrics");
+        assert_eq!(metrics.actual_backend.as_deref(), Some("krun"));
         let snapshot = metrics
             .metrics
             .map(|metrics| metrics.report.snapshot)
@@ -1924,6 +1933,22 @@ mod tests {
         assert_eq!(snapshot.filesystems.len(), 1);
         assert_eq!(snapshot.network_interfaces.len(), 1);
         assert_eq!(snapshot.block_devices.len(), 1);
+    }
+
+    #[test]
+    fn metrics_conversion_accepts_an_old_vmmon_without_actual_backend() {
+        let value = v1::HostMetrics {
+            machine_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
+            name: Some("machine".to_string()),
+            actual_backend: None,
+            monitor: Some(v1::MonitorSnapshot {
+                instance_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
+                observed_at: Some(timestamp()),
+            }),
+            metrics: None,
+        };
+        let metrics = MachineMetrics::try_from(value.clone()).expect("old vmmon metrics");
+        assert_eq!(metrics.actual_backend, None);
     }
     #[test]
     fn request_validation_rejects_invalid_values() {

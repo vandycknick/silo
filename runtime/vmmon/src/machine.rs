@@ -41,6 +41,7 @@ pub(crate) struct VmSpecInputs<'a> {
     pub guest_services_enabled: bool,
     pub krun_path: &'a Path,
     pub host_memory_reclaim: HostMemoryReclaim,
+    pub selected_backend: crate::virt::BackendKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +54,11 @@ pub(crate) fn vm_spec_machine_config(
     inputs: VmSpecInputs<'_>,
 ) -> Result<InstanceVmConfig, MachineSpecError> {
     let boot_assets = vm_spec_boot_assets(&inputs)?;
-    let machine_identifier = load_host_machine_identifier(inputs.data_dir)?;
+    let machine_identifier = if inputs.selected_backend == crate::virt::BackendKind::Vz {
+        load_host_machine_identifier(inputs.data_dir)?
+    } else {
+        None
+    };
 
     let mut builder = VmConfig::builder(inputs.name)
         .vm_id(inputs.id)
@@ -344,6 +349,7 @@ mod tests {
             guest_services_enabled: true,
             krun_path: Path::new("/tmp/krun"),
             host_memory_reclaim: HostMemoryReclaim::Off,
+            selected_backend: crate::virt::BackendKind::Vz,
         })
         .expect("machine config should resolve");
 
@@ -379,6 +385,7 @@ mod tests {
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
             host_memory_reclaim: HostMemoryReclaim::Off,
+            selected_backend: crate::virt::BackendKind::Vz,
         })
         .expect("machine config should resolve");
 
@@ -419,6 +426,7 @@ mod tests {
                 guest_services_enabled: false,
                 krun_path: Path::new("/tmp/krun"),
                 host_memory_reclaim: HostMemoryReclaim::Off,
+                selected_backend: crate::virt::BackendKind::Vz,
             })
             .expect("machine config should resolve");
 
@@ -461,6 +469,7 @@ mod tests {
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
             host_memory_reclaim: HostMemoryReclaim::Off,
+            selected_backend: crate::virt::BackendKind::Vz,
         })
         .expect("machine config should resolve");
 
@@ -495,6 +504,7 @@ mod tests {
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
             host_memory_reclaim: HostMemoryReclaim::Off,
+            selected_backend: crate::virt::BackendKind::Vz,
         })
         .expect("machine config should resolve");
 
@@ -526,6 +536,7 @@ mod tests {
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
             host_memory_reclaim: HostMemoryReclaim::Off,
+            selected_backend: crate::virt::BackendKind::Vz,
         })
         .expect("machine config should resolve");
 
@@ -556,6 +567,7 @@ mod tests {
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
             host_memory_reclaim: HostMemoryReclaim::Off,
+            selected_backend: crate::virt::BackendKind::Vz,
         })
         .expect("machine config should resolve");
 
@@ -579,11 +591,43 @@ mod tests {
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
             host_memory_reclaim: HostMemoryReclaim::Off,
+            selected_backend: crate::virt::BackendKind::Vz,
         })
         .expect_err("missing kernel path should fail");
 
         assert!(err.to_string().contains("boot.kernel.path"));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn krun_preserves_but_does_not_load_vz_machine_identity() {
+        let dir = temp_dir("krun-vz-identity");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let identity_path = crate::machine::machine_identifier_path_from_dir(&dir);
+        fs::write(&identity_path, b"retained-vz-identity").expect("write identity");
+        let spec = sample_spec(&dir);
+
+        let machine_config = vm_spec_machine_config(VmSpecInputs {
+            name: "devbox",
+            id: "vm-krun",
+            data_dir: &dir,
+            spec: &spec,
+            network: &RuntimeNetwork::None,
+            guest_services_enabled: false,
+            krun_path: Path::new("/tmp/krun"),
+            host_memory_reclaim: HostMemoryReclaim::Off,
+            selected_backend: crate::virt::BackendKind::Krun,
+        })
+        .expect("build krun config");
+
+        assert!(machine_config.machine_identifier.is_none());
+        assert!(machine_config.config.vz().machine_identifier.is_none());
+        assert_eq!(
+            fs::read(&identity_path).expect("read retained identity"),
+            b"retained-vz-identity"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

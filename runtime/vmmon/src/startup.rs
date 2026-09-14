@@ -16,7 +16,7 @@ use crate::machine::{
     machine_identifier_path_from_dir, vm_spec_machine_config, RuntimeNetwork, VmSpecInputs,
 };
 use crate::start_request::StartRequestPipe;
-use crate::state::new_instance_store;
+use crate::state::new_instance_store_with_backend;
 use protocol::v1::VmState;
 
 pub const ENV_STARTPIPE: &str = "_VM_STARTPIPE";
@@ -177,6 +177,7 @@ pub async fn init(
     })?;
     let guest_services_enabled = agent_enabled;
     let network = parse_network_args(network_args)?;
+    let selected_backend = resolve_backend(start_request.virt_backend.as_ref())?;
 
     tracing::info!(
         instance = %name,
@@ -221,9 +222,13 @@ pub async fn init(
                 crate::virt::HostMemoryReclaim::Off
             }
         },
+        selected_backend,
     })?;
-    let machine =
-        create_virtual_machine(start_request.virt_backend.as_ref(), machine_config.config)?;
+    let machine = create_virtual_machine(
+        selected_backend,
+        start_request.virt_backend.as_ref(),
+        machine_config.config,
+    )?;
     let serial_console = machine.serial();
     serial_console
         .add_sink(tokio::fs::File::from_std(serial_file))
@@ -239,10 +244,11 @@ pub async fn init(
         .map_err(|error| eyre::eyre!("invalid machine UUID {machine_id}: {error}"))?;
     let machine_run_id = uuid::Uuid::parse_str(machine_run_id)
         .map_err(|error| eyre::eyre!("invalid machine run UUID {machine_run_id}: {error}"))?;
-    let store = Arc::new(new_instance_store(
+    let store = Arc::new(new_instance_store_with_backend(
         machine_id.hyphenated().to_string(),
         name.to_string(),
         guest_services_enabled,
+        selected_backend.name().to_string(),
     ));
 
     store.set_vm_state(VmState::Starting, "vm starting")?;
@@ -293,39 +299,62 @@ pub async fn init(
 /// selection means the platform default. Selecting "mock" in a vmmon built
 /// without the mock-backend feature fails cleanly (surfaced on the syncpipe
 /// as a start failure).
-fn create_virtual_machine(
+fn resolve_backend(
     virt_backend: Option<&crate::start_request::VirtBackendRequest>,
-    config: crate::virt::VmConfig,
-) -> eyre::Result<VirtualMachine> {
-    match virt_backend {
-        None => Ok(VirtualMachine::new(config)?),
+) -> eyre::Result<crate::virt::BackendKind> {
+    let kind = match virt_backend {
+        None => crate::virt::BackendKind::default_for_host()?,
+        Some(backend) if backend.kind == "krun" => crate::virt::BackendKind::Krun,
+        Some(backend) if backend.kind == "vz" => crate::virt::BackendKind::Vz,
         Some(backend) if backend.kind == "mock" => {
             #[cfg(feature = "mock-backend")]
             {
-                let mut config = config;
-                if let Some(scenario) = backend.scenario.as_ref() {
-                    config.set_mock_scenario(scenario.clone());
-                }
-                Ok(VirtualMachine::with_backend(
-                    crate::virt::BackendKind::Mock,
-                    config,
-                )?)
+                crate::virt::BackendKind::Mock
             }
             #[cfg(not(feature = "mock-backend"))]
             {
-                let _ = config;
-                Err(crate::virt::VirtError::UnsupportedBackend {
+                return Err(crate::virt::VirtError::UnsupportedBackend {
                     kind: "mock",
                     reason: "vmmon was built without the mock-backend feature".to_string(),
                 }
-                .into())
+                .into());
             }
         }
-        Some(backend) => Err(eyre::eyre!(
-            "start request selected unknown virt backend {:?}",
-            backend.kind
-        )),
+        Some(backend) => {
+            return Err(eyre::eyre!(
+                "start request selected unknown virt backend {:?}",
+                backend.kind
+            ))
+        }
+    };
+    if !crate::virt::BackendKind::compiled().contains(&kind) {
+        return Err(crate::virt::VirtError::UnsupportedBackend {
+            kind: kind.name(),
+            reason: "backend is not compiled into this vmmon binary".to_string(),
+        }
+        .into());
     }
+    Ok(kind)
+}
+
+fn create_virtual_machine(
+    kind: crate::virt::BackendKind,
+    request: Option<&crate::start_request::VirtBackendRequest>,
+    config: crate::virt::VmConfig,
+) -> eyre::Result<VirtualMachine> {
+    #[cfg(feature = "mock-backend")]
+    let config = {
+        let mut config = config;
+        if kind == crate::virt::BackendKind::Mock {
+            if let Some(scenario) = request.and_then(|request| request.scenario.as_ref()) {
+                config.set_mock_scenario(scenario.clone());
+            }
+        }
+        config
+    };
+    #[cfg(not(feature = "mock-backend"))]
+    let _ = request;
+    Ok(VirtualMachine::with_backend(kind, config)?)
 }
 
 fn secure_machine_dir(path: &std::path::Path) -> eyre::Result<()> {

@@ -152,7 +152,7 @@ async fn ensure_system_machine_for_installation(
 struct SystemHardware {
     cpus: Option<u8>,
     memory_mib: Option<u32>,
-    rosetta: bool,
+    rosetta: Option<bool>,
 }
 
 impl SystemHardware {
@@ -161,9 +161,11 @@ impl SystemHardware {
         Self {
             cpus: hardware.and_then(|hardware| hardware.cpus),
             memory_mib: hardware.and_then(|hardware| hardware.memory),
-            rosetta: hardware
-                .and_then(|hardware| hardware.rosetta)
-                .unwrap_or(false),
+            rosetta: Some(
+                hardware
+                    .and_then(|hardware| hardware.rosetta)
+                    .unwrap_or(false),
+            ),
         }
     }
 
@@ -171,13 +173,19 @@ impl SystemHardware {
         Self {
             cpus: Some(config.cpus),
             memory_mib: u32::try_from(config.memory_bytes / (1024 * 1024)).ok(),
-            rosetta: config.rosetta,
+            rosetta: config.rosetta_explicit.then_some(config.rosetta),
         }
     }
 }
 
 fn hardware_matches(machine: &MachineData, config: &ResolvedSystemConfig) -> bool {
-    SystemHardware::of_machine(machine) == SystemHardware::of_config(config)
+    let current = SystemHardware::of_machine(machine);
+    let desired = SystemHardware::of_config(config);
+    current.cpus == desired.cpus
+        && current.memory_mib == desired.memory_mib
+        && desired
+            .rosetta
+            .is_none_or(|rosetta| current.rosetta == Some(rosetta))
 }
 
 /// Applies CPU, memory, and Rosetta settings to a stopped system machine so config or
@@ -190,7 +198,7 @@ async fn reconcile_system_hardware(
 ) -> eyre::Result<MachineData> {
     let current = SystemHardware::of_machine(&machine);
     let desired = SystemHardware::of_config(config);
-    if current == desired
+    if hardware_matches(&machine, config)
         || matches!(
             machine.status,
             MachineStatus::Running { .. }
@@ -207,8 +215,10 @@ async fn reconcile_system_hardware(
     if current.memory_mib != desired.memory_mib {
         update = update.memory(Memory::bytes(config.memory_bytes));
     }
-    if current.rosetta != desired.rosetta {
-        update = update.rosetta(config.rosetta);
+    if let Some(rosetta) = desired.rosetta {
+        if current.rosetta != Some(rosetta) {
+            update = update.rosetta(rosetta);
+        }
     }
     api.update_system_machine(&machine.id, update)
         .await
@@ -349,7 +359,7 @@ fn validate_machine(
 #[cfg(test)]
 mod tests {
     use crate::system::config::SystemConfig;
-    use crate::system::provision::validate_installation;
+    use crate::system::provision::{validate_installation, SystemHardware};
     use crate::system::record::InstallationRecord;
 
     #[test]
@@ -371,5 +381,43 @@ mod tests {
         let mut changed = resolved;
         changed.data_size_bytes += 1;
         assert!(validate_installation(&record, &changed).is_err());
+    }
+
+    #[test]
+    fn implicit_krun_rosetta_default_is_not_a_persisted_hardware_update() {
+        let home = tempfile::tempdir().expect("home");
+        let config: SystemConfig = serde_yaml_ng::from_str(
+            "version: '1'\nbackend: krun\nsystem:\n  image: registry.example/system@sha256:test\n",
+        )
+        .expect("config");
+        let resolved = config.resolve(home.path(), None).expect("resolve");
+
+        assert!(!resolved.rosetta);
+        assert_eq!(SystemHardware::of_config(&resolved).rosetta, None);
+    }
+
+    #[test]
+    fn old_persisted_true_rosetta_intent_remains_an_explicit_hardware_update() {
+        let config: crate::system::config::ResolvedSystemConfig =
+            serde_json::from_value(serde_json::json!({
+                "schema": 1,
+                "engine": "docker",
+                "image": "registry.example/system@sha256:test",
+                "cpus": 2,
+                "memory_bytes": 1073741824,
+                "root_size_bytes": 1073741824,
+                "data_size_bytes": 1073741824,
+                "shares": [],
+                "publish_bind": "any",
+                "compatibility_socket": "disabled",
+                "docker_socket": "/tmp/silo.sock",
+                "backend": "vz",
+                "rosetta": true,
+                "identity": "fnv1a64:test"
+            }))
+            .expect("old persisted config");
+
+        assert!(config.rosetta_explicit);
+        assert_eq!(SystemHardware::of_config(&config).rosetta, Some(true));
     }
 }

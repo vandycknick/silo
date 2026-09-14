@@ -36,7 +36,7 @@ impl VmmonHostMemoryReclaim {
     }
 }
 
-/// Explicit virtualization backend selection (testing only).
+/// Explicit virtualization backend selection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct VmmonVirtBackend {

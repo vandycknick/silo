@@ -449,7 +449,10 @@ fn validate(config: &VmConfig) -> Result<(), VirtError> {
         );
     }
     if config.vz().rosetta {
-        return invalid_config(config, "rosetta is not implemented for the krun backend");
+        return invalid_config(
+            config,
+            "rosetta is not supported on the krun backend yet\n\nhint: select the vz backend",
+        );
     }
     if config.nested_virtualization() {
         return invalid_config(
@@ -717,7 +720,7 @@ mod tests {
     use tokio::net::UnixStream;
 
     use super::{
-        read_connect_response, ConnectionRequest, KrunBackend, KrunVsockRegistry,
+        read_connect_response, validate, ConnectionRequest, KrunBackend, KrunVsockRegistry,
         MAX_VSOCK_LISTENERS, VSOCK_CONNECT_TIMEOUT,
     };
     use crate::virt::backend::VirtBackend;
@@ -739,6 +742,28 @@ mod tests {
     fn write_executable(path: &Path, contents: &str) {
         fs::write(path, contents).expect("write executable");
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("make executable");
+    }
+
+    #[test]
+    fn rosetta_rejection_names_the_vz_escape_hatch() {
+        let root = test_dir();
+        fs::create_dir_all(&root).expect("create test root");
+        let kernel = root.join("kernel");
+        fs::write(&kernel, b"kernel").expect("write kernel");
+        let config = VmConfig::builder("krun-rosetta")
+            .base_directory(&root)
+            .cpus(1)
+            .memory(128)
+            .kernel(kernel)
+            .rosetta(true)
+            .build();
+
+        let error = validate(&config).expect_err("reject Rosetta");
+        assert!(error
+            .to_string()
+            .contains("rosetta is not supported on the krun backend yet"));
+        assert!(error.to_string().contains("select the vz backend"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

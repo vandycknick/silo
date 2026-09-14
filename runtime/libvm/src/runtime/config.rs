@@ -49,7 +49,7 @@ pub struct RuntimeConfig {
     pub runtime_root: Option<PathBuf>,
     /// Portable runtime root bundled by an SDK frontend.
     pub bundled_runtime_root: Option<PathBuf>,
-    /// Testing-only override of vmmon's virtualization backend.
+    /// Explicit override of vmmon's virtualization backend.
     pub virt_backend: Option<VirtBackendOverride>,
     /// Per-VM host memory reclaim policy. Qualification still decides whether it is effective.
     pub host_memory_reclaim: HostMemoryReclaim,
@@ -66,13 +66,14 @@ pub enum HostMemoryReclaim {
     Auto,
 }
 
-/// Testing-only override of vmmon's virtualization backend.
-///
-/// Set via [`RuntimeConfig::with_mock_vmm`]; requires a vmmon binary built
-/// with its `mock-backend` feature (see the `test-utils` crate).
+/// Explicit override of vmmon's virtualization backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum VirtBackendOverride {
+    /// libkrun via the spawned krun helper.
+    Krun,
+    /// Apple Virtualization.framework.
+    Vz,
     /// vmmon's in-process mock backend: no real VM runs, the guest side is
     /// faked in-process. `scenario` is an absolute path to a scenario file
     /// scripting the mock's behavior; absent means the happy path.
@@ -104,7 +105,10 @@ impl RuntimeConfig {
     /// Creates the default local runtime configuration from the environment.
     pub fn from_env() -> Result<Self, LibVmError> {
         let _ = resolve_default_data_dir()?;
-        Ok(Self::default())
+        Ok(Self {
+            virt_backend: VirtBackendOverride::from_env()?,
+            ..Self::default()
+        })
     }
 
     /// Sets the local runtime root.
@@ -152,6 +156,12 @@ impl RuntimeConfig {
     /// Sets the per-VM host memory reclaim policy.
     pub fn with_host_memory_reclaim(mut self, policy: HostMemoryReclaim) -> Self {
         self.host_memory_reclaim = policy;
+        self
+    }
+
+    /// Selects the virtualization backend used for machines started by this runtime.
+    pub fn with_virt_backend(mut self, backend: VirtBackendOverride) -> Self {
+        self.virt_backend = Some(backend);
         self
     }
 
@@ -287,6 +297,35 @@ impl RuntimeConfig {
         match &self.run_root {
             PathChoice::Default => resolve_default_run_dir(),
             PathChoice::Explicit(path) => Ok(path.clone()),
+        }
+    }
+}
+
+impl VirtBackendOverride {
+    /// Reads the developer backend override from `SILO_VIRT_BACKEND`.
+    pub fn from_env() -> Result<Option<Self>, LibVmError> {
+        Self::from_env_value(std::env::var_os("SILO_VIRT_BACKEND"))
+    }
+
+    fn from_env_value(value: Option<std::ffi::OsString>) -> Result<Option<Self>, LibVmError> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let value = value
+            .into_string()
+            .map_err(|_| LibVmError::InvalidVirtBackendOverride {
+                value: "<non-UTF-8>".to_string(),
+            })?;
+        Self::parse_selection(&value).map(Some)
+    }
+
+    fn parse_selection(value: &str) -> Result<Self, LibVmError> {
+        match value {
+            "krun" => Ok(Self::Krun),
+            "vz" => Ok(Self::Vz),
+            _ => Err(LibVmError::InvalidVirtBackendOverride {
+                value: value.to_string(),
+            }),
         }
     }
 }
@@ -529,7 +568,59 @@ mod tests {
     use crate::paths::LocalRoots;
     use crate::store::models::MachineId;
     use crate::store::{ConfigStore, Store};
-    use crate::{LibVmError, Runtime, RuntimeConfig};
+    use crate::{LibVmError, Runtime, RuntimeConfig, VirtBackendOverride};
+
+    #[test]
+    fn backend_override_is_typed() {
+        let config = RuntimeConfig::default().with_virt_backend(VirtBackendOverride::Krun);
+        assert_eq!(config.virt_backend, Some(VirtBackendOverride::Krun));
+    }
+
+    #[test]
+    fn backend_override_parser_accepts_only_real_cli_backends() {
+        assert_eq!(
+            VirtBackendOverride::parse_selection("krun").expect("parse krun"),
+            VirtBackendOverride::Krun
+        );
+        assert_eq!(
+            VirtBackendOverride::parse_selection("vz").expect("parse VZ"),
+            VirtBackendOverride::Vz
+        );
+        assert!(VirtBackendOverride::parse_selection("mock").is_err());
+        assert!(VirtBackendOverride::parse_selection("").is_err());
+    }
+
+    #[test]
+    fn backend_override_environment_input_is_strict_without_global_mutation() {
+        assert_eq!(
+            VirtBackendOverride::from_env_value(Some("krun".into())).expect("parse krun"),
+            Some(VirtBackendOverride::Krun)
+        );
+        assert_eq!(
+            VirtBackendOverride::from_env_value(Some("vz".into())).expect("parse vz"),
+            Some(VirtBackendOverride::Vz)
+        );
+        assert!(VirtBackendOverride::from_env_value(Some("mock".into())).is_err());
+        assert!(VirtBackendOverride::from_env_value(Some("KRUN".into())).is_err());
+        assert_eq!(
+            VirtBackendOverride::from_env_value(None).expect("absent override"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backend_override_rejects_non_utf8_environment_input() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let error =
+            VirtBackendOverride::from_env_value(Some(std::ffi::OsString::from_vec(vec![0xff])))
+                .expect_err("reject non-UTF-8 override");
+        assert!(matches!(
+            error,
+            LibVmError::InvalidVirtBackendOverride { ref value } if value == "<non-UTF-8>"
+        ));
+    }
 
     fn complete_runtime_root(base: &std::path::Path) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;

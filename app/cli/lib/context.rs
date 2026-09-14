@@ -12,7 +12,28 @@ use crate::system::record::SystemPaths;
 pub struct Context {
     verbose: u8,
     config: Option<GlobalConfig>,
-    api: Option<AppApi>,
+    api: Option<CachedAppApi>,
+}
+
+#[derive(Debug)]
+struct CachedAppApi {
+    api: AppApi,
+    policy: CachedRuntimePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedRuntimePolicy {
+    virt_backend: Option<libvm::VirtBackendOverride>,
+    host_memory_reclaim: libvm::HostMemoryReclaim,
+}
+
+impl CachedRuntimePolicy {
+    fn from_config(config: &RuntimeConfig) -> Self {
+        Self {
+            virt_backend: config.virt_backend.clone(),
+            host_memory_reclaim: config.host_memory_reclaim,
+        }
+    }
 }
 
 impl Context {
@@ -39,26 +60,62 @@ impl Context {
     }
 
     pub(crate) async fn app_api(&mut self) -> eyre::Result<&mut AppApi> {
-        self.app_api_with_host_memory_reclaim(libvm::HostMemoryReclaim::Off)
-            .await
+        if self.api.is_none() {
+            let networking = self.config()?.networking.clone();
+            let runtime_config = RuntimeConfig::from_env()
+                .context("resolve libvm runtime config")?
+                .with_networking(networking);
+            self.api = Some(CachedAppApi {
+                policy: CachedRuntimePolicy::from_config(&runtime_config),
+                api: AppApi::local(runtime_config),
+            });
+        }
+        self.api
+            .as_mut()
+            .map(|cached| &mut cached.api)
+            .ok_or_else(|| eyre::eyre!("application API was not initialized"))
     }
 
     pub(crate) async fn app_api_with_host_memory_reclaim(
         &mut self,
         host_memory_reclaim: libvm::HostMemoryReclaim,
+        virt_backend: libvm::VirtBackendOverride,
     ) -> eyre::Result<&mut AppApi> {
-        if self.api.is_none() {
-            let networking = self.config()?.networking.clone();
-            let runtime_config = RuntimeConfig::from_env()
-                .context("resolve libvm runtime config")?
-                .with_networking(networking)
-                .with_host_memory_reclaim(host_memory_reclaim);
-            self.api = Some(AppApi::local(runtime_config));
+        let requested_policy = CachedRuntimePolicy {
+            virt_backend: Some(virt_backend.clone()),
+            host_memory_reclaim,
+        };
+        if let Some(cached) = self.api.as_ref() {
+            if cached.policy != requested_policy {
+                eyre::bail!(
+                    "the initialized runtime policy is incompatible with the daemon request: cached {:?}, requested {:?}",
+                    cached.policy,
+                    requested_policy
+                );
+            }
+        }
+        if self.api.is_some() {
+            return self
+                .api
+                .as_mut()
+                .map(|cached| &mut cached.api)
+                .ok_or_else(|| eyre::eyre!("application API was not initialized"));
         }
 
+        let networking = self.config()?.networking.clone();
+        let runtime_config = explicit_runtime_config(networking, host_memory_reclaim, virt_backend);
+        self.api = Some(CachedAppApi {
+            policy: requested_policy,
+            api: AppApi::local(runtime_config),
+        });
         self.api
             .as_mut()
+            .map(|cached| &mut cached.api)
             .ok_or_else(|| eyre::eyre!("application API was not initialized"))
+    }
+
+    pub(crate) fn virt_backend_override(&self) -> eyre::Result<Option<libvm::VirtBackendOverride>> {
+        libvm::VirtBackendOverride::from_env().map_err(Into::into)
     }
 
     pub(crate) fn resolve_machine_name(&mut self, name: Option<&str>) -> eyre::Result<String> {
@@ -126,5 +183,99 @@ impl Context {
             }
         }
         Ok((paths, resolved))
+    }
+}
+
+fn explicit_runtime_config(
+    networking: libvm::RuntimeNetworkingConfig,
+    host_memory_reclaim: libvm::HostMemoryReclaim,
+    virt_backend: libvm::VirtBackendOverride,
+) -> RuntimeConfig {
+    RuntimeConfig::default()
+        .with_networking(networking)
+        .with_host_memory_reclaim(host_memory_reclaim)
+        .with_virt_backend(virt_backend)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::AppApi;
+    use crate::context::{explicit_runtime_config, CachedAppApi, CachedRuntimePolicy, Context};
+
+    #[tokio::test]
+    async fn explicit_daemon_policy_rejects_incompatible_default_and_direct_env_caches() {
+        for cached_backend in [None, Some(libvm::VirtBackendOverride::Vz)] {
+            let mut runtime = libvm::RuntimeConfig::default();
+            runtime.virt_backend = cached_backend.clone();
+            let mut context = Context::new(0);
+            context.api = Some(CachedAppApi {
+                policy: CachedRuntimePolicy::from_config(&runtime),
+                api: AppApi::local(runtime),
+            });
+
+            let error = context
+                .app_api_with_host_memory_reclaim(
+                    libvm::HostMemoryReclaim::Auto,
+                    libvm::VirtBackendOverride::Krun,
+                )
+                .await
+                .expect_err("reject incompatible cached runtime");
+            assert!(error.to_string().contains("incompatible"));
+            assert_eq!(
+                context.api.as_ref().map(|cached| &cached.policy),
+                Some(&CachedRuntimePolicy {
+                    virt_backend: cached_backend,
+                    host_memory_reclaim: libvm::HostMemoryReclaim::Off,
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_daemon_policy_reuses_a_compatible_cached_runtime() {
+        let runtime = explicit_runtime_config(
+            libvm::RuntimeNetworkingConfig::default(),
+            libvm::HostMemoryReclaim::Auto,
+            libvm::VirtBackendOverride::Krun,
+        );
+        let mut context = Context::new(0);
+        context.api = Some(CachedAppApi {
+            policy: CachedRuntimePolicy::from_config(&runtime),
+            api: AppApi::local(runtime),
+        });
+
+        context
+            .app_api_with_host_memory_reclaim(
+                libvm::HostMemoryReclaim::Auto,
+                libvm::VirtBackendOverride::Krun,
+            )
+            .await
+            .expect("reuse compatible runtime");
+        context
+            .app_api()
+            .await
+            .expect("ordinary access reuses cache");
+    }
+
+    #[test]
+    fn explicit_daemon_config_preserves_default_roots_components_and_networking() {
+        let networking = libvm::RuntimeNetworkingConfig::default()
+            .with_netd(libvm::NetdRuntimeConfig::new().with_subnet("192.168.247.0/24"));
+        let runtime = explicit_runtime_config(
+            networking.clone(),
+            libvm::HostMemoryReclaim::Auto,
+            libvm::VirtBackendOverride::Krun,
+        );
+
+        assert_eq!(runtime.data_root, libvm::PathChoice::Default);
+        assert_eq!(runtime.state_root, libvm::PathChoice::Default);
+        assert_eq!(runtime.run_root, libvm::PathChoice::Default);
+        assert_eq!(runtime.image_root, libvm::PathChoice::Default);
+        assert_eq!(runtime.networking, networking);
+        assert!(runtime.vmmon_path.is_none());
+        assert!(runtime.netd_path.is_none());
+        assert!(runtime.krun_path.is_none());
+        assert_eq!(runtime.virt_backend, Some(libvm::VirtBackendOverride::Krun));
+        assert_eq!(runtime.host_memory_reclaim, libvm::HostMemoryReclaim::Auto);
     }
 }

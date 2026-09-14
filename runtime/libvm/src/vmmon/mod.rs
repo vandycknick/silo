@@ -59,9 +59,17 @@ impl Vmmon {
         &self.krun_path
     }
 
-    /// Testing-only backend selection forwarded in every start request.
+    /// Explicit backend selection forwarded in every start request.
     pub(crate) fn virt_backend_request(&self) -> Option<start_request::VmmonVirtBackend> {
         self.virt_backend.as_ref().map(|selection| match selection {
+            crate::runtime::VirtBackendOverride::Krun => start_request::VmmonVirtBackend {
+                kind: "krun".to_string(),
+                scenario: None,
+            },
+            crate::runtime::VirtBackendOverride::Vz => start_request::VmmonVirtBackend {
+                kind: "vz".to_string(),
+                scenario: None,
+            },
             crate::runtime::VirtBackendOverride::Mock { scenario } => {
                 start_request::VmmonVirtBackend {
                     kind: "mock".to_string(),
@@ -80,5 +88,30 @@ impl Vmmon {
 
     pub(crate) fn client(&self, machine_id: MachineId) -> VmmonClient {
         VmmonClient::new(self.paths.machine(machine_id).vmmon_socket_path())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::VirtBackendOverride;
+    use crate::vmmon::Vmmon;
+
+    #[test]
+    fn real_backend_requests_are_strictly_paired_without_mock_scenarios() {
+        for (selection, expected) in [
+            (VirtBackendOverride::Krun, "krun"),
+            (VirtBackendOverride::Vz, "vz"),
+        ] {
+            let vmmon = Vmmon::new(
+                crate::paths::LocalPaths::new("/tmp/silo-test"),
+                "/tmp/vmmon".into(),
+                "/tmp/krun".into(),
+                Some(selection),
+                crate::runtime::HostMemoryReclaim::Off,
+            );
+            let request = vmmon.virt_backend_request().expect("backend request");
+            assert_eq!(request.kind, expected);
+            assert!(request.scenario.is_none());
+        }
     }
 }

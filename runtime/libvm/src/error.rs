@@ -17,6 +17,9 @@ pub enum LibVmError {
     #[error("environment variable {name} must be an absolute path, got {path}")]
     RelativeEnvironmentPath { name: &'static str, path: PathBuf },
 
+    #[error("invalid SILO_VIRT_BACKEND value {value:?}; expected krun or vz")]
+    InvalidVirtBackendOverride { value: String },
+
     #[error("invalid Silo run root {path}: {message}")]
     InvalidRunRoot { path: PathBuf, message: String },
 
@@ -234,6 +237,7 @@ impl LibVmError {
             Self::StateDirUnavailable => "StateDirUnavailable",
             Self::ConfigDirUnavailable => "ConfigDirUnavailable",
             Self::RelativeEnvironmentPath { .. } => "RelativeEnvironmentPath",
+            Self::InvalidVirtBackendOverride { .. } => "InvalidVirtBackendOverride",
             Self::InvalidRunRoot { .. } => "InvalidRunRoot",
             Self::InvalidOwnedPath { .. } => "InvalidOwnedPath",
             Self::InvalidMachineName { .. } => "InvalidMachineName",

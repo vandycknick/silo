@@ -44,6 +44,9 @@ pub(crate) struct DaemonStatus {
     pub(crate) machine_id: Option<String>,
     pub(crate) run_id: Option<String>,
     pub(crate) image_digest: Option<String>,
+    /// Backend reported by the running vmmon instance.
+    #[serde(default)]
+    pub(crate) actual_backend: Option<String>,
     pub(crate) docker_socket: String,
     pub(crate) updated_at: String,
     pub(crate) last_error: Option<String>,
@@ -140,6 +143,7 @@ pub(crate) async fn serve(
         machine_id: None,
         run_id: None,
         image_digest: None,
+        actual_backend: None,
         docker_socket: config.docker_socket.display().to_string(),
         updated_at: now(),
         last_error: None,
@@ -325,6 +329,7 @@ async fn reconcile_ready(
         }
     };
     status.run_id = Some(run_id.to_string());
+    status.actual_backend = machine.metrics().await?.actual_backend;
     status.phase = DaemonPhase::WaitingGuest;
     publish(paths, status)?;
     let readiness = machine.wait_ready(READY_TIMEOUT).await?;
