@@ -8,6 +8,8 @@ const MAX_ENCODED_LEN: usize = 16_384;
 const MAX_HOST_ROOT_LEN: usize = 4_096;
 const DIGEST_LEN: usize = 32;
 const RESPONSE_LEN: usize = 1_024;
+pub(crate) const ENV_ROSETTA_CONFIG: &str = "SILO_ROSETTA_CONFIG";
+pub(crate) const ROSETTA_MOUNT_TAG: &str = "rosetta";
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -153,7 +155,7 @@ impl fmt::Debug for RosettaLaunchConfig {
         formatter
             .debug_struct("RosettaLaunchConfig")
             .field("profile", &self.profile)
-            .field("host_root", &self.host_root)
+            .field("host_root", &"<redacted>")
             .field("translator_sha256", &"<redacted>")
             .field("ioctl_result", &self.ioctl_result)
             .field("data", &self.data)
@@ -582,6 +584,7 @@ mod tests {
         .expect("valid config");
         let debug = format!("{value:?}");
         assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("/root"));
         assert!(!debug.contains(&"ab".repeat(RESPONSE_LEN)));
         assert!(!debug.contains(&"cd".repeat(DIGEST_LEN)));
     }

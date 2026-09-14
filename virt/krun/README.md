@@ -8,6 +8,7 @@ The crate exposes:
 - a `VirtualMachine` handle for lifecycle management
 - a `SerialConnection` wrapper for helper stdio access
 - typed disk, mount, network, and inherited-vsock configuration
+- typed Rosetta launch configuration transported only to the selected helper
 
 The `krun` binary is intentionally small. It parses Silo's flat helper arguments, configures libkrun directly, and then enters the VM. It does not use the library builder and does not expose subcommands. On Linux, `krun --check-host` runs the deeper KVM host check without starting a guest.
 
@@ -85,6 +86,27 @@ Planned follow-up scope includes:
 The optional `krun-bin` Cargo feature compiles the pinned libkrun fork directly into the helper executable. Building the launcher library alone does not activate or link libkrun, preserving the process boundary for `vmmon` and other callers.
 
 The helper uses a narrow private adapter over `VmmBuilder` and the native device constructors. It transfers owned network descriptors to libkrun, borrows console descriptors for the VMM lifetime, and rejects non-UTF-8 paths rather than changing them. The `ffi` feature and generated C exports stay disabled. The resulting runtime does not require `libkrun.so`, `libkrun.dylib`, or `libkrunfw`.
+
+Rosetta uses one `--rosetta` enable flag and a bounded versioned JSON value in
+`SILO_ROSETTA_CONFIG`. The launcher removes any ambient value from host checks
+and native helpers, and overwrites it only on the enabled helper command. The
+helper decodes it once before host admission or VMM construction and converts
+the owned fields into libkrun's immutable `RosettaFsDevice`. The value contains
+non-secret compatibility data, not credentials: process environments remain
+inspectable under normal OS permissions and may appear in external crash or
+environment dumps. Silo does not log the value, place it in argv, or promise to
+isolate subprocesses created independently by third-party code. The audited
+production `Command` boundary is limited to the launcher's host-admission and
+VM-helper children, both of which explicitly remove the ambient value. The
+helper and its enabled libkrun block, network, and filesystem paths currently
+create no runtime child processes; adding one requires an explicit
+`env_remove("SILO_ROSETTA_CONFIG")` at that command site.
+
+The E2BIG regression covers the process-backed builder path specifically: its
+host-admission child completes without the Rosetta value, then the intended
+helper exec exceeds the inherited argv/environment limit only after the valid
+bounded value is added. This verifies spawn-error propagation and cleanup; it
+does not launch or qualify a hypervisor, filesystem response, or translator.
 
 The adapter initializes libkrun's stderr logger at info level while honoring its standard environment filter, so startup qualification diagnostics are visible. `Vmm::run()` owns the event loop and returns `()` only after a fatal event-loop error. The helper converts that return into a controlled error so the process exits nonzero instead of falsely reporting a successful VM exit.
 

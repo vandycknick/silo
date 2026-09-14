@@ -6,7 +6,8 @@ use krun::{Disk, KrunConfig, Mount, Network};
 use libkrun::{
     init_log, BalloonDevice, BlockDevice, ConsoleDevice, DiskFormat, FsDevice, KernelFormat,
     LogLevel, LogOptions, LogStyle, MmioDeviceManager, NetDevice, NetFlags, Payload, RngDevice,
-    SyncMode, TsiFlags, VmmBuilder, VmmError, VsockDevice,
+    RosettaFsConfig, RosettaFsDevice, RosettaProfile, SyncMode, TsiFlags, VmmBuilder, VmmError,
+    VsockDevice,
 };
 use thiserror::Error;
 
@@ -73,6 +74,7 @@ enum DeviceKind {
     Console,
     Disk,
     Mount,
+    Rosetta,
     VsockMux,
     Vsock,
     Network,
@@ -85,6 +87,7 @@ enum DeviceConfig<'a> {
     Console,
     Disk(&'a Disk),
     Mount(&'a Mount),
+    Rosetta(&'a krun::RosettaLaunchConfig),
     VsockMux,
     Vsock(u64),
     Network(&'a Network),
@@ -99,6 +102,7 @@ impl DeviceConfig<'_> {
             Self::Console => DeviceKind::Console,
             Self::Disk(_) => DeviceKind::Disk,
             Self::Mount(_) => DeviceKind::Mount,
+            Self::Rosetta(_) => DeviceKind::Rosetta,
             Self::VsockMux => DeviceKind::VsockMux,
             Self::Vsock(_) => DeviceKind::Vsock,
             Self::Network(_) => DeviceKind::Network,
@@ -181,6 +185,9 @@ pub(crate) fn run(
                 }
                 .map_err(|source| libkrun_error("create filesystem device", source))?;
                 devices.add(device);
+            }
+            DeviceConfig::Rosetta(config) => {
+                devices.add(rosetta_device(config)?);
             }
             DeviceConfig::VsockMux => {
                 let fd = vsock_mux_fd.take().ok_or_else(|| {
@@ -329,6 +336,7 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
         usize::from(config.stdio_console)
             + config.disks.len()
             + config.mounts.len()
+            + usize::from(config.rosetta.is_some())
             + usize::from(config.vsock_mux)
             + usize::from(config.vsock_cid.is_some())
             + usize::from(!matches!(config.network, Network::None))
@@ -339,6 +347,9 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
     }
     devices.extend(config.disks.iter().map(DeviceConfig::Disk));
     devices.extend(config.mounts.iter().map(DeviceConfig::Mount));
+    if let Some(rosetta) = config.rosetta.as_ref() {
+        devices.push(DeviceConfig::Rosetta(rosetta));
+    }
     if config.vsock_mux {
         devices.push(DeviceConfig::VsockMux);
     }
@@ -351,6 +362,22 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
     devices.push(DeviceConfig::Rng);
     devices.push(DeviceConfig::Balloon(config.host_memory_reclaim));
     devices
+}
+
+fn rosetta_device(config: &krun::RosettaLaunchConfig) -> Result<RosettaFsDevice, Error> {
+    let profile = match config.profile() {
+        krun::RosettaProfileId::CapturedCompatibilityV1 => RosettaProfile::CapturedCompatibilityV1,
+    };
+    let config = RosettaFsConfig::new(
+        profile,
+        config.host_root().to_path_buf(),
+        config.translator_sha256(),
+        config.ioctl_result(),
+        config.data().as_bytes(),
+    )
+    .map_err(|source| libkrun_error("configure Rosetta filesystem", source))?;
+    RosettaFsDevice::new("rosetta", config)
+        .map_err(|source| libkrun_error("create Rosetta filesystem", source))
 }
 
 const GUEST_CID: u64 = 3;
@@ -399,12 +426,20 @@ fn libkrun_error(operation: &'static str, source: VmmError) -> Error {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use std::fs;
     use std::os::unix::ffi::OsStringExt;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use krun::{Disk, KrunConfig, Mount, NetUnixstream, Network};
+    use krun::{Disk, KrunConfig, Mount, NetUnixstream, Network, RosettaLaunchConfig};
     use libkrun::{KernelFormat, SyncMode};
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use crate::vmm::rosetta_device;
     use crate::vmm::{
         device_plan, disk_sync_mode, external_kernel_format, path_str, DeviceConfig, DeviceKind,
         Error, COMPAT_NET_FEATURES,
@@ -427,6 +462,40 @@ mod tests {
     #[test]
     fn compatibility_network_features_remain_stable() {
         assert_eq!(COMPAT_NET_FEATURES, 19_587);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn native_rosetta_adapter_verifies_the_immutable_source_digest() {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "silo-rosetta-adapter-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("create synthetic source root");
+        let root = fs::canonicalize(root).expect("resolve synthetic source root");
+        let translator = root.join("rosetta");
+        fs::write(&translator, b"synthetic executable").expect("write synthetic translator");
+        fs::set_permissions(&translator, fs::Permissions::from_mode(0o755))
+            .expect("make synthetic translator executable");
+        let digest = [
+            0xeb, 0x4f, 0xfe, 0x43, 0xc9, 0xed, 0xcf, 0x31, 0x0d, 0xc3, 0x51, 0x39, 0x98, 0xdf,
+            0x4f, 0xa1, 0x70, 0x0f, 0xc6, 0x57, 0x0c, 0x6c, 0x46, 0xe3, 0x2d, 0xd3, 0xaf, 0x9e,
+            0x02, 0x8f, 0xe7, 0x20,
+        ];
+        let valid = RosettaLaunchConfig::new(root.clone(), digest, 1, [0x5a; 1024])
+            .expect("valid launch config");
+        rosetta_device(&valid).expect("construct verified immutable device");
+
+        let mismatch = RosettaLaunchConfig::new(root.clone(), [0; 32], 1, [0x5a; 1024])
+            .expect("structurally valid mismatched config");
+        let error = match rosetta_device(&mismatch) {
+            Ok(_) => panic!("digest mismatch must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("translator digest mismatch"));
+        fs::remove_dir_all(root).expect("remove synthetic source root");
     }
 
     #[test]
@@ -456,6 +525,10 @@ mod tests {
                 peer_path: PathBuf::from("net.sock"),
                 mac: [0x02, 0, 0, 0, 0, 1],
             }),
+            rosetta: Some(
+                RosettaLaunchConfig::new(PathBuf::from("/synthetic/root"), [0; 32], 0, [0; 1024])
+                    .expect("valid synthetic Rosetta config"),
+            ),
             ..KrunConfig::default()
         };
         let config = KrunConfig {
@@ -467,6 +540,7 @@ mod tests {
             DeviceKind::Console,
             DeviceKind::Disk,
             DeviceKind::Mount,
+            DeviceKind::Rosetta,
             DeviceKind::VsockMux,
             DeviceKind::Network,
             DeviceKind::Rng,

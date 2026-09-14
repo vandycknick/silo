@@ -16,8 +16,10 @@ use crate::config::{validate_config, Disk, KrunConfig, Network};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::error::KrunBackendError;
 use crate::error::Result;
+use crate::rosetta::ENV_ROSETTA_CONFIG;
 use crate::serial::SerialConnection;
 use crate::vm::VirtualMachine;
+use crate::RosettaLaunchConfig;
 
 #[derive(Debug)]
 struct KrunSerialPty {
@@ -119,6 +121,11 @@ impl VirtualMachineBuilder {
         self
     }
 
+    pub fn rosetta(mut self, config: RosettaLaunchConfig) -> Self {
+        self.config.rosetta = Some(config);
+        self
+    }
+
     pub fn build(self) -> Result<KrunConfig> {
         validate_config(&self.config)?;
         Ok(self.config)
@@ -126,6 +133,17 @@ impl VirtualMachineBuilder {
 
     pub fn start(mut self) -> Result<VirtualMachine> {
         validate_config(&self.config)?;
+        let rosetta_config = self
+            .config
+            .rosetta
+            .as_ref()
+            .map(RosettaLaunchConfig::encode)
+            .transpose()
+            .map_err(|error| {
+                KrunBackendError::InvalidConfig(format!(
+                    "failed to serialize Rosetta configuration: {error}"
+                ))
+            })?;
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         check_krun_host(&self.krun_binary)?;
@@ -146,6 +164,7 @@ impl VirtualMachineBuilder {
             crate::watchdog::ENV_WATCHDOG_FD,
             crate::watchdog::fd_env_value(&watchdog_fd),
         );
+        configure_rosetta_environment(&mut command, rosetta_config.as_deref());
         let serial = if self.config.stdio_console {
             let serial_pty = open_krun_serial_pty()?;
             command
@@ -178,7 +197,9 @@ impl VirtualMachineBuilder {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn check_krun_host(binary: &std::path::Path) -> Result<()> {
-    let output = Command::new(binary)
+    let mut command = Command::new(binary);
+    configure_rosetta_environment(&mut command, None);
+    let output = command
         .arg("--check-host-basic")
         .stdin(Stdio::null())
         .output()?;
@@ -262,7 +283,17 @@ pub(crate) fn command_args(config: &KrunConfig, vsock_mux_fd: Option<&OwnedFd>) 
     if config.stdio_console {
         args.push("--stdio-console".into());
     }
+    if config.rosetta.is_some() {
+        args.push("--rosetta".into());
+    }
     args
+}
+
+fn configure_rosetta_environment(command: &mut Command, encoded: Option<&str>) {
+    command.env_remove(ENV_ROSETTA_CONFIG);
+    if let Some(encoded) = encoded {
+        command.env(ENV_ROSETTA_CONFIG, encoded);
+    }
 }
 
 fn install_child_fd_allowlist(
@@ -541,18 +572,92 @@ fn open_krun_serial_pty() -> io::Result<KrunSerialPty> {
 mod tests {
     use std::ffi::OsStr;
     use std::ffi::OsString;
+    use std::fs;
     use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use nix::libc;
 
-    use crate::{Disk, KrunConfig, VirtualMachineBuilder};
+    use crate::rosetta::ENV_ROSETTA_CONFIG;
+    use crate::{
+        Disk, KrunBackendError, KrunConfig, Mount, RosettaLaunchConfig, VirtualMachineBuilder,
+    };
 
     #[cfg(target_os = "macos")]
     use crate::builder::parse_darwin_fd_record;
     use crate::builder::{
-        command_args, format_command, install_child_fd_allowlist, normalize_child_fd,
+        command_args, configure_rosetta_environment, format_command, install_child_fd_allowlist,
+        normalize_child_fd,
     };
+
+    fn rosetta_config(byte: u8) -> RosettaLaunchConfig {
+        RosettaLaunchConfig::new(
+            PathBuf::from("/synthetic/translator/root"),
+            [byte; 32],
+            i32::from(byte),
+            [byte; 1024],
+        )
+        .expect("valid synthetic Rosetta config")
+    }
+
+    struct CaptureHelper {
+        root: PathBuf,
+        executable: PathBuf,
+        args: PathBuf,
+        environment: PathBuf,
+        host_check: PathBuf,
+    }
+
+    impl CaptureHelper {
+        fn new() -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+            let root = std::env::temp_dir().join(format!(
+                "silo-krun-rosetta-capture-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).expect("create capture fixture directory");
+            let executable = root.join("helper");
+            let args = root.join("args");
+            let environment = root.join("environment");
+            let host_check = root.join("host-check");
+            let script = format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"--check-host-basic\" ]; then\n\
+                   : > '{}'\n\
+                   test -z \"${{SILO_ROSETTA_CONFIG+x}}\" || exit 91\n\
+                   exit 0\n\
+                 fi\n\
+                 : > '{}'\n\
+                 for argument in \"$@\"; do printf '%s\\n' \"$argument\" >> '{}'; done\n\
+                 printf '%s' \"${{SILO_ROSETTA_CONFIG-}}\" > '{}'\n",
+                host_check.display(),
+                args.display(),
+                args.display(),
+                environment.display(),
+            );
+            fs::write(&executable, script).expect("write capture helper");
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+                .expect("make capture helper executable");
+            Self {
+                root,
+                executable,
+                args,
+                environment,
+                host_check,
+            }
+        }
+    }
+
+    impl Drop for CaptureHelper {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).expect("remove capture fixture directory");
+        }
+    }
 
     #[cfg(target_os = "macos")]
     fn darwin_dirent_bytes(name: &[u8]) -> Vec<u8> {
@@ -628,6 +733,248 @@ mod tests {
                 std::ffi::OsString::from("on"),
             ]
         }));
+    }
+
+    #[test]
+    fn rosetta_adds_only_the_enable_flag_to_argv() {
+        let rosetta = rosetta_config(7);
+        let encoded = rosetta.encode().expect("encode config");
+        let config = VirtualMachineBuilder::new("krun")
+            .kernel("/kernel")
+            .rosetta(rosetta)
+            .build()
+            .expect("config should be valid");
+
+        let args = command_args(&config, None);
+        assert_eq!(args.iter().filter(|arg| *arg == "--rosetta").count(), 1);
+        assert!(!args.iter().any(|arg| arg == OsStr::new(&encoded)));
+        assert!(!args.iter().any(|arg| {
+            arg.to_string_lossy().contains("translator_sha256")
+                || arg.to_string_lossy().contains("data_hex")
+        }));
+    }
+
+    #[test]
+    fn rosetta_rejects_a_colliding_user_mount() {
+        let error = VirtualMachineBuilder::new("krun")
+            .kernel("/kernel")
+            .mount(Mount {
+                tag: "rosetta".to_string(),
+                path: PathBuf::from("/another/share"),
+                read_only: true,
+            })
+            .rosetta(rosetta_config(1))
+            .build()
+            .expect_err("reserved mount tag must conflict");
+        assert!(error.to_string().contains("reserved for Rosetta"));
+    }
+
+    #[test]
+    fn command_environment_utility_overwrites_enabled_and_strips_disabled_values() {
+        let encoded = rosetta_config(9).encode().expect("encode config");
+        let mut enabled = Command::new("sh");
+        enabled
+            .args(["-c", "printf '%s' \"$SILO_ROSETTA_CONFIG\""])
+            .env(ENV_ROSETTA_CONFIG, "ambient-stale-value")
+            .stdout(Stdio::piped());
+        configure_rosetta_environment(&mut enabled, Some(&encoded));
+        let output = enabled.output().expect("run enabled child");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, encoded.as_bytes());
+
+        let mut disabled = Command::new("sh");
+        disabled
+            .args(["-c", "test -z \"${SILO_ROSETTA_CONFIG+x}\""])
+            .env(ENV_ROSETTA_CONFIG, "ambient-stale-value");
+        configure_rosetta_environment(&mut disabled, None);
+        assert!(disabled.status().expect("run disabled child").success());
+    }
+
+    #[test]
+    fn production_start_limits_rosetta_to_the_enabled_helper_environment() {
+        let fixture = CaptureHelper::new();
+        let rosetta = rosetta_config(11);
+        let encoded = rosetta.encode().expect("encode config");
+        let mut vm = VirtualMachineBuilder::new(&fixture.executable)
+            .kernel("/synthetic/kernel")
+            .rosetta(rosetta)
+            .start()
+            .expect("start capture helper");
+        assert!(vm.wait().expect("wait for capture helper").success());
+
+        assert!(fixture.host_check.exists());
+        assert_eq!(
+            fs::read(&fixture.environment).expect("read captured environment"),
+            encoded.as_bytes()
+        );
+        let args = fs::read_to_string(&fixture.args).expect("read captured argv");
+        assert_eq!(args.lines().filter(|arg| *arg == "--rosetta").count(), 1);
+        assert!(!args.contains(&encoded));
+        assert!(!args.contains("translator_sha256"));
+        assert!(!args.contains("data_hex"));
+    }
+
+    #[test]
+    fn production_start_strips_rosetta_from_native_and_host_check_children() {
+        let fixture = CaptureHelper::new();
+        let mut vm = VirtualMachineBuilder::new(&fixture.executable)
+            .kernel("/synthetic/kernel")
+            .start()
+            .expect("start native capture helper");
+        assert!(vm.wait().expect("wait for capture helper").success());
+
+        assert!(fixture.host_check.exists());
+        assert!(fs::read(&fixture.environment)
+            .expect("read captured environment")
+            .is_empty());
+        let args = fs::read_to_string(&fixture.args).expect("read captured argv");
+        assert!(!args.lines().any(|arg| arg == "--rosetta"));
+    }
+
+    #[test]
+    fn command_environment_utility_isolates_concurrent_real_children() {
+        let encoded = [
+            rosetta_config(3).encode().expect("encode first config"),
+            rosetta_config(5).encode().expect("encode second config"),
+        ];
+        std::thread::scope(|scope| {
+            let handles = encoded
+                .iter()
+                .map(|expected| {
+                    scope.spawn(move || {
+                        let mut command = Command::new("sh");
+                        command.args(["-c", "printf '%s' \"$SILO_ROSETTA_CONFIG\""]);
+                        configure_rosetta_environment(&mut command, Some(expected));
+                        command.output().expect("run capture child").stdout
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (handle, expected) in handles.into_iter().zip(&encoded) {
+                assert_eq!(
+                    handle.join().expect("join capture child"),
+                    expected.as_bytes()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn real_exec_reports_e2big_without_a_fallback_child() {
+        let mut command = Command::new("true");
+        configure_rosetta_environment(&mut command, None);
+        command.env("SILO_E2BIG_TEST", "x".repeat(8 * 1024 * 1024));
+        let error = command
+            .spawn()
+            .expect_err("oversized environment must fail exec");
+        assert_eq!(error.raw_os_error(), Some(libc::E2BIG));
+        assert!(!error.to_string().contains(&"x".repeat(1024)));
+    }
+
+    #[test]
+    fn builder_start_reports_e2big_from_the_intended_rosetta_helper() {
+        let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+        assert!(arg_max > 0, "ARG_MAX must be available");
+        let mut lower = usize::try_from(arg_max)
+            .expect("positive ARG_MAX")
+            .saturating_sub(128 * 1024);
+        let mut upper = usize::try_from(arg_max).expect("positive ARG_MAX") + 1;
+
+        while lower < upper {
+            let padding = lower + (upper - lower) / 2;
+            let mut command = Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .arg("--exact")
+                .arg("builder::tests::builder_start_e2big_fixture")
+                .arg("--ignored")
+                .env_clear()
+                .env("SILO_BUILDER_E2BIG_FIXTURE", "1");
+            add_bounded_padding_environment(&mut command, padding);
+
+            match command.output() {
+                Err(error) if error.raw_os_error() == Some(libc::E2BIG) => upper = padding,
+                Err(error) => panic!("failed to run E2BIG fixture: {error}"),
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    for marker in [
+                        rosetta_config(13).encode().expect("encode config"),
+                        "0d".repeat(64),
+                        "/synthetic/translator/root".to_string(),
+                        "translator_sha256".to_string(),
+                        "data_hex".to_string(),
+                    ] {
+                        assert!(!stdout.contains(&marker));
+                        assert!(!stderr.contains(&marker));
+                    }
+                    return;
+                }
+                Ok(output)
+                    if output_contains(&output, "SILO_BUILDER_E2BIG_HOST_CHECK") =>
+                {
+                    upper = padding;
+                }
+                Ok(output)
+                    if output_contains(&output, "SILO_BUILDER_E2BIG_TARGET_SPAWNED") =>
+                {
+                    lower = padding + 1;
+                }
+                Ok(output) => panic!(
+                    "E2BIG fixture failed outside the intended spawn path with {}: stdout={}; stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            }
+        }
+
+        panic!("could not isolate intended-helper E2BIG below the fixture exec limit");
+    }
+
+    fn add_bounded_padding_environment(command: &mut Command, bytes: usize) {
+        const CHUNK_LEN: usize = 16 * 1024;
+        let mut remaining = bytes;
+        let mut index = 0_u32;
+        while remaining > 0 {
+            let length = remaining.min(CHUNK_LEN);
+            command.env(format!("SILO_E2BIG_PADDING_{index:04}"), "x".repeat(length));
+            remaining -= length;
+            index += 1;
+        }
+    }
+
+    fn output_contains(output: &std::process::Output, expected: &str) -> bool {
+        String::from_utf8_lossy(&output.stdout).contains(expected)
+            || String::from_utf8_lossy(&output.stderr).contains(expected)
+    }
+
+    #[test]
+    #[ignore]
+    fn builder_start_e2big_fixture() {
+        if std::env::var_os("SILO_BUILDER_E2BIG_FIXTURE").is_none() {
+            return;
+        }
+
+        let fixture = CaptureHelper::new();
+        match VirtualMachineBuilder::new(&fixture.executable)
+            .kernel("/synthetic/kernel")
+            .rosetta(rosetta_config(13))
+            .start()
+        {
+            Err(KrunBackendError::Io(error)) if error.raw_os_error() == Some(libc::E2BIG) => {
+                if !fixture.host_check.exists() {
+                    panic!("SILO_BUILDER_E2BIG_HOST_CHECK");
+                }
+                assert!(
+                    !fixture.args.exists() && !fixture.environment.exists(),
+                    "the intended helper must not execute"
+                );
+            }
+            Err(error) => panic!("unexpected builder failure category: {error}"),
+            Ok(mut vm) => {
+                vm.wait().expect("reap unexpectedly spawned target");
+                panic!("SILO_BUILDER_E2BIG_TARGET_SPAWNED");
+            }
+        }
     }
 
     #[test]

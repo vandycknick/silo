@@ -5,7 +5,10 @@ use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
-use krun::{validate_config, KrunConfig, NetTap, NetUnixgram, NetUnixstream, Network, DEFAULT_ID};
+use krun::{
+    validate_config, KrunConfig, NetTap, NetUnixgram, NetUnixstream, Network, RosettaLaunchConfig,
+    DEFAULT_ID,
+};
 use nix::sys::socket::{setsockopt, sockopt};
 
 #[path = "krun/admission.rs"]
@@ -18,6 +21,7 @@ mod vmm;
 mod watchdog;
 
 const LOCAL_SOCKET_ID_LEN: usize = 12;
+const ENV_ROSETTA_CONFIG: &str = "SILO_ROSETTA_CONFIG";
 const DEFAULT_SOCKET_BUF_SIZE: usize = 7 * 1024 * 1024;
 const SOCKET_RCVBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
 
@@ -94,6 +98,9 @@ struct Cli {
     /// Request host memory reclaim after the startup qualification probe passes.
     #[arg(long, value_enum, default_value_t = HostMemoryReclaimArg::Off)]
     host_memory_reclaim: HostMemoryReclaimArg,
+    /// Attach the dedicated immutable Rosetta filesystem.
+    #[arg(long)]
+    rosetta: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -111,7 +118,10 @@ enum HostMemoryReclaimArg {
 }
 
 impl Cli {
-    fn into_launch(self) -> eyre::Result<(KrunConfig, Option<OwnedFd>)> {
+    fn into_launch(
+        self,
+        rosetta: Option<RosettaLaunchConfig>,
+    ) -> eyre::Result<(KrunConfig, Option<OwnedFd>)> {
         let network = self.network()?;
         reject_unused_network_args(
             &network,
@@ -139,6 +149,7 @@ impl Cli {
                 network,
                 stdio_console: self.stdio_console,
                 host_memory_reclaim: self.host_memory_reclaim == HostMemoryReclaimArg::On,
+                rosetta,
             },
             vsock_mux_fd,
         ))
@@ -220,6 +231,7 @@ fn reject_arg(present: bool, flag: &'static str, mode: &'static str) -> eyre::Re
 }
 
 fn main() -> eyre::Result<()> {
+    let rosetta_value = std::env::var_os(ENV_ROSETTA_CONFIG);
     let watchdog_fd = watchdog::take_from_env()?;
     let cli = Cli::parse();
     #[cfg(target_os = "linux")]
@@ -237,7 +249,6 @@ fn main() -> eyre::Result<()> {
             krun::check_host().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
             return Ok(());
         }
-        krun::check_host().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
     }
     #[cfg(target_os = "macos")]
     {
@@ -254,9 +265,14 @@ fn main() -> eyre::Result<()> {
                 .map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
             return Ok(());
         }
-        admission::check_hvf().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
     }
-    let (config, vsock_mux_fd) = cli.into_launch()?;
+    let rosetta = rosetta_from_environment(cli.rosetta, rosetta_value)?;
+    require_supported_rosetta_host(rosetta.as_ref())?;
+    #[cfg(target_os = "linux")]
+    krun::check_host().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
+    #[cfg(target_os = "macos")]
+    admission::check_hvf().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
+    let (config, vsock_mux_fd) = cli.into_launch(rosetta)?;
     validate_config(&config)?;
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -271,6 +287,40 @@ fn main() -> eyre::Result<()> {
             stderr: stderr.as_fd(),
         },
     )?;
+    Ok(())
+}
+
+fn rosetta_from_environment(
+    enabled: bool,
+    value: Option<std::ffi::OsString>,
+) -> eyre::Result<Option<RosettaLaunchConfig>> {
+    match (enabled, value) {
+        (false, None) => Ok(None),
+        (false, Some(_)) => {
+            eyre::bail!("{ENV_ROSETTA_CONFIG} requires --rosetta for a VM launch")
+        }
+        (true, None) => eyre::bail!("--rosetta requires {ENV_ROSETTA_CONFIG}"),
+        (true, Some(value)) => {
+            let value = value.to_str().ok_or_else(|| {
+                eyre::eyre!("{ENV_ROSETTA_CONFIG} is not a valid Rosetta configuration")
+            })?;
+            RosettaLaunchConfig::decode(value.as_bytes())
+                .map(Some)
+                .map_err(|error| eyre::eyre!("invalid {ENV_ROSETTA_CONFIG}: {error}"))
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn require_supported_rosetta_host(_: Option<&RosettaLaunchConfig>) -> eyre::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn require_supported_rosetta_host(config: Option<&RosettaLaunchConfig>) -> eyre::Result<()> {
+    if config.is_some() {
+        eyre::bail!("--rosetta is supported only on macOS aarch64 hosts");
+    }
     Ok(())
 }
 
@@ -398,7 +448,7 @@ mod tests {
             &raw.to_string(),
         ])
         .expect("mux argument should parse")
-        .into_launch()
+        .into_launch(None)
         .expect("mux argument should produce a launch");
 
         assert!(config.vsock_mux);
@@ -409,7 +459,7 @@ mod tests {
     fn parses_standalone_vsock_guest_cid() {
         let config = Cli::try_parse_from(["krun", "--kernel", "/kernel", "--vsock-cid", "3"])
             .expect("standalone vsock argument should parse")
-            .into_launch()
+            .into_launch(None)
             .map(|launch| launch.0)
             .expect("standalone vsock argument should produce a config");
 
@@ -420,13 +470,13 @@ mod tests {
     fn host_memory_reclaim_requires_an_explicit_on_value() {
         let default = Cli::try_parse_from(["krun", "--kernel", "/kernel"])
             .expect("default arguments should parse")
-            .into_launch()
+            .into_launch(None)
             .map(|launch| launch.0)
             .expect("default arguments should produce a config");
         let requested =
             Cli::try_parse_from(["krun", "--kernel", "/kernel", "--host-memory-reclaim=on"])
                 .expect("host reclaim argument should parse")
-                .into_launch()
+                .into_launch(None)
                 .map(|launch| launch.0)
                 .expect("host reclaim argument should produce a config");
 
