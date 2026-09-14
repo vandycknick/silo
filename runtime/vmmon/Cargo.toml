@@ -2,10 +2,15 @@
 name = "vmmon"
 version = "0.1.0"
 edition = "2021"
+default-run = "vmmon"
 
 [[bin]]
 name = "vmmon"
 path = "src/main.rs"
+
+[[bin]]
+name = "silo-rprobe-vz-harness"
+path = "src/bin/rprobe_vz_harness.rs"
 
 [features]
 # Compiles the in-process mock virtualization backend for tests. Never enabled
@@ -49,4 +54,5 @@ test-utils = { path = "../test-utils", optional = true }
 krun = { path = "../../virt/krun" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+rprobe = { path = "../../guest/rprobe" }
 vz = { path = "../../virt/vz" }

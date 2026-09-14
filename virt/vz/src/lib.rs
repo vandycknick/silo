@@ -16,5 +16,7 @@ pub use crate::configuration::{
     GenericMachineIdentifier, GenericPlatform, LinuxBootLoader, VirtualMachineConfiguration,
 };
 pub use crate::error::VzError;
-pub use crate::utils::{rosetta_availability, RosettaAvailability};
+pub use crate::utils::{
+    rosetta_availability, virtual_machine_limits, RosettaAvailability, VirtualMachineLimits,
+};
 pub use crate::vm::{VirtualMachine, VirtualMachineDelegate, VirtualMachineState};

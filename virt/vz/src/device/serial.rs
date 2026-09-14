@@ -32,13 +32,15 @@ unsafe impl Send for SerialPortConfiguration {}
 unsafe impl Sync for SerialPortConfiguration {}
 
 impl SerialPortConfiguration {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, VzError> {
         Self::virtio_console()
     }
 
-    pub fn virtio_console() -> Self {
-        let (guest_read, host_write) = pipe().expect("create serial input pipe");
-        let (host_read, guest_write) = pipe().expect("create serial output pipe");
+    pub fn virtio_console() -> Result<Self, VzError> {
+        let (guest_read, host_write) =
+            pipe().map_err(|err| VzError::Backend(format!("create serial input pipe: {err}")))?;
+        let (host_read, guest_write) =
+            pipe().map_err(|err| VzError::Backend(format!("create serial output pipe: {err}")))?;
 
         let inner = unsafe {
             let read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
@@ -62,11 +64,11 @@ impl SerialPortConfiguration {
             inner
         };
 
-        Self {
+        Ok(Self {
             inner,
             host_read: Arc::new(host_read),
             host_write: Arc::new(Mutex::new(Some(host_write))),
-        }
+        })
     }
 
     pub(crate) fn as_inner(&self) -> &VZSerialPortConfiguration {
@@ -85,12 +87,6 @@ impl SerialPortConfiguration {
             .map(std::fs::File::from)
             .ok_or_else(|| VzError::Backend("serial stream is already open".to_string()))?;
         SerialPortStream::new(output, input).map_err(VzError::from)
-    }
-}
-
-impl Default for SerialPortConfiguration {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

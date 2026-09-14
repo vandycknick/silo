@@ -152,6 +152,18 @@ impl Decoder {
         Ok(copied)
     }
 
+    pub const fn received_len(&self) -> usize {
+        self.received
+    }
+
+    pub const fn expected_len(&self) -> Option<usize> {
+        self.expected
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.error.is_none() && self.expected == Some(self.received)
+    }
+
     pub fn finish(&self) -> Result<Frame<'_>, FrameError> {
         if let Some(error) = self.error {
             return Err(error);
@@ -372,5 +384,19 @@ mod tests {
             }
         );
         assert!(decoded.payload.is_empty());
+    }
+
+    #[test]
+    fn expected_length_is_exposed_only_after_valid_header() {
+        let bytes = success(1);
+        let mut decoder = Decoder::new();
+        decoder.push(&bytes[..HEADER_LEN - 1]).unwrap();
+        assert_eq!(decoder.expected_len(), None);
+        assert!(!decoder.is_complete());
+        decoder.push(&bytes[HEADER_LEN - 1..HEADER_LEN]).unwrap();
+        assert_eq!(decoder.expected_len(), Some(SUCCESS_LEN));
+        assert_eq!(decoder.received_len(), HEADER_LEN);
+        decoder.push(&bytes[HEADER_LEN..]).unwrap();
+        assert!(decoder.is_complete());
     }
 }

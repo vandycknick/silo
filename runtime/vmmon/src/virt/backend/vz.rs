@@ -366,7 +366,7 @@ fn validate_support() -> Result<(), VirtError> {
 }
 
 fn build_vm(config: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguration), VirtError> {
-    let serial_port = SerialPortConfiguration::virtio_console();
+    let serial_port = SerialPortConfiguration::virtio_console().map_err(vz_error)?;
 
     let mut builder = VirtualMachine::builder()
         .map_err(vz_error)?
@@ -399,13 +399,15 @@ fn build_vm(config: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguratio
     for mount in config.mounts() {
         let shared_dir = SharedDirectory::new(mount.host_path.clone(), mount.read_only);
         let single_share = SingleDirectoryShare::new(shared_dir);
-        let mut fs_config = VirtioFileSystemDeviceConfiguration::new(mount.tag.clone());
+        let mut fs_config =
+            VirtioFileSystemDeviceConfiguration::new(mount.tag.clone()).map_err(vz_error)?;
         fs_config.set_share(single_share);
         builder = builder.add_directory_share(fs_config);
     }
 
     if config.vz().rosetta {
-        let mut rosetta_config = VirtioFileSystemDeviceConfiguration::new(SILO_ROSETTA_TAG);
+        let mut rosetta_config =
+            VirtioFileSystemDeviceConfiguration::new(SILO_ROSETTA_TAG).map_err(vz_error)?;
         rosetta_config.set_rosetta_share(LinuxRosettaDirectoryShare::new().map_err(vz_error)?);
         builder = builder.add_directory_share(rosetta_config);
     }
