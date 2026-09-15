@@ -6,7 +6,7 @@
 //! ([`SerialConsole`]), and vsock stream types shared by all backends.
 //!
 //! Backends implement the crate-private [`backend::VirtBackend`] trait:
-//! `krun` (libkrun via a helper process) on Linux, `vz`
+//! `krun` (libkrun via a helper process) on Linux and macOS, `vz`
 //! (Virtualization.framework) on macOS, and — behind the `mock-backend`
 //! feature — an in-process mock that fakes the guest side for tests.
 //! Selection is pinned per platform today ([`BackendKind::default_for_host`])

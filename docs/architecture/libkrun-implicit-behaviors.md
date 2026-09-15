@@ -21,7 +21,7 @@ The historical `krun_set_port_map()` API is intentionally not part of Silo's sta
 | --- | --- | --- | --- | --- |
 | Console device | Add `ConsoleDevice` | No console device | Added only for `--stdio-console`, then selected as `hvc0` | Applies on Linux and macOS |
 | Init binary | Select a payload | No injected init binary | Silo loads an external kernel and optional initramfs | Applies on Linux and macOS |
-| Vsock device | Add `VsockDevice` | No vsock device | Native CID 3 device with TSI disabled and an inherited control-channel fd | Same krun implementation on Linux and macOS; VZ remains the macOS default |
+| Vsock device | Add `VsockDevice` | No vsock device | Native CID 3 device with TSI disabled and an inherited control-channel fd | Same default krun implementation on Linux and macOS; VZ is an explicit macOS override |
 | RNG device | Add `RngDevice` | No RNG device | Always added explicitly | Applies on Linux and macOS |
 | Balloon device | Add `BalloonDevice` | No balloon device | Added explicitly; host reclaim is configured independently and remains qualification-gated | Applies on Linux and macOS |
 | TSI networking | Enable TSI flags on libkrun's built-in vsock device | No TSI fallback | Not used; the native vsock device has empty TSI flags and configured hosts may add explicit virtio-net | Applies on Linux and macOS |

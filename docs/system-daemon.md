@@ -13,7 +13,8 @@ or replace `/var/run/docker.sock`.
 ## Prerequisites
 
 - Linux amd64/arm64 with KVM, or supported Apple Silicon macOS with
-  Virtualization.framework.
+  Hypervisor.framework. Apple Virtualization.framework remains available as an
+  explicit backend.
 - A non-root login session with a systemd user manager on Linux or GUI launchd
   domain on macOS. Silo does not install a system service, enable lingering, or
   use a privileged helper.
@@ -31,7 +32,7 @@ equivalent `XDG_CONFIG_HOME` path):
 ```yaml
 daemon:
   version: "1"
-  backend: vz                    # experimental: krun | vz
+  backend: krun                  # optional; krun (default) | vz (macOS)
   system:
     image: ghcr.io/vandycknick/silo/system@sha256:<qualified-digest>
     resources:
@@ -70,17 +71,17 @@ promise that the same number of bytes were returned to the host.
 and run its per-VM host-reclaim qualification probe. A passing probe enables
 host reclaim for that VM; failed or inconclusive probes leave ordinary guest
 memory active. It defaults to `off` until the release, refault, and cost gates
-are complete. The current macOS default remains Virtualization.framework, so
-this setting does not change backend selection, vsock, native execution, or
-Rosetta intent. `daemon status` reports requested and observed effective state
-separately and never treats `auto` as proof that reclaim became effective.
+are complete. This setting does not change backend selection, vsock, native
+execution, or Rosetta intent. `daemon status` reports requested and observed
+effective state separately and never treats `auto` as proof that reclaim became
+effective.
 
 `backend` explicitly selects `krun` or Apple Virtualization.framework (`vz`).
-The macOS default remains `vz`. If the key is omitted, `SILO_VIRT_BACKEND=krun`
-or `SILO_VIRT_BACKEND=vz` on `silo daemon up` is copied into the resolved daemon
-registration, including login-item starts. An explicit `backend` key wins over
-that environment variable. The environment variable also selects the backend
-for direct CLI machine starts.
+The default is `krun` on Linux and macOS. If the key is omitted,
+`SILO_VIRT_BACKEND=krun` or `SILO_VIRT_BACKEND=vz` on `silo daemon up` is copied
+into the resolved daemon registration, including login-item starts. An explicit
+`backend` key wins over that environment variable. The environment variable
+also selects the backend for direct CLI machine starts.
 
 `rosetta` enables x86_64 container execution through Rosetta. Left unset, it is
 on for `vz` when the host is Apple silicon with Rosetta installed
@@ -89,8 +90,10 @@ on for `vz` when the host is Apple silicon with Rosetta installed
 `CapturedCompatibilityV1` path, currently restricted to host build `25G83` and
 a pinned unmodified translator digest. The captured baseline is not
 TSO-qualified and does not promise compatibility with later Apple releases.
-VZ remains the macOS default. The setting is applied to the system
-VM the next time the daemon starts it from stopped.
+The setting is applied to the system VM the next time the daemon starts it from
+stopped. Existing schema-1 resolved records that predate the persisted
+`backend` field retain their historical platform selection; create a new
+registration to adopt the current default.
 
 The home share is enabled read/write by default and appears at the same absolute
 path in the guest. Disable it if the engine must not access the host home.

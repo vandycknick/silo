@@ -12,9 +12,10 @@ The workspace dependency is pinned by full Git commit in the root
 
 ```text
 repository: https://github.com/vandycknick/libkrun.git
-tracked revision: ea84066ff3c8499a4aac5cdd3ec326aee0667e9b
+tracked revision: ff25952c0d94090add6f06d73737a37247cac18f
 public branch: silo/v2
 previous tip backup: backup/silo-v2-2026-09-15 @ 10b6f752ba8ea735c3d9edaa549599dcf3f98d18
+pre-split backup: backup/silo-v2-before-feature-split-2026-09-15 @ ea84066ff3c8499a4aac5cdd3ec326aee0667e9b
 fetchable: yes
 ```
 
@@ -23,7 +24,7 @@ or tag is useful for reviewing the fork, but neither replaces the immutable
 commit pin.
 
 The committed revision is reachable through the fork URL: a direct
-`git fetch https://github.com/vandycknick/libkrun.git ea84066ff3c8499a4aac5cdd3ec326aee0667e9b`
+`git fetch https://github.com/vandycknick/libkrun.git ff25952c0d94090add6f06d73737a37247cac18f`
 succeeds. Cargo therefore resolves the tracked pin directly from GitHub with no
 local checkout, path patch, URL rewrite, or alternate lockfile. The public
 `silo/v2` branch names the reviewable tip, while release reproducibility comes
@@ -99,8 +100,10 @@ The macOS krun Rosetta path is experimental. Its current
 `CapturedCompatibilityV1` profile accepts only host build `25G83` and the
 pinned unmodified translator digest, then captures the host response through a
 bounded VZ acquisition probe. This baseline is not TSO-qualified and makes no
-compatibility promise for later Apple releases. VZ remains the default macOS
-backend; selecting krun is explicit.
+compatibility promise for later Apple releases. New Linux and macOS
+configurations default to krun; VZ remains an explicit macOS override. Legacy
+resolved records that predate persisted backend selection retain their
+historical VZ selection on macOS.
 
 ## Updating libkrun
 

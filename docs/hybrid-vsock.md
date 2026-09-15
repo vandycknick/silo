@@ -25,8 +25,9 @@ messages cross that channel with one per-connection Unix stream descriptor
 passed by `SCM_RIGHTS`; payload bytes use the passed stream and never the
 control channel. This private transport creates no filesystem path and does not
 change the public registry, admission limits, listener discovery, stream
-relays, or lifecycle described below. The default macOS backend remains
-Virtualization.framework; krun is compiled there as an experimental backend.
+relays, or lifecycle described below. Krun is the default backend on Linux and
+macOS; Virtualization.framework remains available through an explicit `vz`
+selection on macOS.
 
 ## Host To Guest
 

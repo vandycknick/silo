@@ -122,19 +122,14 @@ impl BackendKind {
         }
     }
 
-    /// Today's pinned selection policy: krun on Linux, vz on macOS.
+    /// Today's pinned selection policy: krun on Linux and macOS.
     ///
     /// A future user-facing backend picker replaces callers of this with
     /// "user preference, validated against `compiled()` + `probe()`".
     pub fn default_for_host() -> Result<BackendKind, VirtError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             Ok(BackendKind::Krun)
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            Ok(BackendKind::Vz)
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -183,7 +178,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert_eq!(kind, BackendKind::Krun);
         #[cfg(target_os = "macos")]
-        assert_eq!(kind, BackendKind::Vz);
+        assert_eq!(kind, BackendKind::Krun);
     }
 
     #[test]

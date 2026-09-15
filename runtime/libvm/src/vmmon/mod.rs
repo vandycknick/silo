@@ -142,12 +142,12 @@ impl Vmmon {
             }
 
             match self.virt_backend.as_ref() {
-                Some(crate::runtime::VirtBackendOverride::Krun) => {
+                Some(crate::runtime::VirtBackendOverride::Krun) | None => {
                     Ok(start_request::VmmonRosettaIntent::KrunCaptured {
                         profile: start_request::VmmonRosettaProfile::CapturedCompatibilityV1,
                     })
                 }
-                Some(crate::runtime::VirtBackendOverride::Vz) | None => {
+                Some(crate::runtime::VirtBackendOverride::Vz) => {
                     Ok(start_request::VmmonRosettaIntent::VzNative)
                 }
                 Some(crate::runtime::VirtBackendOverride::Mock { .. }) => {
@@ -244,6 +244,29 @@ mod tests {
             vmmon
                 .rosetta_intent_request(&config)
                 .expect("default durable contract"),
+            VmmonRosettaIntent::KrunCaptured {
+                profile: VmmonRosettaProfile::CapturedCompatibilityV1
+            }
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn default_backend_uses_krun_rosetta_intent() {
+        use crate::vmmon::start_request::{VmmonRosettaIntent, VmmonRosettaProfile};
+
+        let vmmon = Vmmon::new(
+            crate::paths::LocalPaths::new("/tmp/silo-test"),
+            "/operator/vmmon".into(),
+            "/operator/krun".into(),
+            None,
+            crate::runtime::HostMemoryReclaim::Off,
+        );
+
+        assert_eq!(
+            vmmon
+                .rosetta_intent_request(&rosetta_machine_config())
+                .expect("default krun Rosetta intent"),
             VmmonRosettaIntent::KrunCaptured {
                 profile: VmmonRosettaProfile::CapturedCompatibilityV1
             }

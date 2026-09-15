@@ -37,6 +37,11 @@ impl SystemBackend {
     }
 
     fn default_for_host() -> Self {
+        Self::Krun
+    }
+
+    /// Preserve the meaning of schema-1 records written before `backend` was persisted.
+    fn legacy_record_default() -> Self {
         if cfg!(target_os = "macos") {
             Self::Vz
         } else {
@@ -256,7 +261,7 @@ pub(crate) struct ResolvedSystemConfig {
     pub(crate) publish_bind: PublishBind,
     pub(crate) compatibility_socket: CompatibilitySocket,
     pub(crate) docker_socket: PathBuf,
-    #[serde(default = "SystemBackend::default_for_host")]
+    #[serde(default = "SystemBackend::legacy_record_default")]
     pub(crate) backend: SystemBackend,
     #[serde(default)]
     pub(crate) rosetta: bool,
@@ -610,8 +615,35 @@ mod tests {
         assert_eq!(pinned.data_size_bytes, 64 << 30);
         assert_ne!(pinned.identity, resolved.identity);
         assert_eq!(resolved.compatibility_socket, CompatibilitySocket::Auto);
-        assert_eq!(resolved.backend, SystemBackend::default_for_host());
+        assert_eq!(resolved.backend, SystemBackend::Krun);
+        assert!(!resolved.rosetta);
+        assert!(!resolved.rosetta_explicit);
         assert!(resolved.identity.starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn legacy_resolved_config_without_backend_keeps_historical_platform_selection() {
+        let config: crate::system::config::ResolvedSystemConfig =
+            serde_json::from_value(serde_json::json!({
+                "schema": 1,
+                "engine": "docker",
+                "image": "registry.example/system@sha256:test",
+                "cpus": 2,
+                "memory_bytes": 1073741824,
+                "root_size_bytes": 1073741824,
+                "data_size_bytes": 1073741824,
+                "shares": [],
+                "publish_bind": "any",
+                "compatibility_socket": "disabled",
+                "docker_socket": "/tmp/silo.sock",
+                "rosetta": true,
+                "identity": "fnv1a64:test"
+            }))
+            .expect("legacy resolved config");
+
+        assert_eq!(config.backend, SystemBackend::legacy_record_default());
+        assert!(config.rosetta);
+        assert!(config.rosetta_explicit);
     }
 
     #[test]
