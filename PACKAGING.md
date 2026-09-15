@@ -60,6 +60,17 @@ sudo apt-get install build-essential binutils pkg-config
 Nix supplies the release build tools. These Ubuntu packages provide the native
 compiler, linker, archive, and `pkg-config` tools used through `/usr/bin`.
 
+On macOS, release builds require an upstream Go toolchain on `PATH`. The Nix Go
+package embeds Nix-store paths for runtime timezone, MIME, service, and protocol
+databases, so xtask skips it when selecting the release compiler. This also lets
+CI-provided toolchains such as `actions/setup-go` participate normally. If the
+upstream toolchain is not already on the release shell's `PATH`, prepend it when
+invoking the package command:
+
+```sh
+PATH="<upstream-go-bin>:$PATH" make archive
+```
+
 Packaging normally needs network access to fetch dependencies and the default
 kernel OCI artifact. See [Kernel Selection](#kernel-selection) for local and
 offline kernel options.

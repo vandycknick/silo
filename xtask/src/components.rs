@@ -276,7 +276,7 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         source,
     })?;
 
-    let go_program = release::tool("go")?;
+    let go_program = release::go_program(context.profile == Profile::Release)?;
     let (goos, goarch) = context.host.go_target();
     let mut go = Command::new(&go_program);
     go.current_dir(context.workspace_root.join("net/netd"))
@@ -284,7 +284,12 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         .env("GOOS", goos)
         .env("GOARCH", goarch)
         .args(["build", "-mod=readonly"]);
-    release::configure_command(&mut go, context.profile == Profile::Release)?;
+    release::configure_command(
+        &mut go,
+        context.profile == Profile::Release,
+        context.workspace_root,
+        context.target_dir,
+    )?;
     go.env("CARGO_TARGET_DIR", context.target_dir);
     context.profile.apply_go(&mut go);
     let output = output_dir.join("netd");
@@ -381,7 +386,12 @@ fn build_guest_init(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         "--target",
         context.host.guest_target().triple(),
     ]);
-    release::configure_guest_init_command(&mut cargo, context.profile == Profile::Release);
+    release::configure_guest_init_command(
+        &mut cargo,
+        context.profile == Profile::Release,
+        context.workspace_root,
+        context.target_dir,
+    );
     context.profile.apply_cargo(&mut cargo);
     command::run(cargo)?;
     Ok(())
@@ -408,7 +418,12 @@ fn build_rprobe(
                 "--target",
                 "aarch64-unknown-linux-musl",
             ]);
-            release::configure_guest_init_command(&mut cargo, context.profile == Profile::Release);
+            release::configure_guest_init_command(
+                &mut cargo,
+                context.profile == Profile::Release,
+                context.workspace_root,
+                context.target_dir,
+            );
             context.profile.apply_cargo(&mut cargo);
             command::run(cargo)?;
             context
@@ -486,7 +501,12 @@ fn cargo_command(context: &BuildContext<'_>) -> Result<Command, ComponentError> 
     cargo
         .current_dir(context.workspace_root)
         .env("CARGO_TARGET_DIR", context.target_dir);
-    release::configure_command(&mut cargo, context.profile == Profile::Release)?;
+    release::configure_command(
+        &mut cargo,
+        context.profile == Profile::Release,
+        context.workspace_root,
+        context.target_dir,
+    )?;
     cargo.env("CARGO_TARGET_DIR", context.target_dir);
     Ok(cargo)
 }

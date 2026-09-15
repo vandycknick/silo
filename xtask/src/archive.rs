@@ -273,7 +273,7 @@ fn actual_toolchains(syft: &Path) -> Result<BTreeMap<String, String>, ArchiveErr
     for (name, path, args) in [
         ("cargo", release::tool("cargo")?, vec!["--version"]),
         ("rustc", release::tool("rustc")?, vec!["--version"]),
-        ("go", release::tool("go")?, vec!["version"]),
+        ("go", release::go_program(true)?, vec!["version"]),
         ("zig", release::tool("zig")?, vec!["version"]),
         (
             "cargo-zigbuild",
