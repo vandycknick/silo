@@ -85,10 +85,12 @@ for direct CLI machine starts.
 `rosetta` enables x86_64 container execution through Rosetta. Left unset, it is
 on for `vz` when the host is Apple silicon with Rosetta installed
 (`softwareupdate --install-rosetta`) and off otherwise. It defaults off for
-`krun`, where Rosetta is not supported yet; explicit or previously persisted
-true intent is rejected with a hint to select `vz`, never silently disabled.
-The setting is applied to the system VM the next time the daemon starts it from
-stopped.
+`krun`. Explicitly enabling it with krun selects the experimental
+`CapturedCompatibilityV1` path, currently restricted to host build `25G83` and
+a pinned unmodified translator digest. The captured baseline is not
+TSO-qualified and does not promise compatibility with later Apple releases.
+VZ remains the macOS default. The setting is applied to the system
+VM the next time the daemon starts it from stopped.
 
 The home share is enabled read/write by default and appears at the same absolute
 path in the guest. Disable it if the engine must not access the host home.

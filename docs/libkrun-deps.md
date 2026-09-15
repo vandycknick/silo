@@ -12,9 +12,10 @@ The workspace dependency is pinned by full Git commit in the root
 
 ```text
 repository: https://github.com/vandycknick/libkrun.git
-tracked revision: 24d714b5dce8e8dd91afb9e0f64ebf6f3e1e846e
+tracked revision: ea84066ff3c8499a4aac5cdd3ec326aee0667e9b
+public branch: silo/v2
+previous tip backup: backup/silo-v2-2026-09-15 @ 10b6f752ba8ea735c3d9edaa549599dcf3f98d18
 fetchable: yes
-next revision: pending publication of the reviewed fork commits
 ```
 
 Release builds must use the committed `Cargo.lock` with `--locked`. A branch
@@ -22,17 +23,12 @@ or tag is useful for reviewing the fork, but neither replaces the immutable
 commit pin.
 
 The committed revision is reachable through the fork URL: a direct
-`git fetch https://github.com/vandycknick/libkrun.git 24d714b5dce8e8dd91afb9e0f64ebf6f3e1e846e`
+`git fetch https://github.com/vandycknick/libkrun.git ea84066ff3c8499a4aac5cdd3ec326aee0667e9b`
 succeeds. Cargo therefore resolves the tracked pin directly from GitHub with no
-path patch or URL rewrite.
-
-Development currently uses an untracked Cargo path override and development
-lockfile to test unpublished fork work, including the native vsock control
-channel. Those machine-local files must not be committed. The tracked revision
-and lockfile will move only after the fork commit is published and fetchable;
-until then, this development branch's helper requires the explicit local
-override. The tracked remote pin alone does not provide its new native APIs,
-and no remote `--locked` build success is claimed for this integration.
+local checkout, path patch, URL rewrite, or alternate lockfile. The public
+`silo/v2` branch names the reviewable tip, while release reproducibility comes
+from the immutable revision in `Cargo.toml` and `Cargo.lock`. The force update
+preserved the former public tip on `backup/silo-v2-2026-09-15`.
 
 The previous fork tip carried an x86_64 initrd placement patch and immediate
 Unix-vsock endpoint release. Upstream now contains its own initrd placement fix
@@ -98,6 +94,13 @@ On macOS,
 `otool -L` must not report `libkrun.dylib`. The macOS helper still uses
 Hypervisor.framework and must be signed with the
 `com.apple.security.hypervisor` entitlement before distribution.
+
+The macOS krun Rosetta path is experimental. Its current
+`CapturedCompatibilityV1` profile accepts only host build `25G83` and the
+pinned unmodified translator digest, then captures the host response through a
+bounded VZ acquisition probe. This baseline is not TSO-qualified and makes no
+compatibility promise for later Apple releases. VZ remains the default macOS
+backend; selecting krun is explicit.
 
 ## Updating libkrun
 
