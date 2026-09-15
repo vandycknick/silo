@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -131,23 +131,6 @@ impl ProcessSupervisor {
         let output = child.wait_with_output();
         drop(guard);
         output
-    }
-
-    pub(crate) fn status<I, S>(&self, program: &str, args: I) -> io::Result<ExitStatus>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let (mut child, guard) = self.spawn_child(&mut command, program)?;
-        let status = child.wait();
-        drop(guard);
-        status
     }
 }
 

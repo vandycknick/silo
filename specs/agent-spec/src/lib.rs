@@ -108,10 +108,10 @@ impl AgentConfig {
                 .provision
                 .mounts
                 .iter()
-                .any(|mount| mount.tag == ROSETTA_MOUNT_TAG)
+                .any(|mount| mount.tag == ROSETTA_MOUNT_TAG || mount.path == ROSETTA_MOUNT_PATH)
             {
                 return Err(AgentConfigError::new(format!(
-                    "mount tag {ROSETTA_MOUNT_TAG:?} is reserved for enabled rosetta"
+                    "mount tag {ROSETTA_MOUNT_TAG:?} and path {ROSETTA_MOUNT_PATH:?} are reserved for enabled rosetta"
                 )));
             }
         }
@@ -585,6 +585,22 @@ provision:
         });
 
         let error = config.validate().expect_err("reject reserved mount tag");
+        assert!(error.to_string().contains("reserved for enabled rosetta"));
+    }
+
+    #[test]
+    fn enabled_rosetta_reserves_its_mount_path_from_user_mounts() {
+        let mut config = AgentConfig::default();
+        config.provision.enabled = true;
+        config.provision.rosetta.enabled = true;
+        config.provision.mounts.push(MountConfig {
+            tag: "workspace".to_string(),
+            path: "/mnt/rosetta".to_string(),
+            fstype: "virtiofs".to_string(),
+            options: Vec::new(),
+        });
+
+        let error = config.validate().expect_err("reject reserved mount path");
         assert!(error.to_string().contains("reserved for enabled rosetta"));
     }
 
