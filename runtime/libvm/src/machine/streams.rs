@@ -367,6 +367,31 @@ pub struct MachineMetrics {
     pub actual_backend: Option<String>,
     pub monitor: MachineMonitorSnapshot,
     pub metrics: Option<MachineAgentMetricsObservation>,
+    /// Host memory reclaim state of the running VM, when the backend reports it.
+    pub host_memory_reclaim: Option<MachineHostMemoryReclaim>,
+}
+/// Host memory reclaim state as last reported by the VM backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineHostMemoryReclaim {
+    /// Whether the runtime asked the backend to release guest RAM to the host.
+    pub requested: bool,
+    /// Outcome of the backend's per-VM qualification probe.
+    pub qualification: MachineHostMemoryReclaimQualification,
+    /// True only while free-page reports are actually released to the host.
+    pub effective: bool,
+    pub released_bytes: u64,
+    pub released_extents: u64,
+    pub retried_faults: u64,
+    pub skipped_reports: u64,
+    pub failed_operations: u64,
+    pub observed_at: SystemTime,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineHostMemoryReclaimQualification {
+    NotRun,
+    Passed,
+    Failed,
+    Inconclusive,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct MachineAgentMetricsObservation {
@@ -1339,6 +1364,43 @@ impl TryFrom<v1::HostMetrics> for MachineMetrics {
             )?,
             monitor: required(value.monitor, "monitor")?.try_into()?,
             metrics: value.metrics.map(TryInto::try_into).transpose()?,
+            host_memory_reclaim: value
+                .host_memory_reclaim
+                .map(TryInto::try_into)
+                .transpose()?,
+        })
+    }
+}
+impl TryFrom<v1::HostMemoryReclaim> for MachineHostMemoryReclaim {
+    type Error = String;
+    fn try_from(value: v1::HostMemoryReclaim) -> Result<Self, Self::Error> {
+        let qualification = match required_text(
+            value.qualification,
+            "host_memory_reclaim.qualification",
+            protocol::MAX_INFO_BYTES,
+        )?
+        .as_str()
+        {
+            "not-run" => MachineHostMemoryReclaimQualification::NotRun,
+            "passed" => MachineHostMemoryReclaimQualification::Passed,
+            "failed" => MachineHostMemoryReclaimQualification::Failed,
+            "inconclusive" => MachineHostMemoryReclaimQualification::Inconclusive,
+            other => {
+                return Err(format!(
+                    "vmmon response has unknown host_memory_reclaim.qualification {other:?}"
+                ))
+            }
+        };
+        Ok(Self {
+            requested: required(value.requested, "host_memory_reclaim.requested")?,
+            qualification,
+            effective: required(value.effective, "host_memory_reclaim.effective")?,
+            released_bytes: value.released_bytes.unwrap_or_default(),
+            released_extents: value.released_extents.unwrap_or_default(),
+            retried_faults: value.retried_faults.unwrap_or_default(),
+            skipped_reports: value.skipped_reports.unwrap_or_default(),
+            failed_operations: value.failed_operations.unwrap_or_default(),
+            observed_at: timestamp(value.observed_at, "host_memory_reclaim.observed_at")?,
         })
     }
 }
@@ -1859,6 +1921,17 @@ mod tests {
             machine_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             name: Some("machine".to_string()),
             actual_backend: Some("krun".to_string()),
+            host_memory_reclaim: Some(v1::HostMemoryReclaim {
+                requested: Some(true),
+                qualification: Some("passed".to_string()),
+                effective: Some(true),
+                released_bytes: Some(4_194_304),
+                released_extents: Some(2),
+                retried_faults: Some(1),
+                skipped_reports: Some(0),
+                failed_operations: Some(0),
+                observed_at: Some(timestamp()),
+            }),
             monitor: Some(v1::MonitorSnapshot {
                 instance_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
                 observed_at: Some(timestamp()),
@@ -1922,6 +1995,15 @@ mod tests {
         })
         .expect("valid metrics");
         assert_eq!(metrics.actual_backend.as_deref(), Some("krun"));
+        let reclaim = metrics.host_memory_reclaim.expect("host memory reclaim");
+        assert!(reclaim.requested);
+        assert!(reclaim.effective);
+        assert_eq!(
+            reclaim.qualification,
+            MachineHostMemoryReclaimQualification::Passed
+        );
+        assert_eq!(reclaim.released_bytes, 4_194_304);
+        assert_eq!(reclaim.retried_faults, 1);
         let snapshot = metrics
             .metrics
             .map(|metrics| metrics.report.snapshot)
@@ -1941,6 +2023,7 @@ mod tests {
             machine_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             name: Some("machine".to_string()),
             actual_backend: None,
+            host_memory_reclaim: None,
             monitor: Some(v1::MonitorSnapshot {
                 instance_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
                 observed_at: Some(timestamp()),
@@ -1949,6 +2032,7 @@ mod tests {
         };
         let metrics = MachineMetrics::try_from(value.clone()).expect("old vmmon metrics");
         assert_eq!(metrics.actual_backend, None);
+        assert_eq!(metrics.host_memory_reclaim, None);
     }
     #[test]
     fn request_validation_rejects_invalid_values() {

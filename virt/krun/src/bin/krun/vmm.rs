@@ -66,7 +66,15 @@ pub(crate) enum Error {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[error("failed to spawn shutdown signal thread: {0}")]
     ShutdownThread(#[source] io::Error),
+
+    #[cfg(target_os = "macos")]
+    #[error("failed to spawn status reporter thread: {0}")]
+    StatusThread(#[source] io::Error),
 }
+
+/// How often the helper re-samples host memory reclaim for the status channel.
+#[cfg(target_os = "macos")]
+const STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +124,7 @@ pub(crate) fn run(
     config: &KrunConfig,
     mut vsock_mux_fd: Option<OwnedFd>,
     watchdog_fd: Option<OwnedFd>,
+    status_fd: Option<OwnedFd>,
     console_fds: ConsoleFds<'_>,
 ) -> Result<(), Error> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -123,13 +132,6 @@ pub(crate) fn run(
 
     init_log(None, LogLevel::Info, LogStyle::Auto, LogOptions::empty())
         .map_err(|source| libkrun_error("initialize logging", source))?;
-    if config.host_memory_reclaim {
-        eprintln!(
-            "host memory reclaim requested=on effective=pending; startup probe result follows"
-        );
-    } else {
-        eprintln!("host memory reclaim requested=off effective=off probe=not-run");
-    }
 
     let kernel = config.kernel.as_deref().ok_or(Error::MissingKernel)?;
     let cmdline = config.cmdline.join(" ");
@@ -288,6 +290,24 @@ pub(crate) fn run(
     let vmm = builder
         .build()
         .map_err(|source| libkrun_error("build VMM", source))?;
+    #[cfg(target_os = "macos")]
+    {
+        let handle = vmm
+            .handle()
+            .map_err(|source| libkrun_error("obtain VMM status handle", source))?;
+        let first = host_memory_reclaim_status(&handle);
+        eprintln!(
+            "host memory reclaim requested={} effective={} probe={}",
+            if first.requested { "on" } else { "off" },
+            if first.effective { "on" } else { "off" },
+            first.qualification.as_str()
+        );
+        if let Some(status_fd) = status_fd {
+            start_status_reporter(status_fd, handle)?;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    drop(status_fd);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         let handle = vmm
@@ -329,6 +349,55 @@ fn block_shutdown_signal() -> Result<SigSet, Error> {
         }
     })?;
     Ok(signals)
+}
+
+#[cfg(target_os = "macos")]
+fn host_memory_reclaim_status(handle: &libkrun::VmmHandle) -> krun::HostMemoryReclaimStatus {
+    use krun::HostMemoryReclaimQualification as Q;
+    use libkrun::HostReclaimQualification;
+
+    let status = handle.host_reclaim_status();
+    krun::HostMemoryReclaimStatus {
+        requested: status.requested,
+        qualification: match status.qualification {
+            HostReclaimQualification::NotRun => Q::NotRun,
+            HostReclaimQualification::Passed => Q::Passed,
+            HostReclaimQualification::Failed => Q::Failed,
+            HostReclaimQualification::Inconclusive => Q::Inconclusive,
+        },
+        effective: status.effective,
+        released_bytes: status.released_bytes,
+        released_extents: status.released_extents,
+        retried_faults: status.retried_faults,
+        skipped_reports: status.skipped_reports,
+        failed_operations: status.failed_operations,
+    }
+}
+
+/// Writes a status record immediately and then whenever the sampled state
+/// changes. Stops silently once the parent closes its end of the pipe.
+#[cfg(target_os = "macos")]
+fn start_status_reporter(status_fd: OwnedFd, handle: libkrun::VmmHandle) -> Result<(), Error> {
+    use std::io::Write as _;
+
+    std::thread::Builder::new()
+        .name("silo-krun-status".to_string())
+        .spawn(move || {
+            let mut channel = std::fs::File::from(status_fd);
+            let mut last = None;
+            loop {
+                let current = host_memory_reclaim_status(&handle);
+                if last != Some(current) {
+                    if channel.write_all(current.encode().as_bytes()).is_err() {
+                        return;
+                    }
+                    last = Some(current);
+                }
+                std::thread::sleep(STATUS_INTERVAL);
+            }
+        })
+        .map(drop)
+        .map_err(Error::StatusThread)
 }
 
 fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {

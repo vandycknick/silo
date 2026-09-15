@@ -241,31 +241,11 @@ impl DaemonStatusView {
                     .zip(status.memory_reclaim_at.as_deref())
                     .and_then(|(outcome, at)| {
                         let at = chrono::DateTime::parse_from_rfc3339(at).ok()?.timestamp();
-                        let outcome = match outcome {
-                            crate::system::supervisor::MemoryReclaimOutcome::Bounded => {
-                                "used bounded cgroup reclaim".to_string()
-                            }
-                            crate::system::supervisor::MemoryReclaimOutcome::Fallback => status
-                                .memory_reclaim_bounded_exit_code
-                                .map(|code| {
-                                    format!("used global fallback after bounded exit {code}")
-                                })
-                                .unwrap_or_else(|| "used global fallback".to_string()),
-                            crate::system::supervisor::MemoryReclaimOutcome::Failed => {
-                                "failed".to_string()
-                            }
-                        };
-                        let observed = status
-                            .memory_reclaim_observed_cache_delta_bytes
-                            .map(|bytes| {
-                                format!(
-                                    ", observed guest cache delta {}",
-                                    crate::ui::human_bytes(Some(bytes))
-                                )
-                            })
-                            .unwrap_or_default();
-                        Some(format!(
-                            "; last idle cache reclaim {outcome} {}{observed}",
+                        Some(format_guest_reclaim(
+                            status.memory_reclaim_trigger,
+                            outcome,
+                            status.memory_reclaim_bounded_exit_code,
+                            status.memory_reclaim_observed_cache_delta_bytes,
                             crate::ui::relative_time(at, crate::ui::now_unix()).to_lowercase(),
                         ))
                     })
@@ -279,6 +259,8 @@ impl DaemonStatusView {
                     format_host_memory_reclaim(
                         status.host_memory_reclaim_requested,
                         status.host_memory_reclaim_effective,
+                        status.host_memory_reclaim_qualification.as_deref(),
+                        status.host_memory_reclaim_released_bytes,
                     ),
                 ));
             }
@@ -307,14 +289,64 @@ fn format_actual_backend(backend: Option<&str>) -> &str {
     backend.unwrap_or("unknown")
 }
 
-fn format_host_memory_reclaim(requested: bool, effective: Option<bool>) -> String {
+/// One clause describing the last guest cache reclaim, for the Memory row.
+fn format_guest_reclaim(
+    trigger: Option<crate::system::supervisor::MemoryReclaimTrigger>,
+    outcome: crate::system::supervisor::MemoryReclaimOutcome,
+    bounded_exit_code: Option<u32>,
+    reclaimed_bytes: Option<u64>,
+    when: String,
+) -> String {
+    use crate::system::supervisor::{MemoryReclaimOutcome, MemoryReclaimTrigger};
+
+    let trigger = match trigger {
+        Some(MemoryReclaimTrigger::HostPressure) => "host memory pressure",
+        Some(MemoryReclaimTrigger::Idle) | None => "idle",
+    };
+    let outcome = match (outcome, bounded_exit_code) {
+        (MemoryReclaimOutcome::Bounded, None) => "used bounded cgroup reclaim".to_string(),
+        (MemoryReclaimOutcome::Bounded, Some(code)) => {
+            format!("used bounded cgroup reclaim, stopped early with exit {code}")
+        }
+        (MemoryReclaimOutcome::Fallback, _) => "used the global cache-drop fallback".to_string(),
+        (MemoryReclaimOutcome::Nothing, _) => "found nothing reclaimable".to_string(),
+        (MemoryReclaimOutcome::Failed, _) => "failed".to_string(),
+    };
+    let reclaimed = reclaimed_bytes
+        .filter(|_| outcome != "failed")
+        .map(|bytes| {
+            format!(
+                ", guest cache fell by {}",
+                crate::ui::human_bytes(Some(bytes))
+            )
+        })
+        .unwrap_or_default();
+    format!("; last cache reclaim ({trigger}) {outcome} {when}{reclaimed}")
+}
+
+fn format_host_memory_reclaim(
+    requested: bool,
+    effective: Option<bool>,
+    qualification: Option<&str>,
+    released_bytes: Option<u64>,
+) -> String {
     let requested = if requested { "auto" } else { "off" };
-    let effective = match effective {
+    let effective_text = match effective {
         Some(true) => "on",
         Some(false) => "off",
-        None => "unknown (see bounded VM diagnostics)",
+        None => "unknown (not yet reported by the VM backend)",
     };
-    format!("requested {requested}; effective {effective}")
+    let mut text = format!("requested {requested}; effective {effective_text}");
+    if let Some(qualification) = qualification {
+        text.push_str(&format!(" (probe {qualification})"));
+    }
+    if let (Some(_), Some(bytes)) = (effective, released_bytes) {
+        text.push_str(&format!(
+            "; {} released to host since VM start",
+            crate::ui::human_bytes(Some(bytes))
+        ));
+    }
+    text
 }
 
 async fn run_registered(path: std::path::PathBuf) -> eyre::Result<()> {
@@ -425,18 +457,74 @@ mod tests {
             (
                 false,
                 None,
-                "requested off; effective unknown (see bounded VM diagnostics)",
+                "requested off; effective unknown (not yet reported by the VM backend)",
             ),
             (true, Some(false), "requested auto; effective off"),
             (true, Some(true), "requested auto; effective on"),
             (
                 true,
                 None,
-                "requested auto; effective unknown (see bounded VM diagnostics)",
+                "requested auto; effective unknown (not yet reported by the VM backend)",
             ),
         ] {
-            assert_eq!(format_host_memory_reclaim(requested, effective), expected);
+            assert_eq!(
+                format_host_memory_reclaim(requested, effective, None, None),
+                expected
+            );
         }
+    }
+
+    #[test]
+    fn host_memory_reclaim_status_appends_probe_and_released_bytes_once_reported() {
+        assert_eq!(
+            format_host_memory_reclaim(true, Some(true), Some("passed"), Some(6 * 1024 * 1024)),
+            "requested auto; effective on (probe passed); 6MiB released to host since VM start"
+        );
+        assert_eq!(
+            format_host_memory_reclaim(true, Some(false), Some("failed"), Some(0)),
+            "requested auto; effective off (probe failed); 0B released to host since VM start"
+        );
+        // Counters are only meaningful alongside a reported effective state.
+        assert_eq!(
+            format_host_memory_reclaim(true, None, None, Some(10)),
+            "requested auto; effective unknown (not yet reported by the VM backend)"
+        );
+    }
+
+    #[test]
+    fn guest_reclaim_clause_names_trigger_outcome_and_measured_delta() {
+        use crate::system::supervisor::{MemoryReclaimOutcome, MemoryReclaimTrigger};
+
+        assert_eq!(
+            super::format_guest_reclaim(
+                Some(MemoryReclaimTrigger::HostPressure),
+                MemoryReclaimOutcome::Bounded,
+                Some(1),
+                Some(512 * 1024 * 1024),
+                "2 minutes ago".to_string(),
+            ),
+            "; last cache reclaim (host memory pressure) used bounded cgroup reclaim, stopped early with exit 1 2 minutes ago, guest cache fell by 512MiB"
+        );
+        assert_eq!(
+            super::format_guest_reclaim(
+                None,
+                MemoryReclaimOutcome::Failed,
+                None,
+                Some(7),
+                "just now".to_string(),
+            ),
+            "; last cache reclaim (idle) failed just now"
+        );
+        assert_eq!(
+            super::format_guest_reclaim(
+                Some(MemoryReclaimTrigger::Idle),
+                MemoryReclaimOutcome::Nothing,
+                None,
+                Some(0),
+                "just now".to_string(),
+            ),
+            "; last cache reclaim (idle) found nothing reclaimable just now, guest cache fell by 0B"
+        );
     }
 
     #[test]

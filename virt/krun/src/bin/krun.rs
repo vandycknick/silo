@@ -15,6 +15,8 @@ use nix::sys::socket::{setsockopt, sockopt};
 mod admission;
 #[path = "../internal/parse.rs"]
 mod parse;
+#[path = "../status.rs"]
+mod status;
 #[path = "krun/vmm.rs"]
 mod vmm;
 #[path = "../watchdog.rs"]
@@ -233,6 +235,7 @@ fn reject_arg(present: bool, flag: &'static str, mode: &'static str) -> eyre::Re
 fn main() -> eyre::Result<()> {
     let rosetta_value = std::env::var_os(ENV_ROSETTA_CONFIG);
     let watchdog_fd = watchdog::take_from_env()?;
+    let status_fd = status::take_from_env()?;
     let cli = Cli::parse();
     #[cfg(target_os = "linux")]
     {
@@ -281,6 +284,7 @@ fn main() -> eyre::Result<()> {
         &config,
         vsock_mux_fd,
         watchdog_fd,
+        status_fd,
         vmm::ConsoleFds {
             stdin: stdin.as_fd(),
             stdout: stdout.as_fd(),
@@ -328,9 +332,10 @@ fn start_enter(
     config: &KrunConfig,
     vsock_mux_fd: Option<OwnedFd>,
     watchdog_fd: Option<OwnedFd>,
+    status_fd: Option<OwnedFd>,
     console_fds: vmm::ConsoleFds<'_>,
 ) -> eyre::Result<()> {
-    vmm::run(config, vsock_mux_fd, watchdog_fd, console_fds)?;
+    vmm::run(config, vsock_mux_fd, watchdog_fd, status_fd, console_fds)?;
     Ok(())
 }
 

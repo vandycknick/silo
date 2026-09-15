@@ -17,7 +17,7 @@ use crate::machine::{
     machine_identifier_path_from_dir, vm_spec_machine_config, RuntimeNetwork, VmSpecInputs,
 };
 use crate::start_request::StartRequestPipe;
-use crate::state::new_instance_store_with_backend;
+use crate::state::{new_instance_store_with_backend, InstanceStore};
 use protocol::v1::VmState;
 
 pub const ENV_STARTPIPE: &str = "_VM_STARTPIPE";
@@ -376,6 +376,7 @@ pub async fn init(
         None => None,
     };
     forwards.activate(machine.clone());
+    publish_host_memory_reclaim(&machine, &store);
     if let Err(error) = store.set_vm_state(VmState::Running, "vm running") {
         drop(vsock_surface);
         return Err(cleanup_primary_start_failure(&machine, &forwards, error.into()).await);
@@ -684,6 +685,39 @@ pub(crate) fn set_cloexec(fd: RawFd, enabled: bool) -> io::Result<()> {
     nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_SETFD(fd_flags))
         .map_err(io::Error::other)?;
     Ok(())
+}
+
+/// Mirrors the backend's host memory reclaim reports into the instance store so
+/// `GetMetrics` callers see them. Ends when the backend drops its sender.
+fn publish_host_memory_reclaim(machine: &VirtualMachine, store: &Arc<InstanceStore>) {
+    let Some(mut updates) = machine.host_memory_reclaim_updates() else {
+        return;
+    };
+    let store = Arc::clone(store);
+    tokio::spawn(async move {
+        loop {
+            let report = *updates.borrow_and_update();
+            if let Some(report) = report {
+                let proto = protocol::v1::HostMemoryReclaim {
+                    requested: Some(report.requested),
+                    qualification: Some(report.qualification.to_string()),
+                    effective: Some(report.effective),
+                    released_bytes: Some(report.released_bytes),
+                    released_extents: Some(report.released_extents),
+                    retried_faults: Some(report.retried_faults),
+                    skipped_reports: Some(report.skipped_reports),
+                    failed_operations: Some(report.failed_operations),
+                    observed_at: Some(prost_types::Timestamp::from(report.observed_at)),
+                };
+                if let Err(error) = store.set_host_memory_reclaim(proto) {
+                    tracing::warn!(error = %error, "failed to record host memory reclaim report");
+                }
+            }
+            if updates.changed().await.is_err() {
+                break;
+            }
+        }
+    });
 }
 
 #[cfg(test)]

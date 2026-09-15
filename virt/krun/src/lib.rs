@@ -9,6 +9,7 @@ mod error;
 mod host;
 mod rosetta;
 mod serial;
+mod status;
 mod vm;
 mod watchdog;
 
@@ -26,4 +27,5 @@ pub use crate::rosetta::{
     CapturedResponse, RosettaConfigError, RosettaLaunchConfig, RosettaProfileId,
 };
 pub use crate::serial::SerialConnection;
+pub use crate::status::{HostMemoryReclaimQualification, HostMemoryReclaimStatus};
 pub use crate::vm::VirtualMachine;

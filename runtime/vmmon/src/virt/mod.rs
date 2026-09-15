@@ -26,6 +26,7 @@ mod machine;
 mod serial;
 mod stream;
 
+pub use backend::HostMemoryReclaimReport;
 pub use backend::{Availability, BackendKind};
 pub(crate) use capacity::VsockLease;
 pub use config::{

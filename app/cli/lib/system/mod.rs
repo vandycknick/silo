@@ -1,5 +1,6 @@
 pub(crate) mod config;
 pub(crate) mod docker;
+pub(crate) mod host_pressure;
 pub(crate) mod ownership;
 pub(crate) mod provision;
 pub(crate) mod record;

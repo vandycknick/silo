@@ -58,20 +58,27 @@ daemon:
 page cache, and the host keeps every page the guest has touched, so a busy
 engine's host footprint grows toward `memory` and stays there while idle.
 
-`memory-reclaim: auto` enables an experimental idle reclaim modelled on WSL2's
-`autoMemoryReclaim`: after the guest has been idle for `memory-reclaim-after`
-it asks the guest's cgroup v2 controller to reclaim the currently observed
-cached bytes. If bounded cgroup reclaim is unavailable or incomplete, including
-an `EAGAIN` partial reclaim, it falls back to a synchronized guest-wide cache
-drop. It is off by default until both branches have passed the guest workload
-gates. This setting controls guest cache cleanup only; it does not report or
-promise that the same number of bytes were returned to the host.
+`memory-reclaim: auto` enables an experimental guest cache reclaim modelled on
+WSL2's `autoMemoryReclaim`. It runs after the guest has been idle for
+`memory-reclaim-after`, and immediately (at most every 30 seconds) whenever
+macOS reports warning or critical memory pressure. The guest computes its own
+reclaimable target from `/proc/meminfo` (page cache minus shmem, plus
+reclaimable slab) and asks the cgroup v2 root `memory.reclaim` for it in
+chunks, so a partially satisfied request keeps its progress instead of failing.
+The guest-wide cache drop is only used on kernels without `memory.reclaim`.
+`daemon status` shows the trigger, the outcome, and how far the guest's cached
+memory fell. It is off by default. This setting controls guest cache cleanup
+only; freed guest pages reach the host through the balloon's free-page
+reporting when `host-memory-reclaim` is effective.
 
 `host-memory-reclaim: auto` separately asks the krun helper to attach a balloon
 and run its per-VM host-reclaim qualification probe. A passing probe enables
 host reclaim for that VM; failed or inconclusive probes leave ordinary guest
 memory active. Releases remap the range immediately so guest refaults stay
-in-kernel; it still defaults to `off` while that path is validated in the field. This setting does not change backend selection, vsock, native
+in-kernel; it still defaults to `off` while that path is validated in the field.
+The krun helper reports the probe outcome, the effective state, and the bytes
+released so far over a status pipe, and `daemon status` shows them on the
+`Host memory reclaim` row. This setting does not change backend selection, vsock, native
 execution, or Rosetta intent. `daemon status` reports requested and observed
 effective state separately and never treats `auto` as proof that reclaim became
 effective.

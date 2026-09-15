@@ -1,3 +1,4 @@
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::process::{Child, ExitStatus};
 
@@ -12,6 +13,7 @@ pub struct VirtualMachine {
     krun_binary: PathBuf,
     config: KrunConfig,
     serial: Option<SerialConnection>,
+    status_fd: Option<OwnedFd>,
     _watchdog_keepalive: Option<Keepalive>,
 }
 
@@ -21,6 +23,7 @@ impl VirtualMachine {
         krun_binary: PathBuf,
         config: KrunConfig,
         serial: Option<SerialConnection>,
+        status_fd: Option<OwnedFd>,
         watchdog_keepalive: Option<Keepalive>,
     ) -> Self {
         Self {
@@ -28,8 +31,15 @@ impl VirtualMachine {
             krun_binary,
             config,
             serial,
+            status_fd,
             _watchdog_keepalive: watchdog_keepalive,
         }
+    }
+
+    /// Read end of the helper's status channel: newline-delimited records that
+    /// [`crate::HostMemoryReclaimStatus::parse`] decodes. Available once.
+    pub fn take_status_fd(&mut self) -> Option<OwnedFd> {
+        self.status_fd.take()
     }
 
     pub fn krun_binary(&self) -> &PathBuf {
@@ -111,7 +121,14 @@ mod tests {
     #[test]
     fn serial_errors_when_stdio_console_is_disabled() {
         let child = Command::new("true").spawn().expect("spawn true");
-        let mut vm = VirtualMachine::new(child, "krun".into(), KrunConfig::default(), None, None);
+        let mut vm = VirtualMachine::new(
+            child,
+            "krun".into(),
+            KrunConfig::default(),
+            None,
+            None,
+            None,
+        );
 
         let err = vm.serial().expect_err("serial should be disabled");
 
@@ -136,6 +153,7 @@ mod tests {
             config,
             Some(SerialConnection::new(read, write)),
             None,
+            None,
         );
 
         let _serial = vm.serial().expect("serial should be configured");
@@ -159,7 +177,14 @@ mod tests {
             .read_line(&mut ready)
             .expect("read child readiness");
         assert_eq!(ready.trim(), "ready");
-        let mut vm = VirtualMachine::new(child, "krun".into(), KrunConfig::default(), None, None);
+        let mut vm = VirtualMachine::new(
+            child,
+            "krun".into(),
+            KrunConfig::default(),
+            None,
+            None,
+            None,
+        );
 
         vm.shutdown().expect("request graceful shutdown");
         let status = wait_for_exit(&mut vm, Duration::from_secs(2));
@@ -177,7 +202,14 @@ mod tests {
             .stdout(Stdio::null())
             .spawn()
             .expect("spawn TERM-resistant child");
-        let mut vm = VirtualMachine::new(child, "krun".into(), KrunConfig::default(), None, None);
+        let mut vm = VirtualMachine::new(
+            child,
+            "krun".into(),
+            KrunConfig::default(),
+            None,
+            None,
+            None,
+        );
 
         vm.kill().expect("force child exit");
         let status = wait_for_exit(&mut vm, Duration::from_secs(2));

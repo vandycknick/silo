@@ -10,20 +10,20 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use krun::{
     Disk as KrunDisk, KrunBackendError, Mount as KrunMount, NetUnixgram as KrunNetUnixgram,
     VirtualMachine, VirtualMachineBuilder,
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, timeout, timeout_at};
 
-use crate::virt::backend::VirtBackend;
+use crate::virt::backend::{HostMemoryReclaimReport, VirtBackend};
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission, MAX_ACTIVE_VSOCK_CONNECTIONS};
 use crate::virt::config::{validate_common, DiskImage, NetworkMode, SharedDirectory, VmConfig};
 use crate::virt::error::VirtError;
@@ -45,6 +45,7 @@ pub(crate) struct KrunBackend {
     exit: Arc<Mutex<Option<VmExit>>>,
     runtime: AsyncMutex<Option<RunningKrun>>,
     vsock_registry: KrunVsockRegistry,
+    host_memory_reclaim: watch::Sender<Option<HostMemoryReclaimReport>>,
 }
 
 struct RunningKrun {
@@ -52,6 +53,7 @@ struct RunningKrun {
     mux: mux::KrunVsockMux,
     mux_task: mux::KrunVsockMuxTask,
     session: Arc<KrunVsockSession>,
+    status_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -229,6 +231,7 @@ impl KrunBackend {
             exit: Arc::new(Mutex::new(None)),
             runtime: AsyncMutex::new(None),
             vsock_registry: KrunVsockRegistry::default(),
+            host_memory_reclaim: watch::Sender::new(None),
         })
     }
 
@@ -267,7 +270,7 @@ impl VirtBackend for KrunBackend {
         let session = KrunVsockSession::new();
         let (mux, mux_task, child_mux_fd) =
             mux::KrunVsockMux::pair(self.vsock_registry.clone(), session.clone(), &[])?;
-        let vm = match build_krun_vm(&self.krun_bin, &self.config, child_mux_fd)?.start() {
+        let mut vm = match build_krun_vm(&self.krun_bin, &self.config, child_mux_fd)?.start() {
             Ok(vm) => vm,
             Err(error) => {
                 mux.shutdown().await;
@@ -276,11 +279,20 @@ impl VirtBackend for KrunBackend {
             }
         };
         tracing::info!(machine = %self.config.name(), "krun process started");
+        self.host_memory_reclaim.send_replace(None);
+        let status_task = vm.take_status_fd().and_then(|status_fd| {
+            spawn_status_reader(
+                self.config.name().to_string(),
+                status_fd,
+                self.host_memory_reclaim.clone(),
+            )
+        });
         *runtime = Some(RunningKrun {
             vm: Arc::new(AsyncMutex::new(vm)),
             mux,
             mux_task,
             session,
+            status_task,
         });
         Ok(())
     }
@@ -305,7 +317,15 @@ impl VirtBackend for KrunBackend {
             ));
         };
         drop(runtime);
-        let RunningKrun { mux, mux_task, .. } = running;
+        let RunningKrun {
+            mux,
+            mux_task,
+            status_task,
+            ..
+        } = running;
+        if let Some(status_task) = status_task {
+            status_task.abort();
+        }
         mux.shutdown().await;
         mux_task.join().await?;
         self.cache_exit(VmExit::Stopped);
@@ -405,6 +425,12 @@ impl VirtBackend for KrunBackend {
         self.vsock_registry.register(port, admission, session)
     }
 
+    fn host_memory_reclaim_updates(
+        &self,
+    ) -> Option<watch::Receiver<Option<HostMemoryReclaimReport>>> {
+        Some(self.host_memory_reclaim.subscribe())
+    }
+
     async fn open_serial(&self) -> Result<SerialDevice, VirtError> {
         let serial = {
             let runtime = self.runtime.lock().await;
@@ -417,6 +443,62 @@ impl VirtBackend for KrunBackend {
 
         let (read, write) = serial.into_files();
         Ok(SerialDevice::from_pty_files(read, write)?)
+    }
+}
+
+/// Reads the helper's status channel and publishes each host memory reclaim
+/// record. Ends when the helper closes the pipe or the task is aborted.
+fn spawn_status_reader(
+    machine: String,
+    status_fd: OwnedFd,
+    sender: watch::Sender<Option<HostMemoryReclaimReport>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let receiver = match tokio::net::unix::pipe::Receiver::from_owned_fd(status_fd) {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            tracing::warn!(
+                machine = %machine,
+                error = %error,
+                "krun status channel is unavailable; host memory reclaim stays unreported"
+            );
+            return None;
+        }
+    };
+    Some(tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(receiver).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => match krun::HostMemoryReclaimStatus::parse(&line) {
+                    Some(status) => {
+                        sender.send_replace(Some(host_memory_reclaim_report(status)));
+                    }
+                    None => tracing::debug!(
+                        machine = %machine,
+                        line = %line,
+                        "ignoring unrecognized krun status record"
+                    ),
+                },
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::debug!(machine = %machine, error = %error, "krun status channel closed");
+                    break;
+                }
+            }
+        }
+    }))
+}
+
+fn host_memory_reclaim_report(status: krun::HostMemoryReclaimStatus) -> HostMemoryReclaimReport {
+    HostMemoryReclaimReport {
+        requested: status.requested,
+        qualification: status.qualification.as_str(),
+        effective: status.effective,
+        released_bytes: status.released_bytes,
+        released_extents: status.released_extents,
+        retried_faults: status.retried_faults,
+        skipped_reports: status.skipped_reports,
+        failed_operations: status.failed_operations,
+        observed_at: SystemTime::now(),
     }
 }
 

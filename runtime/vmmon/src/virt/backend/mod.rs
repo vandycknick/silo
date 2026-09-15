@@ -16,8 +16,10 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
+use tokio::sync::watch;
 
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission};
 use crate::virt::config::VmConfig;
@@ -62,6 +64,29 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
 
     /// Open the guest serial device. Called once per boot by the serial console.
     async fn open_serial(&self) -> Result<SerialDevice, VirtError>;
+
+    /// Live host memory reclaim reports, for backends that can observe them.
+    /// The value is `None` until the first report of the current boot.
+    fn host_memory_reclaim_updates(
+        &self,
+    ) -> Option<watch::Receiver<Option<HostMemoryReclaimReport>>> {
+        None
+    }
+}
+
+/// Host memory reclaim state of the running VM as last reported by the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMemoryReclaimReport {
+    pub requested: bool,
+    /// `not-run`, `passed`, `failed`, or `inconclusive`.
+    pub qualification: &'static str,
+    pub effective: bool,
+    pub released_bytes: u64,
+    pub released_extents: u64,
+    pub retried_faults: u64,
+    pub skipped_reports: u64,
+    pub failed_operations: u64,
+    pub observed_at: SystemTime,
 }
 
 /// Identifies a virtualization backend implementation.

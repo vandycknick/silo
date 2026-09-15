@@ -6,8 +6,9 @@ use prost_types::Timestamp;
 use protocol::v1::{
     AgentConnection, AgentConnectionState, AgentIdentity, AgentMetricReport, AgentMetrics,
     AgentMetricsObservation, AgentStatus, AgentStatusObservation, AgentStatusReport,
-    AgentStatusState, DisabledAgent, EnabledAgent, Freshness, HostAgent, HostMetrics, HostStatus,
-    MonitorSnapshot, Readiness, ReadinessReason, StaleReason, VmSnapshot, VmState,
+    AgentStatusState, DisabledAgent, EnabledAgent, Freshness, HostAgent, HostMemoryReclaim,
+    HostMetrics, HostStatus, MonitorSnapshot, Readiness, ReadinessReason, StaleReason, VmSnapshot,
+    VmState,
 };
 use tokio::sync::watch;
 
@@ -65,6 +66,7 @@ struct State {
     identity: Option<AgentIdentity>,
     status: Option<Observation<AgentStatusReport>>,
     metrics: Option<Observation<(String, AgentMetricReport)>>,
+    host_memory_reclaim: Option<HostMemoryReclaim>,
     agent_services: Vec<String>,
     stopping: bool,
     last_log_snapshot: Option<StateLogSnapshot>,
@@ -125,6 +127,7 @@ impl InstanceStore {
             identity: None,
             status: None,
             metrics: None,
+            host_memory_reclaim: None,
             agent_services: Vec::new(),
             stopping: false,
             last_log_snapshot: None,
@@ -215,6 +218,17 @@ impl InstanceStore {
                 vm_state,
                 VmState::Stopping | VmState::Stopped | VmState::Failed
             );
+            Ok(())
+        })
+    }
+
+    /// Records the latest host memory reclaim report from the backend.
+    pub(crate) fn set_host_memory_reclaim(
+        &self,
+        report: HostMemoryReclaim,
+    ) -> Result<(), StoreError> {
+        self.mutate(|state| {
+            state.host_memory_reclaim = Some(report);
             Ok(())
         })
     }
@@ -1105,6 +1119,7 @@ fn project_metrics(state: &State, now: Instant, observed_at: SystemTime) -> Host
                 report: Some(metrics.value.1.clone()),
             }),
         actual_backend: Some(state.actual_backend.clone()),
+        host_memory_reclaim: state.host_memory_reclaim.clone(),
     }
 }
 

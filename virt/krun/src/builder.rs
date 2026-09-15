@@ -155,6 +155,8 @@ impl VirtualMachineBuilder {
             .transpose()?;
         let (watchdog_fd, watchdog_keepalive) = crate::watchdog::create()?;
         let watchdog_fd = normalize_child_fd(watchdog_fd)?;
+        let (status_read_fd, status_write_fd) = crate::status::create()?;
+        let status_write_fd = normalize_child_fd(status_write_fd)?;
         let args = command_args(&self.config, self.vsock_mux_fd.as_ref());
         let mut command = Command::new(&self.krun_binary);
         for arg in &args {
@@ -163,6 +165,10 @@ impl VirtualMachineBuilder {
         command.env(
             crate::watchdog::ENV_WATCHDOG_FD,
             crate::watchdog::fd_env_value(&watchdog_fd),
+        );
+        command.env(
+            crate::status::ENV_STATUS_FD,
+            crate::status::fd_env_value(&status_write_fd),
         );
         configure_rosetta_environment(&mut command, rosetta_config.as_deref());
         let serial = if self.config.stdio_console {
@@ -179,17 +185,24 @@ impl VirtualMachineBuilder {
                 .stderr(Stdio::null());
             None
         };
-        install_child_fd_allowlist(&mut command, &watchdog_fd, self.vsock_mux_fd.as_ref())?;
+        install_child_fd_allowlist(
+            &mut command,
+            &watchdog_fd,
+            self.vsock_mux_fd.as_ref(),
+            Some(&status_write_fd),
+        )?;
 
         tracing::debug!(command = %format_command(self.krun_binary.as_os_str(), &args), "launching krun backend");
 
         let child = command.spawn()?;
         drop(watchdog_fd);
+        drop(status_write_fd);
         Ok(VirtualMachine::new(
             child,
             self.krun_binary,
             self.config,
             serial,
+            Some(status_read_fd),
             Some(watchdog_keepalive),
         ))
     }
@@ -300,15 +313,17 @@ fn install_child_fd_allowlist(
     command: &mut Command,
     watchdog_fd: &OwnedFd,
     vsock_mux_fd: Option<&OwnedFd>,
+    status_fd: Option<&OwnedFd>,
 ) -> io::Result<()> {
     let watchdog_fd = watchdog_fd.as_raw_fd();
     let vsock_mux_fd = vsock_mux_fd.map(AsRawFd::as_raw_fd).unwrap_or(-1);
+    let status_fd = status_fd.map(AsRawFd::as_raw_fd).unwrap_or(-1);
     // SAFETY: child setup uses only raw OS descriptor operations. OS errors are
     // represented inline by from_raw_os_error, so this path does not allocate.
     unsafe {
         command.pre_exec(move || {
             mark_child_fds_cloexec()?;
-            for fd in [watchdog_fd, vsock_mux_fd] {
+            for fd in [watchdog_fd, vsock_mux_fd, status_fd] {
                 if fd >= 3 {
                     let flags = libc::fcntl(fd, libc::F_GETFD);
                     if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
@@ -1036,7 +1051,7 @@ mod tests {
             .arg("test -e /dev/fd/$MUX && test -e /dev/fd/$WATCHDOG && test ! -e /dev/fd/$AMBIENT")
             .env("MUX", mux.as_raw_fd().to_string())
             .env("WATCHDOG", watchdog.as_raw_fd().to_string());
-        install_child_fd_allowlist(&mut command, &watchdog, Some(&mux)).expect("child setup");
+        install_child_fd_allowlist(&mut command, &watchdog, Some(&mux), None).expect("child setup");
         let (ambient, _ambient_peer) =
             std::os::unix::net::UnixStream::pair().expect("late ambient pair");
         let flags =
@@ -1104,7 +1119,7 @@ mod tests {
     fn child_fd_allowlist_preserves_spawn_error_reporting() {
         let (watchdog, _keepalive) = crate::watchdog::create().expect("watchdog");
         let mut command = std::process::Command::new("/definitely/missing/silo-krun-helper");
-        install_child_fd_allowlist(&mut command, &watchdog, None).expect("child setup");
+        install_child_fd_allowlist(&mut command, &watchdog, None, None).expect("child setup");
 
         assert_eq!(
             command
