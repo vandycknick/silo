@@ -12,7 +12,7 @@ The workspace dependency is pinned by full Git commit in the root
 
 ```text
 repository: https://github.com/vandycknick/libkrun.git
-tracked revision: 041237ac66aec612aae13eb11b06309b6e96eefb
+tracked revision: fda927fe4ad70e1dee8b9ce44fea2bfbb6f9e895
 public branch: silo/v2
 previous tracked revision: d34748e32bf3169a81ab16a7c2ba3dcb93716a31
 previous tip backup: backup/silo-v2-2026-09-15 @ 10b6f752ba8ea735c3d9edaa549599dcf3f98d18
@@ -25,7 +25,7 @@ or tag is useful for reviewing the fork, but neither replaces the immutable
 commit pin.
 
 The committed revision is reachable through the fork URL: a direct
-`git fetch https://github.com/vandycknick/libkrun.git 041237ac66aec612aae13eb11b06309b6e96eefb`
+`git fetch https://github.com/vandycknick/libkrun.git fda927fe4ad70e1dee8b9ce44fea2bfbb6f9e895`
 succeeds. Cargo therefore resolves the tracked pin directly from GitHub with no
 local checkout, path patch, URL rewrite, or alternate lockfile. The public
 `silo/v2` branch names the reviewable tip, while release reproducibility comes

@@ -26,7 +26,7 @@ default-members = ["app/cli", "runtime/vmmon"]
 resolver = "2"
 
 [workspace.dependencies]
-libkrun = { package = "libkrun", git = "https://github.com/vandycknick/libkrun.git", rev = "041237ac66aec612aae13eb11b06309b6e96eefb", default-features = false, features = ["blk", "net"] }
+libkrun = { package = "libkrun", git = "https://github.com/vandycknick/libkrun.git", rev = "fda927fe4ad70e1dee8b9ce44fea2bfbb6f9e895", default-features = false, features = ["blk", "net"] }
 
 [profile.dev.package.sha2]
 opt-level = 3
