@@ -6,12 +6,25 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::ffi::c_void;
+    use std::fs;
     use std::future::Future;
-    use std::path::PathBuf;
-    use std::time::Duration;
+    use std::io::{self, Read};
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::{Path, PathBuf};
+    use std::process::ExitStatus;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant as StdInstant};
 
     use clap::Parser;
     use eyre::{eyre, Context, Result};
+    use krun::{RosettaLaunchConfig, VirtualMachineBuilder};
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use rprobe::exerciser::{Decoder as ExerciserDecoder, REQUIRED_CHECKS};
     use rprobe::frame::{Decoder, FrameError, SUCCESS_LEN};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::watch;
@@ -29,6 +42,10 @@ mod macos {
     const REQUESTED_MEMORY: u64 = 128 * 1024 * 1024;
     const MAX_PROBE_MEMORY: u64 = 512 * 1024 * 1024;
     const DIAGNOSTIC_LIMIT: usize = 64 * 1024;
+    const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+    const HELPER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+    const MAX_TRANSLATOR_SIZE: usize = 128 * 1024 * 1024;
+    const DEFAULT_HOST_ROOT: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux";
 
     #[derive(Debug, Parser)]
     struct Args {
@@ -38,6 +55,16 @@ mod macos {
         initramfs: PathBuf,
         #[arg(long)]
         cancel_while_starting: bool,
+        #[arg(long)]
+        cancel_helper_after_spawn: bool,
+        #[arg(long, value_name = "PATH")]
+        krun: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        guest_kernel: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        guest_initramfs: Option<PathBuf>,
+        #[arg(long, value_name = "PATH", default_value = DEFAULT_HOST_ROOT)]
+        host_root: PathBuf,
     }
 
     struct Capture {
@@ -54,6 +81,35 @@ mod macos {
         starting_direct_stop: String,
     }
 
+    #[derive(Clone)]
+    struct HelperInputs {
+        krun: PathBuf,
+        kernel: PathBuf,
+        initramfs: PathBuf,
+    }
+
+    struct SourceSnapshot {
+        root: PathBuf,
+        bytes: Vec<u8>,
+        sha256: [u8; 32],
+        identity: SourceIdentity,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct SourceIdentity {
+        device: u64,
+        inode: u64,
+        size: u64,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ProbeResponse {
+        ioctl_result: i32,
+        data: [u8; 1024],
+    }
+
     #[derive(Clone, Debug)]
     enum StartCompletion {
         Pending,
@@ -68,6 +124,20 @@ mod macos {
         }
         if !args.initramfs.is_file() {
             return Err(eyre!("initramfs is not a regular file"));
+        }
+        let helper = helper_inputs(&args)?;
+        if args.cancel_while_starting && helper.is_some() {
+            return Err(eyre!(
+                "--cancel-while-starting cannot be combined with helper qualification"
+            ));
+        }
+        if args.cancel_helper_after_spawn && helper.is_none() {
+            return Err(eyre!(
+                "--cancel-helper-after-spawn requires helper qualification inputs"
+            ));
+        }
+        if args.cancel_while_starting && args.cancel_helper_after_spawn {
+            return Err(eyre!("only one cancellation scenario may be selected"));
         }
         match vz::rosetta_availability() {
             RosettaAvailability::Installed => {}
@@ -96,12 +166,16 @@ mod macos {
             .enable_all()
             .build()
             .wrap_err("build hardware-test runtime")?;
-        runtime.block_on(run(args, memory))
+        runtime.block_on(run(args, helper, memory))
     }
 
-    async fn run(args: Args, memory: u64) -> Result<()> {
+    async fn run(args: Args, helper: Option<HelperInputs>, memory: u64) -> Result<()> {
         let started = Instant::now();
         let acquisition_deadline = started + ACQUISITION_TIMEOUT;
+        let source = helper
+            .as_ref()
+            .map(|_| SourceSnapshot::capture(&args.host_root))
+            .transpose()?;
 
         let diagnostic_port = SerialPortConfiguration::virtio_console()
             .wrap_err("construct diagnostic serial port")?;
@@ -225,20 +299,431 @@ mod macos {
         if frame.payload.len() != 1024 {
             return Err(eyre!("successful probe frame has invalid payload length"));
         }
+        let mut data = [0; 1024];
+        data.copy_from_slice(frame.payload);
+        let response = ProbeResponse {
+            ioctl_result: frame.header.result,
+            data,
+        };
+
+        let helper_report = match (helper, source) {
+            (Some(helper), Some(source)) => {
+                source.verify_unchanged()?;
+                Some(
+                    qualify_helper(helper, &source, response, args.cancel_helper_after_spawn)
+                        .await?,
+                )
+            }
+            (None, None) => None,
+            _ => return Err(eyre!("helper qualification inputs became inconsistent")),
+        };
 
         println!(
-            "host_harness_pid={} guest_pid=1 status={} payload_len={} cpu_count=1 memory_bytes={} acquisition_ms={} cleanup_ms={} diagnostic_bytes={} diagnostic_retained={} resources=disks:0,network:0,vsock:0,balloon:0 serial_ports=hvc0:diagnostic,hvc1:raw share=rosetta start_callback={} vz_xpc_pid=not-observed cleanup=stopped-released",
+            "host_harness_pid={} guest_pid=1 status={} payload_len={} cpu_count=1 memory_bytes={} acquisition_ms={} cleanup_ms={} diagnostic_bytes={} diagnostic_retained={} resources=disks:0,network:0,vsock:0,balloon:0 serial_ports=hvc0:diagnostic,hvc1:raw share=rosetta start_callback={} vz_xpc_pid=not-observed cleanup=stopped-released helper_qualification={}",
             std::process::id(),
-            frame.header.result,
-            frame.payload.len(),
+            response.ioctl_result,
+            response.data.len(),
             memory,
             cleanup_started.duration_since(started).as_millis(),
             cleanup_started.elapsed().as_millis(),
             diagnostic_stats.total,
             diagnostic_stats.retained.len(),
             cleanup.start_completion,
+            helper_report.unwrap_or("not-requested"),
         );
         Ok(())
+    }
+
+    fn helper_inputs(args: &Args) -> Result<Option<HelperInputs>> {
+        match (&args.krun, &args.guest_kernel, &args.guest_initramfs) {
+            (None, None, None) => Ok(None),
+            (Some(krun), Some(kernel), Some(initramfs)) => {
+                for (kind, path) in [
+                    ("krun helper", krun),
+                    ("guest kernel", kernel),
+                    ("guest initramfs", initramfs),
+                ] {
+                    if !path.is_file() {
+                        return Err(eyre!("{kind} is not a regular file"));
+                    }
+                }
+                Ok(Some(HelperInputs {
+                    krun: krun.clone(),
+                    kernel: kernel.clone(),
+                    initramfs: initramfs.clone(),
+                }))
+            }
+            _ => Err(eyre!(
+                "--krun, --guest-kernel and --guest-initramfs must be supplied together"
+            )),
+        }
+    }
+
+    impl SourceSnapshot {
+        fn capture(root: &Path) -> Result<Self> {
+            if !root.is_absolute() {
+                return Err(eyre!("translator source root must be absolute"));
+            }
+            let path = root.join("rosetta");
+            let metadata = fs::symlink_metadata(&path).wrap_err("inspect translator source")?;
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.permissions().mode() & 0o111 == 0
+            {
+                return Err(eyre!("translator source must be a regular executable file"));
+            }
+            let size = usize::try_from(metadata.len())
+                .map_err(|_| eyre!("translator source size does not fit usize"))?;
+            if size == 0 || size > MAX_TRANSLATOR_SIZE {
+                return Err(eyre!("translator source exceeds the bounded size policy"));
+            }
+            let bytes = fs::read(&path).wrap_err("read translator source snapshot")?;
+            if bytes.len() != size {
+                return Err(eyre!("translator source changed while reading"));
+            }
+            let identity = source_identity(&metadata);
+            let after = fs::symlink_metadata(&path)
+                .wrap_err("reinspect translator source after snapshot")?;
+            if source_identity(&after) != identity {
+                return Err(eyre!("translator source changed while reading"));
+            }
+            let sha256 = sha256(&bytes)?;
+            Ok(Self {
+                root: root.to_path_buf(),
+                bytes,
+                sha256,
+                identity,
+            })
+        }
+
+        fn verify_unchanged(&self) -> Result<()> {
+            let path = self.root.join("rosetta");
+            let metadata = fs::symlink_metadata(&path)
+                .wrap_err("reinspect translator source after acquisition")?;
+            let current = fs::read(path).wrap_err("re-read translator source after acquisition")?;
+            if source_identity(&metadata) != self.identity || current != self.bytes {
+                return Err(eyre!("translator source changed during acquisition"));
+            }
+            Ok(())
+        }
+    }
+
+    fn source_identity(metadata: &fs::Metadata) -> SourceIdentity {
+        SourceIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+        }
+    }
+
+    async fn qualify_helper(
+        inputs: HelperInputs,
+        source: &SourceSnapshot,
+        response: ProbeResponse,
+        cancel_after_spawn: bool,
+    ) -> Result<&'static str> {
+        let config = RosettaLaunchConfig::new(
+            source.root.clone(),
+            source.sha256,
+            response.ioctl_result,
+            response.data,
+        )
+        .wrap_err("construct bounded helper configuration")?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            run_helper(inputs, config, response, worker_cancel, started_tx)
+        });
+
+        if cancel_after_spawn {
+            if started_rx.await.is_err() {
+                return match join_helper_worker(worker.await)? {
+                    HelperOutcome::Passed => Ok("passed"),
+                    HelperOutcome::Cancelled => Err(eyre!(
+                        "helper qualification cancelled before spawn notification"
+                    )),
+                };
+            }
+            cancel.store(true, Ordering::Release);
+            return match join_helper_worker(worker.await)? {
+                HelperOutcome::Cancelled => Ok("cancelled-reaped"),
+                HelperOutcome::Passed => Err(eyre!(
+                    "helper qualification completed before cancellation was observed"
+                )),
+            };
+        }
+
+        tokio::select! {
+            result = &mut worker => match join_helper_worker(result)? {
+                HelperOutcome::Passed => Ok("passed"),
+                HelperOutcome::Cancelled => Err(eyre!("helper qualification cancelled unexpectedly")),
+            },
+            signal = tokio::signal::ctrl_c() => {
+                signal.wrap_err("listen for helper qualification cancellation")?;
+                cancel.store(true, Ordering::Release);
+                match join_helper_worker(worker.await)? {
+                    HelperOutcome::Cancelled => Err(eyre!(
+                        "helper qualification cancelled; standalone helper cleaned up and reaped"
+                    )),
+                    HelperOutcome::Passed => Err(eyre!(
+                        "helper qualification completed before cancellation was observed"
+                    )),
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum HelperOutcome {
+        Passed,
+        Cancelled,
+    }
+
+    fn join_helper_worker(
+        result: std::result::Result<Result<HelperOutcome>, tokio::task::JoinError>,
+    ) -> Result<HelperOutcome> {
+        result.map_err(|error| eyre!("helper qualification worker failed: {error}"))?
+    }
+
+    fn run_helper(
+        inputs: HelperInputs,
+        config: RosettaLaunchConfig,
+        response: ProbeResponse,
+        cancel: Arc<AtomicBool>,
+        started: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<HelperOutcome> {
+        let mut vm = VirtualMachineBuilder::new(&inputs.krun)
+            .cpus(1)
+            .memory_mib(512)
+            .kernel(&inputs.kernel)
+            .initramfs(&inputs.initramfs)
+            .cmdline(vec![
+                "rdinit=/init console=hvc0 panic=0 quiet loglevel=0".to_string()
+            ])
+            .network_none()
+            .stdio_console(true)
+            .rosetta(config)
+            .start()
+            .wrap_err("start standalone krun responder guest")?;
+        let serial = vm.serial().wrap_err("take standalone helper console")?;
+        let (mut reader, writer) = serial.into_files();
+        let flags = OFlag::from_bits_retain(
+            fcntl(reader.as_fd(), FcntlArg::F_GETFL).wrap_err("read console flags")?,
+        );
+        fcntl(reader.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+            .wrap_err("make helper console nonblocking")?;
+        let _ = started.send(());
+        let qualification = receive_exerciser_frame(&mut vm, &mut reader, &response, &cancel);
+        let completed = qualification.as_ref().is_ok_and(|completed| *completed);
+        let cleanup = if completed {
+            request_helper_shutdown(&mut vm, &mut reader)
+        } else {
+            cancel_and_reap_helper(&mut vm, &mut reader)
+        };
+        drop(reader);
+        drop(writer);
+        let completed = qualification?;
+        cleanup?;
+        Ok(if completed {
+            HelperOutcome::Passed
+        } else {
+            HelperOutcome::Cancelled
+        })
+    }
+
+    fn receive_exerciser_frame(
+        vm: &mut krun::VirtualMachine,
+        reader: &mut fs::File,
+        response: &ProbeResponse,
+        cancel: &AtomicBool,
+    ) -> Result<bool> {
+        let deadline = StdInstant::now() + HELPER_TIMEOUT;
+        let mut decoder = ExerciserDecoder::new();
+        let mut buffer = [0; 4096];
+        let mut console_bytes = 0_u64;
+        while !decoder.is_complete() {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            match reader.read(&mut buffer) {
+                Ok(0) => {}
+                Ok(count) => {
+                    console_bytes = console_bytes.saturating_add(count as u64);
+                    decoder
+                        .push(&buffer[..count])
+                        .map_err(|error| eyre!("invalid exerciser frame: {error:?}"))?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+                Err(error) => return Err(error).wrap_err("read helper console"),
+            }
+
+            let now = StdInstant::now();
+            if let Some(status) = vm.try_wait().wrap_err("poll krun helper")? {
+                return Err(eyre!(
+                    "krun helper exited before the shutdown request: {status}; console_bytes={console_bytes} frame_bytes={}",
+                    decoder.received_len()
+                ));
+            }
+            if now >= deadline {
+                return Err(eyre!("standalone helper exerciser timed out"));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let frame = decoder
+            .finish()
+            .map_err(|error| eyre!("invalid exerciser frame: {error:?}"))?;
+        if frame.checks != REQUIRED_CHECKS {
+            return Err(eyre!("guest filesystem checks were incomplete"));
+        }
+        if frame.ioctl_result != response.ioctl_result {
+            return Err(eyre!("guest ioctl status differs from the captured status"));
+        }
+        if frame.payload != &response.data {
+            return Err(eyre!("guest ioctl data differs from the captured response"));
+        }
+        Ok(true)
+    }
+
+    fn request_helper_shutdown(
+        vm: &mut krun::VirtualMachine,
+        console: &mut fs::File,
+    ) -> Result<()> {
+        if let Some(status) = vm.try_wait().wrap_err("poll standalone helper")? {
+            return Err(eyre!(
+                "standalone helper exited before the shutdown request: {status}"
+            ));
+        }
+        if let Err(error) = vm.shutdown() {
+            force_reap_helper(vm)?;
+            return Err(error).wrap_err("request standalone helper shutdown");
+        }
+        match wait_for_helper_with_console(vm, console, HELPER_CLEANUP_TIMEOUT) {
+            Ok(Some(status)) => require_successful_helper_exit(status),
+            Ok(None) => {
+                force_reap_helper(vm)?;
+                Err(eyre!(
+                    "standalone helper did not exit after the shutdown request"
+                ))
+            }
+            Err(error) => {
+                force_reap_helper(vm)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn cancel_and_reap_helper(vm: &mut krun::VirtualMachine, console: &mut fs::File) -> Result<()> {
+        if let Some(status) = vm.try_wait().wrap_err("poll standalone helper")? {
+            return require_cancelled_helper_exit(status);
+        }
+        let shutdown_error = vm.shutdown().err();
+        if shutdown_error.is_none() {
+            match wait_for_helper_with_console(vm, console, HELPER_CLEANUP_TIMEOUT) {
+                Ok(Some(status)) => return require_cancelled_helper_exit(status),
+                Ok(None) => {}
+                Err(error) => {
+                    force_reap_helper(vm)?;
+                    return Err(error);
+                }
+            }
+        }
+        force_reap_helper(vm)?;
+        if let Some(error) = shutdown_error {
+            return Err(error).wrap_err("request standalone helper shutdown");
+        }
+        Ok(())
+    }
+
+    fn wait_for_helper_with_console(
+        vm: &mut krun::VirtualMachine,
+        console: &mut fs::File,
+        timeout: Duration,
+    ) -> Result<Option<ExitStatus>> {
+        let deadline = StdInstant::now() + timeout;
+        let mut buffer = [0; 4096];
+        loop {
+            if let Some(status) = vm.try_wait().wrap_err("poll standalone helper")? {
+                return Ok(Some(status));
+            }
+            match console.read(&mut buffer) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+                Err(error) => return Err(error).wrap_err("drain helper console during shutdown"),
+            }
+            if StdInstant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn require_successful_helper_exit(status: ExitStatus) -> Result<()> {
+        if status.success() {
+            Ok(())
+        } else {
+            Err(eyre!("standalone helper exited unsuccessfully: {status}"))
+        }
+    }
+
+    fn require_cancelled_helper_exit(status: ExitStatus) -> Result<()> {
+        if status.success() || matches!(status.signal(), Some(libc::SIGTERM) | Some(libc::SIGKILL))
+        {
+            Ok(())
+        } else {
+            Err(eyre!(
+                "standalone helper exited unexpectedly during cancellation: {status}"
+            ))
+        }
+    }
+
+    fn force_reap_helper(vm: &mut krun::VirtualMachine) -> Result<()> {
+        let kill_error = vm.kill().err();
+        if wait_for_helper(vm, Duration::from_secs(2))?.is_none() {
+            return Err(eyre!("standalone helper was not reaped after kill"));
+        }
+        if let Some(error) = kill_error {
+            return Err(error).wrap_err("kill standalone helper after timeout");
+        }
+        Ok(())
+    }
+
+    fn wait_for_helper(
+        vm: &mut krun::VirtualMachine,
+        timeout: Duration,
+    ) -> Result<Option<ExitStatus>> {
+        let deadline = StdInstant::now() + timeout;
+        loop {
+            if let Some(status) = vm.try_wait().wrap_err("poll standalone helper")? {
+                return Ok(Some(status));
+            }
+            if StdInstant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // nix does not expose Apple's CommonCrypto digest API.
+    #[link(name = "System")]
+    unsafe extern "C" {
+        fn CC_SHA256(data: *const c_void, len: u32, digest: *mut u8) -> *mut u8;
+    }
+
+    fn sha256(bytes: &[u8]) -> Result<[u8; 32]> {
+        let len =
+            u32::try_from(bytes.len()).map_err(|_| eyre!("translator source is too large"))?;
+        let mut digest = [0; 32];
+        let result = unsafe { CC_SHA256(bytes.as_ptr().cast(), len, digest.as_mut_ptr()) };
+        if result != digest.as_mut_ptr() {
+            return Err(eyre!("CommonCrypto SHA-256 failed"));
+        }
+        Ok(digest)
     }
 
     async fn bounded_acquisition<F, T>(deadline: Instant, future: F) -> Result<T>
