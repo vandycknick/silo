@@ -128,8 +128,9 @@ mod macos {
 
         let platform = GenericPlatform::new();
         platform.set_nested_virtualization_enabled(false);
-        let mut filesystem = VirtioFileSystemDeviceConfiguration::new("rosetta")
-            .wrap_err("construct Rosetta virtio-fs configuration")?;
+        let mut filesystem =
+            VirtioFileSystemDeviceConfiguration::new(agent_spec::ROSETTA_MOUNT_TAG)
+                .wrap_err("construct Rosetta virtio-fs configuration")?;
         filesystem.set_rosetta_share(
             LinuxRosettaDirectoryShare::new().wrap_err("construct Rosetta directory share")?,
         );

@@ -11,6 +11,15 @@ pub const SSH_VSOCK_PORT: u32 = 22;
 /// Maximum serialized configuration accepted by host composition and the guest agent.
 pub const MAX_AGENT_CONFIG_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Virtio-fs tag reserved for the host-provided Rosetta share.
+pub const ROSETTA_MOUNT_TAG: &str = "rosetta";
+
+/// Guest mount point for the host-provided Rosetta share.
+pub const ROSETTA_MOUNT_PATH: &str = "/mnt/rosetta";
+
+/// Guest interpreter registered for x86-64 ELF binaries.
+pub const ROSETTA_INTERPRETER_PATH: &str = "/mnt/rosetta/rosetta";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
@@ -80,8 +89,31 @@ impl AgentConfig {
             validate_nonempty(&mount.fstype, "mount fstype")?;
         }
         if self.provision.rosetta.enabled {
-            validate_nonempty(&self.provision.rosetta.mount_tag, "rosetta mount tag")?;
-            validate_absolute_path(&self.provision.rosetta.mount_path, "rosetta mount path")?;
+            if !self.provision.enabled {
+                return Err(AgentConfigError::new(
+                    "enabled rosetta requires provision.enabled to be true",
+                ));
+            }
+            if self.provision.rosetta.mount_tag != ROSETTA_MOUNT_TAG {
+                return Err(AgentConfigError::new(format!(
+                    "enabled rosetta mount tag must be {ROSETTA_MOUNT_TAG:?}"
+                )));
+            }
+            if self.provision.rosetta.mount_path != ROSETTA_MOUNT_PATH {
+                return Err(AgentConfigError::new(format!(
+                    "enabled rosetta mount path must be {ROSETTA_MOUNT_PATH:?}"
+                )));
+            }
+            if self
+                .provision
+                .mounts
+                .iter()
+                .any(|mount| mount.tag == ROSETTA_MOUNT_TAG)
+            {
+                return Err(AgentConfigError::new(format!(
+                    "mount tag {ROSETTA_MOUNT_TAG:?} is reserved for enabled rosetta"
+                )));
+            }
         }
         if let Some(userdata) = &self.provision.userdata {
             validate_nonempty(&userdata.content, "userdata content")?;
@@ -373,11 +405,11 @@ impl Default for AgentRosettaConfig {
 }
 
 fn default_rosetta_mount_tag() -> String {
-    "silo-rosetta".to_string()
+    ROSETTA_MOUNT_TAG.to_string()
 }
 
 fn default_rosetta_mount_path() -> String {
-    "/mnt/silo-rosetta".to_string()
+    ROSETTA_MOUNT_PATH.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -458,11 +490,18 @@ mod tests {
         assert!(!config.provision.enabled);
         assert!(!config.provision.resize_rootfs.enabled);
         assert!(!config.provision.rosetta.enabled);
-        assert_eq!(config.provision.rosetta.mount_tag, "silo-rosetta");
-        assert_eq!(config.provision.rosetta.mount_path, "/mnt/silo-rosetta");
+        assert_eq!(config.provision.rosetta.mount_tag, crate::ROSETTA_MOUNT_TAG);
+        assert_eq!(
+            config.provision.rosetta.mount_path,
+            crate::ROSETTA_MOUNT_PATH
+        );
         assert!(config.provision.users.is_empty());
         assert!(config.provision.network.is_none());
         assert!(config.ssh.authorized_users.is_empty());
+        assert_eq!(
+            format!("{}/rosetta", crate::ROSETTA_MOUNT_PATH),
+            crate::ROSETTA_INTERPRETER_PATH
+        );
     }
 
     #[test]
@@ -489,11 +528,64 @@ provision:
         assert_eq!(config.provision.hostname.as_deref(), Some("demo"));
         assert!(config.provision.resize_rootfs.enabled);
         assert!(config.provision.rosetta.enabled);
-        assert_eq!(config.provision.rosetta.mount_tag, "silo-rosetta");
-        assert_eq!(config.provision.rosetta.mount_path, "/mnt/silo-rosetta");
+        assert_eq!(config.provision.rosetta.mount_tag, crate::ROSETTA_MOUNT_TAG);
+        assert_eq!(
+            config.provision.rosetta.mount_path,
+            crate::ROSETTA_MOUNT_PATH
+        );
         let userdata = config.provision.userdata.expect("userdata");
         assert_eq!(userdata.content_type, UserdataContentType::ShellScript);
         assert_eq!(userdata.run, UserdataRunPolicy::Always);
+    }
+
+    #[test]
+    fn enabled_rosetta_rejects_disabled_provisioning() {
+        let mut config = AgentConfig::default();
+        config.provision.rosetta.enabled = true;
+
+        let error = config
+            .validate()
+            .expect_err("reject Rosetta without provisioning");
+        assert!(error
+            .to_string()
+            .contains("requires provision.enabled to be true"));
+        assert!(config.provision.rosetta.enabled);
+    }
+
+    #[test]
+    fn enabled_rosetta_rejects_custom_and_legacy_contract_values() {
+        for (mount_tag, mount_path, expected) in [
+            ("custom", "/mnt/rosetta", "mount tag"),
+            ("silo-rosetta", "/mnt/silo-rosetta", "mount tag"),
+            ("rosetta", "/custom/rosetta", "mount path"),
+        ] {
+            let mut config = AgentConfig::default();
+            config.provision.enabled = true;
+            config.provision.rosetta = AgentRosettaConfig {
+                enabled: true,
+                mount_tag: mount_tag.to_string(),
+                mount_path: mount_path.to_string(),
+            };
+
+            let error = config.validate().expect_err("reject unsupported contract");
+            assert!(error.to_string().contains(expected));
+        }
+    }
+
+    #[test]
+    fn enabled_rosetta_reserves_its_mount_tag_from_user_mounts() {
+        let mut config = AgentConfig::default();
+        config.provision.enabled = true;
+        config.provision.rosetta.enabled = true;
+        config.provision.mounts.push(MountConfig {
+            tag: "rosetta".to_string(),
+            path: "/workspace".to_string(),
+            fstype: "virtiofs".to_string(),
+            options: Vec::new(),
+        });
+
+        let error = config.validate().expect_err("reject reserved mount tag");
+        assert!(error.to_string().contains("reserved for enabled rosetta"));
     }
 
     #[test]

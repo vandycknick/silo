@@ -650,7 +650,10 @@ mod tests {
         let decoded: AgentConfig = serde_json::from_str(&rendered).expect("decode metadata config");
         assert!(decoded.provision.enabled);
         assert!(decoded.provision.resize_rootfs.enabled);
-        assert_eq!(decoded.provision.rosetta.mount_tag, "silo-rosetta");
+        assert_eq!(
+            decoded.provision.rosetta.mount_tag,
+            agent_spec::ROSETTA_MOUNT_TAG
+        );
         assert_eq!(
             decoded
                 .provision
@@ -778,8 +781,8 @@ mod tests {
         .expect("resolve provision config");
 
         assert!(provision.rosetta.enabled);
-        assert_eq!(provision.rosetta.mount_tag, "silo-rosetta");
-        assert_eq!(provision.rosetta.mount_path, "/mnt/silo-rosetta");
+        assert_eq!(provision.rosetta.mount_tag, agent_spec::ROSETTA_MOUNT_TAG);
+        assert_eq!(provision.rosetta.mount_path, agent_spec::ROSETTA_MOUNT_PATH);
     }
 
     #[test]

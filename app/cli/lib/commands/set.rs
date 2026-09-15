@@ -311,6 +311,12 @@ mod tests {
         assert!(error.to_string().contains("select the vz backend"));
         validate_rosetta_update(&update, None, Some(&libvm::VirtBackendOverride::Vz))
             .expect("allow Rosetta on VZ");
+
+        let disabled = ParsedSet::parse(&["rosetta=false".to_string()])
+            .expect("parse update")
+            .update;
+        validate_rosetta_update(&disabled, None, Some(&libvm::VirtBackendOverride::Krun))
+            .expect("allow explicitly disabling Rosetta on krun");
     }
 
     #[test]

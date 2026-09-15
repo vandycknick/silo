@@ -20,6 +20,8 @@ pub(crate) struct VmmonStartRequest {
     virt_backend: Option<VmmonVirtBackend>,
     #[serde(skip_serializing_if = "VmmonHostMemoryReclaim::is_off")]
     host_memory_reclaim: VmmonHostMemoryReclaim,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rosetta_intent: Option<VmmonRosettaIntent>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -43,6 +45,20 @@ pub(crate) struct VmmonVirtBackend {
     pub(crate) kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) scenario: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub(crate) enum VmmonRosettaIntent {
+    Disabled,
+    VzNative,
+    KrunCaptured { profile: VmmonRosettaProfile },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum VmmonRosettaProfile {
+    CapturedCompatibilityV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -82,6 +98,7 @@ impl VmmonStartRequest {
             startup_command,
             virt_backend: None,
             host_memory_reclaim: VmmonHostMemoryReclaim::Off,
+            rosetta_intent: None,
         }
     }
 
@@ -92,6 +109,14 @@ impl VmmonStartRequest {
 
     pub(crate) fn with_host_memory_reclaim(mut self, policy: VmmonHostMemoryReclaim) -> Self {
         self.host_memory_reclaim = policy;
+        self
+    }
+
+    pub(crate) fn with_rosetta_intent(mut self, intent: VmmonRosettaIntent) -> Self {
+        self.rosetta_intent = match intent {
+            VmmonRosettaIntent::Disabled => None,
+            intent => Some(intent),
+        };
         self
     }
 }
@@ -119,16 +144,18 @@ mod tests {
 
     use crate::vmmon::start_request::{
         encode_start_request, VmmonEnvironmentVariable, VmmonHostMemoryReclaim, VmmonProcessSpec,
-        VmmonStartRequest, VmmonStartupCommand, VMMON_START_REQUEST_MAX_BYTES,
+        VmmonRosettaIntent, VmmonRosettaProfile, VmmonStartRequest, VmmonStartupCommand,
+        VMMON_START_REQUEST_MAX_BYTES,
     };
 
     #[test]
-    fn idle_request_is_compact_newline_terminated_json() {
+    fn disabled_rosetta_preserves_the_old_native_encoding() {
         let request = VmmonStartRequest::new(
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
-        );
+        )
+        .with_rosetta_intent(VmmonRosettaIntent::Disabled);
         assert_eq!(
             String::from_utf8(encode_start_request(&request).expect("encode request"))
                 .expect("UTF-8 request"),
@@ -180,6 +207,46 @@ mod tests {
             serde_json::from_slice(&encoded[..encoded.len() - 1]).expect("parse request");
 
         assert_eq!(value["hostMemoryReclaim"], "auto");
+    }
+
+    #[test]
+    fn rosetta_intent_contains_only_mode_and_profile_metadata() {
+        let request = VmmonStartRequest::new(
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
+            None,
+        )
+        .with_rosetta_intent(VmmonRosettaIntent::KrunCaptured {
+            profile: VmmonRosettaProfile::CapturedCompatibilityV1,
+        });
+        let encoded = encode_start_request(&request).expect("encode request");
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded[..encoded.len() - 1]).expect("parse request");
+
+        assert_eq!(value["rosettaIntent"]["mode"], "krunCaptured");
+        assert_eq!(value["rosettaIntent"]["profile"], "capturedCompatibilityV1");
+        assert_eq!(
+            value["rosettaIntent"].as_object().map(|value| value.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn vz_native_rosetta_intent_is_explicit_on_the_wire() {
+        let request = VmmonStartRequest::new(
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
+            None,
+        )
+        .with_rosetta_intent(VmmonRosettaIntent::VzNative);
+        let encoded = encode_start_request(&request).expect("encode request");
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded[..encoded.len() - 1]).expect("parse request");
+
+        assert_eq!(
+            value["rosettaIntent"],
+            serde_json::json!({"mode": "vzNative"})
+        );
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub(crate) struct VmmonStartRequest {
     pub(crate) virt_backend: Option<VirtBackendRequest>,
     #[serde(default)]
     pub(crate) host_memory_reclaim: HostMemoryReclaimRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rosetta_intent: Option<RosettaIntentRequest>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -41,6 +43,20 @@ pub(crate) struct VirtBackendRequest {
     /// Absolute path to a mock scenario file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) scenario: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) enum RosettaIntentRequest {
+    Disabled,
+    VzNative,
+    KrunCaptured { profile: RosettaProfileRequest },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum RosettaProfileRequest {
+    CapturedCompatibilityV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -100,6 +116,7 @@ impl StartRequestPipe {
                     startup_command: None,
                     virt_backend: None,
                     host_memory_reclaim: HostMemoryReclaimRequest::Off,
+                    rosetta_intent: None,
                 },
                 expected_machine_id,
                 expected_machine_run_id,
@@ -282,8 +299,9 @@ mod tests {
     use uuid::Uuid;
 
     use crate::start_request::{
-        decode_start_request, HostMemoryReclaimRequest, StartRequestPipe,
-        VMMON_START_REQUEST_MAX_BYTES, VMMON_START_REQUEST_VERSION,
+        decode_start_request, HostMemoryReclaimRequest, RosettaIntentRequest,
+        RosettaProfileRequest, StartRequestPipe, VMMON_START_REQUEST_MAX_BYTES,
+        VMMON_START_REQUEST_VERSION,
     };
 
     #[tokio::test]
@@ -348,6 +366,58 @@ mod tests {
         let request = decode_start_request(&encoded, &machine_id, &run_id)
             .expect("decode host reclaim request");
         assert_eq!(request.host_memory_reclaim, HostMemoryReclaimRequest::Auto);
+    }
+
+    #[test]
+    fn strict_reader_accepts_only_the_versioned_rosetta_contract() {
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        let request = encode(json!({
+            "version": VMMON_START_REQUEST_VERSION,
+            "machineId": machine_id,
+            "machineRunId": run_id,
+            "rosettaIntent": {
+                "mode": "krunCaptured",
+                "profile": "capturedCompatibilityV1"
+            }
+        }));
+        let decoded =
+            decode_start_request(&request, &machine_id, &run_id).expect("accept Rosetta contract");
+        assert_eq!(
+            decoded.rosetta_intent,
+            Some(RosettaIntentRequest::KrunCaptured {
+                profile: RosettaProfileRequest::CapturedCompatibilityV1
+            })
+        );
+
+        for (intent, expected) in [
+            (json!({"mode": "disabled"}), RosettaIntentRequest::Disabled),
+            (json!({"mode": "vzNative"}), RosettaIntentRequest::VzNative),
+        ] {
+            let encoded = encode(json!({
+                "version": VMMON_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+                "rosettaIntent": intent
+            }));
+            let decoded = decode_start_request(&encoded, &machine_id, &run_id)
+                .expect("accept explicit Rosetta intent");
+            assert_eq!(decoded.rosetta_intent, Some(expected));
+        }
+
+        for intent in [
+            json!({"mode": "krunCaptured", "profile": "future"}),
+            json!({"mode": "krunCaptured", "profile": "capturedCompatibilityV1", "data": "00"}),
+            json!({"mode": "future"}),
+        ] {
+            let invalid = encode(json!({
+                "version": VMMON_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+                "rosettaIntent": intent
+            }));
+            assert!(decode_start_request(&invalid, &machine_id, &run_id).is_err());
+        }
     }
 
     #[test]

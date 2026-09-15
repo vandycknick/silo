@@ -1115,8 +1115,12 @@ impl Runtime {
         config: &MachineConfig,
         network: &VmmonNetworkAttachment,
         resize_rootfs: bool,
-    ) -> Result<bool, LibVmError> {
-        let prepare = || -> eyre::Result<bool> {
+    ) -> Result<crate::vmmon::VmmonLaunchInputs, LibVmError> {
+        let prepare = || -> eyre::Result<crate::vmmon::VmmonLaunchInputs> {
+            let rosetta_intent = self
+                .vmmon
+                .rosetta_intent_request(config)
+                .map_err(eyre::Report::msg)?;
             let relative_mount_base = std::env::current_dir()
                 .context("resolve current directory for relative mount sources")?;
             let machine_paths = self.machine_paths(config.id);
@@ -1162,7 +1166,10 @@ impl Runtime {
             remove_file_if_exists(&machine_paths.metadata_config_path())?;
 
             vmmon::write_launch_spec(&machine_paths.vm_spec_path(), &launch_spec)?;
-            Ok(agent_enabled)
+            Ok(crate::vmmon::VmmonLaunchInputs {
+                agent_enabled,
+                rosetta_intent,
+            })
         };
 
         prepare().map_err(|err| LibVmError::MachinePreparationFailed {
@@ -1922,6 +1929,32 @@ mod tests {
             network: MachineNetworkConfig::default(),
             guest: crate::machine::MachineGuestConfig::default(),
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[tokio::test]
+    async fn rosetta_eligibility_fails_before_launch_asset_completion() {
+        let temp = tempfile::tempdir().expect("temp runtime");
+        let paths = LocalPaths::new(temp.path());
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .expect("open runtime");
+        let mut config = sample_machine_config(&paths, MachineId::new(), "rosetta-test");
+        spec_hardware_mut(&mut config.spec).rosetta = Some(true);
+        config.guest.agent = crate::machine::MachineAgent::Custom {
+            path: "/custom/agent".into(),
+        };
+
+        let error = runtime
+            .prepare_vmmon_launch_inputs(
+                &config,
+                &crate::network::VmmonNetworkAttachment::None,
+                false,
+            )
+            .expect_err("reject ineligible durable contract");
+        assert!(error.to_string().contains("installed default guest agent"));
+        assert!(!error.to_string().contains("kernel"));
+        assert!(!runtime.machine_paths(config.id).vm_spec_path().exists());
     }
 
     fn sample_oci_rootfs_image() -> PublishedRootfs {

@@ -39,6 +39,7 @@ pub(crate) struct VmmonLaunch<'a> {
     pub(crate) run_id: &'a str,
     pub(crate) exit_command: Option<&'a HostCommand>,
     pub(crate) agent_enabled: bool,
+    pub(crate) rosetta_intent: crate::vmmon::start_request::VmmonRosettaIntent,
     pub(crate) startup_command: Option<&'a VmmonStartupCommand>,
     pub(crate) machine_log_dir: &'a OwnedDirectory,
     pub(crate) machine_lock: &'a MachineLifetimeLock,
@@ -113,7 +114,8 @@ impl Vmmon {
             launch.startup_command.cloned(),
         )
         .with_virt_backend(self.virt_backend_request())
-        .with_host_memory_reclaim(self.host_memory_reclaim_request());
+        .with_host_memory_reclaim(self.host_memory_reclaim_request())
+        .with_rosetta_intent(launch.rosetta_intent);
         handoff_start_request(start_write, &start_request, VMMON_START_REQUEST_TIMEOUT).await?;
         let readiness_timeout = if launch.startup_command.is_some() {
             Duration::from_secs(5 * 60 + 30)

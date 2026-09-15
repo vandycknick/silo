@@ -444,11 +444,17 @@ fn validate(config: &VmConfig) -> Result<(), VirtError> {
             "machine identifiers are not used by the krun backend",
         );
     }
-    if config.vz().rosetta {
-        return invalid_config(
-            config,
-            "rosetta is not supported on the krun backend yet\n\nhint: select the vz backend",
-        );
+    match config.rosetta() {
+        crate::virt::RosettaIntent::Disabled => {}
+        crate::virt::RosettaIntent::KrunCaptured { .. } => {
+            return invalid_config(
+                config,
+                "captured Rosetta is not enabled for production krun launches yet\n\nhint: select the vz backend",
+            )
+        }
+        crate::virt::RosettaIntent::VzNative => {
+            return invalid_config(config, "VZ-native Rosetta intent cannot be used with krun")
+        }
     }
     if config.nested_virtualization() {
         return invalid_config(
@@ -855,13 +861,15 @@ mod tests {
             .cpus(1)
             .memory(128)
             .kernel(kernel)
-            .rosetta(true)
+            .rosetta(crate::virt::RosettaIntent::KrunCaptured {
+                profile: crate::virt::RosettaProfile::CapturedCompatibilityV1,
+            })
             .build();
 
         let error = validate(&config).expect_err("reject Rosetta");
         assert!(error
             .to_string()
-            .contains("rosetta is not supported on the krun backend yet"));
+            .contains("captured Rosetta is not enabled for production krun launches yet"));
         assert!(error.to_string().contains("select the vz backend"));
         let _ = fs::remove_dir_all(root);
     }
@@ -970,7 +978,25 @@ mod tests {
             .build();
         let backend = KrunBackend::new(config).expect("create backend");
         backend.start().await.expect("start helper process");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let session_active = backend
+                    .runtime
+                    .lock()
+                    .await
+                    .as_ref()
+                    .expect("running backend")
+                    .session
+                    .is_active();
+                if !session_active {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("control EOF must fence the vsock session");
 
         assert_eq!(backend.try_wait().await.expect("probe helper"), None);
         let capacity = VsockCapacity::test_with_limit("control-eof", 1);

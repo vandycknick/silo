@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use vm_spec::VmSpec;
 
 use crate::context::{DaemonContext, RuntimeContext};
+use crate::ext::VmSpecExt;
 use crate::machine::{
     machine_identifier_path_from_dir, vm_spec_machine_config, RuntimeNetwork, VmSpecInputs,
 };
@@ -178,6 +179,12 @@ pub async fn init(
     let guest_services_enabled = agent_enabled;
     let network = parse_network_args(network_args)?;
     let selected_backend = resolve_backend(start_request.virt_backend.as_ref())?;
+    let rosetta_intent = resolve_rosetta_intent(
+        &spec,
+        selected_backend,
+        guest_services_enabled,
+        start_request.rosetta_intent,
+    )?;
 
     tracing::info!(
         instance = %name,
@@ -223,6 +230,7 @@ pub async fn init(
             }
         },
         selected_backend,
+        rosetta_intent,
     })?;
     let machine = create_virtual_machine(
         selected_backend,
@@ -335,6 +343,70 @@ fn resolve_backend(
         .into());
     }
     Ok(kind)
+}
+
+fn resolve_rosetta_intent(
+    spec: &VmSpec,
+    backend: crate::virt::BackendKind,
+    agent_enabled: bool,
+    request: Option<crate::start_request::RosettaIntentRequest>,
+) -> eyre::Result<crate::virt::RosettaIntent> {
+    use crate::start_request::{RosettaIntentRequest, RosettaProfileRequest};
+    use crate::virt::{BackendKind, RosettaIntent, RosettaProfile};
+
+    let requested = spec.rosetta_or_default();
+    if !requested {
+        return match request {
+            None | Some(RosettaIntentRequest::Disabled) => Ok(RosettaIntent::Disabled),
+            Some(_) => Err(eyre::eyre!(
+                "vmmon start request enables Rosetta but the durable VM spec disables it"
+            )),
+        };
+    }
+    let request = request.ok_or_else(|| {
+        eyre::eyre!(
+            "Rosetta was requested but the start request does not establish a matching runtime and guest contract"
+        )
+    })?;
+    if !agent_enabled {
+        return Err(eyre::eyre!(
+            "Rosetta requires the managed guest agent before VM construction"
+        ));
+    }
+    if spec.nested_virtualization_or_default() {
+        return Err(eyre::eyre!(
+            "Rosetta does not support nested virtualization"
+        ));
+    }
+
+    let expected = match backend {
+        BackendKind::Vz => RosettaIntentRequest::VzNative,
+        BackendKind::Krun => RosettaIntentRequest::KrunCaptured {
+            profile: RosettaProfileRequest::CapturedCompatibilityV1,
+        },
+        #[cfg(feature = "mock-backend")]
+        BackendKind::Mock => {
+            return Err(eyre::eyre!("Rosetta is not supported by the mock backend"))
+        }
+    };
+    if request != expected {
+        return Err(eyre::eyre!(
+            "Rosetta start-request intent does not agree with backend {} and the durable VM spec",
+            backend.name()
+        ));
+    }
+
+    match request {
+        RosettaIntentRequest::Disabled => Err(eyre::eyre!(
+            "Rosetta was requested but the start request disables it"
+        )),
+        RosettaIntentRequest::VzNative => Ok(RosettaIntent::VzNative),
+        RosettaIntentRequest::KrunCaptured {
+            profile: RosettaProfileRequest::CapturedCompatibilityV1,
+        } => Ok(RosettaIntent::KrunCaptured {
+            profile: RosettaProfile::CapturedCompatibilityV1,
+        }),
+    }
 }
 
 fn create_virtual_machine(
@@ -460,7 +532,107 @@ mod tests {
     use nix::unistd::pipe;
 
     use crate::machine::RuntimeNetwork;
-    use crate::startup::{parse_network_arg, secure_machine_dir, SyncReporter};
+    use crate::startup::{
+        parse_network_arg, resolve_rosetta_intent, secure_machine_dir, SyncReporter,
+    };
+
+    fn rosetta_spec(enabled: bool) -> vm_spec::VmSpec {
+        vm_spec::VmSpec {
+            hardware: Some(vm_spec::Hardware {
+                cpus: None,
+                memory: None,
+                nested_virtualization: Some(false),
+                rosetta: Some(enabled),
+            }),
+            ..vm_spec::VmSpec::current()
+        }
+    }
+
+    #[test]
+    fn rosetta_intent_is_strictly_paired_with_spec_backend_and_agent() {
+        use crate::start_request::{RosettaIntentRequest, RosettaProfileRequest};
+        use crate::virt::{BackendKind, RosettaIntent, RosettaProfile};
+
+        let disabled = rosetta_spec(false);
+        assert_eq!(
+            resolve_rosetta_intent(&disabled, BackendKind::Krun, false, None)
+                .expect("old disabled request"),
+            RosettaIntent::Disabled
+        );
+        assert!(resolve_rosetta_intent(
+            &disabled,
+            BackendKind::Vz,
+            true,
+            Some(RosettaIntentRequest::VzNative)
+        )
+        .is_err());
+
+        let enabled = rosetta_spec(true);
+        for backend in [BackendKind::Vz, BackendKind::Krun] {
+            assert!(resolve_rosetta_intent(&enabled, backend, true, None)
+                .expect_err("enabled Rosetta requires parent contract metadata")
+                .to_string()
+                .contains("matching runtime and guest contract"));
+        }
+        assert_eq!(
+            resolve_rosetta_intent(
+                &enabled,
+                BackendKind::Vz,
+                true,
+                Some(RosettaIntentRequest::VzNative),
+            )
+            .expect("paired VZ-native intent"),
+            RosettaIntent::VzNative
+        );
+        assert_eq!(
+            resolve_rosetta_intent(
+                &enabled,
+                BackendKind::Krun,
+                true,
+                Some(RosettaIntentRequest::KrunCaptured {
+                    profile: RosettaProfileRequest::CapturedCompatibilityV1,
+                })
+            )
+            .expect("paired krun capture intent"),
+            RosettaIntent::KrunCaptured {
+                profile: RosettaProfile::CapturedCompatibilityV1
+            }
+        );
+        assert!(resolve_rosetta_intent(
+            &enabled,
+            BackendKind::Krun,
+            true,
+            Some(RosettaIntentRequest::VzNative)
+        )
+        .is_err());
+        assert!(resolve_rosetta_intent(
+            &enabled,
+            BackendKind::Vz,
+            false,
+            Some(RosettaIntentRequest::VzNative)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rosetta_rejects_nested_virtualization_before_backend_construction() {
+        use crate::start_request::RosettaIntentRequest;
+        use crate::virt::BackendKind;
+
+        let mut spec = rosetta_spec(true);
+        spec.hardware
+            .as_mut()
+            .expect("hardware")
+            .nested_virtualization = Some(true);
+        let error = resolve_rosetta_intent(
+            &spec,
+            BackendKind::Vz,
+            true,
+            Some(RosettaIntentRequest::VzNative),
+        )
+        .expect_err("reject nested virtualization");
+        assert!(error.to_string().contains("nested virtualization"));
+    }
 
     #[tokio::test]
     async fn malformed_start_request_fails_before_vm_spec_or_vmm_construction() {

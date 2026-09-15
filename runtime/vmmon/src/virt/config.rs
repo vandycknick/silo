@@ -118,6 +118,22 @@ pub struct KrunOptions {
     pub host_memory_reclaim: HostMemoryReclaim,
 }
 
+/// Backend-specific realization of a machine's transient Rosetta intent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RosettaIntent {
+    #[default]
+    Disabled,
+    VzNative,
+    KrunCaptured {
+        profile: RosettaProfile,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RosettaProfile {
+    CapturedCompatibilityV1,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HostMemoryReclaim {
     Auto,
@@ -128,8 +144,6 @@ pub enum HostMemoryReclaim {
 /// Options consumed only by the Virtualization.framework (macOS) backend.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VzOptions {
-    /// Mount a Rosetta directory share for x86_64 binary translation.
-    pub rosetta: bool,
     /// Persisted machine identity; generated on first boot and written back.
     pub machine_identifier: Option<MachineIdentifier>,
 }
@@ -161,6 +175,7 @@ pub struct VmConfig {
     network: NetworkMode,
     disks: Vec<DiskImage>,
     mounts: Vec<SharedDirectory>,
+    rosetta: RosettaIntent,
     krun: KrunOptions,
     vz: VzOptions,
     mock: MockOptions,
@@ -222,6 +237,10 @@ impl VmConfig {
 
     pub fn mounts(&self) -> &[SharedDirectory] {
         &self.mounts
+    }
+
+    pub fn rosetta(&self) -> RosettaIntent {
+        self.rosetta
     }
 
     pub fn krun(&self) -> &KrunOptions {
@@ -352,9 +371,8 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Enable a Rosetta share (macOS backend only; ignored elsewhere).
-    pub fn rosetta(mut self, enabled: bool) -> Self {
-        self.config.vz.rosetta = enabled;
+    pub fn rosetta(mut self, intent: RosettaIntent) -> Self {
+        self.config.rosetta = intent;
         self
     }
 
@@ -391,6 +409,17 @@ pub(crate) fn validate_common(config: &VmConfig) -> Result<(), VirtError> {
     if config.memory_mib == Some(0) {
         return Err(invalid("memory size must be nonzero".to_string()));
     }
+    if config.rosetta != RosettaIntent::Disabled
+        && config
+            .mounts
+            .iter()
+            .any(|mount| mount.tag == agent_spec::ROSETTA_MOUNT_TAG)
+    {
+        return Err(invalid(format!(
+            "mount tag {:?} is reserved for Rosetta",
+            agent_spec::ROSETTA_MOUNT_TAG
+        )));
+    }
 
     Ok(())
 }
@@ -412,7 +441,7 @@ mod tests {
         let config = base_builder()
             .krun_path("/usr/libexec/krun")
             .host_memory_reclaim(HostMemoryReclaim::Auto)
-            .rosetta(true)
+            .rosetta(RosettaIntent::VzNative)
             .machine_identifier(identifier.clone())
             .build();
 
@@ -420,17 +449,17 @@ mod tests {
             config.krun().helper_path.as_deref(),
             Some(Path::new("/usr/libexec/krun"))
         );
-        assert!(config.vz().rosetta);
+        assert_eq!(config.rosetta(), RosettaIntent::VzNative);
         assert_eq!(config.krun().host_memory_reclaim, HostMemoryReclaim::Auto);
         assert_eq!(config.vz().machine_identifier, Some(identifier));
     }
 
     #[test]
     fn host_memory_reclaim_defaults_off_without_changing_rosetta_intent() {
-        let config = base_builder().rosetta(true).build();
+        let config = base_builder().rosetta(RosettaIntent::VzNative).build();
 
         assert_eq!(config.krun().host_memory_reclaim, HostMemoryReclaim::Off);
-        assert!(config.vz().rosetta);
+        assert_eq!(config.rosetta(), RosettaIntent::VzNative);
     }
 
     #[test]
@@ -473,6 +502,21 @@ mod tests {
             validate_common(&config),
             Err(VirtError::InvalidConfig { .. })
         ));
+    }
+
+    #[test]
+    fn enabled_rosetta_reserves_its_share_tag() {
+        let config = base_builder()
+            .rosetta(RosettaIntent::VzNative)
+            .mount(SharedDirectory {
+                host_path: "/tmp/user-rosetta".into(),
+                tag: agent_spec::ROSETTA_MOUNT_TAG.to_string(),
+                read_only: true,
+            })
+            .build();
+
+        let error = validate_common(&config).expect_err("reject reserved mount tag");
+        assert!(error.to_string().contains("reserved for Rosetta"));
     }
 
     #[test]

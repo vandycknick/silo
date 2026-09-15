@@ -131,12 +131,12 @@ impl Machine {
                     .await);
                 }
             };
-            let agent_enabled = match runtime.prepare_vmmon_launch_inputs(
+            let launch_inputs = match runtime.prepare_vmmon_launch_inputs(
                 &config,
                 &resolved_network,
                 root_disk_resize == RootDiskResizeOutcome::GuestRequired,
             ) {
-                Ok(agent_enabled) => agent_enabled,
+                Ok(inputs) => inputs,
                 Err(err) => {
                     return Err(finish_failed_start(
                         runtime,
@@ -149,7 +149,7 @@ impl Machine {
                     .await);
                 }
             };
-            if options.entrypoint.is_some() && !agent_enabled {
+            if options.entrypoint.is_some() && !launch_inputs.agent_enabled {
                 let error = LibVmError::MachinePreparationFailed {
                     reference: config.name.clone(),
                     message: "an entrypoint requires the managed guest agent".to_string(),
@@ -194,7 +194,8 @@ impl Machine {
                 network: &resolved_network,
                 run_id: &run_id,
                 exit_command: options.on_exit.as_ref(),
-                agent_enabled,
+                agent_enabled: launch_inputs.agent_enabled,
+                rosetta_intent: launch_inputs.rosetta_intent,
                 startup_command: startup_command.as_ref(),
                 machine_log_dir: &machine_log_dir,
                 machine_lock: &lifetime_lock,

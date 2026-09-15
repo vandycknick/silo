@@ -24,7 +24,7 @@ const ROSETTA_REGISTRATION_PREFIX: &[u8] = br":rosetta:M::\x7fELF\x02\x01\x01\x0
 // - O opens the target binary and passes the fd to the interpreter.
 // - C uses target-binary credentials and implies O; this matches normal exec semantics.
 // - F opens and pins the interpreter at registration time. Docker containers,
-//   chroots, and mount namespaces may not have /mnt/silo-rosetta mounted, so
+//   chroots, and mount namespaces may not have /mnt/rosetta mounted, so
 //   Rosetta needs F even though it can keep the virtiofs mount busy until the
 //   binfmt entry is unregistered.
 const ROSETTA_REGISTRATION_SUFFIX: &[u8] = b":OCF";
@@ -216,21 +216,25 @@ impl BinFmtEntryStatus {
 mod tests {
     use std::path::Path;
 
+    use agent_spec::ROSETTA_INTERPRETER_PATH;
+
     #[test]
     fn registration_uses_configured_rosetta_path() {
-        let registration = super::rosetta_registration(Path::new("/mnt/rosetta/rosetta"));
+        let registration =
+            crate::provision::rosetta::rosetta_registration(Path::new(ROSETTA_INTERPRETER_PATH));
 
-        assert!(registration.starts_with(super::ROSETTA_REGISTRATION_PREFIX));
-        assert!(registration.ends_with(super::ROSETTA_REGISTRATION_SUFFIX));
+        assert!(registration.starts_with(crate::provision::rosetta::ROSETTA_REGISTRATION_PREFIX));
+        assert!(registration.ends_with(crate::provision::rosetta::ROSETTA_REGISTRATION_SUFFIX));
         assert!(!registration.contains(&0));
         assert!(registration
-            .windows(b"/mnt/rosetta/rosetta".len())
-            .any(|window| window == b"/mnt/rosetta/rosetta"));
+            .windows(ROSETTA_INTERPRETER_PATH.len())
+            .any(|window| window == ROSETTA_INTERPRETER_PATH.as_bytes()));
     }
 
     #[test]
     fn registration_uses_escaped_magic_and_ocf_flags() {
-        let registration = super::rosetta_registration(Path::new("/mnt/rosetta/rosetta"));
+        let registration =
+            crate::provision::rosetta::rosetta_registration(Path::new(ROSETTA_INTERPRETER_PATH));
 
         assert!(registration
             .windows(br"\x00".len())
@@ -240,14 +244,14 @@ mod tests {
 
     #[test]
     fn parses_registered_binfmt_entry_status() {
-        let status = super::BinFmtEntryStatus::parse(
-            "enabled\ninterpreter /mnt/silo-rosetta/rosetta\nflags: OCF\n",
+        let status = crate::provision::rosetta::BinFmtEntryStatus::parse(
+            "enabled\ninterpreter /mnt/rosetta/rosetta\nflags: OCF\n",
         );
 
         assert_eq!(status.enabled, Some(true));
         assert_eq!(
             status.interpreter.as_deref(),
-            Some("/mnt/silo-rosetta/rosetta")
+            Some(ROSETTA_INTERPRETER_PATH)
         );
         assert_eq!(status.flags.as_deref(), Some("OCF"));
     }
