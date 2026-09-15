@@ -12,8 +12,9 @@ The workspace dependency is pinned by full Git commit in the root
 
 ```text
 repository: https://github.com/vandycknick/libkrun.git
-tracked revision: ff25952c0d94090add6f06d73737a37247cac18f
-public branch: silo/v2
+tracked revision: d34748e32bf3169a81ab16a7c2ba3dcb93716a31
+public branch: silo/v2-reclaim-fast
+previous tracked revision: ff25952c0d94090add6f06d73737a37247cac18f @ silo/v2
 previous tip backup: backup/silo-v2-2026-09-15 @ 10b6f752ba8ea735c3d9edaa549599dcf3f98d18
 pre-split backup: backup/silo-v2-before-feature-split-2026-09-15 @ ea84066ff3c8499a4aac5cdd3ec326aee0667e9b
 fetchable: yes
@@ -24,12 +25,22 @@ or tag is useful for reviewing the fork, but neither replaces the immutable
 commit pin.
 
 The committed revision is reachable through the fork URL: a direct
-`git fetch https://github.com/vandycknick/libkrun.git ff25952c0d94090add6f06d73737a37247cac18f`
+`git fetch https://github.com/vandycknick/libkrun.git d34748e32bf3169a81ab16a7c2ba3dcb93716a31`
 succeeds. Cargo therefore resolves the tracked pin directly from GitHub with no
 local checkout, path patch, URL rewrite, or alternate lockfile. The public
-`silo/v2` branch names the reviewable tip, while release reproducibility comes
+`silo/v2-reclaim-fast` branch names the reviewable tip, while release reproducibility comes
 from the immutable revision in `Cargo.toml` and `Cargo.lock`. The force update
 preserved the former public tip on `backup/silo-v2-2026-09-15`.
+
+The tracked revision changes how the balloon releases guest RAM on macOS.
+Each free-page report is released as `hv_vm_unmap`, `madvise(MADV_FREE_REUSABLE)`,
+`hv_vm_map` with the range remapped immediately, so the host footprint drops
+while later guest refaults are handled in-kernel without a VM exit. Host device
+access to guest memory is no longer guarded by a lease ledger; devices use
+passthrough guest memory the way KVM-based VMMs do. The only shared state is
+one atomic per 2 MiB extent so a vCPU that faults inside the unmap window
+retries after the remap. This removed the throughput collapse that
+`host-memory-reclaim: auto` previously caused on virtio-net and vsock.
 
 The previous fork tip carried an x86_64 initrd placement patch and immediate
 Unix-vsock endpoint release. Upstream now contains its own initrd placement fix

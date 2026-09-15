@@ -70,8 +70,8 @@ promise that the same number of bytes were returned to the host.
 `host-memory-reclaim: auto` separately asks the krun helper to attach a balloon
 and run its per-VM host-reclaim qualification probe. A passing probe enables
 host reclaim for that VM; failed or inconclusive probes leave ordinary guest
-memory active. It defaults to `off` until the release, refault, and cost gates
-are complete. This setting does not change backend selection, vsock, native
+memory active. Releases remap the range immediately so guest refaults stay
+in-kernel; it still defaults to `off` while that path is validated in the field. This setting does not change backend selection, vsock, native
 execution, or Rosetta intent. `daemon status` reports requested and observed
 effective state separately and never treats `auto` as proof that reclaim became
 effective.
