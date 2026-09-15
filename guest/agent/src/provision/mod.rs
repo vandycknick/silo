@@ -13,7 +13,6 @@ use protocol::v1::{
     ProvisionStepReport, ProvisionStepStatus,
 };
 
-use crate::handoff::BootMode;
 use crate::pid1::ProcessSupervisor;
 
 mod ca;
@@ -23,13 +22,10 @@ mod mounts;
 mod network;
 mod resize;
 mod rosetta;
-mod service_manager;
 mod ssh;
 mod timezone;
 mod user;
 mod userdata;
-
-pub(crate) use service_manager::ServiceManagerState;
 
 #[derive(Debug, Default)]
 pub(crate) struct EarlyProvisioning {
@@ -47,7 +43,6 @@ pub fn run_provisioning(
     config: &ProvisionConfig,
     ssh_config: &AgentSshConfig,
     process_supervisor: &ProcessSupervisor,
-    boot_mode: &BootMode,
     early: &EarlyProvisioning,
 ) -> eyre::Result<ProvisionReport> {
     let started_at = timestamp();
@@ -66,7 +61,7 @@ pub fn run_provisioning(
         });
     }
 
-    let context = ProvisionContext::new(process_supervisor.clone(), boot_mode);
+    let context = ProvisionContext::new(process_supervisor.clone());
     tracing::info!("guest reconciliation starting");
 
     let plan = provisioners(config, ssh_config, early)?;
@@ -583,15 +578,13 @@ fn proto_duration(duration: Duration) -> prost_types::Duration {
 pub(crate) struct ProvisionContext {
     root: PathBuf,
     process_supervisor: ProcessSupervisor,
-    service_manager: ServiceManagerState,
 }
 
 impl ProvisionContext {
-    fn new(process_supervisor: ProcessSupervisor, boot_mode: &BootMode) -> Self {
+    fn new(process_supervisor: ProcessSupervisor) -> Self {
         Self {
             root: PathBuf::from("/"),
             process_supervisor,
-            service_manager: ServiceManagerState::detect(boot_mode),
         }
     }
 
@@ -600,7 +593,6 @@ impl ProvisionContext {
         Self {
             root: root.to_path_buf(),
             process_supervisor: ProcessSupervisor::default(),
-            service_manager: ServiceManagerState::detect(&BootMode::Standard),
         }
     }
 
@@ -612,10 +604,6 @@ impl ProvisionContext {
 
     pub(crate) fn process_supervisor(&self) -> &ProcessSupervisor {
         &self.process_supervisor
-    }
-
-    pub(crate) fn service_manager(&self) -> &ServiceManagerState {
-        &self.service_manager
     }
 }
 
@@ -870,10 +858,7 @@ mod tests {
     fn run_plan<'a>(run: &mut ProvisionRun, provisioners: Vec<BoxedProvisioner<'a>>) {
         let plan =
             ProvisionerPlan::new(provisioners).expect("test provisioner plan should be valid");
-        let context = ProvisionContext::new(
-            crate::pid1::ProcessSupervisor::default(),
-            &crate::handoff::BootMode::Standard,
-        );
+        let context = ProvisionContext::new(crate::pid1::ProcessSupervisor::default());
         run.run(&context, plan);
     }
 

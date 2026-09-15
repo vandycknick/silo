@@ -174,7 +174,6 @@ async fn run_agent(
         &agent_config.provision,
         &agent_config.ssh,
         &process_supervisor,
-        boot_mode,
         &early_provisioning,
     ) {
         Ok(report) => report,
