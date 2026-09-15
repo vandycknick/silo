@@ -60,6 +60,16 @@ pub enum ComponentError {
     UnsupportedLinuxRprobeBinary,
     #[error("--rprobe-binary is only valid for component rprobe")]
     UnexpectedRprobeBinary,
+    #[error("--rprobe-kernel-provenance requires --rprobe-kernel")]
+    MissingRprobeKernel,
+    #[error("--rprobe-kernel requires --rprobe-kernel-provenance")]
+    MissingRprobeKernelProvenance,
+    #[error("failed to remove stale installed rprobe manifest {path}")]
+    RemoveRprobeManifest {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
@@ -80,15 +90,19 @@ pub fn build_component(
     component: Component,
     context: &BuildContext<'_>,
 ) -> Result<(), ComponentError> {
-    build_component_with_rprobe_binary(component, context, None)
+    build_component_with_rprobe_binary(component, context, None, None, None)
 }
 
 pub fn build_component_with_rprobe_binary(
     component: Component,
     context: &BuildContext<'_>,
     rprobe_binary: Option<&Path>,
+    rprobe_kernel: Option<&Path>,
+    rprobe_kernel_provenance: Option<&Path>,
 ) -> Result<(), ComponentError> {
-    if rprobe_binary.is_some() && !matches!(component, Component::Rprobe) {
+    if (rprobe_binary.is_some() || rprobe_kernel.is_some() || rprobe_kernel_provenance.is_some())
+        && !matches!(component, Component::Rprobe)
+    {
         return Err(ComponentError::UnexpectedRprobeBinary);
     }
     match component {
@@ -100,7 +114,12 @@ pub fn build_component_with_rprobe_binary(
         Component::Portd => build_guest_portd(context),
         Component::Init => build_guest_init(context),
         Component::Initramfs => build_initramfs(context),
-        Component::Rprobe => build_rprobe(context, rprobe_binary),
+        Component::Rprobe => build_rprobe(
+            context,
+            rprobe_binary,
+            rprobe_kernel,
+            rprobe_kernel_provenance,
+        ),
         Component::GoFfi => build_cargo_package(context, "silo-go-ffi"),
     }
 }
@@ -371,6 +390,8 @@ fn build_guest_init(context: &BuildContext<'_>) -> Result<(), ComponentError> {
 fn build_rprobe(
     context: &BuildContext<'_>,
     supplied_binary: Option<&Path>,
+    kernel: Option<&Path>,
+    kernel_provenance: Option<&Path>,
 ) -> Result<(), ComponentError> {
     let binary = match rprobe_binary_source(context.host, supplied_binary)? {
         RprobeBinarySource::NativeBuild => {
@@ -398,11 +419,31 @@ fn build_rprobe(
         }
         RprobeBinarySource::Supplied(path) => path.to_path_buf(),
     };
-    let output = context
+    let assets = context
         .target_dir
         .join(context.profile.directory())
-        .join("assets/rprobe-initramfs");
-    crate::rprobe::package(&binary, &output)?;
+        .join("assets");
+    match (kernel, kernel_provenance) {
+        (Some(kernel), Some(provenance)) => {
+            crate::rprobe::package_assets(&binary, kernel, provenance, &assets)?
+        }
+        (None, None) => {
+            let manifest = assets.join("rprobe.json");
+            match fs::remove_file(&manifest) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(ComponentError::RemoveRprobeManifest {
+                        path: manifest,
+                        source,
+                    })
+                }
+            }
+            crate::rprobe::package(&binary, &assets.join("rprobe-initramfs"))?
+        }
+        (Some(_), None) => return Err(ComponentError::MissingRprobeKernelProvenance),
+        (None, Some(_)) => return Err(ComponentError::MissingRprobeKernel),
+    }
     Ok(())
 }
 

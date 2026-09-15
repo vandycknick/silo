@@ -53,6 +53,10 @@ enum Commands {
         profile: Profile,
         #[arg(long, value_name = "PATH", requires = "component")]
         rprobe_binary: Option<PathBuf>,
+        #[arg(long, value_name = "PATH", requires = "component")]
+        rprobe_kernel: Option<PathBuf>,
+        #[arg(long, value_name = "PATH", requires = "component")]
+        rprobe_kernel_provenance: Option<PathBuf>,
     },
     Kernel {
         #[command(flatten)]
@@ -63,10 +67,14 @@ enum Commands {
         profile: Profile,
         #[command(flatten)]
         kernel: KernelOptions,
+        #[command(flatten)]
+        rprobe: RprobeAssetOptions,
     },
     Archive {
         #[command(flatten)]
         kernel: KernelOptions,
+        #[command(flatten)]
+        rprobe: RprobeAssetOptions,
     },
     App {
         #[arg(long, value_name = "NUMBER")]
@@ -75,6 +83,8 @@ enum Commands {
         developer_id_application: Option<String>,
         #[command(flatten)]
         kernel: KernelOptions,
+        #[command(flatten)]
+        rprobe: RprobeAssetOptions,
     },
     Package {
         #[arg(long, help = "Also create a DMG")]
@@ -85,6 +95,8 @@ enum Commands {
         developer_id_application: Option<String>,
         #[command(flatten)]
         kernel: KernelOptions,
+        #[command(flatten)]
+        rprobe: RprobeAssetOptions,
     },
     Install {
         #[arg(long, value_name = "PATH", default_value = "/Applications")]
@@ -97,6 +109,8 @@ enum Commands {
         developer_id_application: Option<String>,
         #[command(flatten)]
         kernel: KernelOptions,
+        #[command(flatten)]
+        rprobe: RprobeAssetOptions,
     },
     Fmt,
     Clippy,
@@ -136,6 +150,12 @@ enum Commands {
     },
 }
 
+#[derive(Debug, clap::Args)]
+struct RprobeAssetOptions {
+    #[arg(long, value_name = "DIRECTORY")]
+    rprobe_assets: Option<PathBuf>,
+}
+
 #[derive(Debug, Error)]
 enum XtaskError {
     #[error(transparent)]
@@ -165,31 +185,58 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     match args.command {
         Commands::Build { profile, kernel } => {
-            build_release_or_development(&workspace_root, &target_dir, profile, kernel, false)?;
+            build_release_or_development(
+                &workspace_root,
+                &target_dir,
+                profile,
+                kernel,
+                false,
+                None,
+            )?;
         }
         Commands::Component {
             component,
             profile,
             rprobe_binary,
+            rprobe_kernel,
+            rprobe_kernel_provenance,
         } => {
             let context = build_context(&workspace_root, &target_dir, profile)?;
-            build_component_with_rprobe_binary(component, &context, rprobe_binary.as_deref())?;
+            build_component_with_rprobe_binary(
+                component,
+                &context,
+                rprobe_binary.as_deref(),
+                rprobe_kernel.as_deref(),
+                rprobe_kernel_provenance.as_deref(),
+            )?;
         }
         Commands::Kernel { kernel } => {
             let context = build_context(&workspace_root, &target_dir, Profile::Debug)?;
             let kernel = kernel::resolve(&context, &kernel)?;
             println!("{}", kernel.path.display());
         }
-        Commands::Stage { profile, kernel } => {
-            build_release_or_development(&workspace_root, &target_dir, profile, kernel, true)?;
+        Commands::Stage {
+            profile,
+            kernel,
+            rprobe,
+        } => {
+            build_release_or_development(
+                &workspace_root,
+                &target_dir,
+                profile,
+                kernel,
+                true,
+                rprobe.rprobe_assets.as_deref(),
+            )?;
         }
-        Commands::Archive { kernel } => {
+        Commands::Archive { kernel, rprobe } => {
             build_release_or_development(
                 &workspace_root,
                 &target_dir,
                 Profile::Release,
                 kernel,
                 true,
+                rprobe.rprobe_assets.as_deref(),
             )?;
             archive::produce(&workspace_root, &target_dir)?;
         }
@@ -197,6 +244,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             build_number,
             developer_id_application,
             kernel,
+            rprobe,
         } => {
             let host = HostTarget::current()?;
             if host != HostTarget::MacosArm64 {
@@ -208,6 +256,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Profile::Release,
                 kernel,
                 true,
+                rprobe.rprobe_assets.as_deref(),
             )?;
             app::assemble(
                 &workspace_root,
@@ -221,6 +270,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             build_number,
             developer_id_application,
             kernel,
+            rprobe,
         } => {
             require_macos_arm64()?;
             build_release_or_development(
@@ -229,6 +279,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Profile::Release,
                 kernel,
                 true,
+                rprobe.rprobe_assets.as_deref(),
             )?;
             app::assemble(
                 &workspace_root,
@@ -250,6 +301,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             build_number,
             developer_id_application,
             kernel,
+            rprobe,
         } => {
             require_macos_arm64()?;
             build_release_or_development(
@@ -258,6 +310,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Profile::Release,
                 kernel,
                 true,
+                rprobe.rprobe_assets.as_deref(),
             )?;
             app::assemble(
                 &workspace_root,
@@ -303,7 +356,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             profile,
             kernel,
         } => {
-            build_release_or_development(&workspace_root, &target_dir, profile, kernel, true)?;
+            build_release_or_development(
+                &workspace_root,
+                &target_dir,
+                profile,
+                kernel,
+                true,
+                None,
+            )?;
             let context = build_context(&workspace_root, &target_dir, profile)?;
             build_component(Component::GoFfi, &context)?;
             go_sdk::run_example(&context, &example)?;
@@ -337,11 +397,12 @@ fn build_release_or_development(
     profile: Profile,
     kernel_options: KernelOptions,
     stage: bool,
+    rprobe_assets: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let context = build_context(workspace_root, target_dir, profile)?;
     build_all(&context)?;
     let kernel = kernel::resolve(&context, &kernel_options)?;
-    runtime::assemble_development(&context, &kernel)?;
+    runtime::assemble_development(&context, &kernel, rprobe_assets)?;
     if stage {
         runtime::stage(&context)?;
     }

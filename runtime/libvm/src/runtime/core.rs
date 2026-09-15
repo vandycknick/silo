@@ -1121,6 +1121,7 @@ impl Runtime {
                 .vmmon
                 .rosetta_intent_request(config)
                 .map_err(eyre::Report::msg)?;
+            let _rprobe_assets = self.components.resolve_rprobe_assets(rosetta_intent)?;
             let relative_mount_base = std::env::current_dir()
                 .context("resolve current directory for relative mount sources")?;
             let machine_paths = self.machine_paths(config.id);

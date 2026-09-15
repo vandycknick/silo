@@ -1,8 +1,10 @@
 use std::fs::{self, File};
 use std::io::{self, Read};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -18,6 +20,27 @@ const ELF_PROGRAM_DYNAMIC: u32 = 2;
 const ELF_PROGRAM_INTERPRETER: u32 = 3;
 const ELF_PROGRAM_EXECUTABLE: u32 = 1;
 
+pub const ASSETS: [(&str, u32); 3] = [
+    ("rprobe-kernel", 0o644),
+    ("rprobe-initramfs", 0o644),
+    ("rprobe.json", 0o644),
+];
+
+pub fn installed_asset_set_present(assets: &Path) -> io::Result<bool> {
+    Ok(
+        entry_present(&assets.join("rprobe-kernel"))?
+            || entry_present(&assets.join("rprobe.json"))?,
+    )
+}
+
+fn entry_present(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RprobeError {
     #[error(transparent)]
@@ -32,8 +55,12 @@ pub enum RprobeError {
     NonDeterministicArchive,
     #[error("failed to remove temporary archive {path}")]
     RemoveTemporary { path: PathBuf, source: io::Error },
-    #[error("failed to publish rprobe initramfs {path}")]
+    #[error("failed to publish rprobe artifact {path}")]
     Publish { path: PathBuf, source: io::Error },
+    #[error("invalid rprobe kernel provenance {path}: {reason}")]
+    InvalidProvenance { path: PathBuf, reason: String },
+    #[error("failed to serialize rprobe asset manifest")]
+    SerializeManifest(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, RprobeError>;
@@ -67,6 +94,111 @@ pub fn package(binary: &Path, output: &Path) -> Result<()> {
         archive_identity.sha256
     );
     Ok(())
+}
+
+pub fn package_assets(
+    binary: &Path,
+    kernel: &Path,
+    kernel_provenance: &Path,
+    assets: &Path,
+) -> Result<()> {
+    let binary_identity = validate_elf(binary)?;
+    let kernel_identity = file_identity(kernel)?;
+    let provenance = read_kernel_provenance(kernel_provenance, &kernel_identity)?;
+    fs::create_dir_all(assets).map_err(|source| RprobeError::Publish {
+        path: assets.to_path_buf(),
+        source,
+    })?;
+
+    let initramfs = assets.join("rprobe-initramfs");
+    package(binary, &initramfs)?;
+    let initramfs_identity = file_identity(&initramfs)?;
+    let installed_kernel = assets.join("rprobe-kernel");
+    fs::copy(kernel, &installed_kernel).map_err(|source| RprobeError::Publish {
+        path: installed_kernel.clone(),
+        source,
+    })?;
+    for path in [&installed_kernel, &initramfs] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).map_err(|source| {
+            RprobeError::Publish {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+
+    let manifest = json!({
+        "version": 1,
+        "purpose": "rosetta-acquisition-probe",
+        "profile": "rprobe",
+        "kernel": manifest_asset("rprobe-kernel", &kernel_identity),
+        "initramfs": manifest_asset("rprobe-initramfs", &initramfs_identity),
+        "capture": {
+            "profile": "capturedCompatibilityV1",
+            "request": 0x8045_6122_u32,
+            "payloadBytes": 1024,
+            "diagnosticPort": "hvc0",
+            "dataPort": "hvc1",
+            "cpus": 1,
+            "memoryMiB": 128
+        },
+        "provenance": {
+            "kernel": provenance,
+            "probe": {
+                "size": binary_identity.size,
+                "sha256": binary_identity.sha256
+            }
+        }
+    });
+    let manifest_path = assets.join("rprobe.json");
+    let mut bytes = serde_json::to_vec_pretty(&manifest)?;
+    bytes.push(b'\n');
+    fs::write(&manifest_path, bytes).map_err(|source| RprobeError::Publish {
+        path: manifest_path.clone(),
+        source,
+    })?;
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o644)).map_err(|source| {
+        RprobeError::Publish {
+            path: manifest_path,
+            source,
+        }
+    })?;
+    Ok(())
+}
+
+fn manifest_asset(name: &str, identity: &FileIdentity) -> Value {
+    json!({
+        "file": name,
+        "size": identity.size,
+        "sha256": identity.sha256,
+    })
+}
+
+fn read_kernel_provenance(path: &Path, identity: &FileIdentity) -> Result<Value> {
+    let bytes = fs::read(path).map_err(|source| RprobeError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let provenance: Value =
+        serde_json::from_slice(&bytes).map_err(|error| RprobeError::InvalidProvenance {
+            path: path.to_path_buf(),
+            reason: format!("parse JSON: {error}"),
+        })?;
+    let expected_digest = format!("sha256:{}", identity.sha256);
+    let valid = provenance.get("schemaVersion").and_then(Value::as_u64) == Some(1)
+        && provenance.get("profile").and_then(Value::as_str) == Some("rprobe")
+        && provenance.get("purpose").and_then(Value::as_str) == Some("rosetta-acquisition-probe")
+        && provenance.pointer("/kernel/size").and_then(Value::as_u64) == Some(identity.size)
+        && provenance.pointer("/kernel/digest").and_then(Value::as_str)
+            == Some(expected_digest.as_str());
+    if !valid {
+        return Err(RprobeError::InvalidProvenance {
+            path: path.to_path_buf(),
+            reason: "profile, purpose, or kernel identity does not match the supplied Image"
+                .to_string(),
+        });
+    }
+    Ok(provenance)
 }
 
 fn temporary_archive(output: &Path, label: &str) -> PathBuf {
