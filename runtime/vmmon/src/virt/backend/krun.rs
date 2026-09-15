@@ -446,12 +446,25 @@ fn validate(config: &VmConfig) -> Result<(), VirtError> {
     }
     match config.rosetta() {
         crate::virt::RosettaIntent::Disabled => {}
-        crate::virt::RosettaIntent::KrunCaptured { .. } => {
-            return invalid_config(
-                config,
-                "captured Rosetta is not enabled for production krun launches yet\n\nhint: select the vz backend",
-            )
-        }
+        crate::virt::RosettaIntent::KrunCaptured { profile } => match (
+            profile,
+            config
+                .krun()
+                .prepared_rosetta
+                .as_ref()
+                .map(|value| value.profile()),
+        ) {
+            (
+                crate::virt::RosettaProfile::CapturedCompatibilityV1,
+                Some(krun::RosettaProfileId::CapturedCompatibilityV1),
+            ) => {}
+            _ => {
+                return invalid_config(
+                    config,
+                    "captured Rosetta launch data is missing or mismatched",
+                )
+            }
+        },
         crate::virt::RosettaIntent::VzNative => {
             return invalid_config(config, "VZ-native Rosetta intent cannot be used with krun")
         }
@@ -547,6 +560,10 @@ fn build_krun_vm(
         ))
         .vsock_mux_fd(vsock_mux_fd)
         .stdio_console(true);
+
+    if let Some(rosetta) = config.krun().prepared_rosetta.clone() {
+        builder = builder.rosetta(rosetta);
+    }
 
     if let Some(initramfs) = config.initramfs_path() {
         builder = builder.initramfs(initramfs);
@@ -851,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn rosetta_rejection_names_the_vz_escape_hatch() {
+    fn captured_rosetta_requires_prepared_acquisition_data() {
         let root = test_dir();
         fs::create_dir_all(&root).expect("create test root");
         let kernel = root.join("kernel");
@@ -866,11 +883,33 @@ mod tests {
             })
             .build();
 
-        let error = validate(&config).expect_err("reject Rosetta");
+        let error = validate(&config).expect_err("reject missing acquisition data");
         assert!(error
             .to_string()
-            .contains("captured Rosetta is not enabled for production krun launches yet"));
-        assert!(error.to_string().contains("select the vz backend"));
+            .contains("captured Rosetta launch data is missing or mismatched"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn captured_rosetta_accepts_matching_typed_acquisition_data() {
+        let root = test_dir();
+        fs::create_dir_all(&root).expect("create test root");
+        let kernel = root.join("kernel");
+        fs::write(&kernel, b"kernel").expect("write kernel");
+        let prepared = krun::RosettaLaunchConfig::new(root.clone(), [0x11; 32], 1, [0x22; 1024])
+            .expect("prepared Rosetta config");
+        let config = VmConfig::builder("krun-rosetta")
+            .base_directory(&root)
+            .cpus(1)
+            .memory(128)
+            .kernel(kernel)
+            .rosetta(crate::virt::RosettaIntent::KrunCaptured {
+                profile: crate::virt::RosettaProfile::CapturedCompatibilityV1,
+            })
+            .prepared_rosetta(prepared)
+            .build();
+
+        validate(&config).expect("accept matching captured Rosetta data");
         let _ = fs::remove_dir_all(root);
     }
 

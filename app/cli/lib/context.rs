@@ -114,10 +114,6 @@ impl Context {
             .ok_or_else(|| eyre::eyre!("application API was not initialized"))
     }
 
-    pub(crate) fn virt_backend_override(&self) -> eyre::Result<Option<libvm::VirtBackendOverride>> {
-        libvm::VirtBackendOverride::from_env().map_err(Into::into)
-    }
-
     pub(crate) fn resolve_machine_name(&mut self, name: Option<&str>) -> eyre::Result<String> {
         if let Some(name) = name {
             return Ok(name.to_string());

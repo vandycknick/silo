@@ -24,6 +24,10 @@ pub(crate) struct VmmonStartRequest {
     pub(crate) host_memory_reclaim: HostMemoryReclaimRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rosetta_intent: Option<RosettaIntentRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rosetta_probe_assets: Option<RosettaProbeAssetsRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    startup_budget_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -57,6 +61,14 @@ pub(crate) enum RosettaIntentRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) enum RosettaProfileRequest {
     CapturedCompatibilityV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RosettaProbeAssetsRequest {
+    pub(crate) kernel: std::path::PathBuf,
+    pub(crate) initramfs: std::path::PathBuf,
+    pub(crate) manifest: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -117,6 +129,8 @@ impl StartRequestPipe {
                     virt_backend: None,
                     host_memory_reclaim: HostMemoryReclaimRequest::Off,
                     rosetta_intent: None,
+                    rosetta_probe_assets: None,
+                    startup_budget_ms: None,
                 },
                 expected_machine_id,
                 expected_machine_run_id,
@@ -221,7 +235,45 @@ fn validate_start_request(
     if let Some(backend) = &request.virt_backend {
         validate_backend_request(backend)?;
     }
+    if request
+        .startup_budget_ms
+        .is_some_and(|budget| budget == 0 || budget > 420_000)
+    {
+        return Err(invalid_data("startupBudgetMs must be in 1..=420000"));
+    }
+    match (&request.rosetta_intent, &request.rosetta_probe_assets) {
+        (Some(RosettaIntentRequest::KrunCaptured { .. }), Some(assets)) => {
+            for (name, path) in [
+                ("kernel", &assets.kernel),
+                ("initramfs", &assets.initramfs),
+                ("manifest", &assets.manifest),
+            ] {
+                if !path.is_absolute() {
+                    return Err(invalid_data(format!(
+                        "Rosetta probe {name} path must be absolute"
+                    )));
+                }
+            }
+        }
+        (Some(RosettaIntentRequest::KrunCaptured { .. }), None) => {
+            return Err(invalid_data("KrunCaptured requires Rosetta probe assets"));
+        }
+        (_, Some(_)) => return Err(invalid_data("Rosetta probe assets require KrunCaptured")),
+        (_, None) => {}
+    }
     Ok(request)
+}
+
+impl VmmonStartRequest {
+    pub(crate) fn effective_startup_budget_ms(&self) -> u64 {
+        self.startup_budget_ms.unwrap_or_else(|| {
+            if self.startup_command.is_some() {
+                330_000
+            } else {
+                30_000
+            }
+        })
+    }
 }
 
 fn validate_backend_request(backend: &VirtBackendRequest) -> io::Result<()> {
@@ -343,6 +395,7 @@ mod tests {
         let request = decode_start_request(&encoded, &machine_id, &run_id)
             .expect("decode valid startup request");
         assert_eq!(request.host_memory_reclaim, HostMemoryReclaimRequest::Off);
+        assert_eq!(request.effective_startup_budget_ms(), 330_000);
         assert_eq!(
             request
                 .startup_command
@@ -350,6 +403,57 @@ mod tests {
                 .execution_id,
             execution_id
         );
+    }
+
+    #[test]
+    fn legacy_requests_derive_budget_from_startup_command_presence() {
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        let idle = encode(json!({
+            "version": VMMON_START_REQUEST_VERSION,
+            "machineId": machine_id,
+            "machineRunId": run_id,
+        }));
+        let idle = decode_start_request(&idle, &machine_id, &run_id).expect("decode legacy idle");
+        assert_eq!(idle.effective_startup_budget_ms(), 30_000);
+
+        let startup = encode(json!({
+            "version": VMMON_START_REQUEST_VERSION,
+            "machineId": machine_id,
+            "machineRunId": run_id,
+            "startupCommand": {
+                "executionId": Uuid::new_v4().to_string(),
+                "process": { "argv": ["true"], "environment": [] }
+            }
+        }));
+        let startup =
+            decode_start_request(&startup, &machine_id, &run_id).expect("decode legacy startup");
+        assert_eq!(startup.effective_startup_budget_ms(), 330_000);
+    }
+
+    #[test]
+    fn explicit_startup_budget_must_be_in_the_bounded_range() {
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        for budget in [0_u64, 420_001] {
+            let encoded = encode(json!({
+                "version": VMMON_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+                "startupBudgetMs": budget,
+            }));
+            assert!(decode_start_request(&encoded, &machine_id, &run_id).is_err());
+        }
+
+        let maximum = encode(json!({
+            "version": VMMON_START_REQUEST_VERSION,
+            "machineId": machine_id,
+            "machineRunId": run_id,
+            "startupBudgetMs": 420_000,
+        }));
+        let maximum =
+            decode_start_request(&maximum, &machine_id, &run_id).expect("accept maximum budget");
+        assert_eq!(maximum.effective_startup_budget_ms(), 420_000);
     }
 
     #[test]
@@ -379,7 +483,13 @@ mod tests {
             "rosettaIntent": {
                 "mode": "krunCaptured",
                 "profile": "capturedCompatibilityV1"
-            }
+            },
+            "rosettaProbeAssets": {
+                "kernel": "/runtime/rprobe-kernel",
+                "initramfs": "/runtime/rprobe-initramfs",
+                "manifest": "/runtime/rprobe.json"
+            },
+            "startupBudgetMs": 120000
         }));
         let decoded =
             decode_start_request(&request, &machine_id, &run_id).expect("accept Rosetta contract");
@@ -389,6 +499,8 @@ mod tests {
                 profile: RosettaProfileRequest::CapturedCompatibilityV1
             })
         );
+        assert_eq!(decoded.effective_startup_budget_ms(), 120_000);
+        assert!(decoded.rosetta_probe_assets.is_some());
 
         for (intent, expected) in [
             (json!({"mode": "disabled"}), RosettaIntentRequest::Disabled),

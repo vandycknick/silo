@@ -33,10 +33,11 @@ pub(crate) struct Vmmon {
     host_memory_reclaim: crate::runtime::HostMemoryReclaim,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VmmonLaunchInputs {
     pub(crate) agent_enabled: bool,
     pub(crate) rosetta_intent: start_request::VmmonRosettaIntent,
+    pub(crate) rosetta_probe_assets: Option<start_request::VmmonRosettaProbeAssets>,
 }
 
 impl Vmmon {

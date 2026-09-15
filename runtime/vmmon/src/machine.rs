@@ -43,6 +43,7 @@ pub(crate) struct VmSpecInputs<'a> {
     pub host_memory_reclaim: HostMemoryReclaim,
     pub selected_backend: crate::virt::BackendKind,
     pub rosetta_intent: crate::virt::RosettaIntent,
+    pub prepared_rosetta: Option<krun::RosettaLaunchConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +73,9 @@ pub(crate) fn vm_spec_machine_config(
         ))
         .nested_virtualization(inputs.spec.nested_virtualization_or_default())
         .rosetta(inputs.rosetta_intent);
+    if let Some(prepared) = inputs.prepared_rosetta {
+        builder = builder.prepared_rosetta(prepared);
+    }
 
     builder = apply_runtime_network(builder, inputs.network)?;
 
@@ -347,6 +351,7 @@ mod tests {
             host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("machine config should resolve");
 
@@ -384,6 +389,7 @@ mod tests {
             host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("machine config should resolve");
 
@@ -426,6 +432,7 @@ mod tests {
                 host_memory_reclaim: HostMemoryReclaim::Off,
                 selected_backend: crate::virt::BackendKind::Vz,
                 rosetta_intent: crate::virt::RosettaIntent::Disabled,
+                prepared_rosetta: None,
             })
             .expect("machine config should resolve");
 
@@ -470,6 +477,7 @@ mod tests {
             host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("machine config should resolve");
 
@@ -508,6 +516,7 @@ mod tests {
             host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Krun,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("build VM config with projected mount");
 
@@ -546,6 +555,7 @@ mod tests {
             host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Krun,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect_err("duplicate mount tags must fail before VM construction");
 
@@ -576,6 +586,7 @@ mod tests {
             host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("machine config should resolve");
 
@@ -609,6 +620,7 @@ mod tests {
             host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("machine config should resolve");
 
@@ -641,6 +653,7 @@ mod tests {
             host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("machine config should resolve");
 
@@ -666,6 +679,7 @@ mod tests {
             host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect_err("missing kernel path should fail");
 
@@ -694,6 +708,7 @@ mod tests {
             host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Krun,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("build krun config");
 

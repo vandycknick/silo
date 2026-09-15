@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -22,6 +23,9 @@ pub(crate) struct VmmonStartRequest {
     host_memory_reclaim: VmmonHostMemoryReclaim,
     #[serde(skip_serializing_if = "Option::is_none")]
     rosetta_intent: Option<VmmonRosettaIntent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rosetta_probe_assets: Option<VmmonRosettaProbeAssets>,
+    startup_budget_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -63,6 +67,14 @@ pub(crate) enum VmmonRosettaProfile {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct VmmonRosettaProbeAssets {
+    pub(crate) kernel: PathBuf,
+    pub(crate) initramfs: PathBuf,
+    pub(crate) manifest: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct VmmonStartupCommand {
     pub(crate) execution_id: Uuid,
     pub(crate) process: VmmonProcessSpec,
@@ -91,6 +103,11 @@ impl VmmonStartRequest {
         machine_run_id: impl Into<String>,
         startup_command: Option<VmmonStartupCommand>,
     ) -> Self {
+        let startup_budget_ms = if startup_command.is_some() {
+            330_000
+        } else {
+            30_000
+        };
         Self {
             version: VMMON_START_REQUEST_VERSION,
             machine_id: machine_id.into(),
@@ -99,6 +116,8 @@ impl VmmonStartRequest {
             virt_backend: None,
             host_memory_reclaim: VmmonHostMemoryReclaim::Off,
             rosetta_intent: None,
+            rosetta_probe_assets: None,
+            startup_budget_ms,
         }
     }
 
@@ -117,6 +136,19 @@ impl VmmonStartRequest {
             VmmonRosettaIntent::Disabled => None,
             intent => Some(intent),
         };
+        self
+    }
+
+    pub(crate) fn with_rosetta_probe_assets(
+        mut self,
+        assets: Option<VmmonRosettaProbeAssets>,
+    ) -> Self {
+        self.rosetta_probe_assets = assets;
+        self
+    }
+
+    pub(crate) fn with_startup_budget(mut self, budget: std::time::Duration) -> Self {
+        self.startup_budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
         self
     }
 }
@@ -149,7 +181,7 @@ mod tests {
     };
 
     #[test]
-    fn disabled_rosetta_preserves_the_old_native_encoding() {
+    fn disabled_rosetta_carries_only_the_native_startup_budget_addition() {
         let request = VmmonStartRequest::new(
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
@@ -159,7 +191,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(encode_start_request(&request).expect("encode request"))
                 .expect("UTF-8 request"),
-            "{\"version\":1,\"machineId\":\"01234567-89ab-cdef-0123-456789abcdef\",\"machineRunId\":\"9e7d6ad8-f804-4936-9633-1fd3df6bd7d3\"}\n"
+            "{\"version\":1,\"machineId\":\"01234567-89ab-cdef-0123-456789abcdef\",\"machineRunId\":\"9e7d6ad8-f804-4936-9633-1fd3df6bd7d3\",\"startupBudgetMs\":30000}\n"
         );
     }
 
@@ -192,6 +224,7 @@ mod tests {
         );
         assert_eq!(value["startupCommand"]["process"]["argv"][1], "--all");
         assert!(value["startupCommand"]["process"].get("stdio").is_none());
+        assert_eq!(value["startupBudgetMs"], 330_000);
     }
 
     #[test]

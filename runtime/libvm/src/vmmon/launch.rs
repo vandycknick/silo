@@ -40,6 +40,7 @@ pub(crate) struct VmmonLaunch<'a> {
     pub(crate) exit_command: Option<&'a HostCommand>,
     pub(crate) agent_enabled: bool,
     pub(crate) rosetta_intent: crate::vmmon::start_request::VmmonRosettaIntent,
+    pub(crate) rosetta_probe_assets: Option<crate::vmmon::start_request::VmmonRosettaProbeAssets>,
     pub(crate) startup_command: Option<&'a VmmonStartupCommand>,
     pub(crate) machine_log_dir: &'a OwnedDirectory,
     pub(crate) machine_lock: &'a MachineLifetimeLock,
@@ -47,6 +48,8 @@ pub(crate) struct VmmonLaunch<'a> {
 
 impl Vmmon {
     pub(crate) async fn spawn(&self, launch: &VmmonLaunch<'_>) -> Result<(), LibVmError> {
+        let startup_budget = startup_budget(launch);
+        let startup_deadline = Instant::now() + startup_budget;
         let (start_read, start_write) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
         let (sync_read, sync_write) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
         configure_pipe_inheritance(&start_read, &start_write, &sync_read, &sync_write)?;
@@ -115,14 +118,29 @@ impl Vmmon {
         )
         .with_virt_backend(self.virt_backend_request())
         .with_host_memory_reclaim(self.host_memory_reclaim_request())
-        .with_rosetta_intent(launch.rosetta_intent);
+        .with_rosetta_intent(launch.rosetta_intent)
+        .with_rosetta_probe_assets(launch.rosetta_probe_assets.clone())
+        .with_startup_budget(startup_deadline.saturating_duration_since(Instant::now()));
         handoff_start_request(start_write, &start_request, VMMON_START_REQUEST_TIMEOUT).await?;
-        let readiness_timeout = if launch.startup_command.is_some() {
-            Duration::from_secs(5 * 60 + 30)
-        } else {
-            Duration::from_secs(30)
-        };
-        wait_for_start(sync_read, launch.trace_log, readiness_timeout).await
+        wait_for_start(
+            sync_read,
+            launch.trace_log,
+            startup_deadline.saturating_duration_since(Instant::now()),
+        )
+        .await
+    }
+}
+
+fn startup_budget(launch: &VmmonLaunch<'_>) -> Duration {
+    let translated = matches!(
+        launch.rosetta_intent,
+        crate::vmmon::start_request::VmmonRosettaIntent::KrunCaptured { .. }
+    );
+    match (translated, launch.startup_command.is_some()) {
+        (true, true) => Duration::from_secs(420),
+        (true, false) => Duration::from_secs(120),
+        (false, true) => Duration::from_secs(330),
+        (false, false) => Duration::from_secs(30),
     }
 }
 

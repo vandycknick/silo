@@ -242,6 +242,15 @@ async fn run_guest(
                     _ => {}
                 }
                 if terminal {
+                    match event.event.as_ref() {
+                        Some(ExecutionEventKind::Exited(exited)) => {
+                            tracing::info!(%execution_id, exit_code = exited.code, "startup command exited");
+                        }
+                        Some(ExecutionEventKind::Signaled(signaled)) => {
+                            tracing::info!(%execution_id, signal = ?signaled.signal, "startup command was signaled");
+                        }
+                        _ => {}
+                    }
                     return Ok(());
                 }
             }

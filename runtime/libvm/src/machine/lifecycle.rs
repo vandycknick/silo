@@ -196,6 +196,7 @@ impl Machine {
                 exit_command: options.on_exit.as_ref(),
                 agent_enabled: launch_inputs.agent_enabled,
                 rosetta_intent: launch_inputs.rosetta_intent,
+                rosetta_probe_assets: launch_inputs.rosetta_probe_assets,
                 startup_command: startup_command.as_ref(),
                 machine_log_dir: &machine_log_dir,
                 machine_lock: &lifetime_lock,

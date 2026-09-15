@@ -14,6 +14,8 @@ mod forward;
 mod guest;
 mod lock;
 mod machine;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod rosetta;
 mod secure_file;
 mod services;
 mod shutdown;
@@ -175,7 +177,18 @@ async fn run(
         args.config.clone(),
         args.socket.clone(),
     );
+    let startup_cancel = tokio_util::sync::CancellationToken::new();
     let pid_guard = PidGuard::create(&args.pidfile).await?;
+    let mut parent_loss_monitor = Some(sync_reporter.monitor_parent_loss(startup_cancel.clone())?);
+    let mut signal_task = match spawn_startup_signal_handler(startup_cancel.clone()) {
+        Ok(task) => Some(task),
+        Err(error) => {
+            if let Some(monitor) = parent_loss_monitor.take() {
+                monitor.shutdown().await;
+            }
+            return Err(error);
+        }
+    };
 
     let (exec_log, _exec_log_guard) = match machine_log_dir {
         Some(fd) => match crate::exec_log::ExecLogDirectory::from_fd(fd)
@@ -198,7 +211,14 @@ async fn run(
         krun_path: &args.krun_path,
         serial_file,
     };
-    let result = match startup::init(&runtime, startup_inputs, &mut start_request).await {
+    let result = match startup::init(
+        &runtime,
+        startup_inputs,
+        &mut start_request,
+        startup_cancel.clone(),
+    )
+    .await
+    {
         Ok(initialized) => match services::start_services(
             &runtime,
             &initialized.context,
@@ -206,22 +226,50 @@ async fn run(
             exec_log.clone(),
             initialized.vsock_surface,
             &mut sync_reporter,
+            services::StartupGate {
+                require_guest_ready: initialized.require_guest_ready,
+                deadline: initialized.startup_deadline,
+                cancelled: initialized.startup_cancel.clone(),
+            },
         )
         .await
         {
-            Ok(handles) => shutdown::run(runtime, initialized.context, handles).await,
+            Ok(handles) => {
+                if let Some(task) = signal_task.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
+                if let Some(monitor) = parent_loss_monitor.take() {
+                    monitor.shutdown().await;
+                }
+                shutdown::run(runtime, initialized.context, handles).await
+            }
             Err(err) => {
-                if let Err(forward_error) = initialized.context.forwards.shutdown().await {
-                    tracing::error!(%forward_error, "failed to stop forwards after service startup failure");
+                let forward_result = initialized.context.forwards.shutdown().await;
+                let stop_result = initialized.context.machine.stop().await;
+                match (forward_result, stop_result) {
+                    (Ok(()), Ok(())) => Err(err),
+                    (Err(forward), Ok(())) => {
+                        Err(eyre::eyre!("{err}; forward cleanup failed: {forward}"))
+                    }
+                    (Ok(()), Err(stop)) => {
+                        Err(eyre::eyre!("{err}; primary VM cleanup failed: {stop}"))
+                    }
+                    (Err(forward), Err(stop)) => Err(eyre::eyre!(
+                        "{err}; forward cleanup failed: {forward}; primary VM cleanup failed: {stop}"
+                    )),
                 }
-                if let Err(stop_error) = initialized.context.machine.stop().await {
-                    tracing::error!(%stop_error, "failed to stop VM after service startup failure");
-                }
-                Err(err)
             }
         },
         Err(err) => Err(err),
     };
+    if let Some(task) = signal_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some(monitor) = parent_loss_monitor.take() {
+        monitor.shutdown().await;
+    }
 
     let last_error = result.as_ref().err().map(format_error_chain);
     if let Some(exec_log) = &exec_log {
@@ -229,7 +277,6 @@ async fn run(
     }
     if let Some(full_error) = &last_error {
         tracing::error!(error = %full_error, data_dir = %args.data_dir.display(), "vmmon exiting with error");
-        let _ = sync_reporter.report_failed(full_error);
     }
 
     let outcome = if last_error.is_some() {
@@ -250,6 +297,9 @@ async fn run(
         }
         Err(err) => tracing::warn!(error = %err, "build runtime exit status"),
     }
+    if let Some(full_error) = &last_error {
+        let _ = sync_reporter.report_failed(full_error);
+    }
 
     drop(pid_guard);
     if let Some(exit_command) = &exit_command {
@@ -257,6 +307,31 @@ async fn run(
     }
 
     result
+}
+
+fn spawn_startup_signal_handler(
+    cancelled: tokio_util::sync::CancellationToken,
+) -> eyre::Result<tokio::task::JoinHandle<()>> {
+    #[cfg(unix)]
+    {
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        Ok(tokio::spawn(async move {
+            tokio::select! {
+                _ = interrupt.recv() => cancelled.cancel(),
+                _ = terminate.recv() => cancelled.cancel(),
+            }
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            cancelled.cancel();
+        }))
+    }
 }
 
 fn format_error_chain(err: &eyre::Report) -> String {

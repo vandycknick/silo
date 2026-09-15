@@ -72,7 +72,7 @@ pub(crate) struct VmOverrideArgs {
     /// Enable nested virtualization for supported VZ guests.
     #[arg(long)]
     pub(crate) nested_virtualization: bool,
-    /// Enable Rosetta for x86_64 Linux binaries in supported VZ guests.
+    /// Enable Rosetta for x86_64 Linux binaries on a supported backend and host.
     #[arg(long)]
     pub(crate) rosetta: bool,
     /// Path to userdata file.

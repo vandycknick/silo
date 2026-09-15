@@ -1121,7 +1121,7 @@ impl Runtime {
                 .vmmon
                 .rosetta_intent_request(config)
                 .map_err(eyre::Report::msg)?;
-            let _rprobe_assets = self.components.resolve_rprobe_assets(rosetta_intent)?;
+            let rprobe_assets = self.components.resolve_rprobe_assets(rosetta_intent)?;
             let relative_mount_base = std::env::current_dir()
                 .context("resolve current directory for relative mount sources")?;
             let machine_paths = self.machine_paths(config.id);
@@ -1170,6 +1170,13 @@ impl Runtime {
             Ok(crate::vmmon::VmmonLaunchInputs {
                 agent_enabled,
                 rosetta_intent,
+                rosetta_probe_assets: rprobe_assets.map(|assets| {
+                    crate::vmmon::start_request::VmmonRosettaProbeAssets {
+                        kernel: assets.kernel,
+                        initramfs: assets.initramfs,
+                        manifest: assets.manifest,
+                    }
+                }),
             })
         };
 

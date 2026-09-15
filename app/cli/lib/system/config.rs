@@ -409,11 +409,6 @@ impl SystemConfig {
             .system
             .rosetta
             .unwrap_or_else(|| backend == SystemBackend::Vz && rosetta_available());
-        if backend == SystemBackend::Krun && self.system.rosetta == Some(true) {
-            bail!(
-                "rosetta is not supported on the krun backend yet\n\nhint: select the vz backend"
-            );
-        }
         let mut resolved = ResolvedSystemConfig {
             schema: 1,
             engine: self.system.engine,
@@ -620,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn krun_defaults_rosetta_off_and_rejects_explicit_enablement() {
+    fn krun_defaults_rosetta_off_and_preserves_explicit_enablement() {
         let home = tempfile::tempdir().expect("temp home");
         let config: SystemConfig = serde_yaml_ng::from_str(
             "version: '1'\nbackend: krun\nsystem:\n  image: registry.example/system@sha256:test\n",
@@ -635,10 +630,11 @@ mod tests {
             "version: '1'\nbackend: krun\nsystem:\n  image: registry.example/system@sha256:test\n  rosetta: true\n",
         )
         .expect("config");
-        let error = enabled
+        let enabled = enabled
             .resolve(home.path(), None)
-            .expect_err("reject Rosetta");
-        assert!(error.to_string().contains("select the vz backend"));
+            .expect("resolve Rosetta opt-in");
+        assert!(enabled.rosetta);
+        assert!(enabled.rosetta_explicit);
     }
 
     #[test]

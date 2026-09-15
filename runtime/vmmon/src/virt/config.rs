@@ -116,6 +116,8 @@ pub struct KrunOptions {
     pub helper_path: Option<PathBuf>,
     /// Whether the helper should request per-VM host reclaim qualification.
     pub host_memory_reclaim: HostMemoryReclaim,
+    /// Per-start compatibility data acquired and released before helper spawn.
+    pub prepared_rosetta: Option<krun::RosettaLaunchConfig>,
 }
 
 /// Backend-specific realization of a machine's transient Rosetta intent.
@@ -368,6 +370,11 @@ impl VmConfigBuilder {
 
     pub fn host_memory_reclaim(mut self, policy: HostMemoryReclaim) -> Self {
         self.config.krun.host_memory_reclaim = policy;
+        self
+    }
+
+    pub fn prepared_rosetta(mut self, config: krun::RosettaLaunchConfig) -> Self {
+        self.config.krun.prepared_rosetta = Some(config);
         self
     }
 

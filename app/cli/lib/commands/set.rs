@@ -65,9 +65,6 @@ impl Cmd {
         let parsed = ParsedSet::parse(&self.args)?;
         let reference = context.resolve_machine_name(parsed.machine.as_deref())?;
         let existing = context.app_api().await?.inspect_machine(&reference).await?;
-        let managed_backend = crate::system::ownership::managed_system_backend(&existing.id)?;
-        let direct_backend = context.virt_backend_override()?;
-        validate_rosetta_update(&parsed.update, managed_backend, direct_backend.as_ref())?;
         let old_name = if parsed.update.name.is_some() {
             Some(existing.name)
         } else {
@@ -92,22 +89,6 @@ impl Cmd {
         ui::success(format!("updated {}", data.name));
         Ok(())
     }
-}
-
-fn validate_rosetta_update(
-    update: &MachineUpdate,
-    managed_backend: Option<crate::system::config::SystemBackend>,
-    direct_backend: Option<&libvm::VirtBackendOverride>,
-) -> eyre::Result<()> {
-    let uses_krun = managed_backend
-        .map(|backend| backend == crate::system::config::SystemBackend::Krun)
-        .unwrap_or(direct_backend == Some(&libvm::VirtBackendOverride::Krun));
-    if update.rosetta == Some(true) && uses_krun {
-        eyre::bail!(
-            "rosetta is not supported on the krun backend yet\n\nhint: select the vz backend"
-        );
-    }
-    Ok(())
 }
 
 struct ParsedSet {
@@ -248,7 +229,7 @@ fn parse_bool(value: &str) -> eyre::Result<bool> {
 mod tests {
     use libvm::{MachineUserUpdate, Memory};
 
-    use crate::commands::set::{validate_rosetta_update, ParsedSet};
+    use crate::commands::set::ParsedSet;
 
     #[test]
     fn parses_default_machine_settings() {
@@ -299,44 +280,5 @@ mod tests {
         let parsed = ParsedSet::parse(&["dev".to_string(), "user=none".to_string()])
             .expect("parse disabled user");
         assert!(matches!(parsed.update.user, Some(MachineUserUpdate::Clear)));
-    }
-
-    #[test]
-    fn krun_rejects_enabling_rosetta_before_persisting_the_update() {
-        let update = ParsedSet::parse(&["rosetta=true".to_string()])
-            .expect("parse update")
-            .update;
-        let error = validate_rosetta_update(&update, None, Some(&libvm::VirtBackendOverride::Krun))
-            .expect_err("reject Rosetta on krun");
-        assert!(error.to_string().contains("select the vz backend"));
-        validate_rosetta_update(&update, None, Some(&libvm::VirtBackendOverride::Vz))
-            .expect("allow Rosetta on VZ");
-
-        let disabled = ParsedSet::parse(&["rosetta=false".to_string()])
-            .expect("parse update")
-            .update;
-        validate_rosetta_update(&disabled, None, Some(&libvm::VirtBackendOverride::Krun))
-            .expect("allow explicitly disabling Rosetta on krun");
-    }
-
-    #[test]
-    fn managed_backend_wins_and_does_not_gate_ordinary_machines() {
-        let update = ParsedSet::parse(&["rosetta=true".to_string()])
-            .expect("parse update")
-            .update;
-        let krun = crate::system::config::SystemBackend::Krun;
-        let vz = crate::system::config::SystemBackend::Vz;
-
-        assert!(validate_rosetta_update(&update, Some(krun), None).is_err());
-        assert!(validate_rosetta_update(
-            &update,
-            Some(krun),
-            Some(&libvm::VirtBackendOverride::Vz)
-        )
-        .is_err());
-        validate_rosetta_update(&update, Some(vz), Some(&libvm::VirtBackendOverride::Krun))
-            .expect("managed VZ policy wins");
-        validate_rosetta_update(&update, None, Some(&libvm::VirtBackendOverride::Vz))
-            .expect("ordinary VZ machine");
     }
 }

@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -80,6 +80,12 @@ impl InheritedPipeFds {
 
 pub struct SyncReporter {
     file: Option<File>,
+    inherited: bool,
+}
+
+pub struct ParentLossMonitor {
+    shutdown: CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Serialize)]
@@ -100,14 +106,20 @@ impl SyncReporter {
     fn from_sync_fd(fd: RawFd) -> io::Result<Self> {
         set_cloexec(fd, true)?;
         let file = unsafe { File::from_raw_fd(fd) };
-        Ok(Self { file: Some(file) })
+        Ok(Self {
+            file: Some(file),
+            inherited: true,
+        })
     }
 
     fn from_stdout() -> io::Result<Self> {
         let borrowed = unsafe { BorrowedFd::borrow_raw(libc::STDOUT_FILENO) };
         let duplicated = nix::unistd::dup(borrowed).map_err(io::Error::other)?;
         let file = File::from(duplicated);
-        Ok(Self { file: Some(file) })
+        Ok(Self {
+            file: Some(file),
+            inherited: false,
+        })
     }
 
     pub fn report_started(&mut self) -> io::Result<()> {
@@ -128,6 +140,58 @@ impl SyncReporter {
         self.write_message(&format!("startup-command-launch-failed\t{failure}\n"))
     }
 
+    pub fn monitor_parent_loss(
+        &self,
+        cancelled: CancellationToken,
+    ) -> io::Result<ParentLossMonitor> {
+        if !self.inherited {
+            return Ok(ParentLossMonitor {
+                shutdown: CancellationToken::new(),
+                task: None,
+            });
+        }
+        let file = self.file.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "syncpipe reporter is closed")
+        })?;
+        let fd = nix::unistd::dup(file).map_err(io::Error::other)?;
+        let shutdown = CancellationToken::new();
+        let monitor_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+
+            let mut descriptors = [PollFd::new(
+                fd.as_fd(),
+                PollFlags::POLLERR | PollFlags::POLLHUP,
+            )];
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(25));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = monitor_shutdown.cancelled() => return,
+                    _ = interval.tick() => {
+                        match poll(&mut descriptors, PollTimeout::ZERO) {
+                            Ok(_) if descriptors[0].revents().is_some_and(|events| {
+                                events.intersects(PollFlags::POLLERR | PollFlags::POLLHUP)
+                            }) => {
+                                cancelled.cancel();
+                                return;
+                            }
+                            Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+                            Err(_) => {
+                                cancelled.cancel();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Ok(ParentLossMonitor {
+            shutdown,
+            task: Some(task),
+        })
+    }
+
     fn write_message(&mut self, message: &str) -> io::Result<()> {
         let Some(mut file) = self.file.take() else {
             return Ok(());
@@ -135,6 +199,15 @@ impl SyncReporter {
         file.write_all(message.as_bytes())?;
         file.flush()?;
         Ok(())
+    }
+}
+
+impl ParentLossMonitor {
+    pub async fn shutdown(mut self) {
+        self.shutdown.cancel();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
     }
 }
 
@@ -152,12 +225,16 @@ pub(crate) struct InitResult {
     pub(crate) context: DaemonContext,
     pub(crate) startup_command: Option<crate::start_request::StartupCommand>,
     pub(crate) vsock_surface: Option<crate::vsock::VsockSurface>,
+    pub(crate) startup_deadline: tokio::time::Instant,
+    pub(crate) startup_cancel: CancellationToken,
+    pub(crate) require_guest_ready: bool,
 }
 
 pub async fn init(
     runtime: &RuntimeContext,
     inputs: InitInputs<'_>,
     start_request: &mut StartRequestPipe,
+    startup_cancel: CancellationToken,
 ) -> eyre::Result<InitResult> {
     let InitInputs {
         machine_id,
@@ -169,6 +246,8 @@ pub async fn init(
         serial_file,
     } = inputs;
     let start_request = start_request.read(machine_id, machine_run_id).await?;
+    let startup_deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(start_request.effective_startup_budget_ms());
     let spec = load_spec(runtime)?;
     spec.validate().map_err(|error| {
         eyre::eyre!(
@@ -185,6 +264,13 @@ pub async fn init(
         guest_services_enabled,
         start_request.rosetta_intent,
     )?;
+    let prepared_rosetta = prepare_rosetta(
+        rosetta_intent,
+        start_request.rosetta_probe_assets.clone(),
+        startup_deadline,
+        startup_cancel.clone(),
+    )
+    .await?;
 
     tracing::info!(
         instance = %name,
@@ -231,6 +317,7 @@ pub async fn init(
         },
         selected_backend,
         rosetta_intent,
+        prepared_rosetta,
     })?;
     let machine = create_virtual_machine(
         selected_backend,
@@ -261,29 +348,37 @@ pub async fn init(
 
     store.set_vm_state(VmState::Starting, "vm starting")?;
     forwards.register_outbound(&machine).await?;
-    machine.start().await?;
+    tracing::info!(
+        event = "primary_vm_spawn",
+        "starting primary VM after probe release"
+    );
+    let start_result = tokio::select! {
+        result = tokio::time::timeout_at(startup_deadline, machine.start()) => {
+            match result {
+                Ok(result) => result.map_err(eyre::Report::from),
+                Err(_) => Err(eyre::eyre!("primary VM startup deadline expired")),
+            }
+        }
+        () = startup_cancel.cancelled() => {
+            Err(eyre::eyre!("primary VM startup cancelled"))
+        }
+    };
+    if let Err(error) = start_result {
+        return Err(cleanup_primary_start_failure(&machine, &forwards, error).await);
+    }
     let vsock_surface = match prepared_vsock {
         Some(prepared) => match prepared.activate(machine.clone(), forwards.clone()).await {
             Ok(surface) => Some(surface),
             Err(error) => {
-                if let Err(stop_error) = machine.stop().await {
-                    tracing::error!(%stop_error, "failed to stop VM after vsock surface startup failure");
-                }
-                return Err(error);
+                return Err(cleanup_primary_start_failure(&machine, &forwards, error).await);
             }
         },
         None => None,
     };
     forwards.activate(machine.clone());
     if let Err(error) = store.set_vm_state(VmState::Running, "vm running") {
-        if let Err(shutdown_error) = forwards.shutdown().await {
-            tracing::error!(%shutdown_error, "failed to stop forwards after state initialization failure");
-        }
         drop(vsock_surface);
-        if let Err(stop_error) = machine.stop().await {
-            tracing::error!(%stop_error, "failed to stop VM after state initialization failure");
-        }
-        return Err(error.into());
+        return Err(cleanup_primary_start_failure(&machine, &forwards, error.into()).await);
     }
 
     Ok(InitResult {
@@ -300,7 +395,76 @@ pub async fn init(
         },
         startup_command: start_request.startup_command,
         vsock_surface,
+        startup_deadline,
+        startup_cancel,
+        require_guest_ready: matches!(
+            rosetta_intent,
+            crate::virt::RosettaIntent::KrunCaptured { .. }
+        ),
     })
+}
+
+async fn cleanup_primary_start_failure(
+    machine: &VirtualMachine,
+    forwards: &crate::forward::ForwardTable,
+    primary: eyre::Report,
+) -> eyre::Report {
+    let forward_result = forwards.shutdown().await;
+    let stop_result = machine.stop().await;
+    match (forward_result, stop_result) {
+        (Ok(()), Ok(())) => primary,
+        (Err(forward), Ok(())) => eyre::eyre!("{primary}; forward cleanup failed: {forward}"),
+        (Ok(()), Err(stop)) => eyre::eyre!("{primary}; primary VM cleanup failed: {stop}"),
+        (Err(forward), Err(stop)) => eyre::eyre!(
+            "{primary}; forward cleanup failed: {forward}; primary VM cleanup failed: {stop}"
+        ),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+async fn prepare_rosetta(
+    intent: crate::virt::RosettaIntent,
+    assets: Option<crate::start_request::RosettaProbeAssetsRequest>,
+    deadline: tokio::time::Instant,
+    cancelled: CancellationToken,
+) -> eyre::Result<Option<krun::RosettaLaunchConfig>> {
+    match intent {
+        crate::virt::RosettaIntent::Disabled | crate::virt::RosettaIntent::VzNative => {
+            if assets.is_some() {
+                return Err(eyre::eyre!(
+                    "Rosetta probe assets were supplied for a non-probe start"
+                ));
+            }
+            Ok(None)
+        }
+        crate::virt::RosettaIntent::KrunCaptured { profile } => {
+            let assets =
+                assets.ok_or_else(|| eyre::eyre!("KrunCaptured probe assets are missing"))?;
+            let profile = match profile {
+                crate::virt::RosettaProfile::CapturedCompatibilityV1 => {
+                    crate::start_request::RosettaProfileRequest::CapturedCompatibilityV1
+                }
+            };
+            crate::rosetta::acquire(profile, assets, deadline, cancelled)
+                .await
+                .map(|prepared| Some(prepared.launch))
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+async fn prepare_rosetta(
+    intent: crate::virt::RosettaIntent,
+    assets: Option<crate::start_request::RosettaProbeAssetsRequest>,
+    _deadline: tokio::time::Instant,
+    _cancelled: CancellationToken,
+) -> eyre::Result<Option<krun::RosettaLaunchConfig>> {
+    if !matches!(intent, crate::virt::RosettaIntent::Disabled) || assets.is_some() {
+        return Err(eyre::eyre!(
+            "captured Rosetta requires an Apple silicon macOS host"
+        ));
+    }
+    Ok(None)
 }
 
 /// Construct the machine on the backend the start request selects; absent
@@ -674,6 +838,7 @@ mod tests {
                 serial_file,
             },
             &mut start_request,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         let error = match result {
@@ -774,6 +939,7 @@ mod tests {
                 serial_file,
             },
             &mut start_request,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         writer.await.expect("join start request writer");
@@ -939,6 +1105,57 @@ mod tests {
             message,
             "startup-command-launch-failed\t{\"reason\":1,\"message\":\"command was not found\"}\n"
         );
+    }
+
+    #[tokio::test]
+    async fn syncpipe_parent_loss_cancels_owned_startup() {
+        let (read_fd, write_fd) = pipe().expect("create pipe");
+        let reporter =
+            SyncReporter::from_fd(Some(write_fd.into_raw_fd())).expect("open sync reporter");
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let monitor = reporter
+            .monitor_parent_loss(cancelled.clone())
+            .expect("monitor parent loss");
+
+        drop(read_fd);
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancelled.cancelled())
+            .await
+            .expect("parent loss should cancel startup");
+        monitor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutting_down_parent_monitor_closes_duplicate_without_cancelling_completed_startup() {
+        let (read_fd, write_fd) = pipe().expect("create pipe");
+        let mut reporter =
+            SyncReporter::from_fd(Some(write_fd.into_raw_fd())).expect("open sync reporter");
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let monitor = reporter
+            .monitor_parent_loss(cancelled.clone())
+            .expect("monitor parent loss");
+
+        monitor.shutdown().await;
+        assert!(!cancelled.is_cancelled());
+        reporter.report_started().expect("complete startup");
+
+        let mut file = std::fs::File::from(read_fd);
+        let mut message = String::new();
+        file.read_to_string(&mut message)
+            .expect("monitor duplicate must not retain the writer");
+        assert_eq!(message, "started\n");
+    }
+
+    #[tokio::test]
+    async fn direct_vmmon_stdout_reporter_does_not_monitor_parent_loss() {
+        let reporter = SyncReporter::from_fd(None).expect("open stdout reporter");
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let monitor = reporter
+            .monitor_parent_loss(cancelled.clone())
+            .expect("direct reporter does not require a syncpipe");
+
+        assert!(monitor.task.is_none());
+        monitor.shutdown().await;
+        assert!(!cancelled.is_cancelled());
     }
 
     #[test]
