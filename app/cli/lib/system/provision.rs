@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 
 use eyre::{bail, Context as _};
@@ -341,12 +342,15 @@ fn validate_machine(
         .iter()
         .filter(|disk| disk.path.is_absolute())
         .collect();
-    match attached.as_slice() {
-        [disk] if disk.path == data_image && !disk.read_only => {}
-        _ => bail!(
+    let valid_attachment = match attached.as_slice() {
+        [disk] => attachment_matches_data_image(&disk.path, disk.read_only, data_image)?,
+        _ => false,
+    };
+    if !valid_attachment {
+        bail!(
             "recorded system machine does not attach the installation data image {} read-write",
             data_image.display()
-        ),
+        );
     }
     validate_data_image(
         data_image,
@@ -356,10 +360,29 @@ fn validate_machine(
     )
 }
 
+fn attachment_matches_data_image(
+    attached_path: &Path,
+    read_only: bool,
+    data_image: &Path,
+) -> eyre::Result<bool> {
+    if read_only {
+        return Ok(false);
+    }
+    let attached_path = std::fs::canonicalize(attached_path)
+        .with_context(|| format!("resolve attached data image {}", attached_path.display()))?;
+    let data_image = std::fs::canonicalize(data_image)
+        .with_context(|| format!("resolve installation data image {}", data_image.display()))?;
+    Ok(attached_path == data_image)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::symlink;
+
     use crate::system::config::SystemConfig;
-    use crate::system::provision::{validate_installation, SystemHardware};
+    use crate::system::provision::{
+        attachment_matches_data_image, validate_installation, SystemHardware,
+    };
     use crate::system::record::InstallationRecord;
 
     #[test]
@@ -381,6 +404,45 @@ mod tests {
         let mut changed = resolved;
         changed.data_size_bytes += 1;
         assert!(validate_installation(&record, &changed).is_err());
+    }
+
+    #[test]
+    fn data_attachment_accepts_only_the_same_existing_writable_image_through_an_alias() {
+        let temp = tempfile::tempdir_in("/tmp").expect("tempdir");
+        let actual = temp.path().join("actual");
+        std::fs::create_dir(&actual).expect("actual directory");
+        let data_image = actual.join("data.img");
+        std::fs::write(&data_image, b"data").expect("data image");
+        let other_image = actual.join("other.img");
+        std::fs::write(&other_image, b"other").expect("other image");
+
+        let alias = temp.path().join("alias");
+        symlink(&actual, &alias).expect("data directory alias");
+        let wrong_alias = temp.path().join("wrong-alias.img");
+        symlink(&other_image, &wrong_alias).expect("wrong image alias");
+
+        assert!(
+            attachment_matches_data_image(&alias.join("data.img"), false, &data_image)
+                .expect("compare aliased image")
+        );
+        assert!(
+            !attachment_matches_data_image(&other_image, false, &data_image)
+                .expect("compare different image")
+        );
+        assert!(
+            !attachment_matches_data_image(&wrong_alias, false, &data_image)
+                .expect("compare wrong symlink target")
+        );
+        assert!(
+            !attachment_matches_data_image(&alias.join("data.img"), true, &data_image)
+                .expect("reject read-only image")
+        );
+        assert!(attachment_matches_data_image(
+            &temp.path().join("missing.img"),
+            false,
+            &data_image
+        )
+        .is_err());
     }
 
     #[test]
