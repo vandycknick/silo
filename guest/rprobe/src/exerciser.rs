@@ -13,7 +13,8 @@ pub const CHECK_WRITE_REJECTED: u32 = 1 << 5;
 pub const CHECK_TRUNCATE_REJECTED: u32 = 1 << 6;
 pub const CHECK_METADATA_REJECTED: u32 = 1 << 7;
 pub const CHECK_RENAME_REJECTED: u32 = 1 << 8;
-pub const REQUIRED_CHECKS: u32 = CHECK_READ_ONLY_MOUNT
+pub const CHECK_TRANSLATED_WORKLOAD: u32 = 1 << 9;
+pub const FILESYSTEM_CHECKS: u32 = CHECK_READ_ONLY_MOUNT
     | CHECK_NAMESPACE
     | CHECK_FILE_IDENTITY
     | CHECK_REPEATED_READ
@@ -22,6 +23,7 @@ pub const REQUIRED_CHECKS: u32 = CHECK_READ_ONLY_MOUNT
     | CHECK_TRUNCATE_REJECTED
     | CHECK_METADATA_REJECTED
     | CHECK_RENAME_REJECTED;
+const KNOWN_CHECKS: u32 = FILESYSTEM_CHECKS | CHECK_TRANSLATED_WORKLOAD;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameError {
@@ -153,7 +155,7 @@ impl Default for Decoder {
 }
 
 fn validate(checks: u32, ioctl_result: i32, payload_len: usize) -> Result<(), FrameError> {
-    if checks != REQUIRED_CHECKS {
+    if checks & FILESYSTEM_CHECKS != FILESYSTEM_CHECKS || checks & !KNOWN_CHECKS != 0 {
         return Err(FrameError::InvalidChecks);
     }
     if ioctl_result < 0 {
@@ -185,32 +187,47 @@ fn i32_at(bytes: &[u8; FRAME_LEN], offset: usize) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use crate::exerciser::{encode, Decoder, FrameError, MAGIC, PAYLOAD_LEN, REQUIRED_CHECKS};
+    use crate::exerciser::{
+        encode, Decoder, FrameError, CHECK_TRANSLATED_WORKLOAD, FILESYSTEM_CHECKS, MAGIC,
+        PAYLOAD_LEN,
+    };
 
     #[test]
     fn frame_round_trips_after_arbitrary_console_prefixes_and_splits() {
         let payload = core::array::from_fn(|index| index as u8);
-        let frame = encode(REQUIRED_CHECKS, 1, &payload).unwrap();
+        let frame = encode(FILESYSTEM_CHECKS, 1, &payload).unwrap();
         for split in 0..=frame.len() {
             let mut decoder = Decoder::new();
             decoder.push(b"kernel diagnostics\r\nSLR").unwrap();
             decoder.push(&frame[..split]).unwrap();
             decoder.push(&frame[split..]).unwrap();
             let decoded = decoder.finish().unwrap();
-            assert_eq!(decoded.checks, REQUIRED_CHECKS);
+            assert_eq!(decoded.checks, FILESYSTEM_CHECKS);
             assert_eq!(decoded.ioctl_result, 1);
             assert_eq!(decoded.payload, &payload);
         }
     }
 
     #[test]
-    fn frame_rejects_missing_checks_and_trailing_bytes() {
+    fn frame_accepts_optional_workload_bit_and_rejects_missing_or_unknown_checks() {
         let payload = [0xaa; PAYLOAD_LEN];
         assert_eq!(
-            encode(REQUIRED_CHECKS & !1, 1, &payload),
+            encode(FILESYSTEM_CHECKS & !1, 1, &payload),
             Err(FrameError::InvalidChecks)
         );
-        let frame = encode(REQUIRED_CHECKS, 1, &payload).unwrap();
+        assert_eq!(
+            encode(FILESYSTEM_CHECKS | 1 << 31, 1, &payload),
+            Err(FrameError::InvalidChecks)
+        );
+        let frame = encode(FILESYSTEM_CHECKS | CHECK_TRANSLATED_WORKLOAD, 1, &payload).unwrap();
+        let mut decoder = Decoder::new();
+        decoder.push(&frame).unwrap();
+        assert_eq!(
+            decoder.finish().unwrap().checks,
+            FILESYSTEM_CHECKS | CHECK_TRANSLATED_WORKLOAD
+        );
+
+        let frame = encode(FILESYSTEM_CHECKS, 1, &payload).unwrap();
         let mut decoder = Decoder::new();
         decoder.push(&frame).unwrap();
         assert_eq!(decoder.push(&[0]), Err(FrameError::TrailingData));
@@ -227,10 +244,10 @@ mod tests {
     #[test]
     fn frame_offsets_are_independently_fixed() {
         let payload = [0x5a; PAYLOAD_LEN];
-        let frame = encode(REQUIRED_CHECKS, i32::MAX, &payload).unwrap();
+        let frame = encode(FILESYSTEM_CHECKS, i32::MAX, &payload).unwrap();
         assert_eq!(&frame[0..8], &MAGIC);
         assert_eq!(&frame[8..12], &1u32.to_le_bytes());
-        assert_eq!(&frame[12..16], &REQUIRED_CHECKS.to_le_bytes());
+        assert_eq!(&frame[12..16], &FILESYSTEM_CHECKS.to_le_bytes());
         assert_eq!(&frame[16..20], &i32::MAX.to_le_bytes());
         assert_eq!(&frame[20..24], &(PAYLOAD_LEN as u32).to_le_bytes());
         assert_eq!(&frame[24..28], &[0; 4]);

@@ -142,6 +142,14 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },
+    RosettaExerciserInitramfs {
+        #[arg(long, value_name = "PATH")]
+        binary: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        x86_workload: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
     RprobeHardwareTest {
         #[arg(long, value_name = "PATH")]
         kernel: PathBuf,
@@ -373,6 +381,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Commands::RprobeInitramfs { binary, out } => {
             rprobe::package(&binary, &out)?;
+        }
+        Commands::RosettaExerciserInitramfs {
+            binary,
+            x86_workload,
+            out,
+        } => {
+            write_initramfs(&InitramfsOptions::rosetta_exerciser(
+                binary,
+                x86_workload,
+                out,
+            ))?;
         }
         Commands::RprobeHardwareTest { kernel, initramfs } => {
             require_macos_arm64()?;

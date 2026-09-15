@@ -11,18 +11,23 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr;
 use std::time::{Duration, Instant};
 
 use rprobe::exerciser::{
     encode, CHECK_FILE_IDENTITY, CHECK_METADATA_REJECTED, CHECK_MMAP_READ, CHECK_NAMESPACE,
-    CHECK_READ_ONLY_MOUNT, CHECK_RENAME_REJECTED, CHECK_REPEATED_READ, CHECK_TRUNCATE_REJECTED,
-    CHECK_WRITE_REJECTED, PAYLOAD_LEN,
+    CHECK_READ_ONLY_MOUNT, CHECK_RENAME_REJECTED, CHECK_REPEATED_READ, CHECK_TRANSLATED_WORKLOAD,
+    CHECK_TRUNCATE_REJECTED, CHECK_WRITE_REJECTED, PAYLOAD_LEN,
 };
 
 const ROOT: &str = "/mnt/rosetta";
 const TRANSLATOR: &str = "/mnt/rosetta/rosetta";
+const X86_WORKLOAD: &str = "/x86_64-static";
+const WORKLOAD_STDOUT: &[u8] = b"SILO_X86_STATIC_OK\n";
+const WORKLOAD_EXIT: i32 = 37;
 const IOCTL_REQUEST: u32 = 0x8045_6122;
 const DEV_INPUT_DIR: &str = "/dev/input";
 const INPUT_EVENT_PREFIX: &str = "event";
@@ -43,15 +48,23 @@ struct InputEvent64 {
 const _: [(); 24] = [(); std::mem::size_of::<InputEvent64>()];
 
 fn main() {
-    if let Err(error) = run() {
+    if let Err(error) = run_with_console() {
         eprintln!("rosetta exerciser failed: {error}");
     }
     poweroff()
 }
 
-fn run() -> io::Result<()> {
+fn run_with_console() -> io::Result<()> {
     mount_filesystems()?;
     let mut console = open_console()?;
+    if let Err(error) = run(&mut console) {
+        let _ = writeln!(console, "rosetta exerciser failed: {error}");
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn run(console: &mut File) -> io::Result<()> {
     mount_rosetta()?;
 
     let mut checks = 0;
@@ -126,6 +139,10 @@ fn run() -> io::Result<()> {
     }
     checks |= CHECK_FILE_IDENTITY;
 
+    if Path::new(X86_WORKLOAD).try_exists()? {
+        checks |= run_translated_workload(console)?;
+    }
+
     let mut payload = [0xaa; PAYLOAD_LEN];
     // libc's musl binding uses Ioctl; the cast preserves the request's exact low 32 bits.
     let ioctl_result = unsafe {
@@ -143,6 +160,44 @@ fn run() -> io::Result<()> {
         .map_err(|_| io::Error::other("failed to encode exerciser frame"))?;
     console.write_all(&frame)?;
     wait_for_shutdown(power_inputs)
+}
+
+fn run_translated_workload(console: &mut File) -> io::Result<u32> {
+    writeln!(console, "translated_workload_start")?;
+    console.flush()?;
+    let output = Command::new(TRANSLATOR).arg(X86_WORKLOAD).output()?;
+    writeln!(
+        console,
+        "translated_workload_result {} stdout_bytes={} stderr_bytes={} stderr={}",
+        exit_description(&output.status),
+        output.stdout.len(),
+        output.stderr.len(),
+        String::from_utf8_lossy(&output.stderr).escape_debug()
+    )?;
+    console.flush()?;
+    if output.status.code() != Some(WORKLOAD_EXIT) {
+        return Err(io::Error::other(format!(
+            "translated workload exit differed; {}",
+            exit_description(&output.status)
+        )));
+    }
+    if output.stdout != WORKLOAD_STDOUT {
+        return Err(io::Error::other(format!(
+            "translated workload stdout differed; bytes={}",
+            output.stdout.len()
+        )));
+    }
+    if !output.stderr.is_empty() {
+        return Err(io::Error::other(format!(
+            "translated workload wrote stderr; bytes={}",
+            output.stderr.len()
+        )));
+    }
+    Ok(CHECK_TRANSLATED_WORKLOAD)
+}
+
+fn exit_description(status: &std::process::ExitStatus) -> String {
+    format!("exit={:?} signal={:?}", status.code(), status.signal())
 }
 
 fn open_power_inputs() -> io::Result<Vec<File>> {
@@ -228,7 +283,8 @@ fn mount_filesystems() -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
-    mount("devtmpfs", "/dev", "devtmpfs", 0)
+    mount("devtmpfs", "/dev", "devtmpfs", 0)?;
+    mount("proc", "/proc", "proc", 0)
 }
 
 fn mount_rosetta() -> io::Result<()> {

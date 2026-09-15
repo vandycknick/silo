@@ -24,7 +24,9 @@ mod macos {
     use eyre::{eyre, Context, Result};
     use krun::{RosettaLaunchConfig, VirtualMachineBuilder};
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
-    use rprobe::exerciser::{Decoder as ExerciserDecoder, REQUIRED_CHECKS};
+    use rprobe::exerciser::{
+        Decoder as ExerciserDecoder, CHECK_TRANSLATED_WORKLOAD, FILESYSTEM_CHECKS,
+    };
     use rprobe::frame::{Decoder, FrameError, SUCCESS_LEN};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::watch;
@@ -45,6 +47,7 @@ mod macos {
     const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
     const HELPER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
     const MAX_TRANSLATOR_SIZE: usize = 128 * 1024 * 1024;
+    const HELPER_DIAGNOSTIC_LIMIT: usize = 4096;
     const DEFAULT_HOST_ROOT: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux";
 
     #[derive(Debug, Parser)]
@@ -57,6 +60,8 @@ mod macos {
         cancel_while_starting: bool,
         #[arg(long)]
         cancel_helper_after_spawn: bool,
+        #[arg(long)]
+        translated_workload: bool,
         #[arg(long, value_name = "PATH")]
         krun: Option<PathBuf>,
         #[arg(long, value_name = "PATH")]
@@ -134,6 +139,11 @@ mod macos {
         if args.cancel_helper_after_spawn && helper.is_none() {
             return Err(eyre!(
                 "--cancel-helper-after-spawn requires helper qualification inputs"
+            ));
+        }
+        if args.translated_workload && helper.is_none() {
+            return Err(eyre!(
+                "--translated-workload requires helper qualification inputs"
             ));
         }
         if args.cancel_while_starting && args.cancel_helper_after_spawn {
@@ -310,16 +320,35 @@ mod macos {
             (Some(helper), Some(source)) => {
                 source.verify_unchanged()?;
                 Some(
-                    qualify_helper(helper, &source, response, args.cancel_helper_after_spawn)
-                        .await?,
+                    qualify_helper(
+                        helper,
+                        &source,
+                        response,
+                        args.cancel_helper_after_spawn,
+                        args.translated_workload,
+                    )
+                    .await?,
                 )
             }
             (None, None) => None,
             _ => return Err(eyre!("helper qualification inputs became inconsistent")),
         };
 
+        let (helper_qualification, workload) = match helper_report {
+            Some(HelperOutcome::Passed(FrameOutcome {
+                translated_workload: true,
+            })) => (
+                "passed",
+                "translated_workload=passed translated_workload_exit=37 translated_workload_stdout=SILO_X86_STATIC_OK\\n",
+            ),
+            Some(HelperOutcome::Passed(FrameOutcome {
+                translated_workload: false,
+            })) => ("passed", "translated_workload=not-requested"),
+            Some(HelperOutcome::Cancelled) => ("cancelled-reaped", "translated_workload=not-completed"),
+            None => ("not-requested", "translated_workload=not-requested"),
+        };
         println!(
-            "host_harness_pid={} guest_pid=1 status={} payload_len={} cpu_count=1 memory_bytes={} acquisition_ms={} cleanup_ms={} diagnostic_bytes={} diagnostic_retained={} resources=disks:0,network:0,vsock:0,balloon:0 serial_ports=hvc0:diagnostic,hvc1:raw share=rosetta start_callback={} vz_xpc_pid=not-observed cleanup=stopped-released helper_qualification={}",
+            "host_harness_pid={} guest_pid=1 status={} payload_len={} cpu_count=1 memory_bytes={} acquisition_ms={} cleanup_ms={} diagnostic_bytes={} diagnostic_retained={} resources=disks:0,network:0,vsock:0,balloon:0 serial_ports=hvc0:diagnostic,hvc1:raw share=rosetta start_callback={} vz_xpc_pid=not-observed cleanup=stopped-released helper_qualification={} {}",
             std::process::id(),
             response.ioctl_result,
             response.data.len(),
@@ -329,7 +358,8 @@ mod macos {
             diagnostic_stats.total,
             diagnostic_stats.retained.len(),
             cleanup.start_completion,
-            helper_report.unwrap_or("not-requested"),
+            helper_qualification,
+            workload,
         );
         Ok(())
     }
@@ -423,7 +453,8 @@ mod macos {
         source: &SourceSnapshot,
         response: ProbeResponse,
         cancel_after_spawn: bool,
-    ) -> Result<&'static str> {
+        translated_workload: bool,
+    ) -> Result<HelperOutcome> {
         let config = RosettaLaunchConfig::new(
             source.root.clone(),
             source.sha256,
@@ -435,13 +466,20 @@ mod macos {
         let worker_cancel = Arc::clone(&cancel);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let mut worker = tokio::task::spawn_blocking(move || {
-            run_helper(inputs, config, response, worker_cancel, started_tx)
+            run_helper(
+                inputs,
+                config,
+                response,
+                worker_cancel,
+                started_tx,
+                translated_workload,
+            )
         });
 
         if cancel_after_spawn {
             if started_rx.await.is_err() {
                 return match join_helper_worker(worker.await)? {
-                    HelperOutcome::Passed => Ok("passed"),
+                    HelperOutcome::Passed(outcome) => Ok(HelperOutcome::Passed(outcome)),
                     HelperOutcome::Cancelled => Err(eyre!(
                         "helper qualification cancelled before spawn notification"
                     )),
@@ -449,8 +487,8 @@ mod macos {
             }
             cancel.store(true, Ordering::Release);
             return match join_helper_worker(worker.await)? {
-                HelperOutcome::Cancelled => Ok("cancelled-reaped"),
-                HelperOutcome::Passed => Err(eyre!(
+                HelperOutcome::Cancelled => Ok(HelperOutcome::Cancelled),
+                HelperOutcome::Passed(_) => Err(eyre!(
                     "helper qualification completed before cancellation was observed"
                 )),
             };
@@ -458,7 +496,7 @@ mod macos {
 
         tokio::select! {
             result = &mut worker => match join_helper_worker(result)? {
-                HelperOutcome::Passed => Ok("passed"),
+                HelperOutcome::Passed(outcome) => Ok(HelperOutcome::Passed(outcome)),
                 HelperOutcome::Cancelled => Err(eyre!("helper qualification cancelled unexpectedly")),
             },
             signal = tokio::signal::ctrl_c() => {
@@ -468,7 +506,7 @@ mod macos {
                     HelperOutcome::Cancelled => Err(eyre!(
                         "helper qualification cancelled; standalone helper cleaned up and reaped"
                     )),
-                    HelperOutcome::Passed => Err(eyre!(
+                    HelperOutcome::Passed(_) => Err(eyre!(
                         "helper qualification completed before cancellation was observed"
                     )),
                 }
@@ -478,8 +516,13 @@ mod macos {
 
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum HelperOutcome {
-        Passed,
+        Passed(FrameOutcome),
         Cancelled,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct FrameOutcome {
+        translated_workload: bool,
     }
 
     fn join_helper_worker(
@@ -494,6 +537,7 @@ mod macos {
         response: ProbeResponse,
         cancel: Arc<AtomicBool>,
         started: tokio::sync::oneshot::Sender<()>,
+        translated_workload: bool,
     ) -> Result<HelperOutcome> {
         let mut vm = VirtualMachineBuilder::new(&inputs.krun)
             .cpus(1)
@@ -516,8 +560,14 @@ mod macos {
         fcntl(reader.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
             .wrap_err("make helper console nonblocking")?;
         let _ = started.send(());
-        let qualification = receive_exerciser_frame(&mut vm, &mut reader, &response, &cancel);
-        let completed = qualification.as_ref().is_ok_and(|completed| *completed);
+        let qualification = receive_exerciser_frame(
+            &mut vm,
+            &mut reader,
+            &response,
+            &cancel,
+            translated_workload,
+        );
+        let completed = qualification.as_ref().is_ok_and(Option::is_some);
         let cleanup = if completed {
             request_helper_shutdown(&mut vm, &mut reader)
         } else {
@@ -525,12 +575,11 @@ mod macos {
         };
         drop(reader);
         drop(writer);
-        let completed = qualification?;
+        let outcome = qualification?;
         cleanup?;
-        Ok(if completed {
-            HelperOutcome::Passed
-        } else {
-            HelperOutcome::Cancelled
+        Ok(match outcome {
+            Some(outcome) => HelperOutcome::Passed(outcome),
+            None => HelperOutcome::Cancelled,
         })
     }
 
@@ -539,22 +588,31 @@ mod macos {
         reader: &mut fs::File,
         response: &ProbeResponse,
         cancel: &AtomicBool,
-    ) -> Result<bool> {
+        translated_workload: bool,
+    ) -> Result<Option<FrameOutcome>> {
         let deadline = StdInstant::now() + HELPER_TIMEOUT;
         let mut decoder = ExerciserDecoder::new();
         let mut buffer = [0; 4096];
         let mut console_bytes = 0_u64;
+        let mut diagnostics = Vec::with_capacity(HELPER_DIAGNOSTIC_LIMIT);
         while !decoder.is_complete() {
             if cancel.load(Ordering::Acquire) {
-                return Ok(false);
+                return Ok(None);
             }
             match reader.read(&mut buffer) {
                 Ok(0) => {}
                 Ok(count) => {
                     console_bytes = console_bytes.saturating_add(count as u64);
-                    decoder
-                        .push(&buffer[..count])
-                        .map_err(|error| eyre!("invalid exerciser frame: {error:?}"))?;
+                    for byte in &buffer[..count] {
+                        decoder
+                            .push(core::slice::from_ref(byte))
+                            .map_err(|error| eyre!("invalid exerciser frame: {error:?}"))?;
+                        if decoder.received_len() == 0
+                            && diagnostics.len() < HELPER_DIAGNOSTIC_LIMIT
+                        {
+                            diagnostics.push(*byte);
+                        }
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
@@ -564,12 +622,16 @@ mod macos {
             let now = StdInstant::now();
             if let Some(status) = vm.try_wait().wrap_err("poll krun helper")? {
                 return Err(eyre!(
-                    "krun helper exited before the shutdown request: {status}; console_bytes={console_bytes} frame_bytes={}",
-                    decoder.received_len()
+                    "krun helper exited before the shutdown request: {status}; console_bytes={console_bytes} frame_bytes={} diagnostics={}",
+                    decoder.received_len(),
+                    String::from_utf8_lossy(&diagnostics).escape_debug()
                 ));
             }
             if now >= deadline {
-                return Err(eyre!("standalone helper exerciser timed out"));
+                return Err(eyre!(
+                    "standalone helper exerciser timed out; diagnostics={}",
+                    String::from_utf8_lossy(&diagnostics).escape_debug()
+                ));
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -577,8 +639,16 @@ mod macos {
         let frame = decoder
             .finish()
             .map_err(|error| eyre!("invalid exerciser frame: {error:?}"))?;
-        if frame.checks != REQUIRED_CHECKS {
-            return Err(eyre!("guest filesystem checks were incomplete"));
+        let expected_checks = FILESYSTEM_CHECKS
+            | if translated_workload {
+                CHECK_TRANSLATED_WORKLOAD
+            } else {
+                0
+            };
+        if frame.checks != expected_checks {
+            return Err(eyre!(
+                "guest checks differ from the requested qualification mode"
+            ));
         }
         if frame.ioctl_result != response.ioctl_result {
             return Err(eyre!("guest ioctl status differs from the captured status"));
@@ -586,7 +656,9 @@ mod macos {
         if frame.payload != &response.data {
             return Err(eyre!("guest ioctl data differs from the captured response"));
         }
-        Ok(true)
+        Ok(Some(FrameOutcome {
+            translated_workload: frame.checks & CHECK_TRANSLATED_WORKLOAD != 0,
+        }))
     }
 
     fn request_helper_shutdown(

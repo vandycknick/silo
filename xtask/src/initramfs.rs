@@ -13,6 +13,7 @@ const INIT_MODE: u32 = 0o755;
 const ROOT_UID: u32 = 0;
 const ROOT_GID: u32 = 0;
 const MTIME: u32 = 0;
+const X86_WORKLOAD_MODE: u32 = 0o755;
 
 pub const INITRAMFS_DIRECTORIES: &[&str] = &[
     ".", "bin", "dev", "etc", "mnt", "proc", "run", "sbin", "sys", "tmp", "usr", "usr/bin",
@@ -33,6 +34,7 @@ pub struct InitramfsOptions {
     pub init_binary: PathBuf,
     pub output: PathBuf,
     inventory: Inventory,
+    x86_workload: Option<PathBuf>,
 }
 
 impl InitramfsOptions {
@@ -41,6 +43,7 @@ impl InitramfsOptions {
             init_binary: init_binary.into(),
             output: output.into(),
             inventory: Inventory::Workload,
+            x86_workload: None,
         }
     }
 
@@ -49,6 +52,20 @@ impl InitramfsOptions {
             init_binary: init_binary.into(),
             output: output.into(),
             inventory: Inventory::Rprobe,
+            x86_workload: None,
+        }
+    }
+
+    pub fn rosetta_exerciser(
+        init_binary: impl Into<PathBuf>,
+        x86_workload: impl Into<PathBuf>,
+        output: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            init_binary: init_binary.into(),
+            output: output.into(),
+            inventory: Inventory::Rprobe,
+            x86_workload: Some(x86_workload.into()),
         }
     }
 }
@@ -112,7 +129,14 @@ fn write_initramfs_options_to_writer<W: Write>(options: &InitramfsOptions, write
         Inventory::Workload => INITRAMFS_DIRECTORIES,
         Inventory::Rprobe => RPROBE_INITRAMFS_DIRECTORIES,
     };
-    let mut gzip = write_cpio_entries(gzip, &mut init_file, init_size, init_binary, directories)?;
+    let mut gzip = write_cpio_entries(
+        gzip,
+        &mut init_file,
+        init_size,
+        init_binary,
+        directories,
+        options.x86_workload.as_deref(),
+    )?;
     gzip.flush()
         .map_err(|source| InitramfsError::FinishGzip { source })?;
     gzip.finish()
@@ -156,6 +180,7 @@ fn write_cpio_entries<W: Write>(
     init_size: u32,
     init_path: &Path,
     directories: &[&str],
+    x86_workload: Option<&Path>,
 ) -> Result<GzEncoder<W>> {
     let mut inode = 1;
     for directory in directories {
@@ -164,6 +189,24 @@ fn write_cpio_entries<W: Write>(
     }
 
     write_init(&mut writer, inode, init_file, init_size, init_path)?;
+    inode += 1;
+    if let Some(workload) = x86_workload {
+        let workload_size = init_binary_size(workload)?;
+        let mut workload_file =
+            File::open(workload).map_err(|source| InitramfsError::OpenInit {
+                path: workload.to_path_buf(),
+                source,
+            })?;
+        write_regular_file(
+            &mut writer,
+            "x86_64-static",
+            inode,
+            X86_WORKLOAD_MODE,
+            &mut workload_file,
+            workload_size,
+            workload,
+        )?;
+    }
 
     cpio::newc::trailer(writer).map_err(|source| InitramfsError::WriteTrailer { source })
 }
@@ -197,19 +240,31 @@ fn write_init<W: Write>(
     init_size: u32,
     init_path: &Path,
 ) -> Result<()> {
-    let mut cpio_writer =
-        entry("init", inode, INIT_MODE, ModeFileType::Regular).write(writer, init_size);
-    let bytes =
-        io::copy(init_file, &mut cpio_writer).map_err(|source| InitramfsError::ReadInit {
-            path: init_path.to_path_buf(),
-            source,
-        })?;
-    if bytes != u64::from(init_size) {
+    write_regular_file(
+        writer, "init", inode, INIT_MODE, init_file, init_size, init_path,
+    )
+}
+
+fn write_regular_file<W: Write>(
+    writer: &mut W,
+    name: &str,
+    inode: u32,
+    mode: u32,
+    file: &mut File,
+    size: u32,
+    path: &Path,
+) -> Result<()> {
+    let mut cpio_writer = entry(name, inode, mode, ModeFileType::Regular).write(writer, size);
+    let bytes = io::copy(file, &mut cpio_writer).map_err(|source| InitramfsError::ReadInit {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if bytes != u64::from(size) {
         return Err(InitramfsError::ReadInit {
-            path: init_path.to_path_buf(),
+            path: path.to_path_buf(),
             source: io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "init binary changed while archiving",
+                "input binary changed while archiving",
             ),
         });
     }
@@ -217,7 +272,7 @@ fn write_init<W: Write>(
         .finish()
         .map(|_| ())
         .map_err(|source| InitramfsError::WriteEntry {
-            name: "init".to_string(),
+            name: name.to_string(),
             source,
         })
 }
