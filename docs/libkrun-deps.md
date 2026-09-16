@@ -12,10 +12,11 @@ The workspace dependency is pinned by full Git commit in the root
 
 ```text
 repository: https://github.com/vandycknick/libkrun.git
-tracked revision: b892b1974e34a48b857c4562bc41f2e541b30ea5
+tracked revision: 3dbda91919594139209bd5577f6ef80089ac5f17
 public branch: silo/v2
-previous tracked revision: d54c7e9088687098ded67245efc7cb63a68d5223
-previous tip backup: backup/silo-v2-2026-09-15 @ 10b6f752ba8ea735c3d9edaa549599dcf3f98d18
+previous tracked revision: b892b1974e34a48b857c4562bc41f2e541b30ea5
+previous tip backup: backup/silo-v2-before-cleanup-20260916-202550 @ b892b1974e34a48b857c4562bc41f2e541b30ea5
+older tip backup: backup/silo-v2-2026-09-15 @ 10b6f752ba8ea735c3d9edaa549599dcf3f98d18
 pre-split backup: backup/silo-v2-before-feature-split-2026-09-15 @ ea84066ff3c8499a4aac5cdd3ec326aee0667e9b
 fetchable: yes
 ```
@@ -25,14 +26,28 @@ or tag is useful for reviewing the fork, but neither replaces the immutable
 commit pin.
 
 The committed revision is reachable through the fork URL: a direct
-`git fetch https://github.com/vandycknick/libkrun.git b892b1974e34a48b857c4562bc41f2e541b30ea5`
+`git fetch https://github.com/vandycknick/libkrun.git 3dbda91919594139209bd5577f6ef80089ac5f17`
 succeeds. Cargo therefore resolves the tracked pin directly from GitHub with no
 local checkout, path patch, URL rewrite, or alternate lockfile. The public
 `silo/v2` branch names the reviewable tip, while release reproducibility comes
 from the immutable revision in `Cargo.toml` and `Cargo.lock`. The force update
-preserved the former public tip on `backup/silo-v2-2026-09-15`.
+preserved the former public tip on
+`backup/silo-v2-before-cleanup-20260916-202550`.
 
-The tracked revision changes how the balloon advises guest RAM free on macOS.
+The downstream series contains four commits above `24d714b5dce8e8dd91afb9e0f64ebf6f3e1e846e`:
+
+1. `366377893787a7299e35a0bd748d199e548ab571`: balloon host reclaim, including
+   page-wise advice, fault recovery, qualification and periodic mapping maintenance.
+2. `4f03adbf74fd55882a0337b87fa271612fdd86af`: owned native vsock control-channel mux.
+3. `212f92a66405a286581c4b4d498593f91d0658b5`: immutable captured Rosetta compatibility data.
+4. `3dbda91919594139209bd5577f6ef80089ac5f17`: direct external initramfs streaming.
+
+This revision only reorganizes history and improves comments/documentation relative
+to the previous tracked revision. The reconstructed tree was verified byte-identical
+before documentation edits; the final implementation and tests remain unchanged.
+The original commits and their full messages remain available on the backup branch.
+
+The fork reclaims reported guest RAM on macOS as follows.
 Each coalesced report uses `hv_vm_unmap`, one `madvise(MADV_FREE)` call per
 native host page, and immediate `hv_vm_map`. Page-wise advice avoids XNU's
 bulk host-PTE path, which can leave guest-written backing dirty. There is no
