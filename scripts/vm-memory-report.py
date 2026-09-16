@@ -16,11 +16,11 @@ import subprocess
 import sys
 
 MIB = 1024 * 1024
-REPORT_BLOCK = 2 * MIB  # Linux free-page reporting granularity on this guest
 GUEST_SCRIPT = r"""
 echo '@meminfo'; cat /proc/meminfo
 echo '@zoneinfo'; grep -E '^Node|zone|pages free|managed' /proc/zoneinfo
 echo '@buddyinfo'; cat /proc/buddyinfo
+echo '@reporting_geometry'; getconf PAGESIZE; cat /sys/module/page_reporting/parameters/page_reporting_order
 echo '@balloon'; for d in /sys/bus/virtio/drivers/virtio_balloon/virtio*; do [ -e "$d/features" ] && cat "$d/features"; done
 echo '@tmpfs'; df -k -t tmpfs 2>/dev/null | tail -n +2
 echo '@agent'; p=$(pidof silo-agent | cut -d' ' -f1); [ -n "$p" ] && for t in /proc/$p/task/*; do c=$(cat $t/comm 2>/dev/null); [ "$c" = memory-reclaim ] && grep -E '^policy' $t/sched; done; tr ',' '\n' < /run/agent/config.json 2>/dev/null | grep -A1 memory_reclaim
@@ -111,7 +111,16 @@ def kib_field(lines, key):
     return 0
 
 
-def zones(zoneinfo, buddyinfo):
+def reporting_geometry(lines: list[str]) -> tuple[int, int]:
+    if len(lines) != 2:
+        raise ValueError("guest page size or reporting order is unavailable")
+    page_size, order = map(int, lines)
+    if page_size < 1024 or page_size & (page_size - 1) or not 0 <= order < 64:
+        raise ValueError("invalid guest page size or reporting order")
+    return page_size, order
+
+
+def zones(zoneinfo, buddyinfo, page_size: int, reporting_order: int):
     result = {}
     zone = None
     for line in zoneinfo:
@@ -119,15 +128,15 @@ def zones(zoneinfo, buddyinfo):
             zone = line.split("zone")[1].strip()
             result[zone] = {"free": 0, "managed": 0, "fragments": 0}
         elif zone and "pages free" in line:
-            result[zone]["free"] = int(line.split()[-1]) * 4096
+            result[zone]["free"] = int(line.split()[-1]) * page_size
         elif zone and "managed" in line:
-            result[zone]["managed"] = int(line.split()[-1]) * 4096
+            result[zone]["managed"] = int(line.split()[-1]) * page_size
     for line in buddyinfo:
         m = re.match(r"Node \d+, zone\s+(\S+)\s+(.*)$", line)
         if not m:
             continue
         counts = [int(x) for x in m.group(2).split()]
-        small = sum(count * (4096 << order) for order, count in enumerate(counts) if (4096 << order) < REPORT_BLOCK)
+        small = sum(count * (page_size << order) for order, count in enumerate(counts) if order < reporting_order)
         result.setdefault(m.group(1), {"free": 0, "managed": 0, "fragments": 0})["fragments"] = small
     return result
 
@@ -149,7 +158,13 @@ def main():
     totals = vmmap_totals(krun)
     guest = guest_view(machine["name"])
     meminfo = guest.get("meminfo", [])
-    zone_table = zones(guest.get("zoneinfo", []), guest.get("buddyinfo", []))
+    try:
+        page_size, reporting_order = reporting_geometry(guest.get("reporting_geometry", []))
+    except ValueError as error:
+        sys.exit(f"cannot determine guest free-page reporting threshold: {error}")
+    report_block = page_size << reporting_order
+    report_label = f"{report_block // MIB} MiB" if report_block >= MIB else f"{report_block // 1024} KiB"
+    zone_table = zones(guest.get("zoneinfo", []), guest.get("buddyinfo", []), page_size, reporting_order)
 
     charged, peak = fp if fp else (0, 0)
     untagged_charge = table.get("untagged (VM_ALLOCATE)", (0, 0, 0))[0]
@@ -188,10 +203,11 @@ def main():
     print(f"  free                      {mib(mem_free)}")
     for zone, z in zone_table.items():
         if z["managed"]:
-            print(f"    zone {zone:7s} managed {mib(z['managed'])}  free {mib(z['free'])}  in blocks < 2 MiB {mib(z['fragments'])}")
+            print(f"    zone {zone:7s} managed {mib(z['managed'])}  free {mib(z['free'])}  in blocks < {report_label} {mib(z['fragments'])}")
     features = "".join(guest.get("balloon", []))
     reporting = "yes" if len(features) > 5 and features[5] == "1" else "no"
     print(f"  balloon free-page reporting negotiated: {reporting}")
+    print(f"  minimum reportable block: {report_label} (order {reporting_order}, {page_size // 1024} KiB guest pages)")
     agent_lines = [l.strip() for l in guest.get("agent", []) if l.strip()]
     policy = next((l.split()[-1] for l in agent_lines if l.startswith("policy")), None)
     policy_name = {"0": "SCHED_OTHER", "5": "SCHED_IDLE"}.get(policy, policy)
@@ -213,7 +229,7 @@ def main():
     print(f"  VMM overhead              {mib(vmm_overhead)}")
     print(f"  guest held                {mib(guest_held)}")
     print(f"  kernel reserved           {mib(kernel_reserved)}")
-    print(f"  unreportable fragments    {mib(fragments)}   (free but in blocks smaller than 2 MiB)")
+    print(f"  unreportable fragments    {mib(fragments)}   (free but in blocks smaller than {report_label})")
     print(f"  = guest-based estimate    {mib(expected)}")
     print(f"  phys_footprint            {mib(charged)}")
     print(f"  accounting residual       {mib(residual)}   (not a leak or reported-page measurement)")
