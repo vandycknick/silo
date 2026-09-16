@@ -12,9 +12,9 @@ The workspace dependency is pinned by full Git commit in the root
 
 ```text
 repository: https://github.com/vandycknick/libkrun.git
-tracked revision: 3ab6249a1ff4cb4945d216ce74f9feecbf4def7d
+tracked revision: d54c7e9088687098ded67245efc7cb63a68d5223
 public branch: silo/v2
-previous tracked revision: d34748e32bf3169a81ab16a7c2ba3dcb93716a31
+previous tracked revision: 3ab6249a1ff4cb4945d216ce74f9feecbf4def7d
 previous tip backup: backup/silo-v2-2026-09-15 @ 10b6f752ba8ea735c3d9edaa549599dcf3f98d18
 pre-split backup: backup/silo-v2-before-feature-split-2026-09-15 @ ea84066ff3c8499a4aac5cdd3ec326aee0667e9b
 fetchable: yes
@@ -25,22 +25,29 @@ or tag is useful for reviewing the fork, but neither replaces the immutable
 commit pin.
 
 The committed revision is reachable through the fork URL: a direct
-`git fetch https://github.com/vandycknick/libkrun.git 3ab6249a1ff4cb4945d216ce74f9feecbf4def7d`
+`git fetch https://github.com/vandycknick/libkrun.git d54c7e9088687098ded67245efc7cb63a68d5223`
 succeeds. Cargo therefore resolves the tracked pin directly from GitHub with no
 local checkout, path patch, URL rewrite, or alternate lockfile. The public
 `silo/v2` branch names the reviewable tip, while release reproducibility comes
 from the immutable revision in `Cargo.toml` and `Cargo.lock`. The force update
 preserved the former public tip on `backup/silo-v2-2026-09-15`.
 
-The tracked revision changes how the balloon releases guest RAM on macOS.
-Each free-page report is released as `hv_vm_unmap`, `madvise(MADV_FREE_REUSABLE)`,
-`hv_vm_map` with the range remapped immediately, so the host footprint drops
-while later guest refaults are handled in-kernel without a VM exit. Host device
-access to guest memory is no longer guarded by a lease ledger; devices use
-passthrough guest memory the way KVM-based VMMs do. The only shared state is
-one atomic per 2 MiB extent so a vCPU that faults inside the unmap window
-retries after the remap. This removed the throughput collapse that
-`host-memory-reclaim: auto` previously caused on virtio-net and vsock.
+The tracked revision changes how the balloon advises guest RAM free on macOS.
+Each coalesced report uses `hv_vm_unmap`, one `madvise(MADV_FREE)` call per
+native host page, and immediate `hv_vm_map`. Page-wise advice avoids XNU's
+bulk host-PTE path, which can leave guest-written backing dirty. There is no
+`MAP_FIXED` backing replacement or periodic whole-RAM remap. Later guest
+refaults remain in-kernel, and host devices retain passthrough memory access.
+One atomic per 2 MiB extent lets a vCPU faulting inside the unmap window retry
+once the mapping is restored, including after new reclaim has been disabled.
+
+The scratch probe checks page state without first reading host payload pages;
+it no longer qualifies on footprint deltas. A passing probe verifies clean,
+unreferenced, uncompressed backing and guest reuse, not a pressure soak.
+Real-HVF tests also verified release of already-compressed backing, while the
+report-before-pressure test remained inconclusive at its bounded 1 GiB budget.
+Nested EL2 guests remain unqualified. The external initramfs is streamed into
+guest RAM instead of staged in a large heap buffer.
 
 The fork also merges adjacent descriptors of one free-page report into a
 single release cycle and exposes `VmmHandle::host_reclaim_status()`. The krun
@@ -48,8 +55,9 @@ helper samples that every five seconds and writes a `host-memory-reclaim`
 record on a dedicated status pipe (`SILO_KRUN_STATUS_FD`) whenever it changes.
 vmmon reads the pipe, stores the latest record, and returns it in `GetMetrics`
 as `HostMetrics.host_memory_reclaim`, which is how `silo daemon status` learns
-whether the probe passed, whether reclaim is effective, and how many bytes the
-VM has released to the host.
+whether the probe passed, whether reclaim is effective, and how many bytes were
+successfully advised free. The cumulative counter includes repeat reports and
+is not a measurement of physical memory returned.
 
 The previous fork tip carried an x86_64 initrd placement patch and immediate
 Unix-vsock endpoint release. Upstream now contains its own initrd placement fix
@@ -94,13 +102,13 @@ Consequently, Silo neither builds nor packages `libkrunfw`.
 Build the self-contained helper with:
 
 ```bash
-cargo build --locked -p krun --features krun-bin --bin krun
+make krun PROFILE=debug
 ```
 
 For a release build:
 
 ```bash
-cargo build --locked --release -p krun --features krun-bin --bin krun
+make krun PROFILE=release
 ```
 
 The plain `krun` library does not activate the optional libkrun dependency.
@@ -114,7 +122,8 @@ On Linux, `ldd` and `readelf -d` must not report `libkrun.so` or `libbz2.so`.
 On macOS,
 `otool -L` must not report `libkrun.dylib`. The macOS helper still uses
 Hypervisor.framework and must be signed with the
-`com.apple.security.hypervisor` entitlement before distribution.
+`com.apple.security.hypervisor` entitlement before distribution. The xtask
+component build invoked by `make krun` signs and verifies it automatically.
 
 The macOS krun Rosetta path is experimental. Its current
 `CapturedCompatibilityV1` profile accepts only host build `25G83` and the

@@ -55,8 +55,9 @@ daemon:
 ```
 
 `memory` is the ceiling the VM can use. A Linux guest fills spare memory with
-page cache, and the host keeps every page the guest has touched, so a busy
-engine's host footprint grows toward `memory` and stays there while idle.
+page cache, and without host reclaim the host can retain backing for pages the
+guest has touched, so a busy engine's host footprint can grow toward `memory`
+while idle.
 
 `memory-reclaim: auto` enables guest cache reclaim modelled on WSL2's
 `autoMemoryReclaim`. The daemon ships the policy to the guest agent in the
@@ -80,10 +81,12 @@ and run its per-VM host-reclaim qualification probe. A passing probe enables
 host reclaim for that VM; failed or inconclusive probes leave ordinary guest
 memory active. Releases remap the range immediately so guest refaults stay
 in-kernel; it still defaults to `off` while that path is validated in the field.
-The krun helper reports the probe outcome, the effective state, and the bytes
-released so far over a status pipe, and `daemon status` shows them on the
-`Host memory reclaim` row. This setting does not change backend selection, vsock, native
-execution, or Rosetta intent. `daemon status` reports requested and observed
+The krun helper reports the probe outcome, the effective state, and cumulative
+bytes advised free over a status pipe, and `daemon status` shows them on the
+`Host memory reclaim` row. That counter includes repeat reports, not current
+physical memory savings; macOS may retain clean pages until memory pressure.
+This setting does not change backend selection, vsock, native execution, or
+Rosetta intent. `daemon status` reports requested and observed
 effective state separately and never treats `auto` as proof that reclaim became
 effective.
 

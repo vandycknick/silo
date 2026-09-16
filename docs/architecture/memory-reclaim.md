@@ -67,14 +67,16 @@ same primitive is a silent no-op for pages the guest dirtied, so Silo's
 libkrun fork runs, per contiguous range:
 
 ```text
-hv_vm_unmap  ->  madvise(MADV_FREE_REUSABLE)  ->  hv_vm_map
+hv_vm_unmap  ->  madvise(MADV_FREE) once per native host page  ->  hv_vm_map
 ```
 
-The range is remapped immediately. The footprint drop survives the remap,
-and when the guest touches the page again the host kernel handles the
-stage-2 fault with a zero-fill page and no VM exit. Adjacent descriptors in
-one report are merged into one cycle because the cost is dominated by the TLB
-invalidation broadcast, not the size.
+The range is remapped immediately. `MADV_FREE` makes backing eligible for
+reclamation; it does not promise an immediate resident-size or footprint drop.
+When backing is discarded, the host handles later guest refaults in-kernel
+without a VM exit. Adjacent descriptors in one report are merged to amortize
+HV TLB invalidations, but advice remains page-wise: bulk advice can miss backing
+that the guest dirtied without populating host PTEs. Production reclaim uses
+neither `MAP_FIXED` nor periodic whole-RAM Mach remapping.
 
 Host device access to guest memory is never guarded. The host mapping stays
 valid throughout, and the reporting protocol keeps a reported page out of the
@@ -84,22 +86,23 @@ window waits for the remap and retries.
 
 ### Qualification probe
 
-Whether the unmap, advise, remap cycle actually moves the host's accounting
-depends on the OS build. At VM start the fork maps a 2 MiB scratch region,
-has a scratch vCPU dirty it, releases it, and measures `phys_footprint`
-before and after. Host memory reclaim is only effective when that probe
-passes. `silo daemon status` reports the probe result separately from the
-requested policy and never treats `auto` as proof that reclaim works.
+At VM start the fork maps a 2 MiB scratch region and has a scratch vCPU dirty
+it. Without first reading its payload through the host mapping, it runs the
+production unmap, page-wise advice, immediate-remap cycle and checks that
+`mincore` reports clean, unreferenced, uncompressed backing. It then verifies
+guest read/write reuse. Host memory reclaim is only effective when the probe
+passes; nested EL2 guests remain unqualified. `silo daemon status` reports the
+probe result separately from the requested policy. Passing verifies page state
+and reuse, not physical release under every future pressure condition.
 
 ### What it does not do
 
 - It cannot release page cache, tmpfs, shmem, or anything the guest kernel
   still considers allocated. That is the job of guest memory reclaim, or of
   the guest's own workloads freeing memory.
-- It does not track re-dirtied pages. After a release and remap the host
-  kernel keeps those pages flagged reusable until its pageout scan un-marks
-  them, so `phys_footprint` can under-count for a while. This is an
-  accounting artifact, not a leak; the pages are resident and safe.
+- It does not track current physical savings. Clean `MADV_FREE` pages can stay
+  resident until pressure, and subsequent writes cancel their discardability.
+  The cumulative advice counter does not subtract re-dirtied or repeated pages.
 - It does nothing on the Virtualization.framework backend, which owns guest
   RAM in Apple's helper process where Silo cannot advise it.
 
@@ -164,26 +167,26 @@ the guest's memory from "cached" to "free".
 
 ```text
 guest workload frees memory ─┐
-                             ├─> guest free lists ─> free page reporting ─> libkrun release ─> host footprint drops
-guest memory reclaim ────────┘        (2 MiB blocks,     (virtio-balloon        (unmap, MADV_FREE_
-  idle or host pressure                2 s delay)         reporting queue)       REUSABLE, remap)
+                             ├─> guest free lists ─> free page reporting ─> backing made discardable
+guest memory reclaim ────────┘        (2 MiB blocks,     (virtio-balloon        (unmap, page-wise
+  after guest CPU idle                2 s delay)         reporting queue)       MADV_FREE, remap)
 
-guest touches the page again ─> stage-2 fault handled in the host kernel, zero-fill, no VM exit
+guest reuses discarded backing ─> stage-2 refault handled in the host kernel, no VM exit
 ```
 
 `daemon status` shows both:
 
 ```text
 Memory:               8GiB; last idle gradual reclaim in the guest reclaimed 2 minutes ago, guest cache fell by 512MiB
-Host memory reclaim:  requested auto; effective on (probe passed); 7.01GiB released to host since VM start
+Host memory reclaim:  requested auto; effective on (probe passed); 7.01GiB advised free since VM start
 ```
 
 The `Memory` row is guest memory reclaim as the agent reported it: mode,
 outcome, and how far the guest's own `Cached` figure fell. The `Host memory reclaim` row is host
-memory reclaim: requested policy, probe outcome, whether releases are
-happening, and cumulative bytes released. The released counter grows whenever
-the guest frees memory, including at boot when it reports everything it has
-not touched.
+memory reclaim: requested policy, probe outcome, and cumulative bytes
+successfully advised free. The underlying `released_bytes` counter includes
+repeat reports and untouched memory reported at boot, so it can exceed the VM's
+RAM ceiling. It is not current physical memory savings.
 
 ## Reading the numbers
 
@@ -193,12 +196,13 @@ The host process footprint of a healthy VM is roughly:
   cache, plus tmpfs and shmem, which never go away without swap
 - guest free memory that is not reportable: blocks smaller than 2 MiB,
   per-CPU free lists, the low-watermark reserve
+- reported pages whose clean backing the host has not yet discarded
 - VMM overhead: virtio buffers, stacks, and any large buffers libkrun retains
 
-Things that have looked like leaks and were not: a debug-profile agent binary
-of 170 MB staged on tmpfs under `/run/agent`, and the freed initramfs read
-buffer of the same size that macOS's allocator keeps cached in the helper.
-Both shrink to a few MB with a release build.
+A debug-profile agent binary of 170 MB staged on tmpfs under `/run/agent`
+is real guest memory use, not a host reclaim leak; release builds shrink it.
+The pinned fork now streams the external initramfs into guest RAM, removing
+the former same-sized host heap staging buffer and its allocator retention.
 
 ## What Silo deliberately does not use
 

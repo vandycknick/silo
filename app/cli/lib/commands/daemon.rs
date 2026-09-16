@@ -337,7 +337,7 @@ fn format_host_memory_reclaim(
     }
     if let (Some(_), Some(bytes)) = (effective, released_bytes) {
         text.push_str(&format!(
-            "; {} released to host since VM start",
+            "; {} advised free since VM start",
             crate::ui::human_bytes(Some(bytes))
         ));
     }
@@ -470,14 +470,14 @@ mod tests {
     }
 
     #[test]
-    fn host_memory_reclaim_status_appends_probe_and_released_bytes_once_reported() {
+    fn host_memory_reclaim_status_appends_probe_and_advised_bytes_once_reported() {
         assert_eq!(
             format_host_memory_reclaim(true, Some(true), Some("passed"), Some(6 * 1024 * 1024)),
-            "requested auto; effective on (probe passed); 6MiB released to host since VM start"
+            "requested auto; effective on (probe passed); 6MiB advised free since VM start"
         );
         assert_eq!(
             format_host_memory_reclaim(true, Some(false), Some("failed"), Some(0)),
-            "requested auto; effective off (probe failed); 0B released to host since VM start"
+            "requested auto; effective off (probe failed); 0B advised free since VM start"
         );
         // Counters are only meaningful alongside a reported effective state.
         assert_eq!(
