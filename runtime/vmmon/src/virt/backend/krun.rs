@@ -596,7 +596,11 @@ fn prepare(config: &VmConfig) -> Result<(), VirtError> {
 }
 
 fn build_boot_args(config: &VmConfig) -> Vec<String> {
-    let mut args = vec!["console=hvc0".to_string(), "panic=1".to_string()];
+    let mut args = vec![
+        "console=hvc0".to_string(),
+        "panic=1".to_string(),
+        "page_reporting.page_reporting_order=2".to_string(),
+    ];
     args.extend(config.kernel_cmdline().iter().cloned());
     args
 }
@@ -947,6 +951,23 @@ mod tests {
     fn write_executable(path: &Path, contents: &str) {
         fs::write(path, contents).expect("write executable");
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("make executable");
+    }
+
+    #[test]
+    fn boot_args_default_to_order_two_page_reporting() {
+        let config = VmConfig::builder("page-reporting")
+            .kernel_cmdline(vec!["root=/dev/vda".to_string()])
+            .build();
+
+        assert_eq!(
+            crate::virt::backend::krun::build_boot_args(&config),
+            [
+                "console=hvc0",
+                "panic=1",
+                "page_reporting.page_reporting_order=2",
+                "root=/dev/vda",
+            ]
+        );
     }
 
     #[test]
