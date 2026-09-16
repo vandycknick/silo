@@ -19,7 +19,7 @@ use crate::constants::{
     USERDATA_CONTENT_TYPE_PLAIN_TEXT, USERDATA_CONTENT_TYPE_SHELL_SCRIPT, VIRTIOFS_FSTYPE,
 };
 use crate::host;
-use crate::machine::MachineUserConfig;
+use crate::machine::{MachineMemoryReclaimConfig, MachineMemoryReclaimMode, MachineUserConfig};
 use crate::network::VmmonNetworkAttachment;
 use crate::paths::LocalPaths;
 use crate::RuntimeNetworkingConfig;
@@ -32,6 +32,7 @@ pub(crate) struct GuestAgentConfigInput<'a> {
     pub(crate) networking: &'a RuntimeNetworkingConfig,
     pub(crate) resize_rootfs: bool,
     pub(crate) user: Option<&'a MachineUserConfig>,
+    pub(crate) memory_reclaim: &'a MachineMemoryReclaimConfig,
 }
 
 struct GuestAgentHostContext {
@@ -55,6 +56,7 @@ pub(crate) fn build_config(input: GuestAgentConfigInput<'_>) -> eyre::Result<Age
         input.network,
         input.resize_rootfs,
         &host_context,
+        input.memory_reclaim,
     )
 }
 
@@ -85,6 +87,7 @@ fn build_config_with_host_context(
     network: &VmmonNetworkAttachment,
     resize_rootfs: bool,
     host_context: &GuestAgentHostContext,
+    memory_reclaim: &MachineMemoryReclaimConfig,
 ) -> eyre::Result<AgentConfig> {
     Ok(AgentConfig {
         provision: build_provision_config(
@@ -95,7 +98,21 @@ fn build_config_with_host_context(
             host_context,
         )?,
         ssh: build_ssh_config(host_context),
+        memory_reclaim: build_memory_reclaim_config(memory_reclaim),
     })
+}
+
+fn build_memory_reclaim_config(
+    config: &MachineMemoryReclaimConfig,
+) -> agent_spec::MemoryReclaimConfig {
+    agent_spec::MemoryReclaimConfig {
+        mode: match config.mode {
+            MachineMemoryReclaimMode::Off => agent_spec::MemoryReclaimMode::Off,
+            MachineMemoryReclaimMode::Gradual => agent_spec::MemoryReclaimMode::Gradual,
+            MachineMemoryReclaimMode::DropCache => agent_spec::MemoryReclaimMode::DropCache,
+        },
+        idle_after_secs: config.idle_after_secs,
+    }
 }
 
 fn build_provision_config(
@@ -331,7 +348,7 @@ mod tests {
         GuestAgentHostContext,
     };
     use crate::host;
-    use crate::machine::MachineUserConfig;
+    use crate::machine::{MachineMemoryReclaimConfig, MachineUserConfig};
     use crate::network::VmmonNetworkAttachment;
     use crate::paths::LocalPaths;
 
@@ -518,6 +535,7 @@ mod tests {
             &VmmonNetworkAttachment::None,
             false,
             &context,
+            &MachineMemoryReclaimConfig::default(),
         )
         .expect("build agent config");
 
@@ -793,6 +811,7 @@ mod tests {
             &VmmonNetworkAttachment::None,
             true,
             &host_context(),
+            &MachineMemoryReclaimConfig::default(),
         )
         .expect("build agent config");
 

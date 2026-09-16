@@ -6,6 +6,7 @@ mod forward;
 mod guest_process;
 mod handoff;
 mod host;
+mod memory_reclaim;
 mod metrics;
 mod pid1;
 mod port;
@@ -164,10 +165,12 @@ async fn run_agent(
     tracing::info!(boot_mode = ?boot_mode, "agent starting");
 
     let boot_report = boot_mode.report();
+    let memory_reclaim = memory_reclaim::start(&agent_config.memory_reclaim);
     let agent_server = AgentServer::start(
         from_kernel_cmdline(),
         boot_report.clone(),
         process_supervisor.clone(),
+        memory_reclaim,
     )
     .await?;
     let provision_report = match run_provisioning(

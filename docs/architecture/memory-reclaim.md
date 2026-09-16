@@ -9,7 +9,7 @@ do, and shows how they compose.
 | Silo setting | Name used in this document | Where it runs | Kernel / spec term |
 | --- | --- | --- | --- |
 | `host-memory-reclaim` | **host memory reclaim** | libkrun in the `krun` helper, fed by the guest kernel | virtio-balloon **free page reporting** (`VIRTIO_BALLOON_F_REPORTING`) plus a host-side page release |
-| `memory-reclaim` | **guest memory reclaim** | the silo daemon on the host, acting on the guest kernel | cgroup v2 **proactive reclaim** (`memory.reclaim`) plus **memory compaction** |
+| `memory-reclaim` | **guest memory reclaim** | a thread inside the guest agent, configured at launch | cgroup v2 **proactive reclaim** (`memory.reclaim`) plus **memory compaction** |
 
 Neither one is "ballooning" in the classic sense. Silo attaches a
 virtio-balloon device, but only for its free page reporting queue. The
@@ -108,43 +108,46 @@ requested policy and never treats `auto` as proof that reclaim works.
 The guest kernel only frees page cache when it needs the memory for
 something else. In a VM that means cache accumulates to the VM's memory
 limit and stays there, invisible to free page reporting. Guest memory reclaim
-asks the kernel to give it up early. It is the same idea as WSL2's
-`autoMemoryReclaim`, and like WSL2 it is a host-side policy driving a
-guest-side kernel mechanism.
+asks the kernel to give it up early. It follows WSL2's `autoMemoryReclaim`
+closely, including the design choice that the policy runs inside the guest:
+WSL runs it in its `init`, Silo runs it in the guest agent.
 
 ### Mechanism
 
-The daemon runs a short script in the guest as root. The script:
+The daemon translates `memory-reclaim` and `memory-reclaim-after` into the
+machine's durable guest config, which libvm ships to the agent in
+`/run/agent/config.json` at every launch. When the mode is not `off` the
+agent starts a `memory-reclaim` thread at `SCHED_IDLE` priority, so it never
+competes with workloads, and that thread:
 
-1. Reads `/proc/meminfo` and computes a reclaimable target: `Cached` minus
-   `Shmem` plus `SReclaimable`. Shared memory and tmpfs cannot be dropped
-   without swap and are excluded so the request is honest.
-2. Writes the target to the cgroup v2 root `memory.reclaim` in eight chunks.
-   The kernel refuses a request it cannot satisfy in full with `EAGAIN`, so
-   chunking keeps whatever progress was made instead of failing outright.
-   This interface is Linux's proactive reclaim, added in 5.19; it runs the
-   same reclaim path `kswapd` uses, without the pressure.
-3. Falls back to `/proc/sys/vm/drop_caches` only on kernels that have no
-   `memory.reclaim`.
-4. Reports `Cached` before and after so the daemon records what the guest
-   measured rather than a possibly stale agent sample.
+1. Samples `/proc/stat` every ten seconds. The guest counts as idle when
+   non-idle CPU stays at or below 0.5% across a rolling window of
+   `memory-reclaim-after`, and the latest interval is idle too. A short burst
+   postpones one tick without discarding the idle history.
+2. In `gradual` mode computes the reclaimable cache as
+   `Active(file) + Inactive(file) + SReclaimable`. Shared memory and tmpfs
+   are not file cache and are never counted. It keeps a 128 MiB floor and asks
+   the cgroup v2 root `memory.reclaim` for one bounded step per tick, RAM/32
+   clamped between 256 MiB and 1 GiB, with `swappiness=0`. `EAGAIN` means the
+   kernel freed part of the request and counts as progress. This interface is
+   Linux's proactive reclaim, added in 5.19; it runs the same reclaim path
+   `kswapd` uses, without the pressure.
+3. In `dropcache` mode, or when `memory.reclaim` is missing, writes `3` to
+   `/proc/sys/vm/drop_caches` once per idle period.
+4. After a reclaim writes `1` to `/proc/sys/vm/compact_memory` so the freed
+   pages merge into blocks large enough for free page reporting.
+5. Re-samples CPU afterwards so its own work does not restart the idle
+   window, and records the run: mode, outcome, bytes requested, and `Cached`
+   before and after.
+
+The record travels with the agent's normal metrics stream, so vmmon and the
+daemon learn about it without any extra channel. The daemon only observes;
+it runs nothing in the guest.
 
 Pages the guest frees this way land on its free lists and, two seconds later,
 free page reporting hands them to the host. Guest memory reclaim therefore
 only helps when host memory reclaim is effective; on its own it just moves
 the guest's memory from "cached" to "free".
-
-### Triggers
-
-- **Idle.** The daemon samples guest CPU and block I/O every five seconds.
-  Once both have stayed below their thresholds for `memory-reclaim-after`
-  and the guest holds at least 512 MiB of cache, it runs one reclaim and then
-  requires a fresh idle window before the next.
-- **Host memory pressure.** On macOS the daemon also reads
-  `kern.memorystatus_vm_pressure_level` every tick. At warning or critical
-  it reclaims at once, regardless of idleness, with a 30 second cooldown and
-  a 128 MiB cache floor. This is the case where memory is needed now and
-  waiting for the idle window would be wrong.
 
 ### What it does not do
 
@@ -153,6 +156,9 @@ the guest's memory from "cached" to "free".
   cache, and anonymous memory only if swap exists, which the guest has none.
 - It does not reduce the VM's memory limit. The guest can use the full
   `memory` setting again at any time.
+- It does not react to host memory pressure. The guest cannot see the host,
+  and a host-to-agent signal would need a new RPC through vmmon. That was
+  judged not worth the depth for now; the idle window is the only trigger.
 
 ## How they compose
 
@@ -168,12 +174,12 @@ guest touches the page again ─> stage-2 fault handled in the host kernel, zero
 `daemon status` shows both:
 
 ```text
-Memory:               8GiB; last cache reclaim (idle) used bounded cgroup reclaim 2 minutes ago, guest cache fell by 512MiB
+Memory:               8GiB; last idle gradual reclaim in the guest reclaimed 2 minutes ago, guest cache fell by 512MiB
 Host memory reclaim:  requested auto; effective on (probe passed); 7.01GiB released to host since VM start
 ```
 
-The `Memory` row is guest memory reclaim: trigger, outcome, and how far the
-guest's own `Cached` figure fell. The `Host memory reclaim` row is host
+The `Memory` row is guest memory reclaim as the agent reported it: mode,
+outcome, and how far the guest's own `Cached` figure fell. The `Host memory reclaim` row is host
 memory reclaim: requested policy, probe outcome, whether releases are
 happening, and cumulative bytes released. The released counter grows whenever
 the guest frees memory, including at boot when it reports everything it has
@@ -214,16 +220,17 @@ Both shrink to a few MB with a release build.
 Force guest memory reclaim without waiting:
 
 ```sh
-# idle path: lower the window to its 30 s minimum, fill cache, leave it alone
+# lower the window to its 30 s minimum in daemon.yaml, restart, fill cache, leave it alone
 docker run --rm alpine sh -c 'dd if=/dev/urandom of=/cache bs=1M count=1024 && sync && cat /cache >/dev/null'
-silo daemon logs | tail -3
+silo daemon logs | tail -3          # "guest memory reclaim run N: ..."
+silo exec silo-system -- journalctl -u silo-agent -n 5   # the agent's own log line
 
-# pressure path: real pressure, not simulated (-S only posts notifications)
-memory_pressure -l warn
-
-# kernel path only, bypassing the daemon
+# kernel path only, bypassing the agent
 silo exec -u root silo-system -- sh -c 'echo 512M > /sys/fs/cgroup/memory.reclaim; echo $?'
 ```
+
+The agent's policy changes only at VM start: `silo daemon down && silo daemon up`
+after editing the config.
 
 Watch host memory reclaim with the released counter in `daemon status`, or
 with `footprint -p <krun pid>` on the host. Inside the guest,

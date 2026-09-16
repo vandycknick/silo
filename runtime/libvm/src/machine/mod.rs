@@ -24,7 +24,10 @@ pub use forward::{
     MachineForwardErrorDetail, MachineForwardScope, MachineForwardSession, MachineForwardState,
     MachineForwardStatus,
 };
-pub use guest::{GuestBuilder, MachineAgent, MachineGuestConfig, MachineUserConfig};
+pub use guest::{
+    GuestBuilder, MachineAgent, MachineGuestConfig, MachineMemoryReclaimConfig,
+    MachineMemoryReclaimMode, MachineUserConfig,
+};
 pub use handle::Machine;
 pub use inspect::{
     MachineBootMode, MachineBootReport, MachineData, MachineProvisionFailurePolicy,
@@ -63,11 +66,11 @@ pub use streams::{
     MachineEnabledAgent, MachineEntryKind, MachineFileDownload, MachineFileEntry,
     MachineFileUploadOptions, MachineFilesystemMetrics, MachineFreshness, MachineGuestBootMode,
     MachineGuestBootReport, MachineHostMemoryReclaim, MachineHostMemoryReclaimQualification,
-    MachineLoadAverageMetrics, MachineMemoryMetrics, MachineMetricSnapshot, MachineMetrics,
-    MachineMonitorSnapshot, MachineMonitorStatus, MachineNetworkInterfaceMetrics,
-    MachineProvisionOverallStatus, MachineProvisioningReport, MachineReadiness,
-    MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState, MachineStaleReason,
-    MachineSystemInfo, MachineVmSnapshot, MachineVmState,
+    MachineLoadAverageMetrics, MachineMemoryMetrics, MachineMemoryReclaimReport,
+    MachineMetricSnapshot, MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus,
+    MachineNetworkInterfaceMetrics, MachineProvisionOverallStatus, MachineProvisioningReport,
+    MachineReadiness, MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState,
+    MachineStaleReason, MachineSystemInfo, MachineVmSnapshot, MachineVmState,
 };
 pub use update::{GuestPublishUpdate, MachineUpdate, MachineUserUpdate, NetworkPolicyUpdate};
 

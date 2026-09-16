@@ -161,6 +161,7 @@ mod tests {
                 path: agent.clone(),
             },
             user: None,
+            memory_reclaim: Default::default(),
         };
 
         let guest = canonicalize_guest_config(guest).expect("canonicalize guest");

@@ -323,11 +323,12 @@ that lowers the host footprint.
 
 ### Guest Memory Reclaim
 
-Setting: `memory-reclaim`. A host-side policy that asks the guest kernel to
-give up page cache early through cgroup v2 **proactive reclaim**
-(`memory.reclaim`), triggered when the guest is idle or when macOS reports
-memory pressure. WSL2 calls the same idea `autoMemoryReclaim`. It frees
-memory inside the guest; free page reporting then carries it to the host.
+Setting: `memory-reclaim`. A thread in the guest agent that asks the guest
+kernel to give up page cache early through cgroup v2 **proactive reclaim**
+(`memory.reclaim`) once the guest has been idle, then compacts free memory.
+WSL2 calls the same idea `autoMemoryReclaim` and also runs it in the guest.
+It frees memory inside the guest; free page reporting then carries it to the
+host. The daemon only configures it, at launch, and reports its runs.
 
 ### Not Ballooning
 

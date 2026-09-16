@@ -12,6 +12,7 @@ agent-spec = { path = "../../specs/agent-spec" }
 forward-spec = { path = "../../specs/forward-spec", features = ["tokio"] }
 protocol = { path = "../../specs/protocol" }
 eyre = "0.6.12"
+libc = "0.2"
 futures = "0.3.33"
 bytes = "1.12.1"
 clap = { version = "4.6.4", default-features = false, features = ["derive", "std"] }

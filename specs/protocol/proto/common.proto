@@ -181,6 +181,25 @@ message MetricSnapshot {
   repeated FilesystemMetrics filesystems = 5;
   repeated NetworkInterfaceMetrics network_interfaces = 6;
   repeated BlockDeviceMetrics block_devices = 7;
+  // Last guest page-cache reclaim run by the agent. Absent until the first run.
+  MemoryReclaimReport memory_reclaim = 8;
+}
+
+message MemoryReclaimReport {
+  google.protobuf.Timestamp finished_at = 1;
+  // gradual | dropcache
+  optional string mode = 2;
+  // reclaimed: the request was met; partial: the kernel stopped early;
+  // nothing: no reclaimable cache above the floor; failed: the control file
+  // could not be written.
+  optional string outcome = 3;
+  optional uint64 requested_bytes = 4;
+  // Cached from /proc/meminfo before and after the run.
+  optional uint64 cached_before_bytes = 5;
+  optional uint64 cached_after_bytes = 6;
+  optional bool compacted = 7;
+  // Reclaim runs since the agent started, including this one.
+  optional uint64 runs = 8;
 }
 
 message MemoryMetrics {

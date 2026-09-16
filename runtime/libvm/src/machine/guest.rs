@@ -12,6 +12,57 @@ pub struct MachineGuestConfig {
     /// Guest account provisioned by the managed agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<MachineUserConfig>,
+    /// Guest page-cache reclaim run by the managed agent.
+    #[serde(default, skip_serializing_if = "MachineMemoryReclaimConfig::is_off")]
+    pub memory_reclaim: MachineMemoryReclaimConfig,
+}
+
+/// How the managed agent returns idle page cache to the guest kernel, where the
+/// balloon's free-page reporting can hand it to the host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineMemoryReclaimMode {
+    /// Never reclaim.
+    #[default]
+    Off,
+    /// Reclaim cold file cache in bounded steps through cgroup v2 `memory.reclaim`.
+    Gradual,
+    /// Drop the whole page cache once per idle period.
+    DropCache,
+}
+
+/// Guest memory reclaim policy shipped to the managed agent at launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineMemoryReclaimConfig {
+    pub mode: MachineMemoryReclaimMode,
+    /// Idle window, in seconds, before the first reclaim of an idle period.
+    pub idle_after_secs: u64,
+}
+
+impl Default for MachineMemoryReclaimConfig {
+    fn default() -> Self {
+        Self {
+            mode: MachineMemoryReclaimMode::Off,
+            idle_after_secs: 120,
+        }
+    }
+}
+
+impl MachineMemoryReclaimConfig {
+    pub(crate) fn is_off(&self) -> bool {
+        self.mode == MachineMemoryReclaimMode::Off
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.is_off() && self.idle_after_secs < agent_spec::MIN_MEMORY_RECLAIM_IDLE_AFTER_SECS {
+            return Err(format!(
+                "guest memory reclaim idle window must be at least {} seconds",
+                agent_spec::MIN_MEMORY_RECLAIM_IDLE_AFTER_SECS
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Concrete guest account configuration.
@@ -113,6 +164,15 @@ impl GuestBuilder {
     /// Configures a concrete account for managed guest provisioning.
     pub fn user(mut self, user: MachineUserConfig) -> Self {
         self.config.user = Some(user);
+        self
+    }
+
+    /// Configures guest page-cache reclaim by the managed agent.
+    pub fn memory_reclaim(mut self, mode: MachineMemoryReclaimMode, idle_after_secs: u64) -> Self {
+        self.config.memory_reclaim = MachineMemoryReclaimConfig {
+            mode,
+            idle_after_secs,
+        };
         self
     }
 

@@ -148,12 +148,14 @@ async fn ensure_system_machine_for_installation(
     Ok((record, machine))
 }
 
-/// The resource settings the daemon may change between starts: CPUs, memory, Rosetta.
+/// The settings the daemon may change between starts: CPUs, memory, Rosetta, and
+/// the guest memory reclaim policy the agent runs.
 #[derive(Debug, PartialEq, Eq)]
 struct SystemHardware {
     cpus: Option<u8>,
     memory_mib: Option<u32>,
     rosetta: Option<bool>,
+    memory_reclaim: libvm::MachineMemoryReclaimConfig,
 }
 
 impl SystemHardware {
@@ -167,6 +169,7 @@ impl SystemHardware {
                     .and_then(|hardware| hardware.rosetta)
                     .unwrap_or(false),
             ),
+            memory_reclaim: machine.guest.memory_reclaim,
         }
     }
 
@@ -175,7 +178,22 @@ impl SystemHardware {
             cpus: Some(config.cpus),
             memory_mib: u32::try_from(config.memory_bytes / (1024 * 1024)).ok(),
             rosetta: config.rosetta_explicit.then_some(config.rosetta),
+            memory_reclaim: guest_memory_reclaim(config),
         }
+    }
+}
+
+/// The guest memory reclaim policy a resolved config asks the agent to run.
+pub(crate) fn guest_memory_reclaim(
+    config: &ResolvedSystemConfig,
+) -> libvm::MachineMemoryReclaimConfig {
+    libvm::MachineMemoryReclaimConfig {
+        mode: if config.memory_reclaim {
+            libvm::MachineMemoryReclaimMode::Gradual
+        } else {
+            libvm::MachineMemoryReclaimMode::Off
+        },
+        idle_after_secs: config.memory_reclaim_after_secs,
     }
 }
 
@@ -187,6 +205,7 @@ fn hardware_matches(machine: &MachineData, config: &ResolvedSystemConfig) -> boo
         && desired
             .rosetta
             .is_none_or(|rosetta| current.rosetta == Some(rosetta))
+        && current.memory_reclaim == desired.memory_reclaim
 }
 
 /// Applies CPU, memory, and Rosetta settings to a stopped system machine so config or
@@ -220,6 +239,13 @@ async fn reconcile_system_hardware(
         if current.rosetta != Some(rosetta) {
             update = update.rosetta(rosetta);
         }
+    }
+    if current.memory_reclaim != desired.memory_reclaim {
+        // The system machine carries no other durable guest settings, so a fresh
+        // guest config with just the reclaim policy is the whole desired state.
+        let reclaim = desired.memory_reclaim;
+        update =
+            update.guest(move |guest| guest.memory_reclaim(reclaim.mode, reclaim.idle_after_secs));
     }
     api.update_system_machine(&machine.id, update)
         .await

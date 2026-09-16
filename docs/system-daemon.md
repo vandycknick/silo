@@ -58,18 +58,19 @@ daemon:
 page cache, and the host keeps every page the guest has touched, so a busy
 engine's host footprint grows toward `memory` and stays there while idle.
 
-`memory-reclaim: auto` enables an experimental guest cache reclaim modelled on
-WSL2's `autoMemoryReclaim`. It runs after the guest has been idle for
-`memory-reclaim-after`, and immediately (at most every 30 seconds) whenever
-macOS reports warning or critical memory pressure. The guest computes its own
-reclaimable target from `/proc/meminfo` (page cache minus shmem, plus
-reclaimable slab) and asks the cgroup v2 root `memory.reclaim` for it in
-chunks, so a partially satisfied request keeps its progress instead of failing.
-The guest-wide cache drop is only used on kernels without `memory.reclaim`.
-`daemon status` shows the trigger, the outcome, and how far the guest's cached
-memory fell. It is off by default. This setting controls guest cache cleanup
-only; freed guest pages reach the host through the balloon's free-page
-reporting when `host-memory-reclaim` is effective.
+`memory-reclaim: auto` enables guest cache reclaim modelled on WSL2's
+`autoMemoryReclaim`. The daemon ships the policy to the guest agent in the
+machine's guest config at launch, and a low-priority thread in the agent does
+the work: once CPU has stayed idle for `memory-reclaim-after` it asks the
+cgroup v2 root `memory.reclaim` for one bounded step of file cache per ten
+seconds, then compacts free memory so the freed pages can be reported to the
+host. It falls back to a cache drop only on kernels without `memory.reclaim`.
+`daemon status` shows the last run's mode, outcome, and how far the guest's
+cached memory fell. It is off by default and changes take effect on the next
+VM start. This setting controls guest cache cleanup only; freed guest pages
+reach the host through the balloon's free-page reporting when
+`host-memory-reclaim` is effective. See
+[Memory Reclaim](architecture/memory-reclaim.md).
 
 See [Memory Reclaim](architecture/memory-reclaim.md) for how the two
 memory settings relate.

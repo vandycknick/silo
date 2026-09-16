@@ -416,6 +416,30 @@ pub struct MachineMetricSnapshot {
     pub filesystems: Vec<MachineFilesystemMetrics>,
     pub network_interfaces: Vec<MachineNetworkInterfaceMetrics>,
     pub block_devices: Vec<MachineBlockDeviceMetrics>,
+    /// Last guest page-cache reclaim run by the agent, once it has run.
+    pub memory_reclaim: Option<MachineMemoryReclaimReport>,
+}
+/// One guest memory reclaim run, as the agent reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineMemoryReclaimReport {
+    pub finished_at: SystemTime,
+    /// `gradual` or `dropcache`.
+    pub mode: String,
+    /// `reclaimed`, `partial`, `nothing`, or `failed`.
+    pub outcome: String,
+    pub requested_bytes: u64,
+    pub cached_before_bytes: u64,
+    pub cached_after_bytes: u64,
+    pub compacted: bool,
+    /// Runs since the agent started, including this one.
+    pub runs: u64,
+}
+impl MachineMemoryReclaimReport {
+    /// How far the guest's `Cached` figure fell across the run.
+    pub fn cached_delta_bytes(&self) -> u64 {
+        self.cached_before_bytes
+            .saturating_sub(self.cached_after_bytes)
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineMemoryMetrics {
@@ -1467,6 +1491,30 @@ impl TryFrom<v1::MetricSnapshot> for MachineMetricSnapshot {
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
+            memory_reclaim: value.memory_reclaim.map(TryInto::try_into).transpose()?,
+        })
+    }
+}
+impl TryFrom<v1::MemoryReclaimReport> for MachineMemoryReclaimReport {
+    type Error = String;
+    fn try_from(value: v1::MemoryReclaimReport) -> Result<Self, Self::Error> {
+        Ok(Self {
+            finished_at: timestamp(value.finished_at, "metrics.memory_reclaim.finished_at")?,
+            mode: required_text(
+                value.mode,
+                "metrics.memory_reclaim.mode",
+                protocol::MAX_INFO_BYTES,
+            )?,
+            outcome: required_text(
+                value.outcome,
+                "metrics.memory_reclaim.outcome",
+                protocol::MAX_INFO_BYTES,
+            )?,
+            requested_bytes: value.requested_bytes.unwrap_or_default(),
+            cached_before_bytes: value.cached_before_bytes.unwrap_or_default(),
+            cached_after_bytes: value.cached_after_bytes.unwrap_or_default(),
+            compacted: value.compacted.unwrap_or_default(),
+            runs: value.runs.unwrap_or_default(),
         })
     }
 }
@@ -1988,6 +2036,16 @@ mod tests {
                             write_operations: Some(4),
                             in_flight_operations: Some(5),
                         }],
+                        memory_reclaim: Some(v1::MemoryReclaimReport {
+                            finished_at: Some(timestamp()),
+                            mode: Some("gradual".to_string()),
+                            outcome: Some("reclaimed".to_string()),
+                            requested_bytes: Some(268_435_456),
+                            cached_before_bytes: Some(1_073_741_824),
+                            cached_after_bytes: Some(805_306_368),
+                            compacted: Some(true),
+                            runs: Some(3),
+                        }),
                     }),
                 }),
                 agent_instance_id: Some("00000000-0000-4000-8000-000000000003".to_string()),
@@ -1995,6 +2053,15 @@ mod tests {
         })
         .expect("valid metrics");
         assert_eq!(metrics.actual_backend.as_deref(), Some("krun"));
+        let guest_reclaim = metrics
+            .metrics
+            .as_ref()
+            .and_then(|observation| observation.report.snapshot.memory_reclaim.clone())
+            .expect("guest memory reclaim report");
+        assert_eq!(guest_reclaim.mode, "gradual");
+        assert_eq!(guest_reclaim.outcome, "reclaimed");
+        assert_eq!(guest_reclaim.cached_delta_bytes(), 268_435_456);
+        assert_eq!(guest_reclaim.runs, 3);
         let reclaim = metrics.host_memory_reclaim.expect("host memory reclaim");
         assert!(reclaim.requested);
         assert!(reclaim.effective);

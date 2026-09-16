@@ -490,6 +490,10 @@ impl LocalVmService {
             .mounts(mounts)
             .forwards(vec![forward])
             .network(|network| network.private().publish(config.publish_bind))
+            .guest(|guest| {
+                let reclaim = crate::system::provision::guest_memory_reclaim(config);
+                guest.memory_reclaim(reclaim.mode, reclaim.idle_after_secs)
+            })
             .create()
             .await?;
         Ok(machine.inspect().await?)

@@ -450,6 +450,7 @@ fn agent_metrics(instance_id: String) -> AgentMetrics {
                 filesystems: Vec::new(),
                 network_interfaces: Vec::new(),
                 block_devices: Vec::new(),
+                memory_reclaim: None,
             }),
         }),
     }

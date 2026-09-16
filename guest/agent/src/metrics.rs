@@ -5,10 +5,14 @@ use std::path::Path;
 use prost_types::Timestamp;
 use protocol::v1::{
     AgentMetricReport, AgentMetrics, BlockDeviceMetrics, CpuMetrics, FilesystemMetrics,
-    LoadAverageMetrics, MemoryMetrics, MetricSnapshot, NetworkInterfaceMetrics,
+    LoadAverageMetrics, MemoryMetrics, MemoryReclaimReport, MetricSnapshot,
+    NetworkInterfaceMetrics,
 };
 
-pub(crate) fn collect(instance_id: String) -> AgentMetrics {
+pub(crate) fn collect(
+    instance_id: String,
+    memory_reclaim: Option<MemoryReclaimReport>,
+) -> AgentMetrics {
     AgentMetrics {
         agent_instance_id: Some(instance_id),
         report: Some(AgentMetricReport {
@@ -29,6 +33,7 @@ pub(crate) fn collect(instance_id: String) -> AgentMetrics {
                 filesystems: filesystems(),
                 network_interfaces: network(),
                 block_devices: block_devices(),
+                memory_reclaim,
             }),
         }),
     }

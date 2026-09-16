@@ -242,9 +242,8 @@ impl DaemonStatusView {
                     .and_then(|(outcome, at)| {
                         let at = chrono::DateTime::parse_from_rfc3339(at).ok()?.timestamp();
                         Some(format_guest_reclaim(
-                            status.memory_reclaim_trigger,
+                            status.memory_reclaim_mode.as_deref(),
                             outcome,
-                            status.memory_reclaim_bounded_exit_code,
                             status.memory_reclaim_observed_cache_delta_bytes,
                             crate::ui::relative_time(at, crate::ui::now_unix()).to_lowercase(),
                         ))
@@ -289,28 +288,24 @@ fn format_actual_backend(backend: Option<&str>) -> &str {
     backend.unwrap_or("unknown")
 }
 
-/// One clause describing the last guest cache reclaim, for the Memory row.
+/// One clause describing the agent's last guest cache reclaim, for the Memory row.
 fn format_guest_reclaim(
-    trigger: Option<crate::system::supervisor::MemoryReclaimTrigger>,
+    mode: Option<&str>,
     outcome: crate::system::supervisor::MemoryReclaimOutcome,
-    bounded_exit_code: Option<u32>,
     reclaimed_bytes: Option<u64>,
     when: String,
 ) -> String {
-    use crate::system::supervisor::{MemoryReclaimOutcome, MemoryReclaimTrigger};
+    use crate::system::supervisor::MemoryReclaimOutcome;
 
-    let trigger = match trigger {
-        Some(MemoryReclaimTrigger::HostPressure) => "host memory pressure",
-        Some(MemoryReclaimTrigger::Idle) | None => "idle",
+    let mode = match mode {
+        Some("dropcache") => "cache drop",
+        Some(_) | None => "gradual",
     };
-    let outcome = match (outcome, bounded_exit_code) {
-        (MemoryReclaimOutcome::Bounded, None) => "used bounded cgroup reclaim".to_string(),
-        (MemoryReclaimOutcome::Bounded, Some(code)) => {
-            format!("used bounded cgroup reclaim, stopped early with exit {code}")
-        }
-        (MemoryReclaimOutcome::Fallback, _) => "used the global cache-drop fallback".to_string(),
-        (MemoryReclaimOutcome::Nothing, _) => "found nothing reclaimable".to_string(),
-        (MemoryReclaimOutcome::Failed, _) => "failed".to_string(),
+    let outcome = match outcome {
+        MemoryReclaimOutcome::Reclaimed => "reclaimed",
+        MemoryReclaimOutcome::Partial => "reclaimed partially",
+        MemoryReclaimOutcome::Nothing => "found nothing reclaimable",
+        MemoryReclaimOutcome::Failed => "failed",
     };
     let reclaimed = reclaimed_bytes
         .filter(|_| outcome != "failed")
@@ -321,7 +316,7 @@ fn format_guest_reclaim(
             )
         })
         .unwrap_or_default();
-    format!("; last cache reclaim ({trigger}) {outcome} {when}{reclaimed}")
+    format!("; last idle {mode} reclaim in the guest {outcome} {when}{reclaimed}")
 }
 
 fn format_host_memory_reclaim(
@@ -492,38 +487,35 @@ mod tests {
     }
 
     #[test]
-    fn guest_reclaim_clause_names_trigger_outcome_and_measured_delta() {
-        use crate::system::supervisor::{MemoryReclaimOutcome, MemoryReclaimTrigger};
+    fn guest_reclaim_clause_names_mode_outcome_and_measured_delta() {
+        use crate::system::supervisor::MemoryReclaimOutcome;
 
         assert_eq!(
             super::format_guest_reclaim(
-                Some(MemoryReclaimTrigger::HostPressure),
-                MemoryReclaimOutcome::Bounded,
-                Some(1),
+                Some("gradual"),
+                MemoryReclaimOutcome::Partial,
                 Some(512 * 1024 * 1024),
                 "2 minutes ago".to_string(),
             ),
-            "; last cache reclaim (host memory pressure) used bounded cgroup reclaim, stopped early with exit 1 2 minutes ago, guest cache fell by 512MiB"
+            "; last idle gradual reclaim in the guest reclaimed partially 2 minutes ago, guest cache fell by 512MiB"
         );
         assert_eq!(
             super::format_guest_reclaim(
-                None,
+                Some("dropcache"),
                 MemoryReclaimOutcome::Failed,
-                None,
                 Some(7),
                 "just now".to_string(),
             ),
-            "; last cache reclaim (idle) failed just now"
+            "; last idle cache drop reclaim in the guest failed just now"
         );
         assert_eq!(
             super::format_guest_reclaim(
-                Some(MemoryReclaimTrigger::Idle),
-                MemoryReclaimOutcome::Nothing,
                 None,
+                MemoryReclaimOutcome::Nothing,
                 Some(0),
                 "just now".to_string(),
             ),
-            "; last cache reclaim (idle) found nothing reclaimable just now, guest cache fell by 0B"
+            "; last idle gradual reclaim in the guest found nothing reclaimable just now, guest cache fell by 0B"
         );
     }
 

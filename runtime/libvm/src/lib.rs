@@ -61,6 +61,7 @@ pub use crate::machine::{
     MachineGuestConfig, MachineHostMemoryReclaim, MachineHostMemoryReclaimQualification,
     MachineKillOptions, MachineLoadAverageMetrics, MachineLogChunk, MachineLogOptions,
     MachineLogOutput, MachineLogSource, MachineLogStream, MachineMemoryMetrics,
+    MachineMemoryReclaimConfig, MachineMemoryReclaimMode, MachineMemoryReclaimReport,
     MachineMetricSnapshot, MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus,
     MachineNetworkInterfaceMetrics, MachineProvisionFailurePolicy, MachineProvisionOverallStatus,
     MachineProvisionReport, MachineProvisionStatus, MachineProvisionStepReport,

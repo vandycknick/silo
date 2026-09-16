@@ -6,7 +6,7 @@ use std::time::Duration;
 use eyre::{bail, Context as _};
 use libvm::{
     ExecutionResult, MachineHostMemoryReclaim, MachineHostMemoryReclaimQualification,
-    MachineReadinessOutcome, MachineStatus,
+    MachineMemoryReclaimReport, MachineReadinessOutcome, MachineStatus,
 };
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,6 @@ use uuid::Uuid;
 
 use crate::api::AppApi;
 use crate::system::config::ResolvedSystemConfig;
-use crate::system::host_pressure::{self, HostMemoryPressure};
 use crate::system::provision::ensure_system_machine;
 use crate::system::record::{load_record, write_record, SystemPaths};
 
@@ -55,21 +54,21 @@ pub(crate) struct DaemonStatus {
     pub(crate) updated_at: String,
     pub(crate) last_error: Option<String>,
     pub(crate) restart_count: u32,
-    /// How the last guest cache-reclaim attempt ended.
+    /// How the agent's last guest cache-reclaim run ended.
     #[serde(default)]
     pub(crate) memory_reclaim_outcome: Option<MemoryReclaimOutcome>,
-    /// Exit status from a bounded reclaim that required the global fallback.
+    /// Reclaim mode the agent used for that run: `gradual` or `dropcache`.
     #[serde(default)]
-    pub(crate) memory_reclaim_bounded_exit_code: Option<u32>,
-    /// Guest cached-byte decrease the guest measured across the attempt, not host memory returned.
+    pub(crate) memory_reclaim_mode: Option<String>,
+    /// How far the guest's own `Cached` figure fell across that run, not host memory returned.
     #[serde(default)]
     pub(crate) memory_reclaim_observed_cache_delta_bytes: Option<u64>,
-    /// When the last guest cache-reclaim attempt ran (RFC 3339).
+    /// When that run finished (RFC 3339).
     #[serde(default)]
     pub(crate) memory_reclaim_at: Option<String>,
-    /// What triggered the last guest cache-reclaim attempt.
+    /// Reclaim runs the agent has completed since it started.
     #[serde(default)]
-    pub(crate) memory_reclaim_trigger: Option<MemoryReclaimTrigger>,
+    pub(crate) memory_reclaim_runs: Option<u64>,
     /// Whether the runtime requested per-VM host memory reclaim qualification.
     #[serde(default)]
     pub(crate) host_memory_reclaim_requested: bool,
@@ -87,20 +86,30 @@ pub(crate) struct DaemonStatus {
     pub(crate) host_memory_reclaim_failed_operations: Option<u64>,
 }
 
+/// Outcome of one agent reclaim run, as the agent reported it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MemoryReclaimOutcome {
-    Bounded,
-    Fallback,
+    /// The kernel accepted the whole request.
+    Reclaimed,
+    /// The kernel stopped early and freed less than half of the request.
+    Partial,
+    /// No reclaimable cache above the agent's floor.
     Nothing,
+    /// The control file could not be written.
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum MemoryReclaimTrigger {
-    Idle,
-    HostPressure,
+impl MemoryReclaimOutcome {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "reclaimed" => Self::Reclaimed,
+            "partial" => Self::Partial,
+            "nothing" => Self::Nothing,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,10 +182,10 @@ pub(crate) async fn serve(
         last_error: None,
         restart_count: 0,
         memory_reclaim_outcome: None,
-        memory_reclaim_bounded_exit_code: None,
+        memory_reclaim_mode: None,
         memory_reclaim_observed_cache_delta_bytes: None,
         memory_reclaim_at: None,
-        memory_reclaim_trigger: None,
+        memory_reclaim_runs: None,
         host_memory_reclaim_requested: config.host_memory_reclaim,
         host_memory_reclaim_effective: initial_host_memory_reclaim_effective(
             config.host_memory_reclaim,
@@ -269,7 +278,6 @@ pub(crate) async fn serve(
     };
 
     let mut consecutive_failures = 0_u8;
-    let mut reclaimer = IdleReclaimer::new(&config);
     let mut ticks = 0_u64;
     loop {
         tokio::select! {
@@ -277,17 +285,26 @@ pub(crate) async fn serve(
                 signal?;
                 break;
             }
-            () = tokio::time::sleep(RECLAIM_INTERVAL) => {
+            () = tokio::time::sleep(TICK_INTERVAL) => {
                 ticks += 1;
-                let metrics = machine.metrics().await.ok();
-                if let Some(metrics) = metrics.as_ref() {
-                    if apply_host_memory_reclaim(&mut status, metrics.host_memory_reclaim.as_ref()) {
+                if let Ok(metrics) = machine.metrics().await {
+                    let mut changed =
+                        apply_host_memory_reclaim(&mut status, metrics.host_memory_reclaim.as_ref());
+                    let guest_reclaim = metrics
+                        .metrics
+                        .as_ref()
+                        .and_then(|observation| observation.report.snapshot.memory_reclaim.as_ref());
+                    if let Some(report) = guest_reclaim {
+                        if apply_guest_memory_reclaim(&mut status, report) {
+                            changed = true;
+                            append_log(&paths, &describe_guest_memory_reclaim(report))?;
+                        }
+                    }
+                    if changed {
                         publish(&paths, &mut status)?;
                     }
                 }
-                let snapshot = metrics.and_then(snapshot_of);
-                reclaimer.tick(&machine, &paths, &mut status, snapshot.as_ref()).await?;
-                if !ticks.is_multiple_of(HEALTH_INTERVAL.as_secs() / RECLAIM_INTERVAL.as_secs()) {
+                if !ticks.is_multiple_of(HEALTH_INTERVAL.as_secs() / TICK_INTERVAL.as_secs()) {
                     continue;
                 }
                 match probe_docker_socket(&config.docker_socket) {
@@ -387,413 +404,41 @@ async fn reconcile_ready(
 /// Engine health probe cadence.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 /// Idle-detector cadence; the guest agent reports metrics every 5 seconds.
-const RECLAIM_INTERVAL: Duration = Duration::from_secs(5);
-const MIB: u64 = 1024 * 1024;
-/// Guest CPU busy fraction (of all vCPUs) at or below which the guest counts as idle.
-const IDLE_CPU_FRACTION: f64 = 0.05;
-/// Guest block I/O rate at or below which the guest counts as idle.
-const IDLE_IO_BYTES_PER_SEC: u64 = MIB;
-/// Page cache worth an idle reclaim attempt.
-const RECLAIM_MIN_CACHE: u64 = 512 * MIB;
-/// Page cache worth a reclaim attempt while the host is under memory pressure.
-const PRESSURE_RECLAIM_MIN_CACHE: u64 = 128 * MIB;
-/// Minimum spacing between pressure-triggered reclaim attempts.
-const PRESSURE_RECLAIM_COOLDOWN: Duration = Duration::from_secs(30);
-/// Guest-side reclaim, run as root inside the guest.
-///
-/// The target is computed in the guest from `/proc/meminfo`: page cache minus
-/// shmem (tmpfs and shared memory cannot be dropped) plus reclaimable slab.
-/// cgroup v2 root `memory.reclaim` refuses a request it cannot fully satisfy,
-/// so the target is requested in chunks and a partial result is kept. The
-/// global cache drop is only a fallback for kernels without `memory.reclaim`.
-/// The last stdout line reports `<kind> before=<Cached> after=<Cached> ...`.
-const GUEST_RECLAIM_SCRIPT: &str = r#"meminfo() { while read -r key value _; do if [ "$key" = "$1" ]; then echo $((value * 1024)); return 0; fi; done < %MEMINFO%; echo 0; }
-before=$(meminfo Cached:)
-shmem=$(meminfo Shmem:)
-slab=$(meminfo SReclaimable:)
-target=$((before - shmem + slab))
-if [ "$target" -le 0 ]; then
-  printf 'nothing before=%s after=%s target=%s
-' "$before" "$before" "$target"
-  exit 0
-fi
-if [ -f %CGROUP_RECLAIM% ] && [ -w %CGROUP_RECLAIM% ]; then
-  chunk=$((target / 8))
-  min=$((32 * 1024 * 1024))
-  [ "$chunk" -lt "$min" ] && chunk=$min
-  remaining=$target
-  chunks=0
-  status=0
-  while [ "$remaining" -gt 0 ]; do
-    step=$chunk
-    [ "$step" -gt "$remaining" ] && step=$remaining
-    if echo "$step" > %CGROUP_RECLAIM% 2>/dev/null; then
-      chunks=$((chunks + 1))
-      remaining=$((remaining - step))
-    else
-      status=$?
-      break
-    fi
-  done
-  after=$(meminfo Cached:)
-  printf 'bounded before=%s after=%s target=%s chunks=%s status=%s
-' "$before" "$after" "$target" "$chunks" "$status"
-  exit 0
-fi
-sync
-echo 1 > %DROP_CACHES% || exit $?
-after=$(meminfo Cached:)
-printf 'fallback before=%s after=%s target=%s
-' "$before" "$after" "$target"
-"#;
-const CGROUP_RECLAIM_PATH: &str = "/sys/fs/cgroup/memory.reclaim";
-const DROP_CACHES_PATH: &str = "/proc/sys/vm/drop_caches";
-const MEMINFO_PATH: &str = "/proc/meminfo";
+/// Supervisor tick: refreshes status from vmmon metrics and, every `HEALTH_INTERVAL`,
+/// probes the Docker socket.
+const TICK_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Reclaims guest page cache, the way WSL2's `autoMemoryReclaim` does.
-///
-/// Every tick reads the guest's metrics. Once CPU and block I/O have stayed idle for
-/// the configured window and the guest holds enough page cache, the controller asks
-/// the guest kernel to reclaim that cache. When the host itself reports memory
-/// pressure the wait is skipped and reclaim runs at once, rate-limited by a
-/// cooldown. Freed guest pages reach the host through the balloon's free-page
-/// reporting; this controller does not claim that the host released the same
-/// number of bytes.
-pub(crate) struct IdleReclaimer {
-    enabled: bool,
-    idle_after: Duration,
-    last_sample: Option<ActivitySample>,
-    idle_since: Option<tokio::time::Instant>,
-    last_pressure_reclaim: Option<tokio::time::Instant>,
-}
-
-/// Cumulative guest activity counters at one instant.
-#[derive(Debug, Clone, Copy)]
-struct ActivitySample {
-    at: tokio::time::Instant,
-    busy_seconds: f64,
-    io_bytes: u64,
-}
-
-impl ActivitySample {
-    fn from_snapshot(at: tokio::time::Instant, snapshot: &libvm::MachineMetricSnapshot) -> Self {
-        let busy_seconds = snapshot
-            .cpu
-            .as_ref()
-            .map(|cpu| {
-                cpu.user_seconds
-                    + cpu.nice_seconds
-                    + cpu.system_seconds
-                    + cpu.irq_seconds
-                    + cpu.softirq_seconds
-                    + cpu.steal_seconds
-            })
-            .unwrap_or_default();
-        let io_bytes = snapshot
-            .block_devices
-            .iter()
-            .map(|device| device.read_bytes.saturating_add(device.write_bytes))
-            .fold(0_u64, u64::saturating_add);
-        Self {
-            at,
-            busy_seconds,
-            io_bytes,
-        }
-    }
-}
-
-impl IdleReclaimer {
-    pub(crate) fn new(config: &ResolvedSystemConfig) -> Self {
-        Self {
-            enabled: config.memory_reclaim,
-            idle_after: Duration::from_secs(config.memory_reclaim_after_secs),
-            last_sample: None,
-            idle_since: None,
-            last_pressure_reclaim: None,
-        }
-    }
-
-    /// Records one metrics sample and returns how long the guest has been idle, if
-    /// it is idle now. Activity between two samples is judged against the CPU and
-    /// I/O thresholds; any busy interval resets the idle clock.
-    fn observe(&mut self, sample: ActivitySample, cpus: u32) -> Option<Duration> {
-        let previous = self.last_sample.replace(sample)?;
-        let elapsed = sample
-            .at
-            .saturating_duration_since(previous.at)
-            .as_secs_f64();
-        if elapsed <= 0.0 {
-            return self
-                .idle_since
-                .map(|since| sample.at.saturating_duration_since(since));
-        }
-        let busy = (sample.busy_seconds - previous.busy_seconds).max(0.0)
-            / (elapsed * f64::from(cpus.max(1)));
-        let io_rate = sample.io_bytes.saturating_sub(previous.io_bytes) as f64 / elapsed;
-        if busy <= IDLE_CPU_FRACTION && io_rate <= IDLE_IO_BYTES_PER_SEC as f64 {
-            let since = *self.idle_since.get_or_insert(previous.at);
-            Some(sample.at.saturating_duration_since(since))
-        } else {
-            self.idle_since = None;
-            None
-        }
-    }
-
-    async fn tick(
-        &mut self,
-        machine: &crate::api::machine::AppMachine,
-        paths: &SystemPaths,
-        status: &mut DaemonStatus,
-        snapshot: Option<&libvm::MachineMetricSnapshot>,
-    ) -> eyre::Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-        let Some(snapshot) = snapshot else {
-            return Ok(());
-        };
-        let now = tokio::time::Instant::now();
-        let cpus = snapshot
-            .cpu
-            .as_ref()
-            .map(|cpu| cpu.logical_cpu_count)
-            .unwrap_or(1);
-        let idle_for = self.observe(ActivitySample::from_snapshot(now, snapshot), cpus);
-        let Some(memory) = snapshot.memory.as_ref() else {
-            return Ok(());
-        };
-        let cached = cached_bytes(memory);
-        let Some(trigger) = self.decide(now, idle_for, cached, host_pressure::current()) else {
-            return Ok(());
-        };
-        self.reclaim(machine, paths, status, trigger).await
-    }
-
-    /// Picks the reclaim trigger for this tick, if any, and arms the matching
-    /// cooldown. Host pressure wins over the idle window because it means the
-    /// memory is needed now.
-    fn decide(
-        &mut self,
-        now: tokio::time::Instant,
-        idle_for: Option<Duration>,
-        cached: u64,
-        pressure: Option<HostMemoryPressure>,
-    ) -> Option<MemoryReclaimTrigger> {
-        let pressured = pressure.is_some_and(|level| level >= HostMemoryPressure::Warning);
-        let cooled_down = self
-            .last_pressure_reclaim
-            .is_none_or(|last| now.saturating_duration_since(last) >= PRESSURE_RECLAIM_COOLDOWN);
-        if pressured && cooled_down && cached >= PRESSURE_RECLAIM_MIN_CACHE {
-            self.last_pressure_reclaim = Some(now);
-            // The guest is about to change; judge idleness afresh afterwards.
-            self.idle_since = None;
-            return Some(MemoryReclaimTrigger::HostPressure);
-        }
-        if idle_for.is_some_and(|idle_for| idle_for >= self.idle_after)
-            && cached >= RECLAIM_MIN_CACHE
-        {
-            // Require a fresh idle window before the next attempt whatever happens now.
-            self.idle_since = None;
-            return Some(MemoryReclaimTrigger::Idle);
-        }
-        None
-    }
-
-    async fn reclaim(
-        &mut self,
-        machine: &crate::api::machine::AppMachine,
-        paths: &SystemPaths,
-        status: &mut DaemonStatus,
-        trigger: MemoryReclaimTrigger,
-    ) -> eyre::Result<()> {
-        let trigger_text = match trigger {
-            MemoryReclaimTrigger::Idle => "idle",
-            MemoryReclaimTrigger::HostPressure => "host memory pressure",
-        };
-        let script = guest_reclaim_script(CGROUP_RECLAIM_PATH, DROP_CACHES_PATH, MEMINFO_PATH);
-        let output = match machine
-            .exec_with_input(
-                "/bin/sh",
-                &["-c", &script],
-                "root",
-                Vec::new(),
-                Duration::from_secs(60),
-            )
-            .await
-        {
-            Ok(output) => output,
-            Err(error) => {
-                record_reclaim(status, trigger, MemoryReclaimOutcome::Failed, None, None);
-                publish(paths, status)?;
-                append_log(
-                    paths,
-                    &format!("memory reclaim ({trigger_text}): guest execution failed: {error}"),
-                )?;
-                return Ok(());
-            }
-        };
-        if !matches!(output.result(), ExecutionResult::Exited { code: Some(0) }) {
-            record_reclaim(status, trigger, MemoryReclaimOutcome::Failed, None, None);
-            publish(paths, status)?;
-            append_log(
-                paths,
-                &format!(
-                    "memory reclaim ({trigger_text}): guest cache reclaim failed ({:?}): {}",
-                    output.result(),
-                    String::from_utf8_lossy(output.stderr_bytes()).trim()
-                ),
-            )?;
-            return Ok(());
-        }
-        let Some(result) = parse_reclaim_result(output.stdout_bytes()) else {
-            record_reclaim(status, trigger, MemoryReclaimOutcome::Failed, None, None);
-            publish(paths, status)?;
-            append_log(
-                paths,
-                &format!("memory reclaim ({trigger_text}): guest returned an invalid result"),
-            )?;
-            return Ok(());
-        };
-        let reclaimed = result.reclaimed();
-        let (outcome, bounded_exit_code, description) = match result.branch {
-            ReclaimBranch::Bounded { chunks, status: 0 } => (
-                MemoryReclaimOutcome::Bounded,
-                None,
-                format!(
-                    "bounded guest cgroup reclaim completed in {chunks} chunk(s) for a {} MiB target",
-                    result.target / MIB
-                ),
-            ),
-            ReclaimBranch::Bounded { chunks, status } => (
-                MemoryReclaimOutcome::Bounded,
-                Some(status),
-                format!(
-                    "bounded guest cgroup reclaim stopped after {chunks} chunk(s) with exit {status} for a {} MiB target",
-                    result.target / MIB
-                ),
-            ),
-            ReclaimBranch::Fallback => (
-                MemoryReclaimOutcome::Fallback,
-                None,
-                format!(
-                    "memory.reclaim is unavailable in the guest; global cache-drop fallback completed for a {} MiB target",
-                    result.target / MIB
-                ),
-            ),
-            ReclaimBranch::Nothing => (
-                MemoryReclaimOutcome::Nothing,
-                None,
-                "guest has no reclaimable page cache".to_string(),
-            ),
-        };
-        record_reclaim(status, trigger, outcome, bounded_exit_code, Some(reclaimed));
-        publish(paths, status)?;
-        append_log(
-            paths,
-            &format!(
-                "memory reclaim ({trigger_text}): {description}; guest cached memory fell by {} MiB",
-                reclaimed / MIB
-            ),
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReclaimBranch {
-    /// cgroup v2 `memory.reclaim` ran; `status` is the exit of the first refused
-    /// chunk, or 0 when the whole target was accepted.
-    Bounded { chunks: u32, status: u32 },
-    /// `memory.reclaim` is missing; the global cache drop ran instead.
-    Fallback,
-    /// The guest computed no reclaimable cache.
-    Nothing,
-}
-
-/// What the guest reported after one reclaim attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GuestReclaimResult {
-    branch: ReclaimBranch,
-    /// `Cached` from `/proc/meminfo` before and after, in bytes.
-    before: u64,
-    after: u64,
-    /// Reclaimable estimate the guest targeted, in bytes.
-    target: u64,
-}
-
-impl GuestReclaimResult {
-    fn reclaimed(&self) -> u64 {
-        self.before.saturating_sub(self.after)
-    }
-}
-
-fn guest_reclaim_script(cgroup_reclaim: &str, drop_caches: &str, meminfo: &str) -> String {
-    GUEST_RECLAIM_SCRIPT
-        .replace("%CGROUP_RECLAIM%", cgroup_reclaim)
-        .replace("%DROP_CACHES%", drop_caches)
-        .replace("%MEMINFO%", meminfo)
-}
-
-fn parse_reclaim_result(stdout: &[u8]) -> Option<GuestReclaimResult> {
-    let text = std::str::from_utf8(stdout).ok()?;
-    let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
-    let mut fields = line.split_whitespace();
-    let kind = fields.next()?;
-    let (mut before, mut after, mut target, mut chunks, mut status) =
-        (None, None, None, None, None);
-    for field in fields {
-        let (key, value) = field.split_once('=')?;
-        match key {
-            "before" => before = value.parse::<u64>().ok(),
-            "after" => after = value.parse::<u64>().ok(),
-            "target" => target = value.parse::<i64>().ok().map(|bytes| bytes.max(0) as u64),
-            "chunks" => chunks = value.parse::<u32>().ok(),
-            "status" => status = value.parse::<u32>().ok(),
-            _ => {}
-        }
-    }
-    let branch = match kind {
-        "bounded" => ReclaimBranch::Bounded {
-            chunks: chunks?,
-            status: status?,
-        },
-        "fallback" => ReclaimBranch::Fallback,
-        "nothing" => ReclaimBranch::Nothing,
-        _ => return None,
-    };
-    Some(GuestReclaimResult {
-        branch,
-        before: before?,
-        after: after?,
-        target: target?,
-    })
-}
-
-fn cached_bytes(memory: &libvm::MachineMemoryMetrics) -> u64 {
-    memory.cached_bytes.unwrap_or_else(|| {
-        memory
-            .available_bytes
-            .saturating_sub(memory.free_bytes.unwrap_or(memory.available_bytes))
-    })
-}
-
-fn record_reclaim(
+/// Copies the agent's latest guest memory reclaim report into the status. Returns
+/// whether it describes a run the status did not have yet. Guest memory reclaim
+/// itself runs inside the guest agent; the daemon only observes it.
+fn apply_guest_memory_reclaim(
     status: &mut DaemonStatus,
-    trigger: MemoryReclaimTrigger,
-    outcome: MemoryReclaimOutcome,
-    bounded_exit_code: Option<u32>,
-    observed_delta: Option<u64>,
-) {
-    status.memory_reclaim_trigger = Some(trigger);
-    status.memory_reclaim_outcome = Some(outcome);
-    status.memory_reclaim_bounded_exit_code = bounded_exit_code;
-    status.memory_reclaim_observed_cache_delta_bytes = observed_delta;
-    status.memory_reclaim_at = Some(now());
+    report: &MachineMemoryReclaimReport,
+) -> bool {
+    let finished_at = chrono::DateTime::<chrono::Utc>::from(report.finished_at).to_rfc3339();
+    if status.memory_reclaim_runs == Some(report.runs)
+        && status.memory_reclaim_at.as_deref() == Some(finished_at.as_str())
+    {
+        return false;
+    }
+    status.memory_reclaim_outcome = MemoryReclaimOutcome::parse(&report.outcome);
+    status.memory_reclaim_mode = Some(report.mode.clone());
+    status.memory_reclaim_observed_cache_delta_bytes = Some(report.cached_delta_bytes());
+    status.memory_reclaim_at = Some(finished_at);
+    status.memory_reclaim_runs = Some(report.runs);
+    true
 }
 
-fn snapshot_of(metrics: libvm::MachineMetrics) -> Option<libvm::MachineMetricSnapshot> {
-    metrics
-        .metrics
-        .map(|observation| observation.report.snapshot)
+fn describe_guest_memory_reclaim(report: &MachineMemoryReclaimReport) -> String {
+    format!(
+        "guest memory reclaim run {}: mode {} outcome {} requested {} MiB, guest cached memory fell by {} MiB{}",
+        report.runs,
+        report.mode,
+        report.outcome,
+        report.requested_bytes / (1024 * 1024),
+        report.cached_delta_bytes() / (1024 * 1024),
+        if report.compacted { ", compacted" } else { "" }
+    )
 }
 
 /// Copies the backend's host memory reclaim report into the status. Returns
@@ -1112,17 +757,13 @@ pub(crate) fn status_owner_is_live(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::process::Command;
     use std::time::Duration;
 
     use crate::system::config::{ResolvedShare, SystemConfig};
-    use crate::system::host_pressure::HostMemoryPressure;
     use crate::system::supervisor::{
-        activation_request, error_causes, error_summary, guest_reclaim_script,
-        initial_host_memory_reclaim_effective, parse_reclaim_result, startup_retry_delay,
-        ActivitySample, GuestReclaimResult, IdleReclaimer, LifetimeLock, MemoryReclaimTrigger,
-        ReclaimBranch, MIB,
+        activation_request, apply_guest_memory_reclaim, describe_guest_memory_reclaim,
+        error_causes, error_summary, initial_host_memory_reclaim_effective, startup_retry_delay,
+        LifetimeLock, MemoryReclaimOutcome,
     };
     use vm_spec::Mount;
 
@@ -1284,234 +925,60 @@ mod tests {
     }
 
     #[test]
-    fn idle_reclaimer_tracks_idle_windows() {
-        let mut reclaimer = IdleReclaimer {
-            enabled: true,
-            idle_after: Duration::from_secs(120),
-            last_sample: None,
-            idle_since: None,
-            last_pressure_reclaim: None,
+    fn guest_reclaim_report_is_applied_once_per_run() {
+        let mut status: crate::system::supervisor::DaemonStatus =
+            serde_json::from_value(serde_json::json!({
+                "schema": 1,
+                "generation": "12345678-1234-1234-1234-123456789abc",
+                "pid": 42,
+                "phase": "ready",
+                "machine_id": null,
+                "run_id": null,
+                "image_digest": null,
+                "docker_socket": "/tmp/silo.sock",
+                "updated_at": "2026-09-14T00:00:00Z",
+                "last_error": null,
+                "restart_count": 0
+            }))
+            .expect("status");
+        let report = libvm::MachineMemoryReclaimReport {
+            finished_at: std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+            mode: "gradual".to_string(),
+            outcome: "partial".to_string(),
+            requested_bytes: 256 * 1024 * 1024,
+            cached_before_bytes: 1024 * 1024 * 1024,
+            cached_after_bytes: 960 * 1024 * 1024,
+            compacted: true,
+            runs: 4,
         };
-        let start = tokio::time::Instant::now();
-        let sample = |offset: u64, busy: f64, io: u64| ActivitySample {
-            at: start + Duration::from_secs(offset),
-            busy_seconds: busy,
-            io_bytes: io,
+        assert!(apply_guest_memory_reclaim(&mut status, &report));
+        assert_eq!(
+            status.memory_reclaim_outcome,
+            Some(MemoryReclaimOutcome::Partial)
+        );
+        assert_eq!(status.memory_reclaim_mode.as_deref(), Some("gradual"));
+        assert_eq!(
+            status.memory_reclaim_observed_cache_delta_bytes,
+            Some(64 * 1024 * 1024)
+        );
+        assert_eq!(status.memory_reclaim_runs, Some(4));
+        assert_eq!(
+            status.memory_reclaim_at.as_deref(),
+            Some("2027-01-15T08:00:00+00:00")
+        );
+        // The same run seen again is not a change.
+        assert!(!apply_guest_memory_reclaim(&mut status, &report));
+        assert_eq!(
+            describe_guest_memory_reclaim(&report),
+            "guest memory reclaim run 4: mode gradual outcome partial requested 256 MiB, guest cached memory fell by 64 MiB, compacted"
+        );
+        let unknown = libvm::MachineMemoryReclaimReport {
+            outcome: "surprising".to_string(),
+            runs: 5,
+            ..report
         };
-        // The first sample only establishes a baseline.
-        assert_eq!(reclaimer.observe(sample(0, 100.0, 0), 4), None);
-        // 4 vCPUs, 5 seconds: 0.5 busy seconds is 2.5%, idle.
-        assert_eq!(
-            reclaimer.observe(sample(5, 100.5, 100 * 1024), 4),
-            Some(Duration::from_secs(5))
-        );
-        assert_eq!(
-            reclaimer.observe(sample(10, 101.0, 200 * 1024), 4),
-            Some(Duration::from_secs(10))
-        );
-        // A busy interval (3 of 20 CPU-seconds) resets the idle clock.
-        assert_eq!(reclaimer.observe(sample(15, 104.0, 200 * 1024), 4), None);
-        // Heavy I/O alone also counts as activity.
-        assert_eq!(reclaimer.observe(sample(20, 104.1, 200 * MIB), 4), None);
-        assert_eq!(
-            reclaimer.observe(sample(25, 104.2, 200 * MIB), 4),
-            Some(Duration::from_secs(5))
-        );
-    }
-
-    /// `/proc/meminfo` shape with 1 GiB cached, 256 MiB of it shmem, and 64 MiB
-    /// reclaimable slab: the guest should target 832 MiB.
-    const MEMINFO_FIXTURE: &str = "MemTotal:        8388608 kB\nMemFree:         1048576 kB\nCached:          1048576 kB\nShmem:            262144 kB\nSReclaimable:      65536 kB\n";
-
-    fn run_reclaim_script(temp: &std::path::Path) -> std::process::Output {
-        let script = guest_reclaim_script("memory.reclaim", "drop_caches", "meminfo");
-        Command::new("/bin/sh")
-            .args(["-c", &script])
-            .current_dir(temp)
-            .output()
-            .expect("run shell")
-    }
-
-    #[test]
-    fn guest_reclaim_requests_the_reclaimable_target_in_chunks() {
-        let temp = tempfile::tempdir().expect("temp");
-        fs::write(temp.path().join("meminfo"), MEMINFO_FIXTURE).expect("meminfo fixture");
-        fs::write(temp.path().join("memory.reclaim"), "").expect("bounded fixture");
-        fs::write(temp.path().join("drop_caches"), "untouched").expect("global fixture");
-
-        let output = run_reclaim_script(temp.path());
-
-        assert!(output.status.success(), "stderr: {:?}", output.stderr);
-        let result = parse_reclaim_result(&output.stdout).expect("parsed result");
-        assert_eq!(
-            result,
-            GuestReclaimResult {
-                branch: ReclaimBranch::Bounded {
-                    chunks: 8,
-                    status: 0
-                },
-                before: 1024 * MIB,
-                after: 1024 * MIB,
-                target: 832 * MIB,
-            }
-        );
-        assert_eq!(result.reclaimed(), 0);
-        // The last chunk is the remainder of an 8-way split of the target.
-        assert_eq!(
-            fs::read_to_string(temp.path().join("memory.reclaim")).expect("bounded result"),
-            format!("{}\n", 832 * MIB - 7 * (832 * MIB / 8))
-        );
-        assert_eq!(
-            fs::read_to_string(temp.path().join("drop_caches")).expect("global result"),
-            "untouched"
-        );
-    }
-
-    #[test]
-    fn guest_reclaim_keeps_partial_progress_when_a_chunk_is_refused() {
-        let temp = tempfile::tempdir().expect("temp");
-        fs::write(temp.path().join("meminfo"), MEMINFO_FIXTURE).expect("meminfo fixture");
-        // Writable but every write fails: a directory named like the control file.
-        fs::create_dir(temp.path().join("memory.reclaim")).expect("bounded fixture");
-        fs::write(temp.path().join("drop_caches"), "untouched").expect("global fixture");
-
-        // Not a regular file, so the script must treat memory.reclaim as absent.
-        let output = run_reclaim_script(temp.path());
-        assert!(output.status.success(), "stderr: {:?}", output.stderr);
-        assert_eq!(
-            parse_reclaim_result(&output.stdout).map(|result| result.branch),
-            Some(ReclaimBranch::Fallback)
-        );
-        assert_eq!(
-            fs::read_to_string(temp.path().join("drop_caches")).expect("global result"),
-            "1\n"
-        );
-    }
-
-    #[test]
-    fn guest_reclaim_reports_nothing_when_cache_is_all_shmem() {
-        let temp = tempfile::tempdir().expect("temp");
-        fs::write(
-            temp.path().join("meminfo"),
-            "Cached:           262144 kB\nShmem:            262144 kB\n",
-        )
-        .expect("meminfo fixture");
-        fs::write(temp.path().join("memory.reclaim"), "").expect("bounded fixture");
-        fs::write(temp.path().join("drop_caches"), "untouched").expect("global fixture");
-
-        let output = run_reclaim_script(temp.path());
-        assert!(output.status.success(), "stderr: {:?}", output.stderr);
-        let result = parse_reclaim_result(&output.stdout).expect("parsed result");
-        assert_eq!(result.branch, ReclaimBranch::Nothing);
-        assert_eq!(result.target, 0);
-        assert_eq!(
-            fs::read_to_string(temp.path().join("memory.reclaim")).expect("bounded result"),
-            ""
-        );
-    }
-
-    #[test]
-    fn reclaim_result_parser_reads_the_last_line_and_partial_status() {
-        let result = parse_reclaim_result(
-            b"noise\nbounded before=1073741824 after=536870912 target=800000000 chunks=3 status=1\n",
-        )
-        .expect("parsed");
-        assert_eq!(
-            result.branch,
-            ReclaimBranch::Bounded {
-                chunks: 3,
-                status: 1
-            }
-        );
-        assert_eq!(result.reclaimed(), 512 * MIB);
-        assert_eq!(
-            parse_reclaim_result(b"nothing before=1 after=1 target=-5\n").map(|r| r.target),
-            Some(0)
-        );
-        assert_eq!(
-            parse_reclaim_result(b"bounded before=1 after=1 target=1\n"),
-            None
-        );
-        assert_eq!(
-            parse_reclaim_result(b"unknown before=1 after=1 target=1\n"),
-            None
-        );
-    }
-
-    #[test]
-    fn host_pressure_triggers_reclaim_before_the_idle_window_with_a_cooldown() {
-        let mut reclaimer = IdleReclaimer {
-            enabled: true,
-            idle_after: Duration::from_secs(120),
-            last_sample: None,
-            idle_since: None,
-            last_pressure_reclaim: None,
-        };
-        let start = tokio::time::Instant::now();
-        // Not idle long enough, no pressure: nothing happens.
-        assert_eq!(
-            reclaimer.decide(start, Some(Duration::from_secs(10)), 600 * MIB, None),
-            None
-        );
-        // Warning-level pressure fires at once, even with less cache than idle needs.
-        assert_eq!(
-            reclaimer.decide(
-                start,
-                Some(Duration::from_secs(10)),
-                200 * MIB,
-                Some(HostMemoryPressure::Warning)
-            ),
-            Some(MemoryReclaimTrigger::HostPressure)
-        );
-        // Inside the cooldown the same pressure is ignored.
-        assert_eq!(
-            reclaimer.decide(
-                start + Duration::from_secs(10),
-                Some(Duration::from_secs(20)),
-                600 * MIB,
-                Some(HostMemoryPressure::Critical)
-            ),
-            None
-        );
-        // Too little cache is never worth a pressure run.
-        assert_eq!(
-            reclaimer.decide(
-                start + Duration::from_secs(40),
-                None,
-                64 * MIB,
-                Some(HostMemoryPressure::Critical)
-            ),
-            None
-        );
-        // After the cooldown pressure fires again.
-        assert_eq!(
-            reclaimer.decide(
-                start + Duration::from_secs(40),
-                None,
-                600 * MIB,
-                Some(HostMemoryPressure::Critical)
-            ),
-            Some(MemoryReclaimTrigger::HostPressure)
-        );
-        // The idle path still needs the full window and the larger cache floor.
-        assert_eq!(
-            reclaimer.decide(
-                start + Duration::from_secs(50),
-                Some(Duration::from_secs(120)),
-                200 * MIB,
-                Some(HostMemoryPressure::Normal)
-            ),
-            None
-        );
-        assert_eq!(
-            reclaimer.decide(
-                start + Duration::from_secs(50),
-                Some(Duration::from_secs(120)),
-                600 * MIB,
-                Some(HostMemoryPressure::Normal)
-            ),
-            Some(MemoryReclaimTrigger::Idle)
-        );
+        assert!(apply_guest_memory_reclaim(&mut status, &unknown));
+        assert_eq!(status.memory_reclaim_outcome, None);
     }
 
     #[test]
@@ -1533,10 +1000,10 @@ mod tests {
             .expect("status");
 
         assert_eq!(status.memory_reclaim_outcome, None);
-        assert_eq!(status.memory_reclaim_bounded_exit_code, None);
+        assert_eq!(status.memory_reclaim_mode, None);
         assert_eq!(status.memory_reclaim_observed_cache_delta_bytes, None);
         assert_eq!(status.memory_reclaim_at, None);
-        assert_eq!(status.memory_reclaim_trigger, None);
+        assert_eq!(status.memory_reclaim_runs, None);
         assert!(!status.host_memory_reclaim_requested);
         assert_eq!(status.host_memory_reclaim_effective, None);
         assert_eq!(status.host_memory_reclaim_qualification, None);
