@@ -71,6 +71,9 @@ memory fell. It is off by default. This setting controls guest cache cleanup
 only; freed guest pages reach the host through the balloon's free-page
 reporting when `host-memory-reclaim` is effective.
 
+See [Memory Reclaim](architecture/memory-reclaim.md) for how the two
+memory settings relate.
+
 `host-memory-reclaim: auto` separately asks the krun helper to attach a balloon
 and run its per-VM host-reclaim qualification probe. A passing probe enables
 host reclaim for that VM; failed or inconclusive probes leave ordinary guest

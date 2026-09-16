@@ -305,6 +305,37 @@ Examples:
 
 The guest is the operating system running inside the VM.
 
+## Memory Reclaim
+
+Two mechanisms return guest memory to the host. They run in different places
+and use different vocabularies; [Memory Reclaim](architecture/memory-reclaim.md)
+covers both in depth.
+
+### Host Memory Reclaim
+
+Setting: `host-memory-reclaim`. The guest kernel's **free page reporting**
+(virtio-balloon `VIRTIO_BALLOON_F_REPORTING`) tells the VMM which 2 MiB blocks
+are free, and libkrun **releases** them to the host: `madvise(MADV_DONTNEED)`
+on Linux, an unmap, `MADV_FREE_REUSABLE`, remap cycle on macOS. A startup
+**qualification probe** checks that the release really lowers the host's
+accounting before the policy becomes **effective**. This is the only step
+that lowers the host footprint.
+
+### Guest Memory Reclaim
+
+Setting: `memory-reclaim`. A host-side policy that asks the guest kernel to
+give up page cache early through cgroup v2 **proactive reclaim**
+(`memory.reclaim`), triggered when the guest is idle or when macOS reports
+memory pressure. WSL2 calls the same idea `autoMemoryReclaim`. It frees
+memory inside the guest; free page reporting then carries it to the host.
+
+### Not Ballooning
+
+Silo attaches a virtio-balloon device only for its reporting queue. The
+classic **balloon inflate and deflate**, where the host demands pages and the
+guest pins them, is not used. **Free page hinting** and **virtio-mem** are
+different features again and are not used either.
+
 ## Most Important Distinction
 
 The most common conceptual mistake is collapsing KVM, VMM, and VM into one thing.
