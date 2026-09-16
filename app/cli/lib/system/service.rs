@@ -460,9 +460,10 @@ fn render_native(registration: &Registration, marker: &str) -> eyre::Result<Vec<
     let config = plist_path(&registration.config_root.join("daemon/registration.json"))?;
     let native_log = plist_path(&registration.state_root.join("logs/daemon/native.log"))?;
     // Mirrors the systemd unit: restart only on failure, allow 90s for a graceful VM
-    // shutdown before SIGKILL, run as a background process type, and keep created
-    // files private. Process output goes to a file so panics and pre-status failures
-    // are diagnosable; launchd has no journal for user agents.
+    // shutdown before SIGKILL, and keep created files private. Standard scheduling
+    // avoids imposing background CPU/I/O restrictions on the VM's inherited policy.
+    // Process output goes to a file so panics and pre-status failures are diagnosable;
+    // launchd has no journal for user agents.
     Ok(format!(
         concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
@@ -482,7 +483,7 @@ fn render_native(registration: &Registration, marker: &str) -> eyre::Result<Vec<
             "\t<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t</dict>\n",
             "\t<key>ThrottleInterval</key>\n\t<integer>5</integer>\n",
             "\t<key>ExitTimeOut</key>\n\t<integer>90</integer>\n",
-            "\t<key>ProcessType</key>\n\t<string>Background</string>\n",
+            "\t<key>ProcessType</key>\n\t<string>Standard</string>\n",
             "\t<key>Umask</key>\n\t<integer>63</integer>\n",
             "\t<key>StandardOutPath</key>\n\t<string>{native_log}</string>\n",
             "\t<key>StandardErrorPath</key>\n\t<string>{native_log}</string>\n",
@@ -868,7 +869,7 @@ mod tests {
         ));
         assert!(plist.contains("<key>ExitTimeOut</key>\n\t<integer>90</integer>"));
         assert!(plist.contains("<key>StandardErrorPath</key>\n\t<string>/Users/me/.local/state/silo/logs/daemon/native.log</string>"));
-        assert!(plist.contains("<key>ProcessType</key>\n\t<string>Background</string>"));
+        assert!(plist.contains("<key>ProcessType</key>\n\t<string>Standard</string>"));
         assert!(plist.contains("<key>Umask</key>\n\t<integer>63</integer>"));
         assert!(plist.contains("<!-- Silo-Installation-ID: test -->"));
     }

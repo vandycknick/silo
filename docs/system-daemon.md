@@ -235,10 +235,21 @@ panics and failures that happen before the supervisor publishes a status record
 appear; on Linux use `journalctl --user -u silo-system.service`.
 
 The launchd agent restarts only after an unsuccessful exit, waits 90 seconds for
-a graceful VM shutdown before SIGKILL, and runs with the `Background` process
-type. macOS lists it under System Settings > General > Login Items & Extensions
+a graceful VM shutdown before SIGKILL, and runs with the `Standard` process
+type. The VM inherits this scheduling policy: `Background` throttles its CPU and
+I/O work even when a user is actively building or running containers. Standard
+uses normal service scheduling, without requesting the `Interactive` class or
+pinning host cores. See [build performance](architecture/build-performance.md)
+for the controlled comparison.
+
+This scheduling class is separate from permission to run without an open app.
+macOS still lists Silo under System Settings > General > Login Items & Extensions
 as an item allowed to run in the background; a debug build shows the bare
 executable name because it is not signed with a Developer ID.
+
+After upgrading an existing installation, stop and start the daemon to regenerate
+and reload its launchd definition. Rebuilding the executable or editing the plist
+alone does not change the policy of an already-running VM.
 
 Common failures are actionable:
 
