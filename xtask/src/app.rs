@@ -696,17 +696,7 @@ fn validate_directory_entries<const N: usize>(
 
 fn validate_asset_entries(assets: &Path) -> Result<(), AppError> {
     if has_rprobe_assets(assets)? {
-        validate_directory_entries(
-            assets,
-            [
-                "agent",
-                "initramfs",
-                "kernel-default",
-                "rprobe-initramfs",
-                "rprobe-kernel",
-                "rprobe.json",
-            ],
-        )
+        validate_directory_entries(assets, ["agent", "initramfs", "kernel-default", "rprobe"])
     } else {
         validate_directory_entries(assets, ["agent", "initramfs", "kernel-default"])
     }

@@ -5,6 +5,10 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
+#[path = "../rosetta/mod.rs"]
+mod rosetta;
+
+#[cfg(target_os = "macos")]
 mod macos {
     use std::ffi::c_void;
     use std::fs;
@@ -54,8 +58,9 @@ mod macos {
     struct Args {
         #[arg(long, value_name = "PATH")]
         kernel: PathBuf,
+        /// External initramfs, omitted when the probe is embedded in the kernel.
         #[arg(long, value_name = "PATH")]
-        initramfs: PathBuf,
+        initramfs: Option<PathBuf>,
         #[arg(long)]
         cancel_while_starting: bool,
         #[arg(long)]
@@ -124,11 +129,21 @@ mod macos {
 
     pub fn main() -> Result<()> {
         let args = Args::parse();
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_writer(std::io::stderr)
+            .try_init()
+            .map_err(|error| eyre!("initialize harness tracing: {error}"))?;
         if !args.kernel.is_file() {
             return Err(eyre!("kernel is not a regular file"));
         }
-        if !args.initramfs.is_file() {
-            return Err(eyre!("initramfs is not a regular file"));
+        if let Some(initramfs) = &args.initramfs {
+            if !initramfs.is_file() {
+                return Err(eyre!("initramfs is not a regular file"));
+            }
         }
         let helper = helper_inputs(&args)?;
         if args.cancel_while_starting && helper.is_some() {
@@ -180,6 +195,9 @@ mod macos {
     }
 
     async fn run(args: Args, helper: Option<HelperInputs>, memory: u64) -> Result<()> {
+        if args.initramfs.is_none() && !args.cancel_while_starting {
+            return run_embedded(args, helper).await;
+        }
         let started = Instant::now();
         let acquisition_deadline = started + ACQUISITION_TIMEOUT;
         let source = helper
@@ -207,7 +225,9 @@ mod macos {
             .wrap_err("close raw data input pipe")?;
 
         let mut boot_loader = LinuxBootLoader::new(args.kernel);
-        boot_loader.set_initial_ramdisk(args.initramfs);
+        if let Some(initramfs) = args.initramfs {
+            boot_loader.set_initial_ramdisk(initramfs);
+        }
         boot_loader.set_command_line("rdinit=/init console=hvc0 panic=0 loglevel=4");
 
         let platform = GenericPlatform::new();
@@ -361,6 +381,52 @@ mod macos {
             helper_qualification,
             workload,
         );
+        Ok(())
+    }
+
+    async fn run_embedded(args: Args, helper: Option<HelperInputs>) -> Result<()> {
+        let source = helper
+            .as_ref()
+            .map(|_| SourceSnapshot::capture(&args.host_root))
+            .transpose()?;
+        let prepared = crate::rosetta::acquire(
+            fs::canonicalize(&args.kernel)?,
+            Instant::now() + ACQUISITION_TIMEOUT,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+        let response = ProbeResponse {
+            ioctl_result: prepared.launch.ioctl_result(),
+            data: *prepared.launch.data().as_bytes(),
+        };
+        let mut qualification = "not-requested";
+        let mut translated = false;
+        if let (Some(helper), Some(source)) = (helper, source) {
+            source.verify_unchanged()?;
+            if &source.sha256 != prepared.launch.translator_sha256()
+                || source.root != prepared.launch.host_root()
+            {
+                return Err(eyre!("helper translator differs from captured translator"));
+            }
+            match qualify_helper(
+                helper,
+                &source,
+                response,
+                args.cancel_helper_after_spawn,
+                args.translated_workload,
+            )
+            .await?
+            {
+                HelperOutcome::Passed(outcome) => {
+                    qualification = "passed";
+                    translated = outcome.translated_workload;
+                }
+                HelperOutcome::Cancelled => qualification = "cancelled-reaped",
+            }
+        }
+        println!("runtime_acquisition=passed status={} payload_len={} cleanup=stopped-released helper_qualification={} translated_workload={}",
+            response.ioctl_result, response.data.len(), qualification,
+            if translated { "passed" } else { "not-completed" });
         Ok(())
     }
 
@@ -999,6 +1065,35 @@ mod macos {
 
     fn frame_error(error: FrameError) -> eyre::Report {
         eyre!("invalid probe frame: {error:?}")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::path::PathBuf;
+
+        use clap::Parser;
+
+        use crate::macos::Args;
+
+        #[test]
+        fn embedded_probe_needs_only_a_kernel() {
+            let args = Args::try_parse_from(["harness", "--kernel", "rprobe"]).unwrap();
+            assert_eq!(args.kernel, PathBuf::from("rprobe"));
+            assert!(args.initramfs.is_none());
+        }
+
+        #[test]
+        fn external_initramfs_remains_explicit() {
+            let args = Args::try_parse_from([
+                "harness",
+                "--kernel",
+                "Image",
+                "--initramfs",
+                "probe.cpio.gz",
+            ])
+            .unwrap();
+            assert_eq!(args.initramfs, Some(PathBuf::from("probe.cpio.gz")));
+        }
     }
 }
 

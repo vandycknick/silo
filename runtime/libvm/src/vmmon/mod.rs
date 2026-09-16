@@ -37,7 +37,7 @@ pub(crate) struct Vmmon {
 pub(crate) struct VmmonLaunchInputs {
     pub(crate) agent_enabled: bool,
     pub(crate) rosetta_intent: start_request::VmmonRosettaIntent,
-    pub(crate) rosetta_probe_assets: Option<start_request::VmmonRosettaProbeAssets>,
+    pub(crate) asset_directory: PathBuf,
 }
 
 impl Vmmon {
@@ -102,59 +102,41 @@ impl Vmmon {
             .and_then(|hardware| hardware.rosetta)
             .unwrap_or(false)
         {
-            return Ok(start_request::VmmonRosettaIntent::Disabled);
+            return Ok(start_request::VmmonRosettaIntent::Disabled {});
         }
 
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        return Err("Rosetta requires an Apple silicon macOS host".to_string());
-
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if config.guest.agent != crate::machine::MachineAgent::Default {
+            return Err("Rosetta requires the installed default guest agent".to_string());
+        }
+        if config
+            .spec
+            .boot
+            .as_ref()
+            .and_then(|boot| boot.kernel.as_ref())
+            .and_then(|kernel| kernel.path.as_ref())
+            .is_some()
         {
-            if config.guest.agent != crate::machine::MachineAgent::Default {
-                return Err("Rosetta requires the installed default guest agent".to_string());
-            }
-            if config
-                .spec
-                .boot
-                .as_ref()
-                .and_then(|boot| boot.kernel.as_ref())
-                .and_then(|kernel| kernel.path.as_ref())
-                .is_some()
-            {
-                return Err("Rosetta requires the runtime's default workload kernel".to_string());
-            }
-            if hardware
-                .and_then(|hardware| hardware.nested_virtualization)
-                .unwrap_or(false)
-            {
-                return Err("Rosetta does not support nested virtualization".to_string());
-            }
-            let mounts = vm_spec::project_mounts(&config.spec.mounts)
-                .map_err(|error| format!("validate Rosetta mount contract: {error}"))?;
-            if mounts
-                .iter()
-                .any(|mount| mount.backend_tag == agent_spec::ROSETTA_MOUNT_TAG)
-            {
-                return Err(format!(
-                    "mount tag {:?} is reserved for Rosetta",
-                    agent_spec::ROSETTA_MOUNT_TAG
-                ));
-            }
-
-            match self.virt_backend.as_ref() {
-                Some(crate::runtime::VirtBackendOverride::Krun) | None => {
-                    Ok(start_request::VmmonRosettaIntent::KrunCaptured {
-                        profile: start_request::VmmonRosettaProfile::CapturedCompatibilityV1,
-                    })
-                }
-                Some(crate::runtime::VirtBackendOverride::Vz) => {
-                    Ok(start_request::VmmonRosettaIntent::VzNative)
-                }
-                Some(crate::runtime::VirtBackendOverride::Mock { .. }) => {
-                    Err("Rosetta is not supported by the mock backend".to_string())
-                }
-            }
+            return Err("Rosetta requires the runtime's default workload kernel".to_string());
         }
+        if hardware
+            .and_then(|hardware| hardware.nested_virtualization)
+            .unwrap_or(false)
+        {
+            return Err("Rosetta does not support nested virtualization".to_string());
+        }
+        let mounts = vm_spec::project_mounts(&config.spec.mounts)
+            .map_err(|error| format!("validate Rosetta mount contract: {error}"))?;
+        if mounts
+            .iter()
+            .any(|mount| mount.backend_tag == agent_spec::ROSETTA_MOUNT_TAG)
+        {
+            return Err(format!(
+                "mount tag {:?} is reserved for Rosetta",
+                agent_spec::ROSETTA_MOUNT_TAG
+            ));
+        }
+
+        Ok(start_request::VmmonRosettaIntent::Enabled {})
     }
 
     pub(crate) fn client(&self, machine_id: MachineId) -> VmmonClient {
@@ -230,7 +212,7 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn durable_rosetta_eligibility_uses_guest_contract_not_completed_assets_or_legacy_label() {
-        use crate::vmmon::start_request::{VmmonRosettaIntent, VmmonRosettaProfile};
+        use crate::vmmon::start_request::VmmonRosettaIntent;
 
         let vmmon = Vmmon::new(
             crate::paths::LocalPaths::new("/tmp/silo-test"),
@@ -244,33 +226,34 @@ mod tests {
             vmmon
                 .rosetta_intent_request(&config)
                 .expect("default durable contract"),
-            VmmonRosettaIntent::KrunCaptured {
-                profile: VmmonRosettaProfile::CapturedCompatibilityV1
-            }
+            VmmonRosettaIntent::Enabled {}
         );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn default_backend_uses_krun_rosetta_intent() {
-        use crate::vmmon::start_request::{VmmonRosettaIntent, VmmonRosettaProfile};
+    fn rosetta_intent_is_backend_independent() {
+        use crate::vmmon::start_request::VmmonRosettaIntent;
 
-        let vmmon = Vmmon::new(
-            crate::paths::LocalPaths::new("/tmp/silo-test"),
-            "/operator/vmmon".into(),
-            "/operator/krun".into(),
+        for backend in [
             None,
-            crate::runtime::HostMemoryReclaim::Off,
-        );
-
-        assert_eq!(
-            vmmon
-                .rosetta_intent_request(&rosetta_machine_config())
-                .expect("default krun Rosetta intent"),
-            VmmonRosettaIntent::KrunCaptured {
-                profile: VmmonRosettaProfile::CapturedCompatibilityV1
-            }
-        );
+            Some(VirtBackendOverride::Krun),
+            Some(VirtBackendOverride::Vz),
+        ] {
+            let vmmon = Vmmon::new(
+                crate::paths::LocalPaths::new("/tmp/silo-test"),
+                "/operator/vmmon".into(),
+                "/operator/krun".into(),
+                backend,
+                crate::runtime::HostMemoryReclaim::Off,
+            );
+            assert_eq!(
+                vmmon
+                    .rosetta_intent_request(&rosetta_machine_config())
+                    .expect("generic Rosetta intent"),
+                VmmonRosettaIntent::Enabled {}
+            );
+        }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

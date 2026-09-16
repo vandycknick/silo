@@ -1,5 +1,4 @@
 use std::io;
-use std::path::PathBuf;
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -24,7 +23,7 @@ pub(crate) struct VmmonStartRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     rosetta_intent: Option<VmmonRosettaIntent>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    rosetta_probe_assets: Option<VmmonRosettaProbeAssets>,
+    asset_directory: Option<std::path::PathBuf>,
     startup_budget_ms: u64,
 }
 
@@ -54,23 +53,8 @@ pub(crate) struct VmmonVirtBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "mode", rename_all = "camelCase")]
 pub(crate) enum VmmonRosettaIntent {
-    Disabled,
-    VzNative,
-    KrunCaptured { profile: VmmonRosettaProfile },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum VmmonRosettaProfile {
-    CapturedCompatibilityV1,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct VmmonRosettaProbeAssets {
-    pub(crate) kernel: PathBuf,
-    pub(crate) initramfs: PathBuf,
-    pub(crate) manifest: PathBuf,
+    Disabled {},
+    Enabled {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -116,7 +100,7 @@ impl VmmonStartRequest {
             virt_backend: None,
             host_memory_reclaim: VmmonHostMemoryReclaim::Off,
             rosetta_intent: None,
-            rosetta_probe_assets: None,
+            asset_directory: None,
             startup_budget_ms,
         }
     }
@@ -133,17 +117,14 @@ impl VmmonStartRequest {
 
     pub(crate) fn with_rosetta_intent(mut self, intent: VmmonRosettaIntent) -> Self {
         self.rosetta_intent = match intent {
-            VmmonRosettaIntent::Disabled => None,
+            VmmonRosettaIntent::Disabled {} => None,
             intent => Some(intent),
         };
         self
     }
 
-    pub(crate) fn with_rosetta_probe_assets(
-        mut self,
-        assets: Option<VmmonRosettaProbeAssets>,
-    ) -> Self {
-        self.rosetta_probe_assets = assets;
+    pub(crate) fn with_asset_directory(mut self, directory: std::path::PathBuf) -> Self {
+        self.asset_directory = Some(directory);
         self
     }
 
@@ -176,8 +157,7 @@ mod tests {
 
     use crate::vmmon::start_request::{
         encode_start_request, VmmonEnvironmentVariable, VmmonHostMemoryReclaim, VmmonProcessSpec,
-        VmmonRosettaIntent, VmmonRosettaProfile, VmmonStartRequest, VmmonStartupCommand,
-        VMMON_START_REQUEST_MAX_BYTES,
+        VmmonRosettaIntent, VmmonStartRequest, VmmonStartupCommand, VMMON_START_REQUEST_MAX_BYTES,
     };
 
     #[test]
@@ -187,7 +167,7 @@ mod tests {
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
         )
-        .with_rosetta_intent(VmmonRosettaIntent::Disabled);
+        .with_rosetta_intent(VmmonRosettaIntent::Disabled {});
         assert_eq!(
             String::from_utf8(encode_start_request(&request).expect("encode request"))
                 .expect("UTF-8 request"),
@@ -243,43 +223,45 @@ mod tests {
     }
 
     #[test]
-    fn rosetta_intent_contains_only_mode_and_profile_metadata() {
+    fn rosetta_intent_contains_no_backend_implementation_details() {
         let request = VmmonStartRequest::new(
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
         )
-        .with_rosetta_intent(VmmonRosettaIntent::KrunCaptured {
-            profile: VmmonRosettaProfile::CapturedCompatibilityV1,
-        });
+        .with_rosetta_intent(VmmonRosettaIntent::Enabled {});
         let encoded = encode_start_request(&request).expect("encode request");
         let value: serde_json::Value =
             serde_json::from_slice(&encoded[..encoded.len() - 1]).expect("parse request");
 
-        assert_eq!(value["rosettaIntent"]["mode"], "krunCaptured");
-        assert_eq!(value["rosettaIntent"]["profile"], "capturedCompatibilityV1");
+        assert_eq!(value["rosettaIntent"]["mode"], "enabled");
+        assert!(value["rosettaIntent"].get("profile").is_none());
         assert_eq!(
             value["rosettaIntent"].as_object().map(|value| value.len()),
-            Some(2)
+            Some(1)
         );
     }
 
     #[test]
-    fn vz_native_rosetta_intent_is_explicit_on_the_wire() {
+    fn runtime_asset_directory_is_generic_on_the_wire() {
         let request = VmmonStartRequest::new(
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
         )
-        .with_rosetta_intent(VmmonRosettaIntent::VzNative);
+        .with_rosetta_intent(VmmonRosettaIntent::Enabled {});
         let encoded = encode_start_request(&request).expect("encode request");
         let value: serde_json::Value =
             serde_json::from_slice(&encoded[..encoded.len() - 1]).expect("parse request");
 
         assert_eq!(
             value["rosettaIntent"],
-            serde_json::json!({"mode": "vzNative"})
+            serde_json::json!({"mode": "enabled"})
         );
+        let request = request.with_asset_directory(std::path::PathBuf::from("/runtime/assets"));
+        let value = serde_json::to_value(request).expect("serialize runtime directory");
+        assert_eq!(value["assetDirectory"], "/runtime/assets");
+        assert!(value.get("rosettaProbeAssets").is_none());
     }
 
     #[test]

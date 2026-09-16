@@ -40,7 +40,7 @@ pub(crate) struct VmmonLaunch<'a> {
     pub(crate) exit_command: Option<&'a HostCommand>,
     pub(crate) agent_enabled: bool,
     pub(crate) rosetta_intent: crate::vmmon::start_request::VmmonRosettaIntent,
-    pub(crate) rosetta_probe_assets: Option<crate::vmmon::start_request::VmmonRosettaProbeAssets>,
+    pub(crate) asset_directory: std::path::PathBuf,
     pub(crate) startup_command: Option<&'a VmmonStartupCommand>,
     pub(crate) machine_log_dir: &'a OwnedDirectory,
     pub(crate) machine_lock: &'a MachineLifetimeLock,
@@ -119,7 +119,7 @@ impl Vmmon {
         .with_virt_backend(self.virt_backend_request())
         .with_host_memory_reclaim(self.host_memory_reclaim_request())
         .with_rosetta_intent(launch.rosetta_intent)
-        .with_rosetta_probe_assets(launch.rosetta_probe_assets.clone())
+        .with_asset_directory(launch.asset_directory.clone())
         .with_startup_budget(startup_deadline.saturating_duration_since(Instant::now()));
         handoff_start_request(start_write, &start_request, VMMON_START_REQUEST_TIMEOUT).await?;
         wait_for_start(
@@ -134,7 +134,7 @@ impl Vmmon {
 fn startup_budget(launch: &VmmonLaunch<'_>) -> Duration {
     let translated = matches!(
         launch.rosetta_intent,
-        crate::vmmon::start_request::VmmonRosettaIntent::KrunCaptured { .. }
+        crate::vmmon::start_request::VmmonRosettaIntent::Enabled {}
     );
     match (translated, launch.startup_command.is_some()) {
         (true, true) => Duration::from_secs(420),

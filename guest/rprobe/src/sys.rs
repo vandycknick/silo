@@ -113,10 +113,12 @@ fn run() -> Result<Diagnostic, RuntimeError> {
         return Err(failure(Stage::DataPort, diagnostic));
     }
 
+    diagnostic_message(diagnostic_fd, b"rprobe: mounting Rosetta share\n");
     if let Err(error) = mount_rosetta(deadline) {
         let _ = write_failure(data.raw(), error, deadline);
         return Err(failure(Stage::RosettaMount, diagnostic));
     }
+    diagnostic_message(diagnostic_fd, b"rprobe: opening translator\n");
     let translator = match open_readonly(ROSETTA_FILE) {
         Ok(fd) => OwnedFd(fd),
         Err(error) => {
@@ -125,6 +127,7 @@ fn run() -> Result<Diagnostic, RuntimeError> {
         }
     };
 
+    diagnostic_message(diagnostic_fd, b"rprobe: issuing capture ioctl 0x80456122\n");
     let mut payload = [0xaa; PAYLOAD_LEN];
     // libc 0.2.189's musl binding uses Ioctl; the cast preserves the request's exact 32 bits.
     let result = unsafe {
@@ -148,6 +151,14 @@ fn run() -> Result<Diagnostic, RuntimeError> {
         Err(_) => return Err(failure(Stage::Capture, diagnostic)),
     };
 
+    diagnostic_message(
+        diagnostic_fd,
+        if result >= 0 {
+            b"rprobe: ioctl succeeded, transmitting capture\n"
+        } else {
+            b"rprobe: ioctl failed, transmitting errno\n"
+        },
+    );
     if write_all(data.raw(), &header, deadline).is_err() {
         return Err(failure(Stage::FrameWrite, diagnostic));
     }
@@ -155,6 +166,7 @@ fn run() -> Result<Diagnostic, RuntimeError> {
         return Err(failure(Stage::FrameWrite, diagnostic));
     }
     drop(data);
+    diagnostic_message(diagnostic_fd, b"rprobe: frame sent, powering off\n");
     Ok(diagnostic)
 }
 
@@ -375,6 +387,12 @@ fn report(fd: c_int, stage: Stage) {
         Stage::FrameWrite => b"rprobe: frame write failed\n",
         Stage::Poweroff => b"rprobe: panic or poweroff failed\n",
     };
+    diagnostic_message(fd, message);
+}
+
+fn diagnostic_message(fd: c_int, message: &[u8]) {
+    // This no_std PID1 uses libc directly; nix's std-based APIs are unavailable.
+    // Diagnostics are best-effort and nonblocking, never part of the data protocol.
     unsafe { libc::write(fd, message.as_ptr().cast::<c_void>(), message.len()) };
 }
 

@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand};
 use thiserror::Error;
 
 use crate::components::{
-    build_all, build_component, build_component_with_rprobe_binary, clippy, format,
-    test_integration, test_units, BuildContext, Component,
+    build_all, build_component, clippy, format, test_integration, test_units, BuildContext,
+    Component,
 };
 use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::kernel::KernelOptions;
@@ -51,12 +51,6 @@ enum Commands {
         component: Component,
         #[arg(long, value_enum, default_value_t = Profile::Debug)]
         profile: Profile,
-        #[arg(long, value_name = "PATH", requires = "component")]
-        rprobe_binary: Option<PathBuf>,
-        #[arg(long, value_name = "PATH", requires = "component")]
-        rprobe_kernel: Option<PathBuf>,
-        #[arg(long, value_name = "PATH", requires = "component")]
-        rprobe_kernel_provenance: Option<PathBuf>,
     },
     Kernel {
         #[command(flatten)]
@@ -153,8 +147,6 @@ enum Commands {
     RprobeHardwareTest {
         #[arg(long, value_name = "PATH")]
         kernel: PathBuf,
-        #[arg(long, value_name = "PATH")]
-        initramfs: PathBuf,
     },
 }
 
@@ -202,21 +194,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 None,
             )?;
         }
-        Commands::Component {
-            component,
-            profile,
-            rprobe_binary,
-            rprobe_kernel,
-            rprobe_kernel_provenance,
-        } => {
+        Commands::Component { component, profile } => {
             let context = build_context(&workspace_root, &target_dir, profile)?;
-            build_component_with_rprobe_binary(
-                component,
-                &context,
-                rprobe_binary.as_deref(),
-                rprobe_kernel.as_deref(),
-                rprobe_kernel_provenance.as_deref(),
-            )?;
+            build_component(component, &context)?;
         }
         Commands::Kernel { kernel } => {
             let context = build_context(&workspace_root, &target_dir, Profile::Debug)?;
@@ -393,9 +373,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 out,
             ))?;
         }
-        Commands::RprobeHardwareTest { kernel, initramfs } => {
+        Commands::RprobeHardwareTest { kernel } => {
             require_macos_arm64()?;
-            rprobe::run_hardware_test(&workspace_root, &target_dir, &kernel, &initramfs)?;
+            rprobe::run_hardware_test(&workspace_root, &target_dir, &kernel)?;
         }
     }
 

@@ -1,10 +1,8 @@
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -20,17 +18,10 @@ const ELF_PROGRAM_DYNAMIC: u32 = 2;
 const ELF_PROGRAM_INTERPRETER: u32 = 3;
 const ELF_PROGRAM_EXECUTABLE: u32 = 1;
 
-pub const ASSETS: [(&str, u32); 3] = [
-    ("rprobe-kernel", 0o644),
-    ("rprobe-initramfs", 0o644),
-    ("rprobe.json", 0o644),
-];
+pub const ASSETS: [(&str, u32); 1] = [("rprobe", 0o644)];
 
 pub fn installed_asset_set_present(assets: &Path) -> io::Result<bool> {
-    Ok(
-        entry_present(&assets.join("rprobe-kernel"))?
-            || entry_present(&assets.join("rprobe.json"))?,
-    )
+    entry_present(&assets.join("rprobe"))
 }
 
 fn entry_present(path: &Path) -> io::Result<bool> {
@@ -57,10 +48,6 @@ pub enum RprobeError {
     RemoveTemporary { path: PathBuf, source: io::Error },
     #[error("failed to publish rprobe artifact {path}")]
     Publish { path: PathBuf, source: io::Error },
-    #[error("invalid rprobe kernel provenance {path}: {reason}")]
-    InvalidProvenance { path: PathBuf, reason: String },
-    #[error("failed to serialize rprobe asset manifest")]
-    SerializeManifest(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, RprobeError>;
@@ -96,121 +83,32 @@ pub fn package(binary: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn package_assets(
-    binary: &Path,
-    kernel: &Path,
-    kernel_provenance: &Path,
-    assets: &Path,
-) -> Result<()> {
-    let binary_identity = validate_elf(binary)?;
-    let kernel_identity = file_identity(kernel)?;
-    let provenance = read_kernel_provenance(kernel_provenance, &kernel_identity)?;
-    fs::create_dir_all(assets).map_err(|source| RprobeError::Publish {
-        path: assets.to_path_buf(),
-        source,
-    })?;
-
-    let initramfs = assets.join("rprobe-initramfs");
-    package(binary, &initramfs)?;
-    let initramfs_identity = file_identity(&initramfs)?;
-    let installed_kernel = assets.join("rprobe-kernel");
-    fs::copy(kernel, &installed_kernel).map_err(|source| RprobeError::Publish {
-        path: installed_kernel.clone(),
-        source,
-    })?;
-    for path in [&installed_kernel, &initramfs] {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).map_err(|source| {
-            RprobeError::Publish {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
-    }
-
-    let manifest = json!({
-        "version": 1,
-        "purpose": "rosetta-acquisition-probe",
-        "profile": "rprobe",
-        "kernel": manifest_asset("rprobe-kernel", &kernel_identity),
-        "initramfs": manifest_asset("rprobe-initramfs", &initramfs_identity),
-        "capture": {
-            "profile": "capturedCompatibilityV1",
-            "request": 0x8045_6122_u32,
-            "payloadBytes": 1024,
-            "diagnosticPort": "hvc0",
-            "dataPort": "hvc1",
-            "cpus": 1,
-            "memoryMiB": 128
-        },
-        "provenance": {
-            "kernel": provenance,
-            "probe": {
-                "size": binary_identity.size,
-                "sha256": binary_identity.sha256
-            }
-        }
-    });
-    let manifest_path = assets.join("rprobe.json");
-    let mut bytes = serde_json::to_vec_pretty(&manifest)?;
-    bytes.push(b'\n');
-    fs::write(&manifest_path, bytes).map_err(|source| RprobeError::Publish {
-        path: manifest_path.clone(),
-        source,
-    })?;
-    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o644)).map_err(|source| {
-        RprobeError::Publish {
-            path: manifest_path,
+pub fn build_kernel(workspace: &Path, binary: &Path, build: &Path, assets: &Path) -> Result<()> {
+    for directory in [build, assets] {
+        fs::create_dir_all(directory).map_err(|source| RprobeError::Publish {
+            path: directory.to_path_buf(),
             source,
-        }
-    })?;
-    Ok(())
-}
-
-fn manifest_asset(name: &str, identity: &FileIdentity) -> Value {
-    json!({
-        "file": name,
-        "size": identity.size,
-        "sha256": identity.sha256,
-    })
-}
-
-fn read_kernel_provenance(path: &Path, identity: &FileIdentity) -> Result<Value> {
-    let bytes = fs::read(path).map_err(|source| RprobeError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let provenance: Value =
-        serde_json::from_slice(&bytes).map_err(|error| RprobeError::InvalidProvenance {
-            path: path.to_path_buf(),
-            reason: format!("parse JSON: {error}"),
         })?;
-    let expected_digest = format!("sha256:{}", identity.sha256);
-    let valid = provenance.get("schemaVersion").and_then(Value::as_u64) == Some(1)
-        && provenance.get("profile").and_then(Value::as_str) == Some("rprobe")
-        && provenance.get("purpose").and_then(Value::as_str) == Some("rosetta-acquisition-probe")
-        && provenance.pointer("/kernel/size").and_then(Value::as_u64) == Some(identity.size)
-        && provenance.pointer("/kernel/digest").and_then(Value::as_str)
-            == Some(expected_digest.as_str());
-    if !valid {
-        return Err(RprobeError::InvalidProvenance {
-            path: path.to_path_buf(),
-            reason: "profile, purpose, or kernel identity does not match the supplied Image"
-                .to_string(),
-        });
     }
-    Ok(provenance)
+    let archive = build.join("initramfs.cpio.gz");
+    package(binary, &archive)?;
+    let mut make = Command::new("make");
+    make.current_dir(workspace.join("resources/kernels"))
+        .args(["kernel-image", "KERNEL_PROFILE=rprobe"])
+        .arg(format!("KERNEL_INITRAMFS={}", archive.display()))
+        .arg(format!(
+            "KERNEL_IMAGE_OUTPUT={}",
+            assets.join("rprobe").display()
+        ));
+    command::run(make)?;
+    Ok(())
 }
 
 fn temporary_archive(output: &Path, label: &str) -> PathBuf {
     output.with_extension(format!("rprobe-{label}-{}", std::process::id()))
 }
 
-pub fn run_hardware_test(
-    workspace_root: &Path,
-    target_dir: &Path,
-    kernel: &Path,
-    initramfs: &Path,
-) -> Result<()> {
+pub fn run_hardware_test(workspace_root: &Path, target_dir: &Path, kernel: &Path) -> Result<()> {
     let mut cargo = Command::new("cargo");
     cargo
         .current_dir(workspace_root)
@@ -240,13 +138,11 @@ pub fn run_hardware_test(
 
     let mut run = Command::new(harness);
     run.args(["--kernel"]).arg(kernel);
-    run.args(["--initramfs"]).arg(initramfs);
     command::run(run)?;
 
     let harness = target_dir.join("debug/silo-rprobe-vz-harness");
     let mut cancel_starting = Command::new(harness);
     cancel_starting.args(["--kernel"]).arg(kernel);
-    cancel_starting.args(["--initramfs"]).arg(initramfs);
     cancel_starting.arg("--cancel-while-starting");
     command::run(cancel_starting)?;
     Ok(())
@@ -442,6 +338,23 @@ mod tests {
     use std::path::Path;
 
     use crate::rprobe::{read_u16, read_u32, read_u64, validate_elf_bytes};
+
+    #[test]
+    fn installed_probe_is_a_single_asset_without_a_sidecar() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("rprobe-assets-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        assert!(!crate::rprobe::installed_asset_set_present(&directory).unwrap());
+        std::fs::write(directory.join("rprobe"), b"kernel").unwrap();
+        assert!(crate::rprobe::installed_asset_set_present(&directory).unwrap());
+        assert_eq!(crate::rprobe::ASSETS, [("rprobe", 0o644)]);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn little_endian_elf_fields_are_read_without_native_layout() {

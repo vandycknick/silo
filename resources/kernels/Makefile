@@ -61,12 +61,25 @@ WORKLOAD_CONFIG_FRAGMENTS := \
 	$(RESOURCE_ROOT)/kernels/configs/$(KERNEL_ARCH).config \
 	$(wildcard $(RESOURCE_ROOT)/kernels/configs/compat/$(TRACK).config)
 RPROBE_CONFIG_FRAGMENTS := \
-	$(RESOURCE_ROOT)/kernels/configs/rprobe.common.config \
-	$(RESOURCE_ROOT)/kernels/configs/rprobe.arm64.config
+	$(REPO_ROOT)/guest/rprobe/kernel/common.config \
+	$(REPO_ROOT)/guest/rprobe/kernel/arm64.config
 WORKLOAD_PATCHES ?=
 RPROBE_PATCHES ?=
 CONFIG_FRAGMENTS := $($(shell printf '%s' "$(KERNEL_PROFILE)" | tr '[:lower:]' '[:upper:]')_CONFIG_FRAGMENTS)
 PATCHES := $($(shell printf '%s' "$(KERNEL_PROFILE)" | tr '[:lower:]' '[:upper:]')_PATCHES)
+# The embedded guest is part of the kernel identity, not just its pathname.
+KERNEL_INITRAMFS ?=
+ifneq ($(KERNEL_INITRAMFS),)
+ifneq ($(KERNEL_PROFILE),rprobe)
+$(error KERNEL_INITRAMFS is only supported by the rprobe profile)
+endif
+INITRAMFS_KEY := $(shell "$(INPUT_KEYER)" initramfs $(KERNEL_INITRAMFS))
+ifeq ($(INITRAMFS_KEY),)
+$(error invalid embedded initramfs)
+endif
+else
+INITRAMFS_KEY := none
+endif
 SOURCE_KEY := sha256-$(TRACK_SHA256)
 PATCH_KEY := $(shell "$(INPUT_KEYER)" patches $(PATCHES))
 CONFIG_KEY := $(shell "$(INPUT_KEYER)" config $(CONFIG_FRAGMENTS))
@@ -95,7 +108,7 @@ BUILD_INPUT_KEY := sha256-$(shell printf '%s\0' \
 TOOLCHAIN_KEY := sha256-$(shell { $(CC) --version 2>&1; $(LD) --version 2>&1; $(MAKE) --version 2>&1; printf '%s\n' "$(BUILD_INPUT_KEY)"; } | sha256sum | cut -d' ' -f1)
 TOOLCHAIN_COMPILER := $(shell $(CC) --version 2>&1 | sed -n '1p')
 TOOLCHAIN_LINKER := $(shell $(LD) --version 2>&1 | sed -n '1p')
-IDENTITY_DIGEST := $(shell printf '%s\n' "$(KERNEL_PROFILE)" "$(KERNEL_ARCH)" "$(TRACK)" "$(TRACK_VERSION)" "$(SOURCE_KEY)" "$(PATCH_KEY)" "$(CONFIG_KEY)" "$(TOOLCHAIN_KEY)" | sha256sum | cut -d' ' -f1)
+IDENTITY_DIGEST := $(shell printf '%s\n' "$(KERNEL_PROFILE)" "$(KERNEL_ARCH)" "$(TRACK)" "$(TRACK_VERSION)" "$(SOURCE_KEY)" "$(PATCH_KEY)" "$(CONFIG_KEY)" "$(TOOLCHAIN_KEY)" "$(INITRAMFS_KEY)" | sha256sum | cut -d' ' -f1)
 KERNEL_IDENTITY := $(KERNEL_PROFILE)-$(KERNEL_ARCH)-sha256-$(IDENTITY_DIGEST)
 PRISTINE_SOURCE_DIR ?= $(CACHE_ROOT)/pristine/$(SOURCE_KEY)/linux-$(TRACK_VERSION)
 PRISTINE_SOURCE_CHECKSUM := $(PRISTINE_SOURCE_DIR)/.silo-kernel-pristine
@@ -116,6 +129,9 @@ JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || ec
 
 .PHONY: kernel-config
 kernel-config:
+	@if [ "$(KERNEL_PROFILE)" = rprobe ] && [ -z "$(KERNEL_INITRAMFS)" ]; then \
+		printf 'rprobe requires KERNEL_INITRAMFS; use make rprobe from the repository root\n' >&2; exit 1; \
+	fi
 	@mkdir -p "$(dir $(KERNEL_TARBALL))" "$(dir $(PRISTINE_SOURCE_DIR))" "$(dir $(KERNEL_SOURCE_DIR))" "$(KERNEL_BUILD_DIR)"
 	@"$(SOURCE_FETCHER)" "$(KERNEL_SOURCE_URL)" "$(TRACK_SHA256)" "$(KERNEL_TARBALL)" "$(CACHE_ROOT)/downloads"
 	@"$(PRISTINE_PREPARER)" "$(KERNEL_TARBALL)" "$(TRACK_SHA256)" "$(PRISTINE_SOURCE_DIR)" "$(CACHE_ROOT)/pristine"
@@ -123,23 +139,39 @@ kernel-config:
 		"$(SOURCE_DERIVER)" "$(TRACK_SHA256)" "$(PRISTINE_SOURCE_DIR)" \
 			"$(KERNEL_SOURCE_DIR)" "$(CACHE_ROOT)/source" "$(KERNEL_IDENTITY)" $(PATCHES); \
 	fi
+	@set -eu; if [ -n "$(KERNEL_INITRAMFS)" ]; then \
+		cmp -s "$(KERNEL_INITRAMFS)" "$(KERNEL_BUILD_DIR)/initramfs.cpio.gz" || \
+			cp "$(KERNEL_INITRAMFS)" "$(KERNEL_BUILD_DIR)/initramfs.cpio.gz"; \
+		test "$$("$(INPUT_KEYER)" initramfs "$(KERNEL_BUILD_DIR)/initramfs.cpio.gz")" = "$(INITRAMFS_KEY)" || exit 1; \
+		printf 'CONFIG_INITRAMFS_SOURCE="%s/initramfs.cpio.gz"\n' "$(KERNEL_BUILD_DIR)" > "$(KERNEL_BUILD_DIR)/embedded.config"; \
+	fi
 	@KCONFIG_CONFIG="$(MINICONFIG)" "$(KERNEL_SOURCE_DIR)/scripts/kconfig/merge_config.sh" \
-		-m -s $(CONFIG_FRAGMENTS)
+		-m -s $(CONFIG_FRAGMENTS) $(if $(KERNEL_INITRAMFS),"$(KERNEL_BUILD_DIR)/embedded.config")
 	@if [ "$(KERNEL_PROFILE)" = rprobe ]; then KCONFIG_WERROR=1; export KCONFIG_WERROR; fi; \
 		KCONFIG_WARN_UNKNOWN_SYMBOLS=1 KCONFIG_WARN_CHANGED_INPUT=1 \
 		$(MAKE) -C "$(KERNEL_SOURCE_DIR)" O="$(KERNEL_BUILD_DIR)" \
 		ARCH="$(KERNEL_ARCH)" \
 		KCONFIG_ALLCONFIG="$(MINICONFIG)" alldefconfig
-	@if ! "$(CONFIG_VALIDATOR)" "$(KERNEL_BUILD_DIR)/.config" $(CONFIG_FRAGMENTS); then \
+	@if ! "$(CONFIG_VALIDATOR)" "$(KERNEL_BUILD_DIR)/.config" $(CONFIG_FRAGMENTS) $(if $(KERNEL_INITRAMFS),"$(KERNEL_BUILD_DIR)/embedded.config"); then \
 		if [ "$(TRACK)" = stable ] || [ "$(KERNEL_PROFILE)" = rprobe ]; then exit 1; fi; \
 		printf 'warning: %s/%s config differs from the stable miniconfig contract (best effort)\n' "$(TRACK)" "$(KERNEL_ARCH)" >&2; \
 	fi
 
-.PHONY: kernel
-kernel: kernel-config
+.PHONY: kernel-image
+kernel-image: kernel-config
 	@$(MAKE) -C "$(KERNEL_SOURCE_DIR)" O="$(KERNEL_BUILD_DIR)" \
 		ARCH="$(KERNEL_ARCH)" \
 		-j"$(JOBS)" "$(KERNEL_BUILD_TARGET)"
+	@set -eu; if [ -n "$(KERNEL_IMAGE_OUTPUT)" ]; then \
+		test "$(KERNEL_ARCH)" = arm64 || exit 1; \
+		temporary=$$(mktemp "$(KERNEL_IMAGE_OUTPUT).XXXXXX"); \
+		trap 'rm -f "$$temporary"' EXIT HUP INT TERM; \
+		install -m 644 "$(KERNEL_BUILD_DIR)/arch/arm64/boot/Image" "$$temporary"; \
+		mv "$$temporary" "$(KERNEL_IMAGE_OUTPUT)"; \
+	fi
+
+.PHONY: kernel
+kernel: kernel-image
 	@KERNEL_BUILD_DIR="$(KERNEL_BUILD_DIR)" \
 		KERNEL_ARCH="$(KERNEL_ARCH)" \
 		KERNEL_PROFILE="$(KERNEL_PROFILE)" \

@@ -13,8 +13,10 @@ temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' 0 HUP INT TERM
 
 identities() {
-    make -s -C "$kernel_root" HOST_ARCH=aarch64 KERNEL_PROFILE="$1" \
-        CACHE_ROOT="$temp_dir/cache" TARGET_ROOT="$temp_dir/target" kernel-identities
+    profile=$1
+    shift
+    make -s -C "$kernel_root" HOST_ARCH=aarch64 KERNEL_PROFILE="$profile" \
+        CACHE_ROOT="$temp_dir/cache" TARGET_ROOT="$temp_dir/target" "$@" kernel-identities
 }
 
 identities workload > "$temp_dir/workload-first"
@@ -77,7 +79,8 @@ if ! grep -q '^patches=sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4
 fi
 
 rprobe_fragments=$(sed -n 's/^fragments=//p' "$temp_dir/rprobe-first")
-expected_fragments="$kernel_root/configs/rprobe.common.config $kernel_root/configs/rprobe.arm64.config"
+repo_root=$(CDPATH= cd -- "$kernel_root/../.." && pwd)
+expected_fragments="$repo_root/guest/rprobe/kernel/common.config $repo_root/guest/rprobe/kernel/arm64.config"
 if [ "$rprobe_fragments" != "$expected_fragments" ]; then
     printf 'rprobe inherited unexpected config fragments: %s\n' "$rprobe_fragments" >&2
     exit 1
@@ -104,4 +107,23 @@ if "$kernel_root/scripts/kernel-input-key.sh" config "$temp_dir/path with whites
     exit 1
 fi
 
-printf 'profile isolation and order identity checks passed\n'
+printf 'first archive contents\n' > "$temp_dir/initramfs"
+identities rprobe KERNEL_INITRAMFS="$temp_dir/initramfs" > "$temp_dir/embedded-first"
+cp "$temp_dir/initramfs" "$temp_dir/relocated"
+identities rprobe KERNEL_INITRAMFS="$temp_dir/relocated" > "$temp_dir/embedded-relocated"
+cmp "$temp_dir/embedded-first" "$temp_dir/embedded-relocated"
+printf 'changed archive contents\n' > "$temp_dir/initramfs"
+identities rprobe KERNEL_INITRAMFS="$temp_dir/initramfs" > "$temp_dir/embedded-changed"
+if [ "$(sed -n 's/^identity=//p' "$temp_dir/embedded-first")" = "$(sed -n 's/^identity=//p' "$temp_dir/embedded-changed")" ]; then
+    printf 'embedded archive contents did not change kernel identity\n' >&2
+    exit 1
+fi
+if identities workload KERNEL_INITRAMFS="$temp_dir/initramfs" > /dev/null 2>&1; then
+    printf 'workload accepted a probe initramfs\n' >&2
+    exit 1
+fi
+if identities rprobe KERNEL_INITRAMFS="$temp_dir/missing" > /dev/null 2>&1; then
+    printf 'missing archive accepted\n' >&2
+    exit 1
+fi
+printf 'profile isolation, embedded archive and order identity checks passed\n'

@@ -25,7 +25,7 @@ pub(crate) struct VmmonStartRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rosetta_intent: Option<RosettaIntentRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) rosetta_probe_assets: Option<RosettaProbeAssetsRequest>,
+    pub(crate) asset_directory: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     startup_budget_ms: Option<u64>,
 }
@@ -52,23 +52,8 @@ pub(crate) struct VirtBackendRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) enum RosettaIntentRequest {
-    Disabled,
-    VzNative,
-    KrunCaptured { profile: RosettaProfileRequest },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum RosettaProfileRequest {
-    CapturedCompatibilityV1,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct RosettaProbeAssetsRequest {
-    pub(crate) kernel: std::path::PathBuf,
-    pub(crate) initramfs: std::path::PathBuf,
-    pub(crate) manifest: std::path::PathBuf,
+    Disabled {},
+    Enabled {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -129,7 +114,7 @@ impl StartRequestPipe {
                     virt_backend: None,
                     host_memory_reclaim: HostMemoryReclaimRequest::Off,
                     rosetta_intent: None,
-                    rosetta_probe_assets: None,
+                    asset_directory: None,
                     startup_budget_ms: None,
                 },
                 expected_machine_id,
@@ -241,25 +226,12 @@ fn validate_start_request(
     {
         return Err(invalid_data("startupBudgetMs must be in 1..=420000"));
     }
-    match (&request.rosetta_intent, &request.rosetta_probe_assets) {
-        (Some(RosettaIntentRequest::KrunCaptured { .. }), Some(assets)) => {
-            for (name, path) in [
-                ("kernel", &assets.kernel),
-                ("initramfs", &assets.initramfs),
-                ("manifest", &assets.manifest),
-            ] {
-                if !path.is_absolute() {
-                    return Err(invalid_data(format!(
-                        "Rosetta probe {name} path must be absolute"
-                    )));
-                }
-            }
-        }
-        (Some(RosettaIntentRequest::KrunCaptured { .. }), None) => {
-            return Err(invalid_data("KrunCaptured requires Rosetta probe assets"));
-        }
-        (_, Some(_)) => return Err(invalid_data("Rosetta probe assets require KrunCaptured")),
-        (_, None) => {}
+    if request
+        .asset_directory
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(invalid_data("assetDirectory must be an absolute path"));
     }
     Ok(request)
 }
@@ -351,9 +323,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::start_request::{
-        decode_start_request, HostMemoryReclaimRequest, RosettaIntentRequest,
-        RosettaProfileRequest, StartRequestPipe, VMMON_START_REQUEST_MAX_BYTES,
-        VMMON_START_REQUEST_VERSION,
+        decode_start_request, HostMemoryReclaimRequest, RosettaIntentRequest, StartRequestPipe,
+        VMMON_START_REQUEST_MAX_BYTES, VMMON_START_REQUEST_VERSION,
     };
 
     #[tokio::test]
@@ -480,31 +451,28 @@ mod tests {
             "version": VMMON_START_REQUEST_VERSION,
             "machineId": machine_id,
             "machineRunId": run_id,
-            "rosettaIntent": {
-                "mode": "krunCaptured",
-                "profile": "capturedCompatibilityV1"
-            },
-            "rosettaProbeAssets": {
-                "kernel": "/runtime/rprobe-kernel",
-                "initramfs": "/runtime/rprobe-initramfs",
-                "manifest": "/runtime/rprobe.json"
-            },
+            "rosettaIntent": { "mode": "enabled" },
+            "assetDirectory": "/runtime/assets",
             "startupBudgetMs": 120000
         }));
         let decoded =
             decode_start_request(&request, &machine_id, &run_id).expect("accept Rosetta contract");
         assert_eq!(
             decoded.rosetta_intent,
-            Some(RosettaIntentRequest::KrunCaptured {
-                profile: RosettaProfileRequest::CapturedCompatibilityV1
-            })
+            Some(RosettaIntentRequest::Enabled {})
         );
         assert_eq!(decoded.effective_startup_budget_ms(), 120_000);
-        assert!(decoded.rosetta_probe_assets.is_some());
+        assert_eq!(
+            decoded.asset_directory,
+            Some(std::path::PathBuf::from("/runtime/assets"))
+        );
 
         for (intent, expected) in [
-            (json!({"mode": "disabled"}), RosettaIntentRequest::Disabled),
-            (json!({"mode": "vzNative"}), RosettaIntentRequest::VzNative),
+            (
+                json!({"mode": "disabled"}),
+                RosettaIntentRequest::Disabled {},
+            ),
+            (json!({"mode": "enabled"}), RosettaIntentRequest::Enabled {}),
         ] {
             let encoded = encode(json!({
                 "version": VMMON_START_REQUEST_VERSION,
@@ -521,6 +489,8 @@ mod tests {
             json!({"mode": "krunCaptured", "profile": "future"}),
             json!({"mode": "krunCaptured", "profile": "capturedCompatibilityV1", "data": "00"}),
             json!({"mode": "future"}),
+            json!({"mode": "vzNative"}),
+            json!({"mode": "enabled", "profile": "capturedCompatibilityV1"}),
         ] {
             let invalid = encode(json!({
                 "version": VMMON_START_REQUEST_VERSION,
@@ -529,6 +499,27 @@ mod tests {
                 "rosettaIntent": intent
             }));
             assert!(decode_start_request(&invalid, &machine_id, &run_id).is_err());
+        }
+    }
+
+    #[test]
+    fn runtime_directory_must_be_absolute_and_probe_assets_are_not_a_launch_contract() {
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        for extra in [
+            json!({"assetDirectory": "relative/assets"}),
+            json!({"rosettaProbeAssets": {"kernel": "/rprobe"}}),
+        ] {
+            let mut request = json!({
+                "version": VMMON_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+            });
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(decode_start_request(&encode(request), &machine_id, &run_id).is_err());
         }
     }
 

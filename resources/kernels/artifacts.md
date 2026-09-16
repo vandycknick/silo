@@ -69,7 +69,10 @@ The local-only ARM64 `rprobe` profile is a separate contract:
 Its purpose is `rosetta-acquisition-probe`, and its canonical layout and
 reference include the complete build identity. It is never exported to the
 workload compatibility path or accepted by the workload publisher. Dedicated
-probe publication and installed assets remain Phase 7.4/12 work.
+probe OCI publication remains future work. Local probe builds install only
+`assets/rprobe`, an ARM64 Image with its Rust PID1 embedded through Linux's
+built-in initramfs support. No manifest or external initramfs is installed for
+the probe. The embedded archive's content participates in the build identity.
 
 The artifact config records source provenance and how a loader should interpret
 the kernel blob:

@@ -313,7 +313,7 @@ fn copy_optional_rprobe_assets(source: &Path, destination: &Path) -> Result<(), 
 fn copy_explicit_rprobe_assets(source: &Path, destination: &Path) -> Result<(), RuntimeError> {
     if !has_rprobe_assets(source)? {
         return Err(RuntimeError::Invalid(format!(
-            "explicit rprobe asset directory {} has no rprobe-kernel or rprobe.json",
+            "explicit rprobe asset directory {} has no self-contained rprobe kernel",
             source.display()
         )));
     }

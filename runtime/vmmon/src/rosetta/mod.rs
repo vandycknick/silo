@@ -6,8 +6,6 @@ use std::time::Duration;
 
 use eyre::{eyre, Context};
 use rprobe::frame::{Decoder, FrameError, SUCCESS_LEN};
-use serde::de::IgnoredAny;
-use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -20,27 +18,15 @@ use vz::{
     GenericPlatform, LinuxBootLoader, RosettaAvailability, VirtualMachine, VirtualMachineState,
 };
 
-use crate::start_request::{RosettaProbeAssetsRequest, RosettaProfileRequest};
-
 const ACQUISITION_TIMEOUT: Duration = Duration::from_secs(60);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUESTED_MEMORY: u64 = 128 * 1024 * 1024;
 const MAX_PROBE_MEMORY: u64 = 512 * 1024 * 1024;
 const MAX_TRANSLATOR_SIZE: usize = 128 * 1024 * 1024;
 const MAX_PROBE_KERNEL_SIZE: usize = 128 * 1024 * 1024;
-const MAX_PROBE_INITRAMFS_SIZE: usize = 128 * 1024 * 1024;
-const MAX_PROBE_MANIFEST_SIZE: usize = 1024 * 1024;
 const DIAGNOSTIC_LIMIT: usize = 64 * 1024;
 const ERROR_DIAGNOSTIC_LIMIT: usize = 4096;
 const HOST_ROOT: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux";
-
-// This is the observed unmodified-translator baseline. It is deliberately not
-// an accelerated/TSO qualification or a promise about later Apple releases.
-const EXPERIMENTAL_HOST_BUILD: &str = "25G83";
-const EXPERIMENTAL_TRANSLATOR_SHA256: [u8; 32] = [
-    0xda, 0x8c, 0x4a, 0xc7, 0x0a, 0x16, 0x8d, 0xd0, 0x58, 0x93, 0xd1, 0xd0, 0x06, 0xd2, 0x11, 0xcd,
-    0x73, 0x1a, 0x5e, 0x07, 0xc0, 0x17, 0x2d, 0x90, 0xf3, 0xe9, 0xd8, 0x86, 0x7f, 0x5c, 0x96, 0xd6,
-];
 
 pub(crate) struct PreparedRosetta {
     pub(crate) launch: krun::RosettaLaunchConfig,
@@ -59,12 +45,6 @@ struct FileSnapshot {
     identity: SourceIdentity,
 }
 
-struct ProbeAssetSnapshots {
-    kernel: FileSnapshot,
-    initramfs: FileSnapshot,
-    manifest: FileSnapshot,
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct SourceIdentity {
     device: u64,
@@ -79,46 +59,20 @@ struct DiagnosticStats {
     total: u64,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProbeManifest {
-    version: u32,
-    purpose: String,
-    profile: String,
-    kernel: ProbeManifestAsset,
-    initramfs: ProbeManifestAsset,
-    #[serde(rename = "capture")]
-    _capture: IgnoredAny,
-    #[serde(rename = "provenance")]
-    _provenance: IgnoredAny,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProbeManifestAsset {
-    file: String,
-    size: u64,
-    sha256: String,
-}
-
 pub(crate) async fn acquire(
-    profile: RosettaProfileRequest,
-    assets: RosettaProbeAssetsRequest,
+    kernel: PathBuf,
     outer_deadline: Instant,
     cancelled: CancellationToken,
 ) -> eyre::Result<PreparedRosetta> {
-    let acquisition_deadline = (Instant::now() + ACQUISITION_TIMEOUT).min(outer_deadline);
-    if profile != RosettaProfileRequest::CapturedCompatibilityV1 {
-        return Err(eyre!("unsupported Rosetta acquisition profile"));
-    }
+    let started = Instant::now();
+    let acquisition_deadline = (started + ACQUISITION_TIMEOUT).min(outer_deadline);
     let preflight = async {
-        let snapshots = validate_assets(&assets).await?;
+        let snapshot = FileSnapshot::capture(&kernel, MAX_PROBE_KERNEL_SIZE, false).await?;
         require_available()?;
-        require_supported_host_build()?;
         let source = SourceSnapshot::capture(Path::new(HOST_ROOT)).await?;
-        Ok::<_, eyre::Report>((snapshots, source))
+        Ok::<_, eyre::Report>((snapshot, source))
     };
-    let (asset_snapshots, source) = tokio::select! {
+    let (kernel_snapshot, source) = tokio::select! {
         biased;
         () = cancelled.cancelled() => Err(eyre!("Rosetta source and asset validation cancelled")),
         result = tokio::time::timeout_at(acquisition_deadline, preflight) => match result {
@@ -126,11 +80,13 @@ pub(crate) async fn acquire(
             Err(_) => Err(eyre!("Rosetta source and asset validation exceeded the acquisition deadline")),
         },
     }?;
-    if source.sha256 != EXPERIMENTAL_TRANSLATOR_SHA256 {
-        return Err(eyre!(
-            "unsupported Rosetta source for experimental CapturedCompatibilityV1 on host build {EXPERIMENTAL_HOST_BUILD}"
-        ));
-    }
+    tracing::debug!(
+        host_build = ?sysctl_string("kern.osversion").ok(),
+        translator_sha256 = %encode_hex(&source.sha256),
+        kernel_sha256 = %encode_hex(&sha256(&kernel_snapshot.bytes)?),
+        kernel = %kernel.display(),
+        "Rosetta acquisition inputs"
+    );
 
     let limits = vz::virtual_machine_limits();
     if limits.minimum_cpu_count > 1 || limits.maximum_cpu_count < 1 {
@@ -151,7 +107,7 @@ pub(crate) async fn acquire(
             return Err(eyre!("Rosetta pre-probe validation cancelled"));
         }
         result = tokio::time::timeout_at(acquisition_deadline, async {
-            asset_snapshots.verify_unchanged().await?;
+            kernel_snapshot.verify_unchanged().await?;
             source.verify_unchanged().await
         }) => match result {
             Ok(result) => result,
@@ -178,9 +134,12 @@ pub(crate) async fn acquire(
         .await
         .wrap_err("close Rosetta probe data input")?;
 
-    let mut boot_loader = LinuxBootLoader::new(assets.kernel);
-    boot_loader.set_initial_ramdisk(assets.initramfs);
-    boot_loader.set_command_line("rdinit=/init console=hvc0 panic=0 loglevel=4");
+    let mut boot_loader = LinuxBootLoader::new(kernel);
+    boot_loader.set_command_line(if tracing::enabled!(tracing::Level::DEBUG) {
+        "rdinit=/init console=hvc0 panic=0 loglevel=7"
+    } else {
+        "rdinit=/init console=hvc0 panic=0 loglevel=4"
+    });
     let platform = GenericPlatform::new();
     platform.set_nested_virtualization_enabled(false);
     let mut filesystem = VirtioFileSystemDeviceConfiguration::new(agent_spec::ROSETTA_MOUNT_TAG)
@@ -248,23 +207,25 @@ pub(crate) async fn acquire(
         }
     };
 
-    cleanup.wrap_err("Rosetta probe cleanup failed")?;
-    trailing.wrap_err("Rosetta probe trailing-data validation failed")?;
-    let diagnostics = diagnostics?;
+    let (decoder, diagnostics) = finish_acquisition(acquisition, cleanup, trailing, diagnostics)
+        .inspect_err(|error| tracing::error!(error = %error, "Rosetta acquisition failed"))?;
     tracing::info!(
         event = "rosetta_probe_released",
         "Rosetta acquisition probe resources released"
     );
-    let decoder = acquisition.map_err(|error| acquisition_error(error, &diagnostics))?;
     let frame = decoder
         .finish()
         .map_err(|error| eyre!("Rosetta probe frame failed final validation: {error:?}"))?;
+    tracing::debug!(header = ?frame.header, "Rosetta response decoded");
     if frame.header.result < 0 {
-        return Err(eyre!(
-            "Rosetta probe ioctl failed status={} errno={} payload_len={}",
-            frame.header.result,
-            frame.header.errno,
-            frame.payload.len()
+        return Err(acquisition_error(
+            eyre!(
+                "Rosetta probe ioctl failed status={} errno={} payload_len={}",
+                frame.header.result,
+                frame.header.errno,
+                frame.payload.len()
+            ),
+            &diagnostics,
         ));
     }
     let data: [u8; 1024] = frame
@@ -273,7 +234,7 @@ pub(crate) async fn acquire(
         .map_err(|_| eyre!("successful Rosetta probe frame has invalid payload length"))?;
     tokio::select! {
         result = tokio::time::timeout_at(acquisition_deadline, async {
-            asset_snapshots.verify_unchanged().await?;
+            kernel_snapshot.verify_unchanged().await?;
             source.verify_unchanged().await
         }) => match result {
             Ok(result) => result,
@@ -281,86 +242,44 @@ pub(crate) async fn acquire(
         },
         () = cancelled.cancelled() => Err(eyre!("Rosetta post-acquisition validation cancelled")),
     }?;
+    tracing::debug!(result = frame.header.result, payload_len = data.len(),
+        payload_sha256 = %encode_hex(&sha256(&data)?), "Rosetta capture validated");
     let launch =
         krun::RosettaLaunchConfig::new(source.root, source.sha256, frame.header.result, data)
             .wrap_err("construct captured Rosetta launch configuration")?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "Rosetta acquisition succeeded"
+    );
     Ok(PreparedRosetta { launch })
 }
 
-async fn validate_assets(assets: &RosettaProbeAssetsRequest) -> eyre::Result<ProbeAssetSnapshots> {
-    for (name, path) in [
-        ("kernel", &assets.kernel),
-        ("initramfs", &assets.initramfs),
-        ("manifest", &assets.manifest),
-    ] {
-        if !path.is_absolute() {
-            return Err(eyre!(
-                "Rosetta probe {name} is not an absolute regular file"
-            ));
+fn finish_acquisition(
+    acquisition: eyre::Result<Decoder>,
+    cleanup: eyre::Result<()>,
+    trailing: eyre::Result<()>,
+    diagnostics: eyre::Result<DiagnosticStats>,
+) -> eyre::Result<(Decoder, DiagnosticStats)> {
+    let mut errors = Vec::new();
+    if let Err(error) = &acquisition {
+        errors.push(format!("acquisition: {error:#}"));
+    }
+    for (stage, result) in [("cleanup", cleanup), ("trailing-data validation", trailing)] {
+        if let Err(error) = result {
+            errors.push(format!("{stage}: {error:#}"));
         }
     }
-    let directory = assets
-        .manifest
-        .parent()
-        .ok_or_else(|| eyre!("Rosetta probe manifest has no parent directory"))?;
-    if assets.kernel.parent() != Some(directory) || assets.initramfs.parent() != Some(directory) {
-        return Err(eyre!(
-            "Rosetta probe assets do not share one canonical directory"
-        ));
+    if let Err(error) = &diagnostics {
+        errors.push(format!("diagnostics: {error:#}"));
     }
-    let manifest_snapshot =
-        FileSnapshot::capture(&assets.manifest, MAX_PROBE_MANIFEST_SIZE, false).await?;
-    let manifest: ProbeManifest = serde_json::from_slice(&manifest_snapshot.bytes)
-        .map_err(|_| eyre!("Rosetta probe manifest has an invalid schema"))?;
-    if manifest.version != 1
-        || manifest.purpose != "rosetta-acquisition-probe"
-        || manifest.profile != "rprobe"
-    {
-        return Err(eyre!("Rosetta probe manifest has an unsupported contract"));
+    if !errors.is_empty() {
+        let error = eyre!("Rosetta probe failed: {}", errors.join("; "));
+        return Err(match &diagnostics {
+            Ok(stats) => acquisition_error(error, stats),
+            Err(_) => error,
+        });
     }
-    let kernel = validate_manifest_asset(
-        &assets.kernel,
-        "rprobe-kernel",
-        &manifest.kernel,
-        MAX_PROBE_KERNEL_SIZE,
-    )
-    .await?;
-    let initramfs = validate_manifest_asset(
-        &assets.initramfs,
-        "rprobe-initramfs",
-        &manifest.initramfs,
-        MAX_PROBE_INITRAMFS_SIZE,
-    )
-    .await?;
-    Ok(ProbeAssetSnapshots {
-        kernel,
-        initramfs,
-        manifest: manifest_snapshot,
-    })
-}
-
-async fn validate_manifest_asset(
-    path: &Path,
-    expected_name: &str,
-    asset: &ProbeManifestAsset,
-    maximum_size: usize,
-) -> eyre::Result<FileSnapshot> {
-    if asset.file != expected_name
-        || path.file_name().and_then(|name| name.to_str()) != Some(expected_name)
-    {
-        return Err(eyre!(
-            "Rosetta probe manifest asset name does not match its path"
-        ));
-    }
-    let snapshot = FileSnapshot::capture(path, maximum_size, false).await?;
-    if snapshot.bytes.len() as u64 != asset.size
-        || encode_hex(&sha256(&snapshot.bytes)?) != asset.sha256
-    {
-        return Err(eyre!(
-            "Rosetta probe {expected_name} does not match its manifest size and SHA-256"
-        ));
-    }
-    Ok(snapshot)
+    Ok((acquisition?, diagnostics?))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -382,17 +301,6 @@ fn require_available() -> eyre::Result<()> {
         RosettaAvailability::NotSupported => {
             Err(eyre!("Rosetta for Linux VMs is not supported on this host"))
         }
-    }
-}
-
-fn require_supported_host_build() -> eyre::Result<()> {
-    let build = sysctl_string("kern.osversion")?;
-    if build == EXPERIMENTAL_HOST_BUILD {
-        Ok(())
-    } else {
-        Err(eyre!(
-            "unsupported host build {build:?} for experimental CapturedCompatibilityV1"
-        ))
     }
 }
 
@@ -480,14 +388,6 @@ impl FileSnapshot {
     }
 }
 
-impl ProbeAssetSnapshots {
-    async fn verify_unchanged(&self) -> eyre::Result<()> {
-        self.kernel.verify_unchanged().await?;
-        self.initramfs.verify_unchanged().await?;
-        self.manifest.verify_unchanged().await
-    }
-}
-
 fn source_identity(metadata: &fs::Metadata) -> SourceIdentity {
     SourceIdentity {
         device: metadata.dev(),
@@ -516,6 +416,8 @@ async fn receive_frame(stream: &mut SerialPortStream) -> eyre::Result<Decoder> {
         if count == 0 {
             return Err(eyre!("Rosetta probe frame ended before completion"));
         }
+        tracing::trace!(target: "rosetta_wire", offset = decoder.received_len(), count,
+            bytes = %encode_hex(&buffer[..count]), "Rosetta frame received");
         decoder.push(&buffer[..count]).map_err(frame_error)?;
     }
     Ok(decoder)
@@ -601,6 +503,7 @@ async fn wait_for_state(
 ) -> eyre::Result<()> {
     loop {
         let state = vm.state();
+        tracing::debug!(?state, ?target, "Rosetta probe state");
         if state == target {
             return Ok(());
         }
@@ -625,6 +528,7 @@ async fn check_trailing_data(stream: &mut SerialPortStream, deadline: Instant) -
     if count == 0 {
         Ok(())
     } else {
+        tracing::trace!(target: "rosetta_wire", bytes = %encode_hex(&byte[..count]), "Rosetta unexpected trailing data");
         Err(eyre!("Rosetta probe raw serial contained trailing data"))
     }
 }
@@ -643,6 +547,17 @@ async fn drain_diagnostics(mut stream: SerialPortStream) -> eyre::Result<Diagnos
         }
         total = total.saturating_add(count as u64);
         let keep = (DIAGNOSTIC_LIMIT - retained.len()).min(count);
+        if keep > 0 {
+            tracing::debug!(offset = retained.len(),
+                diagnostic = %String::from_utf8_lossy(&buffer[..keep]).escape_debug(),
+                "Rosetta guest diagnostic");
+        }
+        if keep < count && retained.len() < DIAGNOSTIC_LIMIT {
+            tracing::debug!(
+                limit = DIAGNOSTIC_LIMIT,
+                "Rosetta diagnostic logging truncated; continuing to drain"
+            );
+        }
         retained.extend_from_slice(&buffer[..keep]);
     }
 }
@@ -727,20 +642,50 @@ mod tests {
 
     use tokio_util::sync::CancellationToken;
 
-    use crate::rosetta::acquire;
-    use crate::start_request::{RosettaProbeAssetsRequest, RosettaProfileRequest};
+    use crate::rosetta::{acquire, finish_acquisition, DiagnosticStats, FileSnapshot};
+
+    #[test]
+    fn acquisition_error_preserves_cleanup_failure_and_guest_diagnostics() {
+        let result = finish_acquisition(
+            Err(eyre::eyre!("bad frame")),
+            Err(eyre::eyre!("stop failed")),
+            Err(eyre::eyre!("trailing byte")),
+            Ok(DiagnosticStats {
+                retained: b"guest failed".to_vec(),
+                total: 12,
+            }),
+        );
+        let error = result.err().expect("must fail").to_string();
+        for context in ["bad frame", "stop failed", "trailing byte", "guest failed"] {
+            assert!(error.contains(context), "missing {context}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn single_kernel_snapshot_rejects_replacement_and_symlinks() {
+        let directory =
+            std::env::temp_dir().join(format!("rprobe-snapshot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let directory = std::fs::canonicalize(directory).unwrap();
+        let kernel = directory.join("rprobe");
+        std::fs::write(&kernel, b"kernel-one").unwrap();
+        let snapshot = FileSnapshot::capture(&kernel, 1024, false).await.unwrap();
+        snapshot.verify_unchanged().await.unwrap();
+        std::fs::write(&kernel, b"kernel-two").unwrap();
+        assert!(snapshot.verify_unchanged().await.is_err());
+        assert!(FileSnapshot::capture(&kernel, 2, false).await.is_err());
+        let link = directory.join("link");
+        std::os::unix::fs::symlink(&kernel, &link).unwrap();
+        assert!(FileSnapshot::capture(&link, 1024, false).await.is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[tokio::test]
     async fn cancellation_wins_before_probe_asset_validation_or_vm_creation() {
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         let result = acquire(
-            RosettaProfileRequest::CapturedCompatibilityV1,
-            RosettaProbeAssetsRequest {
-                kernel: PathBuf::from("invalid-kernel"),
-                initramfs: PathBuf::from("invalid-initramfs"),
-                manifest: PathBuf::from("invalid-manifest"),
-            },
+            PathBuf::from("invalid-kernel"),
             tokio::time::Instant::now() + Duration::from_secs(1),
             cancelled,
         )

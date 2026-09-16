@@ -266,7 +266,7 @@ pub async fn init(
     )?;
     let prepared_rosetta = prepare_rosetta(
         rosetta_intent,
-        start_request.rosetta_probe_assets.clone(),
+        start_request.asset_directory.as_deref(),
         startup_deadline,
         startup_cancel.clone(),
     )
@@ -425,28 +425,17 @@ async fn cleanup_primary_start_failure(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 async fn prepare_rosetta(
     intent: crate::virt::RosettaIntent,
-    assets: Option<crate::start_request::RosettaProbeAssetsRequest>,
+    asset_directory: Option<&Path>,
     deadline: tokio::time::Instant,
     cancelled: CancellationToken,
 ) -> eyre::Result<Option<krun::RosettaLaunchConfig>> {
     match intent {
-        crate::virt::RosettaIntent::Disabled | crate::virt::RosettaIntent::VzNative => {
-            if assets.is_some() {
-                return Err(eyre::eyre!(
-                    "Rosetta probe assets were supplied for a non-probe start"
-                ));
-            }
-            Ok(None)
-        }
-        crate::virt::RosettaIntent::KrunCaptured { profile } => {
-            let assets =
-                assets.ok_or_else(|| eyre::eyre!("KrunCaptured probe assets are missing"))?;
-            let profile = match profile {
-                crate::virt::RosettaProfile::CapturedCompatibilityV1 => {
-                    crate::start_request::RosettaProfileRequest::CapturedCompatibilityV1
-                }
-            };
-            crate::rosetta::acquire(profile, assets, deadline, cancelled)
+        crate::virt::RosettaIntent::Disabled | crate::virt::RosettaIntent::VzNative => Ok(None),
+        crate::virt::RosettaIntent::KrunCaptured { .. } => {
+            let directory = asset_directory.ok_or_else(|| {
+                eyre::eyre!("Rosetta acquisition requires the runtime asset directory")
+            })?;
+            crate::rosetta::acquire(directory.join("rprobe"), deadline, cancelled)
                 .await
                 .map(|prepared| Some(prepared.launch))
         }
@@ -456,14 +445,12 @@ async fn prepare_rosetta(
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 async fn prepare_rosetta(
     intent: crate::virt::RosettaIntent,
-    assets: Option<crate::start_request::RosettaProbeAssetsRequest>,
+    _asset_directory: Option<&Path>,
     _deadline: tokio::time::Instant,
     _cancelled: CancellationToken,
 ) -> eyre::Result<Option<krun::RosettaLaunchConfig>> {
-    if !matches!(intent, crate::virt::RosettaIntent::Disabled) || assets.is_some() {
-        return Err(eyre::eyre!(
-            "captured Rosetta requires an Apple silicon macOS host"
-        ));
+    if !matches!(intent, crate::virt::RosettaIntent::Disabled) {
+        return Err(eyre::eyre!("Rosetta requires an Apple silicon macOS host"));
     }
     Ok(None)
 }
@@ -516,13 +503,13 @@ fn resolve_rosetta_intent(
     agent_enabled: bool,
     request: Option<crate::start_request::RosettaIntentRequest>,
 ) -> eyre::Result<crate::virt::RosettaIntent> {
-    use crate::start_request::{RosettaIntentRequest, RosettaProfileRequest};
+    use crate::start_request::RosettaIntentRequest;
     use crate::virt::{BackendKind, RosettaIntent, RosettaProfile};
 
     let requested = spec.rosetta_or_default();
     if !requested {
         return match request {
-            None | Some(RosettaIntentRequest::Disabled) => Ok(RosettaIntent::Disabled),
+            None | Some(RosettaIntentRequest::Disabled {}) => Ok(RosettaIntent::Disabled),
             Some(_) => Err(eyre::eyre!(
                 "vmmon start request enables Rosetta but the durable VM spec disables it"
             )),
@@ -544,33 +531,18 @@ fn resolve_rosetta_intent(
         ));
     }
 
-    let expected = match backend {
-        BackendKind::Vz => RosettaIntentRequest::VzNative,
-        BackendKind::Krun => RosettaIntentRequest::KrunCaptured {
-            profile: RosettaProfileRequest::CapturedCompatibilityV1,
-        },
-        #[cfg(feature = "mock-backend")]
-        BackendKind::Mock => {
-            return Err(eyre::eyre!("Rosetta is not supported by the mock backend"))
-        }
-    };
-    if request != expected {
+    if request != (RosettaIntentRequest::Enabled {}) {
         return Err(eyre::eyre!(
-            "Rosetta start-request intent does not agree with backend {} and the durable VM spec",
-            backend.name()
+            "Rosetta was requested but the start request disables it"
         ));
     }
-
-    match request {
-        RosettaIntentRequest::Disabled => Err(eyre::eyre!(
-            "Rosetta was requested but the start request disables it"
-        )),
-        RosettaIntentRequest::VzNative => Ok(RosettaIntent::VzNative),
-        RosettaIntentRequest::KrunCaptured {
-            profile: RosettaProfileRequest::CapturedCompatibilityV1,
-        } => Ok(RosettaIntent::KrunCaptured {
+    match backend {
+        BackendKind::Vz => Ok(RosettaIntent::VzNative),
+        BackendKind::Krun => Ok(RosettaIntent::KrunCaptured {
             profile: RosettaProfile::CapturedCompatibilityV1,
         }),
+        #[cfg(feature = "mock-backend")]
+        BackendKind::Mock => Err(eyre::eyre!("Rosetta is not supported by the mock backend")),
     }
 }
 
@@ -748,7 +720,7 @@ mod tests {
 
     #[test]
     fn rosetta_intent_is_strictly_paired_with_spec_backend_and_agent() {
-        use crate::start_request::{RosettaIntentRequest, RosettaProfileRequest};
+        use crate::start_request::RosettaIntentRequest;
         use crate::virt::{BackendKind, RosettaIntent, RosettaProfile};
 
         let disabled = rosetta_spec(false);
@@ -761,7 +733,7 @@ mod tests {
             &disabled,
             BackendKind::Vz,
             true,
-            Some(RosettaIntentRequest::VzNative)
+            Some(RosettaIntentRequest::Enabled {})
         )
         .is_err());
 
@@ -777,7 +749,7 @@ mod tests {
                 &enabled,
                 BackendKind::Vz,
                 true,
-                Some(RosettaIntentRequest::VzNative),
+                Some(RosettaIntentRequest::Enabled {}),
             )
             .expect("paired VZ-native intent"),
             RosettaIntent::VzNative
@@ -787,9 +759,7 @@ mod tests {
                 &enabled,
                 BackendKind::Krun,
                 true,
-                Some(RosettaIntentRequest::KrunCaptured {
-                    profile: RosettaProfileRequest::CapturedCompatibilityV1,
-                })
+                Some(RosettaIntentRequest::Enabled {})
             )
             .expect("paired krun capture intent"),
             RosettaIntent::KrunCaptured {
@@ -800,14 +770,14 @@ mod tests {
             &enabled,
             BackendKind::Krun,
             true,
-            Some(RosettaIntentRequest::VzNative)
+            Some(RosettaIntentRequest::Disabled {})
         )
         .is_err());
         assert!(resolve_rosetta_intent(
             &enabled,
             BackendKind::Vz,
             false,
-            Some(RosettaIntentRequest::VzNative)
+            Some(RosettaIntentRequest::Enabled {})
         )
         .is_err());
     }
@@ -826,7 +796,7 @@ mod tests {
             &spec,
             BackendKind::Vz,
             true,
-            Some(RosettaIntentRequest::VzNative),
+            Some(RosettaIntentRequest::Enabled {}),
         )
         .expect_err("reject nested virtualization");
         assert!(error.to_string().contains("nested virtualization"));

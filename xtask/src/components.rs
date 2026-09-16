@@ -54,22 +54,6 @@ pub enum ComponentError {
     MissingKrunBinary { path: std::path::PathBuf },
     #[error("rprobe must be built natively on Linux ARM64")]
     UnsupportedRprobeHost,
-    #[error("macOS rprobe packaging requires --rprobe-binary with an owned AArch64 artifact")]
-    MissingRprobeBinary,
-    #[error("Linux ARM64 rprobe builds are native; --rprobe-binary is only supported on macOS")]
-    UnsupportedLinuxRprobeBinary,
-    #[error("--rprobe-binary is only valid for component rprobe")]
-    UnexpectedRprobeBinary,
-    #[error("--rprobe-kernel-provenance requires --rprobe-kernel")]
-    MissingRprobeKernel,
-    #[error("--rprobe-kernel requires --rprobe-kernel-provenance")]
-    MissingRprobeKernelProvenance,
-    #[error("failed to remove stale installed rprobe manifest {path}")]
-    RemoveRprobeManifest {
-        path: std::path::PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
 }
 
 pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
@@ -90,21 +74,6 @@ pub fn build_component(
     component: Component,
     context: &BuildContext<'_>,
 ) -> Result<(), ComponentError> {
-    build_component_with_rprobe_binary(component, context, None, None, None)
-}
-
-pub fn build_component_with_rprobe_binary(
-    component: Component,
-    context: &BuildContext<'_>,
-    rprobe_binary: Option<&Path>,
-    rprobe_kernel: Option<&Path>,
-    rprobe_kernel_provenance: Option<&Path>,
-) -> Result<(), ComponentError> {
-    if (rprobe_binary.is_some() || rprobe_kernel.is_some() || rprobe_kernel_provenance.is_some())
-        && !matches!(component, Component::Rprobe)
-    {
-        return Err(ComponentError::UnexpectedRprobeBinary);
-    }
     match component {
         Component::Cli => build_cargo_package(context, "cli"),
         Component::Vmmon => build_vmmon(context),
@@ -114,12 +83,7 @@ pub fn build_component_with_rprobe_binary(
         Component::Portd => build_guest_portd(context),
         Component::Init => build_guest_init(context),
         Component::Initramfs => build_initramfs(context),
-        Component::Rprobe => build_rprobe(
-            context,
-            rprobe_binary,
-            rprobe_kernel,
-            rprobe_kernel_provenance,
-        ),
+        Component::Rprobe => build_rprobe(context),
         Component::GoFfi => build_cargo_package(context, "silo-go-ffi"),
     }
 }
@@ -397,87 +361,44 @@ fn build_guest_init(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     Ok(())
 }
 
-fn build_rprobe(
-    context: &BuildContext<'_>,
-    supplied_binary: Option<&Path>,
-    kernel: Option<&Path>,
-    kernel_provenance: Option<&Path>,
-) -> Result<(), ComponentError> {
-    let binary = match rprobe_binary_source(context.host, supplied_binary)? {
-        RprobeBinarySource::NativeBuild => {
-            let mut cargo = cargo_command(context)?;
-            cargo.args([
-                "build",
-                "--locked",
-                "-p",
-                "rprobe",
-                "--features",
-                "probe-bin",
-                "--bin",
-                "silo-rprobe",
-                "--target",
-                "aarch64-unknown-linux-musl",
-            ]);
-            release::configure_guest_init_command(
-                &mut cargo,
-                context.profile == Profile::Release,
-                context.workspace_root,
-                context.target_dir,
-            );
-            context.profile.apply_cargo(&mut cargo);
-            command::run(cargo)?;
-            context
-                .target_dir
-                .join("aarch64-unknown-linux-musl")
-                .join(context.profile.directory())
-                .join("silo-rprobe")
-        }
-        RprobeBinarySource::Supplied(path) => path.to_path_buf(),
-    };
-    let assets = context
+fn build_rprobe(context: &BuildContext<'_>) -> Result<(), ComponentError> {
+    if context.host != HostTarget::LinuxArm64 {
+        return Err(ComponentError::UnsupportedRprobeHost);
+    }
+    let mut cargo = cargo_command(context)?;
+    cargo.args([
+        "build",
+        "--locked",
+        "-p",
+        "rprobe",
+        "--features",
+        "probe-bin",
+        "--bin",
+        "silo-rprobe",
+        "--target",
+        "aarch64-unknown-linux-musl",
+    ]);
+    release::configure_guest_init_command(
+        &mut cargo,
+        context.profile == Profile::Release,
+        context.workspace_root,
+        context.target_dir,
+    );
+    context.profile.apply_cargo(&mut cargo);
+    command::run(cargo)?;
+    let binary = context
         .target_dir
+        .join("aarch64-unknown-linux-musl")
         .join(context.profile.directory())
-        .join("assets");
-    match (kernel, kernel_provenance) {
-        (Some(kernel), Some(provenance)) => {
-            crate::rprobe::package_assets(&binary, kernel, provenance, &assets)?
-        }
-        (None, None) => {
-            let manifest = assets.join("rprobe.json");
-            match fs::remove_file(&manifest) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(ComponentError::RemoveRprobeManifest {
-                        path: manifest,
-                        source,
-                    })
-                }
-            }
-            crate::rprobe::package(&binary, &assets.join("rprobe-initramfs"))?
-        }
-        (Some(_), None) => return Err(ComponentError::MissingRprobeKernelProvenance),
-        (None, Some(_)) => return Err(ComponentError::MissingRprobeKernel),
-    }
+        .join("silo-rprobe");
+    let profile = context.target_dir.join(context.profile.directory());
+    crate::rprobe::build_kernel(
+        context.workspace_root,
+        &binary,
+        &profile.join("rprobe-build"),
+        &profile.join("assets"),
+    )?;
     Ok(())
-}
-
-enum RprobeBinarySource<'a> {
-    NativeBuild,
-    Supplied(&'a Path),
-}
-
-fn rprobe_binary_source(
-    host: HostTarget,
-    supplied_binary: Option<&Path>,
-) -> Result<RprobeBinarySource<'_>, ComponentError> {
-    match (host, supplied_binary) {
-        (HostTarget::LinuxArm64, None) => Ok(RprobeBinarySource::NativeBuild),
-        (HostTarget::LinuxArm64, Some(_)) => Err(ComponentError::UnsupportedLinuxRprobeBinary),
-        (HostTarget::MacosArm64, Some(path)) => Ok(RprobeBinarySource::Supplied(path)),
-        (HostTarget::MacosArm64, None) => Err(ComponentError::MissingRprobeBinary),
-        (HostTarget::LinuxX86_64, _) => Err(ComponentError::UnsupportedRprobeHost),
-    }
 }
 
 fn build_initramfs(context: &BuildContext<'_>) -> Result<(), ComponentError> {
@@ -521,32 +442,24 @@ fn standard_cargo_command(workspace_root: &Path, target_dir: &Path) -> Command {
 
 #[cfg(test)]
 mod tests {
+    use crate::components::{build_rprobe, BuildContext, ComponentError};
+    use crate::profiles::Profile;
+    use crate::targets::HostTarget;
     use std::path::Path;
 
-    use crate::components::{rprobe_binary_source, ComponentError, RprobeBinarySource};
-    use crate::targets::HostTarget;
-
     #[test]
-    fn rprobe_binary_selection_is_host_explicit() {
-        assert!(matches!(
-            rprobe_binary_source(HostTarget::LinuxArm64, None),
-            Ok(RprobeBinarySource::NativeBuild)
-        ));
-        assert!(matches!(
-            rprobe_binary_source(HostTarget::LinuxArm64, Some(Path::new("owned-rprobe"))),
-            Err(ComponentError::UnsupportedLinuxRprobeBinary)
-        ));
-        assert!(matches!(
-            rprobe_binary_source(HostTarget::MacosArm64, Some(Path::new("owned-rprobe"))),
-            Ok(RprobeBinarySource::Supplied(path)) if path == Path::new("owned-rprobe")
-        ));
-        assert!(matches!(
-            rprobe_binary_source(HostTarget::MacosArm64, None),
-            Err(ComponentError::MissingRprobeBinary)
-        ));
-        assert!(matches!(
-            rprobe_binary_source(HostTarget::LinuxX86_64, None),
-            Err(ComponentError::UnsupportedRprobeHost)
-        ));
+    fn probe_build_requires_native_linux_arm64() {
+        for host in [HostTarget::MacosArm64, HostTarget::LinuxX86_64] {
+            let context = BuildContext {
+                workspace_root: Path::new("."),
+                target_dir: Path::new("target"),
+                profile: Profile::Debug,
+                host,
+            };
+            assert!(matches!(
+                build_rprobe(&context),
+                Err(ComponentError::UnsupportedRprobeHost)
+            ));
+        }
     }
 }

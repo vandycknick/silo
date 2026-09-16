@@ -2,9 +2,6 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::{de::IgnoredAny, Deserialize};
-use sha2::{Digest, Sha256};
-
 use crate::runtime::RuntimeConfig;
 use crate::LibVmError;
 
@@ -23,56 +20,7 @@ pub(crate) struct ResolvedRuntimeComponents {
     pub(crate) kernel: PathBuf,
     pub(crate) initramfs: PathBuf,
     pub(crate) agent: PathBuf,
-    asset_dir: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RprobeAssets {
-    pub(crate) kernel: PathBuf,
-    pub(crate) initramfs: PathBuf,
-    pub(crate) manifest: PathBuf,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RprobeManifest {
-    version: u32,
-    purpose: String,
-    profile: String,
-    kernel: RprobeManifestAsset,
-    initramfs: RprobeManifestAsset,
-    #[serde(rename = "capture")]
-    _capture: IgnoredAny,
-    #[serde(rename = "provenance")]
-    _provenance: IgnoredAny,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RprobeManifestAsset {
-    file: String,
-    size: u64,
-    sha256: String,
-}
-
-impl ResolvedRuntimeComponents {
-    pub(crate) fn resolve_rprobe_assets(
-        &self,
-        intent: crate::vmmon::start_request::VmmonRosettaIntent,
-    ) -> Result<Option<RprobeAssets>, LibVmError> {
-        if !matches!(
-            intent,
-            crate::vmmon::start_request::VmmonRosettaIntent::KrunCaptured { .. }
-        ) {
-            return Ok(None);
-        }
-        resolve_rprobe_assets(&self.asset_dir)
-            .map(Some)
-            .map_err(|message| LibVmError::RuntimeComponentInvalid {
-                input: "KrunCaptured rprobe assets".to_string(),
-                message,
-            })
-    }
+    pub(crate) asset_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -592,64 +540,6 @@ fn canonical_component(
     Ok(canonical)
 }
 
-fn resolve_rprobe_assets(asset_dir: &Path) -> Result<RprobeAssets, String> {
-    let manifest_path = canonical_component(
-        "rprobe.json",
-        &asset_dir.join("rprobe.json"),
-        false,
-        Some(asset_dir),
-    )?;
-    let bytes = fs::read(&manifest_path)
-        .map_err(|error| format!("read rprobe manifest {}: {error}", manifest_path.display()))?;
-    let manifest: RprobeManifest = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("parse rprobe manifest {}: {error}", manifest_path.display()))?;
-    if manifest.version != 1
-        || manifest.purpose != "rosetta-acquisition-probe"
-        || manifest.profile != "rprobe"
-    {
-        return Err("rprobe manifest has an unsupported contract".to_string());
-    }
-    let kernel = validate_rprobe_manifest_asset(asset_dir, "rprobe-kernel", &manifest.kernel)?;
-    let initramfs =
-        validate_rprobe_manifest_asset(asset_dir, "rprobe-initramfs", &manifest.initramfs)?;
-    Ok(RprobeAssets {
-        kernel,
-        initramfs,
-        manifest: manifest_path,
-    })
-}
-
-fn validate_rprobe_manifest_asset(
-    asset_dir: &Path,
-    expected_name: &str,
-    asset: &RprobeManifestAsset,
-) -> Result<PathBuf, String> {
-    if asset.file != expected_name {
-        return Err(format!(
-            "rprobe manifest names {:?}, expected {expected_name:?}",
-            asset.file
-        ));
-    }
-    let path = canonical_component(
-        expected_name,
-        &asset_dir.join(expected_name),
-        false,
-        Some(asset_dir),
-    )?;
-    let bytes = fs::read(&path)
-        .map_err(|error| format!("read {expected_name} at {}: {error}", path.display()))?;
-    let digest = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    if bytes.len() as u64 != asset.size || digest != asset.sha256 {
-        return Err(format!(
-            "{expected_name} does not match the size and SHA-256 in rprobe.json"
-        ));
-    }
-    Ok(path)
-}
-
 fn portable_root_for_executable(executable: &Path) -> Option<PathBuf> {
     let bin = executable.parent()?;
     (executable.file_name()? == "silo" && bin.file_name()? == "bin")
@@ -667,6 +557,7 @@ fn app_bundle_for_executable(executable: &Path) -> Option<PathBuf> {
         .then(|| bundle.to_path_buf())
 }
 
+#[cfg(target_os = "macos")]
 fn consider_app_bundle(
     considered: &mut Vec<String>,
     bundle: &Path,
@@ -958,8 +849,6 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
 
-    use sha2::{Digest, Sha256};
-
     #[derive(Default)]
     struct TestEnvironment {
         values: BTreeMap<&'static str, OsString>,
@@ -989,44 +878,6 @@ mod tests {
         write_file(&root.join("assets/initramfs"), false);
         write_file(&root.join("assets/agent"), true);
         ComponentPaths::portable(root)
-    }
-
-    fn write_rprobe_assets(root: &Path) {
-        let assets = root.join("assets");
-        let kernel = b"rprobe kernel";
-        let initramfs = b"rprobe initramfs";
-        write_file(&assets.join("rprobe-kernel"), false);
-        write_file(&assets.join("rprobe-initramfs"), false);
-        std::fs::write(assets.join("rprobe-kernel"), kernel).expect("write rprobe kernel");
-        std::fs::write(assets.join("rprobe-initramfs"), initramfs).expect("write rprobe initramfs");
-        let digest = |bytes: &[u8]| {
-            Sha256::digest(bytes)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        };
-        let manifest = serde_json::json!({
-            "version": 1,
-            "purpose": "rosetta-acquisition-probe",
-            "profile": "rprobe",
-            "kernel": {"file": "rprobe-kernel", "size": kernel.len(), "sha256": digest(kernel)},
-            "initramfs": {"file": "rprobe-initramfs", "size": initramfs.len(), "sha256": digest(initramfs)},
-            "capture": {
-                "profile": "capturedCompatibilityV1",
-                "request": 0x8045_6122_u32,
-                "payloadBytes": 1024,
-                "diagnosticPort": "hvc0",
-                "dataPort": "hvc1",
-                "cpus": 1,
-                "memoryMiB": 128
-            },
-            "provenance": {"kernel": {}}
-        });
-        std::fs::write(
-            assets.join("rprobe.json"),
-            serde_json::to_vec(&manifest).expect("serialize manifest"),
-        )
-        .expect("write manifest");
     }
 
     fn resolve(
@@ -1180,115 +1031,6 @@ mod tests {
     }
 
     #[test]
-    fn rprobe_assets_are_resolved_only_for_krun_captured() {
-        use crate::vmmon::start_request::{VmmonRosettaIntent, VmmonRosettaProfile};
-
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().join("portable");
-        portable(&root);
-        let components = resolve(
-            &RuntimeConfig::default().with_runtime_root(&root),
-            &mut TestEnvironment::default(),
-            temp.path().join("silo"),
-            vec![],
-        )
-        .expect("resolve runtime");
-
-        for intent in [VmmonRosettaIntent::Disabled, VmmonRosettaIntent::VzNative] {
-            assert_eq!(
-                components
-                    .resolve_rprobe_assets(intent)
-                    .expect("native mode does not resolve probe assets"),
-                None
-            );
-        }
-        assert!(components
-            .resolve_rprobe_assets(VmmonRosettaIntent::KrunCaptured {
-                profile: VmmonRosettaProfile::CapturedCompatibilityV1,
-            })
-            .is_err());
-
-        write_rprobe_assets(&root);
-        let resolved = components
-            .resolve_rprobe_assets(VmmonRosettaIntent::KrunCaptured {
-                profile: VmmonRosettaProfile::CapturedCompatibilityV1,
-            })
-            .expect("resolve rprobe assets")
-            .expect("KrunCaptured assets");
-        assert_eq!(
-            resolved.kernel,
-            root.join("assets/rprobe-kernel")
-                .canonicalize()
-                .expect("kernel")
-        );
-        assert!(resolved.initramfs.is_file());
-        assert!(resolved.manifest.is_file());
-    }
-
-    #[test]
-    fn asset_directory_override_is_used_for_lazy_rprobe_resolution() {
-        use crate::vmmon::start_request::{VmmonRosettaIntent, VmmonRosettaProfile};
-
-        let temp = tempfile::tempdir().expect("temp dir");
-        let native = temp.path().join("native");
-        portable(&native);
-        let override_root = temp.path().join("override");
-        portable(&override_root);
-        write_rprobe_assets(&override_root);
-        let mut environment = TestEnvironment::default();
-        environment.values.insert(
-            "SILO_ASSET_DIR",
-            override_root.join("assets").into_os_string(),
-        );
-        let components = resolve(
-            &RuntimeConfig::default(),
-            &mut environment,
-            temp.path().join("silo"),
-            vec![("native".to_string(), ComponentPaths::portable(&native))],
-        )
-        .expect("resolve overridden assets");
-
-        let resolved = components
-            .resolve_rprobe_assets(VmmonRosettaIntent::KrunCaptured {
-                profile: VmmonRosettaProfile::CapturedCompatibilityV1,
-            })
-            .expect("resolve overridden rprobe assets")
-            .expect("KrunCaptured assets");
-        assert_eq!(
-            resolved.kernel,
-            override_root
-                .join("assets/rprobe-kernel")
-                .canonicalize()
-                .expect("kernel")
-        );
-    }
-
-    #[test]
-    fn rprobe_manifest_rejects_changed_asset_bytes() {
-        use crate::vmmon::start_request::{VmmonRosettaIntent, VmmonRosettaProfile};
-
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().join("portable");
-        portable(&root);
-        write_rprobe_assets(&root);
-        std::fs::write(root.join("assets/rprobe-kernel"), b"changed").expect("change kernel");
-        let components = resolve(
-            &RuntimeConfig::default().with_runtime_root(&root),
-            &mut TestEnvironment::default(),
-            temp.path().join("silo"),
-            vec![],
-        )
-        .expect("resolve runtime");
-
-        let error = components
-            .resolve_rprobe_assets(VmmonRosettaIntent::KrunCaptured {
-                profile: VmmonRosettaProfile::CapturedCompatibilityV1,
-            })
-            .expect_err("changed kernel must fail");
-        assert!(error.to_string().contains("does not match"));
-    }
-
-    #[test]
     fn path_requires_valid_explicit_assets_and_one_complete_entry() {
         let temp = tempfile::tempdir().expect("temp dir");
         let assets = temp.path().join("assets");
@@ -1330,6 +1072,13 @@ mod tests {
         assert_eq!(
             resolved.vmmon,
             complete.join("vmmon").canonicalize().expect("vmmon")
+        );
+        assert_eq!(
+            resolved.asset_dir,
+            temp.path()
+                .join("assets")
+                .canonicalize()
+                .expect("asset directory")
         );
         assert!(environment.read.contains(&"PATH"));
     }
