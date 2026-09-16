@@ -3,10 +3,10 @@
 
 Usage: scripts/vm-memory-report.py [VM]      (default: silo-system)
 
-Read-only. Pulls the krun helper's footprint from the host and the kernel's
-view from inside the guest, then reconciles them so stranded memory (charged to
-the host but neither used by the guest nor legitimately unreportable) stands
-out. Needs `footprint` and `vmmap` (Xcode command line tools) and `silo exec`.
+Read-only. Compares the krun helper's host accounting with guest kernel metrics.
+These are different views, not an additive physical-memory accounting: a residual
+does not prove that pages leaked, were reported free, or became irreclaimable.
+Needs `footprint` and `vmmap` (Xcode command line tools) and `silo exec`.
 """
 
 import ctypes
@@ -152,7 +152,7 @@ def main():
     zone_table = zones(guest.get("zoneinfo", []), guest.get("buddyinfo", []))
 
     charged, peak = fp if fp else (0, 0)
-    guest_ram_dirty = table.get("untagged (VM_ALLOCATE)", (0, 0, 0))[0]
+    untagged_charge = table.get("untagged (VM_ALLOCATE)", (0, 0, 0))[0]
     vmm_overhead = sum(d for cat, (d, _, _) in table.items() if cat != "untagged (VM_ALLOCATE)")
     reusable = sum(r for (_, _, r) in table.values())
 
@@ -167,19 +167,19 @@ def main():
     kernel_reserved = max(machine["memory"] - mem_total, 0)
     fragments = sum(z["fragments"] for z in zone_table.values())
     expected = vmm_overhead + guest_held + kernel_reserved + fragments
-    stranded = charged - expected
+    residual = charged - expected
 
     print(f"VM {machine['name']} ({machine['short_id']})  krun pid {krun}  vmmon pid {vmmon}  configured RAM {mib(machine['memory'])}")
     print()
     print("HOST (what macOS charges the krun process)")
     print(f"  phys_footprint            {mib(charged)}   peak {mib(peak)}")
-    print(f"    resident, unwired       {mib(totals.get('resident', 0))}   (vmmap RESIDENT)")
-    print(f"    compressed / swapped    {mib(totals.get('swapped', 0))}   (vmmap SWAPPED: charged but not in RAM)")
-    print(f"    marked reusable         {mib(reusable)}   (released, awaiting discard)")
-    print(f"    guest RAM region dirty  {mib(guest_ram_dirty)}   (footprint; includes compressed)")
+    print(f"    mapped resident         {mib(totals.get('resident', 0))}   (vmmap RESIDENT; not total backing residency)")
+    print(f"    compressed / swapped    {mib(totals.get('swapped', 0))}   (logical pages; not compressor RAM or swap-file bytes)")
+    print(f"    marked reusable         {mib(reusable)}   (explicit accounting category; not all MADV_FREE pages)")
+    print(f"    untagged mapping charge {mib(untagged_charge)}   (default footprint view; includes compressed)")
     print(f"    VMM overhead            {mib(vmm_overhead)}   (malloc, stacks, page tables)")
-    wired = charged - totals.get("resident", 0) - totals.get("swapped", 0)
-    print(f"    wired by hypervisor     {mib(max(wired, 0))}   (derived: footprint - resident - swapped)")
+    print(f"  Inspect backing separately: footprint -p {krun} --wide --vmObjectDirty")
+    print("  Neither that object-accounting view nor these totals establishes per-page discardability.")
     print()
     print("GUEST (what the Linux kernel holds)")
     print(f"  MemTotal {mib(mem_total)}   kernel reserved outside MemTotal {mib(kernel_reserved)}")
@@ -209,28 +209,21 @@ def main():
     print("  largest processes (RSS): " + ", ".join(
         f"{f[1]} {int(f[0]) // 1024} MiB" for f in (l.split(None, 1) for l in guest.get("procs", [])[1:6]) if len(f) == 2))
     print()
-    print("RECONCILIATION (host charge that the guest's state explains)")
+    print("HEURISTIC COMPARISON (not an additive physical-memory accounting)")
     print(f"  VMM overhead              {mib(vmm_overhead)}")
     print(f"  guest held                {mib(guest_held)}")
     print(f"  kernel reserved           {mib(kernel_reserved)}")
     print(f"  unreportable fragments    {mib(fragments)}   (free but in blocks smaller than 2 MiB)")
-    print(f"  = explained               {mib(expected)}")
+    print(f"  = guest-based estimate    {mib(expected)}")
     print(f"  phys_footprint            {mib(charged)}")
-    compressed = totals.get("swapped", 0)
-    if stranded <= 64 * MIB:
-        verdict = "within noise"
-    elif compressed >= stranded * 0.8:
-        verdict = "matches the compressed bytes: pages the guest freed and reported, which the host later compressed instead of discarding"
-    else:
-        verdict = "host-charged memory the guest does not hold; compare with the compressed and reusable lines above"
-    print(f"  STRANDED                  {mib(max(stranded, 0))}   {verdict}")
-    print(f"    of which compressed     {mib(min(compressed, max(stranded, 0)))}")
+    print(f"  accounting residual       {mib(residual)}   (not a leak or reported-page measurement)")
+    print("  Host mappings, guest mappings and backing objects can account for the same pages differently.")
     try:
         status = json.load(open("/tmp/silo-501/daemon/status.json"))
         if status.get("machine_id", "").startswith(machine["short_id"]):
             print()
             print("DAEMON")
-            print(f"  host reclaim: effective={status.get('host_memory_reclaim_effective')} probe={status.get('host_memory_reclaim_qualification')} released {mib(status.get('host_memory_reclaim_released_bytes') or 0)} failed_ops {status.get('host_memory_reclaim_failed_operations')}")
+            print(f"  host reclaim: effective={status.get('host_memory_reclaim_effective')} probe={status.get('host_memory_reclaim_qualification')} advised {mib(status.get('host_memory_reclaim_released_bytes') or 0)} failed_ops {status.get('host_memory_reclaim_failed_operations')}")
             print(f"  guest reclaim: runs {status.get('memory_reclaim_runs')} last {status.get('memory_reclaim_at')} outcome {status.get('memory_reclaim_outcome')} cached fell {mib(status.get('memory_reclaim_observed_cache_delta_bytes') or 0)}")
     except (OSError, ValueError):
         pass

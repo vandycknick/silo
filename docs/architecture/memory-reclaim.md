@@ -48,9 +48,11 @@ using.
 
 Facts that shape everything downstream:
 
-- Only blocks of `pageblock_order` or larger are reported. On Silo's arm64
-  guest that is 2 MiB. Free memory fragmented into smaller pieces is never
-  reported; compaction can merge it back into reportable blocks.
+- The guest's configured `page_reporting_order` sets the minimum block size.
+  Silo's arm64 guest currently uses order 9, or 2 MiB with its 4 KiB pages.
+  Free memory fragmented into smaller pieces is not reported; compaction can
+  merge it back into reportable blocks. OrbStack's inspected guest uses order 2
+  (16 KiB), a separate policy difference from host mapping maintenance.
 - Reporting runs two seconds after free memory crosses the threshold, in
   batches of at most 32 blocks.
 - Reporting stops while a zone is near its low watermark, so the guest
@@ -75,14 +77,34 @@ reclamation; it does not promise an immediate resident-size or footprint drop.
 When backing is discarded, the host handles later guest refaults in-kernel
 without a VM exit. Adjacent descriptors in one report are merged to amortize
 HV TLB invalidations, but advice remains page-wise: bulk advice can miss backing
-that the guest dirtied without populating host PTEs. Production reclaim uses
-neither `MAP_FIXED` nor periodic whole-RAM Mach remapping.
+that the guest dirtied without populating host PTEs. Production reclaim does not
+replace reported backing with `MAP_FIXED`.
 
 Host device access to guest memory is never guarded. The host mapping stays
 valid throughout, and the reporting protocol keeps a reported page out of the
 guest allocator until the report is acknowledged. The only shared state is
 one atomic per 2 MiB extent so that a vCPU that faults inside the unmap
 window waits for the remap and retries.
+
+### Host mapping maintenance
+
+Host accesses to guest RAM also populate host page-table entries. Their charge
+can survive successful free-page advice even when the backing is clean. To
+remove those translations, the native VMM event loop performs same-address
+`mach_vm_remap(copy=false)` over registered RAM every 30 seconds while host
+reclaim is effective. This preserves the VM objects, guest mappings and live
+contents; it is not a fresh anonymous allocation and does not discard old reports
+again. The owning VMM keeps RAM alive throughout maintenance. Failure stops the
+VM rather than continuing with uncertain host mappings.
+
+This accounts for an important part of OrbStack's apparent memory efficiency.
+In a matched 512 MiB Linux VM test, a 128 MiB disk-read/free workload left about
+210 MiB charged without maintenance, versus 62 MiB after the maintenance pass.
+Both runs still showed about 179 MiB in VM-object accounting. A footprint drop
+therefore cannot be claimed as the same amount of physical RAM returned.
+
+The implementation uses only the 30-second pass, not OrbStack's additional
+report-triggered 250 ms scheduling or its 4 MiB backing allocation scheme.
 
 ### Qualification probe
 

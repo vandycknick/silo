@@ -12,9 +12,9 @@ The workspace dependency is pinned by full Git commit in the root
 
 ```text
 repository: https://github.com/vandycknick/libkrun.git
-tracked revision: d54c7e9088687098ded67245efc7cb63a68d5223
+tracked revision: b892b1974e34a48b857c4562bc41f2e541b30ea5
 public branch: silo/v2
-previous tracked revision: 3ab6249a1ff4cb4945d216ce74f9feecbf4def7d
+previous tracked revision: d54c7e9088687098ded67245efc7cb63a68d5223
 previous tip backup: backup/silo-v2-2026-09-15 @ 10b6f752ba8ea735c3d9edaa549599dcf3f98d18
 pre-split backup: backup/silo-v2-before-feature-split-2026-09-15 @ ea84066ff3c8499a4aac5cdd3ec326aee0667e9b
 fetchable: yes
@@ -25,7 +25,7 @@ or tag is useful for reviewing the fork, but neither replaces the immutable
 commit pin.
 
 The committed revision is reachable through the fork URL: a direct
-`git fetch https://github.com/vandycknick/libkrun.git d54c7e9088687098ded67245efc7cb63a68d5223`
+`git fetch https://github.com/vandycknick/libkrun.git b892b1974e34a48b857c4562bc41f2e541b30ea5`
 succeeds. Cargo therefore resolves the tracked pin directly from GitHub with no
 local checkout, path patch, URL rewrite, or alternate lockfile. The public
 `silo/v2` branch names the reviewable tip, while release reproducibility comes
@@ -36,8 +36,8 @@ The tracked revision changes how the balloon advises guest RAM free on macOS.
 Each coalesced report uses `hv_vm_unmap`, one `madvise(MADV_FREE)` call per
 native host page, and immediate `hv_vm_map`. Page-wise advice avoids XNU's
 bulk host-PTE path, which can leave guest-written backing dirty. There is no
-`MAP_FIXED` backing replacement or periodic whole-RAM remap. Later guest
-refaults remain in-kernel, and host devices retain passthrough memory access.
+`MAP_FIXED` backing replacement. Later guest refaults remain in-kernel, and host
+devices retain passthrough memory access.
 One atomic per 2 MiB extent lets a vCPU faulting inside the unmap window retry
 once the mapping is restored, including after new reclaim has been disabled.
 
@@ -48,6 +48,19 @@ Real-HVF tests also verified release of already-compressed backing, while the
 report-before-pressure test remained inconclusive at its bounded 1 GiB budget.
 Nested EL2 guests remain unqualified. The external initramfs is streamed into
 guest RAM instead of staged in a large heap buffer.
+
+The native VMM event loop now also performs content-preserving, same-address
+Mach self-remapping every 30 seconds while reclaim is effective. This removes
+host translations whose footprint charge survives page-wise advice, including
+translations populated by virtio block I/O. It keeps the existing backing and
+guest mappings, never replays old free-page reports, and runs only while the
+VMM owns the RAM. No maintenance thread is attached to the status handle.
+A remapping failure stops the event loop. This maintenance changes mapping
+accounting; it does not prove physical discard or immediate compressor relief.
+
+A matched 512 MiB Linux VM experiment reading and freeing 128 MiB through
+virtio-block stayed near 210 MiB footprint without maintenance and fell to
+62 MiB with it. VM-object accounting stayed near 179 MiB in both cases.
 
 The fork also merges adjacent descriptors of one free-page report into a
 single release cycle and exposes `VmmHandle::host_reclaim_status()`. The krun

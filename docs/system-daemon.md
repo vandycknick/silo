@@ -85,6 +85,8 @@ The krun helper reports the probe outcome, the effective state, and cumulative
 bytes advised free over a status pipe, and `daemon status` shows them on the
 `Host memory reclaim` row. That counter includes repeat reports, not current
 physical memory savings; macOS may retain clean pages until memory pressure.
+While reclaim is effective, the VMM also normalizes host mappings every 30 seconds
+to remove host page-table charges without replacing backing or losing live data.
 This setting does not change backend selection, vsock, native execution, or
 Rosetta intent. `daemon status` reports requested and observed
 effective state separately and never treats `auto` as proof that reclaim became
