@@ -735,12 +735,17 @@ impl Runtime {
         let current_state = runtime
             .map(|runtime| runtime.status)
             .unwrap_or(MachineRuntimeState::Stopped);
-        let abandoned_start = current_state == MachineRuntimeState::Starting
+        let abandoned_start = if current_state == MachineRuntimeState::Starting
             && live_pid.is_none()
-            && MachineLifetimeLock::try_acquire(
-                &self.paths.machine(metadata.id).vmmon_lock_path(),
-            )?
-            .is_some();
+        {
+            // Persisted starting state can survive a missing runtime tree. Recreate it
+            // securely before lock creation can inherit a permissive umask.
+            self.paths.ensure_machine_run_dir(metadata.id)?;
+            MachineLifetimeLock::try_acquire(&self.paths.machine(metadata.id).vmmon_lock_path())?
+                .is_some()
+        } else {
+            false
+        };
         let exit_status = exit_status::read(&exit_status_path)?;
         let matching_exit = exit_status
             .as_ref()
@@ -3656,7 +3661,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_starting_without_live_monitor_marks_machine_stopped() {
+    async fn abandoned_start_recreates_private_runtime_directories() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let runtime = Runtime::open(
+            LocalPaths::new(temp.path().join("silo")),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .expect("create runtime");
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+        let paths = runtime.machine_paths(machine.id);
+        assert!(!paths.machine_run_dir().exists());
+        runtime
+            .set_machine_state(
+                machine.id,
+                MachineRuntimeState::Starting,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("set starting state");
+
+        let status = runtime
+            .reconcile_machine_runtime_locked(&machine)
+            .await
+            .expect("reconcile");
+        assert!(!status.is_active());
+        for path in [
+            paths.machine_run_dir().to_path_buf(),
+            paths
+                .machine_run_dir()
+                .parent()
+                .expect("machines parent")
+                .to_path_buf(),
+        ] {
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("runtime directory")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "{} must stay private",
+                path.display(),
+            );
+        }
+        runtime
+            .local_paths()
+            .remove_machine_run_tree(machine.id)
+            .expect("secure cleanup");
+        assert!(!paths.machine_run_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn stop_starting_without_live_monitor_preserves_start_failure() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
             LocalPaths::new(temp.path().join("silo")),
@@ -3692,8 +3757,16 @@ mod tests {
             .await
             .expect("read machine state");
 
-        assert_eq!(inspect_data.status, MachineStatus::Stopped);
-        assert_eq!(state.status, MachineRuntimeState::Stopped);
+        let message = "machine start did not leave a live runtime";
+        assert_eq!(
+            inspect_data.status,
+            MachineStatus::Error {
+                message: Some(message.to_string())
+            }
+        );
+        assert_eq!(state.status, MachineRuntimeState::Error);
+        assert_eq!(state.last_error.as_deref(), Some(message));
+        assert!(!runtime.machine_paths(machine.id).machine_run_dir().exists());
     }
 
     #[tokio::test]
@@ -3855,7 +3928,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_finishes_starting_machine_without_live_runtime() {
+    async fn stop_cleans_abandoned_start_without_live_runtime() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
             LocalPaths::new(temp.path().join("silo")),
@@ -3891,8 +3964,16 @@ mod tests {
             .await
             .expect("read machine state");
 
-        assert_eq!(inspect_data.status, MachineStatus::Stopped);
-        assert_eq!(state.status, MachineRuntimeState::Stopped);
+        let message = "machine start did not leave a live runtime";
+        assert_eq!(
+            inspect_data.status,
+            MachineStatus::Error {
+                message: Some(message.to_string())
+            }
+        );
+        assert_eq!(state.status, MachineRuntimeState::Error);
+        assert_eq!(state.last_error.as_deref(), Some(message));
+        assert!(!runtime.machine_paths(machine.id).machine_run_dir().exists());
     }
 
     #[tokio::test]
