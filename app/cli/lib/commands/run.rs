@@ -21,6 +21,7 @@ use crate::planning::{Plan, PlanKind, ProcessOverrides, RunOptions, TtyCapabilit
 use crate::ui::{self, watch_image_progress, OutputFormat, Spinner};
 
 const FAILED_READINESS_EXIT_WAIT: Duration = Duration::from_secs(2);
+const SHUTDOWN_PROGRESS_DELAY: Duration = Duration::from_secs(5);
 const EXAMPLES: &[&str] = &[
     "silo run ubuntu:26.04 -- uname -a",
     "silo run --detach ubuntu:26.04 -- sleep 300",
@@ -286,7 +287,7 @@ impl Cmd {
                     error,
                 )
                 .await;
-                let stop = stop_run(&machine, start.run_id, plan.create.retention).await;
+                let stop = stop_run(&machine, start.run_id, plan.create.retention, None).await;
                 return Err(
                     foreground_stop_failure(&machine, plan.create.retention, stop, error).await,
                 );
@@ -302,7 +303,7 @@ impl Cmd {
             } else {
                 eyre::eyre!("guest readiness check ended with {:?}", readiness.outcome)
             };
-            let stop = stop_run(&machine, start.run_id, plan.create.retention).await;
+            let stop = stop_run(&machine, start.run_id, plan.create.retention, None).await;
             return Err(
                 foreground_stop_failure(&machine, plan.create.retention, stop, error).await,
             );
@@ -312,7 +313,20 @@ impl Cmd {
         let execution =
             crate::api::streams::run_process(&machine, &plan.create.process, &plan.argv, plan.tty)
                 .await;
-        let stop = stop_run(&machine, start.run_id, plan.create.retention).await;
+        let (shutdown_progress, shutdown_labels) = tokio::sync::watch::channel("Stopping");
+        let stop = ui::with_delayed_spinner(
+            stop_run(
+                &machine,
+                start.run_id,
+                plan.create.retention,
+                Some(shutdown_progress),
+            ),
+            SHUTDOWN_PROGRESS_DELAY,
+            shutdown_labels,
+            &name,
+            "Stopped",
+        )
+        .await;
         let result = match execution {
             Ok(result) => result,
             Err(error) => {
@@ -408,8 +422,35 @@ async fn stop_run(
     machine: &AppMachine,
     run_id: MachineRunId,
     retention: MachineRetention,
+    progress: Option<tokio::sync::watch::Sender<&'static str>>,
 ) -> eyre::Result<()> {
-    match machine.stop_run(run_id).await {
+    // Listen before starting shutdown, including its initial quiet period.
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
+    if let Err(error) = &interrupt {
+        eprintln!("warning: cannot listen for Ctrl+C during shutdown: {error}");
+    }
+    let stopping = machine.stop_run(run_id.clone());
+    tokio::pin!(stopping);
+    let result = tokio::select! {
+        biased;
+        result = &mut stopping => result,
+        Some(()) = async {
+            match &mut interrupt {
+                Ok(signal) => signal.recv().await,
+                Err(_) => std::future::pending().await,
+            }
+        } => {
+            if let Some(progress) = &progress {
+                progress.send_replace("Forcing");
+            }
+            // Keep polling the graceful operation: it may already hold a
+            // cleanup lock. Dropping it or leaving it suspended could interrupt
+            // cleanup or deadlock the forced stop waiting for that same lock.
+            let (stopped, forced) = tokio::join!(stopping, machine.force_stop_run(run_id));
+            completed_stop(stopped, forced)
+        }
+    };
+    match result {
         Ok(_)
         | Err(libvm::LibVmError::MachineNotRunning { .. })
         | Err(libvm::LibVmError::MachineStaleGeneration { current: None, .. }) => {}
@@ -417,6 +458,17 @@ async fn stop_run(
     }
     cleanup_ephemeral_best_effort(machine, retention).await;
     Ok(())
+}
+
+fn completed_stop<T>(
+    stopped: Result<T, libvm::LibVmError>,
+    forced: Result<T, libvm::LibVmError>,
+) -> Result<T, libvm::LibVmError> {
+    match (stopped, forced) {
+        (Ok(machine), _) | (_, Ok(machine)) => Ok(machine),
+        (Err(error), Err(libvm::LibVmError::MachineNotRunning { .. })) => Err(error),
+        (_, Err(error)) => Err(error),
+    }
 }
 
 async fn diagnose_readiness_failure(
@@ -534,9 +586,52 @@ mod tests {
 
     use crate::app::Cli;
     use crate::commands::run::{
-        detached_default_workload_hint, detached_lifecycle_hint, start_failure,
+        completed_stop, detached_default_workload_hint, detached_lifecycle_hint, start_failure,
     };
     use crate::commands::Command;
+
+    #[test]
+    fn completed_stop_accepts_either_successful_shutdown() {
+        let timeout = || libvm::LibVmError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert_eq!(
+            completed_stop(Ok(1), Err(timeout())).expect("graceful success"),
+            1
+        );
+        assert_eq!(
+            completed_stop(Err(timeout()), Ok(2)).expect("forced success"),
+            2
+        );
+    }
+
+    #[test]
+    fn completed_stop_preserves_cleanup_errors_when_force_is_too_late() {
+        let result = completed_stop::<()>(
+            Err(libvm::LibVmError::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+            Err(libvm::LibVmError::MachineNotRunning {
+                reference: "vm".to_string(),
+            }),
+        );
+        assert!(
+            matches!(result, Err(libvm::LibVmError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn completed_stop_reports_failed_force() {
+        let result = completed_stop::<()>(
+            Err(libvm::LibVmError::Io(std::io::Error::from(
+                std::io::ErrorKind::TimedOut,
+            ))),
+            Err(libvm::LibVmError::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+        );
+        assert!(
+            matches!(result, Err(libvm::LibVmError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+    }
 
     #[test]
     fn run_parses_the_final_image_first_form() {

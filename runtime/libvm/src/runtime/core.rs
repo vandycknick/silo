@@ -2760,6 +2760,7 @@ mod tests {
                 std::env::current_exe().expect("current test binary path"),
             )
             .env("SILO_LIBVM_SIGINT_IGNORING_CHILD", "1")
+            .process_group(0)
             .arg("sigint_ignoring_child_process")
             .arg("--nocapture")
             .stdout(std::process::Stdio::piped())
@@ -3295,6 +3296,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_timeout_escalates_only_when_requested() {
+        for force in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let runtime = Runtime::open(
+                LocalPaths::new(temp.path().join("silo")),
+                RuntimeNetworkingConfig::default(),
+            )
+            .await
+            .expect("runtime");
+            let machine = create_pending_sample(&runtime, "stop-timeout")
+                .await
+                .expect("pending")
+                .commit(&runtime)
+                .await
+                .expect("commit");
+            let mut child = ChildGuard::sleep_ignoring_sigint();
+            let pid = child.id() as i32;
+            create_machine_runtime_dirs(&runtime, machine.id);
+            std::fs::write(
+                runtime.machine_paths(machine.id).vmmon_pid_path(),
+                format!("{pid}\n"),
+            )
+            .expect("pidfile");
+            runtime
+                .set_machine_state(
+                    machine.id,
+                    MachineRuntimeState::Running,
+                    Some(pid),
+                    child.started_at(),
+                    Some("run-stop-timeout".to_string()),
+                    None,
+                )
+                .await
+                .expect("running");
+            let mut options = crate::MachineStopOptions::new().timeout(Duration::from_millis(100));
+            if force {
+                options = options.force_after_timeout(Duration::from_secs(2));
+            }
+            // A real parent must reap the child, as init does for detached vmmon.
+            let reaper = tokio::spawn(async move {
+                loop {
+                    if let Some(status) = child.child.try_wait().expect("wait child") {
+                        return status;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(4),
+                machine_handle(&runtime, machine.id).stop_run_with(
+                    MachineRunId::from_raw("run-stop-timeout".to_string()),
+                    options,
+                ),
+            )
+            .await
+            .expect("bounded stop");
+            if force {
+                assert_eq!(result.expect("forced stop").status, MachineStatus::Stopped);
+                assert!(!reaper.await.expect("reap").success());
+                assert!(!runtime.machine_paths(machine.id).vmmon_pid_path().exists());
+            } else {
+                assert!(
+                    matches!(result, Err(LibVmError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+                );
+                assert!(ProcessIdentity::for_pid(pid).expect("identity").is_some());
+                reaper.abort();
+                let _ = reaper.await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn stop_releases_machine_lock_while_waiting_for_monitor_shutdown() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
@@ -3362,103 +3435,116 @@ mod tests {
 
     #[tokio::test]
     async fn generation_checked_stop_does_not_clean_up_a_replacement_run() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("silo")),
-            RuntimeNetworkingConfig::default(),
-        )
-        .await
-        .expect("create runtime");
-        let machine = create_pending_sample(&runtime, "devbox")
-            .await
-            .expect("create pending machine")
-            .commit(&runtime)
-            .await
-            .expect("commit machine");
-        let mut old_monitor = ChildGuard::sleep_ignoring_sigint();
-        let old_pid = old_monitor.id() as i32;
-        let old_started_at = old_monitor.started_at();
-        create_machine_runtime_dirs(&runtime, machine.id);
-        let machine_paths = runtime.machine_paths(machine.id);
-        std::fs::write(machine_paths.vmmon_pid_path(), format!("{old_pid}\n"))
-            .expect("write old pid file");
-        std::fs::write(machine_paths.vmmon_socket_path(), b"replacement sentinel")
-            .expect("write runtime sentinel");
-        runtime
-            .set_machine_state(
-                machine.id,
-                MachineRuntimeState::Running,
-                Some(old_pid),
-                old_started_at,
-                Some("run-old".to_string()),
-                None,
+        for force in [false, true] {
+            let temp = tempfile::tempdir().expect("create temp dir");
+            let runtime = Runtime::open(
+                LocalPaths::new(temp.path().join("silo")),
+                RuntimeNetworkingConfig::default(),
             )
             .await
-            .expect("set old generation");
+            .expect("create runtime");
+            let machine = create_pending_sample(&runtime, "devbox")
+                .await
+                .expect("create pending machine")
+                .commit(&runtime)
+                .await
+                .expect("commit machine");
+            let mut old_monitor = ChildGuard::sleep_ignoring_sigint();
+            let old_pid = old_monitor.id() as i32;
+            let old_started_at = old_monitor.started_at();
+            create_machine_runtime_dirs(&runtime, machine.id);
+            let machine_paths = runtime.machine_paths(machine.id);
+            std::fs::write(machine_paths.vmmon_pid_path(), format!("{old_pid}\n"))
+                .expect("write old pid file");
+            std::fs::write(machine_paths.vmmon_socket_path(), b"replacement sentinel")
+                .expect("write runtime sentinel");
+            runtime
+                .set_machine_state(
+                    machine.id,
+                    MachineRuntimeState::Running,
+                    Some(old_pid),
+                    old_started_at,
+                    Some("run-old".to_string()),
+                    None,
+                )
+                .await
+                .expect("set old generation");
 
-        let old_machine = machine_handle(&runtime, machine.id);
-        let old_run = MachineRunId::from_raw("run-old".to_string());
-        let stop_task = tokio::spawn(async move { old_machine.stop_run(old_run).await });
-        wait_for_machine_state(&runtime, machine.id, MachineRuntimeState::Stopping).await;
+            let old_machine = machine_handle(&runtime, machine.id);
+            let old_run = MachineRunId::from_raw("run-old".to_string());
+            let stop_task = tokio::spawn(async move {
+                let options = if force {
+                    crate::MachineStopOptions::new()
+                        .timeout(Duration::from_millis(500))
+                        .force_after_timeout(Duration::from_secs(2))
+                } else {
+                    crate::MachineStopOptions::new()
+                };
+                old_machine.stop_run_with(old_run, options).await
+            });
+            wait_for_machine_state(&runtime, machine.id, MachineRuntimeState::Stopping).await;
 
-        let replacement_monitor = ChildGuard::sleep_ignoring_sigint();
-        let replacement_pid = replacement_monitor.id() as i32;
-        let replacement_started_at = replacement_monitor.started_at();
-        runtime
-            .set_machine_state(
-                machine.id,
-                MachineRuntimeState::Running,
-                Some(replacement_pid),
-                replacement_started_at,
-                Some("run-new".to_string()),
-                None,
-            )
-            .await
-            .expect("install replacement generation");
+            let replacement_monitor = ChildGuard::sleep_ignoring_sigint();
+            let replacement_pid = replacement_monitor.id() as i32;
+            let replacement_started_at = replacement_monitor.started_at();
+            runtime
+                .set_machine_state(
+                    machine.id,
+                    MachineRuntimeState::Running,
+                    Some(replacement_pid),
+                    replacement_started_at,
+                    Some("run-new".to_string()),
+                    None,
+                )
+                .await
+                .expect("install replacement generation");
 
-        old_monitor.kill();
-        let error = stop_task
-            .await
-            .expect("join old stop")
-            .expect_err("old stop must not clean up the replacement run");
-        assert!(matches!(
-            error,
-            LibVmError::MachineStaleGeneration {
-                requested,
-                current: Some(current),
-                ..
-            } if requested.as_str() == "run-old" && current.as_str() == "run-new"
-        ));
-        let state = runtime
-            .machine_state(machine.id)
-            .await
-            .expect("read replacement state");
+            if !force {
+                old_monitor.kill();
+            }
+            let error = stop_task
+                .await
+                .expect("join old stop")
+                .expect_err("old stop must not clean up the replacement run");
+            assert!(matches!(
+                error,
+                LibVmError::MachineStaleGeneration {
+                    requested,
+                    current: Some(current),
+                    ..
+                } if requested.as_str() == "run-old" && current.as_str() == "run-new"
+            ));
+            let state = runtime
+                .machine_state(machine.id)
+                .await
+                .expect("read replacement state");
 
-        let wait_error = machine_handle(&runtime, machine.id)
-            .wait_for_run(MachineRunId::from_raw("run-old".to_string()))
-            .await
-            .expect_err("old wait must not observe the replacement run");
-        assert!(matches!(
-            wait_error,
-            LibVmError::MachineStaleGeneration { .. }
-        ));
-        let kill_error = machine_handle(&runtime, machine.id)
-            .kill_run(MachineRunId::from_raw("run-old".to_string()))
-            .await
-            .expect_err("old kill must not signal the replacement run");
-        assert!(matches!(
-            kill_error,
-            LibVmError::MachineStaleGeneration { .. }
-        ));
+            let wait_error = machine_handle(&runtime, machine.id)
+                .wait_for_run(MachineRunId::from_raw("run-old".to_string()))
+                .await
+                .expect_err("old wait must not observe the replacement run");
+            assert!(matches!(
+                wait_error,
+                LibVmError::MachineStaleGeneration { .. }
+            ));
+            let kill_error = machine_handle(&runtime, machine.id)
+                .kill_run(MachineRunId::from_raw("run-old".to_string()))
+                .await
+                .expect_err("old kill must not signal the replacement run");
+            assert!(matches!(
+                kill_error,
+                LibVmError::MachineStaleGeneration { .. }
+            ));
 
-        assert_eq!(state.status, MachineRuntimeState::Running);
-        assert_eq!(state.run_id.as_deref(), Some("run-new"));
-        assert!(ProcessIdentity::for_pid(replacement_pid)
-            .expect("read replacement monitor")
-            .expect("replacement monitor should exist")
-            .is_alive()
-            .expect("check replacement monitor"));
-        assert!(machine_paths.vmmon_socket_path().exists());
+            assert_eq!(state.status, MachineRuntimeState::Running);
+            assert_eq!(state.run_id.as_deref(), Some("run-new"));
+            assert!(ProcessIdentity::for_pid(replacement_pid)
+                .expect("read replacement monitor")
+                .expect("replacement monitor should exist")
+                .is_alive()
+                .expect("check replacement monitor"));
+            assert!(machine_paths.vmmon_socket_path().exists());
+        }
     }
 
     #[tokio::test]

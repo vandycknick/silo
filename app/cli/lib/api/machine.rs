@@ -46,7 +46,29 @@ impl AppMachine {
         &self,
         run_id: MachineRunId,
     ) -> Result<MachineData, libvm::LibVmError> {
-        self.inner.stop_run(run_id).await
+        // vmmon can spend 45s stopping the backend, then drain its services.
+        // Give that sequence room to finish before escalating a stuck monitor.
+        self.inner
+            .stop_run_with(
+                run_id,
+                libvm::MachineStopOptions::new()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .force_after_timeout(std::time::Duration::from_secs(5)),
+            )
+            .await
+    }
+
+    pub(crate) async fn force_stop_run(
+        &self,
+        run_id: MachineRunId,
+    ) -> Result<MachineData, libvm::LibVmError> {
+        self.inner
+            .kill_run_with(
+                run_id,
+                libvm::MachineKillOptions::new().timeout(std::time::Duration::from_secs(5)),
+            )
+            .await
+            .map(|exit| exit.machine)
     }
 
     pub(crate) async fn exec_with_input(

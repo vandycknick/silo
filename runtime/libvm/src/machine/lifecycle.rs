@@ -379,9 +379,36 @@ impl Machine {
             }
         };
 
-        self.wait_for_target_exit(wait_target, options.wait_options(), expected_run_id)
-            .await
-            .map(|exit| exit.machine)
+        // Capture the generation before releasing control to the wait. Never
+        // escalate against whichever run happens to be current after a timeout.
+        let run_id = wait_target
+            .generation
+            .run_id
+            .clone()
+            .map(MachineRunId::from_raw);
+        let result = self
+            .wait_for_target_exit(wait_target, options.wait_options(), expected_run_id)
+            .await;
+        match (result, options.force_timeout(), run_id) {
+            (Err(LibVmError::Io(error)), Some(timeout), Some(run_id))
+                if error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                match self
+                    .kill_run_with(run_id.clone(), MachineKillOptions::new().timeout(timeout))
+                    .await
+                {
+                    Ok(exit) => Ok(exit.machine),
+                    // The original monitor may have exited between the timed
+                    // wait and the generation-checked kill. Reconcile its exit.
+                    Err(LibVmError::MachineNotRunning { .. }) => self
+                        .wait_for_run_with(run_id, MachineWaitOptions::new().timeout(timeout))
+                        .await
+                        .map(|exit| exit.machine),
+                    Err(error) => Err(error),
+                }
+            }
+            (result, _, _) => result.map(|exit| exit.machine),
+        }
     }
 
     /// Waits for the current machine run to exit without sending a stop signal.

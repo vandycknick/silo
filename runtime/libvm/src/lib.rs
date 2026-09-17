@@ -23,6 +23,7 @@ mod constants;
 mod error;
 mod guest_agent;
 pub mod host;
+pub mod host_input;
 mod image;
 mod initramfs_overlay;
 mod lock_manager;

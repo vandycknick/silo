@@ -82,10 +82,11 @@ impl MachineWaitOptions {
     }
 }
 
-/// Options for gracefully stopping a machine.
+/// Options for stopping a machine, optionally escalating after a graceful timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MachineStopOptions {
     wait: MachineWaitOptions,
+    force_timeout: Option<Duration>,
 }
 
 impl MachineStopOptions {
@@ -98,6 +99,17 @@ impl MachineStopOptions {
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.wait = self.wait.timeout(timeout);
         self
+    }
+
+    /// If the graceful wait expires, kill the same machine run and wait up to
+    /// `timeout` for its monitor to exit. Other stop errors are not suppressed.
+    pub fn force_after_timeout(mut self, timeout: Duration) -> Self {
+        self.force_timeout = Some(timeout);
+        self
+    }
+
+    pub(crate) fn force_timeout(self) -> Option<Duration> {
+        self.force_timeout
     }
 
     pub(crate) fn wait_options(self) -> MachineWaitOptions {

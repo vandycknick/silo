@@ -5,7 +5,7 @@ use libvm::{
     ExecutionControl, ExecutionEvent, ExecutionOptionsBuilder, ExecutionResult, ExecutionSession,
     MachineData, ProcessConfig, SshExitStatus,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::api::machine::AppMachine;
@@ -118,8 +118,7 @@ pub(crate) async fn run_process(
 async fn stream_events(session: &mut ExecutionSession) -> eyre::Result<ExecutionResult> {
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
-    let mut host_stdin = tokio::io::stdin();
-    let mut input = [0_u8; 8192];
+    let mut host_stdin = libvm::host_input::HostInput::stdin().context("open host stdin")?;
     let control = session.control();
     let mut stdin: Option<libvm::ExecutionStdin> = None;
     let mut stdin_closed = false;
@@ -129,15 +128,15 @@ async fn stream_events(session: &mut ExecutionSession) -> eyre::Result<Execution
     loop {
         let event = tokio::select! {
             event = session.recv() => event?,
-            read = host_stdin.read(&mut input), if started && !launch_cancelled && !stdin_closed => {
-                let read = read.context("read host stdin")?;
-                if read == 0 {
+            read = host_stdin.read(), if started && !launch_cancelled && !stdin_closed => {
+                let input = read.context("read host stdin")?;
+                if input.is_empty() {
                     stdin_closed = true;
                     if let Some(stdin) = stdin.as_ref() {
                         stdin.close().await.context("close guest stdin")?;
                     }
                 } else if let Some(stdin) = stdin.as_ref() {
-                    stdin.write(input[..read].to_vec()).await.context("write guest stdin")?;
+                    stdin.write(input).await.context("write guest stdin")?;
                 }
                 continue;
             }
