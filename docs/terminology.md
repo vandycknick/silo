@@ -307,28 +307,23 @@ The guest is the operating system running inside the VM.
 
 ## Memory Reclaim
 
-Two mechanisms return guest memory to the host. They run in different places
-and use different vocabularies; [Memory Reclaim](architecture/memory-reclaim.md)
-covers both in depth.
+Four components have separate responsibilities; see
+[Memory Reclaim](architecture/memory-reclaim.md).
 
-### Host Memory Reclaim
+- **FreePageReporter:** guest-kernel free-page reporting through the balloon's
+  negotiated reporting queue.
+- **HostMemoryReclaimer:** handles reports using HV unmap, per-native-page
+  `MADV_FREE`, and immediate HV map on macOS. Qualification checks page state
+  and safe reuse, not merely a lower footprint.
+- **HostMemoryRemapper:** independently maintains compatible host mappings with
+  same-address, content-preserving Mach remapping. Periodic at 30 seconds, with
+  report-driven preparation throttled to 250 ms.
+- **GuestCacheReclaimer:** the managed agent's capability-detected idle cache
+  policy, using bounded cgroup v2 `memory.reclaim` without a global cache-drop
+  fallback. No user configuration is required or exposed.
 
-Setting: `host-memory-reclaim`. The guest kernel's **free page reporting**
-(virtio-balloon `VIRTIO_BALLOON_F_REPORTING`) tells the VMM which 2 MiB blocks
-are free, and libkrun **releases** them to the host: `madvise(MADV_DONTNEED)`
-on Linux, an unmap, `MADV_FREE_REUSABLE`, remap cycle on macOS. A startup
-**qualification probe** checks that the release really lowers the host's
-accounting before the policy becomes **effective**. This is the only step
-that lowers the host footprint.
-
-### Guest Memory Reclaim
-
-Setting: `memory-reclaim`. A thread in the guest agent that asks the guest
-kernel to give up page cache early through cgroup v2 **proactive reclaim**
-(`memory.reclaim`) once the guest has been idle, then compacts free memory.
-WSL2 calls the same idea `autoMemoryReclaim` and also runs it in the guest.
-It frees memory inside the guest; free page reporting then carries it to the
-host. The daemon only configures it, at launch, and reports its runs.
+Guest-free memory, advice counters, host footprint, compression, and physical
+discard must not be treated as interchangeable measurements.
 
 ### Not Ballooning
 

@@ -269,9 +269,9 @@ mod tests {
             backend: crate::system::config::SystemBackend::Vz,
             rosetta: false,
             rosetta_explicit: false,
-            memory_reclaim: false,
+            memory_reclaim: (),
             legacy_host_reclaim: (),
-            memory_reclaim_after_secs: 120,
+            memory_reclaim_after_secs: (),
             identity: "test".to_string(),
         }
     }

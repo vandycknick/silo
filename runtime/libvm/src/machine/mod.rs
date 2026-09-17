@@ -24,10 +24,7 @@ pub use forward::{
     MachineForwardErrorDetail, MachineForwardScope, MachineForwardSession, MachineForwardState,
     MachineForwardStatus,
 };
-pub use guest::{
-    GuestBuilder, MachineAgent, MachineGuestConfig, MachineMemoryReclaimConfig,
-    MachineMemoryReclaimMode, MachineUserConfig,
-};
+pub use guest::{GuestBuilder, MachineAgent, MachineGuestConfig, MachineUserConfig};
 pub use handle::Machine;
 pub use inspect::{
     MachineBootMode, MachineBootReport, MachineData, MachineProvisionFailurePolicy,

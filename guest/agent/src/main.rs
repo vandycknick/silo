@@ -165,7 +165,7 @@ async fn run_agent(
     tracing::info!(boot_mode = ?boot_mode, "agent starting");
 
     let boot_report = boot_mode.report();
-    let memory_reclaim = memory_reclaim::start(&agent_config.memory_reclaim);
+    let memory_reclaim = memory_reclaim::start();
     let agent_server = AgentServer::start(
         from_kernel_cmdline(),
         boot_report.clone(),

@@ -27,61 +27,10 @@ pub struct AgentConfig {
     pub provision: ProvisionConfig,
     #[serde(default)]
     pub ssh: AgentSshConfig,
-    #[serde(default)]
-    pub memory_reclaim: MemoryReclaimConfig,
-}
-
-/// How the agent gives idle page cache back to the guest kernel's free lists,
-/// where the balloon's free-page reporting can hand it to the host.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryReclaimMode {
-    /// Never reclaim.
-    #[default]
-    Off,
-    /// Reclaim cold file cache in bounded steps through cgroup v2 `memory.reclaim`,
-    /// falling back to `drop_caches` on kernels without it.
-    Gradual,
-    /// Drop the whole page cache once per idle period.
-    DropCache,
-}
-
-/// Guest-side memory reclaim policy, modelled on WSL2's `autoMemoryReclaim`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct MemoryReclaimConfig {
-    #[serde(default)]
-    pub mode: MemoryReclaimMode,
-    /// How long CPU has to stay idle before the first reclaim of an idle period.
-    #[serde(default = "default_memory_reclaim_idle_after_secs")]
-    pub idle_after_secs: u64,
-}
-
-impl Default for MemoryReclaimConfig {
-    fn default() -> Self {
-        Self {
-            mode: MemoryReclaimMode::Off,
-            idle_after_secs: default_memory_reclaim_idle_after_secs(),
-        }
-    }
-}
-
-/// Minimum idle window: one reclaim poll interval.
-pub const MIN_MEMORY_RECLAIM_IDLE_AFTER_SECS: u64 = 10;
-
-fn default_memory_reclaim_idle_after_secs() -> u64 {
-    120
 }
 
 impl AgentConfig {
     pub fn validate(&self) -> Result<(), AgentConfigError> {
-        if self.memory_reclaim.mode != MemoryReclaimMode::Off
-            && self.memory_reclaim.idle_after_secs < MIN_MEMORY_RECLAIM_IDLE_AFTER_SECS
-        {
-            return Err(AgentConfigError::new(format!(
-                "memory_reclaim.idle_after_secs must be at least {MIN_MEMORY_RECLAIM_IDLE_AFTER_SECS}"
-            )));
-        }
         validate_unique_nonempty(
             self.ssh
                 .authorized_users
@@ -529,11 +478,23 @@ pub enum UserdataRunPolicy {
 mod tests {
     use crate::{
         AgentConfig, AgentRosettaConfig, AgentSshAuthorizedUser, AgentSshConfig,
-        CertificateAuthorityConfig, MemoryReclaimConfig, MemoryReclaimMode, MountConfig,
-        NetworkConfig, NetworkDnsConfig, NetworkInterfaceConfig, NetworkIpv4Config,
-        ProvisionConfig, ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType,
-        UserdataRunPolicy,
+        CertificateAuthorityConfig, MountConfig, NetworkConfig, NetworkDnsConfig,
+        NetworkInterfaceConfig, NetworkIpv4Config, ProvisionConfig, ResizeRootfsConfig, UserConfig,
+        UserdataConfig, UserdataContentType, UserdataRunPolicy,
     };
+
+    #[test]
+    fn guest_cache_reclaim_is_not_a_config_option() {
+        let config: AgentConfig = serde_json::from_str("{}").expect("defaults");
+        config.validate().expect("valid defaults");
+        assert!(serde_json::to_value(config)
+            .expect("encode")
+            .get("memory_reclaim")
+            .is_none());
+        assert!(
+            serde_json::from_str::<AgentConfig>(r#"{"memory_reclaim":{"mode":"off"}}"#).is_err()
+        );
+    }
 
     #[test]
     fn provision_config_defaults_are_safe() {
@@ -744,10 +705,6 @@ provision:
                     authorized_keys: vec!["ssh-ed25519 AAAAC3NzaSilo".to_string()],
                     allow_without_auth: false,
                 }],
-            },
-            memory_reclaim: MemoryReclaimConfig {
-                mode: MemoryReclaimMode::Gradual,
-                idle_after_secs: 90,
             },
         };
 

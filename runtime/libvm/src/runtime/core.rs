@@ -1137,7 +1137,6 @@ impl Runtime {
                     networking: &self.networking,
                     resize_rootfs,
                     user: config.guest.user.as_ref(),
-                    memory_reclaim: &config.guest.memory_reclaim,
                 })?;
                 agent_config.validate().context("validate agent config")?;
                 let serialized =

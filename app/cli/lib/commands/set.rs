@@ -232,6 +232,13 @@ mod tests {
     use crate::commands::set::ParsedSet;
 
     #[test]
+    fn reclaim_is_not_a_user_setting() {
+        for key in ["memory-reclaim", "host-memory-reclaim", "balloon"] {
+            assert!(ParsedSet::parse(&[format!("{key}=off")]).is_err());
+        }
+    }
+
+    #[test]
     fn parses_default_machine_settings() {
         let parsed = ParsedSet::parse(&["cpus=4".to_string(), "memory=8G".to_string()])
             .expect("parse set args");

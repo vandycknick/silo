@@ -1,41 +1,25 @@
-//! Guest memory reclaim: gives idle page cache back to the kernel's free lists,
-//! where the balloon's free-page reporting hands it to the host.
-//!
-//! Modelled on WSL2's `autoMemoryReclaim`. A background thread at `SCHED_IDLE`
-//! samples `/proc/stat` every ten seconds. Once the guest has been idle for the
-//! configured window it asks the kernel for cold file cache, one bounded step
-//! per tick through cgroup v2 `memory.reclaim`, then compacts free memory so
-//! the freed pages form blocks large enough to report. The thread only ever
-//! reclaims what the kernel would reclaim under pressure anyway; it never
-//! touches memory a workload is using.
+//! GuestCacheReclaimer automatically reclaims cold file cache when a negotiated
+//! FreePageReporter and writable cgroup v2 reclaim interfaces are available.
 
 use std::fs;
 use std::io::{self, Write as _};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agent_spec::{MemoryReclaimConfig, MemoryReclaimMode};
 use prost_types::Timestamp;
 use protocol::v1::MemoryReclaimReport;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// Non-idle CPU share at or below which an interval counts as idle: 0.5%.
+const IDLE_WINDOW: usize = 12;
 const BUSY_THRESHOLD_PER_MILLE: u64 = 5;
-/// Reclaimable cache below this floor is always retained as a working set.
+const MIB: u64 = 1024 * 1024;
 const FLOOR_BYTES: u64 = 128 * MIB;
-/// Bounds on one reclaim step: RAM/32 clamped into this range.
 const MIN_STEP_BYTES: u64 = 256 * MIB;
 const MAX_STEP_BYTES: u64 = 1024 * MIB;
-const MIB: u64 = 1024 * 1024;
-
-const MEMINFO: &str = "/proc/meminfo";
-const STAT: &str = "/proc/stat";
-const RECLAIM: &str = "/sys/fs/cgroup/memory.reclaim";
-const DROP_CACHES: &str = "/proc/sys/vm/drop_caches";
 const COMPACT_MEMORY: &str = "/proc/sys/vm/compact_memory";
 
-/// Shared view of the last reclaim run, read by the metrics collector.
 #[derive(Clone, Default)]
 pub(crate) struct MemoryReclaimStatus {
     last: Arc<Mutex<Option<MemoryReclaimReport>>>,
@@ -53,119 +37,267 @@ impl MemoryReclaimStatus {
     }
 }
 
-/// Starts the reclaim thread when the mode is not `Off`. Returns the status
-/// handle either way so metrics can always ask for the last run.
-pub(crate) fn start(config: &MemoryReclaimConfig) -> MemoryReclaimStatus {
+pub(crate) fn start() -> MemoryReclaimStatus {
     let status = MemoryReclaimStatus::default();
-    if config.mode == MemoryReclaimMode::Off {
-        return status;
-    }
     let thread_status = status.clone();
-    let mode = config.mode;
-    let idle_after_secs = config.idle_after_secs;
-    let thread_config = config.clone();
-    let spawned = thread::Builder::new()
-        .name("memory-reclaim".to_string())
+    if let Err(error) = thread::Builder::new()
+        .name("guest-cache-reclaimer".to_string())
         .spawn(move || {
             lower_to_idle_priority();
-            run(&thread_config, &thread_status, &ProcFs);
-        });
-    match spawned {
-        Ok(_) => tracing::info!(?mode, idle_after_secs, "memory reclaim thread started"),
-        Err(error) => tracing::warn!(%error, "failed to start memory reclaim thread"),
+            GuestCacheReclaimer::new().run(&thread_status);
+        })
+    {
+        tracing::warn!(%error, "failed to start GuestCacheReclaimer");
     }
     status
 }
 
-/// Runs reclaim at idle scheduling priority so it never competes with workloads.
-///
-/// Uses the pthread interface: musl's `sched_setscheduler` is a stub that
-/// returns `ENOSYS`, while `pthread_setschedparam` issues the real syscall.
 fn lower_to_idle_priority() {
-    // SAFETY: sched_param is plain old data; zeroed is a valid value for every
-    // field on every libc, and SCHED_IDLE ignores the priority anyway.
-    let mut parameter: libc::sched_param = unsafe { std::mem::zeroed() };
-    parameter.sched_priority = 0;
-    // SAFETY: applies to the calling thread with an initialized parameter block.
-    let status =
+    // SAFETY: sched_param contains only integer fields (including nested timespecs).
+    // Zero initializes musl's extra fields and sets the priority required by SCHED_IDLE.
+    let parameter: libc::sched_param = unsafe { std::mem::zeroed() };
+    // nix has no pthread scheduling wrapper. musl's sched_setscheduler is a stub;
+    // pthread_setschedparam issues the syscall for this thread instead.
+    // SAFETY: applies SCHED_IDLE to the calling thread with a valid parameter.
+    let result =
         unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_IDLE, &parameter) };
-    if status != 0 {
-        tracing::warn!(
-            error = %io::Error::from_raw_os_error(status),
-            "could not switch the memory reclaim thread to SCHED_IDLE"
+    if result != 0 {
+        tracing::warn!(error = %io::Error::from_raw_os_error(result), "could not lower GuestCacheReclaimer priority");
+    }
+}
+
+fn write_control(path: &Path, value: &str) -> io::Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .write_all(value.as_bytes())
+}
+
+fn parse_hex(value: &str) -> Option<u32> {
+    u32::from_str_radix(value.trim().strip_prefix("0x")?, 16).ok()
+}
+
+fn reporting_ready(device: &str, status: &str, features: &str) -> bool {
+    // Linux virtio sysfs prints negotiated bits in ascending bit-number order.
+    let bits = features.trim().as_bytes();
+    parse_hex(device) == Some(5)
+        && parse_hex(status).is_some_and(|status| status & 0xf == 0xf && status & 0xc0 == 0)
+        && bits.len() >= 64
+        && bits.iter().all(|bit| matches!(bit, b'0' | b'1'))
+        && bits.get(5) == Some(&b'1')
+}
+
+fn free_page_reporter_available(devices: &Path) -> bool {
+    let Ok(devices) = fs::read_dir(devices) else {
+        return false;
+    };
+    devices.flatten().any(|entry| {
+        let path = entry.path();
+        let driver = fs::read_link(path.join("driver")).ok();
+        if driver.as_deref().and_then(Path::file_name)
+            != Some(std::ffi::OsStr::new("virtio_balloon"))
+        {
+            return false;
+        }
+        match (
+            fs::read_to_string(path.join("device")),
+            fs::read_to_string(path.join("status")),
+            fs::read_to_string(path.join("features")),
+        ) {
+            (Ok(device), Ok(status), Ok(features)) => reporting_ready(&device, &status, &features),
+            _ => false,
+        }
+    })
+}
+
+fn reclaim_targets(root: &Path) -> Vec<PathBuf> {
+    if !root.join("cgroup.controllers").exists() {
+        return Vec::new();
+    }
+    let writable = |path: &Path| {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path.join("memory.reclaim"))
+            .is_ok()
+    };
+    if writable(root) {
+        return vec![root.to_path_buf()];
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut targets: Vec<_> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .filter(|path| writable(path))
+        .collect();
+    // Top-level memory.stat/reclaim include descendants, so never reclaim both
+    // a parent and its children in one policy pass.
+    targets.sort();
+    targets
+}
+
+fn cgroup_cache_bytes(stat: &str) -> Option<u64> {
+    let value = |key| {
+        stat.lines().find_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            (name == key).then(|| value.parse::<u64>().ok()).flatten()
+        })
+    };
+    value("file")?
+        .checked_sub(value("shmem")?)?
+        .checked_add(value("slab_reclaimable")?)
+}
+
+fn reclaim_budget(cache: u64, total_ram: u64) -> u64 {
+    cache
+        .saturating_sub(FLOOR_BYTES)
+        .min(reclaim_step_bytes(total_ram))
+}
+
+fn cpu_sample() -> Option<CpuSample> {
+    parse_cpu_sample(&fs::read_to_string("/proc/stat").ok()?)
+}
+
+struct GuestCacheReclaimer {
+    tracker: IdleTracker,
+    previous: Option<CpuSample>,
+    next_target: usize,
+    runs: u64,
+}
+
+impl GuestCacheReclaimer {
+    fn new() -> Self {
+        Self {
+            tracker: IdleTracker::new(IDLE_WINDOW),
+            previous: None,
+            next_target: 0,
+            runs: 0,
+        }
+    }
+
+    fn run(mut self, status: &MemoryReclaimStatus) {
+        let mut last_availability = None;
+        loop {
+            thread::sleep(POLL_INTERVAL);
+            let reporter = free_page_reporter_available(Path::new("/sys/bus/virtio/devices"));
+            let targets = if reporter {
+                reclaim_targets(Path::new("/sys/fs/cgroup"))
+            } else {
+                Vec::new()
+            };
+            let availability = (reporter, !targets.is_empty());
+            if last_availability != Some(availability) {
+                tracing::info!(
+                    reporter,
+                    reclaim_interface = availability.1,
+                    "GuestCacheReclaimer capability detection"
+                );
+                last_availability = Some(availability);
+            }
+            if !availability.1 {
+                self.previous = None;
+                self.tracker.reset();
+                continue;
+            }
+            let Some(sample) = cpu_sample() else {
+                self.previous = None;
+                self.tracker.reset();
+                continue;
+            };
+            let Some(previous) = self.previous.replace(sample) else {
+                continue;
+            };
+            let (Some(busy), Some(idle)) = (
+                sample.busy.checked_sub(previous.busy),
+                sample.idle.checked_sub(previous.idle),
+            ) else {
+                self.tracker.reset();
+                continue;
+            };
+            let idle = self.tracker.add(busy, busy.saturating_add(idle));
+            if !idle.window_idle || !idle.interval_idle {
+                continue;
+            }
+            let index = self.next_target % targets.len();
+            self.next_target = index + 1;
+            if let Some(target) = targets.get(index) {
+                self.reclaim(target, status);
+            }
+            // Do not count this worker's CPU time as workload activity.
+            self.previous = cpu_sample();
+            if self.previous.is_none() {
+                self.tracker.reset()
+            }
+        }
+    }
+
+    fn reclaim(&mut self, target: &Path, status: &MemoryReclaimStatus) {
+        let Ok(meminfo) = fs::read_to_string("/proc/meminfo") else {
+            return;
+        };
+        let Some(total) = meminfo_value(&meminfo, "MemTotal:") else {
+            return;
+        };
+        let Some(cached_before) = meminfo_value(&meminfo, "Cached:") else {
+            return;
+        };
+        let Some(cache) = fs::read_to_string(target.join("memory.stat"))
+            .ok()
+            .and_then(|text| cgroup_cache_bytes(&text))
+        else {
+            return;
+        };
+        let requested = reclaim_budget(cache, total);
+        if requested == 0 {
+            return;
+        }
+        let result = write_control(
+            &target.join("memory.reclaim"),
+            &format!("{requested} swappiness=0"),
+        );
+        let outcome = match result {
+            Ok(()) => "reclaimed",
+            Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => "partial",
+            Err(error) => {
+                tracing::warn!(%error, cgroup = %target.display(), "GuestCacheReclaimer unavailable or failed; no global cache-drop fallback");
+                self.tracker.reset();
+                "failed"
+            }
+        };
+        let compacted =
+            outcome != "failed" && write_control(Path::new(COMPACT_MEMORY), "1").is_ok();
+        let cached_after = fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|text| meminfo_value(&text, "Cached:"))
+            .unwrap_or(cached_before);
+        self.runs = self.runs.saturating_add(1);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        status.record(MemoryReclaimReport {
+            finished_at: Some(Timestamp {
+                seconds: i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
+                nanos: i32::try_from(now.subsec_nanos()).unwrap_or(0),
+            }),
+            mode: Some("gradual".to_string()),
+            outcome: Some(outcome.to_string()),
+            requested_bytes: Some(requested),
+            cached_before_bytes: Some(cached_before),
+            cached_after_bytes: Some(cached_after),
+            compacted: Some(compacted),
+            runs: Some(self.runs),
+        });
+        tracing::info!(
+            outcome,
+            requested_bytes = requested,
+            cached_before_bytes = cached_before,
+            cached_after_bytes = cached_after,
+            compacted,
+            "GuestCacheReclaimer run"
         );
     }
-}
-
-/// The kernel interfaces the loop touches, abstracted so the policy is testable.
-trait System {
-    fn stat(&self) -> Option<String>;
-    fn meminfo(&self) -> Option<String>;
-    fn total_ram_bytes(&self) -> u64;
-    fn reclaim_available(&self) -> bool;
-    fn request_reclaim(&self, bytes: u64) -> io::Result<()>;
-    fn drop_caches(&self) -> io::Result<()>;
-    fn compact(&self) -> io::Result<()>;
-    fn sleep(&self, duration: Duration);
-    fn now(&self) -> Timestamp;
-}
-
-struct ProcFs;
-
-impl System for ProcFs {
-    fn stat(&self) -> Option<String> {
-        fs::read_to_string(STAT).ok()
-    }
-
-    fn meminfo(&self) -> Option<String> {
-        fs::read_to_string(MEMINFO).ok()
-    }
-
-    fn total_ram_bytes(&self) -> u64 {
-        self.meminfo()
-            .and_then(|text| meminfo_value(&text, "MemTotal:"))
-            .unwrap_or(0)
-    }
-
-    fn reclaim_available(&self) -> bool {
-        fs::OpenOptions::new().write(true).open(RECLAIM).is_ok()
-    }
-
-    fn request_reclaim(&self, bytes: u64) -> io::Result<()> {
-        // EAGAIN means the kernel reclaimed some but not all of the request;
-        // that is progress, not failure.
-        match write_control(RECLAIM, &format!("{bytes} swappiness=0")) {
-            Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => Ok(()),
-            result => result,
-        }
-    }
-
-    fn drop_caches(&self) -> io::Result<()> {
-        write_control(DROP_CACHES, "3")
-    }
-
-    fn compact(&self) -> io::Result<()> {
-        write_control(COMPACT_MEMORY, "1")
-    }
-
-    fn sleep(&self, duration: Duration) {
-        thread::sleep(duration);
-    }
-
-    fn now(&self) -> Timestamp {
-        let duration = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        Timestamp {
-            seconds: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
-            nanos: duration.subsec_nanos() as i32,
-        }
-    }
-}
-
-fn write_control(path: &str, value: &str) -> io::Result<()> {
-    let mut file = fs::OpenOptions::new().write(true).open(path)?;
-    file.write_all(value.as_bytes())
 }
 
 /// Cumulative CPU jiffies split into busy and idle, from the aggregate `cpu` line.
@@ -188,13 +320,14 @@ fn parse_cpu_sample(stat: &str) -> Option<CpuSample> {
         return None;
     }
     // user nice system idle iowait irq softirq steal ...; iowait counts as idle.
-    let idle = fields[3] + fields.get(4).copied().unwrap_or(0);
+    let idle = fields[3].checked_add(fields[4])?;
+    // guest/guest_nice are already included in user/nice.
     let busy = fields
         .iter()
+        .take(8)
         .enumerate()
         .filter(|(index, _)| !matches!(index, 3 | 4))
-        .map(|(_, value)| *value)
-        .sum();
+        .try_fold(0_u64, |sum, (_, value)| sum.checked_add(*value))?;
     Some(CpuSample { busy, idle })
 }
 
@@ -207,16 +340,6 @@ fn meminfo_value(meminfo: &str, key: &str) -> Option<u64> {
         .parse::<u64>()
         .ok()?
         .checked_mul(1024)
-}
-
-/// File-backed page cache plus reclaimable slab: the memory the kernel can
-/// return without swap. Anonymous memory and shmem are excluded.
-fn reclaimable_cache_bytes(meminfo: &str) -> Option<u64> {
-    Some(
-        meminfo_value(meminfo, "Active(file):")?
-            + meminfo_value(meminfo, "Inactive(file):")?
-            + meminfo_value(meminfo, "SReclaimable:")?,
-    )
 }
 
 fn reclaim_step_bytes(total_ram: u64) -> u64 {
@@ -264,143 +387,49 @@ impl IdleTracker {
 }
 
 fn is_idle(busy: u64, total: u64) -> bool {
-    total == 0 || busy * 1000 <= total * BUSY_THRESHOLD_PER_MILLE
-}
-
-fn run(config: &MemoryReclaimConfig, status: &MemoryReclaimStatus, system: &dyn System) {
-    let window = (config.idle_after_secs / POLL_INTERVAL.as_secs()).max(1) as usize;
-    let mut use_reclaim = config.mode == MemoryReclaimMode::Gradual;
-    if use_reclaim && !system.reclaim_available() {
-        tracing::warn!("memory.reclaim is unavailable; falling back to drop_caches");
-        use_reclaim = false;
-    }
-    let step = reclaim_step_bytes(system.total_ram_bytes());
-    let mut tracker = IdleTracker::new(window);
-    let mut previous: Option<CpuSample> = None;
-    let mut dropped_this_idle_period = false;
-    let mut compacted_this_idle_period = false;
-    let mut runs: u64 = 0;
-    loop {
-        system.sleep(POLL_INTERVAL);
-        let Some(sample) = system.stat().and_then(|text| parse_cpu_sample(&text)) else {
-            continue;
-        };
-        let Some(last) = previous.replace(sample) else {
-            continue;
-        };
-        if sample.busy < last.busy || sample.idle < last.idle {
-            tracker.reset();
-            dropped_this_idle_period = false;
-            compacted_this_idle_period = false;
-            continue;
-        }
-        let busy = sample.busy - last.busy;
-        let total = busy + (sample.idle - last.idle);
-        let idle = tracker.add(busy, total);
-        if !idle.window_idle {
-            dropped_this_idle_period = false;
-            compacted_this_idle_period = false;
-            continue;
-        }
-        // A short burst blocks this tick but keeps the idle history.
-        if !idle.interval_idle {
-            continue;
-        }
-
-        let meminfo = system.meminfo().unwrap_or_default();
-        let cached_before = meminfo_value(&meminfo, "Cached:").unwrap_or(0);
-        let mut requested = 0;
-        let mut outcome: Option<&str> = None;
-        let mut mode = "gradual";
-        if use_reclaim {
-            let reclaimable = reclaimable_cache_bytes(&meminfo).unwrap_or(0);
-            if reclaimable > FLOOR_BYTES {
-                requested = (reclaimable - FLOOR_BYTES).min(step);
-                outcome = Some(match system.request_reclaim(requested) {
-                    Ok(()) => "reclaimed",
-                    Err(error) => {
-                        tracing::warn!(%error, bytes = requested, "memory.reclaim write failed");
-                        "failed"
-                    }
-                });
-            }
-        } else if !dropped_this_idle_period {
-            mode = "dropcache";
-            outcome = Some(match system.drop_caches() {
-                Ok(()) => {
-                    dropped_this_idle_period = true;
-                    "reclaimed"
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "drop_caches write failed");
-                    "failed"
-                }
-            });
-        }
-
-        let reclaimed = matches!(outcome, Some("reclaimed"));
-        let mut compacted = false;
-        if reclaimed || !compacted_this_idle_period {
-            compacted = system.compact().is_ok();
-            compacted_this_idle_period |= compacted;
-        }
-        if outcome.is_none() && !compacted {
-            continue;
-        }
-
-        let cached_after = system
-            .meminfo()
-            .and_then(|text| meminfo_value(&text, "Cached:"))
-            .unwrap_or(cached_before);
-        let outcome = outcome.unwrap_or("nothing");
-        let outcome = if outcome == "reclaimed"
-            && use_reclaim
-            && cached_after + requested / 2 > cached_before
-        {
-            // The kernel accepted the request but freed less than half of it.
-            "partial"
-        } else {
-            outcome
-        };
-        runs += 1;
-        status.record(MemoryReclaimReport {
-            finished_at: Some(system.now()),
-            mode: Some(mode.to_string()),
-            outcome: Some(outcome.to_string()),
-            requested_bytes: Some(requested),
-            cached_before_bytes: Some(cached_before),
-            cached_after_bytes: Some(cached_after),
-            compacted: Some(compacted),
-            runs: Some(runs),
-        });
-        tracing::info!(
-            mode,
-            outcome,
-            requested_bytes = requested,
-            cached_before_bytes = cached_before,
-            cached_after_bytes = cached_after,
-            compacted,
-            "memory reclaim run"
-        );
-        // Exclude our own work from the next interval so it does not restart
-        // the idle window.
-        previous = system.stat().and_then(|text| parse_cpu_sample(&text));
-        if previous.is_none() {
-            tracker.reset();
-            dropped_this_idle_period = false;
-            compacted_this_idle_period = false;
-        }
-    }
+    total > 0 && u128::from(busy) * 1000 <= u128::from(total) * u128::from(BUSY_THRESHOLD_PER_MILLE)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::*;
-
+    use crate::memory_reclaim::*;
     const MEMINFO_FIXTURE: &str = "MemTotal:        8388608 kB\nMemFree:         6291456 kB\nCached:          1048576 kB\nActive(file):     524288 kB\nInactive(file):   393216 kB\nShmem:            262144 kB\nSReclaimable:      65536 kB\n";
+
+    #[test]
+    fn reporter_requires_negotiation_and_ready_driver_status() {
+        let bits = format!("000001{}\n", "0".repeat(58));
+        assert!(reporting_ready("0x0005\n", "0x0000000f\n", &bits));
+        for status in ["0x0", "0x03", "0x0b", "0x8f", "0x4f", "invalid"] {
+            assert!(!reporting_ready("0x0005", status, &bits));
+        }
+        assert!(!reporting_ready("0x0003", "0x0f", &bits));
+        assert!(!reporting_ready("0x0005", "0x0f", &"0".repeat(64)));
+        assert!(!reporting_ready("0x0005", "0x0f", "000001"));
+        assert!(!reporting_ready(
+            "0x0005",
+            "0x0f",
+            &format!("{bits}garbage")
+        ));
+    }
+
+    #[test]
+    fn cache_budget_excludes_shared_and_anonymous_memory_and_retains_floor() {
+        let stat = "anon 999999999\nfile 1073741824\nshmem 268435456\nslab_reclaimable 67108864\n";
+        assert_eq!(cgroup_cache_bytes(stat), Some(832 * MIB));
+        assert_eq!(reclaim_budget(832 * MIB, 8 * 1024 * MIB), 256 * MIB);
+        assert_eq!(reclaim_budget(FLOOR_BYTES, 8 * 1024 * MIB), 0);
+        assert_eq!(reclaim_budget(1, 8 * 1024 * MIB), 0);
+        assert_eq!(reclaim_budget(FLOOR_BYTES + 10, 8 * 1024 * MIB), 10);
+        assert_eq!(
+            cgroup_cache_bytes("file 1\nshmem 2\nslab_reclaimable 0\n"),
+            None
+        );
+        assert_eq!(cgroup_cache_bytes("file 1\n"), None);
+        assert_eq!(
+            meminfo_value(MEMINFO_FIXTURE, "MemTotal:"),
+            Some(8 * 1024 * MIB)
+        );
+    }
 
     #[test]
     fn cpu_sample_splits_busy_and_idle_with_iowait_as_idle() {
@@ -411,16 +440,15 @@ mod tests {
         assert_eq!(sample.idle, 5000 + 40);
         assert_eq!(parse_cpu_sample("cpu 1 2 3\n"), None);
         assert_eq!(parse_cpu_sample("intr 5\n"), None);
-    }
-
-    #[test]
-    fn reclaimable_cache_counts_file_pages_and_slab_only() {
         assert_eq!(
-            reclaimable_cache_bytes(MEMINFO_FIXTURE),
-            Some((524288 + 393216 + 65536) * 1024)
+            parse_cpu_sample("cpu 10 20 30 40 50 60 70 80 999 999\n")
+                .expect("sample")
+                .busy,
+            270
         );
-        assert_eq!(meminfo_value(MEMINFO_FIXTURE, "Cached:"), Some(1024 * MIB));
-        assert_eq!(reclaimable_cache_bytes("MemTotal: 1 kB\n"), None);
+        assert_eq!(parse_cpu_sample("cpu 18446744073709551615 1 0 0 0\n"), None);
+        assert!(!is_idle(0, 0));
+        assert!(is_idle(1, u64::MAX));
     }
 
     #[test]
@@ -453,189 +481,5 @@ mod tests {
         assert!(tracker.add(0, 1000).window_idle);
         tracker.reset();
         assert!(!tracker.add(0, 1000).window_idle);
-    }
-
-    /// Fake kernel: scripted CPU samples, a fixed meminfo, and a log of writes.
-    struct Fake {
-        stats: RefCell<Vec<&'static str>>,
-        cached_after: RefCell<Vec<u64>>,
-        reclaim_available: bool,
-        reclaims: RefCell<Vec<u64>>,
-        drops: AtomicUsize,
-        compacts: AtomicUsize,
-        sleeps: AtomicUsize,
-        stop_after_sleeps: usize,
-    }
-
-    impl Fake {
-        fn new(stats: Vec<&'static str>, reclaim_available: bool) -> Self {
-            let stop_after_sleeps = stats.len();
-            Self {
-                stats: RefCell::new(stats),
-                cached_after: RefCell::new(Vec::new()),
-                reclaim_available,
-                reclaims: RefCell::new(Vec::new()),
-                drops: AtomicUsize::new(0),
-                compacts: AtomicUsize::new(0),
-                sleeps: AtomicUsize::new(0),
-                stop_after_sleeps,
-            }
-        }
-    }
-
-    struct StopLoop;
-
-    impl System for Fake {
-        fn stat(&self) -> Option<String> {
-            let mut stats = self.stats.borrow_mut();
-            if stats.is_empty() {
-                return None;
-            }
-            Some(stats.remove(0).to_string())
-        }
-        fn meminfo(&self) -> Option<String> {
-            let mut after = self.cached_after.borrow_mut();
-            if after.is_empty() {
-                return Some(MEMINFO_FIXTURE.to_string());
-            }
-            let cached = after.remove(0) / 1024;
-            Some(MEMINFO_FIXTURE.replace(
-                "Cached:          1048576 kB",
-                &format!("Cached: {cached} kB"),
-            ))
-        }
-        fn total_ram_bytes(&self) -> u64 {
-            8 * 1024 * MIB
-        }
-        fn reclaim_available(&self) -> bool {
-            self.reclaim_available
-        }
-        fn request_reclaim(&self, bytes: u64) -> io::Result<()> {
-            self.reclaims.borrow_mut().push(bytes);
-            Ok(())
-        }
-        fn drop_caches(&self) -> io::Result<()> {
-            self.drops.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-        fn compact(&self) -> io::Result<()> {
-            self.compacts.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-        fn sleep(&self, _: Duration) {
-            if self.sleeps.fetch_add(1, Ordering::SeqCst) >= self.stop_after_sleeps {
-                std::panic::panic_any(StopLoop);
-            }
-        }
-        fn now(&self) -> Timestamp {
-            Timestamp::default()
-        }
-    }
-
-    fn run_until_exhausted(config: &MemoryReclaimConfig, fake: &Fake) -> MemoryReclaimStatus {
-        let status = MemoryReclaimStatus::default();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run(config, &status, fake);
-        }));
-        assert!(
-            result
-                .err()
-                .is_some_and(|payload| payload.downcast_ref::<StopLoop>().is_some()),
-            "loop must end only through the scripted stop"
-        );
-        status
-    }
-
-    fn config(mode: MemoryReclaimMode, idle_after_secs: u64) -> MemoryReclaimConfig {
-        MemoryReclaimConfig {
-            mode,
-            idle_after_secs,
-        }
-    }
-
-    #[test]
-    fn gradual_reclaims_one_bounded_step_after_the_idle_window() {
-        // Baseline, then two idle intervals (window of 2 at 20 s), then the run.
-        let fake = Fake::new(
-            vec![
-                "cpu 1000 0 0 100000 0 0 0 0 0 0\n",
-                "cpu 1001 0 0 101000 0 0 0 0 0 0\n",
-                "cpu 1002 0 0 102000 0 0 0 0 0 0\n",
-                "cpu 1002 0 0 102000 0 0 0 0 0 0\n", // re-sample after the run
-            ],
-            true,
-        );
-        *fake.cached_after.borrow_mut() = vec![1024 * MIB, 700 * MIB];
-        let status = run_until_exhausted(&config(MemoryReclaimMode::Gradual, 20), &fake);
-        // 983,040 KiB reclaimable minus the 128 MiB floor exceeds the 256 MiB step.
-        assert_eq!(*fake.reclaims.borrow(), vec![256 * MIB]);
-        assert_eq!(fake.compacts.load(Ordering::SeqCst), 1);
-        assert_eq!(fake.drops.load(Ordering::SeqCst), 0);
-        let report = status.last().expect("report");
-        assert_eq!(report.mode.as_deref(), Some("gradual"));
-        assert_eq!(report.outcome.as_deref(), Some("reclaimed"));
-        assert_eq!(report.requested_bytes, Some(256 * MIB));
-        assert_eq!(report.cached_before_bytes, Some(1024 * MIB));
-        assert_eq!(report.cached_after_bytes, Some(700 * MIB));
-        assert_eq!(report.compacted, Some(true));
-        assert_eq!(report.runs, Some(1));
-    }
-
-    #[test]
-    fn busy_intervals_postpone_reclaim() {
-        let fake = Fake::new(
-            vec![
-                "cpu 1000 0 0 100000 0 0 0 0 0 0\n",
-                "cpu 1500 0 0 100500 0 0 0 0 0 0\n", // 50% busy
-                "cpu 1501 0 0 101500 0 0 0 0 0 0\n", // idle, but window still busy
-            ],
-            true,
-        );
-        let status = run_until_exhausted(&config(MemoryReclaimMode::Gradual, 20), &fake);
-        assert!(fake.reclaims.borrow().is_empty());
-        assert!(status.last().is_none());
-    }
-
-    #[test]
-    fn dropcache_runs_once_per_idle_period_and_is_the_fallback() {
-        let fake = Fake::new(
-            vec![
-                "cpu 1000 0 0 100000 0 0 0 0 0 0\n",
-                "cpu 1000 0 0 101000 0 0 0 0 0 0\n",
-                "cpu 1000 0 0 101000 0 0 0 0 0 0\n", // re-sample after first run
-                "cpu 1000 0 0 102000 0 0 0 0 0 0\n", // still idle: no second drop
-            ],
-            false,
-        );
-        let status = run_until_exhausted(&config(MemoryReclaimMode::Gradual, 10), &fake);
-        assert_eq!(fake.drops.load(Ordering::SeqCst), 1);
-        assert_eq!(fake.compacts.load(Ordering::SeqCst), 1);
-        let report = status.last().expect("report");
-        assert_eq!(report.mode.as_deref(), Some("dropcache"));
-        assert_eq!(report.runs, Some(1));
-    }
-
-    #[test]
-    fn partial_outcome_when_the_kernel_frees_less_than_half() {
-        let fake = Fake::new(
-            vec![
-                "cpu 1000 0 0 100000 0 0 0 0 0 0\n",
-                "cpu 1000 0 0 101000 0 0 0 0 0 0\n",
-                "cpu 1000 0 0 101000 0 0 0 0 0 0\n",
-            ],
-            true,
-        );
-        *fake.cached_after.borrow_mut() = vec![1024 * MIB, 1000 * MIB];
-        let status = run_until_exhausted(&config(MemoryReclaimMode::Gradual, 10), &fake);
-        assert_eq!(
-            status.last().and_then(|report| report.outcome),
-            Some("partial".to_string())
-        );
-    }
-
-    #[test]
-    fn off_mode_starts_no_thread() {
-        let status = start(&config(MemoryReclaimMode::Off, 120));
-        assert!(status.last().is_none());
     }
 }

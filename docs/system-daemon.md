@@ -38,9 +38,6 @@ daemon:
     resources:
       cpus: 4
       memory: 8GiB
-      memory-reclaim: off         # experimental: auto | off
-      host-memory-reclaim: off    # experimental: auto | off
-      memory-reclaim-after: 2m
     storage:
       root-size: 20GiB
       data-size: 500GiB
@@ -59,38 +56,22 @@ page cache, and without host reclaim the host can retain backing for pages the
 guest has touched, so a busy engine's host footprint can grow toward `memory`
 while idle.
 
-`memory-reclaim: auto` enables guest cache reclaim modelled on WSL2's
-`autoMemoryReclaim`. The daemon ships the policy to the guest agent in the
-machine's guest config at launch, and a low-priority thread in the agent does
-the work: once CPU has stayed idle for `memory-reclaim-after` it asks the
-cgroup v2 root `memory.reclaim` for one bounded step of file cache per ten
-seconds, then compacts free memory so the freed pages can be reported to the
-host. It falls back to a cache drop only on kernels without `memory.reclaim`.
-`daemon status` shows the last run's mode, outcome, and how far the guest's
-cached memory fell. It is off by default and changes take effect on the next
-VM start. This setting controls guest cache cleanup only; freed guest pages
-reach the host through the balloon's free-page reporting when
-`host-memory-reclaim` is effective. See
-[Memory Reclaim](architecture/memory-reclaim.md).
+Memory reclamation is automatic, with no daemon policy knobs. vmmon enables a
+balloon; libkrun advertises free-page reporting only when the backend supports
+it and its qualification succeeds. Otherwise the basic balloon remains.
+`HostMemoryRemapper` maintains compatible private RAM mappings independently of
+the balloon and its reporting capability.
 
-See [Memory Reclaim](architecture/memory-reclaim.md) for how the two
-memory settings relate.
+The managed agent's `GuestCacheReclaimer` detects negotiated reporting and
+writable cgroup v2 reclaim interfaces. After two idle minutes it requests
+bounded file-cache reclaim, with no global cache-drop fallback. Unsupported
+guests retain their cache. `daemon status` reports the last guest reclaim run
+and host qualification/cumulative advised bytes, not current physical savings.
 
-`host-memory-reclaim: auto` separately asks the krun helper to attach a balloon
-and run its per-VM host-reclaim qualification probe. A passing probe enables
-host reclaim for that VM; failed or inconclusive probes leave ordinary guest
-memory active. Releases remap the range immediately so guest refaults stay
-in-kernel; it still defaults to `off` while that path is validated in the field.
-The krun helper reports the probe outcome, the effective state, and cumulative
-bytes advised free over a status pipe, and `daemon status` shows them on the
-`Host memory reclaim` row. That counter includes repeat reports, not current
-physical memory savings; macOS may retain clean pages until memory pressure.
-While reclaim is effective, the VMM also normalizes host mappings every 30 seconds
-to remove host page-table charges without replacing backing or losing live data.
-This setting does not change backend selection, vsock, native execution, or
-Rosetta intent. `daemon status` reports requested and observed
-effective state separately and never treats `auto` as proof that reclaim became
-effective.
+Remove the retired `memory-reclaim`, `memory-reclaim-after`, and
+`host-memory-reclaim` YAML keys when upgrading. See
+[Memory Reclaim](architecture/memory-reclaim.md) for the four components,
+capability checks, safety policies, and upgrade behavior.
 
 `backend` explicitly selects `krun` or Apple Virtualization.framework (`vz`).
 The default is `krun` on Linux and macOS. If the key is omitted,
