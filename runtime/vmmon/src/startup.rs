@@ -307,14 +307,6 @@ pub async fn init(
         network: &network,
         guest_services_enabled,
         krun_path,
-        host_memory_reclaim: match start_request.host_memory_reclaim {
-            crate::start_request::HostMemoryReclaimRequest::Auto => {
-                crate::virt::HostMemoryReclaim::Auto
-            }
-            crate::start_request::HostMemoryReclaimRequest::Off => {
-                crate::virt::HostMemoryReclaim::Off
-            }
-        },
         selected_backend,
         rosetta_intent,
         prepared_rosetta,

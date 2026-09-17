@@ -51,19 +51,6 @@ pub struct RuntimeConfig {
     pub bundled_runtime_root: Option<PathBuf>,
     /// Explicit override of vmmon's virtualization backend.
     pub virt_backend: Option<VirtBackendOverride>,
-    /// Per-VM host memory reclaim policy. Qualification still decides whether it is effective.
-    pub host_memory_reclaim: HostMemoryReclaim,
-}
-
-/// Host memory reclaim policy for machines started by this runtime.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum HostMemoryReclaim {
-    /// Do not request host memory reclaim.
-    #[default]
-    Off,
-    /// Request reclaim and use it only when the per-VM startup probe passes.
-    Auto,
 }
 
 /// Explicit override of vmmon's virtualization backend.
@@ -98,7 +85,6 @@ impl RuntimeConfig {
             runtime_root: None,
             bundled_runtime_root: None,
             virt_backend: None,
-            host_memory_reclaim: HostMemoryReclaim::Off,
         }
     }
 
@@ -150,12 +136,6 @@ impl RuntimeConfig {
     /// Sets the krun executable path used by the krun backend.
     pub fn with_krun_path(mut self, krun_path: impl Into<PathBuf>) -> Self {
         self.krun_path = Some(krun_path.into());
-        self
-    }
-
-    /// Sets the per-VM host memory reclaim policy.
-    pub fn with_host_memory_reclaim(mut self, policy: HostMemoryReclaim) -> Self {
-        self.host_memory_reclaim = policy;
         self
     }
 
@@ -478,7 +458,6 @@ impl Default for RuntimeConfig {
             runtime_root: None,
             bundled_runtime_root: None,
             virt_backend: None,
-            host_memory_reclaim: HostMemoryReclaim::Off,
         }
     }
 }

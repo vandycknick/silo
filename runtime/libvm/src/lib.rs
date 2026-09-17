@@ -78,8 +78,8 @@ pub use crate::network::{
     NetworkDriver, NetworkTopology, PublishBind,
 };
 pub use crate::runtime::{
-    HostMemoryReclaim, NetdRuntimeConfig, PathChoice, ReadOnlyRuntime, Runtime, RuntimeBuilder,
-    RuntimeConfig, RuntimeNetworkingConfig, VirtBackendOverride,
+    NetdRuntimeConfig, PathChoice, ReadOnlyRuntime, Runtime, RuntimeBuilder, RuntimeConfig,
+    RuntimeNetworkingConfig, VirtBackendOverride,
 };
 pub use crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub use forward_spec::{

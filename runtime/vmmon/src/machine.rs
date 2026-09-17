@@ -1,8 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::virt::{
-    DiskImage, HostMemoryReclaim, MachineIdentifier, SharedDirectory, VirtError, VmConfig,
-    VmConfigBuilder,
+    DiskImage, MachineIdentifier, SharedDirectory, VirtError, VmConfig, VmConfigBuilder,
 };
 use protocol::guest_port_arg;
 use thiserror::Error;
@@ -40,7 +39,6 @@ pub(crate) struct VmSpecInputs<'a> {
     pub network: &'a RuntimeNetwork,
     pub guest_services_enabled: bool,
     pub krun_path: &'a Path,
-    pub host_memory_reclaim: HostMemoryReclaim,
     pub selected_backend: crate::virt::BackendKind,
     pub rosetta_intent: crate::virt::RosettaIntent,
     pub prepared_rosetta: Option<krun::RosettaLaunchConfig>,
@@ -66,7 +64,6 @@ pub(crate) fn vm_spec_machine_config(
         .vm_id(inputs.id)
         .base_directory(inputs.data_dir.to_path_buf())
         .krun_path(inputs.krun_path)
-        .host_memory_reclaim(inputs.host_memory_reclaim)
         .kernel_cmdline(vm_spec_kernel_cmdline(
             inputs.spec,
             inputs.guest_services_enabled,
@@ -246,7 +243,7 @@ mod tests {
     use crate::machine::{
         apply_runtime_network, vm_spec_machine_config, RuntimeNetwork, VmSpecInputs,
     };
-    use crate::virt::{HostMemoryReclaim, VmConfig};
+    use crate::virt::VmConfig;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -348,7 +345,6 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: true,
             krun_path: Path::new("/tmp/krun"),
-            host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -386,7 +382,6 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
-            host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -429,7 +424,6 @@ mod tests {
                 network: &RuntimeNetwork::None,
                 guest_services_enabled: false,
                 krun_path: Path::new("/tmp/krun"),
-                host_memory_reclaim: HostMemoryReclaim::Off,
                 selected_backend: crate::virt::BackendKind::Vz,
                 rosetta_intent: crate::virt::RosettaIntent::Disabled,
                 prepared_rosetta: None,
@@ -474,7 +468,6 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
-            host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -513,7 +506,6 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
-            host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Krun,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -552,7 +544,6 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
-            host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Krun,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -583,7 +574,6 @@ mod tests {
             network: &runtime_network,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
-            host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -617,7 +607,6 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
-            host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -650,7 +639,6 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
-            host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -676,7 +664,6 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
-            host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -705,7 +692,6 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
-            host_memory_reclaim: HostMemoryReclaim::Off,
             selected_backend: crate::virt::BackendKind::Krun,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,

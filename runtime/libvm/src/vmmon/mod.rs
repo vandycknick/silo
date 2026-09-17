@@ -30,7 +30,6 @@ pub(crate) struct Vmmon {
     executable: PathBuf,
     krun_path: PathBuf,
     virt_backend: Option<crate::runtime::VirtBackendOverride>,
-    host_memory_reclaim: crate::runtime::HostMemoryReclaim,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,14 +46,12 @@ impl Vmmon {
         executable: PathBuf,
         krun_path: PathBuf,
         virt_backend: Option<crate::runtime::VirtBackendOverride>,
-        host_memory_reclaim: crate::runtime::HostMemoryReclaim,
     ) -> Self {
         Self {
             paths,
             executable,
             krun_path,
             virt_backend,
-            host_memory_reclaim,
         }
     }
 
@@ -84,13 +81,6 @@ impl Vmmon {
                 }
             }
         })
-    }
-
-    pub(crate) fn host_memory_reclaim_request(&self) -> start_request::VmmonHostMemoryReclaim {
-        match self.host_memory_reclaim {
-            crate::runtime::HostMemoryReclaim::Off => start_request::VmmonHostMemoryReclaim::Off,
-            crate::runtime::HostMemoryReclaim::Auto => start_request::VmmonHostMemoryReclaim::Auto,
-        }
     }
 
     pub(crate) fn rosetta_intent_request(
@@ -201,7 +191,6 @@ mod tests {
                 "/tmp/vmmon".into(),
                 "/tmp/krun".into(),
                 Some(selection),
-                crate::runtime::HostMemoryReclaim::Off,
             );
             let request = vmmon.virt_backend_request().expect("backend request");
             assert_eq!(request.kind, expected);
@@ -219,7 +208,6 @@ mod tests {
             "/operator/vmmon".into(),
             "/operator/krun".into(),
             Some(VirtBackendOverride::Krun),
-            crate::runtime::HostMemoryReclaim::Off,
         );
         let config = rosetta_machine_config();
         assert_eq!(
@@ -245,7 +233,6 @@ mod tests {
                 "/operator/vmmon".into(),
                 "/operator/krun".into(),
                 backend,
-                crate::runtime::HostMemoryReclaim::Off,
             );
             assert_eq!(
                 vmmon
@@ -264,7 +251,6 @@ mod tests {
             "/operator/vmmon".into(),
             "/operator/krun".into(),
             Some(VirtBackendOverride::Vz),
-            crate::runtime::HostMemoryReclaim::Off,
         );
 
         let mut custom_agent = rosetta_machine_config();

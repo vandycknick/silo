@@ -270,7 +270,7 @@ mod tests {
             rosetta: false,
             rosetta_explicit: false,
             memory_reclaim: false,
-            host_memory_reclaim: false,
+            legacy_host_reclaim: (),
             memory_reclaim_after_secs: 120,
             identity: "test".to_string(),
         }

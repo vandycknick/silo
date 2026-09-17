@@ -100,7 +100,7 @@ enum DeviceConfig<'a> {
     Vsock(u64),
     Network(&'a Network),
     Rng,
-    Balloon(bool),
+    Balloon,
 }
 
 #[cfg(test)]
@@ -115,7 +115,7 @@ impl DeviceConfig<'_> {
             Self::Vsock(_) => DeviceKind::Vsock,
             Self::Network(_) => DeviceKind::Network,
             Self::Rng => DeviceKind::Rng,
-            Self::Balloon(_) => DeviceKind::Balloon,
+            Self::Balloon => DeviceKind::Balloon,
         }
     }
 }
@@ -258,11 +258,10 @@ pub(crate) fn run(
                         .map_err(|source| libkrun_error("create RNG device", source))?,
                 );
             }
-            DeviceConfig::Balloon(host_reclaim) => {
+            DeviceConfig::Balloon => {
                 devices.add(
                     BalloonDevice::new()
-                        .map_err(|source| libkrun_error("create balloon device", source))?
-                        .host_reclaim(host_reclaim),
+                        .map_err(|source| libkrun_error("create balloon device", source))?,
                 );
             }
         }
@@ -429,7 +428,9 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
         devices.push(DeviceConfig::Network(&config.network));
     }
     devices.push(DeviceConfig::Rng);
-    devices.push(DeviceConfig::Balloon(config.host_memory_reclaim));
+    if config.balloon {
+        devices.push(DeviceConfig::Balloon);
+    }
     devices
 }
 
@@ -602,6 +603,7 @@ mod tests {
         };
         let config = KrunConfig {
             vsock_mux: true,
+            balloon: true,
             ..config
         };
 
@@ -646,7 +648,7 @@ mod tests {
                 .iter()
                 .map(DeviceConfig::kind)
                 .collect::<Vec<_>>(),
-            vec![DeviceKind::Network, DeviceKind::Rng, DeviceKind::Balloon]
+            vec![DeviceKind::Network, DeviceKind::Rng]
         );
         assert!(matches!(
             standalone_plan.first(),
@@ -657,26 +659,23 @@ mod tests {
                 .iter()
                 .map(DeviceConfig::kind)
                 .collect::<Vec<_>>(),
-            vec![
-                DeviceKind::Vsock,
-                DeviceKind::Network,
-                DeviceKind::Rng,
-                DeviceKind::Balloon,
-            ]
+            vec![DeviceKind::Vsock, DeviceKind::Network, DeviceKind::Rng,]
         );
     }
 
     #[test]
-    fn balloon_is_always_attached_with_the_requested_host_policy() {
-        for requested in [false, true] {
+    fn balloon_attachment_is_explicit() {
+        for enabled in [false, true] {
             let config = KrunConfig {
-                host_memory_reclaim: requested,
+                balloon: enabled,
                 ..KrunConfig::default()
             };
-            assert!(matches!(
-                device_plan(&config).last(),
-                Some(DeviceConfig::Balloon(actual)) if *actual == requested
-            ));
+            assert_eq!(
+                device_plan(&config)
+                    .iter()
+                    .any(|device| matches!(device, DeviceConfig::Balloon)),
+                enabled
+            );
         }
     }
 }

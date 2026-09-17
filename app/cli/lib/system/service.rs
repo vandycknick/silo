@@ -66,11 +66,6 @@ impl Registration {
             .with_image_root(&self.image_root)
             .with_networking(networking)
             .with_virt_backend(config.backend.runtime_override())
-            .with_host_memory_reclaim(if config.host_memory_reclaim {
-                libvm::HostMemoryReclaim::Auto
-            } else {
-                libvm::HostMemoryReclaim::Off
-            })
     }
 }
 
@@ -767,7 +762,6 @@ mod tests {
             libvm::RuntimeNetworkingConfig::default(),
         );
         assert_eq!(runtime.virt_backend, Some(libvm::VirtBackendOverride::Vz));
-        assert_eq!(runtime.host_memory_reclaim, libvm::HostMemoryReclaim::Auto);
     }
 
     #[test]

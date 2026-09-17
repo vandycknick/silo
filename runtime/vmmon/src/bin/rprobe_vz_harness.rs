@@ -615,6 +615,7 @@ mod macos {
             ])
             .network_none()
             .stdio_console(true)
+            .balloon(true)
             .rosetta(config)
             .start()
             .wrap_err("start standalone krun responder guest")?;

@@ -395,14 +395,7 @@ async fn run_foreground(context: &mut Context) -> eyre::Result<()> {
     let (paths, config) = context.resolved_system_config(None)?;
     crate::system::docker::preflight(&config, false)?;
     let api = context
-        .app_api_with_host_memory_reclaim(
-            if config.host_memory_reclaim {
-                libvm::HostMemoryReclaim::Auto
-            } else {
-                libvm::HostMemoryReclaim::Off
-            },
-            config.backend.runtime_override(),
-        )
+        .app_api_with_backend(config.backend.runtime_override())
         .await?;
     crate::system::supervisor::serve(api, paths, config).await
 }
@@ -491,7 +484,7 @@ mod tests {
         use crate::system::supervisor::MemoryReclaimOutcome;
 
         assert_eq!(
-            super::format_guest_reclaim(
+            crate::commands::daemon::format_guest_reclaim(
                 Some("gradual"),
                 MemoryReclaimOutcome::Partial,
                 Some(512 * 1024 * 1024),
@@ -500,7 +493,7 @@ mod tests {
             "; last idle gradual reclaim in the guest reclaimed partially 2 minutes ago, guest cache fell by 512MiB"
         );
         assert_eq!(
-            super::format_guest_reclaim(
+            crate::commands::daemon::format_guest_reclaim(
                 Some("dropcache"),
                 MemoryReclaimOutcome::Failed,
                 Some(7),
@@ -509,7 +502,7 @@ mod tests {
             "; last idle cache drop reclaim in the guest failed just now"
         );
         assert_eq!(
-            super::format_guest_reclaim(
+            crate::commands::daemon::format_guest_reclaim(
                 None,
                 MemoryReclaimOutcome::Nothing,
                 Some(0),

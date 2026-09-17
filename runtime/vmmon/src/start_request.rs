@@ -20,22 +20,12 @@ pub(crate) struct VmmonStartRequest {
     // the pipe must parse the same schema regardless of compiled features.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) virt_backend: Option<VirtBackendRequest>,
-    #[serde(default)]
-    pub(crate) host_memory_reclaim: HostMemoryReclaimRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rosetta_intent: Option<RosettaIntentRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) asset_directory: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     startup_budget_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum HostMemoryReclaimRequest {
-    Auto,
-    #[default]
-    Off,
 }
 
 /// Explicit virtualization backend selection carried in the start request.
@@ -112,7 +102,6 @@ impl StartRequestPipe {
                     machine_run_id: expected_machine_run_id.to_string(),
                     startup_command: None,
                     virt_backend: None,
-                    host_memory_reclaim: HostMemoryReclaimRequest::Off,
                     rosetta_intent: None,
                     asset_directory: None,
                     startup_budget_ms: None,
@@ -135,7 +124,6 @@ impl StartRequestPipe {
         tracing::info!(
             event = "start_request_accepted",
             startup_command = request.startup_command.is_some(),
-            host_memory_reclaim = ?request.host_memory_reclaim,
             "vmmon start request accepted"
         );
         Ok(request)
@@ -323,7 +311,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::start_request::{
-        decode_start_request, HostMemoryReclaimRequest, RosettaIntentRequest, StartRequestPipe,
+        decode_start_request, RosettaIntentRequest, StartRequestPipe,
         VMMON_START_REQUEST_MAX_BYTES, VMMON_START_REQUEST_VERSION,
     };
 
@@ -365,7 +353,6 @@ mod tests {
 
         let request = decode_start_request(&encoded, &machine_id, &run_id)
             .expect("decode valid startup request");
-        assert_eq!(request.host_memory_reclaim, HostMemoryReclaimRequest::Off);
         assert_eq!(request.effective_startup_budget_ms(), 330_000);
         assert_eq!(
             request
@@ -428,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_reader_accepts_host_memory_reclaim_auto() {
+    fn strict_reader_rejects_removed_host_reclaim_switch() {
         let machine_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
         let encoded = encode(json!({
@@ -438,9 +425,7 @@ mod tests {
             "hostMemoryReclaim": "auto"
         }));
 
-        let request = decode_start_request(&encoded, &machine_id, &run_id)
-            .expect("decode host reclaim request");
-        assert_eq!(request.host_memory_reclaim, HostMemoryReclaimRequest::Auto);
+        assert!(decode_start_request(&encoded, &machine_id, &run_id).is_err());
     }
 
     #[test]

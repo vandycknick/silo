@@ -18,27 +18,11 @@ pub(crate) struct VmmonStartRequest {
     // with vmmon's strict (deny_unknown_fields) reader.
     #[serde(skip_serializing_if = "Option::is_none")]
     virt_backend: Option<VmmonVirtBackend>,
-    #[serde(skip_serializing_if = "VmmonHostMemoryReclaim::is_off")]
-    host_memory_reclaim: VmmonHostMemoryReclaim,
     #[serde(skip_serializing_if = "Option::is_none")]
     rosetta_intent: Option<VmmonRosettaIntent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     asset_directory: Option<std::path::PathBuf>,
     startup_budget_ms: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum VmmonHostMemoryReclaim {
-    Auto,
-    #[default]
-    Off,
-}
-
-impl VmmonHostMemoryReclaim {
-    fn is_off(&self) -> bool {
-        *self == Self::Off
-    }
 }
 
 /// Explicit virtualization backend selection.
@@ -98,7 +82,6 @@ impl VmmonStartRequest {
             machine_run_id: machine_run_id.into(),
             startup_command,
             virt_backend: None,
-            host_memory_reclaim: VmmonHostMemoryReclaim::Off,
             rosetta_intent: None,
             asset_directory: None,
             startup_budget_ms,
@@ -107,11 +90,6 @@ impl VmmonStartRequest {
 
     pub(crate) fn with_virt_backend(mut self, virt_backend: Option<VmmonVirtBackend>) -> Self {
         self.virt_backend = virt_backend;
-        self
-    }
-
-    pub(crate) fn with_host_memory_reclaim(mut self, policy: VmmonHostMemoryReclaim) -> Self {
-        self.host_memory_reclaim = policy;
         self
     }
 
@@ -156,8 +134,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::vmmon::start_request::{
-        encode_start_request, VmmonEnvironmentVariable, VmmonHostMemoryReclaim, VmmonProcessSpec,
-        VmmonRosettaIntent, VmmonStartRequest, VmmonStartupCommand, VMMON_START_REQUEST_MAX_BYTES,
+        encode_start_request, VmmonEnvironmentVariable, VmmonProcessSpec, VmmonRosettaIntent,
+        VmmonStartRequest, VmmonStartupCommand, VMMON_START_REQUEST_MAX_BYTES,
     };
 
     #[test]
@@ -208,18 +186,17 @@ mod tests {
     }
 
     #[test]
-    fn host_memory_reclaim_auto_is_an_explicit_additive_field() {
+    fn start_request_has_no_host_reclaim_switch() {
         let request = VmmonStartRequest::new(
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
-        )
-        .with_host_memory_reclaim(VmmonHostMemoryReclaim::Auto);
+        );
         let encoded = encode_start_request(&request).expect("encode request");
         let value: serde_json::Value =
             serde_json::from_slice(&encoded[..encoded.len() - 1]).expect("parse request");
 
-        assert_eq!(value["hostMemoryReclaim"], "auto");
+        assert!(value.get("hostMemoryReclaim").is_none());
     }
 
     #[test]

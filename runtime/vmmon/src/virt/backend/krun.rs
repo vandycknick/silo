@@ -640,12 +640,9 @@ fn build_krun_vm(
         .memory_mib(memory_mib)
         .kernel(kernel)
         .cmdline(build_boot_args(config))
-        .host_memory_reclaim(matches!(
-            config.krun().host_memory_reclaim,
-            crate::virt::HostMemoryReclaim::Auto
-        ))
         .vsock_mux_fd(vsock_mux_fd)
-        .stdio_console(true);
+        .stdio_console(true)
+        .balloon(true);
 
     if let Some(rosetta) = config.krun().prepared_rosetta.clone() {
         builder = builder.rosetta(rosetta);
@@ -926,16 +923,16 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
-    use super::{
+    #[cfg(target_os = "macos")]
+    use crate::virt::backend::krun::stop_vm;
+    use crate::virt::backend::krun::{
         read_connect_response, validate, ConnectionRequest, KrunBackend, KrunVsockRegistry,
         MAX_VSOCK_LISTENERS, VSOCK_CONNECT_TIMEOUT,
     };
-    #[cfg(target_os = "macos")]
-    use crate::virt::backend::krun::stop_vm;
     use crate::virt::backend::VirtBackend;
     use crate::virt::capacity::VsockCapacity;
     use crate::virt::stream::KrunVsockSession;
-    use crate::virt::{HostMemoryReclaim, NetworkMode, VmConfig, VmExit};
+    use crate::virt::{NetworkMode, VmConfig, VmExit};
 
     fn test_dir() -> PathBuf {
         let timestamp = SystemTime::now()
@@ -1035,7 +1032,6 @@ mod tests {
             .memory(128)
             .base_directory(&root)
             .krun_path(&krun)
-            .host_memory_reclaim(HostMemoryReclaim::Auto)
             .kernel(&kernel)
             .network(NetworkMode::None)
             .build();
@@ -1058,8 +1054,8 @@ mod tests {
         assert!(args.lines().any(|arg| arg == "--kernel"));
         assert!(args.lines().any(|arg| arg == kernel.display().to_string()));
         assert!(args.lines().any(|arg| arg == "--vsock-mux-fd"));
-        assert!(args.lines().any(|arg| arg == "--host-memory-reclaim"));
-        assert!(args.lines().any(|arg| arg == "on"));
+        assert!(args.lines().any(|arg| arg == "--balloon"));
+        assert!(!args.lines().any(|arg| arg == "--host-memory-reclaim"));
         assert!(!args.lines().any(|arg| arg == "--vsock-port"));
 
         fs::remove_dir_all(root).expect("remove test root");

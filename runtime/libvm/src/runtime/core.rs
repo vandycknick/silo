@@ -145,7 +145,6 @@ impl Runtime {
             config.networking,
             components,
             config.virt_backend,
-            config.host_memory_reclaim,
         )
         .await
     }
@@ -166,15 +165,7 @@ impl Runtime {
     ) -> Result<Self, LibVmError> {
         let store = Store::new(&paths).await?;
         let components = crate::runtime::components::test_components(paths.data_dir());
-        Self::from_store(
-            paths,
-            Arc::new(store),
-            networking,
-            components,
-            None,
-            crate::runtime::HostMemoryReclaim::Off,
-        )
-        .await
+        Self::from_store(paths, Arc::new(store), networking, components, None).await
     }
 
     pub(crate) async fn from_store(
@@ -183,7 +174,6 @@ impl Runtime {
         networking: RuntimeNetworkingConfig,
         components: ResolvedRuntimeComponents,
         virt_backend: Option<crate::runtime::VirtBackendOverride>,
-        host_memory_reclaim: crate::runtime::HostMemoryReclaim,
     ) -> Result<Self, LibVmError> {
         let lock_manager = LockManager::open(paths.locks_dir().to_path_buf())?;
         let vmmon = Vmmon::new(
@@ -191,7 +181,6 @@ impl Runtime {
             components.vmmon.clone(),
             components.krun.clone(),
             virt_backend,
-            host_memory_reclaim,
         );
         let runtime = Self {
             paths,
@@ -2084,7 +2073,6 @@ mod tests {
             RuntimeNetworkingConfig::default(),
             components,
             None,
-            crate::runtime::HostMemoryReclaim::Off,
         )
         .await
         .expect("create runtime with mock store")
@@ -2717,7 +2705,6 @@ mod tests {
             RuntimeNetworkingConfig::default(),
             components,
             None,
-            crate::runtime::HostMemoryReclaim::Off,
         )
         .await
         .expect("create runtime");

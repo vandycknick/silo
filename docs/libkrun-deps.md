@@ -12,10 +12,11 @@ The workspace dependency is pinned by full Git commit in the root
 
 ```text
 repository: https://github.com/vandycknick/libkrun.git
-tracked revision: 3dbda91919594139209bd5577f6ef80089ac5f17
+tracked revision: 11dbc7863a6ca6176939d48147e67f03d34eeda0
 public branch: silo/v2
-previous tracked revision: b892b1974e34a48b857c4562bc41f2e541b30ea5
-previous tip backup: backup/silo-v2-before-cleanup-20260916-202550 @ b892b1974e34a48b857c4562bc41f2e541b30ea5
+previous tracked revision: 6c26f56863317971cd61a1b7bc51c05470077c65
+previous tip backup: backup/silo-v2-before-four-commit-cleanup-20260917 @ 6c26f56863317971cd61a1b7bc51c05470077c65
+earlier cleanup backup: backup/silo-v2-before-cleanup-20260916-202550 @ b892b1974e34a48b857c4562bc41f2e541b30ea5
 older tip backup: backup/silo-v2-2026-09-15 @ 10b6f752ba8ea735c3d9edaa549599dcf3f98d18
 pre-split backup: backup/silo-v2-before-feature-split-2026-09-15 @ ea84066ff3c8499a4aac5cdd3ec326aee0667e9b
 fetchable: yes
@@ -25,27 +26,30 @@ Release builds must use the committed `Cargo.lock` with `--locked`. A branch
 or tag is useful for reviewing the fork, but neither replaces the immutable
 commit pin.
 
-The committed revision is reachable through the fork URL: a direct
-`git fetch https://github.com/vandycknick/libkrun.git 3dbda91919594139209bd5577f6ef80089ac5f17`
-succeeds. Cargo therefore resolves the tracked pin directly from GitHub with no
-local checkout, path patch, URL rewrite, or alternate lockfile. The public
-`silo/v2` branch names the reviewable tip, while release reproducibility comes
-from the immutable revision in `Cargo.toml` and `Cargo.lock`. The force update
-preserved the former public tip on
-`backup/silo-v2-before-cleanup-20260916-202550`.
+The tracked revision is published on `silo/v2` and fetchable directly from
+GitHub, with no path override or URL rewrite. The local libkrun worktree at
+`/Users/nickvd/Projects/worktrees/libkrun/v2-cleanup` remains on `silo/v2`.
 
 The downstream series contains four commits above `24d714b5dce8e8dd91afb9e0f64ebf6f3e1e846e`:
 
-1. `366377893787a7299e35a0bd748d199e548ab571`: balloon host reclaim, including
-   page-wise advice, fault recovery, qualification and periodic mapping maintenance.
-2. `4f03adbf74fd55882a0337b87fa271612fdd86af`: owned native vsock control-channel mux.
-3. `212f92a66405a286581c4b4d498593f91d0658b5`: immutable captured Rosetta compatibility data.
-4. `3dbda91919594139209bd5577f6ef80089ac5f17`: direct external initramfs streaming.
+1. `ac4b8578e4a323723490077fd188492d43f9a7bf`: balloon host reclaim, including
+   page-wise advice, fault recovery, automatic reporting qualification, and an
+   independent `HostMemoryRemapper`. Periodic passes run every 30 seconds;
+   report preparation is throttled to 250 ms. Incompatible providers retain
+   basic balloon functionality. Tests cover real HVF qualification, remapping
+   without a balloon, nested EL2 reporting suppression, and live-data preservation.
+2. `346f2822f7aad1807e7752b5d8f1d7bf45184d0e`: owned native vsock control-channel
+   mux, including quiet expected Unix-vsock teardown. Shutdown accepts `ENOTCONN`
+   while preserving other errors, and routine proxy removals log at debug level.
+   Real-socket tests cover half-close, repeated shutdown, disconnected sockets,
+   and unexpected errors. Unexpected datagram packet errors remain visible.
+3. `d0d0e277f26ac663769c5d6d848cb5fe7dc4e51b`: immutable captured Rosetta compatibility data.
+4. `11dbc7863a6ca6176939d48147e67f03d34eeda0`: direct external initramfs streaming.
 
-This revision only reorganizes history and improves comments/documentation relative
-to the previous tracked revision. The reconstructed tree was verified byte-identical
-before documentation edits; the final implementation and tests remain unchanged.
-The original commits and their full messages remain available on the backup branch.
+This history cleanup folds the follow-up balloon and vsock fixes into their
+respective feature commits. The final tree is byte-identical to the previous
+six-commit tip. The original commits remain published on
+`backup/silo-v2-before-four-commit-cleanup-20260917`.
 
 The fork reclaims reported guest RAM on macOS as follows.
 Each coalesced report uses `hv_vm_unmap`, one `madvise(MADV_FREE)` call per
@@ -65,7 +69,9 @@ Nested EL2 guests remain unqualified. The external initramfs is streamed into
 guest RAM instead of staged in a large heap buffer.
 
 The native VMM event loop now also performs content-preserving, same-address
-Mach self-remapping every 30 seconds while reclaim is effective. This removes
+Mach self-remapping every 30 seconds for compatible private RAM, independently
+of balloon attachment and reporting qualification. Report-driven preparation
+can bring that deadline forward, with a 250-ms throttle. This removes
 host translations whose footprint charge survives page-wise advice, including
 translations populated by virtio block I/O. It keeps the existing backing and
 guest mappings, never replays old free-page reports, and runs only while the

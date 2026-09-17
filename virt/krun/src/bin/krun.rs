@@ -97,9 +97,9 @@ struct Cli {
     /// Attach stdin/stdout/stderr to an explicit hvc0 virtio console.
     #[arg(long)]
     stdio_console: bool,
-    /// Request host memory reclaim after the startup qualification probe passes.
-    #[arg(long, value_enum, default_value_t = HostMemoryReclaimArg::Off)]
-    host_memory_reclaim: HostMemoryReclaimArg,
+    /// Attach a balloon with automatically selected backend capabilities.
+    #[arg(long)]
+    balloon: bool,
     /// Attach the dedicated immutable Rosetta filesystem.
     #[arg(long)]
     rosetta: bool,
@@ -111,12 +111,6 @@ enum NetworkArg {
     Unixgram,
     Unixstream,
     Tap,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum HostMemoryReclaimArg {
-    On,
-    Off,
 }
 
 impl Cli {
@@ -150,7 +144,7 @@ impl Cli {
                 vsock_cid: self.vsock_cid,
                 network,
                 stdio_console: self.stdio_console,
-                host_memory_reclaim: self.host_memory_reclaim == HostMemoryReclaimArg::On,
+                balloon: self.balloon,
                 rosetta,
             },
             vsock_mux_fd,
@@ -472,24 +466,10 @@ mod tests {
     }
 
     #[test]
-    fn host_memory_reclaim_requires_an_explicit_on_value() {
-        let default = Cli::try_parse_from(["krun", "--kernel", "/kernel"])
-            .expect("default arguments should parse")
-            .into_launch(None)
-            .map(|launch| launch.0)
-            .expect("default arguments should produce a config");
-        let requested =
-            Cli::try_parse_from(["krun", "--kernel", "/kernel", "--host-memory-reclaim=on"])
-                .expect("host reclaim argument should parse")
-                .into_launch(None)
-                .map(|launch| launch.0)
-                .expect("host reclaim argument should produce a config");
-
-        assert!(!default.host_memory_reclaim);
-        assert!(requested.host_memory_reclaim);
-        assert!(
-            Cli::try_parse_from(["krun", "--kernel", "/kernel", "--host-memory-reclaim",]).is_err()
-        );
+    fn rejects_removed_host_memory_reclaim_switch() {
+        for argument in ["--host-memory-reclaim=on", "--host-memory-reclaim=off"] {
+            assert!(Cli::try_parse_from(["krun", "--kernel", "/kernel", argument]).is_err());
+        }
     }
 
     #[test]

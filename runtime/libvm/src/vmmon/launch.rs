@@ -117,7 +117,6 @@ impl Vmmon {
             launch.startup_command.cloned(),
         )
         .with_virt_backend(self.virt_backend_request())
-        .with_host_memory_reclaim(self.host_memory_reclaim_request())
         .with_rosetta_intent(launch.rosetta_intent)
         .with_asset_directory(launch.asset_directory.clone())
         .with_startup_budget(startup_deadline.saturating_duration_since(Instant::now()));

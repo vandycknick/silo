@@ -186,9 +186,9 @@ pub(crate) async fn serve(
         memory_reclaim_observed_cache_delta_bytes: None,
         memory_reclaim_at: None,
         memory_reclaim_runs: None,
-        host_memory_reclaim_requested: config.host_memory_reclaim,
+        host_memory_reclaim_requested: config.backend == crate::system::config::SystemBackend::Krun,
         host_memory_reclaim_effective: initial_host_memory_reclaim_effective(
-            config.host_memory_reclaim,
+            config.backend == crate::system::config::SystemBackend::Krun,
         ),
         host_memory_reclaim_qualification: None,
         host_memory_reclaim_released_bytes: None,

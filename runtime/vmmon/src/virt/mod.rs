@@ -30,8 +30,8 @@ pub use backend::HostMemoryReclaimReport;
 pub use backend::{Availability, BackendKind};
 pub(crate) use capacity::VsockLease;
 pub use config::{
-    DiskImage, HostMemoryReclaim, KrunOptions, MachineIdentifier, MockOptions, NetworkMode,
-    RosettaIntent, RosettaProfile, SharedDirectory, VmConfig, VmConfigBuilder, VmExit, VzOptions,
+    DiskImage, KrunOptions, MachineIdentifier, MockOptions, NetworkMode, RosettaIntent,
+    RosettaProfile, SharedDirectory, VmConfig, VmConfigBuilder, VmExit, VzOptions,
 };
 pub use error::VirtError;
 pub use machine::VirtualMachine;
