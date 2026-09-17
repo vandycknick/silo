@@ -105,6 +105,18 @@ silo stop dev
 silo rm dev
 ```
 
+## Persistent Docker Service
+
+Silo can run an optional per-user Docker Engine in a persistent system VM. Its
+engine data survives daemon and appliance replacement, while the host uses the
+dedicated `silo` Docker context and `~/.docker/run/silo.sock` endpoint. This is
+separate from ordinary Silo VMs and does not require or replace a host Docker
+Engine.
+
+See the [system daemon operator guide](docs/system-daemon.md) for setup,
+security implications, lifecycle, upgrades, recovery, and deliberate v1
+limitations.
+
 ## SDK
 
 Use `libvm` when you want to create and manage machines directly from Rust. See
@@ -141,3 +153,4 @@ async fn main() -> Result<(), LibVmError> {
 - [Hybrid vsock](docs/hybrid-vsock.md)
 - [Terminology](docs/terminology.md)
 - [Guest agent](guest/agent/README.md)
+- [System daemon](docs/system-daemon.md)

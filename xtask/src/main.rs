@@ -24,6 +24,7 @@ mod kernel;
 mod macos;
 mod profiles;
 mod release;
+mod rprobe;
 mod runtime;
 mod targets;
 mod version;
@@ -60,10 +61,14 @@ enum Commands {
         profile: Profile,
         #[command(flatten)]
         kernel: KernelOptions,
+        #[command(flatten)]
+        rprobe: RprobeAssetOptions,
     },
     Archive {
         #[command(flatten)]
         kernel: KernelOptions,
+        #[command(flatten)]
+        rprobe: RprobeAssetOptions,
     },
     App {
         #[arg(long, value_name = "NUMBER")]
@@ -72,6 +77,8 @@ enum Commands {
         developer_id_application: Option<String>,
         #[command(flatten)]
         kernel: KernelOptions,
+        #[command(flatten)]
+        rprobe: RprobeAssetOptions,
     },
     Package {
         #[arg(long, help = "Also create a DMG")]
@@ -82,6 +89,8 @@ enum Commands {
         developer_id_application: Option<String>,
         #[command(flatten)]
         kernel: KernelOptions,
+        #[command(flatten)]
+        rprobe: RprobeAssetOptions,
     },
     Install {
         #[arg(long, value_name = "PATH", default_value = "/Applications")]
@@ -94,6 +103,8 @@ enum Commands {
         developer_id_application: Option<String>,
         #[command(flatten)]
         kernel: KernelOptions,
+        #[command(flatten)]
+        rprobe: RprobeAssetOptions,
     },
     Fmt,
     Clippy,
@@ -119,6 +130,30 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
     },
+    RprobeInitramfs {
+        #[arg(long, value_name = "PATH")]
+        binary: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
+    RosettaExerciserInitramfs {
+        #[arg(long, value_name = "PATH")]
+        binary: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        x86_workload: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
+    RprobeHardwareTest {
+        #[arg(long, value_name = "PATH")]
+        kernel: PathBuf,
+    },
+}
+
+#[derive(Debug, clap::Args)]
+struct RprobeAssetOptions {
+    #[arg(long, value_name = "DIRECTORY")]
+    rprobe_assets: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -150,7 +185,14 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     match args.command {
         Commands::Build { profile, kernel } => {
-            build_release_or_development(&workspace_root, &target_dir, profile, kernel, false)?;
+            build_release_or_development(
+                &workspace_root,
+                &target_dir,
+                profile,
+                kernel,
+                false,
+                None,
+            )?;
         }
         Commands::Component { component, profile } => {
             let context = build_context(&workspace_root, &target_dir, profile)?;
@@ -161,16 +203,28 @@ fn run() -> Result<(), Box<dyn Error>> {
             let kernel = kernel::resolve(&context, &kernel)?;
             println!("{}", kernel.path.display());
         }
-        Commands::Stage { profile, kernel } => {
-            build_release_or_development(&workspace_root, &target_dir, profile, kernel, true)?;
+        Commands::Stage {
+            profile,
+            kernel,
+            rprobe,
+        } => {
+            build_release_or_development(
+                &workspace_root,
+                &target_dir,
+                profile,
+                kernel,
+                true,
+                rprobe.rprobe_assets.as_deref(),
+            )?;
         }
-        Commands::Archive { kernel } => {
+        Commands::Archive { kernel, rprobe } => {
             build_release_or_development(
                 &workspace_root,
                 &target_dir,
                 Profile::Release,
                 kernel,
                 true,
+                rprobe.rprobe_assets.as_deref(),
             )?;
             archive::produce(&workspace_root, &target_dir)?;
         }
@@ -178,6 +232,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             build_number,
             developer_id_application,
             kernel,
+            rprobe,
         } => {
             let host = HostTarget::current()?;
             if host != HostTarget::MacosArm64 {
@@ -189,6 +244,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Profile::Release,
                 kernel,
                 true,
+                rprobe.rprobe_assets.as_deref(),
             )?;
             app::assemble(
                 &workspace_root,
@@ -202,6 +258,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             build_number,
             developer_id_application,
             kernel,
+            rprobe,
         } => {
             require_macos_arm64()?;
             build_release_or_development(
@@ -210,6 +267,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Profile::Release,
                 kernel,
                 true,
+                rprobe.rprobe_assets.as_deref(),
             )?;
             app::assemble(
                 &workspace_root,
@@ -231,6 +289,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             build_number,
             developer_id_application,
             kernel,
+            rprobe,
         } => {
             require_macos_arm64()?;
             build_release_or_development(
@@ -239,6 +298,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Profile::Release,
                 kernel,
                 true,
+                rprobe.rprobe_assets.as_deref(),
             )?;
             app::assemble(
                 &workspace_root,
@@ -284,13 +344,38 @@ fn run() -> Result<(), Box<dyn Error>> {
             profile,
             kernel,
         } => {
-            build_release_or_development(&workspace_root, &target_dir, profile, kernel, true)?;
+            build_release_or_development(
+                &workspace_root,
+                &target_dir,
+                profile,
+                kernel,
+                true,
+                None,
+            )?;
             let context = build_context(&workspace_root, &target_dir, profile)?;
             build_component(Component::GoFfi, &context)?;
             go_sdk::run_example(&context, &example)?;
         }
         Commands::PackInitramfs { init, out } => {
             write_initramfs(&InitramfsOptions::new(init, out))?;
+        }
+        Commands::RprobeInitramfs { binary, out } => {
+            rprobe::package(&binary, &out)?;
+        }
+        Commands::RosettaExerciserInitramfs {
+            binary,
+            x86_workload,
+            out,
+        } => {
+            write_initramfs(&InitramfsOptions::rosetta_exerciser(
+                binary,
+                x86_workload,
+                out,
+            ))?;
+        }
+        Commands::RprobeHardwareTest { kernel } => {
+            require_macos_arm64()?;
+            rprobe::run_hardware_test(&workspace_root, &target_dir, &kernel)?;
         }
     }
 
@@ -311,11 +396,12 @@ fn build_release_or_development(
     profile: Profile,
     kernel_options: KernelOptions,
     stage: bool,
+    rprobe_assets: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let context = build_context(workspace_root, target_dir, profile)?;
     build_all(&context)?;
     let kernel = kernel::resolve(&context, &kernel_options)?;
-    runtime::assemble_development(&context, &kernel)?;
+    runtime::assemble_development(&context, &kernel, rprobe_assets)?;
     if stage {
         runtime::stage(&context)?;
     }

@@ -6,22 +6,22 @@ use std::time::Duration;
 use clap::Args;
 use libvm::{
     ImageProgressSender, MachineExitOutcome, MachineReadinessOutcome, MachineRetention,
-    MachineRunId, MachineStartOptions, MachineWaitOptions, ReadOnlyRuntime, RuntimeConfig,
+    MachineRunId, MachineStartOptions, MachineWaitOptions, RuntimeConfig,
     DEFAULT_GUEST_READINESS_TIMEOUT,
 };
 
+use crate::api::machine::AppMachine;
 use crate::commands::create::{
-    create_machine, ensure_name_available, ensure_read_only_name_available, load_template,
-    machine_settings, parse_environment, read_environment_layers, render_plan, resolve_plan,
-    resolve_read_only_source, resolve_source, selected_image_reference, validate_process_overrides,
-    MachineCliOptions, PlanInputs, Pull, VmOverrideArgs,
+    load_template, machine_settings, parse_environment, read_environment_layers, render_plan,
+    resolve_plan, selected_image_reference, validate_process_overrides, MachineCliOptions,
+    PlanInputs, Pull, VmOverrideArgs,
 };
-use crate::commands::start_options::machine_start_options_without_cleanup;
 use crate::environment::EnvironmentOverride;
 use crate::planning::{Plan, PlanKind, ProcessOverrides, RunOptions, TtyCapabilities, TtyMode};
 use crate::ui::{self, watch_image_progress, OutputFormat, Spinner};
 
 const FAILED_READINESS_EXIT_WAIT: Duration = Duration::from_secs(2);
+const SHUTDOWN_PROGRESS_DELAY: Duration = Duration::from_secs(5);
 const EXAMPLES: &[&str] = &[
     "silo run ubuntu:26.04 -- uname -a",
     "silo run --detach ubuntu:26.04 -- sleep 300",
@@ -146,21 +146,12 @@ impl Cmd {
             MachineRetention::Ephemeral
         };
         if self.dry_run {
-            let runtime = ReadOnlyRuntime::open(RuntimeConfig::from_env()?)
-                .await
-                .map_err(|error| execution_infrastructure(error.into()))?;
-            let name = match self.name {
-                Some(name) => {
-                    ensure_read_only_name_available(&runtime, &name).await?;
-                    name
-                }
-                None => runtime.propose_machine_name()?,
-            };
-            let source = resolve_read_only_source(
-                &runtime,
+            let resolution = crate::api::AppApi::resolve_read_only_creation(
+                RuntimeConfig::from_env()?,
+                self.name,
                 self.image.as_deref(),
                 &template.template,
-                self.pull,
+                self.pull.map(Pull::policies),
             )
             .await
             .map_err(execution_infrastructure)?;
@@ -168,14 +159,14 @@ impl Cmd {
             let plan = resolve_plan(PlanInputs {
                 kind: PlanKind::Run(run_options),
                 template,
-                image: source.plan_image,
-                image_is_positional: source.is_positional,
+                image: resolution.source.plan_image,
+                image_is_positional: resolution.source.is_positional,
                 machine_overrides: machine.overrides,
                 machine_settings: settings,
                 process_overrides,
                 command_tail: self.command,
                 retention,
-                name: Some(name),
+                name: Some(resolution.name),
                 environment_files,
                 host_environment,
                 environment_overrides: self.env,
@@ -185,28 +176,25 @@ impl Cmd {
 
         let image_reference = selected_image_reference(self.image.as_deref(), &template.template)?;
         let recipe_progress = Spinner::start("Reading", "run recipe");
-        let runtime = context
-            .runtime()
-            .await
-            .map_err(execution_infrastructure)?
-            .clone();
         if let Some(name) = &self.name {
-            ensure_name_available(&runtime, name).await?;
+            context.app_api().await?.ensure_name_available(name).await?;
         }
         recipe_progress.finish_clear();
 
         let (image_progress, image_events) = ImageProgressSender::default_channel();
         let image_progress_task = watch_image_progress(&image_reference, image_events);
-        let progress_runtime = runtime.clone().with_image_progress(image_progress);
         let image_result = async {
-            let source = resolve_source(
-                &progress_runtime,
-                self.image.as_deref(),
-                &template.template,
-                self.pull,
-            )
-            .await
-            .map_err(execution_infrastructure)?;
+            let source = context
+                .app_api()
+                .await?
+                .resolve_source(
+                    self.image.as_deref(),
+                    &template.template,
+                    self.pull.map(Pull::policies),
+                    image_progress,
+                )
+                .await
+                .map_err(execution_infrastructure)?;
             let settings = machine_settings(&machine);
             let plan = resolve_plan(PlanInputs {
                 kind: PlanKind::Run(run_options),
@@ -226,29 +214,23 @@ impl Cmd {
             let Plan::Run(plan) = plan else {
                 unreachable!("run resolution returns a run plan")
             };
-            let machine = create_machine(&progress_runtime, &plan.create, source, context)
+            let policy_config_dir = context.config()?.networking.policy_config_dir.clone();
+            let data = context
+                .app_api()
+                .await?
+                .create_machine(&plan.create, source, policy_config_dir.as_deref())
                 .await
                 .map_err(execution_infrastructure)?;
-            Ok::<_, eyre::Report>((plan, machine))
+            Ok::<_, eyre::Report>((plan, data))
         };
         let image_result = image_result.await;
-        drop(progress_runtime);
         let _ = image_progress_task.await;
-        let (plan, machine) = image_result?;
-        let name = match machine.inspect().await {
-            Ok(data) => data.name,
-            Err(error) => {
-                return Err(cleanup_foreground_failure(
-                    &machine,
-                    plan.create.retention,
-                    error.into(),
-                )
-                .await)
-            }
-        };
+        let (plan, created) = image_result?;
+        let name = created.name;
+        let (_reference, machine) = context.machine(Some(&created.id)).await?;
         if plan.detached {
             let progress = Spinner::start("Starting", &name);
-            let options = match detached_start_options(&runtime, &machine, &plan).await {
+            let options = match detached_start_options(context, &machine, &plan).await {
                 Ok(options) => options,
                 Err(error) => {
                     return Err(
@@ -270,7 +252,12 @@ impl Cmd {
         }
 
         let mut progress = Spinner::start("Starting", &name);
-        let options = match machine_start_options_without_cleanup(&runtime, &machine).await {
+        let options = match context
+            .app_api()
+            .await?
+            .machine_start_options(&machine, false)
+            .await
+        {
             Ok(options) => options,
             Err(error) => {
                 return Err(
@@ -300,7 +287,7 @@ impl Cmd {
                     error,
                 )
                 .await;
-                let stop = stop_run(&machine, start.run_id, plan.create.retention).await;
+                let stop = stop_run(&machine, start.run_id, plan.create.retention, None).await;
                 return Err(
                     foreground_stop_failure(&machine, plan.create.retention, stop, error).await,
                 );
@@ -316,7 +303,7 @@ impl Cmd {
             } else {
                 eyre::eyre!("guest readiness check ended with {:?}", readiness.outcome)
             };
-            let stop = stop_run(&machine, start.run_id, plan.create.retention).await;
+            let stop = stop_run(&machine, start.run_id, plan.create.retention, None).await;
             return Err(
                 foreground_stop_failure(&machine, plan.create.retention, stop, error).await,
             );
@@ -324,8 +311,22 @@ impl Cmd {
         progress.step("Ready", &name);
         progress.finish_success("Started");
         let execution =
-            crate::guest::run_process(&machine, &plan.create.process, &plan.argv, plan.tty).await;
-        let stop = stop_run(&machine, start.run_id, plan.create.retention).await;
+            crate::api::streams::run_process(&machine, &plan.create.process, &plan.argv, plan.tty)
+                .await;
+        let (shutdown_progress, shutdown_labels) = tokio::sync::watch::channel("Stopping");
+        let stop = ui::with_delayed_spinner(
+            stop_run(
+                &machine,
+                start.run_id,
+                plan.create.retention,
+                Some(shutdown_progress),
+            ),
+            SHUTDOWN_PROGRESS_DELAY,
+            shutdown_labels,
+            &name,
+            "Stopped",
+        )
+        .await;
         let result = match execution {
             Ok(result) => result,
             Err(error) => {
@@ -388,8 +389,8 @@ fn parse_entrypoint(value: &str) -> Result<String, String> {
 }
 
 async fn detached_start_options(
-    runtime: &libvm::Runtime,
-    machine: &libvm::Machine,
+    context: &mut crate::context::Context,
+    machine: &AppMachine,
     plan: &crate::planning::RunPlan,
 ) -> eyre::Result<MachineStartOptions> {
     let process = &plan.create.process;
@@ -397,7 +398,11 @@ async fn detached_start_options(
         .argv
         .split_first()
         .ok_or_else(|| eyre::eyre!("guest command is required"))?;
-    let options = crate::commands::start_options::machine_start_options(runtime, machine).await?;
+    let options = context
+        .app_api()
+        .await?
+        .machine_start_options(machine, true)
+        .await?;
     let process = process.clone();
     let program = program.clone();
     let args = args.to_vec();
@@ -414,11 +419,38 @@ async fn detached_start_options(
 }
 
 async fn stop_run(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     run_id: MachineRunId,
     retention: MachineRetention,
+    progress: Option<tokio::sync::watch::Sender<&'static str>>,
 ) -> eyre::Result<()> {
-    match machine.stop_run(run_id).await {
+    // Listen before starting shutdown, including its initial quiet period.
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
+    if let Err(error) = &interrupt {
+        eprintln!("warning: cannot listen for Ctrl+C during shutdown: {error}");
+    }
+    let stopping = machine.stop_run(run_id.clone());
+    tokio::pin!(stopping);
+    let result = tokio::select! {
+        biased;
+        result = &mut stopping => result,
+        Some(()) = async {
+            match &mut interrupt {
+                Ok(signal) => signal.recv().await,
+                Err(_) => std::future::pending().await,
+            }
+        } => {
+            if let Some(progress) = &progress {
+                progress.send_replace("Forcing");
+            }
+            // Keep polling the graceful operation: it may already hold a
+            // cleanup lock. Dropping it or leaving it suspended could interrupt
+            // cleanup or deadlock the forced stop waiting for that same lock.
+            let (stopped, forced) = tokio::join!(stopping, machine.force_stop_run(run_id));
+            completed_stop(stopped, forced)
+        }
+    };
+    match result {
         Ok(_)
         | Err(libvm::LibVmError::MachineNotRunning { .. })
         | Err(libvm::LibVmError::MachineStaleGeneration { current: None, .. }) => {}
@@ -428,8 +460,19 @@ async fn stop_run(
     Ok(())
 }
 
+fn completed_stop<T>(
+    stopped: Result<T, libvm::LibVmError>,
+    forced: Result<T, libvm::LibVmError>,
+) -> Result<T, libvm::LibVmError> {
+    match (stopped, forced) {
+        (Ok(machine), _) | (_, Ok(machine)) => Ok(machine),
+        (Err(error), Err(libvm::LibVmError::MachineNotRunning { .. })) => Err(error),
+        (_, Err(error)) => Err(error),
+    }
+}
+
 async fn diagnose_readiness_failure(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     run_id: MachineRunId,
     retention: MachineRetention,
     error: libvm::LibVmError,
@@ -444,7 +487,7 @@ async fn diagnose_readiness_failure(
 }
 
 async fn diagnose_backend_exit(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     run_id: MachineRunId,
     retention: MachineRetention,
 ) -> Option<eyre::Report> {
@@ -496,7 +539,7 @@ fn execution_infrastructure(error: eyre::Report) -> eyre::Report {
 }
 
 async fn cleanup_foreground_failure(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     retention: MachineRetention,
     error: eyre::Report,
 ) -> eyre::Report {
@@ -505,7 +548,7 @@ async fn cleanup_foreground_failure(
 }
 
 async fn foreground_stop_failure(
-    machine: &libvm::Machine,
+    machine: &AppMachine,
     retention: MachineRetention,
     stop: eyre::Result<()>,
     error: eyre::Report,
@@ -523,7 +566,7 @@ async fn foreground_stop_failure(
     }
 }
 
-async fn cleanup_ephemeral_best_effort(machine: &libvm::Machine, retention: MachineRetention) {
+async fn cleanup_ephemeral_best_effort(machine: &AppMachine, retention: MachineRetention) {
     if retention != MachineRetention::Ephemeral {
         return;
     }
@@ -543,9 +586,52 @@ mod tests {
 
     use crate::app::Cli;
     use crate::commands::run::{
-        detached_default_workload_hint, detached_lifecycle_hint, start_failure,
+        completed_stop, detached_default_workload_hint, detached_lifecycle_hint, start_failure,
     };
     use crate::commands::Command;
+
+    #[test]
+    fn completed_stop_accepts_either_successful_shutdown() {
+        let timeout = || libvm::LibVmError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert_eq!(
+            completed_stop(Ok(1), Err(timeout())).expect("graceful success"),
+            1
+        );
+        assert_eq!(
+            completed_stop(Err(timeout()), Ok(2)).expect("forced success"),
+            2
+        );
+    }
+
+    #[test]
+    fn completed_stop_preserves_cleanup_errors_when_force_is_too_late() {
+        let result = completed_stop::<()>(
+            Err(libvm::LibVmError::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+            Err(libvm::LibVmError::MachineNotRunning {
+                reference: "vm".to_string(),
+            }),
+        );
+        assert!(
+            matches!(result, Err(libvm::LibVmError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn completed_stop_reports_failed_force() {
+        let result = completed_stop::<()>(
+            Err(libvm::LibVmError::Io(std::io::Error::from(
+                std::io::ErrorKind::TimedOut,
+            ))),
+            Err(libvm::LibVmError::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+        );
+        assert!(
+            matches!(result, Err(libvm::LibVmError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+    }
 
     #[test]
     fn run_parses_the_final_image_first_form() {

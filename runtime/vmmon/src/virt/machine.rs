@@ -66,6 +66,13 @@ impl VirtualMachine {
         &self.inner.name
     }
 
+    /// Live host memory reclaim reports when the backend can observe them.
+    pub fn host_memory_reclaim_updates(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<Option<crate::virt::HostMemoryReclaimReport>>> {
+        self.inner.backend.host_memory_reclaim_updates()
+    }
+
     pub fn backend_kind(&self) -> BackendKind {
         self.inner.kind
     }

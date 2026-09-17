@@ -13,7 +13,6 @@ use protocol::v1::{
     ProvisionStepReport, ProvisionStepStatus,
 };
 
-use crate::handoff::BootMode;
 use crate::pid1::ProcessSupervisor;
 
 mod ca;
@@ -23,19 +22,28 @@ mod mounts;
 mod network;
 mod resize;
 mod rosetta;
-mod service_manager;
 mod ssh;
 mod timezone;
 mod user;
 mod userdata;
 
-pub(crate) use service_manager::ServiceManagerState;
+#[derive(Debug, Default)]
+pub(crate) struct EarlyProvisioning {
+    rosetta: Option<ProvisionOutcome>,
+}
+
+pub(crate) fn prepare_early_provisioning(
+    config: &ProvisionConfig,
+) -> eyre::Result<EarlyProvisioning> {
+    let rosetta = rosetta::prepare_early(&config.rosetta)?;
+    Ok(EarlyProvisioning { rosetta })
+}
 
 pub fn run_provisioning(
     config: &ProvisionConfig,
     ssh_config: &AgentSshConfig,
     process_supervisor: &ProcessSupervisor,
-    boot_mode: &BootMode,
+    early: &EarlyProvisioning,
 ) -> eyre::Result<ProvisionReport> {
     let started_at = timestamp();
     let started = Instant::now();
@@ -53,10 +61,10 @@ pub fn run_provisioning(
         });
     }
 
-    let context = ProvisionContext::new(process_supervisor.clone(), boot_mode);
+    let context = ProvisionContext::new(process_supervisor.clone());
     tracing::info!("guest reconciliation starting");
 
-    let plan = provisioners(config, ssh_config)?;
+    let plan = provisioners(config, ssh_config, early)?;
     let mut run = ProvisionRun::default();
     run.run(&context, plan);
 
@@ -84,6 +92,7 @@ pub fn run_provisioning(
 fn provisioners<'a>(
     config: &'a ProvisionConfig,
     ssh_config: &'a AgentSshConfig,
+    early: &'a EarlyProvisioning,
 ) -> eyre::Result<ProvisionerPlan<'a>> {
     let mut provisioners: Vec<BoxedProvisioner<'a>> =
         vec![Box::new(network::Network::init(&config.network))];
@@ -98,7 +107,10 @@ fn provisioners<'a>(
         )),
         Box::new(resize::ResizeRootfs::init(&config.resize_rootfs)),
         Box::new(mounts::Mounts::init(&config.mounts)),
-        Box::new(rosetta::Rosetta::init(&config.rosetta)),
+        Box::new(rosetta::Rosetta::with_early_outcome(
+            &config.rosetta,
+            early.rosetta.as_ref(),
+        )),
         Box::new(userdata::Userdata::init(&config.userdata)),
     ]);
     ProvisionerPlan::new(provisioners)
@@ -566,15 +578,13 @@ fn proto_duration(duration: Duration) -> prost_types::Duration {
 pub(crate) struct ProvisionContext {
     root: PathBuf,
     process_supervisor: ProcessSupervisor,
-    service_manager: ServiceManagerState,
 }
 
 impl ProvisionContext {
-    fn new(process_supervisor: ProcessSupervisor, boot_mode: &BootMode) -> Self {
+    fn new(process_supervisor: ProcessSupervisor) -> Self {
         Self {
             root: PathBuf::from("/"),
             process_supervisor,
-            service_manager: ServiceManagerState::detect(boot_mode),
         }
     }
 
@@ -583,7 +593,6 @@ impl ProvisionContext {
         Self {
             root: root.to_path_buf(),
             process_supervisor: ProcessSupervisor::default(),
-            service_manager: ServiceManagerState::detect(&BootMode::Standard),
         }
     }
 
@@ -595,10 +604,6 @@ impl ProvisionContext {
 
     pub(crate) fn process_supervisor(&self) -> &ProcessSupervisor {
         &self.process_supervisor
-    }
-
-    pub(crate) fn service_manager(&self) -> &ServiceManagerState {
-        &self.service_manager
     }
 }
 
@@ -671,26 +676,6 @@ where
     String::from_utf8(output.stdout).with_context(|| {
         format!(
             "decode stdout from provisioning command {} as UTF-8",
-            format_command(program, &args)
-        )
-    })
-}
-
-pub(crate) fn command_status<I, S>(
-    process_supervisor: &ProcessSupervisor,
-    program: &str,
-    args: I,
-) -> eyre::Result<std::process::ExitStatus>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let args = collect_command_args(args);
-    tracing::debug!(program, args = ?args, "running provisioning command");
-
-    process_supervisor.status(program, &args).with_context(|| {
-        format!(
-            "run provisioning command {}",
             format_command(program, &args)
         )
     })
@@ -873,10 +858,7 @@ mod tests {
     fn run_plan<'a>(run: &mut ProvisionRun, provisioners: Vec<BoxedProvisioner<'a>>) {
         let plan =
             ProvisionerPlan::new(provisioners).expect("test provisioner plan should be valid");
-        let context = ProvisionContext::new(
-            crate::pid1::ProcessSupervisor::default(),
-            &crate::handoff::BootMode::Standard,
-        );
+        let context = ProvisionContext::new(crate::pid1::ProcessSupervisor::default());
         run.run(&context, plan);
     }
 
@@ -1179,7 +1161,12 @@ mod tests {
         let config = agent_spec::ProvisionConfig::default();
         let ssh_config = agent_spec::AgentSshConfig::default();
 
-        provisioners(&config, &ssh_config).expect("built-in provisioner plan should be valid");
+        provisioners(
+            &config,
+            &ssh_config,
+            &crate::provision::EarlyProvisioning::default(),
+        )
+        .expect("built-in provisioner plan should be valid");
     }
 
     #[test]
@@ -1187,7 +1174,8 @@ mod tests {
         let config = agent_spec::ProvisionConfig::default();
         let ssh_config = agent_spec::AgentSshConfig::default();
 
-        let plan = provisioners(&config, &ssh_config).expect("build provisioner plan");
+        let early = crate::provision::EarlyProvisioning::default();
+        let plan = provisioners(&config, &ssh_config, &early).expect("build provisioner plan");
         let network = plan.provisioners.first().expect("network provisioner");
 
         assert_eq!(network.id(), ProvisionerId::NETWORK);
@@ -1215,7 +1203,8 @@ mod tests {
         };
         let ssh_config = agent_spec::AgentSshConfig::default();
 
-        let plan = provisioners(&config, &ssh_config).expect("build provisioner plan");
+        let early = crate::provision::EarlyProvisioning::default();
+        let plan = provisioners(&config, &ssh_config, &early).expect("build provisioner plan");
         let network = plan.provisioners.first().expect("network provisioner");
 
         assert_eq!(network.id(), ProvisionerId::NETWORK);
@@ -1227,7 +1216,8 @@ mod tests {
         let config = agent_spec::ProvisionConfig::default();
         let ssh_config = agent_spec::AgentSshConfig::default();
 
-        let plan = provisioners(&config, &ssh_config).expect("build provisioner plan");
+        let early = crate::provision::EarlyProvisioning::default();
+        let plan = provisioners(&config, &ssh_config, &early).expect("build provisioner plan");
         let resize = plan
             .provisioners
             .iter()

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
@@ -10,6 +10,11 @@ use serde_json::Value;
 
 /// Default filename for the public hybrid vsock mux.
 pub const DEFAULT_VSOCK_MUX_FILENAME: &str = "vsock.sock";
+
+/// Maximum virtio-fs tag size supported by the virtualization backends.
+pub const VIRTIOFS_TAG_MAX_BYTES: usize = 36;
+
+const GENERATED_MOUNT_TAG_PREFIX: &str = "silo-mount-";
 
 /// Top-level Silo virtual machine specification.
 ///
@@ -70,6 +75,7 @@ impl VmSpec {
         if let Some(vsock) = &self.vsock {
             vsock.validate().map_err(str::to_owned)?;
         }
+        project_mounts(&self.mounts).map_err(|error| error.to_string())?;
         let mux_filename = effective_vsock_filename(self.vsock.as_ref()).and_then(Path::to_str);
         forward_spec::validate_forwards(&self.forwards, mux_filename)
             .map_err(|error| error.to_string())
@@ -103,7 +109,7 @@ impl<'de> Visitor<'de> for VmSpecVisitor {
         let mut boot = None;
         let mut hardware = None;
         let mut storage = None;
-        let mut mounts = None;
+        let mut mounts: Option<Vec<Mount>> = None;
         let mut forwards: Option<Vec<forward_spec::Forward>> = None;
         let mut vsock = None;
         let mut annotations = None;
@@ -191,6 +197,8 @@ impl<'de> Visitor<'de> for VmSpecVisitor {
             }
         }
 
+        let mounts = mounts.unwrap_or_default();
+        project_mounts(&mounts).map_err(A::Error::custom)?;
         let forwards = forwards.unwrap_or_default();
         let mux_filename = effective_vsock_filename(vsock.as_ref().map(|parsed| &parsed.value))
             .and_then(Path::to_str);
@@ -202,7 +210,7 @@ impl<'de> Visitor<'de> for VmSpecVisitor {
             boot: boot.flatten(),
             hardware: hardware.flatten(),
             storage: storage.flatten(),
-            mounts: mounts.unwrap_or_default(),
+            mounts,
             forwards,
             vsock: vsock.map(|parsed| parsed.value),
             annotations: annotations.unwrap_or_default(),
@@ -298,11 +306,120 @@ pub struct Disk {
 pub struct Mount {
     /// Host path to share with the guest.
     pub source: PathBuf,
-    /// Guest mount tag used by the virtualization backend.
+    /// Original mount tag, interpreted at runtime without changing persistence.
     pub tag: String,
     /// Mount the share read-only.
     #[serde(default)]
     pub read_only: bool,
+}
+
+/// Runtime view of a persisted mount, with backend identity separated from paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedMount {
+    /// Original host directory without path rewriting.
+    pub host_source: PathBuf,
+    /// Original absolute tag, or the host source for legacy named tags.
+    pub guest_path: PathBuf,
+    /// Tag passed to the virtualization backend and guest mount command.
+    pub backend_tag: String,
+    /// Whether the share is mounted read-only.
+    pub read_only: bool,
+}
+
+/// Invalid persisted mount data that cannot be projected safely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountProjectionError {
+    /// A mount tag is empty or consists only of whitespace.
+    EmptyTag { mount_source: PathBuf },
+    /// A mount tag contains a NUL byte.
+    NulTag { tag: String },
+    /// Two mounts use the same original tag.
+    DuplicateTag { tag: String },
+    /// Every generated tag representable by the monotonic counter is reserved.
+    GeneratedTagSpaceExhausted,
+}
+
+impl fmt::Display for MountProjectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyTag { mount_source } => write!(
+                formatter,
+                "invalid mount tag for {}: mount tags must be non-empty",
+                mount_source.display()
+            ),
+            Self::NulTag { tag } => write!(
+                formatter,
+                "invalid mount tag {tag:?}: mount tags must not contain NUL bytes"
+            ),
+            Self::DuplicateTag { tag } => {
+                write!(formatter, "mount tag {tag:?} is repeated")
+            }
+            Self::GeneratedTagSpaceExhausted => {
+                formatter.write_str("generated mount tag counter exhausted")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MountProjectionError {}
+
+/// Project persisted mounts into their host, guest, and backend identities.
+pub fn project_mounts(mounts: &[Mount]) -> Result<Vec<ProjectedMount>, MountProjectionError> {
+    let mut original_tags = BTreeSet::new();
+    let mut reserved_backend_tags = BTreeSet::new();
+
+    for mount in mounts {
+        if mount.tag.trim().is_empty() {
+            return Err(MountProjectionError::EmptyTag {
+                mount_source: mount.source.clone(),
+            });
+        }
+        if mount.tag.contains('\0') {
+            return Err(MountProjectionError::NulTag {
+                tag: mount.tag.clone(),
+            });
+        }
+        if !original_tags.insert(mount.tag.as_str()) {
+            return Err(MountProjectionError::DuplicateTag {
+                tag: mount.tag.clone(),
+            });
+        }
+        if mount.tag.len() <= VIRTIOFS_TAG_MAX_BYTES {
+            reserved_backend_tags.insert(mount.tag.clone());
+        }
+    }
+
+    let mut next_generated_tag = Some(0_u64);
+    mounts
+        .iter()
+        .map(|mount| {
+            let backend_tag = if mount.tag.len() <= VIRTIOFS_TAG_MAX_BYTES {
+                mount.tag.clone()
+            } else {
+                loop {
+                    let counter = next_generated_tag
+                        .ok_or(MountProjectionError::GeneratedTagSpaceExhausted)?;
+                    next_generated_tag = counter.checked_add(1);
+                    let candidate = format!("{GENERATED_MOUNT_TAG_PREFIX}{counter}");
+                    if reserved_backend_tags.insert(candidate.clone()) {
+                        break candidate;
+                    }
+                }
+            };
+            let guest_path = if mount.tag.starts_with('/') {
+                PathBuf::from(&mount.tag)
+            } else {
+                mount.source.clone()
+            };
+
+            Ok(ProjectedMount {
+                host_source: mount.source.clone(),
+                guest_path,
+                backend_tag,
+                read_only: mount.read_only,
+            })
+        })
+        .collect()
 }
 
 /// Public hybrid vsock host surface.
@@ -511,8 +628,9 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        effective_vsock_enabled, effective_vsock_filename, Boot, Disk, Guest, GuestOs, Hardware,
-        Kernel, Mount, Storage, VmSpec, Vsock, DEFAULT_VSOCK_MUX_FILENAME,
+        effective_vsock_enabled, effective_vsock_filename, project_mounts, Boot, Disk, Guest,
+        GuestOs, Hardware, Kernel, Mount, MountProjectionError, Storage, VmSpec, Vsock,
+        DEFAULT_VSOCK_MUX_FILENAME, GENERATED_MOUNT_TAG_PREFIX, VIRTIOFS_TAG_MAX_BYTES,
     };
 
     fn forward(listen: &str, connect: &str) -> forward_spec::Forward {
@@ -636,6 +754,210 @@ mod tests {
                 "annotations": { "io.silo.demo": "true" }
             })
         );
+    }
+
+    #[test]
+    fn mount_projection_separates_long_absolute_destination_from_backend_tag() {
+        let source = PathBuf::from("/host/a/very/long/workspace/source/that/must/not/change");
+        let destination = "/guest/a/very/long/workspace/destination/that/exceeds/the/tag/field";
+        let mounts = vec![Mount {
+            source: source.clone(),
+            tag: destination.to_string(),
+            read_only: true,
+        }];
+
+        let projected = project_mounts(&mounts).expect("project long absolute mount");
+
+        assert_eq!(projected[0].host_source, source);
+        assert_eq!(projected[0].guest_path, PathBuf::from(destination));
+        assert_eq!(projected[0].backend_tag, "silo-mount-0");
+        assert!(projected[0].read_only);
+        assert_eq!(mounts[0].tag, destination);
+    }
+
+    #[test]
+    fn mount_projection_uses_source_as_legacy_named_guest_path() {
+        let source = PathBuf::from("/host/and/guest/workspace");
+        let long_name = "named-workspace-with-a-tag-longer-than-thirty-six-bytes";
+        let projected = project_mounts(&[Mount {
+            source: source.clone(),
+            tag: long_name.to_string(),
+            read_only: false,
+        }])
+        .expect("project long named mount");
+
+        assert_eq!(projected[0].host_source, source);
+        assert_eq!(projected[0].guest_path, projected[0].host_source);
+        assert_eq!(projected[0].backend_tag, "silo-mount-0");
+    }
+
+    #[test]
+    fn mount_projection_applies_the_backend_limit_in_utf8_bytes() {
+        let exactly_36_bytes = "界".repeat(12);
+        let over_36_bytes = "界".repeat(13);
+        let projected = project_mounts(&[
+            Mount {
+                source: PathBuf::from("/exact"),
+                tag: exactly_36_bytes.clone(),
+                read_only: false,
+            },
+            Mount {
+                source: PathBuf::from("/over"),
+                tag: over_36_bytes,
+                read_only: false,
+            },
+        ])
+        .expect("project UTF-8 tags");
+
+        assert_eq!(exactly_36_bytes.len(), VIRTIOFS_TAG_MAX_BYTES);
+        assert_eq!(projected[0].backend_tag, exactly_36_bytes);
+        assert_eq!(projected[1].backend_tag, "silo-mount-0");
+    }
+
+    #[test]
+    fn mount_projection_reserves_all_short_literals_before_generating_tags() {
+        let projected = project_mounts(&[
+            Mount {
+                source: PathBuf::from("/first"),
+                tag: "/guest/destination/that/is/far/too/long/for/virtiofs".to_string(),
+                read_only: false,
+            },
+            Mount {
+                source: PathBuf::from("/literal"),
+                tag: "silo-mount-0".to_string(),
+                read_only: false,
+            },
+            Mount {
+                source: PathBuf::from("/second"),
+                tag: "another-named-workspace-tag-that-is-also-oversized".to_string(),
+                read_only: false,
+            },
+        ])
+        .expect("project colliding literal tag");
+
+        assert_eq!(projected[0].backend_tag, "silo-mount-1");
+        assert_eq!(projected[1].backend_tag, "silo-mount-0");
+        assert_eq!(projected[2].backend_tag, "silo-mount-2");
+        assert_eq!(
+            format!("{GENERATED_MOUNT_TAG_PREFIX}{}", u64::MAX).len(),
+            31
+        );
+    }
+
+    #[test]
+    fn mount_projection_preserves_named_and_short_absolute_tags() {
+        let projected = project_mounts(&[
+            Mount {
+                source: PathBuf::from("/workspace"),
+                tag: "workspace".to_string(),
+                read_only: false,
+            },
+            Mount {
+                source: PathBuf::from("/host/cache"),
+                tag: "/cache".to_string(),
+                read_only: true,
+            },
+        ])
+        .expect("project compatible tags");
+
+        assert_eq!(projected[0].backend_tag, "workspace");
+        assert_eq!(projected[0].guest_path, PathBuf::from("/workspace"));
+        assert_eq!(projected[1].backend_tag, "/cache");
+        assert_eq!(projected[1].guest_path, PathBuf::from("/cache"));
+    }
+
+    #[test]
+    fn mount_projection_rejects_invalid_original_tags() {
+        for (tags, expected) in [
+            (vec!["   "], "must be non-empty"),
+            (vec!["bad\0tag"], "must not contain NUL"),
+            (vec!["workspace", "workspace"], "is repeated"),
+        ] {
+            let mounts = tags
+                .into_iter()
+                .map(|tag| Mount {
+                    source: PathBuf::from("/workspace"),
+                    tag: tag.to_string(),
+                    read_only: false,
+                })
+                .collect::<Vec<_>>();
+
+            let error = project_mounts(&mounts).expect_err("invalid tags must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+
+        let duplicate = project_mounts(&[
+            Mount {
+                source: PathBuf::from("/one"),
+                tag: "duplicate".to_string(),
+                read_only: false,
+            },
+            Mount {
+                source: PathBuf::from("/two"),
+                tag: "duplicate".to_string(),
+                read_only: true,
+            },
+        ])
+        .expect_err("duplicate original tags must fail before VM construction");
+        assert_eq!(
+            duplicate,
+            MountProjectionError::DuplicateTag {
+                tag: "duplicate".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn mount_projection_does_not_change_persisted_wire_format() {
+        let mount = Mount {
+            source: PathBuf::from("/host/workspace"),
+            tag: "/guest/workspace/with/a/destination/longer/than/the/backend/field".to_string(),
+            read_only: true,
+        };
+
+        assert_eq!(
+            serde_json::to_value(&mount).expect("serialize persisted mount"),
+            json!({
+                "source": "/host/workspace",
+                "tag": "/guest/workspace/with/a/destination/longer/than/the/backend/field",
+                "readOnly": true
+            })
+        );
+    }
+
+    #[test]
+    fn vm_spec_validation_and_deserialization_reject_invalid_mounts() {
+        let invalid = VmSpec {
+            mounts: vec![
+                Mount {
+                    source: PathBuf::from("/one"),
+                    tag: "workspace".to_string(),
+                    read_only: false,
+                },
+                Mount {
+                    source: PathBuf::from("/two"),
+                    tag: "workspace".to_string(),
+                    read_only: true,
+                },
+            ],
+            ..VmSpec::current()
+        };
+        assert!(invalid
+            .validate()
+            .expect_err("programmatic duplicate tags must fail")
+            .contains("mount tag \"workspace\" is repeated"));
+
+        let error = serde_json::from_value::<VmSpec>(json!({
+            "specVersion": "0.1.0",
+            "mounts": [
+                { "source": "/one", "tag": "workspace" },
+                { "source": "/two", "tag": "workspace" }
+            ]
+        }))
+        .expect_err("persisted duplicate tags must fail while parsing");
+        assert!(error
+            .to_string()
+            .contains("mount tag \"workspace\" is repeated"));
     }
 
     #[test]

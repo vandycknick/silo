@@ -49,6 +49,12 @@ pub struct ServiceHandles {
     pub(crate) forwards: Option<Arc<crate::forward::ForwardTable>>,
 }
 
+pub(crate) struct StartupGate {
+    pub(crate) require_guest_ready: bool,
+    pub(crate) deadline: tokio::time::Instant,
+    pub(crate) cancelled: CancellationToken,
+}
+
 #[derive(Clone)]
 struct MonitorService {
     store: Arc<InstanceStore>,
@@ -252,7 +258,13 @@ pub async fn start_services(
     exec_log: Option<crate::exec_log::ExecLogWriter>,
     vsock_surface: Option<crate::vsock::VsockSurface>,
     sync_reporter: &mut SyncReporter,
+    startup: StartupGate,
 ) -> eyre::Result<ServiceHandles> {
+    let StartupGate {
+        require_guest_ready,
+        deadline: startup_deadline,
+        cancelled: startup_cancel,
+    } = startup;
     let path = runtime.socket().to_path_buf();
     let listener = UnixListener::bind(&path).context(format!("bind socket {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
@@ -324,7 +336,7 @@ pub async fn start_services(
     let execution = ExecutionService::new(ctx, exec_log.clone());
     let filesystem = FilesystemProxy::new(ctx.machine.clone(), ctx.shutdown.clone());
     let forwards = crate::forward::service::ForwardService::new(ctx.forwards.clone());
-    let control_socket = tokio::spawn(async move {
+    let mut control_socket = tokio::spawn(async move {
         let monitor = VmMonitorServiceServer::new(monitor)
             .max_decoding_message_size(protocol::STRUCTURED_16_MIB)
             .max_encoding_message_size(protocol::STRUCTURED_16_MIB);
@@ -390,19 +402,52 @@ pub async fn start_services(
             .map_err(eyre::Report::from)
     });
 
-    let guest_monitor = if ctx.guest_services_enabled {
-        Some(
-            spawn_guest_services(
-                &ctx.machine,
-                ctx.store.clone(),
-                ctx.forwards.clone(),
-                ctx.shutdown.clone(),
-            )
-            .await?,
-        )
+    let mut guest_monitor = if ctx.guest_services_enabled {
+        let guest_start = tokio::select! {
+            result = tokio::time::timeout_at(
+                startup_deadline,
+                spawn_guest_services(
+                    &ctx.machine,
+                    ctx.store.clone(),
+                    ctx.forwards.clone(),
+                    ctx.shutdown.clone(),
+                ),
+            ) => match result {
+                Ok(result) => result,
+                Err(_) => Err(eyre::eyre!("guest service startup exceeded the original startup deadline")),
+            },
+            () = startup_cancel.cancelled() => Err(eyre::eyre!("guest service startup cancelled")),
+        };
+        match guest_start {
+            Ok(task) => Some(task),
+            Err(error) => {
+                cleanup_failed_service_start(
+                    &server_shutdown,
+                    &mut control_socket,
+                    &mut None,
+                    &mut None,
+                )
+                .await;
+                return Err(error);
+            }
+        }
     } else {
         None
     };
+    if require_guest_ready {
+        if let Err(error) =
+            wait_for_required_guest_ready(ctx, startup_deadline, &startup_cancel).await
+        {
+            cleanup_failed_service_start(
+                &server_shutdown,
+                &mut control_socket,
+                &mut guest_monitor,
+                &mut None,
+            )
+            .await;
+            return Err(error);
+        }
+    }
     if let Some(exec_log) = &exec_log {
         exec_log.generation(
             &ctx.machine_id.hyphenated().to_string(),
@@ -412,29 +457,57 @@ pub async fn start_services(
     }
     let startup_command = startup_command
         .map(|command| crate::execution::spawn_startup_command(ctx, command, exec_log));
-    let startup_command = match startup_command {
-        Some(crate::execution::StartupCommandHandle { task, started }) => match started.await {
-            Ok(Ok(())) => Some(task),
-            Ok(Err(error)) => {
-                let _ = task.await;
-                if let crate::execution::StartupCommandStartError::LaunchFailed {
-                    reason,
-                    message,
-                } = &error
-                {
-                    sync_reporter.report_startup_command_launch_failed(*reason, Some(message))?;
+    let mut startup_command = match startup_command {
+        Some(crate::execution::StartupCommandHandle { task, started }) => {
+            let started = tokio::select! {
+                result = tokio::time::timeout_at(startup_deadline, started) => match result {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(_)) => Err(eyre::eyre!("startup command supervisor ended before reporting Started")),
+                    Err(_) => Err(eyre::eyre!("startup command launch exceeded the original startup deadline")),
+                },
+                () = startup_cancel.cancelled() => Err(eyre::eyre!("startup command launch cancelled")),
+            };
+            match started {
+                Ok(Ok(())) => Some(task),
+                Ok(Err(error)) => {
+                    task.abort();
+                    let _ = task.await;
+                    if let crate::execution::StartupCommandStartError::LaunchFailed {
+                        reason,
+                        message,
+                    } = &error
+                    {
+                        if let Err(report_error) = sync_reporter
+                            .report_startup_command_launch_failed(*reason, Some(message))
+                        {
+                            tracing::warn!(%report_error, "failed to report startup command launch failure");
+                        }
+                    }
+                    cleanup_failed_service_start(
+                        &server_shutdown,
+                        &mut control_socket,
+                        &mut guest_monitor,
+                        &mut None,
+                    )
+                    .await;
+                    return Err(eyre::eyre!(
+                        "startup command failed before Started: {error}"
+                    ));
                 }
-                return Err(eyre::eyre!(
-                    "startup command failed before Started: {error}"
-                ));
+                Err(error) => {
+                    task.abort();
+                    let _ = task.await;
+                    cleanup_failed_service_start(
+                        &server_shutdown,
+                        &mut control_socket,
+                        &mut guest_monitor,
+                        &mut None,
+                    )
+                    .await;
+                    return Err(error);
+                }
             }
-            Err(_) => {
-                let _ = task.await;
-                return Err(eyre::eyre!(
-                    "startup command supervisor ended before reporting Started"
-                ));
-            }
-        },
+        }
         None => None,
     };
     tracing::info!(
@@ -442,7 +515,16 @@ pub async fn start_services(
         guest_services_enabled = ctx.guest_services_enabled,
         "vmmon gRPC control plane is serving"
     );
-    sync_reporter.report_started()?;
+    if let Err(error) = sync_reporter.report_started() {
+        cleanup_failed_service_start(
+            &server_shutdown,
+            &mut control_socket,
+            &mut guest_monitor,
+            &mut startup_command,
+        )
+        .await;
+        return Err(error.into());
+    }
     Ok(ServiceHandles {
         control_socket,
         guest_monitor,
@@ -452,6 +534,55 @@ pub async fn start_services(
         vsock_surface,
         forwards: Some(ctx.forwards.clone()),
     })
+}
+
+async fn cleanup_failed_service_start(
+    server_shutdown: &CancellationToken,
+    control_socket: &mut JoinHandle<eyre::Result<()>>,
+    guest_monitor: &mut Option<JoinHandle<()>>,
+    startup_command: &mut Option<JoinHandle<()>>,
+) {
+    server_shutdown.cancel();
+    if let Some(task) = startup_command.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some(task) = guest_monitor.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    control_socket.abort();
+    let _ = control_socket.await;
+}
+
+async fn wait_for_required_guest_ready(
+    ctx: &DaemonContext,
+    deadline: tokio::time::Instant,
+    cancelled: &CancellationToken,
+) -> eyre::Result<()> {
+    let mut changed = ctx.store.subscribe();
+    loop {
+        match ctx.store.readiness()? {
+            WaitOutcome::Ready => return Ok(()),
+            WaitOutcome::Terminal => {
+                return Err(eyre::eyre!(
+                    "required guest translation bootstrap or workload readiness failed"
+                ));
+            }
+            WaitOutcome::TimedOut => {}
+        }
+        tokio::select! {
+            result = tokio::time::timeout_at(deadline, changed.changed()) => {
+                result
+                    .map_err(|_| eyre::eyre!("required guest readiness timed out"))?
+                    .map_err(|_| eyre::eyre!("required guest readiness owner stopped"))?;
+            }
+            exit = ctx.machine.wait() => {
+                return Err(eyre::eyre!("primary helper exited before required guest readiness: {:?}", exit?));
+            }
+            () = cancelled.cancelled() => return Err(eyre::eyre!("required guest readiness cancelled")),
+        }
+    }
 }
 
 fn relay<S, I>(

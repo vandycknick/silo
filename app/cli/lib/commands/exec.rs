@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use clap::Args;
 use eyre::bail;
 
+use crate::api::streams as guest;
 use crate::context::Context;
-use crate::guest;
 
 #[derive(Debug, Args)]
 #[command(about = "Execute a command in a running VM")]

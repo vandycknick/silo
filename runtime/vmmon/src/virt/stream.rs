@@ -11,15 +11,14 @@
 //! VZ reserves capacity in its synchronous framework callback and transports
 //! the same lease into this common stream wrapper without double accounting.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-#[cfg(target_os = "linux")]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::pin::Pin;
-#[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{ready, Context, Poll};
 
@@ -28,7 +27,6 @@ use std::collections::VecDeque;
 
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
-#[cfg(target_os = "linux")]
 use tokio::sync::mpsc;
 
 use crate::virt::capacity::{VsockCapacity, VsockLease, VsockListenerAdmission};
@@ -44,6 +42,7 @@ pub struct VsockStream {
     destination_port: u32,
     _lease: Option<VsockLease>,
     _synthetic_source: Option<SyntheticPortLease>,
+    _session_guard: Option<KrunVsockStreamGuard>,
 }
 
 enum VsockStreamInner {
@@ -65,6 +64,24 @@ impl VsockStream {
             destination_port,
             _lease: lease,
             _synthetic_source: None,
+            _session_guard: None,
+        }
+    }
+
+    pub(crate) fn from_krun_stream(
+        stream: UnixStream,
+        source_port: u32,
+        destination_port: u32,
+        lease: VsockLease,
+        session_guard: KrunVsockStreamGuard,
+    ) -> Self {
+        Self {
+            inner: VsockStreamInner::Unix(stream),
+            source_port: Some(source_port),
+            destination_port,
+            _lease: Some(lease),
+            _synthetic_source: None,
+            _session_guard: Some(session_guard),
         }
     }
 
@@ -80,6 +97,7 @@ impl VsockStream {
             destination_port,
             _lease: Some(lease),
             _synthetic_source: Some(source),
+            _session_guard: None,
         }
     }
 
@@ -96,6 +114,7 @@ impl VsockStream {
             destination_port,
             _lease: lease,
             _synthetic_source: None,
+            _session_guard: None,
         }
     }
 
@@ -232,7 +251,6 @@ pub struct VsockListener {
 
 enum VsockListenerInner {
     Unix(UnixListener),
-    #[cfg(target_os = "linux")]
     Krun(mpsc::Receiver<PendingUnixVsock>),
     #[cfg(target_os = "macos")]
     Vz {
@@ -241,13 +259,157 @@ enum VsockListenerInner {
     },
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) struct PendingUnixVsock {
     pub(crate) stream: StdUnixStream,
     pub(crate) source_port: u32,
     pub(crate) destination_port: u32,
-    pub(crate) lease: VsockLease,
-    pub(crate) session_active: Arc<AtomicBool>,
+    pub(crate) lease: KrunPendingLease,
+    pub(crate) session: Arc<KrunVsockSession>,
+    pub(crate) session_guard: KrunVsockStreamGuard,
+}
+
+#[derive(Debug)]
+pub(crate) struct KrunVsockSession {
+    active: AtomicBool,
+    next_stream: AtomicU64,
+    streams: Mutex<HashMap<u64, OwnedFd>>,
+    pending_leases: Mutex<HashMap<u64, Arc<Mutex<Option<VsockLease>>>>>,
+}
+
+impl KrunVsockSession {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            active: AtomicBool::new(true),
+            next_stream: AtomicU64::new(1),
+            streams: Mutex::new(HashMap::new()),
+            pending_leases: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn track(self: &Arc<Self>, fd: BorrowedFd<'_>) -> io::Result<KrunVsockStreamGuard> {
+        let id = self.allocate_id()?;
+        let tracked = nix::unistd::dup(fd).map_err(io::Error::other)?;
+        let mut flags = nix::fcntl::FdFlag::from_bits_retain(
+            nix::fcntl::fcntl(&tracked, nix::fcntl::FcntlArg::F_GETFD).map_err(io::Error::other)?,
+        );
+        flags.insert(nix::fcntl::FdFlag::FD_CLOEXEC);
+        nix::fcntl::fcntl(&tracked, nix::fcntl::FcntlArg::F_SETFD(flags))
+            .map_err(io::Error::other)?;
+        let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.is_active() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "krun vsock session stopped",
+            ));
+        }
+        streams.insert(id, tracked);
+        Ok(KrunVsockStreamGuard {
+            session: self.clone(),
+            id,
+        })
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.active.store(false, Ordering::Release);
+        let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        for fd in streams.values() {
+            let _ = nix::sys::socket::shutdown(fd.as_raw_fd(), nix::sys::socket::Shutdown::Both);
+        }
+        streams.clear();
+        let mut pending = self
+            .pending_leases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for lease in pending.values() {
+            lease.lock().unwrap_or_else(PoisonError::into_inner).take();
+        }
+        pending.clear();
+    }
+
+    pub(crate) fn hold_lease(self: &Arc<Self>, lease: VsockLease) -> Option<KrunPendingLease> {
+        let id = self.allocate_id().ok()?;
+        let lease = Arc::new(Mutex::new(Some(lease)));
+        let mut pending = self
+            .pending_leases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !self.is_active() {
+            return None;
+        }
+        pending.insert(id, lease.clone());
+        Some(KrunPendingLease {
+            session: self.clone(),
+            id,
+            lease,
+        })
+    }
+
+    fn allocate_id(&self) -> io::Result<u64> {
+        match self
+            .next_stream
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            }) {
+            Ok(id) => Ok(id),
+            Err(_) => {
+                self.shutdown();
+                Err(io::Error::other("krun vsock session id space exhausted"))
+            }
+        }
+    }
+}
+
+pub(crate) struct KrunVsockStreamGuard {
+    session: Arc<KrunVsockSession>,
+    id: u64,
+}
+
+pub(crate) struct KrunPendingLease {
+    session: Arc<KrunVsockSession>,
+    id: u64,
+    lease: Arc<Mutex<Option<VsockLease>>>,
+}
+
+impl KrunPendingLease {
+    fn take(&self) -> Option<VsockLease> {
+        self.session
+            .pending_leases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+        self.lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl Drop for KrunPendingLease {
+    fn drop(&mut self) {
+        self.session
+            .pending_leases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+        self.lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+}
+
+impl Drop for KrunVsockStreamGuard {
+    fn drop(&mut self) {
+        self.session
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+    }
 }
 
 struct ListenerCleanup(Option<Box<dyn FnOnce() + Send>>);
@@ -290,7 +452,6 @@ impl VsockListener {
         }
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn from_krun_channel<F>(
         receiver: mpsc::Receiver<PendingUnixVsock>,
         registered_port: u32,
@@ -342,18 +503,22 @@ impl VsockListener {
             VsockListenerInner::Unix(listener) => listener.accept().await.map(|(stream, _)| {
                 VsockStream::from_unix_stream(stream, None, self.registered_port, None)
             })?,
-            #[cfg(target_os = "linux")]
             VsockListenerInner::Krun(receiver) => loop {
                 let pending = receiver.recv().await.ok_or_else(|| {
                     VirtError::Backend("krun vsock backend stopped while listening".to_string())
                 })?;
-                if pending.session_active.load(Ordering::Acquire) {
-                    break VsockStream::from_unix_stream(
+                if pending.session.is_active() {
+                    let Some(lease) = pending.lease.take() else {
+                        continue;
+                    };
+                    let mut stream = VsockStream::from_unix_stream(
                         UnixStream::from_std(pending.stream)?,
                         Some(pending.source_port),
                         pending.destination_port,
-                        Some(pending.lease),
+                        Some(lease),
                     );
+                    stream._session_guard = Some(pending.session_guard);
+                    break stream;
                 }
             },
             #[cfg(target_os = "macos")]
@@ -383,16 +548,20 @@ impl VsockListener {
             VsockListenerInner::Unix(listener) => try_accept_unix(listener)?.map(|stream| {
                 VsockStream::from_unix_stream(stream, None, self.registered_port, None)
             }),
-            #[cfg(target_os = "linux")]
             VsockListenerInner::Krun(receiver) => loop {
                 match receiver.try_recv() {
-                    Ok(pending) if pending.session_active.load(Ordering::Acquire) => {
-                        break Some(VsockStream::from_unix_stream(
+                    Ok(pending) if pending.session.is_active() => {
+                        let Some(lease) = pending.lease.take() else {
+                            continue;
+                        };
+                        let mut stream = VsockStream::from_unix_stream(
                             UnixStream::from_std(pending.stream)?,
                             Some(pending.source_port),
                             pending.destination_port,
-                            Some(pending.lease),
-                        ));
+                            Some(lease),
+                        );
+                        stream._session_guard = Some(pending.session_guard);
+                        break Some(stream);
                     }
                     Ok(_) => continue,
                     Err(mpsc::error::TryRecvError::Empty) => break None,
@@ -752,9 +921,10 @@ fn shutdown_write<F: AsRawFd>(file: &F) -> io::Result<()> {
 mod tests {
     use std::fs::File;
     use std::io::{self, Read, Write};
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use nix::libc;
@@ -763,7 +933,8 @@ mod tests {
 
     use crate::virt::capacity::VsockCapacity;
     use crate::virt::stream::{
-        SerialDevice, SyntheticPortAllocator, VsockListener, VsockStream, SYNTHETIC_SOURCE_BASE,
+        KrunVsockSession, SerialDevice, SyntheticPortAllocator, VsockListener, VsockStream,
+        SYNTHETIC_SOURCE_BASE,
     };
     use crate::virt::VirtError;
 
@@ -807,6 +978,41 @@ mod tests {
         }
 
         assert_eq!(&buf, b"ping");
+    }
+
+    #[test]
+    fn krun_session_id_exhaustion_fences_tracked_streams_without_reuse() {
+        let session = KrunVsockSession::new();
+        session.next_stream.store(u64::MAX - 1, Ordering::Relaxed);
+        let (stream, mut peer) = StdUnixStream::pair().expect("stream pair");
+        let _guard = session.track(stream.as_fd()).expect("last stream id");
+        let (next, _next_peer) = StdUnixStream::pair().expect("next stream pair");
+
+        let error = match session.track(next.as_fd()) {
+            Ok(_) => panic!("wrapped stream id must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("id space exhausted"));
+        assert!(!session.is_active());
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("read timeout");
+        assert_eq!(peer.read(&mut [0_u8; 1]).expect("fenced stream EOF"), 0);
+    }
+
+    #[test]
+    fn krun_session_id_exhaustion_releases_pending_lease() {
+        let session = KrunVsockSession::new();
+        session.next_stream.store(u64::MAX - 1, Ordering::Relaxed);
+        let capacity = VsockCapacity::test_with_limit("session-id", 1);
+        let pending = session
+            .hold_lease(capacity.reserve().expect("reserve capacity"))
+            .expect("last pending id");
+        assert_eq!(capacity.available_permits(), 0);
+
+        assert!(session.allocate_id().is_err());
+        assert!(!session.is_active());
+        assert_eq!(capacity.available_permits(), 1);
+        drop(pending);
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use crate::command;
 use crate::release;
+use crate::rprobe::ASSETS as RPROBE_ASSETS;
 use crate::targets::HostTarget;
 
 const DISK_IMAGE_LICENSE: &str = "common/disk-image/LICENSE-APACHE";
@@ -24,7 +25,6 @@ const RUNTIME_FILES: [(&str, u32); 6] = [
     ("assets/initramfs", 0o644),
     ("assets/agent", 0o755),
 ];
-
 #[derive(Debug, Error)]
 pub enum ArchiveError {
     #[error(transparent)]
@@ -212,10 +212,19 @@ fn write_provenance(
     let stage = stage_path(target_dir, host);
     let mut files = BTreeMap::new();
     for (path, _) in RUNTIME_FILES {
-        files.insert(path, sha256(&stage.join(path))?);
+        files.insert(path.to_string(), sha256(&stage.join(path))?);
+    }
+    if has_rprobe_assets(&stage)? {
+        for (name, _) in RPROBE_ASSETS {
+            let path = format!("assets/{name}");
+            files.insert(path.clone(), sha256(&stage.join(path))?);
+        }
     }
     if kind.has_cli() {
-        files.insert("bin/silo", sha256(&target_dir.join("release/silo"))?);
+        files.insert(
+            "bin/silo".to_string(),
+            sha256(&target_dir.join("release/silo"))?,
+        );
     }
     let kernel = target_dir
         .join("kernel-provenance")
@@ -264,7 +273,7 @@ fn actual_toolchains(syft: &Path) -> Result<BTreeMap<String, String>, ArchiveErr
     for (name, path, args) in [
         ("cargo", release::tool("cargo")?, vec!["--version"]),
         ("rustc", release::tool("rustc")?, vec!["--version"]),
-        ("go", release::tool("go")?, vec!["version"]),
+        ("go", release::go_program(true)?, vec!["version"]),
         ("zig", release::tool("zig")?, vec!["version"]),
         (
             "cargo-zigbuild",
@@ -358,7 +367,21 @@ fn validate_stage(stage: &Path) -> Result<(), ArchiveError> {
     for (path, mode) in RUNTIME_FILES {
         validate_regular_file(&stage.join(path), mode)?;
     }
+    if has_rprobe_assets(stage)? {
+        for (name, mode) in RPROBE_ASSETS {
+            validate_regular_file(&stage.join("assets").join(name), mode)?;
+        }
+    }
     Ok(())
+}
+
+fn has_rprobe_assets(stage: &Path) -> Result<bool, ArchiveError> {
+    let assets = stage.join("assets");
+    crate::rprobe::installed_asset_set_present(&assets).map_err(|source| ArchiveError::Io {
+        action: "read rprobe asset metadata",
+        path: assets,
+        source,
+    })
 }
 
 fn validate_regular_file(path: &Path, expected_mode: u32) -> Result<(), ArchiveError> {

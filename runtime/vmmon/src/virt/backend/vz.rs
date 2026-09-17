@@ -28,8 +28,6 @@ use crate::virt::VmExit;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-const SILO_ROSETTA_TAG: &str = "silo-rosetta";
-
 #[derive(Debug)]
 pub(crate) struct VzBackend {
     config: VmConfig,
@@ -366,7 +364,7 @@ fn validate_support() -> Result<(), VirtError> {
 }
 
 fn build_vm(config: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguration), VirtError> {
-    let serial_port = SerialPortConfiguration::virtio_console();
+    let serial_port = SerialPortConfiguration::virtio_console().map_err(vz_error)?;
 
     let mut builder = VirtualMachine::builder()
         .map_err(vz_error)?
@@ -399,13 +397,16 @@ fn build_vm(config: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguratio
     for mount in config.mounts() {
         let shared_dir = SharedDirectory::new(mount.host_path.clone(), mount.read_only);
         let single_share = SingleDirectoryShare::new(shared_dir);
-        let mut fs_config = VirtioFileSystemDeviceConfiguration::new(mount.tag.clone());
+        let mut fs_config =
+            VirtioFileSystemDeviceConfiguration::new(mount.tag.clone()).map_err(vz_error)?;
         fs_config.set_share(single_share);
         builder = builder.add_directory_share(fs_config);
     }
 
-    if config.vz().rosetta {
-        let mut rosetta_config = VirtioFileSystemDeviceConfiguration::new(SILO_ROSETTA_TAG);
+    if config.rosetta() == crate::virt::RosettaIntent::VzNative {
+        let mut rosetta_config =
+            VirtioFileSystemDeviceConfiguration::new(agent_spec::ROSETTA_MOUNT_TAG)
+                .map_err(vz_error)?;
         rosetta_config.set_rosetta_share(LinuxRosettaDirectoryShare::new().map_err(vz_error)?);
         builder = builder.add_directory_share(rosetta_config);
     }
@@ -523,8 +524,16 @@ fn validate_nested_virtualization(config: &VmConfig) -> Result<(), VirtError> {
 }
 
 fn validate_rosetta(config: &VmConfig) -> Result<(), VirtError> {
-    if !config.vz().rosetta {
-        return Ok(());
+    match config.rosetta() {
+        crate::virt::RosettaIntent::Disabled => return Ok(()),
+        crate::virt::RosettaIntent::VzNative => {}
+        crate::virt::RosettaIntent::KrunCaptured { .. } => {
+            return Err(VirtError::InvalidConfig {
+                name: config.name().to_string(),
+                reason: "krun-captured Rosetta intent cannot be used with the VZ backend"
+                    .to_string(),
+            })
+        }
     }
 
     match vz::rosetta_availability() {
@@ -617,4 +626,24 @@ async fn wait_for_state(
 
 fn vz_error(err: VzError) -> VirtError {
     VirtError::Backend(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::virt::{RosettaIntent, RosettaProfile, VmConfig};
+
+    #[test]
+    fn vz_rejects_krun_capture_intent_before_availability_checks() {
+        let config = VmConfig::builder("vz-rosetta")
+            .rosetta(RosettaIntent::KrunCaptured {
+                profile: RosettaProfile::CapturedCompatibilityV1,
+            })
+            .build();
+
+        let error = crate::virt::backend::vz::validate_rosetta(&config)
+            .expect_err("reject mismatched intent");
+        assert!(error
+            .to_string()
+            .contains("cannot be used with the VZ backend"));
+    }
 }

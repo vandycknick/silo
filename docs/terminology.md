@@ -305,6 +305,33 @@ Examples:
 
 The guest is the operating system running inside the VM.
 
+## Memory Reclaim
+
+Four components have separate responsibilities; see
+[Memory Reclaim](architecture/memory-reclaim.md).
+
+- **FreePageReporter:** guest-kernel free-page reporting through the balloon's
+  negotiated reporting queue.
+- **HostMemoryReclaimer:** handles reports using HV unmap, per-native-page
+  `MADV_FREE`, and immediate HV map on macOS. Qualification checks page state
+  and safe reuse, not merely a lower footprint.
+- **HostMemoryRemapper:** independently maintains compatible host mappings with
+  same-address, content-preserving Mach remapping. Periodic at 30 seconds, with
+  report-driven preparation throttled to 250 ms.
+- **GuestCacheReclaimer:** the managed agent's capability-detected idle cache
+  policy, using bounded cgroup v2 `memory.reclaim` without a global cache-drop
+  fallback. No user configuration is required or exposed.
+
+Guest-free memory, advice counters, host footprint, compression, and physical
+discard must not be treated as interchangeable measurements.
+
+### Not Ballooning
+
+Silo attaches a virtio-balloon device only for its reporting queue. The
+classic **balloon inflate and deflate**, where the host demands pages and the
+guest pins them, is not used. **Free page hinting** and **virtio-mem** are
+different features again and are not used either.
+
 ## Most Important Distinction
 
 The most common conceptual mistake is collapsing KVM, VMM, and VM into one thing.

@@ -6,7 +6,7 @@
 //! ([`SerialConsole`]), and vsock stream types shared by all backends.
 //!
 //! Backends implement the crate-private [`backend::VirtBackend`] trait:
-//! `krun` (libkrun via a helper process) on Linux, `vz`
+//! `krun` (libkrun via a helper process) on Linux and macOS, `vz`
 //! (Virtualization.framework) on macOS, and — behind the `mock-backend`
 //! feature — an in-process mock that fakes the guest side for tests.
 //! Selection is pinned per platform today ([`BackendKind::default_for_host`])
@@ -26,11 +26,12 @@ mod machine;
 mod serial;
 mod stream;
 
+pub use backend::HostMemoryReclaimReport;
 pub use backend::{Availability, BackendKind};
 pub(crate) use capacity::VsockLease;
 pub use config::{
-    DiskImage, KrunOptions, MachineIdentifier, MockOptions, NetworkMode, SharedDirectory, VmConfig,
-    VmConfigBuilder, VmExit, VzOptions,
+    DiskImage, KrunOptions, MachineIdentifier, MockOptions, NetworkMode, RosettaIntent,
+    RosettaProfile, SharedDirectory, VmConfig, VmConfigBuilder, VmExit, VzOptions,
 };
 pub use error::VirtError;
 pub use machine::VirtualMachine;

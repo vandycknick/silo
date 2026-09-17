@@ -16,8 +16,10 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
+use tokio::sync::watch;
 
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission};
 use crate::virt::config::VmConfig;
@@ -25,7 +27,6 @@ use crate::virt::error::VirtError;
 use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
 use crate::virt::VmExit;
 
-#[cfg(target_os = "linux")]
 mod krun;
 #[cfg(feature = "mock-backend")]
 pub(crate) mod mock;
@@ -63,13 +64,36 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
 
     /// Open the guest serial device. Called once per boot by the serial console.
     async fn open_serial(&self) -> Result<SerialDevice, VirtError>;
+
+    /// Live host memory reclaim reports, for backends that can observe them.
+    /// The value is `None` until the first report of the current boot.
+    fn host_memory_reclaim_updates(
+        &self,
+    ) -> Option<watch::Receiver<Option<HostMemoryReclaimReport>>> {
+        None
+    }
+}
+
+/// Host memory reclaim state of the running VM as last reported by the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMemoryReclaimReport {
+    pub requested: bool,
+    /// `not-run`, `passed`, `failed`, or `inconclusive`.
+    pub qualification: &'static str,
+    pub effective: bool,
+    pub released_bytes: u64,
+    pub released_extents: u64,
+    pub retried_faults: u64,
+    pub skipped_reports: u64,
+    pub failed_operations: u64,
+    pub observed_at: SystemTime,
 }
 
 /// Identifies a virtualization backend implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BackendKind {
-    /// libkrun via the spawned `krun` helper binary (Linux).
+    /// libkrun via the spawned `krun` helper binary.
     Krun,
     /// Apple Virtualization.framework (macOS).
     Vz,
@@ -99,7 +123,7 @@ impl BackendKind {
     /// Backends compiled into this binary (target- and feature-dependent).
     pub fn compiled() -> &'static [BackendKind] {
         &[
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             BackendKind::Krun,
             #[cfg(target_os = "macos")]
             BackendKind::Vz,
@@ -123,19 +147,14 @@ impl BackendKind {
         }
     }
 
-    /// Today's pinned selection policy: krun on Linux, vz on macOS.
+    /// Today's pinned selection policy: krun on Linux and macOS.
     ///
     /// A future user-facing backend picker replaces callers of this with
     /// "user preference, validated against `compiled()` + `probe()`".
     pub fn default_for_host() -> Result<BackendKind, VirtError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             Ok(BackendKind::Krun)
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            Ok(BackendKind::Vz)
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -160,7 +179,7 @@ pub(crate) fn create_backend(
     config: VmConfig,
 ) -> Result<Arc<dyn VirtBackend>, VirtError> {
     match kind {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         BackendKind::Krun => Ok(Arc::new(krun::KrunBackend::new(config)?)),
         #[cfg(target_os = "macos")]
         BackendKind::Vz => Ok(Arc::new(vz::VzBackend::new(config)?)),
@@ -184,7 +203,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert_eq!(kind, BackendKind::Krun);
         #[cfg(target_os = "macos")]
-        assert_eq!(kind, BackendKind::Vz);
+        assert_eq!(kind, BackendKind::Krun);
     }
 
     #[test]

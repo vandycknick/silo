@@ -18,15 +18,27 @@ pub(crate) struct VmmonStartRequest {
     // with vmmon's strict (deny_unknown_fields) reader.
     #[serde(skip_serializing_if = "Option::is_none")]
     virt_backend: Option<VmmonVirtBackend>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rosetta_intent: Option<VmmonRosettaIntent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asset_directory: Option<std::path::PathBuf>,
+    startup_budget_ms: u64,
 }
 
-/// Explicit virtualization backend selection (testing only).
+/// Explicit virtualization backend selection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct VmmonVirtBackend {
     pub(crate) kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) scenario: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub(crate) enum VmmonRosettaIntent {
+    Disabled {},
+    Enabled {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -59,17 +71,43 @@ impl VmmonStartRequest {
         machine_run_id: impl Into<String>,
         startup_command: Option<VmmonStartupCommand>,
     ) -> Self {
+        let startup_budget_ms = if startup_command.is_some() {
+            330_000
+        } else {
+            30_000
+        };
         Self {
             version: VMMON_START_REQUEST_VERSION,
             machine_id: machine_id.into(),
             machine_run_id: machine_run_id.into(),
             startup_command,
             virt_backend: None,
+            rosetta_intent: None,
+            asset_directory: None,
+            startup_budget_ms,
         }
     }
 
     pub(crate) fn with_virt_backend(mut self, virt_backend: Option<VmmonVirtBackend>) -> Self {
         self.virt_backend = virt_backend;
+        self
+    }
+
+    pub(crate) fn with_rosetta_intent(mut self, intent: VmmonRosettaIntent) -> Self {
+        self.rosetta_intent = match intent {
+            VmmonRosettaIntent::Disabled {} => None,
+            intent => Some(intent),
+        };
+        self
+    }
+
+    pub(crate) fn with_asset_directory(mut self, directory: std::path::PathBuf) -> Self {
+        self.asset_directory = Some(directory);
+        self
+    }
+
+    pub(crate) fn with_startup_budget(mut self, budget: std::time::Duration) -> Self {
+        self.startup_budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
         self
     }
 }
@@ -96,21 +134,22 @@ mod tests {
     use uuid::Uuid;
 
     use crate::vmmon::start_request::{
-        encode_start_request, VmmonEnvironmentVariable, VmmonProcessSpec, VmmonStartRequest,
-        VmmonStartupCommand, VMMON_START_REQUEST_MAX_BYTES,
+        encode_start_request, VmmonEnvironmentVariable, VmmonProcessSpec, VmmonRosettaIntent,
+        VmmonStartRequest, VmmonStartupCommand, VMMON_START_REQUEST_MAX_BYTES,
     };
 
     #[test]
-    fn idle_request_is_compact_newline_terminated_json() {
+    fn disabled_rosetta_carries_only_the_native_startup_budget_addition() {
         let request = VmmonStartRequest::new(
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
-        );
+        )
+        .with_rosetta_intent(VmmonRosettaIntent::Disabled {});
         assert_eq!(
             String::from_utf8(encode_start_request(&request).expect("encode request"))
                 .expect("UTF-8 request"),
-            "{\"version\":1,\"machineId\":\"01234567-89ab-cdef-0123-456789abcdef\",\"machineRunId\":\"9e7d6ad8-f804-4936-9633-1fd3df6bd7d3\"}\n"
+            "{\"version\":1,\"machineId\":\"01234567-89ab-cdef-0123-456789abcdef\",\"machineRunId\":\"9e7d6ad8-f804-4936-9633-1fd3df6bd7d3\",\"startupBudgetMs\":30000}\n"
         );
     }
 
@@ -143,6 +182,63 @@ mod tests {
         );
         assert_eq!(value["startupCommand"]["process"]["argv"][1], "--all");
         assert!(value["startupCommand"]["process"].get("stdio").is_none());
+        assert_eq!(value["startupBudgetMs"], 330_000);
+    }
+
+    #[test]
+    fn start_request_has_no_host_reclaim_switch() {
+        let request = VmmonStartRequest::new(
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
+            None,
+        );
+        let encoded = encode_start_request(&request).expect("encode request");
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded[..encoded.len() - 1]).expect("parse request");
+
+        assert!(value.get("hostMemoryReclaim").is_none());
+    }
+
+    #[test]
+    fn rosetta_intent_contains_no_backend_implementation_details() {
+        let request = VmmonStartRequest::new(
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
+            None,
+        )
+        .with_rosetta_intent(VmmonRosettaIntent::Enabled {});
+        let encoded = encode_start_request(&request).expect("encode request");
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded[..encoded.len() - 1]).expect("parse request");
+
+        assert_eq!(value["rosettaIntent"]["mode"], "enabled");
+        assert!(value["rosettaIntent"].get("profile").is_none());
+        assert_eq!(
+            value["rosettaIntent"].as_object().map(|value| value.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn runtime_asset_directory_is_generic_on_the_wire() {
+        let request = VmmonStartRequest::new(
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
+            None,
+        )
+        .with_rosetta_intent(VmmonRosettaIntent::Enabled {});
+        let encoded = encode_start_request(&request).expect("encode request");
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded[..encoded.len() - 1]).expect("parse request");
+
+        assert_eq!(
+            value["rosettaIntent"],
+            serde_json::json!({"mode": "enabled"})
+        );
+        let request = request.with_asset_directory(std::path::PathBuf::from("/runtime/assets"));
+        let value = serde_json::to_value(request).expect("serialize runtime directory");
+        assert_eq!(value["assetDirectory"], "/runtime/assets");
+        assert!(value.get("rosettaProbeAssets").is_none());
     }
 
     #[test]

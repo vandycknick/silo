@@ -20,6 +20,7 @@ pub(crate) struct ResolvedRuntimeComponents {
     pub(crate) kernel: PathBuf,
     pub(crate) initramfs: PathBuf,
     pub(crate) agent: PathBuf,
+    pub(crate) asset_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -30,6 +31,7 @@ struct ComponentOverrides {
     kernel: Option<PathBuf>,
     initramfs: Option<PathBuf>,
     agent: Option<PathBuf>,
+    asset_dir: Option<PathBuf>,
 }
 
 struct EnvironmentOverrides {
@@ -57,6 +59,9 @@ impl ComponentOverrides {
         if let Some(path) = self.agent {
             components.agent = path;
         }
+        if let Some(path) = self.asset_dir {
+            components.asset_dir = path;
+        }
         components
     }
 
@@ -68,6 +73,7 @@ impl ComponentOverrides {
             kernel: self.kernel.or(lower.kernel),
             initramfs: self.initramfs.or(lower.initramfs),
             agent: self.agent.or(lower.agent),
+            asset_dir: self.asset_dir.or(lower.asset_dir),
         }
     }
 }
@@ -80,6 +86,7 @@ struct ComponentPaths {
     kernel: PathBuf,
     initramfs: PathBuf,
     agent: PathBuf,
+    asset_dir: PathBuf,
 }
 
 impl ComponentPaths {
@@ -91,6 +98,7 @@ impl ComponentPaths {
             kernel: root.join("assets/kernel-default"),
             initramfs: root.join("assets/initramfs"),
             agent: root.join("assets/agent"),
+            asset_dir: root.join("assets"),
         }
     }
 
@@ -102,6 +110,7 @@ impl ComponentPaths {
             kernel: directory.join("assets/kernel-default"),
             initramfs: directory.join("assets/initramfs"),
             agent: directory.join("assets/agent"),
+            asset_dir: directory.join("assets"),
         }
     }
 
@@ -114,6 +123,7 @@ impl ComponentPaths {
             kernel: assets.join("kernel-default"),
             initramfs: assets.join("initramfs"),
             agent: assets.join("agent"),
+            asset_dir: assets.to_path_buf(),
         }
     }
 }
@@ -267,6 +277,7 @@ fn explicit_api_overrides(config: &RuntimeConfig) -> Result<ComponentOverrides, 
         kernel: explicit_component("kernel_path", config.kernel_path.as_deref(), false)?,
         initramfs: explicit_component("initramfs_path", config.initramfs_path.as_deref(), false)?,
         agent: explicit_component("agent_path", config.agent_path.as_deref(), true)?,
+        asset_dir: None,
     })
 }
 
@@ -320,6 +331,7 @@ fn explicit_environment_overrides<E: ComponentEnvironment>(
                     input: ENV_ASSET_DIR.to_string(),
                     message,
                 })?,
+            asset_dir: assets.clone(),
         },
         assets,
     })
@@ -411,6 +423,16 @@ fn validate_components(
     root: Option<&Path>,
 ) -> Result<ResolvedRuntimeComponents, String> {
     let root = root.map(canonical_root).transpose()?;
+    let asset_dir = canonical_root(&paths.asset_dir)?;
+    if root
+        .as_ref()
+        .is_some_and(|root| !asset_dir.starts_with(root))
+    {
+        return Err(format!(
+            "asset directory {} escapes runtime root",
+            asset_dir.display()
+        ));
+    }
     let mut errors = Vec::new();
     let vmmon = collect_component("vmmon", &paths.vmmon, true, root.as_deref(), &mut errors);
     let netd = collect_component("netd", &paths.netd, true, root.as_deref(), &mut errors);
@@ -443,6 +465,7 @@ fn validate_components(
                 kernel,
                 initramfs,
                 agent,
+                asset_dir,
             })
         }
         _ => Err("component validation did not produce a complete runtime".to_string()),
@@ -534,6 +557,7 @@ fn app_bundle_for_executable(executable: &Path) -> Option<PathBuf> {
         .then(|| bundle.to_path_buf())
 }
 
+#[cfg(target_os = "macos")]
 fn consider_app_bundle(
     considered: &mut Vec<String>,
     bundle: &Path,
@@ -587,6 +611,7 @@ fn validate_app_bundle(bundle: &Path) -> Result<ResolvedRuntimeComponents, Strin
             kernel: contents.join("Resources/assets/kernel-default"),
             initramfs: contents.join("Resources/assets/initramfs"),
             agent: contents.join("Resources/assets/agent"),
+            asset_dir: contents.join("Resources/assets"),
         },
         Some(&bundle),
     )
@@ -715,6 +740,7 @@ fn resolve_path_helpers<E: ComponentEnvironment>(
             kernel: assets.join("kernel-default"),
             initramfs: assets.join("initramfs"),
             agent: assets.join("agent"),
+            asset_dir: assets.to_path_buf(),
         };
         if let Some(components) = consider(
             considered,
@@ -791,6 +817,7 @@ pub(crate) fn test_components(base: &Path) -> ResolvedRuntimeComponents {
         kernel: paths.kernel,
         initramfs: paths.initramfs,
         agent: paths.agent,
+        asset_dir: paths.asset_dir,
     }
 }
 
@@ -1045,6 +1072,13 @@ mod tests {
         assert_eq!(
             resolved.vmmon,
             complete.join("vmmon").canonicalize().expect("vmmon")
+        );
+        assert_eq!(
+            resolved.asset_dir,
+            temp.path()
+                .join("assets")
+                .canonicalize()
+                .expect("asset directory")
         );
         assert!(environment.read.contains(&"PATH"));
     }

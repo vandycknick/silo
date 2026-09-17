@@ -20,17 +20,30 @@ pub(crate) struct VmmonStartRequest {
     // the pipe must parse the same schema regardless of compiled features.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) virt_backend: Option<VirtBackendRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rosetta_intent: Option<RosettaIntentRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) asset_directory: Option<std::path::PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    startup_budget_ms: Option<u64>,
 }
 
 /// Explicit virtualization backend selection carried in the start request.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct VirtBackendRequest {
-    /// Backend name; today only "mock" is meaningful.
+    /// Backend name: "krun", "vz", or "mock".
     pub(crate) kind: String,
     /// Absolute path to a mock scenario file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) scenario: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) enum RosettaIntentRequest {
+    Disabled {},
+    Enabled {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -89,6 +102,9 @@ impl StartRequestPipe {
                     machine_run_id: expected_machine_run_id.to_string(),
                     startup_command: None,
                     virt_backend: None,
+                    rosetta_intent: None,
+                    asset_directory: None,
+                    startup_budget_ms: None,
                 },
                 expected_machine_id,
                 expected_machine_run_id,
@@ -189,7 +205,50 @@ fn validate_start_request(
         parse_uuid("startupCommand.executionId", &command.execution_id)?;
         validate_process(&command.process)?;
     }
+    if let Some(backend) = &request.virt_backend {
+        validate_backend_request(backend)?;
+    }
+    if request
+        .startup_budget_ms
+        .is_some_and(|budget| budget == 0 || budget > 420_000)
+    {
+        return Err(invalid_data("startupBudgetMs must be in 1..=420000"));
+    }
+    if request
+        .asset_directory
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(invalid_data("assetDirectory must be an absolute path"));
+    }
     Ok(request)
+}
+
+impl VmmonStartRequest {
+    pub(crate) fn effective_startup_budget_ms(&self) -> u64 {
+        self.startup_budget_ms.unwrap_or_else(|| {
+            if self.startup_command.is_some() {
+                330_000
+            } else {
+                30_000
+            }
+        })
+    }
+}
+
+fn validate_backend_request(backend: &VirtBackendRequest) -> io::Result<()> {
+    match backend.kind.as_str() {
+        "mock" => Ok(()),
+        "krun" | "vz" if backend.scenario.is_none() => Ok(()),
+        "krun" | "vz" => Err(invalid_data(format!(
+            "vmmon start request backend {:?} cannot include a mock scenario",
+            backend.kind
+        ))),
+        _ => Err(invalid_data(format!(
+            "vmmon start request selected unknown virt backend {:?}",
+            backend.kind
+        ))),
+    }
 }
 
 fn validate_process(process: &StartupProcess) -> io::Result<()> {
@@ -252,8 +311,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::start_request::{
-        decode_start_request, StartRequestPipe, VMMON_START_REQUEST_MAX_BYTES,
-        VMMON_START_REQUEST_VERSION,
+        decode_start_request, RosettaIntentRequest, StartRequestPipe,
+        VMMON_START_REQUEST_MAX_BYTES, VMMON_START_REQUEST_VERSION,
     };
 
     #[tokio::test]
@@ -294,6 +353,7 @@ mod tests {
 
         let request = decode_start_request(&encoded, &machine_id, &run_id)
             .expect("decode valid startup request");
+        assert_eq!(request.effective_startup_budget_ms(), 330_000);
         assert_eq!(
             request
                 .startup_command
@@ -301,6 +361,174 @@ mod tests {
                 .execution_id,
             execution_id
         );
+    }
+
+    #[test]
+    fn legacy_requests_derive_budget_from_startup_command_presence() {
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        let idle = encode(json!({
+            "version": VMMON_START_REQUEST_VERSION,
+            "machineId": machine_id,
+            "machineRunId": run_id,
+        }));
+        let idle = decode_start_request(&idle, &machine_id, &run_id).expect("decode legacy idle");
+        assert_eq!(idle.effective_startup_budget_ms(), 30_000);
+
+        let startup = encode(json!({
+            "version": VMMON_START_REQUEST_VERSION,
+            "machineId": machine_id,
+            "machineRunId": run_id,
+            "startupCommand": {
+                "executionId": Uuid::new_v4().to_string(),
+                "process": { "argv": ["true"], "environment": [] }
+            }
+        }));
+        let startup =
+            decode_start_request(&startup, &machine_id, &run_id).expect("decode legacy startup");
+        assert_eq!(startup.effective_startup_budget_ms(), 330_000);
+    }
+
+    #[test]
+    fn explicit_startup_budget_must_be_in_the_bounded_range() {
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        for budget in [0_u64, 420_001] {
+            let encoded = encode(json!({
+                "version": VMMON_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+                "startupBudgetMs": budget,
+            }));
+            assert!(decode_start_request(&encoded, &machine_id, &run_id).is_err());
+        }
+
+        let maximum = encode(json!({
+            "version": VMMON_START_REQUEST_VERSION,
+            "machineId": machine_id,
+            "machineRunId": run_id,
+            "startupBudgetMs": 420_000,
+        }));
+        let maximum =
+            decode_start_request(&maximum, &machine_id, &run_id).expect("accept maximum budget");
+        assert_eq!(maximum.effective_startup_budget_ms(), 420_000);
+    }
+
+    #[test]
+    fn strict_reader_rejects_removed_host_reclaim_switch() {
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        let encoded = encode(json!({
+            "version": VMMON_START_REQUEST_VERSION,
+            "machineId": machine_id,
+            "machineRunId": run_id,
+            "hostMemoryReclaim": "auto"
+        }));
+
+        assert!(decode_start_request(&encoded, &machine_id, &run_id).is_err());
+    }
+
+    #[test]
+    fn strict_reader_accepts_only_the_versioned_rosetta_contract() {
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        let request = encode(json!({
+            "version": VMMON_START_REQUEST_VERSION,
+            "machineId": machine_id,
+            "machineRunId": run_id,
+            "rosettaIntent": { "mode": "enabled" },
+            "assetDirectory": "/runtime/assets",
+            "startupBudgetMs": 120000
+        }));
+        let decoded =
+            decode_start_request(&request, &machine_id, &run_id).expect("accept Rosetta contract");
+        assert_eq!(
+            decoded.rosetta_intent,
+            Some(RosettaIntentRequest::Enabled {})
+        );
+        assert_eq!(decoded.effective_startup_budget_ms(), 120_000);
+        assert_eq!(
+            decoded.asset_directory,
+            Some(std::path::PathBuf::from("/runtime/assets"))
+        );
+
+        for (intent, expected) in [
+            (
+                json!({"mode": "disabled"}),
+                RosettaIntentRequest::Disabled {},
+            ),
+            (json!({"mode": "enabled"}), RosettaIntentRequest::Enabled {}),
+        ] {
+            let encoded = encode(json!({
+                "version": VMMON_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+                "rosettaIntent": intent
+            }));
+            let decoded = decode_start_request(&encoded, &machine_id, &run_id)
+                .expect("accept explicit Rosetta intent");
+            assert_eq!(decoded.rosetta_intent, Some(expected));
+        }
+
+        for intent in [
+            json!({"mode": "krunCaptured", "profile": "future"}),
+            json!({"mode": "krunCaptured", "profile": "capturedCompatibilityV1", "data": "00"}),
+            json!({"mode": "future"}),
+            json!({"mode": "vzNative"}),
+            json!({"mode": "enabled", "profile": "capturedCompatibilityV1"}),
+        ] {
+            let invalid = encode(json!({
+                "version": VMMON_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+                "rosettaIntent": intent
+            }));
+            assert!(decode_start_request(&invalid, &machine_id, &run_id).is_err());
+        }
+    }
+
+    #[test]
+    fn runtime_directory_must_be_absolute_and_probe_assets_are_not_a_launch_contract() {
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        for extra in [
+            json!({"assetDirectory": "relative/assets"}),
+            json!({"rosettaProbeAssets": {"kernel": "/rprobe"}}),
+        ] {
+            let mut request = json!({
+                "version": VMMON_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+            });
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(decode_start_request(&encode(request), &machine_id, &run_id).is_err());
+        }
+    }
+
+    #[test]
+    fn strict_reader_accepts_real_backends_only_without_mock_scenarios() {
+        let machine_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        for kind in ["krun", "vz"] {
+            let request = encode(json!({
+                "version": VMMON_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+                "virtBackend": { "kind": kind }
+            }));
+            decode_start_request(&request, &machine_id, &run_id).expect("accept real backend");
+
+            let invalid = encode(json!({
+                "version": VMMON_START_REQUEST_VERSION,
+                "machineId": machine_id,
+                "machineRunId": run_id,
+                "virtBackend": { "kind": kind, "scenario": "/tmp/mock.json" }
+            }));
+            assert!(decode_start_request(&invalid, &machine_id, &run_id).is_err());
+        }
     }
 
     #[test]

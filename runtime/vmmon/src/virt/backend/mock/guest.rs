@@ -434,6 +434,8 @@ fn agent_metrics(instance_id: String) -> AgentMetrics {
                 memory: Some(MemoryMetrics {
                     total_bytes: Some(2 * 1024 * 1024 * 1024),
                     available_bytes: Some(1024 * 1024 * 1024),
+                    free_bytes: None,
+                    cached_bytes: None,
                 }),
                 cpu: Some(CpuMetrics {
                     logical_cpu_count: Some(2),
@@ -448,6 +450,7 @@ fn agent_metrics(instance_id: String) -> AgentMetrics {
                 filesystems: Vec::new(),
                 network_interfaces: Vec::new(),
                 block_devices: Vec::new(),
+                memory_reclaim: None,
             }),
         }),
     }

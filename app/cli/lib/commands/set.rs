@@ -63,9 +63,10 @@ fn after_help() -> clap::builder::StyledStr {
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         let parsed = ParsedSet::parse(&self.args)?;
-        let (_reference, machine) = context.machine(parsed.machine.as_deref()).await?;
+        let reference = context.resolve_machine_name(parsed.machine.as_deref())?;
+        let existing = context.app_api().await?.inspect_machine(&reference).await?;
         let old_name = if parsed.update.name.is_some() {
-            Some(machine.inspect().await?.name)
+            Some(existing.name)
         } else {
             None
         };
@@ -74,11 +75,12 @@ impl Cmd {
             .as_deref()
             .is_some_and(|name| default_machine.as_deref() == Some(name));
 
-        let data = machine.update(parsed.update).await.map_err(|err| match err {
-            libvm::LibVmError::MachineAlreadyRunning { reference } => eyre::eyre!(
+        let data = context.app_api().await?.update_machine(&reference, parsed.update).await.map_err(|err| match err.downcast::<libvm::LibVmError>() {
+            Ok(libvm::LibVmError::MachineAlreadyRunning { reference }) => eyre::eyre!(
                 "{reference} is running\n\nhint: stop it with `silo stop {reference}` before changing settings"
             ),
-            other => eyre::Report::from(other),
+            Ok(other) => eyre::Report::from(other),
+            Err(other) => other,
         })?;
 
         if update_default {
@@ -227,7 +229,14 @@ fn parse_bool(value: &str) -> eyre::Result<bool> {
 mod tests {
     use libvm::{MachineUserUpdate, Memory};
 
-    use super::ParsedSet;
+    use crate::commands::set::ParsedSet;
+
+    #[test]
+    fn reclaim_is_not_a_user_setting() {
+        for key in ["memory-reclaim", "host-memory-reclaim", "balloon"] {
+            assert!(ParsedSet::parse(&[format!("{key}=off")]).is_err());
+        }
+    }
 
     #[test]
     fn parses_default_machine_settings() {

@@ -7,7 +7,8 @@ The crate exposes:
 - a process-backed `VirtualMachineBuilder`
 - a `VirtualMachine` handle for lifecycle management
 - a `SerialConnection` wrapper for helper stdio access
-- typed disk, mount, network, and vhost-user-vsock configuration structs
+- typed disk, mount, network, and inherited-vsock configuration
+- typed Rosetta launch configuration transported only to the selected helper
 
 The `krun` binary is intentionally small. It parses Silo's flat helper arguments, configures libkrun directly, and then enters the VM. It does not use the library builder and does not expose subcommands. On Linux, `krun --check-host` runs the deeper KVM host check without starting a guest.
 
@@ -28,8 +29,8 @@ Library responsibilities:
 Binary responsibilities:
 
 - parse flat helper arguments
-- call the source-integrated libkrun APIs through a helper-private adapter
-- convert paths, strings, and libkrun return codes into contextual errors
+- build libkrun's safe native Rust API through a helper-private adapter
+- convert non-UTF-8 paths and `VmmError` values into contextual errors
 - enter the VM
 - validate Linux KVM access, API compatibility, and required capabilities
 
@@ -60,14 +61,16 @@ Current scope focuses on the libkrun path used by Silo today:
 - direct kernel and initramfs boot
 - raw block devices
 - virtiofs mounts
-- one explicit vhost-user-vsock device terminated by vmmon
+- one explicit native vsock device connected to vmmon by an inherited control
+  socket
 - stdio console output
 - process-backed VM lifecycle management from Rust callers
+- graceful macOS aarch64 guest shutdown through a blocked `SIGTERM` and
+  libkrun's host-side shutdown request
 
 Planned follow-up scope includes:
 
 - richer `VirtualMachine` lifecycle state
-- graceful shutdown when libkrun exposes a host-side shutdown path we can rely on
 - higher-level serial and vsock convenience helpers
 
 ## Requirements
@@ -82,18 +85,47 @@ Planned follow-up scope includes:
 
 The optional `krun-bin` Cargo feature compiles the pinned libkrun fork directly into the helper executable. Building the launcher library alone does not activate or link libkrun, preserving the process boundary for `vmmon` and other callers.
 
-The helper uses a narrow private adapter rather than generated C bindings. It owns context cleanup, string conversion, the small set of C API constants Silo uses, and negative return-code handling. The resulting runtime does not require `libkrun.so`, `libkrun.dylib`, or `libkrunfw`.
+The helper uses a narrow private adapter over `VmmBuilder` and the native device constructors. It transfers owned network descriptors to libkrun, borrows console descriptors for the VMM lifetime, and rejects non-UTF-8 paths rather than changing them. The `ffi` feature and generated C exports stay disabled. The resulting runtime does not require `libkrun.so`, `libkrun.dylib`, or `libkrunfw`.
 
-The `blk`, `net`, and `vhost-user` APIs are selected at compile time through fixed Cargo features. Runtime feature probing is unnecessary because a helper missing a required API cannot compile.
+Rosetta uses one `--rosetta` enable flag and a bounded versioned JSON value in
+`SILO_ROSETTA_CONFIG`. The launcher removes any ambient value from host checks
+and native helpers, and overwrites it only on the enabled helper command. The
+helper decodes it once before host admission or VMM construction and converts
+the owned fields into libkrun's immutable `RosettaFsDevice`. The value contains
+non-secret compatibility data, not credentials: process environments remain
+inspectable under normal OS permissions and may appear in external crash or
+environment dumps. Silo does not log the value, place it in argv, or promise to
+isolate subprocesses created independently by third-party code. The audited
+production `Command` boundary is limited to the launcher's host-admission and
+VM-helper children, both of which explicitly remove the ambient value. The
+helper and its enabled libkrun block, network, and filesystem paths currently
+create no runtime child processes; adding one requires an explicit
+`env_remove("SILO_ROSETTA_CONFIG")` at that command site.
 
-Libkrun v2 starts contexts without implicit console or vsock devices and no longer injects a default init binary. The helper therefore supplies its kernel and optional initramfs directly, adds hvc0 only for `--stdio-console`, and attaches vmmon's explicit vhost-user-vsock frontend with `--vhost-user-vsock`. It never calls `krun_add_vsock` and has no per-port vsock arguments. Vmmon's embedded backend provides unconditional dynamic dials to guest ports 22 and 1027 while the public `VmSpec.vsock.enabled` setting independently controls the host mux and guest-to-host listener discovery.
+The E2BIG regression covers the process-backed builder path specifically: its
+host-admission child completes without the Rosetta value, then the intended
+helper exec exceeds the inherited argv/environment limit only after the valid
+bounded value is added. This verifies spawn-error propagation and cleanup; it
+does not launch or qualify a hypervisor, filesystem response, or translator.
+
+The adapter initializes libkrun's stderr logger at info level while honoring its standard environment filter, so startup qualification diagnostics are visible. `Vmm::run()` owns the event loop and returns `()` only after a fatal event-loop error. The helper converts that return into a controlled error so the process exits nonzero instead of falsely reporting a successful VM exit.
+
+The hidden developer option `--vsock-cid 3` attaches one standalone native `VsockDevice` before networking. This fixture-only path has no port mappings and uses empty TSI flags. It is mutually exclusive with `--vsock-mux-fd`; no other guest CID is admitted. Production callers use `--vsock-mux-fd`, which names a helper-inherited Unix stream descriptor rather than a filesystem path.
+
+The `blk` and `net` APIs are selected at compile time through fixed Cargo features. Runtime feature probing is unnecessary because a helper missing a required API cannot compile.
+
+Libkrun v2 starts VMM builders without implicit console, vsock, balloon, or RNG devices and no longer injects a default init binary. The helper therefore supplies its kernel and optional initramfs directly, adds hvc0 only for `--stdio-console`, adds explicit RNG and balloon devices, and attaches one native vsock device when vmmon supplies `--vsock-mux-fd`. Vmmon and the helper inherit opposite ends of a private socketpair; per-connection stream descriptors cross it with `SCM_RIGHTS`, while payload bytes stay on those streams. This is the same krun transport on Linux and macOS, with no private filesystem socket path. Vmmon retains its existing dynamic registry, admission, leases, and relays, while `VmSpec.vsock.enabled` independently controls only the public host mux and guest-to-host listener discovery.
+
+Krun is the Linux backend. On macOS it is compiled as an experimental backend,
+while Virtualization.framework remains the default. Runtime backend selection
+is owned by libvm and vmmon, outside this launcher crate.
 
 ## libkrun Build Features
 
 Silo's intended libkrun build keeps the upstream library narrow while preserving the current krun backend behavior:
 
 ```text
---no-default-features --features blk --features net --features vhost-user
+--no-default-features --features blk --features net
 ```
 
 That means Silo intentionally builds libkrun with these features enabled:
@@ -102,13 +134,12 @@ That means Silo intentionally builds libkrun with these features enabled:
 | --- | --- | --- |
 | `blk` | Enables virtio-block devices. | Keep. Required for `--disk` and Silo disk images. |
 | `net` | Enables virtio-net devices for unixgram, unixstream, and tap networking. | Keep. Required for Silo networking modes. |
-| `vhost-user` | Enables explicit vhost-user device attachment. | Keep. Required for vmmon's vhost-user-vsock backend. |
 
 Silo intentionally leaves these libkrun v2 features and optional components disabled for now:
 
 | Feature | Purpose | Silo policy |
 | --- | --- | --- |
-| Default init injection | Moved out of libkrun v2; `krun_disable_implicit_init()` is an `-ENOTSUP` compatibility stub. | Do not call the stub. Silo supplies explicit boot inputs and does not use `libkrun_init`. |
+| `ffi` | Generates C exports for the native Rust API. | Disable. The helper calls the Rust API directly. |
 | `gpu` | Enables virtio-gpu, Venus, and native-context graphics support. | Disable. Silo has no krun GPU path today. |
 | `input` | Enables input device support for GUI/input passthrough. | Disable. Silo has no krun input-device path today. |
 | `timesync` | Enables the libkrun guest time synchronization device. | Disable. Silo does not configure this device. |

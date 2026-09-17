@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::command;
 use crate::release;
+use crate::rprobe::ASSETS as RPROBE_ASSETS;
 use crate::targets::HostTarget;
 
 const APP_NAME: &str = "Silo.app";
@@ -24,7 +25,6 @@ const ASSETS: [(&str, u32); 3] = [
     ("initramfs", 0o644),
     ("agent", 0o755),
 ];
-
 pub(crate) fn package_directory(target_dir: &Path, version: &str) -> PathBuf {
     target_dir
         .join("packages")
@@ -113,6 +113,11 @@ pub fn assemble(
         }
         for (name, mode) in ASSETS {
             copy_regular_file(&stage.join("assets").join(name), &assets.join(name), mode)?;
+        }
+        if has_rprobe_assets(&stage.join("assets"))? {
+            for (name, mode) in RPROBE_ASSETS {
+                copy_regular_file(&stage.join("assets").join(name), &assets.join(name), mode)?;
+            }
         }
         generate_icon(workspace_root, &temporary, &resources.join("Silo.icns"))?;
         verify_unsigned_copies(&release, &stage, &temporary)?;
@@ -318,6 +323,14 @@ fn verify_unsigned_copies(release: &Path, stage: &Path, bundle: &Path) -> Result
             &bundle.join("Contents/Resources/assets").join(name),
         )?;
     }
+    if has_rprobe_assets(&stage.join("assets"))? {
+        for (name, _) in RPROBE_ASSETS {
+            compare_files(
+                &stage.join("assets").join(name),
+                &bundle.join("Contents/Resources/assets").join(name),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -332,10 +345,7 @@ fn validate_unsigned_layout(
     validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
     validate_directory_entries(&contents.join("Helpers"), ["krun", "netd", "vmmon"])?;
     validate_directory_entries(&contents.join("Resources"), ["Silo.icns", "assets"])?;
-    validate_directory_entries(
-        &contents.join("Resources/assets"),
-        ["agent", "initramfs", "kernel-default"],
-    )?;
+    validate_asset_entries(&contents.join("Resources/assets"))?;
     validate_regular_file(&contents.join("Info.plist"), None)?;
     validate_regular_file(&contents.join("MacOS/silo"), Some(0o755))?;
     for (name, _) in HELPERS {
@@ -343,6 +353,11 @@ fn validate_unsigned_layout(
     }
     for (name, mode) in ASSETS {
         validate_regular_file(&contents.join("Resources/assets").join(name), Some(mode))?;
+    }
+    if has_rprobe_assets(&contents.join("Resources/assets"))? {
+        for (name, mode) in RPROBE_ASSETS {
+            validate_regular_file(&contents.join("Resources/assets").join(name), Some(mode))?;
+        }
     }
     validate_regular_file(&contents.join("Resources/Silo.icns"), None)?;
     for (key, expected) in [
@@ -561,10 +576,7 @@ fn validate_distribution_layout(bundle: &Path) -> Result<(), AppError> {
     validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
     validate_directory_entries(&contents.join("Helpers"), ["krun", "netd", "vmmon"])?;
     validate_directory_entries(&contents.join("Resources"), ["Silo.icns", "assets"])?;
-    validate_directory_entries(
-        &contents.join("Resources/assets"),
-        ["agent", "initramfs", "kernel-default"],
-    )?;
+    validate_asset_entries(&contents.join("Resources/assets"))?;
     validate_regular_file(&contents.join("Info.plist"), None)?;
     validate_regular_file(&contents.join("MacOS/silo"), Some(0o755))?;
     for (name, _) in HELPERS {
@@ -572,6 +584,11 @@ fn validate_distribution_layout(bundle: &Path) -> Result<(), AppError> {
     }
     for (name, mode) in ASSETS {
         validate_regular_file(&contents.join("Resources/assets").join(name), Some(mode))?;
+    }
+    if has_rprobe_assets(&contents.join("Resources/assets"))? {
+        for (name, mode) in RPROBE_ASSETS {
+            validate_regular_file(&contents.join("Resources/assets").join(name), Some(mode))?;
+        }
     }
     validate_regular_file(&contents.join("Resources/Silo.icns"), None)?;
     for (key, expected) in [
@@ -675,6 +692,22 @@ fn validate_directory_entries<const N: usize>(
             format!("contains {actual:?}, expected {expected:?}"),
         )
     }
+}
+
+fn validate_asset_entries(assets: &Path) -> Result<(), AppError> {
+    if has_rprobe_assets(assets)? {
+        validate_directory_entries(assets, ["agent", "initramfs", "kernel-default", "rprobe"])
+    } else {
+        validate_directory_entries(assets, ["agent", "initramfs", "kernel-default"])
+    }
+}
+
+fn has_rprobe_assets(assets: &Path) -> Result<bool, AppError> {
+    crate::rprobe::installed_asset_set_present(assets).map_err(|source| AppError::Io {
+        action: "read rprobe asset metadata",
+        path: assets.to_path_buf(),
+        source,
+    })
 }
 
 fn validate_regular_file(path: &Path, expected_mode: Option<u32>) -> Result<(), AppError> {

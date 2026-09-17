@@ -6,6 +6,7 @@ mod forward;
 mod guest_process;
 mod handoff;
 mod host;
+mod memory_reclaim;
 mod metrics;
 mod pid1;
 mod port;
@@ -30,7 +31,7 @@ use protocol::v1::ProvisionOverallStatus;
 use crate::handoff::BootMode;
 use crate::pid1::ProcessSupervisor;
 use crate::port::from_kernel_cmdline;
-use crate::provision::run_provisioning;
+use crate::provision::{prepare_early_provisioning, run_provisioning, EarlyProvisioning};
 use crate::rpc::AgentServer;
 use crate::server::VsockServer;
 use crate::ssh::SshService;
@@ -86,14 +87,19 @@ fn main() -> eyre::Result<()> {
     let agent_config = load_agent_config(&agent_args.config)?;
     let agent_mode = select_agent_mode(&agent_args, is_pid1)?;
     ensure_default_path();
-    let boot_mode = prepare_agent_process(&agent_mode)?;
+    let (boot_mode, early_provisioning) = prepare_agent_process(&agent_mode, &agent_config)?;
     let process_supervisor = ProcessSupervisor::activate(&boot_mode)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build Tokio runtime")?;
-    runtime.block_on(run_agent(&boot_mode, process_supervisor, agent_config))
+    runtime.block_on(run_agent(
+        &boot_mode,
+        process_supervisor,
+        agent_config,
+        early_provisioning,
+    ))
 }
 
 fn init_tracing() {
@@ -132,34 +138,46 @@ fn select_agent_mode(agent_args: &AgentArgs, is_pid1: bool) -> eyre::Result<Agen
     Ok(AgentMode::Standard)
 }
 
-fn prepare_agent_process(agent_mode: &AgentMode) -> eyre::Result<BootMode> {
+fn prepare_agent_process(
+    agent_mode: &AgentMode,
+    agent_config: &AgentConfig,
+) -> eyre::Result<(BootMode, EarlyProvisioning)> {
     if let AgentMode::Init { requested_init } = agent_mode {
         tracing::info!(requested_init = ?requested_init, "agent init mode requested");
         prepare_pid1_environment()?;
-        return handoff::maybe_handoff_init(requested_init);
     }
-    Ok(BootMode::Standard)
+
+    let early_provisioning = prepare_early_provisioning(&agent_config.provision)
+        .context("prepare required early guest provisioning")?;
+    let boot_mode = match agent_mode {
+        AgentMode::Standard => BootMode::Standard,
+        AgentMode::Init { requested_init } => handoff::maybe_handoff_init(requested_init)?,
+    };
+    Ok((boot_mode, early_provisioning))
 }
 
 async fn run_agent(
     boot_mode: &BootMode,
     process_supervisor: ProcessSupervisor,
     agent_config: AgentConfig,
+    early_provisioning: EarlyProvisioning,
 ) -> eyre::Result<()> {
     tracing::info!(boot_mode = ?boot_mode, "agent starting");
 
     let boot_report = boot_mode.report();
+    let memory_reclaim = memory_reclaim::start();
     let agent_server = AgentServer::start(
         from_kernel_cmdline(),
         boot_report.clone(),
         process_supervisor.clone(),
+        memory_reclaim,
     )
     .await?;
     let provision_report = match run_provisioning(
         &agent_config.provision,
         &agent_config.ssh,
         &process_supervisor,
-        boot_mode,
+        &early_provisioning,
     ) {
         Ok(report) => report,
         Err(err) => {

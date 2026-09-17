@@ -1,0 +1,17 @@
+Silo system appliance package provenance
+
+Debian base and distribution packages:
+  Source: https://snapshot.debian.org/archive/debian/20260825T000000Z/
+  Licenses: /usr/share/doc/*/copyright
+
+Docker CE, Docker CLI, containerd, runc, and docker-proxy:
+  Source: https://download.docker.com/linux/debian/
+  Upstream: https://github.com/moby/moby and https://github.com/containerd/containerd
+  Licenses: /usr/share/doc/docker-ce/copyright,
+            /usr/share/doc/docker-ce-cli/copyright, and
+            /usr/share/doc/containerd.io/copyright
+
+silo-portd and appliance configuration:
+  Source: https://github.com/vandycknick/silo
+  Revision: recorded in manifest.json and the OCI image labels
+  License: repository license terms

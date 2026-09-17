@@ -1,20 +1,29 @@
 use std::fs;
-use std::os::fd::IntoRawFd;
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
-use krun::{validate_config, KrunConfig, NetTap, NetUnixgram, NetUnixstream, Network, DEFAULT_ID};
+use krun::{
+    validate_config, KrunConfig, NetTap, NetUnixgram, NetUnixstream, Network, RosettaLaunchConfig,
+    DEFAULT_ID,
+};
 use nix::sys::socket::{setsockopt, sockopt};
 
-#[path = "krun/context.rs"]
-mod context;
+#[path = "krun/admission.rs"]
+mod admission;
 #[path = "../internal/parse.rs"]
 mod parse;
+#[path = "../status.rs"]
+mod status;
+#[path = "krun/vmm.rs"]
+mod vmm;
 #[path = "../watchdog.rs"]
 mod watchdog;
 
 const LOCAL_SOCKET_ID_LEN: usize = 12;
+const ENV_ROSETTA_CONFIG: &str = "SILO_ROSETTA_CONFIG";
 const DEFAULT_SOCKET_BUF_SIZE: usize = 7 * 1024 * 1024;
 const SOCKET_RCVBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
 
@@ -31,11 +40,11 @@ const SOCKET_SNDBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
     after_help = "Examples:\n  krun --kernel ./vmlinux --initramfs ./initramfs.img --network none\n  krun --kernel ./vmlinux --net-peer \"$TMPDIR/gvproxy.sock\" --net-mac 02:94:ef:e4:0c:ee --network unixgram\n  krun --kernel ./vmlinux --net-peer \"$TMPDIR/passt.sock\" --net-mac 02:94:ef:e4:0c:ef --network unixstream\n  krun --kernel ./vmlinux --net-tap-name tap0 --net-mac 02:94:ef:e4:0c:f0 --network tap\n"
 )]
 struct Cli {
-    /// Validate KVM access, required capabilities, and empty VM creation.
-    #[cfg(target_os = "linux")]
+    /// Validate host virtualization access and empty VM creation.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[arg(long, exclusive = true)]
     check_host: bool,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[arg(long, exclusive = true, hide = true)]
     check_host_basic: bool,
     /// Stable VM identifier used for helper-owned socket names.
@@ -62,9 +71,17 @@ struct Cli {
     /// Add a virtiofs mount. Format: TAG:PATH:ro|rw.
     #[arg(long = "mount", value_parser = parse::mount)]
     mounts: Vec<krun::Mount>,
-    /// Attach a vhost-user virtio-vsock device at this Unix socket.
-    #[arg(long = "vhost-user-vsock")]
-    vhost_user_vsock: Option<PathBuf>,
+    /// Inherited Unix stream descriptor for the private vsock control mux.
+    #[arg(long = "vsock-mux-fd", conflicts_with = "vsock_cid")]
+    vsock_mux_fd: Option<RawFd>,
+    /// Attach a standalone native virtio-vsock device with this guest CID.
+    #[arg(
+        long = "vsock-cid",
+        hide = true,
+        conflicts_with = "vsock_mux_fd",
+        value_parser = clap::value_parser!(u64).range(3..=3)
+    )]
+    vsock_cid: Option<u64>,
     /// Explicit networking backend. Defaults to no guest networking.
     #[arg(long = "network", value_enum, default_value_t = NetworkArg::None)]
     network: NetworkArg,
@@ -80,6 +97,12 @@ struct Cli {
     /// Attach stdin/stdout/stderr to an explicit hvc0 virtio console.
     #[arg(long)]
     stdio_console: bool,
+    /// Attach a balloon with automatically selected backend capabilities.
+    #[arg(long)]
+    balloon: bool,
+    /// Attach the dedicated immutable Rosetta filesystem.
+    #[arg(long)]
+    rosetta: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -91,7 +114,10 @@ enum NetworkArg {
 }
 
 impl Cli {
-    fn into_config(self) -> eyre::Result<KrunConfig> {
+    fn into_launch(
+        self,
+        rosetta: Option<RosettaLaunchConfig>,
+    ) -> eyre::Result<(KrunConfig, Option<OwnedFd>)> {
         let network = self.network()?;
         reject_unused_network_args(
             &network,
@@ -100,19 +126,29 @@ impl Cli {
             self.net_tap_name.as_deref(),
         )?;
 
-        Ok(KrunConfig {
-            id: self.id,
-            cpus: self.cpus,
-            memory_mib: self.memory_mib,
-            kernel: self.kernel,
-            initramfs: self.initramfs,
-            cmdline: self.cmdline,
-            disks: self.disks,
-            mounts: self.mounts,
-            vhost_user_vsock: self.vhost_user_vsock,
-            network,
-            stdio_console: self.stdio_console,
-        })
+        let vsock_mux_fd = self
+            .vsock_mux_fd
+            .map(validate_inherited_stream_fd)
+            .transpose()?;
+        Ok((
+            KrunConfig {
+                id: self.id,
+                cpus: self.cpus,
+                memory_mib: self.memory_mib,
+                kernel: self.kernel,
+                initramfs: self.initramfs,
+                cmdline: self.cmdline,
+                disks: self.disks,
+                mounts: self.mounts,
+                vsock_mux: vsock_mux_fd.is_some(),
+                vsock_cid: self.vsock_cid,
+                network,
+                stdio_console: self.stdio_console,
+                balloon: self.balloon,
+                rosetta,
+            },
+            vsock_mux_fd,
+        ))
     }
 
     fn network(&self) -> eyre::Result<Network> {
@@ -191,7 +227,9 @@ fn reject_arg(present: bool, flag: &'static str, mode: &'static str) -> eyre::Re
 }
 
 fn main() -> eyre::Result<()> {
-    watchdog::start_from_env();
+    let rosetta_value = std::env::var_os(ENV_ROSETTA_CONFIG);
+    let watchdog_fd = watchdog::take_from_env()?;
+    let status_fd = status::take_from_env()?;
     let cli = Cli::parse();
     #[cfg(target_os = "linux")]
     {
@@ -208,85 +246,121 @@ fn main() -> eyre::Result<()> {
             krun::check_host().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
             return Ok(());
         }
-        krun::check_host().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
     }
-    let config = cli.into_config()?;
-    validate_config(&config)?;
-    start_enter(&config)?;
-    Ok(())
-}
-
-fn start_enter(config: &KrunConfig) -> eyre::Result<()> {
-    let context = context::Context::create()?;
-    configure_ctx(&context, config)?;
-    context.start_enter()?;
-    Ok(())
-}
-
-fn configure_ctx(context: &context::Context, config: &KrunConfig) -> eyre::Result<()> {
-    context.set_vm_config(config.cpus, config.memory_mib)?;
-
-    if let Some(kernel) = config.kernel.as_ref() {
-        let cmdline = (!config.cmdline.is_empty()).then(|| config.cmdline.join(" "));
-        context.set_kernel(
-            kernel,
-            external_kernel_format(),
-            config.initramfs.as_deref(),
-            cmdline.as_deref(),
-        )?;
+    #[cfg(target_os = "macos")]
+    {
+        if cli.check_host {
+            admission::check_hvf()
+                .map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
+            println!(
+                "Hypervisor.framework host check passed: kern.hv_support=1; empty VM creation and destruction succeeded"
+            );
+            return Ok(());
+        }
+        if cli.check_host_basic {
+            admission::check_hvf()
+                .map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
+            return Ok(());
+        }
     }
-
-    for disk in &config.disks {
-        context.add_raw_disk(&disk.block_id, &disk.path, disk.read_only)?;
-    }
-
-    for mount in &config.mounts {
-        context.add_virtiofs(&mount.tag, &mount.path, mount.read_only)?;
-    }
-
+    let rosetta = rosetta_from_environment(cli.rosetta, rosetta_value)?;
+    require_supported_rosetta_host(rosetta.as_ref())?;
     #[cfg(target_os = "linux")]
-    if let Some(socket) = &config.vhost_user_vsock {
-        context.add_vhost_user_vsock(socket)?;
-    }
-
-    match &config.network {
-        Network::None => {}
-        Network::Unixgram(net) => {
-            let socket = open_local_unix_datagram_socket(&net.peer_path, &config.id, "krun")?;
-            context.add_net_unixgram_fd(socket.into_raw_fd(), net.mac)?;
-        }
-        Network::Unixstream(net) => {
-            context.add_net_unixstream(&net.peer_path, net.mac)?;
-        }
-        Network::Tap(net) => {
-            context.add_net_tap(&net.name, net.mac)?;
-        }
-    }
-
-    if config.stdio_console {
-        context.add_virtio_console_default(0, 1, 2)?;
-        context.set_kernel_console("hvc0")?;
-    }
-
+    krun::check_host().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
+    #[cfg(target_os = "macos")]
+    admission::check_hvf().map_err(|error| eyre::eyre!("krun host check failed: {error}"))?;
+    let (config, vsock_mux_fd) = cli.into_launch(rosetta)?;
+    validate_config(&config)?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    start_enter(
+        &config,
+        vsock_mux_fd,
+        watchdog_fd,
+        status_fd,
+        vmm::ConsoleFds {
+            stdin: stdin.as_fd(),
+            stdout: stdout.as_fd(),
+            stderr: stderr.as_fd(),
+        },
+    )?;
     Ok(())
 }
 
-fn external_kernel_format() -> context::KernelFormat {
-    #[cfg(target_arch = "x86_64")]
-    {
-        context::KernelFormat::Elf
+fn rosetta_from_environment(
+    enabled: bool,
+    value: Option<std::ffi::OsString>,
+) -> eyre::Result<Option<RosettaLaunchConfig>> {
+    match (enabled, value) {
+        (false, None) => Ok(None),
+        (false, Some(_)) => {
+            eyre::bail!("{ENV_ROSETTA_CONFIG} requires --rosetta for a VM launch")
+        }
+        (true, None) => eyre::bail!("--rosetta requires {ENV_ROSETTA_CONFIG}"),
+        (true, Some(value)) => {
+            let value = value.to_str().ok_or_else(|| {
+                eyre::eyre!("{ENV_ROSETTA_CONFIG} is not a valid Rosetta configuration")
+            })?;
+            RosettaLaunchConfig::decode(value.as_bytes())
+                .map(Some)
+                .map_err(|error| eyre::eyre!("invalid {ENV_ROSETTA_CONFIG}: {error}"))
+        }
     }
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    {
-        context::KernelFormat::Raw
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn require_supported_rosetta_host(_: Option<&RosettaLaunchConfig>) -> eyre::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn require_supported_rosetta_host(config: Option<&RosettaLaunchConfig>) -> eyre::Result<()> {
+    if config.is_some() {
+        eyre::bail!("--rosetta is supported only on macOS aarch64 hosts");
     }
+    Ok(())
+}
+
+fn start_enter(
+    config: &KrunConfig,
+    vsock_mux_fd: Option<OwnedFd>,
+    watchdog_fd: Option<OwnedFd>,
+    status_fd: Option<OwnedFd>,
+    console_fds: vmm::ConsoleFds<'_>,
+) -> eyre::Result<()> {
+    vmm::run(config, vsock_mux_fd, watchdog_fd, status_fd, console_fds)?;
+    Ok(())
+}
+
+fn validate_inherited_stream_fd(fd: RawFd) -> eyre::Result<OwnedFd> {
+    if fd < 0 {
+        eyre::bail!("--vsock-mux-fd must name an open Unix stream socket");
+    }
+    // SAFETY: the numeric descriptor is transferred exactly once from argv ownership.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    nix::sys::stat::fstat(&fd)
+        .map_err(|error| eyre::eyre!("--vsock-mux-fd is not open: {error}"))?;
+    if nix::sys::socket::getsockopt(&fd, sockopt::SockType)? != nix::sys::socket::SockType::Stream
+        || nix::sys::socket::getsockname::<nix::sys::socket::UnixAddr>(fd.as_fd().as_raw_fd())
+            .is_err()
+    {
+        eyre::bail!("--vsock-mux-fd must name an open Unix stream socket");
+    }
+    let mut flags = nix::fcntl::FdFlag::from_bits_retain(nix::fcntl::fcntl(
+        &fd,
+        nix::fcntl::FcntlArg::F_GETFD,
+    )?);
+    flags.insert(nix::fcntl::FdFlag::FD_CLOEXEC);
+    nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFD(flags))?;
+    Ok(fd)
 }
 
 fn open_local_unix_datagram_socket(
     peer_path: &Path,
     vm_id: &str,
     backend: &str,
-) -> eyre::Result<UnixDatagram> {
+) -> io::Result<UnixDatagram> {
     let local_path = local_unix_datagram_path(peer_path, vm_id, backend);
     remove_file_if_exists(&local_path)?;
     let socket = UnixDatagram::bind(&local_path)?;
@@ -322,24 +396,15 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
     use std::path::Path;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use clap::Parser;
 
-    use super::context::KernelFormat;
-    #[cfg(target_os = "linux")]
-    use super::Cli;
-    use super::{external_kernel_format, local_unix_datagram_path};
-
-    #[test]
-    fn external_kernel_format_matches_host_architecture() {
-        #[cfg(target_arch = "x86_64")]
-        assert_eq!(external_kernel_format(), KernelFormat::Elf);
-
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        assert_eq!(external_kernel_format(), KernelFormat::Raw);
-    }
+    use crate::local_unix_datagram_path;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::Cli;
 
     #[test]
     fn local_unix_datagram_path_uses_short_vm_id_and_backend() {
@@ -361,30 +426,68 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn host_check_is_exclusive_with_vm_arguments() {
         assert!(Cli::try_parse_from(["krun", "--check-host"]).is_ok());
         assert!(Cli::try_parse_from(["krun", "--check-host", "--cpus", "2"]).is_err());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn parses_vhost_user_vsock() {
-        let config = Cli::try_parse_from([
+    fn parses_vsock_mux_fd() {
+        use std::os::fd::IntoRawFd;
+
+        let (fd, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let raw = fd.into_raw_fd();
+        let (config, fd) = Cli::try_parse_from([
             "krun",
             "--kernel",
             "/kernel",
-            "--vhost-user-vsock",
-            "/tmp/vhost-vsock.sock",
+            "--vsock-mux-fd",
+            &raw.to_string(),
         ])
-        .expect("vhost-user argument should parse")
-        .into_config()
-        .expect("vhost-user argument should produce a config");
+        .expect("mux argument should parse")
+        .into_launch(None)
+        .expect("mux argument should produce a launch");
 
-        assert_eq!(
-            config.vhost_user_vsock.as_deref(),
-            Some(Path::new("/tmp/vhost-vsock.sock"))
-        );
+        assert!(config.vsock_mux);
+        assert_eq!(fd.expect("owned mux fd").as_raw_fd(), raw);
+    }
+
+    #[test]
+    fn parses_standalone_vsock_guest_cid() {
+        let config = Cli::try_parse_from(["krun", "--kernel", "/kernel", "--vsock-cid", "3"])
+            .expect("standalone vsock argument should parse")
+            .into_launch(None)
+            .map(|launch| launch.0)
+            .expect("standalone vsock argument should produce a config");
+
+        assert_eq!(config.vsock_cid, Some(3));
+    }
+
+    #[test]
+    fn rejects_removed_host_memory_reclaim_switch() {
+        for argument in ["--host-memory-reclaim=on", "--host-memory-reclaim=off"] {
+            assert!(Cli::try_parse_from(["krun", "--kernel", "/kernel", argument]).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_standalone_and_mux_vsock_together() {
+        assert!(Cli::try_parse_from([
+            "krun",
+            "--kernel",
+            "/kernel",
+            "--vsock-cid",
+            "3",
+            "--vsock-mux-fd",
+            "9",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_standalone_vsock_guest_cid() {
+        assert!(Cli::try_parse_from(["krun", "--kernel", "/kernel", "--vsock-cid", "4"]).is_err());
     }
 }

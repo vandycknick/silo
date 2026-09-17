@@ -1,14 +1,16 @@
+mod api;
 pub mod app;
+mod boundary;
 pub mod commands;
 pub mod config;
 pub mod context;
 pub mod environment;
 pub mod errors;
-pub mod guest;
 pub mod help;
 pub mod machine_defaults;
 mod network_policy;
 pub mod planning;
+pub(crate) mod system;
 pub mod template;
 pub mod terminal;
 pub mod ui;

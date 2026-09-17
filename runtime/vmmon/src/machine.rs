@@ -21,8 +21,8 @@ pub enum MachineSpecError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    #[error("invalid mount tag for {mount_source}: mount tags must be non-empty")]
-    InvalidMountTag { mount_source: String },
+    #[error(transparent)]
+    MountProjection(#[from] vm_spec::MountProjectionError),
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +39,9 @@ pub(crate) struct VmSpecInputs<'a> {
     pub network: &'a RuntimeNetwork,
     pub guest_services_enabled: bool,
     pub krun_path: &'a Path,
+    pub selected_backend: crate::virt::BackendKind,
+    pub rosetta_intent: crate::virt::RosettaIntent,
+    pub prepared_rosetta: Option<krun::RosettaLaunchConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +54,11 @@ pub(crate) fn vm_spec_machine_config(
     inputs: VmSpecInputs<'_>,
 ) -> Result<InstanceVmConfig, MachineSpecError> {
     let boot_assets = vm_spec_boot_assets(&inputs)?;
-    let machine_identifier = load_host_machine_identifier(inputs.data_dir)?;
+    let machine_identifier = if inputs.selected_backend == crate::virt::BackendKind::Vz {
+        load_host_machine_identifier(inputs.data_dir)?
+    } else {
+        None
+    };
 
     let mut builder = VmConfig::builder(inputs.name)
         .vm_id(inputs.id)
@@ -62,7 +69,10 @@ pub(crate) fn vm_spec_machine_config(
             inputs.guest_services_enabled,
         ))
         .nested_virtualization(inputs.spec.nested_virtualization_or_default())
-        .rosetta(inputs.spec.rosetta_or_default());
+        .rosetta(inputs.rosetta_intent);
+    if let Some(prepared) = inputs.prepared_rosetta {
+        builder = builder.prepared_rosetta(prepared);
+    }
 
     builder = apply_runtime_network(builder, inputs.network)?;
 
@@ -90,15 +100,10 @@ pub(crate) fn vm_spec_machine_config(
         }
     }
 
-    for mount in &inputs.spec.mounts {
-        if mount.tag.trim().is_empty() {
-            return Err(MachineSpecError::InvalidMountTag {
-                mount_source: mount.source.display().to_string(),
-            });
-        }
+    for mount in vm_spec::project_mounts(&inputs.spec.mounts)? {
         builder = builder.mount(SharedDirectory {
-            host_path: mount.source.clone(),
-            tag: mount.tag.clone(),
+            host_path: mount.host_source,
+            tag: mount.backend_tag,
             read_only: mount.read_only,
         });
     }
@@ -242,7 +247,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use vm_spec::{Boot, Disk, Hardware, Kernel, Storage, VmSpec, Vsock};
+    use vm_spec::{Boot, Disk, Hardware, Kernel, Mount, Storage, VmSpec, Vsock};
 
     const DATA_DISK: &str = "data.img";
 
@@ -340,6 +345,9 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: true,
             krun_path: Path::new("/tmp/krun"),
+            selected_backend: crate::virt::BackendKind::Vz,
+            rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("machine config should resolve");
 
@@ -374,6 +382,9 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
+            selected_backend: crate::virt::BackendKind::Vz,
+            rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("machine config should resolve");
 
@@ -413,6 +424,9 @@ mod tests {
                 network: &RuntimeNetwork::None,
                 guest_services_enabled: false,
                 krun_path: Path::new("/tmp/krun"),
+                selected_backend: crate::virt::BackendKind::Vz,
+                rosetta_intent: crate::virt::RosettaIntent::Disabled,
+                prepared_rosetta: None,
             })
             .expect("machine config should resolve");
 
@@ -454,6 +468,9 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
+            selected_backend: crate::virt::BackendKind::Vz,
+            rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("machine config should resolve");
 
@@ -466,6 +483,76 @@ mod tests {
         assert_eq!(machine_config.config.disks()[1].path, dir.join(DATA_DISK));
         assert!(machine_config.config.disks()[1].read_only);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vm_spec_machine_config_uses_projected_tag_without_rewriting_host_source() {
+        let dir = temp_dir("projected-mount");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let source = PathBuf::from("/host/workspace/source/that/must/remain/unchanged");
+        let mut spec = sample_spec(&dir);
+        spec.mounts = vec![Mount {
+            source: source.clone(),
+            tag: "/guest/workspace/destination/that/is/longer/than/virtiofs/allows".to_string(),
+            read_only: true,
+        }];
+
+        let machine_config = vm_spec_machine_config(VmSpecInputs {
+            name: "devbox",
+            id: "vm-mount",
+            data_dir: &dir,
+            spec: &spec,
+            network: &RuntimeNetwork::None,
+            guest_services_enabled: false,
+            krun_path: Path::new("/tmp/krun"),
+            selected_backend: crate::virt::BackendKind::Krun,
+            rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
+        })
+        .expect("build VM config with projected mount");
+
+        assert_eq!(machine_config.config.mounts()[0].host_path, source);
+        assert_eq!(machine_config.config.mounts()[0].tag, "silo-mount-0");
+        assert!(machine_config.config.mounts()[0].read_only);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vm_spec_machine_config_propagates_duplicate_original_tag_errors() {
+        let dir = temp_dir("duplicate-mount-tags");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let mut spec = sample_spec(&dir);
+        spec.mounts = vec![
+            Mount {
+                source: PathBuf::from("/one"),
+                tag: "workspace".to_string(),
+                read_only: false,
+            },
+            Mount {
+                source: PathBuf::from("/two"),
+                tag: "workspace".to_string(),
+                read_only: false,
+            },
+        ];
+
+        let error = vm_spec_machine_config(VmSpecInputs {
+            name: "devbox",
+            id: "vm-duplicate-mount",
+            data_dir: &dir,
+            spec: &spec,
+            network: &RuntimeNetwork::None,
+            guest_services_enabled: false,
+            krun_path: Path::new("/tmp/krun"),
+            selected_backend: crate::virt::BackendKind::Krun,
+            rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
+        })
+        .expect_err("duplicate mount tags must fail before VM construction");
+
+        assert!(error
+            .to_string()
+            .contains("mount tag \"workspace\" is repeated"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -487,6 +574,9 @@ mod tests {
             network: &runtime_network,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
+            selected_backend: crate::virt::BackendKind::Vz,
+            rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("machine config should resolve");
 
@@ -517,6 +607,9 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
+            selected_backend: crate::virt::BackendKind::Vz,
+            rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("machine config should resolve");
 
@@ -546,6 +639,9 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
+            selected_backend: crate::virt::BackendKind::Vz,
+            rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect("machine config should resolve");
 
@@ -568,11 +664,46 @@ mod tests {
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
             krun_path: Path::new("/tmp/krun"),
+            selected_backend: crate::virt::BackendKind::Vz,
+            rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
         })
         .expect_err("missing kernel path should fail");
 
         assert!(err.to_string().contains("boot.kernel.path"));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn krun_preserves_but_does_not_load_vz_machine_identity() {
+        let dir = temp_dir("krun-vz-identity");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let identity_path = crate::machine::machine_identifier_path_from_dir(&dir);
+        fs::write(&identity_path, b"retained-vz-identity").expect("write identity");
+        let spec = sample_spec(&dir);
+
+        let machine_config = vm_spec_machine_config(VmSpecInputs {
+            name: "devbox",
+            id: "vm-krun",
+            data_dir: &dir,
+            spec: &spec,
+            network: &RuntimeNetwork::None,
+            guest_services_enabled: false,
+            krun_path: Path::new("/tmp/krun"),
+            selected_backend: crate::virt::BackendKind::Krun,
+            rosetta_intent: crate::virt::RosettaIntent::Disabled,
+            prepared_rosetta: None,
+        })
+        .expect("build krun config");
+
+        assert!(machine_config.machine_identifier.is_none());
+        assert!(machine_config.config.vz().machine_identifier.is_none());
+        assert_eq!(
+            fs::read(&identity_path).expect("read retained identity"),
+            b"retained-vz-identity"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

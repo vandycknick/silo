@@ -1,0 +1,26 @@
+[Unit]
+Description=Silo Docker application container engine
+Documentation=https://docs.docker.com
+Requires=silo-system-docker-preflight.service containerd.service
+After=network-online.target nss-lookup.target silo-system-docker-preflight.service containerd.service time-set.target
+Wants=network-online.target
+StartLimitIntervalSec=30s
+StartLimitBurst=3
+
+[Service]
+Type=notify
+ExecStartPre=/usr/sbin/silo-system-activate check
+ExecStart=/usr/bin/dockerd --host=unix:///run/docker.sock --containerd=/run/containerd/containerd.sock
+ExecReload=/bin/kill -s HUP $MAINPID
+TimeoutStartSec=0
+Restart=on-failure
+RestartSec=2s
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+Delegate=yes
+KillMode=process
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

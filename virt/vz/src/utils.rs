@@ -2,7 +2,7 @@
 
 use objc2_virtualization::{
     VZGenericPlatformConfiguration, VZLinuxRosettaAvailability, VZLinuxRosettaDirectoryShare,
-    VZVirtualMachine,
+    VZVirtualMachine, VZVirtualMachineConfiguration,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,6 +10,14 @@ pub enum RosettaAvailability {
     NotSupported,
     NotInstalled,
     Installed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualMachineLimits {
+    pub minimum_cpu_count: usize,
+    pub maximum_cpu_count: usize,
+    pub minimum_memory_size: u64,
+    pub maximum_memory_size: u64,
 }
 
 pub(crate) fn os_version() -> (i64, i64, i64) {
@@ -40,5 +48,16 @@ pub fn rosetta_availability() -> RosettaAvailability {
         VZLinuxRosettaAvailability::NotInstalled => RosettaAvailability::NotInstalled,
         VZLinuxRosettaAvailability::Installed => RosettaAvailability::Installed,
         _ => RosettaAvailability::NotSupported,
+    }
+}
+
+pub fn virtual_machine_limits() -> VirtualMachineLimits {
+    unsafe {
+        VirtualMachineLimits {
+            minimum_cpu_count: VZVirtualMachineConfiguration::minimumAllowedCPUCount(),
+            maximum_cpu_count: VZVirtualMachineConfiguration::maximumAllowedCPUCount(),
+            minimum_memory_size: VZVirtualMachineConfiguration::minimumAllowedMemorySize(),
+            maximum_memory_size: VZVirtualMachineConfiguration::maximumAllowedMemorySize(),
+        }
     }
 }

@@ -1,13 +1,8 @@
 use std::time::{Duration, Instant};
 
 use clap::Args;
-use libvm::{
-    MachineKillOptions, MachineReadinessOutcome, MachineStatus, MachineStopOptions,
-    DEFAULT_GUEST_READINESS_TIMEOUT,
-};
+use libvm::{MachineStatus, DEFAULT_GUEST_READINESS_TIMEOUT};
 
-use crate::commands::start::{ensure_startable, requires_guest_readiness};
-use crate::commands::start_options::machine_start_options;
 use crate::commands::stop::parse_timeout;
 use crate::context::Context;
 use crate::ui::Spinner;
@@ -31,8 +26,8 @@ pub struct Cmd {
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         let mut spinner = Spinner::start("Finding", self.name.as_deref().unwrap_or("default VM"));
-        let (name, machine) = context.machine(self.name.as_deref()).await?;
-        let data = machine.inspect().await?;
+        let name = context.resolve_machine_name(self.name.as_deref())?;
+        let data = context.app_api().await?.inspect_machine(&name).await?;
         if data.retention == libvm::MachineRetention::Ephemeral {
             eyre::bail!(
                 "machine `{}` is ephemeral and cannot be restarted; use `silo run` instead",
@@ -55,33 +50,25 @@ impl Cmd {
         ) {
             if self.force {
                 spinner.step("Killing", &name);
-                machine
-                    .kill_with(MachineKillOptions::new().timeout(remaining(deadline)?))
-                    .await?;
             } else {
                 spinner.step("Stopping", &name);
-                machine
-                    .stop_with(MachineStopOptions::new().timeout(remaining(deadline)?))
-                    .await?;
             }
+            context
+                .app_api()
+                .await?
+                .stop_machine(&name, self.force, remaining(deadline)?)
+                .await?;
         }
 
-        let data = machine.inspect().await?;
-        ensure_startable(&data)?;
         spinner.step("Starting", &name);
-        let options = machine_start_options(context.runtime().await?, &machine).await?;
-        let start = machine.start_with_options(options).await?;
+        let timeout = remaining(deadline)?.min(DEFAULT_GUEST_READINESS_TIMEOUT);
+        let started = context
+            .app_api()
+            .await?
+            .start_machine(&name, timeout)
+            .await?;
 
-        if requires_guest_readiness(&start.machine) {
-            spinner.step("Waiting", &name);
-            let timeout = remaining(deadline)?.min(DEFAULT_GUEST_READINESS_TIMEOUT);
-            let readiness = machine.wait_ready(timeout).await?;
-            if readiness.outcome != MachineReadinessOutcome::Ready {
-                eyre::bail!("guest readiness check ended with {:?}", readiness.outcome);
-            }
-        }
-
-        spinner.step("Ready", &start.machine.name);
+        spinner.step("Ready", &started.name);
         spinner.finish_success("Restarted");
         Ok(())
     }

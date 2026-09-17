@@ -151,7 +151,7 @@ fn build_provision_config(
                 .unwrap_or(false),
             ..AgentRosettaConfig::default()
         },
-        mounts: provision_mount_entries(spec),
+        mounts: provision_mount_entries(spec)?,
         userdata: provision_userdata(spec)?,
     })
 }
@@ -262,12 +262,13 @@ fn build_provision_network_config(
     }
 }
 
-fn provision_mount_entries(spec: &VmSpec) -> Vec<ProvisionMountConfig> {
-    spec.mounts
-        .iter()
+fn provision_mount_entries(spec: &VmSpec) -> eyre::Result<Vec<ProvisionMountConfig>> {
+    Ok(vm_spec::project_mounts(&spec.mounts)
+        .map_err(eyre::Report::msg)?
+        .into_iter()
         .map(|mount| ProvisionMountConfig {
-            tag: mount.tag.clone(),
-            path: mount.source.to_string_lossy().to_string(),
+            tag: mount.backend_tag,
+            path: mount.guest_path.to_string_lossy().to_string(),
             fstype: VIRTIOFS_FSTYPE.to_string(),
             options: if mount.read_only {
                 vec![
@@ -281,7 +282,7 @@ fn provision_mount_entries(spec: &VmSpec) -> Vec<ProvisionMountConfig> {
                 ]
             },
         })
-        .collect()
+        .collect())
 }
 
 fn certificate_authority_pem_for_config(
@@ -326,7 +327,8 @@ mod tests {
 
     use crate::guest_agent::{
         build_config_with_host_context, build_provision_config, build_provision_network_config,
-        guest_ssh_key_paths, load_or_generate_guest_ssh_keypair, GuestAgentHostContext,
+        guest_ssh_key_paths, load_or_generate_guest_ssh_keypair, provision_mount_entries,
+        GuestAgentHostContext,
     };
     use crate::host;
     use crate::machine::MachineUserConfig;
@@ -648,7 +650,10 @@ mod tests {
         let decoded: AgentConfig = serde_json::from_str(&rendered).expect("decode metadata config");
         assert!(decoded.provision.enabled);
         assert!(decoded.provision.resize_rootfs.enabled);
-        assert_eq!(decoded.provision.rosetta.mount_tag, "silo-rosetta");
+        assert_eq!(
+            decoded.provision.rosetta.mount_tag,
+            agent_spec::ROSETTA_MOUNT_TAG
+        );
         assert_eq!(
             decoded
                 .provision
@@ -665,6 +670,86 @@ mod tests {
                 .map(|userdata| &userdata.run),
             Some(&UserdataRunPolicy::Once)
         );
+    }
+
+    #[test]
+    fn provision_mounts_resolve_guest_paths_without_changing_export_tags() {
+        let mut spec = sample_spec(Vec::new());
+        spec.mounts = vec![
+            Mount {
+                source: PathBuf::from("/host/project"),
+                tag: "/workspace".to_string(),
+                read_only: false,
+            },
+            Mount {
+                source: PathBuf::from("/host/cache"),
+                tag: "/var/cache/project".to_string(),
+                read_only: true,
+            },
+            Mount {
+                source: PathBuf::from("/sdk/worktree"),
+                tag: "workspace".to_string(),
+                read_only: false,
+            },
+            Mount {
+                source: PathBuf::from("/srv/shared"),
+                tag: "/srv/shared".to_string(),
+                read_only: true,
+            },
+        ];
+
+        let mounts = provision_mount_entries(&spec).expect("project provision mounts");
+
+        assert_eq!(mounts[0].tag, "/workspace");
+        assert_eq!(mounts[0].path, "/workspace");
+        assert_eq!(mounts[0].options, ["rw", "nofail"]);
+        assert_eq!(mounts[1].tag, "/var/cache/project");
+        assert_eq!(mounts[1].path, "/var/cache/project");
+        assert_eq!(mounts[1].options, ["ro", "nofail"]);
+        assert_eq!(mounts[2].tag, "workspace");
+        assert_eq!(mounts[2].path, "/sdk/worktree");
+        assert_eq!(mounts[3].tag, "/srv/shared");
+        assert_eq!(mounts[3].path, "/srv/shared");
+    }
+
+    #[test]
+    fn provision_mounts_use_projected_backend_tags_and_original_guest_paths() {
+        let mut spec = sample_spec(Vec::new());
+        let destination = "/guest/workspace/destination/that/is/longer/than/virtiofs/allows";
+        spec.mounts = vec![Mount {
+            source: PathBuf::from("/host/workspace/source/that/must/remain/unchanged"),
+            tag: destination.to_string(),
+            read_only: false,
+        }];
+
+        let mounts = provision_mount_entries(&spec).expect("project provision mounts");
+
+        assert_eq!(mounts[0].tag, "silo-mount-0");
+        assert_eq!(mounts[0].path, destination);
+        assert_eq!(mounts[0].options, ["rw", "nofail"]);
+    }
+
+    #[test]
+    fn provision_mounts_propagate_duplicate_original_tag_errors() {
+        let mut spec = sample_spec(Vec::new());
+        spec.mounts = vec![
+            Mount {
+                source: PathBuf::from("/one"),
+                tag: "workspace".to_string(),
+                read_only: false,
+            },
+            Mount {
+                source: PathBuf::from("/two"),
+                tag: "workspace".to_string(),
+                read_only: false,
+            },
+        ];
+
+        let error = provision_mount_entries(&spec).expect_err("duplicate tags must fail");
+
+        assert!(error
+            .to_string()
+            .contains("mount tag \"workspace\" is repeated"));
     }
 
     #[test]
@@ -696,8 +781,8 @@ mod tests {
         .expect("resolve provision config");
 
         assert!(provision.rosetta.enabled);
-        assert_eq!(provision.rosetta.mount_tag, "silo-rosetta");
-        assert_eq!(provision.rosetta.mount_path, "/mnt/silo-rosetta");
+        assert_eq!(provision.rosetta.mount_tag, agent_spec::ROSETTA_MOUNT_TAG);
+        assert_eq!(provision.rosetta.mount_path, agent_spec::ROSETTA_MOUNT_PATH);
     }
 
     #[test]

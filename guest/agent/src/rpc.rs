@@ -40,6 +40,7 @@ struct AgentState {
     process_supervisor: crate::pid1::ProcessSupervisor,
     status: watch::Sender<AgentStatus>,
     shutdown: watch::Sender<bool>,
+    memory_reclaim: crate::memory_reclaim::MemoryReclaimStatus,
 }
 
 impl AgentServer {
@@ -47,6 +48,7 @@ impl AgentServer {
         port: u32,
         boot: GuestBootReport,
         process_supervisor: crate::pid1::ProcessSupervisor,
+        memory_reclaim: crate::memory_reclaim::MemoryReclaimStatus,
     ) -> eyre::Result<Self> {
         let instance_id = Uuid::new_v4().to_string();
         let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
@@ -73,6 +75,7 @@ impl AgentServer {
                 process_supervisor,
                 status: sender,
                 shutdown: shutdown.clone(),
+                memory_reclaim,
             },
             shutdown,
             task: Mutex::new(None),
@@ -503,11 +506,15 @@ impl GuestAgentService for AgentService {
         _: Request<GetAgentMetricsRequest>,
     ) -> Result<Response<protocol::v1::AgentMetrics>, Status> {
         let instance_id = self.state.instance_id.clone();
-        let report = tokio::task::spawn_blocking(move || metrics::collect(instance_id))
-            .await
-            .map_err(|error| {
-                protocol::detailed_status(Status::internal(format!("metrics task failed: {error}")))
-            })?;
+        let memory_reclaim = self.state.memory_reclaim.last();
+        let report =
+            tokio::task::spawn_blocking(move || metrics::collect(instance_id, memory_reclaim))
+                .await
+                .map_err(|error| {
+                    protocol::detailed_status(Status::internal(format!(
+                        "metrics task failed: {error}"
+                    )))
+                })?;
         Ok(Response::new(report))
     }
     async fn watch_metrics(
@@ -517,6 +524,7 @@ impl GuestAgentService for AgentService {
         let interval = checked_interval(request.into_inner().interval, 1, 300, "interval")?;
         let permit = admission(&self.metric_watches, "metrics watch")?;
         let instance_id = self.state.instance_id.clone();
+        let memory_reclaim_status = self.state.memory_reclaim.clone();
         let mut shutdown = self.state.shutdown.subscribe();
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
@@ -524,7 +532,8 @@ impl GuestAgentService for AgentService {
             loop {
                 let report = tokio::task::spawn_blocking({
                     let instance_id = instance_id.clone();
-                    move || metrics::collect(instance_id)
+                    let memory_reclaim = memory_reclaim_status.last();
+                    move || metrics::collect(instance_id, memory_reclaim)
                 })
                 .await
                 .map_err(|error| protocol::detailed_status(Status::internal(error.to_string())));

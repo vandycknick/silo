@@ -13,7 +13,7 @@ use protocol::v1::{
 use russh::client::Msg as ClientMsg;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 use russh::{Channel, ChannelMsg, ChannelWriteHalf};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -1183,10 +1183,11 @@ pub(crate) fn lost_reason(value: Option<i32>) -> ExecutionLostReason {
 async fn attach_execution_stdio(
     session: &mut ExecutionSession,
 ) -> Result<ExecutionResult, LibVmError> {
-    let mut host_stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut input = [0_u8; 1024];
     let mut _terminal = None;
+    let mut host_stdin = crate::host_input::HostInput::stdin().map_err(|error| {
+        guest_session_error(&session.reference, format!("open host input: {error}"))
+    })?;
+    let mut stdout = tokio::io::stdout();
     let mut stdin: Option<ExecutionStdin> = None;
     let mut stdin_closed = false;
     let mut started = false;
@@ -1204,15 +1205,15 @@ async fn attach_execution_stdio(
     let mut signals = HostSignalForwarders::new(&session.reference)?;
     loop {
         tokio::select! {
-            read = host_stdin.read(&mut input), if started && !launch_cancelled && !stdin_closed => {
-                let read = read.map_err(|error| guest_session_error(&session.reference, format!("read terminal input: {error}")))?;
-                if read == 0 {
+            read = host_stdin.read(), if started && !launch_cancelled && !stdin_closed => {
+                let input = read.map_err(|error| guest_session_error(&session.reference, format!("read terminal input: {error}")))?;
+                if input.is_empty() {
                     stdin_closed = true;
                 } else {
                     let Some(stdin) = stdin.as_ref() else {
                         continue;
                     };
-                    stdin.write(input[..read].to_vec()).await?;
+                    stdin.write(input).await?;
                 }
             }
             resized = resize_signal.recv(), if started && !launch_cancelled && resize_signal_open => {
@@ -1451,9 +1452,9 @@ async fn attach_ssh_stdio(
     })?;
     let (mut rx, tx) = channel.split();
     let tx = Arc::new(tx);
-    let mut stdin = tokio::io::stdin();
+    let mut stdin = crate::host_input::HostInput::stdin()
+        .map_err(|error| guest_session_error(&reference, format!("open host input: {error}")))?;
     let mut stdout = tokio::io::stdout();
-    let mut input = [0_u8; 1024];
     let mut match_pos = 0;
     let mut exit_code = None;
     let mut detached = false;
@@ -1465,16 +1466,16 @@ async fn attach_ssh_stdio(
     let mut resize_signal_open = true;
     loop {
         tokio::select! {
-            read = stdin.read(&mut input), if !stdin_closed => {
-                let read = read.map_err(|error| guest_session_error(&reference, format!("read terminal input: {error}")))?;
-                if read == 0 {
+            read = stdin.read(), if !stdin_closed => {
+                let input = read.map_err(|error| guest_session_error(&reference, format!("read terminal input: {error}")))?;
+                if input.is_empty() {
                     stdin_closed = true;
                     tx.eof().await.map_err(|error| ssh_error(&reference, "close terminal input", error))?;
-                } else if input_contains_detach_sequence(&input[..read], &detach_keys, &mut match_pos) {
+                } else if input_contains_detach_sequence(&input, &detach_keys, &mut match_pos) {
                     detached = true;
                     break;
                 } else {
-                    tx.data_bytes(input[..read].to_vec()).await.map_err(|error| ssh_error(&reference, "write terminal input", error))?;
+                    tx.data_bytes(input).await.map_err(|error| ssh_error(&reference, "write terminal input", error))?;
                 }
             }
             resized = resize_signal.recv(), if resize_signal_open => {

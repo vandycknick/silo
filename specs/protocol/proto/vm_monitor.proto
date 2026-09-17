@@ -162,4 +162,25 @@ message HostMetrics {
   optional string name = 2;
   MonitorSnapshot monitor = 3;
   AgentMetricsObservation metrics = 4;
+  // Backend that constructed this running monitor, never a requested/default guess.
+  optional string actual_backend = 5;
+  // Host memory reclaim state reported by the krun helper. Absent on backends
+  // that cannot observe it and before the helper's first report.
+  HostMemoryReclaim host_memory_reclaim = 6;
+}
+
+message HostMemoryReclaim {
+  // Whether the runtime asked the helper to release guest RAM to the host.
+  optional bool requested = 1;
+  // Outcome of the per-VM qualification probe: not-run, passed, failed, inconclusive.
+  optional string qualification = 2;
+  // True only while free-page reports are actually released to the host.
+  optional bool effective = 3;
+  // Cumulative counters for the VM lifetime.
+  optional uint64 released_bytes = 4;
+  optional uint64 released_extents = 5;
+  optional uint64 retried_faults = 6;
+  optional uint64 skipped_reports = 7;
+  optional uint64 failed_operations = 8;
+  google.protobuf.Timestamp observed_at = 9;
 }

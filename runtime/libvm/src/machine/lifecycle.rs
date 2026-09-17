@@ -131,12 +131,12 @@ impl Machine {
                     .await);
                 }
             };
-            let agent_enabled = match runtime.prepare_vmmon_launch_inputs(
+            let launch_inputs = match runtime.prepare_vmmon_launch_inputs(
                 &config,
                 &resolved_network,
                 root_disk_resize == RootDiskResizeOutcome::GuestRequired,
             ) {
-                Ok(agent_enabled) => agent_enabled,
+                Ok(inputs) => inputs,
                 Err(err) => {
                     return Err(finish_failed_start(
                         runtime,
@@ -149,7 +149,7 @@ impl Machine {
                     .await);
                 }
             };
-            if options.entrypoint.is_some() && !agent_enabled {
+            if options.entrypoint.is_some() && !launch_inputs.agent_enabled {
                 let error = LibVmError::MachinePreparationFailed {
                     reference: config.name.clone(),
                     message: "an entrypoint requires the managed guest agent".to_string(),
@@ -194,7 +194,9 @@ impl Machine {
                 network: &resolved_network,
                 run_id: &run_id,
                 exit_command: options.on_exit.as_ref(),
-                agent_enabled,
+                agent_enabled: launch_inputs.agent_enabled,
+                rosetta_intent: launch_inputs.rosetta_intent,
+                asset_directory: launch_inputs.asset_directory,
                 startup_command: startup_command.as_ref(),
                 machine_log_dir: &machine_log_dir,
                 machine_lock: &lifetime_lock,
@@ -377,9 +379,36 @@ impl Machine {
             }
         };
 
-        self.wait_for_target_exit(wait_target, options.wait_options(), expected_run_id)
-            .await
-            .map(|exit| exit.machine)
+        // Capture the generation before releasing control to the wait. Never
+        // escalate against whichever run happens to be current after a timeout.
+        let run_id = wait_target
+            .generation
+            .run_id
+            .clone()
+            .map(MachineRunId::from_raw);
+        let result = self
+            .wait_for_target_exit(wait_target, options.wait_options(), expected_run_id)
+            .await;
+        match (result, options.force_timeout(), run_id) {
+            (Err(LibVmError::Io(error)), Some(timeout), Some(run_id))
+                if error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                match self
+                    .kill_run_with(run_id.clone(), MachineKillOptions::new().timeout(timeout))
+                    .await
+                {
+                    Ok(exit) => Ok(exit.machine),
+                    // The original monitor may have exited between the timed
+                    // wait and the generation-checked kill. Reconcile its exit.
+                    Err(LibVmError::MachineNotRunning { .. }) => self
+                        .wait_for_run_with(run_id, MachineWaitOptions::new().timeout(timeout))
+                        .await
+                        .map(|exit| exit.machine),
+                    Err(error) => Err(error),
+                }
+            }
+            (result, _, _) => result.map(|exit| exit.machine),
+        }
     }
 
     /// Waits for the current machine run to exit without sending a stop signal.

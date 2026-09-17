@@ -13,9 +13,21 @@ vsock:
 Omitting `vsock`, or setting `enabled: false`, creates no public sockets. A
 custom `uds` must be one filename, not an absolute or nested path. Setting
 `uds` while disabled is rejected. The runtime-owned names `vm.sock`, `vm.pid`,
-`vm.lock`, and `krun.vsock` are reserved. This is an intentional schema break
-without a VM spec version bump: old endpoint and plugin fields are rejected
-with a migration error rather than ignored.
+`vm.lock`, and `krun.vsock` are reserved. `krun.vsock` is retained as a legacy
+validator reservation; the current krun transport does not create that path.
+This is an intentional schema break without a VM spec version bump: old
+endpoint and plugin fields are rejected with a migration error rather than
+ignored.
+
+The krun backend implements this public surface over a separate private
+socketpair inherited by the helper on both Linux and macOS. Connection-control
+messages cross that channel with one per-connection Unix stream descriptor
+passed by `SCM_RIGHTS`; payload bytes use the passed stream and never the
+control channel. This private transport creates no filesystem path and does not
+change the public registry, admission limits, listener discovery, stream
+relays, or lifecycle described below. Krun is the default backend on Linux and
+macOS; Virtualization.framework remains available through an explicit `vz`
+selection on macOS.
 
 ## Host To Guest
 

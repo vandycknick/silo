@@ -3,12 +3,13 @@ use std::path::Path;
 
 use clap::Args;
 use libvm::{
-    Forward, ForwardAddress, ForwardDirection, ForwardEndpoint, MachineAgentStatus,
-    MachineForwardScope, MachineForwardState, MachineForwardStatus,
+    Forward, ForwardAddress, ForwardDirection, ForwardEndpoint, MachineForwardScope,
+    MachineForwardState, MachineForwardStatus,
 };
 
+use crate::api::machine::AppMachine;
+use crate::api::streams as guest;
 use crate::context::Context;
-use crate::guest;
 use crate::ui::Table;
 
 #[derive(Debug, Args)]
@@ -131,10 +132,7 @@ fn absolutize_host_unix(endpoint: ForwardEndpoint, cwd: &Path) -> ForwardEndpoin
     }
 }
 
-async fn report_status(
-    machine: &libvm::Machine,
-    status: &MachineForwardStatus,
-) -> eyre::Result<()> {
+async fn report_status(machine: &AppMachine, status: &MachineForwardStatus) -> eyre::Result<()> {
     match status.state {
         MachineForwardState::Active => {
             let bound = status
@@ -154,15 +152,8 @@ async fn report_status(
         }
         MachineForwardState::Unsupported => {
             let version = machine
-                .monitor_status()
+                .agent_version()
                 .await
-                .ok()
-                .and_then(|status| match status.agent {
-                    MachineAgentStatus::Enabled(agent) => {
-                        agent.identity.map(|identity| identity.version)
-                    }
-                    MachineAgentStatus::Disabled => None,
-                })
                 .unwrap_or_else(|| "unknown".to_string());
             eyre::bail!("guest agent {version} does not support forwarding")
         }

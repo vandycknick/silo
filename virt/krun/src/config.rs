@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{KrunBackendError, Result};
+use crate::rosetta::{RosettaLaunchConfig, ROSETTA_MOUNT_TAG};
 
 pub const DEFAULT_ID: &str = "anonymous-instance";
+const STANDALONE_VSOCK_CID: u64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KrunConfig {
@@ -14,9 +16,12 @@ pub struct KrunConfig {
     pub cmdline: Vec<String>,
     pub disks: Vec<Disk>,
     pub mounts: Vec<Mount>,
-    pub vhost_user_vsock: Option<PathBuf>,
+    pub vsock_mux: bool,
+    pub vsock_cid: Option<u64>,
     pub network: Network,
     pub stdio_console: bool,
+    pub balloon: bool,
+    pub rosetta: Option<RosettaLaunchConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,9 +75,12 @@ impl Default for KrunConfig {
             cmdline: Vec::new(),
             disks: Vec::new(),
             mounts: Vec::new(),
-            vhost_user_vsock: None,
+            vsock_mux: false,
+            vsock_cid: None,
             network: Network::None,
             stdio_console: false,
+            balloon: false,
+            rosetta: None,
         }
     }
 }
@@ -93,20 +101,28 @@ pub fn validate_config(config: &KrunConfig) -> Result<()> {
             "krun requires a kernel".to_string(),
         ));
     }
-    if config
-        .vhost_user_vsock
-        .as_ref()
-        .is_some_and(|path| path.as_os_str().is_empty())
-    {
+    if config.vsock_cid.is_some() && config.vsock_mux {
         return Err(KrunBackendError::InvalidConfig(
-            "vhost-user vsock socket path cannot be empty".to_string(),
+            "standalone vsock and the vsock mux cannot be used together".to_string(),
         ));
     }
-    #[cfg(not(target_os = "linux"))]
-    if config.vhost_user_vsock.is_some() {
-        return Err(KrunBackendError::InvalidConfig(
-            "vhost-user vsock is only supported on Linux".to_string(),
-        ));
+    if config.rosetta.is_some()
+        && config
+            .mounts
+            .iter()
+            .any(|mount| mount.tag == ROSETTA_MOUNT_TAG)
+    {
+        return Err(KrunBackendError::InvalidConfig(format!(
+            "mount tag {ROSETTA_MOUNT_TAG:?} is reserved for Rosetta"
+        )));
+    }
+    if config
+        .vsock_cid
+        .is_some_and(|cid| cid != STANDALONE_VSOCK_CID)
+    {
+        return Err(KrunBackendError::InvalidConfig(format!(
+            "native vsock currently requires guest CID {STANDALONE_VSOCK_CID}"
+        )));
     }
     match &config.network {
         Network::None => {}
@@ -165,4 +181,51 @@ fn validate_mac(mac: [u8; 6], name: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::config::{validate_config, KrunConfig};
+
+    fn valid_config() -> KrunConfig {
+        KrunConfig {
+            kernel: Some(PathBuf::from("/kernel")),
+            ..KrunConfig::default()
+        }
+    }
+
+    #[test]
+    fn standalone_vsock_accepts_guest_cid_three() {
+        let config = KrunConfig {
+            vsock_cid: Some(3),
+            ..valid_config()
+        };
+
+        validate_config(&config).expect("guest CID 3 should be valid");
+    }
+
+    #[test]
+    fn standalone_vsock_rejects_other_guest_cids() {
+        let config = KrunConfig {
+            vsock_cid: Some(4),
+            ..valid_config()
+        };
+
+        let error = validate_config(&config).expect_err("guest CID 4 should be invalid");
+        assert!(error.to_string().contains("guest CID 3"));
+    }
+
+    #[test]
+    fn standalone_and_mux_vsock_are_mutually_exclusive() {
+        let config = KrunConfig {
+            vsock_mux: true,
+            vsock_cid: Some(3),
+            ..valid_config()
+        };
+
+        let error = validate_config(&config).expect_err("vsock devices should conflict");
+        assert!(error.to_string().contains("cannot be used together"));
+    }
 }

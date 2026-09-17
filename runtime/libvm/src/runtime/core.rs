@@ -2,7 +2,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use eyre::Context;
 use oci::{
@@ -10,7 +9,7 @@ use oci::{
 };
 
 use crate::guest_agent::{self, GuestAgentConfigInput};
-use crate::lock_manager::{LockGuard, LockId, LockManager, ManagedLock};
+use crate::lock_manager::{LockGuard, LockId, LockManager, MachineLifetimeLock, ManagedLock};
 use crate::machine::root_disk::resize_raw_disk;
 use crate::paths::{vm_spec_path_in, LocalPaths, MachinePaths};
 use crate::runtime::boot_assets::{self, BootAssetOverrides, ResolvedBootAssets};
@@ -58,8 +57,6 @@ use crate::vmmon::exit_status::{self, VmmonExitOutcome, VmmonExitStatus};
 use crate::vmmon::process::{self, ProcessIdentity};
 use crate::vmmon::{self, LaunchSpecInput, Vmmon};
 use crate::LibVmError;
-
-const STALE_STARTING_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Live runtime observation for a machine: its reconciled state plus the
 /// start timestamp when running.
@@ -727,14 +724,22 @@ impl Runtime {
         let current_state = runtime
             .map(|runtime| runtime.status)
             .unwrap_or(MachineRuntimeState::Stopped);
+        let abandoned_start = if current_state == MachineRuntimeState::Starting
+            && live_pid.is_none()
+        {
+            // Persisted starting state can survive a missing runtime tree. Recreate it
+            // securely before lock creation can inherit a permissive umask.
+            self.paths.ensure_machine_run_dir(metadata.id)?;
+            MachineLifetimeLock::try_acquire(&self.paths.machine(metadata.id).vmmon_lock_path())?
+                .is_some()
+        } else {
+            false
+        };
         let exit_status = exit_status::read(&exit_status_path)?;
         let matching_exit = exit_status
             .as_ref()
             .filter(|status| runtime_exit_matches(status, runtime))
             .filter(|_| live_pid.is_none());
-        let stale_starting = current_state == MachineRuntimeState::Starting
-            && live_pid.is_none()
-            && runtime.is_some_and(|runtime| state_is_older_than(runtime, STALE_STARTING_TIMEOUT));
         let stored_state = runtime
             .cloned()
             .unwrap_or_else(|| stopped_machine_state(metadata.id, None));
@@ -763,7 +768,7 @@ impl Runtime {
                     )
                     .map_err(transition_error)?
                 }
-                None if stale_starting => {
+                None if abandoned_start => {
                     transitions::reduce(stored_state, transitions::Event::StartTimedOut, now_unix())
                         .map_err(transition_error)?
                 }
@@ -1104,8 +1109,12 @@ impl Runtime {
         config: &MachineConfig,
         network: &VmmonNetworkAttachment,
         resize_rootfs: bool,
-    ) -> Result<bool, LibVmError> {
-        let prepare = || -> eyre::Result<bool> {
+    ) -> Result<crate::vmmon::VmmonLaunchInputs, LibVmError> {
+        let prepare = || -> eyre::Result<crate::vmmon::VmmonLaunchInputs> {
+            let rosetta_intent = self
+                .vmmon
+                .rosetta_intent_request(config)
+                .map_err(eyre::Report::msg)?;
             let relative_mount_base = std::env::current_dir()
                 .context("resolve current directory for relative mount sources")?;
             let machine_paths = self.machine_paths(config.id);
@@ -1151,7 +1160,11 @@ impl Runtime {
             remove_file_if_exists(&machine_paths.metadata_config_path())?;
 
             vmmon::write_launch_spec(&machine_paths.vm_spec_path(), &launch_spec)?;
-            Ok(agent_enabled)
+            Ok(crate::vmmon::VmmonLaunchInputs {
+                agent_enabled,
+                rosetta_intent,
+                asset_directory: self.components.asset_dir.clone(),
+            })
         };
 
         prepare().map_err(|err| LibVmError::MachinePreparationFailed {
@@ -1692,11 +1705,6 @@ fn exit_observed_event(status: &VmmonExitStatus) -> (bool, Option<String>) {
     }
 }
 
-fn state_is_older_than(state: &MachineState, age: Duration) -> bool {
-    let age = i64::try_from(age.as_secs()).unwrap_or(i64::MAX);
-    now_unix().saturating_sub(state.updated_at) >= age
-}
-
 fn machine_state_needs_writeback(
     persisted: Option<&MachineState>,
     observed: &MachineState,
@@ -1814,7 +1822,7 @@ mod tests {
     use crate::runtime::core::{
         effective_oci_manifest_digest, materialized_image_identity, oci_image_record,
         read_monitor_pid, stopped_machine_state, validate_image_pull_policy, write_machine_config,
-        Runtime, STALE_STARTING_TIMEOUT,
+        Runtime,
     };
     use crate::store::models::{
         MachineConfig, MachineId, MachineNetworkConfig, MachineRootfsRecord, MachineRuntimeState,
@@ -1911,6 +1919,32 @@ mod tests {
             network: MachineNetworkConfig::default(),
             guest: crate::machine::MachineGuestConfig::default(),
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[tokio::test]
+    async fn rosetta_eligibility_fails_before_launch_asset_completion() {
+        let temp = tempfile::tempdir().expect("temp runtime");
+        let paths = LocalPaths::new(temp.path());
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .expect("open runtime");
+        let mut config = sample_machine_config(&paths, MachineId::new(), "rosetta-test");
+        spec_hardware_mut(&mut config.spec).rosetta = Some(true);
+        config.guest.agent = crate::machine::MachineAgent::Custom {
+            path: "/custom/agent".into(),
+        };
+
+        let error = runtime
+            .prepare_vmmon_launch_inputs(
+                &config,
+                &crate::network::VmmonNetworkAttachment::None,
+                false,
+            )
+            .expect_err("reject ineligible durable contract");
+        assert!(error.to_string().contains("installed default guest agent"));
+        assert!(!error.to_string().contains("kernel"));
+        assert!(!runtime.machine_paths(config.id).vm_spec_path().exists());
     }
 
     fn sample_oci_rootfs_image() -> PublishedRootfs {
@@ -2726,6 +2760,7 @@ mod tests {
                 std::env::current_exe().expect("current test binary path"),
             )
             .env("SILO_LIBVM_SIGINT_IGNORING_CHILD", "1")
+            .process_group(0)
             .arg("sigint_ignoring_child_process")
             .arg("--nocapture")
             .stdout(std::process::Stdio::piped())
@@ -3261,6 +3296,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_timeout_escalates_only_when_requested() {
+        for force in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let runtime = Runtime::open(
+                LocalPaths::new(temp.path().join("silo")),
+                RuntimeNetworkingConfig::default(),
+            )
+            .await
+            .expect("runtime");
+            let machine = create_pending_sample(&runtime, "stop-timeout")
+                .await
+                .expect("pending")
+                .commit(&runtime)
+                .await
+                .expect("commit");
+            let mut child = ChildGuard::sleep_ignoring_sigint();
+            let pid = child.id() as i32;
+            create_machine_runtime_dirs(&runtime, machine.id);
+            std::fs::write(
+                runtime.machine_paths(machine.id).vmmon_pid_path(),
+                format!("{pid}\n"),
+            )
+            .expect("pidfile");
+            runtime
+                .set_machine_state(
+                    machine.id,
+                    MachineRuntimeState::Running,
+                    Some(pid),
+                    child.started_at(),
+                    Some("run-stop-timeout".to_string()),
+                    None,
+                )
+                .await
+                .expect("running");
+            let mut options = crate::MachineStopOptions::new().timeout(Duration::from_millis(100));
+            if force {
+                options = options.force_after_timeout(Duration::from_secs(2));
+            }
+            // A real parent must reap the child, as init does for detached vmmon.
+            let reaper = tokio::spawn(async move {
+                loop {
+                    if let Some(status) = child.child.try_wait().expect("wait child") {
+                        return status;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(4),
+                machine_handle(&runtime, machine.id).stop_run_with(
+                    MachineRunId::from_raw("run-stop-timeout".to_string()),
+                    options,
+                ),
+            )
+            .await
+            .expect("bounded stop");
+            if force {
+                assert_eq!(result.expect("forced stop").status, MachineStatus::Stopped);
+                assert!(!reaper.await.expect("reap").success());
+                assert!(!runtime.machine_paths(machine.id).vmmon_pid_path().exists());
+            } else {
+                assert!(
+                    matches!(result, Err(LibVmError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+                );
+                assert!(ProcessIdentity::for_pid(pid).expect("identity").is_some());
+                reaper.abort();
+                let _ = reaper.await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn stop_releases_machine_lock_while_waiting_for_monitor_shutdown() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
@@ -3328,103 +3435,116 @@ mod tests {
 
     #[tokio::test]
     async fn generation_checked_stop_does_not_clean_up_a_replacement_run() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let runtime = Runtime::open(
-            LocalPaths::new(temp.path().join("silo")),
-            RuntimeNetworkingConfig::default(),
-        )
-        .await
-        .expect("create runtime");
-        let machine = create_pending_sample(&runtime, "devbox")
-            .await
-            .expect("create pending machine")
-            .commit(&runtime)
-            .await
-            .expect("commit machine");
-        let mut old_monitor = ChildGuard::sleep_ignoring_sigint();
-        let old_pid = old_monitor.id() as i32;
-        let old_started_at = old_monitor.started_at();
-        create_machine_runtime_dirs(&runtime, machine.id);
-        let machine_paths = runtime.machine_paths(machine.id);
-        std::fs::write(machine_paths.vmmon_pid_path(), format!("{old_pid}\n"))
-            .expect("write old pid file");
-        std::fs::write(machine_paths.vmmon_socket_path(), b"replacement sentinel")
-            .expect("write runtime sentinel");
-        runtime
-            .set_machine_state(
-                machine.id,
-                MachineRuntimeState::Running,
-                Some(old_pid),
-                old_started_at,
-                Some("run-old".to_string()),
-                None,
+        for force in [false, true] {
+            let temp = tempfile::tempdir().expect("create temp dir");
+            let runtime = Runtime::open(
+                LocalPaths::new(temp.path().join("silo")),
+                RuntimeNetworkingConfig::default(),
             )
             .await
-            .expect("set old generation");
+            .expect("create runtime");
+            let machine = create_pending_sample(&runtime, "devbox")
+                .await
+                .expect("create pending machine")
+                .commit(&runtime)
+                .await
+                .expect("commit machine");
+            let mut old_monitor = ChildGuard::sleep_ignoring_sigint();
+            let old_pid = old_monitor.id() as i32;
+            let old_started_at = old_monitor.started_at();
+            create_machine_runtime_dirs(&runtime, machine.id);
+            let machine_paths = runtime.machine_paths(machine.id);
+            std::fs::write(machine_paths.vmmon_pid_path(), format!("{old_pid}\n"))
+                .expect("write old pid file");
+            std::fs::write(machine_paths.vmmon_socket_path(), b"replacement sentinel")
+                .expect("write runtime sentinel");
+            runtime
+                .set_machine_state(
+                    machine.id,
+                    MachineRuntimeState::Running,
+                    Some(old_pid),
+                    old_started_at,
+                    Some("run-old".to_string()),
+                    None,
+                )
+                .await
+                .expect("set old generation");
 
-        let old_machine = machine_handle(&runtime, machine.id);
-        let old_run = MachineRunId::from_raw("run-old".to_string());
-        let stop_task = tokio::spawn(async move { old_machine.stop_run(old_run).await });
-        wait_for_machine_state(&runtime, machine.id, MachineRuntimeState::Stopping).await;
+            let old_machine = machine_handle(&runtime, machine.id);
+            let old_run = MachineRunId::from_raw("run-old".to_string());
+            let stop_task = tokio::spawn(async move {
+                let options = if force {
+                    crate::MachineStopOptions::new()
+                        .timeout(Duration::from_millis(500))
+                        .force_after_timeout(Duration::from_secs(2))
+                } else {
+                    crate::MachineStopOptions::new()
+                };
+                old_machine.stop_run_with(old_run, options).await
+            });
+            wait_for_machine_state(&runtime, machine.id, MachineRuntimeState::Stopping).await;
 
-        let replacement_monitor = ChildGuard::sleep_ignoring_sigint();
-        let replacement_pid = replacement_monitor.id() as i32;
-        let replacement_started_at = replacement_monitor.started_at();
-        runtime
-            .set_machine_state(
-                machine.id,
-                MachineRuntimeState::Running,
-                Some(replacement_pid),
-                replacement_started_at,
-                Some("run-new".to_string()),
-                None,
-            )
-            .await
-            .expect("install replacement generation");
+            let replacement_monitor = ChildGuard::sleep_ignoring_sigint();
+            let replacement_pid = replacement_monitor.id() as i32;
+            let replacement_started_at = replacement_monitor.started_at();
+            runtime
+                .set_machine_state(
+                    machine.id,
+                    MachineRuntimeState::Running,
+                    Some(replacement_pid),
+                    replacement_started_at,
+                    Some("run-new".to_string()),
+                    None,
+                )
+                .await
+                .expect("install replacement generation");
 
-        old_monitor.kill();
-        let error = stop_task
-            .await
-            .expect("join old stop")
-            .expect_err("old stop must not clean up the replacement run");
-        assert!(matches!(
-            error,
-            LibVmError::MachineStaleGeneration {
-                requested,
-                current: Some(current),
-                ..
-            } if requested.as_str() == "run-old" && current.as_str() == "run-new"
-        ));
-        let state = runtime
-            .machine_state(machine.id)
-            .await
-            .expect("read replacement state");
+            if !force {
+                old_monitor.kill();
+            }
+            let error = stop_task
+                .await
+                .expect("join old stop")
+                .expect_err("old stop must not clean up the replacement run");
+            assert!(matches!(
+                error,
+                LibVmError::MachineStaleGeneration {
+                    requested,
+                    current: Some(current),
+                    ..
+                } if requested.as_str() == "run-old" && current.as_str() == "run-new"
+            ));
+            let state = runtime
+                .machine_state(machine.id)
+                .await
+                .expect("read replacement state");
 
-        let wait_error = machine_handle(&runtime, machine.id)
-            .wait_for_run(MachineRunId::from_raw("run-old".to_string()))
-            .await
-            .expect_err("old wait must not observe the replacement run");
-        assert!(matches!(
-            wait_error,
-            LibVmError::MachineStaleGeneration { .. }
-        ));
-        let kill_error = machine_handle(&runtime, machine.id)
-            .kill_run(MachineRunId::from_raw("run-old".to_string()))
-            .await
-            .expect_err("old kill must not signal the replacement run");
-        assert!(matches!(
-            kill_error,
-            LibVmError::MachineStaleGeneration { .. }
-        ));
+            let wait_error = machine_handle(&runtime, machine.id)
+                .wait_for_run(MachineRunId::from_raw("run-old".to_string()))
+                .await
+                .expect_err("old wait must not observe the replacement run");
+            assert!(matches!(
+                wait_error,
+                LibVmError::MachineStaleGeneration { .. }
+            ));
+            let kill_error = machine_handle(&runtime, machine.id)
+                .kill_run(MachineRunId::from_raw("run-old".to_string()))
+                .await
+                .expect_err("old kill must not signal the replacement run");
+            assert!(matches!(
+                kill_error,
+                LibVmError::MachineStaleGeneration { .. }
+            ));
 
-        assert_eq!(state.status, MachineRuntimeState::Running);
-        assert_eq!(state.run_id.as_deref(), Some("run-new"));
-        assert!(ProcessIdentity::for_pid(replacement_pid)
-            .expect("read replacement monitor")
-            .expect("replacement monitor should exist")
-            .is_alive()
-            .expect("check replacement monitor"));
-        assert!(machine_paths.vmmon_socket_path().exists());
+            assert_eq!(state.status, MachineRuntimeState::Running);
+            assert_eq!(state.run_id.as_deref(), Some("run-new"));
+            assert!(ProcessIdentity::for_pid(replacement_pid)
+                .expect("read replacement monitor")
+                .expect("replacement monitor should exist")
+                .is_alive()
+                .expect("check replacement monitor"));
+            assert!(machine_paths.vmmon_socket_path().exists());
+        }
     }
 
     #[tokio::test]
@@ -3613,7 +3733,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_starting_without_live_monitor_marks_machine_stopped() {
+    async fn abandoned_start_recreates_private_runtime_directories() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let runtime = Runtime::open(
+            LocalPaths::new(temp.path().join("silo")),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .expect("create runtime");
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+        let paths = runtime.machine_paths(machine.id);
+        assert!(!paths.machine_run_dir().exists());
+        runtime
+            .set_machine_state(
+                machine.id,
+                MachineRuntimeState::Starting,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("set starting state");
+
+        let status = runtime
+            .reconcile_machine_runtime_locked(&machine)
+            .await
+            .expect("reconcile");
+        assert!(!status.is_active());
+        for path in [
+            paths.machine_run_dir().to_path_buf(),
+            paths
+                .machine_run_dir()
+                .parent()
+                .expect("machines parent")
+                .to_path_buf(),
+        ] {
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("runtime directory")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "{} must stay private",
+                path.display(),
+            );
+        }
+        runtime
+            .local_paths()
+            .remove_machine_run_tree(machine.id)
+            .expect("secure cleanup");
+        assert!(!paths.machine_run_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn stop_starting_without_live_monitor_preserves_start_failure() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
             LocalPaths::new(temp.path().join("silo")),
@@ -3649,8 +3829,16 @@ mod tests {
             .await
             .expect("read machine state");
 
-        assert_eq!(inspect_data.status, MachineStatus::Stopped);
-        assert_eq!(state.status, MachineRuntimeState::Stopped);
+        let message = "machine start did not leave a live runtime";
+        assert_eq!(
+            inspect_data.status,
+            MachineStatus::Error {
+                message: Some(message.to_string())
+            }
+        );
+        assert_eq!(state.status, MachineRuntimeState::Error);
+        assert_eq!(state.last_error.as_deref(), Some(message));
+        assert!(!runtime.machine_paths(machine.id).machine_run_dir().exists());
     }
 
     #[tokio::test]
@@ -3812,7 +4000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_finishes_starting_machine_without_live_runtime() {
+    async fn stop_cleans_abandoned_start_without_live_runtime() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
             LocalPaths::new(temp.path().join("silo")),
@@ -3848,8 +4036,16 @@ mod tests {
             .await
             .expect("read machine state");
 
-        assert_eq!(inspect_data.status, MachineStatus::Stopped);
-        assert_eq!(state.status, MachineRuntimeState::Stopped);
+        let message = "machine start did not leave a live runtime";
+        assert_eq!(
+            inspect_data.status,
+            MachineStatus::Error {
+                message: Some(message.to_string())
+            }
+        );
+        assert_eq!(state.status, MachineRuntimeState::Error);
+        assert_eq!(state.last_error.as_deref(), Some(message));
+        assert!(!runtime.machine_paths(machine.id).machine_run_dir().exists());
     }
 
     #[tokio::test]
@@ -4092,7 +4288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_starting_without_live_runtime_becomes_error() {
+    async fn unlocked_starting_without_live_runtime_becomes_error_immediately() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
             LocalPaths::new(temp.path().join("silo")),
@@ -4107,7 +4303,6 @@ mod tests {
             .commit(&runtime)
             .await
             .expect("commit machine");
-        let stale_age = i64::try_from(STALE_STARTING_TIMEOUT.as_secs()).expect("timeout fits i64");
         runtime
             .store
             .save_machine_state(&MachineState {
@@ -4117,10 +4312,10 @@ mod tests {
                 started_at: None,
                 run_id: Some("run-1".to_string()),
                 last_error: None,
-                updated_at: now_unix() - stale_age - 1,
+                updated_at: now_unix(),
             })
             .await
-            .expect("set stale starting state");
+            .expect("set unlocked starting state");
 
         let inspect_data = inspect_machine(&runtime, MachineRef::id(machine.id))
             .await
@@ -4140,7 +4335,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_open_refreshes_stale_active_state() {
+    async fn monitorless_starting_is_preserved_only_while_lifetime_lock_is_held() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let runtime = Runtime::open(
+            LocalPaths::new(temp.path().join("silo")),
+            RuntimeNetworkingConfig::default(),
+        )
+        .await
+        .expect("create runtime");
+        let machine = create_pending_sample(&runtime, "devbox")
+            .await
+            .expect("create pending machine")
+            .commit(&runtime)
+            .await
+            .expect("commit machine");
+        runtime
+            .ensure_machine_runtime_directories(machine.id)
+            .expect("create machine runtime directories");
+        let lifetime_lock = crate::lock_manager::MachineLifetimeLock::try_acquire(
+            &runtime.machine_paths(machine.id).vmmon_lock_path(),
+        )
+        .expect("acquire lifetime lock")
+        .expect("lifetime lock available");
+        runtime
+            .request_machine_start(&machine, "run-1")
+            .await
+            .expect("request machine start");
+        let mut starting = runtime
+            .machine_state(machine.id)
+            .await
+            .expect("read starting state");
+        starting.updated_at = now_unix() - 5 * 60;
+        runtime
+            .store
+            .save_machine_state(&starting)
+            .await
+            .expect("age lock-owned start");
+
+        let locked = inspect_machine(&runtime, MachineRef::id(machine.id))
+            .await
+            .expect("inspect lock-owned start");
+        assert!(matches!(locked.status, MachineStatus::Starting { .. }));
+        assert_eq!(
+            runtime
+                .machine_state(machine.id)
+                .await
+                .expect("read lock-owned state")
+                .run_id
+                .as_deref(),
+            Some("run-1")
+        );
+
+        drop(lifetime_lock);
+
+        let released = inspect_machine(&runtime, MachineRef::id(machine.id))
+            .await
+            .expect("inspect abandoned start");
+        let state = runtime
+            .machine_state(machine.id)
+            .await
+            .expect("read abandoned state");
+        assert_eq!(released.status.label(), "error");
+        assert_eq!(state.status, MachineRuntimeState::Error);
+        assert_eq!(state.run_id, None);
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("machine start did not leave a live runtime")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_open_refreshes_unlocked_active_state() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let data_dir = temp.path().join("silo");
         let runtime = Runtime::open(
@@ -4156,7 +4421,6 @@ mod tests {
             .commit(&runtime)
             .await
             .expect("commit machine");
-        let stale_age = i64::try_from(STALE_STARTING_TIMEOUT.as_secs()).expect("timeout fits i64");
         runtime
             .store
             .save_machine_state(&MachineState {
@@ -4166,10 +4430,10 @@ mod tests {
                 started_at: None,
                 run_id: Some("run-1".to_string()),
                 last_error: None,
-                updated_at: now_unix() - stale_age - 1,
+                updated_at: now_unix(),
             })
             .await
-            .expect("set stale starting state");
+            .expect("set unlocked starting state");
         drop(runtime);
 
         let reopened = Runtime::open(
@@ -4203,7 +4467,6 @@ mod tests {
             .request_machine_start(&config, "run-one")
             .await
             .expect("pre-arm ephemeral start");
-        let stale_age = i64::try_from(STALE_STARTING_TIMEOUT.as_secs()).expect("timeout fits i64");
         runtime
             .store
             .save_machine_state(&MachineState {
@@ -4213,7 +4476,7 @@ mod tests {
                 started_at: None,
                 run_id: Some("run-one".to_string()),
                 last_error: None,
-                updated_at: now_unix() - stale_age - 1,
+                updated_at: now_unix(),
             })
             .await
             .expect("simulate crash after pre-arm");
