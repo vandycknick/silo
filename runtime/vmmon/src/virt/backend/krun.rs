@@ -1107,7 +1107,8 @@ mod tests {
         let krun = root.join("krun");
         write_executable(
             &krun,
-            "#!/bin/sh\nif [ \"$1\" = \"--check-host-basic\" ]; then exit 0; fi\nmux=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--vsock-mux-fd\" ]; then mux=$arg; fi\n  previous=$arg\ndone\neval \"exec ${mux}>&-\"\nexec sleep 30\n",
+            // dash does not support the multi-digit descriptors inherited by this fixture.
+            "#!/bin/bash\nif [ \"$1\" = \"--check-host-basic\" ]; then exit 0; fi\nmux=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--vsock-mux-fd\" ]; then mux=$arg; fi\n  previous=$arg\ndone\neval \"exec ${mux}>&-\"\nexec sleep 30\n",
         );
         let config = VmConfig::builder("control-eof")
             .vm_id("machine-1")
