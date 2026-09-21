@@ -133,7 +133,6 @@ impl Context {
 
     pub(crate) fn resolved_system_config(
         &mut self,
-        image_override: Option<&str>,
     ) -> eyre::Result<(SystemPaths, ResolvedSystemConfig)> {
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
@@ -147,16 +146,12 @@ impl Context {
             eyre::eyre!("system daemon is not configured\n\nhint: add `daemon: {{ version: \"1\", system: {{}} }}` to the Silo config")
         })?;
         let paths = default_system_paths()?;
-        let mut resolved = config.resolve(&home, image_override)?;
-        if let Some(installation) = crate::system::record::load_record::<
-            crate::system::record::InstallationRecord,
-        >(&paths.installation())?
-        {
-            if image_override.is_none()
-                && resolved.image == installation.configured_image
+        let mut resolved = config.resolve(&home, None)?;
+        if let Some(installation) = crate::system::record::DaemonRecord::load(&paths)? {
+            if resolved.image == installation.configured_image
                 && resolved.image != installation.config.image
             {
-                resolved = resolved.with_image(installation.config.image)?;
+                resolved.image = installation.config.image;
             }
             // Disk sizes are fixed at creation. Unless the user pinned them, follow the
             // installation so a changed default never reads as a config change.
@@ -170,9 +165,8 @@ impl Context {
             } else {
                 installation.data_size_bytes
             };
-            if (root_size, data_size) != (resolved.root_size_bytes, resolved.data_size_bytes) {
-                resolved = resolved.with_disk_sizes(root_size, data_size)?;
-            }
+            resolved.root_size_bytes = root_size;
+            resolved.data_size_bytes = data_size;
         }
         Ok((paths, resolved))
     }

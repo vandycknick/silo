@@ -3,31 +3,25 @@ use std::path::PathBuf;
 use eyre::bail;
 use libvm::MachineData;
 
-use crate::system::record::{load_record, SystemRecord};
+use crate::system::record::DaemonRecord;
 use crate::system::{INSTALLATION_LABEL, MANAGED_ROLE, MANAGED_ROLE_LABEL};
 
 pub(crate) fn guard_ordinary_mutation(machine: &MachineData) -> eyre::Result<()> {
-    let Some(record) = load_default_system_record()? else {
-        return Ok(());
-    };
-    if machine.id == record.active_machine_id {
-        bail!("machine {:?} is managed by the Silo system daemon; use `silo daemon down`, `upgrade`, or system configuration instead", machine.name);
-    }
-    if crate::system::upgrade::is_pending_candidate(&default_system_paths()?, &machine.id)? {
-        bail!("machine {:?} belongs to a pending system image upgrade; run `silo daemon upgrade --recover`", machine.name);
+    if let Some(state) = DaemonRecord::load(&default_system_paths()?)? {
+        if is_matching_managed_candidate(machine, state.installation_id)
+            || state.owns_machine(&machine.id)
+        {
+            bail!("machine {:?} is managed by the Silo system daemon; use `silo daemon down` or `upgrade` instead", machine.name);
+        }
     }
     Ok(())
 }
 
 pub(crate) fn guard_ordinary_machine_id(machine_id: &str) -> eyre::Result<()> {
-    let Some(record) = load_default_system_record()? else {
-        return Ok(());
-    };
-    if machine_id == record.active_machine_id {
-        bail!("machine {machine_id:?} is managed by the Silo system daemon; use `silo daemon down` instead");
-    }
-    if crate::system::upgrade::is_pending_candidate(&default_system_paths()?, machine_id)? {
-        bail!("machine {machine_id:?} belongs to a pending system image upgrade; run `silo daemon upgrade --recover`");
+    if let Some(state) = DaemonRecord::load(&default_system_paths()?)? {
+        if state.owns_machine(machine_id) {
+            bail!("machine {machine_id:?} is managed by the Silo system daemon; use `silo daemon down` or `upgrade` instead");
+        }
     }
     Ok(())
 }
@@ -45,11 +39,6 @@ fn labels_match(
 ) -> bool {
     labels.get(MANAGED_ROLE_LABEL).map(String::as_str) == Some(MANAGED_ROLE)
         && labels.get(INSTALLATION_LABEL) == Some(&installation_id.to_string())
-}
-
-fn load_default_system_record() -> eyre::Result<Option<SystemRecord>> {
-    let data = xdg_root("XDG_DATA_HOME", ".local/share")?.join("silo/daemon/system.json");
-    load_record(&data)
 }
 
 pub(crate) fn default_system_paths() -> eyre::Result<crate::system::record::SystemPaths> {

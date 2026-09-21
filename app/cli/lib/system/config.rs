@@ -39,15 +39,6 @@ impl SystemBackend {
     fn default_for_host() -> Self {
         Self::Krun
     }
-
-    /// Preserve the meaning of schema-1 records written before `backend` was persisted.
-    fn legacy_record_default() -> Self {
-        if cfg!(target_os = "macos") {
-            Self::Vz
-        } else {
-            Self::Krun
-        }
-    }
 }
 
 impl TryFrom<libvm::VirtBackendOverride> for SystemBackend {
@@ -202,27 +193,9 @@ pub(crate) struct ResolvedSystemConfig {
     pub(crate) shares: Vec<ResolvedShare>,
     pub(crate) publish_bind: PublishBind,
     pub(crate) docker_socket: PathBuf,
-    #[serde(default = "SystemBackend::legacy_record_default")]
     pub(crate) backend: SystemBackend,
-    #[serde(default)]
     pub(crate) rosetta: bool,
-    /// Whether `rosetta` was explicitly configured. Old registrations preserve their value.
-    #[serde(default = "default_true")]
     pub(crate) rosetta_explicit: bool,
-    /// Retired installation-record policy, discarded during migration.
-    #[serde(default, skip_serializing, deserialize_with = "discard_legacy_reclaim")]
-    pub(crate) memory_reclaim: (),
-    /// Accept old installation records without letting their retired policy disable reclaim.
-    #[serde(
-        default,
-        skip_serializing,
-        rename = "host_memory_reclaim",
-        deserialize_with = "discard_legacy_reclaim"
-    )]
-    pub(crate) legacy_host_reclaim: (),
-    #[serde(default, skip_serializing, deserialize_with = "discard_legacy_reclaim")]
-    pub(crate) memory_reclaim_after_secs: (),
-    pub(crate) identity: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,7 +325,7 @@ impl SystemConfig {
             .system
             .rosetta
             .unwrap_or_else(|| backend == SystemBackend::Vz && rosetta_available());
-        let mut resolved = ResolvedSystemConfig {
+        let resolved = ResolvedSystemConfig {
             schema: 1,
             engine: self.system.engine,
             image,
@@ -366,39 +339,8 @@ impl SystemConfig {
             backend,
             rosetta,
             rosetta_explicit: self.system.rosetta.is_some(),
-            memory_reclaim: (),
-            legacy_host_reclaim: (),
-            memory_reclaim_after_secs: (),
-            identity: String::new(),
         };
-        let bytes = serde_json::to_vec(&resolved).context("serialize resolved system config")?;
-        resolved.identity = format!("fnv1a64:{:016x}", fnv1a64(&bytes));
         Ok(resolved)
-    }
-}
-
-impl ResolvedSystemConfig {
-    pub(crate) fn with_image(mut self, image: String) -> eyre::Result<Self> {
-        self.image = image;
-        self.recompute_identity()
-    }
-
-    /// Adopts the disk sizes an existing installation was created with.
-    pub(crate) fn with_disk_sizes(
-        mut self,
-        root_size_bytes: u64,
-        data_size_bytes: u64,
-    ) -> eyre::Result<Self> {
-        self.root_size_bytes = root_size_bytes;
-        self.data_size_bytes = data_size_bytes;
-        self.recompute_identity()
-    }
-
-    fn recompute_identity(mut self) -> eyre::Result<Self> {
-        self.identity.clear();
-        let bytes = serde_json::to_vec(&self).context("serialize resolved system config")?;
-        self.identity = format!("fnv1a64:{:016x}", fnv1a64(&bytes));
-        Ok(self)
     }
 }
 
@@ -424,25 +366,11 @@ fn parse_size(value: &str, field: &str) -> eyre::Result<u64> {
         .map_err(|error| eyre::eyre!("invalid daemon.system {field}: {error}"))
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
 const fn default_cpus() -> u8 {
     4
 }
 fn default_memory() -> String {
     "8GiB".to_string()
-}
-fn discard_legacy_reclaim<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<(), D::Error> {
-    serde::de::IgnoredAny::deserialize(deserializer).map(|_| ())
 }
 /// Rosetta's Linux runtime, installed by `softwareupdate --install-rosetta`. vmmon
 /// performs the authoritative Virtualization.framework check at start; this only picks
@@ -503,55 +431,13 @@ mod tests {
                 .expect("resolve")
                 .rosetta
         );
-        let pinned = resolved
-            .clone()
-            .with_disk_sizes(8 << 30, 64 << 30)
-            .expect("adopt sizes");
-        assert_eq!(pinned.data_size_bytes, 64 << 30);
-        assert_ne!(pinned.identity, resolved.identity);
         assert_eq!(resolved.backend, SystemBackend::Krun);
         assert!(!resolved.rosetta);
         assert!(!resolved.rosetta_explicit);
-        assert!(resolved.identity.starts_with("fnv1a64:"));
-    }
-
-    #[test]
-    fn legacy_resolved_config_without_backend_keeps_historical_platform_selection() {
-        let config: crate::system::config::ResolvedSystemConfig =
-            serde_json::from_value(serde_json::json!({
-                "schema": 1,
-                "engine": "docker",
-                "image": "registry.example/system@sha256:test",
-                "cpus": 2,
-                "memory_bytes": 1073741824,
-                "root_size_bytes": 1073741824,
-                "data_size_bytes": 1073741824,
-                "shares": [],
-                "publish_bind": "any",
-                "docker_socket": "/tmp/silo.sock",
-                "rosetta": true,
-                "identity": "fnv1a64:test"
-            }))
-            .expect("legacy resolved config");
-
-        assert_eq!(config.backend, SystemBackend::legacy_record_default());
-        assert!(config.rosetta);
-        assert!(config.rosetta_explicit);
-        for old_policy in [false, true] {
-            let mut encoded = serde_json::to_value(&config).expect("encode");
-            encoded["host_memory_reclaim"] = serde_json::json!(old_policy);
-            encoded["memory_reclaim"] = serde_json::json!(false);
-            let migrated: crate::system::config::ResolvedSystemConfig =
-                serde_json::from_value(encoded).expect("read legacy host policy");
-            let encoded = serde_json::to_value(&migrated).expect("encode migrated");
-            for key in [
-                "host_memory_reclaim",
-                "memory_reclaim",
-                "memory_reclaim_after_secs",
-            ] {
-                assert!(encoded.get(key).is_none());
-            }
-        }
+        assert!(serde_json::to_value(&resolved)
+            .expect("serialize")
+            .get("identity")
+            .is_none());
     }
 
     #[test]

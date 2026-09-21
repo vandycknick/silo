@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::GlobalConfig;
 use crate::system::config::ResolvedSystemConfig;
 use crate::system::provision::prepare_installation;
-use crate::system::record::{load_record, write_record, SystemPaths};
+use crate::system::record::{DaemonRecord, SystemPaths};
 use crate::system::supervisor::{read_status, DaemonPhase, DaemonStatus};
 
 #[cfg(target_os = "linux")]
@@ -21,25 +21,32 @@ const SERVICE_NAME: &str = "silo-system.service";
 /// still recognisably Silo-owned rather than foreign.
 const MARKER_PREFIX: &str = "Silo-Installation-ID: ";
 
-fn marker(registration: &Registration) -> String {
-    format!("{MARKER_PREFIX}{}", registration.installation_id)
+fn marker(state: &DaemonRecord) -> String {
+    format!("{MARKER_PREFIX}{}", state.installation_id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Registration {
-    pub(crate) schema: u32,
+pub(crate) struct ServiceConfig {
     pub(crate) executable: PathBuf,
     pub(crate) config_root: PathBuf,
     pub(crate) data_root: PathBuf,
     pub(crate) state_root: PathBuf,
     pub(crate) image_root: PathBuf,
     pub(crate) native_service_path: PathBuf,
-    pub(crate) config: ResolvedSystemConfig,
-    pub(crate) installation_id: uuid::Uuid,
 }
 
-impl Registration {
+impl ServiceConfig {
+    pub(crate) fn new(paths: &SystemPaths) -> eyre::Result<Self> {
+        Ok(Self {
+            executable: std::env::current_exe()?.canonicalize()?,
+            config_root: paths.config_root.clone(),
+            data_root: paths.data_root.clone(),
+            state_root: paths.state_root.clone(),
+            image_root: paths.image_root.clone(),
+            native_service_path: default_service_path(paths)?,
+        })
+    }
     pub(crate) fn paths(&self, run_root: PathBuf) -> SystemPaths {
         SystemPaths::new(
             self.config_root.clone(),
@@ -91,76 +98,66 @@ impl OperationLock {
     }
 }
 
-fn prepare_registration(
-    paths: &SystemPaths,
-    config: ResolvedSystemConfig,
-) -> eyre::Result<Registration> {
+fn prepare_daemon(paths: &SystemPaths, config: ResolvedSystemConfig) -> eyre::Result<DaemonRecord> {
     reject_root()?;
-    let installation = prepare_installation(paths, &config)?;
-    let native_service_path = default_service_path(paths)?;
-    let registration = Registration {
-        schema: 1,
-        executable: std::env::current_exe()?
-            .canonicalize()
-            .context("resolve stable Silo executable")?,
-        config_root: paths.config_root.clone(),
-        data_root: paths.data_root.clone(),
-        state_root: paths.state_root.clone(),
-        image_root: paths.image_root.clone(),
-        native_service_path,
-        config,
-        installation_id: installation.installation_id,
-    };
-    if let Some(existing) = load_record::<Registration>(&paths.registration())? {
-        if existing != registration && native_pid()?.is_some() {
-            bail!("the running daemon registration differs; run `silo daemon down` before changing its executable or configuration");
+    let service = ServiceConfig::new(paths)?;
+    if native_pid()?.is_some() {
+        let state = DaemonRecord::load(paths)?
+            .ok_or_else(|| eyre::eyre!("running daemon has no installation state"))?;
+        state.require_no_pending_upgrade()?;
+        if state.service != service || state.config != config {
+            bail!("the running daemon configuration differs; run `silo daemon down` before changing it");
         }
+        return Ok(state);
     }
-    write_record(&paths.registration(), &registration)?;
-    Ok(registration)
-}
-
-pub(crate) fn load_registration(path: &Path) -> eyre::Result<Registration> {
-    load_optional_registration(path)?
-        .ok_or_else(|| eyre::eyre!("registration does not exist: {}", path.display()))
-}
-
-pub(crate) fn load_optional_registration(path: &Path) -> eyre::Result<Option<Registration>> {
-    if !path.is_absolute() {
-        bail!("registration path must be absolute");
-    }
-    let Some(registration) = load_record::<Registration>(path)? else {
-        return Ok(None);
-    };
-    if registration.schema != 1 {
-        bail!("unsupported daemon registration schema");
-    }
-    Ok(Some(registration))
+    let _lifetime = crate::system::supervisor::LifetimeLock::acquire(&paths.lifetime_lock())?;
+    let mut state = prepare_installation(paths, &config)?;
+    state.service = service;
+    state.config = config;
+    state.save(paths)?;
+    Ok(state)
 }
 
 pub(crate) fn up(paths: &SystemPaths, config: ResolvedSystemConfig) -> eyre::Result<()> {
     let _lock = OperationLock::acquire(&paths.operation_lock())?;
-    let registration = prepare_registration(paths, config)?;
-    install_native(&registration)?;
+    let state = prepare_daemon(paths, config)?;
+    install_native(&state)?;
     let started = chrono::Utc::now();
-    native_start(&registration)?;
+    native_start(&state)?;
     wait_ready(paths, started, Duration::from_secs(120))
 }
 
-pub(crate) fn down(registration: &Registration, paths: &SystemPaths) -> eyre::Result<()> {
+pub(crate) async fn down(paths: &SystemPaths) -> eyre::Result<()> {
     reject_root()?;
     let _lock = OperationLock::acquire(&paths.operation_lock())?;
-    stop_locked(registration)
+    let Some(state) = DaemonRecord::load(paths)? else {
+        return Ok(());
+    };
+    stop_locked(&state)?;
+    let _lifetime = crate::system::supervisor::LifetimeLock::acquire(&paths.lifetime_lock())?;
+    let networking = state.service.global_config()?.networking;
+    let runtime = state
+        .service
+        .runtime_config(&paths.run_root, &state.config, networking);
+    let mut api = crate::api::AppApi::local(runtime);
+    crate::system::provision::stop_system_machine(
+        &mut api,
+        paths,
+        state.installation_id,
+        Duration::from_secs(60),
+    )
+    .await?;
+    Ok(())
 }
 
-pub(crate) fn stop_locked(registration: &Registration) -> eyre::Result<()> {
-    verify_native_owned(registration)?;
+pub(crate) fn stop_locked(state: &DaemonRecord) -> eyre::Result<()> {
+    verify_native_owned(state)?;
     native_stop()
 }
 
-pub(crate) fn start_locked(registration: &Registration) -> eyre::Result<()> {
-    install_native(registration)?;
-    native_start(registration)
+pub(crate) fn start_locked(state: &DaemonRecord) -> eyre::Result<()> {
+    install_native(state)?;
+    native_start(state)
 }
 
 pub(crate) fn is_enabled() -> eyre::Result<bool> {
@@ -168,15 +165,11 @@ pub(crate) fn is_enabled() -> eyre::Result<bool> {
 }
 
 pub(crate) fn status(paths: &SystemPaths) -> eyre::Result<Option<DaemonStatus>> {
-    let mut observed_paths = paths.clone();
-    if let Some(run_root) = crate::system::supervisor::last_run_root(paths)? {
-        observed_paths.run_root = run_root;
-    }
-    let Some(status) = read_status(&observed_paths)? else {
+    let Some(status) = read_status(paths)? else {
         return Ok(None);
     };
     if native_pid()? == Some(status.pid)
-        && crate::system::supervisor::status_owner_is_live(&observed_paths, &status)?
+        && crate::system::supervisor::status_owner_is_live(&status)?
     {
         Ok(Some(status))
     } else {
@@ -200,7 +193,7 @@ fn tail_lines(path: &Path, lines: usize) -> eyre::Result<String> {
     Ok(selected.join("\n"))
 }
 
-fn wait_ready(
+pub(crate) fn wait_ready(
     paths: &SystemPaths,
     since: chrono::DateTime<chrono::Utc>,
     timeout: Duration,
@@ -229,25 +222,13 @@ fn wait_ready(
     )
 }
 
-pub(crate) fn wait_ready_locked(
-    paths: &SystemPaths,
-    since: chrono::DateTime<chrono::Utc>,
-    timeout: Duration,
-) -> eyre::Result<()> {
-    wait_ready(paths, since, timeout)
-}
-
 /// Returns the failure recorded by a daemon generation that started after `since`,
 /// regardless of whether that process is still alive.
 fn recent_failure(
     paths: &SystemPaths,
     since: chrono::DateTime<chrono::Utc>,
 ) -> eyre::Result<Option<String>> {
-    let mut observed_paths = paths.clone();
-    if let Some(run_root) = crate::system::supervisor::last_run_root(paths)? {
-        observed_paths.run_root = run_root;
-    }
-    let Some(status) = read_status(&observed_paths)? else {
+    let Some(status) = read_status(paths)? else {
         return Ok(None);
     };
     if status.phase != DaemonPhase::Failed {
@@ -317,7 +298,7 @@ fn default_service_path(_paths: &SystemPaths) -> eyre::Result<PathBuf> {
     {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
-            .ok_or_else(|| eyre::eyre!("HOME is required for launchd registration"))?;
+            .ok_or_else(|| eyre::eyre!("HOME is required for launchd state"))?;
         if !home.is_absolute() {
             bail!("HOME must be absolute: {}", home.display());
         }
@@ -329,10 +310,10 @@ fn default_service_path(_paths: &SystemPaths) -> eyre::Result<PathBuf> {
     ))
 }
 
-fn install_native(registration: &Registration) -> eyre::Result<()> {
-    let path = &registration.native_service_path;
-    let marker = marker(registration);
-    let bytes = render_native(registration, &marker)?;
+fn install_native(state: &DaemonRecord) -> eyre::Result<()> {
+    let path = &state.service.native_service_path;
+    let marker = marker(state);
+    let bytes = render_native(state, &marker)?;
     if let Ok(existing) = std::fs::read(path) {
         if validate_existing_service(path, &existing, &bytes, &marker, native_pid()?.is_some())? {
             return reload_native();
@@ -387,8 +368,8 @@ fn validate_existing_service(
     Ok(false)
 }
 
-fn verify_native_owned(registration: &Registration) -> eyre::Result<()> {
-    let bytes = match std::fs::read(&registration.native_service_path) {
+fn verify_native_owned(state: &DaemonRecord) -> eyre::Result<()> {
+    let bytes = match std::fs::read(&state.service.native_service_path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if native_pid()?.is_some() {
@@ -401,18 +382,18 @@ fn verify_native_owned(registration: &Registration) -> eyre::Result<()> {
     if !String::from_utf8_lossy(&bytes).contains(MARKER_PREFIX) {
         bail!(
             "refusing to control a native service definition not created by Silo at {}",
-            registration.native_service_path.display()
+            state.service.native_service_path.display()
         );
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn render_native(registration: &Registration, marker: &str) -> eyre::Result<Vec<u8>> {
+fn render_native(state: &DaemonRecord, marker: &str) -> eyre::Result<Vec<u8>> {
     Ok(format!(
-        "# Managed by Silo\n# {marker}\n[Unit]\nDescription=Silo system VM manager\nStartLimitIntervalSec=60\nStartLimitBurst=3\n\n[Service]\nType=exec\nExecStart={} daemon serve --config {}\nRestart=on-failure\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=90\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
-        systemd_arg(&registration.executable)?,
-        systemd_arg(&registration.config_root.join("daemon/registration.json"))?
+        "# Managed by Silo\n# {marker}\n[Unit]\nDescription=Silo system VM manager\nStartLimitIntervalSec=60\nStartLimitBurst=3\n\n[Service]\nType=exec\nExecStart={} daemon serve --state {}\nRestart=on-failure\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=90\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
+        systemd_arg(&state.service.executable)?,
+        systemd_arg(&state.service.data_root.join("daemon/daemon.json"))?
     ).into_bytes())
 }
 
@@ -437,7 +418,7 @@ fn systemd_arg(path: &Path) -> eyre::Result<String> {
 const LAUNCHD_LABEL: &str = "io.silo.system";
 
 #[cfg(target_os = "macos")]
-fn render_native(registration: &Registration, marker: &str) -> eyre::Result<Vec<u8>> {
+fn render_native(state: &DaemonRecord, marker: &str) -> eyre::Result<Vec<u8>> {
     fn xml(value: &str) -> String {
         value
             .replace('&', "&amp;")
@@ -451,9 +432,9 @@ fn render_native(registration: &Registration, marker: &str) -> eyre::Result<Vec<
             .map(xml)
             .ok_or_else(|| eyre::eyre!("service path is not UTF-8"))
     }
-    let executable = plist_path(&registration.executable)?;
-    let config = plist_path(&registration.config_root.join("daemon/registration.json"))?;
-    let native_log = plist_path(&registration.state_root.join("logs/daemon/native.log"))?;
+    let executable = plist_path(&state.service.executable)?;
+    let config = plist_path(&state.service.data_root.join("daemon/daemon.json"))?;
+    let native_log = plist_path(&state.service.state_root.join("logs/daemon/native.log"))?;
     // Mirrors the systemd unit: restart only on failure, allow 90s for a graceful VM
     // shutdown before SIGKILL, and keep created files private. Standard scheduling
     // avoids imposing background CPU/I/O restrictions on the VM's inherited policy.
@@ -471,7 +452,7 @@ fn render_native(registration: &Registration, marker: &str) -> eyre::Result<Vec<
             "\t\t<string>{executable}</string>\n",
             "\t\t<string>daemon</string>\n",
             "\t\t<string>serve</string>\n",
-            "\t\t<string>--config</string>\n",
+            "\t\t<string>--state</string>\n",
             "\t\t<string>{config}</string>\n",
             "\t</array>\n",
             "\t<key>RunAtLoad</key>\n\t<true/>\n",
@@ -513,7 +494,7 @@ fn native_halt() -> eyre::Result<()> {
     )
 }
 #[cfg(target_os = "linux")]
-fn native_start(_registration: &Registration) -> eyre::Result<()> {
+fn native_start(_state: &DaemonRecord) -> eyre::Result<()> {
     run(
         Command::new("systemctl").args(["--user", "enable", "--now", SERVICE_NAME]),
         "enable/start systemd user service",
@@ -581,9 +562,10 @@ fn refresh_native_definition() -> eyre::Result<()> {
     native_unload()
 }
 #[cfg(target_os = "macos")]
-fn native_start(registration: &Registration) -> eyre::Result<()> {
+fn native_start(state: &DaemonRecord) -> eyre::Result<()> {
     let target = launchd_target();
-    if let Some(parent) = registration
+    if let Some(parent) = state
+        .service
         .state_root
         .join("logs/daemon/native.log")
         .parent()
@@ -603,7 +585,7 @@ fn native_start(registration: &Registration) -> eyre::Result<()> {
     let output = Command::new("launchctl")
         .arg("bootstrap")
         .arg(launchd_domain())
-        .arg(&registration.native_service_path)
+        .arg(&state.service.native_service_path)
         .output()
         .context("load launchd service")?;
     if output.status.success() {
@@ -739,23 +721,20 @@ mod tests {
                 "publish_bind": "any",
                 "docker_socket": "/tmp/silo.sock",
                 "backend": "vz",
-                "host_memory_reclaim": true,
-                "identity": "fnv1a64:test"
+                "rosetta": false,
+                "rosetta_explicit": false
             }))
             .expect("config");
-        let registration = crate::system::service::Registration {
-            schema: 1,
+        let state = crate::system::service::ServiceConfig {
             executable: "/bin/silo".into(),
             config_root: "/config".into(),
             data_root: "/data".into(),
             state_root: "/state".into(),
             image_root: "/images".into(),
             native_service_path: "/service".into(),
-            config: config.clone(),
-            installation_id: uuid::Uuid::nil(),
         };
 
-        let runtime = registration.runtime_config(
+        let runtime = state.runtime_config(
             std::path::Path::new("/run"),
             &config,
             libvm::RuntimeNetworkingConfig::default(),
@@ -771,6 +750,22 @@ mod tests {
         std::fs::create_dir_all(paths.log().parent().expect("parent")).expect("directory");
         std::fs::write(paths.log(), "one\ntwo\nthree\n").expect("log");
         assert_eq!(logs(&paths, 2).expect("logs"), "two\nthree");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_launches_from_the_single_daemon_record() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (paths, state) = crate::system::record::tests::fixture(temp.path());
+        let unit = String::from_utf8(
+            crate::system::service::render_native(&state, "test-installation").expect("render"),
+        )
+        .expect("utf8");
+        assert!(unit.contains(&format!(
+            "daemon serve --state {}",
+            systemd_arg(&paths.daemon()).expect("escape")
+        )));
+        assert!(!unit.contains("registration.json"));
     }
 
     #[cfg(target_os = "linux")]
@@ -796,7 +791,7 @@ mod tests {
             std::fs::write(
                 paths.status(),
                 format!(
-                    r#"{{"schema":1,"generation":"d823458f-090b-48c3-87d4-33daf76c0000","pid":1,"phase":"{phase}","machine_id":null,"run_id":null,"image_digest":null,"docker_socket":"/tmp/x.sock","updated_at":"{updated_at}","last_error":"boom","restart_count":0}}"#
+                    r#"{{"schema":1,"generation":"d823458f-090b-48c3-87d4-33daf76c0000","pid":1,"process_start":"test","phase":"{phase}","machine_id":null,"run_id":null,"image_digest":null,"docker_socket":"/tmp/x.sock","updated_at":"{updated_at}","last_error":"boom","restart_count":0}}"#
                 ),
             )
             .expect("status");
@@ -821,7 +816,8 @@ mod tests {
         use std::path::PathBuf;
 
         use crate::system::config::ResolvedSystemConfig;
-        use crate::system::service::{render_native, Registration};
+        use crate::system::record::DaemonRecord;
+        use crate::system::service::render_native;
 
         let config: ResolvedSystemConfig = serde_json::from_value(serde_json::json!({
             "schema": 1,
@@ -834,28 +830,25 @@ mod tests {
             "shares": [],
             "publish_bind": "any",
             "docker_socket": "/Users/me/.docker/run/silo.sock",
-            "identity": "fnv1a64:0"
+            "backend": "vz",
+            "rosetta": false,
+            "rosetta_explicit": false
         }))
         .expect("config");
-        let registration = Registration {
-            schema: 1,
-            executable: PathBuf::from("/Applications/Silo & Co/silo"),
-            config_root: PathBuf::from("/Users/me/.config/silo"),
-            data_root: PathBuf::from("/Users/me/.local/share/silo"),
-            state_root: PathBuf::from("/Users/me/.local/state/silo"),
-            image_root: PathBuf::from("/Users/me/.local/share/silo/images"),
-            native_service_path: PathBuf::from(
-                "/Users/me/Library/LaunchAgents/io.silo.system.plist",
-            ),
-            config,
-            installation_id: uuid::Uuid::nil(),
-        };
-        let plist = String::from_utf8(
-            render_native(&registration, "Silo-Installation-ID: test").expect("render"),
-        )
-        .expect("utf8");
+        let paths = SystemPaths::new(
+            "/Users/me/.config/silo".into(),
+            "/Users/me/.local/share/silo".into(),
+            "/Users/me/.local/state/silo".into(),
+            "/tmp/silo".into(),
+            "/Users/me/.local/share/silo/images".into(),
+        );
+        let mut state = DaemonRecord::new(&paths, config).expect("state");
+        state.service.executable = PathBuf::from("/Applications/Silo & Co/silo");
+        let plist =
+            String::from_utf8(render_native(&state, "Silo-Installation-ID: test").expect("render"))
+                .expect("utf8");
         assert!(plist.contains("<string>/Applications/Silo &amp; Co/silo</string>"));
-        assert!(plist.contains("<string>/Users/me/.config/silo/daemon/registration.json</string>"));
+        assert!(plist.contains("<string>/Users/me/.local/share/silo/daemon/daemon.json</string>"));
         assert!(plist.contains(
             "<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>"
         ));

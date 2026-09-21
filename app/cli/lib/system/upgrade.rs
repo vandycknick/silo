@@ -10,43 +10,73 @@ use uuid::Uuid;
 
 use crate::api::AppApi;
 use crate::system::config::ResolvedSystemConfig;
-use crate::system::record::{
-    load_record, write_record, InstallationRecord, SystemPaths, SystemRecord,
-};
-use crate::system::service::{OperationLock, Registration};
+use crate::system::record::{DaemonRecord, SystemPaths};
+use crate::system::service::OperationLock;
 use crate::system::storage::validate_data_image;
 use crate::system::supervisor::{LifetimeLock, READY_TIMEOUT};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum UpgradeStep {
-    BackingUp,
-    BackupComplete,
-    CandidateCreated,
-    RecordsCommitted,
-    Validated,
+/// Only facts needed to undo an upgrade. VM status and image metadata stay in libvm.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpgradeRecord {
+    pub(crate) operation_id: Uuid,
+    pub(crate) previous_machine_id: String,
+    pub(crate) previous_config: ResolvedSystemConfig,
+    pub(crate) previous_configured_image: String,
+    pub(crate) candidate_machine_id: Option<String>,
+    pub(crate) backup_size: Option<u64>,
+    pub(crate) service_was_enabled: bool,
+    pub(crate) complete: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UpgradeRecord {
-    schema: u32,
-    operation_id: Uuid,
-    step: UpgradeStep,
-    old_system: SystemRecord,
-    old_installation: InstallationRecord,
-    old_registration: Registration,
-    target_reference: String,
-    target_digest: String,
-    old_run_id: Option<String>,
-    candidate_machine_id: Option<String>,
-    candidate_run_id: Option<String>,
-    data_path: PathBuf,
-    data_uuid: Uuid,
-    backup_path: PathBuf,
-    backup_size: Option<u64>,
-    backup_complete: bool,
-    service_was_enabled: bool,
+impl UpgradeRecord {
+    pub(crate) fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub(crate) fn owns_machine(&self, id: &str) -> bool {
+        self.candidate_machine_id.as_deref() == Some(id) || self.previous_machine_id == id
+    }
+
+    pub(crate) fn validate(&self, state: &DaemonRecord) -> eyre::Result<()> {
+        if self.previous_machine_id.is_empty()
+            || self.previous_config.data_size_bytes != state.data_size_bytes
+            || self
+                .backup_size
+                .is_some_and(|size| size != state.data_size_bytes)
+            || (self.backup_size.is_none() && self.candidate_machine_id.is_some())
+            || (self.complete
+                && (self.candidate_machine_id != state.machine_id
+                    || self.candidate_machine_id.is_none()))
+            || self
+                .candidate_machine_id
+                .as_ref()
+                .is_some_and(|id| *id == self.previous_machine_id)
+        {
+            bail!("upgrade recovery record does not match this installation");
+        }
+        Ok(())
+    }
+
+    fn restored_state(&self, state: &DaemonRecord) -> DaemonRecord {
+        let mut restored = state.clone();
+        restored.machine_id = Some(self.previous_machine_id.clone());
+        restored.config = self.previous_config.clone();
+        restored.configured_image = self.previous_configured_image.clone();
+        restored.upgrade = None;
+        restored
+    }
+
+    fn candidate_name(&self) -> String {
+        format!("silo-system-upgrade-{}", self.operation_id.simple())
+    }
+
+    fn backup_path(&self, paths: &SystemPaths) -> PathBuf {
+        paths
+            .daemon_data()
+            .join("backups")
+            .join(format!("data-{}.img", self.operation_id))
+    }
 }
 
 pub(crate) async fn upgrade(
@@ -55,225 +85,192 @@ pub(crate) async fn upgrade(
     image: &str,
 ) -> eyre::Result<()> {
     let _operation = OperationLock::acquire(&paths.operation_lock())?;
-    if paths.upgrade().exists() {
-        bail!("an upgrade is already pending; run `silo daemon upgrade --recover`");
-    }
-    let old_system = load_required::<SystemRecord>(&paths.system_record(), "system record")?;
-    let old_installation =
-        load_required::<InstallationRecord>(&paths.installation(), "installation record")?;
-    let old_registration = crate::system::service::load_registration(&paths.registration())?;
-    let networking = old_registration.global_config()?.networking;
-    let runtime = old_registration.runtime_config(&paths.run_root, &config, networking);
+    let mut state = DaemonRecord::load(paths)?
+        .ok_or_else(|| eyre::eyre!("system VM is not installed; run `silo daemon up` first"))?;
+    crate::system::provision::validate_installation(&state, &config)?;
+    let old_id = state.machine_id()?.to_string();
+    let networking = state.service.global_config()?.networking;
+    let runtime = state
+        .service
+        .runtime_config(&paths.run_root, &config, networking);
     let mut api = AppApi::local(runtime);
+    let old_machine = api.inspect_machine(&old_id).await?;
+    crate::system::provision::validate_machine(&old_machine, &state, &paths.data_image())?;
 
     let (progress, _receiver) = ImageProgressSender::channel(1);
     let source = api.resolve_system_image(image, progress).await?;
     validate_target(&source)?;
-    if source.image.manifest_digest == old_system.image_digest {
+    let configured_image = config.image.clone();
+    let mut target_config = config;
+    target_config.image = source.image.selected_reference.clone();
+    let same_image = old_machine
+        .rootfs
+        .as_ref()
+        .and_then(|rootfs| rootfs.selected_manifest_digest.as_deref())
+        == Some(source.image.manifest_digest.as_str());
+    if same_image && state.config.image == configured_image {
         return Ok(());
     }
-    let target_reference = source.image.selected_reference.clone();
-    let target_digest = source.image.manifest_digest.clone();
-    let target_config = config.with_image(target_reference.clone())?;
-    qualify_candidate_image(&mut api, paths, &target_config, source.image.clone()).await?;
+    if !same_image {
+        qualify_candidate_image(&mut api, paths, &target_config, source.image.clone()).await?;
+    }
     let service_was_enabled = crate::system::service::is_enabled()?;
-    let old_machine = api.inspect_machine(&old_system.active_machine_id).await?;
-    let old_run_id = if matches!(
-        old_machine.status,
-        MachineStatus::Running { .. }
-            | MachineStatus::Starting { .. }
-            | MachineStatus::Stopping { .. }
-    ) {
-        Some(
-            api.machine(&old_system.active_machine_id)
-                .await?
-                .current_run_id()
-                .await?
-                .to_string(),
-        )
-    } else {
-        None
-    };
-
-    let backup_dir = paths.daemon_data().join("backups");
-    std::fs::create_dir_all(&backup_dir)?;
-    let operation_id = Uuid::new_v4();
-    let backup_path = backup_dir.join(format!("data-{operation_id}.img"));
-    let mut pending = UpgradeRecord {
-        schema: 1,
-        operation_id,
-        step: UpgradeStep::BackingUp,
-        old_system: old_system.clone(),
-        old_installation: old_installation.clone(),
-        old_registration: old_registration.clone(),
-        target_reference: target_reference.clone(),
-        target_digest: target_digest.clone(),
-        old_run_id,
-        candidate_machine_id: None,
-        candidate_run_id: None,
-        data_path: paths.data_image(),
-        data_uuid: old_installation.data_uuid,
-        backup_path: backup_path.clone(),
-        backup_size: None,
-        backup_complete: false,
-        service_was_enabled,
-    };
-    write_record(&paths.upgrade(), &pending)?;
-
-    crate::system::service::stop_locked(&old_registration)?;
-    let lifetime = match acquire_lifetime(paths, Duration::from_secs(90)) {
-        Ok(lifetime) => lifetime,
-        Err(error) => {
-            rollback_before_backup(paths, &old_registration, service_was_enabled)?;
-            return Err(error);
+    crate::system::service::stop_locked(&state)?;
+    let lifetime = acquire_lifetime(paths, Duration::from_secs(90))?;
+    ensure_machine_stopped(&mut api, &old_id).await?;
+    // The supervisor has exited, so it can no longer overwrite this transaction.
+    state = DaemonRecord::load(paths)?.ok_or_else(|| eyre::eyre!("daemon state disappeared"))?;
+    state.require_no_pending_upgrade()?;
+    if same_image {
+        state.config.image = target_config.image;
+        state.configured_image = configured_image;
+        state.save(paths)?;
+        drop(lifetime);
+        if service_was_enabled {
+            crate::system::service::start_locked(&state)?;
         }
+        return Ok(());
+    }
+    let mut pending = UpgradeRecord {
+        operation_id: Uuid::new_v4(),
+        previous_machine_id: old_id,
+        previous_config: state.config.clone(),
+        previous_configured_image: state.configured_image.clone(),
+        candidate_machine_id: None,
+        backup_size: None,
+        service_was_enabled,
+        complete: false,
     };
-    if let Err(error) = ensure_machine_stopped(&mut api, &old_system.active_machine_id).await {
-        drop(lifetime);
-        rollback_before_backup(paths, &old_registration, service_was_enabled)?;
-        return Err(error);
-    }
-    if let Err(error) = validate_data_image(
-        &paths.data_image(),
-        old_installation.data_size_bytes,
-        old_installation.installation_id,
-        old_installation.data_uuid,
-    ) {
-        drop(lifetime);
-        rollback_before_backup(paths, &old_registration, service_was_enabled)?;
-        return Err(error);
-    }
+    state.upgrade = Some(pending.clone());
+    state.save(paths)?;
 
+    validate_data_image(
+        &paths.data_image(),
+        state.data_size_bytes,
+        state.installation_id,
+        state.data_uuid,
+    )?;
+    let backup_path = pending.backup_path(paths);
+    std::fs::create_dir_all(paths.daemon_data().join("backups"))?;
     let backup_size = sparse_copy(&paths.data_image(), &backup_path)?;
     validate_data_image(
         &backup_path,
-        old_installation.data_size_bytes,
-        old_installation.installation_id,
-        old_installation.data_uuid,
+        state.data_size_bytes,
+        state.installation_id,
+        state.data_uuid,
     )?;
-    pending.step = UpgradeStep::BackupComplete;
     pending.backup_size = Some(backup_size);
-    pending.backup_complete = true;
-    write_record(&paths.upgrade(), &pending)?;
+    state.upgrade = Some(pending.clone());
+    state.save(paths)?;
 
-    let candidate_name = format!(
-        "silo-system-upgrade-{}",
-        &operation_id.simple().to_string()[..12]
-    );
+    let candidate_name = pending.candidate_name();
     api.ensure_name_available(&candidate_name).await?;
     let candidate = api
         .create_system_machine(
             &candidate_name,
             &target_config,
-            old_installation.installation_id,
+            state.installation_id,
             &paths.data_image(),
             source,
         )
         .await?;
     pending.candidate_machine_id = Some(candidate.id.clone());
-    pending.step = UpgradeStep::CandidateCreated;
-    write_record(&paths.upgrade(), &pending)?;
+    state.upgrade = Some(pending.clone());
+    state.save(paths)?;
+    validate_candidate(&mut api, &candidate.id, state.data_uuid, &target_config).await?;
 
-    let new_system = SystemRecord {
-        schema: 1,
-        installation_id: old_system.installation_id,
-        engine: old_system.engine.clone(),
-        active_machine_id: candidate.id,
-        image_reference: target_reference,
-        image_digest: target_digest,
-        data_uuid: old_system.data_uuid,
-        data_layout: old_system.data_layout,
-        config_identity: target_config.identity.clone(),
-    };
-    let mut new_installation = old_installation;
-    new_installation.config = target_config.clone();
-    let mut new_registration = old_registration;
-    new_registration.config = target_config.clone();
-    write_record(&paths.system_record(), &new_system)?;
-    write_record(&paths.installation(), &new_installation)?;
-    write_record(&paths.registration(), &new_registration)?;
-    pending.step = UpgradeStep::RecordsCommitted;
-    write_record(&paths.upgrade(), &pending)?;
-
-    validate_committed_candidate(&mut api, &new_system, &target_config, |run_id| {
-        pending.candidate_run_id = Some(run_id.to_string());
-        write_record(&paths.upgrade(), &pending)
-    })
-    .await?;
-    pending.step = UpgradeStep::Validated;
-    write_record(&paths.upgrade(), &pending)?;
-    replace_completed_record(paths, &pending)?;
+    state.machine_id = Some(candidate.id);
+    state.config = target_config;
+    state.configured_image = configured_image;
+    pending.complete = true;
+    state.upgrade = Some(pending);
+    state.save(paths)?;
     drop(lifetime);
-
     if service_was_enabled {
         let started = chrono::Utc::now();
-        crate::system::service::start_locked(&new_registration)?;
-        crate::system::service::wait_ready_locked(paths, started, Duration::from_secs(120))?;
+        crate::system::service::start_locked(&state)?;
+        crate::system::service::wait_ready(paths, started, Duration::from_secs(120))?;
     }
     Ok(())
 }
 
 pub(crate) async fn recover(paths: &SystemPaths) -> eyre::Result<()> {
     let _operation = OperationLock::acquire(&paths.operation_lock())?;
-    let (pending_path, record) = if let Some(record) = load_record(&paths.upgrade())? {
-        (paths.upgrade(), record)
-    } else if let Some(record) = load_record(&paths.completed_upgrade())? {
-        (paths.completed_upgrade(), record)
-    } else {
-        bail!("there is no recorded system image upgrade to recover");
-    };
-    let record: UpgradeRecord = record;
-    validate_recovery_record(paths, &record)?;
-    let networking = record.old_registration.global_config()?.networking;
-    let runtime = record.old_registration.runtime_config(
-        &paths.run_root,
-        &record.old_registration.config,
-        networking,
-    );
+    let state = DaemonRecord::load(paths)?.ok_or_else(|| eyre::eyre!("daemon is not installed"))?;
+    let record = state
+        .upgrade
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("there is no recorded system image upgrade to recover"))?;
+    record.validate(&state)?;
+    let networking = state.service.global_config()?.networking;
+    let runtime =
+        state
+            .service
+            .runtime_config(&paths.run_root, &record.previous_config, networking);
     let mut api = AppApi::local(runtime);
-    crate::system::service::stop_locked(&record.old_registration)?;
+    crate::system::service::stop_locked(&state)?;
     let lifetime = acquire_lifetime(paths, Duration::from_secs(90))?;
-    if let Some(candidate) = &record.candidate_machine_id {
-        ensure_machine_stopped(&mut api, candidate).await?;
-    }
-    ensure_machine_stopped(&mut api, &record.old_system.active_machine_id).await?;
-    if !record.backup_complete {
-        if record.candidate_machine_id.is_some() {
-            bail!("incomplete backup unexpectedly records a candidate machine; refusing ambiguous recovery");
+    // Creation may have finished just before a crash prevented recording the ID.
+    let candidate = match &record.candidate_machine_id {
+        Some(id) => Some(api.inspect_machine(id).await?),
+        None => {
+            let mut candidates = api.list_machines().await?.into_iter().filter(|machine| {
+                machine.name == record.candidate_name()
+                    && crate::system::ownership::is_matching_managed_candidate(
+                        machine,
+                        state.installation_id,
+                    )
+            });
+            let candidate = candidates.next();
+            if candidates.next().is_some() {
+                bail!(
+                    "multiple upgrade candidates match this operation; refusing ambiguous recovery"
+                );
+            }
+            candidate
         }
-        write_record(&paths.system_record(), &record.old_system)?;
-        write_record(&paths.installation(), &record.old_installation)?;
-        write_record(&paths.registration(), &record.old_registration)?;
-        std::fs::remove_file(pending_path)?;
-        drop(lifetime);
-        restore_service_if_enabled(&record.old_registration, record.service_was_enabled)?;
-        return Ok(());
+    };
+    if let Some(candidate) = &candidate {
+        if !crate::system::ownership::is_matching_managed_candidate(
+            candidate,
+            state.installation_id,
+        ) {
+            bail!("upgrade candidate is not owned by this installation");
+        }
+        ensure_machine_stopped(&mut api, &candidate.id).await?;
     }
-    eprintln!("warning: recovery restores engine data to the pre-upgrade backup and discards all later writes");
-    validate_data_image(
-        &record.backup_path,
-        record.old_installation.data_size_bytes,
-        record.old_installation.installation_id,
-        record.data_uuid,
-    )?;
-    restore_backup(&record.backup_path, &record.data_path)?;
-    validate_data_image(
-        &record.data_path,
-        record.old_installation.data_size_bytes,
-        record.old_installation.installation_id,
-        record.data_uuid,
-    )?;
-    write_record(&paths.system_record(), &record.old_system)?;
-    write_record(&paths.installation(), &record.old_installation)?;
-    write_record(&paths.registration(), &record.old_registration)?;
-    std::fs::remove_file(pending_path)?;
-    if let Some(candidate) = &record.candidate_machine_id {
-        if let Err(error) = api.remove_machine(candidate, false).await {
-            eprintln!("warning: recovered data but could not remove stopped upgrade candidate {candidate}: {error:#}");
+    let restored = record.restored_state(&state);
+    let old_id = &record.previous_machine_id;
+    let old_machine = api.inspect_machine(old_id).await?;
+    crate::system::provision::validate_machine(&old_machine, &restored, &paths.data_image())?;
+    ensure_machine_stopped(&mut api, old_id).await?;
+    if let Some(size) = record.backup_size {
+        let backup = record.backup_path(paths);
+        validate_data_image(&backup, size, state.installation_id, state.data_uuid)?;
+        eprintln!("warning: recovery restores engine data to the pre-upgrade backup and discards all later writes");
+        restore_backup(&backup, &paths.data_image())?;
+        validate_data_image(
+            &paths.data_image(),
+            state.data_size_bytes,
+            state.installation_id,
+            state.data_uuid,
+        )?;
+    } else if candidate.is_some() {
+        bail!("incomplete backup unexpectedly has a candidate machine; refusing recovery");
+    }
+    restored.save(paths)?;
+    if let Some(candidate) = candidate {
+        if let Err(error) = api.remove_machine(&candidate.id, false).await {
+            eprintln!(
+                "warning: could not remove stopped upgrade candidate {}: {error:#}",
+                candidate.id
+            );
         }
     }
     drop(lifetime);
-    restore_service_if_enabled(&record.old_registration, record.service_was_enabled)?;
+    if record.service_was_enabled {
+        crate::system::service::start_locked(&restored)?;
+    }
     Ok(())
 }
 
@@ -305,10 +302,7 @@ async fn qualify_candidate_image(
     )?;
     let mut qualification_config = config.clone();
     qualification_config.docker_socket = temporary.join("docker.sock");
-    let name = format!(
-        "silo-system-qualification-{}",
-        &installation_id.simple().to_string()[..12]
-    );
+    let name = format!("silo-system-qualification-{}", installation_id.simple());
     api.ensure_name_available(&name).await?;
     let candidate = api
         .create_system_machine(
@@ -319,23 +313,7 @@ async fn qualify_candidate_image(
             crate::api::types::SystemImageResolution { image },
         )
         .await?;
-    let record = SystemRecord {
-        schema: 1,
-        installation_id,
-        engine: "docker".to_string(),
-        active_machine_id: candidate.id.clone(),
-        image_reference: config.image.clone(),
-        image_digest: candidate
-            .rootfs
-            .as_ref()
-            .and_then(|rootfs| rootfs.selected_manifest_digest.clone())
-            .ok_or_else(|| eyre::eyre!("qualification candidate has no image digest"))?,
-        data_uuid,
-        data_layout: 1,
-        config_identity: qualification_config.identity.clone(),
-    };
-    let validation =
-        validate_committed_candidate(api, &record, &qualification_config, |_| Ok(())).await;
+    let validation = validate_candidate(api, &candidate.id, data_uuid, &qualification_config).await;
     let removal = api.remove_machine(&candidate.id, false).await;
     if let Err(error) = removal {
         validation?;
@@ -349,23 +327,6 @@ async fn qualify_candidate_image(
     validation?;
     std::fs::remove_dir_all(&temporary)?;
     Ok(())
-}
-
-fn restore_service_if_enabled(registration: &Registration, enabled: bool) -> eyre::Result<()> {
-    if enabled {
-        crate::system::service::start_locked(registration)?;
-    }
-    Ok(())
-}
-
-fn rollback_before_backup(
-    paths: &SystemPaths,
-    registration: &Registration,
-    enabled: bool,
-) -> eyre::Result<()> {
-    std::fs::remove_file(paths.upgrade())?;
-    File::open(paths.daemon_data())?.sync_all()?;
-    restore_service_if_enabled(registration, enabled)
 }
 
 fn validate_target(source: &crate::api::types::SystemImageResolution) -> eyre::Result<()> {
@@ -396,18 +357,17 @@ fn validate_target(source: &crate::api::types::SystemImageResolution) -> eyre::R
     Ok(())
 }
 
-async fn validate_committed_candidate(
+async fn validate_candidate(
     api: &mut AppApi,
-    record: &SystemRecord,
+    machine_id: &str,
+    data_uuid: Uuid,
     config: &ResolvedSystemConfig,
-    on_started: impl FnOnce(&libvm::MachineRunId) -> eyre::Result<()>,
 ) -> eyre::Result<()> {
-    let machine = api.machine(&record.active_machine_id).await?;
+    let machine = api.machine(machine_id).await?;
     let machine_data = machine.inspect().await?;
     let options = api.machine_start_options(&machine, false).await?;
     let run_id = machine.start_with_options(options).await?.run_id;
     let validation = async {
-        on_started(&run_id)?;
         let readiness = machine.wait_ready(READY_TIMEOUT).await?;
         if readiness.outcome != MachineReadinessOutcome::Ready {
             bail!(
@@ -416,9 +376,9 @@ async fn validate_committed_candidate(
             );
         }
         validate_guest_manifest(&machine).await?;
-        crate::system::supervisor::activate(&machine, config, &machine_data.spec, record.data_uuid)
+        crate::system::supervisor::activate(&machine, config, &machine_data.spec, data_uuid)
             .await?;
-        crate::system::supervisor::probe_docker_socket(&config.docker_socket)
+        crate::system::supervisor::wait_docker_socket(&config.docker_socket, READY_TIMEOUT).await
     }
     .await;
     let _ = machine
@@ -433,46 +393,6 @@ async fn validate_committed_candidate(
     let stopped = machine.stop_run(run_id).await;
     validation?;
     stopped?;
-    Ok(())
-}
-
-fn validate_recovery_record(paths: &SystemPaths, record: &UpgradeRecord) -> eyre::Result<()> {
-    if record.schema != 1
-        || record.data_path != paths.data_image()
-        || record.old_system.installation_id != record.old_installation.installation_id
-        || record.old_system.data_uuid != record.data_uuid
-        || record.old_installation.data_uuid != record.data_uuid
-    {
-        bail!("upgrade recovery record does not match this installation");
-    }
-    if record.target_reference.is_empty()
-        || !record.target_digest.starts_with("sha256:")
-        || (record.backup_complete == (record.step == UpgradeStep::BackingUp))
-        || (record.candidate_run_id.is_some() && record.candidate_machine_id.is_none())
-    {
-        bail!("upgrade recovery record has inconsistent operation state");
-    }
-    let backup_root = paths.daemon_data().join("backups");
-    if record.backup_path.parent() != Some(backup_root.as_path()) {
-        bail!("upgrade backup path is outside the installation backup directory");
-    }
-    let expected_backup = format!("data-{}.img", record.operation_id);
-    if record
-        .backup_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        != Some(&expected_backup)
-    {
-        bail!("upgrade backup identity does not match its operation");
-    }
-    for run_id in [&record.old_run_id, &record.candidate_run_id]
-        .into_iter()
-        .flatten()
-    {
-        run_id
-            .parse::<libvm::MachineRunId>()
-            .with_context(|| format!("invalid recorded monitor generation {run_id:?}"))?;
-    }
     Ok(())
 }
 
@@ -557,7 +477,8 @@ fn acquire_lifetime(paths: &SystemPaths, timeout: Duration) -> eyre::Result<Life
             Ok(lock) => return Ok(lock),
             Err(error)
                 if Instant::now() < deadline
-                    && error.to_string().contains("another Silo system daemon") =>
+                    && error.downcast_ref::<nix::errno::Errno>()
+                        == Some(&nix::errno::Errno::EWOULDBLOCK) =>
             {
                 std::thread::sleep(Duration::from_millis(100))
             }
@@ -634,27 +555,103 @@ fn restore_backup(backup: &Path, data: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
-fn replace_completed_record(paths: &SystemPaths, record: &UpgradeRecord) -> eyre::Result<()> {
-    write_record(&paths.completed_upgrade(), record)?;
-    std::fs::remove_file(paths.upgrade())?;
-    File::open(paths.daemon_data())?.sync_all()?;
-    Ok(())
-}
-
-fn load_required<T: serde::de::DeserializeOwned>(path: &Path, name: &str) -> eyre::Result<T> {
-    load_record(path)?.ok_or_else(|| eyre::eyre!("{name} is missing: {}", path.display()))
-}
-
-pub(crate) fn is_pending_candidate(paths: &SystemPaths, machine_id: &str) -> eyre::Result<bool> {
-    let Some(record) = load_record::<UpgradeRecord>(&paths.upgrade())? else {
-        return Ok(false);
-    };
-    Ok(record.candidate_machine_id.as_deref() == Some(machine_id))
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::system::upgrade::sparse_copy;
+    use crate::system::record::DaemonRecord;
+    use crate::system::upgrade::{restore_backup, sparse_copy, UpgradeRecord};
+
+    #[test]
+    fn upgrade_recovery_is_committed_with_the_active_vm_reference() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (paths, mut state) = crate::system::record::tests::fixture(temp.path());
+        state.machine_id = Some("old-vm".to_string());
+        let mut operation = UpgradeRecord {
+            operation_id: uuid::Uuid::new_v4(),
+            previous_machine_id: "old-vm".to_string(),
+            previous_config: state.config.clone(),
+            previous_configured_image: state.configured_image.clone(),
+            candidate_machine_id: None,
+            backup_size: None,
+            service_was_enabled: true,
+            complete: false,
+        };
+        for stage in 0..4 {
+            match stage {
+                1 => operation.backup_size = Some(state.data_size_bytes),
+                2 => operation.candidate_machine_id = Some("new-vm".to_string()),
+                3 => {
+                    operation.complete = true;
+                    state.machine_id = Some("new-vm".to_string());
+                }
+                _ => {}
+            }
+            state.upgrade = Some(operation.clone());
+            state.save(&paths).expect("commit operation");
+            let loaded = DaemonRecord::load(&paths).expect("reload").expect("state");
+            assert_eq!(loaded, state);
+            assert_eq!(loaded.require_no_pending_upgrade().is_ok(), stage == 3);
+            assert!(loaded.owns_machine("old-vm"));
+            assert_eq!(loaded.owns_machine("new-vm"), stage >= 2);
+        }
+        operation
+            .restored_state(&state)
+            .save(&paths)
+            .expect("restore old state");
+        let restored = DaemonRecord::load(&paths).expect("reload").expect("state");
+        assert_eq!(restored.machine_id().expect("VM"), "old-vm");
+        assert!(restored.upgrade.is_none());
+    }
+
+    #[test]
+    fn inconsistent_recovery_state_is_rejected_before_writing() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (paths, mut state) = crate::system::record::tests::fixture(temp.path());
+        state.machine_id = Some("old-vm".to_string());
+        state.save(&paths).expect("initial state");
+        let valid = UpgradeRecord {
+            operation_id: uuid::Uuid::new_v4(),
+            previous_machine_id: "old-vm".to_string(),
+            previous_config: state.config.clone(),
+            previous_configured_image: state.configured_image.clone(),
+            candidate_machine_id: None,
+            backup_size: None,
+            service_was_enabled: true,
+            complete: false,
+        };
+        for case in 0..6 {
+            let mut invalid = valid.clone();
+            match case {
+                0 => invalid.previous_machine_id.clear(),
+                1 => invalid.previous_config.data_size_bytes += 1,
+                2 => invalid.backup_size = Some(state.data_size_bytes + 1),
+                3 => invalid.candidate_machine_id = Some("new-vm".to_string()),
+                4 => invalid.complete = true,
+                _ => {
+                    invalid.backup_size = Some(state.data_size_bytes);
+                    invalid.candidate_machine_id = Some("old-vm".to_string());
+                }
+            }
+            state.upgrade = Some(invalid);
+            assert!(state.save(&paths).is_err(), "case {case}");
+            assert!(DaemonRecord::load(&paths)
+                .expect("load unchanged state")
+                .expect("state")
+                .upgrade
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn restoring_backup_replaces_data_but_preserves_the_backup() {
+        let temp = tempfile::tempdir().expect("temp");
+        let data = temp.path().join("data.img");
+        let backup = temp.path().join("backup.img");
+        std::fs::write(&backup, b"before upgrade").expect("backup");
+        std::fs::write(&data, b"after upgrade").expect("data");
+        restore_backup(&backup, &data).expect("restore");
+        assert_eq!(std::fs::read(&data).expect("data"), b"before upgrade");
+        assert_eq!(std::fs::read(&backup).expect("backup"), b"before upgrade");
+    }
 
     #[test]
     fn sparse_backup_preserves_length_and_allocated_data() {

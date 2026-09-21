@@ -74,7 +74,7 @@ capability checks, safety policies, and upgrade behavior.
 `backend` explicitly selects `krun` or Apple Virtualization.framework (`vz`).
 The default is `krun` on Linux and macOS. If the key is omitted,
 `SILO_VIRT_BACKEND=krun` or `SILO_VIRT_BACKEND=vz` on `silo daemon up` is copied
-into the resolved daemon registration, including login-item starts. An explicit
+into the daemon's configuration snapshot, including login-item starts. An explicit
 `backend` key wins over that environment variable. The environment variable
 also selects the backend for direct CLI machine starts.
 
@@ -86,9 +86,7 @@ on for `vz` when the host is Apple silicon with Rosetta installed
 a pinned unmodified translator digest. The captured baseline is not
 TSO-qualified and does not promise compatibility with later Apple releases.
 The setting is applied to the system VM the next time the daemon starts it from
-stopped. Existing schema-1 resolved records that predate the persisted
-`backend` field retain their historical platform selection; create a new
-registration to adopt the current default.
+stopped.
 
 The home share is enabled read/write by default and appears at the same absolute
 path in the guest. Disable it if the engine must not access the host home.
@@ -148,9 +146,41 @@ silo daemon up --foreground
 Foreground mode uses the same supervisor and persistent installation. It does
 not background itself or install a service. Stop it with SIGINT or SIGTERM.
 
+## Daemon State
+
+`config.yml` holds user settings. Silo keeps one internal installation record at
+`$XDG_DATA_HOME/silo/daemon/daemon.json` (normally
+`~/.local/share/silo/daemon/daemon.json`). It contains:
+
+- Installation and persistent data-disk identities.
+- The active VM ID, or no ID while initial setup is unfinished.
+- One resolved configuration snapshot and the paths needed for background startup.
+- Optional upgrade recovery information: the previous VM ID and configuration,
+  candidate VM ID, and completed-backup information. The last successful upgrade remains
+  recoverable until the next upgrade replaces that recovery information.
+
+There is no persisted VM lifecycle or duplicate image digest. Silo inspects the
+recorded VM for those facts. A missing recorded VM is an error, not permission to
+create a replacement. Ownership-label discovery is only used to recover creation
+that finished before its VM ID could be saved.
+
+The record is replaced atomically. Locks serialize administrative operations and
+prevent two supervisors from owning the installation. `status.json` is only a
+live-status cache, checked against the daemon process, not installation state.
+
+This layout requires a clean installation. There is no migration or compatibility
+support for the previous multi-file daemon state.
+
+An interrupted first setup with no VM can resume with a changed default image;
+it does not require an upgrade of a VM that was never created.
+
 ## Upgrade And Recovery
 
+Bare `upgrade` uses `daemon.system.image` when configured, otherwise the built-in
+default image. Supply `--image` only to override that target.
+
 ```bash
+silo daemon upgrade
 silo daemon upgrade --image ghcr.io/vandycknick/silo/system@sha256:<digest>
 silo daemon upgrade --recover
 ```

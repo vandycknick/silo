@@ -8,98 +8,30 @@ use uuid::Uuid;
 use crate::api::AppApi;
 use crate::system::config::ResolvedSystemConfig;
 use crate::system::ownership::is_matching_managed_candidate;
-use crate::system::record::{
-    load_record, write_record, InstallationRecord, SystemPaths, SystemRecord,
-};
+use crate::system::record::{DaemonRecord, SystemPaths};
 use crate::system::storage::{ensure_data_image, validate_data_image};
 
 pub(crate) async fn ensure_system_machine(
     api: &mut AppApi,
     paths: &SystemPaths,
     config: ResolvedSystemConfig,
-) -> eyre::Result<(SystemRecord, MachineData)> {
-    let installation = prepare_installation(paths, &config)?;
-
-    ensure_system_machine_for_installation(api, paths, config, installation).await
-}
-
-pub(crate) fn prepare_installation(
-    paths: &SystemPaths,
-    config: &ResolvedSystemConfig,
-) -> eyre::Result<InstallationRecord> {
-    let installation = match load_record::<InstallationRecord>(&paths.installation())? {
-        Some(record) => {
-            validate_installation(&record, config)?;
-            record
+) -> eyre::Result<(DaemonRecord, MachineData)> {
+    let mut installation = prepare_installation(paths, &config)?;
+    let machine = match find_system_machine(api, paths, installation.installation_id).await? {
+        Some(machine) => {
+            validate_machine(&machine, &installation, &paths.data_image())?;
+            if installation.machine_id.is_none() && installation.configured_image != config.image {
+                // A previous first start may have created the VM before recording its ID.
+                // Keep that VM addressable by upgrade rather than silently adopting a
+                // different image after a default change.
+                installation.machine_id = Some(machine.id.clone());
+                installation.config.image = installation.configured_image.clone();
+                installation.save(paths)?;
+                bail!("an interrupted setup already created a system VM with the previous image; run `silo daemon upgrade`");
+            }
+            reconcile_system_hardware(api, machine, &config).await?
         }
         None => {
-            let record = InstallationRecord {
-                schema: 1,
-                installation_id: Uuid::new_v4(),
-                data_uuid: Uuid::new_v4(),
-                data_layout: 1,
-                data_size_bytes: config.data_size_bytes,
-                configured_image: config.image.clone(),
-                config: config.clone(),
-            };
-            write_record(&paths.installation(), &record)?;
-            record
-        }
-    };
-
-    ensure_data_image(
-        &paths.data_image(),
-        installation.data_size_bytes,
-        installation.installation_id,
-        installation.data_uuid,
-    )?;
-
-    Ok(installation)
-}
-
-async fn ensure_system_machine_for_installation(
-    api: &mut AppApi,
-    paths: &SystemPaths,
-    config: ResolvedSystemConfig,
-    installation: InstallationRecord,
-) -> eyre::Result<(SystemRecord, MachineData)> {
-    if let Some(mut record) = load_record::<SystemRecord>(&paths.system_record())? {
-        validate_system_record(&record, &installation)?;
-        let machine = api
-            .inspect_machine(&record.active_machine_id)
-            .await
-            .with_context(|| {
-                format!(
-                    "recorded system machine {} is missing; refusing to create a replacement",
-                    record.active_machine_id
-                )
-            })?;
-        validate_machine(&machine, &record, &paths.data_image())?;
-        let machine = reconcile_system_hardware(api, machine, &config).await?;
-        if hardware_matches(&machine, &config) {
-            // The machine now carries the configured resources; record the configuration
-            // they came from so later starts compare against the right baseline.
-            if installation.config != config {
-                let mut installation = installation;
-                installation.config = config.clone();
-                write_record(&paths.installation(), &installation)?;
-            }
-            if record.config_identity != config.identity {
-                record.config_identity = config.identity.clone();
-                write_record(&paths.system_record(), &record)?;
-            }
-        }
-        return Ok((record, machine));
-    }
-
-    let candidates: Vec<_> = api
-        .list_machines()
-        .await?
-        .into_iter()
-        .filter(|machine| is_matching_managed_candidate(machine, installation.installation_id))
-        .collect();
-    let machine = match candidates.as_slice() {
-        [] => {
             api.ensure_name_available(crate::system::SYSTEM_MACHINE_NAME)
                 .await?;
             let (progress, _receiver) = ImageProgressSender::channel(1);
@@ -116,36 +48,51 @@ async fn ensure_system_machine_for_installation(
             )
             .await?
         }
-        [machine] => reconcile_system_hardware(api, machine.clone(), &config).await?,
-        _ => bail!(
-            "multiple unrecorded system machines match installation {}; remove ambiguity manually",
-            installation.installation_id
-        ),
     };
-    let rootfs = machine
-        .rootfs
-        .as_ref()
-        .ok_or_else(|| eyre::eyre!("system machine has no durable rootfs identity"))?;
-    let record = SystemRecord {
-        schema: 1,
-        installation_id: installation.installation_id,
-        engine: "docker".to_string(),
-        active_machine_id: machine.id.clone(),
-        image_reference: rootfs
-            .selected_reference
-            .clone()
-            .unwrap_or_else(|| rootfs.requested_reference.clone()),
-        image_digest: rootfs
-            .selected_manifest_digest
-            .clone()
-            .ok_or_else(|| eyre::eyre!("system image did not resolve to an immutable digest"))?,
-        data_uuid: installation.data_uuid,
-        data_layout: installation.data_layout,
-        config_identity: config.identity.clone(),
+    validate_machine(&machine, &installation, &paths.data_image())?;
+    if installation.machine_id.is_none() {
+        installation.configured_image = config.image.clone();
+    }
+    installation.machine_id = Some(machine.id.clone());
+    if hardware_matches(&machine, &config) {
+        installation.config = config;
+    }
+    installation.save(paths)?;
+    Ok((installation, machine))
+}
+
+pub(crate) fn prepare_installation(
+    paths: &SystemPaths,
+    config: &ResolvedSystemConfig,
+) -> eyre::Result<DaemonRecord> {
+    let installation = match DaemonRecord::load(paths)? {
+        Some(record) => {
+            validate_installation(&record, config)?;
+            if record.machine_id.is_some() && record.config.image != config.image {
+                bail!("system image changes require `silo daemon upgrade`");
+            }
+            record
+        }
+        None => {
+            let record = DaemonRecord::new(paths, config.clone())?;
+            record.save(paths)?;
+            record
+        }
     };
-    validate_machine(&machine, &record, &paths.data_image())?;
-    write_record(&paths.system_record(), &record)?;
-    Ok((record, machine))
+
+    let prepare_data = if installation.machine_id.is_some() {
+        validate_data_image
+    } else {
+        ensure_data_image
+    };
+    prepare_data(
+        &paths.data_image(),
+        installation.data_size_bytes,
+        installation.installation_id,
+        installation.data_uuid,
+    )?;
+
+    Ok(installation)
 }
 
 /// The settings the daemon may change between starts: CPUs, memory, and Rosetta.
@@ -234,16 +181,16 @@ pub(crate) async fn find_system_machine(
     paths: &SystemPaths,
     installation_id: Uuid,
 ) -> eyre::Result<Option<MachineData>> {
-    if let Some(record) = load_record::<SystemRecord>(&paths.system_record())? {
-        return match api.inspect_machine(&record.active_machine_id).await {
-            Ok(machine) => Ok(Some(machine)),
-            Err(error) => Err(error).with_context(|| {
-                format!(
-                    "recorded system machine {} is missing",
-                    record.active_machine_id
-                )
-            }),
-        };
+    if let Some(record) = DaemonRecord::load(paths)? {
+        if let Some(id) = record.machine_id {
+            let machine = api.inspect_machine(&id).await.with_context(|| {
+                format!("recorded system machine {id} is missing; refusing to create a replacement")
+            })?;
+            if !is_matching_managed_candidate(&machine, installation_id) {
+                bail!("recorded machine is not owned by this system installation");
+            }
+            return Ok(Some(machine));
+        }
     }
     let mut candidates: Vec<_> = api
         .list_machines()
@@ -282,8 +229,8 @@ pub(crate) async fn stop_system_machine(
     Ok(Some(machine.id))
 }
 
-fn validate_installation(
-    record: &InstallationRecord,
+pub(crate) fn validate_installation(
+    record: &DaemonRecord,
     config: &ResolvedSystemConfig,
 ) -> eyre::Result<()> {
     if record.schema != 1 || record.data_layout != 1 {
@@ -295,9 +242,7 @@ fn validate_installation(
     if record.config.shares != config.shares {
         bail!("changing system shares after first creation is not supported");
     }
-    if record.config.image != config.image {
-        bail!("system image changes require `silo daemon upgrade --image ...`");
-    }
+    record.require_no_pending_upgrade()?;
     if record.config.docker_socket != config.docker_socket
         || record.config.publish_bind != config.publish_bind
     {
@@ -306,27 +251,16 @@ fn validate_installation(
     Ok(())
 }
 
-fn validate_system_record(
-    record: &SystemRecord,
-    installation: &InstallationRecord,
-) -> eyre::Result<()> {
-    if record.schema != 1
-        || record.installation_id != installation.installation_id
-        || record.data_uuid != installation.data_uuid
-        || record.data_layout != installation.data_layout
-    {
-        bail!("system record does not match installation/data identity");
-    }
-    Ok(())
-}
-
-fn validate_machine(
+pub(crate) fn validate_machine(
     machine: &MachineData,
-    record: &SystemRecord,
+    record: &DaemonRecord,
     data_image: &std::path::Path,
 ) -> eyre::Result<()> {
     if !is_matching_managed_candidate(machine, record.installation_id)
-        || machine.id != record.active_machine_id
+        || record
+            .machine_id
+            .as_ref()
+            .is_some_and(|id| *id != machine.id)
     {
         bail!("recorded machine is not owned by this system installation");
     }
@@ -352,12 +286,7 @@ fn validate_machine(
             data_image.display()
         );
     }
-    validate_data_image(
-        data_image,
-        std::fs::metadata(data_image)?.len(),
-        record.installation_id,
-        record.data_uuid,
-    )
+    Ok(())
 }
 
 fn attachment_matches_data_image(
@@ -383,7 +312,7 @@ mod tests {
     use crate::system::provision::{
         attachment_matches_data_image, validate_installation, SystemHardware,
     };
-    use crate::system::record::InstallationRecord;
+    use crate::system::record::DaemonRecord;
 
     #[test]
     fn persisted_data_and_share_changes_fail_closed() {
@@ -391,19 +320,59 @@ mod tests {
         let config: SystemConfig =
             serde_yaml_ng::from_str("version: '1'\nsystem: {}\n").expect("config");
         let resolved = config.resolve(home.path(), None).expect("resolve");
-        let record = InstallationRecord {
-            schema: 1,
-            installation_id: uuid::Uuid::new_v4(),
-            data_uuid: uuid::Uuid::new_v4(),
-            data_layout: 1,
-            data_size_bytes: resolved.data_size_bytes,
-            configured_image: resolved.image.clone(),
-            config: resolved.clone(),
-        };
+        let root = home.path().to_path_buf();
+        let paths = crate::system::record::SystemPaths::new(
+            root.clone(),
+            root.clone(),
+            root.clone(),
+            root.clone(),
+            root,
+        );
+        let record = DaemonRecord::new(&paths, resolved.clone()).expect("state");
         assert!(validate_installation(&record, &resolved).is_ok());
         let mut changed = resolved;
         changed.data_size_bytes += 1;
         assert!(validate_installation(&record, &changed).is_err());
+    }
+
+    #[test]
+    fn interrupted_setup_accepts_a_new_default_without_replacing_its_data_disk() {
+        use crate::system::provision::prepare_installation;
+        use std::os::unix::fs::MetadataExt as _;
+        let temp = tempfile::tempdir().expect("temp");
+        let (paths, state) = crate::system::record::tests::fixture(temp.path());
+        state.save(&paths).expect("initial identity");
+        let initial = prepare_installation(&paths, &state.config).expect("prepare storage");
+        let inode = std::fs::metadata(paths.data_image()).expect("disk").ino();
+        let mut changed = state.config.clone();
+        changed.image = "registry.example/system@sha256:new".to_string();
+        let mut resumed = prepare_installation(&paths, &changed).expect("resume incomplete setup");
+        assert_eq!(initial.installation_id, resumed.installation_id);
+        assert_eq!(initial.data_uuid, resumed.data_uuid);
+        assert_eq!(
+            inode,
+            std::fs::metadata(paths.data_image()).expect("disk").ino()
+        );
+        resumed.machine_id = Some("already-created".to_string());
+        resumed.save(&paths).expect("record VM");
+        assert!(prepare_installation(&paths, &changed)
+            .expect_err("existing VM needs upgrade")
+            .to_string()
+            .contains("silo daemon upgrade"));
+        assert_eq!(
+            inode,
+            std::fs::metadata(paths.data_image()).expect("disk").ino()
+        );
+    }
+
+    #[test]
+    fn provisioned_installation_never_recreates_a_missing_data_disk() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (paths, mut state) = crate::system::record::tests::fixture(temp.path());
+        state.machine_id = Some("existing-vm".to_string());
+        state.save(&paths).expect("state");
+        assert!(crate::system::provision::prepare_installation(&paths, &state.config).is_err());
+        assert!(!paths.data_image().exists());
     }
 
     #[test]
@@ -459,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn old_persisted_true_rosetta_intent_remains_an_explicit_hardware_update() {
+    fn explicit_rosetta_intent_is_a_hardware_update() {
         let config: crate::system::config::ResolvedSystemConfig =
             serde_json::from_value(serde_json::json!({
                 "schema": 1,
@@ -474,9 +443,9 @@ mod tests {
                 "docker_socket": "/tmp/silo.sock",
                 "backend": "vz",
                 "rosetta": true,
-                "identity": "fnv1a64:test"
+                "rosetta_explicit": true
             }))
-            .expect("old persisted config");
+            .expect("resolved config");
 
         assert!(config.rosetta_explicit);
         assert_eq!(SystemHardware::of_config(&config).rosetta, Some(true));

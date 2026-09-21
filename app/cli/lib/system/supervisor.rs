@@ -43,6 +43,8 @@ pub(crate) struct DaemonStatus {
     pub(crate) schema: u32,
     pub(crate) generation: Uuid,
     pub(crate) pid: u32,
+    #[serde(default)]
+    pub(crate) process_start: String,
     pub(crate) phase: DaemonPhase,
     pub(crate) machine_id: Option<String>,
     pub(crate) run_id: Option<String>,
@@ -112,16 +114,6 @@ impl MemoryReclaimOutcome {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OwnerRecord {
-    schema: u32,
-    generation: Uuid,
-    pid: u32,
-    process_start: String,
-    run_root: String,
-}
-
 pub(crate) struct LifetimeLock {
     _file: Flock<File>,
 }
@@ -140,8 +132,8 @@ impl LifetimeLock {
             .open(path)?;
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
             Ok(file) => Ok(Self { _file: file }),
-            Err((_, nix::errno::Errno::EWOULDBLOCK)) => {
-                bail!("another Silo system daemon owns this installation")
+            Err((_, error @ nix::errno::Errno::EWOULDBLOCK)) => {
+                Err(error).context("another Silo system daemon owns this installation")
             }
             Err((_, error)) => Err(error).context("lock system daemon installation"),
         }
@@ -153,25 +145,16 @@ pub(crate) async fn serve(
     paths: SystemPaths,
     config: ResolvedSystemConfig,
 ) -> eyre::Result<()> {
-    if paths.upgrade().exists() {
-        bail!("a system image upgrade is pending; run `silo daemon upgrade --recover`");
-    }
     let _lock = LifetimeLock::acquire(&paths.lifetime_lock())?;
+    if let Some(state) = crate::system::record::DaemonRecord::load(&paths)? {
+        state.require_no_pending_upgrade()?;
+    }
     let generation = Uuid::new_v4();
-    write_record(
-        &paths.owner(),
-        &OwnerRecord {
-            schema: 1,
-            generation,
-            pid: std::process::id(),
-            process_start: process_start_identity()?,
-            run_root: paths.run_root.display().to_string(),
-        },
-    )?;
     let mut status = DaemonStatus {
         schema: 1,
         generation,
         pid: std::process::id(),
+        process_start: process_start_identity()?,
         phase: DaemonPhase::PreparingStorage,
         machine_id: None,
         run_id: None,
@@ -248,9 +231,7 @@ pub(crate) async fn serve(
         publish(&paths, &mut status)?;
         // Stop the VM even when startup never got as far as writing the system record;
         // otherwise an interrupted first start leaves it running unattended.
-        if let Some(installation) =
-            load_record::<crate::system::record::InstallationRecord>(&paths.installation())?
-        {
+        if let Some(installation) = crate::system::record::DaemonRecord::load(&paths)? {
             match crate::system::provision::stop_system_machine(
                 api,
                 &paths,
@@ -365,9 +346,12 @@ async fn reconcile_ready(
     status.phase = DaemonPhase::Creating;
     publish(paths, status)?;
     let (record, machine_data) = ensure_system_machine(api, paths, config.clone()).await?;
-    status.machine_id = Some(record.active_machine_id.clone());
-    status.image_digest = Some(record.image_digest.clone());
-    let machine = api.machine(&record.active_machine_id).await?;
+    status.machine_id = Some(machine_data.id.clone());
+    status.image_digest = machine_data
+        .rootfs
+        .as_ref()
+        .and_then(|rootfs| rootfs.selected_manifest_digest.clone());
+    let machine = api.machine(&machine_data.id).await?;
     let run_id = match machine_data.status {
         MachineStatus::Running { .. } | MachineStatus::Starting { .. } => {
             machine.current_run_id().await?
@@ -603,7 +587,7 @@ fn activation_request(
     }))
 }
 
-async fn wait_docker_socket(path: &Path, timeout: Duration) -> eyre::Result<()> {
+pub(crate) async fn wait_docker_socket(path: &Path, timeout: Duration) -> eyre::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_error = None;
     while tokio::time::Instant::now() < deadline {
@@ -714,42 +698,22 @@ pub(crate) fn read_status(paths: &SystemPaths) -> eyre::Result<Option<DaemonStat
     Ok(load_record(&paths.status()).unwrap_or_default())
 }
 
-pub(crate) fn last_run_root(paths: &SystemPaths) -> eyre::Result<Option<std::path::PathBuf>> {
-    let Some(owner) = load_record::<OwnerRecord>(&paths.owner())? else {
-        return Ok(None);
-    };
-    let run_root = std::path::PathBuf::from(owner.run_root);
-    if !run_root.is_absolute() {
-        bail!("recorded daemon run root is not absolute");
-    }
-    Ok(Some(run_root))
-}
-
-pub(crate) fn status_owner_is_live(
-    paths: &SystemPaths,
-    status: &DaemonStatus,
-) -> eyre::Result<bool> {
-    let Some(owner) = load_record::<OwnerRecord>(&paths.owner())? else {
-        return Ok(false);
-    };
-    if owner.generation != status.generation || owner.pid != status.pid {
-        return Ok(false);
-    }
+pub(crate) fn status_owner_is_live(status: &DaemonStatus) -> eyre::Result<bool> {
     #[cfg(target_os = "linux")]
     {
-        let stat = match std::fs::read_to_string(format!("/proc/{}/stat", owner.pid)) {
+        let stat = match std::fs::read_to_string(format!("/proc/{}/stat", status.pid)) {
             Ok(stat) => stat,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
         let end = stat
             .rfind(')')
-            .ok_or_else(|| eyre::eyre!("invalid process stat for daemon PID {}", owner.pid))?;
+            .ok_or_else(|| eyre::eyre!("invalid process stat for daemon PID {}", status.pid))?;
         let start = stat[end + 2..]
             .split_whitespace()
             .nth(19)
             .ok_or_else(|| eyre::eyre!("missing daemon process start time"))?;
-        Ok(start == owner.process_start)
+        Ok(start == status.process_start)
     }
     #[cfg(not(target_os = "linux"))]
     Ok(true)
@@ -884,6 +848,25 @@ mod tests {
         assert!(error
             .to_string()
             .contains("actual machine has 0 shares, configuration requires 1"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn status_uses_process_identity_without_a_separate_owner_record() {
+        use crate::system::supervisor::{
+            process_start_identity, status_owner_is_live, DaemonStatus,
+        };
+        let mut status: DaemonStatus = serde_json::from_value(serde_json::json!({
+            "schema": 1, "generation": uuid::Uuid::new_v4(),
+            "pid": std::process::id(), "process_start": process_start_identity().expect("identity"),
+            "phase": "ready", "machine_id": null, "run_id": null, "image_digest": null,
+            "docker_socket": "/tmp/test.sock", "updated_at": "2026-01-01T00:00:00Z",
+            "last_error": null, "restart_count": 0,
+        }))
+        .expect("status");
+        assert!(status_owner_is_live(&status).expect("live"));
+        status.process_start = "different process with the same PID".to_string();
+        assert!(!status_owner_is_live(&status).expect("stale"));
     }
 
     #[test]

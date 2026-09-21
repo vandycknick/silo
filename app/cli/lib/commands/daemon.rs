@@ -48,7 +48,8 @@ struct Logs {
 
 #[derive(Debug, Args)]
 struct Upgrade {
-    #[arg(long, required_unless_present = "recover", conflicts_with = "recover")]
+    /// Override the configured or built-in default system image.
+    #[arg(long, conflicts_with = "recover")]
     image: Option<String>,
     #[arg(long, conflicts_with = "image")]
     recover: bool,
@@ -57,7 +58,7 @@ struct Upgrade {
 #[derive(Debug, Args)]
 struct Serve {
     #[arg(long)]
-    config: std::path::PathBuf,
+    state: std::path::PathBuf,
 }
 
 impl Cmd {
@@ -67,7 +68,7 @@ impl Cmd {
                 if command.foreground {
                     return run_foreground(context).await;
                 }
-                let (paths, config) = context.resolved_system_config(None)?;
+                let (paths, config) = context.resolved_system_config()?;
                 let daemon_live = crate::system::service::status(&paths)?.is_some();
                 crate::system::docker::preflight(&config, daemon_live)?;
                 crate::system::service::up(&paths, config.clone())?;
@@ -75,30 +76,9 @@ impl Cmd {
             }
             DaemonCommand::Down => {
                 let paths = crate::system::ownership::default_system_paths()?;
-                let Some(registration) =
-                    crate::system::service::load_optional_registration(&paths.registration())?
-                else {
-                    return Ok(());
-                };
-                crate::system::service::down(&registration, &paths)?;
-                // A daemon that was running has stopped its VM on SIGTERM by now. Cover the
-                // case where none was running but an earlier interrupted start left the VM up.
-                if let Some(installation) = crate::system::record::load_record::<
-                    crate::system::record::InstallationRecord,
-                >(&paths.installation())?
-                {
-                    let api = context.app_api().await?;
-                    crate::system::provision::stop_system_machine(
-                        api,
-                        &paths,
-                        installation.installation_id,
-                        std::time::Duration::from_secs(60),
-                    )
-                    .await?;
-                }
-                Ok(())
+                crate::system::service::down(&paths).await
             }
-            DaemonCommand::Serve(command) => run_registered(command.config).await,
+            DaemonCommand::Serve(command) => run_service(command.state).await,
             DaemonCommand::Status(command) => {
                 let paths = crate::system::ownership::default_system_paths()?;
                 let view = DaemonStatusView::collect(&paths)?;
@@ -123,10 +103,8 @@ impl Cmd {
                 if command.recover {
                     return crate::system::upgrade::recover(&paths).await;
                 }
-                let image = command
-                    .image
-                    .ok_or_else(|| eyre::eyre!("--image is required"))?;
-                let (_, config) = context.resolved_system_config(None)?;
+                let (_, config) = context.resolved_system_config()?;
+                let image = command.image.unwrap_or_else(|| config.image.clone());
                 crate::system::upgrade::upgrade(&paths, config, &image).await
             }
         }
@@ -134,7 +112,7 @@ impl Cmd {
 }
 
 /// Operator-facing daemon status: the live supervisor record plus what the service
-/// manager and registration say when no daemon is running.
+/// manager and state say when no daemon is running.
 #[derive(Debug, serde::Serialize)]
 struct DaemonStatusView {
     /// Summary state: `stopped`, `starting`, `ready`, `degraded`, `failed`, `stopping`.
@@ -143,7 +121,7 @@ struct DaemonStatusView {
     autostart: Option<bool>,
     /// Docker endpoint the daemon serves (or is registered to serve).
     endpoint: Option<String>,
-    /// Configured guest memory, in bytes, from the registration.
+    /// Configured guest memory, in bytes, from the state.
     memory_bytes: Option<u64>,
     /// Live supervisor record; absent when no daemon process is running.
     daemon: Option<crate::system::supervisor::DaemonStatus>,
@@ -155,17 +133,14 @@ impl DaemonStatusView {
 
         let daemon = crate::system::service::status(paths)?;
         let autostart = crate::system::service::is_enabled().ok();
-        let registration =
-            crate::system::service::load_optional_registration(&paths.registration())?;
+        let state = crate::system::record::DaemonRecord::load(paths)?;
         let endpoint = match &daemon {
             Some(status) => Some(status.docker_socket.clone()),
-            None => registration
+            None => state
                 .as_ref()
-                .map(|registration| registration.config.docker_socket.display().to_string()),
+                .map(|state| state.config.docker_socket.display().to_string()),
         };
-        let memory_bytes = registration
-            .as_ref()
-            .map(|registration| registration.config.memory_bytes);
+        let memory_bytes = state.as_ref().map(|state| state.config.memory_bytes);
         let state = match daemon.as_ref().map(|status| status.phase) {
             None | Some(DaemonPhase::Stopped) => "stopped",
             Some(DaemonPhase::Ready) => "ready",
@@ -344,26 +319,22 @@ fn format_host_memory_reclaim(
     text
 }
 
-async fn run_registered(path: std::path::PathBuf) -> eyre::Result<()> {
-    let registration = crate::system::service::load_registration(&path)?;
-    if std::env::current_exe()?.canonicalize()? != registration.executable {
+async fn run_service(path: std::path::PathBuf) -> eyre::Result<()> {
+    let state = crate::system::record::DaemonRecord::load_from(&path)?
+        .ok_or_else(|| eyre::eyre!("daemon state is missing: {}", path.display()))?;
+    if std::env::current_exe()?.canonicalize()? != state.service.executable {
         return Err(eyre::eyre!(
-            "registration executable identity does not match this process"
+            "state executable identity does not match this process"
         ));
     }
     let run_root = crate::system::ownership::default_system_paths()?.run_root;
-    let paths = registration.paths(run_root);
-    let installation = crate::system::record::load_record::<
-        crate::system::record::InstallationRecord,
-    >(&paths.installation())?
-    .ok_or_else(|| eyre::eyre!("registered installation record is missing"))?;
-    if installation.installation_id != registration.installation_id {
-        return Err(eyre::eyre!("registration installation identity mismatch"));
-    }
-    let networking = registration.global_config()?.networking;
-    let runtime = registration.runtime_config(&paths.run_root, &registration.config, networking);
+    let paths = state.service.paths(run_root);
+    let networking = state.service.global_config()?.networking;
+    let runtime = state
+        .service
+        .runtime_config(&paths.run_root, &state.config, networking);
     let mut api = crate::api::AppApi::local(runtime);
-    crate::system::supervisor::serve(&mut api, paths, registration.config).await
+    crate::system::supervisor::serve(&mut api, paths, state.config).await
 }
 
 async fn follow_logs(path: &std::path::Path) -> eyre::Result<()> {
@@ -392,7 +363,7 @@ async fn follow_logs(path: &std::path::Path) -> eyre::Result<()> {
 }
 
 async fn run_foreground(context: &mut Context) -> eyre::Result<()> {
-    let (paths, config) = context.resolved_system_config(None)?;
+    let (paths, config) = context.resolved_system_config()?;
     crate::system::docker::preflight(&config, false)?;
     let api = context
         .app_api_with_backend(config.backend.runtime_override())
@@ -413,8 +384,8 @@ mod tests {
             "silo",
             "daemon",
             "serve",
-            "--config",
-            "/tmp/registration.json"
+            "--state",
+            "/tmp/daemon.json"
         ])
         .is_ok());
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "down"]).is_ok());
@@ -430,7 +401,16 @@ mod tests {
         assert!(
             crate::app::Cli::try_parse_from(["silo", "daemon", "upgrade", "--recover"]).is_ok()
         );
-        assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "upgrade"]).is_err());
+        assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "upgrade"]).is_ok());
+        assert!(crate::app::Cli::try_parse_from([
+            "silo",
+            "daemon",
+            "upgrade",
+            "--recover",
+            "--image",
+            "registry.example/system@sha256:test"
+        ])
+        .is_err());
         assert!(
             crate::app::Cli::try_parse_from(["silo", "daemon", "balloon", "--target", "1GiB"])
                 .is_err()

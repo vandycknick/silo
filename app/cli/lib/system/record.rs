@@ -39,17 +39,11 @@ impl SystemPaths {
     pub(crate) fn daemon_data(&self) -> PathBuf {
         self.data_root.join("daemon")
     }
-    pub(crate) fn installation(&self) -> PathBuf {
-        self.daemon_data().join("installation.json")
-    }
-    pub(crate) fn system_record(&self) -> PathBuf {
-        self.daemon_data().join("system.json")
+    pub(crate) fn daemon(&self) -> PathBuf {
+        self.daemon_data().join("daemon.json")
     }
     pub(crate) fn data_image(&self) -> PathBuf {
         self.daemon_data().join("system/data.img")
-    }
-    pub(crate) fn registration(&self) -> PathBuf {
-        self.config_root.join("daemon/registration.json")
     }
     pub(crate) fn lifetime_lock(&self) -> PathBuf {
         self.daemon_data().join("daemon.lock")
@@ -57,11 +51,8 @@ impl SystemPaths {
     pub(crate) fn operation_lock(&self) -> PathBuf {
         self.daemon_data().join("operation.lock")
     }
-    pub(crate) fn owner(&self) -> PathBuf {
-        self.daemon_data().join("owner.json")
-    }
     pub(crate) fn status(&self) -> PathBuf {
-        self.run_root.join("daemon/status.json")
+        self.daemon_data().join("status.json")
     }
     pub(crate) fn log(&self) -> PathBuf {
         self.state_root.join("logs/daemon/daemon.log")
@@ -72,17 +63,11 @@ impl SystemPaths {
     pub(crate) fn native_log(&self) -> PathBuf {
         self.state_root.join("logs/daemon/native.log")
     }
-    pub(crate) fn upgrade(&self) -> PathBuf {
-        self.daemon_data().join("upgrade.json")
-    }
-    pub(crate) fn completed_upgrade(&self) -> PathBuf {
-        self.daemon_data().join("upgrade-completed.json")
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct InstallationRecord {
+pub(crate) struct DaemonRecord {
     pub(crate) schema: u32,
     pub(crate) installation_id: Uuid,
     pub(crate) data_uuid: Uuid,
@@ -90,20 +75,81 @@ pub(crate) struct InstallationRecord {
     pub(crate) data_size_bytes: u64,
     pub(crate) configured_image: String,
     pub(crate) config: ResolvedSystemConfig,
+    pub(crate) machine_id: Option<String>,
+    pub(crate) service: crate::system::service::ServiceConfig,
+    pub(crate) upgrade: Option<crate::system::upgrade::UpgradeRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SystemRecord {
-    pub(crate) schema: u32,
-    pub(crate) installation_id: Uuid,
-    pub(crate) engine: String,
-    pub(crate) active_machine_id: String,
-    pub(crate) image_reference: String,
-    pub(crate) image_digest: String,
-    pub(crate) data_uuid: Uuid,
-    pub(crate) data_layout: u32,
-    pub(crate) config_identity: String,
+impl DaemonRecord {
+    pub(crate) fn new(paths: &SystemPaths, config: ResolvedSystemConfig) -> eyre::Result<Self> {
+        Ok(Self {
+            schema: 1,
+            installation_id: Uuid::new_v4(),
+            data_uuid: Uuid::new_v4(),
+            data_layout: 1,
+            data_size_bytes: config.data_size_bytes,
+            configured_image: config.image.clone(),
+            config,
+            machine_id: None,
+            service: crate::system::service::ServiceConfig::new(paths)?,
+            upgrade: None,
+        })
+    }
+
+    pub(crate) fn load(paths: &SystemPaths) -> eyre::Result<Option<Self>> {
+        Self::load_from(&paths.daemon())
+    }
+
+    pub(crate) fn load_from(path: &Path) -> eyre::Result<Option<Self>> {
+        if !path.is_absolute() {
+            bail!("daemon state path must be absolute");
+        }
+        let record = load_record::<Self>(path)?;
+        if let Some(record) = &record {
+            record.validate()?;
+        }
+        Ok(record)
+    }
+
+    pub(crate) fn validate(&self) -> eyre::Result<()> {
+        if self.schema != 1 || self.data_layout != 1 {
+            bail!("unsupported daemon state schema or data layout");
+        }
+        if let Some(upgrade) = &self.upgrade {
+            upgrade.validate(self)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn save(&self, paths: &SystemPaths) -> eyre::Result<()> {
+        self.validate()?;
+        write_record(&paths.daemon(), self)
+    }
+
+    pub(crate) fn machine_id(&self) -> eyre::Result<&str> {
+        self.machine_id.as_deref().ok_or_else(|| {
+            eyre::eyre!("system VM has not been created yet; run `silo daemon up` to finish setup")
+        })
+    }
+
+    pub(crate) fn owns_machine(&self, id: &str) -> bool {
+        self.machine_id.as_deref() == Some(id)
+            || self
+                .upgrade
+                .as_ref()
+                .is_some_and(|upgrade| upgrade.owns_machine(id))
+    }
+
+    pub(crate) fn require_no_pending_upgrade(&self) -> eyre::Result<()> {
+        if self
+            .upgrade
+            .as_ref()
+            .is_some_and(|upgrade| !upgrade.is_complete())
+        {
+            bail!("a system image upgrade is pending; run `silo daemon upgrade --recover`");
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn load_record<T: DeserializeOwned>(path: &Path) -> eyre::Result<Option<T>> {
@@ -183,10 +229,68 @@ fn set_private_file(_path: &Path) -> eyre::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde::{Deserialize, Serialize};
 
-    use crate::system::record::{load_record, write_record};
+    use crate::system::record::{load_record, write_record, DaemonRecord, SystemPaths};
+
+    pub(crate) fn fixture(root: &std::path::Path) -> (SystemPaths, DaemonRecord) {
+        let paths = SystemPaths::new(
+            root.join("config"),
+            root.join("data"),
+            root.join("state"),
+            root.join("run"),
+            root.join("images"),
+        );
+        let config: crate::system::config::SystemConfig = serde_yaml_ng::from_str(
+            "version: '1'\nsystem:\n  image: registry.example/system@sha256:old\n",
+        )
+        .expect("config");
+        let mut config = config.resolve(root, None).expect("resolve");
+        config.data_size_bytes = 256 * 1024 * 1024;
+        let state = DaemonRecord::new(&paths, config).expect("state");
+        (paths, state)
+    }
+
+    #[test]
+    fn daemon_record_tracks_identity_not_vm_status_or_image_metadata() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (paths, mut state) = fixture(temp.path());
+        assert!(DaemonRecord::load(&paths).expect("load").is_none());
+        assert!(state.machine_id().is_err());
+        state.save(&paths).expect("save incomplete setup");
+        assert_eq!(
+            DaemonRecord::load(&paths).expect("load"),
+            Some(state.clone())
+        );
+        state.machine_id = Some("vm-1".to_string());
+        state.save(&paths).expect("save provisioned setup");
+        assert!(state.owns_machine("vm-1"));
+        assert!(!state.owns_machine("other"));
+        let json: serde_json::Value = load_record(&paths.daemon()).expect("json").expect("exists");
+        for field in [
+            "phase",
+            "status",
+            "image_digest",
+            "image_reference",
+            "config_identity",
+        ] {
+            assert!(json.get(field).is_none(), "redundant field {field}");
+        }
+        assert_eq!(
+            DaemonRecord::load(&paths).expect("load"),
+            Some(state.clone())
+        );
+        state.schema = 2;
+        assert!(state.save(&paths).is_err());
+        assert_eq!(
+            DaemonRecord::load(&paths)
+                .expect("original remains")
+                .expect("exists")
+                .schema,
+            1
+        );
+    }
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
