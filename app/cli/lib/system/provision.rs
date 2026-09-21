@@ -471,7 +471,6 @@ mod tests {
                 "data_size_bytes": 1073741824,
                 "shares": [],
                 "publish_bind": "any",
-                "compatibility_socket": "disabled",
                 "docker_socket": "/tmp/silo.sock",
                 "backend": "vz",
                 "rosetta": true,

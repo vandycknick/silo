@@ -6,14 +6,13 @@ use std::os::unix::fs::FileTypeExt as _;
 
 use eyre::{bail, Context as _};
 
-use crate::system::config::{CompatibilitySocket, ResolvedSystemConfig};
+use crate::system::config::ResolvedSystemConfig;
 
 const CONTEXT_NAME: &str = "silo";
 
 pub(crate) fn preflight(config: &ResolvedSystemConfig, daemon_live: bool) -> eyre::Result<()> {
     validate_socket_length(&config.docker_socket)?;
     ensure_owned_socket_parent(&config.docker_socket)?;
-    ensure_compatibility_socket(config)?;
     let metadata = match std::fs::symlink_metadata(&config.docker_socket) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -36,7 +35,6 @@ pub(crate) fn preflight(config: &ResolvedSystemConfig, daemon_live: bool) -> eyr
 }
 
 pub(crate) fn integrate(config: &ResolvedSystemConfig, switch_context: bool) -> eyre::Result<()> {
-    ensure_compatibility_socket(config)?;
     if let Some(value) = std::env::var_os("DOCKER_CONFIG") {
         let path = Path::new(&value);
         if !path.is_absolute() {
@@ -117,40 +115,6 @@ pub(crate) fn integrate(config: &ResolvedSystemConfig, switch_context: bool) -> 
         )?;
     }
     Ok(())
-}
-
-fn ensure_compatibility_socket(config: &ResolvedSystemConfig) -> eyre::Result<()> {
-    if config.compatibility_socket == CompatibilitySocket::Disabled {
-        return Ok(());
-    }
-    let alias = config.docker_socket.with_file_name("docker.sock");
-    match std::fs::symlink_metadata(&alias) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            if std::fs::read_link(&alias)? == Path::new("silo.sock") {
-                return Ok(());
-            }
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink("silo.sock", &alias)?;
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
-    }
-    let message = format!(
-        "compatibility Docker socket {} is foreign; canonical endpoint remains unix://{}",
-        alias.display(),
-        config.docker_socket.display()
-    );
-    match config.compatibility_socket {
-        CompatibilitySocket::Auto => {
-            eprintln!("warning: {message}");
-            Ok(())
-        }
-        CompatibilitySocket::Required => bail!(message),
-        CompatibilitySocket::Disabled => Ok(()),
-    }
 }
 
 fn ensure_owned_socket_parent(socket: &Path) -> eyre::Result<()> {
@@ -247,47 +211,51 @@ fn stderr(output: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::system::config::CompatibilitySocket;
-    use crate::system::docker::{ensure_compatibility_socket, validate_socket_length};
+    use crate::system::docker::{preflight, validate_socket_length};
 
-    fn config(
-        socket: std::path::PathBuf,
-        policy: CompatibilitySocket,
-    ) -> crate::system::config::ResolvedSystemConfig {
-        crate::system::config::ResolvedSystemConfig {
-            schema: 1,
-            engine: crate::system::config::EngineKind::Docker,
-            image: "image".to_string(),
-            cpus: 1,
-            memory_bytes: 1,
-            root_size_bytes: 1,
-            data_size_bytes: 1,
-            shares: Vec::new(),
-            publish_bind: libvm::PublishBind::Loopback,
-            compatibility_socket: policy,
-            docker_socket: socket,
-            backend: crate::system::config::SystemBackend::Vz,
-            rosetta: false,
-            rosetta_explicit: false,
-            memory_reclaim: (),
-            legacy_host_reclaim: (),
-            memory_reclaim_after_secs: (),
-            identity: "test".to_string(),
-        }
+    fn config(home: &std::path::Path) -> crate::system::config::ResolvedSystemConfig {
+        let config: crate::system::config::SystemConfig = serde_yaml_ng::from_str(
+            "version: '1'\nsystem:\n  image: registry.example/system@sha256:test\n",
+        )
+        .expect("config");
+        config.resolve(home, None).expect("resolve")
     }
 
     #[test]
-    fn compatibility_alias_never_replaces_foreign_entries() {
+    fn preflight_creates_socket_directories_without_a_compatibility_alias() {
         let temp = tempfile::tempdir().expect("temp");
-        let socket = temp.path().join("silo.sock");
-        let alias = temp.path().join("docker.sock");
-        std::fs::write(&alias, "foreign").expect("fixture");
-        let required = config(socket.clone(), CompatibilitySocket::Required);
-        assert!(ensure_compatibility_socket(&required).is_err());
-        assert_eq!(std::fs::read_to_string(&alias).expect("read"), "foreign");
-        let automatic = config(socket, CompatibilitySocket::Auto);
-        ensure_compatibility_socket(&automatic).expect("auto continues");
-        assert_eq!(std::fs::read_to_string(alias).expect("read"), "foreign");
+        let mut config = config(temp.path());
+        config.docker_socket = temp.path().join("docker/run/silo.sock");
+        preflight(&config, false).expect("preflight");
+        preflight(&config, false).expect("repeat preflight");
+        assert!(temp.path().join("docker/run").is_dir());
+        assert!(std::fs::symlink_metadata(temp.path().join("docker/run/docker.sock")).is_err());
+    }
+
+    #[test]
+    fn preflight_leaves_existing_docker_socket_entries_untouched() {
+        for symlink in [false, true] {
+            let temp = tempfile::tempdir().expect("temp");
+            let mut config = config(temp.path());
+            let run = temp.path().join("docker/run");
+            std::fs::create_dir_all(&run).expect("directories");
+            let alias = run.join("docker.sock");
+            if symlink {
+                std::os::unix::fs::symlink("silo.sock", &alias).expect("existing symlink");
+            } else {
+                std::fs::write(&alias, "foreign").expect("existing file");
+            }
+            config.docker_socket = run.join("silo.sock");
+            preflight(&config, false).expect("preflight");
+            if symlink {
+                assert_eq!(
+                    std::fs::read_link(&alias).expect("symlink"),
+                    std::path::Path::new("silo.sock")
+                );
+            } else {
+                assert_eq!(std::fs::read_to_string(&alias).expect("file"), "foreign");
+            }
+        }
     }
 
     #[test]

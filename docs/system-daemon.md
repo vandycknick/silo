@@ -46,8 +46,6 @@ daemon:
       additional: []
     networking:
       publish-bind: any
-    docker:
-      compatibility-socket: auto
     # rosetta: true
 ```
 
@@ -103,12 +101,8 @@ supported after installation. CPU, memory, and Rosetta changes are applied
 the next time the daemon starts the VM from stopped (`silo daemon down`, then
 `up`). Image changes use the explicit upgrade command.
 
-`compatibility-socket` accepts:
-
-- `auto`: create `~/.docker/run/docker.sock -> silo.sock` when that path is free;
-  warn and continue through the dedicated context on conflict.
-- `disabled`: never create the compatibility alias.
-- `required`: fail `up` if the alias is foreign or unavailable.
+The Docker context points directly to `~/.docker/run/silo.sock`. Silo does not
+create or modify `~/.docker/run/docker.sock`, including any existing symlink.
 
 Silo never removes a foreign file, symlink, socket, Docker context, systemd unit,
 or LaunchAgent. A dead socket is not assumed to be owned merely because it does
@@ -126,7 +120,9 @@ silo daemon down
 `up` installs/enables the per-user native service and waits for guest, engine,
 and host-socket readiness. It creates or validates the `silo` Docker context and
 selects it unless `--no-switch-context` is passed. Native service restarts never
-change the active Docker context.
+change the active Docker context. Silo invokes `docker context create` and
+`docker context use`; Docker itself writes the context metadata and updates
+`config.json`. Silo does not edit those files directly.
 
 `DOCKER_CONFIG` selects where the Docker CLI stores context metadata and must be
 absolute. `DOCKER_HOST` and `DOCKER_CONTEXT` override the active context; Silo

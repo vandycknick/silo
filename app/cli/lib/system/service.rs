@@ -737,7 +737,6 @@ mod tests {
                 "data_size_bytes": 1073741824,
                 "shares": [],
                 "publish_bind": "any",
-                "compatibility_socket": "disabled",
                 "docker_socket": "/tmp/silo.sock",
                 "backend": "vz",
                 "host_memory_reclaim": true,
@@ -834,7 +833,6 @@ mod tests {
             "data_size_bytes": 1073741824,
             "shares": [],
             "publish_bind": "any",
-            "compatibility_socket": "auto",
             "docker_socket": "/Users/me/.docker/run/silo.sock",
             "identity": "fnv1a64:0"
         }))

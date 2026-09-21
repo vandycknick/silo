@@ -80,8 +80,6 @@ pub(crate) struct SystemOptions {
     pub(crate) mounts: SystemMounts,
     #[serde(default)]
     pub(crate) networking: SystemNetworking,
-    #[serde(default)]
-    pub(crate) docker: DockerIntegration,
     /// Rosetta translation for x86_64 containers. Unset means on when the host is
     /// Apple silicon with Rosetta installed, off otherwise.
     #[serde(default)]
@@ -97,7 +95,6 @@ impl Default for SystemOptions {
             storage: SystemStorage::default(),
             mounts: SystemMounts::default(),
             networking: SystemNetworking::default(),
-            docker: DockerIntegration::default(),
             rosetta: None,
         }
     }
@@ -192,30 +189,6 @@ impl Default for SystemNetworking {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DockerIntegration {
-    #[serde(default, rename = "compatibility-socket")]
-    pub(crate) compatibility_socket: CompatibilitySocket,
-}
-
-impl Default for DockerIntegration {
-    fn default() -> Self {
-        Self {
-            compatibility_socket: CompatibilitySocket::Auto,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum CompatibilitySocket {
-    #[default]
-    Auto,
-    Disabled,
-    Required,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResolvedSystemConfig {
@@ -228,7 +201,6 @@ pub(crate) struct ResolvedSystemConfig {
     pub(crate) data_size_bytes: u64,
     pub(crate) shares: Vec<ResolvedShare>,
     pub(crate) publish_bind: PublishBind,
-    pub(crate) compatibility_socket: CompatibilitySocket,
     pub(crate) docker_socket: PathBuf,
     #[serde(default = "SystemBackend::legacy_record_default")]
     pub(crate) backend: SystemBackend,
@@ -390,7 +362,6 @@ impl SystemConfig {
             data_size_bytes,
             shares,
             publish_bind: self.system.networking.publish_bind,
-            compatibility_socket: self.system.docker.compatibility_socket,
             docker_socket,
             backend,
             rosetta,
@@ -498,7 +469,7 @@ const fn default_publish_bind() -> PublishBind {
 
 #[cfg(test)]
 mod tests {
-    use crate::system::config::{CompatibilitySocket, SystemBackend, SystemConfig};
+    use crate::system::config::{SystemBackend, SystemConfig};
 
     #[test]
     fn strict_config_resolves_home_and_defaults() {
@@ -538,7 +509,6 @@ mod tests {
             .expect("adopt sizes");
         assert_eq!(pinned.data_size_bytes, 64 << 30);
         assert_ne!(pinned.identity, resolved.identity);
-        assert_eq!(resolved.compatibility_socket, CompatibilitySocket::Auto);
         assert_eq!(resolved.backend, SystemBackend::Krun);
         assert!(!resolved.rosetta);
         assert!(!resolved.rosetta_explicit);
@@ -558,7 +528,6 @@ mod tests {
                 "data_size_bytes": 1073741824,
                 "shares": [],
                 "publish_bind": "any",
-                "compatibility_socket": "disabled",
                 "docker_socket": "/tmp/silo.sock",
                 "rosetta": true,
                 "identity": "fnv1a64:test"
