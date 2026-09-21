@@ -184,15 +184,17 @@ async fn run(
     let startup_cancel = tokio_util::sync::CancellationToken::new();
     let pid_guard = PidGuard::create(&args.pidfile).await?;
     let mut parent_loss_monitor = Some(sync_reporter.monitor_parent_loss(startup_cancel.clone())?);
-    let mut signal_task = match spawn_startup_signal_handler(startup_cancel.clone()) {
-        Ok(task) => Some(task),
-        Err(error) => {
-            if let Some(monitor) = parent_loss_monitor.take() {
-                monitor.shutdown().await;
+    let primary_machine = startup::PrimaryMachine::default();
+    let mut signal_task =
+        match spawn_startup_signal_handler(startup_cancel.clone(), primary_machine.clone()) {
+            Ok(task) => Some(task),
+            Err(error) => {
+                if let Some(monitor) = parent_loss_monitor.take() {
+                    monitor.shutdown().await;
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
 
     let (exec_log, _exec_log_guard) = match machine_log_dir {
         Some(fd) => match crate::exec_log::ExecLogDirectory::from_fd(fd)
@@ -213,9 +215,9 @@ async fn run(
         network_args: &args.network,
         agent_enabled: args.agent_enabled,
         serial_file,
+        primary_machine: &primary_machine,
     };
-    let mut primary_machine = None;
-    let result = match startup::init(
+    let mut result = match startup::init(
         &runtime,
         startup_inputs,
         &mut start_request,
@@ -224,7 +226,6 @@ async fn run(
     .await
     {
         Ok(initialized) => {
-            primary_machine = Some(initialized.context.machine.clone());
             match services::start_services(
                 &runtime,
                 &initialized.context,
@@ -270,6 +271,19 @@ async fn run(
         }
         Err(err) => Err(err),
     };
+    if result.is_err() {
+        if let Some(machine) = primary_machine.get() {
+            if let Err(error) = machine.stop().await {
+                result = Err(eyre::eyre!(
+                    "{}; primary VM finalization failed: {error}",
+                    result
+                        .err()
+                        .map(|error| format_error_chain(&error))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+    }
     if let Some(task) = signal_task.take() {
         task.abort();
         let _ = task.await;
@@ -291,7 +305,7 @@ async fn run(
     } else {
         ExitOutcome::Clean
     };
-    let vm_exit = match primary_machine {
+    let vm_exit = match primary_machine.get() {
         Some(machine) => match machine.try_wait().await {
             Ok(exit) => exit,
             Err(error) => {
@@ -329,6 +343,7 @@ async fn run(
 
 fn spawn_startup_signal_handler(
     cancelled: tokio_util::sync::CancellationToken,
+    primary_machine: startup::PrimaryMachine,
 ) -> eyre::Result<tokio::task::JoinHandle<()>> {
     #[cfg(unix)]
     {
@@ -337,9 +352,20 @@ fn spawn_startup_signal_handler(
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         Ok(tokio::spawn(async move {
-            tokio::select! {
-                _ = interrupt.recv() => cancelled.cancel(),
-                _ = terminate.recv() => cancelled.cancel(),
+            loop {
+                tokio::select! {
+                    _ = interrupt.recv() => {},
+                    _ = terminate.recv() => {},
+                }
+                if cancelled.is_cancelled() {
+                    if let Some(machine) = primary_machine.get() {
+                        if let Err(error) = machine.force_stop().await {
+                            tracing::warn!(%error, "startup force-stop failed");
+                        }
+                    }
+                } else {
+                    cancelled.cancel();
+                }
             }
         }))
     }

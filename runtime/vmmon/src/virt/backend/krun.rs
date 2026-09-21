@@ -38,6 +38,7 @@ pub(crate) struct KrunBackend {
     state: watch::Sender<owner::Snapshot>,
     runtime: Arc<AsyncMutex<Option<RunningKrun>>>,
     vsock_registry: KrunVsockRegistry,
+    session: Arc<KrunVsockSession>,
     host_memory_reclaim: watch::Sender<Option<HostMemoryReclaimReport>>,
     stop: CancellationToken,
     force: CancellationToken,
@@ -47,7 +48,6 @@ pub(crate) struct KrunBackend {
 
 struct RunningKrun {
     mux: mux::KrunVsockMux,
-    session: Arc<KrunVsockSession>,
 }
 
 #[derive(Clone, Copy)]
@@ -135,11 +135,6 @@ impl KrunVsockRegistry {
         admission: VsockListenerAdmission,
         session: Arc<KrunVsockSession>,
     ) -> Result<VsockListener, VirtError> {
-        if !session.is_active() {
-            return Err(VirtError::Backend(
-                "krun vsock frontend stopped while registering listener".to_string(),
-            ));
-        }
         let (sender, receiver) = mpsc::channel(MAX_ACTIVE_VSOCK_CONNECTIONS);
         let registration;
         {
@@ -147,6 +142,11 @@ impl KrunVsockRegistry {
                 .listeners
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            if !session.is_active() {
+                return Err(VirtError::Backend(
+                    "krun vsock frontend stopped while registering listener".to_string(),
+                ));
+            }
             if listeners
                 .get(&port)
                 .is_some_and(|listener| listener.session.is_active())
@@ -227,6 +227,7 @@ impl KrunBackend {
             state: watch::Sender::new(owner::Snapshot::default()),
             runtime: Arc::new(AsyncMutex::new(None)),
             vsock_registry: KrunVsockRegistry::default(),
+            session: KrunVsockSession::new(),
             host_memory_reclaim: watch::Sender::new(None),
             stop: CancellationToken::new(),
             force: CancellationToken::new(),
@@ -251,6 +252,8 @@ impl KrunBackend {
 impl Drop for KrunBackend {
     fn drop(&mut self) {
         self.stop.cancel();
+        self.session.shutdown();
+        self.vsock_registry.fence_session(&self.session);
     }
 }
 
@@ -270,6 +273,7 @@ impl VirtBackend for KrunBackend {
         let config = self.config.clone();
         let runtime = self.runtime.clone();
         let registry = self.vsock_registry.clone();
+        let session = self.session.clone();
         let console = self
             .console
             .lock()
@@ -289,13 +293,9 @@ impl VirtBackend for KrunBackend {
                 let console = console.ok_or_else(|| {
                     VirtError::Backend("krun console already consumed".to_string())
                 })?;
-                let session = KrunVsockSession::new();
                 let (mux, task, child_mux) =
                     mux::KrunVsockMux::pair(registry.clone(), session.clone(), &[])?;
-                *runtime.lock().await = Some(RunningKrun {
-                    mux: mux.clone(),
-                    session: session.clone(),
-                });
+                *runtime.lock().await = Some(RunningKrun { mux: mux.clone() });
                 let exit = owner.run(launch, console, child_mux).await;
                 session.shutdown();
                 registry.fence_session(&session);
@@ -307,9 +307,12 @@ impl VirtBackend for KrunBackend {
                 Ok::<_, VirtError>(exit)
             }
             .await;
+            session.shutdown();
+            registry.fence_session(&session);
             let exit = result.unwrap_or_else(|error| VmExit::StoppedWithError(error.to_string()));
             owner.state.send_replace(owner::Snapshot {
                 started: false,
+                reaped: true,
                 exit: Some(exit),
             });
         });
@@ -335,12 +338,15 @@ impl VirtBackend for KrunBackend {
     async fn stop(&self) -> Result<(), VirtError> {
         self.stop.cancel();
         if self.attempt.reserve() {
+            self.session.shutdown();
+            self.vsock_registry.fence_session(&self.session);
             self.console
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
             self.state.send_replace(owner::Snapshot {
                 started: false,
+                reaped: false,
                 exit: Some(VmExit::Stopped),
             });
         }
@@ -357,6 +363,11 @@ impl VirtBackend for KrunBackend {
     }
     async fn try_wait(&self) -> Result<Option<VmExit>, VirtError> {
         Ok(self.state.borrow().exit.clone())
+    }
+
+    async fn is_terminated(&self) -> Result<bool, VirtError> {
+        let state = self.state.borrow();
+        Ok(state.reaped || state.exit.is_some())
     }
 
     async fn connect_vsock(&self, port: u32, lease: VsockLease) -> Result<VsockStream, VirtError> {
@@ -386,17 +397,13 @@ impl VirtBackend for KrunBackend {
         port: u32,
         admission: VsockListenerAdmission,
     ) -> Result<VsockListener, VirtError> {
-        let session = {
-            let runtime = self.runtime.lock().await;
-            runtime
-                .as_ref()
-                .ok_or_else(|| VirtError::NotRunning {
-                    name: self.config.name().to_string(),
-                })?
-                .session
-                .clone()
-        };
-        self.vsock_registry.register(port, admission, session)
+        if self.stop.is_cancelled() || self.is_terminated().await? {
+            return Err(VirtError::NotRunning {
+                name: self.config.name().to_string(),
+            });
+        }
+        self.vsock_registry
+            .register(port, admission, self.session.clone())
     }
 
     fn host_memory_reclaim_updates(
@@ -695,7 +702,21 @@ mod tests {
                 .build(),
         )
         .expect("backend");
+        let capacity = VsockCapacity::new("pre-start-forward");
+        let mut listener = backend
+            .listen_vsock(
+                1028,
+                capacity.listener(crate::virt::capacity::ListenerAdmissionClass::Internal),
+            )
+            .await
+            .expect("register before native startup");
         backend.stop().await.expect("stop before start");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("fenced listener")
+                .is_err()
+        );
         assert!(backend.start().await.is_err());
         let (first, second) = tokio::join!(backend.wait(), backend.wait());
         assert_eq!(first.expect("first"), second.expect("second"));

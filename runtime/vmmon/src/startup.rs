@@ -211,7 +211,28 @@ impl ParentLossMonitor {
     }
 }
 
+/// Retains the primary VM even when initialization returns before a context exists.
+#[derive(Clone, Default)]
+pub(crate) struct PrimaryMachine(Arc<std::sync::Mutex<Option<VirtualMachine>>>);
+
+impl PrimaryMachine {
+    pub(crate) fn get(&self) -> Option<VirtualMachine> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set(&self, machine: VirtualMachine) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(machine);
+    }
+}
+
 pub(crate) struct InitInputs<'a> {
+    pub(crate) primary_machine: &'a PrimaryMachine,
     pub(crate) machine_id: &'a str,
     pub(crate) machine_run_id: &'a str,
     pub(crate) name: &'a str,
@@ -242,8 +263,13 @@ pub async fn init(
         network_args,
         agent_enabled,
         serial_file,
+        primary_machine,
     } = inputs;
-    let start_request = start_request.read(machine_id, machine_run_id).await?;
+    let start_request = tokio::select! {
+        biased;
+        () = startup_cancel.cancelled() => return Err(eyre::eyre!("startup cancelled before launch request")),
+        result = start_request.read(machine_id, machine_run_id) => result?,
+    };
     let startup_deadline = tokio::time::Instant::now()
         + std::time::Duration::from_millis(start_request.effective_startup_budget_ms());
     let spec = load_spec(runtime)?;
@@ -313,6 +339,7 @@ pub async fn init(
         start_request.virt_backend.as_ref(),
         machine_config.config,
     )?;
+    primary_machine.set(machine.clone());
     let serial_console = machine.serial();
     serial_console
         .add_sink(tokio::fs::File::from_std(serial_file))
@@ -336,36 +363,55 @@ pub async fn init(
     ));
 
     store.set_vm_state(VmState::Starting, "vm starting")?;
-    forwards.register_outbound(&machine).await?;
+    let registration = tokio::select! {
+        biased;
+        () = startup_cancel.cancelled() => Err(eyre::eyre!("forward registration cancelled")),
+        () = tokio::time::sleep_until(startup_deadline) => Err(eyre::eyre!("forward registration exceeded startup deadline")),
+        result = forwards.register_outbound(&machine) => result,
+    };
+    if let Err(error) = registration {
+        return Err(cleanup_primary_start_failure(&machine, &forwards, error).await);
+    }
     tracing::info!(
         event = "primary_vm_spawn",
         "starting primary VM after probe release"
     );
     let start_result = tokio::select! {
-        result = tokio::time::timeout_at(startup_deadline, machine.start()) => {
-            match result {
-                Ok(result) => result.map_err(eyre::Report::from),
-                Err(_) => Err(eyre::eyre!("primary VM startup deadline expired")),
-            }
-        }
-        () = startup_cancel.cancelled() => {
-            Err(eyre::eyre!("primary VM startup cancelled"))
-        }
+        biased;
+        () = startup_cancel.cancelled() => Err(eyre::eyre!("primary VM startup cancelled")),
+        () = tokio::time::sleep_until(startup_deadline) => Err(eyre::eyre!("primary VM startup deadline expired")),
+        result = machine.start() => result.map_err(eyre::Report::from),
     };
     if let Err(error) = start_result {
         return Err(cleanup_primary_start_failure(&machine, &forwards, error).await);
     }
+    if let Err(error) = machine.ensure_alive().await {
+        return Err(cleanup_primary_start_failure(&machine, &forwards, error.into()).await);
+    }
     let vsock_surface = match prepared_vsock {
-        Some(prepared) => match prepared.activate(machine.clone(), forwards.clone()).await {
-            Ok(surface) => Some(surface),
-            Err(error) => {
-                return Err(cleanup_primary_start_failure(&machine, &forwards, error).await);
+        Some(prepared) => {
+            let activation = tokio::select! {
+                biased;
+                exit = machine.wait() => Err(eyre::eyre!("primary VM exited during vsock activation: {exit:?}")),
+                () = startup_cancel.cancelled() => Err(eyre::eyre!("vsock activation cancelled")),
+                () = tokio::time::sleep_until(startup_deadline) => Err(eyre::eyre!("vsock activation exceeded startup deadline")),
+                result = prepared.activate(machine.clone(), forwards.clone()) => result,
+            };
+            match activation {
+                Ok(surface) => Some(surface),
+                Err(error) => {
+                    return Err(cleanup_primary_start_failure(&machine, &forwards, error).await)
+                }
             }
-        },
+        }
         None => None,
     };
     forwards.activate(machine.clone());
     publish_host_memory_reclaim(&machine, &store);
+    if let Err(error) = machine.ensure_alive().await {
+        drop(vsock_surface);
+        return Err(cleanup_primary_start_failure(&machine, &forwards, error.into()).await);
+    }
     if let Err(error) = store.set_vm_state(VmState::Running, "vm running") {
         drop(vsock_surface);
         return Err(cleanup_primary_start_failure(&machine, &forwards, error.into()).await);
@@ -821,6 +867,7 @@ mod tests {
         let result = init(
             &runtime,
             InitInputs {
+                primary_machine: &crate::startup::PrimaryMachine::default(),
                 machine_id: &machine_id,
                 machine_run_id: &run_id,
                 name: "ordering-test",
@@ -920,6 +967,7 @@ mod tests {
         let result = init(
             &runtime,
             InitInputs {
+                primary_machine: &crate::startup::PrimaryMachine::default(),
                 machine_id,
                 machine_run_id: run_id,
                 name: "start-order-test",

@@ -1,4 +1,4 @@
-use std::io::{self, BufRead};
+use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -191,22 +191,18 @@ async fn wait_for_start(
     deadline_duration: Duration,
 ) -> Result<(), LibVmError> {
     let trace_path = trace_path.to_path_buf();
-    let result = tokio::time::timeout(
-        deadline_duration,
-        tokio::task::spawn_blocking(move || read_syncpipe(syncpipe)),
-    )
-    .await
-    .map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "vmmon syncpipe did not report readiness in {:?} (hint: see {})",
-                deadline_duration,
-                trace_path.display(),
-            ),
-        )
-    })?
-    .map_err(|err| io::Error::other(format!("join vmmon syncpipe wait task: {err}")))??;
+    let result = tokio::time::timeout(deadline_duration, read_syncpipe(syncpipe))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "vmmon syncpipe did not report readiness in {:?} (hint: see {})",
+                    deadline_duration,
+                    trace_path.display(),
+                ),
+            )
+        })??;
 
     startup_result(result)
 }
@@ -270,10 +266,20 @@ async fn write_start_request(startpipe: OwnedFd, encoded: &[u8]) -> io::Result<(
     Ok(())
 }
 
-fn read_syncpipe(syncpipe: OwnedFd) -> io::Result<StartupResult> {
+async fn read_syncpipe(syncpipe: OwnedFd) -> io::Result<StartupResult> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    const MAX_RESULT_BYTES: usize = 128 * 1024;
+    let reader = tokio::net::unix::pipe::Receiver::from_owned_fd(syncpipe)?;
     let mut input = String::new();
-    let mut file = std::fs::File::from(syncpipe);
-    std::io::BufReader::new(&mut file).read_line(&mut input)?;
+    tokio::io::BufReader::new(reader.take((MAX_RESULT_BYTES + 1) as u64))
+        .read_line(&mut input)
+        .await?;
+    if input.len() > MAX_RESULT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vmmon startup result exceeds byte limit",
+        ));
+    }
 
     if input == "started\n" {
         return Ok(StartupResult::Started);
@@ -534,21 +540,35 @@ mod tests {
         )
     }
 
-    #[test]
-    fn read_syncpipe_accepts_started_message() {
+    #[tokio::test]
+    async fn cancelling_startup_result_read_closes_the_pipe() {
+        let (reader, writer) = nix::unistd::pipe().expect("startup pipe");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), read_syncpipe(reader))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            nix::unistd::write(&writer, b"started\n"),
+            Err(nix::errno::Errno::EPIPE)
+        );
+    }
+
+    #[tokio::test]
+    async fn read_syncpipe_accepts_started_message() {
         let (read_fd, write_fd) = pipe().expect("create pipe");
         let mut write_file = std::fs::File::from(write_fd);
         write_file.write_all(b"started\n").expect("write started");
         drop(write_file);
 
         assert!(matches!(
-            read_syncpipe(read_fd).expect("read syncpipe"),
+            read_syncpipe(read_fd).await.expect("read syncpipe"),
             StartupResult::Started
         ));
     }
 
-    #[test]
-    fn read_syncpipe_accepts_failed_message() {
+    #[tokio::test]
+    async fn read_syncpipe_accepts_failed_message() {
         let (read_fd, write_fd) = pipe().expect("create pipe");
         let mut write_file = std::fs::File::from(write_fd);
         write_file
@@ -557,13 +577,13 @@ mod tests {
         drop(write_file);
 
         assert!(matches!(
-            read_syncpipe(read_fd).expect("read syncpipe"),
+            read_syncpipe(read_fd).await.expect("read syncpipe"),
             StartupResult::Failed(message) if message == "krun exploded"
         ));
     }
 
-    #[test]
-    fn read_syncpipe_accepts_structured_startup_command_launch_failure() {
+    #[tokio::test]
+    async fn read_syncpipe_accepts_structured_startup_command_launch_failure() {
         let (read_fd, write_fd) = pipe().expect("create pipe");
         let mut write_file = std::fs::File::from(write_fd);
         write_file
@@ -572,7 +592,7 @@ mod tests {
         drop(write_file);
 
         assert!(matches!(
-            read_syncpipe(read_fd).expect("read syncpipe"),
+            read_syncpipe(read_fd).await.expect("read syncpipe"),
             StartupResult::StartupCommandLaunchFailed { reason: Some(1), message: Some(message) }
                 if message == "missing"
         ));

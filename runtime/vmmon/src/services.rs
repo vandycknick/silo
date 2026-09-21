@@ -265,6 +265,7 @@ pub async fn start_services(
         deadline: startup_deadline,
         cancelled: startup_cancel,
     } = startup;
+    ctx.machine.ensure_alive().await?;
     let path = runtime.socket().to_path_buf();
     let listener = UnixListener::bind(&path).context(format!("bind socket {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
@@ -404,6 +405,9 @@ pub async fn start_services(
 
     let mut guest_monitor = if ctx.guest_services_enabled {
         let guest_start = tokio::select! {
+            biased;
+            exit = ctx.machine.wait() => Err(eyre::eyre!("primary VM exited during guest service startup: {exit:?}")),
+            () = startup_cancel.cancelled() => Err(eyre::eyre!("guest service startup cancelled")),
             result = tokio::time::timeout_at(
                 startup_deadline,
                 spawn_guest_services(
@@ -416,7 +420,6 @@ pub async fn start_services(
                 Ok(result) => result,
                 Err(_) => Err(eyre::eyre!("guest service startup exceeded the original startup deadline")),
             },
-            () = startup_cancel.cancelled() => Err(eyre::eyre!("guest service startup cancelled")),
         };
         match guest_start {
             Ok(task) => Some(task),
@@ -460,12 +463,14 @@ pub async fn start_services(
     let mut startup_command = match startup_command {
         Some(crate::execution::StartupCommandHandle { task, started }) => {
             let started = tokio::select! {
+                biased;
+                exit = ctx.machine.wait() => Err(eyre::eyre!("primary VM exited before startup command readiness: {exit:?}")),
+                () = startup_cancel.cancelled() => Err(eyre::eyre!("startup command launch cancelled")),
                 result = tokio::time::timeout_at(startup_deadline, started) => match result {
                     Ok(Ok(result)) => Ok(result),
                     Ok(Err(_)) => Err(eyre::eyre!("startup command supervisor ended before reporting Started")),
                     Err(_) => Err(eyre::eyre!("startup command launch exceeded the original startup deadline")),
                 },
-                () = startup_cancel.cancelled() => Err(eyre::eyre!("startup command launch cancelled")),
             };
             match started {
                 Ok(Ok(())) => Some(task),
@@ -515,6 +520,27 @@ pub async fn start_services(
         guest_services_enabled = ctx.guest_services_enabled,
         "vmmon gRPC control plane is serving"
     );
+    let ready = if startup_cancel.is_cancelled() {
+        Err(eyre::eyre!(
+            "startup cancelled before readiness publication"
+        ))
+    } else if tokio::time::Instant::now() >= startup_deadline {
+        Err(eyre::eyre!(
+            "startup deadline elapsed before readiness publication"
+        ))
+    } else {
+        ctx.machine.ensure_alive().await.map_err(eyre::Report::from)
+    };
+    if let Err(error) = ready {
+        cleanup_failed_service_start(
+            &server_shutdown,
+            &mut control_socket,
+            &mut guest_monitor,
+            &mut startup_command,
+        )
+        .await;
+        return Err(error);
+    }
     if let Err(error) = sync_reporter.report_started() {
         cleanup_failed_service_start(
             &server_shutdown,
@@ -562,6 +588,7 @@ async fn wait_for_required_guest_ready(
 ) -> eyre::Result<()> {
     let mut changed = ctx.store.subscribe();
     loop {
+        ctx.machine.ensure_alive().await?;
         match ctx.store.readiness()? {
             WaitOutcome::Ready => return Ok(()),
             WaitOutcome::Terminal => {
@@ -578,7 +605,7 @@ async fn wait_for_required_guest_ready(
                     .map_err(|_| eyre::eyre!("required guest readiness owner stopped"))?;
             }
             exit = ctx.machine.wait() => {
-                return Err(eyre::eyre!("primary helper exited before required guest readiness: {:?}", exit?));
+                return Err(eyre::eyre!("primary VM exited before required guest readiness: {:?}", exit?));
             }
             () = cancelled.cancelled() => return Err(eyre::eyre!("required guest readiness cancelled")),
         }

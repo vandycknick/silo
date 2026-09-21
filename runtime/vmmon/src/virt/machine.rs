@@ -211,6 +211,19 @@ impl VirtualMachine {
         self.inner.backend.try_wait().await
     }
 
+    /// Fence readiness publication as soon as death is observed, including
+    /// while the backend is draining its immutable terminal report.
+    pub(crate) async fn ensure_alive(&self) -> Result<(), VirtError> {
+        if self.inner.backend.is_terminated().await? {
+            let exit = self.wait().await?;
+            return Err(VirtError::Backend(format!(
+                "primary VM exited before readiness: {}",
+                exit.error().unwrap_or_else(|| "stopped".to_string())
+            )));
+        }
+        Ok(())
+    }
+
     pub fn serial(&self) -> Arc<SerialConsole> {
         self.inner.serial_console.clone()
     }

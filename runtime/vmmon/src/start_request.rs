@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::os::fd::{FromRawFd, RawFd};
 
 use serde::{Deserialize, Serialize};
@@ -114,13 +114,14 @@ impl StartRequestPipe {
             event = "start_request_wait",
             "waiting for vmmon start request"
         );
-        let expected_machine_id = expected_machine_id.to_string();
-        let expected_machine_run_id = expected_machine_run_id.to_string();
-        let request = tokio::task::spawn_blocking(move || {
-            read_start_request(file, &expected_machine_id, &expected_machine_run_id)
-        })
-        .await
-        .map_err(|error| io::Error::other(format!("join start request reader: {error}")))??;
+        use tokio::io::AsyncReadExt;
+        let reader = tokio::net::unix::pipe::Receiver::from_owned_fd(file.into())?;
+        let mut encoded = Vec::new();
+        reader
+            .take((VMMON_START_REQUEST_MAX_BYTES + 1) as u64)
+            .read_to_end(&mut encoded)
+            .await?;
+        let request = decode_start_request(&encoded, expected_machine_id, expected_machine_run_id)?;
         tracing::info!(
             event = "start_request_accepted",
             startup_command = request.startup_command.is_some(),
@@ -128,18 +129,6 @@ impl StartRequestPipe {
         );
         Ok(request)
     }
-}
-
-fn read_start_request(
-    mut file: File,
-    expected_machine_id: &str,
-    expected_machine_run_id: &str,
-) -> io::Result<VmmonStartRequest> {
-    let mut encoded = Vec::new();
-    file.by_ref()
-        .take((VMMON_START_REQUEST_MAX_BYTES + 1) as u64)
-        .read_to_end(&mut encoded)?;
-    decode_start_request(&encoded, expected_machine_id, expected_machine_run_id)
 }
 
 fn decode_start_request(

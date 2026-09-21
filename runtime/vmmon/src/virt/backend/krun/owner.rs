@@ -30,6 +30,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Clone, Default)]
 pub(crate) struct Snapshot {
     pub(crate) started: bool,
+    pub(crate) reaped: bool,
     pub(crate) exit: Option<VmExit>,
 }
 
@@ -265,7 +266,7 @@ impl Owner {
                         Some(Ok(Event::StartupStage { stage: next })) if valid_stage(stage, next) && !started => { stage = next; None }
                         Some(Ok(Event::BackendStarted {})) if stage == StartupStage::Build && !started => {
                             started = true; stage = StartupStage::Started;
-                            self.state.send_replace(Snapshot { started: true, exit: None }); None
+                            self.state.send_replace(Snapshot { started: true, reaped: false, exit: None }); None
                         }
                         Some(Ok(Event::StartupFailed { stage: observed, diagnostic })) if observed == stage => Some(diagnostic),
                         Some(Ok(Event::HostMemoryReclaim { status })) if stage == StartupStage::Build || started => {
@@ -314,7 +315,11 @@ impl Owner {
                 }
             }
         };
-        self.state.send_replace(Snapshot::default());
+        self.state.send_replace(Snapshot {
+            started: false,
+            reaped: true,
+            exit: None,
+        });
         if !transmitted {
             transmission.abort();
             let _ = transmission.await;

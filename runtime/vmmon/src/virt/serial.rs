@@ -10,14 +10,18 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, WriteHalf};
 use tokio::sync::{broadcast, Mutex};
 
-use super::backend::VirtBackend;
-use super::error::VirtError;
-use super::stream::SerialDevice;
+use crate::virt::backend::VirtBackend;
+use crate::virt::error::VirtError;
+use crate::virt::stream::SerialDevice;
+
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Access level of a serial client stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +76,7 @@ impl SerialHub {
 
 #[derive(Debug)]
 struct SerialAttachment {
-    guest_input: WriteHalf<SerialDevice>,
+    guest_input: Arc<Mutex<WriteHalf<SerialDevice>>>,
     reader_task: tokio::task::JoinHandle<Result<(), VirtError>>,
 }
 
@@ -98,7 +102,7 @@ impl SerialSink {
 }
 
 /// Fan-out hub for a machine's serial device. Obtain via
-/// [`super::VirtualMachine::serial`].
+/// [`crate::virt::VirtualMachine::serial`].
 #[derive(Debug)]
 pub struct SerialConsole {
     backend: Arc<dyn VirtBackend>,
@@ -107,6 +111,7 @@ pub struct SerialConsole {
     sinks: Arc<Mutex<Vec<SerialSink>>>,
     output_tx: broadcast::Sender<Vec<u8>>,
     attach_lock: Arc<Mutex<()>>,
+    closed: AtomicBool,
 }
 
 impl SerialConsole {
@@ -119,12 +124,12 @@ impl SerialConsole {
             sinks: Arc::new(Mutex::new(Vec::new())),
             output_tx,
             attach_lock: Arc::new(Mutex::new(())),
+            closed: AtomicBool::new(false),
         }
     }
 
     /// Register a writer that receives all guest serial output (e.g. a log
-    /// file). Failing sinks are dropped; others keep receiving. Sinks stay
-    /// registered across machine restarts.
+    /// file). Failing sinks are dropped; others keep receiving.
     pub async fn add_sink<W>(&self, sink: W)
     where
         W: AsyncWrite + Send + 'static,
@@ -141,6 +146,9 @@ impl SerialConsole {
         }
 
         let _guard = self.attach_lock.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(VirtError::Backend("serial console is closed".to_string()));
+        }
         if self.attachment.lock().await.is_some() {
             return Ok(());
         }
@@ -154,7 +162,7 @@ impl SerialConsole {
             tokio::spawn(async move { run_serial_reader(guest_output, sinks, output_tx).await });
 
         *self.attachment.lock().await = Some(SerialAttachment {
-            guest_input,
+            guest_input: Arc::new(Mutex::new(guest_input)),
             reader_task,
         });
         Ok(())
@@ -187,18 +195,22 @@ impl SerialConsole {
             return Ok(());
         }
 
-        let mut attachment = self.attachment.lock().await;
-        let Some(attachment) = attachment.as_mut() else {
-            return Err(io::Error::other("serial console is not attached"));
-        };
+        let input = self
+            .attachment
+            .lock()
+            .await
+            .as_ref()
+            .map(|attachment| attachment.guest_input.clone())
+            .ok_or_else(|| io::Error::other("serial console is not attached"))?;
+        let mut input = input.lock().await;
 
         tracing::debug!(
             client_id,
             bytes = chunk.len(),
             "serial input forwarded to guest"
         );
-        attachment.guest_input.write_all(chunk).await?;
-        attachment.guest_input.flush().await
+        input.write_all(chunk).await?;
+        input.flush().await
     }
 
     async fn detach_client(&self, client_id: u64) {
@@ -208,18 +220,30 @@ impl SerialConsole {
     /// Detach from the device and wait for the reader task to flush the final
     /// output to all sinks. Idempotent; called on machine stop.
     pub async fn drain(&self) -> Result<(), VirtError> {
+        let _guard = self.attach_lock.lock().await;
+        self.closed.store(true, Ordering::Release);
         let Some(mut attachment) = self.attachment.lock().await.take() else {
             return Ok(());
         };
-        attachment
-            .guest_input
-            .shutdown()
-            .await
-            .map_err(VirtError::from)?;
-        attachment
-            .reader_task
-            .await
-            .map_err(|error| VirtError::Backend(format!("serial reader task failed: {error}")))?
+        let result = tokio::time::timeout(DRAIN_TIMEOUT, async {
+            let input_result = attachment.guest_input.lock().await.shutdown().await;
+            let reader_result = (&mut attachment.reader_task).await.map_err(|error| {
+                VirtError::Backend(format!("serial reader task failed: {error}"))
+            })?;
+            input_result.map_err(VirtError::from)?;
+            reader_result
+        })
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                attachment.reader_task.abort();
+                let _ = attachment.reader_task.await;
+                Err(VirtError::Backend(
+                    "serial drain deadline elapsed; trailing output may be truncated".to_string(),
+                ))
+            }
+        }
     }
 }
 
@@ -358,7 +382,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::sync::Mutex;
 
-    use super::{run_serial_reader, SerialSink};
+    use crate::virt::serial::{run_serial_reader, SerialConsole, SerialSink};
 
     fn temporary_file(name: &str) -> PathBuf {
         let timestamp = SystemTime::now()
@@ -382,6 +406,41 @@ mod tests {
             .await
             .expect("serial reader joins")
             .expect("serial reader drains");
+    }
+
+    #[tokio::test]
+    async fn drain_bounds_a_real_open_pty_and_prevents_reattachment() {
+        let backend = crate::virt::backend::create_backend(
+            crate::virt::BackendKind::Krun,
+            crate::virt::VmConfig::builder("serial-drain")
+                .base_directory(std::env::temp_dir())
+                .cpus(1)
+                .memory(128)
+                .kernel("/unused-kernel")
+                .build(),
+        )
+        .expect("real backend configuration");
+        let console = SerialConsole::new(backend);
+        console.attach().await.expect("open real PTY");
+        let reader = console
+            .attachment
+            .lock()
+            .await
+            .as_ref()
+            .expect("attachment")
+            .reader_task
+            .abort_handle();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(3), console.drain())
+            .await
+            .expect("bounded drain")
+            .expect_err("slave remains open");
+        assert!(error
+            .to_string()
+            .contains("trailing output may be truncated"));
+        assert!(reader.is_finished());
+        assert!(console.attachment.lock().await.is_none());
+        console.drain().await.expect("idempotent drain");
+        assert!(console.attach().await.is_err());
     }
 
     #[tokio::test]

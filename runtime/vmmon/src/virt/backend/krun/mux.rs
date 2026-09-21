@@ -201,7 +201,8 @@ impl KrunVsockMux {
 
     pub(super) async fn shutdown(&self) {
         self.session.shutdown();
-        let _ = self.commands.send(Command::Shutdown).await;
+        // Joining the actor has its own abort deadline, even if its queue is full.
+        let _ = self.commands.try_send(Command::Shutdown);
     }
 
     #[cfg(test)]

@@ -95,6 +95,12 @@ fn worker() -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
     {
         command.arg(flag).arg(fd.to_string());
     }
+    inherit(&mut command, roles);
+    let child = Process(Some(command.spawn().expect("spawn actual worker")));
+    (child, writer.into(), keepalive, events.into(), pty.master)
+}
+
+fn inherit<const N: usize>(command: &mut Command, roles: [i32; N]) {
     // SAFETY: only async-signal-safe raw fcntl calls run after fork. nix requires
     // borrowed descriptors; the raw allowlist outlives this immediate spawn.
     unsafe {
@@ -110,8 +116,6 @@ fn worker() -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
             Ok(())
         });
     }
-    let child = Process(Some(command.spawn().expect("spawn actual worker")));
-    (child, writer.into(), keepalive, events.into(), pty.master)
 }
 
 struct SupervisorFixture(std::path::PathBuf);
@@ -150,7 +154,7 @@ impl SupervisorFixture {
         Self(root)
     }
 
-    fn launch(&self) -> Process {
+    fn command(&self) -> Command {
         let mut command = command();
         command.arg("--foreground").args([
             "--id",
@@ -180,7 +184,21 @@ impl SupervisorFixture {
         ] {
             command.env_remove(name);
         }
-        Process(Some(command.spawn().expect("spawn supervisor")))
+        command
+    }
+
+    fn wait_for_request(&self) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !std::fs::read_to_string(self.0.join("trace.log"))
+            .unwrap_or_default()
+            .contains("start_request_wait")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "supervisor never waited for launch request"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -193,7 +211,21 @@ impl Drop for SupervisorFixture {
 #[test]
 fn supervisor_launches_one_real_worker_and_exits_on_native_startup_failure() {
     let fixture = SupervisorFixture::new();
-    let output = fixture.launch().output();
+    let marker = fixture.0.join("exit-command");
+    let mut command = fixture.command();
+    command
+        .args([
+            "--exit-command",
+            "/bin/sh",
+            "--exit-command-arg=-c",
+            "--exit-command-arg=printf '%s\\n' \"$SILO_MACHINE_RUN_ID\" >> \"$1\"",
+            "--exit-command-arg=record",
+        ])
+        .arg("--exit-command-arg")
+        .arg(&marker);
+    let process = Process(Some(command.spawn().expect("supervisor")));
+    let supervisor_pid = process.0.as_ref().expect("child").id();
+    let output = process.output();
     assert!(!output.status.success());
     let trace = std::fs::read_to_string(fixture.0.join("trace.log")).expect("supervisor trace");
     assert_eq!(trace.matches("krun worker spawned").count(), 1, "{trace}");
@@ -202,6 +234,73 @@ fn supervisor_launches_one_real_worker_and_exits_on_native_startup_failure() {
     )
     .expect("exit record");
     assert_eq!(status["outcome"], "error");
+    assert_eq!(status["pid"], supervisor_pid);
+    let worker_pid = status["worker"]["pid"]
+        .as_u64()
+        .expect("retained startup worker identity");
+    assert_ne!(worker_pid, u64::from(supervisor_pid));
+    assert!(status["worker"]["rawStatus"].is_i64());
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(worker_pid as i32), None),
+        Err(nix::errno::Errno::ESRCH),
+        "worker was not reaped"
+    );
+    assert!(!fixture.0.join("vm.pid").exists());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "exit command not invoked");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read_to_string(marker).expect("exit command record"),
+        format!("{}\n", status["runId"].as_str().expect("run identity"))
+    );
+}
+
+#[test]
+fn startup_signal_cancels_an_incomplete_request_without_a_blocking_reader() {
+    let fixture = SupervisorFixture::new();
+    let (reader, writer) = pipe();
+    let mut command = fixture.command();
+    command.env("_VM_STARTPIPE", reader.as_raw_fd().to_string());
+    inherit(&mut command, [reader.as_raw_fd()]);
+    let process = Process(Some(command.spawn().expect("supervisor")));
+    drop(reader);
+    let mut writer = std::fs::File::from(writer);
+    writer.write_all(b"{").expect("partial supervisor request");
+    fixture.wait_for_request();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(process.0.as_ref().expect("child").id() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .expect("cancel startup");
+    assert!(!process.output().status.success());
+    assert!(fixture.0.join("vm.exit.json").exists());
+    assert!(!std::fs::read_to_string(fixture.0.join("trace.log"))
+        .expect("trace")
+        .contains("krun worker spawned"));
+    drop(writer);
+}
+
+#[test]
+fn parent_loss_cancels_an_incomplete_supervisor_request() {
+    let fixture = SupervisorFixture::new();
+    let (request, _keep_request_open) = pipe();
+    let (parent, sync) = pipe();
+    let mut command = fixture.command();
+    command
+        .env("_VM_STARTPIPE", request.as_raw_fd().to_string())
+        .env("_VM_SYNCPIPE", sync.as_raw_fd().to_string());
+    inherit(&mut command, [request.as_raw_fd(), sync.as_raw_fd()]);
+    let process = Process(Some(command.spawn().expect("supervisor")));
+    drop((request, sync));
+    fixture.wait_for_request();
+    drop(parent);
+    assert!(!process.output().status.success());
+    assert!(fixture.0.join("vm.exit.json").exists());
+    assert!(!std::fs::read_to_string(fixture.0.join("trace.log"))
+        .expect("trace")
+        .contains("krun worker spawned"));
 }
 
 #[test]

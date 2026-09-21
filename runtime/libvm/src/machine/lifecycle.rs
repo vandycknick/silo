@@ -721,6 +721,15 @@ async fn stop_failed_start_monitor(
     monitor: &ProcessIdentity,
     machine_name: &str,
 ) -> Result<(), LibVmError> {
+    // Let vmmon stop/reap its worker and finalize the generation first. The
+    // process-group kill below is only the emergency fallback for a stuck owner.
+    if interrupt_monitor(monitor)?
+        && wait_for_monitor_stop(monitor, machine_name, Duration::from_secs(75))
+            .await
+            .is_ok()
+    {
+        return Ok(());
+    }
     if kill_monitor_process_group(monitor)? {
         return wait_for_monitor_stop(monitor, machine_name, Duration::from_secs(5)).await;
     }
@@ -934,4 +943,53 @@ fn monitor_identity(generation: &VmmonRunIdentity) -> Result<Option<ProcessIdent
 fn unix_time(timestamp: i64) -> Option<SystemTime> {
     let timestamp = u64::try_from(timestamp).ok()?;
     Some(UNIX_EPOCH + Duration::from_secs(timestamp))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::machine::lifecycle::stop_failed_start_monitor;
+    use crate::vmmon::process::ProcessIdentity;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::time::Duration;
+
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Generic OS signal mechanics, not a substitute for a vmmon/VM test.
+    #[tokio::test]
+    async fn failed_start_cleanup_interrupts_before_emergency_group_kill() {
+        let mut child = Child(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("real OS child"),
+        );
+        let pid = child.0.id() as i32;
+        let identity = ProcessIdentity::for_pid(pid)
+            .expect("identity lookup")
+            .expect("live child");
+        let (cleanup, status) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                stop_failed_start_monitor(&identity, "signal-mechanics"),
+                async {
+                    loop {
+                        if let Some(status) = child.0.try_wait().expect("probe child") {
+                            break status;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
+            )
+        })
+        .await
+        .expect("cooperative cleanup budget");
+        cleanup.expect("cooperative cleanup");
+        assert_eq!(status.signal(), Some(nix::libc::SIGINT));
+    }
 }

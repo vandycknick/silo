@@ -57,6 +57,11 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
     /// Non-blocking exit check.
     async fn try_wait(&self) -> Result<Option<VmExit>, VirtError>;
 
+    /// Includes observed death while the immutable terminal report is draining.
+    async fn is_terminated(&self) -> Result<bool, VirtError> {
+        Ok(self.try_wait().await?.is_some())
+    }
+
     /// Dynamically connect to a guest endpoint port, consuming its admission lease.
     async fn connect_vsock(&self, port: u32, lease: VsockLease) -> Result<VsockStream, VirtError>;
 
