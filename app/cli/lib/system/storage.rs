@@ -108,9 +108,12 @@ pub(crate) fn validate_data_image(
         .with_context(|| format!("inspect data image {}", path.display()))?;
     if metadata.len() != size {
         bail!(
-            "recorded system data image has size {}, expected {}; resizing is not supported",
-            metadata.len(),
-            size
+            "system data disk size mismatch at {}: found {}, but the daemon expects {}\n\n\
+             Silo does not support resizing its data disk yet; the backing file and ext4 filesystem must be resized together. The disk was not changed.\n\n\
+             hint: if keeping the data, restore the matching daemon state and daemon.system.storage.data-size setting. If starting fresh, stop Silo and reset both the daemon state and its data disk, not just the state. Removing the disk deletes its Docker images, containers, and volumes.",
+            path.display(),
+            utils::format_storage_size(metadata.len()),
+            utils::format_storage_size(size)
         );
     }
     let mut reader = Reader::new(path).context("open system data ext4 image")?;
@@ -151,6 +154,40 @@ mod tests {
         ensure_data_image(&path, size, installation, data).expect("reuse");
         assert!(validate_data_image(&path, size, installation, Uuid::new_v4()).is_err());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn size_mismatch_explains_growth_and_shrink_without_changing_the_disk() {
+        use std::io::{Read as _, Write as _};
+
+        for (actual, expected) in [(64_u64 << 30, 500_u64 << 30), (500_u64 << 30, 64_u64 << 30)] {
+            let temp = tempfile::tempdir().expect("temp");
+            let path = temp.path().join("data.img");
+            let mut file = std::fs::File::create(&path).expect("disk");
+            file.write_all(b"existing data").expect("contents");
+            file.set_len(actual).expect("sparse size");
+            drop(file);
+
+            let error = ensure_data_image(&path, expected, Uuid::new_v4(), Uuid::new_v4())
+                .expect_err("size mismatch")
+                .to_string();
+            assert!(error.contains(&path.display().to_string()));
+            assert!(error.contains(&format!(
+                "found {}, but the daemon expects {}",
+                utils::format_storage_size(actual),
+                utils::format_storage_size(expected)
+            )));
+            assert!(error.contains("backing file and ext4 filesystem"));
+            assert!(error.contains("matching daemon state"));
+            assert!(error.contains("Removing the disk deletes"));
+            assert_eq!(std::fs::metadata(&path).expect("metadata").len(), actual);
+            let mut contents = [0; 13];
+            std::fs::File::open(&path)
+                .expect("disk")
+                .read_exact(&mut contents)
+                .expect("contents");
+            assert_eq!(&contents, b"existing data");
+        }
     }
 
     #[test]
