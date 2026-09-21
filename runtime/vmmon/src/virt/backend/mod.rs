@@ -9,7 +9,7 @@
 //! # Backend contract
 //!
 //! - `start` boots at most once; a second call fails with `AlreadyRunning`.
-//! - `stop` is idempotent and safe before `start`.
+//! - `stop` is idempotent; before `start` it permanently cancels the instance.
 //! - The exit status is cached: `wait`/`try_wait` after the machine exits (or
 //!   after `stop`) resolve immediately and never hang.
 //! - `open_serial` is called exactly once per boot, by the serial console.
@@ -46,6 +46,11 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
     /// Stop the machine (graceful where supported, then hard). Idempotent.
     async fn stop(&self) -> Result<(), VirtError>;
 
+    /// Escalate a supervised stop without abandoning backend ownership.
+    async fn force_stop(&self) -> Result<(), VirtError> {
+        self.stop().await
+    }
+
     /// Block until the machine exits; resolves immediately once exited.
     async fn wait(&self) -> Result<VmExit, VirtError>;
 
@@ -71,6 +76,20 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
         &self,
     ) -> Option<watch::Receiver<Option<HostMemoryReclaimReport>>> {
         None
+    }
+}
+
+/// A single launch attempt, including failures before a VM exists.
+#[derive(Debug, Default)]
+pub(crate) struct StartAttempt(std::sync::atomic::AtomicBool);
+
+impl StartAttempt {
+    pub(crate) fn reserve(&self) -> bool {
+        !self.0.swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub(crate) fn close(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -195,7 +214,36 @@ pub(crate) fn create_backend(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::virt::backend::{Availability, BackendKind, StartAttempt};
+
+    #[test]
+    fn attempts_are_terminal_even_before_a_vm_exists() {
+        let attempt = StartAttempt::default();
+        assert!(attempt.reserve());
+        assert!(!attempt.reserve());
+        attempt.close();
+        assert!(!attempt.reserve());
+        let cancelled = StartAttempt::default();
+        cancelled.close();
+        assert!(!cancelled.reserve());
+    }
+
+    #[test]
+    fn concurrent_attempts_have_one_winner() {
+        let attempt = StartAttempt::default();
+        std::thread::scope(|scope| {
+            let tasks: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| usize::from(attempt.reserve())))
+                .collect();
+            assert_eq!(
+                tasks
+                    .into_iter()
+                    .map(|task| task.join().expect("join reservation"))
+                    .sum::<usize>(),
+                1
+            );
+        });
+    }
 
     #[test]
     fn default_backend_matches_platform() {

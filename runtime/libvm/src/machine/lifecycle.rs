@@ -867,6 +867,7 @@ fn machine_exit(
             unix_time(status.exited_at),
             match status.outcome {
                 VmmonExitOutcome::Clean => MachineExitOutcome::Clean,
+                VmmonExitOutcome::Forced => MachineExitOutcome::Forced,
                 VmmonExitOutcome::Error => MachineExitOutcome::Error {
                     message: status.error,
                 },

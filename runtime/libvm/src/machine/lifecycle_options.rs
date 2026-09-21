@@ -167,7 +167,8 @@ pub enum MachineExitOutcome {
     },
     /// The machine was already stopped when wait started.
     AlreadyStopped,
-    /// libvm forced the monitor to exit and no cleaner vmmon status was reported.
+    /// The monitor intentionally force-killed its worker, or libvm emergency-killed
+    /// the monitor without a more specific matching exit record.
     Forced,
     /// The run exited but no matching vmmon exit status was available.
     Unknown,

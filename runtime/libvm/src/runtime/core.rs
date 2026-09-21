@@ -1700,7 +1700,7 @@ fn runtime_exit_matches(status: &VmmonExitStatus, state: Option<&MachineState>) 
 fn exit_observed_event(status: &VmmonExitStatus) -> (bool, Option<String>) {
     let _ = status.exited_at;
     match status.outcome {
-        VmmonExitOutcome::Clean => (true, None),
+        VmmonExitOutcome::Clean | VmmonExitOutcome::Forced => (true, None),
         VmmonExitOutcome::Error => (false, status.error.clone()),
     }
 }

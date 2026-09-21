@@ -102,13 +102,6 @@ pub enum NetworkMode {
     },
 }
 
-/// Terminal state of a machine observed through `wait`/`try_wait`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VmExit {
-    Stopped,
-    StoppedWithError(String),
-}
-
 /// Options consumed only by the krun (Linux) backend; other backends ignore them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KrunOptions {

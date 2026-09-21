@@ -95,6 +95,12 @@ impl VirtualMachine {
         self.inner.serial_console.drain().await
     }
 
+    /// Escalate shutdown while retaining the backend's termination/reap owner.
+    pub async fn force_stop(&self) -> Result<(), VirtError> {
+        self.inner.backend.force_stop().await?;
+        self.inner.serial_console.drain().await
+    }
+
     /// Dynamically connect to a guest endpoint port.
     pub async fn connect_vsock(&self, port: u32) -> Result<VsockStream, VirtError> {
         let lease = self.reserve_vsock()?;

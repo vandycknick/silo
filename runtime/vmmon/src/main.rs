@@ -211,6 +211,7 @@ async fn run(
         krun_path: &args.krun_path,
         serial_file,
     };
+    let mut primary_machine = None;
     let result = match startup::init(
         &runtime,
         startup_inputs,
@@ -219,35 +220,37 @@ async fn run(
     )
     .await
     {
-        Ok(initialized) => match services::start_services(
-            &runtime,
-            &initialized.context,
-            initialized.startup_command,
-            exec_log.clone(),
-            initialized.vsock_surface,
-            &mut sync_reporter,
-            services::StartupGate {
-                require_guest_ready: initialized.require_guest_ready,
-                deadline: initialized.startup_deadline,
-                cancelled: initialized.startup_cancel.clone(),
-            },
-        )
-        .await
-        {
-            Ok(handles) => {
-                if let Some(task) = signal_task.take() {
-                    task.abort();
-                    let _ = task.await;
+        Ok(initialized) => {
+            primary_machine = Some(initialized.context.machine.clone());
+            match services::start_services(
+                &runtime,
+                &initialized.context,
+                initialized.startup_command,
+                exec_log.clone(),
+                initialized.vsock_surface,
+                &mut sync_reporter,
+                services::StartupGate {
+                    require_guest_ready: initialized.require_guest_ready,
+                    deadline: initialized.startup_deadline,
+                    cancelled: initialized.startup_cancel.clone(),
+                },
+            )
+            .await
+            {
+                Ok(handles) => {
+                    if let Some(task) = signal_task.take() {
+                        task.abort();
+                        let _ = task.await;
+                    }
+                    if let Some(monitor) = parent_loss_monitor.take() {
+                        monitor.shutdown().await;
+                    }
+                    shutdown::run(runtime, initialized.context, handles).await
                 }
-                if let Some(monitor) = parent_loss_monitor.take() {
-                    monitor.shutdown().await;
-                }
-                shutdown::run(runtime, initialized.context, handles).await
-            }
-            Err(err) => {
-                let forward_result = initialized.context.forwards.shutdown().await;
-                let stop_result = initialized.context.machine.stop().await;
-                match (forward_result, stop_result) {
+                Err(err) => {
+                    let forward_result = initialized.context.forwards.shutdown().await;
+                    let stop_result = initialized.context.machine.stop().await;
+                    match (forward_result, stop_result) {
                     (Ok(()), Ok(())) => Err(err),
                     (Err(forward), Ok(())) => {
                         Err(eyre::eyre!("{err}; forward cleanup failed: {forward}"))
@@ -259,8 +262,9 @@ async fn run(
                         "{err}; forward cleanup failed: {forward}; primary VM cleanup failed: {stop}"
                     )),
                 }
+                }
             }
-        },
+        }
         Err(err) => Err(err),
     };
     if let Some(task) = signal_task.take() {
@@ -284,6 +288,16 @@ async fn run(
     } else {
         ExitOutcome::Clean
     };
+    let vm_exit = match primary_machine {
+        Some(machine) => match machine.try_wait().await {
+            Ok(exit) => exit,
+            Err(error) => {
+                tracing::warn!(%error, "could not inspect final backend status");
+                None
+            }
+        },
+        None => None,
+    };
     match ExitStatus::new(
         args.id.clone(),
         args.run_id.clone(),
@@ -291,6 +305,7 @@ async fn run(
         last_error.clone(),
     ) {
         Ok(status) => {
+            let status = status.with_vm_exit(vm_exit);
             if let Err(err) = exit_status::write(&args.exit_status, &status) {
                 tracing::warn!(error = %err, path = %args.exit_status.display(), "write runtime exit status");
             }

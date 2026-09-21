@@ -188,16 +188,13 @@ async fn wait_for_machine_stop(
 }
 
 fn vm_stop_info(exit: VmExit) -> VmStopInfo {
-    match exit {
-        VmExit::Stopped => VmStopInfo {
-            message: String::from("machine stopped"),
-            error: None,
-        },
-        VmExit::StoppedWithError(error) => VmStopInfo {
-            message: format!("machine stopped with error: {error}"),
-            error: Some(error),
-        },
-    }
+    let error = exit.error();
+    let message = match &error {
+        Some(error) => format!("machine stopped with error: {error}"),
+        None if exit.forced() => "machine force-stopped".to_string(),
+        None => "machine stopped".to_string(),
+    };
+    VmStopInfo { message, error }
 }
 
 async fn cleanup(_runtime: &RuntimeContext, ctx: &DaemonContext) -> eyre::Result<()> {

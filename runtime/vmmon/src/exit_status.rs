@@ -20,6 +20,8 @@ pub(crate) struct ExitStatus {
     exited_at: i64,
     outcome: ExitOutcome,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker: Option<crate::virt::exit::WorkerExit>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -27,6 +29,7 @@ pub(crate) struct ExitStatus {
 pub(crate) enum ExitOutcome {
     Clean,
     Error,
+    Forced,
 }
 
 impl ExitStatus {
@@ -44,7 +47,25 @@ impl ExitStatus {
             exited_at: current_unix(),
             outcome,
             error,
+            worker: None,
         })
+    }
+
+    pub(crate) fn with_vm_exit(mut self, exit: Option<crate::virt::VmExit>) -> Self {
+        if let Some(exit) = exit {
+            self.error = self.error.or_else(|| exit.error());
+            self.outcome = if self.error.is_some() {
+                ExitOutcome::Error
+            } else if exit.forced() {
+                ExitOutcome::Forced
+            } else {
+                ExitOutcome::Clean
+            };
+            if let crate::virt::VmExit::Worker(worker) = exit {
+                self.worker = Some(*worker);
+            }
+        }
+        self
     }
 }
 
@@ -241,6 +262,43 @@ mod tests {
             None,
         )
         .expect("build exit status")
+    }
+
+    #[test]
+    fn worker_force_is_not_a_crash_and_does_not_replace_startup_failure() {
+        use crate::virt::exit::{ForceReason, StartupStage, VmExit, WorkerExit};
+        let worker = WorkerExit {
+            pid: 123,
+            raw_status: 9,
+            code: None,
+            signal: Some(9),
+            core_dumped: false,
+            stage: StartupStage::Build,
+            shutdown_requested: true,
+            force_reason: Some(ForceReason::StartupFailure),
+            failure: None,
+            diagnostic_tail: "diagnostic".to_string(),
+            diagnostic_truncated: false,
+        };
+        for error in [None, Some("admission failed".to_string())] {
+            let record = ExitStatus::new(
+                "machine".to_string(),
+                "run".to_string(),
+                ExitOutcome::Clean,
+                error.clone(),
+            )
+            .expect("record")
+            .with_vm_exit(Some(VmExit::Worker(Box::new(worker.clone()))));
+            let value = serde_json::to_value(record).expect("encode record");
+            assert_eq!(value["pid"], std::process::id());
+            assert_eq!(value["worker"]["pid"], 123);
+            if error.is_none() {
+                assert_eq!(value["outcome"], "forced");
+            } else {
+                assert_eq!(value["error"], "admission failed");
+                assert_eq!(value["outcome"], "error");
+            }
+        }
     }
 
     #[test]

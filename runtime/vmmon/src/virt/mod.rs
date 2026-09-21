@@ -22,6 +22,7 @@ mod backend;
 pub(crate) mod capacity;
 mod config;
 mod error;
+pub(crate) mod exit;
 mod machine;
 mod serial;
 mod stream;
@@ -31,9 +32,10 @@ pub use backend::{Availability, BackendKind};
 pub(crate) use capacity::VsockLease;
 pub use config::{
     DiskImage, KrunOptions, MachineIdentifier, MockOptions, NetworkMode, RosettaIntent,
-    RosettaProfile, SharedDirectory, VmConfig, VmConfigBuilder, VmExit, VzOptions,
+    RosettaProfile, SharedDirectory, VmConfig, VmConfigBuilder, VzOptions,
 };
 pub use error::VirtError;
+pub use exit::VmExit;
 pub use machine::VirtualMachine;
 pub use serial::{SerialAccess, SerialConsole, SerialStream};
 pub use stream::{VsockListener, VsockStream};

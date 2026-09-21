@@ -19,7 +19,7 @@ use vz::{
     VirtualMachine, VirtualMachineDelegate, VirtualMachineState, VzError,
 };
 
-use crate::virt::backend::VirtBackend;
+use crate::virt::backend::{StartAttempt, VirtBackend};
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission};
 use crate::virt::config::{validate_common, MachineIdentifier, NetworkMode, VmConfig};
 use crate::virt::error::VirtError;
@@ -28,10 +28,12 @@ use crate::virt::VmExit;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct VzBackend {
     config: VmConfig,
-    inner: AsyncMutex<VzMachineState>,
+    inner: Arc<AsyncMutex<VzMachineState>>,
+    attempt: Arc<StartAttempt>,
+    force: tokio_util::sync::CancellationToken,
     exit: Arc<Mutex<Option<VmExit>>>,
     exit_notify: Arc<Notify>,
 }
@@ -40,7 +42,6 @@ pub(crate) struct VzBackend {
 struct VzMachineState {
     vm: Option<VirtualMachine>,
     serial_port: Option<SerialPortConfiguration>,
-    started: bool,
 }
 
 impl VzBackend {
@@ -48,11 +49,12 @@ impl VzBackend {
         validate(&config)?;
         Ok(Self {
             config,
-            inner: AsyncMutex::new(VzMachineState {
+            inner: Arc::new(AsyncMutex::new(VzMachineState {
                 vm: None,
                 serial_port: None,
-                started: false,
-            }),
+            })),
+            attempt: Arc::new(StartAttempt::default()),
+            force: tokio_util::sync::CancellationToken::new(),
             exit: Arc::new(Mutex::new(None)),
             exit_notify: Arc::new(Notify::new()),
         })
@@ -84,22 +86,23 @@ impl VzBackend {
     }
 }
 
-#[async_trait]
-impl VirtBackend for VzBackend {
-    async fn start(&self) -> Result<(), VirtError> {
+impl VzBackend {
+    async fn start_owned(&self) -> Result<(), VirtError> {
         validate_support()?;
         let mut state = self.inner.lock().await;
-        if state.started {
-            return Err(VirtError::AlreadyRunning {
-                name: self.config.name().to_string(),
-            });
+        if self.cached_exit().is_some() {
+            return Err(VirtError::Backend("VZ start was cancelled".to_string()));
         }
-
-        let (vm, serial_port) = match (state.vm.take(), state.serial_port.take()) {
-            (Some(vm), Some(serial_port)) => (vm, serial_port),
-            _ => build_vm(&self.config)?,
-        };
-        state.started = true;
+        if state.vm.is_none() {
+            let (vm, serial_port) = build_vm(&self.config)?;
+            state.vm = Some(vm);
+            state.serial_port = Some(serial_port);
+        }
+        // Retain the VM before any await: cancellation must not drop its only owner.
+        let vm = state
+            .vm
+            .as_ref()
+            .ok_or_else(|| VirtError::Backend("VZ machine was not retained".to_string()))?;
         vm.set_delegate(ExitDelegate {
             exit: self.exit.clone(),
             notify: self.exit_notify.clone(),
@@ -110,18 +113,63 @@ impl VirtBackend for VzBackend {
         vm.start().await.map_err(vz_error)?;
         wait_for_state(
             &mut state_events,
-            &vm,
+            vm,
             VirtualMachineState::Running,
             STARTUP_TIMEOUT,
         )
         .await?;
 
-        state.vm = Some(vm);
-        state.serial_port = Some(serial_port);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl VirtBackend for VzBackend {
+    async fn start(&self) -> Result<(), VirtError> {
+        if !self.attempt.reserve() {
+            return Err(VirtError::AlreadyRunning {
+                name: self.config.name().to_string(),
+            });
+        }
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let guard = cancelled.clone().drop_guard();
+        let backend = self.clone();
+        // Dropping the caller's future detaches the task, not the native VM.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = backend.start_owned().await;
+            let failed = result.is_err();
+            let unclaimed = ready_tx.send(result).is_err();
+            let cleanup = failed
+                || unclaimed
+                || tokio::select! {
+                    _ = cancelled.cancelled() => true,
+                    accepted = accepted_rx => accepted.is_err(),
+                };
+            if cleanup {
+                if let Err(error) = backend.stop().await {
+                    tracing::error!(%error, "VZ startup owner could not complete cleanup");
+                }
+            }
+        });
+        ready_rx
+            .await
+            .map_err(|error| VirtError::Backend(format!("VZ start owner failed: {error}")))??;
+        accepted_tx
+            .send(())
+            .map_err(|()| VirtError::Backend("VZ start owner closed before handoff".to_string()))?;
+        guard.disarm();
         Ok(())
     }
 
+    async fn force_stop(&self) -> Result<(), VirtError> {
+        self.force.cancel();
+        self.stop().await
+    }
+
     async fn stop(&self) -> Result<(), VirtError> {
+        self.attempt.close();
         let mut state = self.inner.lock().await;
         if let Some(vm) = state.vm.as_ref() {
             if vm.state() != VirtualMachineState::Stopped {
@@ -131,20 +179,18 @@ impl VirtBackend for VzBackend {
                     current_state = %vm.state(),
                     "starting VZ shutdown flow"
                 );
-                let graceful_stop_completed = if vm.can_request_stop() {
+                let graceful_stop_completed = if !self.force.is_cancelled() && vm.can_request_stop()
+                {
                     tracing::debug!(
                         machine_id = self.config.name(),
                         timeout = ?SHUTDOWN_TIMEOUT,
                         "requesting graceful VZ shutdown"
                     );
                     vm.request_stop().map_err(vz_error)?;
-                    let graceful_result = wait_for_state(
-                        &mut state_events,
-                        vm,
-                        VirtualMachineState::Stopped,
-                        SHUTDOWN_TIMEOUT,
-                    )
-                    .await;
+                    let graceful_result = tokio::select! {
+                        result = wait_for_state(&mut state_events, vm, VirtualMachineState::Stopped, SHUTDOWN_TIMEOUT) => result,
+                        _ = self.force.cancelled() => Err(VirtError::Backend("VZ shutdown escalated".to_string())),
+                    };
                     match &graceful_result {
                         Ok(()) => {
                             tracing::debug!(
@@ -197,6 +243,9 @@ impl VirtBackend for VzBackend {
 
     async fn wait(&self) -> Result<VmExit, VirtError> {
         loop {
+            let notified = self.exit_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(exit) = self.cached_exit() {
                 return Ok(exit);
             }
@@ -217,7 +266,7 @@ impl VirtBackend for VzBackend {
                 return Ok(exit);
             }
 
-            self.exit_notify.notified().await;
+            notified.await;
         }
     }
 
@@ -253,6 +302,11 @@ impl VirtBackend for VzBackend {
     ) -> Result<VsockListener, VirtError> {
         let vm = {
             let mut state = self.inner.lock().await;
+            if self.cached_exit().is_some() {
+                return Err(VirtError::NotRunning {
+                    name: self.config.name().to_string(),
+                });
+            }
             if state.vm.is_none() {
                 let (vm, serial_port) = build_vm(&self.config)?;
                 state.vm = Some(vm);
@@ -631,6 +685,36 @@ fn vz_error(err: VzError) -> VirtError {
 #[cfg(test)]
 mod tests {
     use crate::virt::{RosettaIntent, RosettaProfile, VmConfig};
+
+    #[tokio::test]
+    async fn stop_before_start_is_terminal_without_creating_a_native_vm() {
+        use crate::virt::backend::vz::{VzBackend, VzMachineState};
+        use crate::virt::backend::{StartAttempt, VirtBackend};
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::{Mutex as AsyncMutex, Notify};
+        let backend = VzBackend {
+            config: VmConfig::builder("cancel-before-start").build(),
+            inner: Arc::new(AsyncMutex::new(VzMachineState {
+                vm: None,
+                serial_port: None,
+            })),
+            attempt: Arc::new(StartAttempt::default()),
+            force: tokio_util::sync::CancellationToken::new(),
+            exit: Arc::new(Mutex::new(None)),
+            exit_notify: Arc::new(Notify::new()),
+        };
+        backend.stop().await.expect("cancel unstarted VM");
+        backend.stop().await.expect("repeat stop");
+        assert!(matches!(
+            backend.start().await,
+            Err(crate::virt::VirtError::AlreadyRunning { .. })
+        ));
+        assert_eq!(
+            backend.wait().await.expect("cached result"),
+            crate::virt::VmExit::Stopped
+        );
+        assert!(backend.inner.lock().await.vm.is_none());
+    }
 
     #[test]
     fn vz_rejects_krun_capture_intent_before_availability_checks() {
