@@ -10,11 +10,11 @@ The crate exposes:
 - typed disk, mount, network, and inherited-vsock configuration
 - typed Rosetta launch configuration transported only to the selected helper
 
-The `krun` binary is intentionally small. It parses Silo's flat helper arguments, configures libkrun directly, and then enters the VM. It does not use the library builder and does not expose subcommands. On Linux, `krun --check-host` runs the deeper KVM host check without starting a guest.
+With the `engine` feature, the crate also exposes `engine::run_process` for a dedicated worker process. The `krun` binary parses Silo's flat helper arguments, sets up process policy, and delegates device construction and execution to that synchronous engine. It does not use the library builder and does not expose subcommands. On Linux, `krun --check-host` runs the deeper KVM host check without starting a guest.
 
 ## Boundary
 
-The library and binary have different jobs, and keeping that split intact prevents callers like `vmmon` from linking against libkrun directly.
+The synchronous engine and process entry point have different jobs. Enabling the `engine` feature links libkrun, but does not make it safe to execute a VM inside a supervisor process. Normal shutdown calls `_exit()` and terminates the entire calling process; a thread is not isolation.
 
 Library responsibilities:
 
@@ -29,9 +29,9 @@ Library responsibilities:
 Binary responsibilities:
 
 - parse flat helper arguments
-- build libkrun's safe native Rust API through a helper-private adapter
-- convert non-UTF-8 paths and `VmmError` values into contextual errors
-- enter the VM
+- initialize native logging, watchdog, shutdown signals and periodic reporting
+- call `engine::run_process` with explicit console borrows and owned mux resources
+- finish process control setup in the post-build callback before entering the event loop
 - validate Linux KVM access, API compatibility, and required capabilities
 
 ## Linux Host Checks
@@ -52,7 +52,9 @@ empty VM descriptor. It allocates no guest memory or vCPUs and runs no guest
 code. This detects ioctl restrictions and nested-virtualization failures that
 opening `/dev/kvm` alone cannot prove.
 
-Do not import `libkrun` from library modules. Direct libkrun access belongs in the helper-private adapter below `src/bin/krun`. The library is a launcher/wrapper around the helper binary, not a libkrun API facade.
+Direct libkrun access belongs in `engine`. It validates configuration, constructs devices in stable order, rejects unsupported path encodings and enters the event loop. It does not spawn processes, initialize global logging, install signals, or create watchdog/reporting threads. `engine::Control` only offers supported shutdown and host-reclaim snapshots. Its clone shares ownership without duplicating native descriptors.
+
+`VmmBuilder::build()` may begin guest execution before the post-build callback. A callback error requires the worker to terminate, not retry construction. Console descriptors and explicitly protected streams are borrowed for the entire engine call; the mux descriptor is transferred into the native device.
 
 ## Scope
 
@@ -83,9 +85,9 @@ Planned follow-up scope includes:
 
 ## Source Integration
 
-The optional `krun-bin` Cargo feature compiles the pinned libkrun fork directly into the helper executable. Building the launcher library alone does not activate or link libkrun, preserving the process boundary for `vmmon` and other callers.
+The optional `engine` Cargo feature compiles the pinned libkrun fork; `krun-bin` enables it for the helper executable. Building the launcher library alone does not activate or link libkrun, preserving the process boundary for `vmmon` and other callers.
 
-The helper uses a narrow private adapter over `VmmBuilder` and the native device constructors. It transfers owned network descriptors to libkrun, borrows console descriptors for the VMM lifetime, and rejects non-UTF-8 paths rather than changing them. The `ffi` feature and generated C exports stay disabled. The resulting runtime does not require `libkrun.so`, `libkrun.dylib`, or `libkrunfw`.
+The engine uses a narrow adapter over `VmmBuilder` and the native device constructors. It transfers owned network descriptors to libkrun, borrows console descriptors for the VMM lifetime, and rejects non-UTF-8 paths rather than changing them. The `ffi` feature and generated C exports stay disabled. The resulting runtime does not require `libkrun.so`, `libkrun.dylib`, or `libkrunfw`.
 
 Rosetta uses one `--rosetta` enable flag and a bounded versioned JSON value in
 `SILO_ROSETTA_CONFIG`. The launcher removes any ambient value from host checks
@@ -108,7 +110,7 @@ helper exec exceeds the inherited argv/environment limit only after the valid
 bounded value is added. This verifies spawn-error propagation and cleanup; it
 does not launch or qualify a hypervisor, filesystem response, or translator.
 
-The adapter initializes libkrun's stderr logger at info level while honoring its standard environment filter, so startup qualification diagnostics are visible. `Vmm::run()` owns the event loop and returns `()` only after a fatal event-loop error. The helper converts that return into a controlled error so the process exits nonzero instead of falsely reporting a successful VM exit.
+The worker entry point initializes libkrun's stderr logger at info level while honoring its standard environment filter, so startup qualification diagnostics are visible. `Vmm::run()` owns the event loop and returns `()` only after a fatal event-loop error. The helper converts that return into a controlled error so the process exits nonzero instead of falsely reporting a successful VM exit.
 
 The hidden developer option `--vsock-cid 3` attaches one standalone native `VsockDevice` before networking. This fixture-only path has no port mappings and uses empty TSI flags. It is mutually exclusive with `--vsock-mux-fd`; no other guest CID is admitted. Production callers use `--vsock-mux-fd`, which names a helper-inherited Unix stream descriptor rather than a filesystem path.
 
@@ -184,4 +186,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The public crate API is process-backed because Silo uses the `krun` helper as the libkrun execution boundary. The helper binary remains single-purpose and direct-to-libkrun, while Rust callers use the builder and VM handle facade without linking libkrun themselves.
+The active launcher API is process-backed. Callers that enable `engine` may execute libkrun only inside a dedicated worker process, never inside the monitor. Configuration-only consumers can leave that feature disabled.

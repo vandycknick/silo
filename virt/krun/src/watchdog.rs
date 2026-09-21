@@ -89,17 +89,15 @@ fn take_from_value(value: &std::ffi::OsStr) -> io::Result<OwnedFd> {
     Ok(read_fd)
 }
 
-pub(crate) fn start(read_fd: OwnedFd) {
-    if let Err(err) = thread::Builder::new()
+pub(crate) fn start(read_fd: OwnedFd) -> io::Result<()> {
+    thread::Builder::new()
         .name("krun-watchdog".to_string())
         .spawn(move || {
             wait_for_parent_death(read_fd.as_fd());
             tracing::warn!("krun parent process exited, shutting down helper");
             std::process::exit(0);
         })
-    {
-        tracing::warn!(error = %err, "failed to start krun watchdog");
-    }
+        .map(drop)
 }
 
 fn set_cloexec(fd: BorrowedFd<'_>, enabled: bool) -> io::Result<()> {

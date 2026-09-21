@@ -9,7 +9,8 @@ path = "src/bin/krun.rs"
 required-features = ["krun-bin"]
 
 [features]
-krun-bin = ["dep:bzip2", "dep:libkrun"]
+engine = ["dep:bzip2", "dep:libkrun"]
+krun-bin = ["engine"]
 
 [dependencies]
 utils = { path = "../../common/utils" }

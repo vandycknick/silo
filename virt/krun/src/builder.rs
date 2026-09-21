@@ -126,9 +126,15 @@ impl VirtualMachineBuilder {
         self
     }
 
-    pub fn build(self) -> Result<KrunConfig> {
+    /// Build configuration without consuming resources owned by the launcher.
+    pub fn build(&self) -> Result<KrunConfig> {
         validate_config(&self.config)?;
-        Ok(self.config)
+        if self.vsock_mux_fd.is_some() {
+            return Err(KrunBackendError::InvalidConfig(
+                "use start() to transfer an owned vsock mux descriptor".to_string(),
+            ));
+        }
+        Ok(self.config.clone())
     }
 
     pub fn start(mut self) -> Result<VirtualMachine> {
@@ -689,6 +695,24 @@ mod tests {
             .build()
             .expect_err("zero cpus should be invalid");
         assert!(err.to_string().contains("vCPU"));
+    }
+
+    #[test]
+    fn config_build_does_not_discard_mux_ownership() {
+        let (fd, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let builder = VirtualMachineBuilder::new("krun")
+            .kernel("/kernel")
+            .vsock_mux_fd(fd.into());
+        assert!(builder
+            .build()
+            .expect_err("resource is not config")
+            .to_string()
+            .contains("start()"));
+        nix::fcntl::fcntl(
+            builder.vsock_mux_fd.as_ref().expect("still owned"),
+            nix::fcntl::FcntlArg::F_GETFD,
+        )
+        .expect("config build preserves live descriptor");
     }
 
     #[test]

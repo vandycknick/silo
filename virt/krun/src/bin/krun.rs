@@ -1,15 +1,14 @@
-use std::fs;
+use krun::engine::ConsoleFds;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::net::UnixDatagram;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use krun::{
     validate_config, KrunConfig, NetTap, NetUnixgram, NetUnixstream, Network, RosettaLaunchConfig,
     DEFAULT_ID,
 };
-use nix::sys::socket::{setsockopt, sockopt};
+use nix::sys::socket::sockopt;
 
 #[path = "krun/admission.rs"]
 mod admission;
@@ -22,16 +21,7 @@ mod vmm;
 #[path = "../watchdog.rs"]
 mod watchdog;
 
-const LOCAL_SOCKET_ID_LEN: usize = 12;
 const ENV_ROSETTA_CONFIG: &str = "SILO_ROSETTA_CONFIG";
-const DEFAULT_SOCKET_BUF_SIZE: usize = 7 * 1024 * 1024;
-const SOCKET_RCVBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
-
-#[cfg(target_os = "macos")]
-const SOCKET_SNDBUF: usize = 65_562 - 12;
-
-#[cfg(not(target_os = "macos"))]
-const SOCKET_SNDBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -279,7 +269,7 @@ fn main() -> eyre::Result<()> {
         vsock_mux_fd,
         watchdog_fd,
         status_fd,
-        vmm::ConsoleFds {
+        ConsoleFds {
             stdin: stdin.as_fd(),
             stdout: stdout.as_fd(),
             stderr: stderr.as_fd(),
@@ -327,7 +317,7 @@ fn start_enter(
     vsock_mux_fd: Option<OwnedFd>,
     watchdog_fd: Option<OwnedFd>,
     status_fd: Option<OwnedFd>,
-    console_fds: vmm::ConsoleFds<'_>,
+    console_fds: ConsoleFds<'_>,
 ) -> eyre::Result<()> {
     vmm::run(config, vsock_mux_fd, watchdog_fd, status_fd, console_fds)?;
     Ok(())
@@ -356,75 +346,15 @@ fn validate_inherited_stream_fd(fd: RawFd) -> eyre::Result<OwnedFd> {
     Ok(fd)
 }
 
-fn open_local_unix_datagram_socket(
-    peer_path: &Path,
-    vm_id: &str,
-    backend: &str,
-) -> io::Result<UnixDatagram> {
-    let local_path = local_unix_datagram_path(peer_path, vm_id, backend);
-    remove_file_if_exists(&local_path)?;
-    let socket = UnixDatagram::bind(&local_path)?;
-    socket.connect(peer_path)?;
-    configure_socket_buffers(&socket);
-    Ok(socket)
-}
-
-fn configure_socket_buffers(socket: &UnixDatagram) {
-    if let Err(err) = setsockopt(socket, sockopt::SndBuf, &SOCKET_SNDBUF) {
-        tracing::warn!(error = %err, "failed to set krun unixgram SO_SNDBUF");
-    }
-    if let Err(err) = setsockopt(socket, sockopt::RcvBuf, &SOCKET_RCVBUF) {
-        tracing::warn!(error = %err, "failed to set krun unixgram SO_RCVBUF");
-    }
-}
-
-fn local_unix_datagram_path(peer_path: &Path, vm_id: &str, backend: &str) -> PathBuf {
-    peer_path.with_file_name(format!("{}-{backend}.sock", local_socket_id(vm_id)))
-}
-
-fn local_socket_id(vm_id: &str) -> &str {
-    vm_id.get(..LOCAL_SOCKET_ID_LEN).unwrap_or(vm_id)
-}
-
-fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::fd::AsRawFd;
-    use std::path::Path;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use clap::Parser;
 
-    use crate::local_unix_datagram_path;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::Cli;
-
-    #[test]
-    fn local_unix_datagram_path_uses_short_vm_id_and_backend() {
-        assert_eq!(
-            local_unix_datagram_path(
-                Path::new("/tmp/silo-net/gvproxy.sock"),
-                "1234567890abcdef",
-                "krun"
-            ),
-            Path::new("/tmp/silo-net/1234567890ab-krun.sock")
-        );
-    }
-
-    #[test]
-    fn local_unix_datagram_path_keeps_short_vm_id() {
-        assert_eq!(
-            local_unix_datagram_path(Path::new("/tmp/silo-net/gvproxy.sock"), "vm123", "krun"),
-            Path::new("/tmp/silo-net/vm123-krun.sock")
-        );
-    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]

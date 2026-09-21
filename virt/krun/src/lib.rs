@@ -1,12 +1,19 @@
-//! Process-backed libkrun helper API for Silo.
+//! Libkrun configuration, process-owning engine, and helper launcher.
+//!
+//! The `engine` feature exposes synchronous execution for dedicated worker
+//! processes. Normal VM shutdown terminates the caller; it is not embeddable.
 //!
 //! See `virt/krun/README.md` for the libkrun build-feature policy.
 
 mod builder;
 mod config;
+#[cfg(feature = "engine")]
+pub mod engine;
 mod error;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod host;
+#[cfg(feature = "engine")]
+mod network;
 mod rosetta;
 mod serial;
 mod status;
