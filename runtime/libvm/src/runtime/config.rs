@@ -37,8 +37,6 @@ pub struct RuntimeConfig {
     pub vmmon_path: Option<PathBuf>,
     /// Explicit netd executable path.
     pub netd_path: Option<PathBuf>,
-    /// Explicit krun executable path.
-    pub krun_path: Option<PathBuf>,
     /// Explicit default kernel path.
     pub kernel_path: Option<PathBuf>,
     /// Explicit default initramfs path.
@@ -78,7 +76,6 @@ impl RuntimeConfig {
             networking: RuntimeNetworkingConfig::default(),
             vmmon_path: None,
             netd_path: None,
-            krun_path: None,
             kernel_path: None,
             initramfs_path: None,
             agent_path: None,
@@ -130,12 +127,6 @@ impl RuntimeConfig {
     /// Sets the netd executable path used for userspace networking.
     pub fn with_netd_path(mut self, netd_path: impl Into<PathBuf>) -> Self {
         self.netd_path = Some(netd_path.into());
-        self
-    }
-
-    /// Sets the krun executable path used by the krun backend.
-    pub fn with_krun_path(mut self, krun_path: impl Into<PathBuf>) -> Self {
-        self.krun_path = Some(krun_path.into());
         self
     }
 
@@ -451,7 +442,6 @@ impl Default for RuntimeConfig {
             networking: RuntimeNetworkingConfig::default(),
             vmmon_path: None,
             netd_path: None,
-            krun_path: None,
             kernel_path: None,
             initramfs_path: None,
             agent_path: None,

@@ -158,7 +158,6 @@ target/silo-runtime/<target>/release/
   bin/
     vmmon
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -185,7 +184,6 @@ silo-runtime-<version>-<target>/
   bin/
     vmmon
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -203,7 +201,6 @@ silo-<version>-<target>/
     silo
     vmmon
     netd
-    krun
   assets/
     kernel-default
     initramfs

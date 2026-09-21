@@ -11,8 +11,8 @@ use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::krun_worker::protocol::StartupStage;
 use crate::krun_worker::protocol::{Event, MAX_EVENT};
-use crate::virt::exit::StartupStage;
 use clap::Parser;
 use krun::engine::{self, ConsoleFds, Resources};
 

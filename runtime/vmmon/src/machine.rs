@@ -38,7 +38,6 @@ pub(crate) struct VmSpecInputs<'a> {
     pub spec: &'a VmSpec,
     pub network: &'a RuntimeNetwork,
     pub guest_services_enabled: bool,
-    pub krun_path: &'a Path,
     pub selected_backend: crate::virt::BackendKind,
     pub rosetta_intent: crate::virt::RosettaIntent,
     pub prepared_rosetta: Option<krun::RosettaLaunchConfig>,
@@ -63,7 +62,6 @@ pub(crate) fn vm_spec_machine_config(
     let mut builder = VmConfig::builder(inputs.name)
         .vm_id(inputs.id)
         .base_directory(inputs.data_dir.to_path_buf())
-        .krun_path(inputs.krun_path)
         .kernel_cmdline(vm_spec_kernel_cmdline(
             inputs.spec,
             inputs.guest_services_enabled,
@@ -245,7 +243,7 @@ mod tests {
     };
     use crate::virt::VmConfig;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
     use vm_spec::{Boot, Disk, Hardware, Kernel, Mount, Storage, VmSpec, Vsock};
 
@@ -344,7 +342,6 @@ mod tests {
             spec: &spec,
             network: &RuntimeNetwork::None,
             guest_services_enabled: true,
-            krun_path: Path::new("/tmp/krun"),
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -360,10 +357,6 @@ mod tests {
             ]
         );
         assert_eq!(machine_config.config.vm_id(), "vm123");
-        assert_eq!(
-            machine_config.config.krun().helper_path.as_deref(),
-            Some(Path::new("/tmp/krun"))
-        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -381,7 +374,6 @@ mod tests {
             spec: &spec,
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
-            krun_path: Path::new("/tmp/krun"),
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -423,7 +415,6 @@ mod tests {
                 spec: &spec,
                 network: &RuntimeNetwork::None,
                 guest_services_enabled: false,
-                krun_path: Path::new("/tmp/krun"),
                 selected_backend: crate::virt::BackendKind::Vz,
                 rosetta_intent: crate::virt::RosettaIntent::Disabled,
                 prepared_rosetta: None,
@@ -467,7 +458,6 @@ mod tests {
             spec: &spec,
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
-            krun_path: Path::new("/tmp/krun"),
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -505,7 +495,6 @@ mod tests {
             spec: &spec,
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
-            krun_path: Path::new("/tmp/krun"),
             selected_backend: crate::virt::BackendKind::Krun,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -543,7 +532,6 @@ mod tests {
             spec: &spec,
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
-            krun_path: Path::new("/tmp/krun"),
             selected_backend: crate::virt::BackendKind::Krun,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -573,7 +561,6 @@ mod tests {
             spec: &spec,
             network: &runtime_network,
             guest_services_enabled: false,
-            krun_path: Path::new("/tmp/krun"),
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -606,7 +593,6 @@ mod tests {
             spec: &spec,
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
-            krun_path: Path::new("/tmp/krun"),
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -638,7 +624,6 @@ mod tests {
             spec: &spec,
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
-            krun_path: Path::new("/tmp/krun"),
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -663,7 +648,6 @@ mod tests {
             spec: &spec,
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
-            krun_path: Path::new("/tmp/krun"),
             selected_backend: crate::virt::BackendKind::Vz,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,
@@ -691,7 +675,6 @@ mod tests {
             spec: &spec,
             network: &RuntimeNetwork::None,
             guest_services_enabled: false,
-            krun_path: Path::new("/tmp/krun"),
             selected_backend: crate::virt::BackendKind::Krun,
             rosetta_intent: crate::virt::RosettaIntent::Disabled,
             prepared_rosetta: None,

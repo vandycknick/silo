@@ -8,7 +8,6 @@ const MAX_ENCODED_LEN: usize = 16_384;
 const MAX_HOST_ROOT_LEN: usize = 4_096;
 const DIGEST_LEN: usize = 32;
 const RESPONSE_LEN: usize = 1_024;
-pub(crate) const ENV_ROSETTA_CONFIG: &str = "SILO_ROSETTA_CONFIG";
 pub(crate) const ROSETTA_MOUNT_TAG: &str = "rosetta";
 
 #[derive(Deserialize, Serialize)]

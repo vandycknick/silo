@@ -176,12 +176,7 @@ impl Runtime {
         virt_backend: Option<crate::runtime::VirtBackendOverride>,
     ) -> Result<Self, LibVmError> {
         let lock_manager = LockManager::open(paths.locks_dir().to_path_buf())?;
-        let vmmon = Vmmon::new(
-            paths.clone(),
-            components.vmmon.clone(),
-            components.krun.clone(),
-            virt_backend,
-        );
+        let vmmon = Vmmon::new(paths.clone(), components.vmmon.clone(), virt_backend);
         let runtime = Self {
             paths,
             store,
@@ -2089,12 +2084,10 @@ mod tests {
         let assets = root.join("assets");
         std::fs::create_dir_all(&bin).expect("create runtime bin");
         std::fs::create_dir_all(&assets).expect("create runtime assets");
-        for helper in ["netd", "krun"] {
-            let path = bin.join(helper);
-            std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write helper");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("make helper executable");
-        }
+        let netd = bin.join("netd");
+        std::fs::write(&netd, "#!/bin/sh\nexit 0\n").expect("write helper");
+        std::fs::set_permissions(&netd, std::fs::Permissions::from_mode(0o755))
+            .expect("make helper executable");
         let vmmon = bin.join("vmmon");
         std::fs::write(
             &vmmon,

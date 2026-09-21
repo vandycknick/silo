@@ -2389,8 +2389,6 @@ name = "krun"
 version = "0.1.0"
 dependencies = [
  "bzip2",
- "clap",
- "eyre",
  "kvm-ioctls 0.22.1",
  "libkrun",
  "nix 0.31.3",
@@ -2398,7 +2396,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tracing",
- "utils",
 ]
 
 [[package]]

@@ -16,7 +16,6 @@ pub enum Component {
     Cli,
     Vmmon,
     Netd,
-    Krun,
     Agent,
     Portd,
     Init,
@@ -50,8 +49,6 @@ pub enum ComponentError {
     },
     #[error("vmmon binary not found after build: {path}")]
     MissingVmmonBinary { path: std::path::PathBuf },
-    #[error("krun binary not found after build: {path}")]
-    MissingKrunBinary { path: std::path::PathBuf },
     #[error("rprobe must be built natively on Linux ARM64")]
     UnsupportedRprobeHost,
 }
@@ -61,7 +58,6 @@ pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         Component::Cli,
         Component::Vmmon,
         Component::Netd,
-        Component::Krun,
         Component::Agent,
         Component::Init,
     ] {
@@ -78,7 +74,6 @@ pub fn build_component(
         Component::Cli => build_cargo_package(context, "cli"),
         Component::Vmmon => build_vmmon(context),
         Component::Netd => build_netd(context),
-        Component::Krun => build_krun(context),
         Component::Agent => build_guest_agent(context),
         Component::Portd => build_guest_portd(context),
         Component::Init => build_guest_init(context),
@@ -262,51 +257,6 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     if context.profile == Profile::Release && context.host == HostTarget::MacosArm64 {
         release::set_macos_build_version(&output)?;
     }
-    Ok(())
-}
-
-fn build_krun(context: &BuildContext<'_>) -> Result<(), ComponentError> {
-    let mut cargo = cargo_command(context)?;
-    cargo.args([
-        "build",
-        "--locked",
-        "-p",
-        "krun",
-        "--features",
-        "krun-bin",
-        "--bin",
-        "krun",
-    ]);
-    context.profile.apply_cargo(&mut cargo);
-    command::run(cargo)?;
-
-    let binary = context
-        .target_dir
-        .join(context.profile.directory())
-        .join("krun");
-    if !binary.is_file() {
-        return Err(ComponentError::MissingKrunBinary { path: binary });
-    }
-
-    if context.host == HostTarget::MacosArm64 {
-        let entitlements = context
-            .workspace_root
-            .join("packaging/macos/krun.entitlements");
-        let mut sign = Command::new("/usr/bin/codesign");
-        sign.args(["-f", "--entitlements"])
-            .arg(entitlements)
-            .args(["-s", "-"])
-            .arg(&binary);
-        command::run(sign)?;
-
-        let mut verify = Command::new("/usr/bin/codesign");
-        verify.args(["--verify", "--verbose=4"]).arg(&binary);
-        command::run(verify)?;
-    }
-
-    let mut smoke = Command::new(binary);
-    smoke.arg("--help");
-    command::output(smoke)?;
     Ok(())
 }
 

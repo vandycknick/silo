@@ -78,12 +78,6 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Sets the krun executable path used by the krun backend.
-    pub fn krun_path(mut self, krun_path: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_krun_path(krun_path);
-        self
-    }
-
     /// Selects the virtualization backend used for machines started by this runtime.
     pub fn virt_backend(mut self, backend: VirtBackendOverride) -> Self {
         self.config = self.config.with_virt_backend(backend);
@@ -140,7 +134,6 @@ mod tests {
         let config = RuntimeBuilder::new()
             .vmmon_path("/runtime/bin/vmmon")
             .netd_path("/runtime/bin/netd")
-            .krun_path("/runtime/bin/krun")
             .virt_backend(VirtBackendOverride::Krun)
             .kernel_path("/runtime/assets/kernel-default")
             .initramfs_path("/runtime/assets/initramfs")
@@ -157,10 +150,6 @@ mod tests {
         assert_eq!(
             config.netd_path.as_deref(),
             Some(std::path::Path::new("/runtime/bin/netd"))
-        );
-        assert_eq!(
-            config.krun_path.as_deref(),
-            Some(std::path::Path::new("/runtime/bin/krun"))
         );
         assert_eq!(
             config.kernel_path.as_deref(),

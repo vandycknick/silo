@@ -161,7 +161,6 @@ The portable runtime root has this fixed layout:
   bin/
     vmmon
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -184,7 +183,6 @@ silo-<version>-<target>/
     silo
     vmmon
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -204,7 +202,6 @@ profile directory:
   silo
   vmmon
   netd
-  krun
   assets/
     kernel-default
     initramfs
@@ -472,7 +469,6 @@ Existing environment controls remain available while lookup is centralized:
 ```text
 SILO_VMMON_PATH
 NETD_BIN
-KRUN_BIN
 SILO_ASSET_DIR
 ```
 
@@ -506,7 +502,6 @@ adjacent development layout is:
   silo
   vmmon
   netd
-  krun
   assets/
     kernel-default
     initramfs
@@ -530,7 +525,6 @@ derives and validates this fixed layout:
     silo
     vmmon
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -612,7 +606,6 @@ Silo.app/
     Helpers/
       vmmon
       netd
-      krun
     Resources/
       assets/
         kernel-default
@@ -625,7 +618,6 @@ The layout defines the component paths without a Silo-specific manifest:
 ```text
 vmmon     = Contents/Helpers/vmmon
 netd      = Contents/Helpers/netd
-krun      = Contents/Helpers/krun
 kernel    = Contents/Resources/assets/kernel-default
 initramfs = Contents/Resources/assets/initramfs
 agent     = Contents/Resources/assets/agent
@@ -662,7 +654,6 @@ preserves Homebrew Cask invocation:
         |
         +-- ../Helpers/vmmon
         +-- ../Helpers/netd
-        +-- ../Helpers/krun
         `-- ../Resources/assets
 ```
 
@@ -753,7 +744,6 @@ silo-<version>-linux-amd64-gnu/
     silo
     vmmon
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -764,7 +754,6 @@ silo-<version>-linux-arm64-gnu/
     silo
     vmmon
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -866,7 +855,6 @@ runtime/
   bin/
     vmmon
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -892,7 +880,6 @@ silo/
     bin/
       vmmon
       netd
-      krun
     assets/
       kernel-default
       initramfs
@@ -1209,3 +1196,7 @@ and release staging contract in this ADR support them without replacement.
 - [npm: `package.json` platform metadata and optional dependencies](https://docs.npmjs.com/cli/v11/configuring-npm/package-json)
 - [PEP 600: Future `manylinux` platform tags](https://peps.python.org/pep-0600/)
 - [Go Modules Reference: Authenticating modules](https://go.dev/ref/mod#authenticating)
+
+The krun backend now executes as a private worker mode of vmmon. Runtime payloads
+do not contain a separate krun executable. `KRUN_BIN` is rejected as obsolete;
+vmmon requires the union of virtualization and hypervisor macOS entitlements.

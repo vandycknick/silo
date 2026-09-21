@@ -17,10 +17,9 @@ use crate::targets::HostTarget;
 
 const DISK_IMAGE_LICENSE: &str = "common/disk-image/LICENSE-APACHE";
 const RELEASE_MATERIAL: [&str; 2] = ["packaging/release/THIRD_PARTY_NOTICES", DISK_IMAGE_LICENSE];
-const RUNTIME_FILES: [(&str, u32); 6] = [
+const RUNTIME_FILES: [(&str, u32); 5] = [
     ("bin/vmmon", 0o755),
     ("bin/netd", 0o755),
-    ("bin/krun", 0o755),
     ("assets/kernel-default", 0o644),
     ("assets/initramfs", 0o644),
     ("assets/agent", 0o755),
@@ -477,6 +476,16 @@ mod tests {
     use std::path::Path;
 
     use crate::archive::{disk_image_license_transform, DISK_IMAGE_LICENSE, RELEASE_MATERIAL};
+
+    #[test]
+    fn runtime_archive_has_no_standalone_vmm_executable() {
+        let binaries: Vec<_> = crate::archive::RUNTIME_FILES
+            .iter()
+            .filter(|(path, _)| path.starts_with("bin/"))
+            .copied()
+            .collect();
+        assert_eq!(binaries, [("bin/vmmon", 0o755), ("bin/netd", 0o755)]);
+    }
 
     #[test]
     fn release_material_includes_the_disk_image_license() {

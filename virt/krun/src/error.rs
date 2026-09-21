@@ -6,20 +6,4 @@ pub type Result<T> = std::result::Result<T, KrunBackendError>;
 pub enum KrunBackendError {
     #[error("invalid krun config: {0}")]
     InvalidConfig(String),
-
-    #[error("krun serial stream was already taken")]
-    SerialAlreadyTaken,
-
-    #[error("krun serial stream is not configured; enable stdio_console first")]
-    SerialNotConfigured,
-
-    #[error("krun host check through {binary} failed with {status}: {message}")]
-    HostCheck {
-        binary: String,
-        status: String,
-        message: String,
-    },
-
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
 }

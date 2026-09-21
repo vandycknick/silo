@@ -217,7 +217,6 @@ pub(crate) struct InitInputs<'a> {
     pub(crate) name: &'a str,
     pub(crate) network_args: &'a [String],
     pub(crate) agent_enabled: bool,
-    pub(crate) krun_path: &'a Path,
     pub(crate) serial_file: File,
 }
 
@@ -242,7 +241,6 @@ pub async fn init(
         name,
         network_args,
         agent_enabled,
-        krun_path,
         serial_file,
     } = inputs;
     let start_request = start_request.read(machine_id, machine_run_id).await?;
@@ -306,7 +304,6 @@ pub async fn init(
         spec: &spec,
         network: &network,
         guest_services_enabled,
-        krun_path,
         selected_backend,
         rosetta_intent,
         prepared_rosetta,
@@ -820,7 +817,6 @@ mod tests {
             directory.join("vm.sock"),
         );
         let network = vec!["none".to_string()];
-        let krun_path = directory.join("missing-krun");
 
         let result = init(
             &runtime,
@@ -830,7 +826,6 @@ mod tests {
                 name: "ordering-test",
                 network_args: &network,
                 agent_enabled: false,
-                krun_path: &krun_path,
                 serial_file,
             },
             &mut start_request,
@@ -922,7 +917,6 @@ mod tests {
             directory.join("vm.sock"),
         );
         let network = vec!["none".to_string()];
-        let krun_path = directory.join("missing-krun");
         let result = init(
             &runtime,
             InitInputs {
@@ -931,7 +925,6 @@ mod tests {
                 name: "start-order-test",
                 network_args: &network,
                 agent_enabled: false,
-                krun_path: &krun_path,
                 serial_file,
             },
             &mut start_request,

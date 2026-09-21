@@ -114,6 +114,96 @@ fn worker() -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
     (child, writer.into(), keepalive, events.into(), pty.master)
 }
 
+struct SupervisorFixture(std::path::PathBuf);
+
+impl SupervisorFixture {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::path::Path::new("/tmp").join(format!("vmmon-worker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("fixture root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("private root");
+        std::fs::write(root.join("kernel"), b"not a native kernel").expect("invalid payload");
+        let spec = vm_spec::VmSpec {
+            boot: Some(vm_spec::Boot {
+                kernel: Some(vm_spec::Kernel {
+                    path: Some("kernel".into()),
+                    cmdline: vec![],
+                    initramfs: None,
+                }),
+                userdata: None,
+            }),
+            hardware: Some(vm_spec::Hardware {
+                cpus: Some(1),
+                memory: Some(128),
+                nested_virtualization: Some(false),
+                rosetta: Some(false),
+            }),
+            ..vm_spec::VmSpec::current()
+        };
+        std::fs::write(
+            root.join("spec.json"),
+            serde_json::to_vec(&spec).expect("spec encoding"),
+        )
+        .expect("write spec");
+        Self(root)
+    }
+
+    fn launch(&self) -> Process {
+        let mut command = command();
+        command.arg("--foreground").args([
+            "--id",
+            &uuid::Uuid::new_v4().to_string(),
+            "--run-id",
+            &uuid::Uuid::new_v4().to_string(),
+            "--name",
+            "worker-failure",
+        ]);
+        for (flag, path) in [
+            ("--data-dir", self.0.clone()),
+            ("--runtime-dir", self.0.clone()),
+            ("--pidfile", self.0.join("vm.pid")),
+            ("--exit-status", self.0.join("vm.exit.json")),
+            ("--config", self.0.join("spec.json")),
+            ("--socket", self.0.join("vm.sock")),
+            ("--serial-log", self.0.join("serial.log")),
+            ("--trace-log", self.0.join("trace.log")),
+        ] {
+            command.arg(flag).arg(path);
+        }
+        for name in [
+            "_VM_STARTPIPE",
+            "_VM_SYNCPIPE",
+            "_VM_MACHINE_LOCK",
+            "_VM_MACHINE_LOG_DIR",
+        ] {
+            command.env_remove(name);
+        }
+        Process(Some(command.spawn().expect("spawn supervisor")))
+    }
+}
+
+impl Drop for SupervisorFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn supervisor_launches_one_real_worker_and_exits_on_native_startup_failure() {
+    let fixture = SupervisorFixture::new();
+    let output = fixture.launch().output();
+    assert!(!output.status.success());
+    let trace = std::fs::read_to_string(fixture.0.join("trace.log")).expect("supervisor trace");
+    assert_eq!(trace.matches("krun worker spawned").count(), 1, "{trace}");
+    let status: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fixture.0.join("vm.exit.json")).expect("exit metadata"),
+    )
+    .expect("exit record");
+    assert_eq!(status["outcome"], "error");
+}
+
 #[test]
 fn worker_parser_never_falls_through_to_supervisor_arguments() {
     for argv in [

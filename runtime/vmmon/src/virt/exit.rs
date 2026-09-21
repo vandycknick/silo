@@ -1,5 +1,6 @@
 //! Terminal backend results. Process observations never stand in for wait/reap.
 
+use crate::krun_worker::protocol::StartupStage;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7,16 +8,6 @@ pub enum VmExit {
     Stopped,
     StoppedWithError(String),
     Worker(Box<WorkerExit>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum StartupStage {
-    Spawned,
-    Request,
-    Admission,
-    Build,
-    Started,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +74,8 @@ impl VmExit {
 
 #[cfg(test)]
 mod tests {
-    use crate::virt::exit::{ForceReason, StartupStage, VmExit, WorkerExit};
+    use crate::krun_worker::protocol::StartupStage;
+    use crate::virt::exit::{ForceReason, VmExit, WorkerExit};
 
     fn report(
         code: Option<i32>,

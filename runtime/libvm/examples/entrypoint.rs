@@ -17,7 +17,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::builder()
         .vmmon_path(adjacent.join("vmmon"))
         .netd_path(adjacent.join("netd"))
-        .krun_path(adjacent.join("krun"))
         .kernel_path(adjacent.join("assets/kernel-default"))
         .initramfs_path(adjacent.join("assets/initramfs"))
         .agent_path(adjacent.join("assets/agent"))

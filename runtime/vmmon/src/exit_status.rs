@@ -266,7 +266,8 @@ mod tests {
 
     #[test]
     fn worker_force_is_not_a_crash_and_does_not_replace_startup_failure() {
-        use crate::virt::exit::{ForceReason, StartupStage, VmExit, WorkerExit};
+        use crate::krun_worker::protocol::StartupStage;
+        use crate::virt::exit::{ForceReason, VmExit, WorkerExit};
         let worker = WorkerExit {
             pid: 123,
             raw_status: 9,

@@ -3,7 +3,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::virt::exit::StartupStage;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StartupStage {
+    Spawned,
+    Request,
+    Admission,
+    Build,
+    Started,
+}
 
 pub(crate) const MAX_REQUEST: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_EVENT: usize = 16 * 1024;
@@ -30,7 +38,6 @@ pub(crate) struct Launch {
 }
 
 impl Launch {
-    #[cfg(test)]
     pub(crate) fn from_config(config: krun::KrunConfig) -> io::Result<Self> {
         krun::validate_config(&config).map_err(io::Error::other)?;
         let rosetta = config

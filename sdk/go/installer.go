@@ -324,7 +324,6 @@ func (reader *contextReader) Read(buffer []byte) (int, error) {
 var runtimeFiles = map[string]os.FileMode{
 	"bin/vmmon":               0o755,
 	"bin/netd":                0o755,
-	"bin/krun":                0o755,
 	"assets/kernel-default":   0o644,
 	"assets/initramfs":        0o644,
 	"assets/agent":            0o755,

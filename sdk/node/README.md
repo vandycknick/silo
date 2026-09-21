@@ -11,7 +11,7 @@ co-versioned runtime set containing `vmmon`, `netd`, `krun`, the kernel,
 initramfs, and agent. `Runtime.open({ vmmonPath })` replaces only `vmmon`; the
 remaining components must still resolve from the same centralized discovery
 contract. The retained component overrides (`SILO_VMMON_PATH`, `NETD_BIN`,
-`KRUN_BIN`, and `SILO_ASSET_DIR`) and portable-root override
+and `SILO_ASSET_DIR`) and portable-root override
 (`SILO_RUNTIME_DIR`) remain available to `libvm`.
 
 `PATH` is disabled unless `SILO_ASSET_DIR` is explicit and validates as one

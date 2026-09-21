@@ -15,10 +15,9 @@ use crate::targets::HostTarget;
 const APP_NAME: &str = "Silo.app";
 const BUNDLE_IDENTIFIER: &str = "sh.silo.app";
 const MINIMUM_SYSTEM_VERSION: &str = "26.0";
-const HELPERS: [(&str, Option<&str>); 3] = [
+const HELPERS: [(&str, Option<&str>); 2] = [
     ("vmmon", Some("runtime/vmmon/vmmon.entitlements")),
     ("netd", None),
-    ("krun", Some("packaging/macos/krun.entitlements")),
 ];
 const ASSETS: [(&str, u32); 3] = [
     ("kernel-default", 0o644),
@@ -343,7 +342,7 @@ fn validate_unsigned_layout(
     let contents = bundle.join("Contents");
     validate_directory_entries(&contents, ["Helpers", "Info.plist", "MacOS", "Resources"])?;
     validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
-    validate_directory_entries(&contents.join("Helpers"), ["krun", "netd", "vmmon"])?;
+    validate_directory_entries(&contents.join("Helpers"), ["netd", "vmmon"])?;
     validate_directory_entries(&contents.join("Resources"), ["Silo.icns", "assets"])?;
     validate_asset_entries(&contents.join("Resources/assets"))?;
     validate_regular_file(&contents.join("Info.plist"), None)?;
@@ -490,7 +489,7 @@ fn entitlement_map(path: &Path, plist: &[u8]) -> Result<BTreeMap<String, bool>, 
 
 pub fn verify_signed_bundle(bundle: &Path) -> Result<(), AppError> {
     validate_distribution_layout(bundle)?;
-    for name in ["silo", "vmmon", "netd", "krun"] {
+    for name in ["silo", "vmmon", "netd"] {
         let path = match name {
             "silo" => bundle.join("Contents/MacOS/silo"),
             _ => bundle.join("Contents/Helpers").join(name),
@@ -504,10 +503,6 @@ pub fn verify_signed_bundle(bundle: &Path) -> Result<(), AppError> {
             "com.apple.security.hypervisor",
             "com.apple.security.virtualization",
         ],
-    )?;
-    verify_entitlements(
-        &bundle.join("Contents/Helpers/krun"),
-        &["com.apple.security.hypervisor"],
     )?;
     verify_entitlements(&bundle.join("Contents/MacOS/silo"), &[])?;
     verify_entitlements(&bundle.join("Contents/Helpers/netd"), &[])?;
@@ -577,7 +572,7 @@ fn validate_distribution_layout(bundle: &Path) -> Result<(), AppError> {
         ],
     )?;
     validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
-    validate_directory_entries(&contents.join("Helpers"), ["krun", "netd", "vmmon"])?;
+    validate_directory_entries(&contents.join("Helpers"), ["netd", "vmmon"])?;
     validate_directory_entries(&contents.join("Resources"), ["Silo.icns", "assets"])?;
     validate_asset_entries(&contents.join("Resources/assets"))?;
     validate_regular_file(&contents.join("Info.plist"), None)?;
@@ -853,4 +848,22 @@ fn invalid<T>(path: &Path, reason: String) -> Result<T, AppError> {
         path: path.to_path_buf(),
         reason,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn app_uses_vmmon_for_both_virtualization_roles() {
+        assert_eq!(
+            crate::app::HELPERS,
+            [
+                ("vmmon", Some("runtime/vmmon/vmmon.entitlements")),
+                ("netd", None)
+            ]
+        );
+        let entitlements = include_str!("../../runtime/vmmon/vmmon.entitlements");
+        assert!(entitlements.contains("com.apple.security.virtualization"));
+        assert!(entitlements.contains("com.apple.security.hypervisor"));
+        assert_eq!(entitlements.matches("<key>").count(), 2);
+    }
 }

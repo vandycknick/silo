@@ -81,9 +81,7 @@ impl Vmmon {
             .arg("--network")
             .arg(launch.network.to_vmmon_arg())
             .arg("--run-id")
-            .arg(launch.run_id)
-            .arg("--krun-path")
-            .arg(self.krun_path());
+            .arg(launch.run_id);
         if launch.agent_enabled {
             command.arg("--agent-enabled");
         }

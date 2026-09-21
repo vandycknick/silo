@@ -105,8 +105,6 @@ pub enum NetworkMode {
 /// Options consumed only by the krun (Linux) backend; other backends ignore them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KrunOptions {
-    /// Absolute path to the spawned `krun` helper binary.
-    pub helper_path: Option<PathBuf>,
     /// Per-start compatibility data acquired and released before helper spawn.
     pub prepared_rosetta: Option<krun::RosettaLaunchConfig>,
 }
@@ -346,12 +344,6 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Path to the krun helper binary (Linux backend only; ignored elsewhere).
-    pub fn krun_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.config.krun.helper_path = Some(path.into());
-        self
-    }
-
     pub fn prepared_rosetta(mut self, config: krun::RosettaLaunchConfig) -> Self {
         self.config.krun.prepared_rosetta = Some(config);
         self
@@ -425,15 +417,10 @@ mod tests {
     fn builder_maps_backend_sections() {
         let identifier = MachineIdentifier::from_bytes(vec![1, 2, 3]);
         let config = base_builder()
-            .krun_path("/usr/libexec/krun")
             .rosetta(RosettaIntent::VzNative)
             .machine_identifier(identifier.clone())
             .build();
 
-        assert_eq!(
-            config.krun().helper_path.as_deref(),
-            Some(Path::new("/usr/libexec/krun"))
-        );
         assert_eq!(config.rosetta(), RosettaIntent::VzNative);
         assert_eq!(config.vz().machine_identifier, Some(identifier));
     }

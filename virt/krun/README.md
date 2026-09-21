@@ -1,189 +1,74 @@
 # krun
 
-`krun` is Silo's libkrun integration crate and helper binary.
+Silo's typed configuration and synchronous, process-owning libkrun engine.
+There is no standalone krun executable or process launcher in this crate.
 
-The crate exposes:
+## Execution boundary
 
-- a process-backed `VirtualMachineBuilder`
-- a `VirtualMachine` handle for lifecycle management
-- a `SerialConnection` wrapper for helper stdio access
-- typed disk, mount, network, and inherited-vsock configuration
-- typed Rosetta launch configuration transported only to the selected helper
+The supervisor launches its own vmmon executable with argv[0] `krun` and the
+first private argument `__krun`. The worker dispatches before supervisor
+argument parsing, logging, Tokio, or services. It receives private configuration
+through an inherited pipe, not argv or environment variables.
 
-With the `engine` feature, the crate also exposes `engine::run_process` for a dedicated worker process. The `krun` binary parses Silo's flat helper arguments, sets up process policy, and delegates device construction and execution to that synchronous engine. It does not use the library builder and does not expose subcommands. On Linux, `krun --check-host` runs the deeper KVM host check without starting a guest.
+`engine::run_process(config, resources, on_built)` must run only in that dedicated
+worker process. Libkrun normally terminates the **entire calling process** using
+`_exit()`. A thread is not sufficient isolation. Returning errors do not make a
+partially built VM reusable, and restart always needs a new supervisor generation.
 
-## Boundary
+`VmmBuilder::build()` can start guest execution before `on_built`. The callback
+finishes process-control setup and acknowledges backend startup, not guest-agent
+readiness. Unexpected event-loop return is an error.
 
-The synchronous engine and process entry point have different jobs. Enabling the `engine` feature links libkrun, but does not make it safe to execute a VM inside a supervisor process. Normal shutdown calls `_exit()` and terminates the entire calling process; a thread is not isolation.
+## Ownership
 
-Library responsibilities:
+- The engine validates configuration and constructs devices in stable order:
+  console, disks, mounts, Rosetta, vsock, network, RNG, optional balloon.
+- Console descriptors and explicitly protected streams are borrowed for the
+  entire call. The mux descriptor is moved into the native device.
+- `engine::Control` offers supported guest shutdown and host-reclaim snapshots.
+  Clones share the handle; there is no restart, returning teardown, or child API.
+- The worker owns admission, global native logging, signal masks, mandatory
+  watchdog setup, bounded startup events, and periodic reclaim reporting.
+- Vmmon owns child launch, early console/diagnostic consumption, cancellation,
+  termination, reaping, mux/session fencing, and finalization.
 
-- hold typed configuration structs
-- perform structural config validation only, such as non-zero CPU and memory values
-- build the flat helper command line
-- spawn and manage the `krun` helper process
-- set up PTY-backed stdio when `stdio_console(true)` is requested
-- expose process lifecycle and serial ownership handles
-- run the helper's lightweight host admission check before spawning a VM
+Raw block format, read-only flags, relaxed disk sync, external kernel formats,
+network feature bits and buffer policy remain unchanged. The engine supports
+Unix datagram, Unix stream and TAP configuration; the common production backend
+continues to expose only its supported network modes. Standalone native vsock is
+restricted to CID 3 and cannot coexist with the mux.
 
-Binary responsibilities:
+Rosetta configuration remains typed and validated, including immutable source
+verification, translator digest, ioctl result and captured-response size. Debug
+output redacts its content. The selected worker receives it through the bounded
+private request. The signed qualification harness also uses the vmmon worker;
+its executable option is `--vmmon`, not `--krun`.
 
-- parse flat helper arguments
-- initialize native logging, watchdog, shutdown signals and periodic reporting
-- call `engine::run_process` with explicit console borrows and owned mux resources
-- finish process control setup in the post-build callback before entering the event loop
-- validate Linux KVM access, API compatibility, and required capabilities
+## Features and host support
 
-## Linux Host Checks
+The optional `engine` feature links the pinned libkrun fork. Configuration-only
+consumers need not enable it. On x86-64 it retains static bzip2 support.
 
-Every Linux VM launch performs a lightweight check through the same `krun`
-helper that will run the guest. It opens `/dev/kvm`, requires stable KVM API
-version 12, and verifies the capabilities libkrun needs. Failure is returned to
-vmmon before the VM helper process is spawned.
+The dependency revision and native dependency policy are documented in
+[`docs/libkrun-deps.md`](../../docs/libkrun-deps.md). Silo enables only native
+`blk` and `net` features, without libkrun's default features or C `ffi` exports.
+GPU, input, timesync, confidential-compute, Nitro and other unused APIs stay
+disabled. Do not enable features speculatively.
 
-For a deeper operational check, run:
+Linux admission checks KVM access, API version and required capabilities inside
+the actual worker. The reusable library host-check APIs remain available; there
+is no extra krun host-check process. macOS workers perform the empty HVF admission
+probe and require vmmon's hypervisor entitlement. The vmmon entitlement set also
+retains virtualization support for its VZ backend.
 
-```sh
-krun --check-host
-```
+## Termination semantics
 
-The explicit check also executes `KVM_CREATE_VM` and immediately closes the
-empty VM descriptor. It allocates no guest memory or vCPUs and runs no guest
-code. This detects ioctl restrictions and nested-virtualization failures that
-opening `/dev/kvm` alone cannot prove.
+A supervisor-issued worker SIGKILL is `Forced`, including Linux's normal stop
+mechanism. A nonzero worker exit or an unexpected signal is an error. Shutdown
+intent does not turn an unrelated crash into an expected stop. Raw process status,
+startup progress, force reason and primary startup errors are retained separately.
 
-Direct libkrun access belongs in `engine`. It validates configuration, constructs devices in stable order, rejects unsupported path encodings and enters the event loop. It does not spawn processes, initialize global logging, install signals, or create watchdog/reporting threads. `engine::Control` only offers supported shutdown and host-reclaim snapshots. Its clone shares ownership without duplicating native descriptors.
-
-`VmmBuilder::build()` may begin guest execution before the post-build callback. A callback error requires the worker to terminate, not retry construction. Console descriptors and explicitly protected streams are borrowed for the entire engine call; the mux descriptor is transferred into the native device.
-
-## Scope
-
-Current scope focuses on the libkrun path used by Silo today:
-
-- direct kernel and initramfs boot
-- raw block devices
-- virtiofs mounts
-- one explicit native vsock device connected to vmmon by an inherited control
-  socket
-- stdio console output
-- process-backed VM lifecycle management from Rust callers
-- graceful macOS aarch64 guest shutdown through a blocked `SIGTERM` and
-  libkrun's host-side shutdown request
-
-Planned follow-up scope includes:
-
-- richer `VirtualMachine` lifecycle state
-- higher-level serial and vsock convenience helpers
-
-## Requirements
-
-- Rust toolchain
-- access to the pinned libkrun fork revision documented in
-  `docs/libkrun-deps.md`
-- Linux or macOS host support matching the compiled libkrun backend
-- on Linux, access to a KVM device with the required API and capabilities
-
-## Source Integration
-
-The optional `engine` Cargo feature compiles the pinned libkrun fork; `krun-bin` enables it for the helper executable. Building the launcher library alone does not activate or link libkrun, preserving the process boundary for `vmmon` and other callers.
-
-The engine uses a narrow adapter over `VmmBuilder` and the native device constructors. It transfers owned network descriptors to libkrun, borrows console descriptors for the VMM lifetime, and rejects non-UTF-8 paths rather than changing them. The `ffi` feature and generated C exports stay disabled. The resulting runtime does not require `libkrun.so`, `libkrun.dylib`, or `libkrunfw`.
-
-Rosetta uses one `--rosetta` enable flag and a bounded versioned JSON value in
-`SILO_ROSETTA_CONFIG`. The launcher removes any ambient value from host checks
-and native helpers, and overwrites it only on the enabled helper command. The
-helper decodes it once before host admission or VMM construction and converts
-the owned fields into libkrun's immutable `RosettaFsDevice`. The value contains
-non-secret compatibility data, not credentials: process environments remain
-inspectable under normal OS permissions and may appear in external crash or
-environment dumps. Silo does not log the value, place it in argv, or promise to
-isolate subprocesses created independently by third-party code. The audited
-production `Command` boundary is limited to the launcher's host-admission and
-VM-helper children, both of which explicitly remove the ambient value. The
-helper and its enabled libkrun block, network, and filesystem paths currently
-create no runtime child processes; adding one requires an explicit
-`env_remove("SILO_ROSETTA_CONFIG")` at that command site.
-
-The E2BIG regression covers the process-backed builder path specifically: its
-host-admission child completes without the Rosetta value, then the intended
-helper exec exceeds the inherited argv/environment limit only after the valid
-bounded value is added. This verifies spawn-error propagation and cleanup; it
-does not launch or qualify a hypervisor, filesystem response, or translator.
-
-The worker entry point initializes libkrun's stderr logger at info level while honoring its standard environment filter, so startup qualification diagnostics are visible. `Vmm::run()` owns the event loop and returns `()` only after a fatal event-loop error. The helper converts that return into a controlled error so the process exits nonzero instead of falsely reporting a successful VM exit.
-
-The hidden developer option `--vsock-cid 3` attaches one standalone native `VsockDevice` before networking. This fixture-only path has no port mappings and uses empty TSI flags. It is mutually exclusive with `--vsock-mux-fd`; no other guest CID is admitted. Production callers use `--vsock-mux-fd`, which names a helper-inherited Unix stream descriptor rather than a filesystem path.
-
-The `blk` and `net` APIs are selected at compile time through fixed Cargo features. Runtime feature probing is unnecessary because a helper missing a required API cannot compile.
-
-Libkrun v2 starts VMM builders without implicit console, vsock, balloon, or RNG devices and no longer injects a default init binary. The helper therefore supplies its kernel and optional initramfs directly, adds hvc0 only for `--stdio-console`, adds explicit RNG and balloon devices, and attaches one native vsock device when vmmon supplies `--vsock-mux-fd`. Vmmon and the helper inherit opposite ends of a private socketpair; per-connection stream descriptors cross it with `SCM_RIGHTS`, while payload bytes stay on those streams. This is the same krun transport on Linux and macOS, with no private filesystem socket path. Vmmon retains its existing dynamic registry, admission, leases, and relays, while `VmSpec.vsock.enabled` independently controls only the public host mux and guest-to-host listener discovery.
-
-Krun is the Linux backend. On macOS it is compiled as an experimental backend,
-while Virtualization.framework remains the default. Runtime backend selection
-is owned by libvm and vmmon, outside this launcher crate.
-
-## libkrun Build Features
-
-Silo's intended libkrun build keeps the upstream library narrow while preserving the current krun backend behavior:
-
-```text
---no-default-features --features blk --features net
-```
-
-That means Silo intentionally builds libkrun with these features enabled:
-
-| Feature | Purpose | Silo policy |
-| --- | --- | --- |
-| `blk` | Enables virtio-block devices. | Keep. Required for `--disk` and Silo disk images. |
-| `net` | Enables virtio-net devices for unixgram, unixstream, and tap networking. | Keep. Required for Silo networking modes. |
-
-Silo intentionally leaves these libkrun v2 features and optional components disabled for now:
-
-| Feature | Purpose | Silo policy |
-| --- | --- | --- |
-| `ffi` | Generates C exports for the native Rust API. | Disable. The helper calls the Rust API directly. |
-| `gpu` | Enables virtio-gpu, Venus, and native-context graphics support. | Disable. Silo has no krun GPU path today. |
-| `input` | Enables input device support for GUI/input passthrough. | Disable. Silo has no krun input-device path today. |
-| `timesync` | Enables the libkrun guest time synchronization device. | Disable. Silo does not configure this device. |
-| `tee` | Enables trusted execution environment plumbing. | Disable unless Silo grows a confidential-compute krun backend. |
-| `amd-sev` | Enables AMD SEV, SEV-ES, and SEV-SNP support. Implies `blk` and `tee`. | Disable unless Silo grows an SEV backend. |
-| `tdx` | Enables Intel TDX support. Implies `blk` and `tee`. | Disable unless Silo grows a TDX backend. |
-| `aws-nitro` | Enables AWS Nitro Enclaves support and its specialized init path. | Disable unless Silo grows a Nitro backend. |
-| `virgl_resource_map2` | Enables an optional virglrenderer GPU API used by some virtio-gpu builds. | Disable with `gpu`. It has no use without the GPU path. |
-
-If a new krun feature is exposed through Silo, update this table, enable the matching Cargo feature, and add only the required helper adapter methods. Do not enable upstream libkrun features speculatively. The tiny VM goblin gets one feature only when it can point to the code that uses it.
-
-## Example
-
-```rust,no_run
-use std::io::{Read, Write};
-
-use krun::{Disk, VirtualMachineBuilder};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut vm = VirtualMachineBuilder::new("/usr/local/bin/krun")
-        .cpus(2)
-        .memory_mib(1024)
-        .kernel("/path/to/kernel")
-        .initramfs("/path/to/initramfs")
-        .cmdline(vec!["console=hvc0".to_string(), "panic=1".to_string()])
-        .disk(Disk {
-            block_id: "root".to_string(),
-            path: "/path/to/rootfs.img".into(),
-            read_only: false,
-        })
-        .stdio_console(true)
-        .start()?;
-
-    let mut serial = vm.serial()?;
-    serial.write_all(b"hello serial\n")?;
-
-    let mut buffer = [0; 1024];
-    let _ = serial.read(&mut buffer)?;
-
-    vm.shutdown()?;
-    Ok(())
-}
-```
-
-The active launcher API is process-backed. Callers that enable `engine` may execute libkrun only inside a dedicated worker process, never inside the monitor. Configuration-only consumers can leave that feature disabled.
+`Machine::kill()` is still an emergency operation: killing the supervisor may
+bypass diagnostics, metadata and the configured exit command. The worker watchdog
+terminates on loss of its supervisor keepalive without running Rust destructors
+or waiting on logging locks.

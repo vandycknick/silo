@@ -38,13 +38,7 @@ fn write_file(path: &Path, contents: &[u8], mode: u32) {
 /// A minimal portable runtime tree. The real mock-enabled vmmon is installed
 /// into it so each test also exercises portable component resolution.
 fn write_runtime_root(root: &Path) -> PathBuf {
-    for helper in ["netd", "krun"] {
-        write_file(
-            &root.join("bin").join(helper),
-            b"#!/bin/sh\nexit 0\n",
-            0o755,
-        );
-    }
+    write_file(&root.join("bin/netd"), b"#!/bin/sh\nexit 0\n", 0o755);
     let vmmon = root.join("bin/vmmon");
     std::fs::copy(test_utils::mock_vmmon_binary(), &vmmon).expect("install mock-enabled vmmon");
     std::fs::set_permissions(&vmmon, std::fs::Permissions::from_mode(0o755))

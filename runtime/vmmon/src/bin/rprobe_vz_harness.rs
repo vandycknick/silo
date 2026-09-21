@@ -5,6 +5,10 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
+#[path = "rprobe/worker.rs"]
+mod krun_worker;
+
+#[cfg(target_os = "macos")]
 #[path = "../rosetta/mod.rs"]
 mod rosetta;
 
@@ -24,9 +28,10 @@ mod macos {
     use std::thread;
     use std::time::{Duration, Instant as StdInstant};
 
+    use crate::krun_worker::Worker;
     use clap::Parser;
     use eyre::{eyre, Context, Result};
-    use krun::{RosettaLaunchConfig, VirtualMachineBuilder};
+    use krun::RosettaLaunchConfig;
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use rprobe::exerciser::{
         Decoder as ExerciserDecoder, CHECK_TRANSLATED_WORKLOAD, FILESYSTEM_CHECKS,
@@ -68,7 +73,7 @@ mod macos {
         #[arg(long)]
         translated_workload: bool,
         #[arg(long, value_name = "PATH")]
-        krun: Option<PathBuf>,
+        vmmon: Option<PathBuf>,
         #[arg(long, value_name = "PATH")]
         guest_kernel: Option<PathBuf>,
         #[arg(long, value_name = "PATH")]
@@ -93,7 +98,7 @@ mod macos {
 
     #[derive(Clone)]
     struct HelperInputs {
-        krun: PathBuf,
+        vmmon: PathBuf,
         kernel: PathBuf,
         initramfs: PathBuf,
     }
@@ -431,11 +436,11 @@ mod macos {
     }
 
     fn helper_inputs(args: &Args) -> Result<Option<HelperInputs>> {
-        match (&args.krun, &args.guest_kernel, &args.guest_initramfs) {
+        match (&args.vmmon, &args.guest_kernel, &args.guest_initramfs) {
             (None, None, None) => Ok(None),
-            (Some(krun), Some(kernel), Some(initramfs)) => {
+            (Some(vmmon), Some(kernel), Some(initramfs)) => {
                 for (kind, path) in [
-                    ("krun helper", krun),
+                    ("vmmon worker executable", vmmon),
                     ("guest kernel", kernel),
                     ("guest initramfs", initramfs),
                 ] {
@@ -444,13 +449,13 @@ mod macos {
                     }
                 }
                 Ok(Some(HelperInputs {
-                    krun: krun.clone(),
+                    vmmon: vmmon.clone(),
                     kernel: kernel.clone(),
                     initramfs: initramfs.clone(),
                 }))
             }
             _ => Err(eyre!(
-                "--krun, --guest-kernel and --guest-initramfs must be supplied together"
+                "--vmmon, --guest-kernel and --guest-initramfs must be supplied together"
             )),
         }
     }
@@ -570,7 +575,7 @@ mod macos {
                 cancel.store(true, Ordering::Release);
                 match join_helper_worker(worker.await)? {
                     HelperOutcome::Cancelled => Err(eyre!(
-                        "helper qualification cancelled; standalone helper cleaned up and reaped"
+                        "helper qualification cancelled; krun worker cleaned up and reaped"
                     )),
                     HelperOutcome::Passed(_) => Err(eyre!(
                         "helper qualification completed before cancellation was observed"
@@ -605,22 +610,22 @@ mod macos {
         started: tokio::sync::oneshot::Sender<()>,
         translated_workload: bool,
     ) -> Result<HelperOutcome> {
-        let mut vm = VirtualMachineBuilder::new(&inputs.krun)
-            .cpus(1)
-            .memory_mib(512)
-            .kernel(&inputs.kernel)
-            .initramfs(&inputs.initramfs)
-            .cmdline(vec![
-                "rdinit=/init console=hvc0 panic=0 quiet loglevel=0".to_string()
-            ])
-            .network_none()
-            .stdio_console(true)
-            .balloon(true)
-            .rosetta(config)
-            .start()
-            .wrap_err("start standalone krun responder guest")?;
-        let serial = vm.serial().wrap_err("take standalone helper console")?;
-        let (mut reader, writer) = serial.into_files();
+        let mut vm = Worker::start(
+            &inputs.vmmon,
+            krun::KrunConfig {
+                cpus: 1,
+                memory_mib: 512,
+                kernel: Some(inputs.kernel.clone()),
+                initramfs: Some(inputs.initramfs.clone()),
+                cmdline: vec!["rdinit=/init console=hvc0 panic=0 quiet loglevel=0".to_string()],
+                stdio_console: true,
+                balloon: true,
+                rosetta: Some(config),
+                ..krun::KrunConfig::default()
+            },
+        )
+        .wrap_err("start krun responder worker")?;
+        let (mut reader, writer) = vm.serial().wrap_err("take worker console")?;
         let flags = OFlag::from_bits_retain(
             fcntl(reader.as_fd(), FcntlArg::F_GETFL).wrap_err("read console flags")?,
         );
@@ -651,7 +656,7 @@ mod macos {
     }
 
     fn receive_exerciser_frame(
-        vm: &mut krun::VirtualMachine,
+        vm: &mut Worker,
         reader: &mut fs::File,
         response: &ProbeResponse,
         cancel: &AtomicBool,
@@ -696,7 +701,7 @@ mod macos {
             }
             if now >= deadline {
                 return Err(eyre!(
-                    "standalone helper exerciser timed out; diagnostics={}",
+                    "krun worker exerciser timed out; diagnostics={}",
                     String::from_utf8_lossy(&diagnostics).escape_debug()
                 ));
             }
@@ -728,26 +733,21 @@ mod macos {
         }))
     }
 
-    fn request_helper_shutdown(
-        vm: &mut krun::VirtualMachine,
-        console: &mut fs::File,
-    ) -> Result<()> {
-        if let Some(status) = vm.try_wait().wrap_err("poll standalone helper")? {
+    fn request_helper_shutdown(vm: &mut Worker, console: &mut fs::File) -> Result<()> {
+        if let Some(status) = vm.try_wait().wrap_err("poll krun worker")? {
             return Err(eyre!(
-                "standalone helper exited before the shutdown request: {status}"
+                "krun worker exited before the shutdown request: {status}"
             ));
         }
         if let Err(error) = vm.shutdown() {
             force_reap_helper(vm)?;
-            return Err(error).wrap_err("request standalone helper shutdown");
+            return Err(error).wrap_err("request krun worker shutdown");
         }
         match wait_for_helper_with_console(vm, console, HELPER_CLEANUP_TIMEOUT) {
             Ok(Some(status)) => require_successful_helper_exit(status),
             Ok(None) => {
                 force_reap_helper(vm)?;
-                Err(eyre!(
-                    "standalone helper did not exit after the shutdown request"
-                ))
+                Err(eyre!("krun worker did not exit after the shutdown request"))
             }
             Err(error) => {
                 force_reap_helper(vm)?;
@@ -756,8 +756,8 @@ mod macos {
         }
     }
 
-    fn cancel_and_reap_helper(vm: &mut krun::VirtualMachine, console: &mut fs::File) -> Result<()> {
-        if let Some(status) = vm.try_wait().wrap_err("poll standalone helper")? {
+    fn cancel_and_reap_helper(vm: &mut Worker, console: &mut fs::File) -> Result<()> {
+        if let Some(status) = vm.try_wait().wrap_err("poll krun worker")? {
             return require_cancelled_helper_exit(status);
         }
         let shutdown_error = vm.shutdown().err();
@@ -773,20 +773,20 @@ mod macos {
         }
         force_reap_helper(vm)?;
         if let Some(error) = shutdown_error {
-            return Err(error).wrap_err("request standalone helper shutdown");
+            return Err(error).wrap_err("request krun worker shutdown");
         }
         Ok(())
     }
 
     fn wait_for_helper_with_console(
-        vm: &mut krun::VirtualMachine,
+        vm: &mut Worker,
         console: &mut fs::File,
         timeout: Duration,
     ) -> Result<Option<ExitStatus>> {
         let deadline = StdInstant::now() + timeout;
         let mut buffer = [0; 4096];
         loop {
-            if let Some(status) = vm.try_wait().wrap_err("poll standalone helper")? {
+            if let Some(status) = vm.try_wait().wrap_err("poll krun worker")? {
                 return Ok(Some(status));
             }
             match console.read(&mut buffer) {
@@ -806,7 +806,7 @@ mod macos {
         if status.success() {
             Ok(())
         } else {
-            Err(eyre!("standalone helper exited unsuccessfully: {status}"))
+            Err(eyre!("krun worker exited unsuccessfully: {status}"))
         }
     }
 
@@ -816,29 +816,26 @@ mod macos {
             Ok(())
         } else {
             Err(eyre!(
-                "standalone helper exited unexpectedly during cancellation: {status}"
+                "krun worker exited unexpectedly during cancellation: {status}"
             ))
         }
     }
 
-    fn force_reap_helper(vm: &mut krun::VirtualMachine) -> Result<()> {
+    fn force_reap_helper(vm: &mut Worker) -> Result<()> {
         let kill_error = vm.kill().err();
         if wait_for_helper(vm, Duration::from_secs(2))?.is_none() {
-            return Err(eyre!("standalone helper was not reaped after kill"));
+            return Err(eyre!("krun worker was not reaped after kill"));
         }
         if let Some(error) = kill_error {
-            return Err(error).wrap_err("kill standalone helper after timeout");
+            return Err(error).wrap_err("kill krun worker after timeout");
         }
         Ok(())
     }
 
-    fn wait_for_helper(
-        vm: &mut krun::VirtualMachine,
-        timeout: Duration,
-    ) -> Result<Option<ExitStatus>> {
+    fn wait_for_helper(vm: &mut Worker, timeout: Duration) -> Result<Option<ExitStatus>> {
         let deadline = StdInstant::now() + timeout;
         loop {
-            if let Some(status) = vm.try_wait().wrap_err("poll standalone helper")? {
+            if let Some(status) = vm.try_wait().wrap_err("poll krun worker")? {
                 return Ok(Some(status));
             }
             if StdInstant::now() >= deadline {

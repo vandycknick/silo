@@ -211,10 +211,19 @@ impl KrunVsockMux {
 }
 
 impl KrunVsockMuxTask {
-    pub(super) async fn join(self) -> Result<(), VirtError> {
-        self.0
-            .await
-            .map_err(|error| VirtError::Backend(format!("krun vsock mux task failed: {error}")))
+    pub(super) async fn join(mut self) -> Result<(), VirtError> {
+        match tokio::time::timeout(Duration::from_secs(1), &mut self.0).await {
+            Ok(result) => result.map_err(|error| {
+                VirtError::Backend(format!("krun vsock mux task failed: {error}"))
+            }),
+            Err(_) => {
+                self.0.abort();
+                let _ = self.0.await;
+                Err(VirtError::Backend(
+                    "krun vsock mux cleanup timed out".to_string(),
+                ))
+            }
+        }
     }
 }
 
@@ -770,7 +779,10 @@ mod tests {
             .expect("join mux");
         assert!(!session.is_active());
         assert_eq!(capacity.available_permits(), 1);
-        assert_eq!(mux.available_request_capacity(), super::MAX_REQUEST_FRAMES);
+        assert_eq!(
+            mux.available_request_capacity(),
+            crate::virt::backend::krun::mux::MAX_REQUEST_FRAMES
+        );
         assert!(listener.try_accept().is_err());
         assert_eq!(
             nix::sys::socket::getsockopt(&control, nix::sys::socket::sockopt::SockType)
@@ -820,7 +832,10 @@ mod tests {
             .expect("join mux");
         assert!(!session.is_active());
         assert_eq!(capacity.available_permits(), 1);
-        assert_eq!(mux.available_request_capacity(), super::MAX_REQUEST_FRAMES);
+        assert_eq!(
+            mux.available_request_capacity(),
+            crate::virt::backend::krun::mux::MAX_REQUEST_FRAMES
+        );
         assert!(listener.try_accept().is_err());
         stdio
             .write_all(b"x")
@@ -1034,7 +1049,7 @@ mod tests {
         nix::sys::socket::setsockopt(&control, nix::sys::socket::sockopt::RcvBuf, &1024)
             .expect("limit peer receive buffer");
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let connects = (0..super::MAX_REQUEST_FRAMES)
+        let connects = (0..crate::virt::backend::krun::mux::MAX_REQUEST_FRAMES)
             .map(|port| {
                 let mux = mux.clone();
                 tokio::spawn(async move { mux.connect(port as u32 + 1, deadline).await })
@@ -1042,7 +1057,9 @@ mod tests {
             .collect::<Vec<_>>();
 
         tokio::time::timeout(Duration::from_secs(1), async {
-            while mux.available_request_capacity() == super::MAX_REQUEST_FRAMES {
+            while mux.available_request_capacity()
+                == crate::virt::backend::krun::mux::MAX_REQUEST_FRAMES
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -1055,7 +1072,9 @@ mod tests {
             let _ = connect.await;
         }
         tokio::time::timeout(Duration::from_secs(1), async {
-            while mux.available_request_capacity() != super::MAX_REQUEST_FRAMES {
+            while mux.available_request_capacity()
+                != crate::virt::backend::krun::mux::MAX_REQUEST_FRAMES
+            {
                 tokio::task::yield_now().await;
             }
         })

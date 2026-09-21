@@ -16,7 +16,6 @@ const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) struct ResolvedRuntimeComponents {
     pub(crate) vmmon: PathBuf,
     pub(crate) netd: PathBuf,
-    pub(crate) krun: PathBuf,
     pub(crate) kernel: PathBuf,
     pub(crate) initramfs: PathBuf,
     pub(crate) agent: PathBuf,
@@ -27,7 +26,6 @@ pub(crate) struct ResolvedRuntimeComponents {
 struct ComponentOverrides {
     vmmon: Option<PathBuf>,
     netd: Option<PathBuf>,
-    krun: Option<PathBuf>,
     kernel: Option<PathBuf>,
     initramfs: Option<PathBuf>,
     agent: Option<PathBuf>,
@@ -46,9 +44,6 @@ impl ComponentOverrides {
         }
         if let Some(path) = self.netd {
             components.netd = path;
-        }
-        if let Some(path) = self.krun {
-            components.krun = path;
         }
         if let Some(path) = self.kernel {
             components.kernel = path;
@@ -69,7 +64,6 @@ impl ComponentOverrides {
         Self {
             vmmon: self.vmmon.or(lower.vmmon),
             netd: self.netd.or(lower.netd),
-            krun: self.krun.or(lower.krun),
             kernel: self.kernel.or(lower.kernel),
             initramfs: self.initramfs.or(lower.initramfs),
             agent: self.agent.or(lower.agent),
@@ -82,7 +76,6 @@ impl ComponentOverrides {
 struct ComponentPaths {
     vmmon: PathBuf,
     netd: PathBuf,
-    krun: PathBuf,
     kernel: PathBuf,
     initramfs: PathBuf,
     agent: PathBuf,
@@ -94,7 +87,6 @@ impl ComponentPaths {
         Self {
             vmmon: root.join("bin/vmmon"),
             netd: root.join("bin/netd"),
-            krun: root.join("bin/krun"),
             kernel: root.join("assets/kernel-default"),
             initramfs: root.join("assets/initramfs"),
             agent: root.join("assets/agent"),
@@ -106,7 +98,6 @@ impl ComponentPaths {
         Self {
             vmmon: directory.join("vmmon"),
             netd: directory.join("netd"),
-            krun: directory.join("krun"),
             kernel: directory.join("assets/kernel-default"),
             initramfs: directory.join("assets/initramfs"),
             agent: directory.join("assets/agent"),
@@ -119,7 +110,6 @@ impl ComponentPaths {
         Self {
             vmmon: helpers.join("vmmon"),
             netd: helpers.join("netd"),
-            krun: helpers.join("krun"),
             kernel: assets.join("kernel-default"),
             initramfs: assets.join("initramfs"),
             agent: assets.join("agent"),
@@ -171,6 +161,12 @@ fn resolve_components_for_executable<E>(
 where
     E: ComponentEnvironment,
 {
+    if environment.get(ENV_KRUN_PATH).is_some() {
+        return Err(LibVmError::RuntimeComponentInvalid {
+            input: ENV_KRUN_PATH.to_string(),
+            message: "KRUN_BIN was removed; vmmon now launches its own private worker".to_string(),
+        });
+    }
     let api = explicit_api_overrides(config)?;
     if let Some(root) = config.runtime_root.as_deref() {
         let components = resolve_required_portable_root("runtime_root", root)?;
@@ -273,7 +269,6 @@ fn explicit_api_overrides(config: &RuntimeConfig) -> Result<ComponentOverrides, 
     Ok(ComponentOverrides {
         vmmon: explicit_component("vmmon_path", config.vmmon_path.as_deref(), true)?,
         netd: explicit_component("netd_path", config.netd_path.as_deref(), true)?,
-        krun: explicit_component("krun_path", config.krun_path.as_deref(), true)?,
         kernel: explicit_component("kernel_path", config.kernel_path.as_deref(), false)?,
         initramfs: explicit_component("initramfs_path", config.initramfs_path.as_deref(), false)?,
         agent: explicit_component("agent_path", config.agent_path.as_deref(), true)?,
@@ -286,7 +281,6 @@ fn explicit_environment_overrides<E: ComponentEnvironment>(
 ) -> Result<EnvironmentOverrides, LibVmError> {
     let vmmon = environment.get(ENV_VMMON_PATH).map(PathBuf::from);
     let netd = environment.get(ENV_NETD_PATH).map(PathBuf::from);
-    let krun = environment.get(ENV_KRUN_PATH).map(PathBuf::from);
     let assets = environment.get(ENV_ASSET_DIR).map(PathBuf::from);
     let assets = assets
         .map(|path| resolve_required_asset_dir(ENV_ASSET_DIR, &path))
@@ -295,7 +289,6 @@ fn explicit_environment_overrides<E: ComponentEnvironment>(
         components: ComponentOverrides {
             vmmon: explicit_component(ENV_VMMON_PATH, vmmon.as_deref(), true)?,
             netd: explicit_component(ENV_NETD_PATH, netd.as_deref(), true)?,
-            krun: explicit_component(ENV_KRUN_PATH, krun.as_deref(), true)?,
             kernel: assets
                 .as_ref()
                 .map(|assets| {
@@ -436,7 +429,6 @@ fn validate_components(
     let mut errors = Vec::new();
     let vmmon = collect_component("vmmon", &paths.vmmon, true, root.as_deref(), &mut errors);
     let netd = collect_component("netd", &paths.netd, true, root.as_deref(), &mut errors);
-    let krun = collect_component("krun", &paths.krun, true, root.as_deref(), &mut errors);
     let kernel = collect_component(
         "kernel-default",
         &paths.kernel,
@@ -456,12 +448,11 @@ fn validate_components(
         return Err(errors.join(", "));
     }
 
-    match (vmmon, netd, krun, kernel, initramfs, agent) {
-        (Some(vmmon), Some(netd), Some(krun), Some(kernel), Some(initramfs), Some(agent)) => {
+    match (vmmon, netd, kernel, initramfs, agent) {
+        (Some(vmmon), Some(netd), Some(kernel), Some(initramfs), Some(agent)) => {
             Ok(ResolvedRuntimeComponents {
                 vmmon,
                 netd,
-                krun,
                 kernel,
                 initramfs,
                 agent,
@@ -607,7 +598,6 @@ fn validate_app_bundle(bundle: &Path) -> Result<ResolvedRuntimeComponents, Strin
         ComponentPaths {
             vmmon: contents.join("Helpers/vmmon"),
             netd: contents.join("Helpers/netd"),
-            krun: contents.join("Helpers/krun"),
             kernel: contents.join("Resources/assets/kernel-default"),
             initramfs: contents.join("Resources/assets/initramfs"),
             agent: contents.join("Resources/assets/agent"),
@@ -736,7 +726,6 @@ fn resolve_path_helpers<E: ComponentEnvironment>(
         let paths = ComponentPaths {
             vmmon: entry.join("vmmon"),
             netd: entry.join("netd"),
-            krun: entry.join("krun"),
             kernel: assets.join("kernel-default"),
             initramfs: assets.join("initramfs"),
             agent: assets.join("agent"),
@@ -790,10 +779,10 @@ fn native_candidates() -> Vec<(String, ComponentPaths)> {
 
 fn expected_runtime_layouts() -> String {
     let mut layouts = vec![
-        "adjacent <exe-dir>/{vmmon,netd,krun,assets/{kernel-default,initramfs,agent}}".to_string(),
-        "portable <root>/{bin/{vmmon,netd,krun},assets/{kernel-default,initramfs,agent}}"
+        "adjacent <exe-dir>/{vmmon,netd,assets/{kernel-default,initramfs,agent}}".to_string(),
+        "portable <root>/{bin/{vmmon,netd},assets/{kernel-default,initramfs,agent}}"
             .to_string(),
-        "Silo.app/Contents/{MacOS/silo,Helpers/{vmmon,netd,krun},Resources/assets/{kernel-default,initramfs,agent}}".to_string(),
+        "Silo.app/Contents/{MacOS/silo,Helpers/{vmmon,netd},Resources/assets/{kernel-default,initramfs,agent}}".to_string(),
     ];
     #[cfg(target_os = "linux")]
     layouts.push(
@@ -813,7 +802,6 @@ pub(crate) fn test_components(base: &Path) -> ResolvedRuntimeComponents {
     ResolvedRuntimeComponents {
         vmmon: paths.vmmon,
         netd: paths.netd,
-        krun: paths.krun,
         kernel: paths.kernel,
         initramfs: paths.initramfs,
         agent: paths.agent,
@@ -839,7 +827,7 @@ fn sdk_app_candidates_for_home(home: Option<&Path>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
+    use crate::runtime::components::{
         native_candidates, resolve_components_for_executable, validate_app_bundle,
         ComponentEnvironment, ComponentPaths, ResolvedRuntimeComponents,
     };
@@ -871,7 +859,7 @@ mod tests {
     }
 
     fn portable(root: &Path) -> ComponentPaths {
-        for name in ["vmmon", "netd", "krun"] {
+        for name in ["vmmon", "netd"] {
             write_file(&root.join("bin").join(name), true);
         }
         write_file(&root.join("assets/kernel-default"), false);
@@ -894,6 +882,25 @@ mod tests {
             &native,
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn obsolete_krun_override_is_rejected_even_with_an_explicit_runtime_root() {
+        let temp = tempfile::tempdir().expect("temp");
+        portable(temp.path());
+        for value in ["", "/obsolete/krun"] {
+            let mut environment = TestEnvironment::default();
+            environment.values.insert("KRUN_BIN", value.into());
+            let error = resolve(
+                &RuntimeConfig::default().with_runtime_root(temp.path()),
+                &mut environment,
+                temp.path().join("silo"),
+                vec![],
+            )
+            .expect_err("reject obsolete override");
+            assert!(error.to_string().contains("KRUN_BIN was removed"));
+        }
+        assert!(!temp.path().join("bin/krun").exists());
     }
 
     #[test]
@@ -983,7 +990,7 @@ mod tests {
         let direct = temp.path().join("debug");
         let parent = temp.path().join("target");
         portable(&parent);
-        for name in ["vmmon", "netd", "krun"] {
+        for name in ["vmmon", "netd"] {
             write_file(&direct.join(name), true);
         }
         write_file(&direct.join("assets/kernel-default"), false);
@@ -1001,8 +1008,8 @@ mod tests {
         .expect("resolve adjacent runtime");
 
         assert_eq!(
-            resolved.krun,
-            direct.join("krun").canonicalize().expect("krun")
+            resolved.vmmon,
+            direct.join("vmmon").canonicalize().expect("vmmon")
         );
     }
 
@@ -1041,9 +1048,8 @@ mod tests {
         let second = temp.path().join("second");
         write_file(&first.join("vmmon"), true);
         write_file(&second.join("netd"), true);
-        write_file(&second.join("krun"), true);
         let complete = temp.path().join("complete");
-        for name in ["vmmon", "netd", "krun"] {
+        for name in ["vmmon", "netd"] {
             write_file(&complete.join(name), true);
         }
         let mut environment = TestEnvironment::default();
@@ -1129,14 +1135,7 @@ mod tests {
         .expect_err("missing runtime must fail");
         let diagnostic = error.to_string();
 
-        for component in [
-            "vmmon",
-            "netd",
-            "krun",
-            "kernel-default",
-            "initramfs",
-            "agent",
-        ] {
+        for component in ["vmmon", "netd", "kernel-default", "initramfs", "agent"] {
             assert!(
                 diagnostic.contains(component),
                 "missing {component}: {diagnostic}"
@@ -1280,7 +1279,6 @@ mod tests {
         let executable = contents.join("MacOS/silo");
         write_file(&contents.join("Helpers/vmmon"), true);
         write_file(&contents.join("Helpers/netd"), true);
-        write_file(&contents.join("Helpers/krun"), true);
         write_file(&contents.join("Resources/assets/kernel-default"), false);
         write_file(&contents.join("Resources/assets/initramfs"), false);
         write_file(&contents.join("Resources/assets/agent"), true);
@@ -1443,7 +1441,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let bundle = app_bundle(temp.path(), false);
         let macos = bundle.join("Contents/MacOS");
-        for name in ["vmmon", "netd", "krun"] {
+        for name in ["vmmon", "netd"] {
             write_file(&macos.join(name), true);
         }
         write_file(&macos.join("assets/kernel-default"), false);

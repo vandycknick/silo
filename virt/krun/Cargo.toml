@@ -3,20 +3,11 @@ name = "krun"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "krun"
-path = "src/bin/krun.rs"
-required-features = ["krun-bin"]
-
 [features]
 engine = ["dep:bzip2", "dep:libkrun"]
-krun-bin = ["engine"]
 
 [dependencies]
-utils = { path = "../../common/utils" }
 libkrun = { workspace = true, optional = true }
-clap = { version = "4.6.4", features = ["derive"] }
-eyre = "0.6.12"
 nix = { version = "0.31.3", features = ["fs", "poll", "signal", "socket", "uio", "term"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -25,7 +16,7 @@ tracing = "0.1.44"
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 # libkrun supports Image.bz2 kernels. Keep its bzip2 dependency inside the
-# self-contained helper instead of resolving a host libbz2 at runtime.
+# self-contained worker instead of resolving a host libbz2 at runtime.
 bzip2 = { version = "0.5.2", features = ["static"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

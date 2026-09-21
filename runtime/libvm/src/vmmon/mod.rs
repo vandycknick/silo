@@ -28,7 +28,6 @@ pub(crate) use launch_spec::{prepare_launch_spec, write_launch_spec, LaunchSpecI
 pub(crate) struct Vmmon {
     paths: LocalPaths,
     executable: PathBuf,
-    krun_path: PathBuf,
     virt_backend: Option<crate::runtime::VirtBackendOverride>,
 }
 
@@ -44,23 +43,17 @@ impl Vmmon {
     pub(crate) fn new(
         paths: LocalPaths,
         executable: PathBuf,
-        krun_path: PathBuf,
         virt_backend: Option<crate::runtime::VirtBackendOverride>,
     ) -> Self {
         Self {
             paths,
             executable,
-            krun_path,
             virt_backend,
         }
     }
 
     pub(crate) fn executable(&self) -> &std::path::Path {
         &self.executable
-    }
-
-    pub(crate) fn krun_path(&self) -> &std::path::Path {
-        &self.krun_path
     }
 
     /// Explicit backend selection forwarded in every start request.
@@ -189,7 +182,6 @@ mod tests {
             let vmmon = Vmmon::new(
                 crate::paths::LocalPaths::new("/tmp/silo-test"),
                 "/tmp/vmmon".into(),
-                "/tmp/krun".into(),
                 Some(selection),
             );
             let request = vmmon.virt_backend_request().expect("backend request");
@@ -206,7 +198,6 @@ mod tests {
         let vmmon = Vmmon::new(
             crate::paths::LocalPaths::new("/tmp/silo-test"),
             "/operator/vmmon".into(),
-            "/operator/krun".into(),
             Some(VirtBackendOverride::Krun),
         );
         let config = rosetta_machine_config();
@@ -231,7 +222,6 @@ mod tests {
             let vmmon = Vmmon::new(
                 crate::paths::LocalPaths::new("/tmp/silo-test"),
                 "/operator/vmmon".into(),
-                "/operator/krun".into(),
                 backend,
             );
             assert_eq!(
@@ -249,7 +239,6 @@ mod tests {
         let vmmon = Vmmon::new(
             crate::paths::LocalPaths::new("/tmp/silo-test"),
             "/operator/vmmon".into(),
-            "/operator/krun".into(),
             Some(VirtBackendOverride::Vz),
         );
 

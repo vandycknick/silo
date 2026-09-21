@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::virt::backend::{create_backend, BackendKind, VirtBackend};
+use crate::virt::backend::{create_backend, BackendKind, StartAttempt, VirtBackend};
 use crate::virt::capacity::{ListenerAdmissionClass, VsockCapacity, VsockLease};
 use crate::virt::config::VmConfig;
 use crate::virt::error::VirtError;
@@ -23,6 +23,7 @@ struct MachineInner {
     backend: Arc<dyn VirtBackend>,
     serial_console: Arc<SerialConsole>,
     vsock_capacity: VsockCapacity,
+    attempt: StartAttempt,
 }
 
 impl std::fmt::Debug for VirtualMachine {
@@ -58,6 +59,7 @@ impl VirtualMachine {
                 backend,
                 serial_console,
                 vsock_capacity,
+                attempt: StartAttempt::default(),
             }),
         })
     }
@@ -80,10 +82,24 @@ impl VirtualMachine {
     /// Boot the machine and attach the serial console. If the console cannot
     /// attach, the machine is stopped again and the error is returned.
     pub async fn start(&self) -> Result<(), VirtError> {
+        if !self.inner.attempt.reserve() {
+            return Err(VirtError::AlreadyRunning {
+                name: self.name().to_string(),
+            });
+        }
+        let early = self.inner.backend.serial_available_before_start();
+        if early {
+            if let Err(error) = self.inner.serial_console.attach().await {
+                let _ = self.inner.backend.stop().await;
+                return Err(error);
+            }
+        }
         self.inner.backend.start().await?;
-        if let Err(error) = self.inner.serial_console.attach().await {
-            let _ = self.inner.backend.stop().await;
-            return Err(error);
+        if !early {
+            if let Err(error) = self.inner.serial_console.attach().await {
+                let _ = self.inner.backend.stop().await;
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -91,12 +107,14 @@ impl VirtualMachine {
     /// Stop the machine, then drain remaining serial output to sinks.
     /// Idempotent.
     pub async fn stop(&self) -> Result<(), VirtError> {
+        self.inner.attempt.close();
         self.inner.backend.stop().await?;
         self.inner.serial_console.drain().await
     }
 
     /// Escalate shutdown while retaining the backend's termination/reap owner.
     pub async fn force_stop(&self) -> Result<(), VirtError> {
+        self.inner.attempt.close();
         self.inner.backend.force_stop().await?;
         self.inner.serial_console.drain().await
     }
@@ -360,6 +378,7 @@ mod tests {
                 serial_console: Arc::new(SerialConsole::new(backend_trait.clone())),
                 backend: backend_trait,
                 vsock_capacity: VsockCapacity::test_with_limit("capacity-test", limit),
+                attempt: crate::virt::backend::StartAttempt::default(),
             }),
         }
     }

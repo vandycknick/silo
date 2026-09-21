@@ -67,6 +67,11 @@ pub(crate) trait VirtBackend: Send + Sync + fmt::Debug + 'static {
         admission: VsockListenerAdmission,
     ) -> Result<VsockListener, VirtError>;
 
+    /// Whether console resources exist before native startup can execute guest code.
+    fn serial_available_before_start(&self) -> bool {
+        false
+    }
+
     /// Open the guest serial device. Called once per boot by the serial console.
     async fn open_serial(&self) -> Result<SerialDevice, VirtError>;
 
@@ -112,7 +117,7 @@ pub struct HostMemoryReclaimReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BackendKind {
-    /// libkrun via the spawned `krun` helper binary.
+    /// libkrun in a private worker process launched from vmmon.
     Krun,
     /// Apple Virtualization.framework (macOS).
     Vz,
@@ -153,7 +158,7 @@ impl BackendKind {
 
     /// Cheap host probe: can this backend plausibly start a machine here?
     ///
-    /// Per-machine requirements (helper binary path, rosetta installation)
+    /// Per-machine requirements (payload assets, Rosetta installation)
     /// are still validated at machine construction; this only answers whether
     /// the backend is present on this host at all.
     pub fn probe(self) -> Availability {

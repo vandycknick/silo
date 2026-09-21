@@ -1,9 +1,10 @@
 # Embedded libkrun Dependency
 
-Silo compiles its pinned libkrun fork directly into the `krun` helper. The
-launcher library remains process-backed, so `vmmon` and other Rust callers do
-not link libkrun. The distributed runtime contains one self-contained `krun`
-executable and no `libkrun.so`, `libkrun.dylib`, or `libkrunfw` sidecar.
+Silo compiles its pinned libkrun fork into `vmmon` through the `krun` engine
+crate. Vmmon executes it only in a separate private worker process, launched
+from the same executable with argv[0] `krun` and the first argument `__krun`.
+There is no standalone krun executable, `libkrun.so`, `libkrun.dylib`, or
+`libkrunfw` sidecar.
 
 ## Source Pin
 
@@ -133,22 +134,22 @@ Consequently, Silo neither builds nor packages `libkrunfw`.
 
 ## Build
 
-Build the self-contained helper with:
+Build the combined supervisor/worker executable with:
 
 ```bash
-make krun PROFILE=debug
+make vmmon PROFILE=debug
 ```
 
 For a release build:
 
 ```bash
-make krun PROFILE=release
+make vmmon PROFILE=release
 ```
 
 The plain `krun` library does not activate the optional libkrun dependency.
-Only the `krun-bin` feature used by the helper does so.
+The `engine` feature links libkrun into vmmon, which executes it only in a separate private worker process.
 
-On x86-64, `krun-bin` also activates bzip2's `static` feature. Libkrun uses
+On x86-64, `engine` also activates bzip2's `static` feature. Libkrun uses
 bzip2 to load `Image.bz2` kernels, and the helper must not depend on a host
 `libbz2.so` that is absent from the portable runtime.
 
@@ -156,8 +157,9 @@ On Linux, `ldd` and `readelf -d` must not report `libkrun.so` or `libbz2.so`.
 On macOS,
 `otool -L` must not report `libkrun.dylib`. The macOS helper still uses
 Hypervisor.framework and must be signed with the
-`com.apple.security.hypervisor` entitlement before distribution. The xtask
-component build invoked by `make krun` signs and verifies it automatically.
+`com.apple.security.hypervisor` entitlement before distribution, alongside
+`com.apple.security.virtualization` for VZ. The xtask component build invoked
+by `make vmmon` signs and verifies this union automatically.
 
 The macOS krun Rosetta path is experimental. Its current
 `CapturedCompatibilityV1` profile accepts only host build `25G83` and the
