@@ -12,6 +12,7 @@ mod exit_status;
 mod ext;
 mod forward;
 mod guest;
+mod krun_worker;
 mod lock;
 mod machine;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -91,6 +92,12 @@ struct Args {
 }
 
 fn main() -> eyre::Result<()> {
+    let mut arguments = std::env::args_os();
+    let program = arguments.next().unwrap_or_default();
+    let first = arguments.next();
+    if krun_worker::mode(&program, first.as_deref())? == krun_worker::Mode::Worker {
+        return krun_worker::run(arguments);
+    }
     let args = Args::parse();
     let inherited_fds = InheritedPipeFds::from_env()?;
 

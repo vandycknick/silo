@@ -500,7 +500,10 @@ pub fn verify_signed_bundle(bundle: &Path) -> Result<(), AppError> {
     verify_signature(bundle)?;
     verify_entitlements(
         &bundle.join("Contents/Helpers/vmmon"),
-        &["com.apple.security.virtualization"],
+        &[
+            "com.apple.security.hypervisor",
+            "com.apple.security.virtualization",
+        ],
     )?;
     verify_entitlements(
         &bundle.join("Contents/Helpers/krun"),

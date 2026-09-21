@@ -93,7 +93,8 @@ fn set_cloexec(fd: BorrowedFd<'_>, enabled: bool) -> io::Result<()> {
 }
 
 /// Outcome of libkrun's per-VM host reclaim qualification probe.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HostMemoryReclaimQualification {
     NotRun,
     Passed,
@@ -126,7 +127,8 @@ impl HostMemoryReclaimQualification {
 ///
 /// `effective` is true only while free-page reports are actually released to
 /// the host. The counters are cumulative for the VM lifetime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostMemoryReclaimStatus {
     pub requested: bool,
     pub qualification: HostMemoryReclaimQualification,
