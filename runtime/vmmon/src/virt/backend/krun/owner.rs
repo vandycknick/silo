@@ -131,6 +131,25 @@ impl Tail {
     }
 }
 
+async fn collect_diagnostics(mut diagnostics: Receiver, pid: u32, tail: Arc<Mutex<Tail>>) {
+    let mut chunk = [0; 4096];
+    loop {
+        match diagnostics.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(count) => {
+                tail.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(&chunk[..count]);
+                tracing::debug!(worker_pid = pid, diagnostic = %String::from_utf8_lossy(&chunk[..count]), "krun diagnostic");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "krun diagnostics closed");
+                break;
+            }
+        }
+    }
+}
+
 async fn read_event(events: &mut Receiver) -> io::Result<Event> {
     let mut header = [0; 4];
     events.read_exact(&mut header).await?;
@@ -172,7 +191,7 @@ impl Owner {
             mut child,
             mut request,
             mut events,
-            mut diagnostics,
+            diagnostics,
             _keepalive,
         } = match spawn(console, mux) {
             Ok(spawned) => spawned,
@@ -181,26 +200,7 @@ impl Owner {
         let pid = child.id().unwrap_or_default();
         tracing::info!(worker_pid = pid, "krun worker spawned");
         let tail = Arc::new(Mutex::new(Tail::default()));
-        let capture = tail.clone();
-        let mut diagnostic_task = tokio::spawn(async move {
-            let mut chunk = [0; 4096];
-            loop {
-                match diagnostics.read(&mut chunk).await {
-                    Ok(0) => break,
-                    Ok(count) => {
-                        capture
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .push(&chunk[..count]);
-                        tracing::debug!(worker_pid = pid, diagnostic = %String::from_utf8_lossy(&chunk[..count]), "krun diagnostic");
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "krun diagnostics closed");
-                        break;
-                    }
-                }
-            }
-        });
+        let mut diagnostic_task = tokio::spawn(collect_diagnostics(diagnostics, pid, tail.clone()));
         let mut transmission = tokio::spawn(async move { request.write_all(&frame).await });
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let event_task = tokio::spawn(async move {
@@ -397,6 +397,31 @@ mod tests {
         assert_eq!(tail.bytes.len(), DIAGNOSTIC_LIMIT);
         assert!(tail.text().len() <= DIAGNOSTIC_LIMIT);
     }
+    /// Generic child output collection through the production pipe reader.
+    #[tokio::test]
+    async fn real_child_can_fill_many_pipe_capacities_without_a_newline() {
+        use crate::virt::backend::krun::owner::{collect_diagnostics, pipe};
+        use std::process::Stdio;
+        use std::sync::{Arc, Mutex};
+        let (read, write) = pipe().expect("diagnostic pipe");
+        let reader = tokio::net::unix::pipe::Receiver::from_owned_fd(read).expect("async reader");
+        let tail = Arc::new(Mutex::new(Tail::default()));
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "i=0; while [ $i -lt 4096 ]; do printf '%0256d' 0; i=$((i+1)); done; printf diagnostic-tail"])
+            .stdout(Stdio::from(write)).stderr(Stdio::null()).kill_on_drop(true).spawn().expect("real child");
+        let pid = child.id().expect("child PID");
+        let (status, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(child.wait(), collect_diagnostics(reader, pid, tail.clone()))
+        })
+        .await
+        .expect("diagnostics do not block child exit");
+        assert!(status.expect("reap child").success());
+        let tail = tail.lock().expect("tail");
+        assert!(tail.truncated);
+        assert_eq!(tail.bytes.len(), DIAGNOSTIC_LIMIT);
+        assert!(tail.text().ends_with("diagnostic-tail"));
+    }
+
     #[test]
     fn startup_stages_cannot_repeat_skip_or_regress() {
         assert!(valid_stage(StartupStage::Request, StartupStage::Admission));

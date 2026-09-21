@@ -725,6 +725,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_start_and_waiter_leave_one_terminal_preparation_attempt() {
+        use crate::virt::backend::{krun::KrunBackend, VirtBackend};
+        use futures::FutureExt;
+        let backend = KrunBackend::new(
+            VmConfig::builder("cancelled-preparation")
+                .base_directory(std::env::temp_dir())
+                .cpus(1)
+                .memory(128)
+                .kernel("/definitely-missing-silo/kernel")
+                .build(),
+        )
+        .expect("backend");
+        // Poll once, then drop both futures. No native worker can be launched with
+        // this missing payload, and cancellation must not reset the attempt.
+        assert!(backend.wait().now_or_never().is_none());
+        assert!(backend.start().now_or_never().is_none());
+        let (stopped, first, second) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(backend.stop(), backend.wait(), backend.wait())
+        })
+        .await
+        .expect("owned preparation cleanup");
+        stopped.expect("concurrent stop");
+        let first = first.expect("first waiter");
+        assert_eq!(first, second.expect("second waiter"));
+        assert_eq!(Some(first), backend.try_wait().await.expect("cached exit"));
+        backend.stop().await.expect("repeated stop");
+        assert!(backend.start().await.is_err());
+    }
+
+    #[tokio::test]
     async fn preparation_failure_cannot_retry_or_erase_the_cached_error() {
         use crate::virt::backend::{krun::KrunBackend, VirtBackend};
         let backend = KrunBackend::new(

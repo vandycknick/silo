@@ -6,6 +6,10 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+// Exercise the exact production inheritance policy against the actual executable.
+#[path = "../src/virt/backend/krun/inherit.rs"]
+mod fd_policy;
+
 struct Process(Option<Child>);
 impl Process {
     fn output(mut self) -> Output {
@@ -37,7 +41,14 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         if let Some(child) = &mut self.0 {
-            let _ = child.kill();
+            if child.try_wait().ok().flatten().is_none() {
+                // Each fixture owns a new process group; never touch unrelated processes.
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-(child.id() as i32)),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = child.kill();
+            }
             let _ = child.wait();
         }
     }
@@ -46,28 +57,33 @@ impl Drop for Process {
 fn command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_vmmon"));
     command
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    fd_policy::install(&mut command, &[]);
     command
 }
 
 fn pipe() -> (OwnedFd, OwnedFd) {
-    let pair = nix::unistd::pipe().expect("pipe");
-    for fd in [&pair.0, &pair.1] {
-        nix::fcntl::fcntl(
-            fd,
-            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-        )
-        .expect("cloexec");
-    }
-    pair
+    let (read, write) = nix::unistd::pipe().expect("pipe");
+    (
+        fd_policy::normalize(read).expect("normalize reader"),
+        fd_policy::normalize(write).expect("normalize writer"),
+    )
 }
 
 fn worker() -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
+    worker_with_events(|_| {})
+}
+
+fn worker_with_events(
+    prepare: impl FnOnce(&OwnedFd),
+) -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
     let (request, writer) = pipe();
     let (events, reporter) = pipe();
     let (watchdog, keepalive) = pipe();
+    prepare(&reporter);
     let pty = nix::pty::openpty(None, None).expect("pty");
     for fd in [&pty.master, &pty.slave] {
         nix::fcntl::fcntl(
@@ -82,6 +98,21 @@ fn worker() -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
         watchdog.as_raw_fd(),
         pty.slave.as_raw_fd(),
     ];
+    let mut command = private_command(roles);
+    // Deliberately inheritable opposite endpoints must still be closed by exec.
+    for fd in [&writer, &events, &keepalive] {
+        nix::fcntl::fcntl(
+            fd,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+        )
+        .expect("inheritable sentinel");
+    }
+    fd_policy::install(&mut command, &[&request, &reporter, &watchdog, &pty.slave]);
+    let child = Process(Some(command.spawn().expect("spawn actual worker")));
+    (child, writer.into(), keepalive, events.into(), pty.master)
+}
+
+fn private_command(roles: [i32; 4]) -> Command {
     let mut command = command();
     command.arg0("krun").arg("__krun");
     for (flag, fd) in [
@@ -95,27 +126,7 @@ fn worker() -> (Process, std::fs::File, OwnedFd, std::fs::File, OwnedFd) {
     {
         command.arg(flag).arg(fd.to_string());
     }
-    inherit(&mut command, roles);
-    let child = Process(Some(command.spawn().expect("spawn actual worker")));
-    (child, writer.into(), keepalive, events.into(), pty.master)
-}
-
-fn inherit<const N: usize>(command: &mut Command, roles: [i32; N]) {
-    // SAFETY: only async-signal-safe raw fcntl calls run after fork. nix requires
-    // borrowed descriptors; the raw allowlist outlives this immediate spawn.
-    unsafe {
-        command.pre_exec(move || {
-            for raw in roles {
-                let flags = nix::libc::fcntl(raw, nix::libc::F_GETFD);
-                if flags < 0
-                    || nix::libc::fcntl(raw, nix::libc::F_SETFD, flags & !nix::libc::FD_CLOEXEC) < 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
+    command
 }
 
 struct SupervisorFixture(std::path::PathBuf);
@@ -263,7 +274,7 @@ fn startup_signal_cancels_an_incomplete_request_without_a_blocking_reader() {
     let (reader, writer) = pipe();
     let mut command = fixture.command();
     command.env("_VM_STARTPIPE", reader.as_raw_fd().to_string());
-    inherit(&mut command, [reader.as_raw_fd()]);
+    fd_policy::install(&mut command, &[&reader]);
     let process = Process(Some(command.spawn().expect("supervisor")));
     drop(reader);
     let mut writer = std::fs::File::from(writer);
@@ -291,7 +302,7 @@ fn parent_loss_cancels_an_incomplete_supervisor_request() {
     command
         .env("_VM_STARTPIPE", request.as_raw_fd().to_string())
         .env("_VM_SYNCPIPE", sync.as_raw_fd().to_string());
-    inherit(&mut command, [request.as_raw_fd(), sync.as_raw_fd()]);
+    fd_policy::install(&mut command, &[&request, &sync]);
     let process = Process(Some(command.spawn().expect("supervisor")));
     drop((request, sync));
     fixture.wait_for_request();
@@ -357,6 +368,138 @@ fn watchdog_runs_before_a_complete_launch_request_exists() {
     drop(keepalive);
     let output = child.output();
     assert_eq!(output.status.code(), Some(125));
+}
+
+#[test]
+fn invalid_descriptor_roles_fail_before_any_worker_event() {
+    let (request, _writer) = pipe();
+    let (events, reporter) = pipe();
+    let (watchdog, keepalive) = pipe();
+    let alias = request.try_clone().expect("aliased resource");
+    let pty = nix::pty::openpty(None, None).expect("PTY");
+    let valid = [
+        request.as_raw_fd(),
+        reporter.as_raw_fd(),
+        watchdog.as_raw_fd(),
+        pty.slave.as_raw_fd(),
+    ];
+    for (label, slot, bad) in [
+        ("stdio role", 0, 0),
+        ("closed role", 0, i32::MAX),
+        ("write-only request", 0, keepalive.as_raw_fd()),
+        ("read-only events", 1, events.as_raw_fd()),
+        ("repeated number", 2, request.as_raw_fd()),
+        ("aliased resource", 2, alias.as_raw_fd()),
+        ("opposite pipe ends", 1, _writer.as_raw_fd()),
+        ("pipe instead of TTY", 3, events.as_raw_fd()),
+    ] {
+        let mut roles = valid;
+        roles[slot] = bad;
+        let mut command = private_command(roles);
+        fd_policy::install(
+            &mut command,
+            &[
+                &request, &_writer, &reporter, &events, &watchdog, &keepalive, &alias, &pty.slave,
+            ],
+        );
+        let output = Process(Some(command.spawn().expect("worker"))).output();
+        assert!(!output.status.success(), "{label}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("--data-dir"),
+            "{label}"
+        );
+    }
+    let (datagram, _peer) = std::os::unix::net::UnixDatagram::pair().expect("datagram");
+    let datagram: OwnedFd = datagram.into();
+    let unconnected = nix::sys::socket::socket(
+        nix::sys::socket::AddressFamily::Unix,
+        nix::sys::socket::SockType::Stream,
+        nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .expect("unconnected stream");
+    for mux in [&datagram, &unconnected] {
+        let mut command = private_command(valid);
+        command
+            .arg("--vsock-mux-fd")
+            .arg(mux.as_raw_fd().to_string());
+        fd_policy::install(
+            &mut command,
+            &[&request, &reporter, &watchdog, &pty.slave, mux],
+        );
+        assert!(!Process(Some(command.spawn().expect("invalid mux worker")))
+            .output()
+            .status
+            .success());
+    }
+    drop(reporter);
+    let mut bytes = Vec::new();
+    std::fs::File::from(events)
+        .read_to_end(&mut bytes)
+        .expect("events EOF");
+    assert!(bytes.is_empty(), "invalid roles reached request processing");
+}
+
+#[test]
+fn worker_rejects_truncated_oversized_zero_and_trailing_frames() {
+    for bytes in [
+        vec![],
+        vec![0, 0, 0],
+        vec![0, 0, 0, 3, b'{'],
+        vec![0; 4],
+        u32::MAX.to_be_bytes().to_vec(),
+        vec![0, 0, 0, 2, b'{', b'}', 0],
+    ] {
+        let (child, mut request, _keepalive, _events, _console) = worker();
+        request.write_all(&bytes).expect("invalid frame");
+        drop(request);
+        assert!(!child.output().status.success());
+    }
+}
+
+#[test]
+fn watchdog_terminates_worker_with_a_full_event_channel() {
+    let (child, _request, keepalive, _events, _console) = worker_with_events(|events| {
+        nix::fcntl::fcntl(
+            events,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("nonblocking event pipe");
+        loop {
+            match nix::unistd::write(events, &[b'x'; 4096]) {
+                Ok(_) => {}
+                Err(nix::errno::Errno::EAGAIN) => break,
+                Err(error) => panic!("fill event pipe: {error}"),
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    drop(keepalive);
+    assert_eq!(child.output().status.code(), Some(125));
+}
+
+#[test]
+fn later_marker_remains_supervisor_data_and_non_utf8_basename_fails_closed() {
+    use std::os::unix::ffi::OsStringExt;
+    let output = Process(Some(
+        command()
+            .args(["--name", "__krun", "--help"])
+            .spawn()
+            .expect("supervisor help"),
+    ))
+    .output();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--data-dir"));
+    let output = Process(Some(
+        command()
+            .arg0(std::ffi::OsString::from_vec(b"/private/\xff/krun".to_vec()))
+            .arg("--help")
+            .spawn()
+            .expect("basename guard"),
+    ))
+    .output();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("private __krun marker"));
 }
 
 #[test]
