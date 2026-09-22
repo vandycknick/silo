@@ -121,8 +121,8 @@ from a particular cgroup under concurrent activity.
 Remove `host-memory-reclaim`, `memory-reclaim`, and `memory-reclaim-after` from
 daemon YAML. Old persisted installation records discard these retired settings;
 old machine guest-policy fields are likewise not retained. New agent JSON
-rejects the retired `memory_reclaim` key. Upgrade the CLI, vmmon, krun helper,
-and managed agent together. Running VMs are unchanged until restarted.
+rejects the retired `memory_reclaim` key. Upgrade the CLI, vmmon (including its
+private krun worker), and managed agent together. Running VMs are unchanged until restarted.
 
 The OrbStack handoff in `~/Projects/orb-analyses2` informs this separation, but
 Silo retains stock virtio reporting, its existing RAM provider, mapping

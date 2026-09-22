@@ -59,7 +59,6 @@ pub(crate) fn spawn_startup_command(
         {
             Ok(Ok(agent)) => agent,
             Ok(Err(message)) => {
-                stop_machine(&machine, &shutdown).await;
                 report_start_failure(
                     &mut started,
                     StartupCommandStartError::Unavailable(message.to_string()),
@@ -67,7 +66,6 @@ pub(crate) fn spawn_startup_command(
                 return;
             }
             Err(_) => {
-                stop_machine(&machine, &shutdown).await;
                 report_start_failure(
                     &mut started,
                     StartupCommandStartError::Unavailable(
@@ -81,7 +79,6 @@ pub(crate) fn spawn_startup_command(
         let execution_id = match Uuid::parse_str(&command.execution_id) {
             Ok(execution_id) => execution_id,
             Err(error) => {
-                stop_machine(&machine, &shutdown).await;
                 report_start_failure(
                     &mut started,
                     StartupCommandStartError::Unavailable(format!(
@@ -114,7 +111,6 @@ pub(crate) fn spawn_startup_command(
             stop_requested.cancel();
             return;
         }
-        stop_machine(&machine, &shutdown).await;
         report_start_failure(
             &mut started,
             failure.unwrap_or_else(|| {
@@ -288,18 +284,6 @@ fn report_start_failure(
 
 fn unavailable(message: impl Into<String>) -> StartupCommandStartError {
     StartupCommandStartError::Unavailable(message.into())
-}
-
-async fn stop_machine(
-    machine: &crate::virt::VirtualMachine,
-    shutdown: &tokio_util::sync::CancellationToken,
-) {
-    if shutdown.is_cancelled() {
-        return;
-    }
-    if let Err(error) = machine.stop().await {
-        tracing::error!(%error, "stop machine after startup command completion");
-    }
 }
 
 #[cfg(test)]

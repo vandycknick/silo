@@ -1,6 +1,6 @@
 # libkrun Implicit Behaviors
 
-Silo treats the `krun` helper as an explicit VM launcher. At the pinned native Rust API revision, `VmmBuilder` starts without implicit console, vsock, balloon, or RNG devices and does not inject a default init binary. Silo adds every required device explicitly.
+Silo executes libkrun in a private worker launched from vmmon itself, with argv[0] `krun`. The `virt/krun` crate constructs the VM explicitly; it does not launch processes. At the pinned native Rust API revision, `VmmBuilder` starts without implicit console, vsock, balloon, or RNG devices and does not inject a default init binary. Silo adds every required device explicitly.
 
 ## Runtime Defaults
 

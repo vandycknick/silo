@@ -6,7 +6,10 @@ Updated: 2026-08-18
 
 ## Status
 
-Accepted
+Accepted. The current worker/layout contract is documented in
+[the krun worker architecture](../architecture/krun-worker.md). Historical rollout
+and verification notes below describe their original revisions, not current
+standalone-helper requirements.
 
 ## The Problem
 
@@ -19,9 +22,9 @@ CLI, Rust consumer, or language SDK
         v
       libvm
         |
-        +-- vmmon
-        |     +-- Virtualization.framework on macOS
-        |     `-- krun helper on Linux
+        +-- vmmon supervisor
+        |     +-- same-executable krun worker (Linux/macOS default)
+        |     `-- Virtualization.framework (explicit macOS override)
         |
         +-- netd
         |
@@ -167,11 +170,11 @@ The portable runtime root has this fixed layout:
     agent
 ```
 
-All six files are included for every initial target. `krun` contains the pinned
-Silo libkrun fork directly. The payload does not contain `libkrun.so`,
-`libkrun.dylib`, or `libkrunfw`. Only the krun helper links libkrun code; the
-process boundary remains `vmmon -> krun`. Neither `vmmon`, `libvm`, nor a
-language binding links libkrun merely by using the launcher library.
+All five files are included for every initial target. `vmmon` contains the
+pinned Silo libkrun fork directly, executing it only in a separate private worker
+process with argv[0] `krun`. The payload does not contain a standalone krun,
+`libkrun.so`, `libkrun.dylib`, or `libkrunfw`. Libvm and language bindings launch
+vmmon; they do not link libkrun.
 
 The runtime payload does not inherently include the `silo` CLI. Product archives
 add the CLI and SDK packages add their native binding. A complete portable CLI

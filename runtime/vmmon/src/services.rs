@@ -462,15 +462,17 @@ pub async fn start_services(
         .map(|command| crate::execution::spawn_startup_command(ctx, command, exec_log));
     let mut startup_command = match startup_command {
         Some(crate::execution::StartupCommandHandle { task, started }) => {
+            // Preserve a buffered typed launch failure before observing exit.
+            // Successful Started still passes the final machine-alive fence.
             let started = tokio::select! {
                 biased;
-                exit = ctx.machine.wait() => Err(eyre::eyre!("primary VM exited before startup command readiness: {exit:?}")),
-                () = startup_cancel.cancelled() => Err(eyre::eyre!("startup command launch cancelled")),
                 result = tokio::time::timeout_at(startup_deadline, started) => match result {
                     Ok(Ok(result)) => Ok(result),
                     Ok(Err(_)) => Err(eyre::eyre!("startup command supervisor ended before reporting Started")),
                     Err(_) => Err(eyre::eyre!("startup command launch exceeded the original startup deadline")),
                 },
+                exit = ctx.machine.wait() => Err(eyre::eyre!("primary VM exited before startup command readiness: {exit:?}")),
+                () = startup_cancel.cancelled() => Err(eyre::eyre!("startup command launch cancelled")),
             };
             match started {
                 Ok(Ok(())) => Some(task),

@@ -55,7 +55,7 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum VirtBackendOverride {
-    /// libkrun via the spawned krun helper.
+    /// libkrun in vmmon's private worker process.
     Krun,
     /// Apple Virtualization.framework.
     Vz,

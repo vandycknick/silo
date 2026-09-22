@@ -3,7 +3,7 @@
 
 Usage: scripts/vm-memory-report.py [VM]      (default: silo-system)
 
-Read-only. Compares the krun helper's host accounting with guest kernel metrics.
+Read-only. Compares the private krun worker's host accounting with guest kernel metrics.
 These are different views, not an additive physical-memory accounting: a residual
 does not prove that pages leaked, were reported free, or became irreclaimable.
 Needs `footprint` and `vmmap` (Xcode command line tools) and `silo exec`.
@@ -70,6 +70,27 @@ def find_pid(binary, short_id):
         if f"/{binary} " in cmd or cmd.startswith(binary):
             return int(pid)
     return None
+
+
+def worker_pid(process_rows: str, supervisor_pid: int) -> int | None:
+    """Select the supervisor's private worker, not an executable named krun."""
+    candidates: list[int] = []
+    for line in process_rows.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) != 3:
+            continue
+        try:
+            pid, parent = int(fields[0]), int(fields[1])
+        except ValueError:
+            continue
+        command = fields[2].split()
+        if (parent == supervisor_pid and len(command) >= 2
+                and command[0].rsplit("/", 1)[-1] in ("krun", "vmmon")
+                and command[1] == "__krun"):
+            candidates.append(pid)
+    if len(candidates) > 1:
+        raise ValueError("supervisor has multiple private krun workers")
+    return candidates[0] if candidates else None
 
 
 def footprint_table(pid):
@@ -148,10 +169,10 @@ def mib(value):
 def main():
     reference = sys.argv[1] if len(sys.argv) > 1 else "silo-system"
     machine = find_machine(reference)
-    krun = find_pid("krun", machine["short_id"])
     vmmon = find_pid("vmmon", machine["short_id"])
+    krun = worker_pid(run(["ps", "-axo", "pid=,ppid=,args="]), vmmon) if vmmon is not None else None
     if krun is None:
-        sys.exit(f"{machine['name']} has no running krun helper (state {machine['state']})")
+        sys.exit(f"{machine['name']} has no running private krun worker (state {machine['state']})")
 
     fp = phys_footprint(krun)
     table = footprint_table(krun)

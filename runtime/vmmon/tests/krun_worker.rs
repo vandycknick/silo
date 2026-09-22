@@ -12,8 +12,12 @@ mod fd_policy;
 
 struct Process(Option<Child>);
 impl Process {
-    fn output(mut self) -> Output {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    fn output(self) -> Output {
+        self.output_with_timeout(Duration::from_secs(5))
+    }
+
+    fn output_with_timeout(mut self, timeout: Duration) -> Output {
+        let deadline = Instant::now() + timeout;
         loop {
             if self
                 .0
@@ -41,13 +45,28 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         if let Some(child) = &mut self.0 {
-            if child.try_wait().ok().flatten().is_none() {
-                // Each fixture owns a new process group; never touch unrelated processes.
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-(child.id() as i32)),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                let _ = child.kill();
+            if matches!(child.try_wait(), Ok(None)) {
+                let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+                let started = Instant::now();
+                let mut escalated = false;
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT);
+                // Prefer supervisor-owned reaping, including on assertion failure.
+                while matches!(child.try_wait(), Ok(None)) {
+                    if !escalated && started.elapsed() >= Duration::from_millis(100) {
+                        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT);
+                        escalated = true;
+                    }
+                    if started.elapsed() >= Duration::from_secs(3) {
+                        // Each fixture owns this process group, never a system-wide kill.
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(-pid.as_raw()),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                        let _ = child.kill();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
             let _ = child.wait();
         }
@@ -129,7 +148,7 @@ fn private_command(roles: [i32; 4]) -> Command {
     command
 }
 
-struct SupervisorFixture(std::path::PathBuf);
+struct SupervisorFixture(std::path::PathBuf, uuid::Uuid);
 
 impl SupervisorFixture {
     fn new() -> Self {
@@ -162,14 +181,14 @@ impl SupervisorFixture {
             serde_json::to_vec(&spec).expect("spec encoding"),
         )
         .expect("write spec");
-        Self(root)
+        Self(root, uuid::Uuid::new_v4())
     }
 
     fn command(&self) -> Command {
         let mut command = command();
         command.arg("--foreground").args([
             "--id",
-            &uuid::Uuid::new_v4().to_string(),
+            &self.1.to_string(),
             "--run-id",
             &uuid::Uuid::new_v4().to_string(),
             "--name",
@@ -198,6 +217,89 @@ impl SupervisorFixture {
         command
     }
 
+    fn native() -> Self {
+        let fixture = Self::new();
+        let asset = |name| {
+            let path = std::path::PathBuf::from(
+                std::env::var_os(name)
+                    .unwrap_or_else(|| panic!("set {name} to run ignored native qualification")),
+            );
+            std::fs::canonicalize(path).expect("native asset must exist")
+        };
+        let mut spec: vm_spec::VmSpec =
+            serde_json::from_slice(&std::fs::read(fixture.0.join("spec.json")).expect("spec"))
+                .expect("spec schema");
+        let kernel = spec
+            .boot
+            .as_mut()
+            .expect("boot")
+            .kernel
+            .as_mut()
+            .expect("kernel");
+        kernel.path = Some(asset("SILO_TEST_KERNEL"));
+        kernel.initramfs = Some(asset("SILO_TEST_INITRAMFS"));
+        kernel.cmdline = vec![
+            "loglevel=4".to_string(),
+            "silo.qualification=krun-worker".to_string(),
+        ];
+        spec.hardware.as_mut().expect("hardware").memory = Some(256);
+        let share = fixture.0.join("share");
+        std::fs::create_dir(&share).expect("share");
+        std::fs::write(share.join("proof"), b"SILO_NATIVE_MOUNT\n").expect("mount proof");
+        std::fs::copy(asset("SILO_TEST_SHUTDOWN"), share.join("shutdown"))
+            .expect("guest-only shutdown utility");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            share.join("shutdown"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("executable guest fixture");
+        spec.mounts.push(vm_spec::Mount {
+            source: share,
+            tag: "acceptance".to_string(),
+            read_only: true,
+        });
+        let mut disks = Vec::new();
+        for (name, read_only) in [("first.raw", false), ("second.raw", true)] {
+            let path = fixture.0.join(name);
+            std::fs::File::create(&path)
+                .expect("disk")
+                .set_len(8 * 1024 * 1024)
+                .expect("disk size");
+            disks.push(vm_spec::Disk { path, read_only });
+        }
+        spec.storage = Some(vm_spec::Storage { disks });
+        std::fs::write(
+            fixture.0.join("spec.json"),
+            serde_json::to_vec(&spec).expect("native spec"),
+        )
+        .expect("write native spec");
+        fixture
+    }
+
+    async fn wait_for_guest(&self, process: &mut Process, previous_generations: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let console = std::fs::read_to_string(self.0.join("serial.log")).unwrap_or_default();
+            if console.matches("starting rescue shell").count() > previous_generations {
+                return;
+            }
+            assert!(
+                process
+                    .0
+                    .as_mut()
+                    .expect("supervisor")
+                    .try_wait()
+                    .expect("probe supervisor")
+                    .is_none(),
+                "native startup failed: {}",
+                std::fs::read_to_string(self.0.join("trace.log")).unwrap_or_default()
+            );
+            assert!(Instant::now() < deadline, "guest boot timed out: {console}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     fn wait_for_request(&self) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while !std::fs::read_to_string(self.0.join("trace.log"))
@@ -215,6 +317,16 @@ impl SupervisorFixture {
 
 impl Drop for SupervisorFixture {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            for name in ["serial.log", "trace.log"] {
+                if let Ok(bytes) = std::fs::read(self.0.join(name)) {
+                    eprintln!(
+                        "{name} tail: {}",
+                        String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(8192)..])
+                    );
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -500,6 +612,247 @@ fn later_marker_remains_supervisor_data_and_non_utf8_basename_fails_closed() {
     .output();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("private __krun marker"));
+}
+
+async fn native_serial(
+    path: &std::path::Path,
+) -> (
+    tokio::sync::mpsc::Sender<protocol::v1::ByteChunk>,
+    tonic::Streaming<protocol::v1::ByteChunk>,
+) {
+    let path = path.to_owned();
+    let channel = tonic::transport::Endpoint::from_static("http://localhost")
+        .connect_with_connector(tower::service_fn(move |_| {
+            let path = path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await
+        .expect("real vmmon API");
+    let mut client = protocol::v1::vm_access_service_client::VmAccessServiceClient::new(channel);
+    let (send, input) = tokio::sync::mpsc::channel(4);
+    let stream = client
+        .open_serial(tokio_stream::wrappers::ReceiverStream::new(input))
+        .await
+        .expect("real guest serial")
+        .into_inner();
+    (send, stream)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeExit {
+    Stop,
+    WorkerSignal,
+    GuestReboot,
+    GuestPoweroff,
+}
+
+#[tokio::test]
+#[ignore = "requires native hypervisor and SILO_TEST_KERNEL/INITRAMFS/SHUTDOWN; macOS vmmon must be signed"]
+async fn native_guest_devices_shutdown_crash_and_new_generation() {
+    native_guest_cases(&[
+        NativeExit::Stop,
+        NativeExit::Stop,
+        NativeExit::WorkerSignal,
+        NativeExit::GuestReboot,
+    ])
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "power-off acceptance gate; requires native assets, currently blocked with the available x86-64 kernel"]
+async fn native_guest_poweroff() {
+    native_guest_cases(&[NativeExit::GuestPoweroff]).await;
+}
+
+async fn native_guest_cases(scenarios: &[NativeExit]) {
+    let fixture = SupervisorFixture::native();
+    let mut previous_run = None;
+    let mut previous_worker = None;
+    for (generation, &scenario) in scenarios.iter().enumerate() {
+        let mut process = Process(Some(fixture.command().spawn().expect("native supervisor")));
+        fixture.wait_for_guest(&mut process, generation).await;
+        let supervisor = process.0.as_ref().expect("supervisor").id();
+        let children = Command::new("pgrep")
+            .args(["-P", &supervisor.to_string()])
+            .output()
+            .expect("inspect owned process tree");
+        let children: Vec<u32> = String::from_utf8(children.stdout)
+            .expect("PIDs")
+            .split_whitespace()
+            .map(|pid| pid.parse().expect("worker PID"))
+            .collect();
+        assert_eq!(
+            children.len(),
+            1,
+            "one primary worker, no helper descendants"
+        );
+        let worker = children[0];
+        assert_ne!(Some(worker), previous_worker);
+        #[cfg(target_os = "linux")]
+        {
+            let argv = std::fs::read(format!("/proc/{worker}/cmdline")).expect("worker argv");
+            let mut argv = argv.split(|byte| *byte == 0);
+            assert_eq!(argv.next(), Some(b"krun".as_slice()));
+            assert_eq!(argv.next(), Some(b"__krun".as_slice()));
+            assert_eq!(
+                std::fs::read_link(format!("/proc/{worker}/exe")).expect("worker executable"),
+                std::fs::canonicalize(env!("CARGO_BIN_EXE_vmmon")).expect("vmmon executable")
+            );
+        }
+        let (send, mut serial) = native_serial(&fixture.0.join("vm.sock")).await;
+        let mut input =
+            "echo DISKS_BEGIN; cat /sys/block/vda/ro /sys/block/vdb/ro; echo DISKS_END; "
+                .to_string();
+        // The rescue shell does not expand globs. Enumerate the console, two
+        // block devices, filesystem, vsock, RNG, and balloon explicitly.
+        for index in 0..7 {
+            input.push_str(&format!(
+                "cat /sys/bus/virtio/devices/virtio{index}/device; "
+            ));
+        }
+        input.push_str("mount -t virtiofs acceptance /mnt; cat /mnt/proof; echo denied > /mnt/denied; echo SILO_NATIVE_DONE\n");
+        send.send(protocol::v1::ByteChunk {
+            data: Some(bytes::Bytes::from(input)),
+        })
+        .await
+        .expect("guest input");
+        let output = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut output = String::new();
+            loop {
+                let chunk = serial
+                    .message()
+                    .await
+                    .expect("serial response")
+                    .expect("live guest");
+                output.push_str(&String::from_utf8_lossy(&chunk.data.unwrap_or_default()));
+                assert!(output.len() <= 1024 * 1024, "bounded guest output");
+                if output
+                    .replace('\r', "")
+                    .lines()
+                    .any(|line| line == "SILO_NATIVE_DONE")
+                {
+                    return output.replace('\r', "");
+                }
+            }
+        })
+        .await
+        .expect("real guest round trip");
+        assert!(output.contains("DISKS_BEGIN\n0\n1\nDISKS_END"), "{output}");
+        assert!(
+            output.lines().any(|line| line == "SILO_NATIVE_MOUNT"),
+            "{output}"
+        );
+        let devices: Vec<u32> = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("0x"))
+            .filter_map(|id| u32::from_str_radix(id, 16).ok())
+            .collect();
+        assert!(devices.contains(&5), "balloon device missing: {output}");
+        assert!(devices.contains(&19), "vsock device missing: {output}");
+        assert!(
+            !fixture.0.join("share/denied").exists(),
+            "read-only virtio-fs share accepted a write"
+        );
+        if matches!(
+            scenario,
+            NativeExit::GuestReboot | NativeExit::GuestPoweroff
+        ) {
+            let command: &'static [u8] = if scenario == NativeExit::GuestPoweroff {
+                b"/mnt/shutdown poweroff\n"
+            } else {
+                b"/mnt/shutdown\n"
+            };
+            send.send(protocol::v1::ByteChunk {
+                data: Some(bytes::Bytes::from_static(command)),
+            })
+            .await
+            .expect("guest shutdown request");
+            // Poll the response while the guest consumes the final request.
+            let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                while let Some(chunk) = serial.message().await.expect("shutdown serial response") {
+                    let text =
+                        String::from_utf8_lossy(&chunk.data.unwrap_or_default()).into_owned();
+                    if text.contains("SILO_NATIVE_SHUTDOWN") {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+        drop((send, serial));
+        if scenario == NativeExit::Stop {
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(supervisor as i32),
+                nix::sys::signal::Signal::SIGINT,
+            )
+            .expect("supervised stop");
+        } else if scenario == NativeExit::WorkerSignal {
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(worker as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .expect("unexpected worker death");
+        }
+        let result = process.output_with_timeout(Duration::from_secs(45));
+        assert_eq!(
+            result.stdout, b"started\n",
+            "guest and native diagnostics must not contaminate the supervisor protocol"
+        );
+        assert!(!fixture.0.join("vm.pid").exists());
+        let status: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.0.join("vm.exit.json")).expect("native exit metadata"),
+        )
+        .expect("exit record");
+        assert_eq!(status["pid"], supervisor);
+        assert_eq!(status["machineId"], fixture.1.to_string());
+        assert_eq!(status["worker"]["pid"], worker);
+        assert_eq!(status["worker"]["coreDumped"], false);
+        assert_eq!(status["worker"]["stage"], "started");
+        assert_ne!(Some(&status["runId"]), previous_run.as_ref());
+        let expected = match scenario {
+            NativeExit::WorkerSignal => {
+                assert!(!result.status.success());
+                assert!(status["worker"]["forceReason"].is_null());
+                "error"
+            }
+            NativeExit::Stop if cfg!(target_os = "linux") => {
+                assert!(result.status.success());
+                assert_eq!(status["worker"]["signal"], 9);
+                "forced"
+            }
+            NativeExit::Stop if status["worker"]["signal"] == 9 => {
+                assert!(result.status.success());
+                assert_eq!(status["worker"]["forceReason"], "graceful_timeout");
+                "forced"
+            }
+            _ => {
+                assert!(result.status.success());
+                assert_eq!(status["worker"]["code"], 0);
+                "clean"
+            }
+        };
+        assert_eq!(status["outcome"], expected, "{status}");
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(worker as i32), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("trace.log"))
+                .expect("trace")
+                .matches("krun worker spawned")
+                .count(),
+            generation + 1
+        );
+        eprintln!(
+            "native {scenario:?}: supervisor={supervisor}, worker={worker}, outcome={expected}"
+        );
+        previous_run = Some(status["runId"].clone());
+        previous_worker = Some(worker);
+    }
 }
 
 #[test]

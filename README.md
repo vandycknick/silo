@@ -18,6 +18,10 @@ The short version:
 
 Only network policies are implemented today. Kernel and userspace policies are the direction.
 
+Vmmon supervises a separate libkrun worker launched from the same executable.
+There is no standalone krun runtime binary. See the [worker architecture and
+qualification notes](docs/architecture/krun-worker.md).
+
 ## CLI
 
 Build the CLI locally:
