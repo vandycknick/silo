@@ -39,6 +39,8 @@ impl Bootstrap {
             (console, Role::Console),
         ];
         let mut identities = Vec::new();
+        #[cfg(target_os = "macos")]
+        let mut pipes = Vec::new();
         let mut numbers = Vec::new();
         for (raw, role) in roles.into_iter().chain(mux.map(|raw| (raw, Role::Mux))) {
             if raw < 3 || numbers.contains(&raw) {
@@ -58,6 +60,14 @@ impl Bootstrap {
                 return Err(invalid("bootstrap roles alias the same resource"));
             }
             let kind = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT;
+            #[cfg(target_os = "macos")]
+            if kind == SFlag::S_IFIFO {
+                let identity = pipe_identity(raw)?;
+                if pipes.contains(&identity) {
+                    return Err(invalid("bootstrap roles alias the same pipe"));
+                }
+                pipes.push(identity);
+            }
             let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
             let access = flags & OFlag::O_ACCMODE;
             match role {
@@ -95,6 +105,58 @@ impl Bootstrap {
             }
         })
     }
+}
+
+#[cfg(target_os = "macos")]
+fn pipe_identity(fd: RawFd) -> io::Result<(u64, u64)> {
+    // Darwin assigns distinct inodes to the ends of an anonymous pipe. Its
+    // proc_info.h ABI exposes opaque handles linking those ends; nix does not
+    // wrap PROC_PIDFDPIPEINFO, and libc only exposes the query and vinfo_stat.
+    #[repr(C)]
+    struct FileInfo {
+        openflags: u32,
+        status: u32,
+        offset: nix::libc::off_t,
+        kind: i32,
+        guardflags: u32,
+    }
+    #[repr(C)]
+    struct PipeInfo {
+        stat: nix::libc::vinfo_stat,
+        handle: u64,
+        peerhandle: u64,
+        status: i32,
+        reserved: i32,
+    }
+    #[repr(C)]
+    struct PipeFdInfo {
+        file: FileInfo,
+        pipe: PipeInfo,
+    }
+    const PROC_PIDFDPIPEINFO: i32 = 6;
+    let mut info = std::mem::MaybeUninit::<PipeFdInfo>::uninit();
+    let size = std::mem::size_of::<PipeFdInfo>() as i32;
+    // SAFETY: the query writes at most size bytes into correctly aligned storage
+    // matching the SDK's pipe_fdinfo layout. No fields are read on a short result.
+    let count = unsafe {
+        nix::libc::proc_pidfdinfo(
+            nix::unistd::getpid().as_raw(),
+            fd,
+            PROC_PIDFDPIPEINFO,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if count <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if count != size {
+        return Err(invalid("incomplete pipe descriptor information"));
+    }
+    // SAFETY: the kernel returned the entire initialized structure.
+    let info = unsafe { info.assume_init() };
+    let (handle, peer) = (info.pipe.handle, info.pipe.peerhandle);
+    Ok((handle.min(peer), handle.max(peer)))
 }
 
 pub(crate) fn nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
@@ -136,6 +198,24 @@ pub(crate) fn start_watchdog(fd: OwnedFd) -> io::Result<()> {
 mod tests {
     use crate::krun_worker::fds::Bootstrap;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn opposite_pipe_ends_cannot_fill_distinct_roles() {
+        let (request, events) = nix::unistd::pipe().expect("request pipe");
+        let (watchdog, _keepalive) = nix::unistd::pipe().expect("watchdog pipe");
+        let pty = nix::pty::openpty(None, None).expect("pty");
+        assert!(Bootstrap::adopt(
+            request.as_raw_fd(),
+            events.as_raw_fd(),
+            watchdog.as_raw_fd(),
+            pty.slave.as_raw_fd(),
+            None,
+        )
+        .is_err());
+        for fd in [&request, &events, &watchdog, &pty.slave] {
+            nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).expect("still owned");
+        }
+    }
 
     #[test]
     fn invalid_roles_do_not_adopt_or_close_caller_descriptors() {

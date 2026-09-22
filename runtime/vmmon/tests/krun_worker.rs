@@ -526,10 +526,11 @@ fn invalid_descriptor_roles_fail_before_any_worker_event() {
     let unconnected = nix::sys::socket::socket(
         nix::sys::socket::AddressFamily::Unix,
         nix::sys::socket::SockType::Stream,
-        nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        nix::sys::socket::SockFlag::empty(),
         None,
     )
     .expect("unconnected stream");
+    let unconnected = fd_policy::normalize(unconnected).expect("normalize unconnected stream");
     for mux in [&datagram, &unconnected] {
         let mut command = private_command(valid);
         command
