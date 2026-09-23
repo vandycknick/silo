@@ -1,9 +1,33 @@
-use std::ffi::OsString;
-use std::fs;
+//! The `--exit-command` runner.
+//!
+//! The exit command is not spawned by the supervisor at the end of a
+//! generation. Instead a runner is forked early, while the supervisor is still
+//! single-threaded and before it opens any machine resource beyond its inherited
+//! descriptors, and waits on a pipe:
+//!
+//! ```text
+//! silo-vmmon ──fork──► runner (idle, holds only the pipe read end)
+//!     │                    │
+//!     │ finalize: write 1  │ read returns (byte or EOF)
+//!     └──────── pipe ─────►│
+//!                          └─ execve(exit command)
+//! ```
+//!
+//! If the supervisor dies without finalizing, the pipe reaches EOF and the
+//! command still runs. The runner is never reaped by the supervisor, which
+//! exits right after triggering it; it is reparented. Keeping the command out of
+//! the supervisor's own process also keeps it independent of any confinement
+//! the supervisor enters later.
+
+use std::ffi::{CString, OsString};
+use std::fs::{self, File};
+use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use eyre::Context;
+use nix::fcntl::OFlag;
 
 const MACHINE_ID_ENV: &str = "SILO_MACHINE_ID";
 const MACHINE_RUN_ID_ENV: &str = "SILO_MACHINE_RUN_ID";
@@ -25,47 +49,142 @@ impl ExitCommand {
             None => eyre::bail!("--exit-command-arg requires --exit-command"),
         }
     }
+}
 
-    pub(crate) fn spawn(&self, machine_id: &str, machine_run_id: &str) {
-        if let Err(err) = self.spawn_inner(machine_id, machine_run_id) {
-            tracing::warn!(error = %err, command = %self.command.display(), "exit command failed");
+/// Write end of the pipe the forked runner waits on.
+#[derive(Debug)]
+pub(crate) struct ExitRunner {
+    trigger: File,
+}
+
+impl ExitRunner {
+    /// Resolve the exit command and fork its runner.
+    ///
+    /// Must be called while the process is single-threaded: before tracing
+    /// (whose appender starts a thread) and before the Tokio runtime.
+    pub(crate) fn fork(
+        command: &ExitCommand,
+        machine_id: &str,
+        machine_run_id: &str,
+    ) -> eyre::Result<Self> {
+        let executable =
+            resolve_exit_command_with_context(&command.command, &ResolveContext::current()?)?;
+        let program = c_string(executable.as_os_str().as_bytes())?;
+        let mut argv = vec![program.clone()];
+        for arg in &command.args {
+            argv.push(c_string(arg.as_bytes())?);
+        }
+        let mut envp = Vec::new();
+        for (name, value) in std::env::vars_os() {
+            if name == MACHINE_ID_ENV || name == MACHINE_RUN_ID_ENV {
+                continue;
+            }
+            let mut entry = name.into_encoded_bytes();
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_bytes());
+            envp.push(c_string(&entry)?);
+        }
+        envp.push(c_string(
+            format!("{MACHINE_ID_ENV}={machine_id}").as_bytes(),
+        )?);
+        envp.push(c_string(
+            format!("{MACHINE_RUN_ID_ENV}={machine_run_id}").as_bytes(),
+        )?);
+
+        let (read, write) = nix::unistd::pipe().context("create exit runner pipe")?;
+        for fd in [&read, &write] {
+            nix::fcntl::fcntl(
+                fd,
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .context("mark exit runner pipe close-on-exec")?;
+        }
+        // SAFETY: the caller guarantees no other thread exists, so the child
+        // cannot inherit a lock held mid-operation by another thread.
+        match unsafe { nix::unistd::fork() }.context("fork exit runner")? {
+            nix::unistd::ForkResult::Parent { .. } => {
+                drop(read);
+                Ok(Self {
+                    trigger: File::from(write),
+                })
+            }
+            nix::unistd::ForkResult::Child => {
+                drop(write);
+                run_child(read, &program, &argv, &envp)
+            }
         }
     }
 
-    fn spawn_inner(&self, machine_id: &str, machine_run_id: &str) -> eyre::Result<()> {
-        let resolve_context = ResolveContext::current()?;
-        tracing::debug!(
-            command = %self.command.display(),
-            args = ?self.args,
-            cwd = %resolve_context.cwd.display(),
-            "resolving exit command"
-        );
-        let executable = resolve_exit_command_with_context(&self.command, &resolve_context)?;
-
-        tracing::info!(
-            command = %self.command.display(),
-            executable = %executable.display(),
-            args = ?self.args,
-            cwd = %resolve_context.cwd.display(),
-            "spawning exit command"
-        );
-
-        let mut command = tokio::process::Command::new(&executable);
-        command
-            .args(&self.args)
-            .env(MACHINE_ID_ENV, machine_id)
-            .env(MACHINE_RUN_ID_ENV, machine_run_id)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(false);
-
-        let child = command
-            .spawn()
-            .with_context(|| format!("spawn exit command {}", executable.display()))?;
-        tracing::info!(pid = child.id(), executable = %executable.display(), "exit command spawned");
-        Ok(())
+    /// Release the runner. Called once, after the exit record is written.
+    pub(crate) fn trigger(self) {
+        let mut trigger = self.trigger;
+        if let Err(error) = trigger.write_all(&[1]) {
+            // The runner still observes EOF when this descriptor closes.
+            tracing::warn!(%error, "exit runner trigger write failed");
+        }
     }
+}
+
+fn run_child(trigger: OwnedFd, program: &CString, argv: &[CString], envp: &[CString]) -> ! {
+    // Failures here cannot be reported anywhere useful; the command still runs.
+    let _ = redirect_stdio_to_null();
+    let _ = close_all_except(trigger.as_raw_fd());
+    // One byte or EOF releases the runner; only EINTR keeps waiting.
+    let mut byte = [0_u8; 1];
+    while let Err(nix::errno::Errno::EINTR) = nix::unistd::read(&trigger, &mut byte) {}
+    drop(trigger);
+    let _ = nix::unistd::execve(program, argv, envp);
+    // nix exposes no _exit. The forked child must not run the parent's atexit
+    // handlers or destructors.
+    unsafe { nix::libc::_exit(127) }
+}
+
+fn redirect_stdio_to_null() -> nix::Result<()> {
+    let null = nix::fcntl::open("/dev/null", OFlag::O_RDWR, nix::sys::stat::Mode::empty())?;
+    nix::unistd::dup2_stdin(&null)?;
+    nix::unistd::dup2_stdout(&null)?;
+    nix::unistd::dup2_stderr(&null)?;
+    Ok(())
+}
+
+/// Close every descriptor above stdio except `keep`, so the runner never holds
+/// `vm.lock` (flock state belongs to the open file description), log
+/// directories or supervisor pipes.
+fn close_all_except(keep: RawFd) -> nix::Result<()> {
+    #[cfg(target_os = "linux")]
+    const FD_DIR: &str = "/proc/self/fd";
+    #[cfg(target_os = "macos")]
+    const FD_DIR: &str = "/dev/fd";
+    let mut open = Vec::new();
+    {
+        let mut directory = nix::dir::Dir::open(
+            FD_DIR,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )?;
+        let own = directory.as_raw_fd();
+        for entry in directory.iter().flatten() {
+            if let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .ok()
+                .and_then(|name| name.parse::<RawFd>().ok())
+            {
+                if fd > 2 && fd != keep && fd != own {
+                    open.push(fd);
+                }
+            }
+        }
+    }
+    for fd in open {
+        // SAFETY: the single-threaded child owns every inherited descriptor.
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+    Ok(())
+}
+
+fn c_string(bytes: &[u8]) -> eyre::Result<CString> {
+    CString::new(bytes).context("exit command argument contains a NUL byte")
 }
 
 #[derive(Debug, Clone)]
@@ -163,7 +282,7 @@ fn is_executable_metadata(_metadata: &fs::Metadata) -> bool {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::exit_command::{resolve_exit_command_with_context, ExitCommand, ResolveContext};
 
@@ -244,34 +363,6 @@ mod tests {
         let context = fixture.context(Vec::new());
 
         assert!(resolve_exit_command_with_context(Path::new("missing-hook"), &context).is_err());
-    }
-
-    #[tokio::test]
-    async fn spawned_command_outlives_the_handle_and_receives_generation() {
-        let fixture = Fixture::new("spawned-watcher");
-        let output = fixture.dir.join("generation");
-        let script = fixture.executable_with(
-            "watcher",
-            "#!/bin/sh\nsleep 0.1\nprintf '%s\\n%s\\n' \"$SILO_MACHINE_ID\" \"$SILO_MACHINE_RUN_ID\" > \"$1\"\n",
-        );
-        let command = ExitCommand::from_cli(Some(script), vec![output.clone().into_os_string()])
-            .expect("parse exit command")
-            .expect("exit command exists");
-
-        command.spawn("machine-id", "0198c783-cd1c-77c2-b66a-c06275f20d1f");
-        drop(command);
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !output.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("spawned watcher writes output");
-        assert_eq!(
-            fs::read_to_string(output).expect("read watcher output"),
-            "machine-id\n0198c783-cd1c-77c2-b66a-c06275f20d1f\n"
-        );
     }
 
     struct Fixture {

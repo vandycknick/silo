@@ -9,13 +9,13 @@
 //!   -> write vm.exit.json (primary error first, cleanup errors appended)
 //!   -> report failure on the syncpipe
 //!   -> remove the pidfile
-//!   -> trigger the exit command
+//!   -> trigger the exit runner
 //! ```
 
 use std::path::Path;
 
 use crate::exec_log::ExecLogWriter;
-use crate::exit_command::ExitCommand;
+use crate::exit_command::ExitRunner;
 use crate::exit_status::{ExitOutcome, ExitStatus};
 use crate::lock::pid::PidGuard;
 use crate::startup::{PrimaryMachine, SyncReporter};
@@ -29,7 +29,7 @@ pub(crate) struct Finalization<'a> {
     pub(crate) exec_log: Option<&'a ExecLogWriter>,
     pub(crate) sync_reporter: &'a mut SyncReporter,
     pub(crate) pid_guard: PidGuard,
-    pub(crate) exit_command: Option<&'a ExitCommand>,
+    pub(crate) exit_runner: Option<ExitRunner>,
 }
 
 impl Finalization<'_> {
@@ -91,8 +91,8 @@ impl Finalization<'_> {
         }
 
         drop(self.pid_guard);
-        if let Some(exit_command) = self.exit_command {
-            exit_command.spawn(self.machine_id, self.run_id);
+        if let Some(exit_runner) = self.exit_runner {
+            exit_runner.trigger();
         }
 
         result

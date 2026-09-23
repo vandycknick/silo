@@ -326,7 +326,7 @@ fn supervisor_launches_one_real_worker_and_exits_on_native_startup_failure() {
             "--exit-command",
             "/bin/sh",
             "--exit-command-arg=-c",
-            "--exit-command-arg=printf '%s\\n' \"$SILO_MACHINE_RUN_ID\" >> \"$1\"",
+            "--exit-command-arg=test -f \"$(dirname \"$1\")/vm.exit.json\" && printf '%s %s\\n' \"$SILO_MACHINE_ID\" \"$SILO_MACHINE_RUN_ID\" >> \"$1\"",
             "--exit-command-arg=record",
         ])
         .arg("--exit-command-arg")
@@ -365,10 +365,150 @@ fn supervisor_launches_one_real_worker_and_exits_on_native_startup_failure() {
         assert!(Instant::now() < deadline, "exit command not invoked");
         std::thread::sleep(Duration::from_millis(10));
     }
+    // Once, after vm.exit.json exists, with both identity variables.
+    std::thread::sleep(Duration::from_millis(100));
     assert_eq!(
         std::fs::read_to_string(marker).expect("exit command record"),
-        format!("{}\n", status["runId"].as_str().expect("run identity"))
+        format!(
+            "{} {}\n",
+            status["machineId"].as_str().expect("machine identity"),
+            status["runId"].as_str().expect("run identity")
+        )
     );
+}
+
+/// Children of `pid`, by `pgrep -P`.
+fn children(pid: u32) -> Vec<u32> {
+    let output = Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .expect("inspect process tree");
+    String::from_utf8(output.stdout)
+        .expect("PIDs")
+        .split_whitespace()
+        .map(|pid| pid.parse().expect("child PID"))
+        .collect()
+}
+
+/// Numeric descriptors another process holds open.
+fn open_descriptors(pid: u32) -> Vec<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .expect("proc fd listing")
+            .map(|entry| {
+                entry
+                    .expect("fd entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .parse()
+                    .expect("numeric fd")
+            })
+            .collect()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("lsof")
+            .args(["-n", "-P", "-p", &pid.to_string(), "-F", "f"])
+            .output()
+            .expect("lsof");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix('f'))
+            .filter_map(|fd| fd.parse().ok())
+            .collect()
+    }
+}
+
+/// A supervisor parked in its start-request wait, optionally with an exit command.
+fn parked_supervisor(
+    fixture: &SupervisorFixture,
+    exit_command: Option<&std::path::Path>,
+) -> (Process, OwnedFd) {
+    let (request, keep_request_open) = pipe();
+    let mut command = fixture.command();
+    // The shared inheritance helper maps descriptors onto 3, 4, ... in order.
+    command.env("_VM_STARTPIPE", "3");
+    if let Some(marker) = exit_command {
+        command
+            .args([
+                "--exit-command",
+                "/bin/sh",
+                "--exit-command-arg=-c",
+                "--exit-command-arg=printf '%s\\n' \"$SILO_MACHINE_RUN_ID\" >> \"$1\"",
+                "--exit-command-arg=record",
+            ])
+            .arg("--exit-command-arg")
+            .arg(marker);
+    }
+    fd_policy::install(&mut command, &[&request]);
+    let process = Process(Some(command.spawn().expect("supervisor")));
+    drop(request);
+    fixture.wait_for_request();
+    (process, keep_request_open)
+}
+
+#[test]
+fn exit_runner_runs_when_the_supervisor_is_killed() {
+    let fixture = SupervisorFixture::new();
+    let marker = fixture.0.join("exit-command");
+    let (mut process, _request) = parked_supervisor(&fixture, Some(&marker));
+    assert!(!marker.exists(), "runner must wait for its trigger");
+    let child = process.0.as_mut().expect("supervisor");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect("kill supervisor");
+    let _ = child.wait();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "EOF did not run the exit command"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        std::fs::read_to_string(&marker)
+            .expect("exit command record")
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn exit_runner_exists_only_with_an_exit_command_and_holds_only_its_trigger() {
+    let fixture = SupervisorFixture::new();
+    let (process, _request) = parked_supervisor(&fixture, None);
+    let supervisor = process.0.as_ref().expect("supervisor").id();
+    assert!(
+        children(supervisor).is_empty(),
+        "no runner without --exit-command"
+    );
+    drop(process);
+
+    let fixture = SupervisorFixture::new();
+    let marker = fixture.0.join("exit-command");
+    let (process, _request) = parked_supervisor(&fixture, Some(&marker));
+    let supervisor = process.0.as_ref().expect("supervisor").id();
+    let runners = children(supervisor);
+    assert_eq!(runners.len(), 1, "exactly one idle runner");
+    let mut descriptors = open_descriptors(runners[0]);
+    descriptors.sort_unstable();
+    assert_eq!(
+        descriptors.len(),
+        4,
+        "stdio plus the trigger: {descriptors:?}"
+    );
+    assert_eq!(&descriptors[..3], &[0, 1, 2]);
+    assert!(
+        !open_descriptors(supervisor).is_empty(),
+        "descriptor inspection works for the supervisor"
+    );
+    drop(process);
 }
 
 #[test]

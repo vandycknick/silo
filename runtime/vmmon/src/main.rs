@@ -28,7 +28,7 @@ mod virt;
 mod vsock;
 
 use crate::context::RuntimeContext;
-use crate::exit_command::ExitCommand;
+use crate::exit_command::{ExitCommand, ExitRunner};
 use crate::lock::pid::PidGuard;
 use crate::start_request::StartRequestPipe;
 use crate::startup::{InheritedPipeFds, SyncReporter};
@@ -111,6 +111,14 @@ fn main() -> eyre::Result<()> {
     let machine_log_dir = inherited_fds.machine_log_dir;
     let _machine_lock = inherited_fds.take_machine_lock()?;
 
+    // Fork the exit runner while this process is still single-threaded: the
+    // tracing appender below starts the first thread.
+    let exit_command =
+        ExitCommand::from_cli(args.exit_command.clone(), args.exit_command_args.clone())?;
+    let exit_runner = exit_command
+        .as_ref()
+        .map(|command| ExitRunner::fork(command, &args.id, &args.run_id));
+
     let trace_file = secure_file::open_append(&args.trace_log)?;
 
     let (writer, _guard) = tracing_appender::non_blocking(trace_file);
@@ -131,6 +139,14 @@ fn main() -> eyre::Result<()> {
         run_id = %args.run_id,
         "vmmon generation started"
     );
+    let exit_runner = match exit_runner {
+        Some(Ok(runner)) => Some(runner),
+        Some(Err(error)) => {
+            tracing::warn!(error = %finalize::format_error_chain(&error), "exit command runner unavailable");
+            None
+        }
+        None => None,
+    };
     let mut serial_file = secure_file::open_append(&args.serial_log)?;
     write_serial_generation_boundary(&mut serial_file, &args.id, &args.run_id)?;
 
@@ -144,6 +160,7 @@ fn main() -> eyre::Result<()> {
             sync_reporter,
             serial_file,
             machine_log_dir,
+            exit_runner,
         ))
 }
 
@@ -166,11 +183,10 @@ async fn run(
     sync_reporter: SyncReporter,
     serial_file: std::fs::File,
     machine_log_dir: Option<std::os::fd::RawFd>,
+    exit_runner: Option<ExitRunner>,
 ) -> eyre::Result<()> {
     let mut start_request = start_request;
     let mut sync_reporter = sync_reporter;
-    let exit_command =
-        ExitCommand::from_cli(args.exit_command.clone(), args.exit_command_args.clone())?;
     let runtime = RuntimeContext::new(
         args.data_dir.clone(),
         args.runtime_dir.clone(),
@@ -272,7 +288,7 @@ async fn run(
         exec_log: exec_log.as_ref(),
         sync_reporter: &mut sync_reporter,
         pid_guard,
-        exit_command: exit_command.as_ref(),
+        exit_runner,
     }
     .run(result)
     .await
