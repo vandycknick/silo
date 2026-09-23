@@ -1,0 +1,104 @@
+From: Silo <silo@localhost>
+Subject: [PATCH] x86: complete explicit krun poweroff through i8042
+
+Without a poweroff handler Linux converts POWER_OFF to HALT, and a halted
+KVM vCPU does not end libkrun. Register a final poweroff callback only
+when libkrun declares krun.poweroff=i8042; libkrun turns the i8042 reset
+byte into a terminal VMM exit. Modelled on zerocore-ai/libkrunfw PR 28,
+as a separate file so the patch applies to every supported track.
+
+diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -101,6 +101,7 @@
+ obj-y				+= cpu/
+ obj-y				+= acpi/
+ obj-y				+= reboot.o
++obj-y				+= krun_poweroff.o
+ obj-$(CONFIG_X86_MSR)		+= msr.o
+ obj-$(CONFIG_X86_CPUID)		+= cpuid.o
+ obj-$(CONFIG_PCI)		+= early-quirks.o
+diff --git a/arch/x86/kernel/krun_poweroff.c b/arch/x86/kernel/krun_poweroff.c
+new file mode 100644
+--- /dev/null
++++ b/arch/x86/kernel/krun_poweroff.c
+@@ -0,0 +1,79 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Final poweroff through libkrun's i8042 exit device.
++ *
++ * The Silo x86_64 guest kernel has neither ACPI nor an i8042 driver, so
++ * without a poweroff handler Linux turns POWER_OFF into HALT and a halted
++ * KVM vCPU does not end the VMM. libkrun treats the i8042 reset command
++ * 0xfe on port 0x64 as a terminal VMM exit, not a PC reset.
++ *
++ * The handler is registered only when the host declares that transport
++ * with krun.poweroff=i8042: a generic KVM identity is not enough to use it
++ * safely on another hypervisor. It runs after orderly kernel shutdown and
++ * behind any firmware poweroff handler.
++ */
++
++#include <linux/err.h>
++#include <linux/init.h>
++#include <linux/pm.h>
++#include <linux/printk.h>
++#include <linux/reboot.h>
++#include <linux/string.h>
++#include <linux/version.h>
++#include <asm/io.h>
++
++static bool krun_i8042_poweroff_enabled __initdata;
++
++static int __init krun_poweroff_setup(char *arg)
++{
++	krun_i8042_poweroff_enabled = arg && !strcmp(arg, "i8042");
++	return 0;
++}
++early_param("krun.poweroff", krun_poweroff_setup);
++
++static void krun_i8042_poweroff(void)
++{
++	outb(0xfe, 0x64);
++}
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
++static int krun_i8042_poweroff_handler(struct sys_off_data *data)
++{
++	krun_i8042_poweroff();
++	return NOTIFY_DONE;
++}
++
++static int __init krun_poweroff_register(void)
++{
++	struct sys_off_handler *handler;
++
++	handler = register_sys_off_handler(SYS_OFF_MODE_POWER_OFF,
++					   SYS_OFF_PRIO_LOW,
++					   krun_i8042_poweroff_handler, NULL);
++	return PTR_ERR_OR_ZERO(handler);
++}
++#else
++static int __init krun_poweroff_register(void)
++{
++	if (!pm_power_off)
++		pm_power_off = krun_i8042_poweroff;
++	return 0;
++}
++#endif
++
++static int __init krun_poweroff_init(void)
++{
++	int error;
++
++	if (!krun_i8042_poweroff_enabled)
++		return 0;
++
++	error = krun_poweroff_register();
++	if (error) {
++		pr_err("krun: i8042 poweroff registration failed: %d\n", error);
++		return error;
++	}
++	pr_info("krun: i8042 poweroff handler registered\n");
++	return 0;
++}
++late_initcall(krun_poweroff_init);

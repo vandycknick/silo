@@ -527,12 +527,20 @@ fn prepare(config: &VmConfig) -> Result<(), VirtError> {
     Ok(())
 }
 
+/// Declares libkrun's i8042 exit device as the guest's final poweroff path.
+/// The Silo x86_64 kernel carries a patch that registers that handler only
+/// when this argument is present; aarch64 powers off through PSCI.
+#[cfg(target_arch = "x86_64")]
+const X86_POWEROFF_ARG: &str = "krun.poweroff=i8042";
+
 fn build_boot_args(config: &VmConfig) -> Vec<String> {
     let mut args = vec![
         "console=hvc0".to_string(),
         "panic=1".to_string(),
         "page_reporting.page_reporting_order=2".to_string(),
     ];
+    #[cfg(target_arch = "x86_64")]
+    args.push(X86_POWEROFF_ARG.to_string());
     args.extend(config.kernel_cmdline().iter().cloned());
     args
 }
@@ -774,8 +782,12 @@ mod tests {
             .kernel_cmdline(vec!["root=/dev/vda".to_string()])
             .build();
 
+        let args = crate::virt::backend::krun::build_boot_args(&config);
         assert_eq!(
-            crate::virt::backend::krun::build_boot_args(&config),
+            args.iter()
+                .filter(|arg| arg.as_str() != "krun.poweroff=i8042")
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             [
                 "console=hvc0",
                 "panic=1",
@@ -783,6 +795,17 @@ mod tests {
                 "root=/dev/vda",
             ]
         );
+    }
+
+    #[test]
+    fn x86_64_declares_the_i8042_poweroff_transport_and_aarch64_does_not() {
+        let config = VmConfig::builder("poweroff").build();
+        let args = crate::virt::backend::krun::build_boot_args(&config);
+        let declared = args
+            .iter()
+            .filter(|arg| *arg == "krun.poweroff=i8042")
+            .count();
+        assert_eq!(declared, usize::from(cfg!(target_arch = "x86_64")));
     }
 
     #[test]

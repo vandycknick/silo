@@ -192,6 +192,21 @@ Makefiles may then transform it into a boot representation. For arm64, `Image`
 is the uncompressed direct-boot representation derived from `vmlinux`. For the
 current x86-64 direct-boot contract, the ELF itself is the packaged kernel.
 
+## Source Patches
+
+Workload kernels apply the ordered patches in `patches/<architecture>/` to the
+pristine source with `patch --fuzz=0 -p1`. The patch set is part of the kernel
+identity (`inputs.patchSet`), so changing, adding or removing a patch produces a
+new kernel reference.
+
+| Architecture | Patch | Purpose |
+| --- | --- | --- |
+| x86_64 | `0001-x86-krun-i8042-poweroff.patch` | Adds `arch/x86/kernel/krun_poweroff.c`. When the command line carries `krun.poweroff=i8042`, it registers a lowest-priority poweroff handler that writes `0xfe` to port `0x64`, which libkrun turns into a terminal VMM exit. Without the argument nothing is registered. The krun backend adds the argument on x86_64 only. |
+
+The x86_64 kernel has neither ACPI nor an i8042 driver, so without this patch a
+guest `poweroff` halts and the VM never exits. arm64 powers off through PSCI and
+carries no patch.
+
 ## Configuration Files
 
 ### `.miniconfig`

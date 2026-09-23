@@ -63,7 +63,8 @@ WORKLOAD_CONFIG_FRAGMENTS := \
 RPROBE_CONFIG_FRAGMENTS := \
 	$(REPO_ROOT)/guest/rprobe/kernel/common.config \
 	$(REPO_ROOT)/guest/rprobe/kernel/arm64.config
-WORKLOAD_PATCHES ?=
+# Ordered, architecture-specific workload patches (part of the kernel identity).
+WORKLOAD_PATCHES ?= $(sort $(wildcard $(RESOURCE_ROOT)/kernels/patches/$(KERNEL_ARCH)/*.patch))
 RPROBE_PATCHES ?=
 CONFIG_FRAGMENTS := $($(shell printf '%s' "$(KERNEL_PROFILE)" | tr '[:lower:]' '[:upper:]')_CONFIG_FRAGMENTS)
 PATCHES := $($(shell printf '%s' "$(KERNEL_PROFILE)" | tr '[:lower:]' '[:upper:]')_PATCHES)

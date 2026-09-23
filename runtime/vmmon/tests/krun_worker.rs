@@ -751,14 +751,11 @@ async fn native_guest_devices_shutdown_crash_and_new_generation() {
         NativeExit::Stop,
         NativeExit::WorkerSignal,
         NativeExit::GuestReboot,
+        // x86_64 needs the workload kernel built from this tree (i8042 patch)
+        // and the krun.poweroff=i8042 argument; aarch64 uses PSCI.
+        NativeExit::GuestPoweroff,
     ])
     .await;
-}
-
-#[tokio::test]
-#[ignore = "power-off acceptance gate; requires native assets, currently blocked with the available x86-64 kernel"]
-async fn native_guest_poweroff() {
-    native_guest_cases(&[NativeExit::GuestPoweroff]).await;
 }
 
 async fn native_guest_cases(scenarios: &[NativeExit]) {
