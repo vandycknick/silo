@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StartupStage {
     Spawned,
-    Request,
     Admission,
     Build,
     Started,

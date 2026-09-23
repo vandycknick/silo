@@ -73,7 +73,7 @@ def find_pid(binary, short_id):
 
 
 def worker_pid(process_rows: str, supervisor_pid: int) -> int | None:
-    """Select the vmmon worker belonging to this supervisor."""
+    """Select the silo-krun worker belonging to this supervisor."""
     candidates: list[int] = []
     for line in process_rows.splitlines():
         fields = line.split(maxsplit=2)
@@ -84,9 +84,8 @@ def worker_pid(process_rows: str, supervisor_pid: int) -> int | None:
         except ValueError:
             continue
         command = fields[2].split()
-        if (parent == supervisor_pid and len(command) >= 2
-                and command[0].rsplit("/", 1)[-1] == "vmmon"
-                and command[1] == "worker"):
+        if (parent == supervisor_pid and len(command) == 1
+                and command[0].rsplit("/", 1)[-1] == "silo-krun"):
             candidates.append(pid)
     if len(candidates) > 1:
         raise ValueError("supervisor has multiple private krun workers")

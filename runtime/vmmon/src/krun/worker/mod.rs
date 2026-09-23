@@ -3,63 +3,50 @@
 #[cfg(target_os = "macos")]
 mod admission;
 mod fds;
-pub(crate) mod protocol;
+pub(crate) mod wire;
 
 use std::io;
-use std::os::fd::{AsFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::krun::engine::{self, ConsoleFds, Resources};
-use crate::krun::worker::protocol::{Event, MAX_EVENT};
+use crate::krun::worker::wire::{Event, MAX_EVENT};
 use crate::virt::exit::StartupStage;
-use clap::Parser;
 
-#[derive(Parser)]
-#[command(
-    name = "worker",
-    about = "Run the supervised libkrun process",
-    disable_help_subcommand = true
-)]
-pub(crate) struct Args {
-    #[arg(long)]
-    request_fd: RawFd,
-    #[arg(long)]
-    events_fd: RawFd,
-    #[arg(long)]
-    watchdog_fd: RawFd,
-    #[arg(long)]
-    console_fd: RawFd,
-    #[arg(long)]
-    vsock_mux_fd: Option<RawFd>,
+/// argv[0] basename that selects the worker instead of the supervisor.
+pub(crate) const WORKER_NAME: &str = "silo-krun";
+
+/// Whether this process was started as the libkrun worker.
+pub(crate) fn invoked_as_worker() -> bool {
+    std::env::args_os()
+        .next()
+        .is_some_and(|argv0| std::path::Path::new(&argv0).file_name() == Some(WORKER_NAME.as_ref()))
 }
 
-pub(crate) fn run(args: Args) -> eyre::Result<()> {
+/// Worker entry point. It takes no arguments and no environment: everything it
+/// needs arrives on the fixed descriptors described in [`fds`].
+pub(crate) fn main() -> eyre::Result<()> {
+    #[cfg(target_os = "linux")]
+    nix::sys::prctl::set_name(c"silo-krun")?;
     let fds::Bootstrap {
-        request,
+        config,
         events,
         watchdog,
         console,
         mux,
-    } = fds::Bootstrap::adopt(
-        args.request_fd,
-        args.events_fd,
-        args.watchdog_fd,
-        args.console_fd,
-        args.vsock_mux_fd,
-    )?;
+    } = fds::Bootstrap::adopt_fixed()?;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let shutdown_signals = block_shutdown_signal()?;
-    // Must precede logging, request reads, payload loading and host admission.
+    // Must precede logging, config reads, payload loading and host admission.
     fds::start_watchdog(watchdog)?;
     fds::nonblocking(events.as_fd())?;
     let events = Arc::new(Mutex::new(EventWriter(events)));
-    let mut stage = StartupStage::Request;
+    let mut stage = StartupStage::Spawned;
     let result = (|| -> eyre::Result<()> {
-        emit(&events, &Event::StartupStage { stage })?;
-        let config = protocol::read_launch(&mut std::fs::File::from(request))?.into_config()?;
+        let config = wire::read_config(&mut std::fs::File::from(config))?;
         if config.vsock_mux != mux.is_some() {
-            return Err(protocol::invalid("mux role does not match launch request").into());
+            return Err(wire::invalid("mux descriptor does not match the worker config").into());
         }
         engine::init_log(
             None,
@@ -117,7 +104,7 @@ pub(crate) fn run(args: Args) -> eyre::Result<()> {
             &events,
             &Event::StartupFailed {
                 stage,
-                diagnostic: protocol::diagnostic(error),
+                diagnostic: wire::diagnostic(error),
             },
         );
     }
@@ -129,7 +116,7 @@ struct EventWriter(OwnedFd);
 impl EventWriter {
     fn send(&mut self, event: &Event) -> io::Result<()> {
         use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-        let bytes = protocol::encode(event, MAX_EVENT)?;
+        let bytes = wire::encode(event, MAX_EVENT)?;
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut pending = bytes.as_slice();
         while !pending.is_empty() {

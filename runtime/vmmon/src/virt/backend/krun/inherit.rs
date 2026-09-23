@@ -5,22 +5,52 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
+/// First descriptor number of the worker contract; roles follow in order.
+pub(crate) const FIRST_CHILD_FD: libc::c_int = 3;
+const MAX_CHILD_FDS: usize = 5;
+
+/// Map `descriptors` onto the child's fixed numbers 3, 4, ... in order and let
+/// nothing else survive exec.
+///
+/// ```text
+/// parent fds (any numbers)      child after exec
+///   descriptors[0] ──────────►  3
+///   descriptors[1] ──────────►  4
+///   ...                         ...
+///   everything else ─ CLOEXEC ► closed
+/// ```
 pub(crate) fn install(command: &mut Command, descriptors: &[&OwnedFd]) {
-    let descriptors = descriptors
-        .iter()
-        .map(|fd| fd.as_raw_fd())
-        .collect::<Vec<_>>();
-    // SAFETY: child setup uses only raw OS descriptor operations. OS errors are
-    // represented inline by from_raw_os_error, so this path does not allocate.
+    let count = descriptors.len();
+    let mut sources = [-1; MAX_CHILD_FDS];
+    for (slot, fd) in sources.iter_mut().zip(descriptors) {
+        *slot = fd.as_raw_fd();
+    }
+    // Raw libc, not nix: nix's descriptor wrappers need borrowed fds that cannot
+    // be constructed soundly from this pre-fork number array.
+    // SAFETY: child setup uses only raw OS descriptor operations on a fixed-size
+    // stack array. OS errors are represented inline by from_raw_os_error, so this
+    // path neither allocates nor takes locks.
     unsafe {
         command.pre_exec(move || {
+            if count > MAX_CHILD_FDS {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
             mark_child_fds_cloexec()?;
-            for &fd in &descriptors {
-                if fd >= 3 {
-                    let flags = libc::fcntl(fd, libc::F_GETFD);
-                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                        return Err(child_last_os_error());
-                    }
+            // Park every source above the target range first: a source may
+            // already occupy another role's target number.
+            let floor = FIRST_CHILD_FD + count as libc::c_int;
+            let mut parked = [-1; MAX_CHILD_FDS];
+            for index in 0..count {
+                let high = libc::fcntl(sources[index], libc::F_DUPFD_CLOEXEC, floor);
+                if high < 0 {
+                    return Err(child_last_os_error());
+                }
+                parked[index] = high;
+            }
+            // dup2 clears FD_CLOEXEC on the target; the parked copies close at exec.
+            for (index, high) in parked.iter().copied().enumerate().take(count) {
+                if libc::dup2(high, FIRST_CHILD_FD + index as libc::c_int) < 0 {
+                    return Err(child_last_os_error());
                 }
             }
             Ok(())

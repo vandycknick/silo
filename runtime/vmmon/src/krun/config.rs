@@ -6,7 +6,10 @@ use crate::krun::rosetta::{RosettaLaunchConfig, ROSETTA_MOUNT_TAG};
 pub const DEFAULT_ID: &str = "anonymous-instance";
 const STANDALONE_VSOCK_CID: u64 = 3;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The one typed worker config. Serialized to the worker's config descriptor;
+/// the Rosetta field keeps its own redacted `Debug`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KrunConfig {
     pub id: String,
     pub cpus: u8,

@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -14,7 +14,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::krun::worker::protocol::{self, Event, Launch, MAX_EVENT, MAX_REQUEST};
+use crate::krun::worker::wire::{self, Event, MAX_EVENT};
+use crate::krun::worker::WORKER_NAME;
 use crate::virt::backend::krun::{host_memory_reclaim_report, inherit};
 use crate::virt::backend::HostMemoryReclaimReport;
 use crate::virt::exit::{Diagnostic, ForceReason, ProcessExit, StartupStage, VmExit, VmOutcome};
@@ -55,7 +56,7 @@ pub(crate) struct Owner {
 
 struct Spawned {
     child: Child,
-    request: Sender,
+    config: Sender,
     events: Receiver,
     diagnostics: Receiver,
     _keepalive: OwnedFd,
@@ -66,42 +67,35 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok((inherit::normalize(read)?, inherit::normalize(write)?))
 }
 
+/// Spawn `silo-krun` with the fixed descriptor table of the worker contract:
+/// 3 config, 4 events, 5 watchdog, 6 console, 7 vsock mux.
 fn spawn(console: OwnedFd, mux: OwnedFd) -> io::Result<Spawned> {
     let console = inherit::normalize(console)?;
     let mux = inherit::normalize(mux)?;
-    let (request, send) = pipe()?;
+    let (config, send) = pipe()?;
     let (receive, events) = pipe()?;
     let (diagnostics, output) = pipe()?;
     let (watchdog, keepalive) = pipe()?;
     // Every fallible channel registration precedes spawn. Once spawn succeeds,
     // returning this bundle cannot lose a child through an error path.
-    let request_sender = Sender::from_owned_fd(send)?;
+    let config_sender = Sender::from_owned_fd(send)?;
     let event_receiver = Receiver::from_owned_fd(receive)?;
     let diagnostic_receiver = Receiver::from_owned_fd(diagnostics)?;
     let mut command = Command::new(std::env::current_exe()?);
-    command.arg("worker");
-    for (name, fd) in [
-        ("--request-fd", &request),
-        ("--events-fd", &events),
-        ("--watchdog-fd", &watchdog),
-        ("--console-fd", &console),
-        ("--vsock-mux-fd", &mux),
-    ] {
-        command.arg(name).arg(fd.as_raw_fd().to_string());
-    }
     command
+        .arg0(WORKER_NAME)
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::from(output));
     command.kill_on_drop(true);
     inherit::install(
         command.as_std_mut(),
-        &[&request, &events, &watchdog, &console, &mux],
+        &[&config, &events, &watchdog, &console, &mux],
     );
     let child = command.spawn()?;
     Ok(Spawned {
         child,
-        request: request_sender,
+        config: config_sender,
         events: event_receiver,
         diagnostics: diagnostic_receiver,
         _keepalive: keepalive,
@@ -158,9 +152,9 @@ async fn collect_diagnostics(mut diagnostics: Receiver, pid: u32, tail: Arc<Mute
 async fn read_event(events: &mut Receiver) -> io::Result<Event> {
     let mut header = [0; 4];
     events.read_exact(&mut header).await?;
-    let mut payload = vec![0; protocol::frame_length(header, MAX_EVENT)?];
+    let mut payload = vec![0; wire::frame_length(header, MAX_EVENT)?];
     events.read_exact(&mut payload).await?;
-    protocol::decode(&payload)
+    wire::decode(&payload)
 }
 
 fn force(
@@ -186,15 +180,13 @@ impl Owner {
         if self.stop.is_cancelled() || self.force.is_cancelled() {
             return VmExit::stopped(StartupStage::Spawned);
         }
-        let frame = match Launch::from_config(config)
-            .and_then(|launch| protocol::encode(&launch, MAX_REQUEST))
-        {
+        let frame = match wire::encode_config(&config) {
             Ok(frame) => frame,
             Err(error) => return VmExit::failed(StartupStage::Spawned, error.to_string()),
         };
         let Spawned {
             mut child,
-            mut request,
+            config: mut config_pipe,
             mut events,
             diagnostics,
             _keepalive,
@@ -208,7 +200,9 @@ impl Owner {
         tracing::info!(worker_pid = pid, "krun worker spawned");
         let tail = Arc::new(Mutex::new(Tail::default()));
         let mut diagnostic_task = tokio::spawn(collect_diagnostics(diagnostics, pid, tail.clone()));
-        let mut transmission = tokio::spawn(async move { request.write_all(&frame).await });
+        // The worker reads the config descriptor to EOF: dropping the sender
+        // after the write is the end-of-config marker.
+        let mut transmission = tokio::spawn(async move { config_pipe.write_all(&frame).await });
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let event_task = tokio::spawn(async move {
             loop {
@@ -299,7 +293,7 @@ impl Owner {
                 result = &mut transmission, if !transmitted => {
                     transmitted = true;
                     if !matches!(result, Ok(Ok(()))) {
-                        failure.get_or_insert_with(|| "worker launch transmission failed".to_string());
+                        failure.get_or_insert_with(|| "worker config transmission failed".to_string());
                         stopping = true;
                         let _ = force(&mut child, ForceReason::StartupFailure, &mut forced);
                         stop_deadline = tokio::time::Instant::now() + FORCE_OBSERVATION;
@@ -411,8 +405,7 @@ fn worker_outcome(
 fn valid_stage(current: StartupStage, next: StartupStage) -> bool {
     matches!(
         (current, next),
-        (StartupStage::Spawned, StartupStage::Request)
-            | (StartupStage::Request, StartupStage::Admission)
+        (StartupStage::Spawned, StartupStage::Admission)
             | (StartupStage::Admission, StartupStage::Build)
     )
 }
@@ -510,9 +503,9 @@ mod tests {
 
     #[test]
     fn startup_stages_cannot_repeat_skip_or_regress() {
-        assert!(valid_stage(StartupStage::Request, StartupStage::Admission));
+        assert!(valid_stage(StartupStage::Spawned, StartupStage::Admission));
         assert!(!valid_stage(StartupStage::Spawned, StartupStage::Build));
         assert!(!valid_stage(StartupStage::Build, StartupStage::Build));
-        assert!(!valid_stage(StartupStage::Started, StartupStage::Request));
+        assert!(!valid_stage(StartupStage::Started, StartupStage::Admission));
     }
 }

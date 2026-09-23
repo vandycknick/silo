@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 const VERSION: u64 = 1;
-const MAX_ENCODED_LEN: usize = 16_384;
 const MAX_HOST_ROOT_LEN: usize = 4_096;
 const DIGEST_LEN: usize = 32;
 const RESPONSE_LEN: usize = 1_024;
 pub(crate) const ROSETTA_MOUNT_TAG: &str = "rosetta";
 
+/// Wire shape of [`RosettaLaunchConfig`] inside the worker's `KrunConfig`.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RosettaWire {
@@ -44,7 +44,8 @@ impl fmt::Debug for CapturedResponse {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(try_from = "RosettaWire", into = "RosettaWire")]
 pub struct RosettaLaunchConfig {
     profile: RosettaProfileId,
     host_root: PathBuf,
@@ -62,7 +63,7 @@ impl RosettaLaunchConfig {
     ) -> Result<Self, RosettaConfigError> {
         validate_host_root(&host_root)?;
         if ioctl_result < 0 {
-            return Err(RosettaConfigError::InvalidIoctlResult);
+            return Err(RosettaConfigError::IoctlResult);
         }
 
         Ok(Self {
@@ -93,53 +94,32 @@ impl RosettaLaunchConfig {
     pub fn data(&self) -> &CapturedResponse {
         &self.data
     }
+}
 
-    pub fn encode(&self) -> Result<String, RosettaConfigError> {
-        let host_root = self
-            .host_root
-            .to_str()
-            .ok_or(RosettaConfigError::InvalidHostRoot)?;
-        let wire = RosettaWire {
+impl From<RosettaLaunchConfig> for RosettaWire {
+    fn from(config: RosettaLaunchConfig) -> Self {
+        Self {
             version: VERSION,
-            host_root: host_root.to_owned(),
-            translator_sha256: encode_hex(&self.translator_sha256),
-            ioctl_result: self.ioctl_result,
-            data_hex: encode_hex(self.data.as_bytes()),
-        };
-        let encoded = serde_json::to_string(&wire).map_err(|_| RosettaConfigError::Json)?;
-        if encoded.len() > MAX_ENCODED_LEN {
-            return Err(RosettaConfigError::EncodedTooLarge);
+            // Construction rejects non-UTF-8 roots, so nothing is replaced here.
+            host_root: config.host_root.to_string_lossy().into_owned(),
+            translator_sha256: encode_hex(&config.translator_sha256),
+            ioctl_result: config.ioctl_result,
+            data_hex: encode_hex(config.data.as_bytes()),
         }
-        Ok(encoded)
     }
+}
 
-    pub fn decode(encoded: &[u8]) -> Result<Self, RosettaConfigError> {
-        if encoded.is_empty() {
-            return Err(RosettaConfigError::Empty);
-        }
-        if encoded.len() > MAX_ENCODED_LEN {
-            return Err(RosettaConfigError::EncodedTooLarge);
-        }
-        let encoded_text =
-            std::str::from_utf8(encoded).map_err(|_| RosettaConfigError::InvalidUtf8)?;
-        if encoded_text
-            .bytes()
-            .find(|byte| !matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
-            != Some(b'{')
-        {
-            return Err(RosettaConfigError::Json);
-        }
+impl TryFrom<RosettaWire> for RosettaLaunchConfig {
+    type Error = RosettaConfigError;
 
-        let wire: RosettaWire =
-            serde_json::from_slice(encoded).map_err(|_| RosettaConfigError::Json)?;
+    fn try_from(wire: RosettaWire) -> Result<Self, Self::Error> {
         if wire.version != VERSION {
-            return Err(RosettaConfigError::InvalidVersion);
+            return Err(RosettaConfigError::Version);
         }
-
         let digest = decode_hex::<DIGEST_LEN>(&wire.translator_sha256)
-            .map_err(|_| RosettaConfigError::InvalidDigest)?;
-        let data = decode_hex::<RESPONSE_LEN>(&wire.data_hex)
-            .map_err(|_| RosettaConfigError::InvalidResponse)?;
+            .map_err(|_| RosettaConfigError::Digest)?;
+        let data =
+            decode_hex::<RESPONSE_LEN>(&wire.data_hex).map_err(|_| RosettaConfigError::Response)?;
         Self::new(
             PathBuf::from(wire.host_root),
             digest,
@@ -164,36 +144,26 @@ impl fmt::Debug for RosettaLaunchConfig {
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum RosettaConfigError {
-    #[error("Rosetta configuration is empty")]
-    Empty,
-    #[error("Rosetta configuration exceeds the encoded size limit")]
-    EncodedTooLarge,
-    #[error("Rosetta configuration is not UTF-8")]
-    InvalidUtf8,
-    #[error("Rosetta configuration is not valid JSON")]
-    Json,
     #[error("Rosetta configuration has an unsupported version")]
-    InvalidVersion,
+    Version,
     #[error("Rosetta configuration has an invalid host root")]
-    InvalidHostRoot,
+    HostRoot,
     #[error("Rosetta configuration has an invalid translator digest")]
-    InvalidDigest,
+    Digest,
     #[error("Rosetta configuration has an invalid ioctl result")]
-    InvalidIoctlResult,
+    IoctlResult,
     #[error("Rosetta configuration has an invalid captured response")]
-    InvalidResponse,
+    Response,
 }
 
 fn validate_host_root(host_root: &Path) -> Result<(), RosettaConfigError> {
-    let host_root = host_root
-        .to_str()
-        .ok_or(RosettaConfigError::InvalidHostRoot)?;
+    let host_root = host_root.to_str().ok_or(RosettaConfigError::HostRoot)?;
     if host_root.is_empty()
         || host_root.len() > MAX_HOST_ROOT_LEN
         || host_root.as_bytes().contains(&0)
         || !Path::new(host_root).is_absolute()
     {
-        return Err(RosettaConfigError::InvalidHostRoot);
+        return Err(RosettaConfigError::HostRoot);
     }
     Ok(())
 }
@@ -234,8 +204,8 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::krun::rosetta::{
-        RosettaConfigError, RosettaLaunchConfig, RosettaProfileId, DIGEST_LEN, MAX_ENCODED_LEN,
-        MAX_HOST_ROOT_LEN, RESPONSE_LEN,
+        RosettaConfigError, RosettaLaunchConfig, RosettaProfileId, DIGEST_LEN, MAX_HOST_ROOT_LEN,
+        RESPONSE_LEN,
     };
 
     fn data_with_every_byte() -> [u8; RESPONSE_LEN] {
@@ -253,23 +223,23 @@ mod tests {
     }
 
     fn encoded_value() -> serde_json::Value {
-        serde_json::from_str(&config(1).encode().expect("encode config")).expect("decode JSON")
+        serde_json::to_value(config(1)).expect("encode config")
     }
 
-    fn decode_value(value: &serde_json::Value) -> Result<RosettaLaunchConfig, RosettaConfigError> {
-        RosettaLaunchConfig::decode(
-            serde_json::to_string(value)
-                .expect("encode test JSON")
-                .as_bytes(),
-        )
+    fn decode_value(value: &serde_json::Value) -> Result<RosettaLaunchConfig, String> {
+        serde_json::from_value(value.clone()).map_err(|error| error.to_string())
+    }
+
+    fn rejected_with(value: &serde_json::Value, expected: RosettaConfigError) {
+        let error = decode_value(value).expect_err("invalid Rosetta config");
+        assert!(error.contains(&expected.to_string()), "{error}");
     }
 
     #[test]
     fn round_trips_all_bytes_and_statuses() {
         for status in [0, 1, i32::MAX] {
             let original = config(status);
-            let encoded = original.encode().expect("encode config");
-            let value: serde_json::Value = serde_json::from_str(&encoded).expect("encoded JSON");
+            let value = serde_json::to_value(&original).expect("encode config");
             for (field, expected_len) in [
                 ("translator_sha256", DIGEST_LEN * 2),
                 ("data_hex", RESPONSE_LEN * 2),
@@ -279,7 +249,7 @@ mod tests {
                 assert!(hex.bytes().all(|byte| !byte.is_ascii_uppercase()));
             }
 
-            let decoded = RosettaLaunchConfig::decode(encoded.as_bytes()).expect("decode config");
+            let decoded = decode_value(&value).expect("decode config");
             assert_eq!(decoded, original);
             assert_eq!(decoded.profile(), RosettaProfileId::CapturedCompatibilityV1);
             assert_eq!(decoded.ioctl_result(), status);
@@ -310,7 +280,7 @@ mod tests {
         ] {
             let mut value = encoded_value();
             value["translator_sha256"] = serde_json::Value::String(invalid);
-            assert_eq!(decode_value(&value), Err(RosettaConfigError::InvalidDigest));
+            rejected_with(&value, RosettaConfigError::Digest);
         }
     }
 
@@ -327,31 +297,12 @@ mod tests {
         ] {
             let mut value = encoded_value();
             value["data_hex"] = serde_json::Value::String(invalid);
-            assert_eq!(
-                decode_value(&value),
-                Err(RosettaConfigError::InvalidResponse)
-            );
+            rejected_with(&value, RosettaConfigError::Response);
         }
     }
 
     #[test]
     fn validates_strict_schema_and_types() {
-        for missing in [
-            "version",
-            "host_root",
-            "translator_sha256",
-            "ioctl_result",
-            "data_hex",
-        ] {
-            let mut value = encoded_value();
-            value.as_object_mut().expect("object").remove(missing);
-            assert_eq!(decode_value(&value), Err(RosettaConfigError::Json));
-        }
-
-        let mut unknown = encoded_value();
-        unknown["extra"] = serde_json::Value::Bool(true);
-        assert_eq!(decode_value(&unknown), Err(RosettaConfigError::Json));
-
         for field in [
             "version",
             "host_root",
@@ -359,70 +310,24 @@ mod tests {
             "ioctl_result",
             "data_hex",
         ] {
+            let mut value = encoded_value();
+            value.as_object_mut().expect("object").remove(field);
+            assert!(decode_value(&value).is_err());
             for invalid in [serde_json::Value::Null, serde_json::Value::Bool(true)] {
                 let mut value = encoded_value();
                 value[field] = invalid;
                 assert!(decode_value(&value).is_err());
             }
         }
-    }
 
-    #[test]
-    fn rejects_duplicate_fields_and_trailing_values() {
-        let encoded = config(1).encode().expect("encode config");
-        let duplicate = encoded.replacen('{', "{\"version\":1,", 1);
-        assert_eq!(
-            RosettaLaunchConfig::decode(duplicate.as_bytes()),
-            Err(RosettaConfigError::Json)
-        );
-        let escaped_duplicate = encoded.replacen('{', "{\"vers\\u0069on\":1,", 1);
-        assert_eq!(
-            RosettaLaunchConfig::decode(escaped_duplicate.as_bytes()),
-            Err(RosettaConfigError::Json)
-        );
+        let mut unknown = encoded_value();
+        unknown["extra"] = serde_json::Value::Bool(true);
+        assert!(decode_value(&unknown).is_err());
 
-        for suffix in ["{}", "null", "garbage"] {
-            let trailing = format!("{encoded}{suffix}");
-            assert_eq!(
-                RosettaLaunchConfig::decode(trailing.as_bytes()),
-                Err(RosettaConfigError::Json)
-            );
-        }
-        let whitespace = format!("{encoded} \n\r\t");
-        assert_eq!(
-            RosettaLaunchConfig::decode(whitespace.as_bytes()).expect("trailing whitespace"),
-            config(1)
-        );
-    }
-
-    #[test]
-    fn requires_a_top_level_object() {
-        let value = encoded_value();
-        let ordered_array = serde_json::json!([
-            value["version"],
-            value["host_root"],
-            value["translator_sha256"],
-            value["ioctl_result"],
-            value["data_hex"],
-        ]);
-        for encoded in [
-            serde_json::to_string(&ordered_array).expect("encode ordered array"),
-            "1".to_string(),
-            "null".to_string(),
-        ] {
-            assert_eq!(
-                RosettaLaunchConfig::decode(encoded.as_bytes()),
-                Err(RosettaConfigError::Json)
-            );
-        }
-
-        let object = config(1).encode().expect("encode config");
-        let leading_whitespace = format!(" \n\r\t{object}");
-        assert_eq!(
-            RosettaLaunchConfig::decode(leading_whitespace.as_bytes())
-                .expect("leading JSON whitespace"),
-            config(1)
-        );
+        let duplicate = serde_json::to_string(&config(1))
+            .expect("encode config")
+            .replacen('{', "{\"version\":1,", 1);
+        assert!(serde_json::from_str::<RosettaLaunchConfig>(&duplicate).is_err());
     }
 
     #[test]
@@ -430,24 +335,15 @@ mod tests {
         for version in [serde_json::json!(0), serde_json::json!(2)] {
             let mut value = encoded_value();
             value["version"] = version;
-            assert_eq!(
-                decode_value(&value),
-                Err(RosettaConfigError::InvalidVersion)
-            );
+            rejected_with(&value, RosettaConfigError::Version);
         }
         let mut noninteger_version = encoded_value();
         noninteger_version["version"] = serde_json::json!(1.0);
-        assert_eq!(
-            decode_value(&noninteger_version),
-            Err(RosettaConfigError::Json)
-        );
+        assert!(decode_value(&noninteger_version).is_err());
 
         let mut negative_result = encoded_value();
         negative_result["ioctl_result"] = serde_json::json!(-1);
-        assert_eq!(
-            decode_value(&negative_result),
-            Err(RosettaConfigError::InvalidIoctlResult)
-        );
+        rejected_with(&negative_result, RosettaConfigError::IoctlResult);
 
         for result in [
             serde_json::json!(2_147_483_648_u64),
@@ -457,12 +353,12 @@ mod tests {
         ] {
             let mut value = encoded_value();
             value["ioctl_result"] = result;
-            assert_eq!(decode_value(&value), Err(RosettaConfigError::Json));
+            assert!(decode_value(&value).is_err());
         }
 
         assert_eq!(
             RosettaLaunchConfig::new(PathBuf::from("/root"), [0; 32], -1, [0; 1024]),
-            Err(RosettaConfigError::InvalidIoctlResult)
+            Err(RosettaConfigError::IoctlResult)
         );
     }
 
@@ -475,9 +371,12 @@ mod tests {
             format!("/{}", "a".repeat(MAX_HOST_ROOT_LEN)),
         ] {
             assert_eq!(
-                RosettaLaunchConfig::new(PathBuf::from(invalid), [0; 32], 0, [0; 1024]),
-                Err(RosettaConfigError::InvalidHostRoot)
+                RosettaLaunchConfig::new(PathBuf::from(&invalid), [0; 32], 0, [0; 1024]),
+                Err(RosettaConfigError::HostRoot)
             );
+            let mut value = encoded_value();
+            value["host_root"] = serde_json::Value::String(invalid);
+            rejected_with(&value, RosettaConfigError::HostRoot);
         }
 
         let maximum = format!("/{}", "a".repeat(MAX_HOST_ROOT_LEN - 1));
@@ -487,11 +386,11 @@ mod tests {
         let path = "/quote\"/slash\\/café";
         let value = RosettaLaunchConfig::new(PathBuf::from(path), [0; 32], 0, [0; 1024])
             .expect("escaped path");
-        let encoded = value.encode().expect("encode escaped path");
+        let encoded = serde_json::to_string(&value).expect("encode escaped path");
         assert!(encoded.contains("quote\\\""));
         assert!(encoded.contains("slash\\\\"));
         assert_eq!(
-            RosettaLaunchConfig::decode(encoded.as_bytes())
+            serde_json::from_str::<RosettaLaunchConfig>(&encoded)
                 .expect("decode escaped path")
                 .host_root(),
             PathBuf::from(path)
@@ -507,69 +406,17 @@ mod tests {
         let path = PathBuf::from(OsString::from_vec(vec![b'/', 0xff]));
         assert_eq!(
             RosettaLaunchConfig::new(path, [0; 32], 0, [0; 1024]),
-            Err(RosettaConfigError::InvalidHostRoot)
+            Err(RosettaConfigError::HostRoot)
         );
     }
 
     #[test]
-    fn enforces_encoded_limit_before_parsing() {
-        let encoded = config(1).encode().expect("encode config");
-        let exact = format!("{encoded}{}", " ".repeat(MAX_ENCODED_LEN - encoded.len()));
-        assert_eq!(exact.len(), MAX_ENCODED_LEN);
-        assert_eq!(
-            RosettaLaunchConfig::decode(exact.as_bytes()).expect("exact encoded limit"),
-            config(1)
-        );
-
-        let oversized = format!("{exact} ");
-        assert_eq!(
-            RosettaLaunchConfig::decode(oversized.as_bytes()),
-            Err(RosettaConfigError::EncodedTooLarge)
-        );
-
-        let malformed = vec![b'x'; MAX_ENCODED_LEN + 1];
-        assert_eq!(
-            RosettaLaunchConfig::decode(&malformed),
-            Err(RosettaConfigError::EncodedTooLarge)
-        );
-    }
-
-    #[test]
-    fn rejects_writer_output_expanded_past_limit() {
-        let path = format!("/{}", "\u{1}".repeat(MAX_HOST_ROOT_LEN - 1));
-        let value = RosettaLaunchConfig::new(PathBuf::from(path), [0; 32], 0, [0; 1024])
-            .expect("decoded path is within limit");
-        assert_eq!(value.encode(), Err(RosettaConfigError::EncodedTooLarge));
-    }
-
-    #[test]
-    fn rejects_empty_invalid_utf8_and_malformed_json_without_leaking_input() {
-        assert_eq!(
-            RosettaLaunchConfig::decode(b""),
-            Err(RosettaConfigError::Empty)
-        );
-        assert_eq!(
-            RosettaLaunchConfig::decode(&[0xff]),
-            Err(RosettaConfigError::InvalidUtf8)
-        );
-        let encoded = config(1).encode().expect("encode config");
-        let invalid_unicode = encoded.replacen("\"/Library/Apple/RosettaLinux\"", "\"\\uD800\"", 1);
-        assert_eq!(
-            RosettaLaunchConfig::decode(invalid_unicode.as_bytes()),
-            Err(RosettaConfigError::Json)
-        );
-        let malformed_nested = br#"{"version":{"nested":[{"still":"open"}]}"#;
-        assert!(malformed_nested.len() < MAX_ENCODED_LEN);
-        assert_eq!(
-            RosettaLaunchConfig::decode(malformed_nested),
-            Err(RosettaConfigError::Json)
-        );
-
+    fn decode_errors_do_not_leak_input() {
         let marker = "PAYLOAD_MUST_NOT_LEAK";
-        let error = RosettaLaunchConfig::decode(format!("{{\"{marker}\":").as_bytes())
-            .expect_err("malformed JSON");
-        assert!(!error.to_string().contains(marker));
-        assert!(!format!("{error:?}").contains(marker));
+        let mut value = encoded_value();
+        value["translator_sha256"] = serde_json::Value::String(marker.to_string());
+        let error = decode_value(&value).expect_err("invalid digest");
+        assert!(!error.contains(marker));
     }
 
     #[test]

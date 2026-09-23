@@ -1,13 +1,34 @@
+//! The worker's fixed descriptor table:
+//!
+//! | fd | role                                              |
+//! |----|---------------------------------------------------|
+//! | 0  | /dev/null                                         |
+//! | 1  | diagnostics pipe (write end)                      |
+//! | 2  | diagnostics pipe (write end)                      |
+//! | 3  | config: FIFO read end, one `KrunConfig`, read to EOF |
+//! | 4  | events: FIFO write end, length-prefixed events    |
+//! | 5  | watchdog: FIFO read end, POLLHUP = supervisor gone |
+//! | 6  | console: PTY slave                                |
+//! | 7  | vsock mux: connected stream socket, iff configured |
+//!
+//! Nothing above the last role may be open.
+
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 use nix::sys::stat::{fstat, SFlag};
 
-use crate::krun::worker::protocol::invalid;
+use crate::krun::worker::wire::invalid;
+
+pub(crate) const CONFIG_FD: RawFd = 3;
+pub(crate) const EVENTS_FD: RawFd = 4;
+pub(crate) const WATCHDOG_FD: RawFd = 5;
+pub(crate) const CONSOLE_FD: RawFd = 6;
+pub(crate) const MUX_FD: RawFd = 7;
 
 pub(crate) struct Bootstrap {
-    pub(crate) request: OwnedFd,
+    pub(crate) config: OwnedFd,
     pub(crate) events: OwnedFd,
     pub(crate) watchdog: OwnedFd,
     pub(crate) console: OwnedFd,
@@ -16,7 +37,7 @@ pub(crate) struct Bootstrap {
 
 #[derive(Clone, Copy)]
 enum Role {
-    Request,
+    Config,
     Events,
     Watchdog,
     Console,
@@ -24,16 +45,26 @@ enum Role {
 }
 
 impl Bootstrap {
+    /// Adopt the fixed descriptor table. The mux is optional; whether it must be
+    /// present is decided by the config, which is read afterwards.
+    pub(crate) fn adopt_fixed() -> io::Result<Self> {
+        // nix's fcntl API requires an already-valid AsFd; probe the number first.
+        let mux = (unsafe { nix::libc::fcntl(MUX_FD, nix::libc::F_GETFD) } >= 0).then_some(MUX_FD);
+        let highest = mux.unwrap_or(CONSOLE_FD);
+        ensure_nothing_open_above(highest)?;
+        Self::adopt(CONFIG_FD, EVENTS_FD, WATCHDOG_FD, CONSOLE_FD, mux)
+    }
+
     /// Adopt descriptors only after validating all roles, access and aliases.
-    pub(crate) fn adopt(
-        request: RawFd,
+    fn adopt(
+        config: RawFd,
         events: RawFd,
         watchdog: RawFd,
         console: RawFd,
         mux: Option<RawFd>,
     ) -> io::Result<Self> {
         let roles = [
-            (request, Role::Request),
+            (config, Role::Config),
             (events, Role::Events),
             (watchdog, Role::Watchdog),
             (console, Role::Console),
@@ -71,7 +102,7 @@ impl Bootstrap {
             let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
             let access = flags & OFlag::O_ACCMODE;
             match role {
-                Role::Request | Role::Watchdog
+                Role::Config | Role::Watchdog
                     if kind == SFlag::S_IFIFO && access == OFlag::O_RDONLY => {}
                 Role::Events if kind == SFlag::S_IFIFO && access == OFlag::O_WRONLY => {}
                 Role::Console if nix::unistd::isatty(fd)? && access == OFlag::O_RDWR => {}
@@ -94,10 +125,10 @@ impl Bootstrap {
             let flags = FdFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFD)?);
             fcntl(fd, FcntlArg::F_SETFD(flags | FdFlag::FD_CLOEXEC))?;
         }
-        // SAFETY: the private argv contract transfers each validated, unique FD once.
+        // SAFETY: the fixed descriptor contract transfers each validated, unique FD once.
         Ok(unsafe {
             Self {
-                request: OwnedFd::from_raw_fd(request),
+                config: OwnedFd::from_raw_fd(config),
                 events: OwnedFd::from_raw_fd(events),
                 watchdog: OwnedFd::from_raw_fd(watchdog),
                 console: OwnedFd::from_raw_fd(console),
@@ -105,6 +136,33 @@ impl Bootstrap {
             }
         })
     }
+}
+
+/// Fail closed if the worker inherited anything beyond its contract.
+fn ensure_nothing_open_above(highest: RawFd) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    const FD_DIR: &str = "/proc/self/fd";
+    #[cfg(target_os = "macos")]
+    const FD_DIR: &str = "/dev/fd";
+    let mut directory = nix::dir::Dir::open(
+        FD_DIR,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )?;
+    let own = std::os::fd::AsRawFd::as_raw_fd(&directory);
+    for entry in directory.iter() {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        let Ok(fd) = name.parse::<RawFd>() else {
+            continue;
+        };
+        if fd > highest && fd != own {
+            return Err(invalid("worker inherited an unexpected descriptor"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

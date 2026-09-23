@@ -3,10 +3,11 @@
 #[path = "../../virt/backend/krun/inherit.rs"]
 mod inherit;
 
-use crate::krun::worker::protocol;
+use crate::krun::worker::wire;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -25,11 +26,8 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 
 impl Worker {
     pub(crate) fn start(vmmon: &Path, config: crate::krun::KrunConfig) -> io::Result<Self> {
-        let bytes = protocol::encode(
-            &protocol::Launch::from_config(config)?,
-            protocol::MAX_REQUEST,
-        )?;
-        let (request, send) = pipe()?;
+        let bytes = wire::encode_config(&config)?;
+        let (config, send) = pipe()?;
         let (receive, events) = pipe()?;
         let (watchdog, keepalive) = pipe()?;
         let pty = nix::pty::openpty(None, None)?;
@@ -40,20 +38,12 @@ impl Worker {
         let master = File::from(pty.master);
         let serial = (master.try_clone()?, master);
         let mut command = Command::new(vmmon);
-        command.arg("worker");
-        for (name, fd) in [
-            ("--request-fd", &request),
-            ("--events-fd", &events),
-            ("--watchdog-fd", &watchdog),
-            ("--console-fd", &console),
-        ] {
-            command.arg(name).arg(fd.as_raw_fd().to_string());
-        }
         command
+            .arg0(crate::krun::worker::WORKER_NAME)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        inherit::install(&mut command, &[&request, &events, &watchdog, &console]);
+        inherit::install(&mut command, &[&config, &events, &watchdog, &console]);
         let mut worker = Self {
             child: command.spawn()?,
             _keepalive: keepalive,
@@ -61,7 +51,7 @@ impl Worker {
             events: None,
         };
         drop(command);
-        drop(request);
+        drop(config);
         drop(events);
         worker.events = Some(
             std::thread::Builder::new()
@@ -73,12 +63,12 @@ impl Worker {
                         if receiver.read_exact(&mut header).is_err() {
                             return;
                         }
-                        let Ok(length) = protocol::frame_length(header, protocol::MAX_EVENT) else {
+                        let Ok(length) = wire::frame_length(header, wire::MAX_EVENT) else {
                             return;
                         };
                         let mut frame = vec![0; length];
                         if receiver.read_exact(&mut frame).is_err()
-                            || protocol::decode::<protocol::Event>(&frame).is_err()
+                            || wire::decode::<wire::Event>(&frame).is_err()
                         {
                             return;
                         }
