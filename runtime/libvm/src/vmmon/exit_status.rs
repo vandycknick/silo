@@ -21,24 +21,37 @@ pub(crate) struct VmmonExitStatus {
     pub(crate) exited_at: i64,
     pub(crate) outcome: VmmonExitOutcome,
     pub(crate) error: Option<String>,
-    pub(crate) worker: Option<VmmonWorkerExit>,
+    pub(crate) backend: Option<VmmonBackendExit>,
 }
 
-/// Optional worker telemetry, never a replacement for the supervisor identity.
+/// Backend detail of the terminal outcome. Stored for diagnosis, never
+/// interpreted by reconciliation and never a replacement for the monitor pid.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct VmmonWorkerExit {
+pub(crate) struct VmmonBackendExit {
+    pub(crate) kind: String,
+    pub(crate) stage: String,
+    pub(crate) force_reason: Option<String>,
+    pub(crate) process: Option<VmmonProcessExit>,
+    pub(crate) diagnostic: Option<VmmonDiagnostic>,
+}
+
+/// Wait status of the process that ran the VMM, when the backend owns one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct VmmonProcessExit {
     pub(crate) pid: u32,
     pub(crate) raw_status: i32,
     pub(crate) code: Option<i32>,
     pub(crate) signal: Option<i32>,
     pub(crate) core_dumped: bool,
-    pub(crate) stage: String,
-    pub(crate) shutdown_requested: bool,
-    pub(crate) force_reason: Option<String>,
-    pub(crate) failure: Option<String>,
-    pub(crate) diagnostic_tail: String,
-    pub(crate) diagnostic_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct VmmonDiagnostic {
+    pub(crate) tail: String,
+    pub(crate) truncated: bool,
 }
 
 /// High-level outcome reported in a vmmon exit status file.
@@ -139,23 +152,50 @@ mod tests {
     }
 
     #[test]
-    fn forced_worker_telemetry_is_additive_and_keeps_supervisor_identity() {
+    fn backend_detail_is_additive_and_keeps_supervisor_identity() {
         let status: crate::vmmon::exit_status::VmmonExitStatus =
             serde_json::from_value(serde_json::json!({
                 "machineId": "machine-1", "runId": "run-1", "pid": 42,
                 "exitedAt": 99, "outcome": "forced", "error": null,
-                "worker": { "pid": 43, "rawStatus": 9, "code": null, "signal": 9,
-                    "coreDumped": false, "stage": "started", "shutdownRequested": true,
-                    "forceReason": "stop", "failure": null, "diagnosticTail": "tail",
-                    "diagnosticTruncated": false, "futureField": true }
+                "backend": { "kind": "krun", "stage": "started", "forceReason": "stop",
+                    "process": { "pid": 43, "rawStatus": 9, "code": null, "signal": 9,
+                        "coreDumped": false },
+                    "diagnostic": { "tail": "tail", "truncated": false },
+                    "futureField": true }
             }))
-            .expect("read additive worker telemetry");
+            .expect("read additive backend detail");
         assert_eq!(status.pid, 42);
-        assert_eq!(status.worker.expect("worker").pid, 43);
+        let backend = status.backend.expect("backend");
+        assert_eq!(backend.kind, "krun");
+        assert_eq!(backend.force_reason.as_deref(), Some("stop"));
+        assert_eq!(backend.process.expect("process").pid, 43);
+        assert_eq!(backend.diagnostic.expect("diagnostic").tail, "tail");
         assert_eq!(
             status.outcome,
             crate::vmmon::exit_status::VmmonExitOutcome::Forced
         );
+    }
+
+    #[test]
+    fn backend_detail_is_optional_at_every_level() {
+        let status: crate::vmmon::exit_status::VmmonExitStatus =
+            serde_json::from_value(serde_json::json!({
+                "machineId": "machine-1", "runId": "run-1", "pid": 42,
+                "exitedAt": 99, "outcome": "clean", "error": null,
+                "backend": { "kind": "vz", "stage": "started", "forceReason": null }
+            }))
+            .expect("read backend without process");
+        let backend = status.backend.expect("backend");
+        assert!(backend.process.is_none());
+        assert!(backend.diagnostic.is_none());
+
+        let status: crate::vmmon::exit_status::VmmonExitStatus =
+            serde_json::from_value(serde_json::json!({
+                "machineId": "machine-1", "runId": "run-1", "pid": 42,
+                "exitedAt": 99, "outcome": "error", "error": "startup cancelled"
+            }))
+            .expect("read record without backend");
+        assert!(status.backend.is_none());
     }
 
     #[test]

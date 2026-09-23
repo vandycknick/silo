@@ -131,14 +131,6 @@ pub enum BackendKind {
     Mock,
 }
 
-/// Result of probing whether a backend can run on this host.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum Availability {
-    Available,
-    Unavailable { reason: String },
-}
-
 impl BackendKind {
     pub fn name(self) -> &'static str {
         match self {
@@ -159,21 +151,6 @@ impl BackendKind {
             #[cfg(feature = "mock-backend")]
             BackendKind::Mock,
         ]
-    }
-
-    /// Cheap host probe: can this backend plausibly start a machine here?
-    ///
-    /// Per-machine requirements (payload assets, Rosetta installation)
-    /// are still validated at machine construction; this only answers whether
-    /// the backend is present on this host at all.
-    pub fn probe(self) -> Availability {
-        if Self::compiled().contains(&self) {
-            Availability::Available
-        } else {
-            Availability::Unavailable {
-                reason: format!("backend {} is not compiled into this binary", self.name()),
-            }
-        }
     }
 
     /// Today's pinned selection policy: krun on Linux and macOS.
@@ -224,7 +201,7 @@ pub(crate) fn create_backend(
 
 #[cfg(test)]
 mod tests {
-    use crate::virt::backend::{Availability, BackendKind, StartAttempt};
+    use crate::virt::backend::{BackendKind, StartAttempt};
 
     #[test]
     fn attempts_are_terminal_even_before_a_vm_exists() {
@@ -262,12 +239,5 @@ mod tests {
         assert_eq!(kind, BackendKind::Krun);
         #[cfg(target_os = "macos")]
         assert_eq!(kind, BackendKind::Krun);
-    }
-
-    #[test]
-    fn compiled_backends_probe_available() {
-        for kind in BackendKind::compiled() {
-            assert!(matches!(kind.probe(), Availability::Available));
-        }
     }
 }

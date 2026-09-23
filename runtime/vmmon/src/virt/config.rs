@@ -92,14 +92,6 @@ pub enum NetworkMode {
         peer_path: PathBuf,
         mac: [u8; 6],
     },
-    UnixStream {
-        path: PathBuf,
-        mac: [u8; 6],
-    },
-    Tap {
-        name: String,
-        mac: [u8; 6],
-    },
 }
 
 /// Options consumed only by the krun (Linux) backend; other backends ignore them.
@@ -235,16 +227,19 @@ impl VmConfig {
         &self.vz
     }
 
+    #[cfg(feature = "mock-backend")]
     pub fn mock(&self) -> &MockOptions {
         &self.mock
     }
 
     /// Set the mock scenario path on an already-built config (used when the
     /// start request selects the mock backend after spec resolution).
+    #[cfg(feature = "mock-backend")]
     pub fn set_mock_scenario(&mut self, path: impl Into<PathBuf>) {
         self.mock.scenario = Some(path.into());
     }
 
+    #[cfg(test)]
     pub fn unix_datagram_network(&self) -> Option<(&PathBuf, [u8; 6])> {
         match &self.network {
             NetworkMode::UnixDatagram { peer_path, mac } => Some((peer_path, *mac)),
@@ -300,11 +295,6 @@ impl VmConfigBuilder {
         self
     }
 
-    pub fn network(mut self, network: NetworkMode) -> Self {
-        self.config.network = network;
-        self
-    }
-
     pub fn no_network(mut self) -> Self {
         self.config.network = NetworkMode::None;
         self
@@ -313,22 +303,6 @@ impl VmConfigBuilder {
     pub fn unix_datagram_network(mut self, peer_path: impl Into<PathBuf>, mac: [u8; 6]) -> Self {
         self.config.network = NetworkMode::UnixDatagram {
             peer_path: peer_path.into(),
-            mac,
-        };
-        self
-    }
-
-    pub fn unix_stream_network(mut self, path: impl Into<PathBuf>, mac: [u8; 6]) -> Self {
-        self.config.network = NetworkMode::UnixStream {
-            path: path.into(),
-            mac,
-        };
-        self
-    }
-
-    pub fn tap_network(mut self, name: impl Into<String>, mac: [u8; 6]) -> Self {
-        self.config.network = NetworkMode::Tap {
-            name: name.into(),
             mac,
         };
         self

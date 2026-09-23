@@ -10,8 +10,8 @@ use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::krun_worker::protocol::StartupStage;
 use crate::krun_worker::protocol::{Event, MAX_EVENT};
+use crate::virt::exit::StartupStage;
 use clap::Parser;
 use krun::engine::{self, ConsoleFds, Resources};
 
@@ -84,7 +84,6 @@ pub(crate) fn run(args: Args) -> eyre::Result<()> {
                     stderr: console.as_fd(),
                 },
                 vsock_mux: mux,
-                protected_streams: &[],
             },
             |control| {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

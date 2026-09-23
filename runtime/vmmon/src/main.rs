@@ -10,6 +10,7 @@ mod execution;
 mod exit_command;
 mod exit_status;
 mod ext;
+mod finalize;
 mod forward;
 mod guest;
 mod krun_worker;
@@ -23,15 +24,11 @@ mod shutdown;
 mod start_request;
 mod startup;
 mod state;
-mod vsock;
-// Library-style module: parts of its surface are only used on one platform,
-// behind the mock-backend feature, or from tests.
-#[allow(dead_code)]
 mod virt;
+mod vsock;
 
 use crate::context::RuntimeContext;
 use crate::exit_command::ExitCommand;
-use crate::exit_status::{ExitOutcome, ExitStatus};
 use crate::lock::pid::PidGuard;
 use crate::start_request::StartRequestPipe;
 use crate::startup::{InheritedPipeFds, SyncReporter};
@@ -219,7 +216,7 @@ async fn run(
         serial_file,
         primary_machine: &primary_machine,
     };
-    let mut result = match startup::init(
+    let result = match startup::init(
         &runtime,
         startup_inputs,
         &mut start_request,
@@ -253,39 +250,14 @@ async fn run(
                     }
                     shutdown::run(runtime, initialized.context, handles).await
                 }
-                Err(err) => {
-                    let forward_result = initialized.context.forwards.shutdown().await;
-                    let stop_result = initialized.context.machine.stop().await;
-                    match (forward_result, stop_result) {
-                    (Ok(()), Ok(())) => Err(err),
-                    (Err(forward), Ok(())) => {
-                        Err(eyre::eyre!("{err}; forward cleanup failed: {forward}"))
-                    }
-                    (Ok(()), Err(stop)) => {
-                        Err(eyre::eyre!("{err}; primary VM cleanup failed: {stop}"))
-                    }
-                    (Err(forward), Err(stop)) => Err(eyre::eyre!(
-                        "{err}; forward cleanup failed: {forward}; primary VM cleanup failed: {stop}"
-                    )),
-                }
-                }
+                Err(err) => match initialized.context.forwards.shutdown().await {
+                    Ok(()) => Err(err),
+                    Err(forward) => Err(eyre::eyre!("{err}; forward cleanup failed: {forward}")),
+                },
             }
         }
         Err(err) => Err(err),
     };
-    if result.is_err() {
-        if let Some(machine) = primary_machine.get() {
-            if let Err(error) = machine.stop().await {
-                result = Err(eyre::eyre!(
-                    "{}; primary VM finalization failed: {error}",
-                    result
-                        .err()
-                        .map(|error| format_error_chain(&error))
-                        .unwrap_or_default()
-                ));
-            }
-        }
-    }
     if let Some(task) = signal_task.take() {
         task.abort();
         let _ = task.await;
@@ -294,53 +266,19 @@ async fn run(
         monitor.shutdown().await;
     }
 
-    let last_error = result.as_ref().err().map(format_error_chain);
-    if let Some(exec_log) = &exec_log {
-        exec_log.generation(&args.id, &args.run_id, "stopped");
+    finalize::Finalization {
+        machine_id: &args.id,
+        run_id: &args.run_id,
+        data_dir: &args.data_dir,
+        exit_status: &args.exit_status,
+        primary_machine: &primary_machine,
+        exec_log: exec_log.as_ref(),
+        sync_reporter: &mut sync_reporter,
+        pid_guard,
+        exit_command: exit_command.as_ref(),
     }
-    if let Some(full_error) = &last_error {
-        tracing::error!(error = %full_error, data_dir = %args.data_dir.display(), "vmmon exiting with error");
-    }
-
-    let outcome = if last_error.is_some() {
-        ExitOutcome::Error
-    } else {
-        ExitOutcome::Clean
-    };
-    let vm_exit = match primary_machine.get() {
-        Some(machine) => match machine.try_wait().await {
-            Ok(exit) => exit,
-            Err(error) => {
-                tracing::warn!(%error, "could not inspect final backend status");
-                None
-            }
-        },
-        None => None,
-    };
-    match ExitStatus::new(
-        args.id.clone(),
-        args.run_id.clone(),
-        outcome,
-        last_error.clone(),
-    ) {
-        Ok(status) => {
-            let status = status.with_vm_exit(vm_exit);
-            if let Err(err) = exit_status::write(&args.exit_status, &status) {
-                tracing::warn!(error = %err, path = %args.exit_status.display(), "write runtime exit status");
-            }
-        }
-        Err(err) => tracing::warn!(error = %err, "build runtime exit status"),
-    }
-    if let Some(full_error) = &last_error {
-        let _ = sync_reporter.report_failed(full_error);
-    }
-
-    drop(pid_guard);
-    if let Some(exit_command) = &exit_command {
-        exit_command.spawn(&args.id, &args.run_id);
-    }
-
-    result
+    .run(result)
+    .await
 }
 
 fn spawn_startup_signal_handler(
@@ -378,14 +316,6 @@ fn spawn_startup_signal_handler(
             cancelled.cancel();
         }))
     }
-}
-
-fn format_error_chain(err: &eyre::Report) -> String {
-    let mut parts = Vec::new();
-    for cause in err.chain() {
-        parts.push(cause.to_string());
-    }
-    parts.join(": ")
 }
 
 #[cfg(target_os = "macos")]

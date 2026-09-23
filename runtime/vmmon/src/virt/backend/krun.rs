@@ -7,6 +7,7 @@ use crate::virt::backend::{HostMemoryReclaimReport, StartAttempt, VirtBackend};
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission, MAX_ACTIVE_VSOCK_CONNECTIONS};
 use crate::virt::config::{validate_common, DiskImage, NetworkMode, SharedDirectory, VmConfig};
 use crate::virt::error::VirtError;
+use crate::virt::exit::StartupStage;
 use crate::virt::stream::{
     KrunVsockSession, PendingUnixVsock, SerialDevice, VsockListener, VsockStream,
 };
@@ -35,8 +36,8 @@ const VSOCK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct KrunBackend {
     config: VmConfig,
     attempt: StartAttempt,
-    state: watch::Sender<owner::Snapshot>,
-    runtime: Arc<AsyncMutex<Option<RunningKrun>>>,
+    state: watch::Sender<owner::Phase>,
+    mux: Arc<AsyncMutex<Option<mux::KrunVsockMux>>>,
     vsock_registry: KrunVsockRegistry,
     session: Arc<KrunVsockSession>,
     host_memory_reclaim: watch::Sender<Option<HostMemoryReclaimReport>>,
@@ -44,10 +45,6 @@ pub(crate) struct KrunBackend {
     force: CancellationToken,
     console: Mutex<Option<OwnedFd>>,
     serial: Mutex<Option<(File, File)>>,
-}
-
-struct RunningKrun {
-    mux: mux::KrunVsockMux,
 }
 
 #[derive(Clone, Copy)]
@@ -224,8 +221,8 @@ impl KrunBackend {
         Ok(Self {
             config,
             attempt: StartAttempt::default(),
-            state: watch::Sender::new(owner::Snapshot::default()),
-            runtime: Arc::new(AsyncMutex::new(None)),
+            state: watch::Sender::new(owner::Phase::default()),
+            mux: Arc::new(AsyncMutex::new(None)),
             vsock_registry: KrunVsockRegistry::default(),
             session: KrunVsockSession::new(),
             host_memory_reclaim: watch::Sender::new(None),
@@ -239,7 +236,7 @@ impl KrunBackend {
     async fn completion(&self) -> Result<VmExit, VirtError> {
         let mut state = self.state.subscribe();
         loop {
-            if let Some(exit) = state.borrow().exit.clone() {
+            if let Some(exit) = state.borrow().exit().cloned() {
                 return Ok(exit);
             }
             state.changed().await.map_err(|_| {
@@ -271,7 +268,7 @@ impl VirtBackend for KrunBackend {
         }
         let guard = self.stop.clone().drop_guard();
         let config = self.config.clone();
-        let runtime = self.runtime.clone();
+        let running_mux = self.mux.clone();
         let registry = self.vsock_registry.clone();
         let session = self.session.clone();
         let console = self
@@ -295,7 +292,7 @@ impl VirtBackend for KrunBackend {
                 })?;
                 let (mux, task, child_mux) =
                     mux::KrunVsockMux::pair(registry.clone(), session.clone(), &[])?;
-                *runtime.lock().await = Some(RunningKrun { mux: mux.clone() });
+                *running_mux.lock().await = Some(mux.clone());
                 let exit = owner.run(launch, console, child_mux).await;
                 session.shutdown();
                 registry.fence_session(&session);
@@ -303,30 +300,30 @@ impl VirtBackend for KrunBackend {
                 if let Err(error) = task.join().await {
                     tracing::warn!(%error, "krun mux cleanup failed");
                 }
-                *runtime.lock().await = None;
+                *running_mux.lock().await = None;
                 Ok::<_, VirtError>(exit)
             }
             .await;
             session.shutdown();
             registry.fence_session(&session);
-            let exit = result.unwrap_or_else(|error| VmExit::StoppedWithError(error.to_string()));
-            owner.state.send_replace(owner::Snapshot {
-                started: false,
-                reaped: true,
-                exit: Some(exit),
-            });
+            let exit = result
+                .unwrap_or_else(|error| VmExit::failed(StartupStage::Spawned, error.to_string()));
+            owner.state.send_replace(owner::Phase::Exited(exit));
         });
         let mut state = self.state.subscribe();
         loop {
-            let snapshot = state.borrow().clone();
-            if let Some(exit) = snapshot.exit {
-                return Err(VirtError::Backend(exit.error().unwrap_or_else(|| {
-                    "worker stopped before startup handoff".to_string()
-                })));
-            }
-            if snapshot.started {
-                guard.disarm();
-                return Ok(());
+            let phase = state.borrow().clone();
+            match phase {
+                owner::Phase::Exited(exit) => {
+                    return Err(VirtError::Backend(exit.error().unwrap_or_else(|| {
+                        "worker stopped before startup handoff".to_string()
+                    })));
+                }
+                owner::Phase::Started => {
+                    guard.disarm();
+                    return Ok(());
+                }
+                owner::Phase::Starting | owner::Phase::Reaped => {}
             }
             state
                 .changed()
@@ -344,11 +341,8 @@ impl VirtBackend for KrunBackend {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
-            self.state.send_replace(owner::Snapshot {
-                started: false,
-                reaped: false,
-                exit: Some(VmExit::Stopped),
-            });
+            self.state
+                .send_replace(owner::Phase::Exited(VmExit::stopped(StartupStage::Spawned)));
         }
         self.completion().await.map(|_| ())
     }
@@ -362,21 +356,24 @@ impl VirtBackend for KrunBackend {
         self.completion().await
     }
     async fn try_wait(&self) -> Result<Option<VmExit>, VirtError> {
-        Ok(self.state.borrow().exit.clone())
+        Ok(self.state.borrow().exit().cloned())
     }
 
     async fn is_terminated(&self) -> Result<bool, VirtError> {
-        let state = self.state.borrow();
-        Ok(state.reaped || state.exit.is_some())
+        Ok(matches!(
+            *self.state.borrow(),
+            owner::Phase::Reaped | owner::Phase::Exited(_)
+        ))
     }
 
     async fn connect_vsock(&self, port: u32, lease: VsockLease) -> Result<VsockStream, VirtError> {
         let mux = {
-            let runtime = self.runtime.lock().await;
-            let running = runtime.as_ref().ok_or_else(|| VirtError::NotRunning {
-                name: self.config.name().to_string(),
-            })?;
-            running.mux.clone()
+            let mux = self.mux.lock().await;
+            mux.as_ref()
+                .ok_or_else(|| VirtError::NotRunning {
+                    name: self.config.name().to_string(),
+                })?
+                .clone()
         };
 
         let deadline = Instant::now() + VSOCK_CONNECT_TIMEOUT;
@@ -505,12 +502,6 @@ fn validate(config: &VmConfig) -> Result<(), VirtError> {
                 );
             }
         }
-        NetworkMode::UnixStream { .. } => {
-            return invalid_config(config, "unixstream networking is not implemented yet")
-        }
-        NetworkMode::Tap { .. } => {
-            return invalid_config(config, "tap networking is not implemented yet")
-        }
     }
 
     Ok(())
@@ -576,7 +567,7 @@ fn engine_config(config: &VmConfig) -> Result<krun::KrunConfig, VirtError> {
                     mac: *mac,
                 })
             }
-            _ => krun::Network::None,
+            NetworkMode::None => krun::Network::None,
         },
         stdio_console: true,
         balloon: true,

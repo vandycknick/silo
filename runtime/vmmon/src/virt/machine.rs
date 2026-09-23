@@ -36,12 +36,6 @@ impl std::fmt::Debug for VirtualMachine {
 }
 
 impl VirtualMachine {
-    /// Create a machine on the platform-default backend
-    /// (krun on Linux, Virtualization.framework on macOS).
-    pub fn new(config: VmConfig) -> Result<Self, VirtError> {
-        Self::with_backend(BackendKind::default_for_host()?, config)
-    }
-
     /// Create a machine on an explicit backend.
     ///
     /// This is the entry point for runtime backend selection; today it is
@@ -300,7 +294,7 @@ mod tests {
         }
 
         async fn wait(&self) -> Result<VmExit, VirtError> {
-            Ok(VmExit::Stopped)
+            Ok(VmExit::stopped(crate::virt::exit::StartupStage::Started))
         }
 
         async fn try_wait(&self) -> Result<Option<VmExit>, VirtError> {

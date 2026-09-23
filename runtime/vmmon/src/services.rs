@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::virt::{SerialAccess, SerialConsole, SerialStream, VirtualMachine};
+use crate::virt::{SerialConsole, SerialStream, VirtualMachine};
 use agent_spec::SSH_VSOCK_PORT;
 use eyre::Context;
 use futures::{Stream, StreamExt};
@@ -176,27 +176,24 @@ impl VmAccessService for AccessService {
                 None,
             ));
         }
-        let stream = tokio::time::timeout(
-            BACKEND_SETUP_TIMEOUT,
-            self.serial.open_stream(SerialAccess::Interactive),
-        )
-        .await
-        .map_err(|_| {
-            protocol::status_with_error(
-                tonic::Code::DeadlineExceeded,
-                protocol::v1::ErrorCode::AgentTimeout,
-                "serial backend setup timed out",
-                None,
-            )
-        })?
-        .map_err(|error| {
-            protocol::status_with_error(
-                tonic::Code::ResourceExhausted,
-                protocol::v1::ErrorCode::SerialInUse,
-                format!("serial backend unavailable: {error}"),
-                None,
-            )
-        })?;
+        let stream = tokio::time::timeout(BACKEND_SETUP_TIMEOUT, self.serial.open_stream())
+            .await
+            .map_err(|_| {
+                protocol::status_with_error(
+                    tonic::Code::DeadlineExceeded,
+                    protocol::v1::ErrorCode::AgentTimeout,
+                    "serial backend setup timed out",
+                    None,
+                )
+            })?
+            .map_err(|error| {
+                protocol::status_with_error(
+                    tonic::Code::ResourceExhausted,
+                    protocol::v1::ErrorCode::SerialInUse,
+                    format!("serial backend unavailable: {error}"),
+                    None,
+                )
+            })?;
         Ok(Response::new(Box::pin(relay_serial(
             stream,
             request.into_inner(),

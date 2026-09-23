@@ -134,15 +134,6 @@ impl VsockStream {
             .is_some_and(|lease| capacity.owns(lease))
     }
 
-    /// Duplicate the underlying descriptor as an owned, non-blocking fd.
-    pub fn dup_fd(&self) -> io::Result<OwnedFd> {
-        match &self.inner {
-            VsockStreamInner::Unix(stream) => duplicate_nonblocking_fd(stream),
-            #[cfg(target_os = "macos")]
-            VsockStreamInner::Vz(stream) => duplicate_nonblocking_fd(stream),
-        }
-    }
-
     fn attach_listener_lease(
         mut self,
         registered_port: u32,
@@ -250,6 +241,7 @@ pub struct VsockListener {
 }
 
 enum VsockListenerInner {
+    #[cfg(any(test, feature = "mock-backend"))]
     Unix(UnixListener),
     Krun(mpsc::Receiver<PendingUnixVsock>),
     #[cfg(target_os = "macos")]
@@ -423,6 +415,7 @@ impl Drop for ListenerCleanup {
 }
 
 impl VsockListener {
+    #[cfg(test)]
     pub(crate) fn from_unix_listener(
         listener: UnixListener,
         registered_port: u32,
@@ -437,6 +430,7 @@ impl VsockListener {
         }
     }
 
+    #[cfg(any(test, feature = "mock-backend"))]
     pub(crate) fn from_mock_unix_listener(
         listener: UnixListener,
         registered_port: u32,
@@ -500,6 +494,7 @@ impl VsockListener {
     /// Wait for the next guest-initiated connection.
     pub async fn accept(&mut self) -> Result<VsockStream, VirtError> {
         let stream = match &mut self.inner {
+            #[cfg(any(test, feature = "mock-backend"))]
             VsockListenerInner::Unix(listener) => listener.accept().await.map(|(stream, _)| {
                 VsockStream::from_unix_stream(stream, None, self.registered_port, None)
             })?,
@@ -543,6 +538,7 @@ impl VsockListener {
     }
 
     /// Accept a queued connection without waiting; `Ok(None)` when none is pending.
+    #[cfg(test)]
     pub fn try_accept(&mut self) -> Result<Option<VsockStream>, VirtError> {
         let stream = match &mut self.inner {
             VsockListenerInner::Unix(listener) => try_accept_unix(listener)?.map(|stream| {
@@ -636,6 +632,7 @@ impl fmt::Debug for VsockListener {
 }
 
 const SYNTHETIC_SOURCE_BASE: u32 = 1 << 30;
+#[cfg(any(test, feature = "mock-backend"))]
 const SYNTHETIC_SOURCE_COUNT: usize = 1024;
 
 /// Per-mock-machine deterministic high-range source ports for protocol tests.
@@ -645,6 +642,7 @@ pub(crate) struct SyntheticPortAllocator {
 }
 
 impl SyntheticPortAllocator {
+    #[cfg(any(test, feature = "mock-backend"))]
     pub(crate) fn new() -> Self {
         Self {
             slots: Arc::new(Mutex::new(vec![false; SYNTHETIC_SOURCE_COUNT])),
@@ -790,6 +788,7 @@ impl AsyncWrite for SerialDevice {
 }
 
 /// Non-blocking accept on a tokio listener without consuming its readiness.
+#[cfg(test)]
 fn try_accept_unix(listener: &UnixListener) -> io::Result<Option<UnixStream>> {
     use nix::errno::Errno;
     use nix::sys::socket::accept;
@@ -891,14 +890,6 @@ fn pty_read_reached_eof(_error: &io::Error) -> bool {
     false
 }
 
-fn duplicate_nonblocking_fd<F: AsRawFd>(fd_owner: &F) -> io::Result<OwnedFd> {
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd_owner.as_raw_fd()) };
-    let duplicated = nix::unistd::dup(borrowed).map_err(io::Error::other)?;
-    let file = File::from(duplicated);
-    set_nonblocking(&file)?;
-    Ok(file.into())
-}
-
 fn set_nonblocking(file: &File) -> io::Result<()> {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
@@ -944,40 +935,6 @@ mod tests {
             .expect("clock should be after epoch")
             .as_nanos();
         PathBuf::from("/tmp").join(format!("vmmon-{name}-{}-{now}.sock", std::process::id()))
-    }
-
-    #[tokio::test]
-    async fn dup_fd_returns_valid_nonblocking_descriptor() {
-        let (mut left, right) = StdUnixStream::pair().expect("unix stream pair should be created");
-        right
-            .set_nonblocking(true)
-            .expect("right stream should be nonblocking");
-
-        let stream = UnixStream::from_std(right).expect("tokio unix stream should wrap std stream");
-        let stream = VsockStream::from_unix_stream(stream, None, 7000, None);
-        let duplicated = stream.dup_fd().expect("dup fd should succeed");
-
-        assert_eq!(stream.source_port(), None);
-        assert_eq!(stream.destination_port(), 7000);
-
-        let raw_flags = unsafe { libc::fcntl(duplicated.as_raw_fd(), libc::F_GETFL) };
-        assert_ne!(raw_flags, -1, "fcntl should succeed");
-        assert_ne!(raw_flags & libc::O_NONBLOCK, 0, "fd should be nonblocking");
-
-        let mut duplicated_stream = StdUnixStream::from(duplicated);
-        left.write_all(b"ping").expect("write should succeed");
-
-        let mut buf = [0u8; 4];
-        loop {
-            match duplicated_stream.read(&mut buf) {
-                Ok(4) => break,
-                Ok(_) => panic!("unexpected short read"),
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(err) => panic!("read should succeed: {err}"),
-            }
-        }
-
-        assert_eq!(&buf, b"ping");
     }
 
     #[test]

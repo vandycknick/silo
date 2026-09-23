@@ -5,8 +5,7 @@
 //! stream open) it opens the backend serial device exactly once, splits it,
 //! and spawns a single reader task that fans guest output out to every
 //! registered sink and to a broadcast channel for live streams. At most one
-//! `Interactive` stream may exist at a time and only it may write guest
-//! input; `Watch` streams are unlimited and their writes are ignored.
+//! client stream may exist at a time; it owns guest input.
 
 use std::io;
 use std::pin::Pin;
@@ -23,15 +22,6 @@ use crate::virt::stream::SerialDevice;
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Access level of a serial client stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SerialAccess {
-    /// Exclusive read/write client; only one may be attached at a time.
-    Interactive,
-    /// Read-only observer; input writes are silently ignored.
-    Watch,
-}
-
 #[derive(Debug)]
 struct SerialHub {
     next_id: u64,
@@ -46,8 +36,8 @@ impl SerialHub {
         }
     }
 
-    fn attach(&mut self, access: SerialAccess) -> Result<u64, VirtError> {
-        if access == SerialAccess::Interactive && self.interactive_owner.is_some() {
+    fn attach(&mut self) -> Result<u64, VirtError> {
+        if self.interactive_owner.is_some() {
             return Err(VirtError::Backend(
                 "interactive serial client is already attached".to_string(),
             ));
@@ -56,10 +46,7 @@ impl SerialHub {
         let id = self.next_id;
         self.next_id += 1;
 
-        if access == SerialAccess::Interactive {
-            self.interactive_owner = Some(id);
-        }
-
+        self.interactive_owner = Some(id);
         Ok(id)
     }
 
@@ -169,22 +156,18 @@ impl SerialConsole {
     }
 
     /// Open a live client stream over the serial console.
-    pub async fn open_stream(
-        self: &Arc<Self>,
-        access: SerialAccess,
-    ) -> Result<SerialStream, VirtError> {
+    pub async fn open_stream(self: &Arc<Self>) -> Result<SerialStream, VirtError> {
         self.attach().await?;
 
         let client_id = {
             let mut hub = self.hub.lock().await;
-            hub.attach(access)?
+            hub.attach()?
         };
-        tracing::info!(client_id, access = ?access, "serial client attached");
+        tracing::info!(client_id, "serial client attached");
 
         Ok(SerialStream {
             console: self.clone(),
             client_id,
-            access,
             output_rx: self.output_tx.subscribe(),
         })
     }
@@ -262,7 +245,6 @@ impl Drop for SerialConsole {
 pub struct SerialStream {
     console: Arc<SerialConsole>,
     client_id: u64,
-    access: SerialAccess,
     output_rx: broadcast::Receiver<Vec<u8>>,
 }
 
@@ -280,12 +262,9 @@ impl SerialStream {
         }
     }
 
-    /// Write interactive input to the guest. Watch-only streams ignore input.
+    /// Write input to the guest.
     pub async fn write_input(&self, chunk: &[u8]) -> io::Result<()> {
-        match self.access {
-            SerialAccess::Interactive => self.console.write_input(self.client_id, chunk).await,
-            SerialAccess::Watch => Ok(()),
-        }
+        self.console.write_input(self.client_id, chunk).await
     }
 }
 

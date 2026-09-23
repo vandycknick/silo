@@ -9,6 +9,16 @@ fn main() {
 mod krun_worker;
 
 #[cfg(target_os = "macos")]
+#[path = "../virt/exit.rs"]
+#[allow(dead_code)]
+mod exit;
+
+#[cfg(target_os = "macos")]
+mod virt {
+    pub(crate) use crate::exit;
+}
+
+#[cfg(target_os = "macos")]
 #[path = "../rosetta/mod.rs"]
 mod rosetta;
 

@@ -11,6 +11,9 @@ use nix::sys::stat::{fchmod, fstat, Mode, SFlag};
 use nix::unistd::{unlinkat, UnlinkatFlags};
 use serde::Serialize;
 
+use crate::virt::exit::{Diagnostic, ForceReason, ProcessExit, StartupStage};
+use crate::virt::{BackendKind, VmExit};
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExitStatus {
@@ -21,7 +24,21 @@ pub(crate) struct ExitStatus {
     outcome: ExitOutcome,
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    worker: Option<crate::virt::exit::WorkerExit>,
+    backend: Option<BackendExit>,
+}
+
+/// Backend detail of the terminal outcome. libvm stores it without
+/// interpreting it; fields are added, never repurposed.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackendExit {
+    kind: &'static str,
+    stage: StartupStage,
+    force_reason: Option<ForceReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process: Option<ProcessExit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<Diagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -47,24 +64,26 @@ impl ExitStatus {
             exited_at: current_unix(),
             outcome,
             error,
-            worker: None,
+            backend: None,
         })
     }
 
-    pub(crate) fn with_vm_exit(mut self, exit: Option<crate::virt::VmExit>) -> Self {
-        if let Some(exit) = exit {
-            self.error = self.error.or_else(|| exit.error());
-            self.outcome = if self.error.is_some() {
-                ExitOutcome::Error
-            } else if exit.forced() {
-                ExitOutcome::Forced
-            } else {
-                ExitOutcome::Clean
-            };
-            if let crate::virt::VmExit::Worker(worker) = exit {
-                self.worker = Some(*worker);
-            }
-        }
+    pub(crate) fn with_vm_exit(mut self, kind: BackendKind, exit: VmExit) -> Self {
+        self.error = self.error.or_else(|| exit.error());
+        self.outcome = if self.error.is_some() {
+            ExitOutcome::Error
+        } else if exit.forced() {
+            ExitOutcome::Forced
+        } else {
+            ExitOutcome::Clean
+        };
+        self.backend = Some(BackendExit {
+            kind: kind.name(),
+            stage: exit.stage,
+            force_reason: exit.force_reason,
+            process: exit.process,
+            diagnostic: exit.diagnostic,
+        });
         self
     }
 }
@@ -265,21 +284,26 @@ mod tests {
     }
 
     #[test]
-    fn worker_force_is_not_a_crash_and_does_not_replace_startup_failure() {
-        use crate::krun_worker::protocol::StartupStage;
-        use crate::virt::exit::{ForceReason, VmExit, WorkerExit};
-        let worker = WorkerExit {
-            pid: 123,
-            raw_status: 9,
-            code: None,
-            signal: Some(9),
-            core_dumped: false,
+    fn backend_force_is_not_a_crash_and_does_not_replace_startup_failure() {
+        use crate::virt::exit::{
+            Diagnostic, ForceReason, ProcessExit, StartupStage, VmExit, VmOutcome,
+        };
+        use crate::virt::BackendKind;
+        let exit = VmExit {
+            outcome: VmOutcome::Forced,
             stage: StartupStage::Build,
-            shutdown_requested: true,
             force_reason: Some(ForceReason::StartupFailure),
-            failure: None,
-            diagnostic_tail: "diagnostic".to_string(),
-            diagnostic_truncated: false,
+            process: Some(ProcessExit {
+                pid: 123,
+                raw_status: 9,
+                code: None,
+                signal: Some(9),
+                core_dumped: false,
+            }),
+            diagnostic: Some(Diagnostic {
+                tail: "diagnostic".to_string(),
+                truncated: false,
+            }),
         };
         for error in [None, Some("admission failed".to_string())] {
             let record = ExitStatus::new(
@@ -289,10 +313,15 @@ mod tests {
                 error.clone(),
             )
             .expect("record")
-            .with_vm_exit(Some(VmExit::Worker(Box::new(worker.clone()))));
+            .with_vm_exit(BackendKind::Krun, exit.clone());
             let value = serde_json::to_value(record).expect("encode record");
             assert_eq!(value["pid"], std::process::id());
-            assert_eq!(value["worker"]["pid"], 123);
+            assert_eq!(value["backend"]["kind"], "krun");
+            assert_eq!(value["backend"]["stage"], "build");
+            assert_eq!(value["backend"]["forceReason"], "startup_failure");
+            assert_eq!(value["backend"]["process"]["pid"], 123);
+            assert_eq!(value["backend"]["process"]["rawStatus"], 9);
+            assert_eq!(value["backend"]["diagnostic"]["tail"], "diagnostic");
             if error.is_none() {
                 assert_eq!(value["outcome"], "forced");
             } else {
@@ -300,6 +329,27 @@ mod tests {
                 assert_eq!(value["outcome"], "error");
             }
         }
+    }
+
+    #[test]
+    fn backend_without_process_omits_process_and_diagnostic() {
+        use crate::virt::exit::{StartupStage, VmExit};
+        use crate::virt::BackendKind;
+        let record =
+            status("run").with_vm_exit(BackendKind::Vz, VmExit::stopped(StartupStage::Started));
+        let value = serde_json::to_value(record).expect("encode record");
+        assert_eq!(value["outcome"], "clean");
+        assert_eq!(value["backend"]["kind"], "vz");
+        assert_eq!(value["backend"]["stage"], "started");
+        assert!(value["backend"]["forceReason"].is_null());
+        assert!(value["backend"].get("process").is_none());
+        assert!(value["backend"].get("diagnostic").is_none());
+    }
+
+    #[test]
+    fn record_without_machine_has_no_backend_block() {
+        let value = serde_json::to_value(status("run")).expect("encode record");
+        assert!(value.get("backend").is_none());
     }
 
     #[test]

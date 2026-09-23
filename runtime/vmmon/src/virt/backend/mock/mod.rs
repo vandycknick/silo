@@ -30,6 +30,7 @@ use crate::virt::backend::{BackendKind, VirtBackend};
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission};
 use crate::virt::config::{validate_common, VmConfig};
 use crate::virt::error::VirtError;
+use crate::virt::exit::StartupStage;
 use crate::virt::machine::VirtualMachine;
 use crate::virt::stream::{SerialDevice, SyntheticPortAllocator, VsockListener, VsockStream};
 use crate::virt::VmExit;
@@ -192,7 +193,11 @@ impl VirtBackend for MockBackend {
             let shutdown = self.shutdown.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(crash_after_ms)).await;
-                cache_exit_in(&exit, &exit_notify, VmExit::StoppedWithError(message));
+                cache_exit_in(
+                    &exit,
+                    &exit_notify,
+                    VmExit::failed(StartupStage::Started, message),
+                );
                 shutdown.send_replace(true);
             });
         }
@@ -205,7 +210,7 @@ impl VirtBackend for MockBackend {
     async fn stop(&self) -> Result<(), VirtError> {
         let _ = self.running.lock().await.take();
         self.shutdown.send_replace(true);
-        self.cache_exit(VmExit::Stopped);
+        self.cache_exit(VmExit::stopped(StartupStage::Started));
         Ok(())
     }
 

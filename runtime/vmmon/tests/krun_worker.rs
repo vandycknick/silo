@@ -358,11 +358,17 @@ fn supervisor_launches_one_real_worker_and_exits_on_native_startup_failure() {
     .expect("exit record");
     assert_eq!(status["outcome"], "error");
     assert_eq!(status["pid"], supervisor_pid);
-    let worker_pid = status["worker"]["pid"]
+    assert_eq!(status["backend"]["kind"], "krun");
+    assert!(
+        status["backend"]["stage"].is_string(),
+        "startup failure records its stage: {status}"
+    );
+    assert_ne!(status["backend"]["stage"], "started");
+    let worker_pid = status["backend"]["process"]["pid"]
         .as_u64()
         .expect("retained startup worker identity");
     assert_ne!(worker_pid, u64::from(supervisor_pid));
-    assert!(status["worker"]["rawStatus"].is_i64());
+    assert!(status["backend"]["process"]["rawStatus"].is_i64());
     assert_eq!(
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(worker_pid as i32), None),
         Err(nix::errno::Errno::ESRCH),
@@ -398,7 +404,16 @@ fn startup_signal_cancels_an_incomplete_request_without_a_blocking_reader() {
     )
     .expect("cancel startup");
     assert!(!process.output().status.success());
-    assert!(fixture.0.join("vm.exit.json").exists());
+    let status: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fixture.0.join("vm.exit.json")).expect("exit metadata"),
+    )
+    .expect("exit record");
+    assert_eq!(status["outcome"], "error");
+    assert!(
+        status.get("backend").is_none(),
+        "no machine means no backend block: {status}"
+    );
+    assert!(!fixture.0.join("vm.pid").exists());
     assert!(!std::fs::read_to_string(fixture.0.join("trace.log"))
         .expect("trace")
         .contains("krun worker spawned"));
@@ -420,7 +435,16 @@ fn parent_loss_cancels_an_incomplete_supervisor_request() {
     fixture.wait_for_request();
     drop(parent);
     assert!(!process.output().status.success());
-    assert!(fixture.0.join("vm.exit.json").exists());
+    let status: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fixture.0.join("vm.exit.json")).expect("exit metadata"),
+    )
+    .expect("exit record");
+    assert_eq!(status["outcome"], "error");
+    assert!(
+        status.get("backend").is_none(),
+        "no machine means no backend block: {status}"
+    );
+    assert!(!fixture.0.join("vm.pid").exists());
     assert!(!std::fs::read_to_string(fixture.0.join("trace.log"))
         .expect("trace")
         .contains("krun worker spawned"));
@@ -741,29 +765,29 @@ async fn native_guest_cases(scenarios: &[NativeExit]) {
         .expect("exit record");
         assert_eq!(status["pid"], supervisor);
         assert_eq!(status["machineId"], fixture.1.to_string());
-        assert_eq!(status["worker"]["pid"], worker);
-        assert_eq!(status["worker"]["coreDumped"], false);
-        assert_eq!(status["worker"]["stage"], "started");
+        assert_eq!(status["backend"]["process"]["pid"], worker);
+        assert_eq!(status["backend"]["process"]["coreDumped"], false);
+        assert_eq!(status["backend"]["stage"], "started");
         assert_ne!(Some(&status["runId"]), previous_run.as_ref());
         let expected = match scenario {
             NativeExit::WorkerSignal => {
                 assert!(!result.status.success());
-                assert!(status["worker"]["forceReason"].is_null());
+                assert!(status["backend"]["forceReason"].is_null());
                 "error"
             }
             NativeExit::Stop if cfg!(target_os = "linux") => {
                 assert!(result.status.success());
-                assert_eq!(status["worker"]["signal"], 9);
+                assert_eq!(status["backend"]["process"]["signal"], 9);
                 "forced"
             }
-            NativeExit::Stop if status["worker"]["signal"] == 9 => {
+            NativeExit::Stop if status["backend"]["process"]["signal"] == 9 => {
                 assert!(result.status.success());
-                assert_eq!(status["worker"]["forceReason"], "graceful_timeout");
+                assert_eq!(status["backend"]["forceReason"], "graceful_timeout");
                 "forced"
             }
             _ => {
                 assert!(result.status.success());
-                assert_eq!(status["worker"]["code"], 0);
+                assert_eq!(status["backend"]["process"]["code"], 0);
                 "clean"
             }
         };

@@ -14,11 +14,10 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::krun_worker::protocol::StartupStage;
 use crate::krun_worker::protocol::{self, Event, Launch, MAX_EVENT, MAX_REQUEST};
 use crate::virt::backend::krun::{host_memory_reclaim_report, inherit};
 use crate::virt::backend::HostMemoryReclaimReport;
-use crate::virt::exit::{ForceReason, VmExit, WorkerExit};
+use crate::virt::exit::{Diagnostic, ForceReason, ProcessExit, StartupStage, VmExit, VmOutcome};
 
 const DIAGNOSTIC_LIMIT: usize = 64 * 1024;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
@@ -27,15 +26,28 @@ const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(30);
 const FORCE_OBSERVATION: Duration = Duration::from_secs(5);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Published lifecycle of one worker generation. `Reaped` means the child is
+/// gone but the owner is still draining channels; `Exited` is terminal.
 #[derive(Clone, Default)]
-pub(crate) struct Snapshot {
-    pub(crate) started: bool,
-    pub(crate) reaped: bool,
-    pub(crate) exit: Option<VmExit>,
+pub(crate) enum Phase {
+    #[default]
+    Starting,
+    Started,
+    Reaped,
+    Exited(VmExit),
+}
+
+impl Phase {
+    pub(crate) fn exit(&self) -> Option<&VmExit> {
+        match self {
+            Self::Exited(exit) => Some(exit),
+            Self::Starting | Self::Started | Self::Reaped => None,
+        }
+    }
 }
 
 pub(crate) struct Owner {
-    pub(crate) state: watch::Sender<Snapshot>,
+    pub(crate) state: watch::Sender<Phase>,
     pub(crate) stop: CancellationToken,
     pub(crate) force: CancellationToken,
     pub(crate) reclaim: watch::Sender<Option<HostMemoryReclaimReport>>,
@@ -172,13 +184,13 @@ impl Owner {
         mux: OwnedFd,
     ) -> VmExit {
         if self.stop.is_cancelled() || self.force.is_cancelled() {
-            return VmExit::Stopped;
+            return VmExit::stopped(StartupStage::Spawned);
         }
         let frame = match Launch::from_config(config)
             .and_then(|launch| protocol::encode(&launch, MAX_REQUEST))
         {
             Ok(frame) => frame,
-            Err(error) => return VmExit::StoppedWithError(error.to_string()),
+            Err(error) => return VmExit::failed(StartupStage::Spawned, error.to_string()),
         };
         let Spawned {
             mut child,
@@ -188,7 +200,9 @@ impl Owner {
             _keepalive,
         } = match spawn(console, mux) {
             Ok(spawned) => spawned,
-            Err(error) => return VmExit::StoppedWithError(format!("spawn krun worker: {error}")),
+            Err(error) => {
+                return VmExit::failed(StartupStage::Spawned, format!("spawn krun worker: {error}"))
+            }
         };
         let pid = child.id().unwrap_or_default();
         tracing::info!(worker_pid = pid, "krun worker spawned");
@@ -259,7 +273,7 @@ impl Owner {
                         Some(Ok(Event::StartupStage { stage: next })) if valid_stage(stage, next) && !started => { stage = next; None }
                         Some(Ok(Event::BackendStarted {})) if stage == StartupStage::Build && !started => {
                             started = true; stage = StartupStage::Started;
-                            self.state.send_replace(Snapshot { started: true, reaped: false, exit: None }); None
+                            self.state.send_replace(Phase::Started); None
                         }
                         Some(Ok(Event::StartupFailed { stage: observed, diagnostic })) if observed == stage => Some(diagnostic),
                         Some(Ok(Event::HostMemoryReclaim { status })) if stage == StartupStage::Build || started => {
@@ -308,11 +322,7 @@ impl Owner {
                 }
             }
         };
-        self.state.send_replace(Snapshot {
-            started: false,
-            reaped: true,
-            exit: None,
-        });
+        self.state.send_replace(Phase::Reaped);
         if !transmitted {
             transmission.abort();
             let _ = transmission.await;
@@ -353,19 +363,48 @@ impl Owner {
                 .get_or_insert_with(|| "worker exited before startup acknowledgement".to_string());
         }
         let tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
-        VmExit::Worker(Box::new(WorkerExit {
+        let process = ProcessExit {
             pid,
             raw_status: status.into_raw(),
             code: status.code(),
             signal: status.signal(),
             core_dumped: status.core_dumped(),
+        };
+        let diagnostic = (!tail.bytes.is_empty()).then(|| Diagnostic {
+            tail: tail.text(),
+            truncated: tail.truncated,
+        });
+        VmExit {
+            outcome: worker_outcome(failure, forced, &process),
             stage,
-            shutdown_requested,
             force_reason: forced,
-            failure,
-            diagnostic_tail: tail.text(),
-            diagnostic_truncated: tail.truncated,
-        }))
+            process: Some(process),
+            diagnostic,
+        }
+    }
+}
+
+/// A requested force only counts when SIGKILL is what the reaper observed;
+/// any other signal or a non-zero code is a crash even during shutdown.
+fn worker_outcome(
+    failure: Option<String>,
+    forced: Option<ForceReason>,
+    process: &ProcessExit,
+) -> VmOutcome {
+    if let Some(failure) = failure {
+        return VmOutcome::Failed(failure);
+    }
+    if forced.is_some() && process.signal == Some(nix::libc::SIGKILL) {
+        return VmOutcome::Forced;
+    }
+    match (process.code, process.signal) {
+        (Some(0), _) => VmOutcome::Clean,
+        (Some(code), _) => VmOutcome::Failed(format!("krun exited with status code {code}")),
+        (_, Some(signal)) => VmOutcome::Failed(format!("krun exited after signal {signal}")),
+        _ => VmOutcome::Failed(format!(
+            "krun exited with unknown status {}",
+            process.raw_status
+        )),
     }
 }
 
@@ -380,8 +419,62 @@ fn valid_stage(current: StartupStage, next: StartupStage) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::krun_worker::protocol::StartupStage;
-    use crate::virt::backend::krun::owner::{valid_stage, Tail, DIAGNOSTIC_LIMIT};
+    use crate::virt::backend::krun::owner::{valid_stage, worker_outcome, Tail, DIAGNOSTIC_LIMIT};
+    use crate::virt::exit::{ForceReason, ProcessExit, StartupStage, VmOutcome};
+
+    fn process(code: Option<i32>, signal: Option<i32>) -> ProcessExit {
+        ProcessExit {
+            pid: 123,
+            raw_status: 0,
+            code,
+            signal,
+            core_dumped: false,
+        }
+    }
+
+    #[test]
+    fn shutdown_intent_does_not_hide_crashes_or_nonzero_exits() {
+        for signal in [nix::libc::SIGSEGV, nix::libc::SIGTERM, nix::libc::SIGKILL] {
+            assert!(matches!(
+                worker_outcome(None, None, &process(None, Some(signal))),
+                VmOutcome::Failed(_)
+            ));
+        }
+        assert!(matches!(
+            worker_outcome(None, Some(ForceReason::Stop), &process(Some(127), None)),
+            VmOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            worker_outcome(
+                None,
+                Some(ForceReason::Stop),
+                &process(None, Some(nix::libc::SIGSEGV))
+            ),
+            VmOutcome::Failed(_)
+        ));
+        assert_eq!(
+            worker_outcome(None, None, &process(Some(0), None)),
+            VmOutcome::Clean
+        );
+    }
+
+    #[test]
+    fn force_requires_observed_sigkill_and_preserves_primary_startup_error() {
+        let killed = process(None, Some(nix::libc::SIGKILL));
+        assert_eq!(
+            worker_outcome(None, Some(ForceReason::StartupFailure), &killed),
+            VmOutcome::Forced
+        );
+        assert_eq!(
+            worker_outcome(
+                Some("host admission failed".to_string()),
+                Some(ForceReason::StartupFailure),
+                &killed
+            ),
+            VmOutcome::Failed("host admission failed".to_string())
+        );
+    }
+
     #[test]
     fn diagnostic_tail_is_bounded_for_binary_unterminated_output() {
         let mut tail = Tail::default();

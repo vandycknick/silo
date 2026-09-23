@@ -6,6 +6,7 @@ use crate::virt::error::VirtError;
 
 pub(crate) const MAX_ACTIVE_VSOCK_CONNECTIONS: usize = 1023;
 pub(crate) const INTERNAL_HEADROOM: usize = 16;
+#[cfg(test)]
 pub(crate) const MAX_PUBLIC_VSOCK_CONNECTIONS: usize =
     MAX_ACTIVE_VSOCK_CONNECTIONS - INTERNAL_HEADROOM;
 

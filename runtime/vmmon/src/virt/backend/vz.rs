@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use crate::virt::backend::{StartAttempt, VirtBackend};
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission};
 use crate::virt::config::{validate_common, MachineIdentifier, NetworkMode, VmConfig};
 use crate::virt::error::VirtError;
+use crate::virt::exit::StartupStage;
 use crate::virt::stream::{SerialDevice, VsockListener, VsockStream};
 use crate::virt::VmExit;
 
@@ -36,6 +38,7 @@ pub(crate) struct VzBackend {
     force: tokio_util::sync::CancellationToken,
     exit: Arc<Mutex<Option<VmExit>>>,
     exit_notify: Arc<Notify>,
+    started: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -57,7 +60,12 @@ impl VzBackend {
             force: tokio_util::sync::CancellationToken::new(),
             exit: Arc::new(Mutex::new(None)),
             exit_notify: Arc::new(Notify::new()),
+            started: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    fn stage(&self) -> StartupStage {
+        stage(&self.started)
     }
 
     fn cached_exit(&self) -> Option<VmExit> {
@@ -77,9 +85,10 @@ impl VzBackend {
 
     fn try_cache_exit_from_vm(&self, vm: &VirtualMachine) {
         match vm.state() {
-            VirtualMachineState::Stopped => self.cache_exit(VmExit::Stopped),
-            VirtualMachineState::Error => self.cache_exit(VmExit::StoppedWithError(
-                "virtual machine entered error state".to_string(),
+            VirtualMachineState::Stopped => self.cache_exit(VmExit::stopped(self.stage())),
+            VirtualMachineState::Error => self.cache_exit(VmExit::failed(
+                self.stage(),
+                "virtual machine entered error state",
             )),
             _ => {}
         }
@@ -106,6 +115,7 @@ impl VzBackend {
         vm.set_delegate(ExitDelegate {
             exit: self.exit.clone(),
             notify: self.exit_notify.clone(),
+            started: self.started.clone(),
         })
         .map_err(vz_error)?;
         let mut state_events = vm.subscribe_state();
@@ -118,6 +128,7 @@ impl VzBackend {
             STARTUP_TIMEOUT,
         )
         .await?;
+        self.started.store(true, Ordering::Release);
 
         Ok(())
     }
@@ -237,7 +248,7 @@ impl VirtBackend for VzBackend {
 
         state.vm = None;
         state.serial_port = None;
-        self.cache_exit(VmExit::Stopped);
+        self.cache_exit(VmExit::stopped(self.stage()));
         Ok(())
     }
 
@@ -384,13 +395,23 @@ fn socket_device(vm: &VirtualMachine) -> Result<VirtioSocketDevice, VirtError> {
 struct ExitDelegate {
     exit: Arc<Mutex<Option<VmExit>>>,
     notify: Arc<Notify>,
+    started: Arc<AtomicBool>,
+}
+
+/// VZ has no worker stages: it is either still building or running.
+fn stage(started: &AtomicBool) -> StartupStage {
+    if started.load(Ordering::Acquire) {
+        StartupStage::Started
+    } else {
+        StartupStage::Build
+    }
 }
 
 impl VirtualMachineDelegate for ExitDelegate {
     fn guest_did_stop(&self) {
         let mut slot = self.exit.lock().unwrap_or_else(PoisonError::into_inner);
         if slot.is_none() {
-            *slot = Some(VmExit::Stopped);
+            *slot = Some(VmExit::stopped(stage(&self.started)));
         }
         drop(slot);
         self.notify.notify_waiters();
@@ -399,7 +420,7 @@ impl VirtualMachineDelegate for ExitDelegate {
     fn did_stop_with_error(&self, error: VzError) {
         let mut slot = self.exit.lock().unwrap_or_else(PoisonError::into_inner);
         if slot.is_none() {
-            *slot = Some(VmExit::StoppedWithError(error.to_string()));
+            *slot = Some(VmExit::failed(stage(&self.started), error.to_string()));
         }
         drop(slot);
         self.notify.notify_waiters();
@@ -439,7 +460,6 @@ fn build_vm(config: &VmConfig) -> Result<(VirtualMachine, SerialPortConfiguratio
                     .map_err(vz_error)?,
             );
         }
-        NetworkMode::UnixStream { .. } | NetworkMode::Tap { .. } => {}
     }
 
     for disk in config.disks() {
@@ -531,16 +551,6 @@ fn validate_machine_config(config: &VmConfig) -> Result<(), VirtError> {
                         .to_string(),
                 ));
             }
-        }
-        NetworkMode::UnixStream { .. } => {
-            return Err(invalid(
-                "unixstream networking is not supported by the VZ backend".to_string(),
-            ));
-        }
-        NetworkMode::Tap { .. } => {
-            return Err(invalid(
-                "tap networking is not supported by the VZ backend".to_string(),
-            ));
         }
     }
 
@@ -702,6 +712,7 @@ mod tests {
             force: tokio_util::sync::CancellationToken::new(),
             exit: Arc::new(Mutex::new(None)),
             exit_notify: Arc::new(Notify::new()),
+            started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         backend.stop().await.expect("cancel unstarted VM");
         backend.stop().await.expect("repeat stop");
@@ -711,7 +722,7 @@ mod tests {
         ));
         assert_eq!(
             backend.wait().await.expect("cached result"),
-            crate::virt::VmExit::Stopped
+            crate::virt::VmExit::stopped(crate::virt::exit::StartupStage::Build)
         );
         assert!(backend.inner.lock().await.vm.is_none());
     }

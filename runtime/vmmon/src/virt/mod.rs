@@ -27,8 +27,8 @@ mod machine;
 mod serial;
 mod stream;
 
+pub use backend::BackendKind;
 pub use backend::HostMemoryReclaimReport;
-pub use backend::{Availability, BackendKind};
 pub(crate) use capacity::VsockLease;
 pub use config::{
     DiskImage, KrunOptions, MachineIdentifier, MockOptions, NetworkMode, RosettaIntent,
@@ -37,5 +37,5 @@ pub use config::{
 pub use error::VirtError;
 pub use exit::VmExit;
 pub use machine::VirtualMachine;
-pub use serial::{SerialAccess, SerialConsole, SerialStream};
+pub use serial::{SerialConsole, SerialStream};
 pub use stream::{VsockListener, VsockStream};

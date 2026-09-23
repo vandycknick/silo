@@ -17,7 +17,6 @@ pub use libkrun::{init_log, LogLevel, LogOptions, LogStyle};
 pub struct Resources<'a> {
     pub console: ConsoleFds<'a>,
     pub vsock_mux: Option<OwnedFd>,
-    pub protected_streams: &'a [BorrowedFd<'a>],
 }
 
 /// Process-local controls, not a reusable VM or a process lifecycle handle.
@@ -143,7 +142,6 @@ pub fn run_process(
     let Resources {
         console: console_fds,
         vsock_mux: mut vsock_mux_fd,
-        protected_streams,
     } = resources;
     if config.vsock_mux != vsock_mux_fd.is_some() {
         return Err(crate::KrunBackendError::InvalidConfig(
@@ -222,9 +220,6 @@ pub fn run_process(
                 protect_stream_socket(&mut device, console_fds.stdin)?;
                 protect_stream_socket(&mut device, console_fds.stdout)?;
                 protect_stream_socket(&mut device, console_fds.stderr)?;
-                for fd in protected_streams {
-                    protect_stream_socket(&mut device, *fd)?;
-                }
                 device.set_unix_mux_fd(fd);
                 devices.add(device);
             }
@@ -470,7 +465,6 @@ mod tests {
                     stderr: console.as_fd(),
                 },
                 vsock_mux: None,
-                protected_streams: &[],
             },
             |_| panic!("invalid config must not reach post-build hook"),
         );
@@ -498,7 +492,6 @@ mod tests {
                         stderr: console.as_fd(),
                     },
                     vsock_mux: if enabled { None } else { Some(mux.into()) },
-                    protected_streams: &[],
                 },
                 |_| panic!("mismatched resources must not reach build"),
             );

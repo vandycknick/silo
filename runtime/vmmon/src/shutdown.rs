@@ -255,12 +255,14 @@ async fn wait_for_signal() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::virt::exit::StartupStage;
     use crate::virt::VmExit;
 
     #[test]
     fn backend_failure_is_preserved_for_monitor_exit_status() {
-        let info = crate::shutdown::vm_stop_info(VmExit::StoppedWithError(
-            "krun exited with status code 127".to_string(),
+        let info = crate::shutdown::vm_stop_info(VmExit::failed(
+            StartupStage::Started,
+            "krun exited with status code 127",
         ));
 
         assert_eq!(
@@ -275,7 +277,7 @@ mod tests {
 
     #[test]
     fn normal_backend_stop_remains_clean() {
-        let info = crate::shutdown::vm_stop_info(VmExit::Stopped);
+        let info = crate::shutdown::vm_stop_info(VmExit::stopped(StartupStage::Started));
 
         assert_eq!(info.message, "machine stopped");
         assert_eq!(info.error, None);
