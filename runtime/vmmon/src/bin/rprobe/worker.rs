@@ -2,10 +2,8 @@
 
 #[path = "../../virt/backend/krun/inherit.rs"]
 mod inherit;
-#[path = "../../krun_worker/protocol.rs"]
-#[allow(dead_code)]
-pub(crate) mod protocol;
 
+use crate::krun::worker::protocol;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -26,7 +24,7 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 impl Worker {
-    pub(crate) fn start(vmmon: &Path, config: krun::KrunConfig) -> io::Result<Self> {
+    pub(crate) fn start(vmmon: &Path, config: crate::krun::KrunConfig) -> io::Result<Self> {
         let bytes = protocol::encode(
             &protocol::Launch::from_config(config)?,
             protocol::MAX_REQUEST,

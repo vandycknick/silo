@@ -29,7 +29,7 @@ const ERROR_DIAGNOSTIC_LIMIT: usize = 4096;
 const HOST_ROOT: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux";
 
 pub(crate) struct PreparedRosetta {
-    pub(crate) launch: krun::RosettaLaunchConfig,
+    pub(crate) launch: crate::krun::RosettaLaunchConfig,
 }
 
 struct SourceSnapshot {
@@ -244,9 +244,13 @@ pub(crate) async fn acquire(
     }?;
     tracing::debug!(result = frame.header.result, payload_len = data.len(),
         payload_sha256 = %encode_hex(&sha256(&data)?), "Rosetta capture validated");
-    let launch =
-        krun::RosettaLaunchConfig::new(source.root, source.sha256, frame.header.result, data)
-            .wrap_err("construct captured Rosetta launch configuration")?;
+    let launch = crate::krun::RosettaLaunchConfig::new(
+        source.root,
+        source.sha256,
+        frame.header.result,
+        data,
+    )
+    .wrap_err("construct captured Rosetta launch configuration")?;
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis(),
         "Rosetta acquisition succeeded"

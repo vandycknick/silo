@@ -40,7 +40,7 @@ fn local_unix_datagram_path(peer_path: &Path, vm_id: &str, backend: &str) -> Pat
 
 #[cfg(test)]
 mod tests {
-    use crate::network::local_unix_datagram_path;
+    use crate::krun::network::local_unix_datagram_path;
     use std::path::Path;
 
     #[test]

@@ -16,7 +16,7 @@ const HV_UNSUPPORTED: i32 = -85_377_009;
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum HvfAdmissionError {
     #[error(transparent)]
-    Host(#[from] krun::HvfHostError),
+    Host(#[from] crate::krun::HvfHostError),
     #[error("create an empty Hypervisor.framework VM: {status}.{guidance}")]
     Create {
         status: HvfStatus,
@@ -48,8 +48,8 @@ impl std::fmt::Display for HvfStatus {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn check_hvf() -> Result<krun::HvfHostInfo, HvfAdmissionError> {
-    let info = krun::check_host()?;
+pub(crate) fn check_hvf() -> Result<crate::krun::HvfHostInfo, HvfAdmissionError> {
+    let info = crate::krun::check_host()?;
 
     // libkrun's native API does not expose an admission probe or destruction of its
     // private HvfVm. nix has no Hypervisor.framework binding; use the public SDK API.
@@ -98,7 +98,7 @@ unsafe extern "C" {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use crate::krun_worker::admission::{status_guidance, HvfStatus, HV_DENIED, HV_NO_RESOURCES};
+    use crate::krun::worker::admission::{status_guidance, HvfStatus, HV_DENIED, HV_NO_RESOURCES};
 
     #[test]
     fn denied_status_names_the_required_entitlement() {

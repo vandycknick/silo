@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use crate::error::{KrunBackendError, Result};
-use crate::rosetta::{RosettaLaunchConfig, ROSETTA_MOUNT_TAG};
+use crate::krun::error::{KrunBackendError, Result};
+use crate::krun::rosetta::{RosettaLaunchConfig, ROSETTA_MOUNT_TAG};
 
 pub const DEFAULT_ID: &str = "anonymous-instance";
 const STANDALONE_VSOCK_CID: u64 = 3;
@@ -193,7 +193,7 @@ fn validate_mac(mac: [u8; 6], name: &str) -> Result<()> {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::config::{validate_config, KrunConfig};
+    use crate::krun::config::{validate_config, KrunConfig};
 
     fn valid_config() -> KrunConfig {
         KrunConfig {

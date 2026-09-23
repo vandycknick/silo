@@ -13,7 +13,7 @@ mod ext;
 mod finalize;
 mod forward;
 mod guest;
-mod krun_worker;
+mod krun;
 mod lock;
 mod machine;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -87,12 +87,12 @@ struct Args {
 
 fn main() -> eyre::Result<()> {
     let matches = Args::command()
-        .subcommand(krun_worker::Args::command())
+        .subcommand(krun::worker::Args::command())
         .subcommand_negates_reqs(true)
         .args_conflicts_with_subcommands(true)
         .get_matches();
     if let Some(("worker", matches)) = matches.subcommand() {
-        return krun_worker::run(krun_worker::Args::from_arg_matches(matches)?);
+        return krun::worker::run(krun::worker::Args::from_arg_matches(matches)?);
     }
     let args = Args::from_arg_matches(&matches)?;
     let inherited_fds = InheritedPipeFds::from_env()?;

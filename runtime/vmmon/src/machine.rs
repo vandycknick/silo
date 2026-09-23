@@ -40,7 +40,7 @@ pub(crate) struct VmSpecInputs<'a> {
     pub guest_services_enabled: bool,
     pub selected_backend: crate::virt::BackendKind,
     pub rosetta_intent: crate::virt::RosettaIntent,
-    pub prepared_rosetta: Option<krun::RosettaLaunchConfig>,
+    pub prepared_rosetta: Option<crate::krun::RosettaLaunchConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

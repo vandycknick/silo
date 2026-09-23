@@ -10,10 +10,10 @@ use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::krun_worker::protocol::{Event, MAX_EVENT};
+use crate::krun::engine::{self, ConsoleFds, Resources};
+use crate::krun::worker::protocol::{Event, MAX_EVENT};
 use crate::virt::exit::StartupStage;
 use clap::Parser;
-use krun::engine::{self, ConsoleFds, Resources};
 
 #[derive(Parser)]
 #[command(
@@ -70,7 +70,7 @@ pub(crate) fn run(args: Args) -> eyre::Result<()> {
         stage = StartupStage::Admission;
         emit(&events, &Event::StartupStage { stage })?;
         #[cfg(target_os = "linux")]
-        krun::check_host()?;
+        crate::krun::check_host()?;
         #[cfg(target_os = "macos")]
         admission::check_hvf()?;
         stage = StartupStage::Build;

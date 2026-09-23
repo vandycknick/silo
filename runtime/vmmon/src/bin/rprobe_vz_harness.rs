@@ -6,7 +6,14 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 #[path = "rprobe/worker.rs"]
-mod krun_worker;
+mod rprobe_worker;
+
+// The harness drives the production worker protocol and config types; the
+// rest of the krun module is compiled but unused here.
+#[cfg(target_os = "macos")]
+#[path = "../krun/mod.rs"]
+#[allow(dead_code, unused_imports)]
+mod krun;
 
 #[cfg(target_os = "macos")]
 #[path = "../virt/exit.rs"]
@@ -38,10 +45,10 @@ mod macos {
     use std::thread;
     use std::time::{Duration, Instant as StdInstant};
 
-    use crate::krun_worker::Worker;
+    use crate::krun::RosettaLaunchConfig;
+    use crate::rprobe_worker::Worker;
     use clap::Parser;
     use eyre::{eyre, Context, Result};
-    use krun::RosettaLaunchConfig;
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use rprobe::exerciser::{
         Decoder as ExerciserDecoder, CHECK_TRANSLATED_WORKLOAD, FILESYSTEM_CHECKS,
@@ -622,7 +629,7 @@ mod macos {
     ) -> Result<HelperOutcome> {
         let mut vm = Worker::start(
             &inputs.vmmon,
-            krun::KrunConfig {
+            crate::krun::KrunConfig {
                 cpus: 1,
                 memory_mib: 512,
                 kernel: Some(inputs.kernel.clone()),
@@ -631,7 +638,7 @@ mod macos {
                 stdio_console: true,
                 balloon: true,
                 rosetta: Some(config),
-                ..krun::KrunConfig::default()
+                ..crate::krun::KrunConfig::default()
             },
         )
         .wrap_err("start krun responder worker")?;

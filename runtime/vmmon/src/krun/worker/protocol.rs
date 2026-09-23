@@ -19,23 +19,23 @@ pub(crate) struct Launch {
     kernel: Option<PathBuf>,
     initramfs: Option<PathBuf>,
     cmdline: Vec<String>,
-    disks: Vec<krun::Disk>,
-    mounts: Vec<krun::Mount>,
+    disks: Vec<crate::krun::Disk>,
+    mounts: Vec<crate::krun::Mount>,
     vsock_mux: bool,
     vsock_cid: Option<u64>,
-    network: krun::Network,
+    network: crate::krun::Network,
     stdio_console: bool,
     balloon: bool,
     rosetta: Option<String>,
 }
 
 impl Launch {
-    pub(crate) fn from_config(config: krun::KrunConfig) -> io::Result<Self> {
-        krun::validate_config(&config).map_err(io::Error::other)?;
+    pub(crate) fn from_config(config: crate::krun::KrunConfig) -> io::Result<Self> {
+        crate::krun::validate_config(&config).map_err(io::Error::other)?;
         let rosetta = config
             .rosetta
             .as_ref()
-            .map(krun::RosettaLaunchConfig::encode)
+            .map(crate::krun::RosettaLaunchConfig::encode)
             .transpose()
             .map_err(io::Error::other)?;
         Ok(Self {
@@ -56,17 +56,17 @@ impl Launch {
         })
     }
 
-    pub(crate) fn into_config(self) -> io::Result<krun::KrunConfig> {
+    pub(crate) fn into_config(self) -> io::Result<crate::krun::KrunConfig> {
         let rosetta = self
             .rosetta
-            .map(|value| krun::RosettaLaunchConfig::decode(value.as_bytes()))
+            .map(|value| crate::krun::RosettaLaunchConfig::decode(value.as_bytes()))
             .transpose()
             .map_err(io::Error::other)?;
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         if rosetta.is_some() {
             return Err(invalid("Rosetta requires macOS aarch64"));
         }
-        let config = krun::KrunConfig {
+        let config = crate::krun::KrunConfig {
             id: self.id,
             cpus: self.cpus,
             memory_mib: self.memory_mib,
@@ -82,7 +82,7 @@ impl Launch {
             balloon: self.balloon,
             rosetta,
         };
-        krun::validate_config(&config).map_err(io::Error::other)?;
+        crate::krun::validate_config(&config).map_err(io::Error::other)?;
         Ok(config)
     }
 }
@@ -99,7 +99,7 @@ pub(crate) enum Event {
         diagnostic: String,
     },
     HostMemoryReclaim {
-        status: krun::HostMemoryReclaimStatus,
+        status: crate::krun::HostMemoryReclaimStatus,
     },
 }
 
@@ -176,18 +176,18 @@ pub(crate) fn invalid(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use crate::krun_worker::protocol::*;
+    use crate::krun::worker::protocol::*;
 
     #[test]
     fn launch_round_trip_preserves_paths_and_devices() {
-        let config = krun::KrunConfig {
+        let config = crate::krun::KrunConfig {
             kernel: Some("/kernel with : spaces".into()),
-            disks: vec![krun::Disk {
+            disks: vec![crate::krun::Disk {
                 block_id: "root".to_string(),
                 path: "/root:disk".into(),
                 read_only: true,
             }],
-            ..krun::KrunConfig::default()
+            ..crate::krun::KrunConfig::default()
         };
         let launch = Launch::from_config(config.clone()).expect("launch");
         let wire = encode(&launch, MAX_REQUEST).expect("encode");
@@ -206,9 +206,9 @@ mod tests {
         assert!(frame_length([0; 4], MAX_REQUEST).is_err());
         assert!(read_launch(&mut &[0, 0, 0][..]).is_err());
         assert!(read_launch(&mut &[0, 0, 0, 2, b'{'][..]).is_err());
-        let config = krun::KrunConfig {
+        let config = crate::krun::KrunConfig {
             kernel: Some("/kernel".into()),
-            ..krun::KrunConfig::default()
+            ..crate::krun::KrunConfig::default()
         };
         let mut wire =
             encode(&Launch::from_config(config).expect("launch"), MAX_REQUEST).expect("wire");

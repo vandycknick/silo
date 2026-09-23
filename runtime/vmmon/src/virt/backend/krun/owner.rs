@@ -14,7 +14,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::krun_worker::protocol::{self, Event, Launch, MAX_EVENT, MAX_REQUEST};
+use crate::krun::worker::protocol::{self, Event, Launch, MAX_EVENT, MAX_REQUEST};
 use crate::virt::backend::krun::{host_memory_reclaim_report, inherit};
 use crate::virt::backend::HostMemoryReclaimReport;
 use crate::virt::exit::{Diagnostic, ForceReason, ProcessExit, StartupStage, VmExit, VmOutcome};
@@ -179,7 +179,7 @@ fn force(
 impl Owner {
     pub(crate) async fn run(
         &self,
-        config: krun::KrunConfig,
+        config: crate::krun::KrunConfig,
         console: OwnedFd,
         mux: OwnedFd,
     ) -> VmExit {

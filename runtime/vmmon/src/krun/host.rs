@@ -215,9 +215,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(target_os = "linux")]
-    use crate::host::{check_host_at, errno_guidance, KvmHostError};
+    use crate::krun::host::{check_host_at, errno_guidance, KvmHostError};
     #[cfg(target_os = "macos")]
-    use crate::host::{validate_hv_support, HvfHostError};
+    use crate::krun::host::{validate_hv_support, HvfHostError};
 
     #[cfg(target_os = "linux")]
     #[test]

@@ -2385,20 +2385,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "krun"
-version = "0.1.0"
-dependencies = [
- "bzip2",
- "kvm-ioctls 0.22.1",
- "libkrun",
- "nix 0.31.3",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tracing",
-]
-
-[[package]]
 name = "krun-arch"
 version = "0.1.0-2.0.0-dev"
 source = "git+https://github.com/vandycknick/libkrun.git?rev=11dbc7863a6ca6176939d48147e67f03d34eeda0#11dbc7863a6ca6176939d48147e67f03d34eeda0"
@@ -5792,14 +5778,16 @@ dependencies = [
  "async-trait",
  "base64 0.23.0",
  "bytes",
+ "bzip2",
  "chrono",
  "clap",
  "eyre",
  "forward-spec",
  "futures",
  "hyper-util",
- "krun",
+ "kvm-ioctls 0.22.1",
  "libc",
+ "libkrun",
  "nix 0.31.3",
  "notify",
  "prost-types",

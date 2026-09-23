@@ -4,7 +4,7 @@ use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 use nix::sys::stat::{fstat, SFlag};
 
-use crate::krun_worker::protocol::invalid;
+use crate::krun::worker::protocol::invalid;
 
 pub(crate) struct Bootstrap {
     pub(crate) request: OwnedFd,
@@ -196,7 +196,7 @@ pub(crate) fn start_watchdog(fd: OwnedFd) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::krun_worker::fds::Bootstrap;
+    use crate::krun::worker::fds::Bootstrap;
     use std::os::fd::AsRawFd;
 
     #[test]

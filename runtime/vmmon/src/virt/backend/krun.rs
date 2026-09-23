@@ -3,6 +3,7 @@ mod inherit;
 mod mux;
 mod owner;
 
+use crate::krun::{Disk as KrunDisk, Mount as KrunMount};
 use crate::virt::backend::{HostMemoryReclaimReport, StartAttempt, VirtBackend};
 use crate::virt::capacity::{VsockLease, VsockListenerAdmission, MAX_ACTIVE_VSOCK_CONNECTIONS};
 use crate::virt::config::{validate_common, DiskImage, NetworkMode, SharedDirectory, VmConfig};
@@ -13,7 +14,6 @@ use crate::virt::stream::{
 };
 use crate::virt::VmExit;
 use async_trait::async_trait;
-use krun::{Disk as KrunDisk, Mount as KrunMount};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
@@ -422,7 +422,9 @@ impl VirtBackend for KrunBackend {
     }
 }
 
-fn host_memory_reclaim_report(status: krun::HostMemoryReclaimStatus) -> HostMemoryReclaimReport {
+fn host_memory_reclaim_report(
+    status: crate::krun::HostMemoryReclaimStatus,
+) -> HostMemoryReclaimReport {
     HostMemoryReclaimReport {
         requested: status.requested,
         qualification: status.qualification.as_str(),
@@ -472,7 +474,7 @@ fn validate(config: &VmConfig) -> Result<(), VirtError> {
         ) {
             (
                 crate::virt::RosettaProfile::CapturedCompatibilityV1,
-                Some(krun::RosettaProfileId::CapturedCompatibilityV1),
+                Some(crate::krun::RosettaProfileId::CapturedCompatibilityV1),
             ) => {}
             _ => {
                 return invalid_config(
@@ -535,7 +537,7 @@ fn build_boot_args(config: &VmConfig) -> Vec<String> {
     args
 }
 
-fn engine_config(config: &VmConfig) -> Result<krun::KrunConfig, VirtError> {
+fn engine_config(config: &VmConfig) -> Result<crate::krun::KrunConfig, VirtError> {
     let cpus = config
         .cpus()
         .and_then(|value| u8::try_from(value).ok())
@@ -544,7 +546,7 @@ fn engine_config(config: &VmConfig) -> Result<krun::KrunConfig, VirtError> {
         .memory_mib()
         .and_then(|value| u32::try_from(value).ok())
         .ok_or_else(|| VirtError::Backend("invalid krun memory size".to_string()))?;
-    Ok(krun::KrunConfig {
+    Ok(crate::krun::KrunConfig {
         id: config.vm_id().to_string(),
         cpus,
         memory_mib,
@@ -562,12 +564,12 @@ fn engine_config(config: &VmConfig) -> Result<krun::KrunConfig, VirtError> {
         vsock_cid: None,
         network: match config.network() {
             NetworkMode::UnixDatagram { peer_path, mac } => {
-                krun::Network::Unixgram(krun::NetUnixgram {
+                crate::krun::Network::Unixgram(crate::krun::NetUnixgram {
                     peer_path: peer_path.clone(),
                     mac: *mac,
                 })
             }
-            NetworkMode::None => krun::Network::None,
+            NetworkMode::None => crate::krun::Network::None,
         },
         stdio_console: true,
         balloon: true,
@@ -812,8 +814,9 @@ mod tests {
         fs::create_dir_all(&root).expect("create test root");
         let kernel = root.join("kernel");
         fs::write(&kernel, b"kernel").expect("write kernel");
-        let prepared = krun::RosettaLaunchConfig::new(root.clone(), [0x11; 32], 1, [0x22; 1024])
-            .expect("prepared Rosetta config");
+        let prepared =
+            crate::krun::RosettaLaunchConfig::new(root.clone(), [0x11; 32], 1, [0x22; 1024])
+                .expect("prepared Rosetta config");
         let config = VmConfig::builder("krun-rosetta")
             .base_directory(&root)
             .cpus(1)

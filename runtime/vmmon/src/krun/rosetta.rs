@@ -233,7 +233,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::rosetta::{
+    use crate::krun::rosetta::{
         RosettaConfigError, RosettaLaunchConfig, RosettaProfileId, DIGEST_LEN, MAX_ENCODED_LEN,
         MAX_HOST_ROOT_LEN, RESPONSE_LEN,
     };

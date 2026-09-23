@@ -2,7 +2,7 @@ use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use crate::{Disk, KrunConfig, Mount, Network};
+use crate::krun::{Disk, KrunConfig, Mount, Network};
 use libkrun::{
     BalloonDevice, BlockDevice, ConsoleDevice, DiskFormat, FsDevice, KernelFormat,
     MmioDeviceManager, NetDevice, NetFlags, Payload, RngDevice, RosettaFsConfig, RosettaFsDevice,
@@ -31,7 +31,7 @@ impl Control {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn host_memory_reclaim(&self) -> crate::HostMemoryReclaimStatus {
+    pub fn host_memory_reclaim(&self) -> crate::krun::HostMemoryReclaimStatus {
         host_memory_reclaim_status(&self.0)
     }
 }
@@ -59,7 +59,7 @@ pub struct ConsoleFds<'a> {
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]
-    InvalidConfig(#[from] crate::KrunBackendError),
+    InvalidConfig(#[from] crate::krun::KrunBackendError),
 
     #[error("post-build worker setup failed: {0}")]
     PostBuild(#[source] io::Error),
@@ -102,7 +102,7 @@ enum DeviceConfig<'a> {
     Console,
     Disk(&'a Disk),
     Mount(&'a Mount),
-    Rosetta(&'a crate::RosettaLaunchConfig),
+    Rosetta(&'a crate::krun::RosettaLaunchConfig),
     VsockMux,
     Vsock(u64),
     Network(&'a Network),
@@ -138,13 +138,13 @@ pub fn run_process(
     resources: Resources<'_>,
     on_built: impl FnOnce(Control) -> io::Result<()>,
 ) -> Result<(), Error> {
-    crate::validate_config(config)?;
+    crate::krun::validate_config(config)?;
     let Resources {
         console: console_fds,
         vsock_mux: mut vsock_mux_fd,
     } = resources;
     if config.vsock_mux != vsock_mux_fd.is_some() {
-        return Err(crate::KrunBackendError::InvalidConfig(
+        return Err(crate::krun::KrunBackendError::InvalidConfig(
             "vsock mux configuration and resource must agree".to_string(),
         )
         .into());
@@ -238,7 +238,7 @@ pub fn run_process(
                         ));
                     }
                     Network::Unixgram(net) => {
-                        let socket = crate::network::open_local_unix_datagram_socket(
+                        let socket = crate::krun::network::open_local_unix_datagram_socket(
                             &net.peer_path,
                             &config.id,
                             "krun",
@@ -308,12 +308,12 @@ pub fn run_process(
 }
 
 #[cfg(target_os = "macos")]
-fn host_memory_reclaim_status(handle: &libkrun::VmmHandle) -> crate::HostMemoryReclaimStatus {
-    use crate::HostMemoryReclaimQualification as Q;
+fn host_memory_reclaim_status(handle: &libkrun::VmmHandle) -> crate::krun::HostMemoryReclaimStatus {
+    use crate::krun::HostMemoryReclaimQualification as Q;
     use libkrun::HostReclaimQualification;
 
     let status = handle.host_reclaim_status();
-    crate::HostMemoryReclaimStatus {
+    crate::krun::HostMemoryReclaimStatus {
         requested: status.requested,
         qualification: match status.qualification {
             HostReclaimQualification::NotRun => Q::NotRun,
@@ -365,9 +365,11 @@ fn device_plan(config: &KrunConfig) -> Vec<DeviceConfig<'_>> {
     devices
 }
 
-fn rosetta_device(config: &crate::RosettaLaunchConfig) -> Result<RosettaFsDevice, Error> {
+fn rosetta_device(config: &crate::krun::RosettaLaunchConfig) -> Result<RosettaFsDevice, Error> {
     let profile = match config.profile() {
-        crate::RosettaProfileId::CapturedCompatibilityV1 => RosettaProfile::CapturedCompatibilityV1,
+        crate::krun::RosettaProfileId::CapturedCompatibilityV1 => {
+            RosettaProfile::CapturedCompatibilityV1
+        }
     };
     let config = RosettaFsConfig::new(
         profile,
@@ -436,19 +438,20 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::{Disk, KrunConfig, Mount, NetUnixstream, Network, RosettaLaunchConfig};
+    use crate::krun::config::NetUnixstream;
+    use crate::krun::{Disk, KrunConfig, Mount, Network, RosettaLaunchConfig};
     use libkrun::{KernelFormat, SyncMode};
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    use crate::engine::rosetta_device;
-    use crate::engine::{
+    use crate::krun::engine::rosetta_device;
+    use crate::krun::engine::{
         device_plan, disk_sync_mode, external_kernel_format, path_str, DeviceConfig, DeviceKind,
         Error, COMPAT_NET_FEATURES,
     };
 
     #[test]
     fn invalid_configuration_never_reaches_payload_or_post_build_setup() {
-        use crate::engine::{run_process, ConsoleFds, Resources};
+        use crate::krun::engine::{run_process, ConsoleFds, Resources};
         use std::os::fd::AsFd;
         let console = std::fs::File::open("/dev/null").expect("console fixture");
         let config = KrunConfig {
@@ -473,7 +476,7 @@ mod tests {
 
     #[test]
     fn mux_configuration_requires_exactly_one_matching_owned_resource() {
-        use crate::engine::{run_process, ConsoleFds, Resources};
+        use crate::krun::engine::{run_process, ConsoleFds, Resources};
         use std::os::fd::AsFd;
         let console = std::fs::File::open("/dev/null").expect("console fixture");
         for enabled in [false, true] {

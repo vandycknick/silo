@@ -98,7 +98,7 @@ pub enum NetworkMode {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KrunOptions {
     /// Per-start compatibility data acquired and released before helper spawn.
-    pub prepared_rosetta: Option<krun::RosettaLaunchConfig>,
+    pub prepared_rosetta: Option<crate::krun::RosettaLaunchConfig>,
 }
 
 /// Backend-specific realization of a machine's transient Rosetta intent.
@@ -318,7 +318,7 @@ impl VmConfigBuilder {
         self
     }
 
-    pub fn prepared_rosetta(mut self, config: krun::RosettaLaunchConfig) -> Self {
+    pub fn prepared_rosetta(mut self, config: crate::krun::RosettaLaunchConfig) -> Self {
         self.config.krun.prepared_rosetta = Some(config);
         self
     }

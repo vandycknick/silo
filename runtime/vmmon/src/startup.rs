@@ -463,7 +463,7 @@ async fn prepare_rosetta(
     asset_directory: Option<&Path>,
     deadline: tokio::time::Instant,
     cancelled: CancellationToken,
-) -> eyre::Result<Option<krun::RosettaLaunchConfig>> {
+) -> eyre::Result<Option<crate::krun::RosettaLaunchConfig>> {
     match intent {
         crate::virt::RosettaIntent::Disabled | crate::virt::RosettaIntent::VzNative => Ok(None),
         crate::virt::RosettaIntent::KrunCaptured { .. } => {
@@ -483,7 +483,7 @@ async fn prepare_rosetta(
     _asset_directory: Option<&Path>,
     _deadline: tokio::time::Instant,
     _cancelled: CancellationToken,
-) -> eyre::Result<Option<krun::RosettaLaunchConfig>> {
+) -> eyre::Result<Option<crate::krun::RosettaLaunchConfig>> {
     if !matches!(intent, crate::virt::RosettaIntent::Disabled) {
         return Err(eyre::eyre!("Rosetta requires an Apple silicon macOS host"));
     }
