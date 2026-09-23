@@ -1,6 +1,6 @@
 # Go SDK native bridge
 
-The Go SDK in `sdk/go` is an idiomatic facade over `libvm`. It does not invoke the CLI, speak directly to `vmmon`, or recreate machine state in Go.
+The Go SDK in `sdk/go` is an idiomatic facade over `libvm`. It does not invoke the CLI, speak directly to `silo-vmmon`, or recreate machine state in Go.
 
 ## Boundary
 
@@ -24,7 +24,7 @@ Every exported C entry point catches ordinary Rust unwinds. Native errors contai
 
 Consumer builds require `CGO_ENABLED=1`. A small cgo shim uses `dlopen`/`dlsym` with an absolute path and local symbol visibility. Development uses `SILO_GO_FFI_PATH`. Release preparation builds, signs where required, hashes, and embeds one bridge for each supported target. The loaded library remains pinned for process lifetime.
 
-Bridge bytes are materialized under `${XDG_CACHE_HOME:-$HOME/.cache}/silo/go-ffi/<version>/<target>/`. This is independent of the explicit six-component Silo runtime installation under the XDG data root. Bridge loading never downloads a runtime.
+Bridge bytes are materialized under `~/.silo/cache/go-ffi/<version>/<target>/` (`$SILO_HOME/cache/go-ffi` when `SILO_HOME` is set). This is independent of the explicit five-component Silo runtime installation under `~/.silo/runtimes`. Bridge loading never downloads a runtime.
 
 ## Cancellation
 

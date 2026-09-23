@@ -96,7 +96,7 @@ virtio queues, virtiofs/FUSE protocol and console/shutdown implementation.
 ## Runtime ownership
 
 libvm forwards only enabled/disabled Rosetta intent and the generic runtime
-asset directory. vmmon resolves the implementation for its selected backend:
+asset directory. silo-vmmon resolves the implementation for its selected backend:
 VZ uses Apple's native share; krun first acquires compatibility data through the
 VZ probe and then supplies the typed response to krun. Probe assets and capture
 profiles do not appear in the libvm launch contract.
@@ -110,31 +110,33 @@ requests are deliberately rejected by the strict reader.
 ## Hardware harness (Apple Silicon macOS)
 
 ```sh
-cargo build --locked -p vmmon --bin silo-rprobe-vz-harness
-codesign -f --entitlements runtime/vmmon/vmmon.entitlements \
+cargo build --locked -p silo-vmmon --bin silo-rprobe-vz-harness
+codesign -f --entitlements virt/vmmon/silo-vmmon.entitlements \
   -s - target/debug/silo-rprobe-vz-harness
 
 target/debug/silo-rprobe-vz-harness --kernel /absolute/path/to/rprobe
 ```
 
-Embedded-kernel runs execute the same acquisition implementation as vmmon.
+Embedded-kernel runs execute the same acquisition implementation as silo-vmmon.
 The harness retains `--initramfs` for explicit external-archive experiments and
 `--cancel-while-starting` for the specialized VZ lifecycle test.
 
-For actual translated execution, also supply `--krun`, `--guest-kernel`,
+For actual translated execution, also supply `--supervisor` (a signed
+`silo-vmmon` executable, which the harness starts as the `silo-krun` worker),
+`--guest-kernel`,
 `--guest-initramfs`, and `--translated-workload`. Those guest assets belong to
 the krun qualification VM, not the probe. Build the current exerciser with
 xtask's `rosetta-exerciser-initramfs` command and this crate's x86-64 fixture.
 The exerciser checks the translated program's stdout and exit status, not just
-successful acquisition. `--cancel-helper-after-spawn` tests helper cleanup.
+successful acquisition. `--cancel-helper-after-spawn` tests worker cleanup.
 
 ## Diagnostics
 
-vmmon reads `RUST_LOG` at launch and writes into its existing trace log:
+silo-vmmon reads `RUST_LOG` at launch and writes into its existing trace log:
 
 ```sh
-RUST_LOG=info,vmmon::rosetta=debug
-RUST_LOG=info,vmmon::rosetta=debug,rosetta_wire=trace
+RUST_LOG=info,silo_vmmon::rosetta=debug
+RUST_LOG=info,silo_vmmon::rosetta=debug,rosetta_wire=trace
 ```
 
 For the standalone harness, use its module target and redirect stderr:
@@ -155,4 +157,4 @@ Use scoped targets to avoid enabling unrelated backend logging.
 Both streams are drained regardless of logging level. Diagnostic retention is
 bounded to 64 KiB, with a 4 KiB excerpt in errors. Cleanup failures retain the
 original acquisition error and available guest diagnostics. Changing the filter
-takes effect on the next vmmon launch, not in an already running process.
+takes effect on the next silo-vmmon launch, not in an already running process.

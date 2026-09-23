@@ -3,7 +3,8 @@
 The optional Silo system daemon runs a persistent Docker Engine inside one
 per-user microVM. Docker and containerd data live on an installation-owned ext4
 disk, separate from the replaceable appliance root disk. The host endpoint is
-`~/.docker/run/silo.sock`.
+`~/.silo/run/docker.sock` (`$SILO_HOME/run/docker.sock` when `SILO_HOME` is
+set).
 
 The Docker socket grants its callers administrative control of the guest and
 read/write access to every configured host share. Treat access to it like
@@ -54,7 +55,7 @@ page cache, and without host reclaim the host can retain backing for pages the
 guest has touched, so a busy engine's host footprint can grow toward `memory`
 while idle.
 
-Memory reclamation is automatic, with no daemon policy knobs. vmmon enables a
+Memory reclamation is automatic, with no daemon policy knobs. silo-vmmon enables a
 balloon; libkrun advertises free-page reporting only when the backend supports
 it and its qualification succeeds. Otherwise the basic balloon remains.
 `HostMemoryRemapper` maintains compatible private RAM mappings independently of
@@ -99,8 +100,9 @@ supported after installation. CPU, memory, and Rosetta changes are applied
 the next time the daemon starts the VM from stopped (`silo daemon down`, then
 `up`). Image changes use the explicit upgrade command.
 
-The Docker context points directly to `~/.docker/run/silo.sock`. Silo does not
-create or modify `~/.docker/run/docker.sock`, including any existing symlink.
+The Docker context points directly to `~/.silo/run/docker.sock`. Silo does not
+create or modify Docker's own sockets (`/var/run/docker.sock`, or a Docker
+Desktop socket under `~/.docker/run`), including any existing symlink.
 
 Silo never removes a foreign file, symlink, socket, Docker context, systemd unit,
 or LaunchAgent. A dead socket is not assumed to be owned merely because it does
@@ -128,7 +130,7 @@ reports those overrides and does not claim that `context use` changed the
 effective endpoint. The endpoint is always usable explicitly:
 
 ```bash
-docker --host unix://$HOME/.docker/run/silo.sock version
+docker --host unix://$HOME/.silo/run/docker.sock version
 docker --context silo info
 ```
 
@@ -149,8 +151,7 @@ not background itself or install a service. Stop it with SIGINT or SIGTERM.
 ## Daemon State
 
 `config.yml` holds user settings. Silo keeps one internal installation record at
-`$XDG_DATA_HOME/silo/daemon/daemon.json` (normally
-`~/.local/share/silo/daemon/daemon.json`). It contains:
+`~/.silo/daemon/daemon.json`. It contains:
 
 - Installation and persistent data-disk identities.
 - The active VM ID, or no ID while initial setup is unfinished.
@@ -206,7 +207,7 @@ is in `daemon logs`.
 ```
 State:      failed (retrying; 3 attempts so far)
 Autostart:  enabled
-Endpoint:   unix:///Users/me/.docker/run/silo.sock
+Endpoint:   unix:///Users/me/.silo/run/docker.sock
 PID:        80954
 Memory:     8 GiB; last idle cache reclaim used bounded cgroup reclaim 12 minutes ago, observed guest cache delta 5.2 GiB
 Updated:    2026-09-11 10:37:29 UTC (12 seconds ago)
@@ -223,7 +224,7 @@ service over vsock, so they need no guest configuration or host keys.
 `daemon status` and `daemon logs` do not initialize libvm or start the engine.
 The live status is corroborated with native service PID, daemon generation, and
 process-start identity rather than trusting an old `ready` file. Logs are
-bounded and rotated under `XDG_STATE_HOME/silo/logs/daemon`.
+bounded and rotated under `~/.silo/logs/daemon`.
 
 If the engine cannot be brought up, for example because the system image is
 not available yet, the daemon stays running: it records the failure in
@@ -237,7 +238,7 @@ pending upgrade or a foreign lock), `up` reports the recorded failure at once
 instead of waiting for the readiness timeout, and stops the native service so
 the service manager does not relaunch it in a loop. The service stays enabled;
 the next `up` or login starts it again. On macOS the process's stdout/stderr
-are captured in `XDG_STATE_HOME/silo/logs/daemon/native.log`, which is where
+are captured in `~/.silo/logs/daemon/native.log`, which is where
 panics and failures that happen before the supervisor publishes a status record
 appear; on Linux use `journalctl --user -u silo-system.service`.
 

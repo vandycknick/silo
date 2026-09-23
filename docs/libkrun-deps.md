@@ -1,8 +1,10 @@
 # Embedded libkrun Dependency
 
-Silo compiles its pinned libkrun fork into `vmmon` through the `krun` engine
-crate. Vmmon executes it only in a separate private worker process, launched
-from the same executable using the `worker` subcommand.
+Silo compiles its pinned libkrun fork directly into `silo-vmmon`; the krun
+backend code lives in `virt/vmmon/src/krun`. silo-vmmon executes libkrun only
+in a separate private worker process: the same executable started with argv[0]
+`silo-krun` and no arguments, configured through a fixed descriptor table (see
+[silo-vmmon architecture](architecture/silo-vmmon.md)).
 There is no standalone krun executable, `libkrun.so`, `libkrun.dylib`, or
 `libkrunfw` sidecar.
 
@@ -13,14 +15,10 @@ The workspace dependency is pinned by full Git commit in the root
 
 ```text
 repository: https://github.com/vandycknick/libkrun.git
-tracked revision: 11dbc7863a6ca6176939d48147e67f03d34eeda0
+tracked revision: bd2d296b71f681761685893f94be3aec0c6537a1
 public branch: silo/v2
-previous tracked revision: 6c26f56863317971cd61a1b7bc51c05470077c65
-previous tip backup: backup/silo-v2-before-four-commit-cleanup-20260917 @ 6c26f56863317971cd61a1b7bc51c05470077c65
-earlier cleanup backup: backup/silo-v2-before-cleanup-20260916-202550 @ b892b1974e34a48b857c4562bc41f2e541b30ea5
-older tip backup: backup/silo-v2-2026-09-15 @ 10b6f752ba8ea735c3d9edaa549599dcf3f98d18
-pre-split backup: backup/silo-v2-before-feature-split-2026-09-15 @ ea84066ff3c8499a4aac5cdd3ec326aee0667e9b
-fetchable: yes
+upstream base: containers/libkrun main @ 85bed715 (2026-09-21)
+previous tracked revision: 11dbc7863a6ca6176939d48147e67f03d34eeda0 (not preserved)
 ```
 
 Release builds must use the committed `Cargo.lock` with `--locked`. A branch
@@ -31,26 +29,26 @@ The tracked revision is published on `silo/v2` and fetchable directly from
 GitHub, with no path override or URL rewrite. The local libkrun worktree at
 `/Users/nickvd/Projects/worktrees/libkrun/v2-cleanup` remains on `silo/v2`.
 
-The downstream series contains four commits above `24d714b5dce8e8dd91afb9e0f64ebf6f3e1e846e`:
+The downstream series contains four commits above upstream `85bed715`:
 
-1. `ac4b8578e4a323723490077fd188492d43f9a7bf`: balloon host reclaim, including
-   page-wise advice, fault recovery, automatic reporting qualification, and an
-   independent `HostMemoryRemapper`. Periodic passes run every 30 seconds;
-   report preparation is throttled to 250 ms. Incompatible providers retain
-   basic balloon functionality. Tests cover real HVF qualification, remapping
-   without a balloon, nested EL2 reporting suppression, and live-data preservation.
-2. `346f2822f7aad1807e7752b5d8f1d7bf45184d0e`: owned native vsock control-channel
-   mux, including quiet expected Unix-vsock teardown. Shutdown accepts `ENOTCONN`
-   while preserving other errors, and routine proxy removals log at debug level.
-   Real-socket tests cover half-close, repeated shutdown, disconnected sockets,
-   and unexpected errors. Unexpected datagram packet errors remain visible.
-3. `d0d0e277f26ac663769c5d6d848cb5fe7dc4e51b`: immutable captured Rosetta compatibility data.
-4. `11dbc7863a6ca6176939d48147e67f03d34eeda0`: direct external initramfs streaming.
+1. `af6d190d`: balloon host reclaim, including page-wise advice, fault
+   recovery, automatic reporting qualification, and an independent
+   `HostMemoryRemapper`. Periodic passes run every 30 seconds; report
+   preparation is throttled to 250 ms. Incompatible providers retain basic
+   balloon functionality. Tests cover real HVF qualification, remapping without
+   a balloon, nested EL2 reporting suppression, and live-data preservation. The
+   HVF reclaim probe uses the IPA size that upstream now selects per VM.
+2. `7750b8d2`: owned native vsock control-channel mux, including quiet expected
+   Unix-vsock teardown. Shutdown accepts `ENOTCONN` while preserving other
+   errors, and routine proxy removals log at debug level. Real-socket tests
+   cover half-close, repeated shutdown, disconnected sockets, and unexpected
+   errors. Unexpected datagram packet errors remain visible.
+3. `194333c9`: immutable captured Rosetta compatibility data.
+4. `bd2d296b`: direct external initramfs streaming.
 
-This history cleanup folds the follow-up balloon and vsock fixes into their
-respective feature commits. The final tree is byte-identical to the previous
-six-commit tip. The original commits remain published on
-`backup/silo-v2-before-four-commit-cleanup-20260917`.
+The rebase onto `85bed715` was a hard break: the previous tip was
+force-replaced and older Silo commits pinned to it may no longer fetch.
+Windows device paths added upstream are not built or adapted by the fork.
 
 The fork reclaims reported guest RAM on macOS as follows.
 Each coalesced report uses `hv_vm_unmap`, one `madvise(MADV_FREE)` call per
@@ -85,7 +83,7 @@ virtio-block stayed near 210 MiB footprint without maintenance and fell to
 62 MiB with it. VM-object accounting stayed near 179 MiB in both cases.
 
 The fork also merges adjacent descriptors of one free-page report into a
-single release cycle and exposes `VmmHandle::host_reclaim_status()`. The krun
+single release cycle and exposes `VmmHandle::host_reclaim_status()`. The silo-krun
 worker samples that every five seconds and writes a `host_memory_reclaim`
 event on its inherited event pipe. The supervisor reads the pipe, stores the
 latest record, and returns it in `GetMetrics`
@@ -112,7 +110,7 @@ net
 ```
 
 `blk` provides the raw virtio-block path used by Silo disks. `net` provides
-the Unix datagram, Unix stream, and Linux TAP networking paths. The helper's
+the Unix datagram, Unix stream, and Linux TAP networking paths. The worker's
 private adapter calls the safe native Rust block, network, and vsock device
 constructors directly. Libkrun's `ffi` and `vhost-user` features are disabled.
 The former Silo-side nix `uio` feature carrier for libkrun's vhost-user graph
@@ -128,8 +126,8 @@ transitive versions on every libkrun update.
 Libkrun's native builder has no implicit console, vsock, balloon, or RNG device
 and no longer injects a default init binary. Silo supplies an explicit kernel
 and optional initramfs, adds its console when requested, always adds RNG and
-balloon devices, and attaches one native vsock device when vmmon supplies the
-inherited control descriptor. TSI and per-port mappings remain disabled.
+balloon devices, and attaches one native vsock device when silo-vmmon supplies
+the inherited control descriptor (fd 7). TSI and per-port mappings remain disabled.
 Consequently, Silo neither builds nor packages `libkrunfw`.
 
 ## Build
@@ -137,29 +135,31 @@ Consequently, Silo neither builds nor packages `libkrunfw`.
 Build the combined supervisor/worker executable with:
 
 ```bash
-make vmmon PROFILE=debug
+make silo-vmmon PROFILE=debug
 ```
 
 For a release build:
 
 ```bash
-make vmmon PROFILE=release
+make silo-vmmon PROFILE=release
 ```
 
-The plain `krun` library does not activate the optional libkrun dependency.
-The `engine` feature links libkrun into vmmon, which executes it only in a separate private worker process.
+libkrun is an unconditional dependency of `silo-vmmon`; there is no feature
+flag that links or omits it. The supervisor never calls into libkrun itself,
+only the `silo-krun` worker does.
 
-On x86-64, `engine` also activates bzip2's `static` feature. Libkrun uses
-bzip2 to load `Image.bz2` kernels, and the helper must not depend on a host
+On x86-64, `silo-vmmon` also enables bzip2's `static` feature. Libkrun uses
+bzip2 to load `Image.bz2` kernels, and the worker must not depend on a host
 `libbz2.so` that is absent from the portable runtime.
 
 On Linux, `ldd` and `readelf -d` must not report `libkrun.so` or `libbz2.so`.
 On macOS,
-`otool -L` must not report `libkrun.dylib`. The macOS helper still uses
+`otool -L` must not report `libkrun.dylib`. The macOS `silo-vmmon` binary still uses
 Hypervisor.framework and must be signed with the
 `com.apple.security.hypervisor` entitlement before distribution, alongside
-`com.apple.security.virtualization` for VZ. The xtask component build invoked
-by `make vmmon` signs and verifies this union automatically.
+`com.apple.security.virtualization` for VZ. The entitlements live in
+`virt/vmmon/silo-vmmon.entitlements`, and the xtask component build invoked by
+`make silo-vmmon` signs and verifies this union automatically.
 
 The macOS krun Rosetta path is experimental. Its current
 `CapturedCompatibilityV1` profile accepts only host build `25G83` and the
@@ -181,12 +181,12 @@ For each upstream update:
 5. Build the fork with default features disabled and `blk,net` enabled.
 6. Update the full Git revision in the root `Cargo.toml`.
 7. Regenerate and commit `Cargo.lock`.
-8. Review the helper adapter against the native Rust API signatures.
+8. Review the krun engine (`virt/vmmon/src/krun/engine.rs`) against the native Rust API signatures.
 9. Run Silo's krun unit, integration, lint, and VM boot tests.
 10. Inspect the final binary for unexpected dynamic dependencies and compare
     its compressed size with the prior release.
 
-The helper uses typed native API variants for disk format, disk synchronization,
+The krun engine uses typed native API variants for disk format, disk synchronization,
 kernel format, and network flags. It retains only the virtio-net feature mask,
 which is a guest protocol compatibility policy rather than a C API mirror.
 

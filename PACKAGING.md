@@ -29,11 +29,15 @@ The current commands do not produce notarized macOS artifacts, release
 signatures, or published releases. Official Linux distribution is archive-only;
 native Linux distribution packages are not planned requirements.
 
-Vmmon contains both the supervisor and the `worker` subcommand. Package vmmon
-and netd alongside the guest assets; krun is linked into vmmon as a library.
-macOS signing must use vmmon's Hypervisor/Virtualization entitlement union. See
-the [worker acceptance matrix](docs/architecture/krun-worker.md#evidence-from-this-refactor)
-before treating a build or inventory check as native release qualification.
+`silo-vmmon` contains both the VM monitor and the libkrun worker: one
+executable that runs as the supervisor by default and as the `silo-krun` worker
+when started with that argv[0]. libkrun is linked into it as a library, so there
+is no separate krun binary. Package `silo-vmmon` (`bin/silo-vmmon`, or
+`Contents/Helpers/silo-vmmon` in `Silo.app`) and `netd` alongside the guest
+assets. macOS signing must use the Hypervisor/Virtualization entitlement union
+in `virt/vmmon/silo-vmmon.entitlements`. See
+[silo-vmmon architecture](docs/architecture/silo-vmmon.md) before treating a
+build or inventory check as native release qualification.
 
 ## Prerequisites
 
@@ -162,7 +166,7 @@ The canonical stage contains exactly the private runtime payload:
 ```text
 target/silo-runtime/<target>/release/
   bin/
-    vmmon
+    silo-vmmon
     netd
   assets/
     kernel-default
@@ -188,7 +192,7 @@ The runtime archive contains:
 ```text
 silo-runtime-<version>-<target>/
   bin/
-    vmmon
+    silo-vmmon
     netd
   assets/
     kernel-default
@@ -205,7 +209,7 @@ The portable CLI archive contains the same files plus `bin/silo`:
 silo-<version>-<target>/
   bin/
     silo
-    vmmon
+    silo-vmmon
     netd
   assets/
     kernel-default
@@ -368,8 +372,9 @@ Existing runtime discovery support for libexec or multilib resolver layouts may
 be adopted as downstream policy. It is compatibility support, not an official
 Linux distribution layout or promise.
 
-Package uninstallers must not delete user-owned XDG state, including runtime
-data, configuration, caches, or logs.
+Package uninstallers must not delete user-owned state: the Silo home
+(`~/.silo`, including installed runtimes, caches, and logs) and the
+configuration directory (`~/.config/silo`).
 
 ## Go Runtime Installer Contract
 
@@ -377,7 +382,7 @@ The Go SDK implements the explicit runtime-only archive installer specified by A
 selects the current supported target and exact SDK version, verifies the release-compiled SHA-256
 digest, rejects path traversal, links, devices, and unexpected files, preserves and validates
 modes and notices, stages into a temporary sibling, and atomically installs a complete runtime
-below the user-owned XDG data root. It supports exact offline archives and mirrors without
+below the user-owned Silo home (`~/.silo/runtimes`). It supports exact offline archives and mirrors without
 allowing callers to replace the expected digest. Installation never occurs at SDK import,
 runtime open, machine creation, or VM start, and it never deletes user-owned state.
 

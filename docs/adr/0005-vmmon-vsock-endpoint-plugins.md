@@ -1,6 +1,8 @@
-# 5. Vmmon Endpoint Plugins for Vsock Streams
+# 5. silo-vmmon Endpoint Plugins for Vsock Streams
 
 Date: 2026-04-12
+
+Updated: 2026-09-24
 
 ## Status
 
@@ -8,11 +10,11 @@ Superseded by [ADR 0015](0015-hybrid-vsock-host-surface.md)
 
 ## Context
 
-`vmmon` already owns per-VM runtime supervision. It reads `config.json`, starts the VM, exposes the monitor control surface, and tracks VM and guest readiness.
+`silo-vmmon` already owns per-VM runtime supervision. It reads `config.json`, starts the VM, exposes the monitor control surface, and tracks VM and guest readiness.
 
-Today, host to guest stream integrations are implemented as built-ins. `vmmon` already connects to guest vsock ports for things like the guest agent and shell access. That works for a small fixed set of features, but it does not scale well for arbitrary host to guest services. Every new service would require more built-in `vmmon` logic, more coupling to host virtualization details, and more monitor-specific code for behavior that does not belong in the core VM supervisor.
+Today, host to guest stream integrations are implemented as built-ins. `silo-vmmon` already connects to guest vsock ports for things like the guest agent and shell access. That works for a small fixed set of features, but it does not scale well for arbitrary host to guest services. Every new service would require more built-in `silo-vmmon` logic, more coupling to host virtualization details, and more monitor-specific code for behavior that does not belong in the core VM supervisor.
 
-Silo needs a generic way for `vmmon` to launch long-running helpers that can consume host to guest byte streams without `vmmon` relaying data in userspace.
+Silo needs a generic way for `silo-vmmon` to launch long-running helpers that can consume host to guest byte streams without `silo-vmmon` relaying data in userspace.
 
 This ADR defines that mechanism as endpoint plugins.
 
@@ -20,7 +22,7 @@ The first implementation target is macOS Virtualization.framework. The plugin co
 
 ## Decision
 
-Silo will add declarative `vsock_endpoints` to `VmSpec` and `vmmon` will supervise vsock endpoint plugins for them.
+Silo will add declarative `vsock_endpoints` to `VmSpec` and `silo-vmmon` will supervise vsock endpoint plugins for them.
 
 Each configured endpoint binds together:
 
@@ -59,7 +61,7 @@ Decision: use `endpoint` in config, runtime state, plugin protocol, and monitor 
 
 ### Plugin contract
 
-Plugins are external processes launched by `vmmon`.
+Plugins are external processes launched by `silo-vmmon`.
 
 The plugin interface is intentionally small:
 
@@ -76,20 +78,20 @@ All stream file descriptors handed to plugins represent connected, full-duplex, 
 
 For `connect` mode:
 
-- `vmmon` creates a Unix `socketpair` control socket,
-- `vmmon` passes one end of that control socket to the plugin as `fd 3`,
+- `silo-vmmon` creates a Unix `socketpair` control socket,
+- `silo-vmmon` passes one end of that control socket to the plugin as `fd 3`,
 - the plugin requests guest streams on demand over the control socket,
-- `vmmon` opens a connected vsock stream to the configured guest port for each request,
-- `vmmon` passes each connected stream back to the plugin over the control socket using `SCM_RIGHTS`.
+- `silo-vmmon` opens a connected vsock stream to the configured guest port for each request,
+- `silo-vmmon` passes each connected stream back to the plugin over the control socket using `SCM_RIGHTS`.
 
 For `listen` mode:
 
-- `vmmon` creates a Unix `socketpair`,
-- `vmmon` passes one end of that control socket to the plugin as `fd 3`,
-- `vmmon` accepts guest-initiated vsock connections,
-- `vmmon` passes each accepted connected stream to the plugin over the control socket using `SCM_RIGHTS`.
+- `silo-vmmon` creates a Unix `socketpair`,
+- `silo-vmmon` passes one end of that control socket to the plugin as `fd 3`,
+- `silo-vmmon` accepts guest-initiated vsock connections,
+- `silo-vmmon` passes each accepted connected stream to the plugin over the control socket using `SCM_RIGHTS`.
 
-This keeps `vmmon` out of the data path while allowing one long-running plugin process to handle multiple guest connections in both modes.
+This keeps `silo-vmmon` out of the data path while allowing one long-running plugin process to handle multiple guest connections in both modes.
 
 ### Diagrams
 
@@ -98,36 +100,36 @@ This keeps `vmmon` out of the data path while allowing one long-running plugin p
 ```mermaid
 sequenceDiagram
   participant libvm as libvm (launcher)
-  participant vmmon as vmmon
+  participant monitor as silo-vmmon
   participant virt as virt
   participant plugin as plugin
 
-  libvm->>vmmon: spawn vmmon (startup-fd pipe)
-  vmmon->>virt: load config.json (VmSpec) and create VM
-  virt-->>vmmon: VM handle
-  vmmon->>virt: start VM
-  vmmon->>vmmon: start control socket + agent monitor
-  vmmon->>vmmon: start endpoint supervisor
+  libvm->>monitor: spawn silo-vmmon (startup-fd pipe)
+  monitor->>virt: load config.json (VmSpec) and create VM
+  virt-->>monitor: VM handle
+  monitor->>virt: start VM
+  monitor->>monitor: start control socket + agent monitor
+  monitor->>monitor: start endpoint supervisor
 
   alt endpoint.mode == "connect"
-    vmmon->>plugin: spawn (fd3 = unix control socket)
-    vmmon->>plugin: stdin startup JSON
-    plugin-->>vmmon: {"event":"ready"} on stdout
+    monitor->>plugin: spawn (fd3 = unix control socket)
+    monitor->>plugin: stdin startup JSON
+    plugin-->>monitor: {"event":"ready"} on stdout
     loop for each Plugin::connect()
-      plugin->>vmmon: control message connect_open
-      vmmon->>virt: connect_vsock(port)
-      virt-->>vmmon: connected stream
-      vmmon->>plugin: sendmsg(SCM_RIGHTS, conn_fd)
+      plugin->>monitor: control message connect_open
+      monitor->>virt: connect_vsock(port)
+      virt-->>monitor: connected stream
+      monitor->>plugin: sendmsg(SCM_RIGHTS, conn_fd)
     end
   else endpoint.mode == "listen"
-    vmmon->>virt: listen_vsock(port)
-    virt-->>vmmon: listener
-    vmmon->>plugin: spawn (fd3 = unix control socket)
-    vmmon->>plugin: stdin startup JSON
-    plugin-->>vmmon: {"event":"ready"} on stdout
+    monitor->>virt: listen_vsock(port)
+    virt-->>monitor: listener
+    monitor->>plugin: spawn (fd3 = unix control socket)
+    monitor->>plugin: stdin startup JSON
+    plugin-->>monitor: {"event":"ready"} on stdout
     loop for each inbound guest connection
-      virt-->>vmmon: accept() => connected stream
-      vmmon->>plugin: sendmsg(SCM_RIGHTS, conn_fd)
+      virt-->>monitor: accept() => connected stream
+      monitor->>plugin: sendmsg(SCM_RIGHTS, conn_fd)
     end
   end
 ```
@@ -161,7 +163,7 @@ Endpoint supervision does not change the existing meaning of instance readiness:
 - `HostStatus.readiness` remains driven by VM and guest readiness as defined by
   [ADR 0008](0008-vmmon-host-and-guest-grpc-api.md).
 
-Endpoint failures are handled by `vmmon` supervision, restart policy, and logs, not by redefining overall instance readiness.
+Endpoint failures are handled by `silo-vmmon` supervision, restart policy, and logs, not by redefining overall instance readiness.
 
 ### Protocol ownership
 
@@ -177,16 +179,16 @@ This ADR does not require every host virtualization driver to expose `listen_vso
 
 ### Positive
 
-- `vmmon` stays generic and does not need service-specific built-ins for every new host to guest integration.
+- `silo-vmmon` stays generic and does not need service-specific built-ins for every new host to guest integration.
 - Plugins can be written against one small API with no driver-specific logic.
-- `vmmon` avoids becoming a per-byte relay in the hot data path.
+- `silo-vmmon` avoids becoming a per-byte relay in the hot data path.
 - One plugin process can serve multiple guest streams in both `connect` and `listen` mode.
 - Plugin startup failures stay isolated from core VM lifecycle readiness.
 
 ### Negative
 
-- `vmmon` gains process supervision logic for plugins.
-- `vmmon` must own fd hygiene, child process setup, restart policy, and stdout protocol parsing.
+- `silo-vmmon` gains process supervision logic for plugins.
+- `silo-vmmon` must own fd hygiene, child process setup, restart policy, and stdout protocol parsing.
 - Plugins must correctly handle raw nonblocking stream fds.
 
 ### Constraints
@@ -222,8 +224,8 @@ vsock_endpoints:
 
 - `name` is the stable identifier used in logs, startup JSON, and runtime status.
 - `port` is the vsock port associated with the endpoint.
-- `mode` defines whether `vmmon` connects or listens.
-- `plugin` describes the executable launched by `vmmon`.
+- `mode` defines whether `silo-vmmon` connects or listens.
+- `plugin` describes the executable launched by `silo-vmmon`.
 - `lifecycle` controls startup timeout and restart behavior.
 
 ### Rust shape
@@ -296,7 +298,7 @@ Existing configs without `vsock_endpoints` remain valid by defaulting to an empt
 
 ### Startup JSON
 
-`vmmon` writes exactly one JSON object to plugin stdin as a single UTF-8 line.
+`silo-vmmon` writes exactly one JSON object to plugin stdin as a single UTF-8 line.
 
 ```json
 {
@@ -339,20 +341,20 @@ No runtime status events are currently part of the plugin stdout protocol.
 For both endpoint modes:
 
 - `fd 3` is a Unix datagram control socket created by `socketpair()`.
-- `vmmon` uses that control socket to exchange fixed-size control messages and optional `SCM_RIGHTS` fd attachments.
+- `silo-vmmon` uses that control socket to exchange fixed-size control messages and optional `SCM_RIGHTS` fd attachments.
 - Each received connection fd is a nonblocking generic byte-stream fd.
 
 #### `mode: connect`
 
 - plugins call `Plugin::connect().await?` to request a new guest stream,
-- `vmmon` responds by opening a new vsock connection to the configured endpoint port,
-- `vmmon` returns that connected stream fd via `SCM_RIGHTS`.
+- `silo-vmmon` responds by opening a new vsock connection to the configured endpoint port,
+- `silo-vmmon` returns that connected stream fd via `SCM_RIGHTS`.
 
 #### `mode: listen`
 
 - plugins call `Plugin::accept().await?` to wait for the next guest-initiated connection,
-- `vmmon` accepts guest-initiated connections on the configured endpoint port,
-- `vmmon` returns each accepted stream fd via `SCM_RIGHTS`.
+- `silo-vmmon` accepts guest-initiated connections on the configured endpoint port,
+- `silo-vmmon` returns each accepted stream fd via `SCM_RIGHTS`.
 
 ### Control protocol
 
@@ -429,4 +431,4 @@ That contract is compatible with the macOS-first implementation and with future 
 
 There is no per-endpoint runtime status schema in `HostStatus`.
 
-`vmmon` owns endpoint supervision internally and treats plugin readiness/failure events as process-supervision inputs. Scripts that need endpoint definitions should read the VM spec, not monitor inspection output.
+`silo-vmmon` owns endpoint supervision internally and treats plugin readiness/failure events as process-supervision inputs. Scripts that need endpoint definitions should read the VM spec, not monitor inspection output.

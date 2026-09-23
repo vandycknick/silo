@@ -2,6 +2,8 @@
 
 Date: 2026-02-23
 
+Updated: 2026-09-24
+
 ## Status
 
 Proposed
@@ -10,7 +12,7 @@ Proposed
 
 Current shell access works through an external OpenSSH process and proxy command:
 
-`silo shell -> host ssh binary -> silo shell-proxy -> vmmon (UDS control) -> VSOCK -> guest socat -> guest sshd`
+`silo shell -> host ssh binary -> silo shell-proxy -> silo-vmmon (UDS control) -> VSOCK -> guest socat -> guest sshd`
 
 This implementation is functional and supports concurrent sessions, but it has architectural and UX drawbacks:
 
@@ -20,7 +22,7 @@ This implementation is functional and supports concurrent sessions, but it has a
 - Limited ability to provide Silo-native shell behavior and features without shelling out.
 - Harder path to unify shell/exec/cp behavior under one in-process client model.
 
-We want `vmmon` to remain the sole VM owner and VSOCK endpoint owner. We also want future per-VM key injection via cloud-init and immediate key-based login.
+We want `silo-vmmon` to remain the sole VM owner and VSOCK endpoint owner. We also want future per-VM key injection via cloud-init and immediate key-based login.
 
 ## Decision
 
@@ -28,19 +30,19 @@ We will replace the external OpenSSH invocation path with an in-process SSH clie
 
 The `silo shell` command will own:
 
-1. transport setup to `vmmon` control socket,
+1. transport setup to `silo-vmmon` control socket,
 2. protocol handshake (`open_vsock`),
 3. SSH handshake and auth over that stream,
 4. PTY shell lifecycle (stdin/stdout relay, resize, teardown).
 
-`vmmon` and guest responsibilities remain unchanged:
+`silo-vmmon` and guest responsibilities remain unchanged:
 
-- `vmmon` owns VM and VSOCK connect.
+- `silo-vmmon` owns VM and VSOCK connect.
 - Guest provides SSH endpoint (currently via `socat` bridge to `sshd`).
 
 ## Target Architecture
 
-`silo shell -> vmmon vm.sock -> open_vsock(2222) -> guest VSOCK bridge -> guest sshd`
+`silo shell -> silo-vmmon vm.sock -> open_vsock(2222) -> guest VSOCK bridge -> guest sshd`
 
 Implementation shape in `silo`:
 
@@ -94,7 +96,7 @@ We considered pure Rust SSH libraries and external OpenSSH wrappers.
 
 ### Phase 1: Native shell MVP
 
-- Add `ssh2` integration and native SSH session over existing `vmmon` transport.
+- Add `ssh2` integration and native SSH session over existing `silo-vmmon` transport.
 - Support interactive shell with `--user` (default `root`).
 - Preserve current failure semantics and improve messages.
 
@@ -113,7 +115,7 @@ We considered pure Rust SSH libraries and external OpenSSH wrappers.
 ### Phase 4: Remove legacy path
 
 - Remove `shell-proxy` command and external `ssh` invocation path.
-- Keep protocol compatibility with `vmmon` control interface.
+- Keep protocol compatibility with `silo-vmmon` control interface.
 
 ## Follow-ups
 

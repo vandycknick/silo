@@ -249,40 +249,51 @@ The Silo runtime layers sit above the host virtualization stack:
 flowchart TD
     CLI[silo]
     LibVm[libvm]
-    Vmmon[vmmon]
-    Virt[virt]
-    BackendDriver[vz / krun]
+    subgraph Monitor[silo-vmmon]
+        Virt[virt facade]
+        Krun[krun driver]
+        Vz[vz driver]
+    end
     HostPlatform[Host virtualization platform]
     Guest[Guest VM]
     Agent[Guest agent]
 
-    CLI --> LibVm --> Vmmon --> Virt --> BackendDriver --> HostPlatform --> Guest
+    CLI --> LibVm --> Virt
+    Virt --> Krun
+    Virt --> Vz
+    Krun --> HostPlatform
+    Vz --> HostPlatform
+    HostPlatform --> Guest
     Agent -. runs inside .-> Guest
 ```
 
+### VM Monitor Process vs VMM
+
+Silo keeps two similar sounding roles apart. The **VM monitor process** is `silo-vmmon`: one supervisor process per running VM, in the same sense as conmon for a container. It owns the VM's lifecycle, control socket, logs, and exit record, but it does not emulate hardware. The **VMM** is the userspace virtualization runtime that actually runs the guest: libkrun on Linux and macOS, or Virtualization.framework on macOS. `silo-vmmon` drives a VMM; it is not one.
+
 ### `virt`
 
-`virt` is Silo's host virtualization facade.
+`virt` is Silo's host virtualization facade, a module inside `silo-vmmon`.
 
-It exposes the common Rust API that `vmmon` uses to create, start, stop, and communicate with a VM. The concrete implementation is selected at compile time by host platform.
+It exposes the common Rust API that `silo-vmmon` uses to create, start, stop, and communicate with a VM. Each machine runs on one backend driver (`krun` or `vz`); the default is selected per host platform.
 
 The exported `VirtualMachine` type is Silo's per-instance VM handle. It is not the guest OS and it is not the underlying VMM implementation. It is the API handle used by Silo code to control one VM.
 
 `virt` is not a hypervisor. It is also not the product-level VM manager.
 
-### `vmmon`
+### `silo-vmmon`
 
-`vmmon` is the VM monitor process.
+`silo-vmmon` is the VM monitor process.
 
 It supervises one running VM, exposes monitor and control APIs, tracks lifecycle state, handles guest readiness, and participates in cleanup and reconciliation.
 
-`vmmon` uses `virt` to start and control the host-selected virtualization implementation. It is Silo's process-level supervisor around one VM, not the guest VM itself.
+`silo-vmmon` uses `virt` to start and control the host-selected virtualization implementation. It is Silo's process-level supervisor around one VM, not the guest VM itself. With the `krun` driver, libkrun runs in a private child process: the same executable started with argv[0] `silo-krun`, so a VMM crash or exit never takes the monitor down with it. See [silo-vmmon architecture](architecture/silo-vmmon.md) and [ADR 0018](adr/0018-silo-vmmon-contract.md).
 
 ### `libvm`
 
 `libvm` is the higher-level VM orchestration library.
 
-It owns product-level lifecycle semantics, persisted state, image handling, launch flow, and interaction with `vmmon`.
+It owns product-level lifecycle semantics, persisted state, image handling, launch flow, and interaction with `silo-vmmon`.
 
 Its role is similar in spirit to how libpod sits above lower-level container runtime pieces.
 
@@ -290,7 +301,7 @@ Its role is similar in spirit to how libpod sits above lower-level container run
 
 The guest agent is software running inside the guest VM.
 
-It is separate from the VMM, `virt`, and `vmmon`. It provides guest-side services such as readiness, shell support, or bootstrap integration.
+It is separate from the VMM, `virt`, and `silo-vmmon`. It provides guest-side services such as readiness, shell support, or bootstrap integration.
 
 ### Host
 

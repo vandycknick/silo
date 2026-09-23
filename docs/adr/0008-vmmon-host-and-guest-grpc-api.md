@@ -1,8 +1,8 @@
-# 8. Vmmon Host and Guest Agent gRPC APIs
+# 8. silo-vmmon Host and Guest Agent gRPC APIs
 
 Date: 2026-07-08
 
-Updated: 2026-07-14
+Updated: 2026-09-24
 
 ## Status
 
@@ -15,11 +15,11 @@ Silo needs to read lifecycle state and metrics, wait for readiness, establish
 SSH and serial sessions, and transfer files without depending on a particular
 VMM backend or on guest networking.
 
-That interface spans two processes. `vmmon` owns the VMM, lifecycle policy,
+That interface spans two processes. `silo-vmmon` owns the VMM, lifecycle policy,
 host-side access, and the host control socket. The guest agent observes the
 guest, reports provisioning and metrics, and performs guest filesystem
 operations. Neither surface is sufficient by itself: local callers use the
-`vmmon` API, while `vmmon` uses the guest agent API.
+`silo-vmmon` API, while `silo-vmmon` uses the guest agent API.
 
 The protocol must support finite requests and long-lived streams without
 inventing separate framing for SSH, serial, file transfer, status updates, or
@@ -30,9 +30,9 @@ state and untrusted guest reports.
 
 Silo uses gRPC with Protocol Buffers for both control surfaces.
 
-- Each `vmmon` serves a host gRPC API on its machine-scoped Unix socket.
+- Each `silo-vmmon` serves a host gRPC API on its machine-scoped Unix socket.
 - The guest agent serves a guest gRPC API on machine-scoped vsock port 1027.
-- `vmmon` initiates all guest API connections. The guest never calls back into
+- `silo-vmmon` initiates all guest API connections. The guest never calls back into
   the host API.
 - Unary, client-streaming, server-streaming, and bidirectional-streaming RPCs
   are used according to the operation's data flow.
@@ -53,7 +53,7 @@ CLI, libvm, or local administrative tool
                   |
                   | gRPC over machine vm.sock (Unix socket)
                   v
-               vmmon ------------------> VMM lifecycle
+               silo-vmmon ------------------> VMM lifecycle
                   |  \
                   |   +----------------> SSH and serial backends
                   |
@@ -93,7 +93,7 @@ The host also serves `grpc.health.v1.Health` and
 
 `GetStatus` and `GetMetrics` read monitor-owned state. A host request never
 synchronously fetches status or metrics from the guest. Filesystem requests are
-validated by `vmmon`, forwarded to the guest service, and independently
+validated by `silo-vmmon`, forwarded to the guest service, and independently
 validated again before a response is exposed to the host caller.
 
 ### Guest Surface
@@ -116,7 +116,7 @@ The guest endpoint admits these Silo services:
 The guest also serves `grpc.health.v1.Health` and
 `grpc.reflection.v1.ServerReflection`.
 
-`vmmon` uses `WatchStatus` and `WatchMetrics` during normal supervision. The
+`silo-vmmon` uses `WatchStatus` and `WatchMetrics` during normal supervision. The
 unary guest methods remain useful for direct diagnostics and independent
 clients, but they do not drive host readiness.
 
@@ -182,9 +182,9 @@ the caller explicit control over that value.
 
 ## One Monitor Per Boot
 
-One `vmmon` invocation owns exactly one VMM instance and one VM boot. It creates
+One `silo-vmmon` invocation owns exactly one VMM instance and one VM boot. It creates
 one random monitor instance ID and one in-memory state store. A terminal VM
-state ends that process; restarting a machine creates a new `vmmon`, monitor
+state ends that process; restarting a machine creates a new `silo-vmmon`, monitor
 identity, state store, control listener, and set of guest streams.
 
 There is no separate in-process VM generation. Host status cannot cross a boot
@@ -203,12 +203,12 @@ line. The guest agent reads that argument and binds its listener before
 long-running provisioning completes, allowing it to publish `starting` while
 boot work continues.
 
-After the VM reaches the VMM's running state, `vmmon` starts independent status
+After the VM reaches the VMM's running state, `silo-vmmon` starts independent status
 and metrics supervisors.
 
 ### Status Stream
 
-`vmmon` opens `WatchStatus` with a five-second heartbeat interval. The guest
+`silo-vmmon` opens `WatchStatus` with a five-second heartbeat interval. The guest
 sends the current status immediately, sends a new message when status changes,
 and repeats the latest status on each heartbeat. The guest retains only the
 latest status, so a slow watcher does not build an unbounded queue of obsolete
@@ -249,7 +249,7 @@ agent version and the guest's claimed boot ID. These values establish an
 untrusted process identity for consistency checks, not authentication.
 
 The first valid status establishes the current identity. If a later status has
-a different instance ID, `vmmon` clears status and metrics from the previous
+a different instance ID, `silo-vmmon` clears status and metrics from the previous
 agent before accepting the replacement. Reusing one instance ID with a
 different version or boot ID is a protocol violation.
 
@@ -258,7 +258,7 @@ before status has established identity. A mismatched metric identity clears the
 retained identity and observations, interrupts the status stream, and requires
 status to establish the replacement before metrics resume.
 
-For every accepted status or metric message, `vmmon` records:
+For every accepted status or metric message, `silo-vmmon` records:
 
 - the host receipt time;
 - the host-computed stale time;
@@ -278,7 +278,7 @@ current state, not event history.
 
 Readiness is monitor policy, not a guest fact and not gRPC channel readiness.
 The VM must first be running according to the VMM. If managed guest services
-are disabled, that condition is sufficient. If they are enabled, `vmmon` also
+are disabled, that condition is sufficient. If they are enabled, `silo-vmmon` also
 requires a fresh guest status whose state is `ready`.
 
 The monitor chooses exactly one readiness reason in this order:
@@ -361,7 +361,7 @@ descriptors admitted on that endpoint.
 ## Guest Filesystem
 
 The same `GuestFilesystemService` contract is implemented by the guest and
-proxied by `vmmon`. This gives callers typed filesystem operations before guest
+proxied by `silo-vmmon`. This gives callers typed filesystem operations before guest
 networking or SSH is available, without exposing arbitrary command execution.
 
 ### Paths
@@ -379,8 +379,8 @@ do not follow the final symlink when identifying the target. Recursive removal
 does not traverse symlinks. Non-UTF-8 directory entry names cannot be represented
 by v1 and produce `UNSUPPORTED_FILENAME`.
 
-`vmmon` validates host requests before connecting to the guest. The guest
-validates the request again before touching the filesystem. For reads, `vmmon`
+`silo-vmmon` validates host requests before connecting to the guest. The guest
+validates the request again before touching the filesystem. For reads, `silo-vmmon`
 also validates returned paths, names, kinds, attributes, ordering, cardinality,
 timestamps, cursors, and dispositions before exposing the result.
 
@@ -451,17 +451,17 @@ Concurrency values and timing are operational policy rather than compatibility
 promises. Size and shape limits that protect cross-version decoding are shared
 by the protocol crate and enforced on both sides.
 
-`vmmon` does not retry a filesystem mutation after delivery becomes ambiguous.
+`silo-vmmon` does not retry a filesystem mutation after delivery becomes ambiguous.
 Callers must treat a deadline or connection loss during a mutating RPC as an
 unknown outcome and inspect the target before deciding whether to retry.
 
 ## SSH And Serial Access
 
 `OpenSsh` and `OpenSerial` are bidirectional streams of `ByteChunk`. They use
-gRPC framing and flow control only; `vmmon` does not parse, authenticate, log,
+gRPC framing and flow control only; `silo-vmmon` does not parse, authenticate, log,
 or modify the relayed SSH or terminal protocol.
 
-Before returning a successful RPC response, `vmmon` acquires stream capacity
+Before returning a successful RPC response, `silo-vmmon` acquires stream capacity
 and opens the backend under a five-second setup deadline. A successful response
 therefore means the requested backend was acquired, not merely that the host
 gRPC method exists.
@@ -478,7 +478,7 @@ SSH has an independent capacity of 32 streams. Serial interactive access is
 exclusive through the serial backend. SSH and serial are available regardless
 of guest readiness; readiness is not an access-control gate.
 
-The host SSH client, not `vmmon`, owns SSH server-key acceptance and continuity.
+The host SSH client, not `silo-vmmon`, owns SSH server-key acceptance and continuity.
 
 ## Errors
 
@@ -506,7 +506,7 @@ The canonical status communicates broad behavior:
 Diagnostic messages are bounded to 4096 UTF-8 bytes. They are not stable
 machine interfaces; callers branch on canonical status and `ErrorCode`.
 
-When proxying filesystem operations, `vmmon` ensures a detail-free guest status
+When proxying filesystem operations, `silo-vmmon` ensures a detail-free guest status
 receives the stable detail implied by its canonical code, then verifies that
 the gRPC status, Silo detail, and retry metadata are mutually consistent.
 Malformed, oversized, unknown, or contradictory guest details become
@@ -522,22 +522,22 @@ gRPC returned `UNAVAILABLE` or `DEADLINE_EXCEEDED`.
 ### Host Caller
 
 The machine directory is mode `0700` before the host socket is bound, and the
-socket is created with mode `0600`. `vmmon` also requires each accepted peer UID
+socket is created with mode `0600`. `silo-vmmon` also requires each accepted peer UID
 to match the socket owner and rejects connections when peer credentials are not
 available. Access is therefore an owner-only, full-administrator capability for
 that VM. The API has no read-only role, per-RPC authorization, configured
 administrator group, or active revocation of an already accepted connection.
 
 The manager supplies a machine-scoped socket path and serializes machine
-lifecycle operations. At startup, `vmmon` tightens the machine directory,
+lifecycle operations. At startup, `silo-vmmon` tightens the machine directory,
 removes the expected stale socket entry, binds the socket, and sets its
-permissions. `vmmon` does not unlink the path during late process exit, avoiding
+permissions. `silo-vmmon` does not unlink the path during late process exit, avoiding
 removal of a successor's listener. Managed path reconciliation remains a
 `libvm` responsibility.
 
 ### Guest Agent
 
-The guest accepts RPC connections only from the host vsock CID. `vmmon` opens
+The guest accepts RPC connections only from the host vsock CID. `silo-vmmon` opens
 those connections through the current `VirtualMachine`, so another host process
 still needs access to that machine object or backend transport.
 
@@ -547,7 +547,7 @@ identity and readiness, return malicious filesystem data, or deliberately
 consume resources. Every guest report and filesystem result is an untrusted
 assertion.
 
-`vmmon` therefore validates guest messages after protobuf decoding, bounds all
+`silo-vmmon` therefore validates guest messages after protobuf decoding, bounds all
 retained text and collections, applies stream silence deadlines, sanitizes
 errors, and keeps lifecycle, status, metrics, filesystem, SSH, and serial in
 separate admission domains.
@@ -586,7 +586,7 @@ refreshes only the idle deadline, never the total deadline.
 Signal-driven shutdown and spontaneous VMM exit converge on the same lifecycle
 state and server cleanup.
 
-On requested shutdown, `vmmon`:
+On requested shutdown, `silo-vmmon`:
 
 1. changes VM state to `STOPPING`, revoking readiness and waking waiters;
 2. marks access, filesystem, and reflection health `NOT_SERVING`;
@@ -654,7 +654,7 @@ runtime state or request content.
 - Guest readiness, telemetry, and filesystem results remain untrusted despite
   being strongly typed.
 - Long-lived watches require reconnect, silence detection, cancellation, and
-  identity-reset logic in `vmmon`.
+  identity-reset logic in `silo-vmmon`.
 - Current status retains no event history and may coalesce rapid transitions.
 - Recursive deletion can partially succeed, and atomic upload visibility does
   not imply crash durability.
@@ -706,7 +706,7 @@ uses internal admission domains for resource isolation.
 
 ### SSH-Backed Filesystem Operations
 
-SFTP or SSH exec would require `vmmon` to terminate SSH, own guest credentials,
+SFTP or SSH exec would require `silo-vmmon` to terminate SSH, own guest credentials,
 choose a guest user, and map less precise errors. It would also violate the
 opaque SSH relay boundary. The guest agent already has direct filesystem access
 and can implement exact typed semantics.
@@ -728,7 +728,7 @@ service with a different lifecycle and resource model.
 
 - Guest root or the guest kernel can impersonate the agent and fabricate every
   guest assertion and filesystem result.
-- Status, metrics, and diagnostics are not retained after `vmmon` exits.
+- Status, metrics, and diagnostics are not retained after `silo-vmmon` exits.
 - A latest-value status watch can coalesce intermediate guest changes.
 - Raw guest and file output may contain hostile control sequences or payloads;
   clients own safe display and storage.
@@ -748,9 +748,9 @@ This ADR does not define:
 - guest-agent authentication against guest root or cryptographic attestation;
 - confidential delivery of data from the host to a guest workload;
 - durable telemetry, event history, audit storage, or a Prometheus adapter;
-- SSH parsing, termination, authentication, or server-key policy in `vmmon`;
+- SSH parsing, termination, authentication, or server-key policy in `silo-vmmon`;
 - sanitization of terminal or file content for client display;
-- in-process VM restart or multiple VM boots in one `vmmon` process;
+- in-process VM restart or multiple VM boots in one `silo-vmmon` process;
 - per-RPC host roles, read-only access, or active revocation;
 - archive extraction, resumable transfer, or filesystem transactions; or
 - automatic application-level retries for mutating RPCs.
@@ -765,15 +765,15 @@ Those concerns require separate decisions and trust models.
 - [Guest filesystem service](../../specs/protocol/proto/filesystem.proto)
 - [Stable Silo error details](../../specs/protocol/proto/errors.proto)
 - [Host gRPC testing with `grpcurl`](../host-grpc-testing.md)
-- `runtime/vmmon/src/services.rs` for host service admission, access streams,
+- `virt/vmmon/src/services.rs` for host service admission, access streams,
   health, and reflection
-- `runtime/vmmon/src/guest.rs` for guest watches, discovery, and reconnects
-- `runtime/vmmon/src/state.rs` for identity, validation, freshness, and
+- `virt/vmmon/src/guest.rs` for guest watches, discovery, and reconnects
+- `virt/vmmon/src/state.rs` for identity, validation, freshness, and
   readiness
-- `runtime/vmmon/src/filesystem.rs` for the host filesystem proxy
+- `virt/vmmon/src/filesystem.rs` for the host filesystem proxy
 - `guest/agent/src/rpc.rs` for guest status, metrics, health, and reflection
 - `guest/agent/src/filesystem.rs` for guest filesystem semantics
-- `runtime/libvm/src/vmmon/client.rs` for the host client
+- `runtime/libvm/src/supervisor/client.rs` for the host client
 
 ## External References
 

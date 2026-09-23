@@ -2,6 +2,8 @@
 
 Date: 2026-08-25
 
+Updated: 2026-09-24
+
 ## Status
 
 Accepted
@@ -9,7 +11,7 @@ Accepted
 Supersedes [ADR 0005](0005-vmmon-vsock-endpoint-plugins.md)
 
 Amended by [ADR 0016](0016-vsock-forwards-and-netd-publications.md): port
-1028 is reserved in both namespaces, `vmmon` binds host listeners for machine-
+1028 is reserved in both namespaces, `silo-vmmon` binds host listeners for machine-
 and session-scoped forwards, and 16 of the 1023 connection slots are reserved for
 internal traffic.
 
@@ -22,10 +24,10 @@ decision without changing the public hybrid-vsock contract.
 
 Silo needs a generic way for host software to exchange byte streams with guest
 services over vsock, in both directions, without baking every integration into
-`vmmon`.
+`silo-vmmon`.
 
 [ADR 0005](0005-vmmon-vsock-endpoint-plugins.md) answered this with endpoint
-plugins: `vmmon` supervised external plugin processes and brokered connected
+plugins: `silo-vmmon` supervised external plugin processes and brokered connected
 stream file descriptors to them over a `SCM_RIGHTS` control socket. That model
 was implemented, and its use revealed structural problems:
 
@@ -40,7 +42,7 @@ was implemented, and its use revealed structural problems:
   deployment question open.
 - On Linux, libkrun's built-in vsock support mapped each port to a Unix socket
   that had to be declared before boot and was owned by the `krun` child process.
-  A `vmmon`-level plugin surface on top of that meant relaying between two
+  A `silo-vmmon`-level plugin surface on top of that meant relaying between two
   Unix sockets per stream and prevented connections to ports that were not
   known at boot.
 
@@ -65,12 +67,12 @@ This ADR replaces the plugin model with that convention.
 | Guest-initiated | A connection dialed by the guest toward a host port on CID 2. |
 | Mux socket | The single Unix socket through which all host-initiated connections enter, using the `CONNECT` command. |
 | Listener socket | A Unix socket at `<uds>_<port>` that receives guest-initiated connections for one host port. |
-| Krun control channel | A private Unix stream socketpair inherited by the `krun` helper. It carries bounded connection-control messages and per-connection descriptors via `SCM_RIGHTS`, never stream payload bytes. |
+| Krun control channel | A private Unix stream socketpair inherited by the `silo-krun` worker. It carries bounded connection-control messages and per-connection descriptors via `SCM_RIGHTS`, never stream payload bytes. |
 | libkrun built-in vsock port-path API | Libkrun's own virtio-vsock backend configured with `krun_add_vsock` and predeclared port-to-Unix-socket mappings through `krun_add_vsock_port2`. |
 
 ## Decision
 
-`vmmon` always attaches a vsock device for its internal SSH and guest-agent
+`silo-vmmon` always attaches a vsock device for its internal SSH and guest-agent
 traffic. When explicitly enabled, it also exposes that device through a
 Firecracker-compatible hybrid Unix-socket surface in the machine runtime
 directory. The public surface uses Firecracker's host-initiated wire protocol
@@ -84,14 +86,14 @@ Core invariants:
   is enabled and the filename of its mux socket. It does not control attachment
   of the internal device and contains no routes, endpoints, or process
   definitions.
-- The device and vmmon's ability to dial guest ports 22 and 1027 exist whether
+- The device and silo-vmmon's ability to dial guest ports 22 and 1027 exist whether
   or not the public surface is enabled. A dial may still be refused when the
   corresponding managed guest service is disabled or not running.
 - Host-initiated connections use one mux socket and the textual
   `CONNECT <port>\n` / `OK <port>\n` handshake for any guest port after boot.
   No guest port is declared before boot.
 - A host process publishes a guest-initiated user port `N` by binding and
-  listening on `<uds>_N`. `vmmon` discovers published listeners through an
+  listening on `<uds>_N`. `silo-vmmon` discovers published listeners through an
   initial directory scan and subsequent directory-change notifications. The
   port becomes reachable after backend registration completes.
 - Guest-initiated destination port 1027 belongs exclusively to Silo and never
@@ -105,7 +107,7 @@ Core invariants:
   of this decision. Both implementations preserve the same observable public
   contract, including reset behavior while a newly published listener awaits
   discovery; discovery latency need not be identical.
-- `vmmon` neither launches nor supervises consumers of this surface. The
+- `silo-vmmon` neither launches nor supervises consumers of this surface. The
   process hosting `libvm` owns extension lifecycles. Whoever controls the guest
   image owns delivery and startup of guest-side services.
 
@@ -114,7 +116,7 @@ Core invariants:
 Host-initiated, guest service on port 8080:
 
 ```text
-host process                     vmmon                        guest
+host process                     silo-vmmon                        guest
     |  connect(<dir>/vsock.sock)   |                            |
     |------------------------------>                            |
     |  "CONNECT 8080\n"            |                            |
@@ -122,13 +124,13 @@ host process                     vmmon                        guest
     |                               |--------------------------->
     |  "OK 1073741824\n"           |         accepted           |
     <------------------------------|                            |
-    |  <== raw byte stream, spliced by vmmon in both ways ==>   |
+    |  <== raw byte stream, spliced by silo-vmmon in both ways ==>   |
 ```
 
 Guest-initiated, host service on port 5000:
 
 ```text
-host process                     vmmon                        guest
+host process                     silo-vmmon                        guest
     | bind/listen(vsock.sock_5000) |                            |
     |                              |                            |
     |      directory change        |                            |
@@ -138,7 +140,7 @@ host process                     vmmon                        guest
     |                              <----------------------------|
     |        accept()              | connect(vsock.sock_5000)   |
     <------------------------------|                            |
-    |  <== raw byte stream, spliced by vmmon in both ways ==>   |
+    |  <== raw byte stream, spliced by silo-vmmon in both ways ==>   |
 ```
 
 A guest connection made before backend registration completes receives a reset.
@@ -174,21 +176,21 @@ pub struct Vsock {
 
 Semantics:
 
-- The virtio-vsock device is always attached because vmmon uses it for internal
+- The virtio-vsock device is always attached because silo-vmmon uses it for internal
   traffic. Omitting `vsock`, or setting `enabled: false`, disables the public
-  mux and user-listener discovery without disabling the device or vmmon's
+  mux and user-listener discovery without disabling the device or silo-vmmon's
   internal connection API.
 - `enabled` defaults to `false`. When it is `true`, `uds` defaults to
   `vsock.sock`. Configuring `uds` while `enabled` is `false` is rejected because
   the path would otherwise be silently ignored.
 - `uds` must contain exactly one normal path
-  component. `vmmon` rejects absolute paths, empty paths, `.` and `..`, and
+  component. `silo-vmmon` rejects absolute paths, empty paths, `.` and `..`, and
   paths containing directory separators. The resolved mux and listener paths
   therefore remain inside the machine runtime directory. The runtime-owned
   names `vm.sock`, `vm.pid`, `vm.lock`, and `krun.vsock` are also rejected.
   `krun.vsock` remains reserved for validator compatibility with existing
   configurations; the current transport does not create that path. At
-  startup, `vmmon` verifies that the resolved mux path and the longest possible
+  startup, `silo-vmmon` verifies that the resolved mux path and the longest possible
   listener path fit the platform's Unix-socket path limit. A failure identifies
   the invalid path and platform limit in the user-facing diagnostic.
 - Listener sockets derive from the mux path by suffixing `_<port>`, where
@@ -211,37 +213,37 @@ Semantics:
 ## Listener Discovery And Registration
 
 The socket filename is the complete registration surface; there is no Silo
-registration API. `vmmon` implements registration as directory reconciliation:
+registration API. `silo-vmmon` implements registration as directory reconciliation:
 
-1. Before starting the VM, `vmmon` opens the machine runtime directory and
+1. Before starting the VM, `silo-vmmon` opens the machine runtime directory and
    attempts to install a directory-change watcher.
-2. Once the backend can accept listener registrations, `vmmon` scans the
+2. Once the backend can accept listener registrations, `silo-vmmon` scans the
    directory and registers every canonical non-reserved listener socket.
 3. Each directory-change notification causes a complete rescan. Notifications
    are invalidation signals, not a lossless event log.
 4. A successfully discovered port remains registered until the machine stops.
    Removal or replacement of its Unix socket does not unregister the backend
    port.
-5. For every guest connection, `vmmon` performs a fresh Unix `connect()` to the
+5. For every guest connection, `silo-vmmon` performs a fresh Unix `connect()` to the
    current `<uds>_<port>` path. A missing, stale, or non-listening socket causes
    that connection to reset.
 
 The watcher is installed before the initial scan so a socket created during VM
-startup cannot be missed. `vmmon` registers the initial listener set as soon as
+startup cannot be missed. `silo-vmmon` registers the initial listener set as soon as
 the backend socket device is available and completes the initial scan before
 reporting VM startup success. On macOS, the guest may already be executing and
 can attempt a connection before registration completes. Guest software must
 treat that reset like any other transiently unavailable host service and retry.
 
 Failure to install or operate the watcher does not terminate the machine.
-`vmmon` continues serving registered ports, logs that dynamic discovery is
+`silo-vmmon` continues serving registered ports, logs that dynamic discovery is
 unavailable, and retries watcher installation. After restoring the watcher, it
 performs a complete rescan before resuming notification-driven reconciliation.
 
-`vmmon` registers at most 1024 non-reserved listener ports per machine. Each
+`silo-vmmon` registers at most 1024 non-reserved listener ports per machine. Each
 scan processes new canonical ports in ascending order until the remaining slots
 are full; an existing registration is never evicted in favor of a lower port.
-`vmmon` logs each ignored port with its path and the limit. Silo port 1027 does
+`silo-vmmon` logs each ignored port with its path and the limit. Silo port 1027 does
 not consume this allowance.
 
 ## Compatibility And Migration
@@ -252,7 +254,7 @@ process supervision and fd delivery that have no equivalent in this surface.
 
 Before upgrading, users must replace an ADR 0005 `vsock` configuration with the
 public-surface section above and arrange extension-process lifecycles outside
-`vmmon`. On the next launch, `vm-spec` rejects removed plugin fields and names
+`silo-vmmon`. On the next launch, `vm-spec` rejects removed plugin fields and names
 each unsupported field in the diagnostic. An upgrade does not rewrite stored
 machine definitions or silently discard endpoint configuration.
 
@@ -260,64 +262,64 @@ machine definitions or silently discard endpoint configuration.
 
 ### Host-Initiated Connections
 
-When the public surface is enabled, `vmmon` owns the mux socket at the resolved
-`uds` path. The machine-runtime owner ensures that only one `vmmon` instance may
-start a machine. After that exclusion is established, `vmmon` removes a stale
+When the public surface is enabled, `silo-vmmon` owns the mux socket at the resolved
+`uds` path. The machine-runtime owner ensures that only one `silo-vmmon` instance may
+start a machine. After that exclusion is established, `silo-vmmon` removes a stale
 socket inode, binds the mux before VM start, sets its mode to `0600`, and removes
 it during shutdown. The lifecycle exclusion remains held until socket cleanup
-completes. `vmmon` never replaces a non-socket entry or follows a symbolic link.
+completes. `silo-vmmon` never replaces a non-socket entry or follows a symbolic link.
 
-`vmmon` accepts mux connections for the lifetime of the machine. Per
+`silo-vmmon` accepts mux connections for the lifetime of the machine. Per
 connection:
 
 1. The client sends `CONNECT <port>\n`, where `<port>` is the decimal vsock
    port and the terminator is one `\n` byte (0x0A). The complete command,
    including the terminator, must fit in 32 bytes.
-2. `vmmon` dials the guest on that port.
-3. On success, `vmmon` replies `OK <hostside_port>\n`, where
+2. `silo-vmmon` dials the guest on that port.
+3. On success, `silo-vmmon` replies `OK <hostside_port>\n`, where
    `<hostside_port>` is the decimal source port assigned to the host end.
    Every byte after that newline in either direction belongs to the stream.
-4. On a malformed or oversized command or a guest refusal, `vmmon` closes the
+4. On a malformed or oversized command or a guest refusal, `silo-vmmon` closes the
    Unix connection without a reply.
 
 The command, acknowledgement, and 32-byte command bound match Firecracker.
-Like Firecracker, `vmmon` does not apply an application-level count or timeout
+Like Firecracker, `silo-vmmon` does not apply an application-level count or timeout
 while an accepted mux client has not yet supplied a complete command. After a
 valid command, connection establishment has Firecracker's two-second request
 timeout.
 
-`vmmon` accepts `CONNECT` for guest port 1027. Reservation of that guest port
+`silo-vmmon` accepts `CONNECT` for guest port 1027. Reservation of that guest port
 governs service allocation, not access control. Silo's host tooling reaches the
 Silo guest service through the same mux as other authorized clients.
 
 ### Guest-Initiated Connections
 
-When the guest dials CID 2 on port `N`, `vmmon` routes the connection in this
+When the guest dials CID 2 on port `N`, `silo-vmmon` routes the connection in this
 order:
 
-1. If `N` is 1027, `vmmon` delivers the connection to the Silo-internal
+1. If `N` is 1027, `silo-vmmon` delivers the connection to the Silo-internal
    service or sends `VIRTIO_VSOCK_OP_RST` when no handler exists. It never
    dials a user socket for that reserved host port.
-2. Otherwise, if `N` has been discovered and registered, `vmmon` dials
+2. Otherwise, if `N` has been discovered and registered, `silo-vmmon` dials
    `<uds>_N`. On success it splices the streams. If the path is absent, stale,
-   or not listening, `vmmon` resets the guest connection.
-3. Otherwise, `vmmon` resets the guest connection. This includes a connection
+   or not listening, `silo-vmmon` resets the guest connection.
+3. Otherwise, `silo-vmmon` resets the guest connection. This includes a connection
    attempted before listener discovery completes.
 
-`vmmon` never creates, removes, or accepts ownership of listener sockets. One
+`silo-vmmon` never creates, removes, or accepts ownership of listener sockets. One
 Unix connection is dialed per guest connection.
 
 ### Resource Limits
 
-Matching Firecracker's single device connection map, `vmmon` permits at most
+Matching Firecracker's single device connection map, `silo-vmmon` permits at most
 1023 active vsock connections per machine. This is one device-wide allowance
 shared by every port, both connection directions, the public surface, and
-vmmon's internal SSH and guest-agent traffic. A connection becomes active after
+silo-vmmon's internal SSH and guest-agent traffic. A connection becomes active after
 a mux client supplies a valid `CONNECT` command or when a guest connection
 request reaches the backend. A raw mux client awaiting its command is not an
 active vsock connection and consumes no slot.
 
-When all 1023 slots are active, `vmmon` closes a newly accepted mux connection
+When all 1023 slots are active, `silo-vmmon` closes a newly accepted mux connection
 without a reply, rejects a valid command that raced with another connection,
 and resets a new guest connection. Closing or failing a connection releases its
 slot. The 1024-port discovery limit is independent of this active-connection
@@ -327,7 +329,7 @@ limit; listener registration does not consume a connection slot.
 
 | Concern | Owner |
 | --- | --- |
-| Internal vsock device, mux socket, listener discovery, backend registration, `_<port>` routing, stream splicing | `vmmon` |
+| Internal vsock device, mux socket, listener discovery, backend registration, `_<port>` routing, stream splicing | `silo-vmmon` |
 | Path accessors for the mux and listener sockets | `libvm` |
 | Lifecycle of host processes that consume the surface | the process hosting `libvm` (CLI, SDK consumer, or user tooling) |
 | Guest-side services, their delivery into the image, and their startup | whoever controls the guest image |
@@ -364,19 +366,20 @@ socat - VSOCK-CONNECT:2:5000
 The `VirtBackend` primitives (`connect_vsock`, `listen_vsock`) remain the
 internal seam. The public mux accept loop, directory reconciliation, per-port
 accept loops, `_<port>` dialing, admission, leases, and stream relays remain
-backend-agnostic `vmmon` code above that seam. Discovery still calls
+backend-agnostic `silo-vmmon` code above that seam. Discovery still calls
 `listen_vsock(N)` once for each new port and retains the registration until
 machine shutdown.
 
 ### Krun: Native Vsock With An Inherited Control Channel
 
 On Linux and macOS, the krun backend attaches one native libkrun `VsockDevice`
-with guest CID 3 and TSI disabled. Before spawning the helper, `vmmon` creates a
-private nonblocking Unix stream socketpair. One endpoint stays in `vmmon`; the
-other is inherited by that specific helper process through a child descriptor
-allowlist and supplied as `--vsock-mux-fd`. The helper validates the descriptor
-as an open Unix stream socket, restores close-on-exec protection, and transfers
-ownership to libkrun's native Rust API.
+with guest CID 3 and TSI disabled. Before spawning the `silo-krun` worker,
+`silo-vmmon` creates a private nonblocking Unix stream socketpair. One endpoint
+stays in `silo-vmmon`; the other is inherited by that specific worker process as
+fixed descriptor 7, present exactly when the worker configuration enables the
+vsock mux ([ADR 0018](0018-silo-vmmon-contract.md)). The worker validates the
+descriptor as an open connected Unix stream socket, restores close-on-exec
+protection, and transfers ownership to libkrun's native Rust API.
 
 The channel is private and inherited. It has no pathname, creates no
 `krun.vsock` directory or `vhost.sock`, and is not the public hybrid mux. The
@@ -391,7 +394,7 @@ bounded command:
 ```text
 Host initiated
 
-vmmon                         krun/libkrun                    guest
+silo-vmmon                         krun/libkrun                    guest
   | CONNECT <port> + fd  -------> |                              |
   |                               | virtio-vsock request -------->|
   |<======= per-connection socketpair ========> accepted stream  |
@@ -400,7 +403,7 @@ vmmon                         krun/libkrun                    guest
 ```text
 Guest initiated
 
-guest                         krun/libkrun                    vmmon
+guest                         krun/libkrun                    silo-vmmon
   |---- virtio-vsock request ---->|                              |
   |                               | CONNECT <id> <dst> <src> + fd|
   |                               |----------------------------->|
@@ -412,14 +415,14 @@ Control lines carry connection intent and admission results only. Stream
 payload bytes flow over the per-connection socketpairs, never over the control
 channel and never through a private filesystem transport path. For
 guest-initiated connections, libkrun does not send the guest a response until
-`vmmon` has applied the existing listener lookup and admission policy. Unknown,
+`silo-vmmon` has applied the existing listener lookup and admission policy. Unknown,
 unavailable, or over-capacity destinations are rejected with the existing reset
 semantics.
 
 The channel uses bounded lines, queues, descriptor counts, request IDs, and
 deadlines. End-of-file or a protocol failure fences that control session,
 cancels pending requests, closes tracked stream endpoints, and releases their
-leases. It does not fabricate a helper exit. A restarted helper receives a new
+leases. It does not fabricate a worker exit. A restarted worker receives a new
 socketpair and session identity, so stale listeners or replies cannot revive an
 old session.
 
@@ -427,15 +430,15 @@ The current and superseded libkrun approaches compare as follows:
 
 | Concern | Native control-channel mux (current) | Embedded vhost-user-vsock (superseded) | Built-in port-path API (not used) |
 | --- | --- | --- | --- |
-| Device owner | libkrun native vsock device | `vmmon` vhost-user backend | libkrun native vsock device |
+| Device owner | libkrun native vsock device | `silo-vmmon` vhost-user backend | libkrun native vsock device |
 | Host control topology | One inherited unnamed socketpair per VM | One pathname-based vhost-user socket per VM | Predeclared pathname mappings per port |
 | Connection dataplane | One unnamed socketpair per connection | Shared guest memory, virtqueues, and eventfds | Configured per-port Unix sockets |
-| Dynamic ports after boot | Both directions | Both directions through `vmmon` | No; mappings are declared before boot |
-| Guest-memory sharing with `vmmon` | None | Required | None |
-| Public registry and admission | Existing `vmmon` registry and limits | Existing `vmmon` registry and limits | Requires an adaptation layer |
+| Dynamic ports after boot | Both directions | Both directions through `silo-vmmon` | No; mappings are declared before boot |
+| Guest-memory sharing with `silo-vmmon` | None | Required | None |
+| Public registry and admission | Existing `silo-vmmon` registry and limits | Existing `silo-vmmon` registry and limits | Requires an adaptation layer |
 
 The native mux avoids vhost-user guest-memory sharing and queue processing in
-`vmmon`, but descriptor passing and the per-connection socketpair still incur
+`silo-vmmon`, but descriptor passing and the per-connection socketpair still incur
 Unix-socket operations and copies. Public connections retain the existing relay
 between that internal stream and the public mux or listener socket. These are
 architectural properties, not benchmark claims; throughput and latency remain
@@ -444,7 +447,7 @@ subject to the Phase 4 runtime qualification.
 ### macOS: Virtualization.framework And Experimental Krun
 
 The default macOS backend remains Virtualization.framework.
-`VZVirtioSocketDeviceConfiguration` is attached for vmmon's internal traffic,
+`VZVirtioSocketDeviceConfiguration` is attached for silo-vmmon's internal traffic,
 `connect_vsock` maps to `VZVirtioSocketDevice.connect(toPort:)`, and
 `listen_vsock(N)` installs a `VZVirtioSocketListener` for that port. The
 directory discovery loop supplies port numbers and may add listeners while the
@@ -462,15 +465,15 @@ for Rosetta, memory reclaim, or the complete macOS workload lifecycle.
   mode `0600`; directory search permission also protects user-created listener
   sockets when their modes are broader. This is consistent with `vm.sock` from
   [ADR 0008](0008-vmmon-host-and-guest-grpc-api.md).
-- For every accepted mux connection, `vmmon` requires platform peer
+- For every accepted mux connection, `silo-vmmon` requires platform peer
   credentials and verifies that the peer UID matches the machine-runtime owner.
-  A missing credential or UID mismatch causes `vmmon` to close the connection
+  A missing credential or UID mismatch causes `silo-vmmon` to close the connection
   before reading a command. Any authorized process can reach every guest port,
   including port 1027. That matches the control-socket authorization model, in
   which the same user controls the machine and its control socket.
-- `vmmon` never exposes vsock on TCP. Bridging a guest port to localhost or
+- `silo-vmmon` never exposes vsock on TCP. Bridging a guest port to localhost or
   beyond is a deliberate act performed by a host process the user runs and
-  owns, outside `vmmon`.
+  owns, outside `silo-vmmon`.
 - The guest is untrusted. Guest-initiated connections reach only the fixed
   `_<port>` path selected by the destination port, or the Silo-internal handler
   on port 1027. The machine-runtime owner is trusted and may replace or redirect
@@ -478,21 +481,21 @@ for Rosetta, memory reclaim, or the complete macOS workload lifecycle.
 
 ## Failure Semantics And Diagnostics
 
-- A malformed or oversized mux command or a guest refusal causes `vmmon` to
+- A malformed or oversized mux command or a guest refusal causes `silo-vmmon` to
   close the mux connection without an `OK` line.
 - A guest dial to an undiscovered, missing, stale, or non-listening user socket
   receives a reset. A guest dial to port 1027 without an internal handler also
   receives a reset.
 - Failure to install or operate the directory watcher logs that dynamic
   listener discovery is unavailable. Existing registrations continue to work.
-  `vmmon` retries installation and performs a complete rescan after recovery.
+  `silo-vmmon` retries installation and performs a complete rescan after recovery.
 - Failure to register a listener found during the initial scan prevents VM
   startup. A runtime registration failure logs the machine, port, path, and
   backend error; later rescans retry it. Guest attempts reset until registration
   succeeds.
 - Reaching a listener-registration or active-connection limit logs the machine,
   rejected port when known, and applicable limit.
-- Either half of a spliced stream reaching EOF or error causes `vmmon` to shut
+- Either half of a spliced stream reaching EOF or error causes `silo-vmmon` to shut
   down the opposite half and release both ends.
 - Vsock activity and discovery progress do not change instance readiness.
   `HostStatus.readiness` remains defined by
@@ -512,17 +515,17 @@ for Rosetta, memory reclaim, or the complete macOS workload lifecycle.
   backend.
 - A guest-initiated listener bound before VM start is included in the initial
   scan. New listeners may also be published while the VM runs.
-- `vmmon` loses process supervision, fd brokering, restart policy, and the
+- `silo-vmmon` loses process supervision, fd brokering, restart policy, and the
   stdout event protocol. `vm-spec` loses six plugin-related types.
 - Both backends expose the same paths, wire format, port policy, limits, and
   failure outcomes despite using different discovery mechanisms internally.
 
 ### Tradeoffs
 
-- `vmmon` relays every vsock byte in userspace. This is inherent to both
+- `silo-vmmon` relays every vsock byte in userspace. This is inherent to both
   backends (Virtualization.framework hands connections to the host process;
-  the krun transport hands vmmon a per-connection Unix stream) and matches the
-  cost `vmmon` already pays for serial and SSH streams.
+  the krun transport hands silo-vmmon a per-connection Unix stream) and matches the
+  cost `silo-vmmon` already pays for serial and SSH streams.
 - The `CONNECT`/`OK` preamble means a byte relay cannot front the mux without
   first sending the command and consuming the acknowledgement line. A
   convenience proxy can be layered later without changing this surface.
@@ -530,7 +533,7 @@ for Rosetta, memory reclaim, or the complete macOS workload lifecycle.
   Virtualization.framework requires per-port registration. A guest that races
   discovery receives a reset and must retry. Linux follows the same public
   failure contract but may discover a listener sooner.
-- `vmmon` must run a platform-specific directory watcher for every machine with
+- `silo-vmmon` must run a platform-specific directory watcher for every machine with
   the public surface enabled. The watcher and monotonic VZ registrations consume
   resources even when no stream is active.
 - Guest-initiated availability is discoverable only through the filesystem.
@@ -544,7 +547,7 @@ for Rosetta, memory reclaim, or the complete macOS workload lifecycle.
 
 ### Keep Endpoint Plugins (ADR 0005)
 
-The plugin model kept `vmmon` out of the data path and isolated integrations
+The plugin model kept `silo-vmmon` out of the data path and isolated integrations
 in supervised child processes. It loses because the contract cost lands on
 every consumer: a per-language client library, fd-passing conventions, an
 opaque stream type incompatible with standard tooling, and an unsolved
@@ -553,7 +556,7 @@ with sockets every language already speaks.
 
 ### Explicit Listener Registration API
 
-An RPC or SDK method could register each guest-initiated port with `vmmon` and
+An RPC or SDK method could register each guest-initiated port with `silo-vmmon` and
 acknowledge exactly when the VZ listener is ready. This would eliminate the
 filesystem discovery race and provide precise errors. It loses because it adds
 a Silo control-plane protocol to an otherwise standard socket convention,
@@ -575,13 +578,13 @@ adding endpoint configuration.
 The original decision rejected a supervised sidecar in favor of an embedded
 vhost-user backend. Both are now superseded by the native control-channel mux.
 A sidecar would add a packaged process and still require shared guest memory
-and a separate adaptation to preserve vmmon's existing dynamic connection and
+and a separate adaptation to preserve silo-vmmon's existing dynamic connection and
 admission contract.
 
 ## Accepted Limitations
 
 - No per-connection or per-port metrics, health, or inventory. Diagnostics are
-  `vmmon` logs.
+  `silo-vmmon` logs.
 - The `_<port>` suffix convention is name-based coupling with no discovery
   mechanism beyond the filesystem.
 - A newly published listener is not reachable until directory reconciliation

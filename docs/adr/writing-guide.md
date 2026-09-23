@@ -313,12 +313,12 @@ Prefer a concrete boundary over a vague abstraction.
 
 Good:
 
-> `vmmon` receives the resolved VM specification. It does not resolve agent
+> `silo-vmmon` receives the resolved VM specification. It does not resolve agent
 > assets, serialize `AgentConfig`, or write CPIO entries.
 
 Bad:
 
-> `vmmon` remains appropriately decoupled from boot concerns.
+> `silo-vmmon` remains appropriately decoupled from boot concerns.
 
 ### Rhythm And Paragraphs
 

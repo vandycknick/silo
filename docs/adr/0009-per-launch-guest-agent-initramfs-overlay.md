@@ -2,6 +2,8 @@
 
 Date: 2026-07-11
 
+Updated: 2026-09-24
+
 ## Status
 
 Accepted
@@ -65,7 +67,7 @@ Consider one managed VM start.
    file, appends a launch-specific archive containing the agent and that exact
    JSON, closes it, and atomically renames it into the managed machine path.
    It writes the resulting path into the generated launch specification and
-   starts `vmmon` only once every generated input is complete.
+   starts `silo-vmmon` only once every generated input is complete.
 4. Linux expands the base and appended archive members into the same early root.
    The base supplies `/init`; the appended member supplies `/agent/silo-agent`
    and `/agent/config.json`.
@@ -152,6 +154,12 @@ filenames are `kernel-default`, `initramfs`, and `agent`. Each asset resolves
 independently and may come from a different directory. A relative
 `SILO_ASSET_DIR` is invalid.
 
+> Superseded by [ADR 0012](0012-cross-platform-runtime-and-sdk-packaging.md):
+> omitted defaults now resolve as one asset set from the resolved runtime
+> installation or an explicit `SILO_ASSET_DIR`, and the two fixed directories
+> above are no longer searched. The paragraph above is kept as the historical
+> record.
+
 Only explicit machine overrides are durable. Default paths are resolved for
 each start and are not written back to machine configuration. The Silo
 installation owns placing defaults in a system or user asset directory; `libvm`
@@ -195,7 +203,7 @@ While holding the machine lifecycle boundary, `libvm`:
 4. Serializes the typed configuration to JSON.
 5. Creates the composite initramfs at a managed machine path.
 6. Writes the generated launch specification with the composite path.
-7. Starts `vmmon` only after every generated launch input is complete.
+7. Starts `silo-vmmon` only after every generated launch input is complete.
 
 The persisted `MachineConfig` retains only explicit kernel, base-initramfs, and
 custom or disabled agent choices. Agent selection is not part of `VmSpec`.
@@ -212,7 +220,7 @@ base and overlay bytes are written and the temporary file closes successfully,
 `libvm` atomically renames it over the prior derived artifact. Failed writes
 leave no partially updated launch artifact.
 
-`vmmon` receives only the generated VM specification and resolved base or
+`silo-vmmon` receives only the generated VM specification and resolved base or
 composite initramfs path. It does not resolve the agent, parse `AgentConfig`,
 write CPIO entries, or serve boot configuration. Whether post-boot guest-agent
 services are expected is launch policy owned by ADR 0008, not a `VmSpec`
@@ -347,7 +355,7 @@ Unit and integration tests cover:
 - Disabled launches without an overlay or agent readiness requirement.
 - Custom-agent composition.
 - Explicit custom-initramfs composition.
-- Launch failure before `vmmon` starts when generation fails.
+- Launch failure before `silo-vmmon` starts when generation fails.
 - Copying both payloads into the early `/run` mount.
 - Rescue behavior for each missing, invalid, and failed-copy payload.
 - Agent configuration parsing and validation when invoked with
@@ -374,7 +382,7 @@ added; it does not weaken the archive or guest preparation contract.
 - Agent configuration delivery does not depend on guest networking or a host
   configuration service.
 - The base is never unpacked or recompressed during normal launch.
-- `vmmon` remains focused on supervision and post-boot control surfaces.
+- `silo-vmmon` remains focused on supervision and post-boot control surfaces.
 - An explicit configuration argument makes tests and alternate launch modes
   straightforward.
 - Machine-specific configuration never modifies the guest root disk.

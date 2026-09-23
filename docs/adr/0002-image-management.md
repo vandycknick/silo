@@ -2,6 +2,8 @@
 
 Date: 2026-02-20
 
+Updated: 2026-09-24
+
 ## Status
 
 Abandoned
@@ -26,10 +28,11 @@ long-lived OCI blob cache in V1.
 
 ### Local image store
 
-Silo stores normalized images under `Directory::with_prefix("images").get_data_home()`:
+Silo stores normalized images below the Silo home defined by
+[ADR 0017](0017-single-host-state-root.md):
 
-- `$XDG_DATA_HOME/silo/images`, else
-- `~/.local/share/silo/images`
+- `$SILO_HOME/images`, else
+- `~/.silo/images`
 
 Store layout:
 

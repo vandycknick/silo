@@ -195,8 +195,8 @@ The shell is OpenSSH-backed, not native-agent-backed.
 SSH public-key authentication failed
 ```
 
-Current builds obtain `AgentConfig` from `vmmon` metadata. Confirm the VM booted
-with the rebuilt initramfs and inspect `vmmon` and agent logs for metadata
+Current builds obtain `AgentConfig` from `silo-vmmon` metadata. Confirm the VM booted
+with the rebuilt initramfs and inspect `silo-vmmon` and agent logs for metadata
 retrieval, decoding, or schema failures. `/run/agent/config.json` is not
 expected in the current implementation.
 

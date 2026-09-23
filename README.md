@@ -18,9 +18,12 @@ The short version:
 
 Only network policies are implemented today. Kernel and userspace policies are the direction.
 
-Vmmon supervises a separate libkrun worker launched from the same executable.
-There is no standalone krun runtime binary. See the [worker architecture and
-qualification notes](docs/architecture/krun-worker.md).
+Each running VM is supervised by one `silo-vmmon` process, Silo's VM monitor.
+With the default krun backend, libkrun runs in a private worker: the same
+`silo-vmmon` executable started with argv[0] `silo-krun`. There is no standalone
+krun runtime binary. Runtime packages ship it as `bin/silo-vmmon` (or
+`Contents/Helpers/silo-vmmon` in `Silo.app`). See the
+[silo-vmmon architecture and qualification notes](docs/architecture/silo-vmmon.md).
 
 ## CLI
 
@@ -113,7 +116,7 @@ silo rm dev
 
 Silo can run an optional per-user Docker Engine in a persistent system VM. Its
 engine data survives daemon and appliance replacement, while the host uses the
-dedicated `silo` Docker context and `~/.docker/run/silo.sock` endpoint. This is
+dedicated `silo` Docker context and `~/.silo/run/docker.sock` endpoint. This is
 separate from ordinary Silo VMs and does not require or replace a host Docker
 Engine.
 

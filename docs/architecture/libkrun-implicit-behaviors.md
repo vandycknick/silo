@@ -1,17 +1,17 @@
 # libkrun Implicit Behaviors
 
-Silo executes libkrun in a private worker launched as `vmmon worker` from its own executable. The `virt/krun` crate constructs the VM explicitly; it does not launch processes. At the pinned native Rust API revision, `VmmBuilder` starts without implicit console, vsock, balloon, or RNG devices and does not inject a default init binary. Silo adds every required device explicitly.
+Silo executes libkrun in a private worker: the `silo-vmmon` executable started with argv[0] `silo-krun` and a fixed descriptor table (see [silo-vmmon architecture](silo-vmmon.md)). The krun engine in `virt/vmmon/src/krun` constructs the VM explicitly from one typed `KrunConfig`; it does not launch processes. At the pinned native Rust API revision, `VmmBuilder` starts without implicit console, vsock, balloon, or RNG devices and does not inject a default init binary. Silo adds every required device explicitly.
 
 ## Runtime Defaults
 
-Every helper-created VMM does the following:
+Every worker-created VMM does the following:
 
 1. Set the VM CPU and memory configuration.
 2. Set the explicit kernel, optional initramfs, and kernel command line.
 3. Add console, disks, mounts, the native vsock control-channel device, and networking when configured, in that deterministic order.
 4. Add explicit RNG and balloon devices. Host memory release remains disabled unless the separate reclaim policy and startup qualification enable it.
 
-The helper does not use the compatibility C API. If a console is needed, it builds `ConsoleDevice::builder().add_default_console(...)` with borrowed stdio descriptors and selects `hvc0` on `VmmBuilder`. On Linux and macOS, vmmon passes one inherited Unix stream descriptor to the helper, which constructs a native `VsockDevice` with CID 3 and empty TSI flags, then gives the descriptor to libkrun's control-channel mux. Per-connection descriptors cross that private channel with `SCM_RIGHTS`; stream payloads do not. The helper configures no per-port mappings and the transport binds no filesystem path.
+The worker does not use the compatibility C API. If a console is needed, it builds `ConsoleDevice::builder().add_default_console(...)` with borrowed stdio descriptors and selects `hvc0` on `VmmBuilder`. On Linux and macOS, when `KrunConfig.vsock_mux` is set, silo-vmmon passes one connected Unix stream descriptor to the worker as fd 7, and the worker constructs a native `VsockDevice` with CID 3 and empty TSI flags, then gives the descriptor to libkrun's control-channel mux. Per-connection descriptors cross that private channel with `SCM_RIGHTS`; stream payloads do not. The worker configures no per-port mappings and the transport binds no filesystem path.
 
 The historical `krun_set_port_map()` API is intentionally not part of Silo's startup path. It controls TSI stream remapping, not explicit virtio-net backends or Silo's native control-channel vsock device.
 
@@ -19,7 +19,7 @@ The historical `krun_set_port_map()` API is intentionally not part of Silo's sta
 
 | Behavior | Trigger | Default libkrun behavior | Silo behavior | Platform notes |
 | --- | --- | --- | --- | --- |
-| Console device | Add `ConsoleDevice` | No console device | Added only for `--stdio-console`, then selected as `hvc0` | Applies on Linux and macOS |
+| Console device | Add `ConsoleDevice` | No console device | Added only when `KrunConfig.stdio_console` is set, then selected as `hvc0` | Applies on Linux and macOS |
 | Init binary | Select a payload | No injected init binary | Silo loads an external kernel and optional initramfs | Applies on Linux and macOS |
 | Vsock device | Add `VsockDevice` | No vsock device | Native CID 3 device with TSI disabled and an inherited control-channel fd | Same default krun implementation on Linux and macOS; VZ is an explicit macOS override |
 | RNG device | Add `RngDevice` | No RNG device | Always added explicitly | Applies on Linux and macOS |
@@ -27,19 +27,19 @@ The historical `krun_set_port_map()` API is intentionally not part of Silo's sta
 | TSI networking | Enable TSI flags on libkrun's built-in vsock device | No TSI fallback | Not used; the native vsock device has empty TSI flags and configured hosts may add explicit virtio-net | Applies on Linux and macOS |
 | TSI port remapping | Use TSI stream listens through libkrun's vsock path | May rewrite guest listen ports according to a libkrun port map | Not used; TSI is disabled and explicit virtio-net backends do not consume this map | Applies only to libkrun's vsock/TSI stream path |
 | Exec-mode environment | Use the compatibility C exec APIs | Not exposed by the native `VmmBuilder` API | Not used; Silo direct-boots its kernel and initramfs | Applies on Linux and macOS |
-| Unixgram networking | Add `NetDevice::new_unixgram_fd()` | No network device | Available via `--network unixgram` with `--net-peer` and `--net-mac` | Current Silo gvproxy path; the fd is owned by libkrun |
-| Unixstream networking | Add `NetDevice::new_unixstream_path()` | No network device | Available via `--network unixstream` with `--net-peer` and `--net-mac` | Suitable for passt/socket_vmnet-style peers |
-| TAP networking | Add `NetDevice::new_tap()` | No network device | Available via `--network tap` with `--net-tap-name` and `--net-mac` | Linux only |
+| Unixgram networking | Add `NetDevice::new_unixgram_fd()` | No network device | Available via `Network::Unixgram { peer_path, mac }` | Current Silo netd path; the fd is owned by libkrun |
+| Unixstream networking | Add `NetDevice::new_unixstream_path()` | No network device | Available via `Network::Unixstream { peer_path, mac }` | Suitable for passt/socket_vmnet-style peers |
+| TAP networking | Add `NetDevice::new_tap()` | No network device | Available via `Network::Tap { name, mac }` | Linux only |
 
 ## Networking Modes
 
-`--network none` means no guest network device. It is the default and must not fall back to TSI.
+`Network::None` means no guest network device. It is the default and must not fall back to TSI.
 
-`--network unixgram` connects a virtio-net device to a datagram Unix socket peer. The helper creates its local datagram socket next to the peer and passes the connected fd to libkrun.
+`Network::Unixgram` connects a virtio-net device to a datagram Unix socket peer. The worker creates its local datagram socket (`<id12>-krun.sock`) next to the peer and passes the connected fd to libkrun.
 
-`--network unixstream` connects a virtio-net device to a stream Unix socket path. The helper passes the path directly to libkrun.
+`Network::Unixstream` connects a virtio-net device to a stream Unix socket path. The worker passes the path directly to libkrun.
 
-`--network tap` connects a virtio-net device to an existing TAP interface by name. Validation rejects this mode on non-Linux hosts.
+`Network::Tap` connects a virtio-net device to an existing TAP interface by name. Validation rejects this mode on non-Linux hosts.
 
 ## Historical Port Map Evidence
 
@@ -56,4 +56,4 @@ Source references for the historical v1 behavior:
 
 ## Parent Liveness
 
-The supervisor passes the worker a watchdog pipe read fd through `--watchdog-fd` and holds the write fd for the VM lifetime. If the parent dies, the write fd closes, the helper observes `POLLHUP`, and exits. This avoids orphaned helper processes without relying on Linux-only `PR_SET_PDEATHSIG`.
+The supervisor hands the worker the read end of a watchdog FIFO as fd 5 and holds the write end for the VM lifetime. If the supervisor dies, the write end closes, the worker observes `POLLHUP`, and calls `_exit(125)` without running destructors. This avoids orphaned worker processes without relying on Linux-only `PR_SET_PDEATHSIG`.

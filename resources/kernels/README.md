@@ -159,6 +159,22 @@ required; building a bare rprobe kernel is rejected.
 The generated `.config` contains thousands of transitive dependencies and
 Kconfig defaults. It is an artifact, not a maintained source file.
 
+## Workload Patches
+
+Workload kernels apply the ordered patches in `patches/<architecture>/` to the
+pristine upstream source with `patch --fuzz=0 -p1`. The patch set is part of the
+kernel identity (`inputs.patchSet` in the OCI config), so adding, changing, or
+removing a patch produces a distinct canonical artifact. Probe kernels apply no patches. See
+[Kernel Build Artifacts](artifacts.md#source-patches) for the full contract.
+
+Today the only patch is `patches/x86_64/0001-x86-krun-i8042-poweroff.patch`.
+The x86_64 workload kernel has neither ACPI nor an i8042 driver, so a guest
+`poweroff` would otherwise halt forever. With `krun.poweroff=i8042` on the
+kernel command line, the patch registers a lowest-priority poweroff handler that
+writes `0xfe` to port `0x64`, which libkrun's i8042 device turns into a terminal
+VMM exit. The krun backend adds that argument on x86_64 only; aarch64 guests
+power off through PSCI and carry no patch.
+
 ## Editing Rules
 
 - Put each symbol in exactly one maintained config.
