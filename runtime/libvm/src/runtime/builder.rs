@@ -14,7 +14,7 @@ use crate::LibVmError;
 ///
 /// # async fn example() -> Result<(), libvm::LibVmError> {
 /// let runtime = Runtime::builder()
-///     .data_root("/var/lib/silo")
+///     .home("/var/lib/silo")
 ///     .networking(
 ///         RuntimeNetworkingConfig::new()
 ///             .with_netd(NetdRuntimeConfig::new().with_pcap(true)),
@@ -31,32 +31,14 @@ pub struct RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
-    /// Creates a runtime builder using environment/default roots.
+    /// Creates a runtime builder using the environment's Silo home.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Sets the persistent data root.
-    pub fn data_root(mut self, data_root: impl Into<PathBuf>) -> Self {
-        self.config.data_root = crate::runtime::PathChoice::Explicit(data_root.into());
-        self
-    }
-
-    /// Sets the host-runtime root.
-    pub fn run_root(mut self, run_root: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_run_root(run_root);
-        self
-    }
-
-    /// Sets the durable operational state root.
-    pub fn state_root(mut self, state_root: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_state_root(state_root);
-        self
-    }
-
-    /// Sets the image root.
-    pub fn image_root(mut self, image_root: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_image_root(image_root);
+    /// Sets the Silo home holding all persistent state.
+    pub fn home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.config.home = Some(home.into());
         self
     }
 

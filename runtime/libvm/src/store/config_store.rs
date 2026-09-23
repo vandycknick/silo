@@ -10,10 +10,6 @@ const DB_CONFIG_ID: i64 = 1;
 
 #[async_trait]
 impl ConfigStore for Store {
-    async fn db_config(&self) -> Result<Option<DbConfig>, LibVmError> {
-        self.read_single_db_config().await
-    }
-
     async fn read_or_seed_db_config(&self, seed: &DbConfig) -> Result<DbConfig, LibVmError> {
         if let Some(config) = self.read_single_db_config().await? {
             return Ok(config);
@@ -31,19 +27,21 @@ impl ConfigStore for Store {
 }
 
 impl Store {
+    #[cfg(test)]
+    pub(crate) async fn db_config(&self) -> Result<Option<DbConfig>, LibVmError> {
+        self.read_single_db_config().await
+    }
+
     async fn insert_db_config(&self, seed: &DbConfig) -> Result<(), LibVmError> {
         let now = now_unix();
         sqlx::query(
             "INSERT INTO db_config
-                (id, os, data_root, state_root, image_root, created_at, modified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                (id, os, created_at, modified_at)
+             VALUES (?1, ?2, ?3, ?3)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(DB_CONFIG_ID)
         .bind(&seed.os)
-        .bind(&seed.data_root)
-        .bind(&seed.state_root)
-        .bind(&seed.image_root)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -51,20 +49,14 @@ impl Store {
     }
 
     async fn read_db_configs(&self) -> Result<Vec<DbConfig>, LibVmError> {
-        let rows = sqlx::query(
-            "SELECT os, data_root, state_root, image_root
-             FROM db_config",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query("SELECT os FROM db_config")
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.into_iter()
             .map(|row| {
                 Ok(DbConfig {
                     os: row.try_get("os")?,
-                    data_root: row.try_get("data_root")?,
-                    state_root: row.try_get("state_root")?,
-                    image_root: row.try_get("image_root")?,
                 })
             })
             .collect()

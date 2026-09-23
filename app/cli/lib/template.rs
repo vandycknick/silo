@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use eyre::{bail, Context as _};
 use serde::{Deserialize, Serialize};
 
-use crate::config::resolve_default_config_dir;
 use crate::machine_defaults::{
     validate_machine_defaults, MachineMount, MachineNetwork, MachineResources,
 };
@@ -62,7 +61,9 @@ pub(crate) struct TemplateStore {
 
 impl TemplateStore {
     pub(crate) fn from_env() -> eyre::Result<Self> {
-        Ok(Self::from_config_root(resolve_default_config_dir()?))
+        Ok(Self::from_config_root(
+            libvm::HostPaths::from_env()?.config_dir(),
+        ))
     }
 
     pub(crate) fn from_config_root(config_root: impl Into<PathBuf>) -> Self {

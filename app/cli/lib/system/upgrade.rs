@@ -90,9 +90,7 @@ pub(crate) async fn upgrade(
     crate::system::provision::validate_installation(&state, &config)?;
     let old_id = state.machine_id()?.to_string();
     let networking = state.service.global_config()?.networking;
-    let runtime = state
-        .service
-        .runtime_config(&paths.run_root, &config, networking);
+    let runtime = state.service.runtime_config(&config, networking);
     let mut api = AppApi::local(runtime);
     let old_machine = api.inspect_machine(&old_id).await?;
     crate::system::provision::validate_machine(&old_machine, &state, &paths.data_image())?;
@@ -203,10 +201,9 @@ pub(crate) async fn recover(paths: &SystemPaths) -> eyre::Result<()> {
         .ok_or_else(|| eyre::eyre!("there is no recorded system image upgrade to recover"))?;
     record.validate(&state)?;
     let networking = state.service.global_config()?.networking;
-    let runtime =
-        state
-            .service
-            .runtime_config(&paths.run_root, &record.previous_config, networking);
+    let runtime = state
+        .service
+        .runtime_config(&record.previous_config, networking);
     let mut api = AppApi::local(runtime);
     crate::system::service::stop_locked(&state)?;
     let lifetime = acquire_lifetime(paths, Duration::from_secs(90))?;

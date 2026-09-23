@@ -327,12 +327,9 @@ async fn run_service(path: std::path::PathBuf) -> eyre::Result<()> {
             "state executable identity does not match this process"
         ));
     }
-    let run_root = crate::system::ownership::default_system_paths()?.run_root;
-    let paths = state.service.paths(run_root);
+    let paths = state.service.paths();
     let networking = state.service.global_config()?.networking;
-    let runtime = state
-        .service
-        .runtime_config(&paths.run_root, &state.config, networking);
+    let runtime = state.service.runtime_config(&state.config, networking);
     let mut api = crate::api::AppApi::local(runtime);
     crate::system::supervisor::serve(&mut api, paths, state.config).await
 }

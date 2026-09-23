@@ -12,9 +12,7 @@ export interface NativeBindings {
 }
 
 export interface NativeRuntimeOpenOptions {
-  dataRoot?: string;
-  runRoot?: string;
-  imageRoot?: string;
+  home?: string;
   vmmonPath?: string;
 }
 

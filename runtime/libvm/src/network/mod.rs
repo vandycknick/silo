@@ -540,12 +540,7 @@ mod tests {
         let data_root = temp.path().join("data");
         let current_run_root = temp.path().join("run-current");
         let old_run_root = temp.path().join("run-old");
-        let paths = LocalPaths::from_roots(LocalRoots::with_roots(
-            &data_root,
-            &data_root,
-            &current_run_root,
-            data_root.join("images"),
-        ));
+        let paths = LocalPaths::from_roots(LocalRoots::with_roots(&data_root, &current_run_root));
         let store = Store::new(&paths).await.expect("open fresh database");
         let machine_id = MachineId::new();
         let metadata = machine_config(

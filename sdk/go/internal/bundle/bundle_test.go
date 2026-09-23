@@ -73,14 +73,18 @@ func TestMaterializedBridgeDigest(t *testing.T) {
 	}
 }
 
-func TestCacheRootUsesXDGOnEveryPlatform(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", root)
+func TestCacheRootLivesInTheSiloHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SILO_HOME", home)
 	got, err := cacheRoot()
 	if err != nil {
 		t.Fatalf("cacheRoot() failed: %v", err)
 	}
-	if got != root {
-		t.Fatalf("cacheRoot() = %q, want %q", got, root)
+	if want := filepath.Join(home, "cache"); got != want {
+		t.Fatalf("cacheRoot() = %q, want %q", got, want)
+	}
+	t.Setenv("SILO_HOME", "relative")
+	if _, err := cacheRoot(); err == nil {
+		t.Fatal("cacheRoot() accepted a relative SILO_HOME")
 	}
 }

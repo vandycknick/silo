@@ -319,15 +319,11 @@ mod tests {
         let home = tempfile::tempdir().expect("home");
         let config: SystemConfig =
             serde_yaml_ng::from_str("version: '1'\nsystem: {}\n").expect("config");
-        let resolved = config.resolve(home.path(), None).expect("resolve");
+        let resolved = config
+            .resolve(home.path(), home.path(), None)
+            .expect("resolve");
         let root = home.path().to_path_buf();
-        let paths = crate::system::record::SystemPaths::new(
-            root.clone(),
-            root.clone(),
-            root.clone(),
-            root.clone(),
-            root,
-        );
+        let paths = crate::system::record::SystemPaths::new(root.clone(), root.clone(), root);
         let record = DaemonRecord::new(&paths, resolved.clone()).expect("state");
         assert!(validate_installation(&record, &resolved).is_ok());
         let mut changed = resolved;
@@ -421,7 +417,9 @@ mod tests {
             "version: '1'\nbackend: krun\nsystem:\n  image: registry.example/system@sha256:test\n",
         )
         .expect("config");
-        let resolved = config.resolve(home.path(), None).expect("resolve");
+        let resolved = config
+            .resolve(home.path(), home.path(), None)
+            .expect("resolve");
 
         assert!(!resolved.rosetta);
         assert_eq!(SystemHardware::of_config(&resolved).rosetta, None);

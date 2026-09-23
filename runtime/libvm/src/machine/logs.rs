@@ -895,7 +895,7 @@ mod tests {
     async fn log_directory_symlinks_are_rejected_without_following_them() {
         let (temp, runtime, machine, id) =
             test_machine(StoredMachineNetworkConfig::default()).await;
-        let state_root = runtime.local_paths().roots().state_root().to_path_buf();
+        let state_root = runtime.local_paths().roots().home().to_path_buf();
         let external = temp.path().join("external");
         std::fs::create_dir(&external).expect("create external directory");
         std::fs::write(external.join("keep"), b"safe").expect("write external sentinel");

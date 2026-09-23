@@ -1,6 +1,7 @@
 """Unit tests for worker discovery and guest memory accounting."""
 
 import importlib.util
+import os
 from pathlib import Path
 import unittest
 
@@ -30,6 +31,19 @@ class WorkerDiscoveryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             report.worker_pid("11 10 silo-krun\n12 10 silo-krun", 10)
         self.assertIsNone(report.worker_pid("unknown\npid ppid args", 10))
+
+
+class SiloHomeTests(unittest.TestCase):
+    def test_prefers_silo_home_then_dot_silo(self) -> None:
+        saved = os.environ.get("SILO_HOME")
+        try:
+            os.environ["SILO_HOME"] = "/custom/silo"
+            self.assertEqual(report.silo_home(), Path("/custom/silo"))
+            del os.environ["SILO_HOME"]
+            self.assertEqual(report.silo_home(), Path.home() / ".silo")
+        finally:
+            if saved is not None:
+                os.environ["SILO_HOME"] = saved
 
 
 class ReportingGeometryTests(unittest.TestCase):

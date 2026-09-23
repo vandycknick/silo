@@ -30,9 +30,7 @@ fn marker(state: &DaemonRecord) -> String {
 pub(crate) struct ServiceConfig {
     pub(crate) executable: PathBuf,
     pub(crate) config_root: PathBuf,
-    pub(crate) data_root: PathBuf,
-    pub(crate) state_root: PathBuf,
-    pub(crate) image_root: PathBuf,
+    pub(crate) home: PathBuf,
     pub(crate) native_service_path: PathBuf,
 }
 
@@ -41,36 +39,28 @@ impl ServiceConfig {
         Ok(Self {
             executable: std::env::current_exe()?.canonicalize()?,
             config_root: paths.config_root.clone(),
-            data_root: paths.data_root.clone(),
-            state_root: paths.state_root.clone(),
-            image_root: paths.image_root.clone(),
+            home: paths.home.clone(),
             native_service_path: default_service_path(paths)?,
         })
     }
-    pub(crate) fn paths(&self, run_root: PathBuf) -> SystemPaths {
+    pub(crate) fn paths(&self) -> SystemPaths {
         SystemPaths::new(
             self.config_root.clone(),
-            self.data_root.clone(),
-            self.state_root.clone(),
-            run_root,
-            self.image_root.clone(),
+            self.home.clone(),
+            libvm::HostPaths::run_root(),
         )
     }
 
     pub(crate) fn global_config(&self) -> eyre::Result<GlobalConfig> {
-        GlobalConfig::load_from_dir(self.config_root.clone())
+        GlobalConfig::load_from(&libvm::HostPaths::new(&self.home, &self.config_root))
     }
 
     pub(crate) fn runtime_config(
         &self,
-        run_root: &Path,
         config: &ResolvedSystemConfig,
         networking: libvm::RuntimeNetworkingConfig,
     ) -> libvm::RuntimeConfig {
-        libvm::RuntimeConfig::local(&self.data_root)
-            .with_state_root(&self.state_root)
-            .with_run_root(run_root)
-            .with_image_root(&self.image_root)
+        libvm::RuntimeConfig::local(&self.home)
             .with_networking(networking)
             .with_virt_backend(config.backend.runtime_override())
     }
@@ -136,9 +126,7 @@ pub(crate) async fn down(paths: &SystemPaths) -> eyre::Result<()> {
     stop_locked(&state)?;
     let _lifetime = crate::system::supervisor::LifetimeLock::acquire(&paths.lifetime_lock())?;
     let networking = state.service.global_config()?.networking;
-    let runtime = state
-        .service
-        .runtime_config(&paths.run_root, &state.config, networking);
+    let runtime = state.service.runtime_config(&state.config, networking);
     let mut api = crate::api::AppApi::local(runtime);
     crate::system::provision::stop_system_machine(
         &mut api,
@@ -393,7 +381,7 @@ fn render_native(state: &DaemonRecord, marker: &str) -> eyre::Result<Vec<u8>> {
     Ok(format!(
         "# Managed by Silo\n# {marker}\n[Unit]\nDescription=Silo system VM manager\nStartLimitIntervalSec=60\nStartLimitBurst=3\n\n[Service]\nType=exec\nExecStart={} daemon serve --state {}\nRestart=on-failure\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=90\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
         systemd_arg(&state.service.executable)?,
-        systemd_arg(&state.service.data_root.join("daemon/daemon.json"))?
+        systemd_arg(&state.service.home.join("daemon/daemon.json"))?
     ).into_bytes())
 }
 
@@ -433,8 +421,8 @@ fn render_native(state: &DaemonRecord, marker: &str) -> eyre::Result<Vec<u8>> {
             .ok_or_else(|| eyre::eyre!("service path is not UTF-8"))
     }
     let executable = plist_path(&state.service.executable)?;
-    let config = plist_path(&state.service.data_root.join("daemon/daemon.json"))?;
-    let native_log = plist_path(&state.service.state_root.join("logs/daemon/native.log"))?;
+    let config = plist_path(&state.service.home.join("daemon/daemon.json"))?;
+    let native_log = plist_path(&state.service.home.join("logs/daemon/native.log"))?;
     // Mirrors the systemd unit: restart only on failure, allow 90s for a graceful VM
     // shutdown before SIGKILL, and keep created files private. Standard scheduling
     // avoids imposing background CPU/I/O restrictions on the VM's inherited policy.
@@ -564,12 +552,7 @@ fn refresh_native_definition() -> eyre::Result<()> {
 #[cfg(target_os = "macos")]
 fn native_start(state: &DaemonRecord) -> eyre::Result<()> {
     let target = launchd_target();
-    if let Some(parent) = state
-        .service
-        .state_root
-        .join("logs/daemon/native.log")
-        .parent()
-    {
+    if let Some(parent) = state.service.home.join("logs/daemon/native.log").parent() {
         std::fs::create_dir_all(parent).context("create native service log directory")?;
     }
     run(
@@ -728,17 +711,12 @@ mod tests {
         let state = crate::system::service::ServiceConfig {
             executable: "/bin/silo".into(),
             config_root: "/config".into(),
-            data_root: "/data".into(),
-            state_root: "/state".into(),
-            image_root: "/images".into(),
+            home: "/home".into(),
             native_service_path: "/service".into(),
         };
 
-        let runtime = state.runtime_config(
-            std::path::Path::new("/run"),
-            &config,
-            libvm::RuntimeNetworkingConfig::default(),
-        );
+        let runtime = state.runtime_config(&config, libvm::RuntimeNetworkingConfig::default());
+        assert_eq!(runtime.home.as_deref(), Some(std::path::Path::new("/home")));
         assert_eq!(runtime.virt_backend, Some(libvm::VirtBackendOverride::Vz));
     }
 
@@ -746,7 +724,7 @@ mod tests {
     fn logs_are_bounded_by_requested_lines() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let paths = SystemPaths::new(root.clone(), root.clone(), root.clone(), root.clone(), root);
+        let paths = SystemPaths::new(root.clone(), root.clone(), root);
         std::fs::create_dir_all(paths.log().parent().expect("parent")).expect("directory");
         std::fs::write(paths.log(), "one\ntwo\nthree\n").expect("log");
         assert_eq!(logs(&paths, 2).expect("logs"), "two\nthree");
@@ -784,7 +762,7 @@ mod tests {
         use crate::system::service::recent_failure;
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let paths = SystemPaths::new(root.clone(), root.clone(), root.clone(), root.clone(), root);
+        let paths = SystemPaths::new(root.clone(), root.clone(), root);
         let before = chrono::Utc::now() - chrono::Duration::seconds(30);
         let write = |phase: &str, updated_at: &str| {
             std::fs::create_dir_all(paths.status().parent().expect("parent")).expect("dir");
@@ -829,7 +807,7 @@ mod tests {
             "data_size_bytes": 1073741824,
             "shares": [],
             "publish_bind": "any",
-            "docker_socket": "/Users/me/.docker/run/silo.sock",
+            "docker_socket": "/Users/me/.silo/run/docker.sock",
             "backend": "vz",
             "rosetta": false,
             "rosetta_explicit": false
@@ -837,10 +815,8 @@ mod tests {
         .expect("config");
         let paths = SystemPaths::new(
             "/Users/me/.config/silo".into(),
-            "/Users/me/.local/share/silo".into(),
-            "/Users/me/.local/state/silo".into(),
-            "/tmp/silo".into(),
-            "/Users/me/.local/share/silo/images".into(),
+            "/Users/me/.silo".into(),
+            "/tmp/silo-501".into(),
         );
         let mut state = DaemonRecord::new(&paths, config).expect("state");
         state.service.executable = PathBuf::from("/Applications/Silo & Co/silo");
@@ -848,12 +824,12 @@ mod tests {
             String::from_utf8(render_native(&state, "Silo-Installation-ID: test").expect("render"))
                 .expect("utf8");
         assert!(plist.contains("<string>/Applications/Silo &amp; Co/silo</string>"));
-        assert!(plist.contains("<string>/Users/me/.local/share/silo/daemon/daemon.json</string>"));
+        assert!(plist.contains("<string>/Users/me/.silo/daemon/daemon.json</string>"));
         assert!(plist.contains(
             "<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>"
         ));
         assert!(plist.contains("<key>ExitTimeOut</key>\n\t<integer>90</integer>"));
-        assert!(plist.contains("<key>StandardErrorPath</key>\n\t<string>/Users/me/.local/state/silo/logs/daemon/native.log</string>"));
+        assert!(plist.contains("<key>StandardErrorPath</key>\n\t<string>/Users/me/.silo/logs/daemon/native.log</string>"));
         assert!(plist.contains("<key>ProcessType</key>\n\t<string>Standard</string>"));
         assert!(plist.contains("<key>Umask</key>\n\t<integer>63</integer>"));
         assert!(plist.contains("<!-- Silo-Installation-ID: test -->"));

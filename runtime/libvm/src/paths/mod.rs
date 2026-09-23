@@ -1,12 +1,12 @@
 mod defaults;
+mod host;
 mod local;
 mod machine;
 mod network;
 mod owned;
 
-pub(crate) use defaults::{
-    ensure_run_root, resolve_default_data_dir, resolve_default_run_dir, resolve_default_state_dir,
-};
+pub(crate) use defaults::{default_run_root, ensure_run_root, resolve_default_home};
+pub use host::HostPaths;
 pub(crate) use local::{LocalPaths, LocalRoots};
 pub(crate) use machine::{
     root_disk_relative_path, vm_spec_path_in, MachinePaths, NETWORK_AUDIT_LOG_FILE_NAME,

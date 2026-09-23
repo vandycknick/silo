@@ -76,16 +76,16 @@ describe("runtime options", () => {
   it("passes through supported runtime options", () => {
     expect(
       runtimeOptionsToNative({
-        dataRoot: "/tmp/silo",
+        home: "/tmp/silo",
       }),
     ).toMatchObject({
-      dataRoot: "/tmp/silo",
+      home: "/tmp/silo",
     });
   });
 
   it("does not reject extra runtime option fields", () => {
-    const options: RuntimeOpenOptions & { bogus: string } = { dataRoot: "/tmp/silo", bogus: "nope" };
-    expect(runtimeOptionsToNative(options)).toMatchObject({ dataRoot: "/tmp/silo" });
+    const options: RuntimeOpenOptions & { bogus: string } = { home: "/tmp/silo", bogus: "nope" };
+    expect(runtimeOptionsToNative(options)).toMatchObject({ home: "/tmp/silo" });
   });
 });
 

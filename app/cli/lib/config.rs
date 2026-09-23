@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::path::PathBuf;
 
 use eyre::Context as _;
@@ -7,9 +6,6 @@ use serde::Deserialize;
 use serde_yaml_ng::{Mapping, Value};
 
 use crate::system::config::SystemConfig;
-
-const APP_DIR_NAME: &str = "silo";
-const CONFIG_FILE_NAME: &str = "config.yaml";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GlobalConfig {
@@ -20,12 +16,15 @@ pub struct GlobalConfig {
 
 impl GlobalConfig {
     pub(crate) fn load() -> eyre::Result<Self> {
-        let config_dir = resolve_default_config_dir()?;
-        Self::load_from_dir(config_dir)
+        Self::load_from(&libvm::HostPaths::from_env()?)
     }
 
-    pub(crate) fn load_from_dir(config_dir: PathBuf) -> eyre::Result<Self> {
-        let config_path = config_dir.join(CONFIG_FILE_NAME);
+    /// Reads the config file the host paths resolve (the config directory's
+    /// `config.yaml`, else the home fallback). Policies stay in the config
+    /// directory either way.
+    pub(crate) fn load_from(host: &libvm::HostPaths) -> eyre::Result<Self> {
+        let config_dir = host.config_dir().to_path_buf();
+        let config_path = host.config_file();
         let raw = match std::fs::read_to_string(&config_path) {
             Ok(raw) => raw,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -52,10 +51,11 @@ impl GlobalConfig {
     }
 
     pub(crate) fn write_default_machine(default_machine: Option<&str>) -> eyre::Result<()> {
-        let config_dir = resolve_default_config_dir()?;
-        std::fs::create_dir_all(&config_dir)
-            .with_context(|| format!("create global config directory {}", config_dir.display()))?;
-        let config_path = config_dir.join(CONFIG_FILE_NAME);
+        let config_path = libvm::HostPaths::from_env()?.config_file();
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create global config directory {}", parent.display()))?;
+        }
         write_default_machine_to_path(&config_path, default_machine)
     }
 
@@ -65,37 +65,6 @@ impl GlobalConfig {
             networking: RuntimeNetworkingConfig::default().with_policy_config_dir(config_dir),
             daemon: None,
         }
-    }
-}
-
-pub(crate) fn resolve_default_config_dir() -> eyre::Result<PathBuf> {
-    let home = env_absolute_path("HOME")?;
-    let config_home = env_absolute_path("XDG_CONFIG_HOME")?
-        .or_else(|| home.as_ref().map(|path| path.join(".config")));
-
-    config_home
-        .map(|path| path.join(APP_DIR_NAME))
-        .ok_or_else(|| {
-            eyre::eyre!("could not resolve Silo config directory from XDG_CONFIG_HOME or HOME")
-        })
-}
-
-fn env_absolute_path(name: &'static str) -> eyre::Result<Option<PathBuf>> {
-    match std::env::var_os(name) {
-        Some(value) => absolute_path(name, value).map(Some),
-        None => Ok(None),
-    }
-}
-
-fn absolute_path(name: &'static str, value: OsString) -> eyre::Result<PathBuf> {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Err(eyre::eyre!(
-            "environment variable {name} must be an absolute path: {}",
-            path.display()
-        ))
     }
 }
 

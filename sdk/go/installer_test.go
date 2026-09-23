@@ -260,11 +260,32 @@ func TestInstallRuntimeHonorsCancelledContext(t *testing.T) {
 	}
 }
 
-func TestResolveInstallRootRejectsRelativeXDGPath(t *testing.T) {
-	t.Setenv("XDG_DATA_HOME", "relative")
+func TestResolveInstallRootRejectsRelativeSiloHome(t *testing.T) {
+	t.Setenv("SILO_HOME", "relative")
 	_, err := resolveInstallRoot("")
 	if !IsErrorKind(err, ErrorRelativeEnvironmentPath) {
 		t.Fatalf("error = %v, want ErrorRelativeEnvironmentPath", err)
+	}
+}
+
+func TestResolveInstallRootUsesSiloHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SILO_HOME", home)
+	root, err := resolveInstallRoot("")
+	if err != nil {
+		t.Fatalf("resolve install root: %v", err)
+	}
+	if want := filepath.Join(home, "runtimes"); root != want {
+		t.Fatalf("root = %q, want %q", root, want)
+	}
+	t.Setenv("SILO_HOME", "")
+	t.Setenv("HOME", home)
+	root, err = resolveInstallRoot("")
+	if err != nil {
+		t.Fatalf("resolve install root from HOME: %v", err)
+	}
+	if want := filepath.Join(home, ".silo", "runtimes"); root != want {
+		t.Fatalf("root = %q, want %q", root, want)
 	}
 }
 

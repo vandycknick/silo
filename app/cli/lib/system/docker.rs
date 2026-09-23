@@ -218,18 +218,17 @@ mod tests {
             "version: '1'\nsystem:\n  image: registry.example/system@sha256:test\n",
         )
         .expect("config");
-        config.resolve(home, None).expect("resolve")
+        config.resolve(home, home, None).expect("resolve")
     }
 
     #[test]
     fn preflight_creates_socket_directories_without_a_compatibility_alias() {
         let temp = tempfile::tempdir().expect("temp");
-        let mut config = config(temp.path());
-        config.docker_socket = temp.path().join("docker/run/silo.sock");
+        let config = config(temp.path());
+        assert_eq!(config.docker_socket, temp.path().join("run/docker.sock"));
         preflight(&config, false).expect("preflight");
         preflight(&config, false).expect("repeat preflight");
-        assert!(temp.path().join("docker/run").is_dir());
-        assert!(std::fs::symlink_metadata(temp.path().join("docker/run/docker.sock")).is_err());
+        assert!(temp.path().join("run").is_dir());
     }
 
     #[test]

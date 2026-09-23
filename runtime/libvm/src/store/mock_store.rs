@@ -16,8 +16,6 @@ mock! {
 
     #[async_trait]
     impl ConfigStore for DataStore {
-        async fn db_config(&self) -> Result<Option<DbConfig>, LibVmError>;
-
         async fn read_or_seed_db_config(&self, seed: &DbConfig) -> Result<DbConfig, LibVmError>;
     }
 

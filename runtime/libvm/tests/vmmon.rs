@@ -51,7 +51,8 @@ fn write_runtime_root(root: &Path) -> PathBuf {
 
 struct TestEnv {
     _temp: tempfile::TempDir,
-    _run_root: tempfile::TempDir,
+    /// The fixed generated-state root every runtime uses.
+    run_root: std::path::PathBuf,
     runtime: Runtime,
     disk: PathBuf,
     machines: Mutex<Vec<Machine>>,
@@ -104,12 +105,6 @@ async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
         .prefix("silo-test")
         .tempdir_in("/tmp")
         .expect("create short temp dir");
-    let run_root = tempfile::Builder::new()
-        .prefix("silo-mock")
-        .tempdir_in("/tmp")
-        .expect("create short run root");
-    std::fs::set_permissions(run_root.path(), std::fs::Permissions::from_mode(0o700))
-        .expect("restrict run root");
     let runtime_root = write_runtime_root(&temp.path().join("runtime"));
     let scenario_path = temp.path().join(format!("{name}-scenario.json"));
     scenario.write_to(&scenario_path).expect("write scenario");
@@ -118,10 +113,7 @@ async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
     std::fs::write(&disk, vec![0u8; 4096]).expect("write disk image");
 
     let runtime = Runtime::new(
-        RuntimeConfig::local(temp.path().join("data"))
-            .with_state_root(temp.path().join("state"))
-            .with_run_root(run_root.path())
-            .with_image_root(temp.path().join("images"))
+        RuntimeConfig::local(temp.path().join("home"))
             .with_runtime_root(&runtime_root)
             .with_mock_vmm(&scenario_path),
     )
@@ -130,7 +122,7 @@ async fn test_env(name: &str, scenario: &Scenario) -> TestEnv {
 
     TestEnv {
         _temp: temp,
-        _run_root: run_root,
+        run_root: std::path::PathBuf::from(format!("/tmp/silo-{}", nix::unistd::geteuid())),
         runtime,
         disk,
         machines: Mutex::new(Vec::new()),
@@ -283,8 +275,7 @@ async fn dropping_test_environment_stops_a_running_monitor() {
     let machine = create_machine(&env, "integration-drop-cleanup").await;
     start_ready(&machine).await;
     let pid_path = env
-        ._run_root
-        .path()
+        .run_root
         .join("machines")
         .join(machine.id())
         .join("vm.pid");
@@ -309,8 +300,7 @@ async fn machine_inbound_unix_forward_reaches_guest_unix_target_and_cleans_up() 
     let echo = spawn_unix_echo(&target).await;
     set_forwards(&machine, vec![inbound_unix("svc.sock", &target)]).await;
     let listen = env
-        ._run_root
-        .path()
+        .run_root
         .join("machines")
         .join(machine.id())
         .join("svc.sock");
@@ -859,7 +849,7 @@ async fn machine_outbound_raw_vsock_reaches_relative_host_unix_target() {
         .expect("configure raw outbound forward");
 
     machine.start().await.expect("start raw outbound machine");
-    let machine_run_dir = env._run_root.path().join("machines").join(machine.id());
+    let machine_run_dir = env.run_root.join("machines").join(machine.id());
     let echo = spawn_unix_echo(&machine_run_dir.join("raw-target.sock")).await;
     let _extension = UnixListener::bind(machine_run_dir.join(format!("vsock.sock_{PORT}")))
         .expect("bind extension path that discovery must ignore");
@@ -867,7 +857,7 @@ async fn machine_outbound_raw_vsock_reaches_relative_host_unix_target() {
     let mut guest = UnixStream::connect(
         env._temp
             .path()
-            .join("data/machines")
+            .join("home/machines")
             .join(machine.id())
             .join(format!(".v_{PORT}")),
     )
@@ -909,7 +899,7 @@ async fn outbound_agent_restart_reopens_listener_and_unknown_token_is_rejected()
     let return_path = env
         ._temp
         .path()
-        .join("data/machines")
+        .join("home/machines")
         .join(machine.id())
         .join(format!(".v_{}", forward_spec::FORWARD_VSOCK_PORT));
     let mut unknown = UnixStream::connect(return_path)
@@ -930,7 +920,7 @@ async fn outbound_agent_restart_reopens_listener_and_unknown_token_is_rejected()
     let mut malformed = UnixStream::connect(
         env._temp
             .path()
-            .join("data/machines")
+            .join("home/machines")
             .join(machine.id())
             .join(format!(".v_{}", forward_spec::FORWARD_VSOCK_PORT)),
     )
@@ -1346,7 +1336,7 @@ async fn session_raw_vsock_port_unregisters_and_can_be_reopened() {
     let guest_path = env
         ._temp
         .path()
-        .join("data/machines")
+        .join("home/machines")
         .join(machine.id())
         .join(format!(".v_{PORT}"));
 
@@ -1423,7 +1413,7 @@ async fn vsock_path_accessors_are_store_backed_and_follow_enablement() {
             .expect("disabled listener path"),
         None
     );
-    let machine_run_dir = env._run_root.path().join("machines").join(machine.id());
+    let machine_run_dir = env.run_root.join("machines").join(machine.id());
     assert!(
         !machine_run_dir.exists(),
         "omitted path accessors must not create runtime state"
@@ -1494,8 +1484,7 @@ async fn vsock_path_accessors_are_store_backed_and_follow_enablement() {
         .await
         .expect("customize vsock path");
     let custom_mux = env
-        ._run_root
-        .path()
+        .run_root
         .join("machines")
         .join(machine.id())
         .join("custom.sock");
@@ -1611,8 +1600,7 @@ async fn machine_lifecycle_uses_vmmon_from_portable_runtime() {
         "machine must be running after readiness"
     );
     assert!(
-        !env._run_root
-            .path()
+        !env.run_root
             .join("machines")
             .join(machine.id())
             .join(vm_spec::DEFAULT_VSOCK_MUX_FILENAME)
@@ -1679,8 +1667,7 @@ async fn explicitly_disabled_public_vsock_preserves_internal_ssh_and_agent_servi
     assert_eq!(output.stdout_bytes(), b"agent-over-internal-vsock\n");
 
     let vmmon_socket = env
-        ._run_root
-        .path()
+        .run_root
         .join("machines")
         .join(machine.id())
         .join("vm.sock");

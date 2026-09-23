@@ -224,10 +224,7 @@ mod tests {
     #[tokio::test]
     async fn local_api_uses_only_its_explicit_disposable_roots() {
         let temp = tempfile::tempdir().expect("create disposable application roots");
-        let data = temp.path().join("data");
-        let state = temp.path().join("state");
-        let run = temp.path().join("run");
-        let images = temp.path().join("images");
+        let home = temp.path().join("home");
         let components = temp.path().join("components");
         let bin = components.join("bin");
         let assets = components.join("assets");
@@ -240,11 +237,7 @@ mod tests {
             std::fs::write(assets.join(name), b"fixture").expect("write asset fixture");
         }
         executable_fixture(&assets, "agent");
-        let config = RuntimeConfig::local(&data)
-            .with_state_root(&state)
-            .with_run_root(&run)
-            .with_image_root(&images)
-            .with_runtime_root(&components);
+        let config = RuntimeConfig::local(&home).with_runtime_root(&components);
         let mut api = AppApi::local(config);
 
         let machines = api
@@ -253,8 +246,8 @@ mod tests {
             .expect("open and list isolated local API");
 
         assert!(machines.is_empty());
-        assert!(data.join("state.db").is_file());
-        assert!(run.is_dir());
+        assert!(home.join("state.db").is_file());
+        assert!(libvm::HostPaths::run_root().is_dir());
         assert!(!temp.path().join(".docker").exists());
         assert!(!temp.path().join("native-service").exists());
     }

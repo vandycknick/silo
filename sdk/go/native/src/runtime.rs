@@ -11,9 +11,7 @@ use crate::handles::{MachineHandle, MachineHandleList, RuntimeContext, RuntimeHa
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeOpenRequest {
-    data_root: Option<String>,
-    run_root: Option<String>,
-    image_root: Option<String>,
+    home: Option<String>,
     runtime_root: Option<String>,
     vmmon_path: Option<String>,
 }
@@ -145,16 +143,10 @@ pub unsafe extern "C" fn silo_machine_free(machine: *mut MachineHandle) {
 }
 
 fn runtime_config(request: RuntimeOpenRequest) -> Result<RuntimeConfig, *mut SiloError> {
-    let mut config = match request.data_root {
-        Some(data_root) => RuntimeConfig::local(data_root),
+    let mut config = match request.home {
+        Some(home) => RuntimeConfig::local(home),
         None => RuntimeConfig::from_env().map_err(error_from_libvm)?,
     };
-    if let Some(run_root) = request.run_root {
-        config = config.with_run_root(PathBuf::from(run_root));
-    }
-    if let Some(image_root) = request.image_root {
-        config = config.with_image_root(PathBuf::from(image_root));
-    }
     if let Some(runtime_root) = request.runtime_root {
         config = config.with_runtime_root(PathBuf::from(runtime_root));
     }

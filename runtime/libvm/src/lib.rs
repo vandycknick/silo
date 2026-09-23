@@ -77,8 +77,9 @@ pub use crate::network::{
     GuestPublish, MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition,
     NetworkDriver, NetworkTopology, PublishBind,
 };
+pub use crate::paths::HostPaths;
 pub use crate::runtime::{
-    NetdRuntimeConfig, PathChoice, ReadOnlyRuntime, Runtime, RuntimeBuilder, RuntimeConfig,
+    NetdRuntimeConfig, ReadOnlyRuntime, Runtime, RuntimeBuilder, RuntimeConfig,
     RuntimeNetworkingConfig, VirtBackendOverride,
 };
 pub use crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT;

@@ -27,20 +27,12 @@ pub(crate) struct MachinePaths {
 }
 
 impl MachinePaths {
-    pub(crate) fn new(
-        data_root: &Path,
-        state_root: &Path,
-        run_root: &Path,
-        machine_id: MachineId,
-    ) -> Self {
+    pub(crate) fn new(home: &Path, run_root: &Path, machine_id: MachineId) -> Self {
         let id = machine_id.to_string();
         Self {
-            data_dir: data_root.join(MACHINES_DIR_NAME).join(&id),
+            data_dir: home.join(MACHINES_DIR_NAME).join(&id),
             run_dir: run_root.join(MACHINES_DIR_NAME).join(&id),
-            logs_dir: state_root
-                .join(LOGS_DIR_NAME)
-                .join(MACHINES_DIR_NAME)
-                .join(id),
+            logs_dir: home.join(LOGS_DIR_NAME).join(MACHINES_DIR_NAME).join(id),
         }
     }
 
@@ -155,7 +147,6 @@ mod tests {
         );
         let paths = MachinePaths::new(
             PathBuf::from("/tmp/silo").as_path(),
-            PathBuf::from("/tmp/silo-state").as_path(),
             PathBuf::from("/tmp/silo-run").as_path(),
             machine_id,
         );
@@ -211,43 +202,43 @@ mod tests {
         );
         assert_eq!(
             paths.vm_trace_log_path(),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("vm.trace.log")
         );
         assert_eq!(
             paths.vmmon_exit_status_path(),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("vm.exit.json")
         );
         assert_eq!(
             paths.serial_log_path(),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("serial.log")
         );
         assert_eq!(
             paths.exec_log_path(),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("exec.log")
         );
         assert_eq!(
             paths.exec_log_archive_path(3),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("exec.log.3")
         );
         assert_eq!(
             paths.network_service_log_path(),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("network/netd.log")
         );
         assert_eq!(
             paths.network_audit_log_path(),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("network/audit.jsonl")
         );

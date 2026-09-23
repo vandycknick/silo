@@ -230,7 +230,7 @@ impl LocalVmService {
             let executable = std::env::current_exe().context("resolve CLI binary path")?;
             options = crate::api::start_options::cleanup_on_exit_options(
                 executable,
-                self.runtime().await?.local_data_dir(),
+                self.runtime().await?.local_home(),
                 &machine.id(),
             );
         }

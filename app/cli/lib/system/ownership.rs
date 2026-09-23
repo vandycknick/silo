@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use eyre::bail;
 use libvm::MachineData;
 
@@ -42,40 +40,14 @@ fn labels_match(
 }
 
 pub(crate) fn default_system_paths() -> eyre::Result<crate::system::record::SystemPaths> {
-    let config = xdg_root("XDG_CONFIG_HOME", ".config")?.join("silo");
-    let data = xdg_root("XDG_DATA_HOME", ".local/share")?.join("silo");
-    let state = xdg_root("XDG_STATE_HOME", ".local/state")?.join("silo");
-    // libvm unpacks images under the data root by default. Mirror that so the roots
-    // recorded for the native service match the state database that ordinary CLI use
-    // created; the service itself runs without the shell's XDG environment.
-    let image = data.join("images");
-    let run = match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(value) => absolute("XDG_RUNTIME_DIR", value)?.join("silo"),
-        None => PathBuf::from(format!("/tmp/silo-{}", nix::unistd::geteuid().as_raw())),
-    };
+    // The native service runs without the shell's environment, so it records the
+    // resolved config directory and home instead of re-resolving them.
+    let host = libvm::HostPaths::from_env()?;
     Ok(crate::system::record::SystemPaths::new(
-        config, data, state, run, image,
+        host.config_dir().to_path_buf(),
+        host.home().to_path_buf(),
+        libvm::HostPaths::run_root(),
     ))
-}
-
-fn xdg_root(name: &'static str, fallback: &str) -> eyre::Result<PathBuf> {
-    if let Some(value) = std::env::var_os(name) {
-        return absolute(name, value);
-    }
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| eyre::eyre!("HOME is required to resolve {name}"))?;
-    Ok(absolute("HOME", home)?.join(fallback))
-}
-
-fn absolute(name: &'static str, value: std::ffi::OsString) -> eyre::Result<PathBuf> {
-    let path = PathBuf::from(value);
-    if !path.is_absolute() {
-        bail!(
-            "environment variable {name} must be absolute: {}",
-            path.display()
-        );
-    }
-    Ok(path)
 }
 
 #[cfg(test)]

@@ -44,6 +44,7 @@ use crate::network::{
 };
 use crate::runtime::transitions::{self, StartFailure, TransitionError};
 use crate::runtime::RuntimeBuilder;
+use crate::store::models::DbConfig;
 use crate::store::models::MachineId;
 use crate::store::models::{
     ImageConfigRecord, ImageLayerRecord, ImageManifestLayerRecord, ImageManifestRecord,
@@ -128,16 +129,10 @@ impl Runtime {
     /// Opens a local runtime from explicit configuration.
     pub async fn new(config: RuntimeConfig) -> Result<Self, LibVmError> {
         let components = resolve_components(&config)?;
-        let bootstrap_paths = config.bootstrap_paths()?;
-        let store = Store::open(bootstrap_paths.state_db_path()).await?;
-        let stored = match store.db_config().await? {
-            Some(stored) => stored,
-            None => {
-                let seed = config.seed_db_config()?;
-                store.read_or_seed_db_config(&seed).await?
-            }
-        };
-        let roots = config.resolve_store_roots(&stored, bootstrap_paths.state_db_path())?;
+        let roots = config.resolve_roots()?;
+        let store = Store::open(&roots.state_db_path()).await?;
+        let stored = store.read_or_seed_db_config(&DbConfig::current()).await?;
+        crate::runtime::config::validate_db_config(&stored)?;
         let paths = LocalPaths::from_roots(roots);
         Self::from_store(
             paths,
@@ -164,7 +159,7 @@ impl Runtime {
         networking: RuntimeNetworkingConfig,
     ) -> Result<Self, LibVmError> {
         let store = Store::new(&paths).await?;
-        let components = crate::runtime::components::test_components(paths.data_dir());
+        let components = crate::runtime::components::test_components(paths.home());
         Self::from_store(paths, Arc::new(store), networking, components, None).await
     }
 
@@ -191,9 +186,9 @@ impl Runtime {
         Ok(runtime)
     }
 
-    /// Returns the local data directory.
-    pub fn local_data_dir(&self) -> &Path {
-        self.paths.data_dir()
+    /// Returns the Silo home holding this runtime's persistent state.
+    pub fn local_home(&self) -> &Path {
+        self.paths.home()
     }
 
     /// Returns the local image directory.
@@ -2060,7 +2055,7 @@ mod tests {
     }
 
     async fn runtime_with_mock_store(paths: LocalPaths, store: MockDataStore) -> Runtime {
-        let components = crate::runtime::components::test_components(paths.data_dir());
+        let components = crate::runtime::components::test_components(paths.home());
         Runtime::from_store(
             paths,
             Arc::new(store),
@@ -2661,7 +2656,7 @@ mod tests {
     }
 
     fn write_start_failure_components(paths: &LocalPaths, vmmon: &str) {
-        let root = paths.data_dir();
+        let root = paths.home();
         let bin = root.join("bin");
         let assets = root.join("assets");
         std::fs::create_dir_all(&bin).expect("create test runtime binaries");
@@ -2690,7 +2685,7 @@ mod tests {
         let paths = LocalPaths::new(temp.path().join("silo"));
         write_start_failure_components(&paths, vmmon);
         let store = Arc::new(Store::new(&paths).await.expect("open test store"));
-        let components = crate::runtime::components::test_components(paths.data_dir());
+        let components = crate::runtime::components::test_components(paths.home());
         let runtime = Runtime::from_store(
             paths,
             store.clone(),

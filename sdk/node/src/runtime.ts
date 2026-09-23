@@ -21,7 +21,7 @@ export class Runtime {
    *
    * @example
    * ```ts
-   * const runtime = await Runtime.open({ dataRoot: "/tmp/silo-sdk" });
+   * const runtime = await Runtime.open({ home: "/tmp/silo-sdk" });
    * ```
    *
    * @throws {TypeError} When `options` is malformed.

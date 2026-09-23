@@ -13,31 +13,21 @@ const MAX_RECORD_BYTES: u64 = 256 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SystemPaths {
     pub(crate) config_root: PathBuf,
-    pub(crate) data_root: PathBuf,
-    pub(crate) state_root: PathBuf,
+    pub(crate) home: PathBuf,
     pub(crate) run_root: PathBuf,
-    pub(crate) image_root: PathBuf,
 }
 
 impl SystemPaths {
-    pub(crate) fn new(
-        config_root: PathBuf,
-        data_root: PathBuf,
-        state_root: PathBuf,
-        run_root: PathBuf,
-        image_root: PathBuf,
-    ) -> Self {
+    pub(crate) fn new(config_root: PathBuf, home: PathBuf, run_root: PathBuf) -> Self {
         Self {
             config_root,
-            data_root,
-            state_root,
+            home,
             run_root,
-            image_root,
         }
     }
 
     pub(crate) fn daemon_data(&self) -> PathBuf {
-        self.data_root.join("daemon")
+        self.home.join("daemon")
     }
     pub(crate) fn daemon(&self) -> PathBuf {
         self.daemon_data().join("daemon.json")
@@ -55,13 +45,13 @@ impl SystemPaths {
         self.daemon_data().join("status.json")
     }
     pub(crate) fn log(&self) -> PathBuf {
-        self.state_root.join("logs/daemon/daemon.log")
+        self.home.join("logs/daemon/daemon.log")
     }
     /// Captured stdout/stderr of the native service process (launchd only; systemd
     /// keeps it in the journal). Surfaces panics and failures that happen before the
     /// supervisor publishes a status record.
     pub(crate) fn native_log(&self) -> PathBuf {
-        self.state_root.join("logs/daemon/native.log")
+        self.home.join("logs/daemon/native.log")
     }
 }
 
@@ -235,18 +225,12 @@ pub(crate) mod tests {
     use crate::system::record::{load_record, write_record, DaemonRecord, SystemPaths};
 
     pub(crate) fn fixture(root: &std::path::Path) -> (SystemPaths, DaemonRecord) {
-        let paths = SystemPaths::new(
-            root.join("config"),
-            root.join("data"),
-            root.join("state"),
-            root.join("run"),
-            root.join("images"),
-        );
+        let paths = SystemPaths::new(root.join("config"), root.join("home"), root.join("run"));
         let config: crate::system::config::SystemConfig = serde_yaml_ng::from_str(
             "version: '1'\nsystem:\n  image: registry.example/system@sha256:old\n",
         )
         .expect("config");
-        let mut config = config.resolve(root, None).expect("resolve");
+        let mut config = config.resolve(root, root, None).expect("resolve");
         config.data_size_bytes = 256 * 1024 * 1024;
         let state = DaemonRecord::new(&paths, config).expect("state");
         (paths, state)

@@ -146,7 +146,7 @@ impl Context {
             eyre::eyre!("system daemon is not configured\n\nhint: add `daemon: {{ version: \"1\", system: {{}} }}` to the Silo config")
         })?;
         let paths = default_system_paths()?;
-        let mut resolved = config.resolve(&home, None)?;
+        let mut resolved = config.resolve(&home, &paths.home, None)?;
         if let Some(installation) = crate::system::record::DaemonRecord::load(&paths)? {
             if resolved.image == installation.configured_image
                 && resolved.image != installation.config.image
@@ -239,10 +239,7 @@ mod tests {
             .with_netd(libvm::NetdRuntimeConfig::new().with_subnet("192.168.247.0/24"));
         let runtime = explicit_runtime_config(networking.clone(), libvm::VirtBackendOverride::Krun);
 
-        assert_eq!(runtime.data_root, libvm::PathChoice::Default);
-        assert_eq!(runtime.state_root, libvm::PathChoice::Default);
-        assert_eq!(runtime.run_root, libvm::PathChoice::Default);
-        assert_eq!(runtime.image_root, libvm::PathChoice::Default);
+        assert_eq!(runtime.home, None);
         assert_eq!(runtime.networking, networking);
         assert!(runtime.vmmon_path.is_none());
         assert!(runtime.netd_path.is_none());

@@ -27,7 +27,7 @@ func TestOpenRealBridgeReportsMissingRuntime(t *testing.T) {
 		t.Skip("SILO_GO_FFI_PATH is not set")
 	}
 	root := t.TempDir()
-	_, err := Open(context.Background(), WithDataRoot(root), WithRuntimeRoot(root))
+	_, err := Open(context.Background(), WithHome(root), WithRuntimeRoot(root))
 	if err == nil {
 		t.Fatal("Open() unexpectedly succeeded with an empty runtime root")
 	}

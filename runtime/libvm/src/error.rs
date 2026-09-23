@@ -5,13 +5,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LibVmError {
-    #[error("could not resolve Silo data directory from XDG_DATA_HOME or HOME")]
-    DataDirUnavailable,
+    #[error("could not resolve the Silo home from SILO_HOME or HOME")]
+    HomeUnavailable,
 
-    #[error("could not resolve Silo state directory from XDG_STATE_HOME or HOME")]
-    StateDirUnavailable,
-
-    #[error("could not resolve Silo config directory from XDG_CONFIG_HOME or HOME")]
+    #[error("could not resolve the Silo config directory from XDG_CONFIG_HOME or HOME")]
     ConfigDirUnavailable,
 
     #[error("environment variable {name} must be an absolute path, got {path}")]
@@ -233,8 +230,7 @@ impl LibVmError {
     /// cannot silently degrade a binding to message parsing or an unknown kind.
     pub fn variant(&self) -> &'static str {
         match self {
-            Self::DataDirUnavailable => "DataDirUnavailable",
-            Self::StateDirUnavailable => "StateDirUnavailable",
+            Self::HomeUnavailable => "HomeUnavailable",
             Self::ConfigDirUnavailable => "ConfigDirUnavailable",
             Self::RelativeEnvironmentPath { .. } => "RelativeEnvironmentPath",
             Self::InvalidVirtBackendOverride { .. } => "InvalidVirtBackendOverride",

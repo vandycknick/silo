@@ -738,7 +738,7 @@ mod tests {
         let config: SystemConfig =
             serde_yaml_ng::from_str("version: '1'\nsystem: {}\n").expect("config");
         let mut config = config
-            .resolve(home.path(), None)
+            .resolve(home.path(), home.path(), None)
             .expect("resolve system config");
         config.shares = shares;
         config

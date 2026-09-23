@@ -1236,14 +1236,8 @@ netd log: /tmp/silo/netd.log";
     async fn netd_launches_the_resolved_absolute_helper() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let data_root = temp.path().join("data");
-        let state_root = temp.path().join("state");
         let run_root = temp.path().join("run");
-        let paths = LocalPaths::from_roots(LocalRoots::with_roots(
-            &data_root,
-            &state_root,
-            &run_root,
-            data_root.join("images"),
-        ));
+        let paths = LocalPaths::from_roots(LocalRoots::with_roots(&data_root, &run_root));
         let netd = temp.path().join("runtime/bin/netd");
         std::fs::create_dir_all(netd.parent().expect("netd parent")).expect("create netd parent");
         std::fs::write(
@@ -1315,12 +1309,12 @@ netd log: /tmp/silo/netd.log";
         };
         assert_eq!(
             log_path,
-            state_root
+            data_root
                 .join("logs/machines")
                 .join(machine_id.to_string())
                 .join("network/netd.log")
         );
-        assert!(!state_root.join("logs/networks").exists());
+        assert!(!data_root.join("logs/networks").exists());
         let directory_fds = std::fs::read_to_string(netd.with_extension("directories"))
             .expect("read inherited directories");
         let (log_directory_fd, runtime_directory_fd) = directory_fds

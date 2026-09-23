@@ -9,35 +9,26 @@ use nix::unistd::geteuid;
 
 use crate::LibVmError;
 
-const APP_DIR_NAME: &str = "silo";
+/// Directory under `$HOME` holding every piece of persistent Silo state.
+const HOME_DIR_NAME: &str = ".silo";
+/// Overrides the Silo home; must be absolute.
+pub(crate) const SILO_HOME_ENV: &str = "SILO_HOME";
 
-pub(crate) fn resolve_default_data_dir() -> Result<PathBuf, LibVmError> {
-    let home = env_absolute_path("HOME")?;
-    let data_home = env_absolute_path("XDG_DATA_HOME")?
-        .or_else(|| home.as_ref().map(|path| path.join(".local/share")));
-
-    data_home
-        .map(|path| path.join(APP_DIR_NAME))
-        .ok_or(LibVmError::DataDirUnavailable)
+/// Resolves the Silo home: `SILO_HOME`, else `$HOME/.silo`.
+pub(crate) fn resolve_default_home() -> Result<PathBuf, LibVmError> {
+    if let Some(home) = env_absolute_path(SILO_HOME_ENV)? {
+        return Ok(home);
+    }
+    env_absolute_path("HOME")?
+        .map(|home| home.join(HOME_DIR_NAME))
+        .ok_or(LibVmError::HomeUnavailable)
 }
 
-pub(crate) fn resolve_default_state_dir() -> Result<PathBuf, LibVmError> {
-    let home = env_absolute_path("HOME")?;
-    let state_home = env_absolute_path("XDG_STATE_HOME")?
-        .or_else(|| home.as_ref().map(|path| path.join(".local/state")));
-
-    state_home
-        .map(|path| path.join(APP_DIR_NAME))
-        .ok_or(LibVmError::StateDirUnavailable)
-}
-
-pub(crate) fn resolve_default_run_dir() -> Result<PathBuf, LibVmError> {
-    env_absolute_path("XDG_RUNTIME_DIR")
-        .map(|runtime_dir| runtime_dir.map(|path| path.join(APP_DIR_NAME)))
-        .map(|runtime_dir| {
-            runtime_dir
-                .unwrap_or_else(|| PathBuf::from(format!("/tmp/silo-{}", geteuid().as_raw())))
-        })
+/// The run root for generated sockets, pidfiles and locks. It is fixed and
+/// independent of the home directory so Unix socket paths stay well inside
+/// `sun_path` no matter how long the home path is.
+pub(crate) fn default_run_root() -> PathBuf {
+    PathBuf::from(format!("/tmp/silo-{}", geteuid().as_raw()))
 }
 
 pub(crate) fn ensure_run_root(path: &Path) -> Result<(), LibVmError> {
@@ -90,7 +81,7 @@ fn invalid_run_root(path: &Path, message: impl std::fmt::Display) -> LibVmError 
     }
 }
 
-fn env_absolute_path(name: &'static str) -> Result<Option<PathBuf>, LibVmError> {
+pub(crate) fn env_absolute_path(name: &'static str) -> Result<Option<PathBuf>, LibVmError> {
     match std::env::var_os(name) {
         Some(value) => absolute_path(name, value).map(Some),
         None => Ok(None),
@@ -110,26 +101,25 @@ fn absolute_path(name: &'static str, value: OsString) -> Result<PathBuf, LibVmEr
 mod tests {
     use std::ffi::OsString;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use nix::unistd::geteuid;
 
     use crate::paths::defaults::{
-        absolute_path, ensure_run_root, resolve_default_data_dir, resolve_default_run_dir,
-        resolve_default_state_dir,
+        absolute_path, default_run_root, ensure_run_root, resolve_default_home,
     };
     use crate::LibVmError;
 
     #[test]
     fn absolute_path_rejects_relative_env_values() {
-        let err = absolute_path("XDG_DATA_HOME", OsString::from("relative"))
+        let err = absolute_path("SILO_HOME", OsString::from("relative"))
             .expect_err("relative path should be rejected");
 
         assert!(matches!(
             err,
             LibVmError::RelativeEnvironmentPath {
-                name: "XDG_DATA_HOME",
+                name: "SILO_HOME",
                 path
             } if path == Path::new("relative")
         ));
@@ -182,102 +172,70 @@ mod tests {
         assert!(ensure_run_root(&run_root).is_err());
     }
 
+    /// Runs in a child process with a controlled environment (see the tests below).
     #[test]
     fn environment_probe() {
         let Some(mode) = std::env::var_os("SILO_PATHS_TEST_PROBE") else {
             return;
         };
-        if mode == "reject-relative" {
-            let operation = std::env::var("SILO_PATHS_TEST_OPERATION").expect("probe operation");
-            let error = match operation.as_str() {
-                "data" => resolve_default_data_dir().expect_err("reject relative data path"),
-                "state" => resolve_default_state_dir().expect_err("reject relative state path"),
-                "run" => resolve_default_run_dir().expect_err("reject relative run path"),
-                _ => panic!("unknown probe operation {operation}"),
-            };
-            assert!(matches!(error, LibVmError::RelativeEnvironmentPath { .. }));
+        if mode == "reject" {
+            assert!(matches!(
+                resolve_default_home().expect_err("reject home"),
+                LibVmError::RelativeEnvironmentPath { .. } | LibVmError::HomeUnavailable
+            ));
             return;
         }
-
-        let expected_data = std::env::var_os("SILO_EXPECT_DATA").expect("expected data path");
-        let expected_state = std::env::var_os("SILO_EXPECT_STATE").expect("expected state path");
-        let expected_run = std::env::var_os("SILO_EXPECT_RUN").expect("expected run path");
+        let expected_home = std::env::var_os("SILO_EXPECT_HOME").expect("expected home");
         assert_eq!(
-            resolve_default_data_dir().expect("resolve data"),
-            std::path::PathBuf::from(expected_data)
+            resolve_default_home().expect("resolve home"),
+            PathBuf::from(expected_home)
         );
         assert_eq!(
-            resolve_default_state_dir().expect("resolve state"),
-            std::path::PathBuf::from(expected_state)
-        );
-        assert_eq!(
-            resolve_default_run_dir().expect("resolve run"),
-            std::path::PathBuf::from(expected_run)
+            default_run_root(),
+            PathBuf::from(format!("/tmp/silo-{}", geteuid().as_raw()))
         );
     }
 
-    #[test]
-    fn environment_resolution_uses_absolute_xdg_paths_and_fallbacks() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        run_environment_probe(
-            [
-                ("HOME", temp.path().join("home")),
-                ("XDG_DATA_HOME", temp.path().join("data")),
-                ("XDG_STATE_HOME", temp.path().join("state")),
-                ("XDG_RUNTIME_DIR", temp.path().join("runtime")),
-            ],
-            temp.path().join("data/silo"),
-            temp.path().join("state/silo"),
-            temp.path().join("runtime/silo"),
-        );
-        run_environment_probe(
-            [("HOME", temp.path().join("home"))],
-            temp.path().join("home/.local/share/silo"),
-            temp.path().join("home/.local/state/silo"),
-            std::path::PathBuf::from(format!("/tmp/silo-{}", geteuid().as_raw())),
-        );
-    }
-
-    #[test]
-    fn environment_resolution_rejects_relative_xdg_and_home_paths() {
-        for (name, value, operation) in [
-            ("XDG_DATA_HOME", "relative", "data"),
-            ("XDG_STATE_HOME", "relative", "state"),
-            ("XDG_RUNTIME_DIR", "relative", "run"),
-            ("HOME", "relative", "data"),
-        ] {
-            let output = Command::new(std::env::current_exe().expect("current test executable"))
-                .arg("--exact")
-                .arg("paths::defaults::tests::environment_probe")
-                .env_clear()
-                .env("SILO_PATHS_TEST_PROBE", "reject-relative")
-                .env("SILO_PATHS_TEST_OPERATION", operation)
-                .env(name, value)
-                .output()
-                .expect("run environment probe");
-            assert!(output.status.success(), "{name} should be rejected");
-        }
-    }
-
-    fn run_environment_probe<const N: usize>(
-        environment: [(&str, std::path::PathBuf); N],
-        data: std::path::PathBuf,
-        state: std::path::PathBuf,
-        run: std::path::PathBuf,
-    ) {
+    fn probe<const N: usize>(mode: &str, environment: [(&str, PathBuf); N]) -> bool {
         let mut command = Command::new(std::env::current_exe().expect("current test executable"));
         command
             .arg("--exact")
             .arg("paths::defaults::tests::environment_probe")
             .env_clear()
-            .env("SILO_PATHS_TEST_PROBE", "1")
-            .env("SILO_EXPECT_DATA", data)
-            .env("SILO_EXPECT_STATE", state)
-            .env("SILO_EXPECT_RUN", run);
+            .env("SILO_PATHS_TEST_PROBE", mode);
         for (name, value) in environment {
             command.env(name, value);
         }
-        let status = command.status().expect("run environment probe");
-        assert!(status.success(), "environment probe should succeed");
+        command.status().expect("run environment probe").success()
+    }
+
+    #[test]
+    fn home_prefers_silo_home_then_dot_silo_and_ignores_xdg() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        assert!(probe(
+            "resolve",
+            [
+                ("HOME", temp.path().join("user")),
+                ("SILO_HOME", temp.path().join("custom")),
+                ("SILO_EXPECT_HOME", temp.path().join("custom")),
+            ]
+        ));
+        assert!(probe(
+            "resolve",
+            [
+                ("HOME", temp.path().join("user")),
+                ("XDG_DATA_HOME", temp.path().join("data")),
+                ("XDG_STATE_HOME", temp.path().join("state")),
+                ("XDG_RUNTIME_DIR", temp.path().join("runtime")),
+                ("SILO_EXPECT_HOME", temp.path().join("user/.silo")),
+            ]
+        ));
+    }
+
+    #[test]
+    fn home_rejects_relative_or_missing_environment() {
+        assert!(probe("reject", [("SILO_HOME", PathBuf::from("relative"))]));
+        assert!(probe("reject", [("HOME", PathBuf::from("relative"))]));
+        assert!(probe("reject", []));
     }
 }

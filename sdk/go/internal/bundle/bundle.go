@@ -27,7 +27,7 @@ func Path() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	directory := filepath.Join(root, "silo", "go-ffi", sdkVersion, platformTarget)
+	directory := filepath.Join(root, "go-ffi", sdkVersion, platformTarget)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return "", fmt.Errorf("create Silo bridge cache: %w", err)
 	}
@@ -90,18 +90,19 @@ func validateOverride(value string) (string, error) {
 	return path, nil
 }
 
+// cacheRoot is <silo home>/cache: SILO_HOME (must be absolute), else $HOME/.silo.
 func cacheRoot() (string, error) {
-	if value := os.Getenv("XDG_CACHE_HOME"); value != "" {
+	if value := os.Getenv("SILO_HOME"); value != "" {
 		if !filepath.IsAbs(value) {
-			return "", fmt.Errorf("XDG_CACHE_HOME must be absolute: %s", value)
+			return "", fmt.Errorf("SILO_HOME must be absolute: %s", value)
 		}
-		return filepath.Clean(value), nil
+		return filepath.Join(filepath.Clean(value), "cache"), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" || !filepath.IsAbs(home) {
-		return "", errors.New("could not resolve Silo bridge cache from XDG_CACHE_HOME or HOME")
+		return "", errors.New("could not resolve the Silo home from SILO_HOME or HOME")
 	}
-	return filepath.Join(home, ".cache"), nil
+	return filepath.Join(home, ".silo", "cache"), nil
 }
 
 func validDigest(path, expected string) bool {

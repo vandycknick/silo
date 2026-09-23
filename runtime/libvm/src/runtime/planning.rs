@@ -19,28 +19,21 @@ use crate::LibVmError;
 /// entries. Registry resolution may use the network for policies that allow it.
 #[derive(Debug, Clone)]
 pub struct ReadOnlyRuntime {
-    data_root: PathBuf,
-    image_root: PathBuf,
+    home: PathBuf,
     store: Option<ReadOnlyStore>,
 }
 
 impl ReadOnlyRuntime {
     /// Opens existing planning state without creating any local state.
     pub async fn open(config: RuntimeConfig) -> Result<Self, LibVmError> {
-        let data_root = config.bootstrap_data_root()?;
-        let state_db_path = data_root.join("state.db");
-        let store = ReadOnlyStore::open_if_exists(&state_db_path).await?;
-        let stored = match &store {
-            Some(store) => store.db_config().await?,
-            None => None,
-        };
-        let (data_root, _state_root, image_root) =
-            config.resolve_durable_roots_read_only(stored.as_ref(), &state_db_path)?;
-        Ok(Self {
-            data_root,
-            image_root,
-            store,
-        })
+        let home = config.resolve_home()?;
+        let store = ReadOnlyStore::open_if_exists(&home.join("state.db")).await?;
+        if let Some(store) = &store {
+            if let Some(stored) = store.db_config().await? {
+                crate::runtime::config::validate_db_config(&stored)?;
+            }
+        }
+        Ok(Self { home, store })
     }
 
     /// Checks whether a machine name is free without reserving it.
@@ -62,7 +55,7 @@ impl ReadOnlyRuntime {
         reference: String,
         policy: ImagePullPolicy,
     ) -> Result<ResolvedOciImage, LibVmError> {
-        let store = RootfsImageStore::open(&self.image_root)
+        let store = RootfsImageStore::open(self.home.join("images"))
             .map_err(|error| image_error(&reference, error))?;
         let options =
             MaterializeOptions::for_host().map_err(|error| image_error(&reference, error))?;
@@ -85,7 +78,7 @@ impl ReadOnlyRuntime {
 
     /// Validates that a disk can be read and that its future machine parent can be created.
     pub fn validate_disk_source(&self, path: &Path) -> Result<PathBuf, LibVmError> {
-        validate_create_parent(&self.data_root.join("machines"))?;
+        validate_create_parent(&self.home.join("machines"))?;
         Ok(resolve_local_disk(path)?.canonical_path)
     }
 }
@@ -128,7 +121,6 @@ mod tests {
     use crate::{OciImageConfigMetadata, Platform};
     use oci::{RootfsLayerMetadata, RootfsMetadata};
 
-    use crate::paths::LocalRoots;
     use crate::store::models::DbConfig;
     use crate::store::{ConfigStore, Store};
     use crate::{ImagePullPolicy, ReadOnlyRuntime, RuntimeConfig};
@@ -200,21 +192,13 @@ mod tests {
     async fn existing_database_is_unchanged_while_checking_name_collisions() {
         let temp = tempfile::tempdir().expect("create temp root");
         let data_root = temp.path().join("data");
-        let state_root = temp.path().join("state");
-        let image_root = temp.path().join("images");
-        let roots = LocalRoots::with_roots(
-            &data_root,
-            &state_root,
-            temp.path().join("run"),
-            &image_root,
-        );
         let store = Store::open(&data_root.join("state.db"))
             .await
             .expect("create state database");
         store
-            .read_or_seed_db_config(&DbConfig::from_roots(&roots))
+            .read_or_seed_db_config(&DbConfig::current())
             .await
-            .expect("seed roots");
+            .expect("seed host contract");
         store
             .execute_test_sql(
                 "INSERT INTO machine_config (id, name, config_json)
@@ -225,13 +209,9 @@ mod tests {
         store.close().await;
         let before = snapshot(temp.path());
 
-        let runtime = ReadOnlyRuntime::open(
-            RuntimeConfig::local(&data_root)
-                .with_state_root(&state_root)
-                .with_image_root(&image_root),
-        )
-        .await
-        .expect("open read-only runtime");
+        let runtime = ReadOnlyRuntime::open(RuntimeConfig::local(&data_root))
+            .await
+            .expect("open read-only runtime");
 
         assert!(!runtime
             .machine_name_available("taken")
@@ -306,7 +286,7 @@ mod tests {
     async fn cached_oci_resolution_preserves_all_local_metadata() {
         let temp = tempfile::tempdir().expect("create temp root");
         let data_root = temp.path().join("data");
-        let image_root = temp.path().join("images");
+        let image_root = data_root.join("images");
         let digest = format!("sha256:{}", "a".repeat(64));
         let reference = format!("example.test/demo@{digest}");
         let platform = Platform::host().expect("host platform");
@@ -345,10 +325,9 @@ mod tests {
         )
         .expect("write cached metadata");
         let before = snapshot(temp.path());
-        let runtime =
-            ReadOnlyRuntime::open(RuntimeConfig::local(&data_root).with_image_root(&image_root))
-                .await
-                .expect("open read-only runtime");
+        let runtime = ReadOnlyRuntime::open(RuntimeConfig::local(&data_root))
+            .await
+            .expect("open read-only runtime");
 
         let image = runtime
             .resolve_oci_image(reference.clone(), ImagePullPolicy::Never)
@@ -357,18 +336,16 @@ mod tests {
 
         assert_eq!(image.selected_reference, reference);
         assert_eq!(before, snapshot(temp.path()));
-        assert!(!data_root.exists());
+        assert!(!data_root.join("state.db").exists());
     }
 
     #[tokio::test]
     async fn uncached_never_resolution_creates_no_local_state() {
         let temp = tempfile::tempdir().expect("create temp root");
         let data_root = temp.path().join("data");
-        let image_root = temp.path().join("images");
-        let runtime =
-            ReadOnlyRuntime::open(RuntimeConfig::local(&data_root).with_image_root(&image_root))
-                .await
-                .expect("open read-only runtime");
+        let runtime = ReadOnlyRuntime::open(RuntimeConfig::local(&data_root))
+            .await
+            .expect("open read-only runtime");
 
         assert!(runtime
             .resolve_oci_image(

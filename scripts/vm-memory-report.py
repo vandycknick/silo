@@ -11,9 +11,11 @@ Needs `footprint` and `vmmap` (Xcode command line tools) and `silo exec`.
 
 import ctypes
 import json
+import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 MIB = 1024 * 1024
 GUEST_SCRIPT = r"""
@@ -70,6 +72,12 @@ def find_pid(binary, short_id):
         if f"/{binary} " in cmd or cmd.startswith(binary):
             return int(pid)
     return None
+
+
+def silo_home() -> Path:
+    """Resolve the Silo home like libvm: SILO_HOME, else ~/.silo."""
+    configured = os.environ.get("SILO_HOME")
+    return Path(configured) if configured else Path.home() / ".silo"
 
 
 def worker_pid(process_rows: str, supervisor_pid: int) -> int | None:
@@ -255,7 +263,7 @@ def main():
     print(f"  accounting residual       {mib(residual)}   (not a leak or reported-page measurement)")
     print("  Host mappings, guest mappings and backing objects can account for the same pages differently.")
     try:
-        status = json.load(open("/tmp/silo-501/daemon/status.json"))
+        status = json.load(open(silo_home() / "daemon" / "status.json"))
         if status.get("machine_id", "").startswith(machine["short_id"]):
             print()
             print("DAEMON")

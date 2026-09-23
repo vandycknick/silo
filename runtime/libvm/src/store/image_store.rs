@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use async_trait::async_trait;
 use sqlx::Row;
@@ -232,11 +232,7 @@ impl ImageStore for Store {
     }
 
     async fn prune_images(&self) -> Result<ImagePruneReport, LibVmError> {
-        let image_root = PathBuf::from(
-            sqlx::query_scalar::<_, String>("SELECT image_root FROM db_config WHERE id = 1")
-                .fetch_one(&self.pool)
-                .await?,
-        );
+        let image_root = self.images_dir.clone();
         let artifact_rows = sqlx::query(
             "SELECT image_id, rootfs_path, size_bytes
              FROM image_rootfs_artifact a

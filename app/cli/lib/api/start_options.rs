@@ -18,7 +18,7 @@ pub(crate) async fn machine_start_options(
     let mut options = MachineStartOptions::new();
     if data.retention == libvm::MachineRetention::Ephemeral {
         let executable = std::env::current_exe().context("resolve CLI binary path")?;
-        options = cleanup_on_exit_options(executable, runtime.local_data_dir(), &machine.id());
+        options = cleanup_on_exit_options(executable, runtime.local_home(), &machine.id());
     }
     if let Some(policy) = data.network.policy() {
         let credentials = egress_credentials_from_secret_store(policy)?;
@@ -46,13 +46,13 @@ pub(crate) async fn machine_start_options_without_cleanup(
 
 pub(crate) fn cleanup_on_exit_options(
     executable: PathBuf,
-    data_dir: &Path,
+    home: &Path,
     machine_id: &str,
 ) -> MachineStartOptions {
     MachineStartOptions::new().on_exit(HostCommand::new(executable).args([
         OsString::from("cleanup"),
-        OsString::from("--data-dir"),
-        data_dir.as_os_str().to_owned(),
+        OsString::from("--home"),
+        home.as_os_str().to_owned(),
         OsString::from("--machine-id"),
         OsString::from(machine_id),
     ]))
@@ -79,7 +79,7 @@ mod tests {
             on_exit.args,
             vec![
                 OsString::from("cleanup"),
-                OsString::from("--data-dir"),
+                OsString::from("--home"),
                 OsString::from("/tmp/silo"),
                 OsString::from("--machine-id"),
                 OsString::from("0123456789abcdef0123456789abcdef"),

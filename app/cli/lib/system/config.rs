@@ -206,9 +206,12 @@ pub(crate) struct ResolvedShare {
 }
 
 impl SystemConfig {
+    /// `home` is the user's home (shared into the system VM when configured);
+    /// `silo_home` holds Silo's fixed-name control sockets such as `docker.sock`.
     pub(crate) fn resolve(
         &self,
         home: &Path,
+        silo_home: &Path,
         image_override: Option<&str>,
     ) -> eyre::Result<ResolvedSystemConfig> {
         let environment_backend = if self.backend.is_some() {
@@ -218,12 +221,13 @@ impl SystemConfig {
                 .map(SystemBackend::try_from)
                 .transpose()?
         };
-        self.resolve_with_backend_override(home, image_override, environment_backend)
+        self.resolve_with_backend_override(home, silo_home, image_override, environment_backend)
     }
 
     fn resolve_with_backend_override(
         &self,
         home: &Path,
+        silo_home: &Path,
         image_override: Option<&str>,
         environment_backend: Option<SystemBackend>,
     ) -> eyre::Result<ResolvedSystemConfig> {
@@ -316,7 +320,7 @@ impl SystemConfig {
         if image.trim().is_empty() {
             bail!("daemon.system.image cannot be empty");
         }
-        let docker_socket = home.join(".docker/run/silo.sock");
+        let docker_socket = silo_home.join("run/docker.sock");
         let backend = self
             .backend
             .or(environment_backend)
@@ -406,8 +410,14 @@ mod tests {
             "version: '1'\nsystem:\n  image: 'registry.example/system@sha256:test'\n",
         )
         .expect("config");
-        let resolved = config.resolve(temp.path(), None).expect("resolve");
+        let resolved = config
+            .resolve(temp.path(), &temp.path().join(".silo"), None)
+            .expect("resolve");
         assert_eq!(resolved.shares.len(), 1);
+        assert_eq!(
+            resolved.docker_socket,
+            temp.path().join(".silo/run/docker.sock")
+        );
         assert_eq!(resolved.memory_bytes, 8 * 1024 * 1024 * 1024);
         for key in [
             "memory-reclaim",
@@ -427,7 +437,7 @@ mod tests {
             serde_yaml_ng::from_str("version: '1'\nsystem:\n  rosetta: false\n").expect("config");
         assert!(
             !pinned_off
-                .resolve(temp.path(), None)
+                .resolve(temp.path(), temp.path(), None)
                 .expect("resolve")
                 .rosetta
         );
@@ -447,7 +457,9 @@ mod tests {
             "version: '1'\nbackend: krun\nsystem:\n  image: registry.example/system@sha256:test\n",
         )
         .expect("config");
-        let resolved = config.resolve(home.path(), None).expect("resolve");
+        let resolved = config
+            .resolve(home.path(), home.path(), None)
+            .expect("resolve");
         assert_eq!(resolved.backend, SystemBackend::Krun);
         assert!(!resolved.rosetta);
         assert!(!resolved.rosetta_explicit);
@@ -457,7 +469,7 @@ mod tests {
         )
         .expect("config");
         let enabled = enabled
-            .resolve(home.path(), None)
+            .resolve(home.path(), home.path(), None)
             .expect("resolve Rosetta opt-in");
         assert!(enabled.rosetta);
         assert!(enabled.rosetta_explicit);
@@ -471,7 +483,12 @@ mod tests {
         )
         .expect("config");
         let resolved = config
-            .resolve_with_backend_override(home.path(), None, Some(SystemBackend::Krun))
+            .resolve_with_backend_override(
+                home.path(),
+                home.path(),
+                None,
+                Some(SystemBackend::Krun),
+            )
             .expect("resolve explicit VZ");
         assert_eq!(resolved.backend, SystemBackend::Vz);
         assert_eq!(
@@ -489,7 +506,12 @@ mod tests {
         .expect("config");
         assert_eq!(
             environment_selected
-                .resolve_with_backend_override(home.path(), None, Some(SystemBackend::Krun))
+                .resolve_with_backend_override(
+                    home.path(),
+                    home.path(),
+                    None,
+                    Some(SystemBackend::Krun)
+                )
                 .expect("resolve environment krun")
                 .backend,
             SystemBackend::Krun
@@ -503,7 +525,10 @@ mod tests {
         let config: SystemConfig =
             serde_yaml_ng::from_str("version: '1'\nsystem: {}\n").expect("config");
         assert_eq!(
-            config.resolve(temp.path(), None).expect("resolve").image,
+            config
+                .resolve(temp.path(), temp.path(), None)
+                .expect("resolve")
+                .image,
             "ghcr.io/vandycknick/silo/system:dev"
         );
     }
@@ -519,6 +544,6 @@ mod tests {
             child.display()
         );
         let config: SystemConfig = serde_yaml_ng::from_str(&raw).expect("config");
-        assert!(config.resolve(home.path(), None).is_err());
+        assert!(config.resolve(home.path(), home.path(), None).is_err());
     }
 }

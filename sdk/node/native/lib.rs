@@ -24,9 +24,7 @@ use vm_spec::Mount;
 
 #[napi(object)]
 pub struct RuntimeOpenOptions {
-    pub data_root: Option<String>,
-    pub run_root: Option<String>,
-    pub image_root: Option<String>,
+    pub home: Option<String>,
     pub vmmon_path: Option<String>,
 }
 
@@ -469,21 +467,12 @@ struct MachineLogHandleState {
 
 #[napi(js_name = "openRuntime")]
 pub async fn open_runtime(options: Option<RuntimeOpenOptions>) -> Result<NativeRuntime> {
-    let mut config = match options
-        .as_ref()
-        .and_then(|options| options.data_root.as_ref())
-    {
-        Some(data_root) => RuntimeConfig::local(data_root),
+    let mut config = match options.as_ref().and_then(|options| options.home.as_ref()) {
+        Some(home) => RuntimeConfig::local(home),
         None => RuntimeConfig::from_env().map_err(to_napi_error)?,
     };
 
     if let Some(options) = options {
-        if let Some(run_root) = options.run_root {
-            config = config.with_run_root(run_root);
-        }
-        if let Some(image_root) = options.image_root {
-            config = config.with_image_root(image_root);
-        }
         if let Some(vmmon_path) = options.vmmon_path {
             config = config.with_vmmon_path(vmmon_path);
         }
@@ -2201,7 +2190,7 @@ fn pull_policy_from_string(policy: &str) -> Result<ImagePullPolicy> {
 
 fn to_napi_error(error: LibVmError) -> Error {
     let variant = match &error {
-        LibVmError::DataDirUnavailable => "DataDirUnavailable",
+        LibVmError::HomeUnavailable => "HomeUnavailable",
         LibVmError::ConfigDirUnavailable => "ConfigDirUnavailable",
         LibVmError::RelativeEnvironmentPath { .. } => "RelativeEnvironmentPath",
         LibVmError::InvalidMachineName { .. } => "InvalidMachineName",
