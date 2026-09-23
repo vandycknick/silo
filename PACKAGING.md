@@ -29,8 +29,8 @@ The current commands do not produce notarized macOS artifacts, release
 signatures, or published releases. Official Linux distribution is archive-only;
 native Linux distribution packages are not planned requirements.
 
-Vmmon now contains both supervisor and private krun-worker modes. Do not package
-`bin/krun` or `Contents/Helpers/krun`, and remove obsolete `KRUN_BIN` overrides.
+Vmmon contains both the supervisor and the `worker` subcommand. Package vmmon
+and netd alongside the guest assets; krun is linked into vmmon as a library.
 macOS signing must use vmmon's Hypervisor/Virtualization entitlement union. See
 the [worker acceptance matrix](docs/architecture/krun-worker.md#evidence-from-this-refactor)
 before treating a build or inventory check as native release qualification.

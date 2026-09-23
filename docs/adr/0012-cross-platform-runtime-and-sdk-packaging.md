@@ -172,7 +172,7 @@ The portable runtime root has this fixed layout:
 
 All five files are included for every initial target. `vmmon` contains the
 pinned Silo libkrun fork directly, executing it only in a separate private worker
-process with argv[0] `krun`. The payload does not contain a standalone krun,
+process using the `worker` subcommand. The payload does not contain a standalone krun,
 `libkrun.so`, `libkrun.dylib`, or `libkrunfw`. Libvm and language bindings launch
 vmmon; they do not link libkrun.
 
@@ -1201,5 +1201,5 @@ and release staging contract in this ADR support them without replacement.
 - [Go Modules Reference: Authenticating modules](https://go.dev/ref/mod#authenticating)
 
 The krun backend now executes as a private worker mode of vmmon. Runtime payloads
-do not contain a separate krun executable. `KRUN_BIN` is rejected as obsolete;
-vmmon requires the union of virtualization and hypervisor macOS entitlements.
+contain vmmon and netd executables. Vmmon requires the union of virtualization
+and hypervisor macOS entitlements.

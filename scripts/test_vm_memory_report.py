@@ -17,19 +17,19 @@ class WorkerDiscoveryTests(unittest.TestCase):
     def test_selects_only_the_supervisors_private_worker(self) -> None:
         rows = "\n".join([
             "10 1 /runtime/vmmon --id abc",
-            "11 10 krun __krun --request-fd 3",
-            "12 99 krun __krun --request-fd 3",
-            "13 10 vmmon --name __krun",
-            "14 10 krun --id abc",
+            "11 10 /runtime/vmmon worker --request-fd 3",
+            "12 99 /runtime/vmmon worker --request-fd 3",
+            "13 10 vmmon --name worker",
+            "14 10 /bin/sh -c true",
         ])
         self.assertEqual(report.worker_pid(rows, 10), 11)
         self.assertIsNone(report.worker_pid(rows, 42))
-        self.assertEqual(report.worker_pid("11 10 /runtime/vmmon __krun --request-fd 3", 10), 11)
+        self.assertEqual(report.worker_pid("11 10 vmmon worker --request-fd 3", 10), 11)
 
     def test_rejects_multiple_workers_and_ignores_malformed_rows(self) -> None:
         with self.assertRaises(ValueError):
-            report.worker_pid("11 10 krun __krun\n12 10 krun __krun", 10)
-        self.assertIsNone(report.worker_pid("unknown\npid ppid args\n11 10 vmmon __krun-extra", 10))
+            report.worker_pid("11 10 vmmon worker\n12 10 vmmon worker", 10)
+        self.assertIsNone(report.worker_pid("unknown\npid ppid args", 10))
 
 
 class ReportingGeometryTests(unittest.TestCase):

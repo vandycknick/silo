@@ -133,7 +133,7 @@ fn worker_with_events(
 
 fn private_command(roles: [i32; 4]) -> Command {
     let mut command = command();
-    command.arg0("krun").arg("__krun");
+    command.arg("worker");
     for (flag, fd) in [
         "--request-fd",
         "--events-fd",
@@ -427,43 +427,6 @@ fn parent_loss_cancels_an_incomplete_supervisor_request() {
 }
 
 #[test]
-fn worker_parser_never_falls_through_to_supervisor_arguments() {
-    for argv in [
-        vec!["__krun"],
-        vec!["__krun", "--id", "not-a-supervisor"],
-        vec![
-            "__krun",
-            "--request-fd",
-            "0",
-            "--events-fd",
-            "1",
-            "--watchdog-fd",
-            "2",
-            "--console-fd",
-            "3",
-        ],
-    ] {
-        let output = Process(Some(command().args(argv).spawn().expect("spawn parser"))).output();
-        assert!(!output.status.success());
-        let diagnostic = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !diagnostic.contains("--data-dir"),
-            "supervisor parser ran: {diagnostic}"
-        );
-    }
-    let output = Process(Some(
-        command()
-            .arg0("krun")
-            .arg("--help")
-            .spawn()
-            .expect("basename guard"),
-    ))
-    .output();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("private __krun marker"));
-}
-
-#[test]
 fn watchdog_runs_before_a_complete_launch_request_exists() {
     let (child, mut request, keepalive, mut events, _console) = worker();
     // Receipt of the first event proves adoption and watchdog setup completed.
@@ -516,10 +479,6 @@ fn invalid_descriptor_roles_fail_before_any_worker_event() {
         );
         let output = Process(Some(command.spawn().expect("worker"))).output();
         assert!(!output.status.success(), "{label}");
-        assert!(
-            !String::from_utf8_lossy(&output.stderr).contains("--data-dir"),
-            "{label}"
-        );
     }
     let (datagram, _peer) = std::os::unix::net::UnixDatagram::pair().expect("datagram");
     let datagram: OwnedFd = datagram.into();
@@ -589,30 +548,6 @@ fn watchdog_terminates_worker_with_a_full_event_channel() {
     std::thread::sleep(Duration::from_millis(50));
     drop(keepalive);
     assert_eq!(child.output().status.code(), Some(125));
-}
-
-#[test]
-fn later_marker_remains_supervisor_data_and_non_utf8_basename_fails_closed() {
-    use std::os::unix::ffi::OsStringExt;
-    let output = Process(Some(
-        command()
-            .args(["--name", "__krun", "--help"])
-            .spawn()
-            .expect("supervisor help"),
-    ))
-    .output();
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("--data-dir"));
-    let output = Process(Some(
-        command()
-            .arg0(std::ffi::OsString::from_vec(b"/private/\xff/krun".to_vec()))
-            .arg("--help")
-            .spawn()
-            .expect("basename guard"),
-    ))
-    .output();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("private __krun marker"));
 }
 
 async fn native_serial(
@@ -695,10 +630,6 @@ async fn native_guest_cases(scenarios: &[NativeExit]) {
         assert_ne!(Some(worker), previous_worker);
         #[cfg(target_os = "linux")]
         {
-            let argv = std::fs::read(format!("/proc/{worker}/cmdline")).expect("worker argv");
-            let mut argv = argv.split(|byte| *byte == 0);
-            assert_eq!(argv.next(), Some(b"krun".as_slice()));
-            assert_eq!(argv.next(), Some(b"__krun".as_slice()));
             assert_eq!(
                 std::fs::read_link(format!("/proc/{worker}/exe")).expect("worker executable"),
                 std::fs::canonicalize(env!("CARGO_BIN_EXE_vmmon")).expect("vmmon executable")

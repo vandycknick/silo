@@ -1,6 +1,6 @@
 # libkrun Implicit Behaviors
 
-Silo executes libkrun in a private worker launched from vmmon itself, with argv[0] `krun`. The `virt/krun` crate constructs the VM explicitly; it does not launch processes. At the pinned native Rust API revision, `VmmBuilder` starts without implicit console, vsock, balloon, or RNG devices and does not inject a default init binary. Silo adds every required device explicitly.
+Silo executes libkrun in a private worker launched as `vmmon worker` from its own executable. The `virt/krun` crate constructs the VM explicitly; it does not launch processes. At the pinned native Rust API revision, `VmmBuilder` starts without implicit console, vsock, balloon, or RNG devices and does not inject a default init binary. Silo adds every required device explicitly.
 
 ## Runtime Defaults
 
@@ -56,4 +56,4 @@ Source references for the historical v1 behavior:
 
 ## Parent Liveness
 
-The parent process passes the helper a watchdog pipe read fd in `SILO_KRUN_WATCHDOG_FD` and holds the write fd for the VM lifetime. If the parent dies, the write fd closes, the helper observes `POLLHUP`, and exits. This avoids orphaned helper processes without relying on Linux-only `PR_SET_PDEATHSIG`.
+The supervisor passes the worker a watchdog pipe read fd through `--watchdog-fd` and holds the write fd for the VM lifetime. If the parent dies, the write fd closes, the helper observes `POLLHUP`, and exits. This avoids orphaned helper processes without relying on Linux-only `PR_SET_PDEATHSIG`.

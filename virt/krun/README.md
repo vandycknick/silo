@@ -5,10 +5,9 @@ There is no standalone krun executable or process launcher in this crate.
 
 ## Execution boundary
 
-The supervisor launches its own vmmon executable with argv[0] `krun` and the
-first private argument `__krun`. The worker dispatches before supervisor
-argument parsing, logging, Tokio, or services. It receives private configuration
-through an inherited pipe, not argv or environment variables.
+The supervisor launches `vmmon worker` using its own executable. Clap selects
+the worker before supervisor logging, Tokio, or services. It receives private
+configuration through an inherited pipe, not argv or environment variables.
 
 `engine::run_process(config, resources, on_built)` must run only in that dedicated
 worker process. Libkrun normally terminates the **entire calling process** using
@@ -41,8 +40,8 @@ restricted to CID 3 and cannot coexist with the mux.
 Rosetta configuration remains typed and validated, including immutable source
 verification, translator digest, ioctl result and captured-response size. Debug
 output redacts its content. The selected worker receives it through the bounded
-private request. The signed qualification harness also uses the vmmon worker;
-its executable option is `--vmmon`, not `--krun`.
+private request. The signed qualification harness selects the vmmon executable
+with `--vmmon`.
 
 ## Features and host support
 

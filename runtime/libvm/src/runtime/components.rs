@@ -7,7 +7,6 @@ use crate::LibVmError;
 
 const ENV_VMMON_PATH: &str = "SILO_VMMON_PATH";
 const ENV_NETD_PATH: &str = "NETD_BIN";
-const ENV_KRUN_PATH: &str = "KRUN_BIN";
 const ENV_ASSET_DIR: &str = "SILO_ASSET_DIR";
 const ENV_RUNTIME_DIR: &str = "SILO_RUNTIME_DIR";
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -161,12 +160,6 @@ fn resolve_components_for_executable<E>(
 where
     E: ComponentEnvironment,
 {
-    if environment.get(ENV_KRUN_PATH).is_some() {
-        return Err(LibVmError::RuntimeComponentInvalid {
-            input: ENV_KRUN_PATH.to_string(),
-            message: "KRUN_BIN was removed; vmmon now launches its own private worker".to_string(),
-        });
-    }
     let api = explicit_api_overrides(config)?;
     if let Some(root) = config.runtime_root.as_deref() {
         let components = resolve_required_portable_root("runtime_root", root)?;
@@ -882,25 +875,6 @@ mod tests {
             &native,
             Vec::new(),
         )
-    }
-
-    #[test]
-    fn obsolete_krun_override_is_rejected_even_with_an_explicit_runtime_root() {
-        let temp = tempfile::tempdir().expect("temp");
-        portable(temp.path());
-        for value in ["", "/obsolete/krun"] {
-            let mut environment = TestEnvironment::default();
-            environment.values.insert("KRUN_BIN", value.into());
-            let error = resolve(
-                &RuntimeConfig::default().with_runtime_root(temp.path()),
-                &mut environment,
-                temp.path().join("silo"),
-                vec![],
-            )
-            .expect_err("reject obsolete override");
-            assert!(error.to_string().contains("KRUN_BIN was removed"));
-        }
-        assert!(!temp.path().join("bin/krun").exists());
     }
 
     #[test]

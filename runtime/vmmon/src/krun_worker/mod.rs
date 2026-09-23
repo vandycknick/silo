@@ -5,7 +5,6 @@ mod admission;
 mod fds;
 pub(crate) mod protocol;
 
-use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
@@ -16,27 +15,13 @@ use crate::krun_worker::protocol::{Event, MAX_EVENT};
 use clap::Parser;
 use krun::engine::{self, ConsoleFds, Resources};
 
-pub(crate) const MARKER: &str = "__krun";
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Mode {
-    Supervisor,
-    Worker,
-}
-
-pub(crate) fn mode(program: &OsStr, first: Option<&OsStr>) -> io::Result<Mode> {
-    if first == Some(OsStr::new(MARKER)) {
-        return Ok(Mode::Worker);
-    }
-    if std::path::Path::new(program).file_name() == Some(OsStr::new("krun")) {
-        return Err(protocol::invalid("krun requires the private __krun marker"));
-    }
-    Ok(Mode::Supervisor)
-}
-
 #[derive(Parser)]
-#[command(name = "krun", disable_help_subcommand = true)]
-struct Args {
+#[command(
+    name = "worker",
+    about = "Run the supervised libkrun process",
+    disable_help_subcommand = true
+)]
+pub(crate) struct Args {
     #[arg(long)]
     request_fd: RawFd,
     #[arg(long)]
@@ -49,8 +34,7 @@ struct Args {
     vsock_mux_fd: Option<RawFd>,
 }
 
-pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> eyre::Result<()> {
-    let args = Args::try_parse_from(std::iter::once(OsString::from("krun")).chain(args))?;
+pub(crate) fn run(args: Args) -> eyre::Result<()> {
     let fds::Bootstrap {
         request,
         events,
@@ -219,33 +203,4 @@ fn block_shutdown_signal() -> io::Result<nix::sys::signal::SigSet> {
     signals.add(Signal::SIGTERM);
     signal::pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&signals), None)?;
     Ok(signals)
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::krun_worker::{mode, Mode};
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
-
-    #[test]
-    fn only_the_first_marker_selects_worker_mode() {
-        assert_eq!(
-            mode(OsStr::new("vmmon"), Some(OsStr::new("__krun"))).expect("mode"),
-            Mode::Worker
-        );
-        assert_eq!(
-            mode(OsStr::new("vmmon"), Some(OsStr::new("--id"))).expect("mode"),
-            Mode::Supervisor
-        );
-        assert!(mode(OsStr::new("/private/bin/krun"), None).is_err());
-        assert!(mode(OsStr::new("krun"), Some(OsStr::new("--help"))).is_err());
-        assert_eq!(
-            mode(
-                OsStr::from_bytes(b"vm\xff"),
-                Some(OsStr::from_bytes(b"__krun\xff"))
-            )
-            .expect("mode"),
-            Mode::Supervisor
-        );
-    }
 }

@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 
 mod context;
 mod exec_log;
@@ -89,13 +89,15 @@ struct Args {
 }
 
 fn main() -> eyre::Result<()> {
-    let mut arguments = std::env::args_os();
-    let program = arguments.next().unwrap_or_default();
-    let first = arguments.next();
-    if krun_worker::mode(&program, first.as_deref())? == krun_worker::Mode::Worker {
-        return krun_worker::run(arguments);
+    let matches = Args::command()
+        .subcommand(krun_worker::Args::command())
+        .subcommand_negates_reqs(true)
+        .args_conflicts_with_subcommands(true)
+        .get_matches();
+    if let Some(("worker", matches)) = matches.subcommand() {
+        return krun_worker::run(krun_worker::Args::from_arg_matches(matches)?);
     }
-    let args = Args::parse();
+    let args = Args::from_arg_matches(&matches)?;
     let inherited_fds = InheritedPipeFds::from_env()?;
 
     let inherited_fds = if args.foreground {

@@ -7,7 +7,7 @@ libvm / CLI / SDK
   -> vmmon supervisor
        Tokio, API, guest services, lifecycle, exit metadata
        |
-       +-> current_exe(), argv[0] = krun, argv[1] = __krun
+       +-> current_exe() worker
              descriptor validation, watchdog, host admission
              synchronous krun engine -> libkrun -> process exit
 ```
@@ -17,10 +17,9 @@ the worker. Libkrun may call `_exit()` during normal shutdown. It must not run
 on a supervisor thread. The `virt/krun` crate is a process-owning engine facade,
 not a process launcher or reusable VM teardown API.
 
-The first OS-string argument `__krun` selects the private worker before Clap,
-Tokio, daemonization, or supervisor logging. Argv[0] `krun` without the marker
-fails closed. A later marker is ordinary supervisor data. The worker cannot
-fall through into supervisor initialization or spawn another worker.
+Clap dispatches the `vmmon worker` subcommand before Tokio, daemonization, or
+supervisor logging. The worker has its own descriptor arguments and does not
+initialize supervisor services or spawn another worker.
 
 `virt::VirtualMachine` remains the common application boundary. VZ remains in
 process on its existing dispatch queue. On macOS, vmmon needs both
@@ -101,13 +100,11 @@ retain weaker guarantees. They cannot promise final metadata or an exit command.
 The watchdog prevents a persistently running worker, but cannot resurrect a dead
 supervisor to finalize it.
 
-## Migration and qualification
+## Packaging and qualification
 
-There is no standalone krun build target, executable, runtime component, or helper
-path. Remove `KRUN_BIN` (even an empty value is rejected), `--krun-path`, and old
-runtime-builder krun-path overrides. Runtime/application payloads contain vmmon
-and netd plus the usual guest assets. The process label `krun` does not imply an
-installed `bin/krun`; executable-oriented tools may display vmmon instead.
+Runtime/application payloads contain vmmon and netd plus the usual guest assets.
+Both supervisor and worker processes execute vmmon; the worker uses the `worker`
+subcommand. The krun engine is a library, not an installed executable.
 
 See [process and native test instructions](../../runtime/vmmon/tests/README.md),
 [packaging](../../PACKAGING.md), and [native dependencies](../libkrun-deps.md).

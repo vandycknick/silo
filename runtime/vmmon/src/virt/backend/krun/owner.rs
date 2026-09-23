@@ -67,7 +67,7 @@ fn spawn(console: OwnedFd, mux: OwnedFd) -> io::Result<Spawned> {
     let event_receiver = Receiver::from_owned_fd(receive)?;
     let diagnostic_receiver = Receiver::from_owned_fd(diagnostics)?;
     let mut command = Command::new(std::env::current_exe()?);
-    command.arg0("krun").arg(crate::krun_worker::MARKER);
+    command.arg("worker");
     for (name, fd) in [
         ("--request-fd", &request),
         ("--events-fd", &events),
@@ -82,13 +82,6 @@ fn spawn(console: OwnedFd, mux: OwnedFd) -> io::Result<Spawned> {
         .stdout(Stdio::from(output.try_clone()?))
         .stderr(Stdio::from(output));
     command.kill_on_drop(true);
-    for name in [
-        "SILO_ROSETTA_CONFIG",
-        "SILO_KRUN_WATCHDOG_FD",
-        "SILO_KRUN_STATUS_FD",
-    ] {
-        command.env_remove(name);
-    }
     inherit::install(
         command.as_std_mut(),
         &[&request, &events, &watchdog, &console, &mux],

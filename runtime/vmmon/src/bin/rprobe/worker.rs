@@ -9,7 +9,6 @@ pub(crate) mod protocol;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -43,7 +42,7 @@ impl Worker {
         let master = File::from(pty.master);
         let serial = (master.try_clone()?, master);
         let mut command = Command::new(vmmon);
-        command.arg0("krun").arg("__krun");
+        command.arg("worker");
         for (name, fd) in [
             ("--request-fd", &request),
             ("--events-fd", &events),

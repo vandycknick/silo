@@ -2,7 +2,7 @@
 
 Silo compiles its pinned libkrun fork into `vmmon` through the `krun` engine
 crate. Vmmon executes it only in a separate private worker process, launched
-from the same executable with argv[0] `krun` and the first argument `__krun`.
+from the same executable using the `worker` subcommand.
 There is no standalone krun executable, `libkrun.so`, `libkrun.dylib`, or
 `libkrunfw` sidecar.
 
@@ -86,9 +86,9 @@ virtio-block stayed near 210 MiB footprint without maintenance and fell to
 
 The fork also merges adjacent descriptors of one free-page report into a
 single release cycle and exposes `VmmHandle::host_reclaim_status()`. The krun
-helper samples that every five seconds and writes a `host-memory-reclaim`
-record on a dedicated status pipe (`SILO_KRUN_STATUS_FD`) whenever it changes.
-vmmon reads the pipe, stores the latest record, and returns it in `GetMetrics`
+worker samples that every five seconds and writes a `host_memory_reclaim`
+event on its inherited event pipe. The supervisor reads the pipe, stores the
+latest record, and returns it in `GetMetrics`
 as `HostMetrics.host_memory_reclaim`, which is how `silo daemon status` learns
 whether the probe passed, whether reclaim is effective, and how many bytes were
 successfully advised free. The cumulative counter includes repeat reports and
