@@ -13,7 +13,7 @@ use crate::handles::{MachineHandle, MachineHandleList, RuntimeContext, RuntimeHa
 struct RuntimeOpenRequest {
     home: Option<String>,
     runtime_root: Option<String>,
-    vmmon_path: Option<String>,
+    supervisor_path: Option<String>,
 }
 
 #[no_mangle]
@@ -150,8 +150,8 @@ fn runtime_config(request: RuntimeOpenRequest) -> Result<RuntimeConfig, *mut Sil
     if let Some(runtime_root) = request.runtime_root {
         config = config.with_runtime_root(PathBuf::from(runtime_root));
     }
-    if let Some(vmmon_path) = request.vmmon_path {
-        config = config.with_vmmon_path(PathBuf::from(vmmon_path));
+    if let Some(supervisor_path) = request.supervisor_path {
+        config = config.with_supervisor_path(PathBuf::from(supervisor_path));
     }
     Ok(config)
 }

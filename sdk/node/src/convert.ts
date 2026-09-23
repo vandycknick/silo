@@ -69,7 +69,7 @@ export function runtimeOptionsToNative(options?: RuntimeOpenOptions): NativeRunt
   const record = assertRecord(options, "options");
   return {
     home: optionalNonEmptyString(record.home, "options.home"),
-    vmmonPath: optionalNonEmptyString(record.vmmonPath, "options.vmmonPath"),
+    supervisorPath: optionalNonEmptyString(record.supervisorPath, "options.supervisorPath"),
   };
 }
 

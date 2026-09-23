@@ -44,7 +44,7 @@ pub(crate) struct MachineConfig {
 #[serde(rename_all = "camelCase")]
 /// Persisted runtime state for a machine.
 ///
-/// This stores vmmon run facts used for reconciliation, including PID,
+/// This stores silo-vmmon run facts used for reconciliation, including PID,
 /// platform birth time when available, and run ID. It is not exposed directly;
 /// public callers see the reconciled `MachineStatus` view.
 pub(crate) struct MachineState {

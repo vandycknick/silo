@@ -20,9 +20,9 @@ use crate::runtime::core::{
 };
 use crate::runtime::Runtime;
 use crate::store::models::{MachineConfig, MachineRuntimeState};
-use crate::vmmon::exit_status::{self, VmmonExitOutcome, VmmonExitStatus};
-use crate::vmmon::process::ProcessIdentity;
-use crate::vmmon::VmmonLaunch;
+use crate::supervisor::exit_status::{self, VmmonExitOutcome, VmmonExitStatus};
+use crate::supervisor::process::ProcessIdentity;
+use crate::supervisor::VmmonLaunch;
 use crate::LibVmError;
 
 const WAIT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -63,7 +63,7 @@ impl Machine {
         options: MachineStartOptions,
     ) -> Result<MachineStart, LibVmError> {
         let runtime = self.runtime();
-        let vmmon = runtime.vmmon();
+        let supervisor = runtime.supervisor();
         let (config, run_id) = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             runtime.validate_machine_data_dir(&config)?;
@@ -201,7 +201,7 @@ impl Machine {
                 machine_log_dir: &machine_log_dir,
                 machine_lock: &lifetime_lock,
             };
-            if let Err(err) = vmmon.spawn(&launch).await {
+            if let Err(err) = supervisor.spawn(&launch).await {
                 return Err(finish_failed_start(
                     runtime,
                     &config,
@@ -251,7 +251,7 @@ impl Machine {
                     LibVmError::MonitorConnection {
                         reference: config.name.clone(),
                         message: format!(
-                            "vmmon pid {pid} from {} has no stable process generation",
+                            "silo-vmmon pid {pid} from {} has no stable process generation",
                             pid_path.display()
                         ),
                     },
@@ -648,7 +648,7 @@ async fn finish_failed_start(
             Ok(pid) => match ProcessIdentity::for_pid(pid) {
                 Ok(identity) => identity,
                 Err(err) => {
-                    cleanup_errors.push(format!("inspect vmmon for cleanup: {err}"));
+                    cleanup_errors.push(format!("inspect silo-vmmon for cleanup: {err}"));
                     None
                 }
             },
@@ -661,7 +661,7 @@ async fn finish_failed_start(
         Some(monitor) => match stop_failed_start_monitor(monitor, &config.name).await {
             Ok(()) => true,
             Err(err) => {
-                cleanup_errors.push(format!("terminate vmmon: {err}"));
+                cleanup_errors.push(format!("terminate silo-vmmon: {err}"));
                 false
             }
         },
@@ -721,7 +721,7 @@ async fn stop_failed_start_monitor(
     monitor: &ProcessIdentity,
     machine_name: &str,
 ) -> Result<(), LibVmError> {
-    // Let vmmon stop/reap its worker and finalize the generation first. The
+    // Let silo-vmmon stop/reap its worker and finalize the generation first. The
     // process-group kill below is only the emergency fallback for a stuck owner.
     if interrupt_monitor(monitor)?
         && wait_for_monitor_stop(monitor, machine_name, Duration::from_secs(75))
@@ -752,7 +752,7 @@ impl Machine {
         let runtime = self.runtime();
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
 
-        // vmmon removes its pidfile during shutdown before releasing its lifetime lock and
+        // silo-vmmon removes its pidfile during shutdown before releasing its lifetime lock and
         // exiting. Preserve the persisted process identity long enough to wait for that final
         // shutdown work instead of reconciling the missing pidfile as an already-stopped run.
         let persisted = runtime.machine_state(config.id).await?;
@@ -948,7 +948,7 @@ fn unix_time(timestamp: i64) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use crate::machine::lifecycle::stop_failed_start_monitor;
-    use crate::vmmon::process::ProcessIdentity;
+    use crate::supervisor::process::ProcessIdentity;
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::time::Duration;
 
@@ -960,7 +960,7 @@ mod tests {
         }
     }
 
-    /// Generic OS signal mechanics, not a substitute for a vmmon/VM test.
+    /// Generic OS signal mechanics, not a substitute for a silo-vmmon/VM test.
     #[tokio::test]
     async fn failed_start_cleanup_interrupts_before_emergency_group_kill() {
         let mut child = Child(

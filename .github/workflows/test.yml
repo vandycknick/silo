@@ -76,7 +76,7 @@ jobs:
           fi
 
   # Clippy and Cargo tests stay per-OS: the workspace has platform-only
-  # crates (virt/vz on macOS, libkrun in vmmon on both hosts) that a single lane
+  # crates (virt/vz on macOS, libkrun in silo-vmmon on both hosts) that a single lane
   # would silently stop covering. Platform-independent style and
   # consistency checks run once, on the Linux cell.
   checks:
@@ -131,7 +131,7 @@ jobs:
 
       # Cargo integration discovery includes tests/krun_worker.rs on both hosts.
       # These real-process boundary tests need no successful hypervisor admission.
-      - name: Run host-aware tests, including the private vmmon worker boundary
+      - name: Run host-aware tests, including the private silo-vmmon worker boundary
         run: nix develop .#ci --command make test
 
   node-sdk:

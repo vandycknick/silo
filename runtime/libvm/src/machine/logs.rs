@@ -24,7 +24,7 @@ const EXEC_LOG_SNAPSHOT_RETRIES: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MachineLogSource {
-    /// vmmon diagnostic output.
+    /// silo-vmmon diagnostic output.
     Monitor,
     /// VM serial console output.
     Serial,
@@ -514,7 +514,7 @@ mod tests {
 
     async fn set_running(runtime: &Runtime, id: MachineId, child: &Child, run_id: &str) {
         let pid = i32::try_from(child.id()).expect("child pid fits in i32");
-        let started_at = crate::vmmon::process::ProcessIdentity::for_pid(pid)
+        let started_at = crate::supervisor::process::ProcessIdentity::for_pid(pid)
             .expect("read process identity")
             .and_then(|identity| identity.started_at());
         runtime

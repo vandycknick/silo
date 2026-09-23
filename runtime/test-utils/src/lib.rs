@@ -1,9 +1,9 @@
 //! Shared utilities for Silo's Rust tests.
 //!
 //! This crate is the single source of truth for the mock scenario schema:
-//! vmmon (behind its `mock-backend` feature) reads scenarios, tests write
+//! silo-vmmon (behind its `mock-backend` feature) reads scenarios, tests write
 //! them. It also provides [`mock_vmmon_binary`], which builds and locates a
-//! vmmon binary compiled with the mock backend so libvm integration tests can
+//! silo-vmmon binary compiled with the mock backend so libvm integration tests can
 //! spawn a real monitor process on hosts without virtualization support.
 //!
 //! Every scenario field is optional; an absent field (or an absent scenario
@@ -165,10 +165,10 @@ impl Scenario {
     }
 }
 
-/// Build (once) and return the path to a vmmon binary compiled with the
+/// Build (once) and return the path to a silo-vmmon binary compiled with the
 /// `mock-backend` feature.
 ///
-/// Runs `cargo build -p vmmon --features mock-backend` in the workspace root
+/// Runs `cargo build -p silo-vmmon --features mock-backend` in the workspace root
 /// the first time it is called in a process. Under `make test` / CI this is a
 /// cache hit because the workspace is already built with `--all-features`.
 /// Nested `cargo build` inside `cargo test` is safe: cargo releases its build
@@ -182,18 +182,18 @@ pub fn mock_vmmon_binary() -> &'static Path {
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let status = std::process::Command::new(cargo)
             .current_dir(&workspace_root)
-            .args(["build", "-p", "vmmon", "--features", "mock-backend"])
+            .args(["build", "-p", "silo-vmmon", "--features", "mock-backend"])
             .status()
-            .expect("failed to invoke cargo to build the mock-enabled vmmon");
+            .expect("failed to invoke cargo to build the mock-enabled silo-vmmon");
         assert!(
             status.success(),
-            "cargo build -p vmmon --features mock-backend failed"
+            "cargo build -p silo-vmmon --features mock-backend failed"
         );
 
-        let binary = target_dir(&workspace_root).join("debug").join("vmmon");
+        let binary = target_dir(&workspace_root).join("debug").join("silo-vmmon");
         assert!(
             binary.is_file(),
-            "expected mock-enabled vmmon binary at {}",
+            "expected mock-enabled silo-vmmon binary at {}",
             binary.display()
         );
         binary

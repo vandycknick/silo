@@ -30,8 +30,8 @@ use crate::store::models::MachineId;
 use crate::store::models::{
     MachineConfig, NetworkAttachment, NetworkInstance, NetworkInstanceState,
 };
+use crate::supervisor::process::{self, ProcessIdentity};
 use crate::utils::now_unix;
-use crate::vmmon::process::{self, ProcessIdentity};
 use crate::{LibVmError, NetdRuntimeConfig};
 
 use super::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
@@ -1203,7 +1203,7 @@ netd log: /tmp/silo/netd.log";
             .spawn()
             .expect("spawn helper");
         let pid = i32::try_from(child.id()).expect("pid fits i32");
-        let started_at = crate::vmmon::process::ProcessIdentity::for_pid(pid)
+        let started_at = crate::supervisor::process::ProcessIdentity::for_pid(pid)
             .expect("read helper identity")
             .and_then(|identity| identity.started_at())
             .expect("helper has stable generation");

@@ -14,7 +14,7 @@ use crate::targets::HostTarget;
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Component {
     Cli,
-    Vmmon,
+    SiloVmmon,
     Netd,
     Agent,
     Portd,
@@ -47,7 +47,7 @@ pub enum ComponentError {
         #[source]
         source: std::io::Error,
     },
-    #[error("vmmon binary not found after build: {path}")]
+    #[error("silo-vmmon binary not found after build: {path}")]
     MissingVmmonBinary { path: std::path::PathBuf },
     #[error("rprobe must be built natively on Linux ARM64")]
     UnsupportedRprobeHost,
@@ -56,7 +56,7 @@ pub enum ComponentError {
 pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     for component in [
         Component::Cli,
-        Component::Vmmon,
+        Component::SiloVmmon,
         Component::Netd,
         Component::Agent,
         Component::Init,
@@ -72,7 +72,7 @@ pub fn build_component(
 ) -> Result<(), ComponentError> {
     match component {
         Component::Cli => build_cargo_package(context, "cli"),
-        Component::Vmmon => build_vmmon(context),
+        Component::SiloVmmon => build_vmmon(context),
         Component::Netd => build_netd(context),
         Component::Agent => build_guest_agent(context),
         Component::Portd => build_guest_portd(context),
@@ -199,20 +199,20 @@ fn build_cargo_package(context: &BuildContext<'_>, package: &str) -> Result<(), 
 }
 
 fn build_vmmon(context: &BuildContext<'_>) -> Result<(), ComponentError> {
-    build_cargo_package(context, "vmmon")?;
+    build_cargo_package(context, "silo-vmmon")?;
 
     if context.host == HostTarget::MacosArm64 {
         let binary = context
             .target_dir
             .join(context.profile.directory())
-            .join("vmmon");
+            .join("silo-vmmon");
         if !binary.is_file() {
             return Err(ComponentError::MissingVmmonBinary { path: binary });
         }
 
         let entitlements = context
             .workspace_root
-            .join("runtime/vmmon/vmmon.entitlements");
+            .join("virt/vmmon/silo-vmmon.entitlements");
         let mut sign = Command::new("/usr/bin/codesign");
         sign.args(["-f", "--entitlements"])
             .arg(entitlements)

@@ -1,7 +1,7 @@
 use protocol::v1;
 
 use crate::machine::{Machine, MachineRef};
-use crate::vmmon::{forward_rpc_error, ForwardClientError, VmmonClientError};
+use crate::supervisor::{forward_rpc_error, ForwardClientError, VmmonClientError};
 use crate::LibVmError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +71,7 @@ impl Machine {
         let config = self.running_config().await?;
         let stream = self
             .runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .open_forward(forward)
             .await
@@ -88,7 +88,7 @@ impl Machine {
             .resolve_machine_config(&MachineRef::id(self.machine_id()))
             .await?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .list_forwards()
             .await

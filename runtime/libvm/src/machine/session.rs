@@ -58,7 +58,7 @@ pub enum StdinMode {
     Bytes(Vec<u8>),
 }
 
-/// The exact terminal result reported by vmmon.
+/// The exact terminal result reported by silo-vmmon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionResult {
     Exited { code: Option<u32> },

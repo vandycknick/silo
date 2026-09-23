@@ -31,7 +31,7 @@ const DRIVER_NETD: &str = "netd";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-/// Resolved network attachment projected into vmmon and guest-agent inputs.
+/// Resolved network attachment projected into silo-vmmon and guest-agent inputs.
 ///
 /// This is neither the public desired network (`MachineNetworkConfig`) nor the stored
 /// network model. Drivers produce this after resolving policy, named networks,

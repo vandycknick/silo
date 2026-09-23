@@ -230,7 +230,7 @@ mod tests {
         let assets = components.join("assets");
         std::fs::create_dir_all(&bin).expect("create binary component fixtures");
         std::fs::create_dir(&assets).expect("create asset component fixtures");
-        for name in ["vmmon", "netd", "krun"] {
+        for name in ["silo-vmmon", "netd", "krun"] {
             executable_fixture(&bin, name);
         }
         for name in ["kernel-default", "initramfs"] {

@@ -13,7 +13,7 @@ export interface NativeBindings {
 
 export interface NativeRuntimeOpenOptions {
   home?: string;
-  vmmonPath?: string;
+  supervisorPath?: string;
 }
 
 export interface NativeRuntime {

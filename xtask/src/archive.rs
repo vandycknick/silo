@@ -18,7 +18,7 @@ use crate::targets::HostTarget;
 const DISK_IMAGE_LICENSE: &str = "common/disk-image/LICENSE-APACHE";
 const RELEASE_MATERIAL: [&str; 2] = ["packaging/release/THIRD_PARTY_NOTICES", DISK_IMAGE_LICENSE];
 const RUNTIME_FILES: [(&str, u32); 5] = [
-    ("bin/vmmon", 0o755),
+    ("bin/silo-vmmon", 0o755),
     ("bin/netd", 0o755),
     ("assets/kernel-default", 0o644),
     ("assets/initramfs", 0o644),
@@ -484,7 +484,7 @@ mod tests {
             .filter(|(path, _)| path.starts_with("bin/"))
             .copied()
             .collect();
-        assert_eq!(binaries, [("bin/vmmon", 0o755), ("bin/netd", 0o755)]);
+        assert_eq!(binaries, [("bin/silo-vmmon", 0o755), ("bin/netd", 0o755)]);
     }
 
     #[test]

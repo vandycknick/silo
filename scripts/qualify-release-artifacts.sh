@@ -232,7 +232,7 @@ verify_extracted_layouts() {
     local root="$QUALIFICATION_ROOT/$target/silo-$VERSION-$target"
     require_directory "$root"
 
-    for name in silo vmmon netd; do
+    for name in silo silo-vmmon netd; do
       assert_mode "$root/bin/$name" 755
     done
     assert_mode "$root/assets/agent" 755
@@ -265,7 +265,7 @@ inspect_linux_target() {
   local architecture="$2"
   local loader="$3"
   local root="$QUALIFICATION_ROOT/$target/silo-$VERSION-$target"
-  local dynamic_binaries=("$root/bin/silo" "$root/bin/vmmon")
+  local dynamic_binaries=("$root/bin/silo" "$root/bin/silo-vmmon")
   local static_binaries=("$root/bin/netd" "$root/assets/agent" "$root/initramfs-unpacked/init")
 
   section "Linux Binary Inspection: $target"
@@ -318,7 +318,7 @@ inspect_darwin_binaries() {
   section "Darwin Binary Inspection"
 
   local root="$QUALIFICATION_ROOT/darwin-arm64/silo-$VERSION-darwin-arm64"
-  local binaries=("$root/bin/silo" "$root/bin/vmmon" "$root/bin/netd")
+  local binaries=("$root/bin/silo" "$root/bin/silo-vmmon" "$root/bin/netd")
 
   for binary in "${binaries[@]}"; do
     local description
@@ -352,7 +352,7 @@ verify_dmg() {
   require_directory "$app"
   for executable in \
     "$app/Contents/MacOS/silo" \
-    "$app/Contents/Helpers/vmmon" \
+    "$app/Contents/Helpers/silo-vmmon" \
     "$app/Contents/Helpers/netd" \
   do
     codesign --verify --strict --verbose=4 "$executable"

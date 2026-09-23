@@ -176,8 +176,8 @@ def mib(value):
 def main():
     reference = sys.argv[1] if len(sys.argv) > 1 else "silo-system"
     machine = find_machine(reference)
-    vmmon = find_pid("vmmon", machine["short_id"])
-    krun = worker_pid(run(["ps", "-axo", "pid=,ppid=,args="]), vmmon) if vmmon is not None else None
+    supervisor = find_pid("silo-vmmon", machine["short_id"])
+    krun = worker_pid(run(["ps", "-axo", "pid=,ppid=,args="]), supervisor) if supervisor is not None else None
     if krun is None:
         sys.exit(f"{machine['name']} has no running private krun worker (state {machine['state']})")
 
@@ -212,7 +212,7 @@ def main():
     expected = vmm_overhead + guest_held + kernel_reserved + fragments
     residual = charged - expected
 
-    print(f"VM {machine['name']} ({machine['short_id']})  krun pid {krun}  vmmon pid {vmmon}  configured RAM {mib(machine['memory'])}")
+    print(f"VM {machine['name']} ({machine['short_id']})  krun pid {krun}  silo-vmmon pid {supervisor}  configured RAM {mib(machine['memory'])}")
     print()
     print("HOST (what macOS charges the krun process)")
     print(f"  phys_footprint            {mib(charged)}   peak {mib(peak)}")

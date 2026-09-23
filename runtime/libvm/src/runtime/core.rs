@@ -53,10 +53,10 @@ use crate::store::models::{
     MachineState, OciImageRecord,
 };
 use crate::store::{ConfigStore, DataStore, Store};
+use crate::supervisor::exit_status::{self, VmmonExitOutcome, VmmonExitStatus};
+use crate::supervisor::process::{self, ProcessIdentity};
+use crate::supervisor::{self, LaunchSpecInput, VmSupervisor};
 use crate::utils::now_unix;
-use crate::vmmon::exit_status::{self, VmmonExitOutcome, VmmonExitStatus};
-use crate::vmmon::process::{self, ProcessIdentity};
-use crate::vmmon::{self, LaunchSpecInput, Vmmon};
 use crate::LibVmError;
 
 /// Live runtime observation for a machine: its reconciled state plus the
@@ -102,16 +102,16 @@ pub struct Runtime {
     lock_manager: LockManager,
     networking: RuntimeNetworkingConfig,
     components: ResolvedRuntimeComponents,
-    vmmon: Vmmon,
+    supervisor: VmSupervisor,
     image_pull_policy: ImagePullPolicy,
     image_progress: Option<ImageProgressSender>,
 }
 
-/// Identity for one concrete vmmon run.
+/// Identity for one concrete silo-vmmon run.
 ///
 /// PID alone is not enough because host PIDs can be reused. When the platform
 /// can expose process birth time we include it, and we also carry the runtime
-/// run ID written into persisted state and vmmon exit files. Lifecycle paths use
+/// run ID written into persisted state and silo-vmmon exit files. Lifecycle paths use
 /// this to avoid applying stale transitions to a newer machine run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VmmonRunIdentity {
@@ -149,8 +149,8 @@ impl Runtime {
         Self::new(RuntimeConfig::from_env()?).await
     }
 
-    pub(crate) fn execution_client(&self, machine_id: MachineId) -> crate::vmmon::VmmonClient {
-        self.vmmon.client(machine_id)
+    pub(crate) fn execution_client(&self, machine_id: MachineId) -> crate::supervisor::VmmonClient {
+        self.supervisor.client(machine_id)
     }
 
     #[cfg(test)]
@@ -171,14 +171,15 @@ impl Runtime {
         virt_backend: Option<crate::runtime::VirtBackendOverride>,
     ) -> Result<Self, LibVmError> {
         let lock_manager = LockManager::open(paths.locks_dir().to_path_buf())?;
-        let vmmon = Vmmon::new(paths.clone(), components.vmmon.clone(), virt_backend);
+        let supervisor =
+            VmSupervisor::new(paths.clone(), components.supervisor.clone(), virt_backend);
         let runtime = Self {
             paths,
             store,
             lock_manager,
             networking,
             components,
-            vmmon,
+            supervisor,
             image_pull_policy: ImagePullPolicy::default(),
             image_progress: None,
         };
@@ -249,8 +250,8 @@ impl Runtime {
         self.paths.ensure_machine_logs_dir(machine_id)
     }
 
-    pub(crate) fn vmmon(&self) -> &Vmmon {
-        &self.vmmon
+    pub(crate) fn supervisor(&self) -> &VmSupervisor {
+        &self.supervisor
     }
 
     pub(crate) fn resolve_boot_assets(
@@ -1019,7 +1020,7 @@ impl Runtime {
                     .machine_run_dir()
                     .to_path_buf(),
                 message: format!(
-                    "vmmon pid {pid} is a different process generation than persisted machine state"
+                    "silo-vmmon pid {pid} is a different process generation than persisted machine state"
                 ),
             });
         }
@@ -1099,10 +1100,10 @@ impl Runtime {
         config: &MachineConfig,
         network: &VmmonNetworkAttachment,
         resize_rootfs: bool,
-    ) -> Result<crate::vmmon::VmmonLaunchInputs, LibVmError> {
-        let prepare = || -> eyre::Result<crate::vmmon::VmmonLaunchInputs> {
+    ) -> Result<crate::supervisor::VmmonLaunchInputs, LibVmError> {
+        let prepare = || -> eyre::Result<crate::supervisor::VmmonLaunchInputs> {
             let rosetta_intent = self
-                .vmmon
+                .supervisor
                 .rosetta_intent_request(config)
                 .map_err(eyre::Report::msg)?;
             let relative_mount_base = std::env::current_dir()
@@ -1110,7 +1111,7 @@ impl Runtime {
             let machine_paths = self.machine_paths(config.id);
             let mut launch_spec = config.spec.clone();
             self.complete_launch_boot_assets(&mut launch_spec)?;
-            let mut launch_spec = vmmon::prepare_launch_spec(LaunchSpecInput {
+            let mut launch_spec = supervisor::prepare_launch_spec(LaunchSpecInput {
                 relative_mount_base: &relative_mount_base,
                 spec: launch_spec,
             })?;
@@ -1149,8 +1150,8 @@ impl Runtime {
 
             remove_file_if_exists(&machine_paths.metadata_config_path())?;
 
-            vmmon::write_launch_spec(&machine_paths.vm_spec_path(), &launch_spec)?;
-            Ok(crate::vmmon::VmmonLaunchInputs {
+            supervisor::write_launch_spec(&machine_paths.vm_spec_path(), &launch_spec)?;
+            Ok(crate::supervisor::VmmonLaunchInputs {
                 agent_enabled,
                 rosetta_intent,
                 asset_directory: self.components.asset_dir.clone(),
@@ -1272,7 +1273,7 @@ impl Runtime {
         let runtime_status = self.reconcile_machine_runtime_best_effort(&config).await?;
         let state = self.machine_state(config.id).await?;
         let (status, boot_report, provision_report) = if runtime_status.is_running() {
-            match self.vmmon.client(config.id).status().await {
+            match self.supervisor.client(config.id).status().await {
                 Ok(response) => {
                     let (boot_report, provision_report) = response
                         .agent
@@ -1305,7 +1306,7 @@ impl Runtime {
                 }
                 Err(message) => (
                     MachineStatus::running_with_message(format!(
-                        "vmmon get_status failed: {message}"
+                        "silo-vmmon get_status failed: {message}"
                     )),
                     None,
                     None,
@@ -1665,13 +1666,19 @@ pub(crate) fn monitor_identity(
     let Some(identity) = ProcessIdentity::for_pid(pid)? else {
         return Err(LibVmError::MonitorConnection {
             reference: machine_name.to_string(),
-            message: format!("vmmon pid {pid} from {} is not running", pid_path.display()),
+            message: format!(
+                "silo-vmmon pid {pid} from {} is not running",
+                pid_path.display()
+            ),
         });
     };
     if !identity.is_alive()? {
         return Err(LibVmError::MonitorConnection {
             reference: machine_name.to_string(),
-            message: format!("vmmon pid {pid} from {} is not running", pid_path.display()),
+            message: format!(
+                "silo-vmmon pid {pid} from {} is not running",
+                pid_path.display()
+            ),
         });
     }
     Ok(identity)
@@ -1819,8 +1826,8 @@ mod tests {
         MachineState,
     };
     use crate::store::{MachineStore, MockDataStore, Store};
+    use crate::supervisor::process::ProcessIdentity;
     use crate::utils::now_unix;
-    use crate::vmmon::process::ProcessIdentity;
     use crate::OciImageConfigMetadata;
     use crate::Platform;
     use crate::{
@@ -2083,14 +2090,14 @@ mod tests {
         std::fs::write(&netd, "#!/bin/sh\nexit 0\n").expect("write helper");
         std::fs::set_permissions(&netd, std::fs::Permissions::from_mode(0o755))
             .expect("make helper executable");
-        let vmmon = bin.join("vmmon");
+        let supervisor = bin.join("silo-vmmon");
         std::fs::write(
-            &vmmon,
+            &supervisor,
             "#!/bin/sh\ntrace=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--trace-log\" ]; then trace=\"$arg\"; fi\n  previous=\"$arg\"\ndone\nprintf '%s\\n' \"$0\" > \"$trace.program\"\nprintf '%s\\n' \"$@\" > \"$trace.args\"\n( sleep 1; eval \"printf 'started\\n' >&$_VM_SYNCPIPE\" ) &\nexit 0\n",
         )
-        .expect("write vmmon helper");
-        std::fs::set_permissions(&vmmon, std::fs::Permissions::from_mode(0o755))
-            .expect("make vmmon executable");
+        .expect("write silo-vmmon helper");
+        std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755))
+            .expect("make silo-vmmon executable");
         for (asset, mode) in [
             ("kernel-default", 0o644),
             ("initramfs", 0o644),
@@ -2655,7 +2662,7 @@ mod tests {
         })
     }
 
-    fn write_start_failure_components(paths: &LocalPaths, vmmon: &str) {
+    fn write_start_failure_components(paths: &LocalPaths, supervisor: &str) {
         let root = paths.home();
         let bin = root.join("bin");
         let assets = root.join("assets");
@@ -2669,10 +2676,10 @@ mod tests {
         .expect("write test netd");
         std::fs::set_permissions(&netd, std::fs::Permissions::from_mode(0o755))
             .expect("make test netd executable");
-        let vmmon_path = bin.join("vmmon");
-        std::fs::write(&vmmon_path, vmmon).expect("write test vmmon");
-        std::fs::set_permissions(&vmmon_path, std::fs::Permissions::from_mode(0o755))
-            .expect("make test vmmon executable");
+        let supervisor_path = bin.join("silo-vmmon");
+        std::fs::write(&supervisor_path, supervisor).expect("write test silo-vmmon");
+        std::fs::set_permissions(&supervisor_path, std::fs::Permissions::from_mode(0o755))
+            .expect("make test silo-vmmon executable");
         for asset in ["kernel-default", "initramfs"] {
             std::fs::write(assets.join(asset), b"asset").expect("write test boot asset");
         }
@@ -2680,10 +2687,10 @@ mod tests {
 
     async fn start_failure_runtime(
         temp: &tempfile::TempDir,
-        vmmon: &str,
+        supervisor: &str,
     ) -> (Runtime, MachineConfig, Arc<Store>) {
         let paths = LocalPaths::new(temp.path().join("silo"));
-        write_start_failure_components(&paths, vmmon);
+        write_start_failure_components(&paths, supervisor);
         let store = Arc::new(Store::new(&paths).await.expect("open test store"));
         let components = crate::runtime::components::test_components(paths.home());
         let runtime = Runtime::from_store(
@@ -2865,14 +2872,14 @@ mod tests {
 
         assert_failed_start_network_is_clean(&runtime, config.id).await;
 
-        for vmmon in [launch_failure, missing_pid, missing_process] {
+        for supervisor in [launch_failure, missing_pid, missing_process] {
             let temp = tempfile::tempdir().expect("create temp dir");
-            let (runtime, config, _store) = start_failure_runtime(&temp, vmmon).await;
+            let (runtime, config, _store) = start_failure_runtime(&temp, supervisor).await;
 
             machine_handle(&runtime, config.id)
                 .start()
                 .await
-                .expect_err("test vmmon must fail to start");
+                .expect_err("test silo-vmmon must fail to start");
 
             assert_failed_start_network_is_clean(&runtime, config.id).await;
             assert!(!runtime
@@ -3124,7 +3131,7 @@ mod tests {
         let data = machine_handle(&runtime, machine.id)
             .inspect()
             .await
-            .expect("stopped machine status should not require vmmon socket");
+            .expect("stopped machine status should not require silo-vmmon socket");
 
         assert_eq!(data.status, MachineStatus::Stopped);
         assert!(!data.status.ready());
@@ -3322,7 +3329,7 @@ mod tests {
             if force {
                 options = options.force_after_timeout(Duration::from_secs(2));
             }
-            // A real parent must reap the child, as init does for detached vmmon.
+            // A real parent must reap the child, as init does for detached silo-vmmon.
             let reaper = tokio::spawn(async move {
                 loop {
                     if let Some(status) = child.child.try_wait().expect("wait child") {
@@ -3642,7 +3649,7 @@ mod tests {
         let exit = machine_handle(&runtime, machine.id)
             .wait()
             .await
-            .expect("wait should report vmmon exit status");
+            .expect("wait should report silo-vmmon exit status");
         let state = runtime
             .machine_state(machine.id)
             .await
@@ -3920,7 +3927,7 @@ mod tests {
     #[test]
     fn read_monitor_pid_rejects_non_positive_pid() {
         let temp = tempfile::tempdir().expect("create temp dir");
-        let pid_path = temp.path().join("vmmon.pid");
+        let pid_path = temp.path().join("silo-vmmon.pid");
         std::fs::write(&pid_path, "0\n").expect("write pid file");
 
         let err = read_monitor_pid(&pid_path).expect_err("pid 0 should be invalid");
@@ -4474,7 +4481,7 @@ mod tests {
             runtime.machine_paths(config.id).vmmon_pid_path(),
             format!("{}\n", monitor.id()),
         )
-        .expect("write live vmmon pidfile");
+        .expect("write live silo-vmmon pidfile");
         drop(runtime);
 
         let reopened = Runtime::open(paths, RuntimeNetworkingConfig::default())
@@ -4531,7 +4538,7 @@ mod tests {
         let error = machine_handle(&runtime, config.id)
             .start()
             .await
-            .expect_err("pre-vmmon preparation must fail");
+            .expect_err("pre-supervisor preparation must fail");
         assert!(matches!(error, LibVmError::MachinePreparationFailed { .. }));
         assert!(runtime
             .machine_config(config.id)

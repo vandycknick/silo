@@ -376,7 +376,7 @@ const fn default_cpus() -> u8 {
 fn default_memory() -> String {
     "8GiB".to_string()
 }
-/// Rosetta's Linux runtime, installed by `softwareupdate --install-rosetta`. vmmon
+/// Rosetta's Linux runtime, installed by `softwareupdate --install-rosetta`. silo-vmmon
 /// performs the authoritative Virtualization.framework check at start; this only picks
 /// a sensible default so hosts without Rosetta keep working.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -214,7 +214,7 @@ pub(crate) enum CleanupPlan {
     RetainMachine,
 }
 
-/// Fixed vmmon execution-log behavior, included because it affects every run.
+/// Fixed silo-vmmon execution-log behavior, included because it affects every run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExecLogPolicy {

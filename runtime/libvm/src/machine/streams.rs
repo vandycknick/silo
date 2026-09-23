@@ -17,7 +17,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::machine::{Machine, MachineData, MachineRef};
 use crate::store::models::MachineConfig;
-use crate::vmmon::VmmonClientError;
+use crate::supervisor::VmmonClientError;
 use crate::LibVmError;
 
 const PRODUCER_CHUNK_BYTES: usize = 32 * 1024;
@@ -101,7 +101,7 @@ impl AsyncRead for MachineByteStream {
             &mut this.read_buffer,
             cx,
             buffer,
-            "vmmon access",
+            "silo-vmmon access",
         )
     }
 }
@@ -118,14 +118,14 @@ impl AsyncWrite for MachineByteStream {
         let Some(writer) = self.writer.as_mut() else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "vmmon request stream is closed",
+                "silo-vmmon request stream is closed",
             )));
         };
         match writer.poll_reserve(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "vmmon request stream closed",
+                "silo-vmmon request stream closed",
             ))),
             Poll::Ready(Ok(())) => {
                 let len = data.len().min(PRODUCER_CHUNK_BYTES);
@@ -134,7 +134,10 @@ impl AsyncWrite for MachineByteStream {
                         data: Some(Bytes::copy_from_slice(&data[..len])),
                     })
                     .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "vmmon request stream closed")
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "silo-vmmon request stream closed",
+                        )
                     })?;
                 Poll::Ready(Ok(len))
             }
@@ -363,7 +366,7 @@ pub enum MachineAgentProvisionFailurePolicy {
 pub struct MachineMetrics {
     pub machine_id: String,
     pub name: String,
-    /// Backend that constructed the running VM monitor, when reported by vmmon.
+    /// Backend that constructed the running VM monitor, when reported by silo-vmmon.
     pub actual_backend: Option<String>,
     pub monitor: MachineMonitorSnapshot,
     pub metrics: Option<MachineAgentMetricsObservation>,
@@ -559,7 +562,7 @@ impl Machine {
     pub async fn monitor_status(&self) -> Result<MachineMonitorStatus, LibVmError> {
         let config = self.running_config().await?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .status()
             .await
@@ -569,7 +572,7 @@ impl Machine {
     pub async fn wait_ready(&self, timeout: Duration) -> Result<MachineReadiness, LibVmError> {
         let config = self.running_config().await?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .wait_ready(timeout)
             .await
@@ -579,7 +582,7 @@ impl Machine {
     pub async fn metrics(&self) -> Result<MachineMetrics, LibVmError> {
         let config = self.running_config().await?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .metrics()
             .await
@@ -593,7 +596,7 @@ impl Machine {
         let config = self.running_config().await?;
         let path = validate_path(path.into())?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .get_entry(GetEntryRequest { path: Some(path) })
             .await
@@ -609,7 +612,7 @@ impl Machine {
         let path = validate_path(path.into())?;
         reject_root(&path)?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .remove_entry(RemoveEntryRequest {
                 path: Some(path),
@@ -628,7 +631,7 @@ impl Machine {
         let path = validate_path(path.into())?;
         validate_page(limit, cursor.as_deref())?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .list_directory(ListDirectoryRequest {
                 path: Some(path),
@@ -652,7 +655,7 @@ impl Machine {
         reject_root(&path)?;
         validate_mode(mode)?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .create_directory(CreateDirectoryRequest {
                 path: Some(path),
@@ -675,7 +678,7 @@ impl Machine {
         let path = validate_path(path.into())?;
         reject_root(&path)?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .download_file(DownloadFileRequest { path: Some(path) })
             .await
@@ -702,7 +705,7 @@ impl Machine {
         };
         let request_guard = tx.clone();
         let (producer, mut completion_rx) = spawn_upload_producer(tx, header, reader);
-        let client = self.runtime().vmmon().client(self.machine_id());
+        let client = self.runtime().supervisor().client(self.machine_id());
         let mut rpc = Box::pin(client.upload_file(ReceiverStream::new(rx)));
         let outcome = tokio::select! {
             response = &mut rpc => UploadOutcome::Rpc(response),
@@ -749,7 +752,7 @@ impl Machine {
     pub async fn open_serial_stream(&self) -> Result<MachineByteStream, LibVmError> {
         let config = self.running_config().await?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .open_serial_stream()
             .await
@@ -757,7 +760,7 @@ impl Machine {
     }
     pub(crate) async fn open_shell_stream(&self) -> Result<MachineByteStream, LibVmError> {
         let config = self.running_config().await?;
-        let client = self.runtime().vmmon().client(self.machine_id());
+        let client = self.runtime().supervisor().client(self.machine_id());
         client
             .open_shell_stream()
             .await
@@ -802,7 +805,7 @@ where
             .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "vmmon upload request stream closed",
+                    "silo-vmmon upload request stream closed",
                 )
             })?;
             let mut buffer = BytesMut::zeroed(PRODUCER_CHUNK_BYTES);
@@ -820,7 +823,7 @@ where
                 .map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::BrokenPipe,
-                        "vmmon upload request stream closed",
+                        "silo-vmmon upload request stream closed",
                     )
                 })?;
             }
@@ -917,12 +920,12 @@ fn validate_page(limit: Option<u32>, cursor: Option<&[u8]>) -> Result<(), LibVmE
     Ok(())
 }
 fn required<T>(value: Option<T>, field: &str) -> Result<T, String> {
-    value.ok_or_else(|| format!("vmmon response is missing required {field}"))
+    value.ok_or_else(|| format!("silo-vmmon response is missing required {field}"))
 }
 fn required_text(value: Option<String>, field: &str, maximum: usize) -> Result<String, String> {
     let value = required(value, field)?;
     if value.is_empty() || value.len() > maximum || value.as_bytes().contains(&0) {
-        return Err(format!("vmmon response has invalid {field}"));
+        return Err(format!("silo-vmmon response has invalid {field}"));
     }
     Ok(value)
 }
@@ -934,7 +937,7 @@ fn optional_text(
     value
         .map(|value| {
             if value.len() > maximum || value.as_bytes().contains(&0) {
-                Err(format!("vmmon response has invalid {field}"))
+                Err(format!("silo-vmmon response has invalid {field}"))
             } else {
                 Ok(value)
             }
@@ -944,9 +947,11 @@ fn optional_text(
 fn canonical_uuid(value: Option<String>, field: &str) -> Result<String, String> {
     let value = required_text(value, field, 36)?;
     let parsed = uuid::Uuid::parse_str(&value)
-        .map_err(|_| format!("vmmon response has invalid {field} UUID"))?;
+        .map_err(|_| format!("silo-vmmon response has invalid {field} UUID"))?;
     if parsed.hyphenated().to_string() != value {
-        return Err(format!("vmmon response has non-canonical {field} UUID"));
+        return Err(format!(
+            "silo-vmmon response has non-canonical {field} UUID"
+        ));
     }
     Ok(value)
 }
@@ -955,12 +960,12 @@ fn required_duration(
     field: &str,
 ) -> Result<Duration, String> {
     optional_duration(value, field)?
-        .ok_or_else(|| format!("vmmon response is missing required {field}"))
+        .ok_or_else(|| format!("silo-vmmon response is missing required {field}"))
 }
 fn finite_nonnegative(value: Option<f64>, field: &str) -> Result<f64, String> {
     let value = required(value, field)?;
     if !value.is_finite() || value < 0.0 {
-        return Err(format!("vmmon response has invalid {field}"));
+        return Err(format!("silo-vmmon response has invalid {field}"));
     }
     Ok(value)
 }
@@ -972,13 +977,13 @@ fn validate_mac(value: &str, field: &str) -> Result<(), String> {
                 || (b'a'..=b'f').contains(byte)
         })
     {
-        return Err(format!("vmmon response has invalid {field}"));
+        return Err(format!("silo-vmmon response has invalid {field}"));
     }
     Ok(())
 }
 fn validate_paths(values: Vec<String>, field: &str, maximum: usize) -> Result<Vec<String>, String> {
     if values.len() > maximum {
-        return Err(format!("vmmon response {field} exceeds maximum size"));
+        return Err(format!("silo-vmmon response {field} exceeds maximum size"));
     }
     values
         .into_iter()
@@ -990,7 +995,7 @@ fn timestamp(value: Option<prost_types::Timestamp>, field: &str) -> Result<Syste
     if !(-62_135_596_800..=253_402_300_799).contains(&value.seconds)
         || !(0..1_000_000_000).contains(&value.nanos)
     {
-        return Err(format!("vmmon response has invalid {field}"));
+        return Err(format!("silo-vmmon response has invalid {field}"));
     }
     if value.seconds >= 0 {
         UNIX_EPOCH.checked_add(Duration::new(value.seconds as u64, value.nanos as u32))
@@ -999,7 +1004,7 @@ fn timestamp(value: Option<prost_types::Timestamp>, field: &str) -> Result<Syste
             .checked_sub(Duration::from_secs(value.seconds.unsigned_abs()))
             .and_then(|time| time.checked_add(Duration::from_nanos(value.nanos as u64)))
     }
-    .ok_or_else(|| format!("vmmon response has out-of-range {field}"))
+    .ok_or_else(|| format!("silo-vmmon response has out-of-range {field}"))
 }
 fn optional_timestamp(
     value: Option<prost_types::Timestamp>,
@@ -1014,7 +1019,7 @@ fn optional_duration(
     value
         .map(|value| {
             if value.seconds < 0 || !(0..1_000_000_000).contains(&value.nanos) {
-                return Err(format!("vmmon response has invalid {field}"));
+                return Err(format!("silo-vmmon response has invalid {field}"));
             }
             Ok(Duration::new(value.seconds as u64, value.nanos as u32))
         })
@@ -1024,9 +1029,9 @@ fn enum_value<T>(value: i32, field: &str) -> Result<T, String>
 where
     T: TryFrom<i32>,
 {
-    T::try_from(value).map_err(|_| format!("vmmon response has unknown {field} value {value}"))
+    T::try_from(value).map_err(|_| format!("silo-vmmon response has unknown {field} value {value}"))
 }
-macro_rules! protocol_enum { ($name:ident, $wire:ident => $public:ident, { $($source:ident => $target:ident),+ $(,)? }) => { fn $name(value: i32, field: &str) -> Result<$public, String> { match enum_value::<v1::$wire>(value, field)? { $(v1::$wire::$source => Ok($public::$target),)+ v1::$wire::Unspecified => Err(format!("vmmon response has unspecified {field}")), } } }; }
+macro_rules! protocol_enum { ($name:ident, $wire:ident => $public:ident, { $($source:ident => $target:ident),+ $(,)? }) => { fn $name(value: i32, field: &str) -> Result<$public, String> { match enum_value::<v1::$wire>(value, field)? { $(v1::$wire::$source => Ok($public::$target),)+ v1::$wire::Unspecified => Err(format!("silo-vmmon response has unspecified {field}")), } } }; }
 protocol_enum!(vm_state, VmState => MachineVmState, { Starting => Starting, Running => Running, Stopping => Stopping, Stopped => Stopped, Failed => Failed });
 protocol_enum!(readiness_reason, ReadinessReason => MachineReadinessReason, { VmStarting => VmStarting, VmStopping => VmStopping, VmStopped => VmStopped, VmFailed => VmFailed, AgentNotRequired => AgentNotRequired, AgentUnavailable => AgentUnavailable, AgentStatusStale => AgentStatusStale, GuestStarting => GuestStarting, GuestFailed => GuestFailed, GuestReportedReady => GuestReportedReady });
 protocol_enum!(connection_state, AgentConnectionState => MachineAgentConnectionState, { Connecting => Connecting, Responsive => Responsive, Unresponsive => Unresponsive });
@@ -1194,7 +1199,7 @@ impl TryFrom<v1::SystemInfo> for MachineSystemInfo {
     type Error = String;
     fn try_from(value: v1::SystemInfo) -> Result<Self, Self::Error> {
         if value.ip_addresses.len() > protocol::MAX_AGENT_IP_ADDRESSES {
-            return Err("vmmon response system.ip_addresses exceeds maximum size".to_string());
+            return Err("silo-vmmon response system.ip_addresses exceeds maximum size".to_string());
         }
         let ip_addresses = value
             .ip_addresses
@@ -1205,11 +1210,13 @@ impl TryFrom<v1::SystemInfo> for MachineSystemInfo {
                     "system.ip_addresses",
                     protocol::MAX_INFO_BYTES,
                 )?;
-                let parsed = address
-                    .parse::<std::net::IpAddr>()
-                    .map_err(|_| "vmmon response has invalid system.ip_addresses".to_string())?;
+                let parsed = address.parse::<std::net::IpAddr>().map_err(|_| {
+                    "silo-vmmon response has invalid system.ip_addresses".to_string()
+                })?;
                 if parsed.to_string() != address {
-                    return Err("vmmon response has non-canonical system.ip_addresses".to_string());
+                    return Err(
+                        "silo-vmmon response has non-canonical system.ip_addresses".to_string()
+                    );
                 }
                 Ok(address)
             })
@@ -1281,7 +1288,7 @@ impl TryFrom<v1::ProvisionReport> for MachineProvisioningReport {
     type Error = String;
     fn try_from(value: v1::ProvisionReport) -> Result<Self, Self::Error> {
         if value.steps.len() > protocol::MAX_PROVISIONING_STEPS {
-            return Err("vmmon response provisioning.steps exceeds maximum size".to_string());
+            return Err("silo-vmmon response provisioning.steps exceeds maximum size".to_string());
         }
         let started_at = timestamp(
             value.started_at,
@@ -1292,7 +1299,9 @@ impl TryFrom<v1::ProvisionReport> for MachineProvisioningReport {
             "agent.status.report.provisioning.finished_at",
         )?;
         if finished_at < started_at {
-            return Err("vmmon response provisioning finished_at precedes started_at".to_string());
+            return Err(
+                "silo-vmmon response provisioning finished_at precedes started_at".to_string(),
+            );
         }
         let duration =
             required_duration(value.duration, "agent.status.report.provisioning.duration")?;
@@ -1307,7 +1316,7 @@ impl TryFrom<v1::ProvisionReport> for MachineProvisioningReport {
                 .enumerate()
                 .any(|(index, step)| steps[..index].iter().any(|previous| previous.id == step.id))
         {
-            return Err("vmmon response provisioning step IDs must be unique".to_string());
+            return Err("silo-vmmon response provisioning step IDs must be unique".to_string());
         }
         Ok(Self {
             status: provision_status(
@@ -1411,7 +1420,7 @@ impl TryFrom<v1::HostMemoryReclaim> for MachineHostMemoryReclaim {
             "inconclusive" => MachineHostMemoryReclaimQualification::Inconclusive,
             other => {
                 return Err(format!(
-                    "vmmon response has unknown host_memory_reclaim.qualification {other:?}"
+                    "silo-vmmon response has unknown host_memory_reclaim.qualification {other:?}"
                 ))
             }
         };
@@ -1466,7 +1475,7 @@ impl TryFrom<v1::MetricSnapshot> for MachineMetricSnapshot {
             || value.network_interfaces.len() > protocol::MAX_METRIC_ARRAY_ENTRIES
             || value.block_devices.len() > protocol::MAX_METRIC_ARRAY_ENTRIES
         {
-            return Err("vmmon response metric array exceeds maximum size".to_string());
+            return Err("silo-vmmon response metric array exceeds maximum size".to_string());
         }
         Ok(Self {
             memory: value.memory.map(TryInto::try_into).transpose()?,
@@ -1525,7 +1534,8 @@ impl TryFrom<v1::MemoryMetrics> for MachineMemoryMetrics {
         let available_bytes = required(value.available_bytes, "metrics.memory.available_bytes")?;
         if available_bytes > total_bytes {
             return Err(
-                "vmmon response metrics.memory.available_bytes exceeds total_bytes".to_string(),
+                "silo-vmmon response metrics.memory.available_bytes exceeds total_bytes"
+                    .to_string(),
             );
         }
         Ok(Self {
@@ -1542,7 +1552,7 @@ impl TryFrom<v1::CpuMetrics> for MachineCpuMetrics {
         let logical_cpu_count = required(value.logical_cpu_count, "metrics.cpu.logical_cpu_count")?;
         if logical_cpu_count == 0 {
             return Err(
-                "vmmon response metrics.cpu.logical_cpu_count must be positive".to_string(),
+                "silo-vmmon response metrics.cpu.logical_cpu_count must be positive".to_string(),
             );
         }
         Ok(Self {
@@ -1588,7 +1598,9 @@ impl TryFrom<v1::FilesystemMetrics> for MachineFilesystemMetrics {
             .checked_add(available_bytes)
             .is_none_or(|sum| sum > total_bytes)
         {
-            return Err("vmmon response metrics.filesystems totals are inconsistent".to_string());
+            return Err(
+                "silo-vmmon response metrics.filesystems totals are inconsistent".to_string(),
+            );
         }
         Ok(Self {
             mount_point: required_text(
@@ -1676,7 +1688,7 @@ impl TryFrom<v1::FilesystemEntry> for MachineFileEntry {
             v1::FilesystemEntryKind::BlockDevice => MachineEntryKind::BlockDevice,
             v1::FilesystemEntryKind::CharacterDevice => MachineEntryKind::CharacterDevice,
             v1::FilesystemEntryKind::Unspecified => {
-                return Err("vmmon response has unspecified filesystem entry.kind".to_string());
+                return Err("silo-vmmon response has unspecified filesystem entry.kind".to_string());
             }
         };
         Ok(Self {
@@ -1695,14 +1707,14 @@ impl TryFrom<v1::DirectoryPage> for MachineDirectoryPage {
     type Error = String;
     fn try_from(value: v1::DirectoryPage) -> Result<Self, Self::Error> {
         if value.entries.len() > protocol::MAX_DIRECTORY_PAGE_SIZE as usize {
-            return Err("vmmon response directory page exceeds maximum size".to_string());
+            return Err("silo-vmmon response directory page exceeds maximum size".to_string());
         }
         let next_cursor = value.next_cursor.map(Bytes::from);
         if next_cursor
             .as_ref()
             .is_some_and(|cursor| cursor.len() > protocol::MAX_CURSOR_BYTES)
         {
-            return Err("vmmon response directory cursor exceeds maximum size".to_string());
+            return Err("silo-vmmon response directory cursor exceeds maximum size".to_string());
         }
         Ok(Self {
             entries: value
@@ -1724,7 +1736,7 @@ impl TryFrom<Option<i32>> for MachineDirectoryCreateDisposition {
             v1::DirectoryCreateDisposition::Created => Ok(Self::Created),
             v1::DirectoryCreateDisposition::AlreadyExists => Ok(Self::AlreadyExists),
             v1::DirectoryCreateDisposition::Unspecified => {
-                Err("vmmon response has unspecified directory create disposition".to_string())
+                Err("silo-vmmon response has unspecified directory create disposition".to_string())
             }
         }
     }
@@ -1739,7 +1751,7 @@ impl TryFrom<Option<i32>> for FileWriteDisposition {
             v1::FileWriteDisposition::Created => Ok(Self::Created),
             v1::FileWriteDisposition::Replaced => Ok(Self::Replaced),
             v1::FileWriteDisposition::Unspecified => {
-                Err("vmmon response has unspecified file write disposition".to_string())
+                Err("silo-vmmon response has unspecified file write disposition".to_string())
             }
         }
     }
@@ -1755,7 +1767,7 @@ impl TryFrom<v1::WaitReadyResponse> for MachineReadiness {
             v1::WaitReadyOutcome::Terminal => MachineReadinessOutcome::Terminal,
             v1::WaitReadyOutcome::TimedOut => MachineReadinessOutcome::TimedOut,
             v1::WaitReadyOutcome::Unspecified => {
-                return Err("vmmon response has unspecified wait ready outcome".to_string());
+                return Err("silo-vmmon response has unspecified wait ready outcome".to_string());
             }
         };
         Ok(Self {
@@ -2097,7 +2109,7 @@ mod tests {
             }),
             metrics: None,
         };
-        let metrics = MachineMetrics::try_from(value.clone()).expect("old vmmon metrics");
+        let metrics = MachineMetrics::try_from(value.clone()).expect("old silo-vmmon metrics");
         assert_eq!(metrics.actual_backend, None);
         assert_eq!(metrics.host_memory_reclaim, None);
     }

@@ -241,7 +241,7 @@ mod tests {
 
         assert_eq!(runtime.home, None);
         assert_eq!(runtime.networking, networking);
-        assert!(runtime.vmmon_path.is_none());
+        assert!(runtime.supervisor_path.is_none());
         assert!(runtime.netd_path.is_none());
         assert_eq!(runtime.virt_backend, Some(libvm::VirtBackendOverride::Krun));
     }

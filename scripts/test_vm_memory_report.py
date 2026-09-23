@@ -17,10 +17,10 @@ spec.loader.exec_module(report)
 class WorkerDiscoveryTests(unittest.TestCase):
     def test_selects_only_the_supervisors_private_worker(self) -> None:
         rows = "\n".join([
-            "10 1 /runtime/vmmon --id abc",
+            "10 1 /runtime/bin/silo-vmmon --id abc",
             "11 10 silo-krun",
             "12 99 silo-krun",
-            "13 10 vmmon --name silo-krun",
+            "13 10 silo-vmmon --name silo-krun",
             "14 10 /bin/sh -c silo-krun",
         ])
         self.assertEqual(report.worker_pid(rows, 10), 11)

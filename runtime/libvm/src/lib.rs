@@ -32,8 +32,8 @@ mod network;
 mod paths;
 mod runtime;
 mod store;
+mod supervisor;
 mod utils;
-mod vmmon;
 
 pub use crate::error::LibVmError;
 pub use crate::host::{ensure_certificate_authority, CertificateAuthority};
@@ -82,7 +82,7 @@ pub use crate::runtime::{
     NetdRuntimeConfig, ReadOnlyRuntime, Runtime, RuntimeBuilder, RuntimeConfig,
     RuntimeNetworkingConfig, VirtBackendOverride,
 };
-pub use crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT;
+pub use crate::supervisor::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub use forward_spec::{
     Address as ForwardAddress, Direction as ForwardDirection, Endpoint as ForwardEndpoint, Forward,
     ForwardShape, UnixMode,

@@ -48,9 +48,9 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Sets the vmmon executable path used to launch machines.
-    pub fn vmmon_path(mut self, vmmon_path: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_vmmon_path(vmmon_path);
+    /// Sets the silo-vmmon executable path used to launch machines.
+    pub fn supervisor_path(mut self, supervisor_path: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_supervisor_path(supervisor_path);
         self
     }
 
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn component_and_runtime_root_methods_populate_runtime_config() {
         let config = RuntimeBuilder::new()
-            .vmmon_path("/runtime/bin/vmmon")
+            .supervisor_path("/runtime/bin/silo-vmmon")
             .netd_path("/runtime/bin/netd")
             .virt_backend(VirtBackendOverride::Krun)
             .kernel_path("/runtime/assets/kernel-default")
@@ -125,8 +125,8 @@ mod tests {
             .into_config();
 
         assert_eq!(
-            config.vmmon_path.as_deref(),
-            Some(std::path::Path::new("/runtime/bin/vmmon"))
+            config.supervisor_path.as_deref(),
+            Some(std::path::Path::new("/runtime/bin/silo-vmmon"))
         );
         assert_eq!(config.virt_backend, Some(VirtBackendOverride::Krun));
         assert_eq!(

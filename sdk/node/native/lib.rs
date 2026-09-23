@@ -25,7 +25,7 @@ use vm_spec::Mount;
 #[napi(object)]
 pub struct RuntimeOpenOptions {
     pub home: Option<String>,
-    pub vmmon_path: Option<String>,
+    pub supervisor_path: Option<String>,
 }
 
 #[napi(object)]
@@ -473,8 +473,8 @@ pub async fn open_runtime(options: Option<RuntimeOpenOptions>) -> Result<NativeR
     };
 
     if let Some(options) = options {
-        if let Some(vmmon_path) = options.vmmon_path {
-            config = config.with_vmmon_path(vmmon_path);
+        if let Some(supervisor_path) = options.supervisor_path {
+            config = config.with_supervisor_path(supervisor_path);
         }
     }
 

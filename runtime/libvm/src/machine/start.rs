@@ -28,11 +28,11 @@ pub struct MachineStartOptions {
     /// validated against the persisted network policy before a network runtime
     /// is launched.
     pub egress_credentials: EgressCredentials,
-    /// Optional vmmon-owned guest process this machine run exists to execute.
+    /// Optional silo-vmmon-owned guest process this machine run exists to execute.
     ///
     /// Machine startup is acknowledged only after the guest reports that the
     /// entrypoint started. The process then continues independently, its
-    /// output is captured best-effort in the machine execution log, and vmmon
+    /// output is captured best-effort in the machine execution log, and silo-vmmon
     /// stops the VM when it ends. It cannot be attached to or controlled after
     /// startup.
     pub entrypoint: Option<Entrypoint>,
@@ -50,10 +50,10 @@ pub trait LaunchCredentials: sealed::Sealed {
     fn apply(self, options: &mut MachineStartOptions);
 }
 
-/// A vmmon-owned guest process that a machine run exists to execute.
+/// A silo-vmmon-owned guest process that a machine run exists to execute.
 ///
 /// Machine start is acknowledged only after the entrypoint launches in the
-/// guest, and vmmon stops the VM when it exits.
+/// guest, and silo-vmmon stops the VM when it exits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entrypoint {
     program: String,
@@ -137,7 +137,7 @@ impl MachineStartOptions {
     /// Sets the guest process this machine run exists to execute.
     ///
     /// Machine start is acknowledged only after the entrypoint launches in the
-    /// guest, and vmmon stops the VM when it exits.
+    /// guest, and silo-vmmon stops the VM when it exits.
     pub fn entrypoint<F>(mut self, program: impl Into<String>, configure: F) -> Self
     where
         F: FnOnce(Entrypoint) -> Entrypoint,
@@ -146,7 +146,7 @@ impl MachineStartOptions {
         self
     }
 
-    /// Registers a host command for vmmon to execute after this machine run
+    /// Registers a host command for silo-vmmon to execute after this machine run
     /// exits.
     pub fn on_exit(mut self, command: HostCommand) -> Self {
         self.on_exit = Some(command);
@@ -165,11 +165,11 @@ impl MachineStartOptions {
 
     pub(crate) fn vmmon_startup_command(
         &self,
-    ) -> Option<crate::vmmon::start_request::VmmonStartupCommand> {
+    ) -> Option<crate::supervisor::start_request::VmmonStartupCommand> {
         self.entrypoint.as_ref().map(|entrypoint| {
-            crate::vmmon::start_request::VmmonStartupCommand {
+            crate::supervisor::start_request::VmmonStartupCommand {
                 execution_id: uuid::Uuid::new_v4(),
-                process: crate::vmmon::start_request::VmmonProcessSpec {
+                process: crate::supervisor::start_request::VmmonProcessSpec {
                     argv: std::iter::once(entrypoint.program.clone())
                         .chain(entrypoint.args.iter().cloned())
                         .collect(),
@@ -178,7 +178,7 @@ impl MachineStartOptions {
                         .env
                         .iter()
                         .map(|(name, value)| {
-                            crate::vmmon::start_request::VmmonEnvironmentVariable {
+                            crate::supervisor::start_request::VmmonEnvironmentVariable {
                                 name: name.clone(),
                                 value: value.clone(),
                             }

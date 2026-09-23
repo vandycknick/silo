@@ -15,8 +15,8 @@ pub struct RuntimeConfig {
     pub home: Option<PathBuf>,
     /// Networking configuration for locally started machines.
     pub networking: RuntimeNetworkingConfig,
-    /// Explicit vmmon executable path.
-    pub vmmon_path: Option<PathBuf>,
+    /// Explicit silo-vmmon executable path.
+    pub supervisor_path: Option<PathBuf>,
     /// Explicit netd executable path.
     pub netd_path: Option<PathBuf>,
     /// Explicit default kernel path.
@@ -29,19 +29,19 @@ pub struct RuntimeConfig {
     pub runtime_root: Option<PathBuf>,
     /// Portable runtime root bundled by an SDK frontend.
     pub bundled_runtime_root: Option<PathBuf>,
-    /// Explicit override of vmmon's virtualization backend.
+    /// Explicit override of silo-vmmon's virtualization backend.
     pub virt_backend: Option<VirtBackendOverride>,
 }
 
-/// Explicit override of vmmon's virtualization backend.
+/// Explicit override of silo-vmmon's virtualization backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum VirtBackendOverride {
-    /// libkrun in vmmon's private worker process.
+    /// libkrun in silo-vmmon's private worker process.
     Krun,
     /// Apple Virtualization.framework.
     Vz,
-    /// vmmon's in-process mock backend: no real VM runs, the guest side is
+    /// silo-vmmon's in-process mock backend: no real VM runs, the guest side is
     /// faked in-process. `scenario` is an absolute path to a scenario file
     /// scripting the mock's behavior; absent means the happy path.
     Mock { scenario: Option<PathBuf> },
@@ -71,9 +71,9 @@ impl RuntimeConfig {
         self
     }
 
-    /// Sets the vmmon executable path used to launch machines.
-    pub fn with_vmmon_path(mut self, vmmon_path: impl Into<PathBuf>) -> Self {
-        self.vmmon_path = Some(vmmon_path.into());
+    /// Sets the silo-vmmon executable path used to launch machines.
+    pub fn with_supervisor_path(mut self, supervisor_path: impl Into<PathBuf>) -> Self {
+        self.supervisor_path = Some(supervisor_path.into());
         self
     }
 
@@ -119,11 +119,11 @@ impl RuntimeConfig {
         self
     }
 
-    /// Testing only: run machines on vmmon's mock virtualization backend.
+    /// Testing only: run machines on silo-vmmon's mock virtualization backend.
     ///
     /// `scenario` is an absolute path to a mock scenario file (see the
-    /// `test-utils` crate, which also builds a mock-enabled vmmon binary to
-    /// pass to [`RuntimeConfig::with_vmmon_path`]). No real VM will run.
+    /// `test-utils` crate, which also builds a mock-enabled silo-vmmon binary to
+    /// pass to [`RuntimeConfig::with_supervisor_path`]). No real VM will run.
     pub fn with_mock_vmm(mut self, scenario: impl Into<PathBuf>) -> Self {
         self.virt_backend = Some(VirtBackendOverride::Mock {
             scenario: Some(scenario.into()),
@@ -368,7 +368,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = base.join("runtime-components");
-        for name in ["vmmon", "netd", "krun"] {
+        for name in ["silo-vmmon", "netd", "krun"] {
             let path = root.join("bin").join(name);
             std::fs::create_dir_all(path.parent().expect("helper parent"))
                 .expect("create helper parent");
