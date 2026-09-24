@@ -147,6 +147,8 @@ activate() {
     done
     require_engine_mounts
 
+    sh /usr/lib/silo-system/wait-systemd \
+        || fail "timed out waiting for the systemd control interface"
     if systemctl is-active --quiet docker.service; then
         docker info >/dev/null 2>&1 || fail "Docker is active but unhealthy"
         return 0

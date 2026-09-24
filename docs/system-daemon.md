@@ -247,6 +247,11 @@ context integration. If the deadline expires, `up` exits non-zero with the last
 startup error without stopping the service; inspect `status` and `logs`, then
 rerun `up` when ready.
 
+Guest activation waits up to 30 seconds for systemd's control interface before
+starting Docker units. Guest-agent readiness alone does not imply systemd is
+ready. This wait probes the manager directly, so unrelated degraded units do
+not prevent activation.
+
 If the daemon process itself exits during startup (a fatal condition such as a
 pending upgrade or a foreign lock), `up` reports the recorded failure at once
 instead of waiting for the readiness timeout, and stops the native service so

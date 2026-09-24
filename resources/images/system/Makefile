@@ -18,7 +18,7 @@ CARGO_TARGET_DIR := $(abspath $(ROOT)/target)
 PORTD := $(ROOT)/target/$(RUST_TARGET)/release/silo-portd
 HOST_ARCH := $(shell uname -m)
 
-.PHONY: portd build archive rootfs verify clean
+.PHONY: portd build archive rootfs verify verify-systemd clean
 portd:
 	@test "$(ARCH):$(HOST_ARCH)" = "amd64:x86_64" -o "$(ARCH):$(HOST_ARCH)" = "arm64:aarch64" || \
 		{ printf 'ARCH=%s requires a native matching build host (found %s)\n' "$(ARCH)" "$(HOST_ARCH)" >&2; exit 1; }
@@ -53,6 +53,10 @@ rootfs: portd
 
 verify:
 	sh ./verify.sh
+
+# Run after building IMAGE, on a Docker host with privileged cgroup v2 support.
+verify-systemd:
+	IMAGE="$(IMAGE)" sh ./test-systemd-readiness.sh
 
 clean:
 	rm -rf .dist

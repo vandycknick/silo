@@ -48,6 +48,13 @@ floating image default. Debug builds alone retain the explicit `:dev` default.
 daemon. A container build additionally validates packages, configuration,
 units, proxy binaries, static portd installation, and records the package lock.
 
+After rebuilding the image, `make verify-systemd IMAGE=<built-image>` tests the
+activation readiness helper against real systemd: absent-manager timeout,
+delayed manager startup, and an already available manager. It uses a temporary
+privileged container with private cgroup and tmpfs mounts, and requires a Docker
+host that supports running systemd with cgroup v2. It does not start the host's
+Silo daemon or replace its system image.
+
 ## Activation request
 
 The controller invokes `silo-system-activate activate` as root and sends exactly

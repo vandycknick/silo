@@ -15,6 +15,8 @@ jq --exit-status '
     .features["containerd-snapshotter"] == true
 ' files/etc/docker/daemon.json >/dev/null
 sh -n files/usr/lib/silo-system/silo-system-activate
+sh -n files/usr/lib/silo-system/wait-systemd
+sh -n test-systemd-readiness.sh
 printf '%s\n' \
     '{"schema":1,"data_uuid":"01234567-89ab-cdef-0123-456789abcdef","data_layout":1,"required_shares":[{"path":"/home/alice","tag":"/home/alice","writable":true}]}' \
     | jq --exit-status --from-file files/usr/lib/silo-system/activation-request.jq >/dev/null
