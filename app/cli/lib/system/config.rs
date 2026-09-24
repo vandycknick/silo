@@ -21,6 +21,16 @@ pub(crate) struct SystemConfig {
     pub(crate) system: SystemOptions,
 }
 
+impl Default for SystemConfig {
+    fn default() -> Self {
+        Self {
+            version: "1".to_string(),
+            backend: None,
+            system: SystemOptions::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SystemBackend {

@@ -27,15 +27,26 @@ or replace `/var/run/docker.sock`.
 
 ## Configuration
 
-Add a strict version-1 `daemon` section to `~/.config/silo/config.yaml` (or the
-equivalent `XDG_CONFIG_HOME` path):
+No configuration file is required: run `silo daemon up` to use the built-in
+system image and defaults (4 CPUs, 8 GiB memory, a sparse 20 GiB root disk and
+500 GiB data disk, and a read/write home share). Silo generates
+`~/.silo/daemon/daemon.json` as internal installation state; do not create or
+edit it yourself.
+
+Release builds use the qualified image digest embedded via `SILO_SYSTEM_IMAGE`.
+Development builds otherwise use `ghcr.io/vandycknick/silo/system:dev`. A release
+built without an embedded image requires an explicit image override.
+
+To override defaults, optionally add a strict version-1 `daemon` section to
+`~/.config/silo/config.yaml` (or the equivalent `XDG_CONFIG_HOME` path).
+Only specify settings you want to change:
 
 ```yaml
 daemon:
   version: "1"
   backend: krun                  # optional; krun (default) | vz (macOS)
   system:
-    image: ghcr.io/vandycknick/silo/system@sha256:<qualified-digest>
+    # image: ghcr.io/vandycknick/silo/system@sha256:<qualified-digest>
     resources:
       cpus: 4
       memory: 8GiB

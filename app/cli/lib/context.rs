@@ -142,9 +142,7 @@ impl Context {
         if !home.is_absolute() {
             return Err(eyre::eyre!("HOME must be absolute: {}", home.display()));
         }
-        let config = self.config()?.daemon().cloned().ok_or_else(|| {
-            eyre::eyre!("system daemon is not configured\n\nhint: add `daemon: {{ version: \"1\", system: {{}} }}` to the Silo config")
-        })?;
+        let config = self.config()?.daemon();
         let paths = default_system_paths()?;
         let mut resolved = config.resolve(&home, &paths.home, None)?;
         if let Some(installation) = crate::system::record::DaemonRecord::load(&paths)? {
