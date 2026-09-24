@@ -183,9 +183,10 @@ impl AppApi {
         plan: &CreatePlan,
         source: SourceResolution,
         policy_config_dir: Option<&std::path::Path>,
+        progress: ImageProgressSender,
     ) -> eyre::Result<MachineData> {
         self.local
-            .create_machine(plan, source, policy_config_dir)
+            .create_machine(plan, source, policy_config_dir, progress)
             .await
     }
 
@@ -225,19 +226,7 @@ mod tests {
     async fn local_api_uses_only_its_explicit_disposable_roots() {
         let temp = tempfile::tempdir().expect("create disposable application roots");
         let home = temp.path().join("home");
-        let components = temp.path().join("components");
-        let bin = components.join("bin");
-        let assets = components.join("assets");
-        std::fs::create_dir_all(&bin).expect("create binary component fixtures");
-        std::fs::create_dir(&assets).expect("create asset component fixtures");
-        for name in ["silo-vmm", "netd", "krun"] {
-            executable_fixture(&bin, name);
-        }
-        for name in ["kernel-default", "initramfs"] {
-            std::fs::write(assets.join(name), b"fixture").expect("write asset fixture");
-        }
-        executable_fixture(&assets, "agent");
-        let config = RuntimeConfig::local(&home).with_runtime_root(&components);
+        let config = isolated_runtime_config(temp.path(), &home);
         let mut api = AppApi::local(config);
 
         let machines = api
@@ -250,6 +239,93 @@ mod tests {
         assert!(libvm::HostPaths::run_root().is_dir());
         assert!(!temp.path().join(".docker").exists());
         assert!(!temp.path().join("native-service").exists());
+    }
+
+    #[tokio::test]
+    async fn image_progress_survives_resolution_and_covers_creation() {
+        use crate::commands::create::{machine_settings, VmOverrideArgs};
+        use crate::planning::{self, Plan, PlanKind, ProcessOverrides, ResolveRequest};
+        use crate::template::Template;
+        use libvm::{ImageProgress, ImageProgressSender, MachineRetention};
+
+        let temp = tempfile::tempdir().expect("create disposable roots");
+        let mut api = AppApi::local(isolated_runtime_config(
+            temp.path(),
+            &temp.path().join("home"),
+        ));
+        let disk = temp.path().join("rootfs.img");
+        std::fs::write(&disk, b"caller-owned disk").expect("write local disk");
+        let reference = format!("disk:{}", disk.display());
+        let template: Template =
+            serde_json::from_str(r#"{"version":"1"}"#).expect("parse minimal template");
+        let (progress, mut events) = ImageProgressSender::default_channel();
+        let source = api
+            .resolve_source(Some(&reference), &template, None, progress.clone())
+            .await
+            .expect("resolve local disk");
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "resolution must not close the progress channel"
+        );
+        let options = VmOverrideArgs::default()
+            .resolve()
+            .expect("resolve defaults");
+        let plan = planning::resolve(ResolveRequest {
+            kind: PlanKind::Create,
+            template,
+            template_name: None,
+            template_image: None,
+            positional_image: Some(source.plan_image.clone()),
+            machine_settings: machine_settings(&options),
+            machine_overrides: options.overrides,
+            environment_files: Vec::new(),
+            host_environment: Default::default(),
+            environment_overrides: Vec::new(),
+            command_tail: Vec::new(),
+            process_overrides: ProcessOverrides::default(),
+            retention: MachineRetention::Persistent,
+            name: Some("progress-test".to_string()),
+        })
+        .expect("resolve creation plan");
+        let Plan::Create(plan) = plan else {
+            panic!("expected create plan");
+        };
+        let machine = api
+            .create_machine(&plan, source, None, progress)
+            .await
+            .expect("create machine");
+        assert_eq!(machine.name, "progress-test");
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ImageProgress::UsingLocalDisk { .. })
+        ));
+        assert!(matches!(events.try_recv(), Ok(ImageProgress::Complete)));
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "creation must release its reporter even while the API stays alive"
+        );
+    }
+
+    fn isolated_runtime_config(root: &Path, home: &Path) -> RuntimeConfig {
+        let components = root.join("components");
+        let bin = components.join("bin");
+        let assets = components.join("assets");
+        std::fs::create_dir_all(&bin).expect("create binary component fixtures");
+        std::fs::create_dir(&assets).expect("create asset component fixtures");
+        for name in ["silo-vmm", "netd", "krun"] {
+            executable_fixture(&bin, name);
+        }
+        for name in ["kernel-default", "initramfs"] {
+            std::fs::write(assets.join(name), b"fixture").expect("write asset fixture");
+        }
+        executable_fixture(&assets, "agent");
+        RuntimeConfig::local(home).with_runtime_root(&components)
     }
 
     fn executable_fixture(parent: &Path, name: &str) -> std::path::PathBuf {

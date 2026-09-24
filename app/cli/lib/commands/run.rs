@@ -191,7 +191,7 @@ impl Cmd {
                     self.image.as_deref(),
                     &template.template,
                     self.pull.map(Pull::policies),
-                    image_progress,
+                    image_progress.clone(),
                 )
                 .await
                 .map_err(execution_infrastructure)?;
@@ -218,7 +218,12 @@ impl Cmd {
             let data = context
                 .app_api()
                 .await?
-                .create_machine(&plan.create, source, policy_config_dir.as_deref())
+                .create_machine(
+                    &plan.create,
+                    source,
+                    policy_config_dir.as_deref(),
+                    image_progress,
+                )
                 .await
                 .map_err(execution_infrastructure)?;
             Ok::<_, eyre::Report>((plan, data))

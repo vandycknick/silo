@@ -271,7 +271,7 @@ impl Cmd {
                     self.image.as_deref(),
                     &template.template,
                     self.pull.map(Pull::policies),
-                    image_progress,
+                    image_progress.clone(),
                 )
                 .await?;
             let settings = machine_settings(&machine);
@@ -297,7 +297,7 @@ impl Cmd {
             context
                 .app_api()
                 .await?
-                .create_machine(&plan, source, policy_config_dir.as_deref())
+                .create_machine(&plan, source, policy_config_dir.as_deref(), image_progress)
                 .await
         };
         let image_result = image_result.await;

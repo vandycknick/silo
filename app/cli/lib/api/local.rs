@@ -500,9 +500,11 @@ impl LocalVmService {
         plan: &CreatePlan,
         source: SourceResolution,
         policy_config_dir: Option<&std::path::Path>,
+        progress: ImageProgressSender,
     ) -> eyre::Result<MachineData> {
         ensure_source_matches_plan(plan, &source)?;
-        let mut builder = self.runtime().await?.machine();
+        let runtime = self.runtime().await?.clone().with_image_progress(progress);
+        let mut builder = runtime.machine();
         if let Some(name) = &plan.proposed_name {
             builder = builder.name(name);
         }
