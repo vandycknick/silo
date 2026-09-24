@@ -216,7 +216,7 @@ last update, and a one-line summary of the last failure. The full cause chain
 is in `daemon logs`.
 
 ```
-State:      failed (retrying; 3 attempts so far)
+State:      starting (retrying; 3 attempts so far)
 Autostart:  enabled
 Endpoint:   unix:///Users/me/.silo/run/docker.sock
 PID:        80954
@@ -240,9 +240,12 @@ bounded and rotated under `~/.silo/logs/daemon`.
 If the engine cannot be brought up, for example because the system image is
 not available yet, the daemon stays running: it records the failure in
 `daemon status` and its log and retries with exponential backoff, at most every
-60 seconds. `up` reports the first such failure it observes and exits non-zero
-without stopping the service; rerun `up` once the daemon is ready to finish
-Docker integration.
+60 seconds. These attempts use the `retrying` phase, not terminal `failed`.
+`up` reports retry errors as progress and keeps waiting within its 120-second
+startup deadline. Once the engine is ready, the same invocation finishes Docker
+context integration. If the deadline expires, `up` exits non-zero with the last
+startup error without stopping the service; inspect `status` and `logs`, then
+rerun `up` when ready.
 
 If the daemon process itself exits during startup (a fatal condition such as a
 pending upgrade or a foreign lock), `up` reports the recorded failure at once

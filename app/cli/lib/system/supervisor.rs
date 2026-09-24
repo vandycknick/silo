@@ -28,6 +28,7 @@ pub(crate) enum DaemonPhase {
     StartingVm,
     WaitingGuest,
     ActivatingEngine,
+    Retrying,
     Ready,
     Degraded,
     Failed,
@@ -204,7 +205,7 @@ pub(crate) async fn serve(
                 failed_attempts = failed_attempts.saturating_add(1);
                 let delay = startup_retry_delay(failed_attempts);
                 let causes = error_causes(&error);
-                status.phase = DaemonPhase::Failed;
+                status.phase = DaemonPhase::Retrying;
                 status.last_error = Some(error_summary(&causes));
                 status.restart_count = failed_attempts;
                 publish(&paths, &mut status)?;

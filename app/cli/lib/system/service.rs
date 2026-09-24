@@ -186,15 +186,14 @@ pub(crate) fn wait_ready(
     since: chrono::DateTime<chrono::Utc>,
     timeout: Duration,
 ) -> eyre::Result<()> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    let mut readiness = StartupReadiness::new(timeout);
+    loop {
+        readiness
+            .check_deadline()
+            .map_err(|error| eyre::eyre!("{error}{}", native_log_tail(paths)))?;
         if let Some(status) = status(paths)? {
-            match status.phase {
-                DaemonPhase::Ready => return Ok(()),
-                // The daemon is alive and retrying with backoff; report what blocks it
-                // and leave the service running.
-                DaemonPhase::Failed => return Err(retrying_failure(status.last_error)),
-                _ => {}
+            if readiness.observe(status.phase, status.last_error)? {
+                return Ok(());
             }
         } else if let Some(error) = recent_failure(paths, since)? {
             // The daemon process itself exited, so its PID no longer corroborates the
@@ -204,10 +203,52 @@ pub(crate) fn wait_ready(
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    bail!(
-        "timed out waiting for readiness; the native service may still be running{}",
-        native_log_tail(paths)
-    )
+}
+
+struct StartupReadiness {
+    deadline: Instant,
+    last_error: Option<String>,
+}
+
+impl StartupReadiness {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + timeout,
+            last_error: None,
+        }
+    }
+
+    fn observe(&mut self, phase: DaemonPhase, error: Option<String>) -> eyre::Result<bool> {
+        if let Some(error) = error {
+            if self.last_error.as_ref() != Some(&error) && phase == DaemonPhase::Retrying {
+                eprintln!("daemon startup is retrying: {error}");
+            }
+            self.last_error = Some(error);
+        }
+        match phase {
+            DaemonPhase::Ready => Ok(true),
+            DaemonPhase::Failed => bail!(
+                "system daemon failed: {}",
+                self.last_error.as_deref().unwrap_or("unknown failure")
+            ),
+            DaemonPhase::Stopping | DaemonPhase::Stopped => {
+                bail!("system daemon stopped before becoming ready")
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn check_deadline(&self) -> eyre::Result<()> {
+        if Instant::now() >= self.deadline {
+            let detail = self
+                .last_error
+                .as_ref()
+                .map(|error| format!("; last startup error: {error}"))
+                .unwrap_or_default();
+            bail!("timed out waiting for readiness{detail}\n\nhint: the native service may still be running; check `silo daemon status` and `silo daemon logs`");
+        }
+        Ok(())
+    }
 }
 
 /// Returns the failure recorded by a daemon generation that started after `since`,
@@ -233,13 +274,6 @@ fn recent_failure(
             .last_error
             .unwrap_or_else(|| "unknown failure".to_string()),
     ))
-}
-
-fn retrying_failure(error: Option<String>) -> eyre::Report {
-    eyre::eyre!(
-        "{}\n\nhint: the daemon keeps retrying in the background; check `silo daemon status`, then rerun `silo daemon up`",
-        error.unwrap_or_else(|| "system daemon is not ready".to_string())
-    )
 }
 
 /// Stops the service manager from relaunching a daemon process that keeps exiting,
@@ -690,6 +724,65 @@ mod tests {
     use crate::system::service::{logs, validate_existing_service};
 
     #[test]
+    fn startup_wait_survives_retry_and_completes_only_when_ready() {
+        use crate::system::service::StartupReadiness;
+        use crate::system::supervisor::DaemonPhase;
+        let mut wait = StartupReadiness::new(std::time::Duration::from_secs(120));
+        for phase in [DaemonPhase::WaitingGuest, DaemonPhase::ActivatingEngine] {
+            assert!(!wait.observe(phase, None).expect("starting"));
+        }
+        assert!(!wait
+            .observe(DaemonPhase::Retrying, Some("systemd unavailable".into()))
+            .expect("retry is not terminal"));
+        wait.check_deadline().expect("retry leaves time to start");
+        assert!(!wait
+            .observe(DaemonPhase::Creating, None)
+            .expect("next attempt"));
+        assert!(!wait
+            .observe(DaemonPhase::ActivatingEngine, None)
+            .expect("activation"));
+        assert!(wait.observe(DaemonPhase::Ready, None).expect("ready"));
+    }
+
+    #[test]
+    fn startup_deadline_preserves_latest_retry_error_across_attempts() {
+        use crate::system::service::StartupReadiness;
+        use crate::system::supervisor::DaemonPhase;
+        let mut wait = StartupReadiness::new(std::time::Duration::ZERO);
+        wait.observe(DaemonPhase::Retrying, Some("first failure".into()))
+            .expect("retry");
+        wait.observe(DaemonPhase::Retrying, Some("systemd unavailable".into()))
+            .expect("retry");
+        wait.observe(DaemonPhase::Creating, None)
+            .expect("another attempt");
+        let error = wait
+            .check_deadline()
+            .expect_err("deadline expired")
+            .to_string();
+        assert!(error.contains("timed out"));
+        assert!(error.contains("systemd unavailable"));
+        assert!(!error.contains("first failure"));
+        assert!(error.contains("silo daemon status"));
+    }
+
+    #[test]
+    fn startup_terminal_failure_and_shutdown_do_not_wait_for_deadline() {
+        use crate::system::service::StartupReadiness;
+        use crate::system::supervisor::DaemonPhase;
+        for phase in [
+            DaemonPhase::Failed,
+            DaemonPhase::Stopping,
+            DaemonPhase::Stopped,
+        ] {
+            let mut wait = StartupReadiness::new(std::time::Duration::from_secs(120));
+            assert!(wait
+                .observe(phase, Some("terminal failure".into()))
+                .is_err());
+            wait.check_deadline().expect("failed before timeout");
+        }
+    }
+
+    #[test]
     fn registered_runtime_uses_resolved_backend_and_reclaim_policy() {
         let config: crate::system::config::ResolvedSystemConfig =
             serde_json::from_value(serde_json::json!({
@@ -782,6 +875,10 @@ mod tests {
             recent_failure(&paths, before).expect("fresh").as_deref(),
             Some("boom")
         );
+        write("retrying", &chrono::Utc::now().to_rfc3339());
+        assert!(recent_failure(&paths, before)
+            .expect("retry is not terminal")
+            .is_none());
         write("creating", &chrono::Utc::now().to_rfc3339());
         assert!(recent_failure(&paths, before)
             .expect("progressing")

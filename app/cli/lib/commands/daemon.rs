@@ -152,7 +152,8 @@ impl DaemonStatusView {
                 | DaemonPhase::Creating
                 | DaemonPhase::StartingVm
                 | DaemonPhase::WaitingGuest
-                | DaemonPhase::ActivatingEngine,
+                | DaemonPhase::ActivatingEngine
+                | DaemonPhase::Retrying,
             ) => "starting",
         };
         Ok(Self {
@@ -177,10 +178,11 @@ impl DaemonStatusView {
                 DaemonPhase::ActivatingEngine => "starting (activating Docker)".to_string(),
                 DaemonPhase::Ready => "ready".to_string(),
                 DaemonPhase::Degraded => "degraded (Docker health probe failing)".to_string(),
-                DaemonPhase::Failed => match status.restart_count {
-                    0 | 1 => "failed (retrying)".to_string(),
-                    attempts => format!("failed (retrying; {attempts} attempts so far)"),
-                },
+                DaemonPhase::Retrying => format!(
+                    "starting (retrying; {} attempts so far)",
+                    status.restart_count
+                ),
+                DaemonPhase::Failed => "failed".to_string(),
                 DaemonPhase::Stopping => "stopping".to_string(),
                 DaemonPhase::Stopped => "stopped".to_string(),
             },
