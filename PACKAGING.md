@@ -29,14 +29,14 @@ The current commands do not produce notarized macOS artifacts, release
 signatures, or published releases. Official Linux distribution is archive-only;
 native Linux distribution packages are not planned requirements.
 
-`silo-vmmon` contains both the VM monitor and the libkrun worker: one
-executable that runs as the supervisor by default and as the `silo-krun` worker
+`silo-vmm` contains both the VM monitor and the libkrun worker: one
+executable that runs as the supervisor by default and as the `krun` worker
 when started with that argv[0]. libkrun is linked into it as a library, so there
-is no separate krun binary. Package `silo-vmmon` (`bin/silo-vmmon`, or
-`Contents/Helpers/silo-vmmon` in `Silo.app`) and `netd` alongside the guest
+is no separate krun binary. Package `silo-vmm` (`bin/silo-vmm`, or
+`Contents/Helpers/silo-vmm` in `Silo.app`) and `netd` alongside the guest
 assets. macOS signing must use the Hypervisor/Virtualization entitlement union
-in `virt/vmmon/silo-vmmon.entitlements`. See
-[silo-vmmon architecture](docs/architecture/silo-vmmon.md) before treating a
+in `virt/vmm/silo-vmm.entitlements`. See
+[silo-vmm architecture](docs/architecture/silo-vmm.md) before treating a
 build or inventory check as native release qualification.
 
 ## Prerequisites
@@ -166,7 +166,7 @@ The canonical stage contains exactly the private runtime payload:
 ```text
 target/silo-runtime/<target>/release/
   bin/
-    silo-vmmon
+    silo-vmm
     netd
   assets/
     kernel-default
@@ -192,7 +192,7 @@ The runtime archive contains:
 ```text
 silo-runtime-<version>-<target>/
   bin/
-    silo-vmmon
+    silo-vmm
     netd
   assets/
     kernel-default
@@ -209,7 +209,7 @@ The portable CLI archive contains the same files plus `bin/silo`:
 silo-<version>-<target>/
   bin/
     silo
-    silo-vmmon
+    silo-vmm
     netd
   assets/
     kernel-default

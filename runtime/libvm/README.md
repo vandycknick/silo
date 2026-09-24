@@ -50,7 +50,7 @@ the selected root disk and persists a stopped machine; it never starts the VM.
 `Machine::start` and `Machine::stop` manage a persisted machine. A normal start
 creates an idle VM. `Machine::start_with` can instead set one
 `Entrypoint`; startup succeeds only after that guest program launches, and
-`silo-vmmon` stops the VM when the program exits:
+`silo-vmm` stops the VM when the program exits:
 
 ```rust,no_run
 use libvm::Runtime;
@@ -137,15 +137,15 @@ database, machine, runtime, or cache files.
 
 ## Runtime Components
 
-`Runtime::new` resolves `silo-vmmon`, `netd`, `kernel-default`, `initramfs`,
+`Runtime::new` resolves `silo-vmm`, `netd`, `kernel-default`, `initramfs`,
 and `agent` once, validates them as absolute paths, and retains that immutable
-set for the runtime lifetime. `SILO_VMMON_PATH`, or
+set for the runtime lifetime. `SILO_VMM_PATH`, or
 `RuntimeConfig::with_supervisor_path` / `RuntimeBuilder::supervisor_path`,
-replaces only the `silo-vmmon` path. Machine starts launch the resolved absolute
-`silo-vmmon` path directly. For the krun backend,
-silo-vmmon re-executes itself with argv[0] `silo-krun` to run libkrun in a
+replaces only the `silo-vmm` path. Machine starts launch the resolved absolute
+`silo-vmm` path directly. For the krun backend,
+silo-vmm re-executes itself with argv[0] `krun` to run libkrun in a
 private worker, so there is no separate krun component to resolve (see
-[silo-vmmon architecture](../../docs/architecture/silo-vmmon.md)).
+[silo-vmm architecture](../../docs/architecture/silo-vmm.md)).
 Private networking launches the resolved absolute `netd` path directly.
 
 ## Hybrid Vsock Paths
@@ -159,7 +159,7 @@ paths also return `None` for Silo's reserved host port 1027.
 
 Resolving an enabled path creates the owner-only machine runtime directory so an
 extension can bind a listener before VM startup. The extension owns that
-listener and must close it during shutdown. silo-vmmon cleans up its mux and private
+listener and must close it during shutdown. silo-vmm cleans up its mux and private
 backend sockets, then libvm removes the complete machine runtime tree; extension
 unlink attempts must therefore tolerate an already-removed path. See the
 [hybrid vsock guide](../../docs/hybrid-vsock.md) for protocol examples, retries,
@@ -180,11 +180,11 @@ last persisted state over blocking when another process owns the machine lock.
 
 The persisted machine states mean:
 
-- `stopped`: no live `silo-vmmon` is associated with the VM.
+- `stopped`: no live `silo-vmm` is associated with the VM.
 - `starting`: a start transaction owns the VM and is waiting for the host-side
-  `silo-vmmon` startup handshake to finish.
-- `running`: `silo-vmmon` is alive and the host-side startup handshake succeeded.
-- `stopping`: a stop signal was sent to `silo-vmmon` and Silo is waiting for the
+  `silo-vmm` startup handshake to finish.
+- `running`: `silo-vmm` is alive and the host-side startup handshake succeeded.
+- `stopping`: a stop signal was sent to `silo-vmm` and Silo is waiting for the
   monitor to exit.
 - `error`: the VM is not usable until an explicit lifecycle command repairs or
   replaces the state.

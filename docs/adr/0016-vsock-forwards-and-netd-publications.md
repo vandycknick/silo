@@ -10,7 +10,7 @@ Draft
 
 Extends and amends [ADR 0015](0015-hybrid-vsock-host-surface.md). Relates to
 [ADR 0006](0006-sandbox-network-policy-and-firewall-semantics.md),
-[ADR 0008](0008-vmmon-host-and-guest-grpc-api.md), and
+[ADR 0008](0008-vmm-host-and-guest-grpc-api.md), and
 [ADR 0010](0010-static-guest-network-configuration.md).
 
 ## The Problem
@@ -56,25 +56,25 @@ Two transports exist and each is right for a different job:
   serves them nowhere.
 
 This ADR decides the forwarding model, which transport serves which case, what
-the guest agent and `silo-vmmon` gain, what netd must serve, and how `silo forward`
+the guest agent and `silo-vmm` gain, what netd must serve, and how `silo forward`
 and the system VM compose those pieces.
 
 ## Terminology
 
 | Term | Meaning |
 | --- | --- |
-| Forward | A host-configured rule with a listen endpoint and a connect endpoint. `silo-vmmon` and the guest agent accept connections at the listen endpoint and connect each one to the connect endpoint over one vsock stream. |
+| Forward | A host-configured rule with a listen endpoint and a connect endpoint. `silo-vmm` and the guest agent accept connections at the listen endpoint and connect each one to the connect endpoint over one vsock stream. |
 | Listen endpoint | Where a forward accepts new connections. |
 | Connect endpoint | Where a forward connects each accepted connection. Also called the target. |
-| Endpoint side | The `host:` or `guest:` prefix on an endpoint. The side names the process that performs the socket operation: `silo-vmmon` for `host:`, the guest agent for `guest:`. |
+| Endpoint side | The `host:` or `guest:` prefix on an endpoint. The side names the process that performs the socket operation: `silo-vmm` for `host:`, the guest agent for `guest:`. |
 | Vsock endpoint | An endpoint written `vsock:<port>` that names a raw vsock port instead of a socket the agent operates. It replaces the guest half of a forward when the guest speaks vsock natively. |
 | Inbound forward | A forward whose listen endpoint is on the host. Connections are host-initiated in ADR 0015 terms; a guest service becomes reachable from the host. |
 | Outbound forward | A forward whose listen endpoint is in the guest. Connections are guest-initiated; a host service becomes reachable from inside the guest. |
 | Machine-scoped forward | A forward in the `VmSpec`. Its configuration persists with the machine, and its listener exists for the life of each machine run. |
-| Session-scoped forward | A forward created through the `silo-vmmon` host API. It exists exactly as long as the gRPC stream that created it. |
+| Session-scoped forward | A forward created through the `silo-vmm` host API. It exists exactly as long as the gRPC stream that created it. |
 | Forward dialer | The guest agent's listener on guest vsock port 1028. It reads one target line and connects to that guest address. |
-| Forward return port | Host vsock port 1028, served by `silo-vmmon`. The agent dials it for every connection accepted by an outbound forward and presents that forward's token. |
-| Forward token | A 128-bit random value `silo-vmmon` issues per outbound forward. The agent presents it on the return port. |
+| Forward return port | Host vsock port 1028, served by `silo-vmm`. The agent dials it for every connection accepted by an outbound forward and presents that forward's token. |
+| Forward token | A 128-bit random value `silo-vmm` issues per outbound forward. The agent presents it on the return port. |
 | Publication | A host TCP listener that netd binds because the guest asked for it. Connections are dialed to the guest's interface address through the netstack. |
 | Publication endpoint | The gvproxy-compatible HTTP API netd serves on the gateway IP inside the virtual network. |
 | Attachment-scoped publication | A publication created through the gvproxy-compatible API. It lives until an explicit unexpose or the guest attachment ends. |
@@ -90,14 +90,14 @@ requested by the guest and carried by netd.
 
 Silo provides two mechanisms with a fixed division of labor:
 
-1. **Forwards are a core capability of `silo-vmmon` and the guest agent.** A
+1. **Forwards are a core capability of `silo-vmm` and the guest agent.** A
    forward is a pair of endpoints, `listen` and `connect`. Exactly one is a
-   `host:` endpoint that `silo-vmmon` operates; the other is a `guest:` endpoint the
+   `host:` endpoint that `silo-vmm` operates; the other is a `guest:` endpoint the
    agent operates or a raw `vsock:` port. Each accepted connection becomes one
    vsock stream. Forwards carry TCP and Unix-socket streams, work with
    `network: none`, reach guest loopback addresses, and never involve netd.
    Forwards are machine-scoped in the `VmSpec` or session-scoped through a
-   `silo-vmmon` gRPC stream for the caller's lifetime. `silo forward` opens a
+   `silo-vmm` gRPC stream for the caller's lifetime. `silo forward` opens a
    session-scoped forward.
 2. **Publications are a netd capability for container engines.** A guest
    process asks netd, through the gvproxy-compatible publication endpoint, to
@@ -114,12 +114,12 @@ Core invariants:
   stream to a guest address, and listen on a guest address and return each
   connection to the host over vsock. It has no forward table, no policy, and
   no knowledge of host addresses.
-- `silo-vmmon` owns every host-side socket a forward needs and the complete
+- `silo-vmm` owns every host-side socket a forward needs and the complete
   forward table. It binds a host TCP or Unix listener only for a machine- or
   session-scoped forward. The hybrid surface itself still never exposes vsock
   on TCP.
 - Every forward and publication has an explicit scope whose end removes it:
-  the machine run for machine-scoped forwards, a `silo-vmmon` gRPC stream for
+  the machine run for machine-scoped forwards, a `silo-vmm` gRPC stream for
   session-scoped forwards, the guest attachment for attachment-scoped
   publications, and an HTTP connection for session-scoped publications. There
   are no orphan listeners and no lease protocol.
@@ -129,14 +129,14 @@ Core invariants:
   constrained by a per-machine policy.
 - A host that wants to know whether a guest supports forwards asks one
   question through an existing mechanism: the gRPC health status of
-  `silo.v1.GuestForwardService`. `silo-vmmon` asks once per agent instance and
+  `silo.v1.GuestForwardService`. `silo-vmm` asks once per agent instance and
   caches the answer in `HostStatus`.
 
 ### Transport Selection
 
 | Case | Mechanism | Path |
 | --- | --- | --- |
-| `silo forward` in either direction | Forward (session scope) | CLI keeps a `silo-vmmon` stream open |
+| `silo forward` in either direction | Forward (session scope) | CLI keeps a `silo-vmm` stream open |
 | Host `docker.sock` for a guest engine | Forward (machine scope) | `VmSpec` `forwards` entry |
 | Host service reachable inside the guest | Forward | `listen: guest:...`, `connect: host:...` |
 | Guest AF_VSOCK service, no agent involvement | Forward | `connect: vsock:<port>` |
@@ -152,7 +152,7 @@ Core invariants:
 flowchart LR
   subgraph HOST
     direction TB
-    subgraph monitor["silo-vmmon"]
+    subgraph monitor["silo-vmm"]
       direction TB
       spec["VmSpec forwards"] --> table["forward table"]
       hold["silo forward · Open stream"] --> table
@@ -196,7 +196,7 @@ flowchart LR
   class pe,tl,dockerd,eth0 net
 ```
 
-Blue nodes belong to `silo-vmmon`, orange nodes to the guest agent and its
+Blue nodes belong to `silo-vmm`, orange nodes to the guest agent and its
 sockets, green nodes to netd and the container engine. Thick edges are vsock
 streams. The forward system and the publication system share no node.
 
@@ -214,7 +214,7 @@ forwards:
 ```mermaid
 sequenceDiagram
   participant C as docker CLI (host)
-  participant V as silo-vmmon (host)
+  participant V as silo-vmm (host)
   participant A as guest agent
   participant D as dockerd (guest)
   C->>V: connect(machine-run-dir/docker.sock)
@@ -226,16 +226,16 @@ sequenceDiagram
   Note over C,D: spliced both ways: host connection ↔ vsock stream ↔ guest connection
 ```
 
-1. `silo-vmmon` binds `<machine-run-dir>/docker.sock` (mode `0600`) before the VM
+1. `silo-vmm` binds `<machine-run-dir>/docker.sock` (mode `0600`) before the VM
    starts. The path exists as soon as `silo start` returns.
-2. Per accepted connection, `silo-vmmon` dials guest vsock port 1028, writes one
+2. Per accepted connection, `silo-vmm` dials guest vsock port 1028, writes one
    target line, and waits for `OK`.
 3. The agent connects to the named Unix socket inside the guest, replies
-   `OK`, and splices. `silo-vmmon` splices the host connection to the vsock stream.
+   `OK`, and splices. `silo-vmm` splices the host connection to the vsock stream.
 4. A connection accepted before the agent is ready waits, bounded, for the
    agent; a refusal after that closes the host connection.
 
-Neither side runs custom code beyond the agent and `silo-vmmon`. The guest image
+Neither side runs custom code beyond the agent and `silo-vmm`. The guest image
 ships no bridge unit.
 
 ### Inbound Forward Without The Agent: A Raw Vsock Target
@@ -249,7 +249,7 @@ forwards:
 ```mermaid
 sequenceDiagram
   participant C as host client
-  participant V as silo-vmmon (host)
+  participant V as silo-vmm (host)
   participant G as guest AF_VSOCK service on port 2375
   C->>V: connect(127.0.0.1:2375)
   V->>G: connect_vsock(2375), no preamble
@@ -272,7 +272,7 @@ forwards:
 ```mermaid
 sequenceDiagram
   participant P as host postgres
-  participant V as silo-vmmon (host)
+  participant V as silo-vmm (host)
   participant A as guest agent
   participant G as guest client
   V->>A: Listen{listen tcp:127.0.0.1:5432, token T} over gRPC, stream stays open
@@ -288,11 +288,11 @@ sequenceDiagram
 ```
 
 1. When the agent is ready and reports `GuestForwardService` as serving,
-   `silo-vmmon` opens a `Listen` stream carrying the guest listen address and a
+   `silo-vmm` opens a `Listen` stream carrying the guest listen address and a
    fresh token. The stream stays open while the forward exists.
 2. The agent binds the address in the guest and reports the bound address.
 3. Per accepted guest connection, the agent dials host port 1028 and presents
-   the token. `silo-vmmon` maps the token to the forward's host connect endpoint,
+   the token. `silo-vmm` maps the token to the forward's host connect endpoint,
    connects, replies `OK`, and splices.
 4. Ending the `Listen` stream, for any reason, closes the guest listener and
    every connection it accepted.
@@ -305,20 +305,20 @@ forwards:
     connect: host:unix:/run/user/1000/some-service.sock
 ```
 
-`silo-vmmon` registers host vsock port 5000 with `listen_vsock`, and per guest dial
+`silo-vmm` registers host vsock port 5000 with `listen_vsock`, and per guest dial
 to `(2, 5000)` connects the host Unix socket and splices. This is the ADR 0015
-`<uds>_5000` path with `silo-vmmon` acting as the extension process, so no host
+`<uds>_5000` path with `silo-vmm` acting as the extension process, so no host
 process needs to run to serve the guest.
 
 ```mermaid
 sequenceDiagram
   participant S as host service (unix socket)
-  participant V as silo-vmmon (host)
+  participant V as silo-vmm (host)
   participant G as guest AF_VSOCK client
   Note over V: listen_vsock(5000) registered before VM start
   G->>V: dial CID 2 port 5000
   V->>S: connect(host unix path)
-  Note over S,G: spliced both ways, no preamble, no host process besides silo-vmmon
+  Note over S,G: spliced both ways, no preamble, no host process besides silo-vmm
 ```
 
 ### Held Forward: `silo forward`
@@ -326,7 +326,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
   participant S as silo forward dev 8080:80
-  participant V as silo-vmmon (host)
+  participant V as silo-vmm (host)
   participant A as guest agent
   S->>V: VmForwardService.Open(forward)
   V->>V: validate, bind 127.0.0.1:8080 before the first response
@@ -410,7 +410,7 @@ its gvproxy publication path.
 ### Endpoint Grammar
 
 One grammar describes every endpoint in the `VmSpec`, on the CLI, in the
-`silo-vmmon` API, and on the wire between `silo-vmmon` and the agent:
+`silo-vmm` API, and on the wire between `silo-vmm` and the agent:
 
 ```text
 endpoint        = host-endpoint / guest-endpoint / vsock-endpoint
@@ -440,7 +440,7 @@ lossy address.
 ### Validity Rules
 
 A forward is valid when all of the following hold. `vm-spec` enforces them at
-parse time and `silo-vmmon` enforces them again on the host API:
+parse time and `silo-vmm` enforces them again on the host API:
 
 1. Exactly one of `listen` and `connect` is a `host:` endpoint.
 2. The other endpoint is a `guest:` endpoint or a `vsock:` endpoint.
@@ -458,13 +458,13 @@ parse time and `silo-vmmon` enforces them again on the host API:
    octal permission string.
 8. `name`, when present, is unique among the machine's forwards.
 9. Unix listen endpoints are unique on each side. Before binding any host
-   listener, `silo-vmmon` also resolves relative names against the runtime directory
+   listener, `silo-vmm` also resolves relative names against the runtime directory
    and existing parent-directory aliases, rejecting duplicate resolved paths.
    A session cannot replace a machine-scoped listener by spelling it differently.
 
 The resulting matrix is the complete set of forward shapes:
 
-| `listen` | `connect` | Host half (`silo-vmmon`) | Guest half | Direction |
+| `listen` | `connect` | Host half (`silo-vmm`) | Guest half | Direction |
 | --- | --- | --- | --- | --- |
 | `host:*` | `guest:*` | binds host socket, dials guest 1028 with target line | agent dialer connects target | inbound |
 | `host:*` | `vsock:P` | binds host socket, dials guest port P | native AF_VSOCK service | inbound |
@@ -498,19 +498,19 @@ vsock streams; shapes 1 and 3 need the agent, shapes 2 and 4 do not.
 flowchart LR
   subgraph S1["1 · listen host, connect guest · inbound"]
     direction LR
-    c1["host client"] --> v1["silo-vmmon listener"] ==>|"CONNECT tcp:127.0.0.1:80"| a1["agent dialer 1028"] --> t1["guest target"]
+    c1["host client"] --> v1["silo-vmm listener"] ==>|"CONNECT tcp:127.0.0.1:80"| a1["agent dialer 1028"] --> t1["guest target"]
   end
   subgraph S2["2 · listen host, connect vsock P · inbound"]
     direction LR
-    c2["host client"] --> v2["silo-vmmon listener"] ==>|"no preamble"| g2["guest AF_VSOCK service P"]
+    c2["host client"] --> v2["silo-vmm listener"] ==>|"no preamble"| g2["guest AF_VSOCK service P"]
   end
   subgraph S3["3 · listen guest, connect host · outbound"]
     direction LR
-    g3["guest client"] --> a3["agent listener"] ==>|"CONNECT token"| v3["silo-vmmon return port 1028"] --> h3["host target"]
+    g3["guest client"] --> a3["agent listener"] ==>|"CONNECT token"| v3["silo-vmm return port 1028"] --> h3["host target"]
   end
   subgraph S4["4 · listen vsock P, connect host · outbound"]
     direction LR
-    g4["guest AF_VSOCK client"] ==>|"no preamble"| v4["silo-vmmon listen_vsock P"] --> h4["host target"]
+    g4["guest AF_VSOCK client"] ==>|"no preamble"| v4["silo-vmm listen_vsock P"] --> h4["host target"]
   end
   classDef host stroke:#2b69b3,stroke-width:2px,fill:none
   classDef guest stroke:#b5602a,stroke-width:2px,fill:none
@@ -576,7 +576,7 @@ JSON, CLI arguments, and diagnostics all show the same text.
 
 ### The Target Line
 
-The agent's forward dialer and `silo-vmmon`'s forward return port share one
+The agent's forward dialer and `silo-vmm`'s forward return port share one
 textual preamble, modeled on the ADR 0015 mux command:
 
 ```text
@@ -598,11 +598,11 @@ server → client:  "OK\n"                      then raw stream
 
 The asymmetry is deliberate. The host is trusted and names guest addresses
 directly. The guest is untrusted and names nothing; it presents a capability
-`silo-vmmon` issued to it.
+`silo-vmm` issued to it.
 
 ### Inbound Connections
 
-For a forward whose listen endpoint is `host:*`, `silo-vmmon` runs one accept loop
+For a forward whose listen endpoint is `host:*`, `silo-vmm` runs one accept loop
 per forward. Per accepted connection:
 
 1. Apply the ADR 0015 peer-credential check to a Unix listener with the
@@ -623,7 +623,7 @@ indefinitely before the stream exists.
 
 A connection accepted while the guest half is not yet available (the VM is
 booting, the agent has not reported ready, or the agent is restarting) is
-parked rather than refused. `silo-vmmon` parks at most 64 connections per forward
+parked rather than refused. `silo-vmm` parks at most 64 connections per forward
 and for at most 30 seconds each; a parked connection is dialed when the
 forward becomes active and closed when its timer expires or the forward
 reaches a terminal state. Parking makes `docker ps` immediately after
@@ -631,12 +631,12 @@ reaches a terminal state. Parking makes `docker ps` immediately after
 
 ### Outbound Connections
 
-For a forward whose listen endpoint is `guest:*`, `silo-vmmon` opens a
+For a forward whose listen endpoint is `guest:*`, `silo-vmm` opens a
 `GuestForwardService.Listen` stream once the agent is ready and serving that
-service. For `listen: vsock:P`, `silo-vmmon` registers host port P with
+service. For `listen: vsock:P`, `silo-vmm` registers host port P with
 `listen_vsock` before the VM starts.
 
-`silo-vmmon` serves the forward return port, host vsock port 1028, whenever at
+`silo-vmm` serves the forward return port, host vsock port 1028, whenever at
 least one outbound forward with a `guest:*` listen endpoint exists. Per guest
 connection to port 1028:
 
@@ -656,7 +656,7 @@ stops producing return connections immediately.
 
 Every forwarded connection, inbound or outbound, is one active vsock
 connection and consumes one slot of the ADR 0015 allowance. This ADR reserves
-a headroom for `silo-vmmon`'s own traffic: the mux and forwards together may
+a headroom for `silo-vmm`'s own traffic: the mux and forwards together may
 consume at most `1023 - 16 = 1007` slots, so a busy forward cannot starve the
 guest-agent status stream, SSH, exec, or filesystem RPCs. A forward connection
 refused for capacity is closed without a reply and logged with the forward's
@@ -694,28 +694,28 @@ stateDiagram-v2
   end note
 ```
 
-- `silo-vmmon` prepares every machine-scoped forward's host half before the VM starts:
+- `silo-vmm` prepares every machine-scoped forward's host half before the VM starts:
   it binds `host:*` listen sockets and registers `vsock:` listen ports. A
   failure names the forward, the endpoint, and the error, and the machine
   does not start. This matches ADR 0015's treatment of the initial listener
   scan.
-- Forwards whose guest half needs the agent are `PENDING` until `silo-vmmon` has an
+- Forwards whose guest half needs the agent are `PENDING` until `silo-vmm` has an
   agent identity and a serving `GuestForwardService`. A forward with
   `connect: vsock:P` is `ACTIVE` as soon as its host half is bound, because
   its guest half is not observable until a connection is attempted.
-- `silo-vmmon` reconciles the forward table against the agent whenever the agent
+- `silo-vmm` reconciles the forward table against the agent whenever the agent
   instance changes: it reopens every outbound `Listen` stream with the same
   token and returns inbound forwards to `ACTIVE`. Parked connections drain
   when the forward becomes active.
 - An agent that does not serve `GuestForwardService` moves the forward to
-  `UNSUPPORTED`. The machine keeps running; `silo-vmmon` logs once per agent
+  `UNSUPPORTED`. The machine keeps running; `silo-vmm` logs once per agent
   instance and exposes the state through the host API. Inbound connections
   are closed at accept, so a client sees an immediate failure rather than a
   hang.
-- At machine stop, `silo-vmmon` closes forward listeners before stopping the VM,
+- At machine stop, `silo-vmm` closes forward listeners before stopping the VM,
   under the same shutdown ordering and drain deadline as the hybrid surface,
   and removes every Unix socket it created if its device and inode are still
-  the ones it bound. Absolute Unix paths follow the same rule; `silo-vmmon` never
+  the ones it bound. Absolute Unix paths follow the same rule; `silo-vmm` never
   removes a socket it did not create.
 
 ### Session-Scoped Forwards
@@ -724,20 +724,20 @@ A session-scoped forward is created with `VmForwardService.Open`, a server-strea
 RPC on the machine's `vm.sock`. The request carries one `Forward`; the response
 stream carries `ForwardStatus` snapshots on every state change.
 
-- `silo-vmmon` validates the forward, checks limits, and binds the host half before
+- `silo-vmm` validates the forward, checks limits, and binds the host half before
   sending the first response. A failure is a gRPC status with an
   `ErrorDetail`; nothing remains bound.
 - The first response reports `ACTIVE` with the bound address, `PENDING` if the
   guest half is not yet available, or `UNSUPPORTED`. A caller that requires a
   working forward waits for `ACTIVE`.
 - The forward exists exactly as long as the stream. The client ending the
-  stream, the client process exiting, or `silo-vmmon` shutting down removes the
+  stream, the client process exiting, or `silo-vmm` shutting down removes the
   forward, closes its listener, and closes every connection it spliced.
 - A session-scoped forward that names a host Unix path resolves relative paths
   against the machine runtime directory, exactly like a machine-scoped forward. Clients
   that mean a path relative to their own working directory must send an
   absolute path.
-- Session-scoped forwards are not persisted and do not survive `silo-vmmon`
+- Session-scoped forwards are not persisted and do not survive `silo-vmm`
   restart. A client that wants a durable forward configures it on the machine.
 
 `VmForwardService.List` returns the status of every machine- and session-scoped
@@ -765,7 +765,7 @@ message ListenRequest {
   // Guest address in the endpoint grammar without the side prefix,
   // for example "tcp:127.0.0.1:5432" or "unix:/run/host.sock".
   string listen = 1;
-  // 16 random bytes issued by silo-vmmon; presented on the return port as hex.
+  // 16 random bytes issued by silo-vmm; presented on the return port as hex.
   bytes token = 2;
   // Permission bits for a Unix listener. Default 0600.
   optional uint32 unix_mode = 3;
@@ -823,7 +823,7 @@ printf 'CONNECT 1028\nCONNECT tcp:127.0.0.1:80\nGET / HTTP/1.0\r\n\r\n' \
 
 ### Capability Discovery
 
-`silo-vmmon` learns whether an agent supports forwards with one
+`silo-vmm` learns whether an agent supports forwards with one
 `grpc.health.v1.Health/Check` for service `silo.v1.GuestForwardService`,
 issued once the agent identity is established and repeated for each new agent
 instance. `SERVING` enables forwards; `NOT_FOUND` or `NOT_SERVING` marks
@@ -832,7 +832,7 @@ agent-dependent forwards `UNSUPPORTED`. The result is cached in
 so libvm and the CLI learn it from a status they already fetch. This uses the
 service inventory ADR 0008 already exposes and adds no negotiation protocol.
 
-## silo-vmmon Contract
+## silo-vmm Contract
 
 ### Host API
 
@@ -883,7 +883,7 @@ service names observed for the current agent instance.
 
 ### Host Sockets
 
-- `silo-vmmon` binds Unix listen sockets with the same directory-relative,
+- `silo-vmm` binds Unix listen sockets with the same directory-relative,
   stale-socket, `0600`, and device-inode identity rules as the mux. The
   default mode is `0600`; `mode` may widen it, because a socket like
   `docker.sock` is sometimes shared with a group by its owner's choice.
@@ -892,16 +892,16 @@ service names observed for the current agent instance.
   successful connection, a full backlog, or a permission error, fail the bind
   without unlinking or changing the socket's mode. Probes send no data. Cleanup
   rechecks the pathname and inode; it never blindly removes a replacement.
-- For an absolute Unix path, `silo-vmmon` opens the parent with `O_NOFOLLOW`,
+- For an absolute Unix path, `silo-vmm` opens the parent with `O_NOFOLLOW`,
   requires it to be owned by its own effective UID, and records its device and
   inode. POSIX provides no dirfd-relative AF_UNIX bind, so after binding the
-  pathname `silo-vmmon` reopens the parent with `O_NOFOLLOW` and requires the same
+  pathname `silo-vmm` reopens the parent with `O_NOFOLLOW` and requires the same
   identity before accepting the listener. It does not require mode `0700`,
   because the owner chose the location.
-- TCP listeners bind exactly the requested address. `silo-vmmon` never widens a
+- TCP listeners bind exactly the requested address. `silo-vmm` never widens a
   bind address and never binds a TCP address for any reason other than a
   machine- or session-scoped forward.
-- `silo-vmmon` applies the peer-credential check to every default-mode Unix
+- `silo-vmm` applies the peer-credential check to every default-mode Unix
   listener it owns, with one shared helper for the mux, the host API socket,
   and forwards. A forward with an explicit `mode` is exempt by design.
 
@@ -923,13 +923,13 @@ is updated to point here.
 
 1. **Reserved ports.** Port 1028 is reserved in both namespaces alongside
    1027, with the routing rules in the table above.
-2. **TCP exposure.** "silo-vmmon never exposes vsock on TCP" becomes: the hybrid
-   surface never exposes vsock on TCP, and `silo-vmmon` binds a host TCP or Unix
+2. **TCP exposure.** "silo-vmm never exposes vsock on TCP" becomes: the hybrid
+   surface never exposes vsock on TCP, and `silo-vmm` binds a host TCP or Unix
    listener only for a forward the machine owner configured in the `VmSpec` or
    holds through the authenticated host API. Bridging remains a deliberate
    act of the owner; it no longer requires an external process.
 3. **Capacity headroom.** Of the 1023-connection allowance, 16 slots are
-   reserved for `silo-vmmon`'s internal connections. Public mux connections and
+   reserved for `silo-vmm`'s internal connections. Public mux connections and
    forward connections share the remaining 1007.
 
 ## Publications
@@ -1116,7 +1116,7 @@ silo forward dev host:tcp:2222 vsock:22                    # raw vsock target, n
 | Concern | Owner |
 | --- | --- |
 | Forward grammar, validity rules, `VmSpec` `forwards` type | `vm-spec` |
-| Forward table, host listeners, host targets, return port 1028, parking, capacity, `VmForwardService`, capability caching in `HostStatus` | `silo-vmmon` |
+| Forward table, host listeners, host targets, return port 1028, parking, capacity, `VmForwardService`, capability caching in `HostStatus` | `silo-vmm` |
 | Forward dialer on guest port 1028, `GuestForwardService.Listen`, health registration | guest agent |
 | Plumbing `forwards` and `vsock` through `MachineBuilder`, templates, and `config.json`; `publish` in `MachineNetworkConfig`; netd flag | `libvm` |
 | `silo forward`, keeping the session stream open, endpoint parsing and shorthand | CLI |
@@ -1141,7 +1141,7 @@ writes `spec.vsock`, and forwards must not inherit that gap.
   API. Publication bind addresses are chosen by the guest but constrained to
   loopback unless the machine owner granted `any`, and the dial address is
   pinned to the guest's own IP.
-- Host Unix sockets `silo-vmmon` creates are `0600` and UID-checked unless the
+- Host Unix sockets `silo-vmm` creates are `0600` and UID-checked unless the
   owner widens them with `mode`, which also disables the UID check for that
   socket. TCP listeners bind exactly the address the owner wrote; the default
   for a bare port is loopback on both sides.
@@ -1161,14 +1161,14 @@ writes `spec.vsock`, and forwards must not inherit that gap.
 - A session-scoped forward whose host half cannot be bound fails the `Open` RPC with
   the statuses listed above; nothing stays bound.
 - An inbound connection whose guest half refuses, times out, or answers
-  `ERR` is closed without any bytes written to the client. `silo-vmmon` logs the
+  `ERR` is closed without any bytes written to the client. `silo-vmm` logs the
   forward name, the target, and the reason at debug level, and increments a
   per-forward refusal count reported by `List`.
 - An outbound return connection with an unknown token is answered
   `ERR invalid` and logged at warn level once per minute per forward, because
   it indicates a guest process probing the return port.
 - An agent instance change returns agent-dependent forwards to `PENDING` and
-  closes their spliced connections; `silo-vmmon` reopens `Listen` streams when the
+  closes their spliced connections; `silo-vmm` reopens `Listen` streams when the
   new instance is ready. Parked connections outlive the transition up to
   their 30-second bound.
 - An agent without `GuestForwardService` produces one warn log per agent
@@ -1193,7 +1193,7 @@ port publication. Their choices explain several of this ADR's.
 | --- | --- | --- | --- |
 | Engine socket transport | vsock (`AF_HYPERV` on Windows) | SSH over gvproxy's userspace TCP stack | vsock |
 | Guest half of the socket forward | `vsudd`, a daemon with a static `-inport <vsock-port>:unix:<path>` table baked into the VM image | `sshd`; gvproxy opens an SSH stream-local channel to the guest socket path | agent dialer on port 1028; each connection names its target |
-| Host half | `com.docker.backend`, an HTTP-aware proxy that parses Engine API requests | gvproxy, a byte relay per connection | `silo-vmmon`, a byte relay per connection |
+| Host half | `com.docker.backend`, an HTTP-aware proxy that parses Engine API requests | gvproxy, a byte relay per connection | `silo-vmm`, a byte relay per connection |
 | Requires the virtual network | no | yes | no |
 | Reaches a new guest socket without changing the image | no, one `vsudd` entry per socket | yes | yes |
 | Host service exposed as a socket inside the guest | yes, `/run/host-services/ssh-auth.sock` | no | yes, any outbound forward |
@@ -1208,7 +1208,7 @@ the backend to bind the host port first, so a port collision is reported to
 the developer before the container exists. It validates bind-mount paths
 against the shared-directory list and reports `Mounts denied` on the host
 instead of a missing-path error from inside the VM, and on Windows it rewrites
-`C:\...` paths to their VM-side mount. gvproxy and Silo's `silo-vmmon` do none of
+`C:\...` paths to their VM-side mount. gvproxy and Silo's `silo-vmm` do none of
 this: a forward is a byte relay and knows nothing about HTTP.
 
 This ADR keeps the relay dumb on purpose. Publication does not need the
@@ -1271,14 +1271,14 @@ sees it at an address an unmodified client already expects.
 
 ### Tradeoffs
 
-- `silo-vmmon` grows: a forward table, host listeners, a token map, parking, and
+- `silo-vmm` grows: a forward table, host listeners, a token map, parking, and
   one more gRPC service. ADR 0004 asks it to stay a runtime monitor; forwards
   are argued here to be part of the machine's runtime surface, like the mux,
   rather than manager policy.
 - Two data planes remain. A user must know that `-p` ports arrive through
   netd on the guest's interface address, while everything else arrives
   through vsock. The disjoint vocabulary is meant to make that visible.
-- Every forwarded byte is relayed by `silo-vmmon` and, for `guest:` endpoints, by
+- Every forwarded byte is relayed by `silo-vmm` and, for `guest:` endpoints, by
   the agent as well. This is the cost ADR 0015 already accepts for the mux,
   paid once more inside the guest.
 - Outbound forwards need the agent to be ready. A guest client that connects
@@ -1313,7 +1313,7 @@ from the side of the listen endpoint removes the field and the ambiguity.
 
 ### One Vsock Port Per Forward
 
-`silo-vmmon` could allocate a guest vsock port per inbound forward and have the
+`silo-vmm` could allocate a guest vsock port per inbound forward and have the
 agent bind it, avoiding the target line. It loses because it needs a
 registration RPC before any connection can be made, it spends the ADR 0015
 listener allowance on macOS, and it makes the agent stateful for the simplest
@@ -1380,7 +1380,7 @@ host bind. The section stays rejected; see the non-decisions below.
 - Hostnames are not accepted in endpoints; addresses are IP literals.
 - Guest listeners bind in the root network namespace. Reaching into a
   container's namespace is not supported.
-- Session-scoped forwards do not survive `silo-vmmon` restart, by construction.
+- Session-scoped forwards do not survive `silo-vmm` restart, by construction.
 - A forward whose guest half depends on the agent is unavailable to images
   launched with the agent disabled.
 - Port 1028 cannot be published by users in either namespace.
@@ -1411,13 +1411,13 @@ host bind. The section stays rejected; see the non-decisions below.
 
 ## Implementation References
 
-- `virt/vmmon/src/vsock/mux.rs`: `handle_connection` splits at the
+- `virt/vmm/src/vsock/mux.rs`: `handle_connection` splits at the
   preamble; the dial-and-splice half is shared with inbound forwards.
-- `virt/vmmon/src/vsock/paths.rs`: `OwnedMux` bind, `0600`, and
+- `virt/vmm/src/vsock/paths.rs`: `OwnedMux` bind, `0600`, and
   device-inode cleanup rules generalized to forward listeners.
-- `virt/vmmon/src/virt/capacity.rs`: the 1023 allowance and the new
+- `virt/vmm/src/virt/capacity.rs`: the 1023 allowance and the new
   headroom.
-- `virt/vmmon/src/guest.rs`: agent identity and readiness tracking where
+- `virt/vmm/src/guest.rs`: agent identity and readiness tracking where
   the health check for `GuestForwardService` is issued.
 - `guest/agent/src/rpc.rs`, `guest/agent/src/server.rs`: service
   registration and the vsock accept-loop helper the dialer reuses, with the

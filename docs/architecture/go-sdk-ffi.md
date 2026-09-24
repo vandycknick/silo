@@ -1,6 +1,6 @@
 # Go SDK native bridge
 
-The Go SDK in `sdk/go` is an idiomatic facade over `libvm`. It does not invoke the CLI, speak directly to `silo-vmmon`, or recreate machine state in Go.
+The Go SDK in `sdk/go` is an idiomatic facade over `libvm`. It does not invoke the CLI, speak directly to `silo-vmm`, or recreate machine state in Go.
 
 ## Boundary
 

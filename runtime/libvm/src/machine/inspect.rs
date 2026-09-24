@@ -60,7 +60,7 @@ impl From<MachineRootfsRecord> for MachineRootfs {
 ///
 /// `MachineData` is an owned read model, not a live handle and not a SQLite
 /// storage model. It intentionally flattens persisted machine configuration,
-/// reconciled lifecycle state, and best-effort silo-vmmon telemetry so callers do not
+/// reconciled lifecycle state, and best-effort silo-vmm telemetry so callers do not
 /// depend on libvm's private `store::models` module.
 ///
 /// Callers should treat this as a point-in-time snapshot. To perform lifecycle
@@ -104,15 +104,15 @@ pub struct MachineData {
     pub guest: MachineGuestConfig,
     /// Reconciled lifecycle status for the machine.
     ///
-    /// `Machine::inspect` always reconciles persisted state with the local silo-vmmon
-    /// process first. When silo-vmmon is running it also attempts a best-effort silo-vmmon
+    /// `Machine::inspect` always reconciles persisted state with the local silo-vmm
+    /// process first. When silo-vmm is running it also attempts a best-effort silo-vmm
     /// inspect RPC to populate guest readiness and a human-readable message. A
-    /// silo-vmmon telemetry failure does not fail the whole inspect call; it is
+    /// silo-vmm telemetry failure does not fail the whole inspect call; it is
     /// reported here as a non-ready running status message instead.
     pub status: MachineStatus,
-    /// Latest guest boot report observed by silo-vmmon, when the guest registered one.
+    /// Latest guest boot report observed by silo-vmm, when the guest registered one.
     pub boot_report: Option<MachineBootReport>,
-    /// Latest guest provisioning report observed by silo-vmmon, when the guest registered one.
+    /// Latest guest provisioning report observed by silo-vmm, when the guest registered one.
     pub provision_report: Option<MachineProvisionReport>,
     /// Unix timestamp for when the machine last started.
     pub started_at: Option<i64>,
@@ -374,29 +374,29 @@ impl MachineProvisionFailurePolicy {
 /// Reconciled public lifecycle status for a machine.
 ///
 /// This is not the database state enum. The private store model records durable
-/// lifecycle facts such as silo-vmmon PID and run ID; `MachineStatus` is the public
-/// view after libvm reconciles those facts with silo-vmmon liveness and, when
-/// possible, silo-vmmon's inspect RPC.
+/// lifecycle facts such as silo-vmm PID and run ID; `MachineStatus` is the public
+/// view after libvm reconciles those facts with silo-vmm liveness and, when
+/// possible, silo-vmm's inspect RPC.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineStatus {
     /// The machine is stopped.
     Stopped,
-    /// silo-vmmon is starting and has not reached a running state yet.
+    /// silo-vmm is starting and has not reached a running state yet.
     Starting {
         /// Optional human-readable status detail.
         message: Option<String>,
     },
-    /// silo-vmmon is running.
+    /// silo-vmm is running.
     Running {
         /// True when the machine satisfies its configured readiness policy.
         ready: bool,
-        /// True when silo-vmmon reports the guest agent as ready.
+        /// True when silo-vmm reports the guest agent as ready.
         guest_ready: bool,
         /// Optional human-readable status detail.
         message: Option<String>,
     },
-    /// silo-vmmon is stopping.
+    /// silo-vmm is stopping.
     Stopping {
         /// Optional human-readable status detail.
         message: Option<String>,
@@ -458,7 +458,7 @@ impl MachineStatus {
         }
     }
 
-    /// Returns true when silo-vmmon is running.
+    /// Returns true when silo-vmm is running.
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running { .. })
     }
@@ -468,7 +468,7 @@ impl MachineStatus {
         matches!(self, Self::Running { ready: true, .. })
     }
 
-    /// Returns true when silo-vmmon reports the guest agent as ready.
+    /// Returns true when silo-vmm reports the guest agent as ready.
     pub fn guest_ready(&self) -> bool {
         matches!(
             self,

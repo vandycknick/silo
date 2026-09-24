@@ -303,7 +303,7 @@ fn require_generation(
 ) -> Result<(), TransitionError> {
     require_run_id(state, run_id)?;
 
-    if state.vmmon_pid != Some(pid) {
+    if state.vmm_pid != Some(pid) {
         return Err(TransitionError::StaleGeneration);
     }
 
@@ -326,14 +326,14 @@ fn require_run_id(state: &MachineState, run_id: Option<&str>) -> Result<(), Tran
 fn replace_runtime(
     mut state: MachineState,
     status: MachineRuntimeState,
-    vmmon_pid: Option<i32>,
+    vmm_pid: Option<i32>,
     started_at: Option<i64>,
     run_id: Option<String>,
     last_error: Option<String>,
     now: i64,
 ) -> MachineState {
     state.status = status;
-    state.vmmon_pid = vmmon_pid;
+    state.vmm_pid = vmm_pid;
     state.started_at = started_at;
     state.run_id = run_id;
     state.last_error = last_error;
@@ -361,7 +361,7 @@ mod tests {
         MachineState {
             machine_id: MachineId::new(),
             status,
-            vmmon_pid: None,
+            vmm_pid: None,
             started_at: None,
             run_id: None,
             last_error: None,
@@ -372,7 +372,7 @@ mod tests {
     fn running() -> MachineState {
         MachineState {
             status: MachineRuntimeState::Running,
-            vmmon_pid: Some(123),
+            vmm_pid: Some(123),
             started_at: Some(42),
             run_id: Some("run-1".to_string()),
             ..state(MachineRuntimeState::Running)
@@ -393,7 +393,7 @@ mod tests {
 
             assert_eq!(next.status, MachineRuntimeState::Starting);
             assert_eq!(next.run_id.as_deref(), Some("run-1"));
-            assert_eq!(next.vmmon_pid, None);
+            assert_eq!(next.vmm_pid, None);
             assert_eq!(next.started_at, None);
             assert_eq!(next.last_error, None);
             assert_eq!(next.updated_at, NOW);
@@ -443,7 +443,7 @@ mod tests {
         .expect("monitor ready should be accepted");
 
         assert_eq!(next.status, MachineRuntimeState::Running);
-        assert_eq!(next.vmmon_pid, Some(123));
+        assert_eq!(next.vmm_pid, Some(123));
         assert_eq!(next.started_at, Some(42));
         assert_eq!(next.run_id.as_deref(), Some("run-1"));
         assert_eq!(next.updated_at, NOW + 1);
@@ -466,7 +466,7 @@ mod tests {
         .expect("observed monitor should be accepted");
 
         assert_eq!(next.status, MachineRuntimeState::Starting);
-        assert_eq!(next.vmmon_pid, Some(123));
+        assert_eq!(next.vmm_pid, Some(123));
         assert_eq!(next.started_at, Some(42));
         assert_eq!(next.run_id.as_deref(), Some("run-1"));
     }
@@ -488,7 +488,7 @@ mod tests {
         .expect("unresolved live monitor should remain active");
 
         assert_eq!(next.status, MachineRuntimeState::Starting);
-        assert_eq!(next.vmmon_pid, Some(123));
+        assert_eq!(next.vmm_pid, Some(123));
         assert_eq!(next.started_at, None);
         assert_eq!(next.run_id.as_deref(), Some("run-1"));
     }
@@ -533,7 +533,7 @@ mod tests {
             .expect("matching start failure should be accepted");
 
             assert_eq!(next.status, expected);
-            assert_eq!(next.vmmon_pid, None);
+            assert_eq!(next.vmm_pid, None);
             assert_eq!(next.started_at, None);
             assert_eq!(next.run_id, None);
             assert_eq!(next.last_error.as_deref(), Some("boom"));
@@ -554,7 +554,7 @@ mod tests {
         .expect("stop should be accepted");
 
         assert_eq!(next.status, MachineRuntimeState::Stopping);
-        assert_eq!(next.vmmon_pid, Some(123));
+        assert_eq!(next.vmm_pid, Some(123));
         assert_eq!(next.started_at, Some(42));
         assert_eq!(next.run_id.as_deref(), Some("run-1"));
     }
@@ -629,7 +629,7 @@ mod tests {
         .expect("matching stop completion should be accepted");
 
         assert_eq!(next.status, MachineRuntimeState::Stopped);
-        assert_eq!(next.vmmon_pid, None);
+        assert_eq!(next.vmm_pid, None);
         assert_eq!(next.started_at, None);
         assert_eq!(next.run_id, None);
         assert_eq!(next.last_error, None);

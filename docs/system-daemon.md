@@ -66,7 +66,7 @@ page cache, and without host reclaim the host can retain backing for pages the
 guest has touched, so a busy engine's host footprint can grow toward `memory`
 while idle.
 
-Memory reclamation is automatic, with no daemon policy knobs. silo-vmmon enables a
+Memory reclamation is automatic, with no daemon policy knobs. silo-vmm enables a
 balloon; libkrun advertises free-page reporting only when the backend supports
 it and its qualification succeeds. Otherwise the basic balloon remains.
 `HostMemoryRemapper` maintains compatible private RAM mappings independently of

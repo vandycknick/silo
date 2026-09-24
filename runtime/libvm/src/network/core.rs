@@ -7,7 +7,7 @@ use crate::store::models::MachineConfig;
 use crate::store::DataStore;
 use crate::{EgressCredentials, LibVmError, RuntimeNetworkingConfig};
 
-use super::VmmonNetworkAttachment;
+use super::VmmNetworkAttachment;
 use crate::network::GuestPublish;
 
 pub(super) struct NetworkAttachmentRequest<'a> {
@@ -54,5 +54,5 @@ pub(super) trait NetworkDriverBackend: Send + Sync {
         &self,
         ctx: &NetworkDriverContext<'_>,
         request: &NetworkAttachmentRequest<'_>,
-    ) -> Result<VmmonNetworkAttachment, LibVmError>;
+    ) -> Result<VmmNetworkAttachment, LibVmError>;
 }

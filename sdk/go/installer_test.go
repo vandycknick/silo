@@ -189,10 +189,10 @@ func TestInstallRuntimeRejectsUnsafeArchives(t *testing.T) {
 			return append(entries, testArchiveEntry{name: "/escape", mode: 0o644, typeflag: tar.TypeReg, body: []byte("bad")})
 		}},
 		{name: "symlink", change: func(root string, entries []testArchiveEntry) []testArchiveEntry {
-			return append(entries, testArchiveEntry{name: root + "/link", mode: 0o777, typeflag: tar.TypeSymlink, linkname: "bin/silo-vmmon"})
+			return append(entries, testArchiveEntry{name: root + "/link", mode: 0o777, typeflag: tar.TypeSymlink, linkname: "bin/silo-vmm"})
 		}},
 		{name: "hard link", change: func(root string, entries []testArchiveEntry) []testArchiveEntry {
-			return append(entries, testArchiveEntry{name: root + "/hard", mode: 0o755, typeflag: tar.TypeLink, linkname: root + "/bin/silo-vmmon"})
+			return append(entries, testArchiveEntry{name: root + "/hard", mode: 0o755, typeflag: tar.TypeLink, linkname: root + "/bin/silo-vmm"})
 		}},
 		{name: "device", change: func(root string, entries []testArchiveEntry) []testArchiveEntry {
 			return append(entries, testArchiveEntry{name: root + "/device", mode: 0o600, typeflag: tar.TypeChar})
@@ -205,7 +205,7 @@ func TestInstallRuntimeRejectsUnsafeArchives(t *testing.T) {
 		}},
 		{name: "wrong mode", change: func(root string, entries []testArchiveEntry) []testArchiveEntry {
 			for index := range entries {
-				if entries[index].name == root+"/bin/silo-vmmon" {
+				if entries[index].name == root+"/bin/silo-vmm" {
 					entries[index].mode = 0o644
 					break
 				}
@@ -292,10 +292,10 @@ func TestResolveInstallRootUsesSiloHome(t *testing.T) {
 func TestSafeArchivePath(t *testing.T) {
 	t.Parallel()
 
-	if _, err := safeArchivePath("root/bin/silo-vmmon", "root"); err != nil {
+	if _, err := safeArchivePath("root/bin/silo-vmm", "root"); err != nil {
 		t.Fatalf("safe path rejected: %v", err)
 	}
-	for _, value := range []string{"", "/root/bin/silo-vmmon", "root/../escape", "other/bin/silo-vmmon", "root\\bin\\silo-vmmon"} {
+	for _, value := range []string{"", "/root/bin/silo-vmm", "root/../escape", "other/bin/silo-vmm", "root\\bin\\silo-vmm"} {
 		if _, err := safeArchivePath(value, "root"); !IsErrorKind(err, ErrorArchiveIntegrity) {
 			t.Errorf("safeArchivePath(%q) error = %v, want ErrorArchiveIntegrity", value, err)
 		}
@@ -364,14 +364,14 @@ func TestValidateRuntimeInstallationRejectsSymlink(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
-	outside := filepath.Join(t.TempDir(), "silo-vmmon")
+	outside := filepath.Join(t.TempDir(), "silo-vmm")
 	if err := os.WriteFile(outside, []byte("x"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(outside, filepath.Join(root, "bin", "silo-vmmon")); err != nil {
+	if err := os.Symlink(outside, filepath.Join(root, "bin", "silo-vmm")); err != nil {
 		t.Fatal(err)
 	}
 	valid, err := validateRuntimeInstallation(root)

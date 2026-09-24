@@ -1,6 +1,6 @@
 # Testing the Host gRPC API
 
-The host API is exposed by each running `silo-vmmon` process on that machine's Unix
+The host API is exposed by each running `silo-vmm` process on that machine's Unix
 socket. Run these commands from `nix develop`, which provides `grpcurl` and
 `jq`.
 
@@ -170,7 +170,7 @@ collector cannot produce a snapshot.
 
 ## Filesystem metadata
 
-These calls traverse the complete host Unix socket to `silo-vmmon` to guest-vsock
+These calls traverse the complete host Unix socket to `silo-vmm` to guest-vsock
 path.
 
 Inspect a guest file without following a final symlink:

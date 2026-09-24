@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::runtime::RuntimeConfig;
 use crate::LibVmError;
 
-const ENV_VMMON_PATH: &str = "SILO_VMMON_PATH";
+const ENV_VMM_PATH: &str = "SILO_VMM_PATH";
 const ENV_NETD_PATH: &str = "NETD_BIN";
 const ENV_ASSET_DIR: &str = "SILO_ASSET_DIR";
 const ENV_RUNTIME_DIR: &str = "SILO_RUNTIME_DIR";
@@ -84,7 +84,7 @@ struct ComponentPaths {
 impl ComponentPaths {
     fn portable(root: &Path) -> Self {
         Self {
-            supervisor: root.join("bin/silo-vmmon"),
+            supervisor: root.join("bin/silo-vmm"),
             netd: root.join("bin/netd"),
             kernel: root.join("assets/kernel-default"),
             initramfs: root.join("assets/initramfs"),
@@ -95,7 +95,7 @@ impl ComponentPaths {
 
     fn adjacent(directory: &Path) -> Self {
         Self {
-            supervisor: directory.join("silo-vmmon"),
+            supervisor: directory.join("silo-vmm"),
             netd: directory.join("netd"),
             kernel: directory.join("assets/kernel-default"),
             initramfs: directory.join("assets/initramfs"),
@@ -107,7 +107,7 @@ impl ComponentPaths {
     #[cfg(target_os = "linux")]
     fn rhel(helpers: &Path, assets: &Path) -> Self {
         Self {
-            supervisor: helpers.join("silo-vmmon"),
+            supervisor: helpers.join("silo-vmm"),
             netd: helpers.join("netd"),
             kernel: assets.join("kernel-default"),
             initramfs: assets.join("initramfs"),
@@ -272,7 +272,7 @@ fn explicit_api_overrides(config: &RuntimeConfig) -> Result<ComponentOverrides, 
 fn explicit_environment_overrides<E: ComponentEnvironment>(
     environment: &mut E,
 ) -> Result<EnvironmentOverrides, LibVmError> {
-    let supervisor = environment.get(ENV_VMMON_PATH).map(PathBuf::from);
+    let supervisor = environment.get(ENV_VMM_PATH).map(PathBuf::from);
     let netd = environment.get(ENV_NETD_PATH).map(PathBuf::from);
     let assets = environment.get(ENV_ASSET_DIR).map(PathBuf::from);
     let assets = assets
@@ -280,7 +280,7 @@ fn explicit_environment_overrides<E: ComponentEnvironment>(
         .transpose()?;
     Ok(EnvironmentOverrides {
         components: ComponentOverrides {
-            supervisor: explicit_component(ENV_VMMON_PATH, supervisor.as_deref(), true)?,
+            supervisor: explicit_component(ENV_VMM_PATH, supervisor.as_deref(), true)?,
             netd: explicit_component(ENV_NETD_PATH, netd.as_deref(), true)?,
             kernel: assets
                 .as_ref()
@@ -421,7 +421,7 @@ fn validate_components(
     }
     let mut errors = Vec::new();
     let supervisor = collect_component(
-        "silo-vmmon",
+        "silo-vmm",
         &paths.supervisor,
         true,
         root.as_deref(),
@@ -595,7 +595,7 @@ fn validate_app_bundle(bundle: &Path) -> Result<ResolvedRuntimeComponents, Strin
     validate_arm64_macho(&executable)?;
     validate_components(
         ComponentPaths {
-            supervisor: contents.join("Helpers/silo-vmmon"),
+            supervisor: contents.join("Helpers/silo-vmm"),
             netd: contents.join("Helpers/netd"),
             kernel: contents.join("Resources/assets/kernel-default"),
             initramfs: contents.join("Resources/assets/initramfs"),
@@ -723,7 +723,7 @@ fn resolve_path_helpers<E: ComponentEnvironment>(
             continue;
         }
         let paths = ComponentPaths {
-            supervisor: entry.join("silo-vmmon"),
+            supervisor: entry.join("silo-vmm"),
             netd: entry.join("netd"),
             kernel: assets.join("kernel-default"),
             initramfs: assets.join("initramfs"),
@@ -778,10 +778,10 @@ fn native_candidates() -> Vec<(String, ComponentPaths)> {
 
 fn expected_runtime_layouts() -> String {
     let mut layouts = vec![
-        "adjacent <exe-dir>/{silo-vmmon,netd,assets/{kernel-default,initramfs,agent}}".to_string(),
-        "portable <root>/{bin/{silo-vmmon,netd},assets/{kernel-default,initramfs,agent}}"
+        "adjacent <exe-dir>/{silo-vmm,netd,assets/{kernel-default,initramfs,agent}}".to_string(),
+        "portable <root>/{bin/{silo-vmm,netd},assets/{kernel-default,initramfs,agent}}"
             .to_string(),
-        "Silo.app/Contents/{MacOS/silo,Helpers/{silo-vmmon,netd},Resources/assets/{kernel-default,initramfs,agent}}".to_string(),
+        "Silo.app/Contents/{MacOS/silo,Helpers/{silo-vmm,netd},Resources/assets/{kernel-default,initramfs,agent}}".to_string(),
     ];
     #[cfg(target_os = "linux")]
     layouts.push(
@@ -858,7 +858,7 @@ mod tests {
     }
 
     fn portable(root: &Path) -> ComponentPaths {
-        for name in ["silo-vmmon", "netd"] {
+        for name in ["silo-vmm", "netd"] {
             write_file(&root.join("bin").join(name), true);
         }
         write_file(&root.join("assets/kernel-default"), false);
@@ -888,7 +888,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().join("runtime");
         portable(&root);
-        let supervisor = temp.path().join("custom-silo-vmmon");
+        let supervisor = temp.path().join("custom-silo-vmm");
         write_file(&supervisor, true);
         let config = RuntimeConfig::default()
             .with_runtime_root(&root)
@@ -904,7 +904,7 @@ mod tests {
 
         assert_eq!(
             resolved.supervisor,
-            supervisor.canonicalize().expect("canonical silo-vmmon")
+            supervisor.canonicalize().expect("canonical silo-vmm")
         );
         assert_eq!(
             resolved.netd,
@@ -970,7 +970,7 @@ mod tests {
         let direct = temp.path().join("debug");
         let parent = temp.path().join("target");
         portable(&parent);
-        for name in ["silo-vmmon", "netd"] {
+        for name in ["silo-vmm", "netd"] {
             write_file(&direct.join(name), true);
         }
         write_file(&direct.join("assets/kernel-default"), false);
@@ -989,10 +989,7 @@ mod tests {
 
         assert_eq!(
             resolved.supervisor,
-            direct
-                .join("silo-vmmon")
-                .canonicalize()
-                .expect("silo-vmmon")
+            direct.join("silo-vmm").canonicalize().expect("silo-vmm")
         );
     }
 
@@ -1029,10 +1026,10 @@ mod tests {
         write_file(&assets.join("agent"), true);
         let first = temp.path().join("first");
         let second = temp.path().join("second");
-        write_file(&first.join("silo-vmmon"), true);
+        write_file(&first.join("silo-vmm"), true);
         write_file(&second.join("netd"), true);
         let complete = temp.path().join("complete");
-        for name in ["silo-vmmon", "netd"] {
+        for name in ["silo-vmm", "netd"] {
             write_file(&complete.join(name), true);
         }
         let mut environment = TestEnvironment::default();
@@ -1060,10 +1057,7 @@ mod tests {
 
         assert_eq!(
             resolved.supervisor,
-            complete
-                .join("silo-vmmon")
-                .canonicalize()
-                .expect("silo-vmmon")
+            complete.join("silo-vmm").canonicalize().expect("silo-vmm")
         );
         assert_eq!(
             resolved.asset_dir,
@@ -1121,7 +1115,7 @@ mod tests {
         .expect_err("missing runtime must fail");
         let diagnostic = error.to_string();
 
-        for component in ["silo-vmmon", "netd", "kernel-default", "initramfs", "agent"] {
+        for component in ["silo-vmm", "netd", "kernel-default", "initramfs", "agent"] {
             assert!(
                 diagnostic.contains(component),
                 "missing {component}: {diagnostic}"
@@ -1263,7 +1257,7 @@ mod tests {
         let bundle = base.join("Silo.app");
         let contents = bundle.join("Contents");
         let executable = contents.join("MacOS/silo");
-        write_file(&contents.join("Helpers/silo-vmmon"), true);
+        write_file(&contents.join("Helpers/silo-vmm"), true);
         write_file(&contents.join("Helpers/netd"), true);
         write_file(&contents.join("Resources/assets/kernel-default"), false);
         write_file(&contents.join("Resources/assets/initramfs"), false);
@@ -1377,9 +1371,9 @@ mod tests {
     fn app_bundle_component_cannot_escape_bundle_root() {
         let temp = tempfile::tempdir().expect("temp dir");
         let bundle = app_bundle(temp.path(), false);
-        let outside = temp.path().join("outside-silo-vmmon");
+        let outside = temp.path().join("outside-silo-vmm");
         write_file(&outside, true);
-        let helper = bundle.join("Contents/Helpers/silo-vmmon");
+        let helper = bundle.join("Contents/Helpers/silo-vmm");
         std::fs::remove_file(&helper).expect("remove helper");
         symlink(&outside, &helper).expect("link outside helper");
 
@@ -1416,9 +1410,9 @@ mod tests {
         assert_eq!(
             resolved.supervisor,
             bundle
-                .join("Contents/Helpers/silo-vmmon")
+                .join("Contents/Helpers/silo-vmm")
                 .canonicalize()
-                .expect("canonical silo-vmmon")
+                .expect("canonical silo-vmm")
         );
     }
 
@@ -1427,7 +1421,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let bundle = app_bundle(temp.path(), false);
         let macos = bundle.join("Contents/MacOS");
-        for name in ["silo-vmmon", "netd"] {
+        for name in ["silo-vmm", "netd"] {
             write_file(&macos.join(name), true);
         }
         write_file(&macos.join("assets/kernel-default"), false);

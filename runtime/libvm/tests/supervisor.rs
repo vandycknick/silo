@@ -1,6 +1,6 @@
-//! libvm <-> silo-vmmon integration tests for hosts without virtualization support.
+//! libvm <-> silo-vmm integration tests for hosts without virtualization support.
 //!
-//! Each test spawns a real silo-vmmon process built with its `mock-backend`
+//! Each test spawns a real silo-vmm process built with its `mock-backend`
 //! feature, so the full launch handshake (pipes, daemonization, gRPC socket),
 //! machine lifecycle, guest execution, and exit reconciliation are exercised
 //! against the in-process fake guest instead of a VM.
@@ -35,15 +35,15 @@ fn write_file(path: &Path, contents: &[u8], mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("set mode");
 }
 
-/// A minimal portable runtime tree. The real mock-enabled silo-vmmon is installed
+/// A minimal portable runtime tree. The real mock-enabled silo-vmm is installed
 /// into it so each test also exercises portable component resolution.
 fn write_runtime_root(root: &Path) -> PathBuf {
     write_file(&root.join("bin/netd"), b"#!/bin/sh\nexit 0\n", 0o755);
-    let supervisor = root.join("bin/silo-vmmon");
-    std::fs::copy(test_utils::mock_vmmon_binary(), &supervisor)
-        .expect("install mock-enabled silo-vmmon");
+    let supervisor = root.join("bin/silo-vmm");
+    std::fs::copy(test_utils::mock_vmm_binary(), &supervisor)
+        .expect("install mock-enabled silo-vmm");
     std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755))
-        .expect("make silo-vmmon executable");
+        .expect("make silo-vmm executable");
     write_file(&root.join("assets/kernel-default"), b"kernel", 0o644);
     write_file(&root.join("assets/initramfs"), b"initramfs", 0o644);
     write_file(&root.join("assets/agent"), b"agent", 0o755);
@@ -70,7 +70,7 @@ impl Drop for TestEnv {
             return;
         }
         let cleanup = std::thread::Builder::new()
-            .name("silo-vmmon-test-cleanup".to_string())
+            .name("silo-vmm-test-cleanup".to_string())
             .spawn(move || {
                 let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -281,10 +281,10 @@ async fn dropping_test_environment_stops_a_running_monitor() {
         .join(machine.id())
         .join("vm.pid");
     let pid = std::fs::read_to_string(pid_path)
-        .expect("read silo-vmmon pid")
+        .expect("read silo-vmm pid")
         .trim()
         .parse::<i32>()
-        .expect("parse silo-vmmon pid");
+        .expect("parse silo-vmm pid");
     assert!(kill(Pid::from_raw(pid), None).is_ok());
 
     drop(machine);
@@ -1256,7 +1256,7 @@ async fn session_outbound_return_port_is_lazy_reusable_and_shutdown_closes_strea
             .await;
             assert!(
                 closed.is_ok(),
-                "session stream remained open after silo-vmmon shutdown"
+                "session stream remained open after silo-vmm shutdown"
             );
         }
     }
@@ -1556,7 +1556,7 @@ async fn read_mux_acknowledgement(stream: &mut UnixStream) -> u32 {
 }
 
 async fn open_raw_ssh(
-    vmmon_socket: PathBuf,
+    vmm_socket: PathBuf,
 ) -> (
     mpsc::Sender<protocol::v1::ByteChunk>,
     tonic::Streaming<protocol::v1::ByteChunk>,
@@ -1564,15 +1564,15 @@ async fn open_raw_ssh(
     let channel = tokio::time::timeout(
         Duration::from_secs(2),
         Endpoint::try_from("http://[::]:50051")
-            .expect("silo-vmmon endpoint")
+            .expect("silo-vmm endpoint")
             .connect_with_connector(service_fn(move |_| {
-                let vmmon_socket = vmmon_socket.clone();
-                async move { UnixStream::connect(vmmon_socket).await.map(TokioIo::new) }
+                let vmm_socket = vmm_socket.clone();
+                async move { UnixStream::connect(vmm_socket).await.map(TokioIo::new) }
             })),
     )
     .await
-    .expect("silo-vmmon connection deadline")
-    .expect("connect silo-vmmon");
+    .expect("silo-vmm connection deadline")
+    .expect("connect silo-vmm");
     let mut client = protocol::v1::vm_access_service_client::VmAccessServiceClient::new(channel);
     let (sender, receiver) = mpsc::channel(1);
     let stream = tokio::time::timeout(
@@ -1587,7 +1587,7 @@ async fn open_raw_ssh(
 }
 
 #[tokio::test]
-async fn machine_lifecycle_uses_vmmon_from_portable_runtime() {
+async fn machine_lifecycle_uses_vmm_from_portable_runtime() {
     let env = test_env("lifecycle", &Scenario::default()).await;
     let machine = create_machine(&env, "integration-lifecycle").await;
 
@@ -1667,12 +1667,12 @@ async fn explicitly_disabled_public_vsock_preserves_internal_ssh_and_agent_servi
         .expect("guest agent request");
     assert_eq!(output.stdout_bytes(), b"agent-over-internal-vsock\n");
 
-    let vmmon_socket = env
+    let vmm_socket = env
         .run_root
         .join("machines")
         .join(machine.id())
         .join("vm.sock");
-    let (ssh_input, mut ssh_output) = open_raw_ssh(vmmon_socket).await;
+    let (ssh_input, mut ssh_output) = open_raw_ssh(vmm_socket).await;
     ssh_input
         .send(protocol::v1::ByteChunk {
             data: Some(b"ssh-over-internal-vsock".to_vec().into()),
@@ -1754,7 +1754,7 @@ async fn custom_mux_connects_to_core_and_arbitrary_guest_ports() {
     );
 
     machine.stop().await.expect("stop machine");
-    assert!(!mux_path.exists(), "silo-vmmon must clean the custom mux");
+    assert!(!mux_path.exists(), "silo-vmm must clean the custom mux");
     machine.remove().await.expect("remove machine");
 }
 
@@ -1794,7 +1794,7 @@ async fn reserved_host_listener_is_ignored_and_remains_extension_owned() {
     machine.stop().await.expect("stop machine");
     assert!(
         !reserved_path.exists(),
-        "libvm must remove the machine runtime tree after silo-vmmon stops"
+        "libvm must remove the machine runtime tree after silo-vmm stops"
     );
     drop(reserved_listener);
     machine.remove().await.expect("remove machine");
@@ -1969,7 +1969,7 @@ async fn hybrid_vsock_surface_serves_mux_and_preboot_listener_end_to_end() {
     drop(replacement_guest);
 
     machine.stop().await.expect("stop machine");
-    assert!(!mux_path.exists(), "silo-vmmon must clean its mux socket");
+    assert!(!mux_path.exists(), "silo-vmm must clean its mux socket");
     machine.remove().await.expect("remove machine");
 }
 
@@ -2212,7 +2212,7 @@ async fn machine_start_propagates_backend_boot_failure_and_leaves_machine_stoppe
 }
 
 #[tokio::test]
-async fn machine_wait_reconciles_vmmon_crash_and_marks_machine_stopped() {
+async fn machine_wait_reconciles_vmm_crash_and_marks_machine_stopped() {
     let scenario = Scenario {
         run: test_utils::RunScenario {
             crash_after_ms: Some(500),
@@ -2250,7 +2250,7 @@ async fn machine_wait_reconciles_vmmon_crash_and_marks_machine_stopped() {
             message
                 .as_deref()
                 .is_some_and(|message| message.contains("scripted vmm crash")),
-            "backend crash must survive silo-vmmon exit reconciliation: {message:?}"
+            "backend crash must survive silo-vmm exit reconciliation: {message:?}"
         ),
         other => panic!("backend crash must produce an error exit, got {other:?}"),
     }
@@ -2306,7 +2306,7 @@ async fn machine_entrypoint_completion_stops_with_a_clean_exit() {
         .expect("start machine with entrypoint");
     let exit = tokio::time::timeout(READY_TIMEOUT, machine.wait_for_run(start.run_id.clone()))
         .await
-        .expect("entrypoint completion stops silo-vmmon before timeout")
+        .expect("entrypoint completion stops silo-vmm before timeout")
         .expect("reconcile entrypoint completion");
 
     assert_eq!(exit.outcome, MachineExitOutcome::Clean);
@@ -2506,7 +2506,7 @@ async fn wait_ready_times_out_without_stopping_a_running_machine() {
 }
 
 #[tokio::test]
-async fn vmmon_reconnects_after_agent_restart_and_preserves_boot_identity() {
+async fn vmm_reconnects_after_agent_restart_and_preserves_boot_identity() {
     const INITIAL_INSTANCE_ID: &str = "00000000-0000-4000-8000-000000000001";
     const BOOT_ID: &str = "00000000-0000-4000-8000-000000000002";
 
@@ -2552,7 +2552,7 @@ async fn vmmon_reconnects_after_agent_restart_and_preserves_boot_identity() {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "silo-vmmon did not reconnect after the scripted agent restart"
+            "silo-vmm did not reconnect after the scripted agent restart"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

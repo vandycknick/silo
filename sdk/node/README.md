@@ -7,18 +7,18 @@ materialization, lifecycle, and guest operations all delegate to `libvm`; the
 TypeScript layer only provides idiomatic method names, types, and error mapping.
 
 The current SDK does not bundle a runtime payload. `libvm` resolves one complete
-co-versioned runtime set containing `silo-vmmon`, `netd`, the kernel,
-initramfs, and agent (`silo-vmmon` also runs the libkrun worker, so there is no
+co-versioned runtime set containing `silo-vmm`, `netd`, the kernel,
+initramfs, and agent (`silo-vmm` also runs the libkrun worker, so there is no
 separate krun binary). `Runtime.open({ supervisorPath })` replaces only
-`silo-vmmon`; the remaining components must still resolve from the same
+`silo-vmm`; the remaining components must still resolve from the same
 centralized discovery contract. `Runtime.open({ home })` selects the Silo home
 that holds all persistent state; it defaults to `SILO_HOME`, else `~/.silo`.
-Generated sockets always live under `/tmp/silo-<euid>`. The retained component overrides (`SILO_VMMON_PATH`, `NETD_BIN`,
+Generated sockets always live under `/tmp/silo-<euid>`. The retained component overrides (`SILO_VMM_PATH`, `NETD_BIN`,
 and `SILO_ASSET_DIR`) and portable-root override
 (`SILO_RUNTIME_DIR`) remain available to `libvm`.
 
 `PATH` is disabled unless `SILO_ASSET_DIR` is explicit and validates as one
-complete asset set. When enabled, `silo-vmmon` and `netd` must be executable
+complete asset set. When enabled, `silo-vmm` and `netd` must be executable
 files in the same absolute `PATH` entry. Historical asset directories are not
 searched automatically. Bundled Node runtime packaging is deferred to Commit
 13.

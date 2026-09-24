@@ -22,7 +22,7 @@ func WithRuntimeRoot(path string) RuntimeOption {
 	return func(config *runtimeConfig) { config.RuntimeRoot = path }
 }
 
-// WithSupervisorPath overrides only the silo-vmmon executable path.
+// WithSupervisorPath overrides only the silo-vmm executable path.
 func WithSupervisorPath(path string) RuntimeOption {
 	return func(config *runtimeConfig) { config.SupervisorPath = path }
 }

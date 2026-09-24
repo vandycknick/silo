@@ -14,14 +14,14 @@ members = [
     "runtime/test-utils",
     "sdk/node",
     "sdk/go/native",
-    "virt/vmmon",
+    "virt/vmm",
     "virt/vz",
     "specs/agent-spec",
     "specs/forward-spec",
     "specs/protocol",
     "specs/vm-spec",
 ]
-default-members = ["app/cli", "virt/vmmon"]
+default-members = ["app/cli", "virt/vmm"]
 resolver = "2"
 
 [workspace.dependencies]

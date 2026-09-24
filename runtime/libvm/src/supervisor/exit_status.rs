@@ -7,39 +7,39 @@ use nix::sys::stat::{fstat, Mode, SFlag};
 use nix::unistd::geteuid;
 use serde::Deserialize;
 
-/// Exit status written by silo-vmmon when a machine run ends.
+/// Exit status written by silo-vmm when a machine run ends.
 ///
-/// This is silo-vmmon telemetry, not the machine lifecycle state stored in SQLite.
+/// This is silo-vmm telemetry, not the machine lifecycle state stored in SQLite.
 /// The runtime uses it as one input while reconciling `MachineState` after a
 /// monitor exits or disappears.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct VmmonExitStatus {
+pub(crate) struct VmmExitStatus {
     pub(crate) machine_id: String,
     pub(crate) run_id: String,
     pub(crate) pid: i32,
     pub(crate) exited_at: i64,
-    pub(crate) outcome: VmmonExitOutcome,
+    pub(crate) outcome: VmmExitOutcome,
     pub(crate) error: Option<String>,
-    pub(crate) backend: Option<VmmonBackendExit>,
+    pub(crate) backend: Option<VmmBackendExit>,
 }
 
 /// Backend detail of the terminal outcome. Stored for diagnosis, never
 /// interpreted by reconciliation and never a replacement for the monitor pid.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct VmmonBackendExit {
+pub(crate) struct VmmBackendExit {
     pub(crate) kind: String,
     pub(crate) stage: String,
     pub(crate) force_reason: Option<String>,
-    pub(crate) process: Option<VmmonProcessExit>,
-    pub(crate) diagnostic: Option<VmmonDiagnostic>,
+    pub(crate) process: Option<VmmProcessExit>,
+    pub(crate) diagnostic: Option<VmmDiagnostic>,
 }
 
 /// Wait status of the process that ran the VMM, when the backend owns one.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct VmmonProcessExit {
+pub(crate) struct VmmProcessExit {
     pub(crate) pid: u32,
     pub(crate) raw_status: i32,
     pub(crate) code: Option<i32>,
@@ -49,21 +49,21 @@ pub(crate) struct VmmonProcessExit {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct VmmonDiagnostic {
+pub(crate) struct VmmDiagnostic {
     pub(crate) tail: String,
     pub(crate) truncated: bool,
 }
 
-/// High-level outcome reported in a silo-vmmon exit status file.
+/// High-level outcome reported in a silo-vmm exit status file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum VmmonExitOutcome {
+pub(crate) enum VmmExitOutcome {
     Clean,
     Error,
     Forced,
 }
 
-pub(crate) fn read(path: &Path) -> io::Result<Option<VmmonExitStatus>> {
+pub(crate) fn read(path: &Path) -> io::Result<Option<VmmExitStatus>> {
     let fd = match open(
         path,
         OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
@@ -98,10 +98,7 @@ pub(crate) fn read(path: &Path) -> io::Result<Option<VmmonExitStatus>> {
     let status = serde_json::from_str(&raw).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "parse silo-vmmon exit status from {}: {err}",
-                path.display()
-            ),
+            format!("parse silo-vmm exit status from {}: {err}", path.display()),
         )
     })?;
     Ok(Some(status))
@@ -109,7 +106,7 @@ pub(crate) fn read(path: &Path) -> io::Result<Option<VmmonExitStatus>> {
 
 fn path_error(path: &Path, error: nix::errno::Errno) -> io::Error {
     io::Error::other(format!(
-        "open silo-vmmon exit status {}: {error}",
+        "open silo-vmm exit status {}: {error}",
         path.display()
     ))
 }
@@ -117,10 +114,7 @@ fn path_error(path: &Path, error: nix::errno::Errno) -> io::Error {
 fn invalid(path: &Path, message: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!(
-            "invalid silo-vmmon exit status {}: {message}",
-            path.display()
-        ),
+        format!("invalid silo-vmm exit status {}: {message}", path.display()),
     )
 }
 
@@ -159,7 +153,7 @@ mod tests {
 
     #[test]
     fn backend_detail_is_additive_and_keeps_supervisor_identity() {
-        let status: crate::supervisor::exit_status::VmmonExitStatus =
+        let status: crate::supervisor::exit_status::VmmExitStatus =
             serde_json::from_value(serde_json::json!({
                 "machineId": "machine-1", "runId": "run-1", "pid": 42,
                 "exitedAt": 99, "outcome": "forced", "error": null,
@@ -178,13 +172,13 @@ mod tests {
         assert_eq!(backend.diagnostic.expect("diagnostic").tail, "tail");
         assert_eq!(
             status.outcome,
-            crate::supervisor::exit_status::VmmonExitOutcome::Forced
+            crate::supervisor::exit_status::VmmExitOutcome::Forced
         );
     }
 
     #[test]
     fn backend_detail_is_optional_at_every_level() {
-        let status: crate::supervisor::exit_status::VmmonExitStatus =
+        let status: crate::supervisor::exit_status::VmmExitStatus =
             serde_json::from_value(serde_json::json!({
                 "machineId": "machine-1", "runId": "run-1", "pid": 42,
                 "exitedAt": 99, "outcome": "clean", "error": null,
@@ -195,7 +189,7 @@ mod tests {
         assert!(backend.process.is_none());
         assert!(backend.diagnostic.is_none());
 
-        let status: crate::supervisor::exit_status::VmmonExitStatus =
+        let status: crate::supervisor::exit_status::VmmExitStatus =
             serde_json::from_value(serde_json::json!({
                 "machineId": "machine-1", "runId": "run-1", "pid": 42,
                 "exitedAt": 99, "outcome": "error", "error": "startup cancelled"

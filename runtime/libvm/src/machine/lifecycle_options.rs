@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::machine::MachineData;
 
-/// Default time libvm waits for silo-vmmon to exit after a lifecycle action.
+/// Default time libvm waits for silo-vmm to exit after a lifecycle action.
 pub const DEFAULT_MACHINE_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Opaque identifier for one acknowledged machine run.
@@ -20,7 +20,7 @@ impl MachineRunId {
         Self(value)
     }
 
-    /// Returns the stable textual representation sent to silo-vmmon for this run.
+    /// Returns the stable textual representation sent to silo-vmm for this run.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -45,7 +45,7 @@ impl fmt::Display for MachineRunId {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct MachineStart {
-    /// Machine snapshot after silo-vmmon acknowledged this start.
+    /// Machine snapshot after silo-vmm acknowledged this start.
     pub machine: MachineData,
     /// Exact generation created by this start.
     pub run_id: MachineRunId,
@@ -146,9 +146,9 @@ impl MachineKillOptions {
 pub struct MachineExit {
     /// Machine snapshot after libvm reconciled the exited run.
     pub machine: MachineData,
-    /// Run ID for the exited silo-vmmon generation, when one was known.
+    /// Run ID for the exited silo-vmm generation, when one was known.
     pub run_id: Option<MachineRunId>,
-    /// Time silo-vmmon reported for the exit, when available.
+    /// Time silo-vmm reported for the exit, when available.
     pub exited_at: Option<SystemTime>,
     /// High-level exit outcome.
     pub outcome: MachineExitOutcome,
@@ -158,11 +158,11 @@ pub struct MachineExit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MachineExitOutcome {
-    /// silo-vmmon reported a clean exit.
+    /// silo-vmm reported a clean exit.
     Clean,
-    /// silo-vmmon reported an error exit.
+    /// silo-vmm reported an error exit.
     Error {
-        /// Optional error message reported by silo-vmmon.
+        /// Optional error message reported by silo-vmm.
         message: Option<String>,
     },
     /// The machine was already stopped when wait started.
@@ -170,7 +170,7 @@ pub enum MachineExitOutcome {
     /// The monitor intentionally force-killed its worker, or libvm emergency-killed
     /// the monitor without a more specific matching exit record.
     Forced,
-    /// The run exited but no matching silo-vmmon exit status was available.
+    /// The run exited but no matching silo-vmm exit status was available.
     Unknown,
 }
 

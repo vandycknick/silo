@@ -92,7 +92,7 @@ parent path Silo controls. Today that is `docker.sock`, which replaces
 | libvm `HostPaths` | The single public resolver for frontends: home, config directory, config file, control socket directory, run root. |
 | libvm store | Opens `<home>/state.db`. The `db_config` row records only the host OS that created the database; no paths are stored. |
 | CLI | Resolves config, templates, secrets, daemon records, logs and the service definition through `HostPaths`. The native service records the resolved config directory and home because it runs without the shell's environment. |
-| silo-vmmon | Receives every path it uses as an argument or descriptor from libvm; it resolves nothing itself. |
+| silo-vmm | Receives every path it uses as an argument or descriptor from libvm; it resolves nothing itself. |
 | Go SDK | Installs runtimes under `<home>/runtimes` and caches its bridge under `<home>/cache/go-ffi`, honoring `SILO_HOME`. |
 
 Programmatic callers pick a different home with `RuntimeConfig::local(home)`,

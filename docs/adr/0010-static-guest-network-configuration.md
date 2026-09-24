@@ -19,7 +19,7 @@ adds boot latency and does not work for minimal OCI images where the agent runs
 as PID 1.
 
 Silo already knows enough about an attachment before boot to configure it
-statically. We need one resolved MAC/IP pair that `netd` reserves, `silo-vmmon` uses
+statically. We need one resolved MAC/IP pair that `netd` reserves, `silo-vmm` uses
 to create the virtual NIC, and `AgentConfig` carries into the guest. This
 removes DHCP from the managed guest boot path and makes the expected address
 known to the host before the guest starts. That address could later improve
@@ -33,12 +33,12 @@ The intended launch flow is:
 ```text
 MachineNetworkConfig
   -> libvm prepares an attachment with netd
-  -> libvm passes the data socket and MAC to silo-vmmon through --network
+  -> libvm passes the data socket and MAC to silo-vmm through --network
   -> libvm adds the static guest settings to AgentConfig.provision.network
   -> ADR 0009 injects AgentConfig into the per-launch initramfs
-  -> silo-vmmon attaches the virtual NIC
+  -> silo-vmm attaches the virtual NIC
   -> the agent performs any PID 1 handoff and starts its gRPC service
-  -> silo-vmmon connects over host-initiated vsock
+  -> silo-vmm connects over host-initiated vsock
   -> loopback and optional static networking run as the first provisioner
 ```
 
@@ -59,7 +59,7 @@ registers the attachment through a local attachment-oriented control API owned
 by the long-running `netd` process. `netd` allocates named-network addresses and
 returns the resolved attachment.
 
-`libvm` sends only the data socket and MAC address to `silo-vmmon` through the
+`libvm` sends only the data socket and MAC address to `silo-vmm` through the
 existing `--network` argument. `VmSpec` remains unchanged. Replacing
 `--network` with another launch contract is outside this ADR.
 
@@ -91,11 +91,11 @@ network implementation.
 | --- | --- |
 | `libvm` | Resolve durable network selection, orchestrate `netd`, pass the existing `--network` argument, and build `AgentConfig`. |
 | `netd` | Validate attachments, allocate named-network addresses, reserve address-to-MAC mappings, and provide VM data sockets. |
-| `silo-vmmon` | Attach the virtual NIC using the data socket and MAC supplied through `--network`. |
+| `silo-vmm` | Attach the virtual NIC using the data socket and MAC supplied through `--network`. |
 | Guest agent | Bring up loopback and apply the optional injected static address, route, and DNS configuration as the first provisioner. |
 
 The resolved attachment is an internal `libvm` value. It is broader than the
-current `silo-vmmon` network argument because it also carries guest configuration.
+current `silo-vmm` network argument because it also carries guest configuration.
 `libvm` projects the host connection into `--network` and the guest settings
 into `AgentConfig`; neither consumer receives fields it does not need.
 
@@ -125,7 +125,7 @@ network therefore creates one data socket per VM attachment while sharing the
 same internal virtual switch and network services.
 
 The control API is a host-local implementation interface for `libvm`. It is not
-part of the `silo-vmmon` API or the guest agent API.
+part of the `silo-vmm` API or the guest agent API.
 
 ### Possible Named Network API
 
@@ -244,7 +244,7 @@ network provisioner.
 
 The provisioner does not attempt to roll back partial kernel changes. Any link,
 address, route, or resolver error uses the `FailBoot` policy, reports the failed
-step to silo-vmmon, and prevents the managed boot from reporting ready.
+step to silo-vmm, and prevents the managed boot from reporting ready.
 
 ## netd Cleanup
 
@@ -266,7 +266,7 @@ existing foreign-key cascade.
 - The host knows the expected guest address before boot.
 - Private networks produce a resolved attachment shape that named networks can
   adopt when their control API is implemented.
-- `silo-vmmon` keeps its existing narrow network boundary.
+- `silo-vmm` keeps its existing narrow network boundary.
 - Guest configuration remains an immutable launch input under ADR 0009.
 - Plain OCI images can have networking without distribution-specific tools.
 
@@ -304,7 +304,7 @@ immutable delivery path we need.
 
 ### Put Attachments In VmSpec
 
-`silo-vmmon` only needs the data socket and MAC address already carried by
+`silo-vmm` only needs the data socket and MAC address already carried by
 `--network`. Adding guest address and DNS settings to `VmSpec` would widen that
 contract without a current consumer.
 
@@ -320,7 +320,7 @@ The following extensions remain unresolved:
 ## References
 
 - [ADR 0006: Sandbox Network Policy and Firewall Semantics](0006-sandbox-network-policy-and-firewall-semantics.md)
-- [ADR 0008: silo-vmmon Host and Guest Agent gRPC APIs](0008-vmmon-host-and-guest-grpc-api.md)
+- [ADR 0008: silo-vmm Host and Guest Agent gRPC APIs](0008-vmm-host-and-guest-grpc-api.md)
 - [ADR 0009: Per-Launch Guest Agent Initramfs Overlay](0009-per-launch-guest-agent-initramfs-overlay.md)
 - [Linux rtnetlink](https://man7.org/linux/man-pages/man7/rtnetlink.7.html)
 - [Linux resolver configuration](https://man7.org/linux/man-pages/man5/resolv.conf.5.html)

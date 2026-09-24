@@ -137,10 +137,10 @@ pub enum LibVmError {
     #[error("network runtime for {reference} failed: {message}")]
     NetworkRuntime { reference: String, message: String },
 
-    #[error("silo-vmmon executable not found; checked {searched}")]
+    #[error("silo-vmm executable not found; checked {searched}")]
     VmMonExecutableNotFound { searched: String },
 
-    #[error("silo-vmmon executable path is not a file: {path}")]
+    #[error("silo-vmm executable path is not a file: {path}")]
     VmMonExecutableInvalid { path: PathBuf },
 
     #[error("invalid runtime component input from {input}: {message}")]

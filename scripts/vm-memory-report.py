@@ -81,7 +81,7 @@ def silo_home() -> Path:
 
 
 def worker_pid(process_rows: str, supervisor_pid: int) -> int | None:
-    """Select the silo-krun worker belonging to this supervisor."""
+    """Select the krun worker belonging to this supervisor."""
     candidates: list[int] = []
     for line in process_rows.splitlines():
         fields = line.split(maxsplit=2)
@@ -93,7 +93,7 @@ def worker_pid(process_rows: str, supervisor_pid: int) -> int | None:
             continue
         command = fields[2].split()
         if (parent == supervisor_pid and len(command) == 1
-                and command[0].rsplit("/", 1)[-1] == "silo-krun"):
+                and command[0].rsplit("/", 1)[-1] == "krun"):
             candidates.append(pid)
     if len(candidates) > 1:
         raise ValueError("supervisor has multiple private krun workers")
@@ -176,7 +176,7 @@ def mib(value):
 def main():
     reference = sys.argv[1] if len(sys.argv) > 1 else "silo-system"
     machine = find_machine(reference)
-    supervisor = find_pid("silo-vmmon", machine["short_id"])
+    supervisor = find_pid("silo-vmm", machine["short_id"])
     krun = worker_pid(run(["ps", "-axo", "pid=,ppid=,args="]), supervisor) if supervisor is not None else None
     if krun is None:
         sys.exit(f"{machine['name']} has no running private krun worker (state {machine['state']})")
@@ -212,7 +212,7 @@ def main():
     expected = vmm_overhead + guest_held + kernel_reserved + fragments
     residual = charged - expected
 
-    print(f"VM {machine['name']} ({machine['short_id']})  krun pid {krun}  silo-vmmon pid {supervisor}  configured RAM {mib(machine['memory'])}")
+    print(f"VM {machine['name']} ({machine['short_id']})  krun pid {krun}  silo-vmm pid {supervisor}  configured RAM {mib(machine['memory'])}")
     print()
     print("HOST (what macOS charges the krun process)")
     print(f"  phys_footprint            {mib(charged)}   peak {mib(peak)}")

@@ -7,7 +7,7 @@ use vm_spec::VmSpec;
 use crate::lock_manager::LockId;
 use crate::machine::{MachineAgent, MachineGuestConfig, MachineRetention, ProcessConfig};
 
-use super::{MachineId, MachineNetworkConfig};
+use crate::store::models::{MachineId, MachineNetworkConfig};
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,13 +44,14 @@ pub(crate) struct MachineConfig {
 #[serde(rename_all = "camelCase")]
 /// Persisted runtime state for a machine.
 ///
-/// This stores silo-vmmon run facts used for reconciliation, including PID,
+/// This stores silo-vmm run facts used for reconciliation, including PID,
 /// platform birth time when available, and run ID. It is not exposed directly;
 /// public callers see the reconciled `MachineStatus` view.
 pub(crate) struct MachineState {
     pub machine_id: MachineId,
     pub status: MachineRuntimeState,
-    pub vmmon_pid: Option<i32>,
+    #[serde(rename = "vmmonPid")]
+    pub vmm_pid: Option<i32>,
     pub started_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
@@ -104,10 +105,27 @@ mod tests {
 
     use crate::lock_manager::LockId;
     use crate::machine::{MachineAgent, MachineGuestConfig, MachineRetention, ProcessConfig};
-    use crate::store::models::{MachineConfig, MachineId, MachineNetworkConfig};
+    use crate::store::models::{
+        MachineConfig, MachineId, MachineNetworkConfig, MachineRuntimeState, MachineState,
+    };
     use vm_spec::VmSpec;
 
-    use super::MachineRuntimeState;
+    #[test]
+    fn runtime_state_preserves_the_stored_monitor_pid_key() {
+        let value = serde_json::json!({
+            "machineId": MachineId::new(),
+            "status": "running",
+            "vmmonPid": 1234,
+            "startedAt": 42,
+            "runId": "generation",
+            "lastError": null,
+            "updatedAt": 43,
+        });
+        let state: MachineState =
+            serde_json::from_value(value.clone()).expect("read existing runtime state");
+        assert_eq!(state.vmm_pid, Some(1234));
+        assert_eq!(serde_json::to_value(state).expect("serialize state"), value);
+    }
 
     #[test]
     fn machine_runtime_state_round_trips_through_storage_string() {

@@ -10,12 +10,10 @@ use tokio::io::unix::AsyncFd;
 
 use crate::lock_manager::MachineLifetimeLock;
 use crate::machine::{ExecutionLaunchFailure, HostCommand};
-use crate::network::VmmonNetworkAttachment;
+use crate::network::VmmNetworkAttachment;
 use crate::paths::OwnedDirectory;
 use crate::store::models::MachineId;
-use crate::supervisor::start_request::{
-    encode_start_request, VmmonStartRequest, VmmonStartupCommand,
-};
+use crate::supervisor::start_request::{encode_start_request, VmmStartRequest, VmmStartupCommand};
 use crate::supervisor::VmSupervisor;
 use crate::LibVmError;
 
@@ -23,10 +21,10 @@ const ENV_VM_STARTPIPE: &str = "_VM_STARTPIPE";
 const ENV_VM_SYNCPIPE: &str = "_VM_SYNCPIPE";
 const ENV_VM_MACHINE_LOG_DIR: &str = "_VM_MACHINE_LOG_DIR";
 const ENV_VM_MACHINE_LOCK: &str = "_VM_MACHINE_LOCK";
-const VMMON_LAUNCHER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
-const VMMON_START_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const VMM_LAUNCHER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const VMM_START_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) struct VmmonLaunch<'a> {
+pub(crate) struct VmmLaunch<'a> {
     pub(crate) machine_id: MachineId,
     pub(crate) name: &'a str,
     pub(crate) machine_dir: &'a Path,
@@ -37,19 +35,19 @@ pub(crate) struct VmmonLaunch<'a> {
     pub(crate) socket: &'a Path,
     pub(crate) serial_log: &'a Path,
     pub(crate) trace_log: &'a Path,
-    pub(crate) network: &'a VmmonNetworkAttachment,
+    pub(crate) network: &'a VmmNetworkAttachment,
     pub(crate) run_id: &'a str,
     pub(crate) exit_command: Option<&'a HostCommand>,
     pub(crate) agent_enabled: bool,
-    pub(crate) rosetta_intent: crate::supervisor::start_request::VmmonRosettaIntent,
+    pub(crate) rosetta_intent: crate::supervisor::start_request::VmmRosettaIntent,
     pub(crate) asset_directory: std::path::PathBuf,
-    pub(crate) startup_command: Option<&'a VmmonStartupCommand>,
+    pub(crate) startup_command: Option<&'a VmmStartupCommand>,
     pub(crate) machine_log_dir: &'a OwnedDirectory,
     pub(crate) machine_lock: &'a MachineLifetimeLock,
 }
 
 impl VmSupervisor {
-    pub(crate) async fn spawn(&self, launch: &VmmonLaunch<'_>) -> Result<(), LibVmError> {
+    pub(crate) async fn spawn(&self, launch: &VmmLaunch<'_>) -> Result<(), LibVmError> {
         let startup_budget = startup_budget(launch);
         let startup_deadline = Instant::now() + startup_budget;
         let (start_read, start_write) = pipe().map_err(|err| io::Error::other(err.to_string()))?;
@@ -81,7 +79,7 @@ impl VmSupervisor {
             .arg("--trace-log")
             .arg(launch.trace_log)
             .arg("--network")
-            .arg(launch.network.to_vmmon_arg())
+            .arg(launch.network.to_vmm_arg())
             .arg("--run-id")
             .arg(launch.run_id);
         if launch.agent_enabled {
@@ -109,9 +107,9 @@ impl VmSupervisor {
         drop(sync_write);
         drop(machine_log_dir);
         drop(machine_lock);
-        wait_for_vmmon_launcher(child).await?;
+        wait_for_vmm_launcher(child).await?;
 
-        let start_request = VmmonStartRequest::new(
+        let start_request = VmmStartRequest::new(
             launch.machine_id.to_string(),
             launch.run_id,
             launch.startup_command.cloned(),
@@ -120,7 +118,7 @@ impl VmSupervisor {
         .with_rosetta_intent(launch.rosetta_intent)
         .with_asset_directory(launch.asset_directory.clone())
         .with_startup_budget(startup_deadline.saturating_duration_since(Instant::now()));
-        handoff_start_request(start_write, &start_request, VMMON_START_REQUEST_TIMEOUT).await?;
+        handoff_start_request(start_write, &start_request, VMM_START_REQUEST_TIMEOUT).await?;
         wait_for_start(
             sync_read,
             launch.trace_log,
@@ -130,10 +128,10 @@ impl VmSupervisor {
     }
 }
 
-fn startup_budget(launch: &VmmonLaunch<'_>) -> Duration {
+fn startup_budget(launch: &VmmLaunch<'_>) -> Duration {
     let translated = matches!(
         launch.rosetta_intent,
-        crate::supervisor::start_request::VmmonRosettaIntent::Enabled {}
+        crate::supervisor::start_request::VmmRosettaIntent::Enabled {}
     );
     match (translated, launch.startup_command.is_some()) {
         (true, true) => Duration::from_secs(420),
@@ -150,14 +148,14 @@ fn append_exit_command_args(command: &mut Command, exit_command: &HostCommand) {
     }
 }
 
-async fn wait_for_vmmon_launcher(child: std::process::Child) -> io::Result<()> {
-    tokio::task::spawn_blocking(move || wait_for_vmmon_launcher_blocking(child))
+async fn wait_for_vmm_launcher(child: std::process::Child) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || wait_for_vmm_launcher_blocking(child))
         .await
-        .map_err(|err| io::Error::other(format!("join silo-vmmon launcher wait task: {err}")))?
+        .map_err(|err| io::Error::other(format!("join silo-vmm launcher wait task: {err}")))?
 }
 
-fn wait_for_vmmon_launcher_blocking(mut child: std::process::Child) -> io::Result<()> {
-    let deadline = Instant::now() + VMMON_LAUNCHER_EXIT_TIMEOUT;
+fn wait_for_vmm_launcher_blocking(mut child: std::process::Child) -> io::Result<()> {
+    let deadline = Instant::now() + VMM_LAUNCHER_EXIT_TIMEOUT;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -169,8 +167,8 @@ fn wait_for_vmmon_launcher_blocking(mut child: std::process::Child) -> io::Resul
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "silo-vmmon launcher did not daemonize within {:?}",
-                    VMMON_LAUNCHER_EXIT_TIMEOUT
+                    "silo-vmm launcher did not daemonize within {:?}",
+                    VMM_LAUNCHER_EXIT_TIMEOUT
                 ),
             ));
         }
@@ -183,7 +181,7 @@ fn wait_for_vmmon_launcher_blocking(mut child: std::process::Child) -> io::Resul
     }
 
     Err(io::Error::other(format!(
-        "silo-vmmon launcher exited with {status}"
+        "silo-vmm launcher exited with {status}"
     )))
 }
 
@@ -199,7 +197,7 @@ async fn wait_for_start(
             io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "silo-vmmon syncpipe did not report readiness in {:?} (hint: see {})",
+                    "silo-vmm syncpipe did not report readiness in {:?} (hint: see {})",
                     deadline_duration,
                     trace_path.display(),
                 ),
@@ -226,7 +224,7 @@ fn startup_result(result: StartupResult) -> Result<(), LibVmError> {
 
 async fn handoff_start_request(
     startpipe: OwnedFd,
-    request: &VmmonStartRequest,
+    request: &VmmStartRequest,
     timeout: Duration,
 ) -> io::Result<()> {
     let encoded = encode_start_request(request)?;
@@ -235,7 +233,7 @@ async fn handoff_start_request(
         .map_err(|_| {
             io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("silo-vmmon start request handoff exceeded {timeout:?}"),
+                format!("silo-vmm start request handoff exceeded {timeout:?}"),
             )
         })?
 }
@@ -257,7 +255,7 @@ async fn write_start_request(startpipe: OwnedFd, encoded: &[u8]) -> io::Result<(
             Ok(Ok(0)) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
-                    "silo-vmmon startpipe accepted zero bytes",
+                    "silo-vmm startpipe accepted zero bytes",
                 ))
             }
             Ok(Ok(written)) => remaining = &remaining[written..],
@@ -279,7 +277,7 @@ async fn read_syncpipe(syncpipe: OwnedFd) -> io::Result<StartupResult> {
     if input.len() > MAX_RESULT_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "silo-vmmon startup result exceeds byte limit",
+            "silo-vmm startup result exceeds byte limit",
         ));
     }
 
@@ -308,13 +306,13 @@ async fn read_syncpipe(syncpipe: OwnedFd) -> io::Result<StartupResult> {
     if input.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            "silo-vmmon exited before reporting syncpipe result",
+            "silo-vmm exited before reporting syncpipe result",
         ));
     }
 
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("unexpected silo-vmmon syncpipe message: {input:?}"),
+        format!("unexpected silo-vmm syncpipe message: {input:?}"),
     ))
 }
 
@@ -328,7 +326,7 @@ fn configure_pipe_inheritance(
     sync_read: &OwnedFd,
     sync_write: &OwnedFd,
 ) -> io::Result<()> {
-    // silo-vmmon daemonizes itself, so only its two child-side descriptors survive exec.
+    // silo-vmm daemonizes itself, so only its two child-side descriptors survive exec.
     clear_cloexec(start_read)?;
     clear_cloexec(sync_write)?;
     set_cloexec(start_write, true)?;
@@ -377,8 +375,8 @@ mod tests {
     use crate::machine::{ExecutionLaunchFailureReason, HostCommand};
 
     use crate::supervisor::start_request::{
-        encode_start_request, VmmonEnvironmentVariable, VmmonProcessSpec, VmmonStartRequest,
-        VmmonStartupCommand, VMMON_START_REQUEST_MAX_BYTES,
+        encode_start_request, VmmEnvironmentVariable, VmmProcessSpec, VmmStartRequest,
+        VmmStartupCommand, VMM_START_REQUEST_MAX_BYTES,
     };
 
     use super::{
@@ -409,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_writes_json_and_closes_the_pipe() {
         let (read_fd, write_fd) = pipe().expect("create pipe");
-        let request = VmmonStartRequest::new(
+        let request = VmmStartRequest::new(
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
             None,
@@ -429,15 +427,15 @@ mod tests {
     #[tokio::test]
     async fn handoff_timeout_closes_a_blocked_writer() {
         let (read_fd, write_fd) = pipe().expect("create pipe");
-        let request = crate::supervisor::start_request::VmmonStartRequest::new(
+        let request = crate::supervisor::start_request::VmmStartRequest::new(
             uuid::Uuid::nil().to_string(),
             uuid::Uuid::nil().to_string(),
-            Some(crate::supervisor::start_request::VmmonStartupCommand {
+            Some(crate::supervisor::start_request::VmmStartupCommand {
                 execution_id: uuid::Uuid::nil(),
-                process: crate::supervisor::start_request::VmmonProcessSpec {
+                process: crate::supervisor::start_request::VmmProcessSpec {
                     argv: vec!["true".to_string()],
                     working_directory: None,
-                    environment: vec![crate::supervisor::start_request::VmmonEnvironmentVariable {
+                    environment: vec![crate::supervisor::start_request::VmmEnvironmentVariable {
                         name: "LARGE".to_string(),
                         value: "x".repeat(1024 * 1024),
                     }],
@@ -461,15 +459,15 @@ mod tests {
     #[tokio::test]
     async fn cancelling_handoff_closes_a_blocked_writer() {
         let (read_fd, write_fd) = pipe().expect("create pipe");
-        let request = crate::supervisor::start_request::VmmonStartRequest::new(
+        let request = crate::supervisor::start_request::VmmStartRequest::new(
             uuid::Uuid::nil().to_string(),
             uuid::Uuid::nil().to_string(),
-            Some(crate::supervisor::start_request::VmmonStartupCommand {
+            Some(crate::supervisor::start_request::VmmStartupCommand {
                 execution_id: uuid::Uuid::nil(),
-                process: crate::supervisor::start_request::VmmonProcessSpec {
+                process: crate::supervisor::start_request::VmmProcessSpec {
                     argv: vec!["true".to_string()],
                     working_directory: None,
-                    environment: vec![crate::supervisor::start_request::VmmonEnvironmentVariable {
+                    environment: vec![crate::supervisor::start_request::VmmEnvironmentVariable {
                         name: "LARGE".to_string(),
                         value: "x".repeat(1024 * 1024),
                     }],
@@ -505,7 +503,7 @@ mod tests {
         let base_len = encode_start_request(&base)
             .expect("encode base request")
             .len();
-        let request = large_start_request("x".repeat(VMMON_START_REQUEST_MAX_BYTES - base_len));
+        let request = large_start_request("x".repeat(VMM_START_REQUEST_MAX_BYTES - base_len));
         let (read_fd, write_fd) = pipe().expect("create pipe");
         let reader = tokio::task::spawn_blocking(move || {
             let mut file = std::fs::File::from(read_fd);
@@ -519,20 +517,20 @@ mod tests {
             .expect("handoff exact request");
         let contents = reader.await.expect("join exact request reader");
 
-        assert_eq!(contents.len(), VMMON_START_REQUEST_MAX_BYTES);
+        assert_eq!(contents.len(), VMM_START_REQUEST_MAX_BYTES);
         assert_eq!(contents.last(), Some(&b'\n'));
     }
 
-    fn large_start_request(value: String) -> VmmonStartRequest {
-        VmmonStartRequest::new(
+    fn large_start_request(value: String) -> VmmStartRequest {
+        VmmStartRequest::new(
             uuid::Uuid::nil().to_string(),
             uuid::Uuid::nil().to_string(),
-            Some(VmmonStartupCommand {
+            Some(VmmStartupCommand {
                 execution_id: uuid::Uuid::nil(),
-                process: VmmonProcessSpec {
+                process: VmmProcessSpec {
                     argv: vec!["true".to_string()],
                     working_directory: None,
-                    environment: vec![VmmonEnvironmentVariable {
+                    environment: vec![VmmEnvironmentVariable {
                         name: "LARGE".to_string(),
                         value,
                     }],
@@ -618,7 +616,7 @@ mod tests {
 
     #[test]
     fn append_exit_command_args_preserves_structured_argv() {
-        let mut command = Command::new("/tmp/silo-vmmon");
+        let mut command = Command::new("/tmp/silo-vmm");
         let exit_command = HostCommand::new("/usr/local/bin/silo").args([
             OsString::from("cleanup"),
             OsString::from("--data-dir"),

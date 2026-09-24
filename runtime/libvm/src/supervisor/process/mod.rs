@@ -1,6 +1,6 @@
-//! Process identity helpers for silo-vmmon.
+//! Process identity helpers for silo-vmm.
 //!
-//! libvm treats silo-vmmon pidfiles as discovery artifacts only. A pidfile can be
+//! libvm treats silo-vmm pidfiles as discovery artifacts only. A pidfile can be
 //! stale, removed early, or point at a reused PID, so lifecycle decisions go
 //! through this module instead of checking pidfile existence.
 //!
@@ -8,7 +8,7 @@
 //! process and remains safe across PID reuse while this libvm process holds it.
 //! If pidfds are unavailable, we fall back to a kill-probe, matching libpod.
 //!
-//! This module intentionally does not call silo-vmmon's control socket or inspect
+//! This module intentionally does not call silo-vmm's control socket or inspect
 //! API. Liveness is OS process identity plus persisted monitor generation
 //! metadata and exit-status files.
 

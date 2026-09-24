@@ -1,10 +1,10 @@
 # Embedded libkrun Dependency
 
-Silo compiles its pinned libkrun fork directly into `silo-vmmon`; the krun
-backend code lives in `virt/vmmon/src/krun`. silo-vmmon executes libkrun only
+Silo compiles its pinned libkrun fork directly into `silo-vmm`; the krun
+backend code lives in `virt/vmm/src/krun`. silo-vmm executes libkrun only
 in a separate private worker process: the same executable started with argv[0]
-`silo-krun` and no arguments, configured through a fixed descriptor table (see
-[silo-vmmon architecture](architecture/silo-vmmon.md)).
+`krun` and no arguments, configured through a fixed descriptor table (see
+[silo-vmm architecture](architecture/silo-vmm.md)).
 There is no standalone krun executable, `libkrun.so`, `libkrun.dylib`, or
 `libkrunfw` sidecar.
 
@@ -83,7 +83,7 @@ virtio-block stayed near 210 MiB footprint without maintenance and fell to
 62 MiB with it. VM-object accounting stayed near 179 MiB in both cases.
 
 The fork also merges adjacent descriptors of one free-page report into a
-single release cycle and exposes `VmmHandle::host_reclaim_status()`. The silo-krun
+single release cycle and exposes `VmmHandle::host_reclaim_status()`. The krun
 worker samples that every five seconds and writes a `host_memory_reclaim`
 event on its inherited event pipe. The supervisor reads the pipe, stores the
 latest record, and returns it in `GetMetrics`
@@ -126,7 +126,7 @@ transitive versions on every libkrun update.
 Libkrun's native builder has no implicit console, vsock, balloon, or RNG device
 and no longer injects a default init binary. Silo supplies an explicit kernel
 and optional initramfs, adds its console when requested, always adds RNG and
-balloon devices, and attaches one native vsock device when silo-vmmon supplies
+balloon devices, and attaches one native vsock device when silo-vmm supplies
 the inherited control descriptor (fd 7). TSI and per-port mappings remain disabled.
 Consequently, Silo neither builds nor packages `libkrunfw`.
 
@@ -135,31 +135,31 @@ Consequently, Silo neither builds nor packages `libkrunfw`.
 Build the combined supervisor/worker executable with:
 
 ```bash
-make silo-vmmon PROFILE=debug
+make silo-vmm PROFILE=debug
 ```
 
 For a release build:
 
 ```bash
-make silo-vmmon PROFILE=release
+make silo-vmm PROFILE=release
 ```
 
-libkrun is an unconditional dependency of `silo-vmmon`; there is no feature
+libkrun is an unconditional dependency of `silo-vmm`; there is no feature
 flag that links or omits it. The supervisor never calls into libkrun itself,
-only the `silo-krun` worker does.
+only the `krun` worker does.
 
-On x86-64, `silo-vmmon` also enables bzip2's `static` feature. Libkrun uses
+On x86-64, `silo-vmm` also enables bzip2's `static` feature. Libkrun uses
 bzip2 to load `Image.bz2` kernels, and the worker must not depend on a host
 `libbz2.so` that is absent from the portable runtime.
 
 On Linux, `ldd` and `readelf -d` must not report `libkrun.so` or `libbz2.so`.
 On macOS,
-`otool -L` must not report `libkrun.dylib`. The macOS `silo-vmmon` binary still uses
+`otool -L` must not report `libkrun.dylib`. The macOS `silo-vmm` binary still uses
 Hypervisor.framework and must be signed with the
 `com.apple.security.hypervisor` entitlement before distribution, alongside
 `com.apple.security.virtualization` for VZ. The entitlements live in
-`virt/vmmon/silo-vmmon.entitlements`, and the xtask component build invoked by
-`make silo-vmmon` signs and verifies this union automatically.
+`virt/vmm/silo-vmm.entitlements`, and the xtask component build invoked by
+`make silo-vmm` signs and verifies this union automatically.
 
 The macOS krun Rosetta path is experimental. Its current
 `CapturedCompatibilityV1` profile accepts only host build `25G83` and the
@@ -181,7 +181,7 @@ For each upstream update:
 5. Build the fork with default features disabled and `blk,net` enabled.
 6. Update the full Git revision in the root `Cargo.toml`.
 7. Regenerate and commit `Cargo.lock`.
-8. Review the krun engine (`virt/vmmon/src/krun/engine.rs`) against the native Rust API signatures.
+8. Review the krun engine (`virt/vmm/src/krun/engine.rs`) against the native Rust API signatures.
 9. Run Silo's krun unit, integration, lint, and VM boot tests.
 10. Inspect the final binary for unexpected dynamic dependencies and compare
     its compressed size with the prior release.

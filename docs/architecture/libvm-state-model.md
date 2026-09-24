@@ -60,7 +60,7 @@ The CLI still uses the default home through `RuntimeConfig::from_env()`, but the
 
 The relational `id` and `name` columns must match the same fields in `config_json`. Decode paths validate that invariant so the indexed values and object document cannot silently drift.
 
-`spec` is not exploded into relational tables. Boot, hardware, storage, mounts, public vsock settings, and annotations remain part of the VM spec because they are object-shaped launch data, not fields the manager currently needs for uniqueness or relationship constraints. silo-vmmon always attaches the backend vsock device for internal guest destinations 22 and 1027. The stored public setting independently controls the hybrid mux and listener discovery surface; libvm resolves those effective runtime paths from the latest stored spec.
+`spec` is not exploded into relational tables. Boot, hardware, storage, mounts, public vsock settings, and annotations remain part of the VM spec because they are object-shaped launch data, not fields the manager currently needs for uniqueness or relationship constraints. silo-vmm always attaches the backend vsock device for internal guest destinations 22 and 1027. The stored public setting independently controls the hybrid mux and listener discovery surface; libvm resolves those effective runtime paths from the latest stored spec.
 
 ## Mutable State
 
@@ -70,7 +70,7 @@ The relational `id` and `name` columns must match the same fields in `config_jso
 - `status`: queryable process status for quick list/status reads.
 - `state_json`: the full mutable `MachineState` document encoded as SQLite JSONB.
 
-`state_json` contains `machineId`, `status`, `vmmonPid`, `startedAt`, `runId`,
+`state_json` contains `machineId`, `status`, `vmmPid`, `startedAt`, `runId`,
 `lastError`, and `updatedAt`. Decode paths validate that `machine_id` and
 `status` match the relational columns.
 
@@ -78,14 +78,14 @@ All durable timestamps, including the timestamps in `MachineConfig` and
 `MachineState`, are signed Unix seconds. The report timestamps supplied by the
 guest agent are separate telemetry and use Unix milliseconds.
 
-Runtime truth still comes from `silo-vmmon` while a VM is running. Local inspect/list paths reconcile the DB state with pidfiles and monitor liveness before returning snapshots.
+Runtime truth still comes from `silo-vmm` while a VM is running. Local inspect/list paths reconcile the DB state with pidfiles and monitor liveness before returning snapshots.
 
 ## Launch Artifacts
 
-The per-instance `config.json` file remains the launch artifact read by `silo-vmmon`.
+The per-instance `config.json` file remains the launch artifact read by `silo-vmm`.
 It is generated from `MachineConfig.spec`. The database is the source of durable
 machine intent, including image identity, retention, and process configuration;
-the launch artifact contains only the VM specification required by `silo-vmmon`.
+the launch artifact contains only the VM specification required by `silo-vmm`.
 
 This mirrors libpod's two-spec model:
 
@@ -109,7 +109,7 @@ machine does not consume its durable process configuration. A restart is a stop
 followed by that same idle start.
 
 An explicit `MachineStartOptions::entrypoint` is separate launch-only state.
-`silo-vmmon` acknowledges start after the guest program has launched, then owns the
+`silo-vmm` acknowledges start after the guest program has launched, then owns the
 VM until that program exits. The entrypoint is not written into the machine's
 durable process configuration.
 

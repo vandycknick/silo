@@ -9,7 +9,7 @@ use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::kernel::KernelArtifact;
 use crate::rprobe::ASSETS as RPROBE_ASSETS;
 
-const HELPERS: [(&str, u32); 2] = [("silo-vmmon", 0o755), ("netd", 0o755)];
+const HELPERS: [(&str, u32); 2] = [("silo-vmm", 0o755), ("netd", 0o755)];
 const ASSETS: [(&str, u32); 3] = [
     ("kernel-default", 0o644),
     ("initramfs", 0o644),
@@ -232,7 +232,7 @@ fn validate_stage(stage: &Path) -> Result<(), RuntimeError> {
     validate_directory_entries(stage, &expected_root)?;
     let bin = stage.join("bin");
     let assets = stage.join("assets");
-    validate_directory_entries(&bin, &BTreeSet::from(["netd", "silo-vmmon"]))?;
+    validate_directory_entries(&bin, &BTreeSet::from(["netd", "silo-vmm"]))?;
     let mut expected_assets = BTreeSet::from(["agent", "initramfs", "kernel-default"]);
     if has_rprobe_assets(&assets)? {
         expected_assets.extend(RPROBE_ASSETS.map(|(name, _)| name));
@@ -618,10 +618,10 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), RuntimeError> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn runtime_layout_requires_vmmon_and_netd_only() {
+    fn runtime_layout_requires_vmm_and_netd_only() {
         assert_eq!(
             crate::runtime::HELPERS,
-            [("silo-vmmon", 0o755), ("netd", 0o755)]
+            [("silo-vmm", 0o755), ("netd", 0o755)]
         );
     }
 }

@@ -9,7 +9,7 @@ This is a source review, not fresh native-HVF/Rosetta/release qualification.
 The inventory below is the concrete debt found, not a proof that every possible
 historical assumption in the repository has been identified.
 
-**Keep the architecture; simplify the contracts.** Linking krun into vmmon is
+**Keep the architecture; simplify the contracts.** Linking krun into vmm is
 right. Running libkrun in a separate process is also right: its normal shutdown
 can terminate the calling process. Removing that boundary would put supervisor
 cleanup, exit metadata and services at risk. There is no reason to maintain a
@@ -18,10 +18,10 @@ second executable identity or a homemade command-line dispatcher.
 Target shape:
 
 ```text
-libvm -> vmmon supervisor
+libvm -> vmm supervisor
            lifecycle, API, console, vsock and finalization
            |
-           +-> vmmon worker
+           +-> vmm worker
                  inherited FD roles + one typed launch request
                  watchdog, native admission, synchronous krun engine
 ```
@@ -33,13 +33,13 @@ protocol negotiation, or a reusable/restartable libkrun VM abstraction.
 
 ## Changes made with this review
 
-- `runtime/vmmon/src/main.rs:91` and `krun_worker/mod.rs`: normal Clap `worker`
+- `runtime/vmm/src/main.rs:91` and `krun_worker/mod.rs`: normal Clap `worker`
   subcommand. Removed the argv[0] disguise, magic marker, basename guards and
   their unit/integration tests. Worker dispatch still precedes runtime creation.
 - `runtime/libvm/src/runtime/components.rs`: removed the obsolete executable
   environment-variable rejection and its dedicated test. An unused environment
   variable is simply not read.
-- `runtime/vmmon/src/virt/backend/krun/owner.rs:70`: launch the current executable
+- `runtime/vmm/src/virt/backend/krun/owner.rs:70`: launch the current executable
   with `worker`; removed environment scrubbing for the retired helper protocol.
 - Updated the Rosetta qualification client, memory-report discovery and docs to
   use the same current invocation. No legacy invocation aliases were added.
@@ -70,9 +70,9 @@ semantic validation tests. Delete removed-field inventories and fixtures.
 
 ### Start-request compatibility and duplicated definitions
 
-`runtime/vmmon/src/start_request.rs:27,217,356` makes `startup_budget_ms` optional
+`runtime/vmm/src/start_request.rs:27,217,356` makes `startup_budget_ms` optional
 and synthesizes a budget for older requests. The current writer in
-`runtime/libvm/src/vmmon/start_request.rs:25` always sends it. Both sides already
+`runtime/libvm/src/vmm/start_request.rs:25` always sends it. Both sides already
 ship together. The reader also has `strict_reader_rejects_removed_host_reclaim_switch`
 at line 407; that tests a retired setting, not current behavior.
 
@@ -101,10 +101,10 @@ handling. No remembered field, special rejection branch or migration message.
 | `specs/agent-spec/src/lib.rs:621` | Delete the removed-forward-setting test. A generic unknown-field test is enough to cover the current strict schema. |
 | `specs/agent-spec/src/lib.rs:569` | Test the current fixed Rosetta contract with generic invalid values; do not preserve a retired tag/path as a special case. |
 | `runtime/libvm/src/machine/guest.rs:131` | Delete the test specifically requiring retired reclaim configuration to be silently discarded. Decide generic unknown-field policy separately. |
-| `runtime/libvm/src/vmmon/exit_status.rs:116-159` | Keep required identity and supervisor/worker identity tests. Remove the fabricated `futureField` compatibility promise and historical framing. `worker: None` is still valid for VZ/pre-spawn failures. |
+| `runtime/libvm/src/vmm/exit_status.rs:116-159` | Keep required identity and supervisor/worker identity tests. Remove the fabricated `futureField` compatibility promise and historical framing. `worker: None` is still valid for VZ/pre-spawn failures. |
 | `app/cli/lib/system/docker.rs:225` | Test creation of the configured socket directory, not absence of a retired alias. Keep foreign-file preservation, expressed using an arbitrary unrelated file/symlink. |
 | `app/cli/lib/boundary.rs` | Remove the empty transitional-file inventory. Prefer actual module visibility over substring policing of Rust source; do not retain a migration ratchet after migration has finished. |
-| `runtime/libvm/src/vmmon/mod.rs:195` | The actual test checks the current Rosetta contract; rename it without the obsolete label/assets narrative. |
+| `runtime/libvm/src/vmm/mod.rs:195` | The actual test checks the current Rosetta contract; rename it without the obsolete label/assets narrative. |
 
 Do not merely rename a historical rejection test and retain its old fixture.
 Retain a test only when it expresses an invariant of the current product.
@@ -134,7 +134,7 @@ arguments.
 ## Architecture simplifications, independent of compatibility
 
 1. **Represent lifecycle phases explicitly.**
-   `runtime/vmmon/src/virt/backend/krun/owner.rs:31,210` combines a
+   `runtime/vmm/src/virt/backend/krun/owner.rs:31,210` combines a
    `started/reaped/exit` snapshot with several independent booleans and deadlines.
    Reaped-but-draining is a real state, but combinations such as running with a
    final exit should not be representable. Use a small local enum for published
@@ -142,7 +142,7 @@ arguments.
    channel bookkeeping separate. Do not turn every flag into a new abstraction.
 
 2. **Reduce duplicate launch representation and validation.**
-   `runtime/vmmon/src/krun_worker/protocol.rs:23` duplicates `KrunConfig` field by
+   `runtime/vmm/src/krun_worker/protocol.rs:23` duplicates `KrunConfig` field by
    field. Rosetta is JSON encoded inside JSON, using the older standalone
    encoder in `virt/krun/src/rosetta.rs:97`. Configuration is validated before
    serialization, after decoding, and again in the engine. Prefer one concrete
@@ -153,20 +153,20 @@ arguments.
 
 3. **Trim dead API surface.**
    `virt/krun/src/engine.rs:20` accepts `protected_streams`, but every in-tree
-   caller passes an empty slice. `runtime/vmmon/src/virt/exit.rs:22` has an unused
-   `OwnerClosed` force reason. `runtime/vmmon/src/virt/backend/krun.rs:49` wraps
+   caller passes an empty slice. `runtime/vmm/src/virt/exit.rs:22` has an unused
+   `OwnerClosed` force reason. `runtime/vmm/src/virt/backend/krun.rs:49` wraps
    just a mux in `RunningKrun`. Remove these unless a present caller needs them.
    Audit the broad `allow(dead_code)` on `virt` in main instead of adding more
    placeholder variants/hooks.
 
 4. **Fix the dependency direction of terminal data.**
-   `runtime/vmmon/src/virt/exit.rs:3` imports `StartupStage` from the worker's wire
+   `runtime/vmm/src/virt/exit.rs:3` imports `StartupStage` from the worker's wire
    protocol. Terminal domain data should not depend on a transport module.
    Put the concrete shared stage type in a small existing domain/exit module and
    let the private protocol use it. No new crate is needed for one enum.
 
 5. **Keep finalization ownership obvious.**
-   `runtime/vmmon/src/main.rs:run`, `startup::PrimaryMachine` and `shutdown::run`
+   `runtime/vmm/src/main.rs:run`, `startup::PrimaryMachine` and `shutdown::run`
    distribute cleanup and terminal reporting across several paths. Preserve the
    retained primary machine through startup failure, but make one finalization
    path responsible for stop, forward/serial cleanup, terminal record and exit
@@ -174,7 +174,7 @@ arguments.
    replace explicit ownership with a generic asynchronous destructor framework.
 
 6. **Do not treat the mock backend as native coverage.**
-   `runtime/vmmon/src/virt/backend/mock` is substantial older test infrastructure,
+   `runtime/vmm/src/virt/backend/mock` is substantial older test infrastructure,
    exposed through a feature-gated backend and start-request scenario field.
    Inventory dependent tests before removal. Move pure state assertions to unit
    tests and runtime assertions to real-process/native tests. The new worker

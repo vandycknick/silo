@@ -1,7 +1,7 @@
-//! Internal adapter for the `silo-vmmon` supervisor process.
+//! Internal adapter for the `silo-vmm` supervisor process.
 //!
-//! This module is deliberately thin: it launches silo-vmmon, speaks the silo-vmmon
-//! control protocol, reads silo-vmmon-owned files, and probes silo-vmmon process
+//! This module is deliberately thin: it launches silo-vmm, speaks the silo-vmm
+//! control protocol, reads silo-vmm-owned files, and probes silo-vmm process
 //! identity. It does not read or write the machine store, take machine locks, or
 //! decide whether a lifecycle operation is valid. Those policies live in
 //! `Machine` and `Runtime`.
@@ -19,11 +19,11 @@ pub(crate) mod process;
 pub(crate) mod start_request;
 
 pub use client::DEFAULT_GUEST_READINESS_TIMEOUT;
-pub(crate) use client::{forward_rpc_error, ForwardClientError, VmmonClient, VmmonClientError};
-pub(crate) use launch::VmmonLaunch;
+pub(crate) use client::{forward_rpc_error, ForwardClientError, VmmClient, VmmClientError};
+pub(crate) use launch::VmmLaunch;
 pub(crate) use launch_spec::{prepare_launch_spec, write_launch_spec, LaunchSpecInput};
 
-/// Crate-private adapter for the `silo-vmmon` supervisor process.
+/// Crate-private adapter for the `silo-vmm` supervisor process.
 #[derive(Debug, Clone)]
 pub(crate) struct VmSupervisor {
     paths: LocalPaths,
@@ -32,14 +32,14 @@ pub(crate) struct VmSupervisor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VmmonLaunchInputs {
+pub(crate) struct VmmLaunchInputs {
     pub(crate) agent_enabled: bool,
-    pub(crate) rosetta_intent: start_request::VmmonRosettaIntent,
+    pub(crate) rosetta_intent: start_request::VmmRosettaIntent,
     pub(crate) asset_directory: PathBuf,
 }
 
 impl VmSupervisor {
-    /// Creates a silo-vmmon adapter bound to the runtime's local paths.
+    /// Creates a silo-vmm adapter bound to the runtime's local paths.
     pub(crate) fn new(
         paths: LocalPaths,
         executable: PathBuf,
@@ -57,18 +57,18 @@ impl VmSupervisor {
     }
 
     /// Explicit backend selection forwarded in every start request.
-    pub(crate) fn virt_backend_request(&self) -> Option<start_request::VmmonVirtBackend> {
+    pub(crate) fn virt_backend_request(&self) -> Option<start_request::VmmVirtBackend> {
         self.virt_backend.as_ref().map(|selection| match selection {
-            crate::runtime::VirtBackendOverride::Krun => start_request::VmmonVirtBackend {
+            crate::runtime::VirtBackendOverride::Krun => start_request::VmmVirtBackend {
                 kind: "krun".to_string(),
                 scenario: None,
             },
-            crate::runtime::VirtBackendOverride::Vz => start_request::VmmonVirtBackend {
+            crate::runtime::VirtBackendOverride::Vz => start_request::VmmVirtBackend {
                 kind: "vz".to_string(),
                 scenario: None,
             },
             crate::runtime::VirtBackendOverride::Mock { scenario } => {
-                start_request::VmmonVirtBackend {
+                start_request::VmmVirtBackend {
                     kind: "mock".to_string(),
                     scenario: scenario.clone(),
                 }
@@ -79,13 +79,13 @@ impl VmSupervisor {
     pub(crate) fn rosetta_intent_request(
         &self,
         config: &crate::store::models::MachineConfig,
-    ) -> Result<start_request::VmmonRosettaIntent, String> {
+    ) -> Result<start_request::VmmRosettaIntent, String> {
         let hardware = config.spec.hardware.as_ref();
         if !hardware
             .and_then(|hardware| hardware.rosetta)
             .unwrap_or(false)
         {
-            return Ok(start_request::VmmonRosettaIntent::Disabled {});
+            return Ok(start_request::VmmRosettaIntent::Disabled {});
         }
 
         if config.guest.agent != crate::machine::MachineAgent::Default {
@@ -119,11 +119,11 @@ impl VmSupervisor {
             ));
         }
 
-        Ok(start_request::VmmonRosettaIntent::Enabled {})
+        Ok(start_request::VmmRosettaIntent::Enabled {})
     }
 
-    pub(crate) fn client(&self, machine_id: MachineId) -> VmmonClient {
-        VmmonClient::new(self.paths.machine(machine_id).vmmon_socket_path())
+    pub(crate) fn client(&self, machine_id: MachineId) -> VmmClient {
+        VmmClient::new(self.paths.machine(machine_id).vmm_socket_path())
     }
 }
 
@@ -181,7 +181,7 @@ mod tests {
         ] {
             let supervisor = VmSupervisor::new(
                 crate::paths::LocalPaths::new("/tmp/silo-test"),
-                "/tmp/silo-vmmon".into(),
+                "/tmp/silo-vmm".into(),
                 Some(selection),
             );
             let request = supervisor.virt_backend_request().expect("backend request");
@@ -193,11 +193,11 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn durable_rosetta_eligibility_uses_guest_contract_not_completed_assets_or_legacy_label() {
-        use crate::supervisor::start_request::VmmonRosettaIntent;
+        use crate::supervisor::start_request::VmmRosettaIntent;
 
         let supervisor = VmSupervisor::new(
             crate::paths::LocalPaths::new("/tmp/silo-test"),
-            "/operator/silo-vmmon".into(),
+            "/operator/silo-vmm".into(),
             Some(VirtBackendOverride::Krun),
         );
         let config = rosetta_machine_config();
@@ -205,14 +205,14 @@ mod tests {
             supervisor
                 .rosetta_intent_request(&config)
                 .expect("default durable contract"),
-            VmmonRosettaIntent::Enabled {}
+            VmmRosettaIntent::Enabled {}
         );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn rosetta_intent_is_backend_independent() {
-        use crate::supervisor::start_request::VmmonRosettaIntent;
+        use crate::supervisor::start_request::VmmRosettaIntent;
 
         for backend in [
             None,
@@ -221,14 +221,14 @@ mod tests {
         ] {
             let supervisor = VmSupervisor::new(
                 crate::paths::LocalPaths::new("/tmp/silo-test"),
-                "/operator/silo-vmmon".into(),
+                "/operator/silo-vmm".into(),
                 backend,
             );
             assert_eq!(
                 supervisor
                     .rosetta_intent_request(&rosetta_machine_config())
                     .expect("generic Rosetta intent"),
-                VmmonRosettaIntent::Enabled {}
+                VmmRosettaIntent::Enabled {}
             );
         }
     }
@@ -238,7 +238,7 @@ mod tests {
     fn durable_rosetta_eligibility_rejects_custom_agent_kernel_nested_and_reserved_tag() {
         let supervisor = VmSupervisor::new(
             crate::paths::LocalPaths::new("/tmp/silo-test"),
-            "/operator/silo-vmmon".into(),
+            "/operator/silo-vmm".into(),
             Some(VirtBackendOverride::Vz),
         );
 

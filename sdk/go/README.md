@@ -25,7 +25,7 @@ defer runtime.Close()
 
 Loading the small Go FFI bridge is separate from runtime installation. It may materialize embedded bridge bytes under `~/.silo/cache/go-ffi`, but it never accesses the network.
 
-`Open` accepts `WithHome` to select the Silo home holding all persistent state (default `SILO_HOME`, else `~/.silo`; generated sockets always live under `/tmp/silo-<euid>`), `WithRuntimeRoot` to select one complete runtime installation, and `WithSupervisorPath` to override only the `silo-vmmon` executable.
+`Open` accepts `WithHome` to select the Silo home holding all persistent state (default `SILO_HOME`, else `~/.silo`; generated sockets always live under `/tmp/silo-<euid>`), `WithRuntimeRoot` to select one complete runtime installation, and `WithSupervisorPath` to override only the `silo-vmm` executable.
 
 Development checkouts deliberately contain no release archive digests or embedded bridge binaries.
 From the repository root, build the staged runtime and bridge and run an example with one command:

@@ -72,7 +72,7 @@ fn process_started_at(pid: i32) -> io::Result<Option<i64>> {
 
     // rustix and nix do not expose a macOS pidfd equivalent or this process
     // birth-time query. We use it only to avoid confusing PID reuse with the
-    // silo-vmmon process whose generation libvm persisted.
+    // silo-vmm process whose generation libvm persisted.
     unsafe extern "C" {
         fn proc_pidinfo(
             pid: libc::c_int,

@@ -18,12 +18,14 @@ The short version:
 
 Only network policies are implemented today. Kernel and userspace policies are the direction.
 
-Each running VM is supervised by one `silo-vmmon` process, Silo's VM monitor.
+Each running VM is supervised by one `silo-vmm` process, Silo's virtual machine
+monitor (VMM). It manages VM configuration, execution, and lifecycle across
+virtualization backends.
 With the default krun backend, libkrun runs in a private worker: the same
-`silo-vmmon` executable started with argv[0] `silo-krun`. There is no standalone
-krun runtime binary. Runtime packages ship it as `bin/silo-vmmon` (or
-`Contents/Helpers/silo-vmmon` in `Silo.app`). See the
-[silo-vmmon architecture and qualification notes](docs/architecture/silo-vmmon.md).
+`silo-vmm` executable started with argv[0] `krun`. There is no standalone
+krun runtime binary. Runtime packages ship it as `bin/silo-vmm` (or
+`Contents/Helpers/silo-vmm` in `Silo.app`). See the
+[silo-vmm architecture and qualification notes](docs/architecture/silo-vmm.md).
 
 ## CLI
 

@@ -58,7 +58,7 @@ pub enum StdinMode {
     Bytes(Vec<u8>),
 }
 
-/// The exact terminal result reported by silo-vmmon.
+/// The exact terminal result reported by silo-vmm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionResult {
     Exited { code: Option<u32> },
@@ -1733,7 +1733,7 @@ mod tests {
     use crate::machine::MachineUserConfig;
 
     #[test]
-    fn vmmon_execution_process_spec_preserves_argv_environment_and_pipe_stdin() {
+    fn vmm_execution_process_spec_preserves_argv_environment_and_pipe_stdin() {
         let spec = process_spec(
             "program with spaces".to_string(),
             ExecutionOptions {
@@ -1759,7 +1759,7 @@ mod tests {
     }
 
     #[test]
-    fn vmmon_execution_process_spec_uses_current_terminal_fallback_for_pty() {
+    fn vmm_execution_process_spec_uses_current_terminal_fallback_for_pty() {
         let spec = process_spec(
             "sh".to_string(),
             ExecutionOptions {
@@ -1791,7 +1791,7 @@ mod tests {
     }
 
     #[test]
-    fn vmmon_execution_wire_lost_event_stays_a_lost_terminal_result() {
+    fn vmm_execution_wire_lost_event_stays_a_lost_terminal_result() {
         let event = execution_event_from_wire(protocol::v1::ExecutionEvent {
             event: Some(protocol::v1::execution_event::Event::Lost(
                 protocol::v1::ExecutionLost {
@@ -1924,7 +1924,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vmmon_execution_control_splits_large_stdin_without_losing_bytes() {
+    async fn vmm_execution_control_splits_large_stdin_without_losing_bytes() {
         let (requests, mut receiver) = tokio::sync::mpsc::channel(4);
         let control = ExecutionControl {
             reference: "dev".to_string(),
@@ -1956,7 +1956,7 @@ mod tests {
     }
 
     #[test]
-    fn vmmon_execution_control_hides_unavailable_stdin() {
+    fn vmm_execution_control_hides_unavailable_stdin() {
         let (requests, _receiver) = tokio::sync::mpsc::channel(1);
         let control = ExecutionControl {
             reference: "dev".to_string(),

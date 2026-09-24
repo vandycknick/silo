@@ -117,14 +117,14 @@ pub fn run_hardware_test(workspace_root: &Path, target_dir: &Path, kernel: &Path
             "build",
             "--locked",
             "-p",
-            "silo-vmmon",
+            "silo-vmm",
             "--bin",
             "silo-rprobe-vz-harness",
         ]);
     command::run(cargo)?;
 
     let harness = target_dir.join("debug/silo-rprobe-vz-harness");
-    let entitlements = workspace_root.join("virt/vmmon/silo-vmmon.entitlements");
+    let entitlements = workspace_root.join("virt/vmm/silo-vmm.entitlements");
     let mut sign = Command::new("/usr/bin/codesign");
     sign.args(["-f", "--entitlements"])
         .arg(entitlements)

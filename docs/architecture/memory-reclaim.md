@@ -18,9 +18,9 @@ different measurements.
 
 ## Balloon attachment and feature selection
 
-silo-vmmon explicitly enables the balloon in the krun backend by setting
+silo-vmm explicitly enables the balloon in the krun backend by setting
 `KrunConfig.balloon`. There is no libvm or daemon balloon setting. The
-`silo-krun` worker attaches the device only when that field is set.
+`krun` worker attaches the device only when that field is set.
 
 Adding `libkrun::BalloonDevice::new()` is sufficient to request automatic
 capability selection. On macOS, reporting is advertised only after the existing
@@ -121,8 +121,8 @@ from a particular cgroup under concurrent activity.
 Remove `host-memory-reclaim`, `memory-reclaim`, and `memory-reclaim-after` from
 daemon YAML. Old persisted installation records discard these retired settings;
 old machine guest-policy fields are likewise not retained. New agent JSON
-rejects the retired `memory_reclaim` key. Upgrade the CLI, silo-vmmon (including its
-private `silo-krun` worker), and managed agent together. Running VMs are unchanged until restarted.
+rejects the retired `memory_reclaim` key. Upgrade the CLI, silo-vmm (including its
+private `krun` worker), and managed agent together. Running VMs are unchanged until restarted.
 
 The OrbStack handoff in `~/Projects/orb-analyses2` informs this separation, but
 Silo retains stock virtio reporting, its existing RAM provider, mapping

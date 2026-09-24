@@ -20,7 +20,7 @@ use crate::constants::{
 };
 use crate::host;
 use crate::machine::MachineUserConfig;
-use crate::network::VmmonNetworkAttachment;
+use crate::network::VmmNetworkAttachment;
 use crate::paths::LocalPaths;
 use crate::RuntimeNetworkingConfig;
 
@@ -28,7 +28,7 @@ pub(crate) struct GuestAgentConfigInput<'a> {
     pub(crate) paths: &'a LocalPaths,
     pub(crate) machine_name: &'a str,
     pub(crate) spec: &'a VmSpec,
-    pub(crate) network: &'a VmmonNetworkAttachment,
+    pub(crate) network: &'a VmmNetworkAttachment,
     pub(crate) networking: &'a RuntimeNetworkingConfig,
     pub(crate) resize_rootfs: bool,
     pub(crate) user: Option<&'a MachineUserConfig>,
@@ -82,7 +82,7 @@ fn load_host_context(
 fn build_config_with_host_context(
     machine_name: &str,
     spec: &VmSpec,
-    network: &VmmonNetworkAttachment,
+    network: &VmmNetworkAttachment,
     resize_rootfs: bool,
     host_context: &GuestAgentHostContext,
 ) -> eyre::Result<AgentConfig> {
@@ -101,7 +101,7 @@ fn build_config_with_host_context(
 fn build_provision_config(
     machine_name: &str,
     spec: &VmSpec,
-    network: &VmmonNetworkAttachment,
+    network: &VmmNetworkAttachment,
     resize_rootfs: bool,
     host_context: &GuestAgentHostContext,
 ) -> eyre::Result<ProvisionConfig> {
@@ -246,11 +246,11 @@ fn provision_userdata(spec: &VmSpec) -> eyre::Result<Option<UserdataConfig>> {
 }
 
 fn build_provision_network_config(
-    network: &VmmonNetworkAttachment,
+    network: &VmmNetworkAttachment,
 ) -> eyre::Result<Option<ProvisionNetworkConfig>> {
     match network {
-        VmmonNetworkAttachment::None => Ok(None),
-        VmmonNetworkAttachment::UnixDatagram { mac, ipv4, dns, .. } => {
+        VmmNetworkAttachment::None => Ok(None),
+        VmmNetworkAttachment::UnixDatagram { mac, ipv4, dns, .. } => {
             Ok(Some(ProvisionNetworkConfig {
                 interfaces: vec![NetworkInterfaceConfig {
                     mac_address: format_mac(parse_mac_string(mac)?),
@@ -332,7 +332,7 @@ mod tests {
     };
     use crate::host;
     use crate::machine::MachineUserConfig;
-    use crate::network::VmmonNetworkAttachment;
+    use crate::network::VmmNetworkAttachment;
     use crate::paths::LocalPaths;
 
     fn sample_spec(kernel_cmdline: Vec<String>) -> VmSpec {
@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn provision_network_is_absent_without_attachment() {
-        let config = build_provision_network_config(&VmmonNetworkAttachment::None)
+        let config = build_provision_network_config(&VmmNetworkAttachment::None)
             .expect("network provision config should render");
 
         assert!(config.is_none());
@@ -494,7 +494,7 @@ mod tests {
         let provision = build_provision_config(
             "demo",
             &spec,
-            &VmmonNetworkAttachment::None,
+            &VmmNetworkAttachment::None,
             true,
             &host_context(),
         )
@@ -515,7 +515,7 @@ mod tests {
         let config = build_config_with_host_context(
             "demo",
             &sample_spec(Vec::new()),
-            &VmmonNetworkAttachment::None,
+            &VmmNetworkAttachment::None,
             false,
             &context,
         )
@@ -535,7 +535,7 @@ mod tests {
         let err = build_provision_config(
             "demo",
             &spec,
-            &VmmonNetworkAttachment::None,
+            &VmmNetworkAttachment::None,
             true,
             &host_context(),
         )
@@ -553,7 +553,7 @@ mod tests {
         let detached = build_provision_config(
             "demo",
             &spec,
-            &VmmonNetworkAttachment::None,
+            &VmmNetworkAttachment::None,
             true,
             &host_context(),
         )
@@ -561,7 +561,7 @@ mod tests {
         let attached = build_provision_config(
             "demo",
             &spec,
-            &VmmonNetworkAttachment::UnixDatagram {
+            &VmmNetworkAttachment::UnixDatagram {
                 path: PathBuf::from("/run/silo/net.sock"),
                 mac: "02:00:00:00:00:01".to_string(),
                 ipv4: agent_spec::NetworkIpv4Config {
@@ -597,7 +597,7 @@ mod tests {
         let provision = build_provision_config(
             "demo",
             &spec,
-            &VmmonNetworkAttachment::UnixDatagram {
+            &VmmNetworkAttachment::UnixDatagram {
                 path: PathBuf::from("/run/silo/net.sock"),
                 mac: "02:00:00:00:00:01".to_string(),
                 ipv4: agent_spec::NetworkIpv4Config {
@@ -757,7 +757,7 @@ mod tests {
         let provision = build_provision_config(
             "demo",
             &sample_spec(Vec::new()),
-            &VmmonNetworkAttachment::None,
+            &VmmNetworkAttachment::None,
             false,
             &host_context(),
         )
@@ -774,7 +774,7 @@ mod tests {
         let provision = build_provision_config(
             "demo",
             &spec,
-            &VmmonNetworkAttachment::None,
+            &VmmNetworkAttachment::None,
             true,
             &host_context(),
         )
@@ -790,7 +790,7 @@ mod tests {
         let config = build_config_with_host_context(
             "demo",
             &sample_spec(Vec::new()),
-            &VmmonNetworkAttachment::None,
+            &VmmNetworkAttachment::None,
             true,
             &host_context(),
         )

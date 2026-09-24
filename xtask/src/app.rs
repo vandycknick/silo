@@ -16,7 +16,7 @@ const APP_NAME: &str = "Silo.app";
 const BUNDLE_IDENTIFIER: &str = "sh.silo.app";
 const MINIMUM_SYSTEM_VERSION: &str = "26.0";
 const HELPERS: [(&str, Option<&str>); 2] = [
-    ("silo-vmmon", Some("virt/vmmon/silo-vmmon.entitlements")),
+    ("silo-vmm", Some("virt/vmm/silo-vmm.entitlements")),
     ("netd", None),
 ];
 const ASSETS: [(&str, u32); 3] = [
@@ -342,7 +342,7 @@ fn validate_unsigned_layout(
     let contents = bundle.join("Contents");
     validate_directory_entries(&contents, ["Helpers", "Info.plist", "MacOS", "Resources"])?;
     validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
-    validate_directory_entries(&contents.join("Helpers"), ["netd", "silo-vmmon"])?;
+    validate_directory_entries(&contents.join("Helpers"), ["netd", "silo-vmm"])?;
     validate_directory_entries(&contents.join("Resources"), ["Silo.icns", "assets"])?;
     validate_asset_entries(&contents.join("Resources/assets"))?;
     validate_regular_file(&contents.join("Info.plist"), None)?;
@@ -489,7 +489,7 @@ fn entitlement_map(path: &Path, plist: &[u8]) -> Result<BTreeMap<String, bool>, 
 
 pub fn verify_signed_bundle(bundle: &Path) -> Result<(), AppError> {
     validate_distribution_layout(bundle)?;
-    for name in ["silo", "silo-vmmon", "netd"] {
+    for name in ["silo", "silo-vmm", "netd"] {
         let path = match name {
             "silo" => bundle.join("Contents/MacOS/silo"),
             _ => bundle.join("Contents/Helpers").join(name),
@@ -498,7 +498,7 @@ pub fn verify_signed_bundle(bundle: &Path) -> Result<(), AppError> {
     }
     verify_signature(bundle)?;
     verify_entitlements(
-        &bundle.join("Contents/Helpers/silo-vmmon"),
+        &bundle.join("Contents/Helpers/silo-vmm"),
         &[
             "com.apple.security.hypervisor",
             "com.apple.security.virtualization",
@@ -572,7 +572,7 @@ fn validate_distribution_layout(bundle: &Path) -> Result<(), AppError> {
         ],
     )?;
     validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
-    validate_directory_entries(&contents.join("Helpers"), ["netd", "silo-vmmon"])?;
+    validate_directory_entries(&contents.join("Helpers"), ["netd", "silo-vmm"])?;
     validate_directory_entries(&contents.join("Resources"), ["Silo.icns", "assets"])?;
     validate_asset_entries(&contents.join("Resources/assets"))?;
     validate_regular_file(&contents.join("Info.plist"), None)?;
@@ -853,15 +853,15 @@ fn invalid<T>(path: &Path, reason: String) -> Result<T, AppError> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn app_uses_vmmon_for_both_virtualization_roles() {
+    fn app_uses_vmm_for_both_virtualization_roles() {
         assert_eq!(
             crate::app::HELPERS,
             [
-                ("silo-vmmon", Some("virt/vmmon/silo-vmmon.entitlements")),
+                ("silo-vmm", Some("virt/vmm/silo-vmm.entitlements")),
                 ("netd", None)
             ]
         );
-        let entitlements = include_str!("../../virt/vmmon/silo-vmmon.entitlements");
+        let entitlements = include_str!("../../virt/vmm/silo-vmm.entitlements");
         assert!(entitlements.contains("com.apple.security.virtualization"));
         assert!(entitlements.contains("com.apple.security.hypervisor"));
         assert_eq!(entitlements.matches("<key>").count(), 2);

@@ -81,7 +81,7 @@ impl NetworkDriverBackend for NetdDriver {
         &self,
         ctx: &NetworkDriverContext<'_>,
         request: &NetworkAttachmentRequest<'_>,
-    ) -> Result<super::VmmonNetworkAttachment, LibVmError> {
+    ) -> Result<super::VmmNetworkAttachment, LibVmError> {
         prepare_netd_runtime(ctx, request).await
     }
 }
@@ -90,7 +90,7 @@ impl NetworkDriverBackend for NetdDriver {
 async fn prepare_netd_runtime(
     ctx: &NetworkDriverContext<'_>,
     request: &NetworkAttachmentRequest<'_>,
-) -> Result<super::VmmonNetworkAttachment, LibVmError> {
+) -> Result<super::VmmNetworkAttachment, LibVmError> {
     let paths = ctx.paths;
     let store = ctx.store;
     let metadata = ctx.metadata;
@@ -214,7 +214,7 @@ async fn prepare_netd_runtime(
         });
     }
 
-    let network = super::VmmonNetworkAttachment::UnixDatagram {
+    let network = super::VmmNetworkAttachment::UnixDatagram {
         path: socket_path.clone(),
         mac: mac.clone(),
         ipv4,
@@ -222,10 +222,8 @@ async fn prepare_netd_runtime(
         requires_certificate_authority,
     };
     let (ipv4, dns) = match &network {
-        super::VmmonNetworkAttachment::UnixDatagram { ipv4, dns, .. } => {
-            (ipv4.clone(), dns.clone())
-        }
-        super::VmmonNetworkAttachment::None => {
+        super::VmmNetworkAttachment::UnixDatagram { ipv4, dns, .. } => (ipv4.clone(), dns.clone()),
+        super::VmmNetworkAttachment::None => {
             return Err(LibVmError::NetworkRuntime {
                 reference: metadata.name.clone(),
                 message: "netd created an invalid network attachment".to_string(),
@@ -289,7 +287,7 @@ async fn prepare_netd_runtime(
 async fn prepare_netd_runtime(
     _ctx: &NetworkDriverContext<'_>,
     _request: &NetworkAttachmentRequest<'_>,
-) -> Result<super::VmmonNetworkAttachment, LibVmError> {
+) -> Result<super::VmmNetworkAttachment, LibVmError> {
     let metadata = _ctx.metadata;
     Err(LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
@@ -1274,7 +1272,7 @@ netd log: /tmp/silo/netd.log";
         let state = MachineState {
             machine_id,
             status: MachineRuntimeState::Stopped,
-            vmmon_pid: None,
+            vmm_pid: None,
             started_at: None,
             run_id: None,
             last_error: None,
@@ -1302,10 +1300,10 @@ netd log: /tmp/silo/netd.log";
                 .expect("launch resolved netd");
 
         let log_path = match attachment {
-            crate::network::VmmonNetworkAttachment::UnixDatagram { .. } => {
+            crate::network::VmmNetworkAttachment::UnixDatagram { .. } => {
                 paths.machine(machine_id).network_service_log_path()
             }
-            crate::network::VmmonNetworkAttachment::None => panic!("netd must attach a socket"),
+            crate::network::VmmNetworkAttachment::None => panic!("netd must attach a socket"),
         };
         assert_eq!(
             log_path,

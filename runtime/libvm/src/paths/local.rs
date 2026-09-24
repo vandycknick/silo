@@ -5,7 +5,7 @@ use crate::paths::defaults::{default_run_root, ensure_run_root, resolve_default_
 use crate::paths::machine::{
     MachinePaths, EXEC_LOG_FILE_NAME, LOGS_DIR_NAME, MACHINES_DIR_NAME,
     NETWORK_AUDIT_LOG_FILE_NAME, NETWORK_DIR_NAME, NETWORK_SERVICE_LOG_FILE_NAME,
-    SERIAL_LOG_FILE_NAME, VMMON_TRACE_LOG_FILE_NAME,
+    SERIAL_LOG_FILE_NAME, VMM_TRACE_LOG_FILE_NAME,
 };
 use crate::paths::network::{NetworkPaths, NETWORKS_DIR_NAME};
 use crate::paths::OwnedDirectory;
@@ -250,7 +250,7 @@ impl LocalPaths {
         &self,
         machine_id: MachineId,
     ) -> Result<Option<File>, LibVmError> {
-        self.open_machine_log(machine_id, false, VMMON_TRACE_LOG_FILE_NAME)
+        self.open_machine_log(machine_id, false, VMM_TRACE_LOG_FILE_NAME)
     }
 
     pub(crate) fn open_serial_log(
@@ -502,7 +502,7 @@ mod tests {
             format!("/tmp/silo-{uid}"),
         );
         let paths = LocalPaths::from_roots(roots);
-        let machine_socket = paths.machine(MachineId::new()).vmmon_socket_path();
+        let machine_socket = paths.machine(MachineId::new()).vmm_socket_path();
         let network_socket = paths
             .network(&MachineId::new().to_string())
             .expect("network paths")

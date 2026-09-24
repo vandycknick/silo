@@ -24,7 +24,7 @@ const EXEC_LOG_SNAPSHOT_RETRIES: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MachineLogSource {
-    /// silo-vmmon diagnostic output.
+    /// silo-vmm diagnostic output.
     Monitor,
     /// VM serial console output.
     Serial,
@@ -483,7 +483,7 @@ mod tests {
                 &MachineState {
                     machine_id: id,
                     status: MachineRuntimeState::Stopped,
-                    vmmon_pid: None,
+                    vmm_pid: None,
                     started_at: None,
                     run_id: None,
                     last_error: None,

@@ -129,8 +129,8 @@ version-check: ## Verify product versions match the version authority.
 	$(XTASK) version-check
 
 # Internal targets
-.PHONY: cli silo-vmmon netd agent portd init initramfs rprobe go-ffi kernel
-cli silo-vmmon netd agent portd init initramfs rprobe go-ffi:
+.PHONY: cli silo-vmm netd agent portd init initramfs rprobe go-ffi kernel
+cli silo-vmm netd agent portd init initramfs rprobe go-ffi:
 	$(XTASK) component $@ --profile "$(PROFILE)"
 
 kernel:

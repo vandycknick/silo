@@ -18,7 +18,7 @@ Silo needs a VM architecture that keeps the runtime surface small, focused, and 
 - works well without a central always-on daemon,
 - preserves room for a future daemon or tunnel mode without changing the machine model.
 
-The chosen architecture is daemonless. `silo` calls into `libvm`, and `libvm` owns machine lifecycle in local ABI mode. When a machine starts, `libvm` spawns a dedicated `silo-vmmon` process for that machine. `silo-vmmon` reads the machine configuration from the instance directory, starts the VM, supervises it, and exposes the per-VM control surface.
+The chosen architecture is daemonless. `silo` calls into `libvm`, and `libvm` owns machine lifecycle in local ABI mode. When a machine starts, `libvm` spawns a dedicated `silo-vmm` process for that machine. `silo-vmm` reads the machine configuration from the instance directory, starts the VM, supervises it, and exposes the per-VM control surface.
 
 This gives Silo the operational flexibility of a daemonless system while still leaving room for a future manager daemon. `libvm` is the boundary that preserves that split. It is the local engine today, and it can also become the client-side boundary for future daemon or tunnel mode without changing the monitor model.
 
@@ -28,19 +28,19 @@ Silo adopts a daemonless, config-driven architecture with these roles:
 
 - `silo` is a thin frontend over `libvm`.
 - `silo-core` owns the canonical shared domain model, including `VmSpec`, machine identity types, and guest service configuration types.
-- `libvm` owns manager-side lifecycle, machine inventory, on-disk layout, image policy, bootstrap materialization, host gRPC client behavior, and `silo-vmmon` process spawning.
-- `silo-vmmon` is the canonical per-VM monitor. It is a small-footprint runtime supervisor that owns one running VM.
-- `virt` is the host virtualization facade inside `silo-vmmon` (`virt/vmmon/src/virt`).
+- `libvm` owns manager-side lifecycle, machine inventory, on-disk layout, image policy, bootstrap materialization, host gRPC client behavior, and `silo-vmm` process spawning.
+- `silo-vmm` is the canonical per-VM monitor. It is a small-footprint runtime supervisor that owns one running VM.
+- `virt` is the host virtualization facade inside `silo-vmm` (`virt/vmm/src/virt`).
 
 Canonical vocabulary for these layers lives in [`../terminology.md`](../terminology.md).
 
-This architecture is intentionally daemonless by default. A future daemon or tunnel mode may be added later, but it must preserve the same `libvm` to `silo-vmmon` boundary and the same per-VM monitor model.
+This architecture is intentionally daemonless by default. A future daemon or tunnel mode may be added later, but it must preserve the same `libvm` to `silo-vmm` boundary and the same per-VM monitor model.
 
 ## Goals
 
-- Keep one `silo-vmmon` process responsible for one VM.
+- Keep one `silo-vmm` process responsible for one VM.
 - Make `silo` a thin consumer of `libvm`.
-- Keep `silo-vmmon` focused on runtime supervision instead of manager concerns.
+- Keep `silo-vmm` focused on runtime supervision instead of manager concerns.
 - Make machine startup config-driven from the per-instance `config.json`.
 - Keep `libvm` as the architectural boundary between daemonless local ABI mode and future daemon or tunnel mode.
 - Keep one machine-scoped gRPC control socket for monitor, filesystem, serial, and shell access.
@@ -49,9 +49,9 @@ This architecture is intentionally daemonless by default. A future daemon or tun
 ## Non-goals
 
 - Introducing a central always-on daemon as the primary architecture.
-- Moving global machine inventory into `silo-vmmon`.
+- Moving global machine inventory into `silo-vmm`.
 - Replacing `config.json` with database-only machine definitions.
-- Defining the detailed host and guest gRPC contract, which belongs to [ADR 0008](0008-vmmon-host-and-guest-grpc-api.md).
+- Defining the detailed host and guest gRPC contract, which belongs to [ADR 0008](0008-vmm-host-and-guest-grpc-api.md).
 - Defining the final future daemon API in this ADR.
 
 ## Component Boundaries
@@ -73,7 +73,7 @@ It does not own:
 - direct monitor spawning,
 - pidfile polling for startup,
 - direct host gRPC protocol ownership,
-- direct `silo-vmmon` lifecycle management.
+- direct `silo-vmm` lifecycle management.
 
 ### `silo-core`
 
@@ -110,10 +110,10 @@ It owns:
 - canonical `config.json` writing from `silo-core::VmSpec`,
 - image resolution and instance materialization,
 - bootstrap and guest runtime materialization,
-- spawning `silo-vmmon`,
+- spawning `silo-vmm`,
 - monitor stop signaling,
 - generated host gRPC client behavior,
-- manager-side status and stream attachment through `silo-vmmon`.
+- manager-side status and stream attachment through `silo-vmm`.
 
 It does not own:
 
@@ -123,9 +123,9 @@ It does not own:
 
 The manager API is currently a library boundary implemented by `libvm`. A future remote manager may expose an equivalent API over the network, but that wire service does not exist yet and is not required for the daemonless architecture.
 
-### `silo-vmmon`
+### `silo-vmm`
 
-`silo-vmmon` is the canonical per-VM monitor and supervisor.
+`silo-vmm` is the canonical per-VM monitor and supervisor.
 
 It owns:
 
@@ -147,11 +147,11 @@ It does not own:
 - create or remove policy,
 - future manager-daemon responsibilities.
 
-`silo-vmmon` should remain small and focused. It is a runtime monitor, not a general manager.
+`silo-vmm` should remain small and focused. It is a runtime monitor, not a general manager.
 
 ### `virt`
 
-`virt` is the host virtualization facade. It is a module of `silo-vmmon`, not a
+`virt` is the host virtualization facade. It is a module of `silo-vmm`, not a
 separate crate or process.
 
 It owns:
@@ -159,7 +159,7 @@ It owns:
 - host-specific VM execution,
 - host VM configuration validation,
 - VM lifecycle primitives,
-- serial and vsock hooks consumed by `silo-vmmon`.
+- serial and vsock hooks consumed by `silo-vmm`.
 
 It does not own:
 
@@ -182,7 +182,7 @@ It does not own:
 
 - `config.json` in the instance directory is the canonical machine configuration.
 - `config.json` is written by `libvm` from `silo-core::VmSpec`.
-- `silo-vmmon` receives the explicit configuration path from `libvm`.
+- `silo-vmm` receives the explicit configuration path from `libvm`.
 
 ### Manager metadata
 
@@ -197,7 +197,7 @@ SQLite does not replace `config.json` as the canonical VM boot contract.
 
 ### Runtime truth
 
-- Runtime truth comes from `silo-vmmon` while it is running.
+- Runtime truth comes from `silo-vmm` while it is running.
 - `libvm` may derive convenience status from monitor artifacts, but liveness and readiness are monitor-owned runtime concerns.
 
 ## On-disk Layout
@@ -248,7 +248,7 @@ uses those XDG paths rather than `~/Library/Logs`. Durable data and state roots
 are persisted database identity; the run root is resolved per open.
 
 The private machine log tree is selected only by immutable machine ID. Private
-network instance IDs select ephemeral runtime files, not durable logs. `vmmon`
+network instance IDs select ephemeral runtime files, not durable logs. `vmm`
 and `netd` are each the sole writers for their logs; `vm.exit.json` is an
 atomically replaced lifecycle record. `exec.log` is a bounded best-effort JSON
 Lines output capture and does not provide process attachment or execution
@@ -351,27 +351,27 @@ pub enum NetworkMode {
 
 Guest service configuration used during bootstrap and readiness lives in `silo-core`, but it is not embedded directly inside `VmSpec` today.
 
-## `silo-vmmon` API and Protocol Ownership
+## `silo-vmm` API and Protocol Ownership
 
-`silo-vmmon` exposes one machine-scoped gRPC endpoint on its Unix socket. The host
+`silo-vmm` exposes one machine-scoped gRPC endpoint on its Unix socket. The host
 surface groups monitor state, readiness, metrics, SSH and serial streams, and
 the guest filesystem proxy. `libvm` owns the generated clients and presents
 manager-side domain types to the CLI.
 
-[ADR 0008](0008-vmmon-host-and-guest-grpc-api.md) owns the service inventory,
+[ADR 0008](0008-vmm-host-and-guest-grpc-api.md) owns the service inventory,
 protobuf contract, streaming behavior, readiness, health, reflection, and
 guest-vsock API. This ADR owns only the process boundary.
 
 The host API does not include a VM `Stop` RPC. Shutdown remains signal-driven
 and manager-owned.
 
-## `silo-vmmon` Process Model
+## `silo-vmm` Process Model
 
-> Superseded by [ADR 0018](0018-silo-vmmon-contract.md), which defines the
-> current `silo-vmmon` invocation, descriptors, and worker handoff. The text
+> Superseded by [ADR 0018](0018-silo-vmm-contract.md), which defines the
+> current `silo-vmm` invocation, descriptors, and worker handoff. The text
 > below is kept as the historical record.
 
-`vmmon` is data-dir-driven and per-instance.
+`vmm` is data-dir-driven and per-instance.
 
 The executable accepts:
 
@@ -383,15 +383,15 @@ The executable accepts:
 
 ## Startup and Shutdown Semantics
 
-> Superseded by [ADR 0018](0018-silo-vmmon-contract.md), which defines the
+> Superseded by [ADR 0018](0018-silo-vmm-contract.md), which defines the
 > current startup, shutdown, exit record, and exit command contract. The text
 > below is kept as the historical record.
 
 ### Startup
 
-`libvm` spawns `vmmon` and passes a startup pipe.
+`libvm` spawns `vmm` and passes a startup pipe.
 
-`vmmon` reports a one-shot startup result over that pipe. The current wire format is simple:
+`vmm` reports a one-shot startup result over that pipe. The current wire format is simple:
 
 ```text
 started
@@ -405,21 +405,21 @@ failed\t<message>
 
 This startup handshake is used instead of an RPC `Start` call so the manager does not need to infer readiness by polling sockets or pidfiles.
 
-Start succeeds once `vmmon` has successfully initialized supervision for the VM. It does not require guest readiness, SSH reachability, or guest service readiness.
+Start succeeds once `vmm` has successfully initialized supervision for the VM. It does not require guest readiness, SSH reachability, or guest service readiness.
 
 ### Shutdown
 
-`libvm` stops a machine by signaling `vmmon`.
+`libvm` stops a machine by signaling `vmm`.
 
-The current implementation uses `SIGINT` for the manager-triggered stop path, and `vmmon` also handles `SIGTERM`.
+The current implementation uses `SIGINT` for the manager-triggered stop path, and `vmm` also handles `SIGTERM`.
 
 Shutdown behavior is:
 
 - first signal requests graceful shutdown,
-- `vmmon` transitions runtime state toward stopping,
-- `vmmon` asks `virt` to stop the VM,
+- `vmm` transitions runtime state toward stopping,
+- `vmm` asks `virt` to stop the VM,
 - a second signal forces immediate exit,
-- `vmmon` exits after supervision shuts down.
+- `vmm` exits after supervision shuts down.
 
 Future work may refine signal choice and add a stronger durable exit-state contract, but the architecture remains signal-driven rather than monitor-RPC-driven.
 
@@ -430,9 +430,9 @@ Future work may refine signal choice and add a stronger durable exit-state contr
 - The CLI stays thin and can remain stable across local and future remote modes.
 - One monitor per VM creates a clean operational boundary.
 - Machine startup is config-driven from canonical on-disk state.
-- `silo-vmmon` stays focused on runtime supervision with a small surface area.
+- `silo-vmm` stays focused on runtime supervision with a small surface area.
 - `libvm` can preserve a clean split between daemonless mode now and daemon or tunnel mode later.
-- One typed gRPC endpoint keeps protocol ownership in `libvm` and `silo-vmmon` while the CLI remains transport-agnostic.
+- One typed gRPC endpoint keeps protocol ownership in `libvm` and `silo-vmm` while the CLI remains transport-agnostic.
 
 ### Negative
 
@@ -443,6 +443,6 @@ Future work may refine signal choice and add a stronger durable exit-state contr
 ## Open Questions
 
 - Whether a future remote manager should expose an `InstanceService` wire protocol, and what that exact surface should be.
-- Resolved: `silo-vmmon` persists a durable exit record, `vm.exit.json`, as part of the runtime contract defined by [ADR 0018](0018-silo-vmmon-contract.md).
+- Resolved: `silo-vmm` persists a durable exit record, `vm.exit.json`, as part of the runtime contract defined by [ADR 0018](0018-silo-vmm-contract.md).
 - Resolved: runtime artifacts use explicit `vm.*` names (`vm.pid`, `vm.sock`, `vm.lock`, `vm.exit.json`) instead of the former `id.*` convention.
 - How future tunnel mode should transport manager operations without weakening the daemonless local ABI model.

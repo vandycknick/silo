@@ -16,7 +16,7 @@ export interface RuntimeOpenOptions {
    * `~/.silo`. Generated sockets always live under `/tmp/silo-<uid>`.
    */
   home?: string;
-  /** Explicit `silo-vmmon` override. Remaining components use centralized discovery. */
+  /** Explicit `silo-vmm` override. Remaining components use centralized discovery. */
   supervisorPath?: string;
 }
 

@@ -31,12 +31,12 @@ const DRIVER_NETD: &str = "netd";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-/// Resolved network attachment projected into silo-vmmon and guest-agent inputs.
+/// Resolved network attachment projected into silo-vmm and guest-agent inputs.
 ///
 /// This is neither the public desired network (`MachineNetworkConfig`) nor the stored
 /// network model. Drivers produce this after resolving policy, named networks,
 /// runtime directories, guest settings, and persisted attachments.
-pub(crate) enum VmmonNetworkAttachment {
+pub(crate) enum VmmNetworkAttachment {
     None,
     UnixDatagram {
         path: std::path::PathBuf,
@@ -48,8 +48,8 @@ pub(crate) enum VmmonNetworkAttachment {
     },
 }
 
-impl VmmonNetworkAttachment {
-    pub(crate) fn to_vmmon_arg(&self) -> String {
+impl VmmNetworkAttachment {
+    pub(crate) fn to_vmm_arg(&self) -> String {
         match self {
             Self::None => "none".to_string(),
             Self::UnixDatagram { path, mac, .. } => {
@@ -77,13 +77,13 @@ pub(crate) async fn prepare_network_runtime(
     config: &RuntimeNetworkingConfig,
     netd_path: &Path,
     egress_credentials: &EgressCredentials,
-) -> Result<VmmonNetworkAttachment, LibVmError> {
+) -> Result<VmmNetworkAttachment, LibVmError> {
     reconcile_network_runtime(paths, store, metadata, false).await?;
 
     match metadata.network.clone() {
         ModelMachineNetworkConfig::None => {
             remove_attached_network(paths, store, metadata.id).await?;
-            Ok(VmmonNetworkAttachment::None)
+            Ok(VmmNetworkAttachment::None)
         }
         ModelMachineNetworkConfig::Private { policy, publish } => {
             let request =
@@ -171,7 +171,7 @@ async fn resolve_named_network(
     definition: &ModelNetworkDefinition,
     config: &RuntimeNetworkingConfig,
     egress_credentials: &EgressCredentials,
-) -> Result<VmmonNetworkAttachment, LibVmError> {
+) -> Result<VmmNetworkAttachment, LibVmError> {
     let _ = (paths, store, run_id, config, egress_credentials, definition);
     Err(LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
@@ -185,7 +185,7 @@ async fn prepare_with_driver(
     driver: impl NetworkDriverBackend,
     ctx: &NetworkDriverContext<'_>,
     request: &NetworkAttachmentRequest<'_>,
-) -> Result<VmmonNetworkAttachment, LibVmError> {
+) -> Result<VmmNetworkAttachment, LibVmError> {
     driver.supports(&ctx.metadata.name, request)?;
     driver.prepare(ctx, request).await
 }
@@ -309,7 +309,7 @@ mod tests {
     use crate::store::{MachineStore, MockDataStore, NetworkStore, Store};
     use crate::{LibVmError, RuntimeNetworkingConfig};
 
-    use super::{prepare_network_runtime, reconcile_network_runtime, VmmonNetworkAttachment};
+    use super::{prepare_network_runtime, reconcile_network_runtime, VmmNetworkAttachment};
 
     fn machine_config(
         paths: &LocalPaths,
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn persisted_attachment_without_ca_requirement_defaults_to_false() {
-        let attachment: VmmonNetworkAttachment = serde_json::from_value(json!({
+        let attachment: VmmNetworkAttachment = serde_json::from_value(json!({
             "kind": "unix_datagram",
             "path": "/tmp/net.sock",
             "mac": "02:11:22:33:44:55",
@@ -391,7 +391,7 @@ mod tests {
 
         assert!(!attachment.requires_certificate_authority());
         assert_eq!(
-            attachment.to_vmmon_arg(),
+            attachment.to_vmm_arg(),
             "unixdg,/tmp/net.sock,mac=02:11:22:33:44:55"
         );
     }
@@ -552,7 +552,7 @@ mod tests {
         let state = MachineState {
             machine_id,
             status: MachineRuntimeState::Stopped,
-            vmmon_pid: None,
+            vmm_pid: None,
             started_at: None,
             run_id: None,
             last_error: None,

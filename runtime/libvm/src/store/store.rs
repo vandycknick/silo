@@ -234,7 +234,7 @@ mod tests {
         MachineState {
             machine_id: id,
             status,
-            vmmon_pid: None,
+            vmm_pid: None,
             started_at: None,
             run_id: None,
             last_error: None,
@@ -847,7 +847,7 @@ mod tests {
         seed_machine(&db, &metadata).await;
 
         let state = MachineState {
-            vmmon_pid: Some(1234),
+            vmm_pid: Some(1234),
             started_at: Some(42),
             run_id: Some("run-1".to_string()),
             updated_at: 43,

@@ -50,7 +50,7 @@ pub(crate) struct DaemonStatus {
     pub(crate) machine_id: Option<String>,
     pub(crate) run_id: Option<String>,
     pub(crate) image_digest: Option<String>,
-    /// Backend reported by the running silo-vmmon instance.
+    /// Backend reported by the running silo-vmm instance.
     #[serde(default)]
     pub(crate) actual_backend: Option<String>,
     pub(crate) docker_socket: String,
@@ -389,7 +389,7 @@ async fn reconcile_ready(
 /// Engine health probe cadence.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 /// Idle-detector cadence; the guest agent reports metrics every 5 seconds.
-/// Supervisor tick: refreshes status from silo-vmmon metrics and, every `HEALTH_INTERVAL`,
+/// Supervisor tick: refreshes status from silo-vmm metrics and, every `HEALTH_INTERVAL`,
 /// probes the Docker socket.
 const TICK_INTERVAL: Duration = Duration::from_secs(5);
 

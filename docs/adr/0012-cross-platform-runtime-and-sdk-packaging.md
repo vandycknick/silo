@@ -6,9 +6,9 @@ Updated: 2026-09-24
 
 ## Status
 
-Accepted. The current `silo-vmmon` and `silo-krun` worker contract is defined by
-[ADR 0018](0018-silo-vmmon-contract.md) and described in
-[the silo-vmmon architecture](../architecture/silo-vmmon.md). The host state
+Accepted. The current `silo-vmm` and `krun` worker contract is defined by
+[ADR 0018](0018-silo-vmm-contract.md) and described in
+[the silo-vmm architecture](../architecture/silo-vmm.md). The host state
 layout is defined by [ADR 0017](0017-single-host-state-root.md). Historical rollout
 and verification notes below describe their original revisions, not current
 standalone-helper requirements.
@@ -24,8 +24,8 @@ CLI, Rust consumer, or language SDK
         v
       libvm
         |
-        +-- silo-vmmon supervisor
-        |     +-- silo-krun worker, same executable (Linux/macOS default)
+        +-- silo-vmm supervisor
+        |     +-- krun worker, same executable (Linux/macOS default)
         |     `-- Virtualization.framework (explicit macOS override)
         |
         +-- netd
@@ -132,7 +132,7 @@ promise concerns the GNU/Linux ABI baseline and portable archive, not a specific
 Linux distribution release or package manager.
 
 VZ remains the only selected macOS backend. Silo packages and signs the krun
-backend inside `silo-vmmon` on macOS so a later backend selector does not require a new distribution
+backend inside `silo-vmm` on macOS so a later backend selector does not require a new distribution
 layout. Packaging a backend does not make it selectable.
 
 The default kernel, initramfs, and agent always match the target architecture.
@@ -165,7 +165,7 @@ The portable runtime root has this fixed layout:
 ```text
 <runtime-root>/
   bin/
-    silo-vmmon
+    silo-vmm
     netd
   assets/
     kernel-default
@@ -173,13 +173,13 @@ The portable runtime root has this fixed layout:
     agent
 ```
 
-All five files are included for every initial target. `silo-vmmon` contains the
+All five files are included for every initial target. `silo-vmm` contains the
 pinned Silo libkrun fork directly, executing it only in a separate private worker
-process: the same executable started with argv[0] `silo-krun` and no arguments,
+process: the same executable started with argv[0] `krun` and no arguments,
 configured only through a fixed inherited descriptor table
-([ADR 0018](0018-silo-vmmon-contract.md)). The payload does not contain a standalone krun,
+([ADR 0018](0018-silo-vmm-contract.md)). The payload does not contain a standalone krun,
 `libkrun.so`, `libkrun.dylib`, or `libkrunfw`. Libvm and language bindings launch
-silo-vmmon; they do not link libkrun.
+silo-vmm; they do not link libkrun.
 
 The runtime payload does not inherently include the `silo` CLI. Product archives
 add the CLI and SDK packages add their native binding. A complete portable CLI
@@ -189,7 +189,7 @@ archive has this layout:
 silo-<version>-<target>/
   bin/
     silo
-    silo-vmmon
+    silo-vmm
     netd
   assets/
     kernel-default
@@ -208,7 +208,7 @@ profile directory:
 ```text
 <cargo-target-dir>/debug/
   silo
-  silo-vmmon
+  silo-vmm
   netd
   assets/
     kernel-default
@@ -272,7 +272,7 @@ native host target:
 
 1. Enter the Nix `.#release` shell pinned by `flake.lock` and
    `rust-toolchain.toml`.
-1. Build `silo`, `silo-vmmon`, and `netd` for the current host OS and CPU.
+1. Build `silo`, `silo-vmm`, and `netd` for the current host OS and CPU.
 1. Use committed lockfiles and locked dependency resolution.
 1. Build the guest initramfs and standalone agent as static-musl Linux programs
    for the same CPU.
@@ -342,7 +342,7 @@ never part of that state.
 
 The immutable machine ID owns every durable machine log. A private network's
 changing runtime instance ID owns only its generated socket, PID, policy, and
-optional capture files, never a durable log directory. `silo-vmmon` and `netd`
+optional capture files, never a durable log directory. `silo-vmm` and `netd`
 write the durable files; neither provides persisted-log RPCs. `libvm`, including
 its Node binding, reads one semantic source at a time (`monitor`, `serial`,
 `exec`, `network`, or `network-audit`) without exposing paths or filenames.
@@ -365,7 +365,7 @@ Runtime discovery produces one immutable in-memory component set, conceptually:
 
 ```rust
 struct ResolvedRuntimeComponents {
-    supervisor: PathBuf, // silo-vmmon
+    supervisor: PathBuf, // silo-vmm
     netd: PathBuf,
     kernel: PathBuf,
     initramfs: PathBuf,
@@ -397,7 +397,7 @@ Resolution follows this order:
 Existing environment controls remain available while lookup is centralized:
 
 ```text
-SILO_VMMON_PATH
+SILO_VMM_PATH
 NETD_BIN
 SILO_ASSET_DIR
 ```
@@ -407,7 +407,7 @@ paths can replace individual files for testing and embedding. All explicit
 paths are absolute. A malformed authoritative input, including a relative or
 incomplete `SILO_RUNTIME_DIR`, fails immediately instead of falling through to
 lower-precedence discovery. Portable-root resolution verifies that derived paths
-remain below the selected root and are regular files. `silo-vmmon`, `netd`, and
+remain below the selected root and are regular files. `silo-vmm`, `netd`, and
 `agent` must be executable. `kernel-default` and `initramfs` must be
 readable but need not be executable.
 
@@ -430,7 +430,7 @@ adjacent development layout is:
 ```text
 <cargo-target-dir>/debug/
   silo
-  silo-vmmon
+  silo-vmm
   netd
   assets/
     kernel-default
@@ -453,7 +453,7 @@ derives and validates this fixed layout:
 <portable-root>/
   bin/
     silo
-    silo-vmmon
+    silo-vmm
     netd
   assets/
     kernel-default
@@ -473,7 +473,7 @@ minimum system version.
 
 `PATH` is disabled unless `SILO_ASSET_DIR` is explicitly set and successfully
 validates as one complete asset set. When enabled, resolution considers PATH
-entries in order, considers only absolute entries, and requires `silo-vmmon` and
+entries in order, considers only absolute entries, and requires `silo-vmm` and
 `netd` to exist and be executable in one entry. It never combines helpers
 from different PATH entries, and higher-precedence explicit helper overrides
 still apply. Empty and relative PATH entries are not resolved against the
@@ -534,7 +534,7 @@ Silo.app/
     MacOS/
       silo
     Helpers/
-      silo-vmmon
+      silo-vmm
       netd
     Resources/
       assets/
@@ -546,7 +546,7 @@ Silo.app/
 The layout defines the component paths without a Silo-specific manifest:
 
 ```text
-silo-vmmon = Contents/Helpers/silo-vmmon
+silo-vmm = Contents/Helpers/silo-vmm
 netd       = Contents/Helpers/netd
 kernel     = Contents/Resources/assets/kernel-default
 initramfs  = Contents/Resources/assets/initramfs
@@ -582,7 +582,7 @@ preserves Homebrew Cask invocation:
         v
 /Applications/Silo.app/Contents/MacOS/silo
         |
-        +-- ../Helpers/silo-vmmon
+        +-- ../Helpers/silo-vmm
         +-- ../Helpers/netd
         `-- ../Resources/assets
 ```
@@ -623,9 +623,9 @@ $HOME/.local/bin/silo -> ~/Applications/Silo.app/Contents/MacOS/silo
 ```
 
 Production signing happens after the complete app is assembled. Nested code is
-signed from the inside out without `codesign --deep`. `silo-vmmon` receives both
+signed from the inside out without `codesign --deep`. `silo-vmm` receives both
 the Virtualization and Hypervisor entitlements from
-`virt/vmmon/silo-vmmon.entitlements`, because its VZ backend and its `silo-krun`
+`virt/vmm/silo-vmm.entitlements`, because its VZ backend and its `krun`
 worker mode are the same signed executable. Other
 entitlements are granted only when their need is demonstrated for that
 executable. The CLI and `netd` do not inherit virtualization entitlements merely
@@ -674,7 +674,7 @@ The portable CLI archives expand to:
 silo-<version>-linux-amd64-gnu/
   bin/
     silo
-    silo-vmmon
+    silo-vmm
     netd
   assets/
     kernel-default
@@ -684,7 +684,7 @@ silo-<version>-linux-amd64-gnu/
 silo-<version>-linux-arm64-gnu/
   bin/
     silo
-    silo-vmmon
+    silo-vmm
     netd
   assets/
     kernel-default
@@ -785,7 +785,7 @@ native/
   silo.node
 runtime/
   bin/
-    silo-vmmon
+    silo-vmm
     netd
   assets/
     kernel-default
@@ -810,7 +810,7 @@ silo/
   <native-extension>
   _runtime/
     bin/
-      silo-vmmon
+      silo-vmm
       netd
     assets/
       kernel-default
@@ -933,7 +933,7 @@ in that environment rather than repeating deep binary qualification.
 - A Homebrew-style command symlink resolves the containing app.
 - Gatekeeper accepts the app and the stapled notarization validates.
 - VZ boots a VM using only packaged files.
-- The dormant krun backend in `silo-vmmon` has a valid Hypervisor entitlement and signature.
+- The dormant krun backend in `silo-vmm` has a valid Hypervisor entitlement and signature.
 - Boundary qualification confirms that host binaries use Apple system libraries
   and frameworks and that `netd` has no Nix dynamic-library dependency.
 
@@ -1005,7 +1005,7 @@ asset set rather than falling through independently across directories.
 - Silo avoids distribution-specific native package production and qualification
   while downstream maintainers can repackage immutable official bytes.
 - `libvm` remains a runtime library rather than a package manager.
-- Compiling the pinned libkrun fork into `silo-vmmon` removes a loader, RPATH,
+- Compiling the pinned libkrun fork into `silo-vmm` removes a loader, RPATH,
   and nested-signing failure class.
 
 ### Tradeoffs
@@ -1135,6 +1135,6 @@ and release staging contract in this ADR support them without replacement.
 - [PEP 600: Future `manylinux` platform tags](https://peps.python.org/pep-0600/)
 - [Go Modules Reference: Authenticating modules](https://go.dev/ref/mod#authenticating)
 
-The krun backend executes as the private `silo-krun` worker mode of `silo-vmmon`.
-Runtime payloads contain the `silo-vmmon` and `netd` executables. `silo-vmmon`
+The krun backend executes as the private `krun` worker mode of `silo-vmm`.
+Runtime payloads contain the `silo-vmm` and `netd` executables. `silo-vmm`
 requires the union of the virtualization and hypervisor macOS entitlements.

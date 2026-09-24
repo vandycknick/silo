@@ -1,6 +1,6 @@
 # libkrun Implicit Behaviors
 
-Silo executes libkrun in a private worker: the `silo-vmmon` executable started with argv[0] `silo-krun` and a fixed descriptor table (see [silo-vmmon architecture](silo-vmmon.md)). The krun engine in `virt/vmmon/src/krun` constructs the VM explicitly from one typed `KrunConfig`; it does not launch processes. At the pinned native Rust API revision, `VmmBuilder` starts without implicit console, vsock, balloon, or RNG devices and does not inject a default init binary. Silo adds every required device explicitly.
+Silo executes libkrun in a private worker: the `silo-vmm` executable started with argv[0] `krun` and a fixed descriptor table (see [silo-vmm architecture](silo-vmm.md)). The krun engine in `virt/vmm/src/krun` constructs the VM explicitly from one typed `KrunConfig`; it does not launch processes. At the pinned native Rust API revision, `VmmBuilder` starts without implicit console, vsock, balloon, or RNG devices and does not inject a default init binary. Silo adds every required device explicitly.
 
 ## Runtime Defaults
 
@@ -11,7 +11,7 @@ Every worker-created VMM does the following:
 3. Add console, disks, mounts, the native vsock control-channel device, and networking when configured, in that deterministic order.
 4. Add explicit RNG and balloon devices. Host memory release remains disabled unless the separate reclaim policy and startup qualification enable it.
 
-The worker does not use the compatibility C API. If a console is needed, it builds `ConsoleDevice::builder().add_default_console(...)` with borrowed stdio descriptors and selects `hvc0` on `VmmBuilder`. On Linux and macOS, when `KrunConfig.vsock_mux` is set, silo-vmmon passes one connected Unix stream descriptor to the worker as fd 7, and the worker constructs a native `VsockDevice` with CID 3 and empty TSI flags, then gives the descriptor to libkrun's control-channel mux. Per-connection descriptors cross that private channel with `SCM_RIGHTS`; stream payloads do not. The worker configures no per-port mappings and the transport binds no filesystem path.
+The worker does not use the compatibility C API. If a console is needed, it builds `ConsoleDevice::builder().add_default_console(...)` with borrowed stdio descriptors and selects `hvc0` on `VmmBuilder`. On Linux and macOS, when `KrunConfig.vsock_mux` is set, silo-vmm passes one connected Unix stream descriptor to the worker as fd 7, and the worker constructs a native `VsockDevice` with CID 3 and empty TSI flags, then gives the descriptor to libkrun's control-channel mux. Per-connection descriptors cross that private channel with `SCM_RIGHTS`; stream payloads do not. The worker configures no per-port mappings and the transport binds no filesystem path.
 
 The historical `krun_set_port_map()` API is intentionally not part of Silo's startup path. It controls TSI stream remapping, not explicit virtio-net backends or Silo's native control-channel vsock device.
 

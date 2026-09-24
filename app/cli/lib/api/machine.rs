@@ -46,7 +46,7 @@ impl AppMachine {
         &self,
         run_id: MachineRunId,
     ) -> Result<MachineData, libvm::LibVmError> {
-        // silo-vmmon can spend 45s stopping the backend, then drain its services.
+        // silo-vmm can spend 45s stopping the backend, then drain its services.
         // Give that sequence room to finish before escalating a stuck monitor.
         self.inner
             .stop_run_with(

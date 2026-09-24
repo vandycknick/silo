@@ -31,7 +31,7 @@ ability to select custom assets independently, and a small launch-specific
 delivery mechanism.
 
 This ADR owns pre-boot materialization and handoff to the agent. [ADR
-0008](0008-vmmon-host-and-guest-grpc-api.md) owns everything after that handoff:
+0008](0008-vmm-host-and-guest-grpc-api.md) owns everything after that handoff:
 post-boot discovery, readiness, status, metrics, and control.
 
 ## Where Reusable And Per-Launch State Meet
@@ -67,7 +67,7 @@ Consider one managed VM start.
    file, appends a launch-specific archive containing the agent and that exact
    JSON, closes it, and atomically renames it into the managed machine path.
    It writes the resulting path into the generated launch specification and
-   starts `silo-vmmon` only once every generated input is complete.
+   starts `silo-vmm` only once every generated input is complete.
 4. Linux expands the base and appended archive members into the same early root.
    The base supplies `/init`; the appended member supplies `/agent/silo-agent`
    and `/agent/config.json`.
@@ -203,7 +203,7 @@ While holding the machine lifecycle boundary, `libvm`:
 4. Serializes the typed configuration to JSON.
 5. Creates the composite initramfs at a managed machine path.
 6. Writes the generated launch specification with the composite path.
-7. Starts `silo-vmmon` only after every generated launch input is complete.
+7. Starts `silo-vmm` only after every generated launch input is complete.
 
 The persisted `MachineConfig` retains only explicit kernel, base-initramfs, and
 custom or disabled agent choices. Agent selection is not part of `VmSpec`.
@@ -220,7 +220,7 @@ base and overlay bytes are written and the temporary file closes successfully,
 `libvm` atomically renames it over the prior derived artifact. Failed writes
 leave no partially updated launch artifact.
 
-`silo-vmmon` receives only the generated VM specification and resolved base or
+`silo-vmm` receives only the generated VM specification and resolved base or
 composite initramfs path. It does not resolve the agent, parse `AgentConfig`,
 write CPIO entries, or serve boot configuration. Whether post-boot guest-agent
 services are expected is launch policy owned by ADR 0008, not a `VmSpec`
@@ -355,7 +355,7 @@ Unit and integration tests cover:
 - Disabled launches without an overlay or agent readiness requirement.
 - Custom-agent composition.
 - Explicit custom-initramfs composition.
-- Launch failure before `silo-vmmon` starts when generation fails.
+- Launch failure before `silo-vmm` starts when generation fails.
 - Copying both payloads into the early `/run` mount.
 - Rescue behavior for each missing, invalid, and failed-copy payload.
 - Agent configuration parsing and validation when invoked with
@@ -382,7 +382,7 @@ added; it does not weaken the archive or guest preparation contract.
 - Agent configuration delivery does not depend on guest networking or a host
   configuration service.
 - The base is never unpacked or recompressed during normal launch.
-- `silo-vmmon` remains focused on supervision and post-boot control surfaces.
+- `silo-vmm` remains focused on supervision and post-boot control surfaces.
 - An explicit configuration argument makes tests and alternate launch modes
   straightforward.
 - Machine-specific configuration never modifies the guest root disk.
