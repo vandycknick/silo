@@ -1,19 +1,39 @@
+//! In-place system image upgrades, owned entirely by the running silod.
+//!
+//! ```text
+//!  check ──► qualify (throwaway VM, engine keeps serving)
+//!              │
+//!              ▼
+//!  stop active VM ──► pending record ──► back up data disk ──► candidate VM
+//!                                                                  │
+//!               recover ◄── any failure ◄── validate candidate ◄───┘
+//!                  │                              │ passes
+//!                  ▼                              ▼
+//!          previous VM active            commit (complete) ──► Ready ──► finalize
+//! ```
+//!
+//! A crash at any point leaves a record `recover` or `finalize` can act on at the
+//! next start.
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use eyre::{bail, Context as _};
-use libvm::{ExecutionResult, ImageProgressSender, MachineReadinessOutcome, MachineStatus};
+use libvm::{ExecutionResult, ImagePullPolicy, MachineData, MachineReadinessOutcome};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::api::AppApi;
-use crate::system::config::ResolvedSystemConfig;
-use crate::system::record::{DaemonRecord, SystemPaths};
-use crate::system::service::OperationLock;
-use crate::system::storage::validate_data_image;
-use crate::system::supervisor::{LifetimeLock, READY_TIMEOUT};
+use crate::config::{DesiredSystem, ResolvedSystemConfig};
+use crate::engine::READY_TIMEOUT;
+use crate::paths::SystemPaths;
+use crate::provision::{is_installation_machine, is_live, validate_installation, validate_machine};
+use crate::record::DaemonRecord;
+use crate::runtime::SystemRuntime;
+use crate::storage::validate_data_image;
+use crate::supervisor::append_log;
+
+const QUALIFICATION_PREFIX: &str = "silo-system-qualification-";
 
 /// Only facts needed to undo an upgrade. VM status and image metadata stay in libvm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,19 +45,12 @@ pub(crate) struct UpgradeRecord {
     pub(crate) previous_configured_image: String,
     pub(crate) candidate_machine_id: Option<String>,
     pub(crate) backup_size: Option<u64>,
-    pub(crate) service_was_enabled: bool,
+    /// The candidate passed validation and is the active VM. It becomes permanent
+    /// (`finalize`) once it reaches Ready under the supervisor.
     pub(crate) complete: bool,
 }
 
 impl UpgradeRecord {
-    pub(crate) fn is_complete(&self) -> bool {
-        self.complete
-    }
-
-    pub(crate) fn owns_machine(&self, id: &str) -> bool {
-        self.candidate_machine_id.as_deref() == Some(id) || self.previous_machine_id == id
-    }
-
     pub(crate) fn validate(&self, state: &DaemonRecord) -> eyre::Result<()> {
         if self.previous_machine_id.is_empty()
             || self.previous_config.data_size_bytes != state.data_size_bytes
@@ -73,62 +86,78 @@ impl UpgradeRecord {
 
     fn backup_path(&self, paths: &SystemPaths) -> PathBuf {
         paths
-            .daemon_data()
-            .join("backups")
+            .backups()
             .join(format!("data-{}.img", self.operation_id))
     }
 }
 
-pub(crate) async fn upgrade(
-    paths: &SystemPaths,
-    config: ResolvedSystemConfig,
-    image: &str,
-) -> eyre::Result<()> {
-    let _operation = OperationLock::acquire(&paths.operation_lock())?;
-    let mut state = DaemonRecord::load(paths)?
-        .ok_or_else(|| eyre::eyre!("system VM is not installed; run `silo daemon up` first"))?;
-    crate::system::provision::validate_installation(&state, &config)?;
-    let old_id = state.machine_id()?.to_string();
-    let networking = state.service.global_config()?.networking;
-    let runtime = state.service.runtime_config(&config, networking);
-    let mut api = AppApi::local(runtime);
-    let old_machine = api.inspect_machine(&old_id).await?;
-    crate::system::provision::validate_machine(&old_machine, &state, &paths.data_image())?;
-
-    let (progress, _receiver) = ImageProgressSender::channel(1);
-    let source = api.resolve_system_image(image, progress).await?;
-    validate_target(&source)?;
-    let configured_image = config.image.clone();
-    let mut target_config = config;
-    target_config.image = source.image.selected_reference.clone();
-    let same_image = old_machine
+/// Resolves `reference` and returns it when it names a different manifest than
+/// `active` runs. A tag is asked of the registry; a digest cannot change.
+pub(crate) async fn check(
+    runtime: &mut SystemRuntime,
+    reference: &str,
+    active: &MachineData,
+) -> eyre::Result<Option<libvm::ResolvedOciImage>> {
+    let policy = if reference.contains("@sha256:") {
+        ImagePullPolicy::IfMissing
+    } else {
+        ImagePullPolicy::Always
+    };
+    let image = runtime
+        .resolve_image(reference, policy)
+        .await
+        .with_context(|| format!("check {reference} for a newer system image"))?;
+    let current = active
         .rootfs
         .as_ref()
-        .and_then(|rootfs| rootfs.selected_manifest_digest.as_deref())
-        == Some(source.image.manifest_digest.as_str());
-    if same_image && state.config.image == configured_image {
-        return Ok(());
+        .and_then(|rootfs| rootfs.selected_manifest_digest.as_deref());
+    if current == Some(image.manifest_digest.as_str()) {
+        return Ok(None);
     }
-    if !same_image {
-        qualify_candidate_image(&mut api, paths, &target_config, source.image.clone()).await?;
+    validate_target(&image)?;
+    Ok(Some(image))
+}
+
+/// Boots `image` against a throwaway data disk and validates it, without touching
+/// the active VM. Cancelling this future can leave a qualification VM behind;
+/// [`remove_abandoned_qualifications`] reclaims it.
+pub(crate) async fn qualify(
+    runtime: &mut SystemRuntime,
+    paths: &SystemPaths,
+    desired: &DesiredSystem,
+    image: libvm::ResolvedOciImage,
+) -> eyre::Result<()> {
+    let config = ResolvedSystemConfig {
+        image: image.selected_reference.clone(),
+        ..desired.config.clone()
+    };
+    qualify_candidate_image(runtime, paths, &config, image).await
+}
+
+/// Replaces the stopped active VM with one built from `image`, committing only once
+/// the candidate validates. On error the recorded transaction is left for
+/// [`recover`].
+pub(crate) async fn replace(
+    runtime: &mut SystemRuntime,
+    paths: &SystemPaths,
+    desired: &DesiredSystem,
+    image: libvm::ResolvedOciImage,
+) -> eyre::Result<()> {
+    let mut state = DaemonRecord::load(paths)?
+        .ok_or_else(|| eyre::eyre!("the system installation record is missing"))?;
+    if state.upgrade.is_some() {
+        bail!("a previous system image upgrade has not been finalized");
     }
-    let service_was_enabled = crate::system::service::is_enabled()?;
-    crate::system::service::stop_locked(&state)?;
-    let lifetime = acquire_lifetime(paths, Duration::from_secs(90))?;
-    ensure_machine_stopped(&mut api, &old_id).await?;
-    // The supervisor has exited, so it can no longer overwrite this transaction.
-    state = DaemonRecord::load(paths)?.ok_or_else(|| eyre::eyre!("daemon state disappeared"))?;
-    state.require_no_pending_upgrade()?;
-    if same_image {
-        state.config.image = target_config.image;
-        state.configured_image = configured_image;
-        state.save(paths)?;
-        drop(lifetime);
-        if service_was_enabled {
-            crate::system::service::start_locked(&state)?;
-        }
-        return Ok(());
-    }
+    let target_config = ResolvedSystemConfig {
+        image: image.selected_reference.clone(),
+        ..desired.config.clone()
+    };
+    validate_installation(&state, &target_config)?;
+    let old_id = state.machine_id()?.to_string();
+    let old_machine = runtime.inspect_machine(&old_id).await?;
+    validate_machine(&old_machine, &state, &paths.data_image())?;
+    ensure_machine_stopped(runtime, &old_id).await?;
+
     let mut pending = UpgradeRecord {
         operation_id: Uuid::new_v4(),
         previous_machine_id: old_id,
@@ -136,7 +165,6 @@ pub(crate) async fn upgrade(
         previous_configured_image: state.configured_image.clone(),
         candidate_machine_id: None,
         backup_size: None,
-        service_was_enabled,
         complete: false,
     };
     state.upgrade = Some(pending.clone());
@@ -149,7 +177,7 @@ pub(crate) async fn upgrade(
         state.data_uuid,
     )?;
     let backup_path = pending.backup_path(paths);
-    std::fs::create_dir_all(paths.daemon_data().join("backups"))?;
+    std::fs::create_dir_all(paths.backups())?;
     let backup_size = sparse_copy(&paths.data_image(), &backup_path)?;
     validate_data_image(
         &backup_path,
@@ -162,62 +190,81 @@ pub(crate) async fn upgrade(
     state.save(paths)?;
 
     let candidate_name = pending.candidate_name();
-    api.ensure_name_available(&candidate_name).await?;
-    let candidate = api
+    runtime.ensure_name_available(&candidate_name).await?;
+    let candidate = runtime
         .create_system_machine(
             &candidate_name,
             &target_config,
             state.installation_id,
             &paths.data_image(),
-            source,
+            image,
         )
         .await?;
     pending.candidate_machine_id = Some(candidate.id.clone());
     state.upgrade = Some(pending.clone());
     state.save(paths)?;
-    validate_candidate(&mut api, &candidate.id, state.data_uuid, &target_config).await?;
+    validate_candidate(runtime, &candidate.id, state.data_uuid, &target_config).await?;
 
     state.machine_id = Some(candidate.id);
     state.config = target_config;
-    state.configured_image = configured_image;
+    state.configured_image = desired.image.clone();
     pending.complete = true;
     state.upgrade = Some(pending);
-    state.save(paths)?;
-    drop(lifetime);
-    if service_was_enabled {
-        let started = chrono::Utc::now();
-        crate::system::service::start_locked(&state)?;
-        crate::system::service::wait_ready(paths, started, Duration::from_secs(120))?;
-    }
-    Ok(())
+    state.save(paths)
 }
 
-pub(crate) async fn recover(paths: &SystemPaths) -> eyre::Result<()> {
-    let _operation = OperationLock::acquire(&paths.operation_lock())?;
-    let state = DaemonRecord::load(paths)?.ok_or_else(|| eyre::eyre!("daemon is not installed"))?;
+/// Makes a committed upgrade permanent: removes the previous VM and the data backup.
+/// Without a committed upgrade this does nothing.
+pub(crate) async fn finalize(runtime: &mut SystemRuntime, paths: &SystemPaths) -> eyre::Result<()> {
+    let Some(mut state) = DaemonRecord::load(paths)? else {
+        return Ok(());
+    };
+    let Some(record) = state.upgrade.clone().filter(|upgrade| upgrade.complete) else {
+        return Ok(());
+    };
+    match runtime.inspect_machine(&record.previous_machine_id).await {
+        Ok(previous) => {
+            if !is_installation_machine(&previous, state.installation_id) {
+                bail!("previous system VM is not owned by this installation");
+            }
+            ensure_machine_stopped(runtime, &previous.id).await?;
+            runtime.remove_machine(&previous.id).await?;
+        }
+        Err(error)
+            if error
+                .downcast_ref::<libvm::LibVmError>()
+                .is_some_and(|error| {
+                    matches!(error, libvm::LibVmError::MachineNotFound { .. })
+                }) => {}
+        Err(error) => return Err(error),
+    }
+    remove_backup(&record.backup_path(paths))?;
+    state.upgrade = None;
+    state.save(paths)
+}
+
+/// Restores the VM, configuration, and engine data from before the recorded
+/// upgrade, whether it was interrupted or committed but never became Ready.
+pub(crate) async fn recover(runtime: &mut SystemRuntime, paths: &SystemPaths) -> eyre::Result<()> {
+    let state = DaemonRecord::load(paths)?
+        .ok_or_else(|| eyre::eyre!("the system installation record is missing"))?;
     let record = state
         .upgrade
         .as_ref()
         .ok_or_else(|| eyre::eyre!("there is no recorded system image upgrade to recover"))?;
     record.validate(&state)?;
-    let networking = state.service.global_config()?.networking;
-    let runtime = state
-        .service
-        .runtime_config(&record.previous_config, networking);
-    let mut api = AppApi::local(runtime);
-    crate::system::service::stop_locked(&state)?;
-    let lifetime = acquire_lifetime(paths, Duration::from_secs(90))?;
     // Creation may have finished just before a crash prevented recording the ID.
     let candidate = match &record.candidate_machine_id {
-        Some(id) => Some(api.inspect_machine(id).await?),
+        Some(id) => Some(runtime.inspect_machine(id).await?),
         None => {
-            let mut candidates = api.list_machines().await?.into_iter().filter(|machine| {
-                machine.name == record.candidate_name()
-                    && crate::system::ownership::is_matching_managed_candidate(
-                        machine,
-                        state.installation_id,
-                    )
-            });
+            let mut candidates = runtime
+                .list_machines()
+                .await?
+                .into_iter()
+                .filter(|machine| {
+                    machine.name == record.candidate_name()
+                        && is_installation_machine(machine, state.installation_id)
+                });
             let candidate = candidates.next();
             if candidates.next().is_some() {
                 bail!(
@@ -228,23 +275,23 @@ pub(crate) async fn recover(paths: &SystemPaths) -> eyre::Result<()> {
         }
     };
     if let Some(candidate) = &candidate {
-        if !crate::system::ownership::is_matching_managed_candidate(
-            candidate,
-            state.installation_id,
-        ) {
+        if !is_installation_machine(candidate, state.installation_id) {
             bail!("upgrade candidate is not owned by this installation");
         }
-        ensure_machine_stopped(&mut api, &candidate.id).await?;
+        ensure_machine_stopped(runtime, &candidate.id).await?;
     }
     let restored = record.restored_state(&state);
     let old_id = &record.previous_machine_id;
-    let old_machine = api.inspect_machine(old_id).await?;
-    crate::system::provision::validate_machine(&old_machine, &restored, &paths.data_image())?;
-    ensure_machine_stopped(&mut api, old_id).await?;
+    let old_machine = runtime.inspect_machine(old_id).await?;
+    validate_machine(&old_machine, &restored, &paths.data_image())?;
+    ensure_machine_stopped(runtime, old_id).await?;
     if let Some(size) = record.backup_size {
         let backup = record.backup_path(paths);
         validate_data_image(&backup, size, state.installation_id, state.data_uuid)?;
-        eprintln!("warning: recovery restores engine data to the pre-upgrade backup and discards all later writes");
+        append_log(
+            paths,
+            "restoring engine data from the pre-upgrade backup; later writes are discarded",
+        )?;
         restore_backup(&backup, &paths.data_image())?;
         validate_data_image(
             &paths.data_image(),
@@ -257,29 +304,68 @@ pub(crate) async fn recover(paths: &SystemPaths) -> eyre::Result<()> {
     }
     restored.save(paths)?;
     if let Some(candidate) = candidate {
-        if let Err(error) = api.remove_machine(&candidate.id, false).await {
-            eprintln!(
-                "warning: could not remove stopped upgrade candidate {}: {error:#}",
-                candidate.id
-            );
+        if let Err(error) = runtime.remove_machine(&candidate.id).await {
+            append_log(
+                paths,
+                &format!(
+                    "could not remove stopped upgrade candidate {}: {error:#}",
+                    candidate.id
+                ),
+            )?;
         }
     }
-    drop(lifetime);
-    if record.service_was_enabled {
-        crate::system::service::start_locked(&restored)?;
+    remove_backup(&record.backup_path(paths))
+}
+
+fn remove_backup(path: &Path) -> eyre::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove the pre-upgrade data backup"),
+    }
+}
+
+/// Removes qualification VMs and their throwaway disks left by a cancelled or
+/// crashed qualification.
+pub(crate) async fn remove_abandoned_qualifications(
+    runtime: &mut SystemRuntime,
+    paths: &SystemPaths,
+) -> eyre::Result<()> {
+    for machine in runtime.list_machines().await? {
+        if machine.name.starts_with(QUALIFICATION_PREFIX)
+            && silod_spec::labels::is_system_managed(&machine.labels)
+        {
+            ensure_machine_stopped(runtime, &machine.id).await?;
+            runtime.remove_machine(&machine.id).await?;
+        }
+    }
+    let entries = match std::fs::read_dir(paths.run_root()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("upgrade-qualification-"))
+        {
+            std::fs::remove_dir_all(entry.path())?;
+        }
     }
     Ok(())
 }
 
 async fn qualify_candidate_image(
-    api: &mut AppApi,
+    runtime: &mut SystemRuntime,
     paths: &SystemPaths,
     config: &ResolvedSystemConfig,
     image: libvm::ResolvedOciImage,
 ) -> eyre::Result<()> {
-    std::fs::create_dir_all(&paths.run_root)?;
+    std::fs::create_dir_all(paths.run_root())?;
     let installation_id = Uuid::new_v4();
-    let temporary = paths.run_root.join(format!(
+    let temporary = paths.run_root().join(format!(
         "upgrade-qualification-{}",
         installation_id.simple()
     ));
@@ -291,27 +377,23 @@ async fn qualify_candidate_image(
     }
     let data_uuid = Uuid::new_v4();
     let data_image = temporary.join("data.img");
-    crate::system::storage::ensure_data_image(
-        &data_image,
-        512 * 1024 * 1024,
-        installation_id,
-        data_uuid,
-    )?;
+    crate::storage::ensure_data_image(&data_image, 512 * 1024 * 1024, installation_id, data_uuid)?;
     let mut qualification_config = config.clone();
     qualification_config.docker_socket = temporary.join("docker.sock");
-    let name = format!("silo-system-qualification-{}", installation_id.simple());
-    api.ensure_name_available(&name).await?;
-    let candidate = api
+    let name = format!("{QUALIFICATION_PREFIX}{}", installation_id.simple());
+    runtime.ensure_name_available(&name).await?;
+    let candidate = runtime
         .create_system_machine(
             &name,
             &qualification_config,
             installation_id,
             &data_image,
-            crate::api::types::SystemImageResolution { image },
+            image,
         )
         .await?;
-    let validation = validate_candidate(api, &candidate.id, data_uuid, &qualification_config).await;
-    let removal = api.remove_machine(&candidate.id, false).await;
+    let validation =
+        validate_candidate(runtime, &candidate.id, data_uuid, &qualification_config).await;
+    let removal = runtime.remove_machine(&candidate.id).await;
     if let Err(error) = removal {
         validation?;
         return Err(error).with_context(|| {
@@ -326,17 +408,16 @@ async fn qualify_candidate_image(
     Ok(())
 }
 
-fn validate_target(source: &crate::api::types::SystemImageResolution) -> eyre::Result<()> {
+fn validate_target(image: &libvm::ResolvedOciImage) -> eyre::Result<()> {
     let expected_arch = match std::env::consts::ARCH {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
         architecture => bail!("unsupported host architecture {architecture}"),
     };
-    if source.image.platform.os != "linux" || source.image.platform.architecture != expected_arch {
+    if image.platform.os != "linux" || image.platform.architecture != expected_arch {
         bail!("resolved system image platform is incompatible with this host");
     }
-    let labels = source
-        .image
+    let labels = image
         .config
         .labels
         .as_ref()
@@ -355,14 +436,14 @@ fn validate_target(source: &crate::api::types::SystemImageResolution) -> eyre::R
 }
 
 async fn validate_candidate(
-    api: &mut AppApi,
+    runtime: &mut SystemRuntime,
     machine_id: &str,
     data_uuid: Uuid,
     config: &ResolvedSystemConfig,
 ) -> eyre::Result<()> {
-    let machine = api.machine(machine_id).await?;
+    let machine = runtime.machine(machine_id).await?;
     let machine_data = machine.inspect().await?;
-    let options = api.machine_start_options(&machine, false).await?;
+    let options = libvm::MachineStartOptions::new();
     let run_id = machine.start_with_options(options).await?.run_id;
     let validation = async {
         let readiness = machine.wait_ready(READY_TIMEOUT).await?;
@@ -373,27 +454,18 @@ async fn validate_candidate(
             );
         }
         validate_guest_manifest(&machine).await?;
-        crate::system::supervisor::activate(&machine, config, &machine_data.spec, data_uuid)
-            .await?;
-        crate::system::supervisor::wait_docker_socket(&config.docker_socket, READY_TIMEOUT).await
+        crate::engine::activate(&machine, config, &machine_data.spec, data_uuid).await?;
+        crate::engine::wait_docker_socket(&config.docker_socket, READY_TIMEOUT).await
     }
     .await;
-    let _ = machine
-        .exec_with_input(
-            "/usr/bin/systemctl",
-            &["stop", "silo-system-docker.target"],
-            "root",
-            Vec::new(),
-            Duration::from_secs(30),
-        )
-        .await;
+    crate::engine::stop_engine(&machine).await;
     let stopped = machine.stop_run(run_id).await;
     validation?;
     stopped?;
     Ok(())
 }
 
-async fn validate_guest_manifest(machine: &crate::api::machine::AppMachine) -> eyre::Result<()> {
+async fn validate_guest_manifest(machine: &crate::runtime::SystemMachine) -> eyre::Result<()> {
     let output = machine
         .exec_with_input(
             "/usr/bin/cat",
@@ -445,43 +517,16 @@ async fn validate_guest_manifest(machine: &crate::api::machine::AppMachine) -> e
     Ok(())
 }
 
-async fn ensure_machine_stopped(api: &mut AppApi, id: &str) -> eyre::Result<()> {
-    let machine = api.inspect_machine(id).await?;
-    if matches!(
-        machine.status,
-        MachineStatus::Running { .. }
-            | MachineStatus::Starting { .. }
-            | MachineStatus::Stopping { .. }
-    ) {
-        api.stop_system_machine(id, Duration::from_secs(60)).await?;
+async fn ensure_machine_stopped(runtime: &mut SystemRuntime, id: &str) -> eyre::Result<()> {
+    if is_live(&runtime.inspect_machine(id).await?) {
+        runtime
+            .stop_system_machine(id, Duration::from_secs(60))
+            .await?;
     }
-    let machine = api.inspect_machine(id).await?;
-    if matches!(
-        machine.status,
-        MachineStatus::Running { .. }
-            | MachineStatus::Starting { .. }
-            | MachineStatus::Stopping { .. }
-    ) {
+    if is_live(&runtime.inspect_machine(id).await?) {
         bail!("machine {id} still has a live monitor after shutdown");
     }
     Ok(())
-}
-
-fn acquire_lifetime(paths: &SystemPaths, timeout: Duration) -> eyre::Result<LifetimeLock> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match LifetimeLock::acquire(&paths.lifetime_lock()) {
-            Ok(lock) => return Ok(lock),
-            Err(error)
-                if Instant::now() < deadline
-                    && error.downcast_ref::<nix::errno::Errno>()
-                        == Some(&nix::errno::Errno::EWOULDBLOCK) =>
-            {
-                std::thread::sleep(Duration::from_millis(100))
-            }
-            Err(error) => return Err(error),
-        }
-    }
 }
 
 fn sparse_copy(source_path: &Path, destination_path: &Path) -> eyre::Result<u64> {
@@ -554,13 +599,14 @@ fn restore_backup(backup: &Path, data: &Path) -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::system::record::DaemonRecord;
-    use crate::system::upgrade::{restore_backup, sparse_copy, UpgradeRecord};
+    use crate::record::tests::fixture;
+    use crate::record::DaemonRecord;
+    use crate::upgrade::{restore_backup, sparse_copy, UpgradeRecord};
 
     #[test]
     fn upgrade_recovery_is_committed_with_the_active_vm_reference() {
         let temp = tempfile::tempdir().expect("temp");
-        let (paths, mut state) = crate::system::record::tests::fixture(temp.path());
+        let (paths, mut state) = fixture(temp.path());
         state.machine_id = Some("old-vm".to_string());
         let mut operation = UpgradeRecord {
             operation_id: uuid::Uuid::new_v4(),
@@ -569,7 +615,6 @@ mod tests {
             previous_configured_image: state.configured_image.clone(),
             candidate_machine_id: None,
             backup_size: None,
-            service_was_enabled: true,
             complete: false,
         };
         for stage in 0..4 {
@@ -586,9 +631,13 @@ mod tests {
             state.save(&paths).expect("commit operation");
             let loaded = DaemonRecord::load(&paths).expect("reload").expect("state");
             assert_eq!(loaded, state);
-            assert_eq!(loaded.require_no_pending_upgrade().is_ok(), stage == 3);
-            assert!(loaded.owns_machine("old-vm"));
-            assert_eq!(loaded.owns_machine("new-vm"), stage >= 2);
+            assert_eq!(
+                loaded
+                    .upgrade
+                    .as_ref()
+                    .is_some_and(|upgrade| upgrade.complete),
+                stage == 3
+            );
         }
         operation
             .restored_state(&state)
@@ -602,7 +651,7 @@ mod tests {
     #[test]
     fn inconsistent_recovery_state_is_rejected_before_writing() {
         let temp = tempfile::tempdir().expect("temp");
-        let (paths, mut state) = crate::system::record::tests::fixture(temp.path());
+        let (paths, mut state) = fixture(temp.path());
         state.machine_id = Some("old-vm".to_string());
         state.save(&paths).expect("initial state");
         let valid = UpgradeRecord {
@@ -612,7 +661,6 @@ mod tests {
             previous_configured_image: state.configured_image.clone(),
             candidate_machine_id: None,
             backup_size: None,
-            service_was_enabled: true,
             complete: false,
         };
         for case in 0..6 {

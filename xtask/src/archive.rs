@@ -148,6 +148,8 @@ fn create_tar(
             &disk_image_license_transform(root),
             "--transform",
             &format!("s,^silo$,{root}/bin/silo,"),
+            "--transform",
+            &format!("s,^silod$,{root}/bin/silod,"),
         ])
         .args(["bin", "assets", "--directory"])
         .arg(workspace_root)
@@ -156,7 +158,7 @@ fn create_tar(
         command
             .args(["--directory"])
             .arg(target_dir.join("release"))
-            .arg("silo");
+            .args(["silo", "silod"]);
     }
     command::run(command)?;
     Ok(())
@@ -220,10 +222,12 @@ fn write_provenance(
         }
     }
     if kind.has_cli() {
-        files.insert(
-            "bin/silo".to_string(),
-            sha256(&target_dir.join("release/silo"))?,
-        );
+        for name in ["silo", "silod"] {
+            files.insert(
+                format!("bin/{name}"),
+                sha256(&target_dir.join("release").join(name))?,
+            );
+        }
     }
     let kernel = target_dir
         .join("kernel-provenance")

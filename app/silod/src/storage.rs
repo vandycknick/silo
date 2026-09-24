@@ -141,7 +141,7 @@ pub(crate) fn validate_data_image(
 mod tests {
     use uuid::Uuid;
 
-    use crate::system::storage::{ensure_data_image, validate_data_image};
+    use crate::storage::{ensure_data_image, validate_data_image};
 
     #[test]
     fn creates_real_ext4_once_and_never_replaces_corruption() {

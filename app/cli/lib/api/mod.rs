@@ -21,7 +21,7 @@ use crate::planning::{CreatePlan, PullPolicy};
 use crate::template::Template;
 
 use self::machine::AppMachine;
-use self::types::{ReadOnlyCreationResolution, SourceResolution, SystemImageResolution};
+use self::types::{ReadOnlyCreationResolution, SourceResolution};
 
 #[derive(Debug)]
 pub(crate) struct AppApi {
@@ -58,22 +58,6 @@ impl AppApi {
         timeout: Duration,
     ) -> eyre::Result<MachineData> {
         self.local.stop_machine(reference, force, timeout).await
-    }
-
-    pub(crate) async fn update_system_machine(
-        &mut self,
-        reference: &str,
-        update: MachineUpdate,
-    ) -> eyre::Result<MachineData> {
-        self.local.update_system_machine(reference, update).await
-    }
-
-    pub(crate) async fn stop_system_machine(
-        &mut self,
-        reference: &str,
-        timeout: Duration,
-    ) -> eyre::Result<MachineData> {
-        self.local.stop_system_machine(reference, timeout).await
     }
 
     pub(crate) async fn remove_machine(
@@ -155,27 +139,6 @@ impl AppApi {
 
     pub(crate) async fn ensure_name_available(&mut self, name: &str) -> eyre::Result<()> {
         self.local.ensure_name_available(name).await
-    }
-
-    pub(crate) async fn resolve_system_image(
-        &mut self,
-        reference: &str,
-        progress: ImageProgressSender,
-    ) -> eyre::Result<SystemImageResolution> {
-        self.local.resolve_system_image(reference, progress).await
-    }
-
-    pub(crate) async fn create_system_machine(
-        &mut self,
-        name: &str,
-        config: &crate::system::config::ResolvedSystemConfig,
-        installation_id: uuid::Uuid,
-        data_image: &std::path::Path,
-        source: SystemImageResolution,
-    ) -> eyre::Result<MachineData> {
-        self.local
-            .create_system_machine(name, config, installation_id, data_image, source)
-            .await
     }
 
     pub(crate) async fn create_machine(

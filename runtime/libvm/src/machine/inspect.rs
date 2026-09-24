@@ -8,7 +8,9 @@ use protocol::v1::{
 };
 use vm_spec::VmSpec;
 
-use crate::machine::{MachineAgent, MachineGuestConfig, MachineRetention, ProcessConfig};
+use crate::machine::{
+    MachineAgent, MachineGuestConfig, MachineRetention, MachineRunId, ProcessConfig,
+};
 use crate::network::MachineNetworkConfig;
 use crate::store::models::{MachineConfig, MachineRootfsRecord, MachineRuntimeState, MachineState};
 use crate::ImageSourceKind;
@@ -110,6 +112,9 @@ pub struct MachineData {
     /// silo-vmm telemetry failure does not fail the whole inspect call; it is
     /// reported here as a non-ready running status message instead.
     pub status: MachineStatus,
+    /// The current silo-vmm run while the machine is running. Pass it to
+    /// `stop_run`/`wait_for_run` to act on exactly this run.
+    pub run_id: Option<MachineRunId>,
     /// Latest guest boot report observed by silo-vmm, when the guest registered one.
     pub boot_report: Option<MachineBootReport>,
     /// Latest guest provisioning report observed by silo-vmm, when the guest registered one.
@@ -127,6 +132,7 @@ impl MachineData {
         config: MachineConfig,
         rootfs: Option<MachineRootfsRecord>,
         status: MachineStatus,
+        run_id: Option<MachineRunId>,
         boot_report: Option<MachineBootReport>,
         provision_report: Option<MachineProvisionReport>,
         state: MachineState,
@@ -150,6 +156,7 @@ impl MachineData {
             network: config.network.into(),
             guest: config.guest,
             status,
+            run_id,
             boot_report,
             provision_report,
             started_at: state.started_at,

@@ -162,6 +162,14 @@ impl Spinner {
         }
     }
 
+    /// Prints a warning above the spinner without tearing its line.
+    pub fn warn(&self, message: impl AsRef<str>) {
+        match &self.pb {
+            Some(pb) => pb.suspend(|| warn(message)),
+            None => warn(message),
+        }
+    }
+
     pub fn finish_clear(mut self) {
         if let Some(pb) = self.pb.take() {
             pb.finish_and_clear();

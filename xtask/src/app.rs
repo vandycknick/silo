@@ -15,9 +15,10 @@ use crate::targets::HostTarget;
 const APP_NAME: &str = "Silo.app";
 const BUNDLE_IDENTIFIER: &str = "sh.silo.app";
 const MINIMUM_SYSTEM_VERSION: &str = "26.0";
-const HELPERS: [(&str, Option<&str>); 2] = [
+const HELPERS: [(&str, Option<&str>); 3] = [
     ("silo-vmm", Some("virt/vmm/silo-vmm.entitlements")),
     ("netd", None),
+    ("silod", None),
 ];
 const ASSETS: [(&str, u32); 3] = [
     ("kernel-default", 0o644),
@@ -108,7 +109,8 @@ pub fn assemble(
         )?;
         copy_regular_file(&release.join("silo"), &macos.join("silo"), 0o755)?;
         for (name, _) in HELPERS {
-            copy_regular_file(&stage.join("bin").join(name), &helpers.join(name), 0o755)?;
+            let source = helper_source(&release, &stage, name);
+            copy_regular_file(&source, &helpers.join(name), 0o755)?;
         }
         for (name, mode) in ASSETS {
             copy_regular_file(&stage.join("assets").join(name), &assets.join(name), mode)?;
@@ -308,11 +310,19 @@ fn generate_icon(workspace_root: &Path, bundle: &Path, destination: &Path) -> Re
     result
 }
 
+fn helper_source(release: &Path, stage: &Path, name: &str) -> PathBuf {
+    if name == "silod" {
+        release.join(name)
+    } else {
+        stage.join("bin").join(name)
+    }
+}
+
 fn verify_unsigned_copies(release: &Path, stage: &Path, bundle: &Path) -> Result<(), AppError> {
     compare_files(&release.join("silo"), &bundle.join("Contents/MacOS/silo"))?;
     for (name, _) in HELPERS {
         compare_files(
-            &stage.join("bin").join(name),
+            &helper_source(release, stage, name),
             &bundle.join("Contents/Helpers").join(name),
         )?;
     }
@@ -342,7 +352,7 @@ fn validate_unsigned_layout(
     let contents = bundle.join("Contents");
     validate_directory_entries(&contents, ["Helpers", "Info.plist", "MacOS", "Resources"])?;
     validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
-    validate_directory_entries(&contents.join("Helpers"), ["netd", "silo-vmm"])?;
+    validate_directory_entries(&contents.join("Helpers"), ["netd", "silo-vmm", "silod"])?;
     validate_directory_entries(&contents.join("Resources"), ["Silo.icns", "assets"])?;
     validate_asset_entries(&contents.join("Resources/assets"))?;
     validate_regular_file(&contents.join("Info.plist"), None)?;
@@ -489,7 +499,7 @@ fn entitlement_map(path: &Path, plist: &[u8]) -> Result<BTreeMap<String, bool>, 
 
 pub fn verify_signed_bundle(bundle: &Path) -> Result<(), AppError> {
     validate_distribution_layout(bundle)?;
-    for name in ["silo", "silo-vmm", "netd"] {
+    for name in ["silo", "silod", "silo-vmm", "netd"] {
         let path = match name {
             "silo" => bundle.join("Contents/MacOS/silo"),
             _ => bundle.join("Contents/Helpers").join(name),
@@ -572,7 +582,7 @@ fn validate_distribution_layout(bundle: &Path) -> Result<(), AppError> {
         ],
     )?;
     validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
-    validate_directory_entries(&contents.join("Helpers"), ["netd", "silo-vmm"])?;
+    validate_directory_entries(&contents.join("Helpers"), ["netd", "silo-vmm", "silod"])?;
     validate_directory_entries(&contents.join("Resources"), ["Silo.icns", "assets"])?;
     validate_asset_entries(&contents.join("Resources/assets"))?;
     validate_regular_file(&contents.join("Info.plist"), None)?;
@@ -858,7 +868,8 @@ mod tests {
             crate::app::HELPERS,
             [
                 ("silo-vmm", Some("virt/vmm/silo-vmm.entitlements")),
-                ("netd", None)
+                ("netd", None),
+                ("silod", None)
             ]
         );
         let entitlements = include_str!("../../virt/vmm/silo-vmm.entitlements");

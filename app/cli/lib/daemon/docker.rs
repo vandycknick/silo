@@ -6,14 +6,12 @@ use std::os::unix::fs::FileTypeExt as _;
 
 use eyre::{bail, Context as _};
 
-use crate::system::config::ResolvedSystemConfig;
-
 const CONTEXT_NAME: &str = "silo";
 
-pub(crate) fn preflight(config: &ResolvedSystemConfig, daemon_live: bool) -> eyre::Result<()> {
-    validate_socket_length(&config.docker_socket)?;
-    ensure_owned_socket_parent(&config.docker_socket)?;
-    let metadata = match std::fs::symlink_metadata(&config.docker_socket) {
+pub(crate) fn preflight(socket: &Path, daemon_live: bool) -> eyre::Result<()> {
+    validate_socket_length(socket)?;
+    ensure_owned_socket_parent(socket)?;
+    let metadata = match std::fs::symlink_metadata(socket) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
@@ -21,46 +19,46 @@ pub(crate) fn preflight(config: &ResolvedSystemConfig, daemon_live: bool) -> eyr
     if !metadata.file_type().is_socket() {
         bail!(
             "refusing to replace non-socket Docker endpoint {}",
-            config.docker_socket.display()
+            socket.display()
         );
     }
-    validate_owner(&config.docker_socket, &metadata)?;
+    validate_owner(socket, &metadata)?;
     if !daemon_live {
         bail!(
             "Docker endpoint {} already exists without a live owned daemon; remove it manually only after verifying its owner",
-            config.docker_socket.display()
+            socket.display()
         );
     }
     Ok(())
 }
 
-pub(crate) fn integrate(config: &ResolvedSystemConfig, switch_context: bool) -> eyre::Result<()> {
+pub(crate) fn integrate(socket: &Path, switch_context: bool) -> eyre::Result<()> {
     if let Some(value) = std::env::var_os("DOCKER_CONFIG") {
         let path = Path::new(&value);
         if !path.is_absolute() {
             bail!("DOCKER_CONFIG must be absolute: {}", path.display());
         }
-        eprintln!(
+        crate::ui::hint(format!(
             "Docker context metadata will use DOCKER_CONFIG={}",
             path.display()
-        );
+        ));
     }
     let host_override = std::env::var_os("DOCKER_HOST").is_some();
     let context_override = std::env::var_os("DOCKER_CONTEXT").is_some();
     if host_override {
-        eprintln!(
-            "warning: DOCKER_HOST overrides Docker contexts; unset it or use --host unix://{}",
-            config.docker_socket.display()
-        );
+        crate::ui::warn(format!(
+            "DOCKER_HOST overrides Docker contexts; unset it or use --host unix://{}",
+            socket.display()
+        ));
     }
     if context_override {
-        eprintln!("warning: DOCKER_CONTEXT overrides the active Docker context; unset it or pass --context {CONTEXT_NAME}");
+        crate::ui::warn(format!("DOCKER_CONTEXT overrides the active Docker context; unset it or pass --context {CONTEXT_NAME}"));
     }
 
     let version = docker(&["--version"]);
     match version {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("warning: Docker is ready at unix://{}, but the host Docker CLI is not installed; install Docker CLI and run `docker context create {CONTEXT_NAME} --docker host=unix://{}`", config.docker_socket.display(), config.docker_socket.display());
+            crate::ui::warn(format!("Docker is ready at unix://{}, but the host Docker CLI is not installed; install Docker CLI and run `docker context create {CONTEXT_NAME} --docker host=unix://{}`", socket.display(), socket.display()));
             return Ok(());
         }
         Err(error) => return Err(error).context("run host Docker CLI"),
@@ -75,7 +73,7 @@ pub(crate) fn integrate(config: &ResolvedSystemConfig, switch_context: bool) -> 
         "list Docker contexts",
     )?;
     let exists = contexts.lines().any(|name| name.trim() == CONTEXT_NAME);
-    let endpoint = format!("unix://{}", config.docker_socket.display());
+    let endpoint = format!("unix://{}", socket.display());
     if exists {
         let host = docker_success(
             &[
@@ -106,6 +104,7 @@ pub(crate) fn integrate(config: &ResolvedSystemConfig, switch_context: bool) -> 
             ],
             "create Docker context `silo`",
         )?;
+        crate::ui::success(format!("Created Docker context `{CONTEXT_NAME}`"));
     }
 
     if switch_context && !host_override && !context_override {
@@ -113,6 +112,7 @@ pub(crate) fn integrate(config: &ResolvedSystemConfig, switch_context: bool) -> 
             &["context", "use", CONTEXT_NAME],
             "activate Docker context `silo`",
         )?;
+        crate::ui::success(format!("Selected Docker context `{CONTEXT_NAME}`"));
     }
     Ok(())
 }
@@ -211,23 +211,15 @@ fn stderr(output: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::system::docker::{preflight, validate_socket_length};
-
-    fn config(home: &std::path::Path) -> crate::system::config::ResolvedSystemConfig {
-        let config: crate::system::config::SystemConfig = serde_yaml_ng::from_str(
-            "version: '1'\nsystem:\n  image: registry.example/system@sha256:test\n",
-        )
-        .expect("config");
-        config.resolve(home, home, None).expect("resolve")
-    }
+    use crate::daemon::docker::{preflight, validate_socket_length};
 
     #[test]
     fn preflight_creates_socket_directories_without_a_compatibility_alias() {
         let temp = tempfile::tempdir().expect("temp");
-        let config = config(temp.path());
-        assert_eq!(config.docker_socket, temp.path().join("run/docker.sock"));
-        preflight(&config, false).expect("preflight");
-        preflight(&config, false).expect("repeat preflight");
+        let socket = silod_spec::paths::DaemonPaths::new(temp.path()).docker_socket();
+        assert_eq!(socket, temp.path().join("run/docker.sock"));
+        preflight(&socket, false).expect("preflight");
+        preflight(&socket, false).expect("repeat preflight");
         assert!(temp.path().join("run").is_dir());
     }
 
@@ -235,7 +227,6 @@ mod tests {
     fn preflight_leaves_existing_docker_socket_entries_untouched() {
         for symlink in [false, true] {
             let temp = tempfile::tempdir().expect("temp");
-            let mut config = config(temp.path());
             let run = temp.path().join("docker/run");
             std::fs::create_dir_all(&run).expect("directories");
             let alias = run.join("docker.sock");
@@ -244,8 +235,7 @@ mod tests {
             } else {
                 std::fs::write(&alias, "foreign").expect("existing file");
             }
-            config.docker_socket = run.join("silo.sock");
-            preflight(&config, false).expect("preflight");
+            preflight(&run.join("silo.sock"), false).expect("preflight");
             if symlink {
                 assert_eq!(
                     std::fs::read_link(&alias).expect("symlink"),
@@ -255,6 +245,20 @@ mod tests {
                 assert_eq!(std::fs::read_to_string(&alias).expect("file"), "foreign");
             }
         }
+    }
+
+    #[test]
+    fn stale_sockets_and_non_sockets_are_refused() {
+        let temp = tempfile::tempdir().expect("temp");
+        let run = temp.path().join("run");
+        std::fs::create_dir_all(&run).expect("run");
+        let socket = run.join("docker.sock");
+        std::fs::write(&socket, "not a socket").expect("file");
+        assert!(preflight(&socket, true).is_err());
+        std::fs::remove_file(&socket).expect("remove");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket");
+        assert!(preflight(&socket, false).is_err());
+        preflight(&socket, true).expect("owned by the live daemon");
     }
 
     #[test]

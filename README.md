@@ -18,6 +18,10 @@ The short version:
 
 Only network policies are implemented today. Kernel and userspace policies are the direction.
 
+The optional system appliance is managed by the separate `silod` executable.
+`silo daemon up` starts it through the native service manager; the CLI does not
+run the daemon loop. Direct CLI VM operations continue to use libvm in process.
+
 Each running VM is supervised by one `silo-vmm` process, Silo's virtual machine
 monitor (VMM). It manages VM configuration, execution, and lifecycle across
 virtualization backends.

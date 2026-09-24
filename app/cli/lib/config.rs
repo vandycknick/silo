@@ -5,13 +5,13 @@ use libvm::{NetdRuntimeConfig, RuntimeNetworkingConfig};
 use serde::Deserialize;
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::system::config::SystemConfig;
+use crate::daemon::config::DaemonConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GlobalConfig {
     pub(crate) default_machine: Option<String>,
     pub(crate) networking: RuntimeNetworkingConfig,
-    pub(crate) daemon: Option<SystemConfig>,
+    pub(crate) daemon: Option<DaemonConfig>,
 }
 
 impl GlobalConfig {
@@ -46,8 +46,12 @@ impl GlobalConfig {
         self.default_machine.as_deref()
     }
 
-    pub(crate) fn daemon(&self) -> SystemConfig {
-        self.daemon.clone().unwrap_or_default()
+    /// The explicit system-appliance overrides to pass to silod.
+    pub(crate) fn daemon_overrides(&self) -> eyre::Result<silod_spec::arguments::SystemOverrides> {
+        self.daemon
+            .as_ref()
+            .map(DaemonConfig::overrides)
+            .unwrap_or_else(|| Ok(Default::default()))
     }
 
     pub(crate) fn write_default_machine(default_machine: Option<&str>) -> eyre::Result<()> {
@@ -95,7 +99,7 @@ fn parse_global_config(input: &str) -> eyre::Result<GlobalConfig> {
 struct RawGlobalConfig {
     default_machine: Option<String>,
     networking: Option<RawNetworkingConfig>,
-    daemon: Option<SystemConfig>,
+    daemon: Option<DaemonConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,72 +210,40 @@ fn write_default_machine_to_path(
 #[cfg(test)]
 mod tests {
     use crate::config::{parse_global_config, GlobalConfig};
-    use crate::system::config::SystemConfig;
 
     #[test]
-    fn daemon_defaults_without_a_config_file_or_section() {
+    fn daemon_overrides_are_empty_without_a_config_file_or_section() {
         let temp = tempfile::tempdir().expect("temp home");
         let paths = libvm::HostPaths::new(temp.path().join(".silo"), temp.path().join("config"));
         let config = GlobalConfig::load_from(&paths).expect("load missing config");
-        let minimal: SystemConfig =
-            serde_yaml_ng::from_str("version: '1'\nsystem: {}\n").expect("minimal config");
-        assert_eq!(config.daemon(), minimal);
         assert_eq!(
-            parse_global_config("{}\n").expect("empty mapping").daemon(),
-            minimal
+            config.daemon_overrides().expect("overrides"),
+            Default::default()
         );
-        assert_eq!(
-            parse_global_config("default_machine: example\n")
-                .expect("unrelated settings")
-                .daemon(),
-            minimal
-        );
+        for yaml in ["{}\n", "default_machine: example\n"] {
+            assert_eq!(
+                parse_global_config(yaml)
+                    .expect("config")
+                    .daemon_overrides()
+                    .expect("overrides"),
+                Default::default()
+            );
+        }
         assert!(!paths.config_file().exists());
         assert!(!paths.home().exists());
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    fn unconfigured_daemon_resolves_existing_default_image_and_resources() {
-        let temp = tempfile::tempdir().expect("temp home");
-        let config = GlobalConfig::default().daemon();
-        let resolved = config
-            .resolve(temp.path(), &temp.path().join(".silo"), None)
-            .expect("resolve defaults without a config file");
-        assert_eq!(
-            resolved.image,
-            option_env!("SILO_SYSTEM_IMAGE").unwrap_or("ghcr.io/vandycknick/silo/system:dev")
-        );
-        assert_eq!(resolved.cpus, 4);
-        assert_eq!(resolved.memory_bytes, 8 * 1024 * 1024 * 1024);
-        assert_eq!(resolved.root_size_bytes, 20 * 1024 * 1024 * 1024);
-        assert_eq!(resolved.data_size_bytes, 500 * 1024 * 1024 * 1024);
-        assert_eq!(resolved.shares.len(), 1);
-        assert_eq!(
-            resolved.docker_socket,
-            temp.path().join(".silo/run/docker.sock")
-        );
-    }
-
-    #[test]
-    fn daemon_explicit_overrides_and_validation_are_preserved() {
-        let temp = tempfile::tempdir().expect("temp home");
+    fn daemon_section_is_strict_and_versioned() {
         let config = parse_global_config(
-            "daemon:\n  version: '1'\n  system:\n    image: registry.example/system@sha256:test\n    resources:\n      cpus: 2\n      memory: 4GiB\n    mounts:\n      home: false\n",
-        ).expect("explicit config");
-        let resolved = config
-            .daemon()
-            .resolve(temp.path(), temp.path(), None)
-            .expect("resolve overrides");
-        assert_eq!(resolved.image, "registry.example/system@sha256:test");
-        assert_eq!(resolved.cpus, 2);
-        assert_eq!(resolved.memory_bytes, 4 * 1024 * 1024 * 1024);
-        assert!(resolved.shares.is_empty());
+            "daemon:\n  version: '1'\n  system:\n    resources:\n      cpus: 2\n",
+        )
+        .expect("explicit config");
+        assert_eq!(config.daemon_overrides().expect("overrides").cpus, Some(2));
         assert!(parse_global_config("daemon:\n  version: '1'\n  unknown: true\n").is_err());
-        let invalid = parse_global_config("daemon:\n  version: '2'\n").expect("parse version");
-        assert!(invalid
-            .daemon()
-            .resolve(temp.path(), temp.path(), None)
+        assert!(parse_global_config("daemon:\n  version: '2'\n")
+            .expect("parse version")
+            .daemon_overrides()
             .is_err());
     }
 }

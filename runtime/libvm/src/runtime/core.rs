@@ -1320,10 +1320,20 @@ impl Runtime {
         };
 
         let rootfs = self.store.machine_rootfs(config.id).await?;
+        let run_id = runtime_status
+            .is_running()
+            .then(|| {
+                runtime_status
+                    .run_id
+                    .clone()
+                    .map(crate::machine::MachineRunId::from_raw)
+            })
+            .flatten();
         Ok(MachineData::from_models_with_status(
             config,
             rootfs,
             status,
+            run_id,
             boot_report,
             provision_report,
             state,

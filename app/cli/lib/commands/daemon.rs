@@ -1,6 +1,11 @@
 use clap::{Args, Subcommand};
 
+use silod_spec::paths::DaemonPaths;
+use silod_spec::status::{DaemonPhase, DaemonStatus, MemoryReclaimOutcome};
+
 use crate::context::Context;
+use crate::daemon::service;
+use crate::ui::Spinner;
 
 #[derive(Debug, Args)]
 pub struct Cmd {
@@ -18,10 +23,6 @@ enum DaemonCommand {
     Status(Status),
     /// Read bounded daemon supervisor logs.
     Logs(Logs),
-    /// Replace the system image while retaining installation-owned engine data.
-    Upgrade(Upgrade),
-    #[command(hide = true)]
-    Serve(Serve),
 }
 
 #[derive(Debug, Args)]
@@ -46,41 +47,31 @@ struct Logs {
     lines: usize,
 }
 
-#[derive(Debug, Args)]
-struct Upgrade {
-    /// Override the configured or built-in default system image.
-    #[arg(long, conflicts_with = "recover")]
-    image: Option<String>,
-    #[arg(long, conflicts_with = "image")]
-    recover: bool,
-}
-
-#[derive(Debug, Args)]
-struct Serve {
-    #[arg(long)]
-    state: std::path::PathBuf,
-}
-
 impl Cmd {
     pub(crate) async fn run(self, context: &mut Context) -> eyre::Result<()> {
+        let paths = DaemonPaths::from_env()?;
         match self.command {
             DaemonCommand::Up(command) => {
+                let mut spinner = Spinner::start("Checking", "daemon configuration");
+                let arguments = context.config()?.daemon_overrides()?.to_args();
+                let executable = crate::daemon::executable()?;
+                let socket = paths.docker_socket();
+                let live = service::status(&paths)?.is_some();
+                crate::daemon::docker::preflight(&socket, live)?;
+                crate::daemon::check(&executable, &arguments)?;
                 if command.foreground {
-                    return run_foreground(context).await;
+                    spinner.finish_clear();
+                    return crate::daemon::foreground(&executable, &arguments);
                 }
-                let (paths, config) = context.resolved_system_config()?;
-                let daemon_live = crate::system::service::status(&paths)?.is_some();
-                crate::system::docker::preflight(&config, daemon_live)?;
-                crate::system::service::up(&paths, config.clone())?;
-                crate::system::docker::integrate(&config, !command.no_switch_context)
+                let service = service::ServiceConfig::new(&paths, executable)?;
+                service::up(&service, &arguments, &mut spinner)?;
+                spinner.finish_success("Started");
+                crate::daemon::docker::integrate(&socket, !command.no_switch_context)?;
+                crate::ui::hint(format!("Docker endpoint: unix://{}", socket.display()));
+                Ok(())
             }
-            DaemonCommand::Down => {
-                let paths = crate::system::ownership::default_system_paths()?;
-                crate::system::service::down(&paths).await
-            }
-            DaemonCommand::Serve(command) => run_service(command.state).await,
+            DaemonCommand::Down => service::down(&paths, &crate::daemon::executable()?),
             DaemonCommand::Status(command) => {
-                let paths = crate::system::ownership::default_system_paths()?;
                 let view = DaemonStatusView::collect(&paths)?;
                 match command.format {
                     crate::ui::OutputFormat::Json => crate::ui::print_json(&view),
@@ -88,8 +79,7 @@ impl Cmd {
                 }
             }
             DaemonCommand::Logs(command) => {
-                let paths = crate::system::ownership::default_system_paths()?;
-                let logs = crate::system::service::logs(&paths, command.lines)?;
+                let logs = service::logs(&paths, command.lines)?;
                 if !logs.is_empty() {
                     println!("{logs}");
                 }
@@ -98,21 +88,10 @@ impl Cmd {
                 }
                 Ok(())
             }
-            DaemonCommand::Upgrade(command) => {
-                let paths = crate::system::ownership::default_system_paths()?;
-                if command.recover {
-                    return crate::system::upgrade::recover(&paths).await;
-                }
-                let (_, config) = context.resolved_system_config()?;
-                let image = command.image.unwrap_or_else(|| config.image.clone());
-                crate::system::upgrade::upgrade(&paths, config, &image).await
-            }
         }
     }
 }
 
-/// Operator-facing daemon status: the live supervisor record plus what the service
-/// manager and state say when no daemon is running.
 #[derive(Debug, serde::Serialize)]
 struct DaemonStatusView {
     /// Summary state: `stopped`, `starting`, `ready`, `degraded`, `failed`, `stopping`.
@@ -121,32 +100,28 @@ struct DaemonStatusView {
     autostart: Option<bool>,
     /// Docker endpoint the daemon serves (or is registered to serve).
     endpoint: Option<String>,
-    /// Configured guest memory, in bytes, from the state.
+    /// Configured guest memory ceiling, in bytes, as the running daemon reports it.
     memory_bytes: Option<u64>,
     /// Live supervisor record; absent when no daemon process is running.
-    daemon: Option<crate::system::supervisor::DaemonStatus>,
+    daemon: Option<DaemonStatus>,
 }
 
 impl DaemonStatusView {
-    fn collect(paths: &crate::system::record::SystemPaths) -> eyre::Result<Self> {
-        use crate::system::supervisor::DaemonPhase;
-
-        let daemon = crate::system::service::status(paths)?;
-        let autostart = crate::system::service::is_enabled().ok();
-        let state = crate::system::record::DaemonRecord::load(paths)?;
-        let endpoint = match &daemon {
-            Some(status) => Some(status.docker_socket.clone()),
-            None => state
-                .as_ref()
-                .map(|state| state.config.docker_socket.display().to_string()),
-        };
-        let memory_bytes = state.as_ref().map(|state| state.config.memory_bytes);
+    fn collect(paths: &DaemonPaths) -> eyre::Result<Self> {
+        let daemon = service::status(paths)?;
+        let autostart = service::is_enabled().ok();
+        let endpoint = Some(match &daemon {
+            Some(status) => status.docker_socket.clone(),
+            None => paths.docker_socket().display().to_string(),
+        });
+        let memory_bytes = daemon.as_ref().and_then(|status| status.memory_bytes);
         let state = match daemon.as_ref().map(|status| status.phase) {
             None | Some(DaemonPhase::Stopped) => "stopped",
             Some(DaemonPhase::Ready) => "ready",
             Some(DaemonPhase::Degraded) => "degraded",
             Some(DaemonPhase::Failed) => "failed",
             Some(DaemonPhase::Stopping) => "stopping",
+            Some(DaemonPhase::Upgrading) => "upgrading",
             Some(
                 DaemonPhase::PreparingStorage
                 | DaemonPhase::Creating
@@ -166,8 +141,6 @@ impl DaemonStatusView {
     }
 
     fn print_human(&self) -> eyre::Result<()> {
-        use crate::system::supervisor::DaemonPhase;
-
         let mut rows: Vec<(String, String)> = Vec::new();
         let state = match &self.daemon {
             Some(status) => match status.phase {
@@ -178,6 +151,7 @@ impl DaemonStatusView {
                 DaemonPhase::ActivatingEngine => "starting (activating Docker)".to_string(),
                 DaemonPhase::Ready => "ready".to_string(),
                 DaemonPhase::Degraded => "degraded (Docker health probe failing)".to_string(),
+                DaemonPhase::Upgrading => "upgrading (replacing the system VM)".to_string(),
                 DaemonPhase::Retrying => format!(
                     "starting (retrying; {} attempts so far)",
                     status.restart_count
@@ -205,9 +179,13 @@ impl DaemonStatusView {
             if let Some(machine_id) = &status.machine_id {
                 rows.push(("Machine".to_string(), machine_id.clone()));
             }
-            if let Some(digest) = &status.image_digest {
-                rows.push(("Image".to_string(), digest.clone()));
+            if let Some(image) = &status.configured_image {
+                rows.push(("Image".to_string(), image.clone()));
             }
+            if let Some(digest) = &status.image_digest {
+                rows.push(("Digest".to_string(), digest.clone()));
+            }
+            rows.push(("Updates".to_string(), format_update_check(status)));
             rows.push((
                 "Backend".to_string(),
                 format_actual_backend(status.actual_backend.as_deref()).to_string(),
@@ -261,6 +239,25 @@ impl DaemonStatusView {
     }
 }
 
+/// When silod last asked the registry about the system image, and what went wrong.
+fn format_update_check(status: &DaemonStatus) -> String {
+    let checked = status
+        .update_checked_at
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| {
+            format!(
+                "checked {}",
+                crate::ui::relative_time(at.timestamp(), crate::ui::now_unix()).to_lowercase()
+            )
+        })
+        .unwrap_or_else(|| "not checked yet".to_string());
+    match &status.update_error {
+        Some(error) => format!("{checked}; {error}"),
+        None => checked,
+    }
+}
+
 fn format_actual_backend(backend: Option<&str>) -> &str {
     backend.unwrap_or("unknown")
 }
@@ -268,12 +265,10 @@ fn format_actual_backend(backend: Option<&str>) -> &str {
 /// One clause describing the agent's last guest cache reclaim, for the Memory row.
 fn format_guest_reclaim(
     mode: Option<&str>,
-    outcome: crate::system::supervisor::MemoryReclaimOutcome,
+    outcome: MemoryReclaimOutcome,
     reclaimed_bytes: Option<u64>,
     when: String,
 ) -> String {
-    use crate::system::supervisor::MemoryReclaimOutcome;
-
     let mode = match mode {
         Some("dropcache") => "cache drop",
         Some(_) | None => "gradual",
@@ -321,21 +316,6 @@ fn format_host_memory_reclaim(
     text
 }
 
-async fn run_service(path: std::path::PathBuf) -> eyre::Result<()> {
-    let state = crate::system::record::DaemonRecord::load_from(&path)?
-        .ok_or_else(|| eyre::eyre!("daemon state is missing: {}", path.display()))?;
-    if std::env::current_exe()?.canonicalize()? != state.service.executable {
-        return Err(eyre::eyre!(
-            "state executable identity does not match this process"
-        ));
-    }
-    let paths = state.service.paths();
-    let networking = state.service.global_config()?.networking;
-    let runtime = state.service.runtime_config(&state.config, networking);
-    let mut api = crate::api::AppApi::local(runtime);
-    crate::system::supervisor::serve(&mut api, paths, state.config).await
-}
-
 async fn follow_logs(path: &std::path::Path) -> eyre::Result<()> {
     use std::io::{Read as _, Seek as _};
 
@@ -361,23 +341,16 @@ async fn follow_logs(path: &std::path::Path) -> eyre::Result<()> {
     }
 }
 
-async fn run_foreground(context: &mut Context) -> eyre::Result<()> {
-    let (paths, config) = context.resolved_system_config()?;
-    crate::system::docker::preflight(&config, false)?;
-    let api = context
-        .app_api_with_backend(config.backend.runtime_override())
-        .await?;
-    crate::system::supervisor::serve(api, paths, config).await
-}
-
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
 
-    use crate::commands::daemon::{format_actual_backend, format_host_memory_reclaim};
+    use crate::commands::daemon::{
+        format_actual_backend, format_host_memory_reclaim, format_update_check,
+    };
 
     #[test]
-    fn parses_foreground_and_hidden_serve() {
+    fn parses_controller_commands_only() {
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "up", "--foreground"]).is_ok());
         assert!(crate::app::Cli::try_parse_from([
             "silo",
@@ -386,30 +359,11 @@ mod tests {
             "--state",
             "/tmp/daemon.json"
         ])
-        .is_ok());
+        .is_err());
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "down"]).is_ok());
         assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "logs", "--follow"]).is_ok());
-        assert!(crate::app::Cli::try_parse_from([
-            "silo",
-            "daemon",
-            "upgrade",
-            "--image",
-            "registry.example/system@sha256:test"
-        ])
-        .is_ok());
-        assert!(
-            crate::app::Cli::try_parse_from(["silo", "daemon", "upgrade", "--recover"]).is_ok()
-        );
-        assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "upgrade"]).is_ok());
-        assert!(crate::app::Cli::try_parse_from([
-            "silo",
-            "daemon",
-            "upgrade",
-            "--recover",
-            "--image",
-            "registry.example/system@sha256:test"
-        ])
-        .is_err());
+        // silod upgrades the system VM itself; there is nothing to drive by hand.
+        assert!(crate::app::Cli::try_parse_from(["silo", "daemon", "upgrade"]).is_err());
         assert!(
             crate::app::Cli::try_parse_from(["silo", "daemon", "balloon", "--target", "1GiB"])
                 .is_err()
@@ -460,7 +414,7 @@ mod tests {
 
     #[test]
     fn guest_reclaim_clause_names_mode_outcome_and_measured_delta() {
-        use crate::system::supervisor::MemoryReclaimOutcome;
+        use silod_spec::status::MemoryReclaimOutcome;
 
         assert_eq!(
             crate::commands::daemon::format_guest_reclaim(
@@ -495,5 +449,23 @@ mod tests {
     fn missing_actual_backend_is_reported_as_unknown() {
         assert_eq!(format_actual_backend(None), "unknown");
         assert_eq!(format_actual_backend(Some("krun")), "krun");
+    }
+
+    #[test]
+    fn update_check_row_reports_errors_alongside_the_last_check() {
+        let mut status: silod_spec::status::DaemonStatus =
+            serde_json::from_value(serde_json::json!({
+                "schema": 1, "generation": "d823458f-090b-48c3-87d4-33daf76c0000",
+                "pid": 1, "phase": "ready", "machine_id": null, "run_id": null,
+                "image_digest": null, "docker_socket": "/tmp/test.sock",
+                "updated_at": "2026-01-01T00:00:00Z", "last_error": null, "restart_count": 0,
+            }))
+            .expect("status");
+        assert_eq!(format_update_check(&status), "not checked yet");
+        status.update_checked_at = Some(chrono::Utc::now().to_rfc3339());
+        status.update_error = Some("registry unreachable".into());
+        let row = format_update_check(&status);
+        assert!(row.starts_with("checked "), "{row}");
+        assert!(row.ends_with("; registry unreachable"), "{row}");
     }
 }

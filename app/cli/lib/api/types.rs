@@ -13,11 +13,6 @@ pub(crate) struct SourceResolution {
 }
 
 #[derive(Debug)]
-pub(crate) struct SystemImageResolution {
-    pub(crate) image: libvm::ResolvedOciImage,
-}
-
-#[derive(Debug)]
 pub(crate) struct ReadOnlyCreationResolution {
     pub(crate) name: String,
     pub(crate) source: SourceResolution,

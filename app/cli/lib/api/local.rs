@@ -2,15 +2,15 @@ use eyre::Context as _;
 use std::time::Duration;
 
 use libvm::{
-    Forward, ImageProgressSender, ImagePullPolicy, ImageResolveOptions, ImageSource, MachineAgent,
+    ImageProgressSender, ImagePullPolicy, ImageResolveOptions, ImageSource, MachineAgent,
     MachineBuilder, MachineData, MachineExitOutcome, MachineKillOptions, MachineReadinessOutcome,
     MachineRef, MachineRetention, MachineRunId, MachineStartOptions, MachineStatus,
     MachineStopOptions, MachineUpdate, MachineWaitOptions, Memory, NetworkDefinition,
-    NetworkDriver, NetworkTopology, ProcessConfig, ReadOnlyRuntime, Runtime, RuntimeConfig,
+    NetworkDriver, NetworkTopology, ReadOnlyRuntime, Runtime, RuntimeConfig,
 };
 
 use crate::api::machine::AppMachine;
-use crate::api::types::{ReadOnlyCreationResolution, SourceResolution, SystemImageResolution};
+use crate::api::types::{ReadOnlyCreationResolution, SourceResolution};
 use crate::machine_defaults::{
     disk_size_bytes, memory_mib, resolve_machine_mounts, ResolvedMachineNetwork,
 };
@@ -69,7 +69,6 @@ impl LocalVmService {
     ) -> eyre::Result<MachineData> {
         let machine = self.machine(reference).await?;
         let before = machine.inspect().await?;
-        crate::system::ownership::guard_ordinary_mutation(&before)?;
         crate::commands::start::ensure_startable(&before)?;
         let options = self.start_options(&machine, true).await?;
         let start = machine.start_with_options(options).await?;
@@ -90,7 +89,6 @@ impl LocalVmService {
     ) -> eyre::Result<MachineData> {
         let machine = self.machine(reference).await?;
         let data = machine.inspect().await?;
-        crate::system::ownership::guard_ordinary_mutation(&data)?;
         if !data.is_running() {
             return Ok(data);
         }
@@ -106,36 +104,6 @@ impl LocalVmService {
         Ok(machine.inspect().await?)
     }
 
-    /// Updates the daemon-managed system machine's configuration; see
-    /// [`Self::stop_system_machine`] for why this bypasses the ordinary-mutation guard.
-    pub(crate) async fn update_system_machine(
-        &mut self,
-        reference: &str,
-        update: MachineUpdate,
-    ) -> eyre::Result<MachineData> {
-        let machine = self.machine(reference).await?;
-        machine.update(update).await.map_err(Into::into)
-    }
-
-    /// Stops the daemon-managed system machine. Bypasses the ordinary-mutation guard,
-    /// which exists to keep `silo stop`/`rm` away from that machine; callers here are
-    /// the daemon lifecycle paths that own it.
-    pub(crate) async fn stop_system_machine(
-        &mut self,
-        reference: &str,
-        timeout: Duration,
-    ) -> eyre::Result<MachineData> {
-        let machine = self.machine(reference).await?;
-        let data = machine.inspect().await?;
-        if !data.is_running() {
-            return Ok(data);
-        }
-        machine
-            .stop_with(MachineStopOptions::new().timeout(timeout))
-            .await?;
-        Ok(machine.inspect().await?)
-    }
-
     pub(crate) async fn remove_machine(
         &mut self,
         reference: &str,
@@ -143,7 +111,6 @@ impl LocalVmService {
     ) -> eyre::Result<MachineData> {
         let machine = self.machine(reference).await?;
         let data = machine.inspect().await?;
-        crate::system::ownership::guard_ordinary_mutation(&data)?;
         if force && data.is_running() {
             match machine.stop().await {
                 Ok(_) | Err(libvm::LibVmError::MachineNotRunning { .. }) => {}
@@ -160,7 +127,6 @@ impl LocalVmService {
         update: MachineUpdate,
     ) -> eyre::Result<MachineData> {
         let machine = self.machine(reference).await?;
-        crate::system::ownership::guard_ordinary_mutation(&machine.inspect().await?)?;
         machine.update(update).await.map_err(Into::into)
     }
 
@@ -205,7 +171,6 @@ impl LocalVmService {
         network: ResolvedMachineNetwork,
     ) -> eyre::Result<MachineData> {
         let machine = self.machine(reference).await?;
-        crate::system::ownership::guard_ordinary_mutation(&machine.inspect().await?)?;
         Ok(machine
             .set_network(|builder| network.apply(builder))
             .await?)
@@ -267,7 +232,6 @@ impl LocalVmService {
         machine_id: String,
         run_id: MachineRunId,
     ) -> eyre::Result<()> {
-        crate::system::ownership::guard_ordinary_machine_id(&machine_id)?;
         const WAIT_INTERVAL: Duration = Duration::from_secs(5 * 60);
         let runtime = Runtime::new(config).await.context("initialize libvm")?;
         let machine = runtime.get_machine(&MachineRef::parse(machine_id)?).await?;
@@ -420,79 +384,6 @@ impl LocalVmService {
             Err(libvm::LibVmError::MachineNotFound { .. }) => Ok(()),
             Err(error) => Err(error.into()),
         }
-    }
-
-    pub(crate) async fn resolve_system_image(
-        &mut self,
-        reference: &str,
-        progress: ImageProgressSender,
-    ) -> eyre::Result<SystemImageResolution> {
-        let runtime = self.runtime().await?.clone().with_image_progress(progress);
-        let image = runtime
-            .images()
-            .resolve_with(
-                reference.to_string(),
-                ImageResolveOptions {
-                    policy: Some(ImagePullPolicy::IfMissing),
-                },
-            )
-            .await?;
-        Ok(SystemImageResolution { image })
-    }
-
-    pub(crate) async fn create_system_machine(
-        &mut self,
-        name: &str,
-        config: &crate::system::config::ResolvedSystemConfig,
-        installation_id: uuid::Uuid,
-        data_image: &std::path::Path,
-        source: SystemImageResolution,
-    ) -> eyre::Result<MachineData> {
-        use libvm::{ForwardAddress, ForwardEndpoint};
-        use vm_spec::Mount;
-
-        let mounts = config
-            .shares
-            .iter()
-            .map(|share| Mount {
-                source: share.path.clone(),
-                tag: share.path.to_string_lossy().into_owned(),
-                read_only: share.read_only,
-            })
-            .collect();
-        let forward = Forward::new(
-            ForwardEndpoint::host(ForwardAddress::unix(config.docker_socket.clone())),
-            ForwardEndpoint::guest(ForwardAddress::unix("/run/docker.sock")),
-        )
-        .with_name("docker");
-        forward.validate()?;
-        let machine = self
-            .runtime()
-            .await?
-            .machine()
-            .name(name)
-            .resolved_image(source.image)
-            .label(
-                crate::system::MANAGED_ROLE_LABEL,
-                crate::system::MANAGED_ROLE,
-            )
-            .label(
-                crate::system::INSTALLATION_LABEL,
-                installation_id.to_string(),
-            )
-            .retention(MachineRetention::Persistent)
-            .process(ProcessConfig::default())
-            .cpus(config.cpus)
-            .memory(Memory::bytes(config.memory_bytes))
-            .root_disk_size(config.root_size_bytes)
-            .disks(vec![data_image.to_path_buf()])
-            .rosetta(config.rosetta)
-            .mounts(mounts)
-            .forwards(vec![forward])
-            .network(|network| network.private().publish(config.publish_bind))
-            .create()
-            .await?;
-        Ok(machine.inspect().await?)
     }
 
     pub(crate) async fn create_machine(

@@ -14,6 +14,7 @@ use crate::targets::HostTarget;
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Component {
     Cli,
+    Silod,
     SiloVmm,
     Netd,
     Agent,
@@ -56,6 +57,7 @@ pub enum ComponentError {
 pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     for component in [
         Component::Cli,
+        Component::Silod,
         Component::SiloVmm,
         Component::Netd,
         Component::Agent,
@@ -72,6 +74,7 @@ pub fn build_component(
 ) -> Result<(), ComponentError> {
     match component {
         Component::Cli => build_cargo_package(context, "cli"),
+        Component::Silod => build_cargo_package(context, "silod"),
         Component::SiloVmm => build_vmm(context),
         Component::Netd => build_netd(context),
         Component::Agent => build_guest_agent(context),

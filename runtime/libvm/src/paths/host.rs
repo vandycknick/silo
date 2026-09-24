@@ -69,6 +69,15 @@ impl HostPaths {
         self.home.join("run")
     }
 
+    /// Create `<home>/logs/<component>` for a frontend with the same ownership,
+    /// no-symlink, and private-mode requirements as libvm's machine logs.
+    pub fn ensure_log_dir(home: &Path, component: &str) -> Result<PathBuf, LibVmError> {
+        crate::paths::OwnedDirectory::open_root(home)?
+            .ensure_dir("logs")?
+            .ensure_dir(component)?;
+        Ok(home.join("logs").join(component))
+    }
+
     /// Root for generated sockets, pidfiles and locks. Fixed so socket paths
     /// stay inside `sun_path` regardless of the home path's length.
     pub fn run_root() -> PathBuf {
@@ -93,6 +102,53 @@ mod tests {
         std::fs::create_dir_all(temp.path().join("config")).expect("config dir");
         std::fs::write(temp.path().join("config/config.yaml"), b"{}").expect("primary");
         assert_eq!(paths.config_file(), temp.path().join("config/config.yaml"));
+    }
+
+    #[test]
+    fn frontend_log_directories_are_private_and_reusable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = HostPaths::new(temp.path().join("home"), temp.path().join("config"));
+        let log_dir = HostPaths::ensure_log_dir(paths.home(), "daemon").expect("create logs");
+        assert_eq!(log_dir, paths.home().join("logs/daemon"));
+        for path in [paths.home().join("logs"), log_dir.clone()] {
+            assert_eq!(
+                std::fs::metadata(path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(
+            HostPaths::ensure_log_dir(paths.home(), "daemon").expect("reuse"),
+            log_dir
+        );
+        assert!(HostPaths::ensure_log_dir(paths.home(), "../escape").is_err());
+    }
+
+    #[test]
+    fn frontend_logs_refuse_foreign_modes_and_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = HostPaths::new(temp.path().join("home"), temp.path().join("config"));
+        std::fs::create_dir_all(paths.home()).expect("home");
+        symlink(temp.path(), paths.home().join("logs")).expect("symlink");
+        assert!(HostPaths::ensure_log_dir(paths.home(), "daemon").is_err());
+        std::fs::remove_file(paths.home().join("logs")).expect("remove symlink");
+        let logs = HostPaths::ensure_log_dir(paths.home(), "daemon").expect("logs");
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o755))
+            .expect("wrong mode");
+        assert!(HostPaths::ensure_log_dir(paths.home(), "daemon").is_err());
+        assert_eq!(
+            std::fs::metadata(logs)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
     }
 
     #[test]

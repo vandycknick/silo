@@ -174,7 +174,7 @@ target/silo-runtime/<target>/release/
     agent
 ```
 
-The stage deliberately excludes the public `silo` frontend. Product and SDK
+The stage deliberately excludes the public `silo` frontend and the `silod` appliance daemon. Product and SDK
 packagers add their frontend or native binding without rebuilding or replacing
 the staged runtime files.
 
@@ -203,12 +203,16 @@ silo-runtime-<version>-<target>/
     APACHE-2.0.txt
 ```
 
-The portable CLI archive contains the same files plus `bin/silo`:
+The portable CLI archive contains the same files plus `bin/silo` and `bin/silod`.
+The CLI starts its sibling `silod`; distribute and upgrade them together.
+`Silo.app` places the daemon at `Contents/Helpers/silod` and signs it without
+virtualization entitlements (the VMM owns virtualization):
 
 ```text
 silo-<version>-<target>/
   bin/
     silo
+    silod
     silo-vmm
     netd
   assets/

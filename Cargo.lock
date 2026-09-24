@@ -688,7 +688,6 @@ dependencies = [
  "chrono",
  "clap",
  "console",
- "disk-image",
  "eyre",
  "indicatif",
  "libc",
@@ -698,6 +697,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "silod-spec",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -4688,6 +4688,37 @@ dependencies = [
  "uuid",
  "vm-spec",
  "vz",
+]
+
+[[package]]
+name = "silod"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "disk-image",
+ "eyre",
+ "libvm",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "silod-spec",
+ "tempfile",
+ "tokio",
+ "utils",
+ "uuid",
+ "vm-spec",
+]
+
+[[package]]
+name = "silod-spec"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "uuid",
 ]
 
 [[package]]

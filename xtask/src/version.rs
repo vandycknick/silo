@@ -6,6 +6,7 @@ use thiserror::Error;
 
 const RUST_PRODUCT_MANIFESTS: &[&str] = &[
     "app/cli/Cargo.toml",
+    "app/silod/Cargo.toml",
     "runtime/libvm/Cargo.toml",
     "virt/vmm/Cargo.toml",
     "guest/agent/Cargo.toml",
