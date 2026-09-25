@@ -370,6 +370,8 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
 
+    use std::os::fd::OwnedFd;
+
     use nix::unistd::pipe;
 
     use crate::machine::{ExecutionLaunchFailureReason, HostCommand};
@@ -379,10 +381,27 @@ mod tests {
         VmmStartupCommand, VMM_START_REQUEST_MAX_BYTES,
     };
 
-    use super::{
+    use crate::supervisor::launch::{
         append_exit_command_args, configure_pipe_inheritance, handoff_start_request, read_syncpipe,
         StartupResult,
     };
+
+    /// A pipe no concurrently spawned test child can inherit. Tests that observe a
+    /// pipe closing (EOF, EPIPE) fail at random if some child holds an end open.
+    fn private_pipe() -> (OwnedFd, OwnedFd) {
+        #[cfg(target_os = "linux")]
+        {
+            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("create pipe")
+        }
+        // macOS has no pipe2; this leaves a window of two syscalls, not the whole test.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let (read, write) = pipe().expect("create pipe");
+            crate::supervisor::launch::set_cloexec(&read, true).expect("cloexec read end");
+            crate::supervisor::launch::set_cloexec(&write, true).expect("cloexec write end");
+            (read, write)
+        }
+    }
 
     #[test]
     fn only_child_pipe_ends_survive_exec() {
@@ -406,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_writes_json_and_closes_the_pipe() {
-        let (read_fd, write_fd) = pipe().expect("create pipe");
+        let (read_fd, write_fd) = private_pipe();
         let request = VmmStartRequest::new(
             "01234567-89ab-cdef-0123-456789abcdef",
             "9e7d6ad8-f804-4936-9633-1fd3df6bd7d3",
@@ -426,7 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_timeout_closes_a_blocked_writer() {
-        let (read_fd, write_fd) = pipe().expect("create pipe");
+        let (read_fd, write_fd) = private_pipe();
         let request = crate::supervisor::start_request::VmmStartRequest::new(
             uuid::Uuid::nil().to_string(),
             uuid::Uuid::nil().to_string(),
@@ -458,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_handoff_closes_a_blocked_writer() {
-        let (read_fd, write_fd) = pipe().expect("create pipe");
+        let (read_fd, write_fd) = private_pipe();
         let request = crate::supervisor::start_request::VmmStartRequest::new(
             uuid::Uuid::nil().to_string(),
             uuid::Uuid::nil().to_string(),
@@ -504,7 +523,7 @@ mod tests {
             .expect("encode base request")
             .len();
         let request = large_start_request("x".repeat(VMM_START_REQUEST_MAX_BYTES - base_len));
-        let (read_fd, write_fd) = pipe().expect("create pipe");
+        let (read_fd, write_fd) = private_pipe();
         let reader = tokio::task::spawn_blocking(move || {
             let mut file = std::fs::File::from(read_fd);
             let mut contents = Vec::new();
@@ -542,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_startup_result_read_closes_the_pipe() {
-        let (reader, writer) = nix::unistd::pipe().expect("startup pipe");
+        let (reader, writer) = private_pipe();
         assert!(
             tokio::time::timeout(Duration::from_millis(10), read_syncpipe(reader))
                 .await
@@ -556,7 +575,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_syncpipe_accepts_started_message() {
-        let (read_fd, write_fd) = pipe().expect("create pipe");
+        let (read_fd, write_fd) = private_pipe();
         let mut write_file = std::fs::File::from(write_fd);
         write_file.write_all(b"started\n").expect("write started");
         drop(write_file);
@@ -569,7 +588,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_syncpipe_accepts_failed_message() {
-        let (read_fd, write_fd) = pipe().expect("create pipe");
+        let (read_fd, write_fd) = private_pipe();
         let mut write_file = std::fs::File::from(write_fd);
         write_file
             .write_all(b"failed\tkrun exploded\n")
@@ -584,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_syncpipe_accepts_structured_startup_command_launch_failure() {
-        let (read_fd, write_fd) = pipe().expect("create pipe");
+        let (read_fd, write_fd) = private_pipe();
         let mut write_file = std::fs::File::from(write_fd);
         write_file
             .write_all(b"startup-command-launch-failed\t{\"reason\":1,\"message\":\"missing\"}\n")
@@ -600,11 +619,12 @@ mod tests {
 
     #[test]
     fn structured_startup_command_launch_failure_remains_typed() {
-        let error = super::startup_result(StartupResult::StartupCommandLaunchFailed {
-            reason: Some(protocol::v1::LaunchFailureReason::CommandNotFound as i32),
-            message: Some("missing".to_string()),
-        })
-        .expect_err("startup command launch failure");
+        let error =
+            crate::supervisor::launch::startup_result(StartupResult::StartupCommandLaunchFailed {
+                reason: Some(protocol::v1::LaunchFailureReason::CommandNotFound as i32),
+                message: Some("missing".to_string()),
+            })
+            .expect_err("startup command launch failure");
 
         assert!(matches!(
             error,
