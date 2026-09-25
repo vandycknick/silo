@@ -1,0 +1,25 @@
+[package]
+name = "rprobe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "silo-rprobe"
+path = "src/main.rs"
+required-features = ["probe-bin"]
+
+[[bin]]
+name = "silo-rosetta-exerciser"
+path = "src/exerciser_main.rs"
+required-features = ["exerciser-bin"]
+
+[features]
+default = []
+probe-bin = ["dep:libc"]
+exerciser-bin = ["dep:libc"]
+
+[dependencies]
+libc = { version = "0.2.189", default-features = false, optional = true }

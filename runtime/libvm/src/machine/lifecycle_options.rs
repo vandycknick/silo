@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::machine::MachineData;
 
-/// Default time libvm waits for vmmon to exit after a lifecycle action.
+/// Default time libvm waits for silo-vmm to exit after a lifecycle action.
 pub const DEFAULT_MACHINE_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Opaque identifier for one acknowledged machine run.
@@ -20,7 +20,7 @@ impl MachineRunId {
         Self(value)
     }
 
-    /// Returns the stable textual representation sent to vmmon for this run.
+    /// Returns the stable textual representation sent to silo-vmm for this run.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -45,7 +45,7 @@ impl fmt::Display for MachineRunId {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct MachineStart {
-    /// Machine snapshot after vmmon acknowledged this start.
+    /// Machine snapshot after silo-vmm acknowledged this start.
     pub machine: MachineData,
     /// Exact generation created by this start.
     pub run_id: MachineRunId,
@@ -82,10 +82,11 @@ impl MachineWaitOptions {
     }
 }
 
-/// Options for gracefully stopping a machine.
+/// Options for stopping a machine, optionally escalating after a graceful timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MachineStopOptions {
     wait: MachineWaitOptions,
+    force_timeout: Option<Duration>,
 }
 
 impl MachineStopOptions {
@@ -98,6 +99,17 @@ impl MachineStopOptions {
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.wait = self.wait.timeout(timeout);
         self
+    }
+
+    /// If the graceful wait expires, kill the same machine run and wait up to
+    /// `timeout` for its monitor to exit. Other stop errors are not suppressed.
+    pub fn force_after_timeout(mut self, timeout: Duration) -> Self {
+        self.force_timeout = Some(timeout);
+        self
+    }
+
+    pub(crate) fn force_timeout(self) -> Option<Duration> {
+        self.force_timeout
     }
 
     pub(crate) fn wait_options(self) -> MachineWaitOptions {
@@ -134,9 +146,9 @@ impl MachineKillOptions {
 pub struct MachineExit {
     /// Machine snapshot after libvm reconciled the exited run.
     pub machine: MachineData,
-    /// Run ID for the exited vmmon generation, when one was known.
+    /// Run ID for the exited silo-vmm generation, when one was known.
     pub run_id: Option<MachineRunId>,
-    /// Time vmmon reported for the exit, when available.
+    /// Time silo-vmm reported for the exit, when available.
     pub exited_at: Option<SystemTime>,
     /// High-level exit outcome.
     pub outcome: MachineExitOutcome,
@@ -146,18 +158,19 @@ pub struct MachineExit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MachineExitOutcome {
-    /// vmmon reported a clean exit.
+    /// silo-vmm reported a clean exit.
     Clean,
-    /// vmmon reported an error exit.
+    /// silo-vmm reported an error exit.
     Error {
-        /// Optional error message reported by vmmon.
+        /// Optional error message reported by silo-vmm.
         message: Option<String>,
     },
     /// The machine was already stopped when wait started.
     AlreadyStopped,
-    /// libvm forced the monitor to exit and no cleaner vmmon status was reported.
+    /// The monitor intentionally force-killed its worker, or libvm emergency-killed
+    /// the monitor without a more specific matching exit record.
     Forced,
-    /// The run exited but no matching vmmon exit status was available.
+    /// The run exited but no matching silo-vmm exit status was available.
     Unknown,
 }
 

@@ -55,6 +55,7 @@ dependencies = [
  "eyre",
  "forward-spec",
  "futures",
+ "libc",
  "nix 0.31.3",
  "prost-types",
  "protocol",
@@ -144,7 +145,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -155,7 +156,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -180,15 +181,6 @@ name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
-name = "arc-swap"
-version = "1.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
-dependencies = [
- "rustversion",
-]
 
 [[package]]
 name = "argon2"
@@ -705,10 +697,12 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "silod-spec",
  "tempfile",
  "tokio",
  "tokio-stream",
  "utils",
+ "uuid",
  "vm-spec",
 ]
 
@@ -1339,16 +1333,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "epoll"
-version = "4.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e74d68fe2927dbf47aa976d14d93db9b23dced457c7bb2bdc6925a16d31b736e"
-dependencies = [
- "bitflags 2.13.1",
- "libc",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1361,7 +1345,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2099,21 +2083,20 @@ dependencies = [
 
 [[package]]
 name = "imago"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae7cfee876c698a1a2ed9c705ab18f21acbed82110f19b51cc458de73426fe2c"
+checksum = "404f567d70cd6d288e43f95ea8f2d6e8fe6156dd07df7da955cb9b147c4ab2a5"
 dependencies = [
- "async-trait",
  "bincode",
  "cfg-if",
  "libc",
+ "maybe-async",
  "miniz_oxide",
  "nix 0.30.1",
  "page_size",
  "rustc_version",
- "tokio",
  "tracing",
- "vm-memory 0.17.1",
+ "vm-memory",
  "windows-sys 0.61.2",
 ]
 
@@ -2402,35 +2385,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "krun"
-version = "0.1.0"
-dependencies = [
- "bzip2",
- "clap",
- "eyre",
- "kvm-ioctls 0.22.1",
- "libkrun",
- "nix 0.30.1",
- "nix 0.31.3",
- "thiserror 2.0.19",
- "tracing",
- "utils",
-]
-
-[[package]]
 name = "krun-arch"
 version = "0.1.0-2.0.0-dev"
-source = "git+https://github.com/vandycknick/libkrun.git?rev=10b6f752ba8ea735c3d9edaa549599dcf3f98d18#10b6f752ba8ea735c3d9edaa549599dcf3f98d18"
+source = "git+https://github.com/vandycknick/libkrun.git?rev=11dbc7863a6ca6176939d48147e67f03d34eeda0#11dbc7863a6ca6176939d48147e67f03d34eeda0"
 dependencies = [
  "krun-arch-gen",
  "krun-smbios",
  "krun-utils",
  "krun-whp",
- "kvm-bindings 0.14.0",
- "kvm-ioctls 0.24.0",
+ "kvm-bindings 0.14.1",
+ "kvm-ioctls 0.25.0",
  "libc",
  "linux-loader",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util 0.15.0",
  "windows-sys 0.61.2",
 ]
@@ -2438,22 +2405,22 @@ dependencies = [
 [[package]]
 name = "krun-arch-gen"
 version = "0.1.0-2.0.0-dev"
-source = "git+https://github.com/vandycknick/libkrun.git?rev=10b6f752ba8ea735c3d9edaa549599dcf3f98d18#10b6f752ba8ea735c3d9edaa549599dcf3f98d18"
+source = "git+https://github.com/vandycknick/libkrun.git?rev=11dbc7863a6ca6176939d48147e67f03d34eeda0#11dbc7863a6ca6176939d48147e67f03d34eeda0"
 
 [[package]]
 name = "krun-cpuid"
 version = "0.1.0-2.0.0-dev"
-source = "git+https://github.com/vandycknick/libkrun.git?rev=10b6f752ba8ea735c3d9edaa549599dcf3f98d18#10b6f752ba8ea735c3d9edaa549599dcf3f98d18"
+source = "git+https://github.com/vandycknick/libkrun.git?rev=11dbc7863a6ca6176939d48147e67f03d34eeda0#11dbc7863a6ca6176939d48147e67f03d34eeda0"
 dependencies = [
- "kvm-bindings 0.14.0",
- "kvm-ioctls 0.24.0",
+ "kvm-bindings 0.14.1",
+ "kvm-ioctls 0.25.0",
  "vmm-sys-util 0.15.0",
 ]
 
 [[package]]
 name = "krun-devices"
 version = "0.1.0-2.0.0-dev"
-source = "git+https://github.com/vandycknick/libkrun.git?rev=10b6f752ba8ea735c3d9edaa549599dcf3f98d18#10b6f752ba8ea735c3d9edaa549599dcf3f98d18"
+source = "git+https://github.com/vandycknick/libkrun.git?rev=11dbc7863a6ca6176939d48147e67f03d34eeda0#11dbc7863a6ca6176939d48147e67f03d34eeda0"
 dependencies = [
  "bitflags 1.3.2",
  "caps",
@@ -2464,26 +2431,24 @@ dependencies = [
  "krun-polly",
  "krun-utils",
  "krun-whp",
- "kvm-bindings 0.14.0",
- "kvm-ioctls 0.24.0",
+ "kvm-bindings 0.14.1",
+ "kvm-ioctls 0.25.0",
  "libc",
  "libloading 0.8.9",
  "log",
  "lru",
  "nix 0.30.1",
  "rand",
- "vhost",
  "virtio-bindings",
  "vm-fdt",
- "vm-memory 0.17.1",
- "vmm-sys-util 0.15.0",
+ "vm-memory",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "krun-hvf"
 version = "0.1.0-2.0.0-dev"
-source = "git+https://github.com/vandycknick/libkrun.git?rev=10b6f752ba8ea735c3d9edaa549599dcf3f98d18#10b6f752ba8ea735c3d9edaa549599dcf3f98d18"
+source = "git+https://github.com/vandycknick/libkrun.git?rev=11dbc7863a6ca6176939d48147e67f03d34eeda0#11dbc7863a6ca6176939d48147e67f03d34eeda0"
 dependencies = [
  "crossbeam-channel",
  "krun-arch",
@@ -2494,16 +2459,16 @@ dependencies = [
 [[package]]
 name = "krun-kernel"
 version = "0.1.0-2.0.0-dev"
-source = "git+https://github.com/vandycknick/libkrun.git?rev=10b6f752ba8ea735c3d9edaa549599dcf3f98d18#10b6f752ba8ea735c3d9edaa549599dcf3f98d18"
+source = "git+https://github.com/vandycknick/libkrun.git?rev=11dbc7863a6ca6176939d48147e67f03d34eeda0#11dbc7863a6ca6176939d48147e67f03d34eeda0"
 dependencies = [
  "krun-utils",
- "vm-memory 0.17.1",
+ "vm-memory",
 ]
 
 [[package]]
 name = "krun-polly"
 version = "0.1.0-2.0.0-dev"
-source = "git+https://github.com/vandycknick/libkrun.git?rev=10b6f752ba8ea735c3d9edaa549599dcf3f98d18#10b6f752ba8ea735c3d9edaa549599dcf3f98d18"
+source = "git+https://github.com/vandycknick/libkrun.git?rev=11dbc7863a6ca6176939d48147e67f03d34eeda0#11dbc7863a6ca6176939d48147e67f03d34eeda0"
 dependencies = [
  "krun-utils",
  "libc",
@@ -2512,58 +2477,30 @@ dependencies = [
 [[package]]
 name = "krun-smbios"
 version = "0.1.0-2.0.0-dev"
-source = "git+https://github.com/vandycknick/libkrun.git?rev=10b6f752ba8ea735c3d9edaa549599dcf3f98d18#10b6f752ba8ea735c3d9edaa549599dcf3f98d18"
+source = "git+https://github.com/vandycknick/libkrun.git?rev=11dbc7863a6ca6176939d48147e67f03d34eeda0#11dbc7863a6ca6176939d48147e67f03d34eeda0"
 dependencies = [
- "vm-memory 0.17.1",
+ "vm-memory",
 ]
 
 [[package]]
 name = "krun-utils"
 version = "0.1.0-2.0.0-dev"
-source = "git+https://github.com/vandycknick/libkrun.git?rev=10b6f752ba8ea735c3d9edaa549599dcf3f98d18#10b6f752ba8ea735c3d9edaa549599dcf3f98d18"
+source = "git+https://github.com/vandycknick/libkrun.git?rev=11dbc7863a6ca6176939d48147e67f03d34eeda0#11dbc7863a6ca6176939d48147e67f03d34eeda0"
 dependencies = [
  "bitflags 1.3.2",
  "crossbeam-channel",
- "kvm-bindings 0.14.0",
+ "kvm-bindings 0.14.1",
  "libc",
  "log",
  "nix 0.30.1",
  "vmm-sys-util 0.15.0",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "krun-vmm"
-version = "0.1.0-2.0.0-dev"
-source = "git+https://github.com/vandycknick/libkrun.git?rev=10b6f752ba8ea735c3d9edaa549599dcf3f98d18#10b6f752ba8ea735c3d9edaa549599dcf3f98d18"
-dependencies = [
- "bzip2",
- "crossbeam-channel",
- "flate2",
- "krun-arch",
- "krun-arch-gen",
- "krun-cpuid",
- "krun-devices",
- "krun-hvf",
- "krun-kernel",
- "krun-polly",
- "krun-utils",
- "kvm-bindings 0.14.0",
- "kvm-ioctls 0.24.0",
- "libc",
- "linux-loader",
- "log",
- "nix 0.30.1",
- "vm-memory 0.17.1",
- "vmm-sys-util 0.15.0",
- "windows-sys 0.61.2",
- "zstd",
 ]
 
 [[package]]
 name = "krun-whp"
 version = "0.1.0-2.0.0-dev"
-source = "git+https://github.com/vandycknick/libkrun.git?rev=10b6f752ba8ea735c3d9edaa549599dcf3f98d18#10b6f752ba8ea735c3d9edaa549599dcf3f98d18"
+source = "git+https://github.com/vandycknick/libkrun.git?rev=11dbc7863a6ca6176939d48147e67f03d34eeda0#11dbc7863a6ca6176939d48147e67f03d34eeda0"
 dependencies = [
  "log",
  "windows-sys 0.61.2",
@@ -2590,9 +2527,9 @@ dependencies = [
 
 [[package]]
 name = "kvm-bindings"
-version = "0.14.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b3c06ff73c7ce03e780887ec2389d62d2a2a9ddf471ab05c2ff69207cd3f3b4"
+checksum = "11cf0ca75d59e9d298647c59cf6c5286fa048120caa77972a7a504a0824d234f"
 dependencies = [
  "vmm-sys-util 0.15.0",
 ]
@@ -2611,12 +2548,12 @@ dependencies = [
 
 [[package]]
 name = "kvm-ioctls"
-version = "0.24.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "333f77a20344a448f3f70664918135fddeb804e938f28a99d685bd92926e0b19"
+checksum = "06ac372c120eb893b086d1a12027669cf2b478d1f71204021ffa7adf57948d63"
 dependencies = [
  "bitflags 2.13.1",
- "kvm-bindings 0.14.0",
+ "kvm-bindings 0.14.1",
  "libc",
  "vmm-sys-util 0.15.0",
 ]
@@ -2636,23 +2573,34 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libkrun"
 version = "2.0.0-dev"
-source = "git+https://github.com/vandycknick/libkrun.git?rev=10b6f752ba8ea735c3d9edaa549599dcf3f98d18#10b6f752ba8ea735c3d9edaa549599dcf3f98d18"
+source = "git+https://github.com/vandycknick/libkrun.git?rev=11dbc7863a6ca6176939d48147e67f03d34eeda0#11dbc7863a6ca6176939d48147e67f03d34eeda0"
 dependencies = [
+ "bitflags 2.13.1",
+ "bzip2",
  "crossbeam-channel",
  "env_logger",
+ "flate2",
+ "krun-arch",
+ "krun-arch-gen",
+ "krun-cpuid",
  "krun-devices",
  "krun-hvf",
+ "krun-kernel",
  "krun-polly",
  "krun-utils",
- "krun-vmm",
- "kvm-bindings 0.14.0",
- "kvm-ioctls 0.24.0",
+ "kvm-bindings 0.14.1",
+ "kvm-ioctls 0.25.0",
  "libc",
  "libloading 0.8.9",
+ "linux-loader",
  "log",
+ "nix 0.30.1",
  "once_cell",
- "vm-memory 0.17.1",
+ "thiserror 2.0.19",
+ "vm-memory",
+ "vmm-sys-util 0.15.0",
  "windows-sys 0.61.2",
+ "zstd",
 ]
 
 [[package]]
@@ -2731,11 +2679,11 @@ dependencies = [
 
 [[package]]
 name = "linux-loader"
-version = "0.13.2"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de72cb02c55ecffcf75fe78295926f872eb6eb0a58d629c58a8c324dc26380f6"
+checksum = "d54207cb617cd75b10c57ad20235c914ab62b180ceeff2ef3111983670d3b321"
 dependencies = [
- "vm-memory 0.17.1",
+ "vm-memory",
 ]
 
 [[package]]
@@ -2794,6 +2742,17 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "maybe-async"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "746873a384ad60adc5db74471dfaba74bd278afbdcfd81db93fafcdfc8b5ca0c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "md-5"
@@ -3107,7 +3066,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3938,7 +3897,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4109,6 +4068,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rprobe"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "rsa"
 version = "0.10.0-rc.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4275,7 +4241,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4332,7 +4298,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4681,6 +4647,81 @@ dependencies = [
 ]
 
 [[package]]
+name = "silo-vmm"
+version = "0.1.0"
+dependencies = [
+ "agent-spec",
+ "async-trait",
+ "base64 0.23.0",
+ "bytes",
+ "bzip2",
+ "chrono",
+ "clap",
+ "eyre",
+ "forward-spec",
+ "futures",
+ "hyper-util",
+ "kvm-ioctls 0.22.1",
+ "libc",
+ "libkrun",
+ "nix 0.31.3",
+ "notify",
+ "prost-types",
+ "protocol",
+ "rand",
+ "rprobe",
+ "serde",
+ "serde_json",
+ "test-utils",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-health",
+ "tonic-reflection",
+ "tower",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "utils",
+ "uuid",
+ "vm-spec",
+ "vz",
+]
+
+[[package]]
+name = "silod"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "disk-image",
+ "eyre",
+ "libvm",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "silod-spec",
+ "tempfile",
+ "tokio",
+ "utils",
+ "uuid",
+ "vm-spec",
+]
+
+[[package]]
+name = "silod-spec"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4724,7 +4765,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5112,7 +5153,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5713,7 +5754,6 @@ checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
- "rand",
  "serde_core",
  "wasm-bindgen",
 ]
@@ -5746,79 +5786,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "vhost"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c63c14485260662b4257bd929d5fd4aaf96bbecbe61d2224bad8807849f5f8f"
-dependencies = [
- "bitflags 2.13.1",
- "libc",
- "uuid",
- "vm-memory 0.18.0",
- "vmm-sys-util 0.15.0",
-]
-
-[[package]]
-name = "vhost-user-backend"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "555753b65bc33837bd011f981e2c6d52d8ddc330d92c2deb9aa3f0b378a58bcc"
-dependencies = [
- "libc",
- "log",
- "vhost",
- "virtio-bindings",
- "virtio-queue",
- "vm-memory 0.18.0",
- "vmm-sys-util 0.15.0",
-]
-
-[[package]]
-name = "vhost-vsock"
-version = "0.1.0"
-dependencies = [
- "epoll",
- "log",
- "tempfile",
- "thiserror 2.0.19",
- "vhost",
- "vhost-user-backend",
- "virtio-bindings",
- "virtio-queue",
- "virtio-vsock",
- "vm-memory 0.18.0",
- "vmm-sys-util 0.15.0",
-]
-
-[[package]]
 name = "virtio-bindings"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
-
-[[package]]
-name = "virtio-queue"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f631bfd09362a9b17f0cfd5ca3b0a1b179d153fa276f9ce86919d560891e61d6"
-dependencies = [
- "libc",
- "log",
- "virtio-bindings",
- "vm-memory 0.18.0",
- "vmm-sys-util 0.15.0",
-]
-
-[[package]]
-name = "virtio-vsock"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79123315dc0bad0a2923891c0cdf76269cc64f553548e7b090c2676776ea6baf"
-dependencies = [
- "virtio-bindings",
- "virtio-queue",
- "vm-memory 0.18.0",
-]
 
 [[package]]
 name = "virtue"
@@ -5834,22 +5805,10 @@ checksum = "7e21282841a059bb62627ce8441c491f09603622cd5a21c43bfedc85a2952f23"
 
 [[package]]
 name = "vm-memory"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f39348a049689cabd3377cdd9182bf526ec76a6f823b79903896452e9d7a7380"
-dependencies = [
- "libc",
- "thiserror 2.0.19",
- "winapi",
-]
-
-[[package]]
-name = "vm-memory"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b55e753c7725603745cb32b2287ef7ef3da05c03c7702cda3fa8abe25ae0465"
 dependencies = [
- "arc-swap",
  "libc",
  "thiserror 2.0.19",
  "winapi",
@@ -5884,48 +5843,6 @@ checksum = "506c62fdf617a5176827c2f9afbcf1be155b03a9b4bf9617a60dbc07e3a1642f"
 dependencies = [
  "bitflags 1.3.2",
  "libc",
-]
-
-[[package]]
-name = "vmmon"
-version = "0.1.0"
-dependencies = [
- "agent-spec",
- "async-trait",
- "base64 0.23.0",
- "bytes",
- "chrono",
- "clap",
- "eyre",
- "forward-spec",
- "futures",
- "hyper-util",
- "krun",
- "libc",
- "nix 0.31.3",
- "notify",
- "prost-types",
- "protocol",
- "rand",
- "serde",
- "serde_json",
- "test-utils",
- "thiserror 2.0.19",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-health",
- "tonic-reflection",
- "tower",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "utils",
- "uuid",
- "vhost-vsock",
- "vm-spec",
- "vz",
 ]
 
 [[package]]
@@ -6104,7 +6021,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -18,6 +18,19 @@ The short version:
 
 Only network policies are implemented today. Kernel and userspace policies are the direction.
 
+The optional system appliance is managed by the separate `silod` executable.
+`silo daemon up` starts it through the native service manager; the CLI does not
+run the daemon loop. Direct CLI VM operations continue to use libvm in process.
+
+Each running VM is supervised by one `silo-vmm` process, Silo's virtual machine
+monitor (VMM). It manages VM configuration, execution, and lifecycle across
+virtualization backends.
+With the default krun backend, libkrun runs in a private worker: the same
+`silo-vmm` executable started with argv[0] `krun`. There is no standalone
+krun runtime binary. Runtime packages ship it as `bin/silo-vmm` (or
+`Contents/Helpers/silo-vmm` in `Silo.app`). See the
+[silo-vmm architecture and qualification notes](docs/architecture/silo-vmm.md).
+
 ## CLI
 
 Build the CLI locally:
@@ -105,6 +118,18 @@ silo stop dev
 silo rm dev
 ```
 
+## Persistent Docker Service
+
+Silo can run an optional per-user Docker Engine in a persistent system VM. Its
+engine data survives daemon and appliance replacement, while the host uses the
+dedicated `silo` Docker context and `~/.silo/run/docker.sock` endpoint. This is
+separate from ordinary Silo VMs and does not require or replace a host Docker
+Engine.
+
+See the [system daemon operator guide](docs/system-daemon.md) for setup,
+security implications, lifecycle, upgrades, recovery, and deliberate v1
+limitations.
+
 ## SDK
 
 Use `libvm` when you want to create and manage machines directly from Rust. See
@@ -141,3 +166,4 @@ async fn main() -> Result<(), LibVmError> {
 - [Hybrid vsock](docs/hybrid-vsock.md)
 - [Terminology](docs/terminology.md)
 - [Guest agent](guest/agent/README.md)
+- [System daemon](docs/system-daemon.md)

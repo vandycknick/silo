@@ -14,13 +14,14 @@ use crate::targets::HostTarget;
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Component {
     Cli,
-    Vmmon,
+    Silod,
+    SiloVmm,
     Netd,
-    Krun,
     Agent,
     Portd,
     Init,
     Initramfs,
+    Rprobe,
     GoFfi,
 }
 
@@ -39,22 +40,26 @@ pub enum ComponentError {
     Initramfs(#[from] crate::initramfs::InitramfsError),
     #[error(transparent)]
     Release(#[from] release::ReleaseError),
+    #[error(transparent)]
+    Rprobe(#[from] crate::rprobe::RprobeError),
     #[error("failed to create output directory {path}")]
     CreateOutputDirectory {
         path: std::path::PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("vmmon binary not found after build: {path}")]
-    MissingVmmonBinary { path: std::path::PathBuf },
+    #[error("silo-vmm binary not found after build: {path}")]
+    MissingVmmBinary { path: std::path::PathBuf },
+    #[error("rprobe must be built natively on Linux ARM64")]
+    UnsupportedRprobeHost,
 }
 
 pub fn build_all(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     for component in [
         Component::Cli,
-        Component::Vmmon,
+        Component::Silod,
+        Component::SiloVmm,
         Component::Netd,
-        Component::Krun,
         Component::Agent,
         Component::Init,
     ] {
@@ -69,13 +74,14 @@ pub fn build_component(
 ) -> Result<(), ComponentError> {
     match component {
         Component::Cli => build_cargo_package(context, "cli"),
-        Component::Vmmon => build_vmmon(context),
+        Component::Silod => build_cargo_package(context, "silod"),
+        Component::SiloVmm => build_vmm(context),
         Component::Netd => build_netd(context),
-        Component::Krun => build_krun(context),
         Component::Agent => build_guest_agent(context),
         Component::Portd => build_guest_portd(context),
         Component::Init => build_guest_init(context),
         Component::Initramfs => build_initramfs(context),
+        Component::Rprobe => build_rprobe(context),
         Component::GoFfi => build_cargo_package(context, "silo-go-ffi"),
     }
 }
@@ -117,7 +123,18 @@ pub fn clippy(
     for member in host.workspace_excludes() {
         cargo.args(["--exclude", member]);
     }
-    command::run(cargo)
+    command::run(cargo)?;
+
+    let mut rprobe = standard_cargo_command(workspace_root, target_dir);
+    rprobe.args([
+        "clippy",
+        "--locked",
+        "-p",
+        "rprobe",
+        "--lib",
+        "--no-default-features",
+    ]);
+    command::run(rprobe)
 }
 
 pub fn test_units(
@@ -137,7 +154,18 @@ pub fn test_units(
     for member in host.workspace_excludes() {
         cargo.args(["--exclude", member]);
     }
-    command::run(cargo)
+    command::run(cargo)?;
+
+    let mut rprobe = standard_cargo_command(workspace_root, target_dir);
+    rprobe.args([
+        "test",
+        "--locked",
+        "-p",
+        "rprobe",
+        "--lib",
+        "--no-default-features",
+    ]);
+    command::run(rprobe)
 }
 
 pub fn test_integration(
@@ -173,21 +201,21 @@ fn build_cargo_package(context: &BuildContext<'_>, package: &str) -> Result<(), 
     Ok(())
 }
 
-fn build_vmmon(context: &BuildContext<'_>) -> Result<(), ComponentError> {
-    build_cargo_package(context, "vmmon")?;
+fn build_vmm(context: &BuildContext<'_>) -> Result<(), ComponentError> {
+    build_cargo_package(context, "silo-vmm")?;
 
     if context.host == HostTarget::MacosArm64 {
         let binary = context
             .target_dir
             .join(context.profile.directory())
-            .join("vmmon");
+            .join("silo-vmm");
         if !binary.is_file() {
-            return Err(ComponentError::MissingVmmonBinary { path: binary });
+            return Err(ComponentError::MissingVmmBinary { path: binary });
         }
 
         let entitlements = context
             .workspace_root
-            .join("runtime/vmmon/vmmon.entitlements");
+            .join("virt/vmm/silo-vmm.entitlements");
         let mut sign = Command::new("/usr/bin/codesign");
         sign.args(["-f", "--entitlements"])
             .arg(entitlements)
@@ -210,7 +238,7 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         source,
     })?;
 
-    let go_program = release::tool("go")?;
+    let go_program = release::go_program(context.profile == Profile::Release)?;
     let (goos, goarch) = context.host.go_target();
     let mut go = Command::new(&go_program);
     go.current_dir(context.workspace_root.join("net/netd"))
@@ -218,7 +246,12 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         .env("GOOS", goos)
         .env("GOARCH", goarch)
         .args(["build", "-mod=readonly"]);
-    release::configure_command(&mut go, context.profile == Profile::Release)?;
+    release::configure_command(
+        &mut go,
+        context.profile == Profile::Release,
+        context.workspace_root,
+        context.target_dir,
+    )?;
     go.env("CARGO_TARGET_DIR", context.target_dir);
     context.profile.apply_go(&mut go);
     let output = output_dir.join("netd");
@@ -227,31 +260,6 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
     if context.profile == Profile::Release && context.host == HostTarget::MacosArm64 {
         release::set_macos_build_version(&output)?;
     }
-    Ok(())
-}
-
-fn build_krun(context: &BuildContext<'_>) -> Result<(), ComponentError> {
-    let mut cargo = cargo_command(context)?;
-    cargo.args([
-        "build",
-        "--locked",
-        "-p",
-        "krun",
-        "--features",
-        "krun-bin",
-        "--bin",
-        "krun",
-    ]);
-    context.profile.apply_cargo(&mut cargo);
-    command::run(cargo)?;
-
-    let krun = context
-        .target_dir
-        .join(context.profile.directory())
-        .join("krun");
-    let mut smoke = Command::new(krun);
-    smoke.arg("--help");
-    command::output(smoke)?;
     Ok(())
 }
 
@@ -295,9 +303,54 @@ fn build_guest_init(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         "--target",
         context.host.guest_target().triple(),
     ]);
-    release::configure_guest_init_command(&mut cargo, context.profile == Profile::Release);
+    release::configure_guest_init_command(
+        &mut cargo,
+        context.profile == Profile::Release,
+        context.workspace_root,
+        context.target_dir,
+    );
     context.profile.apply_cargo(&mut cargo);
     command::run(cargo)?;
+    Ok(())
+}
+
+fn build_rprobe(context: &BuildContext<'_>) -> Result<(), ComponentError> {
+    if context.host != HostTarget::LinuxArm64 {
+        return Err(ComponentError::UnsupportedRprobeHost);
+    }
+    let mut cargo = cargo_command(context)?;
+    cargo.args([
+        "build",
+        "--locked",
+        "-p",
+        "rprobe",
+        "--features",
+        "probe-bin",
+        "--bin",
+        "silo-rprobe",
+        "--target",
+        "aarch64-unknown-linux-musl",
+    ]);
+    release::configure_guest_init_command(
+        &mut cargo,
+        context.profile == Profile::Release,
+        context.workspace_root,
+        context.target_dir,
+    );
+    context.profile.apply_cargo(&mut cargo);
+    command::run(cargo)?;
+    let binary = context
+        .target_dir
+        .join("aarch64-unknown-linux-musl")
+        .join(context.profile.directory())
+        .join("silo-rprobe");
+    let profile = context.target_dir.join(context.profile.directory());
+    crate::rprobe::build_kernel(
+        context.workspace_root,
+        &binary,
+        &profile.join("rprobe-build"),
+        &profile.join("assets"),
+    )?;
     Ok(())
 }
 
@@ -322,7 +375,12 @@ fn cargo_command(context: &BuildContext<'_>) -> Result<Command, ComponentError> 
     cargo
         .current_dir(context.workspace_root)
         .env("CARGO_TARGET_DIR", context.target_dir);
-    release::configure_command(&mut cargo, context.profile == Profile::Release)?;
+    release::configure_command(
+        &mut cargo,
+        context.profile == Profile::Release,
+        context.workspace_root,
+        context.target_dir,
+    )?;
     cargo.env("CARGO_TARGET_DIR", context.target_dir);
     Ok(cargo)
 }
@@ -333,4 +391,28 @@ fn standard_cargo_command(workspace_root: &Path, target_dir: &Path) -> Command {
         .current_dir(workspace_root)
         .env("CARGO_TARGET_DIR", target_dir);
     cargo
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::components::{build_rprobe, BuildContext, ComponentError};
+    use crate::profiles::Profile;
+    use crate::targets::HostTarget;
+    use std::path::Path;
+
+    #[test]
+    fn probe_build_requires_native_linux_arm64() {
+        for host in [HostTarget::MacosArm64, HostTarget::LinuxX86_64] {
+            let context = BuildContext {
+                workspace_root: Path::new("."),
+                target_dir: Path::new("target"),
+                profile: Profile::Debug,
+                host,
+            };
+            assert!(matches!(
+                build_rprobe(&context),
+                Err(ComponentError::UnsupportedRprobeHost)
+            ));
+        }
+    }
 }

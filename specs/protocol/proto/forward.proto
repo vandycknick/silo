@@ -17,7 +17,7 @@ service GuestForwardService {
 message ListenRequest {
   // Guest address in the endpoint grammar without the side prefix.
   string listen = 1;
-  // 16 random bytes issued by vmmon and presented on the return port as hex.
+  // 16 random bytes issued by vmm and presented on the return port as hex.
   bytes token = 2;
   // Permission bits for a Unix listener. Defaults to 0600.
   optional uint32 unix_mode = 3;
@@ -39,7 +39,7 @@ message ListenerFailed {
   ErrorDetail error = 1;
 }
 
-// Host side, served by vmmon on vm.sock.
+// Host side, served by vmm on vm.sock.
 service VmForwardService {
   // Open a session-scoped forward that exists while this stream is open.
   rpc Open(OpenForwardRequest) returns (stream ForwardStatus);

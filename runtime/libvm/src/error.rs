@@ -5,17 +5,17 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LibVmError {
-    #[error("could not resolve Silo data directory from XDG_DATA_HOME or HOME")]
-    DataDirUnavailable,
+    #[error("could not resolve the Silo home from SILO_HOME or HOME")]
+    HomeUnavailable,
 
-    #[error("could not resolve Silo state directory from XDG_STATE_HOME or HOME")]
-    StateDirUnavailable,
-
-    #[error("could not resolve Silo config directory from XDG_CONFIG_HOME or HOME")]
+    #[error("could not resolve the Silo config directory from XDG_CONFIG_HOME or HOME")]
     ConfigDirUnavailable,
 
     #[error("environment variable {name} must be an absolute path, got {path}")]
     RelativeEnvironmentPath { name: &'static str, path: PathBuf },
+
+    #[error("invalid SILO_VIRT_BACKEND value {value:?}; expected krun or vz")]
+    InvalidVirtBackendOverride { value: String },
 
     #[error("invalid Silo run root {path}: {message}")]
     InvalidRunRoot { path: PathBuf, message: String },
@@ -53,14 +53,14 @@ pub enum LibVmError {
         source_kind: crate::ImageSourceKind,
     },
 
-    #[error("could not canonicalize local disk {path}: {source}")]
+    #[error("could not canonicalize local disk {path}")]
     LocalDiskCanonicalize {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("could not inspect local disk {path}: {source}")]
+    #[error("could not inspect local disk {path}")]
     LocalDiskMetadata {
         path: PathBuf,
         #[source]
@@ -70,7 +70,7 @@ pub enum LibVmError {
     #[error("local disk {path} is invalid: path must point to a regular file")]
     LocalDiskNotRegularFile { path: PathBuf },
 
-    #[error("could not read local disk {path}: {source}")]
+    #[error("could not read local disk {path}")]
     LocalDiskUnreadable {
         path: PathBuf,
         #[source]
@@ -137,10 +137,10 @@ pub enum LibVmError {
     #[error("network runtime for {reference} failed: {message}")]
     NetworkRuntime { reference: String, message: String },
 
-    #[error("vmmon executable not found; checked {searched}")]
+    #[error("silo-vmm executable not found; checked {searched}")]
     VmMonExecutableNotFound { searched: String },
 
-    #[error("vmmon executable path is not a file: {path}")]
+    #[error("silo-vmm executable path is not a file: {path}")]
     VmMonExecutableInvalid { path: PathBuf },
 
     #[error("invalid runtime component input from {input}: {message}")]
@@ -230,10 +230,10 @@ impl LibVmError {
     /// cannot silently degrade a binding to message parsing or an unknown kind.
     pub fn variant(&self) -> &'static str {
         match self {
-            Self::DataDirUnavailable => "DataDirUnavailable",
-            Self::StateDirUnavailable => "StateDirUnavailable",
+            Self::HomeUnavailable => "HomeUnavailable",
             Self::ConfigDirUnavailable => "ConfigDirUnavailable",
             Self::RelativeEnvironmentPath { .. } => "RelativeEnvironmentPath",
+            Self::InvalidVirtBackendOverride { .. } => "InvalidVirtBackendOverride",
             Self::InvalidRunRoot { .. } => "InvalidRunRoot",
             Self::InvalidOwnedPath { .. } => "InvalidOwnedPath",
             Self::InvalidMachineName { .. } => "InvalidMachineName",

@@ -50,7 +50,7 @@ the selected root disk and persists a stopped machine; it never starts the VM.
 `Machine::start` and `Machine::stop` manage a persisted machine. A normal start
 creates an idle VM. `Machine::start_with` can instead set one
 `Entrypoint`; startup succeeds only after that guest program launches, and
-`vmmon` stops the VM when the program exits:
+`silo-vmm` stops the VM when the program exits:
 
 ```rust,no_run
 use libvm::Runtime;
@@ -89,45 +89,43 @@ without reconstructing image metadata.
 
 ## Runtime Roots
 
-The first runtime open resolves root defaults from process configuration,
-creates `state.db`, and stores the durable root contract in `db_config`.
-Later opens require explicit durable roots to match that contract. The run root
-is resolved again for each open and is intentionally not database identity.
+A local runtime has two roots (see
+[ADR 0017](../../docs/adr/0017-single-host-state-root.md)):
 
-The persisted root contract stores only main roots:
+- The **home** holds all persistent state. It defaults to `~/.silo`;
+  `SILO_HOME` overrides it and must be absolute. Pass an explicit home with
+  `RuntimeConfig::local(home)` or `RuntimeBuilder::home(..)`, and read the
+  resolved value back with `Runtime::local_home()`.
+- The **run root** is always `/tmp/silo-<effective-uid>` and holds generated
+  sockets, pidfiles, and locks. A fixed short root keeps Unix socket paths under
+  the `sun_path` limit regardless of the home path. Its final directory must be
+  a non-symlink directory owned by the effective user with exact mode `0700`.
 
-- `data_root`: durable manager state. `state.db`, machines, assets, keys, and
-  `secrets.json` derive from this root.
-- `state_root`: durable operational state, defaulting to
-  `$XDG_STATE_HOME/silo` or `$HOME/.local/state/silo`.
-- `image_root`: local image and cache storage.
+Configuration is separate: `libvm::HostPaths` resolves the config directory
+`${XDG_CONFIG_HOME:-~/.config}/silo`, with `<home>/config.yaml` as a fallback
+config file read only when the XDG one is absent. No other XDG variable is
+consulted.
 
-The run root is selected per open from an explicit configuration value,
-`$XDG_RUNTIME_DIR/silo`, or `/tmp/silo-<effective-uid>`. It is never stored in
-the database. Its final directory must be a non-symlink directory owned by the
-effective user with exact mode `0700`.
-
-`db_config` is a singleton row with `id = 1`. It records the host `os`,
-`data_root`, `state_root`, `image_root`, `created_at`, and `modified_at`. Derived
-paths are not duplicated in the row unless they become independently
-configurable. The derivation is:
+`db_config` is a singleton row with `id = 1` that records only the host `os`,
+`created_at`, and `modified_at`. No root path is stored in the database. The
+derivation is:
 
 | Path           | Derived from             |
 | -------------- | ------------------------ |
-| `state.db`     | `data_root/state.db`     |
-| `machines/`    | `data_root/machines`     |
-| `assets/`      | `data_root/assets`       |
-| `keys/`        | `data_root/keys`         |
-| `secrets.json` | `data_root/secrets.json` |
-| `images/`      | `image_root`             |
+| `state.db`     | `home/state.db`          |
+| `machines/<id>/` | `home/machines/<id>` (launch config, disks, initramfs) |
+| `keys/`        | `home/keys`              |
+| `secrets.json` | `home/secrets.json`      |
+| `images/`      | `home/images`            |
+| machine logs and exit records | `home/logs/machines/<id>/` |
+| private-network logs | `home/logs/machines/<id>/network/` |
 | `locks/`       | `run_root/locks`         |
 | `machines/<id>/vm.pid` | `run_root/machines/<id>/vm.pid` |
 | `machines/<id>/vm.sock` | `run_root/machines/<id>/vm.sock` |
+| `machines/<id>/vm.lock` | `run_root/machines/<id>/vm.lock` |
 | `machines/<id>/<uds>` | enabled public vsock mux |
 | `machines/<id>/<uds>_<port>` | extension-owned guest-to-host listener |
 | `networks/`    | `run_root/networks`      |
-| machine logs and exit records | `state_root/logs/machines/<id>/` |
-| private-network logs | `state_root/logs/machines/<id>/network/` |
 
 ### State Database Reset
 
@@ -139,11 +137,15 @@ database, machine, runtime, or cache files.
 
 ## Runtime Components
 
-`Runtime::new` resolves `vmmon`, `netd`, `krun`, `kernel-default`, `initramfs`,
+`Runtime::new` resolves `silo-vmm`, `netd`, `kernel-default`, `initramfs`,
 and `agent` once, validates them as absolute paths, and retains that immutable
-set for the runtime lifetime. Machine starts launch the resolved absolute
-`vmmon` path directly. `vmmon` receives the resolved absolute `krun` path as
-private launch state and keeps the `vmmon -> krun` process boundary intact.
+set for the runtime lifetime. `SILO_VMM_PATH`, or
+`RuntimeConfig::with_supervisor_path` / `RuntimeBuilder::supervisor_path`,
+replaces only the `silo-vmm` path. Machine starts launch the resolved absolute
+`silo-vmm` path directly. For the krun backend,
+silo-vmm re-executes itself with argv[0] `krun` to run libkrun in a
+private worker, so there is no separate krun component to resolve (see
+[silo-vmm architecture](../../docs/architecture/silo-vmm.md)).
 Private networking launches the resolved absolute `netd` path directly.
 
 ## Hybrid Vsock Paths
@@ -157,7 +159,7 @@ paths also return `None` for Silo's reserved host port 1027.
 
 Resolving an enabled path creates the owner-only machine runtime directory so an
 extension can bind a listener before VM startup. The extension owns that
-listener and must close it during shutdown. Vmmon cleans up its mux and private
+listener and must close it during shutdown. silo-vmm cleans up its mux and private
 backend sockets, then libvm removes the complete machine runtime tree; extension
 unlink attempts must therefore tolerate an already-removed path. See the
 [hybrid vsock guide](../../docs/hybrid-vsock.md) for protocol examples, retries,
@@ -178,11 +180,11 @@ last persisted state over blocking when another process owns the machine lock.
 
 The persisted machine states mean:
 
-- `stopped`: no live `vmmon` is associated with the VM.
+- `stopped`: no live `silo-vmm` is associated with the VM.
 - `starting`: a start transaction owns the VM and is waiting for the host-side
-  `vmmon` startup handshake to finish.
-- `running`: `vmmon` is alive and the host-side startup handshake succeeded.
-- `stopping`: a stop signal was sent to `vmmon` and Silo is waiting for the
+  `silo-vmm` startup handshake to finish.
+- `running`: `silo-vmm` is alive and the host-side startup handshake succeeded.
+- `stopping`: a stop signal was sent to `silo-vmm` and Silo is waiting for the
   monitor to exit.
 - `error`: the VM is not usable until an explicit lifecycle command repairs or
   replaces the state.

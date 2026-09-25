@@ -23,6 +23,14 @@ emulation. An arm64 host cannot boot an x86 `bzImage` through libkrun.
 
 ## OCI Contract
 
+Workload kernels retain the published contract and compatibility location
+`target/kernels/<track>/<architecture>:<kernel-version>`. Their canonical local
+layout is identity-keyed below `target/kernels/.canonical/workload/`; the build
+copies the verified canonical manifest to the compatibility location.
+Canonical and compatibility directories carry separate Silo ownership markers.
+A rebuild replaces only a matching marked directory or an unmarked OCI layout
+that passes the complete expected-profile contract and provenance validation.
+
 The multi-platform index and each platform manifest use this artifact type:
 
 ```text
@@ -50,14 +58,33 @@ The remaining media types are:
 | Symbol map | `application/vnd.silo.kernel.system-map.v1` |
 | XZ-compressed diagnostic ELF | `application/vnd.silo.kernel.debug.v1+xz` |
 
+The local-only ARM64 `rprobe` profile is a separate contract:
+
+| Purpose | Media type |
+| --- | --- |
+| Artifact | `application/vnd.silo.rprobe-kernel.v1` |
+| Artifact metadata | `application/vnd.silo.rprobe-kernel.config.v1+json` |
+| Boot Image | `application/vnd.silo.rprobe-kernel.image.v1` |
+
+Its purpose is `rosetta-acquisition-probe`, and its canonical layout and
+reference include the complete build identity. It is never exported to the
+workload compatibility path or accepted by the workload publisher. Dedicated
+probe OCI publication remains future work. Local probe builds install only
+`assets/rprobe`, an ARM64 Image with its Rust PID1 embedded through Linux's
+built-in initramfs support. No manifest or external initramfs is installed for
+the probe. The embedded archive's content participates in the build identity.
+
 The artifact config records source provenance and how a loader should interpret
 the kernel blob:
 
 ```json
 {
   "schemaVersion": 1,
+  "profile": "workload",
+  "purpose": "workload",
+  "identity": "workload-arm64-sha256-...",
   "track": "stable",
-  "kernelVersion": "7.1.3",
+  "kernelVersion": "7.2.2",
   "architecture": "arm64",
   "platform": {
     "os": "linux",
@@ -65,15 +92,30 @@ the kernel blob:
   },
   "kernel": {
     "mediaType": "application/vnd.silo.kernel.image.v1",
-    "format": "arm64-image"
+    "format": "arm64-image",
+    "size": 123,
+    "digest": "sha256:..."
+  },
+  "resolvedConfig": {
+    "size": 123,
+    "digest": "sha256:..."
   },
   "source": {
-    "url": "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.1.3.tar.xz",
-    "digest": "sha256:..."
+    "url": "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.2.tar.xz",
+    "digest": "sha256:...",
+    "key": "sha256-..."
+  },
+  "inputs": {
+    "patchSet": "sha256-...",
+    "config": "sha256-...",
+    "build": "sha256-...",
+    "toolchain": "sha256-..."
   },
   "build": {
     "revision": "...",
-    "created": "..."
+    "created": "...",
+    "compiler": "...",
+    "linker": "..."
   }
 }
 ```
@@ -149,6 +191,21 @@ Kbuild always links the resident kernel as an ELF `vmlinux`. Architecture
 Makefiles may then transform it into a boot representation. For arm64, `Image`
 is the uncompressed direct-boot representation derived from `vmlinux`. For the
 current x86-64 direct-boot contract, the ELF itself is the packaged kernel.
+
+## Source Patches
+
+Workload kernels apply the ordered patches in `patches/<architecture>/` to the
+pristine source with `patch --fuzz=0 -p1`. The patch set is part of the kernel
+identity (`inputs.patchSet`), so changing, adding or removing a patch produces a
+new kernel reference.
+
+| Architecture | Patch | Purpose |
+| --- | --- | --- |
+| x86_64 | `0001-x86-krun-i8042-poweroff.patch` | Adds `arch/x86/kernel/krun_poweroff.c`. When the command line carries `krun.poweroff=i8042`, it registers a lowest-priority poweroff handler that writes `0xfe` to port `0x64`, which libkrun turns into a terminal VMM exit. Without the argument nothing is registered. The krun backend adds the argument on x86_64 only. |
+
+The x86_64 kernel has neither ACPI nor an i8042 driver, so without this patch a
+guest `poweroff` halts and the VM never exits. arm64 powers off through PSCI and
+carries no patch.
 
 ## Configuration Files
 

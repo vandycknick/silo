@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -17,15 +17,15 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
     pub(super) pool: SqlitePool,
+    /// `<home>/images`, where cached rootfs artifacts live; `state.db` is `<home>/state.db`.
+    pub(super) images_dir: PathBuf,
 }
 
 impl Store {
     #[cfg(test)]
     pub(crate) async fn new(paths: &LocalPaths) -> Result<Self, LibVmError> {
-        let store = Self::open(paths.state_db_path()).await?;
-        store
-            .read_or_seed_db_config(&DbConfig::from_roots(paths.roots()))
-            .await?;
+        let store = Self::open(&paths.state_db_path()).await?;
+        store.read_or_seed_db_config(&DbConfig::current()).await?;
         Ok(store)
     }
 
@@ -41,12 +41,19 @@ impl Store {
     }
 
     pub(crate) async fn open(state_db_path: &Path) -> Result<Self, LibVmError> {
-        if let Some(parent) = state_db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let home = state_db_path.parent().ok_or_else(|| {
+            std::io::Error::other(format!(
+                "state database {} has no parent directory",
+                state_db_path.display()
+            ))
+        })?;
+        std::fs::create_dir_all(home)?;
         let pool = Self::connect(state_db_path).await?;
         MIGRATOR.run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            images_dir: home.join("images"),
+        })
     }
 
     async fn connect(path: &Path) -> Result<SqlitePool, LibVmError> {
@@ -111,16 +118,10 @@ impl ReadOnlyStore {
     pub(crate) async fn db_config(
         &self,
     ) -> Result<Option<crate::store::models::DbConfig>, LibVmError> {
-        let row =
-            sqlx::query("SELECT os, data_root, state_root, image_root FROM db_config WHERE id = 1")
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|row| crate::store::models::DbConfig {
-            os: row.get("os"),
-            data_root: row.get("data_root"),
-            state_root: row.get("state_root"),
-            image_root: row.get("image_root"),
-        }))
+        let row = sqlx::query("SELECT os FROM db_config WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| crate::store::models::DbConfig { os: row.get("os") }))
     }
 
     pub(crate) async fn machine_name_exists(&self, name: &str) -> Result<bool, LibVmError> {
@@ -179,13 +180,14 @@ mod tests {
 
     use crate::lock_manager::LockId;
     use crate::paths::LocalPaths;
+    use crate::store::models::DbConfig;
     use crate::store::models::MachineId;
     use crate::store::models::{
         MachineConfig, MachineNetworkConfig, MachineRootfsRecord, MachineRuntimeState,
         MachineState, NetworkAttachment, NetworkDefinition, NetworkDriverPreference,
         NetworkInstance, NetworkInstanceState, NetworkTopology,
     };
-    use crate::store::{ConfigStore, MachineStore, NetworkStore, Store};
+    use crate::store::{MachineStore, NetworkStore, Store};
     use crate::LibVmError;
 
     fn temp_paths() -> (tempfile::TempDir, LocalPaths) {
@@ -232,7 +234,7 @@ mod tests {
         MachineState {
             machine_id: id,
             status,
-            vmmon_pid: None,
+            vmm_pid: None,
             started_at: None,
             run_id: None,
             last_error: None,
@@ -316,12 +318,8 @@ mod tests {
             .expect("read db_config")
             .expect("db_config row");
 
-        assert_eq!(config.data_root, paths.data_dir().display().to_string());
-        assert_eq!(
-            config.state_root,
-            paths.roots().state_root().display().to_string()
-        );
-        assert_eq!(config.image_root, paths.images_dir().display().to_string());
+        assert_eq!(config, DbConfig::current());
+        assert_eq!(db.images_dir, paths.images_dir());
     }
 
     #[tokio::test]
@@ -360,18 +358,7 @@ mod tests {
         .fetch_all(&db.pool)
         .await
         .expect("list db_config columns");
-        assert_eq!(
-            db_config_columns,
-            [
-                "id",
-                "os",
-                "data_root",
-                "state_root",
-                "image_root",
-                "created_at",
-                "modified_at",
-            ]
-        );
+        assert_eq!(db_config_columns, ["id", "os", "created_at", "modified_at"]);
 
         let network_columns = sqlx::query_scalar::<_, String>(
             "SELECT name FROM pragma_table_info('network_instances') ORDER BY cid",
@@ -776,7 +763,9 @@ mod tests {
         seed_machine(&db, &machine).await;
         db.pool.close().await;
 
-        let reopened = Store::open(paths.state_db_path()).await.expect("reopen db");
+        let reopened = Store::open(&paths.state_db_path())
+            .await
+            .expect("reopen db");
         assert_eq!(
             reopened.machine_config(id).await.expect("read config"),
             Some(machine)
@@ -858,7 +847,7 @@ mod tests {
         seed_machine(&db, &metadata).await;
 
         let state = MachineState {
-            vmmon_pid: Some(1234),
+            vmm_pid: Some(1234),
             started_at: Some(42),
             run_id: Some("run-1".to_string()),
             updated_at: 43,

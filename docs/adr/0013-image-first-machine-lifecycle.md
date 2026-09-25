@@ -2,6 +2,8 @@
 
 Date: 2026-08-07
 
+Updated: 2026-09-24
+
 ## Status
 
 Implemented
@@ -37,14 +39,14 @@ explicit command is supplied.
 name and is ephemeral; its lifecycle owner makes a best-effort removal attempt
 after completion. A named run is persistent and remains after the workload
 exits. Foreground runs attempt removal directly, while detached runs install a
-one-shot `vmmon` exit watcher. The watcher receives the exact run generation,
+one-shot `silo-vmm` exit watcher. The watcher receives the exact run generation,
 waits for that monitor process to exit, and removes the machine only if a newer
 generation has not taken ownership. Cleanup is not persisted or retried;
 failures may leave a stopped machine that can be removed with `silo rm`. The
 persisted retention value is visible through machine inspection.
 
 `silo run --detach` sets a launch-only `Entrypoint` on the start request.
-`vmmon` acknowledges the start only after the guest program launches, then
+`silo-vmm` acknowledges the start only after the guest program launches, then
 supervises the VM until the program exits. The launch-only entrypoint is not
 written into `ProcessConfig`. Detachment changes CLI attachment and ownership;
 it does not make VM lifetime independent of the workload. The VM stops when the

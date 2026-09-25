@@ -249,40 +249,53 @@ The Silo runtime layers sit above the host virtualization stack:
 flowchart TD
     CLI[silo]
     LibVm[libvm]
-    Vmmon[vmmon]
-    Virt[virt]
-    BackendDriver[vz / krun]
+    subgraph Monitor[silo-vmm]
+        Virt[virt facade]
+        Krun[krun driver]
+        Vz[vz driver]
+    end
     HostPlatform[Host virtualization platform]
     Guest[Guest VM]
     Agent[Guest agent]
 
-    CLI --> LibVm --> Vmmon --> Virt --> BackendDriver --> HostPlatform --> Guest
+    CLI --> LibVm --> Virt
+    Virt --> Krun
+    Virt --> Vz
+    Krun --> HostPlatform
+    Vz --> HostPlatform
+    HostPlatform --> Guest
     Agent -. runs inside .-> Guest
 ```
 
+### VMM and Virtualization Backends
+
+**Virtual machine monitor (VMM)** names the userspace runtime that configures, executes, and controls a VM. In Silo, that runtime is `silo-vmm`. It owns one VM generation's lifecycle, control socket, guest services, logs, and exit record. It delegates guest execution and virtual devices to a backend: libkrun on Linux and macOS, or Virtualization.framework on macOS. A VMM can compose these implementations rather than implement every virtualization primitive itself.
+
+The **supervisor process** is the lifecycle-owning part of `silo-vmm`. With libkrun, a private worker runs the backend; with Virtualization.framework, the supervisor calls the framework in process. Neither role is the host hypervisor.
+
 ### `virt`
 
-`virt` is Silo's host virtualization facade.
+`virt` is Silo's host virtualization facade, a module inside `silo-vmm`.
 
-It exposes the common Rust API that `vmmon` uses to create, start, stop, and communicate with a VM. The concrete implementation is selected at compile time by host platform.
+It exposes the common Rust API that `silo-vmm` uses to create, start, stop, and communicate with a VM. Each machine runs on one backend driver (`krun` or `vz`); the default is selected per host platform.
 
 The exported `VirtualMachine` type is Silo's per-instance VM handle. It is not the guest OS and it is not the underlying VMM implementation. It is the API handle used by Silo code to control one VM.
 
 `virt` is not a hypervisor. It is also not the product-level VM manager.
 
-### `vmmon`
+### `silo-vmm`
 
-`vmmon` is the VM monitor process.
+`silo-vmm` is Silo's virtual machine monitor executable.
 
 It supervises one running VM, exposes monitor and control APIs, tracks lifecycle state, handles guest readiness, and participates in cleanup and reconciliation.
 
-`vmmon` uses `virt` to start and control the host-selected virtualization implementation. It is Silo's process-level supervisor around one VM, not the guest VM itself.
+`silo-vmm` uses `virt` to start and control the host-selected virtualization implementation. It is Silo's process-level supervisor around one VM, not the guest VM itself. With the `krun` driver, libkrun runs in a private child process: the same executable started with argv[0] `krun`, so a libkrun crash or process exit does not take the supervisor down with it. See [silo-vmm architecture](architecture/silo-vmm.md) and [ADR 0018](adr/0018-silo-vmm-contract.md).
 
 ### `libvm`
 
 `libvm` is the higher-level VM orchestration library.
 
-It owns product-level lifecycle semantics, persisted state, image handling, launch flow, and interaction with `vmmon`.
+It owns product-level lifecycle semantics, persisted state, image handling, launch flow, and interaction with `silo-vmm`.
 
 Its role is similar in spirit to how libpod sits above lower-level container runtime pieces.
 
@@ -290,7 +303,7 @@ Its role is similar in spirit to how libpod sits above lower-level container run
 
 The guest agent is software running inside the guest VM.
 
-It is separate from the VMM, `virt`, and `vmmon`. It provides guest-side services such as readiness, shell support, or bootstrap integration.
+It is separate from the host-side VMM (`silo-vmm`) and its `virt` facade. It provides guest-side services such as readiness, shell support, or bootstrap integration.
 
 ### Host
 
@@ -304,6 +317,33 @@ Examples:
 ### Guest
 
 The guest is the operating system running inside the VM.
+
+## Memory Reclaim
+
+Four components have separate responsibilities; see
+[Memory Reclaim](architecture/memory-reclaim.md).
+
+- **FreePageReporter:** guest-kernel free-page reporting through the balloon's
+  negotiated reporting queue.
+- **HostMemoryReclaimer:** handles reports using HV unmap, per-native-page
+  `MADV_FREE`, and immediate HV map on macOS. Qualification checks page state
+  and safe reuse, not merely a lower footprint.
+- **HostMemoryRemapper:** independently maintains compatible host mappings with
+  same-address, content-preserving Mach remapping. Periodic at 30 seconds, with
+  report-driven preparation throttled to 250 ms.
+- **GuestCacheReclaimer:** the managed agent's capability-detected idle cache
+  policy, using bounded cgroup v2 `memory.reclaim` without a global cache-drop
+  fallback. No user configuration is required or exposed.
+
+Guest-free memory, advice counters, host footprint, compression, and physical
+discard must not be treated as interchangeable measurements.
+
+### Not Ballooning
+
+Silo attaches a virtio-balloon device only for its reporting queue. The
+classic **balloon inflate and deflate**, where the host demands pages and the
+guest pins them, is not used. **Free page hinting** and **virtio-mem** are
+different features again and are not used either.
 
 ## Most Important Distinction
 

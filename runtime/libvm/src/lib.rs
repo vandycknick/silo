@@ -23,6 +23,7 @@ mod constants;
 mod error;
 mod guest_agent;
 pub mod host;
+pub mod host_input;
 mod image;
 mod initramfs_overlay;
 mod lock_manager;
@@ -31,8 +32,8 @@ mod network;
 mod paths;
 mod runtime;
 mod store;
+mod supervisor;
 mod utils;
-mod vmmon;
 
 pub use crate::error::LibVmError;
 pub use crate::host::{ensure_certificate_authority, CertificateAuthority};
@@ -58,14 +59,15 @@ pub use crate::machine::{
     MachineFileDownload, MachineFileEntry, MachineFileUploadOptions, MachineFilesystemMetrics,
     MachineForwardErrorDetail, MachineForwardScope, MachineForwardSession, MachineForwardState,
     MachineForwardStatus, MachineFreshness, MachineGuestBootMode, MachineGuestBootReport,
-    MachineGuestConfig, MachineKillOptions, MachineLoadAverageMetrics, MachineLogChunk,
-    MachineLogOptions, MachineLogOutput, MachineLogSource, MachineLogStream, MachineMemoryMetrics,
-    MachineMetricSnapshot, MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus,
-    MachineNetworkInterfaceMetrics, MachineProvisionFailurePolicy, MachineProvisionOverallStatus,
-    MachineProvisionReport, MachineProvisionStatus, MachineProvisionStepReport,
-    MachineProvisionStepStatus, MachineProvisioningReport, MachineReadiness,
-    MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState, MachineRef,
-    MachineRetention, MachineRootfs, MachineRunId, MachineStaleReason, MachineStart,
+    MachineGuestConfig, MachineHostMemoryReclaim, MachineHostMemoryReclaimQualification,
+    MachineKillOptions, MachineLoadAverageMetrics, MachineLogChunk, MachineLogOptions,
+    MachineLogOutput, MachineLogSource, MachineLogStream, MachineMemoryMetrics,
+    MachineMemoryReclaimReport, MachineMetricSnapshot, MachineMetrics, MachineMonitorSnapshot,
+    MachineMonitorStatus, MachineNetworkInterfaceMetrics, MachineProvisionFailurePolicy,
+    MachineProvisionOverallStatus, MachineProvisionReport, MachineProvisionStatus,
+    MachineProvisionStepReport, MachineProvisionStepStatus, MachineProvisioningReport,
+    MachineReadiness, MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState,
+    MachineRef, MachineRetention, MachineRootfs, MachineRunId, MachineStaleReason, MachineStart,
     MachineStartOptions, MachineStatus, MachineStopOptions, MachineSystemInfo, MachineUpdate,
     MachineUserConfig, MachineUserUpdate, MachineVmSnapshot, MachineVmState, MachineWaitOptions,
     Memory, NetworkPolicyUpdate, OAuthRefreshHook, ProcessConfig, SshExitStatus, SshShellOptions,
@@ -75,11 +77,12 @@ pub use crate::network::{
     GuestPublish, MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition,
     NetworkDriver, NetworkTopology, PublishBind,
 };
+pub use crate::paths::HostPaths;
 pub use crate::runtime::{
-    NetdRuntimeConfig, PathChoice, ReadOnlyRuntime, Runtime, RuntimeBuilder, RuntimeConfig,
-    RuntimeNetworkingConfig,
+    NetdRuntimeConfig, ReadOnlyRuntime, Runtime, RuntimeBuilder, RuntimeConfig,
+    RuntimeNetworkingConfig, VirtBackendOverride,
 };
-pub use crate::vmmon::DEFAULT_GUEST_READINESS_TIMEOUT;
+pub use crate::supervisor::DEFAULT_GUEST_READINESS_TIMEOUT;
 pub use forward_spec::{
     Address as ForwardAddress, Direction as ForwardDirection, Endpoint as ForwardEndpoint, Forward,
     ForwardShape, UnixMode,

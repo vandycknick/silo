@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::path::PathBuf;
 
 use eyre::Context as _;
@@ -6,19 +5,26 @@ use libvm::{NetdRuntimeConfig, RuntimeNetworkingConfig};
 use serde::Deserialize;
 use serde_yaml_ng::{Mapping, Value};
 
-const APP_DIR_NAME: &str = "silo";
-const CONFIG_FILE_NAME: &str = "config.yaml";
+use crate::daemon::config::DaemonConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GlobalConfig {
     pub(crate) default_machine: Option<String>,
     pub(crate) networking: RuntimeNetworkingConfig,
+    pub(crate) daemon: Option<DaemonConfig>,
 }
 
 impl GlobalConfig {
     pub(crate) fn load() -> eyre::Result<Self> {
-        let config_dir = resolve_default_config_dir()?;
-        let config_path = config_dir.join(CONFIG_FILE_NAME);
+        Self::load_from(&libvm::HostPaths::from_env()?)
+    }
+
+    /// Reads the config file the host paths resolve (the config directory's
+    /// `config.yaml`, else the home fallback). Policies stay in the config
+    /// directory either way.
+    pub(crate) fn load_from(host: &libvm::HostPaths) -> eyre::Result<Self> {
+        let config_dir = host.config_dir().to_path_buf();
+        let config_path = host.config_file();
         let raw = match std::fs::read_to_string(&config_path) {
             Ok(raw) => raw,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -40,11 +46,20 @@ impl GlobalConfig {
         self.default_machine.as_deref()
     }
 
+    /// The explicit system-appliance overrides to pass to silod.
+    pub(crate) fn daemon_overrides(&self) -> eyre::Result<silod_spec::arguments::SystemOverrides> {
+        self.daemon
+            .as_ref()
+            .map(DaemonConfig::overrides)
+            .unwrap_or_else(|| Ok(Default::default()))
+    }
+
     pub(crate) fn write_default_machine(default_machine: Option<&str>) -> eyre::Result<()> {
-        let config_dir = resolve_default_config_dir()?;
-        std::fs::create_dir_all(&config_dir)
-            .with_context(|| format!("create global config directory {}", config_dir.display()))?;
-        let config_path = config_dir.join(CONFIG_FILE_NAME);
+        let config_path = libvm::HostPaths::from_env()?.config_file();
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create global config directory {}", parent.display()))?;
+        }
         write_default_machine_to_path(&config_path, default_machine)
     }
 
@@ -52,38 +67,8 @@ impl GlobalConfig {
         Self {
             default_machine: None,
             networking: RuntimeNetworkingConfig::default().with_policy_config_dir(config_dir),
+            daemon: None,
         }
-    }
-}
-
-pub(crate) fn resolve_default_config_dir() -> eyre::Result<PathBuf> {
-    let home = env_absolute_path("HOME")?;
-    let config_home = env_absolute_path("XDG_CONFIG_HOME")?
-        .or_else(|| home.as_ref().map(|path| path.join(".config")));
-
-    config_home
-        .map(|path| path.join(APP_DIR_NAME))
-        .ok_or_else(|| {
-            eyre::eyre!("could not resolve Silo config directory from XDG_CONFIG_HOME or HOME")
-        })
-}
-
-fn env_absolute_path(name: &'static str) -> eyre::Result<Option<PathBuf>> {
-    match std::env::var_os(name) {
-        Some(value) => absolute_path(name, value).map(Some),
-        None => Ok(None),
-    }
-}
-
-fn absolute_path(name: &'static str, value: OsString) -> eyre::Result<PathBuf> {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Err(eyre::eyre!(
-            "environment variable {name} must be an absolute path: {}",
-            path.display()
-        ))
     }
 }
 
@@ -105,13 +90,16 @@ fn parse_global_config(input: &str) -> eyre::Result<GlobalConfig> {
     Ok(GlobalConfig {
         default_machine,
         networking: RuntimeNetworkingConfig::default().with_netd(netd),
+        daemon: parsed.daemon,
     })
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawGlobalConfig {
     default_machine: Option<String>,
     networking: Option<RawNetworkingConfig>,
+    daemon: Option<DaemonConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,4 +205,45 @@ fn write_default_machine_to_path(
     let rendered = serde_yaml_ng::to_string(&document).context("serialize global config yaml")?;
     std::fs::write(config_path, rendered)
         .with_context(|| format!("write global config {}", config_path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::{parse_global_config, GlobalConfig};
+
+    #[test]
+    fn daemon_overrides_are_empty_without_a_config_file_or_section() {
+        let temp = tempfile::tempdir().expect("temp home");
+        let paths = libvm::HostPaths::new(temp.path().join(".silo"), temp.path().join("config"));
+        let config = GlobalConfig::load_from(&paths).expect("load missing config");
+        assert_eq!(
+            config.daemon_overrides().expect("overrides"),
+            Default::default()
+        );
+        for yaml in ["{}\n", "default_machine: example\n"] {
+            assert_eq!(
+                parse_global_config(yaml)
+                    .expect("config")
+                    .daemon_overrides()
+                    .expect("overrides"),
+                Default::default()
+            );
+        }
+        assert!(!paths.config_file().exists());
+        assert!(!paths.home().exists());
+    }
+
+    #[test]
+    fn daemon_section_is_strict_and_versioned() {
+        let config = parse_global_config(
+            "daemon:\n  version: '1'\n  system:\n    resources:\n      cpus: 2\n",
+        )
+        .expect("explicit config");
+        assert_eq!(config.daemon_overrides().expect("overrides").cpus, Some(2));
+        assert!(parse_global_config("daemon:\n  version: '1'\n  unknown: true\n").is_err());
+        assert!(parse_global_config("daemon:\n  version: '2'\n")
+            .expect("parse version")
+            .daemon_overrides()
+            .is_err());
+    }
 }

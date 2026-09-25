@@ -199,18 +199,27 @@ func resolveInstallRoot(explicit string) (string, error) {
 		}
 		return filepath.Clean(explicit), nil
 	}
-	dataHome := os.Getenv("XDG_DATA_HOME")
-	if dataHome != "" {
-		if !filepath.IsAbs(dataHome) {
-			return "", newError(ErrorRelativeEnvironmentPath, "", "XDG_DATA_HOME must be an absolute path: "+dataHome)
+	home, err := siloHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "runtimes"), nil
+}
+
+// siloHome resolves the Silo home the same way libvm does: SILO_HOME (must be
+// absolute), else $HOME/.silo.
+func siloHome() (string, error) {
+	if value := os.Getenv("SILO_HOME"); value != "" {
+		if !filepath.IsAbs(value) {
+			return "", newError(ErrorRelativeEnvironmentPath, "", "SILO_HOME must be an absolute path: "+value)
 		}
-		return filepath.Join(filepath.Clean(dataHome), "silo", "runtimes"), nil
+		return filepath.Clean(value), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" || !filepath.IsAbs(home) {
-		return "", newError(ErrorDataDirUnavailable, "", "could not resolve Silo runtime installation directory from XDG_DATA_HOME or HOME")
+		return "", newError(ErrorHomeUnavailable, "", "could not resolve the Silo home from SILO_HOME or HOME")
 	}
-	return filepath.Join(home, ".local", "share", "silo", "runtimes"), nil
+	return filepath.Join(home, ".silo"), nil
 }
 
 func materializeRuntimeArchive(ctx context.Context, parent string, config installConfig, metadata runtimeArchiveMetadata) (string, error) {
@@ -322,9 +331,8 @@ func (reader *contextReader) Read(buffer []byte) (int, error) {
 }
 
 var runtimeFiles = map[string]os.FileMode{
-	"bin/vmmon":               0o755,
+	"bin/silo-vmm":            0o755,
 	"bin/netd":                0o755,
-	"bin/krun":                0o755,
 	"assets/kernel-default":   0o644,
 	"assets/initramfs":        0o644,
 	"assets/agent":            0o755,

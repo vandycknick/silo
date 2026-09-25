@@ -1,0 +1,7 @@
+[Unit]
+Description=Silo Docker engine capability
+Requires=silo-system-docker-preflight.service containerd.service docker.service
+After=silo-system-docker-preflight.service containerd.service docker.service
+
+[Install]
+WantedBy=multi-user.target

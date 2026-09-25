@@ -11,14 +11,13 @@ export type KeyValueMap = Record<string, string>;
  * asset set.
  */
 export interface RuntimeOpenOptions {
-  /** Root directory for persistent state. */
-  dataRoot?: string;
-  /** Runtime directory for sockets and transient files. */
-  runRoot?: string;
-  /** Image cache directory. */
-  imageRoot?: string;
-  /** Explicit `vmmon` override. Remaining components use centralized discovery. */
-  vmmonPath?: string;
+  /**
+   * Silo home holding all persistent state. Defaults to `SILO_HOME`, else
+   * `~/.silo`. Generated sockets always live under `/tmp/silo-<uid>`.
+   */
+  home?: string;
+  /** Explicit `silo-vmm` override. Remaining components use centralized discovery. */
+  supervisorPath?: string;
 }
 
 /** Source used to materialize a machine root disk during `MachineBuilder.create()`. */

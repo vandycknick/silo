@@ -8,7 +8,7 @@ use super::MachineId;
 /// Persisted network runtime instance.
 ///
 /// Instances are internal driver-owned records, not public named-network
-/// configuration and not the vmmon network argument.
+/// configuration and not the silo-vmm network argument.
 pub(crate) struct NetworkInstance {
     pub id: String,
     pub driver: String,

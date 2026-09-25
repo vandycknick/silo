@@ -30,8 +30,8 @@ use crate::store::models::MachineId;
 use crate::store::models::{
     MachineConfig, NetworkAttachment, NetworkInstance, NetworkInstanceState,
 };
+use crate::supervisor::process::{self, ProcessIdentity};
 use crate::utils::now_unix;
-use crate::vmmon::process::{self, ProcessIdentity};
 use crate::{LibVmError, NetdRuntimeConfig};
 
 use super::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
@@ -81,7 +81,7 @@ impl NetworkDriverBackend for NetdDriver {
         &self,
         ctx: &NetworkDriverContext<'_>,
         request: &NetworkAttachmentRequest<'_>,
-    ) -> Result<super::VmmonNetworkAttachment, LibVmError> {
+    ) -> Result<super::VmmNetworkAttachment, LibVmError> {
         prepare_netd_runtime(ctx, request).await
     }
 }
@@ -90,7 +90,7 @@ impl NetworkDriverBackend for NetdDriver {
 async fn prepare_netd_runtime(
     ctx: &NetworkDriverContext<'_>,
     request: &NetworkAttachmentRequest<'_>,
-) -> Result<super::VmmonNetworkAttachment, LibVmError> {
+) -> Result<super::VmmNetworkAttachment, LibVmError> {
     let paths = ctx.paths;
     let store = ctx.store;
     let metadata = ctx.metadata;
@@ -214,7 +214,7 @@ async fn prepare_netd_runtime(
         });
     }
 
-    let network = super::VmmonNetworkAttachment::UnixDatagram {
+    let network = super::VmmNetworkAttachment::UnixDatagram {
         path: socket_path.clone(),
         mac: mac.clone(),
         ipv4,
@@ -222,10 +222,8 @@ async fn prepare_netd_runtime(
         requires_certificate_authority,
     };
     let (ipv4, dns) = match &network {
-        super::VmmonNetworkAttachment::UnixDatagram { ipv4, dns, .. } => {
-            (ipv4.clone(), dns.clone())
-        }
-        super::VmmonNetworkAttachment::None => {
+        super::VmmNetworkAttachment::UnixDatagram { ipv4, dns, .. } => (ipv4.clone(), dns.clone()),
+        super::VmmNetworkAttachment::None => {
             return Err(LibVmError::NetworkRuntime {
                 reference: metadata.name.clone(),
                 message: "netd created an invalid network attachment".to_string(),
@@ -289,7 +287,7 @@ async fn prepare_netd_runtime(
 async fn prepare_netd_runtime(
     _ctx: &NetworkDriverContext<'_>,
     _request: &NetworkAttachmentRequest<'_>,
-) -> Result<super::VmmonNetworkAttachment, LibVmError> {
+) -> Result<super::VmmNetworkAttachment, LibVmError> {
     let metadata = _ctx.metadata;
     Err(LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
@@ -1203,7 +1201,7 @@ netd log: /tmp/silo/netd.log";
             .spawn()
             .expect("spawn helper");
         let pid = i32::try_from(child.id()).expect("pid fits i32");
-        let started_at = crate::vmmon::process::ProcessIdentity::for_pid(pid)
+        let started_at = crate::supervisor::process::ProcessIdentity::for_pid(pid)
             .expect("read helper identity")
             .and_then(|identity| identity.started_at())
             .expect("helper has stable generation");
@@ -1236,14 +1234,8 @@ netd log: /tmp/silo/netd.log";
     async fn netd_launches_the_resolved_absolute_helper() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let data_root = temp.path().join("data");
-        let state_root = temp.path().join("state");
         let run_root = temp.path().join("run");
-        let paths = LocalPaths::from_roots(LocalRoots::with_roots(
-            &data_root,
-            &state_root,
-            &run_root,
-            data_root.join("images"),
-        ));
+        let paths = LocalPaths::from_roots(LocalRoots::with_roots(&data_root, &run_root));
         let netd = temp.path().join("runtime/bin/netd");
         std::fs::create_dir_all(netd.parent().expect("netd parent")).expect("create netd parent");
         std::fs::write(
@@ -1280,7 +1272,7 @@ netd log: /tmp/silo/netd.log";
         let state = MachineState {
             machine_id,
             status: MachineRuntimeState::Stopped,
-            vmmon_pid: None,
+            vmm_pid: None,
             started_at: None,
             run_id: None,
             last_error: None,
@@ -1308,19 +1300,19 @@ netd log: /tmp/silo/netd.log";
                 .expect("launch resolved netd");
 
         let log_path = match attachment {
-            crate::network::VmmonNetworkAttachment::UnixDatagram { .. } => {
+            crate::network::VmmNetworkAttachment::UnixDatagram { .. } => {
                 paths.machine(machine_id).network_service_log_path()
             }
-            crate::network::VmmonNetworkAttachment::None => panic!("netd must attach a socket"),
+            crate::network::VmmNetworkAttachment::None => panic!("netd must attach a socket"),
         };
         assert_eq!(
             log_path,
-            state_root
+            data_root
                 .join("logs/machines")
                 .join(machine_id.to_string())
                 .join("network/netd.log")
         );
-        assert!(!state_root.join("logs/networks").exists());
+        assert!(!data_root.join("logs/networks").exists());
         let directory_fds = std::fs::read_to_string(netd.with_extension("directories"))
             .expect("read inherited directories");
         let (log_directory_fd, runtime_directory_fd) = directory_fds

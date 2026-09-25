@@ -128,6 +128,18 @@ mod tests {
     use crate::machine::{GuestBuilder, MachineAgent, MachineGuestConfig, MachineUserConfig};
 
     #[test]
+    fn retired_reclaim_policy_is_not_persisted() {
+        let guest: MachineGuestConfig =
+            serde_json::from_str(r#"{"memoryReclaim":{"mode":"off","idleAfterSecs":120}}"#)
+                .expect("legacy guest config");
+        assert_eq!(guest, MachineGuestConfig::default());
+        assert!(serde_json::to_value(guest)
+            .expect("encode")
+            .get("memoryReclaim")
+            .is_none());
+    }
+
+    #[test]
     fn guest_builder_defaults_to_installed_agent() {
         assert_eq!(GuestBuilder::new().build(), MachineGuestConfig::default());
     }

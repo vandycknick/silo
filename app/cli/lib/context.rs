@@ -1,13 +1,15 @@
 use eyre::Context as _;
-use libvm::{Machine, MachineRef, Runtime, RuntimeConfig};
+use libvm::RuntimeConfig;
 
+use crate::api::machine::AppMachine;
+use crate::api::AppApi;
 use crate::config::GlobalConfig;
 
 #[derive(Debug)]
 pub struct Context {
     verbose: u8,
     config: Option<GlobalConfig>,
-    runtime: Option<Runtime>,
+    api: Option<AppApi>,
 }
 
 impl Context {
@@ -15,7 +17,7 @@ impl Context {
         Self {
             verbose,
             config: None,
-            runtime: None,
+            api: None,
         }
     }
 
@@ -33,21 +35,17 @@ impl Context {
             .ok_or_else(|| eyre::eyre!("global config was not initialized"))
     }
 
-    pub(crate) async fn runtime(&mut self) -> eyre::Result<&Runtime> {
-        if self.runtime.is_none() {
+    pub(crate) async fn app_api(&mut self) -> eyre::Result<&mut AppApi> {
+        if self.api.is_none() {
             let networking = self.config()?.networking.clone();
             let runtime_config = RuntimeConfig::from_env()
                 .context("resolve libvm runtime config")?
                 .with_networking(networking);
-            let runtime = Runtime::new(runtime_config)
-                .await
-                .context("initialize libvm")?;
-            self.runtime = Some(runtime);
+            self.api = Some(AppApi::local(runtime_config));
         }
-
-        self.runtime
-            .as_ref()
-            .ok_or_else(|| eyre::eyre!("libvm runtime was not initialized"))
+        self.api
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("application API was not initialized"))
     }
 
     pub(crate) fn resolve_machine_name(&mut self, name: Option<&str>) -> eyre::Result<String> {
@@ -62,10 +60,12 @@ impl Context {
         })
     }
 
-    pub(crate) async fn machine(&mut self, name: Option<&str>) -> eyre::Result<(String, Machine)> {
+    pub(crate) async fn machine(
+        &mut self,
+        name: Option<&str>,
+    ) -> eyre::Result<(String, AppMachine)> {
         let resolved = self.resolve_machine_name(name)?;
-        let machine_ref = MachineRef::parse(resolved.clone())?;
-        let machine = self.runtime().await?.get_machine(&machine_ref).await?;
+        let machine = self.app_api().await?.machine(&resolved).await?;
         Ok((resolved, machine))
     }
 }

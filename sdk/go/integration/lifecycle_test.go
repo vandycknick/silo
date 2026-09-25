@@ -21,7 +21,7 @@ func TestGoSDKLifecycleExecutionLogsAndImages(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	runtime, err := silo.Open(ctx, silo.WithDataRoot(t.TempDir()), silo.WithRuntimeRoot(runtimeRoot))
+	runtime, err := silo.Open(ctx, silo.WithHome(t.TempDir()), silo.WithRuntimeRoot(runtimeRoot))
 	if err != nil {
 		t.Fatal(err)
 	}

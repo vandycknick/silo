@@ -15,9 +15,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(std::path::Path::parent)
         .ok_or("example executable has no adjacent runtime parent")?;
     let runtime = Runtime::builder()
-        .vmmon_path(adjacent.join("vmmon"))
+        .supervisor_path(adjacent.join("silo-vmm"))
         .netd_path(adjacent.join("netd"))
-        .krun_path(adjacent.join("krun"))
         .kernel_path(adjacent.join("assets/kernel-default"))
         .initramfs_path(adjacent.join("assets/initramfs"))
         .agent_path(adjacent.join("assets/agent"))
@@ -42,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let exit = machine.wait().await?;
-    eprintln!("entrypoint acknowledged Started and vmmon exited: {exit:?}");
+    eprintln!("entrypoint acknowledged Started and silo-vmm exited: {exit:?}");
     machine.remove().await?;
 
     let machine = runtime

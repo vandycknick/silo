@@ -62,11 +62,12 @@ pub use streams::{
     MachineByteStream, MachineCpuMetrics, MachineDirectoryCreateDisposition, MachineDirectoryPage,
     MachineEnabledAgent, MachineEntryKind, MachineFileDownload, MachineFileEntry,
     MachineFileUploadOptions, MachineFilesystemMetrics, MachineFreshness, MachineGuestBootMode,
-    MachineGuestBootReport, MachineLoadAverageMetrics, MachineMemoryMetrics, MachineMetricSnapshot,
-    MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus, MachineNetworkInterfaceMetrics,
-    MachineProvisionOverallStatus, MachineProvisioningReport, MachineReadiness,
-    MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState, MachineStaleReason,
-    MachineSystemInfo, MachineVmSnapshot, MachineVmState,
+    MachineGuestBootReport, MachineHostMemoryReclaim, MachineHostMemoryReclaimQualification,
+    MachineLoadAverageMetrics, MachineMemoryMetrics, MachineMemoryReclaimReport,
+    MachineMetricSnapshot, MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus,
+    MachineNetworkInterfaceMetrics, MachineProvisionOverallStatus, MachineProvisioningReport,
+    MachineReadiness, MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState,
+    MachineStaleReason, MachineSystemInfo, MachineVmSnapshot, MachineVmState,
 };
 pub use update::{GuestPublishUpdate, MachineUpdate, MachineUserUpdate, NetworkPolicyUpdate};
 

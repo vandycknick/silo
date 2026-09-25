@@ -14,3 +14,6 @@ tracing = "0.1.44"
 objc2 = { version = "0.6.4", features = ["catch-all", "exception"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSFileHandle", "NSObject", "NSProcessInfo", "NSString", "NSURL"] }
 objc2-virtualization = { version = "0.3.2", features = ["default", "VZFileHandleNetworkDeviceAttachment", "VZMACAddress"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt"] }

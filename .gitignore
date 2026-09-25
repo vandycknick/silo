@@ -48,6 +48,8 @@ lib/
 # Rust sources under app/cli/lib are not Python library artifacts.
 !app/cli/lib/
 !app/cli/lib/*.rs
+!resources/images/system/files/usr/lib/
+!resources/images/system/files/usr/lib/silo-system/wait-systemd
 lib64/
 parts/
 sdist/

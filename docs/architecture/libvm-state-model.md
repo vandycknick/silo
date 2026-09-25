@@ -6,20 +6,20 @@ The local target follows the same split Podman's libpod uses for containers, pod
 
 ## Runtime Root
 
-Each local runtime resolves four roots. `db_config` is a singleton guard row that
-records the host OS and the three durable roots used to create the database:
-`data_root`, `state_root`, and `image_root`. An explicit value for one of those
-roots must match the stored value when reopening the database. The run root is
-resolved for each open and is intentionally not persisted.
+Each local runtime resolves one persistent home and one generated-state run
+root (see [ADR 0017](../adr/0017-single-host-state-root.md)). `db_config` is a
+singleton guard row that records only the host OS the database was created on;
+it stores no root paths.
 
-- Data root defaults to `${XDG_DATA_HOME:-$HOME/.local/share}/silo`; it holds
-  `state.db`, machine directories, assets, keys, and secrets.
-- State root defaults to `${XDG_STATE_HOME:-$HOME/.local/state}/silo`; it holds
-  durable machine logs and exit records.
-- Image root defaults to `images` below the data root.
-- Run root defaults to `${XDG_RUNTIME_DIR}/silo`, or `/tmp/silo-<euid>` when
-  `XDG_RUNTIME_DIR` is unavailable. It holds sockets, PID files, locks, and
-  network runtime state, so it may change between opens.
+- Home defaults to `~/.silo` (`SILO_HOME` overrides it and must be absolute).
+  It holds `state.db`, `machines/<id>/` (launch config, disks, initramfs),
+  `logs/machines/<id>/` (durable machine logs and exit records),
+  `logs/daemon/`, `images/`, `keys/`, `secrets.json`, and `run/` for
+  fixed-name control sockets such as `docker.sock`.
+- Run root is always `/tmp/silo-<euid>`, created `0700` and checked for owner
+  and symlinks. It holds sockets, PID files, locks, and network runtime state.
+  A fixed short root keeps Unix socket paths under the `sun_path` limit (104
+  bytes on macOS, 108 on Linux) regardless of how long the home path is.
 
 Schema compatibility is owned by SQLite migrations. `db_config` has no schema
 version column.
@@ -35,7 +35,7 @@ let runtime = Runtime::new(RuntimeConfig::local("/var/lib/silo-dev")).await?;
 # }
 ```
 
-The CLI still uses the default local root through `Runtime::from_env()`, but the API does not require that default.
+The CLI still uses the default home through `RuntimeConfig::from_env()`, but the API does not require that default.
 
 ## Static Config
 
@@ -60,7 +60,7 @@ The CLI still uses the default local root through `Runtime::from_env()`, but the
 
 The relational `id` and `name` columns must match the same fields in `config_json`. Decode paths validate that invariant so the indexed values and object document cannot silently drift.
 
-`spec` is not exploded into relational tables. Boot, hardware, storage, mounts, public vsock settings, and annotations remain part of the VM spec because they are object-shaped launch data, not fields the manager currently needs for uniqueness or relationship constraints. Vmmon always attaches the backend vsock device for internal guest destinations 22 and 1027. The stored public setting independently controls the hybrid mux and listener discovery surface; libvm resolves those effective runtime paths from the latest stored spec.
+`spec` is not exploded into relational tables. Boot, hardware, storage, mounts, public vsock settings, and annotations remain part of the VM spec because they are object-shaped launch data, not fields the manager currently needs for uniqueness or relationship constraints. silo-vmm always attaches the backend vsock device for internal guest destinations 22 and 1027. The stored public setting independently controls the hybrid mux and listener discovery surface; libvm resolves those effective runtime paths from the latest stored spec.
 
 ## Mutable State
 
@@ -70,7 +70,7 @@ The relational `id` and `name` columns must match the same fields in `config_jso
 - `status`: queryable process status for quick list/status reads.
 - `state_json`: the full mutable `MachineState` document encoded as SQLite JSONB.
 
-`state_json` contains `machineId`, `status`, `vmmonPid`, `startedAt`, `runId`,
+`state_json` contains `machineId`, `status`, `vmmPid`, `startedAt`, `runId`,
 `lastError`, and `updatedAt`. Decode paths validate that `machine_id` and
 `status` match the relational columns.
 
@@ -78,14 +78,14 @@ All durable timestamps, including the timestamps in `MachineConfig` and
 `MachineState`, are signed Unix seconds. The report timestamps supplied by the
 guest agent are separate telemetry and use Unix milliseconds.
 
-Runtime truth still comes from `vmmon` while a VM is running. Local inspect/list paths reconcile the DB state with pidfiles and monitor liveness before returning snapshots.
+Runtime truth still comes from `silo-vmm` while a VM is running. Local inspect/list paths reconcile the DB state with pidfiles and monitor liveness before returning snapshots.
 
 ## Launch Artifacts
 
-The per-instance `config.json` file remains the launch artifact read by `vmmon`.
+The per-instance `config.json` file remains the launch artifact read by `silo-vmm`.
 It is generated from `MachineConfig.spec`. The database is the source of durable
 machine intent, including image identity, retention, and process configuration;
-the launch artifact contains only the VM specification required by `vmmon`.
+the launch artifact contains only the VM specification required by `silo-vmm`.
 
 This mirrors libpod's two-spec model:
 
@@ -109,7 +109,7 @@ machine does not consume its durable process configuration. A restart is a stop
 followed by that same idle start.
 
 An explicit `MachineStartOptions::entrypoint` is separate launch-only state.
-`vmmon` acknowledges start after the guest program has launched, then owns the
+`silo-vmm` acknowledges start after the guest program has launched, then owns the
 VM until that program exits. The entrypoint is not written into the machine's
 durable process configuration.
 
@@ -120,9 +120,6 @@ erDiagram
     DB_CONFIG {
         integer id PK
         text os
-        text data_root
-        text state_root
-        text image_root
         integer created_at
         integer modified_at
     }

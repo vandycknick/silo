@@ -100,15 +100,21 @@ pub struct VirtioFileSystemDeviceConfiguration {
 }
 
 impl VirtioFileSystemDeviceConfiguration {
-    pub fn new(tag: impl Into<String>) -> Self {
+    pub fn new(tag: impl Into<String>) -> Result<Self, VzError> {
         let tag = tag.into();
+        let tag_string = NSString::from_str(&tag);
         let inner = unsafe {
+            VZVirtioFileSystemDeviceConfiguration::validateTag_error(&tag_string).map_err(
+                |error| VzError::InvalidConfiguration {
+                    reason: format!("invalid virtio-fs tag: {error}"),
+                },
+            )?;
             VZVirtioFileSystemDeviceConfiguration::initWithTag(
                 VZVirtioFileSystemDeviceConfiguration::alloc(),
-                &NSString::from_str(&tag),
+                &tag_string,
             )
         };
-        Self { inner, tag }
+        Ok(Self { inner, tag })
     }
 
     pub fn set_share(&mut self, share: SingleDirectoryShare) {

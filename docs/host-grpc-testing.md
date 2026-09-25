@@ -1,19 +1,18 @@
 # Testing the Host gRPC API
 
-The host API is exposed by each running `vmmon` process on that machine's Unix
+The host API is exposed by each running `silo-vmm` process on that machine's Unix
 socket. Run these commands from `nix develop`, which provides `grpcurl` and
 `jq`.
 
 ## Select a running machine
 
 Set the machine name, obtain its immutable ID from the CLI, then derive the
-ephemeral runtime socket from the configured run root:
+ephemeral runtime socket from the run root (`/tmp/silo-<euid>`):
 
 ```bash
 VM=dev
 MACHINE_ID="$(silo status "$VM" --format json | jq -r '.id')"
-RUN_ROOT="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/silo}"
-RUN_ROOT="${RUN_ROOT:-/tmp/silo-$(id -u)}"
+RUN_ROOT="/tmp/silo-$(id -u)"
 SOCKET="$RUN_ROOT/machines/$MACHINE_ID/vm.sock"
 GRPC_TARGET="unix://$SOCKET"
 
@@ -21,7 +20,7 @@ test -S "$SOCKET" && printf 'Using %s\n' "$SOCKET"
 ```
 
 `silo status` already exercises `VmMonitorService.GetStatus`. If it fails
-before printing the machine ID, inspect the configured run root directly:
+before printing the machine ID, inspect the run root directly:
 
 ```bash
 ls "$RUN_ROOT/machines"/*/vm.sock
@@ -171,7 +170,7 @@ collector cannot produce a snapshot.
 
 ## Filesystem metadata
 
-These calls traverse the complete host Unix socket to `vmmon` to guest-vsock
+These calls traverse the complete host Unix socket to `silo-vmm` to guest-vsock
 path.
 
 Inspect a guest file without following a final symlink:

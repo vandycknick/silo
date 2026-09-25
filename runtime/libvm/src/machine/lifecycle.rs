@@ -16,20 +16,20 @@ use crate::machine::{
 };
 use crate::runtime::core::{
     interrupt_monitor, kill_monitor_process_group, monitor_identity as monitor_identity_for_pid,
-    read_monitor_pid, reconcile_root_disk_size, wait_for_monitor_stop, VmmonRunIdentity,
+    read_monitor_pid, reconcile_root_disk_size, wait_for_monitor_stop, VmmRunIdentity,
 };
 use crate::runtime::Runtime;
 use crate::store::models::{MachineConfig, MachineRuntimeState};
-use crate::vmmon::exit_status::{self, VmmonExitOutcome, VmmonExitStatus};
-use crate::vmmon::process::ProcessIdentity;
-use crate::vmmon::VmmonLaunch;
+use crate::supervisor::exit_status::{self, VmmExitOutcome, VmmExitStatus};
+use crate::supervisor::process::ProcessIdentity;
+use crate::supervisor::VmmLaunch;
 use crate::LibVmError;
 
 const WAIT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 struct WaitTarget {
     config: MachineConfig,
-    generation: VmmonRunIdentity,
+    generation: VmmRunIdentity,
     identity: ProcessIdentity,
     stop_requested: bool,
     forced: bool,
@@ -63,23 +63,23 @@ impl Machine {
         options: MachineStartOptions,
     ) -> Result<MachineStart, LibVmError> {
         let runtime = self.runtime();
-        let vmmon = runtime.vmmon();
+        let supervisor = runtime.supervisor();
         let (config, run_id) = {
             let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
             runtime.validate_machine_data_dir(&config)?;
             let machine_paths = runtime.machine_paths(config.id);
-            let pid_path = machine_paths.vmmon_pid_path();
-            let exit_status_path = machine_paths.vmmon_exit_status_path();
+            let pid_path = machine_paths.vmm_pid_path();
+            let exit_status_path = machine_paths.vmm_exit_status_path();
             let config_path = machine_paths.vm_spec_path();
-            let socket_path = machine_paths.vmmon_socket_path();
+            let socket_path = machine_paths.vmm_socket_path();
             let trace_path = machine_paths.vm_trace_log_path();
             let serial_log_path = machine_paths.serial_log_path();
 
             runtime.ensure_machine_runtime_directories(config.id)?;
-            let lifetime_lock = MachineLifetimeLock::try_acquire(&machine_paths.vmmon_lock_path())?
+            let lifetime_lock = MachineLifetimeLock::try_acquire(&machine_paths.vmm_lock_path())?
                 .ok_or_else(|| LibVmError::MachineAlreadyRunning {
-                    reference: config.name.clone(),
-                })?;
+                reference: config.name.clone(),
+            })?;
 
             let status = runtime.reconcile_machine_runtime_locked(&config).await?;
             runtime
@@ -131,12 +131,12 @@ impl Machine {
                     .await);
                 }
             };
-            let agent_enabled = match runtime.prepare_vmmon_launch_inputs(
+            let launch_inputs = match runtime.prepare_vmm_launch_inputs(
                 &config,
                 &resolved_network,
                 root_disk_resize == RootDiskResizeOutcome::GuestRequired,
             ) {
-                Ok(agent_enabled) => agent_enabled,
+                Ok(inputs) => inputs,
                 Err(err) => {
                     return Err(finish_failed_start(
                         runtime,
@@ -149,7 +149,7 @@ impl Machine {
                     .await);
                 }
             };
-            if options.entrypoint.is_some() && !agent_enabled {
+            if options.entrypoint.is_some() && !launch_inputs.agent_enabled {
                 let error = LibVmError::MachinePreparationFailed {
                     reference: config.name.clone(),
                     message: "an entrypoint requires the managed guest agent".to_string(),
@@ -178,9 +178,9 @@ impl Machine {
                     .await)
                 }
             };
-            let startup_command = options.vmmon_startup_command();
+            let startup_command = options.vmm_startup_command();
 
-            let launch = VmmonLaunch {
+            let launch = VmmLaunch {
                 machine_id: config.id,
                 name: &config.name,
                 machine_dir: &config.machine_dir,
@@ -194,12 +194,14 @@ impl Machine {
                 network: &resolved_network,
                 run_id: &run_id,
                 exit_command: options.on_exit.as_ref(),
-                agent_enabled,
+                agent_enabled: launch_inputs.agent_enabled,
+                rosetta_intent: launch_inputs.rosetta_intent,
+                asset_directory: launch_inputs.asset_directory,
                 startup_command: startup_command.as_ref(),
                 machine_log_dir: &machine_log_dir,
                 machine_lock: &lifetime_lock,
             };
-            if let Err(err) = vmmon.spawn(&launch).await {
+            if let Err(err) = supervisor.spawn(&launch).await {
                 return Err(finish_failed_start(
                     runtime,
                     &config,
@@ -249,7 +251,7 @@ impl Machine {
                     LibVmError::MonitorConnection {
                         reference: config.name.clone(),
                         message: format!(
-                            "vmmon pid {pid} from {} has no stable process generation",
+                            "silo-vmm pid {pid} from {} has no stable process generation",
                             pid_path.display()
                         ),
                     },
@@ -324,7 +326,7 @@ impl Machine {
 
             match status.pid {
                 Some(pid) if status.state == MachineRuntimeState::Stopping => {
-                    let generation = VmmonRunIdentity {
+                    let generation = VmmRunIdentity {
                         pid,
                         started_at: status.started_at,
                         run_id: status.run_id.clone(),
@@ -344,7 +346,7 @@ impl Machine {
                     }
                 }
                 Some(pid) => {
-                    let generation = VmmonRunIdentity {
+                    let generation = VmmRunIdentity {
                         pid,
                         started_at: status.started_at,
                         run_id: status.run_id.clone(),
@@ -377,9 +379,36 @@ impl Machine {
             }
         };
 
-        self.wait_for_target_exit(wait_target, options.wait_options(), expected_run_id)
-            .await
-            .map(|exit| exit.machine)
+        // Capture the generation before releasing control to the wait. Never
+        // escalate against whichever run happens to be current after a timeout.
+        let run_id = wait_target
+            .generation
+            .run_id
+            .clone()
+            .map(MachineRunId::from_raw);
+        let result = self
+            .wait_for_target_exit(wait_target, options.wait_options(), expected_run_id)
+            .await;
+        match (result, options.force_timeout(), run_id) {
+            (Err(LibVmError::Io(error)), Some(timeout), Some(run_id))
+                if error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                match self
+                    .kill_run_with(run_id.clone(), MachineKillOptions::new().timeout(timeout))
+                    .await
+                {
+                    Ok(exit) => Ok(exit.machine),
+                    // The original monitor may have exited between the timed
+                    // wait and the generation-checked kill. Reconcile its exit.
+                    Err(LibVmError::MachineNotRunning { .. }) => self
+                        .wait_for_run_with(run_id, MachineWaitOptions::new().timeout(timeout))
+                        .await
+                        .map(|exit| exit.machine),
+                    Err(error) => Err(error),
+                }
+            }
+            (result, _, _) => result.map(|exit| exit.machine),
+        }
     }
 
     /// Waits for the current machine run to exit without sending a stop signal.
@@ -513,7 +542,7 @@ impl Machine {
                 });
             };
 
-            let generation = VmmonRunIdentity {
+            let generation = VmmRunIdentity {
                 pid,
                 started_at: status.started_at,
                 run_id: status.run_id.clone(),
@@ -522,7 +551,7 @@ impl Machine {
                 runtime.mark_machine_stopped(config.id, None).await?;
                 runtime.cleanup_machine_resources_locked(&config).await?;
                 let exit_status =
-                    exit_status::read(&runtime.machine_paths(config.id).vmmon_exit_status_path())?;
+                    exit_status::read(&runtime.machine_paths(config.id).vmm_exit_status_path())?;
                 let machine = runtime.machine_inspect_data(config).await?;
                 return Ok(machine_exit(machine, generation, false, exit_status));
             };
@@ -530,7 +559,7 @@ impl Machine {
                 runtime.mark_machine_stopped(config.id, None).await?;
                 runtime.cleanup_machine_resources_locked(&config).await?;
                 let exit_status =
-                    exit_status::read(&runtime.machine_paths(config.id).vmmon_exit_status_path())?;
+                    exit_status::read(&runtime.machine_paths(config.id).vmm_exit_status_path())?;
                 let machine = runtime.machine_inspect_data(config).await?;
                 return Ok(machine_exit(machine, generation, false, exit_status));
             }
@@ -567,7 +596,7 @@ impl Machine {
         }
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
         runtime.validate_machine_data_dir(&config)?;
-        runtime.ensure_no_live_vmmon_generation(&config).await?;
+        runtime.ensure_no_live_vmm_generation(&config).await?;
         let status = runtime.reconcile_machine_runtime_locked(&config).await?;
 
         if status.is_active() {
@@ -581,7 +610,7 @@ impl Machine {
 
         if let Some(expected_run_id) = expected_run_id {
             let exit_status =
-                exit_status::read(&runtime.machine_paths(config.id).vmmon_exit_status_path())?;
+                exit_status::read(&runtime.machine_paths(config.id).vmm_exit_status_path())?;
             let machine_id = config.id.to_string();
             let current = exit_status
                 .as_ref()
@@ -615,11 +644,11 @@ async fn finish_failed_start(
     let mut cleanup_errors = Vec::new();
 
     let discovered_monitor = if monitor.is_none() {
-        match read_monitor_pid(&runtime.machine_paths(config.id).vmmon_pid_path()) {
+        match read_monitor_pid(&runtime.machine_paths(config.id).vmm_pid_path()) {
             Ok(pid) => match ProcessIdentity::for_pid(pid) {
                 Ok(identity) => identity,
                 Err(err) => {
-                    cleanup_errors.push(format!("inspect vmmon for cleanup: {err}"));
+                    cleanup_errors.push(format!("inspect silo-vmm for cleanup: {err}"));
                     None
                 }
             },
@@ -632,7 +661,7 @@ async fn finish_failed_start(
         Some(monitor) => match stop_failed_start_monitor(monitor, &config.name).await {
             Ok(()) => true,
             Err(err) => {
-                cleanup_errors.push(format!("terminate vmmon: {err}"));
+                cleanup_errors.push(format!("terminate silo-vmm: {err}"));
                 false
             }
         },
@@ -692,6 +721,15 @@ async fn stop_failed_start_monitor(
     monitor: &ProcessIdentity,
     machine_name: &str,
 ) -> Result<(), LibVmError> {
+    // Let silo-vmm stop/reap its worker and finalize the generation first. The
+    // process-group kill below is only the emergency fallback for a stuck owner.
+    if interrupt_monitor(monitor)?
+        && wait_for_monitor_stop(monitor, machine_name, Duration::from_secs(75))
+            .await
+            .is_ok()
+    {
+        return Ok(());
+    }
     if kill_monitor_process_group(monitor)? {
         return wait_for_monitor_stop(monitor, machine_name, Duration::from_secs(5)).await;
     }
@@ -714,7 +752,7 @@ impl Machine {
         let runtime = self.runtime();
         let (_lock, config) = runtime.lock_machine_config(self.machine_id()).await?;
 
-        // vmmon removes its pidfile during shutdown before releasing its lifetime lock and
+        // silo-vmm removes its pidfile during shutdown before releasing its lifetime lock and
         // exiting. Preserve the persisted process identity long enough to wait for that final
         // shutdown work instead of reconciling the missing pidfile as an already-stopped run.
         let persisted = runtime.machine_state(config.id).await?;
@@ -724,8 +762,8 @@ impl Machine {
                 | MachineRuntimeState::Running
                 | MachineRuntimeState::Stopping
         ) {
-            if let Some(pid) = persisted.vmmon_pid {
-                let generation = VmmonRunIdentity {
+            if let Some(pid) = persisted.vmm_pid {
+                let generation = VmmRunIdentity {
                     pid,
                     started_at: persisted.started_at,
                     run_id: persisted.run_id.clone(),
@@ -812,7 +850,7 @@ impl Machine {
         let exit_status = exit_status::read(
             &runtime
                 .machine_paths(target.config.id)
-                .vmmon_exit_status_path(),
+                .vmm_exit_status_path(),
         )?;
         let machine = runtime.machine_inspect_data(target.config).await?;
         Ok(machine_exit(
@@ -826,9 +864,9 @@ impl Machine {
 
 fn machine_exit(
     machine: MachineData,
-    generation: VmmonRunIdentity,
+    generation: VmmRunIdentity,
     forced: bool,
-    exit_status: Option<VmmonExitStatus>,
+    exit_status: Option<VmmExitStatus>,
 ) -> MachineExit {
     let matching_exit = exit_status.filter(|status| {
         status.machine_id == machine.id && exit_status_matches_generation(status, &generation)
@@ -837,8 +875,9 @@ fn machine_exit(
         Some(status) => (
             unix_time(status.exited_at),
             match status.outcome {
-                VmmonExitOutcome::Clean => MachineExitOutcome::Clean,
-                VmmonExitOutcome::Error => MachineExitOutcome::Error {
+                VmmExitOutcome::Clean => MachineExitOutcome::Clean,
+                VmmExitOutcome::Forced => MachineExitOutcome::Forced,
+                VmmExitOutcome::Error => MachineExitOutcome::Error {
                     message: status.error,
                 },
             },
@@ -885,11 +924,11 @@ fn stale_generation(
     }
 }
 
-fn exit_status_matches_generation(status: &VmmonExitStatus, generation: &VmmonRunIdentity) -> bool {
+fn exit_status_matches_generation(status: &VmmExitStatus, generation: &VmmRunIdentity) -> bool {
     generation.run_id.as_deref() == Some(status.run_id.as_str()) && generation.pid == status.pid
 }
 
-fn monitor_identity(generation: &VmmonRunIdentity) -> Result<Option<ProcessIdentity>, LibVmError> {
+fn monitor_identity(generation: &VmmRunIdentity) -> Result<Option<ProcessIdentity>, LibVmError> {
     let Some(identity) = ProcessIdentity::for_pid(generation.pid)? else {
         return Ok(None);
     };
@@ -904,4 +943,53 @@ fn monitor_identity(generation: &VmmonRunIdentity) -> Result<Option<ProcessIdent
 fn unix_time(timestamp: i64) -> Option<SystemTime> {
     let timestamp = u64::try_from(timestamp).ok()?;
     Some(UNIX_EPOCH + Duration::from_secs(timestamp))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::machine::lifecycle::stop_failed_start_monitor;
+    use crate::supervisor::process::ProcessIdentity;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::time::Duration;
+
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Generic OS signal mechanics, not a substitute for a silo-vmm/VM test.
+    #[tokio::test]
+    async fn failed_start_cleanup_interrupts_before_emergency_group_kill() {
+        let mut child = Child(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("real OS child"),
+        );
+        let pid = child.0.id() as i32;
+        let identity = ProcessIdentity::for_pid(pid)
+            .expect("identity lookup")
+            .expect("live child");
+        let (cleanup, status) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                stop_failed_start_monitor(&identity, "signal-mechanics"),
+                async {
+                    loop {
+                        if let Some(status) = child.0.try_wait().expect("probe child") {
+                            break status;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
+            )
+        })
+        .await
+        .expect("cooperative cleanup budget");
+        cleanup.expect("cooperative cleanup");
+        assert_eq!(status.signal(), Some(nix::libc::SIGINT));
+    }
 }

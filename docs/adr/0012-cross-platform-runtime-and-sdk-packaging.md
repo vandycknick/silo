@@ -2,11 +2,16 @@
 
 Date: 2026-07-22
 
-Updated: 2026-08-18
+Updated: 2026-09-24
 
 ## Status
 
-Accepted
+Accepted. The current `silo-vmm` and `krun` worker contract is defined by
+[ADR 0018](0018-silo-vmm-contract.md) and described in
+[the silo-vmm architecture](../architecture/silo-vmm.md). The host state
+layout is defined by [ADR 0017](0017-single-host-state-root.md). Historical rollout
+and verification notes below describe their original revisions, not current
+standalone-helper requirements.
 
 ## The Problem
 
@@ -19,9 +24,9 @@ CLI, Rust consumer, or language SDK
         v
       libvm
         |
-        +-- vmmon
-        |     +-- Virtualization.framework on macOS
-        |     `-- krun helper on Linux
+        +-- silo-vmm supervisor
+        |     +-- krun worker, same executable (Linux/macOS default)
+        |     `-- Virtualization.framework (explicit macOS override)
         |
         +-- netd
         |
@@ -90,14 +95,15 @@ a normal first VM start requires no runtime download.
 
 ### Core Invariants
 
-- Package-owned product files are immutable. User-owned portable product files
-  and mutable state follow XDG conventions on Linux and macOS.
+- Package-owned product files are immutable. User-owned mutable state, including
+  Go SDK installed runtimes, lives below the Silo home defined by
+  [ADR 0017](0017-single-host-state-root.md) on Linux and macOS.
 - Convention-based resolution selects one complete runtime component set rather
   than mixing files from unrelated installations. Explicit per-component API
   paths, per-component environment overrides, and machine asset overrides may
   replace individual files.
-- Runtime-component installation paths are not persisted in `db_config`; the
-  ephemeral run root is not part of durable database identity.
+- Runtime-component installation paths are not persisted in `db_config`, which
+  records only the host OS.
 - There is no installed path manifest, `silo-runtime.json`, or
   `--component-info` subprocess protocol.
 - Official runtime components are co-versioned and updated atomically. They are
@@ -126,7 +132,7 @@ promise concerns the GNU/Linux ABI baseline and portable archive, not a specific
 Linux distribution release or package manager.
 
 VZ remains the only selected macOS backend. Silo packages and signs the krun
-helper on macOS so a later backend selector does not require a new distribution
+backend inside `silo-vmm` on macOS so a later backend selector does not require a new distribution
 layout. Packaging a backend does not make it selectable.
 
 The default kernel, initramfs, and agent always match the target architecture.
@@ -159,20 +165,21 @@ The portable runtime root has this fixed layout:
 ```text
 <runtime-root>/
   bin/
-    vmmon
+    silo-vmm
     netd
-    krun
   assets/
     kernel-default
     initramfs
     agent
 ```
 
-All six files are included for every initial target. `krun` contains the pinned
-Silo libkrun fork directly. The payload does not contain `libkrun.so`,
-`libkrun.dylib`, or `libkrunfw`. Only the krun helper links libkrun code; the
-process boundary remains `vmmon -> krun`. Neither `vmmon`, `libvm`, nor a
-language binding links libkrun merely by using the launcher library.
+All five files are included for every initial target. `silo-vmm` contains the
+pinned Silo libkrun fork directly, executing it only in a separate private worker
+process: the same executable started with argv[0] `krun` and no arguments,
+configured only through a fixed inherited descriptor table
+([ADR 0018](0018-silo-vmm-contract.md)). The payload does not contain a standalone krun,
+`libkrun.so`, `libkrun.dylib`, or `libkrunfw`. Libvm and language bindings launch
+silo-vmm; they do not link libkrun.
 
 The runtime payload does not inherently include the `silo` CLI. Product archives
 add the CLI and SDK packages add their native binding. A complete portable CLI
@@ -182,9 +189,8 @@ archive has this layout:
 silo-<version>-<target>/
   bin/
     silo
-    vmmon
+    silo-vmm
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -202,9 +208,8 @@ profile directory:
 ```text
 <cargo-target-dir>/debug/
   silo
-  vmmon
+  silo-vmm
   netd
-  krun
   assets/
     kernel-default
     initramfs
@@ -220,7 +225,7 @@ produce an incomplete directory; running that executable fails with a diagnostic
 that identifies the missing adjacent components and recommends `make`.
 
 Canonical staging remains separate from adjacent development runtime discovery.
-`make stage` creates the portable six-file payload in predictable target
+`make stage` creates the portable five-file payload in predictable target
 directories:
 
 ```text
@@ -257,7 +262,7 @@ release. Staging verifies that all three default assets match the target
 architecture.
 
 Additional user-installed kernels are deferred. When added, they live below the
-XDG data root and never modify `Silo.app`, an official archive, or optional
+Silo home and never modify `Silo.app`, an official archive, or optional
 downstream package-owned paths.
 
 ### Native Release Environment And Staging
@@ -267,7 +272,7 @@ native host target:
 
 1. Enter the Nix `.#release` shell pinned by `flake.lock` and
    `rust-toolchain.toml`.
-1. Build `silo`, `vmmon`, `netd`, and `krun` for the current host OS and CPU.
+1. Build `silo`, `silo-vmm`, and `netd` for the current host OS and CPU.
 1. Use committed lockfiles and locked dependency resolution.
 1. Build the guest initramfs and standalone agent as static-musl Linux programs
    for the same CPU.
@@ -320,73 +325,26 @@ Nix release shell + repository-owned staging command
 GoReleaser Pro is not part of the design. The common contract is the staged
 payload, not one third-party packager.
 
-## Installation Ownership, Mutable XDG State, And Unsupported Old Layouts
+## Installation Ownership, Mutable State, And Unsupported Old Layouts
 
 Product files are immutable. Silo never writes mutable state into `Silo.app`,
 an official archive installation, or an optional downstream package-owned `/usr`
-path. Linux and macOS use the same XDG conventions for user-owned product files
-and mutable state; Silo does not use `~/Library/Application Support`,
-`~/Library/Caches`, or `~/Library/Logs` on macOS.
+path. Silo does not use `~/Library/Application Support`, `~/Library/Caches`, or
+`~/Library/Logs` on macOS.
 
-| Purpose | Environment or configuration | Fallback on Linux and macOS |
-| --- | --- | --- |
-| Data | `$XDG_DATA_HOME/silo` | `$HOME/.local/share/silo` |
-| State and logs | `$XDG_STATE_HOME/silo` | `$HOME/.local/state/silo` |
-| Images | Runtime-configured or data root | `$HOME/.local/share/silo/images` |
-| Runtime files | `$XDG_RUNTIME_DIR/silo` | `/tmp/silo-<effective-uid>` |
-
-The default data tree is:
-
-```text
-${XDG_DATA_HOME:-$HOME/.local/share}/silo/
-  state.db
-  machines/
-  images/
-  keys/
-  runtimes/
-  kernels/
-```
-
-Durable operational output has this fixed state layout:
-
-```text
-${XDG_STATE_HOME:-$HOME/.local/state}/silo/
-  logs/
-    machines/
-      <machine-id>/
-        vm.trace.log
-        serial.log
-        exec.log
-        exec.log.{1,2,3}
-        vm.exit.json
-        network/
-          netd.log
-          audit.jsonl
-```
-
-Ephemeral per-machine process files use the run root:
-
-```text
-<run-root>/
-  machines/
-    <machine-id>/
-      vm.pid
-      vm.sock
-  networks/
-  locks/
-```
-
-Canonical machine configuration, disks, and launch-derived artifacts remain
-below the data root. Logs and exit records are durable operational state, not
-canonical machine configuration. PID files, sockets, network runtime files, and
-locks are ephemeral and never belong below the data root in a newly created
-layout.
+All user-owned mutable state lives below one Silo home, `~/.silo` by default or
+the absolute `SILO_HOME`, with generated sockets and PID files below the fixed
+`/tmp/silo-<effective-uid>` directory. User configuration stays in
+`${XDG_CONFIG_HOME:-$HOME/.config}/silo`. [ADR 0017](0017-single-host-state-root.md)
+defines that layout, its ownership and permission checks, and its resolution
+rules; this ADR does not repeat them. Runtime-component installation paths are
+never part of that state.
 
 The immutable machine ID owns every durable machine log. A private network's
-changing runtime instance ID owns only its run-root socket, PID, policy, and
-optional capture files, never a durable log directory. `vmmon` and `netd` write
-the durable files; neither provides persisted-log RPCs. `libvm`, including its
-Node binding, reads one semantic source at a time (`monitor`, `serial`,
+changing runtime instance ID owns only its generated socket, PID, policy, and
+optional capture files, never a durable log directory. `silo-vmm` and `netd`
+write the durable files; neither provides persisted-log RPCs. `libvm`, including
+its Node binding, reads one semantic source at a time (`monitor`, `serial`,
 `exec`, `network`, or `network-audit`) without exposing paths or filenames.
 Snapshot reads are finite. Follow reads emit the snapshot, hand off without a
 byte gap, and remain attached while the machine is stopped and across later
@@ -395,41 +353,11 @@ Lines output from structured executions, not process history or an
 authoritative result. These interfaces do not create an additional root, a
 compatibility reader, or a public path configuration surface.
 
-Existing SQL migration history and old mutable filesystem layouts are
-unsupported after this breaking release. Silo does not migrate, adopt, or read
-old databases or old layouts. With all Silo processes stopped, users must
-manually archive or remove the old state and mutable files before opening the
-new layout.
-
-XDG environment paths and `$HOME` must be absolute when used. Silo rejects a
-relative value rather than interpreting it relative to the process working
-directory.
-
-### Ephemeral Runtime Directory
-
-The run-root resolution order is:
-
-1. Explicit `RuntimeConfig` run root.
-1. `$XDG_RUNTIME_DIR/silo`.
-1. `/tmp/silo-<effective-uid>`.
-
-The fallback ignores process temporary-directory settings, including `TMPDIR`.
-Silo obtains the effective UID and creates or validates
-`/tmp/silo-<effective-uid>` as a real, non-symlink directory owned by that
-effective user with exact mode `0700`. It rejects symlinks, foreign ownership,
-non-directories, and unsafe permissions. It never uses a cross-user `/tmp/silo`
-directory.
-
-The run root is ephemeral session placement, not durable database identity.
-`Runtime::open` resolves the default run root from the current environment on
-every open. An explicit `RuntimeConfig` run root applies to that runtime instance
-without requiring the same value on later opens.
-
-`db_config` persists data, state, and image roots as durable database identity;
-it does not persist the run root. `Runtime::open` resolves the current run root
-for every open. Later explicit data, image, or state roots must match the stored
-database identity; the ephemeral run root is intentionally exempt from that
-rule.
+Existing SQL migration history and old mutable filesystem layouts, including the
+former XDG data, state, and runtime directories, are unsupported. Silo does not
+migrate, adopt, or read old databases or old layouts. With all Silo processes
+stopped, users must manually archive or remove the old state and mutable files
+before opening the new layout.
 
 ## Runtime Discovery
 
@@ -437,9 +365,8 @@ Runtime discovery produces one immutable in-memory component set, conceptually:
 
 ```rust
 struct ResolvedRuntimeComponents {
-    vmmon: PathBuf,
+    supervisor: PathBuf, // silo-vmm
     netd: PathBuf,
-    krun: PathBuf,
     kernel: PathBuf,
     initramfs: PathBuf,
     agent: PathBuf,
@@ -470,9 +397,8 @@ Resolution follows this order:
 Existing environment controls remain available while lookup is centralized:
 
 ```text
-SILO_VMMON_PATH
+SILO_VMM_PATH
 NETD_BIN
-KRUN_BIN
 SILO_ASSET_DIR
 ```
 
@@ -481,8 +407,8 @@ paths can replace individual files for testing and embedding. All explicit
 paths are absolute. A malformed authoritative input, including a relative or
 incomplete `SILO_RUNTIME_DIR`, fails immediately instead of falling through to
 lower-precedence discovery. Portable-root resolution verifies that derived paths
-remain below the selected root and are regular files. `vmmon`, `netd`, `krun`,
-and `agent` must be executable. `kernel-default` and `initramfs` must be
+remain below the selected root and are regular files. `silo-vmm`, `netd`, and
+`agent` must be executable. `kernel-default` and `initramfs` must be
 readable but need not be executable.
 
 Native-location resolution checks only a small documented set of conventional
@@ -504,9 +430,8 @@ adjacent development layout is:
 ```text
 <cargo-target-dir>/debug/
   silo
-  vmmon
+  silo-vmm
   netd
-  krun
   assets/
     kernel-default
     initramfs
@@ -528,9 +453,8 @@ derives and validates this fixed layout:
 <portable-root>/
   bin/
     silo
-    vmmon
+    silo-vmm
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -549,8 +473,8 @@ minimum system version.
 
 `PATH` is disabled unless `SILO_ASSET_DIR` is explicitly set and successfully
 validates as one complete asset set. When enabled, resolution considers PATH
-entries in order, considers only absolute entries, and requires `vmmon`, `netd`,
-and `krun` to exist and be executable in one entry. It never combines helpers
+entries in order, considers only absolute entries, and requires `silo-vmm` and
+`netd` to exist and be executable in one entry. It never combines helpers
 from different PATH entries, and higher-precedence explicit helper overrides
 still apply. Empty and relative PATH entries are not resolved against the
 working directory. If no complete helper set is found, the error reports every
@@ -610,9 +534,8 @@ Silo.app/
     MacOS/
       silo
     Helpers/
-      vmmon
+      silo-vmm
       netd
-      krun
     Resources/
       assets/
         kernel-default
@@ -623,12 +546,11 @@ Silo.app/
 The layout defines the component paths without a Silo-specific manifest:
 
 ```text
-vmmon     = Contents/Helpers/vmmon
-netd      = Contents/Helpers/netd
-krun      = Contents/Helpers/krun
-kernel    = Contents/Resources/assets/kernel-default
-initramfs = Contents/Resources/assets/initramfs
-agent     = Contents/Resources/assets/agent
+silo-vmm = Contents/Helpers/silo-vmm
+netd       = Contents/Helpers/netd
+kernel     = Contents/Resources/assets/kernel-default
+initramfs  = Contents/Resources/assets/initramfs
+agent      = Contents/Resources/assets/agent
 ```
 
 `Info.plist` carries standard application identity, version, and minimum-system
@@ -660,9 +582,8 @@ preserves Homebrew Cask invocation:
         v
 /Applications/Silo.app/Contents/MacOS/silo
         |
-        +-- ../Helpers/vmmon
+        +-- ../Helpers/silo-vmm
         +-- ../Helpers/netd
-        +-- ../Helpers/krun
         `-- ../Resources/assets
 ```
 
@@ -702,8 +623,10 @@ $HOME/.local/bin/silo -> ~/Applications/Silo.app/Contents/MacOS/silo
 ```
 
 Production signing happens after the complete app is assembled. Nested code is
-signed from the inside out without `codesign --deep`. `vmmon` receives the
-Virtualization entitlement and `krun` receives the Hypervisor entitlement. Other
+signed from the inside out without `codesign --deep`. `silo-vmm` receives both
+the Virtualization and Hypervisor entitlements from
+`virt/vmm/silo-vmm.entitlements`, because its VZ backend and its `krun`
+worker mode are the same signed executable. Other
 entitlements are granted only when their need is demonstrated for that
 executable. The CLI and `netd` do not inherit virtualization entitlements merely
 because they share the bundle.
@@ -751,9 +674,8 @@ The portable CLI archives expand to:
 silo-<version>-linux-amd64-gnu/
   bin/
     silo
-    vmmon
+    silo-vmm
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -762,9 +684,8 @@ silo-<version>-linux-amd64-gnu/
 silo-<version>-linux-arm64-gnu/
   bin/
     silo
-    vmmon
+    silo-vmm
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -775,7 +696,7 @@ The top-level archive directory is the runtime root. The archive is relocatable:
 users may extract it into a user-owned directory and expose `bin/silo` with a
 symlink on `PATH`. It contains no system daemon, service unit, setuid executable,
 or privileged installation helper. Product files remain read-only after
-extraction; mutable state follows the XDG ownership model.
+extraction; mutable state lives below the Silo home ([ADR 0017](0017-single-host-state-root.md)).
 
 For each target and exact version, the official release publishes one atomic
 archive set: both compressed archives and each archive's SHA-256 checksum, SBOM,
@@ -864,9 +785,8 @@ native/
   silo.node
 runtime/
   bin/
-    vmmon
+    silo-vmm
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -890,9 +810,8 @@ silo/
   <native-extension>
   _runtime/
     bin/
-      vmmon
+      silo-vmm
       netd
-      krun
     assets/
       kernel-default
       initramfs
@@ -917,20 +836,26 @@ This is packaging behavior outside `libvm`, not a runtime capability. Installati
 during package import, `init()`, runtime open, VM start, or a hidden postinstall
 hook.
 
-The exact SDK-matched runtime is installed using the same XDG location on Linux
-and macOS:
+The exact SDK-matched runtime is installed below the Silo home on Linux and
+macOS. The installer honors an absolute `SILO_HOME` and otherwise uses
+`$HOME/.silo`:
 
 ```text
-${XDG_DATA_HOME:-$HOME/.local/share}/silo/runtimes/<version>/<target>/
+${SILO_HOME:-$HOME/.silo}/runtimes/<version>/<target>/
 ```
 
 Examples:
 
 ```text
-$HOME/.local/share/silo/runtimes/0.1.0/darwin-arm64/
-$HOME/.local/share/silo/runtimes/0.1.0/linux-amd64-gnu/
-$HOME/.local/share/silo/runtimes/0.1.0/linux-arm64-gnu/
+$HOME/.silo/runtimes/0.1.0/darwin-arm64/
+$HOME/.silo/runtimes/0.1.0/linux-amd64-gnu/
+$HOME/.silo/runtimes/0.1.0/linux-arm64-gnu/
 ```
+
+Loading the Go FFI bridge is separate from runtime installation. The SDK may
+materialize its embedded bridge bytes below
+`${SILO_HOME:-$HOME/.silo}/cache/go-ffi/<version>/<target>/`, and never accesses
+the network to do so.
 
 Each exact Go SDK release embeds the expected SHA-256 digest and default
 release URL for every supported target archive. It verifies that digest before
@@ -1008,7 +933,7 @@ in that environment rather than repeating deep binary qualification.
 - A Homebrew-style command symlink resolves the containing app.
 - Gatekeeper accepts the app and the stapled notarization validates.
 - VZ boots a VM using only packaged files.
-- The dormant krun helper has a valid Hypervisor entitlement and signature.
+- The dormant krun backend in `silo-vmm` has a valid Hypervisor entitlement and signature.
 - Boundary qualification confirms that host binaries use Apple system libraries
   and frameworks and that `netd` has no Nix dynamic-library dependency.
 
@@ -1080,7 +1005,7 @@ asset set rather than falling through independently across directories.
 - Silo avoids distribution-specific native package production and qualification
   while downstream maintainers can repackage immutable official bytes.
 - `libvm` remains a runtime library rather than a package manager.
-- Compiling the pinned libkrun fork into the krun helper removes a loader, RPATH,
+- Compiling the pinned libkrun fork into `silo-vmm` removes a loader, RPATH,
   and nested-signing failure class.
 
 ### Tradeoffs
@@ -1148,7 +1073,7 @@ repackaging where it is valuable.
 ### One Universal Physical Layout
 
 One layout would reduce resolver cases, but app bundles, portable archives, SDK
-packages, optional downstream native paths, and user-owned XDG runtimes have
+packages, optional downstream native paths, and user-owned Go SDK runtimes have
 distinct ownership and installation conventions.
 
 ### One Generic Release Tool
@@ -1167,7 +1092,7 @@ entitlements, signing order, and clean-machine qualification.
   native Linux packages.
 - Optional downstream native repackaging has no official Silo support or CI
   matrix beyond archive byte and layout preservation requirements.
-- macOS packages the dormant krun helper but selects only VZ.
+- macOS packages the dormant krun backend but selects only VZ.
 - zip-only Python imports are unsupported unless the package is first
   materialized into a stable directory.
 - A DMG alone does not place a command on `PATH`.
@@ -1195,7 +1120,7 @@ The following delivery work remains deferred:
   architecture, and kernel provenance.
 
 This diagnostic capability must remain outside `libvm`, runtime open, and VM startup. It
-must not delete user state. The layouts, discovery rules, XDG ownership model,
+must not delete user state. The layouts, discovery rules, state ownership model,
 and release staging contract in this ADR support them without replacement.
 
 ## External References
@@ -1209,3 +1134,7 @@ and release staging contract in this ADR support them without replacement.
 - [npm: `package.json` platform metadata and optional dependencies](https://docs.npmjs.com/cli/v11/configuring-npm/package-json)
 - [PEP 600: Future `manylinux` platform tags](https://peps.python.org/pep-0600/)
 - [Go Modules Reference: Authenticating modules](https://go.dev/ref/mod#authenticating)
+
+The krun backend executes as the private `krun` worker mode of `silo-vmm`.
+Runtime payloads contain the `silo-vmm` and `netd` executables. `silo-vmm`
+requires the union of the virtualization and hypervisor macOS entitlements.

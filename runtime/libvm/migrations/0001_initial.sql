@@ -1,9 +1,6 @@
 CREATE TABLE db_config (
     id                  INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
     os                  TEXT NOT NULL,
-    data_root           TEXT NOT NULL,
-    state_root          TEXT NOT NULL,
-    image_root          TEXT NOT NULL,
     created_at          INTEGER NOT NULL,
     modified_at         INTEGER NOT NULL
 );

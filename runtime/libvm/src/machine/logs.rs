@@ -24,7 +24,7 @@ const EXEC_LOG_SNAPSHOT_RETRIES: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MachineLogSource {
-    /// vmmon diagnostic output.
+    /// silo-vmm diagnostic output.
     Monitor,
     /// VM serial console output.
     Serial,
@@ -483,7 +483,7 @@ mod tests {
                 &MachineState {
                     machine_id: id,
                     status: MachineRuntimeState::Stopped,
-                    vmmon_pid: None,
+                    vmm_pid: None,
                     started_at: None,
                     run_id: None,
                     last_error: None,
@@ -514,7 +514,7 @@ mod tests {
 
     async fn set_running(runtime: &Runtime, id: MachineId, child: &Child, run_id: &str) {
         let pid = i32::try_from(child.id()).expect("child pid fits in i32");
-        let started_at = crate::vmmon::process::ProcessIdentity::for_pid(pid)
+        let started_at = crate::supervisor::process::ProcessIdentity::for_pid(pid)
             .expect("read process identity")
             .and_then(|identity| identity.started_at());
         runtime
@@ -895,7 +895,7 @@ mod tests {
     async fn log_directory_symlinks_are_rejected_without_following_them() {
         let (temp, runtime, machine, id) =
             test_machine(StoredMachineNetworkConfig::default()).await;
-        let state_root = runtime.local_paths().roots().state_root().to_path_buf();
+        let state_root = runtime.local_paths().roots().home().to_path_buf();
         let external = temp.path().join("external");
         std::fs::create_dir(&external).expect("create external directory");
         std::fs::write(external.join("keep"), b"safe").expect("write external sentinel");

@@ -9,18 +9,15 @@ use crate::LibVmError;
 
 /// Durable runtime configuration storage.
 ///
-/// The config row records the filesystem roots a state database was initialized
-/// with. Runtime startup validates those roots after reading the row; the store
-/// only provides atomic read/seed operations.
+/// The config row records the host OS a state database was initialized on.
+/// Runtime startup validates it after reading the row; the store only provides
+/// an atomic read/seed operation.
 #[async_trait]
 pub(crate) trait ConfigStore: std::fmt::Debug + Send + Sync {
-    /// Reads the persisted database configuration, if the store has been seeded.
-    async fn db_config(&self) -> Result<Option<DbConfig>, LibVmError>;
-
     /// Inserts `seed` only when the config row is missing and returns the stored row.
     ///
     /// Existing rows are returned as-is and are not compared with `seed`; callers
-    /// that care about root compatibility must validate the returned value.
+    /// that care about host compatibility must validate the returned value.
     async fn read_or_seed_db_config(&self, seed: &DbConfig) -> Result<DbConfig, LibVmError>;
 }
 

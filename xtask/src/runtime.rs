@@ -7,14 +7,14 @@ use thiserror::Error;
 use crate::components::BuildContext;
 use crate::initramfs::{write_initramfs, InitramfsOptions};
 use crate::kernel::KernelArtifact;
+use crate::rprobe::ASSETS as RPROBE_ASSETS;
 
-const HELPERS: [(&str, u32); 3] = [("vmmon", 0o755), ("netd", 0o755), ("krun", 0o755)];
+const HELPERS: [(&str, u32); 2] = [("silo-vmm", 0o755), ("netd", 0o755)];
 const ASSETS: [(&str, u32); 3] = [
     ("kernel-default", 0o644),
     ("initramfs", 0o644),
     ("agent", 0o755),
 ];
-
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error(transparent)]
@@ -78,6 +78,7 @@ pub enum RuntimeError {
 pub fn assemble_development(
     context: &BuildContext<'_>,
     kernel: &KernelArtifact,
+    rprobe_assets: Option<&Path>,
 ) -> Result<(), RuntimeError> {
     let profile_dir = context.target_dir.join(context.profile.directory());
     validate_directory(&profile_dir)?;
@@ -93,6 +94,11 @@ pub fn assemble_development(
             &temporary.join("agent"),
             0o755,
         )?;
+        if let Some(rprobe_assets) = rprobe_assets {
+            copy_explicit_rprobe_assets(rprobe_assets, &temporary)?;
+        } else {
+            copy_optional_rprobe_assets(&assets, &temporary)?;
+        }
         validate_assets(&temporary)?;
         if assets_match(&temporary, &assets)? {
             fs::remove_dir_all(&temporary).map_err(|source| {
@@ -159,6 +165,15 @@ pub fn stage(context: &BuildContext<'_>) -> Result<(), RuntimeError> {
                 mode,
             )?;
         }
+        if has_rprobe_assets(&profile_dir.join("assets"))? {
+            for (name, mode) in RPROBE_ASSETS {
+                copy_regular_file(
+                    &profile_dir.join("assets").join(name),
+                    &assets.join(name),
+                    mode,
+                )?;
+            }
+        }
         validate_stage_against_adjacent(context, &temporary)?;
         replace_directory(&temporary, &stage)?;
         validate_stage_against_adjacent(context, &stage)
@@ -203,6 +218,11 @@ fn validate_assets(assets: &Path) -> Result<(), RuntimeError> {
     for (name, mode) in ASSETS {
         validate_regular_file(&assets.join(name), name == "agent", Some(mode))?;
     }
+    if has_rprobe_assets(assets)? {
+        for (name, mode) in RPROBE_ASSETS {
+            validate_regular_file(&assets.join(name), false, Some(mode))?;
+        }
+    }
     Ok(())
 }
 
@@ -212,11 +232,12 @@ fn validate_stage(stage: &Path) -> Result<(), RuntimeError> {
     validate_directory_entries(stage, &expected_root)?;
     let bin = stage.join("bin");
     let assets = stage.join("assets");
-    validate_directory_entries(&bin, &BTreeSet::from(["krun", "netd", "vmmon"]))?;
-    validate_directory_entries(
-        &assets,
-        &BTreeSet::from(["agent", "initramfs", "kernel-default"]),
-    )?;
+    validate_directory_entries(&bin, &BTreeSet::from(["netd", "silo-vmm"]))?;
+    let mut expected_assets = BTreeSet::from(["agent", "initramfs", "kernel-default"]);
+    if has_rprobe_assets(&assets)? {
+        expected_assets.extend(RPROBE_ASSETS.map(|(name, _)| name));
+    }
+    validate_directory_entries(&assets, &expected_assets)?;
     for (name, mode) in HELPERS {
         validate_regular_file(&bin.join(name), true, Some(mode))?;
     }
@@ -224,7 +245,12 @@ fn validate_stage(stage: &Path) -> Result<(), RuntimeError> {
 }
 
 fn assets_match(source: &Path, destination: &Path) -> Result<bool, RuntimeError> {
-    if !directory_entries_match(destination, &["agent", "initramfs", "kernel-default"])? {
+    let source_has_rprobe = has_rprobe_assets(source)?;
+    let mut expected = vec!["agent", "initramfs", "kernel-default"];
+    if source_has_rprobe {
+        expected.extend(RPROBE_ASSETS.map(|(name, _)| name));
+    }
+    if !directory_entries_match(destination, &expected)? {
         return Ok(false);
     }
     for (name, mode) in ASSETS {
@@ -235,6 +261,13 @@ fn assets_match(source: &Path, destination: &Path) -> Result<bool, RuntimeError>
             mode,
         )? {
             return Ok(false);
+        }
+    }
+    if source_has_rprobe {
+        for (name, mode) in RPROBE_ASSETS {
+            if !regular_files_match(&source.join(name), &destination.join(name), false, mode)? {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -256,7 +289,45 @@ pub fn validate_stage_against_adjacent(
             mode,
         )?;
     }
+    if has_rprobe_assets(&profile.join("assets"))? {
+        for (name, mode) in RPROBE_ASSETS {
+            compare_regular_files(
+                &profile.join("assets").join(name),
+                &stage.join("assets").join(name),
+                mode,
+            )?;
+        }
+    }
     Ok(())
+}
+
+fn copy_optional_rprobe_assets(source: &Path, destination: &Path) -> Result<(), RuntimeError> {
+    if has_rprobe_assets(source)? {
+        for (name, mode) in RPROBE_ASSETS {
+            copy_regular_file(&source.join(name), &destination.join(name), mode)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_explicit_rprobe_assets(source: &Path, destination: &Path) -> Result<(), RuntimeError> {
+    if !has_rprobe_assets(source)? {
+        return Err(RuntimeError::Invalid(format!(
+            "explicit rprobe asset directory {} has no self-contained rprobe kernel",
+            source.display()
+        )));
+    }
+    for (name, mode) in RPROBE_ASSETS {
+        copy_regular_file(&source.join(name), &destination.join(name), mode)?;
+    }
+    Ok(())
+}
+
+fn has_rprobe_assets(assets: &Path) -> Result<bool, RuntimeError> {
+    crate::rprobe::installed_asset_set_present(assets).map_err(|source| RuntimeError::Metadata {
+        path: assets.to_path_buf(),
+        source,
+    })
 }
 
 fn compare_regular_files(source: &Path, destination: &Path, mode: u32) -> Result<(), RuntimeError> {
@@ -542,4 +613,15 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), RuntimeError> {
             source,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn runtime_layout_requires_vmm_and_netd_only() {
+        assert_eq!(
+            crate::runtime::HELPERS,
+            [("silo-vmm", 0o755), ("netd", 0o755)]
+        );
+    }
 }

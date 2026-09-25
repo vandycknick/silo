@@ -29,6 +29,16 @@ The current commands do not produce notarized macOS artifacts, release
 signatures, or published releases. Official Linux distribution is archive-only;
 native Linux distribution packages are not planned requirements.
 
+`silo-vmm` contains both the VM monitor and the libkrun worker: one
+executable that runs as the supervisor by default and as the `krun` worker
+when started with that argv[0]. libkrun is linked into it as a library, so there
+is no separate krun binary. Package `silo-vmm` (`bin/silo-vmm`, or
+`Contents/Helpers/silo-vmm` in `Silo.app`) and `netd` alongside the guest
+assets. macOS signing must use the Hypervisor/Virtualization entitlement union
+in `virt/vmm/silo-vmm.entitlements`. See
+[silo-vmm architecture](docs/architecture/silo-vmm.md) before treating a
+build or inventory check as native release qualification.
+
 ## Prerequisites
 
 Enter the repository's release shell before running packaging commands:
@@ -59,6 +69,17 @@ sudo apt-get install build-essential binutils pkg-config
 
 Nix supplies the release build tools. These Ubuntu packages provide the native
 compiler, linker, archive, and `pkg-config` tools used through `/usr/bin`.
+
+On macOS, release builds require an upstream Go toolchain on `PATH`. The Nix Go
+package embeds Nix-store paths for runtime timezone, MIME, service, and protocol
+databases, so xtask skips it when selecting the release compiler. This also lets
+CI-provided toolchains such as `actions/setup-go` participate normally. If the
+upstream toolchain is not already on the release shell's `PATH`, prepend it when
+invoking the package command:
+
+```sh
+PATH="<upstream-go-bin>:$PATH" make archive
+```
 
 Packaging normally needs network access to fetch dependencies and the default
 kernel OCI artifact. See [Kernel Selection](#kernel-selection) for local and
@@ -145,16 +166,15 @@ The canonical stage contains exactly the private runtime payload:
 ```text
 target/silo-runtime/<target>/release/
   bin/
-    vmmon
+    silo-vmm
     netd
-    krun
   assets/
     kernel-default
     initramfs
     agent
 ```
 
-The stage deliberately excludes the public `silo` frontend. Product and SDK
+The stage deliberately excludes the public `silo` frontend and the `silod` appliance daemon. Product and SDK
 packagers add their frontend or native binding without rebuilding or replacing
 the staged runtime files.
 
@@ -172,9 +192,8 @@ The runtime archive contains:
 ```text
 silo-runtime-<version>-<target>/
   bin/
-    vmmon
+    silo-vmm
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -184,15 +203,18 @@ silo-runtime-<version>-<target>/
     APACHE-2.0.txt
 ```
 
-The portable CLI archive contains the same files plus `bin/silo`:
+The portable CLI archive contains the same files plus `bin/silo` and `bin/silod`.
+The CLI starts its sibling `silod`; distribute and upgrade them together.
+`Silo.app` places the daemon at `Contents/Helpers/silod` and signs it without
+virtualization entitlements (the VMM owns virtualization):
 
 ```text
 silo-<version>-<target>/
   bin/
     silo
-    vmmon
+    silod
+    silo-vmm
     netd
-    krun
   assets/
     kernel-default
     initramfs
@@ -354,8 +376,9 @@ Existing runtime discovery support for libexec or multilib resolver layouts may
 be adopted as downstream policy. It is compatibility support, not an official
 Linux distribution layout or promise.
 
-Package uninstallers must not delete user-owned XDG state, including runtime
-data, configuration, caches, or logs.
+Package uninstallers must not delete user-owned state: the Silo home
+(`~/.silo`, including installed runtimes, caches, and logs) and the
+configuration directory (`~/.config/silo`).
 
 ## Go Runtime Installer Contract
 
@@ -363,7 +386,7 @@ The Go SDK implements the explicit runtime-only archive installer specified by A
 selects the current supported target and exact SDK version, verifies the release-compiled SHA-256
 digest, rejects path traversal, links, devices, and unexpected files, preserves and validates
 modes and notices, stages into a temporary sibling, and atomically installs a complete runtime
-below the user-owned XDG data root. It supports exact offline archives and mirrors without
+below the user-owned Silo home (`~/.silo/runtimes`). It supports exact offline archives and mirrors without
 allowing callers to replace the expected digest. Installation never occurs at SDK import,
 runtime open, machine creation, or VM start, and it never deletes user-owned state.
 

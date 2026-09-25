@@ -6,11 +6,11 @@ pub(super) const MACHINES_DIR_NAME: &str = "machines";
 pub(super) const LOGS_DIR_NAME: &str = "logs";
 pub(super) const NETWORK_DIR_NAME: &str = "network";
 const VM_SPEC_FILE_NAME: &str = "config.json";
-const VMMON_PID_FILE_NAME: &str = "vm.pid";
-const VMMON_SOCKET_FILE_NAME: &str = "vm.sock";
-const VMMON_LOCK_FILE_NAME: &str = "vm.lock";
-pub(super) const VMMON_TRACE_LOG_FILE_NAME: &str = "vm.trace.log";
-const VMMON_EXIT_STATUS_FILE_NAME: &str = "vm.exit.json";
+const VMM_PID_FILE_NAME: &str = "vm.pid";
+const VMM_SOCKET_FILE_NAME: &str = "vm.sock";
+const VMM_LOCK_FILE_NAME: &str = "vm.lock";
+pub(super) const VMM_TRACE_LOG_FILE_NAME: &str = "vm.trace.log";
+const VMM_EXIT_STATUS_FILE_NAME: &str = "vm.exit.json";
 pub(super) const SERIAL_LOG_FILE_NAME: &str = "serial.log";
 pub(super) const EXEC_LOG_FILE_NAME: &str = "exec.log";
 pub(crate) const NETWORK_SERVICE_LOG_FILE_NAME: &str = "netd.log";
@@ -27,20 +27,12 @@ pub(crate) struct MachinePaths {
 }
 
 impl MachinePaths {
-    pub(crate) fn new(
-        data_root: &Path,
-        state_root: &Path,
-        run_root: &Path,
-        machine_id: MachineId,
-    ) -> Self {
+    pub(crate) fn new(home: &Path, run_root: &Path, machine_id: MachineId) -> Self {
         let id = machine_id.to_string();
         Self {
-            data_dir: data_root.join(MACHINES_DIR_NAME).join(&id),
+            data_dir: home.join(MACHINES_DIR_NAME).join(&id),
             run_dir: run_root.join(MACHINES_DIR_NAME).join(&id),
-            logs_dir: state_root
-                .join(LOGS_DIR_NAME)
-                .join(MACHINES_DIR_NAME)
-                .join(id),
+            logs_dir: home.join(LOGS_DIR_NAME).join(MACHINES_DIR_NAME).join(id),
         }
     }
 
@@ -73,16 +65,16 @@ impl MachinePaths {
         self.data_dir.join(COMPOSITE_INITRAMFS_FILE_NAME)
     }
 
-    pub(crate) fn vmmon_pid_path(&self) -> PathBuf {
-        self.run_dir.join(VMMON_PID_FILE_NAME)
+    pub(crate) fn vmm_pid_path(&self) -> PathBuf {
+        self.run_dir.join(VMM_PID_FILE_NAME)
     }
 
-    pub(crate) fn vmmon_socket_path(&self) -> PathBuf {
-        self.run_dir.join(VMMON_SOCKET_FILE_NAME)
+    pub(crate) fn vmm_socket_path(&self) -> PathBuf {
+        self.run_dir.join(VMM_SOCKET_FILE_NAME)
     }
 
-    pub(crate) fn vmmon_lock_path(&self) -> PathBuf {
-        self.run_dir.join(VMMON_LOCK_FILE_NAME)
+    pub(crate) fn vmm_lock_path(&self) -> PathBuf {
+        self.run_dir.join(VMM_LOCK_FILE_NAME)
     }
 
     pub(crate) fn vsock_mux_path(&self, filename: &Path) -> PathBuf {
@@ -96,11 +88,11 @@ impl MachinePaths {
     }
 
     pub(crate) fn vm_trace_log_path(&self) -> PathBuf {
-        self.logs_dir.join(VMMON_TRACE_LOG_FILE_NAME)
+        self.logs_dir.join(VMM_TRACE_LOG_FILE_NAME)
     }
 
-    pub(crate) fn vmmon_exit_status_path(&self) -> PathBuf {
-        self.logs_dir.join(VMMON_EXIT_STATUS_FILE_NAME)
+    pub(crate) fn vmm_exit_status_path(&self) -> PathBuf {
+        self.logs_dir.join(VMM_EXIT_STATUS_FILE_NAME)
     }
 
     pub(crate) fn serial_log_path(&self) -> PathBuf {
@@ -155,7 +147,6 @@ mod tests {
         );
         let paths = MachinePaths::new(
             PathBuf::from("/tmp/silo").as_path(),
-            PathBuf::from("/tmp/silo-state").as_path(),
             PathBuf::from("/tmp/silo-run").as_path(),
             machine_id,
         );
@@ -180,19 +171,19 @@ mod tests {
                 .join("initramfs")
         );
         assert_eq!(
-            paths.vmmon_pid_path(),
+            paths.vmm_pid_path(),
             PathBuf::from("/tmp/silo-run/machines")
                 .join(&id)
                 .join("vm.pid")
         );
         assert_eq!(
-            paths.vmmon_socket_path(),
+            paths.vmm_socket_path(),
             PathBuf::from("/tmp/silo-run/machines")
                 .join(&id)
                 .join("vm.sock")
         );
         assert_eq!(
-            paths.vmmon_lock_path(),
+            paths.vmm_lock_path(),
             PathBuf::from("/tmp/silo-run/machines")
                 .join(&id)
                 .join("vm.lock")
@@ -211,43 +202,43 @@ mod tests {
         );
         assert_eq!(
             paths.vm_trace_log_path(),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("vm.trace.log")
         );
         assert_eq!(
-            paths.vmmon_exit_status_path(),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            paths.vmm_exit_status_path(),
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("vm.exit.json")
         );
         assert_eq!(
             paths.serial_log_path(),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("serial.log")
         );
         assert_eq!(
             paths.exec_log_path(),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("exec.log")
         );
         assert_eq!(
             paths.exec_log_archive_path(3),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("exec.log.3")
         );
         assert_eq!(
             paths.network_service_log_path(),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("network/netd.log")
         );
         assert_eq!(
             paths.network_audit_log_path(),
-            PathBuf::from("/tmp/silo-state/logs/machines")
+            PathBuf::from("/tmp/silo/logs/machines")
                 .join(&id)
                 .join("network/audit.jsonl")
         );

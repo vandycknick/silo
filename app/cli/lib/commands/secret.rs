@@ -1719,7 +1719,9 @@ struct SecretStore {
 impl SecretStore {
     fn from_env() -> eyre::Result<Self> {
         Ok(Self::new(
-            resolve_default_data_dir()?.join(SECRET_STORE_FILE_NAME),
+            libvm::HostPaths::from_env()?
+                .home()
+                .join(SECRET_STORE_FILE_NAME),
         ))
     }
 
@@ -1831,29 +1833,6 @@ fn validate_secret_name(name: &str) -> eyre::Result<()> {
         eyre::bail!("secret name `{name}` may only contain ASCII letters, numbers, dots, underscores, and dashes");
     }
     Ok(())
-}
-
-fn resolve_default_data_dir() -> eyre::Result<PathBuf> {
-    if let Some(data_home) = env_absolute_path("XDG_DATA_HOME")? {
-        return Ok(data_home.join("silo"));
-    }
-    let home = env_absolute_path("HOME")?
-        .ok_or_else(|| eyre::eyre!("could not resolve Silo data dir from HOME"))?;
-    Ok(home.join(".local/share/silo"))
-}
-
-fn env_absolute_path(name: &'static str) -> eyre::Result<Option<PathBuf>> {
-    let Some(value) = std::env::var_os(name) else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(value);
-    if !path.is_absolute() {
-        eyre::bail!(
-            "environment variable {name} must be an absolute path: {}",
-            path.display()
-        );
-    }
-    Ok(Some(path))
 }
 
 fn expires_at_from_seconds(expires_in: i64) -> String {

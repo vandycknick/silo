@@ -15,13 +15,13 @@ export class Runtime {
   /**
    * Open a local runtime.
    *
-   * `libvm` resolves one complete runtime set. `vmmonPath` replaces only
-   * `vmmon`; `PATH` is considered only with an explicit, complete
+   * `libvm` resolves one complete runtime set. `supervisorPath` replaces only
+   * `silo-vmm`; `PATH` is considered only with an explicit, complete
    * `SILO_ASSET_DIR`.
    *
    * @example
    * ```ts
-   * const runtime = await Runtime.open({ dataRoot: "/tmp/silo-sdk" });
+   * const runtime = await Runtime.open({ home: "/tmp/silo-sdk" });
    * ```
    *
    * @throws {TypeError} When `options` is malformed.

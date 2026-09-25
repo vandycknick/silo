@@ -232,7 +232,7 @@ verify_extracted_layouts() {
     local root="$QUALIFICATION_ROOT/$target/silo-$VERSION-$target"
     require_directory "$root"
 
-    for name in silo vmmon netd krun; do
+    for name in silo silod silo-vmm netd; do
       assert_mode "$root/bin/$name" 755
     done
     assert_mode "$root/assets/agent" 755
@@ -265,7 +265,7 @@ inspect_linux_target() {
   local architecture="$2"
   local loader="$3"
   local root="$QUALIFICATION_ROOT/$target/silo-$VERSION-$target"
-  local dynamic_binaries=("$root/bin/silo" "$root/bin/vmmon" "$root/bin/krun")
+  local dynamic_binaries=("$root/bin/silo" "$root/bin/silod" "$root/bin/silo-vmm")
   local static_binaries=("$root/bin/netd" "$root/assets/agent" "$root/initramfs-unpacked/init")
 
   section "Linux Binary Inspection: $target"
@@ -307,9 +307,11 @@ verify_extracted_cli_hashes() {
     local provenance="$PACKAGE_ROOT/$VERSION/$target/silo-$VERSION-$target.provenance.json"
     local actual expected
 
-    actual="$(shasum -a 256 "$root/bin/silo" | cut -d ' ' -f 1)"
-    expected="$(jq -er '.file_hashes["bin/silo"]' "$provenance")"
-    [[ "$actual" == "$expected" ]] || die "$target extracted CLI does not match provenance"
+    for name in silo silod; do
+      actual="$(shasum -a 256 "$root/bin/$name" | cut -d ' ' -f 1)"
+      expected="$(jq -er --arg path "bin/$name" '.file_hashes[$path]' "$provenance")"
+      [[ "$actual" == "$expected" ]] || die "$target extracted $name does not match provenance"
+    done
     printf '%s: extracted CLI matches provenance\n' "$target"
   done
 }
@@ -318,7 +320,7 @@ inspect_darwin_binaries() {
   section "Darwin Binary Inspection"
 
   local root="$QUALIFICATION_ROOT/darwin-arm64/silo-$VERSION-darwin-arm64"
-  local binaries=("$root/bin/silo" "$root/bin/vmmon" "$root/bin/netd" "$root/bin/krun")
+  local binaries=("$root/bin/silo" "$root/bin/silod" "$root/bin/silo-vmm" "$root/bin/netd")
 
   for binary in "${binaries[@]}"; do
     local description
@@ -335,6 +337,7 @@ inspect_darwin_binaries() {
   fi
 
   "$root/bin/silo" --help >/dev/null
+  "$root/bin/silod" --help >/dev/null
   printf 'darwin-arm64: Apple linkage and CLI startup checks passed\n'
 }
 
@@ -352,9 +355,9 @@ verify_dmg() {
   require_directory "$app"
   for executable in \
     "$app/Contents/MacOS/silo" \
-    "$app/Contents/Helpers/vmmon" \
-    "$app/Contents/Helpers/netd" \
-    "$app/Contents/Helpers/krun"
+    "$app/Contents/Helpers/silo-vmm" \
+    "$app/Contents/Helpers/silod" \
+    "$app/Contents/Helpers/netd"
   do
     codesign --verify --strict --verbose=4 "$executable"
   done
@@ -365,6 +368,7 @@ verify_dmg() {
     die "$applications does not point to /Applications"
 
   "$app/Contents/MacOS/silo" --help >/dev/null
+  "$app/Contents/Helpers/silod" --help >/dev/null
 
   hdiutil detach "$DMG_MOUNT" >/dev/null
   DMG_MOUNTED=false

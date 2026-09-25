@@ -148,7 +148,6 @@ fn resolve_local_kernel(
         cached,
         json!({
             "source": "local",
-            "path": path,
             "architecture": context.host.kernel_architecture(),
             "descriptor": {"digest": digest, "size": bytes.len()},
         }),

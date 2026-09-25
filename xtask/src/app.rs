@@ -9,22 +9,22 @@ use thiserror::Error;
 
 use crate::command;
 use crate::release;
+use crate::rprobe::ASSETS as RPROBE_ASSETS;
 use crate::targets::HostTarget;
 
 const APP_NAME: &str = "Silo.app";
 const BUNDLE_IDENTIFIER: &str = "sh.silo.app";
 const MINIMUM_SYSTEM_VERSION: &str = "26.0";
 const HELPERS: [(&str, Option<&str>); 3] = [
-    ("vmmon", Some("runtime/vmmon/vmmon.entitlements")),
+    ("silo-vmm", Some("virt/vmm/silo-vmm.entitlements")),
     ("netd", None),
-    ("krun", Some("packaging/macos/krun.entitlements")),
+    ("silod", None),
 ];
 const ASSETS: [(&str, u32); 3] = [
     ("kernel-default", 0o644),
     ("initramfs", 0o644),
     ("agent", 0o755),
 ];
-
 pub(crate) fn package_directory(target_dir: &Path, version: &str) -> PathBuf {
     target_dir
         .join("packages")
@@ -109,10 +109,16 @@ pub fn assemble(
         )?;
         copy_regular_file(&release.join("silo"), &macos.join("silo"), 0o755)?;
         for (name, _) in HELPERS {
-            copy_regular_file(&stage.join("bin").join(name), &helpers.join(name), 0o755)?;
+            let source = helper_source(&release, &stage, name);
+            copy_regular_file(&source, &helpers.join(name), 0o755)?;
         }
         for (name, mode) in ASSETS {
             copy_regular_file(&stage.join("assets").join(name), &assets.join(name), mode)?;
+        }
+        if has_rprobe_assets(&stage.join("assets"))? {
+            for (name, mode) in RPROBE_ASSETS {
+                copy_regular_file(&stage.join("assets").join(name), &assets.join(name), mode)?;
+            }
         }
         generate_icon(workspace_root, &temporary, &resources.join("Silo.icns"))?;
         verify_unsigned_copies(&release, &stage, &temporary)?;
@@ -304,11 +310,19 @@ fn generate_icon(workspace_root: &Path, bundle: &Path, destination: &Path) -> Re
     result
 }
 
+fn helper_source(release: &Path, stage: &Path, name: &str) -> PathBuf {
+    if name == "silod" {
+        release.join(name)
+    } else {
+        stage.join("bin").join(name)
+    }
+}
+
 fn verify_unsigned_copies(release: &Path, stage: &Path, bundle: &Path) -> Result<(), AppError> {
     compare_files(&release.join("silo"), &bundle.join("Contents/MacOS/silo"))?;
     for (name, _) in HELPERS {
         compare_files(
-            &stage.join("bin").join(name),
+            &helper_source(release, stage, name),
             &bundle.join("Contents/Helpers").join(name),
         )?;
     }
@@ -317,6 +331,14 @@ fn verify_unsigned_copies(release: &Path, stage: &Path, bundle: &Path) -> Result
             &stage.join("assets").join(name),
             &bundle.join("Contents/Resources/assets").join(name),
         )?;
+    }
+    if has_rprobe_assets(&stage.join("assets"))? {
+        for (name, _) in RPROBE_ASSETS {
+            compare_files(
+                &stage.join("assets").join(name),
+                &bundle.join("Contents/Resources/assets").join(name),
+            )?;
+        }
     }
     Ok(())
 }
@@ -330,12 +352,9 @@ fn validate_unsigned_layout(
     let contents = bundle.join("Contents");
     validate_directory_entries(&contents, ["Helpers", "Info.plist", "MacOS", "Resources"])?;
     validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
-    validate_directory_entries(&contents.join("Helpers"), ["krun", "netd", "vmmon"])?;
+    validate_directory_entries(&contents.join("Helpers"), ["netd", "silo-vmm", "silod"])?;
     validate_directory_entries(&contents.join("Resources"), ["Silo.icns", "assets"])?;
-    validate_directory_entries(
-        &contents.join("Resources/assets"),
-        ["agent", "initramfs", "kernel-default"],
-    )?;
+    validate_asset_entries(&contents.join("Resources/assets"))?;
     validate_regular_file(&contents.join("Info.plist"), None)?;
     validate_regular_file(&contents.join("MacOS/silo"), Some(0o755))?;
     for (name, _) in HELPERS {
@@ -343,6 +362,11 @@ fn validate_unsigned_layout(
     }
     for (name, mode) in ASSETS {
         validate_regular_file(&contents.join("Resources/assets").join(name), Some(mode))?;
+    }
+    if has_rprobe_assets(&contents.join("Resources/assets"))? {
+        for (name, mode) in RPROBE_ASSETS {
+            validate_regular_file(&contents.join("Resources/assets").join(name), Some(mode))?;
+        }
     }
     validate_regular_file(&contents.join("Resources/Silo.icns"), None)?;
     for (key, expected) in [
@@ -475,7 +499,7 @@ fn entitlement_map(path: &Path, plist: &[u8]) -> Result<BTreeMap<String, bool>, 
 
 pub fn verify_signed_bundle(bundle: &Path) -> Result<(), AppError> {
     validate_distribution_layout(bundle)?;
-    for name in ["silo", "vmmon", "netd", "krun"] {
+    for name in ["silo", "silod", "silo-vmm", "netd"] {
         let path = match name {
             "silo" => bundle.join("Contents/MacOS/silo"),
             _ => bundle.join("Contents/Helpers").join(name),
@@ -484,12 +508,11 @@ pub fn verify_signed_bundle(bundle: &Path) -> Result<(), AppError> {
     }
     verify_signature(bundle)?;
     verify_entitlements(
-        &bundle.join("Contents/Helpers/vmmon"),
-        &["com.apple.security.virtualization"],
-    )?;
-    verify_entitlements(
-        &bundle.join("Contents/Helpers/krun"),
-        &["com.apple.security.hypervisor"],
+        &bundle.join("Contents/Helpers/silo-vmm"),
+        &[
+            "com.apple.security.hypervisor",
+            "com.apple.security.virtualization",
+        ],
     )?;
     verify_entitlements(&bundle.join("Contents/MacOS/silo"), &[])?;
     verify_entitlements(&bundle.join("Contents/Helpers/netd"), &[])?;
@@ -559,12 +582,9 @@ fn validate_distribution_layout(bundle: &Path) -> Result<(), AppError> {
         ],
     )?;
     validate_directory_entries(&contents.join("MacOS"), ["silo"])?;
-    validate_directory_entries(&contents.join("Helpers"), ["krun", "netd", "vmmon"])?;
+    validate_directory_entries(&contents.join("Helpers"), ["netd", "silo-vmm", "silod"])?;
     validate_directory_entries(&contents.join("Resources"), ["Silo.icns", "assets"])?;
-    validate_directory_entries(
-        &contents.join("Resources/assets"),
-        ["agent", "initramfs", "kernel-default"],
-    )?;
+    validate_asset_entries(&contents.join("Resources/assets"))?;
     validate_regular_file(&contents.join("Info.plist"), None)?;
     validate_regular_file(&contents.join("MacOS/silo"), Some(0o755))?;
     for (name, _) in HELPERS {
@@ -572,6 +592,11 @@ fn validate_distribution_layout(bundle: &Path) -> Result<(), AppError> {
     }
     for (name, mode) in ASSETS {
         validate_regular_file(&contents.join("Resources/assets").join(name), Some(mode))?;
+    }
+    if has_rprobe_assets(&contents.join("Resources/assets"))? {
+        for (name, mode) in RPROBE_ASSETS {
+            validate_regular_file(&contents.join("Resources/assets").join(name), Some(mode))?;
+        }
     }
     validate_regular_file(&contents.join("Resources/Silo.icns"), None)?;
     for (key, expected) in [
@@ -675,6 +700,22 @@ fn validate_directory_entries<const N: usize>(
             format!("contains {actual:?}, expected {expected:?}"),
         )
     }
+}
+
+fn validate_asset_entries(assets: &Path) -> Result<(), AppError> {
+    if has_rprobe_assets(assets)? {
+        validate_directory_entries(assets, ["agent", "initramfs", "kernel-default", "rprobe"])
+    } else {
+        validate_directory_entries(assets, ["agent", "initramfs", "kernel-default"])
+    }
+}
+
+fn has_rprobe_assets(assets: &Path) -> Result<bool, AppError> {
+    crate::rprobe::installed_asset_set_present(assets).map_err(|source| AppError::Io {
+        action: "read rprobe asset metadata",
+        path: assets.to_path_buf(),
+        source,
+    })
 }
 
 fn validate_regular_file(path: &Path, expected_mode: Option<u32>) -> Result<(), AppError> {
@@ -817,4 +858,23 @@ fn invalid<T>(path: &Path, reason: String) -> Result<T, AppError> {
         path: path.to_path_buf(),
         reason,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn app_uses_vmm_for_both_virtualization_roles() {
+        assert_eq!(
+            crate::app::HELPERS,
+            [
+                ("silo-vmm", Some("virt/vmm/silo-vmm.entitlements")),
+                ("netd", None),
+                ("silod", None)
+            ]
+        );
+        let entitlements = include_str!("../../virt/vmm/silo-vmm.entitlements");
+        assert!(entitlements.contains("com.apple.security.virtualization"));
+        assert!(entitlements.contains("com.apple.security.hypervisor"));
+        assert_eq!(entitlements.matches("<key>").count(), 2);
+    }
 }

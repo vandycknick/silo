@@ -5,10 +5,14 @@ use std::path::Path;
 use prost_types::Timestamp;
 use protocol::v1::{
     AgentMetricReport, AgentMetrics, BlockDeviceMetrics, CpuMetrics, FilesystemMetrics,
-    LoadAverageMetrics, MemoryMetrics, MetricSnapshot, NetworkInterfaceMetrics,
+    LoadAverageMetrics, MemoryMetrics, MemoryReclaimReport, MetricSnapshot,
+    NetworkInterfaceMetrics,
 };
 
-pub(crate) fn collect(instance_id: String) -> AgentMetrics {
+pub(crate) fn collect(
+    instance_id: String,
+    memory_reclaim: Option<MemoryReclaimReport>,
+) -> AgentMetrics {
     AgentMetrics {
         agent_instance_id: Some(instance_id),
         report: Some(AgentMetricReport {
@@ -29,6 +33,7 @@ pub(crate) fn collect(instance_id: String) -> AgentMetrics {
                 filesystems: filesystems(),
                 network_interfaces: network(),
                 block_devices: block_devices(),
+                memory_reclaim,
             }),
         }),
     }
@@ -60,6 +65,8 @@ fn parse_memory(text: &str) -> Option<MemoryMetrics> {
     Some(MemoryMetrics {
         total_bytes: Some(value("MemTotal:")?),
         available_bytes: Some(value("MemAvailable:")?),
+        free_bytes: value("MemFree:"),
+        cached_bytes: value("Cached:"),
     })
 }
 
@@ -310,10 +317,17 @@ fn parse_block_devices(text: &str) -> Vec<BlockDeviceMetrics> {
 mod tests {
     #[test]
     fn parses_complete_proc_fixtures() {
-        let memory =
-            crate::metrics::parse_memory("MemTotal: 2 kB\nMemAvailable: 1 kB\n").expect("memory");
+        let memory = crate::metrics::parse_memory(
+            "MemTotal: 2 kB\nMemFree: 1 kB\nMemAvailable: 1 kB\nCached: 1 kB\n",
+        )
+        .expect("memory");
         assert_eq!(memory.total_bytes, Some(2048));
         assert_eq!(memory.available_bytes, Some(1024));
+        assert_eq!(memory.free_bytes, Some(1024));
+        assert_eq!(memory.cached_bytes, Some(1024));
+        let sparse =
+            crate::metrics::parse_memory("MemTotal: 2 kB\nMemAvailable: 1 kB\n").expect("memory");
+        assert_eq!(sparse.free_bytes, None);
         let load = crate::metrics::parse_load("1.0 2.0 3.0 1/1 1").expect("load");
         assert_eq!(load.fifteen_minutes, Some(3.0));
         assert_eq!(crate::metrics::parse_uptime("12.5 0.0"), Some(12.5));

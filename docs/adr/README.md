@@ -25,10 +25,10 @@ and review standards for new and substantially revised records.
 | 0002 | Image management                                              | Abandoned   | 2026-02-20 | `docs/adr/0002-image-management.md`              |
 | 0003 | Replace shell command with native SSH client (`ssh2`/libssh2) | Proposed    | 2026-02-23 | `docs/adr/0003-native-shell-client-ssh2.md`      |
 | 0004 | Daemonless architecture                                       | Implemented | 2026-04-06 | `docs/adr/0004-daemonless-architecture.md`       |
-| 0005 | Vmmon endpoint plugins for vsock streams                      | Superseded  | 2026-04-12 | `docs/adr/0005-vmmon-vsock-endpoint-plugins.md`  |
+| 0005 | silo-vmm endpoint plugins for vsock streams                 | Superseded  | 2026-04-12 | `docs/adr/0005-vmm-vsock-endpoint-plugins.md`  |
 | 0006 | Sandbox network policy and firewall semantics                 | Proposed    | 2026-06-18 | `docs/adr/0006-sandbox-network-policy-and-firewall-semantics.md` |
 | 0007 | HCL network policy frontend                                   | Proposed    | 2026-07-04 | `docs/adr/0007-hcl-network-policy-frontend.md`   |
-| 0008 | Vmmon host and guest agent gRPC APIs                           | Implemented | 2026-07-08 | `docs/adr/0008-vmmon-host-and-guest-grpc-api.md` |
+| 0008 | silo-vmm host and guest agent gRPC APIs                     | Implemented | 2026-07-08 | `docs/adr/0008-vmm-host-and-guest-grpc-api.md` |
 | 0009 | Per-launch guest agent initramfs overlay                      | Accepted    | 2026-07-11 | `docs/adr/0009-per-launch-guest-agent-initramfs-overlay.md` |
 | 0010 | Static guest network configuration                            | Accepted    | 2026-07-11 | `docs/adr/0010-static-guest-network-configuration.md` |
 | 0011 | Package registry endpoint semantics                          | Draft       | 2026-07-16 | `docs/adr/0011-package-registry-endpoint-semantics.md` |
@@ -36,3 +36,5 @@ and review standards for new and substantially revised records.
 | 0013 | Image-first machine lifecycle                                | Implemented | 2026-08-07 | `docs/adr/0013-image-first-machine-lifecycle.md` |
 | 0015 | Firecracker-compatible hybrid vsock host surface             | Accepted    | 2026-08-25 | `docs/adr/0015-hybrid-vsock-host-surface.md`     |
 | 0016 | Forwarding: machine- and session-scoped vsock forwards and guest-requested netd publications | Draft | 2026-09-01 | `docs/adr/0016-vsock-forwards-and-netd-publications.md` |
+| 0017 | Single host state root                                        | Accepted    | 2026-09-24 | `docs/adr/0017-single-host-state-root.md`        |
+| 0018 | silo-vmm contract                                           | Accepted    | 2026-09-24 | `docs/adr/0018-silo-vmm-contract.md`           |

@@ -162,9 +162,70 @@ impl Spinner {
         }
     }
 
+    /// Prints a warning above the spinner without tearing its line.
+    pub fn warn(&self, message: impl AsRef<str>) {
+        match &self.pb {
+            Some(pb) => pb.suspend(|| warn(message)),
+            None => warn(message),
+        }
+    }
+
     pub fn finish_clear(mut self) {
         if let Some(pb) = self.pb.take() {
             pb.finish_and_clear();
+        }
+    }
+}
+
+/// Keep short operations quiet, but show progress for a slow operation without
+/// cancelling or restarting it when the display delay expires. Noninteractive
+/// callers receive no extra output.
+pub(crate) async fn with_delayed_spinner<T, E>(
+    operation: impl std::future::Future<Output = Result<T, E>>,
+    delay: Duration,
+    mut labels: tokio::sync::watch::Receiver<&'static str>,
+    target: &str,
+    past_tense: &str,
+) -> Result<T, E> {
+    let started = Instant::now();
+    let delay = tokio::time::sleep(delay);
+    tokio::pin!(operation, delay);
+    let mut spinner: Option<Spinner> = None;
+    let mut labels_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut operation => {
+                if let Some(spinner) = spinner {
+                    if result.is_ok() {
+                        spinner.finish_success(past_tense);
+                    } else {
+                        spinner.finish_clear();
+                    }
+                }
+                return result;
+            }
+            changed = labels.changed(), if labels_open => {
+                if changed.is_err() {
+                    labels_open = false;
+                    continue;
+                }
+            }
+            _ = &mut delay, if spinner.is_none() => {}
+        }
+        // A phase change (for example Ctrl+C forcing a stop) is shown
+        // immediately, even if the initial quiet period has not elapsed.
+        let label = *labels.borrow_and_update();
+        if let Some(spinner) = &mut spinner {
+            spinner.step(label, target);
+        } else {
+            let mut progress = if stderr_is_interactive() {
+                Spinner::start(label, target)
+            } else {
+                Spinner::quiet()
+            };
+            progress.start = started;
+            spinner = Some(progress);
         }
     }
 }
@@ -572,7 +633,14 @@ pub fn print_detail_rows(rows: &[(impl AsRef<str>, impl AsRef<str>)]) -> eyre::R
         for _ in 0..padding {
             write!(out, " ")?;
         }
-        writeln!(out, "{value}")?;
+        let mut lines = value.lines();
+        writeln!(out, "{}", lines.next().unwrap_or_default())?;
+        for line in lines {
+            for _ in 0..label_width + 3 {
+                write!(out, " ")?;
+            }
+            writeln!(out, "{line}")?;
+        }
     }
 
     Ok(())
@@ -687,7 +755,46 @@ fn write_columns(out: &mut impl Write, values: &[String], widths: &[usize]) -> e
 mod tests {
     use libvm::ImageProgress;
 
-    use super::{relative_time, short_id, PullProgressDisplay};
+    use crate::ui::{relative_time, short_id, with_delayed_spinner, PullProgressDisplay};
+
+    #[tokio::test]
+    async fn delayed_spinner_does_not_delay_fast_operations() {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            with_delayed_spinner(
+                std::future::ready(Ok::<_, &str>(42)),
+                std::time::Duration::from_secs(60),
+                tokio::sync::watch::channel("Stopping").1,
+                "vm",
+                "Stopped",
+            ),
+        )
+        .await
+        .expect("fast operation should not wait for the spinner");
+        assert_eq!(result, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn delayed_spinner_preserves_slow_results_without_restarting_work() {
+        for expected in [Ok(42), Err("shutdown failed")] {
+            let starts = std::cell::Cell::new(0);
+            let operation = async {
+                starts.set(starts.get() + 1);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                expected
+            };
+            let result = with_delayed_spinner(
+                operation,
+                std::time::Duration::ZERO,
+                tokio::sync::watch::channel("Stopping").1,
+                "vm",
+                "Stopped",
+            )
+            .await;
+            assert_eq!(result, expected);
+            assert_eq!(starts.get(), 1);
+        }
+    }
 
     #[test]
     fn relative_time_formatting() {

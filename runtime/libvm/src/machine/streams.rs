@@ -17,7 +17,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::machine::{Machine, MachineData, MachineRef};
 use crate::store::models::MachineConfig;
-use crate::vmmon::VmmonClientError;
+use crate::supervisor::VmmClientError;
 use crate::LibVmError;
 
 const PRODUCER_CHUNK_BYTES: usize = 32 * 1024;
@@ -101,7 +101,7 @@ impl AsyncRead for MachineByteStream {
             &mut this.read_buffer,
             cx,
             buffer,
-            "vmmon access",
+            "silo-vmm access",
         )
     }
 }
@@ -118,14 +118,14 @@ impl AsyncWrite for MachineByteStream {
         let Some(writer) = self.writer.as_mut() else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "vmmon request stream is closed",
+                "silo-vmm request stream is closed",
             )));
         };
         match writer.poll_reserve(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "vmmon request stream closed",
+                "silo-vmm request stream closed",
             ))),
             Poll::Ready(Ok(())) => {
                 let len = data.len().min(PRODUCER_CHUNK_BYTES);
@@ -134,7 +134,7 @@ impl AsyncWrite for MachineByteStream {
                         data: Some(Bytes::copy_from_slice(&data[..len])),
                     })
                     .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "vmmon request stream closed")
+                        io::Error::new(io::ErrorKind::BrokenPipe, "silo-vmm request stream closed")
                     })?;
                 Poll::Ready(Ok(len))
             }
@@ -363,8 +363,35 @@ pub enum MachineAgentProvisionFailurePolicy {
 pub struct MachineMetrics {
     pub machine_id: String,
     pub name: String,
+    /// Backend that constructed the running VM monitor, when reported by silo-vmm.
+    pub actual_backend: Option<String>,
     pub monitor: MachineMonitorSnapshot,
     pub metrics: Option<MachineAgentMetricsObservation>,
+    /// Host memory reclaim state of the running VM, when the backend reports it.
+    pub host_memory_reclaim: Option<MachineHostMemoryReclaim>,
+}
+/// Host memory reclaim state as last reported by the VM backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineHostMemoryReclaim {
+    /// Whether the runtime asked the backend to release guest RAM to the host.
+    pub requested: bool,
+    /// Outcome of the backend's per-VM qualification probe.
+    pub qualification: MachineHostMemoryReclaimQualification,
+    /// True only while free-page reports are actually released to the host.
+    pub effective: bool,
+    pub released_bytes: u64,
+    pub released_extents: u64,
+    pub retried_faults: u64,
+    pub skipped_reports: u64,
+    pub failed_operations: u64,
+    pub observed_at: SystemTime,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineHostMemoryReclaimQualification {
+    NotRun,
+    Passed,
+    Failed,
+    Inconclusive,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct MachineAgentMetricsObservation {
@@ -389,11 +416,39 @@ pub struct MachineMetricSnapshot {
     pub filesystems: Vec<MachineFilesystemMetrics>,
     pub network_interfaces: Vec<MachineNetworkInterfaceMetrics>,
     pub block_devices: Vec<MachineBlockDeviceMetrics>,
+    /// Last guest page-cache reclaim run by the agent, once it has run.
+    pub memory_reclaim: Option<MachineMemoryReclaimReport>,
+}
+/// One guest memory reclaim run, as the agent reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineMemoryReclaimReport {
+    pub finished_at: SystemTime,
+    /// `gradual` or `dropcache`.
+    pub mode: String,
+    /// `reclaimed`, `partial`, `nothing`, or `failed`.
+    pub outcome: String,
+    pub requested_bytes: u64,
+    pub cached_before_bytes: u64,
+    pub cached_after_bytes: u64,
+    pub compacted: bool,
+    /// Runs since the agent started, including this one.
+    pub runs: u64,
+}
+impl MachineMemoryReclaimReport {
+    /// How far the guest's `Cached` figure fell across the run.
+    pub fn cached_delta_bytes(&self) -> u64 {
+        self.cached_before_bytes
+            .saturating_sub(self.cached_after_bytes)
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineMemoryMetrics {
     pub total_bytes: u64,
     pub available_bytes: u64,
+    /// Pages on the guest kernel's free lists, when the agent reports them.
+    pub free_bytes: Option<u64>,
+    /// Page cache the guest could drop under pressure, when the agent reports it.
+    pub cached_bytes: Option<u64>,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct MachineCpuMetrics {
@@ -504,7 +559,7 @@ impl Machine {
     pub async fn monitor_status(&self) -> Result<MachineMonitorStatus, LibVmError> {
         let config = self.running_config().await?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .status()
             .await
@@ -514,7 +569,7 @@ impl Machine {
     pub async fn wait_ready(&self, timeout: Duration) -> Result<MachineReadiness, LibVmError> {
         let config = self.running_config().await?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .wait_ready(timeout)
             .await
@@ -524,7 +579,7 @@ impl Machine {
     pub async fn metrics(&self) -> Result<MachineMetrics, LibVmError> {
         let config = self.running_config().await?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .metrics()
             .await
@@ -538,7 +593,7 @@ impl Machine {
         let config = self.running_config().await?;
         let path = validate_path(path.into())?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .get_entry(GetEntryRequest { path: Some(path) })
             .await
@@ -554,7 +609,7 @@ impl Machine {
         let path = validate_path(path.into())?;
         reject_root(&path)?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .remove_entry(RemoveEntryRequest {
                 path: Some(path),
@@ -573,7 +628,7 @@ impl Machine {
         let path = validate_path(path.into())?;
         validate_page(limit, cursor.as_deref())?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .list_directory(ListDirectoryRequest {
                 path: Some(path),
@@ -597,7 +652,7 @@ impl Machine {
         reject_root(&path)?;
         validate_mode(mode)?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .create_directory(CreateDirectoryRequest {
                 path: Some(path),
@@ -620,7 +675,7 @@ impl Machine {
         let path = validate_path(path.into())?;
         reject_root(&path)?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .download_file(DownloadFileRequest { path: Some(path) })
             .await
@@ -647,7 +702,7 @@ impl Machine {
         };
         let request_guard = tx.clone();
         let (producer, mut completion_rx) = spawn_upload_producer(tx, header, reader);
-        let client = self.runtime().vmmon().client(self.machine_id());
+        let client = self.runtime().supervisor().client(self.machine_id());
         let mut rpc = Box::pin(client.upload_file(ReceiverStream::new(rx)));
         let outcome = tokio::select! {
             response = &mut rpc => UploadOutcome::Rpc(response),
@@ -694,7 +749,7 @@ impl Machine {
     pub async fn open_serial_stream(&self) -> Result<MachineByteStream, LibVmError> {
         let config = self.running_config().await?;
         self.runtime()
-            .vmmon()
+            .supervisor()
             .client(self.machine_id())
             .open_serial_stream()
             .await
@@ -702,7 +757,7 @@ impl Machine {
     }
     pub(crate) async fn open_shell_stream(&self) -> Result<MachineByteStream, LibVmError> {
         let config = self.running_config().await?;
-        let client = self.runtime().vmmon().client(self.machine_id());
+        let client = self.runtime().supervisor().client(self.machine_id());
         client
             .open_shell_stream()
             .await
@@ -747,7 +802,7 @@ where
             .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "vmmon upload request stream closed",
+                    "silo-vmm upload request stream closed",
                 )
             })?;
             let mut buffer = BytesMut::zeroed(PRODUCER_CHUNK_BYTES);
@@ -765,7 +820,7 @@ where
                 .map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::BrokenPipe,
-                        "vmmon upload request stream closed",
+                        "silo-vmm upload request stream closed",
                     )
                 })?;
             }
@@ -786,13 +841,11 @@ where
     (producer, completion_rx)
 }
 
-fn monitor_error(reference: String, error: impl Into<VmmonClientError>) -> LibVmError {
+fn monitor_error(reference: String, error: impl Into<VmmClientError>) -> LibVmError {
     match error.into() {
-        VmmonClientError::Connection(message) => {
-            LibVmError::MonitorConnection { reference, message }
-        }
-        VmmonClientError::Protocol(message) => LibVmError::MonitorProtocol { reference, message },
-        VmmonClientError::Forward(error) => LibVmError::MonitorProtocol {
+        VmmClientError::Connection(message) => LibVmError::MonitorConnection { reference, message },
+        VmmClientError::Protocol(message) => LibVmError::MonitorProtocol { reference, message },
+        VmmClientError::Forward(error) => LibVmError::MonitorProtocol {
             reference,
             message: error.to_string(),
         },
@@ -862,12 +915,12 @@ fn validate_page(limit: Option<u32>, cursor: Option<&[u8]>) -> Result<(), LibVmE
     Ok(())
 }
 fn required<T>(value: Option<T>, field: &str) -> Result<T, String> {
-    value.ok_or_else(|| format!("vmmon response is missing required {field}"))
+    value.ok_or_else(|| format!("silo-vmm response is missing required {field}"))
 }
 fn required_text(value: Option<String>, field: &str, maximum: usize) -> Result<String, String> {
     let value = required(value, field)?;
     if value.is_empty() || value.len() > maximum || value.as_bytes().contains(&0) {
-        return Err(format!("vmmon response has invalid {field}"));
+        return Err(format!("silo-vmm response has invalid {field}"));
     }
     Ok(value)
 }
@@ -879,7 +932,7 @@ fn optional_text(
     value
         .map(|value| {
             if value.len() > maximum || value.as_bytes().contains(&0) {
-                Err(format!("vmmon response has invalid {field}"))
+                Err(format!("silo-vmm response has invalid {field}"))
             } else {
                 Ok(value)
             }
@@ -889,9 +942,9 @@ fn optional_text(
 fn canonical_uuid(value: Option<String>, field: &str) -> Result<String, String> {
     let value = required_text(value, field, 36)?;
     let parsed = uuid::Uuid::parse_str(&value)
-        .map_err(|_| format!("vmmon response has invalid {field} UUID"))?;
+        .map_err(|_| format!("silo-vmm response has invalid {field} UUID"))?;
     if parsed.hyphenated().to_string() != value {
-        return Err(format!("vmmon response has non-canonical {field} UUID"));
+        return Err(format!("silo-vmm response has non-canonical {field} UUID"));
     }
     Ok(value)
 }
@@ -900,12 +953,12 @@ fn required_duration(
     field: &str,
 ) -> Result<Duration, String> {
     optional_duration(value, field)?
-        .ok_or_else(|| format!("vmmon response is missing required {field}"))
+        .ok_or_else(|| format!("silo-vmm response is missing required {field}"))
 }
 fn finite_nonnegative(value: Option<f64>, field: &str) -> Result<f64, String> {
     let value = required(value, field)?;
     if !value.is_finite() || value < 0.0 {
-        return Err(format!("vmmon response has invalid {field}"));
+        return Err(format!("silo-vmm response has invalid {field}"));
     }
     Ok(value)
 }
@@ -917,13 +970,13 @@ fn validate_mac(value: &str, field: &str) -> Result<(), String> {
                 || (b'a'..=b'f').contains(byte)
         })
     {
-        return Err(format!("vmmon response has invalid {field}"));
+        return Err(format!("silo-vmm response has invalid {field}"));
     }
     Ok(())
 }
 fn validate_paths(values: Vec<String>, field: &str, maximum: usize) -> Result<Vec<String>, String> {
     if values.len() > maximum {
-        return Err(format!("vmmon response {field} exceeds maximum size"));
+        return Err(format!("silo-vmm response {field} exceeds maximum size"));
     }
     values
         .into_iter()
@@ -935,7 +988,7 @@ fn timestamp(value: Option<prost_types::Timestamp>, field: &str) -> Result<Syste
     if !(-62_135_596_800..=253_402_300_799).contains(&value.seconds)
         || !(0..1_000_000_000).contains(&value.nanos)
     {
-        return Err(format!("vmmon response has invalid {field}"));
+        return Err(format!("silo-vmm response has invalid {field}"));
     }
     if value.seconds >= 0 {
         UNIX_EPOCH.checked_add(Duration::new(value.seconds as u64, value.nanos as u32))
@@ -944,7 +997,7 @@ fn timestamp(value: Option<prost_types::Timestamp>, field: &str) -> Result<Syste
             .checked_sub(Duration::from_secs(value.seconds.unsigned_abs()))
             .and_then(|time| time.checked_add(Duration::from_nanos(value.nanos as u64)))
     }
-    .ok_or_else(|| format!("vmmon response has out-of-range {field}"))
+    .ok_or_else(|| format!("silo-vmm response has out-of-range {field}"))
 }
 fn optional_timestamp(
     value: Option<prost_types::Timestamp>,
@@ -959,7 +1012,7 @@ fn optional_duration(
     value
         .map(|value| {
             if value.seconds < 0 || !(0..1_000_000_000).contains(&value.nanos) {
-                return Err(format!("vmmon response has invalid {field}"));
+                return Err(format!("silo-vmm response has invalid {field}"));
             }
             Ok(Duration::new(value.seconds as u64, value.nanos as u32))
         })
@@ -969,9 +1022,9 @@ fn enum_value<T>(value: i32, field: &str) -> Result<T, String>
 where
     T: TryFrom<i32>,
 {
-    T::try_from(value).map_err(|_| format!("vmmon response has unknown {field} value {value}"))
+    T::try_from(value).map_err(|_| format!("silo-vmm response has unknown {field} value {value}"))
 }
-macro_rules! protocol_enum { ($name:ident, $wire:ident => $public:ident, { $($source:ident => $target:ident),+ $(,)? }) => { fn $name(value: i32, field: &str) -> Result<$public, String> { match enum_value::<v1::$wire>(value, field)? { $(v1::$wire::$source => Ok($public::$target),)+ v1::$wire::Unspecified => Err(format!("vmmon response has unspecified {field}")), } } }; }
+macro_rules! protocol_enum { ($name:ident, $wire:ident => $public:ident, { $($source:ident => $target:ident),+ $(,)? }) => { fn $name(value: i32, field: &str) -> Result<$public, String> { match enum_value::<v1::$wire>(value, field)? { $(v1::$wire::$source => Ok($public::$target),)+ v1::$wire::Unspecified => Err(format!("silo-vmm response has unspecified {field}")), } } }; }
 protocol_enum!(vm_state, VmState => MachineVmState, { Starting => Starting, Running => Running, Stopping => Stopping, Stopped => Stopped, Failed => Failed });
 protocol_enum!(readiness_reason, ReadinessReason => MachineReadinessReason, { VmStarting => VmStarting, VmStopping => VmStopping, VmStopped => VmStopped, VmFailed => VmFailed, AgentNotRequired => AgentNotRequired, AgentUnavailable => AgentUnavailable, AgentStatusStale => AgentStatusStale, GuestStarting => GuestStarting, GuestFailed => GuestFailed, GuestReportedReady => GuestReportedReady });
 protocol_enum!(connection_state, AgentConnectionState => MachineAgentConnectionState, { Connecting => Connecting, Responsive => Responsive, Unresponsive => Unresponsive });
@@ -1139,7 +1192,7 @@ impl TryFrom<v1::SystemInfo> for MachineSystemInfo {
     type Error = String;
     fn try_from(value: v1::SystemInfo) -> Result<Self, Self::Error> {
         if value.ip_addresses.len() > protocol::MAX_AGENT_IP_ADDRESSES {
-            return Err("vmmon response system.ip_addresses exceeds maximum size".to_string());
+            return Err("silo-vmm response system.ip_addresses exceeds maximum size".to_string());
         }
         let ip_addresses = value
             .ip_addresses
@@ -1152,9 +1205,11 @@ impl TryFrom<v1::SystemInfo> for MachineSystemInfo {
                 )?;
                 let parsed = address
                     .parse::<std::net::IpAddr>()
-                    .map_err(|_| "vmmon response has invalid system.ip_addresses".to_string())?;
+                    .map_err(|_| "silo-vmm response has invalid system.ip_addresses".to_string())?;
                 if parsed.to_string() != address {
-                    return Err("vmmon response has non-canonical system.ip_addresses".to_string());
+                    return Err(
+                        "silo-vmm response has non-canonical system.ip_addresses".to_string()
+                    );
                 }
                 Ok(address)
             })
@@ -1226,7 +1281,7 @@ impl TryFrom<v1::ProvisionReport> for MachineProvisioningReport {
     type Error = String;
     fn try_from(value: v1::ProvisionReport) -> Result<Self, Self::Error> {
         if value.steps.len() > protocol::MAX_PROVISIONING_STEPS {
-            return Err("vmmon response provisioning.steps exceeds maximum size".to_string());
+            return Err("silo-vmm response provisioning.steps exceeds maximum size".to_string());
         }
         let started_at = timestamp(
             value.started_at,
@@ -1237,7 +1292,9 @@ impl TryFrom<v1::ProvisionReport> for MachineProvisioningReport {
             "agent.status.report.provisioning.finished_at",
         )?;
         if finished_at < started_at {
-            return Err("vmmon response provisioning finished_at precedes started_at".to_string());
+            return Err(
+                "silo-vmm response provisioning finished_at precedes started_at".to_string(),
+            );
         }
         let duration =
             required_duration(value.duration, "agent.status.report.provisioning.duration")?;
@@ -1252,7 +1309,7 @@ impl TryFrom<v1::ProvisionReport> for MachineProvisioningReport {
                 .enumerate()
                 .any(|(index, step)| steps[..index].iter().any(|previous| previous.id == step.id))
         {
-            return Err("vmmon response provisioning step IDs must be unique".to_string());
+            return Err("silo-vmm response provisioning step IDs must be unique".to_string());
         }
         Ok(Self {
             status: provision_status(
@@ -1326,8 +1383,50 @@ impl TryFrom<v1::HostMetrics> for MachineMetrics {
         Ok(Self {
             machine_id: canonical_uuid(value.machine_id, "machine_id")?,
             name: required_text(value.name, "name", protocol::MAX_INFO_BYTES)?,
+            actual_backend: optional_text(
+                value.actual_backend,
+                "actual_backend",
+                protocol::MAX_INFO_BYTES,
+            )?,
             monitor: required(value.monitor, "monitor")?.try_into()?,
             metrics: value.metrics.map(TryInto::try_into).transpose()?,
+            host_memory_reclaim: value
+                .host_memory_reclaim
+                .map(TryInto::try_into)
+                .transpose()?,
+        })
+    }
+}
+impl TryFrom<v1::HostMemoryReclaim> for MachineHostMemoryReclaim {
+    type Error = String;
+    fn try_from(value: v1::HostMemoryReclaim) -> Result<Self, Self::Error> {
+        let qualification = match required_text(
+            value.qualification,
+            "host_memory_reclaim.qualification",
+            protocol::MAX_INFO_BYTES,
+        )?
+        .as_str()
+        {
+            "not-run" => MachineHostMemoryReclaimQualification::NotRun,
+            "passed" => MachineHostMemoryReclaimQualification::Passed,
+            "failed" => MachineHostMemoryReclaimQualification::Failed,
+            "inconclusive" => MachineHostMemoryReclaimQualification::Inconclusive,
+            other => {
+                return Err(format!(
+                    "silo-vmm response has unknown host_memory_reclaim.qualification {other:?}"
+                ))
+            }
+        };
+        Ok(Self {
+            requested: required(value.requested, "host_memory_reclaim.requested")?,
+            qualification,
+            effective: required(value.effective, "host_memory_reclaim.effective")?,
+            released_bytes: value.released_bytes.unwrap_or_default(),
+            released_extents: value.released_extents.unwrap_or_default(),
+            retried_faults: value.retried_faults.unwrap_or_default(),
+            skipped_reports: value.skipped_reports.unwrap_or_default(),
+            failed_operations: value.failed_operations.unwrap_or_default(),
+            observed_at: timestamp(value.observed_at, "host_memory_reclaim.observed_at")?,
         })
     }
 }
@@ -1369,7 +1468,7 @@ impl TryFrom<v1::MetricSnapshot> for MachineMetricSnapshot {
             || value.network_interfaces.len() > protocol::MAX_METRIC_ARRAY_ENTRIES
             || value.block_devices.len() > protocol::MAX_METRIC_ARRAY_ENTRIES
         {
-            return Err("vmmon response metric array exceeds maximum size".to_string());
+            return Err("silo-vmm response metric array exceeds maximum size".to_string());
         }
         Ok(Self {
             memory: value.memory.map(TryInto::try_into).transpose()?,
@@ -1394,6 +1493,30 @@ impl TryFrom<v1::MetricSnapshot> for MachineMetricSnapshot {
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
+            memory_reclaim: value.memory_reclaim.map(TryInto::try_into).transpose()?,
+        })
+    }
+}
+impl TryFrom<v1::MemoryReclaimReport> for MachineMemoryReclaimReport {
+    type Error = String;
+    fn try_from(value: v1::MemoryReclaimReport) -> Result<Self, Self::Error> {
+        Ok(Self {
+            finished_at: timestamp(value.finished_at, "metrics.memory_reclaim.finished_at")?,
+            mode: required_text(
+                value.mode,
+                "metrics.memory_reclaim.mode",
+                protocol::MAX_INFO_BYTES,
+            )?,
+            outcome: required_text(
+                value.outcome,
+                "metrics.memory_reclaim.outcome",
+                protocol::MAX_INFO_BYTES,
+            )?,
+            requested_bytes: value.requested_bytes.unwrap_or_default(),
+            cached_before_bytes: value.cached_before_bytes.unwrap_or_default(),
+            cached_after_bytes: value.cached_after_bytes.unwrap_or_default(),
+            compacted: value.compacted.unwrap_or_default(),
+            runs: value.runs.unwrap_or_default(),
         })
     }
 }
@@ -1404,12 +1527,14 @@ impl TryFrom<v1::MemoryMetrics> for MachineMemoryMetrics {
         let available_bytes = required(value.available_bytes, "metrics.memory.available_bytes")?;
         if available_bytes > total_bytes {
             return Err(
-                "vmmon response metrics.memory.available_bytes exceeds total_bytes".to_string(),
+                "silo-vmm response metrics.memory.available_bytes exceeds total_bytes".to_string(),
             );
         }
         Ok(Self {
             total_bytes,
             available_bytes,
+            free_bytes: value.free_bytes,
+            cached_bytes: value.cached_bytes,
         })
     }
 }
@@ -1419,7 +1544,7 @@ impl TryFrom<v1::CpuMetrics> for MachineCpuMetrics {
         let logical_cpu_count = required(value.logical_cpu_count, "metrics.cpu.logical_cpu_count")?;
         if logical_cpu_count == 0 {
             return Err(
-                "vmmon response metrics.cpu.logical_cpu_count must be positive".to_string(),
+                "silo-vmm response metrics.cpu.logical_cpu_count must be positive".to_string(),
             );
         }
         Ok(Self {
@@ -1465,7 +1590,9 @@ impl TryFrom<v1::FilesystemMetrics> for MachineFilesystemMetrics {
             .checked_add(available_bytes)
             .is_none_or(|sum| sum > total_bytes)
         {
-            return Err("vmmon response metrics.filesystems totals are inconsistent".to_string());
+            return Err(
+                "silo-vmm response metrics.filesystems totals are inconsistent".to_string(),
+            );
         }
         Ok(Self {
             mount_point: required_text(
@@ -1553,7 +1680,7 @@ impl TryFrom<v1::FilesystemEntry> for MachineFileEntry {
             v1::FilesystemEntryKind::BlockDevice => MachineEntryKind::BlockDevice,
             v1::FilesystemEntryKind::CharacterDevice => MachineEntryKind::CharacterDevice,
             v1::FilesystemEntryKind::Unspecified => {
-                return Err("vmmon response has unspecified filesystem entry.kind".to_string());
+                return Err("silo-vmm response has unspecified filesystem entry.kind".to_string());
             }
         };
         Ok(Self {
@@ -1572,14 +1699,14 @@ impl TryFrom<v1::DirectoryPage> for MachineDirectoryPage {
     type Error = String;
     fn try_from(value: v1::DirectoryPage) -> Result<Self, Self::Error> {
         if value.entries.len() > protocol::MAX_DIRECTORY_PAGE_SIZE as usize {
-            return Err("vmmon response directory page exceeds maximum size".to_string());
+            return Err("silo-vmm response directory page exceeds maximum size".to_string());
         }
         let next_cursor = value.next_cursor.map(Bytes::from);
         if next_cursor
             .as_ref()
             .is_some_and(|cursor| cursor.len() > protocol::MAX_CURSOR_BYTES)
         {
-            return Err("vmmon response directory cursor exceeds maximum size".to_string());
+            return Err("silo-vmm response directory cursor exceeds maximum size".to_string());
         }
         Ok(Self {
             entries: value
@@ -1601,7 +1728,7 @@ impl TryFrom<Option<i32>> for MachineDirectoryCreateDisposition {
             v1::DirectoryCreateDisposition::Created => Ok(Self::Created),
             v1::DirectoryCreateDisposition::AlreadyExists => Ok(Self::AlreadyExists),
             v1::DirectoryCreateDisposition::Unspecified => {
-                Err("vmmon response has unspecified directory create disposition".to_string())
+                Err("silo-vmm response has unspecified directory create disposition".to_string())
             }
         }
     }
@@ -1616,7 +1743,7 @@ impl TryFrom<Option<i32>> for FileWriteDisposition {
             v1::FileWriteDisposition::Created => Ok(Self::Created),
             v1::FileWriteDisposition::Replaced => Ok(Self::Replaced),
             v1::FileWriteDisposition::Unspecified => {
-                Err("vmmon response has unspecified file write disposition".to_string())
+                Err("silo-vmm response has unspecified file write disposition".to_string())
             }
         }
     }
@@ -1632,7 +1759,7 @@ impl TryFrom<v1::WaitReadyResponse> for MachineReadiness {
             v1::WaitReadyOutcome::Terminal => MachineReadinessOutcome::Terminal,
             v1::WaitReadyOutcome::TimedOut => MachineReadinessOutcome::TimedOut,
             v1::WaitReadyOutcome::Unspecified => {
-                return Err("vmmon response has unspecified wait ready outcome".to_string());
+                return Err("silo-vmm response has unspecified wait ready outcome".to_string());
             }
         };
         Ok(Self {
@@ -1795,6 +1922,8 @@ mod tests {
         assert!(MachineMemoryMetrics::try_from(v1::MemoryMetrics {
             total_bytes: Some(1),
             available_bytes: Some(2),
+            free_bytes: None,
+            cached_bytes: None,
         })
         .is_err());
         assert!(MachineCpuMetrics::try_from(v1::CpuMetrics {
@@ -1843,6 +1972,18 @@ mod tests {
         let metrics = MachineMetrics::try_from(v1::HostMetrics {
             machine_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             name: Some("machine".to_string()),
+            actual_backend: Some("krun".to_string()),
+            host_memory_reclaim: Some(v1::HostMemoryReclaim {
+                requested: Some(true),
+                qualification: Some("passed".to_string()),
+                effective: Some(true),
+                released_bytes: Some(4_194_304),
+                released_extents: Some(2),
+                retried_faults: Some(1),
+                skipped_reports: Some(0),
+                failed_operations: Some(0),
+                observed_at: Some(timestamp()),
+            }),
             monitor: Some(v1::MonitorSnapshot {
                 instance_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
                 observed_at: Some(timestamp()),
@@ -1858,6 +1999,8 @@ mod tests {
                         memory: Some(v1::MemoryMetrics {
                             total_bytes: Some(2),
                             available_bytes: Some(2),
+                            free_bytes: None,
+                            cached_bytes: None,
                         }),
                         cpu: Some(v1::CpuMetrics {
                             logical_cpu_count: Some(3),
@@ -1897,12 +2040,41 @@ mod tests {
                             write_operations: Some(4),
                             in_flight_operations: Some(5),
                         }],
+                        memory_reclaim: Some(v1::MemoryReclaimReport {
+                            finished_at: Some(timestamp()),
+                            mode: Some("gradual".to_string()),
+                            outcome: Some("reclaimed".to_string()),
+                            requested_bytes: Some(268_435_456),
+                            cached_before_bytes: Some(1_073_741_824),
+                            cached_after_bytes: Some(805_306_368),
+                            compacted: Some(true),
+                            runs: Some(3),
+                        }),
                     }),
                 }),
                 agent_instance_id: Some("00000000-0000-4000-8000-000000000003".to_string()),
             }),
         })
         .expect("valid metrics");
+        assert_eq!(metrics.actual_backend.as_deref(), Some("krun"));
+        let guest_reclaim = metrics
+            .metrics
+            .as_ref()
+            .and_then(|observation| observation.report.snapshot.memory_reclaim.clone())
+            .expect("guest memory reclaim report");
+        assert_eq!(guest_reclaim.mode, "gradual");
+        assert_eq!(guest_reclaim.outcome, "reclaimed");
+        assert_eq!(guest_reclaim.cached_delta_bytes(), 268_435_456);
+        assert_eq!(guest_reclaim.runs, 3);
+        let reclaim = metrics.host_memory_reclaim.expect("host memory reclaim");
+        assert!(reclaim.requested);
+        assert!(reclaim.effective);
+        assert_eq!(
+            reclaim.qualification,
+            MachineHostMemoryReclaimQualification::Passed
+        );
+        assert_eq!(reclaim.released_bytes, 4_194_304);
+        assert_eq!(reclaim.retried_faults, 1);
         let snapshot = metrics
             .metrics
             .map(|metrics| metrics.report.snapshot)
@@ -1914,6 +2086,24 @@ mod tests {
         assert_eq!(snapshot.filesystems.len(), 1);
         assert_eq!(snapshot.network_interfaces.len(), 1);
         assert_eq!(snapshot.block_devices.len(), 1);
+    }
+
+    #[test]
+    fn metrics_conversion_accepts_an_old_vmm_without_actual_backend() {
+        let value = v1::HostMetrics {
+            machine_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
+            name: Some("machine".to_string()),
+            actual_backend: None,
+            host_memory_reclaim: None,
+            monitor: Some(v1::MonitorSnapshot {
+                instance_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
+                observed_at: Some(timestamp()),
+            }),
+            metrics: None,
+        };
+        let metrics = MachineMetrics::try_from(value.clone()).expect("old silo-vmm metrics");
+        assert_eq!(metrics.actual_backend, None);
+        assert_eq!(metrics.host_memory_reclaim, None);
     }
     #[test]
     fn request_validation_rejects_invalid_values() {

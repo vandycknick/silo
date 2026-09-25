@@ -68,10 +68,8 @@ export function runtimeOptionsToNative(options?: RuntimeOpenOptions): NativeRunt
   if (!options) return undefined;
   const record = assertRecord(options, "options");
   return {
-    dataRoot: optionalNonEmptyString(record.dataRoot, "options.dataRoot"),
-    runRoot: optionalNonEmptyString(record.runRoot, "options.runRoot"),
-    imageRoot: optionalNonEmptyString(record.imageRoot, "options.imageRoot"),
-    vmmonPath: optionalNonEmptyString(record.vmmonPath, "options.vmmonPath"),
+    home: optionalNonEmptyString(record.home, "options.home"),
+    supervisorPath: optionalNonEmptyString(record.supervisorPath, "options.supervisorPath"),
   };
 }
 

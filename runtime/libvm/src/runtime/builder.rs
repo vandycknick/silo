@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::runtime::{Runtime, RuntimeConfig, RuntimeNetworkingConfig};
+use crate::runtime::{Runtime, RuntimeConfig, RuntimeNetworkingConfig, VirtBackendOverride};
 use crate::LibVmError;
 
 /// Builder for opening a local libvm runtime.
@@ -14,7 +14,7 @@ use crate::LibVmError;
 ///
 /// # async fn example() -> Result<(), libvm::LibVmError> {
 /// let runtime = Runtime::builder()
-///     .data_root("/var/lib/silo")
+///     .home("/var/lib/silo")
 ///     .networking(
 ///         RuntimeNetworkingConfig::new()
 ///             .with_netd(NetdRuntimeConfig::new().with_pcap(true)),
@@ -31,32 +31,14 @@ pub struct RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
-    /// Creates a runtime builder using environment/default roots.
+    /// Creates a runtime builder using the environment's Silo home.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Sets the persistent data root.
-    pub fn data_root(mut self, data_root: impl Into<PathBuf>) -> Self {
-        self.config.data_root = crate::runtime::PathChoice::Explicit(data_root.into());
-        self
-    }
-
-    /// Sets the host-runtime root.
-    pub fn run_root(mut self, run_root: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_run_root(run_root);
-        self
-    }
-
-    /// Sets the durable operational state root.
-    pub fn state_root(mut self, state_root: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_state_root(state_root);
-        self
-    }
-
-    /// Sets the image root.
-    pub fn image_root(mut self, image_root: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_image_root(image_root);
+    /// Sets the Silo home holding all persistent state.
+    pub fn home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.config.home = Some(home.into());
         self
     }
 
@@ -66,9 +48,9 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Sets the vmmon executable path used to launch machines.
-    pub fn vmmon_path(mut self, vmmon_path: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_vmmon_path(vmmon_path);
+    /// Sets the silo-vmm executable path used to launch machines.
+    pub fn supervisor_path(mut self, supervisor_path: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_supervisor_path(supervisor_path);
         self
     }
 
@@ -78,9 +60,9 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Sets the krun executable path used by the krun backend.
-    pub fn krun_path(mut self, krun_path: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_krun_path(krun_path);
+    /// Selects the virtualization backend used for machines started by this runtime.
+    pub fn virt_backend(mut self, backend: VirtBackendOverride) -> Self {
+        self.config = self.config.with_virt_backend(backend);
         self
     }
 
@@ -127,14 +109,14 @@ impl RuntimeBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::RuntimeBuilder;
+    use crate::{RuntimeBuilder, VirtBackendOverride};
 
     #[test]
     fn component_and_runtime_root_methods_populate_runtime_config() {
         let config = RuntimeBuilder::new()
-            .vmmon_path("/runtime/bin/vmmon")
+            .supervisor_path("/runtime/bin/silo-vmm")
             .netd_path("/runtime/bin/netd")
-            .krun_path("/runtime/bin/krun")
+            .virt_backend(VirtBackendOverride::Krun)
             .kernel_path("/runtime/assets/kernel-default")
             .initramfs_path("/runtime/assets/initramfs")
             .agent_path("/runtime/assets/agent")
@@ -143,16 +125,13 @@ mod tests {
             .into_config();
 
         assert_eq!(
-            config.vmmon_path.as_deref(),
-            Some(std::path::Path::new("/runtime/bin/vmmon"))
+            config.supervisor_path.as_deref(),
+            Some(std::path::Path::new("/runtime/bin/silo-vmm"))
         );
+        assert_eq!(config.virt_backend, Some(VirtBackendOverride::Krun));
         assert_eq!(
             config.netd_path.as_deref(),
             Some(std::path::Path::new("/runtime/bin/netd"))
-        );
-        assert_eq!(
-            config.krun_path.as_deref(),
-            Some(std::path::Path::new("/runtime/bin/krun"))
         );
         assert_eq!(
             config.kernel_path.as_deref(),
