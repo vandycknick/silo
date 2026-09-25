@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 
 use nix::fcntl::{open, OFlag};
@@ -37,7 +38,10 @@ pub(crate) fn ensure_run_root(path: &Path) -> Result<(), LibVmError> {
         .ok_or_else(|| invalid_run_root(path, "has no parent directory"))?;
     fs::create_dir_all(parent).map_err(|err| invalid_run_root(path, err))?;
 
-    let created = match fs::create_dir(path) {
+    // Create the directory private from the start. Were it created with the umask
+    // mode and tightened afterwards, a concurrent caller seeing `AlreadyExists`
+    // could inspect it in between and reject the transient mode.
+    let created = match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => true,
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => false,
         Err(err) => return Err(invalid_run_root(path, err)),
@@ -135,6 +139,31 @@ mod tests {
         let metadata = std::fs::metadata(&run_root).expect("stat run root");
         assert_eq!(metadata.permissions().mode() & 0o7777, 0o700);
         assert_eq!(metadata.uid(), geteuid().as_raw());
+    }
+
+    #[test]
+    fn concurrent_first_use_never_observes_a_transient_mode() {
+        for _ in 0..50 {
+            let temp = tempfile::tempdir().expect("create temp dir");
+            let run_root = temp.path().join("run");
+            let barrier = std::sync::Barrier::new(8);
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            ensure_run_root(&run_root)
+                        })
+                    })
+                    .collect();
+                for worker in workers {
+                    worker
+                        .join()
+                        .expect("worker")
+                        .expect("every racing caller accepts the new run root");
+                }
+            });
+        }
     }
 
     #[test]
