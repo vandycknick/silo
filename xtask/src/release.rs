@@ -16,10 +16,6 @@ pub enum ReleaseError {
     Command(#[from] command::CommandError),
     #[error("release tool {tool} was not found in PATH")]
     MissingTool { tool: &'static str },
-    #[error(
-        "macOS release Go candidate {path} resolves into /nix/store; put an upstream Go toolchain on PATH"
-    )]
-    NixMacosGo { path: PathBuf },
     #[error("xcrun returned invalid UTF-8 for {tool}")]
     InvalidXcrunPath { tool: &'static str },
     #[error("failed to {action} {path}")]
@@ -40,35 +36,6 @@ pub fn tool(tool: &'static str) -> Result<PathBuf, ReleaseError> {
         }
     }
     Err(ReleaseError::MissingTool { tool })
-}
-
-pub fn go_program(profile_is_release: bool) -> Result<PathBuf, ReleaseError> {
-    if !profile_is_release || env::consts::OS != "macos" {
-        return tool("go");
-    }
-
-    let path = env::var_os("PATH").ok_or(ReleaseError::MissingTool { tool: "go" })?;
-    let mut nix_program = None;
-    for directory in env::split_paths(&path) {
-        let program = directory.join("go");
-        if !program.is_file() {
-            continue;
-        }
-        let resolved = fs::canonicalize(&program).map_err(|source| ReleaseError::Io {
-            action: "resolve macOS Go toolchain",
-            path: program.clone(),
-            source,
-        })?;
-        if resolved.starts_with("/nix/store") {
-            nix_program.get_or_insert(resolved);
-            continue;
-        }
-        return Ok(program);
-    }
-    match nix_program {
-        Some(path) => Err(ReleaseError::NixMacosGo { path }),
-        None => Err(ReleaseError::MissingTool { tool: "go" }),
-    }
 }
 
 pub fn tool_output(path: &Path, args: &[&str]) -> Result<String, ReleaseError> {

@@ -70,16 +70,17 @@ sudo apt-get install build-essential binutils pkg-config
 Nix supplies the release build tools. These Ubuntu packages provide the native
 compiler, linker, archive, and `pkg-config` tools used through `/usr/bin`.
 
-On macOS, release builds require an upstream Go toolchain on `PATH`. The Nix Go
-package embeds Nix-store paths for runtime timezone, MIME, service, and protocol
-databases, so xtask skips it when selecting the release compiler. This also lets
-CI-provided toolchains such as `actions/setup-go` participate normally. If the
-upstream toolchain is not already on the release shell's `PATH`, prepend it when
-invoking the package command:
+The release shell supplies a portable variant of the Go compiler pinned by
+`flake.lock`. It omits Nixpkgs' timezone, MIME, service, and protocol database
+patches, so release binaries use upstream runtime paths rather than Nix-store
+databases. The compiler itself still lives in `/nix/store`; that is not a runtime
+dependency of the generated binaries. Development and CI shells retain ordinary
+Nixpkgs Go. No separately installed Go compiler or `actions/setup-go` is needed.
 
-```sh
-PATH="<upstream-go-bin>:$PATH" make archive
-```
+The portable compiler's install check builds a CGO-free, path-trimmed regression
+test covering those database lookups, rejects embedded Nix-store paths in that
+test executable, and runs it. This checks toolchain portability when the compiler
+is built, without adding recursive binary scanning to release packaging.
 
 Packaging normally needs network access to fetch dependencies and the default
 kernel OCI artifact. See [Kernel Selection](#kernel-selection) for local and

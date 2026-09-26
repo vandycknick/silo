@@ -5,9 +5,10 @@
 }:
 let
   zig = if pkgs ? zig_0_16 then pkgs.zig_0_16 else pkgs.zig;
+  portableGo = pkgs.callPackage ./portable-go.nix { };
   releasePackages = [
     rustToolchain
-    pkgs.go
+    portableGo
     pkgs.nodejs_26
     zig
     pkgs.cargo-zigbuild

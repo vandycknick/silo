@@ -238,7 +238,7 @@ fn build_netd(context: &BuildContext<'_>) -> Result<(), ComponentError> {
         source,
     })?;
 
-    let go_program = release::go_program(context.profile == Profile::Release)?;
+    let go_program = release::tool("go")?;
     let (goos, goarch) = context.host.go_target();
     let mut go = Command::new(&go_program);
     go.current_dir(context.workspace_root.join("net/netd"))
