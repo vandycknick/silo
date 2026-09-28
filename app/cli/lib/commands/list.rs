@@ -38,7 +38,6 @@ fn print_table(views: &[InventoryView]) -> eyre::Result<()> {
         "ID", "NAME", "STATE", "CPUS", "MEMORY", "DISK", "CREATED", "DEFAULT", "ISSUES",
     ]);
 
-    let mut affected = Vec::new();
     for entry in views {
         let view = match entry {
             InventoryView::Available(view) => view,
@@ -56,13 +55,9 @@ fn print_table(views: &[InventoryView]) -> eyre::Result<()> {
                     "-".into(),
                     issues.len().to_string(),
                 ]);
-                affected.push(name.as_str());
                 continue;
             }
         };
-        if !view.issues.is_empty() {
-            affected.push(view.name.as_str());
-        }
         table.add_row([
             ui::short_id(&view.id).to_string(),
             view.name.clone(),
@@ -80,9 +75,5 @@ fn print_table(views: &[InventoryView]) -> eyre::Result<()> {
         ]);
     }
 
-    table.print()?;
-    for name in affected {
-        eprintln!("Details: silo show {name}");
-    }
-    Ok(())
+    table.print()
 }
