@@ -35,14 +35,23 @@ func main() {
 		writeErrorRecords(os.Stderr, err)
 		os.Exit(1)
 	}
+	if cfg.Daemonize {
+		if err := launchWorker(cfg, os.Args[1:]); err != nil {
+			writeErrorRecords(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	logDirectory, err := logfile.OpenDirectory(cfg.LogDirFD)
 	if err != nil {
+		_ = reportWorkerStartup(cfg, fmt.Errorf("open network log directory: %w", err))
 		writeErrorRecords(os.Stderr, fmt.Errorf("open network log directory: %w", err))
 		os.Exit(1)
 	}
 	runtimeDirectory, err := logfile.OpenDirectory(cfg.RuntimeDirFD)
 	if err != nil {
 		_ = logDirectory.Close()
+		_ = reportWorkerStartup(cfg, fmt.Errorf("open network runtime directory: %w", err))
 		writeErrorRecords(os.Stderr, fmt.Errorf("open network runtime directory: %w", err))
 		os.Exit(1)
 	}
@@ -60,6 +69,9 @@ func main() {
 	}
 	auditLog := audit.New(auditFile, compiledPolicy.PolicyHash())
 	runErr := run(cfg, compiledPolicy, auditLog, runtimeDirectory)
+	if runErr != nil {
+		_ = reportWorkerStartup(cfg, runErr)
+	}
 	if auditLog != nil {
 		runErr = errors.Join(runErr, auditLog.Close())
 	}
@@ -85,6 +97,7 @@ func reportStartupError(writer io.Writer, cfg *config.Config, err error) {
 }
 
 func exitWithStartupError(cfg *config.Config, serviceLog *os.File, logDirectory, runtimeDirectory *logfile.Directory, err error) {
+	_ = reportWorkerStartup(cfg, err)
 	reportStartupError(os.Stderr, cfg, err)
 	if closeErr := errors.Join(closeServiceLog(serviceLog), logDirectory.Close(), runtimeDirectory.Close()); closeErr != nil {
 		writeErrorRecords(os.Stderr, closeErr)
@@ -133,6 +146,11 @@ func run(cfg *config.Config, compiledPolicy *policy.Policy, auditLog *audit.Logg
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
+	stopOwnerWatch, err := watchOwner(cfg.ExitFD, cancel)
+	if err != nil {
+		return fmt.Errorf("watch VM lifetime: %w", err)
+	}
+	defer stopOwnerWatch()
 
 	intelligencePool := registry.NewIntelligencePool(nil)
 	vmSession, err := session.New(session.Spec{
@@ -176,6 +194,9 @@ func run(cfg *config.Config, compiledPolicy *policy.Policy, auditLog *audit.Logg
 	defer removeEndpoint(cfg.ListenVfkit)
 
 	slog.Info("netd ready", "listen_vfkit", cfg.ListenVfkit, "subnet", cfg.Stack.Subnet)
+	if err := reportWorkerStartup(cfg, nil); err != nil {
+		return fmt.Errorf("report worker readiness: %w", err)
+	}
 	acceptDone := make(chan struct{})
 	go func() {
 		select {

@@ -16,6 +16,9 @@ import (
 )
 
 type Config struct {
+	Daemonize    bool
+	StartupFD    int
+	ExitFD       int
 	ListenVfkit  string
 	LogDirFD     int
 	RuntimeDirFD int
@@ -81,6 +84,9 @@ func Parse(args []string) (*Config, error) {
 
 	flags := flag.NewFlagSet("netd", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
+	flags.BoolVar(&cfg.Daemonize, "daemonize", false, "launch a detached worker and exit")
+	flags.IntVar(&cfg.StartupFD, "startup-fd", -1, "inherited worker startup report writer")
+	flags.IntVar(&cfg.ExitFD, "exit-fd", -1, "inherited VM lifetime pipe reader")
 	flags.StringVar(&cfg.ListenVfkit, "listen-vfkit", "", "unixgram socket used by vfkit-compatible applications")
 	flags.StringVar(&subnet, "subnet", "192.168.127.0/24", "guest network subnet")
 	flags.StringVar(&staticLease, "static-lease", "", "guest DHCP lease in IP=MAC form")
@@ -99,6 +105,21 @@ func Parse(args []string) (*Config, error) {
 	flags.StringVar(&guestPublish, "guest-publish", "", "allow the guest to request host TCP publications: loopback or any")
 	if err := flags.Parse(args); err != nil {
 		return cfg, err
+	}
+	if cfg.Daemonize && (cfg.StartupFD < 3 || cfg.ExitFD < 3) {
+		return cfg, errors.New("--daemonize requires --startup-fd and --exit-fd above stderr")
+	}
+	if (cfg.StartupFD >= 0) != (cfg.ExitFD >= 0) {
+		return cfg, errors.New("--startup-fd and --exit-fd must be supplied together")
+	}
+	if cfg.StartupFD >= 0 {
+		seen := map[int]bool{}
+		for _, fd := range []int{cfg.LogDirFD, cfg.RuntimeDirFD, cfg.StartupFD, cfg.ExitFD} {
+			if fd < 3 || seen[fd] {
+				return cfg, errors.New("managed descriptors must be distinct and above stderr")
+			}
+			seen[fd] = true
+		}
 	}
 	if cfg.ListenVfkit == "" {
 		return cfg, errors.New("--listen-vfkit is required")
