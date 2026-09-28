@@ -49,13 +49,21 @@ impl LocalVmService {
             .ok_or_else(|| eyre::eyre!("local runtime was not initialized"))
     }
 
-    pub(crate) async fn list_machines(&mut self) -> eyre::Result<Vec<MachineData>> {
-        let machines = self.runtime().await?.list_machines().await?;
-        let mut data = Vec::with_capacity(machines.len());
-        for machine in machines {
-            data.push(machine.inspect().await?);
-        }
-        Ok(data)
+    pub(crate) async fn list_machines(
+        &mut self,
+    ) -> eyre::Result<Vec<libvm::MachineInventoryEntry>> {
+        Ok(self.runtime().await?.inventory().await?)
+    }
+
+    pub(crate) async fn inspect_inventory(
+        &mut self,
+        reference: &str,
+    ) -> eyre::Result<libvm::MachineInventoryEntry> {
+        Ok(self
+            .runtime()
+            .await?
+            .inspect_inventory(&MachineRef::parse(reference)?)
+            .await?)
     }
 
     pub(crate) async fn inspect_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {

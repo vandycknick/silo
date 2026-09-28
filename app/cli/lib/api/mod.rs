@@ -35,8 +35,17 @@ impl AppApi {
         }
     }
 
-    pub(crate) async fn list_machines(&mut self) -> eyre::Result<Vec<MachineData>> {
+    pub(crate) async fn list_machines(
+        &mut self,
+    ) -> eyre::Result<Vec<libvm::MachineInventoryEntry>> {
         self.local.list_machines().await
+    }
+
+    pub(crate) async fn inspect_inventory(
+        &mut self,
+        reference: &str,
+    ) -> eyre::Result<libvm::MachineInventoryEntry> {
+        self.local.inspect_inventory(reference).await
     }
 
     pub(crate) async fn inspect_machine(&mut self, reference: &str) -> eyre::Result<MachineData> {

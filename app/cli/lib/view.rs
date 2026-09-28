@@ -9,11 +9,44 @@ use libvm::{
 use serde::Serialize;
 use vm_spec::VmSpec;
 
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum InventoryView {
+    Available(Box<MachineView>),
+    Unavailable {
+        id: String,
+        name: String,
+        state: &'static str,
+        observation: libvm::MachineObservation,
+        issues: Vec<libvm::MachineIssue>,
+    },
+}
+
+impl InventoryView {
+    pub fn new(entry: &libvm::MachineInventoryEntry, default: bool) -> Self {
+        match &entry.data {
+            Some(data) => Self::Available(Box::new(MachineView::new(data, default))),
+            None => Self::Unavailable {
+                id: entry.id.clone(),
+                name: entry.name.clone(),
+                state: "unknown",
+                observation: libvm::MachineObservation::Unavailable,
+                issues: entry.issues.clone(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MachineView {
     pub id: String,
     pub name: String,
     pub state: &'static str,
+    pub observation: libvm::MachineObservation,
+    pub last_known_state: Option<&'static str>,
+    pub issues: Vec<libvm::MachineIssue>,
+    pub last_error: Option<String>,
+    pub run_id: Option<String>,
     pub default: bool,
     pub template_name: Option<String>,
     pub retention: String,
@@ -99,7 +132,17 @@ impl MachineView {
         Self {
             id: data.id.clone(),
             name: data.name.clone(),
-            state: state_label(&data.status),
+            state: if data.observation == libvm::MachineObservation::Observed {
+                state_label(&data.status)
+            } else {
+                "unknown"
+            },
+            observation: data.observation,
+            last_known_state: (data.observation == libvm::MachineObservation::LastKnown)
+                .then(|| state_label(&data.status)),
+            issues: data.issues.clone(),
+            last_error: data.last_error.clone(),
+            run_id: data.run_id.as_ref().map(ToString::to_string),
             default,
             template_name: data.template_name.clone(),
             retention: retention_label(data.retention).to_string(),
@@ -251,6 +294,26 @@ mod tests {
     use libvm::{MachineAgent, MachineRetention};
 
     use crate::view::{agent_label, retention_label};
+
+    #[test]
+    fn unavailable_inventory_preserves_identity_and_diagnostics_in_json() {
+        let entry = libvm::MachineInventoryEntry {
+            id: "broken-id".into(),
+            name: "broken".into(),
+            data: None,
+            issues: vec![libvm::MachineIssue {
+                component: libvm::MachineIssueComponent::Configuration,
+                message: "cannot decode configuration".into(),
+            }],
+        };
+        let value = serde_json::to_value(crate::view::InventoryView::new(&entry, false))
+            .expect("serialize");
+        assert_eq!(value["state"], "unknown");
+        assert_eq!(value["name"], "broken");
+        assert_eq!(value["observation"], "unavailable");
+        assert_eq!(value["issues"][0]["component"], "configuration");
+        assert!(value.get("resources").is_none());
+    }
 
     #[test]
     fn labels_persisted_machine_lifecycle_fields() {

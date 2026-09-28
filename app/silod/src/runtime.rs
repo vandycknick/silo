@@ -24,10 +24,16 @@ impl SystemRuntime {
     }
 
     pub(crate) async fn list_machines(&mut self) -> eyre::Result<Vec<MachineData>> {
-        let machines = self.runtime.list_machines().await?;
+        let machines = self.runtime.inventory().await?;
         let mut data = Vec::with_capacity(machines.len());
         for machine in machines {
-            data.push(machine.inspect().await?);
+            match machine.data {
+                Some(snapshot) => data.push(snapshot),
+                None => eprintln!(
+                    "machine {} ({}) configuration unavailable: {:?}; inspect with silo show",
+                    machine.name, machine.id, machine.issues
+                ),
+            }
         }
         Ok(data)
     }

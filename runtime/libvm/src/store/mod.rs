@@ -1,6 +1,6 @@
 mod config_store;
 mod image_store;
-mod machine_store;
+pub(crate) mod machine_store;
 #[cfg(test)]
 mod mock_store;
 pub(crate) mod models;

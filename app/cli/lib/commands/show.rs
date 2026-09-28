@@ -2,7 +2,7 @@ use clap::Args;
 
 use crate::context::Context;
 use crate::ui::{self, OutputFormat};
-use crate::view::MachineView;
+use crate::view::{InventoryView, MachineView};
 
 #[derive(Debug, Args)]
 #[command(about = "Show VM details")]
@@ -19,13 +19,26 @@ pub struct Cmd {
 impl Cmd {
     pub async fn run(self, context: &mut Context) -> eyre::Result<()> {
         let name = context.resolve_machine_name(self.name.as_deref())?;
-        let data = context.app_api().await?.inspect_machine(&name).await?;
+        let data = context.app_api().await?.inspect_inventory(&name).await?;
         let default = context.config()?.default_machine() == Some(data.name.as_str());
-        let view = MachineView::new(&data, default);
+        let view = InventoryView::new(&data, default);
 
         match self.format {
             OutputFormat::Json => ui::print_json(&view),
-            OutputFormat::Plain => print_human(&view),
+            OutputFormat::Plain => match &view {
+                InventoryView::Available(view) => print_human(view),
+                InventoryView::Unavailable {
+                    id, name, issues, ..
+                } => {
+                    let mut rows = vec![
+                        ("Name".into(), name.clone()),
+                        ("ID".into(), id.clone()),
+                        ("State".into(), "unknown (configuration unavailable)".into()),
+                    ];
+                    append_issues(&mut rows, name, issues);
+                    ui::print_detail_rows(&rows)
+                }
+            },
         }
     }
 }
@@ -89,7 +102,32 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
         rows.push(("Provision".to_string(), provision_summary(provision)));
     }
 
+    rows.push(("Observation".into(), format!("{:?}", view.observation)));
+    if let Some(state) = view.last_known_state {
+        rows.push(("Last known state".into(), state.into()));
+    }
+    if let Some(error) = &view.last_error {
+        rows.push(("Last failure".into(), error.clone()));
+    }
+    if let Some(run) = &view.run_id {
+        rows.push(("Run".into(), run.clone()));
+    }
+    append_issues(&mut rows, &view.name, &view.issues);
     ui::print_detail_rows(&rows)
+}
+
+fn append_issues(rows: &mut Vec<(String, String)>, name: &str, issues: &[libvm::MachineIssue]) {
+    for issue in issues {
+        rows.push((
+            format!("Issue ({:?})", issue.component),
+            issue.message.clone(),
+        ));
+    }
+    rows.push(("Monitor logs".into(), format!("silo logs {name}")));
+    rows.push((
+        "Network logs".into(),
+        format!("silo logs {name} --stream network"),
+    ));
 }
 
 fn process_summary(process: &libvm::ProcessConfig) -> String {

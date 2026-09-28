@@ -95,8 +95,18 @@ impl Machine {
     ) -> Result<MachineLogStream, LibVmError> {
         let runtime = self.runtime().clone();
         let machine_id = self.machine_id();
-        let (_lock, config) = runtime.lock_machine_config(machine_id).await?;
-        validate_log_source(&config, source)?;
+        // Logs are recovery evidence, not a lifecycle operation. Neither a busy
+        // runtime lock nor an undecodable config should make existing logs inaccessible.
+        match runtime.machine_config(machine_id).await {
+            Ok(Some(config)) => validate_log_source(&config, source)?,
+            Ok(None) => {
+                return Err(LibVmError::MachineNotFound {
+                    reference: machine_id.to_string(),
+                })
+            }
+            Err(error) if error.is_machine_observation_error() => {}
+            Err(error) => return Err(error),
+        }
         let paths = runtime.local_paths().clone();
         let file = (source != MachineLogSource::Exec)
             .then(|| open_log(&paths, machine_id, source))

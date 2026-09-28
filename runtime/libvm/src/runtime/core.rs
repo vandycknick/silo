@@ -287,8 +287,80 @@ impl Runtime {
 
     /// Resolves a machine by name, full ID, or ID prefix.
     pub async fn get_machine(&self, machine: &MachineRef) -> Result<Machine, LibVmError> {
-        let config = self.resolve_machine_config(machine).await?;
-        Ok(Machine::new(self.clone(), config.id))
+        match self.resolve_machine_config(machine).await {
+            Ok(config) => Ok(Machine::new(self.clone(), config.id)),
+            Err(error) if error.is_machine_observation_error() => {
+                let record = self.inventory_record(machine).await?;
+                let id = record.id.parse().map_err(|_| LibVmError::CorruptState {
+                    id: record.id,
+                    field: "machine_config.id",
+                })?;
+                Ok(Machine::new(self.clone(), id))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn inventory_record(
+        &self,
+        reference: &MachineRef,
+    ) -> Result<crate::store::machine_store::InventoryRecord, LibVmError> {
+        let mut records = self
+            .store
+            .machine_inventory()
+            .await?
+            .into_iter()
+            .filter(|record| match reference.kind() {
+                MachineRefKind::Id(id) => record.id == id.to_string(),
+                MachineRefKind::IdPrefix(prefix) => record.id.starts_with(prefix),
+                MachineRefKind::Name(name) => &record.name == name,
+            });
+        let record = records.next().ok_or_else(|| LibVmError::MachineNotFound {
+            reference: format!("{reference:?}"),
+        })?;
+        if records.next().is_some() {
+            return Err(LibVmError::AmbiguousIdPrefix {
+                prefix: format!("{reference:?}"),
+                count: 2 + records.count(),
+            });
+        }
+        Ok(record)
+    }
+
+    /// Inspect one indexed machine even when its configuration cannot decode.
+    pub async fn inspect_inventory(
+        &self,
+        reference: &MachineRef,
+    ) -> Result<crate::MachineInventoryEntry, LibVmError> {
+        let record = self.inventory_record(reference).await?;
+        self.observe_inventory_record(record).await
+    }
+
+    async fn observe_inventory_record(
+        &self,
+        record: crate::store::machine_store::InventoryRecord,
+    ) -> Result<crate::MachineInventoryEntry, LibVmError> {
+        let result = match record.config {
+            Ok(config) => self.machine_inspect_data(config).await,
+            Err(error) => Err(error),
+        };
+        let (data, issues) = match result {
+            Ok(data) => (Some(data), Vec::new()),
+            Err(error) if error.is_machine_observation_error() => (
+                None,
+                vec![crate::MachineIssue::new(
+                    crate::MachineIssueComponent::Configuration,
+                    error,
+                )],
+            ),
+            Err(error) => return Err(error),
+        };
+        Ok(crate::MachineInventoryEntry {
+            id: record.id,
+            name: record.name,
+            data,
+            issues,
+        })
     }
 
     /// Read-only, best-effort inventory. Global database errors remain fatal;
@@ -296,27 +368,7 @@ impl Runtime {
     pub async fn inventory(&self) -> Result<Vec<crate::MachineInventoryEntry>, LibVmError> {
         let mut entries = Vec::new();
         for record in self.store.machine_inventory().await? {
-            let result = match record.config {
-                Ok(config) => self.machine_inspect_data(config).await,
-                Err(error) => Err(error),
-            };
-            let (data, issues) = match result {
-                Ok(data) => (Some(data), Vec::new()),
-                Err(error) if error.is_machine_observation_error() => (
-                    None,
-                    vec![crate::MachineIssue::new(
-                        crate::MachineIssueComponent::Configuration,
-                        error,
-                    )],
-                ),
-                Err(error) => return Err(error),
-            };
-            entries.push(crate::MachineInventoryEntry {
-                id: record.id,
-                name: record.name,
-                data,
-                issues,
-            });
+            entries.push(self.observe_inventory_record(record).await?);
         }
         Ok(entries)
     }

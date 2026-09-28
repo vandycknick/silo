@@ -2,7 +2,7 @@ use clap::Args;
 
 use crate::context::Context;
 use crate::ui::{self, OutputFormat, Table};
-use crate::view::MachineView;
+use crate::view::InventoryView;
 
 #[derive(Debug, Args)]
 #[command(about = "List VMs")]
@@ -19,7 +19,7 @@ impl Cmd {
         let mut views = Vec::with_capacity(machines.len());
 
         for data in machines {
-            views.push(MachineView::new(
+            views.push(InventoryView::new(
                 &data,
                 default_machine.as_deref() == Some(data.name.as_str()),
             ));
@@ -32,13 +32,37 @@ impl Cmd {
     }
 }
 
-fn print_table(views: &[MachineView]) -> eyre::Result<()> {
+fn print_table(views: &[InventoryView]) -> eyre::Result<()> {
     let now = ui::now_unix();
     let mut table = Table::new([
-        "ID", "NAME", "STATE", "CPUS", "MEMORY", "DISK", "CREATED", "DEFAULT",
+        "ID", "NAME", "STATE", "CPUS", "MEMORY", "DISK", "CREATED", "DEFAULT", "ISSUES",
     ]);
 
-    for view in views {
+    let mut affected = Vec::new();
+    for entry in views {
+        let view = match entry {
+            InventoryView::Available(view) => view,
+            InventoryView::Unavailable {
+                id, name, issues, ..
+            } => {
+                table.add_row([
+                    ui::short_id(id).to_string(),
+                    name.clone(),
+                    "unknown".into(),
+                    "-".into(),
+                    "-".into(),
+                    "-".into(),
+                    "-".into(),
+                    "-".into(),
+                    issues.len().to_string(),
+                ]);
+                affected.push(name.as_str());
+                continue;
+            }
+        };
+        if !view.issues.is_empty() {
+            affected.push(view.name.as_str());
+        }
         table.add_row([
             ui::short_id(&view.id).to_string(),
             view.name.clone(),
@@ -48,8 +72,17 @@ fn print_table(views: &[MachineView]) -> eyre::Result<()> {
             ui::human_bytes(view.root_disk_size),
             ui::relative_time(view.created_at, now),
             if view.default { "*" } else { "-" }.to_string(),
+            if view.issues.is_empty() {
+                "-".to_string()
+            } else {
+                view.issues.len().to_string()
+            },
         ]);
     }
 
-    table.print()
+    table.print()?;
+    for name in affected {
+        eprintln!("Details: silo show {name}");
+    }
+    Ok(())
 }

@@ -84,7 +84,7 @@ impl MachineStore for Store {
         machine_id: MachineId,
     ) -> Result<Option<MachineState>, LibVmError> {
         let state = sqlx::query_as::<_, DbMachineState>(
-            "SELECT machine_id, status, json(state_json) AS state_json FROM machine_state WHERE machine_id = ?1",
+            "SELECT machine_id, status, CASE WHEN json_valid(state_json, 8) THEN json(state_json) ELSE '{}' END AS state_json FROM machine_state WHERE machine_id = ?1",
         )
         .bind(machine_id.to_string())
         .fetch_optional(&self.pool)
@@ -147,7 +147,7 @@ impl MachineStore for Store {
 
     async fn machine_config(&self, id: MachineId) -> Result<Option<MachineConfig>, LibVmError> {
         let machine = sqlx::query_as::<_, DbMachineConfig>(
-            "SELECT id, name, json(config_json) AS config_json FROM machine_config WHERE id = ?1",
+            "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE id = ?1",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -160,7 +160,7 @@ impl MachineStore for Store {
         name: &str,
     ) -> Result<Option<MachineConfig>, LibVmError> {
         let machine = sqlx::query_as::<_, DbMachineConfig>(
-            "SELECT id, name, json(config_json) AS config_json FROM machine_config WHERE name = ?1",
+            "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE name = ?1",
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -175,7 +175,7 @@ impl MachineStore for Store {
         Self::validate_machine_id_prefix(prefix)?;
         let pattern = format!("{prefix}%");
         let rows = sqlx::query_as::<_, DbMachineConfig>(
-            "SELECT id, name, json(config_json) AS config_json FROM machine_config WHERE id LIKE ?1",
+            "SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config WHERE id LIKE ?1",
         )
         .bind(pattern)
         .fetch_all(&self.pool)
