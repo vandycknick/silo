@@ -45,6 +45,8 @@ enum Commands {
         profile: Profile,
         #[command(flatten)]
         kernel: KernelOptions,
+        #[command(flatten)]
+        rprobe: RprobeAssetOptions,
     },
     Component {
         #[arg(value_enum)]
@@ -123,6 +125,8 @@ enum Commands {
         profile: Profile,
         #[command(flatten)]
         kernel: KernelOptions,
+        #[command(flatten)]
+        rprobe: RprobeAssetOptions,
     },
     PackInitramfs {
         #[arg(long, value_name = "PATH")]
@@ -154,6 +158,8 @@ enum Commands {
 struct RprobeAssetOptions {
     #[arg(long, value_name = "DIRECTORY")]
     rprobe_assets: Option<PathBuf>,
+    #[command(flatten)]
+    acquisition: kernel::RprobeOptions,
 }
 
 #[derive(Debug, Error)]
@@ -184,14 +190,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     let target_dir = target_directory(&workspace_root, args.target_dir)?;
 
     match args.command {
-        Commands::Build { profile, kernel } => {
+        Commands::Build {
+            profile,
+            kernel,
+            rprobe,
+        } => {
             build_release_or_development(
                 &workspace_root,
                 &target_dir,
                 profile,
                 kernel,
                 false,
-                None,
+                &rprobe,
             )?;
         }
         Commands::Component { component, profile } => {
@@ -214,7 +224,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 profile,
                 kernel,
                 true,
-                rprobe.rprobe_assets.as_deref(),
+                &rprobe,
             )?;
         }
         Commands::Archive { kernel, rprobe } => {
@@ -224,7 +234,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Profile::Release,
                 kernel,
                 true,
-                rprobe.rprobe_assets.as_deref(),
+                &rprobe,
             )?;
             archive::produce(&workspace_root, &target_dir)?;
         }
@@ -244,7 +254,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Profile::Release,
                 kernel,
                 true,
-                rprobe.rprobe_assets.as_deref(),
+                &rprobe,
             )?;
             app::assemble(
                 &workspace_root,
@@ -267,7 +277,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Profile::Release,
                 kernel,
                 true,
-                rprobe.rprobe_assets.as_deref(),
+                &rprobe,
             )?;
             app::assemble(
                 &workspace_root,
@@ -298,7 +308,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Profile::Release,
                 kernel,
                 true,
-                rprobe.rprobe_assets.as_deref(),
+                &rprobe,
             )?;
             app::assemble(
                 &workspace_root,
@@ -343,6 +353,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             example,
             profile,
             kernel,
+            rprobe,
         } => {
             build_release_or_development(
                 &workspace_root,
@@ -350,7 +361,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 profile,
                 kernel,
                 true,
-                None,
+                &rprobe,
             )?;
             let context = build_context(&workspace_root, &target_dir, profile)?;
             build_component(Component::GoFfi, &context)?;
@@ -396,12 +407,25 @@ fn build_release_or_development(
     profile: Profile,
     kernel_options: KernelOptions,
     stage: bool,
-    rprobe_assets: Option<&Path>,
+    rprobe: &RprobeAssetOptions,
 ) -> Result<(), Box<dyn Error>> {
     let context = build_context(workspace_root, target_dir, profile)?;
     build_all(&context)?;
     let kernel = kernel::resolve(&context, &kernel_options)?;
-    runtime::assemble_development(&context, &kernel, rprobe_assets)?;
+    let probe = if context.host == HostTarget::MacosArm64 {
+        Some(kernel::resolve_rprobe(
+            &context,
+            &rprobe.acquisition,
+            rprobe.rprobe_assets.as_deref(),
+        )?)
+    } else {
+        None
+    };
+    runtime::assemble_development(
+        &context,
+        &kernel,
+        probe.as_ref().map(|artifact| artifact.path.as_path()),
+    )?;
     if stage {
         runtime::stage(&context)?;
     }

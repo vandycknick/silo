@@ -1,4 +1,4 @@
-{ pkgs }:
+{ pkgs, rustToolchain ? null }:
 pkgs.mkShell {
   packages = [
     pkgs.bash
@@ -20,6 +20,7 @@ pkgs.mkShell {
     pkgs.pkg-config
     pkgs.xz
   ]
+  ++ pkgs.lib.optional (rustToolchain != null) rustToolchain
   ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
     pkgs.bc
     pkgs.binutils

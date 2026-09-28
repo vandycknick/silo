@@ -78,7 +78,7 @@ pub enum RuntimeError {
 pub fn assemble_development(
     context: &BuildContext<'_>,
     kernel: &KernelArtifact,
-    rprobe_assets: Option<&Path>,
+    rprobe: Option<&Path>,
 ) -> Result<(), RuntimeError> {
     let profile_dir = context.target_dir.join(context.profile.directory());
     validate_directory(&profile_dir)?;
@@ -94,8 +94,8 @@ pub fn assemble_development(
             &temporary.join("agent"),
             0o755,
         )?;
-        if let Some(rprobe_assets) = rprobe_assets {
-            copy_explicit_rprobe_assets(rprobe_assets, &temporary)?;
+        if let Some(rprobe) = rprobe {
+            copy_regular_file(rprobe, &temporary.join("rprobe"), 0o644)?;
         } else {
             copy_optional_rprobe_assets(&assets, &temporary)?;
         }
@@ -306,19 +306,6 @@ fn copy_optional_rprobe_assets(source: &Path, destination: &Path) -> Result<(), 
         for (name, mode) in RPROBE_ASSETS {
             copy_regular_file(&source.join(name), &destination.join(name), mode)?;
         }
-    }
-    Ok(())
-}
-
-fn copy_explicit_rprobe_assets(source: &Path, destination: &Path) -> Result<(), RuntimeError> {
-    if !has_rprobe_assets(source)? {
-        return Err(RuntimeError::Invalid(format!(
-            "explicit rprobe asset directory {} has no self-contained rprobe kernel",
-            source.display()
-        )));
-    }
-    for (name, mode) in RPROBE_ASSETS {
-        copy_regular_file(&source.join(name), &destination.join(name), mode)?;
     }
     Ok(())
 }

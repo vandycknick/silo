@@ -37,6 +37,27 @@ $(error KERNEL_REFRESH must be 0 or 1)
 endif
 endif
 
+# Rosetta probe acquisition (Apple Silicon macOS builds)
+##? RPROBE_REFERENCE=reference: Select the rprobe OCI reference.
+RPROBE_REFERENCE ?= ghcr.io/vandycknick/silo/rprobe:stable
+##? RPROBE_PATH=path: Use a locally built self-contained rprobe kernel.
+RPROBE_PATH ?=
+##? RPROBE_OFFLINE=0|1: Disable network access during probe resolution.
+RPROBE_OFFLINE ?= 0
+##? RPROBE_REFRESH=0|1: Refresh the cached probe reference.
+RPROBE_REFRESH ?= 0
+
+ifneq ($(RPROBE_OFFLINE),0)
+ifneq ($(RPROBE_OFFLINE),1)
+$(error RPROBE_OFFLINE must be 0 or 1)
+endif
+endif
+ifneq ($(RPROBE_REFRESH),0)
+ifneq ($(RPROBE_REFRESH),1)
+$(error RPROBE_REFRESH must be 0 or 1)
+endif
+endif
+
 # macOS packaging configuration
 ##? DMG=0|1: Also create a DMG when packaging (default: 0).
 DMG ?= 0
@@ -69,6 +90,17 @@ endif
 ifeq ($(KERNEL_REFRESH),1)
 KERNEL_ARGS += --refresh
 endif
+RPROBE_ARGS := --rprobe-reference "$(RPROBE_REFERENCE)"
+ifneq ($(strip $(RPROBE_PATH)),)
+RPROBE_ARGS += --rprobe-path "$(abspath $(RPROBE_PATH))"
+endif
+ifeq ($(RPROBE_OFFLINE),1)
+RPROBE_ARGS += --rprobe-offline
+endif
+ifeq ($(RPROBE_REFRESH),1)
+RPROBE_ARGS += --rprobe-refresh
+endif
+RUNTIME_ARGS := $(KERNEL_ARGS) $(RPROBE_ARGS)
 APP_ARGS := $(strip $(if $(strip $(BUILD_NUMBER)),--build-number "$(BUILD_NUMBER)") $(if $(strip $(DEVELOPER_ID_APPLICATION)),--developer-id-application "$(DEVELOPER_ID_APPLICATION)"))
 
 ##@ General
@@ -83,30 +115,30 @@ help: ## Show public targets and configurable options.
 ##@ Build
 .PHONY: build stage go-sdk-example
 build: ## Build the complete adjacent runtime.
-	$(XTASK) build --profile "$(PROFILE)" $(KERNEL_ARGS)
+	$(XTASK) build --profile "$(PROFILE)" $(RUNTIME_ARGS)
 
 stage: ## Build and assemble the portable runtime stage.
-	$(XTASK) stage --profile "$(PROFILE)" $(KERNEL_ARGS)
+	$(XTASK) stage --profile "$(PROFILE)" $(RUNTIME_ARGS)
 
 go-sdk-example: ## Build the runtime and Go bridge, then run EXAMPLE (default: basic).
-	$(XTASK) go-sdk-example "$(EXAMPLE)" --profile "$(PROFILE)" $(KERNEL_ARGS)
+	$(XTASK) go-sdk-example "$(EXAMPLE)" --profile "$(PROFILE)" $(RUNTIME_ARGS)
 
 ##@ Distribution
 .PHONY: archive app package assemble-go-sdk install
 archive: ## Build release runtime and CLI archives.
-	$(XTASK) archive $(KERNEL_ARGS)
+	$(XTASK) archive $(RUNTIME_ARGS)
 
 app: ## Build and sign the macOS release application.
-	$(XTASK) app $(APP_ARGS) $(KERNEL_ARGS)
+	$(XTASK) app $(APP_ARGS) $(RUNTIME_ARGS)
 
 package: ## Build the macOS release package (use DMG=1 for a DMG).
-	$(XTASK) package $(if $(filter 1,$(DMG)),--dmg) $(APP_ARGS) $(KERNEL_ARGS)
+	$(XTASK) package $(if $(filter 1,$(DMG)),--dmg) $(APP_ARGS) $(RUNTIME_ARGS)
 
 assemble-go-sdk: ## Assemble Go SDK release source from all qualified target artifacts (release-only).
 	$(XTASK) assemble-go-sdk
 
 install: ## Install the macOS release application and CLI symlink.
-	$(XTASK) install --appdir "$(APPDIR)" --bindir "$(BINDIR)" $(APP_ARGS) $(KERNEL_ARGS)
+	$(XTASK) install --appdir "$(APPDIR)" --bindir "$(BINDIR)" $(APP_ARGS) $(RUNTIME_ARGS)
 
 ##@ Quality
 .PHONY: fmt clippy test test-unit test-integration version-check

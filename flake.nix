@@ -31,6 +31,7 @@
     in {
       inherit (shells) default ci release;
       kernel = pkgs.callPackage ./nix/kernelShell.nix { };
+      rprobe = pkgs.callPackage ./nix/kernelShell.nix { inherit rustToolchain; };
     });
   };
 }

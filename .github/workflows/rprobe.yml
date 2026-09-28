@@ -1,0 +1,132 @@
+name: Rprobe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - guest/rprobe/**
+      - xtask/Cargo.toml
+      - xtask/src/main.rs
+      - xtask/src/rprobe.rs
+      - xtask/src/initramfs.rs
+      - xtask/src/components.rs
+      - xtask/src/release.rs
+      - xtask/src/command.rs
+      - xtask/src/profiles.rs
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - resources/kernels/Makefile
+      - resources/kernels/sources.mk
+      - resources/kernels/scripts/fetch-source.sh
+      - resources/kernels/scripts/prepare-pristine.sh
+      - resources/kernels/scripts/derive-source.sh
+      - resources/kernels/scripts/kernel-input-key.sh
+      - resources/kernels/scripts/validate-config.sh
+      - resources/kernels/scripts/validate-owned-path.sh
+      - resources/kernels/scripts/package-oci.sh
+      - resources/kernels/scripts/validate-oci.sh
+      - resources/kernels/scripts/publish-rprobe-oci.sh
+      - nix/kernelShell.nix
+      - flake.nix
+      - flake.lock
+      - Makefile
+      - .github/workflows/rprobe.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ARM64 probe
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 30
+    env:
+      KERNEL_PROFILE: rprobe
+      KBUILD_BUILD_HOST: github-actions
+      KBUILD_BUILD_USER: silo
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Restore kernel downloads and compiler cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/ccache
+            ~/.cache/silo/kernels/downloads
+          key: rprobe-arm64-${{ hashFiles('guest/rprobe/**', 'resources/kernels/sources.mk', 'flake.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            rprobe-arm64-
+
+      - name: Build release probe and OCI layout
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/rprobe-cargo"
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          export SOURCE_DATE_EPOCH
+          export KBUILD_BUILD_TIMESTAMP="@$SOURCE_DATE_EPOCH"
+          export CC="ccache gcc"
+          nix develop .#rprobe --command ccache --max-size 2G
+          nix develop .#rprobe --command make rprobe PROFILE=release
+          nix develop .#rprobe --command make -C resources/kernels kernel \
+            KERNEL_INITRAMFS="$CARGO_TARGET_DIR/release/rprobe-build/initramfs.cpio.gz" \
+            KERNEL_CANONICAL_OCI_LAYOUT="$GITHUB_WORKSPACE/target/kernels/.canonical/rprobe/ci" \
+            KERNEL_CANONICAL_OCI_REFERENCE=ci \
+            BUILD_REVISION="$GITHUB_SHA" \
+            BUILD_CREATED="$(git show -s --format=%cI "$GITHUB_SHA")"
+          nix develop .#rprobe --command ccache --show-stats
+
+      - name: Upload OCI layout
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rprobe-oci-arm64
+          path: target/kernels/.canonical/rprobe/ci
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: publish probe
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      OCI_IMAGE: ghcr.io/${{ github.repository_owner }}/silo/rprobe
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Download OCI layout
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rprobe-oci-arm64
+          path: ${{ runner.temp }}/rprobe-oci
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | nix develop .#kernel --command oras login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Publish probe
+        run: nix develop .#kernel --command sh resources/kernels/scripts/publish-rprobe-oci.sh "$RUNNER_TEMP/rprobe-oci" ci

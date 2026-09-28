@@ -13,6 +13,83 @@ use crate::command;
 use crate::components::BuildContext;
 
 pub const DEFAULT_KERNEL_REFERENCE: &str = "ghcr.io/vandycknick/silo/kernel:stable";
+pub const DEFAULT_RPROBE_REFERENCE: &str = "ghcr.io/vandycknick/silo/rprobe:stable";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum KernelProfile {
+    #[default]
+    Workload,
+    Rprobe,
+}
+
+impl KernelProfile {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Workload => "workload",
+            Self::Rprobe => "rprobe",
+        }
+    }
+
+    fn artifact_type(self) -> &'static str {
+        match self {
+            Self::Workload => ARTIFACT_TYPE,
+            Self::Rprobe => "application/vnd.silo.rprobe-kernel.v1",
+        }
+    }
+
+    fn config_type(self) -> &'static str {
+        match self {
+            Self::Workload => CONFIG_MEDIA_TYPE,
+            Self::Rprobe => "application/vnd.silo.rprobe-kernel.config.v1+json",
+        }
+    }
+
+    fn image_type(self) -> &'static str {
+        match self {
+            Self::Workload => KERNEL_MEDIA_TYPE,
+            Self::Rprobe => "application/vnd.silo.rprobe-kernel.image.v1",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct RprobeOptions {
+    #[arg(long, default_value = DEFAULT_RPROBE_REFERENCE)]
+    rprobe_reference: String,
+    #[arg(long, value_name = "PATH", conflicts_with = "rprobe_assets")]
+    rprobe_path: Option<PathBuf>,
+    #[arg(long)]
+    rprobe_offline: bool,
+    #[arg(long)]
+    rprobe_refresh: bool,
+}
+
+pub fn resolve_rprobe(
+    context: &BuildContext<'_>,
+    options: &RprobeOptions,
+    assets: Option<&Path>,
+) -> Result<KernelArtifact, KernelError> {
+    if context.host.oci_architecture() != "arm64" {
+        return Err(KernelError::Invalid("rprobe requires ARM64".to_string()));
+    }
+    let path = match assets {
+        Some(directory) => {
+            let path = directory.join("rprobe");
+            Some(std::path::absolute(&path).map_err(|source| KernelError::Read { path, source })?)
+        }
+        None => options.rprobe_path.clone(),
+    };
+    resolve(
+        context,
+        &KernelOptions {
+            reference: options.rprobe_reference.clone(),
+            path,
+            offline: options.rprobe_offline,
+            refresh: options.rprobe_refresh,
+            profile: KernelProfile::Rprobe,
+        },
+    )
+}
 
 const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -33,6 +110,8 @@ pub struct KernelOptions {
     offline: bool,
     #[arg(long)]
     refresh: bool,
+    #[arg(skip)]
+    profile: KernelProfile,
 }
 
 pub struct KernelArtifact {
@@ -107,14 +186,17 @@ pub fn resolve(
     context: &BuildContext<'_>,
     options: &KernelOptions,
 ) -> Result<KernelArtifact, KernelError> {
-    let cache_root = context.target_dir.join("kernel-cache");
+    let cache_root = context.target_dir.join(match options.profile {
+        KernelProfile::Workload => "kernel-cache",
+        KernelProfile::Rprobe => "rprobe-cache",
+    });
     create_directory(&cache_root)?;
 
     let (path, identity) = match options.path.as_deref() {
         Some(path) => resolve_local_kernel(context, &cache_root, path)?,
         None => resolve_oci_kernel(context, &cache_root, options)?,
     };
-    write_provenance(context, &identity)?;
+    write_provenance(context, &identity, options.profile)?;
     Ok(KernelArtifact { path })
 }
 
@@ -194,7 +276,7 @@ fn resolve_oci_kernel(
     }
     let index = read_cached(cache_root, &index_descriptor)?;
     let index = parse_json(&index, "OCI index")?;
-    validate_index(&index)?;
+    validate_index(&index, options.profile)?;
     let manifest_descriptor = select_manifest(&index, context)?;
     let repository = repository(reference)?;
     let manifest_reference = format!("{repository}@{}", manifest_descriptor.digest);
@@ -205,14 +287,14 @@ fn resolve_oci_kernel(
         options.offline,
     )?;
     let manifest = parse_json(&manifest, "platform OCI manifest")?;
-    let artifacts = validate_manifest(&manifest, context)?;
+    let artifacts = validate_manifest(&manifest, context, options.profile)?;
     let config = fetch_or_cached_blob(cache_root, &artifacts.config, repository, options.offline)?;
     let config = parse_json(&config, "kernel artifact config")?;
-    validate_config(&config, context)?;
+    validate_config(&config, context, options.profile)?;
     let mut kernel_path = None;
     for layer in &artifacts.layers {
         let bytes = fetch_or_cached_blob(cache_root, layer, repository, options.offline)?;
-        if layer.media_type == KERNEL_MEDIA_TYPE {
+        if layer.media_type == options.profile.image_type() {
             validate_kernel(&bytes, context)?;
             kernel_path = Some(cache_path(cache_root, &layer.digest)?);
         }
@@ -238,10 +320,10 @@ fn resolve_oci_kernel(
     ))
 }
 
-fn validate_index(index: &Value) -> Result<(), KernelError> {
+fn validate_index(index: &Value, profile: KernelProfile) -> Result<(), KernelError> {
     require_u64(index, "schemaVersion", "OCI index", 2)?;
     require_string_value(index, "mediaType", "OCI index", OCI_INDEX_MEDIA_TYPE)?;
-    require_string_value(index, "artifactType", "OCI index", ARTIFACT_TYPE)?;
+    require_string_value(index, "artifactType", "OCI index", profile.artifact_type())?;
     let manifests = index
         .get("manifests")
         .and_then(Value::as_array)
@@ -295,6 +377,7 @@ fn select_manifest(index: &Value, context: &BuildContext<'_>) -> Result<Descript
 fn validate_manifest(
     manifest: &Value,
     context: &BuildContext<'_>,
+    profile: KernelProfile,
 ) -> Result<ManifestArtifacts, KernelError> {
     require_u64(manifest, "schemaVersion", "OCI manifest", 2)?;
     require_string_value(
@@ -303,17 +386,23 @@ fn validate_manifest(
         "OCI manifest",
         OCI_MANIFEST_MEDIA_TYPE,
     )?;
-    require_string_value(manifest, "artifactType", "OCI manifest", ARTIFACT_TYPE)?;
+    require_string_value(
+        manifest,
+        "artifactType",
+        "OCI manifest",
+        profile.artifact_type(),
+    )?;
     let config = descriptor(
         manifest.get("config").ok_or_else(|| {
             KernelError::Invalid("OCI manifest has no config descriptor".to_string())
         })?,
         "OCI config descriptor",
     )?;
-    if config.media_type != CONFIG_MEDIA_TYPE {
+    if config.media_type != profile.config_type() {
         return Err(KernelError::Invalid(format!(
-            "OCI config has media type {}, expected {CONFIG_MEDIA_TYPE}",
-            config.media_type
+            "OCI config has media type {}, expected {}",
+            config.media_type,
+            profile.config_type()
         )));
     }
     let layers = manifest
@@ -328,7 +417,7 @@ fn validate_manifest(
     for layer in layers {
         let descriptor = descriptor(layer, "OCI layer descriptor")?;
         match descriptor.media_type.as_str() {
-            KERNEL_MEDIA_TYPE => {
+            media_type if media_type == profile.image_type() => {
                 if kernel.replace(descriptor.clone()).is_some() {
                     return Err(KernelError::Invalid(
                         "OCI manifest contains more than one kernel layer".to_string(),
@@ -364,7 +453,20 @@ fn validate_manifest(
     }
 }
 
-fn validate_config(config: &Value, context: &BuildContext<'_>) -> Result<(), KernelError> {
+fn validate_config(
+    config: &Value,
+    context: &BuildContext<'_>,
+    profile: KernelProfile,
+) -> Result<(), KernelError> {
+    if profile == KernelProfile::Rprobe {
+        require_string_value(config, "profile", "kernel artifact config", profile.name())?;
+        require_string_value(
+            config,
+            "purpose",
+            "kernel artifact config",
+            "rosetta-acquisition-probe",
+        )?;
+    }
     require_u64(config, "schemaVersion", "kernel artifact config", 1)?;
     require_string_value(config, "track", "kernel artifact config", "stable")?;
     require_string_value(
@@ -394,7 +496,7 @@ fn validate_config(config: &Value, context: &BuildContext<'_>) -> Result<(), Ker
         .ok_or_else(|| {
             KernelError::Invalid("kernel artifact config kernel must be an object".to_string())
         })?;
-    if kernel.get("mediaType").and_then(Value::as_str) != Some(KERNEL_MEDIA_TYPE) {
+    if kernel.get("mediaType").and_then(Value::as_str) != Some(profile.image_type()) {
         return Err(KernelError::Invalid(
             "kernel artifact config has an invalid kernel media type".to_string(),
         ));
@@ -612,10 +714,17 @@ fn cache_bytes(cache_root: &Path, digest: &str, bytes: &[u8]) -> Result<PathBuf,
     Ok(path)
 }
 
-fn write_provenance(context: &BuildContext<'_>, provenance: &Value) -> Result<(), KernelError> {
+fn write_provenance(
+    context: &BuildContext<'_>,
+    provenance: &Value,
+    profile: KernelProfile,
+) -> Result<(), KernelError> {
     let directory = context
         .target_dir
-        .join("kernel-provenance")
+        .join(match profile {
+            KernelProfile::Workload => "kernel-provenance",
+            KernelProfile::Rprobe => "rprobe-provenance",
+        })
         .join(context.host.runtime_target());
     create_directory(&directory)?;
     write_json_atomic(

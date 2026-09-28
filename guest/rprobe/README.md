@@ -48,12 +48,41 @@ silo exec --workdir "$PWD" builder -- sh -c '
 The complete kernel build identity includes the archive content hash, not its
 source pathname. A probe change cannot reuse an old embedded image. Unchanged
 inputs reuse their build tree. Output publication uses a temporary file and
-rename. Final OCI publication through CI is separate future work.
+rename.
 
-To assemble a macOS runtime, provide a directory containing just the built
-`rprobe` file with xtask's existing `--rprobe-assets DIRECTORY` option. Do not
-reuse a legacy three-file probe asset directory. The workload's own kernel and
-initramfs remain separate and unchanged.
+## Development builds and publication
+
+On Apple Silicon macOS, `make build` downloads the published probe from
+`ghcr.io/vandycknick/silo/rprobe:stable`. Linux runtime builds do not acquire it.
+The probe uses the workload kernel's existing OCI descriptor, SHA-256, size,
+platform and image validation, with separate artifact media types. Verified
+bytes are cached in `target/rprobe-cache`; the resolved provenance record is
+written under `target/rprobe-provenance`. `CARGO_TARGET_DIR` relocates both.
+
+```sh
+make build RPROBE_PATH=/absolute/path/to/rprobe # local appliance development
+make build RPROBE_REFERENCE=ghcr.io/vandycknick/silo/rprobe:VERSION-REVISION
+make build KERNEL_OFFLINE=1 RPROBE_OFFLINE=1   # requires both caches
+make build RPROBE_REFRESH=1                  # resolve stable again
+```
+
+These options also apply to stage, archive, app, package, install and Go SDK
+example builds. A missing or invalid probe fails the macOS build; an old file
+in `target/debug/assets` is not silently reused. xtask's existing
+`--rprobe-assets DIRECTORY` option remains available as a local override,
+mutually exclusive with `--rprobe-path`.
+
+The separate `.github/workflows/rprobe.yml` pipeline runs on main when the
+probe crate or its build inputs change, or manually through `workflow_dispatch`.
+It builds on native ARM64 Linux using `nix develop .#rprobe`, packages the
+existing probe OCI contract, and publishes a single-platform index with
+`VERSION-REVISION` and `stable` tags. It does not capture or publish Rosetta
+response bytes. The shared workload kernel publication pipeline is unchanged.
+
+The first pipeline publication must complete before default acquisition works.
+The GHCR package must be publicly readable for unauthenticated fresh clones.
+Until then, use `RPROBE_PATH` with a locally built probe. The workload's own
+kernel and initramfs remain separate and unchanged.
 
 ## Kernel size and configuration policy
 

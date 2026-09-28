@@ -58,7 +58,7 @@ The remaining media types are:
 | Symbol map | `application/vnd.silo.kernel.system-map.v1` |
 | XZ-compressed diagnostic ELF | `application/vnd.silo.kernel.debug.v1+xz` |
 
-The local-only ARM64 `rprobe` profile is a separate contract:
+The ARM64 `rprobe` profile is a separate contract:
 
 | Purpose | Media type |
 | --- | --- |
@@ -68,8 +68,10 @@ The local-only ARM64 `rprobe` profile is a separate contract:
 
 Its purpose is `rosetta-acquisition-probe`, and its canonical layout and
 reference include the complete build identity. It is never exported to the
-workload compatibility path or accepted by the workload publisher. Dedicated
-probe OCI publication remains future work. Local probe builds install only
+workload compatibility path or accepted by the workload publisher. The dedicated
+rprobe pipeline publishes an `application/vnd.silo.rprobe-kernel.v1` OCI index
+containing one linux/arm64 manifest to `ghcr.io/vandycknick/silo/rprobe`, tagged
+`VERSION-REVISION` and `stable`. Probe builds and runtime acquisition install only
 `assets/rprobe`, an ARM64 Image with its Rust PID1 embedded through Linux's
 built-in initramfs support. No manifest or external initramfs is installed for
 the probe. The embedded archive's content participates in the build identity.

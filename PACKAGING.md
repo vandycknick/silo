@@ -425,6 +425,14 @@ The same kernel options apply to `make build`, `make stage`, `make app`, and
 `make package`. Kernel construction and OCI publication are separate operations;
 see the [kernel documentation](resources/kernels/README.md).
 
+Apple Silicon macOS builds also resolve and include the Rosetta probe from
+`ghcr.io/vandycknick/silo/rprobe:stable`. It uses the same verification and cache
+mechanism as the kernel, with separate `rprobe-cache` and `rprobe-provenance`
+directories. Override it with `RPROBE_REFERENCE` or `RPROBE_PATH`; control cache
+use with `RPROBE_OFFLINE=1` and `RPROBE_REFRESH=1`. For a fully offline build,
+set both `KERNEL_OFFLINE=1` and `RPROBE_OFFLINE=1`. Existing adjacent probe files
+are not an implicit override. Linux runtime builds do not download the probe.
+
 ## Command Reference
 
 | Command | Builds or stages | Output or action |

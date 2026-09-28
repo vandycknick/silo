@@ -98,8 +98,11 @@ oras pull --oci-layout target/kernels/stable/x86_64:7.2.2 --output ./kernel
 Probe layouts remain identity-keyed below
 `target/kernels/.canonical/rprobe/<track>/arm64/`. They use a distinct purpose,
 reference, artifact type, and image media type. They are local build artifacts:
-`make publish KERNEL_PROFILE=rprobe` is rejected. Dedicated probe OCI publication
-and registry acquisition remain future work; local builds install one `rprobe` file.
+`make publish KERNEL_PROFILE=rprobe` is rejected by the workload publisher.
+The separate `.github/workflows/rprobe.yml` pipeline publishes probe artifacts
+using `scripts/publish-rprobe-oci.sh`. macOS runtime builds acquire the published
+probe automatically; local builds still install one `rprobe` file. See the
+[probe guide](../../guest/rprobe/README.md#development-builds-and-publication).
 
 ## Runtime Acquisition
 
