@@ -29,7 +29,7 @@ use self::netd_driver::NetdDriver;
 
 const DRIVER_NETD: &str = "netd";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 /// Resolved network attachment projected into silo-vmm and guest-agent inputs.
 ///
@@ -45,10 +45,20 @@ pub(crate) enum VmmNetworkAttachment {
         dns: agent_spec::NetworkDnsConfig,
         #[serde(default)]
         requires_certificate_authority: bool,
+        /// Kept only through startup, then owned by the final VMM process.
+        #[serde(skip)]
+        exit_writer: Option<std::os::fd::OwnedFd>,
     },
 }
 
 impl VmmNetworkAttachment {
+    pub(crate) fn exit_writer(&self) -> Option<&std::os::fd::OwnedFd> {
+        match self {
+            Self::None => None,
+            Self::UnixDatagram { exit_writer, .. } => exit_writer.as_ref(),
+        }
+    }
+
     pub(crate) fn to_vmm_arg(&self) -> String {
         match self {
             Self::None => "none".to_string(),

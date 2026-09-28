@@ -110,6 +110,9 @@ fn main() -> eyre::Result<()> {
         .map_err(|err| eyre::eyre!("open syncpipe reporter: {err}"))?;
     let machine_log_dir = inherited_fds.machine_log_dir;
     let _machine_lock = inherited_fds.take_machine_lock()?;
+    // Held through backend shutdown/finalization. This is a one-way lifetime
+    // lease, not a health check; netd death never stops the VM.
+    let _netd_exit = inherited_fds.take_netd_exit()?;
 
     // Fork the exit runner while this process is still single-threaded: the
     // tracing appender below starts the first thread.

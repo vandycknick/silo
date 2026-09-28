@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{ChildStderr, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -13,9 +13,8 @@ use std::time::Duration;
 use agent_spec::{NetworkDnsConfig, NetworkIpv4Config};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::sys::signal::{kill, Signal};
-use nix::unistd::{pipe, Pid};
+use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 use silo_policy::NetworkPolicy;
 use tokio::time::sleep;
@@ -109,6 +108,18 @@ async fn prepare_netd_runtime(
     let runtime_directory = paths.ensure_network_run_dir(&network_id)?;
     let log_directory = paths.ensure_machine_network_logs_dir(metadata.id)?;
     let mut startup = NetdStartupGuard::new(paths.clone(), network_id.clone());
+    // std creates non-inheritable pipes on both macOS and Linux, coordinating
+    // its pipe+fcntl fallback with concurrent std::process launches.
+    let (owner_read, owner_write) = std::io::pipe()?;
+    let (owner_read, owner_write) = (OwnedFd::from(owner_read), OwnedFd::from(owner_write));
+    let (report_read, report_write) = std::io::pipe()?;
+    let (report_read, report_write) = (OwnedFd::from(report_read), OwnedFd::from(report_write));
+    nix::fcntl::fcntl(
+        &report_read,
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .map_err(std::io::Error::other)?;
+    startup.owner_write = Some(owner_write);
 
     let socket_path = network_paths.socket_path();
     let log_path = machine_paths.network_service_log_path();
@@ -165,11 +176,32 @@ async fn prepare_netd_runtime(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    let daemon_pid_read = configure_daemonized_network_helper(&mut command)?;
+    command
+        .arg("--daemonize")
+        .arg("--startup-fd")
+        .arg(report_write.as_raw_fd().to_string())
+        .arg("--exit-fd")
+        .arg(owner_read.as_raw_fd().to_string());
+    let owner_fd = owner_read.as_raw_fd();
+    let report_fd = report_write.as_raw_fd();
+    unsafe {
+        command.pre_exec(move || {
+            // Clear CLOEXEC in this child only, never in the multithreaded caller.
+            for raw in [owner_fd, report_fd] {
+                let fd = std::os::fd::BorrowedFd::borrow_raw(raw);
+                nix::fcntl::fcntl(
+                    fd,
+                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                )
+                .map_err(std::io::Error::other)?;
+            }
+            Ok(())
+        });
+    }
+
     let child = command.spawn();
-    // The pre_exec closure owns the pipe's write end; drop it with the command
-    // so a daemon that dies before reporting its pid produces EOF, not a hang.
-    drop(command);
+    drop(owner_read);
+    drop(report_write);
     drop(log_directory_fd);
     drop(runtime_directory_fd);
     let mut child = child.map_err(|err| LibVmError::NetworkRuntime {
@@ -177,49 +209,37 @@ async fn prepare_netd_runtime(
         message: format!("spawn userspace network helper: {err}"),
     })?;
     let stderr_capture = child.stderr.take().map(CapturedStderr::spawn);
-    let pid_result = read_daemon_pid(daemon_pid_read);
-    let launcher_status = child.wait();
-    let pid = pid_result.map_err(|err| LibVmError::NetworkRuntime {
+    startup.set_child(child, stderr_capture);
+    let report = match wait_for_netd_startup(
+        &report_read,
+        &mut startup,
+        metadata.id,
+        ctx.run_id,
+        &network_id,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(err) => {
+            let stderr_lines = startup.rollback_after_startup_failure();
+            return Err(LibVmError::NetworkRuntime {
+                reference: metadata.name.clone(),
+                message: format_netd_startup_failure(&err, &stderr_lines, &log_path),
+            });
+        }
+    };
+    let pid = report.pid;
+    let identity = ProcessIdentity::for_pid(pid)?.ok_or_else(|| LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
-        message: format!("read userspace network helper daemon pid: {err}"),
+        message: "netd worker exited after readiness".into(),
     })?;
-    let launcher_status = launcher_status.map_err(|err| LibVmError::NetworkRuntime {
-        reference: metadata.name.clone(),
-        message: format!("wait for userspace network helper launcher: {err}"),
-    })?;
-    if !launcher_status.success() {
-        return Err(LibVmError::NetworkRuntime {
-            reference: metadata.name.clone(),
-            message: format!("userspace network helper launcher exited with {launcher_status}"),
-        });
-    }
-    let helper = ProcessIdentity::for_pid(pid)?.ok_or_else(|| LibVmError::NetworkRuntime {
-        reference: metadata.name.clone(),
-        message: format!("netd pid {pid} exited during startup"),
-    })?;
-    startup.set_helper(helper, stderr_capture);
-    let helper_started_at = startup
-        .helper()
-        .and_then(ProcessIdentity::started_at)
+    let helper_started_at = identity
+        .started_at()
         .ok_or_else(|| LibVmError::NetworkRuntime {
             reference: metadata.name.clone(),
             message: format!("netd pid {pid} has no stable process generation"),
         })?;
-
-    let startup_result = {
-        let helper = startup.helper().ok_or_else(|| LibVmError::NetworkRuntime {
-            reference: metadata.name.clone(),
-            message: "userspace network helper was not started".to_string(),
-        })?;
-        wait_for_netd_startup(&socket_path, helper).await
-    };
-    if let Err(err) = startup_result {
-        let stderr_lines = startup.rollback_after_startup_failure();
-        return Err(LibVmError::NetworkRuntime {
-            reference: metadata.name.clone(),
-            message: format_netd_startup_failure(&err, &stderr_lines, &log_path),
-        });
-    }
+    startup.worker = Some(identity);
 
     let network = super::VmmNetworkAttachment::UnixDatagram {
         path: socket_path.clone(),
@@ -227,6 +247,7 @@ async fn prepare_netd_runtime(
         ipv4,
         dns,
         requires_certificate_authority,
+        exit_writer: None,
     };
     let (ipv4, dns) = match &network {
         super::VmmNetworkAttachment::UnixDatagram { ipv4, dns, .. } => (ipv4.clone(), dns.clone()),
@@ -286,59 +307,12 @@ async fn prepare_netd_runtime(
         }
         return Err(err);
     }
+    let mut network = network;
+    if let crate::network::VmmNetworkAttachment::UnixDatagram { exit_writer, .. } = &mut network {
+        *exit_writer = startup.owner_write.take();
+    }
     startup.commit();
     Ok(network)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn configure_daemonized_network_helper(command: &mut Command) -> io::Result<OwnedFd> {
-    let (pid_read, pid_write) = pipe().map_err(io::Error::from)?;
-    fcntl(&pid_read, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(io::Error::from)?;
-    fcntl(&pid_write, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(io::Error::from)?;
-    unsafe {
-        command.pre_exec(move || daemonize_network_helper(&pid_write));
-    }
-    Ok(pid_read)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn daemonize_network_helper(pid_write: &OwnedFd) -> io::Result<()> {
-    match unsafe { nix::unistd::fork() } {
-        Ok(nix::unistd::ForkResult::Parent { .. }) => {
-            // nix intentionally has no _exit wrapper; std::process::exit is not
-            // safe after fork because it may run inherited userspace cleanup.
-            unsafe { libc::_exit(0) }
-        }
-        Ok(nix::unistd::ForkResult::Child) => {}
-        Err(error) => return Err(io::Error::from(error)),
-    }
-
-    nix::unistd::setsid().map_err(io::Error::from)?;
-    let pid = nix::unistd::getpid().as_raw().to_ne_bytes();
-    let mut remaining = pid.as_slice();
-    while !remaining.is_empty() {
-        match nix::unistd::write(pid_write, remaining) {
-            Ok(0) => return Err(io::Error::from_raw_os_error(libc::EIO)),
-            Ok(written) => remaining = &remaining[written..],
-            Err(nix::errno::Errno::EINTR) => {}
-            Err(error) => return Err(io::Error::from(error)),
-        }
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn read_daemon_pid(pid_read: OwnedFd) -> io::Result<i32> {
-    let mut bytes = [0_u8; std::mem::size_of::<i32>()];
-    std::fs::File::from(pid_read).read_exact(&mut bytes)?;
-    let pid = i32::from_ne_bytes(bytes);
-    if pid <= 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("daemon reported invalid pid {pid}"),
-        ));
-    }
-    Ok(pid)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -608,26 +582,69 @@ fn resolve_certificate_authority_paths(
     }
 }
 
-async fn wait_for_netd_startup(path: &Path, helper: &ProcessIdentity) -> Result<(), String> {
+#[derive(Deserialize)]
+struct WorkerStartupReport {
+    pid: i32,
+    vm_id: String,
+    run_id: String,
+    network_id: String,
+    ready: bool,
+    #[serde(default)]
+    error: String,
+}
+
+async fn wait_for_netd_startup(
+    report_fd: &OwnedFd,
+    startup: &mut NetdStartupGuard,
+    machine_id: MachineId,
+    run_id: &str,
+    network_id: &str,
+) -> Result<WorkerStartupReport, String> {
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
+    let mut bytes = Vec::new();
+    let mut launcher_exited = false;
+    let mut eof = false;
     loop {
-        if path.exists() {
-            return Ok(());
-        }
-        match helper.is_alive() {
-            Ok(true) => {}
-            Ok(false) => return Err("userspace network helper exited during startup".to_string()),
-            Err(err) => {
-                return Err(format!(
-                    "check userspace network helper startup identity: {err}"
-                ));
+        if let Some(child) = startup.child.as_mut() {
+            if !launcher_exited {
+                if let Some(status) = child
+                    .try_wait()
+                    .map_err(|err| format!("wait for netd launcher: {err}"))?
+                {
+                    if !status.success() {
+                        return Err(format!("netd launcher exited with {status}"));
+                    }
+                    launcher_exited = true;
+                }
             }
         }
+        let mut chunk = [0u8; 4096];
+        match nix::unistd::read(report_fd, &mut chunk) {
+            Ok(0) => eof = true,
+            Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+            Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => {}
+            Err(error) => return Err(format!("read netd worker startup: {error}")),
+        }
+        if bytes.len() > STDERR_CAPTURE_LIMIT {
+            return Err("netd startup report exceeds limit".into());
+        }
+        if launcher_exited && (bytes.contains(&b'\n') || eof) {
+            let report: WorkerStartupReport = serde_json::from_slice(&bytes)
+                .map_err(|err| format!("invalid netd worker startup report: {err}"))?;
+            if report.pid <= 1
+                || report.vm_id != machine_id.to_string()
+                || report.run_id != run_id
+                || report.network_id != network_id
+            {
+                return Err("netd startup report does not match requested generation".into());
+            }
+            if !report.ready {
+                return Err(format!("netd worker startup failed: {}", report.error));
+            }
+            return Ok(report);
+        }
         if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "userspace network helper did not create socket {}",
-                path.display()
-            ));
+            return Err("timed out waiting for netd worker readiness".into());
         }
         sleep(READY_POLL_INTERVAL).await;
     }
@@ -765,7 +782,9 @@ impl CapturedStderr {
 struct NetdStartupGuard {
     paths: LocalPaths,
     network_id: String,
-    helper: Option<ProcessIdentity>,
+    child: Option<Child>,
+    worker: Option<ProcessIdentity>,
+    owner_write: Option<OwnedFd>,
     stderr_capture: Option<CapturedStderr>,
     armed: bool,
 }
@@ -776,19 +795,17 @@ impl NetdStartupGuard {
         Self {
             paths,
             network_id,
-            helper: None,
+            child: None,
+            worker: None,
+            owner_write: None,
             stderr_capture: None,
             armed: true,
         }
     }
 
-    fn set_helper(&mut self, helper: ProcessIdentity, stderr_capture: Option<CapturedStderr>) {
-        self.helper = Some(helper);
+    fn set_child(&mut self, child: Child, stderr_capture: Option<CapturedStderr>) {
+        self.child = Some(child);
         self.stderr_capture = stderr_capture;
-    }
-
-    fn helper(&self) -> Option<&ProcessIdentity> {
-        self.helper.as_ref()
     }
 
     fn rollback_after_startup_failure(&mut self) -> Vec<String> {
@@ -808,11 +825,16 @@ impl NetdStartupGuard {
     }
 
     fn stop_helper(&mut self) {
-        let Some(helper) = self.helper.as_ref() else {
-            return;
-        };
-        let _ = terminate_helper(helper);
-        let _ = kill(Pid::from_raw(-helper.pid()), Signal::SIGKILL);
+        self.owner_write.take();
+        if let Some(identity) = self.worker.take() {
+            if identity.is_alive().unwrap_or(false) {
+                let _ = terminate_helper(&identity);
+            }
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     fn rollback_files(&mut self) {
@@ -918,18 +940,17 @@ fn terminate_helper(identity: &ProcessIdentity) -> Result<(), LibVmError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
+    use crate::network::netd_driver::{
         append_bounded_stderr_line, configure_egress_credentials_environment,
-        configure_network_helper_command, driver_state, format_netd_startup_failure,
-        prepare_netd_runtime, private_ipv4_config, resolve_certificate_authority_paths,
-        CapturedStderrLines, NetworkHelperCommandConfig, OAUTH_REFRESH_AUTH_ENV,
-        OAUTH_REFRESH_HOOK_ENV, STDERR_CAPTURE_LIMIT,
+        configure_network_helper_command, format_netd_startup_failure, prepare_netd_runtime,
+        private_ipv4_config, resolve_certificate_authority_paths, CapturedStderrLines,
+        NetworkHelperCommandConfig, OAUTH_REFRESH_AUTH_ENV, OAUTH_REFRESH_HOOK_ENV,
+        STDERR_CAPTURE_LIMIT,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
     use silo_policy::NetworkPolicy;
     use std::collections::BTreeMap;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -942,7 +963,6 @@ mod tests {
         NetworkInstance, NetworkInstanceState,
     };
     use crate::store::{MachineStore, NetworkStore, Store};
-    use crate::supervisor::process::ProcessIdentity;
     use crate::{NetdRuntimeConfig, RuntimeNetworkingConfig};
 
     fn oauth_policy() -> NetworkPolicy {
@@ -1270,7 +1290,7 @@ netd log: /tmp/silo/netd.log";
             modified_at: 1,
         };
 
-        assert!(super::instance_process_identity(&instance).is_err());
+        assert!(crate::network::netd_driver::instance_process_identity(&instance).is_err());
         assert!(child.try_wait().expect("check helper").is_none());
         child.kill().expect("stop helper");
         child.wait().expect("reap helper");
@@ -1278,19 +1298,27 @@ netd log: /tmp/silo/netd.log";
 
     #[tokio::test]
     async fn netd_launches_the_resolved_absolute_helper() {
-        let temp = tempfile::tempdir().expect("create temp dir");
+        let temp = tempfile::Builder::new()
+            .prefix("netd-")
+            .tempdir_in("/tmp")
+            .expect("create temp dir");
         let data_root = temp.path().join("data");
         let run_root = temp.path().join("run");
         let paths = LocalPaths::from_roots(LocalRoots::with_roots(&data_root, &run_root));
         let netd = temp.path().join("runtime/bin/netd");
         std::fs::create_dir_all(netd.parent().expect("netd parent")).expect("create netd parent");
-        std::fs::write(
-            &netd,
-            "#!/bin/sh\nsocket=\nlog_dir_fd=\nruntime_dir_fd=\nlog=\naudit=\nrun=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--listen-vfkit\" ]; then socket=\"${arg#unixgram://}\"; fi\n  if [ \"$previous\" = \"--log-dir-fd\" ]; then log_dir_fd=\"$arg\"; fi\n  if [ \"$previous\" = \"--runtime-dir-fd\" ]; then runtime_dir_fd=\"$arg\"; fi\n  if [ \"$previous\" = \"--log-file\" ]; then log=\"$arg\"; fi\n  if [ \"$previous\" = \"--audit-log-file\" ]; then audit=\"$arg\"; fi\n  if [ \"$previous\" = \"--run-id\" ]; then run=\"$arg\"; fi\n  previous=\"$arg\"\ndone\nif [ \"$log\" != netd.log ] || [ \"$audit\" != audit.jsonl ] || [ ! -d \"/dev/fd/$log_dir_fd\" ] || [ ! -d \"/dev/fd/$runtime_dir_fd\" ]; then exit 42; fi\nprintf '%s\\n' \"$0\" > \"$0.program\"\nprintf '%s\\n' \"$log_dir_fd,$runtime_dir_fd\" > \"$0.directories\"\nprintf '%s\\n' \"$run\" > \"$0.run\"\nprintf '%s,%s\\n' \"$$\" \"$PPID\" > \"$0.process\"\n: > \"$socket\"\nwhile :; do sleep 1; done\n",
-        )
-        .expect("write netd helper");
-        std::fs::set_permissions(&netd, std::fs::Permissions::from_mode(0o755))
-            .expect("make netd executable");
+        let build = Command::new("go")
+            .args(["build", "-o"])
+            .arg(&netd)
+            .arg("./cmd/netd")
+            .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../net/netd"))
+            .output()
+            .expect("build real netd");
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
         let store = Store::new(&paths).await.expect("open store");
         let machine_id = MachineId::new();
         let metadata = MachineConfig {
@@ -1359,64 +1387,45 @@ netd log: /tmp/silo/netd.log";
                 .join("network/netd.log")
         );
         assert!(!data_root.join("logs/networks").exists());
-        let directory_fds = std::fs::read_to_string(netd.with_extension("directories"))
-            .expect("read inherited directories");
-        let (log_directory_fd, runtime_directory_fd) = directory_fds
-            .trim()
-            .split_once(',')
-            .expect("recorded directory descriptors");
-        assert!(log_directory_fd.parse::<i32>().is_ok());
-        assert!(runtime_directory_fd.parse::<i32>().is_ok());
-        assert_ne!(log_directory_fd, runtime_directory_fd);
-        assert_eq!(
-            std::fs::read_to_string(netd.with_extension("run"))
-                .expect("read netd run id")
-                .trim(),
-            "run-123"
-        );
-        assert_eq!(
-            std::fs::read_to_string(netd.with_extension("program"))
-                .expect("read executed netd path")
-                .trim(),
-            netd.display().to_string()
-        );
-        let process = std::fs::read_to_string(netd.with_extension("process"))
-            .expect("read netd process identity");
-        let (helper_pid, helper_parent_pid) = process
-            .trim()
-            .split_once(',')
-            .expect("split netd process identity");
-        let helper_pid = helper_pid.parse::<i32>().expect("parse netd pid");
-        let helper_parent_pid = helper_parent_pid
-            .parse::<u32>()
-            .expect("parse netd parent pid");
-        assert_ne!(helper_parent_pid, std::process::id());
-        let network_attachment = store
-            .network_attachment(machine_id)
+        let log = std::fs::read_to_string(&log_path).expect("worker log");
+        assert!(log.contains("run-123"));
+        let instance = store
+            .network_instance(
+                &store
+                    .network_attachment(machine_id)
+                    .await
+                    .expect("attachment")
+                    .expect("attached")
+                    .network_instance_id,
+            )
             .await
-            .expect("read network attachment")
-            .expect("network attachment exists");
-        let network_instance = store
-            .network_instance(&network_attachment.network_instance_id)
-            .await
-            .expect("read network instance")
-            .expect("network instance exists");
-        assert_eq!(
-            driver_state(&network_instance)
-                .expect("netd state")
-                .helper_pid,
-            helper_pid
-        );
+            .expect("instance")
+            .expect("present");
+        let identity = crate::network::netd_driver::instance_process_identity(&instance)
+            .expect("identity")
+            .expect("live worker");
+        assert!(matches!(
+            nix::sys::wait::waitpid(
+                nix::unistd::Pid::from_raw(identity.pid()),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+            ),
+            Err(nix::errno::Errno::ECHILD)
+        ));
+        drop(attachment);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::supervisor::process::ProcessIdentity::for_pid(identity.pid())
+            .expect("probe")
+            .is_some()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker not reaped after owner EOF"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
 
         crate::network::reconcile_network_runtime(&paths, &store, &metadata, false)
             .await
             .expect("clean netd runtime");
-        let helper_gone = ProcessIdentity::for_pid(helper_pid)
-            .expect("inspect cleaned netd process")
-            .is_none_or(|helper| !helper.is_alive().expect("check cleaned netd process"));
-        assert!(
-            helper_gone,
-            "netd pid {helper_pid} still alive after cleanup"
-        );
     }
 }

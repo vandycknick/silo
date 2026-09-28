@@ -24,6 +24,7 @@ pub const ENV_STARTPIPE: &str = "_VM_STARTPIPE";
 pub const ENV_SYNCPIPE: &str = "_VM_SYNCPIPE";
 pub const ENV_MACHINE_LOG_DIR: &str = "_VM_MACHINE_LOG_DIR";
 pub const ENV_MACHINE_LOCK: &str = "_VM_MACHINE_LOCK";
+pub const ENV_NETD_EXIT: &str = "_VM_NETD_EXIT";
 
 #[derive(Clone, Copy, Debug)]
 pub struct InheritedPipeFds {
@@ -31,16 +32,35 @@ pub struct InheritedPipeFds {
     pub syncpipe: Option<RawFd>,
     pub machine_log_dir: Option<RawFd>,
     pub machine_lock: Option<RawFd>,
+    pub netd_exit: Option<RawFd>,
 }
 
 impl InheritedPipeFds {
     pub fn from_env() -> eyre::Result<Self> {
-        Ok(Self {
+        let fds = Self {
             startpipe: parse_env_fd(ENV_STARTPIPE)?,
             syncpipe: parse_env_fd(ENV_SYNCPIPE)?,
             machine_log_dir: parse_env_fd(ENV_MACHINE_LOG_DIR)?,
             machine_lock: parse_env_fd(ENV_MACHINE_LOCK)?,
-        })
+            netd_exit: parse_env_fd(ENV_NETD_EXIT)?,
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for fd in [
+            fds.startpipe,
+            fds.syncpipe,
+            fds.machine_log_dir,
+            fds.machine_lock,
+            fds.netd_exit,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            eyre::ensure!(
+                fd > 2 && seen.insert(fd),
+                "inherited descriptors must be distinct and above stderr"
+            );
+        }
+        Ok(fds)
     }
 
     pub fn require_for_daemon(self) -> eyre::Result<Self> {
@@ -59,6 +79,7 @@ impl InheritedPipeFds {
             self.syncpipe,
             self.machine_log_dir,
             self.machine_lock,
+            self.netd_exit,
         ]
         .into_iter()
         .flatten()
@@ -66,6 +87,27 @@ impl InheritedPipeFds {
             set_cloexec(fd, false).map_err(|err| eyre::eyre!("clear CLOEXEC on fd {fd}: {err}"))?;
         }
         Ok(())
+    }
+
+    pub fn take_netd_exit(self) -> eyre::Result<Option<File>> {
+        let Some(fd) = self.netd_exit else {
+            return Ok(None);
+        };
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let stat = nix::sys::stat::fstat(borrowed)?;
+        eyre::ensure!(
+            nix::sys::stat::SFlag::from_bits_truncate(stat.st_mode)
+                .contains(nix::sys::stat::SFlag::S_IFIFO),
+            "netd lifetime descriptor is not a pipe"
+        );
+        let flags = nix::fcntl::fcntl(borrowed, nix::fcntl::FcntlArg::F_GETFL)?;
+        eyre::ensure!(
+            nix::fcntl::OFlag::from_bits_truncate(flags) & nix::fcntl::OFlag::O_ACCMODE
+                == nix::fcntl::OFlag::O_WRONLY,
+            "netd lifetime descriptor is not a writer"
+        );
+        set_cloexec(fd, true)?;
+        Ok(Some(unsafe { File::from_raw_fd(fd) }))
     }
 
     pub fn take_machine_lock(self) -> eyre::Result<Option<File>> {
@@ -1011,6 +1053,7 @@ mod tests {
             syncpipe: Some(sync_write.as_raw_fd()),
             machine_log_dir: None,
             machine_lock: None,
+            netd_exit: None,
         }
         .clear_cloexec()
         .expect("preserve inherited pipes");
@@ -1024,6 +1067,52 @@ mod tests {
             assert!(!nix::fcntl::FdFlag::from_bits_retain(flags)
                 .contains(nix::fcntl::FdFlag::FD_CLOEXEC));
         }
+    }
+
+    #[test]
+    fn netd_lifetime_writer_is_owned_and_not_inherited_by_exec_children() {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        let (mut reader, writer) = std::io::pipe().expect("pipe");
+        let fd = writer.into_raw_fd();
+        let inherited = crate::startup::InheritedPipeFds {
+            startpipe: None,
+            syncpipe: None,
+            machine_log_dir: None,
+            machine_lock: None,
+            netd_exit: Some(fd),
+        };
+        let lease = inherited
+            .take_netd_exit()
+            .expect("validate writer")
+            .expect("lease");
+        let flags = nix::fcntl::fcntl(&lease, nix::fcntl::FcntlArg::F_GETFD).expect("flags");
+        assert!(
+            nix::fcntl::FdFlag::from_bits_retain(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC)
+        );
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("10")
+            .spawn()
+            .expect("exec child");
+        drop(lease);
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        let mut polls = [nix::poll::PollFd::new(
+            reader.as_fd(),
+            nix::poll::PollFlags::POLLHUP,
+        )];
+        nix::poll::poll(&mut polls, 1000u16).expect("poll");
+        let closed = polls[0]
+            .revents()
+            .expect("events")
+            .contains(nix::poll::PollFlags::POLLHUP);
+        child.kill().expect("kill sleep");
+        child.wait().expect("reap sleep");
+        assert!(
+            closed,
+            "exec child retained lifetime writer {}",
+            reader.as_raw_fd()
+        );
+        assert_eq!(reader.read(&mut [0u8; 1]).expect("EOF"), 0);
     }
 
     #[cfg(target_os = "macos")]
@@ -1042,6 +1131,7 @@ mod tests {
             syncpipe: Some(sync_write.as_raw_fd()),
             machine_log_dir: None,
             machine_lock: None,
+            netd_exit: None,
         }
         .clear_cloexec()
         .expect("preserve inherited pipes");

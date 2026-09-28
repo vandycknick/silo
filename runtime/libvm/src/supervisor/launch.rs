@@ -1,5 +1,6 @@
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -96,6 +97,26 @@ impl VmSupervisor {
             machine_log_dir.as_raw_fd().to_string(),
         );
         command.env(ENV_VM_MACHINE_LOCK, machine_lock.as_raw_fd().to_string());
+
+        // The writer stays CLOEXEC in the caller, including while other VMs
+        // launch concurrently. Only this VMM child receives it.
+        if let Some(writer) = launch.network.exit_writer() {
+            let raw = writer.as_raw_fd();
+            command.env("_VM_NETD_EXIT", raw.to_string());
+            unsafe {
+                command.pre_exec(move || {
+                    let fd = std::os::fd::BorrowedFd::borrow_raw(raw);
+                    nix::fcntl::fcntl(
+                        fd,
+                        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                    )
+                    .map_err(io::Error::other)?;
+                    Ok(())
+                });
+            }
+        } else {
+            command.env_remove("_VM_NETD_EXIT");
+        }
 
         let child = command
             .stdin(Stdio::null())
