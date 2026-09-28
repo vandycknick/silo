@@ -28,8 +28,10 @@ impl NetworkStore for Store {
         network_id: &str,
     ) -> Result<Option<NetworkInstance>, LibVmError> {
         let instance = sqlx::query_as::<_, DbNetworkInstance>(
-            "SELECT id, driver, definition_name, json(attachment_json) AS attachment_json,
-                    json(driver_state_json) AS driver_state_json, state, created_at, modified_at
+            "SELECT id, driver, definition_name,
+                    CASE WHEN json_valid(attachment_json, 8) THEN json(attachment_json) ELSE 'invalid JSONB' END AS attachment_json,
+                    CASE WHEN json_valid(driver_state_json, 8) THEN json(driver_state_json) ELSE 'invalid JSONB' END AS driver_state_json,
+                    state, created_at, modified_at
              FROM network_instances WHERE id = ?1",
         )
         .bind(network_id)

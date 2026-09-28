@@ -887,8 +887,9 @@ pub(super) async fn terminate_instance(
     instance: &NetworkInstance,
     reference: &str,
 ) -> Result<(), LibVmError> {
-    let Some(identity) = instance_process_identity(instance)? else {
-        return Ok(());
+    let identity = match observe_instance_process(instance)? {
+        NetdProcess::Absent | NetdProcess::Replaced { .. } => return Ok(()),
+        NetdProcess::Running(identity) => identity,
     };
     if !identity.is_alive()? {
         return Ok(());
@@ -907,20 +908,54 @@ pub(super) async fn terminate_instance(
 pub(super) fn instance_process_identity(
     instance: &NetworkInstance,
 ) -> Result<Option<ProcessIdentity>, LibVmError> {
+    match observe_instance_process(instance)? {
+        NetdProcess::Absent => Ok(None),
+        NetdProcess::Running(identity) => Ok(Some(identity)),
+        NetdProcess::Replaced { pid, expected, observed } => Err(LibVmError::NetworkRuntime {
+            reference: instance.id.clone(),
+            message: format!("netd pid {pid} belongs to a different process generation (expected {expected}, observed {observed}); no signal will be sent"),
+        }),
+    }
+}
+
+enum NetdProcess {
+    Absent,
+    Replaced {
+        pid: i32,
+        expected: i64,
+        observed: i64,
+    },
+    Running(ProcessIdentity),
+}
+
+fn observe_instance_process(instance: &NetworkInstance) -> Result<NetdProcess, LibVmError> {
     let state = driver_state(instance)?;
-    let Some(identity) = ProcessIdentity::for_pid(state.helper_pid)? else {
-        return Ok(None);
-    };
-    if !identity.matches_started_at(Some(state.helper_started_at)) {
+    if state.helper_pid <= 1 {
         return Err(LibVmError::NetworkRuntime {
             reference: instance.id.clone(),
-            message: format!(
-                "netd pid {} is a different process generation than persisted runtime {}",
-                state.helper_pid, instance.id
-            ),
+            message: "invalid persisted netd PID; refusing cleanup".into(),
         });
     }
-    Ok(Some(identity))
+    let Some(identity) = ProcessIdentity::for_pid(state.helper_pid)? else {
+        return Ok(NetdProcess::Absent);
+    };
+    let observed = identity
+        .started_at()
+        .ok_or_else(|| LibVmError::NetworkRuntime {
+            reference: instance.id.clone(),
+            message: format!(
+                "netd pid {} identity is unavailable; refusing cleanup",
+                state.helper_pid
+            ),
+        })?;
+    if observed != state.helper_started_at {
+        return Ok(NetdProcess::Replaced {
+            pid: state.helper_pid,
+            expected: state.helper_started_at,
+            observed,
+        });
+    }
+    Ok(NetdProcess::Running(identity))
 }
 
 fn driver_state(instance: &NetworkInstance) -> Result<NetdDriverState, LibVmError> {
@@ -934,8 +969,10 @@ fn driver_state(instance: &NetworkInstance) -> Result<NetdDriverState, LibVmErro
 
 fn terminate_helper(identity: &ProcessIdentity) -> Result<(), LibVmError> {
     let process_group = Pid::from_raw(-identity.pid());
-    let _ = kill(process_group, Signal::SIGTERM);
-    Ok(())
+    match kill(process_group, Signal::SIGTERM) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(error) => Err(std::io::Error::from_raw_os_error(error as i32).into()),
+    }
 }
 
 #[cfg(test)]
@@ -1260,10 +1297,10 @@ netd log: /tmp/silo/netd.log";
         assert!(err.to_string().contains("between 1 and 29"));
     }
 
-    #[test]
-    fn netd_identity_rejects_a_live_reused_generation() {
-        let mut child = Command::new("sh")
-            .args(["-c", "while :; do sleep 1; done"])
+    #[tokio::test]
+    async fn netd_identity_rejects_a_live_reused_generation() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
             .spawn()
             .expect("spawn helper");
         let pid = i32::try_from(child.id()).expect("pid fits i32");
@@ -1291,6 +1328,9 @@ netd log: /tmp/silo/netd.log";
         };
 
         assert!(crate::network::netd_driver::instance_process_identity(&instance).is_err());
+        crate::network::netd_driver::terminate_instance(&instance, "stale")
+            .await
+            .expect("stale generation is safe to detach without signalling replacement");
         assert!(child.try_wait().expect("check helper").is_none());
         child.kill().expect("stop helper");
         child.wait().expect("reap helper");

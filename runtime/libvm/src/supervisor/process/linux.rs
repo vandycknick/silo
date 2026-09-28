@@ -21,17 +21,30 @@ impl ProcessIdentity {
         };
 
         match pidfd_open(raw_pid, PidfdFlags::empty()) {
-            Ok(pidfd) => Ok(Some(Self {
-                pid,
-                started_at: process_started_at(pid)?,
-                pidfd: Some(pidfd),
-            })),
+            Ok(pidfd) => {
+                if pidfd_has_exited(&pidfd)? {
+                    return Ok(None);
+                }
+                let Some(started_at) = process_started_at(pid)? else {
+                    return Ok(None);
+                };
+                Ok(Some(Self {
+                    pid,
+                    started_at: Some(started_at),
+                    pidfd: Some(pidfd),
+                }))
+            }
             Err(rustix::io::Errno::SRCH) => Ok(None),
-            Err(_) if pid_exists(pid)? => Ok(Some(Self {
-                pid,
-                started_at: process_started_at(pid)?,
-                pidfd: None,
-            })),
+            Err(_) if pid_exists(pid)? => {
+                let Some(started_at) = process_started_at(pid)? else {
+                    return Ok(None);
+                };
+                Ok(Some(Self {
+                    pid,
+                    started_at: Some(started_at),
+                    pidfd: None,
+                }))
+            }
             Err(_) => Ok(None),
         }
     }
@@ -51,7 +64,8 @@ impl ProcessIdentity {
     pub(crate) fn is_alive(&self) -> io::Result<bool> {
         match self.pidfd.as_ref() {
             Some(pidfd) => Ok(!pidfd_has_exited(pidfd)?),
-            None => pid_exists(self.pid),
+            None => Ok(process_started_at(self.pid)?
+                .is_some_and(|started| Some(started) == self.started_at)),
         }
     }
 }
@@ -69,6 +83,9 @@ fn process_started_at(pid: i32) -> io::Result<Option<i64>> {
             format!("parse process stat {}", path.display()),
         ));
     };
+    if matches!(fields.split_whitespace().next(), Some("Z" | "X")) {
+        return Ok(None);
+    }
     let started_at = fields
         .split_whitespace()
         .nth(19)

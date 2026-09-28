@@ -14,9 +14,12 @@ impl ProcessIdentity {
             return Ok(None);
         }
 
+        let Some(started_at) = process_started_at(pid)? else {
+            return Ok(None);
+        };
         Ok(Some(Self {
             pid,
-            started_at: process_started_at(pid)?,
+            started_at: Some(started_at),
         }))
     }
 
@@ -102,10 +105,17 @@ fn process_started_at(pid: i32) -> io::Result<Option<i64>> {
         return Err(err);
     }
     if result < size as libc::c_int {
-        return Ok(None);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short proc_pidinfo response; process identity is unavailable",
+        ));
     }
 
     let info = unsafe { info.assume_init() };
+    // Darwin's BSD SZOMB state. nix does not expose proc_pidinfo/process status.
+    if info.pbi_status == 5 {
+        return Ok(None);
+    }
     let seconds = i64::try_from(info.pbi_start_tvsec).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -118,7 +128,14 @@ fn process_started_at(pid: i32) -> io::Result<Option<i64>> {
             "process start microseconds overflow i64",
         )
     })?;
-    Ok(seconds
+    seconds
         .checked_mul(1_000_000)
-        .and_then(|value| value.checked_add(micros)))
+        .and_then(|value| value.checked_add(micros))
+        .map(Some)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process start timestamp overflow",
+            )
+        })
 }

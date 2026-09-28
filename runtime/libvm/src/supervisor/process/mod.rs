@@ -87,7 +87,7 @@ fn errno_to_io(err: rustix::io::Errno) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{identity_is_alive, ProcessIdentity};
+    use crate::supervisor::process::{identity_is_alive, ProcessIdentity};
 
     #[test]
     fn current_process_identity_matches_itself() {
@@ -98,6 +98,34 @@ mod tests {
 
         assert_eq!(identity.pid(), pid);
         assert!(identity_is_alive(&identity).expect("check current process identity"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn exited_unreaped_child_is_not_alive() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn");
+        let pid = i32::try_from(child.id()).expect("pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let absent = loop {
+            if ProcessIdentity::for_pid(pid)
+                .expect("probe child")
+                .is_none()
+            {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        // kill(pid, 0) still sees the zombie. Reap only after observing it.
+        let still_registered = crate::supervisor::process::pid_exists(pid).expect("kill probe");
+        child.wait().expect("reap our child");
+        assert!(absent, "zombie was treated as a live process");
+        assert!(still_registered);
     }
 
     #[test]
