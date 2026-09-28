@@ -88,6 +88,22 @@ pub(crate) trait MachineStore: std::fmt::Debug + Send + Sync {
     /// Lists all machine configs sorted by machine name.
     async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError>;
 
+    /// Enumerate indexed identities even when one configuration cannot decode.
+    async fn machine_inventory(
+        &self,
+    ) -> Result<Vec<crate::store::machine_store::InventoryRecord>, LibVmError> {
+        Ok(self
+            .list_machine_configs()
+            .await?
+            .into_iter()
+            .map(|config| crate::store::machine_store::InventoryRecord {
+                id: config.id.to_string(),
+                name: config.name.clone(),
+                config: Ok(config),
+            })
+            .collect())
+    }
+
     /// Removes a machine config and runtime state.
     ///
     /// Network attachments are removed by the database foreign-key cascade.

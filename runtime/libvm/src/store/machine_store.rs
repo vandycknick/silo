@@ -7,8 +7,33 @@ use crate::store::row::{DbMachineConfig, DbMachineState};
 use crate::store::{MachineStore, Store};
 use crate::LibVmError;
 
+pub(crate) struct InventoryRecord {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) config: Result<MachineConfig, LibVmError>,
+}
+
 #[async_trait]
 impl MachineStore for Store {
+    async fn machine_inventory(&self) -> Result<Vec<InventoryRecord>, LibVmError> {
+        use sqlx::FromRow;
+        // Guard JSON conversion per row: malformed JSONB must not abort the
+        // entire SELECT before we can retain its indexed identity.
+        let rows = sqlx::query("SELECT id, name, CASE WHEN json_valid(config_json, 8) THEN json(config_json) ELSE '{}' END AS config_json FROM machine_config ORDER BY name")
+            .fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(InventoryRecord {
+                    id: row.try_get("id")?,
+                    name: row.try_get("name")?,
+                    config: DbMachineConfig::from_row(&row)
+                        .map(|DbMachineConfig(config)| config)
+                        .map_err(Into::into),
+                })
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     async fn add_machine(
         &self,

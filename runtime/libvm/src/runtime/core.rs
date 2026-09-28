@@ -183,7 +183,9 @@ impl Runtime {
             image_pull_policy: ImagePullPolicy::default(),
             image_progress: None,
         };
-        runtime.refresh_machine_states().await?;
+        // Opening an installation must not depend on any individual VM's
+        // runtime artifacts. Observation belongs to inspect; repair belongs to
+        // the selected machine's lifecycle operations.
         Ok(runtime)
     }
 
@@ -289,6 +291,36 @@ impl Runtime {
         Ok(Machine::new(self.clone(), config.id))
     }
 
+    /// Read-only, best-effort inventory. Global database errors remain fatal;
+    /// individual invalid configurations retain their indexed identity.
+    pub async fn inventory(&self) -> Result<Vec<crate::MachineInventoryEntry>, LibVmError> {
+        let mut entries = Vec::new();
+        for record in self.store.machine_inventory().await? {
+            let result = match record.config {
+                Ok(config) => self.machine_inspect_data(config).await,
+                Err(error) => Err(error),
+            };
+            let (data, issues) = match result {
+                Ok(data) => (Some(data), Vec::new()),
+                Err(error) if error.is_machine_observation_error() => (
+                    None,
+                    vec![crate::MachineIssue::new(
+                        crate::MachineIssueComponent::Configuration,
+                        error,
+                    )],
+                ),
+                Err(error) => return Err(error),
+            };
+            entries.push(crate::MachineInventoryEntry {
+                id: record.id,
+                name: record.name,
+                data,
+                issues,
+            });
+        }
+        Ok(entries)
+    }
+
     /// Lists known machines as operable handles.
     pub async fn list_machines(&self) -> Result<Vec<Machine>, LibVmError> {
         let configs = self.list_machine_configs().await?;
@@ -299,11 +331,7 @@ impl Runtime {
     }
 
     pub(crate) async fn list_machine_configs(&self) -> Result<Vec<MachineConfig>, LibVmError> {
-        let machines = self.store.list_machine_configs().await?;
-        for config in &machines {
-            self.reconcile_machine_runtime_best_effort(config).await?;
-        }
-        Ok(machines)
+        self.store.list_machine_configs().await
     }
 
     pub(crate) async fn materialize_image(
@@ -682,19 +710,6 @@ impl Runtime {
             self.store.save_machine_state(&observed).await?;
         }
         Ok(RuntimeStatus::from_machine_state(&observed))
-    }
-
-    async fn refresh_machine_states(&self) -> Result<(), LibVmError> {
-        for config in self.store.list_machine_configs().await? {
-            let Some(_lock) = self.try_acquire_machine_lock(config.lock_id)? else {
-                continue;
-            };
-            let status = self.reconcile_machine_runtime_locked(&config).await?;
-            if status.is_active() {
-                reconcile_network_runtime(&self.paths, self.store.as_ref(), &config, true).await?;
-            }
-        }
-        Ok(())
     }
 
     async fn observe_machine_state(
@@ -1269,57 +1284,112 @@ impl Runtime {
         &self,
         config: MachineConfig,
     ) -> Result<MachineData, LibVmError> {
-        let runtime_status = self.reconcile_machine_runtime_best_effort(&config).await?;
-        let state = self.machine_state(config.id).await?;
-        let (status, boot_report, provision_report) = if runtime_status.is_running() {
-            match self.supervisor.client(config.id).status().await {
-                Ok(response) => {
-                    let (boot_report, provision_report) = response
-                        .agent
-                        .as_ref()
-                        .and_then(|agent| match agent.mode.as_ref() {
-                            Some(protocol::v1::host_agent::Mode::Enabled(enabled)) => enabled
-                                .status
-                                .as_ref()
-                                .and_then(|status| status.report.as_ref()),
-                            _ => None,
-                        })
-                        .map(|report| {
-                            (
-                                report
-                                    .boot
-                                    .clone()
-                                    .map(crate::machine::MachineBootReport::from_protocol),
-                                report
-                                    .provisioning
-                                    .clone()
-                                    .map(crate::machine::MachineProvisionReport::from_protocol),
-                            )
-                        })
-                        .unwrap_or((None, None));
-                    (
-                        MachineStatus::from_protocol(response),
-                        boot_report,
-                        provision_report,
-                    )
-                }
-                Err(message) => (
-                    MachineStatus::running_with_message(format!(
-                        "silo-vmm get_status failed: {message}"
-                    )),
-                    None,
-                    None,
-                ),
-            }
-        } else {
-            (
-                MachineStatus::from_machine_state(state.status, state.last_error.clone()),
-                None,
-                None,
-            )
-        };
+        use crate::machine::{MachineIssue, MachineIssueComponent, MachineObservation};
 
-        let rootfs = self.store.machine_rootfs(config.id).await?;
+        let mut issues = Vec::new();
+        let persisted = match self.store.machine_state(config.id).await {
+            Ok(state) => state,
+            Err(error) if error.is_machine_observation_error() => {
+                issues.push(MachineIssue::new(MachineIssueComponent::Lifecycle, error));
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let (state, observation) = match self
+            .observe_machine_state(&config, persisted.as_ref())
+            .await
+        {
+            Ok(state) if issues.is_empty() => (state, MachineObservation::Observed),
+            result => {
+                if let Err(error) = result {
+                    if !error.is_machine_observation_error() {
+                        return Err(error);
+                    }
+                    issues.push(MachineIssue::new(MachineIssueComponent::Lifecycle, error));
+                }
+                let observation = if persisted.is_some() {
+                    MachineObservation::LastKnown
+                } else {
+                    MachineObservation::Unavailable
+                };
+                (
+                    persisted.unwrap_or_else(|| stopped_machine_state(config.id, None)),
+                    observation,
+                )
+            }
+        };
+        let runtime_status = RuntimeStatus::from_machine_state(&state);
+        if let Err(error) =
+            crate::network::observe_network_runtime(self.store.as_ref(), config.id).await
+        {
+            if !error.is_machine_observation_error() {
+                return Err(error);
+            }
+            issues.push(MachineIssue::new(MachineIssueComponent::Network, error));
+        }
+        let (status, boot_report, provision_report) =
+            if runtime_status.is_running() && observation == MachineObservation::Observed {
+                match self.supervisor.client(config.id).status().await {
+                    Ok(response) => {
+                        let (boot_report, provision_report) = response
+                            .agent
+                            .as_ref()
+                            .and_then(|agent| match agent.mode.as_ref() {
+                                Some(protocol::v1::host_agent::Mode::Enabled(enabled)) => enabled
+                                    .status
+                                    .as_ref()
+                                    .and_then(|status| status.report.as_ref()),
+                                _ => None,
+                            })
+                            .map(|report| {
+                                (
+                                    report
+                                        .boot
+                                        .clone()
+                                        .map(crate::machine::MachineBootReport::from_protocol),
+                                    report
+                                        .provisioning
+                                        .clone()
+                                        .map(crate::machine::MachineProvisionReport::from_protocol),
+                                )
+                            })
+                            .unwrap_or((None, None));
+                        (
+                            MachineStatus::from_protocol(response),
+                            boot_report,
+                            provision_report,
+                        )
+                    }
+                    Err(message) => {
+                        issues.push(MachineIssue::new(
+                            MachineIssueComponent::Telemetry,
+                            &message,
+                        ));
+                        (
+                            MachineStatus::running_with_message(format!(
+                                "silo-vmm get_status failed: {message}"
+                            )),
+                            None,
+                            None,
+                        )
+                    }
+                }
+            } else {
+                (
+                    MachineStatus::from_machine_state(state.status, state.last_error.clone()),
+                    None,
+                    None,
+                )
+            };
+
+        let rootfs = match self.store.machine_rootfs(config.id).await {
+            Ok(rootfs) => rootfs,
+            Err(error) if error.is_machine_observation_error() => {
+                issues.push(MachineIssue::new(MachineIssueComponent::Rootfs, error));
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let run_id = runtime_status
             .is_running()
             .then(|| {
@@ -1329,7 +1399,7 @@ impl Runtime {
                     .map(crate::machine::MachineRunId::from_raw)
             })
             .flatten();
-        Ok(MachineData::from_models_with_status(
+        let mut data = MachineData::from_models_with_status(
             config,
             rootfs,
             status,
@@ -1337,7 +1407,10 @@ impl Runtime {
             boot_report,
             provision_report,
             state,
-        ))
+        );
+        data.observation = observation;
+        data.issues = issues;
+        Ok(data)
     }
 }
 
@@ -2961,6 +3034,73 @@ mod tests {
         machine_ref: MachineRef,
     ) -> Result<crate::MachineData, LibVmError> {
         runtime.get_machine(&machine_ref).await?.inspect().await
+    }
+
+    #[tokio::test]
+    async fn inventory_retains_broken_machine_and_does_not_repair_it() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .expect("runtime");
+        let broken = create_pending_sample(&runtime, "broken")
+            .await
+            .expect("prepare")
+            .commit(&runtime)
+            .await
+            .expect("commit");
+        create_pending_sample(&runtime, "healthy")
+            .await
+            .expect("prepare")
+            .commit(&runtime)
+            .await
+            .expect("commit");
+        runtime
+            .paths
+            .ensure_machine_run_dir(broken.id)
+            .expect("run dir");
+        let pid_path = runtime.paths.machine(broken.id).vmm_pid_path();
+        std::fs::write(&pid_path, "not a pid").expect("bad pid");
+        let reopened = Runtime::open(paths, RuntimeNetworkingConfig::default())
+            .await
+            .expect("opening is independent of VM state");
+        let entries = reopened.inventory().await.expect("inventory");
+        assert_eq!(entries.len(), 2);
+        let data = entries[0].data.as_ref().expect("partial details");
+        assert!(!data.issues.is_empty());
+        assert_ne!(data.observation, crate::MachineObservation::Observed);
+        assert!(entries[1].data.as_ref().expect("healthy").issues.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(pid_path).expect("still present"),
+            "not a pid"
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_retains_corrupt_configuration_identity() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let runtime = Runtime::open(paths.clone(), RuntimeNetworkingConfig::default())
+            .await
+            .expect("runtime");
+        create_pending_sample(&runtime, "broken")
+            .await
+            .expect("prepare")
+            .commit(&runtime)
+            .await
+            .expect("commit");
+        let store = Store::open(&paths.state_db_path()).await.expect("store");
+        store
+            .execute_test_sql("UPDATE machine_config SET config_json = x'00' WHERE name = 'broken'")
+            .await
+            .expect("corrupt record");
+        let entries = runtime.inventory().await.expect("inventory");
+        assert_eq!(entries[0].name, "broken");
+        assert!(entries[0].data.is_none());
+        assert_eq!(
+            entries[0].issues[0].component,
+            crate::MachineIssueComponent::Configuration
+        );
     }
 
     #[tokio::test]

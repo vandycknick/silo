@@ -27,7 +27,8 @@ pub use forward::{
 pub use guest::{GuestBuilder, MachineAgent, MachineGuestConfig, MachineUserConfig};
 pub use handle::Machine;
 pub use inspect::{
-    MachineBootMode, MachineBootReport, MachineData, MachineProvisionFailurePolicy,
+    MachineBootMode, MachineBootReport, MachineData, MachineInventoryEntry, MachineIssue,
+    MachineIssueComponent, MachineObservation, MachineProvisionFailurePolicy,
     MachineProvisionReport, MachineProvisionStatus, MachineProvisionStepReport,
     MachineProvisionStepStatus, MachineRootfs, MachineStatus,
 };

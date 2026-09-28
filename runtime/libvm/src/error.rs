@@ -224,6 +224,23 @@ pub enum LibVmError {
 }
 
 impl LibVmError {
+    /// Only used at an individual machine's observation boundary. Database-wide
+    /// failures must never be downgraded to a machine warning.
+    pub(crate) fn is_machine_observation_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Io(_)
+                | Self::InvalidOwnedPath { .. }
+                | Self::CorruptState { .. }
+                | Self::StateDecode { .. }
+                | Self::NetworkRuntime { .. }
+                | Self::MonitorConnection { .. }
+                | Self::MonitorProtocol { .. }
+                | Self::InvalidMachineConfig { .. }
+                | Self::Database(sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_))
+        )
+    }
+
     /// Returns the stable Rust variant name for language bindings.
     ///
     /// This match deliberately remains exhaustive so adding an error variant

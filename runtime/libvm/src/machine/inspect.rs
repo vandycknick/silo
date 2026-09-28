@@ -58,6 +58,50 @@ impl From<MachineRootfsRecord> for MachineRootfs {
     }
 }
 
+/// Whether the lifecycle in a snapshot was observed or is only a persisted fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachineObservation {
+    Observed,
+    LastKnown,
+    Unavailable,
+}
+
+/// The component whose observation failed. This is not a connectivity verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachineIssueComponent {
+    Lifecycle,
+    Telemetry,
+    Network,
+    Rootfs,
+    Configuration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MachineIssue {
+    pub component: MachineIssueComponent,
+    pub message: String,
+}
+
+impl MachineIssue {
+    pub(crate) fn new(component: MachineIssueComponent, error: impl std::fmt::Display) -> Self {
+        Self {
+            component,
+            message: error.to_string(),
+        }
+    }
+}
+
+/// An inventory entry retains indexed identity even if its configuration is corrupt.
+#[derive(Debug, Clone)]
+pub struct MachineInventoryEntry {
+    pub id: String,
+    pub name: String,
+    pub data: Option<MachineData>,
+    pub issues: Vec<MachineIssue>,
+}
+
 /// Public machine snapshot returned by inspect and mutation operations.
 ///
 /// `MachineData` is an owned read model, not a live handle and not a SQLite
@@ -112,6 +156,11 @@ pub struct MachineData {
     /// silo-vmm telemetry failure does not fail the whole inspect call; it is
     /// reported here as a non-ready running status message instead.
     pub status: MachineStatus,
+    /// Whether `status` is observed or only a last-known value. Never treat a
+    /// last-known status as proof that a VM is running or stopped.
+    pub observation: MachineObservation,
+    /// Best-effort observation failures, independent of VM lifecycle/readiness.
+    pub issues: Vec<MachineIssue>,
     /// The current silo-vmm run while the machine is running. Pass it to
     /// `stop_run`/`wait_for_run` to act on exactly this run.
     pub run_id: Option<MachineRunId>,
@@ -156,6 +205,8 @@ impl MachineData {
             network: config.network.into(),
             guest: config.guest,
             status,
+            observation: MachineObservation::Observed,
+            issues: Vec::new(),
             run_id,
             boot_report,
             provision_report,

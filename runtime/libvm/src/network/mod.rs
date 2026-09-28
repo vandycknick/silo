@@ -124,6 +124,39 @@ pub(crate) async fn prepare_network_runtime(
     }
 }
 
+/// Observe persisted attachment identity without detaching, signalling, or
+/// repairing anything. A missing helper does not change VM lifecycle.
+pub(crate) async fn observe_network_runtime(
+    store: &dyn DataStore,
+    machine_id: MachineId,
+) -> Result<(), LibVmError> {
+    let Some(attachment) = store.network_attachment(machine_id).await? else {
+        return Ok(());
+    };
+    let Some(instance) = store
+        .network_instance(&attachment.network_instance_id)
+        .await?
+    else {
+        return Err(LibVmError::NetworkRuntime {
+            reference: machine_id.to_string(),
+            message: format!(
+                "attachment references missing network {}",
+                attachment.network_instance_id
+            ),
+        });
+    };
+    if !network_instance_is_alive(&instance)? {
+        return Err(LibVmError::NetworkRuntime {
+            reference: machine_id.to_string(),
+            message: format!(
+                "network {} has no live helper; persisted attachment requires cleanup",
+                instance.id
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) async fn reconcile_network_runtime(
     paths: &LocalPaths,
     store: &dyn DataStore,
