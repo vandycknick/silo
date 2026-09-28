@@ -6,6 +6,27 @@ import (
 	"testing"
 )
 
+func TestManagedDescriptorContract(t *testing.T) {
+	for _, args := range [][]string{
+		{"--daemonize"}, {"--startup-fd=5"}, {"--exit-fd=6"},
+		{"--startup-fd=0", "--exit-fd=6"}, {"--startup-fd=5", "--exit-fd=5"},
+		{"--startup-fd=3", "--exit-fd=6"}, {"--startup-fd=-2"},
+		{"--daemonize", "unexpected-positional-argument"},
+	} {
+		if _, err := Parse(append(configArgs(t), args...)); err == nil {
+			t.Fatalf("accepted invalid arguments %v", args)
+		}
+	}
+	cfg := parseConfig(t, "--daemonize", "--startup-fd=5", "--exit-fd=6")
+	if !cfg.Daemonize || cfg.StartupFD != 5 || cfg.ExitFD != 6 {
+		t.Fatalf("unexpected managed config: %+v", cfg)
+	}
+	cfg = parseConfig(t)
+	if cfg.Daemonize || cfg.StartupFD != -1 || cfg.ExitFD != -1 {
+		t.Fatal("foreground worker unexpectedly managed")
+	}
+}
+
 func TestParseWithoutStaticLeaseHasNoGuestLeaseOrForwards(t *testing.T) {
 	cfg := parseConfig(t)
 	if len(cfg.Stack.DHCPStaticLeases) != 0 {

@@ -7,7 +7,7 @@
 //!        ▲    │ error                                   health, metrics, │
 //!        └────┘ back off                                 update checks   │
 //!                                                                        ▼
-//!                                                     SIGINT/SIGTERM: stop VM
+//!                                                     SIGINT/SIGTERM: detach
 //! ```
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
@@ -207,10 +207,10 @@ impl Supervisor {
     async fn run(&mut self, shutdown: &mut Shutdown) -> eyre::Result<()> {
         loop {
             let Some(active) = self.start(shutdown).await? else {
-                return self.cancelled().await;
+                return self.detach();
             };
             match self.supervise(&active, shutdown).await? {
-                Next::Shutdown => return self.stop(active).await,
+                Next::Shutdown => return self.detach(),
                 Next::Restart => {}
             }
         }
@@ -428,7 +428,7 @@ impl Supervisor {
         };
         match qualified {
             None => {
-                // Best effort: shutdown must still stop the active VM, and the next
+                // Best effort: the next
                 // start removes whatever is left.
                 if let Err(error) =
                     crate::upgrade::remove_abandoned_qualifications(runtime, &self.paths).await
@@ -499,40 +499,17 @@ impl Supervisor {
         append_log(&self.paths, &format!("{what}: {error:#}"))
     }
 
-    async fn stop(&mut self, active: Active) -> eyre::Result<()> {
-        self.status.phase = DaemonPhase::Stopping;
-        publish(&self.paths, &mut self.status)?;
-        stop_engine(&active.machine).await;
-        active.machine.stop().await?;
+    fn detach(&mut self) -> eyre::Result<()> {
+        // Restarting the management process is not a request to stop the VM.
+        // `silo daemon stop` separately invokes silod --stop after service exit.
         self.status.phase = DaemonPhase::Stopped;
-        self.status.run_id = None;
         publish(&self.paths, &mut self.status)?;
-        append_log(&self.paths, "system daemon stopped")
-    }
-
-    /// Stops the VM even when startup never got as far as recording it; otherwise an
-    /// interrupted first start leaves it running unattended.
-    async fn cancelled(&mut self) -> eyre::Result<()> {
-        self.status.phase = DaemonPhase::Stopping;
-        publish(&self.paths, &mut self.status)?;
-        if let (Some(runtime), Some(record)) =
-            (self.runtime.as_mut(), DaemonRecord::load(&self.paths)?)
-        {
-            let stopped =
-                crate::provision::stop_system_machine(runtime, &record, Duration::from_secs(60))
-                    .await
-                    .context("startup cancellation could not stop the system VM")?;
-            self.status.machine_id = stopped;
-        }
-        self.status.phase = DaemonPhase::Stopped;
-        self.status.run_id = None;
-        publish(&self.paths, &mut self.status)?;
-        append_log(&self.paths, "system daemon cancelled during startup")
+        append_log(&self.paths, "system daemon detached; VM remains running")
     }
 }
 
-/// Stops every live VM this installation owns, for a controller that found no
-/// daemon left to do it: silod exited without stopping its VM, or was killed.
+/// Explicitly stops every live VM this installation owns after its management
+/// process has detached. Ordinary daemon restarts do not call this operation.
 /// The caller holds the lifetime lock.
 pub(crate) async fn stop_installation(
     paths: &SystemPaths,
@@ -803,6 +780,41 @@ mod tests {
         apply_guest_memory_reclaim, describe_guest_memory_reclaim, error_causes, error_summary,
         initial_host_memory_reclaim_effective, startup_retry_delay, LifetimeLock,
     };
+
+    #[test]
+    fn manager_detach_preserves_the_vm_generation_without_a_runtime() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths =
+            crate::paths::SystemPaths::new(temp.path().join("home"), temp.path().join("run"));
+        let desired = crate::config::resolve(
+            &silod_spec::arguments::SystemOverrides::default(),
+            temp.path(),
+            &paths.docker_socket(),
+            None,
+        )
+        .expect("config");
+        let mut status = crate::supervisor::initial_status(&paths.docker_socket()).expect("status");
+        status.machine_id = Some("existing-vm".into());
+        status.run_id = Some("existing-run".into());
+        let mut supervisor = crate::supervisor::Supervisor {
+            runtime_config: libvm::RuntimeConfig::local(paths.home()),
+            paths,
+            desired,
+            runtime: None,
+            status,
+            rejected: std::collections::BTreeSet::new(),
+            next_update_check: tokio::time::Instant::now(),
+        };
+        supervisor
+            .detach()
+            .expect("detach does not require or mutate a VM runtime");
+        assert_eq!(supervisor.status.machine_id.as_deref(), Some("existing-vm"));
+        assert_eq!(supervisor.status.run_id.as_deref(), Some("existing-run"));
+        assert_eq!(
+            supervisor.status.phase,
+            silod_spec::status::DaemonPhase::Stopped
+        );
+    }
 
     #[test]
     fn error_causes_list_each_distinct_cause_once() {

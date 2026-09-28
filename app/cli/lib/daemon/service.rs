@@ -108,7 +108,8 @@ pub(crate) fn down(paths: &DaemonPaths, executable: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
-/// silod holds its lifetime lock until it has stopped the VM and exits.
+/// silod holds its lifetime lock until it has detached and exited. Explicit
+/// installation shutdown runs separately after this wait.
 fn wait_for_exit(paths: &DaemonPaths, timeout: Duration) -> eyre::Result<()> {
     let deadline = Instant::now() + timeout;
     while !lifetime_lock_is_free(&paths.lifetime_lock())? {
@@ -470,7 +471,7 @@ fn render_native(
         .collect::<eyre::Result<Vec<_>>>()?
         .join(" ");
     Ok(format!(
-        "# Managed by Silo\n# {marker}\n[Unit]\nDescription=Silo system VM manager\nStartLimitIntervalSec=60\nStartLimitBurst=3\n\n[Service]\nType=exec\nExecStart={}\nRestart=on-failure\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=90\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
+        "# Managed by Silo\n# {marker}\n[Unit]\nDescription=Silo system VM manager\nStartLimitIntervalSec=60\nStartLimitBurst=3\n\n[Service]\nType=exec\nExecStart={}\nRestart=on-failure\nRestartSec=5\nKillMode=process\nTimeoutStopSec=90\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
         command
     ).into_bytes())
 }
@@ -524,8 +525,9 @@ fn render_native(
         })
         .collect::<eyre::Result<Vec<_>>>()?
         .concat();
-    // Mirrors the systemd unit: restart only on failure, allow 90s for a graceful VM
-    // shutdown before SIGKILL, and keep created files private. Standard scheduling
+    // Restart only on failure and allow the manager to detach before SIGKILL.
+    // VM shutdown is an explicit operation, not a service-lifetime side effect.
+    // Keep created files private. Standard scheduling
     // avoids imposing background CPU/I/O restrictions on the VM's inherited policy.
     // Process output goes to a file so panics and pre-status failures are diagnosable;
     // launchd has no journal for user agents.
@@ -545,6 +547,7 @@ fn render_native(
             "\t<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t</dict>\n",
             "\t<key>ThrottleInterval</key>\n\t<integer>5</integer>\n",
             "\t<key>ExitTimeOut</key>\n\t<integer>90</integer>\n",
+            "\t<key>AbandonProcessGroup</key>\n\t<true/>\n",
             "\t<key>ProcessType</key>\n\t<string>Standard</string>\n",
             "\t<key>Umask</key>\n\t<integer>63</integer>\n",
             "\t<key>StandardOutPath</key>\n\t<string>{native_log}</string>\n",
@@ -1033,6 +1036,7 @@ mod tests {
             "<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>"
         ));
         assert!(plist.contains("<key>ExitTimeOut</key>\n\t<integer>90</integer>"));
+        assert!(plist.contains("<key>AbandonProcessGroup</key>\n\t<true/>"));
         assert!(plist.contains("<key>StandardErrorPath</key>\n\t<string>/Users/me/.silo/logs/daemon/native.log</string>"));
         assert!(plist.contains("<key>ProcessType</key>\n\t<string>Standard</string>"));
         assert!(plist.contains("<key>Umask</key>\n\t<integer>63</integer>"));

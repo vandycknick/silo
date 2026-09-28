@@ -34,8 +34,8 @@ use crate::supervisor::process::{self, ProcessIdentity};
 use crate::utils::now_unix;
 use crate::{LibVmError, NetdRuntimeConfig};
 
-use super::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
-use super::{mac_from_machine_id, serialize_json, DRIVER_NETD};
+use crate::network::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
+use crate::network::{mac_from_machine_id, serialize_json, VmmNetworkAttachment, DRIVER_NETD};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -81,7 +81,7 @@ impl NetworkDriverBackend for NetdDriver {
         &self,
         ctx: &NetworkDriverContext<'_>,
         request: &NetworkAttachmentRequest<'_>,
-    ) -> Result<super::VmmNetworkAttachment, LibVmError> {
+    ) -> Result<VmmNetworkAttachment, LibVmError> {
         prepare_netd_runtime(ctx, request).await
     }
 }
@@ -90,7 +90,7 @@ impl NetworkDriverBackend for NetdDriver {
 async fn prepare_netd_runtime(
     ctx: &NetworkDriverContext<'_>,
     request: &NetworkAttachmentRequest<'_>,
-) -> Result<super::VmmNetworkAttachment, LibVmError> {
+) -> Result<VmmNetworkAttachment, LibVmError> {
     let paths = ctx.paths;
     let store = ctx.store;
     let metadata = ctx.metadata;
@@ -241,7 +241,7 @@ async fn prepare_netd_runtime(
         })?;
     startup.worker = Some(identity);
 
-    let network = super::VmmNetworkAttachment::UnixDatagram {
+    let network = VmmNetworkAttachment::UnixDatagram {
         path: socket_path.clone(),
         mac: mac.clone(),
         ipv4,
@@ -250,8 +250,8 @@ async fn prepare_netd_runtime(
         exit_writer: None,
     };
     let (ipv4, dns) = match &network {
-        super::VmmNetworkAttachment::UnixDatagram { ipv4, dns, .. } => (ipv4.clone(), dns.clone()),
-        super::VmmNetworkAttachment::None => {
+        VmmNetworkAttachment::UnixDatagram { ipv4, dns, .. } => (ipv4.clone(), dns.clone()),
+        VmmNetworkAttachment::None => {
             return Err(LibVmError::NetworkRuntime {
                 reference: metadata.name.clone(),
                 message: "netd created an invalid network attachment".to_string(),
@@ -319,7 +319,7 @@ async fn prepare_netd_runtime(
 async fn prepare_netd_runtime(
     _ctx: &NetworkDriverContext<'_>,
     _request: &NetworkAttachmentRequest<'_>,
-) -> Result<super::VmmNetworkAttachment, LibVmError> {
+) -> Result<VmmNetworkAttachment, LibVmError> {
     let metadata = _ctx.metadata;
     Err(LibVmError::NetworkRuntime {
         reference: metadata.name.clone(),
@@ -874,6 +874,14 @@ fn append_bounded_stderr_line(captured: &mut CapturedStderrLines, line: String) 
     }
     captured.byte_len = captured.byte_len.saturating_add(line_len);
     captured.lines.push_back(line);
+}
+
+pub(super) fn instance_description(instance: &NetworkInstance) -> Result<String, LibVmError> {
+    let state = driver_state(instance)?;
+    Ok(format!(
+        "netd pid {}, started {}, run {}",
+        state.helper_pid, state.helper_started_at, state.run_id
+    ))
 }
 
 pub(super) fn instance_is_alive(instance: &NetworkInstance) -> Result<bool, LibVmError> {

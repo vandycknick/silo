@@ -106,7 +106,7 @@ pub struct MachineInventoryEntry {
 ///
 /// `MachineData` is an owned read model, not a live handle and not a SQLite
 /// storage model. It intentionally flattens persisted machine configuration,
-/// reconciled lifecycle state, and best-effort silo-vmm telemetry so callers do not
+/// observed lifecycle state, and best-effort silo-vmm telemetry so callers do not
 /// depend on libvm's private `store::models` module.
 ///
 /// Callers should treat this as a point-in-time snapshot. To perform lifecycle
@@ -148,13 +148,11 @@ pub struct MachineData {
     pub network: MachineNetworkConfig,
     /// Durable guest behavior owned by libvm.
     pub guest: MachineGuestConfig,
-    /// Reconciled lifecycle status for the machine.
-    ///
-    /// `Machine::inspect` always reconciles persisted state with the local silo-vmm
-    /// process first. When silo-vmm is running it also attempts a best-effort silo-vmm
-    /// inspect RPC to populate guest readiness and a human-readable message. A
-    /// silo-vmm telemetry failure does not fail the whole inspect call; it is
-    /// reported here as a non-ready running status message instead.
+    /// Observed lifecycle status, or a persisted fallback when `observation`
+    /// is not `Observed`. Inspection never repairs attachments or writes state.
+    /// Running monitors receive a bounded best-effort status RPC. Telemetry
+    /// failure is an issue and non-ready running status, not a fleet-wide error.
+    /// A network-helper issue does not change VM lifecycle or guest readiness.
     pub status: MachineStatus,
     /// Whether `status` is observed or only a last-known value. Never treat a
     /// last-known status as proof that a VM is running or stopped.

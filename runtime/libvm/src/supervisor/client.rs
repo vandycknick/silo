@@ -66,12 +66,17 @@ impl VmmClient {
     }
 
     pub(crate) async fn status(&self) -> Result<HostStatus, VmmClientError> {
-        let mut client = monitor_client(self.channel().await?);
-        client
-            .get_status(timed_request(GetStatusRequest {}, RPC_TIMEOUT))
-            .await
-            .map(|response| response.into_inner())
-            .map_err(|error| rpc_error("vm monitor get_status RPC failed", error))
+        const INSPECT_TIMEOUT: Duration = Duration::from_secs(2);
+        tokio::time::timeout(INSPECT_TIMEOUT, async {
+            let mut client = monitor_client(self.channel().await?);
+            client
+                .get_status(timed_request(GetStatusRequest {}, INSPECT_TIMEOUT))
+                .await
+                .map(|response| response.into_inner())
+                .map_err(|error| rpc_error("vm monitor get_status RPC failed", error))
+        })
+        .await
+        .map_err(|_| VmmClientError::Protocol("vm monitor inspection timed out after 2s".into()))?
     }
 
     pub(crate) async fn wait_ready(

@@ -208,10 +208,10 @@ docker --host unix://$HOME/.silo/run/docker.sock version
 docker --context silo info
 ```
 
-`down` disables automatic startup and waits for `silod` to stop Docker and the
-VM and exit. It then runs `silod --stop`, which stops any VM of the installation
-still running (for example after silod crashed), so the system VM is always
-stopped when `down` returns. It preserves the machine, images, containers, networks, volumes, build cache, and
+`down` disables automatic startup and waits for `silod` to detach and exit.
+It then runs `silod --stop`, which explicitly stops the installation's VMs,
+so the system VM is stopped when `down` returns. A service-manager restart or
+SIGINT/SIGTERM to silod alone leaves the VM running for the next manager to adopt. It preserves the machine, images, containers, networks, volumes, build cache, and
 both disks. It does not select another Docker context. Repeated `down` remains
 disabled across the next login or service-manager activation cycle.
 
@@ -222,7 +222,10 @@ silo daemon up --foreground
 ```
 
 Foreground mode uses the same supervisor and persistent installation. It does
-not background itself or install a service. Stop it with SIGINT or SIGTERM.
+not background itself or install a service. SIGINT or SIGTERM stops only the
+manager, leaving an established VM and its network helper running. Run `silod
+--stop` after the manager exits to explicitly stop the system appliance, or use
+`silo daemon down` for the complete stop operation.
 
 ## Daemon State
 
@@ -335,9 +338,11 @@ are captured in `~/.silo/logs/daemon/native.log`, which is where
 panics and failures that happen before the supervisor publishes a status record
 appear; on Linux use `journalctl --user -u silo-system.service`.
 
-The launchd agent restarts only after an unsuccessful exit, waits 90 seconds for
-a graceful VM shutdown before SIGKILL, and runs with the `Standard` process
-type. The VM inherits this scheduling policy: `Background` throttles its CPU and
+The launchd agent restarts only after an unsuccessful exit, allows 90 seconds
+for the manager to detach before SIGKILL, uses `AbandonProcessGroup`, and runs
+with the `Standard` process type. The systemd unit uses `KillMode=process`:
+restarting the management service must not kill the surviving VMM/netd processes.
+Explicit `down` still stops the VM through the separate `silod --stop` operation. The VM inherits this scheduling policy: `Background` throttles its CPU and
 I/O work even when a user is actively building or running containers. Standard
 uses normal service scheduling, without requesting the `Interactive` class or
 pinning host cores. See [build performance](architecture/build-performance.md)

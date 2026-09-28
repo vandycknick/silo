@@ -796,10 +796,7 @@ mod tests {
     }
 
     fn expect_empty_refresh(store: &mut MockDataStore) {
-        store
-            .expect_list_machine_configs()
-            .once()
-            .returning(|| Ok(Vec::new()));
+        store.expect_list_machine_configs().never();
     }
 
     async fn runtime_with_mock_store(paths: LocalPaths, store: MockDataStore) -> Runtime {

@@ -106,6 +106,12 @@ func Parse(args []string) (*Config, error) {
 	if err := flags.Parse(args); err != nil {
 		return cfg, err
 	}
+	if flags.NArg() != 0 {
+		return cfg, errors.New("netd does not accept positional arguments")
+	}
+	if cfg.StartupFD < -1 || cfg.ExitFD < -1 {
+		return cfg, errors.New("optional inherited descriptors must be -1 or above stderr")
+	}
 	if cfg.Daemonize && (cfg.StartupFD < 3 || cfg.ExitFD < 3) {
 		return cfg, errors.New("--daemonize requires --startup-fd and --exit-fd above stderr")
 	}

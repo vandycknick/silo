@@ -155,12 +155,13 @@ pub(crate) async fn observe_network_runtime(
             ),
         });
     };
-    if !network_instance_is_alive(&instance)? {
+    if instance.driver == DRIVER_NETD && !netd_driver::instance_is_alive(&instance)? {
         return Err(LibVmError::NetworkRuntime {
             reference: machine_id.to_string(),
             message: format!(
-                "network {} has no live helper; persisted attachment requires cleanup",
-                instance.id
+                "network {} has no live helper ({}); persisted attachment requires cleanup",
+                instance.id,
+                netd_driver::instance_description(&instance)?
             ),
         });
     }
@@ -575,6 +576,102 @@ mod tests {
             runtime_dir.exists(),
             "shared instance runtime dir should stay"
         );
+    }
+
+    #[tokio::test]
+    async fn real_store_cleanup_preserves_shared_attachments_and_failed_cleanup_evidence() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = LocalPaths::new(temp.path().join("silo"));
+        let store = Store::new(&paths).await.expect("store");
+        let mut machines = Vec::new();
+        for name in ["first", "second"] {
+            let id = MachineId::new();
+            let config = machine_config(&paths, id, name, ModelMachineNetworkConfig::default());
+            store
+                .add_machine(
+                    &config,
+                    &MachineState {
+                        machine_id: id,
+                        status: MachineRuntimeState::Stopped,
+                        vmm_pid: None,
+                        started_at: None,
+                        run_id: None,
+                        last_error: None,
+                        updated_at: 1,
+                    },
+                )
+                .await
+                .expect("machine");
+            machines.push(config);
+        }
+        let mut network = instance("shared");
+        network.driver = "netd".into();
+        network.driver_state_json = json!({ "helper_pid": i32::MAX, "helper_started_at": 1,
+            "machine_id": machines[0].id, "run_id": "old", "subnet": "192.168.105.0/24", "pcap": false }).to_string();
+        store
+            .save_network_instance(&network)
+            .await
+            .expect("network");
+        for machine in &machines {
+            store
+                .attach_network(&attachment(machine.id, "shared"))
+                .await
+                .expect("attach");
+        }
+        paths.ensure_network_run_dir("shared").expect("runtime dir");
+        reconcile_network_runtime(&paths, &store, &machines[0], false)
+            .await
+            .expect("detach only first");
+        assert!(store
+            .network_instance("shared")
+            .await
+            .expect("network")
+            .is_some());
+        assert!(store
+            .network_attachment(machines[1].id)
+            .await
+            .expect("second")
+            .is_some());
+        // Unverifiable persisted identity must preserve both record and artifacts.
+        network.driver_state_json = "{}".into();
+        store
+            .save_network_instance(&network)
+            .await
+            .expect("corrupt driver state");
+        assert!(
+            reconcile_network_runtime(&paths, &store, &machines[1], false)
+                .await
+                .is_err()
+        );
+        assert!(store
+            .network_instance("shared")
+            .await
+            .expect("network")
+            .is_some());
+        assert!(paths
+            .network("shared")
+            .expect("paths")
+            .runtime_dir()
+            .exists());
+        network.driver_state_json = json!({ "helper_pid": i32::MAX, "helper_started_at": 1,
+            "machine_id": machines[1].id, "run_id": "old", "subnet": "192.168.105.0/24", "pcap": false }).to_string();
+        store
+            .save_network_instance(&network)
+            .await
+            .expect("restore identity");
+        reconcile_network_runtime(&paths, &store, &machines[1], false)
+            .await
+            .expect("retry cleanup");
+        assert!(store
+            .network_instance("shared")
+            .await
+            .expect("network")
+            .is_none());
+        assert!(!paths
+            .network("shared")
+            .expect("paths")
+            .runtime_dir()
+            .exists());
     }
 
     #[tokio::test]

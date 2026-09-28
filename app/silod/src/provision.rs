@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::time::Duration;
 
 use eyre::{bail, Context as _};
 use libvm::{ImagePullPolicy, MachineData, MachineStatus, Memory};
@@ -194,22 +193,6 @@ pub(crate) async fn find_system_machine(
             record.installation_id
         ),
     }
-}
-
-/// Gracefully stops this installation's system machine if it is running, whether or
-/// not the daemon got as far as recording it. Returns the machine ID it acted on.
-pub(crate) async fn stop_system_machine(
-    runtime: &mut SystemRuntime,
-    record: &DaemonRecord,
-    timeout: Duration,
-) -> eyre::Result<Option<String>> {
-    let Some(machine) = find_system_machine(runtime, record).await? else {
-        return Ok(None);
-    };
-    if is_live(&machine) {
-        runtime.stop_system_machine(&machine.id, timeout).await?;
-    }
-    Ok(Some(machine.id))
 }
 
 pub(crate) fn is_live(machine: &MachineData) -> bool {

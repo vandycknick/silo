@@ -1347,10 +1347,23 @@ impl Runtime {
             }
             Err(error) => return Err(error),
         };
-        let (state, observation) = match self
+        let observed = match self
             .observe_machine_state(&config, persisted.as_ref())
             .await
         {
+            Ok(state) if machine_state_needs_writeback(persisted.as_ref(), &state) => {
+                match self.try_acquire_machine_lock(config.lock_id) {
+                    Ok(Some(_lock)) => Ok(state),
+                    Ok(None) => Err(LibVmError::MonitorConnection {
+                        reference: config.name.clone(),
+                        message: "machine is being modified; showing last-known state".into(),
+                    }),
+                    Err(error) => Err(error),
+                }
+            }
+            result => result,
+        };
+        let (state, observation) = match observed {
             Ok(state) if issues.is_empty() => (state, MachineObservation::Observed),
             result => {
                 if let Err(error) = result {
@@ -2185,10 +2198,7 @@ mod tests {
     }
 
     fn expect_empty_refresh(store: &mut MockDataStore) {
-        store
-            .expect_list_machine_configs()
-            .once()
-            .returning(|| Ok(Vec::new()));
+        store.expect_list_machine_configs().never();
     }
 
     async fn runtime_with_mock_store(paths: LocalPaths, store: MockDataStore) -> Runtime {
@@ -2799,13 +2809,18 @@ mod tests {
         std::fs::create_dir_all(&bin).expect("create test runtime binaries");
         std::fs::create_dir_all(&assets).expect("create test runtime assets");
         let netd = bin.join("netd");
-        std::fs::write(
-            &netd,
-            "#!/bin/sh\nsocket=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--listen-vfkit\" ]; then socket=\"${arg#unixgram://}\"; fi\n  previous=\"$arg\"\ndone\n: > \"$socket\"\nwhile :; do sleep 1; done\n",
-        )
-        .expect("write test netd");
-        std::fs::set_permissions(&netd, std::fs::Permissions::from_mode(0o755))
-            .expect("make test netd executable");
+        let build = std::process::Command::new("go")
+            .args(["build", "-o"])
+            .arg(&netd)
+            .arg("./cmd/netd")
+            .current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../net/netd"))
+            .output()
+            .expect("build real netd");
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
         let supervisor_path = bin.join("silo-vmm");
         std::fs::write(&supervisor_path, supervisor).expect("write test silo-vmm");
         std::fs::set_permissions(&supervisor_path, std::fs::Permissions::from_mode(0o755))
@@ -2983,7 +2998,7 @@ mod tests {
         let missing_pid = "#!/bin/sh\neval \"printf 'started\\n' >&$_VM_SYNCPIPE\"\nexit 0\n";
         let missing_process = "#!/bin/sh\npidfile=\nprevious=\nfor arg do\n  if [ \"$previous\" = \"--pidfile\" ]; then pidfile=\"$arg\"; fi\n  previous=\"$arg\"\ndone\nprintf '999999\\n' > \"$pidfile\"\neval \"printf 'started\\n' >&$_VM_SYNCPIPE\"\nexit 0\n";
 
-        let temp = tempfile::tempdir().expect("create temp dir");
+        let temp = tempfile::tempdir_in("/tmp").expect("create temp dir");
         let (runtime, mut config, _store) = start_failure_runtime(&temp, launch_failure).await;
         config.spec.mounts.push(vm_spec::Mount {
             source: std::path::PathBuf::from("~unsupported"),
@@ -3003,7 +3018,7 @@ mod tests {
         assert_failed_start_network_is_clean(&runtime, config.id).await;
 
         for supervisor in [launch_failure, missing_pid, missing_process] {
-            let temp = tempfile::tempdir().expect("create temp dir");
+            let temp = tempfile::tempdir_in("/tmp").expect("create temp dir");
             let (runtime, config, _store) = start_failure_runtime(&temp, supervisor).await;
 
             machine_handle(&runtime, config.id)
@@ -3028,7 +3043,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_start_failure_after_network_preparation_removes_network_runtime() {
-        let temp = tempfile::tempdir().expect("create temp dir");
+        let temp = tempfile::tempdir_in("/tmp").expect("create temp dir");
         let (runtime, config, store) = start_failure_runtime(&temp, "#!/bin/sh\nexit 23\n").await;
         store
             .execute_test_sql(
@@ -4332,7 +4347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_reconciles_stopping_without_live_runtime_to_stopped() {
+    async fn inventory_observes_stopped_without_writing_back_stopping_state() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let runtime = Runtime::open(
             LocalPaths::new(temp.path().join("silo")),
@@ -4366,9 +4381,14 @@ mod tests {
             .expect("read machine state");
 
         assert_eq!(machines.len(), 1);
-        assert_eq!(state.status, MachineRuntimeState::Stopped);
+        assert_eq!(state.status, MachineRuntimeState::Stopping);
         assert_eq!(state.vmm_pid, None);
-        assert_eq!(state.run_id, None);
+        assert_eq!(state.run_id.as_deref(), Some("run-1"));
+        let inventory = runtime.inventory().await.expect("inventory");
+        assert_eq!(
+            inventory[0].data.as_ref().expect("snapshot").status,
+            MachineStatus::Stopped
+        );
     }
 
     #[tokio::test]
@@ -4420,10 +4440,20 @@ mod tests {
             .expect("read machine state");
 
         assert_eq!(inspect_data.status.label(), "error");
-        assert_eq!(state.status, MachineRuntimeState::Error);
-        assert_eq!(state.vmm_pid, None);
-        assert_eq!(state.run_id, None);
-        assert_eq!(state.last_error.as_deref(), Some("runtime exploded"));
+        assert_eq!(inspect_data.last_error.as_deref(), Some("runtime exploded"));
+        assert_eq!(
+            state.status,
+            MachineRuntimeState::Running,
+            "inspection does not write back"
+        );
+        runtime
+            .reconcile_machine_runtime_best_effort(&machine)
+            .await
+            .expect("explicit reconciliation");
+        let repaired = runtime.machine_state(machine.id).await.expect("state");
+        assert_eq!(repaired.status, MachineRuntimeState::Error);
+        assert_eq!(repaired.vmm_pid, None);
+        assert_eq!(repaired.run_id, None);
     }
 
     #[tokio::test]
@@ -4475,7 +4505,11 @@ mod tests {
             .expect("read machine state");
 
         assert_eq!(inspect_data.status, MachineStatus::Stopped);
-        assert_eq!(state.status, MachineRuntimeState::Stopped);
+        assert_eq!(
+            state.status,
+            MachineRuntimeState::Running,
+            "inspection does not write back"
+        );
         assert_eq!(state.last_error, None);
     }
 
@@ -4518,10 +4552,14 @@ mod tests {
             .expect("read machine state");
 
         assert_eq!(inspect_data.status.label(), "error");
-        assert_eq!(state.status, MachineRuntimeState::Error);
-        assert_eq!(state.run_id, None);
         assert_eq!(
-            state.last_error.as_deref(),
+            state.status,
+            MachineRuntimeState::Starting,
+            "inspection does not write back"
+        );
+        assert_eq!(inspect_data.run_id, None);
+        assert_eq!(
+            inspect_data.last_error.as_deref(),
             Some("machine start did not leave a live runtime")
         );
     }
@@ -4588,16 +4626,20 @@ mod tests {
             .await
             .expect("read abandoned state");
         assert_eq!(released.status.label(), "error");
-        assert_eq!(state.status, MachineRuntimeState::Error);
-        assert_eq!(state.run_id, None);
         assert_eq!(
-            state.last_error.as_deref(),
+            state.status,
+            MachineRuntimeState::Starting,
+            "inspection does not write back"
+        );
+        assert_eq!(released.run_id, None);
+        assert_eq!(
+            released.last_error.as_deref(),
             Some("machine start did not leave a live runtime")
         );
     }
 
     #[tokio::test]
-    async fn runtime_open_refreshes_unlocked_active_state() {
+    async fn runtime_open_leaves_unlocked_active_state_for_explicit_reconciliation() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let data_dir = temp.path().join("silo");
         let runtime = Runtime::open(
@@ -4639,11 +4681,13 @@ mod tests {
             .await
             .expect("read refreshed machine state");
 
-        assert_eq!(state.status, MachineRuntimeState::Error);
-        assert_eq!(state.run_id, None);
+        assert_eq!(state.status, MachineRuntimeState::Starting);
+        assert_eq!(state.run_id.as_deref(), Some("run-1"));
+        assert_eq!(state.last_error, None);
+        let data = reopened.inventory().await.expect("inventory");
         assert_eq!(
-            state.last_error.as_deref(),
-            Some("machine start did not leave a live runtime")
+            data[0].data.as_ref().expect("snapshot").status.label(),
+            "error"
         );
     }
 
@@ -4684,6 +4728,10 @@ mod tests {
         let reopened = Runtime::open(paths, RuntimeNetworkingConfig::default())
             .await
             .expect("reopen after pre-arm crash");
+        reopened
+            .reconcile_machine_runtime_best_effort(&config)
+            .await
+            .expect("explicitly recover runtime");
         let recovered = reopened
             .machine_state(config.id)
             .await
@@ -4718,7 +4766,7 @@ mod tests {
 
     #[tokio::test]
     async fn ephemeral_pre_vmm_start_failure_cleans_up_immediately() {
-        let temp = tempfile::tempdir().expect("create temp dir");
+        let temp = tempfile::tempdir_in("/tmp").expect("create temp dir");
         let (runtime, mut config, _store) =
             start_failure_runtime(&temp, "#!/bin/sh\nexit 23\n").await;
         config.retention = MachineRetention::Ephemeral;
