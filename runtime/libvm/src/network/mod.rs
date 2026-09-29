@@ -4,6 +4,7 @@ mod api;
 mod builder;
 mod core;
 mod netd_driver;
+mod secret_transport;
 
 pub use api::{
     GuestPublish, MachineNetworkBuilder, MachineNetworkConfig, NetworkDefinition, NetworkDriver,

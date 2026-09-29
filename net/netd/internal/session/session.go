@@ -33,6 +33,7 @@ type Spec struct {
 	CACert       string
 	CAKey        string
 	GuestPublish config.PublishBind
+	Secrets      credentials.Source
 }
 
 type Shared struct {
@@ -77,11 +78,10 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 		return nil, err
 	}
 	route := router.New(spec.Policy, shared.Audit)
-	credentialManager, err := credentials.NewManagerFromEnvironment()
-	if err != nil {
-		cancel()
-		return nil, err
+	if spec.Secrets == nil {
+		spec.Secrets = credentials.NewStatic(nil, nil)
 	}
+	credentialManager := credentials.NewManager(spec.Secrets)
 	dispatcher := packet.NewTCPDispatcher()
 	httpsProxy, err := forwarder.NewHTTPSProxy(route, spec.CACert, spec.CAKey, credentialManager)
 	if err != nil {

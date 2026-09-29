@@ -1,7 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -97,14 +97,10 @@ impl MachineLifetimeLock {
     }
 
     pub(crate) fn duplicate_inheritable(&self) -> io::Result<OwnedFd> {
-        let duplicate = nix::unistd::dup(&self.file).map_err(io::Error::other)?;
-        let flags = nix::fcntl::fcntl(&duplicate, nix::fcntl::FcntlArg::F_GETFD)
+        let duplicate = nix::fcntl::fcntl(&self.file, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(3))
             .map_err(io::Error::other)?;
-        let flags =
-            nix::fcntl::FdFlag::from_bits_retain(flags).difference(nix::fcntl::FdFlag::FD_CLOEXEC);
-        nix::fcntl::fcntl(&duplicate, nix::fcntl::FcntlArg::F_SETFD(flags))
-            .map_err(io::Error::other)?;
-        Ok(duplicate)
+        // The duplicate is newly owned; only the intended VMM child clears CLOEXEC.
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
     }
 }
 
@@ -332,6 +328,14 @@ mod tests {
         let inherited = guard
             .duplicate_inheritable()
             .expect("duplicate inherited lock descriptor");
+        let flags = nix::fcntl::fcntl(&inherited, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert!(
+            nix::fcntl::FdFlag::from_bits_retain(flags).contains(nix::fcntl::FdFlag::FD_CLOEXEC)
+        );
+        let mut unrelated = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
 
         drop(guard);
         assert!(MachineLifetimeLock::try_acquire(&path)
@@ -339,9 +343,12 @@ mod tests {
             .is_none());
 
         drop(inherited);
-        assert!(MachineLifetimeLock::try_acquire(&path)
+        let available = MachineLifetimeLock::try_acquire(&path)
             .expect("try released lock")
-            .is_some());
+            .is_some();
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+        assert!(available, "unrelated exec inherited the lifetime lock");
     }
 
     #[test]

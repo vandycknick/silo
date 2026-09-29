@@ -28,7 +28,6 @@ const OPENAI_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/cal
 const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
 const OPENAI_CODEX_KIND: &str = "openai_codex_oauth";
 const OPENAI_DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const OAUTH_REFRESH_AUTH_ENV: &str = "SILO_NET_OAUTH_REFRESH_AUTH";
 
 const EXAMPLES: &[&str] = &[
     "silo secret login openai-codex --name personal",
@@ -1142,10 +1141,7 @@ async fn refresh_oauth_request(
             "unsupported OAuth refresh request",
         ));
     }
-    let encoded_auth = std::env::var(OAUTH_REFRESH_AUTH_ENV).map_err(|_| {
-        OAuthRefreshFailure::unauthorized(format!("{OAUTH_REFRESH_AUTH_ENV} is required"))
-    })?;
-    let grant = decode_oauth_refresh_grant(&encoded_auth)?;
+    let grant = decode_oauth_refresh_grant(&request.grant)?;
     if grant.version != 1 {
         return Err(OAuthRefreshFailure::unauthorized(
             "unsupported OAuth refresh grant version",
@@ -1333,6 +1329,8 @@ where
 struct OAuthRefreshHookRequest {
     version: u8,
     operation: String,
+    #[serde(default)]
+    grant: String,
     credential: OAuthRefreshHookCredential,
     #[allow(dead_code)]
     reason: String,
@@ -2144,6 +2142,7 @@ mod tests {
         let request = OAuthRefreshHookRequest {
             version: 1,
             operation: "oauth_refresh".to_string(),
+            grant: "e30=".to_string(),
             credential: crate::commands::secret::OAuthRefreshHookCredential {
                 name: "personal".to_string(),
                 kind: OPENAI_CODEX_KIND.to_string(),
@@ -2159,6 +2158,7 @@ mod tests {
             read_json_frame(frame.as_slice()).expect("read frame");
         assert_eq!(decoded.version, 1);
         assert_eq!(decoded.operation, "oauth_refresh");
+        assert_eq!(decoded.grant, "e30=");
         assert_eq!(decoded.credential.name, "personal");
         assert_eq!(decoded.credential.kind, OPENAI_CODEX_KIND);
         assert_eq!(decoded.credential.endpoint, "openai");

@@ -12,13 +12,19 @@ func TestManagedDescriptorContract(t *testing.T) {
 		{"--startup-fd=0", "--exit-fd=6"}, {"--startup-fd=5", "--exit-fd=5"},
 		{"--startup-fd=3", "--exit-fd=6"}, {"--startup-fd=-2"},
 		{"--daemonize", "unexpected-positional-argument"},
+		{"--secrets-fd=-2"}, {"--secrets-fd=0"}, {"--secrets-fd=1"}, {"--secrets-fd=2"},
+		{"--secrets-fd=3"}, {"--secrets-fd=4"},
+		{"--startup-fd=5", "--exit-fd=6", "--secrets-fd=5"},
+		{"--startup-fd=5", "--exit-fd=6", "--secrets-fd=6"},
+		{"--log-dir-fd=0"}, {"--runtime-dir-fd=2"}, {"--log-dir-fd=-2"},
+		{"--policy-file=policy.json"},
 	} {
 		if _, err := Parse(append(configArgs(t), args...)); err == nil {
 			t.Fatalf("accepted invalid arguments %v", args)
 		}
 	}
-	cfg := parseConfig(t, "--daemonize", "--startup-fd=5", "--exit-fd=6")
-	if !cfg.Daemonize || cfg.StartupFD != 5 || cfg.ExitFD != 6 {
+	cfg := parseConfig(t, "--daemonize", "--startup-fd=5", "--exit-fd=6", "--secrets-fd=7")
+	if !cfg.Daemonize || cfg.StartupFD != 5 || cfg.ExitFD != 6 || cfg.SecretsFD != 7 {
 		t.Fatalf("unexpected managed config: %+v", cfg)
 	}
 	cfg = parseConfig(t)
@@ -236,6 +242,7 @@ func TestLoadPolicyRequiresTLSCAForHTTPSEndpoints(t *testing.T) {
 
 	cfg, err := Parse(append(configArgs(t),
 		"--policy-file", policyPath,
+		"--secrets-fd", "7",
 	))
 	if err != nil {
 		t.Fatal(err)
@@ -267,6 +274,7 @@ func TestLoadPolicyRequiresTLSCAForRegistryEndpoints(t *testing.T) {
 `)
 	cfg, err := Parse(append(configArgs(t),
 		"--policy-file", policyPath,
+		"--secrets-fd", "7",
 	))
 	if err != nil {
 		t.Fatal(err)
@@ -294,6 +302,7 @@ func TestLoadPolicyDoesNotRequireSecretStoreForCredentials(t *testing.T) {
 
 	cfg, err := Parse(append(configArgs(t),
 		"--policy-file", policyPath,
+		"--secrets-fd", "7",
 		"--tls-ca-cert", filepath.Join(dir, "ca.pem"),
 		"--tls-ca-key", filepath.Join(dir, "ca-key.pem"),
 	))

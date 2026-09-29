@@ -38,6 +38,7 @@ tonic = { version = "0.14.6", features = ["transport"] }
 tower = "0.5.3"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 prost-types = "0.14.4"
+zeroize.workspace = true
 
 [dev-dependencies]
 test-utils = { path = "../test-utils" }

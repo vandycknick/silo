@@ -2656,6 +2656,7 @@ dependencies = [
  "utils",
  "uuid",
  "vm-spec",
+ "zeroize",
 ]
 
 [[package]]

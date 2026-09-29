@@ -46,7 +46,7 @@ func NewHTTPSProxy(route *router.Router, certPath string, keyPath string, manage
 		return nil, err
 	}
 	if manager == nil {
-		manager = credentials.NewManager()
+		manager = credentials.NewManager(credentials.NewStatic(nil, nil))
 	}
 	return &HTTPSProxy{route: route, ca: ca, credentialManager: manager}, nil
 }

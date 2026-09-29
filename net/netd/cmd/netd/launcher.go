@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/vandycknick/silo/net/netd/internal/config"
@@ -21,7 +22,7 @@ func launchWorker(cfg *config.Config, args []string) error {
 	if err != nil {
 		return err
 	}
-	files := make([]*os.File, 0, 4)
+	files := make([]*os.File, 0, 5)
 	defer func() {
 		for _, file := range files {
 			_ = file.Close()
@@ -33,6 +34,7 @@ func launchWorker(cfg *config.Config, args []string) error {
 			return fmt.Errorf("invalid inherited descriptor %d", fd)
 		}
 		files = append(files, file)
+		unix.CloseOnExec(fd)
 	}
 	if err := validatePipe(cfg.StartupFD, unix.O_WRONLY); err != nil {
 		return fmt.Errorf("startup pipe: %w", err)
@@ -40,10 +42,20 @@ func launchWorker(cfg *config.Config, args []string) error {
 	if err := validatePipe(cfg.ExitFD, unix.O_RDONLY); err != nil {
 		return fmt.Errorf("exit pipe: %w", err)
 	}
-	// ExtraFiles establishes an explicit descriptor allowlist across Go's exec.
+	// ExtraFiles allowlist: log directory 3, runtime directory 4, startup writer
+	// 5, lifetime reader 6, unread secrets reader 7 (when present).
 	workerArgs := append([]string{}, args...)
 	workerArgs = append(workerArgs, "--daemonize=false", "--log-dir-fd=3", "--runtime-dir-fd=4", "--startup-fd=5", "--exit-fd=6")
+	if cfg.SecretsFD != -1 {
+		if err := validatePipe(cfg.SecretsFD, unix.O_RDONLY); err != nil {
+			return fmt.Errorf("secrets pipe: %w", err)
+		}
+		unix.CloseOnExec(cfg.SecretsFD)
+		files = append(files, os.NewFile(uintptr(cfg.SecretsFD), "netd-secrets"))
+		workerArgs = append(workerArgs, "--secrets-fd=7")
+	}
 	command := exec.Command(executable, workerArgs...)
+	command.Env = sanitizedEnvironment(os.Environ())
 	command.ExtraFiles = files
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	// Nil standard streams are /dev/null, never pipes owned by a departing CLI.
@@ -51,6 +63,28 @@ func launchWorker(cfg *config.Config, args []string) error {
 		return fmt.Errorf("spawn netd worker: %w", err)
 	}
 	return command.Process.Release()
+}
+
+func sanitizedEnvironment(environment []string) []string {
+	clean := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		if !strings.HasPrefix(entry, "SILO_NET_") {
+			clean = append(clean, entry)
+		}
+	}
+	return clean
+}
+
+func sanitizeLegacyEnvironment() error {
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(name, "SILO_NET_") {
+			if err := os.Unsetenv(name); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func validatePipe(fd int, access int) error {

@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -30,8 +29,6 @@ const (
 	ReasonRefresh   = "credential_refresh_error"
 	ReasonSigning   = "credential_signing_error"
 	ReasonInjection = "credential_injection_error"
-
-	networkSecretPrefix = "SILO_NET_SECRET_"
 )
 
 type ApplyError struct {
@@ -69,9 +66,8 @@ func applyError(reason string, format string, args ...any) error {
 }
 
 type Manager struct {
-	now                   func() time.Time
-	awsProfileCredentials func(context.Context, string) (aws.Credentials, error)
-	oauthRefreshHook      *OAuthRefreshHook
+	now    func() time.Time
+	source Source
 
 	oauthMu      sync.Mutex
 	oauthSecrets map[string]oauthSecret
@@ -83,24 +79,14 @@ type oauthSecret struct {
 	AccountID   string
 }
 
-func NewManager() *Manager {
-	return newManager(nil)
-}
-
-func NewManagerFromEnvironment() (*Manager, error) {
-	hook, err := LoadOAuthRefreshHookFromEnvironment()
-	if err != nil {
-		return nil, err
+func NewManager(source Source) *Manager {
+	if source == nil {
+		source = NewStatic(nil, nil)
 	}
-	return newManager(hook), nil
-}
-
-func newManager(hook *OAuthRefreshHook) *Manager {
 	return &Manager{
-		now:                   time.Now,
-		awsProfileCredentials: retrieveAWSProfileCredentials,
-		oauthRefreshHook:      hook,
-		oauthSecrets:          make(map[string]oauthSecret),
+		now:          time.Now,
+		source:       source,
+		oauthSecrets: make(map[string]oauthSecret),
 	}
 }
 
@@ -225,7 +211,7 @@ func (m *Manager) applyAWSCredential(ctx context.Context, credential *hooks.Cred
 
 func (m *Manager) plainSlot(credential *hooks.Credential, slot string, required bool) (string, error) {
 	key := slotKey(credential.Name, slot)
-	return networkSecretString(key, required)
+	return m.networkSecretString(key, required)
 }
 
 func (m *Manager) currentOAuth(ctx context.Context, credential *hooks.Credential) (oauthSecret, error) {
@@ -235,34 +221,35 @@ func (m *Manager) currentOAuth(ctx context.Context, credential *hooks.Credential
 	}
 	expiresAt, err := time.Parse(time.RFC3339, secret.ExpiresAt)
 	if err != nil {
-		return oauthSecret{}, fmt.Errorf("oauth slot %q has invalid expires_at: %w", oauthSlotKey(credential.Name), err)
+		return oauthSecret{}, fmt.Errorf("oauth slot %q has invalid expires_at", oauthSlotKey(credential.Name))
 	}
 	now := m.now()
 	expired := !now.Before(expiresAt)
-	needsRefresh := m.oauthRefreshHook != nil && !now.Add(m.oauthRefreshHook.refreshSkew()).Before(expiresAt)
-	if !expired && !needsRefresh {
-		return secret, nil
+	skew := defaultOAuthRefreshSkew
+	if source, ok := m.source.(*Static); ok {
+		skew = source.refreshSkew()
+		source.BindCredential(credential)
 	}
-	if m.oauthRefreshHook == nil {
-		if expired {
-			return oauthSecret{}, fmt.Errorf("oauth credential %q expired at %s", credential.Name, secret.ExpiresAt)
-		}
+	needsRefresh := !now.Add(skew).Before(expiresAt)
+	if !expired && !needsRefresh {
 		return secret, nil
 	}
 	reason := "expires_soon"
 	if expired {
 		reason = "expired"
 	}
-	refreshed, err := m.oauthRefreshHook.Refresh(ctx, credential, secret.ExpiresAt, reason)
+	key := oauthSlotKey(credential.Name)
+	values, err := m.source.Refresh(ctx, []string{key + ".access_token", key + ".expires_at", key + ".account_id"}, reason)
 	if err != nil {
 		if expired {
 			return oauthSecret{}, err
 		}
 		return secret, nil
 	}
-	if _, err := time.Parse(time.RFC3339, refreshed.ExpiresAt); err != nil {
+	refreshed := oauthSecret{AccessToken: string(values[key+".access_token"]), ExpiresAt: string(values[key+".expires_at"]), AccountID: string(values[key+".account_id"])}
+	if expiry, err := time.Parse(time.RFC3339, refreshed.ExpiresAt); err != nil || !now.Before(expiry) || refreshed.AccessToken == "" {
 		if expired {
-			return oauthSecret{}, fmt.Errorf("oauth refresh hook returned invalid expires_at: %w", err)
+			return oauthSecret{}, fmt.Errorf("oauth refresh hook returned invalid or expired credential")
 		}
 		return secret, nil
 	}
@@ -278,15 +265,15 @@ func (m *Manager) oauthSlot(credential *hooks.Credential) (oauthSecret, error) {
 	if ok {
 		return cached, nil
 	}
-	accessToken, err := networkSecretString(key+".access_token", true)
+	accessToken, err := m.networkSecretString(key+".access_token", true)
 	if err != nil {
 		return oauthSecret{}, err
 	}
-	expiresAt, err := networkSecretString(key+".expires_at", true)
+	expiresAt, err := m.networkSecretString(key+".expires_at", true)
 	if err != nil {
 		return oauthSecret{}, err
 	}
-	accountID, err := networkSecretString(key+".account_id", false)
+	accountID, err := m.networkSecretString(key+".account_id", false)
 	if err != nil {
 		return oauthSecret{}, err
 	}
@@ -309,31 +296,8 @@ func oauthSlotKey(name string) string {
 	return name + ".oauth"
 }
 
-func envNameForSlot(key string) string {
-	var builder strings.Builder
-	builder.WriteString(networkSecretPrefix)
-	lastUnderscore := false
-	for _, r := range key {
-		if r >= 'a' && r <= 'z' {
-			builder.WriteRune(r - 'a' + 'A')
-			lastUnderscore = false
-			continue
-		}
-		if r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
-			builder.WriteRune(r)
-			lastUnderscore = false
-			continue
-		}
-		if !lastUnderscore {
-			builder.WriteByte('_')
-			lastUnderscore = true
-		}
-	}
-	return strings.TrimRight(builder.String(), "_")
-}
-
-func networkSecretString(key string, required bool) (string, error) {
-	value, ok, err := networkSecretBytes(key, required)
+func (m *Manager) networkSecretString(key string, required bool) (string, error) {
+	value, ok, err := m.networkSecretBytes(key, required)
 	if err != nil || !ok {
 		return "", err
 	}
@@ -343,21 +307,13 @@ func networkSecretString(key string, required bool) (string, error) {
 	return string(value), nil
 }
 
-func networkSecretBytes(key string, required bool) ([]byte, bool, error) {
-	envName := envNameForSlot(key)
-	encoded, ok := os.LookupEnv(envName)
+func (m *Manager) networkSecretBytes(key string, required bool) ([]byte, bool, error) {
+	decoded, ok := m.source.Lookup(key)
 	if !ok {
 		if required {
 			return nil, false, fmt.Errorf("slot %q not found", key)
 		}
 		return nil, false, nil
-	}
-	if encoded == "" {
-		return nil, true, fmt.Errorf("env %s is empty", envName)
-	}
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return nil, true, fmt.Errorf("env %s is not valid base64: %w", envName, err)
 	}
 	if len(decoded) == 0 {
 		return nil, true, fmt.Errorf("slot %q is empty", key)
@@ -458,7 +414,7 @@ func (m *Manager) awsCredentials(ctx context.Context, credential *hooks.Credenti
 		return aws.Credentials{}, fmt.Errorf("aws profile: %w", err)
 	}
 	if profile != "" {
-		return m.awsProfileCredentials(ctx, profile)
+		return retrieveAWSProfileCredentials(ctx, profile)
 	}
 	accessKeyID, err := m.plainSlot(credential, "access_key_id", true)
 	if err != nil {

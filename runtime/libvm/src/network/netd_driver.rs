@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use agent_spec::{NetworkDnsConfig, NetworkIpv4Config};
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
@@ -21,7 +20,7 @@ use tokio::time::sleep;
 use utils::format_mac;
 
 use crate::host;
-use crate::machine::{EgressCredentials, OAuthRefreshHook};
+use crate::network::secret_transport;
 use crate::paths::{
     LocalPaths, NETWORK_AUDIT_LOG_FILE_NAME, NETWORK_SERVICE_LOG_FILE_NAME, PCAP_FILE_NAME,
     PID_FILE_NAME,
@@ -40,8 +39,6 @@ use crate::network::{mac_from_machine_id, serialize_json, VmmNetworkAttachment, 
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
-const OAUTH_REFRESH_HOOK_ENV: &str = "SILO_NET_OAUTH_REFRESH_HOOK";
-const OAUTH_REFRESH_AUTH_ENV: &str = "SILO_NET_OAUTH_REFRESH_AUTH";
 
 pub(super) struct NetdDriver;
 
@@ -95,6 +92,8 @@ async fn prepare_netd_runtime(
     let store = ctx.store;
     let metadata = ctx.metadata;
     let config = ctx.config.netd.clone();
+    let secret_frame =
+        secret_transport::frame(ctx.egress_credentials, request.policy(), &metadata.name)?;
     if !host_uses_user_network_runtime() {
         return Err(LibVmError::NetworkRuntime {
             reference: metadata.name.clone(),
@@ -114,6 +113,8 @@ async fn prepare_netd_runtime(
     let (owner_read, owner_write) = (OwnedFd::from(owner_read), OwnedFd::from(owner_write));
     let (report_read, report_write) = std::io::pipe()?;
     let (report_read, report_write) = (OwnedFd::from(report_read), OwnedFd::from(report_write));
+    let (secret_read, secret_write) = std::io::pipe()?;
+    let (secret_read, secret_write) = (OwnedFd::from(secret_read), OwnedFd::from(secret_write));
     nix::fcntl::fcntl(
         &report_read,
         nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
@@ -165,12 +166,7 @@ async fn prepare_netd_runtime(
             guest_publish: request.publish().map(|publish| publish.bind.as_str()),
         },
     );
-    configure_egress_credentials_environment(
-        &mut command,
-        ctx.egress_credentials,
-        request.policy(),
-        &metadata.name,
-    )?;
+    secret_transport::strip_environment(&mut command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -181,13 +177,18 @@ async fn prepare_netd_runtime(
         .arg("--startup-fd")
         .arg(report_write.as_raw_fd().to_string())
         .arg("--exit-fd")
-        .arg(owner_read.as_raw_fd().to_string());
+        .arg(owner_read.as_raw_fd().to_string())
+        .arg("--secrets-fd")
+        .arg(secret_read.as_raw_fd().to_string());
     let owner_fd = owner_read.as_raw_fd();
     let report_fd = report_write.as_raw_fd();
+    let secret_fd = secret_read.as_raw_fd();
+    let log_fd = log_directory_fd.as_raw_fd();
+    let runtime_fd = runtime_directory_fd.as_raw_fd();
     unsafe {
         command.pre_exec(move || {
             // Clear CLOEXEC in this child only, never in the multithreaded caller.
-            for raw in [owner_fd, report_fd] {
+            for raw in [owner_fd, report_fd, secret_fd, log_fd, runtime_fd] {
                 let fd = std::os::fd::BorrowedFd::borrow_raw(raw);
                 nix::fcntl::fcntl(
                     fd,
@@ -199,9 +200,11 @@ async fn prepare_netd_runtime(
         });
     }
 
+    let deadline = std::time::Instant::now() + READY_TIMEOUT;
     let child = command.spawn();
     drop(owner_read);
     drop(report_write);
+    drop(secret_read);
     drop(log_directory_fd);
     drop(runtime_directory_fd);
     let mut child = child.map_err(|err| LibVmError::NetworkRuntime {
@@ -210,13 +213,18 @@ async fn prepare_netd_runtime(
     })?;
     let stderr_capture = child.stderr.take().map(CapturedStderr::spawn);
     startup.set_child(child, stderr_capture);
-    let report = match wait_for_netd_startup(
-        &report_read,
-        &mut startup,
-        metadata.id,
-        ctx.run_id,
-        &network_id,
-    )
+    let report = match async {
+        secret_transport::write_frame(secret_write, secret_frame, deadline).await?;
+        wait_for_netd_startup(
+            &report_read,
+            &mut startup,
+            metadata.id,
+            ctx.run_id,
+            &network_id,
+            deadline,
+        )
+        .await
+    }
     .await
     {
         Ok(report) => report,
@@ -490,71 +498,6 @@ fn write_runtime_policy_file(
         })
 }
 
-fn configure_egress_credentials_environment(
-    command: &mut Command,
-    launch: &EgressCredentials,
-    policy: Option<&NetworkPolicy>,
-    reference: &str,
-) -> Result<(), LibVmError> {
-    let Some(policy) = policy else {
-        if launch.is_empty() {
-            return Ok(());
-        }
-        return Err(LibVmError::NetworkRuntime {
-            reference: reference.to_string(),
-            message: "egress credentials require a persisted network policy".to_string(),
-        });
-    };
-
-    for (name, value) in launch.secret_environment(policy, reference)? {
-        command.env(name, value);
-    }
-    if let Some(hook) = &launch.oauth_refresh_hook {
-        command.env(
-            OAUTH_REFRESH_HOOK_ENV,
-            encode_oauth_refresh_hook_config(hook, reference)?,
-        );
-        command.env(OAUTH_REFRESH_AUTH_ENV, hook.encoded_auth());
-    }
-    Ok(())
-}
-
-#[derive(Serialize)]
-struct OAuthRefreshHookConfig<'a> {
-    version: u8,
-    command: &'a str,
-    args: &'a [String],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timeout_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    refresh_skew_seconds: Option<u64>,
-}
-
-fn encode_oauth_refresh_hook_config(
-    hook: &OAuthRefreshHook,
-    reference: &str,
-) -> Result<String, LibVmError> {
-    let command = hook
-        .command
-        .to_str()
-        .ok_or_else(|| LibVmError::NetworkRuntime {
-            reference: reference.to_string(),
-            message: "OAuth refresh hook command must be valid UTF-8".to_string(),
-        })?;
-    let config = OAuthRefreshHookConfig {
-        version: 1,
-        command,
-        args: &hook.args,
-        timeout_ms: hook.timeout_ms,
-        refresh_skew_seconds: hook.refresh_skew_seconds,
-    };
-    let bytes = serde_json::to_vec(&config).map_err(|err| LibVmError::NetworkRuntime {
-        reference: reference.to_string(),
-        message: format!("serialize OAuth refresh hook config: {err}"),
-    })?;
-    Ok(STANDARD.encode(bytes))
-}
-
 fn resolve_certificate_authority_paths(
     paths: &LocalPaths,
     config: &NetdRuntimeConfig,
@@ -599,12 +542,15 @@ async fn wait_for_netd_startup(
     machine_id: MachineId,
     run_id: &str,
     network_id: &str,
+    deadline: std::time::Instant,
 ) -> Result<WorkerStartupReport, String> {
-    let deadline = std::time::Instant::now() + READY_TIMEOUT;
     let mut bytes = Vec::new();
     let mut launcher_exited = false;
     let mut eof = false;
     loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("timed out waiting for netd worker readiness".into());
+        }
         if let Some(child) = startup.child.as_mut() {
             if !launcher_exited {
                 if let Some(status) = child
@@ -643,10 +589,10 @@ async fn wait_for_netd_startup(
             }
             return Ok(report);
         }
-        if std::time::Instant::now() >= deadline {
-            return Err("timed out waiting for netd worker readiness".into());
-        }
-        sleep(READY_POLL_INTERVAL).await;
+        sleep(
+            READY_POLL_INTERVAL.min(deadline.saturating_duration_since(std::time::Instant::now())),
+        )
+        .await;
     }
 }
 
@@ -986,11 +932,9 @@ fn terminate_helper(identity: &ProcessIdentity) -> Result<(), LibVmError> {
 #[cfg(test)]
 mod tests {
     use crate::network::netd_driver::{
-        append_bounded_stderr_line, configure_egress_credentials_environment,
-        configure_network_helper_command, format_netd_startup_failure, prepare_netd_runtime,
-        private_ipv4_config, resolve_certificate_authority_paths, CapturedStderrLines,
-        NetworkHelperCommandConfig, OAUTH_REFRESH_AUTH_ENV, OAUTH_REFRESH_HOOK_ENV,
-        STDERR_CAPTURE_LIMIT,
+        append_bounded_stderr_line, configure_network_helper_command, format_netd_startup_failure,
+        prepare_netd_runtime, private_ipv4_config, resolve_certificate_authority_paths,
+        CapturedStderrLines, NetworkHelperCommandConfig, STDERR_CAPTURE_LIMIT,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
@@ -1126,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn netd_command_sets_egress_credentials_environment() {
+    fn netd_payload_contains_credentials_and_single_encoded_grant() {
         let policy = oauth_policy();
         let launch = EgressCredentials::new()
             .secret("codex.oauth.access_token", "token")
@@ -1138,42 +1082,30 @@ mod tests {
                     .timeout_ms(2500)
                     .refresh_skew_seconds(120),
             );
-        let mut command = Command::new("/tmp/netd");
-
-        configure_egress_credentials_environment(&mut command, &launch, Some(&policy), "devbox")
-            .expect("configure launch environment");
-
-        let env = command
-            .get_envs()
-            .map(|(name, value)| {
-                (
-                    name.to_string_lossy().into_owned(),
-                    value.expect("env value").to_string_lossy().into_owned(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-
+        let frame = crate::network::secret_transport::frame(&launch, Some(&policy), "devbox")
+            .expect("frame");
+        let body = frame.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let payload: serde_json::Value = serde_json::from_slice(&frame[body..]).unwrap();
         assert_eq!(
-            env.get("SILO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN"),
-            Some(&"dG9rZW4=".to_string())
+            payload["secrets"][0],
+            json!({"name":"codex.oauth.access_token", "value":"dG9rZW4="})
         );
+        let hook_json = &payload["provider"];
         assert_eq!(
-            env.get(OAUTH_REFRESH_AUTH_ENV),
-            Some(&"YXV0aA==".to_string())
+            STANDARD
+                .decode(hook_json["grant"].as_str().unwrap())
+                .unwrap(),
+            b"auth"
         );
-
-        let hook_config = env.get(OAUTH_REFRESH_HOOK_ENV).expect("hook config env");
-        let hook_json = STANDARD.decode(hook_config).expect("decode hook config");
-        let hook_json: serde_json::Value =
-            serde_json::from_slice(&hook_json).expect("parse hook config");
         assert_eq!(
             hook_json,
-            json!({
+            &json!({
                 "version": 1,
                 "command": "/usr/bin/silo",
                 "args": ["secret", "refresh-oauth"],
                 "timeout_ms": 2500,
-                "refresh_skew_seconds": 120
+                "refresh_skew_seconds": 120,
+                "grant": "YXV0aA=="
             })
         );
     }
@@ -1475,5 +1407,230 @@ netd log: /tmp/silo/netd.log";
         crate::network::reconcile_network_runtime(&paths, &store, &metadata, false)
             .await
             .expect("clean netd runtime");
+
+        // Also cross the actual Go decoder with a policy, binary values and a
+        // provider grant, rather than qualifying only the empty frame.
+        let policy = oauth_policy();
+        let credentials = EgressCredentials::new()
+            .secret_bytes("codex.oauth.access_token", vec![0, 255, 128])
+            .secret("codex.oauth.expires_at", "2099-01-01T00:00:00Z")
+            .oauth_refresh_hook(OAuthRefreshHook::new(
+                "/bin/false",
+                b"synthetic-hook-auth".to_vec(),
+            ));
+        let context = NetworkDriverContext {
+            egress_credentials: &credentials,
+            ..context
+        };
+        let attachment = prepare_netd_runtime(
+            &context,
+            &NetworkAttachmentRequest::private(Some(&policy), None),
+        )
+        .await
+        .expect("actual netd accepts Rust binary/provider frame");
+        let network_id = store
+            .network_attachment(machine_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .network_instance_id;
+        let instance = store.network_instance(&network_id).await.unwrap().unwrap();
+        let worker = crate::network::netd_driver::instance_process_identity(&instance)
+            .unwrap()
+            .unwrap();
+        assert!(worker.is_alive().unwrap());
+        #[cfg(target_os = "linux")]
+        {
+            let environment = std::fs::read(format!("/proc/{}/environ", worker.pid())).unwrap();
+            assert!(environment
+                .split(|byte| *byte == 0)
+                .all(|entry| !entry.starts_with(b"SILO_NET_")));
+            let argv = std::fs::read(format!("/proc/{}/cmdline", worker.pid())).unwrap();
+            assert!(!argv
+                .windows(b"synthetic-hook-auth".len())
+                .any(|value| value == b"synthetic-hook-auth"));
+            assert!(!argv
+                .windows(b"c3ludGhldGljLWhvb2stYXV0aA==".len())
+                .any(|value| value == b"c3ludGhldGljLWhvb2stYXV0aA=="));
+        }
+        drop(attachment);
+        crate::network::reconcile_network_runtime(&paths, &store, &metadata, false)
+            .await
+            .unwrap();
+    }
+
+    // This executable exercises only process transport and startup rollback.
+    // Network behavior is covered by the real-netd integration tests.
+    #[tokio::test]
+    async fn secret_transport_startup_rolls_back_failure_timeout_and_cancellation() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        for mode in ["reject", "epipe", "stall", "cancel", "oversize"] {
+            let temp = tempfile::Builder::new()
+                .prefix("s2-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let paths = LocalPaths::from_roots(LocalRoots::with_roots(
+                temp.path().join("data"),
+                temp.path().join("run"),
+            ));
+            let store = Store::new(&paths).await.unwrap();
+            let machine_id = MachineId::new();
+            let policy = oauth_policy();
+            let metadata = MachineConfig {
+                id: machine_id,
+                lock_id: LockId::from(0),
+                name: "transport-test".into(),
+                spec: vm_spec::VmSpec::current(),
+                retention: crate::MachineRetention::Persistent,
+                process: crate::ProcessConfig::default(),
+                template_name: None,
+                agent_mode: None,
+                machine_dir: paths.machine(machine_id).dir().to_path_buf(),
+                created_at: 1,
+                modified_at: 1,
+                image_ref: String::new(),
+                root_disk_size: None,
+                labels: BTreeMap::new(),
+                metadata: BTreeMap::new(),
+                network: MachineNetworkConfig::Private {
+                    policy: Some(policy.clone()),
+                    publish: None,
+                },
+                guest: crate::machine::MachineGuestConfig::default(),
+            };
+            let launch = EgressCredentials::new()
+                .secret_bytes(
+                    "codex.oauth.access_token",
+                    vec![0xab; if mode == "oversize" { 16384 } else { 12000 }],
+                )
+                .secret("codex.oauth.expires_at", "2026-09-30T00:00:00Z");
+            let executable = temp.path().join("transport");
+            let marker = temp.path().join("spawned");
+            let received = temp.path().join("received");
+            let script = format!(
+                r#"#!/usr/bin/python3
+import os,sys,time,json,fcntl
+a=sys.argv[1:]
+def flag(name): return a[a.index(name)+1]
+open({marker:?},'w').write(str(os.getpid()))
+assert not any(k.startswith('SILO_NET_') for k in os.environ)
+assert not any('q6ur' in arg for arg in a)
+for key in ['--log-dir-fd','--runtime-dir-fd','--secrets-fd']:
+ assert fcntl.fcntl(int(flag(key)),fcntl.F_GETFD)==0
+fd=int(flag('--secrets-fd'))
+mode={mode:?}
+if mode=='epipe':
+ os.close(fd)
+ sys.exit(1)
+if mode in ['stall','cancel']:
+ time.sleep(30)
+data=b''
+while True:
+ b=os.read(fd,127)
+ if not b: break
+ data+=b
+ time.sleep(.001)
+os.close(fd)
+h,b=data.split(b'\r\n\r\n',1)
+assert h==('Content-Length: '+str(len(b))).encode()
+assert len(b)<=16384
+p=json.loads(b)
+assert p['version']==1 and len(p['secrets'])==2
+open({received:?},'wb').write(data)
+report={{'pid':os.getpid(),'vm_id':flag('--vm-id'),'run_id':flag('--run-id'),'network_id':flag('--network-id'),'ready':False,'error':'transport-only rejection'}}
+os.write(int(flag('--startup-fd')),json.dumps(report).encode()+b'\n')
+"#,
+                marker = marker.to_str().unwrap(),
+                received = received.to_str().unwrap()
+            );
+            std::fs::write(&executable, script).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let networking = RuntimeNetworkingConfig::default();
+            let context = NetworkDriverContext {
+                paths: &paths,
+                store: &store,
+                metadata: &metadata,
+                run_id: "transport-run",
+                config: &networking,
+                netd_path: &executable,
+                egress_credentials: &launch,
+            };
+            let request = NetworkAttachmentRequest::private(Some(&policy), None);
+            let start = std::time::Instant::now();
+            let future = prepare_netd_runtime(&context, &request);
+            if mode == "cancel" {
+                assert!(tokio::time::timeout(Duration::from_millis(150), future)
+                    .await
+                    .is_err());
+            } else {
+                let error = future
+                    .await
+                    .expect_err("transport test must reject startup")
+                    .to_string();
+                match mode {
+                    "oversize" => assert!(error.contains("exceeds limit"), "{error}"),
+                    "stall" => assert!(error.contains("timed out"), "{error}"),
+                    "reject" => assert!(error.contains("transport-only rejection"), "{error}"),
+                    "epipe" => assert!(
+                        error.contains("EPIPE") || error.contains("launcher exited"),
+                        "{error}"
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(6),
+                "startup budget reset"
+            );
+            if mode == "oversize" {
+                assert!(!marker.exists(), "oversize payload spawned a process");
+            } else {
+                let pid: i32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+                assert!(
+                    crate::supervisor::process::ProcessIdentity::for_pid(pid)
+                        .unwrap()
+                        .is_none(),
+                    "startup child was not reaped"
+                );
+            }
+            if mode == "reject" {
+                let bytes = std::fs::read(&received).unwrap();
+                assert_eq!(
+                    bytes,
+                    *crate::network::secret_transport::frame(&launch, Some(&policy), "test")
+                        .unwrap()
+                );
+            }
+            let network_root = temp.path().join("run/networks");
+            if network_root.exists() {
+                assert_eq!(
+                    std::fs::read_dir(network_root).unwrap().count(),
+                    0,
+                    "startup left runtime files"
+                );
+            }
+            assert!(store
+                .network_attachment(machine_id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn secret_transport_strips_ambient_environment_in_real_child() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "network::netd_driver::tests::netd_launches_the_resolved_absolute_helper",
+            ])
+            .env("SILO_NET_SECRET_API_KEY", "ambient-secret")
+            .env("SILO_NET_OAUTH_REFRESH_AUTH", "ambient-grant")
+            .env("SILO_NET_UNKNOWN_FUTURE_KEY", "ambient-value")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }

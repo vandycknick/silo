@@ -17,6 +17,7 @@ import (
 	"github.com/containers/gvisor-tap-vsock/pkg/transport"
 	log "github.com/sirupsen/logrus"
 	"github.com/vandycknick/silo/net/netd/internal/config"
+	"github.com/vandycknick/silo/net/netd/internal/credentials"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/audit"
 	"github.com/vandycknick/silo/net/netd/internal/logfile"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
@@ -41,6 +42,21 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+	if err := sanitizeLegacyEnvironment(); err != nil {
+		_ = reportWorkerStartup(cfg, err)
+		writeErrorRecords(os.Stderr, err)
+		os.Exit(1)
+	}
+	var secrets credentials.Source = credentials.NewStatic(nil, nil)
+	if cfg.SecretsFD != -1 {
+		secrets, err = credentials.LoadFromFD(cfg.SecretsFD)
+		cfg.SecretsFD = -1
+		if err != nil {
+			_ = reportWorkerStartup(cfg, err)
+			writeErrorRecords(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 	logDirectory, err := logfile.OpenDirectory(cfg.LogDirFD)
 	if err != nil {
@@ -68,7 +84,7 @@ func main() {
 		exitWithStartupError(cfg, serviceLog, logDirectory, runtimeDirectory, err)
 	}
 	auditLog := audit.New(auditFile, compiledPolicy.PolicyHash())
-	runErr := run(cfg, compiledPolicy, auditLog, runtimeDirectory)
+	runErr := run(cfg, compiledPolicy, auditLog, runtimeDirectory, secrets)
 	if runErr != nil {
 		_ = reportWorkerStartup(cfg, runErr)
 	}
@@ -105,7 +121,7 @@ func exitWithStartupError(cfg *config.Config, serviceLog *os.File, logDirectory,
 	os.Exit(1)
 }
 
-func run(cfg *config.Config, compiledPolicy *policy.Policy, auditLog *audit.Logger, runtimeDirectory *logfile.Directory) (runErr error) {
+func run(cfg *config.Config, compiledPolicy *policy.Policy, auditLog *audit.Logger, runtimeDirectory *logfile.Directory, secrets credentials.Source) (runErr error) {
 	if cfg == nil {
 		return errors.New("missing configuration")
 	}
@@ -163,6 +179,7 @@ func run(cfg *config.Config, compiledPolicy *policy.Policy, auditLog *audit.Logg
 		CACert:       cfg.TLS.CACert,
 		CAKey:        cfg.TLS.CAKey,
 		GuestPublish: cfg.GuestPublish,
+		Secrets:      secrets,
 	}, session.Shared{Audit: auditLog, Intelligence: intelligencePool})
 	captureFile = nil
 	if err != nil {

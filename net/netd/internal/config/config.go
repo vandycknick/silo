@@ -19,6 +19,7 @@ type Config struct {
 	Daemonize    bool
 	StartupFD    int
 	ExitFD       int
+	SecretsFD    int
 	ListenVfkit  string
 	LogDirFD     int
 	RuntimeDirFD int
@@ -87,6 +88,7 @@ func Parse(args []string) (*Config, error) {
 	flags.BoolVar(&cfg.Daemonize, "daemonize", false, "launch a detached worker and exit")
 	flags.IntVar(&cfg.StartupFD, "startup-fd", -1, "inherited worker startup report writer")
 	flags.IntVar(&cfg.ExitFD, "exit-fd", -1, "inherited VM lifetime pipe reader")
+	flags.IntVar(&cfg.SecretsFD, "secrets-fd", -1, "inherited secret frame pipe reader")
 	flags.StringVar(&cfg.ListenVfkit, "listen-vfkit", "", "unixgram socket used by vfkit-compatible applications")
 	flags.StringVar(&subnet, "subnet", "192.168.127.0/24", "guest network subnet")
 	flags.StringVar(&staticLease, "static-lease", "", "guest DHCP lease in IP=MAC form")
@@ -109,8 +111,18 @@ func Parse(args []string) (*Config, error) {
 	if flags.NArg() != 0 {
 		return cfg, errors.New("netd does not accept positional arguments")
 	}
-	if cfg.StartupFD < -1 || cfg.ExitFD < -1 {
-		return cfg, errors.New("optional inherited descriptors must be -1 or above stderr")
+	seen := map[int]bool{}
+	for _, fd := range []int{cfg.LogDirFD, cfg.RuntimeDirFD, cfg.StartupFD, cfg.ExitFD, cfg.SecretsFD} {
+		if fd == -1 {
+			continue
+		}
+		if fd < 3 || seen[fd] {
+			return cfg, errors.New("inherited descriptors must be -1 or distinct and above stderr")
+		}
+		seen[fd] = true
+	}
+	if cfg.PolicyFile != "" && cfg.SecretsFD == -1 {
+		return cfg, errors.New("--policy-file requires --secrets-fd")
 	}
 	if cfg.Daemonize && (cfg.StartupFD < 3 || cfg.ExitFD < 3) {
 		return cfg, errors.New("--daemonize requires --startup-fd and --exit-fd above stderr")
@@ -119,12 +131,10 @@ func Parse(args []string) (*Config, error) {
 		return cfg, errors.New("--startup-fd and --exit-fd must be supplied together")
 	}
 	if cfg.StartupFD >= 0 {
-		seen := map[int]bool{}
 		for _, fd := range []int{cfg.LogDirFD, cfg.RuntimeDirFD, cfg.StartupFD, cfg.ExitFD} {
-			if fd < 3 || seen[fd] {
+			if fd < 3 {
 				return cfg, errors.New("managed descriptors must be distinct and above stderr")
 			}
-			seen[fd] = true
 		}
 	}
 	if cfg.ListenVfkit == "" {
