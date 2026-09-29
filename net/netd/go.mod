@@ -1,6 +1,6 @@
 module github.com/vandycknick/silo/net/netd
 
-go 1.26.0
+go 1.26.6
 
 toolchain go1.26.8
 
