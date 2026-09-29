@@ -28,13 +28,14 @@ jobs:
     outputs:
       node: ${{ steps.result.outputs.node }}
       go: ${{ steps.result.outputs.go }}
+      netd: ${{ steps.result.outputs.netd }}
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      - name: Detect SDK-relevant changes
+      - name: Detect SDK and netd changes
         id: filter
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
@@ -48,6 +49,7 @@ jobs:
               - 'flake.lock'
               - 'flake.nix'
               - 'runtime/libvm/**'
+              - 'common/policy/**'
               - 'specs/**'
               - 'sdk/node/**'
             go:
@@ -59,20 +61,28 @@ jobs:
               - 'flake.lock'
               - 'flake.nix'
               - 'runtime/libvm/**'
+              - 'common/policy/**'
               - 'specs/**'
               - 'sdk/go/**'
               - 'xtask/**'
+            netd:
+              - '.github/workflows/test.yml'
+              - 'net/netd/**'
+              - 'common/policy/**'
+              - 'flake.lock'
+              - 'flake.nix'
 
-      - name: Select SDK checks
+      - name: Select checks
         id: result
         env:
           NODE_CHANGED: ${{ steps.filter.outputs.node }}
           GO_CHANGED: ${{ steps.filter.outputs.go }}
+          NETD_CHANGED: ${{ steps.filter.outputs.netd }}
         run: |
           if [ "${{ github.event_name }}" = workflow_dispatch ]; then
-            printf 'node=true\ngo=true\n' >> "$GITHUB_OUTPUT"
+            printf 'node=true\ngo=true\nnetd=true\n' >> "$GITHUB_OUTPUT"
           else
-            printf 'node=%s\ngo=%s\n' "$NODE_CHANGED" "$GO_CHANGED" >> "$GITHUB_OUTPUT"
+            printf 'node=%s\ngo=%s\nnetd=%s\n' "$NODE_CHANGED" "$GO_CHANGED" "$NETD_CHANGED" >> "$GITHUB_OUTPUT"
           fi
 
   # Clippy and Cargo tests stay per-OS: the workspace has platform-only
@@ -268,6 +278,49 @@ jobs:
           nix develop "$GITHUB_WORKSPACE#ci" --command go mod tidy
           nix develop "$GITHUB_WORKSPACE#ci" --command go build ./...
 
+  netd:
+    name: netd (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.netd == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: auto
+      GOFLAGS: -mod=readonly
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+          - platform: macos-arm64
+            runner: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Verify netd toolchain
+        run: nix develop .#ci --command go -C net/netd version
+
+      - name: Check netd formatting
+        run: |
+          files="$(nix develop .#ci --command gofmt -l net/netd)"
+          if [ -n "$files" ]; then
+            printf '%s\n' "$files"
+            exit 1
+          fi
+
+      - name: Vet netd
+        run: nix develop .#ci --command go -C net/netd vet ./...
+
+      - name: Test netd with race detector
+        run: nix develop .#ci --command go -C net/netd test -race -count=1 -timeout=4m ./...
+
   summary:
     name: Summary
     if: always()
@@ -276,6 +329,7 @@ jobs:
       - checks
       - node-sdk
       - go-sdk
+      - netd
     runs-on: ubuntu-24.04
     steps:
       - name: Require successful checks
