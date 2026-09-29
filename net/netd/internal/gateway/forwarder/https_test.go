@@ -9,7 +9,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -253,8 +252,7 @@ rule "allow-local" {
   verdict = "allow"
 }
 `)
-	setHTTPSNetworkSecret(t, "local.token", "local-token")
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, credentials.NewManager())
+	proxy, err := NewHTTPSProxy(route, caCert, caKey, credentials.NewManager(credentials.NewStatic(map[string][]byte{"local.token": []byte("local-token")}, nil)))
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -992,30 +990,6 @@ func startObservedTLSUpstreamWithResponseForHost(t *testing.T, caCertPath string
 		_, _ = fmt.Fprint(conn, response)
 	}()
 	return listener.Addr().String(), func() { _ = listener.Close() }, acceptedCh
-}
-
-func setHTTPSNetworkSecret(t *testing.T, slot string, value string) {
-	t.Helper()
-	var builder strings.Builder
-	builder.WriteString("SILO_NET_SECRET_")
-	lastUnderscore := false
-	for _, r := range slot {
-		if r >= 'a' && r <= 'z' {
-			builder.WriteRune(r - 'a' + 'A')
-			lastUnderscore = false
-			continue
-		}
-		if r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
-			builder.WriteRune(r)
-			lastUnderscore = false
-			continue
-		}
-		if !lastUnderscore {
-			builder.WriteByte('_')
-			lastUnderscore = true
-		}
-	}
-	t.Setenv(strings.TrimRight(builder.String(), "_"), base64.StdEncoding.EncodeToString([]byte(value)))
 }
 
 func waitForProxyError(t *testing.T, done <-chan error, want string) {

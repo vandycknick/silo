@@ -4618,9 +4618,21 @@ mod tests {
 
         drop(lifetime_lock);
 
-        let released = inspect_machine(&runtime, MachineRef::id(machine.id))
-            .await
-            .expect("inspect abandoned start");
+        // Parallel std::process forks can briefly retain the original CLOEXEC
+        // descriptor until exec. Require release, without assuming zero fork time.
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let released = inspect_machine(&runtime, MachineRef::id(machine.id))
+                    .await
+                    .expect("inspect abandoned start");
+                if released.status.label() == "error" {
+                    break released;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("lifetime lock must release after concurrent exec");
         let state = runtime
             .machine_state(machine.id)
             .await

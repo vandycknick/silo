@@ -3,7 +3,6 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use silo_policy::{NetworkPolicy, NetworkSecretKind};
 
 use crate::store::models::MachineNetworkConfig;
@@ -380,24 +379,6 @@ impl EgressCredentials {
         };
 
         let slots = policy.secret_slots();
-        let mut env_names = HashMap::new();
-        for slot in &slots {
-            let env_name = slot.env_name();
-            if let Some(existing) = env_names.get(&env_name) {
-                if *existing != slot.name.as_str() {
-                    return Err(LibVmError::NetworkRuntime {
-                        reference: reference.to_string(),
-                        message: format!(
-                            "network secret slots {:?} and {:?} both map to {}",
-                            existing, slot.name, env_name
-                        ),
-                    });
-                }
-            } else {
-                env_names.insert(env_name, slot.name.as_str());
-            }
-        }
-
         let allowed_slots: HashMap<&str, _> = slots
             .iter()
             .map(|slot| (slot.name.as_str(), slot))
@@ -450,30 +431,6 @@ impl EgressCredentials {
         }
 
         self.validate_oauth_refresh_hook(policy, reference)
-    }
-
-    pub(crate) fn secret_environment(
-        &self,
-        policy: &NetworkPolicy,
-        reference: &str,
-    ) -> Result<Vec<(String, String)>, LibVmError> {
-        self.validate_for_policy(Some(policy), reference)?;
-        let policy_slots = policy.secret_slots();
-        let slots: HashMap<&str, _> = policy_slots
-            .iter()
-            .map(|slot| (slot.name.as_str(), slot.env_name()))
-            .collect();
-        Ok(self
-            .secrets
-            .iter()
-            .map(|secret| {
-                let env_name = slots
-                    .get(secret.slot.as_str())
-                    .expect("validated launch secret slot")
-                    .clone();
-                (env_name, STANDARD.encode(&secret.value))
-            })
-            .collect())
     }
 
     fn validate_oauth_refresh_hook(
@@ -574,15 +531,11 @@ impl OAuthRefreshHook {
         self.refresh_skew_seconds = Some(refresh_skew_seconds);
         self
     }
-
-    pub(crate) fn encoded_auth(&self) -> String {
-        STANDARD.encode(&self.auth)
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::machine::start::*;
 
     #[test]
     fn entrypoint_gets_a_fresh_internal_execution_id_per_launch() {
@@ -767,24 +720,19 @@ mod tests {
     }
 
     #[test]
-    fn egress_credentials_encode_secret_environment() {
+    fn egress_credentials_validate_exact_secret_slots() {
         let policy = oauth_policy();
         let credentials = EgressCredentials::new()
             .secret("codex.oauth.access_token", "token")
             .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z");
 
-        let env = credentials
-            .secret_environment(&policy, "devbox")
-            .expect("secret env");
-
-        assert!(env.contains(&(
-            "SILO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN".to_string(),
-            "dG9rZW4=".to_string()
-        )));
+        credentials
+            .validate_for_policy(Some(&policy), "devbox")
+            .expect("valid secrets");
     }
 
     #[test]
-    fn egress_credentials_reject_policy_secret_env_name_collisions() {
+    fn egress_credentials_accept_distinct_exact_names() {
         let policy: NetworkPolicy = serde_json::from_str(
             r#"
             {
@@ -804,17 +752,9 @@ mod tests {
             .secret("api-key.token", "left")
             .secret("api_key.token", "right");
 
-        let err = credentials
+        credentials
             .validate_for_policy(Some(&policy), "devbox")
-            .expect_err("colliding env names should fail before spawning netd");
-
-        assert!(matches!(
-            err,
-            LibVmError::NetworkRuntime { ref message, .. }
-                if message.contains("api-key.token")
-                    && message.contains("api_key.token")
-                    && message.contains("SILO_NET_SECRET_API_KEY_TOKEN")
-        ));
+            .expect("exact names are distinct");
     }
 
     #[test]

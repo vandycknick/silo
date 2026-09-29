@@ -9,17 +9,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
 )
 
 func TestBasicAuthAppliesPasswordSlotAndOverwritesAuthorization(t *testing.T) {
-	setNetworkSecret(t, "git-basic.password", "stored-password")
-	manager := NewManager()
+	manager := NewManager(NewStatic(map[string][]byte{"git-basic.password": []byte("stored-password")}, nil))
 	req := httptest.NewRequest(http.MethodGet, "https://git.example.test/repo", nil)
 	req.Header.Set("Authorization", "Bearer guest-token")
 
@@ -34,8 +33,7 @@ func TestBasicAuthAppliesPasswordSlotAndOverwritesAuthorization(t *testing.T) {
 }
 
 func TestBearerTokenUsesNetworkSecretAndIdempotencyKey(t *testing.T) {
-	setNetworkSecret(t, "github-api.token", "env-token")
-	manager := NewManager()
+	manager := NewManager(NewStatic(map[string][]byte{"github-api.token": []byte("stored-token")}, nil))
 	req := httptest.NewRequest(http.MethodPost, "https://api.example.test/repos?debug=1", nil)
 	req.Header.Set("Authorization", "Bearer guest-token")
 
@@ -43,8 +41,8 @@ func TestBearerTokenUsesNetworkSecretAndIdempotencyKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply returned error: %v", err)
 	}
-	if got := req.Header.Get("Authorization"); got != "Bearer env-token" {
-		t.Fatalf("expected env bearer token, got %q", got)
+	if got := req.Header.Get("Authorization"); got != "Bearer stored-token" {
+		t.Fatalf("expected stored bearer token, got %q", got)
 	}
 	if req.Header.Get("Idempotency-Key") == "" {
 		t.Fatal("expected idempotency key to be generated")
@@ -52,8 +50,7 @@ func TestBearerTokenUsesNetworkSecretAndIdempotencyKey(t *testing.T) {
 }
 
 func TestHeaderTokenAppliesTokenSlotAndOverwritesManagedHeader(t *testing.T) {
-	setNetworkSecret(t, "internal-api.token", "stored-token")
-	manager := NewManager()
+	manager := NewManager(NewStatic(map[string][]byte{"internal-api.token": []byte("stored-token")}, nil))
 	req := httptest.NewRequest(http.MethodGet, "https://internal.example.test", nil)
 	req.Header.Set("X-Internal-Token", "guest-token")
 
@@ -66,38 +63,34 @@ func TestHeaderTokenAppliesTokenSlotAndOverwritesManagedHeader(t *testing.T) {
 	}
 }
 
-func TestInvalidBase64SecretFailsClosed(t *testing.T) {
-	t.Setenv(envNameForSlot("api.token"), "not base64!!!")
-	manager := NewManager()
+func TestInvalidUTF8SecretFailsClosed(t *testing.T) {
+	manager := NewManager(NewStatic(map[string][]byte{"api.token": {0xff}}, nil))
 	req := httptest.NewRequest(http.MethodGet, "https://api.example.test", nil)
 
 	err := manager.Apply(context.Background(), req, &hooks.Credential{Kind: "bearer_token", Name: "api"})
 	if err == nil || FailureReason(err) != ReasonSecret {
-		t.Fatalf("expected invalid env slot to fail closed with %q, got %v", ReasonSecret, err)
+		t.Fatalf("expected invalid slot to fail closed with %q, got %v", ReasonSecret, err)
 	}
 	if got := req.Header.Get("Authorization"); got != "" {
-		t.Fatalf("invalid env slot must not inject Authorization, got %q", got)
+		t.Fatalf("invalid slot must not inject Authorization, got %q", got)
 	}
 }
 
 func TestRequiredPlainSlotRejectsEmptyValue(t *testing.T) {
-	t.Setenv(envNameForSlot("api.token"), "")
-	manager := NewManager()
+	manager := NewManager(NewStatic(map[string][]byte{"api.token": {}}, nil))
 	req := httptest.NewRequest(http.MethodGet, "https://api.example.test", nil)
 
 	err := manager.Apply(context.Background(), req, &hooks.Credential{Kind: "bearer_token", Name: "api"})
 	if err == nil || FailureReason(err) != ReasonSecret {
-		t.Fatalf("expected empty env slot to fail closed with %q, got %v", ReasonSecret, err)
+		t.Fatalf("expected empty slot to fail closed with %q, got %v", ReasonSecret, err)
 	}
 	if got := req.Header.Get("Authorization"); got != "" {
-		t.Fatalf("empty env slot must not inject Authorization, got %q", got)
+		t.Fatalf("empty slot must not inject Authorization, got %q", got)
 	}
 }
 
 func TestGitHubOAuthUsesBearerForAPIAndBasicForSmartHTTP(t *testing.T) {
-	setNetworkSecret(t, "personal.oauth.access_token", "gh-access-token")
-	setNetworkSecret(t, "personal.oauth.expires_at", "2026-06-02T12:30:00Z")
-	manager := NewManager()
+	manager := NewManager(NewStatic(map[string][]byte{"personal.oauth.access_token": []byte("gh-access-token"), "personal.oauth.expires_at": []byte("2026-06-02T12:30:00Z")}, nil))
 	manager.now = func() time.Time { return mustTime(t, "2026-06-02T12:00:00Z") }
 	credential := &hooks.Credential{Kind: "github_oauth", Name: "personal", Endpoint: "github"}
 
@@ -122,20 +115,14 @@ func TestGitHubOAuthUsesBearerForAPIAndBasicForSmartHTTP(t *testing.T) {
 }
 
 func TestOpenAICodexOAuthInjectsHeadersAndRefreshesExpiredSecretWithHook(t *testing.T) {
-	setNetworkSecret(t, "personal.oauth.access_token", "old-access-token")
-	setNetworkSecret(t, "personal.oauth.expires_at", "2026-06-02T11:59:00Z")
-	setNetworkSecret(t, "personal.oauth.account_id", "acct_old")
-	configureOAuthRefreshHookHelper(t)
-	manager, err := NewManagerFromEnvironment()
-	if err != nil {
-		t.Fatalf("NewManagerFromEnvironment returned error: %v", err)
-	}
+	source := NewStatic(map[string][]byte{"personal.oauth.access_token": []byte("old-access-token"), "personal.oauth.expires_at": []byte("2026-06-02T11:59:00Z"), "personal.oauth.account_id": []byte("acct_old")}, configureOAuthRefreshHookHelper(t, "expired"))
+	manager := NewManager(source)
 	manager.now = func() time.Time { return mustTime(t, "2026-06-02T12:00:00Z") }
 	req := httptest.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/conversation", nil)
 	req.Header.Set("Authorization", "Bearer guest-token")
 	req.Header.Set("ChatGPT-Account-Id", "guest-account")
 
-	err = manager.Apply(context.Background(), req, &hooks.Credential{Kind: "openai_codex_oauth", Name: "personal", Endpoint: "chatgpt"})
+	err := manager.Apply(context.Background(), req, &hooks.Credential{Kind: "openai_codex_oauth", Name: "personal", Endpoint: "chatgpt"})
 	if err != nil {
 		t.Fatalf("Apply returned error: %v", err)
 	}
@@ -145,12 +132,13 @@ func TestOpenAICodexOAuthInjectsHeadersAndRefreshesExpiredSecretWithHook(t *test
 	if got := req.Header.Get("ChatGPT-Account-Id"); got != "acct_new" {
 		t.Fatalf("expected refreshed account id, got %q", got)
 	}
+	if token, _ := source.Lookup("personal.oauth.access_token"); string(token) != "new-access-token" {
+		t.Fatal("source was not refreshed")
+	}
 }
 
 func TestExpiredOAuthWithoutHookFailsClosed(t *testing.T) {
-	setNetworkSecret(t, "personal.oauth.access_token", "old-access-token")
-	setNetworkSecret(t, "personal.oauth.expires_at", "2026-06-02T11:59:00Z")
-	manager := NewManager()
+	manager := NewManager(NewStatic(map[string][]byte{"personal.oauth.access_token": []byte("old-access-token"), "personal.oauth.expires_at": []byte("2026-06-02T11:59:00Z")}, nil))
 	manager.now = func() time.Time { return mustTime(t, "2026-06-02T12:00:00Z") }
 	req := httptest.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/conversation", nil)
 
@@ -164,10 +152,7 @@ func TestExpiredOAuthWithoutHookFailsClosed(t *testing.T) {
 }
 
 func TestAWSCredentialSignsWithStaticSlots(t *testing.T) {
-	setNetworkSecret(t, "prod.access_key_id", "AKIASTATIC")
-	setNetworkSecret(t, "prod.secret_access_key", "static-secret")
-	setNetworkSecret(t, "prod.session_token", "static-session")
-	manager := NewManager()
+	manager := NewManager(NewStatic(map[string][]byte{"prod.access_key_id": []byte("AKIASTATIC"), "prod.secret_access_key": []byte("static-secret"), "prod.session_token": []byte("static-session")}, nil))
 	manager.now = func() time.Time { return mustTime(t, "2026-06-02T12:00:00Z") }
 	req := httptest.NewRequest(http.MethodPost, "https://s3.us-west-2.amazonaws.com/bucket/key", strings.NewReader("hello"))
 	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=PLACEHOLDER/20260602/us-east-1/sts/aws4_request")
@@ -197,26 +182,26 @@ func TestAWSCredentialSignsWithStaticSlots(t *testing.T) {
 }
 
 func TestAWSCredentialProfileSlotUsesProfileResolver(t *testing.T) {
-	setNetworkSecret(t, "prod.profile", "production-admin")
-	manager := NewManager()
+	manager := NewManager(NewStatic(map[string][]byte{"prod.profile": []byte("production-admin")}, nil))
 	manager.now = func() time.Time { return mustTime(t, "2026-06-02T12:00:00Z") }
-	calledProfile := ""
-	manager.awsProfileCredentials = func(_ context.Context, profile string) (aws.Credentials, error) {
-		calledProfile = profile
-		return aws.Credentials{
-			AccessKeyID:     "AKIAPROFILE",
-			SecretAccessKey: "profile-secret",
-			SessionToken:    "profile-session",
-		}, nil
+	path := filepath.Join(t.TempDir(), "credentials")
+	if err := os.WriteFile(path, []byte("[production-admin]\naws_access_key_id=AKIAPROFILE\naws_secret_access_key=profile-secret\naws_session_token=profile-session\n"), 0600); err != nil {
+		t.Fatal(err)
 	}
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", path)
+	configPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(configPath, []byte("[profile production-admin]\nregion=us-east-1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_CONFIG_FILE", configPath)
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	t.Setenv("AWS_SESSION_TOKEN", "")
 	req := httptest.NewRequest(http.MethodGet, "https://dynamodb.us-east-1.amazonaws.com/", nil)
 
 	err := manager.Apply(context.Background(), req, &hooks.Credential{Kind: "aws_credential", Name: "prod"})
 	if err != nil {
 		t.Fatalf("Apply returned error: %v", err)
-	}
-	if calledProfile != "production-admin" {
-		t.Fatalf("expected profile resolver to use production-admin, got %q", calledProfile)
 	}
 	if authorization := req.Header.Get("Authorization"); !strings.Contains(authorization, "Credential=AKIAPROFILE/20260602/us-east-1/dynamodb/aws4_request") {
 		t.Fatalf("expected profile AWS signature, got %q", authorization)
@@ -241,21 +226,31 @@ func TestFailureReasonUsesClassifiedApplyError(t *testing.T) {
 }
 
 func TestOAuthRefreshHookHelperProcess(t *testing.T) {
-	if os.Getenv(OAuthRefreshAuthEnv) == "" {
+	if len(os.Args) < 3 || os.Args[len(os.Args)-2] != "--provider-helper" {
 		return
 	}
-	if os.Getenv(OAuthRefreshAuthEnv) != base64.StdEncoding.EncodeToString([]byte("hook-auth")) {
-		t.Fatalf("hook did not receive expected auth env")
+	if len(os.Environ()) != 0 {
+		t.Fatal("provider environment is not empty")
 	}
-	if os.Getenv(envNameForSlot("personal.oauth.access_token")) != "" {
-		t.Fatalf("hook received network secret env")
+	mode := os.Args[len(os.Args)-1]
+	if mode == "timeout" {
+		time.Sleep(time.Minute)
+		os.Exit(1)
+	}
+	if mode == "fail" {
+		_, _ = os.Stderr.WriteString("must-not-leak-grant-or-token")
+		os.Exit(2)
 	}
 	var request oauthRefreshHookRequest
 	if err := readJSONFrame(os.Stdin, &request); err != nil {
 		t.Fatalf("read hook request: %v", err)
 	}
-	if request.Operation != "oauth_refresh" || request.Credential.Name != "personal" || request.Credential.Kind != "openai_codex_oauth" || request.Credential.Endpoint != "chatgpt" || request.Reason != "expired" {
-		t.Fatalf("unexpected hook request: %#v", request)
+	expectedReason := mode
+	if mode == "invalid-expiry" || mode == "error" || mode == "expired-response" {
+		expectedReason = "expired"
+	}
+	if request.Version != 1 || request.Grant != base64.StdEncoding.EncodeToString([]byte("opaque-hook-auth")) || request.Operation != "oauth_refresh" || request.Credential.Name != "personal" || request.Credential.Kind != "openai_codex_oauth" || request.Credential.Endpoint != "chatgpt" || request.Reason != expectedReason {
+		t.Fatal("unexpected hook request")
 	}
 	response := oauthRefreshHookResponse{
 		Version: 1,
@@ -265,6 +260,16 @@ func TestOAuthRefreshHookHelperProcess(t *testing.T) {
 			ExpiresAt:   "2026-06-02T13:00:00Z",
 			AccountID:   "acct_new",
 		},
+	}
+	if mode == "invalid-expiry" {
+		response.OAuth.ExpiresAt = "bad-expiry"
+	}
+	if mode == "expired-response" {
+		response.OAuth.ExpiresAt = "2026-06-02T11:00:00Z"
+	}
+	if mode == "error" {
+		response.Status = "error"
+		response.Error = oauthRefreshHookErrorBody{Code: "provider_rejected", Message: "must-not-leak-secret"}
 	}
 	payload, err := json.Marshal(response)
 	if err != nil {
@@ -276,30 +281,91 @@ func TestOAuthRefreshHookHelperProcess(t *testing.T) {
 	os.Exit(0)
 }
 
-func configureOAuthRefreshHookHelper(t *testing.T) {
+func TestOAuthRefreshRejectsBadProviderResponse(t *testing.T) {
+	for _, mode := range []string{"invalid-expiry", "expired-response", "error"} {
+		t.Run(mode, func(t *testing.T) {
+			source := NewStatic(map[string][]byte{"personal.oauth.access_token": []byte("old"), "personal.oauth.expires_at": []byte("2026-06-02T11:59:00Z")}, configureOAuthRefreshHookHelper(t, mode))
+			manager := NewManager(source)
+			manager.now = func() time.Time { return mustTime(t, "2026-06-02T12:00:00Z") }
+			req := httptest.NewRequest(http.MethodGet, "https://chatgpt.com/", nil)
+			err := manager.Apply(context.Background(), req, &hooks.Credential{Kind: "openai_codex_oauth", Name: "personal", Endpoint: "chatgpt"})
+			if err == nil || req.Header.Get("Authorization") != "" {
+				t.Fatal("invalid response did not fail closed")
+			}
+			if strings.Contains(err.Error(), "must-not-leak") || strings.Contains(err.Error(), "bad-expiry") {
+				t.Fatal("provider secret leaked into error")
+			}
+		})
+	}
+}
+
+func TestProviderOutputBoundAppliesToIOCopy(t *testing.T) {
+	output := boundedOutput{limit: 128}
+	if _, err := io.Copy(&output, strings.NewReader(strings.Repeat("x", 129))); err == nil {
+		t.Fatal("provider output bound bypassed")
+	}
+	if len(output.Bytes()) > 128 {
+		t.Fatal("provider output exceeded limit")
+	}
+}
+
+func TestOAuthRefreshFailureFallbackAndExpiredFailClosed(t *testing.T) {
+	for _, mode := range []string{"fail", "timeout"} {
+		for _, expired := range []bool{false, true} {
+			t.Run(mode+map[bool]string{false: "-proactive", true: "-expired"}[expired], func(t *testing.T) {
+				provider := configureOAuthRefreshHookHelper(t, mode)
+				provider.TimeoutMS = 50
+				expiry := "2026-06-02T12:01:00Z"
+				if expired {
+					expiry = "2026-06-02T11:59:00Z"
+				}
+				source := NewStatic(map[string][]byte{"personal.oauth.access_token": []byte("old-access-token"), "personal.oauth.expires_at": []byte(expiry)}, provider)
+				manager := NewManager(source)
+				manager.now = func() time.Time { return mustTime(t, "2026-06-02T12:00:00Z") }
+				req := httptest.NewRequest(http.MethodGet, "https://chatgpt.com/", nil)
+				err := manager.Apply(context.Background(), req, &hooks.Credential{Kind: "openai_codex_oauth", Name: "personal", Endpoint: "chatgpt"})
+				if expired {
+					if err == nil || req.Header.Get("Authorization") != "" {
+						t.Fatal("expired credential did not fail closed")
+					}
+				} else if err != nil || req.Header.Get("Authorization") != "Bearer old-access-token" {
+					t.Fatalf("lost proactive fallback: %v", err)
+				}
+				if err != nil && strings.Contains(err.Error(), "must-not-leak") {
+					t.Fatal("provider stderr leaked")
+				}
+			})
+		}
+	}
+}
+
+func TestOAuthRefreshProactiveUsesPolicyMetadata(t *testing.T) {
+	source := NewStatic(map[string][]byte{"personal.oauth.access_token": []byte("old"), "personal.oauth.expires_at": []byte("2026-06-02T12:01:00Z")}, configureOAuthRefreshHookHelper(t, "expires_soon"))
+	manager := NewManager(source)
+	manager.now = func() time.Time { return mustTime(t, "2026-06-02T12:00:00Z") }
+	req := httptest.NewRequest(http.MethodGet, "https://chatgpt.com/", nil)
+	if err := manager.Apply(context.Background(), req, &hooks.Credential{Kind: "openai_codex_oauth", Name: "personal", Endpoint: "chatgpt"}); err != nil {
+		t.Fatal(err)
+	}
+	if req.Header.Get("Authorization") != "Bearer new-access-token" {
+		t.Fatal("proactive refresh missing")
+	}
+}
+
+func configureOAuthRefreshHookHelper(t *testing.T, mode string) *Provider {
 	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable returned error: %v", err)
 	}
-	config := oauthRefreshHookConfig{
+	return &Provider{
 		Version:            1,
 		Command:            executable,
-		Args:               []string{"-test.run=TestOAuthRefreshHookHelperProcess"},
+		Args:               []string{"-test.run=^TestOAuthRefreshHookHelperProcess$", "--", "--provider-helper", mode},
 		TimeoutMS:          5000,
 		RefreshSkewSeconds: 300,
+		Grant:              []byte("opaque-hook-auth"),
 	}
-	payload, err := json.Marshal(config)
-	if err != nil {
-		t.Fatalf("marshal hook config: %v", err)
-	}
-	t.Setenv(OAuthRefreshHookEnv, base64.StdEncoding.EncodeToString(payload))
-	t.Setenv(OAuthRefreshAuthEnv, base64.StdEncoding.EncodeToString([]byte("hook-auth")))
-}
-
-func setNetworkSecret(t *testing.T, slot string, value string) {
-	t.Helper()
-	t.Setenv(envNameForSlot(slot), base64.StdEncoding.EncodeToString([]byte(value)))
 }
 
 func mustTime(t *testing.T, value string) time.Time {

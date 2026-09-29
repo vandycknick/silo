@@ -461,26 +461,6 @@ pub struct NetworkSecretSource {
     pub field: silo_secrets::SecretField,
 }
 
-impl NetworkSecretSlot {
-    pub fn env_name(&self) -> String {
-        let mut name = String::from("SILO_NET_SECRET_");
-        let mut previous_was_separator = false;
-        for character in self.name.chars() {
-            if character.is_ascii_alphanumeric() {
-                name.push(character.to_ascii_uppercase());
-                previous_was_separator = false;
-            } else if !previous_was_separator {
-                name.push('_');
-                previous_was_separator = true;
-            }
-        }
-        while name.ends_with('_') {
-            name.pop();
-        }
-        name
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkSecretRequirement {
     pub owner: String,
@@ -1275,8 +1255,6 @@ impl PolicyValidator {
     }
 
     fn validate_secret_slots(&mut self, policy: &NetworkPolicy) {
-        let mut env_names: BTreeMap<String, String> = BTreeMap::new();
-
         for slot in policy.secret_slots() {
             if !valid_secret_slot(&slot.name) {
                 self.error(
@@ -1286,21 +1264,6 @@ impl PolicyValidator {
                         slot.name
                     ),
                 );
-            }
-
-            let env_name = slot.env_name();
-            if let Some(existing) = env_names.get(&env_name) {
-                if existing != &slot.name {
-                    self.error(
-                        "network secret env name collision",
-                        format!(
-                            "network secret slots {:?} and {:?} both map to {}",
-                            existing, slot.name, env_name
-                        ),
-                    );
-                }
-            } else {
-                env_names.insert(env_name, slot.name);
             }
         }
     }
@@ -1797,7 +1760,6 @@ plugin "echo" {
             slot.name == "codex.oauth.access_token"
                 && slot.required
                 && slot.kind == NetworkSecretKind::OAuth
-                && slot.env_name() == "SILO_NET_SECRET_CODEX_OAUTH_ACCESS_TOKEN"
         }));
         assert!(slots
             .iter()
@@ -1808,8 +1770,8 @@ plugin "echo" {
     }
 
     #[test]
-    fn rejects_network_secret_env_name_collisions() {
-        let error = NetworkPolicy::from_json_str(
+    fn preserves_distinct_exact_secret_names() {
+        let policy = NetworkPolicy::from_json_str(
             r#"
             {
               "version": 1,
@@ -1823,14 +1785,14 @@ plugin "echo" {
             }
             "#,
         )
-        .expect_err("colliding secret env names should fail");
-
-        assert!(error.diagnostics.iter().any(|diagnostic| {
-            diagnostic.summary == "network secret env name collision"
-                && diagnostic.detail.contains("api-key.token")
-                && diagnostic.detail.contains("api_key.token")
-                && diagnostic.detail.contains("SILO_NET_SECRET_API_KEY_TOKEN")
-        }));
+        .expect("exact secret names are distinct");
+        let names: Vec<_> = policy
+            .secret_slots()
+            .into_iter()
+            .map(|slot| slot.name)
+            .collect();
+        assert!(names.contains(&"api-key.token".to_string()));
+        assert!(names.contains(&"api_key.token".to_string()));
     }
 
     #[test]

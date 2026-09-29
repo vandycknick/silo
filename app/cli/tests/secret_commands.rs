@@ -153,18 +153,31 @@ fn v1_refresh_grants_and_arbitrary_store_file_are_preserved() {
     )
     .unwrap();
     let before = std::fs::read(&path).unwrap();
-    for (grant_path, allowed, code) in [
-        (path.clone(), true, "invalid_request"),
-        (dir.path().join("other.json"), true, "unauthorized"),
-        (path.clone(), false, "unauthorized"),
+    for (grant_path, allowed, encoding, code) in [
+        (path.clone(), true, "valid", "invalid_request"),
+        (dir.path().join("other.json"), true, "valid", "unauthorized"),
+        (path.clone(), false, "valid", "unauthorized"),
+        (path.clone(), true, "missing", "unauthorized"),
+        (path.clone(), true, "malformed", "unauthorized"),
+        (path.clone(), true, "double", "unauthorized"),
+        (path.clone(), true, "version", "unauthorized"),
     ] {
-        let grant = serde_json::json!({"version":1,"store_file":grant_path,"credentials":if allowed { vec![serde_json::json!({"name":"personal","kind":"openai_codex_oauth","endpoint":"api","secret_key":"openai_codex_oauth.personal.oauth"})] } else { vec![] }});
-        let request = serde_json::to_vec(&serde_json::json!({"version":1,"operation":"oauth_refresh","credential":{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"},"reason":"expired","expires_at":"2026-09-30T00:00:00Z"})).unwrap();
+        let grant = serde_json::json!({"version":if encoding == "version" {2} else {1},"store_file":grant_path,"credentials":if allowed { vec![serde_json::json!({"name":"personal","kind":"openai_codex_oauth","endpoint":"api","secret_key":"openai_codex_oauth.personal.oauth"})] } else { vec![] }});
+        let encoded = STANDARD.encode(serde_json::to_vec(&grant).unwrap());
+        let mut request = serde_json::json!({"version":1,"operation":"oauth_refresh","credential":{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"},"reason":"expired","expires_at":"2026-09-30T00:00:00Z"});
+        if encoding != "missing" {
+            request["grant"] = Value::String(match encoding {
+                "malformed" => "%%%".to_string(),
+                "double" => STANDARD.encode(encoded.as_bytes()),
+                _ => encoded,
+            });
+        }
+        let request = serde_json::to_vec(&request).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_silo"))
             .env("SILO_HOME", dir.path().join("wrong-home"))
             .env(
                 "SILO_NET_OAUTH_REFRESH_AUTH",
-                STANDARD.encode(serde_json::to_vec(&grant).unwrap()),
+                "ambient-auth-must-be-ignored",
             )
             .args(["secret", "refresh-oauth", "--store-file"])
             .arg(&path)
