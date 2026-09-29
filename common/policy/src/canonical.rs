@@ -165,10 +165,19 @@ impl NetworkPolicy {
             slots.extend(credential_secret_slots(credential));
         }
         for tunnel in &self.tailscale {
-            slots.push(NetworkSecretSlot::required(
-                format!("{}.tailscale.auth_key", tunnel.name),
-                NetworkSecretKind::Plain,
-            ));
+            if let Ok(key) =
+                silo_secrets::SecretName::new(format!("tailscale.{}.auth_key", tunnel.name))
+            {
+                slots.push(NetworkSecretSlot {
+                    name: format!("{}.tailscale.auth_key", tunnel.name),
+                    required: false,
+                    kind: NetworkSecretKind::Plain,
+                    source: NetworkSecretSource {
+                        key,
+                        field: silo_secrets::SecretField::Value,
+                    },
+                });
+            }
         }
         slots
     }
@@ -177,12 +186,6 @@ impl NetworkPolicy {
         let mut requirements = Vec::new();
         for credential in &self.credentials {
             requirements.extend(credential_secret_requirements(credential));
-        }
-        for tunnel in &self.tailscale {
-            requirements.push(NetworkSecretRequirement::one(
-                format!("Tailscale tunnel {}", tunnel.name),
-                vec![format!("{}.tailscale.auth_key", tunnel.name)],
-            ));
         }
         requirements
     }
@@ -449,6 +452,13 @@ pub struct NetworkSecretSlot {
     pub name: String,
     pub required: bool,
     pub kind: NetworkSecretKind,
+    pub source: NetworkSecretSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkSecretSource {
+    pub key: silo_secrets::SecretName,
+    pub field: silo_secrets::SecretField,
 }
 
 impl NetworkSecretSlot {
@@ -468,22 +478,6 @@ impl NetworkSecretSlot {
             name.pop();
         }
         name
-    }
-
-    fn required(name: String, kind: NetworkSecretKind) -> Self {
-        Self {
-            name,
-            required: true,
-            kind,
-        }
-    }
-
-    fn optional(name: String, kind: NetworkSecretKind) -> Self {
-        Self {
-            name,
-            required: false,
-            kind,
-        }
     }
 }
 
@@ -1312,6 +1306,12 @@ impl PolicyValidator {
     }
 
     fn validate_name(&mut self, kind: &str, name: &str) {
+        if name == "silo" && matches!(kind, "credential" | "tailscale tunnel") {
+            self.error(
+                "reserved policy object name",
+                format!("{kind} name silo is reserved for generated secrets"),
+            );
+        }
         if !valid_identifier(name) {
             self.error(
                 "invalid policy object name",
@@ -1350,29 +1350,48 @@ struct NetworkCredentialInfo {
 }
 
 fn credential_secret_slots(credential: &NetworkCredential) -> Vec<NetworkSecretSlot> {
-    let slot = |name: &str| format!("{}.{}", credential.name, name);
-    match credential.kind.as_str() {
-        "basic_auth" => vec![NetworkSecretSlot::required(
-            slot("password"),
-            NetworkSecretKind::Plain,
-        )],
-        "bearer_token" | "header_token" => vec![NetworkSecretSlot::required(
-            slot("token"),
-            NetworkSecretKind::Plain,
-        )],
-        "github_oauth" | "openai_codex_oauth" => vec![
-            NetworkSecretSlot::required(slot("oauth.access_token"), NetworkSecretKind::OAuth),
-            NetworkSecretSlot::required(slot("oauth.expires_at"), NetworkSecretKind::OAuth),
-            NetworkSecretSlot::optional(slot("oauth.account_id"), NetworkSecretKind::OAuth),
+    use silo_secrets::SecretField;
+    let fields: &[(&str, bool, SecretField)] = match credential.kind.as_str() {
+        "basic_auth" => &[("password", true, SecretField::Value)],
+        "bearer_token" | "header_token" => &[("token", true, SecretField::Value)],
+        "github_oauth" | "openai_codex_oauth" => &[
+            ("oauth.access_token", true, SecretField::OAuthAccessToken),
+            ("oauth.expires_at", true, SecretField::OAuthExpiresAt),
+            ("oauth.account_id", false, SecretField::OAuthAccountId),
         ],
-        "aws_credential" => vec![
-            NetworkSecretSlot::required(slot("access_key_id"), NetworkSecretKind::Plain),
-            NetworkSecretSlot::required(slot("secret_access_key"), NetworkSecretKind::Plain),
-            NetworkSecretSlot::optional(slot("session_token"), NetworkSecretKind::Plain),
-            NetworkSecretSlot::optional(slot("profile"), NetworkSecretKind::Plain),
+        "aws_credential" => &[
+            ("access_key_id", true, SecretField::Value),
+            ("secret_access_key", true, SecretField::Value),
+            ("session_token", false, SecretField::Value),
+            ("profile", false, SecretField::Value),
         ],
-        _ => Vec::new(),
-    }
+        _ => &[],
+    };
+    fields
+        .iter()
+        .filter_map(|(suffix, required, field)| {
+            let oauth = *field != SecretField::Value;
+            // Invalid policies are rejected by validate(); don't manufacture an
+            // unchecked store address when inspecting an unvalidated builder.
+            let key = silo_secrets::SecretName::new(format!(
+                "{}.{}.{}",
+                credential.kind,
+                credential.name,
+                if oauth { "oauth" } else { suffix }
+            ))
+            .ok()?;
+            Some(NetworkSecretSlot {
+                name: format!("{}.{}", credential.name, suffix),
+                required: *required,
+                kind: if oauth {
+                    NetworkSecretKind::OAuth
+                } else {
+                    NetworkSecretKind::Plain
+                },
+                source: NetworkSecretSource { key, field: *field },
+            })
+        })
+        .collect()
 }
 
 fn credential_secret_requirements(credential: &NetworkCredential) -> Vec<NetworkSecretRequirement> {
@@ -1785,7 +1804,7 @@ plugin "echo" {
             .any(|slot| slot.name == "codex.oauth.account_id" && !slot.required));
         assert!(slots
             .iter()
-            .any(|slot| slot.name == "worktail.tailscale.auth_key" && slot.required));
+            .any(|slot| slot.name == "worktail.tailscale.auth_key" && !slot.required));
     }
 
     #[test]

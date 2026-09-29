@@ -570,6 +570,14 @@ impl<'a> DocumentBuilder<'a> {
         }
         let kind = labels[0].clone();
         let name = labels[1].clone();
+        if name == "silo" {
+            self.error_at(
+                block_position,
+                "Reserved credential name",
+                "credential name silo is reserved for generated secrets",
+            );
+            return;
+        }
         if !valid_identifier(&name) {
             let position = self
                 .locator
@@ -948,6 +956,14 @@ impl<'a> DocumentBuilder<'a> {
             return;
         }
         let name = labels[0].clone();
+        if name == "silo" {
+            self.error_at(
+                block_position,
+                "Reserved tailscale name",
+                "tailscale name silo is reserved for generated secrets",
+            );
+            return;
+        }
         if !valid_identifier(&name) {
             let position = self
                 .locator

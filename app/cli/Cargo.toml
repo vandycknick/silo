@@ -13,6 +13,7 @@ name = "silo"
 path = "bin/main.rs"
 
 [dependencies]
+secrets = { path = "../../common/secrets" }
 silod-spec = { path = "../../specs/silod-spec" }
 libvm = { path = "../../runtime/libvm" }
 vm-spec = { path = "../../specs/vm-spec" }

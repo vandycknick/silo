@@ -13,8 +13,8 @@ pub use builder::{
 pub use canonical::{
     IpProtocol, NetworkAuditSettings, NetworkCredential, NetworkEgress, NetworkEndpoint,
     NetworkForward, NetworkPolicy, NetworkPolicySettings, NetworkRule, NetworkSecretAlternative,
-    NetworkSecretKind, NetworkSecretRequirement, NetworkSecretSlot, PolicyLoadError,
-    TailscaleTunnel,
+    NetworkSecretKind, NetworkSecretRequirement, NetworkSecretSlot, NetworkSecretSource,
+    PolicyLoadError, TailscaleTunnel,
 };
 pub use condition::{ConditionCompileError, ConditionEvalError, HttpConditionContext};
 pub use model::{
