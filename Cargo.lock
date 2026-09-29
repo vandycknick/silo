@@ -675,6 +675,7 @@ dependencies = [
  "libvm",
  "nix 0.31.3",
  "reqwest",
+ "secrets",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -3527,6 +3528,7 @@ version = "0.1.0"
 dependencies = [
  "cel",
  "hcl-rs",
+ "secrets",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4368,6 +4370,18 @@ dependencies = [
  "der",
  "hybrid-array",
  "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "secrets"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
  "zeroize",
 ]
 

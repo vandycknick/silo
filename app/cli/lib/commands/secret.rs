@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,6 +12,9 @@ use libvm::{
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use silo_secrets::{
+    FileStore, OAuthSecret, Secret, SecretBytes, SecretField, SecretName, SecretScope, SecretStore,
+};
 
 use crate::context::Context;
 use crate::ui::{self, OutputFormat, Table};
@@ -26,7 +28,6 @@ const OPENAI_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/cal
 const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
 const OPENAI_CODEX_KIND: &str = "openai_codex_oauth";
 const OPENAI_DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const SECRET_STORE_FILE_NAME: &str = "secrets.json";
 const OAUTH_REFRESH_AUTH_ENV: &str = "SILO_NET_OAUTH_REFRESH_AUTH";
 
 const EXAMPLES: &[&str] = &[
@@ -170,23 +171,23 @@ impl Cmd {
     pub async fn run(self, _context: &mut Context) -> eyre::Result<()> {
         match &self.command {
             SecretSubcommand::Login(command) => {
-                let store = SecretStore::from_env()?;
+                let store = file_store_from_env()?;
                 login(&store, command).await
             }
             SecretSubcommand::Set(command) => {
-                let store = SecretStore::from_env()?;
+                let store = file_store_from_env()?;
                 set_plain_secret(&store, command)
             }
             SecretSubcommand::List(command) => {
-                let store = SecretStore::from_env()?;
+                let store = file_store_from_env()?;
                 list_secrets(&store, command)
             }
             SecretSubcommand::Show(command) => {
-                let store = SecretStore::from_env()?;
+                let store = file_store_from_env()?;
                 show_secret(&store, command)
             }
             SecretSubcommand::Rm(command) => {
-                let store = SecretStore::from_env()?;
+                let store = file_store_from_env()?;
                 remove_secret(&store, command)
             }
             SecretSubcommand::RefreshOAuth(command) => refresh_oauth(command).await,
@@ -203,9 +204,10 @@ fn parse_provider(input: &str) -> Result<LoginProvider, String> {
     }
 }
 
-async fn login(store: &SecretStore, command: &LoginCmd) -> eyre::Result<()> {
+async fn login(store: &FileStore, command: &LoginCmd) -> eyre::Result<()> {
     let key = slot_key(OPENAI_CODEX_KIND, &command.name, "oauth");
-    if store.contains(&key)? {
+    let name = cli_secret_name(&key)?;
+    if store.get(&SecretScope::Home, &name)?.is_some() {
         eyre::bail!(
             "secret `{}` already exists in {}",
             key,
@@ -216,16 +218,25 @@ async fn login(store: &SecretStore, command: &LoginCmd) -> eyre::Result<()> {
     let token = match command.provider {
         LoginProvider::OpenAICodex => login_openai_codex().await?,
     };
-    let now = rfc3339_now();
-    let secret = Secret::OAuth {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        expires_at: expires_at_from_seconds(token.expires_in),
+    let now = timestamp_now();
+    let secret = Secret::OAuth(OAuthSecret {
+        provider: None,
+        access_token: SecretBytes::new(token.access_token.into_bytes()),
+        refresh_token: SecretBytes::new(token.refresh_token.into_bytes()),
+        expires_at: expires_at_from_seconds(token.expires_in).parse()?,
         account_id: None,
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    store.put(&key, secret)?;
+        created_at: Some(now),
+        updated_at: Some(now),
+    });
+    store.transaction(&SecretScope::Home, |tx| {
+        if tx.get(&name)?.is_some() {
+            return Err(silo_secrets::SecretError::InvalidRequest(format!(
+                "secret `{key}` already exists in {}",
+                store.path().display()
+            )));
+        }
+        tx.put(&name, secret)
+    })?;
 
     ui::success(format!(
         "saved secret `{}` in {}",
@@ -370,7 +381,7 @@ where
     Ok(serde_json::from_str(&body)?)
 }
 
-fn set_plain_secret(store: &SecretStore, command: &SetCmd) -> eyre::Result<()> {
+fn set_plain_secret(store: &FileStore, command: &SetCmd) -> eyre::Result<()> {
     if command.stdin_source_count() > 1 {
         eyre::bail!("only one stdin-backed secret value can be provided at a time");
     }
@@ -396,7 +407,7 @@ fn set_plain_secret(store: &SecretStore, command: &SetCmd) -> eyre::Result<()> {
 }
 
 fn set_provider_plain_secret(
-    store: &SecretStore,
+    store: &FileStore,
     kind: &str,
     name: &str,
     command: &SetCmd,
@@ -598,54 +609,44 @@ fn read_stdin_string() -> eyre::Result<String> {
 }
 
 fn write_plain_secret(
-    store: &SecretStore,
+    store: &FileStore,
     name: &str,
     value: String,
     force: bool,
 ) -> eyre::Result<()> {
-    if store.contains(name)? && !force {
-        eyre::bail!(
-            "secret `{}` already exists in {}; pass --force to replace it",
-            name,
-            store.path().display()
-        );
-    }
-    store.put(name, Secret::Plain { value })?;
-    ui::success(format!(
-        "saved secret `{}` in {}",
-        name,
-        store.path().display()
-    ));
-    Ok(())
+    write_plain_secret_entries(store, vec![(name.to_owned(), value)], force)
 }
 
 fn write_plain_secret_entries(
-    store: &SecretStore,
+    store: &FileStore,
     entries: Vec<(String, String)>,
     force: bool,
 ) -> eyre::Result<()> {
     if entries.is_empty() {
         eyre::bail!("no secret slots to write");
     }
-    if !force {
-        for (name, _) in &entries {
-            if store.contains(name)? {
-                eyre::bail!(
+    let names = entries
+        .iter()
+        .map(|(name, _)| cli_secret_name(name))
+        .collect::<eyre::Result<Vec<_>>>()?;
+    store.transaction(&SecretScope::Home, |tx| {
+        for name in &names {
+            if !force && tx.get(name)?.is_some() {
+                return Err(silo_secrets::SecretError::InvalidRequest(format!(
                     "secret `{}` already exists in {}; pass --force to replace it",
-                    name,
+                    name.as_str(),
                     store.path().display()
-                );
+                )));
             }
         }
-    }
-    for (name, value) in &entries {
-        store.put(
-            name,
-            Secret::Plain {
-                value: value.clone(),
-            },
-        )?;
-    }
+        for (name, (_, value)) in names.iter().zip(&entries) {
+            tx.put(
+                name,
+                Secret::Plain(SecretBytes::new(value.as_bytes().to_vec())),
+            )?;
+        }
+        Ok(())
+    })?;
     for (name, _) in entries {
         ui::success(format!(
             "saved secret `{}` in {}",
@@ -682,22 +683,40 @@ pub(crate) fn egress_credentials_from_secret_store(
         return Ok(EgressCredentials::new());
     }
     let hook_command = std::env::current_exe()?;
-    let store = SecretStore::from_env()?;
+    let store = file_store_from_env()?;
     egress_credentials_from_store(policy, &store, &hook_command)
 }
 
 fn egress_credentials_from_store(
     policy: &NetworkPolicy,
-    store: &SecretStore,
+    store: &FileStore,
     hook_command: &Path,
 ) -> eyre::Result<EgressCredentials> {
     let mut credentials = EgressCredentials::new();
     let mut supplied_slots = std::collections::BTreeSet::new();
-    for slot in policy.secret_slots() {
-        if should_skip_network_slot(policy, store, &slot)? {
+    let slots = policy.secret_slots();
+    let mut profile_owners = std::collections::BTreeSet::new();
+    for slot in &slots {
+        if slot.source.key.as_str().starts_with("aws_credential.")
+            && slot.name.ends_with(".profile")
+            && projected_slot_value(store, slot)?.is_some()
+        {
+            if let Some((owner, _)) = slot.name.split_once('.') {
+                profile_owners.insert(owner.to_owned());
+            }
+        }
+    }
+    for slot in slots {
+        if slot.name.split_once('.').is_some_and(|(owner, field)| {
+            profile_owners.contains(owner)
+                && matches!(
+                    field,
+                    "access_key_id" | "secret_access_key" | "session_token"
+                )
+        }) {
             continue;
         }
-        if let Some(value) = network_secret_value(policy, store, &slot)? {
+        if let Some(value) = projected_slot_value(store, &slot)? {
             supplied_slots.insert(slot.name.clone());
             credentials = credentials.secret(slot.name, value);
         }
@@ -714,7 +733,7 @@ fn egress_credentials_from_store(
 
 fn oauth_refresh_hook_from_store(
     policy: &NetworkPolicy,
-    store: &SecretStore,
+    store: &FileStore,
     hook_command: &Path,
 ) -> eyre::Result<Option<OAuthRefreshHook>> {
     let grant = oauth_refresh_grant(policy, store)?;
@@ -733,23 +752,26 @@ fn oauth_refresh_hook_from_store(
 
 fn oauth_refresh_grant(
     policy: &NetworkPolicy,
-    store: &SecretStore,
+    store: &FileStore,
 ) -> eyre::Result<OAuthRefreshGrant> {
     let mut credentials = Vec::new();
     for credential in policy.credentials() {
-        if !credential_uses_oauth_secret_slots(policy, credential) {
-            continue;
-        }
-        let key = slot_key(&credential.kind, &credential.name, "oauth");
-        let Some(secret) = store.get_optional(&key)? else {
+        let Some(slot) = policy.secret_slots().into_iter().find(|slot| {
+            slot.kind == NetworkSecretKind::OAuth
+                && slot.name == format!("{}.oauth.access_token", credential.name)
+        }) else {
             continue;
         };
-        if matches!(secret, Secret::OAuth { .. }) {
+        let key = slot.source.key;
+        let Some(secret) = store.get(&SecretScope::Home, &key)? else {
+            continue;
+        };
+        if matches!(secret, Secret::OAuth(_)) {
             credentials.push(OAuthRefreshGrantCredential {
                 name: credential.name.clone(),
                 kind: credential.kind.clone(),
                 endpoint: credential.endpoint.clone(),
-                secret_key: key,
+                secret_key: key.as_str().to_owned(),
             });
         }
     }
@@ -760,102 +782,34 @@ fn oauth_refresh_grant(
     })
 }
 
-fn credential_uses_oauth_secret_slots(
-    policy: &NetworkPolicy,
-    credential: &NetworkCredential,
-) -> bool {
-    let prefix = format!("{}.", credential.name);
-    policy
-        .secret_slots()
-        .into_iter()
-        .any(|slot| slot.kind == NetworkSecretKind::OAuth && slot.name.starts_with(prefix.as_str()))
-}
-
-fn network_secret_value(
-    policy: &NetworkPolicy,
-    store: &SecretStore,
+fn projected_slot_value(
+    store: &FileStore,
     slot: &NetworkSecretSlot,
 ) -> eyre::Result<Option<String>> {
-    if let Some(secret) = store.get_optional(&slot.name)? {
-        return secret_plain_value(&slot.name, secret, store.path()).map(Some);
-    }
-
-    if let Some(credential) = credential_for_slot(policy, &slot.name) {
-        return credential_secret_value(store, credential, slot);
-    }
-
-    tailscale_secret_value(store, &slot.name)
-}
-
-fn should_skip_network_slot(
-    policy: &NetworkPolicy,
-    store: &SecretStore,
-    slot: &NetworkSecretSlot,
-) -> eyre::Result<bool> {
-    let Some(credential) = credential_for_slot(policy, &slot.name) else {
-        return Ok(false);
+    // Exact raw slot records predate canonical store keys and take precedence.
+    let (key, secret, field) =
+        if let Some(secret) = store.get(&SecretScope::Home, &SecretName::legacy(&slot.name))? {
+            (&slot.name[..], secret, SecretField::Value)
+        } else if let Some(secret) = store.get(&SecretScope::Home, &slot.source.key)? {
+            (slot.source.key.as_str(), secret, slot.source.field)
+        } else {
+            return Ok(None);
+        };
+    let expected = if field == SecretField::Value {
+        "plain"
+    } else {
+        "oauth"
     };
-    if credential.kind != "aws_credential" {
-        return Ok(false);
+    if secret.secret_type() != expected {
+        eyre::bail!(
+            "secret `{key}` in {} has type {}, expected {expected}",
+            store.path().display(),
+            secret.secret_type()
+        );
     }
-    let Some(slot_suffix) = slot.name.strip_prefix(&format!("{}.", credential.name)) else {
-        return Ok(false);
-    };
-    if !matches!(
-        slot_suffix,
-        "access_key_id" | "secret_access_key" | "session_token"
-    ) {
-        return Ok(false);
-    }
-    Ok(network_secret_value(
-        policy,
-        store,
-        &NetworkSecretSlot {
-            name: format!("{}.profile", credential.name),
-            required: false,
-            kind: NetworkSecretKind::Plain,
-        },
-    )?
-    .is_some())
-}
-
-fn credential_secret_value(
-    store: &SecretStore,
-    credential: &NetworkCredential,
-    slot: &NetworkSecretSlot,
-) -> eyre::Result<Option<String>> {
-    let Some(slot_suffix) = slot.name.strip_prefix(&format!("{}.", credential.name)) else {
-        return Ok(None);
-    };
-    match slot.kind {
-        NetworkSecretKind::Plain => {
-            let key = slot_key(&credential.kind, &credential.name, slot_suffix);
-            store
-                .get_optional(&key)?
-                .map(|secret| secret_plain_value(&key, secret, store.path()))
-                .transpose()
-        }
-        NetworkSecretKind::OAuth => {
-            let Some(oauth_field) = slot_suffix.strip_prefix("oauth.") else {
-                return Ok(None);
-            };
-            let key = slot_key(&credential.kind, &credential.name, "oauth");
-            let Some(secret) = store.get_optional(&key)? else {
-                return Ok(None);
-            };
-            secret_oauth_field(&key, secret, oauth_field, store.path())
-        }
-    }
-}
-
-fn tailscale_secret_value(store: &SecretStore, slot_name: &str) -> eyre::Result<Option<String>> {
-    let Some((name, "tailscale.auth_key")) = slot_name.split_once('.') else {
-        return Ok(None);
-    };
-    let key = format!("tailscale.{name}.auth_key");
-    store
-        .get_optional(&key)?
-        .map(|secret| secret_plain_value(&key, secret, store.path()))
+    secret
+        .project(field)
+        .map(|value| non_empty_secret_value(key, value.as_str()?.to_owned(), store.path()))
         .transpose()
 }
 
@@ -868,45 +822,6 @@ fn credential_for_slot<'a>(
         .credentials()
         .iter()
         .find(|credential| credential.name == name)
-}
-
-fn secret_plain_value(key: &str, secret: Secret, path: &Path) -> eyre::Result<String> {
-    match secret {
-        Secret::Plain { value } => non_empty_secret_value(key, value, path),
-        other => eyre::bail!(
-            "secret `{key}` in {} has type {}, expected plain",
-            path.display(),
-            other.secret_type()
-        ),
-    }
-}
-
-fn secret_oauth_field(
-    key: &str,
-    secret: Secret,
-    field: &str,
-    path: &Path,
-) -> eyre::Result<Option<String>> {
-    let Secret::OAuth {
-        access_token,
-        expires_at,
-        account_id,
-        ..
-    } = secret
-    else {
-        eyre::bail!(
-            "secret `{key}` in {} has type plain, expected oauth",
-            path.display()
-        );
-    };
-    match field {
-        "access_token" => non_empty_secret_value(key, access_token, path).map(Some),
-        "expires_at" => non_empty_secret_value(key, expires_at, path).map(Some),
-        "account_id" => account_id
-            .map(|value| non_empty_secret_value(key, value, path))
-            .transpose(),
-        _ => Ok(None),
-    }
 }
 
 fn non_empty_secret_value(key: &str, value: String, path: &Path) -> eyre::Result<String> {
@@ -969,49 +884,19 @@ fn expected_secret_alternative_keys(
     policy: &NetworkPolicy,
     alternative: &NetworkSecretAlternative,
 ) -> Vec<Vec<String>> {
-    if let Some(credential) = credential_for_alternative(policy, alternative) {
-        let slot_suffixes = alternative
-            .slots
-            .iter()
-            .filter_map(|slot| slot.strip_prefix(&format!("{}.", credential.name)))
-            .collect::<Vec<_>>();
-        let slot_kinds = alternative
-            .slots
-            .iter()
-            .filter_map(|slot_name| policy_slot(policy, slot_name).map(|slot| slot.kind))
-            .collect::<Vec<_>>();
-        if slot_kinds
-            .iter()
-            .all(|kind| *kind == NetworkSecretKind::OAuth)
-        {
-            return vec![
-                vec![slot_key(&credential.kind, &credential.name, "oauth")],
-                alternative.slots.clone(),
-            ];
-        }
-        if slot_kinds
-            .iter()
-            .all(|kind| *kind == NetworkSecretKind::Plain)
-            && slot_suffixes.len() == alternative.slots.len()
-        {
-            return vec![
-                slot_suffixes
-                    .iter()
-                    .map(|suffix| slot_key(&credential.kind, &credential.name, suffix))
-                    .collect(),
-                alternative.slots.clone(),
-            ];
-        }
+    let mut keys = alternative
+        .slots
+        .iter()
+        .filter_map(|name| policy_slot(policy, name))
+        .map(|slot| slot.source.key.as_str().to_owned())
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    if keys.is_empty() {
+        vec![alternative.slots.clone()]
+    } else {
+        vec![keys, alternative.slots.clone()]
     }
-
-    if let Some(tunnel_name) = tailscale_tunnel_for_alternative(alternative) {
-        return vec![
-            vec![format!("tailscale.{tunnel_name}.auth_key")],
-            alternative.slots.clone(),
-        ];
-    }
-
-    vec![alternative.slots.clone()]
 }
 
 fn credential_for_alternative<'a>(
@@ -1122,8 +1007,30 @@ fn format_expected_secret_alternatives(alternatives: &[Vec<String>]) -> String {
         .join(" or ")
 }
 
-fn list_secrets(store: &SecretStore, command: &ListCmd) -> eyre::Result<()> {
-    let secrets = store.list()?;
+fn list_secrets(store: &FileStore, command: &ListCmd) -> eyre::Result<()> {
+    let mut secrets = store
+        .list(&SecretScope::Home)?
+        .into_iter()
+        .map(|entry| SecretSummary {
+            provider: if entry.kind == silo_secrets::SecretKind::Plain {
+                "plain"
+            } else {
+                OPENAI_CODEX_PROVIDER
+            },
+            name: entry.name.as_str().to_owned(),
+            kind: if entry.kind == silo_secrets::SecretKind::Plain {
+                "plain"
+            } else {
+                OPENAI_CODEX_KIND
+            },
+            expires_at: entry
+                .expires_at
+                .map(|v| v.to_rfc3339_opts(SecondsFormat::AutoSi, true))
+                .unwrap_or_default(),
+            path: store.path().to_owned(),
+        })
+        .collect::<Vec<_>>();
+    secrets.sort_by(|a, b| a.provider.cmp(b.provider).then(a.name.cmp(&b.name)));
     match command.format {
         OutputFormat::Json => ui::print_json(&secrets),
         OutputFormat::Plain => {
@@ -1146,13 +1053,15 @@ fn list_secrets(store: &SecretStore, command: &ListCmd) -> eyre::Result<()> {
     }
 }
 
-fn show_secret(store: &SecretStore, command: &ShowCmd) -> eyre::Result<()> {
+fn show_secret(store: &FileStore, command: &ShowCmd) -> eyre::Result<()> {
     let path = store.path();
     if command.path {
         println!("{}", path.display());
         return Ok(());
     }
-    let secret = store.get(&command.name)?;
+    let secret = store
+        .get(&SecretScope::Home, &SecretName::legacy(&command.name))?
+        .ok_or_else(|| eyre::eyre!("secret `{}` not found", command.name))?;
     let redacted = RedactedSecret::from_secret(&command.name, &secret, path);
     match command.format {
         OutputFormat::Json => ui::print_json(&redacted),
@@ -1180,14 +1089,16 @@ fn print_secret_details(secret: &RedactedSecret) -> eyre::Result<()> {
     ui::print_detail_rows(&rows)
 }
 
-fn remove_secret(store: &SecretStore, command: &RmCmd) -> eyre::Result<()> {
+fn remove_secret(store: &FileStore, command: &RmCmd) -> eyre::Result<()> {
     if !command.force {
         eyre::bail!(
             "refusing to remove secret `{}` without --force",
             command.name
         );
     }
-    store.remove(&command.name)?;
+    if !store.delete(&SecretScope::Home, &SecretName::legacy(&command.name))? {
+        eyre::bail!("secret `{}` not found", command.name);
+    }
     ui::success(format!(
         "removed secret `{}` from {}",
         command.name,
@@ -1213,7 +1124,7 @@ fn print_hcl_snippet(name: &str) -> eyre::Result<()> {
 
 async fn refresh_oauth(command: &RefreshOAuthCmd) -> eyre::Result<()> {
     let request = read_json_frame(std::io::stdin().lock())?;
-    let store = SecretStore::new(command.store_file.clone());
+    let store = FileStore::with_store_file(command.store_file.clone())?;
     let response = match refresh_oauth_request(&store, &command.store_file, request).await {
         Ok(oauth) => OAuthRefreshHookResponse::ok(oauth),
         Err(error) => OAuthRefreshHookResponse::error(error),
@@ -1222,7 +1133,7 @@ async fn refresh_oauth(command: &RefreshOAuthCmd) -> eyre::Result<()> {
 }
 
 async fn refresh_oauth_request(
-    store: &SecretStore,
+    store: &FileStore,
     store_file: &Path,
     request: OAuthRefreshHookRequest,
 ) -> Result<OAuthRefreshHookOAuth, OAuthRefreshFailure> {
@@ -1254,14 +1165,8 @@ async fn refresh_oauth_request(
             "OAuth refresh grant does not allow this credential",
         ));
     };
-    let secret = store
-        .get_optional(&grant_credential.secret_key)
-        .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?
-        .ok_or_else(|| OAuthRefreshFailure::not_found("OAuth secret was not found"))?;
     match request.credential.kind.as_str() {
-        OPENAI_CODEX_KIND => {
-            refresh_openai_codex_oauth(store, &grant_credential.secret_key, secret).await
-        }
+        OPENAI_CODEX_KIND => refresh_openai_codex_oauth(store, &grant_credential.secret_key).await,
         other => Err(OAuthRefreshFailure::invalid_request(format!(
             "OAuth credential kind {other:?} is not refreshable by this command"
         ))),
@@ -1277,16 +1182,26 @@ fn decode_oauth_refresh_grant(encoded: &str) -> Result<OAuthRefreshGrant, OAuthR
 }
 
 async fn refresh_openai_codex_oauth(
-    store: &SecretStore,
+    store: &FileStore,
     key: &str,
-    secret: Secret,
 ) -> Result<OAuthRefreshHookOAuth, OAuthRefreshFailure> {
-    let Secret::OAuth {
+    let store = store.clone();
+    let mut tx = tokio::task::spawn_blocking(move || store.begin_transaction(&SecretScope::Home))
+        .await
+        .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?
+        .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?;
+    let name = SecretName::legacy(key);
+    let secret = tx
+        .get(&name)
+        .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?
+        .ok_or_else(|| OAuthRefreshFailure::not_found("OAuth secret was not found"))?;
+    let Secret::OAuth(OAuthSecret {
+        provider,
         refresh_token,
         account_id,
         created_at,
         ..
-    } = secret
+    }) = secret
     else {
         return Err(OAuthRefreshFailure::invalid_request(format!(
             "secret {key:?} is not an OAuth secret"
@@ -1302,23 +1217,33 @@ async fn refresh_openai_codex_oauth(
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?;
-    let token = refresh_openai_codex_token(&client, &refresh_token).await?;
+    let token = refresh_openai_codex_token(
+        &client,
+        refresh_token
+            .as_str()
+            .map_err(|err| OAuthRefreshFailure::invalid_request(err.to_string()))?,
+    )
+    .await?;
     let next_refresh_token = if token.refresh_token.is_empty() {
         refresh_token
     } else {
-        token.refresh_token
+        SecretBytes::new(token.refresh_token.into_bytes())
     };
     let expires_at = expires_at_from_seconds(token.expires_in);
-    let updated = Secret::OAuth {
-        access_token: token.access_token.clone(),
+    let updated = Secret::OAuth(OAuthSecret {
+        provider,
+        access_token: SecretBytes::new(token.access_token.as_bytes().to_vec()),
         refresh_token: next_refresh_token,
-        expires_at: expires_at.clone(),
+        expires_at: expires_at
+            .parse()
+            .map_err(|err: chrono::ParseError| OAuthRefreshFailure::internal(err.to_string()))?,
         account_id: account_id.clone(),
         created_at,
-        updated_at: rfc3339_now(),
-    };
-    store
-        .put(key, updated)
+        updated_at: Some(timestamp_now()),
+    });
+    tx.put(&name, updated)
+        .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?;
+    tx.commit()
         .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?;
     Ok(OAuthRefreshHookOAuth {
         access_token: token.access_token,
@@ -1601,53 +1526,6 @@ struct TokenResponse {
     expires_in: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", deny_unknown_fields)]
-enum Secret {
-    #[serde(rename = "plain")]
-    Plain { value: String },
-    #[serde(rename = "oauth")]
-    OAuth {
-        access_token: String,
-        refresh_token: String,
-        expires_at: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        account_id: Option<String>,
-        created_at: String,
-        updated_at: String,
-    },
-}
-
-impl Secret {
-    fn provider(&self) -> &'static str {
-        match self {
-            Self::Plain { .. } => "plain",
-            Self::OAuth { .. } => OPENAI_CODEX_PROVIDER,
-        }
-    }
-
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Plain { .. } => "plain",
-            Self::OAuth { .. } => OPENAI_CODEX_KIND,
-        }
-    }
-
-    fn secret_type(&self) -> &'static str {
-        match self {
-            Self::Plain { .. } => "plain",
-            Self::OAuth { .. } => "oauth",
-        }
-    }
-
-    fn expires_at(&self) -> Option<&str> {
-        match self {
-            Self::Plain { .. } => None,
-            Self::OAuth { expires_at, .. } => Some(expires_at.as_str()),
-        }
-    }
-}
-
 #[derive(Debug, Serialize)]
 struct RedactedSecret {
     provider: &'static str,
@@ -1669,34 +1547,34 @@ struct RedactedSecret {
 impl RedactedSecret {
     fn from_secret(name: &str, secret: &Secret, path: &Path) -> Self {
         match secret {
-            Secret::Plain { .. } => Self {
-                provider: secret.provider(),
+            Secret::Plain(_) => Self {
+                provider: "plain",
                 name: name.to_string(),
                 path: path.to_path_buf(),
                 secret_type: secret.secret_type(),
-                kind: secret.kind(),
+                kind: "plain",
                 expires_at: None,
                 account_id: None,
                 created_at: None,
                 updated_at: None,
                 redacted_fields: vec!["value"],
             },
-            Secret::OAuth {
+            Secret::OAuth(OAuthSecret {
                 expires_at,
                 account_id,
                 created_at,
                 updated_at,
                 ..
-            } => Self {
-                provider: secret.provider(),
+            }) => Self {
+                provider: OPENAI_CODEX_PROVIDER,
                 name: name.to_string(),
                 path: path.to_path_buf(),
                 secret_type: secret.secret_type(),
-                kind: secret.kind(),
-                expires_at: Some(expires_at.clone()),
+                kind: OPENAI_CODEX_KIND,
+                expires_at: Some(expires_at.to_rfc3339_opts(SecondsFormat::AutoSi, true)),
                 account_id: account_id.clone(),
-                created_at: Some(created_at.clone()),
-                updated_at: Some(updated_at.clone()),
+                created_at: created_at.map(|v| v.to_rfc3339_opts(SecondsFormat::AutoSi, true)),
+                updated_at: updated_at.map(|v| v.to_rfc3339_opts(SecondsFormat::AutoSi, true)),
                 redacted_fields: vec!["access_token", "refresh_token"],
             },
         }
@@ -1712,127 +1590,19 @@ struct SecretSummary {
     path: PathBuf,
 }
 
-struct SecretStore {
-    path: PathBuf,
+fn file_store_from_env() -> eyre::Result<FileStore> {
+    Ok(FileStore::new(libvm::HostPaths::from_env()?.home()))
 }
 
-impl SecretStore {
-    fn from_env() -> eyre::Result<Self> {
-        Ok(Self::new(
-            libvm::HostPaths::from_env()?
-                .home()
-                .join(SECRET_STORE_FILE_NAME),
-        ))
+fn cli_secret_name(name: &str) -> eyre::Result<SecretName> {
+    let name = SecretName::new(name)?;
+    if name.as_str().starts_with("silo.") {
+        eyre::bail!(
+            "secret name `{}` is reserved for Silo-generated secrets",
+            name.as_str()
+        );
     }
-
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn contains(&self, name: &str) -> eyre::Result<bool> {
-        validate_secret_name(name)?;
-        Ok(self.read_all()?.contains_key(name))
-    }
-
-    fn put(&self, name: &str, secret: Secret) -> eyre::Result<()> {
-        validate_secret_name(name)?;
-        let mut secrets = self.read_all()?;
-        secrets.insert(name.to_string(), secret);
-        self.write_all(&secrets)
-    }
-
-    fn get(&self, name: &str) -> eyre::Result<Secret> {
-        self.get_optional(name)?
-            .ok_or_else(|| eyre::eyre!("secret `{name}` not found"))
-    }
-
-    fn get_optional(&self, name: &str) -> eyre::Result<Option<Secret>> {
-        validate_secret_name(name)?;
-        Ok(self.read_all()?.remove(name))
-    }
-
-    fn remove(&self, name: &str) -> eyre::Result<()> {
-        validate_secret_name(name)?;
-        let mut secrets = self.read_all()?;
-        if secrets.remove(name).is_none() {
-            eyre::bail!("secret `{name}` not found");
-        }
-        self.write_all(&secrets)
-    }
-
-    fn list(&self) -> eyre::Result<Vec<SecretSummary>> {
-        let mut secrets = self
-            .read_all()?
-            .into_iter()
-            .map(|(name, secret)| SecretSummary {
-                provider: secret.provider(),
-                name,
-                kind: secret.kind(),
-                expires_at: secret.expires_at().unwrap_or_default().to_string(),
-                path: self.path.clone(),
-            })
-            .collect::<Vec<_>>();
-        secrets.sort_by(|a, b| a.provider.cmp(b.provider).then(a.name.cmp(&b.name)));
-        Ok(secrets)
-    }
-
-    fn read_all(&self) -> eyre::Result<BTreeMap<String, Secret>> {
-        if !self.path.exists() {
-            return Ok(BTreeMap::new());
-        }
-        let raw = std::fs::read_to_string(&self.path)?;
-        if raw.trim().is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        let secrets = serde_json::from_str::<BTreeMap<String, Secret>>(&raw)?;
-        for name in secrets.keys() {
-            validate_secret_name(name)?;
-        }
-        Ok(secrets)
-    }
-
-    fn write_all(&self, secrets: &BTreeMap<String, Secret>) -> eyre::Result<()> {
-        let Some(parent) = self.path.parent() else {
-            eyre::bail!("invalid secret store path {}", self.path.display());
-        };
-        std::fs::create_dir_all(parent)?;
-        set_secure_dir_permissions(parent)?;
-        let file_name = self
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| eyre::eyre!("invalid secret store path {}", self.path.display()))?;
-        let tmp_path = self
-            .path
-            .with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
-        let mut body = serde_json::to_vec_pretty(secrets)?;
-        body.push(b'\n');
-        write_secure_file(&tmp_path, &body)?;
-        set_secure_file_permissions(&tmp_path)?;
-        std::fs::rename(&tmp_path, &self.path)?;
-        set_secure_file_permissions(&self.path)?;
-        Ok(())
-    }
-}
-
-fn validate_secret_name(name: &str) -> eyre::Result<()> {
-    if name.is_empty() {
-        eyre::bail!("secret name cannot be empty");
-    }
-    if name == "." || name == ".." || name.starts_with('.') {
-        eyre::bail!("secret name `{name}` is not allowed");
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
-        eyre::bail!("secret name `{name}` may only contain ASCII letters, numbers, dots, underscores, and dashes");
-    }
-    Ok(())
+    Ok(name)
 }
 
 fn expires_at_from_seconds(expires_in: i64) -> String {
@@ -1844,8 +1614,9 @@ fn expires_at_from_seconds(expires_in: i64) -> String {
     expires_at.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-fn rfc3339_now() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+fn timestamp_now() -> chrono::DateTime<Utc> {
+    let now = Utc::now();
+    now - chrono::Duration::nanoseconds(i64::from(now.timestamp_subsec_nanos()))
 }
 
 fn sanitize_response_body(body: &str) -> String {
@@ -1862,61 +1633,6 @@ fn sanitize_response_body(body: &str) -> String {
     }
 }
 
-#[cfg(unix)]
-fn write_secure_file(path: &Path, body: &[u8]) -> eyre::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(body)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_secure_file(path: &Path, body: &[u8]) -> eyre::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(body)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_secure_dir_permissions(path: &Path) -> eyre::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = std::fs::metadata(path)?.permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(path, permissions)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_secure_dir_permissions(_path: &Path) -> eyre::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_secure_file_permissions(path: &Path) -> eyre::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = std::fs::metadata(path)?.permissions();
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(path, permissions)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_secure_file_permissions(_path: &Path) -> eyre::Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1927,12 +1643,31 @@ mod tests {
     use crate::app::Cli;
     use crate::commands::Command;
 
-    use super::{
+    use crate::commands::secret::{
         egress_credentials_from_store, is_pending_device_poll_response, plain_secret_value,
         read_json_frame, set_plain_secret, slot_key, write_json_frame, write_plain_secret,
-        LoginProvider, OAuthRefreshGrant, OAuthRefreshHookRequest, Secret, SecretStore,
-        SecretSubcommand, SetCmd, OPENAI_CODEX_KIND,
+        LoginProvider, OAuthRefreshGrant, OAuthRefreshHookRequest, SecretSubcommand, SetCmd,
+        OPENAI_CODEX_KIND,
     };
+    use silo_secrets::{
+        FileStore, OAuthSecret, Secret, SecretBytes, SecretKind, SecretName, SecretScope,
+        SecretStore,
+    };
+
+    fn plain(value: &str) -> Secret {
+        Secret::Plain(SecretBytes::new(value.as_bytes().to_vec()))
+    }
+    fn get(store: &FileStore, name: &str) -> Secret {
+        store
+            .get(&SecretScope::Home, &SecretName::legacy(name))
+            .unwrap()
+            .unwrap()
+    }
+    fn put(store: &FileStore, name: &str, secret: Secret) {
+        store
+            .put(&SecretScope::Home, &SecretName::new(name).unwrap(), secret)
+            .unwrap();
+    }
 
     #[test]
     fn secret_login_openai_codex_parses() {
@@ -2070,17 +1805,15 @@ mod tests {
     #[test]
     fn set_provider_aware_bearer_token_writes_slot_key() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SecretStore::new(dir.path().join("secrets.json"));
+        let store = FileStore::new(dir.path());
         let mut command = set_cmd(["bearer_token", "github-api"]);
         command.token = Some("secret-token".to_string());
 
         set_plain_secret(&store, &command).expect("write bearer token");
 
-        let loaded = store
-            .get("bearer_token.github-api.token")
-            .expect("read bearer token slot");
+        let loaded = get(&store, "bearer_token.github-api.token");
         match loaded {
-            Secret::Plain { value } => assert_eq!(value, "secret-token"),
+            Secret::Plain(value) => assert_eq!(value.as_str().unwrap(), "secret-token"),
             other => panic!("expected plain secret, got {other:?}"),
         }
     }
@@ -2088,17 +1821,15 @@ mod tests {
     #[test]
     fn set_provider_aware_aws_profile_writes_profile_slot() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SecretStore::new(dir.path().join("secrets.json"));
+        let store = FileStore::new(dir.path());
         let mut command = set_cmd(["aws_credential", "prod"]);
         command.profile = Some("production-admin".to_string());
 
         set_plain_secret(&store, &command).expect("write aws profile");
 
-        let loaded = store
-            .get("aws_credential.prod.profile")
-            .expect("read aws profile slot");
+        let loaded = get(&store, "aws_credential.prod.profile");
         match loaded {
-            Secret::Plain { value } => assert_eq!(value, "production-admin"),
+            Secret::Plain(value) => assert_eq!(value.as_str().unwrap(), "production-admin"),
             other => panic!("expected plain secret, got {other:?}"),
         }
     }
@@ -2106,7 +1837,7 @@ mod tests {
     #[test]
     fn set_provider_aware_aws_static_writes_required_slots() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SecretStore::new(dir.path().join("secrets.json"));
+        let store = FileStore::new(dir.path());
         let mut command = set_cmd(["aws_credential", "prod"]);
         command.access_key_id = Some("AKIAEXAMPLE".to_string());
         command.secret_access_key = Some("secret".to_string());
@@ -2122,21 +1853,21 @@ mod tests {
     #[test]
     fn egress_credentials_read_openai_oauth_secret() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SecretStore::new(dir.path().join("secrets.json"));
+        let store = FileStore::new(dir.path());
         let key = slot_key(OPENAI_CODEX_KIND, "personal", "oauth");
-        store
-            .put(
-                &key,
-                Secret::OAuth {
-                    access_token: "access-token".to_string(),
-                    refresh_token: "refresh-token".to_string(),
-                    expires_at: "2026-07-04T00:00:00Z".to_string(),
-                    account_id: Some("acct_123".to_string()),
-                    created_at: "2026-07-03T00:00:00Z".to_string(),
-                    updated_at: "2026-07-03T00:00:00Z".to_string(),
-                },
-            )
-            .expect("write oauth secret");
+        put(
+            &store,
+            &key,
+            Secret::OAuth(OAuthSecret {
+                provider: None,
+                access_token: SecretBytes::new(b"access-token".to_vec()),
+                refresh_token: SecretBytes::new(b"refresh-token".to_vec()),
+                expires_at: "2026-07-04T00:00:00Z".parse().unwrap(),
+                account_id: Some("acct_123".to_string()),
+                created_at: Some("2026-07-03T00:00:00Z".parse().unwrap()),
+                updated_at: Some("2026-07-03T00:00:00Z".parse().unwrap()),
+            }),
+        );
         let policy = network_policy(
             r#"{
                 "version": 1,
@@ -2187,7 +1918,7 @@ mod tests {
     #[test]
     fn egress_credentials_report_missing_oauth_secret_with_hint() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SecretStore::new(dir.path().join("secrets.json"));
+        let store = FileStore::new(dir.path());
         let policy = network_policy(
             r#"{
                 "version": 1,
@@ -2217,15 +1948,12 @@ mod tests {
     #[test]
     fn egress_credentials_read_provider_plain_secret() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SecretStore::new(dir.path().join("secrets.json"));
-        store
-            .put(
-                "bearer_token.github-api.token",
-                Secret::Plain {
-                    value: "github-token".to_string(),
-                },
-            )
-            .expect("write token secret");
+        let store = FileStore::new(dir.path());
+        put(
+            &store,
+            "bearer_token.github-api.token",
+            plain("github-token"),
+        );
         let policy = network_policy(
             r#"{
                 "version": 1,
@@ -2252,31 +1980,22 @@ mod tests {
     #[test]
     fn egress_credentials_read_aws_profile_secret() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SecretStore::new(dir.path().join("secrets.json"));
-        store
-            .put(
-                "aws_credential.prod.profile",
-                Secret::Plain {
-                    value: "production-admin".to_string(),
-                },
-            )
-            .expect("write aws profile");
-        store
-            .put(
-                "aws_credential.prod.access_key_id",
-                Secret::Plain {
-                    value: "AKIAIGNORED".to_string(),
-                },
-            )
-            .expect("write ignored access key");
-        store
-            .put(
-                "aws_credential.prod.secret_access_key",
-                Secret::Plain {
-                    value: "ignored-secret".to_string(),
-                },
-            )
-            .expect("write ignored secret key");
+        let store = FileStore::new(dir.path());
+        put(
+            &store,
+            "aws_credential.prod.profile",
+            plain("production-admin"),
+        );
+        put(
+            &store,
+            "aws_credential.prod.access_key_id",
+            plain("AKIAIGNORED"),
+        );
+        put(
+            &store,
+            "aws_credential.prod.secret_access_key",
+            plain("ignored-secret"),
+        );
         let policy = aws_network_policy();
 
         let launch = egress_credentials_from_store(
@@ -2300,31 +2019,22 @@ mod tests {
     #[test]
     fn egress_credentials_read_aws_static_secret_pair() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SecretStore::new(dir.path().join("secrets.json"));
-        store
-            .put(
-                "aws_credential.prod.access_key_id",
-                Secret::Plain {
-                    value: "AKIAEXAMPLE".to_string(),
-                },
-            )
-            .expect("write access key");
-        store
-            .put(
-                "aws_credential.prod.secret_access_key",
-                Secret::Plain {
-                    value: "secret".to_string(),
-                },
-            )
-            .expect("write secret key");
-        store
-            .put(
-                "aws_credential.prod.session_token",
-                Secret::Plain {
-                    value: "session".to_string(),
-                },
-            )
-            .expect("write session token");
+        let store = FileStore::new(dir.path());
+        put(
+            &store,
+            "aws_credential.prod.access_key_id",
+            plain("AKIAEXAMPLE"),
+        );
+        put(
+            &store,
+            "aws_credential.prod.secret_access_key",
+            plain("secret"),
+        );
+        put(
+            &store,
+            "aws_credential.prod.session_token",
+            plain("session"),
+        );
         let policy = aws_network_policy();
 
         let launch = egress_credentials_from_store(
@@ -2340,17 +2050,78 @@ mod tests {
     }
 
     #[test]
+    fn egress_legacy_raw_slots_take_precedence_and_profiles_suppress_stale_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::new(dir.path());
+        put(&store, "aws_credential.prod.profile", plain("canonical"));
+        put(&store, "prod.profile", plain("legacy-profile"));
+        // Empty stale static fields must never be projected when a profile wins.
+        put(&store, "prod.access_key_id", plain(""));
+        put(&store, "aws_credential.prod.secret_access_key", plain(""));
+        let credentials = egress_credentials_from_store(
+            &aws_network_policy(),
+            &store,
+            std::path::Path::new("/usr/bin/silo"),
+        )
+        .unwrap();
+        assert_eq!(credentials.secrets.len(), 1);
+        assert_egress_secret(&credentials, "prod.profile", "legacy-profile");
+    }
+
+    #[test]
+    fn egress_oauth_raw_overrides_and_optional_tailscale() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::new(dir.path());
+        let policy = network_policy(
+            r#"{
+            "version":1,
+            "endpoints":[{"name":"api","kind":"https","family":"http","transport":"https-mitm","tls":"terminate","capabilities":["credential-injection"],"hosts":["example.com"]}],
+            "credentials":[{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"}],
+            "tailscale":[{"name":"work"}]
+        }"#,
+        );
+        put(
+            &store,
+            "personal.oauth.access_token",
+            plain("legacy-access"),
+        );
+        put(
+            &store,
+            "personal.oauth.expires_at",
+            plain("2026-09-30T00:00:00Z"),
+        );
+        let credentials =
+            egress_credentials_from_store(&policy, &store, std::path::Path::new("/usr/bin/silo"))
+                .unwrap();
+        assert_eq!(credentials.secrets.len(), 2);
+        assert!(credentials.oauth_refresh_hook.is_none());
+        assert_egress_secret(&credentials, "personal.oauth.access_token", "legacy-access");
+        put(&store, "tailscale.work.auth_key", plain("canonical-key"));
+        put(&store, "work.tailscale.auth_key", plain("legacy-key"));
+        let credentials =
+            egress_credentials_from_store(&policy, &store, std::path::Path::new("/usr/bin/silo"))
+                .unwrap();
+        assert_egress_secret(&credentials, "work.tailscale.auth_key", "legacy-key");
+        put(&store, "personal.oauth.access_token", plain(""));
+        assert!(egress_credentials_from_store(
+            &policy,
+            &store,
+            std::path::Path::new("/usr/bin/silo")
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("has an empty value"));
+    }
+
+    #[test]
     fn egress_credentials_report_missing_aws_profile_or_static_pair() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SecretStore::new(dir.path().join("secrets.json"));
-        store
-            .put(
-                "aws_credential.prod.session_token",
-                Secret::Plain {
-                    value: "session".to_string(),
-                },
-            )
-            .expect("write session token");
+        let store = FileStore::new(dir.path());
+        put(
+            &store,
+            "aws_credential.prod.session_token",
+            plain("session"),
+        );
         let policy = aws_network_policy();
 
         let error = egress_credentials_from_store(
@@ -2373,7 +2144,7 @@ mod tests {
         let request = OAuthRefreshHookRequest {
             version: 1,
             operation: "oauth_refresh".to_string(),
-            credential: super::OAuthRefreshHookCredential {
+            credential: crate::commands::secret::OAuthRefreshHookCredential {
                 name: "personal".to_string(),
                 kind: OPENAI_CODEX_KIND.to_string(),
                 endpoint: "openai".to_string(),
@@ -2396,22 +2167,22 @@ mod tests {
     #[test]
     fn write_plain_secret_writes_and_protects_existing_secret() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SecretStore::new(dir.path().join("secrets.json"));
+        let store = FileStore::new(dir.path());
 
         write_plain_secret(&store, "api-token", "secret-token".to_string(), false)
             .expect("write plain secret");
-        let loaded = store.get("api-token").expect("read plain secret");
+        let loaded = get(&store, "api-token");
         match loaded {
-            Secret::Plain { value } => assert_eq!(value, "secret-token"),
+            Secret::Plain(value) => assert_eq!(value.as_str().unwrap(), "secret-token"),
             other => panic!("expected plain secret, got {other:?}"),
         }
 
         assert!(write_plain_secret(&store, "api-token", "new-token".to_string(), false).is_err());
         write_plain_secret(&store, "api-token", "new-token".to_string(), true)
             .expect("force replace plain secret");
-        let loaded = store.get("api-token").expect("read replaced plain secret");
+        let loaded = get(&store, "api-token");
         match loaded {
-            Secret::Plain { value } => assert_eq!(value, "new-token"),
+            Secret::Plain(value) => assert_eq!(value.as_str().unwrap(), "new-token"),
             other => panic!("expected plain secret, got {other:?}"),
         }
     }
@@ -2420,30 +2191,31 @@ mod tests {
     fn secret_store_writes_single_json_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("secrets.json");
-        let store = SecretStore::new(path.clone());
-        let secret = Secret::OAuth {
-            access_token: "access".to_string(),
-            refresh_token: "refresh".to_string(),
-            expires_at: "2026-06-02T12:00:00Z".to_string(),
+        let store = FileStore::with_store_file(path.clone()).unwrap();
+        let secret = Secret::OAuth(OAuthSecret {
+            provider: None,
+            access_token: SecretBytes::new(b"access".to_vec()),
+            refresh_token: SecretBytes::new(b"refresh".to_vec()),
+            expires_at: "2026-06-02T12:00:00Z".parse().unwrap(),
             account_id: None,
-            created_at: "2026-06-02T11:00:00Z".to_string(),
-            updated_at: "2026-06-02T11:00:00Z".to_string(),
-        };
+            created_at: Some("2026-06-02T11:00:00Z".parse().unwrap()),
+            updated_at: Some("2026-06-02T11:00:00Z".parse().unwrap()),
+        });
 
         let key = slot_key(OPENAI_CODEX_KIND, "personal", "oauth");
-        store.put(&key, secret).expect("write secret");
+        put(&store, &key, secret);
 
         assert_eq!(path, dir.path().join("secrets.json"));
         let raw = std::fs::read_to_string(&path).expect("read secret store");
         assert!(raw.contains(r#""type": "oauth""#));
-        let loaded = store.get(&key).expect("read secret");
+        let loaded = get(&store, &key);
         match loaded {
-            Secret::OAuth { refresh_token, .. } => assert_eq!(refresh_token, "refresh"),
+            Secret::OAuth(o) => assert_eq!(o.refresh_token.as_str().unwrap(), "refresh"),
             other => panic!("expected oauth secret, got {other:?}"),
         }
-        let listed = store.list().expect("list secrets");
+        let listed = store.list(&SecretScope::Home).expect("list secrets");
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].kind, OPENAI_CODEX_KIND);
+        assert_eq!(listed[0].kind, SecretKind::OAuth);
 
         #[cfg(unix)]
         {
@@ -2461,22 +2233,20 @@ mod tests {
     #[test]
     fn secret_store_rejects_path_names() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SecretStore::new(dir.path().join("secrets.json"));
+        let store = FileStore::new(dir.path());
 
         assert!(store
             .put(
-                "../bad",
-                Secret::Plain {
-                    value: "bad".to_string()
-                }
+                &SecretScope::Home,
+                &SecretName::legacy("../bad"),
+                plain("bad")
             )
             .is_err());
         assert!(store
             .put(
-                ".hidden",
-                Secret::Plain {
-                    value: "bad".to_string()
-                }
+                &SecretScope::Home,
+                &SecretName::legacy(".hidden"),
+                plain("bad")
             )
             .is_err());
     }
@@ -2486,25 +2256,25 @@ mod tests {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("testdata/secrets/basic.json");
-        let store = SecretStore::new(path);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(path, dir.path().join("secrets.json")).unwrap();
+        let store = FileStore::new(dir.path());
 
-        let plain = store.get("something").expect("plain fixture secret");
+        let plain = get(&store, "something");
         match plain {
-            Secret::Plain { value } => assert_eq!(value, "123"),
+            Secret::Plain(value) => assert_eq!(value.as_str().unwrap(), "123"),
             other => panic!("expected plain secret, got {other:?}"),
         }
 
-        let oauth = store
-            .get("openai_codex_oauth.personal.oauth")
-            .expect("oauth fixture secret");
+        let oauth = get(&store, "openai_codex_oauth.personal.oauth");
         match oauth {
-            Secret::OAuth {
+            Secret::OAuth(OAuthSecret {
                 access_token,
                 refresh_token,
                 ..
-            } => {
-                assert_eq!(access_token, "access-token");
-                assert_eq!(refresh_token, "refresh-token");
+            }) => {
+                assert_eq!(access_token.as_str().unwrap(), "access-token");
+                assert_eq!(refresh_token.as_str().unwrap(), "refresh-token");
             }
             other => panic!("expected oauth secret, got {other:?}"),
         }
@@ -2590,10 +2360,10 @@ mod tests {
         assert_eq!(secret.value, expected.as_bytes());
     }
 
-    fn assert_plain_secret(store: &SecretStore, name: &str, expected: &str) {
-        let loaded = store.get(name).expect("read plain secret");
+    fn assert_plain_secret(store: &FileStore, name: &str, expected: &str) {
+        let loaded = get(store, name);
         match loaded {
-            Secret::Plain { value } => assert_eq!(value, expected),
+            Secret::Plain(value) => assert_eq!(value.as_str().unwrap(), expected),
             other => panic!("expected plain secret, got {other:?}"),
         }
     }
