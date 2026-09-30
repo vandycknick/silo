@@ -41,6 +41,7 @@ pub struct ExecutionOptions {
     pub stdin: StdinMode,
     pub tty: bool,
     pub term: String,
+    pub initial_pty_size: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Default)]
@@ -574,11 +575,16 @@ impl Default for ExecutionOptions {
             stdin: StdinMode::Null,
             tty: false,
             term: DEFAULT_TERM.to_string(),
+            initial_pty_size: None,
         }
     }
 }
 
 impl ExecutionOptionsBuilder {
+    pub fn initial_pty_size(mut self, rows: u16, columns: u16) -> Self {
+        self.options.initial_pty_size = Some((rows, columns));
+        self
+    }
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.options.args.push(arg.into());
         self
@@ -1062,7 +1068,15 @@ fn process_spec(program: String, options: ExecutionOptions) -> ProcessSpec {
     argv.extend(options.args);
     let stdio = if options.tty {
         Some(protocol::v1::process_spec::Stdio::Pty(PtyStdio {
-            initial_size: Some(terminal_size()),
+            initial_size: Some(
+                options
+                    .initial_pty_size
+                    .map(|(rows, columns)| TerminalSize {
+                        rows: u32::from(rows),
+                        columns: u32::from(columns),
+                    })
+                    .unwrap_or_else(terminal_size),
+            ),
             terminal: Some(options.term),
         }))
     } else {
@@ -1767,6 +1781,7 @@ mod tests {
                 stdin: StdinMode::Pipe,
                 tty: false,
                 term: "xterm".to_string(),
+                initial_pty_size: None,
             },
         );
         assert_eq!(spec.argv, ["program with spaces", "one two"]);

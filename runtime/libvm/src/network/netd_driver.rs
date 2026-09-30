@@ -25,9 +25,7 @@ use crate::paths::{
     PID_FILE_NAME,
 };
 use crate::store::models::MachineId;
-use crate::store::models::{
-    MachineConfig, NetworkAttachment, NetworkInstance, NetworkInstanceState,
-};
+use crate::store::models::{NetworkAttachment, NetworkInstance, NetworkInstanceState};
 use crate::supervisor::process::{self, ProcessIdentity};
 use crate::utils::now_unix;
 use crate::LibVmError;
@@ -125,7 +123,7 @@ async fn prepare_netd_runtime(
     let log_path = machine_paths.network_service_log_path();
     let policy_path = if let Some(policy) = request.policy() {
         let path = network_paths.policy_path();
-        write_runtime_policy_file(metadata, policy, &runtime_directory, &path)?;
+        write_runtime_policy_file(&metadata.name, policy, &runtime_directory, &path)?;
         Some(path)
     } else {
         None
@@ -157,6 +155,24 @@ async fn prepare_netd_runtime(
         },
     );
     secret_transport::strip_environment(&mut command);
+    if request
+        .policy()
+        .is_some_and(|policy| !policy.tailscale().is_empty())
+    {
+        configure_tailscale_helper_command(
+            &mut command,
+            &metadata.machine_dir.join("tailscale"),
+            &machine_paths.vsock_mux_path(
+                metadata
+                    .spec
+                    .vsock
+                    .as_ref()
+                    .and_then(|vsock| vsock.uds.as_deref())
+                    .unwrap_or_else(|| Path::new("vsock.sock")),
+            ),
+            &machine_paths.vmm_socket_path(),
+        );
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -349,6 +365,21 @@ struct NetworkHelperCommandConfig<'a> {
     guest_publish: Option<&'a str>,
 }
 
+fn configure_tailscale_helper_command(
+    command: &mut Command,
+    state_dir: &Path,
+    mux: &Path,
+    status: &Path,
+) {
+    command
+        .arg("--tailscale-state-dir")
+        .arg(state_dir)
+        .arg("--vsock-mux")
+        .arg(mux)
+        .arg("--guest-status-socket")
+        .arg(status);
+}
+
 fn configure_network_helper_command(
     command: &mut Command,
     config: &NetworkHelperCommandConfig<'_>,
@@ -450,15 +481,18 @@ fn validate_policy(
 }
 
 fn write_runtime_policy_file(
-    metadata: &MachineConfig,
+    machine_name: &str,
     policy: &NetworkPolicy,
     runtime_directory: &crate::paths::OwnedDirectory,
     path: &Path,
 ) -> Result<(), LibVmError> {
-    let normalized = policy.clone().normalized();
+    let normalized = policy
+        .clone()
+        .with_default_tailscale_hostname(machine_name)
+        .normalized();
     let mut bytes =
         serde_json::to_vec_pretty(&normalized).map_err(|err| LibVmError::NetworkRuntime {
-            reference: metadata.name.clone(),
+            reference: machine_name.into(),
             message: format!("serialize generated network policy: {err}"),
         })?;
     bytes.push(b'\n');
@@ -466,7 +500,7 @@ fn write_runtime_policy_file(
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .ok_or_else(|| LibVmError::NetworkRuntime {
-            reference: metadata.name.clone(),
+            reference: machine_name.into(),
             message: format!(
                 "generated network policy path has no filename: {}",
                 path.display()
@@ -475,7 +509,7 @@ fn write_runtime_policy_file(
     runtime_directory
         .write_file(file_name, &bytes)
         .map_err(|err| LibVmError::NetworkRuntime {
-            reference: metadata.name.clone(),
+            reference: machine_name.into(),
             message: format!("write generated network policy {}: {err}", path.display()),
         })
 }
@@ -886,6 +920,53 @@ fn terminate_helper(identity: &ProcessIdentity) -> Result<(), LibVmError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generated_policy_file_supplies_the_exact_effective_tailscale_hostname() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("runtime");
+        let directory = crate::paths::OwnedDirectory::open_root(&path).unwrap();
+        let policy = silo_policy::NetworkPolicy::from_hcl_str("tailscale \"vm\" {}").unwrap();
+        let file = path.join("policy.json");
+        crate::network::netd_driver::write_runtime_policy_file(
+            "exact-name",
+            &policy,
+            &directory,
+            &file,
+        )
+        .unwrap();
+        let generated = silo_policy::NetworkPolicy::from_json_file(file).unwrap();
+        assert_eq!(
+            generated.tailscale()[0].hostname.as_deref(),
+            Some("exact-name")
+        );
+        assert_eq!(policy.tailscale()[0].hostname, None);
+    }
+    #[test]
+    fn tailscale_flags_use_durable_state_and_run_sockets_only_when_requested() {
+        let mut command = std::process::Command::new("netd");
+        assert_eq!(command.get_args().count(), 0);
+        crate::network::netd_driver::configure_tailscale_helper_command(
+            &mut command,
+            std::path::Path::new("/home/machines/id/tailscale"),
+            std::path::Path::new("/run/machines/id/vsock.sock"),
+            std::path::Path::new("/run/machines/id/vm.sock"),
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--tailscale-state-dir",
+                "/home/machines/id/tailscale",
+                "--vsock-mux",
+                "/run/machines/id/vsock.sock",
+                "--guest-status-socket",
+                "/run/machines/id/vm.sock"
+            ]
+        );
+    }
     use crate::network::netd_driver::{
         append_bounded_stderr_line, configure_network_helper_command, format_netd_startup_failure,
         prepare_netd_runtime, private_ipv4_config, CapturedStderrLines, NetworkHelperCommandConfig,

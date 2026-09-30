@@ -38,10 +38,17 @@ type GuestPublish struct {
 }
 
 type MachineNetwork struct {
-	Kind    MachineNetworkKind
-	Name    string
-	Policy  *NetworkPolicy
-	Publish *GuestPublish
+	Kind      MachineNetworkKind
+	Name      string
+	Policy    *NetworkPolicy
+	Publish   *GuestPublish
+	Tailscale *MachineTailscale
+}
+
+type MachineTailscale struct {
+	StateDir  string `json:"state_dir"`
+	Hostname  string `json:"hostname"`
+	Ephemeral bool   `json:"ephemeral"`
 }
 
 func PrivateNetwork(policy *NetworkPolicy) MachineNetwork {
@@ -64,6 +71,7 @@ type machineNetworkWire struct {
 	Name       string             `json:"name,omitempty"`
 	PolicyJSON string             `json:"policy_json,omitempty"`
 	Publish    *GuestPublish      `json:"publish,omitempty"`
+	Tailscale  *MachineTailscale  `json:"tailscale,omitempty"`
 }
 
 func (network MachineNetwork) wire() (machineNetworkWire, error) {
@@ -181,6 +189,7 @@ type NetworkRule struct {
 }
 type TailscaleTunnel struct {
 	Name       string   `json:"name"`
+	Ephemeral  bool     `json:"ephemeral"`
 	Tags       []string `json:"tags,omitempty"`
 	Hostname   *string  `json:"hostname,omitempty"`
 	ControlURL *string  `json:"control_url,omitempty"`
@@ -202,21 +211,84 @@ type NetworkForward struct {
 }
 
 func BuildNetworkPolicy(config NetworkPolicyConfig) (*NetworkPolicy, error) {
-	return policyRequest(struct {
-		JSON   *string              `json:"json,omitempty"`
-		Config *NetworkPolicyConfig `json:"config,omitempty"`
-	}{Config: &config})
+	return policyRequest(networkPolicyRequest{Config: &config})
 }
 func ParseNetworkPolicyJSON(value string) (*NetworkPolicy, error) {
 	if value == "" {
 		return nil, newError(ErrorInvalidArgument, "", "network policy JSON must not be empty")
 	}
-	return policyRequest(struct {
-		JSON   *string              `json:"json,omitempty"`
-		Config *NetworkPolicyConfig `json:"config,omitempty"`
-	}{JSON: &value})
+	return policyRequest(networkPolicyRequest{JSON: &value})
 }
-func policyRequest(request any) (*NetworkPolicy, error) {
+
+type networkPolicyRequest struct {
+	JSON   *string              `json:"json,omitempty"`
+	HCL    *string              `json:"hcl,omitempty"`
+	Config *NetworkPolicyConfig `json:"config,omitempty"`
+	Output string               `json:"output,omitempty"`
+}
+
+func ParseNetworkPolicyHCL(value string) (*NetworkPolicy, error) {
+	return policyRequest(networkPolicyRequest{HCL: &value})
+}
+
+func ValidateNetworkPolicyHCL(value string) error {
+	_, err := ParseNetworkPolicyHCL(value)
+	return err
+}
+
+func (policy *NetworkPolicy) HCL() (string, error) {
+	if policy == nil {
+		return "", newError(ErrorInvalidArgument, "", "policy is required")
+	}
+	value := policy.JSON()
+	data, err := nativePolicyRequest(networkPolicyRequest{JSON: &value, Output: "hcl"})
+	return string(data), err
+}
+
+type NetworkSecretSource struct {
+	Key   string `json:"key"`
+	Field string `json:"field"`
+}
+type NetworkSecretSlot struct {
+	Name     string              `json:"name"`
+	Required bool                `json:"required"`
+	Kind     string              `json:"kind"`
+	Source   NetworkSecretSource `json:"source"`
+}
+type NetworkSecretRequirement struct {
+	Owner        string     `json:"owner"`
+	Alternatives [][]string `json:"alternatives"`
+}
+type NetworkSecretMetadata struct {
+	Slots        []NetworkSecretSlot        `json:"slots"`
+	Requirements []NetworkSecretRequirement `json:"requirements"`
+}
+
+func (policy *NetworkPolicy) SecretMetadata() (*NetworkSecretMetadata, error) {
+	if policy == nil {
+		return nil, newError(ErrorInvalidArgument, "", "policy is required")
+	}
+	value := policy.JSON()
+	data, err := nativePolicyRequest(networkPolicyRequest{JSON: &value, Output: "slots"})
+	if err != nil {
+		return nil, err
+	}
+	var result NetworkSecretMetadata
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func policyRequest(request networkPolicyRequest) (*NetworkPolicy, error) {
+	data, err := nativePolicyRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	return &NetworkPolicy{canonicalJSON: string(data)}, nil
+}
+
+func nativePolicyRequest(request networkPolicyRequest) ([]byte, error) {
 	if err := ffi.Load(Version, ffiABIVersion); err != nil {
 		return nil, fromNativeError(err)
 	}
@@ -228,5 +300,5 @@ func policyRequest(request any) (*NetworkPolicy, error) {
 	if err != nil {
 		return nil, fromNativeError(err)
 	}
-	return &NetworkPolicy{canonicalJSON: string(data)}, nil
+	return data, nil
 }

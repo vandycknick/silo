@@ -1,6 +1,6 @@
 # Node to Go SDK parity
 
-This inventory is completed alongside implementation. A checked item has a public Go symbol, native bridge path, and test coverage. `libvm` APIs absent from the public Node facade are intentionally excluded.
+This inventory is completed alongside implementation. A checked item has a public Go symbol, native bridge path, and test coverage. It also includes the public libvm service-consumer contracts added in phase 7.
 
 | Node facade | Go facade | Native operation | Coverage | State |
 |---|---|---|---|---|
@@ -19,6 +19,16 @@ This inventory is completed alongside implementation. A checked item has a publi
 | `inspect` | `Machine.Inspect` | `silo_machine_inspect` | lifecycle tests | implemented |
 | `start` | `Machine.Start` | `silo_machine_start` | lifecycle tests | implemented |
 | `stop` | `Machine.Stop` | `silo_machine_stop` | lifecycle tests | implemented |
+| stopped resource/name/label updates | `Machine.Update` | `silo_machine_update` | actual native temp-home contracts and native KVM | implemented |
+| stop options | `Machine.StopWith` | `silo_machine_stop_with` | same-run Rust escalation and native KVM | implemented |
+| guest provisioning readiness | `Machine.WaitReady` | polling `silo_machine_inspect` | terminal errors and native KVM | implemented |
+| generic launch generation | `MachineData.RunID` / fenced `WaitReady` | `VmMonitorService` protobuf `run_id` + inspect DTO | preserved readers, expected machine/run fencing and real native gRPC/KVM | implemented |
+| guest account provisioning | `WithGuestUser` / `MachineData.GuestUser` | create/update/inspect DTO | temp-home defaults and actual guest uid/gid | implemented |
+| PTY size / TERM | `WithExecInitialPTYSize` / `WithExecTerm` | execution request DTO | actual guest stty/TERM | implemented |
+| Tailscale identity settings | `MachineData.Network.Tailscale` | inspect DTO | stopped create/update and 0700 cleanup | implemented |
+| resilient inventory | `Runtime.Inventory` | `silo_runtime_query` | real healthy/broken records | implemented |
+| HCL parse/validation/rendering | `ParseNetworkPolicyHCL`, `ValidateNetworkPolicyHCL`, `NetworkPolicy.HCL` | Rust policy parser/formatter | actual native round trips | implemented |
+| secret requirements/readiness | `NetworkPolicy.SecretMetadata`, `Runtime.PolicySecretsReady` | Rust slots and start resolver | real stores, precedence and optional keys | implemented |
 | `remove` | `Machine.Remove` | `silo_machine_remove` | lifecycle tests | implemented |
 | `exec` | `Machine.Exec` | `silo_machine_exec` | execution tests | implemented |
 | `shell` | `Machine.Shell` | `silo_machine_shell` | execution tests | implemented |
@@ -44,4 +54,4 @@ This inventory is completed alongside implementation. A checked item has a publi
 | machine/image/process/status types | corresponding Go read models | response DTO conversion | conversion tests | implemented |
 | `SiloError` | `silo.Error` | exhaustive native error DTO | error tests | implemented |
 
-Go-only packaging APIs (`InstallRuntime`, `InstalledRuntime`, and `ByteSize`) have no Node equivalent and exist to satisfy the Go transport contract in ADR 0012.
+Go-only packaging APIs (`InstallRuntime`, `InstalledRuntime`, and `ByteSize`) have no Node equivalent and exist to satisfy the Go transport contract in ADR 0012. Phase 7 requires native bridge ABI 2; ABI 1 is rejected before resolving newer symbols. Tailscale checks cover stopped creation and launch arguments. Starting a Tailscale policy requires phase 8 netd support.

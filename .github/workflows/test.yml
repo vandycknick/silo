@@ -273,7 +273,23 @@ jobs:
             "context"
             "github.com/vandycknick/silo/sdk/go"
           )
-          func main() { _, _ = silo.InstalledRuntime(); _ = context.Background() }
+          func contracts(runtime *silo.Runtime, machine *silo.Machine, policy *silo.NetworkPolicy) {
+            ctx := context.Background()
+            name := "exact"
+            labels := map[string]string{"io.silo.taild.name": name}
+            _, _ = machine.Update(ctx, silo.MachineUpdate{Name: &name, Labels: &labels})
+            _, _ = machine.StopWith(ctx, silo.StopOptions{Force: true})
+            _, _ = machine.WaitReady(ctx, 1)
+            _, _ = runtime.Inventory(ctx)
+            _, _ = runtime.PolicySecretsReady(ctx, policy, "")
+            _, _ = silo.ParseNetworkPolicyHCL(`tailscale "vm" { ephemeral = false }`)
+            _, _ = policy.HCL()
+            _, _ = policy.SecretMetadata()
+            _ = silo.WithGuestUser("silo", 1000, 1000, "/home/silo")
+            _ = silo.WithExecInitialPTYSize(24, 80)
+            _ = silo.WithExecTerm("xterm")
+          }
+          func main() { _, _ = silo.InstalledRuntime(); _ = contracts }
           EOF
           nix develop "$GITHUB_WORKSPACE#ci" --command go mod tidy
           nix develop "$GITHUB_WORKSPACE#ci" --command go build ./...

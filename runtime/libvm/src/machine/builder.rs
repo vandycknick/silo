@@ -417,6 +417,7 @@ async fn create_machine_config_with_name(
             reason: "root disk size must be greater than 0".to_string(),
         });
     }
+    crate::machine::reference::validate_new_machine_name(&name)?;
     if matches!(request.cpus, Some(0)) {
         return Err(LibVmError::InvalidCreateRequest {
             name,
@@ -509,6 +510,12 @@ async fn create_machine_config_with_name(
 
     let network = request.network.unwrap_or_default().into();
     runtime.validate_machine_network_config(&network).await?;
+    let tailscale = runtime.validate_tailscale_vsock(&network, &spec)?;
+    let materialized = match request.resolved_oci_image.as_ref() {
+        Some(image) => runtime.materialize_resolved_oci_image(image).await?,
+        None => runtime.materialize_image(&image_source).await?,
+    };
+    let _name_lock = runtime.lock_machine_names().await?;
     let create = create_machine_guard(
         runtime,
         MachineCreatePlan {
@@ -526,10 +533,9 @@ async fn create_machine_config_with_name(
     )
     .await?;
 
-    let materialized = match request.resolved_oci_image.as_ref() {
-        Some(image) => runtime.materialize_resolved_oci_image(image).await?,
-        None => runtime.materialize_image(&image_source).await?,
-    };
+    if tailscale {
+        runtime.ensure_tailscale_directory(create.id)?;
+    }
     let root_disk_size = request.disk_size_bytes.unwrap_or(materialized.size_bytes);
     if root_disk_size == 0 {
         return Err(LibVmError::InvalidCreateRequest {

@@ -494,6 +494,11 @@ pub struct TailscaleTunnelBuilder {
 }
 
 impl TailscaleTunnelBuilder {
+    pub fn ephemeral(mut self, ephemeral: bool) -> Self {
+        self.tunnel.ephemeral = ephemeral;
+        self
+    }
+
     fn new(name: impl Into<String>) -> Self {
         Self {
             tunnel: TailscaleTunnel {
@@ -501,6 +506,7 @@ impl TailscaleTunnelBuilder {
                 tags: Vec::new(),
                 hostname: None,
                 control_url: None,
+                ephemeral: false,
             },
         }
     }

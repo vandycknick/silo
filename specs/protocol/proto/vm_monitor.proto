@@ -140,6 +140,8 @@ message HostStatus {
   VmSnapshot vm = 4;
   Readiness readiness = 5;
   HostAgent agent = 6;
+  // Exact libvm run generation. Consumers must reset readiness on mismatch or disconnect.
+  optional string run_id = 7;
 }
 
 message AgentMetricsObservation {

@@ -48,11 +48,24 @@ type machineConfig struct {
 	Forwards             []Forward           `json:"forwards,omitempty"`
 	Vsock                *bool               `json:"vsock,omitempty"`
 	Network              *machineNetworkWire `json:"network,omitempty"`
+	GuestUser            *GuestUser          `json:"guest_user,omitempty"`
 	error                error
 }
 
 // MachineOption configures machine creation.
 type MachineOption func(*machineConfig)
+
+// GuestUser is the concrete account provisioned by the managed guest agent.
+type GuestUser struct {
+	Name string `json:"name"`
+	UID  uint32 `json:"uid"`
+	GID  uint32 `json:"gid"`
+	Home string `json:"home"`
+}
+
+func WithGuestUser(name string, uid, gid uint32, home string) MachineOption {
+	return func(config *machineConfig) { config.GuestUser = &GuestUser{Name: name, UID: uid, GID: gid, Home: home} }
+}
 
 func WithName(name string) MachineOption { return func(config *machineConfig) { config.Name = &name } }
 func WithLabel(key, value string) MachineOption {

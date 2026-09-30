@@ -58,8 +58,17 @@ pub(crate) struct StartupGate {
 #[derive(Clone)]
 struct MonitorService {
     store: Arc<InstanceStore>,
+    machine_run_id: String,
     finite_capacity: Arc<Semaphore>,
     waiter_capacity: Arc<Semaphore>,
+}
+
+impl MonitorService {
+    fn status(&self) -> Result<HostStatus, Status> {
+        let mut status = self.store.status().map_err(store_status)?;
+        status.run_id = Some(self.machine_run_id.clone());
+        Ok(status)
+    }
 }
 
 #[tonic::async_trait]
@@ -69,7 +78,7 @@ impl VmMonitorService for MonitorService {
         _: Request<GetStatusRequest>,
     ) -> Result<Response<HostStatus>, Status> {
         let _permit = admission(&self.finite_capacity, "monitor finite RPC")?;
-        Ok(Response::new(self.store.status().map_err(store_status)?))
+        Ok(Response::new(self.status()?))
     }
 
     async fn wait_ready(
@@ -83,10 +92,7 @@ impl VmMonitorService for MonitorService {
         loop {
             let outcome = self.store.readiness().map_err(store_status)?;
             if outcome != WaitOutcome::TimedOut {
-                return Ok(Response::new(wait_response(
-                    outcome,
-                    self.store.status().map_err(store_status)?,
-                )));
+                return Ok(Response::new(wait_response(outcome, self.status()?)));
             }
             match tokio::time::timeout_at(deadline, changed.changed()).await {
                 Ok(Ok(())) => {}
@@ -98,7 +104,7 @@ impl VmMonitorService for MonitorService {
                 Err(_) => {
                     return Ok(Response::new(wait_response(
                         WaitOutcome::TimedOut,
-                        self.store.status().map_err(store_status)?,
+                        self.status()?,
                     )));
                 }
             }
@@ -322,6 +328,7 @@ pub async fn start_services(
     let server_shutdown_signal = server_shutdown.clone();
     let monitor = MonitorService {
         store: ctx.store.clone(),
+        machine_run_id: ctx.machine_run_id.to_string(),
         finite_capacity: Arc::new(Semaphore::new(64)),
         waiter_capacity: Arc::new(Semaphore::new(64)),
     };
@@ -782,6 +789,26 @@ fn admission(capacity: &Arc<Semaphore>, resource: &str) -> Result<OwnedSemaphore
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generic_status_fences_machine_and_run_before_guest_readiness() {
+        let machine = uuid::Uuid::new_v4().to_string();
+        let run = uuid::Uuid::new_v4().to_string();
+        let monitor = crate::services::MonitorService {
+            store: std::sync::Arc::new(crate::state::InstanceStore::new(
+                machine.clone(),
+                "test".into(),
+                true,
+                "krun".into(),
+            )),
+            machine_run_id: run.clone(),
+            finite_capacity: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            waiter_capacity: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let status = monitor.status().unwrap();
+        assert_eq!(status.machine_id, Some(machine));
+        assert_eq!(status.run_id, Some(run));
+        assert_eq!(status.readiness.unwrap().ready, Some(false));
+    }
     use bytes::Bytes;
     use futures::StreamExt;
     use protocol::v1::ByteChunk;

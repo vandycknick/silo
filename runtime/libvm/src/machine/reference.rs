@@ -59,10 +59,49 @@ pub(crate) fn validate_machine_name(name: &str) -> Result<(), LibVmError> {
     })
 }
 
+pub(crate) fn validate_new_machine_name(name: &str) -> Result<(), LibVmError> {
+    let bytes = name.as_bytes();
+    if bytes.len() <= 63
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        && bytes.last() != Some(&b'-')
+    {
+        Ok(())
+    } else {
+        Err(LibVmError::InvalidMachineName { name: name.into(), reason: "new names must use 1-63 lowercase letters, digits or hyphens, start with a letter or digit, and not end with a hyphen".into() })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MachineRef, MachineRefKind};
+    use crate::machine::reference::{MachineRef, MachineRefKind};
     use crate::store::models::MachineId;
+
+    #[test]
+    fn new_names_are_exact_dns_labels_while_legacy_references_remain_readable() {
+        for name in ["dev", "0", "a-b", &"a".repeat(63)] {
+            crate::machine::reference::validate_new_machine_name(name).unwrap();
+        }
+        for name in [
+            "",
+            "-dev",
+            "dev-",
+            "Dev",
+            "dev_box",
+            "dev.box",
+            &"a".repeat(64),
+        ] {
+            assert!(
+                crate::machine::reference::validate_new_machine_name(name).is_err(),
+                "{name}"
+            );
+        }
+        assert!(MachineRef::parse("Legacy_name").is_ok());
+    }
 
     #[test]
     fn parse_treats_full_uuid_as_machine_id() {

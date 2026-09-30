@@ -6,6 +6,12 @@ import (
 )
 
 type machineDataWire struct {
+	Observation     string               `json:"observation"`
+	Issues          []MachineIssue       `json:"issues"`
+	RunID           *string              `json:"run_id"`
+	CPUs            *uint8               `json:"cpus"`
+	MemoryBytes     *uint64              `json:"memory_bytes"`
+	GuestUser       *GuestUser           `json:"guest_user"`
 	ID              string               `json:"id"`
 	Name            string               `json:"name"`
 	MachineDir      string               `json:"machine_dir"`
@@ -68,6 +74,16 @@ func decodeMachineData(data []byte) (*MachineData, error) {
 	}
 	result := &MachineData{ID: wire.ID, Name: wire.Name, MachineDir: wire.MachineDir, CreatedAt: time.UnixMilli(wire.CreatedAt), ModifiedAt: time.UnixMilli(wire.ModifiedAt), ImageRef: wire.ImageRef, Retention: wire.Retention, Process: wire.Process, TemplateName: wire.TemplateName, AgentMode: wire.AgentMode, Labels: wire.Labels, Metadata: wire.Metadata, Network: MachineNetwork{Kind: wire.Network.Kind, Name: wire.Network.Name}, Agent: wire.Agent, Status: wire.Status, BootReport: wire.BootReport, LastError: wire.LastError, UpdatedAt: time.UnixMilli(wire.UpdatedAt)}
 	result.Forwards = wire.Forwards
+	result.Observation = wire.Observation
+	result.Issues = wire.Issues
+	result.RunID = wire.RunID
+	result.CPUs = wire.CPUs
+	result.GuestUser = wire.GuestUser
+	if wire.MemoryBytes != nil {
+		value := Bytes(*wire.MemoryBytes)
+		result.Memory = &value
+	}
+	result.Network.Tailscale = wire.Network.Tailscale
 	result.Vsock = wire.Vsock
 	result.Network.Publish = wire.Network.Publish
 	if wire.Network.PolicyJSON != "" {

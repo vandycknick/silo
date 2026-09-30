@@ -71,6 +71,13 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
     if !view.image.is_empty() {
         rows.push(("Image".to_string(), view.image.clone()));
     }
+    if let Some(tailscale) = &view.tailscale {
+        rows.push((
+            "Tailscale state".into(),
+            tailscale.state_dir.display().to_string(),
+        ));
+        rows.push(("Tailscale hostname".into(), tailscale.hostname.clone()));
+    }
     let pin = view.dir.join("ssh/known_host");
     if pin.exists() {
         let key = ssh_key::PublicKey::from_openssh(&std::fs::read_to_string(pin)?)?;

@@ -23,9 +23,30 @@ type execConfig struct {
 	Stdin          []byte            `json:"stdin,omitempty"`
 	PipeStdin      bool              `json:"pipe_stdin"`
 	TTY            *bool             `json:"tty,omitempty"`
+	Term           *string           `json:"term,omitempty"`
+	InitialPTYSize *ptySizeWire      `json:"initial_pty_size,omitempty"`
 	error          error
 }
 type ExecOption func(*execConfig)
+
+type ptySizeWire struct {
+	Rows    uint16 `json:"rows"`
+	Columns uint16 `json:"columns"`
+}
+
+func WithExecTerm(term string) ExecOption {
+	return func(c *execConfig) { c.Term = &term }
+}
+
+func WithExecInitialPTYSize(rows, columns uint16) ExecOption {
+	return func(c *execConfig) {
+		if rows == 0 || columns == 0 {
+			c.error = newError(ErrorInvalidArgument, "", "PTY rows and columns must be positive")
+			return
+		}
+		c.InitialPTYSize = &ptySizeWire{Rows: rows, Columns: columns}
+	}
+}
 
 func WithExecAdditionalArgs(args ...string) ExecOption {
 	return func(c *execConfig) { c.AdditionalArgs = append([]string(nil), args...) }
