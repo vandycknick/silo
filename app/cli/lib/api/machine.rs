@@ -9,11 +9,12 @@ use tokio_stream::Stream;
 #[derive(Debug, Clone)]
 pub(crate) struct AppMachine {
     inner: libvm::Machine,
+    home: std::path::PathBuf,
 }
 
 impl AppMachine {
-    pub(in crate::api) fn new(inner: libvm::Machine) -> Self {
-        Self { inner }
+    pub(in crate::api) fn new(inner: libvm::Machine, home: std::path::PathBuf) -> Self {
+        Self { inner, home }
     }
 
     pub(in crate::api) fn inner(&self) -> &libvm::Machine {
@@ -31,8 +32,11 @@ impl AppMachine {
     pub(crate) async fn start_with_options(
         &self,
         options: MachineStartOptions,
-    ) -> Result<MachineStart, libvm::LibVmError> {
-        self.inner.start_with_options(options).await
+    ) -> eyre::Result<MachineStart> {
+        self.inner
+            .start_with_options(options)
+            .await
+            .map_err(|error| crate::commands::secret::map_start_error(error, Some(&self.home)))
     }
 
     pub(crate) async fn wait_ready(

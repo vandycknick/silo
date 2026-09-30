@@ -8,7 +8,7 @@ use serde::{Serialize, Serializer};
 use silo_policy::NetworkPolicy;
 use zeroize::Zeroizing;
 
-use crate::machine::EgressCredentials;
+use crate::secrets::ResolvedSecrets;
 use crate::LibVmError;
 
 const JSON_LIMIT: usize = 16384;
@@ -80,7 +80,7 @@ impl Write for BoundedJson {
 }
 
 pub(crate) fn frame(
-    launch: &EgressCredentials,
+    launch: &ResolvedSecrets,
     policy: Option<&NetworkPolicy>,
     reference: &str,
 ) -> Result<Zeroizing<Vec<u8>>, LibVmError> {
@@ -182,7 +182,7 @@ mod tests {
     use silo_policy::NetworkPolicy;
     use zeroize::Zeroizing;
 
-    use crate::machine::{EgressCredentials, OAuthRefreshHook};
+    use crate::machine::{EgressCredentials, V1RefreshProvider};
     use crate::network::secret_transport::{frame, strip_environment, write_frame, JSON_LIMIT};
 
     fn policy() -> NetworkPolicy {
@@ -211,11 +211,11 @@ mod tests {
     #[test]
     fn payload_preserves_binary_exact_names_and_provider_defaults() {
         assert_eq!(
-            body(&frame(&EgressCredentials::new(), None, "test").unwrap()),
+            body(&frame(&crate::secrets::ResolvedSecrets::default(), None, "test").unwrap()),
             serde_json::json!({"version":1,"secrets":[]})
         );
         for timing in [None, Some(0), Some(42)] {
-            let mut hook = OAuthRefreshHook::new("/usr/bin/silo", vec![0, 255, 128]);
+            let mut hook = V1RefreshProvider::new("/usr/bin/silo", vec![0, 255, 128]);
             hook.timeout_ms = timing;
             hook.refresh_skew_seconds = timing;
             let payload = body(
@@ -251,29 +251,29 @@ mod tests {
         let policy = policy();
         let mut launch = credentials();
         launch.secrets[0].value = vec![1; JSON_LIMIT];
-        assert!(frame(&launch, Some(&policy), "test").is_err());
-        let mut launch = credentials();
-        launch.oauth_refresh_hook = Some(OAuthRefreshHook::new("/bin/true", vec![1; JSON_LIMIT]));
+        assert!(frame(&launch.into(), Some(&policy), "test").is_err());
+        let mut launch: crate::secrets::ResolvedSecrets = credentials().into();
+        launch.oauth_refresh_hook = Some(V1RefreshProvider::new("/bin/true", vec![1; JSON_LIMIT]));
         assert!(frame(&launch, Some(&policy), "test").is_err());
         assert!(frame(
-            &credentials().secret("api-key.token", "duplicate"),
+            &credentials().secret("api-key.token", "duplicate").into(),
             Some(&policy),
             "test"
         )
         .is_err());
         assert!(frame(
-            &credentials().secret("unknown", "unknown"),
+            &credentials().secret("unknown", "unknown").into(),
             Some(&policy),
             "test"
         )
         .is_err());
-        assert!(frame(&credentials(), None, "test").is_err());
+        assert!(frame(&credentials().into(), None, "test").is_err());
         // Find the exact last accepted size, including provider metadata and JSON escaping.
-        let mut launch =
-            credentials().oauth_refresh_hook(OAuthRefreshHook::new("/bin/true", b"grant".to_vec()));
+        let mut launch = credentials()
+            .oauth_refresh_hook(V1RefreshProvider::new("/bin/true", b"grant".to_vec()));
         let mut last = 0;
         for size in 11000..12500 {
-            launch.secrets[0].value.resize(size, 1);
+            launch.credentials.secrets[0].value.resize(size, 1);
             if let Ok(bytes) = frame(&launch, Some(&policy), "test") {
                 last = size;
                 body(&bytes);

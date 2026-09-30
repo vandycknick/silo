@@ -31,6 +31,7 @@ mod machine;
 mod network;
 mod paths;
 mod runtime;
+mod secrets;
 mod store;
 mod supervisor;
 mod utils;
@@ -71,7 +72,7 @@ pub use crate::machine::{
     MachineRef, MachineRetention, MachineRootfs, MachineRunId, MachineStaleReason, MachineStart,
     MachineStartOptions, MachineStatus, MachineStopOptions, MachineSystemInfo, MachineUpdate,
     MachineUserConfig, MachineUserUpdate, MachineVmSnapshot, MachineVmState, MachineWaitOptions,
-    Memory, NetworkPolicyUpdate, OAuthRefreshHook, ProcessConfig, SshExitStatus, SshShellOptions,
+    Memory, NetworkPolicyUpdate, ProcessConfig, SshExitStatus, SshShellOptions,
     SshShellOptionsBuilder, StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{

@@ -96,9 +96,10 @@ impl Machine {
             let run_id = run_uuid.to_string();
 
             runtime.request_machine_start(&config, &run_id).await?;
-            let root_disk_resize = match (|| {
-                options.validate_egress_credentials(&config.network, &config.name)?;
-                reconcile_root_disk_size(&config)
+            let (root_disk_resize, secrets) = match (|| {
+                let secrets =
+                    runtime.resolve_secrets(&config, &run_id, &options.egress_credentials)?;
+                Ok((reconcile_root_disk_size(&config)?, secrets))
             })() {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -115,7 +116,7 @@ impl Machine {
             };
 
             let resolved_network = match runtime
-                .prepare_machine_network(&config, &run_id, &options.egress_credentials)
+                .prepare_machine_network(&config, &run_id, &secrets)
                 .await
             {
                 Ok(network) => network,

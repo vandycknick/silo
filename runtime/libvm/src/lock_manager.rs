@@ -343,9 +343,21 @@ mod tests {
             .is_none());
 
         drop(inherited);
-        let available = MachineLifetimeLock::try_acquire(&path)
-            .expect("try released lock")
-            .is_some();
+        // Concurrent test subprocesses may still be between fork and exec.
+        // CLOEXEC releases those copies at exec, rather than at fork.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let available = loop {
+            if MachineLifetimeLock::try_acquire(&path)
+                .expect("try released lock")
+                .is_some()
+            {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         unrelated.kill().unwrap();
         unrelated.wait().unwrap();
         assert!(available, "unrelated exec inherited the lifetime lock");

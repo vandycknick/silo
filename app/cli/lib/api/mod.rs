@@ -300,6 +300,54 @@ mod tests {
         RuntimeConfig::local(home).with_runtime_root(&components)
     }
 
+    #[tokio::test]
+    async fn both_cli_start_paths_map_real_store_missing_secret_to_the_same_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let mut api = AppApi::local(isolated_runtime_config(temp.path(), &home));
+        let disk = temp.path().join("disk.img");
+        std::fs::write(&disk, b"never-booted disk fixture").unwrap();
+        let policy = libvm::NetworkPolicy::from_json_str(r#"{"version":1,"endpoints":[{"name":"api","kind":"https","family":"http","transport":"https-mitm","tls":"terminate","capabilities":["credential-injection"],"hosts":["example.com"]}],"credentials":[{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"}]}"#).unwrap();
+        let created = api
+            .local
+            .runtime()
+            .await
+            .unwrap()
+            .machine()
+            .name("secret-hint")
+            .image_source(libvm::ImageSource::disk(disk))
+            .agent_mode(Some(libvm::MachineAgent::Disabled))
+            .network(|network| network.private().policy(policy))
+            .create()
+            .await
+            .unwrap();
+        let message = api
+            .start_machine("secret-hint", std::time::Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(&home.join("secrets.json").display().to_string()));
+        assert!(message.contains("silo secret login openai-codex --name personal"));
+        let machine = api.machine("secret-hint").await.unwrap();
+        for detached in [true, false] {
+            let options = api.machine_start_options(&machine, detached).await.unwrap();
+            assert!(options.egress_credentials.secrets.is_empty());
+            assert_eq!(
+                machine
+                    .start_with_options(options)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                message
+            );
+        }
+        assert_eq!(
+            created.inspect().await.unwrap().status,
+            libvm::MachineStatus::Stopped
+        );
+        created.remove().await.unwrap();
+    }
+
     fn executable_fixture(parent: &Path, name: &str) -> std::path::PathBuf {
         let path = parent.join(name);
         std::fs::write(&path, b"fixture").expect("write component fixture");

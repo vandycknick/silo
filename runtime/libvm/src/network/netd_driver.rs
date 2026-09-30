@@ -944,7 +944,7 @@ mod tests {
     use std::process::Command;
 
     use crate::lock_manager::LockId;
-    use crate::machine::{EgressCredentials, OAuthRefreshHook};
+    use crate::machine::{EgressCredentials, V1RefreshProvider};
     use crate::network::core::{NetworkAttachmentRequest, NetworkDriverContext};
     use crate::paths::{LocalPaths, LocalRoots};
     use crate::store::models::{
@@ -1076,7 +1076,7 @@ mod tests {
             .secret("codex.oauth.access_token", "token")
             .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
             .oauth_refresh_hook(
-                OAuthRefreshHook::new("/usr/bin/silo", b"auth".to_vec())
+                V1RefreshProvider::new("/usr/bin/silo", b"auth".to_vec())
                     .arg("secret")
                     .arg("refresh-oauth")
                     .timeout_ms(2500)
@@ -1337,7 +1337,7 @@ netd log: /tmp/silo/netd.log";
             .await
             .expect("save machine");
         let networking = RuntimeNetworkingConfig::default();
-        let launch = EgressCredentials::default();
+        let launch = crate::secrets::ResolvedSecrets::default();
         let context = NetworkDriverContext {
             paths: &paths,
             store: &store,
@@ -1414,7 +1414,7 @@ netd log: /tmp/silo/netd.log";
         let credentials = EgressCredentials::new()
             .secret_bytes("codex.oauth.access_token", vec![0, 255, 128])
             .secret("codex.oauth.expires_at", "2099-01-01T00:00:00Z")
-            .oauth_refresh_hook(OAuthRefreshHook::new(
+            .oauth_refresh_hook(V1RefreshProvider::new(
                 "/bin/false",
                 b"synthetic-hook-auth".to_vec(),
             ));
@@ -1505,7 +1505,8 @@ netd log: /tmp/silo/netd.log";
                     "codex.oauth.access_token",
                     vec![0xab; if mode == "oversize" { 16384 } else { 12000 }],
                 )
-                .secret("codex.oauth.expires_at", "2026-09-30T00:00:00Z");
+                .secret("codex.oauth.expires_at", "2026-09-30T00:00:00Z")
+                .into();
             let executable = temp.path().join("transport");
             let marker = temp.path().join("spawned");
             let received = temp.path().join("received");

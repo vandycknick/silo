@@ -236,7 +236,21 @@ impl From<serde_json::Error> for SecretError {
     }
 }
 
+/// Address understood by an out-of-process secret provider. Stores without a
+/// compatible address still support ordinary start-time secret resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SecretStoreDescriptor {
+    /// Home record file; Machine records are addressed by scope relative to it.
+    File { store_file: PathBuf },
+}
+
 pub trait SecretStore: Send + Sync + fmt::Debug {
+    /// Returns the actual provider address, rather than a runtime-home default.
+    /// External stores can leave this unset until their provider protocol exists.
+    fn descriptor(&self) -> Option<SecretStoreDescriptor> {
+        None
+    }
     fn get(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<Secret>, SecretError>;
     fn put(
         &self,
@@ -373,8 +387,18 @@ impl FileStore {
                 secure_directory(parent)?;
             }
             SecretScope::Machine { .. } => {
-                if !parent.is_dir() {
-                    return Err(SecretError::NotFound);
+                let metadata = fs::metadata(parent).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        SecretError::NotFound
+                    } else {
+                        error.into()
+                    }
+                })?;
+                if !metadata.is_dir() {
+                    return Err(SecretError::InvalidRequest(format!(
+                        "machine secret scope path {} is not a directory",
+                        parent.display()
+                    )));
                 }
                 permissions(parent, 0o700)?;
             }
@@ -478,6 +502,11 @@ impl ScopeTransaction {
 }
 
 impl SecretStore for FileStore {
+    fn descriptor(&self) -> Option<SecretStoreDescriptor> {
+        Some(SecretStoreDescriptor::File {
+            store_file: self.home_file.clone(),
+        })
+    }
     fn get(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<Secret>, SecretError> {
         self.transaction(scope, |tx| tx.get(name))
     }

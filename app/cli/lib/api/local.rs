@@ -37,11 +37,17 @@ impl LocalVmService {
                 .config
                 .take()
                 .ok_or_else(|| eyre::eyre!("local runtime configuration was not initialized"))?;
-            self.runtime = Some(
-                Runtime::new(config)
-                    .await
-                    .context("initialize local libvm adapter")?,
-            );
+            let runtime = Runtime::new(config)
+                .await
+                .context("initialize local libvm adapter")?;
+            let provider = libvm::HostCommand::new(
+                std::env::current_exe().context("resolve CLI binary path")?,
+            )
+            .arg("secret")
+            .arg("refresh-oauth")
+            .arg("--store-file")
+            .arg(runtime.local_home().join("secrets.json"));
+            self.runtime = Some(runtime.with_secret_provider(provider));
         }
 
         self.runtime
@@ -79,7 +85,12 @@ impl LocalVmService {
         let before = machine.inspect().await?;
         crate::commands::start::ensure_startable(&before)?;
         let options = self.start_options(&machine, true).await?;
-        let start = machine.start_with_options(options).await?;
+        let start = machine.start_with_options(options).await.map_err(|error| {
+            crate::commands::secret::map_start_error(
+                error,
+                self.runtime.as_ref().map(Runtime::local_home),
+            )
+        })?;
         if crate::commands::start::requires_guest_readiness(&start.machine) {
             let readiness = machine.wait_ready(readiness_timeout).await?;
             if readiness.outcome != MachineReadinessOutcome::Ready {
@@ -207,16 +218,15 @@ impl LocalVmService {
                 &machine.id(),
             );
         }
-        if let Some(policy) = data.network.policy() {
-            options = options.credentials(
-                crate::commands::secret::egress_credentials_from_secret_store(policy)?,
-            );
-        }
         Ok(options)
     }
 
     pub(crate) async fn machine_handle(&mut self, reference: &str) -> eyre::Result<AppMachine> {
-        Ok(AppMachine::new(self.machine(reference).await?))
+        let machine = self.machine(reference).await?;
+        Ok(AppMachine::new(
+            machine,
+            self.runtime().await?.local_home().to_path_buf(),
+        ))
     }
 
     pub(crate) async fn machine_start_options(
@@ -227,11 +237,7 @@ impl LocalVmService {
         if detached_cleanup {
             crate::api::start_options::machine_start_options(self.runtime().await?, machine).await
         } else {
-            crate::api::start_options::machine_start_options_without_cleanup(
-                self.runtime().await?,
-                machine,
-            )
-            .await
+            Ok(MachineStartOptions::new())
         }
     }
 

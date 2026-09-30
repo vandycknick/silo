@@ -105,6 +105,8 @@ pub struct Runtime {
     supervisor: VmSupervisor,
     image_pull_policy: ImagePullPolicy,
     image_progress: Option<ImageProgressSender>,
+    secret_store: Arc<dyn silo_secrets::SecretStore>,
+    secret_provider: Option<crate::HostCommand>,
 }
 
 /// Identity for one concrete silo-vmm run.
@@ -174,6 +176,8 @@ impl Runtime {
         let supervisor =
             VmSupervisor::new(paths.clone(), components.supervisor.clone(), virt_backend);
         let runtime = Self {
+            secret_store: Arc::new(silo_secrets::FileStore::new(paths.home())),
+            secret_provider: None,
             paths,
             store,
             lock_manager,
@@ -192,6 +196,39 @@ impl Runtime {
     /// Returns the Silo home holding this runtime's persistent state.
     pub fn local_home(&self) -> &Path {
         self.paths.home()
+    }
+
+    /// Uses this store to resolve policy secrets for future starts.
+    pub fn with_secret_store(mut self, store: Arc<dyn silo_secrets::SecretStore>) -> Self {
+        self.secret_store = store;
+        self
+    }
+
+    /// Configures the host command used to refresh resolved OAuth records.
+    pub fn with_secret_provider(mut self, command: crate::HostCommand) -> Self {
+        self.secret_provider = Some(command);
+        self
+    }
+
+    pub(crate) fn secret_store(&self) -> &dyn silo_secrets::SecretStore {
+        self.secret_store.as_ref()
+    }
+
+    pub(crate) fn resolve_secrets(
+        &self,
+        config: &MachineConfig,
+        run_id: &str,
+        explicit: &EgressCredentials,
+    ) -> Result<crate::secrets::ResolvedSecrets, LibVmError> {
+        crate::secrets::resolve_for_start(
+            self.secret_store(),
+            &config.network,
+            config.id,
+            run_id,
+            explicit,
+            self.secret_provider.as_ref(),
+            &config.name,
+        )
     }
 
     /// Returns the local image directory.
@@ -1139,7 +1176,7 @@ impl Runtime {
         &self,
         config: &MachineConfig,
         run_id: &str,
-        egress_credentials: &EgressCredentials,
+        egress_credentials: &crate::secrets::ResolvedSecrets,
     ) -> Result<VmmNetworkAttachment, LibVmError> {
         prepare_network_runtime(
             &self.paths,

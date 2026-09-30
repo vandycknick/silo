@@ -50,9 +50,10 @@ pub use session::{
     ExecutionResult, ExecutionSession, ExecutionStdin, SshExitStatus, SshShellOptions,
     SshShellOptionsBuilder, StdinMode,
 };
+pub(crate) use start::V1RefreshProvider;
 pub use start::{
     EgressCredentials, EgressSecret, Entrypoint, HostCommand, LaunchCredentials,
-    MachineStartOptions, OAuthRefreshHook,
+    MachineStartOptions,
 };
 pub use streams::{
     FileWriteDisposition, MachineAgentConnection, MachineAgentConnectionState,

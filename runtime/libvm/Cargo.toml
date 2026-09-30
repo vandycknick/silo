@@ -8,6 +8,7 @@ agent-spec = { path = "../../specs/agent-spec" }
 disk-image = { path = "../../common/disk-image" }
 forward-spec = { path = "../../specs/forward-spec" }
 silo_policy = { package = "policy", path = "../../common/policy" }
+silo_secrets = { package = "secrets", path = "../../common/secrets" }
 oci = { path = "../oci" }
 protocol = { path = "../../specs/protocol" }
 vm-spec = { path = "../../specs/vm-spec" }
