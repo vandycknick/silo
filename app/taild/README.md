@@ -1,7 +1,7 @@
-# taild, phase 10 lobby
+# taild, owned VM lobby
 
-The management node exposes `help`, `whoami`, and `version` over tailnet SSH.
-VM operations, templates and enrollment are subsequent phases. Closing this
+The management node exposes owned VM operations over tailnet SSH. Phase 11 VMs
+have no tailnet node. Templates and VM enrollment arrive in later phases. Closing this
 daemon releases SDK handles and its own node, never stops VMs.
 
 ## Build and check
@@ -58,8 +58,9 @@ The five exact label keys are `io.silo.taild.owner`, `.owner-login`, `.name`,
 `.node.mode`, `.instance`. Only this instance's valid labels select managed
 machines. Name is exact, globally reserved across owners, with the SDK's native
 home-wide name lock authoritative against CLI/SDK writers. There is no prefix
-or auto-suffix. Future create must hold the service reservation through SDK
-creation, then verify assigned tailnet DNS. Inventory projections exclude host
+or auto-suffix. Create holds name and selected-principal quota reservations through
+durable SDK creation, releasing them on failure. Assigned VM DNS verification is
+phase 13. Inventory projections exclude host
 paths and native issue text. Unreadable indexed records never hide healthy
 ones. State readers use public ipn/profile/store types; directory presence does
 not prove enrollment. Stopped recovery only promotes validated state, retaining
@@ -80,8 +81,85 @@ expansion syntax fail validation; quoted/escaped bytes are literal. Empty
 quoted words are retained. Empty command with PTY opens a prompt; without PTY
 prints help and exits 2. `--json` returns exactly one stdout object with `ok`,
 human/error text goes to stderr. Exit categories: 2 usage, 3 invisible/missing,
-4 capability denial, 6 concurrency limit, 9 unavailable, 255 transport failure.
+4 capability denial, 5 state/conflict, 6 limit, 7 operation failure, 8 enrollment
+(later phase), 9 unavailable, 255 transport failure. Guest exit status passes through.
 Every REPL command re-resolves WhoIs; idle identity is checked every 30 seconds.
+
+## VM commands (phase 11)
+
+```text
+create NAME [IMAGE|--image OCI] [--cpus N] [--memory SIZE] [--disk-size SIZE]
+            [--userdata INLINE|-] [--label KEY=VALUE]... [--owner tag:NAME]
+            [--no-tailnet] [--no-start]
+ls
+show VM
+start VM
+stop VM [--force] [--timeout DURATION]
+restart VM
+rm VM [--force] [--yes]
+set VM [name=NAME] [cpus=N] [memory=SIZE] [disk=SIZE]
+shell VM [-u USER]
+exec VM [-u USER] [-w GUEST_DIR] [-e KEY=VALUE]... [-t] -- CMD [ARG]...
+logs VM [--follow] [--stream SOURCE] [--output stdout|stderr]
+ops [show op_ULID]
+```
+
+Aliases: `new`, `list`, `status`, `ssh`. `--json` is available for queries and
+mutations, with [documented schemas](docs/json.md). Flags after the exec `--`
+delimiter, including `--json`, are guest arguments. Quotes preserve literal
+operators and dollar signs; no host shell evaluates any command. Exec environments
+and working directories go only to the guest. `shell` and `exec -t` require an
+SSH PTY (`ssh -t`), including its initial size/TERM, resize and signal requests.
+Shell spawns the provisioned guest's `/bin/bash -l`, not a host program. Its default
+account and home come from persisted guest configuration. Lost executions return
+255; disconnect/revocation cancels only the guest execution, never the VM.
+PTY stdin EOF sends a finite two-EOT sequence: the first flushes an unterminated
+canonical line, the second produces EOF on the empty line. No pipe-close request
+is sent for a PTY. Raw-mode guests receive the two literal bytes and retain their
+own interpretation and session-cancellation lifetime. Empty input and login-shell
+exit statuses are preserved. Failed stdout/stderr transport writes return 255.
+The prompt consumes CRLF as one command terminator, including the transition into
+confirmation or guest stdin, while CR-only input returns without waiting for LF.
+
+Create accepts OCI references under configured registry/namespace prefixes,
+bounded inline userdata (`--userdata -` reads at most 16 KiB from client stdin)
+and nonreserved labels. `--disk` aliases `--disk-size`. It never accepts a host image,
+userdata file, mount, kernel, forward or raw spec. All `io.silo.*` labels are reserved.
+Multi-tag callers must select one of their verified tags with `--owner`; humans
+cannot supply another owner. Effective resource/count limits are the minimum of
+operator ceilings and capability limits. Exact names collide globally with all
+local records (including unmanaged/unreadable names) and visible tailnet names.
+
+Create reports actual pull completion/digest, durable creation, start and guest
+provisioning readiness. The SDK has no byte-progress callback; percentages are not
+invented. `--no-start` persists a stopped VM. Start never repulls its image. Set
+requires a stopped VM; disks only grow. Name and display label update through one
+atomic native SDK update. Any tailscale declaration, even pending enrollment,
+prevents rename.
+
+Remove refuses running VMs without `--force` (5). Force requires stop permission,
+uses bounded `StopWith`, then reauthorizes deletion. Confirmation requires a PTY;
+unattended callers must use `--yes` or `--json`, and are never left waiting for input.
+
+Mutations are bounded-admission daemon-owned jobs with crypto-entropy canonical
+`op_<ULID>` IDs, per-VM serialization and a 24-hour in-memory result/progress history.
+The observer subscribes to changes, and disconnect only closes the subscription.
+Queued mutations re-resolve production WhoIs at execution, before changing state;
+create rechecks after pulling and before boot. Ops requires `vm.read` and exposes
+only the caller's principal-scoped operations. Logs, exec and shell recheck fresh
+identity, ownership and the exact action every 30 seconds, denying on resolver error.
+Log sources: `monitor`, `serial`, `exec`, `network`, `network-audit` (`network_audit`
+also accepted). The last 4 MiB
+are retained, follow uses bounded line buffering, and path/credential diagnostics
+are redacted. Native error text never reaches remote responses.
+
+Shutdown seals admission, closes sessions and drains jobs within a shared 90-second
+budget. Operations have a separate daemon-owned context; it is cancelled when the
+drain expires. SDK Close starts only after both sessions and jobs drain successfully
+and budget remains; its wait is bounded by that same deadline. A timed-out drain or
+blocked library close reports incomplete runtime cleanup and leaves handle cleanup
+to process exit. No shutdown path calls Stop or Remove. Restart
+reconciles libvm records; it neither replays operations nor creates a service database.
 
 ## Startup environment and credentials
 
@@ -129,3 +207,23 @@ inventory/health and consumer/binary-check fixtures fail instead of skipping
 when prerequisites are missing. A configured invalid path always fails, even
 without strict mode. Local runs can reuse an existing complete stage; no runtime
 binaries or assets are fabricated by tests.
+
+Native KVM qualification uses an actual ephemeral TLS OCI registry serving a
+digest-verified tar of the read-only generated minimal guest rootfs. The same
+rootfs generated `.tmp/silo-taild/s7-kvm-v3/minimal.ext4`. Native OCI materialization
+creates a fresh root disk in a real temporary SDK home, without internet, tailnet
+or a production host-image bypass. Ephemeral registry trust exists only in tests.
+
+```sh
+CGO_ENABLED=1 SILO_GO_FFI_PATH=/absolute/path/libsilo_go_ffi.so \
+  SILO_TEST_RUNTIME_ROOT=/absolute/path/complete/runtime \
+  SILO_TAILD_TEST_ROOTFS=/absolute/path/s7-kvm-v3/rootfs SILO_E2E_KVM=1 \
+  go -C app/taild test -race -tags=e2e -count=1 -timeout=4m -v ./...
+```
+
+These service tests receive explicit principal/capability **input** below
+authentication. They use the actual public SDK, OCI, guest PTY and KVM, including
+two positive users, disconnect, queued revocation, 30-second stream revocation,
+50 shells and genuine SDK close/reopen with an unchanged running VM run ID.
+They do not qualify WhoIs or registered tailnet behavior. G1/HUMAN and live gates
+remain separately unverified.

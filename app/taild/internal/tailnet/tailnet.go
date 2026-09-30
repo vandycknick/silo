@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	_ "github.com/vandycknick/silo/app/taild/internal/bootenv"
@@ -113,3 +114,31 @@ func (n *Node) WhoIs(ctx context.Context, remote string) (identity.Peer, error) 
 	return identity.FromWhoIs(who, n.config.Tailnet.Capability, n.defaults, n.log)
 }
 func (n *Node) Close() error { return n.Server.Close() }
+
+func (n *Node) VisibleNames(ctx context.Context) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	status, e := n.Client.Status(ctx)
+	if e != nil {
+		return nil, e
+	}
+	if e = n.verify(status); e != nil {
+		return nil, e
+	}
+	names := []string{}
+	add := func(peer *ipnstate.PeerStatus) {
+		if peer == nil {
+			return
+		}
+		dns := strings.TrimSuffix(strings.ToLower(peer.DNSName), ".")
+		name, _, _ := strings.Cut(dns, ".")
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	add(status.Self)
+	for _, peer := range status.Peer {
+		add(peer)
+	}
+	return names, nil
+}
