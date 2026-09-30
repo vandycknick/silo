@@ -1,4 +1,4 @@
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -19,6 +19,7 @@ use nix::unistd::{
     chown, dup, getgrouplist, getpid, setgid, setgroups, setsid, setuid, tcsetpgrp, Gid, Pid, Uid,
 };
 use russh::keys::ssh_key::private::Ed25519Keypair;
+use russh::keys::ssh_key::{certificate::CertType, Certificate};
 use russh::keys::{PrivateKey, PublicKey};
 use russh::server::{Auth, ChannelOpenHandle, Config, Handler, Msg, Session};
 use russh::{Channel, ChannelId, Pty, Sig};
@@ -46,14 +47,26 @@ pub(crate) struct NativeSshBackend {
 }
 
 impl NativeSshBackend {
+    pub(crate) fn host_public_key(&self) -> eyre::Result<PublicKey> {
+        self.server_config
+            .keys
+            .first()
+            .map(|key| key.public_key().clone())
+            .ok_or_else(|| eyre::eyre!("native SSH host key is missing"))
+    }
     pub(crate) fn new(
         config: AgentSshConfig,
         process_supervisor: ProcessSupervisor,
     ) -> eyre::Result<Self> {
         let auth = Arc::new(AuthDb::from_config(&config)?);
-        let mut server_config = Config::default();
-        server_config.inactivity_timeout = None;
-        server_config.keys.push(generate_host_key()?);
+        let server_config = Config {
+            inactivity_timeout: None,
+            methods: russh::MethodSet::from(&[russh::MethodKind::PublicKey][..]),
+            keys: vec![persistent_host_key(Path::new(
+                crate::provision::ssh::HOST_KEY,
+            ))?],
+            ..Default::default()
+        };
 
         Ok(Self {
             auth,
@@ -87,6 +100,8 @@ impl NativeSshBackend {
             auth: Arc::clone(&self.auth),
             process_supervisor: self.process_supervisor.clone(),
             authenticated_user: None,
+            permit_pty: false,
+            permit_agent_forwarding: false,
             channels: HashMap::new(),
             runtime: RuntimeHandle::current(),
         };
@@ -135,6 +150,8 @@ struct NativeSshHandler {
     auth: Arc<AuthDb>,
     process_supervisor: ProcessSupervisor,
     authenticated_user: Option<UserEntry>,
+    permit_pty: bool,
+    permit_agent_forwarding: bool,
     channels: HashMap<ChannelId, ChannelState>,
     runtime: RuntimeHandle,
 }
@@ -142,33 +159,16 @@ struct NativeSshHandler {
 impl Handler for NativeSshHandler {
     type Error = eyre::Report;
 
-    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
-        if let Some(auth_user) = self.auth.authenticate_none(user) {
-            tracing::info!(
-                connection_id = self.connection_id,
-                user = %auth_user.name,
-                method = "none",
-                "native SSH authentication succeeded"
-            );
-            self.authenticated_user = Some(auth_user);
-            return Ok(Auth::Accept);
-        }
-
-        tracing::debug!(
-            connection_id = self.connection_id,
-            user,
-            method = "none",
-            "native SSH authentication rejected"
-        );
+    async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
         Ok(Auth::reject())
     }
 
     async fn auth_publickey_offered(
         &mut self,
         user: &str,
-        public_key: &PublicKey,
+        _public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        if self.auth.public_key_allowed(user, public_key) {
+        if self.auth.users.contains_key(user) {
             tracing::debug!(
                 connection_id = self.connection_id,
                 user,
@@ -189,27 +189,41 @@ impl Handler for NativeSshHandler {
 
     async fn auth_publickey(
         &mut self,
-        user: &str,
-        public_key: &PublicKey,
+        _user: &str,
+        _public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        if let Some(auth_user) = self.auth.authenticate_public_key(user, public_key) {
-            tracing::info!(
-                connection_id = self.connection_id,
-                user = %auth_user.name,
-                method = "publickey",
-                "native SSH authentication succeeded"
-            );
-            self.authenticated_user = Some(auth_user);
-            return Ok(Auth::Accept);
-        }
-
-        tracing::debug!(
-            connection_id = self.connection_id,
-            user,
-            method = "publickey",
-            "native SSH authentication rejected"
-        );
         Ok(Auth::reject())
+    }
+
+    async fn auth_openssh_certificate(
+        &mut self,
+        user: &str,
+        certificate: &Certificate,
+    ) -> Result<Auth, Self::Error> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        if !valid_certificate(certificate, &self.auth.ca, user, now) {
+            return Ok(Auth::reject());
+        }
+        let Some(account) = self.auth.users.get(user) else {
+            return Ok(Auth::reject());
+        };
+        self.authenticated_user = Some(account.clone());
+        self.permit_pty = certificate
+            .extensions()
+            .get("permit-pty")
+            .is_some_and(String::is_empty);
+        self.permit_agent_forwarding = certificate
+            .extensions()
+            .get("permit-agent-forwarding")
+            .is_some_and(String::is_empty);
+        tracing::info!(
+            user,
+            key_id = certificate.key_id(),
+            "native SSH certificate authentication succeeded"
+        );
+        Ok(Auth::Accept)
     }
 
     async fn channel_open_session(
@@ -240,6 +254,10 @@ impl Handler for NativeSshHandler {
         _modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if !self.permit_pty {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         let Some(state) = self.channels.get_mut(&channel) else {
             session.channel_failure(channel)?;
             return Ok(());
@@ -279,7 +297,10 @@ impl Handler for NativeSshHandler {
             session.channel_failure(channel)?;
             return Ok(());
         };
-        if valid_environment_name(variable_name) && !variable_value.contains('\0') {
+        if variable_name.starts_with("SILO_")
+            && valid_environment_name(variable_name)
+            && !variable_value.contains('\0')
+        {
             state
                 .env
                 .insert(variable_name.to_string(), variable_value.to_string());
@@ -295,6 +316,10 @@ impl Handler for NativeSshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        if !self.permit_agent_forwarding {
+            session.channel_failure(channel)?;
+            return Ok(true);
+        }
         let Some(user) = self.authenticated_user.clone() else {
             session.channel_failure(channel)?;
             return Ok(true);
@@ -798,76 +823,29 @@ impl Drop for AgentForward {
 
 #[derive(Clone)]
 struct AuthDb {
-    users: HashMap<String, AuthUser>,
+    users: HashMap<String, UserEntry>,
+    ca: PublicKey,
 }
 
 impl AuthDb {
     fn from_config(config: &AgentSshConfig) -> eyre::Result<Self> {
-        let passwd = parse_passwd(PASSWD_PATH)?;
-        let mut users: HashMap<String, AuthUser> = HashMap::new();
-
-        for configured in &config.authorized_users {
-            let Some(mut user) = passwd.get(&configured.name).cloned() else {
-                tracing::warn!(
-                    user = configured.name,
-                    "configured SSH user is not present in /etc/passwd"
-                );
-                continue;
-            };
-            let auth_user = match users.entry(user.name.clone()) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    user.groups = supplementary_groups(&user)?;
-                    entry.insert(AuthUser {
-                        user,
-                        keys: Vec::new(),
-                        allow_without_auth: false,
-                    })
-                }
-            };
-            auth_user.allow_without_auth |= configured.allow_without_auth;
-            for key in &configured.authorized_keys {
-                let key = key.trim();
-                if key.is_empty() {
-                    continue;
-                }
-                auth_user
-                    .keys
-                    .push(PublicKey::from_openssh(key).with_context(|| {
-                        format!("parse SSH authorized key for {}", configured.name)
-                    })?);
-            }
+        let mut users = parse_passwd(PASSWD_PATH)?;
+        users
+            .retain(|_, user| !user.shell.ends_with("/nologin") && !user.shell.ends_with("/false"));
+        for user in users.values_mut() {
+            user.groups = supplementary_groups(user)?;
         }
-
-        Ok(Self { users })
+        let ca = PublicKey::from_openssh(
+            config
+                .trusted_ca
+                .as_deref()
+                .ok_or_else(|| eyre::eyre!("missing mandatory SSH CA trust"))?,
+        )?;
+        if ca.algorithm() != russh::keys::ssh_key::Algorithm::Ed25519 {
+            eyre::bail!("SSH CA must be Ed25519");
+        }
+        Ok(Self { users, ca })
     }
-
-    fn authenticate_none(&self, name: &str) -> Option<UserEntry> {
-        let user = self.users.get(name)?;
-        user.allow_without_auth.then(|| user.user.clone())
-    }
-
-    fn public_key_allowed(&self, name: &str, public_key: &PublicKey) -> bool {
-        self.users
-            .get(name)
-            .map(|user| user.keys.iter().any(|key| same_public_key(key, public_key)))
-            .unwrap_or(false)
-    }
-
-    fn authenticate_public_key(&self, name: &str, public_key: &PublicKey) -> Option<UserEntry> {
-        let user = self.users.get(name)?;
-        user.keys
-            .iter()
-            .any(|key| same_public_key(key, public_key))
-            .then(|| user.user.clone())
-    }
-}
-
-#[derive(Clone)]
-struct AuthUser {
-    user: UserEntry,
-    keys: Vec<PublicKey>,
-    allow_without_auth: bool,
 }
 
 #[derive(Clone)]
@@ -1264,8 +1242,72 @@ pub(crate) fn valid_environment_name(name: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn same_public_key(left: &PublicKey, right: &PublicKey) -> bool {
-    left.key_data() == right.key_data()
+fn valid_certificate(cert: &Certificate, ca: &PublicKey, user: &str, now: u64) -> bool {
+    cert.cert_type() == CertType::User
+        && cert.algorithm() == russh::keys::ssh_key::Algorithm::Ed25519
+        && cert.signature_key() == ca.key_data()
+        && cert.valid_principals().iter().any(|p| p == user)
+        && cert.critical_options().is_empty()
+        && cert.valid_before() != u64::MAX
+        && cert
+            .valid_before()
+            .checked_sub(cert.valid_after())
+            .is_some_and(|window| window > 0 && window <= 360)
+        && now >= cert.valid_after()
+        && now < cert.valid_before()
+        && cert.verify_signature().is_ok()
+}
+
+pub(crate) fn persistent_host_key(path: &Path) -> eyre::Result<PrivateKey> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = path
+        .parent()
+        .ok_or_else(|| eyre::eyre!("host key has no parent"))?;
+    fs::create_dir_all(parent)?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(parent.join("host-key.lock"))?;
+    lock.lock()?;
+    match fs::read(path) {
+        Ok(bytes) => {
+            let key = PrivateKey::from_openssh(bytes)?;
+            if key.is_encrypted() || key.algorithm() != russh::keys::ssh_key::Algorithm::Ed25519 {
+                eyre::bail!("invalid native SSH host key");
+            }
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            Ok(key)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let key = generate_host_key()?;
+            let temp = parent.join(format!(".host-key.{}", uuid::Uuid::new_v4()));
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp)?;
+            let result = (|| -> eyre::Result<()> {
+                file.write_all(
+                    key.to_openssh(russh::keys::ssh_key::LineEnding::LF)?
+                        .as_bytes(),
+                )?;
+                file.sync_all()?;
+                fs::rename(&temp, path)?;
+                File::open(parent)?.sync_all()?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = fs::remove_file(&temp);
+            }
+            result?;
+            Ok(key)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn process_group_from_child(child: &Child) -> eyre::Result<i32> {
@@ -1317,4 +1359,269 @@ fn clamp_to_u16(value: u32) -> u16 {
 
 fn ssh_error_to_io(error: eyre::Report) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use crate::pid1::ProcessSupervisor;
+    use crate::ssh::agent::{persistent_host_key, valid_certificate, AuthDb, NativeSshHandler};
+    use russh::keys::ssh_key::{
+        certificate::{Builder, CertType},
+        private::Ed25519Keypair,
+        Certificate, PrivateKey,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    pub(crate) fn certificate(
+        ca: &PrivateKey,
+        principal: &str,
+        after: u64,
+        before: u64,
+        host: bool,
+        critical: bool,
+    ) -> (Arc<PrivateKey>, Certificate) {
+        let subject = Arc::new(PrivateKey::from(Ed25519Keypair::from_seed(&[2; 32])));
+        let mut builder = Builder::new(vec![3; 32], subject.public_key(), after, before).unwrap();
+        builder.valid_principal(principal).unwrap();
+        builder.key_id("silo:cli:uid1000:test").unwrap();
+        builder
+            .cert_type(if host { CertType::Host } else { CertType::User })
+            .unwrap();
+        builder.extension("permit-pty", "").unwrap();
+        if critical {
+            builder
+                .critical_option("unknown-silo-option", "false")
+                .unwrap();
+        }
+        (subject, builder.sign(ca).unwrap())
+    }
+
+    #[test]
+    fn certificate_validation_is_strict_at_all_boundaries() {
+        let ca = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
+        let other = PrivateKey::from(Ed25519Keypair::from_seed(&[4; 32]));
+        for (signer, principal, after, before, host, critical, now, accepted) in [
+            (&ca, "silo", 940, 1300, false, false, 1000, true),
+            (&ca, "silo", 940, 1300, false, false, 940, true),
+            (&ca, "silo", 940, 1300, false, false, 939, false),
+            (&ca, "silo", 940, 1300, false, false, 1299, true),
+            (&ca, "silo", 940, 1300, false, false, 1300, false),
+            (&ca, "silo", 1001, 1301, false, false, 1000, false),
+            (&ca, "root", 940, 1300, false, false, 1000, false),
+            (&other, "silo", 940, 1300, false, false, 1000, false),
+            (&ca, "silo", 940, 1300, true, false, 1000, false),
+            (&ca, "silo", 940, 1300, false, true, 1000, false),
+            (&ca, "silo", 939, 1300, false, false, 1000, false),
+            (&ca, "silo", 940, u64::MAX, false, false, 1000, false),
+        ] {
+            let (_, cert) = certificate(signer, principal, after, before, host, critical);
+            assert_eq!(
+                valid_certificate(&cert, ca.public_key(), "silo", now),
+                accepted,
+                "{principal} {after} {before} {now}"
+            );
+        }
+        let (_, cert) = certificate(&ca, "silo", 940, 1300, false, false);
+        let mut bytes = cert.to_bytes().unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        let tampered = Certificate::from_bytes(&bytes).unwrap();
+        assert!(!valid_certificate(&tampered, ca.public_key(), "silo", 1000));
+    }
+
+    #[test]
+    fn native_host_key_persists_with_private_permissions_and_rejects_corruption() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("ssh/host");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let interrupted = path.parent().unwrap().join("host-key.tmp");
+        std::fs::write(&interrupted, "interrupted write").unwrap();
+        let first = persistent_host_key(&path).unwrap();
+        assert_eq!(std::fs::read(interrupted).unwrap(), b"interrupted write");
+        assert_eq!(
+            persistent_host_key(&path).unwrap().public_key(),
+            first.public_key()
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        std::fs::write(&path, "corrupt").unwrap();
+        assert!(persistent_host_key(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"corrupt");
+    }
+
+    pub(crate) struct Client {
+        pub(crate) key: russh::keys::PublicKey,
+    }
+    impl russh::client::Handler for Client {
+        type Error = russh::Error;
+        async fn check_server_key(
+            &mut self,
+            key: &russh::keys::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(key.key_data() == self.key.key_data())
+        }
+    }
+
+    #[tokio::test]
+    async fn native_real_handshake_accepts_certificate_and_rejects_alternate_auth() {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let ca = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
+            let auth = Arc::new(
+                AuthDb::from_config(&agent_spec::AgentSshConfig {
+                    trusted_ca: Some(ca.public_key().to_openssh().unwrap()),
+                })
+                .unwrap(),
+            );
+            let user = auth
+                .users
+                .values()
+                .find(|u| u.uid == nix::unistd::Uid::current().as_raw())
+                .unwrap()
+                .name
+                .clone();
+            let host = PrivateKey::from(Ed25519Keypair::from_seed(&[5; 32]));
+            let host_public = host.public_key().clone();
+            let config = Arc::new(russh::server::Config {
+                keys: vec![host],
+                auth_rejection_time: std::time::Duration::from_millis(5),
+                ..Default::default()
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let handler = NativeSshHandler {
+                        connection_id: 1,
+                        auth: auth.clone(),
+                        process_supervisor: ProcessSupervisor::default(),
+                        authenticated_user: None,
+                        permit_pty: false,
+                        permit_agent_forwarding: false,
+                        channels: HashMap::new(),
+                        runtime: tokio::runtime::Handle::current(),
+                    };
+                    let config = config.clone();
+                    tokio::spawn(async move {
+                        if let Ok(session) =
+                            russh::server::run_stream(config, stream, handler).await
+                        {
+                            let _ = session.await;
+                        }
+                    });
+                }
+            });
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let (key, cert) = certificate(&ca, &user, now - 60, now + 300, false, false);
+            let mut client = russh::client::connect(
+                Arc::new(Default::default()),
+                address,
+                Client {
+                    key: host_public.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!client.authenticate_none(&user).await.unwrap().success());
+            assert!(!client
+                .authenticate_password(&user, "not-a-password")
+                .await
+                .unwrap()
+                .success());
+            assert!(!client
+                .authenticate_publickey(
+                    &user,
+                    russh::keys::PrivateKeyWithHashAlg::new(key.clone(), None)
+                )
+                .await
+                .unwrap()
+                .success());
+            assert!(client
+                .authenticate_openssh_cert(&user, key, cert)
+                .await
+                .unwrap()
+                .success());
+            let mut channel = client.channel_open_session().await.unwrap();
+            channel.agent_forward(true).await.unwrap();
+            assert!(matches!(
+                channel.wait().await,
+                Some(russh::ChannelMsg::Failure)
+            ));
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            assert!(matches!(
+                channel.wait().await,
+                Some(russh::ChannelMsg::Success)
+            ));
+            client
+                .disconnect(russh::Disconnect::ByApplication, "done", "en")
+                .await
+                .unwrap();
+            let key = Arc::new(PrivateKey::from(Ed25519Keypair::from_seed(&[6; 32])));
+            let mut builder =
+                Builder::new(vec![7; 32], key.public_key(), now - 60, now + 300).unwrap();
+            builder.valid_principal(&user).unwrap();
+            let cert = builder.sign(&ca).unwrap();
+            let mut client = russh::client::connect(
+                Arc::new(Default::default()),
+                address,
+                Client {
+                    key: host_public.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(client
+                .authenticate_openssh_cert(&user, key, cert)
+                .await
+                .unwrap()
+                .success());
+            let mut channel = client.channel_open_session().await.unwrap();
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            assert!(matches!(
+                channel.wait().await,
+                Some(russh::ChannelMsg::Failure)
+            ));
+            client
+                .disconnect(russh::Disconnect::ByApplication, "done", "en")
+                .await
+                .unwrap();
+            let (key, cert) =
+                certificate(&ca, "wrong-principal", now - 60, now + 300, false, false);
+            let mut client = russh::client::connect(
+                Arc::new(Default::default()),
+                address,
+                Client { key: host_public },
+            )
+            .await
+            .unwrap();
+            assert!(!client
+                .authenticate_openssh_cert(&user, key, cert)
+                .await
+                .unwrap()
+                .success());
+            server.abort();
+        })
+        .await
+        .expect("bounded native handshake");
+    }
 }

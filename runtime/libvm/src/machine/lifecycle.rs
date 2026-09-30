@@ -96,9 +96,12 @@ impl Machine {
             let run_id = run_uuid.to_string();
 
             runtime.request_machine_start(&config, &run_id).await?;
-            let (root_disk_resize, secrets) = match (|| {
-                let secrets =
-                    runtime.resolve_secrets(&config, &run_id, &options.egress_credentials)?;
+            let (root_disk_resize, mut secrets) = match (|| {
+                let secrets = runtime.resolve_machine_secrets(
+                    &config,
+                    &run_id,
+                    &options.egress_credentials,
+                )?;
                 Ok((reconcile_root_disk_size(&config)?, secrets))
             })() {
                 Ok(outcome) => outcome,
@@ -132,10 +135,17 @@ impl Machine {
                     .await);
                 }
             };
+            secrets.infrastructure.clear();
             let launch_inputs = match runtime.prepare_vmm_launch_inputs(
                 &config,
                 &resolved_network,
                 root_disk_resize == RootDiskResizeOutcome::GuestRequired,
+                secrets.ssh_trusted_ca.as_deref().ok_or_else(|| {
+                    LibVmError::MachinePreparationFailed {
+                        reference: config.name.clone(),
+                        message: "missing resolved SSH CA".into(),
+                    }
+                })?,
             ) {
                 Ok(inputs) => inputs,
                 Err(err) => {
@@ -627,9 +637,20 @@ impl Machine {
         }
 
         runtime.cleanup_machine_resources_locked(&config).await?;
+        let scope_error = crate::ssh_ca::delete_scope(runtime.secret_store(), config.id).err();
+        if let Some(error) = &scope_error {
+            tracing::error!(machine = %config.id, %error, "remove machine secret scope");
+        }
         runtime.local_paths().remove_machine_logs_tree(config.id)?;
         runtime.local_paths().remove_machine_data_tree(config.id)?;
-        runtime.remove_machine_records(&config).await
+        runtime.remove_machine_records(&config).await?;
+        if let Some(error) = scope_error {
+            return Err(LibVmError::MachinePreparationFailed {
+                reference: config.name,
+                message: format!("machine removed but secret scope cleanup failed: {error}"),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -699,13 +720,20 @@ async fn finish_failed_start(
         }
     }
     if terminal_transitioned && config.retention == crate::MachineRetention::Ephemeral {
-        let _: Result<(), LibVmError> = async {
+        if let Err(error) = crate::ssh_ca::delete_scope(runtime.secret_store(), config.id) {
+            tracing::error!(machine = %config.id, %error, "delete ephemeral machine secret scope");
+            cleanup_errors.push(format!("delete ephemeral machine secret scope: {error}"));
+        }
+        let cleanup: Result<(), LibVmError> = async {
             runtime.cleanup_machine_resources_locked(config).await?;
             runtime.local_paths().remove_machine_logs_tree(config.id)?;
             runtime.local_paths().remove_machine_data_tree(config.id)?;
             runtime.remove_machine_records(config).await
         }
         .await;
+        if let Err(error) = cleanup {
+            cleanup_errors.push(format!("remove ephemeral machine: {error}"));
+        }
     }
 
     if cleanup_errors.is_empty() {

@@ -16,7 +16,6 @@ const AFTER: &[ProvisionerId] = &[
     ProvisionerId::TIMEZONE,
     ProvisionerId::LOCALE,
     ProvisionerId::USERS,
-    ProvisionerId::SSH_AUTHORIZED_KEYS,
     ProvisionerId::CERTIFICATE_AUTHORITY,
     ProvisionerId::RESIZE_ROOTFS,
     ProvisionerId::MOUNTS,

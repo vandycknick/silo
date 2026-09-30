@@ -25,6 +25,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 pub(crate) async fn spawn_guest_services(
     machine: &VirtualMachine,
+    machine_dir: &std::path::Path,
     store: Arc<InstanceStore>,
     forwards: Arc<crate::forward::ForwardTable>,
     shutdown: CancellationToken,
@@ -34,8 +35,14 @@ pub(crate) async fn spawn_guest_services(
         "connecting to guest agent over vsock"
     );
     let machine = machine.clone();
+    let machine_dir = machine_dir.to_path_buf();
     Ok(tokio::spawn(async move {
-        let status = supervise_status(machine.clone(), store.clone(), shutdown.clone());
+        let status = supervise_status(
+            machine.clone(),
+            machine_dir,
+            store.clone(),
+            shutdown.clone(),
+        );
         let metrics = supervise_metrics(machine.clone(), store.clone(), shutdown.clone());
         let capability =
             crate::forward::spawn_capability_supervisor(machine, store, forwards, shutdown);
@@ -48,6 +55,7 @@ pub(crate) async fn spawn_guest_services(
 
 async fn supervise_status(
     machine: VirtualMachine,
+    machine_dir: std::path::PathBuf,
     store: Arc<InstanceStore>,
     shutdown: CancellationToken,
 ) {
@@ -80,6 +88,8 @@ async fn supervise_status(
                 match connect(&machine).await {
                     Ok(channel) => {
                         status_stream(
+                            &machine,
+                            &machine_dir,
                             agent_client(channel),
                             store.clone(),
                             &mut reset,
@@ -169,6 +179,8 @@ async fn supervise_metrics(
 }
 
 async fn status_stream(
+    machine: &VirtualMachine,
+    machine_dir: &std::path::Path,
     mut client: GuestAgentServiceClient<Channel>,
     store: Arc<InstanceStore>,
     reset: &mut tokio::sync::watch::Receiver<u64>,
@@ -203,9 +215,27 @@ async fn status_stream(
                 if received_snapshot { HEARTBEAT * 3 } else { FIRST_STATUS_DEADLINE },
                 stream.message(),
             ) => {
-                let message = message.map_err(|_| (tonic::Status::deadline_exceeded("guest status stream became silent"), received_snapshot))?
+                let mut message = message.map_err(|_| (tonic::Status::deadline_exceeded("guest status stream became silent"), received_snapshot))?
                     .map_err(|error| (error, received_snapshot))?
                     .ok_or_else(|| (tonic::Status::unavailable("guest status stream ended"), received_snapshot))?;
+                if let Some(report) = message.report.as_mut() {
+                    if let Some(ssh) = report.ssh.as_mut() {
+                        ssh.kex_verified = false;
+                        if ssh.config_verified && ssh.port == 22 {
+                            let failure = match tokio::time::timeout(Duration::from_secs(5), verify_ssh_listener(machine, machine_dir, &ssh.host_public_key)).await {
+                                Ok(Ok(())) => { ssh.kex_verified = true; None }
+                                Ok(Err(error)) => Some(error.to_string()),
+                                Err(_) => Some("actual listener KEX/pin verification timed out".into()),
+                            };
+                            if let Some(error) = failure {
+                                tracing::warn!(%error, "guest SSH readiness verification failed");
+                                report.state = Some(protocol::v1::AgentStatusState::Starting as i32);
+                                report.code = Some("SSH_NOT_READY".into());
+                                report.message = Some(format!("SSH listener verification failed: {}", error.chars().take(400).collect::<String>()));
+                            }
+                        }
+                    }
+                }
                 store
                     .observe_status(message, HEARTBEAT * 3)
                     .map_err(|error| (observation_error(error), received_snapshot))?;
@@ -218,6 +248,50 @@ async fn status_stream(
                 received_snapshot = true;
             }
         }
+    }
+}
+
+async fn verify_ssh_listener(
+    machine: &VirtualMachine,
+    machine_dir: &std::path::Path,
+    expected: &str,
+) -> eyre::Result<()> {
+    let expected = russh::keys::PublicKey::from_openssh(expected)?;
+    let stream = machine.connect_vsock(22).await?;
+    verify_ssh_stream(stream, expected.clone()).await?;
+    let dir = machine_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || utils::ssh::verify_host_key_pin(&dir, &expected)).await??;
+    Ok(())
+}
+
+async fn verify_ssh_stream<S>(stream: S, expected: russh::keys::PublicKey) -> eyre::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let handle = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        stream,
+        ListenerKey {
+            expected: expected.clone(),
+        },
+    )
+    .await?;
+    handle
+        .disconnect(russh::Disconnect::ByApplication, "readiness probe", "en")
+        .await?;
+    Ok(())
+}
+
+struct ListenerKey {
+    expected: russh::keys::PublicKey,
+}
+impl russh::client::Handler for ListenerKey {
+    type Error = russh::Error;
+    async fn check_server_key(
+        &mut self,
+        key: &russh::keys::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        Ok(key.key_data() == self.expected.key_data())
     }
 }
 
@@ -437,6 +511,47 @@ mod tests {
         RetryPhase, RetrySchedule, FAST_DISCOVERY_RETRY, FAST_DISCOVERY_WINDOW, INITIAL_BACKOFF,
         MAX_BACKOFF,
     };
+
+    #[tokio::test]
+    async fn actual_ssh_kex_accepts_only_the_reported_listener_key() {
+        use russh::keys::ssh_key::{private::Ed25519Keypair, PrivateKey};
+        use std::sync::Arc;
+        struct RejectAuth;
+        impl russh::server::Handler for RejectAuth {
+            type Error = russh::Error;
+        }
+        let host = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
+        let other = PrivateKey::from(Ed25519Keypair::from_seed(&[2; 32]));
+        for (expected, valid) in [
+            (host.public_key().clone(), true),
+            (other.public_key().clone(), false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server_stream, _) = listener.accept().await.unwrap();
+            let config = Arc::new(russh::server::Config {
+                keys: vec![host.clone()],
+                ..Default::default()
+            });
+            let server = tokio::spawn(async move {
+                if let Ok(session) =
+                    russh::server::run_stream(config, server_stream, RejectAuth).await
+                {
+                    let _ = session.await;
+                }
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::guest::verify_ssh_stream(stream, expected),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), valid);
+            server.abort();
+        }
+    }
 
     #[test]
     fn initial_discovery_retries_are_bounded_during_fast_window() {

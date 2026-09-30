@@ -16,6 +16,8 @@ pub(crate) struct ResolvedSecrets {
     pub(crate) credentials: EgressCredentials,
     pub(crate) oauth_refresh_hook: Option<SecretProvider>,
     pub(crate) provenance: Vec<Provenance>,
+    pub(crate) infrastructure: Vec<(String, silo_secrets::SecretBytes)>,
+    pub(crate) ssh_trusted_ca: Option<String>,
 }
 
 impl std::ops::Deref for ResolvedSecrets {
@@ -415,6 +417,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not a directory"));
+        std::fs::remove_file(&machine_dir).unwrap();
         runtime
             .get_machine(&crate::MachineRef::id(config.id))
             .await

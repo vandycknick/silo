@@ -1,20 +1,14 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-
 use agent_spec::{
-    AgentConfig, AgentRosettaConfig, AgentSshAuthorizedUser, AgentSshConfig,
-    CertificateAuthorityConfig, MountConfig as ProvisionMountConfig,
-    NetworkConfig as ProvisionNetworkConfig, NetworkInterfaceConfig, ProvisionConfig,
-    ResizeRootfsConfig, UserConfig, UserdataConfig, UserdataContentType, UserdataRunPolicy,
+    AgentConfig, AgentRosettaConfig, AgentSshConfig, CertificateAuthorityConfig,
+    MountConfig as ProvisionMountConfig, NetworkConfig as ProvisionNetworkConfig,
+    NetworkInterfaceConfig, ProvisionConfig, ResizeRootfsConfig, UserConfig, UserdataConfig,
+    UserdataContentType, UserdataRunPolicy,
 };
-use eyre::Context;
-use ssh_key::PrivateKey;
 use utils::format_mac;
 use vm_spec::VmSpec;
 
 use crate::constants::{
-    GUEST_CERTIFICATE_AUTHORITY_PATH, GUEST_SSH_PRIVATE_KEY_FILE_NAME,
-    GUEST_SSH_PUBLIC_KEY_FILE_NAME, GUEST_USER_SHELL, GUEST_USER_SUDO_RULE, MOUNT_OPTION_NOFAIL,
+    GUEST_CERTIFICATE_AUTHORITY_PATH, GUEST_USER_SHELL, GUEST_USER_SUDO_RULE, MOUNT_OPTION_NOFAIL,
     MOUNT_OPTION_READ_ONLY, MOUNT_OPTION_READ_WRITE, USERDATA_CONTENT_TYPE_CLOUD_CONFIG,
     USERDATA_CONTENT_TYPE_PLAIN_TEXT, USERDATA_CONTENT_TYPE_SHELL_SCRIPT, VIRTIOFS_FSTYPE,
 };
@@ -32,11 +26,12 @@ pub(crate) struct GuestAgentConfigInput<'a> {
     pub(crate) networking: &'a RuntimeNetworkingConfig,
     pub(crate) resize_rootfs: bool,
     pub(crate) user: Option<&'a MachineUserConfig>,
+    pub(crate) ssh_trusted_ca: &'a str,
 }
 
 struct GuestAgentHostContext {
     user: Option<MachineUserConfig>,
-    ssh_public_key_openssh: String,
+    ssh_trusted_ca: String,
     certificate_authority_pem: Option<String>,
     timezone: String,
     locale: String,
@@ -48,6 +43,7 @@ pub(crate) fn build_config(input: GuestAgentConfigInput<'_>) -> eyre::Result<Age
         input.networking,
         input.network.requires_certificate_authority(),
         input.user,
+        input.ssh_trusted_ca,
     )?;
     build_config_with_host_context(
         input.machine_name,
@@ -63,16 +59,15 @@ fn load_host_context(
     networking: &RuntimeNetworkingConfig,
     requires_certificate_authority: bool,
     user: Option<&MachineUserConfig>,
+    ssh_trusted_ca: &str,
 ) -> eyre::Result<GuestAgentHostContext> {
-    let ssh_keypair =
-        load_or_generate_guest_ssh_keypair(paths).context("load guest SSH keypair")?;
     let certificate_authority_pem = requires_certificate_authority
         .then(|| certificate_authority_pem_for_config(paths, networking))
         .transpose()?;
 
     Ok(GuestAgentHostContext {
         user: user.cloned(),
-        ssh_public_key_openssh: ssh_keypair.public_key_openssh,
+        ssh_trusted_ca: ssh_trusted_ca.to_string(),
         certificate_authority_pem,
         timezone: host::current_timezone(),
         locale: host::current_locale(),
@@ -157,71 +152,9 @@ fn build_provision_config(
 }
 
 fn build_ssh_config(host_context: &GuestAgentHostContext) -> AgentSshConfig {
-    let public_key = host_context.ssh_public_key_openssh.trim().to_string();
-    let mut authorized_users = vec![AgentSshAuthorizedUser {
-        name: "root".to_string(),
-        authorized_keys: vec![public_key.clone()],
-        allow_without_auth: false,
-    }];
-
-    if let Some(user) = &host_context.user {
-        if user.name != "root" {
-            authorized_users.push(AgentSshAuthorizedUser {
-                name: user.name.clone(),
-                authorized_keys: vec![public_key],
-                allow_without_auth: false,
-            });
-        }
+    AgentSshConfig {
+        trusted_ca: Some(host_context.ssh_trusted_ca.clone()),
     }
-
-    AgentSshConfig { authorized_users }
-}
-
-pub(crate) fn load_or_generate_guest_ssh_keypair(
-    paths: &LocalPaths,
-) -> eyre::Result<host::SshKeyPair> {
-    let (private_key_path, public_key_path) = guest_ssh_key_paths(paths);
-    if private_key_path.is_file() && public_key_path.is_file() {
-        validate_guest_ssh_keypair(&private_key_path, &public_key_path)
-    } else {
-        host::generate_ssh_keypair(&private_key_path, &public_key_path, None)
-    }
-}
-
-fn guest_ssh_key_paths(paths: &LocalPaths) -> (PathBuf, PathBuf) {
-    let keys_dir = paths.keys_dir();
-    (
-        keys_dir.join(GUEST_SSH_PRIVATE_KEY_FILE_NAME),
-        keys_dir.join(GUEST_SSH_PUBLIC_KEY_FILE_NAME),
-    )
-}
-
-fn validate_guest_ssh_keypair(
-    private_key_path: &Path,
-    public_key_path: &Path,
-) -> eyre::Result<host::SshKeyPair> {
-    let private_key = PrivateKey::read_openssh_file(private_key_path)
-        .with_context(|| format!("read SSH private key {}", private_key_path.display()))?;
-    let derived_public_key = private_key
-        .public_key()
-        .to_openssh()
-        .context("encode SSH public key")?;
-    let public_key = fs::read_to_string(public_key_path)
-        .with_context(|| format!("read SSH public key {}", public_key_path.display()))?;
-    let public_key = public_key.trim();
-    if public_key != derived_public_key {
-        eyre::bail!(
-            "SSH public key {} does not match private key {}",
-            public_key_path.display(),
-            private_key_path.display()
-        );
-    }
-
-    Ok(host::SshKeyPair {
-        private_key_path: private_key_path.to_path_buf(),
-        public_key_path: public_key_path.to_path_buf(),
-        public_key_openssh: derived_public_key,
-    })
 }
 
 fn provision_userdata(spec: &VmSpec) -> eyre::Result<Option<UserdataConfig>> {
@@ -319,7 +252,6 @@ fn parse_mac_string(mac: &str) -> eyre::Result<[u8; 6]> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::PathBuf;
 
     use agent_spec::{AgentConfig, UserdataContentType, UserdataRunPolicy};
@@ -327,13 +259,10 @@ mod tests {
 
     use crate::guest_agent::{
         build_config_with_host_context, build_provision_config, build_provision_network_config,
-        guest_ssh_key_paths, load_or_generate_guest_ssh_keypair, provision_mount_entries,
-        GuestAgentHostContext,
+        provision_mount_entries, GuestAgentHostContext,
     };
-    use crate::host;
     use crate::machine::MachineUserConfig;
     use crate::network::VmmNetworkAttachment;
-    use crate::paths::LocalPaths;
 
     fn sample_spec(kernel_cmdline: Vec<String>) -> VmSpec {
         VmSpec {
@@ -371,111 +300,18 @@ mod tests {
     fn host_context() -> GuestAgentHostContext {
         GuestAgentHostContext {
             user: Some(MachineUserConfig::new("silo", 1000, 2000, "/home/silo")),
-            ssh_public_key_openssh: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISilo".to_string(),
+            ssh_trusted_ca: ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(
+                &[1u8; 32],
+            ))
+            .public_key()
+            .to_openssh()
+            .unwrap(),
             certificate_authority_pem: Some(
                 "-----BEGIN CERTIFICATE-----\nMIISILO\n-----END CERTIFICATE-----\n".to_string(),
             ),
             timezone: "Europe/Amsterdam".to_string(),
             locale: "nl_NL.UTF-8".to_string(),
         }
-    }
-
-    #[test]
-    fn guest_ssh_key_paths_use_local_keys_dir() {
-        let paths = LocalPaths::new("/tmp/silo");
-
-        let (private_key_path, public_key_path) = guest_ssh_key_paths(&paths);
-
-        assert_eq!(private_key_path, PathBuf::from("/tmp/silo/keys/id_ed25519"));
-        assert_eq!(
-            public_key_path,
-            PathBuf::from("/tmp/silo/keys/id_ed25519.pub")
-        );
-    }
-
-    #[test]
-    fn guest_ssh_keypair_generates_missing_keypair() {
-        let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("silo"));
-
-        let keypair = load_or_generate_guest_ssh_keypair(&paths).expect("load guest SSH keypair");
-
-        assert_eq!(
-            keypair.private_key_path,
-            paths.keys_dir().join("id_ed25519")
-        );
-        assert_eq!(
-            keypair.public_key_path,
-            paths.keys_dir().join("id_ed25519.pub")
-        );
-        assert!(keypair.private_key_path.is_file());
-        assert!(keypair.public_key_path.is_file());
-        assert!(keypair.public_key_openssh.starts_with("ssh-ed25519 "));
-    }
-
-    #[test]
-    fn guest_ssh_keypair_regenerates_when_private_key_is_missing() {
-        let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("silo"));
-        let first = load_or_generate_guest_ssh_keypair(&paths).expect("generate guest SSH keypair");
-        fs::remove_file(&first.private_key_path).expect("remove private key");
-
-        let second =
-            load_or_generate_guest_ssh_keypair(&paths).expect("regenerate guest SSH keypair");
-
-        assert!(second.private_key_path.is_file());
-        assert!(second.public_key_path.is_file());
-        assert_ne!(second.public_key_openssh, first.public_key_openssh);
-    }
-
-    #[test]
-    fn guest_ssh_keypair_regenerates_when_public_key_is_missing() {
-        let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("silo"));
-        let first = load_or_generate_guest_ssh_keypair(&paths).expect("generate guest SSH keypair");
-        fs::remove_file(&first.public_key_path).expect("remove public key");
-
-        let second =
-            load_or_generate_guest_ssh_keypair(&paths).expect("regenerate guest SSH keypair");
-
-        assert!(second.private_key_path.is_file());
-        assert!(second.public_key_path.is_file());
-        assert_ne!(second.public_key_openssh, first.public_key_openssh);
-    }
-
-    #[test]
-    fn guest_ssh_keypair_reuses_existing_valid_keypair() {
-        let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("silo"));
-        let first = load_or_generate_guest_ssh_keypair(&paths).expect("generate guest SSH keypair");
-
-        let second = load_or_generate_guest_ssh_keypair(&paths).expect("reuse guest SSH keypair");
-
-        assert_eq!(second.public_key_openssh, first.public_key_openssh);
-    }
-
-    #[test]
-    fn guest_ssh_keypair_rejects_mismatched_public_key() {
-        let temp = tempfile::tempdir().expect("create tempdir");
-        let keys_dir = temp.path().join("keys");
-        let private_key_path = keys_dir.join("id_ed25519");
-        let public_key_path = keys_dir.join("id_ed25519.pub");
-        host::generate_ssh_keypair(&private_key_path, &public_key_path, None)
-            .expect("generate first keypair");
-        let other = host::generate_ssh_keypair(
-            &temp.path().join("other").join("id_ed25519"),
-            &temp.path().join("other").join("id_ed25519.pub"),
-            None,
-        )
-        .expect("generate second keypair");
-        fs::write(&public_key_path, format!("{}\n", other.public_key_openssh))
-            .expect("replace public key");
-
-        let paths = LocalPaths::new(temp.path());
-        let err =
-            load_or_generate_guest_ssh_keypair(&paths).expect_err("reject mismatched keypair");
-
-        assert!(err.to_string().contains("does not match"));
     }
 
     #[test]
@@ -522,8 +358,7 @@ mod tests {
         .expect("build agent config");
 
         assert!(config.provision.users.is_empty());
-        assert_eq!(config.ssh.authorized_users.len(), 1);
-        assert_eq!(config.ssh.authorized_users[0].name, "root");
+        assert_eq!(config.ssh.trusted_ca, Some(context.ssh_trusted_ca));
     }
 
     #[test]
@@ -800,14 +635,6 @@ mod tests {
 
         assert!(config.provision.enabled);
         assert_eq!(config.provision.hostname.as_deref(), Some("demo"));
-        assert_eq!(
-            config
-                .ssh
-                .authorized_users
-                .iter()
-                .map(|user| user.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["root", "silo"]
-        );
+        assert_eq!(config.ssh.trusted_ca, Some(host_context().ssh_trusted_ca));
     }
 }

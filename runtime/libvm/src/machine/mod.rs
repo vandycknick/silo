@@ -69,7 +69,8 @@ pub use streams::{
     MachineMetricSnapshot, MachineMetrics, MachineMonitorSnapshot, MachineMonitorStatus,
     MachineNetworkInterfaceMetrics, MachineProvisionOverallStatus, MachineProvisioningReport,
     MachineReadiness, MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState,
-    MachineStaleReason, MachineSystemInfo, MachineVmSnapshot, MachineVmState,
+    MachineSshBackend, MachineSshListenerReport, MachineStaleReason, MachineSystemInfo,
+    MachineVmSnapshot, MachineVmState,
 };
 pub use update::{GuestPublishUpdate, MachineUpdate, MachineUserUpdate, NetworkPolicyUpdate};
 

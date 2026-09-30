@@ -11,7 +11,6 @@ use protocol::v1::{
     ProcessSpec, PtyStdio, ResizePty, SignalProcess, StartExecution, StdinData, TerminalSize,
 };
 use russh::client::Msg as ClientMsg;
-use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 use russh::{Channel, ChannelMsg, ChannelWriteHalf};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
@@ -786,7 +785,7 @@ impl Machine {
         configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
     ) -> Result<ExecutionOutput, LibVmError> {
         self.exec_with("/bin/sh", |options| {
-            configure(options).arg("-lc").arg(script.into())
+            configure(options).arg("-l").arg("-c").arg(script.into())
         })
         .await
     }
@@ -954,6 +953,29 @@ impl Machine {
         user: Option<&str>,
         forward_agent: bool,
     ) -> Result<GuestSshClient, LibVmError> {
+        let snapshot = self.inspect().await?;
+        if !snapshot.status.ready() {
+            return Err(guest_session_error(
+                reference,
+                "guest SSH listener is not ready or its host key is not verified",
+            ));
+        }
+        let monitor = self.monitor_status().await?;
+        let verified = match monitor.agent {
+            crate::machine::MachineAgentStatus::Enabled(agent) => {
+                agent.status.is_some_and(|status| {
+                    status.freshness == crate::machine::MachineFreshness::Fresh
+                        && status
+                            .report
+                            .ssh
+                            .is_some_and(|ssh| ssh.config_verified && ssh.kex_verified)
+                })
+            }
+            _ => false,
+        };
+        if !verified {
+            return Err(guest_session_error(reference, "guest SSH listener has no fresh, configuration- and KEX-verified readiness descriptor"));
+        }
         let agent_socket = resolve_agent_socket(reference, forward_agent)?;
         let user = match user {
             Some(user) => user.to_string(),
@@ -966,12 +988,10 @@ impl Machine {
                 .map(|user| user.name)
                 .unwrap_or_else(|| "root".to_string()),
         };
-        let keypair = self.runtime().load_guest_ssh_keypair().map_err(|error| {
-            guest_session_error(reference, format!("load guest SSH keypair: {error}"))
-        })?;
-        let private_key = load_secret_key(&keypair.private_key_path, None).map_err(|error| {
-            guest_session_error(reference, format!("load SSH private key: {error}"))
-        })?;
+        let (private_key, certificate) =
+            crate::ssh_ca::issue(self.runtime().secret_store(), self.machine_id(), &user).map_err(
+                |error| guest_session_error(reference, format!("issue SSH certificate: {error}")),
+            )?;
         let started = std::time::Instant::now();
         let mut handle = loop {
             let stream = self.open_shell_stream().await?;
@@ -980,6 +1000,15 @@ impl Machine {
                 stream,
                 SshClientHandler {
                     agent_socket: agent_socket.clone(),
+                    expected_key: utils::ssh::read_host_key_pin(
+                        self.runtime().machine_paths(self.machine_id()).dir(),
+                    )
+                    .map_err(|error| {
+                        guest_session_error(
+                            reference,
+                            format!("guest SSH host key is not pinned: {error}"),
+                        )
+                    })?,
                 },
             )
             .await
@@ -994,16 +1023,8 @@ impl Machine {
                 Err(error) => return Err(ssh_error(reference, "client handshake", error)),
             }
         };
-        let hash_alg = handle
-            .best_supported_rsa_hash()
-            .await
-            .map_err(|error| ssh_error(reference, "server signature algorithms", error))?
-            .flatten();
         let auth = handle
-            .authenticate_publickey(
-                user,
-                PrivateKeyWithHashAlg::new(Arc::new(private_key), hash_alg),
-            )
+            .authenticate_openssh_cert(user, private_key, certificate)
             .await
             .map_err(|error| ssh_error(reference, "public-key authentication", error))?;
         if !auth.success() {
@@ -1326,14 +1347,15 @@ struct GuestSshClient {
 #[derive(Clone)]
 struct SshClientHandler {
     agent_socket: Option<PathBuf>,
+    expected_key: ssh_key::PublicKey,
 }
 impl russh::client::Handler for SshClientHandler {
     type Error = russh::Error;
     async fn check_server_key(
         &mut self,
-        _: &russh::keys::ssh_key::PublicKey,
+        key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        Ok(key.key_data() == self.expected_key.key_data())
     }
     async fn server_channel_open_agent_forward(
         &mut self,
@@ -1425,7 +1447,7 @@ fn ssh_shell_command(options: &SshShellOptions) -> Result<String, LibVmError> {
         }
         command.push(' ');
     }
-    command.push_str("/bin/sh -lc ");
+    command.push_str("/bin/sh -l -c ");
     command.push_str(&quote_ssh_shell_argument(DEFAULT_LOGIN_SHELL_SCRIPT));
     Ok(command)
 }
@@ -2036,5 +2058,159 @@ mod tests {
             .push(("GOOD; touch /tmp/nope".to_string(), "value".to_string()));
 
         assert!(ssh_shell_command(&options).is_err());
+    }
+
+    async fn qualify_certificate_image(image_variable: &str, native: bool, external: bool) {
+        if std::env::var("SILO_E2E_KVM").as_deref() != Ok("1") {
+            eprintln!("SKIPPED phase5 {image_variable}: SILO_E2E_KVM=1 required");
+            return;
+        }
+        let (Some(root), Ok(image)) = (
+            std::env::var_os("SILO_TEST_RUNTIME_ROOT"),
+            std::env::var(image_variable),
+        ) else {
+            eprintln!("SKIPPED phase5: SILO_TEST_RUNTIME_ROOT and {image_variable} required");
+            return;
+        };
+        assert!(std::path::Path::new("/dev/kvm").exists());
+        let home = tempfile::tempdir().unwrap();
+        let runtime =
+            crate::Runtime::new(crate::RuntimeConfig::local(home.path()).with_runtime_root(root))
+                .await
+                .unwrap();
+        let stale = std::sync::Arc::new(ssh_key::PrivateKey::from(
+            ssh_key::private::Ed25519Keypair::from_seed(&[77; 32]),
+        ));
+        let userdata = format!("#!/bin/sh\nmkdir -p /root/.ssh\nchmod 700 /root/.ssh\nprintf '%s\\n' '{}' > /root/.ssh/authorized_keys\nchmod 600 /root/.ssh/authorized_keys\n", stale.public_key().to_openssh().unwrap());
+        let machine = runtime
+            .machine()
+            .name("phase5-cert")
+            .image(image)
+            .userdata(userdata)
+            .vsock(true)
+            .create()
+            .await
+            .unwrap();
+        let task_machine = machine.clone();
+        let mut task = tokio::spawn(async move {
+            let machine = task_machine;
+            let mut pin = None;
+            for _ in 0..2 {
+                machine.start().await.unwrap();
+                let ready = machine
+                    .wait_ready(std::time::Duration::from_secs(75))
+                    .await
+                    .unwrap();
+                assert_eq!(ready.outcome, crate::MachineReadinessOutcome::Ready);
+                if external {
+                    let monitor = machine.monitor_status().await.unwrap();
+                    let crate::MachineAgentStatus::Enabled(agent) = monitor.agent else {
+                        panic!("missing guest agent status");
+                    };
+                    assert_eq!(
+                        agent.status.unwrap().report.ssh.unwrap().backend,
+                        crate::MachineSshBackend::SystemdOpenSsh
+                    );
+                }
+                let data = machine.inspect().await.unwrap();
+                let key = utils::ssh::read_host_key_pin(&data.machine_dir).unwrap();
+                if let Some(previous) = &pin {
+                    assert_eq!(previous, key.key_data());
+                } else {
+                    pin = Some(key.key_data().clone());
+                }
+                let mut raw = russh::client::connect_stream(
+                    std::sync::Arc::new(Default::default()),
+                    machine.open_shell_stream().await.unwrap(),
+                    crate::machine::session::SshClientHandler {
+                        agent_socket: None,
+                        expected_key: key,
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(!raw
+                    .authenticate_publickey(
+                        "root",
+                        russh::keys::PrivateKeyWithHashAlg::new(stale.clone(), None)
+                    )
+                    .await
+                    .unwrap()
+                    .success());
+                raw.disconnect(russh::Disconnect::ByApplication, "negative control", "en")
+                    .await
+                    .unwrap();
+                let client = machine
+                    .connect_guest_ssh("phase5-cert", Some("root"), false)
+                    .await
+                    .unwrap();
+                let mut channel = client.handle.channel_open_session().await.unwrap();
+                channel
+                    .exec(true, "printf certificate-session")
+                    .await
+                    .unwrap();
+                let mut output = Vec::new();
+                while let Some(message) = channel.wait().await {
+                    if let russh::ChannelMsg::Data { data } = message {
+                        output.extend_from_slice(&data);
+                    }
+                }
+                assert_eq!(output, b"certificate-session");
+                client
+                    .handle
+                    .disconnect(russh::Disconnect::ByApplication, "done", "en")
+                    .await
+                    .unwrap();
+                if !native {
+                    let log = machine
+                        .exec(
+                            "sh",
+                            [
+                                "-c",
+                                "journalctl --no-pager -b | grep 'silo:cli:' | grep 'CA ED25519'",
+                            ],
+                        )
+                        .await
+                        .unwrap();
+                    assert!(log.stdout().unwrap().contains("silo:cli:"));
+                }
+                machine.stop().await.unwrap();
+            }
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(210), &mut task).await;
+        if result.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+        let _ = machine
+            .stop_with(
+                crate::MachineStopOptions::new()
+                    .force_after_timeout(std::time::Duration::from_secs(20)),
+            )
+            .await;
+        machine.remove().await.unwrap();
+        result.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn phase5_fedora_certificate_guest() {
+        qualify_certificate_image("SILO_TEST_SSH_FEDORA_IMAGE", false, false).await;
+    }
+    #[tokio::test]
+    async fn phase5_arch_certificate_guest() {
+        qualify_certificate_image("SILO_TEST_SSH_ARCH_IMAGE", false, false).await;
+    }
+    #[tokio::test]
+    async fn phase5_ubuntu_certificate_guest() {
+        qualify_certificate_image("SILO_TEST_SSH_UBUNTU_IMAGE", false, false).await;
+    }
+    #[tokio::test]
+    async fn phase5_system_certificate_guest() {
+        qualify_certificate_image("SILO_TEST_SSH_SYSTEM_IMAGE", true, false).await;
+    }
+
+    #[tokio::test]
+    async fn phase5_systemd_owned_certificate_guest() {
+        qualify_certificate_image("SILO_TEST_SSH_SYSTEMD_IMAGE", false, true).await;
     }
 }

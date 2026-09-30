@@ -409,6 +409,7 @@ pub async fn start_services(
                 startup_deadline,
                 spawn_guest_services(
                     &ctx.machine,
+                    runtime.dir(),
                     ctx.store.clone(),
                     ctx.forwards.clone(),
                     ctx.shutdown.clone(),

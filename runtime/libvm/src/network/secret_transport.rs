@@ -115,6 +115,10 @@ pub(crate) fn frame(
                 name: &secret.slot,
                 value: Base64Bytes(&secret.value),
             })
+            .chain(launch.infrastructure.iter().map(|(name, value)| Secret {
+                name,
+                value: Base64Bytes(value.as_bytes()),
+            }))
             .collect(),
         provider,
     };

@@ -286,6 +286,47 @@ pub struct MachineAgentStatusReport {
     pub system: Option<MachineSystemInfo>,
     pub boot: Option<MachineGuestBootReport>,
     pub provisioning: Option<MachineProvisioningReport>,
+    pub ssh: Option<MachineSshListenerReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineSshListenerReport {
+    pub backend: MachineSshBackend,
+    pub port: u32,
+    pub host_public_key: String,
+    pub config_verified: bool,
+    pub kex_verified: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineSshBackend {
+    Native,
+    OpenSsh,
+    SystemdOpenSsh,
+}
+
+impl TryFrom<v1::SshListenerReport> for MachineSshListenerReport {
+    type Error = String;
+    fn try_from(value: v1::SshListenerReport) -> Result<Self, Self::Error> {
+        let backend = match value.backend.as_str() {
+            "native" => MachineSshBackend::Native,
+            "openssh" => MachineSshBackend::OpenSsh,
+            "systemd-openssh" => MachineSshBackend::SystemdOpenSsh,
+            _ => return Err("invalid SSH listener backend".into()),
+        };
+        if value.port != 22 || !value.config_verified {
+            return Err("unverified SSH listener configuration".into());
+        }
+        ssh_key::PublicKey::from_openssh(&value.host_public_key)
+            .map_err(|error| format!("invalid SSH listener host key: {error}"))?;
+        Ok(Self {
+            backend,
+            port: value.port,
+            host_public_key: value.host_public_key,
+            config_verified: value.config_verified,
+            kex_verified: value.kex_verified,
+        })
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MachineAgentStatusState {
@@ -1185,6 +1226,7 @@ impl TryFrom<v1::AgentStatusReport> for MachineAgentStatusReport {
             system: value.system.map(TryInto::try_into).transpose()?,
             boot: value.boot.map(TryInto::try_into).transpose()?,
             provisioning: value.provisioning.map(TryInto::try_into).transpose()?,
+            ssh: value.ssh.map(TryInto::try_into).transpose()?,
         })
     }
 }
@@ -1836,6 +1878,7 @@ mod tests {
                         freshness: Some(v1::Freshness::Fresh as i32),
                         stale_reason: Some(v1::StaleReason::ReceiptAge as i32),
                         report: Some(v1::AgentStatusReport {
+                            ssh: None,
                             observed_at: Some(timestamp()),
                             state: Some(v1::AgentStatusState::Ready as i32),
                             code: Some("ready".to_string()),

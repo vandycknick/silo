@@ -84,6 +84,7 @@ struct MachineCreateGuard {
     agent_mode: Option<MachineAgent>,
     machine_parent: Option<OwnedDirectory>,
     committed: bool,
+    secret_store: std::sync::Arc<dyn silo_secrets::SecretStore>,
 }
 
 /// Builder for creating a machine.
@@ -600,9 +601,16 @@ async fn create_machine_guard(
         agent_mode,
         machine_parent: None,
         committed: false,
+        secret_store: runtime.secret_store_arc(),
     };
 
     create.create_machine_dir(runtime)?;
+    crate::ssh_ca::resolve(runtime.secret_store(), id, true).map_err(|error| {
+        LibVmError::MachinePreparationFailed {
+            reference: create.name.clone(),
+            message: format!("create machine SSH CA: {error}"),
+        }
+    })?;
     write_machine_config(create.dir(), &create.name, &create.spec)?;
 
     Ok(create)
@@ -726,6 +734,12 @@ impl Drop for MachineCreateGuard {
     fn drop(&mut self) {
         if self.committed {
             return;
+        }
+
+        if self.machine_parent.is_some() {
+            if let Err(error) = crate::ssh_ca::delete_scope(self.secret_store.as_ref(), self.id) {
+                tracing::error!(machine = %self.id, %error, "delete SSH CA scope during create rollback");
+            }
         }
 
         if let Some(machine_parent) = self.machine_parent.take() {
