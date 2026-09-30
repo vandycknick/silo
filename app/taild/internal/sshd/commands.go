@@ -32,6 +32,93 @@ func commands(ctx context.Context, s *service.Service, c service.Caller, t []str
 	var op jobs.Operation
 	var err error
 	switch cmd {
+	case "template", "policy":
+		if len(args) == 0 {
+			return nil, "", 2, usage()
+		}
+		verb := args[0]
+		name := ""
+		owner := identity.Principal("")
+		pos := 1
+		if verb != "ls" && verb != "validate" {
+			if len(args) < 2 {
+				return nil, "", 2, usage()
+			}
+			name = args[1]
+			pos = 2
+		}
+		if len(args) > pos {
+			if len(args) != pos+2 || args[pos] != "--owner" {
+				return nil, "", 2, usage()
+			}
+			owner = identity.Principal(args[pos+1])
+		}
+		switch verb {
+		case "ls", "show", "create", "edit", "rm", "validate":
+		default:
+			return nil, "", 2, usage()
+		}
+		raw := ""
+		if verb == "create" || verb == "edit" || verb == "validate" {
+			action := identity.TemplateManage
+			if verb == "validate" {
+				action = identity.Read
+			}
+			if e := s.Authorize(c.Peer, action, nil); e != nil {
+				return nil, "", 4, e
+			}
+			data, e := documentInput(ctx, streams, service.DocumentLimit)
+			if e != nil {
+				return nil, "", 2, e
+			}
+			raw = string(data)
+		}
+		docs, e := s.Documents(ctx, c, cmd, verb, name, owner, raw)
+		if e != nil {
+			return nil, "", service.Categorize(e).Exit, e
+		}
+		var b strings.Builder
+		if verb == "show" {
+			b.WriteString(docs[0].Content)
+		} else {
+			for _, d := range docs {
+				fmt.Fprintf(&b, "%s %s %s\n", d.Kind, d.Name, d.Tier)
+				if d.Template != nil {
+					if d.Template.Description != nil {
+						fmt.Fprintf(&b, "Description: %s\n", *d.Template.Description)
+					}
+					t := d.Template
+					if t.Image != nil {
+						fmt.Fprintf(&b, "Image: %s\n", *t.Image)
+					}
+					if t.Resources != nil {
+						if t.Resources.CPUs != nil {
+							fmt.Fprintf(&b, "CPUs: %d\n", *t.Resources.CPUs)
+						}
+						if t.Resources.Memory != nil {
+							fmt.Fprintf(&b, "Memory: %s\n", *t.Resources.Memory)
+						}
+					}
+					if t.DiskSize != nil {
+						fmt.Fprintf(&b, "Disk: %s\n", *t.DiskSize)
+					}
+					if t.Network != nil {
+						if t.Network.PolicyRef != nil {
+							fmt.Fprintf(&b, "Policy: %s\n", *t.Network.PolicyRef)
+						}
+						if len(t.Network.Publish) > 0 {
+							fmt.Fprintf(&b, "Guest TCP hints (ACL controls access): %v\n", t.Network.Publish)
+						}
+					}
+				}
+				if d.Secrets != nil {
+					for _, slot := range d.Secrets.Slots {
+						fmt.Fprintf(&b, "Secret: %s (key %s, required %t)\n", slot.Name, slot.Source.Key, slot.Required)
+					}
+				}
+			}
+		}
+		return docs, b.String(), 0, nil
 	case "ls":
 		if len(args) != 0 {
 			return nil, "", 2, usage()
@@ -91,7 +178,20 @@ func commands(ctx context.Context, s *service.Service, c service.Caller, t []str
 				i++
 				v := args[i]
 				switch key {
+				case "--template":
+					if v == "" {
+						return nil, "", 2, usage()
+					}
+					q.Template = v
+				case "--policy":
+					if v == "" {
+						return nil, "", 2, usage()
+					}
+					q.PolicyRef = v
 				case "--image":
+					if v == "" {
+						return nil, "", 2, usage()
+					}
 					q.Image = v
 				case "--owner":
 					q.Owner = identity.Principal(v)
@@ -105,6 +205,7 @@ func commands(ctx context.Context, s *service.Service, c service.Caller, t []str
 				case "--disk":
 					q.Disk, err = size(v)
 				case "--userdata":
+					q.UserdataSet = true
 					if v == "-" {
 						if streams.Stdin == nil {
 							return nil, "", 2, usage()
@@ -359,4 +460,24 @@ func commands(ctx context.Context, s *service.Service, c service.Caller, t []str
 			c.Peer = p
 		}
 	}
+}
+
+func documentInput(ctx context.Context, streams service.IO, limit int) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	src := streams.Stdin
+	if streams.Input != nil {
+		src = streams.Input(ctx)
+	}
+	if src == nil {
+		return nil, usage()
+	}
+	data, e := io.ReadAll(io.LimitReader(src, int64(limit+1)))
+	if e != nil {
+		return nil, &authz.Error{Code: "usage", Message: "document input interrupted or timed out", Exit: 2}
+	}
+	if len(data) > limit {
+		return nil, &authz.Error{Code: "usage", Message: "document input exceeds size limit", Exit: 2}
+	}
+	return data, nil
 }

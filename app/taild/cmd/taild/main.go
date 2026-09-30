@@ -61,8 +61,12 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		documentError := (&service.Service{Config: c}).ReloadDocuments()
 		if err = r.Close(); err != nil {
 			return err
+		}
+		if documentError != nil {
+			return documentError
 		}
 		fmt.Fprintln(os.Stderr, "taild: configuration and runtime ready")
 		return nil
@@ -117,6 +121,24 @@ func run() error {
 	jobctx, stopJobs := context.WithCancel(context.Background())
 	defer stopJobs()
 	s := &service.Service{Runtime: r, Audit: audit, Jobs: jobs.New(jobctx, c.Sessions.Global), Capability: c.Tailnet.Capability, Config: c, VisibleNames: node.VisibleNames}
+	if e = s.ReloadDocuments(); e != nil {
+		return e
+	}
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hup:
+				if e := s.ReloadDocuments(); e != nil {
+					log.Error("operator documents reload failed", "error", e)
+				}
+			}
+		}
+	}()
 	sshListener, e := node.Server.ListenSSH(":22")
 	if e != nil {
 		return e

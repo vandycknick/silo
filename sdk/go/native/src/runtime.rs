@@ -17,6 +17,12 @@ enum QueryRequest {
         policy_json: String,
         machine: Option<String>,
     },
+    CheckPolicySecrets {
+        policy_json: String,
+        machine: Option<String>,
+        #[serde(default)]
+        secrets: std::collections::BTreeMap<String, String>,
+    },
 }
 
 #[no_mangle]
@@ -38,6 +44,45 @@ pub unsafe extern "C" fn silo_runtime_query(
             serde_json::from_slice(request_bytes(request_ptr, request_len)?)
                 .map_err(|error| invalid_argument(format!("decode runtime query: {error}")))?;
         let value = match request {
+            QueryRequest::CheckPolicySecrets {
+                policy_json,
+                machine,
+                secrets,
+            } => {
+                let policy = libvm::NetworkPolicy::from_json_str(&policy_json)
+                    .map_err(|error| invalid_argument(error.to_string()))?;
+                let machine = machine
+                    .map(MachineRef::parse)
+                    .transpose()
+                    .map_err(error_from_libvm)?;
+                let mut explicit = libvm::EgressCredentials::default();
+                for (slot, value) in secrets {
+                    explicit = explicit.secret(&slot, value);
+                }
+                let result = runtime
+                    .context
+                    .tokio
+                    .block_on(runtime.context.runtime.check_policy_secrets(
+                        &policy,
+                        machine.as_ref(),
+                        &explicit,
+                    ))
+                    .map_err(error_from_libvm)?;
+                match result {
+                    libvm::policy_secrets::PolicySecretsCheck::Ready => {
+                        serde_json::json!({"status":"ready"})
+                    }
+                    libvm::policy_secrets::PolicySecretsCheck::Missing {
+                        requirements,
+                        slots,
+                    } => {
+                        serde_json::json!({"status":"missing", "slots":slots, "requirements":requirements.into_iter().map(|r| serde_json::json!({"owner":r.owner,"alternatives":r.alternatives.into_iter().map(|a| a.slots).collect::<Vec<_>>()})).collect::<Vec<_>>()})
+                    }
+                    libvm::policy_secrets::PolicySecretsCheck::Unavailable { slot, key, code } => {
+                        serde_json::json!({"status":"unavailable","slot":slot,"key":key,"code":code})
+                    }
+                }
+            }
             QueryRequest::Inventory {} => {
                 let entries = runtime
                     .context
@@ -269,6 +314,9 @@ mod tests {
         for input in [
             r#"{"operation":"inventory","unknown":true}"#,
             r#"{"operation":"secret_readiness","policy_json":"{}","unknown":true}"#,
+            r#"{"operation":"check_policy_secrets","policy_json":"{}","unknown":true}"#,
+            r#"{"operation":"check_policy_secrets","policy_json":"{}","secrets":null}"#,
+            r#"{"operation":"check_policy_secrets","policy_json":"{}","secrets":[]}"#,
         ] {
             assert!(serde_json::from_str::<crate::runtime::QueryRequest>(input).is_err());
         }

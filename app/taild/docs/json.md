@@ -1,4 +1,4 @@
-# Lobby JSON, phase 11
+# Lobby JSON, phase 12
 
 `--json` produces exactly one UTF-8 JSON object on stdout. Progress, human
 messages and errors use stderr. Shell, exec and logs are streaming byte commands
@@ -22,11 +22,23 @@ contents are projected into VM/operation queries.
 | `whoami` | `{peer, capability, explanation?}` |
 | `version` | `{taild, sdk, runtime, tailscale}` strings |
 | `help` | `{help}` string |
+| `template` / `policy` commands | Array of document records (one for show/create/edit/rm/validate); ls includes both tiers |
 
 VM projections have `id`, `name`, `owner`, `state`, `node`, `address`, `cpus`,
 `memory`, `disk`, `created`, `image`, `labels`, and optional `last_operation` on
 show. Labels contain caller labels only; reserved ownership labels are projected
 as validated fields. Image is empty for local-disk or unvalidated legacy sources.
+Optional `template`, `policy`, and `guest_tcp_ports` project immutable provenance
+and guest TCP discovery hints, never host publication authority or inbound ACLs.
+
+Document records contain `kind`, `name`, `tier` (`yours` or `operator`), and `owner`
+only for principal-owned files. Show/create/edit/validate include canonical `content`;
+template records include typed `template` fields; policies include `secrets`
+(`slots` and `requirements`, names/projections/alternatives only). Lists omit content,
+remove returns identity only, and validation has empty name/tier because nothing is
+stored. Another principal's documents are invisible (3). Operator-only writes are
+forbidden (4), duplicate creates conflict (5), invalid stdin/documents fail (2),
+unsafe/unreadable stored documents fail (9).
 Resource sizes are integer bytes. Times are UTC
 RFC 3339 strings with optional fractional seconds. Node/address are empty until
 VM enrollment is implemented. Ownership is one verified `user:<numeric-id>` or
@@ -78,6 +90,9 @@ limits are additive; enforcement additionally constrains them by operator ceilin
         "created": {"type": "string", "format": "date-time"},
         "image": {"type": "string"},
         "labels": {"type": "object", "additionalProperties": {"type": "string"}},
+        "template": {"type": "string"},
+        "policy": {"type": "string"},
+        "guest_tcp_ports": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 1, "maximum": 65535}},
         "last_operation": {"$ref": "#/$defs/operation"}
       },
       "additionalProperties": false

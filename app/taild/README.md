@@ -1,7 +1,7 @@
 # taild, owned VM lobby
 
-The management node exposes owned VM operations over tailnet SSH. Phase 11 VMs
-have no tailnet node. Templates and VM enrollment arrive in later phases. Closing this
+The management node exposes owned VM operations and templates over tailnet SSH. Phase 12 VMs
+have no tailnet node. VM enrollment arrives in phase 13. Closing this
 daemon releases SDK handles and its own node, never stops VMs.
 
 ## Build and check
@@ -88,7 +88,8 @@ Every REPL command re-resolves WhoIs; idle identity is checked every 30 seconds.
 ## VM commands (phase 11)
 
 ```text
-create NAME [IMAGE|--image OCI] [--cpus N] [--memory SIZE] [--disk-size SIZE]
+create NAME [IMAGE|--image OCI] [--template NAME] [--policy NAME]
+            [--cpus N] [--memory SIZE] [--disk-size SIZE]
             [--userdata INLINE|-] [--label KEY=VALUE]... [--owner tag:NAME]
             [--no-tailnet] [--no-start]
 ls
@@ -160,6 +161,71 @@ and budget remains; its wait is bounded by that same deadline. A timed-out drain
 blocked library close reports incomplete runtime cleanup and leaves handle cleanup
 to process exit. No shutdown path calls Stop or Remove. Restart
 reconciles libvm records; it neither replays operations nor creates a service database.
+
+## Templates and policies (phase 12)
+
+`template` and `policy` support `ls`, `show NAME`, `create NAME`, `edit NAME`,
+`rm NAME`, and `validate`. Create/edit/validate read finite stdin (64 KiB,
+30-second budget), never a host filename. `--json` follows the same one-object
+contract as VM commands; human documents and summaries use stderr. Reads and
+validation require `vm.read`; both kinds' writes require `template.manage` and
+fresh identity. Tagged callers select a namespace with `--owner tag:NAME` for
+show/write/VM creation; `ls` without an owner lists all their own namespaces.
+
+Principal documents live under `<home>/taild/principals/<base64url-principal>/`
+in private `templates/` and `policies/` directories, using atomic synced 0600
+files. Operator `templates_dir` and `policies_dir` default to
+`/etc/silo-taild/{templates,policies}`. Operator files are read-only, validated
+at startup/`--check`, on SIGHUP, and on every list/resolve. Principal names shadow
+operator names; editing/removing an operator-only name is forbidden (4), while
+create can make a private shadow. Other principals' files remain invisible (3).
+All ancestors/files are descriptor-walked without following symlinks; reads are
+regular-file-only and size-limited. Document names match `[a-z0-9][a-z0-9-]{0,62}`.
+
+The remote template is a strict single YAML document, based on CLI version **"1"**:
+`version`, `description`, OCI `image`, `resources {cpus, memory}`, `disk_size`,
+`vsock`, inline `userdata`, `network {kind, policy_ref, publish}`, and `labels`.
+Unknown fields, duplicate keys, null, aliases/merges, wrong types, host mounts,
+disks, kernels, initramfs, guest agents, forwards and network targets are rejected.
+Only `kind: private` is accepted; explicit vsock must be true for guest management.
+Userdata must be an inline shebang script (16 KiB maximum), never a file path.
+Sizes are positive integer bytes, optionally suffixed by B/KB/MB/GB/TB or
+KiB/MiB/GiB/TiB. Resource/capability ceilings apply to the effective VM at create.
+
+**Remote `network.publish: [8080, 8443]` is a list of fixed guest TCP port discovery
+hints (1–65535, unique), not CLI/SDK `publish {bind: loopback|any}`.** It is stamped
+into immutable VM metadata and exposed as `guest_tcp_ports`. It creates no host
+listener and is never mapped to SDK `WithPublish`. In phase 13 netd's inbound
+fallback still accepts every guest TCP port allowed by the tailnet ACL, regardless
+of these hints. Configure the ACL to restrict inbound ports; this list does not.
+
+Create resolves the selected principal's template/policy first, then operator
+defaults. Only explicit flags override template values, and `--policy NAME`
+overrides its policy reference. Labels merge with explicit flags winning;
+`io.silo.*` remains reserved. Template/policy names are stamped in immutable
+labels and projected by `show`. Description remains template metadata.
+
+Policies are HCL parsed and emitted exclusively by the public Rust-backed SDK.
+Any Tailscale declaration, rule tunnel reference or forward is prohibited, even
+with `--no-tailnet`. The one `Service.VMNodesEnabled` switch stays false until
+phase 13. Pure injection retains the entire canonical JSON, supplies the exact
+hostname, and appends TCP routes for both `100.64.0.0/10` and
+`fd7a:115c:a1e0::/48` at minimum priority. Explicit user rules retain priority and
+order, including deny at minimum priority. User IP allow rules gain neutral tunnel
+routing, used only for tailnet destinations by netd. Thus explicit denials win,
+while otherwise the tailnet is exempt from default deny. User HTTP rules and
+non-tailnet routing remain intact. No phase 12 VM starts a Tailscale node.
+
+Before image pull/admission and again before SDK CreateMachine, public
+`Runtime.CheckPolicySecrets` runs the actual start resolver. Missing alternatives
+fail with slot and backing key names (2). Corrupt/unavailable stores and invalid
+selected projections are separately categorized and redacted (9). Optional
+Tailscale auth keys, Machine/Home precedence, AWS profile suppression and complete
+explicit overrides follow that resolver. Values and host paths are never returned.
+Machine-scoped remote secret writes arrive later.
+
+Operator examples: [`devbox.yaml`](../../packaging/silo-taild/examples/devbox.yaml)
+and [`dev-egress.hcl`](../../packaging/silo-taild/examples/dev-egress.hcl).
 
 ## Startup environment and credentials
 

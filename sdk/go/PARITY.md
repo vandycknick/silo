@@ -29,6 +29,7 @@ This inventory is completed alongside implementation. A checked item has a publi
 | resilient inventory | `Runtime.Inventory` | `silo_runtime_query` | real healthy/broken records | implemented |
 | HCL parse/validation/rendering | `ParseNetworkPolicyHCL`, `ValidateNetworkPolicyHCL`, `NetworkPolicy.HCL` | Rust policy parser/formatter | actual native round trips | implemented |
 | secret requirements/readiness | `NetworkPolicy.SecretMetadata`, `Runtime.PolicySecretsReady` | Rust slots and start resolver | real stores, precedence and optional keys | implemented |
+| redacted secret diagnostics | `Runtime.CheckPolicySecrets` | `silo_runtime_query` operation `check_policy_secrets`, public Rust `Runtime::check_policy_secrets` | actual native missing alternatives vs corrupt/type/empty projections, Machine/Home precedence, whole-set overrides, AWS profile, optional auth key | implemented |
 | `remove` | `Machine.Remove` | `silo_machine_remove` | lifecycle tests | implemented |
 | `exec` | `Machine.Exec` | `silo_machine_exec` | execution tests | implemented |
 | `shell` | `Machine.Shell` | `silo_machine_shell` | execution tests | implemented |

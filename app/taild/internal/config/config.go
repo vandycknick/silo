@@ -21,10 +21,12 @@ type Resources struct {
 	Disk   string `yaml:"disk"`
 }
 type Config struct {
-	Home        string `yaml:"home"`
-	RuntimeRoot string `yaml:"runtime_root"`
-	SecretsDir  string `yaml:"secrets_dir"`
-	Tailnet     struct {
+	TemplatesDir string `yaml:"templates_dir"`
+	PoliciesDir  string `yaml:"policies_dir"`
+	Home         string `yaml:"home"`
+	RuntimeRoot  string `yaml:"runtime_root"`
+	SecretsDir   string `yaml:"secrets_dir"`
+	Tailnet      struct {
 		Hostname   string `yaml:"hostname"`
 		Tag        string `yaml:"tag"`
 		Capability string `yaml:"capability"`
@@ -67,6 +69,8 @@ func Defaults() Config {
 	var c Config
 	c.Home = "/var/lib/silo-taild"
 	c.SecretsDir = "/etc/silo-taild/secrets"
+	c.TemplatesDir = "/etc/silo-taild/templates"
+	c.PoliciesDir = "/etc/silo-taild/policies"
 	c.Tailnet.Hostname = "silo"
 	c.Tailnet.Tag = "tag:silo"
 	c.Tailnet.Capability = "github.com/vandycknick/silo/cap/taild"
@@ -141,7 +145,7 @@ func (c Config) Validate() error {
 	default:
 		return errors.New("invalid enrollment mode")
 	}
-	for _, p := range []string{c.Home, c.SecretsDir} {
+	for _, p := range []string{c.Home, c.SecretsDir, c.TemplatesDir, c.PoliciesDir} {
 		if !filepath.IsAbs(p) {
 			return errors.New("home and secrets_dir must be absolute")
 		}

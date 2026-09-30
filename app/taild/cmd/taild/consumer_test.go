@@ -38,7 +38,7 @@ func TestCleanPublicConsumerAndActualCheckBinary(t *testing.T) {
 	}
 	code := `package main
 import("context"; "fmt"; "os"; silo "github.com/vandycknick/silo/sdk/go")
-func main(){_,e:=silo.Open(context.Background(),silo.WithHome(os.Args[1]),silo.WithRuntimeRoot(os.Args[1]));if !silo.IsErrorKind(e,silo.ErrorRuntimeComponentInvalid){fmt.Fprintln(os.Stderr,e);os.Exit(1)}}
+func main(){ctx:=context.Background();_,e:=silo.Open(ctx,silo.WithHome(os.Args[1]),silo.WithRuntimeRoot(os.Args[1]));if !silo.IsErrorKind(e,silo.ErrorRuntimeComponentInvalid){fmt.Fprintln(os.Stderr,e);os.Exit(1)};r,e:=silo.Open(ctx,silo.WithHome(os.Args[1]),silo.WithRuntimeRoot(os.Getenv("SILO_TEST_RUNTIME_ROOT")));if e!=nil{panic(e)};defer r.Close();p,e:=silo.ParseNetworkPolicyHCL("tailscale \"vm\" {}");if e!=nil{panic(e)};check,e:=r.CheckPolicySecrets(ctx,p,"",nil);if e!=nil||check.Status!=silo.PolicySecretsReady{panic(fmt.Sprintf("%+v %v",check,e))}}
 `
 	if e := os.WriteFile(filepath.Join(consumer, "main.go"), []byte(code), 0600); e != nil {
 		t.Fatal(e)
@@ -57,7 +57,7 @@ func main(){_,e:=silo.Open(context.Background(),silo.WithHome(os.Args[1]),silo.W
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	writeConfig := func(home, root string) {
 		t.Helper()
-		body := fmt.Sprintf("home: %q\nsecrets_dir: %q\n", home, t.TempDir())
+		body := fmt.Sprintf("home: %q\nsecrets_dir: %q\ntemplates_dir: %q\npolicies_dir: %q\n", home, t.TempDir(), t.TempDir(), t.TempDir())
 		if root != "" {
 			body += fmt.Sprintf("runtime_root: %q\n", root)
 		}

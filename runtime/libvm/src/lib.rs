@@ -38,6 +38,7 @@ mod supervisor;
 mod utils;
 
 pub use crate::error::LibVmError;
+pub mod policy_secrets;
 pub use crate::image::{
     ImageBuilder, ImageCacheState, ImageDetail, ImageHandle, ImageLayerDetail, ImageProgress,
     ImageProgressReceiver, ImageProgressSender, ImagePruneReport, ImagePullOptions,

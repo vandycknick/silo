@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"maps"
 	"strings"
@@ -71,6 +72,9 @@ func Categorize(err error) *authz.Error {
 }
 
 type VM struct {
+	Template      string                 `json:"template,omitempty"`
+	Policy        string                 `json:"policy,omitempty"`
+	GuestTCPPorts []uint16               `json:"guest_tcp_ports,omitempty"`
 	ID            string                 `json:"id"`
 	Name          string                 `json:"name"`
 	Owner         identity.Principal     `json:"owner"`
@@ -88,6 +92,9 @@ type VM struct {
 
 func project(d *silo.MachineData) VM {
 	v := VM{ID: d.ID, Name: d.Name, Owner: identity.Principal(d.Labels[runtime.OwnerLabel]), State: d.Status.Kind, Created: d.CreatedAt.UTC()}
+	v.Template = d.Labels[TemplateLabel]
+	v.Policy = d.Labels[PolicyLabel]
+	_ = json.Unmarshal([]byte(d.Labels[GuestPortsLabel]), &v.GuestTCPPorts)
 	v.Labels = map[string]string{}
 	for k, value := range d.Labels {
 		if !strings.HasPrefix(k, "io.silo.") {
@@ -184,16 +191,21 @@ func (s *Service) Ops(p identity.Peer, id string) ([]jobs.Operation, error) {
 }
 
 type CreateRequest struct {
-	Name      string
-	Image     string
-	CPUs      uint64
-	Memory    uint64
-	Disk      uint64
-	Userdata  string
-	Labels    map[string]string
-	Owner     identity.Principal
-	NoTailnet bool
-	NoStart   bool
+	Template    string
+	PolicyRef   string
+	GuestPorts  []uint16
+	UserdataSet bool
+	policy      *silo.NetworkPolicy
+	Name        string
+	Image       string
+	CPUs        uint64
+	Memory      uint64
+	Disk        uint64
+	Userdata    string
+	Labels      map[string]string
+	Owner       identity.Principal
+	NoTailnet   bool
+	NoStart     bool
 }
 
 func text(s string) bool { return !strings.ContainsFunc(s, unicode.IsControl) }
@@ -245,16 +257,11 @@ func (s *Service) ValidateCreate(p identity.Peer, q CreateRequest) (CreateReques
 	if !imageAllowed(q.Image, s.Config.VM.AllowedRegistries) {
 		return q, failure("usage", "image must be an allowlisted OCI reference", 2)
 	}
-	if len(q.Userdata) > 16384 || strings.ContainsRune(q.Userdata, 0) {
-		return q, failure("usage", "userdata must be bounded inline content", 2)
+	if !validUserdata(q.Userdata) {
+		return q, failure("usage", "userdata must be an inline shebang script, at most 16KiB", 2)
 	}
-	if len(q.Labels) > 32 {
-		return q, failure("usage", "too many labels", 2)
-	}
-	for k, v := range q.Labels {
-		if k == "" || len(k) > 128 || len(v) > 1024 || !text(k) || !text(v) || strings.HasPrefix(k, "io.silo.") {
-			return q, failure("usage", "invalid or reserved label", 2)
-		}
+	if e := validateLabels(q.Labels); e != nil {
+		return q, e
 	}
 	q.Labels = maps.Clone(q.Labels)
 	if q.CPUs == 0 {
@@ -277,7 +284,6 @@ func (s *Service) ValidateCreate(p identity.Peer, q CreateRequest) (CreateReques
 	if e := s.resources(p, q.CPUs, q.Memory, q.Disk); e != nil {
 		return q, e
 	}
-	q.NoTailnet = true
 	return q, nil
 }
 func (s *Service) resources(p identity.Peer, cpus, mem, disk uint64) error {
@@ -370,7 +376,14 @@ func (s *Service) materialize(ctx context.Context, p identity.Peer, q CreateRequ
 	return s.Runtime.SDK.CreateMachine(ctx, silo.OCIImage(q.Image), opts...)
 }
 func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.Operation, error) {
-	q, e := s.ValidateCreate(c.Peer, q)
+	if e := s.Authorize(c.Peer, identity.Create, nil); e != nil {
+		return jobs.Operation{}, e
+	}
+	q, e := s.resolveCreate(ctx, c.Peer, q)
+	if e != nil {
+		return jobs.Operation{}, e
+	}
+	q, e = s.ValidateCreate(c.Peer, q)
 	if e != nil {
 		return jobs.Operation{}, e
 	}
@@ -431,10 +444,29 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 		labels[runtime.NameLabel] = q.Name
 		labels[runtime.ModeLabel] = "none"
 		labels[runtime.InstanceLabel] = s.Runtime.Instance
+		if q.Template != "" {
+			labels[TemplateLabel] = q.Template
+		}
+		if q.PolicyRef != "" {
+			labels[PolicyLabel] = q.PolicyRef
+		}
+		if len(q.GuestPorts) > 0 {
+			b, e := json.Marshal(q.GuestPorts)
+			if e != nil {
+				return Categorize(e)
+			}
+			labels[GuestPortsLabel] = string(b)
+		}
 		u := s.Config.VM.GuestUser
 		opts := []silo.MachineOption{silo.WithName(q.Name), silo.WithLabels(labels), silo.WithCPUs(uint8(q.CPUs)), silo.WithMemory(silo.Bytes(q.Memory)), silo.WithRootDiskSize(silo.Bytes(q.Disk)), silo.WithVsock(true), silo.WithGuestUser(u.Name, u.UID, u.GID, u.Home)}
 		if q.Userdata != "" {
 			opts = append(opts, silo.WithUserdata(q.Userdata))
+		}
+		if q.policy != nil {
+			if e := s.checkSecrets(ctx, q.policy); e != nil {
+				return e
+			}
+			opts = append(opts, silo.WithMachineNetwork(silo.PrivateNetwork(q.policy)))
 		}
 		m, e := s.materialize(ctx, p, q, opts)
 		if e != nil {
