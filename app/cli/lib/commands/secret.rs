@@ -1,4 +1,4 @@
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,6 +12,10 @@ use libvm::{
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use silo_secrets::grant::{
+    read_json_frame, write_json_frame, ProjectedSecret, ProviderError, ProviderRequest,
+    ProviderResponse, SecretGrant,
+};
 use silo_secrets::{
     FileStore, OAuthSecret, Secret, SecretBytes, SecretName, SecretScope, SecretStore,
 };
@@ -61,8 +65,8 @@ pub(crate) enum SecretSubcommand {
     Show(ShowCmd),
     #[command(name = "rm", about = "Remove a saved secret")]
     Rm(RmCmd),
-    #[command(name = "refresh-oauth", hide = true)]
-    RefreshOAuth(RefreshOAuthCmd),
+    #[command(name = "provide", hide = true)]
+    Provide(ProvideCmd),
 }
 
 #[derive(Args, Debug)]
@@ -155,7 +159,7 @@ pub(crate) struct RmCmd {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct RefreshOAuthCmd {
+pub(crate) struct ProvideCmd {
     /// Secret store file used by the launch that created this hook.
     #[arg(long = "store-file")]
     pub(crate) store_file: PathBuf,
@@ -189,7 +193,7 @@ impl Cmd {
                 let store = file_store_from_env()?;
                 remove_secret(&store, command)
             }
-            SecretSubcommand::RefreshOAuth(command) => refresh_oauth(command).await,
+            SecretSubcommand::Provide(command) => provide(command).await,
         }
     }
 }
@@ -660,31 +664,6 @@ fn slot_key(kind: &str, name: &str, slot: &str) -> String {
     format!("{kind}.{name}.{slot}")
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct OAuthRefreshGrant {
-    version: u8,
-    store_file: PathBuf,
-    credentials: Vec<OAuthRefreshGrantCredential>,
-    #[serde(default)]
-    machine: Option<silo_secrets::MachineScopeId>,
-    #[serde(default)]
-    run: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct OAuthRefreshGrantCredential {
-    name: String,
-    kind: String,
-    endpoint: String,
-    secret_key: String,
-    #[serde(default = "home_scope")]
-    scope: SecretScope,
-}
-
-fn home_scope() -> SecretScope {
-    SecretScope::Home
-}
-
 fn credential_for_slot<'a>(
     policy: &'a NetworkPolicy,
     slot_name: &str,
@@ -988,88 +967,176 @@ fn print_hcl_snippet(name: &str) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn refresh_oauth(command: &RefreshOAuthCmd) -> eyre::Result<()> {
-    let request = read_json_frame(std::io::stdin().lock())?;
-    let store = FileStore::with_store_file(command.store_file.clone())?;
-    let response = match refresh_oauth_request(&store, &command.store_file, request).await {
-        Ok(oauth) => OAuthRefreshHookResponse::ok(oauth),
-        Err(error) => OAuthRefreshHookResponse::error(error),
+async fn provide(command: &ProvideCmd) -> eyre::Result<()> {
+    let result = match read_json_frame(std::io::stdin().lock()) {
+        Ok(request) => provide_request(&command.store_file, request, OPENAI_TOKEN_URL).await,
+        Err(_) => Err(OAuthRefreshFailure::invalid_request(
+            "invalid provider frame",
+        )),
     };
-    write_json_frame(std::io::stdout().lock(), &response)
+    let response = match result {
+        Ok(secrets) => ProviderResponse::Ok {
+            version: 2,
+            secrets,
+        },
+        Err(error) => ProviderResponse::Error {
+            version: 2,
+            error: ProviderError {
+                code: error.code.into(),
+                message: error.message,
+                retryable: error.retryable,
+            },
+        },
+    };
+    Ok(write_json_frame(std::io::stdout().lock(), &response)?)
 }
 
-async fn refresh_oauth_request(
-    store: &FileStore,
+async fn provide_request(
     store_file: &Path,
-    request: OAuthRefreshHookRequest,
-) -> Result<OAuthRefreshHookOAuth, OAuthRefreshFailure> {
-    if request.version != 1 || request.operation != "oauth_refresh" {
+    request: ProviderRequest,
+    token_endpoint: &str,
+) -> Result<Vec<ProjectedSecret>, OAuthRefreshFailure> {
+    if request.version != 2
+        || request.operation != "get"
+        || !matches!(request.reason.as_str(), "expired" | "expires_soon")
+    {
         return Err(OAuthRefreshFailure::invalid_request(
-            "unsupported OAuth refresh request",
+            "unsupported provider request",
         ));
     }
-    let grant = decode_oauth_refresh_grant(&request.grant)?;
-    if grant.version != 1 {
-        return Err(OAuthRefreshFailure::unauthorized(
-            "unsupported OAuth refresh grant version",
-        ));
-    }
-    if grant.store_file != store_file {
-        return Err(OAuthRefreshFailure::unauthorized(
-            "OAuth refresh grant does not match requested secret store",
-        ));
-    }
-    let Some(grant_credential) = grant.credentials.iter().find(|candidate| {
-        candidate.name == request.credential.name
-            && candidate.kind == request.credential.kind
-            && candidate.endpoint == request.credential.endpoint
-    }) else {
-        return Err(OAuthRefreshFailure::unauthorized(
-            "OAuth refresh grant does not allow this credential",
-        ));
-    };
-    if let SecretScope::Machine { id } = &grant_credential.scope {
-        if grant.machine.as_ref() != Some(id) || grant.run.as_ref().is_none_or(String::is_empty) {
-            return Err(OAuthRefreshFailure::unauthorized(
-                "OAuth refresh grant machine scope does not match its run",
-            ));
-        }
-    }
-    match request.credential.kind.as_str() {
-        OPENAI_CODEX_KIND => {
-            refresh_openai_codex_oauth(store, &grant_credential.scope, &grant_credential.secret_key)
-                .await
-        }
-        other => Err(OAuthRefreshFailure::invalid_request(format!(
-            "OAuth credential kind {other:?} is not refreshable by this command"
-        ))),
-    }
-}
-
-fn decode_oauth_refresh_grant(encoded: &str) -> Result<OAuthRefreshGrant, OAuthRefreshFailure> {
     let raw = STANDARD
-        .decode(encoded)
-        .map_err(|err| OAuthRefreshFailure::unauthorized(format!("decode refresh auth: {err}")))?;
-    serde_json::from_slice(&raw)
-        .map_err(|err| OAuthRefreshFailure::unauthorized(format!("parse refresh auth: {err}")))
+        .decode(&request.grant)
+        .map_err(|_| OAuthRefreshFailure::unauthorized("invalid provider grant"))?;
+    if raw.len() > silo_secrets::grant::MAX_BODY || STANDARD.encode(&raw) != request.grant {
+        return Err(OAuthRefreshFailure::unauthorized(
+            "invalid provider grant encoding",
+        ));
+    }
+    let grant: SecretGrant = serde_json::from_slice(&raw)
+        .map_err(|_| OAuthRefreshFailure::unauthorized("invalid provider grant"))?;
+    let allowed = grant.authorize(store_file, &request).map_err(|_| {
+        OAuthRefreshFailure::unauthorized("provider grant does not authorize this request")
+    })?;
+    // Validate all names and supported backing kinds before any store IO.
+    if allowed.iter().any(|entry| {
+        !entry.key.as_str().starts_with("openai_codex_oauth.")
+            || !entry.key.as_str().ends_with(".oauth")
+    }) {
+        return Err(OAuthRefreshFailure::invalid_request(
+            "unsupported OAuth backing kind",
+        ));
+    }
+    let store = FileStore::with_store_file(store_file).map_err(OAuthRefreshFailure::from)?;
+    let mut groups: Vec<(SecretScope, Vec<&silo_secrets::grant::AllowedSecret>)> = Vec::new();
+    for entry in allowed {
+        if let Some((_, entries)) = groups
+            .iter_mut()
+            .find(|(scope, _)| scope == &entry.backing_scope)
+        {
+            entries.push(entry);
+        } else {
+            groups.push((entry.backing_scope.clone(), vec![entry]));
+        }
+    }
+    // All provider requests acquire unique scopes in the same path order. Keep
+    // every lock until prevalidation and refresh finish, without re-entering a
+    // locked scope through FileStore::get/put.
+    groups.sort_by_key(|(scope, _)| store.scope_path(scope));
+    let scopes = groups
+        .iter()
+        .map(|(scope, _)| scope.clone())
+        .collect::<Vec<_>>();
+    let transactions = tokio::task::spawn_blocking(move || {
+        scopes
+            .iter()
+            .map(|scope| store.begin_transaction(scope))
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .await
+    .map_err(|e| OAuthRefreshFailure::internal(e.to_string()))?
+    .map_err(OAuthRefreshFailure::from)?;
+    let mut plans = Vec::new();
+    for ((_, entries), tx) in groups.into_iter().zip(transactions) {
+        let mut records = std::collections::BTreeMap::new();
+        for entry in &entries {
+            if records.contains_key(&entry.key) {
+                continue;
+            }
+            let secret = tx
+                .get(&entry.key)
+                .map_err(OAuthRefreshFailure::from)?
+                .ok_or_else(|| OAuthRefreshFailure::not_found("OAuth secret was not found"))?;
+            if !matches!(secret, Secret::OAuth(_)) {
+                return Err(OAuthRefreshFailure::invalid_request(
+                    "backing record is not an OAuth secret",
+                ));
+            }
+            records.insert(entry.key.clone(), secret);
+        }
+        // Validate every requested projection in every locked scope before the
+        // first irreversible HTTP refresh, including optional fields removed
+        // since the runtime issued its grant.
+        for entry in &entries {
+            let value = records
+                .get(&entry.key)
+                .and_then(|record| record.project(entry.field))
+                .ok_or_else(|| OAuthRefreshFailure::not_found("OAuth projection was not found"))?;
+            if value.is_empty() {
+                return Err(OAuthRefreshFailure::invalid_request(
+                    "OAuth projection is empty",
+                ));
+            }
+        }
+        for secret in records.values() {
+            if let Secret::OAuth(record) = secret {
+                if record.expires_at <= Utc::now() + chrono::Duration::seconds(300) {
+                    if record.refresh_token.is_empty() {
+                        return Err(OAuthRefreshFailure::invalid_request(
+                            "OAuth secret does not contain a refresh token",
+                        ));
+                    }
+                    record
+                        .refresh_token
+                        .as_str()
+                        .map_err(OAuthRefreshFailure::from)?;
+                }
+            }
+        }
+        plans.push((tx, entries, records));
+    }
+    let mut projected = Vec::new();
+    for (tx, entries, records) in &mut plans {
+        for (name, secret) in records.iter_mut() {
+            if secret
+                .expires_at()
+                .is_some_and(|expiry| expiry <= Utc::now() + chrono::Duration::seconds(300))
+            {
+                *secret = refresh_openai_codex_oauth(secret.clone(), token_endpoint).await?;
+                tx.put(name, secret.clone())
+                    .map_err(OAuthRefreshFailure::from)?;
+                // Do not lose a rotated refresh token if a subsequent record's
+                // upstream refresh fails. The response remains all-or-none.
+                tx.persist().map_err(OAuthRefreshFailure::from)?;
+            }
+        }
+        for entry in entries.iter() {
+            let value = records
+                .get(&entry.key)
+                .and_then(|record| record.project(entry.field))
+                .ok_or_else(|| OAuthRefreshFailure::not_found("OAuth projection was not found"))?;
+            projected.push(ProjectedSecret {
+                name: entry.slot.clone(),
+                value: STANDARD.encode(value.as_bytes()),
+            });
+        }
+    }
+    Ok(projected)
 }
 
 async fn refresh_openai_codex_oauth(
-    store: &FileStore,
-    scope: &SecretScope,
-    key: &str,
-) -> Result<OAuthRefreshHookOAuth, OAuthRefreshFailure> {
-    let store = store.clone();
-    let scope = scope.clone();
-    let mut tx = tokio::task::spawn_blocking(move || store.begin_transaction(&scope))
-        .await
-        .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?
-        .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?;
-    let name = SecretName::legacy(key);
-    let secret = tx
-        .get(&name)
-        .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?
-        .ok_or_else(|| OAuthRefreshFailure::not_found("OAuth secret was not found"))?;
+    secret: Secret,
+    token_endpoint: &str,
+) -> Result<Secret, OAuthRefreshFailure> {
     let Secret::OAuth(OAuthSecret {
         provider,
         refresh_token,
@@ -1078,9 +1145,9 @@ async fn refresh_openai_codex_oauth(
         ..
     }) = secret
     else {
-        return Err(OAuthRefreshFailure::invalid_request(format!(
-            "secret {key:?} is not an OAuth secret"
-        )));
+        return Err(OAuthRefreshFailure::invalid_request(
+            "backing record is not an OAuth secret",
+        ));
     };
     if refresh_token.is_empty() {
         return Err(OAuthRefreshFailure::invalid_request(
@@ -1089,11 +1156,12 @@ async fn refresh_openai_codex_oauth(
     }
     let client = reqwest::Client::builder()
         .user_agent(concat!("silo/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(8))
         .build()
         .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?;
     let token = refresh_openai_codex_token(
         &client,
+        token_endpoint,
         refresh_token
             .as_str()
             .map_err(|err| OAuthRefreshFailure::invalid_request(err.to_string()))?,
@@ -1116,23 +1184,16 @@ async fn refresh_openai_codex_oauth(
         created_at,
         updated_at: Some(timestamp_now()),
     });
-    tx.put(&name, updated)
-        .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?;
-    tx.commit()
-        .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?;
-    Ok(OAuthRefreshHookOAuth {
-        access_token: token.access_token,
-        expires_at,
-        account_id,
-    })
+    Ok(updated)
 }
 
 async fn refresh_openai_codex_token(
     client: &reqwest::Client,
+    token_endpoint: &str,
     refresh_token: &str,
 ) -> Result<TokenResponse, OAuthRefreshFailure> {
     let response = client
-        .post(OPENAI_TOKEN_URL)
+        .post(token_endpoint)
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
@@ -1140,20 +1201,18 @@ async fn refresh_openai_codex_token(
         ])
         .send()
         .await
-        .map_err(|err| OAuthRefreshFailure::provider_unavailable(err.to_string()))?;
+        .map_err(|_| OAuthRefreshFailure::provider_unavailable("token endpoint unavailable"))?;
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|err| OAuthRefreshFailure::provider_unavailable(err.to_string()))?;
+    let body = response.text().await.map_err(|_| {
+        OAuthRefreshFailure::provider_unavailable("token endpoint response unavailable")
+    })?;
     if !status.is_success() {
         return Err(OAuthRefreshFailure::provider_rejected(format!(
-            "OpenAI Codex OAuth refresh returned {status}: {}",
-            sanitize_response_body(&body)
+            "OpenAI Codex OAuth refresh returned {status}"
         )));
     }
     let token = serde_json::from_str::<TokenResponse>(&body)
-        .map_err(|err| OAuthRefreshFailure::provider_rejected(err.to_string()))?;
+        .map_err(|_| OAuthRefreshFailure::provider_rejected("invalid token endpoint response"))?;
     if token.access_token.is_empty() {
         return Err(OAuthRefreshFailure::provider_rejected(
             "OpenAI Codex OAuth refresh did not include an access token",
@@ -1162,127 +1221,25 @@ async fn refresh_openai_codex_token(
     Ok(token)
 }
 
-fn read_json_frame<R, T>(reader: R) -> eyre::Result<T>
-where
-    R: Read,
-    T: for<'de> Deserialize<'de>,
-{
-    let mut reader = std::io::BufReader::new(reader);
-    let mut content_length = None;
-    loop {
-        let mut line = String::new();
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 {
-            eyre::bail!("missing Content-Length frame header");
-        }
-        let header = line.trim_end_matches(['\r', '\n']);
-        if header.is_empty() {
-            break;
-        }
-        let Some((name, value)) = header.split_once(':') else {
-            eyre::bail!("invalid frame header {header:?}");
-        };
-        if name.eq_ignore_ascii_case("content-length") {
-            content_length = Some(value.trim().parse::<usize>()?);
-        }
-    }
-    let length = content_length.ok_or_else(|| eyre::eyre!("missing Content-Length header"))?;
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body)?;
-    Ok(serde_json::from_slice(&body)?)
-}
-
-fn write_json_frame<W, T>(mut writer: W, value: &T) -> eyre::Result<()>
-where
-    W: Write,
-    T: Serialize,
-{
-    let body = serde_json::to_vec(value)?;
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
-    writer.write_all(&body)?;
-    writer.flush()?;
-    Ok(())
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct OAuthRefreshHookRequest {
-    version: u8,
-    operation: String,
-    #[serde(default)]
-    grant: String,
-    credential: OAuthRefreshHookCredential,
-    #[allow(dead_code)]
-    reason: String,
-    #[allow(dead_code)]
-    expires_at: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct OAuthRefreshHookCredential {
-    name: String,
-    kind: String,
-    endpoint: String,
-}
-
-#[derive(Debug, Serialize)]
-struct OAuthRefreshHookResponse {
-    version: u8,
-    status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    oauth: Option<OAuthRefreshHookOAuth>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<OAuthRefreshHookError>,
-}
-
-impl OAuthRefreshHookResponse {
-    fn ok(oauth: OAuthRefreshHookOAuth) -> Self {
-        Self {
-            version: 1,
-            status: "ok",
-            oauth: Some(oauth),
-            error: None,
-        }
-    }
-
-    fn error(error: OAuthRefreshFailure) -> Self {
-        Self {
-            version: 1,
-            status: "error",
-            oauth: None,
-            error: Some(OAuthRefreshHookError {
-                code: error.code,
-                message: error.message,
-                retryable: error.retryable,
-            }),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct OAuthRefreshHookOAuth {
-    access_token: String,
-    expires_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    account_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct OAuthRefreshHookError {
-    code: &'static str,
-    message: String,
-    #[serde(skip_serializing_if = "is_false")]
-    retryable: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 #[derive(Debug)]
 struct OAuthRefreshFailure {
     code: &'static str,
     message: String,
     retryable: bool,
+}
+
+impl From<silo_secrets::SecretError> for OAuthRefreshFailure {
+    fn from(error: silo_secrets::SecretError) -> Self {
+        Self {
+            code: error.wire_code(),
+            message: "secret store operation failed".into(),
+            retryable: matches!(
+                error,
+                silo_secrets::SecretError::ProviderUnavailable(_)
+                    | silo_secrets::SecretError::RateLimited
+            ),
+        }
+    }
 }
 
 impl OAuthRefreshFailure {
@@ -1513,6 +1470,7 @@ fn sanitize_response_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use clap::Parser;
     use reqwest::StatusCode;
@@ -1522,7 +1480,7 @@ mod tests {
 
     use crate::commands::secret::{
         is_pending_device_poll_response, plain_secret_value, read_json_frame, set_plain_secret,
-        slot_key, write_json_frame, write_plain_secret, LoginProvider, OAuthRefreshHookRequest,
+        slot_key, write_json_frame, write_plain_secret, LoginProvider, ProviderRequest,
         SecretSubcommand, SetCmd, OPENAI_CODEX_KIND,
     };
     use silo_secrets::{
@@ -1532,6 +1490,622 @@ mod tests {
 
     fn plain(value: &str) -> Secret {
         Secret::Plain(SecretBytes::new(value.as_bytes().to_vec()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_http_child() {
+        use std::os::fd::FromRawFd;
+        let Ok(endpoint) = std::env::var("SILO_TEST_PROVIDER_ENDPOINT") else {
+            return;
+        };
+        let store = std::env::var("SILO_TEST_PROVIDER_STORE").unwrap();
+        let fd = std::env::var("SILO_TEST_PROVIDER_FD")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let output = unsafe { std::fs::File::from_raw_fd(fd) };
+        let request = read_json_frame(std::io::stdin().lock()).unwrap();
+        let secrets = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::commands::secret::provide_request(
+                std::path::Path::new(&store),
+                request,
+                &endpoint,
+            ))
+            .unwrap();
+        write_json_frame(
+            output,
+            &silo_secrets::grant::ProviderResponse::Ok {
+                version: 2,
+                secrets,
+            },
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn subprocess_provider_get(
+        store: PathBuf,
+        endpoint: String,
+        request: ProviderRequest,
+    ) -> Vec<silo_secrets::grant::ProjectedSecret> {
+        use std::os::fd::{AsRawFd, BorrowedFd};
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        let (reader, writer) = std::io::pipe().unwrap();
+        let fd = writer.as_raw_fd();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .env_clear()
+            .env("SILO_TEST_PROVIDER_ENDPOINT", endpoint)
+            .env("SILO_TEST_PROVIDER_STORE", store)
+            .env("SILO_TEST_PROVIDER_FD", fd.to_string())
+            .args([
+                "--exact",
+                "commands::secret::tests::provider_http_child",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(move || {
+                nix::fcntl::fcntl(
+                    BorrowedFd::borrow_raw(fd),
+                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                )
+                .map_err(std::io::Error::from)?;
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(writer);
+        write_json_frame(child.stdin.take().unwrap(), &request).unwrap();
+        let response = silo_secrets::grant::read_json_frame(reader).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        match response {
+            silo_secrets::grant::ProviderResponse::Ok { secrets, .. } => secrets,
+            _ => panic!("provider error"),
+        }
+    }
+
+    struct LocalTokenEndpoint {
+        url: String,
+        stop: Option<std::sync::mpsc::Sender<()>>,
+        server: Option<std::thread::JoinHandle<Vec<String>>>,
+    }
+
+    impl LocalTokenEndpoint {
+        fn start(rejected_checkpoint: Option<(String, PathBuf, String)>) -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/token", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let (stop, receiver) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                while matches!(
+                    receiver.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ) {
+                    let (mut socket, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(e) => panic!("{e}"),
+                    };
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        socket.read_exact(&mut byte).unwrap();
+                        header.push(byte[0]);
+                        assert!(header.len() < 8192);
+                    }
+                    let header = String::from_utf8(header).unwrap();
+                    assert!(header.starts_with("POST /token HTTP/1.1"));
+                    let length = header
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(|n| n.parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    let mut body = vec![0; length];
+                    socket.read_exact(&mut body).unwrap();
+                    let body = String::from_utf8(body).unwrap();
+                    assert!(body.contains("grant_type=refresh_token"));
+                    assert!(body.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+                    let token = body
+                        .split('&')
+                        .find_map(|field| field.strip_prefix("refresh_token="))
+                        .unwrap();
+                    let rejected = rejected_checkpoint
+                        .as_ref()
+                        .is_some_and(|(reject, _, _)| reject == token);
+                    let (status, response) = if rejected {
+                        let (_, path, key) = rejected_checkpoint.as_ref().unwrap();
+                        let disk: serde_json::Value =
+                            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                        assert_eq!(
+                            disk[key]["refresh_token"], "first-refresh-rotated",
+                            "first rotation must be durable before the second endpoint call"
+                        );
+                        ("400 Bad Request", r#"{"error":"invalid_grant"}"#.to_owned())
+                    } else {
+                        ("200 OK",serde_json::json!({"access_token":format!("{token}-access"),"refresh_token":format!("{token}-rotated"),"expires_in":3600}).to_string())
+                    };
+                    write!(socket,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
+                    requests.push(body);
+                }
+                requests
+            });
+            Self {
+                url,
+                stop: Some(stop),
+                server: Some(server),
+            }
+        }
+        fn finish(mut self) -> Vec<String> {
+            self.stop.take().unwrap().send(()).unwrap();
+            self.server.take().unwrap().join().unwrap()
+        }
+    }
+    impl Drop for LocalTokenEndpoint {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    fn expired_provider_record(refresh: &str, account: Option<&str>) -> Secret {
+        Secret::OAuth(OAuthSecret {
+            provider: None,
+            access_token: SecretBytes::new(b"old-access".to_vec()),
+            refresh_token: SecretBytes::new(refresh.as_bytes().to_vec()),
+            expires_at: "2020-01-01T00:00:00Z".parse().unwrap(),
+            account_id: account.map(str::to_owned),
+            created_at: None,
+            updated_at: None,
+        })
+    }
+    fn provider_request_for(
+        store: &FileStore,
+        addresses: &[(&str, &str, SecretScope, bool)],
+    ) -> ProviderRequest {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use silo_secrets::grant::{AllowedSecret, RequestScope, SecretGrant};
+        use silo_secrets::{MachineScopeId, SecretField};
+        let machine = MachineScopeId::new("0123456789abcdef0123456789abcdef").unwrap();
+        let mut allowed = Vec::new();
+        for (slot, key, scope, account) in addresses {
+            for (suffix, field) in [
+                ("access_token", SecretField::OAuthAccessToken),
+                ("expires_at", SecretField::OAuthExpiresAt),
+                ("account_id", SecretField::OAuthAccountId),
+            ] {
+                if suffix == "account_id" && !account {
+                    continue;
+                }
+                allowed.push(AllowedSecret {
+                    slot: SecretName::new(format!("{slot}.oauth.{suffix}")).unwrap(),
+                    key: SecretName::new(*key).unwrap(),
+                    field,
+                    backing_scope: scope.clone(),
+                });
+            }
+        }
+        let grant =
+            SecretGrant::issue(store.path(), machine.clone(), "run".into(), allowed).unwrap();
+        ProviderRequest {
+            version: 2,
+            operation: "get".into(),
+            grant: STANDARD.encode(serde_json::to_vec(&grant).unwrap()),
+            scope: RequestScope {
+                machine,
+                run: "run".into(),
+            },
+            names: grant
+                .allowed
+                .iter()
+                .map(|entry| entry.slot.clone())
+                .collect(),
+            reason: "expired".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_prevalidates_all_scopes_and_projections_before_http_or_writes() {
+        use crate::commands::secret::provide_request;
+        use silo_secrets::MachineScopeId;
+        for invalid in [
+            "removed-account",
+            "plain",
+            "missing",
+            "empty-account",
+            "empty-refresh",
+        ] {
+            for reverse in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = FileStore::new(dir.path());
+                let machine = SecretScope::Machine {
+                    id: MachineScopeId::new("0123456789abcdef0123456789abcdef").unwrap(),
+                };
+                std::fs::create_dir_all(store.scope_path(&machine).parent().unwrap()).unwrap();
+                let first = "openai_codex_oauth.first.oauth";
+                let second = "openai_codex_oauth.second.oauth";
+                store
+                    .put(
+                        &machine,
+                        &SecretName::new(first).unwrap(),
+                        expired_provider_record("first-refresh", Some("first-account")),
+                    )
+                    .unwrap();
+                let invalid_record = match invalid {
+                    "plain" => plain("wrong-kind"),
+                    "removed-account" => expired_provider_record("second-refresh", None),
+                    "empty-account" => expired_provider_record("second-refresh", Some("")),
+                    "empty-refresh" => expired_provider_record("", Some("second-account")),
+                    _ => expired_provider_record("second-refresh", Some("second-account")),
+                };
+                if invalid != "missing" {
+                    store
+                        .put(
+                            &SecretScope::Home,
+                            &SecretName::new(second).unwrap(),
+                            invalid_record,
+                        )
+                        .unwrap();
+                } else {
+                    std::fs::write(store.path(), b"{}").unwrap();
+                }
+                let before_home = std::fs::read(store.path()).unwrap();
+                let before_machine = std::fs::read(store.scope_path(&machine)).unwrap();
+                let mut addresses = vec![
+                    ("first", first, machine.clone(), true),
+                    ("second", second, SecretScope::Home, true),
+                ];
+                if reverse {
+                    addresses.reverse();
+                }
+                let endpoint = LocalTokenEndpoint::start(None);
+                let result = provide_request(
+                    store.path(),
+                    provider_request_for(&store, &addresses),
+                    &endpoint.url,
+                )
+                .await;
+                assert!(result.is_err(), "{invalid}");
+                assert!(
+                    endpoint.finish().is_empty(),
+                    "{invalid}: invalid later scope reached upstream"
+                );
+                assert_eq!(std::fs::read(store.path()).unwrap(), before_home);
+                assert_eq!(
+                    std::fs::read(store.scope_path(&machine)).unwrap(),
+                    before_machine
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_keeps_successful_rotation_when_later_http_refresh_fails() {
+        use crate::commands::secret::provide_request;
+        use silo_secrets::MachineScopeId;
+        for separate_scopes in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FileStore::new(dir.path());
+            let first_scope = if separate_scopes {
+                SecretScope::Machine {
+                    id: MachineScopeId::new("0123456789abcdef0123456789abcdef").unwrap(),
+                }
+            } else {
+                SecretScope::Home
+            };
+            std::fs::create_dir_all(store.scope_path(&first_scope).parent().unwrap()).unwrap();
+            let first = "openai_codex_oauth.first.oauth";
+            let second = "openai_codex_oauth.second.oauth";
+            store
+                .put(
+                    &first_scope,
+                    &SecretName::new(first).unwrap(),
+                    expired_provider_record("first-refresh", Some("account")),
+                )
+                .unwrap();
+            let second_record = expired_provider_record("reject-refresh", Some("account"));
+            store
+                .put(
+                    &SecretScope::Home,
+                    &SecretName::new(second).unwrap(),
+                    second_record.clone(),
+                )
+                .unwrap();
+            let endpoint = LocalTokenEndpoint::start(Some((
+                "reject-refresh".into(),
+                store.scope_path(&first_scope),
+                first.into(),
+            )));
+            let request = provider_request_for(
+                &store,
+                &[
+                    ("second", second, SecretScope::Home, true),
+                    ("first", first, first_scope.clone(), true),
+                ],
+            );
+            let result = provide_request(store.path(), request, &endpoint.url).await;
+            assert_eq!(result.err().unwrap().code, "provider_rejected");
+            let requests = endpoint.finish();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[0].contains("refresh_token=first-refresh"));
+            assert!(requests[1].contains("refresh_token=reject-refresh"));
+            let Secret::OAuth(first_record) = store
+                .get(&first_scope, &SecretName::new(first).unwrap())
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("OAuth")
+            };
+            assert_eq!(
+                first_record.refresh_token.as_bytes(),
+                b"first-refresh-rotated"
+            );
+            assert_eq!(
+                first_record.access_token.as_bytes(),
+                b"first-refresh-access"
+            );
+            assert_eq!(
+                store
+                    .get(&SecretScope::Home, &SecretName::new(second).unwrap())
+                    .unwrap()
+                    .unwrap(),
+                second_record
+            );
+            // Retrying the all-or-none response must reuse the durable first
+            // rotation and refresh only the failed record.
+            let endpoint = LocalTokenEndpoint::start(None);
+            let request = provider_request_for(
+                &store,
+                &[
+                    ("second", second, SecretScope::Home, true),
+                    ("first", first, first_scope.clone(), true),
+                ],
+            );
+            let values = provide_request(store.path(), request, &endpoint.url)
+                .await
+                .unwrap();
+            assert_eq!(values.len(), 6);
+            let requests = endpoint.finish();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].contains("refresh_token=reject-refresh"));
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_refreshes_real_http_once_per_exact_scope_record_and_persists() {
+        use crate::commands::secret::provide_request;
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use silo_secrets::grant::{AllowedSecret, ProviderRequest, RequestScope, SecretGrant};
+        use silo_secrets::{MachineScopeId, SecretField};
+        use std::io::{Read, Write};
+        for machine_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FileStore::new(dir.path());
+            let machine = MachineScopeId::new("0123456789abcdef0123456789abcdef").unwrap();
+            let scope = if machine_backed {
+                SecretScope::Machine {
+                    id: machine.clone(),
+                }
+            } else {
+                SecretScope::Home
+            };
+            std::fs::create_dir_all(store.scope_path(&scope).parent().unwrap()).unwrap();
+            let key = SecretName::new("openai_codex_oauth.personal.oauth").unwrap();
+            let created = "2025-01-01T00:00:00Z".parse().unwrap();
+            store
+                .put(
+                    &scope,
+                    &key,
+                    Secret::OAuth(OAuthSecret {
+                        provider: if machine_backed {
+                            Some("openai-codex".into())
+                        } else {
+                            None
+                        },
+                        access_token: SecretBytes::new(b"old-access".to_vec()),
+                        refresh_token: SecretBytes::new(b"private-refresh-only-at-host".to_vec()),
+                        expires_at: "2020-01-01T00:00:00Z".parse().unwrap(),
+                        account_id: Some("account".into()),
+                        created_at: Some(created),
+                        updated_at: None,
+                    }),
+                )
+                .unwrap();
+            if machine_backed {
+                store
+                    .put(&SecretScope::Home, &key, plain("home-must-stay-untouched"))
+                    .unwrap();
+            }
+            let home_before = std::fs::read(store.path()).ok();
+            let allowed = [
+                ("access_token", SecretField::OAuthAccessToken),
+                ("expires_at", SecretField::OAuthExpiresAt),
+                ("account_id", SecretField::OAuthAccountId),
+            ]
+            .into_iter()
+            .map(|(suffix, field)| AllowedSecret {
+                slot: SecretName::new(format!("personal.oauth.{suffix}")).unwrap(),
+                key: key.clone(),
+                field,
+                backing_scope: scope.clone(),
+            })
+            .collect::<Vec<_>>();
+            let grant =
+                SecretGrant::issue(store.path(), machine.clone(), "run".into(), allowed).unwrap();
+            let encoded = STANDARD.encode(serde_json::to_vec(&grant).unwrap());
+            assert!(!String::from_utf8(serde_json::to_vec(&grant).unwrap())
+                .unwrap()
+                .contains("private-refresh"));
+            let request = || ProviderRequest {
+                version: 2,
+                operation: "get".into(),
+                grant: encoded.clone(),
+                scope: RequestScope {
+                    machine: machine.clone(),
+                    run: "run".into(),
+                },
+                names: grant.allowed.iter().map(|a| a.slot.clone()).collect(),
+                reason: "expired".into(),
+            };
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let mut count = 0;
+                while stop_rx.try_recv().is_err() {
+                    let (mut socket, _) = match listener.accept() {
+                        Ok(s) => s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(e) => panic!("{e}"),
+                    };
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    while !bytes.ends_with(b"\r\n\r\n") {
+                        let mut b = [0];
+                        socket.read_exact(&mut b).unwrap();
+                        bytes.push(b[0]);
+                    }
+                    let header = String::from_utf8(bytes).unwrap();
+                    let length = header
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(|n| n.parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    let mut body = vec![0; length];
+                    socket.read_exact(&mut body).unwrap();
+                    let body = String::from_utf8(body).unwrap();
+                    assert!(header.starts_with("POST /token HTTP/1.1"));
+                    assert!(body.contains("grant_type=refresh_token"));
+                    assert!(body.contains("refresh_token=private-refresh-only-at-host"));
+                    assert!(body.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+                    let response = r#"{"access_token":"new-local-access","refresh_token":"rotated-host-refresh","expires_in":3600}"#;
+                    write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
+                    count += 1;
+                }
+                count
+            });
+            #[cfg(unix)]
+            let first = {
+                let path = store.path().to_path_buf();
+                let endpoint = endpoint.clone();
+                let request = request();
+                tokio::task::spawn_blocking(move || {
+                    subprocess_provider_get(path, endpoint, request)
+                })
+            };
+            #[cfg(unix)]
+            let second = {
+                let path = store.path().to_path_buf();
+                let endpoint = endpoint.clone();
+                let request = request();
+                tokio::task::spawn_blocking(move || {
+                    subprocess_provider_get(path, endpoint, request)
+                })
+            };
+            #[cfg(unix)]
+            let (first, second) = tokio::join!(first, second);
+            #[cfg(unix)]
+            let responses = [first.unwrap(), second.unwrap()];
+            #[cfg(not(unix))]
+            let responses = [
+                provide_request(store.path(), request(), &endpoint)
+                    .await
+                    .unwrap(),
+                provide_request(store.path(), request(), &endpoint)
+                    .await
+                    .unwrap(),
+            ];
+            for response in responses {
+                assert_eq!(response.len(), 3);
+                assert_eq!(
+                    STANDARD
+                        .decode(
+                            &response
+                                .iter()
+                                .find(|s| s.name.as_str().ends_with("access_token"))
+                                .unwrap()
+                                .value
+                        )
+                        .unwrap(),
+                    b"new-local-access"
+                );
+                let mut wire = Vec::new();
+                write_json_frame(
+                    &mut wire,
+                    &silo_secrets::grant::ProviderResponse::Ok {
+                        version: 2,
+                        secrets: response,
+                    },
+                )
+                .unwrap();
+                assert!(!String::from_utf8(wire)
+                    .unwrap()
+                    .contains(&STANDARD.encode(b"rotated-host-refresh")));
+            }
+            stop_tx.send(()).unwrap();
+            assert_eq!(server.join().unwrap(), 1);
+            let Secret::OAuth(record) = store.get(&scope, &key).unwrap().unwrap() else {
+                panic!("OAuth")
+            };
+            assert_eq!(record.access_token.as_bytes(), b"new-local-access");
+            assert_eq!(record.refresh_token.as_bytes(), b"rotated-host-refresh");
+            assert_eq!(
+                record.provider,
+                if machine_backed {
+                    Some("openai-codex".into())
+                } else {
+                    None
+                }
+            );
+            assert_eq!(record.created_at, Some(created));
+            assert!(record.updated_at.is_some());
+            assert_eq!(record.account_id.as_deref(), Some("account"));
+            if machine_backed {
+                assert_eq!(std::fs::read(store.path()).ok(), home_before);
+            }
+            let bytes = std::fs::read(store.scope_path(&scope)).unwrap();
+            let values = provide_request(store.path(), request(), "http://127.0.0.1:1/unreachable")
+                .await
+                .unwrap();
+            assert_eq!(values.len(), 3);
+            assert_eq!(std::fs::read(store.scope_path(&scope)).unwrap(), bytes);
+        }
     }
     fn get(store: &FileStore, name: &str) -> Secret {
         store
@@ -1589,11 +2163,11 @@ mod tests {
     }
 
     #[test]
-    fn secret_refresh_oauth_parses_but_is_hidden() {
+    fn secret_provide_parses_but_is_hidden() {
         let cli = Cli::try_parse_from([
             "silo",
             "secret",
-            "refresh-oauth",
+            "provide",
             "--store-file",
             "/tmp/secrets.json",
         ])
@@ -1603,10 +2177,10 @@ mod tests {
             Command::Secret(command) => command,
             other => panic!("expected secret command, got {other:?}"),
         };
-        assert!(matches!(secret.command, SecretSubcommand::RefreshOAuth(_)));
+        assert!(matches!(secret.command, SecretSubcommand::Provide(_)));
 
         let help = Cli::command().render_long_help().to_string();
-        assert!(!help.contains("refresh-oauth"));
+        assert!(!help.contains("provide"));
     }
 
     #[test]
@@ -1745,29 +2319,26 @@ mod tests {
 
     #[test]
     fn oauth_refresh_frames_round_trip_json() {
-        let request = OAuthRefreshHookRequest {
-            version: 1,
-            operation: "oauth_refresh".to_string(),
+        let request = ProviderRequest {
+            version: 2,
+            operation: "get".to_string(),
             grant: "e30=".to_string(),
-            credential: crate::commands::secret::OAuthRefreshHookCredential {
-                name: "personal".to_string(),
-                kind: OPENAI_CODEX_KIND.to_string(),
-                endpoint: "openai".to_string(),
+            scope: silo_secrets::grant::RequestScope {
+                machine: silo_secrets::MachineScopeId::new("0123456789abcdef0123456789abcdef")
+                    .unwrap(),
+                run: "run".into(),
             },
+            names: vec![SecretName::new("personal.oauth.access_token").unwrap()],
             reason: "expires_soon".to_string(),
-            expires_at: "2026-07-04T00:00:00Z".to_string(),
         };
         let mut frame = Vec::new();
         write_json_frame(&mut frame, &request).expect("write frame");
 
-        let decoded: OAuthRefreshHookRequest =
-            read_json_frame(frame.as_slice()).expect("read frame");
-        assert_eq!(decoded.version, 1);
-        assert_eq!(decoded.operation, "oauth_refresh");
+        let decoded: ProviderRequest = read_json_frame(frame.as_slice()).expect("read frame");
+        assert_eq!(decoded.version, 2);
+        assert_eq!(decoded.operation, "get");
         assert_eq!(decoded.grant, "e30=");
-        assert_eq!(decoded.credential.name, "personal");
-        assert_eq!(decoded.credential.kind, OPENAI_CODEX_KIND);
-        assert_eq!(decoded.credential.endpoint, "openai");
+        assert_eq!(decoded.names[0].as_str(), "personal.oauth.access_token");
     }
 
     #[test]

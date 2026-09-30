@@ -97,7 +97,7 @@ pub(crate) fn frame(
                     message: "OAuth refresh hook command must be valid UTF-8".into(),
                 })?;
             Ok::<_, LibVmError>(Provider {
-                version: 1,
+                version: 2,
                 command,
                 args: &hook.args,
                 timeout_ms: hook.timeout_ms,
@@ -182,7 +182,7 @@ mod tests {
     use silo_policy::NetworkPolicy;
     use zeroize::Zeroizing;
 
-    use crate::machine::{EgressCredentials, V1RefreshProvider};
+    use crate::machine::{EgressCredentials, SecretProvider};
     use crate::network::secret_transport::{frame, strip_environment, write_frame, JSON_LIMIT};
 
     fn policy() -> NetworkPolicy {
@@ -215,7 +215,7 @@ mod tests {
             serde_json::json!({"version":1,"secrets":[]})
         );
         for timing in [None, Some(0), Some(42)] {
-            let mut hook = V1RefreshProvider::new("/usr/bin/silo", vec![0, 255, 128]);
+            let mut hook = SecretProvider::new("/usr/bin/silo", vec![0, 255, 128]);
             hook.timeout_ms = timing;
             hook.refresh_skew_seconds = timing;
             let payload = body(
@@ -253,7 +253,7 @@ mod tests {
         launch.secrets[0].value = vec![1; JSON_LIMIT];
         assert!(frame(&launch.into(), Some(&policy), "test").is_err());
         let mut launch: crate::secrets::ResolvedSecrets = credentials().into();
-        launch.oauth_refresh_hook = Some(V1RefreshProvider::new("/bin/true", vec![1; JSON_LIMIT]));
+        launch.oauth_refresh_hook = Some(SecretProvider::new("/bin/true", vec![1; JSON_LIMIT]));
         assert!(frame(&launch, Some(&policy), "test").is_err());
         assert!(frame(
             &credentials().secret("api-key.token", "duplicate").into(),
@@ -269,8 +269,8 @@ mod tests {
         .is_err());
         assert!(frame(&credentials().into(), None, "test").is_err());
         // Find the exact last accepted size, including provider metadata and JSON escaping.
-        let mut launch = credentials()
-            .oauth_refresh_hook(V1RefreshProvider::new("/bin/true", b"grant".to_vec()));
+        let mut launch =
+            credentials().oauth_refresh_hook(SecretProvider::new("/bin/true", b"grant".to_vec()));
         let mut last = 0;
         for size in 11000..12500 {
             launch.credentials.secrets[0].value.resize(size, 1);

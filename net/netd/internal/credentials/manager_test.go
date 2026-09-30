@@ -1,6 +1,7 @@
 package credentials
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -233,6 +234,11 @@ func TestOAuthRefreshHookHelperProcess(t *testing.T) {
 		t.Fatal("provider environment is not empty")
 	}
 	mode := os.Args[len(os.Args)-1]
+	if strings.HasPrefix(mode, "pair-regression:") {
+		if err := os.WriteFile(strings.TrimPrefix(mode, "pair-regression:"), []byte("called"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if mode == "timeout" {
 		time.Sleep(time.Minute)
 		os.Exit(1)
@@ -241,39 +247,74 @@ func TestOAuthRefreshHookHelperProcess(t *testing.T) {
 		_, _ = os.Stderr.WriteString("must-not-leak-grant-or-token")
 		os.Exit(2)
 	}
-	var request oauthRefreshHookRequest
+	var request providerRequest
 	if err := readJSONFrame(os.Stdin, &request); err != nil {
 		t.Fatalf("read hook request: %v", err)
 	}
 	expectedReason := mode
-	if mode == "invalid-expiry" || mode == "error" || mode == "expired-response" {
+	if mode == "invalid-expiry" || mode == "error" || mode == "expired-response" || strings.HasPrefix(mode, "bad-") {
 		expectedReason = "expired"
 	}
-	if request.Version != 1 || request.Grant != base64.StdEncoding.EncodeToString([]byte("opaque-hook-auth")) || request.Operation != "oauth_refresh" || request.Credential.Name != "personal" || request.Credential.Kind != "openai_codex_oauth" || request.Credential.Endpoint != "chatgpt" || request.Reason != expectedReason {
+	customGrant := strings.HasPrefix(mode, "pair-regression:") || mode == "account-override"
+	if !customGrant && (request.Version != 2 || request.Grant != base64.StdEncoding.EncodeToString(helperGrant()) || request.Operation != "get" || request.Scope.Machine != "0123456789abcdef0123456789abcdef" || request.Scope.Run != "run" || len(request.Names) != 3 || request.Names[0] != "personal.oauth.access_token" || request.Reason != expectedReason) {
 		t.Fatal("unexpected hook request")
 	}
-	response := oauthRefreshHookResponse{
-		Version: 1,
-		Status:  "ok",
-		OAuth: oauthRefreshHookOAuth{
-			AccessToken: "new-access-token",
-			ExpiresAt:   "2026-06-02T13:00:00Z",
-			AccountID:   "acct_new",
-		},
+	secrets := []providerSecret{{"personal.oauth.access_token", base64.StdEncoding.EncodeToString([]byte("new-access-token"))}, {"personal.oauth.expires_at", base64.StdEncoding.EncodeToString([]byte("2099-01-01T00:00:00Z"))}, {"personal.oauth.account_id", base64.StdEncoding.EncodeToString([]byte("acct_new"))}}
+	if customGrant {
+		if request.Version != 2 || request.Operation != "get" {
+			t.Fatal("not a v2 get")
+		}
+		selected := make([]providerSecret, 0, len(request.Names))
+		for _, name := range request.Names {
+			for _, secret := range secrets {
+				if secret.Name == name {
+					selected = append(selected, secret)
+				}
+			}
+		}
+		secrets = selected
+		if mode == "account-override" && (len(request.Names) != 2 || request.Reason != "expired") {
+			t.Fatal("raw account should not be requested")
+		}
 	}
+	response := providerResponse{Version: 2, Status: "ok", Secrets: &secrets}
 	if mode == "invalid-expiry" {
-		response.OAuth.ExpiresAt = "bad-expiry"
+		secrets[1].Value = base64.StdEncoding.EncodeToString([]byte("bad-expiry"))
 	}
 	if mode == "expired-response" {
-		response.OAuth.ExpiresAt = "2026-06-02T11:00:00Z"
+		secrets[1].Value = base64.StdEncoding.EncodeToString([]byte("2026-06-02T11:00:00Z"))
 	}
 	if mode == "error" {
 		response.Status = "error"
-		response.Error = oauthRefreshHookErrorBody{Code: "provider_rejected", Message: "must-not-leak-secret"}
+		response.Secrets = nil
+		response.Error = &providerError{Code: "provider_rejected", Message: "must-not-leak-secret"}
+	}
+	switch mode {
+	case "bad-missing":
+		secrets = secrets[:2]
+	case "bad-extra":
+		secrets = append(secrets, providerSecret{"outside.token", "eA=="})
+	case "bad-duplicate":
+		secrets[2] = secrets[0]
+	case "bad-base64":
+		secrets[2].Value = "%%%"
+	case "bad-version":
+		response.Version = 1
 	}
 	payload, err := json.Marshal(response)
 	if err != nil {
 		t.Fatalf("marshal response: %v", err)
+	}
+	switch mode {
+	case "bad-alias":
+		payload = bytes.Replace(payload, []byte(`"name"`), []byte(`"Name"`), 1)
+	case "bad-unknown":
+		payload = bytes.Replace(payload, []byte(`"name"`), []byte(`"unknown":true,"name"`), 1)
+	case "bad-oversize":
+		payload = []byte(strings.Repeat("x", (1<<20)+1))
+	case "bad-truncated":
+		_, _ = os.Stdout.WriteString("Content-Length: 100\r\n\r\n{")
+		os.Exit(0)
 	}
 	if err := writeJSONFrame(os.Stdout, payload); err != nil {
 		t.Fatalf("write hook response: %v", err)
@@ -282,7 +323,7 @@ func TestOAuthRefreshHookHelperProcess(t *testing.T) {
 }
 
 func TestOAuthRefreshRejectsBadProviderResponse(t *testing.T) {
-	for _, mode := range []string{"invalid-expiry", "expired-response", "error"} {
+	for _, mode := range []string{"invalid-expiry", "expired-response", "error", "bad-missing", "bad-extra", "bad-duplicate", "bad-base64", "bad-version", "bad-alias", "bad-unknown", "bad-oversize", "bad-truncated"} {
 		t.Run(mode, func(t *testing.T) {
 			source := NewStatic(map[string][]byte{"personal.oauth.access_token": []byte("old"), "personal.oauth.expires_at": []byte("2026-06-02T11:59:00Z")}, configureOAuthRefreshHookHelper(t, mode))
 			manager := NewManager(source)
@@ -294,6 +335,9 @@ func TestOAuthRefreshRejectsBadProviderResponse(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "must-not-leak") || strings.Contains(err.Error(), "bad-expiry") {
 				t.Fatal("provider secret leaked into error")
+			}
+			if token, _ := source.Lookup("personal.oauth.access_token"); string(token) != "old" {
+				t.Fatal("invalid response partially mutated cache")
 			}
 		})
 	}
@@ -359,12 +403,92 @@ func configureOAuthRefreshHookHelper(t *testing.T, mode string) *Provider {
 		t.Fatalf("os.Executable returned error: %v", err)
 	}
 	return &Provider{
-		Version:            1,
+		Version:            2,
 		Command:            executable,
 		Args:               []string{"-test.run=^TestOAuthRefreshHookHelperProcess$", "--", "--provider-helper", mode},
 		TimeoutMS:          5000,
 		RefreshSkewSeconds: 300,
-		Grant:              []byte("opaque-hook-auth"),
+		Grant:              helperGrant(),
+	}
+}
+
+func helperGrant() []byte {
+	return []byte(`{"version":2,"machine":"0123456789abcdef0123456789abcdef","run":"run","allowed":[{"slot":"personal.oauth.access_token","key":"openai_codex_oauth.personal.oauth","field":"OAuthAccessToken","backing_scope":"Home"},{"slot":"personal.oauth.expires_at","key":"openai_codex_oauth.personal.oauth","field":"OAuthExpiresAt","backing_scope":"Home"},{"slot":"personal.oauth.account_id","key":"openai_codex_oauth.personal.oauth","field":"OAuthAccountId","backing_scope":"Home"}]}`)
+}
+
+func TestOAuthRefreshRequiresSameBackingTokenExpiryPair(t *testing.T) {
+	for _, variant := range []string{"raw-token", "raw-expiry", "mixed-scope", "mixed-key"} {
+		t.Run(variant, func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "provider-called")
+			provider := configureOAuthRefreshHookHelper(t, "pair-regression:"+marker)
+			var grant struct {
+				Version int              `json:"version"`
+				Machine string           `json:"machine"`
+				Run     string           `json:"run"`
+				Allowed []map[string]any `json:"allowed"`
+			}
+			if err := json.Unmarshal(helperGrant(), &grant); err != nil {
+				t.Fatal(err)
+			}
+			switch variant {
+			case "raw-token":
+				grant.Allowed = grant.Allowed[1:]
+			case "raw-expiry":
+				grant.Allowed = append(grant.Allowed[:1], grant.Allowed[2:]...)
+			case "mixed-scope":
+				grant.Allowed[1]["backing_scope"] = map[string]any{"Machine": map[string]string{"id": grant.Machine}}
+			case "mixed-key":
+				grant.Allowed[1]["key"] = "openai_codex_oauth.other.oauth"
+			}
+			raw, err := json.Marshal(grant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider.Grant = raw
+			originalExpiry := "2026-06-02T12:00:00Z"
+			source := NewStatic(map[string][]byte{"personal.oauth.access_token": []byte("original-token"), "personal.oauth.expires_at": []byte(originalExpiry)}, provider)
+			manager := NewManager(source)
+			credential := &hooks.Credential{Kind: "openai_codex_oauth", Name: "personal", Endpoint: "chatgpt"}
+			manager.now = func() time.Time { return mustTime(t, "2026-06-02T11:58:00Z") }
+			request := httptest.NewRequest(http.MethodGet, "https://chatgpt.com/", nil)
+			if err := manager.Apply(context.Background(), request, credential); err != nil || request.Header.Get("Authorization") != "Bearer original-token" {
+				t.Fatalf("lost original usable token: %v", err)
+			}
+			manager.now = func() time.Time { return mustTime(t, originalExpiry) }
+			request = httptest.NewRequest(http.MethodGet, "https://chatgpt.com/", nil)
+			if err := manager.Apply(context.Background(), request, credential); err == nil || request.Header.Get("Authorization") != "" {
+				t.Fatal("token remained usable at its original expiry")
+			}
+			if expiry, _ := source.Lookup("personal.oauth.expires_at"); string(expiry) != originalExpiry {
+				t.Fatal("advanced expiry independently")
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatal("provider was invoked for an inseparable partial/mixed pair")
+			}
+		})
+	}
+}
+
+func TestOAuthRefreshPreservesIndependentRawAccountOverride(t *testing.T) {
+	provider := configureOAuthRefreshHookHelper(t, "account-override")
+	var grant map[string]json.RawMessage
+	if err := json.Unmarshal(helperGrant(), &grant); err != nil {
+		t.Fatal(err)
+	}
+	var allowed []json.RawMessage
+	if err := json.Unmarshal(grant["allowed"], &allowed); err != nil {
+		t.Fatal(err)
+	}
+	grant["allowed"], _ = json.Marshal(allowed[:2])
+	provider.Grant, _ = json.Marshal(grant)
+	source := NewStatic(map[string][]byte{"personal.oauth.access_token": []byte("old"), "personal.oauth.expires_at": []byte("2020-01-01T00:00:00Z"), "personal.oauth.account_id": []byte("raw-account")}, provider)
+	manager := NewManager(source)
+	request := httptest.NewRequest(http.MethodGet, "https://chatgpt.com/", nil)
+	if err := manager.Apply(context.Background(), request, &hooks.Credential{Kind: "openai_codex_oauth", Name: "personal", Endpoint: "chatgpt"}); err != nil {
+		t.Fatal(err)
+	}
+	if request.Header.Get("Authorization") != "Bearer new-access-token" || request.Header.Get("ChatGPT-Account-Id") != "raw-account" {
+		t.Fatal("did not refresh pair independently of raw account")
 	}
 }
 

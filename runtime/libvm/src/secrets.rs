@@ -1,20 +1,20 @@
-//! Start-time resolution and the scoped adapter for the v1 refresh protocol.
+//! Start-time resolution with exact-scope provider grants.
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use silo_secrets::grant::{AllowedSecret, SecretGrant};
 use silo_secrets::{
     MachineScopeId, Secret, SecretError, SecretField, SecretName, SecretScope, SecretStore,
     SecretStoreDescriptor,
 };
 
-use crate::machine::V1RefreshProvider;
+use crate::machine::SecretProvider;
 use crate::store::models::{MachineId, MachineNetworkConfig};
 use crate::{EgressCredentials, HostCommand, LibVmError};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ResolvedSecrets {
     pub(crate) credentials: EgressCredentials,
-    pub(crate) oauth_refresh_hook: Option<V1RefreshProvider>,
+    pub(crate) oauth_refresh_hook: Option<SecretProvider>,
     pub(crate) provenance: Vec<Provenance>,
 }
 
@@ -42,22 +42,20 @@ pub(crate) struct Provenance {
     field: SecretField,
 }
 
-#[derive(Serialize)]
-struct Grant<'a> {
-    version: u8,
-    store_file: std::path::PathBuf,
-    machine: String,
-    run: &'a str,
-    credentials: Vec<GrantCredential<'a>>,
-}
-
-#[derive(Serialize)]
-struct GrantCredential<'a> {
-    name: &'a str,
-    kind: &'a str,
-    endpoint: &'a str,
-    secret_key: &'a str,
-    scope: &'a SecretScope,
+fn refreshable_oauth_prefixes(provenance: &[Provenance]) -> std::collections::BTreeSet<String> {
+    provenance
+        .iter()
+        .filter_map(|token| {
+            if token.field != SecretField::OAuthAccessToken {
+                return None;
+            }
+            let prefix = token.slot.strip_suffix(".access_token")?;
+            let expiry = provenance.iter().find(|p| {
+                p.slot == format!("{prefix}.expires_at") && p.field == SecretField::OAuthExpiresAt
+            })?;
+            (token.scope == expiry.scope && token.key == expiry.key).then(|| prefix.to_owned())
+        })
+        .collect()
 }
 
 pub(crate) fn resolve_for_start(
@@ -187,49 +185,32 @@ pub(crate) fn resolve_for_start(
         .credentials
         .validate_for_policy(Some(policy), reference)?;
     if let Some(provider) = provider {
-        let credentials = policy
-            .credentials()
+        // An access token and its expiry are one value: a refresh must never
+        // extend a raw token's lifetime by replacing only its canonical expiry.
+        let refreshable = refreshable_oauth_prefixes(&resolved.provenance);
+        let allowed = resolved
+            .provenance
             .iter()
-            .filter_map(|credential| {
-                let token = resolved.provenance.iter().find(|p| {
-                    p.slot == format!("{}.oauth.access_token", credential.name)
-                        && p.field == SecretField::OAuthAccessToken
-                })?;
-                // V1 refresh replaces the whole record's projections. Do not grant it
-                // when a raw override or another scope supplied one of those slots.
-                if slots
-                    .iter()
-                    .filter(|s| {
-                        s.kind == silo_policy::NetworkSecretKind::OAuth
-                            && s.name.starts_with(&format!("{}.oauth.", credential.name))
-                    })
-                    .any(|s| {
-                        resolved
-                            .provenance
-                            .iter()
-                            .find(|p| p.slot == s.name)
-                            .is_some_and(|p| {
-                                p.scope != token.scope
-                                    || p.key != token.key
-                                    || p.field == SecretField::Value
-                            })
-                    })
-                {
-                    return None;
-                }
-                Some(GrantCredential {
-                    name: &credential.name,
-                    kind: &credential.kind,
-                    endpoint: &credential.endpoint,
-                    secret_key: token.key.as_str(),
-                    scope: &token.scope,
+            .filter(|p| {
+                p.field != SecretField::Value
+                    && !p.slot.starts_with("silo.")
+                    && p.slot
+                        .rsplit_once('.')
+                        .is_some_and(|(prefix, _)| refreshable.contains(prefix))
+            })
+            .map(|p| {
+                Ok(AllowedSecret {
+                    slot: SecretName::new(&p.slot).map_err(|e| error(e.to_string()))?,
+                    key: p.key.clone(),
+                    field: p.field,
+                    backing_scope: p.scope.clone(),
                 })
             })
-            .collect::<Vec<_>>();
-        if !credentials.is_empty() {
+            .collect::<Result<Vec<_>, LibVmError>>()?;
+        if !allowed.is_empty() {
             let store_file = match store.descriptor() {
                 Some(SecretStoreDescriptor::File { store_file }) => store_file,
-                _ => return Err(error("OAuth refresh provider v1 requires a compatible file-store descriptor from the selected secret store".into())),
+                _ => return Err(error("secret provider requires a compatible file-store descriptor from the selected secret store".into())),
             };
             if !provider.command.is_absolute()
                 || provider
@@ -253,16 +234,16 @@ pub(crate) fn resolve_for_start(
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let auth = serde_json::to_vec(&Grant {
-                version: 1,
-                store_file,
-                machine: machine_id.to_string(),
-                run,
-                credentials,
-            })
+            let grant = SecretGrant::issue(
+                &store_file,
+                MachineScopeId::new(machine_id.to_string()).map_err(|e| error(e.to_string()))?,
+                run.into(),
+                allowed,
+            )
             .map_err(|e| error(e.to_string()))?;
+            let auth = serde_json::to_vec(&grant).map_err(|e| error(e.to_string()))?;
             resolved.oauth_refresh_hook = Some(
-                V1RefreshProvider::new(&provider.command, auth)
+                SecretProvider::new(&provider.command, auth)
                     .args(args)
                     .timeout_ms(10000)
                     .refresh_skew_seconds(300),
@@ -332,7 +313,7 @@ mod tests {
             ID.parse::<MachineId>().unwrap(),
             "run-123",
             explicit,
-            Some(&HostCommand::new("/usr/bin/silo").args(["secret", "refresh-oauth"])),
+            Some(&HostCommand::new("/usr/bin/silo").args(["secret", "provide"])),
             "test",
         )
     }
@@ -465,7 +446,7 @@ mod tests {
             put(&store, &SecretScope::Home, key, external_record);
             assert!(!external_home.path().join("machines").exists());
             let command = HostCommand::new("/usr/bin/silo")
-                .args(["secret", "refresh-oauth", "--store-file"])
+                .args(["secret", "provide", "--store-file"])
                 .arg(store.path());
             let configured = runtime
                 .clone()
@@ -488,16 +469,13 @@ mod tests {
                 command.args
             );
             let grant: serde_json::Value = serde_json::from_slice(&hook.auth).unwrap();
-            assert_eq!(
-                grant["store_file"],
-                serde_json::to_value(store.path()).unwrap()
-            );
+            assert_eq!(grant["store"], format!("file:{}", store.path().display()));
             assert_ne!(
-                grant["store_file"],
-                serde_json::to_value(runtime_store.path()).unwrap()
+                grant["store"],
+                format!("file:{}", runtime_store.path().display())
             );
-            assert_eq!(grant["credentials"][0]["scope"], "Home");
-            assert_eq!(grant["credentials"][0]["secret_key"], key);
+            assert_eq!(grant["allowed"][0]["backing_scope"], "Home");
+            assert_eq!(grant["allowed"][0]["key"], key);
             assert_eq!(grant["machine"], config.id.to_string());
             assert_eq!(grant["run"], "external-run");
             assert_eq!(std::fs::read(runtime_store.path()).unwrap(), runtime_before);
@@ -761,7 +739,7 @@ mod tests {
             let hook = resolved.oauth_refresh_hook.unwrap();
             let grant: serde_json::Value = serde_json::from_slice(&hook.auth).unwrap();
             assert_eq!(
-                grant["credentials"][0]["scope"],
+                grant["allowed"][0]["backing_scope"],
                 serde_json::to_value(&scope).unwrap()
             );
             assert_eq!(grant["machine"], ID);
@@ -786,6 +764,76 @@ mod tests {
                 "personal.oauth.access_token"
             );
         }
+    }
+
+    #[test]
+    fn oauth_token_and_expiry_are_inseparable_but_account_override_is_independent() {
+        for scope in [SecretScope::Home, machine()] {
+            for suffix in ["access_token", "expires_at", "account_id"] {
+                let (_dir, store, network) = fixture("openai_codex_oauth");
+                put(&store, &scope, "openai_codex_oauth.personal.oauth", oauth());
+                let raw = if suffix == "expires_at" {
+                    "2026-09-30T00:00:00Z"
+                } else {
+                    "raw"
+                };
+                put(
+                    &store,
+                    &scope,
+                    &format!("personal.oauth.{suffix}"),
+                    plain(raw),
+                );
+                let resolved = resolve(&store, &network, &EgressCredentials::new()).unwrap();
+                if suffix == "account_id" {
+                    let grant: silo_secrets::grant::SecretGrant =
+                        serde_json::from_slice(&resolved.oauth_refresh_hook.unwrap().auth).unwrap();
+                    assert_eq!(grant.allowed.len(), 2);
+                    assert!(grant
+                        .allowed
+                        .iter()
+                        .all(|p| p.slot.as_str() != "personal.oauth.account_id"));
+                    assert_eq!(grant.allowed[0].key, grant.allowed[1].key);
+                    assert_eq!(
+                        grant.allowed[0].backing_scope,
+                        grant.allowed[1].backing_scope
+                    );
+                } else {
+                    assert!(
+                        resolved.oauth_refresh_hook.is_none(),
+                        "raw {suffix} must disable the whole credential's refresh"
+                    );
+                }
+            }
+        }
+        // Pure provenance invariant: even two canonical projections cannot be
+        // refreshed together if an external resolver ever splits their address.
+        let (_dir, store, network) = fixture("openai_codex_oauth");
+        put(
+            &store,
+            &machine(),
+            "openai_codex_oauth.personal.oauth",
+            oauth(),
+        );
+        let mut provenance = resolve(&store, &network, &EgressCredentials::new())
+            .unwrap()
+            .provenance;
+        assert_eq!(
+            crate::secrets::refreshable_oauth_prefixes(&provenance).len(),
+            1
+        );
+        let expiry = provenance
+            .iter_mut()
+            .find(|p| p.field == silo_secrets::SecretField::OAuthExpiresAt)
+            .unwrap();
+        expiry.scope = SecretScope::Home;
+        assert!(crate::secrets::refreshable_oauth_prefixes(&provenance).is_empty());
+        let expiry = provenance
+            .iter_mut()
+            .find(|p| p.field == silo_secrets::SecretField::OAuthExpiresAt)
+            .unwrap();
+        expiry.scope = machine();
+        expiry.key = SecretName::new("openai_codex_oauth.other.oauth").unwrap();
+        assert!(crate::secrets::refreshable_oauth_prefixes(&provenance).is_empty());
     }
 
     #[test]

@@ -70,6 +70,7 @@ type Manager struct {
 	source Source
 
 	oauthMu      sync.Mutex
+	refreshMu    sync.Mutex
 	oauthSecrets map[string]oauthSecret
 }
 
@@ -215,6 +216,8 @@ func (m *Manager) plainSlot(credential *hooks.Credential, slot string, required 
 }
 
 func (m *Manager) currentOAuth(ctx context.Context, credential *hooks.Credential) (oauthSecret, error) {
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
 	secret, err := m.oauthSlot(credential)
 	if err != nil {
 		return oauthSecret{}, err
@@ -228,7 +231,6 @@ func (m *Manager) currentOAuth(ctx context.Context, credential *hooks.Credential
 	skew := defaultOAuthRefreshSkew
 	if source, ok := m.source.(*Static); ok {
 		skew = source.refreshSkew()
-		source.BindCredential(credential)
 	}
 	needsRefresh := !now.Add(skew).Before(expiresAt)
 	if !expired && !needsRefresh {
@@ -239,14 +241,37 @@ func (m *Manager) currentOAuth(ctx context.Context, credential *hooks.Credential
 		reason = "expired"
 	}
 	key := oauthSlotKey(credential.Name)
-	values, err := m.source.Refresh(ctx, []string{key + ".access_token", key + ".expires_at", key + ".account_id"}, reason)
+	names := []string{key + ".access_token", key + ".expires_at", key + ".account_id"}
+	if source, ok := m.source.(*Static); ok {
+		names, err = source.oauthRefreshNames(key)
+		if err != nil {
+			if expired {
+				return oauthSecret{}, err
+			}
+			return secret, nil
+		}
+	}
+	values, err := m.source.Refresh(ctx, names, reason)
 	if err != nil {
 		if expired {
 			return oauthSecret{}, err
 		}
 		return secret, nil
 	}
-	refreshed := oauthSecret{AccessToken: string(values[key+".access_token"]), ExpiresAt: string(values[key+".expires_at"]), AccountID: string(values[key+".account_id"])}
+	refreshed := secret
+	token, hasToken := values[key+".access_token"]
+	expiryValue, hasExpiry := values[key+".expires_at"]
+	if !hasToken || !hasExpiry {
+		if expired {
+			return oauthSecret{}, fmt.Errorf("provider did not return an OAuth token/expiry pair")
+		}
+		return secret, nil
+	}
+	refreshed.AccessToken = string(token)
+	refreshed.ExpiresAt = string(expiryValue)
+	if value, ok := values[key+".account_id"]; ok {
+		refreshed.AccountID = string(value)
+	}
 	if expiry, err := time.Parse(time.RFC3339, refreshed.ExpiresAt); err != nil || !now.Before(expiry) || refreshed.AccessToken == "" {
 		if expired {
 			return oauthSecret{}, fmt.Errorf("oauth refresh hook returned invalid or expired credential")
