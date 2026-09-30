@@ -1,205 +1,129 @@
-use std::collections::BTreeMap;
+use crate::provision::write_file;
+use agent_spec::AgentSshConfig;
+use eyre::Context;
+use russh::keys::PublicKey;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
-use agent_spec::AgentSshAuthorizedUser;
-use eyre::{eyre, Context};
+pub(crate) const CONFIG: &str = "/etc/ssh/silo_sshd_config";
+pub(crate) const CA: &str = "/etc/ssh/silo_ca.pub";
+pub(crate) const HOST_KEY: &str = "/var/lib/silo-agent/ssh/ssh_host_ed25519_key";
 
-use crate::provision::{
-    command_exists, run_command, write_file, ProvisionContext, ProvisionOutcome, Provisioner,
-    ProvisionerId,
-};
-
-const AFTER: &[ProvisionerId] = &[ProvisionerId::USERS];
-
-pub(crate) struct AuthorizedKeys<'a> {
-    authorized_users: &'a [AgentSshAuthorizedUser],
+pub(crate) fn policy(ca: &Path, host: &Path) -> String {
+    // PAM handles account/session policy for provisioned password-locked users;
+    // both password and keyboard-interactive authentication remain disabled.
+    // Command directives are omitted from this Include-free authoritative file:
+    // their disabled defaults render as `none` in -T. Explicit `none` can be
+    // retained as a non-null principal command by OpenSSH's inetd re-exec.
+    format!("HostKey {}\nTrustedUserCAKeys {}\nAuthenticationMethods publickey\nPubkeyAuthentication yes\nPubkeyAcceptedAlgorithms ssh-ed25519-cert-v01@openssh.com\nCASignatureAlgorithms ssh-ed25519\nAuthorizedKeysFile none\nAuthorizedPrincipalsFile none\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nHostbasedAuthentication no\nGSSAPIAuthentication no\nPermitEmptyPasswords no\nUsePAM yes\nPermitRootLogin yes\nAcceptEnv SILO_*\nLogLevel VERBOSE\n", host.display(), ca.display())
 }
 
-impl<'a> Provisioner<'a> for AuthorizedKeys<'a> {
-    type Config = [AgentSshAuthorizedUser];
-
-    fn init(config: &'a Self::Config) -> Self {
-        Self {
-            authorized_users: config,
-        }
-    }
-
-    fn id(&self) -> ProvisionerId {
-        ProvisionerId::SSH_AUTHORIZED_KEYS
-    }
-
-    fn after(&self) -> &[ProvisionerId] {
-        AFTER
-    }
-
-    fn apply(&self, context: &ProvisionContext) -> eyre::Result<ProvisionOutcome> {
-        if self.authorized_users.is_empty() {
-            return Ok(ProvisionOutcome::skipped(
-                "no SSH authorized users configured",
-            ));
-        }
-
-        let users = read_passwd_entries(context)?;
-        let mut installed = Vec::new();
-        let mut missing = Vec::new();
-        let mut no_keys = Vec::new();
-
-        for authorized_user in self.authorized_users {
-            if authorized_user.authorized_keys.is_empty() {
-                no_keys.push(authorized_user.name.clone());
-                continue;
-            }
-
-            let Some(user) = users.get(&authorized_user.name) else {
-                missing.push(authorized_user.name.clone());
-                continue;
-            };
-
-            install_authorized_keys(context, user, &authorized_user.authorized_keys)?;
-            installed.push(authorized_user.name.clone());
-        }
-
-        if installed.is_empty() {
-            let mut reasons = Vec::new();
-            if !missing.is_empty() {
-                reasons.push(format!("missing users: {}", missing.join(", ")));
-            }
-            if !no_keys.is_empty() {
-                reasons.push(format!("users without keys: {}", no_keys.join(", ")));
-            }
-            let message = if reasons.is_empty() {
-                "no SSH authorized keys configured".to_string()
-            } else {
-                reasons.join("; ")
-            };
-            return Ok(ProvisionOutcome::skipped(message));
-        }
-
-        let mut message = format!("installed SSH authorized keys for {}", installed.join(", "));
-        if !missing.is_empty() {
-            message.push_str(&format!("; skipped missing users: {}", missing.join(", ")));
-        }
-        if !no_keys.is_empty() {
-            message.push_str(&format!(
-                "; skipped users without keys: {}",
-                no_keys.join(", ")
-            ));
-        }
-
-        Ok(ProvisionOutcome::Succeeded {
-            changed: true,
-            message,
-        })
-    }
+pub(crate) fn systemd_override(config: &Path, inetd: bool) -> String {
+    let mode = if inetd { "-i" } else { "-D" };
+    format!("[Service]\nExecStartPre=\nExecStartPre=/usr/sbin/sshd -t -f {}\nExecStart=\nExecStart=/usr/sbin/sshd {mode} -f {}\n", config.display(), config.display())
 }
 
-fn install_authorized_keys(
-    context: &ProvisionContext,
-    user: &PasswdEntry,
-    authorized_keys: &[String],
-) -> eyre::Result<()> {
-    let ssh_dir = context.guest_path(&format!("{}/.ssh", user.home));
-    fs::create_dir_all(&ssh_dir).with_context(|| format!("create {}", ssh_dir.display()))?;
-    fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("set permissions on {}", ssh_dir.display()))?;
+pub(crate) fn prepare(config: &AgentSshConfig) -> eyre::Result<()> {
+    prepare_at(config, Path::new("/"))
+}
 
-    let mut keys = authorized_keys.join("\n");
-    keys.push('\n');
-    write_file(&ssh_dir.join("authorized_keys"), keys, 0o600)?;
-
-    if command_exists("chown") {
-        let owner = format!("{}:{}", user.uid, user.gid);
-        let path = ssh_dir.to_string_lossy().to_string();
-        run_command(
-            context.process_supervisor(),
-            "chown",
-            ["-R", owner.as_str(), path.as_str()],
+fn prepare_at(config: &AgentSshConfig, root: &Path) -> eyre::Result<()> {
+    if config
+        .trusted_ca
+        .as_deref()
+        .is_some_and(|ca| ca.trim().contains(['\n', '\r']))
+    {
+        eyre::bail!("SSH CA trust must contain exactly one public key line");
+    }
+    let ca = PublicKey::from_openssh(
+        config
+            .trusted_ca
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("missing mandatory SSH CA trust; recreate this machine"))?,
+    )
+    .context("parse SSH CA trust")?;
+    if ca.algorithm() != russh::keys::ssh_key::Algorithm::Ed25519 {
+        eyre::bail!("SSH CA trust must be Ed25519");
+    }
+    let line = ca.to_openssh()?;
+    let ca_path = root.join(&CA[1..]);
+    let host_path = root.join(&HOST_KEY[1..]);
+    let config_path = root.join(&CONFIG[1..]);
+    fs::create_dir_all(root.join("etc/ssh"))?;
+    write_file(&ca_path, format!("{line}\n"), 0o644)?;
+    crate::ssh::agent::persistent_host_key(&host_path)?;
+    write_file(&config_path, policy(&ca_path, &host_path), 0o600)?;
+    // Install before handing PID1 to systemd, so its generated socket services
+    // cannot start a connection handler with image-owned authentication rules.
+    for unit in [
+        "sshd-vsock@.service",
+        "sshd-vsock.service",
+        "sshd.service",
+        "ssh.service",
+    ] {
+        let dir = root.join("run/systemd/system").join(format!("{unit}.d"));
+        fs::create_dir_all(&dir)?;
+        write_file(
+            &dir.join("00-silo-ca.conf"),
+            systemd_override(&config_path, unit.starts_with("sshd-vsock")),
+            0o644,
         )?;
     }
-
-    tracing::info!(user = %user.name, "reconciled SSH authorized keys");
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PasswdEntry {
-    name: String,
-    uid: u32,
-    gid: u32,
-    home: String,
+pub(crate) fn verify_trust(config: &AgentSshConfig) -> eyre::Result<()> {
+    verify_at(config, Path::new("/"))
 }
 
-fn read_passwd_entries(context: &ProvisionContext) -> eyre::Result<BTreeMap<String, PasswdEntry>> {
-    let passwd_path = context.guest_path("/etc/passwd");
-    let contents = fs::read_to_string(&passwd_path)
-        .with_context(|| format!("read {}", passwd_path.display()))?;
-
-    let mut entries = BTreeMap::new();
-    for line in contents.lines() {
-        let Some(entry) = parse_passwd_entry(line)? else {
-            continue;
-        };
-        entries.insert(entry.name.clone(), entry);
+fn verify_at(config: &AgentSshConfig, root: &Path) -> eyre::Result<()> {
+    let expected = PublicKey::from_openssh(
+        config
+            .trusted_ca
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("missing mandatory SSH CA trust"))?,
+    )?;
+    let ca_path = root.join(&CA[1..]);
+    let host_path = root.join(&HOST_KEY[1..]);
+    let config_path = root.join(&CONFIG[1..]);
+    let actual = PublicKey::from_openssh(&fs::read_to_string(&ca_path)?)?;
+    if actual.key_data() != expected.key_data() {
+        eyre::bail!("SSH CA trust changed during provisioning");
     }
-    Ok(entries)
-}
-
-fn parse_passwd_entry(line: &str) -> eyre::Result<Option<PasswdEntry>> {
-    if line.trim().is_empty() || line.starts_with('#') {
-        return Ok(None);
+    if fs::read_to_string(config_path)? != policy(&ca_path, &host_path) {
+        eyre::bail!("SSH policy changed during provisioning");
     }
-
-    let mut fields = line.split(':');
-    let name = fields
-        .next()
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| eyre!("malformed passwd entry: missing name"))?;
-    let _password = fields.next();
-    let uid = fields
-        .next()
-        .ok_or_else(|| eyre!("malformed passwd entry for {name}: missing uid"))?
-        .parse::<u32>()
-        .with_context(|| format!("parse uid for user {name}"))?;
-    let gid = fields
-        .next()
-        .ok_or_else(|| eyre!("malformed passwd entry for {name}: missing gid"))?
-        .parse::<u32>()
-        .with_context(|| format!("parse gid for user {name}"))?;
-    let _gecos = fields.next();
-    let home = fields
-        .next()
-        .filter(|home| !home.is_empty())
-        .ok_or_else(|| eyre!("malformed passwd entry for {name}: missing home"))?;
-
-    Ok(Some(PasswdEntry {
-        name: name.to_string(),
-        uid,
-        gid,
-        home: home.to_string(),
-    }))
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::provision::ssh::parse_passwd_entry;
-
+    use crate::provision::ssh::{prepare_at, verify_at, CONFIG, HOST_KEY};
+    use agent_spec::AgentSshConfig;
+    use russh::keys::ssh_key::{private::Ed25519Keypair, PrivateKey};
     #[test]
-    fn parses_passwd_entry() {
-        let entry = parse_passwd_entry("root:x:0:0:root:/root:/bin/sh")
-            .expect("parse passwd")
-            .expect("entry");
-
-        assert_eq!(entry.name, "root");
-        assert_eq!(entry.uid, 0);
-        assert_eq!(entry.gid, 0);
-        assert_eq!(entry.home, "/root");
-    }
-
-    #[test]
-    fn skips_comment_passwd_entry() {
-        assert!(parse_passwd_entry("# nope")
-            .expect("parse passwd")
-            .is_none());
+    fn trust_is_mandatory_idempotent_and_userdata_changes_are_fatal() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(prepare_at(&AgentSshConfig::default(), root.path()).is_err());
+        assert!(!root.path().join("etc/ssh").exists());
+        let key = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
+        let config = AgentSshConfig {
+            trusted_ca: Some(key.public_key().to_openssh().unwrap()),
+        };
+        let stale = root.path().join("home/silo/.ssh/authorized_keys");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, "user-owned-keys").unwrap();
+        prepare_at(&config, root.path()).unwrap();
+        let host = root.path().join(&HOST_KEY[1..]);
+        let before = std::fs::read(&host).unwrap();
+        prepare_at(&config, root.path()).unwrap();
+        verify_at(&config, root.path()).unwrap();
+        assert_eq!(before, std::fs::read(&host).unwrap());
+        assert_eq!(std::fs::read(&stale).unwrap(), b"user-owned-keys");
+        std::fs::write(root.path().join(&CONFIG[1..]), "PasswordAuthentication yes").unwrap();
+        assert!(verify_at(&config, root.path()).is_err());
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join("etc"), "not a directory").unwrap();
+        assert!(prepare_at(&config, broken.path()).is_err());
     }
 }

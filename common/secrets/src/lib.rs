@@ -249,6 +249,24 @@ pub enum SecretStoreDescriptor {
 }
 
 pub trait SecretStore: Send + Sync + fmt::Debug {
+    /// Initialize a newly allocated resource's scope, atomically rechecking any
+    /// existing material. Ordinary reads never create missing machine scopes.
+    fn initialize_scope(
+        &self,
+        scope: &SecretScope,
+        operation: &mut dyn FnMut(&mut dyn SecretScopeTransaction) -> Result<(), SecretError>,
+    ) -> Result<(), SecretError> {
+        self.update_scope(scope, operation)
+    }
+    /// Run an atomic scope operation. Errors discard changes; implementations
+    /// must serialize this with ordinary reads, writes, and scope deletion.
+    fn update_scope(
+        &self,
+        _scope: &SecretScope,
+        _operation: &mut dyn FnMut(&mut dyn SecretScopeTransaction) -> Result<(), SecretError>,
+    ) -> Result<(), SecretError> {
+        Err(SecretError::Unsupported)
+    }
     /// Returns the actual provider address, rather than a runtime-home default.
     /// External stores can leave this unset until their provider protocol exists.
     fn descriptor(&self) -> Option<SecretStoreDescriptor> {
@@ -267,6 +285,11 @@ pub trait SecretStore: Send + Sync + fmt::Debug {
     fn list_scopes(&self) -> Result<Vec<SecretScope>, SecretError> {
         Err(SecretError::Unsupported)
     }
+}
+
+pub trait SecretScopeTransaction {
+    fn get(&self, name: &SecretName) -> Result<Option<Secret>, SecretError>;
+    fn put(&mut self, name: &SecretName, secret: Secret) -> Result<(), SecretError>;
 }
 
 /// Disk values remain strings, matching the original CLI format. Non-UTF-8 puts
@@ -512,6 +535,23 @@ impl ScopeTransaction {
 }
 
 impl SecretStore for FileStore {
+    fn initialize_scope(
+        &self,
+        scope: &SecretScope,
+        operation: &mut dyn FnMut(&mut dyn SecretScopeTransaction) -> Result<(), SecretError>,
+    ) -> Result<(), SecretError> {
+        let path = self.scope_path(scope);
+        let parent = path.parent().ok_or(SecretError::NotFound)?;
+        secure_directory(parent)?;
+        self.update_scope(scope, operation)
+    }
+    fn update_scope(
+        &self,
+        scope: &SecretScope,
+        operation: &mut dyn FnMut(&mut dyn SecretScopeTransaction) -> Result<(), SecretError>,
+    ) -> Result<(), SecretError> {
+        self.transaction(scope, |tx| operation(tx))
+    }
     fn descriptor(&self) -> Option<SecretStoreDescriptor> {
         Some(SecretStoreDescriptor::File {
             store_file: self.home_file.clone(),
@@ -569,6 +609,15 @@ impl SecretStore for FileStore {
         }
         scopes.sort_by_key(|scope| self.scope_path(scope));
         Ok(scopes)
+    }
+}
+
+impl SecretScopeTransaction for ScopeTransaction {
+    fn get(&self, name: &SecretName) -> Result<Option<Secret>, SecretError> {
+        ScopeTransaction::get(self, name)
+    }
+    fn put(&mut self, name: &SecretName, secret: Secret) -> Result<(), SecretError> {
+        ScopeTransaction::put(self, name, secret)
     }
 }
 

@@ -25,12 +25,6 @@ pub(crate) const DEFAULT_HOST_LOCALE: &str = "en_US.UTF-8";
 pub(crate) const GUEST_CERTIFICATE_AUTHORITY_PATH: &str =
     "/usr/local/share/ca-certificates/silo-ca.crt";
 
-/// Private SSH key filename used for Silo guest login credentials.
-pub(crate) const GUEST_SSH_PRIVATE_KEY_FILE_NAME: &str = "id_ed25519";
-
-/// Public SSH key filename used for Silo guest login credentials.
-pub(crate) const GUEST_SSH_PUBLIC_KEY_FILE_NAME: &str = "id_ed25519.pub";
-
 /// Default shell assigned to the provisioned guest user.
 pub(crate) const GUEST_USER_SHELL: &str = "/bin/bash";
 

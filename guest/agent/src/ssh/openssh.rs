@@ -131,13 +131,20 @@ pub(crate) async fn wait_ready(process_supervisor: &ProcessSupervisor) -> eyre::
     loop {
         let process_supervisor = process_supervisor.clone();
         let output = tokio::task::spawn_blocking(move || {
-            process_supervisor.output(OPENSSH_SERVER_PATH, ["-t"])
+            process_supervisor.output(
+                OPENSSH_SERVER_PATH,
+                ["-t", "-f", crate::provision::ssh::CONFIG],
+            )
         })
         .await
         .context("join OpenSSH readiness check task")?;
 
         match output {
             Ok(output) if output.status.success() => {
+                verify_effective_config(
+                    Path::new(OPENSSH_SERVER_PATH),
+                    Path::new(crate::provision::ssh::CONFIG),
+                )?;
                 tracing::info!(
                     elapsed_ms = started.elapsed().as_millis(),
                     "OpenSSH server is ready"
@@ -174,6 +181,90 @@ pub(crate) async fn wait_ready(process_supervisor: &ProcessSupervisor) -> eyre::
     }
 }
 
+pub(crate) fn verify_effective_config(sshd: &Path, config: &Path) -> eyre::Result<()> {
+    let output = StdCommand::new(sshd)
+        .arg("-T")
+        .arg("-f")
+        .arg(config)
+        .output()?;
+    if !output.status.success() {
+        eyre::bail!(
+            "sshd effective configuration check failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let effective = String::from_utf8(output.stdout)?;
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "authenticationmethods publickey",
+        "pubkeyauthentication yes",
+        "pubkeyacceptedalgorithms ssh-ed25519-cert-v01@openssh.com",
+        "casignaturealgorithms ssh-ed25519",
+        "authorizedkeysfile none",
+        "authorizedkeyscommand none",
+        "authorizedprincipalsfile none",
+        "authorizedprincipalscommand none",
+        "passwordauthentication no",
+        "kbdinteractiveauthentication no",
+        "hostbasedauthentication no",
+        "gssapiauthentication no",
+        "permitemptypasswords no",
+        "loglevel VERBOSE",
+        "acceptenv SILO_*",
+    ] {
+        if !effective
+            .lines()
+            .any(|line| line.trim().eq_ignore_ascii_case(expected))
+        {
+            // OpenSSH 10.5 omits an empty authorized-key path list from -T.
+            if expected == "authorizedkeysfile none"
+                && !effective.lines().any(|line| {
+                    line.split_whitespace()
+                        .next()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("authorizedkeysfile"))
+                })
+            {
+                continue;
+            }
+            // A build without GSSAPI has no such authentication mechanism.
+            if expected == "gssapiauthentication no"
+                && diagnostics.contains("Unsupported option GSSAPIAuthentication")
+            {
+                continue;
+            }
+            eyre::bail!("sshd does not enforce {expected}");
+        }
+    }
+    for directive in ["trustedusercakeys", "hostkey"] {
+        let configured = std::fs::read_to_string(config)?;
+        let desired = configured
+            .lines()
+            .find(|line| {
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(directive))
+            })
+            .ok_or_else(|| eyre::eyre!("missing {directive}"))?;
+        let values: Vec<_> = effective
+            .lines()
+            .filter(|line| {
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(directive))
+            })
+            .collect();
+        if values.len() != 1
+            || values[0]
+                .split_whitespace()
+                .skip(1)
+                .ne(desired.split_whitespace().skip(1))
+        {
+            eyre::bail!("sshd has unexpected {directive}");
+        }
+    }
+    Ok(())
+}
+
 fn command_stream_for_log(value: &[u8]) -> String {
     let value = String::from_utf8_lossy(value).trim().to_string();
     if value.is_empty() {
@@ -205,7 +296,7 @@ async fn handle_connection_async(stream: VsockStream) -> io::Result<()> {
     let sshd_stdout = stream.as_fd().try_clone_to_owned()?;
 
     let mut child = TokioCommand::new(OPENSSH_SERVER_PATH)
-        .arg("-i")
+        .args(["-i", "-f", crate::provision::ssh::CONFIG])
         .stdin(Stdio::from(sshd_stdin))
         .stdout(Stdio::from(sshd_stdout))
         .stderr(Stdio::piped())
@@ -241,7 +332,7 @@ fn handle_connection_blocking(
 
     let mut command = StdCommand::new(OPENSSH_SERVER_PATH);
     command
-        .arg("-i")
+        .args(["-i", "-f", crate::provision::ssh::CONFIG])
         .stdin(Stdio::from(sshd_stdin))
         .stdout(Stdio::from(sshd_stdout))
         .stderr(Stdio::piped());
@@ -401,5 +492,140 @@ mod tests {
             .expect_err("non-directory must fail");
 
         assert!(err.to_string().contains("directory"));
+    }
+
+    #[tokio::test]
+    async fn real_sshd_inetd_is_ca_only_and_ignores_stale_authorized_key() {
+        use crate::ssh::agent::tests::{certificate, Client};
+        use russh::keys::ssh_key::{private::Ed25519Keypair, LineEnding, PrivateKey};
+        use std::process::Stdio;
+        use std::sync::Arc;
+        let sshd = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("sshd"))
+            .find(|path| path.is_file());
+        let Some(sshd) = sshd else {
+            eprintln!("SKIPPED real sshd authentication: sshd binary unavailable");
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let ca = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
+        let host = PrivateKey::from(Ed25519Keypair::from_seed(&[5; 32]));
+        let ca_path = home.path().join("ca.pub");
+        let host_path = home.path().join("host");
+        std::fs::write(&ca_path, ca.public_key().to_openssh().unwrap()).unwrap();
+        host.write_openssh_file(&host_path, LineEnding::LF).unwrap();
+        let config = home.path().join("sshd_config");
+        // PAM account checks need the guest's root-owned PAM service and shadow
+        // database. This unprivileged host fixture exercises the identical
+        // credential policy with account management disabled for its own UID.
+        std::fs::write(
+            &config,
+            crate::provision::ssh::policy(&ca_path, &host_path).replace("UsePAM yes", "UsePAM no"),
+        )
+        .unwrap();
+        crate::ssh::openssh::verify_effective_config(&sshd, &config).unwrap();
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap()
+            .name;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (key, cert) = certificate(&ca, &user, now - 60, now + 300, false, false);
+        let stale = home.path().join("authorized_keys");
+        std::fs::write(&stale, key.public_key().to_openssh().unwrap()).unwrap();
+
+        async fn connect(
+            sshd: &std::path::Path,
+            config: &std::path::Path,
+            host: &PrivateKey,
+            overrides: &[String],
+        ) -> (russh::client::Handle<Client>, tokio::process::Child) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            let mut command = tokio::process::Command::new(sshd);
+            command
+                .arg("-i")
+                .arg("-e")
+                .arg("-f")
+                .arg(config)
+                .args(overrides)
+                .stdin(Stdio::from(std::os::fd::OwnedFd::from(
+                    server.try_clone().unwrap(),
+                )))
+                .stdout(Stdio::from(std::os::fd::OwnedFd::from(server)))
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let mut child = command.spawn().unwrap();
+            client.set_nonblocking(true).unwrap();
+            let stream = tokio::net::TcpStream::from_std(client).unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                russh::client::connect_stream(
+                    Arc::new(Default::default()),
+                    stream,
+                    Client {
+                        key: host.public_key().clone(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            match result {
+                Ok(client) => (client, child),
+                Err(error) => {
+                    use tokio::io::AsyncReadExt;
+                    let _ = child.kill().await;
+                    let mut stderr = String::new();
+                    child
+                        .stderr
+                        .take()
+                        .unwrap()
+                        .read_to_string(&mut stderr)
+                        .await
+                        .unwrap();
+                    panic!("sshd handshake failed: {error}; {stderr}");
+                }
+            }
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let (mut client, mut child) = connect(&sshd, &config, &host, &[]).await;
+            assert!(!client.authenticate_none(&user).await.unwrap().success());
+            assert!(!client.authenticate_password(&user, "not-a-password").await.unwrap().success());
+            assert!(!client.authenticate_publickey(&user, russh::keys::PrivateKeyWithHashAlg::new(key.clone(), None)).await.unwrap().success());
+            if !client.authenticate_openssh_cert(&user, key.clone(), cert).await.unwrap().success() {
+                let _ = client.disconnect(russh::Disconnect::ByApplication, "rejected", "en").await;
+                drop(client);
+                let _ = child.kill().await;
+                let output = child.wait_with_output().await.unwrap();
+                panic!("certificate rejected: {}", String::from_utf8_lossy(&output.stderr));
+            }
+            client.disconnect(russh::Disconnect::ByApplication, "done", "en").await.unwrap();
+            let output = child.wait_with_output().await.unwrap();
+            let log = String::from_utf8_lossy(&output.stderr);
+            assert!(log.contains("silo:cli:uid1000:test") && log.contains("CA ED25519"), "{log}");
+
+            let overrides = vec!["-o".into(), format!("AuthorizedKeysFile={}", stale.display()), "-o".into(), "PubkeyAcceptedAlgorithms=ssh-ed25519".into(), "-o".into(), "StrictModes=no".into()];
+            let (mut control, _child) = connect(&sshd, &config, &host, &overrides).await;
+            assert!(control.authenticate_publickey(&user, russh::keys::PrivateKeyWithHashAlg::new(key.clone(), None)).await.unwrap().success(), "stale-key control must authenticate to prove account eligibility");
+            control.disconnect(russh::Disconnect::ByApplication, "done", "en").await.unwrap();
+            let other = PrivateKey::from(Ed25519Keypair::from_seed(&[4; 32]));
+            for (signer, principal, after, before, host_type, critical) in [
+                (&ca, user.as_str(), now - 400, now - 1, false, false),
+                (&ca, user.as_str(), now + 60, now + 300, false, false),
+                (&ca, "wrong-principal", now - 60, now + 300, false, false),
+                (&other, user.as_str(), now - 60, now + 300, false, false),
+                (&ca, user.as_str(), now - 60, now + 300, true, false),
+                (&ca, user.as_str(), now - 60, now + 300, false, true),
+            ] {
+                let (key, cert) = certificate(signer, principal, after, before, host_type, critical);
+                let (mut client, _child) = connect(&sshd, &config, &host, &[]).await;
+                assert!(!client.authenticate_openssh_cert(&user, key, cert).await.unwrap().success(), "invalid certificate accepted: {principal} {after} {before} {host_type} {critical}");
+                client.disconnect(russh::Disconnect::ByApplication, "done", "en").await.unwrap();
+            }
+        }).await.expect("bounded real sshd authentication");
     }
 }

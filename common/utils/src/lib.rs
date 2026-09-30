@@ -1,5 +1,6 @@
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
+pub mod ssh;
 
 const BYTES_PER_MB: u64 = 1_000_000;
 const BYTES_PER_GB: u64 = 1_000_000_000;

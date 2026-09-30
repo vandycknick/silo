@@ -340,6 +340,7 @@ impl EgressCredentials {
             credentials: self,
             oauth_refresh_hook: Some(hook),
             provenance: Vec::new(),
+            ..Default::default()
         }
     }
 

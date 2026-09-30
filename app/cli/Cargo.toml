@@ -13,6 +13,7 @@ name = "silo"
 path = "bin/main.rs"
 
 [dependencies]
+ssh-key = { version = "0.7.0-rc.11", default-features = false, features = ["ed25519", "std"] }
 secrets = { path = "../../common/secrets" }
 silod-spec = { path = "../../specs/silod-spec" }
 libvm = { path = "../../runtime/libvm" }

@@ -71,6 +71,14 @@ fn print_human(view: &MachineView) -> eyre::Result<()> {
     if !view.image.is_empty() {
         rows.push(("Image".to_string(), view.image.clone()));
     }
+    let pin = view.dir.join("ssh/known_host");
+    if pin.exists() {
+        let key = ssh_key::PublicKey::from_openssh(&std::fs::read_to_string(pin)?)?;
+        rows.push((
+            "SSH host key".into(),
+            key.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
+        ));
+    }
     rows.push(("Process".to_string(), process_summary(&view.process)));
     rows.push((
         "Rootfs".to_string(),

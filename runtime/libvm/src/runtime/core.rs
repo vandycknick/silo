@@ -214,6 +214,10 @@ impl Runtime {
         self.secret_store.as_ref()
     }
 
+    pub(crate) fn secret_store_arc(&self) -> Arc<dyn silo_secrets::SecretStore> {
+        Arc::clone(&self.secret_store)
+    }
+
     pub(crate) fn resolve_secrets(
         &self,
         config: &MachineConfig,
@@ -229,6 +233,27 @@ impl Runtime {
             self.secret_provider.as_ref(),
             &config.name,
         )
+    }
+
+    pub(crate) fn resolve_machine_secrets(
+        &self,
+        config: &MachineConfig,
+        run_id: &str,
+        explicit: &EgressCredentials,
+    ) -> Result<crate::secrets::ResolvedSecrets, LibVmError> {
+        let mut resolved = self.resolve_secrets(config, run_id, explicit)?;
+        let pair =
+            crate::ssh_ca::resolve(self.secret_store(), config.id, false).map_err(|error| {
+                LibVmError::MachinePreparationFailed {
+                    reference: config.name.clone(),
+                    message: format!("resolve machine SSH CA: {error}"),
+                }
+            })?;
+        resolved.ssh_trusted_ca = Some(pair.public);
+        resolved
+            .infrastructure
+            .push((crate::ssh_ca::PRIVATE.into(), pair.private));
+        Ok(resolved)
     }
 
     /// Returns the local image directory.
@@ -267,10 +292,6 @@ impl Runtime {
     pub(crate) fn without_image_progress(mut self) -> Self {
         self.image_progress = None;
         self
-    }
-
-    pub(crate) fn load_guest_ssh_keypair(&self) -> eyre::Result<crate::host::SshKeyPair> {
-        guest_agent::load_or_generate_guest_ssh_keypair(&self.paths)
     }
 
     pub(crate) fn local_paths(&self) -> &LocalPaths {
@@ -1203,6 +1224,7 @@ impl Runtime {
         config: &MachineConfig,
         network: &VmmNetworkAttachment,
         resize_rootfs: bool,
+        ssh_trusted_ca: &str,
     ) -> Result<crate::supervisor::VmmLaunchInputs, LibVmError> {
         let prepare = || -> eyre::Result<crate::supervisor::VmmLaunchInputs> {
             let rosetta_intent = self
@@ -1231,6 +1253,7 @@ impl Runtime {
                     networking: &self.networking,
                     resize_rootfs,
                     user: config.guest.user.as_ref(),
+                    ssh_trusted_ca,
                 })?;
                 agent_config.validate().context("validate agent config")?;
                 let serialized =
@@ -1429,60 +1452,92 @@ impl Runtime {
             }
             issues.push(MachineIssue::new(MachineIssueComponent::Network, error));
         }
-        let (status, boot_report, provision_report) =
-            if runtime_status.is_running() && observation == MachineObservation::Observed {
-                match self.supervisor.client(config.id).status().await {
-                    Ok(response) => {
-                        let (boot_report, provision_report) = response
+        let (status, boot_report, provision_report) = if runtime_status.is_running()
+            && observation == MachineObservation::Observed
+        {
+            match self.supervisor.client(config.id).status().await {
+                Ok(mut response) => {
+                    let listener =
+                        response
                             .agent
                             .as_ref()
                             .and_then(|agent| match agent.mode.as_ref() {
                                 Some(protocol::v1::host_agent::Mode::Enabled(enabled)) => enabled
                                     .status
                                     .as_ref()
-                                    .and_then(|status| status.report.as_ref()),
+                                    .and_then(|status| status.report.as_ref())
+                                    .and_then(|report| report.ssh.as_ref()),
                                 _ => None,
-                            })
-                            .map(|report| {
-                                (
-                                    report
-                                        .boot
-                                        .clone()
-                                        .map(crate::machine::MachineBootReport::from_protocol),
-                                    report
-                                        .provisioning
-                                        .clone()
-                                        .map(crate::machine::MachineProvisionReport::from_protocol),
-                                )
-                            })
-                            .unwrap_or((None, None));
-                        (
-                            MachineStatus::from_protocol(response),
-                            boot_report,
-                            provision_report,
-                        )
+                            });
+                    if let Some(listener) = listener {
+                        if listener.config_verified && listener.kex_verified {
+                            let pin = ssh_key::PublicKey::from_openssh(&listener.host_public_key)
+                                .map_err(eyre::Report::from)
+                                .and_then(|key| {
+                                    utils::ssh::verify_host_key_pin(&config.machine_dir, &key)
+                                        .map_err(eyre::Report::from)
+                                });
+                            if let Err(error) = pin {
+                                issues.push(MachineIssue::new(
+                                    MachineIssueComponent::Telemetry,
+                                    format!("SSH host key verification: {error}"),
+                                ));
+                                if let Some(readiness) = response.readiness.as_mut() {
+                                    readiness.ready = Some(false);
+                                }
+                            }
+                        }
                     }
-                    Err(message) => {
-                        issues.push(MachineIssue::new(
-                            MachineIssueComponent::Telemetry,
-                            &message,
-                        ));
-                        (
-                            MachineStatus::running_with_message(format!(
-                                "silo-vmm get_status failed: {message}"
-                            )),
-                            None,
-                            None,
-                        )
-                    }
+                    let (boot_report, provision_report) = response
+                        .agent
+                        .as_ref()
+                        .and_then(|agent| match agent.mode.as_ref() {
+                            Some(protocol::v1::host_agent::Mode::Enabled(enabled)) => enabled
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.report.as_ref()),
+                            _ => None,
+                        })
+                        .map(|report| {
+                            (
+                                report
+                                    .boot
+                                    .clone()
+                                    .map(crate::machine::MachineBootReport::from_protocol),
+                                report
+                                    .provisioning
+                                    .clone()
+                                    .map(crate::machine::MachineProvisionReport::from_protocol),
+                            )
+                        })
+                        .unwrap_or((None, None));
+                    (
+                        MachineStatus::from_protocol(response),
+                        boot_report,
+                        provision_report,
+                    )
                 }
-            } else {
-                (
-                    MachineStatus::from_machine_state(state.status, state.last_error.clone()),
-                    None,
-                    None,
-                )
-            };
+                Err(message) => {
+                    issues.push(MachineIssue::new(
+                        MachineIssueComponent::Telemetry,
+                        &message,
+                    ));
+                    (
+                        MachineStatus::running_with_message(format!(
+                            "silo-vmm get_status failed: {message}"
+                        )),
+                        None,
+                        None,
+                    )
+                }
+            }
+        } else {
+            (
+                MachineStatus::from_machine_state(state.status, state.last_error.clone()),
+                None,
+                None,
+            )
+        };
 
         let rootfs = match self.store.machine_rootfs(config.id).await {
             Ok(rootfs) => rootfs,
@@ -2117,7 +2172,12 @@ mod tests {
         };
 
         let error = runtime
-            .prepare_vmm_launch_inputs(&config, &crate::network::VmmNetworkAttachment::None, false)
+            .prepare_vmm_launch_inputs(
+                &config,
+                &crate::network::VmmNetworkAttachment::None,
+                false,
+                "",
+            )
             .expect_err("reject ineligible durable contract");
         assert!(error.to_string().contains("installed default guest agent"));
         assert!(!error.to_string().contains("kernel"));
@@ -5423,6 +5483,7 @@ mod tests {
             .local_paths()
             .create_machine_data_dir(id)
             .expect("create owned machine data root");
+        crate::ssh_ca::resolve(runtime.secret_store(), id, true).expect("create test machine CA");
         std::fs::write(config.machine_dir.join("data.txt"), b"machine data")
             .expect("write machine data");
         runtime

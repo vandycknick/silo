@@ -612,6 +612,22 @@ fn validate_identity(identity: &AgentIdentity) -> Result<(), StoreError> {
 }
 
 fn validate_status_report(report: &AgentStatusReport) -> Result<(), StoreError> {
+    if let Some(ssh) = &report.ssh {
+        if !matches!(
+            ssh.backend.as_str(),
+            "native" | "openssh" | "systemd-openssh"
+        ) || ssh.port != 22
+            || !ssh.config_verified
+            || russh::keys::PublicKey::from_openssh(&ssh.host_public_key).is_err()
+        {
+            return Err(invalid("invalid SSH listener descriptor"));
+        }
+        if report.state == Some(AgentStatusState::Ready as i32) && !ssh.kex_verified {
+            return Err(invalid(
+                "SSH listener has not completed host-origin KEX verification",
+            ));
+        }
+    }
     validate_timestamp("status.observed_at", report.observed_at.as_ref())?;
     let state = required_enum::<AgentStatusState>("status.state", report.state)?;
     optional("status.code", &report.code, protocol::MAX_CODE_BYTES)?;
@@ -1210,6 +1226,29 @@ mod tests {
                 ..AgentStatusReport::default()
             }),
         }
+    }
+
+    #[test]
+    fn ssh_readiness_requires_valid_configuration_and_actual_kex() {
+        let mut report = ready_status("test").report.unwrap();
+        let key = russh::keys::PrivateKey::from(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[1; 32]),
+        );
+        report.ssh = Some(protocol::v1::SshListenerReport {
+            backend: "native".into(),
+            port: 22,
+            host_public_key: key.public_key().to_openssh().unwrap(),
+            config_verified: true,
+            kex_verified: false,
+        });
+        assert!(crate::state::validate_status_report(&report).is_err());
+        report.state = Some(AgentStatusState::Starting as i32);
+        assert!(crate::state::validate_status_report(&report).is_ok());
+        report.ssh.as_mut().unwrap().kex_verified = true;
+        report.state = Some(AgentStatusState::Ready as i32);
+        assert!(crate::state::validate_status_report(&report).is_ok());
+        report.ssh.as_mut().unwrap().host_public_key = "corrupt".into();
+        assert!(crate::state::validate_status_report(&report).is_err());
     }
 
     fn logged_snapshot(store: &InstanceStore) -> StateLogSnapshot {
