@@ -224,7 +224,7 @@ func TestLoadPolicyUsesDefaultPolicyWithoutHash(t *testing.T) {
 	}
 }
 
-func TestLoadPolicyRequiresTLSCAForHTTPSEndpoints(t *testing.T) {
+func TestLoadPolicyDefersHTTPSCAValidationToSession(t *testing.T) {
 	dir := t.TempDir()
 	policyPath := filepath.Join(dir, "policy.json")
 	writeConfigPolicy(t, policyPath, `
@@ -248,12 +248,12 @@ func TestLoadPolicyRequiresTLSCAForHTTPSEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = LoadPolicy(cfg)
-	if err == nil {
-		t.Fatal("expected missing CA material to be rejected")
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestLoadPolicyRequiresTLSCAForRegistryEndpoints(t *testing.T) {
+func TestLoadPolicyDefersRegistryCAValidationToSession(t *testing.T) {
 	dir := t.TempDir()
 	policyPath := filepath.Join(dir, "policy.json")
 	writeConfigPolicy(t, policyPath, `
@@ -279,8 +279,8 @@ func TestLoadPolicyRequiresTLSCAForRegistryEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadPolicy(cfg); err == nil {
-		t.Fatal("expected missing CA material to be rejected")
+	if _, err := LoadPolicy(cfg); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -303,8 +303,6 @@ func TestLoadPolicyDoesNotRequireSecretStoreForCredentials(t *testing.T) {
 	cfg, err := Parse(append(configArgs(t),
 		"--policy-file", policyPath,
 		"--secrets-fd", "7",
-		"--tls-ca-cert", filepath.Join(dir, "ca.pem"),
-		"--tls-ca-key", filepath.Join(dir, "ca-key.pem"),
 	))
 	if err != nil {
 		t.Fatal(err)

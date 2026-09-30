@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -37,11 +38,11 @@ type HTTPSProxy struct {
 	upstreamRootCAs   *x509.CertPool
 }
 
-func NewHTTPSProxy(route *router.Router, certPath string, keyPath string, manager *credentials.Manager) (*HTTPSProxy, error) {
+func NewHTTPSProxy(route *router.Router, source credentials.Source, manager *credentials.Manager) (*HTTPSProxy, error) {
 	if route == nil || !route.HasHTTPS() {
 		return nil, nil
 	}
-	ca, err := LoadCertificateAuthority(certPath, keyPath)
+	ca, err := LoadCertificateAuthority(source)
 	if err != nil {
 		return nil, err
 	}
@@ -367,10 +368,21 @@ type CertificateAuthority struct {
 	mu    sync.Mutex
 }
 
-func LoadCertificateAuthority(certPath string, keyPath string) (*CertificateAuthority, error) {
-	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+func LoadCertificateAuthority(source credentials.Source) (*CertificateAuthority, error) {
+	if source == nil {
+		return nil, errors.New("TLS-terminating policy requires silo.tls_ca.certificate and silo.tls_ca.private_key")
+	}
+	certificate, certOK := source.Lookup("silo.tls_ca.certificate")
+	key, keyOK := source.Lookup("silo.tls_ca.private_key")
+	if !certOK || !keyOK {
+		return nil, errors.New("TLS-terminating policy requires silo.tls_ca.certificate and silo.tls_ca.private_key")
+	}
+	pair, err := tls.X509KeyPair(certificate, key)
 	if err != nil {
 		return nil, fmt.Errorf("load tls ca material: %w", err)
+	}
+	if !singlePEM(certificate, "CERTIFICATE") || !singlePEM(key, "") {
+		return nil, errors.New("TLS CA material must contain exactly one PEM block with the expected label")
 	}
 	if len(pair.Certificate) == 0 {
 		return nil, fmt.Errorf("tls ca certificate is empty")
@@ -379,14 +391,32 @@ func LoadCertificateAuthority(certPath string, keyPath string) (*CertificateAuth
 	if err != nil {
 		return nil, fmt.Errorf("parse tls ca certificate: %w", err)
 	}
-	if !cert.IsCA {
+	if !cert.IsCA || !cert.BasicConstraintsValid {
 		return nil, fmt.Errorf("tls ca certificate is not a CA")
+	}
+	for _, extension := range cert.Extensions {
+		if extension.Id.String() == "2.5.29.15" && cert.KeyUsage&x509.KeyUsageCertSign == 0 {
+			return nil, errors.New("TLS CA KeyUsage does not permit certificate signing")
+		}
+	}
+	now := time.Now()
+	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+		return nil, errors.New("TLS CA certificate is expired or not yet valid")
 	}
 	signer, ok := pair.PrivateKey.(crypto.Signer)
 	if !ok {
 		return nil, fmt.Errorf("tls ca private key does not implement crypto.Signer")
 	}
 	return &CertificateAuthority{cert: cert, key: signer, cache: make(map[string]*tls.Certificate)}, nil
+}
+
+func singlePEM(input []byte, label string) bool {
+	input = bytes.TrimSpace(input)
+	if !bytes.HasPrefix(input, []byte("-----BEGIN ")) {
+		return false
+	}
+	block, rest := pem.Decode(input)
+	return block != nil && len(bytes.TrimSpace(rest)) == 0 && (label == "" || block.Type == label)
 }
 
 func (ca *CertificateAuthority) CertificateFor(host string) (*tls.Certificate, error) {

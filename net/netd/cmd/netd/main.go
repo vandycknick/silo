@@ -176,8 +176,6 @@ func run(cfg *config.Config, compiledPolicy *policy.Policy, auditLog *audit.Logg
 		CaptureFile:  captureFile,
 		Stack:        cfg.Stack,
 		Policy:       compiledPolicy,
-		CACert:       cfg.TLS.CACert,
-		CAKey:        cfg.TLS.CAKey,
 		GuestPublish: cfg.GuestPublish,
 		Secrets:      secrets,
 	}, session.Shared{Audit: auditLog, Intelligence: intelligencePool})

@@ -146,6 +146,7 @@ impl Machine {
                         message: "missing resolved SSH CA".into(),
                     }
                 })?,
+                secrets.tls_certificate.as_deref(),
             ) {
                 Ok(inputs) => inputs,
                 Err(err) => {

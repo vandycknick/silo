@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -19,7 +19,6 @@ use silo_policy::NetworkPolicy;
 use tokio::time::sleep;
 use utils::format_mac;
 
-use crate::host;
 use crate::network::secret_transport;
 use crate::paths::{
     LocalPaths, NETWORK_AUDIT_LOG_FILE_NAME, NETWORK_SERVICE_LOG_FILE_NAME, PCAP_FILE_NAME,
@@ -31,7 +30,7 @@ use crate::store::models::{
 };
 use crate::supervisor::process::{self, ProcessIdentity};
 use crate::utils::now_unix;
-use crate::{LibVmError, NetdRuntimeConfig};
+use crate::LibVmError;
 
 use crate::network::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
 use crate::network::{mac_from_machine_id, serialize_json, VmmNetworkAttachment, DRIVER_NETD};
@@ -134,9 +133,6 @@ async fn prepare_netd_runtime(
     let requires_certificate_authority = request
         .policy()
         .is_some_and(NetworkPolicy::has_https_interception);
-    let certificate_authority_paths = requires_certificate_authority
-        .then(|| resolve_certificate_authority_paths(paths, &config, &metadata.name))
-        .transpose()?;
     let mac = format_mac(mac_from_machine_id(metadata.id));
     let (ipv4, dns) = private_ipv4_config(&config.subnet, &metadata.name)?;
     let static_lease = format!("{}={mac}", ipv4.address);
@@ -156,12 +152,6 @@ async fn prepare_netd_runtime(
             run_id: ctx.run_id,
             network_id: &network_id,
             policy_path: policy_path.as_deref(),
-            tls_ca_cert_path: certificate_authority_paths
-                .as_ref()
-                .map(|(certificate, _)| certificate.as_path()),
-            tls_ca_key_path: certificate_authority_paths
-                .as_ref()
-                .map(|(_, private_key)| private_key.as_path()),
             static_lease: &static_lease,
             guest_publish: request.publish().map(|publish| publish.bind.as_str()),
         },
@@ -355,8 +345,6 @@ struct NetworkHelperCommandConfig<'a> {
     run_id: &'a str,
     network_id: &'a str,
     policy_path: Option<&'a Path>,
-    tls_ca_cert_path: Option<&'a Path>,
-    tls_ca_key_path: Option<&'a Path>,
     static_lease: &'a str,
     guest_publish: Option<&'a str>,
 }
@@ -394,12 +382,6 @@ fn configure_network_helper_command(
         .arg(config.network_id);
     if let Some(path) = config.policy_path {
         command.arg("--policy-file").arg(path);
-    }
-    if let Some(path) = config.tls_ca_cert_path {
-        command.arg("--tls-ca-cert").arg(path);
-    }
-    if let Some(path) = config.tls_ca_key_path {
-        command.arg("--tls-ca-key").arg(path);
     }
     if let Some(bind) = config.guest_publish {
         command.arg("--guest-publish").arg(bind);
@@ -496,33 +478,6 @@ fn write_runtime_policy_file(
             reference: metadata.name.clone(),
             message: format!("write generated network policy {}: {err}", path.display()),
         })
-}
-
-fn resolve_certificate_authority_paths(
-    paths: &LocalPaths,
-    config: &NetdRuntimeConfig,
-    reference: &str,
-) -> Result<(PathBuf, PathBuf), LibVmError> {
-    match (&config.tls_ca_cert, &config.tls_ca_key) {
-        (Some(certificate_path), Some(private_key_path)) => {
-            Ok((certificate_path.clone(), private_key_path.clone()))
-        }
-        (None, None) => {
-            let authority = host::ensure_certificate_authority_in(paths).map_err(|err| {
-                LibVmError::NetworkRuntime {
-                    reference: reference.to_string(),
-                    message: format!("ensure certificate authority: {err}"),
-                }
-            })?;
-            Ok((authority.certificate_path, authority.private_key_path))
-        }
-        _ => Err(LibVmError::NetworkRuntime {
-            reference: reference.to_string(),
-            message:
-                "certificate authority certificate and private key must be configured together"
-                    .to_string(),
-        }),
-    }
 }
 
 #[derive(Deserialize)]
@@ -933,14 +888,14 @@ fn terminate_helper(identity: &ProcessIdentity) -> Result<(), LibVmError> {
 mod tests {
     use crate::network::netd_driver::{
         append_bounded_stderr_line, configure_network_helper_command, format_netd_startup_failure,
-        prepare_netd_runtime, private_ipv4_config, resolve_certificate_authority_paths,
-        CapturedStderrLines, NetworkHelperCommandConfig, STDERR_CAPTURE_LIMIT,
+        prepare_netd_runtime, private_ipv4_config, CapturedStderrLines, NetworkHelperCommandConfig,
+        STDERR_CAPTURE_LIMIT,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
     use silo_policy::NetworkPolicy;
     use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
 
     use crate::lock_manager::LockId;
@@ -952,7 +907,7 @@ mod tests {
         NetworkInstance, NetworkInstanceState,
     };
     use crate::store::{MachineStore, NetworkStore, Store};
-    use crate::{NetdRuntimeConfig, RuntimeNetworkingConfig};
+    use crate::RuntimeNetworkingConfig;
 
     fn oauth_policy() -> NetworkPolicy {
         NetworkPolicy::from_json_str(
@@ -985,8 +940,6 @@ mod tests {
                 run_id: "run123",
                 network_id: "net123",
                 policy_path: None,
-                tls_ca_cert_path: None,
-                tls_ca_key_path: None,
                 static_lease: "192.168.105.2=02:00:00:00:00:02",
                 guest_publish: None,
             },
@@ -1022,8 +975,6 @@ mod tests {
                 run_id: "run123",
                 network_id: "net123",
                 policy_path: Some(Path::new("/tmp/silo-net/network-policy.json")),
-                tls_ca_cert_path: Some(Path::new("/tmp/silo-net/ca.pem")),
-                tls_ca_key_path: Some(Path::new("/tmp/silo-net/ca-key.pem")),
                 static_lease: "192.168.105.2=02:00:00:00:00:02",
                 guest_publish: Some("any"),
             },
@@ -1061,12 +1012,7 @@ mod tests {
         assert!(args.windows(2).any(|window| window[0] == "--policy-file"
             && window[1] == "/tmp/silo-net/network-policy.json"));
         assert!(args.iter().all(|arg| arg != "--secret-store-file"));
-        assert!(args
-            .windows(2)
-            .any(|window| window[0] == "--tls-ca-cert" && window[1] == "/tmp/silo-net/ca.pem"));
-        assert!(args
-            .windows(2)
-            .any(|window| window[0] == "--tls-ca-key" && window[1] == "/tmp/silo-net/ca-key.pem"));
+        assert!(args.iter().all(|arg| !arg.starts_with("--tls-ca-")));
     }
 
     #[test]
@@ -1162,60 +1108,6 @@ netd log: /tmp/silo/netd.log";
         assert!(captured.byte_len <= STDERR_CAPTURE_LIMIT);
         let lines = captured.lines.into_iter().collect::<Vec<_>>();
         assert_eq!(lines, vec!["bcdef".to_string()]);
-    }
-
-    #[test]
-    fn certificate_authority_paths_use_config_overrides() {
-        let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("silo"));
-        let config = NetdRuntimeConfig {
-            tls_ca_cert: Some(PathBuf::from("/tmp/custom-ca.pem")),
-            tls_ca_key: Some(PathBuf::from("/tmp/custom-ca-key.pem")),
-            ..NetdRuntimeConfig::default()
-        };
-
-        let (certificate_path, private_key_path) =
-            resolve_certificate_authority_paths(&paths, &config, "test-machine")
-                .expect("resolve configured CA paths");
-
-        assert_eq!(certificate_path, PathBuf::from("/tmp/custom-ca.pem"));
-        assert_eq!(private_key_path, PathBuf::from("/tmp/custom-ca-key.pem"));
-        assert!(!paths.keys_dir().exists());
-    }
-
-    #[test]
-    fn certificate_authority_paths_generate_defaults() {
-        let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("silo"));
-
-        let (certificate_path, private_key_path) = resolve_certificate_authority_paths(
-            &paths,
-            &NetdRuntimeConfig::default(),
-            "test-machine",
-        )
-        .expect("resolve generated CA paths");
-
-        assert_eq!(certificate_path, paths.keys_dir().join("ca.pem"));
-        assert_eq!(private_key_path, paths.keys_dir().join("ca-key.pem"));
-        assert!(certificate_path.is_file());
-        assert!(private_key_path.is_file());
-    }
-
-    #[test]
-    fn certificate_authority_paths_reject_partial_config() {
-        let temp = tempfile::tempdir().expect("create tempdir");
-        let paths = LocalPaths::new(temp.path().join("silo"));
-        let config = NetdRuntimeConfig {
-            tls_ca_cert: Some(PathBuf::from("/tmp/custom-ca.pem")),
-            ..NetdRuntimeConfig::default()
-        };
-
-        let err = resolve_certificate_authority_paths(&paths, &config, "test-machine")
-            .expect_err("reject partial CA config");
-
-        assert!(err.to_string().contains(
-            "certificate authority certificate and private key must be configured together"
-        ));
     }
 
     #[test]
@@ -1411,13 +1303,26 @@ netd log: /tmp/silo/netd.log";
         // Also cross the actual Go decoder with a policy, binary values and a
         // provider grant, rather than qualifying only the empty frame.
         let policy = oauth_policy();
-        let credentials = EgressCredentials::new()
+        let mut credentials = EgressCredentials::new()
             .secret_bytes("codex.oauth.access_token", vec![0, 255, 128])
             .secret("codex.oauth.expires_at", "2099-01-01T00:00:00Z")
             .oauth_refresh_hook(SecretProvider::new(
                 "/bin/false",
                 b"synthetic-hook-auth".to_vec(),
             ));
+        let ca = crate::host::certificates::resolve(
+            &silo_secrets::FileStore::new(paths.home()),
+            &paths,
+            &crate::NetdRuntimeConfig::default(),
+        )
+        .unwrap();
+        credentials.infrastructure.push((
+            crate::host::certificates::CERTIFICATE.into(),
+            silo_secrets::SecretBytes::new(ca.certificate.into_bytes()),
+        ));
+        credentials
+            .infrastructure
+            .push((crate::host::certificates::PRIVATE.into(), ca.private));
         let context = NetworkDriverContext {
             egress_credentials: &credentials,
             ..context

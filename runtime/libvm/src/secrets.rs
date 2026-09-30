@@ -18,6 +18,7 @@ pub(crate) struct ResolvedSecrets {
     pub(crate) provenance: Vec<Provenance>,
     pub(crate) infrastructure: Vec<(String, silo_secrets::SecretBytes)>,
     pub(crate) ssh_trusted_ca: Option<String>,
+    pub(crate) tls_certificate: Option<String>,
 }
 
 impl std::ops::Deref for ResolvedSecrets {
@@ -366,6 +367,63 @@ mod tests {
             .await
             .unwrap();
         (dir, runtime, config)
+    }
+
+    #[tokio::test]
+    async fn tls_home_resolution_is_lazy_and_reserved_material_stays_out_of_grants() {
+        let (_fixture, _, network) = fixture("openai_codex_oauth");
+        let (_dir, runtime, mut config) = runtime_machine(&network).await;
+        let store = FileStore::new(runtime.local_home());
+        assert!(!store.path().exists());
+        let saved = config.network.clone();
+        config.network = MachineNetworkConfig::None;
+        let idle = runtime
+            .resolve_machine_secrets(&config, "no-policy", &EgressCredentials::new())
+            .unwrap();
+        assert!(idle.tls_certificate.is_none());
+        assert!(!store.path().exists());
+        config.network = saved;
+        put(
+            &store,
+            &SecretScope::Home,
+            "openai_codex_oauth.personal.oauth",
+            oauth(),
+        );
+        let runtime = runtime
+            .with_secret_provider(HostCommand::new("/usr/bin/silo").args(["secret", "provide"]));
+        let resolved = runtime
+            .resolve_machine_secrets(&config, "tls-provider", &EgressCredentials::new())
+            .unwrap();
+        let grant: silo_secrets::grant::SecretGrant =
+            serde_json::from_slice(&resolved.oauth_refresh_hook.as_ref().unwrap().auth).unwrap();
+        assert!(grant
+            .allowed
+            .iter()
+            .all(|entry| !entry.slot.as_str().starts_with("silo.")));
+        assert!(resolved
+            .infrastructure
+            .iter()
+            .any(|(name, _)| name == crate::host::certificates::PRIVATE));
+        let ca = store
+            .get(
+                &SecretScope::Home,
+                &SecretName::new(crate::host::certificates::CERTIFICATE).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ca.project(silo_secrets::SecretField::Value)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            resolved.tls_certificate.as_ref().unwrap()
+        );
+        let before = std::fs::read(store.path()).unwrap();
+        runtime
+            .resolve_machine_secrets(&config, "second", &EgressCredentials::new())
+            .unwrap();
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        assert!(!runtime.local_home().join("keys").exists());
     }
 
     #[tokio::test]
@@ -1002,6 +1060,10 @@ mod tests {
         assert_eq!(data.status, crate::MachineStatus::Stopped);
         let machine_paths = paths.machine(machine.id().parse().unwrap());
         assert!(!machine_paths.vmm_pid_path().exists());
+        assert!(
+            !home.join("secrets.json").exists(),
+            "policy validation must precede TLS CA generation"
+        );
         assert!(!machine_paths.network_audit_log_path().exists());
         machine.remove().await.unwrap();
         let external = std::sync::Arc::new(FileStore::new(dir.path().join("external")));

@@ -114,7 +114,7 @@ derivation is:
 | -------------- | ------------------------ |
 | `state.db`     | `home/state.db`          |
 | `machines/<id>/` | `home/machines/<id>` (launch config, disks, initramfs) |
-| `keys/`        | `home/keys`              |
+| `keys/`        | `home/keys` (legacy TLS import inputs only) |
 | `secrets.json` | `home/secrets.json`      |
 | `images/`      | `home/images`            |
 | machine logs and exit records | `home/logs/machines/<id>/` |
@@ -134,6 +134,44 @@ migrations or cache metadata. With every Silo process stopped, remove all local
 Silo state from the previous release, including `state.db`, machine directories,
 logs, and the image cache, before opening the new runtime. Silo does not adopt old
 database, machine, runtime, or cache files.
+
+## TLS Interception Trust
+
+The first start with a TLS-terminating policy resolves a single CA pair under
+`SecretScope::Home` in the runtime's `SecretStore`. The default store is
+`<resolved-home>/secrets.json`; `Runtime::with_secret_store` selects the actual
+store for both CA entries, including an external FileStore or custom filename.
+The reserved names are `silo.tls_ca.certificate` and `silo.tls_ca.private_key`.
+Non-intercepting starts do not create or import a TLS CA.
+
+Resolution, validation and paired writes share one atomic scope transaction.
+Partial, malformed, mismatched, expired or not-yet-valid material fails without
+replacement. Each input contains exactly one PEM block. Certificates require
+CA basic constraints; KeyUsage may be absent, but when present must allow
+certificate signing. The same resolved certificate goes into guest trust and
+the same pair reaches netd through its bounded `--secrets-fd` payload. Reserved
+entries are never included in provider grants, and count toward the total
+16 KiB transport limit. Only the public certificate enters the guest.
+
+`NetdRuntimeConfig::with_tls_ca(cert, key)` supplies operator import inputs.
+The first intercepting start imports them into the selected Home store;
+repeated imports must equal the stored pair. Conflicts fail without changing
+existing trust. CLI `networking.drivers.netd.tls_ca_cert` and `tls_ca_key` have
+these same import semantics.
+
+If no stored or operator pair exists, an intact legacy pair in
+`<runtime-home>/keys/ca.pem` and `ca-key.pem` is validated and imported once.
+The import is logged after persistence; legacy files are left untouched.
+Fresh homes generate in memory and create no separate CA files. Machine
+removal never deletes the Home CA. Rotation requires replacing the pair
+atomically and restarting all affected guests/netd processes to install the
+new trust snapshot.
+
+The old exported `ensure_certificate_authority` and path-bearing
+`CertificateAuthority` API are removed. Callers configure the runtime's store
+or operator import instead. netd no longer accepts TLS CA file flags or session
+file paths; TLS-terminating sessions validate their Static source before
+opening listeners.
 
 ## Runtime Components
 

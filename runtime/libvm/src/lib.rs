@@ -38,7 +38,6 @@ mod supervisor;
 mod utils;
 
 pub use crate::error::LibVmError;
-pub use crate::host::{ensure_certificate_authority, CertificateAuthority};
 pub use crate::image::{
     ImageBuilder, ImageCacheState, ImageDetail, ImageHandle, ImageLayerDetail, ImageProgress,
     ImageProgressReceiver, ImageProgressSender, ImagePruneReport, ImagePullOptions,

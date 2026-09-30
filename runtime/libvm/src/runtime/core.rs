@@ -253,6 +253,26 @@ impl Runtime {
         resolved
             .infrastructure
             .push((crate::ssh_ca::PRIVATE.into(), pair.private));
+        if matches!(&config.network, crate::store::models::MachineNetworkConfig::Private { policy: Some(policy), .. } if policy.has_https_interception())
+        {
+            let pair = crate::host::certificates::resolve(
+                self.secret_store(),
+                &self.paths,
+                &self.networking.netd,
+            )
+            .map_err(|error| LibVmError::MachinePreparationFailed {
+                reference: config.name.clone(),
+                message: format!("resolve home TLS CA: {error}"),
+            })?;
+            resolved.tls_certificate = Some(pair.certificate.clone());
+            resolved.infrastructure.push((
+                crate::host::certificates::CERTIFICATE.into(),
+                silo_secrets::SecretBytes::new(pair.certificate.into_bytes()),
+            ));
+            resolved
+                .infrastructure
+                .push((crate::host::certificates::PRIVATE.into(), pair.private));
+        }
         Ok(resolved)
     }
 
@@ -1225,6 +1245,7 @@ impl Runtime {
         network: &VmmNetworkAttachment,
         resize_rootfs: bool,
         ssh_trusted_ca: &str,
+        tls_certificate: Option<&str>,
     ) -> Result<crate::supervisor::VmmLaunchInputs, LibVmError> {
         let prepare = || -> eyre::Result<crate::supervisor::VmmLaunchInputs> {
             let rosetta_intent = self
@@ -1246,14 +1267,13 @@ impl Runtime {
                 boot_assets::resolve_agent(&config.guest.agent, &self.components.agent)?
             {
                 let agent_config = guest_agent::build_config(GuestAgentConfigInput {
-                    paths: &self.paths,
                     machine_name: &config.name,
                     spec: &launch_spec,
                     network,
-                    networking: &self.networking,
                     resize_rootfs,
                     user: config.guest.user.as_ref(),
                     ssh_trusted_ca,
+                    tls_certificate,
                 })?;
                 agent_config.validate().context("validate agent config")?;
                 let serialized =
@@ -2177,6 +2197,7 @@ mod tests {
                 &crate::network::VmmNetworkAttachment::None,
                 false,
                 "",
+                None,
             )
             .expect_err("reject ineligible durable contract");
         assert!(error.to_string().contains("installed default guest agent"));

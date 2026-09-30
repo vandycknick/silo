@@ -45,7 +45,7 @@ rule "local-reads" {
   verdict = "allow"
 }
 	`)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	proxy, err := NewHTTPSProxy(route, caSource(t, caCert, caKey), nil)
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -54,6 +54,12 @@ rule "local-reads" {
 	requestCh := make(chan *http.Request, 1)
 	upstreamAddress, stopUpstream, _ := startObservedTLSUpstreamWithResponseForHost(t, caCert, caKey, "localhost", requestCh, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Trace: allowed-https\r\nSet-Cookie: session=secret\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
 	defer stopUpstream()
+	if err := os.Remove(caCert); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(caKey); err != nil {
+		t.Fatal(err)
+	}
 
 	clientConn, proxyConn := net.Pipe()
 	flow := hooks.Flow{
@@ -169,7 +175,7 @@ rule "asset-reads" {
   verdict = "allow"
 }
 `)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	proxy, err := NewHTTPSProxy(route, caSource(t, caCert, caKey), nil)
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -252,7 +258,7 @@ rule "allow-local" {
   verdict = "allow"
 }
 `)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, credentials.NewManager(credentials.NewStatic(map[string][]byte{"local.token": []byte("local-token")}, nil)))
+	proxy, err := NewHTTPSProxy(route, caSource(t, caCert, caKey), credentials.NewManager(credentials.NewStatic(map[string][]byte{"local.token": []byte("local-token")}, nil)))
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -338,7 +344,7 @@ rule "allow-local" {
   verdict = "allow"
 }
 `)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	proxy, err := NewHTTPSProxy(route, caSource(t, caCert, caKey), nil)
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -408,7 +414,7 @@ endpoint "https" "local" {
   hosts = ["localhost"]
 }
 `)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	proxy, err := NewHTTPSProxy(route, caSource(t, caCert, caKey), nil)
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -469,7 +475,7 @@ endpoint "https" "api" {
   hosts = ["api.example.com"]
 }
 `)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	proxy, err := NewHTTPSProxy(route, caSource(t, caCert, caKey), nil)
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -513,7 +519,7 @@ rule "allow-proxmox" {
   verdict = "allow"
 }
 `)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	proxy, err := NewHTTPSProxy(route, caSource(t, caCert, caKey), nil)
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -583,7 +589,7 @@ rule "allow-proxmox" {
   verdict = "allow"
 }
 `)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	proxy, err := NewHTTPSProxy(route, caSource(t, caCert, caKey), nil)
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -638,7 +644,7 @@ rule "allow-proxmox" {
   verdict = "allow"
 }
 `)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	proxy, err := NewHTTPSProxy(route, caSource(t, caCert, caKey), nil)
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -699,7 +705,7 @@ rule "allow-ip" {
   verdict = "allow"
 }
 `)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	proxy, err := NewHTTPSProxy(route, caSource(t, caCert, caKey), nil)
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -766,7 +772,7 @@ rule "allow-local" {
   verdict = "allow"
 }
 `)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	proxy, err := NewHTTPSProxy(route, caSource(t, caCert, caKey), nil)
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -821,7 +827,7 @@ rule "allow-local" {
   verdict = "allow"
 }
 `)
-	proxy, err := NewHTTPSProxy(route, caCert, caKey, nil)
+	proxy, err := NewHTTPSProxy(route, caSource(t, caCert, caKey), nil)
 	if err != nil {
 		t.Fatalf("NewHTTPSProxy returned error: %v", err)
 	}
@@ -862,7 +868,7 @@ rule "allow-local" {
 func TestCertificateForReusesFreshCachedCertificate(t *testing.T) {
 	dir := t.TempDir()
 	caCert, caKey, _ := writeTestCA(t, dir)
-	ca, err := LoadCertificateAuthority(caCert, caKey)
+	ca, err := LoadCertificateAuthority(caSource(t, caCert, caKey))
 	if err != nil {
 		t.Fatalf("loadCertificateAuthority returned error: %v", err)
 	}
@@ -888,7 +894,7 @@ func TestCertificateForReusesFreshCachedCertificate(t *testing.T) {
 func TestCertificateForRefreshesNearExpiryCachedCertificate(t *testing.T) {
 	dir := t.TempDir()
 	caCert, caKey, _ := writeTestCA(t, dir)
-	ca, err := LoadCertificateAuthority(caCert, caKey)
+	ca, err := LoadCertificateAuthority(caSource(t, caCert, caKey))
 	if err != nil {
 		t.Fatalf("loadCertificateAuthority returned error: %v", err)
 	}
@@ -916,7 +922,7 @@ func TestCertificateForRefreshesNearExpiryCachedCertificate(t *testing.T) {
 func TestCertificateForReusesCALimitedCachedCertificate(t *testing.T) {
 	dir := t.TempDir()
 	caCert, caKey, _ := writeTestCAExpiringAt(t, dir, time.Now().Add(30*time.Minute))
-	ca, err := LoadCertificateAuthority(caCert, caKey)
+	ca, err := LoadCertificateAuthority(caSource(t, caCert, caKey))
 	if err != nil {
 		t.Fatalf("loadCertificateAuthority returned error: %v", err)
 	}
@@ -953,7 +959,7 @@ func startObservedTLSUpstreamForHost(t *testing.T, caCertPath string, caKeyPath 
 
 func startObservedTLSUpstreamWithResponseForHost(t *testing.T, caCertPath string, caKeyPath string, certHost string, requestCh chan<- *http.Request, response string) (string, func(), <-chan struct{}) {
 	t.Helper()
-	ca, err := LoadCertificateAuthority(caCertPath, caKeyPath)
+	ca, err := LoadCertificateAuthority(caSource(t, caCertPath, caKeyPath))
 	if err != nil {
 		t.Fatalf("loadCertificateAuthority returned error: %v", err)
 	}

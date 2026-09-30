@@ -30,8 +30,6 @@ type Spec struct {
 	CaptureFile  *os.File
 	Stack        config.NetworkConfig
 	Policy       *policy.Policy
-	CACert       string
-	CAKey        string
 	GuestPublish config.PublishBind
 	Secrets      credentials.Source
 }
@@ -83,7 +81,7 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 	}
 	credentialManager := credentials.NewManager(spec.Secrets)
 	dispatcher := packet.NewTCPDispatcher()
-	httpsProxy, err := forwarder.NewHTTPSProxy(route, spec.CACert, spec.CAKey, credentialManager)
+	httpsProxy, err := forwarder.NewHTTPSProxy(route, spec.Secrets, credentialManager)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -92,7 +90,7 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 	if httpsProxy != nil {
 		certificateAuthority = httpsProxy.CertificateAuthority()
 	} else if route.HasRegistries() {
-		certificateAuthority, err = forwarder.LoadCertificateAuthority(spec.CACert, spec.CAKey)
+		certificateAuthority, err = forwarder.LoadCertificateAuthority(spec.Secrets)
 		if err != nil {
 			cancel()
 			return nil, err
