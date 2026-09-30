@@ -78,7 +78,7 @@ func (runtime *Runtime) CreateMachine(ctx context.Context, source ImageSource, o
 	if source.config.Kind != "oci" && source.config.Kind != "disk" {
 		return nil, newError(ErrorInvalidArgument, "", "invalid image source")
 	}
-	config := machineConfig{Source: source.config, Labels: make(map[string]string), Metadata: make(map[string]string)}
+	config := machineConfig{Source: source.config, Labels: make(map[string]string), Metadata: make(map[string]string), GuestUser: &GuestUser{Name: "silo", UID: 1000, GID: 1000, Home: "/home/silo"}}
 	for _, option := range opts {
 		if option == nil {
 			return nil, newError(ErrorInvalidArgument, "", "machine option must not be nil")

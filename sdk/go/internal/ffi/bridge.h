@@ -12,6 +12,7 @@ void bridge_error_free(silo_error *error);
 
 silo_error *bridge_runtime_open(const uint8_t *request, size_t request_len, silo_runtime **out_runtime);
 void bridge_runtime_free(silo_runtime *runtime);
+silo_error *bridge_runtime_query(const silo_runtime *runtime, const uint8_t *request, size_t request_len, silo_buffer *out_data);
 silo_error *bridge_runtime_machine_create(const silo_runtime *runtime, const uint8_t *request, size_t request_len, silo_machine **out_machine);
 silo_error *bridge_runtime_machine_get(const silo_runtime *runtime, const uint8_t *reference, size_t reference_len, silo_machine **out_machine);
 silo_error *bridge_runtime_machines(const silo_runtime *runtime, silo_machine_handle_list *out_machines);
@@ -23,6 +24,8 @@ silo_error *bridge_machine_id(const silo_machine *machine, silo_buffer *out_id);
 silo_error *bridge_machine_inspect(const silo_machine *machine, silo_buffer *out_data);
 silo_error *bridge_machine_start(const silo_machine *machine, silo_buffer *out_data);
 silo_error *bridge_machine_stop(const silo_machine *machine, silo_buffer *out_data);
+silo_error *bridge_machine_update(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data);
+silo_error *bridge_machine_stop_with(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data);
 silo_error *bridge_machine_remove(const silo_machine *machine);
 silo_error *bridge_machine_exec(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output);
 silo_error *bridge_machine_shell(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution_output *out_output);

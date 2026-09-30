@@ -141,6 +141,16 @@ silo_error *silo_log_close(const silo_log *log);
 
 void silo_log_free(silo_log *log);
 
+silo_error *silo_machine_update(const silo_machine *machine,
+                                const uint8_t *request_ptr,
+                                size_t request_len,
+                                silo_buffer *out_data);
+
+silo_error *silo_machine_stop_with(const silo_machine *machine,
+                                   const uint8_t *request_ptr,
+                                   size_t request_len,
+                                   silo_buffer *out_data);
+
 silo_error *silo_runtime_machine_create(const silo_runtime *runtime,
                                         const uint8_t *request_ptr,
                                         size_t request_len,
@@ -159,6 +169,11 @@ silo_error *silo_machine_remove(const silo_machine *machine);
 silo_error *silo_network_policy_build(const uint8_t *request_ptr,
                                       size_t request_len,
                                       silo_buffer *out_policy);
+
+silo_error *silo_runtime_query(const silo_runtime *runtime,
+                               const uint8_t *request_ptr,
+                               size_t request_len,
+                               silo_buffer *out_data);
 
 silo_error *silo_runtime_open(const uint8_t *request_ptr,
                               size_t request_len,

@@ -12,7 +12,9 @@ use crate::runtime::request_bytes;
 #[serde(deny_unknown_fields)]
 struct PolicyRequest {
     json: Option<String>,
+    hcl: Option<String>,
     config: Option<PolicyConfig>,
+    output: Option<String>,
 }
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -91,6 +93,8 @@ struct Rule {
 struct Tunnel {
     name: String,
     #[serde(default)]
+    ephemeral: bool,
+    #[serde(default)]
     tags: Vec<String>,
     hostname: Option<String>,
     control_url: Option<String>,
@@ -121,19 +125,26 @@ pub unsafe extern "C" fn silo_network_policy_build(
             serde_json::from_slice(request_bytes(request_ptr, request_len)?).map_err(|error| {
                 invalid_argument(format!("decode network policy request: {error}"))
             })?;
-        let policy = match (request.json, request.config) {
-            (Some(value), None) => NetworkPolicy::from_json_str(&value).map_err(|error| {
+        let policy = match (request.json, request.hcl, request.config) {
+            (Some(value), None, None) => NetworkPolicy::from_json_str(&value).map_err(|error| {
                 invalid_argument(format!("invalid network policy JSON: {error}"))
             })?,
-            (None, Some(config)) => build(config)?,
+            (None, Some(value), None) => NetworkPolicy::from_hcl_str(&value).map_err(|error| {
+                invalid_argument(format!("invalid network policy HCL: {error}"))
+            })?,
+            (None, None, Some(config)) => build(config)?,
             _ => {
                 return Err(invalid_argument(
                     "provide exactly one policy JSON or configuration",
                 ))
             }
         };
-        let value = serde_json::to_vec(&policy.normalized())
-            .map_err(|error| SiloError::new("Serialization", error.to_string()))?;
+        let value = match request.output.as_deref().unwrap_or("json") {
+            "json" => serde_json::to_vec(&policy.clone().normalized()).map_err(|error| SiloError::new("Serialization", error.to_string()))?,
+            "slots" => serde_json::to_vec(&serde_json::json!({"slots": policy.secret_slots(), "requirements": policy.secret_requirements().into_iter().map(|requirement| serde_json::json!({"owner": requirement.owner, "alternatives": requirement.alternatives.into_iter().map(|alternative| alternative.slots).collect::<Vec<_>>()})).collect::<Vec<_>>() })).map_err(|error| SiloError::new("Serialization", error.to_string()))?,
+            "hcl" => policy.to_hcl_string().map_err(|error| invalid_argument(error.to_string()))?.into_bytes(),
+            _ => return Err(invalid_argument("unsupported policy output")),
+        };
         *out_policy = SiloBuffer::from_vec(value);
         Ok(())
     })
@@ -282,6 +293,7 @@ fn apply_rule(mut b: NetworkRuleBuilder, v: Rule) -> NetworkRuleBuilder {
     b
 }
 fn apply_tunnel(mut b: TailscaleTunnelBuilder, v: Tunnel) -> TailscaleTunnelBuilder {
+    b = b.ephemeral(v.ephemeral);
     b = b.tags(v.tags);
     if let Some(x) = v.hostname {
         b = b.hostname(x)

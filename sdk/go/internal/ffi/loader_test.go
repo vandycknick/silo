@@ -11,7 +11,7 @@ func TestLoadDevelopmentBridge(t *testing.T) {
 	if path == "" && os.Getenv("SILO_TEST_EMBEDDED_FFI") != "1" {
 		t.Skip("neither SILO_GO_FFI_PATH nor SILO_TEST_EMBEDDED_FFI is set")
 	}
-	if err := Load("0.1.0", 1); err != nil {
+	if err := Load("0.1.0", 2); err != nil {
 		t.Fatalf("Load() failed: %v", err)
 	}
 }

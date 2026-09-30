@@ -71,10 +71,10 @@ pub use crate::machine::{
     MachineReadiness, MachineReadinessOutcome, MachineReadinessReason, MachineReadinessState,
     MachineRef, MachineRetention, MachineRootfs, MachineRunId, MachineSshBackend,
     MachineSshListenerReport, MachineStaleReason, MachineStart, MachineStartOptions, MachineStatus,
-    MachineStopOptions, MachineSystemInfo, MachineUpdate, MachineUserConfig, MachineUserUpdate,
-    MachineVmSnapshot, MachineVmState, MachineWaitOptions, Memory, NetworkPolicyUpdate,
-    ProcessConfig, SshExitStatus, SshShellOptions, SshShellOptionsBuilder, StdinMode,
-    DEFAULT_MACHINE_WAIT_TIMEOUT,
+    MachineStopOptions, MachineSystemInfo, MachineTailscale, MachineUpdate, MachineUserConfig,
+    MachineUserUpdate, MachineVmSnapshot, MachineVmState, MachineWaitOptions, Memory,
+    NetworkPolicyUpdate, ProcessConfig, SshExitStatus, SshShellOptions, SshShellOptionsBuilder,
+    StdinMode, DEFAULT_MACHINE_WAIT_TIMEOUT,
 };
 pub use crate::network::{
     GuestPublish, MachineNetworkBuilder, MachineNetworkConfig, NetworkBuilder, NetworkDefinition,

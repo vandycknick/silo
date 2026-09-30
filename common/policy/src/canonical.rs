@@ -131,6 +131,16 @@ impl NetworkPolicy {
         &self.tailscale
     }
 
+    /// Supplies machine identity in a generated run policy without changing explicit hostnames.
+    pub fn with_default_tailscale_hostname(mut self, hostname: &str) -> Self {
+        for tunnel in &mut self.tailscale {
+            if tunnel.hostname.as_deref().is_none_or(str::is_empty) {
+                tunnel.hostname = Some(hostname.to_owned());
+            }
+        }
+        self
+    }
+
     pub fn forwards(&self) -> &[NetworkForward] {
         &self.forwards
     }
@@ -423,6 +433,8 @@ impl NetworkRule {
 pub struct TailscaleTunnel {
     pub name: String,
     #[serde(default)]
+    pub ephemeral: bool,
+    #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
@@ -671,6 +683,7 @@ fn lower_rule(rule: &RuleDecl) -> NetworkRule {
 fn lower_tailscale(tunnel: &TailscaleDecl) -> TailscaleTunnel {
     TailscaleTunnel {
         name: tunnel.name.clone(),
+        ephemeral: tunnel.ephemeral,
         tags: tunnel.tags.clone(),
         hostname: non_empty_string(&tunnel.hostname),
         control_url: non_empty_string(&tunnel.control_url),
@@ -1078,6 +1091,15 @@ impl PolicyValidator {
     }
 
     fn validate_tunnels(&mut self, tunnels: &[TailscaleTunnel]) -> BTreeSet<String> {
+        if let [first, second, ..] = tunnels {
+            self.error(
+                "multiple tailscale tunnels",
+                format!(
+                    "at most one tailscale declaration is allowed: {:?} and {:?}",
+                    first.name, second.name
+                ),
+            );
+        }
         let mut names = BTreeSet::new();
         for tunnel in tunnels {
             self.validate_name("tailscale tunnel", &tunnel.name);

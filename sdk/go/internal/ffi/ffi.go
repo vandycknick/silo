@@ -11,6 +11,7 @@ import "C"
 
 import (
 	"fmt"
+	"strings"
 	"unsafe"
 )
 
@@ -69,6 +70,9 @@ func load(path, expectedVersion string, expectedABI uint32) error {
 	if message := C.bridge_load(cPath); message != nil {
 		value := C.GoString(message)
 		C.bridge_string_free(message)
+		if strings.HasPrefix(value, "native Silo bridge ABI mismatch:") {
+			return &ABIMismatchError{Message: value}
+		}
 		return fmt.Errorf("load native Silo bridge: %s", value)
 	}
 	if actual := uint32(C.bridge_abi_version()); actual != expectedABI {
@@ -172,6 +176,14 @@ func (machine *Machine) Inspect() ([]byte, error) {
 	return copyBuffer(output), nil
 }
 
+func (runtime *Runtime) Query(request []byte) ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_runtime_query(runtime.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
+}
+
 func (machine *Machine) Start() ([]byte, error) {
 	var output C.silo_buffer
 	if err := takeError(C.bridge_machine_start(machine.pointer, &output)); err != nil {
@@ -183,6 +195,22 @@ func (machine *Machine) Start() ([]byte, error) {
 func (machine *Machine) Stop() ([]byte, error) {
 	var output C.silo_buffer
 	if err := takeError(C.bridge_machine_stop(machine.pointer, &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
+}
+
+func (machine *Machine) Update(request []byte) ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_machine_update(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
+}
+
+func (machine *Machine) StopWith(request []byte) ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_machine_stop_with(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
 		return nil, err
 	}
 	return copyBuffer(output), nil

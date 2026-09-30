@@ -5,8 +5,81 @@ use std::sync::Arc;
 use libvm::{MachineRef, Runtime, RuntimeConfig};
 use serde::Deserialize;
 
+use crate::buffer::SiloBuffer;
 use crate::error::{catch_ffi, catch_ffi_void, error_from_libvm, invalid_argument, SiloError};
 use crate::handles::{MachineHandle, MachineHandleList, RuntimeContext, RuntimeHandle};
+
+#[derive(Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum QueryRequest {
+    Inventory {},
+    SecretReadiness {
+        policy_json: String,
+        machine: Option<String>,
+    },
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn silo_runtime_query(
+    runtime: *const RuntimeHandle,
+    request_ptr: *const u8,
+    request_len: usize,
+    out_data: *mut SiloBuffer,
+) -> *mut SiloError {
+    catch_ffi(|| {
+        let runtime = runtime
+            .as_ref()
+            .ok_or_else(|| invalid_argument("runtime must not be null"))?;
+        if out_data.is_null() {
+            return Err(invalid_argument("out_data must not be null"));
+        }
+        *out_data = SiloBuffer::empty();
+        let request: QueryRequest =
+            serde_json::from_slice(request_bytes(request_ptr, request_len)?)
+                .map_err(|error| invalid_argument(format!("decode runtime query: {error}")))?;
+        let value = match request {
+            QueryRequest::Inventory {} => {
+                let entries = runtime
+                    .context
+                    .tokio
+                    .block_on(runtime.context.runtime.inventory())
+                    .map_err(error_from_libvm)?;
+                serde_json::Value::Array(entries.into_iter().map(|entry| {
+                    let mut issues = entry.issues;
+                    if let Some(data) = &entry.data { issues.extend(data.issues.clone()); }
+                    serde_json::json!({"id": entry.id, "name": entry.name, "data": entry.data.map(crate::dto::machine_data), "issues": issues})
+                }).collect())
+            }
+            QueryRequest::SecretReadiness {
+                policy_json,
+                machine,
+            } => {
+                let policy = libvm::NetworkPolicy::from_json_str(&policy_json)
+                    .map_err(|error| invalid_argument(error.to_string()))?;
+                let machine = machine
+                    .map(MachineRef::parse)
+                    .transpose()
+                    .map_err(error_from_libvm)?;
+                let ready = runtime
+                    .context
+                    .tokio
+                    .block_on(
+                        runtime
+                            .context
+                            .runtime
+                            .policy_secrets_ready(&policy, machine.as_ref()),
+                    )
+                    .map_err(error_from_libvm)?;
+                serde_json::json!({"ready": ready})
+            }
+        };
+        *out_data = SiloBuffer::from_vec(
+            serde_json::to_vec(&value)
+                .map_err(|error| SiloError::new("Serialization", error.to_string()))?,
+        );
+        Ok(())
+    })
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -183,4 +256,21 @@ pub(crate) unsafe fn request_string(
         return Err(invalid_argument(format!("{name} must not be empty")));
     }
     Ok(value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn runtime_query_schema_is_strict_for_every_operation() {
+        assert!(serde_json::from_str::<crate::runtime::QueryRequest>(
+            r#"{"operation":"inventory"}"#
+        )
+        .is_ok());
+        for input in [
+            r#"{"operation":"inventory","unknown":true}"#,
+            r#"{"operation":"secret_readiness","policy_json":"{}","unknown":true}"#,
+        ] {
+            assert!(serde_json::from_str::<crate::runtime::QueryRequest>(input).is_err());
+        }
+    }
 }

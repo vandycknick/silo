@@ -976,6 +976,17 @@ impl<'a> DocumentBuilder<'a> {
             );
             return;
         }
+        if let Some(first) = self.tailscale.first() {
+            self.error_at(
+                block_position,
+                "Multiple tailscale blocks",
+                format!(
+                    "at most one tailscale declaration is allowed: {:?} and {:?}",
+                    first.name, name
+                ),
+            );
+            return;
+        }
         if !self.tailscale_names.insert(name.clone()) {
             self.error_at(
                 block_position,
@@ -988,9 +999,19 @@ impl<'a> DocumentBuilder<'a> {
         let mut tags = Vec::new();
         let mut hostname = String::new();
         let mut control_url = String::new();
+        let mut ephemeral = false;
         for structure in block.body().iter() {
             match structure {
                 Structure::Attribute(attribute) => match attribute.key() {
+                    "ephemeral" => match decode_bool(attribute.expr()) {
+                        Ok(value) => ephemeral = value,
+                        Err(detail) => self.attr_error(
+                            attribute,
+                            block_position.line,
+                            "Invalid tailscale ephemeral",
+                            detail,
+                        ),
+                    },
                     "tags" => match decode_string_list(attribute.expr()) {
                         Ok(value) => tags = value,
                         Err(detail) => self.attr_error(
@@ -1045,6 +1066,7 @@ impl<'a> DocumentBuilder<'a> {
 
         self.tailscale.push(TailscaleDecl {
             name,
+            ephemeral,
             tags,
             hostname,
             control_url,
@@ -1759,7 +1781,27 @@ fn parse_port(value: &str) -> Result<u16, String> {
 }
 
 fn decode_ref(expression: &Expression) -> Result<Ref, String> {
-    ref_from_text(&expression.to_string())
+    let Expression::Traversal(traversal) = expression else {
+        return Err("expected two-part reference like https.github or https[\"1github\"]".into());
+    };
+    let Expression::Variable(kind) = &traversal.expr else {
+        return Err("reference must start with a kind identifier".into());
+    };
+    let name = match traversal.operators.as_slice() {
+        [hcl::expr::TraversalOperator::GetAttr(name)] => name.to_string(),
+        [hcl::expr::TraversalOperator::LegacyIndex(name)] => name.to_string(),
+        [hcl::expr::TraversalOperator::Index(Expression::String(name))] => name.clone(),
+        _ => {
+            return Err(
+                "reference must contain exactly one attribute or literal string index".into(),
+            )
+        }
+    };
+    let kind = kind.to_string();
+    if !valid_identifier(&kind) || !valid_identifier(&name) {
+        return Err("reference must use valid kind and declaration names".into());
+    }
+    Ok(Ref { kind, name })
 }
 
 fn decode_ref_list(expression: &Expression) -> Result<Vec<Ref>, String> {
@@ -1770,22 +1812,6 @@ fn decode_ref_list(expression: &Expression) -> Result<Vec<Ref>, String> {
         return Err("expected at least one reference".to_owned());
     }
     values.iter().map(decode_ref).collect()
-}
-
-fn ref_from_text(value: &str) -> Result<Ref, String> {
-    let text = value.trim();
-    let Some((kind, name)) = text.split_once('.') else {
-        return Err("expected two-part reference like https.github".to_owned());
-    };
-    if name.contains('.') || !valid_identifier(kind) || !valid_identifier(name) {
-        return Err(format!(
-            "reference \"{text}\" must use traversal identifiers"
-        ));
-    }
-    Ok(Ref {
-        kind: kind.to_owned(),
-        name: name.to_owned(),
-    })
 }
 
 fn valid_identifier(value: &str) -> bool {

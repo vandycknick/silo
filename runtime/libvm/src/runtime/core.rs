@@ -198,6 +198,81 @@ impl Runtime {
         self.paths.home()
     }
 
+    /// Read-only readiness using the start resolver. No values or signing material are returned.
+    /// Without a machine reference only Home secrets participate.
+    pub async fn policy_secrets_ready(
+        &self,
+        policy: &silo_policy::NetworkPolicy,
+        machine: Option<&MachineRef>,
+    ) -> Result<bool, LibVmError> {
+        let id = match machine {
+            Some(reference) => Some(self.get_machine(reference).await?.machine_id()),
+            None => None,
+        };
+        let network = ModelMachineNetworkConfig::Private {
+            policy: Some(policy.clone()),
+            publish: None,
+        };
+        Ok(crate::secrets::resolve_for_scope(
+            self.secret_store(),
+            &network,
+            id,
+            "readiness",
+            &EgressCredentials::default(),
+            None,
+            "readiness",
+        )
+        .is_ok())
+    }
+
+    pub(crate) async fn lock_machine_names(&self) -> Result<std::fs::File, LibVmError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _home = crate::paths::OwnedDirectory::open_root(self.local_home())?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(self.local_home().join("machine-names.lock"))?;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+    }
+
+    pub(crate) fn validate_tailscale_vsock(
+        &self,
+        network: &ModelMachineNetworkConfig,
+        spec: &VmSpec,
+    ) -> Result<bool, LibVmError> {
+        let present = matches!(network, ModelMachineNetworkConfig::Private { policy: Some(policy), .. } if !policy.tailscale().is_empty());
+        if present && !spec.vsock.as_ref().is_some_and(|vsock| vsock.enabled) {
+            return Err(LibVmError::NetworkRuntime {
+                reference: "tailscale".into(),
+                message: "Tailscale requires vsock.enabled (CLI: --vsock)".into(),
+            });
+        }
+        Ok(present)
+    }
+
+    pub(crate) fn ensure_tailscale_directory(&self, id: MachineId) -> Result<(), LibVmError> {
+        let missing =
+            || std::io::Error::other("Tailscale state requires an existing machine directory");
+        let root = crate::paths::OwnedDirectory::open_existing_root(self.local_home())?
+            .ok_or_else(missing)?;
+        let machines = root.open_dir("machines")?.ok_or_else(missing)?;
+        let machine = machines.open_dir(&id.to_string())?.ok_or_else(missing)?;
+        machine.ensure_dir("tailscale")?;
+        Ok(())
+    }
+
     /// Uses this store to resolve policy secrets for future starts.
     pub fn with_secret_store(mut self, store: Arc<dyn silo_secrets::SecretStore>) -> Self {
         self.secret_store = store;
@@ -1475,7 +1550,21 @@ impl Runtime {
         let (status, boot_report, provision_report) = if runtime_status.is_running()
             && observation == MachineObservation::Observed
         {
-            match self.supervisor.client(config.id).status().await {
+            let response = self
+                .supervisor
+                .client(config.id)
+                .status()
+                .await
+                .and_then(|response| {
+                    validate_host_status_identity(
+                        &response,
+                        config.id,
+                        runtime_status.run_id.as_deref(),
+                    )
+                    .map(|()| response)
+                    .map_err(crate::supervisor::VmmClientError::from)
+                });
+            match response {
                 Ok(mut response) => {
                     let listener =
                         response
@@ -1953,6 +2042,36 @@ fn runtime_exit_matches(status: &VmmExitStatus, state: Option<&MachineState>) ->
         && state.vmm_pid == Some(status.pid)
 }
 
+fn validate_host_status_identity(
+    status: &protocol::v1::HostStatus,
+    machine: MachineId,
+    run: Option<&str>,
+) -> Result<(), String> {
+    let observed_machine = status
+        .machine_id
+        .as_deref()
+        .ok_or("monitor status omitted machine_id")?
+        .parse::<MachineId>()
+        .map_err(|_| "monitor status has invalid machine_id")?;
+    if observed_machine != machine {
+        return Err("monitor status belongs to another machine".into());
+    }
+    let observed_run = status
+        .run_id
+        .as_deref()
+        .ok_or("monitor status omitted run_id")?
+        .parse::<crate::MachineRunId>()
+        .map_err(|_| "monitor status has invalid run_id")?;
+    let expected_run = run
+        .ok_or("running machine has no expected run_id")?
+        .parse::<crate::MachineRunId>()
+        .map_err(|_| "running machine has invalid expected run_id")?;
+    if observed_run != expected_run {
+        return Err("monitor status belongs to another run".into());
+    }
+    Ok(())
+}
+
 fn exit_observed_event(status: &VmmExitStatus) -> (bool, Option<String>) {
     let _ = status.exited_at;
     match status.outcome {
@@ -2073,6 +2192,39 @@ fn apply_resolved_boot_assets(spec: &mut VmSpec, boot_assets: ResolvedBootAssets
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generic_monitor_status_requires_expected_machine_and_launch_run() {
+        let machine = crate::store::models::MachineId::new();
+        let run = uuid::Uuid::new_v4().to_string();
+        let mut status = protocol::v1::HostStatus {
+            machine_id: Some(machine.to_string()),
+            run_id: Some(run.clone()),
+            monitor: Some(protocol::v1::MonitorSnapshot {
+                instance_id: Some(uuid::Uuid::new_v4().to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        crate::runtime::core::validate_host_status_identity(&status, machine, Some(&run)).unwrap();
+        assert!(crate::runtime::core::validate_host_status_identity(
+            &status,
+            crate::store::models::MachineId::new(),
+            Some(&run)
+        )
+        .is_err());
+        assert!(crate::runtime::core::validate_host_status_identity(
+            &status,
+            machine,
+            Some(&uuid::Uuid::new_v4().to_string())
+        )
+        .is_err());
+        status.run_id = None;
+        assert!(
+            crate::runtime::core::validate_host_status_identity(&status, machine, Some(&run))
+                .unwrap_err()
+                .contains("run_id")
+        );
+    }
     use crate::lock_manager::LockId;
     use crate::paths::LocalPaths;
     use crate::runtime::core::{

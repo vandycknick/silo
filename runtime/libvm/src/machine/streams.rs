@@ -15,7 +15,7 @@ use tokio_stream::Stream;
 use tokio_util::sync::PollSender;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::machine::{Machine, MachineData, MachineRef};
+use crate::machine::{Machine, MachineData, MachineRef, MachineRunId};
 use crate::store::models::MachineConfig;
 use crate::supervisor::VmmClientError;
 use crate::LibVmError;
@@ -182,6 +182,8 @@ impl AsyncRead for MachineFileDownload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineMonitorStatus {
     pub machine_id: String,
+    /// Launch generation, never the monitor instance ID. None denotes an older monitor.
+    pub run_id: Option<MachineRunId>,
     pub name: String,
     pub monitor: MachineMonitorSnapshot,
     pub vm: MachineVmSnapshot,
@@ -1082,6 +1084,14 @@ impl TryFrom<v1::HostStatus> for MachineMonitorStatus {
     fn try_from(value: v1::HostStatus) -> Result<Self, Self::Error> {
         Ok(Self {
             machine_id: canonical_uuid(value.machine_id, "machine_id")?,
+            run_id: value
+                .run_id
+                .map(|value| {
+                    value
+                        .parse::<MachineRunId>()
+                        .map_err(|error| format!("invalid run_id: {error}"))
+                })
+                .transpose()?,
             name: required_text(value.name, "name", protocol::MAX_INFO_BYTES)?,
             monitor: required(value.monitor, "monitor")?.try_into()?,
             vm: required(value.vm, "vm")?.try_into()?,
@@ -1841,6 +1851,7 @@ mod tests {
 
     fn status() -> v1::HostStatus {
         v1::HostStatus {
+            run_id: Some("00000000-0000-4000-8000-000000000003".into()),
             machine_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             name: Some("machine".to_string()),
             monitor: Some(v1::MonitorSnapshot {
@@ -1986,6 +1997,14 @@ mod tests {
     fn status_conversion_preserves_nested_agent_observation() {
         let converted = MachineMonitorStatus::try_from(status()).expect("valid status");
         assert_eq!(
+            converted.run_id.as_ref().map(|run| run.as_str()),
+            Some("00000000-0000-4000-8000-000000000003")
+        );
+        assert_ne!(
+            converted.run_id.as_ref().unwrap().as_str(),
+            converted.monitor.instance_id
+        );
+        assert_eq!(
             converted.monitor.instance_id,
             "00000000-0000-4000-8000-000000000002"
         );
@@ -2009,6 +2028,58 @@ mod tests {
                 .as_deref(),
             Some("guest")
         );
+    }
+    #[test]
+    fn status_run_identity_is_validated_without_substituting_monitor_identity() {
+        let mut legacy = status();
+        legacy.run_id = None;
+        assert_eq!(MachineMonitorStatus::try_from(legacy).unwrap().run_id, None);
+        let mut invalid = status();
+        invalid.run_id = Some("not-a-run".into());
+        assert!(MachineMonitorStatus::try_from(invalid)
+            .unwrap_err()
+            .contains("run_id"));
+    }
+
+    #[test]
+    fn status_reader_preserves_ssh_verification_and_freshness() {
+        let key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]));
+        let public = key.public_key().to_openssh().unwrap();
+        for freshness in [v1::Freshness::Fresh, v1::Freshness::Stale] {
+            let mut wire = status();
+            let Some(v1::host_agent::Mode::Enabled(agent)) =
+                wire.agent.as_mut().unwrap().mode.as_mut()
+            else {
+                panic!("enabled agent");
+            };
+            let observation = agent.status.as_mut().unwrap();
+            observation.freshness = Some(freshness as i32);
+            observation.report.as_mut().unwrap().ssh = Some(v1::SshListenerReport {
+                backend: "native".into(),
+                port: 22,
+                host_public_key: public.clone(),
+                config_verified: true,
+                kex_verified: true,
+            });
+            let converted = MachineMonitorStatus::try_from(wire).unwrap();
+            let MachineAgentStatus::Enabled(agent) = converted.agent else {
+                panic!("enabled agent");
+            };
+            let observation = agent.status.unwrap();
+            assert_eq!(
+                observation.freshness,
+                if freshness == v1::Freshness::Fresh {
+                    crate::MachineFreshness::Fresh
+                } else {
+                    crate::MachineFreshness::Stale
+                }
+            );
+            assert!(observation.stale_at >= observation.received_at);
+            let ssh = observation.report.ssh.unwrap();
+            assert_eq!(ssh.host_public_key, public);
+            assert!(ssh.config_verified && ssh.kex_verified);
+            assert_eq!(ssh.port, 22);
+        }
     }
     #[test]
     fn metrics_conversion_preserves_every_snapshot_array() {

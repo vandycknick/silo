@@ -402,6 +402,8 @@ pub struct RuleDecl {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TailscaleDecl {
     pub name: String,
+    #[serde(default)]
+    pub ephemeral: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]

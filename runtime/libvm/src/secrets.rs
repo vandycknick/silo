@@ -70,6 +70,26 @@ pub(crate) fn resolve_for_start(
     provider: Option<&HostCommand>,
     reference: &str,
 ) -> Result<ResolvedSecrets, LibVmError> {
+    resolve_for_scope(
+        store,
+        network,
+        Some(machine_id),
+        run,
+        explicit,
+        provider,
+        reference,
+    )
+}
+
+pub(crate) fn resolve_for_scope(
+    store: &dyn SecretStore,
+    network: &MachineNetworkConfig,
+    machine_id: Option<MachineId>,
+    run: &str,
+    explicit: &EgressCredentials,
+    provider: Option<&HostCommand>,
+    reference: &str,
+) -> Result<ResolvedSecrets, LibVmError> {
     let error = |message| LibVmError::NetworkRuntime {
         reference: reference.into(),
         message,
@@ -85,9 +105,10 @@ pub(crate) fn resolve_for_start(
     else {
         return Ok(ResolvedSecrets::default());
     };
-    let machine = SecretScope::Machine {
-        id: MachineScopeId::new(machine_id.to_string()).map_err(|e| error(e.to_string()))?,
-    };
+    let machine = machine_id
+        .map(|id| MachineScopeId::new(id.to_string()).map(|id| SecretScope::Machine { id }))
+        .transpose()
+        .map_err(|e| error(e.to_string()))?;
     let mut cache = BTreeMap::<(u8, SecretName), Option<Secret>>::new();
     let mut resolved = ResolvedSecrets::default();
     let slots = policy.secret_slots();
@@ -114,7 +135,12 @@ pub(crate) fn resolve_for_start(
             continue;
         }
         let mut selected = None;
-        for (index, scope) in [(0, &machine), (1, &SecretScope::Home)] {
+        for (index, scope) in machine
+            .as_ref()
+            .map(|scope| (0, scope))
+            .into_iter()
+            .chain(std::iter::once((1, &SecretScope::Home)))
+        {
             for (key, field) in [
                 (SecretName::legacy(&slot.name), SecretField::Value),
                 (slot.source.key.clone(), slot.source.field),
@@ -239,7 +265,12 @@ pub(crate) fn resolve_for_start(
                 .collect::<Result<Vec<_>, _>>()?;
             let grant = SecretGrant::issue(
                 &store_file,
-                MachineScopeId::new(machine_id.to_string()).map_err(|e| error(e.to_string()))?,
+                MachineScopeId::new(
+                    machine_id
+                        .ok_or_else(|| error("provider requires a machine scope".into()))?
+                        .to_string(),
+                )
+                .map_err(|e| error(e.to_string()))?,
                 run.into(),
                 allowed,
             )
@@ -356,6 +387,7 @@ mod tests {
         let machine = runtime
             .machine()
             .name("external-store")
+            .vsock(true)
             .image_source(crate::ImageSource::disk(disk))
             .agent_mode(Some(crate::MachineAgent::Disabled))
             .network(|network| network.private().policy(policy.clone()))
@@ -1048,6 +1080,7 @@ mod tests {
         let machine = runtime
             .machine()
             .name("missing-secret")
+            .vsock(true)
             .image_source(crate::ImageSource::disk(disk))
             .agent_mode(Some(crate::MachineAgent::Disabled))
             .network(|network| network.private().policy(policy))

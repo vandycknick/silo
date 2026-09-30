@@ -30,7 +30,7 @@ pub use inspect::{
     MachineBootMode, MachineBootReport, MachineData, MachineInventoryEntry, MachineIssue,
     MachineIssueComponent, MachineObservation, MachineProvisionFailurePolicy,
     MachineProvisionReport, MachineProvisionStatus, MachineProvisionStepReport,
-    MachineProvisionStepStatus, MachineRootfs, MachineStatus,
+    MachineProvisionStepStatus, MachineRootfs, MachineStatus, MachineTailscale,
 };
 pub use lifecycle_options::{
     MachineExit, MachineExitOutcome, MachineKillOptions, MachineRunId, MachineStart,

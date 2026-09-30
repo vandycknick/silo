@@ -34,6 +34,15 @@ struct ExecRequest {
     #[serde(default)]
     pipe_stdin: bool,
     tty: Option<bool>,
+    term: Option<String>,
+    initial_pty_size: Option<PtySizeRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PtySizeRequest {
+    rows: u16,
+    columns: u16,
 }
 
 #[derive(Deserialize)]
@@ -534,8 +543,16 @@ where
 
 fn decode_request(pointer: *const u8, length: usize) -> Result<ExecRequest, *mut SiloError> {
     unsafe {
-        serde_json::from_slice(request_bytes(pointer, length)?)
-            .map_err(|error| invalid_argument(format!("decode execution request: {error}")))
+        let request: ExecRequest = serde_json::from_slice(request_bytes(pointer, length)?)
+            .map_err(|error| invalid_argument(format!("decode execution request: {error}")))?;
+        if request
+            .initial_pty_size
+            .as_ref()
+            .is_some_and(|size| size.rows == 0 || size.columns == 0)
+        {
+            return Err(invalid_argument("PTY rows and columns must be positive"));
+        }
+        Ok(request)
     }
 }
 fn apply_options(
@@ -543,6 +560,12 @@ fn apply_options(
     request: ExecRequest,
 ) -> ExecutionOptionsBuilder {
     builder = builder.args(request.additional_args);
+    if let Some(term) = request.term {
+        builder = builder.term(term);
+    }
+    if let Some(size) = request.initial_pty_size {
+        builder = builder.initial_pty_size(size.rows, size.columns);
+    }
     if let Some(cwd) = request.cwd {
         builder = builder.cwd(cwd)
     }
@@ -761,6 +784,18 @@ fn lost_reason(value: libvm::ExecutionLostReason) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn initial_pty_and_term_are_explicit_and_nested_schema_is_strict() {
+        let request: crate::exec::ExecRequest = serde_json::from_str(r#"{"program":"sh","tty":true,"term":"dumb","initial_pty_size":{"rows":37,"columns":119}}"#).unwrap();
+        let options =
+            crate::exec::apply_options(libvm::ExecutionOptionsBuilder::default(), request).build();
+        assert_eq!(options.initial_pty_size, Some((37, 119)));
+        assert_eq!(options.term, "dumb");
+        assert!(serde_json::from_str::<crate::exec::ExecRequest>(
+            r#"{"initial_pty_size":{"rows":37,"columns":119,"unknown":1}}"#
+        )
+        .is_err());
+    }
     use libvm::ExecutionEvent;
 
     use crate::exec::{decode_request, execution_event};

@@ -1,6 +1,7 @@
 mod builder;
 mod canonical;
 mod condition;
+mod format;
 mod model;
 mod parse;
 mod plugin;

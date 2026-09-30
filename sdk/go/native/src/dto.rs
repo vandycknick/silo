@@ -5,6 +5,10 @@ use libvm::{
 use serde_json::{json, Value};
 
 pub fn machine_data(data: MachineData) -> Value {
+    let mut network = machine_network(data.network);
+    if let Some(tailscale) = data.tailscale {
+        network["tailscale"] = json!({"state_dir": tailscale.state_dir, "hostname": tailscale.hostname, "ephemeral": tailscale.ephemeral});
+    }
     json!({
         "id": data.id,
         "name": data.name,
@@ -29,11 +33,17 @@ pub fn machine_data(data: MachineData) -> Value {
         "root_disk_size_bytes": data.root_disk_size,
         "labels": data.labels,
         "metadata": data.metadata,
-        "network": machine_network(data.network),
+        "network": network,
+        "cpus": data.spec.hardware.as_ref().and_then(|hardware| hardware.cpus),
+        "memory_bytes": data.spec.hardware.as_ref().and_then(|hardware| hardware.memory).map(|memory| u64::from(memory) * 1024 * 1024),
+        "guest_user": data.guest.user,
         "forwards": data.spec.forwards,
         "vsock": data.spec.vsock,
         "agent": machine_agent(data.guest.agent),
         "status": machine_status(data.status),
+        "observation": data.observation,
+        "issues": data.issues,
+        "run_id": data.run_id.map(|id| id.to_string()),
         "boot_report": data.boot_report.map(boot_report),
         "provision_report": data.provision_report.map(provision_report),
         "started_at_unix_ms": data.started_at,
