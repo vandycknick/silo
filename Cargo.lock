@@ -2660,6 +2660,7 @@ dependencies = [
  "utils",
  "uuid",
  "vm-spec",
+ "x509-parser",
  "zeroize",
 ]
 

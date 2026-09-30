@@ -1,11 +1,5 @@
 //! Shared constants for libvm behavior that crosses module boundaries.
 
-/// Local certificate authority certificate filename under the Silo keys directory.
-pub(crate) const CERTIFICATE_AUTHORITY_CERTIFICATE_FILE_NAME: &str = "ca.pem";
-
-/// Local certificate authority private key filename under the Silo keys directory.
-pub(crate) const CERTIFICATE_AUTHORITY_PRIVATE_KEY_FILE_NAME: &str = "ca-key.pem";
-
 /// Common name used for the generated local Silo certificate authority.
 pub(crate) const CERTIFICATE_AUTHORITY_COMMON_NAME: &str = "Silo Local Certificate Authority";
 

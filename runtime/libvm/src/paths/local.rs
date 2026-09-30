@@ -1,7 +1,6 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use crate::paths::defaults::{default_run_root, ensure_run_root, resolve_default_home};
 use crate::paths::machine::{
     MachinePaths, EXEC_LOG_FILE_NAME, LOGS_DIR_NAME, MACHINES_DIR_NAME,
     NETWORK_AUDIT_LOG_FILE_NAME, NETWORK_DIR_NAME, NETWORK_SERVICE_LOG_FILE_NAME,
@@ -43,13 +42,6 @@ impl LocalRoots {
             home: home.into(),
             run_root: run_root.into(),
         }
-    }
-
-    pub(crate) fn from_env() -> Result<Self, LibVmError> {
-        let home = resolve_default_home()?;
-        let run_root = default_run_root();
-        ensure_run_root(&run_root)?;
-        Ok(Self::with_roots(home, run_root))
     }
 
     pub(crate) fn home(&self) -> &Path {
@@ -103,10 +95,6 @@ impl LocalPaths {
     #[cfg(test)]
     pub(crate) fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self::from_roots(LocalRoots::new(data_dir))
-    }
-
-    pub(crate) fn from_env() -> Result<Self, LibVmError> {
-        Ok(Self::from_roots(LocalRoots::from_env()?))
     }
 
     pub(crate) fn from_roots(roots: LocalRoots) -> Self {

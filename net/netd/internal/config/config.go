@@ -29,7 +29,6 @@ type Config struct {
 	CaptureFile  string
 	Stack        NetworkConfig
 	PolicyFile   string
-	TLS          TLSConfig
 	Metadata     Metadata
 	GuestPublish PublishBind
 }
@@ -40,11 +39,6 @@ const (
 	PublishBindLoopback PublishBind = "loopback"
 	PublishBindAny      PublishBind = "any"
 )
-
-type TLSConfig struct {
-	CACert string
-	CAKey  string
-}
 
 type Metadata struct {
 	VMID      string
@@ -99,8 +93,6 @@ func Parse(args []string) (*Config, error) {
 	flags.StringVar(&cfg.AuditLogFile, "audit-log-file", "", "write audit records to this file")
 	flags.StringVar(&cfg.CaptureFile, "pcap", "", "capture network traffic to a pcap file")
 	flags.StringVar(&cfg.PolicyFile, "policy-file", "", "canonical network policy JSON file")
-	flags.StringVar(&cfg.TLS.CACert, "tls-ca-cert", "", "CA certificate used for HTTPS interception")
-	flags.StringVar(&cfg.TLS.CAKey, "tls-ca-key", "", "CA private key used for HTTPS interception")
 	flags.StringVar(&cfg.Metadata.VMID, "vm-id", "", "VM identifier added to flow logs")
 	flags.StringVar(&cfg.Metadata.RunID, "run-id", "", "run identifier added to flow logs")
 	flags.StringVar(&cfg.Metadata.NetworkID, "network-id", "", "network identifier added to flow logs")
@@ -193,9 +185,6 @@ func Parse(args []string) (*Config, error) {
 		return cfg, err
 	}
 	cfg.Stack = stack
-	if (cfg.TLS.CACert == "") != (cfg.TLS.CAKey == "") {
-		return cfg, errors.New("--tls-ca-cert and --tls-ca-key must be provided together")
-	}
 	return cfg, nil
 }
 
@@ -219,11 +208,6 @@ func LoadPolicy(cfg *Config) (*policy.Policy, error) {
 	}
 	if err != nil {
 		return nil, err
-	}
-	if compiledPolicy.HasHTTPS() || compiledPolicy.HasRegistries() {
-		if cfg.TLS.CACert == "" || cfg.TLS.CAKey == "" {
-			return nil, errors.New("--tls-ca-cert and --tls-ca-key are required when policy contains TLS-terminating endpoints")
-		}
 	}
 	return compiledPolicy, nil
 }

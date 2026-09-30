@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,8 +24,8 @@ func TestManagedWorkerIsAdoptedAndExitsOnOwnerEOF(t *testing.T) {
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, output)
 	}
-	for _, mode := range []string{"ready", "startup-error", "secrets-error"} {
-		failStartup := mode != "ready"
+	for _, mode := range []string{"ready", "startup-error", "secrets-error", "tls-ready", "tls-missing", "tls-mismatch", "tls-partial", "tls-malformed"} {
+		failStartup := mode != "ready" && mode != "tls-ready"
 		t.Run(mode, func(t *testing.T) {
 			// Unix socket pathname limits on macOS are shorter than testing.TempDir paths.
 			root, err := os.MkdirTemp("/tmp", "netd-test-")
@@ -69,6 +70,13 @@ func TestManagedWorkerIsAdoptedAndExitsOnOwnerEOF(t *testing.T) {
 			args := []string{"--daemonize", "--log-dir-fd=3", "--runtime-dir-fd=4", "--startup-fd=5", "--exit-fd=6", "--secrets-fd=8",
 				"--listen-vfkit=unixgram://" + endpoint, "--log-file=netd.log", "--audit-log-file=audit.log", "--pid-file=netd.pid",
 				"--vm-id=test-vm", "--run-id=test-run", "--network-id=test-network"}
+			if strings.HasPrefix(mode, "tls-") {
+				policyPath := filepath.Join(root, "policy.json")
+				if err := os.WriteFile(policyPath, []byte(`{"version":1,"endpoints":[{"kind":"https","name":"local","family":"http","transport":"https-mitm","tls":"terminate","capabilities":["credential-injection"],"hosts":["localhost"]}]}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+				args = append(args, "--policy-file="+policyPath)
+			}
 			launcher := exec.Command(binary, args...)
 			launcher.Env = append(os.Environ(), "SILO_NET_LEGACY=must-not-inherit")
 			launcher.ExtraFiles = []*os.File{logs, runtimeDir, reportW, exitR, logs, secretsR}
@@ -79,6 +87,19 @@ func TestManagedWorkerIsAdoptedAndExitsOnOwnerEOF(t *testing.T) {
 			// Maximum-sized JSON with padding exercises spawn-first delivery and
 			// proves the final worker waited for the complete frame plus EOF.
 			body := `{"version":1,"secrets":[]}`
+			if strings.HasPrefix(mode, "tls-") && mode != "tls-missing" {
+				certificate, key := tlsStartupPair(t)
+				if mode == "tls-mismatch" {
+					_, key = tlsStartupPair(t)
+				}
+				if mode == "tls-malformed" {
+					certificate = []byte("malformed")
+				}
+				body = fmt.Sprintf(`{"version":1,"secrets":[{"name":"silo.tls_ca.certificate","value":%q},{"name":"silo.tls_ca.private_key","value":%q}]}`, base64.StdEncoding.EncodeToString(certificate), base64.StdEncoding.EncodeToString(key))
+				if mode == "tls-partial" {
+					body = fmt.Sprintf(`{"version":1,"secrets":[{"name":"silo.tls_ca.certificate","value":%q}]}`, base64.StdEncoding.EncodeToString(certificate))
+				}
+			}
 			body += strings.Repeat(" ", credentials.MaxSecretsBody-len(body))
 			if mode == "secrets-error" {
 				body = `{"version":1,"secrets":[],"unknown":true}`
@@ -107,6 +128,14 @@ func TestManagedWorkerIsAdoptedAndExitsOnOwnerEOF(t *testing.T) {
 			}
 			if mode == "secrets-error" && !strings.Contains(report.Error, "invalid secrets JSON") {
 				t.Fatal("worker did not report secrets failure")
+			}
+			if strings.HasPrefix(mode, "tls-") && mode != "tls-ready" {
+				if (mode == "tls-missing" || mode == "tls-partial") && !strings.Contains(report.Error, "silo.tls_ca.certificate") {
+					t.Fatal("worker did not fail closed on missing TLS CA")
+				}
+				if _, err := os.Stat(endpoint); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("listener opened before TLS source validation")
+				}
 			}
 			if report.RunID != "test-run" || report.NetworkID != "test-network" {
 				t.Fatalf("generation: %+v", report)

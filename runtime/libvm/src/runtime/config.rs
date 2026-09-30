@@ -263,9 +263,9 @@ pub struct NetdRuntimeConfig {
     pub subnet: String,
     /// Whether packet capture should be enabled.
     pub pcap: bool,
-    /// Optional TLS CA certificate path.
+    /// Optional operator CA certificate import input, checked against the Home store.
     pub tls_ca_cert: Option<PathBuf>,
-    /// Optional TLS CA key path.
+    /// Optional operator CA key import input, never passed to netd or the guest.
     pub tls_ca_key: Option<PathBuf>,
 }
 
@@ -298,7 +298,9 @@ impl NetdRuntimeConfig {
         self
     }
 
-    /// Sets both TLS CA paths.
+    /// Imports a TLS CA into the selected Home secret store on the first
+    /// intercepting start. Repeated imports must equal the stored pair;
+    /// conflicts fail without replacing existing trust.
     pub fn with_tls_ca(mut self, cert: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self {
         self.tls_ca_cert = Some(cert.into());
         self.tls_ca_key = Some(key.into());

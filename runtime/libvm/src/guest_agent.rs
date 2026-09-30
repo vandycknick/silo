@@ -15,18 +15,15 @@ use crate::constants::{
 use crate::host;
 use crate::machine::MachineUserConfig;
 use crate::network::VmmNetworkAttachment;
-use crate::paths::LocalPaths;
-use crate::RuntimeNetworkingConfig;
 
 pub(crate) struct GuestAgentConfigInput<'a> {
-    pub(crate) paths: &'a LocalPaths,
     pub(crate) machine_name: &'a str,
     pub(crate) spec: &'a VmSpec,
     pub(crate) network: &'a VmmNetworkAttachment,
-    pub(crate) networking: &'a RuntimeNetworkingConfig,
     pub(crate) resize_rootfs: bool,
     pub(crate) user: Option<&'a MachineUserConfig>,
     pub(crate) ssh_trusted_ca: &'a str,
+    pub(crate) tls_certificate: Option<&'a str>,
 }
 
 struct GuestAgentHostContext {
@@ -38,13 +35,13 @@ struct GuestAgentHostContext {
 }
 
 pub(crate) fn build_config(input: GuestAgentConfigInput<'_>) -> eyre::Result<AgentConfig> {
-    let host_context = load_host_context(
-        input.paths,
-        input.networking,
-        input.network.requires_certificate_authority(),
-        input.user,
-        input.ssh_trusted_ca,
-    )?;
+    let host_context = GuestAgentHostContext {
+        user: input.user.cloned(),
+        ssh_trusted_ca: input.ssh_trusted_ca.into(),
+        certificate_authority_pem: input.tls_certificate.map(str::to_owned),
+        timezone: host::current_timezone(),
+        locale: host::current_locale(),
+    };
     build_config_with_host_context(
         input.machine_name,
         input.spec,
@@ -52,26 +49,6 @@ pub(crate) fn build_config(input: GuestAgentConfigInput<'_>) -> eyre::Result<Age
         input.resize_rootfs,
         &host_context,
     )
-}
-
-fn load_host_context(
-    paths: &LocalPaths,
-    networking: &RuntimeNetworkingConfig,
-    requires_certificate_authority: bool,
-    user: Option<&MachineUserConfig>,
-    ssh_trusted_ca: &str,
-) -> eyre::Result<GuestAgentHostContext> {
-    let certificate_authority_pem = requires_certificate_authority
-        .then(|| certificate_authority_pem_for_config(paths, networking))
-        .transpose()?;
-
-    Ok(GuestAgentHostContext {
-        user: user.cloned(),
-        ssh_trusted_ca: ssh_trusted_ca.to_string(),
-        certificate_authority_pem,
-        timezone: host::current_timezone(),
-        locale: host::current_locale(),
-    })
 }
 
 fn build_config_with_host_context(
@@ -216,17 +193,6 @@ fn provision_mount_entries(spec: &VmSpec) -> eyre::Result<Vec<ProvisionMountConf
             },
         })
         .collect())
-}
-
-fn certificate_authority_pem_for_config(
-    paths: &LocalPaths,
-    config: &RuntimeNetworkingConfig,
-) -> eyre::Result<String> {
-    if let Some(path) = config.netd.tls_ca_cert.as_deref() {
-        return host::read_certificate_authority_certificate(path);
-    }
-
-    host::ensure_certificate_authority_in(paths).map(|authority| authority.certificate_pem)
 }
 
 fn pem_with_trailing_newline(pem: &str) -> String {

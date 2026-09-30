@@ -66,7 +66,7 @@ Notes:
 - `provision` controls optional guest provisioning work such as static networking, hostname, and root filesystem resizing.
 - `provision.network` is omitted for a machine without a network attachment. When provisioning is enabled, the network provisioner still brings up loopback but leaves non-loopback links, routes, and `/etc/resolv.conf` untouched.
 - Networking is the first provisioner. It brings up loopback, then matches and configures the optional static interface through Linux rtnetlink without invoking DHCP, `ip`, or a network manager.
-- The host only configures a guest certificate authority when its network policy contains an HTTPS interception endpoint. VMs without a policy and VMs with only IP or HTTP endpoints do not generate, transfer, or install CA material.
+- The host only configures a guest certificate authority when its network policy contains a TLS-terminating endpoint (HTTPS or registries). It resolves the Home SecretStore pair once, sends its certificate to guest trust, and delivers that same pair to netd through the secrets pipe. VMs without interception do not generate, transfer, or install TLS CA material. The private key never enters guest configuration.
 - CA trust installation uses `update-ca-certificates` when available, otherwise p11-kit `trust`. A configured CA is required launch state, so a missing or failed trust backend fails managed boot.
 - Ext4 root filesystems grow through the kernel's online resize ioctl. Guest images do not need `findmnt`, `resize2fs`, or e2fsprogs.
 - A configured root filesystem resize is required launch state. Discovery or resize failures fail managed boot instead of exposing less capacity than requested.

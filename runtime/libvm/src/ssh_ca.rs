@@ -233,6 +233,11 @@ mod tests {
         assert_eq!(resolved.ssh_trusted_ca, Some(pair.public));
         assert_eq!(resolved.infrastructure[0].1, pair.private);
         assert!(resolved.oauth_refresh_hook.is_none());
+        assert!(resolved.tls_certificate.is_none());
+        assert!(
+            !selected.path().exists(),
+            "non-intercepting start must not create a Home CA"
+        );
         let frame = crate::network::secret_transport::frame(&resolved, None, "test").unwrap();
         let body = frame
             .windows(4)
@@ -258,8 +263,116 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.infrastructure[0].1, pair.private);
         assert_eq!(resolved.credentials.secrets[0].slot, "personal.token");
+        let home_ca = crate::host::certificates::resolve(
+            selected.as_ref(),
+            &crate::paths::LocalPaths::new(runtime.local_home()),
+            &crate::NetdRuntimeConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.tls_certificate.as_deref(),
+            Some(home_ca.certificate.as_str())
+        );
+        assert_eq!(
+            resolved.infrastructure[1].0,
+            crate::host::certificates::CERTIFICATE
+        );
+        assert_eq!(
+            resolved.infrastructure[1].1.as_bytes(),
+            home_ca.certificate.as_bytes()
+        );
+        assert_eq!(resolved.infrastructure[2].1, home_ca.private);
+        let crate::store::models::MachineNetworkConfig::Private { policy, .. } = &config.network
+        else {
+            panic!("private")
+        };
+        let frame =
+            crate::network::secret_transport::frame(&resolved, policy.as_ref(), "test").unwrap();
+        let body = frame
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let payload: serde_json::Value = serde_json::from_slice(&frame[body..]).unwrap();
+        assert!(payload.get("provider").is_none());
+        let tls_cert = payload["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == crate::host::certificates::CERTIFICATE)
+            .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(tls_cert["value"].as_str().unwrap())
+                .unwrap(),
+            home_ca.certificate.as_bytes()
+        );
+        let network = crate::network::VmmNetworkAttachment::UnixDatagram {
+            path: "/tmp/net.sock".into(),
+            mac: "02:00:00:00:00:01".into(),
+            ipv4: agent_spec::NetworkIpv4Config {
+                address: "192.168.105.2".parse().unwrap(),
+                prefix_length: 24,
+                gateway: "192.168.105.1".parse().unwrap(),
+            },
+            dns: agent_spec::NetworkDnsConfig {
+                servers: vec![],
+                search: vec![],
+            },
+            requires_certificate_authority: true,
+            exit_writer: None,
+        };
+        // Change the store after resolution: guest composition must still use
+        // the exact launch snapshot, with no second lookup or CA generator.
+        selected
+            .put(
+                &silo_secrets::SecretScope::Home,
+                &silo_secrets::SecretName::new(crate::host::certificates::CERTIFICATE).unwrap(),
+                silo_secrets::Secret::Plain(silo_secrets::SecretBytes::new(
+                    b"corrupt-after-resolution".to_vec(),
+                )),
+            )
+            .unwrap();
+        let guest = crate::guest_agent::build_config(crate::guest_agent::GuestAgentConfigInput {
+            machine_name: "snapshot",
+            spec: &config.spec,
+            network: &network,
+            resize_rootfs: false,
+            user: None,
+            ssh_trusted_ca: resolved.ssh_trusted_ca.as_deref().unwrap(),
+            tls_certificate: resolved.tls_certificate.as_deref(),
+        })
+        .unwrap();
+        assert_eq!(
+            guest.provision.certificate_authority.unwrap().pem,
+            home_ca.certificate
+        );
+        selected
+            .put(
+                &silo_secrets::SecretScope::Home,
+                &silo_secrets::SecretName::new(crate::host::certificates::CERTIFICATE).unwrap(),
+                silo_secrets::Secret::Plain(silo_secrets::SecretBytes::new(
+                    home_ca.certificate.into_bytes(),
+                )),
+            )
+            .unwrap();
+        assert!(!runtime.local_home().join("keys").exists());
+        let mut oversized = resolved.clone();
+        oversized.credentials =
+            crate::EgressCredentials::new().secret("personal.token", "x".repeat(12_000));
+        assert!(
+            crate::network::secret_transport::frame(&oversized, policy.as_ref(), "test")
+                .unwrap_err()
+                .to_string()
+                .contains("16384")
+        );
+        let before = std::fs::read(selected.path()).unwrap();
         machine.remove().await.unwrap();
-        assert!(selected.list_scopes().unwrap().is_empty());
+        assert_eq!(
+            selected.list_scopes().unwrap(),
+            vec![silo_secrets::SecretScope::Home]
+        );
+        assert_eq!(std::fs::read(selected.path()).unwrap(), before);
         assert!(runtime
             .machine()
             .name("external-rollback")
@@ -268,7 +381,10 @@ mod tests {
             .create()
             .await
             .is_err());
-        assert!(selected.list_scopes().unwrap().is_empty());
+        assert_eq!(
+            selected.list_scopes().unwrap(),
+            vec![silo_secrets::SecretScope::Home]
+        );
         assert!(std::fs::read_dir(runtime.local_home().join("machines"))
             .unwrap()
             .next()
