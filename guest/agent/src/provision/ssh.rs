@@ -15,7 +15,7 @@ pub(crate) fn policy(ca: &Path, host: &Path) -> String {
     // Command directives are omitted from this Include-free authoritative file:
     // their disabled defaults render as `none` in -T. Explicit `none` can be
     // retained as a non-null principal command by OpenSSH's inetd re-exec.
-    format!("HostKey {}\nTrustedUserCAKeys {}\nAuthenticationMethods publickey\nPubkeyAuthentication yes\nPubkeyAcceptedAlgorithms ssh-ed25519-cert-v01@openssh.com\nCASignatureAlgorithms ssh-ed25519\nAuthorizedKeysFile none\nAuthorizedPrincipalsFile none\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nHostbasedAuthentication no\nGSSAPIAuthentication no\nPermitEmptyPasswords no\nUsePAM yes\nPermitRootLogin yes\nAcceptEnv SILO_*\nLogLevel VERBOSE\n", host.display(), ca.display())
+    format!("HostKey {}\nTrustedUserCAKeys {}\nAuthenticationMethods publickey\nPubkeyAuthentication yes\nPubkeyAcceptedAlgorithms ssh-ed25519-cert-v01@openssh.com\nCASignatureAlgorithms ssh-ed25519\nAuthorizedKeysFile none\nAuthorizedPrincipalsFile none\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nHostbasedAuthentication no\nGSSAPIAuthentication no\nPermitEmptyPasswords no\nUsePAM yes\nPermitRootLogin yes\nAcceptEnv SILO_*\nSubsystem sftp internal-sftp\nLogLevel VERBOSE\n", host.display(), ca.display())
 }
 
 pub(crate) fn systemd_override(config: &Path, inetd: bool) -> String {

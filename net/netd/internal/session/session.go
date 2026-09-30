@@ -5,10 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/vandycknick/silo/net/netd/internal/config"
 	"github.com/vandycknick/silo/net/netd/internal/credentials"
@@ -21,6 +24,7 @@ import (
 	"github.com/vandycknick/silo/net/netd/internal/netnode"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
 	"github.com/vandycknick/silo/net/netd/internal/registry"
+	"github.com/vandycknick/silo/net/netd/internal/sshdoor"
 	"github.com/vandycknick/silo/net/netd/internal/virtualnetwork"
 )
 
@@ -91,6 +95,40 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 			return nil, err
 		}
 		result.node, err = netnode.New(netnode.Options{Dir: spec.TailscaleStateDir, Declaration: *decl, Secrets: spec.Secrets, Guest: result, Flows: flows,
+			Ready: func(ctx context.Context) (func(), error) {
+				ca, ok := spec.Secrets.Lookup("silo.ssh_ca.private_key")
+				if !ok {
+					return nil, errors.New("machine SSH CA missing")
+				}
+				// libvm supplies the machine's tailscale directory. SSH identity
+				// and immutable pins are siblings, never inside replaceable state.
+				setup, cancel := context.WithTimeout(ctx, 30*time.Second)
+				door, err := sshdoor.New(setup, filepath.Join(filepath.Dir(spec.TailscaleStateDir), "ssh"), spec.VsockMux, ca, func(event sshdoor.Event) { shared.Audit.RecordInboundSSH(spec.VMID, spec.RunID, spec.NetworkID, event) })
+				cancel()
+				if err != nil {
+					return nil, err
+				}
+				client, err := result.node.LocalClient()
+				if err != nil {
+					door.Close()
+					return nil, err
+				}
+				listener, err := result.node.Listen("tcp", ":22")
+				if err != nil {
+					door.Close()
+					return nil, err
+				}
+				doorCtx, stop := context.WithCancel(ctx)
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					if err := door.Serve(doorCtx, listener, client); err != nil {
+						slog.Warn("SSH front door stopped", "error", err)
+					}
+					door.Close()
+				}()
+				return func() { stop(); listener.Close(); <-done }, nil
+			},
 			Audit: func(event netnode.InboundEvent) {
 				shared.Audit.RecordInbound(spec.VMID, spec.RunID, spec.NetworkID, event)
 			},

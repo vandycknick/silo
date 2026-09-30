@@ -38,6 +38,7 @@ type InboundEvent struct {
 	Duration         time.Duration
 }
 type Options struct {
+	Ready       func(context.Context) (func(), error)
 	Dir         string
 	Declaration policy.TailscaleDecl
 	Secrets     credentials.Source
@@ -147,6 +148,14 @@ func (n *Node) run(ctx context.Context) {
 	n.mu.Lock()
 	n.client = client
 	n.mu.Unlock()
+	if n.options.Ready != nil {
+		closeDoor, err := n.options.Ready(ctx)
+		if err != nil {
+			slog.Warn("tailscale SSH front door unavailable", "error", err)
+		} else {
+			defer closeDoor()
+		}
+	}
 	watchDone := make(chan struct{})
 	go func() { defer close(watchDone); n.watch(ctx, client) }()
 	defer func() { <-watchDone }()
@@ -346,6 +355,26 @@ func (n *Node) DialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn, strin
 
 func (n *Node) Fallback(src, dst netip.AddrPort) (func(net.Conn), bool) {
 	return func(conn net.Conn) { n.relay(src, dst, conn) }, true
+}
+
+// Listen and LocalClient are available after initialization, including while
+// enrollment is pending. No listener bypasses tsnet's packet filter.
+func (n *Node) Listen(network, address string) (net.Listener, error) {
+	n.mu.Lock()
+	ready := n.initialized && !n.closed
+	n.mu.Unlock()
+	if !ready {
+		return nil, errors.New("tailscale node not initialized")
+	}
+	return n.server.Listen(network, address)
+}
+func (n *Node) LocalClient() (*local.Client, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.client == nil || n.closed {
+		return nil, errors.New("tailscale local client unavailable")
+	}
+	return n.client, nil
 }
 func (n *Node) relay(src, dst netip.AddrPort, in net.Conn) {
 	start := time.Now()
