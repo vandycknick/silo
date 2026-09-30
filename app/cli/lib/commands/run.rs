@@ -273,12 +273,9 @@ impl Cmd {
         let start = match machine.start_with_options(options).await {
             Ok(start) => start,
             Err(error) => {
-                return Err(cleanup_foreground_failure(
-                    &machine,
-                    plan.create.retention,
-                    error.into(),
+                return Err(
+                    cleanup_foreground_failure(&machine, plan.create.retention, error).await,
                 )
-                .await)
             }
         };
         progress.step("Waiting", &name);
@@ -526,17 +523,18 @@ async fn diagnose_backend_exit(
     ))
 }
 
-fn start_failure(error: libvm::LibVmError) -> eyre::Report {
-    let exit_code = match &error {
-        libvm::LibVmError::EntrypointLaunchFailed { failure }
+fn start_failure(error: impl Into<eyre::Report>) -> eyre::Report {
+    let error = error.into();
+    let exit_code = match error.downcast_ref::<libvm::LibVmError>() {
+        Some(libvm::LibVmError::EntrypointLaunchFailed { failure })
             if failure.reason == libvm::ExecutionLaunchFailureReason::CommandNotFound =>
         {
             127
         }
-        libvm::LibVmError::EntrypointLaunchFailed { .. } => 126,
+        Some(libvm::LibVmError::EntrypointLaunchFailed { .. }) => 126,
         _ => 125,
     };
-    eyre::Report::from(error).wrap_err(crate::errors::ExecutionExit::new(exit_code))
+    error.wrap_err(crate::errors::ExecutionExit::new(exit_code))
 }
 
 fn execution_infrastructure(error: eyre::Report) -> eyre::Report {

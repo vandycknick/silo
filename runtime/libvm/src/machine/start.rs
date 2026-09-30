@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 
-use silo_policy::{NetworkPolicy, NetworkSecretKind};
+use silo_policy::NetworkPolicy;
 
 use crate::store::models::MachineNetworkConfig;
 use crate::LibVmError;
@@ -21,11 +21,12 @@ pub struct MachineStartOptions {
     ///
     /// When unset, no exit hook is registered.
     pub on_exit: Option<HostCommand>,
-    /// Launch-only egress credentials for this run.
+    /// Explicit launch-only egress credentials for this run.
     ///
     /// Credential material is never persisted in durable machine config. It is
     /// validated against the persisted network policy before a network runtime
-    /// is launched.
+    /// is launched. An empty set resolves policy slots from the runtime's store;
+    /// a non-empty set overrides the whole set and bypasses the store.
     pub egress_credentials: EgressCredentials,
     /// Optional silo-vmm-owned guest process this machine run exists to execute.
     ///
@@ -189,6 +190,7 @@ impl MachineStartOptions {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_egress_credentials(
         &self,
         network: &MachineNetworkConfig,
@@ -210,8 +212,6 @@ impl MachineStartOptions {
 pub struct EgressCredentials {
     /// Secret values keyed by canonical network secret slot name.
     pub secrets: Vec<EgressSecret>,
-    /// Optional OAuth refresh hook shared by OAuth credentials in this network.
-    pub oauth_refresh_hook: Option<OAuthRefreshHook>,
 }
 
 impl sealed::Sealed for EgressCredentials {}
@@ -246,7 +246,7 @@ impl fmt::Debug for EgressSecret {
 /// Command hook used by a networking component to refresh OAuth access tokens.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct OAuthRefreshHook {
+pub(crate) struct V1RefreshProvider {
     /// Absolute executable path.
     pub command: PathBuf,
     /// Arguments passed directly to the executable, without shell parsing.
@@ -259,10 +259,10 @@ pub struct OAuthRefreshHook {
     pub refresh_skew_seconds: Option<u64>,
 }
 
-impl fmt::Debug for OAuthRefreshHook {
+impl fmt::Debug for V1RefreshProvider {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("OAuthRefreshHook")
+            .debug_struct("V1RefreshProvider")
             .field("command", &self.command)
             .field("args", &self.args)
             .field("auth", &"<redacted>")
@@ -331,14 +331,20 @@ impl EgressCredentials {
         self
     }
 
-    /// Registers the OAuth refresh hook for these credentials.
-    pub fn oauth_refresh_hook(mut self, hook: OAuthRefreshHook) -> Self {
-        self.oauth_refresh_hook = Some(hook);
-        self
+    #[cfg(test)]
+    pub(crate) fn oauth_refresh_hook(
+        self,
+        hook: V1RefreshProvider,
+    ) -> crate::secrets::ResolvedSecrets {
+        crate::secrets::ResolvedSecrets {
+            credentials: self,
+            oauth_refresh_hook: Some(hook),
+            provenance: Vec::new(),
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.secrets.is_empty() && self.oauth_refresh_hook.is_none()
+        self.secrets.is_empty()
     }
 
     pub(crate) fn validate_for_network_config(
@@ -412,34 +418,57 @@ impl EgressCredentials {
             }
         }
 
-        for requirement in policy.secret_requirements() {
-            if !requirement.alternatives.iter().any(|alternative| {
-                alternative
-                    .slots
-                    .iter()
-                    .all(|slot| supplied_slots.contains(slot.as_str()))
-            }) {
-                return Err(LibVmError::NetworkRuntime {
-                    reference: reference.to_string(),
-                    message: format!(
-                        "required network secret material for {} was not supplied; expected {}",
-                        requirement.owner,
-                        format_secret_requirement(&requirement.alternatives)
-                    ),
-                });
-            }
+        let missing = policy
+            .secret_requirements()
+            .into_iter()
+            .filter(|requirement| {
+                !requirement.alternatives.iter().any(|alternative| {
+                    alternative
+                        .slots
+                        .iter()
+                        .all(|slot| supplied_slots.contains(slot.as_str()))
+                })
+            })
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let keys = slots
+                .iter()
+                .filter(|slot| {
+                    missing.iter().any(|requirement| {
+                        requirement
+                            .alternatives
+                            .iter()
+                            .any(|alternative| alternative.slots.contains(&slot.name))
+                    })
+                })
+                .map(|slot| slot.source.key.as_str().to_owned())
+                .collect();
+            return Err(LibVmError::MissingNetworkSecrets {
+                reference: reference.into(),
+                requirements: missing,
+                policy: Box::new(policy.clone()),
+                keys,
+            });
         }
-
-        self.validate_oauth_refresh_hook(policy, reference)
+        Ok(())
     }
+}
 
-    fn validate_oauth_refresh_hook(
+impl crate::secrets::ResolvedSecrets {
+    pub(crate) fn validate_for_policy(
         &self,
-        policy: &NetworkPolicy,
+        policy: Option<&NetworkPolicy>,
         reference: &str,
     ) -> Result<(), LibVmError> {
+        self.credentials.validate_for_policy(policy, reference)?;
         let Some(hook) = &self.oauth_refresh_hook else {
             return Ok(());
+        };
+        let Some(policy) = policy else {
+            return Err(LibVmError::NetworkRuntime {
+                reference: reference.into(),
+                message: "OAuth refresh hook requires a persisted network policy".into(),
+            });
         };
         if hook.auth.is_empty() {
             return Err(LibVmError::NetworkRuntime {
@@ -465,7 +494,7 @@ impl EgressCredentials {
         if !policy
             .secret_slots()
             .into_iter()
-            .any(|slot| slot.kind == NetworkSecretKind::OAuth)
+            .any(|slot| slot.kind == silo_policy::NetworkSecretKind::OAuth)
         {
             return Err(LibVmError::NetworkRuntime {
                 reference: reference.to_string(),
@@ -477,22 +506,7 @@ impl EgressCredentials {
     }
 }
 
-fn format_secret_requirement(alternatives: &[silo_policy::NetworkSecretAlternative]) -> String {
-    alternatives
-        .iter()
-        .map(|alternative| {
-            alternative
-                .slots
-                .iter()
-                .map(|slot| format!("{slot:?}"))
-                .collect::<Vec<_>>()
-                .join(" and ")
-        })
-        .collect::<Vec<_>>()
-        .join(" or ")
-}
-
-impl OAuthRefreshHook {
+impl V1RefreshProvider {
     /// Creates an OAuth refresh hook command with opaque authorization bytes.
     pub fn new(command: impl Into<PathBuf>, auth: impl Into<Vec<u8>>) -> Self {
         Self {
@@ -505,6 +519,7 @@ impl OAuthRefreshHook {
     }
 
     /// Appends one command argument.
+    #[cfg(test)]
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.args.push(arg.into());
         self
@@ -652,11 +667,7 @@ mod tests {
             .validate_for_policy(Some(&policy), "devbox")
             .expect_err("missing expires_at should fail");
 
-        assert!(matches!(
-            err,
-            LibVmError::NetworkRuntime { ref message, .. }
-                if message.contains("codex.oauth.expires_at")
-        ));
+        assert!(matches!(err, LibVmError::MissingNetworkSecrets { .. }));
     }
 
     #[test]
@@ -691,13 +702,7 @@ mod tests {
             .validate_for_policy(Some(&policy), "devbox")
             .expect_err("session token alone should fail");
 
-        assert!(matches!(
-            err,
-            LibVmError::NetworkRuntime { ref message, .. }
-                if message.contains("prod.profile")
-                    && message.contains("prod.access_key_id")
-                    && message.contains("prod.secret_access_key")
-        ));
+        assert!(matches!(err, LibVmError::MissingNetworkSecrets { .. }));
     }
 
     #[test]
@@ -763,7 +768,7 @@ mod tests {
         let credentials = EgressCredentials::new()
             .secret("codex.oauth.access_token", "token")
             .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
-            .oauth_refresh_hook(OAuthRefreshHook::new("silo", Vec::<u8>::new()));
+            .oauth_refresh_hook(V1RefreshProvider::new("silo", Vec::<u8>::new()));
 
         let err = credentials
             .validate_for_policy(Some(&policy), "devbox")
@@ -797,10 +802,7 @@ mod tests {
         let options = MachineStartOptions::new().credentials(
             EgressCredentials::new()
                 .secret("codex.oauth.access_token", "token")
-                .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
-                .oauth_refresh_hook(
-                    OAuthRefreshHook::new("/usr/bin/silo", b"auth".to_vec()).arg("refresh"),
-                ),
+                .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z"),
         );
 
         options

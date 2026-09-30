@@ -6,14 +6,14 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{SecondsFormat, Utc};
 use clap::{Args, Subcommand};
 use libvm::{
-    EgressCredentials, NetworkCredential, NetworkPolicy, NetworkSecretAlternative,
-    NetworkSecretKind, NetworkSecretRequirement, NetworkSecretSlot, OAuthRefreshHook,
+    NetworkCredential, NetworkPolicy, NetworkSecretAlternative, NetworkSecretRequirement,
+    NetworkSecretSlot,
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use silo_secrets::{
-    FileStore, OAuthSecret, Secret, SecretBytes, SecretField, SecretName, SecretScope, SecretStore,
+    FileStore, OAuthSecret, Secret, SecretBytes, SecretName, SecretScope, SecretStore,
 };
 
 use crate::context::Context;
@@ -665,6 +665,10 @@ struct OAuthRefreshGrant {
     version: u8,
     store_file: PathBuf,
     credentials: Vec<OAuthRefreshGrantCredential>,
+    #[serde(default)]
+    machine: Option<silo_secrets::MachineScopeId>,
+    #[serde(default)]
+    run: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -673,143 +677,12 @@ struct OAuthRefreshGrantCredential {
     kind: String,
     endpoint: String,
     secret_key: String,
+    #[serde(default = "home_scope")]
+    scope: SecretScope,
 }
 
-pub(crate) fn egress_credentials_from_secret_store(
-    policy: &NetworkPolicy,
-) -> eyre::Result<EgressCredentials> {
-    if policy.secret_slots().is_empty() {
-        return Ok(EgressCredentials::new());
-    }
-    let hook_command = std::env::current_exe()?;
-    let store = file_store_from_env()?;
-    egress_credentials_from_store(policy, &store, &hook_command)
-}
-
-fn egress_credentials_from_store(
-    policy: &NetworkPolicy,
-    store: &FileStore,
-    hook_command: &Path,
-) -> eyre::Result<EgressCredentials> {
-    let mut credentials = EgressCredentials::new();
-    let mut supplied_slots = std::collections::BTreeSet::new();
-    let slots = policy.secret_slots();
-    let mut profile_owners = std::collections::BTreeSet::new();
-    for slot in &slots {
-        if slot.source.key.as_str().starts_with("aws_credential.")
-            && slot.name.ends_with(".profile")
-            && projected_slot_value(store, slot)?.is_some()
-        {
-            if let Some((owner, _)) = slot.name.split_once('.') {
-                profile_owners.insert(owner.to_owned());
-            }
-        }
-    }
-    for slot in slots {
-        if slot.name.split_once('.').is_some_and(|(owner, field)| {
-            profile_owners.contains(owner)
-                && matches!(
-                    field,
-                    "access_key_id" | "secret_access_key" | "session_token"
-                )
-        }) {
-            continue;
-        }
-        if let Some(value) = projected_slot_value(store, &slot)? {
-            supplied_slots.insert(slot.name.clone());
-            credentials = credentials.secret(slot.name, value);
-        }
-    }
-    let missing = missing_network_secret_requirements(policy, &supplied_slots);
-    if !missing.is_empty() {
-        eyre::bail!(format_missing_network_secrets(&missing, store.path()));
-    }
-    if let Some(hook) = oauth_refresh_hook_from_store(policy, store, hook_command)? {
-        credentials = credentials.oauth_refresh_hook(hook);
-    }
-    Ok(credentials)
-}
-
-fn oauth_refresh_hook_from_store(
-    policy: &NetworkPolicy,
-    store: &FileStore,
-    hook_command: &Path,
-) -> eyre::Result<Option<OAuthRefreshHook>> {
-    let grant = oauth_refresh_grant(policy, store)?;
-    if grant.credentials.is_empty() {
-        return Ok(None);
-    }
-    let auth = serde_json::to_vec(&grant)?;
-    Ok(Some(
-        OAuthRefreshHook::new(hook_command, auth)
-            .arg("secret")
-            .arg("refresh-oauth")
-            .arg("--store-file")
-            .arg(store.path().to_string_lossy()),
-    ))
-}
-
-fn oauth_refresh_grant(
-    policy: &NetworkPolicy,
-    store: &FileStore,
-) -> eyre::Result<OAuthRefreshGrant> {
-    let mut credentials = Vec::new();
-    for credential in policy.credentials() {
-        let Some(slot) = policy.secret_slots().into_iter().find(|slot| {
-            slot.kind == NetworkSecretKind::OAuth
-                && slot.name == format!("{}.oauth.access_token", credential.name)
-        }) else {
-            continue;
-        };
-        let key = slot.source.key;
-        let Some(secret) = store.get(&SecretScope::Home, &key)? else {
-            continue;
-        };
-        if matches!(secret, Secret::OAuth(_)) {
-            credentials.push(OAuthRefreshGrantCredential {
-                name: credential.name.clone(),
-                kind: credential.kind.clone(),
-                endpoint: credential.endpoint.clone(),
-                secret_key: key.as_str().to_owned(),
-            });
-        }
-    }
-    Ok(OAuthRefreshGrant {
-        version: 1,
-        store_file: store.path().to_path_buf(),
-        credentials,
-    })
-}
-
-fn projected_slot_value(
-    store: &FileStore,
-    slot: &NetworkSecretSlot,
-) -> eyre::Result<Option<String>> {
-    // Exact raw slot records predate canonical store keys and take precedence.
-    let (key, secret, field) =
-        if let Some(secret) = store.get(&SecretScope::Home, &SecretName::legacy(&slot.name))? {
-            (&slot.name[..], secret, SecretField::Value)
-        } else if let Some(secret) = store.get(&SecretScope::Home, &slot.source.key)? {
-            (slot.source.key.as_str(), secret, slot.source.field)
-        } else {
-            return Ok(None);
-        };
-    let expected = if field == SecretField::Value {
-        "plain"
-    } else {
-        "oauth"
-    };
-    if secret.secret_type() != expected {
-        eyre::bail!(
-            "secret `{key}` in {} has type {}, expected {expected}",
-            store.path().display(),
-            secret.secret_type()
-        );
-    }
-    secret
-        .project(field)
-        .map(|value| non_empty_secret_value(key, value.as_str()?.to_owned(), store.path()))
-        .transpose()
+fn home_scope() -> SecretScope {
+    SecretScope::Home
 }
 
 fn credential_for_slot<'a>(
@@ -821,13 +694,6 @@ fn credential_for_slot<'a>(
         .credentials()
         .iter()
         .find(|credential| credential.name == name)
-}
-
-fn non_empty_secret_value(key: &str, value: String, path: &Path) -> eyre::Result<String> {
-    if value.is_empty() {
-        eyre::bail!("secret `{key}` in {} has an empty value", path.display());
-    }
-    Ok(value)
 }
 
 #[derive(Debug)]
@@ -847,23 +713,24 @@ impl MissingNetworkSecret {
     }
 }
 
-fn missing_network_secret_requirements(
-    policy: &NetworkPolicy,
-    supplied_slots: &std::collections::BTreeSet<String>,
-) -> Vec<MissingNetworkSecret> {
-    policy
-        .secret_requirements()
-        .into_iter()
-        .filter(|requirement| {
-            !requirement.alternatives.iter().any(|alternative| {
-                alternative
-                    .slots
-                    .iter()
-                    .all(|slot| supplied_slots.contains(slot))
-            })
-        })
-        .map(|requirement| MissingNetworkSecret::new(policy, &requirement))
-        .collect()
+pub(crate) fn map_start_error(error: libvm::LibVmError, home: Option<&Path>) -> eyre::Report {
+    match error {
+        libvm::LibVmError::MissingNetworkSecrets {
+            requirements,
+            policy,
+            ..
+        } => {
+            let missing = requirements
+                .iter()
+                .map(|r| MissingNetworkSecret::new(&policy, r))
+                .collect::<Vec<_>>();
+            eyre::eyre!(format_missing_network_secrets(
+                &missing,
+                &home.unwrap_or(Path::new(".")).join("secrets.json")
+            ))
+        }
+        other => other.into(),
+    }
 }
 
 fn expected_secret_requirement_keys(
@@ -1161,8 +1028,18 @@ async fn refresh_oauth_request(
             "OAuth refresh grant does not allow this credential",
         ));
     };
+    if let SecretScope::Machine { id } = &grant_credential.scope {
+        if grant.machine.as_ref() != Some(id) || grant.run.as_ref().is_none_or(String::is_empty) {
+            return Err(OAuthRefreshFailure::unauthorized(
+                "OAuth refresh grant machine scope does not match its run",
+            ));
+        }
+    }
     match request.credential.kind.as_str() {
-        OPENAI_CODEX_KIND => refresh_openai_codex_oauth(store, &grant_credential.secret_key).await,
+        OPENAI_CODEX_KIND => {
+            refresh_openai_codex_oauth(store, &grant_credential.scope, &grant_credential.secret_key)
+                .await
+        }
         other => Err(OAuthRefreshFailure::invalid_request(format!(
             "OAuth credential kind {other:?} is not refreshable by this command"
         ))),
@@ -1179,10 +1056,12 @@ fn decode_oauth_refresh_grant(encoded: &str) -> Result<OAuthRefreshGrant, OAuthR
 
 async fn refresh_openai_codex_oauth(
     store: &FileStore,
+    scope: &SecretScope,
     key: &str,
 ) -> Result<OAuthRefreshHookOAuth, OAuthRefreshFailure> {
     let store = store.clone();
-    let mut tx = tokio::task::spawn_blocking(move || store.begin_transaction(&SecretScope::Home))
+    let scope = scope.clone();
+    let mut tx = tokio::task::spawn_blocking(move || store.begin_transaction(&scope))
         .await
         .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?
         .map_err(|err| OAuthRefreshFailure::internal(err.to_string()))?;
@@ -1642,10 +1521,9 @@ mod tests {
     use crate::commands::Command;
 
     use crate::commands::secret::{
-        egress_credentials_from_store, is_pending_device_poll_response, plain_secret_value,
-        read_json_frame, set_plain_secret, slot_key, write_json_frame, write_plain_secret,
-        LoginProvider, OAuthRefreshGrant, OAuthRefreshHookRequest, SecretSubcommand, SetCmd,
-        OPENAI_CODEX_KIND,
+        is_pending_device_poll_response, plain_secret_value, read_json_frame, set_plain_secret,
+        slot_key, write_json_frame, write_plain_secret, LoginProvider, OAuthRefreshHookRequest,
+        SecretSubcommand, SetCmd, OPENAI_CODEX_KIND,
     };
     use silo_secrets::{
         FileStore, OAuthSecret, Secret, SecretBytes, SecretKind, SecretName, SecretScope,
@@ -1729,6 +1607,23 @@ mod tests {
 
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("refresh-oauth"));
+    }
+
+    #[test]
+    fn structured_missing_secret_error_preserves_hint_snapshot() {
+        let policy = libvm::NetworkPolicy::from_json_str(r#"{"version":1,"endpoints":[{"name":"api","kind":"https","family":"http","transport":"https-mitm","tls":"terminate","capabilities":["credential-injection"],"hosts":["example.com"]}],"credentials":[{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"}]}"#).unwrap();
+        let error = libvm::LibVmError::MissingNetworkSecrets {
+            reference: "test".into(),
+            requirements: policy.secret_requirements(),
+            keys: vec!["openai_codex_oauth.personal.oauth".into()],
+            policy: Box::new(policy),
+        };
+        let message = crate::commands::secret::map_start_error(
+            error,
+            Some(std::path::Path::new("/tmp/home")),
+        )
+        .to_string();
+        assert_eq!(message, "missing required network secret material for persisted network policy in /tmp/home/secrets.json\n- credential openai_codex_oauth.personal\n  expected one of: `openai_codex_oauth.personal.oauth` or `personal.oauth.access_token` and `personal.oauth.expires_at`\n  hint: run `silo secret login openai-codex --name personal`");
     }
 
     #[test]
@@ -1846,295 +1741,6 @@ mod tests {
         assert_plain_secret(&store, "aws_credential.prod.access_key_id", "AKIAEXAMPLE");
         assert_plain_secret(&store, "aws_credential.prod.secret_access_key", "secret");
         assert_plain_secret(&store, "aws_credential.prod.session_token", "session");
-    }
-
-    #[test]
-    fn egress_credentials_read_openai_oauth_secret() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = FileStore::new(dir.path());
-        let key = slot_key(OPENAI_CODEX_KIND, "personal", "oauth");
-        put(
-            &store,
-            &key,
-            Secret::OAuth(OAuthSecret {
-                provider: None,
-                access_token: SecretBytes::new(b"access-token".to_vec()),
-                refresh_token: SecretBytes::new(b"refresh-token".to_vec()),
-                expires_at: "2026-07-04T00:00:00Z".parse().unwrap(),
-                account_id: Some("acct_123".to_string()),
-                created_at: Some("2026-07-03T00:00:00Z".parse().unwrap()),
-                updated_at: Some("2026-07-03T00:00:00Z".parse().unwrap()),
-            }),
-        );
-        let policy = network_policy(
-            r#"{
-                "version": 1,
-                "endpoints": [
-                    { "name": "openai", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["chatgpt.com"] }
-                ],
-                "credentials": [
-                    { "name": "personal", "kind": "openai_codex_oauth", "endpoint": "openai" }
-                ]
-            }"#,
-        );
-
-        let launch = egress_credentials_from_store(
-            &policy,
-            &store,
-            PathBuf::from("/usr/bin/silo").as_path(),
-        )
-        .expect("egress credentials");
-
-        assert_egress_secret(&launch, "personal.oauth.access_token", "access-token");
-        assert_egress_secret(&launch, "personal.oauth.expires_at", "2026-07-04T00:00:00Z");
-        assert_egress_secret(&launch, "personal.oauth.account_id", "acct_123");
-        assert!(!launch
-            .secrets
-            .iter()
-            .any(|secret| secret.value == b"refresh-token"));
-
-        let hook = launch.oauth_refresh_hook.as_ref().expect("oauth hook");
-        assert_eq!(hook.command, PathBuf::from("/usr/bin/silo"));
-        assert_eq!(
-            hook.args,
-            vec![
-                "secret".to_string(),
-                "refresh-oauth".to_string(),
-                "--store-file".to_string(),
-                store.path().to_string_lossy().to_string(),
-            ]
-        );
-        let grant: OAuthRefreshGrant = serde_json::from_slice(&hook.auth).expect("hook grant");
-        assert_eq!(grant.store_file, store.path());
-        assert_eq!(grant.credentials.len(), 1);
-        assert_eq!(grant.credentials[0].name, "personal");
-        assert_eq!(grant.credentials[0].kind, OPENAI_CODEX_KIND);
-        assert_eq!(grant.credentials[0].endpoint, "openai");
-        assert_eq!(grant.credentials[0].secret_key, key);
-    }
-
-    #[test]
-    fn egress_credentials_report_missing_oauth_secret_with_hint() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = FileStore::new(dir.path());
-        let policy = network_policy(
-            r#"{
-                "version": 1,
-                "endpoints": [
-                    { "name": "openai", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["chatgpt.com"] }
-                ],
-                "credentials": [
-                    { "name": "personal", "kind": "openai_codex_oauth", "endpoint": "openai" }
-                ]
-            }"#,
-        );
-
-        let error = egress_credentials_from_store(
-            &policy,
-            &store,
-            PathBuf::from("/usr/bin/silo").as_path(),
-        )
-        .expect_err("missing secret");
-        let message = error.to_string();
-
-        assert!(message.contains("personal.oauth.access_token"));
-        assert!(message.contains("personal.oauth.expires_at"));
-        assert!(message.contains("openai_codex_oauth.personal.oauth"));
-        assert!(message.contains("silo secret login openai-codex --name personal"));
-    }
-
-    #[test]
-    fn egress_credentials_read_provider_plain_secret() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = FileStore::new(dir.path());
-        put(
-            &store,
-            "bearer_token.github-api.token",
-            plain("github-token"),
-        );
-        let policy = network_policy(
-            r#"{
-                "version": 1,
-                "endpoints": [
-                    { "name": "github", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["github.com"] }
-                ],
-                "credentials": [
-                    { "name": "github-api", "kind": "bearer_token", "endpoint": "github" }
-                ]
-            }"#,
-        );
-
-        let launch = egress_credentials_from_store(
-            &policy,
-            &store,
-            PathBuf::from("/usr/bin/silo").as_path(),
-        )
-        .expect("egress credentials");
-
-        assert_egress_secret(&launch, "github-api.token", "github-token");
-        assert!(launch.oauth_refresh_hook.is_none());
-    }
-
-    #[test]
-    fn egress_credentials_read_aws_profile_secret() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = FileStore::new(dir.path());
-        put(
-            &store,
-            "aws_credential.prod.profile",
-            plain("production-admin"),
-        );
-        put(
-            &store,
-            "aws_credential.prod.access_key_id",
-            plain("AKIAIGNORED"),
-        );
-        put(
-            &store,
-            "aws_credential.prod.secret_access_key",
-            plain("ignored-secret"),
-        );
-        let policy = aws_network_policy();
-
-        let launch = egress_credentials_from_store(
-            &policy,
-            &store,
-            PathBuf::from("/usr/bin/silo").as_path(),
-        )
-        .expect("egress credentials");
-
-        assert_egress_secret(&launch, "prod.profile", "production-admin");
-        assert!(!launch
-            .secrets
-            .iter()
-            .any(|secret| secret.slot == "prod.access_key_id"));
-        assert!(!launch
-            .secrets
-            .iter()
-            .any(|secret| secret.slot == "prod.secret_access_key"));
-    }
-
-    #[test]
-    fn egress_credentials_read_aws_static_secret_pair() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = FileStore::new(dir.path());
-        put(
-            &store,
-            "aws_credential.prod.access_key_id",
-            plain("AKIAEXAMPLE"),
-        );
-        put(
-            &store,
-            "aws_credential.prod.secret_access_key",
-            plain("secret"),
-        );
-        put(
-            &store,
-            "aws_credential.prod.session_token",
-            plain("session"),
-        );
-        let policy = aws_network_policy();
-
-        let launch = egress_credentials_from_store(
-            &policy,
-            &store,
-            PathBuf::from("/usr/bin/silo").as_path(),
-        )
-        .expect("egress credentials");
-
-        assert_egress_secret(&launch, "prod.access_key_id", "AKIAEXAMPLE");
-        assert_egress_secret(&launch, "prod.secret_access_key", "secret");
-        assert_egress_secret(&launch, "prod.session_token", "session");
-    }
-
-    #[test]
-    fn egress_legacy_raw_slots_take_precedence_and_profiles_suppress_stale_fields() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileStore::new(dir.path());
-        put(&store, "aws_credential.prod.profile", plain("canonical"));
-        put(&store, "prod.profile", plain("legacy-profile"));
-        // Empty stale static fields must never be projected when a profile wins.
-        put(&store, "prod.access_key_id", plain(""));
-        put(&store, "aws_credential.prod.secret_access_key", plain(""));
-        let credentials = egress_credentials_from_store(
-            &aws_network_policy(),
-            &store,
-            std::path::Path::new("/usr/bin/silo"),
-        )
-        .unwrap();
-        assert_eq!(credentials.secrets.len(), 1);
-        assert_egress_secret(&credentials, "prod.profile", "legacy-profile");
-    }
-
-    #[test]
-    fn egress_oauth_raw_overrides_and_optional_tailscale() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileStore::new(dir.path());
-        let policy = network_policy(
-            r#"{
-            "version":1,
-            "endpoints":[{"name":"api","kind":"https","family":"http","transport":"https-mitm","tls":"terminate","capabilities":["credential-injection"],"hosts":["example.com"]}],
-            "credentials":[{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"}],
-            "tailscale":[{"name":"work"}]
-        }"#,
-        );
-        put(
-            &store,
-            "personal.oauth.access_token",
-            plain("legacy-access"),
-        );
-        put(
-            &store,
-            "personal.oauth.expires_at",
-            plain("2026-09-30T00:00:00Z"),
-        );
-        let credentials =
-            egress_credentials_from_store(&policy, &store, std::path::Path::new("/usr/bin/silo"))
-                .unwrap();
-        assert_eq!(credentials.secrets.len(), 2);
-        assert!(credentials.oauth_refresh_hook.is_none());
-        assert_egress_secret(&credentials, "personal.oauth.access_token", "legacy-access");
-        put(&store, "tailscale.work.auth_key", plain("canonical-key"));
-        put(&store, "work.tailscale.auth_key", plain("legacy-key"));
-        let credentials =
-            egress_credentials_from_store(&policy, &store, std::path::Path::new("/usr/bin/silo"))
-                .unwrap();
-        assert_egress_secret(&credentials, "work.tailscale.auth_key", "legacy-key");
-        put(&store, "personal.oauth.access_token", plain(""));
-        assert!(egress_credentials_from_store(
-            &policy,
-            &store,
-            std::path::Path::new("/usr/bin/silo")
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("has an empty value"));
-    }
-
-    #[test]
-    fn egress_credentials_report_missing_aws_profile_or_static_pair() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = FileStore::new(dir.path());
-        put(
-            &store,
-            "aws_credential.prod.session_token",
-            plain("session"),
-        );
-        let policy = aws_network_policy();
-
-        let error = egress_credentials_from_store(
-            &policy,
-            &store,
-            PathBuf::from("/usr/bin/silo").as_path(),
-        )
-        .expect_err("missing aws credential material");
-        let message = error.to_string();
-
-        assert!(message.contains("aws_credential.prod.profile"));
-        assert!(message.contains("prod.profile"));
-        assert!(message.contains("aws_credential.prod.access_key_id"));
-        assert!(message.contains("aws_credential.prod.secret_access_key"));
-        assert!(message.contains("silo secret set aws_credential prod --profile <profile>"));
     }
 
     #[test]
@@ -2331,33 +1937,6 @@ mod tests {
             profile: None,
             force: false,
         }
-    }
-
-    fn network_policy(source: &str) -> libvm::NetworkPolicy {
-        libvm::NetworkPolicy::from_json_str(source).expect("network policy")
-    }
-
-    fn aws_network_policy() -> libvm::NetworkPolicy {
-        network_policy(
-            r#"{
-                "version": 1,
-                "endpoints": [
-                    { "name": "aws", "kind": "https", "family": "http", "transport": "https-mitm", "tls": "terminate", "capabilities": ["credential-injection"], "hosts": ["sts.amazonaws.com"] }
-                ],
-                "credentials": [
-                    { "name": "prod", "kind": "aws_credential", "endpoint": "aws" }
-                ]
-            }"#,
-        )
-    }
-
-    fn assert_egress_secret(credentials: &libvm::EgressCredentials, slot: &str, expected: &str) {
-        let secret = credentials
-            .secrets
-            .iter()
-            .find(|secret| secret.slot == slot)
-            .unwrap_or_else(|| panic!("missing egress secret {slot}"));
-        assert_eq!(secret.value, expected.as_bytes());
     }
 
     fn assert_plain_secret(store: &FileStore, name: &str, expected: &str) {

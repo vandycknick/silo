@@ -208,3 +208,149 @@ fn v1_refresh_grants_and_arbitrary_store_file_are_preserved() {
         assert!(!dir.path().join("wrong-home/secrets.json").exists());
     }
 }
+
+#[test]
+fn actual_v1_provider_reads_exact_granted_scope_without_home_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let machine_dir = dir.path().join("machines").join(id);
+    std::fs::create_dir_all(&machine_dir).unwrap();
+    let home_file = dir.path().join("secrets.json");
+    let machine_file = machine_dir.join("secrets.json");
+    let key = "openai_codex_oauth.personal.oauth";
+    let home = serde_json::json!({key:{"type":"plain","value":"home-must-not-be-read"}});
+    std::fs::write(&home_file, serde_json::to_vec(&home).unwrap()).unwrap();
+    for (record, machine, run_id, code, text) in [
+        (
+            Some(
+                serde_json::json!({"type":"oauth","access_token":"machine-access","refresh_token":"","expires_at":"2026-09-30T00:00:00Z"}),
+            ),
+            Some(id),
+            Some("run"),
+            "invalid_request",
+            "does not contain a refresh token",
+        ),
+        (
+            None,
+            Some(id),
+            Some("run"),
+            "not_found",
+            "OAuth secret was not found",
+        ),
+        (
+            Some(serde_json::json!({"type":"plain","value":"machine"})),
+            Some(id),
+            Some("run"),
+            "invalid_request",
+            "is not an OAuth secret",
+        ),
+        (None, None, Some("run"), "unauthorized", "machine scope"),
+        (
+            None,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("run"),
+            "unauthorized",
+            "machine scope",
+        ),
+        (None, Some(id), None, "unauthorized", "machine scope"),
+    ] {
+        let mut records = serde_json::json!({});
+        if let Some(record) = record {
+            records[key] = record;
+        }
+        std::fs::write(&machine_file, serde_json::to_vec(&records).unwrap()).unwrap();
+        let before_home = std::fs::read(&home_file).unwrap();
+        let before_machine = std::fs::read(&machine_file).unwrap();
+        let grant = serde_json::json!({"version":1,"store_file":home_file,"machine":machine,"run":run_id,"credentials":[{"name":"personal","kind":"openai_codex_oauth","endpoint":"api","secret_key":key,"scope":{"Machine":{"id":id}}}]});
+        let request = serde_json::json!({"version":1,"operation":"oauth_refresh","grant":STANDARD.encode(serde_json::to_vec(&grant).unwrap()),"credential":{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"},"reason":"expired","expires_at":"2026-09-30T00:00:00Z"});
+        let request = serde_json::to_vec(&request).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_silo"))
+            .env_clear()
+            .args(["secret", "refresh-oauth", "--store-file"])
+            .arg(&home_file)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        write!(input, "Content-Length: {}\r\n\r\n", request.len()).unwrap();
+        input.write_all(&request).unwrap();
+        drop(input);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let frame = String::from_utf8(output.stdout).unwrap();
+        let response: Value =
+            serde_json::from_str(frame.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(response["error"]["code"], code);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(text));
+        assert!(!frame.contains("machine-access"));
+        assert!(!frame.contains("home-must-not-be-read"));
+        assert_eq!(std::fs::read(&home_file).unwrap(), before_home);
+        assert_eq!(std::fs::read(&machine_file).unwrap(), before_machine);
+    }
+}
+
+#[test]
+fn scoped_v1_provider_waits_for_selected_scope_transaction_and_rereads() {
+    use silo_secrets::{FileStore, MachineScopeId, Secret, SecretBytes, SecretName, SecretScope};
+    let dir = tempfile::tempdir().unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let scope = SecretScope::Machine {
+        id: MachineScopeId::new(id).unwrap(),
+    };
+    let store = FileStore::new(dir.path());
+    let machine_file = store.scope_path(&scope);
+    std::fs::create_dir_all(machine_file.parent().unwrap()).unwrap();
+    std::fs::write(&machine_file, br#"{"openai_codex_oauth.personal.oauth":{"type":"oauth","access_token":"access","refresh_token":"","expires_at":"2026-09-30T00:00:00Z"}}"#).unwrap();
+    let mut transaction = store.begin_transaction(&scope).unwrap();
+    let grant = serde_json::json!({"version":1,"store_file":store.path(),"machine":id,"run":"run","credentials":[{"name":"personal","kind":"openai_codex_oauth","endpoint":"api","secret_key":"openai_codex_oauth.personal.oauth","scope":scope}]});
+    let request = serde_json::to_vec(&serde_json::json!({"version":1,"operation":"oauth_refresh","grant":STANDARD.encode(serde_json::to_vec(&grant).unwrap()),"credential":{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"},"reason":"expired","expires_at":"2026-09-30T00:00:00Z"})).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_silo"))
+        .env_clear()
+        .args(["secret", "refresh-oauth", "--store-file"])
+        .arg(store.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    write!(input, "Content-Length: {}\r\n\r\n", request.len()).unwrap();
+    input.write_all(&request).unwrap();
+    drop(input);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "provider did not retain the selected scope lock"
+    );
+    transaction
+        .put(
+            &SecretName::new("openai_codex_oauth.personal.oauth").unwrap(),
+            Secret::Plain(SecretBytes::new(b"replacement".to_vec())),
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let frame = String::from_utf8(output.stdout).unwrap();
+    let response: Value = serde_json::from_str(frame.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(response["error"]["code"], "invalid_request");
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("is not an OAuth secret"));
+    assert!(!frame.contains("replacement"));
+    assert!(!store.path().exists());
+}

@@ -4,7 +4,7 @@ use std::process::Command;
 use serde_json::{json, Value};
 use silo_secrets::{
     FileStore, MachineScopeId, OAuthSecret, Secret, SecretBytes, SecretError, SecretField,
-    SecretName, SecretScope, SecretStore,
+    SecretName, SecretScope, SecretStore, SecretStoreDescriptor,
 };
 
 fn name(value: &str) -> SecretName {
@@ -139,6 +139,23 @@ fn home_machine_round_trips_and_missing_machine_rules() {
     store.delete_scope(&home).unwrap();
     assert!(store.list_scopes().unwrap().is_empty());
     assert!(store.get(&home, &name("key")).unwrap().is_none());
+}
+
+#[test]
+fn file_store_descriptor_is_object_safe_and_preserves_explicit_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    for store in [
+        FileStore::new(dir.path()),
+        FileStore::with_store_file(dir.path().join("custom-credentials.json")).unwrap(),
+    ] {
+        let erased: &dyn SecretStore = &store;
+        assert_eq!(
+            erased.descriptor(),
+            Some(SecretStoreDescriptor::File {
+                store_file: store.path().to_path_buf()
+            })
+        );
+    }
 }
 
 #[test]

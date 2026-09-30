@@ -17,13 +17,14 @@ pub(crate) use api::validate_network_name;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::LocalPaths;
+use crate::secrets::ResolvedSecrets;
 use crate::store::models::MachineId;
 use crate::store::models::{
     MachineConfig, MachineNetworkConfig as ModelMachineNetworkConfig,
     NetworkDefinition as ModelNetworkDefinition, NetworkInstance,
 };
 use crate::store::DataStore;
-use crate::{EgressCredentials, LibVmError, RuntimeNetworkingConfig};
+use crate::{LibVmError, RuntimeNetworkingConfig};
 
 use self::core::{NetworkAttachmentRequest, NetworkDriverBackend, NetworkDriverContext};
 use self::netd_driver::NetdDriver;
@@ -87,7 +88,7 @@ pub(crate) async fn prepare_network_runtime(
     run_id: &str,
     config: &RuntimeNetworkingConfig,
     netd_path: &Path,
-    egress_credentials: &EgressCredentials,
+    egress_credentials: &ResolvedSecrets,
 ) -> Result<VmmNetworkAttachment, LibVmError> {
     reconcile_network_runtime(paths, store, metadata, false).await?;
 
@@ -215,7 +216,7 @@ async fn resolve_named_network(
     run_id: &str,
     definition: &ModelNetworkDefinition,
     config: &RuntimeNetworkingConfig,
-    egress_credentials: &EgressCredentials,
+    egress_credentials: &ResolvedSecrets,
 ) -> Result<VmmNetworkAttachment, LibVmError> {
     let _ = (paths, store, run_id, config, egress_credentials, definition);
     Err(LibVmError::NetworkRuntime {
@@ -774,7 +775,7 @@ mod tests {
             "run-123",
             &RuntimeNetworkingConfig::default(),
             Path::new("/tmp/netd"),
-            &crate::EgressCredentials::default(),
+            &crate::secrets::ResolvedSecrets::default(),
         )
         .await
         .expect_err("named attachment API should be required");

@@ -2640,6 +2640,7 @@ dependencies = [
  "rcgen",
  "russh",
  "rustix",
+ "secrets",
  "serde",
  "serde_json",
  "sha2 0.11.0",

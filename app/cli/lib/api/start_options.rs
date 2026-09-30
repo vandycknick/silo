@@ -5,7 +5,6 @@ use eyre::Context as _;
 use libvm::{HostCommand, MachineStartOptions, Runtime};
 
 use crate::api::machine::AppMachine;
-use crate::commands::secret::egress_credentials_from_secret_store;
 
 pub(crate) async fn machine_start_options(
     runtime: &Runtime,
@@ -19,27 +18,6 @@ pub(crate) async fn machine_start_options(
     if data.retention == libvm::MachineRetention::Ephemeral {
         let executable = std::env::current_exe().context("resolve CLI binary path")?;
         options = cleanup_on_exit_options(executable, runtime.local_home(), &machine.id());
-    }
-    if let Some(policy) = data.network.policy() {
-        let credentials = egress_credentials_from_secret_store(policy)?;
-        options = options.credentials(credentials);
-    }
-    Ok(options)
-}
-
-/// Builds start options for a foreground owner that removes an ephemeral VM itself.
-pub(crate) async fn machine_start_options_without_cleanup(
-    _runtime: &Runtime,
-    machine: &AppMachine,
-) -> eyre::Result<MachineStartOptions> {
-    let data = machine
-        .inspect()
-        .await
-        .context("inspect machine network policy")?;
-    let mut options = MachineStartOptions::new();
-    if let Some(policy) = data.network.policy() {
-        let credentials = egress_credentials_from_secret_store(policy)?;
-        options = options.credentials(credentials);
     }
     Ok(options)
 }
