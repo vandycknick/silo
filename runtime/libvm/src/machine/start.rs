@@ -246,7 +246,7 @@ impl fmt::Debug for EgressSecret {
 /// Command hook used by a networking component to refresh OAuth access tokens.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub(crate) struct V1RefreshProvider {
+pub(crate) struct SecretProvider {
     /// Absolute executable path.
     pub command: PathBuf,
     /// Arguments passed directly to the executable, without shell parsing.
@@ -259,10 +259,10 @@ pub(crate) struct V1RefreshProvider {
     pub refresh_skew_seconds: Option<u64>,
 }
 
-impl fmt::Debug for V1RefreshProvider {
+impl fmt::Debug for SecretProvider {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V1RefreshProvider")
+            .debug_struct("SecretProvider")
             .field("command", &self.command)
             .field("args", &self.args)
             .field("auth", &"<redacted>")
@@ -334,7 +334,7 @@ impl EgressCredentials {
     #[cfg(test)]
     pub(crate) fn oauth_refresh_hook(
         self,
-        hook: V1RefreshProvider,
+        hook: SecretProvider,
     ) -> crate::secrets::ResolvedSecrets {
         crate::secrets::ResolvedSecrets {
             credentials: self,
@@ -506,7 +506,7 @@ impl crate::secrets::ResolvedSecrets {
     }
 }
 
-impl V1RefreshProvider {
+impl SecretProvider {
     /// Creates an OAuth refresh hook command with opaque authorization bytes.
     pub fn new(command: impl Into<PathBuf>, auth: impl Into<Vec<u8>>) -> Self {
         Self {
@@ -768,7 +768,7 @@ mod tests {
         let credentials = EgressCredentials::new()
             .secret("codex.oauth.access_token", "token")
             .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
-            .oauth_refresh_hook(V1RefreshProvider::new("silo", Vec::<u8>::new()));
+            .oauth_refresh_hook(SecretProvider::new("silo", Vec::<u8>::new()));
 
         let err = credentials
             .validate_for_policy(Some(&policy), "devbox")

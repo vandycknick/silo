@@ -22,6 +22,96 @@ fn success(home: &std::path::Path, args: &[&str]) -> Output {
     out
 }
 
+fn provider_get(store: &std::path::Path, request: &Value) -> (Value, Vec<u8>) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_silo"))
+        .env_clear()
+        .args(["secret", "provide", "--store-file"])
+        .arg(store)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    silo_secrets::grant::write_json_frame(child.stdin.take().unwrap(), request).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = silo_secrets::grant::read_json_frame(output.stdout.as_slice()).unwrap();
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("private-refresh"));
+    (response, output.stdout)
+}
+
+#[test]
+fn actual_provider_get_projects_and_denies_entire_request_before_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let key = "openai_codex_oauth.personal.oauth";
+    let file = dir.path().join("custom.json");
+    let before=serde_json::to_vec(&serde_json::json!({key:{"type":"oauth","access_token":"selected-access","refresh_token":"private-refresh","expires_at":"2099-01-01T00:00:00Z"}})).unwrap();
+    std::fs::write(&file, &before).unwrap();
+    let grant = serde_json::json!({"version":2,"store":format!("file:{}",file.display()),"machine":id,"run":"run","issued_at":"2026-09-30T00:00:00Z","allowed":[{"slot":"personal.oauth.access_token","key":key,"field":"OAuthAccessToken","backing_scope":"Home"},{"slot":"personal.oauth.expires_at","key":key,"field":"OAuthExpiresAt","backing_scope":"Home"}]});
+    let request = serde_json::json!({"version":2,"operation":"get","grant":STANDARD.encode(serde_json::to_vec(&grant).unwrap()),"scope":{"machine":id,"run":"run"},"names":["personal.oauth.access_token","personal.oauth.expires_at"],"reason":"expired"});
+    let (response, wire) = provider_get(&file, &request);
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["secrets"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        STANDARD
+            .decode(response["secrets"][0]["value"].as_str().unwrap())
+            .unwrap(),
+        b"selected-access"
+    );
+    assert!(!String::from_utf8(wire)
+        .unwrap()
+        .contains(&STANDARD.encode(b"private-refresh")));
+    for variant in [
+        "name",
+        "run",
+        "machine",
+        "reserved",
+        "duplicate",
+        "store",
+        "backing",
+    ] {
+        let mut denied = request.clone();
+        let mut changed_grant = grant.clone();
+        match variant {
+            "name" => {
+                denied["names"] =
+                    serde_json::json!(["personal.oauth.access_token", "outside.token"])
+            }
+            "run" => denied["scope"]["run"] = serde_json::json!("other"),
+            "machine" => {
+                denied["scope"]["machine"] = serde_json::json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            }
+            "reserved" => denied["names"] = serde_json::json!(["silo.ssh_ca.private_key"]),
+            "duplicate" => {
+                denied["names"] = serde_json::json!([
+                    "personal.oauth.access_token",
+                    "personal.oauth.access_token"
+                ])
+            }
+            "store" => changed_grant["store"] = serde_json::json!("file:/wrong/store.json"),
+            "backing" => {
+                changed_grant["allowed"][0]["backing_scope"] =
+                    serde_json::json!({"Machine":{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}})
+            }
+            _ => unreachable!(),
+        }
+        denied["grant"] =
+            serde_json::json!(STANDARD.encode(serde_json::to_vec(&changed_grant).unwrap()));
+        let (response, _) = provider_get(&file, &denied);
+        assert_eq!(response["error"]["code"], "unauthorized", "{variant}");
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+    }
+    let absent = dir.path().join("never-create/store.json");
+    let (response, _) = provider_get(&absent, &request);
+    assert_eq!(response["error"]["code"], "unauthorized");
+    assert!(!absent.parent().unwrap().exists());
+}
+
 #[test]
 fn actual_binary_set_list_show_remove_preserves_legacy_fixture() {
     let dir = tempfile::tempdir().unwrap();
@@ -144,7 +234,7 @@ fn actual_binary_concurrent_create_does_not_overwrite_without_force() {
 }
 
 #[test]
-fn v1_refresh_grants_and_arbitrary_store_file_are_preserved() {
+fn provider_grants_and_arbitrary_store_file_are_preserved() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("launch-specific-store.json");
     std::fs::write(
@@ -162,9 +252,9 @@ fn v1_refresh_grants_and_arbitrary_store_file_are_preserved() {
         (path.clone(), true, "double", "unauthorized"),
         (path.clone(), true, "version", "unauthorized"),
     ] {
-        let grant = serde_json::json!({"version":if encoding == "version" {2} else {1},"store_file":grant_path,"credentials":if allowed { vec![serde_json::json!({"name":"personal","kind":"openai_codex_oauth","endpoint":"api","secret_key":"openai_codex_oauth.personal.oauth"})] } else { vec![] }});
+        let grant = serde_json::json!({"version":if encoding == "version" {1} else {2},"store":format!("file:{}",grant_path.display()),"machine":"0123456789abcdef0123456789abcdef","run":"run","issued_at":"2026-09-30T00:00:00Z","allowed":if allowed { vec![serde_json::json!({"slot":"personal.oauth.access_token","key":"openai_codex_oauth.personal.oauth","field":"OAuthAccessToken","backing_scope":"Home"})] } else { vec![] }});
         let encoded = STANDARD.encode(serde_json::to_vec(&grant).unwrap());
-        let mut request = serde_json::json!({"version":1,"operation":"oauth_refresh","credential":{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"},"reason":"expired","expires_at":"2026-09-30T00:00:00Z"});
+        let mut request = serde_json::json!({"version":2,"operation":"get","grant":"","scope":{"machine":"0123456789abcdef0123456789abcdef","run":"run"},"names":["personal.oauth.access_token"],"reason":"expired"});
         if encoding != "missing" {
             request["grant"] = Value::String(match encoding {
                 "malformed" => "%%%".to_string(),
@@ -179,7 +269,7 @@ fn v1_refresh_grants_and_arbitrary_store_file_are_preserved() {
                 "SILO_NET_OAUTH_REFRESH_AUTH",
                 "ambient-auth-must-be-ignored",
             )
-            .args(["secret", "refresh-oauth", "--store-file"])
+            .args(["secret", "provide", "--store-file"])
             .arg(&path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -200,7 +290,7 @@ fn v1_refresh_grants_and_arbitrary_store_file_are_preserved() {
         let (header, body) = frame.split_once("\r\n\r\n").unwrap();
         assert_eq!(header, format!("Content-Length: {}", body.len()));
         let response: Value = serde_json::from_str(body).unwrap();
-        assert_eq!(response["version"], 1);
+        assert_eq!(response["version"], 2);
         assert_eq!(response["status"], "error");
         assert_eq!(response["error"]["code"], code);
         assert!(!frame.contains("private-token"));
@@ -210,7 +300,7 @@ fn v1_refresh_grants_and_arbitrary_store_file_are_preserved() {
 }
 
 #[test]
-fn actual_v1_provider_reads_exact_granted_scope_without_home_fallback() {
+fn actual_provider_reads_exact_granted_scope_without_home_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let id = "0123456789abcdef0123456789abcdef";
     let machine_dir = dir.path().join("machines").join(id);
@@ -261,12 +351,12 @@ fn actual_v1_provider_reads_exact_granted_scope_without_home_fallback() {
         std::fs::write(&machine_file, serde_json::to_vec(&records).unwrap()).unwrap();
         let before_home = std::fs::read(&home_file).unwrap();
         let before_machine = std::fs::read(&machine_file).unwrap();
-        let grant = serde_json::json!({"version":1,"store_file":home_file,"machine":machine,"run":run_id,"credentials":[{"name":"personal","kind":"openai_codex_oauth","endpoint":"api","secret_key":key,"scope":{"Machine":{"id":id}}}]});
-        let request = serde_json::json!({"version":1,"operation":"oauth_refresh","grant":STANDARD.encode(serde_json::to_vec(&grant).unwrap()),"credential":{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"},"reason":"expired","expires_at":"2026-09-30T00:00:00Z"});
+        let grant = serde_json::json!({"version":2,"store":format!("file:{}",home_file.display()),"machine":machine,"run":run_id,"issued_at":"2026-09-30T00:00:00Z","allowed":[{"slot":"personal.oauth.access_token","key":key,"field":"OAuthAccessToken","backing_scope":{"Machine":{"id":id}}}]});
+        let request = serde_json::json!({"version":2,"operation":"get","grant":STANDARD.encode(serde_json::to_vec(&grant).unwrap()),"scope":{"machine":id,"run":"run"},"names":["personal.oauth.access_token"],"reason":"expired"});
         let request = serde_json::to_vec(&request).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_silo"))
             .env_clear()
-            .args(["secret", "refresh-oauth", "--store-file"])
+            .args(["secret", "provide", "--store-file"])
             .arg(&home_file)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -287,10 +377,12 @@ fn actual_v1_provider_reads_exact_granted_scope_without_home_fallback() {
         let response: Value =
             serde_json::from_str(frame.split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(response["error"]["code"], code);
-        assert!(response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains(text));
+        if code != "unauthorized" {
+            assert!(response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(text));
+        }
         assert!(!frame.contains("machine-access"));
         assert!(!frame.contains("home-must-not-be-read"));
         assert_eq!(std::fs::read(&home_file).unwrap(), before_home);
@@ -299,7 +391,7 @@ fn actual_v1_provider_reads_exact_granted_scope_without_home_fallback() {
 }
 
 #[test]
-fn scoped_v1_provider_waits_for_selected_scope_transaction_and_rereads() {
+fn scoped_provider_waits_for_selected_scope_transaction_and_rereads() {
     use silo_secrets::{FileStore, MachineScopeId, Secret, SecretBytes, SecretName, SecretScope};
     let dir = tempfile::tempdir().unwrap();
     let id = "0123456789abcdef0123456789abcdef";
@@ -311,11 +403,11 @@ fn scoped_v1_provider_waits_for_selected_scope_transaction_and_rereads() {
     std::fs::create_dir_all(machine_file.parent().unwrap()).unwrap();
     std::fs::write(&machine_file, br#"{"openai_codex_oauth.personal.oauth":{"type":"oauth","access_token":"access","refresh_token":"","expires_at":"2026-09-30T00:00:00Z"}}"#).unwrap();
     let mut transaction = store.begin_transaction(&scope).unwrap();
-    let grant = serde_json::json!({"version":1,"store_file":store.path(),"machine":id,"run":"run","credentials":[{"name":"personal","kind":"openai_codex_oauth","endpoint":"api","secret_key":"openai_codex_oauth.personal.oauth","scope":scope}]});
-    let request = serde_json::to_vec(&serde_json::json!({"version":1,"operation":"oauth_refresh","grant":STANDARD.encode(serde_json::to_vec(&grant).unwrap()),"credential":{"name":"personal","kind":"openai_codex_oauth","endpoint":"api"},"reason":"expired","expires_at":"2026-09-30T00:00:00Z"})).unwrap();
+    let grant = serde_json::json!({"version":2,"store":format!("file:{}",store.path().display()),"machine":id,"run":"run","issued_at":"2026-09-30T00:00:00Z","allowed":[{"slot":"personal.oauth.access_token","key":"openai_codex_oauth.personal.oauth","field":"OAuthAccessToken","backing_scope":scope}]});
+    let request = serde_json::to_vec(&serde_json::json!({"version":2,"operation":"get","grant":STANDARD.encode(serde_json::to_vec(&grant).unwrap()),"scope":{"machine":id,"run":"run"},"names":["personal.oauth.access_token"],"reason":"expired"})).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_silo"))
         .env_clear()
-        .args(["secret", "refresh-oauth", "--store-file"])
+        .args(["secret", "provide", "--store-file"])
         .arg(store.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

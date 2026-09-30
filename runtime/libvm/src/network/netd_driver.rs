@@ -944,7 +944,7 @@ mod tests {
     use std::process::Command;
 
     use crate::lock_manager::LockId;
-    use crate::machine::{EgressCredentials, V1RefreshProvider};
+    use crate::machine::{EgressCredentials, SecretProvider};
     use crate::network::core::{NetworkAttachmentRequest, NetworkDriverContext};
     use crate::paths::{LocalPaths, LocalRoots};
     use crate::store::models::{
@@ -1076,9 +1076,9 @@ mod tests {
             .secret("codex.oauth.access_token", "token")
             .secret("codex.oauth.expires_at", "2026-07-04T00:00:00Z")
             .oauth_refresh_hook(
-                V1RefreshProvider::new("/usr/bin/silo", b"auth".to_vec())
+                SecretProvider::new("/usr/bin/silo", b"auth".to_vec())
                     .arg("secret")
-                    .arg("refresh-oauth")
+                    .arg("provide")
                     .timeout_ms(2500)
                     .refresh_skew_seconds(120),
             );
@@ -1100,9 +1100,9 @@ mod tests {
         assert_eq!(
             hook_json,
             &json!({
-                "version": 1,
+                "version": 2,
                 "command": "/usr/bin/silo",
-                "args": ["secret", "refresh-oauth"],
+                "args": ["secret", "provide"],
                 "timeout_ms": 2500,
                 "refresh_skew_seconds": 120,
                 "grant": "YXV0aA=="
@@ -1414,7 +1414,7 @@ netd log: /tmp/silo/netd.log";
         let credentials = EgressCredentials::new()
             .secret_bytes("codex.oauth.access_token", vec![0, 255, 128])
             .secret("codex.oauth.expires_at", "2099-01-01T00:00:00Z")
-            .oauth_refresh_hook(V1RefreshProvider::new(
+            .oauth_refresh_hook(SecretProvider::new(
                 "/bin/false",
                 b"synthetic-hook-auth".to_vec(),
             ));

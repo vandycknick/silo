@@ -38,7 +38,7 @@ func loadPipe(t *testing.T, frame string) (*Static, error) {
 func framed(body string) string { return fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(body), body) }
 
 func TestLoadFromFDValidBinaryReservedAndDefaults(t *testing.T) {
-	body := `{"version":1,"secrets":[{"name":"silo.ssh_ca.private_key","value":"AP8="}],"provider":{"version":1,"command":"/bin/helper","args":[],"grant":"AP8="}}`
+	body := `{"version":1,"secrets":[{"name":"silo.ssh_ca.private_key","value":"AP8="}],"provider":{"version":2,"command":"/bin/helper","args":[],"grant":"AP8="}}`
 	source, err := loadPipe(t, framed(body))
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +66,7 @@ func TestLoadFromFDValidBinaryReservedAndDefaults(t *testing.T) {
 
 func TestLoadFromFDRejectsMalformed(t *testing.T) {
 	provider := func(fields string) string { return `{"version":1,"secrets":[],"provider":{` + fields + `}}` }
-	base := `"version":1,"command":"/bin/helper","args":[],"grant":"eA=="`
+	base := `"version":2,"command":"/bin/helper","args":[],"grant":"eA=="`
 	bodies := []string{
 		"", `{`, `{}`, `[]`, `null`, `{"version":2,"secrets":[]}`, `{"secrets":[]}`, `{"version":1}`, `{"version":1,"secrets":null}`,
 		`{"version":1,"secrets":[],"extra":1}`, `{"version":1,"version":1,"secrets":[]}`,
@@ -77,9 +77,9 @@ func TestLoadFromFDRejectsMalformed(t *testing.T) {
 		`{"version":1,"secrets":[{"name":".bad","value":"eA=="}]}`, `{"version":1,"secrets":[{"name":"x","value":"eA"}]}`,
 		`{"version":1,"secrets":[{"name":"x","value":"eB=="}]}`, `{"version":1,"secrets":[{"name":"x","value":"eA==\n"}]}`,
 		`{"version":1,"secrets":[]} {}`, provider(`"command":"/bin/helper","args":[],"grant":"eA=="`),
-		provider(`"version":2,"command":"/bin/helper","args":[],"grant":"eA=="`), provider(`"version":1,"command":"relative","args":[],"grant":"eA=="`),
-		provider(`"version":1,"command":"/bin/helper","grant":"eA=="`), provider(`"version":1,"command":"/bin/helper","args":[],"grant":"bad"`),
-		provider(`"version":1,"command":"/bin/helper","args":[]`), provider(base + `,"unknown":1`),
+		provider(`"version":1,"command":"/bin/helper","args":[],"grant":"eA=="`), provider(`"version":2,"command":"relative","args":[],"grant":"eA=="`),
+		provider(`"version":2,"command":"/bin/helper","grant":"eA=="`), provider(`"version":2,"command":"/bin/helper","args":[],"grant":"bad"`),
+		provider(`"version":2,"command":"/bin/helper","args":[]`), provider(base + `,"unknown":1`),
 		provider(base + `,"timeout_ms":-1`), provider(base + `,"timeout_ms":1.5`), provider(base + `,"timeout_ms":9223372036854775807`),
 		provider(base + `,"refresh_skew_seconds":-1`), provider(base + `,"refresh_skew_seconds":9223372036854775807`), provider(base + `,"timeout_ms":null`),
 	}

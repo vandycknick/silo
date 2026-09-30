@@ -18,7 +18,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
 	"golang.org/x/sys/unix"
 )
 
@@ -33,7 +32,7 @@ type Source interface {
 	Refresh(context.Context, []string, string) (map[string][]byte, error)
 }
 
-// Provider carries raw grant bytes. The v1 adapter treats them as opaque.
+// Provider config v2 is embedded in the unchanged transport payload v1.
 type Provider struct {
 	Version            int      `json:"version"`
 	Command            string   `json:"command"`
@@ -44,14 +43,14 @@ type Provider struct {
 }
 
 type Static struct {
-	mu       sync.RWMutex
-	values   map[string][]byte
-	provider *Provider
-	bindings map[string]hooks.Credential
+	refreshMu sync.Mutex
+	mu        sync.RWMutex
+	values    map[string][]byte
+	provider  *Provider
 }
 
 func NewStatic(values map[string][]byte, provider *Provider) *Static {
-	s := &Static{values: make(map[string][]byte), bindings: make(map[string]hooks.Credential)}
+	s := &Static{values: make(map[string][]byte)}
 	for name, value := range values {
 		s.values[name] = bytes.Clone(value)
 	}
@@ -71,14 +70,6 @@ func (s *Static) Lookup(name string) ([]byte, bool) {
 	return bytes.Clone(v), ok
 }
 
-// BindCredential retains trusted policy metadata for the transport-only v1
-// adapter. No credential identity is inferred from the opaque grant.
-func (s *Static) BindCredential(credential *hooks.Credential) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.bindings[oauthSlotKey(credential.Name)] = *credential
-}
-
 func (s *Static) refreshSkew() time.Duration {
 	if s.provider == nil || s.provider.RefreshSkewSeconds == 0 {
 		return defaultOAuthRefreshSkew
@@ -86,40 +77,61 @@ func (s *Static) refreshSkew() time.Duration {
 	return time.Duration(s.provider.RefreshSkewSeconds) * time.Second
 }
 
+func (s *Static) oauthRefreshNames(key string) ([]string, error) {
+	if s.provider == nil {
+		return nil, ErrNoProvider
+	}
+	var grant struct {
+		Allowed []struct {
+			Slot  string          `json:"slot"`
+			Key   string          `json:"key"`
+			Field string          `json:"field"`
+			Scope json.RawMessage `json:"backing_scope"`
+		} `json:"allowed"`
+	}
+	if json.Unmarshal(s.provider.Grant, &grant) != nil {
+		return nil, errors.New("invalid provider grant")
+	}
+	token, expiry := -1, -1
+	account := false
+	for i, entry := range grant.Allowed {
+		switch entry.Slot {
+		case key + ".access_token":
+			token = i
+		case key + ".expires_at":
+			expiry = i
+		case key + ".account_id":
+			account = true
+		}
+	}
+	if token < 0 || expiry < 0 {
+		return nil, errors.New("OAuth token and expiry are not both refreshable")
+	}
+	t, e := grant.Allowed[token], grant.Allowed[expiry]
+	var tokenScope, expiryScope bytes.Buffer
+	if json.Compact(&tokenScope, t.Scope) != nil || json.Compact(&expiryScope, e.Scope) != nil || !bytes.Equal(tokenScope.Bytes(), expiryScope.Bytes()) || t.Key == "" || t.Key != e.Key || t.Field != "OAuthAccessToken" || e.Field != "OAuthExpiresAt" {
+		return nil, errors.New("OAuth token and expiry have different backing records")
+	}
+	names := []string{key + ".access_token", key + ".expires_at"}
+	if account {
+		names = append(names, key+".account_id")
+	}
+	return names, nil
+}
+
 func (s *Static) Refresh(ctx context.Context, names []string, reason string) (map[string][]byte, error) {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
 	if s.provider == nil {
 		return nil, ErrNoProvider
 	}
 	if err := validateProvider(s.provider); err != nil {
 		return nil, err
 	}
-	if len(names) != 3 {
-		return nil, errors.New("v1 refresh requires one OAuth credential")
-	}
-	key, ok := strings.CutSuffix(names[0], ".access_token")
-	if !ok || names[1] != key+".expires_at" || names[2] != key+".account_id" {
-		return nil, errors.New("invalid v1 refresh slots")
-	}
-	s.mu.RLock()
-	credential, bound := s.bindings[key]
-	expiresAt := string(s.values[key+".expires_at"])
-	s.mu.RUnlock()
-	if !bound {
-		return nil, errors.New("OAuth credential has no policy binding")
-	}
-	timeout := defaultOAuthRefreshTimeout
-	if s.provider.TimeoutMS != 0 {
-		timeout = time.Duration(s.provider.TimeoutMS) * time.Millisecond
-	}
-	hook := &OAuthRefreshHook{command: s.provider.Command, args: s.provider.Args, auth: base64.StdEncoding.EncodeToString(s.provider.Grant), timeout: timeout}
-	secret, err := hook.Refresh(ctx, &credential, expiresAt, reason)
+	values, err := s.provider.get(ctx, names, reason)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := time.Parse(time.RFC3339, secret.ExpiresAt); err != nil {
-		return nil, errors.New("provider returned invalid OAuth expiry")
-	}
-	values := map[string][]byte{names[0]: []byte(secret.AccessToken), names[1]: []byte(secret.ExpiresAt), names[2]: []byte(secret.AccountID)}
 	s.mu.Lock()
 	for name, value := range values {
 		s.values[name] = bytes.Clone(value)
@@ -129,7 +141,7 @@ func (s *Static) Refresh(ctx context.Context, names []string, reason string) (ma
 }
 
 func validateProvider(p *Provider) error {
-	if p.Version != 1 || !filepath.IsAbs(p.Command) || strings.ContainsRune(p.Command, 0) || p.Args == nil || len(p.Grant) == 0 {
+	if p.Version != 2 || !filepath.IsAbs(p.Command) || strings.ContainsRune(p.Command, 0) || p.Args == nil || len(p.Grant) == 0 {
 		return errors.New("invalid secret provider configuration")
 	}
 	for _, arg := range p.Args {

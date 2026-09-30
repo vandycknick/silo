@@ -44,7 +44,7 @@ impl LocalVmService {
                 std::env::current_exe().context("resolve CLI binary path")?,
             )
             .arg("secret")
-            .arg("refresh-oauth")
+            .arg("provide")
             .arg("--store-file")
             .arg(runtime.local_home().join("secrets.json"));
             self.runtime = Some(runtime.with_secret_provider(provider));

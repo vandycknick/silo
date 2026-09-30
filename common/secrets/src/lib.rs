@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
+pub mod grant;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct SecretName(String);
@@ -82,6 +84,7 @@ impl<'de> Deserialize<'de> for MachineScopeId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum SecretScope {
     Home,
     Machine { id: MachineScopeId },
@@ -346,7 +349,7 @@ impl FileStore {
             home,
         }
     }
-    /// Compatibility for the v1 provider's explicit `--store-file` argument.
+    /// Explicit file address used by the subprocess provider.
     pub fn with_store_file(path: impl Into<PathBuf>) -> Result<Self, SecretError> {
         let mut home_file = path.into();
         let home = home_file
@@ -420,7 +423,7 @@ impl FileStore {
         Ok((path, lock))
     }
     /// The closure must use only the supplied transaction, never re-enter this
-    /// store. Errors discard all changes. The persistent sidecar survives JSON
+    /// store. Errors discard unpersisted changes. The persistent sidecar survives JSON
     /// replacement and scope deletion, so every reader/writer locks one inode.
     pub fn transaction<T>(
         &self,
@@ -458,9 +461,16 @@ impl fmt::Debug for ScopeTransaction {
     }
 }
 impl ScopeTransaction {
-    pub fn commit(self) -> Result<(), SecretError> {
+    pub fn commit(mut self) -> Result<(), SecretError> {
+        self.persist()
+    }
+    /// Persist a checkpoint without releasing the scope lock. Remote token
+    /// rotation is irreversible, so providers save each successful rotation
+    /// before attempting another remote operation.
+    pub fn persist(&mut self) -> Result<(), SecretError> {
         if self.dirty {
             write_records(&self.path, &self.records)?;
+            self.dirty = false;
         }
         Ok(())
     }
