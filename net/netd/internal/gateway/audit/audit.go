@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
 	"github.com/vandycknick/silo/net/netd/internal/netnode"
+	"github.com/vandycknick/silo/net/netd/internal/sshdoor"
 )
 
 const (
@@ -36,6 +37,7 @@ type Logger struct {
 }
 
 type Event struct {
+	SSH          *SSH         `json:"ssh,omitempty"`
 	DurationMS   *int64       `json:"duration_ms,omitempty"`
 	Version      int          `json:"version"`
 	Phase        string       `json:"phase"`
@@ -64,6 +66,24 @@ type Event struct {
 	Error        *AuditError  `json:"error,omitempty"`
 	Verdict      string       `json:"verdict"`
 	Reason       string       `json:"reason,omitempty"`
+}
+
+type SSH struct {
+	Peer   string `json:"peer"`
+	Login  string `json:"peer_login,omitempty"`
+	Node   string `json:"peer_node,omitempty"`
+	UserID string `json:"peer_user_id,omitempty"`
+	User   string `json:"requested_user,omitempty"`
+}
+
+func (l *Logger) RecordInboundSSH(vmID, runID, networkID string, e sshdoor.Event) {
+	if l == nil {
+		return
+	}
+	duration := e.Duration.Milliseconds()
+	l.emit(Event{Version: 1, Phase: "end", Family: "inbound_ssh", Direction: "inbound", Protocol: "ssh", Timestamp: time.Now().UTC(), PolicyHash: l.policyHash,
+		VMID: vmID, RunID: runID, NetworkID: networkID, RequestID: e.RequestID, Verdict: e.Decision, Reason: e.Reason, DurationMS: &duration,
+		SSH: &SSH{Peer: e.Peer, Login: e.Login, Node: e.Node, UserID: e.UserID, User: e.User}})
 }
 
 type Policy struct {
