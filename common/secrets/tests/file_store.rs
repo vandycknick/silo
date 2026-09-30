@@ -26,6 +26,48 @@ fn value(store: &FileStore, scope: &SecretScope, key: &str) -> String {
 }
 
 #[test]
+fn transaction_checkpoint_is_durable_and_retains_scope_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileStore::new(dir.path());
+    let mut tx = store.begin_transaction(&SecretScope::Home).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.path().join("secrets.json.lock"))
+        .unwrap();
+    assert!(matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock)));
+    tx.put(&name("token"), plain("durable-rotation")).unwrap();
+    tx.persist().unwrap();
+    assert!(matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock)));
+    let checkpoint = fs::read(store.path()).unwrap();
+    tx.put(&name("token"), plain("discarded-next-change"))
+        .unwrap();
+    drop(tx);
+    assert_eq!(fs::read(store.path()).unwrap(), checkpoint);
+    // Parallel subprocess tests can briefly retain a forked copy of the guard
+    // until exec closes its CLOEXEC descriptor. Observe the release boundedly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "checkpoint lock did not release"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+    lock.unlock().unwrap();
+    assert_eq!(
+        value(&store, &SecretScope::Home, "token"),
+        "durable-rotation"
+    );
+}
+
+#[test]
 fn names_scopes_and_deserialization_validate_new_addresses() {
     for key in [
         "",
