@@ -1,0 +1,17 @@
+home: /var/lib/silo-taild
+secrets_dir: /etc/silo-taild/secrets
+tailnet:
+  hostname: silo
+  tag: tag:silo
+  capability: github.com/vandycknick/silo/cap/taild
+enrollment:
+  mode: oauth-app
+  disable_key_expiry: false
+  delete_devices: true
+vm:
+  default_image: ghcr.io/vandycknick/silo/devbox:latest
+  allowed_registries: [ghcr.io/vandycknick]
+  defaults: {cpus: 2, memory: 4GiB, disk: 20GiB}
+  ceilings: {cpus: 8, memory: 32GiB, disk: 200GiB, vms_per_principal: 5}
+  guest_user: {name: silo, uid: 1000, gid: 1000, home: /home/silo}
+sessions: {global: 64, per_peer: 8}
