@@ -29,6 +29,7 @@ jobs:
       node: ${{ steps.result.outputs.node }}
       go: ${{ steps.result.outputs.go }}
       netd: ${{ steps.result.outputs.netd }}
+      taild: ${{ steps.result.outputs.taild }}
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -71,6 +72,24 @@ jobs:
               - 'common/policy/**'
               - 'flake.lock'
               - 'flake.nix'
+            taild:
+              - '.github/workflows/test.yml'
+              - 'app/taild/**'
+              - 'sdk/go/**'
+              - 'runtime/**'
+              - 'guest/**'
+              - 'virt/**'
+              - 'net/netd/**'
+              - 'common/policy/**'
+              - 'common/secrets/**'
+              - 'Makefile'
+              - 'xtask/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'VERSION'
+              - 'specs/**'
+              - 'flake.lock'
+              - 'flake.nix'
 
       - name: Select checks
         id: result
@@ -78,11 +97,12 @@ jobs:
           NODE_CHANGED: ${{ steps.filter.outputs.node }}
           GO_CHANGED: ${{ steps.filter.outputs.go }}
           NETD_CHANGED: ${{ steps.filter.outputs.netd }}
+          TAILD_CHANGED: ${{ steps.filter.outputs.taild }}
         run: |
           if [ "${{ github.event_name }}" = workflow_dispatch ]; then
-            printf 'node=true\ngo=true\nnetd=true\n' >> "$GITHUB_OUTPUT"
+            printf 'node=true\ngo=true\nnetd=true\ntaild=true\n' >> "$GITHUB_OUTPUT"
           else
-            printf 'node=%s\ngo=%s\nnetd=%s\n' "$NODE_CHANGED" "$GO_CHANGED" "$NETD_CHANGED" >> "$GITHUB_OUTPUT"
+            printf 'node=%s\ngo=%s\nnetd=%s\ntaild=%s\n' "$NODE_CHANGED" "$GO_CHANGED" "$NETD_CHANGED" "$TAILD_CHANGED" >> "$GITHUB_OUTPUT"
           fi
 
   # Clippy and Cargo tests stay per-OS: the workspace has platform-only
@@ -337,6 +357,59 @@ jobs:
       - name: Test netd with race detector
         run: nix develop .#ci --command go -C net/netd test -race -count=1 -timeout=4m ./...
 
+  taild:
+    name: taild (Linux)
+    needs: changes
+    if: needs.changes.outputs.taild == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CGO_ENABLED: '1'
+      GOTOOLCHAIN: auto
+      GOFLAGS: -mod=readonly
+      SILO_GO_FFI_PATH: ${{ github.workspace }}/target/debug/libsilo_go_ffi.so
+      SILO_TEST_RUNTIME_ROOT: ${{ github.workspace }}/target/silo-runtime/linux-amd64-gnu/debug
+      SILO_TAILD_REQUIRE_FIXTURES: '1'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          cmd-format: nix develop .#ci --command {0}
+          workspaces: . -> target
+          prefix-key: test
+          shared-key: workspace
+          cache-bin: false
+          save-if: false
+      - name: Build actual native bridge
+        timeout-minutes: 10
+        run: nix develop .#ci --command cargo build --locked -p silo-go-ffi
+      - name: Build and stage the complete actual runtime
+        # The existing target builds real helpers/assets and resolves the
+        # official ghcr.io/vandycknick/silo/kernel:stable OCI dependency.
+        # The default shell supplies ORAS and cargo-zigbuild for acquisition
+        # and real guest helpers; the smaller CI shell deliberately omits them.
+        timeout-minutes: 15
+        run: nix develop --command make stage PROFILE=debug
+      - name: Check taild formatting
+        run: |
+          files="$(timeout 280s nix develop .#ci --command gofmt -l app/taild)"
+          if [ -n "$files" ]; then
+            printf '%s\n' "$files"
+            exit 1
+          fi
+      - name: Vet taild
+        run: timeout 280s nix develop .#ci --command go -C app/taild vet ./...
+      - name: Test taild with actual bridge and race detector
+        run: timeout 280s nix develop .#ci --command go -C app/taild test -race -count=1 -timeout=4m -v ./...
+      - name: Build taild
+        run: timeout 280s nix develop .#ci --command go -C app/taild build ./cmd/taild
+
   summary:
     name: Summary
     if: always()
@@ -346,6 +419,7 @@ jobs:
       - node-sdk
       - go-sdk
       - netd
+      - taild
     runs-on: ubuntu-24.04
     steps:
       - name: Require successful checks
