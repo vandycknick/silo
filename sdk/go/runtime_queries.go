@@ -89,3 +89,46 @@ func (runtime *Runtime) query(ctx context.Context, request []byte) ([]byte, erro
 	}
 	return data, nil
 }
+
+type PolicySecretsStatus string
+
+const (
+	PolicySecretsReady       PolicySecretsStatus = "ready"
+	PolicySecretsMissing     PolicySecretsStatus = "missing"
+	PolicySecretsUnavailable PolicySecretsStatus = "unavailable"
+)
+
+// PolicySecretsCheck contains names and error categories only, never secret values or paths.
+type PolicySecretsCheck struct {
+	Status       PolicySecretsStatus        `json:"status"`
+	Slots        []NetworkSecretSlot        `json:"slots,omitempty"`
+	Requirements []NetworkSecretRequirement `json:"requirements,omitempty"`
+	Slot         string                     `json:"slot,omitempty"`
+	Key          string                     `json:"key,omitempty"`
+	Code         string                     `json:"code,omitempty"`
+}
+
+// CheckPolicySecrets uses the native start resolver. Empty machine checks prospective
+// Home scope. Nonempty overrides replace the whole store-derived set, as at Start.
+func (runtime *Runtime) CheckPolicySecrets(ctx context.Context, policy *NetworkPolicy, machine string, overrides map[string]string) (PolicySecretsCheck, error) {
+	if policy == nil {
+		return PolicySecretsCheck{}, newError(ErrorInvalidArgument, "", "policy is required")
+	}
+	request := struct {
+		Operation  string            `json:"operation"`
+		PolicyJSON string            `json:"policy_json"`
+		Machine    string            `json:"machine,omitempty"`
+		Secrets    map[string]string `json:"secrets,omitempty"`
+	}{"check_policy_secrets", policy.JSON(), machine, overrides}
+	data, err := json.Marshal(request)
+	if err != nil {
+		return PolicySecretsCheck{}, err
+	}
+	data, err = runtime.query(ctx, data)
+	if err != nil {
+		return PolicySecretsCheck{}, err
+	}
+	var result PolicySecretsCheck
+	err = json.Unmarshal(data, &result)
+	return result, err
+}

@@ -23,6 +23,10 @@ type Service struct {
 	VisibleNames func(context.Context) ([]string, error)
 	createMu     sync.Mutex
 	pending      map[string]identity.Principal
+	documentMu   sync.Mutex
+	// Phase 13 enables this after enrollment is implemented. The zero value
+	// suppresses VM-node declarations, independently of user --no-tailnet.
+	VMNodesEnabled bool
 }
 type WhoAmI struct {
 	Peer        identity.Peer `json:"peer"`

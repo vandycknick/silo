@@ -6,6 +6,8 @@ import "errors"
 type ErrorKind string
 
 const (
+	ErrorSecretResolution            ErrorKind = "SecretResolution"
+	ErrorMissingNetworkSecrets       ErrorKind = "MissingNetworkSecrets"
 	ErrorUnknown                     ErrorKind = "Unknown"
 	ErrorInvalidArgument             ErrorKind = "InvalidArgument"
 	ErrorClosed                      ErrorKind = "Closed"

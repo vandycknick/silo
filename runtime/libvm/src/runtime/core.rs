@@ -205,6 +205,21 @@ impl Runtime {
         policy: &silo_policy::NetworkPolicy,
         machine: Option<&MachineRef>,
     ) -> Result<bool, LibVmError> {
+        Ok(matches!(
+            self.check_policy_secrets(policy, machine, &EgressCredentials::default())
+                .await?,
+            crate::policy_secrets::PolicySecretsCheck::Ready
+        ))
+    }
+
+    /// Resolves prospective Home or existing Machine/Home secrets without mutation.
+    /// Missing alternatives and unavailable/corrupt projections are distinct, redacted results.
+    pub async fn check_policy_secrets(
+        &self,
+        policy: &silo_policy::NetworkPolicy,
+        machine: Option<&MachineRef>,
+        explicit: &EgressCredentials,
+    ) -> Result<crate::policy_secrets::PolicySecretsCheck, LibVmError> {
         let id = match machine {
             Some(reference) => Some(self.get_machine(reference).await?.machine_id()),
             None => None,
@@ -213,16 +228,15 @@ impl Runtime {
             policy: Some(policy.clone()),
             publish: None,
         };
-        Ok(crate::secrets::resolve_for_scope(
+        crate::policy_secrets::diagnostic(crate::secrets::resolve_for_scope(
             self.secret_store(),
             &network,
             id,
             "readiness",
-            &EgressCredentials::default(),
+            explicit,
             None,
             "readiness",
-        )
-        .is_ok())
+        ))
     }
 
     pub(crate) async fn lock_machine_names(&self) -> Result<std::fs::File, LibVmError> {

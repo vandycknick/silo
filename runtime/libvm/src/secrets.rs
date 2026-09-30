@@ -151,11 +151,11 @@ pub(crate) fn resolve_for_scope(
                         Ok(record) => record,
                         Err(SecretError::NotFound) => None,
                         Err(e) => {
-                            return Err(error(format!(
-                                "network secret slot {:?}, store key {:?}: {e}",
-                                slot.name,
-                                key.as_str()
-                            )))
+                            return Err(LibVmError::SecretResolution {
+                                slot: slot.name.clone(),
+                                key: key.as_str().to_owned(),
+                                code: e.wire_code().to_owned(),
+                            })
                         }
                     };
                     cache.insert(address.clone(), record);
@@ -183,17 +183,21 @@ pub(crate) fn resolve_for_scope(
                 )
         );
         if !right_kind {
-            return Err(error(format!("network secret slot {:?}, store key {:?} has type {}, incompatible projection {field:?}", slot.name, key.as_str(), record.secret_type())));
+            return Err(LibVmError::SecretResolution {
+                slot: slot.name.clone(),
+                key: key.as_str().to_owned(),
+                code: "incompatible_projection".into(),
+            });
         }
         let Some(value) = record.project(field) else {
             continue;
         };
         if value.is_empty() {
-            return Err(error(format!(
-                "network secret slot {:?}, store key {:?} has an empty value",
-                slot.name,
-                key.as_str()
-            )));
+            return Err(LibVmError::SecretResolution {
+                slot: slot.name.clone(),
+                key: key.as_str().to_owned(),
+                code: "empty_value".into(),
+            });
         }
         if slot.name.ends_with(".profile") {
             if let Some((owner, _)) = slot.name.rsplit_once('.') {
@@ -502,11 +506,9 @@ mod tests {
             .contains("store key"));
         std::fs::remove_dir_all(&machine_dir).unwrap();
         std::fs::write(&machine_dir, "not a directory").unwrap();
-        assert!(runtime
-            .resolve_secrets(&config, "run", &EgressCredentials::new())
-            .unwrap_err()
-            .to_string()
-            .contains("not a directory"));
+        assert!(
+            matches!(runtime.resolve_secrets(&config, "run", &EgressCredentials::new()).unwrap_err(), LibVmError::SecretResolution { code, .. } if code == "invalid_request")
+        );
         std::fs::remove_file(&machine_dir).unwrap();
         runtime
             .get_machine(&crate::MachineRef::id(config.id))

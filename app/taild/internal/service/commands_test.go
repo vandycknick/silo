@@ -35,6 +35,8 @@ func actualService(t *testing.T) *Service {
 	t.Helper()
 	c := config.Defaults()
 	c.Home = t.TempDir()
+	c.TemplatesDir = t.TempDir()
+	c.PoliciesDir = t.TempDir()
 	c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
 	c.VM.Defaults = config.Resources{CPUs: 1, Memory: "256MiB", Disk: "1GiB"}
 	r, e := runtime.Open(context.Background(), c, "native-service")

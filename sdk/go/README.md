@@ -92,3 +92,14 @@ if silo.IsErrorKind(err, silo.ErrorMachineNotFound) { /* ... */ }
 Call `Close` on runtimes, machines, execution sessions, stdin handles, and log streams. Closing a runtime does not stop machines, and closing a machine handle does not stop or remove persisted machine state.
 
 See `examples/` for complete flows and `PARITY.md` for Node SDK capability coverage.
+## Redacted policy secret checks
+
+`Runtime.CheckPolicySecrets(ctx, policy, machine, overrides)` uses the public Rust
+start resolver without exposing values or mutating secrets. Empty `machine` checks
+prospective creation against Home; an existing reference uses Machine then Home.
+Nonempty overrides replace the complete store-derived set, as at Start. The typed
+result is `ready`, `missing` (slots, backing keys, alternative requirements), or
+`unavailable` (selected slot/key and stable error category). Corrupt JSON, wrong
+projection types and empty selected values never masquerade as absent secrets.
+The older `PolicySecretsReady` boolean API remains available. This uses an optional
+operation on ABI 2's existing runtime-query entry point.

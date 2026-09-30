@@ -1,5 +1,7 @@
 home: /var/lib/silo-taild
 secrets_dir: /etc/silo-taild/secrets
+templates_dir: /etc/silo-taild/templates
+policies_dir: /etc/silo-taild/policies
 tailnet:
   hostname: silo
   tag: tag:silo
