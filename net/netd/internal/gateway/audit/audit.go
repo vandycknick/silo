@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/hooks"
+	"github.com/vandycknick/silo/net/netd/internal/netnode"
 )
 
 const (
@@ -35,6 +36,7 @@ type Logger struct {
 }
 
 type Event struct {
+	DurationMS   *int64       `json:"duration_ms,omitempty"`
 	Version      int          `json:"version"`
 	Phase        string       `json:"phase"`
 	Family       string       `json:"family"`
@@ -201,6 +203,15 @@ func (l *Logger) RecordPublication(phase, scope, local, remote, verdict, reason 
 		Verdict:     verdict,
 		Reason:      reason,
 	})
+}
+
+func (l *Logger) RecordInbound(vmID, runID, networkID string, event netnode.InboundEvent) {
+	if l == nil {
+		return
+	}
+	duration := event.Duration.Milliseconds()
+	l.emit(Event{Version: 1, Phase: "end", Family: "inbound", Direction: "inbound", Protocol: "tcp", Timestamp: time.Now().UTC(), PolicyHash: l.policyHash,
+		VMID: vmID, RunID: runID, NetworkID: networkID, SourceIP: event.Peer.Addr().String(), SourcePort: event.Peer.Port(), DestPort: event.Port, Verdict: event.Decision, Reason: event.Reason, DurationMS: &duration})
 }
 
 func (l *Logger) RecordFlow(flow hooks.Flow, decision hooks.RouteDecision) {

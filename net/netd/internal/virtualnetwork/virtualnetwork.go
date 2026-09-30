@@ -15,16 +15,17 @@ import (
 	"time"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/services/dhcp"
-	"github.com/containers/gvisor-tap-vsock/pkg/services/dns"
 	upstreamForwarder "github.com/containers/gvisor-tap-vsock/pkg/services/forwarder"
 	"github.com/containers/gvisor-tap-vsock/pkg/tap"
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
+	"github.com/miekg/dns"
 	"github.com/vandycknick/silo/net/netd/internal/config"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/audit"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/packet"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/publication"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
 	"github.com/vandycknick/silo/net/netd/internal/logfile"
+	"github.com/vandycknick/silo/net/netd/internal/netnode"
 	"golang.org/x/sync/errgroup"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -51,6 +52,8 @@ type PublicationOptions struct {
 }
 
 type VirtualNetwork struct {
+	attached      atomic.Bool
+	beforeClose   func() error
 	configuration *types.Configuration
 	stack         *stack.Stack
 	networkSwitch *tap.Switch
@@ -171,6 +174,8 @@ func (n *VirtualNetwork) Run(ctx context.Context, conn net.Conn) error {
 	if conn == nil {
 		return errors.New("vfkit connection is nil")
 	}
+	n.attached.Store(true)
+	defer n.attached.Store(false)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	group, groupCtx := errgroup.WithContext(runCtx)
@@ -209,6 +214,10 @@ func (n *VirtualNetwork) Close() error {
 	}
 	n.closeOnce.Do(func() {
 		n.closed.Store(true)
+		n.attached.Store(false)
+		if n.beforeClose != nil {
+			n.closeErr = errors.Join(n.closeErr, n.beforeClose())
+		}
 		for _, service := range n.services {
 			if service.close != nil {
 				n.closeErr = errors.Join(n.closeErr, service.close())
@@ -235,7 +244,7 @@ func addServices(ctx context.Context, configuration *types.Configuration, s *sta
 	icmpForwarder := upstreamForwarder.ICMP(s, translation, &natLock)
 	s.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpForwarder.HandlePacket)
 
-	dnsServices, err := dnsServer(configuration, s)
+	dnsServices, err := dnsServer(ctx, configuration, s, route.Node())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -277,7 +286,7 @@ func parseNATTable(configuration *types.Configuration) map[tcpip.Address]tcpip.A
 	return translation
 }
 
-func dnsServer(configuration *types.Configuration, s *stack.Stack) ([]networkService, error) {
+func dnsServer(ctx context.Context, configuration *types.Configuration, s *stack.Stack, node *netnode.Node) ([]networkService, error) {
 	udpConn, err := gonet.DialUDP(s, &tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4Slice(net.ParseIP(configuration.GatewayIP).To4()), Port: uint16(53)}, nil, ipv4.ProtocolNumber)
 	if err != nil {
 		return nil, err
@@ -287,17 +296,24 @@ func dnsServer(configuration *types.Configuration, s *stack.Stack) ([]networkSer
 		_ = udpConn.Close()
 		return nil, err
 	}
-	server, err := dns.New(udpConn, tcpLn, configuration.DNS)
-	if err != nil {
-		_ = udpConn.Close()
-		_ = tcpLn.Close()
-		return nil, err
-	}
+	handler := &gatewayDNS{ctx: ctx, zones: configuration.DNS, node: node, slots: make(chan struct{}, 256)}
+	udpServer := &dns.Server{PacketConn: udpConn, Handler: handler, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
+	tcpServer := &dns.Server{Listener: tcpLn, Handler: handler, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, MaxTCPQueries: 64}
 	services := []networkService{
-		{name: "dns udp server", serve: server.Serve, close: udpConn.Close},
-		{name: "dns tcp server", serve: server.ServeTCP, close: tcpLn.Close},
+		{name: "dns udp server", serve: udpServer.ActivateAndServe, close: func() error { _ = udpServer.Shutdown(); return udpConn.Close() }},
+		{name: "dns tcp server", serve: tcpServer.ActivateAndServe, close: func() error { _ = tcpServer.Shutdown(); return tcpLn.Close() }},
 	}
 	return services, nil
+}
+
+// SetBeforeClose is set during construction before Run or any concurrent use.
+func (n *VirtualNetwork) SetBeforeClose(close func() error) { n.beforeClose = close }
+func (n *VirtualNetwork) DialGuest(ctx context.Context, port uint16) (net.Conn, error) {
+	if !n.attached.Load() || n.closed.Load() {
+		return nil, errors.New("guest stack is not attached")
+	}
+	ip := net.ParseIP(n.configuration.DeviceIP).To4()
+	return gonet.DialContextTCP(ctx, n.stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4Slice(ip), Port: port}, ipv4.ProtocolNumber)
 }
 
 func dhcpServer(configuration *types.Configuration, s *stack.Stack, ipPool *tap.IPPool) (networkService, error) {

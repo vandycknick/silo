@@ -135,10 +135,20 @@ pub(crate) fn frame(
 }
 
 pub(crate) fn strip_environment(command: &mut Command) {
-    for (name, _) in std::env::vars_os() {
-        if name.as_encoded_bytes().starts_with(b"SILO_NET_") {
-            command.env_remove(name);
-        }
+    // Strip before exec, before Go dependencies can inspect/cache/log knobs.
+    // Include explicit command overrides as well as inherited environment.
+    let names = std::env::vars_os()
+        .map(|(name, _)| name)
+        .chain(command.get_envs().map(|(name, _)| name.to_owned()))
+        .filter(|name| {
+            let bytes = name.as_encoded_bytes();
+            bytes.starts_with(b"SILO_NET_")
+                || bytes.starts_with(b"TS_")
+                || bytes.starts_with(b"TSNET_")
+        })
+        .collect::<Vec<_>>();
+    for name in names {
+        command.env_remove(name);
     }
 }
 
@@ -296,6 +306,28 @@ mod tests {
         #[cfg(target_os = "linux")]
         nix::fcntl::fcntl(&writer, nix::fcntl::FcntlArg::F_SETPIPE_SZ(4096)).unwrap();
         (reader, writer)
+    }
+
+    #[test]
+    fn strips_explicit_knobs_before_real_exec_and_preserves_aws() {
+        let mut command = Command::new("/usr/bin/python3");
+        command.args(["-c", "import os\nassert not any(k.startswith(('SILO_NET_', 'TS_', 'TSNET_')) for k in os.environ)\nassert os.environ['AWS_PROFILE'] == 'ordinary'\nassert os.environ['AWS_REGION'] == 'eu-west-1'"]);
+        for name in [
+            "TS_AUTHKEY",
+            "TS_CLIENT_SECRET",
+            "TS_DEBUG_DISCO",
+            "TS_DEBUG_RING_BUFFER_SIZE",
+            "TS_DEBUG_MAGICSOCK_RING_BUFFER_MAX_SIZE_BYTES",
+            "TSNET_FORCE_LOGIN",
+            "SILO_NET_OLD",
+        ] {
+            command.env(name, "invalid-secret-must-not-be-observed");
+        }
+        command
+            .env("AWS_PROFILE", "ordinary")
+            .env("AWS_REGION", "eu-west-1");
+        strip_environment(&mut command);
+        assert!(command.status().unwrap().success());
     }
 
     #[tokio::test]

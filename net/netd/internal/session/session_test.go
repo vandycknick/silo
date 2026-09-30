@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +50,34 @@ func TestSessionRunAfterCloseClosesConnection(t *testing.T) {
 	}
 	if _, err := client.Write([]byte("probe")); err == nil {
 		t.Fatal("connection remained open after closed session rejected Run")
+	}
+}
+
+func TestSessionNewAndCloseBeforeStartNeverInitializeNode(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := config.Parse(testConfigArgs(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := policy.LoadReader("test.json", strings.NewReader(`{"version":1,"tailscale":[{"name":"vm","hostname":"no-start","control_url":"http://127.0.0.1:1"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Spec{VMID: "vm", RunID: "run", NetworkID: "net", Policy: p, Stack: cfg.Stack, TailscaleStateDir: dir, VsockMux: filepath.Join(dir, "vsock.sock")}, Shared{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("New initialized node state: %v %v", entries, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s.Start()
+	entries, err = os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("Start after Close initialized node: %v %v", entries, err)
 	}
 }
 

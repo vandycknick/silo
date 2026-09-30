@@ -16,6 +16,7 @@ import (
 
 	"github.com/containers/gvisor-tap-vsock/pkg/transport"
 	log "github.com/sirupsen/logrus"
+	_ "github.com/vandycknick/silo/net/netd/internal/bootenv"
 	"github.com/vandycknick/silo/net/netd/internal/config"
 	"github.com/vandycknick/silo/net/netd/internal/credentials"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/audit"
@@ -23,6 +24,7 @@ import (
 	"github.com/vandycknick/silo/net/netd/internal/policy"
 	"github.com/vandycknick/silo/net/netd/internal/registry"
 	"github.com/vandycknick/silo/net/netd/internal/session"
+	"tailscale.com/logtail"
 )
 
 const (
@@ -31,6 +33,8 @@ const (
 )
 
 func main() {
+	// Upstream exposes process-wide log-upload control only. netd keeps logs local.
+	logtail.Disable()
 	cfg, err := config.Parse(os.Args[1:])
 	if err != nil {
 		writeErrorRecords(os.Stderr, err)
@@ -170,14 +174,16 @@ func run(cfg *config.Config, compiledPolicy *policy.Policy, auditLog *audit.Logg
 
 	intelligencePool := registry.NewIntelligencePool(nil)
 	vmSession, err := session.New(session.Spec{
-		VMID:         cfg.Metadata.VMID,
-		RunID:        cfg.Metadata.RunID,
-		NetworkID:    cfg.Metadata.NetworkID,
-		CaptureFile:  captureFile,
-		Stack:        cfg.Stack,
-		Policy:       compiledPolicy,
-		GuestPublish: cfg.GuestPublish,
-		Secrets:      secrets,
+		VMID:              cfg.Metadata.VMID,
+		RunID:             cfg.Metadata.RunID,
+		NetworkID:         cfg.Metadata.NetworkID,
+		CaptureFile:       captureFile,
+		Stack:             cfg.Stack,
+		Policy:            compiledPolicy,
+		GuestPublish:      cfg.GuestPublish,
+		Secrets:           secrets,
+		TailscaleStateDir: cfg.TailscaleStateDir,
+		VsockMux:          cfg.VsockMux,
 	}, session.Shared{Audit: auditLog, Intelligence: intelligencePool})
 	captureFile = nil
 	if err != nil {
@@ -212,6 +218,7 @@ func run(cfg *config.Config, compiledPolicy *policy.Policy, auditLog *audit.Logg
 	if err := reportWorkerStartup(cfg, nil); err != nil {
 		return fmt.Errorf("report worker readiness: %w", err)
 	}
+	vmSession.Start()
 	acceptDone := make(chan struct{})
 	go func() {
 		select {

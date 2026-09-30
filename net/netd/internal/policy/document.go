@@ -79,6 +79,7 @@ type RuleDecl struct {
 }
 
 type TailscaleDecl struct {
+	Ephemeral  bool     `json:"ephemeral,omitempty"`
 	Name       string   `json:"name"`
 	Tags       []string `json:"tags"`
 	Hostname   string   `json:"hostname,omitempty"`

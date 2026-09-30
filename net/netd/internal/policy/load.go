@@ -123,8 +123,15 @@ func compileNetworkPolicy(filename string, document networkPolicyFile) (*Policy,
 	if document.Settings.Audit.BodyBufferBytes > 0 && document.Settings.Audit.BodyStorageBytes > 0 && document.Settings.Audit.BodyBufferBytes < document.Settings.Audit.BodyStorageBytes {
 		compiled.diagnostics = append(compiled.diagnostics, Diagnostic{Severity: "warning", Summary: "Audit body buffer is smaller than storage sample", Detail: "body_buffer_bytes is smaller than body_storage_bytes; response/request bodies may truncate before the configured stored sample size", File: filename, Line: 1, Column: 1})
 	}
-	if len(document.Tailscale) > 0 {
-		return nil, compileLoadError(filename, "Unsupported tailscale configuration", "tailscale is not implemented by netd")
+	if len(document.Tailscale) > 1 {
+		return nil, compileLoadError(filename, "Invalid tailscale configuration", "at most one tailscale declaration is supported")
+	}
+	if len(document.Tailscale) == 1 {
+		decl := document.Tailscale[0]
+		if decl.Name == "" || decl.Name == "silo" || strings.ContainsAny(decl.Name, "/ ") {
+			return nil, compileLoadError(filename, "Invalid tailscale configuration", "invalid tunnel name")
+		}
+		compiled.tailscale = &decl
 	}
 	if len(document.Forwards) > 0 {
 		return nil, compileLoadError(filename, "Unsupported network forwards", "forwards are not implemented by netd")
@@ -534,13 +541,18 @@ func (p *Policy) addRuleDecl(decl RuleDecl, order int) error {
 		}
 		credentialRef = &credential
 	}
+	var tunnel *Ref
 	if decl.Tunnel != "" {
-		return fmt.Errorf("rule %q uses tunnel %q, but tunnels are not implemented by netd", decl.Name, decl.Tunnel)
+		if p.tailscale == nil || decl.Tunnel != p.tailscale.Name || family != EndpointFamilyIP || decl.Verdict != ActionAllow {
+			return fmt.Errorf("rule %q requires an existing tailscale tunnel on an IP allow rule", decl.Name)
+		}
+		tunnel = &Ref{Kind: "tailscale", Name: p.tailscale.Name}
 	}
 	if decl.Verdict != ActionAllow && decl.Verdict != ActionDeny {
 		return fmt.Errorf("rule %q has unsupported verdict %q", decl.Name, decl.Verdict)
 	}
 	rule := &Rule{
+		Tunnel:     tunnel,
 		Name:       decl.Name,
 		Family:     family,
 		Endpoints:  endpoints,

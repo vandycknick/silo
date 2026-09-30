@@ -8,9 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	"strings"
 	"syscall"
 
+	"github.com/vandycknick/silo/net/netd/internal/bootenv"
 	"github.com/vandycknick/silo/net/netd/internal/config"
 	"golang.org/x/sys/unix"
 )
@@ -68,7 +68,7 @@ func launchWorker(cfg *config.Config, args []string) error {
 func sanitizedEnvironment(environment []string) []string {
 	clean := make([]string, 0, len(environment))
 	for _, entry := range environment {
-		if !strings.HasPrefix(entry, "SILO_NET_") {
+		if !isolatedEnvironmentName(entry) {
 			clean = append(clean, entry)
 		}
 	}
@@ -76,15 +76,11 @@ func sanitizedEnvironment(environment []string) []string {
 }
 
 func sanitizeLegacyEnvironment() error {
-	for _, entry := range os.Environ() {
-		name, _, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(name, "SILO_NET_") {
-			if err := os.Unsetenv(name); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return bootenv.Clear()
+}
+
+func isolatedEnvironmentName(name string) bool {
+	return bootenv.Isolated(name)
 }
 
 func validatePipe(fd int, access int) error {

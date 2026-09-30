@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -16,21 +17,23 @@ import (
 )
 
 type Config struct {
-	Daemonize    bool
-	StartupFD    int
-	ExitFD       int
-	SecretsFD    int
-	ListenVfkit  string
-	LogDirFD     int
-	RuntimeDirFD int
-	PIDFile      string
-	LogFile      string
-	AuditLogFile string
-	CaptureFile  string
-	Stack        NetworkConfig
-	PolicyFile   string
-	Metadata     Metadata
-	GuestPublish PublishBind
+	TailscaleStateDir string
+	VsockMux          string
+	Daemonize         bool
+	StartupFD         int
+	ExitFD            int
+	SecretsFD         int
+	ListenVfkit       string
+	LogDirFD          int
+	RuntimeDirFD      int
+	PIDFile           string
+	LogFile           string
+	AuditLogFile      string
+	CaptureFile       string
+	Stack             NetworkConfig
+	PolicyFile        string
+	Metadata          Metadata
+	GuestPublish      PublishBind
 }
 
 type PublishBind string
@@ -78,6 +81,8 @@ func Parse(args []string) (*Config, error) {
 	var subnet, staticLease, guestPublish string
 
 	flags := flag.NewFlagSet("netd", flag.ContinueOnError)
+	flags.StringVar(&cfg.TailscaleStateDir, "tailscale-state-dir", "", "existing persistent node state directory")
+	flags.StringVar(&cfg.VsockMux, "vsock-mux", "", "guest vsock mux path")
 	flags.SetOutput(io.Discard)
 	flags.BoolVar(&cfg.Daemonize, "daemonize", false, "launch a detached worker and exit")
 	flags.IntVar(&cfg.StartupFD, "startup-fd", -1, "inherited worker startup report writer")
@@ -209,7 +214,32 @@ func LoadPolicy(cfg *Config) (*policy.Policy, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := ValidateTailscale(cfg, compiledPolicy); err != nil {
+		return nil, err
+	}
 	return compiledPolicy, nil
+}
+
+func ValidateTailscale(cfg *Config, p *policy.Policy) error {
+	if p.Tailscale() == nil {
+		if cfg.TailscaleStateDir != "" || cfg.VsockMux != "" {
+			return errors.New("tailscale flags require a tailscale declaration")
+		}
+		return nil
+	}
+	if cfg.TailscaleStateDir == "" || cfg.VsockMux == "" {
+		return errors.New("tailscale requires --tailscale-state-dir and --vsock-mux")
+	}
+	info, err := os.Stat(cfg.TailscaleStateDir)
+	if err != nil || !info.IsDir() {
+		return errors.New("--tailscale-state-dir must be an existing directory")
+	}
+	// The VMM creates the mux later; only its parent must already exist.
+	info, err = os.Stat(filepath.Dir(cfg.VsockMux))
+	if err != nil || !info.IsDir() {
+		return errors.New("--vsock-mux parent must be an existing directory")
+	}
+	return nil
 }
 
 func stackConfig(subnetText, staticLease string) (NetworkConfig, error) {
