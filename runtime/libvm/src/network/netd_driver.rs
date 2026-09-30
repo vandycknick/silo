@@ -170,7 +170,6 @@ async fn prepare_netd_runtime(
                     .and_then(|vsock| vsock.uds.as_deref())
                     .unwrap_or_else(|| Path::new("vsock.sock")),
             ),
-            &machine_paths.vmm_socket_path(),
         );
     }
     command
@@ -365,19 +364,12 @@ struct NetworkHelperCommandConfig<'a> {
     guest_publish: Option<&'a str>,
 }
 
-fn configure_tailscale_helper_command(
-    command: &mut Command,
-    state_dir: &Path,
-    mux: &Path,
-    status: &Path,
-) {
+fn configure_tailscale_helper_command(command: &mut Command, state_dir: &Path, mux: &Path) {
     command
         .arg("--tailscale-state-dir")
         .arg(state_dir)
         .arg("--vsock-mux")
-        .arg(mux)
-        .arg("--guest-status-socket")
-        .arg(status);
+        .arg(mux);
 }
 
 fn configure_network_helper_command(
@@ -949,7 +941,6 @@ mod tests {
             &mut command,
             std::path::Path::new("/home/machines/id/tailscale"),
             std::path::Path::new("/run/machines/id/vsock.sock"),
-            std::path::Path::new("/run/machines/id/vm.sock"),
         );
         let args = command
             .get_args()
@@ -961,9 +952,7 @@ mod tests {
                 "--tailscale-state-dir",
                 "/home/machines/id/tailscale",
                 "--vsock-mux",
-                "/run/machines/id/vsock.sock",
-                "--guest-status-socket",
-                "/run/machines/id/vm.sock"
+                "/run/machines/id/vsock.sock"
             ]
         );
     }
@@ -1430,7 +1419,9 @@ netd log: /tmp/silo/netd.log";
             let environment = std::fs::read(format!("/proc/{}/environ", worker.pid())).unwrap();
             assert!(environment
                 .split(|byte| *byte == 0)
-                .all(|entry| !entry.starts_with(b"SILO_NET_")));
+                .all(|entry| !entry.starts_with(b"SILO_NET_")
+                    && !entry.starts_with(b"TS_")
+                    && !entry.starts_with(b"TSNET_")));
             let argv = std::fs::read(format!("/proc/{}/cmdline", worker.pid())).unwrap();
             assert!(!argv
                 .windows(b"synthetic-hook-auth".len())
@@ -1502,7 +1493,7 @@ import os,sys,time,json,fcntl
 a=sys.argv[1:]
 def flag(name): return a[a.index(name)+1]
 open({marker:?},'w').write(str(os.getpid()))
-assert not any(k.startswith('SILO_NET_') for k in os.environ)
+assert not any(k.startswith(('SILO_NET_', 'TS_', 'TSNET_')) for k in os.environ)
 assert not any('q6ur' in arg for arg in a)
 for key in ['--log-dir-fd','--runtime-dir-fd','--secrets-fd']:
  assert fcntl.fcntl(int(flag(key)),fcntl.F_GETFD)==0
@@ -1616,6 +1607,15 @@ os.write(int(flag('--startup-fd')),json.dumps(report).encode()+b'\n')
             .env("SILO_NET_SECRET_API_KEY", "ambient-secret")
             .env("SILO_NET_OAUTH_REFRESH_AUTH", "ambient-grant")
             .env("SILO_NET_UNKNOWN_FUTURE_KEY", "ambient-value")
+            .env("TS_AUTHKEY", "ambient-secret")
+            .env("TS_CLIENT_SECRET", "ambient-secret")
+            .env("TS_DEBUG_DISCO", "invalid-private-boolean")
+            .env("TS_DEBUG_RING_BUFFER_SIZE", "invalid-private-integer")
+            .env(
+                "TS_DEBUG_MAGICSOCK_RING_BUFFER_MAX_SIZE_BYTES",
+                "invalid-private-integer",
+            )
+            .env("TSNET_FORCE_LOGIN", "invalid-private-boolean")
             .status()
             .unwrap();
         assert!(status.success());

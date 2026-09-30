@@ -18,20 +18,23 @@ import (
 	"github.com/vandycknick/silo/net/netd/internal/gateway/publication"
 	"github.com/vandycknick/silo/net/netd/internal/gateway/router"
 	"github.com/vandycknick/silo/net/netd/internal/logfile"
+	"github.com/vandycknick/silo/net/netd/internal/netnode"
 	"github.com/vandycknick/silo/net/netd/internal/policy"
 	"github.com/vandycknick/silo/net/netd/internal/registry"
 	"github.com/vandycknick/silo/net/netd/internal/virtualnetwork"
 )
 
 type Spec struct {
-	VMID         string
-	RunID        string
-	NetworkID    string
-	CaptureFile  *os.File
-	Stack        config.NetworkConfig
-	Policy       *policy.Policy
-	GuestPublish config.PublishBind
-	Secrets      credentials.Source
+	TailscaleStateDir string
+	VsockMux          string
+	VMID              string
+	RunID             string
+	NetworkID         string
+	CaptureFile       *os.File
+	Stack             config.NetworkConfig
+	Policy            *policy.Policy
+	GuestPublish      config.PublishBind
+	Secrets           credentials.Source
 }
 
 type Shared struct {
@@ -40,6 +43,7 @@ type Shared struct {
 }
 
 type Session struct {
+	node    *netnode.Node
 	ctx     context.Context
 	cancel  context.CancelFunc
 	flows   *packet.FlowTracker
@@ -80,6 +84,23 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 		spec.Secrets = credentials.NewStatic(nil, nil)
 	}
 	credentialManager := credentials.NewManager(spec.Secrets)
+	result := &Session{ctx: lifetimeCtx, cancel: cancel, flows: flows, runDone: make(chan struct{})}
+	if decl := spec.Policy.Tailscale(); decl != nil {
+		if err := config.ValidateTailscale(&config.Config{TailscaleStateDir: spec.TailscaleStateDir, VsockMux: spec.VsockMux}, spec.Policy); err != nil {
+			cancel()
+			return nil, err
+		}
+		result.node, err = netnode.New(netnode.Options{Dir: spec.TailscaleStateDir, Declaration: *decl, Secrets: spec.Secrets, Guest: result, Flows: flows,
+			Audit: func(event netnode.InboundEvent) {
+				shared.Audit.RecordInbound(spec.VMID, spec.RunID, spec.NetworkID, event)
+			},
+		})
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		route.SetTunnel(result.node)
+	}
 	dispatcher := packet.NewTCPDispatcher()
 	httpsProxy, err := forwarder.NewHTTPSProxy(route, spec.Secrets, credentialManager)
 	if err != nil {
@@ -134,13 +155,23 @@ func New(spec Spec, shared Shared) (session *Session, err error) {
 		return nil, err
 	}
 	captureFile = nil
-	return &Session{
-		ctx:     lifetimeCtx,
-		cancel:  cancel,
-		flows:   flows,
-		network: network,
-		runDone: make(chan struct{}),
-	}, nil
+	result.network = network
+	if result.node != nil {
+		network.SetBeforeClose(result.node.Close)
+	}
+	return result, nil
+}
+
+// Start is called only after the existing worker startup report succeeds.
+func (s *Session) Start() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed && s.node != nil {
+		s.node.Start(s.ctx)
+	}
+}
+func (s *Session) DialGuest(ctx context.Context, port uint16) (net.Conn, error) {
+	return s.network.DialGuest(ctx, port)
 }
 
 func publicationOptions(spec Spec, auditLog *audit.Logger) (virtualnetwork.PublicationOptions, error) {

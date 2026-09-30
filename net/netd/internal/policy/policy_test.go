@@ -72,9 +72,9 @@ func TestLoadCanonicalPolicyRejectsUnimplementedSessionCapabilities(t *testing.T
 		body string
 		want string
 	}{
-		{name: "tailscale", body: `{"version":1,"tailscale":[{"name":"prod"}]}`, want: "tailscale is not implemented"},
+		{name: "tailscale", body: `{"version":1,"tailscale":[{"name":"prod"},{"name":"other"}]}`, want: "at most one tailscale"},
 		{name: "forwards", body: `{"version":1,"forwards":[{"name":"ssh","kind":"host","target":"127.0.0.1","target_port":22}]}`, want: "forwards are not implemented"},
-		{name: "tunnel rule", body: `{"version":1,"endpoints":[{"kind":"ip","name":"private","family":"ip","transport":"packet-filter","tls":"none","destination_cidrs":["10.0.0.0/8"],"protocol":"any"}],"rules":[{"name":"tunneled","endpoints":["private"],"tunnel":"prod","verdict":"allow"}]}`, want: "tunnels are not implemented"},
+		{name: "tunnel rule", body: `{"version":1,"endpoints":[{"kind":"ip","name":"private","family":"ip","transport":"packet-filter","tls":"none","destination_cidrs":["10.0.0.0/8"],"protocol":"any"}],"rules":[{"name":"tunneled","endpoints":["private"],"tunnel":"prod","verdict":"allow"}]}`, want: "requires an existing tailscale tunnel"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
