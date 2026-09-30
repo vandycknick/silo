@@ -90,7 +90,14 @@ func run() error {
 	if e != nil {
 		return e
 	}
-	defer r.Close()
+	closeRuntime := true
+	defer func() {
+		if closeRuntime {
+			closing, done := context.WithTimeout(context.Background(), 90*time.Second)
+			defer done()
+			_ = closeRuntimeAfterDrain(closing, nil, nil, r.Close)
+		}
+	}()
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	node, e := tailnet.Start(ctx, c, secrets, log)
 	if e != nil {
@@ -105,7 +112,11 @@ func run() error {
 		return e
 	}
 	log.Info("reconciled", "managed", len(snapshot.VMs), "unmanaged", snapshot.Unmanaged, "unreadable", snapshot.Unreadable)
-	s := &service.Service{Runtime: r, Audit: audit, Jobs: &jobs.Registry{}, Capability: c.Tailnet.Capability}
+	// Operations outlive sessions and graceful listener shutdown, but are owned
+	// by this daemon and cancelled when its bounded drain budget expires.
+	jobctx, stopJobs := context.WithCancel(context.Background())
+	defer stopJobs()
+	s := &service.Service{Runtime: r, Audit: audit, Jobs: jobs.New(jobctx, c.Sessions.Global), Capability: c.Tailnet.Capability, Config: c, VisibleNames: node.VisibleNames}
 	sshListener, e := node.Server.ListenSSH(":22")
 	if e != nil {
 		return e
@@ -134,18 +145,46 @@ func run() error {
 	}
 	shutdown, done := context.WithTimeout(context.Background(), 90*time.Second)
 	defer done()
+	deadlineCancellation := context.AfterFunc(shutdown, stopJobs)
+	defer deadlineCancellation()
+	s.Jobs.Seal()
+	// Native SDK Close waits for native calls. If the drain budget expires,
+	// process exit releases handles instead of extending the shutdown deadline.
+	closeRuntime = false
 	_ = sshListener.Close()
 	ssh.CloseSessions()
-	if err := web.Shutdown(shutdown); err != nil {
+	webError := web.Shutdown(shutdown)
+	if webError != nil {
 		_ = web.Close()
-		return err
 	}
-	if err := ssh.Wait(shutdown); err != nil {
-		return err
-	}
-	if err := s.Jobs.Wait(shutdown); err != nil {
-		return err
-	}
+	sshError := ssh.Wait(shutdown)
+	jobError := s.Jobs.Wait(shutdown)
 	// Closing SDK handles and this service node never stops machine supervisors.
-	return e
+	runtimeError := closeRuntimeAfterDrain(shutdown, sshError, jobError, r.Close)
+	return errors.Join(e, webError, sshError, jobError, runtimeError)
+}
+
+var errRuntimeCleanupIncomplete = errors.New("runtime cleanup incomplete")
+
+// SDK Close can wait on session calls or library workers. Never enter it while
+// either drain is incomplete, and never let that wait extend the shutdown budget.
+// On timeout the process exits with incomplete cleanup, without stopping VMs.
+func closeRuntimeAfterDrain(ctx context.Context, sessionError, jobError error, closeRuntime func() error) error {
+	if sessionError != nil || jobError != nil {
+		return fmt.Errorf("%w: session or job drain failed", errRuntimeCleanupIncomplete)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %w", errRuntimeCleanupIncomplete, err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- closeRuntime() }()
+	select {
+	case err := <-done:
+		if deadlineError := ctx.Err(); deadlineError != nil {
+			return fmt.Errorf("%w: %w", errRuntimeCleanupIncomplete, deadlineError)
+		}
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", errRuntimeCleanupIncomplete, ctx.Err())
+	}
 }

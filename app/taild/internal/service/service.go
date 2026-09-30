@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/vandycknick/silo/app/taild/internal/authz"
+	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
@@ -13,10 +15,14 @@ import (
 )
 
 type Service struct {
-	Runtime    *runtime.Runtime
-	Audit      *state.Audit
-	Jobs       *jobs.Registry
-	Capability string
+	Runtime      *runtime.Runtime
+	Audit        *state.Audit
+	Jobs         *jobs.Registry
+	Capability   string
+	Config       config.Config
+	VisibleNames func(context.Context) ([]string, error)
+	createMu     sync.Mutex
+	pending      map[string]identity.Principal
 }
 type WhoAmI struct {
 	Peer        identity.Peer `json:"peer"`

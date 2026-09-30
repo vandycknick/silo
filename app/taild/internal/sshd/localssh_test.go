@@ -112,8 +112,8 @@ func TestLocalSSHDispatchJSONAndExit(t *testing.T) {
 		t.Fatal(e)
 	}
 	if e = session.Run("create dev"); e == nil {
-		t.Fatal("phase 11 command accepted")
-	} else if exit, ok := e.(*ssh.ExitError); !ok || exit.ExitStatus() != 2 {
+		t.Fatal("create without capability accepted")
+	} else if exit, ok := e.(*ssh.ExitError); !ok || exit.ExitStatus() != 4 {
 		t.Fatal(e)
 	}
 	session.Close()

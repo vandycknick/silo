@@ -1,7 +1,6 @@
 package sshd
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vandycknick/silo/app/taild/internal/httpd"
+	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	_ "tailscale.com/feature/ssh"
 	"tailscale.com/ssh/tailssh"
@@ -122,17 +122,66 @@ func (s *Server) session(parent context.Context, sess *tailssh.Session) {
 		_ = sess.Exit(2)
 		return
 	}
-	_, windows, pty := sess.Pty()
+	initial, windows, pty := sess.Pty()
+	input := newInput(ctx, sess)
+	converted := make(chan service.Window, 1)
+	convertedSignals := make(chan uint32, 1)
+	signals := make(chan tailssh.Signal, 16)
+	sess.Signals(signals)
+	defer sess.Signals(nil)
+	go func() {
+		defer close(convertedSignals)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case sig := <-signals:
+				numbers := map[tailssh.Signal]uint32{"HUP": 1, "INT": 2, "QUIT": 3, "ILL": 4, "ABRT": 6, "FPE": 8, "KILL": 9, "USR1": 10, "SEGV": 11, "USR2": 12, "PIPE": 13, "ALRM": 14, "TERM": 15}
+				if n, ok := numbers[sig]; ok {
+					select {
+					case convertedSignals <- n:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}
+	}()
 	// Pinned Pty creates a converter goroutine; always drain it through close.
 	if pty {
 		go func() {
-			for range windows {
+			defer close(converted)
+			for w := range windows {
+				if w.Height <= 0 || w.Height > 65535 || w.Width <= 0 || w.Width > 65535 {
+					continue
+				}
+				next := service.Window{Rows: uint16(w.Height), Columns: uint16(w.Width)}
+				select {
+				case converted <- next:
+				default:
+					select {
+					case <-converted:
+					default:
+					}
+					select {
+					case converted <- next:
+					default:
+					}
+				}
 			}
 		}()
 	}
+	terminal := service.Terminal{Present: pty, Term: initial.Term, Windows: converted, Signals: convertedSignals}
+	if initial.Window.Height > 0 && initial.Window.Height <= 65535 && initial.Window.Width > 0 && initial.Window.Width <= 65535 {
+		terminal.Window = service.Window{Rows: uint16(initial.Window.Height), Columns: uint16(initial.Window.Width)}
+	}
+	remote := sess.RemoteAddr().String()
+	caller := service.Caller{Peer: peer, Resolve: func(jobctx context.Context) (identity.Peer, error) { return s.Resolver.WhoIs(jobctx, remote) }}
+	closeChannel := func() { _ = sess.Close() }
+	streams := service.IO{Stdin: input.Reader(ctx), Input: input.Reader, Stdout: sessionOutput{ctx, sess, closeChannel}, Stderr: sessionOutput{ctx, sess.Stderr(), closeChannel}, Terminal: terminal}
 	line := sess.RawCommand()
 	if strings.TrimSpace(line) != "" {
-		_ = sess.Exit(Dispatch(s.Service, peer, line, sess, sess.Stderr()))
+		_ = sess.Exit(DispatchSession(ctx, s.Service, caller, line, streams))
 		return
 	}
 	if !pty {
@@ -162,28 +211,30 @@ func (s *Server) session(parent context.Context, sess *tailssh.Session) {
 			}
 		}
 	}()
-	scanner := bufio.NewScanner(sess)
-	scanner.Buffer(make([]byte, 1024), 16384)
 	for {
 		_, _ = io.WriteString(sess.Stderr(), "silo> ")
-		if !scanner.Scan() {
-			if scanner.Err() != nil {
+		line, e = readLine(input.Reader(ctx))
+		if e != nil {
+			if !errors.Is(e, io.EOF) {
 				_ = sess.Exit(2)
 			} else {
 				_ = sess.Exit(0)
 			}
 			return
 		}
-		line = scanner.Text()
 		if strings.TrimSpace(line) == "exit" {
 			_ = sess.Exit(0)
 			return
+		}
+		if strings.TrimSpace(line) == "" {
+			continue
 		}
 		peer, e = s.Resolver.WhoIs(ctx, sess.RemoteAddr().String())
 		if e != nil || peer.NodeID != nodeID {
 			_ = sess.Exit(4)
 			return
 		}
-		_ = Dispatch(s.Service, peer, line, sess, sess.Stderr())
+		caller.Peer = peer
+		_ = DispatchSession(ctx, s.Service, caller, line, streams)
 	}
 }

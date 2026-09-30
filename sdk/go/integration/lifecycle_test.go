@@ -70,6 +70,21 @@ func TestGoSDKLifecycleExecutionLogsAndImages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if session.Stdin() != nil {
+		t.Fatal("stdin exposed before Started observation")
+	}
+	for {
+		event, e := session.Recv(ctx)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if event.Kind == silo.ExecutionEventStarted {
+			break
+		}
+		if event.Kind == silo.ExecutionEventTerminal {
+			t.Fatal("cat ended before Started")
+		}
+	}
 	stdin := session.Stdin()
 	if stdin == nil {
 		t.Fatal("spawn did not expose requested stdin pipe")

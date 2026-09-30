@@ -252,16 +252,7 @@ func (m *Machine) Spawn(ctx context.Context, program string, args []string, opts
 	if err != nil {
 		return nil, fromNativeError(err)
 	}
-	stdin, err := native.Stdin()
-	if err != nil {
-		native.Close()
-		return nil, fromNativeError(err)
-	}
-	session := &ExecutionSession{native: native}
-	if stdin != nil {
-		session.stdin = &ExecutionStdin{native: stdin}
-	}
-	return session, nil
+	return &ExecutionSession{native: native}, nil
 }
 
 // ExecutionSession is a bidirectional structured execution. Recv, Wait, and Collect must not overlap.
@@ -273,9 +264,24 @@ type ExecutionSession struct {
 	receiver sync.Mutex
 }
 
+// Stdin returns pipe or PTY input after the Started event has been received.
+// Before Started (or after Close) it returns nil. It retains the same writer
+// once available; an early query does not permanently cache the absent writer.
 func (s *ExecutionSession) Stdin() *ExecutionStdin {
 	if s == nil {
 		return nil
+	}
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.closed || s.native == nil {
+		return nil
+	}
+	if s.stdin == nil {
+		stdin, err := s.native.Stdin()
+		if err != nil || stdin == nil {
+			return nil
+		}
+		s.stdin = &ExecutionStdin{native: stdin}
 	}
 	return s.stdin
 }
@@ -388,9 +394,11 @@ func (s *ExecutionSession) control(ctx context.Context, call func() error) error
 	return fromNativeError(call())
 }
 func (s *ExecutionSession) CloseRequests() error {
-	return s.control(context.Background(), s.native.CloseRequests)
+	return s.control(context.Background(), func() error { return s.native.CloseRequests() })
 }
-func (s *ExecutionSession) Cancel() error { return s.control(context.Background(), s.native.Cancel) }
+func (s *ExecutionSession) Cancel() error {
+	return s.control(context.Background(), func() error { return s.native.Cancel() })
+}
 func (s *ExecutionSession) Close() error {
 	if s == nil {
 		return nil
