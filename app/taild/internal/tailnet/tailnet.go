@@ -115,6 +115,19 @@ func (n *Node) WhoIs(ctx context.Context, remote string) (identity.Peer, error) 
 }
 func (n *Node) Close() error { return n.Server.Close() }
 
+func (n *Node) Status(ctx context.Context) (*ipnstate.Status, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	status, err := n.Client.Status(ctx)
+	if err != nil {
+		return nil, errors.New("tailnet status unavailable")
+	}
+	if err = n.verify(status); err != nil {
+		return nil, err
+	}
+	return status, nil
+}
+
 func (n *Node) VisibleNames(ctx context.Context) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

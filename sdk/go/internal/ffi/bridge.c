@@ -28,6 +28,8 @@ DECLARE_FFI(machine_free);
 DECLARE_FFI(machine_id);
 DECLARE_FFI(machine_inspect);
 DECLARE_FFI(machine_start);
+DECLARE_FFI(machine_lease_node_state);
+DECLARE_FFI(node_state_lease_free);
 DECLARE_FFI(machine_stop);
 DECLARE_FFI(machine_update);
 DECLARE_FFI(machine_stop_with);
@@ -106,6 +108,8 @@ char *bridge_load(const char *path) {
     LOAD(ffi_machine_id, "silo_machine_id");
     LOAD(ffi_machine_inspect, "silo_machine_inspect");
     LOAD(ffi_machine_start, "silo_machine_start");
+    LOAD(ffi_machine_lease_node_state, "silo_machine_lease_node_state");
+    LOAD(ffi_node_state_lease_free, "silo_node_state_lease_free");
     LOAD(ffi_machine_stop, "silo_machine_stop");
     LOAD(ffi_machine_update, "silo_machine_update");
     LOAD(ffi_machine_stop_with, "silo_machine_stop_with");
@@ -154,6 +158,8 @@ void bridge_machine_free(silo_machine *machine) { ffi_machine_free(machine); }
 silo_error *bridge_machine_id(const silo_machine *machine, silo_buffer *out_id) { return ffi_machine_id(machine, out_id); }
 silo_error *bridge_machine_inspect(const silo_machine *machine, silo_buffer *out_data) { return ffi_machine_inspect(machine, out_data); }
 silo_error *bridge_machine_start(const silo_machine *machine, silo_buffer *out_data) { return ffi_machine_start(machine, out_data); }
+silo_error *bridge_machine_lease_node_state(const silo_machine *machine, silo_node_state_lease **out_lease) { return ffi_machine_lease_node_state(machine, out_lease); }
+void bridge_node_state_lease_free(silo_node_state_lease *lease) { ffi_node_state_lease_free(lease); }
 silo_error *bridge_machine_stop(const silo_machine *machine, silo_buffer *out_data) { return ffi_machine_stop(machine, out_data); }
 silo_error *bridge_machine_update(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data) { return ffi_machine_update(machine, request, request_len, out_data); }
 silo_error *bridge_machine_stop_with(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data) { return ffi_machine_stop_with(machine, request, request_len, out_data); }

@@ -34,6 +34,7 @@ type Snapshot struct {
 	Unreadable int
 }
 type Runtime struct {
+	NodePin  *state.NodePin
 	SDK      *silo.Runtime
 	Instance string
 	mu       sync.Mutex
@@ -90,7 +91,31 @@ func (r *Runtime) Reconcile(ctx context.Context) (Snapshot, error) {
 			if d.Network.Tailscale == nil {
 				node = state.Unreadable
 			} else {
-				node = state.RecoverNode(d.Network.Tailscale.StateDir, d.Name, owner, d.Status.Kind == silo.MachineStatusStopped)
+				machine, err := r.SDK.Machine(ctx, d.ID)
+				if err != nil {
+					node = state.Unreadable
+				} else {
+					if d.Status.Kind == silo.MachineStatusStopped {
+						lease, err := machine.LeaseNodeState(ctx)
+						if err != nil {
+							node = state.Unreadable
+						} else {
+							var pins []state.NodePin
+							if r.NodePin != nil {
+								pins = []state.NodePin{*r.NodePin}
+							}
+							node = state.RecoverNode(d.Network.Tailscale.StateDir, d.Name, owner, true, pins...)
+							_ = lease.Close()
+						}
+					} else {
+						var pins []state.NodePin
+						if r.NodePin != nil {
+							pins = []state.NodePin{*r.NodePin}
+						}
+						_, node = state.ReadNode(d.Network.Tailscale.StateDir, d.Name, owner, pins...)
+					}
+					_ = machine.Close()
+				}
 			}
 		}
 		if len(entry.Issues) > 0 {

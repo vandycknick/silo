@@ -15,6 +15,7 @@ import (
 
 	_ "github.com/vandycknick/silo/app/taild/internal/bootenv"
 	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/httpd"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
@@ -53,6 +54,9 @@ func run() error {
 	secrets, e := config.ReadSecrets(c.SecretsDir)
 	if e != nil {
 		return e
+	}
+	if c.Enrollment.DisableKeyExpiry && secrets.APIToken == "" {
+		return errors.New("disable_key_expiry requires api-token")
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -111,6 +115,23 @@ func run() error {
 	if e = node.WaitReady(ctx); e != nil {
 		return e
 	}
+	observed, e := node.Status(ctx)
+	if e != nil {
+		return e
+	}
+	pin := state.NodePin{Tailnet: observed.CurrentTailnet.Name, Suffix: observed.CurrentTailnet.MagicDNSSuffix, ControlURL: c.Tailnet.ControlURL}
+	if e = state.PinNodeControl(c.Home, pin); e != nil {
+		return e
+	}
+	r.NodePin = &pin
+	registry := enroll.NewRegistry()
+	enrollment := &enroll.Manager{Config: c, Secrets: secrets, Pin: pin, Registry: registry, Devices: enroll.NewDevices(secrets.APIToken), Visible: node.Status}
+	if secrets.AppSecret != "" {
+		enrollment.OAuth, e = enroll.NewOAuth(registry, secrets.AppSecret, "https://"+c.Tailnet.Hostname+"."+pin.Suffix+"/oauth/callback")
+		if e != nil {
+			return e
+		}
+	}
 	snapshot, e := r.Reconcile(ctx)
 	if e != nil {
 		return e
@@ -120,7 +141,7 @@ func run() error {
 	// by this daemon and cancelled when its bounded drain budget expires.
 	jobctx, stopJobs := context.WithCancel(context.Background())
 	defer stopJobs()
-	s := &service.Service{Runtime: r, Audit: audit, Jobs: jobs.New(jobctx, c.Sessions.Global), Capability: c.Tailnet.Capability, Config: c, VisibleNames: node.VisibleNames}
+	s := &service.Service{Runtime: r, Audit: audit, Jobs: jobs.New(jobctx, c.Sessions.Global), Capability: c.Tailnet.Capability, Config: c, VisibleNames: node.VisibleNames, VMNodesEnabled: true, Enrollment: enrollment}
 	if e = s.ReloadDocuments(); e != nil {
 		return e
 	}

@@ -191,11 +191,17 @@ func TestRecoveryAtPromotionCrashBoundaries(t *testing.T) {
 			switch step {
 			case "before-backup":
 				writeNode(t, dir+".pending", "dev")
+				if e := MarkVerifiedNode(dir + ".pending"); e != nil {
+					t.Fatal(e)
+				}
 			case "after-backup":
 				if e := os.Rename(dir, dir+".backup"); e != nil {
 					t.Fatal(e)
 				}
 				writeNode(t, dir+".pending", "dev")
+				if e := MarkVerifiedNode(dir + ".pending"); e != nil {
+					t.Fatal(e)
+				}
 			case "after-promotion":
 				writeNode(t, dir+".backup", "dev")
 			case "corrupt-canonical":
@@ -204,7 +210,11 @@ func TestRecoveryAtPromotionCrashBoundaries(t *testing.T) {
 					t.Fatal(e)
 				}
 			}
-			if s := RecoverNode(dir, "dev", "user:123", true); s != Enrolled {
+			want := Enrolled
+			if step == "corrupt-canonical" {
+				want = Unreadable
+			}
+			if s := RecoverNode(dir, "dev", "user:123", true); s != want {
 				t.Fatal(s)
 			}
 			if _, s := ReadNode(dir, "dev", "user:123"); s != Enrolled {
@@ -214,5 +224,115 @@ func TestRecoveryAtPromotionCrashBoundaries(t *testing.T) {
 				t.Fatal("validated backup was not finalized")
 			}
 		})
+	}
+}
+
+func TestUnverifiedPendingAndChangedReceiptNeverPromote(t *testing.T) {
+	for _, tamper := range []bool{false, true} {
+		dir := filepath.Join(t.TempDir(), "tailscale")
+		writeNode(t, dir+".pending", "dev")
+		if tamper {
+			if e := MarkVerifiedNode(dir + ".pending"); e != nil {
+				t.Fatal(e)
+			}
+			writeNode(t, dir+".pending", "dev")
+		}
+		if s := RecoverNode(dir, "dev", "user:123", true); s != Unreadable {
+			t.Fatal("unverified pending admitted", s)
+		}
+		if _, e := os.Stat(dir + ".pending"); e != nil {
+			t.Fatal("unknown state removed", e)
+		}
+	}
+}
+
+func TestEmptyCreateStatePromotionAndUnknownBackupRetention(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "tailscale")
+	if e := PrivateDir(dir); e != nil {
+		t.Fatal(e)
+	}
+	writeNode(t, dir+".pending", "dev")
+	if e := MarkVerifiedNode(dir + ".pending"); e != nil {
+		t.Fatal(e)
+	}
+	if s := RecoverNode(dir, "dev", "user:123", true); s != Enrolled {
+		t.Fatal(s)
+	}
+	if _, e := os.Stat(dir + ".backup"); !os.IsNotExist(e) {
+		t.Fatal("empty creation backup retained", e)
+	}
+	if e := PrivateDir(dir + ".backup"); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(filepath.Join(dir+".backup", "tailscaled.state"), []byte("unknown material"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	if s := RecoverNode(dir, "dev", "user:123", true); s != Unreadable {
+		t.Fatal("unknown backup ignored", s)
+	}
+	if _, e := os.Stat(dir + ".backup"); e != nil {
+		t.Fatal("unknown backup deleted", e)
+	}
+}
+func TestPublicProfilePinControlTailnetAndStableID(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "tailscale")
+	writeNode(t, dir, "dev")
+	st, e := store.NewFileStore(t.Logf, filepath.Join(dir, "tailscaled.state"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	raw, e := st.ReadState(ipn.KnownProfilesStateKey)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var known map[ipn.ProfileID]ipn.LoginProfile
+	if e = json.Unmarshal(raw, &known); e != nil {
+		t.Fatal(e)
+	}
+	p := known["abc"]
+	p.NetworkProfile = ipn.NetworkProfile{DomainName: "tailnet", MagicDNSName: "tail.test"}
+	p.ControlURL = ipn.DefaultControlURL
+	known["abc"] = p
+	raw, e = json.Marshal(known)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = st.WriteState(ipn.KnownProfilesStateKey, raw); e != nil {
+		t.Fatal(e)
+	}
+	pin := NodePin{Tailnet: "tailnet", Suffix: "TAIL.TEST.", ControlURL: ipn.DefaultControlURL}
+	node, s := ReadNode(dir, "dev", "user:123", pin)
+	if s != Enrolled || node.NodeID != "node-1" {
+		t.Fatal(node, s)
+	}
+	for _, bad := range []NodePin{{Tailnet: "other", Suffix: "tail.test"}, {Tailnet: "tailnet", Suffix: "other.test"}, {Tailnet: "tailnet", Suffix: "tail.test", ControlURL: "https://foreign.test"}} {
+		if _, s = ReadNode(dir, "dev", "user:123", bad); s != Unreadable {
+			t.Fatal("foreign pin accepted", bad, s)
+		}
+	}
+}
+
+func TestHomeControlPinCannotChangeControlOrSuffix(t *testing.T) {
+	home := t.TempDir()
+	if e := PrivateDir(filepath.Join(home, "taild")); e != nil {
+		t.Fatal(e)
+	}
+	pin := NodePin{Tailnet: "tailnet", Suffix: "TAIL.TEST."}
+	if e := PinNodeControl(home, pin); e != nil {
+		t.Fatal(e)
+	}
+	pin.Suffix = "tail.test"
+	pin.ControlURL = ipn.DefaultControlURL
+	if e := PinNodeControl(home, pin); e != nil {
+		t.Fatal(e)
+	}
+	pin.ControlURL = "https://foreign.test"
+	if e := PinNodeControl(home, pin); e == nil {
+		t.Fatal("foreign control accepted")
+	}
+	pin.ControlURL = ipn.DefaultControlURL
+	pin.Suffix = "foreign.test"
+	if e := PinNodeControl(home, pin); e == nil {
+		t.Fatal("foreign DNS suffix accepted")
 	}
 }

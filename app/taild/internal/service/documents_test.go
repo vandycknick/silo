@@ -7,12 +7,15 @@ import (
 	"path/filepath"
 	"reflect"
 	goruntime "runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
+	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
@@ -250,6 +253,7 @@ endpoint "ip" "all" {
  protocol = "tcp"
  destination_cidrs = ["0.0.0.0/0", "::/0"]
 }
+
 rule "deny" {
  endpoints = [ip.all]
  priority = -2147483648
@@ -267,7 +271,7 @@ rule "allow" {
 	if e != nil {
 		t.Fatal(e)
 	}
-	injected, e := InjectTailnet(p, "exact-name")
+	injected, e := InjectTailnet(p, "exact-name", "user:1", "")
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -304,7 +308,7 @@ rule "allow" {
 	}
 	var original map[string]json.RawMessage
 	_ = json.Unmarshal([]byte(withMetadata.JSON()), &original)
-	withMetadata, e = InjectTailnet(withMetadata, "exact-name")
+	withMetadata, e = InjectTailnet(withMetadata, "exact-name", "user:1", "")
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -337,6 +341,52 @@ rule "allow" {
 	}
 	if _, e = s.Create(ctx, c, CreateRequest{Name: "no-bypass", PolicyRef: "evil", NoTailnet: true}); e == nil {
 		t.Fatal("no-tailnet bypass")
+	}
+}
+
+func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
+	s := actualService(t)
+	s.VMNodesEnabled = true
+	s.Config.Tailnet.ControlURL = "https://wrong-config.example.test"
+	s.Enrollment = &enroll.Manager{Pin: state.NodePin{ControlURL: "https://pinned-control.example.test"}}
+	for _, owner := range []identity.Principal{"tag:owner", "user:7"} {
+		caller := domainCaller(t, s, owner)
+		selected := owner
+		if owner == "user:7" {
+			selected = ""
+		}
+		q, e := s.resolveCreate(context.Background(), caller.Peer, CreateRequest{Name: "exact", Owner: selected})
+		if e != nil {
+			t.Fatal(e)
+		}
+		hcl, e := q.policy.HCL()
+		if e != nil {
+			t.Fatal(e)
+		}
+		round, e := silo.ParseNetworkPolicyHCL(hcl)
+		if e != nil {
+			t.Fatal(e)
+		}
+		var root struct {
+			Tailscale []silo.TailscaleTunnel `json:"tailscale"`
+		}
+		if e = json.Unmarshal([]byte(round.JSON()), &root); e != nil {
+			t.Fatal(e)
+		}
+		if len(root.Tailscale) != 1 {
+			t.Fatal("injected node declaration missing")
+		}
+		node := root.Tailscale[0]
+		want := []string(nil)
+		if owner == "tag:owner" {
+			want = []string{"tag:owner"}
+		}
+		if node.Hostname == nil || *node.Hostname != "exact" || node.ControlURL == nil || *node.ControlURL != s.Enrollment.Pin.ControlURL || !slices.Equal(node.Tags, want) {
+			t.Fatal("lost verified node handoff settings")
+		}
+		if _, e = parseRemotePolicy(hcl); e == nil {
+			t.Fatal("caller could override injected node authority")
+		}
 	}
 }
 

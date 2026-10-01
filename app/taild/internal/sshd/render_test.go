@@ -18,6 +18,7 @@ func TestRenderingSnapshots(t *testing.T) {
 		t.Fatal(got)
 	}
 	want := "Name: dev\nID: vm\nOwner: user:1\nState: stopped\nCPUs: 2\nMemory: 4096\nDisk: 8192\nImage: ghcr.io/ns/image:tag\nLabels: map[team:alpha]\nLast operation: op_00000000000000000000000000 succeeded\n"
+	want += "Node: \nNode state: \nAddress: \nKey expiry: \n"
 	if got := renderShow(v); got != want {
 		t.Fatal(got)
 	}
@@ -45,7 +46,7 @@ func TestStreamingDelimiterAndCommandHelp(t *testing.T) {
 	if tokens[5] != "--json" || tokens[6] != "--yes" || tokens[7] != "$HOME; | literal" {
 		t.Fatal(tokens)
 	}
-	for _, cmd := range []string{"create", "ls", "show", "start", "stop", "restart", "rm", "set", "shell", "exec", "logs", "ops", "whoami"} {
+	for _, cmd := range []string{"create", "ls", "show", "start", "stop", "restart", "reauth", "rm", "set", "shell", "exec", "logs", "ops", "whoami"} {
 		if _, ok := commandHelp(cmd); !ok {
 			t.Fatal("command missing help", cmd)
 		}

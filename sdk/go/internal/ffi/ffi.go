@@ -35,6 +35,25 @@ type Runtime struct{ pointer *C.silo_runtime }
 // Machine owns one native libvm machine handle.
 type Machine struct{ pointer *C.silo_machine }
 
+type NodeStateLease struct{ pointer *C.silo_node_state_lease }
+
+func (machine *Machine) LeaseNodeState() (*NodeStateLease, error) {
+	var output *C.silo_node_state_lease
+	if err := takeError(C.bridge_machine_lease_node_state(machine.pointer, &output)); err != nil {
+		return nil, err
+	}
+	if output == nil {
+		return nil, fmt.Errorf("native Silo bridge returned a nil lease")
+	}
+	return &NodeStateLease{pointer: output}, nil
+}
+func (lease *NodeStateLease) Close() {
+	if lease != nil && lease.pointer != nil {
+		C.bridge_node_state_lease_free(lease.pointer)
+		lease.pointer = nil
+	}
+}
+
 // Execution owns one native structured execution session.
 type Execution struct{ pointer *C.silo_execution }
 

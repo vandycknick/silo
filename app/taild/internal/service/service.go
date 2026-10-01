@@ -7,6 +7,7 @@ import (
 
 	"github.com/vandycknick/silo/app/taild/internal/authz"
 	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
@@ -15,6 +16,7 @@ import (
 )
 
 type Service struct {
+	Enrollment   *enroll.Manager
 	Runtime      *runtime.Runtime
 	Audit        *state.Audit
 	Jobs         *jobs.Registry
@@ -24,8 +26,7 @@ type Service struct {
 	createMu     sync.Mutex
 	pending      map[string]identity.Principal
 	documentMu   sync.Mutex
-	// Phase 13 enables this after enrollment is implemented. The zero value
-	// suppresses VM-node declarations, independently of user --no-tailnet.
+	// Production enables node injection; --no-tailnet and mode none omit it.
 	VMNodesEnabled bool
 }
 type WhoAmI struct {

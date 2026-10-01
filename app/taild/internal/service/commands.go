@@ -14,6 +14,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
+	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/units"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
@@ -72,22 +73,29 @@ func Categorize(err error) *authz.Error {
 }
 
 type VM struct {
-	Template      string                 `json:"template,omitempty"`
-	Policy        string                 `json:"policy,omitempty"`
-	GuestTCPPorts []uint16               `json:"guest_tcp_ports,omitempty"`
-	ID            string                 `json:"id"`
-	Name          string                 `json:"name"`
-	Owner         identity.Principal     `json:"owner"`
-	State         silo.MachineStatusKind `json:"state"`
-	Node          string                 `json:"node"`
-	Address       string                 `json:"address"`
-	CPUs          uint8                  `json:"cpus"`
-	Memory        uint64                 `json:"memory"`
-	Disk          uint64                 `json:"disk"`
-	Created       time.Time              `json:"created"`
-	Image         string                 `json:"image"`
-	Labels        map[string]string      `json:"labels"`
-	LastOperation *jobs.Operation        `json:"last_operation,omitempty"`
+	NodeDiagnostics []string               `json:"node_diagnostics,omitempty"`
+	NodeState       state.NodeState        `json:"node_state"`
+	NodeID          string                 `json:"node_id,omitempty"`
+	Addresses       []string               `json:"addresses,omitempty"`
+	KeyExpiry       string                 `json:"key_expiry"`
+	ApprovalURL     string                 `json:"approval_url,omitempty"`
+	ApprovalExpires *time.Time             `json:"approval_expires,omitempty"`
+	Template        string                 `json:"template,omitempty"`
+	Policy          string                 `json:"policy,omitempty"`
+	GuestTCPPorts   []uint16               `json:"guest_tcp_ports,omitempty"`
+	ID              string                 `json:"id"`
+	Name            string                 `json:"name"`
+	Owner           identity.Principal     `json:"owner"`
+	State           silo.MachineStatusKind `json:"state"`
+	Node            string                 `json:"node"`
+	Address         string                 `json:"address"`
+	CPUs            uint8                  `json:"cpus"`
+	Memory          uint64                 `json:"memory"`
+	Disk            uint64                 `json:"disk"`
+	Created         time.Time              `json:"created"`
+	Image           string                 `json:"image"`
+	Labels          map[string]string      `json:"labels"`
+	LastOperation   *jobs.Operation        `json:"last_operation,omitempty"`
 }
 
 func project(d *silo.MachineData) VM {
@@ -155,7 +163,7 @@ func (s *Service) List(ctx context.Context, p identity.Peer) ([]VM, error) {
 		if d == nil || d.Labels[runtime.InstanceLabel] != s.Runtime.Instance || !p.Owns(identity.Principal(d.Labels[runtime.OwnerLabel])) || d.Labels[runtime.NameLabel] != d.Name || !config.ValidName(d.Name) {
 			continue
 		}
-		out = append(out, project(d))
+		out = append(out, s.nodeView(ctx, d))
 	}
 	return out, nil
 }
@@ -165,7 +173,7 @@ func (s *Service) Show(ctx context.Context, p identity.Peer, ref string) (VM, er
 		return VM{}, e
 	}
 	defer m.Close()
-	v := project(d)
+	v := s.nodeView(ctx, d)
 	if s.Jobs != nil {
 		for _, op := range s.Jobs.List(p) {
 			if op.VM == d.ID || op.Kind == "create" && op.VM == d.Name {
@@ -443,6 +451,9 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 		labels[runtime.LoginLabel] = p.Login
 		labels[runtime.NameLabel] = q.Name
 		labels[runtime.ModeLabel] = "none"
+		if s.VMNodesEnabled && s.Enrollment != nil {
+			labels[runtime.ModeLabel] = string(s.Enrollment.Mode(q.Owner, q.NoTailnet))
+		}
 		labels[runtime.InstanceLabel] = s.Runtime.Instance
 		if q.Template != "" {
 			labels[TemplateLabel] = q.Template
@@ -487,6 +498,16 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 			d, e := m.Inspect(ctx)
 			if e != nil {
 				return Categorize(e)
+			}
+			if e = s.Authorize(p, identity.Create, authority(d)); e != nil {
+				return e
+			}
+			if e = s.enroll(ctx, c, identity.Create, m, d, false, progress); e != nil {
+				return e
+			}
+			p, e = c.Fresh(ctx)
+			if e != nil {
+				return e
 			}
 			if e = s.Authorize(p, identity.Create, authority(d)); e != nil {
 				return e
@@ -546,7 +567,17 @@ func (s *Service) mutation(ctx context.Context, c Caller, ref, kind string, acti
 }
 func (s *Service) Start(ctx context.Context, c Caller, ref string) (jobs.Operation, error) {
 	return s.mutation(ctx, c, ref, "start", identity.Start, func(ctx context.Context, p identity.Peer, m *silo.Machine, d *silo.MachineData, f func(string)) error {
-		_, e := m.Start(ctx)
+		if e := s.enroll(ctx, c, identity.Start, m, d, false, f); e != nil {
+			return e
+		}
+		p, e := c.Fresh(ctx)
+		if e != nil {
+			return e
+		}
+		if e = s.Authorize(p, identity.Start, authority(d)); e != nil {
+			return e
+		}
+		_, e = m.Start(ctx)
 		if e != nil {
 			return e
 		}
@@ -572,6 +603,9 @@ func (s *Service) Restart(ctx context.Context, c Caller, ref string) (jobs.Opera
 			return e
 		}
 		if e = s.Authorize(p, identity.Restart, authority(d)); e != nil {
+			return e
+		}
+		if e = s.enroll(ctx, c, identity.Restart, m, d, false, f); e != nil {
 			return e
 		}
 		if _, e = m.Start(ctx); e != nil {
@@ -621,7 +655,34 @@ func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequ
 		if e = s.Authorize(p, identity.Delete, authority(d)); e != nil {
 			return e
 		}
-		return m.Remove(ctx)
+		var node state.NodeIdentity
+		if d.Network.Tailscale != nil {
+			lease, e := m.LeaseNodeState(ctx)
+			if e != nil {
+				return e
+			}
+			var pins []state.NodePin
+			if s.Enrollment != nil {
+				pins = []state.NodePin{s.Enrollment.Pin}
+			}
+			if state.RecoverNode(d.Network.Tailscale.StateDir, d.Name, identity.Principal(d.Labels[runtime.OwnerLabel]), true, pins...) == state.Unreadable {
+				_ = lease.Close()
+				f("device_retained: node state recovery required")
+				return failure("conflict", "retained node state requires recovery before removal", 5)
+			}
+			var nodeState state.NodeState
+			node, nodeState = state.ReadNode(d.Network.Tailscale.StateDir, d.Name, identity.Principal(d.Labels[runtime.OwnerLabel]), pins...)
+			_ = lease.Close()
+			if nodeState == state.Unreadable {
+				f("device_retained: unknown (state unreadable)")
+				return failure("conflict", "unreadable node state retained; recover before removal", 5)
+			}
+		}
+		if e = m.Remove(ctx); e != nil {
+			return e
+		}
+		s.removeDevice(ctx, node, f)
+		return nil
 	})
 }
 func (s *Service) Set(ctx context.Context, c Caller, ref string, q SetRequest) (jobs.Operation, error) {

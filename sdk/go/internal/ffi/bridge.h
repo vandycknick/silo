@@ -23,6 +23,8 @@ void bridge_machine_free(silo_machine *machine);
 silo_error *bridge_machine_id(const silo_machine *machine, silo_buffer *out_id);
 silo_error *bridge_machine_inspect(const silo_machine *machine, silo_buffer *out_data);
 silo_error *bridge_machine_start(const silo_machine *machine, silo_buffer *out_data);
+silo_error *bridge_machine_lease_node_state(const silo_machine *machine, silo_node_state_lease **out_lease);
+void bridge_node_state_lease_free(silo_node_state_lease *lease);
 silo_error *bridge_machine_stop(const silo_machine *machine, silo_buffer *out_data);
 silo_error *bridge_machine_update(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data);
 silo_error *bridge_machine_stop_with(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_data);

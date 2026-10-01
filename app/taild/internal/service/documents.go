@@ -14,6 +14,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/units"
 	silo "github.com/vandycknick/silo/sdk/go"
 	"go.yaml.in/yaml/v3"
+	"tailscale.com/ipn"
 )
 
 const DocumentLimit = 64 << 10
@@ -250,7 +251,17 @@ func parseRemotePolicy(raw string) (*silo.NetworkPolicy, error) {
 // their order/priority. IP allow rules gain neutral routing, which netd applies
 // only to tailnet destinations; the appended lowest-priority rules exempt the
 // tailnet from default deny without overriding any explicit matching rule.
-func InjectTailnet(p *silo.NetworkPolicy, hostname string) (*silo.NetworkPolicy, error) {
+func InjectTailnet(p *silo.NetworkPolicy, hostname string, owner identity.Principal, controlURL string) (*silo.NetworkPolicy, error) {
+	if _, e := identity.ParsePrincipal(string(owner)); e != nil {
+		return nil, usageDocument()
+	}
+	if controlURL == "" {
+		controlURL = ipn.DefaultControlURL
+	}
+	tags := []string{}
+	if strings.HasPrefix(string(owner), "tag:") {
+		tags = append(tags, string(owner))
+	}
 	if p == nil {
 		var e error
 		p, e = silo.BuildNetworkPolicy(silo.NetworkPolicyConfig{})
@@ -299,7 +310,7 @@ func InjectTailnet(p *silo.NetworkPolicy, hostname string) (*silo.NetworkPolicy,
 		}
 	}
 	priority := int32(-2147483648)
-	injected, e := silo.BuildNetworkPolicy(silo.NetworkPolicyConfig{Tunnels: []silo.TailscaleTunnel{{Name: "vm", Hostname: &hostname}}, Endpoints: []silo.NetworkEndpoint{{Name: "silo-tailnet-v4", Kind: silo.NetworkEndpointIP, Protocol: silo.NetworkProtocolTCP, DestinationCIDRs: []string{"100.64.0.0/10"}}, {Name: "silo-tailnet-v6", Kind: silo.NetworkEndpointIP, Protocol: silo.NetworkProtocolTCP, DestinationCIDRs: []string{"fd7a:115c:a1e0::/48"}}}, Rules: []silo.NetworkRule{{Name: ptr("silo-tailnet-v4"), Endpoints: []string{"silo-tailnet-v4"}, Tunnel: ptr("vm"), Priority: &priority, Verdict: silo.NetworkVerdictAllow}, {Name: ptr("silo-tailnet-v6"), Endpoints: []string{"silo-tailnet-v6"}, Tunnel: ptr("vm"), Priority: &priority, Verdict: silo.NetworkVerdictAllow}}})
+	injected, e := silo.BuildNetworkPolicy(silo.NetworkPolicyConfig{Tunnels: []silo.TailscaleTunnel{{Name: "vm", Hostname: &hostname, Tags: tags, ControlURL: &controlURL}}, Endpoints: []silo.NetworkEndpoint{{Name: "silo-tailnet-v4", Kind: silo.NetworkEndpointIP, Protocol: silo.NetworkProtocolTCP, DestinationCIDRs: []string{"100.64.0.0/10"}}, {Name: "silo-tailnet-v6", Kind: silo.NetworkEndpointIP, Protocol: silo.NetworkProtocolTCP, DestinationCIDRs: []string{"fd7a:115c:a1e0::/48"}}}, Rules: []silo.NetworkRule{{Name: ptr("silo-tailnet-v4"), Endpoints: []string{"silo-tailnet-v4"}, Tunnel: ptr("vm"), Priority: &priority, Verdict: silo.NetworkVerdictAllow}, {Name: ptr("silo-tailnet-v6"), Endpoints: []string{"silo-tailnet-v6"}, Tunnel: ptr("vm"), Priority: &priority, Verdict: silo.NetworkVerdictAllow}}})
 	if e != nil {
 		return nil, e
 	}
@@ -490,8 +501,12 @@ func (s *Service) resolveCreate(ctx context.Context, p identity.Peer, q CreateRe
 			return q, e
 		}
 	}
-	if s.VMNodesEnabled && !q.NoTailnet {
-		q.policy, e = InjectTailnet(q.policy, q.Name)
+	if s.VMNodesEnabled && !q.NoTailnet && s.Config.Enrollment.Mode != "none" {
+		controlURL := s.Config.Tailnet.ControlURL
+		if s.Enrollment != nil {
+			controlURL = s.Enrollment.Pin.ControlURL
+		}
+		q.policy, e = InjectTailnet(q.policy, q.Name, owner, controlURL)
 		if e != nil {
 			return q, e
 		}

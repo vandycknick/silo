@@ -51,7 +51,7 @@ func TestNativeKVMTemplatesPolicyAndMissingSecrets(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	s := &service.Service{Runtime: r, Audit: audit, Jobs: jobs.New(ctx, 8), Config: c}
+	s := &service.Service{Runtime: r, Audit: audit, Jobs: jobs.New(ctx, 8), Config: c, VMNodesEnabled: true}
 	defer func() {
 		cancel()
 		drain, done := context.WithTimeout(context.Background(), 30*time.Second)
