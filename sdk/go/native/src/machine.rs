@@ -10,7 +10,7 @@ use vm_spec::Mount;
 use crate::buffer::SiloBuffer;
 use crate::dto;
 use crate::error::{catch_ffi, error_from_libvm, invalid_argument, SiloError};
-use crate::handles::{MachineHandle, RuntimeHandle};
+use crate::handles::{MachineHandle, NodeStateLeaseHandle, RuntimeHandle};
 use crate::runtime::request_bytes;
 
 #[derive(Deserialize)]
@@ -293,6 +293,36 @@ pub unsafe extern "C" fn silo_machine_start(
     machine_data_operation(machine, out_data, |machine| async move {
         machine.start().await.map(|start| start.machine)
     })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn silo_machine_lease_node_state(
+    machine: *const MachineHandle,
+    out_lease: *mut *mut NodeStateLeaseHandle,
+) -> *mut SiloError {
+    catch_ffi(|| {
+        let machine = machine
+            .as_ref()
+            .ok_or_else(|| invalid_argument("machine must not be null"))?;
+        if out_lease.is_null() {
+            return Err(invalid_argument("out_lease must not be null"));
+        }
+        *out_lease = ptr::null_mut();
+        let lease = machine
+            .context
+            .tokio
+            .block_on(machine.machine.lease_node_state())
+            .map_err(error_from_libvm)?;
+        *out_lease = Box::into_raw(Box::new(NodeStateLeaseHandle { _lease: lease }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn silo_node_state_lease_free(lease: *mut NodeStateLeaseHandle) {
+    if !lease.is_null() {
+        drop(Box::from_raw(lease));
+    }
 }
 
 #[no_mangle]

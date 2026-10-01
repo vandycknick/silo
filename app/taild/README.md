@@ -1,7 +1,7 @@
 # taild, owned VM lobby
 
-The management node exposes owned VM operations and templates over tailnet SSH. Phase 12 VMs
-have no tailnet node. VM enrollment arrives in phase 13. Closing this
+The management node exposes owned VM operations and templates over tailnet SSH.
+VM enrollment completes before boot; `--no-tailnet` retains ordinary networking. Closing this
 daemon releases SDK handles and its own node, never stops VMs.
 
 ## Build and check
@@ -25,15 +25,17 @@ complete operator-installed portable runtime; otherwise lookup is under
 The shipped [`config.example.yaml`](config.example.yaml) shows operator defaults.
 Secrets are optional files in `/etc/silo-taild/secrets`: `oauth-client-secret`,
 `oauth-app-secret`, `api-token`. Files must be regular, private (0600), nonempty.
-Missing secrets select interactive login or later-phase fallback behavior.
+Missing OAuth app secrets select per-VM interactive login. Tagged callers require
+the configured OAuth client to mint their selected owner tag. Configured errors
+fail explicitly, without a silent fallback.
 
 Startup: config/home/secrets, exclusive home lock and private state/audit,
 public SDK, service tailnet node, verified Running status/tag/tailnet pin,
 resilient SDK reconciliation, then listeners. Login URLs are logged while
 waiting. A different observed tailnet is refused. TCP 22 and TLS 443 are bound
 only through tsnet, never host listeners or Funnel. HTTP health/metrics require
-fresh WhoIs and configured own-scope `vm.read`; callback returns 404 until phase
-13. Shutdown cancels lobby sessions and waits at most 90 seconds for sessions
+fresh WhoIs and configured own-scope `vm.read`; the TLS OAuth callback instead
+requires an unexpired one-use nonce. Shutdown cancels lobby sessions and waits at most 90 seconds for sessions
 and operations. The operation registry starts empty on restart.
 
 ## Identity and permissions
@@ -59,12 +61,46 @@ The five exact label keys are `io.silo.taild.owner`, `.owner-login`, `.name`,
 machines. Name is exact, globally reserved across owners, with the SDK's native
 home-wide name lock authoritative against CLI/SDK writers. There is no prefix
 or auto-suffix. Create holds name and selected-principal quota reservations through
-durable SDK creation, releasing them on failure. Assigned VM DNS verification is
-phase 13. Inventory projections exclude host
+durable SDK creation, releasing them on failure. Assigned VM DNS is checked exactly,
+normalizing case/trailing dot only. Inventory projections exclude host
 paths and native issue text. Unreadable indexed records never hide healthy
 ones. State readers use public ipn/profile/store types; directory presence does
 not prove enrollment. Stopped recovery only promotes validated state, retaining
-unknown recovery material for operator inspection. No VM nodes start here.
+unknown recovery material for operator inspection.
+
+## Enrollment
+
+Human callers use OAuth app consent when `oauth-app-secret` is present, otherwise
+interactive login. Tagged callers mint an explicit bounded one-use key for their
+selected tag. `enrollment.mode: none` and `--no-tailnet` omit the VM node.
+TLS callbacks atomically consume a VM/principal-bound nonce before exchanging a
+code. Nonces expire after 15 minutes and disappear on cancellation/restart.
+Callback identity is never trusted; actual node status must match the immutable
+numeric user (untagged) or owner tag, pinned tailnet/control and exact DNS name.
+
+Consent and enrollment hold a public SDK stopped-machine node-state lease.
+Native CLI/SDK Start, Remove and Update fail busy, while Inspect remains available.
+Synced transaction fences and pending/backup/unreadable artifacts continue to
+block native mutations after a writer crash. Recovery may acquire the lease;
+only a committed or safely aborted transaction clears its fence. Unknown state
+must be recovered before removal.
+Consent holds no global name lock. The temporary server closes before synced,
+recoverable pending/backup promotion; netd receives state, never the provisioning
+token. `enrollment.timeout` bounds node approval to at most 5 minutes.
+Expired/failed approvals leave the VM stopped (exit 8); `start` offers a fresh link.
+
+`reauth VM` explicitly refreshes the copied existing identity through the pinned
+local API, waits for login completion and a changed public key in actual status,
+then closes the temporary server and verifies that key in public-package IPN
+state with the same stable ID and exact name. Local API preferences redact
+private keys and are never used as a changed-key signal. Reauth requires a
+stopped VM and both lifecycle capabilities.
+Corrupt/unknown state is retained and requires stale-device/recovery cleanup.
+Remove snapshots the stable ID before native deletion; API cleanup resolves and
+verifies the endpoint device ID, otherwise reports `device_retained`.
+`disable_key_expiry: true` requires `api-token`; configured failures are explicit.
+Live OAuth consent, ownership/approval semantics and stable-ID reauthentication
+remain UNVERIFIED until the live/manual qualification gates run.
 
 ## SSH contract and pinned evidence (D03)
 
@@ -82,10 +118,10 @@ quoted words are retained. Empty command with PTY opens a prompt; without PTY
 prints help and exits 2. `--json` returns exactly one stdout object with `ok`,
 human/error text goes to stderr. Exit categories: 2 usage, 3 invisible/missing,
 4 capability denial, 5 state/conflict, 6 limit, 7 operation failure, 8 enrollment
-(later phase), 9 unavailable, 255 transport failure. Guest exit status passes through.
+(pending/expired approval), 9 unavailable, 255 transport failure. Guest exit status passes through.
 Every REPL command re-resolves WhoIs; idle identity is checked every 30 seconds.
 
-## VM commands (phase 11)
+## VM commands
 
 ```text
 create NAME [IMAGE|--image OCI] [--template NAME] [--policy NAME]
@@ -97,6 +133,7 @@ show VM
 start VM
 stop VM [--force] [--timeout DURATION]
 restart VM
+reauth VM
 rm VM [--force] [--yes]
 set VM [name=NAME] [cpus=N] [memory=SIZE] [disk=SIZE]
 shell VM [-u USER]
@@ -195,7 +232,7 @@ KiB/MiB/GiB/TiB. Resource/capability ceilings apply to the effective VM at creat
 **Remote `network.publish: [8080, 8443]` is a list of fixed guest TCP port discovery
 hints (1–65535, unique), not CLI/SDK `publish {bind: loopback|any}`.** It is stamped
 into immutable VM metadata and exposed as `guest_tcp_ports`. It creates no host
-listener and is never mapped to SDK `WithPublish`. In phase 13 netd's inbound
+listener and is never mapped to SDK `WithPublish`. Netd's inbound
 fallback still accepts every guest TCP port allowed by the tailnet ACL, regardless
 of these hints. Configure the ACL to restrict inbound ports; this list does not.
 
@@ -207,14 +244,15 @@ labels and projected by `show`. Description remains template metadata.
 
 Policies are HCL parsed and emitted exclusively by the public Rust-backed SDK.
 Any Tailscale declaration, rule tunnel reference or forward is prohibited, even
-with `--no-tailnet`. The one `Service.VMNodesEnabled` switch stays false until
-phase 13. Pure injection retains the entire canonical JSON, supplies the exact
-hostname, and appends TCP routes for both `100.64.0.0/10` and
+with `--no-tailnet`. Production enables the one `Service.VMNodesEnabled` switch.
+Injection retains the entire canonical JSON, supplies the exact
+hostname, verified owner tag (empty for users) and pinned control URL, and appends
+TCP routes for both `100.64.0.0/10` and
 `fd7a:115c:a1e0::/48` at minimum priority. Explicit user rules retain priority and
 order, including deny at minimum priority. User IP allow rules gain neutral tunnel
 routing, used only for tailnet destinations by netd. Thus explicit denials win,
 while otherwise the tailnet is exempt from default deny. User HTTP rules and
-non-tailnet routing remain intact. No phase 12 VM starts a Tailscale node.
+non-tailnet routing remain intact.
 
 Before image pull/admission and again before SDK CreateMachine, public
 `Runtime.CheckPolicySecrets` runs the actual start resolver. Missing alternatives

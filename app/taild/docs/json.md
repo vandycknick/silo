@@ -1,4 +1,4 @@
-# Lobby JSON, phase 12
+# Lobby JSON, phase 13
 
 `--json` produces exactly one UTF-8 JSON object on stdout. Progress, human
 messages and errors use stderr. Shell, exec and logs are streaming byte commands
@@ -17,7 +17,7 @@ contents are projected into VM/operation queries.
 | --- | --- |
 | `ls` | Array of VM projections, empty array when no visible VMs |
 | `show VM` | One VM projection |
-| create/start/stop/restart/rm/set | One terminal operation record |
+| create/start/stop/restart/reauth/rm/set | One terminal operation record |
 | `ops`, `ops show ID` | Array of own operation records (one for show) |
 | `whoami` | `{peer, capability, explanation?}` |
 | `version` | `{taild, sdk, runtime, tailscale}` strings |
@@ -40,14 +40,19 @@ stored. Another principal's documents are invisible (3). Operator-only writes ar
 forbidden (4), duplicate creates conflict (5), invalid stdin/documents fail (2),
 unsafe/unreadable stored documents fail (9).
 Resource sizes are integer bytes. Times are UTC
-RFC 3339 strings with optional fractional seconds. Node/address are empty until
-VM enrollment is implemented. Ownership is one verified `user:<numeric-id>` or
+RFC 3339 strings with optional fractional seconds. `node_state` is `none`,
+`pending approval`, `enrolled`, or `state unreadable`. `node_id` is the stable
+Tailscale node ID, not its numeric peer ID or admin endpoint device ID.
+`addresses` and `key_expiry` are API-observed, otherwise address/expiry are `unknown`.
+Authorized owners see the current `approval_url` and `approval_expires`, never tokens.
+`reauth VM` requires a stopped VM and both `vm.stop` and `vm.start` capabilities.
+Ownership is one verified `user:<numeric-id>` or
 `tag:<name>`; other owners and instances are invisible (exit 3).
 
 Operations contain `id`, `kind`, `vm`, `principal`, `state`, `started`, `progress`,
 optional `finished`, optional `error` (`code`, `message`). `vm` is the requested
 exact name during create, otherwise the stable VM ID. Kinds are create/start/
-stop/restart/remove/set. States are queued/running/succeeded/failed. Progress
+stop/restart/reauth/remove/set. States are queued/running/succeeded/failed. Progress
 retains at most 128 lines of at most 1024 bytes. IDs use canonical uppercase
 Crockford ULID encoding: a 48-bit millisecond timestamp plus 80 crypto-random bits.
 Finished operations expire after 24 hours; all operations disappear on daemon
@@ -83,6 +88,13 @@ limits are additive; enforcement additionally constrains them by operator ceilin
         "owner": {"type": "string"},
         "state": {"enum": ["stopped", "starting", "running", "stopping", "error", "unknown"]},
         "node": {"type": "string"},
+        "node_state": {"enum": ["none", "pending approval", "enrolled", "state unreadable"]},
+        "node_id": {"type": "string"},
+        "node_diagnostics": {"type": "array", "items": {"type": "string"}},
+        "addresses": {"type": "array", "items": {"type": "string"}},
+        "key_expiry": {"type": "string"},
+        "approval_url": {"type": "string", "format": "uri"},
+        "approval_expires": {"type": "string", "format": "date-time"},
         "address": {"type": "string"},
         "cpus": {"type": "integer", "minimum": 0},
         "memory": {"type": "integer", "minimum": 0},
@@ -102,7 +114,7 @@ limits are additive; enforcement additionally constrains them by operator ceilin
       "required": ["id", "kind", "vm", "principal", "state", "started", "progress"],
       "properties": {
         "id": {"type": "string", "pattern": "^op_[0-7][0-9A-HJKMNP-TV-Z]{25}$"},
-        "kind": {"enum": ["create", "start", "stop", "restart", "remove", "set"]},
+        "kind": {"enum": ["create", "start", "stop", "restart", "reauth", "remove", "set"]},
         "vm": {"type": "string"},
         "principal": {"type": "string"},
         "state": {"enum": ["queued", "running", "succeeded", "failed"]},
@@ -127,6 +139,6 @@ limits are additive; enforcement additionally constrains them by operator ceilin
 
 Exit codes: 0 success, 2 usage/validation, 3 invisible/missing VM or operation,
 4 forbidden, 5 state/conflict, 6 limit, 7 failed VM/image operation, 8 enrollment
-(future phase), 9 unavailable, 255 lost transport/execution. Exec/shell pass guest
+(pending/expired/failed approval), 9 unavailable, 255 lost transport/execution. Exec/shell pass guest
 exit codes through; signal exits use `128 + signal` (capped at 255), missing guest
 program uses 127, other guest launch failures use 126.

@@ -15,6 +15,8 @@ typedef struct silo_log silo_log;
 
 typedef struct silo_machine silo_machine;
 
+typedef struct silo_node_state_lease silo_node_state_lease;
+
 typedef struct silo_runtime silo_runtime;
 
 typedef struct silo_stdin silo_stdin;
@@ -161,6 +163,11 @@ silo_error *silo_machine_id(const silo_machine *machine, silo_buffer *out_id);
 silo_error *silo_machine_inspect(const silo_machine *machine, silo_buffer *out_data);
 
 silo_error *silo_machine_start(const silo_machine *machine, silo_buffer *out_data);
+
+silo_error *silo_machine_lease_node_state(const silo_machine *machine,
+                                          silo_node_state_lease **out_lease);
+
+void silo_node_state_lease_free(silo_node_state_lease *lease);
 
 silo_error *silo_machine_stop(const silo_machine *machine, silo_buffer *out_data);
 

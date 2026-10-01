@@ -14,7 +14,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/service"
 )
 
-const Help = "silo · VMs on your tailnet\nhelp, whoami, version, create NAME, ls, show VM, start VM, stop VM, restart VM, rm VM, set VM KEY=VALUE, logs VM, shell VM, exec VM -- CMD..., ops [show ID], template, policy\nUse --json for structured queries/mutations. Guest exec arguments after -- are literal. Phase 12 VMs have no tailnet node.\n"
+const Help = "silo · VMs on your tailnet\nhelp, whoami, version, create NAME, ls, show VM, start VM, stop VM, restart VM, reauth VM, rm VM, set VM KEY=VALUE, logs VM, shell VM, exec VM -- CMD..., ops [show ID], template, policy\nUse --json for structured queries/mutations. Guest exec arguments after -- are literal.\n"
 
 type response struct {
 	OK    bool           `json:"ok"`

@@ -29,6 +29,7 @@ mod initramfs_overlay;
 mod lock_manager;
 mod machine;
 mod network;
+pub mod node_state;
 mod paths;
 mod runtime;
 mod secrets;

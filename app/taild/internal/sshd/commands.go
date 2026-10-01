@@ -242,11 +242,13 @@ func commands(ctx context.Context, s *service.Service, c service.Caller, t []str
 			}
 		}
 		op, err = s.Create(ctx, c, q)
-	case "start", "restart":
+	case "start", "restart", "reauth":
 		if len(args) != 1 {
 			return nil, "", 2, usage()
 		}
-		if cmd == "start" {
+		if cmd == "reauth" {
+			op, err = s.Reauth(ctx, c, args[0])
+		} else if cmd == "start" {
 			op, err = s.Start(ctx, c, args[0])
 		} else {
 			op, err = s.Restart(ctx, c, args[0])

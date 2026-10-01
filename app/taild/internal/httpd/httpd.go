@@ -19,7 +19,13 @@ type Resolver interface {
 
 func Handler(s *service.Service, resolver Resolver) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/oauth/callback", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+	mux.HandleFunc("/oauth/callback", func(w http.ResponseWriter, r *http.Request) {
+		if s.Enrollment == nil || s.Enrollment.OAuth == nil {
+			http.NotFound(w, r)
+			return
+		}
+		s.Enrollment.OAuth.Callback(w, r)
+	})
 	for _, path := range []string{"/healthz", "/metrics"} {
 		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != "GET" {
@@ -54,5 +60,5 @@ func Handler(s *service.Service, resolver Resolver) http.Handler {
 	return mux
 }
 func Server(s *service.Service, resolver Resolver) *http.Server {
-	return &http.Server{Handler: Handler(s, resolver), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
+	return &http.Server{Handler: Handler(s, resolver), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 35 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 }

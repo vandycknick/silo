@@ -20,6 +20,7 @@ This inventory is completed alongside implementation. A checked item has a publi
 | `start` | `Machine.Start` | `silo_machine_start` | lifecycle tests | implemented |
 | `stop` | `Machine.Stop` | `silo_machine_stop` | lifecycle tests | implemented |
 | stopped resource/name/label updates | `Machine.Update` | `silo_machine_update` | actual native temp-home contracts and native KVM | implemented |
+| stopped node-state lifecycle exclusion | `Machine.LeaseNodeState`, `NodeStateLease.Close` | `silo_machine_lease_node_state`, `silo_node_state_lease_free`, Rust `Machine::lease_node_state` | actual Rust SQLite and cross-process public SDK Start/Update/Remove busy, Inspect safe, release/update/remove | implemented |
 | stop options | `Machine.StopWith` | `silo_machine_stop_with` | same-run Rust escalation and native KVM | implemented |
 | guest provisioning readiness | `Machine.WaitReady` | polling `silo_machine_inspect` | terminal errors and native KVM | implemented |
 | generic launch generation | `MachineData.RunID` / fenced `WaitReady` | `VmMonitorService` protobuf `run_id` + inspect DTO | preserved readers, expected machine/run fencing and real native gRPC/KVM | implemented |

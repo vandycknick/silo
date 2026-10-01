@@ -48,6 +48,13 @@ func (*Machine) AttachShell([]byte) ([]byte, error)     { return nil, nil }
 func (*Machine) Logs([]byte) (*Log, error)              { return nil, nil }
 func (*Machine) Remove() error                          { return nil }
 func (*Machine) Close()                                 {}
+
+type NodeStateLease struct{}
+
+func (*Machine) LeaseNodeState() (*NodeStateLease, error) {
+	return nil, &NativeError{Variant: "Unsupported", Message: "native SDK unavailable"}
+}
+func (*NodeStateLease) Close()                          {}
 func (*Execution) Recv() (*ExecutionEvent, bool, error) { return nil, false, nil }
 func (*Execution) Wait() ([]byte, error)                { return nil, nil }
 func (*Execution) Collect() (*ExecutionOutput, error)   { return nil, nil }

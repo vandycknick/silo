@@ -12,7 +12,14 @@ func renderList(vms []service.VM) string {
 	var b strings.Builder
 	b.WriteString("NAME STATE NODE ADDRESS CPUS MEMORY CREATED\n")
 	for _, vm := range vms {
-		fmt.Fprintf(&b, "%s %s %s %s %d %d %s\n", vm.Name, vm.State, vm.Node, vm.Address, vm.CPUs, vm.Memory, vm.Created.Format(time.RFC3339))
+		node := vm.Node
+		if node == "" {
+			node = string(vm.NodeState)
+		}
+		fmt.Fprintf(&b, "%s %s %s %s %d %d %s\n", vm.Name, vm.State, node, vm.Address, vm.CPUs, vm.Memory, vm.Created.Format(time.RFC3339))
+		if vm.ApprovalURL != "" && vm.ApprovalExpires != nil {
+			fmt.Fprintf(&b, "Approve %s: %s (expires %s)\n", vm.Name, vm.ApprovalURL, vm.ApprovalExpires.Format(time.RFC3339))
+		}
 	}
 	return b.String()
 }
@@ -30,10 +37,21 @@ func renderShow(v service.VM) string {
 	if v.LastOperation != nil {
 		text += fmt.Sprintf("Last operation: %s %s\n", v.LastOperation.ID, v.LastOperation.State)
 	}
+	text += fmt.Sprintf("Node: %s\nNode state: %s\nAddress: %s\nKey expiry: %s\n", v.Node, v.NodeState, v.Address, v.KeyExpiry)
+	for _, diagnostic := range v.NodeDiagnostics {
+		text += "Node diagnostic: " + diagnostic + "\n"
+	}
+	if v.ApprovalURL != "" {
+		text += "Approve: " + v.ApprovalURL + "\n"
+		if v.ApprovalExpires != nil {
+			text += "Approval expires: " + v.ApprovalExpires.Format(time.RFC3339) + "\n"
+		}
+	}
 	return text
 }
 func commandHelp(cmd string) (string, bool) {
 	help := map[string]string{
+		"reauth":   "reauth VM [--json] (stopped VM; requires vm.start and vm.stop)",
 		"create":   "create NAME [IMAGE|--image OCI] [--template NAME] [--policy NAME] [--cpus N] [--memory SIZE] [--disk-size SIZE] [--userdata INLINE|-] [--label K=V]... [--owner tag:NAME] [--no-tailnet] [--no-start]",
 		"template": "template ls|show NAME|create NAME|edit NAME|rm NAME|validate [--owner tag:NAME] [--json]; create/edit/validate read one YAML document from stdin",
 		"policy":   "policy ls|show NAME|create NAME|edit NAME|rm NAME|validate [--owner tag:NAME] [--json]; create/edit/validate read HCL from stdin",
