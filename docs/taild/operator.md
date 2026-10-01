@@ -12,8 +12,9 @@ and target. See [PACKAGING](../../PACKAGING.md) for provenance and build order.
 Install `bin/taild` at `/usr/bin/taild`. Copy the shipped service and sysusers
 fragment into `/etc/systemd/system/silo-taild.service` and
 `/etc/sysusers.d/silo-taild.conf`, then run `systemd-sysusers`.
-The unit creates `/var/lib/silo-taild` with mode 0700 and grants the service user
-membership in `kvm`. Check that `/dev/kvm` is group-accessible on this host.
+The unit maintains `/var/lib/silo-taild` with mode 0700 and grants the service user
+membership in `kvm`. Create that directory before the initial offline installation,
+which runs before the unit starts. Check that `/dev/kvm` is group-accessible on this host.
 
 Create `/etc/silo-taild` and its `secrets`, `templates`, and `policies` directories.
 Secrets directory: owner `silo-taild:silo-taild`, mode 0700. Secret files: same owner,
@@ -24,9 +25,10 @@ Put the YAML template in `templates/devbox.yaml` and HCL in `policies/dev-egress
 Set `runtime_archive` to the absolute path of the matching runtime-only archive.
 
 ```sh
+sudo install -d -o silo-taild -g silo-taild -m 0700 /var/lib/silo-taild
 sudo -u silo-taild /usr/bin/taild install-runtime --config /etc/silo-taild/config.yaml
 sudo -u silo-taild /usr/bin/taild --check --config /etc/silo-taild/config.yaml
-/usr/bin/taild version
+sudo -u silo-taild /usr/bin/taild version --config /etc/silo-taild/config.yaml
 sudo systemctl daemon-reload
 sudo systemctl enable --now silo-taild
 ```
@@ -41,10 +43,10 @@ embedded, digest-checked and ABI/product-version checked by the SDK loader.
 
 ## Credentials and authorization
 
-The local files are `client-secret`, `app-secret`, and `api-token`. Supply only those
-required by the configured enrollment mode. `client-secret` provisions the tagged
+The local files are `oauth-client-secret`, `oauth-app-secret`, and `api-token`. Supply only those
+required by the configured enrollment mode. `oauth-client-secret` provisions the tagged
 lobby. Interactive enrollment requires user consent, OAuth-app enrollment also
-requires `app-secret`. Device deletion/expiry administration uses `api-token`.
+requires `oauth-app-secret`. Device deletion/expiry administration uses `api-token`.
 Never put credentials in YAML, service environment, command arguments or reports.
 Configure the [tailnet policy](tailnet-policy.md) before admitting users.
 
