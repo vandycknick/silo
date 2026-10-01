@@ -11,12 +11,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::command;
+use crate::profiles::Profile;
 use crate::release;
 use crate::rprobe::ASSETS as RPROBE_ASSETS;
 use crate::targets::HostTarget;
 
-const DISK_IMAGE_LICENSE: &str = "common/disk-image/LICENSE-APACHE";
-const RELEASE_MATERIAL: [&str; 2] = ["packaging/release/THIRD_PARTY_NOTICES", DISK_IMAGE_LICENSE];
 const RUNTIME_FILES: [(&str, u32); 5] = [
     ("bin/silo-vmm", 0o755),
     ("bin/netd", 0o755),
@@ -60,20 +59,71 @@ impl ArchiveKind {
     }
 }
 
-pub fn produce(workspace_root: &Path, target_dir: &Path) -> Result<(), ArchiveError> {
+pub fn produce_runtime(
+    workspace_root: &Path,
+    target_dir: &Path,
+    profile: Profile,
+) -> Result<(), ArchiveError> {
+    produce_kinds(workspace_root, target_dir, profile, &[ArchiveKind::Runtime])
+}
+
+pub fn produce_portable(workspace_root: &Path, target_dir: &Path) -> Result<(), ArchiveError> {
+    produce_kinds(
+        workspace_root,
+        target_dir,
+        Profile::Release,
+        &[ArchiveKind::Portable],
+    )
+}
+
+fn produce_kinds(
+    workspace_root: &Path,
+    target_dir: &Path,
+    profile: Profile,
+    kinds: &[ArchiveKind],
+) -> Result<(), ArchiveError> {
     let host = HostTarget::current().map_err(|error| ArchiveError::Invalid {
         path: target_dir.to_path_buf(),
         reason: error.to_string(),
     })?;
     let version = version(workspace_root)?;
     let epoch = source_date_epoch(workspace_root)?;
-    let stage = stage_path(target_dir, host);
+    let stage = stage_path(target_dir, host, profile);
     validate_stage(&stage)?;
-    let output = artifact_directory(target_dir, host, &version);
+    crate::runtime::validate_stage_against_adjacent(
+        &crate::components::BuildContext {
+            workspace_root,
+            target_dir,
+            profile,
+            host,
+        },
+        &stage,
+    )
+    .map_err(|error| ArchiveError::Invalid {
+        path: stage.clone(),
+        reason: error.to_string(),
+    })?;
+    let output = artifact_directory(target_dir, host, &version, profile);
     create_directory(&output)?;
     let syft = release::tool("syft")?;
 
-    for kind in [ArchiveKind::Runtime, ArchiveKind::Portable] {
+    for &kind in kinds {
+        if profile == Profile::Release && host != HostTarget::MacosArm64 {
+            let mut audit = Command::new("python3");
+            audit
+                .arg(workspace_root.join("packaging/silo-taild/elf_audit.py"))
+                .arg("--target")
+                .arg(host.runtime_target());
+            for name in ["bin/silo-vmm", "bin/netd", "assets/agent"] {
+                audit.arg(stage.join(name));
+            }
+            if kind.has_cli() {
+                for name in ["silo", "silod", "taild"] {
+                    audit.arg(target_dir.join("release").join(name));
+                }
+            }
+            command::run(audit)?;
+        }
         let root = archive_root(kind, &version, host);
         let archive = output.join(format!("{root}.tar.zst"));
         let raw = output.join(format!(".{root}.tar"));
@@ -91,6 +141,7 @@ pub fn produce(workspace_root: &Path, target_dir: &Path) -> Result<(), ArchiveEr
             workspace_root,
             target_dir,
             host,
+            profile,
             &version,
             epoch,
             kind,
@@ -125,6 +176,13 @@ fn create_tar(
     raw: &Path,
 ) -> Result<(), ArchiveError> {
     let tar = release::tool("tar")?;
+    let stage_name = stage
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ArchiveError::Invalid {
+            path: stage.into(),
+            reason: "stage lacks a profile name".into(),
+        })?;
     let mut command = Command::new(tar);
     command
         .current_dir(stage)
@@ -133,39 +191,56 @@ fn create_tar(
         .args([
             "--format=ustar",
             "--sort=name",
+            "--exclude=__pycache__",
             &format!("--mtime=@{epoch}"),
             "--owner=0",
             "--group=0",
             "--numeric-owner",
             "--mode=u+rwX,go+rX,go-w",
             "--transform",
-            &format!("s,^bin,{root}/bin,"),
-            "--transform",
-            &format!("s,^assets,{root}/assets,"),
-            "--transform",
-            &format!("s,^packaging/release/,{root}/,"),
-            "--transform",
-            &disk_image_license_transform(root),
-            "--transform",
             &format!("s,^silo$,{root}/bin/silo,"),
             "--transform",
             &format!("s,^silod$,{root}/bin/silod,"),
+            "--transform",
+            &format!("s,^taild$,{root}/bin/taild,"),
+            "--transform",
+            &format!("s,^packaging/silo-taild,{root}/share/silo-taild,"),
+            "--transform",
+            &format!("s,^taild-licenses,{root}/LICENSES/taild,"),
+            "--transform",
+            &format!("s,^{stage_name}$,{root},"),
+            "--transform",
+            &format!("s,^{stage_name}/,{root}/,"),
         ])
-        .args(["bin", "assets", "--directory"])
-        .arg(workspace_root)
-        .args(RELEASE_MATERIAL);
+        .arg("--directory")
+        .arg(stage.parent().ok_or_else(|| ArchiveError::Invalid {
+            path: stage.into(),
+            reason: "stage has no parent".into(),
+        })?)
+        .arg(stage_name);
     if kind.has_cli() {
         command
             .args(["--directory"])
             .arg(target_dir.join("release"))
             .args(["silo", "silod"]);
+        if HostTarget::current().map_err(|error| ArchiveError::Invalid {
+            path: target_dir.into(),
+            reason: error.to_string(),
+        })? != HostTarget::MacosArm64
+        {
+            command
+                .arg("taild")
+                .arg("--directory")
+                .arg(workspace_root)
+                .arg("packaging/silo-taild");
+            command
+                .arg("--directory")
+                .arg(target_dir)
+                .arg("taild-licenses");
+        }
     }
     command::run(command)?;
     Ok(())
-}
-
-fn disk_image_license_transform(root: &str) -> String {
-    format!("s,^{DISK_IMAGE_LICENSE}$,{root}/LICENSES/APACHE-2.0.txt,")
 }
 
 fn compress_tar(raw: &Path, archive: &Path) -> Result<(), ArchiveError> {
@@ -201,6 +276,7 @@ fn write_provenance(
     workspace_root: &Path,
     target_dir: &Path,
     host: HostTarget,
+    profile: Profile,
     version: &str,
     epoch: u64,
     kind: ArchiveKind,
@@ -210,7 +286,7 @@ fn write_provenance(
     output: &Path,
     syft: &Path,
 ) -> Result<(), ArchiveError> {
-    let stage = stage_path(target_dir, host);
+    let stage = stage_path(target_dir, host, profile);
     let mut files = BTreeMap::new();
     for (path, _) in RUNTIME_FILES {
         files.insert(path.to_string(), sha256(&stage.join(path))?);
@@ -222,7 +298,11 @@ fn write_provenance(
         }
     }
     if kind.has_cli() {
-        for name in ["silo", "silod"] {
+        let mut binaries = vec!["silo", "silod"];
+        if host != HostTarget::MacosArm64 {
+            binaries.push("taild");
+        }
+        for name in binaries {
             files.insert(
                 format!("bin/{name}"),
                 sha256(&target_dir.join("release").join(name))?,
@@ -232,7 +312,7 @@ fn write_provenance(
     let kernel = target_dir
         .join("kernel-provenance")
         .join(host.runtime_target())
-        .join("release.json");
+        .join(format!("{}.json", profile.directory()));
     let kernel: Value =
         serde_json::from_slice(&read(&kernel)?).map_err(|error| ArchiveError::Invalid {
             path: kernel.clone(),
@@ -252,12 +332,14 @@ fn write_provenance(
             "host_os": env::consts::OS,
             "host_architecture": env::consts::ARCH,
             "source_date_epoch": epoch,
+            "profile": profile.directory(),
         },
         "file_hashes": files,
         "kernel": kernel,
         "source_revision": git_output(workspace_root, ["rev-parse", "HEAD"] )?,
+        "source_modified": !git_output(workspace_root, ["status", "--porcelain"] )?.is_empty(),
         "target": host.runtime_target(),
-        "toolchains": actual_toolchains(syft)?,
+        "toolchains": actual_toolchains(syft, workspace_root)?,
         "version": version,
     });
     let bytes = serde_json::to_vec_pretty(&provenance).map_err(|error| ArchiveError::Invalid {
@@ -271,12 +353,14 @@ fn write_provenance(
     })
 }
 
-fn actual_toolchains(syft: &Path) -> Result<BTreeMap<String, String>, ArchiveError> {
+fn actual_toolchains(
+    syft: &Path,
+    workspace_root: &Path,
+) -> Result<BTreeMap<String, String>, ArchiveError> {
     let mut tools = BTreeMap::new();
     for (name, path, args) in [
         ("cargo", release::tool("cargo")?, vec!["--version"]),
         ("rustc", release::tool("rustc")?, vec!["--version"]),
-        ("go", release::tool("go")?, vec!["version"]),
         ("zig", release::tool("zig")?, vec!["version"]),
         (
             "cargo-zigbuild",
@@ -288,6 +372,22 @@ fn actual_toolchains(syft: &Path) -> Result<BTreeMap<String, String>, ArchiveErr
         ("syft", syft.to_path_buf(), vec!["version"]),
     ] {
         tools.insert(name.to_string(), release::tool_output(&path, &args)?);
+    }
+    for (name, module) in [("go-netd", "net/netd"), ("go-taild", "app/taild")] {
+        let mut go = Command::new(release::tool("go")?);
+        go.current_dir(workspace_root.join(module)).arg("version");
+        tools.insert(
+            name.into(),
+            String::from_utf8_lossy(&command::output(go)?.stdout)
+                .trim()
+                .into(),
+        );
+    }
+    if env::consts::OS == "linux" {
+        tools.insert(
+            "native-cc".into(),
+            release::tool_output(Path::new("/usr/bin/cc"), &["--version"])?,
+        );
     }
     Ok(tools)
 }
@@ -345,19 +445,38 @@ fn version(workspace_root: &Path) -> Result<String, ArchiveError> {
         path: path.clone(),
         reason: format!("version is not UTF-8: {error}"),
     })?;
-    Ok(version.trim().to_string())
+    let version = version.trim();
+    if !crate::version::is_semver(version) {
+        return invalid(
+            &path,
+            "VERSION must contain exactly three numeric components".into(),
+        );
+    }
+    Ok(version.to_string())
 }
 
-fn stage_path(target_dir: &Path, host: HostTarget) -> PathBuf {
+fn stage_path(target_dir: &Path, host: HostTarget, profile: Profile) -> PathBuf {
     target_dir
         .join("silo-runtime")
         .join(host.runtime_target())
-        .join("release")
+        .join(profile.directory())
 }
 
-fn artifact_directory(target_dir: &Path, host: HostTarget, version: &str) -> PathBuf {
-    target_dir
-        .join("packages")
+pub fn packages_root(target_dir: &Path, profile: Profile) -> PathBuf {
+    target_dir.join(if profile == Profile::Release {
+        "packages"
+    } else {
+        "packages-debug"
+    })
+}
+
+fn artifact_directory(
+    target_dir: &Path,
+    host: HostTarget,
+    version: &str,
+    profile: Profile,
+) -> PathBuf {
+    packages_root(target_dir, profile)
         .join(version)
         .join(host.runtime_target())
 }
@@ -406,7 +525,7 @@ fn validate_regular_file(path: &Path, expected_mode: u32) -> Result<(), ArchiveE
     Ok(())
 }
 
-fn sha256(path: &Path) -> Result<String, ArchiveError> {
+pub(crate) fn sha256(path: &Path) -> Result<String, ArchiveError> {
     let mut file = fs::File::open(path).map_err(|source| ArchiveError::Io {
         action: "open file for SHA-256",
         path: path.to_path_buf(),
@@ -479,7 +598,54 @@ fn invalid<T>(path: &Path, reason: String) -> Result<T, ArchiveError> {
 mod tests {
     use std::path::Path;
 
-    use crate::archive::{disk_image_license_transform, DISK_IMAGE_LICENSE, RELEASE_MATERIAL};
+    #[test]
+    fn runtime_tar_has_explicit_root_manifest_and_no_duplicate_legal_files() {
+        let temporary = std::env::temp_dir().join(format!("silo-tar-unit-{}", std::process::id()));
+        std::fs::create_dir(&temporary).unwrap();
+        let stage = temporary.join("release");
+        std::fs::create_dir_all(stage.join("bin")).unwrap();
+        std::fs::create_dir_all(stage.join("assets")).unwrap();
+        std::fs::create_dir_all(stage.join("LICENSES")).unwrap();
+        for name in [
+            "bin/netd",
+            "assets/agent",
+            "runtime-manifest.json",
+            "THIRD_PARTY_NOTICES",
+            "LICENSES/APACHE-2.0.txt",
+        ] {
+            std::fs::write(stage.join(name), name).unwrap();
+        }
+        let archive = temporary.join("test.tar");
+        crate::archive::create_tar(
+            &temporary,
+            &temporary,
+            &stage,
+            crate::archive::ArchiveKind::Runtime,
+            "silo-runtime-test",
+            0,
+            &archive,
+        )
+        .unwrap();
+        let output = std::process::Command::new("tar")
+            .arg("-tf")
+            .arg(&archive)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let listing = String::from_utf8(output.stdout).unwrap();
+        let entries: Vec<_> = listing.lines().collect();
+        assert!(entries.contains(&"silo-runtime-test/"));
+        assert!(entries.contains(&"silo-runtime-test/runtime-manifest.json"));
+        assert!(entries.contains(&"silo-runtime-test/LICENSES/APACHE-2.0.txt"));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|name| **name == "silo-runtime-test/THIRD_PARTY_NOTICES")
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
 
     #[test]
     fn runtime_archive_has_no_standalone_vmm_executable() {
@@ -493,14 +659,9 @@ mod tests {
 
     #[test]
     fn release_material_includes_the_disk_image_license() {
-        assert!(RELEASE_MATERIAL.contains(&DISK_IMAGE_LICENSE));
         assert!(Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join(DISK_IMAGE_LICENSE)
+            .join("common/disk-image/LICENSE-APACHE")
             .is_file());
-        assert_eq!(
-            disk_image_license_transform("silo-runtime-1.0.0-linux-amd64"),
-            "s,^common/disk-image/LICENSE-APACHE$,silo-runtime-1.0.0-linux-amd64/LICENSES/APACHE-2.0.txt,"
-        );
     }
 }

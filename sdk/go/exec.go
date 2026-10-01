@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"io"
 	"maps"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/vandycknick/silo/sdk/go/internal/ffi"
@@ -497,6 +500,11 @@ func WithSSHDetachKeys(keys string) SSHShellOption {
 func WithSSHAgentForwarding(enabled bool) SSHShellOption {
 	return func(c *sshShellConfig) { c.ForwardAgent = &enabled }
 }
+
+// Attach forwards host HUP, INT, QUIT, TERM, USR1 and USR2 to the guest process
+// group and uses WINCH for resize. During every call, this overrides inherited
+// ignored dispositions for those signals. Return restores Go's prior behavior,
+// including inherited SIG_IGN, without removing application subscriptions.
 func (m *Machine) Attach(ctx context.Context, program string, args []string, opts ...ExecOption) (ExecutionResult, error) {
 	request, err := executionRequest(program, args, opts)
 	if err != nil {
@@ -510,9 +518,11 @@ func (m *Machine) Attach(ctx context.Context, program string, args []string, opt
 	if m.closed {
 		return ExecutionResult{}, newError(ErrorClosed, "", "machine is closed")
 	}
-	data, err := m.native.Attach(request)
+	data, err := attachmentCall(ctx, false, func(token *ffi.AttachmentCancellation) ([]byte, error) {
+		return m.native.Attach(request, token)
+	})
 	if err != nil {
-		return ExecutionResult{}, fromNativeError(err)
+		return ExecutionResult{}, err
 	}
 	var wire resultWire
 	if err = json.Unmarshal(data, &wire); err != nil {
@@ -520,6 +530,9 @@ func (m *Machine) Attach(ctx context.Context, program string, args []string, opt
 	}
 	return decodeResult(wire), nil
 }
+
+// AttachShell forwards host HUP, INT, QUIT and TERM as SSH signals and uses WINCH
+// for resize. Its scoped subscription has the same restoration semantics as Attach.
 func (m *Machine) AttachShell(ctx context.Context, opts ...SSHShellOption) (SSHExitStatus, error) {
 	if err := validateContext(ctx); err != nil {
 		return SSHExitStatus{}, err
@@ -540,11 +553,89 @@ func (m *Machine) AttachShell(ctx context.Context, opts ...SSHShellOption) (SSHE
 	if m.closed {
 		return SSHExitStatus{}, newError(ErrorClosed, "", "machine is closed")
 	}
-	data, err := m.native.AttachShell(request)
+	data, err := attachmentCall(ctx, true, func(token *ffi.AttachmentCancellation) ([]byte, error) {
+		return m.native.AttachShell(request, token)
+	})
 	if err != nil {
-		return SSHExitStatus{}, fromNativeError(err)
+		return SSHExitStatus{}, err
 	}
 	var result SSHExitStatus
 	err = json.Unmarshal(data, &result)
 	return result, err
+}
+
+// Go owns the scoped process-signal subscription and forwards notifications into
+// native controls. Stop restores inherited dispositions, including SIG_IGN,
+// without affecting application subscribers or relying on cached native handlers.
+func attachmentSignals(shell bool) (<-chan os.Signal, func()) {
+	notifications := make(chan os.Signal, 16)
+	signals := []os.Signal{syscall.SIGHUP, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGWINCH}
+	if !shell {
+		signals = append(signals, syscall.SIGUSR1, syscall.SIGUSR2)
+	}
+	signal.Notify(notifications, signals...)
+	return notifications, func() { signal.Stop(notifications) }
+}
+
+func attachmentSignalNumber(sig os.Signal) (uint32, bool) {
+	switch sig {
+	case syscall.SIGHUP:
+		return 1, true
+	case syscall.SIGINT:
+		return 2, true
+	case syscall.SIGQUIT:
+		return 3, true
+	case syscall.SIGTERM:
+		return 15, true
+	case syscall.SIGUSR1:
+		return 10, true
+	case syscall.SIGUSR2:
+		return 12, true
+	case syscall.SIGWINCH:
+		return 28, true
+	default:
+		return 0, false
+	}
+}
+
+func attachmentCall(ctx context.Context, shell bool, call func(*ffi.AttachmentCancellation) ([]byte, error)) ([]byte, error) {
+	token, err := ffi.NewAttachmentCancellation()
+	if err != nil {
+		return nil, fromNativeError(err)
+	}
+	defer token.Close()
+	notifications, stopSignals := attachmentSignals(shell)
+	defer stopSignals()
+	type result struct {
+		data []byte
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		data, err := call(token)
+		done <- result{data, err}
+	}()
+	for {
+		select {
+		case value := <-done:
+			return value.data, fromNativeError(value.err)
+		case sig := <-notifications:
+			number, supported := attachmentSignalNumber(sig)
+			if !supported {
+				continue
+			}
+			if err := token.Signal(number); err != nil {
+				_ = token.Cancel()
+				<-done
+				return nil, fromNativeError(err)
+			}
+		case <-ctx.Done():
+			if err := token.Cancel(); err != nil {
+				<-done
+				return nil, fromNativeError(err)
+			}
+			<-done // Native future is dropped before freeing the token or restoring signals.
+			return nil, contextError(ctx.Err())
+		}
+	}
 }

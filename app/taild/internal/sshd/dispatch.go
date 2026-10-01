@@ -114,8 +114,9 @@ func DispatchSession(ctx context.Context, s *service.Service, c service.Caller, 
 					failure = &authz.Error{Code: "usage", Message: "unknown argument or option", Exit: 2}
 					break
 				}
-				data = service.Versions()
-				human = fmt.Sprintf("taild %s · SDK %s · runtime %s · tailscale 1.102.5\n", service.Versions().Taild, service.Versions().SDK, service.Versions().Runtime)
+				v := s.Versions()
+				data = v
+				human = fmt.Sprintf("taild %s · SDK %s · runtime %s · tailscale %s\n", v.Taild, v.SDK, v.Runtime, v.Tailscale)
 			case "whoami":
 				if len(tokens) != 1 {
 					failure = &authz.Error{Code: "usage", Message: "unknown argument or option", Exit: 2}

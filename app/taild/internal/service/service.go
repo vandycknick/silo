@@ -16,6 +16,7 @@ import (
 )
 
 type Service struct {
+	Shutdown     *state.ShutdownGate
 	Enrollment   *enroll.Manager
 	Runtime      *runtime.Runtime
 	Audit        *state.Audit
@@ -25,6 +26,7 @@ type Service struct {
 	VisibleNames func(context.Context) ([]string, error)
 	createMu     sync.Mutex
 	pending      map[string]identity.Principal
+	diskPending  map[string]uint64
 	documentMu   sync.Mutex
 	// Production enables node injection; --no-tailnet and mode none omit it.
 	VMNodesEnabled bool
@@ -68,10 +70,17 @@ func (s *Service) WhoAmI(peer identity.Peer) (WhoAmI, error) {
 	return WhoAmI{peer, s.Capability, peer.Permissions.Reason}, nil
 }
 func (s *Service) Authorize(peer identity.Peer, action identity.Action, vm *authz.VM) error {
+	if action != identity.Read && action != identity.Logs && s.ShutdownPending() {
+		return s.decision(peer, string(action), &authz.Error{Code: "unavailable", Message: "host is shutting down", Exit: 9})
+	}
 	if vm != nil && (s.Runtime == nil || vm.Instance != s.Runtime.Instance) {
 		return s.decision(peer, string(action), &authz.Error{Code: "not_found", Message: "VM not found", Exit: 3})
 	}
 	return s.decision(peer, string(action), authz.Allow(peer, action, vm))
+}
+
+func (s *Service) ShutdownPending() bool {
+	return s.Shutdown.Pending() || state.ShutdownPending(s.Config.Home)
 }
 
 type Health struct {
@@ -90,10 +99,22 @@ func (s *Service) Health(ctx context.Context, peer identity.Peer) (Health, error
 }
 
 type Version struct {
-	Taild     string `json:"taild"`
-	SDK       string `json:"sdk"`
-	Runtime   string `json:"runtime"`
-	Tailscale string `json:"tailscale"`
+	Taild       string `json:"taild"`
+	SDK         string `json:"sdk"`
+	Runtime     string `json:"runtime"`
+	Tailscale   string `json:"tailscale"`
+	ABIExpected uint32 `json:"abi_expected"`
+	ABIVerified uint32 `json:"abi_verified,omitempty"`
 }
 
-func Versions() Version { return Version{silo.Version, silo.Version, silo.Version, "1.102.5"} }
+func Versions() Version {
+	return Version{Taild: silo.Version, SDK: silo.Version, Runtime: "unavailable", Tailscale: "1.102.5", ABIExpected: silo.NativeABIVersion}
+}
+func (s *Service) Versions() Version {
+	v := Versions()
+	if s.Runtime != nil && s.Runtime.Version != "" {
+		v.Runtime = s.Runtime.Version
+		v.ABIVerified = s.Runtime.ABI
+	}
+	return v
+}

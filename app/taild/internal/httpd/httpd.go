@@ -51,6 +51,7 @@ func Handler(s *service.Service, resolver Resolver) http.Handler {
 			if r.URL.Path == "/metrics" {
 				w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 				_, _ = w.Write([]byte("taild_runtime_ready 1\ntaild_tailnet_ready 1\n"))
+				s.Runtime.Metrics.Write(w)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")

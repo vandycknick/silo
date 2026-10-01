@@ -71,8 +71,21 @@ func PrincipalDir(home string, p identity.Principal) (string, error) {
 	return path, nil
 }
 func Instance(home string) (string, error) {
+	s, e := ReadInstance(home)
+	if e == nil || !errors.Is(e, os.ErrNotExist) {
+		return s, e
+	}
 	path := filepath.Join(home, "taild", "instance")
-	b, e := os.ReadFile(path)
+	b := make([]byte, 16)
+	if _, e = rand.Read(b); e != nil {
+		return "", e
+	}
+	s = hex.EncodeToString(b)
+	return s, AtomicWrite(path, []byte(s+"\n"))
+}
+
+func ReadInstance(home string) (string, error) {
+	b, e := os.ReadFile(filepath.Join(home, "taild", "instance"))
 	if e == nil {
 		s := strings.TrimSpace(string(b))
 		decoded, err := hex.DecodeString(s)
@@ -81,15 +94,7 @@ func Instance(home string) (string, error) {
 		}
 		return s, nil
 	}
-	if !errors.Is(e, os.ErrNotExist) {
-		return "", e
-	}
-	b = make([]byte, 16)
-	if _, e = rand.Read(b); e != nil {
-		return "", e
-	}
-	s := hex.EncodeToString(b)
-	return s, AtomicWrite(path, []byte(s+"\n"))
+	return "", e
 }
 func PinTailnet(home, name string) error {
 	if name == "" || strings.ContainsAny(name, "\n\r\x00") {

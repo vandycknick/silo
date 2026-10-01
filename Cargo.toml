@@ -38,3 +38,6 @@ libkrun = { package = "libkrun", git = "https://github.com/vandycknick/libkrun.g
 
 [profile.dev.package.sha2]
 opt-level = 3
+
+[patch.crates-io]
+signal-hook-registry = { path = "vendor/signal-hook-registry" }

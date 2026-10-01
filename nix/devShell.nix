@@ -18,6 +18,7 @@ let
     pkgs.oras
     pkgs.syft
     pkgs.zstd
+    pkgs.python3
   ];
   # Everything needed to compile, lint, and test the workspace. Deliberately
   # omits the cross-compilation and packaging tools that only release builds

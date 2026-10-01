@@ -11,6 +11,8 @@ import (
 
 	"github.com/vandycknick/silo/app/taild/internal/authz"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
+	"github.com/vandycknick/silo/app/taild/internal/metrics"
+	"github.com/vandycknick/silo/app/taild/internal/state"
 )
 
 type Operation struct {
@@ -27,6 +29,7 @@ type Operation struct {
 type entry struct {
 	op      Operation
 	changed chan struct{}
+	cancel  context.CancelFunc
 }
 type lock struct {
 	token chan struct{}
@@ -35,14 +38,18 @@ type lock struct {
 
 // Registry starts empty on restart; durable machine records are the recovery truth.
 type Registry struct {
-	mu      sync.Mutex
-	closing bool
-	wg      sync.WaitGroup
-	ctx     context.Context
-	limit   int
-	active  int
-	entries map[string]*entry
-	locks   map[string]*lock
+	Shutdown  *state.ShutdownGate
+	Metrics   *metrics.Metrics
+	mu        sync.Mutex
+	closing   bool
+	paused    bool
+	Admission func() bool
+	wg        sync.WaitGroup
+	ctx       context.Context
+	limit     int
+	active    int
+	entries   map[string]*entry
+	locks     map[string]*lock
 }
 
 func New(ctx context.Context, limit int) *Registry {
@@ -108,7 +115,7 @@ func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(co
 	if r.limit <= 0 {
 		r.limit = 64
 	}
-	if r.closing || r.ctx.Err() != nil {
+	if r.closing || r.paused || r.Shutdown.Pending() || r.ctx.Err() != nil || r.Admission != nil && !r.Admission() {
 		return Operation{}, &authz.Error{Code: "unavailable", Message: "daemon is shutting down", Exit: 9}
 	}
 	if r.active >= r.limit {
@@ -124,6 +131,8 @@ func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(co
 	}
 	r.prune(time.Now())
 	e := &entry{op: Operation{ID: id, Kind: kind, VM: vm, Principal: owner, State: "queued", Started: time.Now().UTC(), Progress: []string{}}, changed: make(chan struct{})}
+	ctx, cancel := context.WithCancel(r.ctx)
+	e.cancel = cancel
 	r.entries[id] = e
 	lockKey := vm
 	if kind == "create" {
@@ -137,16 +146,18 @@ func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(co
 	}
 	l.refs++
 	r.active++
+	r.Metrics.Job(1)
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
+		defer cancel()
 		var err error
 		select {
-		case <-r.ctx.Done():
-			err = r.ctx.Err()
+		case <-ctx.Done():
+			err = ctx.Err()
 		case <-l.token:
 			r.update(e, func(op *Operation) { op.State = "running" })
-			err = run(r.ctx, func(line string) {
+			err = run(ctx, func(line string) {
 				r.update(e, func(op *Operation) {
 					if len(line) > 1024 {
 						line = line[:1024]
@@ -157,6 +168,9 @@ func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(co
 					op.Progress = append(op.Progress, line)
 				})
 			})
+			if ctx.Err() != nil {
+				err = &authz.Error{Code: "unavailable", Message: "daemon operation interrupted; inspect VM state", Exit: 9}
+			}
 			l.token <- struct{}{}
 		}
 		r.mu.Lock()
@@ -174,6 +188,9 @@ func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(co
 		}
 		now := time.Now().UTC()
 		e.op.Finished = &now
+		e.cancel = nil
+		r.Metrics.Operation(kind, e.op.State, now.Sub(e.op.Started))
+		r.Metrics.Job(-1)
 		close(e.changed)
 		e.changed = nil
 		r.active--
@@ -251,14 +268,38 @@ func (r *Registry) Seal() {
 	r.closing = true
 	r.mu.Unlock()
 }
+func (r *Registry) Pause()  { r.mu.Lock(); r.paused = true; r.mu.Unlock() }
+func (r *Registry) Resume() { r.mu.Lock(); r.paused = false; r.mu.Unlock() }
+
+// InterruptIf cancels existing work without poisoning future admission after a
+// cancelled host shutdown. Synchronous native work still requires real drain.
+func (r *Registry) InterruptIf(shutdown func() bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !shutdown() {
+		return
+	}
+	r.paused = true
+	for _, e := range r.entries {
+		if e.cancel != nil {
+			e.cancel()
+		}
+	}
+}
 func (r *Registry) Wait(ctx context.Context) error {
 	r.Seal()
-	done := make(chan struct{})
-	go func() { r.wg.Wait(); close(done) }()
+	done := r.Drained()
 	select {
 	case <-done:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// Drained is used only while admission is paused or permanently sealed.
+func (r *Registry) Drained() <-chan struct{} {
+	done := make(chan struct{})
+	go func() { r.wg.Wait(); close(done) }()
+	return done
 }

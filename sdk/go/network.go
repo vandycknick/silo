@@ -289,7 +289,7 @@ func policyRequest(request networkPolicyRequest) (*NetworkPolicy, error) {
 }
 
 func nativePolicyRequest(request networkPolicyRequest) ([]byte, error) {
-	if err := ffi.Load(Version, ffiABIVersion); err != nil {
+	if err := ffi.Load(Version, NativeABIVersion); err != nil {
 		return nil, fromNativeError(err)
 	}
 	data, err := json.Marshal(request)

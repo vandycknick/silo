@@ -38,7 +38,7 @@ func Open(ctx context.Context, opts ...RuntimeOption) (*Runtime, error) {
 	if err != nil {
 		return nil, newError(ErrorInvalidArgument, "", "encode runtime options: "+err.Error())
 	}
-	if err := ffi.Load(Version, ffiABIVersion); err != nil {
+	if err := ffi.Load(Version, NativeABIVersion); err != nil {
 		return nil, fromNativeError(err)
 	}
 	native, err := ffi.OpenRuntime(request)

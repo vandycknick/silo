@@ -33,7 +33,7 @@ func TestGoSDKLifecycleExecutionLogsAndImages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	machine, err := runtime.CreateMachine(ctx, silo.OCIImage(image), silo.WithName("go-sdk-e2e"), silo.WithCPUs(1), silo.WithMemory(silo.Gibibytes(1)), silo.WithMachineNetwork(silo.PrivateNetwork(policy)))
+	machine, err := runtime.CreateMachine(ctx, silo.OCIImage(image), silo.WithName("go-sdk-e2e"), silo.WithCPUs(1), silo.WithMemory(silo.Gibibytes(1)), silo.WithRootDiskSize(silo.Gibibytes(1)), silo.WithMachineNetwork(silo.PrivateNetwork(policy)))
 	if err != nil {
 		t.Fatal(err)
 	}

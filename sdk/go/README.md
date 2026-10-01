@@ -102,4 +102,20 @@ result is `ready`, `missing` (slots, backing keys, alternative requirements), or
 `unavailable` (selected slot/key and stable error category). Corrupt JSON, wrong
 projection types and empty selected values never masquerade as absent secrets.
 The older `PolicySecretsReady` boolean API remains available. This uses an optional
-operation on ABI 2's existing runtime-query entry point.
+operation on the existing runtime-query entry point.
+
+The current native bridge requires ABI **3**. ABI 2 bridges lack the required
+node-state lease/cancellable attachment symbol contract and are rejected before
+new symbols are resolved. Rebuild the bridge and reassemble target-local SDK
+bundles together. `NativeABIVersion` is the required numeric ABI;
+`VerifiedNativeABIVersion()` loads and checks the exact product/ABI and returns
+the actual bridge ABI without opening a runtime or starting a VM.
+
+ABI 3's current attachment contract also requires
+`silo_attachment_cancellation_signal`. Go owns the scoped signal subscription and
+forwards supported notifications through the token's native channel. Each Attach
+or AttachShell temporarily enables forwarding of inherited ignored signals and
+restores those dispositions on return, while preserving application subscribers.
+The Go path installs no cached Tokio process handlers; standalone Rust attachments
+retain their narrow native-listener mode. Cancellation joins the native call before
+freeing its token or restoring the Go subscription.

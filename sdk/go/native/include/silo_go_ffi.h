@@ -9,6 +9,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/**
+ * A scoped cancellation token for a blocking host attachment call.
+ * It may be cancelled concurrently, but must not be freed until that call returns.
+ */
+typedef struct AttachmentCancellation AttachmentCancellation;
+
 typedef struct silo_execution silo_execution;
 
 typedef struct silo_log silo_log;
@@ -73,6 +79,18 @@ void silo_buffer_free(silo_buffer buffer);
  */
 void silo_error_free(silo_error *error);
 
+silo_error *silo_attachment_cancellation_new(AttachmentCancellation **out_token);
+
+silo_error *silo_attachment_cancellation_cancel(const AttachmentCancellation *token);
+
+/**
+ * Queues one embedding-owned Linux signal or WINCH resize notification.
+ */
+silo_error *silo_attachment_cancellation_signal(const AttachmentCancellation *token,
+                                                uint32_t signal);
+
+void silo_attachment_cancellation_free(AttachmentCancellation *token);
+
 silo_error *silo_machine_exec(const silo_machine *machine,
                               const uint8_t *request_ptr,
                               size_t request_len,
@@ -93,10 +111,22 @@ silo_error *silo_machine_attach(const silo_machine *machine,
                                 size_t request_len,
                                 silo_buffer *out_result);
 
+silo_error *silo_machine_attach_cancellable(const silo_machine *machine,
+                                            const uint8_t *request_ptr,
+                                            size_t request_len,
+                                            const AttachmentCancellation *token,
+                                            silo_buffer *out_result);
+
 silo_error *silo_machine_attach_shell(const silo_machine *machine,
                                       const uint8_t *request_ptr,
                                       size_t request_len,
                                       silo_buffer *out_status);
+
+silo_error *silo_machine_attach_shell_cancellable(const silo_machine *machine,
+                                                  const uint8_t *request_ptr,
+                                                  size_t request_len,
+                                                  const AttachmentCancellation *token,
+                                                  silo_buffer *out_status);
 
 silo_error *silo_execution_recv(const silo_execution *session,
                                 silo_execution_event *out_event,

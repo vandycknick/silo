@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"errors"
+	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
@@ -67,10 +69,24 @@ func (s *Service) nodeView(ctx context.Context, d *silo.MachineData) VM {
 			v.NodeID = node.NodeID
 			if s.Enrollment.Devices != nil {
 				device, err := s.Enrollment.Devices.Get(ctx, node.NodeID)
+				if errors.Is(err, enroll.ErrDeviceNotFound) {
+					v.NodeState = state.Expired
+					v.NodeDiagnostics = append(v.NodeDiagnostics, "device no longer registered; stop and reauth")
+				}
+				if err != nil && !errors.Is(err, enroll.ErrDeviceNotFound) {
+					v.NodeDiagnostics = append(v.NodeDiagnostics, "device status unavailable")
+				}
+				if errors.Is(err, enroll.ErrInvalidDeviceResponse) || err == nil && !strings.EqualFold(strings.TrimSuffix(device.Name, "."), v.Node) {
+					v.NodeState = state.Unreadable
+					v.NodeDiagnostics = append(v.NodeDiagnostics, "device identity response unreadable")
+				}
 				if err == nil && strings.EqualFold(strings.TrimSuffix(device.Name, "."), v.Node) {
 					v.Addresses = device.Addresses
 					v.Address = strings.Join(device.Addresses, ",")
 					v.KeyExpiry = device.Expires
+					if expiry, err := time.Parse(time.RFC3339, device.Expires); err == nil && !expiry.IsZero() && !expiry.After(time.Now()) {
+						v.NodeState = state.Expired
+					}
 				}
 			}
 		}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -79,7 +80,7 @@ func InstalledRuntime(opts ...InstallOption) (*RuntimeInstallation, error) {
 		return nil, err
 	}
 	finalRoot := filepath.Join(root, Version, string(target))
-	valid, err := validateRuntimeInstallation(finalRoot)
+	valid, err := validateRuntimeInstallation(finalRoot, target)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +139,7 @@ func installRuntime(ctx context.Context, target RuntimeTarget, config installCon
 	defer func() { _ = lock.close() }()
 
 	finalRoot := filepath.Join(versionRoot, string(target))
-	valid, err := validateRuntimeInstallation(finalRoot)
+	valid, err := validateRuntimeInstallation(finalRoot, target)
 	if err != nil {
 		return nil, err
 	}
@@ -171,12 +172,12 @@ func installRuntime(ctx context.Context, target RuntimeTarget, config installCon
 	if err := extractRuntimeArchive(ctx, archive, stage, metadata); err != nil {
 		return nil, err
 	}
-	valid, err = validateRuntimeInstallation(stage)
+	valid, err = validateRuntimeInstallation(stage, target)
 	if err != nil {
 		return nil, err
 	}
 	if !valid {
-		return nil, newError(ErrorInstallation, "", "extracted runtime is incomplete")
+		return nil, newError(ErrorArchiveIntegrity, "", "extracted runtime manifest or components are invalid")
 	}
 	if err := syncDirectory(stage); err != nil {
 		return nil, newError(ErrorInstallation, "", "sync runtime staging directory: "+err.Error())
@@ -331,6 +332,7 @@ func (reader *contextReader) Read(buffer []byte) (int, error) {
 }
 
 var runtimeFiles = map[string]os.FileMode{
+	"runtime-manifest.json":   0o644,
 	"bin/silo-vmm":            0o755,
 	"bin/netd":                0o755,
 	"assets/kernel-default":   0o644,
@@ -342,6 +344,14 @@ var runtimeFiles = map[string]os.FileMode{
 
 var runtimeDirectories = map[string]struct{}{
 	"bin": {}, "assets": {}, "LICENSES": {},
+}
+
+func runtimeFileMode(relative string, target RuntimeTarget) (os.FileMode, bool) {
+	mode, found := runtimeFiles[relative]
+	if !found && target == RuntimeTargetDarwinARM64 && relative == "assets/rprobe" {
+		return 0o644, true
+	}
+	return mode, found
 }
 
 func extractRuntimeArchive(ctx context.Context, archivePath, destination string, metadata runtimeArchiveMetadata) error {
@@ -405,7 +415,7 @@ func extractRuntimeArchive(ctx context.Context, archivePath, destination string,
 				return newError(ErrorInstallation, "", "set runtime directory mode: "+err.Error())
 			}
 		case tar.TypeReg, tar.TypeRegA:
-			expectedMode, expected := runtimeFiles[relative]
+			expectedMode, expected := runtimeFileMode(relative, metadata.target)
 			if !expected {
 				return newError(ErrorArchiveIntegrity, "", "runtime archive contains unexpected file: "+relative)
 			}
@@ -493,7 +503,7 @@ func safeArchivePath(name, expectedRoot string) (string, error) {
 	return relative, nil
 }
 
-func validateRuntimeInstallation(root string) (bool, error) {
+func validateRuntimeInstallation(root string, target RuntimeTarget) (bool, error) {
 	rootInfo, err := os.Lstat(root)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -529,7 +539,7 @@ func validateRuntimeInstallation(root string) (bool, error) {
 			}
 			return nil
 		}
-		if _, expected := runtimeFiles[relative]; !expected {
+		if _, expected := runtimeFileMode(relative, target); !expected {
 			return fmt.Errorf("unexpected runtime file %s", relative)
 		}
 		return nil
@@ -549,7 +559,78 @@ func validateRuntimeInstallation(root string) (bool, error) {
 			return false, nil
 		}
 	}
-	return true, nil
+	return validateInstalledManifest(root, target), nil
+}
+
+type runtimeManifest struct {
+	Version string            `json:"version"`
+	Target  RuntimeTarget     `json:"target"`
+	Files   map[string]string `json:"files"`
+}
+
+func validateInstalledManifest(root string, target RuntimeTarget) bool {
+	info, err := os.Lstat(filepath.Join(root, "runtime-manifest.json"))
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
+		return false
+	}
+	directory, err := os.OpenRoot(root)
+	if err != nil {
+		return false
+	}
+	defer directory.Close()
+	file, err := directory.Open("runtime-manifest.json")
+	if err != nil {
+		return false
+	}
+	decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
+	decoder.DisallowUnknownFields()
+	var manifest runtimeManifest
+	err = decoder.Decode(&manifest)
+	var extra json.RawMessage
+	end := decoder.Decode(&extra)
+	_ = file.Close()
+	if err != nil || end != io.EOF || manifest.Version != Version || manifest.Target != target {
+		return false
+	}
+	seen := 0
+	err = filepath.WalkDir(root, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relative, err := filepath.Rel(root, current)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		mode, allowed := runtimeFileMode(relative, target)
+		info, err := entry.Info()
+		if err != nil || !allowed || !info.Mode().IsRegular() || info.Mode().Perm() != mode {
+			return errors.New("invalid runtime file")
+		}
+		if relative == "runtime-manifest.json" {
+			return nil
+		}
+		want, listed := manifest.Files[relative]
+		if !listed || len(want) != 64 {
+			return errors.New("unlisted runtime file")
+		}
+		f, err := directory.Open(relative)
+		if err != nil {
+			return err
+		}
+		hasher := sha256.New()
+		_, err = io.Copy(hasher, f)
+		closeErr := f.Close()
+		if err != nil || closeErr != nil || hex.EncodeToString(hasher.Sum(nil)) != want {
+			return errors.New("runtime digest mismatch")
+		}
+		seen++
+		return nil
+	})
+	return err == nil && seen == len(manifest.Files)
 }
 
 func syncDirectory(path string) error {

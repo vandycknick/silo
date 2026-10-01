@@ -42,6 +42,7 @@ jobs:
         with:
           filters: |
             node:
+              - 'vendor/signal-hook-registry/**'
               - '.github/workflows/test.yml'
               - 'Cargo.lock'
               - 'Cargo.toml'
@@ -54,6 +55,7 @@ jobs:
               - 'specs/**'
               - 'sdk/node/**'
             go:
+              - 'vendor/signal-hook-registry/**'
               - '.github/workflows/test.yml'
               - 'Cargo.lock'
               - 'Cargo.toml'
@@ -61,6 +63,7 @@ jobs:
               - 'VERSION'
               - 'flake.lock'
               - 'flake.nix'
+              - 'nix/**'
               - 'runtime/libvm/**'
               - 'common/policy/**'
               - 'specs/**'
@@ -72,8 +75,14 @@ jobs:
               - 'common/policy/**'
               - 'flake.lock'
               - 'flake.nix'
+              - 'nix/**'
             taild:
+              - 'vendor/signal-hook-registry/**'
               - '.github/workflows/test.yml'
+              - '.github/workflows/release-tip.yml'
+              - 'packaging/silo-taild/**'
+              - 'PACKAGING.md'
+              - 'nix/**'
               - 'app/taild/**'
               - 'sdk/go/**'
               - 'runtime/**'
@@ -410,6 +419,36 @@ jobs:
       - name: Build taild
         run: timeout 280s nix develop .#ci --command go -C app/taild build ./cmd/taild
 
+  taild-package:
+    name: taild package (${{ matrix.platform }})
+    needs: changes
+    if: needs.changes.outputs.taild == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64-gnu
+            runner: ubuntu-24.04
+          - platform: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - name: Build native runtime, qualified SDK, CGO taild and portable package
+        run: nix develop .#release --command make archive
+      - name: Exercise packaged executable without development overrides
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          version="$(tr -d '\n' < VERSION)"
+          nix develop .#release --command python3 packaging/silo-taild/verify-artifact.py "target/packages/$version/$PLATFORM/silo-$version-$PLATFORM.tar.zst" "target/packages/$version/$PLATFORM/silo-runtime-$version-$PLATFORM.tar.zst"
+
   summary:
     name: Summary
     if: always()
@@ -420,6 +459,7 @@ jobs:
       - go-sdk
       - netd
       - taild
+      - taild-package
     runs-on: ubuntu-24.04
     steps:
       - name: Require successful checks

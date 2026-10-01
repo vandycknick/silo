@@ -26,6 +26,7 @@ type LogChunk struct {
 }
 
 func Load(string, uint32) error                         { return nil }
+func NativeABIVersion() uint32                          { return 0 }
 func OpenRuntime([]byte) (*Runtime, error)              { return nil, nil }
 func BuildNetworkPolicy([]byte) ([]byte, error)         { return nil, nil }
 func (*Runtime) Close()                                 {}
@@ -43,11 +44,19 @@ func (*Machine) StopWith([]byte) ([]byte, error)        { return nil, nil }
 func (*Machine) Exec([]byte) (*ExecutionOutput, error)  { return nil, nil }
 func (*Machine) Shell([]byte) (*ExecutionOutput, error) { return nil, nil }
 func (*Machine) Spawn([]byte) (*Execution, error)       { return nil, nil }
-func (*Machine) Attach([]byte) ([]byte, error)          { return nil, nil }
-func (*Machine) AttachShell([]byte) ([]byte, error)     { return nil, nil }
-func (*Machine) Logs([]byte) (*Log, error)              { return nil, nil }
-func (*Machine) Remove() error                          { return nil }
-func (*Machine) Close()                                 {}
+
+type AttachmentCancellation struct{}
+
+func (*AttachmentCancellation) Signal(uint32) error { return nil }
+
+func NewAttachmentCancellation() (*AttachmentCancellation, error)            { return nil, nil }
+func (*AttachmentCancellation) Cancel() error                                { return nil }
+func (*AttachmentCancellation) Close()                                       {}
+func (*Machine) Attach([]byte, *AttachmentCancellation) ([]byte, error)      { return nil, nil }
+func (*Machine) AttachShell([]byte, *AttachmentCancellation) ([]byte, error) { return nil, nil }
+func (*Machine) Logs([]byte) (*Log, error)                                   { return nil, nil }
+func (*Machine) Remove() error                                               { return nil }
+func (*Machine) Close()                                                      {}
 
 type NodeStateLease struct{}
 

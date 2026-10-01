@@ -2,7 +2,8 @@
 
 The management node exposes owned VM operations and templates over tailnet SSH.
 VM enrollment completes before boot; `--no-tailnet` retains ordinary networking. Closing this
-daemon releases SDK handles and its own node, never stops VMs.
+daemon normally releases SDK handles and its own node without stopping VMs.
+Authenticated host shutdown is a separate, bounded lifecycle.
 
 ## Build and check
 
@@ -20,7 +21,21 @@ nonroot ownership of the resolved existing home, and actual SDK runtime
 validation. It never downloads artifacts. Default home is `/var/lib/silo-taild`,
 overridden by `SILO_HOME`, then `home` in YAML. `runtime_root` can select a
 complete operator-installed portable runtime; otherwise lookup is under
-`<home>/runtimes`. Relative paths and writable-by-other homes are rejected.
+`<home>/runtimes` (or `install_root`). Relative paths and writable-by-other homes are rejected.
+The selected root must contain `runtime-manifest.json` with exact SDK version,
+host target and SHA-256 for every installed regular file except the manifest.
+Missing manifests, extra files, symlinks, escaping paths and changed hashes fail
+before opening the SDK. Legacy stages need rebuilding by the packaging writer.
+
+`taild version` and `taild --version` report build/SDK versions and the verified
+installed runtime's metadata, or `runtime unavailable` when none is installed.
+They do not claim that an absent runtime matches the build. The public SDK
+verifies its bridge ABI on open; the version command labels this explicitly.
+`taild install-runtime --config FILE --runtime-archive /absolute/archive.tar.zst
+--install-root /absolute/store` wraps the exact-version public SDK offline
+installer. YAML `runtime_archive` and `install_root` provide the same settings.
+Installation starts no tailnet node and reads no OAuth secrets. Development SDKs
+without compiled release archive digests refuse installation explicitly.
 
 The shipped [`config.example.yaml`](config.example.yaml) shows operator defaults.
 Secrets are optional files in `/etc/silo-taild/secrets`: `oauth-client-secret`,
@@ -88,6 +103,10 @@ Consent holds no global name lock. The temporary server closes before synced,
 recoverable pending/backup promotion; netd receives state, never the provisioning
 token. `enrollment.timeout` bounds node approval to at most 5 minutes.
 Expired/failed approvals leave the VM stopped (exit 8); `start` offers a fresh link.
+A control connection that cannot obtain even a login URL times out with exit 9,
+leaving the durable machine stopped and resumable. Device API data is validated
+before projecting it; a confirmed missing device or elapsed key expiry is shown
+as `expired`. Unavailable or corrupt responses do not prove deletion.
 
 `reauth VM` explicitly refreshes the copied existing identity through the pinned
 local API, waits for login completion and a changed public key in actual status,

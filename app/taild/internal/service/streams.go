@@ -67,7 +67,7 @@ func (s *Service) streamContext(parent context.Context, c Caller, ref string, ac
 					m, _, err := s.machine(ctx, p, ref, action)
 					e = err
 					if m != nil {
-						_ = m.Close()
+						s.Runtime.CloseMachine(m)
 					}
 				}
 				if e != nil {
@@ -123,7 +123,7 @@ func (s *Service) execute(parent context.Context, c Caller, ref string, action i
 	if e != nil {
 		return Categorize(e).Exit, e
 	}
-	defer m.Close()
+	defer s.Runtime.CloseMachine(m)
 	if d.Status.Kind != silo.MachineStatusRunning {
 		return 5, failure("conflict", "VM must be running", 5)
 	}
@@ -165,7 +165,8 @@ func (s *Service) execute(parent context.Context, c Caller, ref string, action i
 	if e != nil {
 		return Categorize(e).Exit, Categorize(e)
 	}
-	defer exec.Close()
+	s.Runtime.Metrics.Handle("exec", 1)
+	defer func() { _ = exec.Close(); s.Runtime.Metrics.Handle("exec", -1) }()
 	cancelDone := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() { defer close(cancelDone); _ = exec.Cancel() })
 	defer func() {
@@ -371,7 +372,7 @@ func (s *Service) Logs(parent context.Context, c Caller, ref string, q LogsReque
 	if e != nil {
 		return e
 	}
-	defer m.Close()
+	defer s.Runtime.CloseMachine(m)
 	ctx, cancel, recheck := s.streamContext(parent, c, d.ID, identity.Logs)
 	defer cancel()
 	defer func() {
@@ -383,6 +384,7 @@ func (s *Service) Logs(parent context.Context, c Caller, ref string, q LogsReque
 	if e != nil {
 		return Categorize(e)
 	}
+	s.Runtime.Metrics.Handle("logs", 1)
 	var tail []byte
 	var historical uint64
 	truncated := false
@@ -393,6 +395,7 @@ func (s *Service) Logs(parent context.Context, c Caller, ref string, q LogsReque
 		}
 		if e != nil {
 			_ = stream.Close()
+			s.Runtime.Metrics.Handle("logs", -1)
 			return Categorize(e)
 		}
 		historical += uint64(len(chunk.Data))
@@ -412,6 +415,7 @@ func (s *Service) Logs(parent context.Context, c Caller, ref string, q LogsReque
 		}
 	}
 	_ = stream.Close()
+	s.Runtime.Metrics.Handle("logs", -1)
 	if truncated {
 		if i := strings.IndexByte(string(tail), '\n'); i >= 0 {
 			tail = tail[i+1:]
@@ -439,7 +443,8 @@ func (s *Service) Logs(parent context.Context, c Caller, ref string, q LogsReque
 	if e != nil {
 		return Categorize(e)
 	}
-	defer stream.Close()
+	s.Runtime.Metrics.Handle("logs", 1)
+	defer func() { _ = stream.Close(); s.Runtime.Metrics.Handle("logs", -1) }()
 	// Follow reopens at the beginning. Skip the snapshot already observed, then
 	// redact complete bounded lines, including credentials split across chunks.
 	line := pending

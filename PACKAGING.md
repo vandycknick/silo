@@ -1,5 +1,107 @@
 # Packaging Silo for Distribution
 
+## Taild Linux packages
+
+`make archive` builds the native release runtime stage, creates its runtime-only
+archive and checksum, builds/hashes the native SDK bridge, generates a target-local
+qualified SDK in `target/taild-qualified-source/release`, builds `taild` against that
+isolated source with `CGO_ENABLED=1`, then creates the portable archive. It does not
+wait for other native targets. Netd's release `CGO_ENABLED=0` recipe must not be used
+for taild. Linux release CGO uses `/usr/bin/cc` and `/usr/bin/c++`; cross compilation
+is not a native qualification substitute. macOS archives omit taild/service material.
+
+Both runtime roots include `runtime-manifest.json`: `{version, target, files}`.
+Version equals the exact SDK product version. Targets are `linux-amd64-gnu`,
+`linux-arm64-gnu`, or `darwin-arm64`, matching SDK runtime identifiers. Files are
+the complete current bin/assets inventory mapped to lowercase SHA-256 digests;
+manifest metadata is never a made-up constant. Stage validation rejects unexpected
+entries/symlinks and verifies manifest bytes against current components and VERSION.
+The archive checksum is embedded in qualified SDK source for explicit offline
+installation. The bridge loader checks the embedded digest, ABI and product version.
+`make version-check` also checks the SDK bundle cache-version constant.
+
+Linux portable archives include `bin/taild`, `share/silo-taild` (service, sysusers,
+config, examples and acceptance tools), and generated `LICENSES/taild` notices from
+the exact Go module graph. The generator fails on missing license material; review
+`modules.json` and the SBOM. Godbus is BSD-2-Clause (not MIT), and retains its actual
+module license. Runtime notices are generated from the existing template with
+the actual locked libkrun revision and vendored signal-registry attribution;
+the Apache license remains included. These are archive outputs, not distro
+package/signature claims.
+
+For bounded component builds, build each release component separately (CLI, silod,
+silo-vmm, netd, agent, init) and stop to inspect a cold-build timeout rather than
+blindly retrying. After coordinated `make stage PROFILE=release`, run:
+
+```sh
+make runtime-archive PROFILE=release
+make go-ffi PROFILE=release
+make qualify-go-bridge PROFILE=release
+make taild PROFILE=release
+make portable-archive
+python3 packaging/silo-taild/verify-artifact.py \
+  target/packages/0.1.0/linux-amd64-gnu/silo-0.1.0-linux-amd64-gnu.tar.zst \
+  target/packages/0.1.0/linux-amd64-gnu/silo-runtime-0.1.0-linux-amd64-gnu.tar.zst
+```
+
+Use the source VERSION and native target in the final command. The script extracts
+the actual binary into isolated HOME, removes development/native-loader overrides,
+installs the actual runtime archive offline, checks versions/config, and rejects
+version/hash/traversal and archive-checksum mismatches. It is wired into native
+Linux Test and Release Tip lanes. KVM memory and real systemd/tailnet acceptance
+remain additional gates in the [operator guide](docs/taild/operator.md).
+The current Linux amd64 release runtime passed real packaged guest execution at
+256 MiB (2026-10-01, agent 10,444,032 bytes). The current unstripped debug archive
+passed at 1 GiB (agent 173,188,384 bytes) and retains that minimum. The historical
+debug256 OOM remains a failure. These are native guest execution/memory results,
+not a qualification of arbitrary guest workloads, other architectures or tailnets.
+Debug qualification archives/bridges use `target/packages-debug`, separate from
+release outputs, with the build profile recorded in provenance.
+
+Linux release commands use verified `/usr/bin` C tools, clear Nix wrapper flags,
+and give CGO `-B/usr/bin` to select native assembler/linker subprograms. An absolute
+CC alone is insufficient because GCC otherwise searches PATH for `as`/`ld`.
+Artifact acceptance checks dynamic loaders/search paths and runs without inherited
+loader overrides. The host must supply `libgcc_s.so.1` and its normal glibc libraries.
+Provenance records the actual module-selected Go toolchains and native compiler.
+
+Release archiving and bridge qualification fail closed on the native ELF audit:
+standard interpreter, no RPATH/RUNPATH or absolute DT_NEEDED entries, complete
+dependency resolution using the designated system loader with its cache disabled
+and only native system library directories, and imported GLIBC versions no newer
+than ADR0012's 2.39 floor. GNU host linker subprograms are pinned for Rust as well
+as CGO. Do not repair a too-new ABI by merely removing an interpreter/search path
+or copying an arbitrary system library closure.
+
+The extracted-archive acceptance script audits both archive payloads and requires
+exactly one materialized embedded bridge for closure inspection. It actually
+executes `silo-vmm --help`, netd's help entry point, and taild version/install/check.
+When rootless user/mount namespaces are available, `no_nix.py` hides `/nix` in the
+child while preserving the user UID. Use `--require-no-nix` to make that isolation
+mandatory, or `--audit-only` to inspect immutable older archive snapshots without
+installing/booting VMs. An unavailable namespace is explicitly unqualified;
+static dependency auditing and designated-loader execution still run. Helper
+entry-point execution alone is not proof of a guest boot on a clean distro.
+
+The shipped `packaging/silo-taild/kvm.go` is a real SDK consumer for that additional
+gate. Build it from the isolated qualified SDK module, then run the built consumer
+with `-archive` (the actual runtime archive), `-disk` (a disposable bootable Linux
+disk with `/bin/sh`), `-home` (a new absolute evidence directory), and
+`-memory-mib 1024` or `256`. It installs offline using the embedded digest, boots the
+packaged guest agent, executes a proof command, stops the VM and retains evidence.
+It refuses known oversized (>64 MiB agent) artifacts at 256 MiB; passing that size
+screen is not itself a memory qualification. Build and VM execution are separate
+bounded commands, with normal Go preemption enabled and no FFI override:
+
+```sh
+go -C target/taild-qualified-source/release/sdk/go build \
+  -o "$PWD/target/packaged-kvm" "$PWD/packaging/silo-taild/kvm.go"
+env -u SILO_GO_FFI_PATH -u GODEBUG target/packaged-kvm \
+  -archive /absolute/path/silo-runtime-VERSION-TARGET.tar.zst \
+  -disk /absolute/path/disposable-linux.ext4 \
+  -home /absolute/path/new-acceptance-home -memory-mib 256
+```
+
 This guide is for Silo contributors and downstream package maintainers. It
 describes how to build the package formats that exist in this source tree, how
 those formats relate to the canonical runtime payload, and where to find their

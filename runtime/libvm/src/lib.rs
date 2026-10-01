@@ -47,9 +47,9 @@ pub use crate::image::{
     OciImageConfigMetadata, Platform, ResolvedOciImage,
 };
 pub use crate::machine::{
-    resolve_mount_location, EgressCredentials, EgressSecret, Entrypoint, ExecutionControl,
-    ExecutionEvent, ExecutionLaunchFailure, ExecutionLaunchFailureReason, ExecutionLost,
-    ExecutionLostReason, ExecutionOptions, ExecutionOptionsBuilder, ExecutionOutput,
+    resolve_mount_location, AttachmentSignal, EgressCredentials, EgressSecret, Entrypoint,
+    ExecutionControl, ExecutionEvent, ExecutionLaunchFailure, ExecutionLaunchFailureReason,
+    ExecutionLost, ExecutionLostReason, ExecutionOptions, ExecutionOptionsBuilder, ExecutionOutput,
     ExecutionResult, ExecutionSession, ExecutionStdin, FileWriteDisposition, GuestBuilder,
     GuestPublishUpdate, HostCommand, LaunchCredentials, Machine, MachineAgent,
     MachineAgentConnection, MachineAgentConnectionState, MachineAgentIdentity,

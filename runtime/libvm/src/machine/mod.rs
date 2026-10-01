@@ -45,10 +45,10 @@ pub use process::{MachineRetention, ProcessConfig};
 pub use reference::MachineRef;
 pub(crate) use session::launch_failure_reason;
 pub use session::{
-    ExecutionControl, ExecutionEvent, ExecutionLaunchFailure, ExecutionLaunchFailureReason,
-    ExecutionLost, ExecutionLostReason, ExecutionOptions, ExecutionOptionsBuilder, ExecutionOutput,
-    ExecutionResult, ExecutionSession, ExecutionStdin, SshExitStatus, SshShellOptions,
-    SshShellOptionsBuilder, StdinMode,
+    AttachmentSignal, ExecutionControl, ExecutionEvent, ExecutionLaunchFailure,
+    ExecutionLaunchFailureReason, ExecutionLost, ExecutionLostReason, ExecutionOptions,
+    ExecutionOptionsBuilder, ExecutionOutput, ExecutionResult, ExecutionSession, ExecutionStdin,
+    SshExitStatus, SshShellOptions, SshShellOptionsBuilder, StdinMode,
 };
 pub(crate) use start::SecretProvider;
 pub use start::{

@@ -1,4 +1,10 @@
 home: /var/lib/silo-taild
+install_root: /var/lib/silo-taild/runtimes
+# runtime_archive: /var/cache/silo-taild/silo-runtime.tar.zst
+disk_reserve: 1GiB
+shutdown:
+  stop_budget: 4s
+  margin: 250ms
 secrets_dir: /etc/silo-taild/secrets
 templates_dir: /etc/silo-taild/templates
 policies_dir: /etc/silo-taild/policies

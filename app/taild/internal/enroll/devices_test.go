@@ -2,6 +2,7 @@ package enroll
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -74,5 +75,43 @@ func TestDeviceMismatchNeverDeletes(t *testing.T) {
 	d.client = server.Client()
 	if d.Delete(context.Background(), "stable") == nil || deleted {
 		t.Fatal("foreign device deleted")
+	}
+}
+
+func TestCorruptDeviceHTTPResponseNeverDeletesOrLeaks(t *testing.T) {
+	for _, body := range []string{
+		`{"id":"endpoint","nodeId":"stable","name":"/home/operator/tskey-auth-secret"}`,
+		`{"id":"endpoint","nodeId":"stable","addresses":["token=opaque-secret"]}`,
+		`{"id":"endpoint","nodeId":"stable","expires":"/etc/private"}`,
+		`not-json tskey-auth-secret`,
+	} {
+		var deletes int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == "DELETE" {
+				deletes++
+				return
+			}
+			if r.URL.Path == "/api/v2/tailnet/-/devices" {
+				_, _ = io.WriteString(w, `{"devices":[{"id":"endpoint","nodeId":"stable"}]}`)
+			} else {
+				_, _ = io.WriteString(w, body)
+			}
+		}))
+		d := NewDevices("local-protocol-test-token")
+		d.base, d.client = server.URL, server.Client()
+		if err := d.Delete(context.Background(), "stable"); err == nil || err.Error() != "invalid device response" {
+			t.Fatal("corrupt response escaped categorization", err)
+		}
+		if deletes != 0 {
+			t.Fatal("corrupt device was deleted")
+		}
+		server.Close()
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, `{"devices":[]}`) }))
+	defer server.Close()
+	d := NewDevices("local-protocol-test-token")
+	d.base, d.client = server.URL, server.Client()
+	if _, err := d.Get(context.Background(), "deleted"); !errors.Is(err, ErrDeviceNotFound) {
+		t.Fatal("confirmed missing device not distinguished", err)
 	}
 }

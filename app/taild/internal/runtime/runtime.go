@@ -4,11 +4,11 @@ package runtime
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"sync"
 
 	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
+	"github.com/vandycknick/silo/app/taild/internal/metrics"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
@@ -34,32 +34,59 @@ type Snapshot struct {
 	Unreadable int
 }
 type Runtime struct {
+	Metrics  *metrics.Metrics
+	Version  string
+	ABI      uint32
 	NodePin  *state.NodePin
 	SDK      *silo.Runtime
 	Instance string
 	mu       sync.Mutex
 	reserved map[string]bool
+	closed   bool
 }
 
 func Open(ctx context.Context, c config.Config, instance string) (*Runtime, error) {
-	root := c.RuntimeRoot
-	if root == "" {
-		installed, e := silo.InstalledRuntime(silo.WithInstallRoot(filepath.Join(c.Home, "runtimes")))
-		if e != nil {
-			return nil, e
-		}
-		if installed == nil {
-			return nil, errors.New("runtime is missing; install it explicitly before starting taild")
-		}
-		root = installed.Root
+	root, e := Root(c)
+	if e != nil {
+		return nil, e
+	}
+	manifest, e := ValidateManifest(root)
+	if e != nil {
+		return nil, e
+	}
+	abi, e := silo.VerifiedNativeABIVersion()
+	if e != nil {
+		return nil, e
 	}
 	sdk, e := silo.Open(ctx, silo.WithHome(c.Home), silo.WithRuntimeRoot(root))
 	if e != nil {
 		return nil, e
 	}
-	return &Runtime{SDK: sdk, Instance: instance, reserved: make(map[string]bool)}, nil
+	m := metrics.New()
+	m.Handle("runtime", 1)
+	return &Runtime{SDK: sdk, Instance: instance, reserved: make(map[string]bool), Metrics: m, Version: manifest.Version, ABI: abi}, nil
 }
-func (r *Runtime) Close() error { return r.SDK.Close() }
+func (r *Runtime) Close() error {
+	err := r.SDK.Close()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.closed {
+		r.Metrics.Handle("runtime", -1)
+		r.closed = true
+	}
+	return err
+}
+func (r *Runtime) Machine(ctx context.Context, ref string) (*silo.Machine, error) {
+	m, err := r.SDK.Machine(ctx, ref)
+	if err == nil {
+		r.Metrics.Handle("machine", 1)
+	}
+	return m, err
+}
+func (r *Runtime) CloseMachine(m *silo.Machine) {
+	_ = m.Close()
+	r.Metrics.Handle("machine", -1)
+}
 func (r *Runtime) Reconcile(ctx context.Context) (Snapshot, error) {
 	entries, e := r.SDK.Inventory(ctx)
 	if e != nil {
@@ -91,7 +118,7 @@ func (r *Runtime) Reconcile(ctx context.Context) (Snapshot, error) {
 			if d.Network.Tailscale == nil {
 				node = state.Unreadable
 			} else {
-				machine, err := r.SDK.Machine(ctx, d.ID)
+				machine, err := r.Machine(ctx, d.ID)
 				if err != nil {
 					node = state.Unreadable
 				} else {
@@ -100,12 +127,14 @@ func (r *Runtime) Reconcile(ctx context.Context) (Snapshot, error) {
 						if err != nil {
 							node = state.Unreadable
 						} else {
+							r.Metrics.Handle("node_lease", 1)
 							var pins []state.NodePin
 							if r.NodePin != nil {
 								pins = []state.NodePin{*r.NodePin}
 							}
 							node = state.RecoverNode(d.Network.Tailscale.StateDir, d.Name, owner, true, pins...)
 							_ = lease.Close()
+							r.Metrics.Handle("node_lease", -1)
 						}
 					} else {
 						var pins []state.NodePin
@@ -114,7 +143,7 @@ func (r *Runtime) Reconcile(ctx context.Context) (Snapshot, error) {
 						}
 						_, node = state.ReadNode(d.Network.Tailscale.StateDir, d.Name, owner, pins...)
 					}
-					_ = machine.Close()
+					r.CloseMachine(machine)
 				}
 			}
 		}

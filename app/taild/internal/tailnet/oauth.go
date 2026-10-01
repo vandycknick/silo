@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+var ErrCredentialUnavailable = errors.New("Tailscale credential service unavailable")
+
 // Mint uses the standard OAuth client-secret flow from pinned oauthkey, with
 // one caller-owned deadline. tsnet.Start must receive only the literal result:
 // its own ClientSecret discovery has no caller cancellation and can block Close.
@@ -74,9 +76,12 @@ func Mint(ctx context.Context, client *http.Client, base, secret, tag string) (s
 func doJSON(client *http.Client, req *http.Request, out any) error {
 	response, e := client.Do(req)
 	if e != nil {
-		return errors.New("Tailscale credential request failed")
+		return ErrCredentialUnavailable
 	}
 	defer response.Body.Close()
+	if response.StatusCode >= 500 || response.StatusCode == http.StatusTooManyRequests {
+		return ErrCredentialUnavailable
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return errors.New("Tailscale credential request rejected")
 	}
