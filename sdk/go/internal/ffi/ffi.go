@@ -35,6 +35,32 @@ type Runtime struct{ pointer *C.silo_runtime }
 // Machine owns one native libvm machine handle.
 type Machine struct{ pointer *C.silo_machine }
 
+type AttachmentCancellation struct{ pointer *C.AttachmentCancellation }
+
+func NewAttachmentCancellation() (*AttachmentCancellation, error) {
+	var token *C.AttachmentCancellation
+	if err := takeError(C.bridge_attachment_cancellation_new(&token)); err != nil {
+		return nil, err
+	}
+	if token == nil {
+		return nil, fmt.Errorf("native Silo bridge returned a nil attachment cancellation token")
+	}
+	return &AttachmentCancellation{pointer: token}, nil
+}
+
+func (token *AttachmentCancellation) Cancel() error {
+	return takeError(C.bridge_attachment_cancellation_cancel(token.pointer))
+}
+
+func (token *AttachmentCancellation) Signal(signal uint32) error {
+	return takeError(C.bridge_attachment_cancellation_signal(token.pointer, C.uint32_t(signal)))
+}
+
+func (token *AttachmentCancellation) Close() {
+	C.bridge_attachment_cancellation_free(token.pointer)
+	token.pointer = nil
+}
+
 type NodeStateLease struct{ pointer *C.silo_node_state_lease }
 
 func (machine *Machine) LeaseNodeState() (*NodeStateLease, error) {
@@ -86,7 +112,7 @@ type LogChunk struct {
 func load(path, expectedVersion string, expectedABI uint32) error {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
-	if message := C.bridge_load(cPath); message != nil {
+	if message := C.bridge_load(cPath, C.uint32_t(expectedABI)); message != nil {
 		value := C.GoString(message)
 		C.bridge_string_free(message)
 		if strings.HasPrefix(value, "native Silo bridge ABI mismatch:") {
@@ -102,6 +128,9 @@ func load(path, expectedVersion string, expectedABI uint32) error {
 	}
 	return nil
 }
+
+// NativeABIVersion returns the ABI of the bridge already validated by Load.
+func NativeABIVersion() uint32 { return uint32(C.bridge_abi_version()) }
 
 func openRuntime(request []byte) (*Runtime, error) {
 	var output *C.silo_runtime
@@ -259,16 +288,16 @@ func (machine *Machine) Spawn(request []byte) (*Execution, error) {
 	}
 	return &Execution{pointer: output}, nil
 }
-func (machine *Machine) Attach(request []byte) ([]byte, error) {
+func (machine *Machine) Attach(request []byte, token *AttachmentCancellation) ([]byte, error) {
 	var output C.silo_buffer
-	if err := takeError(C.bridge_machine_attach(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+	if err := takeError(C.bridge_machine_attach_cancellable(machine.pointer, bytePointer(request), C.size_t(len(request)), token.pointer, &output)); err != nil {
 		return nil, err
 	}
 	return copyBuffer(output), nil
 }
-func (machine *Machine) AttachShell(request []byte) ([]byte, error) {
+func (machine *Machine) AttachShell(request []byte, token *AttachmentCancellation) ([]byte, error) {
 	var output C.silo_buffer
-	if err := takeError(C.bridge_machine_attach_shell(machine.pointer, bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+	if err := takeError(C.bridge_machine_attach_shell_cancellable(machine.pointer, bytePointer(request), C.size_t(len(request)), token.pointer, &output)); err != nil {
 		return nil, err
 	}
 	return copyBuffer(output), nil

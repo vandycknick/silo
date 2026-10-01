@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -43,15 +44,22 @@ func TestActualTemporaryNodeTimeoutKeepsNativeMachineStopped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
+	var requests atomic.Int32
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
 	defer endpoint.Close()
 	c := config.Defaults()
 	c.Enrollment.Mode = "interactive"
 	manager := &Manager{Config: c, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: endpoint.URL}, Registry: NewRegistry(), Timeout: 750 * time.Millisecond}
 	err = manager.Enroll(ctx, machine, data, "user:1", false, func(line string) { t.Log(line) }, nil)
 	var failure *authz.Error
-	if !errors.As(err, &failure) || failure.Exit != 8 {
+	if !errors.As(err, &failure) || failure.Exit != 9 {
 		t.Fatal(err)
+	}
+	if requests.Load() == 0 {
+		t.Fatal("control protocol was not contacted")
 	}
 	after, err := machine.Inspect(ctx)
 	if err != nil || after.Status.Kind != silo.MachineStatusStopped {

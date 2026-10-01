@@ -56,12 +56,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			continue
 		}
 		s.active[sess] = true
+		s.Service.Runtime.Metrics.Session(1)
 		s.wg.Add(1)
 		s.mu.Unlock()
 		go func() {
 			defer s.wg.Done()
 			defer sess.Close()
-			defer func() { s.mu.Lock(); delete(s.active, sess); s.mu.Unlock() }()
+			defer func() { s.mu.Lock(); delete(s.active, sess); s.mu.Unlock(); s.Service.Runtime.Metrics.Session(-1) }()
 			s.session(ctx, sess)
 		}()
 	}

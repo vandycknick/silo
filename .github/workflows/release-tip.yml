@@ -48,7 +48,7 @@ jobs:
           printf 'version=%s\n' "$(tr -d '\n' < VERSION)" >> "$GITHUB_OUTPUT"
           {
             printf '## Release Tip\n\n'
-            printf 'Release SHA: `%s`\n' "$RELEASE_SHA"
+            printf "Release SHA: \`%s\`\n" "$RELEASE_SHA"
           } >> "$GITHUB_STEP_SUMMARY"
 
   core:
@@ -97,7 +97,18 @@ jobs:
           xcodebuild -version
 
       - name: Build release archives
+        # Native target-local order: runtime stage/archive/hash, bridge/hash,
+        # isolated qualified SDK embedding, CGO taild, then portable archive.
+        # No dependency on all-target SDK assembly, so there is no release cycle.
         run: nix develop .#release --command make archive
+
+      - name: Qualify packaged taild offline on native Linux
+        if: ${{ !matrix.create_dmg }}
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          nix develop .#release --command python3 packaging/silo-taild/verify-artifact.py "target/packages/$VERSION/$PLATFORM/silo-$VERSION-$PLATFORM.tar.zst" "target/packages/$VERSION/$PLATFORM/silo-runtime-$VERSION-$PLATFORM.tar.zst"
 
       - name: Smoke test release CLI
         run: target/release/silo --help
@@ -188,9 +199,9 @@ jobs:
           fi
           install -m755 "target/release/$GO_LIBRARY" "$root/go-ffi/$GO_LIBRARY"
           if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$root/go-ffi/$GO_LIBRARY" > "$root/go-ffi/$GO_LIBRARY.sha256"
+            (cd "$root/go-ffi" && sha256sum "$GO_LIBRARY" > "$GO_LIBRARY.sha256")
           else
-            shasum -a 256 "$root/go-ffi/$GO_LIBRARY" > "$root/go-ffi/$GO_LIBRARY.sha256"
+            (cd "$root/go-ffi" && shasum -a 256 "$GO_LIBRARY" > "$GO_LIBRARY.sha256")
           fi
           install -m644 sdk/node/native/index.cjs sdk/node/native/index.d.ts "$root/node/"
           for addon in sdk/node/native/*.node; do
@@ -330,7 +341,7 @@ jobs:
         run: |
           linux_node="target/packages/$VERSION/linux-amd64-gnu/node"
           install -m644 "$linux_node/index.cjs" "$linux_node/index.d.ts" sdk/node/native/
-          for directory in target/packages/$VERSION/*/node; do
+          for directory in target/packages/"$VERSION"/*/node; do
             for addon in "$directory"/*.node; do
               test -f "$addon"
               install -m755 "$addon" sdk/node/native/

@@ -1,14 +1,17 @@
 package httpd
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/metrics"
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	"github.com/vandycknick/silo/app/taild/internal/tailnet"
 )
@@ -24,6 +27,7 @@ func TestActualUnregisteredNodeDeniesHTTPHeaders(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer node.Close()
+	node.Metrics = metrics.New()
 	server := httptest.NewServer(Handler(&service.Service{}, node))
 	defer server.Close()
 	for _, path := range []string{"/healthz", "/metrics", "/oauth/callback"} {
@@ -45,5 +49,10 @@ func TestActualUnregisteredNodeDeniesHTTPHeaders(t *testing.T) {
 		if response.StatusCode != want {
 			t.Fatalf("%s: %d", path, response.StatusCode)
 		}
+	}
+	var out bytes.Buffer
+	node.Metrics.Write(&out)
+	if !strings.Contains(out.String(), `taild_whois_duration_seconds_count{outcome="failed"} 2`) {
+		t.Fatal("actual WhoIs failures not measured", out.String())
 	}
 }

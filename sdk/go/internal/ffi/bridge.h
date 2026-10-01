@@ -3,7 +3,7 @@
 
 #include "../../native/include/silo_go_ffi.h"
 
-char *bridge_load(const char *path);
+char *bridge_load(const char *path, uint32_t expected_abi);
 uint32_t bridge_abi_version(void);
 const char *bridge_sdk_version(void);
 void bridge_string_free(char *value);
@@ -34,6 +34,12 @@ silo_error *bridge_machine_shell(const silo_machine *machine, const uint8_t *req
 silo_error *bridge_machine_spawn(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution **out_session);
 silo_error *bridge_machine_attach(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_result);
 silo_error *bridge_machine_attach_shell(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_status);
+silo_error *bridge_attachment_cancellation_new(AttachmentCancellation **out_token);
+silo_error *bridge_attachment_cancellation_cancel(const AttachmentCancellation *token);
+silo_error *bridge_attachment_cancellation_signal(const AttachmentCancellation *token, uint32_t signal);
+void bridge_attachment_cancellation_free(AttachmentCancellation *token);
+silo_error *bridge_machine_attach_cancellable(const silo_machine *machine, const uint8_t *request, size_t request_len, const AttachmentCancellation *token, silo_buffer *out_result);
+silo_error *bridge_machine_attach_shell_cancellable(const silo_machine *machine, const uint8_t *request, size_t request_len, const AttachmentCancellation *token, silo_buffer *out_status);
 silo_error *bridge_execution_recv(const silo_execution *session, silo_execution_event *out_event, _Bool *out_eof);
 silo_error *bridge_execution_wait(const silo_execution *session, silo_buffer *out_result);
 silo_error *bridge_execution_collect(const silo_execution *session, silo_execution_output *out_output);

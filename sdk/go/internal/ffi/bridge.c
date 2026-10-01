@@ -39,6 +39,12 @@ DECLARE_FFI(machine_shell);
 DECLARE_FFI(machine_spawn);
 DECLARE_FFI(machine_attach);
 DECLARE_FFI(machine_attach_shell);
+DECLARE_FFI(attachment_cancellation_new);
+DECLARE_FFI(attachment_cancellation_cancel);
+DECLARE_FFI(attachment_cancellation_signal);
+DECLARE_FFI(attachment_cancellation_free);
+DECLARE_FFI(machine_attach_cancellable);
+DECLARE_FFI(machine_attach_shell_cancellable);
 DECLARE_FFI(execution_recv);
 DECLARE_FFI(execution_wait);
 DECLARE_FFI(execution_collect);
@@ -79,7 +85,7 @@ static char *load_symbol(void **target, const char *name) {
     } \
 } while (0)
 
-char *bridge_load(const char *path) {
+char *bridge_load(const char *path, uint32_t expected_abi) {
     if (library != NULL) return NULL;
     library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (library == NULL) {
@@ -88,10 +94,13 @@ char *bridge_load(const char *path) {
     }
     LOAD(ffi_abi_version, "silo_ffi_abi_version");
     LOAD(ffi_sdk_version, "silo_ffi_sdk_version");
-    if (ffi_abi_version() != 2) {
+    uint32_t actual_abi = ffi_abi_version();
+    if (actual_abi != expected_abi) {
+        char message[160];
+        snprintf(message, sizeof(message), "native Silo bridge ABI mismatch: bridge ABI %u, SDK requires ABI %u; rebuild the native bridge", actual_abi, expected_abi);
         dlclose(library);
         library = NULL;
-        return strdup("native Silo bridge ABI mismatch: SDK requires ABI 2; rebuild the native bridge");
+        return strdup(message);
     }
     LOAD(ffi_buffer_free, "silo_buffer_free");
     LOAD(ffi_error_free, "silo_error_free");
@@ -119,6 +128,12 @@ char *bridge_load(const char *path) {
     LOAD(ffi_machine_spawn, "silo_machine_spawn");
     LOAD(ffi_machine_attach, "silo_machine_attach");
     LOAD(ffi_machine_attach_shell, "silo_machine_attach_shell");
+    LOAD(ffi_attachment_cancellation_new, "silo_attachment_cancellation_new");
+    LOAD(ffi_attachment_cancellation_cancel, "silo_attachment_cancellation_cancel");
+    LOAD(ffi_attachment_cancellation_signal, "silo_attachment_cancellation_signal");
+    LOAD(ffi_attachment_cancellation_free, "silo_attachment_cancellation_free");
+    LOAD(ffi_machine_attach_cancellable, "silo_machine_attach_cancellable");
+    LOAD(ffi_machine_attach_shell_cancellable, "silo_machine_attach_shell_cancellable");
     LOAD(ffi_execution_recv, "silo_execution_recv");
     LOAD(ffi_execution_wait, "silo_execution_wait");
     LOAD(ffi_execution_collect, "silo_execution_collect");
@@ -169,6 +184,12 @@ silo_error *bridge_machine_shell(const silo_machine *machine, const uint8_t *req
 silo_error *bridge_machine_spawn(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_execution **out_session) { return ffi_machine_spawn(machine, request, request_len, out_session); }
 silo_error *bridge_machine_attach(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_result) { return ffi_machine_attach(machine, request, request_len, out_result); }
 silo_error *bridge_machine_attach_shell(const silo_machine *machine, const uint8_t *request, size_t request_len, silo_buffer *out_status) { return ffi_machine_attach_shell(machine, request, request_len, out_status); }
+silo_error *bridge_attachment_cancellation_new(AttachmentCancellation **out_token) { return ffi_attachment_cancellation_new(out_token); }
+silo_error *bridge_attachment_cancellation_cancel(const AttachmentCancellation *token) { return ffi_attachment_cancellation_cancel(token); }
+silo_error *bridge_attachment_cancellation_signal(const AttachmentCancellation *token, uint32_t signal) { return ffi_attachment_cancellation_signal(token, signal); }
+void bridge_attachment_cancellation_free(AttachmentCancellation *token) { ffi_attachment_cancellation_free(token); }
+silo_error *bridge_machine_attach_cancellable(const silo_machine *machine, const uint8_t *request, size_t request_len, const AttachmentCancellation *token, silo_buffer *out_result) { return ffi_machine_attach_cancellable(machine, request, request_len, token, out_result); }
+silo_error *bridge_machine_attach_shell_cancellable(const silo_machine *machine, const uint8_t *request, size_t request_len, const AttachmentCancellation *token, silo_buffer *out_status) { return ffi_machine_attach_shell_cancellable(machine, request, request_len, token, out_status); }
 silo_error *bridge_execution_recv(const silo_execution *session, silo_execution_event *out_event, _Bool *out_eof) { return ffi_execution_recv(session, out_event, out_eof); }
 silo_error *bridge_execution_wait(const silo_execution *session, silo_buffer *out_result) { return ffi_execution_wait(session, out_result); }
 silo_error *bridge_execution_collect(const silo_execution *session, silo_execution_output *out_output) { return ffi_execution_collect(session, out_output); }

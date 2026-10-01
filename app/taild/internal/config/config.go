@@ -22,12 +22,19 @@ type Resources struct {
 	Disk   string `yaml:"disk"`
 }
 type Config struct {
-	TemplatesDir string `yaml:"templates_dir"`
-	PoliciesDir  string `yaml:"policies_dir"`
-	Home         string `yaml:"home"`
-	RuntimeRoot  string `yaml:"runtime_root"`
-	SecretsDir   string `yaml:"secrets_dir"`
-	Tailnet      struct {
+	TemplatesDir   string `yaml:"templates_dir"`
+	PoliciesDir    string `yaml:"policies_dir"`
+	Home           string `yaml:"home"`
+	RuntimeRoot    string `yaml:"runtime_root"`
+	InstallRoot    string `yaml:"install_root"`
+	RuntimeArchive string `yaml:"runtime_archive"`
+	DiskReserve    string `yaml:"disk_reserve"`
+	Shutdown       struct {
+		StopBudget string `yaml:"stop_budget"`
+		Margin     string `yaml:"margin"`
+	} `yaml:"shutdown"`
+	SecretsDir string `yaml:"secrets_dir"`
+	Tailnet    struct {
 		Hostname   string `yaml:"hostname"`
 		Tag        string `yaml:"tag"`
 		Capability string `yaml:"capability"`
@@ -70,6 +77,9 @@ type Secrets struct {
 func Defaults() Config {
 	var c Config
 	c.Home = "/var/lib/silo-taild"
+	c.DiskReserve = "1GiB"
+	c.Shutdown.StopBudget = "4s"
+	c.Shutdown.Margin = "250ms"
 	c.SecretsDir = "/etc/silo-taild/secrets"
 	c.TemplatesDir = "/etc/silo-taild/templates"
 	c.PoliciesDir = "/etc/silo-taild/policies"
@@ -134,6 +144,19 @@ func (c Config) Limits() (identity.Limits, error) {
 	return identity.Limits{VMs: c.VM.Ceilings.VMs, CPUs: c.VM.Ceilings.CPUs, Memory: uint64(mem), Disk: uint64(disk)}, nil
 }
 func (c Config) Validate() error {
+	if _, e := units.Bytes(c.DiskReserve); e != nil {
+		return errors.New("invalid disk_reserve")
+	}
+	budget, e := time.ParseDuration(c.Shutdown.StopBudget)
+	margin, me := time.ParseDuration(c.Shutdown.Margin)
+	if e != nil || me != nil || budget <= 0 || budget > time.Minute || margin <= 0 || margin > time.Second {
+		return errors.New("invalid shutdown stop_budget or margin")
+	}
+	for _, p := range []string{c.InstallRoot, c.RuntimeArchive} {
+		if p != "" && !filepath.IsAbs(p) {
+			return errors.New("install_root and runtime_archive must be absolute")
+		}
+	}
 	if !ValidName(c.Tailnet.Hostname) {
 		return errors.New("invalid tailnet hostname")
 	}
@@ -182,6 +205,13 @@ func (c Config) Validate() error {
 		return errors.New("invalid session limits")
 	}
 	return nil
+}
+
+func (c Config) RuntimeStore() string {
+	if c.InstallRoot != "" {
+		return c.InstallRoot
+	}
+	return filepath.Join(c.Home, "runtimes")
 }
 func ValidName(s string) bool {
 	if len(s) == 0 || len(s) > 63 || s[len(s)-1] == '-' {

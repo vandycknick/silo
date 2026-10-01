@@ -389,3 +389,12 @@ Common failures are actionable:
 - No root daemon, global socket takeover, automatic host-tool installation,
   Kubernetes service, or manager RPC API is included in v1. Image upgrades are
   always automatic; there is no switch to pin the running image yet.
+## Optional tailnet service
+
+`taild` is a separate optional Linux service using the public Go SDK, not a remote
+host-login interface to silod. Its dedicated home is `/var/lib/silo-taild`.
+See the [operator guide](taild/operator.md) for the shipped systemd unit, private
+secret directories, logind shutdown inhibitor, stopping-only fallback and manual
+restart/shutdown drills. Both service shapes require `KillMode=process` so ordinary
+restart leaves VM workers running. Real logind/systemd survival and a one-week soak
+remain explicit qualification gates; daemonless Linux results do not qualify macOS.

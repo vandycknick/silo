@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -23,6 +24,9 @@ type Devices struct {
 	token, base string
 	client      *http.Client
 }
+
+var ErrDeviceNotFound = errors.New("device not found")
+var ErrInvalidDeviceResponse = errors.New("invalid device response")
 
 func NewDevices(token string) *Devices {
 	if token == "" {
@@ -50,14 +54,17 @@ func (d *Devices) request(ctx context.Context, method, path string, body []byte,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusNotFound {
+			return ErrDeviceNotFound
+		}
 		return errors.New("device API rejected request")
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20+1))
 	if err != nil || len(b) > 4<<20 {
-		return errors.New("invalid device response")
+		return ErrInvalidDeviceResponse
 	}
 	if out != nil && json.Unmarshal(b, out) != nil {
-		return errors.New("invalid device response")
+		return ErrInvalidDeviceResponse
 	}
 	return nil
 }
@@ -73,6 +80,9 @@ func (d *Devices) Get(ctx context.Context, nodeID string) (Device, error) {
 	if err := d.request(ctx, "GET", "/api/v2/tailnet/-/devices", nil, &list); err != nil {
 		return Device{}, err
 	}
+	if list.Devices == nil {
+		return Device{}, ErrInvalidDeviceResponse
+	}
 	id := ""
 	for _, device := range list.Devices {
 		if device.NodeID == nodeID {
@@ -83,14 +93,32 @@ func (d *Devices) Get(ctx context.Context, nodeID string) (Device, error) {
 		}
 	}
 	if id == "" {
-		return Device{}, errors.New("device not found")
+		return Device{}, ErrDeviceNotFound
+	}
+	if len(id) > 128 || strings.ContainsFunc(id, func(c rune) bool {
+		return !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-')
+	}) {
+		return Device{}, ErrInvalidDeviceResponse
 	}
 	var device Device
 	if err := d.request(ctx, "GET", "/api/v2/device/"+url.PathEscape(id), nil, &device); err != nil {
 		return Device{}, err
 	}
 	if device.ID != id || device.NodeID != nodeID {
-		return Device{}, errors.New("device identity mismatch")
+		return Device{}, ErrInvalidDeviceResponse
+	}
+	if len(device.Name) > 253 || strings.ContainsAny(device.Name, "/\\?@\r\n\x00 ") {
+		return Device{}, ErrInvalidDeviceResponse
+	}
+	for _, address := range device.Addresses {
+		if ip, err := netip.ParseAddr(address); err != nil || !ip.IsGlobalUnicast() {
+			return Device{}, ErrInvalidDeviceResponse
+		}
+	}
+	if device.Expires != "" {
+		if _, err := time.Parse(time.RFC3339, device.Expires); err != nil {
+			return Device{}, ErrInvalidDeviceResponse
+		}
 	}
 	return device, nil
 }

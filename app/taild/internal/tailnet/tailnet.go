@@ -14,6 +14,8 @@ import (
 	_ "github.com/vandycknick/silo/app/taild/internal/bootenv"
 	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
+	"github.com/vandycknick/silo/app/taild/internal/metrics"
+	"github.com/vandycknick/silo/app/taild/internal/redact"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"tailscale.com/client/local"
 	"tailscale.com/ipn/ipnstate"
@@ -21,6 +23,7 @@ import (
 )
 
 type Node struct {
+	Metrics  *metrics.Metrics
 	Server   *tsnet.Server
 	Client   *local.Client
 	config   config.Config
@@ -49,7 +52,14 @@ func Start(ctx context.Context, c config.Config, secrets config.Secrets, log *sl
 		return nil, e
 	}
 	n := &Node{config: c, defaults: defaults, log: log}
-	n.Server = &tsnet.Server{Dir: dir, Hostname: c.Tailnet.Hostname, AuthKey: authKey, AdvertiseTags: []string{c.Tailnet.Tag}, ControlURL: c.Tailnet.ControlURL, UserLogf: func(format string, args ...any) { log.Info("tailnet", "message", fmt.Sprintf(format, args...)) }}
+	n.Server = &tsnet.Server{Dir: dir, Hostname: c.Tailnet.Hostname, AuthKey: authKey, AdvertiseTags: []string{c.Tailnet.Tag}, ControlURL: c.Tailnet.ControlURL,
+		UserLogf: func(format string, args ...any) {
+			log.Info("tailnet", "message", redact.Text(fmt.Sprintf(format, args...), authKey, secrets.ClientSecret, secrets.AppSecret, secrets.APIToken))
+		},
+		Logf: func(format string, args ...any) {
+			log.Debug("tailnet", "message", redact.Text(fmt.Sprintf(format, args...), authKey, secrets.ClientSecret, secrets.AppSecret, secrets.APIToken))
+		},
+	}
 	if e = n.Server.Start(); e != nil {
 		return nil, e
 	}
@@ -97,7 +107,9 @@ func (n *Node) verify(s *ipnstate.Status) error {
 	}
 	return nil
 }
-func (n *Node) WhoIs(ctx context.Context, remote string) (identity.Peer, error) {
+func (n *Node) WhoIs(ctx context.Context, remote string) (peer identity.Peer, err error) {
+	started := time.Now()
+	defer func() { n.Metrics.Latency("whois", time.Since(started), err == nil) }()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	status, e := n.Client.StatusWithoutPeers(ctx)

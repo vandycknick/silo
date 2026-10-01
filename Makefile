@@ -124,9 +124,18 @@ go-sdk-example: ## Build the runtime and Go bridge, then run EXAMPLE (default: b
 	$(XTASK) go-sdk-example "$(EXAMPLE)" --profile "$(PROFILE)" $(RUNTIME_ARGS)
 
 ##@ Distribution
-.PHONY: archive app package assemble-go-sdk install
+.PHONY: archive runtime-archive portable-archive qualify-go-bridge app package assemble-go-sdk install
 archive: ## Build release runtime and CLI archives.
 	$(XTASK) archive $(RUNTIME_ARGS)
+
+runtime-archive: ## Archive an already-built PROFILE runtime stage with checksum, SBOM and provenance.
+	$(XTASK) runtime-archive --profile "$(PROFILE)"
+
+qualify-go-bridge: ## Hash an already-built native bridge into target-local package inputs.
+	$(XTASK) qualify-go-bridge --profile "$(PROFILE)"
+
+portable-archive: ## Archive an already-built release runtime, CLI and qualified native taild.
+	$(XTASK) portable-archive
 
 app: ## Build and sign the macOS release application.
 	$(XTASK) app $(APP_ARGS) $(RUNTIME_ARGS)
@@ -161,8 +170,8 @@ version-check: ## Verify product versions match the version authority.
 	$(XTASK) version-check
 
 # Internal targets
-.PHONY: cli silod silo-vmm netd agent portd init initramfs rprobe go-ffi kernel
-cli silod silo-vmm netd agent portd init initramfs rprobe go-ffi:
+.PHONY: cli silod silo-vmm netd agent portd init initramfs rprobe go-ffi taild kernel
+cli silod silo-vmm netd agent portd init initramfs rprobe go-ffi taild:
 	$(XTASK) component $@ --profile "$(PROFILE)"
 
 kernel:

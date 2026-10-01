@@ -51,7 +51,55 @@ pub fn configure_command(
     workspace_root: &Path,
     target_dir: &Path,
 ) -> Result<(), ReleaseError> {
-    if !profile_is_release || env::consts::OS != "macos" {
+    if !profile_is_release {
+        return Ok(());
+    }
+
+    if env::consts::OS == "linux" {
+        for (name, path) in [
+            ("CC", "/usr/bin/cc"),
+            ("CXX", "/usr/bin/c++"),
+            ("AR", "/usr/bin/ar"),
+            ("LD", "/usr/bin/ld"),
+            ("PKG_CONFIG", "/usr/bin/pkg-config"),
+        ] {
+            if !Path::new(path).is_file() {
+                return Err(ReleaseError::MissingTool { tool: path });
+            }
+            command.env(name, path);
+        }
+        let linker = if env::consts::ARCH == "aarch64" {
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"
+        } else {
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"
+        };
+        command.env(linker, "/usr/bin/cc");
+        let flags = if env::consts::ARCH == "aarch64" {
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS"
+        } else {
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"
+        };
+        command.env(flags, "-C link-arg=-B/usr/bin");
+        // GCC searches PATH for as/ld even with an absolute CC. Pin its
+        // subprogram prefix so CGO cannot pick Nix compiler wrappers there.
+        for name in ["CGO_CFLAGS", "CGO_CXXFLAGS", "CGO_LDFLAGS"] {
+            command.env(name, "-O2 -g -B/usr/bin");
+        }
+        for name in [
+            "NIX_CC",
+            "NIX_BINTOOLS",
+            "NIX_CFLAGS_COMPILE",
+            "NIX_CFLAGS_COMPILE_FOR_TARGET",
+            "NIX_CFLAGS_LINK",
+            "NIX_CFLAGS_LINK_FOR_TARGET",
+            "NIX_LDFLAGS",
+            "NIX_LDFLAGS_FOR_TARGET",
+        ] {
+            command.env_remove(name);
+        }
+        return Ok(());
+    }
+    if env::consts::OS != "macos" {
         return Ok(());
     }
 

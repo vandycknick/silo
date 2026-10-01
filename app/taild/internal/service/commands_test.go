@@ -51,6 +51,7 @@ func actualService(t *testing.T) *Service {
 	t.Cleanup(func() { _ = audit.Close() })
 	ctx, cancel := context.WithCancel(context.Background())
 	reg := jobs.New(ctx, 32)
+	reg.Metrics = r.Metrics
 	t.Cleanup(func() {
 		cancel()
 		drain, done := context.WithTimeout(context.Background(), 10*time.Second)

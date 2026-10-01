@@ -130,7 +130,7 @@ func authority(d *silo.MachineData) *authz.VM {
 	return &authz.VM{Owner: identity.Principal(d.Labels[runtime.OwnerLabel]), Instance: d.Labels[runtime.InstanceLabel]}
 }
 func (s *Service) machine(ctx context.Context, p identity.Peer, ref string, action identity.Action) (*silo.Machine, *silo.MachineData, error) {
-	m, e := s.Runtime.SDK.Machine(ctx, ref)
+	m, e := s.Runtime.Machine(ctx, ref)
 	if e != nil {
 		return nil, nil, Categorize(e)
 	}
@@ -144,7 +144,7 @@ func (s *Service) machine(ctx context.Context, p identity.Peer, ref string, acti
 		}
 	}
 	if e != nil {
-		_ = m.Close()
+		s.Runtime.CloseMachine(m)
 		return nil, nil, Categorize(e)
 	}
 	return m, d, nil
@@ -172,7 +172,7 @@ func (s *Service) Show(ctx context.Context, p identity.Peer, ref string) (VM, er
 	if e != nil {
 		return VM{}, e
 	}
-	defer m.Close()
+	defer s.Runtime.CloseMachine(m)
 	v := s.nodeView(ctx, d)
 	if s.Jobs != nil {
 		for _, op := range s.Jobs.List(p) {
@@ -334,6 +334,12 @@ func (s *Service) ownedCountLocked(ctx context.Context, owner identity.Principal
 func (s *Service) reserveCreate(ctx context.Context, p identity.Peer, q CreateRequest) (func(), error) {
 	s.createMu.Lock()
 	defer s.createMu.Unlock()
+	if s.ShutdownPending() {
+		return nil, failure("unavailable", "host is shutting down", 9)
+	}
+	if e := s.diskAdmissionLocked(q.Disk); e != nil {
+		return nil, e
+	}
 	l, e := s.Config.Limits()
 	if e != nil {
 		return nil, Categorize(e)
@@ -360,16 +366,27 @@ func (s *Service) reserveCreate(ctx context.Context, p identity.Peer, q CreateRe
 		s.pending = make(map[string]identity.Principal)
 	}
 	s.pending[q.Name] = q.Owner
+	if s.diskPending == nil {
+		s.diskPending = make(map[string]uint64)
+	}
+	s.diskPending[q.Name] = q.Disk
 	return func() {
 		s.createMu.Lock()
 		defer s.createMu.Unlock()
 		release()
 		delete(s.pending, q.Name)
+		delete(s.diskPending, q.Name)
 	}, nil
 }
 func (s *Service) materialize(ctx context.Context, p identity.Peer, q CreateRequest, opts []silo.MachineOption) (*silo.Machine, error) {
 	s.createMu.Lock()
 	defer s.createMu.Unlock()
+	if s.ShutdownPending() {
+		return nil, failure("unavailable", "host is shutting down", 9)
+	}
+	if e := s.diskAdmissionLocked(0); e != nil {
+		return nil, e
+	}
 	l, e := s.Config.Limits()
 	if e != nil {
 		return nil, Categorize(e)
@@ -381,7 +398,11 @@ func (s *Service) materialize(ctx context.Context, p identity.Peer, q CreateRequ
 	if count > min(l.VMs, p.Permissions.Limits.VMs) {
 		return nil, failure("limit", "VM count ceiling exceeded", 6)
 	}
-	return s.Runtime.SDK.CreateMachine(ctx, silo.OCIImage(q.Image), opts...)
+	m, err := s.Runtime.SDK.CreateMachine(ctx, silo.OCIImage(q.Image), opts...)
+	if err == nil {
+		s.Runtime.Metrics.Handle("machine", 1)
+	}
+	return m, err
 }
 func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.Operation, error) {
 	if e := s.Authorize(c.Peer, identity.Create, nil); e != nil {
@@ -483,7 +504,7 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 		if e != nil {
 			return Categorize(e)
 		}
-		defer m.Close()
+		defer s.Runtime.CloseMachine(m)
 		release()
 		release = nil
 		progress("VM persisted: " + m.ID())
@@ -547,7 +568,7 @@ func (s *Service) mutation(ctx context.Context, c Caller, ref, kind string, acti
 	if e != nil {
 		return jobs.Operation{}, e
 	}
-	_ = m.Close()
+	s.Runtime.CloseMachine(m)
 	return s.Jobs.Submit(kind, d.ID, identity.Principal(d.Labels[runtime.OwnerLabel]), func(ctx context.Context, progress func(string)) error {
 		p, e := c.Fresh(ctx)
 		if e != nil {
@@ -557,7 +578,7 @@ func (s *Service) mutation(ctx context.Context, c Caller, ref, kind string, acti
 		if e != nil {
 			return e
 		}
-		defer m.Close()
+		defer s.Runtime.CloseMachine(m)
 		progress(kind + " VM")
 		if e = run(ctx, p, m, d, progress); e != nil {
 			return Categorize(e)
@@ -608,6 +629,13 @@ func (s *Service) Restart(ctx context.Context, c Caller, ref string) (jobs.Opera
 		if e = s.enroll(ctx, c, identity.Restart, m, d, false, f); e != nil {
 			return e
 		}
+		p, e = c.Fresh(ctx)
+		if e != nil {
+			return e
+		}
+		if e = s.Authorize(p, identity.Restart, authority(d)); e != nil {
+			return e
+		}
 		if _, e = m.Start(ctx); e != nil {
 			return e
 		}
@@ -630,7 +658,7 @@ func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequ
 		if e != nil {
 			return jobs.Operation{}, e
 		}
-		_ = m.Close()
+		s.Runtime.CloseMachine(m)
 		if d.Status.Kind != silo.MachineStatusStopped && !q.Force {
 			return jobs.Operation{}, failure("conflict", "VM is running; use --force", 5)
 		}
@@ -661,18 +689,21 @@ func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequ
 			if e != nil {
 				return e
 			}
+			s.Runtime.Metrics.Handle("node_lease", 1)
 			var pins []state.NodePin
 			if s.Enrollment != nil {
 				pins = []state.NodePin{s.Enrollment.Pin}
 			}
 			if state.RecoverNode(d.Network.Tailscale.StateDir, d.Name, identity.Principal(d.Labels[runtime.OwnerLabel]), true, pins...) == state.Unreadable {
 				_ = lease.Close()
+				s.Runtime.Metrics.Handle("node_lease", -1)
 				f("device_retained: node state recovery required")
 				return failure("conflict", "retained node state requires recovery before removal", 5)
 			}
 			var nodeState state.NodeState
 			node, nodeState = state.ReadNode(d.Network.Tailscale.StateDir, d.Name, identity.Principal(d.Labels[runtime.OwnerLabel]), pins...)
 			_ = lease.Close()
+			s.Runtime.Metrics.Handle("node_lease", -1)
 			if nodeState == state.Unreadable {
 				f("device_retained: unknown (state unreadable)")
 				return failure("conflict", "unreadable node state retained; recover before removal", 5)
@@ -713,6 +744,7 @@ func (s *Service) Set(ctx context.Context, c Caller, ref string, q SetRequest) (
 			return failure("conflict", "set requires a stopped VM", 5)
 		}
 		v := project(d)
+		oldDisk := v.Disk
 		if q.CPUs != nil {
 			v.CPUs = *q.CPUs
 		}
@@ -727,6 +759,13 @@ func (s *Service) Set(ctx context.Context, c Caller, ref string, q SetRequest) (
 		}
 		if e := s.resources(p, uint64(v.CPUs), v.Memory, v.Disk); e != nil {
 			return e
+		}
+		if v.Disk > oldDisk {
+			release, e := s.reserveDiskGrowth(d.ID, v.Disk-oldDisk)
+			if e != nil {
+				return e
+			}
+			defer release()
 		}
 		u := silo.MachineUpdate{CPUs: q.CPUs, Memory: q.Memory, RootDiskSize: q.Disk}
 		if q.Name != nil && *q.Name != d.Name {

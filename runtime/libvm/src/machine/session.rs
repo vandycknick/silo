@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nix::sys::signal::Signal;
 use protocol::v1::execute_input::Message as ExecuteMessage;
 use protocol::v1::execution_event::Event as ExecutionWireEvent;
 use protocol::v1::{
@@ -29,6 +30,85 @@ const EXECUTION_REQUEST_QUEUE_CAPACITY: usize = 64;
 const EXECUTION_CHUNK_SIZE: usize = protocol::CHUNK_64_KIB;
 const SSH_HANDSHAKE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Explicit controls for an attachment whose embedding runtime owns host signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentSignal {
+    Hangup,
+    Interrupt,
+    Quit,
+    Terminate,
+    User1,
+    User2,
+    WindowChange,
+}
+
+impl AttachmentSignal {
+    /// Accepts only supported Linux guest signal numbers (WINCH requests resize).
+    pub fn from_linux(signal: u32) -> Option<Self> {
+        match signal {
+            1 => Some(Self::Hangup),
+            2 => Some(Self::Interrupt),
+            3 => Some(Self::Quit),
+            15 => Some(Self::Terminate),
+            10 => Some(Self::User1),
+            12 => Some(Self::User2),
+            28 => Some(Self::WindowChange),
+            _ => None,
+        }
+    }
+
+    fn host(self) -> Signal {
+        match self {
+            Self::Hangup => Signal::SIGHUP,
+            Self::Interrupt => Signal::SIGINT,
+            Self::Quit => Signal::SIGQUIT,
+            Self::Terminate => Signal::SIGTERM,
+            Self::User1 => Signal::SIGUSR1,
+            Self::User2 => Signal::SIGUSR2,
+            Self::WindowChange => Signal::SIGWINCH,
+        }
+    }
+}
+
+enum AttachmentSignals {
+    Host {
+        resize: tokio::signal::unix::Signal,
+        forwarders: HostSignalForwarders,
+    },
+    External(mpsc::Receiver<AttachmentSignal>),
+}
+
+impl AttachmentSignals {
+    fn new(
+        reference: &str,
+        external: Option<mpsc::Receiver<AttachmentSignal>>,
+        ssh: bool,
+    ) -> Result<Self, LibVmError> {
+        if let Some(receiver) = external {
+            return Ok(Self::External(receiver));
+        }
+        let resize = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            .map_err(|error| {
+                guest_session_error(reference, format!("listen for terminal resize: {error}"))
+            })?;
+        let forwarders = HostSignalForwarders::listen(
+            reference,
+            forwardable_signals().filter(|signal| !ssh || ssh_signal(*signal).is_some()),
+        )?;
+        Ok(Self::Host { resize, forwarders })
+    }
+
+    async fn recv(&mut self) -> Option<AttachmentSignal> {
+        match self {
+            Self::External(receiver) => receiver.recv().await,
+            Self::Host { resize, forwarders } => tokio::select! {
+                value = resize.recv() => value.map(|()| AttachmentSignal::WindowChange),
+                value = forwarders.recv() => value.and_then(guest_signal).and_then(AttachmentSignal::from_linux),
+            },
+        }
+    }
+}
 
 /// Options for one structured guest process execution.
 #[derive(Debug, Clone)]
@@ -814,12 +894,33 @@ impl Machine {
         program: impl Into<String>,
         configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
     ) -> Result<ExecutionResult, LibVmError> {
+        self.attach_with_signal_source(program.into(), configure, None)
+            .await
+    }
+
+    /// Attaches using embedding-owned signals, without installing host handlers.
+    pub async fn attach_with_signals(
+        &self,
+        program: impl Into<String>,
+        configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
+        signals: mpsc::Receiver<AttachmentSignal>,
+    ) -> Result<ExecutionResult, LibVmError> {
+        self.attach_with_signal_source(program.into(), configure, Some(signals))
+            .await
+    }
+
+    async fn attach_with_signal_source(
+        &self,
+        program: String,
+        configure: impl FnOnce(ExecutionOptionsBuilder) -> ExecutionOptionsBuilder,
+        signals: Option<mpsc::Receiver<AttachmentSignal>>,
+    ) -> Result<ExecutionResult, LibVmError> {
         let options = configure(ExecutionOptionsBuilder::default())
             .stdin_pipe()
             .tty(true)
             .build();
-        let mut session = self.start_execution(program.into(), options).await?;
-        attach_execution_stdio(&mut session).await
+        let mut session = self.start_execution(program, options).await?;
+        attach_execution_stdio(&mut session, signals).await
     }
 
     pub async fn attach_shell(&self) -> Result<SshExitStatus, LibVmError> {
@@ -830,7 +931,20 @@ impl Machine {
         configure: impl FnOnce(SshShellOptionsBuilder) -> SshShellOptionsBuilder,
     ) -> Result<SshExitStatus, LibVmError> {
         let options = configure(SshShellOptionsBuilder::default()).build();
-        self.attach_ssh_shell(options).await
+        self.attach_ssh_shell(options, None).await
+    }
+
+    /// Attaches an SSH shell using embedding-owned signals and resize notifications.
+    pub async fn attach_shell_with_signals(
+        &self,
+        configure: impl FnOnce(SshShellOptionsBuilder) -> SshShellOptionsBuilder,
+        signals: mpsc::Receiver<AttachmentSignal>,
+    ) -> Result<SshExitStatus, LibVmError> {
+        self.attach_ssh_shell(
+            configure(SshShellOptionsBuilder::default()).build(),
+            Some(signals),
+        )
+        .await
     }
 
     async fn start_execution(
@@ -916,6 +1030,7 @@ impl Machine {
     async fn attach_ssh_shell(
         &self,
         options: SshShellOptions,
+        signals: Option<mpsc::Receiver<AttachmentSignal>>,
     ) -> Result<SshExitStatus, LibVmError> {
         let reference = self.inspect().await?.name;
         let client = self
@@ -949,6 +1064,7 @@ impl Machine {
             channel,
             detach_sequence(options.detach_keys.as_deref())?,
             client,
+            signals,
         )
         .await
     }
@@ -1217,6 +1333,7 @@ pub(crate) fn lost_reason(value: Option<i32>) -> ExecutionLostReason {
 
 async fn attach_execution_stdio(
     session: &mut ExecutionSession,
+    external_signals: Option<mpsc::Receiver<AttachmentSignal>>,
 ) -> Result<ExecutionResult, LibVmError> {
     let mut _terminal = None;
     let mut host_stdin = crate::host_input::HostInput::stdin().map_err(|error| {
@@ -1227,17 +1344,7 @@ async fn attach_execution_stdio(
     let mut stdin_closed = false;
     let mut started = false;
     let mut launch_cancelled = false;
-    let mut resize_signal = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::window_change(),
-    )
-    .map_err(|error| {
-        guest_session_error(
-            &session.reference,
-            format!("listen for terminal resize: {error}"),
-        )
-    })?;
-    let mut resize_signal_open = true;
-    let mut signals = HostSignalForwarders::new(&session.reference)?;
+    let mut signals = AttachmentSignals::new(&session.reference, external_signals, false)?;
     loop {
         tokio::select! {
             read = host_stdin.read(), if started && !launch_cancelled && !stdin_closed => {
@@ -1251,22 +1358,20 @@ async fn attach_execution_stdio(
                     stdin.write(input).await?;
                 }
             }
-            resized = resize_signal.recv(), if started && !launch_cancelled && resize_signal_open => {
-                if resized.is_none() {
-                    resize_signal_open = false;
-                } else {
-                    let (columns, rows) = current_terminal_size();
-                    let rows = u16::try_from(rows).map_err(|_| guest_session_error(&session.reference, "terminal rows exceed 65535"))?;
-                    let columns = u16::try_from(columns).map_err(|_| guest_session_error(&session.reference, "terminal columns exceed 65535"))?;
-                    session.resize_pty(rows, columns).await?;
-                }
-            }
             signal = signals.recv() => {
                 let Some(signal) = signal else {
                     return Err(guest_session_error(&session.reference, "host signal listeners stopped"));
                 };
-                if started && !launch_cancelled {
-                    session.signal(signal).await?;
+                if signal == AttachmentSignal::WindowChange {
+                    if started && !launch_cancelled {
+                        let (columns, rows) = current_terminal_size();
+                        let rows = u16::try_from(rows).map_err(|_| guest_session_error(&session.reference, "terminal rows exceed 65535"))?;
+                        let columns = u16::try_from(columns).map_err(|_| guest_session_error(&session.reference, "terminal columns exceed 65535"))?;
+                        session.resize_pty(rows, columns).await?;
+                    }
+                } else if started && !launch_cancelled {
+                    let guest = guest_signal(signal.host()).ok_or_else(|| guest_session_error(&session.reference, "unsupported attachment signal"))?;
+                    session.signal(guest).await?;
                 } else if !launch_cancelled {
                     session.close_requests();
                     launch_cancelled = true;
@@ -1286,10 +1391,6 @@ async fn attach_execution_stdio(
                     let execution_stdin = session
                         .stdin()
                         .ok_or_else(|| guest_session_error(&session.reference, "execution stdin is closed"))?;
-                    let (columns, rows) = current_terminal_size();
-                    let rows = u16::try_from(rows).map_err(|_| guest_session_error(&session.reference, "terminal rows exceed 65535"))?;
-                    let columns = u16::try_from(columns).map_err(|_| guest_session_error(&session.reference, "terminal columns exceed 65535"))?;
-                    session.resize_pty(rows, columns).await?;
                     _terminal = Some(raw_terminal);
                     stdin = Some(execution_stdin);
                     started = true;
@@ -1302,22 +1403,26 @@ async fn attach_execution_stdio(
 }
 
 struct HostSignalForwarders {
-    receiver: mpsc::Receiver<u32>,
+    receiver: mpsc::Receiver<Signal>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl HostSignalForwarders {
-    fn new(reference: &str) -> Result<Self, LibVmError> {
+    fn listen(reference: &str, signals: impl Iterator<Item = Signal>) -> Result<Self, LibVmError> {
         let (sender, receiver) = mpsc::channel(64);
-        let mut tasks = Vec::new();
-        for signal in forwardable_signals() {
-            let Ok(mut listener) = tokio::signal::unix::signal(
+        let mut forwarders = Self {
+            receiver,
+            tasks: Vec::new(),
+        };
+        for signal in signals {
+            let mut listener = tokio::signal::unix::signal(
                 tokio::signal::unix::SignalKind::from_raw(signal as i32),
-            ) else {
-                continue;
-            };
+            )
+            .map_err(|error| {
+                guest_session_error(reference, format!("listen for host {signal}: {error}"))
+            })?;
             let sender = sender.clone();
-            tasks.push(tokio::spawn(async move {
+            forwarders.tasks.push(tokio::spawn(async move {
                 while listener.recv().await.is_some() {
                     if sender.send(signal).await.is_err() {
                         break;
@@ -1326,13 +1431,10 @@ impl HostSignalForwarders {
             }));
         }
         drop(sender);
-        if tasks.is_empty() {
-            return Err(guest_session_error(reference, "listen for host signals"));
-        }
-        Ok(Self { receiver, tasks })
+        Ok(forwarders)
     }
 
-    async fn recv(&mut self) -> Option<u32> {
+    async fn recv(&mut self) -> Option<Signal> {
         self.receiver.recv().await
     }
 }
@@ -1345,13 +1447,39 @@ impl Drop for HostSignalForwarders {
     }
 }
 
-fn forwardable_signals() -> impl Iterator<Item = u32> {
-    (1..=64).filter(|signal| {
-        !matches!(
-            *signal as i32,
-            libc::SIGKILL | libc::SIGSTOP | libc::SIGCHLD | libc::SIGWINCH
-        )
-    })
+fn forwardable_signals() -> impl Iterator<Item = Signal> {
+    [
+        Signal::SIGHUP,
+        Signal::SIGINT,
+        Signal::SIGQUIT,
+        Signal::SIGTERM,
+        Signal::SIGUSR1,
+        Signal::SIGUSR2,
+    ]
+    .into_iter()
+}
+
+// The guest is Linux even on macOS, whose USR1/USR2 numbers are different.
+fn guest_signal(signal: Signal) -> Option<u32> {
+    match signal {
+        Signal::SIGHUP => Some(1),
+        Signal::SIGINT => Some(2),
+        Signal::SIGQUIT => Some(3),
+        Signal::SIGTERM => Some(15),
+        Signal::SIGUSR1 => Some(10),
+        Signal::SIGUSR2 => Some(12),
+        _ => None,
+    }
+}
+
+fn ssh_signal(signal: Signal) -> Option<russh::Sig> {
+    match signal {
+        Signal::SIGHUP => Some(russh::Sig::HUP),
+        Signal::SIGINT => Some(russh::Sig::INT),
+        Signal::SIGQUIT => Some(russh::Sig::QUIT),
+        Signal::SIGTERM => Some(russh::Sig::TERM),
+        _ => None,
+    }
 }
 
 struct GuestSshClient {
@@ -1482,6 +1610,7 @@ async fn attach_ssh_stdio(
     channel: Channel<ClientMsg>,
     detach_keys: Vec<u8>,
     _client: GuestSshClient,
+    external_signals: Option<mpsc::Receiver<AttachmentSignal>>,
 ) -> Result<SshExitStatus, LibVmError> {
     let _terminal = RawTerminalGuard::new().map_err(|error| {
         guest_session_error(&reference, format!("enable raw terminal: {error}"))
@@ -1495,11 +1624,7 @@ async fn attach_ssh_stdio(
     let mut exit_code = None;
     let mut detached = false;
     let mut stdin_closed = false;
-    let mut resize_signal =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()).map_err(
-            |error| guest_session_error(&reference, format!("listen for terminal resize: {error}")),
-        )?;
-    let mut resize_signal_open = true;
+    let mut signals = AttachmentSignals::new(&reference, external_signals, true)?;
     loop {
         tokio::select! {
             read = stdin.read(), if !stdin_closed => {
@@ -1514,11 +1639,13 @@ async fn attach_ssh_stdio(
                     tx.data_bytes(input).await.map_err(|error| ssh_error(&reference, "write terminal input", error))?;
                 }
             }
-            resized = resize_signal.recv(), if resize_signal_open => {
-                if resized.is_none() {
-                    resize_signal_open = false;
-                } else {
+            signal = signals.recv() => {
+                let signal = signal.ok_or_else(|| guest_session_error(&reference, "host signal listeners stopped"))?;
+                if signal == AttachmentSignal::WindowChange {
                     resize_attached_pty(&reference, tx.as_ref()).await?;
+                } else {
+                    let signal = ssh_signal(signal.host()).ok_or_else(|| guest_session_error(&reference, "unsupported SSH host signal"))?;
+                    tx.signal(signal).await.map_err(|error| ssh_error(&reference, "forward host signal", error))?;
                 }
             }
             message = rx.wait() => match message {
@@ -1932,24 +2059,32 @@ mod tests {
     }
 
     #[test]
-    fn pty_signal_forwarding_excludes_only_unforwardable_signals() {
+    fn pty_signal_forwarding_is_explicit_and_maps_to_linux() {
         let signals = forwardable_signals().collect::<Vec<_>>();
-
-        for signal in 1..=64 {
-            let excluded = matches!(
-                signal,
-                value if value == libc::SIGKILL as u32
-                    || value == libc::SIGSTOP as u32
-                    || value == libc::SIGCHLD as u32
-                    || value == libc::SIGWINCH as u32
-            );
-            assert_eq!(signals.contains(&signal), !excluded, "signal {signal}");
-        }
+        assert_eq!(
+            signals,
+            [
+                Signal::SIGHUP,
+                Signal::SIGINT,
+                Signal::SIGQUIT,
+                Signal::SIGTERM,
+                Signal::SIGUSR1,
+                Signal::SIGUSR2
+            ]
+        );
+        assert_eq!(
+            signals
+                .into_iter()
+                .map(crate::machine::session::guest_signal)
+                .collect::<Vec<_>>(),
+            [Some(1), Some(2), Some(3), Some(15), Some(10), Some(12)]
+        );
     }
 
     #[tokio::test]
     async fn pty_signal_forwarder_receives_registered_host_signals() {
-        let mut forwarders = HostSignalForwarders::new("dev").expect("register host signals");
+        let mut forwarders = HostSignalForwarders::listen("dev", forwardable_signals())
+            .expect("register host signals");
 
         raise(Signal::SIGUSR1).expect("raise SIGUSR1");
         let signal = timeout(Duration::from_secs(1), forwarders.recv())
@@ -1957,7 +2092,127 @@ mod tests {
             .expect("receive SIGUSR1")
             .expect("signal relay is open");
 
-        assert_eq!(signal, libc::SIGUSR1 as u32);
+        assert_eq!(signal, Signal::SIGUSR1);
+    }
+
+    #[test]
+    fn attachment_signal_actions_are_onstack_in_isolated_child() {
+        const CHILD: &str = "SILO_SIGNAL_ACTION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "machine::session::tests::attachment_signal_actions_are_onstack_in_isolated_child", "--nocapture"])
+                .env(CHILD, "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        fn action(signal: Signal) -> libc::sigaction {
+            let mut action = unsafe { std::mem::zeroed() };
+            // nix::sigaction requires installing an action, and has no read-only query API.
+            assert_eq!(
+                unsafe { libc::sigaction(signal as i32, std::ptr::null(), &mut action) },
+                0
+            );
+            action
+        }
+        let untouched = [
+            Signal::SIGURG,
+            Signal::SIGPROF,
+            Signal::SIGPIPE,
+            Signal::SIGCHLD,
+            Signal::SIGSEGV,
+            Signal::SIGBUS,
+            Signal::SIGFPE,
+        ];
+        let before = untouched.map(action);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let snapshots = forwardable_signals()
+                .chain([Signal::SIGWINCH])
+                .map(|signal| (signal, action(signal)))
+                .collect::<Vec<_>>();
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            let mut external =
+                crate::machine::session::AttachmentSignals::new("isolated", Some(receiver), false)
+                    .unwrap();
+            sender
+                .send(crate::machine::session::AttachmentSignal::Interrupt)
+                .await
+                .unwrap();
+            assert_eq!(
+                external.recv().await,
+                Some(crate::machine::session::AttachmentSignal::Interrupt)
+            );
+            sender
+                .send(crate::machine::session::AttachmentSignal::WindowChange)
+                .await
+                .unwrap();
+            assert_eq!(
+                external.recv().await,
+                Some(crate::machine::session::AttachmentSignal::WindowChange)
+            );
+            drop(sender);
+            assert_eq!(external.recv().await, None);
+            drop(external);
+            for (signal, previous) in snapshots {
+                let current = action(signal);
+                assert_eq!(
+                    current.sa_sigaction, previous.sa_sigaction,
+                    "external source changed {signal}"
+                );
+                assert_eq!(
+                    current.sa_flags, previous.sa_flags,
+                    "external source changed {signal}"
+                );
+            }
+            for round in 0..3 {
+                for signal in forwardable_signals() {
+                    println!(
+                        "round={round} before {signal}: flags={:#x}",
+                        action(signal).sa_flags
+                    );
+                }
+                let mut forwarders =
+                    HostSignalForwarders::listen("isolated", forwardable_signals()).unwrap();
+                let resize =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                        .unwrap();
+                for signal in forwardable_signals().chain([Signal::SIGWINCH]) {
+                    let current = action(signal);
+                    println!(
+                        "round={round} registered {signal}: flags={:#x}",
+                        current.sa_flags
+                    );
+                    assert_ne!(current.sa_flags & libc::SA_ONSTACK, 0);
+                }
+                raise(Signal::SIGUSR1).unwrap();
+                assert_eq!(
+                    timeout(Duration::from_secs(1), forwarders.recv())
+                        .await
+                        .unwrap(),
+                    Some(Signal::SIGUSR1)
+                );
+                drop(forwarders);
+                drop(resize);
+                tokio::task::yield_now().await;
+                for signal in forwardable_signals().chain([Signal::SIGWINCH]) {
+                    let current = action(signal);
+                    println!(
+                        "round={round} dropped {signal}: flags={:#x}",
+                        current.sa_flags
+                    );
+                    assert_ne!(current.sa_flags & libc::SA_ONSTACK, 0);
+                }
+                for (signal, previous) in untouched.into_iter().zip(before) {
+                    let current = action(signal);
+                    assert_eq!(current.sa_sigaction, previous.sa_sigaction, "{signal}");
+                    assert_eq!(current.sa_flags, previous.sa_flags, "{signal}");
+                }
+            }
+        });
     }
 
     #[tokio::test]

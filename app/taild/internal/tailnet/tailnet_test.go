@@ -2,6 +2,7 @@ package tailnet
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -85,5 +86,23 @@ func TestUnregisteredRealTSNetLifecycle(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("tsnet.Close hung")
+	}
+}
+
+func TestCredentialHTTPOutageIsDistinctFromRejection(t *testing.T) {
+	for _, status := range []int{http.StatusServiceUnavailable, http.StatusTooManyRequests, http.StatusForbidden} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, "tskey-auth-private /etc/private")
+		}))
+		key, err := Mint(context.Background(), server.Client(), server.URL, "tskey-client-test", "tag:silo")
+		server.Close()
+		wantUnavailable := status != http.StatusForbidden
+		if key != "" || err == nil || errors.Is(err, ErrCredentialUnavailable) != wantUnavailable {
+			t.Fatal(status, key, err)
+		}
+		if err.Error() != "Tailscale credential service unavailable" && err.Error() != "Tailscale credential request rejected" {
+			t.Fatal("HTTP secret diagnostic escaped", err)
+		}
 	}
 }

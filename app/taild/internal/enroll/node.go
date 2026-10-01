@@ -16,6 +16,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/authz"
 	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
+	"github.com/vandycknick/silo/app/taild/internal/metrics"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/tailnet"
 	silo "github.com/vandycknick/silo/sdk/go"
@@ -26,6 +27,7 @@ import (
 )
 
 type Manager struct {
+	Metrics  *metrics.Metrics
 	Config   config.Config
 	Secrets  config.Secrets
 	Pin      state.NodePin
@@ -79,7 +81,9 @@ func approvalError(message string) error {
 func (m *Manager) Mode(owner identity.Principal, optOut bool) Mode {
 	return Select(owner, m.Config.Enrollment.Mode, m.Secrets.AppSecret, optOut)
 }
-func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.MachineData, owner identity.Principal, reauth bool, progress func(string), validate func(context.Context) error) error {
+func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.MachineData, owner identity.Principal, reauth bool, progress func(string), validate func(context.Context) error) (result error) {
+	started := time.Now()
+	defer func() { m.Metrics.Latency("enrollment", time.Since(started), result == nil) }()
 	if data.Network.Tailscale == nil {
 		return nil
 	}
@@ -87,7 +91,8 @@ func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.
 	if err != nil {
 		return &authz.Error{Code: "conflict", Message: "VM node state busy or VM running", Exit: 5}
 	}
-	defer lease.Close()
+	m.Metrics.Handle("node_lease", 1)
+	defer func() { _ = lease.Close(); m.Metrics.Handle("node_lease", -1) }()
 	dir := data.Network.Tailscale.StateDir
 	if state.RecoverNode(dir, data.Name, owner, true, m.Pin) == state.Unreadable {
 		return approvalError("state unreadable; recover retained state or clean up the stale device before retrying")
@@ -130,6 +135,9 @@ func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.
 	} else if mode == Tag {
 		token, err = tailnet.Mint(ctx, &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, "https://api.tailscale.com", m.Secrets.ClientSecret, string(owner))
 		if err != nil {
+			if errors.Is(err, tailnet.ErrCredentialUnavailable) {
+				return &authz.Error{Code: "unavailable", Message: "credential service unavailable; VM remains stopped and resumable", Exit: 9}
+			}
 			return approvalError("tag credential mint failed")
 		}
 	}
@@ -246,10 +254,16 @@ func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.
 		}
 	}
 	lastLink := ""
+	timeoutError := func() error {
+		if lastLink == "" {
+			return &authz.Error{Code: "unavailable", Message: "control plane unavailable; VM remains stopped and resumable", Exit: 9}
+		}
+		return approvalError("node approval timed out; VM remains stopped")
+	}
 	var status *ipnstate.Status
 	for {
 		if attempt.Err() != nil {
-			return approvalError("node approval timed out; VM remains stopped")
+			return timeoutError()
 		}
 		call, done := context.WithTimeout(attempt, 5*time.Second)
 		status, err = lc.StatusWithoutPeers(call)
@@ -268,7 +282,7 @@ func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.
 		}
 		select {
 		case <-attempt.Done():
-			return approvalError("node approval timed out; VM remains stopped")
+			return timeoutError()
 		case <-time.After(200 * time.Millisecond):
 		}
 	}

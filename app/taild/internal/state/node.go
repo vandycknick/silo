@@ -22,6 +22,7 @@ type NodeState string
 const (
 	Pending    NodeState = "pending approval"
 	Enrolled   NodeState = "enrolled"
+	Expired    NodeState = "expired"
 	Unreadable NodeState = "state unreadable"
 	NoNode     NodeState = "none"
 )

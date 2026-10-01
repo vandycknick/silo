@@ -87,7 +87,7 @@ func TestActualBridgeRejectsInvalidRuntime(t *testing.T) {
 	c := config.Defaults()
 	c.Home = t.TempDir()
 	c.RuntimeRoot = t.TempDir()
-	_, e := Open(context.Background(), c, "")
+	_, e := silo.Open(context.Background(), silo.WithHome(c.Home), silo.WithRuntimeRoot(c.RuntimeRoot))
 	if !silo.IsErrorKind(e, silo.ErrorRuntimeComponentInvalid) {
 		t.Fatalf("actual SDK runtime validation: %v", e)
 	}

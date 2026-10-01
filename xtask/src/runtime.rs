@@ -73,6 +73,8 @@ pub enum RuntimeError {
     },
     #[error("invalid runtime layout: {0}")]
     Invalid(String),
+    #[error(transparent)]
+    Archive(#[from] crate::archive::ArchiveError),
 }
 
 pub fn assemble_development(
@@ -174,6 +176,23 @@ pub fn stage(context: &BuildContext<'_>) -> Result<(), RuntimeError> {
                 )?;
             }
         }
+        create_directory(&temporary.join("LICENSES"))?;
+        let notices = temporary.join("THIRD_PARTY_NOTICES");
+        fs::write(&notices, release_notices(context.workspace_root)?).map_err(|source| {
+            RuntimeError::Metadata {
+                path: notices.clone(),
+                source,
+            }
+        })?;
+        set_mode(&notices, 0o644)?;
+        copy_regular_file(
+            &context
+                .workspace_root
+                .join("common/disk-image/LICENSE-APACHE"),
+            &temporary.join("LICENSES/APACHE-2.0.txt"),
+            0o644,
+        )?;
+        write_manifest(context, &temporary)?;
         validate_stage_against_adjacent(context, &temporary)?;
         replace_directory(&temporary, &stage)?;
         validate_stage_against_adjacent(context, &stage)
@@ -228,8 +247,18 @@ fn validate_assets(assets: &Path) -> Result<(), RuntimeError> {
 
 fn validate_stage(stage: &Path) -> Result<(), RuntimeError> {
     validate_directory(stage)?;
-    let expected_root = BTreeSet::from(["assets", "bin"]);
+    let expected_root = BTreeSet::from([
+        "assets",
+        "bin",
+        "runtime-manifest.json",
+        "THIRD_PARTY_NOTICES",
+        "LICENSES",
+    ]);
     validate_directory_entries(stage, &expected_root)?;
+    validate_regular_file(&stage.join("runtime-manifest.json"), false, Some(0o644))?;
+    validate_regular_file(&stage.join("THIRD_PARTY_NOTICES"), false, Some(0o644))?;
+    validate_directory_entries(&stage.join("LICENSES"), &BTreeSet::from(["APACHE-2.0.txt"]))?;
+    validate_regular_file(&stage.join("LICENSES/APACHE-2.0.txt"), false, Some(0o644))?;
     let bin = stage.join("bin");
     let assets = stage.join("assets");
     validate_directory_entries(&bin, &BTreeSet::from(["netd", "silo-vmm"]))?;
@@ -278,6 +307,33 @@ pub fn validate_stage_against_adjacent(
     stage: &Path,
 ) -> Result<(), RuntimeError> {
     validate_stage(stage)?;
+    let notices_path = stage.join("THIRD_PARTY_NOTICES");
+    let notices = fs::read(&notices_path).map_err(|source| RuntimeError::Metadata {
+        path: notices_path,
+        source,
+    })?;
+    if notices != release_notices(context.workspace_root)? {
+        return Err(RuntimeError::Invalid(
+            "runtime notices do not match current locked sources".into(),
+        ));
+    }
+    compare_regular_files(
+        &context
+            .workspace_root
+            .join("common/disk-image/LICENSE-APACHE"),
+        &stage.join("LICENSES/APACHE-2.0.txt"),
+        0o644,
+    )?;
+    let manifest =
+        fs::read(stage.join("runtime-manifest.json")).map_err(|source| RuntimeError::Metadata {
+            path: stage.join("runtime-manifest.json"),
+            source,
+        })?;
+    if manifest != manifest_bytes(context, stage)? {
+        return Err(RuntimeError::Invalid(
+            "runtime manifest differs from current version, target or component digests".into(),
+        ));
+    }
     let profile = context.target_dir.join(context.profile.directory());
     for (name, mode) in HELPERS {
         compare_regular_files(&profile.join(name), &stage.join("bin").join(name), mode)?;
@@ -299,6 +355,109 @@ pub fn validate_stage_against_adjacent(
         }
     }
     Ok(())
+}
+
+fn release_notices(workspace: &Path) -> Result<Vec<u8>, RuntimeError> {
+    let read = |name: &str| {
+        fs::read_to_string(workspace.join(name)).map_err(|source| RuntimeError::Metadata {
+            path: workspace.join(name),
+            source,
+        })
+    };
+    let lock = read("Cargo.lock")?;
+    let revisions: BTreeSet<_> = lock
+        .lines()
+        .filter(|line| {
+            line.starts_with("source = \"git+https://github.com/vandycknick/libkrun.git?")
+        })
+        .filter_map(|line| {
+            line.rsplit_once('#')
+                .map(|(_, revision)| revision.trim_end_matches('"'))
+        })
+        .collect();
+    let revision = revisions
+        .iter()
+        .next()
+        .filter(|revision| {
+            revisions.len() == 1
+                && revision.len() == 40
+                && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| {
+            RuntimeError::Invalid("Cargo.lock must pin one exact libkrun revision".into())
+        })?;
+    let template = read("packaging/release/THIRD_PARTY_NOTICES")?;
+    let mut lines: Vec<_> = template.lines().map(str::to_owned).collect();
+    let marker = lines
+        .iter()
+        .position(|line| {
+            line == "Silo builds libkrun from the source revision pinned in Cargo.lock:"
+        })
+        .ok_or_else(|| {
+            RuntimeError::Invalid("libkrun notice template lacks revision marker".into())
+        })?;
+    let pin = lines
+        .get_mut(marker + 1)
+        .ok_or_else(|| RuntimeError::Invalid("libkrun notice template lacks revision".into()))?;
+    *pin = format!("{revision}.");
+    let mut notices = lines.join("\n") + "\n";
+    if workspace
+        .join("vendor/signal-hook-registry/LICENSE-APACHE")
+        .is_file()
+    {
+        notices.push_str("\nsignal-hook-registry\nCopyright (c) 2017 tokio-jsonrpc developers\nhttps://github.com/vorner/signal-hook\nSilo includes its vendored signal-interoperability patch. The original is licensed\nunder Apache-2.0 OR MIT; this binary distribution selects Apache-2.0.\nThe complete text is distributed at LICENSES/APACHE-2.0.txt.\n");
+    }
+    Ok(notices.into_bytes())
+}
+
+fn manifest_bytes(context: &BuildContext<'_>, stage: &Path) -> Result<Vec<u8>, RuntimeError> {
+    let version = fs::read_to_string(context.workspace_root.join("VERSION")).map_err(|source| {
+        RuntimeError::Metadata {
+            path: context.workspace_root.join("VERSION"),
+            source,
+        }
+    })?;
+    if !crate::version::is_semver(version.trim()) {
+        return Err(RuntimeError::Invalid(
+            "VERSION must contain exactly three numeric components".into(),
+        ));
+    }
+    let mut files = std::collections::BTreeMap::new();
+    for directory in ["bin", "assets"] {
+        let path = stage.join(directory);
+        for entry in fs::read_dir(&path).map_err(|source| RuntimeError::Metadata {
+            path: path.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| RuntimeError::Metadata {
+                path: path.clone(),
+                source,
+            })?;
+            validate_regular_file(&entry.path(), false, None)?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| RuntimeError::Invalid("non UTF-8 component name".into()))?;
+            files.insert(
+                format!("{directory}/{name}"),
+                crate::archive::sha256(&entry.path())?,
+            );
+        }
+    }
+    for name in ["THIRD_PARTY_NOTICES", "LICENSES/APACHE-2.0.txt"] {
+        validate_regular_file(&stage.join(name), false, None)?;
+        files.insert(name.into(), crate::archive::sha256(&stage.join(name))?);
+    }
+    serde_json::to_vec_pretty(&serde_json::json!({"version": version.trim(), "target": context.host.runtime_target(), "files": files})).map_err(|error| RuntimeError::Invalid(error.to_string()))
+}
+
+fn write_manifest(context: &BuildContext<'_>, stage: &Path) -> Result<(), RuntimeError> {
+    let path = stage.join("runtime-manifest.json");
+    fs::write(&path, manifest_bytes(context, stage)?).map_err(|source| RuntimeError::Metadata {
+        path: path.clone(),
+        source,
+    })?;
+    set_mode(&path, 0o644)
 }
 
 fn copy_optional_rprobe_assets(source: &Path, destination: &Path) -> Result<(), RuntimeError> {
@@ -604,6 +763,62 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), RuntimeError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notices_use_locked_revision_instead_of_stale_template_pin() {
+        let root = std::env::temp_dir().join(format!("silo-notices-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("packaging/release")).unwrap();
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::write(root.join("Cargo.lock"), format!("source = \"git+https://github.com/vandycknick/libkrun.git?rev={revision}#{revision}\"\n")).unwrap();
+        std::fs::write(
+            root.join("packaging/release/THIRD_PARTY_NOTICES"),
+            "Silo builds libkrun from the source revision pinned in Cargo.lock:\nstale.\n",
+        )
+        .unwrap();
+        let notices = String::from_utf8(crate::runtime::release_notices(&root).unwrap()).unwrap();
+        assert!(notices.contains(revision));
+        assert!(!notices.contains("stale"));
+        std::fs::write(root.join("Cargo.lock"), "").unwrap();
+        assert!(crate::runtime::release_notices(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn manifest_hashes_current_components_and_rejects_symlinks() {
+        use crate::components::BuildContext;
+        use crate::profiles::Profile;
+        use crate::targets::HostTarget;
+        let root = std::env::temp_dir().join(format!("silo-manifest-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("VERSION"), "0.1.0\n").unwrap();
+        std::fs::create_dir(root.join("bin")).unwrap();
+        std::fs::create_dir(root.join("assets")).unwrap();
+        std::fs::create_dir(root.join("LICENSES")).unwrap();
+        std::fs::write(root.join("THIRD_PARTY_NOTICES"), b"notices").unwrap();
+        std::fs::write(root.join("LICENSES/APACHE-2.0.txt"), b"license").unwrap();
+        std::fs::write(root.join("bin/netd"), b"actual netd").unwrap();
+        std::fs::write(root.join("assets/agent"), b"actual agent").unwrap();
+        let context = BuildContext {
+            workspace_root: &root,
+            target_dir: &root,
+            profile: Profile::Debug,
+            host: HostTarget::LinuxX86_64,
+        };
+        let first = crate::runtime::manifest_bytes(&context, &root).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(manifest["target"], "linux-amd64-gnu");
+        assert_eq!(manifest["version"], "0.1.0");
+        assert_eq!(
+            manifest["files"]["assets/agent"],
+            crate::archive::sha256(&root.join("assets/agent")).unwrap()
+        );
+        std::fs::write(root.join("assets/agent"), b"new agent").unwrap();
+        assert_ne!(
+            first,
+            crate::runtime::manifest_bytes(&context, &root).unwrap()
+        );
+        std::os::unix::fs::symlink("../VERSION", root.join("assets/escape")).unwrap();
+        assert!(crate::runtime::manifest_bytes(&context, &root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn runtime_layout_requires_vmm_and_netd_only() {
         assert_eq!(

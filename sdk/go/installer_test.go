@@ -6,12 +6,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
@@ -215,6 +217,32 @@ func TestInstallRuntimeRejectsUnsafeArchives(t *testing.T) {
 		{name: "missing file", change: func(_ string, entries []testArchiveEntry) []testArchiveEntry {
 			return entries[:len(entries)-1]
 		}},
+		{name: "missing manifest", change: func(root string, entries []testArchiveEntry) []testArchiveEntry {
+			for index, entry := range entries {
+				if entry.name == root+"/runtime-manifest.json" {
+					return append(entries[:index], entries[index+1:]...)
+				}
+			}
+			return entries
+		}},
+		{name: "duplicate manifest", change: func(root string, entries []testArchiveEntry) []testArchiveEntry {
+			for _, entry := range entries {
+				if entry.name == root+"/runtime-manifest.json" {
+					return append(entries, entry)
+				}
+			}
+			return entries
+		}},
+		{name: "symlink manifest", change: func(root string, entries []testArchiveEntry) []testArchiveEntry {
+			for index := range entries {
+				if entries[index].name == root+"/runtime-manifest.json" {
+					entries[index].typeflag = tar.TypeSymlink
+					entries[index].body = nil
+					entries[index].linkname = "THIRD_PARTY_NOTICES"
+				}
+			}
+			return entries
+		}},
 	}
 
 	for _, test := range cases {
@@ -317,6 +345,23 @@ func createRuntimeArchive(t *testing.T, change func(string, []testArchiveEntry) 
 			name: root + "/" + relative, mode: int64(mode), typeflag: tar.TypeReg, body: []byte(relative),
 		})
 	}
+	manifest := runtimeManifest{Version: Version, Target: metadata.target, Files: make(map[string]string)}
+	for _, entry := range entries {
+		relative := strings.TrimPrefix(entry.name, root+"/")
+		if relative != "runtime-manifest.json" {
+			digest := sha256.Sum256(entry.body)
+			manifest.Files[relative] = hex.EncodeToString(digest[:])
+		}
+	}
+	body, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range entries {
+		if entries[index].name == root+"/runtime-manifest.json" {
+			entries[index].body = body
+		}
+	}
 	if change != nil {
 		entries = change(root, entries)
 	}
@@ -374,7 +419,7 @@ func TestValidateRuntimeInstallationRejectsSymlink(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(root, "bin", "silo-vmm")); err != nil {
 		t.Fatal(err)
 	}
-	valid, err := validateRuntimeInstallation(root)
+	valid, err := validateRuntimeInstallation(root, RuntimeTargetLinuxAMD64GNU)
 	if err != nil {
 		t.Fatalf("validateRuntimeInstallation() failed: %v", err)
 	}
@@ -421,5 +466,57 @@ func TestInstallLockHonorsContext(t *testing.T) {
 	_, err = acquireInstallLock(ctx, path)
 	if !IsErrorKind(err, ErrorCancelled) && !errors.Is(err, context.Canceled) {
 		t.Fatalf("second lock error = %v, want cancellation", err)
+	}
+}
+
+func TestInstalledRuntimeVerifiesManifestAndActualBytes(t *testing.T) {
+	for _, mutation := range []string{"version", "target", "hash", "escape", "legal bytes", "manifest bytes"} {
+		t.Run(mutation, func(t *testing.T) {
+			metadata, archive := createRuntimeArchive(t, nil)
+			installed, err := installRuntime(context.Background(), metadata.target, installConfig{installRoot: t.TempDir(), archivePath: archive, metadata: metadata})
+			if err != nil {
+				t.Fatal(err)
+			}
+			file := filepath.Join(installed.Root, "runtime-manifest.json")
+			if mutation == "legal bytes" {
+				if err = os.WriteFile(filepath.Join(installed.Root, "THIRD_PARTY_NOTICES"), []byte("tampered"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			} else if mutation == "manifest bytes" {
+				if err = os.WriteFile(file, []byte("invalid JSON"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				body, err := os.ReadFile(file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var m runtimeManifest
+				if err = json.Unmarshal(body, &m); err != nil {
+					t.Fatal(err)
+				}
+				switch mutation {
+				case "version":
+					m.Version = "999.0.0"
+				case "target":
+					m.Target = RuntimeTargetLinuxARM64GNU
+				case "hash":
+					m.Files["assets/agent"] = strings.Repeat("0", 64)
+				case "escape":
+					m.Files["../escape"] = strings.Repeat("0", 64)
+				}
+				body, err = json.Marshal(m)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = os.WriteFile(file, body, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			valid, err := validateRuntimeInstallation(installed.Root, metadata.target)
+			if err != nil || valid {
+				t.Fatalf("tampered installation accepted: %v %v", valid, err)
+			}
+		})
 	}
 }

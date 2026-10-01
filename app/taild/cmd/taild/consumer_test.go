@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
+	silo "github.com/vandycknick/silo/sdk/go"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -86,6 +87,16 @@ func main(){ctx:=context.Background();_,e:=silo.Open(ctx,silo.WithHome(os.Args[1
 	output, e = run(module, binary, "--check", "--config", configPath)
 	if e != nil || !strings.Contains(output, "configuration and runtime ready") {
 		t.Fatalf("prepared-home check: %v %s", e, output)
+	}
+	for _, command := range []string{"version", "--version"} {
+		output, e = run(module, binary, command, "--config", configPath)
+		if e != nil || !strings.Contains(output, "runtime "+silo.Version) || !strings.Contains(output, fmt.Sprintf("ABI expected %d verified %d", silo.NativeABIVersion, silo.NativeABIVersion)) {
+			t.Fatalf("actual installed version: %v %s", e, output)
+		}
+	}
+	output, e = run(module, binary, "install-runtime", "--config", configPath, "--runtime-archive", filepath.Join(home, "missing-archive"), "--install-root", filepath.Join(home, "offline-store"))
+	if e == nil || !strings.Contains(output, "offline SDK runtime installation failed") {
+		t.Fatalf("explicit offline installer: %v %s", e, output)
 	}
 	if _, e = os.Stat(filepath.Join(home, "taild", "tsnet")); !os.IsNotExist(e) {
 		t.Fatal("--check initialized a tailnet node")

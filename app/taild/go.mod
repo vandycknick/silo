@@ -5,6 +5,7 @@ go 1.26.6
 toolchain go1.26.8
 
 require (
+	github.com/godbus/dbus/v5 v5.2.2
 	github.com/vandycknick/silo/sdk/go v0.0.0
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/crypto v0.57.0
@@ -26,7 +27,6 @@ require (
 	github.com/gaissmai/bart v0.26.1 // indirect
 	github.com/go-json-experiment/json v0.0.0-20260214004413-d219187c3433 // indirect
 	github.com/go4org/plan9netshell v0.0.0-20250324183649-788daa080737 // indirect
-	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
