@@ -6,6 +6,7 @@ use crate::buffer::SiloBuffer;
 use crate::error::{catch_ffi, error_from_libvm, invalid_argument, SiloError};
 use crate::handles::RuntimeHandle;
 use crate::runtime::request_bytes;
+use crate::timestamps::{optional_unix_ms, unix_ms};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,20 +57,30 @@ pub unsafe extern "C" fn silo_images_call(
                             }
                             None => images.pull(reference).await,
                         };
-                        result.map(image_handle)
+                        result.and_then(image_handle)
                     }
-                    "get" => images
-                        .get(reference(&request)?)
-                        .await
-                        .map(|value| value.map(image_handle).unwrap_or(Value::Null)),
-                    "list" => images
-                        .list()
-                        .await
-                        .map(|values| Value::Array(values.into_iter().map(image_handle).collect())),
+                    "get" => images.get(reference(&request)?).await.and_then(|value| {
+                        value
+                            .map(image_handle)
+                            .transpose()
+                            .map(|value| value.unwrap_or(Value::Null))
+                    }),
+                    "list" => images.list().await.and_then(|values| {
+                        values
+                            .into_iter()
+                            .map(image_handle)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(Value::Array)
+                    }),
                     "inspect" => images
                         .inspect(reference(&request)?)
                         .await
-                        .map(|value| value.map(image_detail).unwrap_or(Value::Null)),
+                        .and_then(|value| {
+                            value
+                                .map(image_detail)
+                                .transpose()
+                                .map(|value| value.unwrap_or(Value::Null))
+                        }),
                     "remove" => images
                         .remove_with(
                             reference(&request)?,
@@ -124,8 +135,8 @@ fn policy(value: &str) -> Result<ImagePullPolicy, libvm::LibVmError> {
     }
 }
 
-fn image_handle(value: ImageHandle) -> Value {
-    json!({
+fn image_handle(value: ImageHandle) -> Result<Value, libvm::LibVmError> {
+    Ok(json!({
         "requested_reference": value.requested_reference,
         "selected_reference": value.selected_reference,
         "selected_manifest_digest": value.selected_manifest_digest,
@@ -137,15 +148,15 @@ fn image_handle(value: ImageHandle) -> Value {
             "variant": value.platform_variant,
         },
         "size_bytes": value.size_bytes,
-        "created_at_unix_ms": value.created_at,
-        "updated_at_unix_ms": value.updated_at,
-        "last_used_at_unix_ms": value.last_used_at,
-    })
+        "created_at_unix_ms": unix_ms(value.created_at, "image.created_at")?,
+        "updated_at_unix_ms": unix_ms(value.updated_at, "image.updated_at")?,
+        "last_used_at_unix_ms": optional_unix_ms(value.last_used_at, "image.last_used_at")?,
+    }))
 }
 
-fn image_detail(value: ImageDetail) -> Value {
-    json!({
-        "handle": image_handle(value.handle),
+fn image_detail(value: ImageDetail) -> Result<Value, libvm::LibVmError> {
+    Ok(json!({
+        "handle": image_handle(value.handle)?,
         "config": {
             "entrypoint": value.config.entrypoint,
             "command": value.config.cmd,
@@ -163,5 +174,5 @@ fn image_detail(value: ImageDetail) -> Value {
             "uncompressed_size_bytes": layer.uncompressed_size_bytes,
             "position": layer.position,
         })).collect::<Vec<_>>(),
-    })
+    }))
 }

@@ -1,20 +1,21 @@
+use crate::timestamps::{optional_unix_ms, unix_ms};
 use libvm::{
     MachineAgent, MachineBootReport, MachineData, MachineNetworkConfig, MachineProvisionReport,
     MachineProvisionStepReport, MachineRootfs, MachineStatus,
 };
 use serde_json::{json, Value};
 
-pub fn machine_data(data: MachineData) -> Value {
+pub fn machine_data(data: MachineData) -> Result<Value, libvm::LibVmError> {
     let mut network = machine_network(data.network);
     if let Some(tailscale) = data.tailscale {
         network["tailscale"] = json!({"state_dir": tailscale.state_dir, "hostname": tailscale.hostname, "ephemeral": tailscale.ephemeral});
     }
-    json!({
+    Ok(json!({
         "id": data.id,
         "name": data.name,
         "machine_dir": data.machine_dir.display().to_string(),
-        "created_at_unix_ms": data.created_at,
-        "modified_at_unix_ms": data.modified_at,
+        "created_at_unix_ms": unix_ms(data.created_at, "machine.created_at")?,
+        "modified_at_unix_ms": unix_ms(data.modified_at, "machine.modified_at")?,
         "image_ref": data.image_ref,
         "retention": match data.retention {
             libvm::MachineRetention::Persistent => "persistent",
@@ -29,7 +30,7 @@ pub fn machine_data(data: MachineData) -> Value {
         },
         "template_name": data.template_name,
         "agent_mode": data.agent_mode.map(machine_agent),
-        "rootfs": data.rootfs.map(machine_rootfs),
+        "rootfs": data.rootfs.map(machine_rootfs).transpose()?,
         "root_disk_size_bytes": data.root_disk_size,
         "labels": data.labels,
         "metadata": data.metadata,
@@ -46,10 +47,10 @@ pub fn machine_data(data: MachineData) -> Value {
         "run_id": data.run_id.map(|id| id.to_string()),
         "boot_report": data.boot_report.map(boot_report),
         "provision_report": data.provision_report.map(provision_report),
-        "started_at_unix_ms": data.started_at,
+        "started_at_unix_ms": optional_unix_ms(data.started_at, "machine.started_at")?,
         "last_error": data.last_error,
-        "updated_at_unix_ms": data.updated_at,
-    })
+        "updated_at_unix_ms": unix_ms(data.updated_at, "machine.updated_at")?,
+    }))
 }
 
 fn machine_agent(agent: MachineAgent) -> Value {
@@ -63,8 +64,8 @@ fn machine_agent(agent: MachineAgent) -> Value {
     }
 }
 
-fn machine_rootfs(rootfs: MachineRootfs) -> Value {
-    json!({
+fn machine_rootfs(rootfs: MachineRootfs) -> Result<Value, libvm::LibVmError> {
+    Ok(json!({
         "source_kind": match rootfs.source_kind {
             libvm::ImageSourceKind::Oci => "oci",
             libvm::ImageSourceKind::Disk => "disk",
@@ -76,8 +77,8 @@ fn machine_rootfs(rootfs: MachineRootfs) -> Value {
         "image_id": rootfs.image_id,
         "root_disk_path": rootfs.root_disk_path.display().to_string(),
         "root_disk_size_bytes": rootfs.root_disk_size_bytes,
-        "created_at_unix_ms": rootfs.created_at,
-    })
+        "created_at_unix_ms": unix_ms(rootfs.created_at, "machine.rootfs.created_at")?,
+    }))
 }
 
 fn machine_network(network: MachineNetworkConfig) -> Value {
@@ -148,4 +149,24 @@ fn provision_step(report: MachineProvisionStepReport) -> Value {
         "message": report.message,
         "error_chain": report.error_chain,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::dto::provision_report;
+
+    #[test]
+    fn provisioning_timestamps_are_already_milliseconds() {
+        let value = provision_report(libvm::MachineProvisionReport {
+            status: libvm::MachineProvisionStatus::Succeeded,
+            started_unix_ms: 1_790_944_496_123,
+            finished_unix_ms: 1_790_944_496_789,
+            duration_ms: 666,
+            steps: vec![],
+            message: None,
+        });
+        assert_eq!(value["started_at_unix_ms"], 1_790_944_496_123_i64);
+        assert_eq!(value["finished_at_unix_ms"], 1_790_944_496_789_i64);
+        assert_eq!(value["duration_ms"], 666);
+    }
 }
