@@ -123,7 +123,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	observerDone := make(chan int, 1)
 	var observerOut, observerErr lockedBuffer
 	go func() {
-		observerDone <- sshd.DispatchSession(observer, s, one, "create native-one", service.IO{Stdout: &observerOut, Stderr: &observerErr})
+		observerDone <- sshd.DispatchSession(observer, s, one, "create native-one --provision-user silo:1000:1000:/home/silo", service.IO{Stdout: &observerOut, Stderr: &observerErr})
 	}()
 	select {
 	case <-entered:
@@ -182,7 +182,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 		t.Fatal("positive-user isolation failed", e)
 	}
 	var out, errout bytes.Buffer
-	code, e := s.Exec(ctx, one, "native-one", service.ExecRequest{Program: "/bin/bash", Args: []string{"-c", `printf 'env=%s uid=' "$SILO_NATIVE_ENV"; id -u; printf 'guest-stderr' >&2; printf 'cwd=%s\n' "$PWD"`}, Env: map[string]string{"SILO_NATIVE_ENV": "guest-only"}, Directory: c.VM.GuestUser.Home}, service.IO{Stdout: &out, Stderr: &errout})
+	code, e := s.Exec(ctx, one, "native-one", service.ExecRequest{Program: "/bin/bash", Args: []string{"-c", `printf 'env=%s uid=' "$SILO_NATIVE_ENV"; id -u; printf 'guest-stderr' >&2; printf 'cwd=%s\n' "$PWD"`}, Env: map[string]string{"SILO_NATIVE_ENV": "guest-only"}, Directory: "/home/silo"}, service.IO{Stdout: &out, Stderr: &errout})
 	if e != nil || code != 0 || !strings.Contains(out.String(), "env=guest-only uid=1000") || !strings.Contains(out.String(), "cwd=/home/silo") || errout.String() != "guest-stderr" {
 		t.Fatalf("exec code %d err %v stdout %q stderr %q", code, e, out.String(), errout.String())
 	}

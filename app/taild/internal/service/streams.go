@@ -34,7 +34,9 @@ type IO struct {
 	Stdin          io.Reader
 	Input          func(context.Context) io.Reader
 	Stdout, Stderr io.Writer
-	Terminal       Terminal
+	// Human is daemon-owned diagnostics and prompts, never guest output or JSON.
+	Human    io.Writer
+	Terminal Terminal
 }
 
 type contextualWriter interface {
@@ -86,8 +88,7 @@ func (s *Service) Shell(ctx context.Context, c Caller, ref, user string, streams
 	if !streams.Terminal.Present {
 		return 2, failure("usage", "shell requires a PTY; use ssh -t", 2)
 	}
-	// Managed guest provisioning selects /bin/bash for the configured account.
-	return s.execute(ctx, c, ref, identity.Shell, ExecRequest{User: user, TTY: true, Program: "/bin/bash", Args: []string{"-l"}}, streams)
+	return s.execute(ctx, c, ref, identity.Shell, ExecRequest{User: user, TTY: true, Program: "/bin/sh", Args: []string{"-l"}}, streams)
 }
 func (s *Service) Exec(ctx context.Context, c Caller, ref string, q ExecRequest, streams IO) (int, error) {
 	return s.execute(ctx, c, ref, identity.Exec, q, streams)
@@ -139,12 +140,24 @@ func (s *Service) execute(parent context.Context, c Caller, ref string, action i
 		if d.GuestUser != nil {
 			q.User = d.GuestUser.Name
 		} else {
-			q.User = s.Config.VM.GuestUser.Name
+			q.User = "root"
 		}
 	}
-	if action == identity.Shell && d.GuestUser != nil && q.User == d.GuestUser.Name {
-		q.Directory = d.GuestUser.Home
-		q.Env = map[string]string{"HOME": d.GuestUser.Home, "USER": q.User, "LOGNAME": q.User, "SHELL": "/bin/bash"}
+	account, e := guestIdentity(ctx, m, q.User, d.GuestUser)
+	if e != nil {
+		return Categorize(e).Exit, Categorize(e)
+	}
+	env := map[string]string{}
+	if account.name != "" {
+		env = map[string]string{"HOME": account.home, "USER": account.name, "LOGNAME": account.name, "SHELL": account.shell}
+	}
+	maps.Copy(env, q.Env)
+	q.Env = env
+	if q.Directory == "" {
+		q.Directory = account.home
+	}
+	if action == identity.Shell {
+		q.Program = account.shell
 	}
 	opts := []silo.ExecOption{silo.WithExecUser(q.User), silo.WithExecTTY(q.TTY), silo.WithExecWorkingDirectory(q.Directory), silo.WithExecEnv(maps.Clone(q.Env)), silo.WithExecStdinPipe()}
 	if q.TTY {

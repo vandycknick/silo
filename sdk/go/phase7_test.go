@@ -123,7 +123,7 @@ func TestPhase7NativePolicyAndStoppedMachineContracts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if data.GuestUser == nil || data.GuestUser.Name != "silo" || data.GuestUser.UID != 1000 || data.GuestUser.GID != 1000 || data.GuestUser.Home != "/home/silo" {
+	if data.GuestUser != nil {
 		t.Fatalf("guest defaults: %#v", data.GuestUser)
 	}
 	if data.CPUs == nil || data.Memory == nil {

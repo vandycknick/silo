@@ -24,7 +24,7 @@ This inventory is completed alongside implementation. A checked item has a publi
 | stop options | `Machine.StopWith` | `silo_machine_stop_with` | same-run Rust escalation and native KVM | implemented |
 | guest provisioning readiness | `Machine.WaitReady` | polling `silo_machine_inspect` | terminal errors and native KVM | implemented |
 | generic launch generation | `MachineData.RunID` / fenced `WaitReady` | `VmMonitorService` protobuf `run_id` + inspect DTO | preserved readers, expected machine/run fencing and real native gRPC/KVM | implemented |
-| guest account provisioning | `WithGuestUser` / `MachineData.GuestUser` | create/update/inspect DTO | temp-home defaults and actual guest uid/gid | implemented |
+| explicit guest account provisioning | `WithGuestUser`, `ParseGuestUser` / `MachineData.GuestUser` | create/update/inspect DTO | absent account/root default, explicit account persistence and real guest uid/gid | implemented |
 | PTY size / TERM | `WithExecInitialPTYSize` / `WithExecTerm` | execution request DTO | actual guest stty/TERM | implemented |
 | Tailscale identity settings | `MachineData.Network.Tailscale` | inspect DTO | stopped create/update and 0700 cleanup | implemented |
 | resilient inventory | `Runtime.Inventory` | `silo_runtime_query` | real healthy/broken records | implemented |

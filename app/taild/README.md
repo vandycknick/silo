@@ -140,11 +140,23 @@ human/error text goes to stderr. Exit categories: 2 usage, 3 invisible/missing,
 (pending/expired approval), 9 unavailable, 255 transport failure. Guest exit status passes through.
 Every REPL command re-resolves WhoIs; idle identity is checked every 30 seconds.
 
+PTY human output uses terminal newlines, including one-shot commands such as
+`ssh -t silo ls`. The interactive lobby echoes input and supports Unicode editing,
+history, Ctrl-C to cancel a line and Ctrl-D to leave an empty prompt. Bracketed
+paste cannot submit commands by itself. Command editing never consumes or rewrites
+guest streams or stdin document/userdata payloads.
+
+Human `ls` output uses aligned columns, CLI-style memory sizes (`4G`, `1536M`)
+and relative creation ages. `show` includes human sizes and an absolute UTC
+creation date. Addresses are hidden from these human views; node hostnames remain.
+JSON retains byte counts, timestamp values and its address fields.
+
 ## VM commands
 
 ```text
 create NAME [IMAGE|--image OCI] [--template NAME] [--policy NAME]
-            [--cpus N] [--memory SIZE] [--disk-size SIZE]
+             [--cpus N] [--memory SIZE] [--disk-size SIZE]
+             [--provision-user NAME:UID:GID:HOME]
             [--userdata INLINE|-] [--label KEY=VALUE]... [--owner tag:NAME]
             [--no-tailnet] [--no-start]
 ls
@@ -167,9 +179,14 @@ delimiter, including `--json`, are guest arguments. Quotes preserve literal
 operators and dollar signs; no host shell evaluates any command. Exec environments
 and working directories go only to the guest. `shell` and `exec -t` require an
 SSH PTY (`ssh -t`), including its initial size/TERM, resize and signal requests.
-Shell spawns the provisioned guest's `/bin/bash -l`, not a host program. Its default
-account and home come from persisted guest configuration. Lost executions return
-255; disconnect/revocation cancels only the guest execution, never the VM.
+Shell uses the selected guest account's login shell and home. New machines
+provision no account by default; shell and exec select root. Explicit per-create
+`--provision-user nickvd:1000:1000:/home/nickvd` provisions and stores that default
+account. Existing machines retain their recorded account, and session `-u` overrides
+the default. Remove the obsolete global `vm.guest_user` config setting when upgrading.
+For direct SSH, request the guest account explicitly, such as `ssh root@dev` or
+`ssh nickvd@dev`. Lost executions return 255; disconnect/revocation cancels only
+the guest execution, never the VM.
 PTY stdin EOF sends a finite two-EOT sequence: the first flushes an unterminated
 canonical line, the second produces EOF on the empty line. No pipe-close request
 is sent for a PTY. Raw-mode guests receive the two literal bytes and retain their

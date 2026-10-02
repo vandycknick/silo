@@ -30,6 +30,11 @@ show. Labels contain caller labels only; reserved ownership labels are projected
 as validated fields. Image is empty for local-disk or unvalidated legacy sources.
 Optional `template`, `policy`, and `guest_tcp_ports` project immutable provenance
 and guest TCP discovery hints, never host publication authority or inbound ACLs.
+`default_user` is the default guest shell/exec account: `root` when no account was
+provisioned, otherwise the recorded account name. Optional `guest_user` contains
+that provisioned account's `name`, `uid`, `gid`, and guest `home` path. An absent
+`guest_user` does not synthesize a root provisioning record. Explicit session
+`-u` overrides `default_user`.
 
 Document records contain `kind`, `name`, `tier` (`yours` or `operator`), and `owner`
 only for principal-owned files. Show/create/edit/validate include canonical `content`;
@@ -48,6 +53,21 @@ Authorized owners see the current `approval_url` and `approval_expires`, never t
 `reauth VM` requires a stopped VM and both `vm.stop` and `vm.start` capabilities.
 Ownership is one verified `user:<numeric-id>` or
 `tag:<name>`; other owners and instances are invisible (exit 3).
+
+Machine and rootfs creation, modification, start and update times, and image
+creation, update and last-use times are stored by libvm as Unix seconds. The
+Go native bridge converts them to signed Unix milliseconds using checked
+multiplication, then the Go SDK decodes them with `time.UnixMilli`. Out-of-range
+stored seconds return a native error rather than a wrapped or saturated time.
+Inventory isolates per-machine conversion failures: the entry retains its
+indexed ID/name with absent data and a structured configuration issue; healthy
+neighbors remain readable and corrupt names remain reserved. Global database
+failures still fail inventory, and inspecting the affected machine still errors.
+Absent optional start/last-use timestamps remain absent. Provisioning report
+start/finish timestamps already contain milliseconds and retain their subsecond
+precision. No stored timestamps are rewritten. Human views use relative creation
+ages in lists and absolute UTC creation dates in show; JSON retains timestamps,
+integer-byte sizes and address fields.
 
 Operations contain `id`, `kind`, `vm`, `principal`, `state`, `started`, `progress`,
 optional `finished`, optional `error` (`code`, `message`). `vm` is the requested
@@ -102,6 +122,18 @@ limits are additive; enforcement additionally constrains them by operator ceilin
         "created": {"type": "string", "format": "date-time"},
         "image": {"type": "string"},
         "labels": {"type": "object", "additionalProperties": {"type": "string"}},
+        "default_user": {"type": "string"},
+        "guest_user": {
+          "type": "object",
+          "required": ["name", "uid", "gid", "home"],
+          "properties": {
+            "name": {"type": "string"},
+            "uid": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+            "gid": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+            "home": {"type": "string"}
+          },
+          "additionalProperties": false
+        },
         "template": {"type": "string"},
         "policy": {"type": "string"},
         "guest_tcp_ports": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 1, "maximum": 65535}},
