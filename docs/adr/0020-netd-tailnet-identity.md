@@ -26,7 +26,10 @@ preserve the prior node state after failure. Reauthentication fences stable node
 and exact name, rather than creating a duplicate registration.
 
 Netd terminates tailnet SSH and relays to guest SSH using a per-machine SSH CA and
-short-lived certificate for the configured non-root user. The guest agent does
+short-lived certificate for the requested guest login. Taild shell/exec defaults
+to root unless an account was explicitly provisioned at VM creation; that selection
+is persisted per machine. Direct SSH uses the username requested by the client.
+The guest agent does
 not own tailnet identity. OpenSSH is used when present; the native fallback serves
 images without it and does not promise the complete OpenSSH SFTP/forwarding feature
 set. SSH CA and HTTPS/TLS CA remain separate authorities.
@@ -56,7 +59,7 @@ avoid duplicating identity ownership.
 
 **User SSH keys** offer familiar administration but require separate key lifecycle
 and revocation. Short-lived per-machine certificates bind relay sessions to the
-configured guest user and limit credential lifetime.
+requested guest user and limit credential lifetime.
 
 ## References
 

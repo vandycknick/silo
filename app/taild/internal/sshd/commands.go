@@ -178,6 +178,10 @@ func commands(ctx context.Context, s *service.Service, c service.Caller, t []str
 				i++
 				v := args[i]
 				switch key {
+				case "--provision-user":
+					var u silo.GuestUser
+					u, err = silo.ParseGuestUser(v)
+					q.GuestUser = &u
 				case "--template":
 					if v == "" {
 						return nil, "", 2, usage()
@@ -207,13 +211,17 @@ func commands(ctx context.Context, s *service.Service, c service.Caller, t []str
 				case "--userdata":
 					q.UserdataSet = true
 					if v == "-" {
-						if streams.Stdin == nil {
+						src := streams.Stdin
+						if streams.Input != nil {
+							src = streams.Input(ctx)
+						}
+						if src == nil {
 							return nil, "", 2, usage()
 						}
 						if e := s.Authorize(c.Peer, identity.Create, nil); e != nil {
 							return nil, "", 4, e
 						}
-						data, e := io.ReadAll(io.LimitReader(streams.Stdin, 16385))
+						data, e := io.ReadAll(io.LimitReader(src, 16385))
 						if e != nil {
 							return nil, "", 255, e
 						}
@@ -292,8 +300,7 @@ func commands(ctx context.Context, s *service.Service, c service.Caller, t []str
 			}
 		}
 		if !q.Confirmed && streams.Terminal.Present && streams.Stdin != nil {
-			_, _ = fmt.Fprintf(streams.Stderr, "Remove %s? Type yes: ", args[0])
-			line, e := readLineLimit(streams.Stdin, 1024)
+			line, e := readPrompt(streams.Stdin, humanOutput(streams), fmt.Sprintf("Remove %s? Type yes: ", args[0]), 1024)
 			if e == nil {
 				q.Confirmed = line == "yes"
 			}
@@ -441,7 +448,9 @@ func commands(ctx context.Context, s *service.Service, c service.Caller, t []str
 			progress = 0
 		}
 		for _, line := range current.Progress[progress:] {
-			_, _ = fmt.Fprintln(streams.Stderr, line)
+			if _, e := fmt.Fprintln(humanOutput(streams), line); e != nil {
+				return nil, "", 255, e
+			}
 		}
 		progress = len(current.Progress)
 		if current.Finished != nil {

@@ -114,7 +114,7 @@ rule "allow-local-http" {
 	}
 	run(two, "template show dev --json", "", 3)
 	run(two, "policy show local --json", "", 3)
-	run(one, "create templated --template dev --no-tailnet --json", "", 0)
+	run(one, "create templated --template dev --no-tailnet --provision-user silo:1000:1000:/home/silo --json", "", 0)
 	m, e := r.SDK.Machine(ctx, "templated")
 	if e != nil {
 		t.Fatal(e)

@@ -59,7 +59,8 @@ operator documents; inspect logs for rejection and retained prior documents.
 ## Restart and shutdown
 
 `KillMode=process` is essential: ordinary stop/restart terminates taild only.
-Lobby sessions drop; running VM workers and independent `ssh dev` sessions survive.
+Lobby sessions drop; running VM workers and independent guest SSH sessions
+(`ssh root@dev` by default, or the explicitly provisioned guest username) survive.
 Never add `Delegate=` or use a whole-cgroup kill to repair the service.
 At host shutdown, the logind delay inhibitor permits a bounded SDK stop of managed
 VMs. The ExecStop fallback stops VMs only when system state is `stopping`.

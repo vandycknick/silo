@@ -95,9 +95,32 @@ func (s *Server) session(parent context.Context, sess *tailssh.Session) {
 	defer stop()
 	closeOnCancel := context.AfterFunc(ctx, func() { _ = sess.Close() })
 	defer closeOnCancel()
+	initial, windows, pty := sess.Pty()
+	closeChannel := func() { _ = sess.Close() }
+	var diagnostic io.Writer = sessionOutput{ctx, sess.Stderr(), closeChannel}
+	if pty {
+		diagnostic = &humanWriter{out: diagnostic}
+	}
+	converted := make(chan service.Window, 1)
+	convertedSignals := make(chan uint32, 1)
+	terminal := service.Terminal{Present: pty, Term: initial.Term, Windows: converted, Signals: convertedSignals}
+	if initial.Window.Height > 0 && initial.Window.Height <= 65535 && initial.Window.Width > 0 && initial.Window.Width <= 65535 {
+		terminal.Window = service.Window{Rows: uint16(initial.Window.Height), Columns: uint16(initial.Window.Width)}
+	}
+	streams := terminalStreams(ctx, sess, service.IO{Stdout: sessionOutput{ctx, sess, closeChannel}, Stderr: sessionOutput{ctx, sess.Stderr(), closeChannel}, Human: diagnostic, Terminal: terminal})
+	// Pty creates an upstream converter. Drain through close even when WhoIs
+	// denies the session, and fan resize out to the editor and guest controls.
+	if pty {
+		go func() {
+			defer close(converted)
+			for w := range windows {
+				terminalResize(streams, converted, w.Width, w.Height)
+			}
+		}()
+	}
 	peer, e := s.Resolver.WhoIs(ctx, sess.RemoteAddr().String())
 	if e != nil {
-		_, _ = fmt.Fprintln(sess.Stderr(), "Error: identity unavailable or node not tagged")
+		_, _ = fmt.Fprintln(diagnostic, "Error: identity unavailable or node not tagged")
 		_ = sess.Exit(4)
 		return
 	}
@@ -119,14 +142,10 @@ func (s *Server) session(parent context.Context, sess *tailssh.Session) {
 		s.mu.Unlock()
 	}()
 	if sess.Subsystem() != "" {
-		_, _ = fmt.Fprintln(sess.Stderr(), "Error: subsystems are not supported")
+		_, _ = fmt.Fprintln(diagnostic, "Error: subsystems are not supported")
 		_ = sess.Exit(2)
 		return
 	}
-	initial, windows, pty := sess.Pty()
-	input := newInput(ctx, sess)
-	converted := make(chan service.Window, 1)
-	convertedSignals := make(chan uint32, 1)
 	signals := make(chan tailssh.Signal, 16)
 	sess.Signals(signals)
 	defer sess.Signals(nil)
@@ -148,50 +167,18 @@ func (s *Server) session(parent context.Context, sess *tailssh.Session) {
 			}
 		}
 	}()
-	// Pinned Pty creates a converter goroutine; always drain it through close.
-	if pty {
-		go func() {
-			defer close(converted)
-			for w := range windows {
-				if w.Height <= 0 || w.Height > 65535 || w.Width <= 0 || w.Width > 65535 {
-					continue
-				}
-				next := service.Window{Rows: uint16(w.Height), Columns: uint16(w.Width)}
-				select {
-				case converted <- next:
-				default:
-					select {
-					case <-converted:
-					default:
-					}
-					select {
-					case converted <- next:
-					default:
-					}
-				}
-			}
-		}()
-	}
-	terminal := service.Terminal{Present: pty, Term: initial.Term, Windows: converted, Signals: convertedSignals}
-	if initial.Window.Height > 0 && initial.Window.Height <= 65535 && initial.Window.Width > 0 && initial.Window.Width <= 65535 {
-		terminal.Window = service.Window{Rows: uint16(initial.Window.Height), Columns: uint16(initial.Window.Width)}
-	}
 	remote := sess.RemoteAddr().String()
 	caller := service.Caller{Peer: peer, Resolve: func(jobctx context.Context) (identity.Peer, error) { return s.Resolver.WhoIs(jobctx, remote) }}
-	closeChannel := func() { _ = sess.Close() }
-	streams := service.IO{Stdin: input.Reader(ctx), Input: input.Reader, Stdout: sessionOutput{ctx, sess, closeChannel}, Stderr: sessionOutput{ctx, sess.Stderr(), closeChannel}, Terminal: terminal}
 	line := sess.RawCommand()
 	if strings.TrimSpace(line) != "" {
 		_ = sess.Exit(DispatchSession(ctx, s.Service, caller, line, streams))
 		return
 	}
 	if !pty {
-		_, _ = io.WriteString(sess.Stderr(), Help)
+		_, _ = io.WriteString(diagnostic, Help)
 		_ = sess.Exit(2)
 		return
 	}
-	_ = Dispatch(s.Service, peer, "whoami", sess, sess.Stderr())
-	_, _ = io.WriteString(sess.Stderr(), Help)
 	rechecks := time.NewTicker(30 * time.Second)
 	defer rechecks.Stop()
 	done := make(chan struct{})
@@ -212,30 +199,5 @@ func (s *Server) session(parent context.Context, sess *tailssh.Session) {
 			}
 		}
 	}()
-	for {
-		_, _ = io.WriteString(sess.Stderr(), "silo> ")
-		line, e = readLine(input.Reader(ctx))
-		if e != nil {
-			if !errors.Is(e, io.EOF) {
-				_ = sess.Exit(2)
-			} else {
-				_ = sess.Exit(0)
-			}
-			return
-		}
-		if strings.TrimSpace(line) == "exit" {
-			_ = sess.Exit(0)
-			return
-		}
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		peer, e = s.Resolver.WhoIs(ctx, sess.RemoteAddr().String())
-		if e != nil || peer.NodeID != nodeID {
-			_ = sess.Exit(4)
-			return
-		}
-		caller.Peer = peer
-		_ = DispatchSession(ctx, s.Service, caller, line, streams)
-	}
+	_ = sess.Exit(Lobby(ctx, s.Service, caller, streams))
 }

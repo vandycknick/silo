@@ -56,12 +56,6 @@ type Config struct {
 			Disk   string `yaml:"disk"`
 			VMs    uint64 `yaml:"vms_per_principal"`
 		} `yaml:"ceilings"`
-		GuestUser struct {
-			Name string `yaml:"name"`
-			UID  uint32 `yaml:"uid"`
-			GID  uint32 `yaml:"gid"`
-			Home string `yaml:"home"`
-		} `yaml:"guest_user"`
 	} `yaml:"vm"`
 	Sessions struct {
 		Global  int `yaml:"global"`
@@ -96,10 +90,6 @@ func Defaults() Config {
 	c.VM.Ceilings.Memory = "32GiB"
 	c.VM.Ceilings.Disk = "200GiB"
 	c.VM.Ceilings.VMs = 5
-	c.VM.GuestUser.Name = "silo"
-	c.VM.GuestUser.UID = 1000
-	c.VM.GuestUser.GID = 1000
-	c.VM.GuestUser.Home = "/home/silo"
 	c.Sessions.Global = 64
 	c.Sessions.PerPeer = 8
 	return c
@@ -124,6 +114,9 @@ func Load(path string) (Config, error) {
 	d := yaml.NewDecoder(bytes.NewReader(b))
 	d.KnownFields(true)
 	if e = d.Decode(&c); e != nil {
+		if strings.Contains(e.Error(), "field guest_user not found") {
+			return c, errors.New("vm.guest_user is no longer supported; remove it and use create --provision-user NAME:UID:GID:HOME for each VM (default sessions use root)")
+		}
 		return c, e
 	}
 	var extra yaml.Node
@@ -197,9 +190,6 @@ func (c Config) Validate() error {
 	}
 	if l.VMs == 0 || l.CPUs == 0 || l.CPUs > 255 || l.Memory == 0 || l.Disk == 0 || c.VM.Defaults.CPUs == 0 || c.VM.Defaults.CPUs > l.CPUs || uint64(m) == 0 || uint64(m) > l.Memory || uint64(disk) == 0 || uint64(disk) > l.Disk {
 		return errors.New("invalid resource defaults or ceilings")
-	}
-	if c.VM.GuestUser.Name == "" || c.VM.GuestUser.UID == 0 || c.VM.GuestUser.GID == 0 || !filepath.IsAbs(c.VM.GuestUser.Home) {
-		return errors.New("guest_user must be nonroot with an absolute home")
 	}
 	if c.Sessions.Global < 1 || c.Sessions.PerPeer < 1 || c.Sessions.PerPeer > c.Sessions.Global {
 		return errors.New("invalid session limits")

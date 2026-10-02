@@ -73,6 +73,11 @@ to private networks. SDK session-scoped forward handles are not yet exposed.
 
 ## Execution
 
+Machine creation provisions no guest account unless `WithGuestUser` is supplied.
+Default sessions use root when `MachineData.GuestUser` is nil, or the machine's
+persisted account when present. Session-level user options override that default.
+Existing machines retain their stored account. See [explicit guest provisioning](examples/guest-user.md).
+
 Non-zero guest exit status is an `ExecutionResult`, not a Go error. Errors report validation, transport, runtime, or lifecycle failures. Output byte methods preserve arbitrary bytes; string methods perform ordinary Go byte-to-string conversion.
 
 Streaming `Recv` methods return `io.EOF` at the finite end. Only one `Recv`, `Wait`, or `Collect` may be active for an execution session. Closing a session or stream unblocks its active receiver. Lifecycle and image mutations observe context cancellation before entering native work, then run to completion because those `libvm` futures are not yet documented as cancellation-safe.

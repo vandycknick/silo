@@ -2,13 +2,397 @@ package sshd
 
 import (
 	"context"
+	"errors"
 	"io"
+	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/vandycknick/silo/app/taild/internal/service"
+	"golang.org/x/term"
 )
 
 type inputChunk struct {
 	data []byte
 	err  error
+}
+
+var errLineCanceled = errors.New("terminal line canceled")
+
+// terminalInput gives x/term exactly one byte at a time. Its private read-ahead
+// can then contain only an incomplete key, never bytes belonging to the guest.
+// All transport reads still go through sessionInput's bounded, single pump.
+type terminalInput struct {
+	r             contextualInput
+	out           io.Writer
+	terminal      *term.Terminal
+	writeErr      error
+	errMu         sync.Mutex
+	queued        []byte
+	paste         bool
+	consumed      int
+	canceled      bool
+	lineErr       error
+	lineLimit     int
+	sizeMu        sync.Mutex
+	width, height int
+	editing       bool
+}
+
+func newTerminalInput(ctx context.Context, input *sessionInput, out io.Writer, width, height int) *terminalInput {
+	if width <= 0 || height <= 0 {
+		width, height = 80, 24
+	}
+	t := &terminalInput{r: contextualInput{ctx, input}, out: out, width: width, height: height}
+	t.terminal = term.NewTerminal(t, "")
+	t.terminal.History = commandHistory{History: t.terminal.History, input: t}
+	t.terminal.AutoCompleteCallback = t.checkInsertion
+	if width > 0 && height > 0 {
+		_ = t.terminal.SetSize(width, height)
+	}
+	return t
+}
+
+// Keep x/term's bounded history, omitting empty/canceled lines and repeats.
+type commandHistory struct {
+	term.History
+	input *terminalInput
+}
+
+func (h commandHistory) Add(line string) {
+	if h.input.lineErr != nil || h.input.canceled || strings.TrimSpace(line) == "" {
+		return
+	}
+	if h.Len() != 0 && h.At(0) == line {
+		return
+	}
+	h.History.Add(line)
+}
+
+// x/term invokes this public hook with the full edited line before inserting
+// printable keys, including after history recall. Refuse insertion before its
+// private 4096-rune ceiling can silently drop input, and poison this submission
+// even if later edits shorten the line. Cursor/editing remain owned by x/term.
+func (t *terminalInput) checkInsertion(line string, pos int, key rune) (string, int, bool) {
+	if key >= 32 && utf8.ValidRune(key) && (utf8.RuneCountInString(line) >= 4096 || len(line)+utf8.RuneLen(key) > t.lineLimit) {
+		t.lineErr = usage()
+		return line, pos, true
+	}
+	return "", 0, false
+}
+
+func (t *terminalInput) Write(p []byte) (int, error) {
+	n, e := t.out.Write(p)
+	if e == nil && n != len(p) {
+		e = io.ErrShortWrite
+	}
+	if e != nil {
+		t.errMu.Lock()
+		t.writeErr = e
+		t.errMu.Unlock()
+	}
+	return n, e
+}
+
+func (t *terminalInput) outputError() error {
+	t.errMu.Lock()
+	defer t.errMu.Unlock()
+	return t.writeErr
+}
+
+func (t *terminalInput) byte() (byte, error) {
+	var b [1]byte
+	_, e := io.ReadFull(t.r, b[:])
+	t.consumed++
+	// Bound control/paste activity independently of the effective edited line.
+	if t.consumed > 65536 {
+		return 0, usage()
+	}
+	return b[0], e
+}
+
+func (t *terminalInput) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+keys:
+	for {
+		if e := t.outputError(); e != nil {
+			return 0, e
+		}
+		if len(t.queued) != 0 {
+			p[0] = t.queued[0]
+			t.queued = t.queued[1:]
+			return 1, nil
+		}
+		b, e := t.byte()
+		if e != nil {
+			return 0, e
+		}
+		if b == 27 {
+			// Consume complete escape keys before x/term sees them. Unknown
+			// terminal controls are discarded, rather than becoming commands.
+			seq := []byte{b}
+			b, e = t.byte()
+			if e != nil {
+				return 0, e
+			}
+			seq = append(seq, b)
+			if b == 3 && !t.paste {
+				t.cancelLine()
+				continue
+			}
+			if b == 4 && !t.paste {
+				t.queued = []byte{4}
+				continue
+			}
+			if b != '[' && b != 'O' {
+				return 0, usage()
+			}
+			for len(seq) < 64 {
+				b, e = t.byte()
+				if e != nil {
+					return 0, e
+				}
+				seq = append(seq, b)
+				if b == 3 && !t.paste {
+					t.cancelLine()
+					continue keys
+				}
+				if b == 4 && !t.paste {
+					t.queued = []byte{4}
+					continue keys
+				}
+				if b < 32 || b > 126 {
+					return 0, usage()
+				}
+				if b >= 0x40 && b <= 0x7e {
+					break
+				}
+			}
+			if len(seq) == 64 {
+				return 0, usage()
+			}
+			switch string(seq) {
+			case "\x1b[200~":
+				t.paste = true
+			case "\x1b[201~":
+				t.paste = false
+			case "\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D", "\x1b[H", "\x1b[F", "\x1b[3~", "\x1bOA", "\x1bOB", "\x1bOC", "\x1bOD", "\x1bOH", "\x1bOF":
+				if !t.paste {
+					if seq[1] == 'O' {
+						seq[1] = '['
+					}
+					t.queued = seq
+				}
+			}
+			continue
+		}
+		if b >= utf8.RuneSelf {
+			seq := []byte{b}
+			for !utf8.FullRune(seq) {
+				b, e = t.byte()
+				if e != nil {
+					return 0, e
+				}
+				seq = append(seq, b)
+			}
+			r, size := utf8.DecodeRune(seq)
+			if r == utf8.RuneError {
+				if size == 1 {
+					return 0, usage()
+				}
+				// x/term uses RuneError as its incomplete-key sentinel. Keep a
+				// literal replacement character from filling its private buffer.
+				seq = []byte{'?'}
+			}
+			if unicode.IsControl(r) {
+				continue
+			}
+			t.queued = seq
+			continue
+		}
+		if t.paste {
+			// Pasted newlines are text, not submission. An explicit Enter after
+			// the closing bracket is required. Pasted controls cannot edit/exit.
+			if b == '\r' || b == '\n' || b == '\t' {
+				b = ' '
+			}
+			if b < 32 || b == 127 {
+				continue
+			}
+		} else {
+			if b == 3 {
+				// Clear and submit an empty editor line, then report cancellation
+				// to the lobby. Keep x/term history and cursor/resize state.
+				t.cancelLine()
+				continue
+			}
+			if b == '\r' {
+				t.r.input.mu.Lock()
+				t.r.input.skipLF = true
+				t.r.input.mu.Unlock()
+			}
+		}
+		p[0] = b
+		return 1, nil
+	}
+}
+
+func (t *terminalInput) cancelLine() {
+	t.canceled = true
+	t.queued = []byte{5, 21, '\r'}
+}
+
+func (t *terminalInput) resize(width, height int) {
+	t.sizeMu.Lock()
+	defer t.sizeMu.Unlock()
+	t.width, t.height = width, height
+	if t.editing {
+		_ = t.terminal.SetSize(width, height)
+	}
+}
+
+func (t *terminalInput) ReadLine(limit int) (string, error) {
+	return t.ReadPrompt("", limit)
+}
+
+func (t *terminalInput) ReadPrompt(prompt string, limit int) (string, error) {
+	t.sizeMu.Lock()
+	t.terminal.SetPrompt(prompt)
+	_ = t.terminal.SetSize(t.width, t.height)
+	t.editing = true
+	t.sizeMu.Unlock()
+	defer func() {
+		t.sizeMu.Lock()
+		t.editing = false
+		t.terminal.SetPrompt("")
+		t.sizeMu.Unlock()
+	}()
+	t.consumed = 0
+	t.canceled = false
+	t.lineErr = nil
+	t.lineLimit = limit
+	// Enable only while the daemon owns input, then release terminal mode
+	// before guest handoff. The adapter flattens pasted newlines to text.
+	if _, e := io.WriteString(t, "\x1b[?2004h"); e != nil {
+		return "", e
+	}
+	line, e := t.terminal.ReadLine()
+	if _, err := io.WriteString(t, "\x1b[?2004l"); err != nil {
+		return "", err
+	}
+	if e := t.outputError(); e != nil {
+		return "", e
+	}
+	if t.lineErr != nil {
+		return "", t.lineErr
+	}
+	if t.canceled {
+		t.canceled = false
+		if e != nil {
+			return "", e
+		}
+		return "", errLineCanceled
+	}
+	if len(line) > limit {
+		return "", usage()
+	}
+	if e != nil {
+		return "", e
+	}
+	return line, e
+}
+
+func readPrompt(src io.Reader, out io.Writer, prompt string, limit int) (string, error) {
+	if reader, ok := src.(interface {
+		ReadPrompt(string, int) (string, error)
+	}); ok {
+		return reader.ReadPrompt(prompt, limit)
+	}
+	if _, e := io.WriteString(out, prompt); e != nil {
+		return "", e
+	}
+	return readLineLimit(src, limit)
+}
+
+func terminalStreams(ctx context.Context, src io.Reader, streams service.IO) service.IO {
+	input := newInput(ctx, src)
+	streams.Input = input.Reader
+	streams.Stdin = input.Reader(ctx)
+	if streams.Human == nil {
+		streams.Human = streams.Stderr
+		if streams.Terminal.Present {
+			streams.Human = &humanWriter{out: streams.Stderr}
+		}
+	}
+	if streams.Terminal.Present {
+		w := streams.Terminal.Window
+		streams.Stdin = newTerminalInput(ctx, input, streams.Human, int(w.Columns), int(w.Rows))
+	}
+	return streams
+}
+
+func terminalResize(streams service.IO, converted chan service.Window, width, height int) {
+	if width <= 0 || width > 65535 || height <= 0 || height > 65535 {
+		return
+	}
+	if editor, ok := streams.Stdin.(*terminalInput); ok {
+		editor.resize(width, height)
+	}
+	next := service.Window{Rows: uint16(height), Columns: uint16(width)}
+	select {
+	case converted <- next:
+	default:
+		select {
+		case <-converted:
+		default:
+		}
+		select {
+		case converted <- next:
+		default:
+		}
+	}
+}
+
+// Lobby is the production interactive front end below WhoIs authentication.
+// Local SSH tests supply an explicit domain caller at this same boundary.
+func Lobby(ctx context.Context, s *service.Service, caller service.Caller, streams service.IO) int {
+	out := humanOutput(streams)
+	if code := DispatchSession(ctx, s, caller, "whoami", streams); code == 255 {
+		return code
+	}
+	if _, e := io.WriteString(out, Help); e != nil {
+		return 255
+	}
+	for {
+		line, e := readPrompt(streams.Stdin, out, "silo> ", 16384)
+		if errors.Is(e, errLineCanceled) {
+			continue
+		}
+		if errors.Is(e, io.EOF) {
+			return 0
+		}
+		if e != nil {
+			return 255
+		}
+		line = strings.TrimSpace(line)
+		if line == "exit" {
+			return 0
+		}
+		if line == "" {
+			continue
+		}
+		peer, e := caller.Fresh(ctx)
+		if e != nil || peer.NodeID != caller.Peer.NodeID {
+			return 4
+		}
+		caller.Peer = peer
+		if code := DispatchSession(ctx, s, caller, line, streams); code == 255 {
+			return code
+		}
+	}
 }
 
 // One bounded transport read pump serves both command lines and guest input.

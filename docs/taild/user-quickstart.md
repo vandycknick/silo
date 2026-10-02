@@ -11,7 +11,7 @@ ssh silo policy ls
 ssh silo create dev --template devbox
 ssh silo show dev
 ssh silo start dev
-ssh dev
+ssh root@dev
 ```
 
 Follow the returned consent link when enrollment is pending. It is short-lived and
@@ -28,8 +28,31 @@ ssh silo reauth dev
 ssh silo rm dev
 ```
 
-Direct VM sessions use a short-lived per-machine certificate and the configured
-non-root guest user. Tailnet ACLs still control network access. Published guest-port
+New VMs provision no account and lobby `shell`/`exec` sessions default to root.
+Opt into a nonroot account when creating the VM:
+
+```sh
+ssh silo create dev --template devbox --provision-user nickvd:1000:1000:/home/nickvd
+ssh -t silo shell dev
+ssh silo exec dev -- id -u
+ssh -t silo shell dev -u root
+ssh nickvd@dev
+```
+
+The home is inside the VM. All four fields are required; a bare flag never infers
+your account from the daemon host. Existing VMs keep their recorded default user.
+Lobby `-u` selects an existing guest account without provisioning it. Direct SSH
+uses the username you request, so specify `root@dev` for a root-default VM.
+Operators migrating old configs must remove `vm.guest_user` and opt in per create.
+
+Account environment lookup uses shell builtins and does not require `cat`.
+Binary execution also works without `/bin/sh`: root or the stored provisioned
+account supplies its default HOME/cwd, while the guest agent validates the
+requested execution identity. Other accounts need a working POSIX shell reader
+to supply their account environment.
+
+Direct VM sessions use a short-lived per-machine certificate.
+Tailnet ACLs still control network access. Published guest-port
 hints create no host listener and are not an inbound firewall.
 
 The native guest SSH fallback does not implement SFTP or SSH port forwarding.

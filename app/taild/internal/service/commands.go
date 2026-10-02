@@ -73,6 +73,8 @@ func Categorize(err error) *authz.Error {
 }
 
 type VM struct {
+	GuestUser       *silo.GuestUser        `json:"guest_user,omitempty"`
+	DefaultUser     string                 `json:"default_user"`
 	NodeDiagnostics []string               `json:"node_diagnostics,omitempty"`
 	NodeState       state.NodeState        `json:"node_state"`
 	NodeID          string                 `json:"node_id,omitempty"`
@@ -100,6 +102,12 @@ type VM struct {
 
 func project(d *silo.MachineData) VM {
 	v := VM{ID: d.ID, Name: d.Name, Owner: identity.Principal(d.Labels[runtime.OwnerLabel]), State: d.Status.Kind, Created: d.CreatedAt.UTC()}
+	v.DefaultUser = "root"
+	if d.GuestUser != nil {
+		u := *d.GuestUser
+		v.GuestUser = &u
+		v.DefaultUser = u.Name
+	}
 	v.Template = d.Labels[TemplateLabel]
 	v.Policy = d.Labels[PolicyLabel]
 	_ = json.Unmarshal([]byte(d.Labels[GuestPortsLabel]), &v.GuestTCPPorts)
@@ -199,6 +207,7 @@ func (s *Service) Ops(p identity.Peer, id string) ([]jobs.Operation, error) {
 }
 
 type CreateRequest struct {
+	GuestUser   *silo.GuestUser
 	Template    string
 	PolicyRef   string
 	GuestPorts  []uint16
@@ -250,6 +259,13 @@ func (s *Service) ValidateCreate(p identity.Peer, q CreateRequest) (CreateReques
 	}
 	if !config.ValidName(q.Name) {
 		return q, failure("usage", "invalid exact name", 2)
+	}
+	if q.GuestUser != nil {
+		u := *q.GuestUser
+		if e := u.Validate(); e != nil {
+			return q, failure("usage", e.Error(), 2)
+		}
+		q.GuestUser = &u
 	}
 	if q.Owner == "" {
 		if len(p.Principals) != 1 {
@@ -489,8 +505,10 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 			}
 			labels[GuestPortsLabel] = string(b)
 		}
-		u := s.Config.VM.GuestUser
-		opts := []silo.MachineOption{silo.WithName(q.Name), silo.WithLabels(labels), silo.WithCPUs(uint8(q.CPUs)), silo.WithMemory(silo.Bytes(q.Memory)), silo.WithRootDiskSize(silo.Bytes(q.Disk)), silo.WithVsock(true), silo.WithGuestUser(u.Name, u.UID, u.GID, u.Home)}
+		opts := []silo.MachineOption{silo.WithName(q.Name), silo.WithLabels(labels), silo.WithCPUs(uint8(q.CPUs)), silo.WithMemory(silo.Bytes(q.Memory)), silo.WithRootDiskSize(silo.Bytes(q.Disk)), silo.WithVsock(true)}
+		if u := q.GuestUser; u != nil {
+			opts = append(opts, silo.WithGuestUser(u.Name, u.UID, u.GID, u.Home))
+		}
 		if q.Userdata != "" {
 			opts = append(opts, silo.WithUserdata(q.Userdata))
 		}

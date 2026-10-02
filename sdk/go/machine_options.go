@@ -1,6 +1,10 @@
 package silo
 
-import "maps"
+import (
+	"maps"
+	"strconv"
+	"strings"
+)
 
 type imageSourceConfig struct {
 	Kind      string `json:"kind"`
@@ -63,8 +67,67 @@ type GuestUser struct {
 	Home string `json:"home"`
 }
 
+// Validate checks the managed account constraints before image admission.
+// Home is a path inside the VM, never a host path.
+func (u GuestUser) Validate() error {
+	invalid := func(message string) error { return newError(ErrorInvalidArgument, "", message) }
+	if u.Name == "root" || u.Name == "nobody" || u.UID == 0 || u.UID == 65534 || u.GID == 0 || u.GID == 65534 {
+		return invalid("guest user must not use root or nobody identities")
+	}
+	if u.UID == ^uint32(0) || u.GID == ^uint32(0) {
+		return invalid("guest UID and GID must not use the reserved maximum value")
+	}
+	body := strings.TrimSuffix(u.Name, "$")
+	if len(u.Name) > 256 || body == "" || strings.HasPrefix(body, "-") {
+		return invalid("invalid guest user name")
+	}
+	numeric := true
+	for _, c := range body {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return invalid("invalid guest user name")
+		}
+		numeric = numeric && c >= '0' && c <= '9'
+	}
+	if numeric && body == u.Name {
+		return invalid("invalid guest user name")
+	}
+	if !strings.HasPrefix(u.Home, "/") || u.Home == "/" || strings.ContainsAny(u.Home, "\x00\n\r:") {
+		return invalid("guest user home must be an absolute normalized guest path other than /")
+	}
+	for _, part := range strings.Split(u.Home, "/") {
+		if part == "." || part == ".." {
+			return invalid("guest user home must be an absolute normalized guest path")
+		}
+	}
+	return nil
+}
+
+// ParseGuestUser parses the explicit NAME:UID:GID:HOME provisioning syntax.
+func ParseGuestUser(value string) (GuestUser, error) {
+	parts := strings.Split(value, ":")
+	if len(parts) != 4 {
+		return GuestUser{}, newError(ErrorInvalidArgument, "", "provision user requires NAME:UID:GID:HOME")
+	}
+	uid, ue := strconv.ParseUint(parts[1], 10, 32)
+	gid, ge := strconv.ParseUint(parts[2], 10, 32)
+	if ue != nil || ge != nil {
+		return GuestUser{}, newError(ErrorInvalidArgument, "", "guest UID and GID must be unsigned 32-bit decimal integers")
+	}
+	u := GuestUser{Name: parts[0], UID: uint32(uid), GID: uint32(gid), Home: parts[3]}
+	return u, u.Validate()
+}
+
+// WithGuestUser opts into provisioning a nonroot VM account. Without this option,
+// no account is provisioned and sessions default to root.
 func WithGuestUser(name string, uid, gid uint32, home string) MachineOption {
-	return func(config *machineConfig) { config.GuestUser = &GuestUser{Name: name, UID: uid, GID: gid, Home: home} }
+	return func(config *machineConfig) {
+		u := GuestUser{Name: name, UID: uid, GID: gid, Home: home}
+		if err := u.Validate(); err != nil {
+			config.error = err
+			return
+		}
+		config.GuestUser = &u
+	}
 }
 
 func WithName(name string) MachineOption { return func(config *machineConfig) { config.Name = &name } }

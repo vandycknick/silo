@@ -34,7 +34,7 @@ func Dispatch(s *service.Service, p identity.Peer, line string, stdout, stderr i
 }
 func DispatchSession(ctx context.Context, s *service.Service, c service.Caller, line string, streams service.IO) int {
 	p := c.Peer
-	stdout, stderr := streams.Stdout, streams.Stderr
+	stdout, stderr := streams.Stdout, humanOutput(streams)
 	tokens, err := Tokenize(line)
 	jsonOutput := false
 	yes := false
@@ -157,7 +157,9 @@ func DispatchSession(ctx context.Context, s *service.Service, c service.Caller, 
 		}
 	}
 	if failure != nil {
-		_, _ = fmt.Fprintln(stderr, "Error:", failure.Message)
+		if _, err := fmt.Fprintln(stderr, "Error:", failure.Message); err != nil {
+			return 255
+		}
 		return failure.Exit
 	}
 	if !jsonOutput {
