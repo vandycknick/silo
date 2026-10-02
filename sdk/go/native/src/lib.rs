@@ -11,6 +11,7 @@ mod logs;
 mod machine;
 mod network;
 mod runtime;
+mod timestamps;
 
 pub use crate::abi::{silo_ffi_abi_version, silo_ffi_sdk_version};
 pub use crate::buffer::{silo_buffer_free, SiloBuffer};

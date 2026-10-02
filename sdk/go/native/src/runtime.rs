@@ -92,7 +92,24 @@ pub unsafe extern "C" fn silo_runtime_query(
                 serde_json::Value::Array(entries.into_iter().map(|entry| {
                     let mut issues = entry.issues;
                     if let Some(data) = &entry.data { issues.extend(data.issues.clone()); }
-                    serde_json::json!({"id": entry.id, "name": entry.name, "data": entry.data.map(crate::dto::machine_data), "issues": issues})
+                    let data = match entry.data.map(crate::dto::machine_data).transpose() {
+                        Ok(data) => data,
+                        Err(error) => {
+                            // Timestamp errors contain a fixed field prefix. Keep the
+                            // category/field, without exposing stored values in inventory.
+                            let field = match &error {
+                                libvm::LibVmError::InvalidCreateRequest { name, reason }
+                                    if name == "timestamp" => reason.split_once(':').map(|(field, _)| field),
+                                _ => None,
+                            };
+                            issues.push(libvm::MachineIssue {
+                                component: libvm::MachineIssueComponent::Configuration,
+                                message: format!("{}: native DTO conversion failed ({})", field.unwrap_or("machine"), error.variant()),
+                            });
+                            None
+                        }
+                    };
+                    serde_json::json!({"id": entry.id, "name": entry.name, "data": data, "issues": issues})
                 }).collect())
             }
             QueryRequest::SecretReadiness {

@@ -373,7 +373,8 @@ where
             .tokio
             .block_on(operation(machine.machine.clone()))
             .map_err(error_from_libvm)?;
-        let data = serde_json::to_vec(&dto::machine_data(data))
+        let data = dto::machine_data(data).map_err(error_from_libvm)?;
+        let data = serde_json::to_vec(&data)
             .map_err(|error| SiloError::new("Serialization", error.to_string()))?;
         *out_data = SiloBuffer::from_vec(data);
         Ok(())
