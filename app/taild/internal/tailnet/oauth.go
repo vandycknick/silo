@@ -12,7 +12,13 @@ import (
 	"time"
 )
 
-var ErrCredentialUnavailable = errors.New("Tailscale credential service unavailable")
+// NewHTTPClient talks to the Tailscale API without following redirects, so a
+// credential never travels to a host the response chose.
+func NewHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}
+
+var ErrCredentialUnavailable = errors.New("tailnet credential service unavailable")
 
 // Mint uses the standard OAuth client-secret flow from pinned oauthkey, with
 // one caller-owned deadline. tsnet.Start must receive only the literal result:
@@ -23,7 +29,7 @@ func Mint(ctx context.Context, client *http.Client, base, secret, tag string) (s
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	request, e := http.NewRequestWithContext(ctx, "POST", base+"/api/v2/oauth/token", strings.NewReader(url.Values{"grant_type": {"client_credentials"}}.Encode()))
+	request, e := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v2/oauth/token", strings.NewReader(url.Values{"grant_type": {"client_credentials"}}.Encode()))
 	if e != nil {
 		return "", e
 	}
@@ -56,7 +62,7 @@ func Mint(ctx context.Context, client *http.Client, base, secret, tag string) (s
 	if e != nil {
 		return "", e
 	}
-	request, e = http.NewRequestWithContext(ctx, "POST", base+"/api/v2/tailnet/-/keys", bytes.NewReader(b))
+	request, e = http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v2/tailnet/-/keys", bytes.NewReader(b))
 	if e != nil {
 		return "", e
 	}
@@ -83,7 +89,7 @@ func doJSON(client *http.Client, req *http.Request, out any) error {
 		return ErrCredentialUnavailable
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return errors.New("Tailscale credential request rejected")
+		return errors.New("tailnet credential request rejected")
 	}
 	b, e := io.ReadAll(io.LimitReader(response.Body, 65537))
 	if e != nil || len(b) > 65536 {

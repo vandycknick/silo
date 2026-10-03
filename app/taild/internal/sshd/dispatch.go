@@ -3,7 +3,6 @@ package sshd
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -14,7 +13,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/service"
 )
 
-const Help = "silo · VMs on your tailnet\nhelp, whoami, version, create NAME, ls, show VM, start VM, stop VM, restart VM, reauth VM, rm VM, set VM KEY=VALUE, logs VM, shell VM, exec VM -- CMD..., ops [show ID], template, policy\nUse --json for structured queries/mutations. Guest exec arguments after -- are literal.\n"
+func HelpText() string { return generalHelp() }
 
 type response struct {
 	OK    bool           `json:"ok"`
@@ -32,141 +31,123 @@ type responseError struct {
 func Dispatch(s *service.Service, p identity.Peer, line string, stdout, stderr io.Writer) int {
 	return DispatchSession(context.Background(), s, service.Caller{Peer: p}, line, service.IO{Stdout: stdout, Stderr: stderr})
 }
+
+// DispatchSession runs one command line: tokenize, strip session-wide flags,
+// check identity, hand the rest to the command's handler, and encode its reply.
 func DispatchSession(ctx context.Context, s *service.Service, c service.Caller, line string, streams service.IO) int {
-	p := c.Peer
-	stdout, stderr := streams.Stdout, humanOutput(streams)
+	streams = normalizeHuman(streams)
+	iv := &invocation{ctx: ctx, service: s, caller: c, streams: streams}
 	tokens, err := Tokenize(line)
-	jsonOutput := false
-	yes := false
 	if err == nil {
-		filtered := []string{}
-		literal := false
-		for _, t := range tokens {
-			if t == "--" {
-				literal = true
-			}
-			if t == "--json" && !literal {
-				if jsonOutput {
-					err = errors.New("duplicate --json")
-				}
-				jsonOutput = true
-			} else if t == "--yes" && !literal {
-				yes = true
-			} else {
-				filtered = append(filtered, t)
-			}
-		}
-		tokens = filtered
+		tokens, err = iv.globals(tokens)
 	}
-	var data any
-	human := ""
-	var failure *authz.Error
-	exit := 0
-	if err != nil {
+	var result reply
+	// Identity outranks syntax: an unverified peer learns nothing about parsing.
+	failure := service.Categorize(s.CheckIdentity(c.Peer))
+	switch {
+	case failure != nil:
+	case err != nil:
 		failure = &authz.Error{Code: "usage", Message: err.Error(), Exit: 2}
-	}
-	if e := s.CheckIdentity(p); e != nil {
-		var denied *authz.Error
-		if errors.As(e, &denied) {
-			failure = denied
+	case len(tokens) == 0 && iv.help:
+		result, err = runHelp(iv, nil)
+	case len(tokens) == 0:
+		failure = &authz.Error{Code: "usage", Message: "command required", Exit: 2}
+	default:
+		name := tokens[0]
+		if canonical, ok := aliases[name]; ok {
+			name = canonical
+		}
+		cmd, ok := commands[name]
+		if !ok {
+			failure = usage()
+			break
+		}
+		if iv.help {
+			path := []string{name}
+			if (name == "template" || name == "policy" || name == "ops") && len(tokens) > 1 && !isFlag(tokens[1]) {
+				path = append(path, tokens[1])
+			}
+			result, err = runHelp(iv, path)
+		} else if iv.json && !acceptsJSON(name) {
+			err = usageReason("--json is not supported by this command")
 		} else {
-			failure = &authz.Error{Code: "unavailable", Message: "service unavailable", Exit: 9}
+			result, err = cmd.run(iv, tokens[1:])
+		}
+		failure = service.Categorize(err)
+	}
+	return iv.respond(result, failure)
+}
+
+// globals strips the flags every command accepts. Tokens after the literal
+// guest delimiter are never interpreted.
+func (iv *invocation) globals(tokens []string) ([]string, error) {
+	kept := make([]string, 0, len(tokens))
+	command := ""
+	for _, t := range tokens {
+		if !isFlag(t) {
+			command = canonicalCommand(t)
+			break
 		}
 	}
-	if failure == nil {
-		if len(tokens) == 0 {
-			failure = &authz.Error{Code: "usage", Message: "command required", Exit: 2}
-		} else {
-			switch tokens[0] {
-			case "new":
-				tokens[0] = "create"
-			case "list":
-				tokens[0] = "ls"
-			case "status":
-				tokens[0] = "show"
-			case "ssh":
-				tokens[0] = "shell"
+	for i := 0; i < len(tokens); i++ {
+		t := tokens[i]
+		switch t {
+		case "--":
+			return append(kept, tokens[i:]...), nil
+		case "--json":
+			if iv.json {
+				return nil, usageReason("duplicate --json")
 			}
-			if yes && tokens[0] == "rm" {
-				tokens = append(tokens, "--yes")
+			iv.json = true
+		case "--yes":
+			if command == "rm" {
+				if iv.yes {
+					return nil, usageReason("duplicate --yes")
+				}
+				iv.yes = true
+			} else {
+				kept = append(kept, t)
 			}
-			switch tokens[0] {
-			case "help":
-				if len(tokens) > 2 {
-					failure = &authz.Error{Code: "usage", Message: "unknown argument or option", Exit: 2}
-					break
-				}
-				help := Help
-				if len(tokens) == 2 {
-					var ok bool
-					help, ok = commandHelp(tokens[1])
-					if !ok {
-						failure = &authz.Error{Code: "usage", Message: "unknown command", Exit: 2}
-						break
-					}
-				}
-				data = struct {
-					Help string `json:"help"`
-				}{help}
-				human = help
-			case "version":
-				if len(tokens) != 1 {
-					failure = &authz.Error{Code: "usage", Message: "unknown argument or option", Exit: 2}
-					break
-				}
-				v := s.Versions()
-				data = v
-				human = fmt.Sprintf("taild %s · SDK %s · runtime %s · tailscale %s\n", v.Taild, v.SDK, v.Runtime, v.Tailscale)
-			case "whoami":
-				if len(tokens) != 1 {
-					failure = &authz.Error{Code: "usage", Message: "unknown argument or option", Exit: 2}
-					break
-				}
-				var who service.WhoAmI
-				who, err = s.WhoAmI(p)
-				if err != nil {
-					var e *authz.Error
-					if errors.As(err, &e) {
-						failure = e
-					} else {
-						failure = &authz.Error{Code: "unavailable", Message: "service unavailable", Exit: 9}
-					}
-				} else {
-					data = who
-					human = fmt.Sprintf("Principals: %v\nNode: %s (%s)\nActions: %v (scope own)\n", p.Principals, p.NodeName, p.NodeID, p.Permissions.Actions)
-					if who.Explanation != "" {
-						human += who.Explanation + ". Ask your tailnet admin for " + s.Capability + ".\n"
-					}
-				}
-			default:
-				data, human, exit, err = commands(ctx, s, c, tokens, jsonOutput, streams)
-				failure = service.Categorize(err)
+		case "-h", "--help":
+			iv.help = true
+		default:
+			kept = append(kept, t)
+			name, _, inline := strings.Cut(strings.TrimLeft(t, "-"), "=")
+			if isFlag(t) && !inline && optionTakesValue(command, name) && i+1 < len(tokens) {
+				i++
+				kept = append(kept, tokens[i])
 			}
 		}
 	}
-	if jsonOutput {
-		var wireError *responseError
+	return kept, nil
+}
+
+// respond writes the JSON envelope to stdout when requested, and the human
+// rendering or error line to the human stream. Transport failures exit 255.
+func (iv *invocation) respond(r reply, failure *authz.Error) int {
+	if iv.json {
+		var wire *responseError
 		if failure != nil {
-			wireError = &responseError{Code: failure.Code, Message: failure.Message}
-			if op, ok := data.(jobs.Operation); ok {
-				wireError.Operation = op.ID
+			wire = &responseError{Code: failure.Code, Message: failure.Message}
+			if op, ok := r.data.(jobs.Operation); ok {
+				wire.Operation = op.ID
 			}
 		}
-		if e := json.NewEncoder(stdout).Encode(response{OK: failure == nil, Data: data, Error: wireError}); e != nil {
+		if e := json.NewEncoder(iv.streams.Stdout).Encode(response{OK: failure == nil, Data: r.data, Error: wire}); e != nil {
 			return 255
 		}
 	}
+	out := humanOutput(iv.streams)
 	if failure != nil {
-		if _, err := fmt.Fprintln(stderr, "Error:", failure.Message); err != nil {
+		if _, e := fmt.Fprintln(out, "Error:", failure.Message); e != nil {
 			return 255
 		}
 		return failure.Exit
 	}
-	if !jsonOutput {
-		_, err = io.Copy(stderr, strings.NewReader(human))
-		if err != nil {
+	if !iv.json {
+		if _, e := io.WriteString(out, r.human); e != nil {
 			return 255
 		}
 	}
-	return exit
+	return r.exit
 }

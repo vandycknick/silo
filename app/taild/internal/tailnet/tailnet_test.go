@@ -56,7 +56,9 @@ func TestBoundedOAuthActualHTTP(t *testing.T) {
 }
 func TestUnregisteredRealTSNetLifecycle(t *testing.T) {
 	// This endpoint never impersonates a successful control plane or WhoIs.
-	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "unregistered offline control", 503) }))
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unregistered offline control", http.StatusServiceUnavailable)
+	}))
 	defer control.Close()
 	c := config.Defaults()
 	c.Home = t.TempDir()
@@ -101,7 +103,7 @@ func TestCredentialHTTPOutageIsDistinctFromRejection(t *testing.T) {
 		if key != "" || err == nil || errors.Is(err, ErrCredentialUnavailable) != wantUnavailable {
 			t.Fatal(status, key, err)
 		}
-		if err.Error() != "Tailscale credential service unavailable" && err.Error() != "Tailscale credential request rejected" {
+		if err.Error() != "tailnet credential service unavailable" && err.Error() != "tailnet credential request rejected" {
 			t.Fatal("HTTP secret diagnostic escaped", err)
 		}
 	}

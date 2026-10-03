@@ -17,7 +17,7 @@ import (
 )
 
 func TestActualUnregisteredNodeDeniesHTTPHeaders(t *testing.T) {
-	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "offline", 503) }))
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "offline", http.StatusServiceUnavailable) }))
 	defer control.Close()
 	c := config.Defaults()
 	c.Home = t.TempDir()

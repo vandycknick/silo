@@ -53,7 +53,7 @@ type Registry struct {
 }
 
 func New(ctx context.Context, limit int) *Registry {
-	return &Registry{ctx: ctx, limit: limit}
+	return &Registry{ctx: ctx, limit: limit, entries: make(map[string]*entry), locks: make(map[string]*lock)}
 }
 
 // newID encodes a 48-bit Unix millisecond timestamp plus 80 crypto-random bits,
@@ -75,7 +75,7 @@ func newID(now time.Time) (string, error) {
 	var out [26]byte
 	for i := range out {
 		v := byte(0)
-		for j := 0; j < 5; j++ {
+		for j := range 5 {
 			bit := i*5 + j - 2
 			v <<= 1
 			if bit >= 0 {
@@ -107,14 +107,20 @@ func (r *Registry) prune(now time.Time) {
 	}
 }
 func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(context.Context, func(string)) error) (Operation, error) {
+	return r.SubmitFinalized(kind, vm, owner, run, nil)
+}
+
+// SubmitFinalized releases admission resources before publishing completion,
+// including rejection and cancellation before the callback can execute.
+func (r *Registry) SubmitFinalized(kind, vm string, owner identity.Principal, run func(context.Context, func(string)) error, finalize func()) (op Operation, err error) {
+	accepted := false
+	defer func() {
+		if !accepted && finalize != nil {
+			finalize()
+		}
+	}()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.ctx == nil {
-		r.ctx = context.Background()
-	}
-	if r.limit <= 0 {
-		r.limit = 64
-	}
 	if r.closing || r.paused || r.Shutdown.Pending() || r.ctx.Err() != nil || r.Admission != nil && !r.Admission() {
 		return Operation{}, &authz.Error{Code: "unavailable", Message: "daemon is shutting down", Exit: 9}
 	}
@@ -125,10 +131,6 @@ func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(co
 	if err != nil {
 		return Operation{}, err
 	}
-	if r.entries == nil {
-		r.entries = make(map[string]*entry)
-		r.locks = make(map[string]*lock)
-	}
 	r.prune(time.Now())
 	e := &entry{op: Operation{ID: id, Kind: kind, VM: vm, Principal: owner, State: "queued", Started: time.Now().UTC(), Progress: []string{}}, changed: make(chan struct{})}
 	ctx, cancel := context.WithCancel(r.ctx)
@@ -138,16 +140,11 @@ func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(co
 	if kind == "create" {
 		lockKey = id
 	}
-	l := r.locks[lockKey]
-	if l == nil {
-		l = &lock{token: make(chan struct{}, 1)}
-		l.token <- struct{}{}
-		r.locks[lockKey] = l
-	}
-	l.refs++
+	l := r.acquireLocked(lockKey)
 	r.active++
 	r.Metrics.Job(1)
 	r.wg.Add(1)
+	accepted = true
 	go func() {
 		defer r.wg.Done()
 		defer cancel()
@@ -173,6 +170,9 @@ func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(co
 			}
 			l.token <- struct{}{}
 		}
+		if finalize != nil {
+			finalize()
+		}
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		e.op.State = "succeeded"
@@ -180,8 +180,8 @@ func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(co
 			e.op.State = "failed"
 			var categorized *authz.Error
 			if errors.As(err, &categorized) {
-				copy := *categorized
-				e.op.Error = &copy
+				failed := *categorized
+				e.op.Error = &failed
 			} else {
 				e.op.Error = &authz.Error{Code: "unavailable", Message: "operation failed; inspect VM state", Exit: 9}
 			}
@@ -194,12 +194,28 @@ func (r *Registry) Submit(kind, vm string, owner identity.Principal, run func(co
 		close(e.changed)
 		e.changed = nil
 		r.active--
-		l.refs--
-		if l.refs == 0 {
-			delete(r.locks, lockKey)
-		}
+		r.releaseLocked(lockKey, l)
 	}()
 	return clone(e.op), nil
+}
+
+// Per-VM locks are reference counted so a key disappears with its last user.
+func (r *Registry) acquireLocked(key string) *lock {
+	l := r.locks[key]
+	if l == nil {
+		l = &lock{token: make(chan struct{}, 1)}
+		l.token <- struct{}{}
+		r.locks[key] = l
+	}
+	l.refs++
+	return l
+}
+
+func (r *Registry) releaseLocked(key string, l *lock) {
+	l.refs--
+	if l.refs == 0 {
+		delete(r.locks, key)
+	}
 }
 func (r *Registry) update(e *entry, f func(*Operation)) {
 	r.mu.Lock()
@@ -213,20 +229,11 @@ func (r *Registry) update(e *entry, f func(*Operation)) {
 // durable ID, which does not exist when create is admitted by exact name.
 func (r *Registry) WithVM(ctx context.Context, id string, run func() error) error {
 	r.mu.Lock()
-	l := r.locks[id]
-	if l == nil {
-		l = &lock{token: make(chan struct{}, 1)}
-		l.token <- struct{}{}
-		r.locks[id] = l
-	}
-	l.refs++
+	l := r.acquireLocked(id)
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
-		l.refs--
-		if l.refs == 0 {
-			delete(r.locks, id)
-		}
+		r.releaseLocked(id, l)
 		r.mu.Unlock()
 	}()
 	select {
@@ -268,7 +275,6 @@ func (r *Registry) Seal() {
 	r.closing = true
 	r.mu.Unlock()
 }
-func (r *Registry) Pause()  { r.mu.Lock(); r.paused = true; r.mu.Unlock() }
 func (r *Registry) Resume() { r.mu.Lock(); r.paused = false; r.mu.Unlock() }
 
 // InterruptIf cancels existing work without poisoning future admission after a
@@ -297,7 +303,6 @@ func (r *Registry) Wait(ctx context.Context) error {
 	}
 }
 
-// Drained is used only while admission is paused or permanently sealed.
 func (r *Registry) Drained() <-chan struct{} {
 	done := make(chan struct{})
 	go func() { r.wg.Wait(); close(done) }()

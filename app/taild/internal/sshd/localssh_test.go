@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -111,9 +112,10 @@ func TestLocalSSHDispatchJSONAndExit(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	var exit *ssh.ExitError
 	if e = session.Run("create dev"); e == nil {
 		t.Fatal("create without capability accepted")
-	} else if exit, ok := e.(*ssh.ExitError); !ok || exit.ExitStatus() != 4 {
+	} else if !errors.As(e, &exit) || exit.ExitStatus() != 4 {
 		t.Fatal(e)
 	}
 	session.Close()

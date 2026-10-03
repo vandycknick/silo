@@ -20,11 +20,11 @@ func (s *Service) diskAdmissionLocked(add uint64) error {
 	if err = unix.Statfs(s.Config.Home, &stat); err != nil {
 		return failure("unavailable", "disk availability unavailable", 9)
 	}
-	if stat.Bsize <= 0 || uint64(stat.Bavail) > math.MaxUint64/uint64(stat.Bsize) {
+	if stat.Bsize <= 0 || stat.Bavail > math.MaxUint64/uint64(stat.Bsize) {
 		return failure("unavailable", "disk availability invalid", 9)
 	}
-	available := uint64(stat.Bavail) * uint64(stat.Bsize)
-	needed := uint64(floor)
+	available := stat.Bavail * uint64(stat.Bsize)
+	needed := floor
 	for _, size := range s.diskPending {
 		if size > math.MaxUint64-needed {
 			return failure("limit", "disk reserve admission exceeded", 6)

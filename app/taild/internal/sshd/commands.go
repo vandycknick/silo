@@ -3,492 +3,464 @@ package sshd
 import (
 	"context"
 	"fmt"
-	"io"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/vandycknick/silo/app/taild/internal/authz"
+	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/service"
-	"github.com/vandycknick/silo/app/taild/internal/units"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
-func usage() error {
+func usage() *authz.Error {
 	return &authz.Error{Code: "usage", Message: "invalid command arguments; see help", Exit: 2}
 }
-func size(s string) (uint64, error) {
-	v, e := units.Bytes(s)
-	if e != nil || v <= 0 {
-		return 0, usage()
-	}
-	return uint64(v), nil
+
+// invocation is one authenticated command line and the session it runs in.
+type invocation struct {
+	ctx     context.Context
+	service *service.Service
+	caller  service.Caller
+	streams service.IO
+	json    bool
+	yes     bool
+	help    bool
 }
-func commands(ctx context.Context, s *service.Service, c service.Caller, t []string, jsonOutput bool, streams service.IO) (any, string, int, error) {
-	cmd := t[0]
-	args := t[1:]
-	var op jobs.Operation
-	var err error
-	switch cmd {
-	case "template", "policy":
-		if len(args) == 0 {
-			return nil, "", 2, usage()
+
+// reply is a command's outcome. exit carries guest or stream exit codes and is
+// zero for daemon-owned commands; failures travel as errors, which the
+// dispatcher categorizes. data may accompany an error, as a failed operation.
+type reply struct {
+	data  any
+	human string
+	exit  int
+}
+
+// handler parses its arguments, calls the domain, and renders the result.
+type handler func(iv *invocation, args []string) (reply, error)
+
+type command struct {
+	usage string
+	run   handler
+}
+
+var aliases = map[string]string{"new": "create", "list": "ls", "status": "show", "ssh": "shell"}
+
+var commands = map[string]command{
+	"whoami":   {"whoami [--json]", runWhoAmI},
+	"version":  {"version [--json]", runVersion},
+	"ls":       {"ls [--json]", runList},
+	"show":     {"show VM [--json]", runShow},
+	"ops":      {"ops [show op_ULID] [--json]", runOps},
+	"create":   {"create [IMAGE] [-n/--name NAME] [OPTIONS]", runCreate},
+	"start":    {"start VM [--json]", vmOperation((*service.Service).Start)},
+	"restart":  {"restart VM [--json]", vmOperation((*service.Service).Restart)},
+	"reauth":   {"reauth VM [--json] (stopped VM; requires vm.start and vm.stop)", vmOperation((*service.Service).Reauth)},
+	"stop":     {"stop VM [--force] [--timeout DURATION] [--json]", runStop},
+	"rm":       {"rm VM [--force] [--yes] [--json]", runRemove},
+	"set":      {"set VM name=NAME|cpus=N|memory=SIZE|disk=SIZE... [--json]", runSet},
+	"shell":    {"shell VM [-u USER] (requires ssh -t)", runShell},
+	"exec":     {"exec VM [-u USER] [-w DIR] [-e K=V]... [-t] -- CMD...", runExec},
+	"logs":     {"logs VM [--follow] [--stream monitor|serial|exec|network|network-audit] [--output stdout|stderr]", runLogs},
+	"template": {"template ls|show NAME|create NAME|edit NAME|rm NAME|validate [--owner tag:NAME] [--json]; create/edit/validate read one YAML document from stdin", documents("template")},
+	"policy":   {"policy ls|show NAME|create NAME|edit NAME|rm NAME|validate [--owner tag:NAME] [--json]; create/edit/validate read HCL from stdin", documents("policy")},
+}
+
+// help reads the table it is listed in, so it registers after the table.
+func init() { commands["help"] = command{"help [COMMAND [SUBCOMMAND]] [--json]", runHelp} }
+
+func commandHelp(name string) (string, bool) {
+	return detailedHelp(strings.Fields(name))
+}
+
+func runHelp(iv *invocation, args []string) (reply, error) {
+	text := generalHelp()
+	switch len(args) {
+	case 0:
+	case 1, 2:
+		var ok bool
+		if iv.service != nil {
+			text, ok = detailedHelp(args, iv.service.Config)
+		} else {
+			text, ok = detailedHelp(args)
 		}
-		verb := args[0]
-		name := ""
-		owner := identity.Principal("")
-		pos := 1
-		if verb != "ls" && verb != "validate" {
-			if len(args) < 2 {
-				return nil, "", 2, usage()
+		if !ok {
+			return reply{}, &authz.Error{Code: "usage", Message: "unknown command", Exit: 2}
+		}
+	default:
+		return reply{}, usage()
+	}
+	return reply{data: struct {
+		Help string `json:"help"`
+	}{text}, human: text}, nil
+}
+
+func runVersion(iv *invocation, args []string) (reply, error) {
+	if len(args) != 0 {
+		return reply{}, usage()
+	}
+	v := iv.service.Versions()
+	return reply{data: v, human: renderVersion(v)}, nil
+}
+
+func runWhoAmI(iv *invocation, args []string) (reply, error) {
+	if len(args) != 0 {
+		return reply{}, usage()
+	}
+	who, e := iv.service.WhoAmI(iv.caller.Peer)
+	if e != nil {
+		return reply{}, e
+	}
+	return reply{data: who, human: renderWhoAmI(iv.service.Capability, who)}, nil
+}
+
+func runList(iv *invocation, args []string) (reply, error) {
+	if len(args) != 0 {
+		return reply{}, usage()
+	}
+	vms, e := iv.service.List(iv.ctx, iv.caller.Peer)
+	if e != nil {
+		return reply{}, e
+	}
+	return reply{data: vms, human: renderList(vms)}, nil
+}
+
+func runShow(iv *invocation, args []string) (reply, error) {
+	if len(args) != 1 {
+		return reply{}, usage()
+	}
+	vm, e := iv.service.Show(iv.ctx, iv.caller.Peer, args[0])
+	if e != nil {
+		return reply{}, e
+	}
+	return reply{data: vm, human: renderShow(vm)}, nil
+}
+
+func runOps(iv *invocation, args []string) (reply, error) {
+	id := ""
+	switch {
+	case len(args) == 0:
+	case len(args) == 2 && args[0] == "show":
+		id = args[1]
+	default:
+		return reply{}, usage()
+	}
+	ops, e := iv.service.Ops(iv.caller.Peer, id)
+	if e != nil {
+		return reply{}, e
+	}
+	return reply{data: ops, human: renderOps(ops)}, nil
+}
+
+func runCreate(iv *invocation, args []string) (reply, error) {
+	q := service.CreateRequest{Labels: map[string]string{}}
+	f := newFlagSet("create")
+	f.Alias("n", f.Flag("name", func(value string) error {
+		if !config.ValidName(value) {
+			return usage()
+		}
+		q.Name = value
+		return nil
+	}))
+	image := f.Flag("image", nonEmpty(&q.Image))
+	f.Flag("template", nonEmpty(&q.Template))
+	f.Flag("policy", nonEmpty(&q.PolicyRef))
+	f.Flag("owner", principal(&q.Owner))
+	f.Flag("cpus", count(&q.CPUs))
+	f.Flag("memory", nonEmpty(&q.MemoryText))
+	f.Alias("disk-size", f.Flag("disk", nonEmpty(&q.DiskText)))
+	f.Bool("no-tailnet", &q.NoTailnet)
+	f.Bool("no-start", &q.NoStart)
+	f.Flag("provision-user", func(v string) error {
+		u, e := silo.ParseGuestUser(v)
+		q.GuestUser = &u
+		return e
+	})
+	userdata := f.String("userdata", &q.Userdata)
+	f.Repeat("label", func(v string) error {
+		k, value, ok := strings.Cut(v, "=")
+		if _, dup := q.Labels[k]; !ok || dup {
+			return usage()
+		}
+		q.Labels[k] = value
+		return nil
+	})
+	positionals, e := f.ParsePositionals(args)
+	if e != nil {
+		return reply{}, e
+	}
+	if len(positionals) > 1 {
+		return reply{}, usageReason("unexpected positional argument: create accepts one IMAGE")
+	}
+	if len(positionals) == 1 {
+		if image.seen {
+			return reply{}, usageReason("IMAGE and --image cannot be supplied together")
+		}
+		if e := image.Set(positionals[0]); e != nil {
+			return reply{}, usageReason("invalid IMAGE")
+		}
+	}
+	// Parsing stays pure; the one flag that reads the session does so after.
+	q.UserdataSet = userdata.seen
+	if q.UserdataSet && q.Userdata == "-" {
+		data, e := iv.document(identity.Create, 16384)
+		if e != nil {
+			return reply{}, e
+		}
+		q.Userdata = string(data)
+	}
+	return iv.await(iv.service.Create(iv.ctx, iv.caller, q))
+}
+
+// vmOperation adapts the single-argument mutations, which share a grammar.
+func vmOperation(run func(*service.Service, context.Context, service.Caller, string) (jobs.Operation, error)) handler {
+	return func(iv *invocation, args []string) (reply, error) {
+		if len(args) != 1 {
+			return reply{}, usage()
+		}
+		return iv.await(run(iv.service, iv.ctx, iv.caller, args[0]))
+	}
+}
+
+func runStop(iv *invocation, args []string) (reply, error) {
+	vm, args, e := shift(args)
+	if e != nil {
+		return reply{}, e
+	}
+	var q service.StopRequest
+	f := newFlagSet("stop")
+	f.Bool("force", &q.Force)
+	f.Flag("timeout", duration(&q.Timeout))
+	if e := f.Parse(args); e != nil {
+		return reply{}, e
+	}
+	return iv.await(iv.service.Stop(iv.ctx, iv.caller, vm, q))
+}
+
+func runRemove(iv *invocation, args []string) (reply, error) {
+	vm, args, e := shift(args)
+	if e != nil {
+		return reply{}, e
+	}
+	q := service.RemoveRequest{Confirmed: iv.yes}
+	f := newFlagSet("rm")
+	f.Bool("force", &q.Force)
+	if e := f.Parse(args); e != nil {
+		return reply{}, e
+	}
+	target, e := iv.service.PreflightRemove(iv.ctx, iv.caller, vm, q.Force)
+	if e != nil {
+		return reply{}, e
+	}
+	if !q.Confirmed {
+		q.Confirmed = confirmRemoval(iv.ctx, iv.streams, target)
+	}
+	if !q.Confirmed || iv.ctx.Err() != nil {
+		return reply{}, &authz.Error{Code: "cancelled", Message: "removal cancelled", Exit: 2}
+	}
+	return iv.await(iv.service.Remove(iv.ctx, iv.caller, target.ID, q))
+}
+
+func runSet(iv *invocation, args []string) (reply, error) {
+	vm, args, e := shift(args)
+	if e != nil || len(args) == 0 {
+		return reply{}, usage()
+	}
+	var q service.SetRequest
+	seen := map[string]bool{}
+	for _, arg := range args {
+		k, v, ok := strings.Cut(arg, "=")
+		if !ok || seen[k] {
+			if seen[k] {
+				return reply{}, usageReason("duplicate setting")
 			}
-			name = args[1]
-			pos = 2
+			return reply{}, usageReason("set expects KEY=VALUE")
 		}
-		if len(args) > pos {
-			if len(args) != pos+2 || args[pos] != "--owner" {
-				return nil, "", 2, usage()
+		seen[k] = true
+		switch k {
+		case "name":
+			q.Name = &v
+		case "cpus":
+			n, e := strconv.ParseUint(v, 10, 8)
+			if e != nil || n == 0 {
+				return reply{}, usageReason("invalid cpus setting: expected a positive integer (1..255)")
 			}
-			owner = identity.Principal(args[pos+1])
-		}
-		switch verb {
-		case "ls", "show", "create", "edit", "rm", "validate":
+			cpus := uint8(n)
+			q.CPUs = &cpus
+		case "memory", "disk":
+			if k == "memory" {
+				q.MemoryText = &v
+			} else {
+				q.DiskText = &v
+			}
 		default:
-			return nil, "", 2, usage()
+			return reply{}, usageReason("unknown setting; expected name, cpus, memory or disk")
+		}
+	}
+	return iv.await(iv.service.Set(iv.ctx, iv.caller, vm, q))
+}
+
+func runShell(iv *invocation, args []string) (reply, error) {
+	vm, args, e := shift(args)
+	if e != nil {
+		return reply{}, e
+	}
+	user := ""
+	f := newFlagSet("shell")
+	f.String("u", &user)
+	if e := f.Parse(args); e != nil {
+		return reply{}, e
+	}
+	code, e := iv.service.Shell(iv.ctx, iv.caller, vm, user, iv.streams)
+	return reply{exit: code}, e
+}
+
+func runExec(iv *invocation, args []string) (reply, error) {
+	vm, args, e := shift(args)
+	if e != nil {
+		return reply{}, e
+	}
+	options, guest, ok := splitDelimiter(args)
+	if !ok || len(guest) == 0 {
+		return reply{}, usage()
+	}
+	q := service.ExecRequest{Env: map[string]string{}, Program: guest[0], Args: guest[1:]}
+	f := newFlagSet("exec")
+	f.String("u", &q.User)
+	f.String("w", &q.Directory)
+	f.Bool("t", &q.TTY)
+	f.Repeat("e", keyValue(q.Env))
+	if e := f.Parse(options); e != nil {
+		return reply{}, e
+	}
+	code, e := iv.service.Exec(iv.ctx, iv.caller, vm, q, iv.streams)
+	return reply{exit: code}, e
+}
+
+func runLogs(iv *invocation, args []string) (reply, error) {
+	vm, args, e := shift(args)
+	if e != nil {
+		return reply{}, e
+	}
+	var q service.LogsRequest
+	f := newFlagSet("logs")
+	f.Bool("follow", &q.Follow)
+	f.Flag("stream", func(v string) error {
+		q.Source = silo.MachineLogSource(v)
+		// The SDK spells this one with an underscore; the CLI uses a dash.
+		if v == "network-audit" {
+			q.Source = silo.MachineLogNetworkAudit
+		}
+		return nil
+	})
+	f.Flag("output", func(v string) error { q.Output = silo.MachineLogOutput(v); return nil })
+	if e := f.Parse(args); e != nil {
+		return reply{}, e
+	}
+	return reply{}, iv.service.Logs(iv.ctx, iv.caller, vm, q, iv.streams.Stdout)
+}
+
+// documents serves template and policy, which differ only in document kind.
+func documents(kind string) handler {
+	return func(iv *invocation, args []string) (reply, error) {
+		verb, args, e := shift(args)
+		if e != nil {
+			return reply{}, e
+		}
+		name := ""
+		switch verb {
+		case "ls", "validate":
+		case "show", "create", "edit", "rm":
+			if name, args, e = shift(args); e != nil {
+				return reply{}, e
+			}
+		default:
+			return reply{}, usage()
+		}
+		var owner identity.Principal
+		f := newFlagSet(kind)
+		f.Flag("owner", principal(&owner))
+		if e := f.Parse(args); e != nil {
+			return reply{}, e
 		}
 		raw := ""
-		if verb == "create" || verb == "edit" || verb == "validate" {
+		switch verb {
+		case "create", "edit", "validate":
 			action := identity.TemplateManage
 			if verb == "validate" {
 				action = identity.Read
 			}
-			if e := s.Authorize(c.Peer, action, nil); e != nil {
-				return nil, "", 4, e
-			}
-			data, e := documentInput(ctx, streams, service.DocumentLimit)
+			data, e := iv.document(action, service.DocumentLimit)
 			if e != nil {
-				return nil, "", 2, e
+				return reply{}, e
 			}
 			raw = string(data)
 		}
-		docs, e := s.Documents(ctx, c, cmd, verb, name, owner, raw)
+		docs, e := iv.service.Documents(iv.ctx, iv.caller, kind, verb, name, owner, raw)
 		if e != nil {
-			return nil, "", service.Categorize(e).Exit, e
+			return reply{}, e
 		}
-		var b strings.Builder
-		if verb == "show" {
-			b.WriteString(docs[0].Content)
-		} else {
-			for _, d := range docs {
-				fmt.Fprintf(&b, "%s %s %s\n", d.Kind, d.Name, d.Tier)
-				if d.Template != nil {
-					if d.Template.Description != nil {
-						fmt.Fprintf(&b, "Description: %s\n", *d.Template.Description)
-					}
-					t := d.Template
-					if t.Image != nil {
-						fmt.Fprintf(&b, "Image: %s\n", *t.Image)
-					}
-					if t.Resources != nil {
-						if t.Resources.CPUs != nil {
-							fmt.Fprintf(&b, "CPUs: %d\n", *t.Resources.CPUs)
-						}
-						if t.Resources.Memory != nil {
-							fmt.Fprintf(&b, "Memory: %s\n", *t.Resources.Memory)
-						}
-					}
-					if t.DiskSize != nil {
-						fmt.Fprintf(&b, "Disk: %s\n", *t.DiskSize)
-					}
-					if t.Network != nil {
-						if t.Network.PolicyRef != nil {
-							fmt.Fprintf(&b, "Policy: %s\n", *t.Network.PolicyRef)
-						}
-						if len(t.Network.Publish) > 0 {
-							fmt.Fprintf(&b, "Guest TCP hints (ACL controls access): %v\n", t.Network.Publish)
-						}
-					}
-				}
-				if d.Secrets != nil {
-					for _, slot := range d.Secrets.Slots {
-						fmt.Fprintf(&b, "Secret: %s (key %s, required %t)\n", slot.Name, slot.Source.Key, slot.Required)
-					}
-				}
-			}
-		}
-		return docs, b.String(), 0, nil
-	case "ls":
-		if len(args) != 0 {
-			return nil, "", 2, usage()
-		}
-		v, e := s.List(ctx, c.Peer)
-		return v, renderList(v), 0, e
-	case "show":
-		if len(args) != 1 {
-			return nil, "", 2, usage()
-		}
-		v, e := s.Show(ctx, c.Peer, args[0])
-		return v, renderShow(v), 0, e
-	case "ops":
-		id := ""
-		if len(args) != 0 {
-			if len(args) != 2 || args[0] != "show" {
-				return nil, "", 2, usage()
-			}
-			id = args[1]
-		}
-		ops, e := s.Ops(c.Peer, id)
-		var b strings.Builder
-		for _, op := range ops {
-			fmt.Fprintf(&b, "%s %s %s %s\n", op.ID, op.Kind, op.VM, op.State)
-		}
-		return ops, b.String(), 0, e
-	case "create":
-		if len(args) == 0 {
-			return nil, "", 2, usage()
-		}
-		q := service.CreateRequest{Name: args[0], Labels: map[string]string{}}
-		seen := map[string]bool{}
-		start := 1
-		if len(args) > 1 && !strings.HasPrefix(args[1], "--") {
-			q.Image = args[1]
-			seen["--image"] = true
-			start = 2
-		}
-		for i := start; i < len(args); i++ {
-			key := args[i]
-			if key == "--disk-size" {
-				key = "--disk"
-			}
-			if key != "--label" && seen[key] {
-				return nil, "", 2, usage()
-			}
-			seen[key] = true
-			switch key {
-			case "--no-tailnet":
-				q.NoTailnet = true
-			case "--no-start":
-				q.NoStart = true
-			default:
-				if i+1 >= len(args) {
-					return nil, "", 2, usage()
-				}
-				i++
-				v := args[i]
-				switch key {
-				case "--provision-user":
-					var u silo.GuestUser
-					u, err = silo.ParseGuestUser(v)
-					q.GuestUser = &u
-				case "--template":
-					if v == "" {
-						return nil, "", 2, usage()
-					}
-					q.Template = v
-				case "--policy":
-					if v == "" {
-						return nil, "", 2, usage()
-					}
-					q.PolicyRef = v
-				case "--image":
-					if v == "" {
-						return nil, "", 2, usage()
-					}
-					q.Image = v
-				case "--owner":
-					q.Owner = identity.Principal(v)
-				case "--cpus":
-					q.CPUs, err = strconv.ParseUint(v, 10, 64)
-					if q.CPUs == 0 {
-						err = usage()
-					}
-				case "--memory":
-					q.Memory, err = size(v)
-				case "--disk":
-					q.Disk, err = size(v)
-				case "--userdata":
-					q.UserdataSet = true
-					if v == "-" {
-						src := streams.Stdin
-						if streams.Input != nil {
-							src = streams.Input(ctx)
-						}
-						if src == nil {
-							return nil, "", 2, usage()
-						}
-						if e := s.Authorize(c.Peer, identity.Create, nil); e != nil {
-							return nil, "", 4, e
-						}
-						data, e := io.ReadAll(io.LimitReader(src, 16385))
-						if e != nil {
-							return nil, "", 255, e
-						}
-						if len(data) > 16384 {
-							return nil, "", 2, usage()
-						}
-						q.Userdata = string(data)
-					} else {
-						q.Userdata = v
-					}
-				case "--label":
-					k, value, ok := strings.Cut(v, "=")
-					if !ok {
-						err = usage()
-					} else if _, ok = q.Labels[k]; ok {
-						err = usage()
-					} else {
-						q.Labels[k] = value
-					}
-				default:
-					err = usage()
-				}
-				if err != nil {
-					return nil, "", 2, usage()
-				}
-			}
-		}
-		op, err = s.Create(ctx, c, q)
-	case "start", "restart", "reauth":
-		if len(args) != 1 {
-			return nil, "", 2, usage()
-		}
-		if cmd == "reauth" {
-			op, err = s.Reauth(ctx, c, args[0])
-		} else if cmd == "start" {
-			op, err = s.Start(ctx, c, args[0])
-		} else {
-			op, err = s.Restart(ctx, c, args[0])
-		}
-	case "stop":
-		if len(args) == 0 {
-			return nil, "", 2, usage()
-		}
-		q := service.StopRequest{}
-		for i := 1; i < len(args); i++ {
-			switch args[i] {
-			case "--force":
-				q.Force = true
-			case "--timeout":
-				if i+1 >= len(args) {
-					return nil, "", 2, usage()
-				}
-				i++
-				q.Timeout, err = time.ParseDuration(args[i])
-				if err != nil {
-					return nil, "", 2, usage()
-				}
-			default:
-				return nil, "", 2, usage()
-			}
-		}
-		op, err = s.Stop(ctx, c, args[0], q)
-	case "rm":
-		if len(args) == 0 {
-			return nil, "", 2, usage()
-		}
-		q := service.RemoveRequest{Confirmed: jsonOutput}
-		for _, arg := range args[1:] {
-			switch arg {
-			case "--force":
-				q.Force = true
-			case "--yes":
-				q.Confirmed = true
-			default:
-				return nil, "", 2, usage()
-			}
-		}
-		if !q.Confirmed && streams.Terminal.Present && streams.Stdin != nil {
-			line, e := readPrompt(streams.Stdin, humanOutput(streams), fmt.Sprintf("Remove %s? Type yes: ", args[0]), 1024)
-			if e == nil {
-				q.Confirmed = line == "yes"
-			}
-		}
-		op, err = s.Remove(ctx, c, args[0], q)
-	case "set":
-		if len(args) < 2 {
-			return nil, "", 2, usage()
-		}
-		q := service.SetRequest{}
-		seen := map[string]bool{}
-		for _, arg := range args[1:] {
-			k, v, ok := strings.Cut(arg, "=")
-			if !ok || seen[k] {
-				return nil, "", 2, usage()
-			}
-			seen[k] = true
-			switch k {
-			case "name":
-				q.Name = &v
-			case "cpus":
-				n, e := strconv.ParseUint(v, 10, 8)
-				if e != nil || n == 0 {
-					return nil, "", 2, usage()
-				}
-				n8 := uint8(n)
-				q.CPUs = &n8
-			case "memory", "disk":
-				n, e := size(v)
-				if e != nil {
-					return nil, "", 2, e
-				}
-				b := silo.Bytes(n)
-				if k == "memory" {
-					q.Memory = &b
-				} else {
-					q.Disk = &b
-				}
-			default:
-				return nil, "", 2, usage()
-			}
-		}
-		op, err = s.Set(ctx, c, args[0], q)
-	case "shell", "exec":
-		if jsonOutput || len(args) == 0 {
-			return nil, "", 2, usage()
-		}
-		q := service.ExecRequest{Env: map[string]string{}}
-		delimiter := false
-		for i := 1; i < len(args); i++ {
-			key := args[i]
-			if key == "--" {
-				if cmd != "exec" || i+1 >= len(args) {
-					return nil, "", 2, usage()
-				}
-				q.Program = args[i+1]
-				q.Args = args[i+2:]
-				delimiter = true
-				break
-			}
-			if key == "-t" && cmd == "exec" {
-				q.TTY = true
-				continue
-			}
-			if i+1 >= len(args) {
-				return nil, "", 2, usage()
-			}
-			i++
-			v := args[i]
-			switch key {
-			case "-u":
-				q.User = v
-			case "-w":
-				if cmd != "exec" {
-					return nil, "", 2, usage()
-				}
-				q.Directory = v
-			case "-e":
-				if cmd != "exec" {
-					return nil, "", 2, usage()
-				}
-				k, v, ok := strings.Cut(v, "=")
-				if !ok {
-					return nil, "", 2, usage()
-				}
-				q.Env[k] = v
-			default:
-				return nil, "", 2, usage()
-			}
-		}
-		var code int
-		if cmd == "shell" {
-			code, err = s.Shell(ctx, c, args[0], q.User, streams)
-		} else {
-			if !delimiter {
-				return nil, "", 2, usage()
-			}
-			code, err = s.Exec(ctx, c, args[0], q, streams)
-		}
-		return nil, "", code, err
-	case "logs":
-		if jsonOutput || len(args) == 0 {
-			return nil, "", 2, usage()
-		}
-		q := service.LogsRequest{}
-		for i := 1; i < len(args); i++ {
-			switch args[i] {
-			case "--follow":
-				q.Follow = true
-			case "--stream", "--output":
-				key := args[i]
-				if i+1 >= len(args) {
-					return nil, "", 2, usage()
-				}
-				i++
-				if key == "--stream" {
-					q.Source = silo.MachineLogSource(args[i])
-					if args[i] == "network-audit" {
-						q.Source = silo.MachineLogNetworkAudit
-					}
-				} else {
-					q.Output = silo.MachineLogOutput(args[i])
-				}
-			default:
-				return nil, "", 2, usage()
-			}
-		}
-		return nil, "", 0, s.Logs(ctx, c, args[0], q, streams.Stdout)
-	default:
-		return nil, "", 2, usage()
-	}
-	if err != nil {
-		return nil, "", service.Categorize(err).Exit, err
-	}
-	// The subscription belongs to the session; the operation belongs to jobs.
-	progress := 0
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		current, changed, e := s.Jobs.Observe(c.Peer, op.ID)
-		if e != nil {
-			return nil, "", 3, e
-		}
-		if progress > len(current.Progress) {
-			progress = 0
-		}
-		for _, line := range current.Progress[progress:] {
-			if _, e := fmt.Fprintln(humanOutput(streams), line); e != nil {
-				return nil, "", 255, e
-			}
-		}
-		progress = len(current.Progress)
-		if current.Finished != nil {
-			if current.Error != nil {
-				return current, "", current.Error.Exit, current.Error
-			}
-			return current, current.ID + " succeeded\n", 0, nil
-		}
-		select {
-		case <-ctx.Done():
-			return op, "", 255, &authz.Error{Code: "disconnected", Message: "observer closed; operation continues", Exit: 255}
-		case <-changed:
-		case <-ticker.C:
-			p, e := c.Fresh(ctx)
-			if e != nil || !p.Owns(current.Principal) {
-				return nil, "", 4, &authz.Error{Code: "forbidden", Message: "operation observer authorization lost", Exit: 4}
-			}
-			c.Peer = p
-		}
+		return reply{data: docs, human: renderDocuments(verb, docs)}, nil
 	}
 }
 
-func documentInput(ctx context.Context, streams service.IO, limit int) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	src := streams.Stdin
-	if streams.Input != nil {
-		src = streams.Input(ctx)
+// document reads one bounded document from the session input. The peer must
+// hold the action before the daemon consumes any of its bytes.
+func (iv *invocation) document(action identity.Action, limit int) ([]byte, error) {
+	if e := iv.service.Authorize(iv.caller.Peer, action, nil); e != nil {
+		return nil, e
 	}
-	if src == nil {
-		return nil, usage()
+	return documentInput(iv.ctx, iv.streams, limit)
+}
+
+// await relays operation progress to the human stream until it finishes. The
+// subscription belongs to this session; the operation belongs to jobs and
+// keeps running if the session disconnects.
+func (iv *invocation) await(op jobs.Operation, err error) (reply, error) {
+	if err != nil {
+		return reply{}, err
 	}
-	data, e := io.ReadAll(io.LimitReader(src, int64(limit+1)))
-	if e != nil {
-		return nil, &authz.Error{Code: "usage", Message: "document input interrupted or timed out", Exit: 2}
+	out := humanOutput(iv.streams)
+	reported := 0
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		current, changed, e := iv.service.Jobs.Observe(iv.caller.Peer, op.ID)
+		if e != nil {
+			return reply{}, e
+		}
+		if reported > len(current.Progress) {
+			reported = 0
+		}
+		for _, line := range current.Progress[reported:] {
+			if _, e := fmt.Fprintln(out, line); e != nil {
+				return reply{}, e
+			}
+		}
+		reported = len(current.Progress)
+		if current.Finished != nil {
+			if current.Error != nil {
+				return reply{data: current}, current.Error
+			}
+			message := current.Kind + " succeeded\n"
+			if current.Kind == "create" {
+				message = "create " + current.VM + " succeeded\n"
+			}
+			return reply{data: current, human: message}, nil
+		}
+		select {
+		case <-iv.ctx.Done():
+			return reply{data: op}, &authz.Error{Code: "disconnected", Message: "observer closed; operation continues", Exit: 255}
+		case <-changed:
+		case <-ticker.C:
+			p, e := iv.caller.Fresh(iv.ctx)
+			if e != nil || !p.Owns(current.Principal) {
+				return reply{}, &authz.Error{Code: "forbidden", Message: "operation observer authorization lost", Exit: 4}
+			}
+			iv.caller.Peer = p
+		}
 	}
-	if len(data) > limit {
-		return nil, &authz.Error{Code: "usage", Message: "document input exceeds size limit", Exit: 2}
-	}
-	return data, nil
 }

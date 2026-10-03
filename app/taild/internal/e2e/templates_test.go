@@ -114,7 +114,7 @@ rule "allow-local-http" {
 	}
 	run(two, "template show dev --json", "", 3)
 	run(two, "policy show local --json", "", 3)
-	run(one, "create templated --template dev --no-tailnet --provision-user silo:1000:1000:/home/silo --json", "", 0)
+	run(one, "create --name templated --template dev --no-tailnet --provision-user silo:1000:1000:/home/silo --json", "", 0)
 	m, e := r.SDK.Machine(ctx, "templated")
 	if e != nil {
 		t.Fatal(e)
@@ -166,7 +166,7 @@ rule "github" {
 	if e != nil {
 		t.Fatal(e)
 	}
-	result := run(one, "create must-not-exist --template dev --policy needs-token --no-tailnet --json", "", 2)
+	result := run(one, "create --name must-not-exist --template dev --policy needs-token --no-tailnet --json", "", 2)
 	if !strings.Contains(result, "github-api.token") || !strings.Contains(result, "bearer_token.github-api.token") {
 		t.Fatal(result)
 	}

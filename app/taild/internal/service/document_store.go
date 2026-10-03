@@ -91,7 +91,7 @@ func writeDocument(dir *os.File, name, raw string, create bool) error {
 	if e != nil {
 		return e
 	}
-	defer unix.Unlinkat(int(dir.Fd()), tmp, 0)
+	defer func() { _ = unix.Unlinkat(int(dir.Fd()), tmp, 0) }()
 	f := os.NewFile(uintptr(fd), tmp)
 	_, e = f.WriteString(raw)
 	if e == nil {

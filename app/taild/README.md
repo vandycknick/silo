@@ -68,8 +68,9 @@ explicit nulls in known fields or action elements are malformed. Explicit zero
 limits remain zero, with additive grants still taking their maximum.
 `vm.restart` and `vm.reauth` are composite operations requiring **both**
 `vm.stop` and `vm.start`, never separate wildcard grants. No admin scope exists.
-Authenticated peers without capabilities can use whoami/help/version to
-diagnose access, including an explanation naming the configured capability.
+Authenticated peers without capabilities can use whoami/help/version.
+Human whoami contains only the verified login and node; `whoami --json` retains
+the capability explanation and full identity diagnostics.
 
 The five exact label keys are `io.silo.taild.owner`, `.owner-login`, `.name`,
 `.node.mode`, `.instance`. Only this instance's valid labels select managed
@@ -134,7 +135,8 @@ Grammar is one line with POSIX single/double quotes and backslash escapes.
 No shell expansion, pipelines or redirection. Unquoted shell operators and
 expansion syntax fail validation; quoted/escaped bytes are literal. Empty
 quoted words are retained. Empty command with PTY opens a prompt; without PTY
-prints help and exits 2. `--json` returns exactly one stdout object with `ok`,
+prints help and exits 2. Interactive entry displays only `silo> `, without an
+automatic identity or capability banner. `--json` returns exactly one stdout object with `ok`,
 human/error text goes to stderr. Exit categories: 2 usage, 3 invisible/missing,
 4 capability denial, 5 state/conflict, 6 limit, 7 operation failure, 8 enrollment
 (pending/expired approval), 9 unavailable, 255 transport failure. Guest exit status passes through.
@@ -154,7 +156,7 @@ JSON retains byte counts, timestamp values and its address fields.
 ## VM commands
 
 ```text
-create NAME [IMAGE|--image OCI] [--template NAME] [--policy NAME]
+create [IMAGE] [-n/--name NAME] [--image OCI] [--template NAME] [--policy NAME]
              [--cpus N] [--memory SIZE] [--disk-size SIZE]
              [--provision-user NAME:UID:GID:HOME]
             [--userdata INLINE|-] [--label KEY=VALUE]... [--owner tag:NAME]
@@ -172,6 +174,26 @@ exec VM [-u USER] [-w GUEST_DIR] [-e KEY=VALUE]... [-t] -- CMD [ARG]...
 logs VM [--follow] [--stream SOURCE] [--output stdout|stderr]
 ops [show op_ULID]
 ```
+
+The positional create argument is always IMAGE. Flags may be interspersed with
+it; positional IMAGE and `--image` are mutually exclusive. An absent name uses
+the shared Silo generator, with at most three pre-publication collision attempts.
+The concrete name is reserved before hostname injection and operation publication.
+Submission failure and cancellation release name/quota/disk reservations even
+when the operation callback has not run. A conflict after publication fails
+without changing the chosen name.
+
+All commands and nested template/policy verbs support `-h`, `--help` and
+`help COMMAND [SUBCOMMAND]`, including aliases. Help checks/audits identity but
+does not read stdin, create jobs, reserve names or access VM/document state.
+Options' values and guest arguments after `--` remain literal, including
+`--help` and `--json`. Only removal accepts `--yes`.
+
+Create/set/template memory and disk values use the shared native CLI parsers:
+`8gb`, `8GB`, `8g` and `8GiB` all mean 8589934592 bytes. Case and surrounding
+whitespace are ignored. Configuration defaults, quota and disk-reserve parsing
+remain unchanged (`GB` decimal, `GiB` binary). SDK byte constructors retain
+their explicit decimal/binary distinction.
 
 Aliases: `new`, `list`, `status`, `ssh`. `--json` is available for queries and
 mutations, with [documented schemas](docs/json.md). Flags after the exec `--`
@@ -212,8 +234,15 @@ atomic native SDK update. Any tailscale declaration, even pending enrollment,
 prevents rename.
 
 Remove refuses running VMs without `--force` (5). Force requires stop permission,
-uses bounded `StopWith`, then reauthorizes deletion. Confirmation requires a PTY;
-unattended callers must use `--yes` or `--json`, and are never left waiting for input.
+uses bounded `StopWith`, then reauthorizes deletion. Remove prompts on stderr with
+`Remove VM 'devbox'? [y/N] ` (or `Stop and remove VM 'devbox'? [y/N] ` when running).
+Trimmed, case-insensitive `y` or `yes` confirms; `n`, `no`, Enter, Ctrl-C, EOF or
+disconnect cancels without submitting an operation (exit 2, `cancelled`). Other
+answers repeat the prompt. Both ordinary SSH stdin and the PTY editor work.
+Unattended callers must use `--yes`, which skips input and prompts. `--json` only
+selects the stdout envelope, including cancellation; `--force` only permits stopping.
+Preflight checks fresh identity and deletion/stop permissions before prompting,
+then execution reauthorizes against the pinned VM ID, even if its name changes.
 
 Mutations are bounded-admission daemon-owned jobs with crypto-entropy canonical
 `op_<ULID>` IDs, per-VM serialization and a 24-hour in-memory result/progress history.

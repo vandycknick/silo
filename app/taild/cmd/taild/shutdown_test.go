@@ -54,7 +54,7 @@ func TestRuntimeCloseDeadlineDoesNotWaitForHeldLibraryLock(t *testing.T) {
 	entered, finished := make(chan struct{}), make(chan struct{})
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	err := closeRuntimeAfterDrain(ctx, nil, nil, func() error { close(entered); lock.Lock(); lock.Unlock(); close(finished); return nil })
+	err := closeRuntimeAfterDrain(ctx, nil, nil, func() error { close(entered); lock.Lock(); defer lock.Unlock(); close(finished); return nil })
 	lock.RUnlock()
 	if !errors.Is(err, errRuntimeCleanupIncomplete) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("blocking close reported full cleanup", err)

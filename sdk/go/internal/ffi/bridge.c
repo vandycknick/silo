@@ -18,6 +18,7 @@ DECLARE_FFI(error_free);
 DECLARE_FFI(runtime_open);
 DECLARE_FFI(runtime_free);
 DECLARE_FFI(runtime_query);
+DECLARE_FFI(planning_query);
 DECLARE_FFI(runtime_machine_create);
 DECLARE_FFI(runtime_machine_get);
 DECLARE_FFI(runtime_machines);
@@ -107,6 +108,7 @@ char *bridge_load(const char *path, uint32_t expected_abi) {
     LOAD(ffi_runtime_open, "silo_runtime_open");
     LOAD(ffi_runtime_free, "silo_runtime_free");
     LOAD(ffi_runtime_query, "silo_runtime_query");
+    LOAD(ffi_planning_query, "silo_planning_query");
     LOAD(ffi_runtime_machine_create, "silo_runtime_machine_create");
     LOAD(ffi_runtime_machine_get, "silo_runtime_machine_get");
     LOAD(ffi_runtime_machines, "silo_runtime_machines");
@@ -155,6 +157,7 @@ char *bridge_load(const char *path, uint32_t expected_abi) {
 }
 
 uint32_t bridge_abi_version(void) { return ffi_abi_version(); }
+silo_error *bridge_planning_query(const uint8_t *request, size_t request_len, silo_buffer *out_data) { return ffi_planning_query(request, request_len, out_data); }
 const char *bridge_sdk_version(void) { return ffi_sdk_version(); }
 void bridge_string_free(char *value) { free(value); }
 void bridge_buffer_free(silo_buffer value) { ffi_buffer_free(value); }

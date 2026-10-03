@@ -31,6 +31,7 @@ mod machine;
 mod network;
 pub mod node_state;
 mod paths;
+pub mod planning;
 mod runtime;
 mod secrets;
 mod ssh_ca;

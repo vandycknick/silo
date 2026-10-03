@@ -136,11 +136,11 @@ func OCIRegistry(t *testing.T, rootfs string) *Registry {
 		r.Requests.Add(1)
 		w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
 		if req.URL.Path == "/v2/" {
-			w.WriteHeader(200)
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 		if req.Method != http.MethodGet && req.Method != http.MethodHead {
-			w.WriteHeader(405)
+			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
 		if strings.HasPrefix(req.URL.Path, "/v2/fixture/rootfs/manifests/") {
@@ -149,7 +149,7 @@ func OCIRegistry(t *testing.T, rootfs string) *Registry {
 			}
 			ref := strings.TrimPrefix(req.URL.Path, "/v2/fixture/rootfs/manifests/")
 			if ref != "latest" && ref != digest(manifest) {
-				w.WriteHeader(404)
+				w.WriteHeader(http.StatusNotFound)
 				return
 			}
 			w.Header().Set("Content-Type", media)
@@ -168,7 +168,7 @@ func OCIRegistry(t *testing.T, rootfs string) *Registry {
 			}
 			return
 		}
-		w.WriteHeader(404)
+		w.WriteHeader(http.StatusNotFound)
 	}))
 	key, e := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if e != nil {

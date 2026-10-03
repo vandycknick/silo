@@ -17,6 +17,9 @@ import (
 	"tailscale.com/ssh/tailssh"
 )
 
+// SSH names signals; the guest agent takes Linux numbers.
+var signalNumbers = map[tailssh.Signal]uint32{"HUP": 1, "INT": 2, "QUIT": 3, "ILL": 4, "ABRT": 6, "FPE": 8, "KILL": 9, "USR1": 10, "SEGV": 11, "USR2": 12, "PIPE": 13, "ALRM": 14, "TERM": 15}
+
 type Server struct {
 	Service  *service.Service
 	Resolver httpd.Resolver
@@ -61,7 +64,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		s.mu.Unlock()
 		go func() {
 			defer s.wg.Done()
-			defer sess.Close()
+			defer func() { _ = sess.Close() }()
 			defer func() { s.mu.Lock(); delete(s.active, sess); s.mu.Unlock(); s.Service.Runtime.Metrics.Session(-1) }()
 			s.session(ctx, sess)
 		}()
@@ -156,8 +159,7 @@ func (s *Server) session(parent context.Context, sess *tailssh.Session) {
 			case <-ctx.Done():
 				return
 			case sig := <-signals:
-				numbers := map[tailssh.Signal]uint32{"HUP": 1, "INT": 2, "QUIT": 3, "ILL": 4, "ABRT": 6, "FPE": 8, "KILL": 9, "USR1": 10, "SEGV": 11, "USR2": 12, "PIPE": 13, "ALRM": 14, "TERM": 15}
-				if n, ok := numbers[sig]; ok {
+				if n, ok := signalNumbers[sig]; ok {
 					select {
 					case convertedSignals <- n:
 					case <-ctx.Done():
@@ -175,7 +177,7 @@ func (s *Server) session(parent context.Context, sess *tailssh.Session) {
 		return
 	}
 	if !pty {
-		_, _ = io.WriteString(diagnostic, Help)
+		_, _ = io.WriteString(diagnostic, HelpText())
 		_ = sess.Exit(2)
 		return
 	}

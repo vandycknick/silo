@@ -2,15 +2,12 @@ package state
 
 import (
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
-
-	"github.com/vandycknick/silo/app/taild/internal/identity"
 )
 
 func PrivateDir(path string) error {
@@ -33,7 +30,7 @@ func AtomicWrite(path string, b []byte) error {
 		return e
 	}
 	tmp := f.Name()
-	defer os.Remove(tmp)
+	defer func() { _ = os.Remove(tmp) }()
 	if e = f.Chmod(0600); e == nil {
 		_, e = f.Write(b)
 	}
@@ -59,16 +56,6 @@ func SyncDir(path string) error {
 	}
 	defer f.Close()
 	return f.Sync()
-}
-func PrincipalDir(home string, p identity.Principal) (string, error) {
-	if _, e := identity.ParsePrincipal(string(p)); e != nil {
-		return "", e
-	}
-	path := filepath.Join(home, "taild", "principals", base64.RawURLEncoding.EncodeToString([]byte(p)))
-	if e := PrivateDir(path); e != nil {
-		return "", e
-	}
-	return path, nil
 }
 func Instance(home string) (string, error) {
 	s, e := ReadInstance(home)

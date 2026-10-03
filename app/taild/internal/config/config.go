@@ -120,7 +120,7 @@ func Load(path string) (Config, error) {
 		return c, e
 	}
 	var extra yaml.Node
-	if e = d.Decode(&extra); e != io.EOF {
+	if e = d.Decode(&extra); !errors.Is(e, io.EOF) {
 		return c, errors.New("config must contain one YAML document")
 	}
 	return c, c.Validate()
@@ -134,7 +134,7 @@ func (c Config) Limits() (identity.Limits, error) {
 	if e != nil {
 		return identity.Limits{}, e
 	}
-	return identity.Limits{VMs: c.VM.Ceilings.VMs, CPUs: c.VM.Ceilings.CPUs, Memory: uint64(mem), Disk: uint64(disk)}, nil
+	return identity.Limits{VMs: c.VM.Ceilings.VMs, CPUs: c.VM.Ceilings.CPUs, Memory: mem, Disk: disk}, nil
 }
 func (c Config) Validate() error {
 	if _, e := units.Bytes(c.DiskReserve); e != nil {
@@ -188,7 +188,7 @@ func (c Config) Validate() error {
 	if e != nil {
 		return e
 	}
-	if l.VMs == 0 || l.CPUs == 0 || l.CPUs > 255 || l.Memory == 0 || l.Disk == 0 || c.VM.Defaults.CPUs == 0 || c.VM.Defaults.CPUs > l.CPUs || uint64(m) == 0 || uint64(m) > l.Memory || uint64(disk) == 0 || uint64(disk) > l.Disk {
+	if l.VMs == 0 || l.CPUs == 0 || l.CPUs > 255 || l.Memory == 0 || l.Disk == 0 || c.VM.Defaults.CPUs == 0 || c.VM.Defaults.CPUs > l.CPUs || m == 0 || m > l.Memory || disk == 0 || disk > l.Disk {
 		return errors.New("invalid resource defaults or ceilings")
 	}
 	if c.Sessions.Global < 1 || c.Sessions.PerPeer < 1 || c.Sessions.PerPeer > c.Sessions.Global {

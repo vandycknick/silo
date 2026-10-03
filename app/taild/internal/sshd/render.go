@@ -6,6 +6,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/service"
 )
 
@@ -16,13 +17,13 @@ func renderList(vms []service.VM) string {
 func renderListAt(vms []service.VM, now time.Time) string {
 	var b strings.Builder
 	table := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(table, "NAME\tSTATE\tNODE\tCPUS\tMEMORY\tCREATED")
+	_, _ = fmt.Fprintln(table, "NAME\tSTATE\tNODE\tCPUS\tMEMORY\tCREATED")
 	for _, vm := range vms {
 		node := vm.Node
 		if node == "" {
 			node = string(vm.NodeState)
 		}
-		fmt.Fprintf(table, "%s\t%s\t%s\t%d\t%s\t%s\n", vm.Name, vm.State, node, vm.CPUs, humanMemory(vm.Memory), relativeTime(vm.Created, now))
+		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%d\t%s\t%s\n", vm.Name, vm.State, node, vm.CPUs, humanMemory(vm.Memory), relativeTime(vm.Created, now))
 	}
 	_ = table.Flush()
 	for _, vm := range vms {
@@ -58,14 +59,67 @@ func renderShow(v service.VM) string {
 	}
 	return text
 }
-func commandHelp(cmd string) (string, bool) {
-	help := map[string]string{
-		"reauth":   "reauth VM [--json] (stopped VM; requires vm.start and vm.stop)",
-		"create":   "create NAME [IMAGE|--image OCI] [--template NAME] [--policy NAME] [--cpus N] [--memory SIZE] [--disk-size SIZE] [--provision-user NAME:UID:GID:HOME] [--userdata INLINE|-] [--label K=V]... [--owner tag:NAME] [--no-tailnet] [--no-start]",
-		"template": "template ls|show NAME|create NAME|edit NAME|rm NAME|validate [--owner tag:NAME] [--json]; create/edit/validate read one YAML document from stdin",
-		"policy":   "policy ls|show NAME|create NAME|edit NAME|rm NAME|validate [--owner tag:NAME] [--json]; create/edit/validate read HCL from stdin",
-		"ls":       "ls [--json]", "show": "show VM [--json]", "start": "start VM [--json]", "stop": "stop VM [--force] [--timeout DURATION] [--json]", "restart": "restart VM [--json]", "rm": "rm VM [--force] [--yes|--json]", "set": "set VM name=NAME|cpus=N|memory=SIZE|disk=SIZE... [--json]", "shell": "shell VM [-u USER] (requires ssh -t)", "exec": "exec VM [-u USER] [-w DIR] [-e K=V]... [-t] -- CMD...", "logs": "logs VM [--follow] [--stream monitor|serial|exec|network|network-audit] [--output stdout|stderr]", "ops": "ops [show op_ULID] [--json]", "whoami": "whoami [--json]", "version": "version [--json]", "help": "help [COMMAND] [--json]",
+func renderVersion(v service.Version) string {
+	return fmt.Sprintf("taild %s · SDK %s · runtime %s · tailscale %s\n", v.Taild, v.SDK, v.Runtime, v.Tailscale)
+}
+
+func renderWhoAmI(_ string, who service.WhoAmI) string {
+	p := who.Peer
+	user := p.Login
+	for _, principal := range p.Principals {
+		if principal.IsTag() {
+			user = "tagged device"
+			break
+		}
 	}
-	value, ok := help[cmd]
-	return value + "\n", ok
+	if user == "" {
+		user = "unknown"
+	}
+	return fmt.Sprintf("User: %s\nNode: %s\n", user, strings.TrimSuffix(p.NodeName, "."))
+}
+
+func renderOps(ops []jobs.Operation) string {
+	var b strings.Builder
+	for _, op := range ops {
+		fmt.Fprintf(&b, "%s %s %s %s\n", op.ID, op.Kind, op.VM, op.State)
+	}
+	return b.String()
+}
+
+// renderDocuments prints show verbatim; every other verb lists summaries.
+func renderDocuments(verb string, docs []service.Document) string {
+	if verb == "show" {
+		return docs[0].Content
+	}
+	var b strings.Builder
+	for _, d := range docs {
+		fmt.Fprintf(&b, "%s %s %s\n", d.Kind, d.Name, d.Tier)
+		if t := d.Template; t != nil {
+			optional(&b, "Description", t.Description)
+			optional(&b, "Image", t.Image)
+			if t.Resources != nil {
+				optional(&b, "CPUs", t.Resources.CPUs)
+				optional(&b, "Memory", t.Resources.Memory)
+			}
+			optional(&b, "Disk", t.DiskSize)
+			if t.Network != nil {
+				optional(&b, "Policy", t.Network.PolicyRef)
+				if len(t.Network.Publish) > 0 {
+					fmt.Fprintf(&b, "Guest TCP hints (ACL controls access): %v\n", t.Network.Publish)
+				}
+			}
+		}
+		if d.Secrets != nil {
+			for _, slot := range d.Secrets.Slots {
+				fmt.Fprintf(&b, "Secret: %s (key %s, required %t)\n", slot.Name, slot.Source.Key, slot.Required)
+			}
+		}
+	}
+	return b.String()
+}
+
+func optional[T any](b *strings.Builder, label string, v *T) {
+	if v != nil {
+		fmt.Fprintf(b, "%s: %v\n", label, *v)
+	}
 }

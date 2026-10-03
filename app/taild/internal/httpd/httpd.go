@@ -28,7 +28,7 @@ func Handler(s *service.Service, resolver Resolver) http.Handler {
 	})
 	for _, path := range []string{"/healthz", "/metrics"} {
 		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != "GET" {
+			if r.Method != http.MethodGet {
 				w.WriteHeader(http.StatusMethodNotAllowed)
 				return
 			}

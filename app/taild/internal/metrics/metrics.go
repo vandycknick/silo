@@ -4,7 +4,9 @@ package metrics
 import (
 	"fmt"
 	"io"
-	"sort"
+	"maps"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -85,36 +87,30 @@ func (m *Metrics) Latency(kind string, elapsed time.Duration, success bool) {
 	v.Seconds += elapsed.Seconds()
 	m.latency[key] = v
 }
+
+// Write renders the exposition text. A failing scrape writer loses its own
+// scrape; nothing here is worth failing the daemon over.
 func (m *Metrics) Write(w io.Writer) {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	fmt.Fprintf(w, "taild_active_sessions %d\ntaild_active_operations %d\n", m.sessions, m.activeJobs)
-	keys := make([]string, 0, len(m.jobs))
-	for k := range m.jobs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		var kind, outcome string
-		for j, c := range key {
-			if c == '/' {
-				kind, outcome = key[:j], key[j+1:]
-				break
-			}
-		}
+	var b strings.Builder
+	fmt.Fprintf(&b, "taild_active_sessions %d\ntaild_active_operations %d\n", m.sessions, m.activeJobs)
+	for _, key := range slices.Sorted(maps.Keys(m.jobs)) {
+		kind, outcome, _ := strings.Cut(key, "/")
 		v := m.jobs[key]
-		fmt.Fprintf(w, "taild_operations_total{kind=%q,outcome=%q} %d\ntaild_operation_duration_seconds_sum{kind=%q,outcome=%q} %g\ntaild_operation_duration_seconds_count{kind=%q,outcome=%q} %d\n", kind, outcome, v.Count, kind, outcome, v.Seconds, kind, outcome, v.Count)
+		fmt.Fprintf(&b, "taild_operations_total{kind=%q,outcome=%q} %d\ntaild_operation_duration_seconds_sum{kind=%q,outcome=%q} %g\ntaild_operation_duration_seconds_count{kind=%q,outcome=%q} %d\n", kind, outcome, v.Count, kind, outcome, v.Seconds, kind, outcome, v.Count)
 	}
 	for _, kind := range []string{"whois", "enrollment"} {
 		for _, outcome := range []string{"succeeded", "failed"} {
 			v := m.latency[kind+"/"+outcome]
-			fmt.Fprintf(w, "taild_%s_duration_seconds_sum{outcome=%q} %g\ntaild_%s_duration_seconds_count{outcome=%q} %d\n", kind, outcome, v.Seconds, kind, outcome, v.Count)
+			fmt.Fprintf(&b, "taild_%s_duration_seconds_sum{outcome=%q} %g\ntaild_%s_duration_seconds_count{outcome=%q} %d\n", kind, outcome, v.Seconds, kind, outcome, v.Count)
 		}
 	}
 	for _, kind := range []string{"runtime", "machine", "exec", "logs", "node_lease"} {
-		fmt.Fprintf(w, "taild_native_handles{kind=%q,scope=\"daemon_owned\"} %d\n", kind, m.handles[kind])
+		fmt.Fprintf(&b, "taild_native_handles{kind=%q,scope=\"daemon_owned\"} %d\n", kind, m.handles[kind])
 	}
+	_, _ = io.WriteString(w, b.String())
 }

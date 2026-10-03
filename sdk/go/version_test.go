@@ -17,10 +17,10 @@ func TestVerifiedNativeABIVersion(t *testing.T) {
 	}
 }
 
-func TestABI3RejectsActualABI2Bridge(t *testing.T) {
-	if os.Getenv("SILO_ABI2_CHILD") == "1" {
+func TestABI4RejectsActualABI3Bridge(t *testing.T) {
+	if os.Getenv("SILO_ABI3_CHILD") == "1" {
 		_, err := VerifiedNativeABIVersion()
-		if !IsErrorKind(err, ErrorABIMismatch) || !strings.Contains(err.Error(), "bridge ABI 2, SDK requires ABI 3") {
+		if !IsErrorKind(err, ErrorABIMismatch) || !strings.Contains(err.Error(), "bridge ABI 3, SDK requires ABI 4") {
 			t.Fatalf("old ABI error = %v", err)
 		}
 		return
@@ -33,9 +33,16 @@ func TestABI3RejectsActualABI2Bridge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command(executable, "-test.run=^TestABI3RejectsActualABI2Bridge$")
-	command.Env = append(os.Environ(), "SILO_ABI2_CHILD=1", "SILO_GO_FFI_PATH="+old)
+	command := exec.Command(executable, "-test.run=^TestABI4RejectsActualABI3Bridge$")
+	command.Env = append(os.Environ(), "SILO_ABI3_CHILD=1", "SILO_GO_FFI_PATH="+old)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, output)
+	}
+}
+
+func TestNativeABIVersionConstant(t *testing.T) {
+	const got uint32 = NativeABIVersion
+	if got != 4 {
+		t.Fatalf("required ABI = %d", got)
 	}
 }

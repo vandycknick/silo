@@ -10,8 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vandycknick/silo/app/taild/internal/config"
-	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
@@ -36,14 +34,6 @@ func SystemState(ctx context.Context) (string, error) {
 type StopResult struct {
 	Issued, Finished, Failed int
 	Drained                  <-chan struct{}
-}
-
-func Managed(d *silo.MachineData, instance string) bool {
-	if d == nil || instance == "" || d.Labels[runtime.InstanceLabel] != instance || d.Labels[runtime.NameLabel] != d.Name || !config.ValidName(d.Name) {
-		return false
-	}
-	_, err := identity.ParsePrincipal(d.Labels[runtime.OwnerLabel])
-	return err == nil
 }
 
 // StopAll issues every stop concurrently before waiting. SDK native calls may
@@ -80,7 +70,7 @@ func StopAll(ctx context.Context, r *runtime.Runtime) (StopResult, error) {
 	}
 	completed := make(chan error, len(entries))
 	for _, entry := range entries {
-		if !Managed(entry.Data, r.Instance) {
+		if !runtime.Managed(entry.Data, r.Instance) {
 			continue
 		}
 		id := entry.Data.ID
@@ -96,7 +86,7 @@ func StopAll(ctx context.Context, r *runtime.Runtime) (StopResult, error) {
 					completed <- inspectErr
 					return
 				}
-				if !Managed(data, r.Instance) {
+				if !runtime.Managed(data, r.Instance) {
 					completed <- errors.New("shutdown ownership changed")
 					return
 				}

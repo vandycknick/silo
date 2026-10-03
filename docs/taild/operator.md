@@ -101,4 +101,5 @@ unstripped debug agent OOMs at 256 MiB. Retained debug builds require at least 1
 the current Linux amd64 release archive passed real guest execution at 256 MiB on
 2026-10-01. This does not qualify other guest workloads or architectures.
 `taild version` reports numeric required and actual verified native ABI (currently
-3); ABI 2 bridges are rejected before newer native symbols are resolved.
+4); older bridges are rejected before newer native symbols are resolved. The
+matching bridge is embedded in the portable taild binary.

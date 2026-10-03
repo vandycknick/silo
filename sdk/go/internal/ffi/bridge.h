@@ -9,6 +9,7 @@ const char *bridge_sdk_version(void);
 void bridge_string_free(char *value);
 void bridge_buffer_free(silo_buffer value);
 void bridge_error_free(silo_error *error);
+silo_error *bridge_planning_query(const uint8_t *request, size_t request_len, silo_buffer *out_data);
 
 silo_error *bridge_runtime_open(const uint8_t *request, size_t request_len, silo_runtime **out_runtime);
 void bridge_runtime_free(silo_runtime *runtime);

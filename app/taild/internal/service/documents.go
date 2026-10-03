@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -11,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/vandycknick/silo/app/taild/internal/identity"
-	"github.com/vandycknick/silo/app/taild/internal/units"
 	silo "github.com/vandycknick/silo/sdk/go"
 	"go.yaml.in/yaml/v3"
 	"tailscale.com/ipn"
@@ -72,7 +72,7 @@ func yamlShape(n *yaml.Node, t reflect.Type, depth int) error {
 			return usageDocument()
 		}
 		fields := map[string]reflect.Type{}
-		for i := 0; i < t.NumField(); i++ {
+		for i := range t.NumField() {
 			f := t.Field(i)
 			fields[strings.Split(f.Tag.Get("yaml"), ",")[0]] = f.Type
 		}
@@ -138,7 +138,7 @@ func (s *Service) ParseTemplate(raw string) (Template, error) {
 		return t, usageDocument()
 	}
 	var extra yaml.Node
-	if e := d.Decode(&extra); e != io.EOF {
+	if e := d.Decode(&extra); !errors.Is(e, io.EOF) {
 		return t, failure("usage", "exactly one YAML document is required", 2)
 	}
 	if e := yamlShape(n.Content[0], reflect.TypeFor[Template](), 0); e != nil {
@@ -161,13 +161,13 @@ func (s *Service) ParseTemplate(raw string) (Template, error) {
 			return t, usageDocument()
 		}
 		if t.Resources.Memory != nil {
-			if v, e := units.Bytes(*t.Resources.Memory); e != nil || v == 0 {
+			if _, e := silo.ParseMachineMemory(*t.Resources.Memory); e != nil {
 				return t, failure("usage", "invalid memory size", 2)
 			}
 		}
 	}
 	if t.DiskSize != nil {
-		if v, e := units.Bytes(*t.DiskSize); e != nil || v == 0 {
+		if _, e := silo.ParseRootDiskSize(*t.DiskSize); e != nil {
 			return t, failure("usage", "invalid disk_size", 2)
 		}
 	}
@@ -259,7 +259,7 @@ func InjectTailnet(p *silo.NetworkPolicy, hostname string, owner identity.Princi
 		controlURL = ipn.DefaultControlURL
 	}
 	tags := []string{}
-	if strings.HasPrefix(string(owner), "tag:") {
+	if owner.IsTag() {
 		tags = append(tags, string(owner))
 	}
 	if p == nil {
@@ -388,7 +388,7 @@ func selectedOwner(p identity.Peer, owner identity.Principal) (identity.Principa
 		}
 		return p.Principals[0], nil
 	}
-	if !strings.HasPrefix(string(owner), "tag:") || !p.Owns(owner) {
+	if !owner.IsTag() || !p.Owns(owner) {
 		return "", failure("forbidden", "owner must be a verified peer tag", 4)
 	}
 	return owner, nil
@@ -468,12 +468,12 @@ func (s *Service) resolveCreate(ctx context.Context, p identity.Peer, q CreateRe
 			if q.CPUs == 0 && t.Resources.CPUs != nil {
 				q.CPUs = *t.Resources.CPUs
 			}
-			if q.Memory == 0 && t.Resources.Memory != nil {
-				q.Memory, _ = units.Bytes(*t.Resources.Memory)
+			if q.Memory == 0 && q.MemoryText == "" && t.Resources.Memory != nil {
+				q.MemoryText = *t.Resources.Memory
 			}
 		}
-		if q.Disk == 0 && t.DiskSize != nil {
-			q.Disk, _ = units.Bytes(*t.DiskSize)
+		if q.Disk == 0 && q.DiskText == "" && t.DiskSize != nil {
+			q.DiskText = *t.DiskSize
 		}
 		if !q.UserdataSet && q.Userdata == "" && t.Userdata != nil {
 			q.Userdata = *t.Userdata
@@ -497,16 +497,6 @@ func (s *Service) resolveCreate(ctx context.Context, p identity.Peer, q CreateRe
 			return q, e
 		}
 		q.policy, e = parseRemotePolicy(docs[0].Content)
-		if e != nil {
-			return q, e
-		}
-	}
-	if s.VMNodesEnabled && !q.NoTailnet && s.Config.Enrollment.Mode != "none" {
-		controlURL := s.Config.Tailnet.ControlURL
-		if s.Enrollment != nil {
-			controlURL = s.Enrollment.Pin.ControlURL
-		}
-		q.policy, e = InjectTailnet(q.policy, q.Name, owner, controlURL)
 		if e != nil {
 			return q, e
 		}

@@ -12,7 +12,6 @@ import (
 	"testing"
 
 	"github.com/vandycknick/silo/app/taild/internal/config"
-	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 	silo "github.com/vandycknick/silo/sdk/go"
 )
@@ -35,7 +34,7 @@ func TestActualSDKRuntimeInventoryAndReservations(t *testing.T) {
 	var wg sync.WaitGroup
 	hold := make(chan struct{})
 	attempted := make(chan struct{}, 20)
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -50,7 +49,7 @@ func TestActualSDKRuntimeInventoryAndReservations(t *testing.T) {
 			}
 		}()
 	}
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		<-attempted
 	}
 	if won.Load() != 1 {
@@ -67,11 +66,6 @@ func TestActualSDKRuntimeInventoryAndReservations(t *testing.T) {
 	}
 	if _, e = os.Stat(filepath.Join(c.Home, "state.db")); e != nil {
 		t.Fatal("SDK did not open real home:", e)
-	}
-	projection := Visible([]VM{{ID: "x", Name: "dev", Owner: "user:1"}, {ID: "y", Name: "other", Owner: "user:2"}}, identity.Peer{Principals: []identity.Principal{"user:1"}})
-	b, e := json.Marshal(projection)
-	if e != nil || len(projection) != 1 || strings.Contains(string(b), c.Home) {
-		t.Fatal("unsafe projection")
 	}
 }
 func TestMissingRuntime(t *testing.T) {
@@ -121,9 +115,14 @@ func TestActualSDKLabelAuthorityAndResilientRecords(t *testing.T) {
 	if e != nil || len(snapshot.VMs) != 3 || snapshot.Unmanaged != 1 {
 		t.Fatalf("%+v %v", snapshot, e)
 	}
-	visible := Visible(snapshot.VMs, identity.Peer{Principals: []identity.Principal{"user:1"}})
-	if len(visible) != 2 {
-		t.Fatal(visible)
+	owned := 0
+	for _, vm := range snapshot.VMs {
+		if vm.Owner == "user:1" {
+			owned++
+		}
+	}
+	if owned != 2 {
+		t.Fatal(snapshot.VMs)
 	}
 	if _, e = r.Reserve(ctx, "foreign", nil); e == nil {
 		t.Fatal("another owner's exact local name was not reserved")
@@ -150,5 +149,23 @@ db=sqlite3.connect(sys.argv[1]);db.execute("UPDATE machine_config SET config_jso
 	b, e := json.Marshal(snapshot.VMs)
 	if e != nil || strings.Contains(string(b), c.Home) || strings.Contains(string(b), "input.raw") {
 		t.Fatalf("unsafe projection: %s %v", b, e)
+	}
+}
+
+func TestManagedLabelAuthority(t *testing.T) {
+	d := &silo.MachineData{Name: "dev", Labels: map[string]string{NameLabel: "dev", InstanceLabel: "instance", OwnerLabel: "user:1"}}
+	if !Managed(d, "instance") {
+		t.Fatal("valid ownership denied")
+	}
+	for _, field := range []string{OwnerLabel, InstanceLabel, NameLabel} {
+		old := d.Labels[field]
+		d.Labels[field] = "invalid"
+		if Managed(d, "instance") {
+			t.Fatal("invalid ownership accepted", field)
+		}
+		d.Labels[field] = old
+	}
+	if Managed(d, "") || Managed(nil, "instance") {
+		t.Fatal("missing authority accepted")
 	}
 }

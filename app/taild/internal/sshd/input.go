@@ -6,9 +6,11 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/vandycknick/silo/app/taild/internal/authz"
 	"github.com/vandycknick/silo/app/taild/internal/service"
 	"golang.org/x/term"
 )
@@ -359,12 +361,10 @@ func terminalResize(streams service.IO, converted chan service.Window, width, he
 // Lobby is the production interactive front end below WhoIs authentication.
 // Local SSH tests supply an explicit domain caller at this same boundary.
 func Lobby(ctx context.Context, s *service.Service, caller service.Caller, streams service.IO) int {
+	streams = normalizeHuman(streams)
 	out := humanOutput(streams)
-	if code := DispatchSession(ctx, s, caller, "whoami", streams); code == 255 {
-		return code
-	}
-	if _, e := io.WriteString(out, Help); e != nil {
-		return 255
+	if failure := service.Categorize(s.CheckIdentity(caller.Peer)); failure != nil {
+		return (&invocation{streams: streams}).respond(reply{}, failure)
 	}
 	for {
 		line, e := readPrompt(streams.Stdin, out, "silo> ", 16384)
@@ -399,6 +399,7 @@ func Lobby(ctx context.Context, s *service.Service, caller service.Caller, strea
 // Per-command readers can stop without closing the SSH channel or competing
 // with the prompt for reads after guest execution finishes.
 type sessionInput struct {
+	start   func()
 	mu      sync.Mutex
 	chunks  chan inputChunk
 	pending []byte
@@ -408,21 +409,23 @@ type sessionInput struct {
 
 func newInput(ctx context.Context, src io.Reader) *sessionInput {
 	s := &sessionInput{chunks: make(chan inputChunk, 1)}
-	go func() {
-		defer close(s.chunks)
-		for {
-			buf := make([]byte, 16384)
-			n, e := src.Read(buf)
-			select {
-			case <-ctx.Done():
-				return
-			case s.chunks <- inputChunk{buf[:n], e}:
+	s.start = func() {
+		go func() {
+			defer close(s.chunks)
+			for {
+				buf := make([]byte, 16384)
+				n, e := src.Read(buf)
+				select {
+				case <-ctx.Done():
+					return
+				case s.chunks <- inputChunk{buf[:n], e}:
+				}
+				if e != nil {
+					return
+				}
 			}
-			if e != nil {
-				return
-			}
-		}
-	}()
+		}()
+	}
 	return s
 }
 
@@ -446,6 +449,11 @@ func (r contextualInput) readLocked(buf []byte) (int, error) {
 	}
 	if e := r.ctx.Err(); e != nil {
 		return 0, e
+	}
+	if s.start != nil {
+		start := s.start
+		s.start = nil
+		start()
 	}
 	for {
 		for len(s.pending) == 0 && s.err == nil {
@@ -486,7 +494,6 @@ func (r contextualInput) ReadLine(limit int) (string, error) {
 	return scanLine(limit, r.readLocked, func() { r.input.skipLF = true })
 }
 
-func readLine(src io.Reader) (string, error) { return readLineLimit(src, 16384) }
 func readLineLimit(src io.Reader, limit int) (string, error) {
 	if reader, ok := src.(interface{ ReadLine(int) (string, error) }); ok {
 		return reader.ReadLine(limit)
@@ -514,4 +521,26 @@ func scanLine(limit int, read func([]byte) (int, error), afterCR func()) (string
 		}
 	}
 	return "", usage()
+}
+
+// documentInput reads a whole bounded document from the session input, with a
+// deadline so a silent peer cannot park a session in the daemon forever.
+func documentInput(ctx context.Context, streams service.IO, limit int) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	src := streams.Stdin
+	if streams.Input != nil {
+		src = streams.Input(ctx)
+	}
+	if src == nil {
+		return nil, usage()
+	}
+	data, e := io.ReadAll(io.LimitReader(src, int64(limit)+1))
+	if e != nil {
+		return nil, &authz.Error{Code: "usage", Message: "document input interrupted or timed out", Exit: 2}
+	}
+	if len(data) > limit {
+		return nil, &authz.Error{Code: "usage", Message: "document input exceeds size limit", Exit: 2}
+	}
+	return data, nil
 }

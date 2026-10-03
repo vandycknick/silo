@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/vandycknick/silo/app/taild/internal/identity"
+	"github.com/vandycknick/silo/app/taild/internal/tailnet"
 )
 
 type Mode string
@@ -136,7 +137,7 @@ func NewOAuth(registry *Registry, secret, redirect string) (*OAuth, error) {
 	if !ok || id == "" || rest == "" || strings.ContainsAny(secret, "\r\n \t?") {
 		return nil, errors.New("invalid OAuth app secret")
 	}
-	return &OAuth{Registry: registry, ClientID: id, Secret: secret, Redirect: redirect, endpoint: "https://api.tailscale.com/api/v2/oauth/token", client: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	return &OAuth{Registry: registry, ClientID: id, Secret: secret, Redirect: redirect, endpoint: "https://api.tailscale.com/api/v2/oauth/token", client: tailnet.NewHTTPClient(30 * time.Second)}, nil
 }
 func validToken(token string) bool {
 	return token != "" && len(token) <= 16384 && !strings.HasPrefix(token, "tskey-client-") && !strings.ContainsAny(token, " \t\r\n?#") && !strings.Contains(token, "://")
@@ -150,17 +151,17 @@ func (o *OAuth) Callback(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if req.TLS == nil || len(req.URL.RawQuery) > 16384 || req.ContentLength != 0 {
-		http.Error(w, "invalid callback", 400)
+		http.Error(w, "invalid callback", http.StatusBadRequest)
 		return
 	}
 	q, err := url.ParseQuery(req.URL.RawQuery)
 	if err != nil || len(q["state"]) != 1 || len(q["code"]) > 1 || len(q["error"]) > 1 {
-		http.Error(w, "invalid callback", 400)
+		http.Error(w, "invalid callback", http.StatusBadRequest)
 		return
 	}
 	c := o.Registry.consume(q.Get("state"))
 	if c == nil {
-		http.Error(w, "expired or invalid state", 400)
+		http.Error(w, "expired or invalid state", http.StatusBadRequest)
 		return
 	}
 	result := Result{}
@@ -171,7 +172,7 @@ func (o *OAuth) Callback(w http.ResponseWriter, req *http.Request) {
 	}
 	c.result <- result
 	if result.Err != nil {
-		http.Error(w, "approval failed; return to your terminal", 400)
+		http.Error(w, "approval failed; return to your terminal", http.StatusBadRequest)
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")

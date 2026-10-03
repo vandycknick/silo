@@ -10,6 +10,7 @@ mod images;
 mod logs;
 mod machine;
 mod network;
+mod planning;
 mod runtime;
 mod timestamps;
 

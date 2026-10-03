@@ -143,6 +143,9 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	one, two := domainCaller(t, s, "user:1"), domainCaller(t, s, "user:2")
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releasePull := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releasePull)
 	var once sync.Once
 	registry.BeforeManifest = func() { once.Do(func() { close(entered); <-release }) }
 	disconnected, cancel := context.WithCancel(context.Background())
@@ -161,20 +164,14 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 		t.Fatal("foreign op visible", e)
 	}
 	quota, e := s.Create(context.Background(), one, CreateRequest{Name: "over", NoStart: true})
-	if e != nil {
-		t.Fatal(e)
-	}
-	if v := waitOperation(t, s, one, quota); v.Error == nil || v.Error.Exit != 6 {
-		t.Fatal(v)
+	if e == nil || Categorize(e).Exit != 6 || quota.ID != "" {
+		t.Fatal("quota must reject before publication", quota, e)
 	}
 	collision, e := s.Create(context.Background(), two, CreateRequest{Name: "one", NoStart: true})
-	if e != nil {
-		t.Fatal(e)
+	if e == nil || Categorize(e).Exit != 5 || collision.ID != "" {
+		t.Fatal("collision must reject before publication", collision, e)
 	}
-	if v := waitOperation(t, s, two, collision); v.Error == nil || v.Error.Exit != 5 {
-		t.Fatal(v)
-	}
-	close(release)
+	releasePull()
 	succeeded(t, s, one, op, nil)
 	if registry.Requests.Load() < 3 {
 		t.Fatal("native OCI did not use real registry")
@@ -258,11 +255,8 @@ func TestActualOCICreateDisconnectIsolationQuotaAndMutations(t *testing.T) {
 	op, e = s.Create(context.Background(), tagged, CreateRequest{Name: "tagged", Owner: "tag:ci", NoStart: true})
 	succeeded(t, s, tagged, op, e)
 	op, e = s.Create(context.Background(), tagged, CreateRequest{Name: "tagged-over", Owner: "tag:ci", NoStart: true})
-	if e != nil {
-		t.Fatal(e)
-	}
-	if got := waitOperation(t, s, tagged, op); got.Error == nil || got.Error.Exit != 6 {
-		t.Fatal("selected tag quota bypass", got)
+	if e == nil || Categorize(e).Exit != 6 || op.ID != "" {
+		t.Fatal("selected tag quota bypass", op, e)
 	}
 }
 

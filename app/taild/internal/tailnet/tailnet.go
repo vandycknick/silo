@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -38,9 +37,9 @@ func Start(ctx context.Context, c config.Config, secrets config.Secrets, log *sl
 	}
 	authKey := ""
 	// Reuse enrolled service state; never mint on every daemon restart.
-	_, existing := state.ReadNode(dir, c.Tailnet.Hostname, identity.Principal(c.Tailnet.Tag))
+	_, existing := state.ReadNode(dir, c.Tailnet.Hostname, identity.Principal(c.Tailnet.Tag), nil)
 	if secrets.ClientSecret != "" && existing != state.Enrolled {
-		client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		client := NewHTTPClient(30 * time.Second)
 		var e error
 		authKey, e = Mint(ctx, client, "https://api.tailscale.com", secrets.ClientSecret, c.Tailnet.Tag)
 		if e != nil {
@@ -65,7 +64,7 @@ func Start(ctx context.Context, c config.Config, secrets config.Secrets, log *sl
 	}
 	n.Client, e = n.Server.LocalClient()
 	if e != nil {
-		n.Server.Close()
+		_ = n.Server.Close()
 		return nil, e
 	}
 	return n, nil

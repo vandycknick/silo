@@ -123,7 +123,7 @@ func TestNativeKVMServiceLifecyclePTYAndReopen(t *testing.T) {
 	observerDone := make(chan int, 1)
 	var observerOut, observerErr lockedBuffer
 	go func() {
-		observerDone <- sshd.DispatchSession(observer, s, one, "create native-one --provision-user silo:1000:1000:/home/silo", service.IO{Stdout: &observerOut, Stderr: &observerErr})
+		observerDone <- sshd.DispatchSession(observer, s, one, "create --name native-one --provision-user silo:1000:1000:/home/silo", service.IO{Stdout: &observerOut, Stderr: &observerErr})
 	}()
 	select {
 	case <-entered:

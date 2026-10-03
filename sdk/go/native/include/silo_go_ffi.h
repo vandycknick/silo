@@ -207,6 +207,17 @@ silo_error *silo_network_policy_build(const uint8_t *request_ptr,
                                       size_t request_len,
                                       silo_buffer *out_policy);
 
+/**
+ * Runs stateless planning. No runtime handle or home directory is required.
+ * Requests are strict objects: memory/disk require input; name accepts no input.
+ *
+ * # Safety
+ * Request bytes must be readable for request_len; out_data must be writable.
+ */
+silo_error *silo_planning_query(const uint8_t *request_ptr,
+                                size_t request_len,
+                                silo_buffer *out_data);
+
 silo_error *silo_runtime_query(const silo_runtime *runtime,
                                const uint8_t *request_ptr,
                                size_t request_len,

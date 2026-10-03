@@ -54,7 +54,7 @@ func ValidateManifest(root string) (Manifest, error) {
 	if err != nil {
 		return fail()
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	info, err = r.Lstat("runtime-manifest.json")
 	if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
 		return fail()

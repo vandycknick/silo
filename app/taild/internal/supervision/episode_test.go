@@ -57,7 +57,7 @@ func pipeEOF(t *testing.T, reader *os.File, within time.Duration) {
 func TestReturnedFDUsesCurrentEpisodeDuringBlockedAcquisition(t *testing.T) {
 	for _, mode := range []string{"before-deadline", "after-deadline", "cancelled-request"} {
 		t.Run(mode, func(t *testing.T) {
-			for iteration := 0; iteration < 12; iteration++ {
+			for range 12 {
 				i, gate, receipts, events, ctx := episodeFixture(t, "40ms")
 				deliverEpisode(t, ctx, receipts, events, 11, true)
 				deliverEpisode(t, ctx, receipts, events, 12, false)
@@ -115,7 +115,7 @@ func TestReturnedFDUsesCurrentEpisodeDuringBlockedAcquisition(t *testing.T) {
 }
 
 func TestLatestCancelledEpisodeRecoversAfterOlderWorkerRetires(t *testing.T) {
-	for iteration := 0; iteration < 100; iteration++ {
+	for range 100 {
 		i, gate, receipts, events, ctx := episodeFixture(t, "1s")
 		home := t.TempDir()
 		deliverEpisode(t, ctx, receipts, events, 11, true)
