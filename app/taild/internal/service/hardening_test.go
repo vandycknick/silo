@@ -30,7 +30,8 @@ func TestActualCreateControlUnreachableIsBoundedExit9AndResumable(t *testing.T) 
 	var requests atomic.Int32
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(503) }))
 	defer control.Close()
-	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: control.URL}, Registry: enroll.NewRegistry(), Timeout: 750 * time.Millisecond, Metrics: s.Runtime.Metrics}
+	s.Config.Enrollment.Timeout = "750ms"
+	s.Enrollment = &enroll.Manager{Config: s.Config, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: control.URL}, Registry: enroll.NewRegistry(), Metrics: s.Runtime.Metrics}
 	c := domainCaller(t, s, "user:1")
 	started := time.Now()
 	op, err := s.Create(context.Background(), c, CreateRequest{Name: "offline"})
@@ -92,7 +93,7 @@ func TestShutdownMarkerBlocksNativeMutationsAndRegistryAdmission(t *testing.T) {
 	if err := state.ClearShutdown(s.Config.Home); err != nil {
 		t.Fatal(err)
 	}
-	s.Jobs.Pause()
+	s.Jobs.InterruptIf(func() bool { return true })
 	select {
 	case <-s.Jobs.Drained():
 	case <-time.After(time.Second):

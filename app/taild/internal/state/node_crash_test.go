@@ -156,7 +156,7 @@ func TestNativeCrashTransactionFence(t *testing.T) {
 			if e != nil {
 				t.Fatal("recovery lease blocked", e)
 			}
-			result := RecoverNode(dir, "dev", "user:123", true)
+			result := RecoverNode(dir, "dev", "user:123", nil)
 			lease.Close()
 			if step == "unverified" {
 				if result != Unreadable {

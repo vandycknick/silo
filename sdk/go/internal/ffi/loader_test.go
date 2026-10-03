@@ -14,13 +14,13 @@ func TestLoadDevelopmentBridge(t *testing.T) {
 	if path == "" && os.Getenv("SILO_TEST_EMBEDDED_FFI") != "1" {
 		t.Skip("neither SILO_GO_FFI_PATH nor SILO_TEST_EMBEDDED_FFI is set")
 	}
-	if err := Load("0.1.0", 3); err != nil {
+	if err := Load("0.1.0", 4); err != nil {
 		t.Fatalf("Load() failed: %v", err)
 	}
 }
 
 func TestLoadAttachmentControlSymbols(t *testing.T) {
-	if err := load(actualBridgePath(t), "0.1.0", 3); err != nil {
+	if err := load(actualBridgePath(t), "0.1.0", 4); err != nil {
 		t.Fatal(err)
 	}
 	token, err := NewAttachmentCancellation()
@@ -45,7 +45,7 @@ func TestLoadAttachmentControlSymbols(t *testing.T) {
 
 func TestLoadRejectsProductVersionMismatch(t *testing.T) {
 	path := actualBridgePath(t)
-	err := load(path, "999.0.0", 3)
+	err := load(path, "999.0.0", 4)
 	var mismatch *ABIMismatchError
 	if !errors.As(err, &mismatch) || !strings.Contains(err.Error(), "version") {
 		t.Fatalf("load() error = %v, want product version mismatch", err)

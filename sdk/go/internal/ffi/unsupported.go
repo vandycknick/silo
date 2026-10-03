@@ -25,8 +25,11 @@ type LogChunk struct {
 	Data   []byte
 }
 
-func Load(string, uint32) error                         { return nil }
-func NativeABIVersion() uint32                          { return 0 }
+func Load(string, uint32) error { return nil }
+func NativeABIVersion() uint32  { return 0 }
+func PlanningQuery([]byte) ([]byte, error) {
+	return nil, &NativeError{Variant: "Unsupported", Message: "native SDK unavailable"}
+}
 func OpenRuntime([]byte) (*Runtime, error)              { return nil, nil }
 func BuildNetworkPolicy([]byte) ([]byte, error)         { return nil, nil }
 func (*Runtime) Close()                                 {}

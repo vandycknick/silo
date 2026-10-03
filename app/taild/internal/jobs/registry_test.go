@@ -12,7 +12,7 @@ import (
 )
 
 func TestRestartRegistryIsEmptyAndShutdownJoins(t *testing.T) {
-	r := &Registry{}
+	r := New(context.Background(), 1)
 	if e := r.Wait(context.Background()); e != nil {
 		t.Fatal(e)
 	}

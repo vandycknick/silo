@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/vandycknick/silo/app/taild/internal/config"
+	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	"github.com/vandycknick/silo/app/taild/internal/tailnet"
 	"github.com/vandycknick/silo/app/taild/internal/testfixture"
@@ -56,11 +57,12 @@ func TestLiveTagEnrollmentKVMStateReuseReauthAndSSH(t *testing.T) {
 	if err != nil {
 		t.Fatal("live lobby status unavailable")
 	}
-	if canonicalDNS(observed.CurrentTailnet.MagicDNSSuffix) != canonicalDNS(os.Getenv("SILO_E2E_TS_TAILNET")) {
+	if identity.CanonicalDNS(observed.CurrentTailnet.MagicDNSSuffix) != identity.CanonicalDNS(os.Getenv("SILO_E2E_TS_TAILNET")) {
 		t.Fatal("qualification tailnet mismatch")
 	}
 	pin := state.NodePin{Tailnet: observed.CurrentTailnet.Name, Suffix: observed.CurrentTailnet.MagicDNSSuffix, ControlURL: cfg.Tailnet.ControlURL}
-	manager := &Manager{Config: cfg, Secrets: secrets, Pin: pin, Registry: NewRegistry(), Devices: NewDevices(secrets.APIToken), Timeout: time.Minute, Visible: lobby.Status}
+	cfg.Enrollment.Timeout = "1m"
+	manager := &Manager{Config: cfg, Secrets: secrets, Pin: pin, Registry: NewRegistry(), Devices: NewDevices(secrets.APIToken), Visible: lobby.Status}
 	defer func() {
 		cleanup, done := context.WithTimeout(context.Background(), 30*time.Second)
 		defer done()
@@ -103,7 +105,7 @@ func TestLiveTagEnrollmentKVMStateReuseReauthAndSSH(t *testing.T) {
 	if err = manager.Enroll(ctx, machine, data, "tag:silo-test-vm", false, func(line string) { t.Log(line) }, nil); err != nil {
 		t.Fatal("live enrollment failed")
 	}
-	enrolled, s := state.ReadNode(data.Network.Tailscale.StateDir, name, "tag:silo-test-vm", pin)
+	enrolled, s := state.ReadNode(data.Network.Tailscale.StateDir, name, "tag:silo-test-vm", &pin)
 	if s != state.Enrolled {
 		t.Fatal("actual tsnet state unreadable")
 	}
@@ -161,7 +163,7 @@ func TestLiveTagEnrollmentKVMStateReuseReauthAndSSH(t *testing.T) {
 	if err = manager.Enroll(ctx, machine, data, "tag:silo-test-vm", true, func(line string) { t.Log(line) }, nil); err != nil {
 		t.Fatal("explicit live reauth failed")
 	}
-	renewed, s := state.ReadNode(data.Network.Tailscale.StateDir, name, "tag:silo-test-vm", pin)
+	renewed, s := state.ReadNode(data.Network.Tailscale.StateDir, name, "tag:silo-test-vm", &pin)
 	if s != state.Enrolled || renewed.NodeID != stable || renewed.NodeKey == enrolled.NodeKey {
 		t.Fatal("closed reauth state failed stable-ID or changed-public-key verification")
 	}
@@ -171,7 +173,7 @@ func TestLiveTagEnrollmentKVMStateReuseReauthAndSSH(t *testing.T) {
 	if _, err = machine.WaitReady(ctx, 45*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	reused, s := state.ReadNode(data.Network.Tailscale.StateDir, name, "tag:silo-test-vm", pin)
+	reused, s := state.ReadNode(data.Network.Tailscale.StateDir, name, "tag:silo-test-vm", &pin)
 	if s != state.Enrolled || reused.NodeID != stable {
 		t.Fatal("restart changed stable node")
 	}

@@ -23,6 +23,18 @@ func humanOutput(streams service.IO) io.Writer {
 	return streams.Stderr
 }
 
+func normalizeHuman(streams service.IO) service.IO {
+	if streams.Human == nil {
+		streams.Human = streams.Stderr
+	}
+	if streams.Terminal.Present {
+		if _, ok := streams.Human.(*humanWriter); !ok {
+			streams.Human = &humanWriter{out: streams.Human}
+		}
+	}
+	return streams
+}
+
 // Only daemon-owned text passes through here. In particular, SSH's stdout
 // already has upstream PTY translation, while extended-data stderr does not.
 type humanWriter struct {

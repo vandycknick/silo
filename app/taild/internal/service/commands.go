@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -168,7 +170,7 @@ func (s *Service) List(ctx context.Context, p identity.Peer) ([]VM, error) {
 	out := []VM{}
 	for _, entry := range entries {
 		d := entry.Data
-		if d == nil || d.Labels[runtime.InstanceLabel] != s.Runtime.Instance || !p.Owns(identity.Principal(d.Labels[runtime.OwnerLabel])) || d.Labels[runtime.NameLabel] != d.Name || !config.ValidName(d.Name) {
+		if !runtime.Managed(d, s.Runtime.Instance) || !p.Owns(identity.Principal(d.Labels[runtime.OwnerLabel])) {
 			continue
 		}
 		out = append(out, s.nodeView(ctx, d))
@@ -185,8 +187,8 @@ func (s *Service) Show(ctx context.Context, p identity.Peer, ref string) (VM, er
 	if s.Jobs != nil {
 		for _, op := range s.Jobs.List(p) {
 			if op.VM == d.ID || op.Kind == "create" && op.VM == d.Name {
-				copy := op
-				v.LastOperation = &copy
+				last := op
+				v.LastOperation = &last
 			}
 		}
 	}
@@ -218,6 +220,8 @@ type CreateRequest struct {
 	CPUs        uint64
 	Memory      uint64
 	Disk        uint64
+	MemoryText  string
+	DiskText    string
 	Userdata    string
 	Labels      map[string]string
 	Owner       identity.Principal
@@ -237,7 +241,7 @@ func imageAllowed(ref string, allow []string) bool {
 		}
 		return false
 	}
-	if len(parts) < 2 || !(strings.ContainsAny(parts[0], ".:") || parts[0] == "localhost") {
+	if len(parts) < 2 || !strings.ContainsAny(parts[0], ".:") && parts[0] != "localhost" {
 		return false
 	}
 	for _, p := range parts {
@@ -253,11 +257,27 @@ func imageAllowed(ref string, allow []string) bool {
 	}
 	return false
 }
+
+// Help uses the loaded config only, with the same OCI allowlist as admission.
+// Never render host paths or userinfo-shaped registry credentials.
+func ImageDefaultForHelp(c config.Config) string {
+	ref := c.VM.DefaultImage
+	host, _, _ := strings.Cut(ref, "/")
+	if !imageAllowed(ref, c.VM.AllowedRegistries) || strings.Contains(host, "@") {
+		return "unavailable"
+	}
+	if _, port, ok := strings.Cut(host, ":"); ok {
+		if n, err := strconv.ParseUint(port, 10, 16); err != nil || n == 0 {
+			return "unavailable"
+		}
+	}
+	return ref
+}
 func (s *Service) ValidateCreate(p identity.Peer, q CreateRequest) (CreateRequest, error) {
 	if e := s.Authorize(p, identity.Create, nil); e != nil {
 		return q, e
 	}
-	if !config.ValidName(q.Name) {
+	if q.Name != "" && !config.ValidName(q.Name) {
 		return q, failure("usage", "invalid exact name", 2)
 	}
 	if q.GuestUser != nil {
@@ -272,7 +292,7 @@ func (s *Service) ValidateCreate(p identity.Peer, q CreateRequest) (CreateReques
 			return q, failure("usage", "multi-tag peers require --owner tag:<name>", 2)
 		}
 		q.Owner = p.Principals[0]
-	} else if !strings.HasPrefix(string(q.Owner), "tag:") || !p.Owns(q.Owner) {
+	} else if !q.Owner.IsTag() || !p.Owns(q.Owner) {
 		return q, failure("forbidden", "owner must be a verified peer tag", 4)
 	}
 	if q.Image == "" {
@@ -291,19 +311,32 @@ func (s *Service) ValidateCreate(p identity.Peer, q CreateRequest) (CreateReques
 	if q.CPUs == 0 {
 		q.CPUs = s.Config.VM.Defaults.CPUs
 	}
+	var e error
+	if q.MemoryText != "" {
+		v, err := ParseResource("memory", q.MemoryText)
+		if err != nil {
+			return q, err
+		}
+		q.Memory = v.Bytes()
+		q.MemoryText = ""
+	}
+	if q.DiskText != "" {
+		v, err := ParseResource("disk", q.DiskText)
+		if err != nil {
+			return q, err
+		}
+		q.Disk = v.Bytes()
+		q.DiskText = ""
+	}
 	if q.Memory == 0 {
-		m, e := units.Bytes(s.Config.VM.Defaults.Memory)
-		if e != nil {
+		if q.Memory, e = units.Bytes(s.Config.VM.Defaults.Memory); e != nil {
 			return q, Categorize(e)
 		}
-		q.Memory = uint64(m)
 	}
 	if q.Disk == 0 {
-		d, e := units.Bytes(s.Config.VM.Defaults.Disk)
-		if e != nil {
+		if q.Disk, e = units.Bytes(s.Config.VM.Defaults.Disk); e != nil {
 			return q, Categorize(e)
 		}
-		q.Disk = uint64(d)
 	}
 	if e := s.resources(p, q.CPUs, q.Memory, q.Disk); e != nil {
 		return q, e
@@ -347,7 +380,7 @@ func (s *Service) ownedCountLocked(ctx context.Context, owner identity.Principal
 	}
 	return count, nil
 }
-func (s *Service) reserveCreate(ctx context.Context, p identity.Peer, q CreateRequest) (func(), error) {
+func (s *Service) reserveCreate(ctx context.Context, p identity.Peer, q *CreateRequest) (func(), error) {
 	s.createMu.Lock()
 	defer s.createMu.Unlock()
 	if s.ShutdownPending() {
@@ -374,9 +407,28 @@ func (s *Service) reserveCreate(ctx context.Context, p identity.Peer, q CreateRe
 			return nil, failure("unavailable", "tailnet name inventory unavailable", 9)
 		}
 	}
-	release, e := s.Runtime.Reserve(ctx, q.Name, names)
+	generated := q.Name == ""
+	var release func()
+	for attempt := 0; attempt < 3; attempt++ {
+		if generated {
+			q.Name, e = silo.ProposeMachineName()
+			if e != nil {
+				return nil, Categorize(e)
+			}
+		}
+		release, e = s.Runtime.Reserve(ctx, q.Name, names)
+		if e == nil {
+			break
+		}
+		if !generated {
+			return nil, Categorize(e)
+		}
+		if Categorize(e).Code != "conflict" {
+			return nil, Categorize(e)
+		}
+	}
 	if e != nil {
-		return nil, failure("conflict", "name already taken locally or on the tailnet", 5)
+		return nil, failure("conflict", "could not reserve a generated name after 3 attempts", 5)
 	}
 	if s.pending == nil {
 		s.pending = make(map[string]identity.Principal)
@@ -386,12 +438,15 @@ func (s *Service) reserveCreate(ctx context.Context, p identity.Peer, q CreateRe
 		s.diskPending = make(map[string]uint64)
 	}
 	s.diskPending[q.Name] = q.Disk
+	var once sync.Once
 	return func() {
-		s.createMu.Lock()
-		defer s.createMu.Unlock()
-		release()
-		delete(s.pending, q.Name)
-		delete(s.diskPending, q.Name)
+		once.Do(func() {
+			s.createMu.Lock()
+			defer s.createMu.Unlock()
+			release()
+			delete(s.pending, q.Name)
+			delete(s.diskPending, q.Name)
+		})
 	}, nil
 }
 func (s *Service) materialize(ctx context.Context, p identity.Peer, q CreateRequest, opts []silo.MachineOption) (*silo.Machine, error) {
@@ -420,6 +475,28 @@ func (s *Service) materialize(ctx context.Context, p identity.Peer, q CreateRequ
 	}
 	return m, err
 }
+
+// revalidateCreate re-runs admission against a fresh identity observation, as
+// the peer's grants may have changed since the request was accepted.
+func (s *Service) revalidateCreate(ctx context.Context, c Caller, q CreateRequest) (identity.Peer, error) {
+	p, e := c.Fresh(ctx)
+	if e != nil {
+		return p, e
+	}
+	validated := q
+	// An already selected human owner is not a client-supplied --owner tag.
+	if !q.Owner.IsTag() {
+		validated.Owner = ""
+	}
+	if validated, e = s.ValidateCreate(p, validated); e != nil {
+		return p, e
+	}
+	if validated.Owner != q.Owner {
+		return p, failure("forbidden", "owner identity changed", 4)
+	}
+	return p, nil
+}
+
 func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.Operation, error) {
 	if e := s.Authorize(c.Peer, identity.Create, nil); e != nil {
 		return jobs.Operation{}, e
@@ -432,53 +509,36 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 	if e != nil {
 		return jobs.Operation{}, e
 	}
-	return s.Jobs.Submit("create", q.Name, q.Owner, func(ctx context.Context, progress func(string)) error {
-		p, e := c.Fresh(ctx)
+	release, e := s.reserveCreate(ctx, c.Peer, &q)
+	if e != nil {
+		return jobs.Operation{}, e
+	}
+	if s.VMNodesEnabled && !q.NoTailnet && s.Config.Enrollment.Mode != "none" {
+		controlURL := s.Config.Tailnet.ControlURL
+		if s.Enrollment != nil {
+			controlURL = s.Enrollment.Pin.ControlURL
+		}
+		q.policy, e = InjectTailnet(q.policy, q.Name, q.Owner, controlURL)
+		if e != nil {
+			release()
+			return jobs.Operation{}, e
+		}
+	}
+	return s.Jobs.SubmitFinalized("create", q.Name, q.Owner, func(ctx context.Context, progress func(string)) error {
+		p, e := s.revalidateCreate(ctx, c, q)
 		if e != nil {
 			return e
 		}
-		validated := q
-		// An already selected human owner is not a client-supplied --owner tag.
-		if !strings.HasPrefix(string(q.Owner), "tag:") {
-			validated.Owner = ""
-		}
-		validated, e = s.ValidateCreate(p, validated)
-		if e != nil {
-			return e
-		}
-		if validated.Owner != q.Owner {
-			return failure("forbidden", "owner identity changed", 4)
-		}
-		release, e := s.reserveCreate(ctx, p, q)
-		if e != nil {
-			return e
-		}
-		defer func() {
-			if release != nil {
-				release()
-			}
-		}()
+		progress("creating " + q.Name)
 		progress("pulling OCI image")
-		image, pullError := s.Runtime.SDK.Images().Pull(ctx, q.Image)
+		_, pullError := s.Runtime.SDK.Images().Pull(ctx, q.Image)
 		if pullError != nil {
 			return Categorize(pullError)
 		}
-		progress("image pull complete: " + image.SelectedManifestDigest)
+		progress("image pull complete")
 		progress("materializing stopped VM")
-		p, e = c.Fresh(ctx)
-		if e != nil {
+		if p, e = s.revalidateCreate(ctx, c, q); e != nil {
 			return e
-		}
-		validated = q
-		if !strings.HasPrefix(string(q.Owner), "tag:") {
-			validated.Owner = ""
-		}
-		validated, e = s.ValidateCreate(p, validated)
-		if e != nil {
-			return e
-		}
-		if validated.Owner != q.Owner {
-			return failure("forbidden", "owner identity changed", 4)
 		}
 		labels := maps.Clone(q.Labels)
 		if labels == nil {
@@ -524,31 +584,22 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 		}
 		defer s.Runtime.CloseMachine(m)
 		release()
-		release = nil
-		progress("VM persisted: " + m.ID())
+		progress("VM created: " + q.Name)
 		if q.NoStart {
 			return nil
 		}
 		return s.Jobs.WithVM(ctx, m.ID(), func() error {
-			p, e = c.Fresh(ctx)
-			if e != nil {
-				return e
-			}
 			d, e := m.Inspect(ctx)
 			if e != nil {
 				return Categorize(e)
 			}
-			if e = s.Authorize(p, identity.Create, authority(d)); e != nil {
+			if e = s.reauthorize(ctx, c, identity.Create, d); e != nil {
 				return e
 			}
 			if e = s.enroll(ctx, c, identity.Create, m, d, false, progress); e != nil {
 				return e
 			}
-			p, e = c.Fresh(ctx)
-			if e != nil {
-				return e
-			}
-			if e = s.Authorize(p, identity.Create, authority(d)); e != nil {
+			if e = s.reauthorize(ctx, c, identity.Create, d); e != nil {
 				return e
 			}
 			progress("starting VM")
@@ -563,7 +614,26 @@ func (s *Service) Create(ctx context.Context, c Caller, q CreateRequest) (jobs.O
 			progress("guest ready")
 			return nil
 		})
-	})
+	}, release)
+}
+
+// ParseResource uses the native CLI parser and never exposes native diagnostics.
+func ParseResource(kind, text string) (silo.ByteSize, error) {
+	var v silo.ByteSize
+	var err error
+	if kind == "memory" {
+		v, err = silo.ParseMachineMemory(text)
+	} else {
+		v, err = silo.ParseRootDiskSize(text)
+	}
+	if err != nil {
+		if !silo.IsErrorKind(err, silo.ErrorInvalidArgument) {
+			return v, Categorize(err)
+		}
+		message := "invalid value for --" + kind + ": expected a positive binary size (e.g. 4GiB or 8gb)"
+		return v, failure("usage", message, 2)
+	}
+	return v, nil
 }
 
 type StopRequest struct {
@@ -574,13 +644,55 @@ type RemoveRequest struct {
 	Force     bool
 	Confirmed bool
 }
-type SetRequest struct {
-	Name   *string
-	CPUs   *uint8
-	Memory *silo.ByteSize
-	Disk   *silo.ByteSize
+
+// RemovalTarget contains only the authorized facts needed for confirmation.
+// Preflight closes its native handle before returning; no job or VM lock is held.
+type RemovalTarget struct {
+	ID      string
+	Name    string
+	Running bool
 }
 
+func (s *Service) PreflightRemove(ctx context.Context, c Caller, ref string, force bool) (RemovalTarget, error) {
+	p, e := c.Fresh(ctx)
+	if e != nil {
+		return RemovalTarget{}, e
+	}
+	m, d, e := s.machine(ctx, p, ref, identity.Delete)
+	if e != nil {
+		return RemovalTarget{}, e
+	}
+	defer s.Runtime.CloseMachine(m)
+	running := d.Status.Kind != silo.MachineStatusStopped
+	if running {
+		if !force {
+			return RemovalTarget{}, failure("conflict", "VM is running; use --force", 5)
+		}
+		if e := s.Authorize(p, identity.Stop, authority(d)); e != nil {
+			return RemovalTarget{}, e
+		}
+	}
+	return RemovalTarget{ID: d.ID, Name: d.Name, Running: running}, nil
+}
+
+type SetRequest struct {
+	MemoryText *string
+	DiskText   *string
+	Name       *string
+	CPUs       *uint8
+	Memory     *silo.ByteSize
+	Disk       *silo.ByteSize
+}
+
+// reauthorize checks the action against a fresh identity observation. Long
+// operations repeat it around every step that changes the machine.
+func (s *Service) reauthorize(ctx context.Context, c Caller, action identity.Action, d *silo.MachineData) error {
+	p, e := c.Fresh(ctx)
+	if e != nil {
+		return e
+	}
+	return s.Authorize(p, action, authority(d))
+}
 func (s *Service) mutation(ctx context.Context, c Caller, ref, kind string, action identity.Action, run func(context.Context, identity.Peer, *silo.Machine, *silo.MachineData, func(string)) error) (jobs.Operation, error) {
 	m, d, e := s.machine(ctx, c.Peer, ref, action)
 	if e != nil {
@@ -605,19 +717,14 @@ func (s *Service) mutation(ctx context.Context, c Caller, ref, kind string, acti
 	})
 }
 func (s *Service) Start(ctx context.Context, c Caller, ref string) (jobs.Operation, error) {
-	return s.mutation(ctx, c, ref, "start", identity.Start, func(ctx context.Context, p identity.Peer, m *silo.Machine, d *silo.MachineData, f func(string)) error {
+	return s.mutation(ctx, c, ref, "start", identity.Start, func(ctx context.Context, _ identity.Peer, m *silo.Machine, d *silo.MachineData, f func(string)) error {
 		if e := s.enroll(ctx, c, identity.Start, m, d, false, f); e != nil {
 			return e
 		}
-		p, e := c.Fresh(ctx)
-		if e != nil {
+		if e := s.reauthorize(ctx, c, identity.Start, d); e != nil {
 			return e
 		}
-		if e = s.Authorize(p, identity.Start, authority(d)); e != nil {
-			return e
-		}
-		_, e = m.Start(ctx)
-		if e != nil {
+		if _, e := m.Start(ctx); e != nil {
 			return e
 		}
 		return waitReady(ctx, m)
@@ -627,34 +734,26 @@ func (s *Service) Stop(ctx context.Context, c Caller, ref string, q StopRequest)
 	if q.Timeout < 0 || q.Timeout > time.Minute {
 		return jobs.Operation{}, failure("usage", "stop timeout must be 0..1m", 2)
 	}
-	return s.mutation(ctx, c, ref, "stop", identity.Stop, func(ctx context.Context, p identity.Peer, m *silo.Machine, d *silo.MachineData, f func(string)) error {
+	return s.mutation(ctx, c, ref, "stop", identity.Stop, func(ctx context.Context, _ identity.Peer, m *silo.Machine, _ *silo.MachineData, _ func(string)) error {
 		_, e := m.StopWith(ctx, silo.StopOptions{Force: q.Force, Timeout: q.Timeout})
 		return e
 	})
 }
 func (s *Service) Restart(ctx context.Context, c Caller, ref string) (jobs.Operation, error) {
-	return s.mutation(ctx, c, ref, "restart", identity.Restart, func(ctx context.Context, p identity.Peer, m *silo.Machine, d *silo.MachineData, f func(string)) error {
+	return s.mutation(ctx, c, ref, "restart", identity.Restart, func(ctx context.Context, _ identity.Peer, m *silo.Machine, d *silo.MachineData, f func(string)) error {
 		if _, e := m.StopWith(ctx, silo.StopOptions{}); e != nil {
 			return e
 		}
-		p, e := c.Fresh(ctx)
-		if e != nil {
+		if e := s.reauthorize(ctx, c, identity.Restart, d); e != nil {
 			return e
 		}
-		if e = s.Authorize(p, identity.Restart, authority(d)); e != nil {
+		if e := s.enroll(ctx, c, identity.Restart, m, d, false, f); e != nil {
 			return e
 		}
-		if e = s.enroll(ctx, c, identity.Restart, m, d, false, f); e != nil {
+		if e := s.reauthorize(ctx, c, identity.Restart, d); e != nil {
 			return e
 		}
-		p, e = c.Fresh(ctx)
-		if e != nil {
-			return e
-		}
-		if e = s.Authorize(p, identity.Restart, authority(d)); e != nil {
-			return e
-		}
-		if _, e = m.Start(ctx); e != nil {
+		if _, e := m.Start(ctx); e != nil {
 			return e
 		}
 		return waitReady(ctx, m)
@@ -680,7 +779,7 @@ func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequ
 		if d.Status.Kind != silo.MachineStatusStopped && !q.Force {
 			return jobs.Operation{}, failure("conflict", "VM is running; use --force", 5)
 		}
-		return jobs.Operation{}, failure("usage", "removal requires confirmation; use --yes or --json unattended", 2)
+		return jobs.Operation{}, failure("usage", "removal requires confirmation; use --yes unattended", 2)
 	}
 	return s.mutation(ctx, c, ref, "remove", identity.Delete, func(ctx context.Context, p identity.Peer, m *silo.Machine, d *silo.MachineData, f func(string)) error {
 		if d.Status.Kind != silo.MachineStatusStopped {
@@ -690,15 +789,17 @@ func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequ
 			if e := s.Authorize(p, identity.Stop, authority(d)); e != nil {
 				return e
 			}
+			if e := s.reauthorize(ctx, c, identity.Delete, d); e != nil {
+				return e
+			}
+			if e := s.reauthorize(ctx, c, identity.Stop, d); e != nil {
+				return e
+			}
 			if _, e := m.StopWith(ctx, silo.StopOptions{Force: true, Timeout: 10 * time.Second}); e != nil {
 				return e
 			}
 		}
-		p, e := c.Fresh(ctx)
-		if e != nil {
-			return e
-		}
-		if e = s.Authorize(p, identity.Delete, authority(d)); e != nil {
+		if e := s.reauthorize(ctx, c, identity.Delete, d); e != nil {
 			return e
 		}
 		var node state.NodeIdentity
@@ -708,18 +809,14 @@ func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequ
 				return e
 			}
 			s.Runtime.Metrics.Handle("node_lease", 1)
-			var pins []state.NodePin
-			if s.Enrollment != nil {
-				pins = []state.NodePin{s.Enrollment.Pin}
-			}
-			if state.RecoverNode(d.Network.Tailscale.StateDir, d.Name, identity.Principal(d.Labels[runtime.OwnerLabel]), true, pins...) == state.Unreadable {
+			if state.RecoverNode(d.Network.Tailscale.StateDir, d.Name, identity.Principal(d.Labels[runtime.OwnerLabel]), s.pin()) == state.Unreadable {
 				_ = lease.Close()
 				s.Runtime.Metrics.Handle("node_lease", -1)
 				f("device_retained: node state recovery required")
 				return failure("conflict", "retained node state requires recovery before removal", 5)
 			}
 			var nodeState state.NodeState
-			node, nodeState = state.ReadNode(d.Network.Tailscale.StateDir, d.Name, identity.Principal(d.Labels[runtime.OwnerLabel]), pins...)
+			node, nodeState = state.ReadNode(d.Network.Tailscale.StateDir, d.Name, identity.Principal(d.Labels[runtime.OwnerLabel]), s.pin())
 			_ = lease.Close()
 			s.Runtime.Metrics.Handle("node_lease", -1)
 			if nodeState == state.Unreadable {
@@ -727,7 +824,7 @@ func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequ
 				return failure("conflict", "unreadable node state retained; recover before removal", 5)
 			}
 		}
-		if e = m.Remove(ctx); e != nil {
+		if e := m.Remove(ctx); e != nil {
 			return e
 		}
 		s.removeDevice(ctx, node, f)
@@ -735,6 +832,30 @@ func (s *Service) Remove(ctx context.Context, c Caller, ref string, q RemoveRequ
 	})
 }
 func (s *Service) Set(ctx context.Context, c Caller, ref string, q SetRequest) (jobs.Operation, error) {
+	if q.MemoryText != nil || q.DiskText != nil {
+		if err := s.Authorize(c.Peer, identity.Update, nil); err != nil {
+			return jobs.Operation{}, err
+		}
+		m, _, err := s.machine(ctx, c.Peer, ref, identity.Update)
+		if err != nil {
+			return jobs.Operation{}, err
+		}
+		s.Runtime.CloseMachine(m)
+		if q.MemoryText != nil {
+			v, err := ParseResource("memory", *q.MemoryText)
+			if err != nil {
+				return jobs.Operation{}, err
+			}
+			q.Memory = &v
+		}
+		if q.DiskText != nil {
+			v, err := ParseResource("disk", *q.DiskText)
+			if err != nil {
+				return jobs.Operation{}, err
+			}
+			q.Disk = &v
+		}
+	}
 	if q.Name == nil && q.CPUs == nil && q.Memory == nil && q.Disk == nil {
 		return jobs.Operation{}, failure("usage", "set requires a setting", 2)
 	}

@@ -109,14 +109,15 @@ projection types and empty selected values never masquerade as absent secrets.
 The older `PolicySecretsReady` boolean API remains available. This uses an optional
 operation on the existing runtime-query entry point.
 
-The current native bridge requires ABI **3**. ABI 2 bridges lack the required
-node-state lease/cancellable attachment symbol contract and are rejected before
+The current native bridge requires ABI **4**. ABI 3 bridges lack the required
+stateless planning query symbol contract and are rejected before
 new symbols are resolved. Rebuild the bridge and reassemble target-local SDK
-bundles together. `NativeABIVersion` is the required numeric ABI;
+bundles together. `NativeABIVersion` is the required numeric ABI constant,
+available without loading the bridge.
 `VerifiedNativeABIVersion()` loads and checks the exact product/ABI and returns
 the actual bridge ABI without opening a runtime or starting a VM.
 
-ABI 3's current attachment contract also requires
+The attachment contract also requires
 `silo_attachment_cancellation_signal`. Go owns the scoped signal subscription and
 forwards supported notifications through the token's native channel. Each Attach
 or AttachShell temporarily enables forwarding of inherited ignored signals and
@@ -124,3 +125,20 @@ restores those dispositions on return, while preserving application subscribers.
 The Go path installs no cached Tokio process handlers; standalone Rust attachments
 retain their narrow native-listener mode. Cancellation joins the native call before
 freeing its token or restoring the Go subscription.
+
+## Stateless CLI creation planning
+
+`ParseMachineMemory(input string) (ByteSize, error)` and
+`ParseRootDiskSize(input string) (ByteSize, error)` use the Rust CLI's integer
+unit parser. Units `m/mb/mib/g/gb/gib` are case-insensitive and binary for both
+operations; surrounding whitespace and whitespace between quantity and unit are
+accepted. `8gb`, `8GB`, `8g`, and `8GiB` all return `8 << 30` bytes; `512mb`
+returns `512 << 20`. Zero, fractions, negatives, missing units, and overflow fail.
+Memory is limited to u32 MiB; disks are limited to u64 bytes. Explicit decimal
+constructors such as `Gigabytes` and `Megabytes` retain their decimal semantics.
+
+`ProposeMachineName() (string, error)` uses the existing Silo Rust generator,
+returning an adjective-noun-fourhex proposal without an owner prefix. It does not
+check availability or reserve the name. These APIs load the bridge but never open
+a runtime, home, database, or network connection. Validation errors contain safe
+reasons rather than echoing input; callers can add their appropriate flag context.

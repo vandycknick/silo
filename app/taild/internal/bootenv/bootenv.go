@@ -1,19 +1,20 @@
-// Package bootenv must depend only on os. Its github.com import path sorts
-// before upstream environment readers once os is eligible for initialization.
+// Package bootenv must depend only on the standard library. Its github.com
+// import path sorts before upstream environment readers once those packages
+// are eligible for initialization.
 package bootenv
 
-import "os"
+import (
+	"os"
+	"strings"
+)
 
 func init() {
 	for _, entry := range os.Environ() {
-		if !(len(entry) >= 3 && entry[:3] == "TS_") && !(len(entry) >= 6 && entry[:6] == "TSNET_") && !(len(entry) >= 9 && entry[:9] == "SILO_NET_") {
+		if !strings.HasPrefix(entry, "TS_") && !strings.HasPrefix(entry, "TSNET_") && !strings.HasPrefix(entry, "SILO_NET_") {
 			continue
 		}
-		end := 0
-		for end < len(entry) && entry[end] != '=' {
-			end++
-		}
-		if err := os.Unsetenv(entry[:end]); err != nil {
+		name, _, _ := strings.Cut(entry, "=")
+		if err := os.Unsetenv(name); err != nil {
 			_, _ = os.Stderr.WriteString("taild: cannot isolate startup environment\n")
 			os.Exit(1)
 		}

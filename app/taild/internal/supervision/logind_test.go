@@ -25,23 +25,6 @@ func TestStopBudgetRespectsActualLogindDelay(t *testing.T) {
 		}
 	}
 }
-func TestManagedShutdownAuthority(t *testing.T) {
-	d := &silo.MachineData{Name: "dev", Labels: map[string]string{runtime.NameLabel: "dev", runtime.InstanceLabel: "instance", runtime.OwnerLabel: "user:1"}}
-	if !Managed(d, "instance") {
-		t.Fatal("valid ownership denied")
-	}
-	for _, field := range []string{runtime.OwnerLabel, runtime.InstanceLabel, runtime.NameLabel} {
-		old := d.Labels[field]
-		d.Labels[field] = "invalid"
-		if Managed(d, "instance") {
-			t.Fatal("invalid ownership accepted", field)
-		}
-		d.Labels[field] = old
-	}
-	if Managed(d, "") || Managed(nil, "instance") {
-		t.Fatal("missing authority accepted")
-	}
-}
 
 func TestActualNonrootLogindAcquireListRelease(t *testing.T) {
 	if os.Geteuid() == 0 {

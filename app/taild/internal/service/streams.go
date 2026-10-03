@@ -198,54 +198,27 @@ func (s *Service) execute(parent context.Context, c Caller, ref string, action i
 	// their process/cancellation controls lifetime. Never issue pipe Close there.
 	started := make(chan struct{})
 	startedOnce := false
-	if streams.Stdin != nil {
-		go func() {
-			defer close(inputDone)
-			select {
-			case <-ctx.Done():
-				return
-			case <-started:
-			}
-			stdin := exec.Stdin()
-			if stdin == nil {
-				return
-			}
-			buf := make([]byte, 16384)
-			for {
-				n, e := streams.Stdin.Read(buf)
-				if n > 0 {
-					if _, err := stdin.WriteContext(ctx, buf[:n]); err != nil {
-						break
-					}
-				}
-				if e != nil {
-					if q.TTY && errors.Is(e, io.EOF) {
-						_, _ = stdin.WriteContext(ctx, []byte{4, 4})
-					}
-					break
-				}
-			}
-			if !q.TTY {
-				_ = stdin.Close()
-			}
-		}()
-	} else {
-		go func() {
-			defer close(inputDone)
-			select {
-			case <-ctx.Done():
-				return
-			case <-started:
-			}
-			if stdin := exec.Stdin(); stdin != nil {
-				if q.TTY {
-					_, _ = stdin.WriteContext(ctx, []byte{4, 4})
-				} else {
-					_ = stdin.Close()
-				}
-			}
-		}()
-	}
+	go func() {
+		defer close(inputDone)
+		select {
+		case <-ctx.Done():
+			return
+		case <-started:
+		}
+		stdin := exec.Stdin()
+		if stdin == nil {
+			return
+		}
+		eof := true
+		if streams.Stdin != nil {
+			eof = pump(ctx, streams.Stdin, stdin)
+		}
+		if !q.TTY {
+			_ = stdin.Close()
+		} else if eof {
+			_, _ = stdin.WriteContext(ctx, []byte{4, 4})
+		}
+	}()
 	defer func() {
 		cancel()
 		_ = exec.Cancel()
@@ -329,6 +302,25 @@ func (s *Service) execute(parent context.Context, c Caller, ref string, action i
 		}
 	}
 }
+
+// pump copies session input into the guest until either side fails, and
+// reports whether the session side ended with a clean EOF.
+func pump(ctx context.Context, from io.Reader, to interface {
+	WriteContext(context.Context, []byte) (int, error)
+}) bool {
+	buf := make([]byte, 16384)
+	for {
+		n, e := from.Read(buf)
+		if n > 0 {
+			if _, err := to.WriteContext(ctx, buf[:n]); err != nil {
+				return false
+			}
+		}
+		if e != nil {
+			return errors.Is(e, io.EOF)
+		}
+	}
+}
 func envKey(s string) bool {
 	if s == "" || len(s) > 128 {
 		return false
@@ -350,17 +342,20 @@ type LogsRequest struct {
 
 const logLimit = 4 << 20
 
+// Redact host-path-shaped and credential-shaped diagnostic fields. Never
+// expose SDK errors or state/credential file content through this endpoint.
+var (
+	pathPattern   = regexp.MustCompile(`/[^\s"'<>]+`)
+	secretPattern = regexp.MustCompile(`(?i)(tskey-|token|secret|password|authorization|authkey|credential|private.?key)`)
+)
+
 func redact(line string) string {
-	// Redact host-path-shaped and credential-shaped diagnostic fields. Never
-	// expose SDK errors or state/credential file content through this endpoint.
-	paths := regexp.MustCompile(`/[^\s"'<>]+`)
-	secrets := regexp.MustCompile(`(?i)(tskey-|token|secret|password|authorization|authkey|credential|private.?key)`)
 	lines := strings.Split(line, "\n")
 	for i, v := range lines {
-		if secrets.MatchString(v) {
+		if secretPattern.MatchString(v) {
 			lines[i] = "[credential diagnostic redacted]"
 		} else {
-			lines[i] = paths.ReplaceAllString(v, "[path]")
+			lines[i] = pathPattern.ReplaceAllString(v, "[path]")
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -483,21 +478,20 @@ func (s *Service) Logs(parent context.Context, c Caller, ref string, q LogsReque
 			continue
 		}
 		for _, b := range data {
-			if b == '\n' {
-				if !discard {
-					if _, e = writeContext(ctx, out, []byte(redact(string(line))+"\n")); e != nil {
-						return e
-					}
-				} else {
-					if _, e = writeContext(ctx, out, []byte("[oversized log line omitted]\n")); e != nil {
-						return e
-					}
+			switch {
+			case b == '\n':
+				text := redact(string(line))
+				if discard {
+					text = "[oversized log line omitted]"
+				}
+				if _, e = writeContext(ctx, out, []byte(text+"\n")); e != nil {
+					return e
 				}
 				line = line[:0]
 				discard = false
-			} else if len(line) < 65536 && !discard {
+			case len(line) < 65536 && !discard:
 				line = append(line, b)
-			} else {
+			default:
 				line = line[:0]
 				discard = true
 			}

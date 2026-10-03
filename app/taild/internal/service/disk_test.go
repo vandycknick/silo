@@ -16,7 +16,7 @@ func TestActualFilesystemDiskReservationFloor(t *testing.T) {
 	if err := unix.Statfs(c.Home, &stat); err != nil {
 		t.Fatal(err)
 	}
-	available := uint64(stat.Bavail) * uint64(stat.Bsize)
+	available := stat.Bavail * uint64(stat.Bsize)
 	if available < 256<<20 {
 		t.Skip("insufficient filesystem space for admission test")
 	}

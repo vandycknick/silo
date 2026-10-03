@@ -3,16 +3,25 @@ package service
 import (
 	"context"
 	"errors"
+	"os"
+	"strings"
+	"time"
+
 	"github.com/vandycknick/silo/app/taild/internal/enroll"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/jobs"
 	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/state"
 	silo "github.com/vandycknick/silo/sdk/go"
-	"os"
-	"strings"
-	"time"
 )
+
+// pin is the daemon's node control identity, absent when enrollment is off.
+func (s *Service) pin() *state.NodePin {
+	if s.Enrollment == nil {
+		return nil
+	}
+	return &s.Enrollment.Pin
+}
 
 func (s *Service) enroll(ctx context.Context, c Caller, action identity.Action, m *silo.Machine, d *silo.MachineData, reauth bool, progress func(string)) error {
 	if d.Network.Tailscale == nil {
@@ -50,11 +59,7 @@ func (s *Service) nodeView(ctx context.Context, d *silo.MachineData) VM {
 		return v
 	}
 	owner := identity.Principal(d.Labels[runtime.OwnerLabel])
-	var pins []state.NodePin
-	if s.Enrollment != nil {
-		pins = []state.NodePin{s.Enrollment.Pin}
-	}
-	node, status := state.ReadNode(d.Network.Tailscale.StateDir, d.Name, owner, pins...)
+	node, status := state.ReadNode(d.Network.Tailscale.StateDir, d.Name, owner, s.pin())
 	v.NodeState = status
 	if _, e := os.Lstat(d.Network.Tailscale.StateDir + ".unreadable"); e == nil {
 		v.NodeState = state.Unreadable

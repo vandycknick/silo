@@ -71,7 +71,7 @@ while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done < /etc
 			continue
 		}
 		entryUID, err := strconv.ParseUint(fields[2], 10, 32)
-		if fields[0] != name && !(numericErr == nil && err == nil && entryUID == uid) {
+		if fields[0] != name && (numericErr != nil || err != nil || entryUID != uid) {
 			continue
 		}
 		home, shell := fields[5], fields[6]

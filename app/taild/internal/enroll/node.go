@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -34,18 +33,15 @@ type Manager struct {
 	Registry *Registry
 	OAuth    *OAuth
 	Devices  *Devices
-	Timeout  time.Duration
 	Visible  func(context.Context) (*ipnstate.Status, error)
 }
-
-func canonicalDNS(s string) string { return strings.TrimSuffix(strings.ToLower(s), ".") }
 
 func NameTaken(status *ipnstate.Status, name, ownID string, pin state.NodePin) bool {
 	if status == nil {
 		return true
 	}
 	check := func(peer *ipnstate.PeerStatus) bool {
-		return peer != nil && string(peer.ID) != ownID && canonicalDNS(peer.DNSName) == canonicalDNS(name+"."+pin.Suffix)
+		return peer != nil && string(peer.ID) != ownID && identity.CanonicalDNS(peer.DNSName) == identity.CanonicalDNS(name+"."+pin.Suffix)
 	}
 	if check(status.Self) {
 		return true
@@ -58,10 +54,10 @@ func NameTaken(status *ipnstate.Status, name, ownID string, pin state.NodePin) b
 	return false
 }
 func Verify(status *ipnstate.Status, name string, owner identity.Principal, pin state.NodePin) error {
-	if status == nil || status.BackendState != "Running" || status.Self == nil || status.Self.ID == "" || status.CurrentTailnet == nil || status.CurrentTailnet.Name != pin.Tailnet || canonicalDNS(status.CurrentTailnet.MagicDNSSuffix) != canonicalDNS(pin.Suffix) {
+	if status == nil || status.BackendState != "Running" || status.Self == nil || status.Self.ID == "" || status.CurrentTailnet == nil || status.CurrentTailnet.Name != pin.Tailnet || identity.CanonicalDNS(status.CurrentTailnet.MagicDNSSuffix) != identity.CanonicalDNS(pin.Suffix) {
 		return errors.New("node tailnet identity mismatch")
 	}
-	if canonicalDNS(status.Self.DNSName) != canonicalDNS(name+"."+pin.Suffix) {
+	if identity.CanonicalDNS(status.Self.DNSName) != identity.CanonicalDNS(name+"."+pin.Suffix) {
 		return errors.New("assigned node name differs from exact requested name")
 	}
 	if strings.HasPrefix(string(owner), "tag:") {
@@ -94,10 +90,10 @@ func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.
 	m.Metrics.Handle("node_lease", 1)
 	defer func() { _ = lease.Close(); m.Metrics.Handle("node_lease", -1) }()
 	dir := data.Network.Tailscale.StateDir
-	if state.RecoverNode(dir, data.Name, owner, true, m.Pin) == state.Unreadable {
+	if state.RecoverNode(dir, data.Name, owner, &m.Pin) == state.Unreadable {
 		return approvalError("state unreadable; recover retained state or clean up the stale device before retrying")
 	}
-	old, nodeState := state.ReadNode(dir, data.Name, owner, m.Pin)
+	old, nodeState := state.ReadNode(dir, data.Name, owner, &m.Pin)
 	if nodeState == state.Enrolled && !reauth {
 		return m.postEnroll(ctx, old.NodeID, progress)
 	}
@@ -118,7 +114,8 @@ func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.
 		return approvalError("enrollment disabled for existing node declaration")
 	}
 	token := ""
-	if mode == User {
+	switch mode {
+	case User:
 		if m.OAuth == nil {
 			return approvalError("configured OAuth app unavailable")
 		}
@@ -132,8 +129,8 @@ func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.
 		if err != nil {
 			return approvalError("approval expired or interrupted; start to obtain a fresh link")
 		}
-	} else if mode == Tag {
-		token, err = tailnet.Mint(ctx, &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, "https://api.tailscale.com", m.Secrets.ClientSecret, string(owner))
+	case Tag:
+		token, err = tailnet.Mint(ctx, tailnet.NewHTTPClient(30*time.Second), "https://api.tailscale.com", m.Secrets.ClientSecret, string(owner))
 		if err != nil {
 			if errors.Is(err, tailnet.ErrCredentialUnavailable) {
 				return &authz.Error{Code: "unavailable", Message: "credential service unavailable; VM remains stopped and resumable", Exit: 9}
@@ -176,10 +173,7 @@ func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.
 	if mode == Tag {
 		server.AdvertiseTags = []string{string(owner)}
 	}
-	timeout := m.Timeout
-	if timeout == 0 {
-		timeout, _ = time.ParseDuration(m.Config.Enrollment.Timeout)
-	}
+	timeout, _ := time.ParseDuration(m.Config.Enrollment.Timeout)
 	if timeout <= 0 || timeout > 5*time.Minute {
 		timeout = 5 * time.Minute
 	}
@@ -208,7 +202,7 @@ func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.
 		if !promoted && candidateID == "" {
 			// A device awaiting approval may persist its ID before Status has Self.
 			// Capture public profile identity before removing owned pending state.
-			stored, kind := state.ReadNode(pending, data.Name, owner)
+			stored, kind := state.ReadNode(pending, data.Name, owner, nil)
 			candidateID = stored.NodeID
 			if kind == state.Unreadable {
 				promoted = true
@@ -236,7 +230,7 @@ func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.
 		if e != nil {
 			return approvalError("reauth watch failed")
 		}
-		defer watcher.Close()
+		defer func() { _ = watcher.Close() }()
 		if err = lc.StartLoginInteractive(attempt); err != nil {
 			return approvalError("explicit reauth failed")
 		}
@@ -325,7 +319,7 @@ func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.
 	if err = state.SyncDir(filepath.Dir(dir)); err != nil {
 		return approvalError("node state promotion requires recovery")
 	}
-	if state.RecoverNode(dir, data.Name, owner, true, m.Pin) != state.Enrolled {
+	if state.RecoverNode(dir, data.Name, owner, &m.Pin) != state.Enrolled {
 		return approvalError("node state promotion requires recovery")
 	}
 	progress("node enrolled: " + data.Name + "." + m.Pin.Suffix)
@@ -335,7 +329,7 @@ func (m *Manager) Enroll(ctx context.Context, machine *silo.Machine, data *silo.
 // Local API preferences redact private keys. After Close, use public IPN state
 // to derive the persisted public key and bind it to the observed current netmap.
 func checkClosedNode(dir, name string, owner identity.Principal, pin state.NodePin, id string, observed key.NodePublic, old state.NodeIdentity, reauth bool) error {
-	stored, kind := state.ReadNode(dir, name, owner, pin)
+	stored, kind := state.ReadNode(dir, name, owner, &pin)
 	if kind != state.Enrolled || stored.NodeID != id || observed.IsZero() || stored.NodeKey != observed {
 		return approvalError("persisted node identity or public key mismatch")
 	}

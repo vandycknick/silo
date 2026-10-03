@@ -132,6 +132,14 @@ func load(path, expectedVersion string, expectedABI uint32) error {
 // NativeABIVersion returns the ABI of the bridge already validated by Load.
 func NativeABIVersion() uint32 { return uint32(C.bridge_abi_version()) }
 
+func PlanningQuery(request []byte) ([]byte, error) {
+	var output C.silo_buffer
+	if err := takeError(C.bridge_planning_query(bytePointer(request), C.size_t(len(request)), &output)); err != nil {
+		return nil, err
+	}
+	return copyBuffer(output), nil
+}
+
 func openRuntime(request []byte) (*Runtime, error) {
 	var output *C.silo_runtime
 	errorValue := C.bridge_runtime_open(bytePointer(request), C.size_t(len(request)), &output)

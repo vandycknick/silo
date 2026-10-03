@@ -24,11 +24,11 @@ func TestAuditRotationConcurrentRealFiles(t *testing.T) {
 		t.Fatal(e)
 	}
 	var wg sync.WaitGroup
-	for worker := 0; worker < 8; worker++ {
+	for worker := range 8 {
 		wg.Add(1)
 		go func(worker int) {
 			defer wg.Done()
-			for i := 0; i < 20; i++ {
+			for i := range 20 {
 				if e := a.Append(Decision{NodeID: fmt.Sprintf("%d-%d", worker, i), Principals: []identity.Principal{"user:1"}, Action: "vm.read", Allowed: true}); e != nil {
 					t.Error(e)
 				}
@@ -92,16 +92,6 @@ func TestPrivateAtomicFiles(t *testing.T) {
 	if e = PinTailnet(home, "other"); e == nil {
 		t.Fatal("tailnet change accepted")
 	}
-	path, e := PrincipalDir(home, "user:123")
-	if e != nil {
-		t.Fatal(e)
-	}
-	if filepath.Dir(path) != filepath.Join(home, "taild", "principals") {
-		t.Fatal(path)
-	}
-	if _, e = PrincipalDir(home, "tag:../../escape"); e == nil {
-		t.Fatal("path traversal")
-	}
 }
 
 func TestExclusiveHomeLock(t *testing.T) {
@@ -153,32 +143,29 @@ func TestProfileStateAndStoppedRecovery(t *testing.T) {
 	if e := PrivateDir(dir); e != nil {
 		t.Fatal(e)
 	}
-	if _, s := ReadNode(dir, "dev", "user:123"); s != Pending {
+	if _, s := ReadNode(dir, "dev", "user:123", nil); s != Pending {
 		t.Fatal(s)
 	}
 	writeNode(t, dir, "dev")
-	if _, s := ReadNode(dir, "dev", "user:123"); s != Enrolled {
+	if _, s := ReadNode(dir, "dev", "user:123", nil); s != Enrolled {
 		t.Fatal(s)
 	}
-	if _, s := ReadNode(dir, "dev", "user:999"); s != Unreadable {
+	if _, s := ReadNode(dir, "dev", "user:999", nil); s != Unreadable {
 		t.Fatal("foreign profile accepted")
 	}
-	if _, s := ReadNode(dir, "other", "user:123"); s != Unreadable {
+	if _, s := ReadNode(dir, "other", "user:123", nil); s != Unreadable {
 		t.Fatal("renamed profile accepted")
 	}
 	if e := os.Rename(dir, dir+".backup"); e != nil {
 		t.Fatal(e)
 	}
-	if s := RecoverNode(dir, "dev", "user:123", false); s != Unreadable {
-		t.Fatal("running recovery accepted")
-	}
-	if s := RecoverNode(dir, "dev", "user:123", true); s != Enrolled {
+	if s := RecoverNode(dir, "dev", "user:123", nil); s != Enrolled {
 		t.Fatal(s)
 	}
 	if e := os.WriteFile(filepath.Join(dir, "tailscaled.state"), []byte("broken"), 0600); e != nil {
 		t.Fatal(e)
 	}
-	if _, s := ReadNode(dir, "dev", "user:123"); s != Unreadable {
+	if _, s := ReadNode(dir, "dev", "user:123", nil); s != Unreadable {
 		t.Fatal(s)
 	}
 }
@@ -214,10 +201,10 @@ func TestRecoveryAtPromotionCrashBoundaries(t *testing.T) {
 			if step == "corrupt-canonical" {
 				want = Unreadable
 			}
-			if s := RecoverNode(dir, "dev", "user:123", true); s != want {
+			if s := RecoverNode(dir, "dev", "user:123", nil); s != want {
 				t.Fatal(s)
 			}
-			if _, s := ReadNode(dir, "dev", "user:123"); s != Enrolled {
+			if _, s := ReadNode(dir, "dev", "user:123", nil); s != Enrolled {
 				t.Fatal(s)
 			}
 			if _, e := os.Stat(dir + ".backup"); !os.IsNotExist(e) {
@@ -237,7 +224,7 @@ func TestUnverifiedPendingAndChangedReceiptNeverPromote(t *testing.T) {
 			}
 			writeNode(t, dir+".pending", "dev")
 		}
-		if s := RecoverNode(dir, "dev", "user:123", true); s != Unreadable {
+		if s := RecoverNode(dir, "dev", "user:123", nil); s != Unreadable {
 			t.Fatal("unverified pending admitted", s)
 		}
 		if _, e := os.Stat(dir + ".pending"); e != nil {
@@ -255,7 +242,7 @@ func TestEmptyCreateStatePromotionAndUnknownBackupRetention(t *testing.T) {
 	if e := MarkVerifiedNode(dir + ".pending"); e != nil {
 		t.Fatal(e)
 	}
-	if s := RecoverNode(dir, "dev", "user:123", true); s != Enrolled {
+	if s := RecoverNode(dir, "dev", "user:123", nil); s != Enrolled {
 		t.Fatal(s)
 	}
 	if _, e := os.Stat(dir + ".backup"); !os.IsNotExist(e) {
@@ -267,7 +254,7 @@ func TestEmptyCreateStatePromotionAndUnknownBackupRetention(t *testing.T) {
 	if e := os.WriteFile(filepath.Join(dir+".backup", "tailscaled.state"), []byte("unknown material"), 0600); e != nil {
 		t.Fatal(e)
 	}
-	if s := RecoverNode(dir, "dev", "user:123", true); s != Unreadable {
+	if s := RecoverNode(dir, "dev", "user:123", nil); s != Unreadable {
 		t.Fatal("unknown backup ignored", s)
 	}
 	if _, e := os.Stat(dir + ".backup"); e != nil {
@@ -301,12 +288,12 @@ func TestPublicProfilePinControlTailnetAndStableID(t *testing.T) {
 		t.Fatal(e)
 	}
 	pin := NodePin{Tailnet: "tailnet", Suffix: "TAIL.TEST.", ControlURL: ipn.DefaultControlURL}
-	node, s := ReadNode(dir, "dev", "user:123", pin)
+	node, s := ReadNode(dir, "dev", "user:123", &pin)
 	if s != Enrolled || node.NodeID != "node-1" {
 		t.Fatal(node, s)
 	}
 	for _, bad := range []NodePin{{Tailnet: "other", Suffix: "tail.test"}, {Tailnet: "tailnet", Suffix: "other.test"}, {Tailnet: "tailnet", Suffix: "tail.test", ControlURL: "https://foreign.test"}} {
-		if _, s = ReadNode(dir, "dev", "user:123", bad); s != Unreadable {
+		if _, s = ReadNode(dir, "dev", "user:123", &bad); s != Unreadable {
 			t.Fatal("foreign pin accepted", bad, s)
 		}
 	}

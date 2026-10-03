@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/vandycknick/silo/app/taild/internal/authz"
 	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/metrics"
@@ -103,49 +104,15 @@ func (r *Runtime) Reconcile(ctx context.Context) (Snapshot, error) {
 			s.Unmanaged++
 			continue
 		}
-		owner, err := identity.ParsePrincipal(d.Labels[OwnerLabel])
-		if err != nil || d.Labels[NameLabel] != d.Name || !config.ValidName(d.Name) {
-			s.Unreadable++
-			continue
-		}
 		mode := d.Labels[ModeLabel]
-		if mode != "user" && mode != "tag" && mode != "interactive" && mode != "none" {
+		if !Managed(d, r.Instance) || mode != "user" && mode != "tag" && mode != "interactive" && mode != "none" {
 			s.Unreadable++
 			continue
 		}
+		owner := identity.Principal(d.Labels[OwnerLabel])
 		node := state.NoNode
 		if mode != "none" {
-			if d.Network.Tailscale == nil {
-				node = state.Unreadable
-			} else {
-				machine, err := r.Machine(ctx, d.ID)
-				if err != nil {
-					node = state.Unreadable
-				} else {
-					if d.Status.Kind == silo.MachineStatusStopped {
-						lease, err := machine.LeaseNodeState(ctx)
-						if err != nil {
-							node = state.Unreadable
-						} else {
-							r.Metrics.Handle("node_lease", 1)
-							var pins []state.NodePin
-							if r.NodePin != nil {
-								pins = []state.NodePin{*r.NodePin}
-							}
-							node = state.RecoverNode(d.Network.Tailscale.StateDir, d.Name, owner, true, pins...)
-							_ = lease.Close()
-							r.Metrics.Handle("node_lease", -1)
-						}
-					} else {
-						var pins []state.NodePin
-						if r.NodePin != nil {
-							pins = []state.NodePin{*r.NodePin}
-						}
-						_, node = state.ReadNode(d.Network.Tailscale.StateDir, d.Name, owner, pins...)
-					}
-					r.CloseMachine(machine)
-				}
-			}
+			node = r.nodeState(ctx, d, owner)
 		}
 		if len(entry.Issues) > 0 {
 			s.Unreadable++
@@ -155,7 +122,42 @@ func (r *Runtime) Reconcile(ctx context.Context) (Snapshot, error) {
 	return s, nil
 }
 
-// Reserve is a short in-process reservation, not a distributed claim. Phase 11
+// Managed reports whether a machine record carries this daemon instance's
+// complete label authority: instance, exact name, and a parseable owner.
+func Managed(d *silo.MachineData, instance string) bool {
+	if d == nil || instance == "" || d.Labels[InstanceLabel] != instance || d.Labels[NameLabel] != d.Name || !config.ValidName(d.Name) {
+		return false
+	}
+	_, err := identity.ParsePrincipal(d.Labels[OwnerLabel])
+	return err == nil
+}
+
+// nodeState reads a tailnet-declared machine's node state. Stopped machines are
+// recovered under the native lease; running ones are only observed.
+func (r *Runtime) nodeState(ctx context.Context, d *silo.MachineData, owner identity.Principal) state.NodeState {
+	if d.Network.Tailscale == nil {
+		return state.Unreadable
+	}
+	machine, err := r.Machine(ctx, d.ID)
+	if err != nil {
+		return state.Unreadable
+	}
+	defer r.CloseMachine(machine)
+	dir := d.Network.Tailscale.StateDir
+	if d.Status.Kind != silo.MachineStatusStopped {
+		_, node := state.ReadNode(dir, d.Name, owner, r.NodePin)
+		return node
+	}
+	lease, err := machine.LeaseNodeState(ctx)
+	if err != nil {
+		return state.Unreadable
+	}
+	r.Metrics.Handle("node_lease", 1)
+	defer func() { _ = lease.Close(); r.Metrics.Handle("node_lease", -1) }()
+	return state.RecoverNode(dir, d.Name, owner, r.NodePin)
+}
+
+// Reserve is a short in-process reservation, not a distributed claim. Create
 // holds it through SDK CreateMachine, whose native exact-name home lock also
 // covers CLI/SDK writers. Consent/boot must never hold that native lock.
 func (r *Runtime) Reserve(ctx context.Context, name string, visibleNames []string) (func(), error) {
@@ -165,7 +167,7 @@ func (r *Runtime) Reserve(ctx context.Context, name string, visibleNames []strin
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.reserved[name] {
-		return nil, errors.New("name already taken locally or on the tailnet")
+		return nil, &authz.Error{Code: "conflict", Message: "name already taken locally or on the tailnet", Exit: 5}
 	}
 	entries, e := r.SDK.Inventory(ctx)
 	if e != nil {
@@ -173,24 +175,15 @@ func (r *Runtime) Reserve(ctx context.Context, name string, visibleNames []strin
 	}
 	for _, entry := range entries {
 		if entry.Name == name {
-			return nil, errors.New("name already taken locally or on the tailnet")
+			return nil, &authz.Error{Code: "conflict", Message: "name already taken locally or on the tailnet", Exit: 5}
 		}
 	}
 	for _, visible := range visibleNames {
 		if visible == name {
-			return nil, errors.New("name already taken locally or on the tailnet")
+			return nil, &authz.Error{Code: "conflict", Message: "name already taken locally or on the tailnet", Exit: 5}
 		}
 	}
 	r.reserved[name] = true
 	var once sync.Once
 	return func() { once.Do(func() { r.mu.Lock(); delete(r.reserved, name); r.mu.Unlock() }) }, nil
-}
-func Visible(vms []VM, p identity.Peer) []VM {
-	result := []VM{}
-	for _, vm := range vms {
-		if p.Owns(vm.Owner) {
-			result = append(result, vm)
-		}
-	}
-	return result
 }

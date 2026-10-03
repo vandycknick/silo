@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/vandycknick/silo/app/taild/internal/identity"
@@ -28,10 +27,8 @@ const (
 )
 
 type NodeIdentity struct {
-	NodeID   string
-	UserID   int64
-	Hostname string
-	NodeKey  key.NodePublic
+	NodeID  string
+	NodeKey key.NodePublic
 }
 
 type NodePin struct{ Tailnet, Suffix, ControlURL string }
@@ -78,7 +75,9 @@ func controlURL(s string) string {
 
 // ReadNode uses the same public state/profile types as pinned tsnet. Never
 // infer enrollment from a directory, cached netmap, or taild-owned record.
-func ReadNode(dir, name string, owner identity.Principal, pins ...NodePin) (NodeIdentity, NodeState) {
+// A pin, when the daemon has one, must match the control plane the profile
+// was issued by.
+func ReadNode(dir, name string, owner identity.Principal, pin *NodePin) (NodeIdentity, NodeState) {
 	directory, e := os.Lstat(dir)
 	if errors.Is(e, os.ErrNotExist) {
 		return NodeIdentity{}, Pending
@@ -138,10 +137,8 @@ func ReadNode(dir, name string, owner identity.Principal, pins ...NodePin) (Node
 		return NodeIdentity{}, Unreadable
 	}
 	p := prefs.Persist
-	for _, pin := range pins {
-		if profile.NetworkProfile.DomainName != pin.Tailnet || strings.TrimSuffix(strings.ToLower(profile.NetworkProfile.MagicDNSName), ".") != strings.TrimSuffix(strings.ToLower(pin.Suffix), ".") || controlURL(profile.ControlURL) != controlURL(pin.ControlURL) || controlURL(prefs.ControlURL) != controlURL(pin.ControlURL) {
-			return NodeIdentity{}, Unreadable
-		}
+	if pin != nil && (profile.NetworkProfile.DomainName != pin.Tailnet || identity.CanonicalDNS(profile.NetworkProfile.MagicDNSName) != identity.CanonicalDNS(pin.Suffix) || controlURL(profile.ControlURL) != controlURL(pin.ControlURL) || controlURL(prefs.ControlURL) != controlURL(pin.ControlURL)) {
+		return NodeIdentity{}, Unreadable
 	}
 	if p.NodeID == "" && p.PrivateNodeKey.IsZero() {
 		return NodeIdentity{}, Pending
@@ -149,14 +146,14 @@ func ReadNode(dir, name string, owner identity.Principal, pins ...NodePin) (Node
 	if p.NodeID == "" || p.PrivateNodeKey.IsZero() || profile.NodeID != p.NodeID || profile.UserProfile.ID != p.UserProfile.ID || prefs.Hostname != name {
 		return NodeIdentity{}, Unreadable
 	}
-	if strings.HasPrefix(string(owner), "tag:") {
+	if owner.IsTag() {
 		if p.UserProfile.LoginName != "tagged-devices" || !slices.Contains(prefs.AdvertiseTags, string(owner)) {
 			return NodeIdentity{}, Unreadable
 		}
-	} else if p.UserProfile.ID == 0 || p.UserProfile.LoginName == "tagged-devices" || len(prefs.AdvertiseTags) != 0 || identity.Principal("user:"+strconv.FormatInt(int64(p.UserProfile.ID), 10)) != owner {
+	} else if p.UserProfile.ID == 0 || p.UserProfile.LoginName == "tagged-devices" || len(prefs.AdvertiseTags) != 0 || identity.UserPrincipal(int64(p.UserProfile.ID)) != owner {
 		return NodeIdentity{}, Unreadable
 	}
-	return NodeIdentity{NodeID: string(p.NodeID), UserID: int64(p.UserProfile.ID), Hostname: prefs.Hostname, NodeKey: p.PrivateNodeKey.Public()}, Enrolled
+	return NodeIdentity{NodeID: string(p.NodeID), NodeKey: p.PrivateNodeKey.Public()}, Enrolled
 }
 
 // BeginNodeTransaction runs under the native lease. Sync the fence before any
@@ -174,8 +171,7 @@ func BeginNodeTransaction(dir string) error {
 // safely aborting a transaction. Unknown recovery material keeps the fence.
 func FinishNodeTransaction(dir string) error {
 	for _, suffix := range []string{".pending", ".backup", ".unreadable"} {
-		_, e := os.Lstat(dir + suffix)
-		if !errors.Is(e, os.ErrNotExist) {
+		if exists(dir + suffix) {
 			return errors.New("node state recovery required")
 		}
 	}
@@ -186,12 +182,17 @@ func FinishNodeTransaction(dir string) error {
 	return SyncDir(filepath.Dir(dir))
 }
 
-// RecoverNode completes only validated stopped-machine replacements. Unknown or
+func exists(path string) bool {
+	_, e := os.Lstat(path)
+	return !errors.Is(e, os.ErrNotExist)
+}
+
+// RecoverNode completes validated replacements of a stopped machine's node
+// state; callers hold the native lease, so no VM can be running. Unknown or
 // conflicting recovery material is retained and reported, never blindly erased.
-func RecoverNode(dir, name string, owner identity.Principal, stopped bool, pins ...NodePin) NodeState {
-	canonicalNode, canonical := ReadNode(dir, name, owner, pins...)
+func RecoverNode(dir, name string, owner identity.Principal, pin *NodePin) NodeState {
+	canonicalNode, canonical := ReadNode(dir, name, owner, pin)
 	pendingDir, backupDir := dir+".pending", dir+".backup"
-	exists := func(p string) bool { _, e := os.Lstat(p); return !errors.Is(e, os.ErrNotExist) }
 	emptyDir := func(p string) bool {
 		info, e := os.Lstat(p)
 		if e != nil || !info.IsDir() {
@@ -205,7 +206,7 @@ func RecoverNode(dir, name string, owner identity.Principal, stopped bool, pins 
 			return Unreadable
 		}
 		if exists(dir + ".transaction") {
-			if !stopped || canonical != Enrolled && !emptyDir(dir) {
+			if canonical != Enrolled && !emptyDir(dir) {
 				return Unreadable
 			}
 			if FinishNodeTransaction(dir) != nil {
@@ -214,14 +215,11 @@ func RecoverNode(dir, name string, owner identity.Principal, stopped bool, pins 
 		}
 		return canonical
 	}
-	if !stopped {
-		return Unreadable
-	}
-	pendingNode, pending := ReadNode(pendingDir, name, owner, pins...)
+	pendingNode, pending := ReadNode(pendingDir, name, owner, pin)
 	if pending == Enrolled && !VerifiedNode(pendingDir) {
 		pending = Unreadable
 	}
-	backupNode, backup := ReadNode(backupDir, name, owner, pins...)
+	backupNode, backup := ReadNode(backupDir, name, owner, pin)
 	if pending == Enrolled && canonical == Enrolled && pendingNode.NodeID != canonicalNode.NodeID || backup == Enrolled && canonical == Enrolled && backupNode.NodeID != canonicalNode.NodeID || pending == Enrolled && backup == Enrolled && pendingNode.NodeID != backupNode.NodeID {
 		return Unreadable
 	}
@@ -277,7 +275,7 @@ func RecoverNode(dir, name string, owner identity.Principal, stopped bool, pins 
 	if SyncDir(filepath.Dir(dir)) != nil {
 		return Unreadable
 	}
-	_, result := ReadNode(dir, name, owner, pins...)
+	_, result := ReadNode(dir, name, owner, pin)
 	if result == Enrolled && exists(backupDir) && (backup == Enrolled || canonical == Enrolled || emptyDir(backupDir)) {
 		if e := os.RemoveAll(backupDir); e != nil {
 			return Unreadable

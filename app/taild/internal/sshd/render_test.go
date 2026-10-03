@@ -74,7 +74,7 @@ func TestHumanRenderingKeepsJSONSizesAndAddresses(t *testing.T) {
 }
 
 func TestStreamingDelimiterAndCommandHelp(t *testing.T) {
-	if help, ok := commandHelp("create"); !ok || !strings.Contains(help, "[--provision-user NAME:UID:GID:HOME]") {
+	if help, ok := commandHelp("create"); !ok || !strings.Contains(help, "--provision-user NAME:UID:GID:HOME") {
 		t.Fatal(help)
 	}
 	tokens, e := Tokenize(`exec dev -- /bin/printf '%s' --json '--yes' '$HOME; | literal'`)

@@ -29,6 +29,8 @@ import (
 	silo "github.com/vandycknick/silo/sdk/go"
 )
 
+const usageLine = "usage: taild [version|install-runtime|stop-vms] [--config FILE] [--check|--version] [--runtime-archive FILE] [--install-root DIR] [--only-when-shutting-down]"
+
 func main() {
 	if e := run(); e != nil {
 		fmt.Fprintln(os.Stderr, "taild:", redact.Text(e.Error()))
@@ -38,39 +40,66 @@ func main() {
 func run() error {
 	return runArgs(os.Args[1:])
 }
-func runArgs(args []string) error {
-	command := ""
-	if len(args) > 0 && (args[0] == "version" || args[0] == "install-runtime" || args[0] == "stop-vms") {
-		command, args = args[0], args[1:]
+
+// invocation is the parsed command line. The subcommand may precede or follow
+// the flags; without one the daemon serves.
+type invocation struct {
+	command      string
+	configPath   string
+	check        bool
+	archive      string
+	installRoot  string
+	onlyShutdown bool
+}
+
+func parseArgs(args []string) (invocation, error) {
+	var iv invocation
+	if len(args) > 0 && isCommand(args[0]) {
+		iv.command, args = args[0], args[1:]
 	}
 	flags := flag.NewFlagSet("taild", flag.ContinueOnError)
 	// Flag errors reach main's redaction boundary rather than being printed raw.
 	flags.SetOutput(io.Discard)
-	configPath := flags.String("config", "/etc/silo-taild/config.yaml", "operator YAML file")
-	check := flags.Bool("check", false, "validate config, home, secrets and installed runtime")
+	flags.StringVar(&iv.configPath, "config", "/etc/silo-taild/config.yaml", "operator YAML file")
+	flags.BoolVar(&iv.check, "check", false, "validate config, home, secrets and installed runtime")
 	version := flags.Bool("version", false, "print build and installed runtime versions")
-	archive := flags.String("runtime-archive", "", "offline SDK runtime archive (install-runtime)")
-	installRoot := flags.String("install-root", "", "SDK runtime store parent")
-	onlyShutdown := flags.Bool("only-when-shutting-down", false, "stop-vms only when systemctl reports stopping")
+	flags.StringVar(&iv.archive, "runtime-archive", "", "offline SDK runtime archive (install-runtime)")
+	flags.StringVar(&iv.installRoot, "install-root", "", "SDK runtime store parent")
+	flags.BoolVar(&iv.onlyShutdown, "only-when-shutting-down", false, "stop-vms only when systemctl reports stopping")
 	if e := flags.Parse(args); e != nil {
-		if errors.Is(e, flag.ErrHelp) {
-			fmt.Fprintln(os.Stdout, "usage: taild [version|install-runtime|stop-vms] [--config FILE] [--check|--version] [--runtime-archive FILE] [--install-root DIR] [--only-when-shutting-down]")
-			return nil
-		}
+		return iv, e
+	}
+	if flags.NArg() == 1 && iv.command == "" {
+		iv.command = flags.Arg(0)
+	} else if flags.NArg() != 0 {
+		return iv, errors.New("unexpected arguments")
+	}
+	if iv.command != "" && !isCommand(iv.command) {
+		return iv, errors.New("unknown command")
+	}
+	if *version {
+		iv.command = "version"
+	}
+	if iv.onlyShutdown && iv.command != "stop-vms" {
+		return iv, errors.New("--only-when-shutting-down requires stop-vms")
+	}
+	return iv, nil
+}
+
+func isCommand(s string) bool {
+	return s == "version" || s == "install-runtime" || s == "stop-vms"
+}
+
+func runArgs(args []string) error {
+	iv, e := parseArgs(args)
+	if errors.Is(e, flag.ErrHelp) {
+		_, _ = fmt.Fprintln(os.Stdout, usageLine)
+		return nil
+	}
+	if e != nil {
 		return e
 	}
-	if flags.NArg() == 1 && command == "" {
-		command = flags.Arg(0)
-	} else if flags.NArg() != 0 {
-		return errors.New("unexpected arguments")
-	}
-	if command != "" && command != "version" && command != "install-runtime" && command != "stop-vms" {
-		return errors.New("unknown command")
-	}
-	if *onlyShutdown && command != "stop-vms" {
-		return errors.New("--only-when-shutting-down requires stop-vms")
-	}
-	if command == "stop-vms" && *onlyShutdown {
+	if iv.command == "stop-vms" && iv.onlyShutdown {
 		host, e := supervision.SystemState(context.Background())
 		if e != nil {
 			return e
@@ -80,41 +109,24 @@ func runArgs(args []string) error {
 			return nil
 		}
 	}
-	c, e := config.Load(*configPath)
-	if (*version || command == "version") && errors.Is(e, os.ErrNotExist) {
+	c, e := config.Load(iv.configPath)
+	if iv.command == "version" && errors.Is(e, os.ErrNotExist) {
 		e = nil
 	}
 	if e != nil {
 		return e
 	}
-	if *installRoot != "" {
-		c.InstallRoot = *installRoot
+	if iv.installRoot != "" {
+		c.InstallRoot = iv.installRoot
 	}
-	if *archive != "" {
-		c.RuntimeArchive = *archive
+	if iv.archive != "" {
+		c.RuntimeArchive = iv.archive
 	}
 	if e := c.Validate(); e != nil {
 		return e
 	}
-	if *version || command == "version" {
-		v := service.Versions()
-		root, err := runtime.Root(c)
-		if err != nil && !errors.Is(err, runtime.ErrMissingRuntime) {
-			return err
-		}
-		if err == nil {
-			manifest, err := runtime.ValidateManifest(root)
-			if err != nil {
-				return err
-			}
-			v.Runtime = manifest.Version
-		}
-		v.ABIVerified, e = silo.VerifiedNativeABIVersion()
-		if e != nil {
-			return e
-		}
-		fmt.Printf("taild %s SDK %s runtime %s tailscale %s ABI expected %d verified %d\n", v.Taild, v.SDK, v.Runtime, v.Tailscale, v.ABIExpected, v.ABIVerified)
-		return nil
+	if iv.command == "version" {
+		return printVersion(c)
 	}
 	c.Home, e = config.ResolveHome(c.Home, os.Geteuid())
 	if e != nil {
@@ -122,75 +134,11 @@ func runArgs(args []string) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	if command == "install-runtime" {
-		if c.RuntimeArchive == "" {
-			return errors.New("install-runtime requires --runtime-archive or runtime_archive")
-		}
-		installed, err := silo.InstallRuntime(ctx, silo.WithInstallRoot(c.RuntimeStore()), silo.WithRuntimeArchive(c.RuntimeArchive))
-		if err != nil {
-			var sdkError *silo.Error
-			if errors.As(err, &sdkError) {
-				return fmt.Errorf("offline SDK runtime installation failed (%s)", sdkError.Kind)
-			}
-			return errors.New("offline SDK runtime installation failed")
-		}
-		manifest, err := runtime.ValidateManifest(installed.Root)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("runtime %s target %s installed\n", manifest.Version, manifest.Target)
-		return nil
-	}
-	if command == "stop-vms" {
-		if _, e := state.LockShutdownHelper(c.Home); e != nil {
-			return errors.New("another shutdown helper is active or helper lock unavailable")
-		}
-		budget, _ := time.ParseDuration(c.Shutdown.StopBudget)
-		stopping, done := context.WithTimeout(ctx, budget)
-		defer done()
-		// The initial guard may precede config/home I/O. Recheck after taking the
-		// helper lease so a cancelled shutdown cannot launch a late stop process.
-		if *onlyShutdown {
-			host, err := supervision.SystemState(stopping)
-			if err != nil {
-				return err
-			}
-			if host != "stopping" {
-				fmt.Fprintln(os.Stderr, "taild: shutdown cancelled; no VMs stopped")
-				return nil
-			}
-		}
-		if e := state.MarkShutdown(c.Home); e != nil {
-			return errors.New("cannot seal host shutdown admission")
-		}
-		instance, e := state.ReadInstance(c.Home)
-		if e != nil {
-			return e
-		}
-		type opened struct {
-			runtime *runtime.Runtime
-			err     error
-		}
-		ready := make(chan opened, 1)
-		go func() { r, err := runtime.Open(stopping, c, instance); ready <- opened{r, err} }()
-		var r *runtime.Runtime
-		select {
-		case opened := <-ready:
-			if opened.err != nil {
-				return opened.err
-			}
-			r = opened.runtime
-		case <-stopping.Done():
-			return errors.New("shutdown runtime open deadline reached; no completion guarantee")
-		}
-		result, e := supervision.Sweep(stopping, r)
-		fmt.Fprintf(os.Stderr, "taild: stops issued=%d finished=%d failed=%d\n", result.Issued, result.Finished, result.Failed)
-		if e != nil {
-			return e
-		}
-		// The helper's process exit reclaims its SDK handles. Close must not wait
-		// on native calls beyond the already-spent host shutdown budget.
-		return nil
+	switch iv.command {
+	case "install-runtime":
+		return installRuntime(ctx, c)
+	case "stop-vms":
+		return stopVMs(ctx, c, iv.onlyShutdown)
 	}
 	secrets, e := config.ReadSecrets(c.SecretsDir)
 	if e != nil {
@@ -199,26 +147,127 @@ func runArgs(args []string) error {
 	if c.Enrollment.DisableKeyExpiry && secrets.APIToken == "" {
 		return errors.New("disable_key_expiry requires api-token")
 	}
-	if *check {
-		r, err := runtime.Open(ctx, c, "")
+	if iv.check {
+		return checkReady(ctx, c)
+	}
+	return serve(ctx, cancel, c, secrets)
+}
+
+func printVersion(c config.Config) error {
+	v := service.Versions()
+	root, err := runtime.Root(c)
+	if err != nil && !errors.Is(err, runtime.ErrMissingRuntime) {
+		return err
+	}
+	if err == nil {
+		manifest, err := runtime.ValidateManifest(root)
 		if err != nil {
 			return err
 		}
-		documentError := (&service.Service{Config: c}).ReloadDocuments()
-		if err = r.Close(); err != nil {
+		v.Runtime = manifest.Version
+	}
+	if v.ABIVerified, err = silo.VerifiedNativeABIVersion(); err != nil {
+		return err
+	}
+	fmt.Printf("taild %s SDK %s runtime %s tailscale %s ABI expected %d verified %d\n", v.Taild, v.SDK, v.Runtime, v.Tailscale, v.ABIExpected, v.ABIVerified)
+	return nil
+}
+
+func installRuntime(ctx context.Context, c config.Config) error {
+	if c.RuntimeArchive == "" {
+		return errors.New("install-runtime requires --runtime-archive or runtime_archive")
+	}
+	installed, err := silo.InstallRuntime(ctx, silo.WithInstallRoot(c.RuntimeStore()), silo.WithRuntimeArchive(c.RuntimeArchive))
+	if err != nil {
+		var sdkError *silo.Error
+		if errors.As(err, &sdkError) {
+			return fmt.Errorf("offline SDK runtime installation failed (%s)", sdkError.Kind)
+		}
+		return errors.New("offline SDK runtime installation failed")
+	}
+	manifest, err := runtime.ValidateManifest(installed.Root)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("runtime %s target %s installed\n", manifest.Version, manifest.Target)
+	return nil
+}
+
+// stopVMs is the ExecStop helper. It seals admission, then stops every managed
+// VM within the configured budget. Its process exit reclaims the SDK handles;
+// Close must not wait on native calls beyond the already-spent host budget.
+func stopVMs(ctx context.Context, c config.Config, onlyShutdown bool) error {
+	if _, e := state.LockShutdownHelper(c.Home); e != nil {
+		return errors.New("another shutdown helper is active or helper lock unavailable")
+	}
+	budget, _ := time.ParseDuration(c.Shutdown.StopBudget)
+	stopping, done := context.WithTimeout(ctx, budget)
+	defer done()
+	// The initial guard may precede config/home I/O. Recheck after taking the
+	// helper lease so a cancelled shutdown cannot launch a late stop process.
+	if onlyShutdown {
+		host, err := supervision.SystemState(stopping)
+		if err != nil {
 			return err
 		}
-		if documentError != nil {
-			return documentError
+		if host != "stopping" {
+			fmt.Fprintln(os.Stderr, "taild: shutdown cancelled; no VMs stopped")
+			return nil
 		}
-		fmt.Fprintln(os.Stderr, "taild: configuration and runtime ready")
-		return nil
 	}
+	if e := state.MarkShutdown(c.Home); e != nil {
+		return errors.New("cannot seal host shutdown admission")
+	}
+	instance, e := state.ReadInstance(c.Home)
+	if e != nil {
+		return e
+	}
+	type opened struct {
+		runtime *runtime.Runtime
+		err     error
+	}
+	ready := make(chan opened, 1)
+	go func() { r, err := runtime.Open(stopping, c, instance); ready <- opened{r, err} }()
+	var r *runtime.Runtime
+	select {
+	case opened := <-ready:
+		if opened.err != nil {
+			return opened.err
+		}
+		r = opened.runtime
+	case <-stopping.Done():
+		return errors.New("shutdown runtime open deadline reached; no completion guarantee")
+	}
+	result, e := supervision.Sweep(stopping, r)
+	fmt.Fprintf(os.Stderr, "taild: stops issued=%d finished=%d failed=%d\n", result.Issued, result.Finished, result.Failed)
+	return e
+}
+
+func checkReady(ctx context.Context, c config.Config) error {
+	r, err := runtime.Open(ctx, c, "")
+	if err != nil {
+		return err
+	}
+	documentError := (&service.Service{Config: c}).ReloadDocuments()
+	if err = r.Close(); err != nil {
+		return err
+	}
+	if documentError != nil {
+		return documentError
+	}
+	fmt.Fprintln(os.Stderr, "taild: configuration and runtime ready")
+	return nil
+}
+
+// serve owns the daemon lifetime: home lock, runtime, shutdown supervision,
+// tailnet node, enrollment, and the SSH and HTTPS listeners, then the bounded
+// drain in reverse.
+func serve(ctx context.Context, cancel context.CancelFunc, c config.Config, secrets config.Secrets) error {
 	lock, e := state.LockHome(c.Home)
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 	for _, dir := range []string{filepath.Join(c.Home, "taild"), filepath.Join(c.Home, "taild", "principals")} {
 		if e = state.PrivateDir(dir); e != nil {
 			return e
@@ -232,7 +281,7 @@ func runArgs(args []string) error {
 	if e != nil {
 		return e
 	}
-	defer audit.Close()
+	defer func() { _ = audit.Close() }()
 	r, e := runtime.Open(ctx, c, instance)
 	if e != nil {
 		return e
@@ -292,7 +341,7 @@ func runArgs(args []string) error {
 		return e
 	}
 	node.Metrics = r.Metrics
-	defer node.Close()
+	defer func() { _ = node.Close() }()
 	if e = node.WaitReady(ctx); e != nil {
 		return e
 	}
@@ -343,12 +392,12 @@ func runArgs(args []string) error {
 	if e != nil {
 		return e
 	}
-	defer sshListener.Close()
+	defer func() { _ = sshListener.Close() }()
 	tlsListener, e := node.Server.ListenTLS("tcp", ":443")
 	if e != nil {
 		return e
 	}
-	defer tlsListener.Close()
+	defer func() { _ = tlsListener.Close() }()
 	ssh := &sshd.Server{Service: s, Resolver: node, Global: c.Sessions.Global, PerPeer: c.Sessions.PerPeer}
 	web := httpd.Server(s, node)
 	results := make(chan error, 2)

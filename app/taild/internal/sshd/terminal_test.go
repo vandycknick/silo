@@ -209,8 +209,8 @@ func TestTerminalOpenSSHFirstContactAndEditing(t *testing.T) {
 	c := openTerminalClient(t, address, "")
 	c.wait(t, lobbyPrompt, 1)
 	first := c.text()
-	if !strings.Contains(first, "test-capability") {
-		t.Fatal("missing first-contact diagnostic", first)
+	if first != lobbyPrompt {
+		t.Fatal("entry must contain only the prompt", first)
 	}
 	assertTerminalNewlines(t, first)
 	time.Sleep(120 * time.Millisecond)
@@ -226,13 +226,13 @@ func TestTerminalOpenSSHFirstContactAndEditing(t *testing.T) {
 	// Both backspace encodings delete a whole unicode character. Arrows edit
 	// at the cursor; history recalls the corrected command, not escape bytes.
 	c.send(t, "whoam界\x7fi\r")
-	c.wait(t, "Principals:", 2)
+	c.wait(t, "User:", 1)
 	c.wait(t, lobbyPrompt, 2)
 	c.send(t, "\x1b[A\n")
-	c.wait(t, "Principals:", 3)
+	c.wait(t, "User:", 2)
 	c.wait(t, lobbyPrompt, 3)
 	c.send(t, "whoamé\bi\x1b[D\x04i\r\n")
-	c.wait(t, "Principals:", 4)
+	c.wait(t, "User:", 3)
 	c.wait(t, lobbyPrompt, 4)
 	// CR and split CRLF cause precisely one new prompt each.
 	c.send(t, "\r")
@@ -248,7 +248,7 @@ func TestTerminalOpenSSHFirstContactAndEditing(t *testing.T) {
 	c.send(t, "help\x1b[D\x1b[")
 	c.send(t, "\x03")
 	c.wait(t, lobbyPrompt, 9)
-	if strings.Count(c.text(), "VMs on your tailnet") != 1 {
+	if strings.Count(c.text(), "VMs on your tailnet") != 0 {
 		t.Fatal("Ctrl-C dispatched line", c.text())
 	}
 	// Bracketed paste cannot submit either command until explicit Enter.
@@ -261,7 +261,7 @@ func TestTerminalOpenSSHFirstContactAndEditing(t *testing.T) {
 	c.wait(t, lobbyPrompt, 10)
 	c.send(t, "\x1b[200~whoami\nhelp\x1b[201~\r")
 	c.wait(t, lobbyPrompt, 11)
-	if strings.Count(c.text(), "Principals:") != 4 || strings.Count(c.text(), "VMs on your tailnet") != 1 {
+	if strings.Count(c.text(), "User:") != 3 || strings.Count(c.text(), "VMs on your tailnet") != 0 {
 		t.Fatal("multiline paste executed separate commands", c.text())
 	}
 	c.send(t, "\x04")
@@ -274,7 +274,7 @@ func TestTerminalOpenSSHFirstContactAndEditing(t *testing.T) {
 		one := openTerminalClient(t, address, command)
 		one.exit(t)
 		assertTerminalNewlines(t, one.text())
-		if !strings.Contains(one.text(), map[string]string{"whoami": "Principals:", "help": "VMs on your tailnet"}[command]) {
+		if !strings.Contains(one.text(), map[string]string{"whoami": "User:", "help": "VMs on your tailnet"}[command]) {
 			t.Fatal(one.text())
 		}
 	}
@@ -283,7 +283,7 @@ func TestTerminalOpenSSHFirstContactAndEditing(t *testing.T) {
 	overflow := openTerminalClient(t, address, "")
 	overflow.wait(t, lobbyPrompt, 1)
 	overflow.send(t, "whoami"+strings.Repeat(" ", 4089)+"\r")
-	overflow.wait(t, "Principals:", 2)
+	overflow.wait(t, "User:", 1)
 	overflow.wait(t, lobbyPrompt, 2)
 	overflow.send(t, "\x1b[Axx\r")
 	select {
@@ -300,7 +300,7 @@ func TestTerminalOpenSSHFirstContactAndEditing(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("overflow PTY did not drain")
 	}
-	if strings.Count(overflow.text(), "Principals:") != 2 || strings.Contains(overflow.text(), "Error:") {
+	if strings.Count(overflow.text(), "User:") != 1 || strings.Contains(overflow.text(), "Error:") {
 		t.Fatal("overflow reached dispatch", overflow.text())
 	}
 }
@@ -593,7 +593,7 @@ func TestTerminalOpenSSHActualSDKInventoryConfirmationAndGuest(t *testing.T) {
 	address := terminalSSHServer(t, svc, caller)
 	var diagnostic bytes.Buffer
 	beforeCreate := time.Now().Truncate(time.Second)
-	if code := DispatchSession(ctx, svc, caller, "create terminal-vm --no-start", service.IO{Stdout: io.Discard, Stderr: &diagnostic}); code != 0 {
+	if code := DispatchSession(ctx, svc, caller, "create --name terminal-vm --no-start", service.IO{Stdout: io.Discard, Stderr: &diagnostic}); code != 0 {
 		t.Fatal(code, diagnostic.String())
 	}
 	view, e := svc.Show(ctx, peer, "terminal-vm")
@@ -639,7 +639,7 @@ func TestTerminalOpenSSHActualSDKInventoryConfirmationAndGuest(t *testing.T) {
 	// The real rm command uses readLineLimit. It must share the editor even
 	// for exec requests, where the lobby has never read a command line.
 	one := openTerminalClient(t, address, "rm terminal-vm")
-	one.wait(t, "Type yes: ", 1)
+	one.wait(t, "Remove VM 'terminal-vm'? [y/N] ", 1)
 	one.send(t, "ye界\x7fs\r\n")
 	one.exit(t)
 	assertTerminalNewlines(t, one.text())
@@ -655,7 +655,7 @@ func TestTerminalOpenSSHActualSDKInventoryConfirmationAndGuest(t *testing.T) {
 	payload := "#!/bin/sh\nexit 0\n#" + strings.Repeat("x", 5000) + "\r\n# controls:\x03\x04\x08\x7f\t\x1b[200~paste\x1b[201~\r\n"
 	for _, mode := range []string{"exec", "lobby"} {
 		name := "userdata-" + mode
-		command := "create " + name + " --no-start --userdata -"
+		command := "create --name " + name + " --no-start --userdata -"
 		if mode == "exec" {
 			out, errOut, code := sshPipeCommand(t, address, command, []byte(payload), true)
 			if code != 0 || len(out) != 0 || bytes.Contains(errOut, []byte("\x1b[?2004h")) {
@@ -693,7 +693,7 @@ func TestTerminalOpenSSHActualSDKInventoryConfirmationAndGuest(t *testing.T) {
 		}
 	}
 	diagnostic.Reset()
-	if code := DispatchSession(ctx, svc, caller, "create terminal-guest", service.IO{Stdout: io.Discard, Stderr: &diagnostic}); code != 0 {
+	if code := DispatchSession(ctx, svc, caller, "create --name terminal-guest", service.IO{Stdout: io.Discard, Stderr: &diagnostic}); code != 0 {
 		t.Fatal(code, diagnostic.String())
 	}
 	lobby := openTerminalClient(t, address, "")

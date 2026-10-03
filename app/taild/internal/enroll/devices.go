@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/vandycknick/silo/app/taild/internal/tailnet"
 	"io"
 	"net/http"
 	"net/netip"
@@ -32,7 +33,7 @@ func NewDevices(token string) *Devices {
 	if token == "" {
 		return nil
 	}
-	return &Devices{token: token, base: "https://api.tailscale.com", client: &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	return &Devices{token: token, base: "https://api.tailscale.com", client: tailnet.NewHTTPClient(15 * time.Second)}
 }
 func (d *Devices) request(ctx context.Context, method, path string, body []byte, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -96,7 +97,7 @@ func (d *Devices) Get(ctx context.Context, nodeID string) (Device, error) {
 		return Device{}, ErrDeviceNotFound
 	}
 	if len(id) > 128 || strings.ContainsFunc(id, func(c rune) bool {
-		return !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-')
+		return (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' && c != '-'
 	}) {
 		return Device{}, ErrInvalidDeviceResponse
 	}

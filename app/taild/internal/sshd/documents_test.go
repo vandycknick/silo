@@ -7,40 +7,13 @@ import (
 	"io"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/vandycknick/silo/app/taild/internal/config"
-	"github.com/vandycknick/silo/app/taild/internal/identity"
-	"github.com/vandycknick/silo/app/taild/internal/runtime"
 	"github.com/vandycknick/silo/app/taild/internal/service"
-	"github.com/vandycknick/silo/app/taild/internal/state"
-	"github.com/vandycknick/silo/app/taild/internal/testfixture"
 )
 
 func TestDocumentCommandsActualRuntimeJSONCRUDAndFiniteInput(t *testing.T) {
-	c := config.Defaults()
-	c.Home = t.TempDir()
-	c.TemplatesDir = t.TempDir()
-	c.PoliciesDir = t.TempDir()
-	c.RuntimeRoot = testfixture.Path(t, "SILO_TEST_RUNTIME_ROOT", true)
 	ctx := context.Background()
-	r, e := runtime.Open(ctx, c, "documents-cli")
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer r.Close()
-	audit, e := state.OpenAudit(c.Home, 1<<20, 2)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer audit.Close()
-	s := &service.Service{Runtime: r, Audit: audit, Config: c}
-	limits, e := c.Limits()
-	if e != nil {
-		t.Fatal(e)
-	}
-	p := identity.Peer{Principals: []identity.Principal{"tag:one", "tag:two"}, NodeID: "explicit-doc-input", ObservedAt: time.Now(), Permissions: identity.Permissions{Actions: identity.Actions(), Limits: limits}}
-	caller := service.Caller{Peer: p, Resolve: func(ctx context.Context) (identity.Peer, error) { return p, ctx.Err() }}
+	s, caller, _ := nativeService(t, ctx, "documents-cli", "tag:one", "tag:two")
 	run := func(line, input string, want int) string {
 		t.Helper()
 		var out, err bytes.Buffer
@@ -50,7 +23,7 @@ func TestDocumentCommandsActualRuntimeJSONCRUDAndFiniteInput(t *testing.T) {
 		}
 		if strings.Contains(line, "--json") {
 			var v map[string]json.RawMessage
-			if e = json.Unmarshal(out.Bytes(), &v); e != nil {
+			if e := json.Unmarshal(out.Bytes(), &v); e != nil {
 				t.Fatal(e, out.String())
 			}
 			if string(v["ok"]) != map[bool]string{true: "true", false: "false"}[want == 0] {

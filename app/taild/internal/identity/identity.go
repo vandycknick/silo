@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"regexp"
 	"slices"
@@ -18,7 +17,10 @@ import (
 	"tailscale.com/tailcfg"
 )
 
+// Principal is a tailnet tag ("tag:name") or a tailnet user ("user:ID").
 type Principal string
+
+var tagPattern = regexp.MustCompile(`^tag:[a-zA-Z][a-zA-Z0-9-]*$`)
 
 func ParsePrincipal(s string) (Principal, error) {
 	if strings.HasPrefix(s, "user:") {
@@ -27,11 +29,18 @@ func ParsePrincipal(s string) (Principal, error) {
 			return Principal(s), nil
 		}
 	}
-	if strings.HasPrefix(s, "tag:") && regexp.MustCompile(`^tag:[a-zA-Z][a-zA-Z0-9-]*$`).MatchString(s) {
+	if tagPattern.MatchString(s) {
 		return Principal(s), nil
 	}
 	return "", errors.New("invalid principal")
 }
+
+func UserPrincipal(id int64) Principal { return Principal("user:" + strconv.FormatInt(id, 10)) }
+
+func (p Principal) IsTag() bool { return strings.HasPrefix(string(p), "tag:") }
+
+// CanonicalDNS lowercases a DNS name and drops its trailing dot for comparison.
+func CanonicalDNS(s string) string { return strings.TrimSuffix(strings.ToLower(s), ".") }
 
 type Action string
 
@@ -110,7 +119,7 @@ func FromWhoIs(w *apitype.WhoIsResponse, capability string, defaults Limits, log
 		if w.UserProfile.LoginName == "tagged-devices" {
 			return Peer{}, errors.New("tagged peer has no tags")
 		}
-		v, e := ParsePrincipal(fmt.Sprintf("user:%d", w.UserProfile.ID))
+		v, e := ParsePrincipal(string(UserPrincipal(int64(w.UserProfile.ID))))
 		if e != nil {
 			return Peer{}, e
 		}

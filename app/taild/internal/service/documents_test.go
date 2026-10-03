@@ -345,7 +345,10 @@ rule "allow" {
 }
 
 func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
+	registry := testfixture.OCIRegistry(t, "")
 	s := actualService(t)
+	s.Config.VM.DefaultImage = registry.Reference
+	s.Config.VM.AllowedRegistries = []string{strings.Split(registry.Reference, "/")[0] + "/fixture"}
 	s.VMNodesEnabled = true
 	s.Config.Tailnet.ControlURL = "https://wrong-config.example.test"
 	s.Enrollment = &enroll.Manager{Pin: state.NodePin{ControlURL: "https://pinned-control.example.test"}}
@@ -355,11 +358,24 @@ func TestCanonicalInjectionCarriesVerifiedOwnerAndPinnedControl(t *testing.T) {
 		if owner == "user:7" {
 			selected = ""
 		}
-		q, e := s.resolveCreate(context.Background(), caller.Peer, CreateRequest{Name: "exact", Owner: selected})
+		ctx := context.Background()
+		op, e := s.Create(ctx, caller, CreateRequest{Name: "exact", Owner: selected, NoStart: true})
+		succeeded(t, s, caller, op, e)
+		m, e := s.Runtime.SDK.Machine(ctx, "exact")
 		if e != nil {
 			t.Fatal(e)
 		}
-		hcl, e := q.policy.HCL()
+		data, e := m.Inspect(ctx)
+		if e != nil {
+			_ = m.Close()
+			t.Fatal(e)
+		}
+		hcl, e := data.Network.Policy.HCL()
+		removeErr := m.Remove(ctx)
+		_ = m.Close()
+		if removeErr != nil {
+			t.Fatal(removeErr)
+		}
 		if e != nil {
 			t.Fatal(e)
 		}

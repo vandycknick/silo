@@ -155,7 +155,7 @@ func TestLiveTailnetKVMOwnedOperations(t *testing.T) {
 		t.Fatal(string(output), e)
 	}
 	name := "s11-" + suffix
-	for _, command := range []string{"create " + name + " --no-tailnet --json", "ls --json", "show " + name + " --json", "exec " + name + " -- /bin/id -u"} {
+	for _, command := range []string{"create --name " + name + " --no-tailnet --json", "ls --json", "show " + name + " --json", "exec " + name + " -- /bin/id -u"} {
 		output, e = run(command)
 		if e != nil {
 			t.Fatalf("%s: %v %s", command, e, output)
@@ -182,7 +182,7 @@ func TestLiveTailnetKVMOwnedOperations(t *testing.T) {
 	} else if exit, ok := e.(*ssh.ExitError); !ok || exit.ExitStatus() != 5 {
 		t.Fatal(e)
 	}
-	for _, command := range []string{"logs " + name + " --stream serial", "stop " + name + " --json", "set " + name + " memory=768MiB --json", "start " + name + " --json", "restart " + name + " --json", "ops --json", "rm " + name + " --force --json"} {
+	for _, command := range []string{"logs " + name + " --stream serial", "stop " + name + " --json", "set " + name + " memory=768MiB --json", "start " + name + " --json", "restart " + name + " --json", "ops --json", "rm " + name + " --force --yes --json"} {
 		if output, e = run(command); e != nil {
 			t.Fatalf("%s: %v %s", command, e, output)
 		}

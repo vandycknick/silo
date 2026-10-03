@@ -6,8 +6,8 @@ import "github.com/vandycknick/silo/sdk/go/internal/ffi"
 const Version = "0.1.0"
 
 // NativeABIVersion is the native bridge ABI required by this SDK.
-// ABI 3 includes node-state leases and cancellable attachments.
-const NativeABIVersion uint32 = 3
+// ABI 4 adds stateless creation planning.
+const NativeABIVersion uint32 = 4
 
 // VerifiedNativeABIVersion loads the exact bridge and returns its actual ABI after
 // checking both ABI and product version. It never opens a runtime or starts a VM.

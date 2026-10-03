@@ -57,7 +57,7 @@ func TestClosedReauthPublicStateRejectsUnchangedOrUnboundKey(t *testing.T) {
 	oldDir := t.TempDir()
 	oldKey := key.NewNode()
 	profileFixture(t, oldDir, "dev", "stable", pin, oldKey, nil)
-	old, kind := state.ReadNode(oldDir, "dev", "user:7", pin)
+	old, kind := state.ReadNode(oldDir, "dev", "user:7", &pin)
 	if kind != state.Enrolled {
 		t.Fatal(kind)
 	}

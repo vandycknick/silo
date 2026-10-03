@@ -86,7 +86,7 @@ func TestCallbackRealTLSExchangeAtomicConsumeAndOpaqueToken(t *testing.T) {
 	}
 	var successes atomic.Int32
 	var wg sync.WaitGroup
-	for i := 0; i < 12; i++ {
+	for range 12 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -136,7 +136,7 @@ func TestExchangeFailureIsConsumedAndBodiesBounded(t *testing.T) {
 		oauth.client = upstream.Client()
 		callback := httptest.NewTLSServer(http.HandlerFunc(oauth.Callback))
 		nonce, c, _ := registry.Begin("vm", "user:1", oauth.ClientID, oauth.Redirect)
-		for i := 0; i < 2; i++ {
+		for range 2 {
 			resp, err := callback.Client().Get(callback.URL + "?state=" + nonce + "&code=code")
 			if err != nil {
 				t.Fatal(err)

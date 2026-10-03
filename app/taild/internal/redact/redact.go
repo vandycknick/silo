@@ -54,16 +54,10 @@ func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 func (h *Handler) attr(a slog.Attr) slog.Attr {
 	v := a.Value.Resolve()
-	if v.Kind() == slog.KindGroup {
-		attrs := v.Group()
-		copy := make([]slog.Attr, len(attrs))
-		for j, attr := range attrs {
-			copy[j] = h.attr(attr)
-		}
-		a.Value = slog.GroupValue(copy...)
-	} else if v.Kind() == slog.KindString {
-		a.Value = slog.StringValue(Text(v.String(), h.secrets...))
-	} else if v.Kind() == slog.KindAny {
+	switch v.Kind() {
+	case slog.KindGroup:
+		a.Value = slog.GroupValue(h.attrs(v.Group())...)
+	case slog.KindString, slog.KindAny:
 		a.Value = slog.StringValue(Text(v.String(), h.secrets...))
 	}
 	return a
@@ -73,12 +67,15 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 	record.Attrs(func(a slog.Attr) bool { r.AddAttrs(h.attr(a)); return true })
 	return h.next.Handle(ctx, r)
 }
-func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	copy := make([]slog.Attr, len(attrs))
+func (h *Handler) attrs(attrs []slog.Attr) []slog.Attr {
+	redacted := make([]slog.Attr, len(attrs))
 	for j, a := range attrs {
-		copy[j] = h.attr(a)
+		redacted[j] = h.attr(a)
 	}
-	return &Handler{h.next.WithAttrs(copy), h.secrets}
+	return redacted
+}
+func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &Handler{h.next.WithAttrs(h.attrs(attrs)), h.secrets}
 }
 func (h *Handler) WithGroup(name string) slog.Handler {
 	return &Handler{h.next.WithGroup(name), h.secrets}

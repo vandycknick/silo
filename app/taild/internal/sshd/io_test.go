@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+func readLine(src io.Reader) (string, error) { return readLineLimit(src, 16384) }
+
 func TestInputCancellationPreservesNextCommand(t *testing.T) {
 	parent, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -52,7 +52,8 @@ func TestActualTemporaryNodeTimeoutKeepsNativeMachineStopped(t *testing.T) {
 	defer endpoint.Close()
 	c := config.Defaults()
 	c.Enrollment.Mode = "interactive"
-	manager := &Manager{Config: c, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: endpoint.URL}, Registry: NewRegistry(), Timeout: 750 * time.Millisecond}
+	c.Enrollment.Timeout = "750ms"
+	manager := &Manager{Config: c, Pin: state.NodePin{Tailnet: "fixture", Suffix: "fixture.test", ControlURL: endpoint.URL}, Registry: NewRegistry()}
 	err = manager.Enroll(ctx, machine, data, "user:1", false, func(line string) { t.Log(line) }, nil)
 	var failure *authz.Error
 	if !errors.As(err, &failure) || failure.Exit != 9 {
