@@ -1,4 +1,4 @@
-package sshd
+package commands
 
 import (
 	"fmt"
@@ -33,6 +33,7 @@ func renderListAt(vms []service.VM, now time.Time) string {
 	}
 	return b.String()
 }
+
 func renderShow(v service.VM) string {
 	text := fmt.Sprintf("Name: %s\nID: %s\nOwner: %s\nState: %s\nCPUs: %d\nMemory: %s\nDisk: %s\nCreated: %s\nImage: %s\nLabels: %v\n", v.Name, v.ID, v.Owner, v.State, v.CPUs, humanMemory(v.Memory), humanDisk(v.Disk), absoluteTime(v.Created), v.Image, v.Labels)
 	if v.Template != "" {
@@ -59,11 +60,12 @@ func renderShow(v service.VM) string {
 	}
 	return text
 }
+
 func renderVersion(v service.Version) string {
 	return fmt.Sprintf("taild %s · SDK %s · runtime %s · tailscale %s\n", v.Taild, v.SDK, v.Runtime, v.Tailscale)
 }
 
-func renderWhoAmI(_ string, who service.WhoAmI) string {
+func renderWhoAmI(who service.WhoAmI) string {
 	p := who.Peer
 	user := p.Login
 	for _, principal := range p.Principals {

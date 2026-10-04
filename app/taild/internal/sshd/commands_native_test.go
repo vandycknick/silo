@@ -27,7 +27,9 @@ func TestActualSDKCRLFCommandRemovalConfirmation(t *testing.T) {
 		t.Fatal(e)
 	}
 	diagnostic.Reset()
-	if code := DispatchSession(ctx, s, caller, command, service.IO{Stdin: reader, Input: input.Reader, Stdout: io.Discard, Stderr: &diagnostic, Terminal: service.Terminal{Present: true}}); code != 0 {
+	streams := service.IO{Stdin: reader, Input: input.Reader, Stdout: io.Discard, Stderr: &diagnostic, Terminal: service.Terminal{Present: true}}
+	streams.Prompt = sessionPrompt(streams)
+	if code := DispatchSession(ctx, s, caller, command, streams); code != 0 {
 		t.Fatal("actual CRLF confirmation rejected", code, diagnostic.String())
 	}
 	if _, e = s.Show(ctx, p, "crlf-vm"); e == nil || service.Categorize(e).Exit != 3 {

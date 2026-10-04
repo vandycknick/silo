@@ -8,7 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/service"
+	"github.com/vandycknick/silo/app/taild/internal/sshd/commands"
 )
 
 func TestDocumentCommandsActualRuntimeJSONCRUDAndFiniteInput(t *testing.T) {
@@ -63,7 +65,7 @@ func TestDocumentCommandsActualRuntimeJSONCRUDAndFiniteInput(t *testing.T) {
 	expired, cancel := context.WithCancel(ctx)
 	cancel()
 	input := newInput(expired, read)
-	if _, e := documentInput(expired, service.IO{Input: input.Reader}, service.DocumentLimit); e == nil {
+	if _, e := (&commands.Context{Context: expired, Service: s, Caller: caller, Streams: service.IO{Input: input.Reader}}).Document(identity.Read, service.DocumentLimit); e == nil {
 		t.Fatal("cancelled finite input succeeded")
 	}
 }

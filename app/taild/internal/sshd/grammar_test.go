@@ -33,6 +33,15 @@ func TestCommandGrammar(t *testing.T) {
 	}{
 		// Session-wide flags and the tokenizer.
 		{"", 2}, {"unknown", 2}, {"ls | cat", 2}, {"--json --json ls", 2}, {"--yes ls", 2}, {"ls --json", 4},
+		{"rm vm --yes --yes", 2}, {"stop vm -- x", 2}, {"ls -- x", 2},
+		{"rm vm --yes --yes=false", 2}, {"rm vm --yes=false --yes", 2}, {"--yes rm vm --yes=false", 2}, {"--yes=false rm vm --yes", 2},
+		{"--yes=false rm vm", 4}, {"--yes=true rm vm", 4}, {"rm vm --yes=false --json", 4},
+		// Help flags anywhere before the delimiter; values of declared options are never flags.
+		{"-h", 0}, {"--help", 0}, {"-h bogus", 2}, {"stop vm --help", 0}, {"exec vm -h -- ls", 0}, {"template -h", 0}, {"template create -h", 0},
+		{"create --name x -h", 0}, {"create --name x --userdata -h", 4}, {"exec vm -- -h", 4},
+		{"template --owner tag:ci create --help", 0}, {"policy --owner tag:ci create --help", 0},
+		{"template --owner tag:ci bogus --help", 2}, {"policy --owner --help bogus --help", 2},
+		{"template --owner tag:ci --help", 0}, {"create --userdata -- --help", 0},
 		// Aliases resolve only in command position.
 		{"list", 4}, {"new dev", 4}, {"status", 2}, {"ssh", 2}, {"help list", 0},
 		// Meta commands.
@@ -71,47 +80,5 @@ func TestCommandGrammar(t *testing.T) {
 		if strings.Contains(tc.line, "--json") && !strings.HasSuffix(tc.line, "-- cmd --json") && tc.exit != 2 && !strings.HasPrefix(out.String(), `{"ok":`) {
 			t.Fatalf("%q: missing JSON envelope: %q", tc.line, out.String())
 		}
-	}
-}
-
-func TestFlagSetStrictness(t *testing.T) {
-	var force, start bool
-	var memory uint64
-	var owner identity.Principal
-	labels := map[string]string{}
-	parse := func(args ...string) error {
-		f := newFlagSet()
-		f.Bool("force", &force)
-		f.Bool("no-start", &start)
-		f.Alias("mem", f.Flag("memory", size(&memory)))
-		f.Flag("owner", principal(&owner))
-		f.Repeat("label", keyValue(labels))
-		return f.Parse(args)
-	}
-	if e := parse("--force", "--memory", "1GiB", "--label", "a=1", "--label", "b=2", "--owner", "tag:x"); e != nil || !force || memory != 1<<30 || owner != "tag:x" || labels["a"] != "1" || labels["b"] != "2" {
-		t.Fatal(e, force, memory, owner, labels)
-	}
-	if e := parse("--no-start=false", "--mem=2GiB"); e != nil || start || memory != 2<<30 {
-		t.Fatal("standard flag spellings rejected", e, start, memory)
-	}
-	for _, args := range [][]string{
-		{"--force", "--force"}, {"--memory", "1GiB", "--mem", "1GiB"}, {"--memory"}, {"--memory", "lots"}, {"--memory", "0"},
-		{"--label", "novalue"}, {"--unknown"}, {"positional"}, {"--force", "trailing"}, {"-h"}, {"--", "literal"},
-	} {
-		if e := parse(args...); e == nil || service.Categorize(e).Exit != 2 {
-			t.Fatalf("%q accepted or wrongly reported: %v", args, e)
-		}
-	}
-	if _, rest, e := shift([]string{"vm", "--force"}); e != nil || len(rest) != 1 {
-		t.Fatal(rest, e)
-	}
-	if _, _, e := shift([]string{"--force"}); e == nil {
-		t.Fatal("flag accepted as positional")
-	}
-	if options, guest, ok := splitDelimiter([]string{"-t", "--", "sh", "--", "x"}); !ok || len(options) != 1 || len(guest) != 3 || guest[1] != "--" {
-		t.Fatal(options, guest, ok)
-	}
-	if _, _, ok := splitDelimiter([]string{"-t"}); ok {
-		t.Fatal("missing delimiter reported as present")
 	}
 }
