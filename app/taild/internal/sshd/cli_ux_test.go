@@ -44,10 +44,10 @@ func TestCLIHelpPureAndLiteralValues(t *testing.T) {
 	input := newInput(t.Context(), inputFile)
 	// No runtime or jobs exist; the real input file must remain unread.
 	var topics []string
-	for name := range commands {
+	for _, name := range commandNames {
 		topics = append(topics, name+" --help", name+" -h", "help "+name)
 	}
-	for alias := range aliases {
+	for _, alias := range commandAliases {
 		topics = append(topics, alias+" --help", "help "+alias)
 	}
 	for _, kind := range []string{"template", "policy"} {
@@ -56,11 +56,18 @@ func TestCLIHelpPureAndLiteralValues(t *testing.T) {
 		}
 	}
 	topics = append(topics, "--help", "-h", "create --userdata - --help", "help ops show", "ops show --help", "ops show -h")
+	for _, kind := range []string{"template", "policy"} {
+		topics = append(topics, kind+" --owner tag:ci create --help", "--json "+kind+" --owner tag:ci create --help", kind+" --owner --help create --help")
+	}
 	for _, line := range topics {
 		var out, human bytes.Buffer
 		code := DispatchSession(t.Context(), s, caller, line, service.IO{Stdin: input.Reader(t.Context()), Input: input.Reader, Stdout: &out, Stderr: &human})
-		if code != 0 || !strings.Contains(human.String(), "Usage:") || !strings.Contains(human.String(), "Options:") || !strings.Contains(human.String(), "Examples:") {
+		text := out.String() + human.String()
+		if code != 0 || !strings.Contains(text, "Usage:") || !strings.Contains(text, "Options:") || !strings.Contains(text, "Examples:") {
 			t.Fatalf("%s: %d %s", line, code, human.String())
+		}
+		if strings.Contains(line, "--owner") && !strings.Contains(text, "create NAME") {
+			t.Fatal("wrong nested topic", line, text)
 		}
 	}
 	if position, err := inputFile.Seek(0, io.SeekCurrent); err != nil || position != 0 {
@@ -92,35 +99,14 @@ func TestCLIHelpPureAndLiteralValues(t *testing.T) {
 	}
 }
 
-func TestCLIUsageDiagnosticsRedacted(t *testing.T) {
-	for _, tc := range []struct {
-		args []string
-		want string
-	}{
-		{[]string{"--cpus"}, "requires a value"}, {[]string{"--cpus", "-1"}, "positive integer"},
-		{[]string{"--cpus", "18446744073709551616"}, "positive integer"},
-		{[]string{"--name", "one", "-n", "two"}, "duplicate option"},
-		{[]string{"--name", ""}, "--name"}, {[]string{"--unknown=SECRET"}, "unknown option"},
-		{[]string{"--label", "SECRET"}, "--label"}, {[]string{"--no-start=SECRET"}, "--no-start"},
-		{[]string{"--cpus", "SECRET/token"}, "positive integer"},
-		{[]string{"--cpus", "1SECRET"}, "positive integer"},
-	} {
-		var name string
-		var cpus uint64
-		var noStart bool
-		f := newFlagSet()
-		f.Alias("n", f.Flag("name", nonEmpty(&name)))
-		f.Flag("cpus", count(&cpus))
-		f.Bool("no-start", &noStart)
-		f.Repeat("label", keyValue(map[string]string{}))
-		err := f.Parse(tc.args)
-		if err == nil || service.Categorize(err).Exit != 2 || !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), "SECRET") {
-			t.Fatal(tc.args, err)
-		}
-	}
-}
+// The transport pins the application's verbs; the command package's own
+// registry test asserts the same list, so drift fails on both sides.
+var (
+	commandNames   = []string{"whoami", "version", "help", "ls", "show", "ops", "create", "start", "restart", "reauth", "stop", "rm", "set", "shell", "exec", "logs", "template", "policy"}
+	commandAliases = []string{"list", "new", "status", "ssh"}
+)
 
-func TestCLIFlagMetadataMatchesActualParsers(t *testing.T) {
+func TestCLIStreamingCommandsRefuseJSON(t *testing.T) {
 	audit, err := state.OpenAudit(t.TempDir(), 1<<20, 2)
 	if err != nil {
 		t.Fatal(err)
@@ -128,107 +114,11 @@ func TestCLIFlagMetadataMatchesActualParsers(t *testing.T) {
 	defer audit.Close()
 	s := &service.Service{Audit: audit, Config: config.Defaults()}
 	p := identity.Peer{Principals: []identity.Principal{"user:7"}, NodeID: "metadata", ObservedAt: time.Now()}
-	for name, cmd := range commands {
-		m, ok := metadata[name]
-		if !ok || m.description == "" || m.example == "" {
-			t.Fatal("missing command metadata", name)
-		}
-		help, ok := commandHelp(name)
-		if !ok {
-			t.Fatal("missing help", name)
-		}
-		if strings.Contains(help, "--json") != acceptsJSON(name) {
-			t.Fatal("JSON help mismatch", name, help)
-		}
-		var prefixes [][]string
-		switch name {
-		case "create":
-			prefixes = [][]string{{}}
-		case "stop", "rm", "shell", "logs":
-			prefixes = [][]string{{"vm"}}
-		case "exec":
-			prefixes = [][]string{{"vm"}}
-		case "template", "policy":
-			for _, verb := range []string{"ls", "show", "create", "edit", "rm", "validate"} {
-				prefix := []string{verb}
-				if verb != "ls" && verb != "validate" {
-					prefix = append(prefix, "document")
-				}
-				prefixes = append(prefixes, prefix)
-				nested, ok := commandHelp(name + " " + verb)
-				if !ok || !strings.Contains(nested, "--json") {
-					t.Fatal("missing nested options", name, verb)
-				}
-			}
-		default:
-			if len(m.options) != 0 {
-				t.Fatal("new flag-bearing command needs a positional grammar fixture", name)
-			}
-		}
-		for _, spec := range m.options {
-			if spec.description == "" || spec.fallback == "" {
-				t.Fatal("missing description/default", name, spec)
-			}
-			for _, alias := range strings.Split(spec.names, ",") {
-				if optionTakesValue(name, alias) != (spec.value != "") {
-					t.Fatal("scanner arity", name, alias)
-				}
-				spelling := "--" + alias
-				if len(alias) == 1 {
-					spelling = "-" + alias
-				}
-				if !strings.Contains(help, spelling) {
-					t.Fatal("missing option alias in help", name, alias)
-				}
-			}
-		}
-		for _, prefix := range prefixes {
-			args := append(append([]string(nil), prefix...), "--unknown")
-			if name == "exec" {
-				args = append(args, "--", "program")
-			}
-			// Run the real handler's registrations, then stop at a syntax error.
-			// Parse checks both missing/extra specs, bool/value arity and alias identity.
-			_, err := cmd.run(&invocation{}, args)
-			if err == nil || service.Categorize(err).Message != "unknown option; see command help" {
-				t.Fatal("registration consistency", name, prefix, err)
-			}
-			for _, spec := range m.options {
-				for _, alias := range strings.Split(spec.names, ",") {
-					args = append([]string(nil), prefix...)
-					flag := "--" + alias
-					if len(alias) == 1 {
-						flag = "-" + alias
-					}
-					if spec.value == "" {
-						args = append(args, flag)
-					} else {
-						args = append(args, flag, "--help")
-					}
-					args = append(args, "--unknown")
-					if name == "exec" {
-						args = append(args, "--", "program", "--json", "--help")
-					}
-					var out, human bytes.Buffer
-					line := strings.Join(append([]string{name}, args...), " ")
-					if code := DispatchSession(t.Context(), s, service.Caller{Peer: p}, line, service.IO{Stdout: &out, Stderr: &human}); code != 2 || strings.Contains(human.String(), "Usage:") || out.Len() != 0 {
-						t.Fatal("actual parser arity/help literal", line, code, out.String(), human.String())
-					}
-				}
-			}
-		}
-	}
 	for _, line := range []string{"shell vm --json", "exec vm --json -- program", "logs vm --json"} {
 		var out, human bytes.Buffer
 		if code := Dispatch(s, p, line, &out, &human); code != 2 || !strings.Contains(human.String(), "--json is not supported") {
 			t.Fatal(line, code, human.String())
 		}
-	}
-	wrongDefault := true
-	f := newFlagSet("rm")
-	f.Bool("force", &wrongDefault)
-	if err := f.checkMetadata(); err == nil {
-		t.Fatal("boolean default drift was not detected")
 	}
 }
 

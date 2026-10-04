@@ -409,7 +409,7 @@ func (s *Service) reserveCreate(ctx context.Context, p identity.Peer, q *CreateR
 	}
 	generated := q.Name == ""
 	var release func()
-	for attempt := 0; attempt < 3; attempt++ {
+	for range 3 {
 		if generated {
 			q.Name, e = silo.ProposeMachineName()
 			if e != nil {

@@ -13,6 +13,7 @@ import (
 	"github.com/vandycknick/silo/app/taild/internal/httpd"
 	"github.com/vandycknick/silo/app/taild/internal/identity"
 	"github.com/vandycknick/silo/app/taild/internal/service"
+	"github.com/vandycknick/silo/app/taild/internal/sshd/commands"
 	_ "tailscale.com/feature/ssh"
 	"tailscale.com/ssh/tailssh"
 )
@@ -177,7 +178,7 @@ func (s *Server) session(parent context.Context, sess *tailssh.Session) {
 		return
 	}
 	if !pty {
-		_, _ = io.WriteString(diagnostic, HelpText())
+		_, _ = io.WriteString(diagnostic, commands.Help())
 		_ = sess.Exit(2)
 		return
 	}

@@ -45,7 +45,7 @@ func TestCreateAdmissionFinalizerWithActualHome(t *testing.T) {
 	checkReleased("submission-failed")
 	// Cancel daemon work immediately after publication. Both cancellation branches
 	// must release pre-publication resources, regardless of callback scheduling.
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		ctx, cancel := context.WithCancel(t.Context())
 		s.Jobs = jobs.New(ctx, 4)
 		c.Resolve = func(ctx context.Context) (identity.Peer, error) { <-ctx.Done(); return c.Peer, ctx.Err() }

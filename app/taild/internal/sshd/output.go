@@ -16,13 +16,6 @@ type sessionOutput struct {
 	close  func()
 }
 
-func humanOutput(streams service.IO) io.Writer {
-	if streams.Human != nil {
-		return streams.Human
-	}
-	return streams.Stderr
-}
-
 func normalizeHuman(streams service.IO) service.IO {
 	if streams.Human == nil {
 		streams.Human = streams.Stderr

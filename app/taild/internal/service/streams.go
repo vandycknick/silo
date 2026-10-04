@@ -37,6 +37,18 @@ type IO struct {
 	// Human is daemon-owned diagnostics and prompts, never guest output or JSON.
 	Human    io.Writer
 	Terminal Terminal
+	// Prompt asks the peer one line: a line editor on a PTY, a raw bounded read
+	// otherwise. The transport supplies it; absent, commands cannot ask.
+	Prompt func(ctx context.Context, prompt string, limit int) (string, error)
+}
+
+// HumanWriter is where daemon-owned text goes: the dedicated human stream when
+// the transport set one up, stderr otherwise.
+func (s IO) HumanWriter() io.Writer {
+	if s.Human != nil {
+		return s.Human
+	}
+	return s.Stderr
 }
 
 type contextualWriter interface {
@@ -340,6 +352,9 @@ type LogsRequest struct {
 	Output silo.MachineLogOutput
 }
 
+// DefaultLogSource is used when no stream filter is supplied.
+const DefaultLogSource = silo.MachineLogSerial
+
 const logLimit = 4 << 20
 
 // Redact host-path-shaped and credential-shaped diagnostic fields. Never
@@ -362,7 +377,7 @@ func redact(line string) string {
 }
 func (s *Service) Logs(parent context.Context, c Caller, ref string, q LogsRequest, out io.Writer) (err error) {
 	if q.Source == "" {
-		q.Source = silo.MachineLogSerial
+		q.Source = DefaultLogSource
 	}
 	switch q.Source {
 	case silo.MachineLogMonitor, silo.MachineLogSerial, silo.MachineLogExec, silo.MachineLogNetwork, silo.MachineLogNetworkAudit:

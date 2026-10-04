@@ -6,12 +6,11 @@ import (
 	"io"
 	"strings"
 	"sync"
-	"time"
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/vandycknick/silo/app/taild/internal/authz"
 	"github.com/vandycknick/silo/app/taild/internal/service"
+	"github.com/vandycknick/silo/app/taild/internal/sshd/commands"
 	"golang.org/x/term"
 )
 
@@ -78,7 +77,7 @@ func (h commandHistory) Add(line string) {
 // even if later edits shorten the line. Cursor/editing remain owned by x/term.
 func (t *terminalInput) checkInsertion(line string, pos int, key rune) (string, int, bool) {
 	if key >= 32 && utf8.ValidRune(key) && (utf8.RuneCountInString(line) >= 4096 || len(line)+utf8.RuneLen(key) > t.lineLimit) {
-		t.lineErr = usage()
+		t.lineErr = commands.Usage()
 		return line, pos, true
 	}
 	return "", 0, false
@@ -109,7 +108,7 @@ func (t *terminalInput) byte() (byte, error) {
 	t.consumed++
 	// Bound control/paste activity independently of the effective edited line.
 	if t.consumed > 65536 {
-		return 0, usage()
+		return 0, commands.Usage()
 	}
 	return b[0], e
 }
@@ -150,7 +149,7 @@ keys:
 				continue
 			}
 			if b != '[' && b != 'O' {
-				return 0, usage()
+				return 0, commands.Usage()
 			}
 			for len(seq) < 64 {
 				b, e = t.byte()
@@ -167,14 +166,14 @@ keys:
 					continue keys
 				}
 				if b < 32 || b > 126 {
-					return 0, usage()
+					return 0, commands.Usage()
 				}
 				if b >= 0x40 && b <= 0x7e {
 					break
 				}
 			}
 			if len(seq) == 64 {
-				return 0, usage()
+				return 0, commands.Usage()
 			}
 			switch string(seq) {
 			case "\x1b[200~":
@@ -203,7 +202,7 @@ keys:
 			r, size := utf8.DecodeRune(seq)
 			if r == utf8.RuneError {
 				if size == 1 {
-					return 0, usage()
+					return 0, commands.Usage()
 				}
 				// x/term uses RuneError as its incomplete-key sentinel. Keep a
 				// literal replacement character from filling its private buffer.
@@ -299,24 +298,12 @@ func (t *terminalInput) ReadPrompt(prompt string, limit int) (string, error) {
 		return "", errLineCanceled
 	}
 	if len(line) > limit {
-		return "", usage()
+		return "", commands.Usage()
 	}
 	if e != nil {
 		return "", e
 	}
 	return line, e
-}
-
-func readPrompt(src io.Reader, out io.Writer, prompt string, limit int) (string, error) {
-	if reader, ok := src.(interface {
-		ReadPrompt(string, int) (string, error)
-	}); ok {
-		return reader.ReadPrompt(prompt, limit)
-	}
-	if _, e := io.WriteString(out, prompt); e != nil {
-		return "", e
-	}
-	return readLineLimit(src, limit)
 }
 
 func terminalStreams(ctx context.Context, src io.Reader, streams service.IO) service.IO {
@@ -333,6 +320,7 @@ func terminalStreams(ctx context.Context, src io.Reader, streams service.IO) ser
 		w := streams.Terminal.Window
 		streams.Stdin = newTerminalInput(ctx, input, streams.Human, int(w.Columns), int(w.Rows))
 	}
+	streams.Prompt = sessionPrompt(streams)
 	return streams
 }
 
@@ -362,12 +350,17 @@ func terminalResize(streams service.IO, converted chan service.Window, width, he
 // Local SSH tests supply an explicit domain caller at this same boundary.
 func Lobby(ctx context.Context, s *service.Service, caller service.Caller, streams service.IO) int {
 	streams = normalizeHuman(streams)
-	out := humanOutput(streams)
+	if streams.Prompt == nil {
+		streams.Prompt = sessionPrompt(streams)
+	}
 	if failure := service.Categorize(s.CheckIdentity(caller.Peer)); failure != nil {
-		return (&invocation{streams: streams}).respond(reply{}, failure)
+		return respond(&commands.Context{Context: ctx, Streams: streams}, commands.Result{}, failure)
+	}
+	if streams.Prompt == nil {
+		return 0
 	}
 	for {
-		line, e := readPrompt(streams.Stdin, out, "silo> ", 16384)
+		line, e := streams.Prompt(ctx, "silo> ", 16384)
 		if errors.Is(e, errLineCanceled) {
 			continue
 		}
@@ -520,27 +513,5 @@ func scanLine(limit int, read func([]byte) (int, error), afterCR func()) (string
 			return "", e
 		}
 	}
-	return "", usage()
-}
-
-// documentInput reads a whole bounded document from the session input, with a
-// deadline so a silent peer cannot park a session in the daemon forever.
-func documentInput(ctx context.Context, streams service.IO, limit int) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	src := streams.Stdin
-	if streams.Input != nil {
-		src = streams.Input(ctx)
-	}
-	if src == nil {
-		return nil, usage()
-	}
-	data, e := io.ReadAll(io.LimitReader(src, int64(limit)+1))
-	if e != nil {
-		return nil, &authz.Error{Code: "usage", Message: "document input interrupted or timed out", Exit: 2}
-	}
-	if len(data) > limit {
-		return nil, &authz.Error{Code: "usage", Message: "document input exceeds size limit", Exit: 2}
-	}
-	return data, nil
+	return "", commands.Usage()
 }
