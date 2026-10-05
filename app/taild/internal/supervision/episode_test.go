@@ -12,7 +12,6 @@ import (
 
 	"github.com/vandycknick/silo/app/taild/internal/config"
 	"github.com/vandycknick/silo/app/taild/internal/state"
-	"github.com/vandycknick/silo/app/taild/internal/units"
 )
 
 // These tests drive the ordered-message domain and real pipe FDs. They do not
@@ -21,13 +20,11 @@ func episodeFixture(t *testing.T, budget time.Duration) (*Inhibitor, *state.Shut
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	t.Cleanup(cancel)
-	c := config.Defaults()
-	c.Shutdown.StopBudget = units.Duration{Duration: budget}
 	receipts := make(chan loginEvent, 8)
-	i := &Inhibitor{owner: ":1.42", maxDelay: time.Second, receipts: receipts, snapshotSequence: 10}
+	i := &Inhibitor{owner: ":1.42", maxDelay: time.Second, budget: StopBudget(budget, time.Second, config.Defaults().Shutdown.Margin.Duration), receipts: receipts, snapshotSequence: 10}
 	t.Cleanup(i.Close)
 	gate := &state.ShutdownGate{}
-	events := i.admitEvents(ctx, c, false, gate, func() {})
+	events := i.admitEvents(ctx, false, gate, func() {})
 	return i, gate, receipts, events, ctx
 }
 

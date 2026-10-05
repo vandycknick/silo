@@ -53,12 +53,15 @@ func (s IO) HumanWriter() io.Writer {
 	return s.Stderr
 }
 
-type contextualWriter interface {
+// ContextWriter is a writer whose blocked write can be abandoned through a
+// context, as the SSH transport's are.
+type ContextWriter interface {
 	WriteContext(context.Context, []byte) (int, error)
 }
 
-func writeContext(ctx context.Context, out io.Writer, data []byte) (int, error) {
-	if writer, ok := out.(contextualWriter); ok {
+// WriteContext writes with cancellation when the writer supports it.
+func WriteContext(ctx context.Context, out io.Writer, data []byte) (int, error) {
+	if writer, ok := out.(ContextWriter); ok {
 		return writer.WriteContext(ctx, data)
 	}
 	return out.Write(data)
@@ -279,11 +282,11 @@ func (s *Service) execute(parent context.Context, c Caller, ref string, action i
 				startedOnce = true
 			}
 		case silo.ExecutionEventStdout, silo.ExecutionEventTerminalOutput:
-			if _, e = writeContext(ctx, streams.Stdout, event.Data); e != nil {
+			if _, e = WriteContext(ctx, streams.Stdout, event.Data); e != nil {
 				return 255, failure("transport", "guest output transport failed", 255)
 			}
 		case silo.ExecutionEventStderr:
-			if _, e = writeContext(ctx, streams.Stderr, event.Data); e != nil {
+			if _, e = WriteContext(ctx, streams.Stderr, event.Data); e != nil {
 				return 255, failure("transport", "guest output transport failed", 255)
 			}
 		case silo.ExecutionEventTerminal:
@@ -315,9 +318,7 @@ func (s *Service) execute(parent context.Context, c Caller, ref string, action i
 
 // pump copies session input into the guest until either side fails, and
 // reports whether the session side ended with a clean EOF.
-func pump(ctx context.Context, from io.Reader, to interface {
-	WriteContext(context.Context, []byte) (int, error)
-}) bool {
+func pump(ctx context.Context, from io.Reader, to ContextWriter) bool {
 	buf := make([]byte, 16384)
 	for {
 		n, e := from.Read(buf)
@@ -454,7 +455,7 @@ func (s *Service) Logs(parent context.Context, c Caller, ref string, q LogsReque
 			tail = nil
 		}
 	}
-	if _, e = writeContext(ctx, out, []byte(redact(string(tail)))); e != nil {
+	if _, e = WriteContext(ctx, out, []byte(redact(string(tail)))); e != nil {
 		return e
 	}
 	if !q.Follow {
@@ -497,7 +498,7 @@ func (s *Service) Logs(parent context.Context, c Caller, ref string, q LogsReque
 				if discard {
 					text = "[oversized log line omitted]"
 				}
-				if _, e = writeContext(ctx, out, []byte(text+"\n")); e != nil {
+				if _, e = WriteContext(ctx, out, []byte(text+"\n")); e != nil {
 					return e
 				}
 				line = line[:0]

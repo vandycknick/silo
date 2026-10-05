@@ -26,6 +26,7 @@ type Inhibitor struct {
 	mu                sync.Mutex
 	fd                *os.File
 	maxDelay          time.Duration
+	budget            time.Duration
 	subscribedAt      time.Time
 	receipts          <-chan loginEvent
 	snapshotSequence  dbus.Sequence
@@ -84,12 +85,12 @@ func Acquire(ctx context.Context, c config.Config) (*Inhibitor, bool, error) {
 		return nil, false, errors.New("logind delay budget invalid")
 	}
 	i.maxDelay = time.Duration(usec) * time.Microsecond
-	budget := StopBudget(c.Shutdown.StopBudget.Duration, i.maxDelay, c.Shutdown.Margin.Duration)
-	if budget <= 0 {
+	i.budget = StopBudget(c.Shutdown.StopBudget.Duration, i.maxDelay, c.Shutdown.Margin.Duration)
+	if i.budget <= 0 {
 		return nil, false, errors.New("logind delay window insufficient")
 	}
 	i.mu.Lock()
-	i.current = shutdownEpisode{phase: episodeAcquiring, deadline: i.subscribedAt.Add(budget)}
+	i.current = shutdownEpisode{phase: episodeAcquiring, deadline: i.subscribedAt.Add(i.budget)}
 	i.mu.Unlock()
 	if err = i.reacquire(call); err != nil {
 		return nil, false, err
@@ -181,6 +182,12 @@ type loginEvent struct {
 	revision uint64
 }
 
+// ownerChanged reports the bus announcing that login1 changed hands.
+func (e loginEvent) ownerChanged() bool {
+	sig := e.signal
+	return sig != nil && sig.Sender == "org.freedesktop.DBus" && sig.Name == "org.freedesktop.DBus.NameOwnerChanged" && len(sig.Body) == 3 && sig.Body[0] == loginService
+}
+
 // Timestamp receipt independently of marker sync/recovery calls. Otherwise a
 // queued signal could accidentally receive a fresh window when finally handled.
 func (i *Inhibitor) events(ctx context.Context) <-chan loginEvent {
@@ -240,9 +247,8 @@ func (o *startupOrder) accept(signal *dbus.Signal, owner string) (bool, bool) {
 
 // admitEvents runs before any startup marker/helper recovery. Receipt arms FD
 // release and seals/cancels process-local admission without doing filesystem I/O.
-func (i *Inhibitor) admitEvents(ctx context.Context, c config.Config, preparing bool, gate *state.ShutdownGate, interrupt func()) <-chan loginEvent {
+func (i *Inhibitor) admitEvents(ctx context.Context, preparing bool, gate *state.ShutdownGate, interrupt func()) <-chan loginEvent {
 	out := make(chan loginEvent, 1)
-	budget := StopBudget(c.Shutdown.StopBudget.Duration, i.maxDelay, c.Shutdown.Margin.Duration)
 	publish := func(event loginEvent) {
 		select {
 		case out <- event:
@@ -255,7 +261,7 @@ func (i *Inhibitor) admitEvents(ctx context.Context, c config.Config, preparing 
 		}
 	}
 	arm := func(event loginEvent) loginEvent {
-		episode := i.transition(ctx, event, true, budget, gate)
+		episode := i.transition(ctx, event, true, i.budget, gate)
 		event.shutdown, event.cancel, event.revision = episode.ctx, episode.cancel, episode.revision
 		interrupt()
 		return event
@@ -275,9 +281,8 @@ func (i *Inhibitor) admitEvents(ctx context.Context, c config.Config, preparing 
 				if !ok {
 					return
 				}
-				sig := event.signal
-				ownerChange := sig != nil && sig.Sender == "org.freedesktop.DBus" && sig.Name == "org.freedesktop.DBus.NameOwnerChanged" && len(sig.Body) == 3 && sig.Body[0] == loginService
-				value, accepted := order.accept(sig, i.owner)
+				ownerChange := event.ownerChanged()
+				value, accepted := order.accept(event.signal, i.owner)
 				if !accepted && !ownerChange {
 					continue
 				}
@@ -285,7 +290,7 @@ func (i *Inhibitor) admitEvents(ctx context.Context, c config.Config, preparing 
 					if value {
 						event = arm(event)
 					} else {
-						i.transition(ctx, event, false, budget, gate)
+						i.transition(ctx, event, false, i.budget, gate)
 					}
 				}
 				publish(event)
@@ -299,7 +304,7 @@ func (i *Inhibitor) admitEvents(ctx context.Context, c config.Config, preparing 
 }
 
 func (i *Inhibitor) Start(ctx context.Context, c config.Config, r *runtime.Runtime, preparing bool, gate *state.ShutdownGate, interrupt func(), resume func(), jobsDrained func() <-chan struct{}, log *slog.Logger) {
-	events := i.admitEvents(ctx, c, preparing, gate, interrupt)
+	events := i.admitEvents(ctx, preparing, gate, interrupt)
 	go i.watch(ctx, c, r, events, gate, resume, jobsDrained, log)
 }
 
@@ -376,8 +381,7 @@ func (i *Inhibitor) watch(ctx context.Context, c config.Config, r *runtime.Runti
 				log.Error("system bus signals lost; shutdown protection unavailable")
 				return
 			}
-			sig := event.signal
-			if sig != nil && sig.Sender == "org.freedesktop.DBus" && sig.Name == "org.freedesktop.DBus.NameOwnerChanged" && len(sig.Body) == 3 && sig.Body[0] == loginService {
+			if event.ownerChanged() {
 				log.Error("logind owner changed; shutdown protection unavailable")
 				return
 			}

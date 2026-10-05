@@ -36,6 +36,17 @@ type StopResult struct {
 	Drained                  <-chan struct{}
 }
 
+func (r *StopResult) add(o StopResult) {
+	r.Issued += o.Issued
+	r.Finished += o.Finished
+	r.Failed += o.Failed
+}
+
+type inventoryResult struct {
+	entries []silo.MachineInventoryEntry
+	err     error
+}
+
 // StopAll issues every stop concurrently before waiting. SDK native calls may
 // outlive their Go context. The returned counts never call those calls finished.
 // Native per-machine lifecycle locks coordinate this with SDK/CLI writers.
@@ -45,18 +56,12 @@ func StopAll(ctx context.Context, r *runtime.Runtime) (StopResult, error) {
 	wg.Add(1)
 	defer func() { wg.Done(); go func() { wg.Wait(); close(drained) }() }()
 	result := StopResult{Drained: drained}
-	entriesDone := make(chan struct {
-		entries []silo.MachineInventoryEntry
-		err     error
-	}, 1)
+	entriesDone := make(chan inventoryResult, 1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		entries, err := r.SDK.Inventory(ctx)
-		entriesDone <- struct {
-			entries []silo.MachineInventoryEntry
-			err     error
-		}{entries, err}
+		entriesDone <- inventoryResult{entries, err}
 	}()
 	var entries []silo.MachineInventoryEntry
 	select {
@@ -146,9 +151,7 @@ func Sweep(ctx context.Context, r *runtime.Runtime) (total StopResult, finalErro
 	}()
 	for {
 		result, err := StopAll(ctx, r)
-		total.Issued += result.Issued
-		total.Finished += result.Finished
-		total.Failed += result.Failed
+		total.add(result)
 		drains = append(drains, result.Drained)
 		lastError = err
 		if err != nil && (ctx.Err() != nil || result.Finished < result.Issued) {
